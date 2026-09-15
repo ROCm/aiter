@@ -7,8 +7,8 @@
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
 #include "opus_gemm_heuristic_dispatch_gfx942.cuh"  // OpusA16W16NoscaleKernel + opus_a16w16_heuristic_dispatch_gfx942<>
-#include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_BF16 / FP32
-#include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_BF16 / FP32
+#include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_{BF16,FP32}_GFX942
+#include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_{BF16,FP32}_GFX942
 #include "opus_gemm_a8w8_tune_lookup.h"             // GENERATE_A8W8_TUNE_LOOKUP_BF16
 #include "opus_gemm_manifest.h"                     // launcher symbols referenced by the lookup macros
 #include "../opus_gemm_utils.cuh"                   // bf16_t / fp32_t
@@ -89,7 +89,7 @@ opus_dispatch_a16w16_gfx942<bf16_t>(int M, int N, int K, int batch, bool has_bia
 {
     using namespace opus_gfx942_detail;
     static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)
+        GENERATE_OPUS_LOOKUP_TABLE_BF16_GFX942(bf16_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
     OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
@@ -107,7 +107,7 @@ opus_dispatch_a16w16_gfx942<fp32_t>(int M, int N, int K, int batch, bool has_bia
 {
     using namespace opus_gfx942_detail;
     static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)
+        GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX942(fp32_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
     OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
@@ -131,7 +131,7 @@ opus_a16w16_tune_dispatch_gfx942<bf16_t>(int id)
 {
     using namespace opus_gfx942_detail;
     static constexpr OpusA16W16TuneEntry kTune[] = {
-        GENERATE_A16W16_TUNE_LOOKUP_BF16(bf16_t)
+        GENERATE_A16W16_TUNE_LOOKUP_BF16_GFX942(bf16_t)
     };
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
@@ -148,7 +148,7 @@ opus_a16w16_tune_dispatch_gfx942<fp32_t>(int id)
 {
     using namespace opus_gfx942_detail;
     static constexpr OpusA16W16TuneEntry kTune[] = {
-        GENERATE_A16W16_TUNE_LOOKUP_FP32(fp32_t)
+        GENERATE_A16W16_TUNE_LOOKUP_FP32_GFX942(fp32_t)
     };
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};

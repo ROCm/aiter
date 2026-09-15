@@ -70,7 +70,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     static constexpr ck::index_t NXDLPerWave = NPerBlock / (MNPerXDL * NWaves);
     // static constexpr ck::index_t NPerBlock = PipelineVer == ck::BlockGemmPipelineVersion::v1 ? 64
     // : 128;
-    static constexpr ck::index_t CShuffleMXDLPerWave = std::min(2, MXDLPerWave);
+    static constexpr ck::index_t CShuffleMXDLPerWave = (2 < MXDLPerWave ? 2 : MXDLPerWave);
     static constexpr ck::index_t CShuffleNXDLPerWave =
         ck::is_same_v<B0DataType, I4> ? 1 : NXDLPerWave;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
@@ -258,7 +258,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t MNPerXDL            = 16;
     static constexpr ck::index_t MXDLPerWave         = MPerBlock / (MNPerXDL * MWaves);
     static constexpr ck::index_t NXDLPerWave         = NPerBlock / (MNPerXDL * NWaves);
-    static constexpr ck::index_t CShuffleMXDLPerWave = std::min(2, MXDLPerWave);
+    static constexpr ck::index_t CShuffleMXDLPerWave = (2 < MXDLPerWave ? 2 : MXDLPerWave);
     static constexpr ck::index_t CShuffleNXDLPerWave =
         ck::is_same_v<B0DataType, I4> ? 2 : NXDLPerWave;
     static constexpr ck::index_t CShuffleNLane =

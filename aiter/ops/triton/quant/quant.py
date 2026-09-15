@@ -8,6 +8,7 @@ import triton
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
     _dynamic_mxfp8_quant_kernel,
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel,
     _dynamic_nvfp4_quant_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
@@ -26,6 +27,7 @@ __all__ = [
     "_nvfp4_quant_op",
     "dynamic_mxfp4_quant",
     "dynamic_mxfp8_quant",
+    "dynamic_mxfp8_quant_n32k4_mbn",
     "dynamic_nvfp4_quant",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_token_quant_fp8_i8",
@@ -41,7 +43,9 @@ _LOGGER = AiterTritonLogger()
 
 
 def static_per_tensor_quant_fp8_i8(
-    qx: torch.Tensor, x_in: torch.Tensor, scale_in: torch.Tensor
+    qx: torch.Tensor,
+    x_in: torch.Tensor,
+    scale_in: torch.Tensor,
 ):
     """
     Quantizes tensor using the provided scale to int8 or fp8
@@ -56,14 +60,39 @@ def static_per_tensor_quant_fp8_i8(
     """
     _LOGGER.info(f"STAIC_PER_TENSOR_QUANT_FP8_I8: x={tuple(x_in.shape)}")
     assert scale_in.numel() == 1  # only single scale value
-    rows = x_in.shape[0]
-    cols = x_in.shape[1]
-    NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
-    _static_per_tensor_quant_fp8_i8_kernel[grid](
-        qx, x_in, scale_in, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
-    )
+    # per_tensor_quant_triton hands in a 2D x with an N-D qx, so view both as 2D
+    # rather than trusting qx.stride(0); .view still writes the caller's buffer.
+    x2d = x_in if x_in.ndim == 2 else x_in.view(-1, x_in.shape[-1])
+    q2d = qx if qx.ndim == 2 else qx.view(-1, qx.shape[-1])
+    assert x2d.shape == q2d.shape, f"{tuple(x2d.shape)=} != {tuple(q2d.shape)=}"
 
+    rows, cols = x2d.shape
+    cols_pow2 = triton.next_power_of_2(cols)
+    if cols_pow2 >= 2048:
+        # Wide rows: one program per row segment, as many columns at a time as
+        # fit. Packing rows on top of this only shrinks the grid.
+        BLOCK_N = min(cols_pow2, 4096)
+        BLOCK_M = 1
+    else:
+        # Narrow rows: a row per program leaves the grid too small and each
+        # program too short, so stack rows up to a ~2K-element tile.
+        BLOCK_N = min(cols_pow2, 512)
+        BLOCK_M = max(1, min(triton.next_power_of_2(rows), 2048 // BLOCK_N))
+    grid = (triton.cdiv(rows, BLOCK_M), triton.cdiv(cols, BLOCK_N))
+    _static_per_tensor_quant_fp8_i8_kernel[grid](
+        q2d,
+        x2d,
+        scale_in,
+        rows,
+        cols,
+        x2d.stride(0),
+        x2d.stride(1),
+        q2d.stride(0),
+        q2d.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
     return qx
 
 
@@ -86,8 +115,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
-    _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
+    _dynamic_per_tensor_quant_fp8_i8_kernel[(rows,)](
         x_in,
         scale_out,
         cols,
@@ -100,9 +128,7 @@ def dynamic_per_tensor_quant_fp8_i8(
         ),
     )
 
-    _static_per_tensor_quant_fp8_i8_kernel[grid](
-        qx, x_in, scale_out, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
-    )
+    static_per_tensor_quant_fp8_i8(qx, x_in, scale_out)
 
     return qx, scale_out
 
@@ -129,7 +155,7 @@ def dynamic_per_token_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
+    grid = (rows,)
     _dynamic_per_token_quant_fp8_i8_kernel[grid](
         qx,
         scale_out,
@@ -148,7 +174,10 @@ def dynamic_per_token_quant_fp8_i8(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor,
+    scaling_mode: str = "even",
+    x_fp4: torch.Tensor | None = None,
+    blockscale_e8m0: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -158,6 +187,11 @@ def dynamic_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
+        x_fp4, blockscale_e8m0: Optional pre-allocated uint8 outputs, shaped
+            (M, N // 2) and (M, ceil(N / 32)). N need not be a multiple of 32
+            (only (N // 2) % 2 == 0 is asserted); a trailing partial block still
+            gets its own scale column, so the scale width is the ceiling, not
+            N // 32. Allocated column-major when omitted.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -169,12 +203,22 @@ def dynamic_mxfp4_quant(
 
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
-    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    blockscale_e8m0 = torch.empty(
-        ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
-        dtype=torch.uint8,
-        device=x.device,
-    ).T
+    if x_fp4 is None:
+        x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    else:
+        assert x_fp4.shape == (M, N // 2) and x_fp4.dtype == torch.uint8
+    n_scales = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    if blockscale_e8m0 is None:
+        blockscale_e8m0 = torch.empty(
+            (n_scales, M),
+            dtype=torch.uint8,
+            device=x.device,
+        ).T
+    else:
+        assert (
+            blockscale_e8m0.shape == (M, n_scales)
+            and blockscale_e8m0.dtype == torch.uint8
+        )
 
     # for large N values
     if M <= 32:
@@ -226,7 +270,6 @@ def dynamic_mxfp4_quant(
         NUM_STAGES=NUM_STAGES,
         num_warps=NUM_WARPS,
         waves_per_eu=0,
-        num_stages=1,
     )
 
     return (x_fp4, blockscale_e8m0)
@@ -271,7 +314,8 @@ def dynamic_mxfp8_quant(
         assert scale.dtype == torch.uint8
 
     BLOCK_SIZE_N = triton.next_power_of_2(K)
-    NUM_PRGMS = M
+    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+    NUM_PRGMS = min(M, 32768)
     grid = (NUM_PRGMS,)
 
     _dynamic_mxfp8_quant_kernel[grid](
@@ -294,6 +338,65 @@ def dynamic_mxfp8_quant(
     y = y.view(*orig_shape[:-1], K)
     s = scale.view(*orig_shape[:-1], Ns)
     return y, s
+
+
+def dynamic_mxfp8_quant_n32k4_mbn(
+    o: torch.Tensor,
+    quant_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused per-1x32 MXFP8 quant + n32k4 scale preshuffle for an mbn activation.
+
+    Single Triton launch: quantizes ``o`` to FP8 e4m3 and writes the e8m0 scale
+    *directly* in the [M//32, B, (K//32)*32] n32k4 layout consumed by the flydsl
+    strided-batched a8w4 kernel (layout='mbn'). Replaces the
+    ``dynamic_mxfp8_quant`` + transpose/permute/contiguous chain (3 uint8 copies)
+    with zero post-quant copies.
+
+    Args:
+        o: [M(tokens), B(groups), K] bf16/fp16 activation, M-outer contiguous.
+        quant_dtype: FP8 dtype for the payload.
+
+    Returns:
+        (a_fp8, a_scales):
+          a_fp8   : [M, B, K] fp8 (mbn physical, M-outer)
+          a_scales: [ceil(M/32), B, (K//32)*32] uint8 e8m0 (n32k4, pre-zeroed)
+    """
+    assert o.dim() == 3, f"expected [M,B,K], got {tuple(o.shape)}"
+    M, B, K = o.shape
+    assert (
+        K % _MXFP8_QUANT_BLOCK_SIZE == 0
+    ), f"K={K} must be a multiple of {_MXFP8_QUANT_BLOCK_SIZE}"
+
+    R = M * B
+    x2d = o.reshape(R, K).contiguous()  # row r = m*B + b (no copy if o contiguous)
+    Ns = K // _MXFP8_QUANT_BLOCK_SIZE
+    S_SUPER = Ns * 32  # bytes per (super, batch) e8m0 block
+
+    y = torch.empty((R, K), dtype=quant_dtype, device=o.device)
+    n_super = (M + 31) // 32
+    # Pre-zeroed so padded rows (m >= M within the last super) stay benign.
+    scale = torch.zeros((n_super, B, S_SUPER), dtype=torch.uint8, device=o.device)
+
+    BLOCK_SIZE_N = triton.next_power_of_2(K)
+    grid = (R,)
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel[grid](
+        x2d,
+        y,
+        scale,
+        R,
+        K,
+        B,
+        x2d.stride(0),
+        x2d.stride(1),
+        y.stride(0),
+        y.stride(1),
+        S_SUPER,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+        NUM_PRGMS=R,
+    )
+
+    return y.view(M, B, K), scale
 
 
 def fp8_legacy_to_mxfp8(
@@ -433,7 +536,6 @@ def dynamic_nvfp4_quant(
         NUM_STAGES=NUM_STAGES,
         num_warps=NUM_WARPS,
         waves_per_eu=0,
-        num_stages=1,
     )
 
     return x_fp4, blockscale_e4m3

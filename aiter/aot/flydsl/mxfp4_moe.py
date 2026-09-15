@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compile for the FlyDSL mxmoe a4w4 MoE port (gemm1 / gemm2).
+"""AOT pre-compile for the FlyDSL MXMOE a4w4/a8w4 port (GEMM1 / GEMM2) and the
+layout-v2 GEMM2 kernels.
 
-Parses the flydsl_mxmoe_* port rows from the fp4 tuned CSVs and warms the FlyDSL
-disk cache via the same runtime entry points, keyed identically so inference
-hits the cache.
+Parses flydsl_mxmoe_* and flydsl_moe2_layout_* rows from the existing model
+configs plus the active FMoE CSV, and warms the FlyDSL disk cache via the same
+runtime entry points, keyed identically so inference hits the cache.
 
 Standalone:
     python -m aiter.aot.flydsl.mxfp4_moe [--csv /path/to/foo_fp4_tuned_fmoe.csv]
@@ -19,15 +20,25 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
-from aiter.jit.core import AITER_ROOT_DIR
+from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
+# moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
+# glob misses gets no AOT job at all and JITs on the first inference call.
+DEFAULT_CSVS = sorted(
+    set(
+        glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv")
+        + glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp8fp4_tuned_fmoe.csv")
+        + glob.glob(f"{_MODEL_CONFIG_DIR}/*_a4w4_tuned_fmoe.csv")
+        + glob.glob(f"{_MODEL_CONFIG_DIR}/*_a8w4_tuned_fmoe.csv")
+    )
+)
+_ACTIVE_FMOE_CSV = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
+    DEFAULT_CSVS.append(_ACTIVE_FMOE_CSV)
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
-# V2 GEMM2 enables fp8 route-out by default; the legacy MoE AOT path keeps its
-# own default behavior in moe.py.
 _STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
@@ -44,24 +55,42 @@ def _job_key(job: dict) -> tuple:
             job["epilog"],
             job["D_INTER"],
             job["N_OUT"],
+            job["a_dtype"],
+            job["b_dtype"],
             job["topk"] if job["epilog"] == "reduce" else 1,
             job["SBM"],
             job["persist"],
             job["cu_num"] if job["persist"] else 0,
-            job["has_pad"],
             job["out_dtype"],
+            job.get("enable_bias", False),
+            job.get("g2_spart"),
+            job.get("g2_bf16_lds"),
         )
     if job["stage"] == 1:
         return (
             1,
             job["BM"],
+            job["BN"],
+            job["BK"],
             job["use_nt"],
             job["inline_quant"],
+            job["prefetch_hidden"],
             job["D_HIDDEN"],
             job["D_INTER"],
             job["NE"],
             job["topk"],
             job["xcd_swizzle"],
+            job["a_dtype"],
+            job["out_dtype"],
+            job["act"],
+            job["situ_beta"],
+            job["situ_linear_beta"],
+            job["swiglu_limit"],
+            job["enable_bias"],
+            job["interleave"],
+            job["native_scale_layout"],
+            job["num_waves"],
+            job["k_wave"],
         )
     return (
         2,
@@ -77,12 +106,17 @@ def _job_key(job: dict) -> tuple:
 
 
 def parse_csv(csv_path: str):
-    """Parse an fp4 tuned CSV into unique mxmoe-port compile jobs (one per stage)."""
+    """Parse a tuned CSV into unique MXMOE-port jobs for each stage and layout."""
+    from aiter.ops.flydsl.moe_common import (
+        DEFAULT_SITUV2_BETA,
+        DEFAULT_SITUV2_LINEAR_BETA,
+    )
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
+        native_scale_layout_for,
         parse_flydsl_v2_gemm2_kernel,
     )
 
@@ -98,95 +132,137 @@ def parse_csv(csv_path: str):
 
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
+            token = int(row["token"])
             topk = int(row["topk"])
-            # Shape comes from CSV columns; v2 GEMM2 aligns K to its encoded BK.
+            # Shape comes from CSV columns; layout-v2 uses the exact K.
             model_dim = int(row["model_dim"])
             expert = int(row["expert"])
             inter_dim = int(row["inter_dim"])
             d_inter = ((inter_dim + 255) // 256) * 256
             d_inter_real = inter_dim if inter_dim != d_inter else None
+
+            kn1 = (row.get("kernelName1") or "").strip()
             kn2 = (row.get("kernelName2") or "").strip()
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
-                bk = v2_g2["tile_k"]
-                v2_d_inter = ((inter_dim + bk - 1) // bk) * bk
-                v2_d_inter_real = inter_dim if inter_dim != v2_d_inter else None
+                v2_d_inter = inter_dim
             else:
                 v2_d_inter = d_inter
-                v2_d_inter_real = d_inter_real
 
-            kn1 = (row.get("kernelName1") or "").strip()
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
-                _add(
-                    {
-                        "stage": 1,
-                        "kernel_name": kn1,
-                        "BM": p1["BM"],
-                        "use_nt": p1["use_nt"],
-                        "inline_quant": p1["inline_quant"],
-                        "D_HIDDEN": model_dim,
-                        "D_INTER": v2_d_inter,
-                        "NE": expert,
-                        "topk": topk,
-                        "xcd_swizzle": p1["xcd_swizzle"],
-                    }
-                )
+                situ_params = [(1.0, 1.0)]
+                if p1["act"] == "situv2":
+                    situ_params.append(
+                        (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
+                    )
+                for situ_beta, situ_linear_beta in situ_params:
+                    # gate_mode selects the layout at runtime; CSV kernel names
+                    # represent both layouts, with separate compiled cache keys.
+                    for interleave in (False, True):
+                        _add(
+                            {
+                                "stage": 1,
+                                "kernel_name": kn1,
+                                "BM": p1["BM"],
+                                "BN": p1["BN"],
+                                "BK": p1["BK"],
+                                "use_nt": p1["use_nt"],
+                                "n_tokens": token,
+                                "inline_quant": p1["inline_quant"],
+                                "prefetch_hidden": p1.get("prefetch_hidden", False),
+                                "D_HIDDEN": model_dim,
+                                # Config lookup and runtime GEMM1 both use the
+                                # unpadded logical width represented by this row.
+                                "D_INTER": inter_dim,
+                                "NE": expert,
+                                "topk": topk,
+                                "xcd_swizzle": p1["xcd_swizzle"],
+                                "a_dtype": p1["a_dtype"],
+                                "out_dtype": p1["out_dtype"],
+                                "act": p1["act"],
+                                "situ_beta": situ_beta,
+                                "situ_linear_beta": situ_linear_beta,
+                                "swiglu_limit": 7.0,
+                                "enable_bias": p1["enable_bias"],
+                                "interleave": interleave,
+                                "native_scale_layout": native_scale_layout_for(
+                                    p1["BM"], p1["out_dtype"]
+                                ),
+                                "num_waves": p1.get("num_waves", 4),
+                                "k_wave": p1.get("k_wave", 1),
+                            }
+                        )
+
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                inter_dim_pad = v2_d_inter - inter_dim
-                model_dim_pad = 0
                 out_dtype = (
                     "fp8"
                     if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
                     else "bf16"
                 )
-                _add(
-                    {
-                        "stage": 2,
-                        "v2_stage2": True,
-                        "kernel_name": kn2,
-                        "BM": bm,
-                        "BN": v2_g2["tile_n"],
-                        "BK": v2_g2["tile_k"],
-                        "use_nt": v2_g2["use_nt"],
-                        "NE": expert,
-                        "N_OUT": model_dim,
-                        "epilog": v2_g2["epilog"],
-                        "D_INTER": v2_d_inter,
-                        "D_INTER_REAL": v2_d_inter_real,
-                        "topk": topk,
-                        "SBM": v2_g2["sort_block_m"] or bm,
-                        "persist": v2_g2["persist"],
-                        "cu_num": int(row.get("cu_num", "0") or "0"),
-                        "a_dtype": v2_g2["a_dtype"],
-                        "inter_dim_pad": inter_dim_pad,
-                        "model_dim_pad": model_dim_pad,
-                        "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
-                        "out_dtype": out_dtype,
-                    }
+                bias_supported = (
+                    row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
+                    and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
+                    and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
                 )
+                enable_bias_options = [False, True] if bias_supported else [False]
+                for enable_bias in enable_bias_options:
+                    _add(
+                        {
+                            "stage": 2,
+                            "v2_stage2": True,
+                            "kernel_name": kn2,
+                            "BM": bm,
+                            "BN": v2_g2["tile_n"],
+                            "BK": v2_g2["tile_k"],
+                            "use_nt": v2_g2["use_nt"],
+                            "NE": expert,
+                            "N_OUT": model_dim,
+                            "epilog": v2_g2["epilog"],
+                            "D_INTER": v2_d_inter,
+                            "topk": topk,
+                            "SBM": v2_g2["sort_block_m"] or bm,
+                            "persist": v2_g2["persist"],
+                            "cu_num": int(row.get("cu_num", "0") or "0"),
+                            "a_dtype": v2_g2["a_dtype"],
+                            "b_dtype": v2_g2["b_dtype"],
+                            "out_dtype": out_dtype,
+                            "enable_bias": enable_bias,
+                            "g2_spart": v2_g2["spart"],
+                            "g2_bf16_lds": v2_g2["bf16_lds"],
+                        }
+                    )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
-                if p2["mxfp4out"] and not _MXFP4_INTERMEDIATE:
-                    continue
-                _add(
-                    {
-                        "stage": 2,
-                        "kernel_name": kn2,
-                        "BM": p2["BM"],
-                        "use_nt": p2["use_nt"],
-                        "NE": expert,
-                        "N_OUT": model_dim,
-                        "epilog": _epilog_of(
-                            p2["atomic"], p2["mxfp4out"], p2["cshuffle"]
-                        ),
-                        "D_INTER": d_inter,
-                        "D_INTER_REAL": d_inter_real,
-                        "topk": topk,  # unused by the kernel; for the entry signature
-                        "xcd_swizzle": p2["xcd_swizzle"],
-                    }
-                )
+                # An _f4out row falls back to the plain kernel whenever the
+                # mxfp4-out path is gated off -- by AITER_MXFP4_INTERMEDIATE
+                # here, or by the shape check in fused_moe at runtime. Emit that
+                # fallback too, else RUN_ONLY has no cache entry for the kernel
+                # that actually launches.
+                mxfp4outs = [False]
+                if p2["mxfp4out"] and _MXFP4_INTERMEDIATE:
+                    mxfp4outs.append(True)
+                for mxfp4out in mxfp4outs:
+                    _add(
+                        {
+                            "stage": 2,
+                            "kernel_name": (
+                                kn2 if mxfp4out else kn2.replace("_f4out", "")
+                            ),
+                            "BM": p2["BM"],
+                            "use_nt": p2["use_nt"],
+                            "NE": expert,
+                            "N_OUT": model_dim,
+                            "epilog": _epilog_of(
+                                p2["atomic"], mxfp4out, p2["cshuffle"]
+                            ),
+                            "D_INTER": d_inter,
+                            "D_INTER_REAL": d_inter_real,
+                            "topk": topk,  # unused by the kernel; for the entry signature
+                            "xcd_swizzle": p2["xcd_swizzle"],
+                        }
+                    )
 
     return jobs
 
@@ -214,15 +290,29 @@ def _compile_stage1(job):
         inter_sorted_quant=d,
         inter_sorted_shuffled_scale=d,
         hidden_states=d,
-        n_tokens=job["BM"],
+        n_tokens=job["n_tokens"],
         BM=job["BM"],
+        BN=job["BN"],
+        BK=job["BK"],
         use_nt=job["use_nt"],
         inline_quant=job["inline_quant"],
+        prefetch_hidden=job["prefetch_hidden"],
         NE=job["NE"],
         D_HIDDEN=job["D_HIDDEN"],
         D_INTER=job["D_INTER"],
         topk=job["topk"],
         xcd_swizzle=job["xcd_swizzle"],
+        a_dtype=job["a_dtype"],
+        out_dtype=job["out_dtype"],
+        act=job["act"],
+        situ_beta=job["situ_beta"],
+        situ_linear_beta=job["situ_linear_beta"],
+        swiglu_limit=job["swiglu_limit"],
+        bias=d if job["enable_bias"] else None,
+        interleave=job["interleave"],
+        native_scale_layout=job["native_scale_layout"],
+        num_waves=job["num_waves"],
+        k_wave=job["k_wave"],
         stream=0,
     )
 
@@ -267,6 +357,7 @@ def _compile_v2_stage2(job):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
     d = _dummy()
+    bias = _dummy(max(256, job["NE"] * job["N_OUT"] * 4))
     max_sorted = job["BM"]
     if job["persist"]:
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
@@ -274,10 +365,12 @@ def _compile_v2_stage2(job):
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
     if job["epilog"] == "reduce":
         if is_fp8_route_out:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+
             target = torch.empty(
                 (
                     job["BM"] * job["topk"],
-                    job["N_OUT"] + job["N_OUT"] // 8,
+                    fp8out_row_bytes(job["N_OUT"]),
                 ),
                 dtype=torch.uint8,
                 device="cpu",
@@ -311,14 +404,16 @@ def _compile_v2_stage2(job):
         BK=job["BK"],
         use_nt=job["use_nt"],
         a_dtype=job["a_dtype"],
+        b_dtype=job["b_dtype"],
         epilog=job["epilog"],
         SBM=job["SBM"],
         persist=job["persist"],
         cu_num=job["cu_num"],
         n_sorted_padded=max_sorted,
-        inter_dim_pad=job["inter_dim_pad"],
-        model_dim_pad=job["model_dim_pad"],
         out_dtype=job["out_dtype"],
+        g2_spart=job.get("g2_spart"),
+        g2_bf16_lds=job.get("g2_bf16_lds"),
+        bias=bias if job.get("enable_bias", False) else None,
         stream=0,
     )
     if job["epilog"] == "reduce":
@@ -334,6 +429,7 @@ def _compile_v2_stage2(job):
             topk_ids=None,
             stream=0,
             is_fp8=is_fp8_route_out,
+            topk_weights=d if is_fp8_route_out else None,
         )
 
 
@@ -368,7 +464,7 @@ def compile_one_config(**job):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AOT pre-compile FlyDSL mxmoe a4w4 MoE port kernels from fp4 tuned CSVs",
+        description="AOT pre-compile FlyDSL mxmoe/layout-v2 kernels from tuned FMoE CSVs",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -376,7 +472,8 @@ def main():
         type=str,
         nargs="+",
         default=DEFAULT_CSVS,
-        help="Path(s) to fp4 tuned CSV(s); default: all *_fp4_tuned_fmoe.csv",
+        help="Path(s) to tuned FMoE CSVs; default: fp4, fp8fp4, a4w4, and a8w4 "
+        "model configs plus the active merged FMoE config",
     )
     args = parser.parse_args()
 
@@ -394,7 +491,7 @@ def main():
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
 
     print("=" * 72)
-    print("FlyDSL mxmoe a4w4 MoE-port AOT Pre-compilation")
+    print("FlyDSL MXMOE a4w4/a8w4 AOT Pre-compilation")
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")

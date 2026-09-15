@@ -14,22 +14,21 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     IS_NVIDIA_HOPPER,
     RCP_LN2,
-    USE_CUDA_GRAPH,
     autotune_cache_kwargs,
     check_shared_mem,
-    gated_delta_rule_autotune_configs,
 )
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_rebased_cu_seqlens,
 )
-from ..utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
@@ -53,16 +52,16 @@ def _gate_exp(x, USE_EXP2: tl.constexpr):
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in NUM_STAGES_FWD
             for BV in [32, 64]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "TRANSPOSE_STATE"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -318,7 +317,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
@@ -326,10 +326,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 [3, 2] if IS_AMD else ([4, 3, 2] if check_shared_mem("ampere") else [1])
             )
             for BV in [64, 32]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "BV", "USE_G"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -660,16 +659,16 @@ def chunk_gated_delta_rule_fwd_h(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in NUM_STAGES_FWD
             for BV in [16, 32, 64]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
@@ -974,16 +973,16 @@ def chunk_gated_delta_rule_fwd_h_opt(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in NUM_STAGES_FWD
             for BV in [16, 32, 64]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
@@ -1252,6 +1251,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
@@ -1263,7 +1263,9 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     `g` is expected in head-major layout [B, H, T].
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
     state_dtype selects the initial/final hidden-state dtype (`fp32` or `bf16`);
-    defaults to fp32. The kernel accumulates in fp32 and casts on store.
+    defaults to fp32. snapshot_dtype independently selects the temporary chunk
+    snapshot dtype and defaults to k.dtype. The kernel accumulates in fp32 and
+    casts each output according to its own dtype policy.
     num_decodes / num_decode_tokens skip a leading decode-only prefix in the
     ORIGINAL cu_seqlens (data tensors are expected pre-sliced); offsets are
     rebased internally via the cached prologue helpers so the chunk-index /
@@ -1331,6 +1333,14 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     if state_dtype is not None and state_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(f"`state_dtype` must be fp32 or bf16, got {state_dtype}.")
     _state_dtype = state_dtype if state_dtype is not None else torch.float32
+    if snapshot_dtype is not None and snapshot_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"`snapshot_dtype` must be fp32 or bf16, got {snapshot_dtype}."
+        )
+    _snapshot_dtype = k.dtype if snapshot_dtype is None else snapshot_dtype
     if (
         state_dtype is not None
         and initial_state is not None
@@ -1352,6 +1362,11 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
             "`initial_state_indices` requires in-place update; "
             "leave `inplace_final_state` unset or set it to True."
         )
+    if has_indices and not output_final_state:
+        raise ValueError(
+            "`initial_state_indices` requires `output_final_state=True` "
+            "(the indexed path writes the final state back into the pool)."
+        )
     if inplace and not initial_state.is_contiguous():
         raise ValueError("`initial_state` must be contiguous for in-place update.")
     state_indices = (
@@ -1364,7 +1379,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
             # gk is expressed in natural-log space, so pre-scale it for exp2 kernels.
             gk = gk * RCP_LN2
 
-    h = k.new_empty(B, NT, H, V, K)
+    h = k.new_empty(B, NT, H, V, K, dtype=_snapshot_dtype)
     if not output_final_state:
         final_state = None
     elif inplace:

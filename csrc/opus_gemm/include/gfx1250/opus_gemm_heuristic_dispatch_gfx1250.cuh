@@ -15,6 +15,106 @@
 // HEURISTIC_DEFAULT_KIDS_GFX1250.
 #pragma once
 
+#include <optional>
+
+#include "aiter_tensor.h"  // aiter_tensor_t (torch-free)
+
+// Shared flat-array dispatch POD types + comparators for gfx1250 (mirrors the
+// gfx950 set). gen_instances.py emits the tune / (M,N,K) lookup tables as
+// arrays of these; std::lower_bound does the O(log N) runtime match.
+namespace opus_gfx1250_detail
+{
+
+// a16w16-family launcher signature for gfx1250: 3 tensors + workspace +
+// std::optional<bias> + int splitK. Different from gfx950 (no workspace).
+using OpusA16W16NoscaleKernel = void (*)(
+    aiter_tensor_t &, aiter_tensor_t &,
+    aiter_tensor_t &, aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
+
+struct OpusA16W16Shape
+{
+    int M;
+    int N;
+    int K;
+};
+
+struct OpusA16W16RuntimeEntry
+{
+    OpusA16W16Shape key;
+    OpusA16W16NoscaleKernel func;
+};
+
+// Comparators are templated on the entry type rather than written once per
+// table: the entry types differ only in what they carry NEXT to the key (a
+// workspace-carrying function pointer, a workspace-free one, ...), and every
+// table is keyed the same way. Explicit template args at the call sites, since
+// std::lower_bound has no target type to deduce them from.
+//
+// Lex order on (M, N, K). Used both during sorting (gen_instances.py emits
+// entries in lex order) and by std::lower_bound at lookup time.
+template <typename Entry>
+constexpr bool shape_entry_less(const Entry& a, const Entry& b) noexcept
+{
+    if (a.key.M != b.key.M) return a.key.M < b.key.M;
+    if (a.key.N != b.key.N) return a.key.N < b.key.N;
+    return a.key.K < b.key.K;
+}
+
+template <typename Entry>
+constexpr bool shape_entry_eq(const Entry& a, const Entry& b) noexcept
+{
+    return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
+}
+
+template <typename Entry>
+constexpr bool kid_entry_less(const Entry& a, const Entry& b) noexcept
+{
+    return a.kid < b.kid;
+}
+
+// id -> kernel<CDataType>, same flat-array layout. Sorted by id (the codegen
+// always emits in ascending id order).
+struct OpusA16W16TuneEntry
+{
+    int kid;
+    OpusA16W16NoscaleKernel func;
+};
+
+using OpusA16W16TuneKernel = OpusA16W16NoscaleKernel;
+
+// ── pre-compiled .co kids (a16w16_4wave_co) ─────────────────────────────────
+// A second function-pointer type, and deliberately so: this family has no
+// split-K, no partial buffer and no reduce kernel, so it has nothing to put in
+// a workspace, and its launcher is the ordinary 5-arg a16w16 signature (the
+// same one gfx950/gfx942 use) rather than the 6-arg gfx1250 one above.
+//
+// The two could be collapsed by making the workspace argument
+// std::optional<aiter_tensor_t> everywhere, but that would ERASE exactly the
+// fact worth keeping: with "needs a workspace" in the type, the production
+// dispatch in opus_gemm.cu can consult the .co table first and skip the
+// hipMalloc / hipDeviceSynchronize / hipFree it has to do for every split-K
+// kid. A merged type cannot tell, from a function pointer alone, whether the
+// buffer is going to be read.
+//
+// A split-K .co variant would use OpusA16W16NoscaleKernel and these types go
+// unused for it; nothing here has to change.
+using OpusA16W16CoKernel = void (*)(
+    aiter_tensor_t &, aiter_tensor_t &,
+    aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
+
+struct OpusA16W16CoTuneEntry
+{
+    int kid;
+    OpusA16W16CoKernel func;
+};
+
+struct OpusA16W16CoRuntimeEntry
+{
+    OpusA16W16Shape key;
+    OpusA16W16CoKernel func;
+};
+}  // namespace opus_gfx1250_detail
+
 // Kid map (B_K=128 chosen here; tuner explores B_K 256/512 + the P/wg space).
 // Tiles whose per-TDM direct-copy request count (rows*B_K*2/256) hits the 256
 // SIMD-pair limit on some operand are NOT generated (e.g. 32x256x128) so the

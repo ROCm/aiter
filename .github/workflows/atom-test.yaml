@@ -27,6 +27,15 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: >-
       github.event_name != 'pull_request' ||
@@ -195,7 +204,7 @@ jobs:
       (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
       contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: [check-signal, load-atom-models]
+    needs: [check-signal, load-atom-models, ci_config]
     name: Accuracy (${{ matrix.display_name }}, ${{ matrix.runner }})
     strategy:
       fail-fast: false
@@ -212,7 +221,10 @@ jobs:
           ref: ${{ env.ATOM_BRANCH }}
 
       - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin || true
 
       - name: Download the ATOM base image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'

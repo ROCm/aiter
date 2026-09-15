@@ -1,9 +1,93 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
-################# Sage V2 quantization kernels ####################
+_mha_v4_per_tensor_amax_repr = make_kernel_repr(
+    "mha_v4_per_tensor_amax_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mha_v4_per_tensor_amax_repr)
+def mha_v4_per_tensor_amax_kernel(
+    input_ptr,
+    partial_ptr,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block = tl.program_id(0)
+    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    values = tl.load(input_ptr + offsets, mask=offsets < numel, other=0.0).to(
+        tl.float32
+    )
+    tl.store(partial_ptr + block, tl.max(tl.abs(values), axis=0))
+
+
+_mha_v4_per_tensor_scale_repr = make_kernel_repr(
+    "mha_v4_per_tensor_scale_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mha_v4_per_tensor_scale_repr)
+def mha_v4_per_tensor_scale_kernel(
+    partial_ptr,
+    scale_ptr,
+    num_partials,
+    dtype_max: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    partial = tl.load(partial_ptr + offsets, mask=offsets < num_partials, other=0.0)
+    maximum = tl.max(partial, axis=0)
+    scale = maximum / dtype_max
+    scale = tl.where(scale > 0.0, scale, 1.0)
+    tl.store(scale_ptr, scale)
+
+
+_mha_v4_per_tensor_quant_repr = make_kernel_repr(
+    "mha_v4_per_tensor_quant_kernel",
+    [
+        "IS_INT8",
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mha_v4_per_tensor_quant_repr)
+def mha_v4_per_tensor_quant_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    numel,
+    IS_INT8: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block = tl.program_id(0)
+    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.load(scale_ptr)
+    if IS_INT8:
+        quantized = values / scale
+        quantized = tl.inline_asm_elementwise(
+            "v_rndne_f32 $0, $1",
+            "=v,v",
+            args=[quantized],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        quantized = tl.maximum(tl.minimum(quantized, 127.0), -128.0)
+    else:
+        quantized = values * (1.0 / scale)
+    tl.store(output_ptr + offsets, quantized, mask=mask)
 
 
 @triton.jit
@@ -123,7 +207,16 @@ def _compute_mx_quant_and_scale_rne(
     return out_tensor, dequant_scale_exponent
 
 
-@triton.jit
+_sage_quant_v_repr = make_kernel_repr(
+    "sage_quant_v_kernel",
+    [
+        "D",
+        "BLK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_repr)
 def sage_quant_v_kernel(
     V_Input,
     V_Output,
@@ -170,7 +263,305 @@ def sage_quant_v_kernel(
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
+_sage_quant_v_amax_partial_repr = make_kernel_repr(
+    "sage_quant_v_amax_partial_kernel",
+    [
+        "D",
+        "BLOCK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_amax_partial_repr)
+def sage_quant_v_amax_partial_kernel(
+    V_Input,
+    Partial_Max,
+    stride_vb,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    SEQLEN_K,
+    K_HEAD,
+    NUM_SEQ_BLKS,
+    D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    seq_blk = pid % NUM_SEQ_BLKS
+    bh = pid // NUM_SEQ_BLKS
+    off_h = bh % K_HEAD
+    off_b = bh // K_HEAD
+    offs_k = seq_blk * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, D)
+    offsets = (
+        off_b * stride_vb
+        + offs_k[:, None] * stride_vs
+        + off_h * stride_vh
+        + offs_d[None, :] * stride_vd
+    )
+    values = tl.load(
+        V_Input + offsets,
+        mask=offs_k[:, None] < SEQLEN_K,
+        other=0.0,
+    ).to(tl.float32)
+    partial = tl.max(tl.abs(values), axis=0)
+    out = (bh * NUM_SEQ_BLKS + seq_blk) * D + offs_d
+    tl.store(Partial_Max + out, partial)
+
+
+_sage_quant_v_amax_finalize_repr = make_kernel_repr(
+    "sage_quant_v_amax_finalize_kernel",
+    [
+        "D",
+        "BLOCK_N",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_amax_finalize_repr)
+def sage_quant_v_amax_finalize_kernel(
+    Partial_Max,
+    V_Scale,
+    NUM_SEQ_BLKS,
+    D: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_d = tl.program_id(0)
+    bh = tl.program_id(1)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offsets = (bh * NUM_SEQ_BLKS + offs_n[:, None]) * D + offs_d[None, :]
+    partial = tl.load(
+        Partial_Max + offsets,
+        mask=(offs_n[:, None] < NUM_SEQ_BLKS) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+    scale = tl.max(partial, axis=0) * (1.0 / FP8_MAX)
+    tl.store(V_Scale + bh * D + offs_d, scale, mask=offs_d < D)
+
+
 @triton.jit
+def _e2m1_code(y):
+    """E2M1 (fp4) nearest encode, ties toward lower magnitude (== numpy argmin
+    first-min): idx = #{grid midpoints strictly below |y|}; sign bit = 8. The grid is
+    {0,.5,1,1.5,2,3,4,6} so the midpoints are {.25,.75,1.25,1.75,2.5,3.5,5.0}."""
+    mag = tl.abs(y)
+    uniform_idx = tl.maximum(tl.ceil(mag * 2.0 - 0.5), 0.0).to(tl.int32)
+    high_idx = 4
+    high_idx += (mag > 2.5).to(tl.int32)
+    high_idx += (mag > 3.5).to(tl.int32)
+    high_idx += (mag > 5.0).to(tl.int32)
+    idx = tl.where(mag <= 2.0, uniform_idx, high_idx)
+    sign = (y < 0.0).to(tl.int32) * 8
+    return idx | sign
+
+
+@triton.jit
+def _mxfp4_scale_from_amax(amax):
+    """Return E8M0 scale bytes and exact reciprocal powers."""
+    safe_amax = tl.maximum(amax, 1e-12)
+    bits = safe_amax.to(tl.uint32, bitcast=True)
+    fp32_exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    scale_e8m0 = fp32_exponent - 2 + (mantissa > 0x400000).to(tl.uint32)
+    scale_e8m0 = tl.minimum(tl.maximum(scale_e8m0, 0), 255)
+    reciprocal_bits = (254 - scale_e8m0) << 23
+    reciprocal = reciprocal_bits.to(tl.float32, bitcast=True)
+    return scale_e8m0.to(tl.uint8), reciprocal
+
+
+@triton.jit
+def _e2m1_pack_native(value_lo, value_hi):
+    lo_bits = value_lo.to(tl.uint32, bitcast=True)
+    hi_bits = value_hi.to(tl.uint32, bitcast=True)
+    lo_sign = lo_bits & 0x80000000
+    hi_sign = hi_bits & 0x80000000
+    lo_mag = lo_bits & 0x7FFFFFFF
+    hi_mag = hi_bits & 0x7FFFFFFF
+    lo_bits = lo_sign | (lo_mag - (lo_mag != 0).to(tl.uint32))
+    hi_bits = hi_sign | (hi_mag - (hi_mag != 0).to(tl.uint32))
+    value_lo = lo_bits.to(tl.float32, bitcast=True)
+    value_hi = hi_bits.to(tl.float32, bitcast=True)
+    return tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[value_lo, value_hi, 1.0],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
+
+
+@triton.jit
+def sage_quant_v_fp4_colmajor_kernel(
+    v_ptr,  # V [b, h_kv, S, D] (any strides -- a permuted view is fine, no copy needed)
+    out_ptr,  # uint8 [b, h_kv, nT*8192] col-major fp4 operand blocks
+    desc_ptr,  # fp32 [b, h_kv, D]  per-channel descale = amax_over_S / 6
+    kperm_ptr,  # int32 [64]  'meas' kv-col permutation (col kk holds token kperm[kk])
+    stride_vb,
+    stride_vh,
+    stride_vs,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_db,
+    stride_dh,
+    h_kv,
+    nT,
+    S,
+):
+    """Pack per-channel fp4 (E2M1) V into the f4f4 kernel's col-major LDS operand layout:
+    per 128-kv tile, 8 blocks of 1024 B (u = 2*n + k; n = head-dim 32-block 0..3, k = kv
+    64-half 0..1); each block is 64 kv-cols x 16 nibble-bytes (even chan -> low nibble, odd
+    chan -> high nibble). One program packs one 1024 B block. Cosine-equivalent to the numpy
+    packer; only exact E2M1 tie-midpoints may differ by one code (arbitrary, cosine-neutral).
+    """
+    pid = tl.program_id(0)
+    u = pid % 8
+    t = (pid // 8) % nT
+    bh = pid // (8 * nT)
+    bb = bh // h_kv
+    hh = bh % h_kv
+    n = u // 2  # head-dim 32-block
+    k = u % 2  # kv 64-half
+
+    kk = tl.arange(0, 64)
+    tok_in_half = tl.load(kperm_ptr + kk)  # [64]
+    token = t * 128 + k * 64 + tok_in_half  # [64] absolute kv token in S
+    jj = tl.arange(0, 16)
+    chan_lo = n * 32 + 2 * jj  # [16] even channels -> low nibble
+    chan_hi = n * 32 + 2 * jj + 1  # [16] odd channels -> high nibble
+
+    vbase = v_ptr + bb * stride_vb + hh * stride_vh
+    dbase = desc_ptr + bb * stride_db + hh * stride_dh
+    row = token[:, None] * stride_vs  # [64,1]
+
+    token_mask = token[:, None] < S
+    v_lo = tl.load(
+        vbase + row + chan_lo[None, :] * stride_vd,
+        mask=token_mask,
+        other=0.0,
+    ).to(tl.float32)
+    v_hi = tl.load(
+        vbase + row + chan_hi[None, :] * stride_vd,
+        mask=token_mask,
+        other=0.0,
+    ).to(tl.float32)
+    d_lo = tl.load(dbase + chan_lo)  # [16]
+    d_hi = tl.load(dbase + chan_hi)
+
+    y_lo = v_lo / d_lo[None, :]
+    y_hi = v_hi / d_hi[None, :]
+
+    code_lo = _e2m1_code(y_lo)
+    code_hi = _e2m1_code(y_hi)
+    byte = (code_lo | (code_hi << 4)).to(tl.uint8)  # [64,16]
+
+    block_bytes: tl.constexpr = 1024
+    obase = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192 + u * block_bytes
+    ooff = kk[:, None] * 16 + jj[None, :]
+    tl.store(obase + ooff, byte)
+
+    slack = tl.arange(0, 64)
+    tl.store(
+        out_ptr + tl.num_programs(0) * block_bytes + slack,
+        0,
+        mask=(pid == 0) & (slack < 64),
+    )
+
+
+@triton.jit
+def sage_quant_v_mxfp4_colmajor_kernel(
+    v_ptr,  # V [b, h_kv, S, D]
+    out_ptr,  # uint8 [b, h_kv, nT*8192] col-major block-normalized fp4
+    scale_ptr,  # uint8 [b, h_kv, nT*512] E8M0 image in kernel gather order
+    kperm_ptr,  # int32 [64] kv-column permutation
+    stride_vb,
+    stride_vh,
+    stride_vs,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_sb,
+    stride_sh,
+    h_kv,
+    nT,
+    S,
+):
+    """Pack true MXFP4 V with per-(channel, 32-token-block) E8M0 scales."""
+    pid = tl.program_id(0)
+    unit = pid % 16
+    tile = (pid // 16) % nT
+    batch_head = pid // (16 * nT)
+    batch = batch_head // h_kv
+    head = batch_head % h_kv
+    channel_block = unit // 4
+    token_quarter = unit % 4
+    token_half = token_quarter // 2
+    token_block = token_quarter % 2
+
+    column = token_block * 32 + tl.arange(0, 32)
+    token_in_half = tl.load(kperm_ptr + column)
+    channel = channel_block * 32 + tl.arange(0, 32)
+    token = tile * 128 + token_half * 64 + token_in_half
+    row = token[:, None] * stride_vs
+    token_mask = token[:, None] < S
+    v_base = v_ptr + batch * stride_vb + head * stride_vh
+    payload_unit = 2 * channel_block + token_half
+    out_base = (
+        out_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + tile * 8192
+        + payload_unit * 1024
+    )
+    scale_base = scale_ptr + batch * stride_sb + head * stride_sh + tile * 512
+
+    values = tl.load(
+        v_base + row + channel[None, :] * stride_vd,
+        mask=token_mask,
+        other=0.0,
+    ).to(tl.float32)
+    encoded, reciprocal = _mxfp4_scale_from_amax(tl.max(tl.abs(values), axis=0))
+    normalized = values * reciprocal[None, :]
+    normalized = tl.reshape(normalized, (32, 16, 2))
+    normalized_lo, normalized_hi = tl.split(normalized)
+    packed = _e2m1_pack_native(normalized_lo, normalized_hi)
+    channel_pair = tl.arange(0, 16)
+    output_offset = column[:, None] * 16 + channel_pair[None, :]
+    tl.store(out_base + output_offset, packed)
+
+    encoded = tl.reshape(encoded, (16, 2))
+    encoded_lo, encoded_hi = tl.split(encoded)
+    scale_half = scale_base + token_half * 256
+    scale_block = scale_half + token_block * 128
+    tl.store(scale_block + 8 * channel_pair + channel_block, encoded_lo)
+    tl.store(scale_block + 8 * channel_pair + 4 + channel_block, encoded_hi)
+
+    slack = tl.arange(0, 64)
+    tl.store(
+        out_ptr + (tl.num_programs(0) // 16) * 8192 + slack,
+        0,
+        mask=(pid == 0) & (slack < 64),
+    )
+
+
+_rotate_quantize_q_repr = make_kernel_repr(
+    "_rotate_quantize_q_kernel",
+    [
+        "q_smoothing",
+        "hadamard_rotation",
+        "BLOCK_M",
+        "BLOCK_R",
+        "D",
+    ],
+)
+
+
+@triton.jit(repr=_rotate_quantize_q_repr)
 def _rotate_quantize_q_kernel(
     Q,
     Q_q,
@@ -294,7 +685,19 @@ def _rotate_quantize_q_kernel(
     )
 
 
-@triton.jit
+_rotate_quantize_k_repr = make_kernel_repr(
+    "_rotate_quantize_k_kernel",
+    [
+        "q_smoothing",
+        "hadamard_rotation",
+        "BLOCK_M",
+        "BLOCK_R",
+        "D",
+    ],
+)
+
+
+@triton.jit(repr=_rotate_quantize_k_repr)
 def _rotate_quantize_k_kernel(
     Q,
     Q_q,
@@ -596,7 +999,17 @@ def _rotate_quantize_qk_kernel(
     )
 
 
-@triton.jit
+_rot_q_repr = make_kernel_repr(
+    "_rot_q_kernel",
+    [
+        "q_smoothing",
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_rot_q_repr)
 def _rot_q_kernel(
     Q,
     Q_rot,
@@ -696,7 +1109,16 @@ def _rot_q_kernel(
     )
 
 
-@triton.jit
+_rot_k_only_repr = make_kernel_repr(
+    "_rot_k_only_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_rot_k_only_repr)
 def _rot_k_only_kernel(
     K,
     K_rot,
@@ -764,7 +1186,15 @@ def _rot_k_only_kernel(
     )
 
 
-@triton.jit
+_compute_delta_s_repr = make_kernel_repr(
+    "_compute_delta_s_kernel",
+    [
+        "BLOCK_N",
+    ],
+)
+
+
+@triton.jit(repr=_compute_delta_s_repr)
 def _compute_delta_s_kernel(
     Q_mean,
     K_rot,
@@ -839,7 +1269,16 @@ def _compute_delta_s_kernel(
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
 
-@triton.jit
+_q_smooth_int8_repr = make_kernel_repr(
+    "_q_smooth_int8_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_q_smooth_int8_repr)
 def _q_smooth_int8_kernel(
     Q,
     Q_out,
@@ -913,10 +1352,19 @@ def _q_smooth_int8_kernel(
     )
 
 
-################# Sage V1 quantization kernels ####################
+_sage_quant_repr = make_kernel_repr(
+    "sage_quant_kernel",
+    [
+        "SEQLEN_K_PADDED",
+        "INT8_MAX",
+        "D",
+        "BLK_Q",
+        "BLK_K",
+    ],
+)
 
 
-@triton.jit
+@triton.jit(repr=_sage_quant_repr)
 def sage_quant_kernel(
     Q_Input,
     Q_Output,

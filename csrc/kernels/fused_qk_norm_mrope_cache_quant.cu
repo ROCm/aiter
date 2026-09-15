@@ -3,6 +3,13 @@
 #include "fused_qk_norm_mrope_cache_quant.h"
 #include "rope/rope_common.h"
 
+// The innermost dim must be dense: the kernel stores whole vectors per head, so a
+// non-unit element stride cannot be expressed by the block/token/head strides below.
+static inline bool has_unit_element_stride(const aiter_tensor_t& t)
+{
+    return t.numel() == 0 || t.stride(t.dim() - 1) == 1;
+}
+
 void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                     aiter_tensor_t& qw,
                                                     aiter_tensor_t& kw,
@@ -35,7 +42,22 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(mrope_section_.size() == 3);
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
-    AITER_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && slot_mapping.is_contiguous());
+    // k_cache/v_cache may be a strided view of a larger KV allocation -- e.g. blocks-first
+    // (num_blocks, 2, block, heads, hs)[:, 0], or a packed (blocks, heads, block, 2*hs) buffer
+    // transposed and split. Both are non-contiguous but well-formed. Every stride the kernel
+    // needs is read off the tensors below, so only slot_mapping must be contiguous here.
+    AITER_CHECK(slot_mapping.is_contiguous());
+    AITER_CHECK(has_unit_element_stride(k_cache) && has_unit_element_stride(v_cache),
+                "k_cache/v_cache must have unit element stride (innermost dim)");
+    // Block/token/head strides taken from the tensors rather than assumed: a transposed or
+    // interleaved view diverges from the contiguous (num_heads*hs, hs) layout on dims 1 and 2,
+    // not just dim 0. Missing dims pass 0, which the kernel treats as "assume contiguous".
+    int64_t k_block_stride_ = k_cache.stride(0);
+    int64_t v_block_stride_ = v_cache.stride(0);
+    int64_t k_token_stride_ = k_cache.dim() >= 2 ? k_cache.stride(1) : 0;
+    int64_t v_token_stride_ = v_cache.dim() >= 2 ? v_cache.stride(1) : 0;
+    int64_t k_head_stride_  = k_cache.dim() >= 3 ? k_cache.stride(2) : 0;
+    int64_t v_head_stride_  = v_cache.dim() >= 3 ? v_cache.stride(2) : 0;
     std::array<int64_t, 3> mrope_section;
     mrope_section[0] = mrope_section_[0];
     mrope_section[1] = mrope_section_[1];
@@ -91,7 +113,13 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     block_size,
                     x,
                     rotary_dim,
-                    gemma_norm);
+                    k_block_stride_,
+                    v_block_stride_,
+                    gemma_norm,
+                    k_token_stride_,
+                    k_head_stride_,
+                    v_token_stride_,
+                    v_head_stride_);
             }
             else
             {
@@ -137,7 +165,13 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             block_size,
                             x,
                             rotary_dim,
-                            gemma_norm);
+                            k_block_stride_,
+                            v_block_stride_,
+                            gemma_norm,
+                            k_token_stride_,
+                            k_head_stride_,
+                            v_token_stride_,
+                            v_head_stride_);
                     }
                     else
                     {
@@ -181,7 +215,13 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             block_size,
                             x,
                             rotary_dim,
-                            gemma_norm);
+                            k_block_stride_,
+                            v_block_stride_,
+                            gemma_norm,
+                            k_token_stride_,
+                            k_head_stride_,
+                            v_token_stride_,
+                            v_head_stride_);
                     }
                 }
                 else

@@ -77,8 +77,9 @@ def flydsl_a16w4_gemm1(
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
 
     ``w_dtype="fp4"`` (default): W1 mxfp4, ``w1_scale_u8`` = shuffled e8m0. ``"int4"``:
-    W1 packed signed int4 (same preshuffle as mxfp4), ``w1_scale_u8`` groupwise bf16 in
-    the ``(E, N_OUT, G//2, 2)`` bf16-pair layout (dword = n*(G//2)+group//2).
+    W1 packed signed int4 (``pack_int8_to_packed_int4(shuffle_weight(w, (16,16)))``),
+    ``w1_scale_u8`` groupwise bf16 in the ``shuffle_scale_for_int4`` ``(E, G//2, N_OUT, 2)``
+    bf16-pair layout (dword = e*(G//2*N_OUT) + (group//2)*N_OUT + n).
     ``"bf16"``: RAW bf16 W1 preshuffled ``shuffle_weight (16,16)``; ``w1_scale_u8`` unused.
 
     ``w_layout="standard"`` (default) consumes the N-major GGUU preshuffle. ``"guinterleave"``
@@ -197,6 +198,7 @@ def flydsl_a16w4_gemm2(
     xcd_swizzle=1,
     w_dtype="fp4",
     persist=None,
+    epilog="atomic",
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
@@ -245,6 +247,8 @@ def flydsl_a16w4_gemm2(
         w_dtype=w_dtype,
         persist=_persist,
         use_k16="gfx95" not in str(get_rocm_arch()),
+        epilog=epilog,
+        topk=topk,
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist

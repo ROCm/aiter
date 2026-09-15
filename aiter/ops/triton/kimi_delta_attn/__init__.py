@@ -8,7 +8,7 @@ Public Triton entry points for the KDA linear-attention mixer used by
 Kimi-Linear / Kimi-K3. The chunked prefill op mirrors ``fla.ops.kda.chunk_kda``.
 """
 
-from .chunk_delta_attn import chunk_kimi_delta_attn
+from aiter.ops.triton.kimi_delta_attn.chunk_delta_attn import chunk_kimi_delta_attn
 
 __all__ = [
     "chunk_kimi_delta_attn",

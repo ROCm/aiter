@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import functools
+
 import pytest
 import torch
 import triton
 
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _get_config as _get_afp4wfp4_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
-    gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
-)
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -79,33 +81,27 @@ def generate_gemm_afp4wfp4_inputs(
     x_scales = x_scales.T
     w_scales = w_scales.T
     if shuffle_scales_fg:
-        if DEVICE_ARCH == "gfx1250":
-            if M >= 32:
-                x_scales_shuffled = shuffle_scale_gemm(
-                    x_scales, arch="gfx1250", preshuffle_factor=16, scale_kwidth=4
-                )
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scale_gemm(
-                w_scales, arch="gfx1250", preshuffle_factor=16, scale_kwidth=4
-            )
+        # Arch-independent aiter.ops.shuffle.shuffle_scale layout (shared with
+        # the CK/asm GEMMs): 32-row stripes of 8 k-groups, returned flat as
+        # (pad256(rows), pad8(K//32)). The kernels index one row per 32-row
+        # stripe, so view it as (pad256(rows)//32, pad8(K//32)*32) -- taken off
+        # the shuffled tensor's own shape, which is padded on both dims.
+        # M < 32 stays un-shuffled (M, K//32) row-major.
+        if M >= 32:
+            xs = shuffle_scale(x_scales[:M])
+            x_scales_shuffled = xs.view(-1, xs.shape[1] * 32)
         else:
-            if M >= 32:
-                x_scales_shuffled = shuffle_scale_gemm(
-                    x_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-                )
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scale_gemm(
-                w_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-            )
+            x_scales_shuffled = x_scales[:M].contiguous()
+        ws = shuffle_scale(w_scales)
+        w_scales_shuffled = ws.view(-1, ws.shape[1] * 32)
     else:
-        x_scales_shuffled = x_scales
+        x_scales_shuffled = x_scales[:M]
         w_scales_shuffled = w_scales
 
     if shuffle_weight_fg:
-        # shuffle_weight returns the (N, K) shuffled weight on both arches; reshape
-        # to the (N//16, K*16) layout the kernel consumes
+        # aiter.ops.shuffle.shuffle_weight (layout=(16, 16)) returns the (N, K)
+        # shuffled weight, byte-identical on both arches; reshape to the
+        # (N//16, K*16) layout the kernel consumes
         w_shuffed = shuffle_weight(w).reshape(w.shape[0] // 16, w.shape[1] * 16)
     else:
         w_shuffed = w
@@ -123,7 +119,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_shuffed,
         x_scales[:M],
         w_scales,
-        x_scales_shuffled[:M],
+        x_scales_shuffled,
         w_scales_shuffled,
         out_dtype,
         y,
@@ -138,6 +134,7 @@ def get_x_vals():
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048, 8192, 4096)]
+    x_vals += [(1, 256, 512), (16, 256, 256), (31, 7168, 4608)]  # M < 32 case
     return x_vals
 
 
@@ -259,7 +256,7 @@ def test_gemm_afp4_wfp4(
         if impl == "triton":
             fn = triton_gemm_afp4wfp4
         elif impl == "gluon":
-            fn = gluon_gemm_afp4wfp4_CDNA4
+            fn = functools.partial(triton_gemm_afp4wfp4, backend="gluon")
         else:
             raise ValueError(f"Unknown implementation: {impl}")
         triton_out = fn(
@@ -274,6 +271,50 @@ def test_gemm_afp4_wfp4(
 
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
+
+    triton.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
+def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
+    dtype = torch.bfloat16
+    (
+        x,
+        w,
+        w_triton,
+        x_scales,
+        w_scales,
+        x_scales_triton,
+        w_scales_triton,
+        _out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        layout="TN",
+        output=True,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+
+    # _get_config doubles K itself, so pass packed bytes as the wrapper does.
+    config, _ = _get_afp4wfp4_config(M, N, K // 2, True, backend="triton")
+    config = dict(config)
+    config["NUM_KSPLIT"] = 4
+
+    triton_out = gemm_afp4wfp4_preshuffle(
+        x,
+        w_triton,
+        x_scales_triton,
+        w_scales_triton,
+        dtype,
+        y,
+        config=config,
+    )
+
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     triton.testing.assert_close(torch_out, triton_out)
 

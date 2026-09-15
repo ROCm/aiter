@@ -8,12 +8,78 @@ from typing import Literal
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
+    _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
+)
 from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel,
+)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
+    """Tuned config for ``(M, N)`` on ``backend``, or the untuned default.
+
+    Both backends read ``configs/{arch}/{backend}/fusions/fused_clamp_act_mul/``.
+
+    gluon takes the N-specialized ``FUSED_CLAMP_ACT_MUL-N={N}.json`` and falls
+    back to ``DEFAULT.json``; within the specialized file the largest
+    ``M_LEQ_<x> <= M`` wins, so an M below the smallest tuned point falls
+    through to the default. A null ``BLOCK_SIZE_N`` means "keep the caller's
+    width" (the whole row unless overridden).
+
+    triton takes ``DEFAULT.json`` for the running arch, falling back to the
+    gfx950 copy where that arch has none, and picks the smallest
+    ``N_LEQ_<x> >= block_size_n``, else ``any``. M and N are unused there --
+    the triton kernel only tunes on the row width.
+
+    Returns:
+        The config dict for this shape.
+    """
+    arch = get_arch()
+    base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/fusions/fused_clamp_act_mul"
+
+    if backend == "triton":
+        raw = load_config_json(f"{base}/DEFAULT.json", required=False)
+        if raw is None:
+            raw = load_config_json(
+                f"{AITER_TRITON_CONFIGS_PATH}/gfx950/{backend}/fusions/"
+                f"fused_clamp_act_mul/DEFAULT.json",
+                required=True,
+            )
+        for bound in sorted(
+            int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")
+        ):
+            if block_size_n <= bound:
+                return dict(raw[f"N_LEQ_{bound}"])
+        return dict(raw["any"])
+
+    config = None
+    specialized = load_config_json(
+        f"{base}/FUSED_CLAMP_ACT_MUL-N={N}.json", required=False
+    )
+    if specialized is not None:
+        for bound in sorted(
+            int(k[len("M_LEQ_") :]) for k in specialized if k.startswith("M_LEQ_")
+        ):
+            if M >= bound:
+                config = dict(specialized[f"M_LEQ_{bound}"])
+            else:
+                break
+
+    if config is None:
+        config = dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
+
+    if config["BLOCK_SIZE_N"] is None:
+        config["BLOCK_SIZE_N"] = block_size_n
+    return config
 
 
 def fused_clamp_act_mul(
@@ -28,28 +94,45 @@ def fused_clamp_act_mul(
     quant_block_size: int = 128,
     scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
     shuffle_scale: bool = False,
+    backend: str | None = None,
 ):
     """
-    Fused clamp (SwiGLU-style) + act(gate) * up + optional weights, with optional FP8 group quant.
+    Fusion of chunk + activation + multiply + quantize,
+    optional FP8 quant/shuffle.
+
+    Splits inp into two halves, gate and up, then computes:
+
+        out = act(clamp(gate)) * clamp(up) * weights
+
+    (clamp and weights if applicable)
 
     Args:
-        inp: ``[M, D]`` with ``D = 2 * N``, contiguous; first ``N`` columns are gate,
-            second ``N`` are up (same as ``chunk(2, dim=-1)`` on gate-up GEMM output).
-        out: pre-allocated ``[M, N]`` output tensor. If ``None``, allocated internally
-            with dtype = ``dtype_quant`` when quantizing, else ``inp.dtype``.
-        scale: pre-allocated ``[M, (N + 127) // 128]`` float32 block scales. Only used
-            and returned when ``dtype_quant`` is not ``None``.
-        swiglu_limit: if ``> 0``, apply reference clamps; if ``<= 0``, skip clamping.
-        weights: optional ``[M, 1]`` (broadcast) or ``[M, N]`` row weights, multiplied
-            into ``silu(gate) * up`` (same as reference ``weights * x``).
-        dtype_quant: if ``None``, no quantization; output is written in ``inp.dtype``
-            (or the dtype of a pre-allocated ``out``) and ``scale`` is unused. Otherwise
-            the result is FP8-group-quantized with ``dtype_quant`` and per-128 scales.
+        inp: input, shape [M, 2N], contiguous. Splits to [M,N] for both gate/up
+        out: output buffer, shape [M, N]
+        scale: buffer for quant scales
+        swiglu_limit: clamp threshold, to skip set <= 0
+        activation: which activation to apply to gate, silu/gelu/gelu_tanh
+        weights: [M, 1] (broadcast over N) or [M, N] or None
+        dtype_quant: dtype to quantize output to, None => output keeps input dtype.
+        transpose_scale: store scales as [N_blocks, M] instead of [M, N_blocks]
+        quant_block_size: how many columns share one scale, default 128.
+            N_blocks = ceil(N / quant_block_size).
+        scale_dtype_fmt: scale format, options "fp32" or "ue8m0"
+            (ue8m0 requires quant_block_size=32 and FP8 E4M3 dtype_quant)
+        shuffle_scale: write scales in the preshuffled layout, padded to
+            [ceil(M/256)*256, ceil(N_blocks/8)*8].
+            Requires scale_dtype_fmt="ue8m0"
+        backend: specify "triton" or "gluon".
+            None picks "gluon" on supported architectures, otherwise "triton"
+
+    Returns:
+        out if no quant, otherwise (out, scale).
 
     Constraints:
-        ``N`` must be a power of two, ``N >= 128``, and ``N % 128 == 0`` so each row
-        uses one ``_fp8_quant_op`` tile (``BLOCK_SIZE_M=1``, ``BLOCK_SIZE_N=N``).
+        N must be a power of two, at least 128, and a multiple of 128.
     """
+
+    # setup inputs
     assert inp.dim() == 2
     M, D = inp.shape
     assert D % 2 == 0
@@ -57,6 +140,7 @@ def fused_clamp_act_mul(
 
     HAS_QUANT = dtype_quant is not None
 
+    # validate scale format, pick storage dtype
     assert scale_dtype_fmt in ("fp32", "ue8m0")
     if scale_dtype_fmt == "ue8m0":
         assert HAS_QUANT, "scale_dtype_fmt='ue8m0' requires dtype_quant"
@@ -78,6 +162,7 @@ def fused_clamp_act_mul(
         _scale_storage_dtype = torch.float32
 
     if HAS_QUANT:
+        # handle quant out
         if out is None:
             out = torch.empty((M, n_half), dtype=dtype_quant, device=inp.device)
         else:
@@ -88,9 +173,13 @@ def fused_clamp_act_mul(
                     dtype_quant,
                     out.dtype,
                 )
+
+        # one scale per group of quant_block_size columns, split N blocks
         num_blocks = (n_half + quant_block_size - 1) // quant_block_size
+
+        # determine scale shape
         if shuffle_scale:
-            # Scales are preshuffled inside the kernel (see e8m0_shuffle /
+            # Scales are preshuffled inside the kernel (see e8m0_shuffle/
             # aiter.ops.shuffle.shuffle_scale): rows padded to a multiple of 256
             # and block-cols to a multiple of 8, written in the tiled layout.
             scale_m_pad = (M + 255) // 256 * 256
@@ -126,8 +215,10 @@ def fused_clamp_act_mul(
     assert n_half >= 128
     assert n_half % 128 == 0
 
+    # default block width is the whole row, can change at config
     BLOCK_SIZE_N = triton.next_power_of_2(n_half)
 
+    # handle weight constants
     HAVE_WEIGHTS = weights is not None
     if HAVE_WEIGHTS:
         assert weights.is_cuda and weights.is_contiguous()
@@ -140,6 +231,7 @@ def fused_clamp_act_mul(
     else:
         WEIGHT_BROADCAST = False
 
+    # saturation bound for the quantized output
     if HAS_QUANT:
         DTYPE_MAX = (
             torch.finfo(out.dtype).max
@@ -149,20 +241,14 @@ def fused_clamp_act_mul(
     else:
         DTYPE_MAX = 0.0
 
-    if BLOCK_SIZE_N <= 512:
-        num_warps = 1
-    elif BLOCK_SIZE_N <= 2048:
-        num_warps = 4
-    else:
-        num_warps = 8
-
     HAVE_SWIGLU_CLAMP = swiglu_limit > 0
 
+    # determine scale strides
     scale_n_pad = 0
     if HAS_QUANT:
+        # Kernel writes directly into the (scale_m_pad, scale_n_pad) buffer
+        # using the shuffled offset, so the plain row/col strides are unused.
         if shuffle_scale:
-            # Kernel writes directly into the (scale_m_pad, scale_n_pad) buffer
-            # using the shuffled offset, so the plain row/col strides are unused.
             scale_row_stride = scale.stride(0)
             scale_col_stride = scale.stride(1)
             num_bs_cols = scale.shape[1]
@@ -179,38 +265,118 @@ def fused_clamp_act_mul(
     else:
         scale_row_stride = 0
         scale_col_stride = 0
-        scale_arg = inp  # placeholder, unused when HAS_QUANT is False
+        scale_arg = inp
 
-    _fused_clamp_silu_mul_kernel[(M,)](
-        inp,
-        out,
-        scale_arg,
-        weights if HAVE_WEIGHTS else inp,
-        M,
-        n_half,
-        inp.stride(0),
-        inp.stride(1),
-        out.stride(0),
-        out.stride(1),
-        scale_row_stride,
-        scale_col_stride,
-        weights.stride(0) if HAVE_WEIGHTS else 0,
-        weights.stride(1) if HAVE_WEIGHTS else 0,
-        swiglu_limit,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=quant_block_size,
-        SCALE_FMT=scale_dtype_fmt,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        HAVE_WEIGHTS=HAVE_WEIGHTS,
-        WEIGHT_BROADCAST=WEIGHT_BROADCAST,
-        HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
-        HAS_QUANT=HAS_QUANT,
-        ACTIVATION=activation,
-        SHUFFLE=shuffle_scale,
-        SCALE_N_PAD=scale_n_pad,
-        num_warps=num_warps,
-    )
+    # choose backend
+    if backend is None:
+        backend = "gluon" if get_arch() in ("gfx1250",) else "triton"
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon":
+        # Config if applicable, otherwise defaults
+        config = _get_config(M, n_half, BLOCK_SIZE_N, "gluon")
+        ROWS_PER_PROG = config["ROWS_PER_PROG"]
+        BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
+        num_warps = config["num_warps"]
+        waves_per_eu = config["waves_per_eu"]
+
+        # ensure quant block can be safely applied to N tile
+        assert BLOCK_SIZE_N % quant_block_size == 0, (
+            f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a multiple of "
+            f"quant_block_size ({quant_block_size})"
+        )
+
+        # gluon -> power of 2 necessary
+        assert (
+            BLOCK_SIZE_M & (BLOCK_SIZE_M - 1) == 0
+        ), f"BLOCK_SIZE_M ({BLOCK_SIZE_M}) must be a power of two"
+        assert (
+            BLOCK_SIZE_N & (BLOCK_SIZE_N - 1) == 0
+        ), f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a power of two"
+
+        assert get_arch() in (
+            "gfx1250",
+        ), f"Gluon backend requires gfx1250, got '{get_arch()}'"
+
+        # (M chunks * rows to process, N tiles)
+        _fused_clamp_silu_mul_gluon_kernel[
+            (
+                triton.cdiv(M, ROWS_PER_PROG * BLOCK_SIZE_M),
+                triton.cdiv(n_half, BLOCK_SIZE_N),
+            )
+        ](
+            inp,
+            out,
+            scale_arg,
+            weights if HAVE_WEIGHTS else inp,
+            M,
+            n_half,
+            inp.stride(0),
+            inp.stride(1),
+            out.stride(0),
+            out.stride(1),
+            scale_row_stride,
+            scale_col_stride,
+            weights.stride(0) if HAVE_WEIGHTS else 0,
+            weights.stride(1) if HAVE_WEIGHTS else 0,
+            swiglu_limit,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=quant_block_size,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            SCALE_FMT=scale_dtype_fmt,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            HAVE_WEIGHTS=HAVE_WEIGHTS,
+            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
+            HAS_QUANT=HAS_QUANT,
+            ACTIVATION=activation,
+            SHUFFLE=shuffle_scale,
+            SCALE_N_PAD=scale_n_pad,
+            num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
+            ROWS_PER_PROG=ROWS_PER_PROG,
+            cache_modifier=".cg",
+        )
+    else:
+        # only for triton
+        num_warps = _get_config(M, n_half, BLOCK_SIZE_N, "triton")["num_warps"]
+
+        _fused_clamp_silu_mul_kernel[(M,)](
+            inp,
+            out,
+            scale_arg,
+            weights if HAVE_WEIGHTS else inp,
+            M,
+            n_half,
+            inp.stride(0),
+            inp.stride(1),
+            out.stride(0),
+            out.stride(1),
+            scale_row_stride,
+            scale_col_stride,
+            weights.stride(0) if HAVE_WEIGHTS else 0,
+            weights.stride(1) if HAVE_WEIGHTS else 0,
+            swiglu_limit,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=quant_block_size,
+            SCALE_FMT=scale_dtype_fmt,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            HAVE_WEIGHTS=HAVE_WEIGHTS,
+            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
+            HAS_QUANT=HAS_QUANT,
+            ACTIVATION=activation,
+            SHUFFLE=shuffle_scale,
+            SCALE_N_PAD=scale_n_pad,
+            num_warps=num_warps,
+        )
 
     if HAS_QUANT:
         if transpose_scale:

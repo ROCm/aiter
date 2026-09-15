@@ -72,14 +72,33 @@ def flops_conv(N, C, K_out, R, S, P, Q):
     return 2.0 * N * P * Q * K_out * C * R * S
 
 
-def which_kernel(x, w_oihw, stride=(1, 1), dilation=(1, 1), layout="nchw"):
+def which_kernel(
+    x,
+    w_oihw,
+    stride=(1, 1),
+    dilation=(1, 1),
+    layout="nchw",
+    padding=(0, 0),
+):
     """Name of the Triton kernel ``conv2d`` would route to for these shapes,
     without launching anything. Delegates to the production ``_resolve_route``
     (the same decision the router uses), so the label can never drift from
     dispatch. Bench-only: used to label rows and pick correctness tolerances."""
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
-    route = _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout.lower())
+    route = _resolve_route(
+        R,
+        S,
+        stride,
+        dilation,
+        N,
+        C,
+        H,
+        W_in,
+        K_out,
+        layout.lower(),
+        padding=padding,
+    )
     return route.value
 
 
@@ -368,7 +387,14 @@ def bench_one_shape(
     y_tri = run_triton()
     torch.cuda.synchronize()
     if method in ("auto", "default") or layout == "nhwc":
-        kernel_name = which_kernel(x_in, w, stride, dilation, layout=layout)
+        kernel_name = which_kernel(
+            x_in,
+            w,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            layout=layout,
+        )
     else:
         kernel_name = method
     is_winograd = "winograd" in kernel_name.lower() or "wino" in kernel_name.lower()

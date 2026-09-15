@@ -57,6 +57,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         num_local_experts: int,
         num_experts_per_token: int,
         gpu_per_node: int,
+        quant_type: str = "none",
     ):
         import mori  # type: ignore[import-not-found]
 
@@ -89,6 +90,9 @@ class MoriAll2AllManager(All2AllManagerBase):
             "kernel_type": kernel_type,
             "rdma_block_num": rdma_block_num,
             "gpu_per_node": gpu_per_node,
+            # Combine-side codec. MoRI defaults this to "none" (bf16 on the wire);
+            # "fp8_blockwise" picks the EpCombineIntraNodeKernel_*_fp8bwq_* kernels.
+            "quant_type": quant_type,
         }
 
     def _make_handle(self, **kwargs):

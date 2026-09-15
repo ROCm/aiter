@@ -19,19 +19,21 @@ def gemm_tune_check(
 
     example 1: FP4 GEMM preshuffled weight scales for shape (16, 1280, 8192)
         from aiter.ops.triton.utils._triton.gemm_tune_check import gemm_tune_check
-        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
         is_tunned = gemm_tune_check(gemm_afp4wfp4_preshuffle, N=1280, K=8192//2, M=16, shuffle=True)
         print(is_tunned) # return True or False
 
     example 2: FP8 GEMM blockscale for shape (16, 1280, 8192)
         from aiter.ops.triton.utils._triton.gemm_tune_check import gemm_tune_check
-        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
         is_tunned = gemm_tune_check(gemm_a8w8_blockscale, N=1024, K=8192, M=16)
         print(is_tunned) # return True or False
     """
 
+    # Public wrappers live at aiter.ops.triton.<group>.<file>; their kernel
+    # modules mirror that path under aiter.ops.triton._triton_kernels.
     module_pth = func.__module__.split(".")
-    module_pth = module_pth[:-1] + ["_triton_kernels"] + module_pth[-1:]
+    module_pth = module_pth[:3] + ["_triton_kernels"] + module_pth[3:]
     module_pth = ".".join(module_pth)
     module = importlib.import_module(module_pth)
     _LOGGER.info(f"Function {func} found at {module}")

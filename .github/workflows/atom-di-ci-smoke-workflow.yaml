@@ -26,9 +26,9 @@ on:
         type: string
         default: "/data/models2/GLM-5.2-FP8"
       run_glm_5_2_fp8:
-        description: "Run GLM-5.2-FP8 1P1D TP-only case (needs an image with the aiter MLA-metadata JIT op; crashes otherwise)"
+        description: "Run GLM-5.2-FP8 1P1D TP-only case"
         required: false
-        default: false
+        default: true
         type: boolean
       log_root:
         description: "Root directory for ATOMesh logs"
@@ -41,7 +41,7 @@ on:
         type: string
         default: "/data/xinhuang/atomesh-ci"
       spur_nodelist:
-        description: "Optional comma-separated Spur nodes; empty lets Spur allocate"
+        description: "Comma-separated Spur node pool; Slurm chooses the required nodes"
         required: false
         type: string
         default: ""
@@ -70,7 +70,7 @@ env:
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
   ATOMESH_LOG_ROOT_DEFAULT: /data/xinhuang/spur_dsv4_logs
   ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/atomesh-ci
-  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  ATOMESH_NODE_POOL_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
   ISL_LIST_DEFAULT: "1024"
   OSL_DEFAULT: "1024"
   CONC_LIST_DEFAULT: "16"
@@ -90,6 +90,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       cell_id: ${{ steps.cell.outputs.cell_id }}
+      node_pool: ${{ steps.cell.outputs.node_pool }}
     steps:
       - name: Apply ATOM DI smoke inputs
         run: |
@@ -117,13 +118,9 @@ jobs:
                   return raw
               return str(raw).lower() == "true"
 
-          # GLM-5.2-FP8 disabled by default: the aiter build baked into
-          # rocm/atom-dev:latest crashes at init with
-          # "NameError: name 'module_mla_metadata' is not defined"
-          # (aiter/jit/core.py check_args, MLA-metadata JIT op) on the
-          # glm_moe_dsa MLA path -- independent of ATOM_REF (main crashes too).
-          # Re-enable once the image ships an aiter with that JIT op registered.
-          run_glm = bool_input("run_glm_5_2_fp8", False)
+          # Include GLM in scheduled runs; workflow_dispatch can disable it for
+          # targeted DeepSeek-only debugging.
+          run_glm = bool_input("run_glm_5_2_fp8", True)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
@@ -141,9 +138,10 @@ jobs:
               "ATOMESH_SHARED_WORKSPACE_ROOT="
               + value("shared_workspace_root", "ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT")
           )
-          node_list = value("spur_nodelist", "ATOMESH_2P1D_NODES_DEFAULT")
-          nodes = [node.strip() for node in node_list.split(",") if node.strip()]
-          print(f"ATOMESH_2P1D_NODES={node_list}")
+          node_pool = value("spur_nodelist", "ATOMESH_NODE_POOL_DEFAULT")
+          nodes = [node.strip() for node in node_pool.split(",") if node.strip()]
+          print(f"SPUR_NODE_POOL={node_pool}")
+          print(f"ATOMESH_2P1D_NODES={node_pool}")
           print(f"ATOMESH_1P1D_NODES={','.join(nodes[:2])}")
           print("ISL_LIST=" + os.environ["ISL_LIST_DEFAULT"])
           print("OSL=" + os.environ["OSL_DEFAULT"])
@@ -214,8 +212,97 @@ jobs:
               if nodes_line not in text:
                   raise SystemExit("Failed to find Spur submit SBATCH nodes directive")
               text = text.replace(nodes_line, nodes_line + ntasks_line, 1)
-              submit_path.write_text(text, encoding="utf-8")
+
+          special_nodelist_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r'''    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"''',
+                  r"  fi",
+                  "",
+              ]
+          )
+          special_pool_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r'''    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"''',
+                  r'  elif [[ -n "${SPUR_NODE_EXCLUDE:-}" ]]; then',
+                  r'''    printf '#SBATCH --exclude=%s\n' "${SPUR_NODE_EXCLUDE}" >> "${SUBMIT_SCRIPT}"''',
+                  r"  fi",
+                  "",
+              ]
+          )
+          standard_nodelist_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r'    SBATCH_CMD+=(--nodelist "${NODE_LIST}")',
+                  r"  fi",
+                  "",
+              ]
+          )
+          standard_pool_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r'    SBATCH_CMD+=(--nodelist "${NODE_LIST}")',
+                  r'  elif [[ -n "${SPUR_NODE_EXCLUDE:-}" ]]; then',
+                  r'    SBATCH_CMD+=(--exclude "${SPUR_NODE_EXCLUDE}")',
+                  r"  fi",
+                  "",
+              ]
+          )
+          patched_pool = 0
+          for old_block, new_block in (
+              (special_nodelist_block, special_pool_block),
+              (standard_nodelist_block, standard_pool_block),
+          ):
+              if new_block in text:
+                  patched_pool += 1
+              elif old_block in text:
+                  text = text.replace(old_block, new_block, 1)
+                  patched_pool += 1
+          if patched_pool != 2:
+              raise SystemExit(
+                  f"Expected two Slurm nodelist submit blocks, found {patched_pool}"
+              )
+
+          submit_path.write_text(text, encoding="utf-8")
           print(f"{submit_path}: patched explicit Spur Slurm task count")
+          print(f"{submit_path}: patched dynamic Spur node-pool exclusion")
+
+          helper_path = Path(".github/scripts/atomesh/slurm_submit_helpers.sh")
+          text = helper_path.read_text(encoding="utf-8")
+          old_sacct = (
+              'sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader '
+              '2>/dev/null | awk -v job_id="${job_id}" '
+              "'$1 == job_id { print $2 \"|\" $3; exit }' || true"
+          )
+          new_sacct = (
+              'sacct --controller "${SPUR_CONTROLLER_ADDR}" -j "${job_id}" '
+              '-n -o JobID,State,ExitCode 2>/dev/null | '
+              'awk -v job_id="${job_id}" '
+              "'$1 == job_id { print $2 \"|\" $3; exit }' || true"
+          )
+          if new_sacct not in text:
+              if old_sacct not in text:
+                  raise SystemExit("Failed to find Spur sacct exit-code query")
+              text = text.replace(old_sacct, new_sacct, 1)
+          helper_path.write_text(text, encoding="utf-8")
+          print(f"{helper_path}: patched Spur sacct exit-code query")
+
+          # ATOM streams every rank's container and role logs to stderr while
+          # also uploading the same files as artifacts. A single cell can exceed
+          # the GitHub Actions per-job log limit and block the runner's final
+          # Slurm status handling. Keep the lightweight Slurm monitor output;
+          # the complete server logs remain available in the result artifact.
+          text = submit_path.read_text(encoding="utf-8")
+          old_streamer = "  SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once"
+          new_streamer = "  unset SLURM_EXTRA_LOG_STREAMER"
+          if new_streamer not in text:
+              if text.count(old_streamer) != 1:
+                  raise SystemExit("Failed to find unique Spur shared-log streamer")
+              text = text.replace(old_streamer, new_streamer, 1)
+          submit_path.write_text(text, encoding="utf-8")
+          print(f"{submit_path}: disabled duplicate full-rank live-log streaming")
+
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
           if "  GLM-5.2-FP8:" not in text:
@@ -341,9 +428,9 @@ jobs:
                   }
               )
 
-          node_list = [
+          node_pool = [
               node.strip()
-              for node in os.environ.get("ATOMESH_2P1D_NODES", "").split(",")
+              for node in os.environ.get("SPUR_NODE_POOL", "").split(",")
               if node.strip()
           ]
           isl = parse_int_list(os.environ["ISL_LIST"])
@@ -386,12 +473,14 @@ jobs:
                       )
 
               required_nodes = int(cell["num_nodes"])
-              if node_list:
-                  if len(node_list) < required_nodes:
-                      raise SystemExit(
-                          f"Need {required_nodes} nodes, got {len(node_list)}: {node_list}"
-                      )
-                  cell["nodes"] = node_list[:required_nodes]
+              if len(node_pool) < required_nodes:
+                  raise SystemExit(
+                      f"Need {required_nodes} pool nodes, got "
+                      f"{len(node_pool)}: {node_pool}"
+                  )
+              # Leave NODE_LIST empty so Slurm can choose any currently
+              # available nodes from the allowed pool.
+              cell["nodes"] = []
 
               cell_env = cell.setdefault("env", {})
               for scope in ("common", "prefill", "decode"):
@@ -427,6 +516,7 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write("cell_id=" + ",".join(cell["id"] for cell in all_cells) + "\n")
+              out.write("node_pool=" + ",".join(node_pool) + "\n")
           PY
       - name: Package patched ATOM source
         run: tar -C ATOM -czf atom-source.tar.gz .
@@ -448,6 +538,7 @@ jobs:
     timeout-minutes: 420
     env:
       ATOMESH_SHARED_WORKSPACE_ROOT: /data/xinhuang/atomesh-ci
+      SPUR_NODE_POOL: ${{ needs.load-config.outputs.node_pool }}
     steps:
       - name: Show runner and Spur-compatible Slurm state
         run: |
@@ -461,6 +552,44 @@ jobs:
           squeue --help | head -80 || true
           command -v scancel
           command -v spur && spur --help | head -120 || true
+
+      - name: Restrict Slurm scheduling to Spur node pool
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a raw_pool_nodes <<< "${SPUR_NODE_POOL}"
+          declare -A allowed=()
+          pool_nodes=()
+          for raw_node in "${raw_pool_nodes[@]}"; do
+            node="${raw_node//[[:space:]]/}"
+            if [[ -n "${node}" ]]; then
+              allowed["${node}"]=1
+              pool_nodes+=("${node}")
+            fi
+          done
+          if (( ${#pool_nodes[@]} == 0 )); then
+            echo "Spur node pool is empty" >&2
+            exit 1
+          fi
+
+          mapfile -t cluster_nodes < <(sinfo -N -h -o '%N' | sort -Vu)
+          declare -A present=()
+          excluded_nodes=()
+          for node in "${cluster_nodes[@]}"; do
+            present["${node}"]=1
+            if [[ -z "${allowed[${node}]+x}" ]]; then
+              excluded_nodes+=("${node}")
+            fi
+          done
+          for node in "${pool_nodes[@]}"; do
+            if [[ -z "${present[${node}]+x}" ]]; then
+              echo "Configured Spur node is not present in sinfo: ${node}" >&2
+              exit 1
+            fi
+          done
+
+          exclude="$(IFS=,; echo "${excluded_nodes[*]}")"
+          echo "SPUR_NODE_EXCLUDE=${exclude}" >> "${GITHUB_ENV}"
+          echo "Slurm will choose from SPUR_NODE_POOL=${SPUR_NODE_POOL}"
 
       - name: Clean stale ATOMesh config from prior runs
         run: |
@@ -529,29 +658,6 @@ jobs:
 
             cd "${shared_workspace}"
             chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
-            # Spur sacct compatibility: ATOM pd_submit.sh reads the Slurm exit
-            # code with flags Spur's sacct rejects (--accounting on the primary
-            # branch, -X/-P on the fallback) and without --controller, so the
-            # query returns empty and the job RC defaults to 1 -- marking runs
-            # that actually succeeded (gsm8k + benchmark) as failed. The "Patch
-            # ATOMesh smoke config" step rewrites the runner label so the FIRST
-            # (--accounting) branch is the one that runs here. Rewrite both
-            # branches to a Spur-compatible query: --controller + -j/-n/-o,
-            # awk-filtered by JobID to State|ExitCode.
-            patched=0
-            if grep -q -- '--accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader' .github/scripts/atomesh/pd_submit.sh; then
-              sed -i "s@sacct --accounting \"\${SPUR_ACCOUNTING_ADDR}\" --brief --noheader@sacct --controller \"\${SPUR_CONTROLLER_ADDR}\" -j \"\${job_id}\" -n -o JobID,State,ExitCode@" .github/scripts/atomesh/pd_submit.sh
-              patched=1
-            fi
-            if grep -q -- '-X -n -P -o State,ExitCode' .github/scripts/atomesh/pd_submit.sh; then
-              sed -i "/-X -n -P -o State,ExitCode/c\\sacct_line=\"\$(sacct --controller \"\${SPUR_CONTROLLER_ADDR}\" -j \"\${job_id}\" -n -o JobID,State,ExitCode 2>/dev/null | awk -v job_id=\"\${job_id}\" '\$1==job_id { print \$2 \"|\" \$3; exit }' || true)\"" .github/scripts/atomesh/pd_submit.sh
-              patched=1
-            fi
-            if [ "$patched" = 1 ]; then
-              echo "[patch] pd_submit.sh sacct exit-code read made Spur-compatible"
-            else
-              echo "[patch] WARNING: no sacct anchor found in pd_submit.sh (ATOM_REF changed?); exit-code may be misread" >&2
-            fi
             cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
             rm -rf "${result_dir}/${cell_id}" \
                    "${result_dir}/${cell_id}-summary.md" \

@@ -34,11 +34,12 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 
 from __future__ import annotations
 
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith
+import flydsl.expr as fx
+from flydsl.expr import arith, rocdl
 from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
@@ -115,6 +116,7 @@ def emit_mx_e8m0_scale(
     """
     # Normalise int / pybind enum into a plain int -- pybind11 enum classes
     # don't auto-compare equal to ``int`` (unlike ``IntEnum``).
+    local_max = _raw(local_max)
     mode_int = int(mode)
     dtype_int = int(dtype)
     if dtype_int not in _DTYPE_CFG:
@@ -135,7 +137,7 @@ def emit_mx_e8m0_scale(
         # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological
         # inputs (denormals, fp32 inf, mantissa bump from 0xFF -> 0x100) can
         # otherwise corrupt the stored uint8.
-        return arith.minsi(arith.maxsi(x, c0_i32), c0xFF_i32)
+        return fx.min(fx.max(fx.Int32(x), fx.Int32(0)), fx.Int32(0xFF)).ir_value()
 
     if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
@@ -265,11 +267,20 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     c23 = arith.constant(23, type=T.i32)
     c_wave = arith.constant(wave_size, type=T.i32)
 
-    block_amax = arith.constant(0.0, type=T.f32)
-    for v in all_vals:
-        abs_v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
-        block_amax = arith.maxnumf(block_amax, abs_v)
-    block_amax = arith.minnumf(block_amax, c_flt_max)
+    # Pairwise tree, not a linear accumulate: a chain of N maxes is N deep and
+    # every step stalls on the last (one s_delay_alu each). The tree is log2(N)
+    # deep with N/2 independent maxes per level for the scheduler to interleave.
+    level = [arith.constant(0.0, type=T.f32)] + [
+        abs(fx.Float32(v)).ir_value() for v in all_vals
+    ]
+    while len(level) > 1:
+        nxt = [
+            arith.maxnumf(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)
+        ]
+        if len(level) % 2:
+            nxt.append(level[-1])
+        level = nxt
+    block_amax = arith.minnumf(level[0], c_flt_max)
     peer = block_amax.shuffle_xor(c16, c_wave)
     block_amax = arith.maxnumf(block_amax, peer)
 
@@ -277,11 +288,6 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     scale_f32 = (e8m0 << c23).bitcast(T.f32)
     e8m0_byte = arith.trunci(T.i8, e8m0)
     return scale_f32, e8m0_byte
-
-
-def _raw(value):
-    """Unwrap a DSL Numeric to a raw ir.Value (rocdl/inline_asm need raw operands)."""
-    return value.ir_value() if hasattr(value, "ir_value") else value
 
 
 def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
@@ -295,5 +301,14 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
     return rocdl.cvt_scalef32_pk8_fp8_f32(
         v2i32_ty,
         _raw(src_v8f32),
+        _raw(scale_f32),
+    )
+
+
+def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
+    """Native gfx1250 scaled conversion of eight bf16 values to packed FP4."""
+    return rocdl.cvt_scalef32_pk8_fp4_bf16(
+        i32_ty,
+        _raw(src_v8bf16),
         _raw(scale_f32),
     )

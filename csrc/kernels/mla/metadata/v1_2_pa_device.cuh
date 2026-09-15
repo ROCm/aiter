@@ -407,9 +407,9 @@ void dispatch_pa_metadata_v1_2_device(const PaMetadataV1KernelParameter& params,
     }
 }
 
-void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                                 const torch::Tensor& pages_kv_indptr,   // [batch size + 1]
-                                 const torch::Tensor& context_lens,      // [batch size]
+void get_pa_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
+                                 const aiter_tensor_t& pages_kv_indptr,   // [batch size + 1]
+                                 const aiter_tensor_t& context_lens,      // [batch size]
                                  const int32_t num_heads_per_head_k,
                                  const int32_t num_heads_k,
                                  const bool is_causal,
@@ -419,16 +419,16 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
                                  const int32_t ori_uni_seqlen_qo,
                                  const int32_t topk,
                                  const int32_t max_split_per_batch,
-                                 torch::Tensor& work_metadata_ptrs,
-                                 torch::Tensor& work_info_set,
-                                 torch::Tensor& work_indptr,
-                                 torch::Tensor& reduce_indptr,
-                                 torch::Tensor& reduce_final_map,
-                                 torch::Tensor& reduce_partial_map)
+                                 aiter_tensor_t& work_metadata_ptrs,
+                                 aiter_tensor_t& work_info_set,
+                                 aiter_tensor_t& work_indptr,
+                                 aiter_tensor_t& reduce_indptr,
+                                 aiter_tensor_t& reduce_final_map,
+                                 aiter_tensor_t& reduce_partial_map)
 {
     constexpr int32_t kPackedQoLenPerWg = 128;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -445,20 +445,20 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     int32_t num_splits =
         max_split_per_batch < 0 ? num_cu : min(num_cu, max_split_per_batch * num_batches);
 
-    TORCH_CHECK(num_splits % num_heads_k == 0,
+    AITER_CHECK(num_splits % num_heads_k == 0,
                 __func__,
                 ": only supports #num_splits evenly divisible by #kv_heads.");
 
     PaMetadataV1KernelParameter params = {};
-    params.p_work_metadata_ptrs        = work_metadata_ptrs.data_ptr<uint64_t>();
-    params.p_work_indptr               = work_indptr.data_ptr<int32_t>();
-    params.p_work_info_set_raw         = work_info_set.data_ptr<int32_t>();
-    params.p_reduce_indptr             = reduce_indptr.data_ptr<int32_t>();
-    params.p_reduce_final_map          = reduce_final_map.data_ptr<int32_t>();
-    params.p_reduce_partial_map        = reduce_partial_map.data_ptr<int32_t>();
-    params.p_seqlens_qo_indptr         = seqlens_qo_indptr.data_ptr<int32_t>();
-    params.p_pages_kv_indptr           = pages_kv_indptr.data_ptr<int32_t>();
-    params.p_context_lens              = context_lens.data_ptr<int32_t>();
+    params.p_work_metadata_ptrs        = static_cast<uint64_t*>(work_metadata_ptrs.data_ptr());
+    params.p_work_indptr               = static_cast<int32_t*>(work_indptr.data_ptr());
+    params.p_work_info_set_raw         = static_cast<int32_t*>(work_info_set.data_ptr());
+    params.p_reduce_indptr             = static_cast<int32_t*>(reduce_indptr.data_ptr());
+    params.p_reduce_final_map          = static_cast<int32_t*>(reduce_final_map.data_ptr());
+    params.p_reduce_partial_map        = static_cast<int32_t*>(reduce_partial_map.data_ptr());
+    params.p_seqlens_qo_indptr         = static_cast<int32_t*>(seqlens_qo_indptr.data_ptr());
+    params.p_pages_kv_indptr           = static_cast<int32_t*>(pages_kv_indptr.data_ptr());
+    params.p_context_lens              = static_cast<int32_t*>(context_lens.data_ptr());
     params.num_batches                 = num_batches;
     params.num_heads                   = num_heads_k * num_heads_per_head_k;
     params.num_heads_k                 = num_heads_k;

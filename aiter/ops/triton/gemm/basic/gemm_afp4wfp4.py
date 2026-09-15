@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 import torch
 import triton
 
@@ -28,6 +29,10 @@ _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
 
+_GLUON_SUPPORTED_ARCHS = ("gfx950",)
+_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
+_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+
 
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
@@ -38,6 +43,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
     NUM_KSPLIT_STEP = 2
     BLOCK_SIZE_K_STEP = 2
+    # Both decrements floor-divide, so they must be clamped: a NUM_KSPLIT below
+    # NUM_KSPLIT_STEP would go to 0 and the next cdiv(K, NUM_KSPLIT) would
+    # divide by zero, and BLOCK_SIZE_K can fall under the 16 that
+    # compute_splitk_params() enforces everywhere else.
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
@@ -49,14 +58,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         ):
             break
         elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
         elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
             if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+                NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
             elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+                BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+            BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         else:
             break
 
@@ -79,6 +88,7 @@ def gemm_afp4wfp4_fake_tensor(
     y: torch.Tensor | None = None,
     config: str | None = None,
     skip_reduce: bool | None = False,
+    backend: str = "triton",
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -115,6 +125,7 @@ def gemm_afp4wfp4_(
     y: torch.Tensor | None = None,
     config: str | None = None,
     skip_reduce: bool | None = False,
+    backend: str = "triton",
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -139,7 +150,26 @@ def gemm_afp4wfp4_(
         f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
+    if backend == "gluon":
+        arch = arch_info.get_arch()
+        assert arch in _GLUON_SUPPORTED_ARCHS, (
+            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'. "
+            "gfx1250 gluon MXFP4 goes through gemm_afp4wfp4_preshuffle."
+        )
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
+            _gemm_afp4wfp4_kernel as _gluon_gemm_afp4wfp4_gfx950_kernel,
+        )
+
+        impl = _gluon_gemm_afp4wfp4_gfx950_kernel
+    else:
+        impl = _triton_gemm_afp4wfp4_kernel
 
     M, K = x.shape
     N, K = w.shape
@@ -148,11 +178,27 @@ def gemm_afp4wfp4_(
     w = w.T
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        if backend == "gluon":
+            config, _ = _get_config(M, N, K, backend="gluon")
+        else:
+            config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
 
-    if config["NUM_KSPLIT"] > 1:
+    if backend == "gluon":
+        # The gluon kernel rounds SPLITK_BLOCK_SIZE up to a BLOCK_SIZE_K
+        # multiple and leaves BLOCK_SIZE_K alone; get_splitk's shrinking is
+        # tuned for the triton kernel.
+        if config["BLOCK_SIZE_K"] >= 2 * K:
+            config["NUM_KSPLIT"] = 1
+        if config["NUM_KSPLIT"] > 1:
+            config["SPLITK_BLOCK_SIZE"] = (
+                triton.cdiv(
+                    2 * triton.cdiv(K, config["NUM_KSPLIT"]), config["BLOCK_SIZE_K"]
+                )
+                * config["BLOCK_SIZE_K"]
+            )
+    elif config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
@@ -161,23 +207,21 @@ def gemm_afp4wfp4_(
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
 
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-        config["NUM_KSPLIT"] = 1
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
+    if backend == "triton":
+        if config["BLOCK_SIZE_K"] >= 2 * K:
+            config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+            config["SPLITK_BLOCK_SIZE"] = 2 * K
+            config["NUM_KSPLIT"] = 1
+        config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
 
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if config["NUM_KSPLIT"] > 1:
-        if _USE_GEMM_SPLITK_BF16:
-            y_pp = torch.empty(
-                (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=x.device
-            )
-        else:
-            y_pp = torch.empty(
-                (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
-            )
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N),
+            dtype=dtype if _USE_GEMM_SPLITK_BF16 else torch.float32,
+            device=x.device,
+        )
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
@@ -195,7 +239,7 @@ def gemm_afp4wfp4_(
         ),
     )
 
-    _triton_gemm_afp4wfp4_kernel[grid](
+    impl[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -265,15 +309,31 @@ def gemm_afp4wfp4(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
+    backend: str | None = None,
 ) -> torch.Tensor:
+    arch = arch_info.get_arch()
+    if backend is None:
+        backend = "gluon" if arch in _GLUON_DEFAULT_ARCHS else "triton"
+
+    if backend == "gluon" and arch not in _GLUON_SUPPORTED_ARCHS:
+        # This entry point takes w as (N, K//2) row-major. gfx1250's gluon MXFP4
+        # kernel takes preshuffled weights, so it cannot serve it.
+        _LOGGER.info(
+            f"GEMM_AFP4WFP4: no gluon kernel for unshuffled weights on {arch}, "
+            "using triton"
+        )
+        backend = "triton"
+
     if config is None:
-        config_hashable = None
         M, K = x.shape
         N, _ = w.shape
-        config, _ = _get_config(M, N, K)
+        if backend == "gluon":
+            config, _ = _get_config(M, N, K, backend="gluon")
+        else:
+            config, _ = _get_config(M, N, K)
     config_hashable = serialize_dict(config)
     return gemm_afp4wfp4_(
-        x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce
+        x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce, backend
     )
 
 
@@ -416,8 +476,6 @@ def gemm_afp4wfp4_preshuffled_scales(
     return y
 
 
-# TODO: Split-K support
-# TODO: gluon kernel for M < 32 without preshuffling scales for M < 32
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
@@ -434,11 +492,23 @@ def gemm_afp4wfp4_preshuffle(
 
     Args:
         x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K//2).
-        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16), internally transposed.
-        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K) if M >= 32 otherwise (M, K//32).
-            One scale per 32 elements in K dimension.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (M//32, K).
-            One scale per 32 elements in K dimension.
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16),
+            preshuffled via aiter.ops.shuffle.shuffle_weight_gfx1250 (or
+            equivalently shuffle_weight(layout=(16, 16)) reshaped to
+            (N//16, K*16) — both produce the same bytes). Internally transposed.
+        x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
+            elements in K. For M >= 32: preshuffled via
+            aiter.ops.shuffle.shuffle_scale (identical layout on gfx950 and
+            gfx1250), then viewed as one row per 32-row stripe, i.e.
+            (M_pad//32, (K//32)*32) where M_pad = M rounded up to a multiple
+            of 256. shuffle_scale returns the buffer flat as
+            (M_pad, K//32), so the caller owns the reshape:
+            ``s = shuffle_scale(x_scales); s.view(-1, s.shape[-1] * 32)``
+            (take the shape off the shuffled tensor -- shuffle_scale pads both
+            dims). For M < 32: un-shuffled (M, K//32) row-major.
+        w_scales (torch.Tensor): E8M0 per-group scale for w, one scale per 32
+            elements in K: same shuffle_scale + stripe view as x_scales,
+            i.e. (N_pad//32, (K//32)*32). Always shuffled, including M < 32.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -450,17 +520,21 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = arch_info.get_arch() in _GLUON_PRESHUFFLE_ARCHS
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = 2 * K_bytes
-    # _get_config doubles K for config - 2 * K_bytes == K_elems
-    K_cfg = K_elems
 
     if config is None:
-        config, _ = _get_config(M, N, K_cfg, True)
+        # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
+        # matching the non-preshuffled path. The two backends take disjoint
+        # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
+        # the config must come from the dir of the backend we actually launch.
+        config, _ = _get_config(
+            M, N, K_bytes, True, backend="gluon" if use_gluon else "triton"
+        )
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
@@ -471,6 +545,19 @@ def gemm_afp4wfp4_preshuffle(
         assert (
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
+
+    # shuffle_scale pads K//32 up to a multiple of 8 (its k-chunk), but the
+    # kernels bound the scale reads at (K//32)*32 columns per stripe row. A
+    # k-chunk interleaves its 8 k-groups across all 256 of its bytes, so a
+    # bound that lands mid-chunk silently masks *real* k-groups to zero rather
+    # than only the padding -- e.g. K=896 loses k-groups 26 and 27. Require
+    # whole k-chunks. w_scales are always preshuffled, so this holds for M < 32
+    # too, where x_scales themselves are un-shuffled.
+    assert K_elems % 256 == 0, (
+        f"preshuffled scales require K % 256 == 0 (K//32 a multiple of 8), got K={K_elems}. "
+        "shuffle_scale pads K//32 to a multiple of 8 and the kernels cannot mask a "
+        "partial k-chunk"
+    )
 
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
@@ -502,8 +589,6 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
-        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
             w_preshuf,
@@ -531,7 +616,7 @@ def gemm_afp4wfp4_preshuffle(
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K_elems, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+            K_bytes, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
 
         config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
@@ -580,7 +665,7 @@ def gemm_afp4wfp4_preshuffle(
         w_scales,
         M,
         N,
-        K_elems,
+        K_bytes,
         x_fp4.stride(0),
         x_fp4.stride(1),
         w_preshuf.stride(0),
@@ -603,7 +688,7 @@ def gemm_afp4wfp4_preshuffle(
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
-        ACTUAL_KSPLIT = triton.cdiv(K_elems, (config["SPLITK_BLOCK_SIZE"] // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K_bytes, (config["SPLITK_BLOCK_SIZE"] // 2))
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),

@@ -19,16 +19,20 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import (
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     IS_GATHER_SUPPORTED,
     IS_TF32_SUPPORTED,
     autotune_cache_kwargs,
-    chunk_delta_attn_autotune_configs,
     exp2,
     input_guard,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
-from .wy_fast import recompute_w_u_fwd
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.wy_fast import (
+    recompute_w_u_fwd,
+)
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
@@ -53,7 +57,8 @@ else:
     }
 )
 @triton.autotune(
-    configs=chunk_delta_attn_autotune_configs(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
         [
             triton.Config({"BH": BH, "BK": BK}, num_warps=nw)
             for BH in [1, 2, 4, 8]
@@ -221,7 +226,8 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     }
 )
 @triton.autotune(
-    configs=chunk_delta_attn_autotune_configs(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
         [
             triton.Config({}, num_warps=nw, num_stages=ns)
             for nw in [1, 2, 4, 8]
@@ -364,7 +370,8 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     }
 )
 @triton.autotune(
-    configs=chunk_delta_attn_autotune_configs(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
         [
             triton.Config({"BK": BK}, num_warps=nw)
             for BK in [32, 64]
