@@ -26,10 +26,10 @@ aiter_lib = Library("aiter", "FRAGMENT")
 
 
 # Arches whose prebuilt HIP CK blockscale modules ship matching code objects.
-# Other arches (e.g. gfx1201) SIGSEGV uncatchably at kernel launch, so gate
-# before the HIP call rather than try/except. Extend when prebuilts add archs.
+# Other arches can SIGSEGV uncatchably at kernel launch, so gate before the HIP
+# call rather than try/except. Extend only after their CK module is validated.
 _BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset(
-    {"gfx940", "gfx941", "gfx942", "gfx950", "gfx1250"}
+    {"gfx940", "gfx941", "gfx942", "gfx950", "gfx1201", "gfx1250"}
 )
 
 
@@ -796,6 +796,17 @@ def gemm_a8w8_blockscale_fake(
     return Y
 
 
+def _gemm_a8w8_blockscale_triton(XQ, WQ, x_scale, w_scale, dtype):
+    """Run the row-major Triton fallback used when no safe CK route exists."""
+    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale as triton_gemm,
+    )
+
+    xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
+    wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+    return triton_gemm(xq, wq, x_scale, w_scale, dtype=dtype)
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
     XQ: Tensor,
@@ -822,13 +833,7 @@ def gemm_a8w8_blockscale(
         if not _hip_blockscale_supported():
             # No CK code object for this arch -> triton (same row-major x_scale
             # + (N, K) weight layout; JIT-compiles per-arch).
-            from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-                gemm_a8w8_blockscale as _gemm_a8w8_blockscale_triton,
-            )
-
-            xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
-            wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
-            return _gemm_a8w8_blockscale_triton(xq, wq, x_scale, w_scale, dtype=dtype)
+            return _gemm_a8w8_blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
         config = get_CKGEMM_config(
             m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
         )
@@ -856,8 +861,15 @@ def gemm_a8w8_blockscale(
                     splitK=splitK,
                     kernelName=kernelName,
                 )
+            elif libtype == "triton":
+                return _gemm_a8w8_blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+        # gfx1201 was previously Triton-only. Keep that fallback for shapes where
+        # no measured CK win is present instead of changing all untuned shapes to
+        # CK's generic heuristic when enabling the tuned gfx1201 rows above.
+        if get_gfx() == "gfx1201":
+            return _gemm_a8w8_blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
         try:
             return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
         except RuntimeError as e:

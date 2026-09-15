@@ -80,6 +80,20 @@ class TestReadCSV(unittest.TestCase):
             os.unlink(path)
 
 
+class TestCUDetection(unittest.TestCase):
+
+    def test_uniform_cu_count(self):
+        from aiter.jit.utils.chip_info import _uniform_cu_count
+
+        self.assertEqual(_uniform_cu_count([64, 64]), 64)
+
+    def test_heterogeneous_cu_count_has_actionable_error(self):
+        from aiter.jit.utils.chip_info import _uniform_cu_count
+
+        with self.assertRaisesRegex(RuntimeError, "set CU_NUM explicitly"):
+            _uniform_cu_count([64, 256])
+
+
 class TestUpdateTunedf(unittest.TestCase):
 
     def test_merges_existing_key(self):
