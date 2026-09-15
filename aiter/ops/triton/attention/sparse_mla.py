@@ -59,6 +59,25 @@ def _cache_pointers(fmt, kv, d_qk, kv_scale):
     return u8, u8.view(torch.bfloat16), u8.view(torch.float32), u8.shape[1]
 
 
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+# fp8 dots need OCP e4m3 MFMA; CDNA3's is fnuz-only and reads OCP as garbage.
+FP8_DOT_ARCHS = ("gfx950",)
+
+# gfx942 has 64 KB of LDS, not gfx950's 160, so BLOCK_K=64 (~67 KB) will not
+# launch. num_warps stays 4 instead of block_k // 16, which the cap would halve.
+_ARCH_BLOCK_K = {"gfx942": 32, "gfx950": 64}
+_ARCH_NUM_WARPS = {"gfx942": 4, "gfx950": 4}
+
+
+def _arch_block_k(arch: str) -> int:
+    return _ARCH_BLOCK_K.get(arch, 64)
+
+
+def _arch_num_warps(arch: str) -> int:
+    return _ARCH_NUM_WARPS.get(arch, _arch_block_k(arch) // 16)
+
+
 def _mla_num_splits(
     num_queries: int, heads_blocks: int, avg_topk: float, block_k: int = 64
 ) -> int:
@@ -86,6 +105,7 @@ def _async_launch_config(
     uni_tile: bool = True,
     has_extra: bool = False,
     block_k: int = 64,
+    lds_limited: bool = False,
 ) -> tuple[bool, int, int]:
     """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
 
@@ -105,6 +125,10 @@ def _async_launch_config(
     )
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
+    # The tiles below are sized for gfx950's LDS; block_k already fits this arch.
+    if lds_limited:
+        waves_per_eu = 1 if (use_buffer_load and workgroups <= num_sms) else 2
+        return False, block_k, waves_per_eu
     if enabled and workgroups >= 4 * num_sms:
         return True, 64, 4
     waves_per_eu = 2
@@ -113,13 +137,20 @@ def _async_launch_config(
     return enabled, (128 if enabled else block_k), waves_per_eu
 
 
-def _resolve_dot_precision(dot_precision: str, fmt: str) -> bool:
+def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str = "gfx950") -> bool:
     if dot_precision not in ("bf16", "fp8"):
         raise ValueError(
             f"dot_precision must be 'bf16' or 'fp8', got {dot_precision!r}"
         )
     if dot_precision == "bf16":
         return False
+    if arch not in FP8_DOT_ARCHS:
+        raise ValueError(
+            f"dot_precision='fp8' is not supported on {arch}: the fp8 matrix "
+            "core there reads the fnuz encoding, so OCP e4m3 code points come "
+            "out wrong. Use dot_precision='bf16', which dequantizes the tile "
+            "on its way into LDS and works with every cache format."
+        )
     if fmt == "fp8_dsv32_mla":
         raise ValueError(
             "dot_precision='fp8' does not support the fp8_dsv32_mla cache."
@@ -481,7 +512,9 @@ def sparse_mla_fwd(
             extra_indptr,
             extra_indices,
         )
-    assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
+    arch = arch_info.get_arch()
+    assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
+    lds_limited = arch == "gfx942"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
@@ -503,7 +536,7 @@ def sparse_mla_fwd(
             )
         q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
     cache, alt, scl, block_size = _cache_pointers(fmt, kv_buffer, d_qk, kv_scale)
-    fp8_dots = _resolve_dot_precision(dot_precision, fmt)
+    fp8_dots = _resolve_dot_precision(dot_precision, fmt, arch)
     if not q_is_fp8:
         # q_scale describes an fp8 q's encoding. With bf16 q the kernel quantizes
         # per (query, head-block) tile when the dots are fp8, so a caller-supplied
@@ -521,8 +554,8 @@ def sparse_mla_fwd(
     # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
     # BLOCK_M = next_pow2(H) instead of padding heads
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    block_k = 64
-    num_warps = block_k // 16
+    block_k = _arch_block_k(arch)
+    num_warps = _arch_num_warps(arch)
 
     num_rows = cache.shape[0] * block_size if cache.ndim >= 2 else cache.shape[0]
     avg_topk = kv_indices.numel() / max(1, num_queries)
@@ -595,6 +628,7 @@ def sparse_mla_fwd(
         uni_tile=True,
         has_extra=False,
         block_k=block_k,
+        lds_limited=lds_limited,
     )
 
     # Q is read once per query without split-K, and re-read by every split
