@@ -1,0 +1,253 @@
+# SILOTIGER-1047 — FlyDSL QSA indexer scorer + sparse GQA
+
+Ship **FlyDSL** kernels for the Qwen Sparse Attention (QSA) block in
+Qwen3.8-Flash-Next / Qwen4-preview (`qwen4_exp`): (1) paged indexer **scorer**
+plus fused top-k, (2) **sparse GQA** attend on the selected tokens.
+
+Parent: [SILOTIGER-1040](https://amd.atlassian.net/browse/SILOTIGER-1040).
+Ticket: [SILOTIGER-1047](https://amd.atlassian.net/browse/SILOTIGER-1047).
+Source dump: `SILOTIGER-1047.md`.
+
+**Primary bar is whatever AMD serving actually launches today**, not the
+unmerged AITER PR. That is vLLM-vendored Triton plus HIP top-k in
+`qwen4_exp/amd/ops/qsa.py` (vLLM PR 53896). Beat that end-to-end on one QSA
+layer (`indexer + select + attend`) before claiming a win.
+
+**Secondary bar** is unmerged AITER Triton/Gluon in
+[ROCm/aiter#4882](https://github.com/ROCm/aiter/pull/4882): beat its portable
+Triton path, and beat its gfx950 Gluon path **on the shapes Gluon actually
+dispatches**. #4882 is a competitor, not production.
+
+QSA is **not** every layer: hybrid is `GGGQ` × 12, so **12 of 48** layers (plus
+MTP, which can reuse indices).
+
+**In scope:** FlyDSL K1 (scorer + fused top-k), FlyDSL K2 (sparse GQA), an
+`aiter/ops/flydsl/` op surface, a correctness+perf harness that reports family A
+and family B separately, and a vLLM `qwen4_exp` opt-in (`auto` / FlyDSL /
+Triton).
+
+**Out of scope:** GR (SILOTIGER-1041 / 1042); DSA / `fp8_mqa_logits` retarget;
+sparse MLA prefill; SWA; FlashInfer / NVIDIA TRT-LLM QSA as an acceptance bar;
+fusing `qsa_pre_indexer` before K1/K2 beat the live AMD bar.
+
+Work the phases **in order**. Later items assume earlier ones have landed.
+Leave checkboxes unchecked until that item is done; paste tables and notes under
+the relevant phase as evidence.
+
+## Progress
+
+- [ ] 0. Repo layout + oracle (no kernel yet)
+- [ ] 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
+- [ ] 2. FlyDSL K1 (scorer + fused top-k) — family A then B
+- [ ] 3. FlyDSL K2 (sparse GQA) — family A then B
+- [ ] 4. Wire `aiter/ops/flydsl/` + vLLM `qwen4_exp` opt-in
+- [ ] 5. Optional fusions (only after the bar)
+
+## Locked decisions
+
+These locks apply to **this ticket** unless a later note explicitly supersedes
+them.
+
+- **Test environment:** run all tests/benches in **`flydsl_venv`** **GPU 6**
+  (`HIP_VISIBLE_DEVICES=6`).
+- **Primary vs secondary.** The must-beat path is **live vLLM AMD** (Triton MQA
+  + HIP top-k + Triton expand+tail + Triton sparse GQA `num_stages=1`). #4882
+  Triton/Gluon is a named competitor column. NVIDIA `qwen4_exp/nvidia/ops/qsa.py`
+  is an optional column only — never the AMD gate.
+- **Do not hide a loss.** Report each named backend separately. A win vs #4882
+  does not cover a loss to live vLLM, or the reverse.
+- **Family A is the production must-win.** Flash-Next / `Qwen/Qwen3.8-Flash-Next`:
+  indexer `H=4`, `kv_heads=1`, `D=128`, `r=4`, budget 2048 → `K_B=512` blocks,
+  expand+tail width ≤ 2051; sparse GQA **24×2** (group **12**), `head_dim=256`,
+  partial RoPE 64, sigmoid output gate, **BF16** main QSA cache (not FP8 KV).
+- **Family B is Gluon-parity only.** Keep #4882 Gluon-validated shapes so FlyDSL
+  is measured where Gluon was tuned: indexer `H` is 4 or 8, `D=128`; sparse GQA
+  `D=128`, group size **5**, `selection_width=2051`. Released Flash-Next GQA is
+  group 12 / `D=256`, so **#4882 Gluon will not auto-dispatch there**. Family A
+  vs #4882 is Triton-vs-FlyDSL; family B vs #4882 is Triton-and-Gluon-vs-FlyDSL.
+- **Wrong kernels stay unused.** Do not retarget FlyDSL `fp8_mqa_logits`
+  (`H % 16 == 0`, dense, weighted ReLU), MLA sparse decode, SWA, or DSA
+  (`H=32` FP8 with per-head `w_h` over tokens). QSA is `H=4` BF16, no `w_h`,
+  over **mean-pooled blocks**. Pad-to-16 of DSA is a prototype only.
+- **K1 must not write a full score matrix.** Stream paged compressed index-K,
+  ReLU-sum per complete block, keep a **local** top-512 (or local top-k on
+  family B), merge to a global 512 (or k). Same “score-plus-top-k” idea as DSA
+  fused indexer work; different ABI.
+- **Score math.** `I_ib = sum_h ReLU(dot(q[h], k_bar[b]))` for complete blocks
+  only (`p_b + r - 1 <= i`). Optional serving scale `1/sqrt(128)` is allowed
+  **only if it cannot change top-k argmax**. `eps` is unused.
+- **Two kernels, one op surface.** K1 = scorer + fused top-k; K2 = sparse GQA.
+  Expand+tail may live in K1’s epilogue or K2’s prologue until phase 5. Public
+  wrappers under `aiter/ops/flydsl/`; kernels under
+  `aiter/ops/flydsl/kernels/` (QSA-named files, not a reuse of `mqa_logits/`).
+- **Arch.** Compile **gfx942 and gfx950** separately if LDS/VGPR models differ.
+  gfx950 should use the extra LDS (live AMD and #4882 both left sparse GQA
+  `num_stages=1` on the vLLM AMD path). Do not union decode GEMV and prefill
+  MFMA in one instantiation if that costs occupancy.
+- **Shapes in the harness.** `M` is flattened tokens. Decode `1..8` and prefill
+  512 / 2048 / 8192 plus at least one long-context length (**32k or 128k**) so
+  indexer scaling is visible. Both archs.
+- **Correctness.** Independent fp32 oracle: block-causal ReLU-sum scores, exact
+  top-512 (tie-break documented), expand+tail, then standard GQA on those
+  positions. Cross-check vs vLLM Triton `qsa.py` and vs #4882 on shared shapes.
+  Authoritative math: Qwen3.8-Next tech report §2.1 / QSA. Fusing top-k may
+  change fp32 score order vs materializing full logits; gate K1 on the oracle
+  with a documented tolerance, and require **set equality** of selected blocks
+  (or a fixed tie policy).
+- **Tests follow aiter op_test shape.** `@benchmark` + `run_perftest` candidate
+  loop, torch/oracle **not** timed into the table, `us` + TFLOPS + TB/s + `err`
+  per candidate, one markdown summary table per test fn, `__main__` guard,
+  `get_gfx()` gate in `main()`. No hand-written ratio columns. Family A and
+  family B are **separate tables**.
+- **#4882 pin.** Do not wait for merge to start the harness. Until it lands,
+  pin a PR head (runtime-tested parent `2462d5b64`; later heads may be
+  docs-only). Forced `gluon` on a dispatch miss must error; `auto` falls back
+  to Triton. If #4882 merges, retarget the competitor pin to `main`.
+- **Compile cache.** After kernel-source edits, run with
+  `FLYDSL_RUNTIME_ENABLE_CACHE=0` (or clear `~/.flydsl/cache`) so a stale HSACO
+  cannot mask a bad rewrite.
+- **Warm-up / claims.** Warm up by duration. Interleave paired rounds. Do not
+  claim a GQA win from the group-5 `D=128` Gluon bench, and do not claim an
+  indexer win from DSA `H=32` FP8 numbers. End-to-end gate is the **whole
+  chain** (launches, bytes, and fused K1/K2), not a single kernel vs its Triton
+  twin in isolation.
+- **AITER fused MoE / tgemm / vision FA** may be on in the same process; they
+  are **not** QSA baselines.
+- **Gate (after a kernel exists).**
+  ```bash
+  source /path/to/flydsl_venv/bin/activate
+  HIP_VISIBLE_DEVICES=6 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+    python3 op_tests/test_flydsl_qsa.py
+  ```
+  Paths may move; keep this snippet in sync. Until the op_test exists, the
+  phase-1 harness command is the gate.
+
+## Subtasks
+
+### 0. Repo layout + oracle (no kernel yet)
+
+Stand up files and the math reference so later kernels have a single ABI to
+hit. Do not start FlyDSL K1 until the oracle matches the ticket math on a
+tiny dense case.
+
+Proposed layout (adjust only if a later lock says so):
+
+- `aiter/ops/flydsl/kernels/qsa/` — K1 / K2 kernels
+- `aiter/ops/flydsl/qsa.py` — public wrappers + arch dispatch
+- `op_tests/test_flydsl_qsa.py` — correctness + perf (family A / B tables)
+- `tickets/1047/` — harness notes, rocprof, competitor pins, pasted tables
+
+- [ ] Oracle: block-causal ReLU-sum, documented top-k tie-break, expand+tail,
+      GQA on selected positions (fp32, then cast).
+- [ ] Document family A / B tensor shapes and dtypes in one comment block on
+      the wrapper (or a tiny `qsa_shapes.py`) so tests and kernels share them.
+- [ ] **Done when:** oracle is importable, covered by a small unit case, and
+      agrees with a hand-checked 1-row / few-block example from the tech
+      report formula.
+
+### 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
+
+This phase answers **which kernel to land first** at 8k / 32k / 128k / 1M
+(open question in the ticket). No FlyDSL win is claimed here.
+
+- [ ] Pin **vLLM AMD live path** (`qwen4_exp/amd/ops/qsa.py` + HIP
+      `top_k_per_row_decode`). Record the exact vLLM / AITER SHAs in
+      `tickets/1047/`.
+- [ ] Pin **#4882 Triton** (`qsa_paged_mqa_logits` / `qsa_sparse_paged_gqa`)
+      and **#4882 Gluon** (gfx950, Triton `>= 3.6`, auto-dispatch only).
+- [ ] Optional NVIDIA QSA column — labeled so it cannot be mistaken for the
+      AMD bar.
+- [ ] Family A table and family B table; never merge them.
+- [ ] rocprof **one real QSA layer** (indexer through GQA) at short and long
+      `L`, including HIP graph replay at decode.
+- [ ] Record whether **indexer or GQA dominates** on this GPU at 8k / 32k /
+      128k (and 1M if the machine can hold it). That result **sets the order
+      of phases 2 vs 3** if it clearly disagrees with “K1 then K2”; note the
+      override here rather than silently swapping.
+- [ ] **Done when:** both family tables exist with live AMD + oracle + #4882
+      where it dispatches; a short note states which side of QSA dominates at
+      the locked lengths on GPU 6.
+
+### 2. FlyDSL K1 (scorer + fused top-k) — family A then B
+
+K1 streams paged compressed index-K tiles, computes the ReLU-sum score, keeps
+a local top-k, merges globally. Output: `block_ids [M, 512]` on family A
+(or local k on B). Expand+tail can still be a separate launch in this phase.
+
+- [ ] Family A (`H=4`, `D=128`, `k=512`, paged compressed blocks, complete-block
+      causal bound).
+- [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
+- [ ] No `[rows, n_blocks]` FP32 score buffer.
+- [ ] gfx942 and gfx950.
+- [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;
+      beat Gluon on gfx950 **where Gluon dispatches**.
+- [ ] **Done when:** selected-block **set equality** (or documented tie policy)
+      vs the oracle; family A beats live AMD on the harness lengths; family B
+      beats #4882 Triton and Gluon on the published indexer bench points.
+
+### 3. FlyDSL K2 (sparse GQA) — family A then B
+
+K2 attends uncompressed paged K/V at the expanded token indices. Prefetch K/V
+for the selected runs (512 runs of 4 plus a short tail on A; 2051-wide list on
+B). Split-K as needed.
+
+- [ ] Family A: 24 Q / 2 KV, group 12, `D=256`, softmax scale, sigmoid gate
+      weights if fused into the epilogue. Out: BF16 `o [M, 24, 256]`
+      (pre-`o_proj`).
+- [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
+- [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
+- [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
+      kernel if occupancy suffers.
+- [ ] **Done when:** GQA `err` vs oracle is within the documented tol; family A
+      beats live AMD sparse GQA and #4882 Triton; family B beats #4882 Triton
+      and Gluon on the published points. Do **not** cite the group-5 Gluon
+      number as a family A GQA win.
+
+### 4. Wire `aiter/ops/flydsl/` + vLLM `qwen4_exp` opt-in
+
+- [ ] Public wrappers + lazy export from `aiter/ops/flydsl/__init__.py`.
+- [ ] End-to-end op_test: indexer through GQA as one QSA layer (launches,
+      bytes, fused K1/K2), family A and B tables, HIP graph replay at decode.
+- [ ] vLLM `qwen4_exp` opt-in with the same three-way backend idea as #4882
+      (`auto` / FlyDSL / Triton). `auto` must not silently pick a backend that
+      fails the family A gate.
+- [ ] **Done when:** one documented command on GPU 6 shows family A e2e beating
+      live AMD; competitor columns still present; vLLM opt-in is callable
+      without editing the default AMD path.
+
+### 5. Optional fusions (only after the bar)
+
+Do not start this phase to “make K1/K2 look better.”
+
+- [ ] Fuse expand+tail into K2 (or keep it in K1’s epilogue — pick one and
+      lock it here).
+- [ ] Fuse `qsa_pre_indexer` (`Gemma RMSNorm + partial MRoPE + compress`) only
+      after K1/K2 already beat live AMD. Live AMD today is unfused
+      (`GemmaRMSNorm + triton_mrope`; no `qsa_pre_indexer.py` on AMD).
+- [ ] MTP IndexShare (`indexer.skip_topk`): GQA-only launch, no scorer.
+- [ ] **Done when:** fused path matches the unfused oracle; e2e still beats
+      live AMD; skip-topk is a harness row, not a surprise.
+
+## Non-goals (do not pull into this plan)
+
+- Changing GPU from the locked `HIP_VISIBLE_DEVICES=6`.
+- Waiting on #4882 to merge before the harness or K1.
+- Treating NVIDIA QSA Triton, FlashInfer, or TRT-LLM as the AMD acceptance bar.
+- Mixing GR kernels (SILOTIGER-1041 / 1042) into these files.
+- Claiming indexer wins from DSA `H=32` FP8 numbers.
+- Mass-comment cleanup as its own commit unless a phase’s diff is unreadable
+  without it.
+
+## Open questions (resolve into locks; do not guess in code)
+
+Leave these open until the named phase produces evidence. When resolved, move
+the answer into **Locked decisions** and check the item.
+
+- [ ] Where indexer vs GQA dominates on this GPU at 8k / 32k / 128k / 1M
+      (phase 1). Sets whether to land K1 or K2 first after the harness.
+- [ ] Whether FlyDSL K1 should emit **block ids** or already-expanded **token
+      ids** (phase 2/5).
+- [ ] Packed vs padded `M` (varlen) from a real vLLM prefill trace (phase 4).
+- [ ] MTP IndexShare wiring in vLLM vs aiter-only skip-topk (phase 5).
+- [ ] #4882 merge timing: keep competing even if it lands; retarget the pin
+      rather than pausing.
