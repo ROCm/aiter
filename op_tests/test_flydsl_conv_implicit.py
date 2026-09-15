@@ -4,7 +4,7 @@
 
 """Correctness and perf for the FlyDSL implicit-GEMM convolution.
 
-Two sweeps, one table each. The first covers the keyword surface: the entry point
+Four sweeps, one table each. The first covers the keyword surface: the entry point
 dispatches 1D/2D/3D off the filter rank, so every rank is here along with stride,
 padding (incl. "same"), dilation, groups, bias and split-K.
 
@@ -304,10 +304,58 @@ def qwen_vae_conv2d(height, width):
     ]
 
 
+# Keyword surface: one row per feature of the entry point's keyword API.
+# 2D reuses the Qwen-Image VAE shape family. splitk needs a ref_kw because torch
+# has no such argument.
+_X3, _W3 = (1, 32, 4, 16, 16), (48, 32, 3, 3, 3)
+_X2, _W2 = (1, 96, 64, 64), (96, 96, 3, 3)
+
+# (case, rank, xshape, wshape, kw, ref_kw, bias)
+KW_CASES = [
+    ("3d_3x3x3_pad1", 3, _X3, _W3, {"padding": 1}, None, False),
+    ("3d_bias", 3, _X3, _W3, {"padding": 1}, None, True),
+    ("3d_stride2", 3, _X3, _W3, {"stride": 2, "padding": 1}, None, False),
+    ("3d_dilation2", 3, _X3, _W3, {"padding": 2, "dilation": 2}, None, False),
+    ("3d_same", 3, _X3, _W3, {"padding": "same"}, None, False),
+    ("3d_groups4", 3, _X3, (48, 8, 3, 3, 3), {"padding": 1, "groups": 4}, None, False),
+    ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
+    ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
+    ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
+    ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
+]
+
+# -c labels, read back off the sweep builders so the choices cannot drift from the
+# shapes. Resolution and clip length scale extents and call counts, never names, so
+# any legal argument answers for all of them.
+ALL_CASES = (
+    [c[0] for c in KW_CASES]
+    + [c[0] for c in wan_vae_conv3d(64, 64, 5)]
+    + [c[0] for c in wan_vae_aux(64, 64, 5)]
+    + [c[0] for c in qwen_vae_conv2d(64, 64)]
+)
+
+
 def _ref(x, w, bias, rank, **kw):
     fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank]
     out = fn(x.float(), w.float(), None if bias is None else bias.float(), **kw)
     return out.to(x.dtype)
+
+
+def _roofline(x, w, ref):
+    """The convolution's implicit-GEMM (M, N, K), and the FLOPs and bytes it implies.
+
+    N is the full out-channel count while K is C/groups * prod(filter), so M*N*K
+    already accounts for a grouped conv summing only over its own group.
+    """
+    m = ref.shape[0]
+    for d in ref.shape[2:]:
+        m *= d
+    n = w.shape[0]
+    k = w.shape[1]
+    for d in w.shape[2:]:
+        k *= d
+    nbytes = (x.numel() + w.numel() + ref.numel()) * x.element_size()
+    return m, n, k, 2 * m * n * k, nbytes
 
 
 @benchmark()
@@ -318,9 +366,22 @@ def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=
     b = torch.randn(wshape[0], device="cuda", dtype=dtype) if bias else None
 
     ref = _ref(x, w, b, rank, **(kw if ref_kw is None else ref_kw))
-    out, us = run_perftest(flydsl_conv_implicit, x, w, b, **kw, num_rotate_args=1)
-    err = checkAllclose(ref, out, msg=f"{case}: ", **TOL)
-    return {"case": case, "dtype": str(dtype), "us": us, "err": err}
+    m, n, k, flops, nbytes = _roofline(x, w, ref)
+
+    # Keyword surface, so torch is the reference only. The model-shape sweeps below
+    # are where it also runs as a candidate, because there MIOpen is the baseline.
+    candidates = {"flydsl": lambda: flydsl_conv_implicit(x, w, b, **kw)}
+
+    ret = {"gfx": get_gfx(), "M": m, "N": n, "K": k}
+    for name, fn in candidates.items():
+        out, us = run_perftest(fn, num_rotate_args=1)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = checkAllclose(
+            ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case} {name}: ", **TOL
+        )
+    return ret
 
 
 def _bench_vs_torch(case, xshape, wshape, dtype, calls, stride=1, padding=0):
@@ -338,16 +399,7 @@ def _bench_vs_torch(case, xshape, wshape, dtype, calls, stride=1, padding=0):
 
     kw = {"stride": stride, "padding": padding}
     ref = _ref(x, w, b, rank, **kw)
-
-    m = ref.shape[0]
-    for d in ref.shape[2:]:
-        m *= d
-    n = wshape[0]
-    k = wshape[1]
-    for d in wshape[2:]:
-        k *= d
-    flops = 2 * m * n * k
-    nbytes = (x.numel() + w.numel() + ref.numel()) * x.element_size()
+    m, n, k, flops, nbytes = _roofline(x, w, ref)
 
     torch_conv = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank]
     candidates = {
@@ -388,6 +440,8 @@ def test_qwen_vae_conv2d(case, res, xshape, wshape, dtype, calls):
 
 
 def summarize(title, rows):
+    if not rows:  # every case in this sweep was filtered out by --cases
+        return
     aiter.logger.info("%s:\n%s", title, pd.DataFrame(rows).to_markdown(index=False))
 
 
@@ -400,14 +454,23 @@ def main():
 
     p = argparse.ArgumentParser()
     p.add_argument(
-        "-d", "--dtype", nargs="*", default=["bf16"], choices=["bf16", "fp16"]
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16],
+        help="the kernel is bf16-only; anything else is dropped with a warning",
     )
     p.add_argument(
         "-c",
         "--cases",
+        type=str,
         nargs="*",
-        default=None,
-        help="restrict the model sweeps to these case names (default: all)",
+        choices=ALL_CASES,
+        default=ALL_CASES,
+        metavar="CASE",
+        help=f"case labels to run (default: all {len(ALL_CASES)}). "
+        "An unknown label is rejected with the full list.",
     )
     p.add_argument(
         "--wan-res",
@@ -432,67 +495,23 @@ def main():
     )
     args = p.parse_args()
 
-    def wanted(case):
-        return args.cases is None or case in args.cases
+    # The kernel asserts bf16 on entry, so drop the rest here instead of letting a
+    # sweep die halfway through.
+    sweep_dtypes = [d for d in args.dtype if d == dtypes.bf16]
+    for d in args.dtype:
+        if d != dtypes.bf16:
+            aiter.logger.warning("flydsl_conv_implicit is bf16-only; skipping %s", d)
+    if not sweep_dtypes:
+        return
 
-    for name in args.dtype:
-        dtype = dtypes.bf16 if name == "bf16" else dtypes.fp16
-        rows = []
+    for dtype in sweep_dtypes:
+        name = str(dtype).split(".")[-1]
 
-        # 3D
-        x3, w3 = (1, 32, 4, 16, 16), (48, 32, 3, 3, 3)
-        rows.append(
-            test_conv_implicit("3d_3x3x3_pad1", 3, x3, w3, dtype, {"padding": 1})
-        )
-        rows.append(
-            test_conv_implicit("3d_bias", 3, x3, w3, dtype, {"padding": 1}, bias=True)
-        )
-        rows.append(
-            test_conv_implicit(
-                "3d_stride2", 3, x3, w3, dtype, {"stride": 2, "padding": 1}
-            )
-        )
-        rows.append(
-            test_conv_implicit(
-                "3d_dilation2", 3, x3, w3, dtype, {"padding": 2, "dilation": 2}
-            )
-        )
-        rows.append(
-            test_conv_implicit("3d_same", 3, x3, w3, dtype, {"padding": "same"})
-        )
-        rows.append(
-            test_conv_implicit(
-                "3d_groups4",
-                3,
-                (1, 32, 4, 16, 16),
-                (48, 8, 3, 3, 3),
-                dtype,
-                {"padding": 1, "groups": 4},
-            )
-        )
-
-        # 2D -- the Qwen-Image VAE shape family
-        x2, w2 = (1, 96, 64, 64), (96, 96, 3, 3)
-        rows.append(test_conv_implicit("2d_3x3_pad1", 2, x2, w2, dtype, {"padding": 1}))
-        rows.append(test_conv_implicit("2d_1x1", 2, x2, (96, 96, 1, 1), dtype, {}))
-        rows.append(
-            test_conv_implicit(
-                "2d_splitk2",
-                2,
-                x2,
-                w2,
-                dtype,
-                {"padding": 1, "splitk": 2},
-                ref_kw={"padding": 1},
-            )
-        )
-
-        # 1D
-        rows.append(
-            test_conv_implicit(
-                "1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), dtype, {"padding": 1}
-            )
-        )
+        rows = [
+            test_conv_implicit(case, rank, xs, ws, dtype, kw, ref_kw, bias)
+            for case, rank, xs, ws, kw, ref_kw, bias in KW_CASES
+            if case in args.cases
+        ]
         summarize(f"flydsl_conv_implicit keyword surface ({name})", rows)
 
         wan_clips = [
@@ -504,7 +523,7 @@ def main():
             test_wan_vae_conv3d(case, clip, xshape, wshape, dtype, calls)
             for clip, h, w, frames in wan_clips
             for case, xshape, wshape, calls in wan_vae_conv3d(h, w, frames)
-            if wanted(case)
+            if case in args.cases
         ]
         summarize(f"Wan2.1 VAE encode, T>1/cached conv3d ({name})", rows)
 
@@ -516,7 +535,7 @@ def main():
             for case, bucket, xshape, wshape, stride, pad, calls in wan_vae_aux(
                 h, w, frames
             )
-            if wanted(case)
+            if case in args.cases
         ]
         summarize(f"Wan2.1 VAE encode, resamplers and pointwise ({name})", rows)
 
@@ -524,7 +543,7 @@ def main():
             test_qwen_vae_conv2d(case, res, xshape, wshape, dtype, calls)
             for res in args.qwen_res
             for case, xshape, wshape, calls in qwen_vae_conv2d(*parse_res(res))
-            if wanted(case)
+            if case in args.cases
         ]
         summarize(f"Qwen-Image VAE encode+decode, T=1 rewritten conv2d ({name})", rows)
 
