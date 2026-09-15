@@ -11,7 +11,7 @@ The gfx950 BF16 per-token MTP4 specialization uses K=128 FP8 MFMA atoms
 without changing this normalization policy.
 The tuned gfx950 BF16 scalar-scale decode path uses direct fp8 Q/P conversion
 instead. It trades dynamic range for speed and can truncate small probabilities;
-see ``kernels.pa_decode_tile`` for its scope. Per-token scales keep normalization.
+see ``kernels.pa_decode_kernel`` for its scope. Per-token scales keep normalization.
 ``key_scale``/``value_scale`` are either a ``[1]`` per-tensor scalar or a
 ``[num_blocks, num_kv_heads, block_size, 1]`` per-token tensor.
 
@@ -39,13 +39,12 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
+from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_reduce import (
     MAX_CONTEXT_PARTITIONS,
     compile_pa_decode_ps_reduce,
 )
-from .kernels.pa_decode_tile import KV_COMPUTE_BLOCK, compile_pa_decode_tile
-from .kernels.tensor_shim import _run_compiled, ptr_arg
-from .kernels.utils import cdiv
+from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
 
 def get_recommended_splits(
@@ -68,7 +67,7 @@ def get_recommended_splits(
     props = torch.cuda.get_device_properties(torch.device("cuda"))
     num_sm = props.multi_processor_count * 2
     denom = max(1, num_sequences * num_kv_heads * split_kv_blocks)
-    n = cdiv(num_sm, denom) * split_kv_blocks
+    n = ((num_sm + denom - 1) // denom) * split_kv_blocks
     return max(4, min(n, max_partitions))
 
 
@@ -86,16 +85,6 @@ def _workgroup_count_enables_v_prefetch(
     """
     workgroups = num_sequences * num_kv_heads * num_partitions
     return num_compute_units < workgroups <= 2 * num_compute_units
-
-
-def _flydsl_dtype_str(dtype: torch.dtype) -> str:
-    if dtype == torch.float32:
-        return "f32"
-    if dtype == torch.float16:
-        return "f16"
-    if dtype == torch.bfloat16:
-        return "bf16"
-    raise ValueError(f"Unsupported FlyDSL dtype: {dtype!r}")
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -142,9 +131,9 @@ def launch_pa_decode_ps_reduce(
     compiled = compile_pa_decode_ps_reduce(
         max_context_partition_num=context_partition_num,
         head_size=head_size,
-        output_dtype_str=_flydsl_dtype_str(output.dtype),
-        logits_dtype_str=_flydsl_dtype_str(logits.dtype),
-        sink_dtype_str=_flydsl_dtype_str(
+        output_dtype_str=get_dtype_str(output.dtype),
+        logits_dtype_str=get_dtype_str(logits.dtype),
+        sink_dtype_str=get_dtype_str(
             output.dtype if sink_token is None else sink_token.dtype
         ),
         use_sinks=use_sinks,

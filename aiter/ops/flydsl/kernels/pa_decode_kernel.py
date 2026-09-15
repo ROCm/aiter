@@ -46,7 +46,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from . import dpp_utils
 from .tensor_shim import ptr_buf_tensor
-from .utils import cdiv, exp2_amdgcn_scalar, exp2_f32_fast, rcp_f32
+from .utils import rcp_f32
 
 MFMA_MNK = (
     16  # M = N = 16 for the MMA atom; also query rows handled per CTA (padded to 16)
@@ -143,7 +143,7 @@ def compile_pa_decode_tile(
     # Flattened query-row axis (MTP outer, GQA head inner), tiled into 16-row M-tiles.
     TOTAL_ROWS = query_length * query_group_size
     CTA_ROWS = QUERIES_PER_CTA * query_group_size
-    M_TILES = cdiv(CTA_ROWS, MFMA_MNK)
+    M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
     ROWS_PADDED = M_TILES * MFMA_MNK
     # CDNA4 contracts four legacy fp8 K=32 groups in one K=128 instruction.
     # Concatenating the existing packs preserves cache/LDS layouts for both
@@ -203,7 +203,7 @@ def compile_pa_decode_tile(
     TOK_PER_WARP = 64  # tokens each warp owns per compute block (matches production KV_COMPUTE_BLOCK)
     TILE_TOK = NWARP * TOK_PER_WARP  # 256 tokens / compute block
     # A warp owns 64 tokens: four page-16s, one page-64, or half a page-128.
-    PAGES_PER_CHUNK = cdiv(TOK_PER_WARP, block_size)
+    PAGES_PER_CHUNK = (TOK_PER_WARP + block_size - 1) // block_size
     assert (
         head_dim % (NWARP * MFMA_MNK) == 0
     ), "head_dim must split across the 4 warps for PV"
@@ -420,8 +420,8 @@ def compile_pa_decode_tile(
         # returns page 0 for that out-of-range read instead of faulting (those
         # tail tokens are masked out anyway).
         bt_num_records_bytes = (
-            fx.Index(gpu.grid_dim.x) * fx.Index(max_blocks_per_seq) * 4
-        )  # int32 entries
+            fx.Int64(gpu.grid_dim.x) * fx.Int64(max_blocks_per_seq) * 4
+        )
         # Wide loads must preserve row starts that are only int32-aligned.
         bt_buf = ptr_buf_tensor(
             block_tables_ptr,
@@ -438,9 +438,11 @@ def compile_pa_decode_tile(
             key_scale = fx.Float32(key_scale_buf[0])
             value_scale = fx.Float32(value_scale_buf[0])
 
-        num_tiles = cdiv(context_len, TILE_TOK)
-        num_pages = cdiv(context_len, block_size)  # pages this sequence really owns
-        tiles_per_part = cdiv(num_tiles, NP)
+        num_tiles = (context_len + TILE_TOK - 1) // TILE_TOK
+        num_pages = (
+            context_len + block_size - 1
+        ) // block_size  # pages this sequence really owns
+        tiles_per_part = (num_tiles + NP - 1) // NP
         part_start = part * tiles_per_part
         part_end_raw = part_start + tiles_per_part
         part_end = (part_end_raw < num_tiles).select(part_end_raw, num_tiles)
@@ -1224,8 +1226,9 @@ def compile_pa_decode_tile(
                         v_sc = _load_scale_vec(sVScale_off, a, cur_kv_buf)
                         for m in range_constexpr(M_TILES):
                             Pa = fx.Vector(
-                                exp2_f32_fast(
-                                    masked_chunks_saved[m][a] - safe_max_saved[m]
+                                fx.exp2(
+                                    masked_chunks_saved[m][a] - safe_max_saved[m],
+                                    fastmath="fast",
                                 )
                             )
                             ls_saved[m] = ls_saved[m] + Pa.reduce(ReductionOp.ADD)
@@ -1274,7 +1277,9 @@ def compile_pa_decode_tile(
                         l_prev = ostate[_l_slot(m)]
                         m_new = m_new_saved[m]
                         safe_max = (m_new > NEG_INF).select(m_new, ZERO_F)
-                        corr_reg = fx.Float32(exp2_amdgcn_scalar(m_prev - safe_max))
+                        corr_reg = fx.Float32(
+                            fx.exp2(m_prev - safe_max, fastmath="fast")
+                        )
                         gsum = _ld_lw_row(lsum_base, lane16).reduce(ReductionOp.ADD)
                         l_new = l_prev * corr_reg + gsum
                         p_ops = _lds_load(
@@ -1360,7 +1365,9 @@ def compile_pa_decode_tile(
                         ls = fx.Float32(0.0)
                         words = []
                         for a in range_constexpr(NCHUNK):
-                            Pa = fx.Vector(exp2_f32_fast(masked_chunks[a] - m_new_b))
+                            Pa = fx.Vector(
+                                fx.exp2(masked_chunks[a] - m_new_b, fastmath="fast")
+                            )
                             ls = ls + Pa.reduce(ReductionOp.ADD)
                             if const_expr(per_token_kv):
                                 v_sc = (
@@ -1394,7 +1401,9 @@ def compile_pa_decode_tile(
                         # swap, so correction/denominator are per-lane scalars (no sCorr).
                         # Empty history must contribute zero: exp2(-inf - safe_max).
                         # Replacing m_prev with 0 can overflow for negative logits.
-                        corr_reg = fx.Float32(exp2_amdgcn_scalar(m_prev - safe_max))
+                        corr_reg = fx.Float32(
+                            fx.exp2(m_prev - safe_max, fastmath="fast")
+                        )
                         if rgroup == 0:
                             _st_lw(lsum_base, lane16, warp, ls)
                         gpu.barrier()
@@ -1618,7 +1627,9 @@ def compile_pa_decode_tile(
                     if const_expr(M1_SCALE_BEFORE_MASK):
                         # Invalid lanes are -inf, hence exp2(-inf-safe_max)=0
                         # without a second validity compare/select.
-                        Pa = fx.Vector(exp2_f32_fast(masked_chunks[a] - m_new_b))
+                        Pa = fx.Vector(
+                            fx.exp2(masked_chunks[a] - m_new_b, fastmath="fast")
+                        )
                     else:
                         # Legacy path: re-mask Pa so a fully-masked chunk
                         # contributes exactly 0.
@@ -1627,7 +1638,10 @@ def compile_pa_decode_tile(
                         )
                         Pa = valid_a.select(
                             fx.Vector(
-                                exp2_f32_fast(masked_chunks[a] * scale - m_new_b)
+                                fx.exp2(
+                                    masked_chunks[a] * scale - m_new_b,
+                                    fastmath="fast",
+                                )
                             ),
                             zero4_p,
                         )
@@ -1659,7 +1673,7 @@ def compile_pa_decode_tile(
                     ls = ls + ls.shuffle_xor(sh, WAVE)
                 # PV (V=A, P=B) -> output [head-dim, query-row=lane16]; same as
                 # the phase-split path.
-                corr_reg = fx.Float32(exp2_amdgcn_scalar(m_prev - softmax_max))
+                corr_reg = fx.Float32(fx.exp2(m_prev - softmax_max, fastmath="fast"))
                 if rgroup == 0:
                     _st_lw(sLsum_off, lane16, warp, ls)
                 gpu.barrier()
