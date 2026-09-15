@@ -354,20 +354,8 @@ def compile_gemm(
         src_vec = src_tensor.load()
         for i in range_constexpr(n_dwords):
             src_val = src_vec[i]
-            pk0_f32 = llvm.inline_asm(
-                T.f32x2,
-                [as_ir_value(src_val)],
-                "v_cvt_pk_f32_fp8 $0, $1",
-                "=v,v",
-                has_side_effects=False,
-            )
-            pk1_f32 = llvm.inline_asm(
-                T.f32x2,
-                [as_ir_value(src_val)],
-                "v_cvt_pk_f32_fp8_sdwa $0, $1 src0_sel:WORD_1",
-                "=v,v",
-                has_side_effects=False,
-            )
+            pk0_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=False))
+            pk1_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=True))
             tmp = (pk0_f32.bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
             items.append(tmp[0])
             items.append(tmp[1])

@@ -116,15 +116,6 @@ TUNE_MOE_EXPERT_BALANCE = (
 COS_DIFF_THRESHOLD = 1e-1
 
 
-# Kernels excluded from tuning candidates, set per-tune via the
-# AITER_FMOE_TUNE_EXCLUDE_KERNELS env var (comma-separated kernel-name
-# substrings). Use it to keep a kernel out of a model's tuned config when it is
-# known to emit NaN / wrong output for that shape -- e.g. the ASM stage1 kernel
-# `fmoe_stage1_bf16_pertokenFp8_g1u1_16x64_5tg_pf3` leaves garbage in the padded
-# sorted-token rows for Qwen3.5-397B (E=513), which propagates to NaN once paired
-# with a CK stage2. The tuner skips excluded kernels so they are never selected;
-# it falls back to the next-best accurate kernel (CK stage1 / FlyDSL / 1-stage).
-# Scoped to the invoking tune only, so other models are unaffected.
 _TUNE_EXCLUDE_KERNEL_PATTERNS = [
     p.strip()
     for p in os.environ.get("AITER_FMOE_TUNE_EXCLUDE_KERNELS", "").split(",")

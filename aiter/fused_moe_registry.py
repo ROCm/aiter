@@ -52,18 +52,6 @@ FusedMoeImpl = Callable[[FusedMoeRequest, str], torch.Tensor]
 BoundFusedMoeImpl = Callable[[FusedMoeRequest], torch.Tensor]
 _IMPLEMENTATIONS: dict[str, FusedMoeImpl | str] = {}
 
-# ``kernelName1`` protocol: ``impl__<registered-name>__<opaque-config>``.
-# The name must be non-empty and cannot contain ``__``. Everything after the
-# second separator is passed to the implementation unchanged, so the config may
-# itself contain ``__``. Names without this prefix remain normal stage1 kernels.
-# Adding a new extension:
-# 1. In the backend module, implement ``run(request, config) -> Tensor``; see
-#    ``aiter/ops/flydsl/fused_moe_gfx942.py::run_flydsl_moe_gfx942_impl``.
-# 2. In the backend package initializer, call ``register_fused_moe_impl`` with a
-#    stable name and the function/import path; see ``aiter/ops/flydsl/__init__.py``.
-# 3. In the tuner/config writer, call ``make_fused_moe_impl_kernel_name`` and
-#    store its result in ``kernelName1``. ``aiter/fused_moe.py`` then resolves
-#    and runs the registered whole-graph implementation automatically.
 _KERNEL_NAME_PREFIX = "impl__"
 
 

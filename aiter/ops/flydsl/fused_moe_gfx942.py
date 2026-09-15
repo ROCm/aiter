@@ -221,6 +221,9 @@ def _run_prefill(
     quant_type: QuantType,
     w1_scale: torch.Tensor | None,
     w2_scale: torch.Tensor | None,
+    expert_mask: Any,
+    num_local_tokens: Any,
+    moe_sorting_dispatch_policy: int,
     config: Config,
     problem: _Problem,
     activation_str: str,
@@ -233,9 +236,9 @@ def _run_prefill(
         problem.model_dim,
         hidden_states.dtype,
         config.BLOCK_M,
-        None,
-        None,
-        0,
+        expert_mask,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
@@ -560,6 +563,9 @@ def run_flydsl_moe_gfx942(
             quant_type,
             w1_scale,
             w2_scale,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
             config,
             problem,
             activation_str,
