@@ -24,17 +24,13 @@ _FALLBACK_NUM_XCD = 8
 
 
 def build_num_xcd():
-    """Die count of the part these instances are built for.
-
-    Falls back to the literal below when aiter is not importable, which is the
-    case for a standalone codegen run.
-    """
+    """Die count of the part these instances are built for."""
     try:
-        from aiter.jit.utils.build_targets import target_num_xcds
-
-        return target_num_xcds("gfx950")
-    except Exception:  # noqa: BLE001
+        from aiter.jit.utils.build_targets import build_num_xcds
+    except ImportError:
+        # Standalone codegen run: aiter, and so torch, is not importable.
         return _FALLBACK_NUM_XCD
+    return build_num_xcds("gfx950")
 
 
 # ---------------- gfx950 arch-override maps ----------------
