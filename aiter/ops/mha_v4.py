@@ -433,11 +433,6 @@ def _resolve_raw_recipe(
             )
         kind = _RawRecipeKind.MXFP4
     elif q_format == AttentionFormat.MXFP6:
-        # Dense already has MXFP6 Q/K/V; remove this guard when the matching sparse row lands.
-        if sparse and v_format == AttentionFormat.MXFP6:
-            raise NotImplementedError(
-                "sorted-sparse MXFP6 Q/K/V does not have a kernel row yet"
-            )
         kind = _RawRecipeKind.MXFP6
     else:
         raise NotImplementedError(
@@ -446,14 +441,16 @@ def _resolve_raw_recipe(
         )
 
     # FP6-P rows need V repacked to match the FP6 P operand's K layout, or the kernel reads V rows
-    # in the wrong order. f8f6 ships that object for both modes; the MXFP6-Q sparse rows are still
-    # pre-FP6-P builds, so they stay on canonical V until those objects are rebuilt.
+    # in the wrong order. f8f6 and MXFP6 Q/K/V ship that object for both modes; the MXFP4-V sparse
+    # row is still a pre-FP6-P build, so it stays on canonical V until that object is rebuilt.
     uses_fp6_p_pack = (
         kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6
     ) or (
-        not sparse
-        and kind == _RawRecipeKind.MXFP6
-        and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
+        kind == _RawRecipeKind.MXFP6
+        and (
+            v_format == AttentionFormat.MXFP6
+            or (not sparse and v_format == AttentionFormat.MXFP4)
+        )
     )
     v_pack = AttentionPack.V_FOR_FP6_P if uses_fp6_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)

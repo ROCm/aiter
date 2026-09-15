@@ -205,6 +205,7 @@ KERNEL_SPECS = {
     ),
     "mha4_mxfp6": _mha_v4_spec(
         (0.75, 0.75, 0.75),
+        supports_block_sparse=True,
         uses_hadamard=True,
     ),
     "mha4_f6f4": _mha_v4_spec(
@@ -1386,6 +1387,9 @@ def make_kernel_runner(
                 "MXFP6 Hadamard preprocessing requires block_r=128 "
                 "and does not support --qsmooth"
             )
+        # MXFP6 Q/K/V ships an FP6-P object in both modes; MXFP4-V sparse is still a pre-FP6-P
+        # build, so it keeps canonical V. The quantizer and the launcher must agree on this.
+        uses_fp6_p = is_mxfp6 or (is_f6f4 and block_lut is None)
 
         def _quantize_mxfp6():
             quant_q, quant_k = q_bshd, k_bshd
@@ -1401,7 +1405,7 @@ def make_kernel_runner(
                     if is_f6f4
                     else AttentionFormat.MXFP6 if is_mxfp6 else None
                 ),
-                fp6_p=(is_f6f4 or is_mxfp6) and block_lut is None,
+                fp6_p=uses_fp6_p,
             )
 
         v_format = (
@@ -1426,9 +1430,7 @@ def make_kernel_runner(
                 v_format,
                 *scale_modes,
                 v_pack=(
-                    AttentionPack.V_FOR_FP6_P
-                    if (is_f6f4 or is_mxfp6) and block_lut is None
-                    else AttentionPack.DEFAULT
+                    AttentionPack.V_FOR_FP6_P if uses_fp6_p else AttentionPack.DEFAULT
                 ),
                 softmax_scale=softmax_scale,
             )

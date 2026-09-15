@@ -277,6 +277,14 @@ def test_mha_v4_bf16fp8_scale_recipe():
             _RawRecipeKind.MXFP6,
             AttentionPack.DEFAULT,
         ),
+        # MXFP6 Q/K/V ships an FP6-P object in both modes, so sparse keeps the repacked V.
+        (
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            True,
+            _RawRecipeKind.MXFP6,
+            AttentionPack.V_FOR_FP6_P,
+        ),
     ],
 )
 def test_mha_v4_resolves_raw_recipe(q_format, v_format, sparse, kind, v_pack):
@@ -301,11 +309,6 @@ def test_mha_v4_resolves_raw_recipe(q_format, v_format, sparse, kind, v_pack):
             AttentionFormat.BF16,
             AttentionFormat.BF16,
             "does not have a BF16 manifest row",
-        ),
-        (
-            AttentionFormat.MXFP6,
-            AttentionFormat.MXFP6,
-            "MXFP6 Q/K/V",
         ),
     ],
 )
@@ -1590,6 +1593,16 @@ def _mha_v4_sparse_co_available() -> bool:
 _MHA_V4_SPARSE_ARCH = get_gfx() in ("gfx942", "gfx950")
 
 
+def _mha_v4_mxfp6_sparse_co_available() -> bool:
+    """MXFP6 Q/K/V sparse is a gfx950-only row."""
+    if get_gfx() != "gfx950":
+        return False
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    return os.path.isfile(
+        os.path.join(asm_dir, "gfx950", "fmha_v4_fwd", "fwd_hd128_mxfp6_sparse.co")
+    )
+
+
 def test_mha_v4_packed_rejects_partial_lut():
     dummy = torch.empty(0)
     with pytest.raises(ValueError, match="all be set or all omitted"):
@@ -1904,21 +1917,27 @@ def test_mha_v4_sparse_dense_only_formats_reject_block_mask(v_format):
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 validation")
-def test_mha_v4_mxfp6_rejects_block_mask():
-    q = torch.zeros((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+@pytest.mark.skipif(
+    not _mha_v4_mxfp6_sparse_co_available(),
+    reason="sorted-sparse MXFP6 code object is not deployed",
+)
+def test_mha_v4_mxfp6_accepts_block_mask():
+    """MXFP6 Q/K/V has a sorted-sparse row, so a block mask is dispatched, not rejected."""
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(
         (1, 2, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
     )
-    with pytest.raises(NotImplementedError, match="MXFP6 Q/K/V"):
-        mha_v4(
-            q,
-            q,
-            q,
-            AttentionFormat.MXFP6,
-            AttentionFormat.MXFP6,
-            AttentionFormat.MXFP6,
-            block_mask=mask,
-        )
+    out = mha_v4(
+        q,
+        q,
+        q,
+        AttentionFormat.MXFP6,
+        AttentionFormat.MXFP6,
+        AttentionFormat.MXFP6,
+        block_mask=mask,
+    )
+    assert out.shape == q.shape
+    assert torch.isfinite(out).all()
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
