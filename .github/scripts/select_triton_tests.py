@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from collections import deque
+from functools import cache
 from pathlib import Path
 
 SRC = "aiter/ops/triton/"
@@ -84,9 +85,18 @@ def category_of(path):
 # --- import graph -----------------------------------------------------------
 
 
+# Roots the graph follows. Tests are in here as well as sources: the suite
+# reuses reference implementations and input generators across test files, so
+# a fused test often reaches the kernel it exercises only through another test.
+IMPORT_ROOTS = ("aiter.ops.triton", "op_tests.triton_tests")
+
+
+@cache
 def resolve_module(dotted):
-    """aiter.ops.triton.x.y -> the repo file for that module, if it exists."""
-    if not dotted.startswith("aiter.ops.triton"):
+    """aiter.ops.triton.x.y -> the repo file for that module, if it exists.
+    Cached: the same names recur across hundreds of files and each miss costs
+    two filesystem probes."""
+    if not dotted.startswith(IMPORT_ROOTS):
         return None
     rel = dotted.replace(".", "/")
     for cand in (rel + ".py", rel + "/__init__.py"):
@@ -141,7 +151,9 @@ def select(diff):
     """Map changed files to test files. Raises when a subset is not safe."""
     tests = list_files(TESTS, "test_*.py")
     sources = list_files(SRC, "*.py")
-    imports = {f: scan_imports(f) for f in sources + tests}
+    # Helpers are parsed as well as test_*.py: a test can reach its kernel
+    # through one, and a helper change has to find the tests behind it.
+    imports = {f: scan_imports(f) for f in sources + list_files(TESTS, "*.py")}
     # Every module each test can reach, so a change anywhere in that set
     # selects the test -- this is what covers fused kernels without a map.
     test_reach = {t: reachable(t, imports) for t in tests}
@@ -154,6 +166,10 @@ def select(diff):
     reasons = []
     relevant = False
 
+    def reached_by(f):
+        """Tests whose import closure contains f."""
+        return [t for t in tests if f in test_reach[t]]
+
     def folder_of(cat, changed):
         hits = [t for t in tests if t.startswith(TESTS + cat + "/")]
         if not hits:
@@ -164,7 +180,7 @@ def select(diff):
         """Paired test by name, else the op-type folder, plus every test whose
         imports reach this module (the fused ones)."""
         paired = by_subject.get(stem(f), [])
-        fused = [t for t in tests if f in test_reach[t] and t not in paired]
+        fused = [t for t in reached_by(f) if t not in paired]
         if paired:
             selected.update(paired)
             note = f"paired {len(paired)}"
@@ -191,14 +207,24 @@ def select(diff):
         if f.startswith(TESTS):
             relevant = True
             if basename(f).startswith("test_") and f.endswith(".py"):
+                importers = reached_by(f)
                 selected.add(f)
-                reasons.append(f"{f}: changed test — runs itself")
+                selected.update(importers)
+                reasons.append(
+                    f"{f}: changed test — runs itself + {len(importers)} importing"
+                )
                 continue
             cat = category_of(f)  # a test helper runs its whole folder
             if not cat:
                 raise RuntimeError(f"{f} is a shared test helper")
-            selected.update(folder_of(cat, f))
-            reasons.append(f"{f}: test helper -> '{cat}' folder")
+            folder = set(folder_of(cat, f))
+            outside = [t for t in reached_by(f) if t not in folder]
+            selected.update(folder)
+            selected.update(outside)
+            reasons.append(
+                f"{f}: test helper -> '{cat}' folder ({len(folder)})"
+                f" + {len(outside)} importing test(s)"
+            )
             continue
 
         if f.startswith(CONFIGS):

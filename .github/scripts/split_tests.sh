@@ -12,7 +12,8 @@
 #                    an empty selection writes empty shard lists and exits 0
 #   --dry-run      only output allocation plan, do not execute
 #   -v             Pytest's -v option, no effect
-# Exit code: always 0
+# Exit code: 0 on success, 1 on a usage error or when the selection file
+#            names a path that is not a collected test file
 
 set -euo pipefail
 
@@ -71,7 +72,9 @@ if [[ -n "$SELECT_FILE" ]]; then
         echo "Selection file not found: $SELECT_FILE" >&2
         exit 1
     fi
-    declare -A SELECTED
+    # Assigned empty rather than bare `declare -A`: under `set -u` a declared
+    # but never assigned array makes ${#SELECTED[@]} an unbound variable.
+    declare -A SELECTED=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && SELECTED["$line"]=1
     done < "$SELECT_FILE"
@@ -79,8 +82,17 @@ if [[ -n "$SELECT_FILE" ]]; then
     for f in "${ALL_FILES[@]}"; do
         if [[ -n "${SELECTED[$f]:-}" ]]; then
             FILTERED+=("$f")
+            unset "SELECTED[$f]"
         fi
     done
+    # Whatever is left names a path that is not a collected test file. Dropping
+    # those silently would let a selector bug empty the shards and report a
+    # green run that executed nothing, so fail where it can be seen.
+    if [[ ${#SELECTED[@]} -gt 0 ]]; then
+        echo "Selection lists paths that are not test files under ${TEST_DIR}:" >&2
+        for f in "${!SELECTED[@]}"; do echo "  ${f}" >&2; done
+        exit 1
+    fi
     echo "Test selection: ${#FILTERED[@]} of ${#ALL_FILES[@]} test files selected."
     if [[ ${#FILTERED[@]} -eq 0 ]]; then
         echo "Selection is empty — writing ${SHARDS} empty shard lists."
