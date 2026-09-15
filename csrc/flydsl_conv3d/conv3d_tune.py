@@ -35,6 +35,7 @@ Usage::
         -o aiter/configs/model_configs/wan21_vae_conv3d_bf16_tuned.csv
 """
 
+import os
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -131,6 +132,14 @@ def conv3d_ref(x, weight, bias, params):
     return F.conv3d(x, weight, bias=ref_bias, **params)
 
 
+def _shape_key(row):
+    """One row's shape identity, normalized so both CSVs hash the same way."""
+    return tuple(
+        str(v).strip().lower() == "true" if c == "bias" else int(v)
+        for c, v in zip(SHAPE_KEYS, row)
+    )
+
+
 class Conv3dTuner(TunerCommon):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -185,6 +194,9 @@ class Conv3dTuner(TunerCommon):
 
     def pre_process(self, args):
         """Load untuned shapes, stamp the device keys, drop already-tuned rows."""
+        # sortResults reorders against this file, and by then untunedf has had
+        # the already-tuned rows dropped, so keep the path rather than the frame.
+        self._untune_file = args.untune_file
         if args.all:
             self.get_retune_gemm_list(args)
             return
@@ -366,6 +378,42 @@ class Conv3dTuner(TunerCommon):
                 )
             rows.append(row)
         return pd.DataFrame(rows, columns=self.columns)
+
+    def sortResults(self, tune_file, issorted, values):
+        """Leave the tuned table in the untuned table's row order.
+
+        The untuned tables list a model's shapes in encode->decode call order;
+        sorting the winners by key throws that away and makes every re-tune
+        reshuffle the file. Rank by the untuned row instead. Anything with no
+        untuned counterpart keeps the base key order, after the rows that have
+        one, so this only ever reorders and never drops.
+        """
+        super().sortResults(tune_file, issorted, values)
+
+        path = getattr(self, "_untune_file", None)
+        if not path or not os.path.exists(path):
+            return
+        untunedf = pd.read_csv(path)
+        untunedf.columns = untunedf.columns.str.strip()
+        tunedf = pd.read_csv(tune_file)
+        tunedf.columns = tunedf.columns.str.strip()
+        if any(c not in df.columns for df in (untunedf, tunedf) for c in SHAPE_KEYS):
+            return
+
+        order = {
+            _shape_key(row): i
+            for i, row in enumerate(untunedf[SHAPE_KEYS].itertuples(index=False))
+        }
+        rank = [
+            order.get(_shape_key(row), len(order))
+            for row in tunedf[SHAPE_KEYS].itertuples(index=False)
+        ]
+        tunedf = (
+            tunedf.assign(_rank=rank)
+            .sort_values("_rank", kind="stable")
+            .drop(columns="_rank")
+        )
+        tunedf.to_csv(tune_file, index=False)
 
     def result_to_csv(self, resultdf, file, concat=False):
         old_df = self.get_tuned_gemm_list(file)
