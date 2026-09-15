@@ -7,6 +7,8 @@
 #
 # Parameters:
 #   --shards N     number of shards (required)
+#   --select-from FILE  restrict sharding to the test files listed in FILE
+#                       (see select_tests.py); empty file means "run nothing"
 #   --test-type TYPE test type, default aiter
 #   --dry-run      only output allocation plan, do not execute
 #   -v             Pytest's -v option, no effect
@@ -17,10 +19,12 @@ set -euo pipefail
 SHARDS=0
 TEST_TYPE="aiter"
 DRY_RUN=0
+SELECT_FROM=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --shards) SHARDS="$2"; shift 2 ;;
+        --select-from) SELECT_FROM="$2"; shift 2 ;;
         --test-type) TEST_TYPE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -v|--verbose) shift ;; # compatibility, ignore
@@ -57,6 +61,40 @@ fi
 if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
     echo "No test files found: $TEST_DIR/test_*.py" >&2
     exit 1
+fi
+
+# ------------------------------
+# optional: restrict to a selected subset (test selection)
+# ------------------------------
+if [[ -n "$SELECT_FROM" ]]; then
+    if [[ ! -f "$SELECT_FROM" ]]; then
+        echo "Selection file not found: $SELECT_FROM" >&2
+        exit 1
+    fi
+    declare -A SELECTED=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && SELECTED["$line"]=1
+    done < "$SELECT_FROM"
+
+    KEPT=()
+    for f in "${ALL_FILES[@]}"; do
+        [[ -n "${SELECTED[$f]:-}" ]] && KEPT+=("$f")
+    done
+    echo "Test selection: ${#KEPT[@]} of ${#ALL_FILES[@]} ${TEST_TYPE} files selected" >&2
+
+    # Nothing to run: emit empty shard lists so downstream jobs no-op cleanly
+    # instead of failing on a missing artifact. Checked before expanding KEPT,
+    # which is unset-unsafe while `set -u` is in effect.
+    if [[ ${#KEPT[@]} -eq 0 ]]; then
+        echo "No tests selected; emitting empty shard lists" >&2
+        if [[ $DRY_RUN -eq 0 ]]; then
+            for ((i=0; i < SHARDS; i++)); do
+                : > "${TEST_TYPE}_shard_${i}.list"
+            done
+        fi
+        exit 0
+    fi
+    ALL_FILES=("${KEPT[@]}")
 fi
 
 # ------------------------------
