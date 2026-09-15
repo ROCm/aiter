@@ -1433,6 +1433,11 @@ void topk_gating_launch(const topk_gating_params& p)
                 _DISPATCH_PREFILL_N_KERNEL(128, 1)
                 _DISPATCH_PREFILL_N_KERNEL(256, 1)
                 _DISPATCH_PREFILL_N_KERNEL(384, 1)
+                // E=512: prefill_n wins at T<=1024; above that smem is faster.
+                if(num_tokens <= 1024)
+                {
+                    _DISPATCH_PREFILL_N_KERNEL(512, 1)
+                }
                 // E=640: prefill_n wins at T<=2048; above that smem is faster.
                 if(num_tokens <= 2048)
                 {
