@@ -1200,15 +1200,18 @@ class QManager16bV2:
         self._warp_region = warp_region
         self._lane_idx = lane_idx
 
-    def load_q_to_vgpr_part2(self, *, scale):
-        """Drain this wave's Q TDM (``tensor_wait(0)``) and read its ``rows_per_warp x qk_hdim``
+    def load_q_to_vgpr_part2(self, *, scale, skip_tensorcnt=0):
+        """Drain this wave's Q TDM and read its ``rows_per_warp x qk_hdim``
         tile into WMMA B-fragments (``scale`` folded). Returns a length-R list; entry ``qt`` is
         that q-tile's list of ``k_tiles`` v16-bf16 fragments (same as ``QManager16bV1``).
 
         Read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l`` reads row
         ``l%16``, d-byte ``(l//16)*16``; fragment (qt, tile) = base + ``qt*16*row_bytes +
-        tile*32*2`` (lo) and ``+ 16*2`` more (hi 8-col half)."""
-        tdm_ops.tensor_wait(0)
+        tile*32*2`` (lo) and ``+ 16*2`` more (hi 8-col half).
+
+        ``skip_tensorcnt`` is how many copies the caller issued AFTER part1 that must stay
+        in flight. tensorcnt retires in issue order, so waiting down to it drains Q alone."""
+        tdm_ops.tensor_wait(skip_tensorcnt)
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
         scale_bf16 = scale.to(self.elem_dtype)
         lane = self._lane_idx

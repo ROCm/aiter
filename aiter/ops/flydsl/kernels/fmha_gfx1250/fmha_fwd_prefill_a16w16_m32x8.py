@@ -149,12 +149,17 @@ DEFAULT_N_BLOCK = 64
 # software-pipelined body: it reads V(u-1) from slot 0 and K(u) from slot 1 while the
 # copy for tile u+1 is written into slot 2.
 N_KV_PP = 3
-# Steady-state KV fence depth. Stage A keeps the full drain: prefetch distance is still
-# 1, so exactly one tile is outstanding at a fence and "wait to 0" is the only correct
-# setting. Stage C moves K one tile ahead of V, which is what makes a partial wait mean
-# something.
-KV_PARTIAL_FENCE = False
-assert not KV_PARTIAL_FENCE, "software-pipelined body needs tile u resident at its top"
+# K one tile ahead of V. Body u reads K from slot 1 and V from slot 0, so with both copies
+# landing in slot 2 the K ring wastes a slot on the already-dead K(u-1) and K gets only one
+# body of latency cover against V's two. LO instead writes K(u+2) into slot 0 -- a chunk
+# whose K half died at body u-1, and whose V half this body reads (12-chunk layout keeps
+# them disjoint) -- which buys K the same two bodies. Costs one extra prologue copy
+# (K(start+1) into slot 2) and makes the two halves' prologues symmetric.
+KV_K_AHEAD = True
+# Steady-state KV fence depth. With K one tile ahead both halves reach a fence with the
+# newest tile still in flight and the one they are about to read already retired, so the
+# fence can leave one tile outstanding instead of draining to 0.
+KV_PARTIAL_FENCE = KV_K_AHEAD
 
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 
@@ -182,6 +187,7 @@ BIG_NEG = -1.0e30
 # swizzled LDS); True = V2 (Q per-warp TDM; K/V TDM global->LDS; all row-major padded LDS, HW OOB,
 # fewer address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by O_VARIANT.
 USE_TDM_LOADER = True
+assert not KV_K_AHEAD or USE_TDM_LOADER, "K-ahead is wired for the V2 TDM loaders only"
 
 # K/V producer specialization (always on; V1's cooperative loaders do not support it).
 # The LO half issues every K copy, the HI half every V copy, and each of a half's
@@ -1066,6 +1072,11 @@ def _core_attention(
     def _v_lds_buf(pp):  # V[pp][0] == the slot base one chunk in
         return _k_lds_buf(pp) + fx.Int32(LDS_CHUNK_BYTES)
 
+    # Logical slot -> physical chunk pair. Q covers all of physical slot 1 and the low
+    # 17 KB of slot 2's K chunks, so physical slot 0 is the only Q-disjoint one; putting
+    # the first tile (logical slot 1) there lets the prologue issue it before Q is read.
+    _PSLOT = [2, 0, 1]
+
     def _k_bufs_at(slot):  # K[.][0], K[.][1] of the slot whose low-half base is ``slot``
         return [slot, slot + fx.Int32(_SPLIT_STRIDE)]
 
@@ -1151,6 +1162,9 @@ def _core_attention(
     else:
         start_tile = fx.Int32(0)
 
+    def _tile_row0(t):  # clamped to the last tile, never guarded off the end
+        return fx.min(t, last_tile) * fx.Int32(n_block)
+
     def _kv_valid(blk_row0):
         # How many rows of [blk_row0, blk_row0+n_block) are in-bounds, clamped to
         # the WG's effective KV length kv_len_wg (0..n_block). Past the end -> 0 (a
@@ -1213,23 +1227,40 @@ def _core_attention(
             for _v in views:
                 fx.copy_atom_call(*_v)
 
-        kv0 = _kv_views(_k_lds_buf(1), start_row0)
+        kv0 = _kv_views(_k_lds_buf(_PSLOT[1]), start_row0)
         # Built here, issued below: the views are pure, so the address VALU stays in the
-        # Q global-load shadow.
-        kv_fill = _kv_views(_k_lds_buf(0), start_row0)
+        # Q global-load shadow. LO's second copy is K(start+1) into slot 2, the tile the
+        # body no longer issues once K runs ahead; HI's is V(start) into slot 0, read by
+        # body start's dead PV.
+        if KV_K_AHEAD and warp_type.is_lo:
+            kv_fill = _kv_views(
+                _k_lds_buf(_PSLOT[2]), _tile_row0(start_tile + fx.Int32(1))
+            )
+        else:
+            kv_fill = _kv_views(_k_lds_buf(_PSLOT[0]), start_row0)
         num_tdm_copies = len(kv0)
         num_async_copies = -1  # nothing increments asynccnt under TDM
         _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
-        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
+        # Copies whose destination misses Q go out BEFORE Q is read, so their global
+        # latency overlaps Q's; part2 then waits tensorcnt down to them instead of to 0.
+        # Only LO's K-ahead fill (logical slot 2) lands on Q, so it waits for the barrier.
+        _early = list(kv0)
+        _late = []
+        if KV_K_AHEAD and warp_type.is_lo:
+            _late = list(kv_fill)
+        elif not warp_type.is_lo:
+            _early += kv_fill
+        _issue_views(_early)
+        q_frags = q_mgr.load_q_to_vgpr_part2(
+            scale=softmax_scale, skip_tensorcnt=len(_early)
+        )
         # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
-        # the tile copies: the tile lands on Q's slot, gpu.barrier() does not retire LDS
-        # reads, and Q's atom is per-wave while a tile's is cooperative (wave A's Q region
-        # is written by wave B's share of the tile).
+        # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
+        # atom is per-wave while a tile's is per-producer (wave A's Q region is written by
+        # wave B's share of the tile).
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
-        _issue_views(kv0)
-        if not warp_type.is_lo:
-            _issue_views(kv_fill)
+        _issue_views(_late)
         _kv_fence(*_kv_drain)
     else:
 
@@ -1264,8 +1295,8 @@ def _core_attention(
             _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
             _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
 
-        kv0 = _kv_ptrs(_k_lds_buf(1), start_row0)
-        kv_fill = _kv_ptrs(_k_lds_buf(0), start_row0)
+        kv0 = _kv_ptrs(_k_lds_buf(_PSLOT[1]), start_row0)
+        kv_fill = _kv_ptrs(_k_lds_buf(_PSLOT[0]), start_row0)
         num_tdm_copies = -1  # nothing increments tensorcnt under V1
         num_async_copies = 0  # V1 has no per-tile count: its counter fully drains
         _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
@@ -1351,11 +1382,11 @@ def _core_attention(
     # manager-defined (V1: 2, V2: 1) — carried generically; the global->LDS ISSUE is the
     # only piece that branches on the loader. ----
     k_lds_ld = [
-        k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(i), lane_idx=lane_idx)
+        k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(_PSLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
     ]
     v_lds_ld = [
-        v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(i), lane_idx=lane_idx)
+        v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(_PSLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
     ]
     _NKB = len(k_lds_ld[0])  # ds bases per K buffer (V1: 2, V2: 1)
@@ -1367,7 +1398,7 @@ def _core_attention(
     for i in range(N_KV_PP):
         _init = _init + v_lds_ld[i]
     _SLOT_BASE = len(_init)
-    _init = _init + [_raw(_k_lds_buf(i)) for i in range(N_KV_PP)]
+    _init = _init + [_raw(_k_lds_buf(_PSLOT[i])) for i in range(N_KV_PP)]
 
     # Carried ring head: _NH of the first body's V loads, issued here (slot 0 is resident
     # -- the prologue fence just drained it) and thereafter at the end of each body.
@@ -1445,7 +1476,6 @@ def _core_attention(
         head_carry = [fx.Vector(state[_HEAD_BASE + i]) for i in range(_NH)]
         v_curr = v_slots[0]  # tile u-1: this body's PV
         k_curr = k_slots[1]  # tile u:   this body's QK
-        wr_slot = slot_of[N_KV_PP - 1]  # tile u+1's target, the slot neither gemm reads
 
         # Warp-specialized preamble: same pieces, ordered so the SIMD-mate pair (i / i+4)
         # staggers the V ring head against the global->LDS prefetch. Correctness is
@@ -1459,8 +1489,11 @@ def _core_attention(
         # case 10 (a third trace of this body), against ~2 dead L2-resident tile loads per
         # workgroup here. The clamped re-load lands in the slot body num_tiles reads as its
         # dead K, and O stages past all the slots.
-        pf = fx.min(u + fx.Int32(1), last_tile)
-        pf_row0 = pf * fx.Int32(n_block)
+        # This half's copy: LO K(u+2) into slot 0 (its K half died at body u-1; its V half
+        # is what this body reads, a different chunk), HI V(u+1) into slot 2 as before.
+        _ahead = 2 if (KV_K_AHEAD and warp_type.is_lo) else 1
+        wr_slot = slot_of[0] if _ahead == 2 else slot_of[N_KV_PP - 1]
+        pf_row0 = _tile_row0(u + fx.Int32(_ahead))
         pf_valid = _kv_valid(pf_row0)
 
         def _addr_phase():
@@ -1515,15 +1548,17 @@ def _core_attention(
             return (k_g, k_l, k_i, v_g, v_l, v_i)
 
         def _drain_barrier():
-            # Full drain: tile u must be RESIDENT here -- this body reads it as K.
-            # KV_PARTIAL_FENCE is asserted off for that reason.
+            # The producing half's own tensorcnt. K runs two bodies ahead, so LO reaches
+            # this fence with the tile it is about to read second-oldest and can leave the
+            # newest in flight. V only has one body of slack on the ring head this half
+            # issues, so HI still drains to 0.
             #
             # dscnt is drained only to _NH: the leading half issues its ring head at the
             # tail of the previous body, so a full drain here would retire it right before
             # the gemm that wants it in flight. The gemm's own last ring fragment already
             # took dscnt to 0, so every read older than the head is retired regardless --
             # the WAR wall for the slot about to be written still holds.
-            if KV_PARTIAL_FENCE:
+            if KV_PARTIAL_FENCE and warp_type.is_lo:
                 _kv_fence(num_tdm_copies, num_async_copies, num_dscnt=_NH)
             else:
                 _kv_fence(*_kv_drain, num_dscnt=_NH)
@@ -1852,9 +1887,13 @@ def _core_attention(
         + ((warp_idx >> fx.Int32(1)) & fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
         + (warp_idx >> fx.Int32(2)) * fx.Int32(_SPLIT_STRIDE)
     )
-    # The trailing body's dead clamped tile copy is still in flight; it targets final[1],
-    # the one slot O never touches, but it must not outlive the workgroup.
+    # The trailing body's dead clamped tile copies are still in flight. HI's targets
+    # final[1], a V chunk O never touches; LO's two K copies land in final[2] and final[1],
+    # and final[2] IS an O chunk -- so under K-ahead the drain needs a rendezvous behind it,
+    # since a wave only retires its own copies and O's chunk halves are shared wave pairs.
     _kv_wait(*_kv_drain)
+    if KV_K_AHEAD:
+        _bare_barrier()
     for qt in range(R):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
         # o_final[dt] lane l elem si = sum_kv P[q,kv] V[kv, dt*16+(l//16)*8+si]
