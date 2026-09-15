@@ -1,23 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Phase 0 QSA oracle unit cases (no FlyDSL kernel).
+"""QSA oracle unit cases + family A paged plumbing (no FlyDSL kernel).
 
 HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
 """
 
 from __future__ import annotations
 
+import argparse
+import itertools
 import math
 
+import pandas as pd
 import torch
 
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.qsa import (
     FAMILY_A_GQA,
     FAMILY_A_INDEXER,
     FAMILY_A_SCORE_SCALE,
     FAMILY_B_GQA,
     FAMILY_B_INDEXER,
+    gather_paged_cache,
+    gather_qsa_family_a_caches,
+    pack_paged_cache,
     qsa_expand_tail,
     qsa_indexer_scores,
     qsa_oracle,
@@ -25,6 +34,9 @@ from aiter.ops.flydsl.qsa import (
     qsa_topk_blocks,
     qsa_visible_blocks,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 
 def test_indexer_hand_checked_one_row():
@@ -168,14 +180,219 @@ def test_family_b_shape_constants():
     assert FAMILY_A_GQA.group_size == 12
 
 
-def main():
+def test_paged_roundtrip_tiny():
+    """Shuffled pages still gather back to dense (CPU, no kernel)."""
+    dense = torch.arange(48, dtype=torch.float32).view(6, 2, 4)
+    physical = torch.tensor([1, 0], dtype=torch.int32)
+    cache, table = pack_paged_cache(dense, page_size=4, physical=physical)
+    assert cache.shape == (2, 4, 2, 4)
+    assert table.tolist() == [[1, 0]]
+    got = gather_paged_cache(cache, table, n_logical=6)
+    assert torch.equal(got, dense)
+    identity = torch.arange(2, dtype=torch.int32).unsqueeze(0)
+    wrong = gather_paged_cache(cache, identity, n_logical=6)
+    assert not torch.equal(wrong, dense)
+
+
+def _query_positions(m: int, seq_len: int, device) -> torch.Tensor:
+    return torch.arange(seq_len - m, seq_len, device=device, dtype=torch.int32)
+
+
+def _pack_family_a(k_bar, k, v, page_size, device):
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    gen_kv = torch.Generator(device=device)
+    gen_kv.manual_seed(2)
+    index_k = k_bar.unsqueeze(1)  # [n_blocks, 1, D]
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen_kv)
+    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    if not torch.equal(kv_table, kv_table_v):
+        raise RuntimeError("K and V page tables diverged")
+    return index_cache, index_table, k_cache, v_cache, kv_table
+
+
+@benchmark()
+def test_qsa_family_a_plumbing(m, seq_len, page_size, dtype):
+    """Paged family A tensors + block tables; oracle on gather vs dense.
+
+    No competitor kernel. ``paged_gather`` is the only timed candidate (copy
+    through the page table). The oracle is the reference and is not timed.
+    """
+    idx = FAMILY_A_INDEXER
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtype, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device)
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(m, dtype=torch.int32, device=device)
+
+    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
+        k_bar, k, v, page_size, device
+    )
+    assert index_cache.shape[2] == idx.kv_heads
+    assert k_cache.shape[2] == gqa.kv_heads
+    assert k_cache.shape[-1] == gqa.head_dim
+
+    def paged_gather():
+        return gather_qsa_family_a_caches(
+            index_cache,
+            index_table,
+            k_cache,
+            v_cache,
+            kv_table,
+            n_blocks,
+            seq_len,
+        )
+
+    (k_bar_g, k_g, v_g), us = run_perftest(paged_gather)
+    err_kbar = checkAllclose(
+        k_bar.to(dtypes.fp32),
+        k_bar_g.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        msg="paged gather index-K",
+    )
+    err_k = checkAllclose(
+        k.to(dtypes.fp32), k_g.to(dtypes.fp32), rtol=0, atol=0, msg="paged gather K"
+    )
+    err_v = checkAllclose(
+        v.to(dtypes.fp32), v_g.to(dtypes.fp32), rtol=0, atol=0, msg="paged gather V"
+    )
+
+    dense = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=FAMILY_A_SCORE_SCALE,
+        out_dtype=torch.float32,
+    )
+    paged = qsa_oracle(
+        q_indexer,
+        k_bar_g,
+        q_gqa,
+        k_g,
+        v_g,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=FAMILY_A_SCORE_SCALE,
+        out_dtype=torch.float32,
+    )
+    err_o = checkAllclose(
+        dense.output, paged.output, rtol=1e-2, atol=1e-2, msg="oracle dense vs paged"
+    )
+    blocks_match = torch.equal(dense.block_ids, paged.block_ids)
+    indices_match = torch.equal(dense.indices, paged.indices)
+    if not blocks_match or not indices_match:
+        raise AssertionError("oracle block_ids/indices diverged after paged gather")
+
+    elem = dtype.itemsize
+    nbytes = (
+        n_blocks * idx.kv_heads * idx.head_dim
+        + 2 * seq_len * gqa.kv_heads * gqa.head_dim
+    ) * elem
+    return {
+        "gfx": get_gfx(),
+        "n_blocks": n_blocks,
+        "index_width": idx.index_width,
+        "paged_gather us": us,
+        "paged_gather TFLOPS": 0.0,
+        "paged_gather TB/s": nbytes / us / 1e6,
+        "paged_gather err": max(err_kbar, err_k, err_v, err_o),
+    }
+
+
+def _run_unit_cases():
     test_indexer_hand_checked_one_row()
     test_topk_smaller_index_wins_ties()
     test_incomplete_blocks_not_selected()
     test_gqa_matches_dense_on_selected()
     test_family_a_shapes_smoke()
     test_family_b_shape_constants()
-    print("QSA phase-0 oracle: all unit cases passed")
+    test_paged_roundtrip_tiny()
+    aiter.logger.info("QSA phase-0 oracle: all unit cases passed")
+
+
+def main():
+    _run_unit_cases()
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Family A QSA paged plumbing (oracle only; no competitor kernels)",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16],
+        help="activation dtype (family A is BF16)",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[1, 8, 512],
+        help="flattened query tokens M (decode 1..8, prefill 512)",
+    )
+    parser.add_argument(
+        "-s",
+        "--seq",
+        type=int,
+        nargs="*",
+        default=[512, 2048, 8192, 32768],
+        help="context length L in tokens (32k default; pass 131072 for 128k)",
+    )
+    parser.add_argument(
+        "-p",
+        "--page-size",
+        type=int,
+        nargs="*",
+        default=[16],
+        help="vLLM-style page size (indexer slots and GQA tokens)",
+    )
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        aiter.logger.warning("no CUDA; skipping family A plumbing sweep")
+        return
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("QSA plumbing unsupported on %s; skipping", get_gfx())
+        return
+
+    for dtype in args.dtype:
+        rows = []
+        for m, seq_len, page_size in itertools.product(
+            args.batch, args.seq, args.page_size
+        ):
+            if m > seq_len:
+                aiter.logger.warning(
+                    "skip m=%s seq_len=%s (M must fit in L)", m, seq_len
+                )
+                continue
+            rows.append(test_qsa_family_a_plumbing(m, seq_len, page_size, dtype))
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "QSA family A plumbing summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":
