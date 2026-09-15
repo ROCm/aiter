@@ -65,6 +65,7 @@ def _make_case(
     seed=0,
     device="cuda",
     dims=DIMS_DEEPSEEK,
+    output_dtype=torch.bfloat16,
 ):
     """Build one page_size-1 gather case.
 
@@ -120,9 +121,9 @@ def _make_case(
     k_prefix = torch.zeros(
         (alloc, n_heads, nope + KV_PE_DIM),
         device=device,
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
     )
-    v_prefix = torch.zeros((alloc, n_heads, v_dim), device=device, dtype=torch.bfloat16)
+    v_prefix = torch.zeros((alloc, n_heads, v_dim), device=device, dtype=output_dtype)
     return {
         "k_buffer": k_buffer,
         "k_scale": k_scale,
@@ -138,6 +139,14 @@ def _make_case(
         "scale_mode": scale_mode,
         "nope": nope,
         "v_dim": v_dim,
+        "out_scales": (
+            {
+                "k_out_scale": torch.tensor([0.73], device=device),
+                "v_out_scale": torch.tensor([0.53], device=device),
+            }
+            if output_dtype == torch.float8_e4m3fn
+            else {}
+        ),
     }
 
 
@@ -183,8 +192,27 @@ def _run_flydsl(case, weight_preshuffle=True, **kw):
         case["v_prefix"],
         num_tokens=case["num_tokens"],
         weight_preshuffle=weight_preshuffle,
-        **kw,
+        **{**case["out_scales"], **kw},
     )
+
+
+_OUTPUT_DTYPES = pytest.mark.parametrize(
+    "output_dtype", [torch.bfloat16, torch.float8_e4m3fn]
+)
+
+
+def _check_output(case):
+    for key, ref, scale_name in zip(
+        ("k_prefix", "v_prefix"), _torch_ref(case), ("k_out_scale", "v_out_scale")
+    ):
+        actual = case[key][: case["num_tokens"]].float()
+        if case["out_scales"]:
+            # Keep the BF16 test's absolute tolerance for GEMM cancellation;
+            # E4M3 rounding adds at most 1/16 relative error for normal values.
+            actual *= case["out_scales"][scale_name]
+            torch.testing.assert_close(actual, ref, rtol=0.065, atol=1e-2)
+        else:
+            checkAllclose(ref, actual, atol=1e-2, rtol=1e-2, msg=key)
 
 
 @_SKIP
@@ -203,29 +231,23 @@ def _run_flydsl(case, weight_preshuffle=True, **kw):
         (1, 12, 256, False, 1.0),
     ],
 )
+@_OUTPUT_DTYPES
 def test_gather_kv_b_proj_flydsl(
-    num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims
+    num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims, output_dtype
 ):
     case = _make_case(
-        num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims=dims
+        num_tokens,
+        n_heads,
+        alloc,
+        duplicate_indices,
+        k_scale_value,
+        output_dtype=output_dtype,
+        dims=dims,
     )
     _run_flydsl(case)
     m = num_tokens
-    k_ref, v_ref = _torch_ref(case)
-    checkAllclose(
-        k_ref,
-        case["k_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="k_prefix vs torch f32",
-    )
-    checkAllclose(
-        v_ref,
-        case["v_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="v_prefix vs torch f32",
-    )
+    _check_output(case)
+    _, v_ref = _torch_ref(case)
 
     cos = torch.nn.functional.cosine_similarity(
         case["v_prefix"][:m].float().flatten(), v_ref.flatten(), dim=0
@@ -244,7 +266,10 @@ def test_gather_kv_b_proj_flydsl(
         (512, 16, None, 1.0),
     ],
 )
-def test_gather_kv_b_proj_flydsl_block_scale(num_tokens, n_heads, alloc, k_scale_value):
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_block_scale(
+    num_tokens, n_heads, alloc, k_scale_value, output_dtype
+):
     """128x128 block scale -- the DeepSeek default quantization.
 
     The scale varies along K, so it cannot be applied once at the end; the kernel
@@ -252,64 +277,39 @@ def test_gather_kv_b_proj_flydsl_block_scale(num_tokens, n_heads, alloc, k_scale
     accumulator. This is the test that the renormalisation is exact.
     """
     case = _make_case(
-        num_tokens, n_heads, alloc, k_scale_value=k_scale_value, scale_mode="block"
+        num_tokens,
+        n_heads,
+        alloc,
+        k_scale_value=k_scale_value,
+        scale_mode="block",
+        output_dtype=output_dtype,
     )
     _run_flydsl(case)
-    m = num_tokens
-    k_ref, v_ref = _torch_ref(case)
-    checkAllclose(
-        k_ref,
-        case["k_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="k_prefix, block scale",
-    )
-    checkAllclose(
-        v_ref,
-        case["v_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="v_prefix, block scale",
-    )
+    _check_output(case)
 
 
 @_SKIP
 @pytest.mark.parametrize("num_tokens", [512, 1000])
-@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens, dims):
+@_OUTPUT_DTYPES
+@pytest.mark.parametrize(
+    "dims,scale_mode", [(DIMS_DEEPSEEK, "row"), (DIMS_DEEPSEEK, "block"), (DIMS_GLM, "row")]
+)
+def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens, dims, output_dtype, scale_mode):
     """Row-major (un-preshuffled) weight must match the preshuffled path exactly.
 
     Same GEMM, only the B-side global->LDS address map and the K-tile stride
     differ, so any difference here is an addressing bug, not arithmetic. The v
     half starts at weight row ``nope``, which the two layouts reach differently.
     """
-    case = _make_case(num_tokens, 12, dims=dims)
+    case = _make_case(num_tokens, 12, output_dtype=output_dtype, scale_mode=scale_mode, dims=dims)
     _run_flydsl(case, weight_preshuffle=False)
-    k_ref, v_ref = _torch_ref(case)
-    m = num_tokens
-    checkAllclose(
-        k_ref,
-        case["k_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="k_prefix, row-major weight",
-    )
-    checkAllclose(
-        v_ref,
-        case["v_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="v_prefix, row-major weight",
-    )
-
-    shuffled = _make_case(num_tokens, 12, dims=dims)
-    _run_flydsl(shuffled, weight_preshuffle=True)
-    assert torch.equal(
-        case["k_prefix"], shuffled["k_prefix"]
-    ), "row-major != preshuffled"
-    assert torch.equal(
-        case["v_prefix"], shuffled["v_prefix"]
-    ), "row-major != preshuffled"
+    _check_output(case)
+    first = [case[key].clone() for key in ("k_prefix", "v_prefix")]
+    _run_flydsl(case, weight_preshuffle=True)
+    for key, expected in zip(("k_prefix", "v_prefix"), first):
+        assert torch.equal(
+            case[key].view(torch.uint8), expected.view(torch.uint8)
+        ), "row-major != preshuffled"
 
 
 @_SKIP
@@ -340,14 +340,15 @@ def _supported(case, **kw):
 
 @_SKIP
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op(dims):
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op(dims, output_dtype):
     """The predicate and the op must never disagree about a configuration.
 
     Both read one ``_unsupported_reason``; this pins that they keep doing so,
     because the failure mode of a second copy is a caller routing a shape here
     that the kernel then refuses mid-forward.
     """
-    ok = _make_case(256, 12, dims=dims)
+    ok = _make_case(256, 12, output_dtype=output_dtype, dims=dims)
     assert _supported(ok)
     _run_flydsl(ok)  # and it really runs
 
@@ -502,8 +503,9 @@ def test_gather_kv_b_proj_flydsl_determinism_large_m(num_tokens, block_m):
 @_SKIP
 @pytest.mark.parametrize("block_m", [128, 256, 384])
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m):
-    """Every rope row must be written, and be a bitwise copy, for any BLOCK_M.
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m, output_dtype):
+    """Every rope row must be written with the correct output scale for any BLOCK_M.
 
     The fused rope copy maps 512 threads onto 256 rows per pass, so BLOCK_M > 256
     needs more than one pass. A single pass leaves rows 256.. of every tile
@@ -514,23 +516,36 @@ def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m):
     """
     # 1536 is divisible by all three block_m under test, so no tail masking
     # confounds the completeness check.
-    case = _make_case(1536, 12, dims=dims)
+    case = _make_case(
+        1536,
+        12,
+        output_dtype=output_dtype,
+        dims=dims,
+        k_scale_value=0.43 if output_dtype == torch.float8_e4m3fn else 1.0,
+    )
     case["k_prefix"].fill_(float("nan"))
     _run_flydsl(case, block_m=block_m)
 
     rope = case["k_prefix"][:, :, case["nope"] :]
-    assert not torch.isnan(rope).any(), f"block_m={block_m}: rope rows left unwritten"
+    assert not torch.isnan(
+        rope.float()
+    ).any(), f"block_m={block_m}: rope rows left unwritten"
 
     idx = case["kv_indices"][: case["num_tokens"]].long()
     want = case["k_buffer"][idx].reshape(-1, KV_C_DIM + KV_PE_DIM)[:, KV_C_DIM:]
-    want = want.to(torch.bfloat16).unsqueeze(1).expand(-1, case["n_heads"], -1)
-    # k_scale is 1.0 here, so the rope is a pure copy and must match bitwise.
-    assert torch.equal(rope, want), f"block_m={block_m}: rope is not a bitwise copy"
+    if case["out_scales"]:
+        scale = case["k_scale"] * case["out_scales"]["k_out_scale"].reciprocal()
+        want = (want.float() * scale).clamp(-448, 448)
+    want = want.to(output_dtype).unsqueeze(1).expand(-1, case["n_heads"], -1)
+    assert torch.equal(
+        rope.view(torch.uint8), want.view(torch.uint8)
+    ), f"block_m={block_m}: incorrect rope"
 
 
 @_SKIP
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_tail_is_untouched(dims):
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_tail_is_untouched(dims, output_dtype):
     """Rows past ``num_tokens`` must not be written.
 
     This is the check that catches a wrong ``num_records_bytes``: the caller
@@ -540,14 +555,22 @@ def test_gather_kv_b_proj_flydsl_tail_is_untouched(dims):
     to exactly that bound, so an off-by-one there shows up here too.
     """
     m, alloc = 1000, 1024
-    case = _make_case(m, 12, alloc, dims=dims)
+    case = _make_case(m, 12, alloc, output_dtype=output_dtype, dims=dims)
     case["k_prefix"].fill_(float("nan"))
     case["v_prefix"].fill_(float("nan"))
     _run_flydsl(case)
-    assert torch.isnan(case["k_prefix"][m:]).all(), "k_prefix tail was clobbered"
-    assert torch.isnan(case["v_prefix"][m:]).all(), "v_prefix tail was clobbered"
-    assert not torch.isnan(case["k_prefix"][:m]).any(), "k_prefix live rows unwritten"
-    assert not torch.isnan(case["v_prefix"][:m]).any(), "v_prefix live rows unwritten"
+    assert torch.isnan(
+        case["k_prefix"][m:].float()
+    ).all(), "k_prefix tail was clobbered"
+    assert torch.isnan(
+        case["v_prefix"][m:].float()
+    ).all(), "v_prefix tail was clobbered"
+    assert not torch.isnan(
+        case["k_prefix"][:m].float()
+    ).any(), "k_prefix live rows unwritten"
+    assert not torch.isnan(
+        case["v_prefix"][:m].float()
+    ).any(), "v_prefix live rows unwritten"
 
 
 @_SKIP
@@ -614,54 +637,6 @@ def _bench(num_tokens, n_heads, dims):
 
 
 @_SKIP
-@pytest.mark.parametrize("scale_mode", ["row", "block"])
-@pytest.mark.parametrize("weight_preshuffle", [False, True])
-@pytest.mark.parametrize("n_heads", [12, 16])
-@pytest.mark.parametrize("num_tokens,block_m", [(1, 128), (257, 256), (8192, 256)])
-def test_fp8_output(scale_mode, weight_preshuffle, n_heads, num_tokens, block_m):
-    case = _make_case(
-        num_tokens,
-        n_heads,
-        alloc=num_tokens + 31,
-        duplicate_indices=True,
-        k_scale_value=0.43,
-        scale_mode=scale_mode,
-    )
-    for key in ("k_prefix", "v_prefix"):
-        case[key] = torch.full_like(case[key], 7).to(torch.float8_e4m3fn)
-    ks = torch.tensor([0.37], device="cuda", dtype=torch.float32)
-    vs = torch.tensor([0.53], device="cuda", dtype=torch.float32)
-    _run_flydsl(
-        case,
-        weight_preshuffle=weight_preshuffle,
-        block_m=block_m,
-        k_out_scale=ks,
-        v_out_scale=vs,
-    )
-    refs = _torch_ref(case)
-    for key, ref, scale in zip(("k_prefix", "v_prefix"), refs, (ks, vs)):
-        actual = case[key][:num_tokens].float() * scale
-        # E4M3 has at most 1/16 relative rounding error; the absolute term
-        # covers subnormals and fp32 GEMM cancellation near zero.
-        torch.testing.assert_close(actual, ref, rtol=0.065, atol=0.001)
-        assert (case[key][num_tokens:].float() == 7).all()
-    # RoPE must use K's descale too, despite bypassing the GEMM epilogue.
-    # The RoPE path precombines the activation scale and reciprocal descale.
-    rope = case["k_buffer"][case["kv_indices"][:num_tokens].long(), 0, 512:].float()
-    expected_rope = (
-        (rope * (case["k_scale"] * ks.reciprocal()))
-        .clamp(-448, 448)
-        .to(torch.float8_e4m3fn)
-        .unsqueeze(1)
-        .expand(-1, n_heads, -1)
-    )
-    assert torch.equal(
-        case["k_prefix"][:num_tokens, :, 128:].view(torch.int8),
-        expected_rope.view(torch.int8),
-    )
-
-
-@_SKIP
 @pytest.mark.parametrize(
     "descale,projection",
     [(0.37, 7.029999732971191), (0.73, 78.83999633789062)],
@@ -670,15 +645,15 @@ def test_fp8_reciprocal_rounding(descale, projection):
     # An exact one-term dot product isolates output conversion from GEMM
     # accumulation error. These values land on E4M3 ties after reciprocal
     # multiplication, but just below the ties after direct fp32 division.
-    case = _make_case(257, 12, k_scale_value=projection)
+    case = _make_case(
+        257, 12, k_scale_value=projection, output_dtype=torch.float8_e4m3fn
+    )
     case["k_buffer"].zero_()
     case["k_buffer"][:, 0, 0] = 1
     case["k_buffer"][:, 0, 512:] = 1
     case["weight"].zero_()
     case["weight"][:, 0] = 1
     case["weight_scale"].fill_(1)
-    for key in ("k_prefix", "v_prefix"):
-        case[key] = case[key].to(torch.float8_e4m3fn)
     scale = torch.tensor([descale], device="cuda", dtype=torch.float32)
     # Compute the boundary reference on CPU so the device compiler cannot
     # transform the reference division into reciprocal multiplication too.
@@ -699,13 +674,11 @@ def test_fp8_reciprocal_rounding(descale, projection):
 @_SKIP
 @pytest.mark.parametrize("zero", [False, True])
 def test_fp8_saturation_and_zero(zero):
-    case = _make_case(259, 2, k_scale_value=2.0)
+    case = _make_case(259, 12, k_scale_value=2.0, output_dtype=torch.float8_e4m3fn)
     case["k_buffer"].fill_(0 if zero else 1)
     case["weight"].fill_(1)
     case["weight"][128:256].fill_(-1)
     case["weight_scale"].fill_(1)
-    for key in ("k_prefix", "v_prefix"):
-        case[key] = case[key].to(torch.float8_e4m3fn)
     scale = torch.tensor([0.001], device="cuda")
     _run_flydsl(case, k_out_scale=scale, v_out_scale=scale)
     for key, ref in zip(("k_prefix", "v_prefix"), _torch_ref(case)):
@@ -748,37 +721,15 @@ def test_fp8_output_validation(invalid):
 
 @_SKIP
 def test_fp8_graph_replay_uses_current_scales():
-    case = _make_case(257, 2)
-    for key in ("k_prefix", "v_prefix"):
-        case[key] = case[key].to(torch.float8_e4m3fn)
-    scale = torch.ones(1, device="cuda")
-    weight = shuffle_weight(case["weight"], layout=(16, 16))
-
-    def run():
-        gather_kv_b_proj_flydsl(
-            case["k_buffer"],
-            case["k_scale"],
-            case["kv_indptr"],
-            case["kv_indices"],
-            case["cu_seqlens_k"],
-            weight,
-            case["weight_scale"],
-            case["k_prefix"],
-            case["v_prefix"],
-            k_out_scale=scale,
-            v_out_scale=scale,
-        )
-
-    run()
+    case = _make_case(257, 12, output_dtype=torch.float8_e4m3fn)
+    _run_flydsl(case)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run()
-    scale.fill_(0.5)
+        _run_flydsl(case)
+    case["out_scales"]["k_out_scale"].mul_(1.5)
+    case["out_scales"]["v_out_scale"].mul_(2.0)
     graph.replay()
-    for key, ref in zip(("k_prefix", "v_prefix"), _torch_ref(case)):
-        torch.testing.assert_close(
-            case[key].float() * scale, ref, rtol=0.065, atol=0.001
-        )
+    _check_output(case)
 
 
 def _bench_fp8(num_tokens, n_heads):
