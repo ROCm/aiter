@@ -44,7 +44,7 @@ def act_mul_and_mxfp4_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
-    _LOGGER.info(f"ACT_MUL_MXFP4_QUANT: x={tuple(x.shape)} activation={activation}")
+    _LOGGER.info("ACT_MUL_MXFP4_QUANT: x=%s activation=%s", tuple(x.shape), activation)
     # Assume x is 2D-Tensor for now
     M, N = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
@@ -157,7 +157,9 @@ def act_mul_and_fp8_group_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
-    _LOGGER.info(f"ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)} activation={activation}")
+    _LOGGER.info(
+        "ACT_MUL_FP8_GROUP_QUANT: x=%s activation=%s", tuple(x.shape), activation
+    )
     # Assume x is 2D-Tensor for now
     M, N = x.shape
     assert N % 2 == 0
@@ -273,7 +275,7 @@ def fused_silu_mul(
             else out
         )
 
-    _LOGGER.info(f"fused_silu_mul: x={tuple(x.shape)} last_half={d} rows={n_rows}")
+    _LOGGER.info("fused_silu_mul: x=%s last_half=%s rows=%s", tuple(x.shape), d, n_rows)
 
     if out is None:
         out = torch.empty(*leading, d, dtype=x.dtype, device=x.device)

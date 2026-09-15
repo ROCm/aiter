@@ -220,7 +220,12 @@ def reduce_scatter(
         raise ValueError(f"M ({M}) must be divisible by world_size ({world_size})")
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: Reduce-scatter M={M}, N={N} -> M_shard={M_shard}"
+        "Rank %s/%s: Reduce-scatter M=%s, N=%s -> M_shard=%s",
+        cur_rank,
+        world_size,
+        M,
+        N,
+        M_shard,
     )
 
     # Allocate output buffer in IRIS shared memory
@@ -254,7 +259,9 @@ def reduce_scatter(
     iris_ctx.barrier()
 
     logger.info(
-        f"Rank {cur_rank}: Reduce-scatter complete, output_shard shape: {output_shard.shape}"
+        "Rank %s: Reduce-scatter complete, output_shard shape: %s",
+        cur_rank,
+        output_shard.shape,
     )
 
     return output_shard

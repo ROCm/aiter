@@ -101,7 +101,7 @@ def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
         inputs.append(data)
         # logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
 
-    logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
+    logger.info("Loaded %s captured inputs for benchmarking", len(inputs))
     return inputs
 
 
@@ -1191,7 +1191,7 @@ def run_benchmark_block_sparse_repetitions(args):
                     ]
                 )
             writer.writerow(row)
-        logger.info(f"Wrote CSV row to {csv_path}")
+        logger.info("Wrote CSV row to %s", csv_path)
 
 
 def run_benchmark_masks_list(
@@ -1414,7 +1414,9 @@ def main():
 
     # Handle captured input mode separately
     if args.load_captured:
-        logger.info(f"Running benchmark with captured inputs from: {args.captured_dir}")
+        logger.info(
+            "Running benchmark with captured inputs from: %s", args.captured_dir
+        )
         run_benchmark_captured(args)
         return 0
 

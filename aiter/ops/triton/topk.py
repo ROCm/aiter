@@ -190,7 +190,9 @@ def topk(
     Returns:
         tuple: (values, indices) both with shape (B, k), sorted in descending order.
     """
-    _LOGGER.info(f"TOPK: x={tuple(x.shape)}, k={k}, largest={largest}, sorted={sorted}")
+    _LOGGER.info(
+        "TOPK: x=%s, k=%s, largest=%s, sorted=%s", tuple(x.shape), k, largest, sorted
+    )
     if dim < 0:
         dim += x.ndim
     if dim != x.ndim - 1:

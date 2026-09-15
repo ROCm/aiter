@@ -138,9 +138,13 @@ def fused_reduce_qk_norm_rope_swa_write(
         assert state_slot_mapping.dim() == 1
 
     _LOGGER.info(
-        "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE "
-        f"M={M} num_splitk={num_splitk} heads={num_local_heads} "
-        f"D={head_dim} rd={rope_head_dim} HAS_SWA={HAS_SWA}"
+        "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE M=%s num_splitk=%s heads=%s D=%s rd=%s HAS_SWA=%s",
+        M,
+        num_splitk,
+        num_local_heads,
+        head_dim,
+        rope_head_dim,
+        HAS_SWA,
     )
 
     BLOCK_SIZE_M, num_warps, waves_per_eu = _pick_block_size_m(

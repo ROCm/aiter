@@ -57,7 +57,11 @@ def gemm_a8wfp4(
         torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
-        f"GEMM_A8FP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)}  "
+        "GEMM_A8FP4: x=%s w=%s x_scale=%s w_scale=%s  ",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scales.shape),
+        tuple(w_scales.shape),
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
