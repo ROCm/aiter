@@ -5,10 +5,12 @@
 import binascii
 import ctypes
 import hashlib
+import importlib.util
 import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +21,43 @@ from functools import cache, lru_cache, partial
 
 from jinja2 import Template
 from packaging.version import Version, parse
+
+IS_WINDOWS = sys.platform == "win32"
+NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
+# Built shared library: Python loads `.pyd`/`.dll` on Windows, `.so` elsewhere.
+LIB_BASENAME = "lib.dll" if IS_WINDOWS else "lib.so"
+# ROCm tools are bare executables on Linux and .exe/.bat wrappers on Windows.
+_EXE_SUFFIXES = (".exe", ".bat", "") if IS_WINDOWS else ("",)
+
+
+def _ninja_path(path):
+    """Escape a Windows path for a ninja build statement.
+
+    Ninja treats ' ' as a field separator and ':' as a rule separator, so the
+    drive-letter colon has to be escaped too (``C:/`` -> ``C$:/``).
+    """
+    path = path.replace("\\", "/").replace(" ", "$ ")
+    return re.sub(r"^([A-Za-z]):/", r"\1$:/", path)
+
+
+def _rocm_executable(name):
+    """Locate a ROCm tool on PATH, or inside an installed rocm-sdk-devel."""
+    for suffix in _EXE_SUFFIXES:
+        found = shutil.which(name + suffix)
+        if found:
+            return found
+    try:
+        spec = importlib.util.find_spec("_rocm_sdk_devel")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    bin_dir = os.path.join(spec.submodule_search_locations[0], "bin")
+    for suffix in _EXE_SUFFIXES:
+        candidate = os.path.join(bin_dir, name + suffix)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def get_git_commit_id_short():
@@ -56,7 +95,9 @@ if GPU_ARCH is None:
     GPU_ARCH = get_gfx_runtime()
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
-HOME_PATH = os.environ.get("HOME")
+HOME_PATH = (
+    os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+)
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
@@ -91,6 +132,24 @@ clean:
 	rm -f $(TARGET) $(OBJS)
 """)
 
+_WINDOWS_NINJA_TEMPLATE = Template("""
+cxx = hipcc
+cflags = {{cxxflags | join(" ")}} {{includes | join(" ")}}
+
+rule cxx
+  command = $cxx -c $cflags $in -o $out
+
+rule link
+  command = $cxx $in -o $out -shared
+
+{% for src in sources -%}
+build {{ src.replace('.cpp', '.obj') }}: cxx {{src}}
+{% endfor %}
+build {{target}}: link {% for src in sources %}{{ src.replace('.cpp', '.obj') }} {% endfor %}
+
+default {{target}}
+""")
+
 
 def mp_lock(
     lock_path: str,
@@ -120,10 +179,9 @@ def mp_lock(
 
 
 def get_hip_version():
-    hipconfig_home = shutil.which("hipconfig")
+    hipconfig_home = _rocm_executable("hipconfig") or "hipconfig"
     version = subprocess.run(
-        f"{hipconfig_home} --version",
-        shell=True,
+        [hipconfig_home, "--version"],
         capture_output=True,
         text=True,
         check=False,
@@ -133,7 +191,12 @@ def get_hip_version():
 
 @lru_cache
 def hip_flag_checker(flag_hip: str) -> bool:
-    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
+    hipcc = _rocm_executable("hipcc") or "hipcc"
+    ret = subprocess.run(
+        [hipcc, *flag_hip.split(), "-x", "hip", "-c", NULL_DEVICE, "-o", NULL_DEVICE],
+        capture_output=True,
+        check=False,
+    ).returncode
     if ret == 0:
         return True
     else:
@@ -244,18 +307,36 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         archs = validate_and_update_archs()
         cxxflags += [f"--offload-arch={arch}" for arch in archs]
         cxxflags = [flag for flag in set(cxxflags) if hip_flag_checker(flag)]
-        makefile_file = makefile_template.render(
-            includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
-        )
-        with open(f"{sub_build_dir}/Makefile", "w") as f:
-            f.write(makefile_file)
-        subprocess.run(
-            ["make", "build", f"-j{len(sources)}"],
-            cwd=sub_build_dir,
-            shell=False,
-            capture_output=AITER_LOG_MORE < 2,
-            check=True,
-        )
+        if IS_WINDOWS:
+            # There is no make on Windows, so drive hipcc with ninja instead.
+            ninja_file = _WINDOWS_NINJA_TEMPLATE.render(
+                includes=[f"-I{_ninja_path(include_dir)}"],
+                sources=[_ninja_path(s) for s in sources],
+                cxxflags=cxxflags,
+                target=LIB_BASENAME,
+            )
+            with open(os.path.join(sub_build_dir, "build.ninja"), "w") as f:
+                f.write(ninja_file)
+            subprocess.run(
+                ["ninja", f"-j{len(sources)}"],
+                cwd=sub_build_dir,
+                shell=False,
+                capture_output=AITER_LOG_MORE < 2,
+                check=True,
+            )
+        else:
+            makefile_file = makefile_template.render(
+                includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
+            )
+            with open(f"{sub_build_dir}/Makefile", "w") as f:
+                f.write(makefile_file)
+            subprocess.run(
+                ["make", "build", f"-j{len(sources)}"],
+                cwd=sub_build_dir,
+                shell=False,
+                capture_output=AITER_LOG_MORE < 2,
+                check=True,
+            )
 
     def final_func():
         logger.info(
@@ -273,7 +354,10 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
 def run_lib(func_name, folder=None):
     if folder is None:
         folder = func_name
-    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
+    lib_path = os.path.join(BUILD_DIR, folder, LIB_BASENAME)
+    # os.RTLD_LAZY does not exist on Windows.
+    mode = os.RTLD_LAZY if not IS_WINDOWS else 0
+    lib = ctypes.CDLL(lib_path, mode)
     return getattr(lib, func_name)
 
 
@@ -288,7 +372,7 @@ def get_default_func_name(md_name, args: tuple):
 
 
 def not_built(folder):
-    return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
+    return not os.path.exists(os.path.join(BUILD_DIR, folder, LIB_BASENAME))
 
 
 def compile_template_op(
