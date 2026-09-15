@@ -717,10 +717,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto dqdkdv_kernel_launch = [&]() {
         arg_size                  = sizeof(dqdkdv_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q >= 256 ? 512 : 256);
-        int gdx_kv = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
-        int gdx_q  = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
-        int gdx = std::max(gdx_kv, gdx_q);
+        int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q == 256 ? 512 : 256);
+        int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
+        if (a.hdim_q == 256) {
+            int gdx_q = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+            gdx = std::max(gdx, gdx_q);
+        }
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
