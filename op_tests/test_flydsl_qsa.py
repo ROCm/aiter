@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA oracle unit cases, family A paged plumbing, and live vLLM AMD kernels.
+"""QSA oracle, family A plumbing, live vLLM AMD, and #4882 Triton.
 
 HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
 """
@@ -33,6 +33,13 @@ from aiter.ops.flydsl.qsa import (
     qsa_sparse_gqa,
     qsa_topk_blocks,
     qsa_visible_blocks,
+)
+from aiter.ops.triton.attention.qsa_4882 import (
+    AITER_4882_QSA_PIN,
+    qsa_sparse_paged_gqa,
+)
+from aiter.ops.triton.attention.qsa_4882 import (
+    qsa_select_paged_tokens as qsa_4882_select_paged_tokens,
 )
 from aiter.ops.triton.attention.qsa_vllm_amd import (
     VLLM_AMD_QSA_PIN,
@@ -437,6 +444,108 @@ def test_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype):
     }
 
 
+@benchmark()
+def test_qsa_family_a_4882_triton(m, seq_len, page_size, dtype):
+    """#4882 portable Triton QSA vs the oracle. Gluon is not launched.
+
+    Indexer chain and sparse GQA are timed separately. Oracle is not timed.
+    """
+    idx = FAMILY_A_INDEXER
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device).contiguous()
+    slen = torch.full((1,), seq_len, dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(m, dtype=torch.int32, device=device)
+
+    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
+        k_bar, k, v, page_size, device
+    )
+    index_cache = index_cache.contiguous()
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    index_table = index_table.contiguous()
+    kv_table = kv_table.contiguous()
+
+    ref = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=FAMILY_A_SCORE_SCALE,
+        out_dtype=torch.float32,
+    )
+
+    def select():
+        return qsa_4882_select_paged_tokens(
+            q_indexer,
+            index_cache,
+            index_table,
+            token_to_req,
+            qpos,
+            slen,
+            idx.token_budget,
+            idx.compress_ratio,
+        )
+
+    (indices, block_ids), select_us = run_perftest(select)
+    block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
+    index_err = _set_mismatch_ratio(ref.indices, indices)
+
+    def attend():
+        return qsa_sparse_paged_gqa(
+            q_gqa, k_cache, v_cache, indices, kv_table, token_to_req
+        )
+
+    out, gqa_us = run_perftest(attend)
+    gqa_err = checkAllclose(
+        ref.output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 Triton GQA vs oracle",
+    )
+
+    w = idx.index_width
+    flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
+    flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
+    bytes_select = (
+        m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim
+    ) * dtype.itemsize
+    bytes_gqa = (
+        m * gqa.n_heads * gqa.head_dim * 2 + 2 * seq_len * gqa.kv_heads * gqa.head_dim
+    ) * dtype.itemsize
+    return {
+        "gfx": get_gfx(),
+        "aiter_4882_pin": AITER_4882_QSA_PIN,
+        "n_blocks": n_blocks,
+        "4882_triton_select us": select_us,
+        "4882_triton_select TFLOPS": flops_select / select_us / 1e6,
+        "4882_triton_select TB/s": bytes_select / select_us / 1e6,
+        "4882_triton_select err": max(block_err, index_err),
+        "4882_triton_gqa us": gqa_us,
+        "4882_triton_gqa TFLOPS": flops_gqa / gqa_us / 1e6,
+        "4882_triton_gqa TB/s": bytes_gqa / gqa_us / 1e6,
+        "4882_triton_gqa err": gqa_err,
+    }
+
+
 def _run_unit_cases():
     test_indexer_hand_checked_one_row()
     test_topk_smaller_index_wins_ties()
@@ -453,7 +562,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Family A QSA plumbing + live vLLM AMD path vs oracle",
+        description="Family A QSA plumbing + vLLM AMD + #4882 Triton vs oracle",
     )
     parser.add_argument(
         "-d",
@@ -523,6 +632,19 @@ def main():
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "QSA family A vLLM AMD summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+        rows = []
+        for m, seq_len, page_size in itertools.product(
+            args.batch, args.seq, args.page_size
+        ):
+            if m > seq_len:
+                continue
+            rows.append(test_qsa_family_a_4882_triton(m, seq_len, page_size, dtype))
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "QSA family A #4882 Triton summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
 

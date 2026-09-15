@@ -169,8 +169,13 @@ separate steps (plumbing → live AMD → #4882 → rocprof → optional NVIDIA)
       `aiter/ops/triton/_triton_kernels/attention/qsa_vllm_amd.py`
       (vLLM `836bb3839ffe`). HIP top-k via
       `aiter.ops.topk._hip_top_k_per_row_decode` (not FlyDSL top-k).
-- [ ] Pin **#4882 Triton** (`qsa_paged_mqa_logits` / `qsa_sparse_paged_gqa`)
-      and **#4882 Gluon** (gfx950, Triton `>= 3.6`, auto-dispatch only).
+- [x] Pin **#4882 Triton** (`qsa_paged_mqa_logits` / expand /
+      `qsa_sparse_paged_gqa`) onto family A paged tensors. PR head
+      `150c7bc12b45`; Triton-only launchers in
+      `aiter/ops/triton/attention/qsa_4882.py`. Separate markdown table vs
+      oracle. Gluon not imported.
+- [ ] Pin **#4882 Gluon** (gfx950, Triton `>= 3.6`, auto-dispatch only;
+      family B shapes — Gluon does not auto-dispatch family A GQA).
 - [ ] Optional NVIDIA QSA column — labeled so it cannot be mistaken for the
       AMD bar.
 - [ ] Family A table and family B table; never merge them.
