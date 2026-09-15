@@ -2022,6 +2022,27 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_gfx1250 =
         /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
         /*TDM_SCOPE*/0, /*C_VIA_LDS*/true>;
 
+// kid63: kid31's reuse at twice the grid. B_N=64 halves the tile's N span, so
+// n=1024 cuts into 16 n-tiles instead of 8 and the grid doubles -- at b=16 m=32
+// that is 256 workgroups against kid31's 128, which is the whole machine rather
+// than half of it. PMC there: kid31 and FlyDSL read the SAME bytes (EA_RDREQ
+// 2,405,535 vs 2,415,953) but kid31 runs at 2.5 TB/s against 3.2, and it is
+// the only one of the three not covering every CU (--att-target-cu 1 captured
+// nothing from it at all).
+//
+// Four waves, not kid31's eight: at 8 waves the 2x4 grid would give a 64x16
+// per-wave tile (kExpN=1, 5.0 ds_reads per WMMA). At 4 waves the 2x2 grid keeps
+// the 64x32 per-wave tile and kid31's 3.0, so the grid doubles for free.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_n64_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/128, /*B_N*/64, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
 // kid47: depth instead of width. Four waves, slots=THREE.
 //
 // ATT settled what the ring wait actually is. kid35 waits 490 cycles a
