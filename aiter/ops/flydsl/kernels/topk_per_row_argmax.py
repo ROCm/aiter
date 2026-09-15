@@ -30,12 +30,31 @@ from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import Float32, Int32, const_expr, gpu, range_constexpr
+from flydsl.expr import (
+    BFloat16,
+    Float16,
+    Float32,
+    Int32,
+    const_expr,
+    gpu,
+    range_constexpr,
+)
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature, ord_signed_f32
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
 
-_VEC = 4
+# A 16-byte load whatever the dtype -- four fp32, eight of either half format --
+# so the element count per vector travels with it. Everything downstream counts
+# vectors: the split rule, the slice bounds, the column arithmetic. All of them
+# read this, and none of them may reach for a module-level default instead.
+VEC_BY_ELEM = {Float32: 4, BFloat16: 8, Float16: 8}
+# One ordering rule for all three: widen to fp32, then `ord_signed_f32`. fp32
+# covers the range and the precision of both half formats, subnormals included,
+# so the widen is exact -- injective and order-preserving -- and ties to the
+# smallest column and NaN over +inf follow by construction rather than by a
+# second rule someone has to keep in step with the first.
+_ELEM_TAG = {Float32: "f32", BFloat16: "bf16", Float16: "f16"}
+_VEC = VEC_BY_ELEM[Float32]
 # Swept jointly with the split rule below -- 64/128/256/512 against every split
 # count, on the same 34 cells -- because the two are coupled: a narrower block
 # absorbs less of a slice, which is what the split rule decides. 256 is the best
@@ -69,14 +88,19 @@ _MIN_SLICE_VECTORS = 512
 _LONG_ROW_VECTORS = 16384
 
 
-def topk_per_row_argmax_splits(rows: int, width: int) -> int:
+def topk_per_row_argmax_splits(rows: int, width: int, vec: int = _VEC) -> int:
     """How many workgroups share one row.
 
     Enough of them to fill the part, and few enough that each still has a slice
     worth launching for. At 16384 rows of 2048 columns this is 1 -- the rows fill
     it on their own -- and at one row of 262144 it is 128, which is 11x.
+
+    `vec` is the caller's element count per vector, which the dtype sets. The
+    thresholds below are in vectors rather than columns, so a bf16 row -- half
+    the bytes, half the vectors -- reaches them where its byte count does, not
+    where its column count does. Measured per dtype; see the sweep note above.
     """
-    vectors = (width + _VEC - 1) // _VEC
+    vectors = (width + vec - 1) // vec
     by_fill = max(1, -(-_TARGET_WORKGROUPS // max(rows, 1)))
     by_work = (
         max(1, vectors // _MAX_SLICE_VECTORS) if vectors > _LONG_ROW_VECTORS else 1
@@ -86,7 +110,10 @@ def topk_per_row_argmax_splits(rows: int, width: int) -> int:
 
 @cache
 def build_topk_per_row_argmax_module(
-    splits: int, block_threads: int = _BLOCK_THREADS, vec: int = _VEC
+    splits: int,
+    elem=Float32,
+    block_threads: int = _BLOCK_THREADS,
+    vec: int | None = None,
 ):
     """Compile the two halves of a `splits`-way per-row argmax.
 
@@ -94,11 +121,18 @@ def build_topk_per_row_argmax_module(
     where the slice kernel writes the answer itself and there is nothing to
     fold. The row width is a runtime value -- nothing here is sized by it, which
     is what lets one build serve every width.
+
+    `elem` is the score element type. Only the slice half reads scores, so the
+    fold is the same kernel for every dtype; the partials it folds are int32
+    ordering keys, which is what lets that be true.
     """
     if splits < 1:
         raise ValueError(f"splits must be positive, got {splits}")
     if block_threads & (block_threads - 1):
         raise ValueError(f"block must be a power of two, got {block_threads}")
+    if elem not in VEC_BY_ELEM:
+        raise ValueError(f"no argmax build for {elem}; have {list(VEC_BY_ELEM)}")
+    vec = VEC_BY_ELEM[elem] if vec is None else vec
 
     @fx.struct
     class SharedStorage:
@@ -118,7 +152,13 @@ def build_topk_per_row_argmax_module(
 
         @flyc.kernel(
             name="topk_per_row_argmax_"
-            + kernel_signature(fold=folding, sp=splits, blk=block_threads, vec=vec),
+            + kernel_signature(
+                fold=folding,
+                sp=splits,
+                blk=block_threads,
+                vec=vec,
+                ty=_ELEM_TAG[elem],
+            ),
             known_block_size=[block_threads, 1, 1],
         )
         def argmax_kernel(
@@ -171,7 +211,7 @@ def build_topk_per_row_argmax_module(
                     fx.rocdl.make_buffer_tensor(
                         fx.slice(scores, (row, None)), max_size=False
                     ),
-                    fx.make_layout(_VEC, 1),
+                    fx.make_layout(vec, 1),
                 )
                 # Whole vectors per workgroup, rounded up, so the last slice is
                 # the short one and the bounds-check covers its tail.
@@ -186,11 +226,14 @@ def build_topk_per_row_argmax_module(
                 for vec_idx in range(first + tid, last, Int32(block_threads)):
                     src = fx.slice(score_row, (None, vec_idx))
                     fragment = fx.make_fragment_like(src)
-                    fx.copy(buf_copy_atom(vec * 4, Float32), src, fragment)
+                    fx.copy(buf_copy_atom(vec * (elem.width // 8), elem), src, fragment)
                     loaded = fx.Vector(fx.memref_load_vec(fragment))
                     for j in range_constexpr(vec):
-                        col = vec_idx * Int32(_VEC) + Int32(j)
-                        key = ord_signed_f32(loaded[j])
+                        col = vec_idx * Int32(vec) + Int32(j)
+                        value = loaded[j]
+                        key = ord_signed_f32(
+                            value if elem is Float32 else value.to(Float32)
+                        )
                         better = (col < row_len) & (key > my_key)
                         my_key = better.select(key, my_key)
                         my_col = better.select(col, my_col)

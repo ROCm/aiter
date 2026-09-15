@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL backend for the DeepSeek MLA fused gather + kv_b_proj expansion (gfx950).
+"""FlyDSL backend for the MLA fused gather + kv_b_proj expansion (gfx950).
 
 Supported: fp8 KV cache (OCP e4m3), fp8 weight in either row-major or
 ``shuffle_weight((16,16))`` layout, per-output-row *or* 128x128 block weight
@@ -19,9 +19,9 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 
-from .kernels.gather_gemm_8wave import compile_gather_kv_b_proj_8w
+from .kernels.gather_gemm_8wave import compile_gather_kv_b_proj_8w, lds_block_n
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 # The MLA latent layout, fixed by the model.
@@ -40,13 +40,46 @@ def lds_bytes(block_m: int, block_n: int) -> int:
     return _LDS_BYTES_PER_BLOCK_UNIT * (int(block_m) + int(block_n))
 
 
+@functools.lru_cache(maxsize=1)
+def _lds_capacity() -> int:
+    """Memoized: ``get_rocm_arch`` is a per-call host cost."""
+    return get_lds_capacity_bytes(get_rocm_arch().split(":", 1)[0])
+
+
+def block_n_of(nope: int, v_dim: int, head_tiles: int) -> int:
+    """Per-workgroup width of the padded ``[k | pad | v | pad]`` head output."""
+    return 2 * lds_block_n(nope, v_dim) // head_tiles
+
+
+def _default_head_tiles(nope: int, v_dim: int) -> int:
+    """Workgroups per head: one, or two when a head that wide would keep LDS
+    from holding a 256-row M tile beside it."""
+    return 1 if lds_bytes(256, block_n_of(nope, v_dim, 1)) <= _lds_capacity() else 2
+
+
+@functools.lru_cache(maxsize=1)
+def _cu_count() -> int:
+    """Memoized: ``get_cu_num`` shells out to rocminfo."""
+    return get_cu_num()
+
+
+def _default_block_m(block_n: int, n_tiles_n: int, m_rows: int) -> int:
+    """Largest supported BLOCK_M with the rows to fill it: the 128-row tile while
+    its grid still covers the GPU in one pass, the 256-row tile past that."""
+    if lds_bytes(256, block_n) > _lds_capacity():
+        return 128
+    return 128 if -(-int(m_rows) // 128) * n_tiles_n <= _cu_count() else 256
+
+
 def _config_reason(
     *,
     n_heads: int,
     nope: int,
     v_dim: int,
     block_m: int,
+    head_tiles: int,
     waves_per_eu: int,
+    per_row_scale: bool,
     m_rows: int | None = None,
 ) -> str | None:
     """Why the kernel cannot serve this configuration, or None if it can.
@@ -57,14 +90,20 @@ def _config_reason(
     would drift, and drift reads as "declines a shape it handles" or, worse,
     "accepts one it does not".
     """
-    block_n = nope + v_dim  # BLOCK_N is one head
+    block_n = block_n_of(nope, v_dim, head_tiles)
     if block_m < 128 or block_m % 128 != 0:
         return f"BLOCK_M must be >=128 and %128==0, got {block_m}"
-    if nope != 128 or v_dim != 128:
+    if nope % 16 != 0 or v_dim % 16 != 0:
         return (
-            f"this backend requires qk_nope_head_dim == v_head_dim == 128 (the "
-            f"k/v split is the MFMA accumulator-group boundary, not a runtime "
+            f"qk_nope_head_dim and v_head_dim must be multiples of 16 (the k/v "
+            f"split is the MFMA accumulator-group boundary, not a runtime "
             f"offset), got nope={nope} v_head_dim={v_dim}"
+        )
+    if not per_row_scale and (nope != 128 or v_dim != 128):
+        return (
+            f"a 128x128 block scale needs each of the k and v halves to be "
+            f"exactly one 128-row scale block, so that one scalar per K tile "
+            f"covers it; got nope={nope} v_head_dim={v_dim}"
         )
     if int(waves_per_eu) < 1:
         return (
@@ -72,7 +111,7 @@ def _config_reason(
             f"rocdl.waves_per_eu attribute), got {waves_per_eu}"
         )
     need = lds_bytes(block_m, block_n)
-    have = get_lds_capacity_bytes(get_rocm_arch().split(":", 1)[0])
+    have = _lds_capacity()
     if need > have:
         return f"BLOCK_M={block_m} needs {need} B of LDS, limit is {have} B"
     # No num_blocks ceiling: past _BUFFER_SPAN_MAX the kernel addresses the
@@ -113,7 +152,7 @@ def _unsupported_reason(
     v_prefix: Tensor,
     *,
     shuffled_kv_cache: bool = False,
-    block_m: int = 256,
+    block_m: int | None = None,
     waves_per_eu: int = 2,
 ) -> str | None:
     """Why this backend cannot serve these tensors, or None if it can.
@@ -196,8 +235,12 @@ def _unsupported_reason(
         n_heads=n_heads,
         nope=nope,
         v_dim=v_dim,
-        block_m=block_m,
+        # `block_m=None` is the op's default, and it then picks a tile that fits;
+        # 128 is the smallest, so if that clears LDS every choice does.
+        block_m=128 if block_m is None else block_m,
+        head_tiles=_default_head_tiles(nope, v_dim),
         waves_per_eu=waves_per_eu,
+        per_row_scale=_is_per_row_scale(kv_proj_scale),
     )
 
 
@@ -219,6 +262,7 @@ def compile_gather_kv_b_proj(
     nope: int,
     v_dim: int,
     block_m: int,
+    head_tiles: int,
     waves_per_eu: int,
     xcd_swizzle: int,
     weight_preshuffle: bool,
@@ -231,13 +275,16 @@ def compile_gather_kv_b_proj(
         nope=nope,
         v_dim=v_dim,
         block_m=block_m,
+        head_tiles=head_tiles,
         waves_per_eu=waves_per_eu,
+        per_row_scale=per_row_scale,
     )
     return compile_gather_kv_b_proj_8w(
         n_heads=int(n_heads),
         nope=int(nope),
         v_dim=int(v_dim),
         BLOCK_M=int(block_m),
+        head_tiles=int(head_tiles),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
         weight_preshuffle=bool(weight_preshuffle),
@@ -261,9 +308,14 @@ def _as_i8(t: Tensor) -> Tensor:
 _NUM_XCDS = 8
 
 
-def _default_xcd(m_rows: int) -> int:
+def _default_xcd(m_rows: int, block_m: int, head_tiles: int) -> int:
     """Pick xcd_swizzle -- the ``wgm`` of the XCD tile remap -- from the row count."""
-    num_pid_m = -(-int(m_rows) // 256)
+    # The ladder below is calibrated for one tile per head. A split head puts
+    # several workgroups on every gathered row, so the remap has to hold a row's
+    # tiles on one XCD to reuse it, and the choice collapses to a row cutoff.
+    if head_tiles > 1:
+        return 0 if int(m_rows) <= 896 else 4
+    num_pid_m = -(-int(m_rows) // int(block_m))
     if num_pid_m <= 8:
         return 0
     if num_pid_m <= 48:
@@ -279,15 +331,15 @@ def gather_kv_b_proj_flydsl(
     kv_indptr: Tensor,  # unused, kept for signature parity with the Triton op
     kv_indices: Tensor,  # [total_kv] int32, one cache slot per token
     kv_prefix_sum_context_lens: Tensor,  # unused, see kv_indptr
-    kv_proj_weight: Tensor,  # [n_heads*256, 512] fp8, shuffle_weight(w, (16,16))
-    kv_proj_scale: Tensor,  # [n_heads*256] or [n_heads*256, 1] fp32, per-row
-    k_prefix: Tensor,  # [total_kv, n_heads, 192] bf16, written in place
-    v_prefix: Tensor,  # [total_kv, n_heads, 128] bf16, written in place
+    kv_proj_weight: Tensor,  # [n_heads*(nope+v_dim), 512] fp8, shuffle_weight(w, (16,16))
+    kv_proj_scale: Tensor,  # [weight_n] or [weight_n, 1] fp32, per-row
+    k_prefix: Tensor,  # [total_kv, n_heads, nope+64] bf16, written in place
+    v_prefix: Tensor,  # [total_kv, n_heads, v_dim] bf16, written in place
     *,
     num_tokens: int | None = None,
     weight_preshuffle: bool = True,
     shuffled_kv_cache: bool = False,
-    block_m: int = 256,
+    block_m: int | None = None,
     waves_per_eu: int = 2,
     xcd_swizzle: int | None = None,
 ) -> None:
@@ -302,6 +354,9 @@ def gather_kv_b_proj_flydsl(
     workspace at its maximum; it defaults to ``k_prefix.shape[0]``. Rows past it
     are neither read nor written -- their gathered indices are clamped by the
     kv_indices descriptor and their stores are dropped by the output descriptor.
+
+    ``block_m`` defaults to ``None``, which takes the largest tile that fits in
+    LDS and has the rows to fill it.
 
     ``xcd_swizzle`` defaults to ``None``, which lets :func:`_default_xcd` pick
     it from the live row count; pass an int to pin it. It is a compile-time
@@ -345,7 +400,13 @@ def gather_kv_b_proj_flydsl(
     if scale.dtype != torch.float32:
         scale = scale.to(torch.float32)
 
-    xcd_swizzle = _default_xcd(m_rows) if xcd_swizzle is None else int(xcd_swizzle)
+    head_tiles = _default_head_tiles(nope, v_dim)
+    if block_m is None:
+        block_m = _default_block_m(
+            block_n_of(nope, v_dim, head_tiles), n_heads * head_tiles, m_rows
+        )
+    if xcd_swizzle is None:
+        xcd_swizzle = _default_xcd(m_rows, block_m, head_tiles)
 
     # The config half already ran in `_unsupported_reason`; this is here for
     # `m_rows`, which only exists once `num_tokens` is resolved.
@@ -354,7 +415,9 @@ def gather_kv_b_proj_flydsl(
         nope=nope,
         v_dim=v_dim,
         block_m=block_m,
+        head_tiles=head_tiles,
         waves_per_eu=waves_per_eu,
+        per_row_scale=per_row_scale,
         m_rows=m_rows,
     )
 
@@ -363,6 +426,7 @@ def gather_kv_b_proj_flydsl(
         nope=int(nope),
         v_dim=int(v_dim),
         block_m=int(block_m),
+        head_tiles=int(head_tiles),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
         weight_preshuffle=bool(weight_preshuffle),
