@@ -147,7 +147,11 @@ def gemm_afp4wfp4_(
         y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
     _LOGGER.info(
-        f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+        "GEMM_AFPWFP4: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
+        x.shape,
+        w.shape,
+        x_scales.shape,
+        w_scales.shape,
     )
 
     assert backend in (

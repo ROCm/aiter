@@ -163,7 +163,7 @@ def dynamic_mxfp4_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
-    _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info("DYNAMIC_MXFP4_QUANT: x=%s", x.shape)
     # Assume x is 2D-Tensor for now
     M, N = x.shape
 

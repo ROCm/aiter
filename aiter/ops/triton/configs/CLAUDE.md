@@ -176,7 +176,10 @@ default file and for `"any"`. **Do not discard it**; it is how callers and
 tuning tooling detect a shape running on untuned numbers. Call sites that
 legitimately ignore it use `config, _ = _get_config(...)`.
 
-The returned config is a fresh deep copy, safe to mutate.
+The returned config is a fresh shallow copy, safe to mutate. Bucket entries are
+flat mappings of scalar tuning values (the `test_gemm_config_flat` guard keeps
+them that way), so a deep copy would only add hot-path overhead — same rule
+`get_conv_config()` already follows.
 
 ### File contents
 

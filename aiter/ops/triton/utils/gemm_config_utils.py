@@ -5,7 +5,6 @@
 helpers, on top of the shared core in ``config_utils``.
 """
 
-import copy
 import functools
 import itertools
 
@@ -38,8 +37,8 @@ def _get_gemm_config_cached(
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
-    ``get_gemm_config()`` instead, which returns a defensive deep-copy so
-    callers can freely mutate the returned dict without polluting the cache.
+    ``get_gemm_config()`` instead, which returns a defensive copy so callers
+    can freely mutate the returned dict without polluting the cache.
 
     Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
     default named ``DEFAULT.json``). ``backend`` is declared by the caller and
@@ -146,13 +145,15 @@ def get_gemm_config(
         B: Batch dimension for batched GEMM (optional)
 
     Returns:
-        Dictionary with the config params (a fresh deep-copy safe to mutate),
+        Dictionary with the config params (a fresh shallow copy, safe to
+        mutate -- GEMM entries are flat mappings of scalar tuning values, so a
+        deep copy only adds hot-path overhead, as in :func:`get_conv_config`),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
         config_name, M, N, K, bounds, specialized_filename, backend, B
     )
-    return copy.deepcopy(config), is_tuned
+    return dict(config), is_tuned
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
