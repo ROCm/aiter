@@ -205,7 +205,7 @@ def test_enable_flag_is_opt_in_only():
 
 def test_byte_overrides():
     # ONESHOT_MAX_VAR applies in both modes -- exact mode's default here is
-    # oneshot_max_exact (48 KiB for TP8/pcie), so leaving mode unset still
+    # oneshot_max_exact (256 KiB for TP8/pcie), so leaving mode unset still
     # exercises the override against a real baseline.
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
         assert P.resolve("pcie", 8).oneshot_max == 65536
@@ -215,10 +215,10 @@ def test_byte_overrides():
         assert P.resolve("pcie", 4, mode="fast").mesh_max == 1048576
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="-1"):
-        assert P.resolve("pcie", 8).oneshot_max == (48 << 10)
+        assert P.resolve("pcie", 8).oneshot_max == (256 << 10)
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="lots"):
-        assert P.resolve("pcie", 8).oneshot_max == (48 << 10)
+        assert P.resolve("pcie", 8).oneshot_max == (256 << 10)
 
 
 def test_exact_mode_ignores_mesh_max_override():

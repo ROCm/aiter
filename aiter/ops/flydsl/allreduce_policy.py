@@ -66,13 +66,13 @@ class FamilyPolicy:
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     # --- PCIe: Policy from measurements --------------------
     ("pcie", 2): FamilyPolicy(
-        oneshot_max=512 << 10, oneshot_max_exact=512 << 10, mesh_max=4 << 20
+        oneshot_max=384 << 10, oneshot_max_exact=1536 << 10, mesh_max=3 << 20
     ),
     ("pcie", 4): FamilyPolicy(
-        oneshot_max=96 << 10, oneshot_max_exact=96 << 10, mesh_max=12 << 20
+        oneshot_max=96 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=12 << 20
     ),
     ("pcie", 8): FamilyPolicy(
-        oneshot_max=32 << 10, oneshot_max_exact=48 << 10, mesh_max=12 << 20
+        oneshot_max=32 << 10, oneshot_max_exact=256 << 10, mesh_max=12 << 20
     ),
     # --- xGMI: Not yet measured, conservative placeholder --------------------
     #

@@ -16,8 +16,8 @@ with ``cross_device_reduce``); the two-shot schedules quantize to INT4/INT6.
 By default (``AITER_FLY_AR_ACCURACY=exact``) only the one-shot is ever
 reachable -- above its ceiling this path declines the payload rather than
 quantize it, so the caller falls through to whatever it would otherwise
-dispatch to. ``AITER_FLY_AR_ACCURACY=fast`` unlocks the mesh/ring schedules for
-larger payloads, quantized, still preferring the exact one-shot wherever that
+dispatch to. ``AITER_FLY_AR_ACCURACY=fast`` unlocks the quantized mesh/ring
+schedules for larger payloads, still preferring the exact one-shot wherever that
 costs nothing.
 """
 

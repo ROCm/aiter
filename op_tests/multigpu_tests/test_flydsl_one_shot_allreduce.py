@@ -205,9 +205,9 @@ def _spawn(
     world_size: int,
     pairs: list[tuple[int, int]],
     *,
-    atoms: int = DEFAULT_ATOMS,
-    grid_cap: int = DEFAULT_GRID_CAP,
-    fanout: str = DEFAULT_FANOUT,
+    atoms: int | None = DEFAULT_ATOMS,
+    grid_cap: int | None = DEFAULT_GRID_CAP,
+    fanout: str | None = DEFAULT_FANOUT,
     mode: str = "shapes",
     iters: int = RUN_AHEAD_ITERS,
 ) -> list:
@@ -240,12 +240,6 @@ def _spawn(
             init_method,
             "--tp",
             str(world_size),
-            "--atoms",
-            str(atoms),
-            "--grid-cap",
-            str(grid_cap),
-            "--fanout",
-            fanout,
             "--mode",
             mode,
             "--tokens",
@@ -255,6 +249,15 @@ def _spawn(
             "--iters",
             str(iters),
         ]
+        # Omitted, not defaulted: OneShotAllReduce distinguishes an unset knob
+        # ("walk ONESHOT_LADDER and pick by payload size") from a pinned one,
+        # and only the unset form exercises _pick_cfg at all.
+        if atoms is not None:
+            cmd += ["--atoms", str(atoms)]
+        if grid_cap is not None:
+            cmd += ["--grid-cap", str(grid_cap)]
+        if fanout is not None:
+            cmd += ["--fanout", fanout]
         if rank == 0:
             cmd += ["--out", out_path]
         log = open(  # noqa: SIM115
@@ -343,6 +346,41 @@ def test_one_shot_allreduce_run_ahead(world_size):
         assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+def test_one_shot_allreduce_ladder(world_size):
+    """The shipped ``ONESHOT_LADDER``, across a payload range that crosses its
+    rung boundaries.
+
+    Every other case here pins ``atoms``/``grid_cap``/``fanout``, which takes
+    ``OneShotAllReduce`` down its single-rung path and leaves ``_pick_cfg``
+    -- and therefore every multi-rung ladder -- uncovered. That was harmless
+    while each world size had one rung; TP2 and TP4 now have two, so switching
+    rungs mid-stream is live behaviour: a different engine, with its own IPC
+    inbox and its own device-side colour counter, selected per payload.
+
+    ``SHAPES`` spans 14 KiB to 224 KiB at HIDDEN=7168, which straddles both
+    shipped boundaries (TP4 at 64 KiB, TP2 at 96 KiB). Run-ahead is included
+    because the colour/parity state is per engine, so alternating across a
+    boundary is what would expose a rung switch desynchronising the ranks.
+    """
+    pairs = [(m, HIDDEN) for m in SHAPES]
+    ranks = _spawn(world_size, pairs, atoms=None, grid_cap=None, fanout=None)
+    for rank, shape_bads in enumerate(ranks):
+        bad = [b for b in shape_bads if b]
+        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+    ahead = _spawn(
+        world_size,
+        [(RUN_AHEAD_M, HIDDEN)],
+        atoms=None,
+        grid_cap=None,
+        fanout=None,
+        mode="run_ahead",
+    )
+    for rank, bad in enumerate(ahead):
+        assert not bad, f"tp={world_size} run_ahead, rank {rank}: {bad}"
+
+
 def main():
     if ARCH not in _SUPPORTED_ARCHS:
         print(f"OneShotAllReduce unsupported on {ARCH}; skipping")
@@ -350,9 +388,11 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("-tp", type=int, default=2, choices=SUPPORTED_WORLDS)
-    ap.add_argument("--atoms", type=int, default=DEFAULT_ATOMS)
-    ap.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
-    ap.add_argument("--fanout", default=DEFAULT_FANOUT, choices=("peer", "atom"))
+    # Unset by default: a bare run then covers the shipped ladder, which is
+    # what production walks. Pass any of them to pin a single rung instead.
+    ap.add_argument("--atoms", type=int, default=None)
+    ap.add_argument("--grid-cap", type=int, default=None)
+    ap.add_argument("--fanout", default=None, choices=("peer", "atom"))
     args = ap.parse_args()
 
     n = torch.cuda.device_count()
@@ -391,9 +431,9 @@ if __name__ == "__main__":
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--init-method", default=None)
     parser.add_argument("--tp", type=int, default=2)
-    parser.add_argument("--atoms", type=int, default=DEFAULT_ATOMS)
-    parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
-    parser.add_argument("--fanout", default=DEFAULT_FANOUT, choices=("peer", "atom"))
+    parser.add_argument("--atoms", type=int, default=None)
+    parser.add_argument("--grid-cap", type=int, default=None)
+    parser.add_argument("--fanout", default=None, choices=("peer", "atom"))
     parser.add_argument("--mode", default="shapes", choices=("shapes", "run_ahead"))
     parser.add_argument("--tokens", default="")
     parser.add_argument("--hiddens", default="")

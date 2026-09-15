@@ -124,17 +124,26 @@ DEFAULT_GRID_CAP = 64
 # The host builds one engine per rung and selects by payload size at launch.
 # Created from a tuning sweep.
 #
-#   TP2  atoms=4  -- fattest tile, because at N=2 there is wire volume to spare
-#                    and the payload runs far enough up to want fewer flags.
-#   TP4  atoms=1  -- narrowest tile and a *smaller* grid cap; this window tops
-#                    out at 96 KiB, where the schedule is flag-bound and blocks
-#                    are worth more than tile width.
-#   TP8  atoms=4  -- the fattest tile again, for the opposite reason: the window
-#                    is only 48 KiB wide, the fanout is to 7 peers, and cutting
-#                    the flag count matters more than the handful of blocks lost.
+#   TP2  atoms=2, cap 64   -- below 96 KiB the schedule is flag-bound and
+#                             blocks are worth more than tile width.
+#        atoms=4, cap 128  -- above it the trade reverses, and the wider cap
+#                             matters because this window runs to 1.5 MiB: at
+#                             a 16 KiB tile that is 96 tiles, so a cap of 64
+#                             would leave half the blocks running two
+#                             serialized handshake rounds.
+#   TP4  atoms=1, cap 64   -- narrowest tile below 64 KiB, same flag-bound
+#                             reason as TP2's first rung.
+#        atoms=4, cap 64, fanout=atom -- above 64 KiB the fatter tile wins, and
+#                             at atoms>1 the fanout order is a real knob:
+#                             walking the peers of one atom starts more links
+#                             sooner than handing each destination a contiguous
+#                             run. Measured only at TP4.
+#   TP8  atoms=4, cap 64   -- the fattest tile, for the opposite reason: the
+#                             fanout is to 7 peers and cutting the flag count
+#                             matters more than the handful of blocks lost.
 ONESHOT_LADDER = {
-    2: ((0, 4, 128, "peer"),),
-    4: ((0, 1, 32, "peer"),),
+    2: ((0, 2, 64, "peer"), (96 << 10, 4, 128, "peer")),
+    4: ((0, 1, 64, "peer"), (64 << 10, 4, 64, "atom")),
     8: ((0, 4, 64, "peer"),),
 }
 
@@ -536,8 +545,12 @@ def make_one_shot_allreduce_kernel(
         ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     # Every compile-time knob that changes the emitted code has to be in the
-    # symbol name, or two variants collide in the JIT cache.
-    tag = f"ws{world_size}_a{atoms}_{inbox_memory}_{fanout}"
+    # symbol name, or two variants collide in the JIT cache. At ``atoms == 1``, 
+    # the (peer, atom) product has one atom per peer, so both fanout orders 
+    # unroll to the same store sequence.
+    tag = f"ws{world_size}_a{atoms}_{inbox_memory}"
+    if atoms > 1:
+        tag += f"_{fanout}"
     if probe != "full":
         tag += f"_{probe}"
     if spin_sleep:

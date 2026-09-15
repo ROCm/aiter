@@ -27,12 +27,12 @@ ladder is 4 points per octave, so nothing here resolves finer than ~19%.
 
 Two answers come out per world size, not one:
 
-* ``fast`` -- minimise latency, whatever the numerics cost.
-* ``exact`` -- keep the bit-exact one-shot as long as it stays within
-  ``--exact-slack`` of the fastest option. The one-shot lands at ~55 dB and the
-  quantized families at ~19 dB, so the default trades up to 10% of latency to
-  leave the model's numerics untouched. This is the shipped default; ``fast``
-  is what an explicit opt-out selects.
+* ``fast`` -- minimise latency, whatever the numerics cost. Chooses among all
+  three families (one-shot, mesh, ring).
+* ``exact`` -- ``AITER_FLY_AR_ACCURACY=exact`` (the shipped default) never
+  builds a quantized engines at all: above its one-shot ceiling,
+  ``should_fly_all_reduce`` just declines and the caller falls through to
+  whatever it would otherwise dispatch to.
 
 Usage::
 
@@ -121,9 +121,65 @@ class Sample:
     variant: dict  # candidate key -> JIT symbol that actually ran
 
 
-def load(paths, metric: str) -> list[Sample]:
+def check_timing_provenance(df, *, require: str | None) -> str:
+    """The measurement regime every input row agrees on, or exit.
+
+    A threshold sits where two curves cross, so it is only as good as the metric
+    both were measured with. Eager and graph-replay numbers differ most at
+    exactly the decode sizes these thresholds live at, and the difference is
+    *per candidate family* -- so a fit over a mixture does not merely average
+    two regimes, it moves the crossover. Refuse rather than warn.
+
+    A CSV with no ``timing`` column predates the provenance and cannot be
+    vouched for. It is reported as ``unknown`` and warned about rather than
+    refused -- such files are still worth reading against, and the CSVs the
+    current tables were fitted from are all of this kind -- but
+    ``--require-timing`` will reject them.
+    """
+    if "timing" not in df.columns:
+        logger.warning(
+            "# inputs carry no `timing` column, so the measurement regime "
+            "cannot be verified."
+        )
+        return "unknown"
+    seen = sorted({str(v) for v in df["timing"].dropna().unique()})
+    if len(seen) > 1:
+        raise SystemExit(
+            f"inputs mix timing regimes {seen}. A dispatch threshold is a "
+            "crossover between two candidates, and the eager/graph gap is both "
+            "large at decode sizes and different per candidate family, so a "
+            "mixed fit moves the boundary. Re-run the sweep with one --timing."
+        )
+    got = seen[0] if seen else "unknown"
+    if require is not None and got != require:
+        raise SystemExit(
+            f"inputs were measured with --timing {got}, but --require-timing "
+            f"{require} was asked for."
+        )
+    return got
+
+
+def load(paths, metric: str, *, require_timing: str | None = None):
+    """``(samples, provenance)`` for *paths*.
+
+    The provenance -- which timing regime and which FlyDSL accuracy mode the
+    sweep ran under -- decides how the result may be used, so it travels with
+    the samples rather than being re-derived by each consumer.
+    """
     frames = [pd.read_csv(p) for p in paths]
     df = pd.concat(frames, ignore_index=True)
+    timing = check_timing_provenance(df, require=require_timing)
+    accuracy = "unknown"
+    if "fly accuracy" in df.columns:
+        modes = sorted({str(v) for v in df["fly accuracy"].dropna().unique()})
+        if len(modes) > 1:
+            raise SystemExit(
+                f"inputs mix FlyDSL accuracy regimes {modes}: the candidate set "
+                "itself differs between them, so they cannot be pooled."
+            )
+        accuracy = modes[0] if modes else "unknown"
+    prov = {"timing": timing, "accuracy": accuracy}
+    logger.info("# inputs: timing=%s, fly accuracy=%s", timing, accuracy)
     keys = [c.key for c in CANDIDATES if f"{c.key} {metric}" in df.columns]
     if not keys:
         raise SystemExit(
@@ -154,7 +210,7 @@ def load(paths, metric: str) -> list[Sample]:
     return [
         Sample(nbytes=n, tp=tp, hidden=k, us=cell, variant=variants[(tp, n, k)])
         for (tp, n, k), cell in sorted(best.items(), key=lambda kv: kv[0])
-    ]
+    ], prov
 
 
 def collapse_aliases(samples, keys) -> tuple[list[str], dict]:
@@ -292,6 +348,111 @@ def fit_families(samples, *, exact_slack: float | None):
 
 
 # --------------------------------------------------------------------------
+# Level 2b: the real "exact" mode ceiling -- one-shot vs. what it declines to
+# --------------------------------------------------------------------------
+
+# What CudaCommunicator.all_reduce actually falls through to once FlyDSL
+# declines a payload in exact mode: `use_new` is hardcoded True with no env
+# lever, so `cdr_naive` never runs in production, and rccl is reachable only
+# past AITER_CUSTOM_AR_MAX_SIZE (64 MiB) -- far above anything measured here.
+# This is the oracle the shipped `oneshot_max_exact` is fitted against.
+EXACT_FALLBACK_PRIMARY = ("cdr",)
+# cdr's own 1stage/2stage internal dispatch has occasional cliffs (see the
+# KB); cdr_naive and rccl are measured and reported alongside as a robustness
+# check on the same boundary, not folded into the shipped table.
+EXACT_FALLBACK_ROBUST = ("cdr", "cdr_naive", "rccl")
+
+CDR_1STAGE_MAX_BYTES = {4: 160 << 10, 8: 80 << 10}
+
+
+def cdr_edge_thresholds(tp: int) -> tuple[int, ...]:
+    """Ceiling candidates that mirror ``cdr``'s 1stage/2stage edge for *tp*.
+
+    ``edge - 1``: a ceiling is inclusive (``nbytes <= oneshot_max``) while
+    ``cdr``'s branch is exclusive (``bytes < edge``), so the payload landing
+    exactly on the edge is the first one ``cdr`` handles with its 2stage kernel
+    and must fall through rather than be kept.
+    """
+    edge = CDR_1STAGE_MAX_BYTES.get(int(tp))
+    return () if edge is None else (edge - 1,)
+
+
+def fit_oneshot_exact_ceiling(samples, oneshot_keys, oracle_keys, extra=()):
+    """Largest one-shot ceiling by worst-case regret against *oracle_keys*.
+
+    This is exactly ``fit_families``'s plain (``exact_slack=None``) search,
+    narrowed to a single threshold and to a caller-supplied oracle instead of
+    the mesh/ring families: below the ceiling the policy runs the best pinned
+    one-shot variant, above it the best of *oracle_keys*, and the fit picks
+    the round threshold minimising worst-case regret against the per-shape
+    best of the two. No accuracy slack applies -- every key on both sides is
+    exact, so the only question is speed.
+
+    The returned ceiling never exceeds the largest size actually measured.
+    ``round_thresholds`` offers infinity as a candidate -- correctly, since "the
+    one-shot wins everywhere" has to be expressible -- but shipping it would put
+    the boundary somewhere no measurement supports, and it would flow into
+    ``windows["oneshot"]`` and re-open the un-windowed ladder fit that
+    ``test_ladder_rungs_fall_inside_their_dispatch_window`` exists to prevent.
+    That answer is reported as a saturation warning instead: extend the sweep.
+    """
+    sizes = [s.nbytes for s in samples]
+    # *extra* admits non-round candidates that mirror a discontinuity in the
+    # fallback itself -- see CDR_1STAGE_MAX_BYTES for why those are exempt from
+    # the round-threshold rule.
+    grid = sorted(set(round_thresholds(min(sizes), max(sizes))) | set(extra))
+    oracle = {s.nbytes: best_in(s, [*oneshot_keys, *oracle_keys])[1] for s in samples}
+    graded = [s for s in samples if math.isfinite(oracle[s.nbytes])]
+
+    def regrets(ceiling):
+        out = []
+        for s in graded:
+            keys = oneshot_keys if s.nbytes <= ceiling else oracle_keys
+            us = best_in(s, keys)[1]
+            if not math.isfinite(us):
+                return None
+            out.append((s.nbytes, us / oracle[s.nbytes]))
+        return out
+
+    scored = []
+    for ceiling in grid:
+        r = regrets(ceiling)
+        if r is None:
+            continue
+        worst = max(x[1] for x in r)
+        scored.append((worst, sum(x[1] for x in r) / len(r), ceiling, r))
+    if not scored:
+        raise SystemExit(
+            "no feasible one-shot exact ceiling; is a fallback candidate absent?"
+        )
+    # Ties on (worst, mean) cost nothing either way -- prefer the widest such
+    # ceiling, so a wash in speed is resolved in favour of running the
+    # bit-exact one-shot rather than declining to the fallback.
+    worst, mean, ceiling, r = min(scored, key=lambda t: (t[0], t[1], -t[2]))
+    # Bounded by where the *one-shot* data stops, not where any data stops. The
+    # one-shot rows are gated above by AITER_BENCH_FLY1S_MAX_KB, so a sweep can
+    # easily carry cdr out to 114 MiB and the one-shot only to 8 -- and then
+    # every ceiling past 8 MiB is infeasible for want of a numerator rather than
+    # because the one-shot lost. Landing on that edge is the same "ran out of
+    # evidence" answer as landing on infinity and is reported the same way.
+    one_max = max(
+        (s.nbytes for s in graded if math.isfinite(best_in(s, oneshot_keys)[1])),
+        default=0,
+    )
+    saturated = ceiling >= one_max
+    if saturated:
+        logger.warning(
+            "  exact ceiling saturated at %s: the one-shot never loses inside "
+            "the range it was measured over, so this is the edge of the sweep "
+            "and not a fitted boundary. Raise AITER_BENCH_FLY1S_MAX_KB (or "
+            "extend the shape ladder) to find the real one.",
+            human(one_max),
+        )
+    ceiling = min(ceiling, one_max)
+    return ceiling, worst, mean, r, saturated
+
+
+# --------------------------------------------------------------------------
 # Level 1: which variant inside a family
 # --------------------------------------------------------------------------
 
@@ -393,6 +554,52 @@ def fit_ladder(
 # --------------------------------------------------------------------------
 
 
+def reconcile_family_row(link, tp, one_fast, one_exact, mesh_max) -> int:
+    """``oneshot_max_exact`` adjusted to satisfy ``FamilyPolicy``'s invariants.
+
+    The two ceilings come from independent searches -- ``oneshot_max`` against
+    the quantized families, ``oneshot_max_exact`` against ``cdr`` -- so nothing
+    in the fit makes them order correctly. ``FamilyPolicy.__post_init__`` raises
+    on both ``oneshot_max_exact < oneshot_max`` and ``mesh_max <
+    oneshot_max_exact``, which would make the paste-ready block below fail at
+    import rather than at review.
+
+    Both violations are meaningful, not bookkeeping, so each is reported:
+
+    * ``exact < fast``: the one-shot beats the *mesh* further up than it beats
+      ``cdr``. Widening exact to match is the conservative repair -- the mode
+      exists to avoid quantizing, and exact mode already ran the one-shot at
+      that size in the fast policy.
+    * ``exact > mesh_max``: the fast fit has the one-shot losing to the mesh
+      somewhere the exact fit still wants it. Clamping to ``mesh_max`` keeps the
+      families partitioning by size; it does not change what exact mode runs,
+      since exact mode collapses everything above its ceiling anyway.
+    """
+    out = one_exact
+    if out < one_fast:
+        logger.warning(
+            "  (%r, %d): oneshot_max_exact (%s) fitted below oneshot_max (%s). "
+            "The one-shot outruns the mesh further than it outruns cdr; "
+            "widening exact to the fast ceiling.",
+            link,
+            tp,
+            human(out),
+            human(one_fast),
+        )
+        out = one_fast
+    if out > mesh_max:
+        logger.warning(
+            "  (%r, %d): oneshot_max_exact (%s) fitted above mesh_max (%s); "
+            "clamping so the families still partition by size.",
+            link,
+            tp,
+            human(out),
+            human(mesh_max),
+        )
+        out = mesh_max
+    return out
+
+
 def human(n: int) -> str:
     if n <= 0:
         return "0"
@@ -425,7 +632,104 @@ def same_work(a: str | None, b: str | None) -> bool:
     return key(a) == key(b)
 
 
-def audit_auto(samples, slack: float, verbose: bool) -> int:
+def audit_declines(samples, slack: float, oracle_keys, oneshot_keys, verbose) -> int:
+    """Grade the payloads exact mode *refuses*. Returns failures.
+
+    Above ``oneshot_max_exact`` the dispatcher declines and the caller falls
+    through to ``cdr``, so ``fly_auto`` reads n/a and drops out of the latency
+    audit entirely. That silence is the whole risk of the exact policy: a
+    ceiling set too low gives away the one-shot's win at every size above it and
+    nothing in the report says so.
+
+    So the decline is audited as its own decision. At each declined size, compare
+    the best pinned one-shot against the fallback the decline actually reaches.
+    Declining is correct when the fallback is at least as fast, or within
+    *slack*; a one-shot that beats it by more than that is a ceiling that should
+    have been wider, and is reported with the size so the table can move.
+    """
+    failures = 0
+    for tp in sorted({s.tp for s in samples}):
+        declined = [
+            s for s in samples if s.tp == tp and "fly_auto" not in s.us and s.us
+        ]
+        if not declined:
+            continue
+        rows = []
+        for s in declined:
+            one_key, one_us = best_in(s, oneshot_keys)
+            _fb_key, fb_us = best_in(s, oracle_keys)
+            if not (math.isfinite(one_us) and math.isfinite(fb_us)):
+                continue
+            rows.append((s.nbytes, fb_us / one_us, one_key, one_us, fb_us))
+        # A fallback reading that some *larger* payload beats by a wide margin
+        # is a straggler, not a cliff -- these collectives are barrier
+        # synchronised and one slow rank moves the whole number. Without this,
+        # a single transient reads as "CEILING TOO LOW" by 10x and buries the
+        # real findings. `audit_auto` filters the same class of noise via
+        # same_work; a decline has no variant to compare, so monotonicity in
+        # payload size is the available invariant.
+        noisy = set()
+        for i, (nbytes, _ratio, _k, _one, fb_us) in enumerate(rows):
+            cheaper = [r[4] for r in rows if r[0] > nbytes]
+            if cheaper and fb_us > 3 * min(cheaper):
+                noisy.add(i)
+        if noisy:
+            for i in sorted(noisy):
+                logger.info(
+                    "     noise %-10s fallback %.1f us, beaten by a larger "
+                    "payload's %.1f us -- straggler, not a cliff",
+                    human(rows[i][0]),
+                    rows[i][4],
+                    min(r[4] for r in rows if r[0] > rows[i][0]),
+                )
+            rows = [r for i, r in enumerate(rows) if i not in noisy]
+        if not rows:
+            continue
+        if not rows:
+            logger.info(
+                "## TP%d  %d declined shape(s), none gradeable "
+                "(no pinned one-shot measured above the ceiling)",
+                tp,
+                len(declined),
+            )
+            continue
+        bad = [r for r in rows if r[1] > slack]
+        failures += len(bad)
+        worst = max(rows, key=lambda r: r[1])
+        logger.info(
+            "## TP%d  declines: %d shape(s) above the ceiling, worst forgone "
+            "speedup %.3fx at %s, %d/%d beyond tolerance",
+            tp,
+            len(rows),
+            worst[1],
+            human(worst[0]),
+            len(bad),
+            len(rows),
+        )
+        for nbytes, ratio, one_key, one_us, fb_us in bad:
+            logger.warning(
+                "     CEILING TOO LOW %-10s one-shot %s %.1f us vs fallback "
+                "%.1f us -- declining gives up %.3fx",
+                human(nbytes),
+                one_key,
+                one_us,
+                fb_us,
+                ratio,
+            )
+        if verbose:
+            for nbytes, ratio, one_key, one_us, fb_us in rows:
+                logger.info(
+                    "     %-10s %.3fx  one-shot %s %.1f us, fallback %.1f us",
+                    human(nbytes),
+                    ratio,
+                    one_key,
+                    one_us,
+                    fb_us,
+                )
+    return failures
+
+
+def audit_auto(samples, slack: float, verbose: bool, *, accuracy: str = "fast") -> int:
     """Grade the shipped dispatcher against the pinned rows. Returns failures.
 
     ``fly_auto`` routes through ``FlyDSLAllReduce``, i.e. the tables as actually
@@ -435,16 +739,20 @@ def audit_auto(samples, slack: float, verbose: bool) -> int:
     only thing that asks whether the table, once compiled into engines and
     driven through the real dispatch path, still lands where the fit said.
 
-    The sweep this reads from must have been run with
-    ``--fly-accuracy fast`` (the bench's default): under ``exact`` mode
-    ``fly_auto`` never reaches the mesh/ring rungs, so it would only ever be
-    compared against the one-shot family and this audit would say nothing
-    about the two levels of heuristic it exists to check.
+    *accuracy* is the regime the sweep ran under, and it changes the oracle:
 
-    Graded against the best pinned variant of *any* family, not just the family
-    the policy chose, so a wrong family choice is caught as well as a wrong
-    rung. Its own SQNR is not checked here -- the benchmark already asserts that
-    per row, and the interesting property is latency.
+    * ``fast`` -- the full three-family policy. The pinned mesh/ring rows are in
+      the sweep and in the oracle, so a wrong *family* choice is caught as well
+      as a wrong rung.
+    * ``exact`` -- only the one-shot is reachable, so the pinned mesh/ring rows
+      were never measured. The alternative to dispatching is not another FlyDSL
+      family, it is ``cdr``; grading against the one-shot family alone would
+      check the ladder and call the policy green without ever asking whether
+      running FlyDSL at all was right. The exact fallback keys join the oracle,
+      and ``audit_declines`` covers the sizes this row is absent from.
+
+    Its own SQNR is not checked here -- the benchmark already asserts that per
+    row, and the interesting property is latency.
     """
     pinned = [
         c.key
@@ -452,6 +760,12 @@ def audit_auto(samples, slack: float, verbose: bool) -> int:
         for c in BY_FAMILY[f]
         if c.key not in AUTO_KEYS.get(f, ())
     ]
+    if accuracy == "exact":
+        pinned = [
+            c.key
+            for c in BY_FAMILY["oneshot"]
+            if c.key not in AUTO_KEYS.get("oneshot", ())
+        ] + list(EXACT_FALLBACK_PRIMARY)
     tps = sorted({s.tp for s in samples})
     failures = 0
     for tp in tps:
@@ -557,8 +871,11 @@ def main():
         "--exact-slack",
         type=float,
         default=1.10,
-        help="how much latency the exact-preferring policy may give up to keep\n"
-        "the bit-exact one-shot, as a ratio. Default 1.10.",
+        help="legacy: how much latency the fit_families exact(legacy, vs\n"
+        "mesh/ring) row may give up to keep the bit-exact one-shot, as a\n"
+        "ratio. Default 1.10. Printed for comparison only -- the shipped\n"
+        "oneshot_max_exact comes from fit_oneshot_exact_ceiling instead, which\n"
+        "has no slack knob (see EXACT_FALLBACK_PRIMARY/ROBUST).",
     )
     ap.add_argument(
         "--max-rungs", type=int, default=3, help="ladder length ceiling per family"
@@ -593,24 +910,55 @@ def main():
         "the end-to-end acceptance test for the tables; run it on a sweep that\n"
         "includes -c fly_auto alongside the pinned rows.",
     )
+    ap.add_argument(
+        "--require-timing",
+        choices=["graph", "eager"],
+        default=None,
+        help="refuse inputs not measured with this --timing regime. The CSVs\n"
+        "carry the regime per row and mixtures are always refused; this is for\n"
+        "pinning a fit to one of them on purpose, e.g. in a script that must\n"
+        "never accidentally consume an eager sweep.",
+    )
     ap.add_argument("--verbose", action="store_true", help="per-shape regret detail")
     args = ap.parse_args()
 
-    samples = load(args.csv, args.metric)
+    samples, prov = load(args.csv, args.metric, require_timing=args.require_timing)
     if args.audit_auto:
         logger.info(
-            "# auditing fly_auto over %d shape(s), metric %r, tolerance %.0f%%\n",
+            "# auditing fly_auto over %d shape(s), metric %r, accuracy %s, "
+            "tolerance %.0f%%\n",
             len(samples),
             args.metric,
+            prov["accuracy"],
             (args.ladder_slack - 1) * 100,
         )
-        n = audit_auto(samples, args.ladder_slack, args.verbose)
+        n = audit_auto(
+            samples, args.ladder_slack, args.verbose, accuracy=prov["accuracy"]
+        )
+        if prov["accuracy"] == "exact":
+            # The sizes exact mode refuses are not in the latency audit at all;
+            # grading the decline is the other half of the same question.
+            n += audit_declines(
+                samples,
+                args.ladder_slack,
+                EXACT_FALLBACK_PRIMARY,
+                [c.key for c in BY_FAMILY["oneshot"]],
+                args.verbose,
+            )
         logger.info(
             "\n%s",
             f"FAILURES: {n}" if n else "PASS: every shape within tolerance",
         )
         raise SystemExit(1 if n else 0)
-    holdout = load(args.holdout, args.metric) if args.holdout else []
+    if prov["accuracy"] == "exact":
+        raise SystemExit(
+            "these inputs were swept with --fly-accuracy exact, which measures "
+            "no mesh/ring rows at all -- fit_families has no mesh or ring family "
+            "to fit and would exit on the first world size. Fit from a "
+            "--fly-accuracy fast sweep (it carries the one-shot and cdr rows the "
+            "exact ceiling needs too), and use an exact sweep with --audit-auto."
+        )
+    holdout = load(args.holdout, args.metric)[0] if args.holdout else []
     tps = sorted({s.tp for s in samples})
     logger.info(
         "# fit from %d file(s), %d shape(s), TP %s, metric %r, link %r\n",
@@ -621,7 +969,10 @@ def main():
         args.link,
     )
 
+    oneshot_keys = [c.key for c in BY_FAMILY["oneshot"]]
     fam_rows, ladder_rows = [], []
+    exact_ceiling: dict[tuple[str, int], int] = {}
+    exact_worst: dict[tuple[str, int], float] = {}
     for tp in tps:
         sub = [s for s in samples if s.tp == tp]
         logger.info(
@@ -634,9 +985,10 @@ def main():
 
         for mode, slack in (("fast", None), ("exact", args.exact_slack)):
             one, mesh, worst, mean, detail = fit_families(sub, exact_slack=slack)
+            label = "fast" if mode == "fast" else "exact(legacy, vs mesh/ring)"
             logger.info(
-                "  %-5s  oneshot <= %-9s  mesh <= %-9s   worst %.3fx  mean %.3fx",
-                mode,
+                "  %-27s oneshot <= %-9s  mesh <= %-9s   worst %.3fx  mean %.3fx",
+                label,
                 human(one),
                 human(mesh),
                 worst,
@@ -666,11 +1018,49 @@ def main():
                         human(bad[0]),
                     )
 
+        # The real "exact" mode ceiling: one-shot vs. the exact fallback its
+        # decline path actually reaches (see EXACT_FALLBACK_PRIMARY/ROBUST).
+        # This -- not the fit_families exact(legacy) row above -- is what
+        # feeds the shipped oneshot_max_exact.
+        new_ceiling = {}
+        for elabel, oracle_keys in (
+            ("primary", EXACT_FALLBACK_PRIMARY),
+            ("robust", EXACT_FALLBACK_ROBUST),
+        ):
+            ceiling, worst, mean, detail, _sat = fit_oneshot_exact_ceiling(
+                sub, oneshot_keys, oracle_keys, extra=cdr_edge_thresholds(tp)
+            )
+            new_ceiling[elabel] = ceiling
+            if elabel == "primary":
+                exact_worst[(args.link, tp)] = worst
+            logger.info(
+                "  exact vs %-7s          oneshot <= %-9s               "
+                "worst %.3fx  mean %.3fx  (oracle: %s)",
+                elabel,
+                human(ceiling),
+                worst,
+                mean,
+                "+".join(oracle_keys),
+            )
+            if args.verbose:
+                for nbytes, ratio in detail:
+                    if ratio > 1.001:
+                        logger.info("      %-10s %.3fx", human(nbytes), ratio)
+        if new_ceiling["robust"] != new_ceiling["primary"]:
+            logger.warning(
+                "  exact ceiling: primary (cdr only, %s) differs from robust "
+                "(cdr/cdr_naive/rccl, %s) -- shipping primary, since cdr is\n"
+                "  what production actually falls through to.",
+                human(new_ceiling["primary"]),
+                human(new_ceiling["robust"]),
+            )
+        exact_ceiling[(args.link, tp)] = new_ceiling["primary"]
+
         # Each family's ladder is fitted only over the sizes the family policy
         # actually sends it. The exact-mode one-shot window is the wider of the
         # two, so use it -- a rung the fast mode never reaches is harmless, a
         # missing rung the exact mode does reach is not.
-        one_exact = next(r[3] for r in fam_rows if r[:3] == (args.link, tp, "exact"))
+        one_exact = new_ceiling["primary"]
         one_fast, mesh_max = next(
             (r[3], r[4]) for r in fam_rows if r[:3] == (args.link, tp, "fast")
         )
@@ -729,19 +1119,19 @@ def main():
     for link, tp, mode, one, mesh, worst in fam_rows:
         if mode != "fast":
             continue
-        ex = next(r for r in fam_rows if r[:3] == (link, tp, "exact"))
+        one_exact = reconcile_family_row(link, tp, one, exact_ceiling[(link, tp)], mesh)
         logger.info(
             "    (%r, %d): FamilyPolicy(oneshot_max=%d, oneshot_max_exact=%d, "
             "mesh_max=%d),  # %s / %s / %s, worst %.3fx",
             link,
             tp,
             one,
-            ex[3],
+            one_exact,
             mesh,
             human(one),
-            human(ex[3]),
+            human(one_exact),
             human(mesh),
-            max(worst, ex[5]),
+            max(worst, exact_worst[(link, tp)]),
         )
     logger.info("}\n")
     for tp, family, rungs, worst in ladder_rows:

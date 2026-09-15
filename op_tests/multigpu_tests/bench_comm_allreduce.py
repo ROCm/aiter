@@ -68,9 +68,22 @@ the quantizing candidates whose wire format is several times smaller: the
 question the table answers is "how fast does my (M, hidden) all-reduce finish",
 not "how efficiently is the wire used".
 
-Every ``us`` is hipEvent wall time bracketing the call, not summed per-kernel
-device time, so it includes the peer-wait that dominates the 1-stage kernel.
-The torch profiler is not usable here -- see the note in ``_bench_shape``.
+**``us`` is HIP-graph replay time by default** (``--timing graph``): capture the
+collective, replay it, divide. That is the metric a captured deployment sees --
+decode is captured -- and it is the only fair kernel-to-kernel comparison here.
+
+``--timing eager`` switches to hipEvent wall time around the Python call. Read
+that number knowing what it contains: ``run_perftest`` brackets a loop of
+back-to-back calls, so once host cost per call exceeds device time the GPU
+starves and the measurement *is* the host cost. That cost also differs per
+candidate family (``cdr``/``qr`` go through pybind, the FlyDSL rows through
+``_run_compiled``, ``rccl`` through an aten op plus a ``copy_``), so eager
+partly ranks candidates by how much Python sits in their bench thunk -- a
+property of this harness, not of the kernel. Every boundary in
+``allreduce_policy`` is a crossover *between* families, so that bias lands
+straight on the shipped thresholds. Either way the peer-wait that dominates the
+1-stage kernel is included, and the torch profiler is not usable here -- see
+the note in ``_bench_shape``.
 
 Which ``cross_device_reduce_*`` runs is chosen by the C++ host dispatch in
 ``csrc/include/custom_all_reduce.cuh`` (``CustomAllreduce::allreduce``), keyed on
@@ -126,10 +139,10 @@ Examples::
     # dispatch-threshold sweep: a byte ladder too long for a command line, and
     # a CSV of the raw numbers to fit against. The default shape list jumps
     # 168 KiB -> 1.75 MiB -> 14 MiB and both family crossovers hide in those
-    # gaps; AITER_BENCH_FLY1S_MAX_KB lifts the one-shot's policy ceiling so its
-    # rows survive past where the crossover might be rather than stopping short
-    # of it. See op_tests/multigpu_tests/shapes/README.md.
-    AITER_BENCH_FLY1S_MAX_KB=8192 \
+    # gaps -- pinned fly_1stage* rows survive across the whole ladder by
+    # default (see _FLY1S_DEFAULT_CEILING); AITER_BENCH_FLY1S_MAX_KB would
+    # only be needed to narrow the window instead. See
+    # op_tests/multigpu_tests/shapes/README.md.
     python3 op_tests/multigpu_tests/bench_comm_allreduce.py -tp 4 \
         -c fly_int4 fly_int4_ring fly_1stage fly_1stage_a4 \
         --shape-csv op_tests/multigpu_tests/shapes/ar_sweep_a_small.csv \
@@ -244,9 +257,6 @@ try:
     from aiter.ops.flydsl.one_shot_allreduce import (
         OneShotAllReduce,
     )
-    from aiter.ops.flydsl.one_shot_allreduce import (
-        max_payload_bytes as _fly1s_max_bytes,
-    )
     from aiter.ops.flydsl.quick_allreduce_int4 import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
@@ -259,7 +269,6 @@ except Exception:  # noqa: BLE001
     QuickAllReduceInt4 = None
     OneShotAllReduce = None
     MIN_PAYLOAD_BYTES = 0
-    _fly1s_max_bytes = None
     ALGORITHMS = {}
     _resolve_codecs = None
     has_xgmi_peer_links = None
@@ -281,6 +290,34 @@ _FLY_ENV = "AITER_FLY_AR"
 _FLY_ACCURACY_ENV = "AITER_FLY_AR_ACCURACY"
 _FLY_ACCURACY_CHOICES = ("fast", "exact")
 _FLY_ACCURACY_DEFAULT = "fast"
+
+# How `us` is measured. Recorded in the report header and in every CSV row, so
+# a fit can refuse to mix regimes -- the two are not comparable and the
+# difference is largest exactly where the decode thresholds live.
+_TIMING_CHOICES = ("graph", "eager")
+_TIMING_DEFAULT = "graph"
+_GRAPH_INNER_DEFAULT = 10
+
+
+def _bench_fly_accuracy_mode() -> str:
+    """The bench's own accuracy regime: ``--fly-accuracy``, as seen by a
+    worker process via ``_FLY_ACCURACY_ENV``.
+
+    Read by ``applicable()`` so pinned FlyDSL rows are gated the same way
+    ``fly_auto`` is -- "exact" has no mesh/ring window in production, so a
+    pinned mesh/ring row is not "relevant for the mode" there either.
+    """
+    return os.environ.get(_FLY_ACCURACY_ENV, _FLY_ACCURACY_DEFAULT)
+
+
+def _aiter_origin() -> str:
+    """Filesystem root of the ``aiter`` package this process actually imported."""
+    try:
+        import aiter as _a
+
+        return str(Path(_a.__file__).resolve().parent)
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def _peer_link_type() -> str:
@@ -537,7 +574,9 @@ CANDIDATES = (
     # to be the *quantized* one even in fast mode even though it is bit-exact
     # at decode sizes: one row spans both accuracy classes because the
     # schedule changes underneath it, which is exactly the thing being tested.
-    Candidate("fly_auto", "flyauto", 14.0, False),  # 55 at decode / 18.7 at prefill (fast)
+    Candidate(
+        "fly_auto", "flyauto", 14.0, False
+    ),  # 55 at decode / 18.7 at prefill (fast)
     Candidate("rccl", "rccl", 40.0, True),  # 51 / 69
 )
 CANDIDATE_KEYS = [c.key for c in CANDIDATES]
@@ -592,8 +631,15 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
             return False
         # INT3 on TP4/TP8 is disabled upstream for poor kernel performance, not
         # for correctness -- benchmarking it there would advertise a path
-        # production refuses to take.
-        return not (cand.quant == "INT3" and world_size != 2)
+        # production refuses to take. Unconditional: a stricter accuracy regime
+        # must not be the thing that re-enables it.
+        if cand.quant == "INT3" and world_size != 2:
+            return False
+        # Same rule as the `fly` mesh/ring rows below: an exact-mode deployment
+        # ships no lossy kernel, so a quantizing quick-reduce level is not
+        # "relevant for the mode" there. `FP` is the one level that is not a
+        # codec -- it lands at the bf16 rounding floor alongside cdr.
+        return cand.quant == "FP" or _bench_fly_accuracy_mode() == "fast"
     if cand.family == "fly":
         # Deliberately *not* gated on QuickAllReduceInt4's own payload floor, which the
         # engines here disable with min_bytes=0.
@@ -602,6 +648,7 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
+            and _bench_fly_accuracy_mode() == "fast"
         )
     if cand.family == "flyauto":
         # Gated by the dispatcher's own policy rather than by a constant here:
@@ -625,18 +672,36 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
     return True  # rccl
 
 
+# The pinned fly1s rows default to this rather than to MAX_PAYLOAD_BYTES_BY_WORLD
+# (the live oneshot_max_exact): that constant is a *policy* -- where fly_auto
+# should stop dispatching to the one-shot -- not a correctness limit, since the
+# kernel is exact at any size.
+#
+# 64 MiB rather than unbounded. The one-shot pushes (N-1)*S and handshakes once
+# per tile, so at TP8/114 MiB it is ~7300 sequential round trips per call --
+# minutes of wall clock per candidate under graph replay, to measure a size no
+# policy would route here. 64 MiB is far past every shipped ceiling (the widest
+# is 1.5 MiB), so a fit can still see the crossover and a long way beyond it,
+# and it matches AITER_CUSTOM_AR_MAX_SIZE -- the largest payload any custom path
+# handles. AITER_BENCH_FLY1S_MAX_KB moves it either way for one run.
+_FLY1S_DEFAULT_CEILING = 64 << 20
+
+
 def _fly1s_ceiling(world_size: int) -> int:
     """Payload ceiling for the one-shot rows, overridable for the sweep.
 
-    ``MAX_PAYLOAD_BYTES`` is a *policy*, not a correctness limit -- the kernel
-    is exact at every size -- so measuring where the policy should sit means
-    lifting it. ``AITER_BENCH_FLY1S_MAX_KB`` does that for one run without
-    editing the shipped constant.
+    Independent of world size and of whatever ``oneshot_max_exact`` is shipped
+    today -- see the module constant's comment. ``AITER_BENCH_FLY1S_MAX_KB``
+    moves it for a single run without editing this function, e.g. to focus a
+    dispatch-ladder sweep on a specific window or to look past 64 MiB.
     """
     kb = os.environ.get("AITER_BENCH_FLY1S_MAX_KB")
     if kb:
         return int(kb) << 10
-    return 0 if _fly1s_max_bytes is None else _fly1s_max_bytes(world_size)
+    # HAS_FLY_INT4, not `_fly1s_max_bytes is not None`: the ceiling no longer
+    # derives from the shipped policy, so the import is only an availability
+    # probe and saying so directly is clearer.
+    return _FLY1S_DEFAULT_CEILING if HAS_FLY_INT4 else 0
 
 
 def sqnr_db(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -829,11 +894,11 @@ def _variant_of(cand: Candidate, fly, fly1s, flyauto, nbytes: int) -> str | None
     eng = (
         fly.get(cand.fly_cfg)
         if cand.family == "fly"
-        else fly1s.get(cand.fly1s_cfg)
-        if cand.family == "fly1s"
-        else flyauto
-        if cand.family == "flyauto"
-        else None
+        else (
+            fly1s.get(cand.fly1s_cfg)
+            if cand.family == "fly1s"
+            else flyauto if cand.family == "flyauto" else None
+        )
     )
     return eng.variant(int(nbytes)) if eng is not None else None
 
@@ -886,6 +951,81 @@ def _fly_kwargs(cfg: tuple, names: tuple) -> dict:
     size), and an unset codec from a pinned one.
     """
     return {n: v for n, v in zip(names, cfg) if v is not None}
+
+
+def _bench_graph(thunk, *, num_iters, num_warmup, inner, group, label="candidate"):
+    """hipEvent-timed HIP-graph replay. Returns ``(output, us_per_call)``.
+
+    Same ``(data, time)`` order ``run_perftest`` returns, so the two timing
+    paths in ``_bench_shape`` unpack identically.
+
+    Why not ``run_perftest(testGraph=True)``: it times the replay through the
+    torch profiler, and this bench cannot use the profiler at all -- spawned
+    ranks get one that records CPU ops but no GPU activity, and the custom-AR
+    and FlyDSL candidates register no aten op, so the event table comes back
+    empty and ``get_trace_perf`` raises on the missing ``host_time_sum``.
+
+    ``graph_capture()`` is required, not cosmetic. It enters ``ca_comm.capture()``,
+    whose exit flushes the buffer addresses the graph recorded
+    (``custom_all_reduce.py:capture``), and it owns the side stream RCCL capture
+    needs. ``stream=gc.stream`` is what puts the capture on *that* stream rather
+    than on ``torch.cuda.graph``'s own class-level one. Capturing
+    without either records a different code path than the one that replays.
+
+    ``inner`` calls per graph, so the replay is back-to-back collectives with no
+    host in between -- the run-ahead case the double-buffered inbox is built
+    for, and a closer model of production than eager is.
+
+    The tensor returned is what a **replay** produced, not what a subsequent
+    eager call produced. The buffer is poisoned and the graph replayed once
+    more before it is read, so a capture that dropped a launch or replayed a
+    stale buffer fails the SQNR gate. Grading an eager call instead would score
+    that capture clean, because every thunk writes into the same preallocated
+    output and the eager call would simply overwrite the evidence.
+    """
+    from aiter.dist.parallel_state import graph_capture
+
+    for _ in range(max(1, num_warmup)):
+        thunk()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+
+    graph = torch.cuda.CUDAGraph()
+    out = None
+    try:
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            for _ in range(inner):
+                out = thunk()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{label}: HIP graph capture failed ({exc}). Re-run with "
+            "--timing eager to measure this candidate on the host path instead."
+        ) from exc
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+
+    reps = max(1, num_iters // inner)
+    graph.replay()  # one untimed replay: the first is cold
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(reps):
+        graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    us = start.elapsed_time(end) * 1000.0 / (reps * inner)
+
+    # Barriered on both sides of the poison: a peer still replaying into this
+    # rank's inbox would otherwise race the fill_, and every rank must reach
+    # the grading replay having issued the same number of colour increments.
+    dist.barrier(group=group)
+    out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    graph.replay()
+    torch.cuda.synchronize()
+    return out, us
 
 
 def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, flyauto, group, x):
@@ -969,6 +1109,8 @@ def _bench_shape(
     flyauto,
     keys,
     prod_regime,
+    timing,
+    graph_inner,
 ):
     """Time and grade every applicable candidate at one shape. Scalars only."""
     device = torch.device(f"cuda:{rank}")
@@ -1034,12 +1176,25 @@ def _bench_shape(
         # host_time_sum column. Events are also the honest metric here -- they
         # bracket the whole collective, including the start_sync spin the
         # profiler's per-kernel device time hides.
-        got, us = run_perftest(
-            thunks[cand.key],
-            num_iters=num_iters,
-            num_warmup=num_warmup,
-            use_cuda_event=True,
-        )
+        if timing == "graph":
+            # `_bench_graph` warms, captures, times the replay and hands back
+            # the output a replay produced -- so the SQNR/allclose gates below
+            # cover the captured path rather than an eager re-run.
+            got, us = _bench_graph(
+                thunks[cand.key],
+                num_iters=num_iters,
+                num_warmup=num_warmup,
+                inner=graph_inner,
+                group=group,
+                label=f"{cand.key} tp{tp_size} {tokens}x{hidden}",
+            )
+        else:
+            got, us = run_perftest(
+                thunks[cand.key],
+                num_iters=num_iters,
+                num_warmup=num_warmup,
+                use_cuda_event=True,
+            )
 
         sqnr = sqnr_db(got, ref)
         assert sqnr >= cand.sqnr_floor, (
@@ -1097,6 +1252,8 @@ def _worker(
     profile,
     keys,
     prod_regime,
+    timing,
+    graph_inner,
 ):
     """One rank: join the group once, then sweep every shape.
 
@@ -1108,6 +1265,7 @@ def _worker(
     """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    logger.info("rank %d: aiter package %s", rank, _aiter_origin())
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=tp_size, rank=rank, distributed_init_method=init_method
@@ -1151,6 +1309,7 @@ def _worker(
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
         and dtype == dtypes.bf16
+        and _bench_fly_accuracy_mode() == "fast"
     ):
         for cfg in wanted_cfgs:
             # QuickAllReduceInt4 exchanges IPC handles via broadcast_object_list, so it
@@ -1300,6 +1459,8 @@ def _worker(
                 flyauto=flyauto,
                 keys=keys,
                 prod_regime=prod_regime,
+                timing=timing,
+                graph_inner=graph_inner,
             )
             for tokens, hidden in shapes
         ]
@@ -1385,11 +1546,12 @@ def run_sweep(tp_size, shapes, dtype, args, keys, prod_regime):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     logger.info(
-        "TP%d %s: %d shape(s), %d iters",
+        "TP%d %s: %d shape(s), %d iters, timing %s",
         tp_size,
         dtype2str(dtype),
         len(shapes),
         args.iters,
+        (f"graph (inner {args.graph_inner})" if args.timing == "graph" else "eager"),
     )
     with Pool(processes=tp_size) as pool:
         rets = [
@@ -1406,6 +1568,8 @@ def run_sweep(tp_size, shapes, dtype, args, keys, prod_regime):
                     args.profile,
                     keys,
                     prod_regime,
+                    args.timing,
+                    args.graph_inner,
                 ),
             )
             for r in range(tp_size)
@@ -1469,6 +1633,8 @@ def run_single_rank(
             args.profile,
             keys,
             prod_regime,
+            args.timing,
+            args.graph_inner,
         )
         if rows is None:
             rows = got
@@ -1550,10 +1716,7 @@ def case_tables(df, keys, baseline: str):
     short column instead.
 
     Ratio is ``baseline_us / candidate_us``, so **> 1.0 means the candidate is
-    faster than the baseline**; the baseline's own row reads 1.0. A candidate
-    not applicable to a given case (see ``applicable()``) is simply absent as
-    a row rather than an ``n/a`` cell -- a wide table needs the placeholder to
-    keep its grid rectangular, a stacked one does not.
+    faster than the baseline**; the baseline's own row reads 1.0.
     """
     live = [k for k in keys if f"{k} us" in df.columns]
     base_col = f"{baseline} us"
@@ -1582,9 +1745,12 @@ def case_tables(df, keys, baseline: str):
         base_us = base_us if pd.notna(base_us) else None
 
         rows = []
+        absent = []
         for k in live:
             us = r.get(f"{k} us")
             if us is None or not pd.notna(us):
+                absent.append(k)
+                rows.append({"candidate": k, "us": float("nan")})
                 continue
             row = {"candidate": k, "us": us}
             if base_us is not None:
@@ -1608,6 +1774,13 @@ def case_tables(df, keys, baseline: str):
             rows = [{"candidate": "-", "us": float("nan")}]
         cdf = pd.DataFrame(rows)
         _mark_na(cdf, ["spread us", "variant"])
+        if absent:
+            mask = cdf["candidate"].isin(absent)
+            for col in cdf.columns:
+                if col == "candidate":
+                    continue
+                cdf[col] = cdf[col].astype(object)
+                cdf.loc[mask, col] = None
         tables.append((title, cdf))
     return tables
 
@@ -1951,7 +2124,7 @@ def _fly_floor_note(world_sizes) -> str:
     return "; ".join(parts) or "n/a"
 
 
-def _write_raw_csv(path, df, dtype_name: str, per_dtype: bool) -> None:
+def _write_raw_csv(path, df, dtype_name: str, per_dtype: bool, args=None) -> None:
     """Dump the un-collapsed dataframe for one dtype.
 
     The markdown tables answer "which candidate won"; this answers "what were
@@ -1969,6 +2142,11 @@ def _write_raw_csv(path, df, dtype_name: str, per_dtype: bool) -> None:
         out = out.with_name(f"{out.stem}_{dtype_name}{out.suffix or '.csv'}")
     if out.parent and not out.parent.exists():
         out.parent.mkdir(parents=True, exist_ok=True)
+    if args is not None:
+        df = df.copy()
+        df["timing"] = args.timing
+        df["graph inner"] = args.graph_inner if args.timing == "graph" else 0
+        df["fly accuracy"] = args.fly_accuracy
     df.to_csv(out, index=False)
     logger.info("wrote %s (%d row(s) x %d column(s))", out, len(df), len(df.columns))
 
@@ -2001,6 +2179,16 @@ def _write_report(
         f"- HIP_VISIBLE_DEVICES: {os.environ.get('HIP_VISIBLE_DEVICES', '(unset)')}",
         f"- GPU NUMA node: {_gpu_numa_map()}",
         f"- iters: {args.iters} (warmup {args.warmup})",
+        f"- aiter package: {_aiter_origin()}",
+        (
+            f"- timing: **{args.timing}** -- `us` is "
+            + (
+                f"HIP-graph replay ({args.graph_inner} collectives per capture)"
+                if args.timing == "graph"
+                else "eager hipEvent wall time, host path included"
+            )
+        ),
+        f"- FlyDSL accuracy regime: {args.fly_accuracy}",
         f"- baseline: {args.baseline}",
         f"- fly_int4 available: {HAS_FLY_INT4}",
         (
@@ -2116,12 +2304,16 @@ def main():
         "--fly-accuracy",
         choices=_FLY_ACCURACY_CHOICES,
         default=_FLY_ACCURACY_DEFAULT,
-        help="AITER_FLY_AR_ACCURACY for the `fly_auto` row (ignored if it is\n"
-        "not in the sweep). 'fast' (default) opens the mesh/ring window past\n"
-        "the one-shot ceiling, so the row exercises the full three-family\n"
-        "policy at every shape. 'exact' matches the shipped production\n"
-        "default: only the one-shot is ever reachable, and `fly_auto` reads\n"
-        "n/a above oneshot_max_exact rather than quantizing.",
+        help="AITER_FLY_AR_ACCURACY for every FlyDSL candidate in the sweep\n"
+        "(ignored if none are). 'fast' (default) opens the mesh/ring window\n"
+        "past the one-shot ceiling, so `fly_auto` exercises the full\n"
+        "three-family policy at every shape, and pinned fly_int4*/\n"
+        "fly_int4_ring* (quantized) rows run alongside the one-shot rows.\n"
+        "'exact' matches the shipped production default: only the one-shot\n"
+        "is ever reachable, `fly_auto` reads n/a above oneshot_max_exact\n"
+        "rather than quantizing, and the quantized fly_int4*/fly_int4_ring*\n"
+        "rows are excluded entirely (n/a) rather than advertising a lossy\n"
+        "kernel an exact-mode deployment would never dispatch to.",
     )
     parser.add_argument("--iters", type=int, default=101, help="timed iterations")
     parser.add_argument("--warmup", type=int, default=5, help="warmup iterations")
@@ -2207,6 +2399,35 @@ def main():
         "_bench_shape) the trace carries CPU rows only.",
     )
     parser.add_argument(
+        "--timing",
+        choices=_TIMING_CHOICES,
+        default=_TIMING_DEFAULT,
+        help="how every candidate is timed. Exactly one time is measured and\n"
+        "the `us` column holds it; the report header and the CSV record which.\n"
+        "'graph' (default) captures a HIP graph and times the replay. That is\n"
+        "the metric production sees -- decode is captured -- and it is the only\n"
+        "fair kernel-to-kernel comparison, because eager timing here is\n"
+        "host-bound: run_perftest brackets back-to-back Python calls, so once\n"
+        "host cost per call exceeds device time the GPU starves and the number\n"
+        "*is* the host cost. That cost also differs per candidate family (cdr\n"
+        "and qr go through pybind, the FlyDSL rows through _run_compiled, rccl\n"
+        "through an aten op plus a copy_), so eager partly ranks candidates by\n"
+        "how much Python sits in their bench thunk -- a property of this\n"
+        "harness, not of the kernel. Since every family boundary in\n"
+        "allreduce_policy is a *crossover between families*, that bias lands\n"
+        "directly on the shipped thresholds.\n"
+        "'eager' is kept for when the host path is what you want to see.",
+    )
+    parser.add_argument(
+        "--graph-inner",
+        type=int,
+        default=_GRAPH_INNER_DEFAULT,
+        help="collectives captured per HIP graph (--timing graph). Replay is\n"
+        "back-to-back with no host in between, which is the run-ahead case the\n"
+        "double-buffered inbox is designed for. Pass 1 to price a capture that\n"
+        "cannot run ahead.",
+    )
+    parser.add_argument(
         "-b",
         "--baseline",
         choices=CANDIDATE_KEYS,
@@ -2237,6 +2458,8 @@ def main():
         "sweep covers more than one.",
     )
     args = parser.parse_args()
+    if args.graph_inner < 1:
+        parser.error("--graph-inner must be positive")
     if args.shape_csv is not None:
         if args.shape is not L_SHAPE:
             parser.error("--shape-csv and -s/--shape are mutually exclusive")
@@ -2284,10 +2507,13 @@ def main():
         # children inherit it. Unlike _QR_ENV this does not change `prod path`,
         # which reports the custom-AR/quick-reduce dispatch only.
         os.environ[_FLY_ENV] = "1"
-        # --fly-accuracy, not whatever accuracy mode the launching shell
-        # happens to have exported -- a report's accuracy regime should be
-        # exactly what its own command line says.
-        os.environ[_FLY_ACCURACY_ENV] = args.fly_accuracy
+    # --fly-accuracy, not whatever accuracy mode the launching shell happens to
+    # have exported -- a report's accuracy regime should be exactly what its own
+    # command line says. Set unconditionally, not just when a FlyDSL family is
+    # in the sweep: applicable() reads this to gate the quantized qr rows too,
+    # and a `-c cdr qr_int4 rccl --fly-accuracy exact` sweep would otherwise
+    # keep them, having never exported the variable the gate reads.
+    os.environ[_FLY_ACCURACY_ENV] = args.fly_accuracy
     prod_regime = os.environ.get(_QR_ENV)
     if any(c.family == "qr" for c in CANDIDATES if c.key in keys):
         os.environ[_QR_ENV] = _QR_ENABLING_REGIME
@@ -2394,7 +2620,7 @@ def main():
             sections.append((title, md))
 
         if args.output_csv:
-            _write_raw_csv(args.output_csv, df, dtype_name, len(args.dtype) > 1)
+            _write_raw_csv(args.output_csv, df, dtype_name, len(args.dtype) > 1, args)
 
     if args.output:
         _write_report(args.output, sections, args, visible, prod_regime, roofline_cus)
