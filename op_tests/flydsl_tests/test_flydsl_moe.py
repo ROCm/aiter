@@ -7,8 +7,8 @@ Covers stage2 tile_k auto-resolve for non-256-aligned inter_dim (e.g. DSV4
 inter=640) and FlyDSL stage2 / E2E with GUI preshuffle on gfx950.
 
 Usage:
-    pytest op_tests/flydsl_tests/test_flydsl_moe_a8w4.py -q
-    pytest op_tests/flydsl_tests/test_flydsl_moe_a8w4.py -k tile_k
+    pytest op_tests/flydsl_tests/test_flydsl_moe.py -q
+    pytest op_tests/flydsl_tests/test_flydsl_moe.py -k tile_k
 """
 
 from __future__ import annotations
@@ -349,7 +349,14 @@ def test_flydsl_stage2_fp8_ep_reduction():
     out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
 
     _run_moe_reduction(
-        target, out, token, topk, model_dim, expert_mask, topk_ids, is_fp8=True
+        target,
+        out,
+        token,
+        topk,
+        model_dim,
+        expert_mask=expert_mask,
+        topk_ids=topk_ids,
+        is_fp8=True,
     )
     torch.testing.assert_close(out, torch.full_like(out, 3.0))
 
