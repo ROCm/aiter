@@ -26,3 +26,20 @@ candidate. Pass `-s 131072` for 128k.
 
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
 
+## Phase 1b — live vLLM AMD path
+
+Vendored from vllm-project/vllm **`836bb3839ffe`** (main, 2026-09-15),
+file `vllm/models/qwen4_exp/amd/ops/qsa.py` (MQA + expand + sparse GQA only).
+HIP top-k: `aiter.ops.topk._hip_top_k_per_row_decode` when
+`aiter/jit/module_top_k_per_row.so` is present. This environment cannot JIT
+that module (`hipcub/hipcub.hpp` missing); the harness then uses the oracle
+tie-break (`qsa_topk_blocks`) on vLLM MQA logits — same smaller-index policy,
+not a substitute for the HIP kernel in production.
+
+- Module: `aiter/ops/triton/_triton_kernels/attention/qsa_vllm_amd.py`
+- Import: `aiter.ops.triton.attention.qsa_vllm_amd`
+- aiter tree: `aa42c32a36bf` (this branch at pin time); `origin/main` was `797cce253bba`.
+
+Table: `vllm_amd_select` (MQA+top-k+expand) and `vllm_amd_gqa` vs oracle
+(block/token **set** equality; GQA `checkAllclose`). Oracle is not timed.
+
