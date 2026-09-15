@@ -154,7 +154,7 @@ bounds=None, specialized_filename=None, backend="triton", B=None)`. It reads
 `<arch>/<backend>/gemm/<d_type>/DEFAULT.json` (required), overlays a
 specialized file when one matches, and returns `(config, is_tuned)`:
 
-- the config is a fresh deep copy, safe to mutate;
+- the config is a fresh shallow copy, safe to mutate;
 - `is_tuned` is `True` only when a specialized (`N=…-K=…`, `B=…-N=…-K=…`, or
   `specialized_filename`) file was hit. `_get_config()` passes the pair
   through unchanged; the flag is there so callers and tuning tooling can

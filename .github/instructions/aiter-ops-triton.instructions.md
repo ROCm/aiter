@@ -200,6 +200,11 @@ values for either backend live in JSON, never in Python. Flag:
 - Mutating the dict returned by `load_config_json()` — it is the shared cached
   object. Copy first (`dict(...)` for flat entries, `copy.deepcopy` for nested
   ones); the family loaders already copy on the caller's behalf.
+  `get_gemm_config()` and `get_conv_config()` return a **shallow** copy, their
+  bucket entries being flat maps of scalars. A nested value added to a GEMM
+  table breaks that and fails
+  `op_tests/tuning_tests/test_gemm_config_flat.py`; such a table needs a deep
+  copy in the loader in the same PR.
 - New hand-built config paths (`f"{AITER_TRITON_CONFIGS_PATH}/..."`) where a
   family loader or `resolve_config_dir()` would work — a hand-built path is a
   second place the layout is encoded, and it skips the argument validation
