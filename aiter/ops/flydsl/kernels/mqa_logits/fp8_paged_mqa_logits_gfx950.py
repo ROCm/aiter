@@ -341,19 +341,18 @@ def _build_kernel():
                 k_base,
                 KV_BLOCK_SIZE * HEAD_DIM + (token_base + lane_mod_16) * 4,
             )
-            row = fx.Int32(0)
-            while row < nn:
+            def _score_row(r):
                 a_packs = [
                     _load_q_pack_lds(
                         q_lds_base,
-                        row,
+                        r,
                         mi * MFMA_M + lane_mod_16,
                         lane_div_16,
                     )
                     for mi in range_constexpr(M_TILES)
                 ]
                 weights_frag = [
-                    _load_weight_frag_lds(w_lds_base, row, mi, lane_div_16)
+                    _load_weight_frag_lds(w_lds_base, r, mi, lane_div_16)
                     for mi in range_constexpr(M_TILES)
                 ]
                 rocdl.s_setprio(3)
@@ -363,10 +362,18 @@ def _build_kernel():
                 rocdl.s_setprio(0)
                 value = _reduce_scores(scores, weights_frag, scale)
                 _store_logit(
-                    row,
+                    r,
                     page * KV_BLOCK_SIZE + token_base + lane_mod_16,
                     value,
                 )
+
+            row = fx.Int32(0)
+            while row + fx.Int32(1) < nn:
+                _score_row(row)
+                _score_row(row + fx.Int32(1))
+                row = row + fx.Int32(2)
+            while row < nn:
+                _score_row(row)
                 row = row + fx.Int32(1)
 
         if page_lo < page_hi:
