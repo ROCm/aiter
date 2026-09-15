@@ -2984,7 +2984,6 @@ def _flash_attn_varlen_forward(
                 and q.dtype == dtypes.bf16
                 and get_gfx() == "gfx950"
                 and nhead_q == nhead_k
-                and q.is_contiguous()
                 and sink_size == 0
                 and sink_ptr is None
             )
