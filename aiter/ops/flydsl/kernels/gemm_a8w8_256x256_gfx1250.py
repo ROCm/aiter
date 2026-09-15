@@ -322,8 +322,8 @@ def launch_gemm_a8w8_256x256(
                 fx.Int32(global_step),
             )
 
-        dgroup0 = Vec.from_elements([as_ir_value(fx.Int32(0))] * 4, fx.Int32)
-        dgroup1 = Vec.from_elements([as_ir_value(fx.Int32(0))] * 8, fx.Int32)
+        dgroup0 = Vec.filled(4, 0, fx.Int32)
+        dgroup1 = Vec.filled(8, 0, fx.Int32)
         tdm_lds_step, tdm_global_step = fx.Int32(0), fx.Int32(0)
         if wave == 0:
             dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(0)

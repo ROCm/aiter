@@ -3,20 +3,18 @@
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from . import dpp_utils
+from .act import sigmoid_batch, sigmoid_f32, tanh_f32
+from .act import silu_mul_batch as _silu_mul_batch
 from .layout_utils import crd2idx
 
 kStages = 2
 kBS_stride_k0_dw = 64
-LOG2E = 1.4426950408889634
 
 
 def _raw(v):
@@ -56,33 +54,9 @@ def _scale_mma_atoms(a_dtype):
     }
 
 
-def _global_i32_buffer_view(addr_i64, num_bytes):
-    num_bytes_i64 = fx.Int64(num_bytes)
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-    view = fx.Tensor(fx.make_view(ptr, fx.make_layout(num_bytes_i64 // fx.Int64(4), 1)))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=False, num_records_bytes=num_bytes_i64
-    )
-
-
-def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_layout):
-    return fx.logical_divide(
-        _global_i32_buffer_view(addr_i64, num_bytes),
-        tile_layout,
-    )
-
-
 def _lds_ptr3(base_i32, byte_off_i32):
     ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared)
     return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(base_i32 + byte_off_i32)))
-
-
-def _lds_base_ptr3(lds_view):
-    base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(lds_view))
-    return _lds_ptr3(base_i32, fx.Int32(0))
 
 
 def _gep3(base_ptr, byte_off_i32):
@@ -106,42 +80,23 @@ def _global_ptr1(arg, byte_off_i32):
     return _gep1(_global_base_ptr1(arg), byte_off_i32)
 
 
-def _global_i32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-
-
 def _global_i32_at(addr_i64, idx):
-    return _global_i32_ptr(addr_i64)[idx]
-
-
-def _global_f32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.f32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+    return global_typed_ptr(addr_i64, T.i32)[idx]
 
 
 def _global_f32_at(addr_i64, idx):
-    return fx.Float32(_global_f32_ptr(addr_i64)[idx])
+    return global_typed_ptr(addr_i64, T.f32)[idx]
 
 
 def _global_i32_load(tiles, idx):
     atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-    fx.copy_atom_call(atom, fx.slice(tiles, (None, idx)), r)
+    fx.copy(atom, fx.slice(tiles, (None, idx)), r)
     return r.load()[0]
 
 
 def _global_scalar_tiles(addr_i64, numeric_cls, num_elems):
-    ptr_ty = fx.PointerType.get(
-        numeric_cls.ir_type,
-        address_space=fx.AddressSpace.Global,
-        alignment=numeric_cls.width // 8,
-    )
-    ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+    ptr = global_typed_ptr(addr_i64, numeric_cls.ir_type, numeric_cls.width // 8)
     flat = fx.make_view(ptr, fx.make_layout(num_elems, 1))
     return fx.logical_divide(flat, fx.make_layout(1, 1))
 
@@ -150,7 +105,7 @@ def _scalar_store(tiles, idx, value, numeric_cls):
     atom = fx.make_copy_atom(fx.UniversalCopy(numeric_cls.width), numeric_cls)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), numeric_cls)
     r.store(fx.Vector.from_elements([numeric_cls(value)], numeric_cls))
-    fx.copy_atom_call(atom, r, fx.slice(tiles, (None, idx)))
+    fx.copy(atom, r, fx.slice(tiles, (None, idx)))
 
 
 def _layout_idx(layout, *coords):
@@ -183,22 +138,51 @@ def lds_dma_dst(base_i32, byte_off_i32, elem_ty=None, align=16):
     return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
 
-def global_typed_ptr(arg, elem_ty, align=4):
+def global_typed_ptr(arg, elem_ty, align=4, *, byte_offset=None):
     """Typed global fx.Pointer over a raw i64 device address; index in ELEMENTS (ptr[i]), not bytes."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
+    if byte_offset is not None:
+        byte_ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Global, align)
+        base = fx.inttoptr(byte_ptr_ty, fx.Int64(arg))
+        return fx.recast_iter(ptr_ty, fx.add_offset(base, byte_offset))
     return fx.inttoptr(ptr_ty, fx.Int64(arg))
 
 
-def lds_typed_ptr(base_i32, elem_ty, align=4):
+def _global_i32_buffer_view(addr_i64, num_bytes):
+    # BufferCopy soffset is in elements; make_layout's dynamic shape must be
+    # i32/i64 rather than Index. Keep the hardware OOB bound in bytes.
+    num_bytes_i64 = fx.Int64(num_bytes)
+    view = fx.Tensor(
+        fx.make_view(
+            global_typed_ptr(addr_i64, T.i32),
+            fx.make_layout(num_bytes_i64 // fx.Int64(4), 1),
+        )
+    )
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=False, num_records_bytes=num_bytes_i64
+    )
+
+
+def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
+    return fx.logical_divide(
+        _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
+    )
+
+
+def lds_typed_ptr(base_i32, elem_ty, align=4, *, byte_offset=None):
     """Typed LDS (Shared) fx.Pointer over an i32 LDS base; index in ELEMENTS (ptr[i]), not bytes."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Shared, align)
+    if byte_offset is not None:
+        byte_ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared, align)
+        base = fx.inttoptr(byte_ptr_ty, fx.Int32(base_i32))
+        return fx.recast_iter(ptr_ty, fx.add_offset(base, byte_offset))
     return fx.inttoptr(ptr_ty, fx.Int32(base_i32))
 
 
 def lds_vec_load(base_i32, byte_off_i32, result_type, elem_ty, align=4):
     """Typed LDS ds-read at a BYTE offset from the i32 LDS base; mirrors raw llvm.load (vector or scalar)."""
     elem_ir_ty = elem_ty.ir_type if hasattr(elem_ty, "ir_type") else elem_ty
-    ptr = lds_typed_ptr(fx.Int32(base_i32) + byte_off_i32, elem_ir_ty, align=align)
+    ptr = lds_typed_ptr(base_i32, elem_ir_ty, align=align, byte_offset=byte_off_i32)
     return fx.ptr_load(ptr, result_type=result_type)
 
 
@@ -245,94 +229,42 @@ def _e8m0_from_amax(amax_f32, max_norm=6.0):
 
 
 def _inline_e8m0(amax_u16_i32, max_norm=6.0):
-    f32 = fx.Float32(
-        _raw((fx.Int32(_raw(amax_u16_i32)) & fx.Int32(0xFFFF)) << fx.Int32(16)).bitcast(
-            T.f32
-        )
-    )
-    return _e8m0_roundup(f32, max_norm=max_norm)
+    bits = (fx.Int32(amax_u16_i32) & 0xFFFF) << 16
+    return _e8m0_roundup(bits.bitcast(fx.Float32), max_norm=max_norm)
 
 
 def _pkmax_u16(a_i32, b_i32):
-    v2i16 = T.vec(2, T.i16)
-    va = llvm.BitcastOp(v2i16, _raw(a_i32)).result
-    vb = llvm.BitcastOp(v2i16, _raw(b_i32)).result
-    vm = arith.MaxUIOp(va, vb).result
-    return fx.Int32(llvm.BitcastOp(T.i32, vm).result)
-
-
-def _silu_mul_batch(gate_values, up_values):
-    exp_values = [
-        fx.Float32(rocdl.exp2(T.f32, _raw(gate * fx.Float32(-LOG2E))))
-        for gate in gate_values
-    ]
-    sigmoid_values = [
-        fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + exp_value)))
-        for exp_value in exp_values
-    ]
-    return [
-        gate_values[i] * sigmoid_values[i] * up_values[i]
-        for i in range(len(gate_values))
-    ]
+    va = fx.Vector.from_elements([a_i32], fx.Int32).bitcast(fx.Uint16)
+    vb = fx.Vector.from_elements([b_i32], fx.Int32).bitcast(fx.Uint16)
+    return fx.max(va, vb).bitcast(fx.Int32)[0]
 
 
 def _swiglu_mul_batch(gate_values, up_values, limit=7.0):
     limit_f32 = fx.Float32(float(limit))
     neg_limit_f32 = fx.Float32(-float(limit))
-    exp_values = []
-    gate_clamped = []
-    up_clamped = []
-    for gate, up in zip(gate_values, up_values):
-        gate_value = fx.Float32(arith.minimumf(_raw(gate), _raw(limit_f32)))
-        up_value = fx.Float32(
-            arith.maximumf(
-                arith.minimumf(_raw(up), _raw(limit_f32)), _raw(neg_limit_f32)
-            )
-        )
-        gate_clamped.append(gate_value)
-        up_clamped.append(up_value)
-        exp_values.append(
-            fx.Float32(rocdl.exp2(T.f32, _raw(gate_value * fx.Float32(-1.702 * LOG2E))))
-        )
+    gates = [fx.min(gate, limit_f32) for gate in gate_values]
+    ups = [fx.max(fx.min(up, limit_f32), neg_limit_f32) for up in up_values]
+    # Fold alpha into the exp2 constant to retain this kernel's rounding.
+    sigmoids = sigmoid_batch(gates, alpha=1.702)
     return [
-        gate_clamped[i]
-        * fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + exp_values[i])))
-        * (up_clamped[i] + fx.Float32(1.0))
-        for i in range(len(gate_values))
+        gate * sigmoid * (up + 1.0) for gate, sigmoid, up in zip(gates, sigmoids, ups)
     ]
 
 
 def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
-    one = fx.Float32(1.0)
-    zero = fx.Float32(0.0)
+    # This variant is unclamped, with host-computed reciprocals and left-associated products.
     beta_f32 = fx.Float32(float(beta))
     beta_rcp = fx.Float32(1.0 / float(beta))
     linear_beta_f32 = fx.Float32(float(linear_beta))
     linear_beta_rcp = fx.Float32(1.0 / float(linear_beta))
-
-    def tanh_elem(x):
-        abs_x = x.maximumf(-x)
-        e = fx.Float32(rocdl.exp2(T.f32, _raw(abs_x * fx.Float32(-2.0 * LOG2E))))
-        tanh_abs = (one - e) * fx.Float32(rocdl.rcp(T.f32, _raw(one + e)))
-        return (x > zero).select(tanh_abs, -tanh_abs)
-
-    result = []
-    for gate, up in zip(gate_values, up_values):
-        situ = (
-            beta_f32
-            * tanh_elem(gate * beta_rcp)
-            * fx.Float32(
-                rocdl.rcp(
-                    T.f32,
-                    _raw(
-                        one
-                        + fx.Float32(rocdl.exp2(T.f32, _raw(gate * fx.Float32(-LOG2E))))
-                    ),
-                )
-            )
-        )
-        result.append(situ * linear_beta_f32 * tanh_elem(up * linear_beta_rcp))
-    return result
+    return [
+        beta_f32
+        * tanh_f32(gate * beta_rcp)
+        * sigmoid_f32(gate)
+        * linear_beta_f32
+        * tanh_f32(up * linear_beta_rcp)
+        for gate, up in zip(gate_values, up_values)
+    ]
 
 
 def _activation_mul_batch(
