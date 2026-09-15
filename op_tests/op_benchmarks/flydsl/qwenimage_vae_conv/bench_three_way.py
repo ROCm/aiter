@@ -16,6 +16,13 @@ The conv is reported by its own kernel, excluding the NCHW->NHWC transpose, so
 it stays comparable with the two GEMM arms, which are handed an already
 materialised M x K matrix. Neither GEMM arm is charged for im2col.
 
+One asymmetry is deliberate: the conv runs with a bias, because all 71 of the
+VAE's convolutions have one and has_bias is part of the kernel's compile key, so
+timing it without one would measure a configuration the model never runs and
+would miss the tuned config. The GEMM arms stay bias-free -- turning it on there
+risks dropping the hipBLASLt arm, which reaches the library through gradlib, and
+one add per output element is negligible against K multiply-accumulates.
+
 Usage::
 
     python op_tests/op_benchmarks/flydsl/qwenimage_vae_conv/bench_three_way.py
@@ -152,10 +159,15 @@ def bench(pairs, stride, pad, iters=20, reps=3, key="conv3d_implicit_kernel"):
 
 
 def time_conv(cin, cout, hin, stride, pad):
+    # With a bias, because every one of the VAE's 71 convolutions has one.
+    # has_bias is a compile-time parameter of the kernel, so timing this without
+    # one measures an artifact the model never runs -- and misses the tuned
+    # config, which is keyed on it.
     pairs = [
         (
             torch.randn((1, cin, hin, hin), device=DEV, dtype=torch.bfloat16),
             torch.randn((cout, cin, 3, 3), device=DEV, dtype=torch.bfloat16),
+            torch.randn((cout,), device=DEV, dtype=torch.bfloat16),
         )
         for _ in range(NROT)
     ]
