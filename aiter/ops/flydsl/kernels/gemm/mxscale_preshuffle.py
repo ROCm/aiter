@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2025-2026 FlyDSL Project Contributors
 
 """MXFP4/MXFP6/MXFP8 A x MXFP4/MXFP8 B preshuffle GEMM (gfx950): per-32 E8M0 scales folded
 into a scaled 16x16x128 fx.gemm; A streams global->LDS via double-buffered async DMA. Layout
@@ -28,9 +28,41 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     _DTYPE_SHORT,
     make_kernel_name,
 )
+from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    atomic_add_agent,
+    load_i32_nt,
+)
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
 _B_ELEM = {"fp4": Float4E2M1FN, "fp8": Float8E4M3FN}
+
+
+def _make_dma_layouts(tile_m, tile_k_bytes, row_stride, num_threads, *, swizzle):
+    """Map cooperative 16-byte A copies onto global rows/K blocks and LDS."""
+    rounds = tile_m * tile_k_bytes // (num_threads * 16)
+    waves = num_threads // 64
+    blocks_per_row = tile_k_bytes // 16
+    rows_per_wave = 64 // blocks_per_row
+    shape = (16, (blocks_per_row, rows_per_wave), waves, rounds)
+
+    dma_to_coord = fx.make_layout(
+        shape,
+        (
+            fx.E(1),
+            (16 * fx.E(1), fx.E(0)),
+            rows_per_wave * fx.E(0),
+            rows_per_wave * waves * fx.E(0),
+        ),
+    )
+    if swizzle:
+        bits = blocks_per_row.bit_length() - 1
+        coord_swizzle = fx.static(fx.CoordSwizzleType.get(bits, 0, [0], 4, [1]))
+        dma_to_coord = fx.make_composed_layout(coord_swizzle, dma_to_coord)
+    source = fx.make_composed_layout(
+        fx.make_layout((tile_m, tile_k_bytes), (row_stride, 1)), dma_to_coord
+    )
+    destination = fx.make_layout((16, waves, rounds), (1, 1024, num_threads * 16))
+    return source, destination
 
 
 def _scale_mma_atoms(a_dtype, b_dtype):
@@ -68,12 +100,14 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair):
 
 
 @flyc.jit
-def launch_gemm(
+def _launch_gemm_impl(
     arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
     arg_scale_a: fx.Pointer,
     arg_scale_b: fx.Pointer,
+    arg_out: fx.Pointer,
+    arg_semaphore: fx.Pointer,
     i32_m: fx.Int32,
     i32_n: fx.Int32,
     stream: fx.Stream,
@@ -96,6 +130,7 @@ def launch_gemm(
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
     blockscale: Constexpr[str] = "none",
+    multi_row_tile: Constexpr[bool] = False,
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -105,6 +140,15 @@ def launch_gemm(
     the [M,B,*] mbn layout. waves_per_eu<=0 = unset.
     """
     BM, BN, BK = tile_m, tile_n, tile_k
+    small_m_bf16 = (
+        BM == 16
+        and blockscale != "none"
+        and out_dtype == "bf16"
+        and batch == 1
+        and c_row_stride < 0
+        and c_batch_stride < 0
+    )
+    splitk_fused = small_m_bf16 and k_batch > 1 and BN <= 128
     if const_expr(out_dtype == "bf16"):
         out_elem = BFloat16
     else:
@@ -135,9 +179,10 @@ def launch_gemm(
     KH4 = b_row_bytes // 4  # i32 per N-row in preshuffled B (== (K//2)//4 for fp4)
     K_TILES = K // BK
     # split-K (k_batch>1): each grid.z split reduces k_tiles_local = K_TILES//k_batch
-    # K-tiles and writes an fp32 partial slab to arg_c (viewed as [batch*k_batch, M, N]);
-    # a follow-up reduce kernel sums the k_batch slabs -> bf16 out. K/k_batch is 256-K
-    # aligned (see fits_shape), so a split boundary lands on whole tiles + scale chunks.
+    # K-tiles. The M<=16 BF16 specialization writes a compact BF16 workspace and
+    # reduces it in the last-arriving GEMM block; other variants write fp32 partial
+    # slabs followed by a separate reduce kernel. K/k_batch is 256-K aligned (see
+    # fits_shape), so a split boundary lands on whole tiles + scale chunks.
     assert K_TILES % k_batch == 0, "K_TILES must be divisible by k_batch"
     k_tiles_local = K_TILES // k_batch
     k_halves = BK // 128  # 16x16x128 MFMA k-steps per K-tile
@@ -159,7 +204,12 @@ def launch_gemm(
     _scale_chunk_dw_a = ((K + 255) // 256) * _sc_k0_a
     _scale_chunk_dw_b = ((K + 255) // 256) * _sc_k0_b
     _b_sc_rows = (N // 128) if _bs_b else (N // 32)  # B scale super-rows
-    n_coop = A_LDS_B // num_threads // 16  # 16B cooperative loads per thread
+    a_copy_granularity = num_threads * 16
+    assert A_LDS_B % a_copy_granularity == 0, (
+        f"A_LDS_B ({A_LDS_B}B) must be divisible by num_threads*16 "
+        f"({a_copy_granularity}B)"
+    )
+    n_coop = A_LDS_B // a_copy_granularity  # 16B cooperative loads per thread
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
 
@@ -192,14 +242,19 @@ def launch_gemm(
         k_batch,
         blockscale,
     )
+    if splitk_fused:
+        _kname += "_fused_reduce"
+    if multi_row_tile:
+        _kname += "_multirow"
 
-    @flyc.kernel(name=_kname)
-    def kernel_gemm(
+    def _kernel_body(
         arg_c: fx.Int64,
         arg_a: fx.Int64,
         arg_b: fx.Int64,
         arg_scale_a: fx.Int64,
         arg_scale_b: fx.Int64,
+        arg_out: fx.Int64,
+        arg_semaphore: fx.Int64,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
@@ -222,7 +277,7 @@ def launch_gemm(
         lane_mod_16 = lane % 16
         # XCD swizzle: remap (bid_x, bid_y) for L2-cache reuse (no-op when xcd_swizzle<=0).
         if const_expr(xcd_swizzle > 0):
-            from .mfma_preshuffle_pipeline import xcd_remap_bx_by
+            from ..mfma_preshuffle_pipeline import xcd_remap_bx_by
 
             _bx, _by = xcd_remap_bx_by(
                 fx.Index(bid_x),
@@ -288,7 +343,6 @@ def launch_gemm(
             max_size=False,
             num_records_bytes=a_nrec,
         )
-        a_flat_div = fx.logical_divide(a_flat, fx.make_layout(1, 1))
         lds = fx.SharedAllocator().allocate(SharedA).peek()
         # A-LDS modeled as i32 (16B = 4 i32): fx.copy is dtype-agnostic, only the MMA cares.
         sA0_i32 = fx.recast_iter(Int32, lds.a0.ptr)
@@ -304,62 +358,127 @@ def launch_gemm(
         def _iter_of(parity):  # parity in {0,1} (runtime) -> i32 LDS iterator
             return fx.add_offset(sA0_i32, parity * lds_db_i32)
 
-        def _lds_view(base_iter, off_i32):
-            return fx.make_view(fx.add_offset(base_iter, off_i32), fx.make_layout(4, 1))
+        if const_expr(BM == 16):
+            # The small-M tile uses layout algebra for both the global->LDS
+            # DMA and LDS reads. Keep the established arithmetic path below for the
+            # wider tiles: materializing these layouts increases VGPR pressure on a
+            # few existing CSV kernels and can reduce their occupancy.
+            dma_src_layout, dma_dst_layout = _make_dma_layouts(
+                BM, A_ROW_B, a_rstride, num_threads, swizzle=swz_lds
+            )
+            dma_blocks_per_row = A_ROW_B // 16
+            dma_lane = lane % dma_blocks_per_row, lane // dma_blocks_per_row
+            dma_a_base = fx.add_offset(fx.get_iter(a_flat), bx_m * a_rstride)
 
-        # Async A: gmem->LDS DMA (buffer_load_lds); issued after B/scale loads to overlap the MFMAs.
-        def dma_a_to_lds(kt, parity):
-            base_off = rocdl.readfirstlane(T.i32, parity * lds_db + wave * (64 * 16))
-            lds_ptr = fx.add_offset(sA0_i8, base_off)
-            base_k_byte = kt * A_ROW_B
-            for i in range_constexpr(n_coop):
-                if const_expr(i > 0):
-                    lds_ptr = fx.add_offset(lds_ptr, fx.Int32(num_threads * 16))
-                lin = (i * num_threads + tid) * 16
-                row = lin // A_ROW_B
-                col = lin % A_ROW_B
-                if const_expr(swz_lds):
-                    col = col ^ ((row % k_blk16) * 16)
-                gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
-                dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
-                src = fx.slice(a_flat_div, (None, gmem_byte))
-                fx.copy(dma_atom, src, dst)
+            # (dword, row lane, K lane, M tile, K half, register half).
+            a_read_layout = fx.make_layout(
+                (4, 16, 4, m_chunks, k_halves, 1 if a_dtype == "fp4" else 2),
+                (1, A_ROW_I32, A_GK_I32, 16 * A_ROW_I32, A_KH_I32, A_HI_OFF),
+            )
+            if const_expr(swz_lds):
+                swz_bits = k_blk16.bit_length() - 1
+                a_read_layout = fx.make_composed_layout(
+                    fx.static(fx.SwizzleType.get(swz_bits, 2, swz_bits)),
+                    a_read_layout,
+                )
 
-        def _read16(base_iter, off_i32):
-            # ds_read_b128 straight into an i32[4] register fragment.
-            t = fx.make_rmem_tensor(4, Int32)
-            fx.copy(lds_copy, _lds_view(base_iter, off_i32), t)
-            return t
+            def dma_a_to_lds(kt, parity):
+                src = fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(dma_a_base, kt * A_ROW_B), dma_src_layout
+                    )
+                )
+                base_off = rocdl.readfirstlane(T.i32, parity * lds_db)
+                dst = fx.Tensor(
+                    fx.make_view(fx.add_offset(sA0_i8, base_off), dma_dst_layout)
+                )
+                for i in range_constexpr(n_coop):
+                    fx.copy(
+                        dma_atom,
+                        src[None, dma_lane, wave, i],
+                        dst[None, wave, i],
+                    )
 
-        def read_a(parity):
-            base_iter = _iter_of(parity)
-            av = []
-            for mi in range_constexpr(m_chunks):
-                for kh in range_constexpr(k_halves):
-                    row = mi * 16 + lane_mod_16
-                    row_base = row * A_ROW_I32
-                    lo_blk = kh * (A_KH_I32 // 4) + lane_div_16 * (A_GK_I32 // 4)
-                    if const_expr(swz_lds):
-                        off = row_base + (lo_blk ^ (row % k_blk16)) * 4
-                    else:
-                        off = row_base + kh * A_KH_I32 + lane_div_16 * A_GK_I32
-                    if const_expr(a_dtype == "fp4"):
-                        av.append(_read16(base_iter, off))
-                    else:
-                        # fp6/fp8: pack two halves (64 K apart, f8f6f4 ABI) into i32[A_NDW].
-                        if const_expr(swz_lds):
-                            hi_off = (
-                                row_base
-                                + ((lo_blk + A_HI_OFF // 4) ^ (row % k_blk16)) * 4
-                            )
+            def _read16(src):
+                t = fx.make_rmem_tensor(4, Int32)
+                fx.copy(lds_copy, src, t)
+                return t
+
+            def read_a(parity):
+                src = fx.Tensor(fx.make_view(_iter_of(parity), a_read_layout))
+                av = []
+                for mi in range_constexpr(m_chunks):
+                    for kh in range_constexpr(k_halves):
+                        lo = _read16(src[None, lane_mod_16, lane_div_16, mi, kh, 0])
+                        if const_expr(a_dtype == "fp4"):
+                            av.append(lo)
                         else:
-                            hi_off = off + A_HI_OFF
-                        lo = Vec(fx.memref_load_vec(_read16(base_iter, off)))
-                        hi = Vec(fx.memref_load_vec(_read16(base_iter, hi_off)))
-                        t = fx.make_rmem_tensor(A_NDW, Int32)
-                        t.store(lo.shuffle(hi, list(range(A_NDW))))
-                        av.append(t)
-            return av
+                            hi = _read16(src[None, lane_mod_16, lane_div_16, mi, kh, 1])
+                            t = fx.make_rmem_tensor(A_NDW, Int32)
+                            t.store(lo.load().shuffle(hi.load(), list(range(A_NDW))))
+                            av.append(t)
+                return av
+
+        else:
+            a_flat_div = fx.logical_divide(a_flat, fx.make_layout(1, 1))
+
+            def _lds_view(base_iter, off_i32):
+                return fx.make_view(
+                    fx.add_offset(base_iter, off_i32), fx.make_layout(4, 1)
+                )
+
+            def dma_a_to_lds(kt, parity):
+                base_off = rocdl.readfirstlane(
+                    T.i32, parity * lds_db + wave * (64 * 16)
+                )
+                lds_ptr = fx.add_offset(sA0_i8, base_off)
+                base_k_byte = kt * A_ROW_B
+                for i in range_constexpr(n_coop):
+                    if const_expr(i > 0):
+                        lds_ptr = fx.add_offset(lds_ptr, fx.Int32(num_threads * 16))
+                    lin = (i * num_threads + tid) * 16
+                    row = lin // A_ROW_B
+                    col = lin % A_ROW_B
+                    if const_expr(swz_lds):
+                        col = col ^ ((row % k_blk16) * 16)
+                    gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
+                    dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
+                    src = fx.slice(a_flat_div, (None, gmem_byte))
+                    fx.copy(dma_atom, src, dst)
+
+            def _read16(base_iter, off_i32):
+                t = fx.make_rmem_tensor(4, Int32)
+                fx.copy(lds_copy, _lds_view(base_iter, off_i32), t)
+                return t
+
+            def read_a(parity):
+                base_iter = _iter_of(parity)
+                av = []
+                for mi in range_constexpr(m_chunks):
+                    for kh in range_constexpr(k_halves):
+                        row = mi * 16 + lane_mod_16
+                        row_base = row * A_ROW_I32
+                        lo_blk = kh * (A_KH_I32 // 4) + lane_div_16 * (A_GK_I32 // 4)
+                        if const_expr(swz_lds):
+                            off = row_base + (lo_blk ^ (row % k_blk16)) * 4
+                        else:
+                            off = row_base + kh * A_KH_I32 + lane_div_16 * A_GK_I32
+                        if const_expr(a_dtype == "fp4"):
+                            av.append(_read16(base_iter, off))
+                        else:
+                            if const_expr(swz_lds):
+                                hi_off = (
+                                    row_base
+                                    + ((lo_blk + A_HI_OFF // 4) ^ (row % k_blk16)) * 4
+                                )
+                            else:
+                                hi_off = off + A_HI_OFF
+                            lo = Vec(fx.memref_load_vec(_read16(base_iter, off)))
+                            hi = Vec(fx.memref_load_vec(_read16(base_iter, hi_off)))
+                            t = fx.make_rmem_tensor(A_NDW, Int32)
+                            t.store(lo.shuffle(hi, list(range(A_NDW))))
+                            av.append(t)
+                return av
 
         n_col_base = by_n + wave * (BN // num_waves)
         bq_views = [
@@ -574,13 +693,24 @@ def launch_gemm(
             rocdl.s_waitcnt(0)  # drain the A DMA before the barrier
             gpu.barrier()
             results = yield accs
-        accs = results
+        # A single loop-carried accumulator is returned directly rather than as
+        # a one-element tuple by the SCF builder.
+        accs = [results] if n_acc == 1 else results
 
-        # Epilogue via fx.copy: a lane owns 4 rows per (mi,ni) accm (row m*16+(l//16)*4+ii, col
-        # base+l%16), c_stride apart.
+        # Epilogue via fx.copy: a lane owns 4 rows per (mi,ni) accm (row
+        # m*16+(l//16)*4+ii, col base+l%16), c_stride apart. The single-row
+        # specialization packs adjacent lanes; multi-row tiles use masked scalar
+        # stores. The dynamically last block for each output tile reduces all slabs.
         c_stride = N if c_row_stride < 0 else c_row_stride
-        # split-K writes an fp32 partial slab (no cast); no-split writes bf16/fp16 out.
-        if const_expr(k_batch > 1):
+        # Regular split-K writes fp32 partial slabs. The small-M fused path writes
+        # BF16 partials; no-split writes directly to the requested output type.
+        if const_expr(splitk_fused):
+            store_elem = BFloat16
+            _ebytes = 2
+            c_addr = arg_c + fx.Int64(bid_z) * fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(
+                _ebytes
+            )
+        elif const_expr(k_batch > 1):
             store_elem = Float32
             _ebytes = 4
             # arg_c is tmp[batch*k_batch, M, N] fp32; this WG's slab index == bid_z.
@@ -608,7 +738,9 @@ def launch_gemm(
         _rows_wg = (_rows_rem < fx.Index(BM)).select(_rows_rem, fx.Index(BM))
         c_nrec = fx.Int64(_rows_wg) * fx.Int64(c_stride) * fx.Int64(_ebytes)
         c_ptr_ty = fx.PointerType.get(
-            store_elem.ir_type, address_space=fx.AddressSpace.Global, alignment=_ebytes
+            store_elem.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=4 if small_m_bf16 else _ebytes,
         )
         c_flat = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(
@@ -622,30 +754,239 @@ def launch_gemm(
             ),
             fx.make_layout(1, 1),
         )
-        if const_expr(k_batch > 1):
+        if const_expr(
+            (k_batch > 1 and not splitk_fused)
+            or (small_m_bf16 and not multi_row_tile)
+        ):
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), store_elem)
         else:
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), store_elem)
         c_rstride = fx.Int32(c_stride)
         col_w = by_n + wave * (BN // num_waves) + lane_mod_16
-        for mi in range_constexpr(m_chunks):
-            row_local = (
-                mi * 16 + lane_div_16 * 4
-            )  # relative to this WG (base folded into c_tile_addr)
+        if const_expr(small_m_bf16 and not multi_row_tile):
+            # Avoid issuing the other 15 rows' masked stores (and their lane
+            # exchanges) for the latency-critical single-row specialization.
             for ni in range_constexpr(num_acc_n):
                 col = col_w + ni * 16
-                acc = Vec(accs[mi * num_acc_n + ni]).to(store_elem)
-                for ii in range_constexpr(4):
-                    cf = fx.make_rmem_tensor(1, store_elem)
-                    cf.store(Vec.from_elements([acc[ii]], store_elem))
-                    off = (row_local + ii) * c_rstride + col
-                    fx.copy(c_copy, cf, c_flat[None, off])
+                acc_f32 = Vec(accs[ni])
+                if lane_div_16 == fx.Int32(0):
+                    peer_bits = rocdl.ds_bpermute(
+                        T.i32,
+                        (lane ^ fx.Int32(1)) * fx.Int32(4),
+                        acc_f32[0].bitcast(fx.Int32),
+                    )
+                    peer = fx.Int32(peer_bits).bitcast(Float32)
+                    if lane_mod_16 % fx.Int32(2) == fx.Int32(0):
+                        cf = fx.make_rmem_tensor(2, store_elem)
+                        cf.store(
+                            Vec.from_elements([acc_f32[0], peer], Float32).to(store_elem)
+                        )
+                        fx.copy(c_copy, cf, c_flat[None, col])
+        else:
+            for mi in range_constexpr(m_chunks):
+                row_local = (
+                    mi * 16 + lane_div_16 * 4
+                )  # relative to this WG (base folded into c_tile_addr)
+                for ni in range_constexpr(num_acc_n):
+                    col = col_w + ni * 16
+                    acc_f32 = Vec(accs[mi * num_acc_n + ni])
+                    acc = acc_f32.to(store_elem)
+                    for ii in range_constexpr(4):
+                        off = (row_local + ii) * c_rstride + col
+                        cf = fx.make_rmem_tensor(1, store_elem)
+                        cf.store(Vec.from_elements([acc[ii]], store_elem))
+                        fx.copy(c_copy, cf, c_flat[None, off])
+
+        if const_expr(splitk_fused):
+            # Publish this block's complete BF16 partial before joining the
+            # per-output-tile arrival counter. The dynamically last block owns
+            # reduction, so no block spins and oversized grids cannot deadlock.
+            # Every lane drains its workspace stores before the block barrier;
+            # the last block then reads partials non-temporally from the shared
+            # agent L2.  A release fence would unnecessarily write back the
+            # whole L2, while an acquire fence would invalidate unrelated cache.
+            rocdl.s_waitcnt(0)
+            gpu.barrier()
+            arrival = fx.Int32(-1)
+            if tid == fx.Int32(0):
+                tile_idx = (bx_m // BM) * (i32_n // BN) + by_n // BN
+                arrival = fx.Int32(
+                    atomic_add_agent(
+                        arg_semaphore + fx.Int64(tile_idx) * fx.Int64(4), fx.Int32(1)
+                    )
+                )
+            if const_expr(multi_row_tile):
+                # Reuse A LDS after the GEMM to broadcast the winning arrival
+                # to every wave.  All waves then share the M*BN reduction; a
+                # single wave becomes the bottleneck by M=8/16.
+                if tid == fx.Int32(0):
+                    fx.ptr_store(arrival, sA0_i32)
+                gpu.barrier()
+                arrival = fx.Int32(fx.ptr_load(sA0_i32))
+                owns_reduce = arrival == fx.Int32(k_batch - 1)
+            else:
+                # M=1 has only BN/2 packed outputs, which fit in wave 0. Avoid
+                # the LDS round trip and extra block barrier on that fast path.
+                arrival = fx.Int32(rocdl.readfirstlane(T.i32, arrival))
+                owns_reduce = (wave == fx.Int32(0)) & (
+                    arrival == fx.Int32(k_batch - 1)
+                )
+            if owns_reduce:
+                bf16_ptr_ty = fx.PointerType.get(
+                    BFloat16.ir_type,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=4,
+                )
+                out_flat = fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(
+                        fx.Tensor(
+                            fx.make_view(
+                                fx.inttoptr(bf16_ptr_ty, arg_out),
+                                fx.make_layout(1 << 28, 1),
+                            )
+                        ),
+                        max_size=False,
+                        num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2),
+                    ),
+                    fx.make_layout(1, 1),
+                )
+                # Keep the fused epilogue's live range small: unlike the
+                # standalone gfx1250 reducer, these registers coexist with the
+                # GEMM body and can otherwise lower GEMM occupancy.
+                reduce_vec = 2
+                vec_bf16 = T.vec(reduce_vec, BFloat16.ir_type)
+                reduce_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), BFloat16)
+                slab_stride = fx.Int32(i32_m * N)
+
+                # Follow the existing AITER split-K reduce's numeric path:
+                # extend BF16 partials to FP32, accumulate there, then truncate
+                # only the final result. Sequential loads minimize live VGPRs.
+                if const_expr(multi_row_tile):
+                    pairs_per_row = BN // reduce_vec
+                    reduce_pairs = i32_m * fx.Int32(pairs_per_row)
+                    for pair_idx in range(
+                        tid, reduce_pairs, fx.Int32(num_threads)
+                    ):
+                        row = pair_idx // fx.Int32(pairs_per_row)
+                        pair_in_row = pair_idx % fx.Int32(pairs_per_row)
+                        out_off = (
+                            row * fx.Int32(N)
+                            + by_n
+                            + pair_in_row * fx.Int32(reduce_vec)
+                        )
+                        reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
+                        for sk in range_constexpr(k_batch):
+                            partial_dw = fx.Int32(
+                                load_i32_nt(
+                                    arg_c,
+                                    (
+                                        out_off + fx.Int32(sk) * slab_stride
+                                    )
+                                    // fx.Int32(2),
+                                )
+                            )
+                            partial = Vec.from_elements([partial_dw], Int32).bitcast(
+                                BFloat16
+                            )
+                            reduced = reduced + partial.to(Float32)
+                        result = fx.make_rmem_tensor(reduce_vec, BFloat16)
+                        fx.memref_store_vec(reduced.truncf(vec_bf16), result)
+                        fx.copy(reduce_copy, result, out_flat[None, out_off])
+                elif tid < fx.Int32(BN // reduce_vec):
+                    out_off = by_n + tid * fx.Int32(reduce_vec)
+                    reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
+                    for sk in range_constexpr(k_batch):
+                        partial_dw = fx.Int32(
+                            load_i32_nt(
+                                arg_c,
+                                (
+                                    out_off + fx.Int32(sk) * slab_stride
+                                )
+                                // fx.Int32(2),
+                            )
+                        )
+                        partial = Vec.from_elements([partial_dw], Int32).bitcast(
+                            BFloat16
+                        )
+                        reduced = reduced + partial.to(Float32)
+                    result = fx.make_rmem_tensor(reduce_vec, BFloat16)
+                    fx.memref_store_vec(reduced.truncf(vec_bf16), result)
+                    fx.copy(reduce_copy, result, out_flat[None, out_off])
+
+                if tid == fx.Int32(0):
+                    tile_idx = (bx_m // BM) * (i32_n // BN) + by_n // BN
+                    sem_ptr_ty = fx.PointerType.get(
+                        Int32.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=4,
+                    )
+                    sem_ptr = fx.inttoptr(
+                        sem_ptr_ty,
+                        arg_semaphore + fx.Int64(tile_idx) * fx.Int64(4),
+                    )
+                    fx.ptr_store(fx.Int32(0), sem_ptr)
+
+    # Keep the established kernel ABI for every non-fused configuration.  The
+    # fused small-M specialization needs two extra pointers, but carrying those
+    # unused kernargs on all prefill/decode kernels can perturb kernarg preload
+    # and regress a few latency-sensitive existing configurations.
+    if const_expr(splitk_fused):
+
+        @flyc.kernel(name=_kname)
+        def kernel_gemm(
+            arg_c: fx.Int64,
+            arg_a: fx.Int64,
+            arg_b: fx.Int64,
+            arg_scale_a: fx.Int64,
+            arg_scale_b: fx.Int64,
+            arg_out: fx.Int64,
+            arg_semaphore: fx.Int64,
+            i32_m: fx.Int32,
+            i32_n: fx.Int32,
+        ):
+            _kernel_body(
+                arg_c,
+                arg_a,
+                arg_b,
+                arg_scale_a,
+                arg_scale_b,
+                arg_out,
+                arg_semaphore,
+                i32_m,
+                i32_n,
+            )
+
+    else:
+
+        @flyc.kernel(name=_kname)
+        def kernel_gemm(
+            arg_c: fx.Int64,
+            arg_a: fx.Int64,
+            arg_b: fx.Int64,
+            arg_scale_a: fx.Int64,
+            arg_scale_b: fx.Int64,
+            i32_m: fx.Int32,
+            i32_n: fx.Int32,
+        ):
+            _kernel_body(
+                arg_c,
+                arg_a,
+                arg_b,
+                arg_scale_a,
+                arg_scale_b,
+                arg_c,
+                arg_c,
+                i32_m,
+                i32_n,
+            )
 
     c_addr = fx.Int64(fx.ptrtoint(arg_c))
     a_addr = fx.Int64(fx.ptrtoint(arg_a))
     b_addr = fx.Int64(fx.ptrtoint(arg_b))
     sa_addr = fx.Int64(fx.ptrtoint(arg_scale_a))
     sb_addr = fx.Int64(fx.ptrtoint(arg_scale_b))
+    out_addr = fx.Int64(fx.ptrtoint(arg_out))
+    semaphore_addr = fx.Int64(fx.ptrtoint(arg_semaphore))
     if const_expr(waves_per_eu > 0):
         wpe = waves_per_eu
     else:
@@ -653,16 +994,164 @@ def launch_gemm(
     gx = (i32_m + (BM - 1)) // BM
     gy = i32_n // BN
     gz = batch * k_batch  # split-K: k_batch splits per (real) batch on grid.z
-    kernel_gemm(
-        c_addr,
-        a_addr,
-        b_addr,
-        sa_addr,
-        sb_addr,
+    if const_expr(splitk_fused):
+        kernel_gemm(
+            c_addr,
+            a_addr,
+            b_addr,
+            sa_addr,
+            sb_addr,
+            out_addr,
+            semaphore_addr,
+            i32_m,
+            i32_n,
+            value_attrs={"rocdl.waves_per_eu": wpe},
+        ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
+    else:
+        kernel_gemm(
+            c_addr,
+            a_addr,
+            b_addr,
+            sa_addr,
+            sb_addr,
+            i32_m,
+            i32_n,
+            value_attrs={"rocdl.waves_per_eu": wpe},
+        ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
+
+
+@flyc.jit
+def launch_gemm(
+    arg_c: fx.Pointer,
+    arg_a: fx.Pointer,
+    arg_b: fx.Pointer,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
+    i32_m: fx.Int32,
+    i32_n: fx.Int32,
+    stream: fx.Stream,
+    N: Constexpr[int],
+    K: Constexpr[int],
+    tile_m: Constexpr[int],
+    tile_n: Constexpr[int],
+    tile_k: Constexpr[int],
+    a_dtype: Constexpr[str],
+    out_dtype: Constexpr[str],
+    b_dtype: Constexpr[str],
+    batch: Constexpr[int],
+    a_row_stride: Constexpr[int],
+    a_batch_stride: Constexpr[int],
+    sca_row_stride: Constexpr[int],
+    sca_batch_stride: Constexpr[int],
+    c_row_stride: Constexpr[int],
+    c_batch_stride: Constexpr[int],
+    waves_per_eu: Constexpr[int],
+    xcd_swizzle: Constexpr[int],
+    k_batch: Constexpr[int] = 1,
+    blockscale: Constexpr[str] = "none",
+    multi_row_tile: Constexpr[bool] = False,
+):
+    """Launch the established non-fused GEMM ABI used by existing configs."""
+    _launch_gemm_impl(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_c,
+        arg_c,
         i32_m,
         i32_n,
-        value_attrs={"rocdl.waves_per_eu": wpe},
-    ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
+        stream,
+        N,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        a_dtype,
+        out_dtype,
+        b_dtype,
+        batch,
+        a_row_stride,
+        a_batch_stride,
+        sca_row_stride,
+        sca_batch_stride,
+        c_row_stride,
+        c_batch_stride,
+        waves_per_eu,
+        xcd_swizzle,
+        k_batch,
+        blockscale,
+        multi_row_tile,
+    )
+
+
+@flyc.jit
+def launch_gemm_fused(
+    arg_c: fx.Pointer,
+    arg_a: fx.Pointer,
+    arg_b: fx.Pointer,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
+    arg_out: fx.Pointer,
+    arg_semaphore: fx.Pointer,
+    i32_m: fx.Int32,
+    i32_n: fx.Int32,
+    stream: fx.Stream,
+    N: Constexpr[int],
+    K: Constexpr[int],
+    tile_m: Constexpr[int],
+    tile_n: Constexpr[int],
+    tile_k: Constexpr[int],
+    a_dtype: Constexpr[str],
+    out_dtype: Constexpr[str],
+    b_dtype: Constexpr[str],
+    batch: Constexpr[int],
+    a_row_stride: Constexpr[int],
+    a_batch_stride: Constexpr[int],
+    sca_row_stride: Constexpr[int],
+    sca_batch_stride: Constexpr[int],
+    c_row_stride: Constexpr[int],
+    c_batch_stride: Constexpr[int],
+    waves_per_eu: Constexpr[int],
+    xcd_swizzle: Constexpr[int],
+    k_batch: Constexpr[int] = 1,
+    blockscale: Constexpr[str] = "none",
+    multi_row_tile: Constexpr[bool] = False,
+):
+    """Launch the M<=16 split-K GEMM with its fused reduction arguments."""
+    _launch_gemm_impl(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_out,
+        arg_semaphore,
+        i32_m,
+        i32_n,
+        stream,
+        N,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        a_dtype,
+        out_dtype,
+        b_dtype,
+        batch,
+        a_row_stride,
+        a_batch_stride,
+        sca_row_stride,
+        sca_batch_stride,
+        c_row_stride,
+        c_batch_stride,
+        waves_per_eu,
+        xcd_swizzle,
+        k_batch,
+        blockscale,
+        multi_row_tile,
+    )
 
 
 # ── split-K reduce ────────────────────────────────────────────────────────────

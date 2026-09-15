@@ -36,21 +36,38 @@ _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
 @functools.cache
-def _gemm_exe(_cfg):
+def _gemm_exe(_cfg, fused, _multi_row):
     import flydsl.compiler as flyc
 
-    from .kernels.mxscale_preshuffle import launch_gemm
+    from .kernels.gemm.mxscale_preshuffle import launch_gemm, launch_gemm_fused
 
-    return flyc.jit(launch_gemm.func)
+    launcher = launch_gemm_fused if fused else launch_gemm
+    return flyc.jit(launcher.func)
 
 
 @functools.cache
 def _reduce_exe(_cfg):
     import flydsl.compiler as flyc
 
-    from .kernels.mxscale_preshuffle import launch_splitk_reduce
+    from .kernels.gemm.mxscale_preshuffle import launch_splitk_reduce
 
     return flyc.jit(launch_splitk_reduce.func)
+
+
+@functools.lru_cache(maxsize=1024)
+def _fused_splitk_buffers(
+    device: torch.device,
+    stream_id: int,
+    split_k: int,
+    M: int,
+    N: int,
+    num_tiles: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stream-private BF16 partials and per-output-tile arrival counters."""
+    del stream_id
+    workspace = torch.empty((split_k, M, N), dtype=torch.bfloat16, device=device)
+    semaphore = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
+    return workspace, semaphore
 
 
 def flydsl_mxscale_preshuffle_gemm(
@@ -75,9 +92,10 @@ def flydsl_mxscale_preshuffle_gemm(
 
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
 
-    split_k>1 splits the K reduction across grid.z: each split writes an fp32
-    partial slab to a scratch tmp[split_k, M, N], then a reduce kernel sums the
-    slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
+    split_k>1 splits the K reduction across grid.z. The tuned M<=16 blockscale
+    specialization writes BF16 partials to a small workspace, then the last
+    arriving block for each output tile reduces them in FP32 and writes Out.
+    Other shapes write fp32 partial slabs and launch a separate reduce kernel.
 
     blockscale selects the scale format and **defaults to True** -- the coarse
     blockscale path is the one this op is tuned for. It is a8w8-only and needs
@@ -139,10 +157,21 @@ def flydsl_mxscale_preshuffle_gemm(
     # a_scale/b_scale are already compact-shuffled by the caller
     # (shuffle_scale_blockscale_a/_b). No per-call repack here.
     bs_mode = "ab" if blockscale else "none"
+    split_k = int(split_k)
+    # For the latency-sensitive M<=16 path, keep the split partials in BF16 and
+    # let the last arriving GEMM block reduce them. This avoids a second launch
+    # without introducing output atomics or a grid-wide spin wait.
+    splitk_fused = (
+        blockscale
+        and split_k > 1
+        and M <= 16
+        and int(tile_m) == 16
+        and out_dtype == "bf16"
+        and int(tile_n) <= 128
+    )
 
     st = stream if stream is not None else torch.cuda.current_stream()
 
-    split_k = int(split_k)
     if split_k > 1:
         # split-K legality (same constraints the tuner enforces in fits_shape):
         # per-split K must be a whole number of tile_k tiles AND 256-K scale chunks.
@@ -176,41 +205,87 @@ def flydsl_mxscale_preshuffle_gemm(
         split_k,  # k_batch
         bs_mode,  # blockscale
     )
-    gemm_exe = _gemm_exe(cfg)
+    multi_row = int(tile_m) == 16 and M > 1
+    gemm_exe = _gemm_exe(cfg, splitk_fused, multi_row)
+    # Build each runtime pointer wrapper once per op.  The fused ABI carries two
+    # additional pointer slots; re-wrapping Out (or the split workspace) for
+    # those aliases measurably increases launch gaps on very short decode GEMMs.
+    a_ptr = ptr_arg(A)
+    b_ptr = ptr_arg(B)
+    a_scale_ptr = ptr_arg(a_scale)
+    b_scale_ptr = ptr_arg(b_scale)
+    out_ptr = ptr_arg(Out)
 
     if split_k == 1:
         _run_compiled(
             gemm_exe,
-            ptr_arg(Out),
-            ptr_arg(A),
-            ptr_arg(B),
-            ptr_arg(a_scale),
-            ptr_arg(b_scale),
+            out_ptr,
+            a_ptr,
+            b_ptr,
+            a_scale_ptr,
+            b_scale_ptr,
             M,
             N,
             st,
             *cfg,
+            multi_row,
+        )
+        return Out
+
+    if splitk_fused:
+        num_tiles = ((M + int(tile_m) - 1) // int(tile_m)) * (N // int(tile_n))
+        if isinstance(st, torch.cuda.Stream):
+            with torch.cuda.stream(st):
+                workspace, semaphore = _fused_splitk_buffers(
+                    A.device,
+                    int(st.cuda_stream),
+                    split_k,
+                    M,
+                    N,
+                    num_tiles,
+                )
+        else:
+            # Compile-only/AOT uses an fx.Stream placeholder and CPU/Fake tensors.
+            workspace, semaphore = _fused_splitk_buffers(
+                A.device, 0, split_k, M, N, num_tiles
+            )
+        _run_compiled(
+            gemm_exe,
+            ptr_arg(workspace),
+            a_ptr,
+            b_ptr,
+            a_scale_ptr,
+            b_scale_ptr,
+            out_ptr,
+            ptr_arg(semaphore),
+            M,
+            N,
+            st,
+            *cfg,
+            multi_row,
         )
         return Out
 
     # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
     tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
+    tmp_ptr = ptr_arg(tmp)
     _run_compiled(
         gemm_exe,
-        ptr_arg(tmp),
-        ptr_arg(A),
-        ptr_arg(B),
-        ptr_arg(a_scale),
-        ptr_arg(b_scale),
+        tmp_ptr,
+        a_ptr,
+        b_ptr,
+        a_scale_ptr,
+        b_scale_ptr,
         M,
         N,
         st,
         *cfg,
+        multi_row,
     )
     _run_compiled(
         _reduce_exe((split_k, out_dtype)),
-        ptr_arg(tmp),
-        ptr_arg(Out),
+        tmp_ptr,
+        out_ptr,
         (M * N) // 2,  # n_out_dw (2 out elems per dword)
         M * N,  # slab_stride_dw (fp32: 1 dword/elem)
         st,

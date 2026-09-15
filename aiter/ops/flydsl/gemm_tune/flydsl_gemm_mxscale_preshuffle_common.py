@@ -25,7 +25,9 @@ _SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
 
 # a/b operand combos the kernel supports (a4w4 / a6w4 / a8w8).
 _COMBOS = [("fp4", "fp4"), ("fp6", "fp4"), ("fp8", "fp8")]
-_TILE_M = (32, 64, 96, 128, 256)
+# Keep 16 last so adding the M=1-specialized blockscale tile does not renumber
+# existing kernel IDs recorded in tuned CSVs.
+_TILE_M = (32, 64, 96, 128, 256, 16)
 # tile_n=16/32 use fewer N-waves (block 64/128) so wide-N small-M shapes launch more
 # workgroups (WG=N/tile_n) and fill the CUs; tile_n>=64 keeps 4 waves / block 256.
 _TILE_N = (16, 32, 64, 128, 256, 512)
@@ -179,7 +181,11 @@ def instance_valid(ki: kernelInstance) -> bool:
     """Shape-independent legality against the mxscale_preshuffle kernel constraints."""
     if ki.tile_k not in (128, 256):
         return False
-    if ki.tile_m % 32 != 0:  # microscale packs M by 2 -> m_chunks = tile_m//16 even
+    if ki.tile_m % 32 != 0 and not (
+        ki.tile_m == 16 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
+    ):
+        # The per-1x32 MX path packs M chunks in pairs. The M=16 exception is
+        # reserved for the blockscale a8w8 path, where one A scale broadcasts.
         return False
     if ki.tile_n % 16 != 0:  # MFMA emits 16 N-cols; tile_n must be a multiple of 16
         return False
@@ -208,6 +214,8 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     whole number of tile_k K-tiles AND a whole number of 256-K e8m0 scale chunks,
     so the split boundary never straddles a tile or a microscale word."""
     if K % 128 != 0:
+        return False
+    if ki.tile_m == 16 and M > 16:
         return False
     # blockscale is a8w8-only and needs whole 128-N blocks: shuffle_scale_blockscale_b
     # takes (N//128, K//128) and the kernel reads 4 dwords per 128-N block. fp4/fp6

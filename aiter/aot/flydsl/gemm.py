@@ -434,7 +434,8 @@ def _compile_mxscale_preshuffle_to_cache(
     """gfx950 MX-microscale preshuffle GEMM (``flydsl_mxpsh_*``).
 
     ``blockscale`` selects the scale format; the two modes are distinct
-    Constexprs and therefore distinct binaries, so each is its own job.
+    Constexprs and therefore distinct binaries, so each is its own job. Keep
+    the CSV's logical M so the M<=16 fused split-K specializations are also AOT'd.
     """
     del kwargs
 
@@ -445,7 +446,6 @@ def _compile_mxscale_preshuffle_to_cache(
     )
 
     dev = torch.device("cpu")
-    m = int(tile_m)
     # fp4 packs 2 codes/byte; fp6/fp8 are 1 byte/code.
     a_bytes = k // 2 if a_dtype == "fp4" else k
     b_bytes = k // 2 if b_dtype == "fp4" else k
