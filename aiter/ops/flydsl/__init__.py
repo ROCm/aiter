@@ -41,6 +41,10 @@ _LAZY_IMPORTS = {
         ".kernels.flash_attn_func_fp8_gfx950",
         "flydsl_flash_attn_fp8_func",
     ),
+    "flydsl_flash_attn_paged_fp8_func": (
+        ".kernels.flash_attn_paged_fp8_func_gfx950",
+        "flydsl_flash_attn_paged_fp8_func",
+    ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_fp8_mqa_logits": (
         ".kernels.mqa_logits.fp8_mqa_logits",
@@ -91,6 +95,7 @@ __all__ = [
     "compute_varqlen_windows",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_paged_fp8_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
     "flydsl_hstu_attention_fwd",
