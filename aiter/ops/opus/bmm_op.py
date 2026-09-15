@@ -381,7 +381,11 @@ def _heuristic_bpreshuffle_kid(
         #
         # Names the measured winner in 48 of 55 cells; every miss is a near-tie
         # it declines to chase (worst 6.7%, at b<=2 m=32 where kid8 edges kid10).
-        if m <= 128 and m * batch <= 256:
+        # The m*batch bound was 256, fitted to the sweep's own edge. Measured
+        # on profiler kernel time at b=16 m=32 (m*batch = 512), kid38 is 12.1 us
+        # against kid31's 13.2 -- the narrow tile still wins there. It does NOT
+        # extend further: at b=16 m=64 kid38 is 32.8 us against kid31's 25.6.
+        if m <= 128 and m * batch <= 512 and m <= 32:
             # kid38 is kid8's 16x64 tile moved onto the NON-SPECIALIZED pipeline
             # at B_K=512 / slots=4. ATT at b=16 m=16 put 43.7% of kid8's latency
             # in s_barrier_wait -- the specialized DATA/FREE handshake, one pair
@@ -433,7 +437,11 @@ def _heuristic_bpreshuffle_kid(
         # enough M tiles for the halved B traffic to outweigh kid31's finer
         # grid -- eight of them, or four when the batch is replicating B anyway.
         # Under that, kid31 still wins and this leaves it alone.
-        return 47 if (mt35 >= 8 or (mt35 >= 4 and batch >= 4)) else 31
+        # kid47's four-M-tile arm needs the batch to be replicating B for the
+        # halved B traffic to pay. At batch 2 it does not: b=2 m=2048 measures
+        # kid47 17.8 us against kid31's 15.7 (profiler kernel time), so the
+        # small-batch corner stays on kid31's finer grid.
+        return 47 if (mt35 >= 8 or (mt35 >= 4 and batch >= 4)) and batch > 2 else 31
     if m > _BPRESHUF_DECODE_M_MAX:
         # Prefill. Two tiles, split on kid27's own workgroup count.
         #
