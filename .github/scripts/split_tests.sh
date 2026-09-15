@@ -51,6 +51,15 @@ TEST_DIR="${TEST_DIR%/}"
 # ------------------------------
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    FLYDSL_GEMM_TESTS=(
+        "op_tests/flydsl_tests/test_flydsl_decode_gemm.py"
+        "op_tests/flydsl_tests/test_flydsl_small_m_hgemm.py"
+    )
+    for test_file in "${FLYDSL_GEMM_TESTS[@]}"; do
+        if [[ -f "$test_file" ]]; then
+            ALL_FILES+=("$test_file")
+        fi
+    done
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi

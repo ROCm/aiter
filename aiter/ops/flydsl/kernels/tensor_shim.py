@@ -263,6 +263,11 @@ def ptr_arg(t: torch.Tensor, dtype=None):
     return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
+def unused_tensor_arg(value, placeholder):
+    """FlyDSL kernel tensor slots cannot be None; use ``placeholder`` when unused."""
+    return placeholder if value is None else value
+
+
 def _run_compiled(exe, *args):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
@@ -521,7 +526,7 @@ class GTensor(TensorBase):
         if vec_size == 1:
             return t[offset]
         frag = fx.make_fragment_like(fx.slice(t, (0, None)))
-        atom = buf_copy_atom(vec_size * (elem.width // 8), elem)
+        atom = buf_copy_atom(vec_size * (elem.width // 8), elem, self.cache_modifier)
         fx.copy(atom, fx.slice(t, (offset, None)), frag)
         return fx.memref_load_vec(frag)
 
