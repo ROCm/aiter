@@ -1398,7 +1398,7 @@ class AttentionProgram:
     ):
         """Split-KV partials: store the un-reduced M (row max), L (exp sum) and acc
         (un-normalized PV accumulator) for this split. The cross-split reduction is
-        done later by the shared Triton `reduce_segments`.
+        done later by the shared Triton reduce_segments.
 
         Buffers are contiguous:
             partial_acc : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS, HEAD_SIZE]
