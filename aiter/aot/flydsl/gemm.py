@@ -863,12 +863,17 @@ def _compile_decode_to_cache(
         num_cus=cu_num,
         has_bias=has_bias,
     )
+    # Pass `bias` through as-is. The decode launcher rejects a non-None bias when
+    # it was compiled without bias support, and substitutes its own placeholder
+    # for the unused slot; wrapping it here in unused_tensor_arg() applied that
+    # substitution twice, so every bias-free row arrived as a real tensor and
+    # failed AOT with "This decode launcher was compiled without bias support."
     _compile_executable_to_cache(
         launcher,
         a,
         b,
         c,
-        unused_tensor_arg(bias if has_bias else None, b),
+        bias if has_bias else None,
         fx.Stream(0),
     )
 
