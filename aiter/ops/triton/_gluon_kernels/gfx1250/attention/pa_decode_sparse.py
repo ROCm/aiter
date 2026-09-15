@@ -1803,6 +1803,42 @@ def _v4_dequant_chunk_mx(
 
 
 @gluon.jit
+def _v4_qk_mx_split(
+    q_smem,
+    qs_smem,
+    kv_buf,
+    scale_buf,
+    dot_q_layout: gl.constexpr,
+    dot_k_layout: gl.constexpr,
+    q_sc_layout: gl.constexpr,
+    k_sc_layout: gl.constexpr,
+    qk_wmma_layout: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_D: gl.constexpr,
+    MXK: gl.constexpr,
+):
+    """QK over BLOCK_D in MXK-wide K steps instead of one full-width dot.
+
+    The ISA only has K=128 (``v_wmma_scale_f32_16x16x128_f8f6f4``), so the
+    full-width dot already lowers to BLOCK_D/128 accumulating instructions;
+    splitting it in the source changes *liveness*, not instruction count.
+    Each step reads its Q and K slices from LDS immediately before its own
+    dot, so the [BLOCK_H, BLOCK_D] Q operand never has to sit in registers
+    across the whole K loop.
+    """
+    NSC: gl.constexpr = MXK // 32
+    acc = gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=qk_wmma_layout)
+    for c in tl.static_range(BLOCK_D // MXK):
+        q_c = q_smem.slice(c * MXK, MXK, dim=1).load(dot_q_layout)
+        qs_c = qs_smem.slice(c * NSC, NSC, dim=1).load(q_sc_layout)
+        k_c = kv_buf.slice(c * MXK, MXK, dim=1).permute([1, 0]).load(dot_k_layout)
+        ks_c = scale_buf.slice(c * NSC, NSC, dim=1).load(k_sc_layout)
+        acc = gl.amd.gfx1250.wmma_scaled(q_c, qs_c, "e4m3", k_c, ks_c, "e4m3", acc)
+    return acc
+
+
+@gluon.jit
 def _v4_pv_bf16(
     p_dot,
     bf16_smem,
@@ -1958,6 +1994,15 @@ def _pa_decode_sparse_v4_a8w8(
     k_scale_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
         dot_k_layout, [BLOCK_K, NUM_MX_BLOCKS], 32
     )
+    # One hardware K step of the scaled dot, plus its scale operands.
+    MXK: gl.constexpr = 128
+    NSC_CHUNK: gl.constexpr = MXK // 32
+    q_sc_chunk_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_q_layout, [BLOCK_H, NSC_CHUNK], 32
+    )
+    k_sc_chunk_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_k_layout, [BLOCK_K, NSC_CHUNK], 32
+    )
     # RoPE QK and all of PV are plain bf16 wmma.
     BF16_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
@@ -2068,6 +2113,13 @@ def _pa_decode_sparse_v4_a8w8(
     pid_k = gl.program_id(2)
     h_off_base = pid_h * BLOCK_H
 
+    # Issued before the Q descriptors so this scalar load is in flight while
+    # the Q TDM loads are set up and issued. Only the LOADS are hoisted: the
+    # s_wait_kmcnt lands on the first consumer, so computing kv_len here would
+    # drag the wait back above the tensor_load_to_lds and defeat the point.
+    kv_start = gl.load(kv_indptr_ptr + t)
+    kv_end = gl.load(kv_indptr_ptr + t + 1)
+
     # ---- Q (once per program): stays e4m3, its E8M0 block is the scale operand ----
     qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
     if Q_TDM:
@@ -2110,10 +2162,11 @@ def _pa_decode_sparse_v4_a8w8(
         gl.amd.gfx1250.tdm.async_load(q_desc, [h_off_base, 0], q_smem)
         gl.amd.gfx1250.tdm.async_load(qs_desc, [h_off_base, 0], qs_smem)
         gl.amd.gfx1250.tdm.async_load(qr_desc, [h_off_base, 0], qr_smem)
-        gl.amd.gfx1250.tdm.async_wait(0)
-        mfma_q = q_smem.load(dot_q_layout)
-        q_scale = qs_smem.load(q_scale_layout)
-        mfma_qr = qr_smem.load(dot_qr_layout)
+        # No wait here: Q stays in flight across the early return, the sink
+        # load, the accumulator init and the descriptor setup below. It is
+        # retired just before the first slot gather. Q also stays in LDS --
+        # the split QK reads a 128-wide slice per dot rather than pinning the
+        # whole [BLOCK_H, BLOCK_D] operand in registers for the loop.
     else:
         h_offs_q = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, QDQ_BLOCKED_LAYOUT))
         d_offs_q = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, QDQ_BLOCKED_LAYOUT))
@@ -2161,12 +2214,15 @@ def _pa_decode_sparse_v4_a8w8(
         # so it cannot hide in the E8M0 scale either -- it is applied to the scores.
         mfma_qr = gl.convert_layout(q_rope, dot_qr_layout)
 
-    kv_start = gl.load(kv_indptr_ptr + t)
-    kv_end = gl.load(kv_indptr_ptr + t + 1)
     kv_len = kv_end - kv_start
-
     tiles_per_segment = gl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
     if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
+        # Q's TDM loads are still in flight here and nothing downstream waits
+        # on this path: s_endpgm does not drain them, so without this the CTA
+        # would exit with DMA still writing into LDS the workgroup is
+        # releasing. Only early-exiting CTAs pay it.
+        if Q_TDM:
+            gl.amd.gfx1250.tdm.async_wait(0)
         return
     num_tiles = gl.cdiv(kv_len, BLOCK_K)
     tile_start = pid_k * tiles_per_segment
@@ -2218,8 +2274,8 @@ def _pa_decode_sparse_v4_a8w8(
     # 3-deep gather ring plus a 2-deep bf16 staging ring, as in the bf16
     # kernel: a tile is gathered two iterations ahead of its use, and tile
     # i+1's dequant writes one staging buffer while tile i's PV reads the other.
-    NUM_BUFFERS: gl.constexpr = 3
-    NUM_STAGE: gl.constexpr = 2
+    NUM_BUFFERS: gl.constexpr = 2
+    NUM_STAGE: gl.constexpr = 1
     kv_bufs = gl.allocate_shared_memory(
         unified_kv_ptr.dtype.element_ty,
         [NUM_BUFFERS, BLOCK_K, BLOCK_D],
@@ -2253,13 +2309,6 @@ def _pa_decode_sparse_v4_a8w8(
         block_shape=[BLOCK_K, BLOCK_D],
         layout=kv_packed_shared,
     )
-    rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=kv_rope_ptr,
-        shape=[total_pages, ROPE_DIM],
-        strides=[kvr_stride_n, 1],
-        block_shape=[BLOCK_K, ROPE_DIM],
-        layout=rope_shared,
-    )
     mxs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=kv_u8_ptr + NOPE_DIM,
         shape=[total_pages, NUM_MX_BLOCKS],
@@ -2277,7 +2326,20 @@ def _pa_decode_sparse_v4_a8w8(
 
     k_offs_mma = gl.arange(0, BLOCK_K, layout=valid_col_mma)
 
+    rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=kv_rope_ptr,
+        shape=[total_pages, ROPE_DIM],
+        strides=[kvr_stride_n, 1],
+        block_shape=[BLOCK_K, ROPE_DIM],
+        layout=rope_shared,
+    )
+
     # ---- Prologue ----
+    # Retire Q here, as late as possible but before any slot/KV gather is in
+    # flight, so the wait cannot be confused with theirs.
+    if Q_TDM:
+        gl.amd.gfx1250.tdm.async_wait(0)
+        mfma_qr = qr_smem.load(dot_qr_layout)
     gl.amd.gfx1250.tdm.async_load(
         slot_desc, [0, tile_start * BLOCK_K], slot_bufs.index(0)
     )
@@ -2295,96 +2357,96 @@ def _pa_decode_sparse_v4_a8w8(
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, kv_bufs.index(0))
     gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot_cur, rope_bufs.index(0))
     gl.amd.gfx1250.tdm.async_gather(mxs_desc, safe_slot_cur, scale_bufs.index(0))
-    gl.amd.gfx1250.tdm.async_load(
-        slot_desc, [0, (tile_start + 2) * BLOCK_K], slot_bufs.index(2)
-    )
-    # Four TDM ops per tile here (slot + kv + rope + mxs) against the bf16
-    # kernel's three, so the waits are one deeper. Invariant at the top of
-    # iteration i: exactly 4 outstanding -- slot(i+2) in flight, KV/RoPE/MXS(i+1)
-    # in flight, and staging[i % NUM_STAGE] already holding dequantized tile i.
-    gl.amd.gfx1250.tdm.async_wait(4)  # slot(1) ready
-    slot_reg = slot_bufs.index(1).reshape([BLOCK_K]).load(layout=SLOT_BLOCKED_LAYOUT)
-    if HAS_INVALID:
-        valid_wide = slot_reg >= 0
-        safe_slot_nxt = gl.where(valid_wide, slot_reg, 0)
-        next_valid = gl.convert_layout(valid_wide, valid_col_mma)
-    else:
-        safe_slot_nxt = slot_reg
-    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_nxt, kv_bufs.index(1))
-    gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot_nxt, rope_bufs.index(1))
-    gl.amd.gfx1250.tdm.async_gather(mxs_desc, safe_slot_nxt, scale_bufs.index(1))
-    gl.amd.gfx1250.tdm.async_wait(4)  # KV/RoPE/MXS(0) ready
-    _v4_dequant_lora_mx(
-        kv_bufs.index(0),
-        scale_bufs.index(0),
-        kv_bf16.index(0),
-        BLOCK_K,
-        CHUNK2_LAYOUT,
-        CHUNK3_LAYOUT,
-        SC_SPAN,
-        PV0,
-        PV1,
-        PV2,
-    )
+    # Two-deep, like the asm kernel: tile i+1 is gathered while tile i is
+    # consumed, so only two KV ring slots and ONE dequant staging tile are
+    # live. Three-deep hides the dequant better per iteration, but its LDS
+    # (3 KV buffers + 2 staging) forces one workgroup per CU at BLOCK_K=64,
+    # and losing the co-resident workgroup costs more than the extra overlap
+    # buys. At two-deep BLOCK_K=64 fits in 152 KB, under the 160 KB that
+    # gfx1250's 320 KB needs for two workgroups.
+    #
+    # Four TDM ops per tile (slot + kv + rope + mxs). Invariant at the top of
+    # iteration i: exactly 4 outstanding -- slot(i+1) in flight and
+    # KV/RoPE/MXS(i) in flight.
 
     gl.assume(num_iters >= 1)
     for i in tl.range(0, num_iters - 1):
-        # 1. retire slot(i+2), read it, gather tile i+2 two iterations ahead
+        # 1. retire slot(i+1), read it, gather tile i+1 one iteration ahead
         gl.amd.gfx1250.tdm.async_wait(3)
         slot_reg = (
-            slot_bufs.index((i + 2) % NUM_SLOT_BUFFERS)
+            slot_bufs.index((i + 1) % NUM_SLOT_BUFFERS)
             .reshape([BLOCK_K])
             .load(layout=SLOT_BLOCKED_LAYOUT)
         )
         if HAS_INVALID:
             valid_wide = slot_reg >= 0
             safe_next_slot = gl.where(valid_wide, slot_reg, 0)
-            next2_valid = gl.convert_layout(valid_wide, valid_col_mma)
+            next_valid = gl.convert_layout(valid_wide, valid_col_mma)
         else:
             safe_next_slot = slot_reg
         gl.amd.gfx1250.tdm.async_load(
             slot_desc,
-            [0, (tile_start + i + 3) * BLOCK_K],
-            slot_bufs.index((i + 3) % NUM_SLOT_BUFFERS),
+            [0, (tile_start + i + 2) * BLOCK_K],
+            slot_bufs.index((i + 2) % NUM_SLOT_BUFFERS),
         )
         gl.amd.gfx1250.tdm.async_gather(
-            kv_desc, safe_next_slot, kv_bufs.index((i + 2) % NUM_BUFFERS)
+            kv_desc, safe_next_slot, kv_bufs.index((i + 1) % NUM_BUFFERS)
         )
         gl.amd.gfx1250.tdm.async_gather(
-            rope_desc, safe_next_slot, rope_bufs.index((i + 2) % NUM_BUFFERS)
+            rope_desc, safe_next_slot, rope_bufs.index((i + 1) % NUM_BUFFERS)
         )
         gl.amd.gfx1250.tdm.async_gather(
-            mxs_desc, safe_next_slot, scale_bufs.index((i + 2) % NUM_BUFFERS)
+            mxs_desc, safe_next_slot, scale_bufs.index((i + 1) % NUM_BUFFERS)
         )
 
-        # ---- QK ----
-        # 2. tile i's dot operands BEFORE the dequant below: the LDS pipe is
-        #    serial, so the dequant's traffic for tile i+1 would otherwise sit
-        #    in front of these and the dots could not start until it drained.
-        k_e4m3 = kv_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_k_layout)
-        k_scale = scale_bufs.index(i % NUM_BUFFERS).load(k_scale_layout)
-        scores = gl.amd.gfx1250.wmma_scaled(
-            mfma_q,
-            q_scale,
-            "e4m3",
-            k_e4m3,
-            k_scale,
-            "e4m3",
-            gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
-        )
-        kr_t = rope_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_kr_layout)
-
-        # 3. retire KV/RoPE/MXS(i+1) and dequantize it into the staging buffer
-        #    tile i's PV is NOT reading this iteration
+        # 2. retire KV/RoPE/MXS(i), gathered one iteration ago
         if CTAS_H > 1:
             gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait(4)
         if CTAS_H > 1:
             gl.amd.gfx1250.cluster.wait()
+
+        # ---- QK ----
+        # 3. tile i's dot operands BEFORE the dequant below: the LDS pipe is
+        #    serial, so the dequant's traffic would otherwise sit in front of
+        #    these and the dots could not start until it drained.
+        if Q_TDM:
+            scores = _v4_qk_mx_split(
+                q_smem,
+                qs_smem,
+                kv_bufs.index(i % NUM_BUFFERS),
+                scale_bufs.index(i % NUM_BUFFERS),
+                dot_q_layout,
+                dot_k_layout,
+                q_sc_chunk_layout,
+                k_sc_chunk_layout,
+                QK_WMMA_LAYOUT,
+                BLOCK_H,
+                BLOCK_K,
+                BLOCK_D,
+                MXK,
+            )
+        else:
+            k_e4m3 = kv_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_k_layout)
+            k_scale = scale_bufs.index(i % NUM_BUFFERS).load(k_scale_layout)
+            scores = gl.amd.gfx1250.wmma_scaled(
+                mfma_q,
+                q_scale,
+                "e4m3",
+                k_e4m3,
+                k_scale,
+                "e4m3",
+                gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
+            )
+        kr_t = rope_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_kr_layout)
+
+        # 4. dequantize tile i into the single staging tile; the PV below is
+        #    what reads it, so this is a serial dependence within the iteration
+        #    rather than the cross-iteration overlap the 3-deep ring had.
         _v4_dequant_lora_mx(
-            kv_bufs.index((i + 1) % NUM_BUFFERS),
-            scale_bufs.index((i + 1) % NUM_BUFFERS),
-            kv_bf16.index((i + 1) % NUM_STAGE),
+            kv_bufs.index(i % NUM_BUFFERS),
+            scale_bufs.index(i % NUM_BUFFERS),
+            kv_bf16.index(0),
             BLOCK_K,
             CHUNK2_LAYOUT,
             CHUNK3_LAYOUT,
@@ -2421,7 +2483,7 @@ def _pa_decode_sparse_v4_a8w8(
         p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
         a0, a1, a2, ar = _v4_pv_bf16(
             p_dot,
-            kv_bf16.index(i % NUM_STAGE),
+            kv_bf16.index(0),
             rope_bufs.index(i % NUM_BUFFERS),
             a0,
             a1,
@@ -2437,7 +2499,6 @@ def _pa_decode_sparse_v4_a8w8(
         l_i = l_new
         if HAS_INVALID:
             cur_valid = next_valid
-            next_valid = next2_valid
 
     # ---- Epilogue: final (possibly partial) tile ----
     if CTAS_H > 1:
@@ -2453,17 +2514,34 @@ def _pa_decode_sparse_v4_a8w8(
         valid_col = final_in_range
 
     final_idx = (num_iters - 1) % NUM_BUFFERS
-    k_e4m3 = kv_bufs.index(final_idx).permute([1, 0]).load(dot_k_layout)
-    k_scale = scale_bufs.index(final_idx).load(k_scale_layout)
-    scores = gl.amd.gfx1250.wmma_scaled(
-        mfma_q,
-        q_scale,
-        "e4m3",
-        k_e4m3,
-        k_scale,
-        "e4m3",
-        gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
-    )
+    if Q_TDM:
+        scores = _v4_qk_mx_split(
+            q_smem,
+            qs_smem,
+            kv_bufs.index(final_idx),
+            scale_bufs.index(final_idx),
+            dot_q_layout,
+            dot_k_layout,
+            q_sc_chunk_layout,
+            k_sc_chunk_layout,
+            QK_WMMA_LAYOUT,
+            BLOCK_H,
+            BLOCK_K,
+            BLOCK_D,
+            MXK,
+        )
+    else:
+        k_e4m3 = kv_bufs.index(final_idx).permute([1, 0]).load(dot_k_layout)
+        k_scale = scale_bufs.index(final_idx).load(k_scale_layout)
+        scores = gl.amd.gfx1250.wmma_scaled(
+            mfma_q,
+            q_scale,
+            "e4m3",
+            k_e4m3,
+            k_scale,
+            "e4m3",
+            gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
+        )
     kr_t = rope_bufs.index(final_idx).permute([1, 0]).load(dot_kr_layout)
     scores_r = gl.amd.gfx1250.wmma(
         mfma_qr,
@@ -2472,6 +2550,25 @@ def _pa_decode_sparse_v4_a8w8(
     )
     scores = (scores + gl.convert_layout(scores_r, QK_WMMA_LAYOUT)) * qk_scale
     scores = scores + gl.where(valid_col, 0.0, float("-inf"))[None, :]
+
+    # Two-deep: nothing staged this tile for us, so the epilogue dequantizes
+    # its own. Unlike the loop body this sits AFTER both dots, not between the
+    # operand loads and the dots: gfx1250 reaches VGPRs through a 256-register
+    # window per operand slot, and wmma_scaled needs src0, src1 and both scale
+    # operands in window 0 at once. Dequantizing first keeps k_e4m3 / kr_t live
+    # across it and costs 8 window-0 spills even with ~120 registers free.
+    _v4_dequant_lora_mx(
+        kv_bufs.index(final_idx),
+        scale_bufs.index(final_idx),
+        kv_bf16.index(0),
+        BLOCK_K,
+        CHUNK2_LAYOUT,
+        CHUNK3_LAYOUT,
+        SC_SPAN,
+        PV0,
+        PV1,
+        PV2,
+    )
 
     m_block = gl.max(scores, axis=1)
     m_new = gl.maximum(m_i, m_block)
@@ -2490,11 +2587,9 @@ def _pa_decode_sparse_v4_a8w8(
     a2 = a2 * alpha_pv
     ar = ar * alpha_pv
     p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
-    # No dequant here: the last loop iteration already staged this tile (and
-    # for num_iters == 1 the prologue did).
     a0, a1, a2, ar = _v4_pv_bf16(
         p_dot,
-        kv_bf16.index((num_iters - 1) % NUM_STAGE),
+        kv_bf16.index(0),
         rope_bufs.index(final_idx),
         a0,
         a1,

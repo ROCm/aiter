@@ -894,7 +894,14 @@ def _pa_decode_sparse_v4_2buff(
     block_k = 16
     waves_per_eu = 1
     if block_h == 128:
-        block_k = 32
+        # The a8w8 (MX QK) kernel wants a 64-row KV tile: now that its Q
+        # operand is streamed from LDS one K step at a time instead of held in
+        # registers, the wider tile no longer overflows the register file, and
+        # the fatter iteration amortises the accumulator rescale and the
+        # barriers over twice the work -- 64.4us vs 69.9us at kv_len=384,
+        # T=512, H=128. The dequant-and-stage kernel is LDS-bound and doubling
+        # its KV ring regresses it badly (69.3 -> 114.7us), so it keeps 32.
+        block_k = 64 if (q_packed and use_mx) else 32
         attn_num_warps = 8
         max_num_wg = 256
         # The bf16 path asks for 2 waves/EU here; the dequant pushes this
