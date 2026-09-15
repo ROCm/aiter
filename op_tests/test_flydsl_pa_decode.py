@@ -979,6 +979,425 @@ def test_extreme_tail_value_scale_is_ignored(context_length, query_length):
     _assert_matches(output, reference)
 
 
+@pytest.mark.parametrize("num_partitions", [1, 4, 8])
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_per_token_scale_extremes_with_mixed_lengths(
+    block_size, trans_v, num_partitions
+):
+    """Per-token normalization ignores tails and survives odd split starts.
+
+    K is zero, so attention is uniform and the expected output is simply the
+    mean of the valid per-token V scales.  Valid scales vary by 256-token tile
+    and 64-token wave, the first tile has an exactly-zero maximum, and unused
+    slots in the final physical page carry a hostile 1e9 scale.  Lengths 769
+    and 2305 put a one-token tail after three and nine full tiles respectively;
+    with four/eight partitions they also exercise odd global tile indices in
+    the ping-pong scale buffer.  The empty row checks the neutral result.
+    """
+    _require_gpu()
+    lengths = [0, 769, 2305]
+    batch_size, num_query_heads, num_kv_heads, head_dim = 3, 16, 1, 128
+    pages_per_sequence = [(length + block_size - 1) // block_size for length in lengths]
+    max_pages = max(pages_per_sequence)
+    num_pages = sum(pages_per_sequence)
+    quant_dtype = _quant_dtype()
+
+    query = torch.ones(batch_size, num_query_heads, head_dim, dtype=dtypes.bf16)
+    key_cache = torch.zeros(
+        num_pages,
+        num_kv_heads,
+        head_dim // 16,
+        block_size,
+        16,
+        dtype=quant_dtype,
+    )
+    value_plain = torch.ones(
+        num_pages, num_kv_heads, head_dim, block_size, dtype=quant_dtype
+    )
+    if trans_v:
+        value_cache = (
+            value_plain.view(
+                num_pages,
+                num_kv_heads,
+                head_dim,
+                block_size // 16,
+                16,
+            )
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+    else:
+        value_cache = value_plain
+
+    block_tables = torch.zeros(batch_size, max_pages, dtype=dtypes.i32)
+    key_scale = torch.full(
+        (num_pages, num_kv_heads, block_size, 1), 1e9, dtype=dtypes.fp32
+    )
+    value_scale = torch.full_like(key_scale, 1e9)
+    expected_values = []
+    next_page = 0
+    for seq, (length, page_count) in enumerate(zip(lengths, pages_per_sequence)):
+        if length == 0:
+            expected_values.append(torch.zeros((), dtype=dtypes.fp32))
+            continue
+        block_tables[seq, :page_count] = torch.arange(
+            next_page, next_page + page_count, dtype=dtypes.i32
+        )
+        capacity = page_count * block_size
+        token = torch.arange(capacity, dtype=dtypes.i32)
+        tile = token // KV_COMPUTE_BLOCK
+        wave = (token % KV_COMPUTE_BLOCK) // 64
+        exponent = ((tile + wave) % 5 - 4).to(dtypes.fp32)
+        scales = torch.exp2(exponent)
+        scales = torch.where(token < KV_COMPUTE_BLOCK, 0.0, scales)
+        scales = torch.where(token < length, scales, 1e9)
+        page_scales = scales.reshape(page_count, block_size)
+        key_scale[next_page : next_page + page_count, 0, :, 0] = page_scales
+        value_scale[next_page : next_page + page_count, 0, :, 0] = page_scales
+        expected_values.append(scales[:length].mean())
+        next_page += page_count
+
+    context_lengths = torch.tensor(lengths, dtype=dtypes.i32)
+    output = torch.full_like(query, float("nan"))
+    pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        1,
+        num_partitions,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+    )
+
+    expected = (
+        torch.stack(expected_values)
+        .reshape(batch_size, 1, 1)
+        .expand(batch_size, num_query_heads, head_dim)
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), expected, rtol=0.005, atol=0.005)
+
+
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_per_token_sparse_pages_with_odd_partition_start(block_size, trans_v):
+    """Page and scale prefetches stay aligned across odd-starting partitions.
+
+    Ten compute tiles split four ways start at 0, 3, 6 and 9. The partition
+    starting at 3 therefore both starts in the odd scale buffer and reuses it.
+    Nontrivial K/V and independently varying scales expose mistakes hidden by
+    uniform attention. Selected physical pages are shuffled and separated by
+    unused pages, so a logical-page/physical-page mixup cannot pass unnoticed.
+    """
+    _require_gpu()
+    context_length, num_partitions = 2305, 4
+    num_query_heads, head_dim = 16, 128
+    logical_pages = (context_length + block_size - 1) // block_size
+    num_pages = 2 * logical_pages + 1
+    quant_dtype = _quant_dtype()
+    generator = torch.Generator(device="cuda").manual_seed(23)
+    pages = 2 * torch.randperm(logical_pages, generator=generator) + 1
+    token = torch.arange(logical_pages * block_size)
+    tile = token // KV_COMPUTE_BLOCK
+    wave = (token % KV_COMPUTE_BLOCK) // 64
+    dim = torch.arange(head_dim)
+    signs = (1 - 2 * (dim % 2)).float()
+    query_factors = 0.5 + 0.25 * (torch.arange(num_query_heads) % 3).float()
+    query = (query_factors[:, None] * signs[None, :]).unsqueeze(0).to(dtypes.bf16)
+
+    key = torch.rand(num_pages, 1, block_size, head_dim, generator=generator) * 0.25
+    value = torch.rand(num_pages, 1, block_size, head_dim, generator=generator) - 0.5
+    # Correlated logits and tile-dependent values make a wrong K scale affect
+    # the answer, while variation within pages exercises every token lane.
+    logical_key = (0.125 + 0.0625 * ((tile + wave) % 4))[:, None] * signs[None, :]
+    logical_key += 0.015625 * ((token[:, None] + dim[None, :]) % 3 - 1)
+    logical_value = (
+        0.25 * (tile % 3 - 1)[:, None]
+        + 0.0625 * (token // 16 % 3 - 1)[:, None]
+        + 0.03125 * (dim % 5 - 2)[None, :]
+    )
+    key[pages] = logical_key.reshape(logical_pages, 1, block_size, head_dim)
+    value[pages] = logical_value.reshape(logical_pages, 1, block_size, head_dim)
+    key = key.to(quant_dtype)
+    value = value.to(quant_dtype)
+    key_scale = torch.ones(num_pages, 1, block_size, 1, dtype=dtypes.fp32)
+    value_scale = torch.ones_like(key_scale)
+    key_scale[pages, 0, :, 0] = torch.exp2(
+        ((2 * tile + wave + token % 3) % 4 - 2).float()
+    ).reshape(logical_pages, block_size)
+    value_scale[pages, 0, :, 0] = torch.exp2(
+        ((tile + 2 * wave + token % 5) % 4 - 3).float()
+    ).reshape(logical_pages, block_size)
+
+    key_cache = (
+        key.view(num_pages, 1, block_size, head_dim // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_plain = value.permute(0, 1, 3, 2).contiguous()
+    value_cache = (
+        value.view(num_pages, 1, block_size // 16, 16, head_dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        if trans_v
+        else value_plain
+    )
+    block_tables = pages.to(dtypes.i32).unsqueeze(0)
+    context_lengths = torch.tensor([context_length], dtype=dtypes.i32)
+    reference = run_torch(
+        query.float(),
+        key,
+        value_plain,
+        block_tables,
+        context_lengths,
+        key_scale,
+        value_scale,
+    )
+    output = torch.full_like(query, float("nan"))
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        1,
+        num_partitions,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), reference, rtol=0.005, atol=0.005)
+
+
+def _run_mtp4_fused_reference_case(
+    lengths, num_kv_heads, block_size, trans_v, num_partitions
+):
+    """Check MTP4 with sparse pages, varying scales, and a causal FP32 reference."""
+    torch.manual_seed(37)
+    query_length, query_group_size, head_dim = 4, 16, 128
+    batch_size = len(lengths)
+    num_query_heads = num_kv_heads * query_group_size
+    pages_per_sequence = [(length + block_size - 1) // block_size for length in lengths]
+    max_pages = max(pages_per_sequence)
+    num_pages = sum(pages_per_sequence)
+    quant_dtype = _quant_dtype()
+
+    query = torch.empty(
+        batch_size * query_length,
+        num_query_heads,
+        head_dim,
+        dtype=dtypes.bf16,
+    ).uniform_(-0.5, 0.5)
+    key = torch.empty(
+        num_pages, num_kv_heads, block_size, head_dim, dtype=dtypes.bf16
+    ).uniform_(-0.5, 0.5)
+    value = torch.empty(
+        num_pages, num_kv_heads, head_dim, block_size, dtype=dtypes.bf16
+    ).uniform_(-0.5, 0.5)
+    key_quant, key_scale = pertoken_quant(key, quant_dtype=quant_dtype)
+    value_token_quant, value_scale = pertoken_quant(
+        value.permute(0, 1, 3, 2).contiguous(), quant_dtype=quant_dtype
+    )
+    value_quant = value_token_quant.permute(0, 1, 3, 2).contiguous()
+
+    token = torch.arange(num_pages * block_size).reshape(num_pages, 1, block_size, 1)
+    kv_head = torch.arange(num_kv_heads).reshape(1, num_kv_heads, 1, 1)
+    key_scale *= torch.exp2(((2 * token + kv_head) % 4 - 2).float())
+    value_scale *= torch.exp2(((token + 2 * kv_head) % 5 - 3).float())
+
+    # Make C1--C4 analytically exact while still detecting causal off-by-one:
+    # K=0 gives uniform attention, V progresses as [.25, .5, .75, 1], and
+    # scale=1. A C4 row therefore produces [.25, .375, .5, .625].
+    data_page = 0
+    for length, page_count in zip(lengths, pages_per_sequence):
+        if 0 < length <= query_length:
+            capacity = page_count * block_size
+            token_values = (
+                torch.arange(capacity, dtype=dtypes.fp32) % query_length + 1
+            ) * 0.25
+            key_quant[data_page : data_page + page_count].zero_()
+            value_quant[data_page : data_page + page_count] = (
+                token_values.reshape(page_count, 1, 1, block_size)
+                .expand(page_count, num_kv_heads, head_dim, block_size)
+                .to(quant_dtype)
+            )
+            key_scale[data_page : data_page + page_count].fill_(1.0)
+            value_scale[data_page : data_page + page_count].fill_(1.0)
+        data_page += page_count
+
+    # Scatter logical pages into a permuted set of odd physical pages. Leave
+    # holes and page zero finite so masked/padded token reads remain valid.
+    selected_pages = 2 * torch.randperm(num_pages) + 1
+    physical_page_count = 2 * num_pages + 1
+
+    def scatter_pages(tensor):
+        sparse = torch.zeros(
+            (physical_page_count, *tensor.shape[1:]), dtype=tensor.dtype
+        )
+        sparse[selected_pages] = tensor
+        return sparse
+
+    key_quant = scatter_pages(key_quant)
+    value_quant = scatter_pages(value_quant)
+    key_scale = scatter_pages(key_scale)
+    value_scale = scatter_pages(value_scale)
+    num_pages = physical_page_count
+
+    key_cache = (
+        key_quant.view(
+            num_pages,
+            num_kv_heads,
+            block_size,
+            head_dim // 16,
+            16,
+        )
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    if trans_v:
+        value_cache = (
+            value_quant.permute(0, 1, 3, 2)
+            .contiguous()
+            .view(
+                num_pages,
+                num_kv_heads,
+                block_size // 16,
+                16,
+                head_dim,
+            )
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+    else:
+        value_cache = value_quant
+
+    block_tables = torch.zeros(batch_size, max_pages, dtype=dtypes.i32)
+    next_page = 0
+    for seq, page_count in enumerate(pages_per_sequence):
+        block_tables[seq, :page_count] = selected_pages[
+            next_page : next_page + page_count
+        ]
+        next_page += page_count
+    context_lengths = torch.tensor(lengths, dtype=dtypes.i32)
+
+    reference = torch.zeros_like(query, dtype=dtypes.fp32)
+    for seq, length in enumerate(lengths):
+        if length == 0:
+            continue
+        token_ids = torch.arange(length)
+        logical_pages = token_ids // block_size
+        token_offsets = token_ids % block_size
+        physical_pages = block_tables[seq, logical_pages].long()
+        keys = key_quant[physical_pages, :, token_offsets, :].float()
+        values = value_quant[physical_pages, :, :, token_offsets].float()
+        keys *= key_scale[physical_pages, :, token_offsets, 0].float().unsqueeze(-1)
+        values *= value_scale[physical_pages, :, token_offsets, 0].float().unsqueeze(-1)
+        keys = keys.repeat_interleave(query_group_size, dim=1)
+        values = values.repeat_interleave(query_group_size, dim=1)
+        for position in range(query_length):
+            visible = max(0, length - (query_length - 1) + position)
+            if visible == 0:
+                continue
+            row = seq * query_length + position
+            scores = (
+                torch.einsum("hd,khd->hk", query[row].float(), keys[:visible])
+                * head_dim**-0.5
+            )
+            probs = torch.softmax(scores, dim=-1)
+            reference[row] = torch.einsum("hk,khd->hd", probs, values[:visible])
+
+    output = torch.full_like(query, float("nan"))
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        query_length,
+        num_partitions,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), reference, rtol=0.005, atol=0.005)
+
+
+@pytest.mark.parametrize("num_partitions", [1, 8])
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize(
+    "lengths,num_kv_heads",
+    [
+        pytest.param([4], 1, id="c4-hkv1"),
+        pytest.param([257], 1, id="c257-hkv1"),
+        pytest.param([259], 1, id="c259-hkv1"),
+        pytest.param([2305], 1, id="c2305-hkv1"),
+        pytest.param([2307], 1, id="c2307-hkv1"),
+        pytest.param(
+            [0, 1, 2, 3, 4, 255, 256, 257, 258, 259, 2303, 2304, 2305, 2306, 2307],
+            1,
+            id="mixed-hkv1",
+        ),
+        pytest.param([257], 2, id="c257-hkv2"),
+        pytest.param([259], 2, id="c259-hkv2"),
+    ],
+)
+def test_mtp4_fused_phase_b_accuracy(
+    monkeypatch, lengths, num_kv_heads, block_size, trans_v, num_partitions
+):
+    """Force the fused path and cover its MTP causal/partition boundaries."""
+    _require_gpu()
+    pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_tile = pa_decode_module.compile_pa_decode_tile
+
+    def compile_fused_mtp4(**kwargs):
+        kwargs["query_splits"] = 1
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(pa_decode_module, "compile_pa_decode_tile", compile_fused_mtp4)
+    _run_mtp4_fused_reference_case(
+        lengths, num_kv_heads, block_size, trans_v, num_partitions
+    )
+
+
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_mtp4_public_selector_fused_path(monkeypatch, block_size, trans_v):
+    """B32/NP8 selects the fused one-CTA-per-sequence MTP4 path."""
+    _require_gpu()
+    pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_tile = pa_decode_module.compile_pa_decode_tile
+    selected_splits = []
+
+    def capture_query_splits(**kwargs):
+        selected_splits.append(kwargs.get("query_splits", 1))
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(
+        pa_decode_module, "compile_pa_decode_tile", capture_query_splits
+    )
+    _run_mtp4_fused_reference_case([257, 259] * 16, 1, block_size, trans_v, 8)
+    assert selected_splits and set(selected_splits) == {1}
+
+
 @pytest.mark.parametrize(
     "head_dim,num_partitions",
     [(64, 1), (256, 1), (1024, 1), (1024, 4)],
@@ -1405,6 +1824,241 @@ def test_page128_reduction_rows_across_m_tiles(
         trans_v=True,
     )
     _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("query_splits", [2, 4])
+@pytest.mark.parametrize("num_partitions", [1, 8])
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize("context_length", [4, 257, 2305])
+def test_per_token_mtp_query_splits(
+    monkeypatch, query_splits, num_partitions, block_size, trans_v, context_length
+):
+    """Query-split CTAs preserve MTP causality and the unsplit partial layout."""
+    _require_gpu()
+    pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_tile = pa_decode_module.compile_pa_decode_tile
+
+    def compile_split_tile(**kwargs):
+        kwargs["query_splits"] = query_splits
+        kwargs["prefetch_v"] = query_splits == 4
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(pa_decode_module, "compile_pa_decode_tile", compile_split_tile)
+    if context_length == 4:
+        # An exact short-prefix case isolates the causal/query mapping. With
+        # random V scales, even the unsplit FP8 kernel has >0.005 absolute
+        # quantization error at four tokens; do not weaken the assertion.
+        quant_dtype = _quant_dtype()
+        query = torch.ones(4, 16, 128, dtype=dtypes.bf16)
+        key_cache = torch.zeros(1, 1, 8, block_size, 16, dtype=quant_dtype)
+        value = torch.zeros(1, 1, block_size, 128, dtype=dtypes.fp32)
+        value[0, 0, :4] = (
+            (torch.arange(4).float() + 1)[:, None]
+            * 0.125
+            * (1 + 0.25 * (torch.arange(128) % 4).float())[None, :]
+        )
+        value = value.to(quant_dtype)
+        value_cache = (
+            value.view(1, 1, block_size // 16, 16, 128)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+            if trans_v
+            else value.permute(0, 1, 3, 2).contiguous()
+        )
+        key_scale = torch.ones(1, 1, block_size, 1, dtype=dtypes.fp32)
+        value_scale = torch.ones_like(key_scale)
+        value_scale[0, 0, :4, 0] = torch.tensor([0.5, 1.0, 0.25, 1.0])
+        prefix_values = (value[0, 0, :4].float() * value_scale[0, 0, :4]).cumsum(0)
+        reference = (prefix_values / (torch.arange(4).float() + 1)[:, None])[
+            :, None, :
+        ].expand(4, 16, 128)
+        output = torch.full_like(query, float("nan"))
+        torch.ops.aiter.pa_decode_flydsl(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            torch.tensor([4], dtype=dtypes.i32),
+            torch.zeros(1, 1, dtype=dtypes.i32),
+            128**-0.5,
+            4,
+            num_partitions,
+            KV_COMPUTE_BLOCK,
+            quant_dtype,
+            None,
+            key_scale,
+            value_scale,
+        )
+        output = output.float()
+    else:
+        output, reference = _adversarial_case(
+            head_dim=128,
+            query_group_size=16,
+            query_length=4,
+            context_length=context_length,
+            block_size=block_size,
+            trans_v=trans_v,
+            per_token=True,
+            num_partitions=num_partitions,
+        )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=0.005, atol=0.005)
+
+
+@pytest.mark.parametrize("num_partitions", [1, 8])
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize("trans_v", [False, True])
+def test_per_token_mtp_query_split_mixed_contexts(num_partitions, block_size, trans_v):
+    """Automatic MTP splitting keeps empty and nonempty sequences independent."""
+    _require_gpu()
+    lengths = [0, 4, 2305]
+    batch_size, query_length, query_heads, head_dim = 3, 4, 16, 128
+    pages_per_sequence = [(length + block_size - 1) // block_size for length in lengths]
+    page_values = [
+        (seq + 1) * 0.125
+        for seq, count in enumerate(pages_per_sequence)
+        for _ in range(count)
+    ]
+    num_pages = len(page_values)
+    quant_dtype = _quant_dtype()
+    query = torch.ones(
+        batch_size * query_length, query_heads, head_dim, dtype=dtypes.bf16
+    )
+    key_cache = torch.zeros(
+        num_pages, 1, head_dim // 16, block_size, 16, dtype=quant_dtype
+    )
+    value_plain = (
+        torch.tensor(page_values, dtype=dtypes.fp32)
+        .reshape(num_pages, 1, 1, 1)
+        .expand(num_pages, 1, head_dim, block_size)
+        .contiguous()
+        .to(quant_dtype)
+    )
+    value_cache = (
+        value_plain.view(num_pages, 1, head_dim, block_size // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        if trans_v
+        else value_plain
+    )
+    block_tables = torch.full(
+        (batch_size, max(pages_per_sequence)), num_pages + 1024, dtype=dtypes.i32
+    )
+    next_page = 0
+    for seq, count in enumerate(pages_per_sequence):
+        block_tables[seq, :count] = torch.arange(next_page, next_page + count)
+        next_page += count
+    scales = torch.ones(num_pages, 1, block_size, 1, dtype=dtypes.fp32)
+    output = torch.full_like(query, float("nan"))
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        torch.tensor(lengths, dtype=dtypes.i32),
+        block_tables,
+        head_dim**-0.5,
+        query_length,
+        num_partitions,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        scales,
+        scales,
+    )
+    expected = (
+        torch.tensor([0.0, 0.25, 0.375], dtype=dtypes.fp32)
+        .repeat_interleave(query_length)
+        .reshape(batch_size * query_length, 1, 1)
+        .expand_as(output)
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), expected, rtol=0.005, atol=0.005)
+
+
+@pytest.mark.parametrize(
+    "batch_size,overrides,expected_splits",
+    [
+        pytest.param(1, {}, 4, id="small"),
+        pytest.param(16, {}, 4, id="cu-boundary"),
+        pytest.param(17, {}, 1, id="past-cu-boundary"),
+        pytest.param(32, {}, 1, id="batch32-fused"),
+        pytest.param(16, {"parts": 16}, 1, id="more-partitions"),
+        pytest.param(1, {"query_length": 1}, 1, id="decode-unchanged"),
+        pytest.param(1, {"head_dim": 64}, 1, id="other-head-dim"),
+        pytest.param(1, {"kv_heads": 2}, 1, id="multiple-kv-heads"),
+        pytest.param(1, {"query_group": 8}, 1, id="other-gqa"),
+        pytest.param(1, {"block_size": 64}, 1, id="other-page-size"),
+        pytest.param(1, {"dtype": dtypes.fp16}, 1, id="fp16"),
+        pytest.param(1, {"per_token": False}, 1, id="scalar-scales"),
+    ],
+)
+def test_mtp_query_split_dispatch(monkeypatch, batch_size, overrides, expected_splits):
+    """Query splitting does not widen the supported shape or partition policy."""
+    _require_gpu()
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_arguments = []
+
+    def capture_compile(**kwargs):
+        compile_arguments.append(kwargs)
+        return {"launch": object()}
+
+    monkeypatch.setattr(module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(module, "compile_pa_decode_tile", capture_compile)
+    monkeypatch.setattr(module, "_run_compiled", lambda *args: None)
+    monkeypatch.setattr(module, "ptr_arg", lambda tensor, dtype=None: tensor)
+    monkeypatch.setattr(
+        module, "launch_pa_decode_ps_reduce", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_args, **_kwargs: type("Props", (), {"multi_processor_count": 256})(),
+    )
+    query_length = overrides.get("query_length", 4)
+    head_dim = overrides.get("head_dim", 128)
+    kv_heads = overrides.get("kv_heads", 1)
+    query_group = overrides.get("query_group", 16)
+    block_size = overrides.get("block_size", 16)
+    parts = overrides.get("parts", 8)
+    dtype = overrides.get("dtype", dtypes.bf16)
+    query = torch.empty(
+        batch_size * query_length, kv_heads * query_group, head_dim, dtype=dtype
+    )
+    key_cache = torch.empty(
+        batch_size, kv_heads, head_dim // 16, block_size, 16, dtype=torch.float8_e4m3fn
+    )
+    value_cache = torch.empty(
+        batch_size, kv_heads, head_dim, block_size, dtype=torch.float8_e4m3fn
+    )
+    scale_shape = (
+        (batch_size, kv_heads, block_size, 1)
+        if overrides.get("per_token", True)
+        else (1,)
+    )
+    scales = torch.ones(scale_shape, dtype=dtypes.fp32)
+    pa_decode(
+        torch.empty_like(query),
+        query,
+        key_cache,
+        value_cache,
+        torch.full((batch_size,), block_size, dtype=dtypes.i32),
+        torch.arange(batch_size, dtype=dtypes.i32).reshape(batch_size, 1),
+        head_dim**-0.5,
+        query_length,
+        parts,
+        KV_COMPUTE_BLOCK,
+        torch.float8_e4m3fn,
+        None,
+        scales,
+        scales,
+    )
+    assert len(compile_arguments) == 1
+    assert compile_arguments[0]["query_splits"] == expected_splits
+    assert compile_arguments[0]["num_partitions"] == parts
+    if expected_splits > 1:
+        assert compile_arguments[0]["prefetch_v"] is True
 
 
 def main():

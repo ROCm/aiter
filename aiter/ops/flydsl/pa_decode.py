@@ -7,6 +7,11 @@ K/V are fp8 e4m3 (FNUZ on gfx942, OCP on gfx950) fed straight into
 ``mfma_f32_16x16x32_fp8_fp8``; Q (bf16/f16) and the softmax probabilities P are
 quantized to fp8 too. Scales fold out of the matmuls (q/key scale into the QK
 score, value scale + 1/FP8_MAX into the epilogue); softmax max/sum stay f32.
+The gfx950 BF16 per-token MTP4 specialization uses K=128 FP8 MFMA atoms
+without changing this normalization policy.
+The tuned gfx950 BF16 scalar-scale decode path uses direct fp8 Q/P conversion
+instead. It trades dynamic range for speed and can truncate small probabilities;
+see ``kernels.pa_decode_tile`` for its scope. Per-token scales keep normalization.
 ``key_scale``/``value_scale`` are either a ``[1]`` per-tensor scalar or a
 ``[num_blocks, num_kv_heads, block_size, 1]`` per-token tensor.
 
@@ -22,9 +27,10 @@ preshuffle.
 * ``context_lengths`` [num_seqs]  int32
 * ``output``       [num_seqs, num_q_heads, head_dim]  same dtype as query
 
-One CTA (4 waves) per (seq, kv_head) runs a flash-style online softmax over
-256-token blocks; the 4 waves split tokens for Q.KT and head-dim for P.V, with
-an LDS round-trip on P transposing ownership between the two MMAs.
+Each CTA (4 waves) processes a KV head and context partition over 256-token
+blocks. Small MTP4 grids split query positions among CTAs; larger grids keep
+queries fused. The waves split tokens for Q.KT and head-dim for P.V, with an
+LDS round-trip on P transposing ownership between the two MMAs.
 """
 
 import os
@@ -45,7 +51,6 @@ from .kernels.utils import cdiv
 
 _PAGE16_VPIPE_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE"
 _PAGE16_VPIPE_IGLP_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE_IGLP"
-_MATCH_GLUON_NUMERICS_ENV = "AITER_FLYDSL_PA_MATCH_GLUON_NUMERICS"
 _PAGE128_EARLY_V_ENV = "AITER_FLYDSL_PA_PAGE128_EARLY_V"
 
 
@@ -538,12 +543,10 @@ def pa_decode(
     # if either does.
     wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
 
-    # The page-16 long-context pipeline is opt-in until it can be benchmarked
-    # on gfx950.  It loads current V before QK and delays next K until the
-    # current PV, while every unsupported shape keeps the existing schedule.
-    page16_vpipe_iglp = _env_enabled(_PAGE16_VPIPE_IGLP_ENV)
+    # Keep the scalar page-16 pipeline opt-in. Both environment spellings
+    # select its tuned schedule; IGLP is now derived from that specialization.
     page16_vpipe = (
-        (_env_enabled(_PAGE16_VPIPE_ENV) or page16_vpipe_iglp)
+        (_env_enabled(_PAGE16_VPIPE_ENV) or _env_enabled(_PAGE16_VPIPE_IGLP_ENV))
         and arch == "gfx950"
         and head_dim == 128
         and block_size == 16
@@ -554,26 +557,6 @@ def pa_decode(
         and query_length == 1
         and query_group_size in (8, 16)
     )
-    page16_vpipe_iglp = page16_vpipe and page16_vpipe_iglp
-
-    # Numerical-policy ablation against Gluon's Hkv1 kernel.  Keep this
-    # independent from the page-16 scheduling switches so the two effects can
-    # be measured separately, and constrain it to the exact MiniMax-M3 shapes
-    # whose Gluon path directly casts both Q and P to fp8.  All other shapes,
-    # including per-token KV scales, retain FlyDSL's range-normalized policy.
-    match_gluon_numerics = (
-        _env_enabled(_MATCH_GLUON_NUMERICS_ENV)
-        and arch == "gfx950"
-        and head_dim == 128
-        and block_size in (16, 128)
-        and trans_v
-        and not per_token_kv
-        and query.dtype == torch.bfloat16
-        and num_kv_heads == 1
-        and query_length == 1
-        and query_group_size in (8, 16)
-    )
-
     # Early V loads help the measured one-to-two-workgroup-per-CU regime.
     # Keep other grids on the existing schedule by default; the opt-in override
     # lets long-context under-filled grids be measured without changing policy.
@@ -596,6 +579,46 @@ def pa_decode(
             )
         )
 
+    # Per-token decode benefits from overlapping V with QK. Page 16 also
+    # delays next K until PV; page 128 stages next scales before issuing K.
+    # With transposed page-128 V, more than one workgroup per CU already hides
+    # latency: retain the lower-register schedule in that regime.
+    if (
+        arch == "gfx950"
+        and per_token_kv
+        and head_dim == 128
+        and query.dtype == torch.bfloat16
+        and num_kv_heads == 1
+        and query_length == 1
+        and query_group_size in (8, 16)
+        and block_size in (16, 128)
+    ):
+        if block_size == 16 or not trans_v:
+            prefetch_v = True
+        else:
+            num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
+            prefetch_v = num_seqs * num_kv_heads * num_partitions <= num_cus
+
+    # Split small MTP4 grids into one query per CTA, retaining the original
+    # partial layout and partition count. Larger grids amortize KV loads by
+    # processing all four queries together. Keep QL1's selector above intact.
+    query_splits = 1
+    if (
+        arch == "gfx950"
+        and per_token_kv
+        and head_dim == 128
+        and query.dtype == torch.bfloat16
+        and num_kv_heads == 1
+        and query_length == 4
+        and query_group_size == 16
+        and block_size in (16, 128)
+    ):
+        num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
+        base_workgroups = num_seqs * num_kv_heads * num_partitions
+        if 4 * base_workgroups <= 2 * num_cus:
+            query_splits = 4
+            prefetch_v = True
+
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -609,8 +632,7 @@ def pa_decode(
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             prefetch_v=prefetch_v,
-            prefetch_v_iglp=page16_vpipe_iglp,
-            match_gluon_numerics=match_gluon_numerics,
+            query_splits=query_splits,
         )
 
     if num_partitions == 1:
