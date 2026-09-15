@@ -79,11 +79,13 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
     the routed rows are few relative to the experts and loses linearly after,
     which is why block_size 16 was originally pinned away from Opus wholesale.
 
-    Switch on which side of that crossover we are: routed_rows >= num_experts is
-    "at least one routed row per expert on average". Measured on kimi-k3 a4w4
-    (NE=896, topk=16, gfx950) the prologue crosses between token 32 and 64 --
-    fused is 2.2us faster at 32, Opus 0.9us faster at 64 and 10.6us faster at
-    512 -- and the rule puts the boundary at token 56.
+    Switch on which side of that crossover we are. Measured on kimi-k3 a4w4
+    (NE=896, topk=16, gfx950) the prologue crosses at roughly one routed row per
+    expert. Small expert sets need a later crossover: MiniMax-M3 (NE=129,
+    topk=5) keeps winning with the fused sort through token 256, at about ten
+    routed rows per expert. Use a conservative factor of 12 there; the next
+    configured token shape is 512 (about twenty rows per expert), which remains
+    on Opus.
 
     Callers that cannot supply the shape keep the old conservative answer.
     """
@@ -91,8 +93,12 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
         return False
     if block_size != 16:
         return True
+    if _MOE_SORT_BACKEND == "fused":
+        return False
     if routed_rows is None or num_experts is None:
         return False
+    if num_experts <= 256:
+        return routed_rows >= num_experts * 12
     return routed_rows >= num_experts
 
 
