@@ -36,6 +36,7 @@ Usage::
 """
 
 import os
+import time
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -91,6 +92,9 @@ RESULT_LIST = [
     "tflops",
     "bw",
 ]
+
+# Readings per shape in the compare benchmark; the gate keeps the fastest.
+RUN_CONFIG_REPS = 3
 
 # Same tolerance as tests/kernels/test_conv3d_implicit.py. The reference is bf16
 # rather than fp32 on purpose: the tuner needs to catch a config that computes
@@ -432,11 +436,32 @@ class Conv3dTuner(TunerCommon):
 
         conv3d_implicit._load_tuned_table.cache_clear()
 
+    @staticmethod
+    def _ramp_clocks(seconds=2.0):
+        """Hold the GPU busy until the clocks settle, before anything is timed.
+
+        The compare gate reads the pre-tune benchmark on a device that has been
+        idle and the post-tune one right after a sweep has hammered it, so
+        without this the two halves are measured at different clock states and
+        every verdict carries that bias. Observed at up to 2.1x on the same
+        config and the same shape, which is far larger than the 3% the gate
+        decides on.
+        """
+        a = torch.randn((4096, 4096), device="cuda", dtype=torch.bfloat16)
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            for _ in range(20):
+                a = torch.mm(a, a).clamp_(-1.0, 1.0)
+            torch.cuda.synchronize()
+        del a
+        torch.cuda.empty_cache()
+
     def run_config(self, args):
         """Benchmark the production entry point (no explicit tile) per shape."""
         from aiter.test_common import run_perftest
 
         self._clear_op_caches()
+        self._ramp_clocks()
         results = []
         for _, row in self.untunedf.iterrows():
             keys = tuple(row[k] for k in self.keys)
@@ -451,13 +476,20 @@ class Conv3dTuner(TunerCommon):
                 data = generate_data(
                     n, c, d, h, w, k, kt, kh, kw, groups, has_bias, device="cuda:0"
                 )
-                out, us = run_perftest(
-                    flydsl_conv_implicit,
-                    data["x"],
-                    data["weight"],
-                    bias=data["bias"],
-                    **params,
-                )
+                # Best of a few, not a single reading: the gate's threshold is
+                # 3%, so a one-shot measurement whose own spread exceeds that
+                # decides by noise.
+                out, us = None, float("inf")
+                for _ in range(RUN_CONFIG_REPS):
+                    out_i, us_i = run_perftest(
+                        flydsl_conv_implicit,
+                        data["x"],
+                        data["weight"],
+                        bias=data["bias"],
+                        **params,
+                    )
+                    if us_i < us:
+                        out, us = out_i, us_i
                 ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
                 ok = torch.allclose(out, ref, rtol=RTOL, atol=ATOL)
                 results.append(

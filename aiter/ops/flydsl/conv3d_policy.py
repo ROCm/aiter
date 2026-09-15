@@ -216,14 +216,23 @@ def get_flydsl_conv3d_configs(
     configs = [config for _, config in scored[:max_configs]]
 
     # Union in whatever the shipped heuristic could pick, so the sweep always
-    # measures the incumbent and "tuned is never worse than default" is
-    # checkable from the same run.
+    # measures the incumbent and "tuned is never worse than default" holds.
+    #
+    # Every WGM value, not just 1: `_pick_tile` and `_pick_wgm` decide
+    # independently, so pinning the baseline tiles at wgm=1 left the real
+    # incumbent out of the sweep wherever the heuristic wanted the L2 swizzle.
+    # 384->384 @48x70 is one: the heuristic runs (32,32,1,2) at wgm=8, only
+    # (32,32,1,2,1) was offered, and the winner came out 18.9% slower than the
+    # config it was supposed to beat. WGM_VALUES is exactly the range
+    # `_pick_wgm` can return, so covering it closes the hole without coupling
+    # this module to the heuristic's internals.
     seen = set(configs)
     for tile in BASELINE_TILES:
         if not is_legal_tile(*tile):
             continue
-        candidate = (*tile, 1)
-        if candidate not in seen:
-            seen.add(candidate)
-            configs.append(candidate)
+        for wgm in WGM_VALUES:
+            candidate = (*tile, wgm)
+            if candidate not in seen:
+                seen.add(candidate)
+                configs.append(candidate)
     return configs
