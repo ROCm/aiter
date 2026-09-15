@@ -1136,7 +1136,7 @@ def _blocks(npq, kg, groups, tile):
     return ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
 
 
-# Column order of aiter/configs/conv3d_bf16_untuned.csv, and therefore of the
+# Column order of the conv3d_bf16_untuned family header, and therefore of the
 # lookup key. Keep in sync with csrc/flydsl_conv3d/conv3d_tune.py::KEYS.
 TUNED_KEY_COLUMNS = (
     "N",

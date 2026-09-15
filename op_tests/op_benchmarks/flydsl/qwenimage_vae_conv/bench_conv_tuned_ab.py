@@ -39,7 +39,11 @@ from aiter.ops.flydsl.kernels import conv3d_implicit as ci
 HERE = Path(__file__).resolve().parent
 ENV = "AITER_CONFIG_CONV3D_BF16"
 REAL_TABLE = (
-    Path(jit_core.AITER_ROOT_DIR) / "aiter" / "configs" / "conv3d_bf16_tuned.csv"
+    Path(jit_core.AITER_ROOT_DIR)
+    / "aiter"
+    / "configs"
+    / "model_configs"
+    / "qwenimage_vae_conv3d_bf16_tuned.csv"
 )
 
 

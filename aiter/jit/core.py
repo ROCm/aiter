@@ -183,6 +183,9 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_conv3d_bf16_tuned.csv, wan21_vae_conv3d_bf16_tuned.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
 AITER_CONFIG_CONV3D_BF16 = os.getenv(
     "AITER_CONFIG_CONV3D_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/conv3d_bf16_tuned.csv",
