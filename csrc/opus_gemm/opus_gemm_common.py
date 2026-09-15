@@ -1995,3 +1995,130 @@ def _opus_sidecar_path():
     from aiter.jit.core import bd_dir
 
     return os.path.join(bd_dir, "compiled_kids_opus.json")
+
+
+# ---------------------------------------------------------------------------
+# a8w8_mxscale BMM with a PRESHUFFLED B (gfx1250-only).
+# ---------------------------------------------------------------------------
+# Single source of truth for the bpreshuffle family's tile geometry, mirroring
+# what a8w8_mxscale_bmm_kernel_lists is for the gfx950 raw-B family. Before
+# this, the geometry lived ONLY in the C++ template aliases in
+# opus_bmm_traits_a8w8_mxscale_bpreshuffle_gfx1250.cuh, and the only Python copy
+# was _BPRESHUF_TILE_BN in aiter/ops/opus/bmm_op.py -- 8 of 43 kids, (B_M, B_N)
+# only, hand-maintained. A tuner cannot work off that: it has to know each kid's
+# GROUP_N, because a GROUP_N=1 tile needs a per-column [G,N,K/128] w_scale and a
+# GROUP_N=128 tile needs the DSV4 block [G,N/128,K/128] one, and the launcher
+# throws on a mismatch (opus_bmm_launchers_...gfx1250.cuh, the w_scale.size(1)
+# check). See opus_bmm_mxscale_tune.py's header for what a second hand-kept
+# table cost last time -- its m_align column was wrong in both directions.
+#
+# The rows below were transcribed from the C++ aliases with a cross-check: the
+# kBpreshuf entry macro spells NO_SPEC (OPUS_BMM_BPRESHUF_NS_ENTRY vs the plain
+# one), and every kid's macro agreed with its alias's NO_SPEC_ argument.
+@dataclass(frozen=True)
+class OpusBmmBpreshufInstance:
+    """One bpreshuffle BMM tile. Field names match the C++ template parameters.
+
+    Deliberately NOT OpusGemmInstance: that class demands T_M/T_N/W_*/VEC_*/
+    GROUP_M, none of which this family has, and it would have to grow twelve
+    axes only this family uses. codegen duck-types the instance (dispatch_emit
+    reads k.kernel_tag; the emit fns use getattr with defaults), so a separate
+    dataclass costs nothing.
+    """
+
+    B_M: int
+    B_N: int
+    B_K: int
+    BLOCK_SIZE: int
+    GROUP_K: int = 128
+    num_slots: int = 3
+    WG_PER_CU: int = 2
+    GROUP_N: int = 1
+    sf_a_lds: bool = False
+    sf_b_lds: bool = False
+    sf_a_tdm_kg: int = 0
+    sf_a_tdm_pad: int = 16
+    tile_m: int = 0
+    no_spec: bool = False
+    sf_a_panel_kg: int = 128
+    all_reads_first: bool = False
+    ds_lookahead: int = -1
+    tdm_scope: int = 0
+    c_via_lds: bool = False
+    kernel_tag: str = "bmm_a8w8_mxscale_bpreshuffle"
+    arch_prefix: str = "gfx1250"
+    has_oob: bool = True
+
+    @property
+    def k_cap(self) -> int:
+        """Largest K this tile accepts, from the LDS scale-panel budget.
+
+        The launcher caps K at kg_cap * GROUP_K whenever either scale panel is
+        staged in LDS, where kg_cap is SF_A_TDM_KG for a TDM-fed panel and
+        SF_A_PANEL_KG otherwise. kid17 (SF_A_TDM_KG=32) is the tight one: 4096.
+        """
+        if not (self.sf_a_lds or self.sf_b_lds):
+            return 1 << 30
+        kg_cap = self.sf_a_tdm_kg if self.sf_a_tdm_kg else self.sf_a_panel_kg
+        return kg_cap * self.GROUP_K
+
+
+def _bpreshuf(**kw) -> OpusBmmBpreshufInstance:
+    return OpusBmmBpreshufInstance(**kw)
+
+
+# kid -> tile. Gaps (11, 12, 15, 16, 37, 39-45, 48, 49, 53, 54, 57-59, 61, 62)
+# are retired ids; kBpreshuf is the authority on which ints exist.
+#
+# kid2 and kid3 are BROKEN and kept for measurement only -- WG_PER_CU=2 makes
+# co-resident workgroups share compile-time-id named barriers, so they are wrong
+# and nondeterministic once the grid exceeds the CU count. Nothing in the C++
+# rejects them; a sweep must skip them explicitly.
+a8w8_mxscale_bmm_bpreshuffle_kernels_list = {
+    0: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1),  # gfx1250
+    1: _bpreshuf(B_M=16, B_N=32, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1),  # dec_n32
+    2: _bpreshuf(B_M=16, B_N=32, B_K=256, BLOCK_SIZE=128),  # dec_n32_wg2
+    3: _bpreshuf(B_M=16, B_N=32, B_K=512, BLOCK_SIZE=128),  # dec_n32_k512
+    4: _bpreshuf(B_M=16, B_N=64, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1),  # dec_n64_w6
+    5: _bpreshuf(B_M=16, B_N=64, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1),  # dec_n64_w4
+    6: _bpreshuf(B_M=16, B_N=128, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1),  # dec_n128_w6
+    7: _bpreshuf(B_M=16, B_N=256, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1),  # dec_n256_w6
+    8: _bpreshuf(B_M=16, B_N=64, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1, GROUP_N=128),  # dec_n64_w6_gn128
+    9: _bpreshuf(B_M=16, B_N=256, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1, GROUP_N=128),  # dec_n256_w6_gn128
+    10: _bpreshuf(B_M=16, B_N=192, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1, GROUP_N=128),  # dec_n192_w6_gn128
+    13: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, sf_a_lds=True),  # sfa
+    14: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, sf_a_lds=True, sf_b_lds=True),  # sfab
+    17: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, sf_a_lds=True, sf_a_tdm_kg=32),  # sfa_tdm32
+    18: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, sf_a_lds=True, sf_a_tdm_kg=128, sf_a_tdm_pad=4),  # sfa_tdm128
+    19: _bpreshuf(B_M=256, B_N=128, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1, tile_m=2),  # pf_m256
+    20: _bpreshuf(B_M=128, B_N=256, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1),  # pf_n256
+    21: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=320, WG_PER_CU=1, tile_m=2),  # pf_m256n256
+    22: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1),  # pf_w6
+    23: _bpreshuf(B_M=128, B_N=128, B_K=128, BLOCK_SIZE=192, WG_PER_CU=1),  # pf_bk128
+    24: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=192, WG_PER_CU=1, tile_m=2),  # pf_w6_2x2
+    25: _bpreshuf(B_M=256, B_N=128, B_K=128, BLOCK_SIZE=192, WG_PER_CU=1, tile_m=2),  # pf_m256_bk128
+    26: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=256, WG_PER_CU=1, tile_m=2, no_spec=True),  # ns128
+    27: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=256, WG_PER_CU=1, tile_m=2, no_spec=True),  # ns256
+    28: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=256, WG_PER_CU=1, GROUP_N=128, tile_m=2, no_spec=True),  # ns256_gn128
+    29: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=256, WG_PER_CU=1, GROUP_N=128, tile_m=2, no_spec=True),  # ns128_gn128
+    30: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=256, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # ns256_gn128_sf
+    31: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=256, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # ns128_gn128_sf
+    32: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # fly256
+    33: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=128, num_slots=4, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # fly256_nb4
+    34: _bpreshuf(B_M=128, B_N=512, B_K=128, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=1, no_spec=True),  # ns128x512_gn128_sf
+    35: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=256, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # ns256_gn128_sf_bk256
+    36: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=256, num_slots=2, WG_PER_CU=1, tile_m=2, no_spec=True),  # ns256_bk256
+    38: _bpreshuf(B_M=16, B_N=64, B_K=512, BLOCK_SIZE=128, num_slots=4, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=1, no_spec=True),  # ns_dec_n64_gn128_sf
+    46: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # ns128_gn128_sf_bk256
+    47: _bpreshuf(B_M=256, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, sf_a_panel_kg=32),  # ns128_n128_s3
+    50: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, all_reads_first=True),  # ns128_arf
+    51: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, ds_lookahead=2),  # ns128_la2
+    52: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, ds_lookahead=4),  # ns128_la4
+    55: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=256, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, tdm_scope=2),  # ns256_cuscope
+    56: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=256, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True),  # ns256_ctdm
+    60: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True),  # ns128_ctdm
+    63: _bpreshuf(B_M=128, B_N=64, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # ns128_n64
+}
+
+# The two BROKEN-by-construction kids, excluded from any sweep.
+A8W8_MXSCALE_BMM_BPRESHUFFLE_BAD_KIDS = frozenset({2, 3})
