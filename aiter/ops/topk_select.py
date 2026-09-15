@@ -43,6 +43,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
 from aiter.ops.flydsl.kernels.topk_per_row_radix_stream import (
     build_topk_per_row_radix_stream_module,
     topk_per_row_radix_stream_block_threads,
+    topk_per_row_radix_stream_lds_plan,
     topk_per_row_radix_stream_serves,
 )
 from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
@@ -100,52 +101,52 @@ _PREFERENCE = ("argmax", "stream", "decode", "small_k", "plain")
 # decode is the fastest backend on 257 of 565 cells and the old rules reached it
 # on 65, for a mean 1.295x and a worst 5.916x against the per-cell oracle.
 #
-# Three constants the sweep cannot separate, held at their shipped values rather
-# than moved on a tie: `_SMALL_K_MAX_K` (no k=32 cell, so 16 and 32 score
-# identically), `_DECODE_MIN_N` (no width between 4096 and 8192) and
-# `_PLAIN_MANY_ROWS_BAND`'s floor (same gap). Widen the sweep before touching
-# any of them.
+# Constants the sweep cannot separate, held at their shipped values rather than
+# moved on a tie: `_SMALL_K_MAX_K` (no k=32 cell) and `_PLAIN_MANY_ROWS_BAND`'s
+# floor (no width between 4096 and 8192). Widen the sweep before touching either.
 #
 # One rule was dropped, not retuned: `plain` used to take a middling-width band
 # at <= 8 rows, and with decode's gate widened that band is now decode's on
 # every cell of it. Every value of the old bound scored identically, which is
 # what a dead rule looks like.
 
-# `plain` is the only one that scales WITH rows, so past enough of them on a
-# middling width it wins outright -- ahead of small_k, hence tested first.
-#
-# "Enough" is 256, not the 16384 this carried while decode's gate was narrow:
-# with decode taking the low-row end, what is left for `plain` starts where
-# decode stops, and the sweep puts that an order of magnitude earlier than the
-# old bound. 192 scores identically -- there is no sampled row count between 128
-# and 256 -- so this is the sample point, not a measured boundary.
 # The block widths `topk_per_row_radix_stream_block_threads` chooses between.
-# Named here because `_available` has to ask about both without knowing which
-# one the row count will select.
+# `_available` has to ask about both without knowing which the row count picks.
 _STREAM_BLOCK_WIDTHS = (512, 1024)
+
+# `plain` is the only backend that scales WITH rows, so past enough of them on a
+# middling width it wins outright -- ahead of small_k, hence tested first. It is
+# never the fastest below k=1024: of the 64 cells it wins, 29 are k=1024 and 35
+# are k=2048.
 _PLAIN_MANY_ROWS = 256
 _PLAIN_MANY_ROWS_BAND = (8192, 65536)
+_PLAIN_MIN_K = 1024
+
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
 # k=16, 44 at k=32, then 300 at k=64, and the time steps 1.7x-1.8x between k=63
-# and k=64 alone. Below this bound it wins over the whole row range, 1 to 16384,
-# so it needs no width or row term.
+# and k=64 alone. Below this bound it wins over the whole row range.
 _SMALL_K_MAX_K = 32
-# decode is grid-wide, so it needs a row wide enough to spread over and few
-# enough rows that the grid is not already full. That is the whole rule: a row
-# bound and a width floor, and nothing conjoined after them.
+
+# decode is grid-wide: it needs a row wide enough to spread a grid over, and few
+# enough rows that the grid is not already full. BOTH bounds relax at the k that
+# amortises its launch -- its time is flat at 30..36us across widths
+# 32768..65536, k 16..1024 and 1..64 rows, which is fixed cost rather than work,
+# while `stream` over those same cells runs 18.6..51.4us.
 #
-# It used to read `rows <= 64 AND (width >= 1048576 OR (width >= 8192 AND k >=
-# 4096))`, which is the shape of a rule fitted against a decode that was always
-# paying for `stable=True` -- `_dispatch` hardwired it, so every reading of this
-# backend carried a promise no caller had asked for, and the fit learned to
-# route around it. With that removed and the sweep extended to the widths a
-# sparse indexer produces (max_seq_len // compress_ratio: 16384, 40960, 262144,
-# none of which is a power of two and all of which fell between the old
-# samples), decode is the fastest backend on 257 of 565 cells while the old
-# rules reached it on 65.
-_DECODE_MAX_M = 128
-_DECODE_MIN_N = 8192
+# `_DECODE_AMORTISING_K` sits in an unsampled gap (256..1024) and the narrow
+# gate's width in another (4096..8192). Widen the sweep before moving either.
+_DECODE_AMORTISING_K = 1024
+# (narrowest row, most rows) decode will take, below and at that k.
+_DECODE_GATE = (65536, 64)
+_DECODE_GATE_AMORTISED = (8192, 128)
+# At the largest k served, decode wins at ANY row count over a band of widths --
+# wide enough to spread a grid across, narrow enough that `stream`'s split
+# cannot outrun it. Measured at k=4096 over rows 1..16384, decode against
+# stream: 0.28x..0.96x inside the band, 0.90x..1.26x at 8192 and 1.02x..1.73x at
+# 262144, which is why it has both ends.
+_DECODE_ANY_ROWS_K = 4096
+_DECODE_ANY_ROWS_BAND = (16384, 131072)
 
 
 @lru_cache(maxsize=1)
@@ -272,9 +273,15 @@ def _available(
     #
     # Not free by construction -- a wider block has a wider tile and so wants
     # more LDS for the same prefetch depth (k=2048 resolves to 72 KiB at 512 and
-    # 120 KiB at 1024) -- but `_resolve_lds` trades depth for room, and both
-    # widths resolve over the whole k range here. Should that stop being true,
-    # this is where it will show up as a decline rather than a failure.
+    # 120 KiB at 1024) -- but `_resolve_lds` trades depth for room, and on gfx950
+    # both widths resolve over the whole k range.
+    #
+    # On gfx942 they do not: a 64 KiB CU holds the half-width build up to k=1024
+    # and the full-width one only to k=256, so `all` withdraws the streaming
+    # selector for a k the narrow block could still have served. That is the
+    # conservative direction and the one this set can express -- it is memoized
+    # without the row count, so it cannot know which width will be asked for --
+    # and it is a decline the router can act on rather than a launch failure.
     if all(
         topk_per_row_radix_stream_serves(k, wave_size, block_threads=bt) is None
         for bt in (_STREAM_BLOCK_WIDTHS)
@@ -313,6 +320,21 @@ def _choose(
     return topk_select_backend(rows, width, k, available)
 
 
+def _plain_takes(rows: int, width: int, k: int) -> bool:
+    """Enough rows for the row-scaling selector, on a width it is tuned for."""
+    lo, hi = _PLAIN_MANY_ROWS_BAND
+    return rows >= _PLAIN_MANY_ROWS and k >= _PLAIN_MIN_K and lo <= width <= hi
+
+
+def _decode_takes(rows: int, width: int, k: int) -> bool:
+    """Room to spread a grid across, and a grid that is not already full."""
+    min_n, max_m = _DECODE_GATE_AMORTISED if k >= _DECODE_AMORTISING_K else _DECODE_GATE
+    band_lo, band_hi = _DECODE_ANY_ROWS_BAND
+    return (width >= min_n and rows <= max_m) or (
+        k >= _DECODE_ANY_ROWS_K and band_lo <= width <= band_hi
+    )
+
+
 def topk_select_backend(
     rows: int, width: int, k: int, available: frozenset[str]
 ) -> str:
@@ -327,21 +349,23 @@ def topk_select_backend(
 
     Fitted to a 565-cell sweep -- rows 1..16384, widths 2048..1M including the
     non-power-of-two widths a sparse indexer produces, k 16..4096 -- against the
-    fastest backend measured at each cell. Costs a mean 1.054x and a p90 1.167x
-    against that oracle, over the 1.295x / 1.795x the rules it replaces cost on
-    the same table, and is more than 1.2x off on 51 cells against their 205.
+    fastest backend measured at each cell. Re-swept twice since, because
+    `_dispatch` twice changed what it hands a backend: the streaming selector's
+    re-select trigger learned a row-count term, and then its `partial` split was
+    retuned and went from unreachable to live, which moved `stream` by up to
+    2.58x on the low-row end. A mean 1.014x and a p90 1.020x against the oracle,
+    more than 1.2x off on 12 cells, and 1.009x of it by total time.
 
-    The worst cell is 2.611x, at 256 rows of 16384 where `_DECODE_MAX_M` sends
-    decode's win to `stream`. Raising that bound to 256 takes the worst to
-    2.130x and gives back 0.009x of the mean; widening the `plain` band to
-    262144 takes the sparse-indexer shapes from 1.049x to 1.036x and costs
-    0.001x of the global mean. Both are real trades, and both were declined in
-    favour of the global stopwatch -- re-run `topk_backend_fit.py` rather than
-    picking one by taste.
+    The worst cell is 1.564x: `plain` takes 256 rows of 8192 and decode is
+    faster there. Every way of trimming that band regresses somewhere else by
+    0.631x..0.707x for a mean gain of at most 1.004x, so it stands.
 
-    Re-run the sweep, not just the fit, if `_dispatch` changes what it passes a
-    backend: these numbers were taken with `stable` following the caller, and
-    the previous rules were fitted when it was hardwired on.
+    Two rules for changing any of this. Score candidates as an A/B against the
+    rule in place, not only against the per-cell oracle -- the two disagreed
+    four times over this table, and each time the oracle preferred a rule that
+    made some shape markedly slower. And re-run the SWEEP, not just
+    `topk_backend_fit.py`, whenever `_dispatch` changes what it hands a backend;
+    twice now that has moved a boundary the fit alone would have kept.
 
     The returned name is always one of `available`.
     """
@@ -351,12 +375,11 @@ def topk_select_backend(
     # the answer does not need, and lose 1.3x to 12x doing so.
     if "argmax" in available:
         return "argmax"
-    lo, hi = _PLAIN_MANY_ROWS_BAND
-    if "plain" in available and rows >= _PLAIN_MANY_ROWS and lo <= width <= hi:
+    if "plain" in available and _plain_takes(rows, width, k):
         return "plain"
     if "small_k" in available and k <= _SMALL_K_MAX_K:
         return "small_k"
-    if "decode" in available and rows <= _DECODE_MAX_M and width >= _DECODE_MIN_N:
+    if "decode" in available and _decode_takes(rows, width, k):
         return "decode"
     if "stream" in available:
         return "stream"
@@ -613,6 +636,66 @@ def topk_select(
     return values, idx
 
 
+# A row is one workgroup, so a call with few rows leaves the machine empty
+# however wide those rows are. The split cuts each row into G slices, selects
+# each in its own workgroup, and merges the G*k survivors -- trading a second
+# pass over a much smaller array for G times the parallelism.
+#
+# Sweep these over the domain the ROUTER reaches, not by forcing `stream`. Fitted
+# the other way once, and the cells it was fitted on could not run: the chain put
+# `decode` ahead of `stream` across the whole of the split's own gate, so of 565
+# routing cells 36 would have split and `stream` was picked on none -- which is
+# how the block target came to contradict itself, stopping G at 2 for 128 rows
+# where 4 measured 1.2x faster.
+#
+# Over the 108 cells the router does send here (`stream_split_grid.csv`), the
+# best G is 4 below 128 rows, 2 at 192..256 but 1.4x..1.6x SLOWER there at
+# k >= 2048, and 1 from 512 rows up where the machine is full and the merge is
+# pure cost. Hence the row bound: lifting it to 256 scores better against the
+# per-cell oracle and is 0.976x as an A/B, 26 cells slower. This rule changes
+# twelve cells and none of them regress.
+_SPLIT_TARGET_BLOCKS = 512
+_SPLIT_MAX_ROWS = 128
+_SPLIT_MIN_WIDTH = 1 << 18
+# Bounds the MERGE, not the fan-out: stage 2 selects from `G * k` values in one
+# workgroup per row, so a G large enough makes it the original problem again.
+# Never binding in the reachable domain -- `_SPLIT_TARGET_BLOCKS` holds G to
+# `512 // rows`, and the router keeps 64 rows and fewer for `decode`.
+_SPLIT_MAX_PARTS = 16
+
+
+def _stream_split_parts(rows: int, width: int, k: int, ragged: bool) -> int:
+    """How many slices to cut each row into, or 1 to select it whole.
+
+    Ragged rows are excluded, and not only for tidiness: a slice shorter than k
+    pads with -1, and the merge's labels would then repeat. Its tie select
+    assumes labels are unique -- it gives untied slots the key 0, and a repeated
+    -1 label maps onto that same 0 -- so the count would come out wrong. A row
+    at least `parts * k` wide has no short slice and no repeated label.
+    """
+    if ragged or rows > _SPLIT_MAX_ROWS or width < _SPLIT_MIN_WIDTH:
+        return 1
+    parts = 1
+    while (
+        parts * 2 <= _SPLIT_MAX_PARTS
+        and rows * parts * 2 <= _SPLIT_TARGET_BLOCKS
+        and width >= parts * 2 * k
+    ):
+        parts *= 2
+    return parts
+
+
+def _stream_scratch(input, dtype=None):
+    """A placeholder for a stream argument this mode does not use.
+
+    The kernel takes one tensor per optional output -- the per-slice values a
+    split writes, and the column labels a merge reads -- and a build that uses
+    neither still has to be handed something of the right dtype for the launcher
+    to specialise on.
+    """
+    return torch.empty(1, 1, dtype=dtype or input.dtype, device=input.device)
+
+
 def _dispatch(
     backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
 ):
@@ -662,6 +745,69 @@ def _dispatch(
             stable=tie == "low" or deterministic,
         )
     elif backend == "stream":
+        wave = wave_size_of(input.device.index)
+        parts = _stream_split_parts(rows, input.shape[1], topk, ragged)
+        if parts > 1:
+            # Stage 1 launches `rows * parts` blocks and stage 2 launches
+            # `rows`, so the two sit on opposite sides of the block-width rule
+            # and each has to ask it for itself.
+            part_idx = torch.empty(
+                rows, parts * topk, dtype=torch.int32, device=input.device
+            )
+            part_val = torch.empty(
+                rows, parts * topk, dtype=input.dtype, device=input.device
+            )
+            stream = torch.cuda.current_stream(input.device)
+            _run_compiled(
+                build_topk_per_row_radix_stream_module(
+                    topk,
+                    wave,
+                    partial=True,
+                    block_threads=topk_per_row_radix_stream_block_threads(
+                        rows * parts, topk
+                    ),
+                    # A slice, not the row: this stage runs one block per
+                    # slice over a slice's width, and the plan reads both.
+                    lds_plan=topk_per_row_radix_stream_lds_plan(
+                        rows * parts, -(-input.shape[1] // parts), topk
+                    ),
+                ),
+                input,
+                row_lens,
+                part_idx,
+                part_val,
+                _stream_scratch(input, torch.int32),
+                parts,
+                rows * parts,
+                stream,
+            )
+            # The merge orders by the ORIGINAL column, which `part_idx` carries,
+            # so its answer is the unsplit answer rather than merely a valid
+            # one -- and it writes those columns straight out, with no slot-to
+            # -column gather to undo afterwards.
+            _run_compiled(
+                build_topk_per_row_radix_stream_module(
+                    topk,
+                    wave,
+                    labelled=True,
+                    block_threads=topk_per_row_radix_stream_block_threads(rows, topk),
+                    # The merge's rows are `parts * topk` wide, not the input's.
+                    lds_plan=topk_per_row_radix_stream_lds_plan(
+                        rows, parts * topk, topk
+                    ),
+                ),
+                part_val,
+                torch.full(
+                    (rows,), parts * topk, dtype=torch.int32, device=input.device
+                ),
+                idx,
+                _stream_scratch(input),
+                part_idx,
+                1,
+                rows,
+                stream,
+            )
+            return
         _run_compiled(
             # The block width follows the ROW COUNT and k, not the row width --
             # see the sweep behind `topk_per_row_radix_stream_block_threads`.
@@ -669,13 +815,17 @@ def _dispatch(
             # width costs 1.135x and a worst 2.03x.
             build_topk_per_row_radix_stream_module(
                 topk,
-                wave_size_of(input.device.index),
+                wave,
                 block_threads=topk_per_row_radix_stream_block_threads(rows, topk),
+                # The deepest prefetch the budget allows is not the one that
+                # wins, and the budget has no term for the row count.
+                lds_plan=topk_per_row_radix_stream_lds_plan(rows, input.shape[1], topk),
             ),
             input,
             row_lens,
             idx,
-            torch.empty(1, 1, dtype=input.dtype, device=input.device),
+            _stream_scratch(input),
+            _stream_scratch(input, torch.int32),
             1,
             rows,
             torch.cuda.current_stream(input.device),

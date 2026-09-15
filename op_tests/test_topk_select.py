@@ -23,7 +23,9 @@ import pandas as pd
 import torch
 
 import aiter
+import aiter.ops.flydsl.kernels.topk_per_row_radix_stream as st
 from aiter import dtypes
+from aiter.jit.utils.chip_info import _LDS_CAPACITY_BYTES as LDS_CAPACITY
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 from aiter.ops.topk_select import (
@@ -220,6 +222,97 @@ def _run_single_backend(x, row_lens, k, backend):
         ts._choose.cache_clear()
 
 
+def test_lds_sizing():
+    """The streaming selector's LDS sizing, on cards this box does not have.
+
+    `_SUPPORTED_GFX` names gfx942 and the routing rule has no arch term, so the
+    streaming selector is what every shape falls through to on a 64 KiB CU as
+    well as a 160 KiB one. A build that claims more LDS than the card holds is
+    chosen at dispatch and dies at launch -- loudly, but after `serves` has
+    already told the router the geometry was fine.
+
+    Arithmetic, so the card it is about does not have to be present. Three
+    properties, and the first is what keeps the other two from being a rewrite
+    of the code they check:
+
+      gfx950 is unchanged     the budgets replaced two literals, and the
+                              prefetch depths were tuned at those literals.
+      servable implies fits   whatever `serves` accepts has a footprint inside
+                              the card, on every arch the capacity table names.
+      a plan is a preference  `_resolve_lds` returns the planned pair only when
+                              it fits, and its own search otherwise. A table
+                              fitted on one card must not become a launch
+                              failure on another.
+    """
+    failures = []
+
+    def want(cond, label):
+        if not cond:
+            failures.append(label)
+
+    def budgets_for(cap):
+        """The kernel's own derivation, not a copy of it."""
+        return cap // 2 - st._LDS_RESIDENT_SLACK, cap - st._LDS_SOLO_SLACK
+
+    want(
+        budgets_for(LDS_CAPACITY["gfx950"]) == (76 * 1024, 148 * 1024),
+        "gfx950 budgets reproduce the literals they replaced",
+    )
+
+    for arch, cap in LDS_CAPACITY.items():
+        pair = budgets_for(cap)
+        for k in (16, 256, 1024, 2048, 4096):
+            for bt in (512, 1024):
+                if 2048 % bt:
+                    continue
+                resolved = st._resolve_lds(k, bt, pair, st._VEC)
+                served = st.topk_per_row_radix_stream_serves(k, 64, bt, pair) is None
+                want(
+                    served == (resolved is not None),
+                    f"{arch} k={k} bt={bt}: serves agrees with _resolve_lds",
+                )
+                if resolved is None:
+                    continue
+                unroll, soft = resolved
+                capacity = k + soft + unroll * bt * st._VEC
+                # `topk_stream_config['lds_bytes']` leaves out `scan` and
+                # `state`; the assembler does not.
+                declared = (
+                    (capacity + k) * 8
+                    + st._NUM_BUCKETS * 4
+                    + (bt // 64) * 4
+                    + st._ST_SLOTS * 4
+                )
+                want(declared <= cap, f"{arch} k={k} bt={bt}: {declared}B fits {cap}B")
+
+                # Both sides of the plan's width test, since above k=1024 it
+                # declines on one of them and offers a pair on the other.
+                for width in (4 * k, 64 * k):
+                    plan = st.topk_per_row_radix_stream_lds_plan(4096, width, k)
+                    got = st._resolve_lds(k, bt, pair, st._VEC, plan=plan)
+                    if plan is None:
+                        want(
+                            got == resolved,
+                            f"{arch} k={k} bt={bt} n={width}: declining is a no-op",
+                        )
+                        continue
+                    p_capacity = k + plan[1] + plan[0] * bt * st._VEC
+                    p_declared = (p_capacity + k) * 8 + st._NUM_BUCKETS * 4 + 4096
+                    want(
+                        (
+                            tuple(got) == plan
+                            if p_declared <= pair[1]
+                            else tuple(got) == tuple(resolved)
+                        ),
+                        f"{arch} k={k} bt={bt} n={width}: "
+                        f"the plan is taken only when it fits",
+                    )
+
+    for label in failures:
+        aiter.logger.error("LDS SIZING FAILED: %s", label)
+    return failures
+
+
 def test_invariants(m, n, k):
     """The properties a value comparison cannot see."""
     failures = []
@@ -357,6 +450,10 @@ def main():
     )
     args = parser.parse_args()
 
+    bad = test_lds_sizing()
+    aiter.logger.info(
+        "LDS sizing: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
     bad = test_invariants(64, 32768, 512)
     aiter.logger.info(
         "invariants: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
