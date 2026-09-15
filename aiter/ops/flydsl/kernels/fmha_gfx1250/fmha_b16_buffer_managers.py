@@ -1102,6 +1102,8 @@ class QManager16bV2:
     at gqa==1. LDS is plain row-major with ``hdim + _Q_PAD_ELEMS`` element row stride (matches K).
     """
 
+    _PART1_COUNTERS = ("tensorcnt",)  # part1 issues TDM copies only
+
     def __init__(
         self,
         *,
@@ -1215,7 +1217,7 @@ class QManager16bV2:
         self._warp_region = warp_region
         self._lane_idx = lane_idx
 
-    def load_q_to_vgpr_part2(self, *, scale, skip_tensorcnt=0):
+    def load_q_to_vgpr_part2(self, *, scale, skip_tensorcnt=-1, skip_asynccnt=-1):
         """Drain this wave's Q TDM and read its ``rows_per_warp x qk_hdim``
         tile into WMMA B-fragments (``scale`` folded). Returns a length-R list; entry ``qt`` is
         that q-tile's list of ``k_tiles`` v16-bf16 fragments (same as ``QManager16bV1``).
@@ -1224,9 +1226,19 @@ class QManager16bV2:
         ``l%16``, d-byte ``(l//16)*16``; fragment (qt, tile) = base + ``qt*16*row_bytes +
         tile*32*2`` (lo) and ``+ 16*2`` more (hi 8-col half).
 
-        ``skip_tensorcnt`` is how many copies the caller issued AFTER part1 that must stay
-        in flight. tensorcnt retires in issue order, so waiting down to it drains Q alone."""
-        tdm_ops.tensor_wait(skip_tensorcnt)
+        Each ``skip_*`` is how many copies the caller issued AFTER part1 that may stay in
+        flight on that counter: the counters retire in issue order, so waiting down to the
+        count drains Q alone. The default -1 means the caller named nothing, and the wait
+        is then emitted at 0 for the counters part1 itself uses (``_PART1_COUNTERS``) and
+        omitted for the rest -- a named count is honoured on either."""
+        for _cnt, _skip, _wait in (
+            ("tensorcnt", skip_tensorcnt, tdm_ops.tensor_wait),
+            ("asynccnt", skip_asynccnt, rocdl.s_wait_asynccnt),
+        ):
+            if _skip >= 0:
+                _wait(_skip)
+            elif _cnt in self._PART1_COUNTERS:
+                _wait(0)
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
         scale_bf16 = scale.to(self.elem_dtype)
         lane = self._lane_idx
