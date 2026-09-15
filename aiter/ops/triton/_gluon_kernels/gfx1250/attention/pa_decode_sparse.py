@@ -1964,6 +1964,12 @@ def _pa_decode_sparse_v4_a8w8(
     CGA_B1: gl.constexpr = _cga_bcast_1d(CGA_H)
     LOG2E: gl.constexpr = 1.4426950408889634
     NUM_MX_BLOCKS: gl.constexpr = BLOCK_D // 32
+    # The packed row is [NOPE_DIM fp8 | NOPE_DIM/32 E8M0 | pad] -- only 14 of
+    # the 16 MX blocks have a real scale byte. Blocks 14/15 cover the RoPE
+    # columns, whose data the descriptors already zero-fill, so their scale
+    # must be zero-filled too: reading the row's PAD there is a live bug, a
+    # pad byte of 0xFF is E8M0 NaN and 0 * NaN poisons the whole score row.
+    REAL_MX_BLOCKS: gl.constexpr = NOPE_DIM // 32
 
     # QK tiles warps along M, PV along N -- as the bf16 kernel does. With PV
     # tiled along M every warp reads the FULL width of the staging tile for
@@ -2182,7 +2188,7 @@ def _pa_decode_sparse_v4_a8w8(
         )
         qs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=q_u8_ptr + t * q_stride_t + NOPE_DIM,
-            shape=[H, NUM_MX_BLOCKS],
+            shape=[H, REAL_MX_BLOCKS],
             strides=[q_stride_h, 1],
             block_shape=[BLOCK_H, NUM_MX_BLOCKS],
             layout=qs_shared,
@@ -2229,7 +2235,7 @@ def _pa_decode_sparse_v4_a8w8(
             offsets=(
                 h_offs_s_eff[:, None] * q_stride_h + NOPE_DIM + b_offs_s[None, :]
             ).to(gl.int32),
-            mask=(h_offs_s_eff < H)[:, None],
+            mask=(h_offs_s_eff < H)[:, None] & (b_offs_s < REAL_MX_BLOCKS)[None, :],
             other=0,
         )
         q_scale = gl.convert_layout(q_exp, q_scale_layout)
@@ -2345,7 +2351,7 @@ def _pa_decode_sparse_v4_a8w8(
     )
     mxs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=kv_u8_ptr + NOPE_DIM,
-        shape=[total_pages, NUM_MX_BLOCKS],
+        shape=[total_pages, REAL_MX_BLOCKS],
         strides=[kv_stride_n, 1],
         block_shape=[BLOCK_K, NUM_MX_BLOCKS],
         layout=mxs_shared,

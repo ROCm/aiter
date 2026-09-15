@@ -156,12 +156,14 @@ def pa_decode_sparse(
             ``block_h * D / (num_warps * 32)`` = 256 VGPRs at every block_h;
             overriding it is the only way to shrink the accumulator's register
             footprint.
-        use_mx: 2buff path only, EXPERIMENTAL. ``True`` routes packed fp8 Q to
-            the native-MX kernel (wmma_scaled QK + a P-folded PV). Default is
-            off: measured 136.6us vs 92.5us for the dequant-and-stage kernel at
-            T=512/H=128/kv_len=384, so MX is an A/B knob, not the fast path.
-            Also note the clustered MX/a8w8 variants are UNDER SUSPICION for a
-            cluster-rendezvous hang -- see the ctas_h note.
+        use_mx: 2buff path only. ``True`` routes packed fp8 Q to the native-MX
+            kernel (wmma_scaled QK on the raw fp8, bf16 PV over a staged tile).
+            It is now the FASTER of the two -- 53.6us vs 79.8us for the
+            dequant-and-stage kernel at T=512/H=128/kv_len=384, and 27.7us vs
+            38.8us at kv_len=136 -- but it is not the default here yet, so
+            callers opt in. Use it with ``ctas_h=1`` (the default): the
+            clustered variants replicate the dequant per CTA and are ~1.4x
+            slower.
         q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q. Supplying it (2buff path
             only) means ``q`` is the packed fp8 ``[N, H, 512]`` Q — i.e. full
             a8w8 parity with the asm kernel. Omit it to pass ``q`` as plain
