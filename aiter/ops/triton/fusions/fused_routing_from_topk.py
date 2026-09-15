@@ -88,8 +88,11 @@ def fused_routing_from_topk(
     )
 
     _LOGGER.info(
-        f"FUSED_ROUTING_FROM_TOPK: n_tokens={n_tokens} K={n_expts_act} "
-        f"E={n_expts_tot} NK={n_gates_pad}"
+        "FUSED_ROUTING_FROM_TOPK: n_tokens=%s K=%s E=%s NK=%s",
+        n_tokens,
+        n_expts_act,
+        n_expts_tot,
+        n_gates_pad,
     )
 
     device = topk_weights.device

@@ -73,7 +73,13 @@ def triton_hstu_attention_fwd(
         torch.Tensor: Output jagged tensor with shape (total_tokens, num_heads, head_dim).
     """
     _LOGGER.info(
-        f"HSTU_ATTENTION_FWD: N={N} alpha={alpha} q={tuple(q.shape)} k={tuple(k.shape)}  v={tuple(v.shape)} seq_offsets={tuple(seq_offsets.shape)}"
+        "HSTU_ATTENTION_FWD: N=%s alpha=%s q=%s k=%s  v=%s seq_offsets=%s",
+        N,
+        alpha,
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(seq_offsets.shape),
     )
     Z = seq_offsets.numel() - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
@@ -180,7 +186,14 @@ def triton_hstu_attention_bwd(
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Gradients (dq, dk, dv).
     """
     _LOGGER.info(
-        f"HSTU_ATTENTION_BKWD: dout={dout.shape}  q={tuple(q.shape)} k={tuple(k.shape)}  v={tuple(v.shape)} dq={tuple(dq.shape)} dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+        "HSTU_ATTENTION_BKWD: dout=%s  q=%s k=%s  v=%s dq=%s dk=%s  dv=%s",
+        dout.shape,
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(dq.shape),
+        tuple(dk.shape),
+        tuple(dv.shape),
     )
     dout = switch_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)

@@ -210,7 +210,12 @@ def all_gather(
     M = M_shard * world_size
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: All-gather M_shard={M_shard}, N={N} -> M={M}"
+        "Rank %s/%s: All-gather M_shard=%s, N=%s -> M=%s",
+        cur_rank,
+        world_size,
+        M_shard,
+        N,
+        M,
     )
 
     # Allocate output buffer in IRIS shared memory
@@ -245,7 +250,7 @@ def all_gather(
     iris_ctx.barrier()
 
     logger.info(
-        f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}"
+        "Rank %s: All-gather complete, output shape: %s", cur_rank, full_output.shape
     )
 
     return full_output

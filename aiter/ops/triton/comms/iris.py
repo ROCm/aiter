@@ -178,7 +178,10 @@ class IrisCommContext:
             self.num_ranks = self.iris_ctx.num_ranks
 
             logger.info(
-                f"Iris context initialized: rank {self.cur_rank}/{self.num_ranks}, heap_size={self.heap_size}"
+                "Iris context initialized: rank %s/%s, heap_size=%s",
+                self.cur_rank,
+                self.num_ranks,
+                self.heap_size,
             )
         return self
 

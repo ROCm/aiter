@@ -55,7 +55,7 @@ def batched_gemm_bf16(
     Returns:
         torch.Tensor: Output batch with shape (B, M, N).
     """
-    _LOGGER.info(f"BATCHED_GEMM_BF16: x={tuple(XQ.shape)} w={tuple(WQ.shape)}")
+    _LOGGER.info("BATCHED_GEMM_BF16: x=%s w=%s", tuple(XQ.shape), tuple(WQ.shape))
 
     assert XQ.shape[0] == WQ.shape[0], "Incompatible Batch dimensions!!!"
     assert XQ.shape[2] == WQ.shape[2], "Incompatible K dimensions!!!"
@@ -99,8 +99,10 @@ def batched_gemm_bf16(
             kernel_type in _KERNEL_MAP
         ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
         _LOGGER.info(
-            f"BATCHED_GEMM_BF16 [gluon/gfx1250]: x={tuple(XQ.shape)} w={tuple(WQ.shape)} "
-            f"kernel={kernel_type}"
+            "BATCHED_GEMM_BF16 [gluon/gfx1250]: x=%s w=%s kernel=%s",
+            tuple(XQ.shape),
+            tuple(WQ.shape),
+            kernel_type,
         )
 
         if config is None:
@@ -131,9 +133,12 @@ def batched_gemm_bf16(
             if depth_cap < _MIN_BUFFERS[kernel_type]:
                 needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
                 _LOGGER.warning(
-                    f"BATCHED_GEMM_BF16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
-                    f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
-                    f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
+                    "BATCHED_GEMM_BF16 [gluon/gfx1250]: kernel_type='%s' needs num_k_tiles>=%s but num_k_tiles=%s (K=%s, BLOCK_K=%s); falling back to kernel_type='bandwidth_bound'.",
+                    kernel_type,
+                    needed,
+                    num_k_tiles,
+                    K,
+                    BLOCK_K,
                 )
                 kernel_type = "bandwidth_bound"
                 depth_cap = num_k_tiles

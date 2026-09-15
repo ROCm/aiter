@@ -140,7 +140,7 @@ try:
             num_warps=conf.pop("num_warps", 4),
         )
 except Exception as e:  # noqa: BLE001
-    logger.warning(f"FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON parse error: {e}")
+    logger.warning("FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON parse error: %s", e)
 
 # Unified debug level:
 #   0 = off (default)
