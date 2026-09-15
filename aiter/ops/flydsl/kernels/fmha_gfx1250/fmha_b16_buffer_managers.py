@@ -432,7 +432,7 @@ class QManager16bV1:
 
     def load_q_to_vgpr_part2(self, *, scale):
         """Part 2 of the Q load: drain the async loads issued in part 1 and read the
-        tiles into WMMA A fragments (``scale`` folded in). A leading ``sched_barrier``
+        tiles into WMMA A fragments (``scale`` folded in; None leaves Q raw). A leading ``sched_barrier``
         keeps the waits/reads below the caller's SALU so it stays in the load shadow.
 
         Returns a length-R list (``R = q_tiles_per_wave``); entry ``qt`` is that
@@ -442,7 +442,10 @@ class QManager16bV1:
         k_tiles = self.k_tiles
         lds_tiles = self.lds_tiles
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
-        scale_bf16 = scale.to(self.elem_dtype)
+        scale_bf16 = None if scale is None else scale.to(self.elem_dtype)
+
+        def _scaled(v):  # scale=None: the caller scales S after the QK gemm instead
+            return v if scale_bf16 is None else v * scale_bf16
 
         def _read_tile(ds_ptrs, tile):
             lo = fx.ptr_load(ds_ptrs[2 * tile], result_type=v8_ty)
@@ -464,9 +467,9 @@ class QManager16bV1:
                     rocdl.s_wait_asynccnt(total - landed)
                     lo, hi = _read_tile(ds_ptrs, tile)
                     rocdl.s_wait_dscnt(1)  # lo landed (in-order LDS return)
-                    lo = lo * scale_bf16
+                    lo = _scaled(lo)
                     rocdl.s_wait_dscnt(0)  # hi landed
-                    hi = hi * scale_bf16
+                    hi = _scaled(hi)
                     q_frags_list[qt].append(lo.shuffle(hi, list(range(16))))
             return q_frags_list
 
@@ -486,15 +489,15 @@ class QManager16bV1:
             lo, hi = _read_tile(ds_ptrs, i - lds_tiles)
             rocdl.s_wait_dscnt(0)  # slot free to overwrite
             _refill(i)
-            q_frags.append(lo.shuffle(hi, list(range(16))) * scale_bf16)
+            q_frags.append(_scaled(lo.shuffle(hi, list(range(16)))))
         # Drain loop: read the last lds_tiles tiles, no refill; overlap lo scale w/ hi load.
         for i in fx.range_constexpr(0, lds_tiles):
             rocdl.s_wait_asynccnt((lds_tiles - 1 - i) * 2)
             lo, hi = _read_tile(ds_ptrs, k_tiles - lds_tiles + i)
             rocdl.s_wait_dscnt(1)  # lo landed (in-order LDS return)
-            lo = lo * scale_bf16
+            lo = _scaled(lo)
             rocdl.s_wait_dscnt(0)  # hi landed
-            hi = hi * scale_bf16
+            hi = _scaled(hi)
             q_frags.append(lo.shuffle(hi, list(range(16))))
         return [q_frags]
 
@@ -1219,7 +1222,8 @@ class QManager16bV2:
 
     def load_q_to_vgpr_part2(self, *, scale, skip_tensorcnt=-1, skip_asynccnt=-1):
         """Drain this wave's Q TDM and read its ``rows_per_warp x qk_hdim``
-        tile into WMMA B-fragments (``scale`` folded). Returns a length-R list; entry ``qt`` is
+        tile into WMMA B-fragments (``scale`` folded; None leaves Q raw). Returns a length-R
+        list; entry ``qt`` is
         that q-tile's list of ``k_tiles`` v16-bf16 fragments (same as ``QManager16bV1``).
 
         Read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l`` reads row
@@ -1240,7 +1244,7 @@ class QManager16bV2:
             elif _cnt in self._PART1_COUNTERS:
                 _wait(0)
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
-        scale_bf16 = scale.to(self.elem_dtype)
+        scale_bf16 = None if scale is None else scale.to(self.elem_dtype)
         lane = self._lane_idx
         lane_base = (
             self._warp_region
@@ -1261,7 +1265,10 @@ class QManager16bV2:
                 p_hi = buffer_ops.get_element_ptr(base, static_byte_offset=imm_hi)
                 lo = fx.Vector(llvm_dialect.load(v8_ty, p_lo))
                 hi = fx.Vector(llvm_dialect.load(v8_ty, p_hi))
-                q_frags_list[qt].append(lo.shuffle(hi, list(range(16))) * scale_bf16)
+                frag = lo.shuffle(hi, list(range(16)))
+                q_frags_list[qt].append(
+                    frag if scale_bf16 is None else frag * scale_bf16
+                )
         return q_frags_list
 
 

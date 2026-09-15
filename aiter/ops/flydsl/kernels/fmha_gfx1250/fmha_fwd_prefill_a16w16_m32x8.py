@@ -43,7 +43,6 @@ from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl.expr import arith, gpu, rocdl
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
@@ -172,6 +171,15 @@ KV_PARTIAL_FENCE = KV_K_AHEAD
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 LOG2E = 1.4426950408889634
 
+# S reaches softmax already in log2 units (S' = S * softmax_scale * LOG2E), so its inner
+# loop is a plain exp2(S' - m) with no LOG2E multiply and m/LSE live in the log2 domain.
+# True folds that constant into Q via the bf16 multiply the Q loader already does: free,
+# but it rounds the scale to bf16's 8 mantissa bits. False leaves Q raw and scales the f32
+# QK accumulator instead -- exact, at R*NKV*8 VALU per tile, and paid on the gemm side of
+# the anti-phase body (the shorter one). Expect to key this off return_lse once training
+# wants the precision.
+FOLD_SCALE_INTO_Q = True
+
 # Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling the
 # running O accumulator by corr = exp(m_prev - m_new) is a full-width VALU pass
 # (d_tiles*8 f32/lane) every tile, but corr == 1 when the running max doesn't
@@ -179,8 +187,8 @@ LOG2E = 1.4426950408889634
 # logit units of it: P = exp2(S - m_stale) accumulates against the un-rescaled
 # oaccu/denom, staying consistent. The per-lane test is promoted to wave-uniform
 # via ballot (any lane over threshold => the whole wave rescales), so the caller
-# can gate the wide multiply with one non-divergent scf.if. Since our exp is
-# exp2((s-m)*LOG2E) = e^(s-m) (natural logits), threshold 8.0 => defer until the
+# can gate the wide multiply with one non-divergent scf.if. In NATURAL logits (m is
+# log2-domain, so the compare scales this by LOG2E): threshold 8.0 => defer until the
 # max would move by e^8 ~ 2981x, far under the e^88 fp32 exp overflow wall.
 # Set ENABLE_DEFER_RESCALE=False (or threshold < 0) to always rescale.
 ENABLE_DEFER_RESCALE = True
@@ -506,6 +514,16 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
             _keepalive(p)
 
 
+def _scale_s(s_acc_list, s_scale):
+    """Apply softmax_scale*LOG2E to a gemm's f32 QK accumulators (``FOLD_SCALE_INTO_Q
+    =False`` path; None = already folded into Q, returns them untouched). The caller
+    invokes this so the multiplies land where it wants them -- keep them on the gemm
+    side of the anti-phase body, i.e. before the phase barrier."""
+    if s_scale is None:
+        return s_acc_list
+    return [[acc * s_scale for acc in row] for row in s_acc_list]
+
+
 def _qk_gemm(
     *, k_emit, q_frags_list, n_block, head=None, ring=QK_RING, lag=QK_LAG
 ):
@@ -608,8 +626,8 @@ def _softmax(
     the tile's K/V. Processing them together lets the two rows' balanced max-tree and
     sum-tree reductions emit INTERLEAVED (position-major across rows, via
     ``_tree_reduce_multi``) so the backend can dual-issue row0/row1 combines and hide each
-    other's cross-lane permlanex16 latency. ``s_list[r]`` already includes softmax_scale
-    (folded into Q), so exp uses plain LOG2E.
+    other's cross-lane permlanex16 latency. ``s_list[r]`` is already in log2 units
+    (softmax_scale*LOG2E applied in Q or on the QK accumulator), so exp is a plain exp2.
 
     Layout (from ``_qk_gemm``): ``s_list[r]`` is a list of ``NKV = n_block//WMMA_N`` v8-f32
     accumulators; this lane owns query ``q = warp*16 + l%16`` and, in tile ``kvt``, the kv
@@ -642,8 +660,6 @@ def _softmax(
     f32 = ir.F32Type.get()
     fast = arith.FastMathFlags.fast
     neg_inf = fx.Float32(float("-inf"))
-    zero = fx.Float32(0.0)
-    log2e = fx.Float32(LOG2E)
 
     def fmax(a, b):
         return fx.Float32(arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fast).result)
@@ -664,6 +680,9 @@ def _softmax(
 
     def fmul(a, b):
         return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fast))
+
+    def fsub_inf(a, b):  # masked s is -inf and must stay -inf: no ninf fast-math here
+        return fx.Float32(arith.subf(_raw(a), _raw(b)))
 
     def exp2(x):
         return fx.Float32(rocdl.exp2(f32, _raw(x)))
@@ -731,8 +750,8 @@ def _softmax(
     max3 = lambda a, b, c: fmax(fmax(a, b), c)
     local_max_list = _tree_reduce_multi(s_masked_list, max3, fmax)
 
-    # ---- Per row: peer reduce + deferred-rescale decision + corr / neg_m. ----
-    m_new_list, corr_list, neg_m_list, do_rescale_list = [], [], [], []
+    # ---- Per row: peer reduce + deferred-rescale decision + corr. ----
+    m_new_list, corr_list, do_rescale_list = [], [], []
     for r in range(R):
         m_prev, q_min = m_prev_list[r], q_min_list[r]
         row_max = fmax(local_max_list[r], peer(local_max_list[r]))
@@ -746,7 +765,7 @@ def _softmax(
         if ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0:
             # `>` lowers to ordered OGT, so a fully-masked lane's -inf - -inf = NaN
             # compares false and never forces a rescale.
-            need = fsub(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD)
+            need = fsub(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
             mask = rocdl.ballot(fx.Int32.ir_type, need)
             do_rescale = fx.Int32(mask) != fx.Int32(0)
             m_new = do_rescale.select(m_full, m_prev)
@@ -754,30 +773,25 @@ def _softmax(
             do_rescale = None
             m_new = m_full
 
-        # corr = exp(m_prev - m_new); neg_m = -(m_new * log2e) for the fused p exp.
+        # corr = exp(m_prev - m_new), log2-domain so exp2 takes the difference directly.
         # m is seeded to BIG_NEG (finite), so m_prev/m_new never reach -inf: a fully
         # masked row (row_max=-inf) keeps m_new=BIG_NEG, giving corr=exp2(0)=1 and a
-        # finite neg_m (p=exp2(-inf)=0). No (-inf)-(-inf) / -inf+inf, so no clamp needed.
-        corr = exp2(fmul(fsub(m_prev, m_new), log2e))
-        neg_m = fsub(zero, fmul(m_new, log2e))
+        # finite p=exp2(-inf)=0. No (-inf)-(-inf) / -inf+inf, so no clamp needed.
+        corr = exp2(fsub(m_prev, m_new))
         m_new_list.append(m_new)
         corr_list.append(corr)
-        neg_m_list.append(neg_m)
         do_rescale_list.append(do_rescale)
 
     # ---- Pass 2 (all R rows): p = exp(S - m_new) (bf16, per tile) + flat p for the sum
     # tree. Built for every row first so the row sum-trees below emit INTERLEAVED. ----
     p_list, p_flat_list = [], []
     for r in range(R):
-        neg_m, s_masked = neg_m_list[r], s_masked_list[r]
+        m_new, s_masked = m_new_list[r], s_masked_list[r]
         p, p_flat, idx = [], [], 0
         for kvt in range(NKV):
             pe = []
             for i in range(8):
-                # exp2(s*log2e - m_new*log2e) via one fma.
-                pj = exp2(
-                    fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m)))
-                )
+                pj = exp2(fsub_inf(s_masked[idx], m_new))
                 pe.append(pj)
                 p_flat.append(pj)
                 idx += 1
@@ -1018,6 +1032,11 @@ def _core_attention(
     """
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
+
+    # softmax_scale*LOG2E goes either into Q (bf16, free) or onto the f32 S (exact).
+    _log2_scale = softmax_scale * fx.Float32(LOG2E)
+    _q_scale = _log2_scale if FOLD_SCALE_INTO_Q else None
+    _s_scale = None if FOLD_SCALE_INTO_Q else _log2_scale
 
     # K/V staging: N_KV_PP slots of 2 LDS_CHUNK_BYTES chunks each, every tile split 2-way
     # along n_block into chunks 6 apart (different 64 KB segments). Q time-shares slot 1's
@@ -1262,7 +1281,7 @@ def _core_attention(
             _early += kv_fill
         _issue_views(_early)
         q_frags = q_mgr.load_q_to_vgpr_part2(
-            scale=softmax_scale, skip_tensorcnt=len(_early)
+            scale=_q_scale, skip_tensorcnt=len(_early)
         )
         # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
         # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
@@ -1312,7 +1331,7 @@ def _core_attention(
         _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
         # (3) QMgr part2 — Q ds_load LDS->VGPR (drains the part1 Q async), issued AHEAD of
         # the cluster_loads so its Q-scaling reg reuse leaves the load shadow.
-        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
+        q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
         rocdl.s_wait_dscnt(0)  # Q's ds_loads retired: its LDS is now dead
         gpu.barrier()
         # (4)+(5) Issue the cluster_loads as ONE packed burst between two barriers, before
@@ -1333,9 +1352,9 @@ def _core_attention(
     # _softmax sanitizes that on the q_min path.)
     #
     # Attention sink (compile-time): the sink is one extra ``exp(sink)`` term in the
-    # softmax denominator. Fold it in by seeding m=sink[q_head] and d=1.0 (=exp(sink-
-    # sink)); the rescales carry that d seed to exactly exp(sink - m_final), the sink
-    # denom term. (Without a sink, m=-inf makes the first tile's corr zero the d seed,
+    # softmax denominator. Fold it in by seeding m=sink[q_head]*LOG2E (m is log2-domain)
+    # and d=1.0 (=exp(sink-sink)); the rescales carry that d seed to exactly
+    # exp(sink - m_final), the sink denom term. (Without a sink, m=-inf makes the first tile's corr zero the d seed,
     # so d=1 would equal d=0 — the no-sink path keeps d=0 to stay byte-for-byte.)
     d_tiles = v_hdim // WMMA_M
     R = WMMA_ROW_PER_WAVE
@@ -1356,7 +1375,8 @@ def _core_attention(
     if has_sink:
         num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
         m_init = [
-            _load_sink_logit(ptr_sink, q_head_idx[qt], num_heads_q) for qt in range(R)
+            _load_sink_logit(ptr_sink, q_head_idx[qt], num_heads_q) * fx.Float32(LOG2E)
+            for qt in range(R)
         ]
         d_init = [fx.Float32(1.0) for _ in range(R)]
     else:
@@ -1710,7 +1730,7 @@ def _core_attention(
             rocdl.sched_barrier(0)
             pvqk_head = _pvqk_head()
             _phase_barrier()
-            o_out, carry_next = _pv_qk_gemm(
+            o_out, s_acc = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
                 p_list=p_list,
@@ -1720,6 +1740,7 @@ def _core_attention(
                 o_acc_list=o_resc,
                 head=pvqk_head,
             )
+            carry_next = _scale_s(s_acc, _s_scale)
             if LAG_DRAIN_AFTER_GEMM:
                 _drain_barrier()
             head_next = []
@@ -1738,6 +1759,7 @@ def _core_attention(
                 o_acc_list=o_acc,
                 head=pvqk_head,
             )
+            s_list = _scale_s(s_list, _s_scale)
             _phase_barrier()
             carry_next, m_new_list, d_new_list, o_out = _softmax_phase(s_list, o_acc)
             # Next body's ring head: V(u) from the slot this body read K from -- resident
@@ -1942,8 +1964,9 @@ def _core_attention(
             qtile=qt,
         )
 
-    # ---- LSE store (optional). LSE = m_final + ln(d_final) in the scaled-score
-    # domain (softmax_scale is folded into Q, so S already carries it) — matches
+    # ---- LSE store (optional). LSE = (m_final + log2(d_final)) / LOG2E: m is carried
+    # in log2 units of the scaled score, d is domain-free (exp2 of a log2 difference is
+    # the natural exp of the natural one), so one multiply converts both — matches
     # torch.logsumexp(scale * Q @ K^T, dim=kv). Each query q = warp*R*16 + qt*16 + l%16
     # is held identically by the lane pair (l, l^16); store once from the khalf==0
     # lanes, masked by seq < q_len. buffer_store redirects mask-drops to byte
@@ -1956,10 +1979,8 @@ def _core_attention(
         for qt in range(R):
             m_final = fx.Float32(final[qt * _QS + 0])
             d_final = fx.Float32(final[qt * _QS + 1])
-            # fx.log2 lowers to the HW v_log_f32 (base-2), so scale by ln2 (= 1/LOG2E)
-            # to get the natural log for LSE = m + ln(d).
-            ln_d = fx.log2(d_final) * fx.Float32(1.0 / LOG2E)
-            lse_val = m_final + ln_d
+            # fx.log2 lowers to the HW v_log_f32 (base-2), matching m's log2 domain.
+            lse_val = (m_final + fx.log2(d_final)) * fx.Float32(1.0 / LOG2E)
             lse_mask = khalf0 & (seq_idx[qt] < q_len)
             lse_off_el = (
                 lse_base_elems
