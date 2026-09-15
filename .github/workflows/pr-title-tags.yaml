@@ -223,7 +223,7 @@ jobs:
         # Add-only. Contributors can appear at any point in a PR's life, so
         # this runs on pushes too, but it never removes anyone: unassigning
         # yourself is a human signal and the workflow does not argue with it.
-        if: ${{ contains(fromJSON('["opened", "ready_for_review", "reopened", "synchronize"]'), github.event.action) }}
+if: ${{ contains(fromJSON('["opened", "ready_for_review", "reopened", "synchronize"]'), github.event.action) || (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-title') }}
         uses: actions/github-script@v7
         with:
           script: |
