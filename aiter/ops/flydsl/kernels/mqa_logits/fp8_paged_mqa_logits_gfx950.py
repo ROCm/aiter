@@ -367,20 +367,12 @@ def _build_kernel():
                     value,
                 )
 
-            row = fx.Int32(0)
-            while row + fx.Int32(3) < nn:
-                _score_row(row)
-                _score_row(row + fx.Int32(1))
-                _score_row(row + fx.Int32(2))
-                _score_row(row + fx.Int32(3))
-                row = row + fx.Int32(4)
-            while row + fx.Int32(1) < nn:
-                _score_row(row)
-                _score_row(row + fx.Int32(1))
-                row = row + fx.Int32(2)
-            while row < nn:
-                _score_row(row)
-                row = row + fx.Int32(1)
+            for r in range_constexpr(MAX_NN):
+
+                def _do(_r=r):
+                    _score_row(fx.Int32(_r))
+
+                _guarded(fx.Int32(r) < nn, _do)
 
         if page_lo < page_hi:
             # All 512 threads fill the first page (two 16-byte issues max).
