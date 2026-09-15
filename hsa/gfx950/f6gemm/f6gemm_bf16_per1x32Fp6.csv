@@ -55,3 +55,5 @@ tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_ma
 256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,65536,f6gemm_sched_batch_full_kernel_func,gemm_mxfp6_sched_batch_full.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,65536,f6gemm_sched_all_full_kernel_func,gemm_mxfp6_sched_all_full.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,65536,f6gemm_sched_bias_full_kernel_func,gemm_mxfp6_sched_bias_full.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,f6gemm_stnt_nobias_kernel_func,gemm_mxfp6_stnt_nobias.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,65536,f6gemm_stnt_allk_nobias_kernel_func,gemm_mxfp6_stnt_allk_nobias.co
