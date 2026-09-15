@@ -14,6 +14,7 @@ from torch import Tensor
 
 from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
@@ -234,13 +235,15 @@ def _get_preshuffle_split_buffers(
     stream: torch.cuda.Stream,
 ) -> tuple[Tensor, Tensor]:
     # Safe to reuse: launches on a stream are ordered and the reduction hands
-    # the semaphore back zeroed.
-    workspace = torch.empty(
-        PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
-    )
-    semaphore = torch.zeros(
-        PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
-    )
+    # the semaphore back zeroed. Allocated from a private MemPool because this
+    # key can first miss inside a CUDA graph capture -- see persistent_alloc.
+    with persistent_alloc(device):
+        workspace = torch.empty(
+            PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
+        )
+        semaphore = torch.zeros(
+            PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
+        )
     return workspace, semaphore
 
 
