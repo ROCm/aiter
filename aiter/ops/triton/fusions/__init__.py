@@ -4,6 +4,7 @@
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.ops.triton.fusions.silu_and_mul_backward import silu_and_mul_backward
 
 __all__ = [
     "attn_res_fwd",
@@ -11,4 +12,5 @@ __all__ = [
     "fused_sigmoid_mul",
     "mhc",
     "mhc_post",
+    "silu_and_mul_backward",
 ]
