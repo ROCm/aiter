@@ -25,9 +25,14 @@ if ! docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.
     exit 125
 fi
 
-if docker exec -w /workspace triton_test pytest -q ${TESTS}; then
-    echo "=== good ==="
-    exit 0
-fi
-echo "=== bad ==="
-exit 1
+# Only a real test failure (pytest exit 1) marks a commit bad. Collection
+# errors (4) or "no tests ran" (5) mean the commit cannot answer the
+# question — for instance the failing test does not exist yet — so hand
+# those to git as 125 (skip) instead of blaming them.
+docker exec -w /workspace triton_test pytest -q ${TESTS}
+rc=$?
+case "${rc}" in
+    0) echo "=== good ==="; exit 0 ;;
+    1) echo "=== bad ==="; exit 1 ;;
+    *) echo "pytest could not evaluate this commit (exit ${rc}) — skipping" >&2; exit 125 ;;
+esac

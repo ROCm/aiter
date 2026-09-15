@@ -11,7 +11,6 @@ import importlib.util
 import json
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -40,7 +39,9 @@ def commits_since(since, until="HEAD"):
     the merged PRs."""
     sep = "\x01"  # not a splitlines() boundary, unlike \x1e
     fmt = sep.join(["%H", "%h", "%an", "%ae", "%ad", "%s"])
-    raw = git("log", "--first-parent", "--date=short", f"--format={fmt}", f"{since}..{until}")
+    raw = git(
+        "log", "--first-parent", "--date=short", f"--format={fmt}", f"{since}..{until}"
+    )
     out = []
     for line in raw.splitlines():
         if not line.strip():
@@ -52,9 +53,11 @@ def commits_since(since, until="HEAD"):
                 "sha": sha,
                 "short": short,
                 "author": author,
-                "login": email.split("@")[0].split("+")[-1]
-                if "users.noreply.github.com" in email
-                else "",
+                "login": (
+                    email.split("@")[0].split("+")[-1]
+                    if "users.noreply.github.com" in email
+                    else ""
+                ),
                 "date": date,
                 "subject": subject,
                 "pr": pr.group(1) if pr else "",
@@ -64,28 +67,54 @@ def commits_since(since, until="HEAD"):
     return out
 
 
-def suspects(failing_tests, since):
-    sel = load_selector()
+TRITON_SRC = "aiter/ops/triton/"
+
+
+def dependency_sets(failing_tests):
+    """What each failing test depends on.
+
+    Uses the import graph from select_triton_tests.py when that script
+    exposes one. It does not on every branch, so fall back to the whole
+    Triton source tree: coarser ranking, but triage still runs.
+    """
+    needed = ("TESTS", "SRC", "list_files", "scan_imports", "reachable")
+    try:
+        sel = load_selector()
+        graph = all(hasattr(sel, n) for n in needed)
+    except Exception:  # noqa: BLE001 -- triage must survive a broken selector
+        graph = False
+    if not graph:
+        return {t: None for t in failing_tests}, False
+
     tests = sel.list_files(sel.TESTS, "test_*.py")
     sources = sel.list_files(sel.SRC, "*.py")
     imports = {f: sel.scan_imports(f) for f in sources + tests}
+    return (
+        {
+            t: (sel.reachable(t, imports) | {t} if t in imports else {t})
+            for t in failing_tests
+        },
+        True,
+    )
 
-    # Everything each failing test depends on, plus the test file itself.
-    blast = {}
-    for t in failing_tests:
-        blast[t] = sel.reachable(t, imports) | {t} if t in imports else {t}
+
+def suspects(failing_tests, since):
+    blast, precise = dependency_sets(failing_tests)
 
     ranked = []
     for c in commits_since(since):
         hits = {}
         for t, deps in blast.items():
-            overlap = sorted(set(c["files"]) & deps)
+            if deps is None:  # no import graph: fall back to the source tree
+                overlap = sorted(f for f in c["files"] if f.startswith(TRITON_SRC))
+            else:
+                overlap = sorted(set(c["files"]) & deps)
             if overlap:
                 hits[t] = overlap
         if hits:
             ranked.append({**c, "hits": hits, "score": len(hits)})
     ranked.sort(key=lambda c: (-c["score"], c["date"]))
-    return ranked
+    return ranked, precise
 
 
 def markdown(ranked, failing_tests, since, limit=5):
@@ -96,12 +125,16 @@ def markdown(ranked, failing_tests, since, limit=5):
             "look at the runner, the Triton pin or the image rather than aiter."
         )
         return "\n".join(lines)
-    lines.append(f"Suspect commits since `{since[:9]}` (ranked by overlap with the failing tests' dependencies):\n")
+    lines.append(
+        f"Suspect commits since `{since[:9]}` (ranked by overlap with the failing tests' dependencies):\n"
+    )
     lines.append("| commit | PR | author | touched |")
     lines.append("|---|---|---|---|")
     for c in ranked[:limit]:
         touched = sorted({f for fs in c["hits"].values() for f in fs})
-        shown = ", ".join(f"`{f}`" for f in touched[:3]) + (" …" if len(touched) > 3 else "")
+        shown = ", ".join(f"`{f}`" for f in touched[:3]) + (
+            " …" if len(touched) > 3 else ""
+        )
         pr = f"#{c['pr']}" if c["pr"] else "—"
         who = f"@{c['login']}" if c["login"] else c["author"]
         lines.append(f"| `{c['short']}` | {pr} | {who} | {shown} |")
@@ -111,23 +144,37 @@ def markdown(ranked, failing_tests, since, limit=5):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--since", required=True, help="last known-good SHA")
-    ap.add_argument("--tests", required=True, help="file with failing test paths, one per line")
+    ap.add_argument(
+        "--tests", required=True, help="file with failing test paths, one per line"
+    )
     ap.add_argument("--json-out", help="also write the ranked suspects as JSON")
     args = ap.parse_args()
 
-    failing = [l.strip() for l in Path(args.tests).read_text().splitlines() if l.strip()]
+    failing = [
+        l.strip() for l in Path(args.tests).read_text().splitlines() if l.strip()
+    ]
     if not failing:
         print("no failing tests given")
         return
     try:
-        ranked = suspects(failing, args.since)
+        ranked, precise = suspects(failing, args.since)
     except Exception as exc:  # noqa: BLE001 -- triage must never break the report
         print(f"suspect ranking failed: {exc}")
         return
-    print(markdown(ranked, failing, args.since))
+    note = (
+        ""
+        if precise
+        else (
+            "\n\n_Ranked by Triton source overlap only — the import graph was "
+            "unavailable on this branch, so this is coarser than usual._"
+        )
+    )
+    print(markdown(ranked, failing, args.since) + note)
     if args.json_out:
         Path(args.json_out).write_text(
-            json.dumps([{k: v for k, v in c.items() if k != "files"} for c in ranked], indent=1)
+            json.dumps(
+                [{k: v for k, v in c.items() if k != "files"} for c in ranked], indent=1
+            )
         )
 
 

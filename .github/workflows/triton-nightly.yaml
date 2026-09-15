@@ -132,7 +132,8 @@ jobs:
           docker exec -w /workspace triton_test mkdir -p test-reports
           run_shard () {
             docker exec -w /workspace triton_test \
-              pytest -v ${SHARD_TESTS} --junitxml=test-reports/triton.xml
+              pytest -v ${SHARD_TESTS} -o junit_family=xunit1 \
+                --junitxml=test-reports/triton.xml
           }
           STATUS=pass
           if ! run_shard; then
@@ -150,6 +151,19 @@ jobs:
           import xml.etree.ElementTree as ET
           status = sys.argv[1]
           failed = []
+          def case_path(case):
+              # xunit1 records `file`; xunit2 does not, so fall back to the
+              # dotted classname (dropping any trailing test-class name).
+              if case.get("file"):
+                  return case.get("file")
+              parts = (case.get("classname") or "").split(".")
+              while parts:
+                  candidate = "/".join(parts) + ".py"
+                  if os.path.exists(candidate):
+                      return candidate
+                  parts.pop()
+              return ""
+
           for path in ("test-reports/triton.xml",):
               try:
                   root = ET.parse(path).getroot()
@@ -157,7 +171,7 @@ jobs:
                   continue
               for case in root.iter("testcase"):
                   if case.find("failure") is not None or case.find("error") is not None:
-                      f = case.get("file") or ""
+                      f = case_path(case)
                       if f:
                           failed.append(f)
           json.dump(
@@ -192,8 +206,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       hard_failures: ${{ steps.aggregate.outputs.hard_failures }}
+      missing_shards: ${{ steps.aggregate.outputs.missing_shards }}
       last_green: ${{ steps.last_green.outputs.sha }}
       failing_tests: ${{ steps.aggregate.outputs.failing_tests }}
+      failing_mi350: ${{ steps.aggregate.outputs.failing_MI350 }}
+      failing_mi300x: ${{ steps.aggregate.outputs.failing_MI300X }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -206,19 +223,33 @@ jobs:
 
       - name: Aggregate shard results
         id: aggregate
+        env:
+          # Keep in sync with the `test` job matrix below.
+          EXPECTED_ARCHES: MI350 MI300X
+          SHARD_COUNT: '8'
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import glob, json
+          import glob, json, os
+          arches = os.environ["EXPECTED_ARCHES"].split()
+          shards = int(os.environ["SHARD_COUNT"])
           rows, failing = [], set()
+          per_arch = {a: set() for a in arches}
           for p in sorted(glob.glob("reports/**/status-*.json", recursive=True)):
               s = json.load(open(p))
               rows.append(s)
               if s["status"] == "fail":
                   failing.update(s["failed_tests"])
+                  per_arch.setdefault(s["arch"], set()).update(s["failed_tests"])
+          # A shard that died before writing its status file must not read as
+          # a pass: compare what reported against the full matrix.
+          expected = {(a, str(i)) for a in arches for i in range(shards)}
+          reported = {(r["arch"], str(r["shard"])) for r in rows}
+          missing = sorted(expected - reported)
           hard = [r for r in rows if r["status"] == "fail"]
           flaky = [r for r in rows if r["status"] == "flaky"]
-          if not rows:
-              overall = "🚨 **no shard results** — the test jobs did not report"
+          if missing:
+              names = ", ".join(f"{a} shard {s}" for a, s in missing)
+              overall = f"🚨 **{len(missing)} shard(s) never reported** — {names}"
           elif hard:
               overall = f"❌ **{len(hard)} shard(s) failed twice**"
           elif flaky:
@@ -232,12 +263,17 @@ jobs:
           print(f"hard_failures={len(hard)}")
           print(f"flaky={len(flaky)}")
           print(f"shards_reported={len(rows)}")
-          print(f"no_results={int(not rows)}")
+          print(f"missing_shards={len(missing)}")
+          for a in arches:
+              print(f"failing_{a}=" + " ".join(sorted(per_arch.get(a, ()))))
           print("failing_tests=" + " ".join(sorted(failing)))
           with open("summary.md", "w") as fh:
               fh.write(overall + "\n\n" + "\n".join(table) + "\n")
           with open("failing_tests.txt", "w") as fh:
               fh.write("\n".join(sorted(failing)) + "\n")
+          for a in arches:
+              with open(f"failing_tests_{a}.txt", "w") as fh:
+                  fh.write("\n".join(sorted(per_arch.get(a, ()))) + "\n")
           PY
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -308,24 +344,37 @@ jobs:
             }
 
       - name: Fail the workflow on hard failures
-        if: steps.aggregate.outputs.hard_failures != '0' || steps.aggregate.outputs.no_results == '1'
+        if: steps.aggregate.outputs.hard_failures != '0' || steps.aggregate.outputs.missing_shards != '0'
         run: |
-          echo "hard failures: ${{ steps.aggregate.outputs.hard_failures }}, shards reported: ${{ steps.aggregate.outputs.shards_reported }}"
+          echo "hard failures: ${{ steps.aggregate.outputs.hard_failures }}, missing shards: ${{ steps.aggregate.outputs.missing_shards }}"
           exit 1
 
   bisect:
-    name: Bisect the offending PR
+    name: Bisect ${{ matrix.arch }}
     needs: [ci_config, report]
     if: >-
       always() && needs.report.outputs.hard_failures != '0'
       && needs.report.outputs.last_green != ''
       && (github.event_name == 'schedule' || inputs.bisect)
-    runs-on: linux-aiter-mi35x-1
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: MI350
+            runner: linux-aiter-mi35x-1
+          - arch: MI300X
+            runner: linux-aiter-oci-mi300x-1
     env:
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
       LAST_GREEN: ${{ needs.report.outputs.last_green }}
-      FAILING_TESTS: ${{ needs.report.outputs.failing_tests }}
+      # Each architecture bisects only its own failures: an MI300X-only
+      # regression does not reproduce on MI350, so a merged list would walk
+      # the history finding nothing bad and blame the wrong PR.
+      FAILING_MI350: ${{ needs.report.outputs.failing_mi350 }}
+      FAILING_MI300X: ${{ needs.report.outputs.failing_mi300x }}
+      ARCH: ${{ matrix.arch }}
       MAX_COMMITS: ${{ inputs.max_bisect_commits || '80' }}
     steps:
       - uses: actions/checkout@v4
@@ -339,9 +388,16 @@ jobs:
           name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
           path: triton_wheels
 
-      - name: Check the bisect range
+      - name: Pick this architecture's failures and check the range
         id: range
         run: |
+          if [ "${ARCH}" = "MI350" ]; then TESTS="${FAILING_MI350}"; else TESTS="${FAILING_MI300X}"; fi
+          if [ -z "${TESTS// /}" ]; then
+            echo "No ${ARCH} failures to bisect."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "FAILING_TESTS=${TESTS}" >> "$GITHUB_ENV"
           COUNT=$(git rev-list --first-parent --count "${LAST_GREEN}..HEAD")
           echo "range=${COUNT}" >> "$GITHUB_OUTPUT"
           if [ "${COUNT}" -gt "${MAX_COMMITS}" ]; then
@@ -402,7 +458,7 @@ jobs:
             const login = commit.data.author?.login;
             const pr = subject.match(/#(\d+)/);
             const body = [
-              `**Bisect result:** \`${sha.slice(0, 9)}\` is the first bad commit.`,
+              `**Bisect result (${process.env.ARCH}):** \`${sha.slice(0, 9)}\` is the first bad commit.`,
               '',
               `> ${subject}`,
               '',
