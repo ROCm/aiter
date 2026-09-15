@@ -527,13 +527,32 @@ def gen_gemm_a4w4_blockscale_fake_tensors(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     splitK: int = 0,
-) -> torch.Tensor:
-    return Out
+) -> None:
+    return None
 
 
+# The C++ side of both ops is torch-free: it takes pybind aiter_tensor_t and
+# writes into Out in place.  `develop=True` makes core.py convert every
+# torch.Tensor argument via torch_to_aiter_pybind() and push the current stream
+# through _set_current_hip_stream() before the call.  The public wrappers below
+# return Out so callers still get a torch.Tensor.
 @compile_ops(
-    "module_gemm_a4w4_blockscale", gen_fake=gen_gemm_a4w4_blockscale_fake_tensors
+    "module_gemm_a4w4_blockscale",
+    fc_name="gemm_a4w4_blockscale",
+    gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
+    develop=True,
 )
+def _gemm_a4w4_blockscale(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    splitK: int = 0,
+    kernelName: str = "",
+) -> None: ...
+
+
 def gemm_a4w4_blockscale(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -542,14 +561,28 @@ def gemm_a4w4_blockscale(
     Out: torch.Tensor,
     splitK: int = 0,
     kernelName: str = "",
-) -> Tensor: ...
+) -> Tensor:
+    _gemm_a4w4_blockscale(XQ, WQ, x_scale, w_scale, Out, splitK, kernelName)
+    return Out
 
 
 @compile_ops(
     "module_gemm_a4w4_blockscale_tune",
     fc_name="gemm_a4w4_blockscale_tune",
     gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
+    develop=True,
 )
+def _gemm_a4w4_blockscale_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int,
+    splitK: int = 0,
+) -> None: ...
+
+
 def gemm_a4w4_blockscale_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -558,4 +591,6 @@ def gemm_a4w4_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int,
     splitK: int = 0,
-) -> Tensor: ...
+) -> Tensor:
+    _gemm_a4w4_blockscale_tune(XQ, WQ, x_scale, w_scale, Out, kernelId, splitK)
+    return Out
