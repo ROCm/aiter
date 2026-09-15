@@ -1273,7 +1273,13 @@ def get_mla_metadata_info_v1(
     # forbids. With cudagraph batch_size >> cu_num that product collapsed to
     # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
     # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
-    if max_split_per_batch > 0:
+    # Only for fast_mode. fast_mode=False dispatches to get_mla_metadata_v1_1
+    # (csrc/kernels/mla/metadata.cu:148), whose device entry point takes no
+    # max_split_per_batch at all -- compare get_mla_metadata_v1_0_device just
+    # above it, which does. That planner is therefore uncapped, and reducing the
+    # size for it would undersize reduce_partial_map, which faults the GPU
+    # rather than raising.
+    if fast_mode and max_split_per_batch > 0:
         per_tile_cap = min(max_splits, max_split_per_batch * batch_size)
         # Take the min. `tile_cnt + per_tile_cap` is the cap-aware bound; the
         # fast_mode estimate above assumes an unbounded per-batch split budget,

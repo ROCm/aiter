@@ -37,7 +37,7 @@ MAX_SEQLEN_QO = 4
 _LARGE_BATCH = 512
 
 
-def _reduce_partial_map_size(batch_size, max_split_per_batch):
+def _reduce_partial_map_size(batch_size, max_split_per_batch, fast_mode=True):
     """Element count of the reduce_partial_map buffer, the one that dominates.
 
     aiter's mla_decode_fwd sizes its fp32 `logits` from this, so it is what
@@ -50,7 +50,7 @@ def _reduce_partial_map_size(batch_size, max_split_per_batch):
         dtypes.fp8,
         dtypes.fp8,
         is_sparse=False,
-        fast_mode=True,
+        fast_mode=fast_mode,
         max_split_per_batch=max_split_per_batch,
     )
     # (work_meta_data, work_indptr, work_info_set, reduce_indptr,
@@ -122,3 +122,22 @@ def test_no_cap_is_unchanged():
     """max_split_per_batch <= 0 means 'no cap' and must not enter the branch,
     so the sizing has to match the historical value exactly."""
     assert _reduce_partial_map_size(64, -1) == _reduce_partial_map_size(64, 0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 64])
+def test_non_fast_mode_ignores_the_cap(batch_size):
+    """fast_mode=False must be byte-identical with and without a cap.
+
+    That path dispatches to get_mla_metadata_v1_1 (csrc/kernels/mla/metadata.cu),
+    whose device entry point takes no max_split_per_batch -- compare
+    get_mla_metadata_v1_0_device directly above it, which does. The planner is
+    therefore uncapped there, and shrinking the sizing would undersize
+    reduce_partial_map, which faults the GPU rather than raising.
+    """
+    uncapped = _reduce_partial_map_size(batch_size, -1, fast_mode=False)
+    for cap in (1, 4, 256):
+        assert _reduce_partial_map_size(batch_size, cap, fast_mode=False) == uncapped, (
+            f"batch_size={batch_size} cap={cap}: the cap changed the non-fast_mode "
+            f"sizing, but get_mla_metadata_v1_1 does not honour a cap -- this "
+            f"undersizes reduce_partial_map and faults the GPU"
+        )
