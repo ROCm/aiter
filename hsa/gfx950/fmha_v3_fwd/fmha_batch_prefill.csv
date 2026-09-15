@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Assembly batch-prefill kernels with a statically compiled KV-cache page size.
+// page_size is deliberately absent from the dense fmha_fwd.csv schema: the
+// generic HSA manifest generator supplies 0 for configurations where it is not
+// applicable.
+// min_seqlen_q/max_seqlen_q are inclusive; 0 means unbounded. The FP8 bounds
+// select the measured QT64/QT256 crossover independently for each mask mode.
+// qtiles_per_workgroup describes the compiled schedule: 1 for full-grid,
+// 2 for paired causal tiles. Causal QT64 uses full-grid through Q=1024.
+dtype,hdim_q,hdim_v,mask,page_size,kv_layout,lookup_table,qscale,min_seqlen_q,max_seqlen_q,ts_qo,bdx,qtiles_per_workgroup,abi,grid_layout,knl_name,co_name
+bf16,128,128,2,64,linear,sglang,no,0,0,256,512,2,paged_varlen_v3_reuse,heads_batch_qtiles,bf16_fmha_prefill_gfx950_hd128_ps64_causal_group,fwd_hd128_bf16_causal_paged_varlen.co
+fp8bf16,256,256,0,64,linear,sglang,pertensor,0,2048,64,256,1,paged_varlen_v3_ext,qtiles_heads_batch,_ZN5aiter43fmha_fwd_hd256_fp8_qt64_paged_varlen_gfx950E,fwd_hd256_fp8_qt64_paged_varlen.co
+fp8bf16,256,256,2,64,linear,sglang,pertensor,0,1024,64,256,1,paged_varlen_v3_ext,qtiles_heads_batch,fmha_fwd_hd256_fp8_causal_qt64_fullgrid_paged_varlen_gfx950,fwd_hd256_fp8_causal_qt64_fullgrid_paged_varlen.co
+fp8bf16,256,256,2,64,linear,sglang,pertensor,1025,4096,64,256,2,paged_varlen_v3_ext,qtiles_heads_batch,_ZN5aiter50fmha_fwd_hd256_fp8_causal_qt64_paged_varlen_gfx950E,fwd_hd256_fp8_causal_qt64_paged_varlen.co
+fp8bf16,256,256,0,64,linear,sglang,pertensor,2049,0,256,512,1,paged_varlen_v3_ext,qtiles_heads_batch,_ZN5aiter38fmha_fwd_hd256_fp8_paged_varlen_gfx950E,fwd_hd256_fp8_paged_varlen.co
+fp8bf16,256,256,2,64,linear,sglang,pertensor,4097,0,256,512,2,paged_varlen_v3_ext,qtiles_heads_batch,_ZN5aiter45fmha_fwd_hd256_fp8_causal_paged_varlen_gfx950E,fwd_hd256_fp8_causal_paged_varlen.co
