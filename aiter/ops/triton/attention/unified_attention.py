@@ -125,16 +125,7 @@ class _UAParams(NamedTuple):
 
 
 def _gfx950_gluon_supported(params: _UAParams):
-    """Shapes the gfx950 Gluon kernel covers.
-
-    bf16 or fp8 for both q and the KV cache, a power-of-2 head size up to 256
-    that k and v share, and neither qq_bias nor alibi. One predicate
-    for all three gates: the arch ships a single kernel, so the 2d and 3d paths
-    accept exactly the same shapes.
-    """
-    # A pre-shuffled cache is fine at any tile size -- the gather loader indexes
-    # the block table per token -- but V's shuffle groups W tokens, so a group
-    # must not straddle pages.
+    """GFX950 Gluon supported configs."""
     if params.shuffled_kv_cache and (
         params.block_size & (params.block_size - 1)
         or params.block_size < params.k_width
@@ -355,10 +346,6 @@ def unified_attention(
         else:
             _unified_attention_2d_triton(params)
     else:
-        # NUM_SEGMENTS and TILE_SIZE go to whichever 3d kernel actually runs, so
-        # they have to come from that kernel's table: a gluon request whose arch
-        # gate declines still lands on the Triton kernel, and the two backends'
-        # tables are not interchangeable.
         use_gluon_3d = is_3d_gluon_available(params, backend)
         config = get_unified_attention_config(
             "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
@@ -991,11 +978,7 @@ def _unified_attention_gfx950(
 
     The W run has to sit on each dot's reduction axis,
     so K groups head_size and V groups tokens. The triton backend reads the same
-    layout off the cache shape, so one shuffled cache serves both.
-
-    Page size 64 is the best default on both the plain and the pre-shuffled path,
-    and it matches the tuned tile so the loader takes its one-page fast path.
-    head_size 256 is the most sensitive to getting it wrong.
+    layout off the cache shape.
     """
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
