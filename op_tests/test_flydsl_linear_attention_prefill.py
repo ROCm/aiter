@@ -802,10 +802,11 @@ def test_chunk_gdn_prefill_h(
                         msg=f"{name}: K5 final_state",
                     ),
                 )
-            ret[f"{name} us"] = us
-            ret[f"{name} TFLOPS"] = flops / us / 1e6
-            ret[f"{name} TB/s"] = nbytes / us / 1e6
-            ret[f"{name} err"] = err
+            ret_name = name if wu_hm else f"{name} token-major"
+            ret[f"{ret_name} us"] = us
+            ret[f"{ret_name} TFLOPS"] = flops / us / 1e6
+            ret[f"{ret_name} TB/s"] = nbytes / us / 1e6
+            ret[f"{ret_name} err"] = err
 
     return ret
 
