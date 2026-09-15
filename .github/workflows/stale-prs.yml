@@ -31,8 +31,6 @@ jobs:
           stale-pr-label: stale
           exempt-pr-labels: 'keep-open,blocked,do-not-close,dependencies'
           exempt-draft-pr: true
-          # Oldest first, with enough API operations per run to work through
-          # the existing backlog instead of the default 30 per day.
           ascending: true
           operations-per-run: 300
           # Branch deletion is handled by stale-branches.yml, which knows
