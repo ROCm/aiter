@@ -491,9 +491,9 @@ def flydsl_gdr_decode(
     if gate_mode == "kda":
         # `a` keeps its strides and is vector-loaded along D_k, so that axis
         # must be dense. dt_bias is copied contiguous below, so it is free.
-        assert a.stride(-1) == 1, (
-            f"`a` must be dense along D_k, got stride {a.stride(-1)}"
-        )
+        assert (
+            a.stride(-1) == 1
+        ), f"`a` must be dense along D_k, got stride {a.stride(-1)}"
 
     # Staging copies share `stream` with the launch, so it is ordered against
     # them. Inputs produced elsewhere are the caller's to order.
