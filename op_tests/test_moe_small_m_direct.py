@@ -8,10 +8,9 @@ import aiter
 from aiter import dtypes
 from aiter.fused_moe import fused_moe, torch_moe
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose
-
 
 pytestmark = pytest.mark.skipif(
     get_gfx() != "gfx1201",
@@ -40,15 +39,11 @@ def test_bf16_g1u1_small_m_direct(token, inter_dim, preshuffle_w1, preshuffle_w2
     expert = 256
     topk = 8
 
-    hidden_states = torch.randn(
-        (token, model_dim), dtype=dtypes.bf16, device="cuda"
-    )
+    hidden_states = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
     w1 = torch.randn(
         (expert, inter_dim * 2, model_dim), dtype=dtypes.bf16, device="cuda"
     )
-    w2 = torch.randn(
-        (expert, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda"
-    )
+    w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda")
     topk_ids, topk_weights = _make_balanced_topk(token, topk, expert)
     w1_input = shuffle_weight(w1, layout=(16, 16)) if preshuffle_w1 else w1
     w2_input = shuffle_weight(w2, layout=(16, 16)) if preshuffle_w2 else w2
