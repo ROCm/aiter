@@ -24,7 +24,7 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     DualwaveFp8KernelContext,
     _make_paged_dualwave_swp_fp8_traits,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 
 def _query_bound_is_safe(ctx, upper_bound, maximum):
@@ -672,7 +672,7 @@ def build_flash_attn_paged_fp8_module(
             seq_len_kv = seq_len
         _validate_paged_bn128_launch(seq_len_kv, block_table_stride)
         _validate_batch_interleave_launch(batch_size)
-        dispatch = flyc.compile if _compile_only else _run_compiled
+        dispatch = _preload_compiled if _compile_only else _run_compiled
         return dispatch(
             launch_flash_attn_dualwave_swp,
             Q,

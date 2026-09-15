@@ -821,17 +821,25 @@ def test_d128_query_bound_preserves_rescaling(mode, csr):
 def test_explicit_compile_then_launch(monkeypatch, page, layout, d, dv, csr):
     case = make_case(page, layout, d, dv, qlens=(65, 17), klens=(128, 97))
     original = paged._build
-    compiled = []
+    original.cache_clear()
+    compile_results = []
 
     def build(**kwargs):
         launcher = original(**kwargs)
 
         def run(*args, **options):
-            compiled.append(launcher.compile(*args, **options))
+            before = case.out.view(torch.uint8).clone()
+            compile_results.append(launcher.compile(*args, **options))
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                case.out.view(torch.uint8), before, rtol=0, atol=0
+            )
             return launcher(*args, **options)
 
         return run
 
     monkeypatch.setattr(paged, "_build", build)
-    check_case(case, **(csr_metadata(case, prefix=1) if csr else {}))
-    assert len(compiled) == 1 and compiled[0] is not None
+    for _ in range(2):  # Cold preload, then preload after a real launch.
+        case.out.fill_(123)
+        check_case(case, **(csr_metadata(case, prefix=1) if csr else {}))
+    assert len(compile_results) == 2  # Older no-dispatch runtimes return None.
