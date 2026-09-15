@@ -1,0 +1,320 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Where fusing the RMSNorm pays, and where the FlyDSL kernels beat aiter's.
+
+Two questions, one sweep:
+
+1. **Is fusing beneficial?** Every fused kernel against its *own* two-launch
+   baseline -- the same all-reduce followed by ``rmsnorm2d_fwd_with_add``. Pairing
+   each kernel with itself is what isolates the fusion from the schedule: a
+   fused mesh beating a separate ring says nothing about fusion.
+2. **Do the new FlyDSL fused kernels beat the ones aiter ships?** Best
+   FlyDSL-fused against best aiter-fused, per shape, with the accuracy each
+   one bought.
+
+This drives ``bench_comm_allreduce.py`` once per (TP, hidden) and reduces the
+per-run CSVs; it measures nothing itself, so the numbers are exactly what the
+bench reports and the commands it ran are printed for reproduction.
+
+Why one invocation per (TP, hidden) rather than one big one: each writes its own
+CSV, so a failure at TP8 does not lose TP2's data and a subset can be re-run
+without redoing the sweep.
+
+Two knobs matter more than the rest:
+
+``--timing`` The bench's default, ``graph``, times a captured replay -- launch
+    overhead removed from *both* sides. That is the metric a graph-capturing
+    deployment sees, and it understates fusion by exactly the launch and device
+    sync that fusing removes. At decode sizes, where a kernel is ~10 us and a
+    launch is a few, run ``eager`` as well; ``--timing both`` does both passes.
+
+``--fly1s-max-kb`` ``OneShotAllReduce`` is gated above by a *policy* ceiling
+    (wire volume is ``(N-1)x`` the message), not a correctness limit. Left
+    alone, its rows are ``n/a`` over most of this sweep and the decode
+    comparison comes back empty. The default here lifts it past the largest
+    shape so the curve is visible all the way to where it stops winning.
+
+Usage::
+
+    # the whole sweep, ~30-45 min on 8 GPUs with a warm JIT cache
+    python op_tests/multigpu_tests/sweep_fused_allreduce.py --outdir sweep_out
+
+    # just print what it would run
+    python op_tests/multigpu_tests/sweep_fused_allreduce.py --dry-run
+
+    # re-reduce CSVs from an earlier run
+    python op_tests/multigpu_tests/sweep_fused_allreduce.py --outdir sweep_out \
+        --analyze-only
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+
+_HERE = Path(__file__).resolve().parent
+_BENCH = _HERE / "bench_comm_allreduce.py"
+
+# Decode through prefill. The gap between 128 and 512 is deliberate: nothing
+# dispatches there, and the crossover this sweep is looking for sits inside it.
+DEFAULT_M = (8, 16, 32, 64, 128, 512, 1024, 2048, 4096, 8192)
+
+# 4096: every candidate applies, so the field is complete and comparable.
+# 7168: DeepSeek-V3/V4's width. aiter's fused quick-reduce is *not* applicable
+#       there -- a 14336 B row does not tile a 32 KiB QR tile -- so this column
+#       is where the FlyDSL two-shot kernels are the only quantized fused
+#       option at all, which is a result in itself.
+DEFAULT_HIDDEN = (4096, 7168)
+DEFAULT_TP = (2, 4, 8)
+
+# Payload ceiling for the one-shot rows, in KiB. 128 MiB clears the largest
+# shape here (8192 x 8192 bf16 = 128 MiB).
+DEFAULT_FLY1S_MAX_KB = 131072
+
+#: ``family -> (fused kernel, its own two-launch baseline)``.
+#:
+#: ``separate_cdr`` serves both cdr rows: it is ``cross_device_reduce`` plus a
+#: standalone norm, which is the unfused form of either fused schedule.
+FUSION_PAIRS = {
+    "cdr_1stage": ("fused_cdr_1stage", "separate_cdr"),
+    "cdr_2stage": ("fused_cdr_2stage", "separate_cdr"),
+    "qr_int4": ("fused_qr_int4", "separate_qr_int4"),
+    "fly_1stage": ("fused_fly_1stage", "separate_fly1s"),
+    "fly_ring": ("fused_fly_ring", "separate_flyring"),
+    "fly_mesh": ("fused_fly_mesh", "separate_flymesh"),
+}
+
+FLYDSL_FUSED = ("fused_fly_1stage", "fused_fly_ring", "fused_fly_mesh")
+AITER_FUSED = ("fused_cdr_1stage", "fused_cdr_2stage", "fused_qr_int4", "fused_qr_fp8")
+
+CANDIDATES = sorted(
+    {c for pair in FUSION_PAIRS.values() for c in pair}
+    | set(FLYDSL_FUSED)
+    | set(AITER_FUSED)
+    | {"separate_rccl"}  # library reference, free to carry
+)
+
+
+def _commands(args) -> list[tuple[tuple, list[str], Path]]:
+    """``[((tp, hidden, timing), argv, csv_path)]`` for the whole sweep."""
+    out = []
+    timings = ("graph", "eager") if args.timing == "both" else (args.timing,)
+    for timing in timings:
+        for tp in args.tp:
+            for hidden in args.hidden:
+                csv = Path(args.outdir) / f"fused_tp{tp}_k{hidden}_{timing}.csv"
+                argv = [
+                    sys.executable,
+                    str(_BENCH),
+                    "-tp",
+                    str(tp),
+                    "--fusion",
+                    "ar_rmsnorm",
+                    "--timing",
+                    timing,
+                    "--iters",
+                    str(args.iters),
+                    "-s",
+                    *[f"{m},{hidden}" for m in args.m],
+                    "-c",
+                    *CANDIDATES,
+                    "--output-csv",
+                    str(csv),
+                ]
+                out.append(((tp, hidden, timing), argv, csv))
+    return out
+
+
+def _run(args) -> None:
+    env = dict(os.environ)
+    # Lift the one-shot's policy ceiling; see the module docstring.
+    env["AITER_BENCH_FLY1S_MAX_KB"] = str(args.fly1s_max_kb)
+    Path(args.outdir).mkdir(parents=True, exist_ok=True)
+    for key, argv, csv in _commands(args):
+        print(f"\n=== TP{key[0]} hidden={key[1]} timing={key[2]} -> {csv}", flush=True)
+        print("    " + " ".join(argv), flush=True)
+        if args.dry_run:
+            continue
+        t0 = time.time()
+        proc = subprocess.run(argv, env=env, check=False)
+        dt = time.time() - t0
+        status = "ok" if proc.returncode == 0 else f"FAILED rc={proc.returncode}"
+        print(f"=== {status} in {dt / 60:.1f} min", flush=True)
+        if proc.returncode != 0 and not args.keep_going:
+            raise SystemExit(proc.returncode)
+
+
+def _load(outdir: Path) -> pd.DataFrame:
+    frames = []
+    for csv in sorted(outdir.glob("fused_tp*_k*_*.csv")):
+        df = pd.read_csv(csv)
+        df["timing"] = csv.stem.rsplit("_", 1)[-1]
+        frames.append(df)
+    if not frames:
+        raise SystemExit(f"no sweep CSVs in {outdir}")
+    return pd.concat(frames, ignore_index=True)
+
+
+def _fusion_table(df: pd.DataFrame, min_gain: float) -> pd.DataFrame:
+    """Speedup of each fused kernel over its own two-launch baseline.
+
+    ``> 1`` means fusing won. ``NaN`` means one of the pair was not applicable
+    at that shape, which is itself informative -- an ``n/a`` in the fly_ring
+    column at hidden=2560 is the row-sized block's width constraint, and one in
+    qr_int4 at 7168 is the QR tile's.
+    """
+    rows = []
+    for _, r in df.iterrows():
+        row = {
+            "timing": r["timing"],
+            "TP": r["TP"],
+            "K": r["K"],
+            "M": r["M"],
+            "KiB": r["payload size (KiB)"],
+        }
+        for name, (fused, sep) in FUSION_PAIRS.items():
+            f, s = r.get(f"{fused} us"), r.get(f"{sep} us")
+            row[name] = (
+                (s / f) if (pd.notna(f) and pd.notna(s) and f > 0) else float("nan")
+            )
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    out.attrs["min_gain"] = min_gain
+    return out
+
+
+def _winner_table(df: pd.DataFrame, min_sqnr: float | None) -> pd.DataFrame:
+    """Best FlyDSL-fused against best aiter-fused, per shape.
+
+    Ranked on time alone unless ``--min-sqnr`` is given: the quantized
+    candidates buy their speed with accuracy, so a table that ranks a 15 dB
+    kernel above a 40 dB one without saying so is a trap. Both winners carry
+    their own dB for exactly that reason.
+    """
+
+    def _best(r, cands):
+        best, best_us, best_db = None, float("inf"), float("nan")
+        for c in cands:
+            us, db = r.get(f"{c} us"), r.get(f"{c} SQNR dB")
+            if pd.isna(us):
+                continue
+            if min_sqnr is not None and (pd.isna(db) or db < min_sqnr):
+                continue
+            if us < best_us:
+                best, best_us, best_db = c, us, db
+        return best, best_us, best_db
+
+    rows = []
+    for _, r in df.iterrows():
+        fly, fly_us, fly_db = _best(r, FLYDSL_FUSED)
+        ait, ait_us, ait_db = _best(r, AITER_FUSED)
+        rows.append(
+            {
+                "timing": r["timing"],
+                "TP": r["TP"],
+                "K": r["K"],
+                "M": r["M"],
+                "KiB": r["payload size (KiB)"],
+                "flydsl": fly,
+                "flydsl us": fly_us if fly else float("nan"),
+                "flydsl dB": fly_db,
+                "aiter": ait,
+                "aiter us": ait_us if ait else float("nan"),
+                "aiter dB": ait_db,
+                "speedup": (ait_us / fly_us)
+                if (fly and ait and fly_us > 0)
+                else float("nan"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _analyze(args) -> None:
+    df = _load(Path(args.outdir))
+    sort = ["timing", "TP", "K", "M"]
+
+    fusion = _fusion_table(df, args.min_gain).sort_values(sort)
+    winner = _winner_table(df, args.min_sqnr).sort_values(sort)
+
+    print("\n## Is fusing beneficial? (separate us / fused us; > 1.00 = fuse)\n")
+    print(fusion.to_markdown(index=False, floatfmt=".2f"))
+
+    print("\n## FlyDSL fused vs aiter fused (speedup > 1.00 = FlyDSL wins)\n")
+    print(winner.to_markdown(index=False, floatfmt=".2f"))
+
+    combined = Path(args.outdir) / "summary.csv"
+    fusion.to_csv(combined.with_name("fusion_benefit.csv"), index=False)
+    winner.to_csv(combined.with_name("flydsl_vs_aiter.csv"), index=False)
+    print(f"\nwrote {combined.with_name('fusion_benefit.csv')}")
+    print(f"wrote {combined.with_name('flydsl_vs_aiter.csv')}")
+
+    # The one-line answers, so the tables do not have to be read to get them.
+    wins = fusion.melt(
+        id_vars=["timing", "TP", "K", "M", "KiB"], var_name="family", value_name="gain"
+    ).dropna()
+    print("\n## Where each fusion pays\n")
+    for family, grp in wins.groupby("family"):
+        good = grp[grp["gain"] >= args.min_gain]
+        if good.empty:
+            print(
+                f"- `{family}`: never, across {len(grp)} shape(s) "
+                f"(best {grp['gain'].max():.2f}x)"
+            )
+            continue
+        lo, hi = good["KiB"].min(), good["KiB"].max()
+        print(
+            f"- `{family}`: {len(good)}/{len(grp)} shape(s), "
+            f"{lo:.0f}-{hi:.0f} KiB, up to {good['gain'].max():.2f}x"
+        )
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--tp", type=int, nargs="+", default=list(DEFAULT_TP))
+    p.add_argument("--hidden", type=int, nargs="+", default=list(DEFAULT_HIDDEN))
+    p.add_argument("--m", type=int, nargs="+", default=list(DEFAULT_M))
+    p.add_argument("--outdir", default="sweep_fused_allreduce")
+    p.add_argument("--timing", choices=("graph", "eager", "both"), default="graph")
+    p.add_argument("--iters", type=int, default=101)
+    p.add_argument(
+        "--fly1s-max-kb",
+        type=int,
+        default=DEFAULT_FLY1S_MAX_KB,
+        help="lift OneShotAllReduce's policy ceiling for the sweep (KiB)",
+    )
+    p.add_argument(
+        "--min-gain",
+        type=float,
+        default=1.02,
+        help="speedup a fusion must reach to count as beneficial (default 1.02, "
+        "i.e. 2%% -- inside that the bench's own spread is the same size)",
+    )
+    p.add_argument(
+        "--min-sqnr",
+        type=float,
+        default=None,
+        help="exclude candidates below this SQNR from the winner table, e.g. 40 "
+        "for exact-only. Default: rank on time and report each winner's dB.",
+    )
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--analyze-only", action="store_true")
+    p.add_argument("--keep-going", action="store_true")
+    args = p.parse_args()
+
+    if not args.analyze_only:
+        _run(args)
+    if not args.dry_run:
+        _analyze(args)
+
+
+if __name__ == "__main__":
+    main()

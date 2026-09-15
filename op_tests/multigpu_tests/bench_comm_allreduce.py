@@ -53,9 +53,22 @@ question instead: all-reduce + residual add + RMSNorm.
 | ``fused_cdr_1stage``  | ``allreduce_fusion_kernel_1stage`` -- the traced kernel | yes |
 | ``fused_cdr_2stage``  | ``allreduce_fusion_kernel_2stage``      | yes |
 | ``fused_qr_fp8``/``_int4`` | ``qr_all_reduce_rmsnorm`` per codec | yes |
+| ``fused_fly_ring``    | FlyDSL quantized **ring** with the epilogue fused | yes |
+| ``fused_fly_mesh``    | same, mesh schedule                     | yes |
 | ``separate_cdr``      | ``cross_device_reduce`` + ``rmsnorm2d_fwd_with_add`` | no |
 | ``separate_rccl``     | ``dist.all_reduce`` + ditto             | no |
 | ``separate_fly1s``    | plain FlyDSL one-shot + ditto           | no |
+| ``separate_flyring``  | plain FlyDSL ring + ditto               | no |
+| ``separate_flymesh``  | plain FlyDSL mesh + ditto               | no |
+| ``separate_qr_int4``  | ``quick_all_reduce`` + ditto            | no |
+
+``fused_fly_ring`` against ``separate_flyring`` is the pair this fusion exists
+for: the same schedule, one launch and ``4S`` of HBM traffic against two and
+``6S``. It is a prefill row -- the quantized schedules are gated below by
+accuracy, and the ring is where the two-shot family wins at size. Its block is
+sized to the token row (``hidden/8`` threads), so it runs at widths that are a
+multiple of 1024 up to 8192 and reports ``n/a`` elsewhere, where
+``fused_qr_*`` needs the row to tile a 32 KiB tile evenly instead.
 
 The prefix describes the **kernel**, not the mode: ``fused_`` only where the
 kernel genuinely fuses, ``separate_`` for the two-launch baselines. Both run
@@ -298,6 +311,9 @@ try:
     from aiter.ops.flydsl.kernels.one_shot_allreduce import (
         fused_hidden_supported as _fused_hidden_supported,
     )
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_hidden_supported as _flyqr_hidden_supported,
+    )
     from aiter.ops.flydsl.one_shot_allreduce import (
         OneShotAllReduce,
         OneShotAllReduceRMSNorm,
@@ -308,6 +324,7 @@ try:
     from aiter.ops.flydsl.quick_allreduce_int4 import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
+        QuickAllReduceInt4RMSNorm,
         _resolve_codecs,
         has_xgmi_peer_links,
     )
@@ -315,9 +332,11 @@ try:
     HAS_FLY_INT4 = True
 except Exception:  # noqa: BLE001
     QuickAllReduceInt4 = None
+    QuickAllReduceInt4RMSNorm = None
     OneShotAllReduce = None
     OneShotAllReduceRMSNorm = None
     _fused_hidden_supported = None
+    _flyqr_hidden_supported = None
     MIN_PAYLOAD_BYTES = 0
     _fly1s_max_bytes = None
     ALGORITHMS = {}
@@ -449,6 +468,24 @@ class Candidate:
     def fly1s_cfg(self) -> tuple:
         """Identity of the OneShotAllReduce engine this candidate needs."""
         return (self.atoms, self.grid_cap, self.fanout)
+
+    @property
+    def flyqr_rms_cfg(self) -> tuple:
+        """Identity of the QuickAllReduceInt4RMSNorm engine this candidate needs.
+
+        Same shape as ``fly_cfg`` and, like ``fly1s_rms_cfg``, deliberately not
+        keyed on hidden: one object serves every width, building a per-hidden
+        inbox on demand. The fused geometry *is* a function of hidden -- the
+        block is sized to the row -- so keying here would build one engine per
+        (config, shape) in a sweep and exhaust the IPC heap.
+        """
+        return (
+            self.algorithm,
+            self.super_tile,
+            self.grid_cap,
+            self.rs_codec,
+            self.ag_codec,
+        )
 
     @property
     def fly1s_rms_cfg(self) -> tuple:
@@ -667,9 +704,57 @@ CANDIDATES = (
     # Two-launch baselines. `separate_fly1s` is the one that isolates what the
     # fusion itself buys: same all-reduce as `fused_fly_1stage`, same arch,
     # differing only in whether the norm is fused.
+    # Quantized fused rows: the two-shot schedules with the epilogue fused.
+    # Graded at the plain fly_int4 floor -- the epilogue adds no error of its
+    # own, the wire is what costs SQNR -- and `exact=False` for the same reason.
+    #
+    # The ring is the one this fusion was built for: it is the schedule that
+    # wins at prefill, which is where the norm's extra HBM pass is worth
+    # removing. The mesh row is the control, and the width at which it starts
+    # paying for the row-sized block in LDS is one thing this sweep is for.
+    Candidate(
+        "fused_fly_ring", "fused_flyqr", 15.0, False, fusion=True, algorithm="ring"
+    ),
+    Candidate(
+        "fused_fly_mesh", "fused_flyqr", 15.0, False, fusion=True, algorithm="mesh"
+    ),
     Candidate("separate_cdr", "separate", 40.0, True, fusion=True, sep_ar="cdr"),
     Candidate("separate_rccl", "separate", 40.0, True, fusion=True, sep_ar="rccl"),
+    # The incumbent quick-reduce's own two-launch baseline, so "does fusing
+    # pay?" is answerable for the kernel we ship as well as for the new ones.
+    Candidate(
+        "separate_qr_int4",
+        "separate",
+        14.0,
+        False,
+        fusion=True,
+        sep_ar="qr",
+        quant="INT4",
+    ),
     Candidate("separate_fly1s", "separate", 40.0, True, fusion=True, sep_ar="fly1s"),
+    # The pair that makes `fused_fly_ring` mean something: the same schedule,
+    # two launches (all-reduce, then aiter's rmsnorm2d_fwd_with_add) against
+    # one. 6S of HBM traffic against 4S, plus the launch.
+    Candidate(
+        "separate_flyring",
+        "separate",
+        15.0,
+        False,
+        fusion=True,
+        sep_ar="flyring",
+        algorithm="ring",
+    ),
+    # Same for the mesh, so each schedule is compared against itself rather
+    # than against the other one's two-launch baseline.
+    Candidate(
+        "separate_flymesh",
+        "separate",
+        15.0,
+        False,
+        fusion=True,
+        sep_ar="flyring",
+        algorithm="mesh",
+    ),
 )
 CANDIDATE_KEYS = [c.key for c in CANDIDATES]
 PRIMARY = "cdr"  # the kernel we ship, and the default baseline
@@ -764,6 +849,19 @@ def applicable(
             return False
         row = hidden * (2 if dtype != dtypes.fp32 else 4)
         return row <= 32768 and 32768 % row == 0
+    if cand.family == "fused_flyqr":
+        # Gated on the fused geometry rather than on a payload floor: the block
+        # is hidden/8 threads, so only widths that land on the 64 B sector grid
+        # can build at all. The engines here disable the size floor, as the
+        # plain fly rows do.
+        return (
+            HAS_FLY_INT4
+            and get_gfx() in _FLY_ARCHS
+            and world_size in _FLY_WORLDS
+            and dtype == dtypes.bf16
+            and hidden is not None
+            and _flyqr_hidden_supported(hidden, world_size)
+        )
     if cand.family == "fused_fly1s":
         return (
             HAS_FLY_INT4
@@ -779,6 +877,15 @@ def applicable(
             return True
         if cand.sep_ar == "cdr":
             return dtype in (dtypes.fp16, dtypes.bf16)
+        if cand.sep_ar == "qr":
+            return world_size in _QR_WORLDS and dtype in _QR_DTYPES
+        if cand.sep_ar == "flyring":
+            return (
+                HAS_FLY_INT4
+                and get_gfx() in _FLY_ARCHS
+                and world_size in _FLY_WORLDS
+                and dtype == dtypes.bf16
+            )
         return (
             HAS_FLY_INT4
             and get_gfx() in _FLY_ARCHS
@@ -1076,7 +1183,15 @@ def production_fused_path(ca_comm, qr_comm, x, weight, world_size: int, prod_reg
 
 
 def _variant_of(
-    cand: Candidate, fly, fly1s, flyauto, nbytes: int, *, fly1s_rms=None, hidden=None
+    cand: Candidate,
+    fly,
+    fly1s,
+    flyauto,
+    nbytes: int,
+    *,
+    fly1s_rms=None,
+    flyqr_rms=None,
+    hidden=None,
 ) -> str | None:
     """The kernel *cand* would actually run at *nbytes*, or None.
 
@@ -1090,8 +1205,18 @@ def _variant_of(
         # the tile is one token row, so the width is baked into the symbol.
         eng = (fly1s_rms or {}).get(cand.fly1s_rms_cfg)
         return eng.variant(int(hidden), int(nbytes)) if eng is not None else None
+    if cand.family == "fused_flyqr":
+        # Same reason, for the same reason: a fused two-shot build sizes its
+        # block to the row, so hidden reaches the symbol.
+        eng = (flyqr_rms or {}).get(cand.flyqr_rms_cfg)
+        return eng.variant(int(hidden), int(nbytes)) if eng is not None else None
     if cand.family == "separate":
-        eng = fly1s.get(cand.fly1s_cfg) if cand.sep_ar == "fly1s" else None
+        if cand.sep_ar == "fly1s":
+            eng = fly1s.get(cand.fly1s_cfg)
+        elif cand.sep_ar == "flyring":
+            eng = fly.get(cand.fly_cfg)
+        else:
+            eng = None
         return eng.variant(int(nbytes)) if eng is not None else None
     eng = (
         fly.get(cand.fly_cfg)
@@ -1241,7 +1366,18 @@ def _bench_graph(thunk, *, num_iters, num_warmup, inner, group, label="candidate
 
 
 def _build_fused_thunks(
-    cands, *, ca_comm, qr_comm, fly1s, fly1s_rms, group, x, residual, weight
+    cands,
+    *,
+    ca_comm,
+    qr_comm,
+    fly,
+    fly1s,
+    fly1s_rms,
+    flyqr_rms,
+    group,
+    x,
+    residual,
+    weight,
 ):
     """Zero-arg thunks returning ``(out, residual_out)`` for the fused mode.
 
@@ -1296,6 +1432,15 @@ def _build_fused_thunks(
                 return o, ro
 
             thunks[cand.key] = _f
+        elif cand.family == "fused_flyqr":
+
+            def _f(o=out, ro=res_out, eng=flyqr_rms[cand.flyqr_rms_cfg]):
+                eng.allreduce_rmsnorm(
+                    x, residual, weight, FUSION_EPS, out=o, residual_out=ro
+                )
+                return o, ro
+
+            thunks[cand.key] = _f
         else:  # separate: all-reduce, then a standalone norm
             ar_buf = torch.empty_like(x)
             buffers.append(ar_buf)
@@ -1310,6 +1455,18 @@ def _build_fused_thunks(
                 def _ar(b=ar_buf):
                     b.copy_(x)
                     dist.all_reduce(b, group=group)
+                    return b
+
+            elif cand.sep_ar == "qr":
+
+                def _ar(b=ar_buf, lvl=QuickReduceRegime[cand.quant]):
+                    qr_comm.qr_quant_level = lvl
+                    return qr_comm.quick_all_reduce(x, out=b)
+
+            elif cand.sep_ar == "flyring":
+
+                def _ar(b=ar_buf, eng=fly[cand.fly_cfg]):
+                    eng.allreduce(x, b)
                     return b
 
             else:
@@ -1411,6 +1568,7 @@ def _bench_shape(
     fusion="none",
     timing="graph",
     fly1s_rms=None,
+    flyqr_rms=None,
     graph_inner=10,
 ):
     """Time and grade every applicable candidate at one shape. Scalars only."""
@@ -1425,11 +1583,16 @@ def _bench_shape(
         if c.key in keys
         and applicable(c, tp_size, dtype, x.numel(), nbytes, fusion, hidden)
         and not (c.family in ("qr", "fused_qr") and qr_comm is None)
+        and not (c.family == "separate" and c.sep_ar == "qr" and qr_comm is None)
         and not (c.family == "fly" and c.fly_cfg not in fly)
         and not (c.family == "fly1s" and c.fly1s_cfg not in fly1s)
         and not (c.family == "fused_fly1s" and c.fly1s_rms_cfg not in (fly1s_rms or {}))
+        and not (c.family == "fused_flyqr" and c.flyqr_rms_cfg not in (flyqr_rms or {}))
         and not (
             c.family == "separate" and c.sep_ar == "fly1s" and c.fly1s_cfg not in fly1s
+        )
+        and not (
+            c.family == "separate" and c.sep_ar == "flyring" and c.fly_cfg not in fly
         )
         # flyauto's window is dynamic (depends on AITER_FLY_AR_ACCURACY, only
         # known once the object exists), unlike every other family's static
@@ -1450,8 +1613,10 @@ def _bench_shape(
             cands,
             ca_comm=ca_comm,
             qr_comm=qr_comm,
+            fly=fly,
             fly1s=fly1s,
             fly1s_rms=fly1s_rms,
+            flyqr_rms=flyqr_rms,
             group=group,
             x=x,
             residual=residual,
@@ -1562,7 +1727,14 @@ def _bench_shape(
         # variant is a function of the payload, and asking the engine is the
         # only way to learn which rung this size took.
         ret[f"{cand.key}_variant"] = _variant_of(
-            cand, fly, fly1s, flyauto, nbytes, fly1s_rms=fly1s_rms, hidden=hidden
+            cand,
+            fly,
+            fly1s,
+            flyauto,
+            nbytes,
+            fly1s_rms=fly1s_rms,
+            flyqr_rms=flyqr_rms,
+            hidden=hidden,
         )
 
     if profile:
@@ -1649,7 +1821,16 @@ def _worker(
     # ``None`` means "constructor default" and does not order against an int,
     # so sort on a total key rather than the tuple itself.
     wanted_cfgs = sorted(
-        {c.fly_cfg for c in CANDIDATES if c.family == "fly" and c.key in keys},
+        {
+            c.fly_cfg
+            for c in CANDIDATES
+            if c.key in keys
+            # separate_flyring runs the *plain* ring and then a standalone
+            # norm, so it draws from this pool rather than from the fused one.
+            and (
+                c.family == "fly" or (c.family == "separate" and c.sep_ar == "flyring")
+            )
+        },
         key=_cfg_order,
     )
     if (
@@ -1765,6 +1946,52 @@ def _worker(
                 eng.compile_and_launch(warm, warm.clone(), w, FUSION_EPS)
             del warm, w
 
+    flyqr_rms = {}  # (algorithm, st, grid_cap, rs, ag) -> QuickAllReduceInt4RMSNorm
+    # One object per distinct config, each building a per-hidden IPC inbox on
+    # demand: a fused two-shot build sizes its block to the token row, so the
+    # whole geometry -- tile, wire slots, codec offsets -- depends on the width.
+    # Same total-order rule as every pool above; each build is a collective.
+    wanted_qr_rms = sorted(
+        {
+            c.flyqr_rms_cfg
+            for c in CANDIDATES
+            if c.family == "fused_flyqr" and c.key in keys
+        },
+        key=_cfg_order,
+    )
+    if (
+        wanted_qr_rms
+        and HAS_FLY_INT4
+        and get_gfx() in _FLY_ARCHS
+        and tp_size in _FLY_WORLDS
+        and dtype == dtypes.bf16
+    ):
+        for cfg in wanted_qr_rms:
+            flyqr_rms[cfg] = QuickAllReduceInt4RMSNorm(
+                group=tp_group.cpu_group,
+                device=device,
+                rank=rank,
+                world_size=tp_size,
+                algorithm=cfg[0],
+                **_fly_kwargs(
+                    cfg[1:], ("super_tile", "grid_cap", "rs_codec", "ag_codec")
+                ),
+            )
+            # Measure every size the sweep asks for, as the plain fly rows do.
+            flyqr_rms[cfg].min_bytes = 0
+        # Warm every (config, hidden) this sweep will touch, before any timing
+        # and well before any graph capture: a FlyDSL JIT compile inside a
+        # capture is fatal, and a lazily-built engine is a collective.
+        for hidden in sorted({h for _, h in shapes}):
+            warm = torch.zeros((8, hidden), dtype=dtypes.bf16, device=device)
+            w = torch.zeros(hidden, dtype=dtypes.bf16, device=device)
+            for cfg, eng in flyqr_rms.items():
+                if not eng.supports_hidden(hidden):
+                    continue
+                dist.barrier(group=group)
+                eng.compile_and_launch(warm, warm.clone(), w, FUSION_EPS)
+            del warm, w
+
     # Production dispatch, built last so its three internal engines exchange
     # handles after every pinned one -- the exchange is a collective and the
     # order has to match across ranks. It self-disables unless AITER_FLY_AR is
@@ -1823,11 +2050,12 @@ def _worker(
     # allocated -- and the inbox scales with ST * grid, so the ring's high rungs
     # dominate it. Report it here, where it is attributable to the candidate
     # list, rather than letting it surface as an OOM on the largest shape.
-    if fly or fly1s or fly1s_rms or flyauto:
+    if fly or fly1s or fly1s_rms or flyqr_rms or flyauto:
         per_engine = sorted(
             [(f"fly{cfg}", eng.inbox_bytes) for cfg, eng in fly.items()]
             + [(f"fly1s{cfg}", eng.inbox_bytes) for cfg, eng in fly1s.items()]
             + [(f"fly1s_rms{cfg}", eng.inbox_bytes) for cfg, eng in fly1s_rms.items()]
+            + [(f"flyqr_rms{cfg}", eng.inbox_bytes) for cfg, eng in flyqr_rms.items()]
             + ([("fly_auto", flyauto.inbox_bytes)] if flyauto else []),
             key=lambda kv: -kv[1],
         )
@@ -1862,12 +2090,15 @@ def _worker(
                 fusion=fusion,
                 timing=timing,
                 fly1s_rms=fly1s_rms,
+                flyqr_rms=flyqr_rms,
                 graph_inner=graph_inner,
             )
             for tokens, hidden in shapes
         ]
     finally:
         for eng in fly.values():
+            eng.close()
+        for eng in flyqr_rms.values():
             eng.close()
         for eng in fly1s_rms.values():
             eng.close()
@@ -2963,7 +3194,11 @@ def main():
         # exactly what its own command line says.
         os.environ[_FLY_ACCURACY_ENV] = args.fly_accuracy
     prod_regime = os.environ.get(_QR_ENV)
-    if any(c.family in ("qr", "fused_qr") for c in CANDIDATES if c.key in keys):
+    if any(
+        c.family in ("qr", "fused_qr") or (c.family == "separate" and c.sep_ar == "qr")
+        for c in CANDIDATES
+        if c.key in keys
+    ):
         os.environ[_QR_ENV] = _QR_ENABLING_REGIME
         # Build the quick-reduce JIT module here rather than letting every
         # spawned rank race for the same first build.

@@ -842,6 +842,359 @@ def test_quick_allreduce_ring_lap_isolation(rs_codec, ag_codec):
     assert not fails, "; ".join(fails)
 
 
+# ---------------------------------------------------------------------------
+# Fused epilogue: QuickAllReduceInt4RMSNorm (all-reduce + residual add + RMSNorm)
+# ---------------------------------------------------------------------------
+
+RMS_EPS = 1e-6
+
+# Floor for the fused ``out`` and ``residual_out`` against the fp32 oracle.
+#
+# Lower than SQNR_MIN_DB, and not because the epilogue is noisy: the reference
+# for a fused run adds the residual, and the residual is signal the all-reduce
+# noise is measured against. The numbers land 21-27 dB across TP2..TP8, so 18.0
+# leaves the same headroom the plain floor does.
+FUSED_SQNR_MIN_DB = 18.0
+
+# ``out`` recomputed from the kernel's own ``residual_out`` must match the
+# kernel's ``out``. Both are bf16 and the two rstds differ (the kernel norms the
+# unrounded fp32 x, this reference norms the rounded bf16 one), so it is a high
+# floor rather than equality -- but far above anything a row-grouping or
+# weight-indexing bug could survive, since those move whole rows.
+FUSED_SELF_SQNR_MIN_DB = 40.0
+
+
+def _fused_inputs(tokens, hidden, rank, device):
+    """Per-rank input, and the residual and gain every rank shares.
+
+    Values stay inside fp16's exponent range so the ``fp16`` passthrough wire
+    is genuinely lossless -- the exactness case below depends on it.
+    """
+    g = torch.Generator().manual_seed(1234 + rank)
+    inp = (torch.randn(tokens, hidden, generator=g) * 0.25).to(device, dtypes.bf16)
+    gs = torch.Generator().manual_seed(99)
+    residual = (torch.randn(tokens, hidden, generator=gs) * 0.5).to(device, dtypes.bf16)
+    weight = (torch.randn(hidden, generator=gs) * 0.1 + 1.0).to(device, dtypes.bf16)
+    return inp, residual, weight
+
+
+def _run_rank_fused(
+    rank: int,
+    tp: int,
+    init_method: str,
+    cases: list[tuple[int, int]],
+    algorithm: str,
+    codecs: tuple[str | None, str | None],
+    solo: bool,
+) -> list[dict]:
+    """One rank of a fused run, over every case in one spawn.
+
+    Every case rides a single engine object and a single process, as the plain
+    worker above does. That is not only startup cost: each fused engine holds an
+    IPC inbox per (hidden, super-tile) rung, hundreds of MiB at the ring's high
+    rungs, and a pool per test leaves those in flight while the next pool tries
+    to allocate. ``QuickAllReduceInt4RMSNorm`` builds per-hidden engines on
+    demand, so one object covers every width here.
+
+    ``solo`` zeroes every rank but 0, which -- paired with the ``fp16``
+    passthrough wire -- makes the all-reduce exact. That is the only
+    configuration in which ``residual_out`` can be checked for bit-equality,
+    and it is the cheapest detector for a dropped bf16 round-trip: SQNR on a
+    quantized wire is far too loose to notice one, and the error it hides
+    compounds per layer.
+    """
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.quick_allreduce_int4 import QuickAllReduceInt4RMSNorm
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        world_size=tp,
+        rank=rank,
+        device_id=device,
+    )
+    gloo = dist.new_group(backend="gloo")
+    rs_codec, ag_codec = codecs
+
+    eng = QuickAllReduceInt4RMSNorm(
+        group=gloo,
+        device=device,
+        rank=rank,
+        world_size=tp,
+        algorithm=algorithm,
+        rs_codec=rs_codec,
+        ag_codec=ag_codec,
+    )
+    # The cases here are deliberately small; the floor is a speed policy, not a
+    # correctness limit, so it must not decide what this test covers.
+    eng.min_bytes = 0
+    rows = []
+    try:
+        for tokens, hidden in cases:
+            inp, residual, weight = _fused_inputs(tokens, hidden, rank, device)
+            if solo and rank != 0:
+                inp.zero_()
+
+            # A real warm launch, so the checked call below is never the one
+            # that JITs. Writes into scratch, not into the buffers checked
+            # after.
+            dist.barrier()
+            eng.compile_and_launch(inp, residual, weight, RMS_EPS)
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            # fp32 oracle of the contract, through an untimed NCCL all-reduce.
+            ar = inp.to(torch.float32)
+            dist.all_reduce(ar, group=dist.group.WORLD)
+            x = ar.to(dtypes.bf16).to(torch.float32) + residual.to(torch.float32)
+            res_ref = x.to(dtypes.bf16)
+            rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+            out_ref = (x * rstd * weight.to(torch.float32)).to(dtypes.bf16)
+
+            # The epilogue judged on its own, with the codec noise factored
+            # out: re-norm the kernel's residual_out and compare to its out.
+            xr = res_out.to(torch.float32)
+            out_self = (
+                xr
+                * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+                * weight.to(torch.float32)
+            ).to(dtypes.bf16)
+
+            rows.append(
+                {
+                    "rank": rank,
+                    "tokens": tokens,
+                    "hidden": hidden,
+                    "variant": eng.variant(hidden, int(inp.numel()) * 2),
+                    "out_sqnr_db": _sqnr_db(
+                        out.to(torch.float32), out_ref.to(torch.float32)
+                    ),
+                    "res_sqnr_db": _sqnr_db(
+                        res_out.to(torch.float32), res_ref.to(torch.float32)
+                    ),
+                    "self_sqnr_db": _sqnr_db(
+                        out.to(torch.float32), out_self.to(torch.float32)
+                    ),
+                    "res_exact": bool(torch.equal(res_out, res_ref)),
+                    "finite": bool(torch.isfinite(out.to(torch.float32)).all()),
+                    # Cheap cross-rank fingerprints; see the mesh identity test.
+                    "out_bits": int(
+                        out.view(torch.int16).to(torch.int64).abs().sum().item()
+                    ),
+                    "res_bits": int(
+                        res_out.view(torch.int16).to(torch.int64).abs().sum().item()
+                    ),
+                }
+            )
+            del inp, residual, weight, out, res_out, ar, x, res_ref, out_ref, xr
+            del out_self
+            torch.cuda.empty_cache()
+    finally:
+        eng.close()
+        dist.destroy_process_group()
+    return rows
+
+
+def _spawn_fused(
+    world_size: int,
+    cases: list[tuple[int, int]],
+    *,
+    algorithm: str = "ring",
+    codecs: tuple[str | None, str | None] = (None, None),
+    solo: bool = False,
+) -> list[list[dict]]:
+    n_gpu = torch.cuda.device_count()
+    if n_gpu < world_size:
+        pytest.skip(f"QuickAllReduceInt4RMSNorm needs {world_size} GPUs, have {n_gpu}")
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
+    pool = Pool(processes=world_size)
+    try:
+        futs = [
+            pool.apply_async(
+                _run_rank_fused,
+                kwds={
+                    "rank": rank,
+                    "tp": world_size,
+                    "init_method": init_method,
+                    "cases": cases,
+                    "algorithm": algorithm,
+                    "codecs": codecs,
+                    "solo": solo,
+                },
+            )
+            for rank in range(world_size)
+        ]
+        # A fused build is a persistent kernel whose blocks wait on the same
+        # block id at every peer, so a co-residency bug hangs rather than
+        # returning a wrong number. The timeout is what turns that into a
+        # failed test instead of a wedged run.
+        ranks = [f.get(timeout=timeout) for f in futs]
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        pool.close()
+    finally:
+        pool.join()
+    return ranks
+
+
+_FUSED_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list[dict]]] = {}
+
+
+def _fused_batch(key: tuple, cases: list[tuple[int, int]], **spawn_kwargs) -> dict:
+    """One ``_spawn_fused`` per *key*, memoized, indexed by shape.
+
+    Same bargain as ``_batch_cache_lookup`` above and for a sharper reason: a
+    fused engine's IPC inboxes are large, and a pool per test leaves the
+    previous one's still resident when the next allocates.
+    """
+    if key not in _FUSED_BATCH_CACHE:
+        ranks = _spawn_fused(key[0], cases, **spawn_kwargs)
+        _FUSED_BATCH_CACHE[key] = {
+            case: [rank_rows[i] for rank_rows in ranks] for i, case in enumerate(cases)
+        }
+    return _FUSED_BATCH_CACHE[key]
+
+
+_FUSED_CASES = (
+    # (tp, tokens, hidden, label). Widths chosen for what they exercise:
+    # 4096 is an 8-wave block, 7168 a 14-wave one (the only non-power-of-two
+    # width, and DeepSeek's), 5120 exercises rows_per_chunk > 1 at TP4, and
+    # 2048 is the narrowest block the mesh fanout accepts. The last case of
+    # each world size is the co-residency stress: the payload is far larger
+    # than the grid, so every block loops over many tiles.
+    (2, 512, 4096, "tp2-4096"),
+    (2, 256, 2048, "tp2-2048-narrow-block"),
+    (2, 4096, 8192, "tp2-8192-wide-block-many-tiles"),
+    (4, 1024, 5120, "tp4-5120"),
+    (8, 1024, 7168, "tp8-7168"),
+    (8, 512, 8192, "tp8-8192-wide-block"),
+)
+
+
+@pytest.mark.parametrize("algorithm", ("ring", "mesh"))
+@pytest.mark.parametrize("tp,tokens,hidden,label", _FUSED_CASES)
+def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
+    """The fused epilogue against an fp32 oracle, plus its own self-consistency.
+
+    Three gates per rank: ``out`` and ``residual_out`` against the oracle, and
+    ``out`` against a norm recomputed from the kernel's own ``residual_out``.
+    The third is the one that isolates the epilogue -- it is blind to codec
+    noise, so a row-grouping or weight-indexing bug cannot hide behind it.
+
+    Every case sharing (tp, algorithm) rides one spawn; see ``_fused_batch``.
+    """
+    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    batch = _fused_batch((tp, "sqnr", algorithm), cases, algorithm=algorithm)
+    fails = []
+    for row in batch[(tokens, hidden)]:
+        if not row["finite"]:
+            fails.append(f"rank {row['rank']}: non-finite output")
+        if row["out_sqnr_db"] < FUSED_SQNR_MIN_DB:
+            fails.append(
+                f"rank {row['rank']}: out SQNR {row['out_sqnr_db']:.2f} dB < "
+                f"{FUSED_SQNR_MIN_DB}"
+            )
+        if row["res_sqnr_db"] < FUSED_SQNR_MIN_DB:
+            fails.append(
+                f"rank {row['rank']}: residual_out SQNR {row['res_sqnr_db']:.2f} dB "
+                f"< {FUSED_SQNR_MIN_DB}"
+            )
+        if row["self_sqnr_db"] < FUSED_SELF_SQNR_MIN_DB:
+            fails.append(
+                f"rank {row['rank']}: out vs norm(residual_out) "
+                f"{row['self_sqnr_db']:.2f} dB < {FUSED_SELF_SQNR_MIN_DB} -- the "
+                "epilogue disagrees with its own residual"
+            )
+    assert not fails, f"{label}/{algorithm}: " + "; ".join(fails)
+
+
+@pytest.mark.parametrize("algorithm", ("ring", "mesh"))
+def test_quick_allreduce_rmsnorm_residual_is_bit_exact(algorithm):
+    """With a lossless wire and one live rank, ``residual_out`` is exact.
+
+    ``out`` still goes through ``rsqrt``, whose hardware approximation
+    legitimately differs from torch's, so only the residual is an equality.
+    This is what pins the bf16 round-trip before the residual add: keeping the
+    extra fp32 mantissa bits would be *more* accurate and would silently
+    diverge from the unfused path it has to match.
+    """
+    batch = _fused_batch(
+        (2, "exact", algorithm),
+        [(512, 4096)],
+        algorithm=algorithm,
+        codecs=("fp16", "fp16"),
+        solo=True,
+    )
+    rows = batch[(512, 4096)]
+    bad = [r["rank"] for r in rows if not r["res_exact"]]
+    assert not bad, (
+        f"{algorithm}: residual_out is not bit-exact on ranks {bad} with a "
+        "lossless wire -- the bf16 round-trip or the residual add has drifted"
+    )
+    for row in rows:
+        assert row["out_sqnr_db"] > 60.0, row
+
+
+def test_quick_allreduce_rmsnorm_mesh_ranks_agree():
+    """Every mesh rank must compute the same bits.
+
+    The mesh dequantizes the same wire bytes for every atom, so its output is a
+    pure function of what went over the wire and the ranks cannot diverge. The
+    **ring** deliberately can: at the seam op it stores its own chunk from the
+    unquantized accumulator, which is a better value than the one its peers
+    receive -- so this gate is mesh-only, and a ring that passed it would mean
+    that optimization had been lost.
+    """
+    rows = _fused_batch((4, "sqnr", "mesh"), [(1024, 5120)], algorithm="mesh")[
+        (1024, 5120)
+    ]
+    first = rows[0]
+    bad = [
+        r["rank"]
+        for r in rows
+        if (r["out_bits"], r["res_bits"]) != (first["out_bits"], first["res_bits"])
+    ]
+    assert not bad, f"mesh ranks {bad} disagree with rank 0"
+
+
+@pytest.mark.parametrize("hidden", (2560, 640, 12288))
+def test_quick_allreduce_rmsnorm_rejects_unsupported_hidden(hidden):
+    """Widths off the row-sized-block grid raise, naming the constraint.
+
+    A fused block is ``hidden/8`` threads and has to be a multiple of 128 (the
+    64 B fabric sector grid) and at most 1024, so 2560 and 640 are off-grid and
+    12288 is too wide. Host-side and GPU-free: no engine is built.
+    """
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_hidden_supported,
+        quick_reduce_row_block,
+    )
+
+    assert not quick_reduce_hidden_supported(hidden, 8)
+    with pytest.raises(ValueError, match="hidden"):
+        quick_reduce_row_block(hidden, 8)
+
+
+def test_quick_allreduce_rmsnorm_supported_hiddens():
+    """Every multiple of 1024 up to 8192 builds at every world size."""
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import quick_reduce_row_block
+
+    for world_size in SUPPORTED_WORLDS:
+        for hidden in range(1024, 8192 + 1, 1024):
+            block, atoms_per_row = quick_reduce_row_block(hidden, world_size)
+            assert atoms_per_row == 1 and block == hidden // 8, (hidden, world_size)
+
+
 @benchmark()
 def test_quick_allreduce_int4(
     tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP, algorithm="mesh"

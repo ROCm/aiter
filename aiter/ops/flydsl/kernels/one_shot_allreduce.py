@@ -16,25 +16,35 @@ No LDS is needed: thread ``t``'s 16 B lands at the same offset in every destinat
 so it can be pushed straight from registers.
 """
 
-import math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import (
     Float32,
     Int32,
     Int64,
-    ReductionOp,
     Stream,
     T,
     as_ir_value,
 )
 
 from . import buffer_ops
+
+# The fused epilogue and the row-to-workgroup geometry are shared with the
+# quantized schedules; see quick_allreduce_fusions.
+from .quick_allreduce_fusions import (
+    ATOM_ELEMS,
+    FUSIONS,
+    make_wave_partials,
+    pack_bf16,
+    residual_add,
+    rms_rstd,
+    row_block,
+    row_block_supported,
+    scale_by_weight,
+)
 
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
 # taxonomy are shared with the quantized kernels verbatim.
@@ -43,9 +53,12 @@ from .quick_allreduce_shared import (
     _CM_SC1,
     _INBOX_POLICY,
     SUPPORTED_WORLDS,
+    WAVE,
     _acquire_inbox,
     _i32_to_bytes,
     _to_sgpr_i64,
+    atom_bf16_to_f32,
+    atom_f32_to_bf16,
 )
 
 
@@ -157,9 +170,6 @@ def oneshot_ladder(world_size: int):
     )
 
 
-# Fused epilogues this factory can append to the reduce. 
-FUSIONS = ("none", "rmsnorm")
-
 # In the plain schedule ``atoms`` sets the *tile width*: tile = BLOCK*atoms*16 B,
 # so a bigger atom count means fewer, fatter tiles and fewer flags. TP2 and TP8
 # pick atoms=4 for exactly that reason.
@@ -182,44 +192,23 @@ def fused_oneshot_ladder(world_size: int):
     )
 
 
-# Wave width on gfx942/gfx950. The sum-of-squares butterfly is a full-wave shuffle_xor.
-WAVE = 64
-
-
 def fused_block(hidden: int, atoms: int) -> int:
     """Threads per block for a fused build, or raise saying why *hidden* is out.
 
     One block covers one whole token row -- ``BLOCK * atoms * 8 == hidden`` --
     because the RMSNorm reduction spans the row and a row split across two
     blocks could only be joined with a grid-wide barrier.
+
+    This schedule carries no codec, so the only alignment a block owes is whole
+    waves for the reduction's shuffles. The quantized schedules need a stricter
+    one; see ``quick_allreduce_fusions.quick_reduce_row_block``.
     """
-    hidden = int(hidden)
-    per_thread = 8 * int(atoms)  # 8 bf16 per 16 B atom
-    if hidden <= 0 or hidden % per_thread != 0:
-        raise ValueError(
-            f"fused hidden must be a multiple of {per_thread} (8*atoms), got {hidden}"
-        )
-    block = hidden // per_thread
-    if block % WAVE != 0:
-        raise ValueError(
-            f"fused hidden={hidden} with atoms={atoms} gives BLOCK={block}, "
-            f"not a multiple of the {WAVE}-lane wave; needs hidden % {WAVE * per_thread} == 0"
-        )
-    if block > 1024:
-        raise ValueError(
-            f"fused hidden={hidden} with atoms={atoms} needs BLOCK={block} threads, "
-            f"over the 1024 limit; raise atoms or split the row"
-        )
-    return block
+    return row_block(hidden, per_thread=ATOM_ELEMS * int(atoms), align=WAVE)
 
 
 def fused_hidden_supported(hidden: int, atoms: int = 1) -> bool:
     """Whether a fused build exists for this (hidden, atoms). For host-side gates."""
-    try:
-        fused_block(hidden, atoms)
-    except ValueError:
-        return False
-    return True
+    return row_block_supported(hidden, per_thread=ATOM_ELEMS * int(atoms), align=WAVE)
 
 
 # Inbox slots are indexed by ``colour & 1``. Two buffers is exactly enough to
@@ -271,19 +260,6 @@ def _load_i32_at(rsrc, elem_off, policy):
     )
     rocdl.s_waitcnt(vmcnt=0)
     return fx.Int32(val)
-
-
-def _atom_bf16_to_f32(atom_i32):
-    """16 B of bf16 (8 values) -> 8 f32. bf16 is the high half of f32, so this
-    is a widening move, not a conversion -- exact, no rounding."""
-    return fx.Vector(atom_i32).bitcast(fx.BFloat16).to(fx.Float32)
-
-
-def _atom_f32_to_bf16(acc_f32):
-    """8 f32 -> 16 B of bf16. One rounding, at the end of the reduction, which
-    is what makes this bit-comparable with ``cross_device_reduce``'s fp32
-    accumulate + single ``downcast``."""
-    return acc_f32.to(fx.BFloat16).bitcast(fx.Int32)
 
 
 def make_one_shot_allreduce_kernel(
@@ -354,10 +330,7 @@ def make_one_shot_allreduce_kernel(
     # LDS for the fused sum-of-squares. Carries the per-wave partial sums
     # only: the 1/hidden, the +eps and the rsqrt all happen afterwards in
     # registers, per thread, so no scale is ever broadcast through LDS.
-    if fused:
-        @fx.struct
-        class _RmsShared:
-            wave_sq: fx.Array[fx.Float32, max(1, n_waves), 16]
+    _RmsShared = make_wave_partials(n_waves) if fused else None
 
     # One signature for both modes. The fused-only arguments are present (and
     # passed as zeros) in a plain build rather than being appended to a second
@@ -608,78 +581,39 @@ def make_one_shot_allreduce_kernel(
                         + fx.Int32(atom * block * ATOM_I32)
                         + tid * fx.Int32(ATOM_I32)
                     )
-                    v = _atom_bf16_to_f32(_load_v4i32_at(self_rsrc, elem, _RECV_POLICY))
+                    v = atom_bf16_to_f32(_load_v4i32_at(self_rsrc, elem, _RECV_POLICY))
                     acc = v if acc is None else acc + v
                 outs.append(acc)
             return outs
 
         def _reduce(parity):
-            return [_atom_f32_to_bf16(a) for a in _reduce_f32(parity)]
+            return [atom_f32_to_bf16(a) for a in _reduce_f32(parity)]
 
-        def _block_sum_sq(accs):
-            """Block-wide ``sum(acc^2)`` over the whole row, one value per thread.
-
-            Three levels: per-thread over its ``8*atoms`` channels, a full-wave
-            ``shuffle_xor`` butterfly, then the cross-wave combine through LDS.
-
-            What lands in LDS is a partial sum -- every thread
-            reads the ``n_waves`` partials back and adds them itself, and
-            computes its own ``rsqrt`` afterwards. That redundancy is bought
-            deliberately: it removes the broadcast, so this costs only one barrier.
-            """
-            local = None
-            for atom in range_constexpr(atoms):
-                sq = accs[atom] * accs[atom]
-                part = fx.Float32(sq.reduce(ReductionOp.ADD))
-                local = part if local is None else local + part
-
-            for sh in range_constexpr(int(math.log2(WAVE))):
-                local = local + local.shuffle_xor(WAVE // (2 << sh), WAVE)
-
-            if const_expr(n_waves == 1):
-                # One wave covers the row: the butterfly already finished it and
-                # LDS would only add a barrier.
-                return local
-
-            sq_lds = fx.SharedAllocator().allocate(_RmsShared).peek().wave_sq.ptr
-            wid = tid // fx.Int32(WAVE)
-            if tid % fx.Int32(WAVE) == fx.Int32(0):
-                sq_lds[wid] = local
-            gpu.barrier()
-            total = None
-            for w in range_constexpr(n_waves):
-                v = fx.Float32(sq_lds[fx.Int32(w)])
-                total = v if total is None else total + v
-            return total
-
-        def _epilogue(tile, x_atoms, w_atoms, parity):
+        def _epilogue(tile, x_atoms, w_atoms, parity, sq_lds):
             """bf16 round-trip, residual add, RMSNorm.
+
+            The arithmetic lives in ``quick_allreduce_fusions``, which the mesh
+            and ring epilogues share; what stays here is the store placement.
+            ``residual_out`` is written *before* the reduction, so it is in
+            flight across the barrier rather than issued behind it -- it has no
+            dependence on the norm.
             """
-            accs = _reduce_f32(parity)
-            res_out = []
-            for atom in range_constexpr(atoms):
-                # Round the all-reduce result to bf16 and back before adding the
-                # residual. 
-                # TODO: Keeping the extra f32 mantissa bits would be more accurate,
-                # diverging 1 ULP per layer from the kernel this replaces.
-                a = accs[atom].to(fx.BFloat16).to(fx.Float32)
-                a = a + fx.Vector(x_atoms[atom]).bitcast(fx.BFloat16).to(fx.Float32)
-                accs[atom] = a
-                res_out.append(_atom_f32_to_bf16(a))
-            _store_rows(res_out_buf, tile, res_out)
+            accs = residual_add(_reduce_f32(parity), x_atoms)
+            _store_rows(res_out_buf, tile, pack_bf16(accs))
+            # One block covers one row, so there is a single row to reduce.
+            rstd = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)[0]
+            _store_tile(tile, scale_by_weight(accs, rstd, w_atoms))
 
-            # rsqrt on the fp32 accumulator, not on the bf16 just stored.
-            rstd = fmath.rsqrt(_block_sum_sq(accs) * (1.0 / hidden) + eps)
-            outs = []
-            for atom in range_constexpr(atoms):
-                w = fx.Vector(w_atoms[atom]).bitcast(fx.BFloat16).to(fx.Float32)
-                outs.append(_atom_f32_to_bf16(accs[atom] * rstd * w))
-            _store_tile(tile, outs)
-
-        # The gain is one row shared by every token, so it is read once here
-        # rather than once per token.
+        sq_lds = None
         if const_expr(fused):
+            # The gain is one row shared by every token, so it is read once here
+            # rather than once per token.
             w_atoms = _load_rows(w_buf, fx.Int32(0))
+            if const_expr(n_waves > 1):
+                # Allocated once, at kernel scope: SharedAllocator is static, so
+                # an allocation reached from inside the tile loop would emit a
+                # fresh LDS symbol per trace-time visit.
+                sq_lds = fx.SharedAllocator().allocate(_RmsShared).peek().wave.ptr
 
         # Stride by the *launched* grid, not the compile-time cap: the host may
         # launch fewer blocks than ``grid``, and striding by the cap would leave
@@ -706,7 +640,7 @@ def make_one_shot_allreduce_kernel(
             _wait(parity, color)
             if const_expr(probe == "full"):
                 if const_expr(fused):
-                    _epilogue(tile, x_atoms, w_atoms, parity)
+                    _epilogue(tile, x_atoms, w_atoms, parity, sq_lds)
                 else:
                     _store_tile(tile, _reduce(parity))
             color = color + fx.Int32(1)
