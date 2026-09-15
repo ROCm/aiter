@@ -155,8 +155,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // The bias rides in ptr_C and its byte length in stride_C1, both slots this ABI carries and
     // the fp6 kernel used to ignore. The kernel bounds-checks against that length, so a length
-    // of zero is the unbiased path at no cost and one code object serves both. Nothing to select
-    // here, and nothing to pad: a bias shorter than a padded N reads zeros past its end.
+    // of zero is the unbiased path and one code object serves both, and nothing needs padding:
+    // a bias shorter than a padded N reads zeros past its end.
+    //
+    // That path is correct but it is not free, which the design note here used to claim. The
+    // eight bias loads still issue and still wait once per output tile even when they are out
+    // of range, and on call sites that pass no bias that costs 1.4% aggregate and up to 3.0%
+    // on one shape. Selecting a _nobias sibling below recovers it; see the kname block.
     //
     // ptr_C as the bias pointer follows a4w4, which already does exactly that. The length goes
     // in stride_C1 rather than stride_C0 because a4w4 sets stride_C0 to the output row stride,
@@ -206,6 +211,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     std::string arch_id = get_gpu_arch();
     std::string kname   = (kernelName && kernelName[0] != 0) ? (arch_id + kernelName)
                                                              : (arch_id + kDefaultKernelName);
+
+    // An unbiased call site pays for a bias epilogue it never uses. Route it to the sibling
+    // built without one when the manifest registers it, and keep the biased build otherwise,
+    // so which shapes have a sibling is a manifest decision rather than one baked in here.
+    // The tuned table stays bias-agnostic: it names the biased symbol and this rewrites it.
+    if(bias == nullptr)
+    {
+        constexpr std::string_view kSuffix = "_kernel_func";
+        if(kname.size() > kSuffix.size() &&
+           std::string_view(kname).substr(kname.size() - kSuffix.size()) == kSuffix)
+        {
+            std::string unbiased = kname.substr(0, kname.size() - kSuffix.size());
+            unbiased += "_nobias";
+            unbiased += kSuffix;
+            if(config_map->find(unbiased) != config_map->end())
+                kname = std::move(unbiased);
+        }
+    }
 
     AiterAsmKernel* impl_ptr = nullptr;
     int SUBM                 = 0;
