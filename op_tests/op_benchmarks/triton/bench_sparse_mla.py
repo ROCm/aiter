@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark for sparse_mla_fwd (gfx950 gluon, separated-rope MLA).
+"""Benchmark for sparse_mla_fwd (gluon, separated-rope MLA; gfx950 and gfx942).
 
 The cache is flushed between iterations by default. Leaving it warm lets the loop
 re-read its KV and flatters decode shapes badly.
@@ -20,6 +20,7 @@ from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+from aiter.ops.triton.attention.sparse_mla import FP8_DOT_ARCHS, SUPPORTED_ARCHS
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -152,13 +153,28 @@ def run_benchmark(args):
         for tokens in args.num_tokens
     ]
 
+    # sparse_mla_fwd raises on fp8 dots where the arch lacks OCP e4m3, and
+    # triton's harness does not catch it, so drop the series instead.
+    dot_vals = ["bf16"]
+    dot_names = ["bf16 dots"]
+    dot_styles = [("green", "-")]
+    if arch_info.get_arch() in FP8_DOT_ARCHS:
+        dot_vals.append("fp8")
+        dot_names.append("fp8 dots")
+        dot_styles.append(("blue", "-"))
+    else:
+        print(
+            f"note: skipping the fp8-dot series, {arch_info.get_arch()} has "
+            "no OCP e4m3 matrix core"
+        )
+
     benchmark = triton.testing.Benchmark(
         x_names=["phase", "num_seqs", "num_tokens", "num_heads", "context", "topk"],
         x_vals=x_vals_list,
         line_arg="dots",
-        line_vals=["bf16", "fp8"],
-        line_names=["bf16 dots", "fp8 dots"],
-        styles=[("green", "-"), ("blue", "-")],
+        line_vals=dot_vals,
+        line_names=dot_names,
+        styles=dot_styles,
         ylabel=ylabel,
         plot_name=get_caller_name_no_ext(),
         args={"metric": args.metric},
@@ -263,8 +279,8 @@ def main():
             f"--num_tokens {over} exceeds --context {args.context}: a sequence "
             "cannot prefill more tokens than its context holds"
         )
-    if arch_info.get_arch() != "gfx950":
-        raise SystemExit(f"sparse_mla_fwd is gfx950-only (got {arch_info.get_arch()})")
+    if arch_info.get_arch() not in SUPPORTED_ARCHS:
+        raise SystemExit(f"sparse_mla_fwd does not support {arch_info.get_arch()}")
     run_benchmark(args)
 
 
