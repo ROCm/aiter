@@ -14,22 +14,21 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     IS_NVIDIA_HOPPER,
     RCP_LN2,
-    USE_CUDA_GRAPH,
     autotune_cache_kwargs,
     check_shared_mem,
-    gated_delta_rule_autotune_configs,
 )
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_rebased_cu_seqlens,
 )
-from ..utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
@@ -53,16 +52,16 @@ def _gate_exp(x, USE_EXP2: tl.constexpr):
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in NUM_STAGES_FWD
             for BV in [32, 64]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "TRANSPOSE_STATE"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -318,7 +317,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
@@ -326,10 +326,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 [3, 2] if IS_AMD else ([4, 3, 2] if check_shared_mem("ampere") else [1])
             )
             for BV in [64, 32]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "BV", "USE_G"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -660,16 +659,16 @@ def chunk_gated_delta_rule_fwd_h(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in NUM_STAGES_FWD
             for BV in [16, 32, 64]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
@@ -974,16 +973,16 @@ def chunk_gated_delta_rule_fwd_h_opt(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in NUM_STAGES_FWD
             for BV in [16, 32, 64]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
