@@ -105,6 +105,11 @@ AITER_CONFIG_GEMM_A4W4 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A6W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A6W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a6w4_flydsl_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A6W6 = os.getenv(
     "AITER_CONFIG_GEMM_A6W6",
     f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
@@ -206,6 +211,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A4W4",
             AITER_CONFIG_GEMM_A4W4,
             "a4w4_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A6W4_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W4",
+            AITER_CONFIG_GEMM_A6W4,
+            "a6w4_flydsl_tuned_gemm",
         )
 
     @property
