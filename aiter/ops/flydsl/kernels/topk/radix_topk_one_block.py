@@ -22,15 +22,11 @@ _VEC = 4
 _LOAD_UNROLL = 4
 _PASS1_HISTOGRAM_REPLICAS = 2
 _KEY_BITS = 32
-# First radix level and pass-1 histogram replicas, per arch. An arch that is
-# absent keeps the fallback. A finer first level cuts both the survivor count and
-# the number of lanes colliding on one histogram bin, so where the LDS allows it
-# it beats replicating a coarser one into the same space: on gfx950 14 bits with
-# a single histogram takes a worst-case production layer from 208 to 179us,
-# against 12 bits replicated four ways. Every entry leaves 1024 bins for the
-# later levels, so the candidate buffer is unaffected.
 _LONG_RADIX_DEFAULT = ((12, 10, 10), _PASS1_HISTOGRAM_REPLICAS)
-_LONG_RADIX_BY_ARCH = {"gfx950": ((14, 10, 8), 1)}
+_LONG_RADIX_BY_ARCH = {
+    "gfx950": ((14, 10, 8), 1),
+    "gfx1250": ((13, 13, 6), 1),
+}
 _SHORT_RADIX_BITS = (11, 10, 11)
 _SHORT_RADIX_SHIFTS = (
     _SHORT_RADIX_BITS[1] + _SHORT_RADIX_BITS[2],
@@ -38,17 +34,17 @@ _SHORT_RADIX_SHIFTS = (
     0,
 )
 _SHORT_RADIX_MASKS = tuple((1 << bits) - 1 for bits in _SHORT_RADIX_BITS)
-_LATER_BUCKETS = 1 << max(
-    max(bits[1:]) for bits, _ in (_LONG_RADIX_DEFAULT, *_LONG_RADIX_BY_ARCH.values())
-)
 _SHORT_HIGH_BUCKETS = 1 << _SHORT_RADIX_BITS[0]
 _MAX_ROW_ELEMENTS = ((1 << 32) - 1) // 4
 _COMPACT_CAPACITY = 4096
-# gfx950 has 160 KiB per CU; half of that (minus padding) keeps two 1024-thread
-# blocks resident. Other arches keep the original layout when this is 0.
-_ONE_BLOCK_LDS_BUDGET_BYTES = {"gfx950": 78 * 1024}
+# Keep two 1024-thread blocks resident by using half the per-CU LDS minus 2 KiB
+# for padding: gfx950 has 160 KiB per CU and gfx1250 has 320 KiB. Other arches
+# keep the original layout when this is 0.
+_ONE_BLOCK_LDS_BUDGET_BYTES = {
+    "gfx950": 78 * 1024,
+    "gfx1250": 158 * 1024,
+}
 _STABLE_INDEX_SORT_MIN_ROW_LEN = 1 << 15
-_STABLE_COMPACT_SORT_MIN_ROW_LEN = 48 * 1024
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -114,7 +110,8 @@ def build_radix_topk_one_block_module(
     long_shifts = (long_radix_bits[1] + long_radix_bits[2], long_radix_bits[2], 0)
     long_masks = tuple((1 << bits) - 1 for bits in long_radix_bits)
     high_bins_per_thread = high_buckets // block_threads
-    later_bins_per_thread = _LATER_BUCKETS // block_threads
+    later_buckets = 1 << max(long_radix_bits[1:])
+    later_bins_per_thread = later_buckets // block_threads
     short_bins_per_thread = _SHORT_HIGH_BUCKETS // block_threads
     full_key_vector_steps = (
         (_COMPACT_CAPACITY // _VEC) + block_threads - 1
@@ -145,7 +142,7 @@ def build_radix_topk_one_block_module(
     # final emit re-scan the row from global instead of reading LDS, so the
     # buffer gets every byte the budget leaves over. Stable index sorting
     # reserves a power-of-two staging array (including its padding slots).
-    histogram_bytes = _LATER_BUCKETS * 4
+    histogram_bytes = later_buckets * 4
     stable_stage_bytes = stable_stage_capacity * 4
     scratch_bytes = (num_waves + _METADATA_SIZE) * 4
     candidate_entry_bytes = 4 + 4  # ordered key, column index
@@ -166,14 +163,13 @@ def build_radix_topk_one_block_module(
     block_scan = fx.coop.BlockScan[fx.Int32, block_threads]
 
     # LDS layouts
-
     @fx.struct
     class LongPass1Storage:
         histograms: fx.Array[fx.Int32, pass1_replicas * high_buckets, 16]
 
     @fx.struct
     class LongLaterStorage:
-        histogram: fx.Array[fx.Int32, _LATER_BUCKETS, 16]
+        histogram: fx.Array[fx.Int32, later_buckets, 16]
         candidate_ordered_keys: fx.Array[fx.Int32, candidate_capacity, 16]
         candidate_local_indices: fx.Array[fx.Int32, candidate_capacity, 16]
         stable_data: fx.Array[fx.Int32, stable_stage_capacity, 16]
@@ -291,7 +287,7 @@ def build_radix_topk_one_block_module(
                 fx.make_layout(pass1_replicas * high_buckets, 1)
             )
             histogram = storage.arena.long_later.histogram.peek().view(
-                fx.make_layout(_LATER_BUCKETS, 1)
+                fx.make_layout(later_buckets, 1)
             )
             candidate_ordered_keys = (
                 storage.arena.long_later.candidate_ordered_keys.peek().view(
