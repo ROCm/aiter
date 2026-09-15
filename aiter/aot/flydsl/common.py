@@ -131,6 +131,18 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
+def _filter_collected_aot_jobs(
+    kind: OpKind, jobs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    # GEMM only: parse_csv for the others keep just one of gfx/cu_num,
+    # so a (gfx, cu_num) filter would drop all of them.
+    if kind is OpKind.GEMM:
+        from .gemm import filter_jobs_for_build_targets
+
+        return filter_jobs_for_build_targets(jobs)
+    return jobs
+
+
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     """Load DEFAULT_CSVS + parse_csv for the named kind and return its
     job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
@@ -153,7 +165,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+    jobs = collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+    return _filter_collected_aot_jobs(kind, jobs)
 
 
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:

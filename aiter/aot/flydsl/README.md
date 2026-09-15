@@ -79,14 +79,18 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
+| `AITER_GPU_TARGETS` / `ARCH` / `GPU_ARCHS` | Filter **GEMM** AOT jobs by target; other kinds are unfiltered. The first one set wins, in that order. Unset builds every job. | unset |
 
-> **About the compile target arch.** The arch each kernel is actually compiled
-> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
-> and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
-> for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, edit the `cu_num`
-> column in the CSV.
+> **Compile target.** Each job is compiled for the arch in its `gfx` field, or
+> from the CSV `cu_num` via `cu_num_to_arch(...)` when `gfx` is empty. AOT
+> applies that through `FLYDSL_GPU_ARCH` and overwrites it per job, so setting
+> `FLYDSL_GPU_ARCH` in the shell does not change what gets built.
+
+`AITER_GPU_TARGETS=gfx950:128` is the exact `(gfx, cu_num)` form on both
+paths. The other two differ by path. Running `python -m aiter.aot.flydsl.gemm`
+directly, `ARCH` selects every GEMM job of that arch and `GPU_ARCHS` does the
+same (`CU_NUM` is ignored); packaging (`setup.py`) reads no `ARCH` and pairs
+`GPU_ARCHS` with `CU_NUM` into exact SKU pairs instead.
 
 Example:
 
