@@ -2,25 +2,22 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.common import _read_exec_i64
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     DualwaveFp8KernelContext,
-    _anchor_scalar_f32,
-    _anchor_v_p,
-    _apply_dualwave_causal_mask_pair,
-    _attn_mask_vec2_imm,
-    _causal_pair_thresholds,
     _exp2_score_slice,
     _pack_p_v8_slices,
-    _read_exec_i64,
     _reduction_pair,
     _safe_l_inv,
     _scale_o_accs,
@@ -199,13 +196,6 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         lhs, rhs = _reduction_pair(local_max)
         return fx.maxnumf(lhs, rhs)
 
-    def _attn_mask_vec2_imm(
-        self, rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
-    ):
-        return _attn_mask_vec2_imm(
-            rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
-        )
-
     def v_s_vec_to_lists(self, v_s):
         return _score_pair_to_lists(v_s)
 
@@ -223,20 +213,10 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             self.ctx_ref.q_row_i32 + self.delta_i32 - kv_start_i32 - lane_off_i32
         )
         rel_hi_i32 = fx.Int32(rel_lo_i32 - fx.Int32(32))
-        neg_inf_i32 = fx.Int32(traits.NEG_INF_F32_BITS)
-        pair_thresholds = _causal_pair_thresholds(False)
-        if const_expr(self.traits.PAGED):
-            for r in range_constexpr(16):
-                threshold = (r // 4) * 8 + r % 4
-                s_lo[r] = (rel_lo_i32 < threshold).select(self.c_neg_inf, s_lo[r])
-                s_hi[r] = (rel_hi_i32 < threshold).select(self.c_neg_inf, s_hi[r])
-        else:
-            _apply_dualwave_causal_mask_pair(
-                s_lo, rel_lo_i32, neg_inf_i32, pair_thresholds
-            )
-            _apply_dualwave_causal_mask_pair(
-                s_hi, rel_hi_i32, neg_inf_i32, pair_thresholds
-            )
+        for r in range_constexpr(16):
+            threshold = (r // 4) * 8 + r % 4
+            s_lo[r] = (rel_lo_i32 < threshold).select(self.c_neg_inf, s_lo[r])
+            s_hi[r] = (rel_hi_i32 < threshold).select(self.c_neg_inf, s_hi[r])
 
     def causal_mask_prologue_if_needed(self, v_s, tile_idx=None, kv_end_pos=None):
         if tile_idx is None:
@@ -327,7 +307,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         return fx.maxnumf(row_max, self.c_neg_floor)
 
     # log2 of e4m3's largest finite value, 448.
-    _P_HEADROOM_LOG2 = 8.807354922057604
+    _P_HEADROOM_LOG2 = math.log2(448.0)
 
     def sub_m(self, v_s, row_max):
         # P is cast to e4m3, whose smallest subnormal is 2**-9, so a softmax
@@ -386,16 +366,11 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
                 dst.append(self.bf16_trunc_pack_v8(scaled))
         return out_lo, out_hi
 
-    def anchor_v_p(self, v_p):
-        return _anchor_v_p(self.traits, v_p, elem_dtype=self.p_elem)
-
     def anchor_v_o(self, v_o):
         return self.preserve_accumulators(v_o)
 
     def anchor_scalar_f32(self, x):
-        if const_expr(self.traits.PAGED):
-            return llvm.intr_arithmetic_fence(fx.as_ir_value(x))
-        return _anchor_scalar_f32(x)
+        return llvm.intr_arithmetic_fence(fx.as_ir_value(x))
 
     def safe_l_inv(self, l_row):
         return _safe_l_inv(l_row, self.c_zero_f)
@@ -548,83 +523,3 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
                 d_col = (dc * self.traits.D_CHUNK) + (2 * g + self.lane_div_32) * 8
                 o_global = self.global_idx_o(q_row, d_col)
                 self.buffer_store_128(o_pack, o_global)
-
-    def store_splitk_partial_o(self, v_o, m_row, l_row, q_row):
-        m_row = fx.Float32(m_row) * self.c_logit_scale
-        split_z = self.batch_idx * self.traits.NUM_KV_SPLITS + self.split_idx
-        o_part_row_base = (
-            (split_z * self.traits.NUM_HEADS_Q + self.q_head_idx) * self.seq_len_v
-            + q_row
-        ) * (self.traits.HEAD_DIM_V // 2)
-        grid_z = fx.Index(gpu.grid_dim.z)
-        mrow_base = (
-            grid_z
-            * self.traits.NUM_HEADS_Q
-            * self.seq_len_v
-            * (self.traits.HEAD_DIM_V // 2)
-        )
-        lrow_base = mrow_base + grid_z * self.traits.NUM_HEADS_Q * self.seq_len_v
-        ml_row_idx = (
-            split_z * self.traits.NUM_HEADS_Q + self.q_head_idx
-        ) * self.seq_len_v + q_row
-
-        @flyc.jit
-        def _store_splitk_partial_if_qrow():
-            if q_row < self.seq_len_v:
-                for dc in range_constexpr(self.traits.D_CHUNKS):
-                    for g in range_constexpr(2):
-                        dw_col = (
-                            dc * (self.traits.D_CHUNK // 2)
-                            + (2 * g + self.lane_div_32) * 4
-                        )
-                        self.ws_store_quad_i32(
-                            self._packed_o_128_dwords(v_o, dc, g),
-                            o_part_row_base + dw_col,
-                        )
-                if self.lane < fx.Index(32):
-                    self.ws_store_f32(m_row, mrow_base + ml_row_idx)
-                    self.ws_store_f32(l_row, lrow_base + ml_row_idx)
-
-        _store_splitk_partial_if_qrow()
-
-    def store_empty_split(self):
-        @flyc.jit
-        def _store_empty_split():
-            if self.max_num_tiles < self.split_t0 + fx.Index(4):
-                q_row_e = self.q_start + self.wave_q_offset + self.lane_mod_32
-                split_z_e = self.batch_idx * self.traits.NUM_KV_SPLITS + self.split_idx
-                o_row_base_e = (
-                    (split_z_e * self.traits.NUM_HEADS_Q + self.q_head_idx)
-                    * self.seq_len_v
-                    + q_row_e
-                ) * (self.traits.HEAD_DIM_V // 2)
-                grid_z_e = fx.Index(gpu.grid_dim.z)
-                mrow_base_e = (
-                    grid_z_e
-                    * self.traits.NUM_HEADS_Q
-                    * self.seq_len_v
-                    * (self.traits.HEAD_DIM_V // 2)
-                )
-                lrow_base_e = (
-                    mrow_base_e + grid_z_e * self.traits.NUM_HEADS_Q * self.seq_len_v
-                )
-                ml_row_e = (
-                    split_z_e * self.traits.NUM_HEADS_Q + self.q_head_idx
-                ) * self.seq_len_v + q_row_e
-                if q_row_e < self.seq_len_v:
-                    c_zero_i = fx.Int32(0)
-                    for dc in range_constexpr(self.traits.D_CHUNKS):
-                        for g in range_constexpr(2):
-                            dw_col = (
-                                dc * (self.traits.D_CHUNK // 2)
-                                + (2 * g + self.lane_div_32) * 4
-                            )
-                            self.ws_store_quad_i32(
-                                [c_zero_i, c_zero_i, c_zero_i, c_zero_i],
-                                o_row_base_e + dw_col,
-                            )
-                    if self.lane < fx.Index(32):
-                        self.ws_store_f32(fx.Float32(-1e30), mrow_base_e + ml_row_e)
-                        self.ws_store_f32(self.c_zero_f, lrow_base_e + ml_row_e)
-
-        _store_empty_split()

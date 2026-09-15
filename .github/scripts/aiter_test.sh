@@ -89,7 +89,7 @@ for file in "${sharded_files[@]}"; do
                 timeout 60m
                 bash -c '
                     set -euo pipefail
-                    python3 -m pytest -q op_tests/flydsl_tests/test_flydsl_paged_fmha*.py
+                    python3 -m pytest -q op_tests/flydsl_tests/test_flydsl_paged_fmha.py
                     exec python3 "$1"
                 '
                 _ "$file"

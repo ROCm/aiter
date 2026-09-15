@@ -13,20 +13,15 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.fmha_gfx950.paged_memory import load as _load
 
+from ..kernels_common import LOG2E as _LOG2E
 from .common import (
     _buffer_load_128,
     _buffer_load_lds_128,
     _buffer_store_128,
     _cu_load,
 )
-from .common import (
-    _read_exec_i64 as _read_exec_i64,  # noqa: PLC0414 - compatibility re-export
-)
-
-_LOG2E = 1.4426950408889634
-
+from .common import load as _load
 
 NUM_XCD_GFX950 = 8
 
@@ -83,30 +78,6 @@ def _bitcast_f32(value):
     return fx.Int32(value).bitcast(fx.Float32).ir_value()
 
 
-def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32):
-    """DUALWAVE_SWP pair mask asm: 2 compares followed by 2 cndmasks."""
-    asm_str = (
-        f"v_cmp_lt_i32_e64 $0, $6, {int(thr_x)}\n\t"
-        f"v_cmp_lt_i32_e64 $1, $6, {int(thr_y)}\n\t"
-        "v_cndmask_b32_e64 $2, $4, $7, $0\n\t"
-        "v_cndmask_b32_e64 $3, $5, $7, $1"
-    )
-    ret_struct_ty = ir.Type.parse("!llvm.struct<(i64, i64, i32, i32)>")
-    ret = llvm.inline_asm(
-        ret_struct_ty,
-        [
-            as_mlir_value(x_ref_i32),
-            as_mlir_value(y_ref_i32),
-            as_mlir_value(rel_i32),
-            as_mlir_value(neg_inf_i32),
-        ],
-        asm_str,
-        "=s,=s,=v,=v,2,3,v,v,~{vcc}",
-        has_side_effects=True,
-    )
-    return llvm.extractvalue(T.i32, ret, [2]), llvm.extractvalue(T.i32, ret, [3])
-
-
 def _reduction_pair(v_f32):
     v_i32 = _bitcast_i32(v_f32)
     pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
@@ -114,68 +85,6 @@ def _reduction_pair(v_f32):
     lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
     rhs_i32 = llvm.extractvalue(T.i32, swapped, [1])
     return _bitcast_f32(lhs_i32), _bitcast_f32(rhs_i32)
-
-
-def _anchor_scalar_f32(x):
-    """Pin a scalar f32 at the current source position (no-op asm)."""
-    x_ir = as_mlir_value(x)
-    return llvm.inline_asm(
-        x_ir.type,
-        [x_ir],
-        "",
-        "=v,0",
-        has_side_effects=True,
-    )
-
-
-def _anchor_v_o(traits, v_o):
-    """Pin v_o accumulators at the current source position."""
-    acc_irs = [as_mlir_value(v_o[dc]) for dc in range_constexpr(traits.D_CHUNKS)]
-    ret_ty = ir.Type.parse(
-        f"!llvm.struct<({', '.join(['vector<16xf32>'] * traits.D_CHUNKS)})>"
-    )
-    constraints = ",".join(
-        ["=v"] * traits.D_CHUNKS + [str(i) for i in range(traits.D_CHUNKS)]
-    )
-    ret = llvm.inline_asm(
-        ret_ty,
-        acc_irs,
-        "",
-        constraints,
-        has_side_effects=True,
-    )
-    return [
-        llvm.extractvalue(acc_irs[dc].type, ret, [dc])
-        for dc in range_constexpr(traits.D_CHUNKS)
-    ]
-
-
-def _anchor_v_p(traits, v_p, elem_dtype):
-    p_lo, p_hi = v_p
-    p_lo_all = _concat_vectors(p_lo[0], p_lo[1])
-    p_hi_all = _concat_vectors(p_hi[0], p_hi[1])
-    p_all = _concat_vectors(p_lo_all, p_hi_all)
-    p_all_ir = as_mlir_value(p_all)
-    p_all_anchored = llvm.inline_asm(
-        p_all_ir.type,
-        [p_all_ir],
-        "",
-        "=v,0",
-        has_side_effects=True,
-    )
-    p_vec = Vec(p_all_anchored, (traits.PV_K_STEPS * 2 * 8,), elem_dtype)
-    anchored_lo = []
-    anchored_hi = []
-    for pks in range_constexpr(traits.PV_K_STEPS):
-        lo_base = pks * 8
-        hi_base = traits.PV_K_STEPS * 8 + pks * 8
-        anchored_lo.append(
-            p_vec.shuffle(p_vec, [lo_base + i for i in range(8)]).ir_value()
-        )
-        anchored_hi.append(
-            p_vec.shuffle(p_vec, [hi_base + i for i in range(8)]).ir_value()
-        )
-    return anchored_lo, anchored_hi
 
 
 def _v_pair_to_vec32(v):
@@ -339,44 +248,6 @@ def _scale_o_accs(v_o, scale_scalar, traits, fm_fast):
     scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)
     for dc in range_constexpr(traits.D_CHUNKS):
         v_o[dc] = Vec(v_o[dc]) * scale_vec
-
-
-def _causal_pair_thresholds(kv_vectorized):
-    if const_expr(kv_vectorized):
-        return [
-            (0, 1),
-            (2, 3),
-            (4, 5),
-            (6, 7),
-            (16, 17),
-            (18, 19),
-            (20, 21),
-            (22, 23),
-        ]
-    return [
-        (0, 1),
-        (2, 3),
-        (8, 9),
-        (10, 11),
-        (16, 17),
-        (18, 19),
-        (24, 25),
-        (26, 27),
-    ]
-
-
-def _apply_dualwave_causal_mask_pair(s_values, rel_i32, neg_inf_i32, pair_thresholds):
-    for p in range_constexpr(len(pair_thresholds)):
-        thr_x, thr_y = pair_thresholds[p]
-        idx_x = p * 2
-        idx_y = p * 2 + 1
-        x_bits = _bitcast_i32(s_values[idx_x])
-        y_bits = _bitcast_i32(s_values[idx_y])
-        new_x, new_y = _attn_mask_vec2_imm(
-            rel_i32, neg_inf_i32, thr_x, thr_y, x_bits, y_bits
-        )
-        s_values[idx_x] = _bitcast_f32(new_x)
-        s_values[idx_y] = _bitcast_f32(new_y)
 
 
 def _vec_k_dma_oct_idx(traits, d, wave_id_uni, lane_in_warp):
@@ -681,7 +552,6 @@ class DualwaveFp8KernelContext:
         K=None,
         V=None,
         O=None,
-        DebugCounts=None,
         CuSeqQ=None,
         KvMetadata=None,
         LastPageLens=None,
@@ -707,7 +577,6 @@ class DualwaveFp8KernelContext:
         self.K = K
         self.V = V
         self.O = O
-        self.DebugCounts = DebugCounts
         self.CuSeqQ = CuSeqQ
         self.KvMetadata = KvMetadata
         self.LastPageLens = LastPageLens
@@ -1060,35 +929,6 @@ class DualwaveFp8KernelContext:
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
 
-    def init_workspace_io(self):
-        if const_expr(self.traits.SPLITK):
-            self.ws_div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(self.DebugCounts), fx.make_layout(1, 1)
-            )
-            self.ws_store_atom_32 = fx.make_copy_atom(
-                fx.rocdl.BufferCopy32b(), fx.Int32
-            )
-            self.ws_store_reg_32 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-            self.ws_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-
-    def ws_store_f32(self, f32_val, elem_index):
-        pack = Vec.from_elements([fx.Float32(f32_val)], fx.Float32).bitcast(fx.Int32)
-        fx.memref_store_vec(pack, self.ws_store_reg_32)
-        fx.copy(
-            self.ws_store_atom_32,
-            self.ws_store_reg_32,
-            fx.slice(self.ws_div, (None, fx.Int32(elem_index))),
-        )
-
-    def ws_store_quad_i32(self, dwords, elem_index):
-        pack = Vec.from_elements([fx.Int32(v) for v in dwords], fx.Int32)
-        fx.memref_store_vec(pack, self.ws_store_reg_128)
-        fx.copy(
-            self.store_atom_128,
-            self.ws_store_reg_128,
-            fx.slice(self.ws_div, (None, fx.Int32(elem_index))),
-        )
-
     def init_q_row(self):
         _init_dualwave_q_row(self)
 
@@ -1305,7 +1145,5 @@ class DualwaveFp8KernelContext:
         return _load(fx.get_iter(tile), dtype=fx.Int32, count=4).ir_value()
 
     def preserve_accumulators(self, v_o):
-        if const_expr(self.traits.PAGED):
-            # Preserve FP expression boundaries without inline-assembly pins.
-            return [llvm.intr_arithmetic_fence(fx.as_ir_value(acc)) for acc in v_o]
-        return _anchor_v_o(self.traits, v_o)
+        # Preserve FP expression boundaries without inline-assembly pins.
+        return [llvm.intr_arithmetic_fence(fx.as_ir_value(acc)) for acc in v_o]
