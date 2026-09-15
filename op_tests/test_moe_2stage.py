@@ -104,6 +104,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    fused_expert=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -120,6 +121,59 @@ def test_fmoe(
         and WQDType == dtypes.fp8
     )
     input = torch.randn((token, model_dim), dtype=dtype)
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        # Highest priority: activate n randomly-chosen experts (NOT the first n);
+        # the other E-n experts are masked to -inf. Load is spread evenly across
+        # the n active experts by round-robin (balanced), so all n are used.
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > E or n_act > token * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
+                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
+            )
+        sel = torch.randperm(E)[:n_act]  # random active expert ids
+        score = torch.full((token, E), float("-inf"), dtype=dtype)
+        slot = torch.arange(token * topk) % n_act  # round-robin over active set
+        rows = torch.arange(token).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    elif AITER_MOE_EXPERT_BALANCE:
+        score = torch.zeros((token, E), dtype=dtype)
+        start_col = 0
+        end_col = topk
+        for token_id in range(token):
+            score[token_id, start_col:end_col] = 1.0
+            start_col = end_col % E
+            end_col = start_col + topk
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    else:
+        score = torch.randn((token, E), dtype=dtype)
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+
+    if fused_expert:
+        fused_id = E
+        shared_ids = torch.full(
+            (token, 1), fused_id, dtype=topk_ids.dtype, device=topk_ids.device
+        )
+        shared_w = torch.ones(
+            (token, 1), dtype=topk_weights.dtype, device=topk_weights.device
+        )
+        topk_ids = torch.cat([topk_ids, shared_ids], dim=1)
+        topk_weights = torch.cat([topk_weights, shared_w], dim=1)
+        if not bool((topk_ids[:, -1] == fused_id).all().item()):
+            raise RuntimeError(
+                f"fused expert id={fused_id} was not appended to every topk row"
+            )
+        E = E + 1
+        topk = topk + 1
+        logger.info(
+            "fused expert id=%s; token=%s topk=%s sample_ids[0]=%s",
+            fused_id,
+            token,
+            topk,
+            topk_ids[0].detach().tolist(),
+        )
+
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0:
@@ -139,33 +193,6 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
-    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
-        # Highest priority: activate n randomly-chosen experts (NOT the first n);
-        # the other E-n experts are masked to -inf. Load is spread evenly across
-        # the n active experts by round-robin (balanced), so all n are used.
-        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
-        if n_act < topk or n_act > E or n_act > token * topk:
-            raise ValueError(
-                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
-                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
-            )
-        sel = torch.randperm(E)[:n_act]  # random active expert ids
-        score = torch.full((token, E), float("-inf"), dtype=dtype)
-        slot = torch.arange(token * topk) % n_act  # round-robin over active set
-        rows = torch.arange(token).repeat_interleave(topk)
-        score[rows, sel[slot]] = 1.0
-    elif AITER_MOE_EXPERT_BALANCE:
-        score = torch.zeros((token, E), dtype=dtype)
-        start_col = 0
-        end_col = topk
-        for token_id in range(token):
-            score[token_id, start_col:end_col] = 1.0
-            start_col = end_col % E
-            end_col = start_col + topk
-    else:
-        score = torch.randn((token, E), dtype=dtype)
-
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -697,6 +724,14 @@ parser.add_argument(
     help="""Number of top experts.
     e.g.: -k 2""",
 )
+parser.add_argument(
+    "--fused-expert",
+    action="store_true",
+    help="""Add one shared/fused expert on top of -e and append it to every
+    token's topk. Last topk id is always the extra expert.
+    AITER_MOE_NUM_EXPERT_ACTIVATED and AITER_MOE_EXPERT_BALANCE still apply
+    to the original -e/-k routed experts.""",
+)
 
 parser.add_argument(
     "-p",
@@ -1022,6 +1057,9 @@ def _moe_2stage_reference_workspace_gib(kwargs):
     model_dim = kwargs["model_dim"]
     inter_dim = kwargs["inter_dim"]
     expert = kwargs["E"]
+    if kwargs.get("fused_expert"):
+        expert += 1
+        topk += 1
     stage1_dim = inter_dim * 2 if kwargs["use_g1u1"] else inter_dim
 
     # torch_moe_stage1/2 materialize routed fp32 activations and dequantized
@@ -1035,9 +1073,12 @@ def _moe_2stage_reference_workspace_gib(kwargs):
 
 
 def _format_moe_2stage_case(kwargs):
+    fused = kwargs.get("fused_expert")
+    e_s = f"{kwargs['E']}+1" if fused else str(kwargs["E"])
+    k_s = f"{kwargs['topk']}+1" if fused else str(kwargs["topk"])
     return (
         f"token={kwargs['token']}, dim=({kwargs['model_dim']},{kwargs['inter_dim']}), "
-        f"E={kwargs['E']}, topk={kwargs['topk']}, act={kwargs['actType']}, "
+        f"E={e_s}, topk={k_s}, act={kwargs['actType']}, "
         f"q={kwargs['qType']}, aq={kwargs['AQDType']}, wq={kwargs['WQDType']}, "
         f"use_g1u1={kwargs['use_g1u1']}, doweight_stage1={kwargs['doweight_stage1']}"
     )
@@ -1099,6 +1140,7 @@ def _iter_legacy_cases():
             inter_dim=inter_dim,
             E=args.expert,
             topk=args.topk,
+            fused_expert=args.fused_expert,
             actType=act_type,
             gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
             qType=quant_type,
