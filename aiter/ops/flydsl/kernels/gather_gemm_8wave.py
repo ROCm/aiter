@@ -641,8 +641,7 @@ def compile_gather_kv_b_proj_8w(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    # BF16 has no output-scale device arguments. Compile-time unity sentinels
-    # cannot accidentally alias the activation scale in a later epilogue edit.
+    # BF16 output scales are compile-time constants, absent from the device ABI.
     OutputScaleArg = fx.Tensor if output_fp8 else fx.Constexpr[float]
 
     @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])

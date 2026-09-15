@@ -207,10 +207,14 @@ def _check_output(case):
     ):
         actual = case[key][: case["num_tokens"]].float()
         if case["out_scales"]:
-            # Keep the BF16 test's absolute tolerance for GEMM cancellation;
-            # E4M3 rounding adds at most 1/16 relative error for normal values.
+            # BF16 absolute tolerance plus E4M3's 1/16 normal-value rounding error.
             actual *= case["out_scales"][scale_name]
-            torch.testing.assert_close(actual, ref, rtol=0.065, atol=1e-2)
+            assert (
+                checkAllclose(
+                    actual, ref, rtol=0.065, atol=1e-2, tol_err_ratio=0, msg=key
+                )
+                == 0
+            )
         else:
             checkAllclose(ref, actual, atol=1e-2, rtol=1e-2, msg=key)
 
@@ -270,12 +274,7 @@ def test_gather_kv_b_proj_flydsl(
 def test_gather_kv_b_proj_flydsl_block_scale(
     num_tokens, n_heads, alloc, k_scale_value, output_dtype
 ):
-    """128x128 block scale -- the DeepSeek default quantization.
-
-    The scale varies along K, so it cannot be applied once at the end; the kernel
-    renormalises the accumulator between K tiles instead of keeping a second
-    accumulator. This is the test that the renormalisation is exact.
-    """
+    """Check accumulator rescaling between K tiles with 128x128 weight scales."""
     case = _make_case(
         num_tokens,
         n_heads,
@@ -292,16 +291,16 @@ def test_gather_kv_b_proj_flydsl_block_scale(
 @pytest.mark.parametrize("num_tokens", [512, 1000])
 @_OUTPUT_DTYPES
 @pytest.mark.parametrize(
-    "dims,scale_mode", [(DIMS_DEEPSEEK, "row"), (DIMS_DEEPSEEK, "block"), (DIMS_GLM, "row")]
+    "dims,scale_mode",
+    [(DIMS_DEEPSEEK, "row"), (DIMS_DEEPSEEK, "block"), (DIMS_GLM, "row")],
 )
-def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens, dims, output_dtype, scale_mode):
-    """Row-major (un-preshuffled) weight must match the preshuffled path exactly.
-
-    Same GEMM, only the B-side global->LDS address map and the K-tile stride
-    differ, so any difference here is an addressing bug, not arithmetic. The v
-    half starts at weight row ``nope``, which the two layouts reach differently.
-    """
-    case = _make_case(num_tokens, 12, output_dtype=output_dtype, scale_mode=scale_mode, dims=dims)
+def test_gather_kv_b_proj_flydsl_row_major_weight(
+    num_tokens, dims, output_dtype, scale_mode
+):
+    """Row-major and preshuffled weight layouts must produce identical outputs."""
+    case = _make_case(
+        num_tokens, 12, output_dtype=output_dtype, scale_mode=scale_mode, dims=dims
+    )
     _run_flydsl(case, weight_preshuffle=False)
     _check_output(case)
     first = [case[key].clone() for key in ("k_prefix", "v_prefix")]
@@ -342,12 +341,7 @@ def _supported(case, **kw):
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
 @_OUTPUT_DTYPES
 def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op(dims, output_dtype):
-    """The predicate and the op must never disagree about a configuration.
-
-    Both read one ``_unsupported_reason``; this pins that they keep doing so,
-    because the failure mode of a second copy is a caller routing a shape here
-    that the kernel then refuses mid-forward.
-    """
+    """The support predicate must agree with launch validation."""
     ok = _make_case(256, 12, output_dtype=output_dtype, dims=dims)
     assert _supported(ok)
     _run_flydsl(ok)  # and it really runs
@@ -505,17 +499,8 @@ def test_gather_kv_b_proj_flydsl_determinism_large_m(num_tokens, block_m):
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
 @_OUTPUT_DTYPES
 def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m, output_dtype):
-    """Every rope row must be written with the correct output scale for any BLOCK_M.
-
-    The fused rope copy maps 512 threads onto 256 rows per pass, so BLOCK_M > 256
-    needs more than one pass. A single pass leaves rows 256.. of every tile
-    unwritten while the GEMM half stays perfectly correct -- silent missing data
-    that an accuracy check on k_nope / v cannot see. On GLM-5.2 dims the rope
-    columns sit right behind the k half's dropped ones, and every tile of a
-    split head writes them, so a mis-dropped store lands here.
-    """
-    # 1536 is divisible by all three block_m under test, so no tail masking
-    # confounds the completeness check.
+    """Check every RoPE row, including the extra copy pass for BLOCK_M > 256."""
+    # Divisible by all tested tile heights to exclude tail masking.
     case = _make_case(
         1536,
         12,
@@ -546,14 +531,7 @@ def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m, output_dtype):
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
 @_OUTPUT_DTYPES
 def test_gather_kv_b_proj_flydsl_tail_is_untouched(dims, output_dtype):
-    """Rows past ``num_tokens`` must not be written.
-
-    This is the check that catches a wrong ``num_records_bytes``: the caller
-    preallocates the workspace at its maximum, so a bound derived from the
-    tensor extent instead of the live row count would let tail workgroups
-    scribble on data the caller still owns. The dropped k columns are steered
-    to exactly that bound, so an off-by-one there shows up here too.
-    """
+    """Store bounds must use the live row count, preserving the allocated tail."""
     m, alloc = 1000, 1024
     case = _make_case(m, 12, alloc, output_dtype=output_dtype, dims=dims)
     case["k_prefix"].fill_(float("nan"))
@@ -642,9 +620,8 @@ def _bench(num_tokens, n_heads, dims):
     [(0.37, 7.029999732971191), (0.73, 78.83999633789062)],
 )
 def test_fp8_reciprocal_rounding(descale, projection):
-    # An exact one-term dot product isolates output conversion from GEMM
-    # accumulation error. These values land on E4M3 ties after reciprocal
-    # multiplication, but just below the ties after direct fp32 division.
+    # Exact dot products that hit E4M3 ties with reciprocal multiplication,
+    # but fall below the ties with division.
     case = _make_case(
         257, 12, k_scale_value=projection, output_dtype=torch.float8_e4m3fn
     )
@@ -655,8 +632,7 @@ def test_fp8_reciprocal_rounding(descale, projection):
     case["weight"][:, 0] = 1
     case["weight_scale"].fill_(1)
     scale = torch.tensor([descale], device="cuda", dtype=torch.float32)
-    # Compute the boundary reference on CPU so the device compiler cannot
-    # transform the reference division into reciprocal multiplication too.
+    # CPU reference prevents device compiler rewrites of division.
     value = torch.tensor([projection], dtype=torch.float32)
     scale_cpu = torch.tensor([descale], dtype=torch.float32)
     expected = (value * scale_cpu.reciprocal()).to(torch.float8_e4m3fn)
@@ -686,7 +662,10 @@ def test_fp8_saturation_and_zero(zero):
         expected = (
             (ref * scale.reciprocal()).clamp(-448, 448).to(torch.float8_e4m3fn).float()
         )
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert (
+            checkAllclose(actual, expected, rtol=0, atol=0, tol_err_ratio=0, msg=key)
+            == 0
+        )
         assert actual.isfinite().all()
         if not zero:
             assert (actual.abs() == 448).any()
@@ -732,10 +711,10 @@ def test_fp8_graph_replay_uses_current_scales():
     _check_output(case)
 
 
-def _bench_fp8(num_tokens, n_heads):
+def _bench_fp8(num_tokens, n_heads, dims):
     from aiter.ops.quant import per_tensor_quant_hip
 
-    case = _make_case(num_tokens, n_heads)
+    case = _make_case(num_tokens, n_heads, dims=dims)
     args = (
         case["k_buffer"],
         case["k_scale"],
@@ -749,9 +728,7 @@ def _bench_fp8(num_tokens, n_heads):
 
     def dynamic_quant():
         gather_kv_b_proj_flydsl(*args, k, v)
-        # These benchmark shapes admit 256 rows of complete 16-element vectors.
-        # Per-tensor quantization is shape-independent; a compact row count
-        # avoids inflating the HIP amax kernel's atomic-reduction overhead.
+        # A 256-row view reduces HIP amax overhead while preserving vector alignment.
         return tuple(
             per_tensor_quant_hip(x.view(256, -1), quant_dtype=torch.float8_e4m3fn)
             for x in (k, v)
@@ -774,7 +751,17 @@ def _bench_fp8(num_tokens, n_heads):
 
     fused()
     for actual, ref, scale in zip((k8, v8), _torch_ref(case), (ks, vs)):
-        torch.testing.assert_close(actual.float() * scale, ref, rtol=0.065, atol=0.01)
+        assert (
+            checkAllclose(
+                actual.float() * scale,
+                ref,
+                rtol=0.065,
+                atol=0.01,
+                tol_err_ratio=0,
+                msg="fp8 gather benchmark",
+            )
+            == 0
+        )
     _, dynamic_us = run_perftest(dynamic_quant)
     _, supplied_scale_us = run_perftest(supplied_scale_quant)
     _, fused_us = run_perftest(fused)
@@ -802,7 +789,9 @@ def main():
     dims = tuple(args.dims)
 
     if args.fp8_output:
-        print(f"\n## FP8 gather output, {args.heads} heads, K=512\n")
+        print(
+            f"\n## FP8 gather output {dims[0]}+{dims[1]}, {args.heads} heads, K=512\n"
+        )
         print("The supplied-scale and fused paths reuse scales prepared before timing.")
         print("The HIP per-tensor baseline uses a 256-row view of each output.")
         print(
@@ -811,7 +800,7 @@ def main():
         )
         print("|---|---|---|---|---|---|")
         for m in (2048, 8192, 16384):
-            dynamic_us, supplied_scale_us, fused_us = _bench_fp8(m, args.heads)
+            dynamic_us, supplied_scale_us, fused_us = _bench_fp8(m, args.heads, dims)
             print(
                 f"| {m} | {dynamic_us:.2f} | {supplied_scale_us:.2f} | {fused_us:.2f} | "
                 f"{dynamic_us / fused_us:.2f}x | {supplied_scale_us / fused_us:.2f}x |"
