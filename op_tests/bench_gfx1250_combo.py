@@ -319,9 +319,7 @@ with _silence():
     from flydsl_tests import test_flydsl_grouped_gemm as moe_mod
     from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
 
-    import aiter
     import aiter.tuned_gemm as tuned_gemm_mod
-    from aiter import dtypes
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
     from aiter.test_common import (
         checkAllclose,
@@ -661,15 +659,19 @@ _MLA_V4_COMPARE_KEEP = [
     "batch",
     "kv_seq_lens",
     "num_kv_splits",
-    "asm_s1",
-    "triton_s1",
-    "s1 triton/asm",
-    "asm_s2",
-    "triton_s2",
-    "s2 triton/asm",
-    "asm_tot",
-    "triton_tot",
-    "tot triton/asm",
+    "asm us",
+    "asm TFLOPS",
+    "asm TB/s",
+    "asm err",
+    "asm o16 us",
+    "asm o16 TFLOPS",
+    "asm o16 TB/s",
+    "asm o16 err",
+    "triton us",
+    "triton TFLOPS",
+    "triton TB/s",
+    "triton/asm",
+    "triton/asm o16",
     "kernel",
 ]
 
@@ -1765,118 +1767,14 @@ def _perf_ratio(num, den):
     return f"{num / den:.2f}x"
 
 
-def _bench_mla_v4_asm_staged(
-    gqa, batch, ctx, split_kv, num_iters, num_warmup, data_init, seed
-):
-    """Asm kernel (s1) + merge (s2) + total; lives in combo bench only."""
-    mod = mla_v4_kargpreld_mod
-    q_seq = 1
-    assert (gqa, q_seq) in mod._SHIPPED_TILE_VARIANTS
-    if split_kv > 1:
-        min_split = ctx // split_kv
-        assert (
-            min_split >= 16
-        ), f"smallest KV split = floor({ctx}/{split_kv}) = {min_split} < 16"
-
-    device = "cuda"
-    inputs = mod._build_bf16_inputs(
-        batch=batch,
-        kv_seq_lens=ctx,
-        q_seq_logical=q_seq,
-        seed=seed,
-        data_init=data_init,
-        gqa_ratio=gqa,
-        attn_sink=True,
-    )
-    sm_scale = 1.0 / (mod._QUANT_D**0.5)
-    q_packed, q_rope = mod._native_to_2buff_for_asm(inputs["q_bf16"])
-    kv_packed, kv_rope = mod._native_to_2buff_for_asm(inputs["kv_bf16"])
-
-    total_q = inputs["q_bf16"].size(0)
-    num_seqs = inputs["qo_indptr"].size(0) - 1
-    num_heads = mod.NUM_KV_HEADS * gqa
-    output_buf = torch.empty(
-        (total_q, gqa, mod.V_HEAD_DIM), dtype=dtypes.bf16, device=device
-    )
-    split_indptr = torch.tensor(
-        [i * split_kv for i in range(num_seqs + 1)],
-        dtype=torch.int32,
-        device=device,
-    )
-    logits_buf = torch.empty(
-        (total_q, split_kv, num_heads, mod.V_HEAD_DIM),
-        dtype=torch.float32,
-        device=device,
-    )
-    lse_buf = torch.empty(
-        (total_q, split_kv, num_heads, 1), dtype=torch.float32, device=device
-    )
-    valid_split_count = torch.empty((num_seqs,), dtype=torch.int32, device=device)
-
-    common_kwargs = {
-        "q": q_packed,
-        "qrope": q_rope.contiguous(),
-        "kv_buffer": kv_packed,
-        "kvrope": kv_rope.contiguous(),
-        "output": output_buf,
-        "qo_indptr": inputs["qo_indptr"],
-        "kv_indptr": inputs["kv_indptr"],
-        "kv_page_indices": inputs["kv_page_indices"],
-        "kv_last_page_lens": inputs["kv_last_page_lens"],
-        "split_indptr": split_indptr,
-        "max_seqlen_q": inputs["max_seqlen_q"],
-        "sink": inputs["sink"],
-        "sm_scale": sm_scale,
-        "num_kv_splits": split_kv,
-        "logits": logits_buf,
-        "attn_lse": lse_buf,
-    }
-    perf = {"num_iters": num_iters, "num_warmup": num_warmup, "num_rotate_args": 1}
-
-    _, us_k = run_perftest(
-        aiter.mla_decode_v4_asm,
-        q_packed,
-        q_rope.contiguous(),
-        kv_packed,
-        kv_rope.contiguous(),
-        inputs["qo_indptr"],
-        inputs["kv_indptr"],
-        inputs["kv_page_indices"],
-        split_indptr,
-        inputs["sink"],
-        inputs["max_seqlen_q"],
-        sm_scale,
-        0,
-        split_kv,
-        logits_buf,
-        lse_buf,
-        output_buf,
-        valid_split_count,
-        int(split_kv > 1),
-        inputs["kv_last_page_lens"],
-        **perf,
-    )
-    _, us_tot = run_perftest(
-        aiter.mla.mla_decode_fwd_v4_nm,
-        out_16_nosplit=0,
-        **common_kwargs,
-        **perf,
-    )
-    asm_s2 = max(0.0, us_tot - us_k) if split_kv > 1 else 0.0
-    return {
-        "asm_s1": round(us_k, 2),
-        "asm_s2": round(asm_s2, 2),
-        "asm_tot": round(us_tot, 2),
-    }
-
-
 def run_mla_v4_decode(args):
     # Side-by-side asm (kargpreld) vs Triton sparse decode on the same shape grid.
     _unused_scale_init(args, "mla_v4_decode")
     iters = args.mla_v4_kargpreld_iters
     warmup = args.mla_v4_kargpreld_warmup
-    mla_v4_triton_mod._PERF["num_iters"] = iters
-    mla_v4_triton_mod._PERF["num_warmup"] = warmup
+    for mod in (mla_v4_kargpreld_mod, mla_v4_triton_mod):
+        mod._PERF["num_iters"] = iters
+        mod._PERF["num_warmup"] = warmup
     default_shapes = (
         _MLA_V4_DSV4_SHAPES if args.suite == "dsv4" else _MLA_V4_KARGPRELD_SHAPES
     )
@@ -1901,17 +1799,17 @@ def run_mla_v4_decode(args):
                     f"mla_v4_decode/gqa={gqa}/batch={batch}/ctx={ctx}/"
                     f"split={split_kv}/data={data_init}/seed={args.seed}"
                 ), _capture() as box:
-                    asm = _bench_mla_v4_asm_staged(
-                        gqa,
-                        batch,
-                        ctx,
-                        split_kv,
-                        iters,
-                        warmup,
-                        data_init,
-                        args.seed,
+                    asm = mla_v4_kargpreld_mod.test_mla_v4_nm(
+                        batch=batch,
+                        kv_seq_lens=ctx,
+                        q_seq_logical=1,
+                        num_kv_splits=split_kv,
+                        gqa_ratio=gqa,
+                        attn_sink=True,
+                        data_init=data_init,
+                        seed=args.seed,
                     )
-                    tri = mla_v4_triton_mod.bench_mla_v4_triton_staged(
+                    tri = mla_v4_triton_mod.bench_mla_v4_triton_perf(
                         gqa_ratio=gqa,
                         batch=batch,
                         kv_seq_lens=ctx,
@@ -1919,11 +1817,19 @@ def run_mla_v4_decode(args):
                         data_init=data_init,
                         seed=args.seed,
                     )
-                row.update(asm)
-                row.update(tri)
-                row["s1 triton/asm"] = _perf_ratio(row["triton_s1"], row["asm_s1"])
-                row["s2 triton/asm"] = _perf_ratio(row["triton_s2"], row["asm_s2"])
-                row["tot triton/asm"] = _perf_ratio(row["triton_tot"], row["asm_tot"])
+                # Keep each UT's measured metrics together; no extra perf pass.
+                for candidate, prefix in (("v4_nm", "asm"), ("v4_nm_o16", "asm o16")):
+                    for metric in ("us", "TFLOPS", "TB/s", "err"):
+                        key = f"{candidate} {metric}"
+                        if key in asm:
+                            row[f"{prefix} {metric}"] = asm[key]
+                for metric in ("us", "TFLOPS", "TB/s"):
+                    row[f"triton {metric}"] = tri[metric]
+                row["triton/asm"] = _perf_ratio(row["triton us"], row["asm us"])
+                if "asm o16 us" in row:
+                    row["triton/asm o16"] = _perf_ratio(
+                        row["triton us"], row["asm o16 us"]
+                    )
             except (RuntimeError, AssertionError, ValueError) as exc:
                 msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
                 row["err_msg"] = msg
