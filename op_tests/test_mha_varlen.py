@@ -1032,7 +1032,7 @@ if __name__ == "__main__":
         "-i",
         "--input_layout",
         type=str,
-        choices=["BSHD", "KVPACKED"],
+        choices=["BSHD", "KVPACKED", "QKVPACKED"],
         default="BSHD",
         help="""input_layout.
         e.g.: -i BSHD""",
