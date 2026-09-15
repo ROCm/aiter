@@ -819,6 +819,15 @@ class FmoeTuner(TunerCommon):
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
             k_wave=kparams.get("k_wave", 1),
+            w_layout=(
+                "guinterleave"
+                if (
+                    act_type == ActivationType.Silu
+                    and kparams.get("a_dtype") == "bf16"
+                    and kparams.get("b_dtype") == "fp4"
+                )
+                else "standard"
+            ),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -1760,14 +1769,19 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         elif q_dtype_w == dtypes.fp4x2 and q_dtype_a in (dtypes.bf16, dtypes.fp16):
-            # a16w4 mxfp4 (bf16/fp16 activation, SiTUv2): standard GGUU (separated
-            # gate/up) W1 layout, matching main (moe_kernels a16w4 dispatch uses
-            # w_layout="standard"). w2 has no gate/up (gate_up=False), scale via
-            # plain e8m0_shuffle.
-            w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, False)
-            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, False)
+            # a16w4 mxfp4: SiTUv2 SEPARATED is GGUU (gate_up=False). Silu a16w4 is
+            # reached only via GateMode.INTERLEAVE, which consumes GUGU W1
+            # (shuffle_weight_a16w4/shuffle_scale_a16w4 gate_up=True) plus
+            # gate_up=False W2 with shuffle_scale_a16w4.
+            _w1_gu = act_type == ActivationType.Silu
+            w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, _w1_gu)
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, _w1_gu)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
-            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+            w2_scale_aiter = (
+                shuffle_scale_a16w4(w2_scale, expert, False)
+                if _w1_gu
+                else fp4_utils.e8m0_shuffle(w2_scale)
+            )
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
@@ -3531,6 +3545,10 @@ class FmoeTuner(TunerCommon):
                     # Match the kernel assert; a floor divide lets tile_n=96 through.
                     if kparams["tile_n"] % (16 * _n_waves) != 0:
                         continue
+                    if inter_dim % kparams["tile_n"] != 0:
+                        continue
+                    if kparams.get("k_batch", 1) != 1:
+                        continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
@@ -4919,6 +4937,9 @@ class FmoeTuner(TunerCommon):
     ):
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
+        _bms = os.environ.get("FMOE_TUNE_BLOCK_MS", "").strip()
+        if _bms:
+            blockMs = [int(x) for x in _bms.split(",") if x.strip()]
         keys = self.keys
         tasks = []
         tasks_ck = []
