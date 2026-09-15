@@ -30,6 +30,7 @@ Usage:
 """
 
 import argparse
+import statistics
 
 import torch
 
@@ -314,10 +315,10 @@ def run_case(
     assert oob_ok, "OOB cells were not left at -inf"
 
     if not bench:
-        return
+        return None
 
     _, us_fp4 = run_perftest(run_fp4, num_iters=iters, num_warmup=warmup)
-    _bench_vs_atom(
+    return _bench_vs_atom(
         kv_bf16,
         slot_mapping,
         block_tables,
@@ -333,7 +334,9 @@ def run_case(
         kv_block_size,
         t_max,
         bs,
+        out,
         us_fp4,
+        cos_bf16,
         iters,
         warmup,
     )
@@ -355,7 +358,9 @@ def _bench_vs_atom(
     kv_block_size,
     t_max,
     bs,
+    fp4_out,
     us_fp4,
+    cos_fp4_bf16,
     iters,
     warmup,
 ):
@@ -426,12 +431,15 @@ def _bench_vs_atom(
 
         atom_out = atom_logits()
         torch.cuda.synchronize()
-        vo, vr = [], []
+        vo, vr, vf = [], [], []
         for r in range(total_tokens):
             b, e = int(row_to_batch[r]), int(le[r])
             vo.append(atom_out[r, cu[b] : cu[b] + e])
             vr.append(ref_bf16[r, :e])
-        cos_atom = _cos(torch.cat(vo), torch.cat(vr)).item()
+            vf.append(fp4_out[r, :e])
+        atom_values = torch.cat(vo)
+        cos_atom = _cos(atom_values, torch.cat(vr)).item()
+        cos_fp4_fp8 = _cos(torch.cat(vf), atom_values).item()
 
         _, us_gather = run_perftest(
             cp_gather_indexer_k_quant_cache,
@@ -455,8 +463,70 @@ def _bench_vs_atom(
     if atom_ok:
         print("  {:<28} | {:>10.2f}".format("ATOM cp_gather", us_gather))
         print("  {:<28} | {:>10.2f}".format("ATOM cp_gather+fp8_logits", us_atom))
+        print(f"  [accuracy] FP4 vs ATOM fp8 cos={cos_fp4_fp8:.6f}")
         print(f"  [accuracy] ATOM fp8 vs bf16 ref cos={cos_atom:.6f}")
         print(f"  speedup (ATOM total / FP4) = {us_atom / us_fp4:.2f}x")
+    if not atom_ok:
+        return None
+    return {
+        "fp4_us": us_fp4,
+        "fp8_gather_us": us_gather,
+        "fp8_total_us": us_atom,
+        "speedup": us_atom / us_fp4,
+        "fp4_bf16_cos": cos_fp4_bf16,
+        "fp8_bf16_cos": cos_atom,
+        "fp4_fp8_cos": cos_fp4_fp8,
+    }
+
+
+def _print_standard_bench_summary(samples):
+    print("\n" + "=" * 126)
+    print("Standard prefill indexer sweep (FP8 gather+logits vs FP4 direct-paged)")
+    print("=" * 126)
+    print(
+        "  {:<11} | {:>3} | {:>5} | {:>6} | {:>8} | {:>8} | {:>8} | "
+        "{:>7} | {:>9} | {:>9} | {:>9} | {:>7}".format(
+            "shape",
+            "bs",
+            "n_q",
+            "ctx",
+            "fp4_us",
+            "gather",
+            "fp8_us",
+            "speedup",
+            "fp4_cos",
+            "fp8_cos",
+            "fp4/fp8",
+            "repeats",
+        )
+    )
+    print("  " + "-" * 122)
+    for shape, rows in samples:
+        row = {
+            key: statistics.median(sample[key] for sample in rows)
+            for key in (
+                "fp4_us",
+                "fp8_gather_us",
+                "fp8_total_us",
+                "speedup",
+                "fp4_bf16_cos",
+                "fp8_bf16_cos",
+                "fp4_fp8_cos",
+            )
+        }
+        print(
+            "  {name:<11} | {bs:>3} | {n_q:>5} | {ctx:>6} | "
+            "{fp4_us:>8.2f} | {fp8_gather_us:>8.2f} | {fp8_total_us:>8.2f} | "
+            "{speedup:>6.2f}x | {fp4_bf16_cos:>9.6f} | {fp8_bf16_cos:>9.6f} | "
+            "{fp4_fp8_cos:>9.6f} | {repeats:>7}".format(
+                name=shape[0],
+                bs=shape[1],
+                n_q=shape[2],
+                ctx=shape[3],
+                repeats=len(rows),
+                **row,
+            )
+        )
     print()
 
 
@@ -698,6 +768,11 @@ def _print_varqlen_perf_summary():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", action="store_true")
+    ap.add_argument(
+        "--bench-sweep",
+        action="store_true",
+        help="Run standard 2K/8K/32K prefill indexer shapes",
+    )
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--n_q", type=int, default=64)
@@ -705,6 +780,12 @@ def main():
     ap.add_argument("--head_dim", type=int, default=128)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument(
+        "--bench-repeats",
+        type=int,
+        default=3,
+        help="Independent repetitions per standard sweep shape",
+    )
     args = ap.parse_args()
 
     if get_arch() != "gfx950":
@@ -734,6 +815,33 @@ def main():
             iters=args.iters,
             warmup=args.warmup,
         )
+    if args.bench_sweep:
+        standard_shapes = (
+            ("small", 1, 32, 2048),
+            ("medium", 4, 64, 2048),
+            ("long", 4, 64, 8192),
+            ("very-long", 8, 16, 32768),
+        )
+        samples = []
+        for shape in standard_shapes:
+            _, bs, n_q, ctx = shape
+            rows = []
+            for repeat in range(args.bench_repeats):
+                result = run_case(
+                    bs,
+                    [[ctx] * n_q for _ in range(bs)],
+                    heads=args.heads,
+                    head_dim=args.head_dim,
+                    seed=7 + repeat,
+                    bench=True,
+                    iters=args.iters,
+                    warmup=args.warmup,
+                )
+                if result is not None:
+                    rows.append(result)
+                torch.cuda.empty_cache()
+            samples.append((shape, rows))
+        _print_standard_bench_summary(samples)
 
     # ── Variable-qlen (per-batch MTP via cu_seq_q) sweep + TFLOPS/bandwidth ──
     print("=" * 80)
