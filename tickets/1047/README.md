@@ -46,3 +46,20 @@ later; do not read 1f select µs as HIP.
 Table: `vllm_amd_select` (MQA+top-k+expand) and `vllm_amd_gqa` vs oracle
 (block/token **set** equality; GQA `checkAllclose`). Oracle is not timed.
 
+## Phase 1c — AITER #4882 Triton (no Gluon)
+
+Vendored from ROCm/aiter **#4882** head **`150c7bc12b45`** (2026-09-15),
+parent `2462d5b6427b`. Portable Triton only: `qsa_paged_mqa_logits`,
+`qsa_expand_block_indices`, `qsa_sparse_paged_gqa` (`num_stages=2`). Gluon
+kernels are not imported. HIP top-k: same as phase 1b at pin time (decode
+`.so` or oracle tie-break), so `4882_triton_select` microseconds are that
+same fallback, not HIP. Family A GQA is group 12 / D=256, so #4882 Gluon
+would not auto-dispatch here anyway.
+
+- Kernels: `aiter/ops/triton/_triton_kernels/attention/qsa_{paged_mqa_logits,expand_indices,sparse_paged_gqa}.py`
+- Launchers: `aiter/ops/triton/_triton_kernels/attention/qsa_4882.py`
+- Import: `aiter.ops.triton.attention.qsa_4882`
+
+Table: `4882_triton_select` / `4882_triton_gqa` vs oracle (separate from the
+vLLM AMD table). Do not merge family A vs B.
+
