@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import csv
 import functools
 import os
 import re
-import csv
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 

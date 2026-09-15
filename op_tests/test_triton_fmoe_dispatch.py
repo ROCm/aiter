@@ -6,8 +6,8 @@ import unittest
 from unittest import mock
 
 try:
-    from aiter import ActivationType, QuantType, dtypes
     import aiter.fused_moe as fused_moe_mod
+    from aiter import ActivationType, QuantType, dtypes
     from aiter.ops.flydsl.moe_common import GateMode
 
     _IMPORT_ERR = None
@@ -30,33 +30,33 @@ class TestTritonFmoeDispatch(unittest.TestCase):
         fused_moe_mod._load_triton_fmoe_configs.cache_clear()
 
     def _call(self, *, gfx="gfx1201", cu_num=64, **overrides):
-        kwargs = dict(
-            M=1152,
-            model_dim=2048,
-            inter_dim=128,
-            expert=256,
-            topk=8,
-            activation=ActivationType.Silu,
-            dtype=dtypes.bf16,
-            q_dtype_a=dtypes.bf16,
-            q_dtype_w=dtypes.bf16,
-            quant_type=QuantType.No,
-            is_g1u1=True,
-            doweight_stage1=False,
-            expert_mask=None,
-            hidden_pad=0,
-            intermediate_pad=0,
-            bias1=None,
-            bias2=None,
-            w1_scale=None,
-            w2_scale=None,
-            a1_scale=None,
-            a2_scale=None,
-            num_local_tokens=None,
-            gate_mode=GateMode.SEPARATED,
-            w1_is_contiguous=True,
-            w2_is_contiguous=True,
-        )
+        kwargs = {
+            "M": 1152,
+            "model_dim": 2048,
+            "inter_dim": 128,
+            "expert": 256,
+            "topk": 8,
+            "activation": ActivationType.Silu,
+            "dtype": dtypes.bf16,
+            "q_dtype_a": dtypes.bf16,
+            "q_dtype_w": dtypes.bf16,
+            "quant_type": QuantType.No,
+            "is_g1u1": True,
+            "doweight_stage1": False,
+            "expert_mask": None,
+            "hidden_pad": 0,
+            "intermediate_pad": 0,
+            "bias1": None,
+            "bias2": None,
+            "w1_scale": None,
+            "w2_scale": None,
+            "a1_scale": None,
+            "a2_scale": None,
+            "num_local_tokens": None,
+            "gate_mode": GateMode.SEPARATED,
+            "w1_is_contiguous": True,
+            "w2_is_contiguous": True,
+        }
         kwargs.update(overrides)
         with (
             mock.patch.object(fused_moe_mod, "get_gfx_runtime", return_value=gfx),
