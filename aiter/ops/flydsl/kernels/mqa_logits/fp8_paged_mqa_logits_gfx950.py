@@ -368,6 +368,12 @@ def _build_kernel():
                 )
 
             row = fx.Int32(0)
+            while row + fx.Int32(3) < nn:
+                _score_row(row)
+                _score_row(row + fx.Int32(1))
+                _score_row(row + fx.Int32(2))
+                _score_row(row + fx.Int32(3))
+                row = row + fx.Int32(4)
             while row + fx.Int32(1) < nn:
                 _score_row(row)
                 _score_row(row + fx.Int32(1))
