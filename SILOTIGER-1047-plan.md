@@ -194,9 +194,14 @@ separate steps (plumbing → live AMD → #4882 → rocprof → optional NVIDIA)
       `block_table`, `M`/`L` sweep, oracle on dense vs gathered. No
       competitor kernels. Sweep lives in `bench_*`, not `test_*`. Gate:
       pytest `-q` then `HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py`
-- [ ] Pin **vLLM AMD live path** (`qwen4_exp/amd/ops/qsa.py` + HIP
+- [x] Pin **vLLM AMD live path** (`qwen4_exp/amd/ops/qsa.py` + HIP
       `top_k_per_row_decode`). Record the exact vLLM / AITER SHAs in
-      `tickets/1047/`.
+      `tickets/1047/`. Vendored Triton subset:
+      `aiter/ops/triton/_triton_kernels/attention/qsa_vllm_amd.py`
+      (vLLM `836bb3839ffe`). HIP top-k via
+      `aiter.ops.topk._hip_top_k_per_row_decode` (not FlyDSL top-k) when
+      `module_top_k_per_row.so` is present. Phase 1 tables were recorded
+      without that module (oracle tie-break on MQA logits).
 - [ ] Pin **#4882 Triton** (`qsa_paged_mqa_logits` / `qsa_sparse_paged_gqa`)
       and **#4882 Gluon** (gfx950, Triton `>= 3.6`, auto-dispatch only).
 - [ ] Optional NVIDIA QSA column — labeled so it cannot be mistaken for the
