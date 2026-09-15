@@ -37,9 +37,12 @@ sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
 import pandas as pd
 from build_targets import (
+    DEFAULT_NUM_XCDS,
     GFX_CU_NUM_MAP,
+    NON_DEFAULT_NUM_XCDS,
     filter_tune_df,
     get_build_targets_env,
+    target_num_xcds,
 )
 
 REPRO_CSV = os.path.join(
@@ -940,6 +943,58 @@ def test_build_tune_dict_strict_unknown_kernel():
 
 
 # ---------------------------------------------------------------------------
+# Section 7: target_num_xcds()
+# ---------------------------------------------------------------------------
+
+
+def test_target_num_xcds():
+    _section("7. target_num_xcds() — die count per SKU")
+
+    for (gfx, cu_num), expected in NON_DEFAULT_NUM_XCDS.items():
+        _check(
+            f"{gfx} at {cu_num} CUs has {expected} dies",
+            target_num_xcds(gfx, cu_num) == expected,
+            f"got {target_num_xcds(gfx, cu_num)}",
+        )
+
+    for gfx, cu_num in [("gfx950", 256), ("gfx942", 304), ("gfx1250", 256)]:
+        _check(
+            f"{gfx} at {cu_num} CUs takes the default",
+            target_num_xcds(gfx, cu_num) == DEFAULT_NUM_XCDS,
+            f"got {target_num_xcds(gfx, cu_num)}",
+        )
+
+    # A SKU splits on the CU count, so the same arch must answer differently.
+    _check(
+        "gfx950 answers differently at 128 and 256 CUs",
+        target_num_xcds("gfx950", 128) != target_num_xcds("gfx950", 256),
+    )
+
+    # The count is baked into both the launcher's grid padding and the traits
+    # the device swizzles by, so a lookup that read anything but its arguments
+    # could hand those two sites different answers.
+    orig_archs = os.environ.pop("GPU_ARCHS", None)
+    orig_cu = os.environ.pop("CU_NUM", None)
+    try:
+        os.environ["GPU_ARCHS"] = "gfx950"
+        os.environ["CU_NUM"] = "256"
+        first = target_num_xcds("gfx950", 128)
+        os.environ["CU_NUM"] = "128"
+        _check(
+            "the lookup ignores the environment",
+            target_num_xcds("gfx950", 128) == first == 4,
+            f"got {first} then {target_num_xcds('gfx950', 128)}",
+        )
+    finally:
+        os.environ.pop("GPU_ARCHS", None)
+        os.environ.pop("CU_NUM", None)
+        if orig_archs is not None:
+            os.environ["GPU_ARCHS"] = orig_archs
+        if orig_cu is not None:
+            os.environ["CU_NUM"] = orig_cu
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -962,6 +1017,7 @@ if __name__ == "__main__":
     test_runtime_dispatch_key()
     test_blockscale_kernel_name_forwarding()
     test_build_tune_dict_strict_unknown_kernel()
+    test_target_num_xcds()
 
     print(f"\n{'='*60}")
     print(f"  Results: {_passed} passed, {_failed} failed")

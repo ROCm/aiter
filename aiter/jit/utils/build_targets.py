@@ -4,6 +4,7 @@
 # Pure-Python arch constants and env-driven build target resolution.
 # No torch dependency — safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
+import functools
 import os
 
 GFX_MAP = {
@@ -55,30 +56,46 @@ NON_DEFAULT_NUM_XCDS = {
 DEFAULT_NUM_XCDS = 8
 
 
-def target_num_xcds(gfx: str, cu_num=None) -> int:
-    """Die count of the part a build targets.
+def target_num_xcds(gfx: str, cu_num: int, default: int = DEFAULT_NUM_XCDS) -> int:
+    """Die count of the SKU named by a (gfx, cu_num) pair.
 
-    Without an explicit cu_num this resolves through get_build_targets(), so it
-    follows GPU_ARCHS and CU_NUM the way the CK codegens filter their tuning
-    CSVs, and needs no GPU when the environment names the target. An
-    architecture absent from the target list takes the default.
+    A lookup and nothing else, so every caller holding the same cu_num gets the
+    same answer. Callers that need the count for a whole build resolve the
+    cu_num once with build_target_cu_num() and pass it here.
+    """
+    return NON_DEFAULT_NUM_XCDS.get((gfx, int(cu_num)), default)
+
+
+def build_target_cu_num(gfx: str):
+    """CU count this build targets for gfx, or None when gfx is not a target.
+
+    Follows GPU_ARCHS and CU_NUM the way the CK codegens filter their tuning
+    CSVs, and needs no GPU when the environment names the target.
 
     Raises whatever get_build_targets() raises when neither the environment nor
     a GPU can name a target, so a build does not quietly bake one part's count.
     """
+    # Deferred: chip_info imports this module at load time.
+    try:
+        from chip_info import get_build_targets
+    except ImportError:
+        from aiter.jit.utils.chip_info import get_build_targets
+    for target_gfx, target_cu in get_build_targets():
+        if target_gfx == gfx:
+            return target_cu
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def build_num_xcds(gfx: str) -> int:
+    """Die count this build targets for gfx.
+
+    Cached so two calls in one build cannot disagree.
+    """
+    cu_num = build_target_cu_num(gfx)
     if cu_num is None:
-        # Deferred: chip_info imports this module at load time.
-        try:
-            from chip_info import get_build_targets
-        except ImportError:
-            from aiter.jit.utils.chip_info import get_build_targets
-        for target_gfx, target_cu in get_build_targets():
-            if target_gfx == gfx:
-                cu_num = target_cu
-                break
-        else:
-            return DEFAULT_NUM_XCDS
-    return NON_DEFAULT_NUM_XCDS.get((gfx, int(cu_num)), DEFAULT_NUM_XCDS)
+        return DEFAULT_NUM_XCDS
+    return target_num_xcds(gfx, cu_num)
 
 
 def _parse_gpu_archs_env(gfx_env: str) -> list[str]:
