@@ -1,4 +1,4 @@
-name: PR Title Tags & Labels
+name: PR Title Tags, Labels & Assignees
 
 # Keeps PR-title component tags ([Triton/Gluon], [HIP], [ASM], [CK], ...) and
 # the matching PR labels uniform and always in sync with the PR's changed
@@ -19,6 +19,10 @@ name: PR Title Tags & Labels
 # The tag set is documented in CONTRIBUTE.md ("PR Title Format") — keep the
 # two in sync when adding or renaming tags.
 #
+# The PR is also assigned to everyone who has committed to it, so a change
+# several people worked on is not owned by whoever happened to open it. The
+# cap of ten is GitHub's own.
+#
 # pull_request_target is used so the default token can edit titles on fork
 # PRs as well. This is safe here because the job never checks out or executes
 # PR code — it only reads the changed-file list from the API.
@@ -29,8 +33,9 @@ on:
     branches: [main]
 
 permissions:
+  contents: read  # the PR's commit list
   pull-requests: write
-  issues: write  # labels on PRs go through the issues API
+  issues: write   # labels and assignees on PRs go through the issues API
 
 concurrency:
   group: pr-title-tags-${{ github.event.pull_request.number }}
@@ -213,3 +218,78 @@ jobs:
             } else {
               core.info('Labels already in sync.');
             }
+
+      - name: Assign the PR to everyone who committed to it
+        # Add-only. Contributors can appear at any point in a PR's life, so
+        # this runs on pushes too, but it never removes anyone: unassigning
+        # yourself is a human signal and the workflow does not argue with it.
+        if: ${{ contains(fromJSON('["opened", "ready_for_review", "reopened", "synchronize"]'), github.event.action) }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const MAX_ASSIGNEES = 10;   // GitHub's hard cap per PR
+
+            const pr = context.payload.pull_request;
+            if (pr.labels.some(l => l.name === 'no-auto-title')) {
+              core.info("Label 'no-auto-title' set — skipping.");
+              return;
+            }
+            const already = new Set(pr.assignees.map(a => a.login));
+            const slots = MAX_ASSIGNEES - already.size;
+            if (slots <= 0) {
+              core.info(`Already at the ${MAX_ASSIGNEES}-assignee limit.`);
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            // The commits on this PR — not the history of the files it
+            // touches. `author` is GitHub's own resolution of a commit to an
+            // account, so no email-to-login guessing; it is null when the
+            // commit email matches no user.
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            const weight = new Map();
+            for (const c of commits) {
+              const login = c.author?.login;
+              if (!login) continue;
+              if (c.author.type === 'Bot' || login.endsWith('[bot]')) continue;
+              weight.set(login, (weight.get(login) || 0) + 1);
+            }
+
+            // Most commits first, so that on the rare PR with more than ten
+            // contributors the slots go to the people who wrote most of it.
+            const ranked = [...weight.entries()]
+              .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+              .map(([login]) => login)
+              .filter(login => !already.has(login));
+
+            // The assignees API drops users without push access SILENTLY, so
+            // check each one first and keep walking the list rather than
+            // spending a slot on someone who would never appear on the PR.
+            const assignees = [];
+            const unassignable = [];
+            for (const login of ranked) {
+              if (assignees.length >= slots) break;
+              try {
+                await github.request('GET /repos/{owner}/{repo}/assignees/{assignee}', {
+                  owner, repo, assignee: login,
+                });
+                assignees.push(login);
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                unassignable.push(login);
+              }
+            }
+
+            if (unassignable.length) {
+              core.info(`Committers without push access: ${unassignable.join(', ')}`);
+            }
+            if (!assignees.length) {
+              core.info('No new assignable committers.');
+              return;
+            }
+            await github.rest.issues.addAssignees({
+              owner, repo, issue_number: pr.number, assignees,
+            });
+            core.info(`Assigned ${assignees.length}: ${assignees.join(', ')}`);
