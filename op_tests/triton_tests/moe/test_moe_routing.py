@@ -201,6 +201,28 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
     _assert_indx_equal(ref_scatter, tri_scatter)
 
 
+@pytest.mark.parametrize("n_tokens", [8, 16, 17, 64])
+def test_routing_compiles(n_tokens):
+    """Regression for the _combined_routing[_fused] compile failure: an early
+    return in _expt_data_compute_stage2[_fused] tripped a Triton TTIR->TTGIR
+    legalization crash. Covers both the fused (<=16) and regular (>16) sort
+    paths; just asserts routing compiles and runs without raising."""
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    n_expts_tot, n_expts_act = 8, 4
+    torch.manual_seed(0)
+    logits = init_data(n_tokens, n_expts_tot, device="cuda", dtype=torch.float32)
+
+    routing_data, gather_indx, scatter_indx = routing(logits, n_expts_act)
+
+    n_gates = n_tokens * n_expts_act
+    assert gather_indx.shape[0] == n_gates
+    assert scatter_indx.shape[0] == n_gates
+    assert routing_data.n_expts_tot == n_expts_tot
+    assert routing_data.n_expts_act == n_expts_act
+
+
 # --------------------------
 # Reference implementations for routing with score mode paths
 # --------------------------
