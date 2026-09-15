@@ -31,8 +31,8 @@ D_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 E4M3_MAX = 448.0
 
 # Both kernels the launch runs are named after the gluon kernel, the combine as
-# _pa_decode_sparse_reduce, so one substring picks up both and nothing else.
-KERNEL_MATCH = "_pa_decode_sparse"
+# _sparse_mla_reduce, so one substring picks up both and nothing else.
+KERNEL_MATCH = "_sparse_mla"
 FLUSH_BYTES = 512 << 20
 
 _flush_buf = None

@@ -193,7 +193,7 @@ def test_global_load_path():
     q, cache, ks, idx, ptr, truth = _build("tensor", 8, 16, 2048, live, ragged=False)
     big = torch.empty(3_800_000, D_QK, dtype=cache.dtype, device=cache.device)
     big[:live] = cache
-    assert smd.max_addressable_bytes(big) >= smd.MAX_BYTES
+    assert smd.max_addressable_bytes(big) >= 2**31 - 1  # past buffer_load's offset
     out, _ = sparse_mla_fwd(q, big, ptr, idx, sm, kv_scale=ks)
     e = rel_err(out, reference(q, truth.to(torch.bfloat16), idx, ptr, sm))
     assert e < 2e-2, f"global load path: rel-err {e:.3e}"

@@ -14,9 +14,9 @@ One kernel serves two geometries, selected by the ROPE_SEPARATE constexpr:
         K-only rope and the QK contraction chains a second MFMA into the first.
         The KV buffer is the entire V in both geometries.
 
-Cache formats (Fmt.KIND), per segment. The two packed kinds are both vLLM's
-``--kv-cache-dtype fp8_ds_mla``, which is one name for two byte layouts
-distinguished by model generation, so they carry the generation instead:
+Cache formats (Fmt.KIND), per segment. vLLM calls both packed kinds
+--kv-cache-dtype fp8_ds_mla, one name for two byte layouts told apart by model
+generation, so the tags here carry the generation instead:
 
     "bf16"            full-row bf16
     "fp8_scalar"      whole-row fp8 + a single per-tensor f32 scale (k_scale).
@@ -91,19 +91,13 @@ def _cache_load(
 
 
 @gluon.jit
-def _fp8_to_f32(x_u8, FP8_FNUZ: gl.constexpr):
-    # fnuz -> f32 has no native cvt on gfx950 (software unpack); fnuz -> bf16 is
-    # cheap and exact (3 mantissa bits), so route fnuz through bf16.
-    if FP8_FNUZ:
-        return x_u8.to(gl.float8e4b8, bitcast=True).to(gl.bfloat16).to(gl.float32)
+def _fp8_to_f32(x_u8):
     return x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32)
 
 
 @gluon.jit
-def _fp8_to_bf16(x_u8, FP8_FNUZ: gl.constexpr):
+def _fp8_to_bf16(x_u8):
     # Exact: fp8's 3 mantissa bits fit bf16's 8.
-    if FP8_FNUZ:
-        return x_u8.to(gl.float8e4b8, bitcast=True).to(gl.bfloat16)
     return x_u8.to(gl.float8e4nv, bitcast=True).to(gl.bfloat16)
 
 
@@ -294,10 +288,7 @@ class Cfg:
         KV_DIM,
         ROPE_DIM,
         ROPE_SEPARATE,
-        MFMA_K,
         NUM_WARPS,
-        GATHER_TW1,
-        LDS_PAD,
         UNI_TILE,
         HAS_INVALID,
         HEAD_ALIGNED,
@@ -307,7 +298,6 @@ class Cfg:
         IDX_CACHE="",
         ASYNC_LDS=False,
         RELAXED_LOAD=True,
-        ROPE_VEC=16,
         PAD_INTERVAL=1024,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -317,7 +307,10 @@ class Cfg:
         self.ROPE_SEPARATE = gl.constexpr(ROPE_SEPARATE)
         self.QK_DIM = gl.constexpr(KV_DIM + (ROPE_DIM if ROPE_SEPARATE else 0))
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        # Threads the row gather spends on the head dim
+        GATHER_TW1 = 32
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
+        LDS_PAD = 16 if FP8_MFMA else 8
         self.LDS_PAD = gl.constexpr(LDS_PAD)
         self.UNI_TILE = gl.constexpr(UNI_TILE)
         self.HAS_INVALID = gl.constexpr(HAS_INVALID)
@@ -328,12 +321,9 @@ class Cfg:
         self.IDX_CACHE = gl.constexpr(IDX_CACHE)
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
+        ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
-        # K=32 is the only shape the backend offers for plain fp8 operands, and
-        # it divides KV_DIM, ROPE_DIM and BLOCK_K alike, so one layout still
-        # covers both dots.
-        if FP8_MFMA:
-            MFMA_K = 32
+        MFMA_K = 32 if FP8_MFMA else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
 
         self.qk_layout = gl.constexpr(
@@ -358,9 +348,9 @@ class Cfg:
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, KW))
         self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, KW))
 
-        # 16 uint8 per thread = 128-bit gather loads
-        # GATHER_TW1 = threads spent on the head dim: 32 requests a whole
-        # 512 B token row per instruction, at the cost of a longer slot vector.
+        # 16 uint8 per thread = 128-bit gather loads. GATHER_TW1 lanes span a row,
+        # so one gather covers GATHER_TW1 * 16 = 512 B of it, at the cost of a
+        # longer slot vector.
         GSPT = 16
         self.gather_l = gl.constexpr(
             gl.BlockedLayout(
@@ -462,8 +452,8 @@ class Fmt:
     IS_FP8: gl.constexpr  # pipeline select: prefetched fp8 loop vs bf16 loop
     BLOCK_SIZE: gl.constexpr
     USE_BUFFER_LOAD: gl.constexpr
-    FP8_FNUZ: gl.constexpr
-    ASM_DEQ: gl.constexpr
+    # dsv4 E8M0 dequant: "none" | "upcast" | "asm" (gathers the int16 view)
+    DEQ: gl.constexpr
     NOPE_CHUNK: gl.constexpr
     CHUNK_AXIS: gl.constexpr
     NOPE_DIM: gl.constexpr  # fp8 payload width (448 dsv4; KV_DIM elsewhere)
@@ -487,8 +477,7 @@ class Fmt:
         KIND,
         BLOCK_SIZE,
         USE_BUFFER_LOAD,
-        FP8_FNUZ,
-        ASM_DEQ,
+        DEQ,
         NOPE_DIM,
         NOPE_CHUNK,
         CHUNK_AXIS,
@@ -497,8 +486,7 @@ class Fmt:
         self.IS_FP8 = gl.constexpr(KIND != "bf16")
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
         self.USE_BUFFER_LOAD = gl.constexpr(USE_BUFFER_LOAD)
-        self.FP8_FNUZ = gl.constexpr(FP8_FNUZ)
-        self.ASM_DEQ = gl.constexpr(ASM_DEQ)
+        self.DEQ = gl.constexpr(DEQ if KIND == "fp8_dsv4_mla" else "none")
         self.NOPE_CHUNK = gl.constexpr(NOPE_CHUNK)
         self.CHUNK_AXIS = gl.constexpr(CHUNK_AXIS)
         self.NOPE_DIM = gl.constexpr(NOPE_DIM)
@@ -594,7 +582,7 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
     """Dequant one fp8 slab into kv_smem[:, off:off+W]. Dequant stays in f32
     (gfx950 has no bf16 multiply). sc: raw UE8M0 byte (dsv4), f32 scale
     (uniform/dsmla), or unused ("fp8_scalar": bare fp8 -> bf16 convert)."""
-    if fmt.ASM_DEQ:
+    if fmt.DEQ == "asm":
         # x_u8 is the int16 view here (see _gather_full), so its column count is W8/2.
         W8: gl.constexpr = x_u8.shape[1] * 2
         # Adjacent fp8 columns share a scale (groups are even), so dropping
@@ -607,14 +595,21 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
         else:
             kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
     else:
-        if fmt.KIND == "fp8_scalar":
-            val = _fp8_to_bf16(x_u8, fmt.FP8_FNUZ)
+        if fmt.DEQ == "upcast":
+            # Upstream fused fp8 x E8M0 -> bf16 upcast; the driver only asks for
+            # it when cdna4.scaled_upcast exists, else DEQ="asm" (_deq_asm).
+            # sc is the raw E8M0 byte, already in x_u8's shape and layout.
+            val = gl.amd.cdna4.scaled_upcast(
+                x_u8.to(gl.float8e4nv, bitcast=True), sc, gl.bfloat16
+            )
+        elif fmt.KIND == "fp8_scalar":
+            val = _fp8_to_bf16(x_u8)
         else:
             if fmt.KIND == "fp8_g64" or fmt.KIND == "fp8_dsv32_mla":
                 scale = sc
             else:
                 scale = gl.exp2(sc.to(gl.float32) - 127.0)
-            val = (_fp8_to_f32(x_u8, fmt.FP8_FNUZ) * scale).to(gl.bfloat16)
+            val = (_fp8_to_f32(x_u8) * scale).to(gl.bfloat16)
         if AXIS == 1:
             kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
         else:
@@ -824,7 +819,7 @@ def _async_segment(
     """Direct-to-LDS tile walk, one LDS buffer.
 
     vmcnt is one in-order FIFO, so the wait goes before any plain load in the body: a
-    plain load outstanding past the newest copy group would drag `wait_group` into
+    plain load outstanding past the newest copy group would drag wait_group into
     waiting for that copy too. The body has no masked variant: the slot read is
     clamped and the partial tail falls out of the score mask (UNI_TILE).
     """
@@ -1023,7 +1018,7 @@ def _gather_full(
                 fmt.USE_BUFFER_LOAD,
                 CACHE=cfg.GATHER_CACHE,
             )
-        if fmt.ASM_DEQ:
+        if fmt.DEQ == "asm":
             # 2-byte elements: <2 x i16> = 4 packed fp8 per VGPR out of one
             # dword load. Same byte as nope_row (both even), addressed through
             # the bf16 view; the layout convert is a rename (shared dim-0 tiling).
@@ -1083,7 +1078,7 @@ def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
         elif fmt.KIND == "fp8_dsv32_mla":
             rope_smem.store(k_rope)
         elif fmt.KIND == "fp8_scalar" and cfg.ROPE_SEPARATE:
-            rope_smem.store(_fp8_to_bf16(k_rope, fmt.FP8_FNUZ))
+            rope_smem.store(_fp8_to_bf16(k_rope))
         # "fp8_g64": the whole head is one fp8 tile; nothing else to store.
 
 
@@ -1331,7 +1326,7 @@ def _decode_tile(
                     other=127,
                     CACHE=cfg.GATHER_CACHE,
                 )
-            if fmt.ASM_DEQ:
+            if fmt.DEQ == "asm":
                 row16 = gl.convert_layout(
                     nope_row >> 1, gl.SliceLayout(1, cfg.gather16_l)
                 )
@@ -1378,7 +1373,7 @@ def _decode_tile(
                     fmt.USE_BUFFER_LOAD,
                     CACHE=cfg.GATHER_CACHE,
                 )
-            if fmt.ASM_DEQ:
+            if fmt.DEQ == "asm":
                 row16 = gl.convert_layout(
                     nope_row >> 1, gl.SliceLayout(1, cfg.gather16_l)
                 )
@@ -1668,14 +1663,14 @@ def _process_segment(
     return m_i, l_i, acc
 
 
-_pa_decode_sparse_repr = make_kernel_repr(
-    "_pa_decode_sparse",
+_sparse_mla_repr = make_kernel_repr(
+    "_sparse_mla",
     ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "NUM_SPLITS", "MAIN_FMT", "ROPE_SEPARATE"],
 )
 
 
-@gluon.jit(repr=_pa_decode_sparse_repr)
-def _pa_decode_sparse(
+@gluon.jit(repr=_sparse_mla_repr)
+def _sparse_mla(
     # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
     # R = ROPE_DIM, nnz = total gathered tokens in a segment's index list.
     q_ptr,  # [C, H, S (+R when ROPE_SEPARATE)] bf16
@@ -1734,9 +1729,6 @@ def _pa_decode_sparse(
     BLOCK_K: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
-    MFMA_K: gl.constexpr,
-    GATHER_TW1: gl.constexpr,
-    LDS_PAD: gl.constexpr,
     # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows,
     # 1 = columns); >= the tile's extent means one shot.
     NOPE_CHUNK: gl.constexpr,
@@ -1751,14 +1743,13 @@ def _pa_decode_sparse(
     MAIN_SPLITS: gl.constexpr,
     # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
     ADAPTIVE_SPLITS: gl.constexpr,
-    ASM_DEQ: gl.constexpr,
+    DEQ: gl.constexpr,  # see Fmt.DEQ
     # Per-cache buffer/global gate: buffer_load carries a 32-bit offset (2 GB),
     # and the two caches are sized independently.
     MAIN_USE_BUFFER_LOAD: gl.constexpr,
     EXTRA_USE_BUFFER_LOAD: gl.constexpr,
     IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
-    FP8_FNUZ: gl.constexpr,
     FP8_MFMA: gl.constexpr = False,
     # q already quantized to e4m3 by the caller, plus the scalar f32 scale it
     # was quantized with. This is the calling convention aiter's asm
@@ -1773,7 +1764,6 @@ def _pa_decode_sparse(
     IDX_CACHE: gl.constexpr = _NO_CACHE,
     ASYNC_LDS: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
-    ROPE_VEC: gl.constexpr = 16,
     PAD_INTERVAL: gl.constexpr = 1024,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
@@ -1814,10 +1804,6 @@ def _pa_decode_sparse(
         "fp8_dsv4_mla/fp8_dsv32_mla rows carry a rope tail; ROPE_DIM=0 is "
         "inconsistent",
     )
-    gl.static_assert(
-        (not ASM_DEQ) or MAIN_FMT == "fp8_dsv4_mla" or EXTRA_FMT == "fp8_dsv4_mla",
-        "ASM_DEQ is the dsv4 E8M0 dequant",
-    )
     # The fp8 path needs one positive scalar scale per cache, since that is what
     # folds outside the loop, and OCP e4m3 code points, which is what the matrix
     # core reads.
@@ -1826,9 +1812,9 @@ def _pa_decode_sparse(
         or (MAIN_FMT == "fp8_scalar" and (not HAS_EXTRA or EXTRA_FMT == "fp8_scalar")),
         "FP8_MFMA requires the per-tensor fp8 format on every segment",
     )
-    gl.static_assert(not (FP8_MFMA and FP8_FNUZ), "FP8_MFMA is OCP e4m3 only")
     # The direct-to-LDS path stages raw code points, needs the clamped (branch-free)
     # tail, and carries no per-tile validity vector.
+    # TODO(has_invalid): the sentinel restriction is conservative, not fundamental.
     gl.static_assert(
         (not ASYNC_LDS)
         or (FP8_MFMA and UNI_TILE and not HAS_INVALID and not HAS_EXTRA),
@@ -1855,10 +1841,7 @@ def _pa_decode_sparse(
         HEAD_SIZE,
         ROPE_DIM,
         ROPE_SEPARATE,
-        MFMA_K,
         NUM_WARPS,
-        GATHER_TW1,
-        LDS_PAD,
         UNI_TILE,
         HAS_INVALID,
         HEAD_ALIGNED,
@@ -1868,7 +1851,6 @@ def _pa_decode_sparse(
         IDX_CACHE,
         ASYNC_LDS,
         RELAXED_LOAD,
-        ROPE_VEC,
         PAD_INTERVAL,
     )
     main_fmt = Fmt(
@@ -1876,8 +1858,7 @@ def _pa_decode_sparse(
         MAIN_FMT,
         MAIN_BLOCK_SIZE,
         MAIN_USE_BUFFER_LOAD,
-        FP8_FNUZ,
-        ASM_DEQ and MAIN_FMT == "fp8_dsv4_mla",
+        DEQ,
         NOPE_DIM,
         NOPE_CHUNK,
         CHUNK_AXIS,
@@ -1887,8 +1868,7 @@ def _pa_decode_sparse(
         EXTRA_FMT,
         EXTRA_BLOCK_SIZE,
         EXTRA_USE_BUFFER_LOAD,
-        FP8_FNUZ,
-        ASM_DEQ and EXTRA_FMT == "fp8_dsv4_mla",
+        DEQ,
         NOPE_DIM,
         NOPE_CHUNK,
         CHUNK_AXIS,
@@ -2215,14 +2195,14 @@ def _pa_decode_sparse(
         )
 
 
-_pa_decode_sparse_reduce_repr = make_kernel_repr(
-    "_pa_decode_sparse_reduce",
+_sparse_mla_reduce_repr = make_kernel_repr(
+    "_sparse_mla_reduce",
     ["BLOCK_M", "HEAD_SIZE", "NUM_SPLITS"],
 )
 
 
-@gluon.jit(repr=_pa_decode_sparse_reduce_repr)
-def _pa_decode_sparse_reduce(
+@gluon.jit(repr=_sparse_mla_reduce_repr)
+def _sparse_mla_reduce(
     part_m_ptr,
     part_l_ptr,
     part_acc_ptr,
