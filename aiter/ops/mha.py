@@ -3211,6 +3211,7 @@ def _flash_attn_varlen_backward(
     is_v3_atomic_fp32: bool | None = True,
     how_v3_bf16_cvt: int | None = 1,
     zero_tensors: bool = False,
+    logits_soft_cap: float = 0.0,
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink: Tensor | None = None,
@@ -3282,6 +3283,7 @@ def _flash_attn_varlen_backward(
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= not swa
+        ret &= logits_soft_cap == 0.0
         ret &= pssk() or psskddv()
 
         return ret
@@ -3295,8 +3297,15 @@ def _flash_attn_varlen_backward(
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= (
+            (hdim_q in (128, 256)) or (hdim_q == 192 and hdim_v == 128)
+        ) and hdim_q % 8 == 0
         ret &= not swa
+        ret &= logits_soft_cap == 0.0
+        if hdim_q == 256:
+            ret &= not causal
+            ret &= nhead_q == nhead_k
+            ret &= q.dtype == dtypes.bf16
 
         return ret
 
@@ -3328,6 +3337,9 @@ def _flash_attn_varlen_backward(
         return ret
 
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
+    # gfx950 hd256 backward uses a16 (atomic32=0)
+    if get_gfx() == "gfx950" and hdim_q == 256:
+        is_v3_atomic_fp32 = False
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
@@ -3520,6 +3532,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
             ctx.cu_seqlens_q_padded = cu_seqlens_q_padded
             ctx.cu_seqlens_k_padded = cu_seqlens_k_padded
+            ctx.logits_soft_cap = logits_soft_cap
 
         out = out_padded[..., :head_size_v_og]
 
@@ -3576,6 +3589,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+            logits_soft_cap=ctx.logits_soft_cap,
             cu_seqlens_q_padded=ctx.cu_seqlens_q_padded,
             cu_seqlens_k_padded=ctx.cu_seqlens_k_padded,
             sink=None,
