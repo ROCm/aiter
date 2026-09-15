@@ -48,6 +48,8 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    requires_flydsl_stage2_reduce,
+    resolve_flydsl_grid_y_persist_m,
     resolve_flydsl_stage1_tile_n,
     resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
@@ -691,7 +693,9 @@ def _precompile_to_cache(
             )
 
             torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-            accumulate = mode != "reduce"
+            accumulate = mode != "reduce" and not requires_flydsl_stage2_reduce(
+                tokens, model_dim, 2
+            )
             out = torch.zeros((tokens, model_dim), dtype=torch_out_dtype, device=dev)
             target = out
             if not accumulate:
@@ -732,7 +736,7 @@ def _precompile_to_cache(
             else:
                 _persist_m = -1 if m_blocks > 256 else 1
             if a_dtype == "fp8":
-                _persist_m = 1
+                _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
             _n_in = model_dim
             _k_in = inter_dim
@@ -802,6 +806,7 @@ def _precompile_to_cache(
                 sort_block_m=sort_block_m,
                 waves_per_eu=waves_per_eu,
                 use_async_copy=use_async_copy,
+                use_global_a=a.numel() * a.element_size() >= (1 << 32),
                 cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
