@@ -30,8 +30,7 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
 )
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent,
-    fence_agent_acquire,
-    fence_agent_release,
+    load_i32_nt,
 )
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
@@ -799,11 +798,14 @@ def _launch_gemm_impl(
             # Publish this block's complete BF16 partial before joining the
             # per-output-tile arrival counter. The dynamically last block owns
             # reduction, so no block spins and oversized grids cannot deadlock.
+            # Every lane drains its workspace stores before the block barrier;
+            # the last block then reads partials non-temporally from the shared
+            # agent L2.  A release fence would unnecessarily write back the
+            # whole L2, while an acquire fence would invalidate unrelated cache.
             rocdl.s_waitcnt(0)
             gpu.barrier()
             arrival = fx.Int32(-1)
             if tid == fx.Int32(0):
-                fence_agent_release()
                 tile_idx = (bx_m // BM) * (i32_n // BN) + by_n // BN
                 arrival = fx.Int32(
                     atomic_add_agent(
@@ -815,33 +817,16 @@ def _launch_gemm_impl(
             # trip and block barrier.
             arrival = fx.Int32(rocdl.readfirstlane(T.i32, arrival))
             if (wave == fx.Int32(0)) & (arrival == fx.Int32(k_batch - 1)):
-                fence_agent_acquire()
-                ws_ptr_ty = fx.PointerType.get(
+                bf16_ptr_ty = fx.PointerType.get(
                     BFloat16.ir_type,
                     address_space=fx.AddressSpace.Global,
                     alignment=4,
-                )
-                ws_nrec = (
-                    fx.Int64(k_batch) * fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
-                )
-                ws_flat = fx.logical_divide(
-                    fx.rocdl.make_buffer_tensor(
-                        fx.Tensor(
-                            fx.make_view(
-                                fx.inttoptr(ws_ptr_ty, arg_c),
-                                fx.make_layout(1 << 28, 1),
-                            )
-                        ),
-                        max_size=False,
-                        num_records_bytes=ws_nrec,
-                    ),
-                    fx.make_layout(1, 1),
                 )
                 out_flat = fx.logical_divide(
                     fx.rocdl.make_buffer_tensor(
                         fx.Tensor(
                             fx.make_view(
-                                fx.inttoptr(ws_ptr_ty, arg_out),
+                                fx.inttoptr(bf16_ptr_ty, arg_out),
                                 fx.make_layout(1 << 28, 1),
                             )
                         ),
@@ -854,7 +839,6 @@ def _launch_gemm_impl(
                 # standalone gfx1250 reducer, these registers coexist with the
                 # GEMM body and can otherwise lower GEMM occupancy.
                 reduce_vec = 2
-                vec_f32 = T.vec(reduce_vec, T.f32)
                 vec_bf16 = T.vec(reduce_vec, BFloat16.ir_type)
                 reduce_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), BFloat16)
                 slab_stride = fx.Int32(i32_m * N)
@@ -866,18 +850,19 @@ def _launch_gemm_impl(
                     out_off = by_n + tid * fx.Int32(reduce_vec)
                     reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
                     for sk in range_constexpr(k_batch):
-                        partial = fx.make_rmem_tensor(reduce_vec, BFloat16)
-                        fx.copy(
-                            reduce_copy,
-                            ws_flat[
-                                None,
-                                out_off + fx.Int32(sk) * slab_stride,
-                            ],
-                            partial,
+                        partial_dw = fx.Int32(
+                            load_i32_nt(
+                                arg_c,
+                                (
+                                    out_off + fx.Int32(sk) * slab_stride
+                                )
+                                // fx.Int32(2),
+                            )
                         )
-                        reduced = reduced + fx.Vector(fx.memref_load_vec(partial)).extf(
-                            vec_f32
+                        partial = Vec.from_elements([partial_dw], Int32).bitcast(
+                            BFloat16
                         )
+                        reduced = reduced + partial.to(Float32)
                     result = fx.make_rmem_tensor(reduce_vec, BFloat16)
                     fx.memref_store_vec(reduced.truncf(vec_bf16), result)
                     fx.copy(reduce_copy, result, out_flat[None, out_off])
