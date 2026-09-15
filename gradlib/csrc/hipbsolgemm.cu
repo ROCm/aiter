@@ -8,7 +8,10 @@
 // __HIP_NO_HALF_CONVERSIONS__ #endif
 
 #include "hipbsolgemm.cuh"
-#include <ATen/hip/HIPContext.h>
+// ATen/hip/HIPContext.h omitted: it transitively pulls in hipsparse and hipblas
+// headers that are not installed on all ROCm setups. Everything hipbsolgemm
+// needs (OptionalHIPGuardMasqueradingAsCUDA, getCurrentHIPStream, device_of)
+// is already provided by the impl header below, which the .cuh also includes.
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 // #include <rocblas/rocblas.h>
@@ -104,11 +107,20 @@ std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
                                                 {at::kChar, HIP_R_8I},
                                                 {at::kShort, HIP_R_16I},
                                                 {at::kInt, HIP_R_32I},
-                                                // uint8 is used as a packed-FP4 proxy: two
-                                                // MXFP4 E2M1 elements per byte. HIP_R_4F_E2M1
-                                                // tells hipBLASLt the true element type so it
-                                                // applies the correct tile layout and scale math.
+                                                // Packed-FP4 (two MXFP4 E2M1 elements per byte).
+                                                // Both the native torch float4 type and uint8
+                                                // (used as a proxy in older code) map to
+                                                // HIP_R_4F_E2M1 so hipBLASLt applies the correct
+                                                // tile layout and scale math.
                                                 {at::kByte, static_cast<hipDataType>(HIP_R_4F_E2M1)}
+#ifdef TORCH_Float4_e2m1fn_x2
+                                                ,
+                                                {at::kFloat4_e2m1fn_x2, static_cast<hipDataType>(HIP_R_4F_E2M1)}
+#endif
+#ifdef TORCH_Float8_e8m0fnu
+                                                ,
+                                                {at::kFloat8_e8m0fnu, HIP_R_8F_UE8M0}
+#endif
 #ifdef ENABLE_TORCH_FP8
                                                 ,
                                                 {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ},

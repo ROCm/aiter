@@ -91,7 +91,8 @@ def hipb_mm_out(
 
     uint8 inputs are interpreted as packed MXFP4 (two E2M1 elements per byte,
     HIP_R_4F_E2M1), matching the layout produced by aiter's gemm_a4w4_asm.
-    """ ...
+    """
+    ...
 
 
 @compile_ops("module_rocsolgemm")

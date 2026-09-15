@@ -9,7 +9,11 @@
 
 #include <ATen/ATen.h>
 #include <ATen/autocast_mode.h>
-#include <ATen/hip/HIPContext.h>
+// ATen/hip/HIPContext.h transitively includes hipsparse/hipsparse.h via
+// HIPContextLight.h, but hipsparse is not installed on all ROCm setups.
+// hipbsolgemm only needs OptionalHIPGuardMasqueradingAsCUDA, device_of(), and
+// getCurrentHIPStream() — all provided by the impl header below.
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <c10/hip/HIPFunctions.h>
 #include <torch/extension.h>
 #include <torch/torch.h>
