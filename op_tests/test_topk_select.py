@@ -90,6 +90,105 @@ def test_topk_select(m, n, k, tie, deterministic):
     return ret
 
 
+@benchmark()
+def test_topk_argmax_half(m, n, dtype):
+    """k=1 at a half format, against the two things a caller would do instead.
+
+    `torch` is what a caller holding bf16 logits runs today. `cast+select` is
+    what adopting this entry cost before the reduction took half formats, and it
+    is here because it is the arm that says whether taking the dtype natively
+    was worth doing -- not as an alternative anyone should pick.
+
+    Exactness is against `torch.argmax` at the tensor's own dtype, with no
+    tolerance: widening a half format to fp32 is lossless, so "close" would be
+    the wrong bar and would hide a column picked one place over.
+    """
+    x = torch.randn(m, n, dtype=dtype)
+    ref = x.argmax(dim=-1)
+    nbytes = m * n * x.element_size() + m * 4
+
+    ret = {"gfx": get_gfx(), "dtype": str(dtype)}
+    arms = {
+        "torch": lambda: x.argmax(dim=-1),
+        "cast+select": lambda: topk_select(x.to(dtypes.fp32), 1, tie="low")[1],
+        "select": lambda: topk_select(x, 1, tie="low")[1],
+    }
+    for name, fn in arms.items():
+        out, us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} match"] = bool(torch.equal(out.view(-1).long(), ref))
+    ret["select vs torch"] = ret["torch us"] / ret["select us"]
+    return ret
+
+
+def test_half_invariants(m, n):
+    """What the half-format reduction promises beyond agreeing on random rows.
+
+    Random rows never tie, and a tie is the whole reason `tie="low"` exists; the
+    documented NaN rule and the signed zeros are likewise invisible without rows
+    built to hold them.
+    """
+    failures = []
+
+    def want(cond, label):
+        if not cond:
+            failures.append(label)
+
+    for dtype in (dtypes.bf16, dtypes.fp16):
+        tag = str(dtype).rsplit(".", 1)[-1]
+        x = torch.randn(4, n, dtype=dtype)
+        # Every element equal: column 0, or the tie-break is not the lowest.
+        x[0] = 1.0
+        # A maximum repeated at three columns: the first of them.
+        x[1] = -1.0
+        x[1, [7, 8, n // 2]] = 5.0
+        # -0.0 and 0.0 are one score with two bit patterns and must not become
+        # two keys; the earlier column wins whichever pattern it holds.
+        x[2] = -3.0
+        x[2, 5] = -0.0
+        x[2, 9] = 0.0
+        # NaN outranks +inf here, which `torch.argmax` does not promise -- so
+        # this row is checked against the rule, and the three above against
+        # torch as well.
+        x[3] = 0.0
+        x[3, 1] = float("inf")
+        x[3, n - 2] = float("nan")
+
+        got = topk_select(x, 1, tie="low")[1].view(-1).long()
+        torch.cuda.synchronize()
+        want(got.tolist() == [0, 7, 5, n - 2], f"{tag}: ties, zeros and NaN")
+        want(
+            torch.equal(got[:3], x[:3].contiguous().argmax(dim=-1)),
+            f"{tag}: agrees with torch where torch promises an order",
+        )
+
+        # A row bound still bounds a half format, and an empty row answers -1.
+        end = torch.tensor([n, 16, 1, 0], dtype=dtypes.i32)
+        _, i = topk_select(x, 1, end=end, tie="low")
+        torch.cuda.synchronize()
+        want(int(i[3]) == -1, f"{tag}: an empty row yields -1")
+        want(
+            all(int(i[r]) < int(end[r]) for r in range(3)),
+            f"{tag}: end= bounds every index",
+        )
+
+        # Past k=1 there is no half-format build, and saying so is the point:
+        # falling through to "no backend serves" would read as a geometry
+        # problem and send the caller looking in the wrong place.
+        try:
+            topk_select(x, 8)
+        except NotImplementedError:
+            pass
+        else:
+            failures.append(f"{tag}: k>1 was accepted without a build")
+
+    del m
+    for label in failures:
+        aiter.logger.error("INVARIANT FAILED: %s", label)
+    return failures
+
+
 def _run_single_backend(x, row_lens, k, backend):
     """Call one backend through the entry by hiding the others from it.
 
@@ -261,6 +360,20 @@ def main():
     bad = test_invariants(64, 32768, 512)
     aiter.logger.info(
         "invariants: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    bad = test_half_invariants(64, 32768)
+    aiter.logger.info(
+        "half-format invariants: %s",
+        "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
+    )
+
+    df = [
+        test_topk_argmax_half(m, n, dtype)
+        for dtype in (dtypes.bf16, dtypes.fp16)
+        for m, n in itertools.product(args.rows, args.width)
+    ]
+    aiter.logger.info(
+        "k=1 half-format summary:\n%s", pd.DataFrame(df).to_markdown(index=False)
     )
 
     for tie in args.tie:

@@ -76,7 +76,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
 _VEC = 4
 # Half the CU's threads, so two or three workgroups stay resident and one
 # streams tiles through another's barriers. Worth 1.3x..1.5x over a full-width
-# block across N=64K..1M and k=512/2048.
+# block across N=64K..1M and k=512/2048 -- in the regime where
+# `topk_per_row_radix_stream_block_threads` keeps it, which is many rows below
+# k=4096.
 #
 # Read `radix_cut` before changing this: the width interacts with register
 # pressure, and this kernel has been silently wrong once for that reason. Soak
@@ -84,6 +86,25 @@ _VEC = 4
 # ten thousand, and only above a row count, so a smoke test passes on a broken
 # build.
 _BLOCK_THREADS = 512
+# The full width wins in two regimes, and the rule is ROWS and k -- not width.
+# Fitted over a 195-cell sweep of both widths (rows 16..16384, widths 16K..1M,
+# k 16..4096, `bt_grid.csv`): `k >= 4096 or rows <= 256` costs a mean 1.001x and
+# a worst 1.12x against picking the better width per cell, where holding 512
+# everywhere costs 1.135x / 2.03x.
+#
+#   k = 4096      the full width wins 39 of 39 cells, ratio 0.76..0.85
+#   rows <= 256   it wins 24 of 24 at every k below 4096, median 0.86
+#   rows >= 512   it LOSES, median 1.47 at 512 rising to 2.12 at 16384
+#
+# A width term was tried and scores identically, so it is not in the rule: the
+# apparent width effect was rows in disguise. A first pass at this shipped
+# `width >= 262144` off two low-row samples and was 2.00x off at
+# 4096x262144 k=256 -- the regime it had never measured.
+#
+# Both block widths soak clean over 338484 rows at k=16..2048.
+_WIDE_BLOCK_THREADS = 1024
+_WIDE_BLOCK_MAX_ROWS = 256
+_WIDE_BLOCK_MIN_K = 4096
 # 11 + 11 + 10 covers the 32-bit key in three passes. 2048 buckets is 8 KiB of
 # LDS, divided evenly across the block, so the scan is one wave prefix plus a
 # fold over the wave totals at any block width.
@@ -191,6 +212,18 @@ def _wave_inclusive_prefix_i32(val, lane, wave_size):
 
 
 @lru_cache(maxsize=64)
+def topk_per_row_radix_stream_block_threads(rows: int, k: int) -> int:
+    """The block width to build for a call of `rows` rows at this `k`.
+
+    A build serves every row WIDTH -- the row length is a runtime value -- but
+    not every row count or k, so the choice is the caller's. It lives here
+    because the constants and the sweep behind them do.
+    """
+    if k >= _WIDE_BLOCK_MIN_K or rows <= _WIDE_BLOCK_MAX_ROWS:
+        return _WIDE_BLOCK_THREADS
+    return _BLOCK_THREADS
+
+
 def _resolve_lds(k: int, block_threads: int, lds_budget: int, vec: int):
     """The (unroll, soft_trigger) the LDS budget allows, or None if none does.
 

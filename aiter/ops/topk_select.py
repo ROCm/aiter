@@ -7,7 +7,8 @@ aiter carries four per-row selectors, each fastest in a different corner and
 none able to cover the whole domain:
 
     argmax   k=1 only, and a reduction rather than a selection: the row split
-             across as many workgroups as it takes to fill the part. Owns k=1.
+             across as many workgroups as it takes to fill the part. Owns k=1,
+             and is the only one to take bf16/fp16 as well as fp32.
     small_k  one chunk per lane, so k <= wave_size, and a survivor buffer that
              grows with the row bound. Unbeatable on short rows and tiny k.
     plain    the C++/ASM radix selector. Bounded at k=2048. Scales with rows
@@ -24,23 +25,29 @@ silently. The differences are listed on `topk_select` itself.
 
 Ties: as in DeepSelect, no prefix index may be assumed by default. `plain` has
 no tie order at all (measured: 40 equal scores, 8 places, a set that is neither
-the lowest nor the highest); `small_k` resolves toward the larger column,
-`decode` and `stream` toward the smaller. `tie=` narrows the backend set to
-those that can promise a direction, which costs speed.
+the lowest nor the highest); `small_k` resolves toward the larger column and
+`stream` toward the smaller, whether or not they were asked to. `decode` gives
+the smaller column only when asked, since that is a mode of its kernel and the
+mode costs up to 20%; `tie='low'` is the request. `tie=` also narrows the
+backend set to those that can promise a direction, which costs speed.
 """
 
 from functools import lru_cache
 
 import torch
+import triton
+import triton.language as tl
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
 from aiter.ops.flydsl.kernels.topk_per_row_radix_stream import (
     build_topk_per_row_radix_stream_module,
+    topk_per_row_radix_stream_block_threads,
     topk_per_row_radix_stream_serves,
 )
 from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
 from aiter.ops.flydsl.topk_per_row_argmax import (
+    ARGMAX_DTYPES,
     topk_per_row_argmax,
     topk_per_row_argmax_serves,
 )
@@ -78,46 +85,67 @@ _NONDETERMINISTIC = frozenset({"plain"})
 # Streaming first because it takes a row length natively and scales with rows;
 # `plain` last for the reasons below.
 _PREFERENCE = ("argmax", "stream", "decode", "small_k", "plain")
-# Fitted to a 232-cell sweep -- M 1..16384, N 2048..1M, k 16..4096, to 64 GiB --
-# by topk_fit_policy.py over topk_full_sweep.csv. Re-run both rather than nudging
-# a number: the function is piecewise constant. Every backend was checked against
-# torch in a poisoned buffer before being timed, in interleaved rounds, because
-# one reading of this domain runs 1.42x off another.
+# Fitted to a 565-cell sweep -- rows 1..16384, widths 2048..1M, k 16..4096, to
+# 8 GiB -- by `topk_backend_fit.py` over `topk_backend_sweep.py`'s table. Re-run
+# both rather than nudging a number: the function is piecewise constant, and
+# three of these constants are pinned by ties rather than by a measurement (see
+# below). Every backend is checked against the others' selected VALUES before
+# being timed, in interleaved rounds, because one reading of this domain runs
+# 1.42x off another.
 #
-# Fitted to a preference, not the stopwatch alone: among backends within 1.4x of
-# the fastest it takes the most preferred (`_PREFERENCE`). That costs a mean
-# 1.063x and a worst 1.77x against the fastest of the moment, and lands a
-# deterministic backend on 200 of the 232 cells. The rules it replaces lost a
-# mean 1.181x, a worst 4.18x, and missed the 1.4x tolerance on 38 cells -- they
-# had no k term at all, having been sampled only at k=16.
+# Fitted to the stopwatch alone. The rules this replaces were fitted to a
+# preference instead -- among backends within 1.4x of the fastest they took the
+# most preferred, and `_PREFERENCE` lists `stream` ahead of `decode` -- which
+# was defensible while both were deterministic and close. They are not close:
+# decode is the fastest backend on 257 of 565 cells and the old rules reached it
+# on 65, for a mean 1.295x and a worst 5.916x against the per-cell oracle.
 #
-# Two unsampled gaps, deliberate: N=65536, and 16384 x 1M above k=16 (the
-# allocator could not return 64 GiB fast enough). Spot-measured, small_k at
-# 64 x 65536, k=16 is 12.7us against plain's 28.6 -- where the rule already
-# sends it. Neither gap is load-bearing; neither is measured.
+# Three constants the sweep cannot separate, held at their shipped values rather
+# than moved on a tie: `_SMALL_K_MAX_K` (no k=32 cell, so 16 and 32 score
+# identically), `_DECODE_MIN_N` (no width between 4096 and 8192) and
+# `_PLAIN_MANY_ROWS_BAND`'s floor (same gap). Widen the sweep before touching
+# any of them.
+#
+# One rule was dropped, not retuned: `plain` used to take a middling-width band
+# at <= 8 rows, and with decode's gate widened that band is now decode's on
+# every cell of it. Every value of the old bound scored identically, which is
+# what a dead rule looks like.
 
 # `plain` is the only one that scales WITH rows, so past enough of them on a
 # middling width it wins outright -- ahead of small_k, hence tested first.
-_PLAIN_MANY_ROWS = 16384
-_PLAIN_MANY_ROWS_BAND = (8192, 32768)
+#
+# "Enough" is 256, not the 16384 this carried while decode's gate was narrow:
+# with decode taking the low-row end, what is left for `plain` starts where
+# decode stops, and the sweep puts that an order of magnitude earlier than the
+# old bound. 192 scores identically -- there is no sampled row count between 128
+# and 256 -- so this is the sample point, not a measured boundary.
+# The block widths `topk_per_row_radix_stream_block_threads` chooses between.
+# Named here because `_available` has to ask about both without knowing which
+# one the row count will select.
+_STREAM_BLOCK_WIDTHS = (512, 1024)
+_PLAIN_MANY_ROWS = 256
+_PLAIN_MANY_ROWS_BAND = (8192, 65536)
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
 # k=16, 44 at k=32, then 300 at k=64, and the time steps 1.7x-1.8x between k=63
 # and k=64 alone. Below this bound it wins over the whole row range, 1 to 16384,
 # so it needs no width or row term.
 _SMALL_K_MAX_K = 32
-# decode is grid-wide, so it needs a wide row to spread over, and wins on few
-# rows AND (a very wide row OR a k past plain's reach) -- never on few rows
-# alone: eight dispatches, 37us of fixed cost at one row of 65536, against a
-# 0.045us streamed read.
-_DECODE_MAX_M = 64
-_DECODE_WIDE_N = 1048576
-_DECODE_MID_N = 8192
-_DECODE_MID_MIN_K = 4096
-# `plain` also holds a middling-width band at very few rows, where the other
-# three are still paying fixed costs.
-_PLAIN_FEW_ROWS = 8
-_PLAIN_FEW_ROWS_BAND = (16384, 131072)
+# decode is grid-wide, so it needs a row wide enough to spread over and few
+# enough rows that the grid is not already full. That is the whole rule: a row
+# bound and a width floor, and nothing conjoined after them.
+#
+# It used to read `rows <= 64 AND (width >= 1048576 OR (width >= 8192 AND k >=
+# 4096))`, which is the shape of a rule fitted against a decode that was always
+# paying for `stable=True` -- `_dispatch` hardwired it, so every reading of this
+# backend carried a promise no caller had asked for, and the fit learned to
+# route around it. With that removed and the sweep extended to the widths a
+# sparse indexer produces (max_seq_len // compress_ratio: 16384, 40960, 262144,
+# none of which is a power of two and all of which fell between the old
+# samples), decode is the fastest backend on 257 of 565 cells while the old
+# rules reached it on 65.
+_DECODE_MAX_M = 128
+_DECODE_MIN_N = 8192
 
 
 @lru_cache(maxsize=1)
@@ -145,8 +173,65 @@ def _no_range(device: torch.device) -> torch.Tensor:
     return torch.empty(0, dtype=torch.int32, device=device)
 
 
+@triton.jit
+def _gather_selected_kernel(
+    scores_ptr,
+    idx_ptr,
+    out_ptr,
+    scores_stride0,
+    idx_stride0,
+    out_stride0,
+    topk,
+    fill,
+    BLOCK_K: tl.constexpr,
+):
+    """`out[r, j] = scores[r, idx[r, j]]`, or `fill` where `idx` is negative."""
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_K)
+    live = offs < topk
+    idx = tl.load(idx_ptr + row * idx_stride0 + offs, mask=live, other=-1)
+    # A padded slot holds -1, which would address backwards; the mask below is
+    # what keeps `fill` in that lane, so the clamp only has to be in bounds.
+    kept = live & (idx >= 0)
+    val = tl.load(
+        # int64 throughout: `rows * stride0` passes 2^31 at 16384 rows of a
+        # 1M-wide fp32 tensor, and a 32-bit offset wraps there silently.
+        scores_ptr + row * scores_stride0 + tl.where(kept, idx, 0).to(tl.int64),
+        mask=kept,
+        other=fill,
+    )
+    tl.store(out_ptr + row * out_stride0 + offs, val, mask=live)
+
+
+def _gather_selected(scores, idx, fill):
+    """The selected scores, padded slots filled, in one launch.
+
+    Replaces `idx.long().clamp_min_(0)`, a `gather`, an `idx < 0` and a
+    `masked_fill_` -- five launches whose cost is almost all fixed. Measured
+    across `[rows, topk]` from 640 to 524288 elements, the element count grows
+    800x while those five grow 17.1us to 38.1us, so what they cost is being five
+    rather than what they touch. One launch over the same data measured 5.9-11.4us.
+    """
+    rows, topk = idx.shape
+    out = torch.empty((rows, topk), dtype=scores.dtype, device=scores.device)
+    _gather_selected_kernel[(rows,)](
+        scores,
+        idx,
+        out,
+        scores.stride(0),
+        idx.stride(0),
+        out.stride(0),
+        topk,
+        fill,
+        BLOCK_K=triton.next_power_of_2(topk),
+    )
+    return out
+
+
 @lru_cache(maxsize=256)
-def _available(width: int, k: int, wave_size: int, ragged: bool) -> frozenset:
+def _available(
+    width: int, k: int, wave_size: int, ragged: bool, fp32: bool = True
+) -> frozenset:
     """Backends that can serve this geometry at all.
 
     Each is asked through its own predicate rather than through a copy of its
@@ -155,12 +240,19 @@ def _available(width: int, k: int, wave_size: int, ragged: bool) -> frozenset:
     because asking costs 12us of Python against 7-10us of device time for the
     selection -- every predicate otherwise re-derives the arch from scratch.
 
-    The tensor half of each contract (fp32, inner stride 1, int32 indices) is
-    already enforced by `_reject_unsupported`, so what is left is geometry.
+    The tensor half of each contract (inner stride 1, int32 indices) is already
+    enforced by `_reject_unsupported`, so what is left is geometry -- and the
+    one dtype fact the geometry predicates do not carry: only the reduction has
+    a half-format build, so a non-fp32 input leaves it alone in the set. That
+    shape is already unreachable via `_reject_unsupported`, which refuses a half
+    format past k=1; keeping it here means the two cannot disagree about which
+    backend would have been asked.
     """
     out = set()
     if topk_per_row_argmax_serves(k) is None:
         out.add("argmax")
+    if not fp32:
+        return frozenset(out)
     if topk_per_row_small_k_serves(k, width, wave_size) is None:
         out.add("small_k")
     if k <= _PLAIN_MAX_K and not (
@@ -173,7 +265,20 @@ def _available(width: int, k: int, wave_size: int, ragged: bool) -> frozenset:
     # decode was refused at 4 GiB when it built descriptors over the whole
     # tensor; it slices the row first now, so there is nothing left to ask.
     out.add("decode")
-    if topk_per_row_radix_stream_serves(k, wave_size) is None:
+    # Both block widths, not the one `_dispatch` will pick: this set is memoized
+    # without the row count, and the width `_dispatch` chooses depends on it. So
+    # admit the streaming selector only where EITHER width could be asked for,
+    # which keeps `_available` from promising a build that then refuses.
+    #
+    # Not free by construction -- a wider block has a wider tile and so wants
+    # more LDS for the same prefetch depth (k=2048 resolves to 72 KiB at 512 and
+    # 120 KiB at 1024) -- but `_resolve_lds` trades depth for room, and both
+    # widths resolve over the whole k range here. Should that stop being true,
+    # this is where it will show up as a decline rather than a failure.
+    if all(
+        topk_per_row_radix_stream_serves(k, wave_size, block_threads=bt) is None
+        for bt in (_STREAM_BLOCK_WIDTHS)
+    ):
         out.add("stream")
     return frozenset(out)
 
@@ -187,6 +292,7 @@ def _choose(
     ragged: bool,
     tie: str | None,
     deterministic: bool,
+    fp32: bool,
 ) -> str:
     """The backend for one call shape, resolved once.
 
@@ -198,11 +304,11 @@ def _choose(
     allowed = frozenset(_BACKENDS_BY_TIE[tie])
     if deterministic:
         allowed -= _NONDETERMINISTIC
-    available = _available(width, k, wave_size, ragged) & allowed
+    available = _available(width, k, wave_size, ragged, fp32) & allowed
     if not available:
         raise RuntimeError(
             f"no backend serves rows={rows} width={width} topk={k} "
-            f"tie={tie!r} deterministic={deterministic}"
+            f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
         )
     return topk_select_backend(rows, width, k, available)
 
@@ -212,15 +318,30 @@ def topk_select_backend(
 ) -> str:
     """Name the backend to use for this shape among those that can serve it.
 
-    Not simply the fastest: where two are within 1.4x, this prefers the one
-    whose answer is a function of the row alone, and among those the streaming
-    selector. See the threshold block above for what that preference costs.
-
     The shape of the answer: `plain` takes the many-row middle, where it is the
     only one that scales with rows rather than against them; the small-k selector
-    takes everything its narrowing still bites on; decode takes the few-row end
-    of the very wide rows and of the large k; `plain` also takes a middling band
-    at very few rows; and the streaming selector takes the rest.
+    takes everything its narrowing still bites on; decode takes the rest of the
+    low-row end, over any row wide enough to spread a grid across; and the
+    streaming selector takes what is left, which is the many-row end outside
+    plain's band.
+
+    Fitted to a 565-cell sweep -- rows 1..16384, widths 2048..1M including the
+    non-power-of-two widths a sparse indexer produces, k 16..4096 -- against the
+    fastest backend measured at each cell. Costs a mean 1.054x and a p90 1.167x
+    against that oracle, over the 1.295x / 1.795x the rules it replaces cost on
+    the same table, and is more than 1.2x off on 51 cells against their 205.
+
+    The worst cell is 2.611x, at 256 rows of 16384 where `_DECODE_MAX_M` sends
+    decode's win to `stream`. Raising that bound to 256 takes the worst to
+    2.130x and gives back 0.009x of the mean; widening the `plain` band to
+    262144 takes the sparse-indexer shapes from 1.049x to 1.036x and costs
+    0.001x of the global mean. Both are real trades, and both were declined in
+    favour of the global stopwatch -- re-run `topk_backend_fit.py` rather than
+    picking one by taste.
+
+    Re-run the sweep, not just the fit, if `_dispatch` changes what it passes a
+    backend: these numbers were taken with `stable` following the caller, and
+    the previous rules were fitted when it was hardwired on.
 
     The returned name is always one of `available`.
     """
@@ -235,18 +356,8 @@ def topk_select_backend(
         return "plain"
     if "small_k" in available and k <= _SMALL_K_MAX_K:
         return "small_k"
-    if (
-        "decode" in available
-        and rows <= _DECODE_MAX_M
-        and (
-            width >= _DECODE_WIDE_N
-            or (width >= _DECODE_MID_N and k >= _DECODE_MID_MIN_K)
-        )
-    ):
+    if "decode" in available and rows <= _DECODE_MAX_M and width >= _DECODE_MIN_N:
         return "decode"
-    lo, hi = _PLAIN_FEW_ROWS_BAND
-    if "plain" in available and rows <= _PLAIN_FEW_ROWS and lo <= width <= hi:
-        return "plain"
     if "stream" in available:
         return "stream"
     # Every rule declined: `tie` or `deterministic` narrowed the set to backends
@@ -259,6 +370,7 @@ def topk_select_backend(
 def _reject_unsupported(
     *,
     input,
+    topk,
     indices_type,
     idx_oob_fill_value,
     abort_when_nan_found,
@@ -273,10 +385,21 @@ def _reject_unsupported(
         raise NotImplementedError("`begin` is not supported (nor is it in DeepSelect)")
     if hint is not None:
         raise NotImplementedError("`hint` is not supported (nor is it in DeepSelect)")
-    if input.dim() != 2 or input.dtype != torch.float32:
+    if input.dim() != 2 or input.dtype not in ARGMAX_DTYPES:
         raise ValueError(
-            f"input must be 2-D float32; got {tuple(input.shape)} {input.dtype}. "
-            "DeepSelect also takes bfloat16; no backend here does."
+            f"input must be 2-D and one of "
+            f"{sorted(str(d) for d in ARGMAX_DTYPES)}; got "
+            f"{tuple(input.shape)} {input.dtype}"
+        )
+    if input.dtype is not torch.float32 and topk != 1:
+        # Named here rather than left to `_choose`, whose "no backend serves"
+        # reads as a geometry problem. Only the k=1 reduction has a half-format
+        # build: it folds int32 ordering keys, so it can widen each element as
+        # it reads it. The selectors compare and re-read the scores themselves,
+        # so for them a half format is a second set of kernels, not a load.
+        raise NotImplementedError(
+            f"{input.dtype} is served only at topk=1, the reduction; got "
+            f"topk={topk}. Cast to float32 for a wider selection."
         )
     if input.stride(1) != 1:
         raise ValueError("input must have inner stride 1")
@@ -328,8 +451,20 @@ def topk_select(
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Per-row top-k, dispatched across aiter's four selectors.
 
-    Parameter names, order and return shape follow ``deep_select.topk``. Four
-    defaults differ, because this cannot honour DeepSelect's and will not
+    Parameter names, order and return shape follow ``deep_select.topk``, and
+    the return shape means the 2-tuple specifically: DeepSelect returns
+    ``(values, indices)`` always, and its ``return_value=False`` sets the first
+    element to None rather than changing the arity. So does this.
+
+    Checked against DeepSelect v1.0.0 / main at 0f03b68 (2026-09-10): the first
+    fourteen parameters match by name, order and default except where the table
+    below says otherwise. Re-check before trusting it -- that repository is days
+    old and moving. Two traps found while checking: its README's usage snippet
+    passes ``sorted_index=True`` and ``indices_type=torch.int32`` explicitly, and
+    neither is the default; and DeepWiki's generated page reports the
+    ``indices_type`` default as int32, which is wrong.
+
+    Four defaults differ, because this cannot honour DeepSelect's and will not
     pretend to -- each raises if you pass DeepSelect's value:
 
     ======================  ============  =========  =============================
@@ -339,8 +474,20 @@ def topk_select(
                                                      read, which this path may not do
     ``idx_oob_fill_value``    2147483647  ``-1``     what the kernels write
     ``indices_type``          int64       int32      what the kernels emit
-    ``input`` dtype           bf16/fp32   fp32       no bf16 backend
+    ``input`` dtype           bf16/fp32   see below  half formats only at ``topk=1``
     ======================  ============  =========  =============================
+
+    fp32 is served at every k. bf16 and fp16 are served at ``topk=1`` and raise
+    past it: the reduction folds int32 ordering keys, so it widens each element
+    as it reads it, while the selectors compare and re-read the scores and would
+    need a second set of kernels. At k=1 this is worth having rather than
+    casting -- the row is half the bytes, and the cast is its own pass over it.
+
+    That row is the one divergence that is not a narrowing. fp16 is not a
+    DeepSelect dtype at all -- its ``csrc/api.cpp`` takes bfloat16 or float32 and
+    rejects the rest -- so at ``topk=1`` this accepts an input DeepSelect will
+    not, while above ``topk=1`` it accepts less. Do not read the table as "a
+    subset of DeepSelect" in either direction.
 
     ``return_value`` also defaults the other way -- ``False`` here, ``True`` in
     DeepSelect -- and this one does not raise, since asking for the values back
@@ -352,7 +499,8 @@ def topk_select(
     most of the time spent. Pass ``return_value=True`` to get them.
 
     Args:
-        input: ``[rows, width]`` float32, inner stride 1.
+        input: ``[rows, width]``, inner stride 1. float32 at any ``topk``;
+            bfloat16 and float16 at ``topk=1`` only.
         topk: elements to select per row.
         sorted: sort the returned values descending. Done on the host.
         end: ``[rows]`` int32 exclusive right bound per row, DeepSelect's
@@ -385,6 +533,7 @@ def topk_select(
     """
     _reject_unsupported(
         input=input,
+        topk=topk,
         indices_type=indices_type,
         idx_oob_fill_value=idx_oob_fill_value,
         abort_when_nan_found=abort_when_nan_found,
@@ -422,8 +571,11 @@ def topk_select(
         end is not None,
         tie,
         deterministic,
+        input.dtype is torch.float32,
     )
-    _dispatch(backend, input, row_lens, idx, topk, rows, end is not None)
+    _dispatch(
+        backend, input, row_lens, idx, topk, rows, end is not None, tie, deterministic
+    )
 
     values = None
     if return_value or sorted:
@@ -435,8 +587,7 @@ def topk_select(
         # that order even when the caller does not want them back. Gathering
         # them and dropping them is the cost of asking for the order; returning
         # indices in an arbitrary order from `sorted=True` is not an option.
-        gathered = input.gather(1, idx.long().clamp_min_(0))
-        gathered.masked_fill_(idx < 0, value_oob_fill_value)
+        gathered = _gather_selected(input, idx, value_oob_fill_value)
         if sorted:
             gathered, order = torch.sort(gathered, dim=1, descending=True)
             idx = idx.gather(1, order)
@@ -462,7 +613,9 @@ def topk_select(
     return values, idx
 
 
-def _dispatch(backend, input, row_lens, idx, topk, rows, ragged):
+def _dispatch(
+    backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
+):
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
     elif backend == "small_k":
@@ -483,13 +636,41 @@ def _dispatch(backend, input, row_lens, idx, topk, rows, ragged):
             empty = _no_range(input.device)
             topk_plain(input, idx, vals, topk, True, empty, empty, -1, 1)
     elif backend == "decode":
+        # `stable` buys the smallest-index tie-break AND the selected set being
+        # a function of the row, so both `tie='low'` and `deterministic` need
+        # it. Only "no promise at all" may drop it.
+        #
+        # The second half of that was measured, not assumed: without `stable`
+        # this backend selects a DIFFERENT set of tied columns from one call to
+        # the next, which `test_invariants` catches at 16 rows of 262144, k=2048
+        # as "selects the same set under {'deterministic': True}". A radix
+        # select being a pure function of the row is the obvious guess and it is
+        # wrong.
+        #
+        # Hardwired on, it cost 0-20% -- and the routing was fitted against a
+        # decode that was always paying it, which is part of why the old rules
+        # sent these shapes elsewhere.
         flydsl_top_k_per_row_decode(
-            input, 1, row_lens, idx, rows, input.stride(0), 1, topk, stable=True
+            input,
+            1,
+            row_lens,
+            idx,
+            rows,
+            input.stride(0),
+            1,
+            topk,
+            stable=tie == "low" or deterministic,
         )
     elif backend == "stream":
         _run_compiled(
+            # The block width follows the ROW COUNT and k, not the row width --
+            # see the sweep behind `topk_per_row_radix_stream_block_threads`.
+            # Costs a mean 1.001x against choosing per cell, where holding one
+            # width costs 1.135x and a worst 2.03x.
             build_topk_per_row_radix_stream_module(
-                topk, wave_size_of(input.device.index)
+                topk,
+                wave_size_of(input.device.index),
+                block_threads=topk_per_row_radix_stream_block_threads(rows, topk),
             ),
             input,
             row_lens,
