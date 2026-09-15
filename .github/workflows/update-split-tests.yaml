@@ -49,7 +49,7 @@ jobs:
             --repo "${REPO}" \
             --runs-count "${RUNS_COUNT}" \
             --aggregate "${AGGREGATE}" \
-            --summary-path split-tests-update-summary.md
+            --summary-path "${RUNNER_TEMP}/split-tests-update-summary.md"
 
       - name: Dry run rebalance check (aiter)
         run: bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run
@@ -62,12 +62,12 @@ jobs:
         run: |
           {
             echo "## Summary"
-            cat split-tests-update-summary.md
+            cat "${RUNNER_TEMP}/split-tests-update-summary.md"
             echo ""
             echo "## Test plan"
             echo "- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run"
             echo "- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run"
-          } > pr-body.md
+          } > "${RUNNER_TEMP}/pr-body.md"
 
       - name: Generate PR GitHub App token
         if: steps.update_times.outputs.changed == 'true'
@@ -88,6 +88,10 @@ jobs:
           branch: ci/update-split-tests-file-times
           title: "CI: auto-update split test FILE_TIMES"
           assignees: gyohuangxin
-          body-path: pr-body.md
+          body-path: ${{ runner.temp }}/pr-body.md
+          # Without this the action commits every dirty file in the workspace,
+          # which is how its own PR body and summary reached the repo root in
+          # #5131. This job only ever means to change the one file.
+          add-paths: .github/scripts/split_tests.sh
           commit-message: "CI: auto-update split test FILE_TIMES"
           delete-branch: true
