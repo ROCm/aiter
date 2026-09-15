@@ -308,6 +308,10 @@ with _silence():
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     import test_mxfp8fp4gemm as f8gemm_mod
     import torch
+    from flydsl_tests import test_flydsl_grouped_gemm as moe_mod
+    from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
+
+    import aiter.tuned_gemm as tuned_gemm_mod
     from aiter.benchmark_data_init import (
         DATA_DISTS,
         E8M0_SCALE_DISTS,
@@ -315,12 +319,8 @@ with _silence():
         make_generator,
     )
     from aiter.benchmark_reporting import print_json_table
-    from aiter.smi_monitor import SMI_RESULT_PREFIX, GpuMonitor
-    from flydsl_tests import test_flydsl_grouped_gemm as moe_mod
-    from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
-
-    import aiter.tuned_gemm as tuned_gemm_mod
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+    from aiter.smi_monitor import SMI_RESULT_PREFIX, GpuMonitor
     from aiter.test_common import (
         checkAllclose,
         run_perftest,
