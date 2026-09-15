@@ -168,6 +168,7 @@ void register_graph_buffers(fptr_t _fa,
                             const std::vector<int64_t>& offset_ptrs);
 #ifdef USE_ROCM
 int64_t allocate_meta_buffer(int64_t size);
+int64_t allocate_data_buffer(int64_t size);
 void free_meta_buffer(int64_t ptr);
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr);
 #endif

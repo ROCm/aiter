@@ -10,6 +10,8 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mha import fmha_fwd_bf16_opus_varlen_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
@@ -18,6 +20,8 @@ from aiter.test_mha_common import (
     convert_flash_attn_S_to_softmax,
     generate_qkv,
     generate_random_padding_mask,
+    opus_check_lse,
+    opus_ref_lse,
     pad_rearrange_dropout_mask_hts_to_bhss,
 )
 
@@ -1317,3 +1321,125 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
         atol=0.5,
         msg="varlen variable-length d_sink mismatch",
     )
+
+
+# OPUS gfx950 group/varlen D_QK=192 / D_V=128 via the direct wrapper (packed THD).
+# Q and KV take independent cu_seqlens, so entries whose length lists differ are packed
+# cross-attention. kv_pad > 0 aligns each group's K/V rows up to that multiple, making
+# seqstart_k (real lengths) and seqstart_k_pad (physical offsets) diverge; the gaps are
+# NaN-filled so a read past a group's real seqlen_kv surfaces as NaN.
+# A kv seqlen of 0 is a group with no keys: out == 0 / lse == -inf exactly.
+#   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad)
+_OPUS_D192_GROUP_CASES = [
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0),  # varlen self-attn, GQA
+    ([128, 1000], [128, 1000], 16, 16, 0),  # varlen self-attn, MHA
+    ([1023, 65], [1023, 65], 16, 4, 0),  # odd / partial, GQA
+    ([777], [777], 8, 2, 0),  # single group, GQA
+    ([64] * 17, [64] * 17, 8, 8, 0),  # many groups, MHA
+    ([128, 512], [512, 128], 8, 2, 0),  # cross, one group each way, GQA
+    ([300, 77, 1024], [700, 200, 300], 4, 4, 0),  # cross, mixed + partial, MHA
+    ([1024, 8], [1, 8], 2, 1, 0),  # 1024 queries vs a single key, MQA
+    ([1, 1, 1], [256, 512, 64], 16, 4, 0),  # decode-shaped groups, GQA
+    ([1024, 1024], [640, 1024], 64, 8, 0),  # 4*64*2 = 512 -> head/tail merge, GQA
+    ([200, 64, 700], [200, 64, 700], 8, 2, 256),  # KV padded to 256, GQA
+    ([1, 300], [1024, 333], 16, 4, 64),  # KV padded + cross, GQA
+    ([256, 256], [0, 256], 8, 2, 0),  # no keys in the first group, GQA
+    ([128, 96, 300], [256, 0, 128], 8, 8, 0),  # no keys in a middle group, MHA
+    ([600, 100], [0, 33], 4, 1, 0),  # empty group spanning 3 Q blocks, MQA
+    ([100, 100], [0, 300], 8, 2, 64),  # empty group + KV padding, GQA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d192_v128_group(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal
+):
+    """OPUS D=192 group/varlen forward with LSE, per group against attention_ref."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=192 kernel requires gfx950")
+    assert len(seqlens_q) == len(seqlens_kv)
+
+    torch.manual_seed(0)
+    d_qk, d_v = 192, 128
+
+    def _cumsum(lengths):
+        return torch.tensor(
+            [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    phys_kv = [
+        ((s + kv_pad - 1) // kv_pad) * kv_pad if kv_pad else s for s in seqlens_kv
+    ]
+    total_q = sum(seqlens_q)
+    cu_q = _cumsum(seqlens_q)
+    cu_k = _cumsum(seqlens_kv)
+    cu_k_pad = _cumsum(phys_kv)
+
+    q = torch.randn(total_q, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(sum(phys_kv), nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(sum(phys_kv), nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+    if kv_pad:
+        for g, (real, phys) in enumerate(zip(seqlens_kv, phys_kv)):
+            gap = slice(int(cu_k_pad[g]) + real, int(cu_k_pad[g]) + phys)
+            k[gap] = float("nan")
+            v[gap] = float("nan")
+
+    with torch.no_grad():
+        out, lse = fmha_fwd_bf16_opus_varlen_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=d_qk**-0.5,
+            causal=causal,
+            seqstart_q=cu_q,
+            seqstart_k=cu_k,
+            seqstart_k_pad=cu_k_pad if kv_pad else None,
+            max_seqlen_q=max(seqlens_q),
+            max_seqlen_k=max(seqlens_kv),
+            return_lse=True,
+        )
+
+    assert tuple(lse.shape) == (nheads, total_q), f"lse shape {tuple(lse.shape)}"
+    assert not torch.isnan(out).any(), "read into the KV padding gap"
+    assert not torch.isnan(lse).any(), "read into the KV padding gap"
+
+    max_diff = 0.0
+    for g in range(len(seqlens_q)):
+        ql, qh = int(cu_q[g]), int(cu_q[g + 1])
+        kl = int(cu_k_pad[g])  # physical start, real length
+        kh = kl + seqlens_kv[g]
+        if seqlens_kv[g] == 0:
+            # Assert the contract exactly rather than through attention_ref, whose
+            # degenerate-shape behaviour is its own question.
+            assert torch.equal(
+                out[ql:qh], torch.zeros_like(out[ql:qh])
+            ), f"group {g} has no keys, out must be exactly 0"
+            assert torch.isneginf(
+                lse[:, ql:qh]
+            ).all(), f"group {g} has no keys, lse must be -inf"
+            continue
+        qg = q[ql:qh].unsqueeze(0)
+        kg = k[kl:kh].unsqueeze(0)
+        vg = v[kl:kh].unsqueeze(0)
+        out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal)
+        out_pt, _, _ = attention_ref(
+            qg, kg, vg, causal=causal, upcast=False, reorder_ops=True
+        )
+        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+        diff = (out[ql:qh].unsqueeze(0) - out_ref).abs().max().item()
+        max_diff = max(max_diff, diff)
+        assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
+        opus_check_lse(
+            f"opus-d192-group g{g}", lse[:, ql:qh], opus_ref_lse(qg, kg, causal)[0]
+        )
+    print(f"[opus-d192-group] max diff across groups: {max_diff}")

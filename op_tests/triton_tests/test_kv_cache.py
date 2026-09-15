@@ -219,6 +219,8 @@ def test_cat_and_cache_mla(
     ):
         pytest.skip("FP4 KV cache is only supported in GFX950 and GFX1250")
 
+    torch.manual_seed(0)
+
     dtype = torch.bfloat16
     k_lora = torch.randn((T, KH, D_lora), dtype=torch.float32, device="cuda") / (
         20 if cache_dtype != torch.bfloat16 else 1

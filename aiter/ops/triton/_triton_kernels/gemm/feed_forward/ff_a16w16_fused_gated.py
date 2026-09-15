@@ -4,8 +4,23 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+_ff_a16w16_fused_gated_repr = make_kernel_repr(
+    "_ff_a16w16_fused_gated",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "cache_modifier",
+        "activation",
+        "use_activation",
+    ],
+)
 
 
 @triton.heuristics(
@@ -15,7 +30,7 @@ from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_ff_a16w16_fused_gated_repr)
 def _ff_a16w16_fused_gated(
     x_ptr,
     w1_ptr,

@@ -6,8 +6,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
-from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
-from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
@@ -39,8 +38,6 @@ def matmul_launch_metadata(grid, kernel, args):
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
         ret["name"] += "_swiglu"
-    if args["Quant_static_scale"] is not None:
-        ret["name"] += "_quant"
 
     fM = n_tokens
     fK = K if K is not None else n_tokens
@@ -106,68 +103,45 @@ def unswizzle_mx_scale_cdna4(
 
 
 @triton.jit
-def _mxfp4_quant_kernel(
-    x_ptr,
-    x_fp4_ptr,
-    bs_ptr,
-    stride_x_m,
-    stride_x_n,
-    stride_fp4_m,
-    stride_fp4_n,
-    stride_bs_m,
-    stride_bs_n,
-    M,
-    N,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
-    EVEN_M_N: tl.constexpr,
+def unswizzle_mx_scale_gfx1250(
+    scale_buffer_slice,
+    BLOCK_N: tl.constexpr,
+    MX_SCALE_BLOCK_K: tl.constexpr,
+    PRESHUFFLE_FACTOR: tl.constexpr,
+    SCALE_KWIDTH: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
-    x_offs = offs_m[:, None] * stride_x_m + offs_n[None, :] * stride_x_n
-    x = tl.load(x_ptr + x_offs, mask=mask, other=0).to(tl.float32)
-
-    out_tensor, bs_e8m0 = _mxfp4_quant_op(
-        x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+    scale_buffer_slice = (
+        scale_buffer_slice.reshape(
+            (
+                BLOCK_N // PRESHUFFLE_FACTOR,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+            )
+        )
+        .permute((0, 2, 1, 3))
+        .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
     )
 
-    # Store quantized x blocks
-    out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
-    out_offs = offs_m[:, None] * stride_fp4_m + out_offs_n[None, :] * stride_fp4_n
-
-    if EVEN_M_N:
-        tl.store(x_fp4_ptr + out_offs, out_tensor)
-    else:
-        out_mask = (offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-        tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
-
-    # Store scale blocks
-    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    num_blocks_total = N // MXFP4_QUANT_BLOCK_SIZE
-    bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-
-    bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-    bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < num_blocks_total)[None, :]
-
-    if EVEN_M_N:
-        tl.store(bs_ptr + bs_offs, bs_e8m0)
-    else:
-        tl.store(
-            bs_ptr + bs_offs,
-            bs_e8m0,
-            mask=bs_mask,
-        )
+    return scale_buffer_slice
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+_moe_gemm_a4w4_repr = make_kernel_repr(
+    "_moe_gemm_a4w4",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "EVEN_K",
+        "SWIZZLE_MX_SCALE",
+        "APPLY_SWIGLU",
+    ],
+)
+
+
+@triton.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a4w4_repr)
 def _moe_gemm_a4w4(
     Y,
     stride_y_k,
@@ -187,8 +161,6 @@ def _moe_gemm_a4w4(
     stride_w_mx_e,
     stride_w_mx_k,
     stride_w_mx_n,
-    X_static_scale,
-    Quant_static_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
@@ -338,10 +310,17 @@ def _moe_gemm_a4w4(
     )
 
     WMxScale += expt_id * stride_w_mx_e
-    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+    tl.static_assert(
+        SWIZZLE_MX_SCALE is None
+        or SWIZZLE_MX_SCALE == "CDNA4_SCALE"
+        or SWIZZLE_MX_SCALE == "GFX1250_SCALE",
+        "SWIZZLE_MX_SCALE must be None, 'CDNA4_SCALE' or 'GFX1250_SCALE'",
+    )
+    if SWIZZLE_MX_SCALE is not None:
         tl.static_assert(stride_w_mx_k is not None)
         tl.static_assert(stride_w_mx_n is not None)
         NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
+        GFX1250_SCALE_KWIDTH: tl.constexpr = 4
         PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
         SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
     else:
@@ -402,6 +381,14 @@ def _moe_gemm_a4w4(
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
             )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                NON_K_PRESHUFFLE_BLOCK_SIZE,
+                GFX1250_SCALE_KWIDTH,
+            )
         else:
             w_scales = tl.load(WMxScalePtrs)
 
@@ -439,19 +426,19 @@ def _moe_gemm_a4w4(
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
             )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                NON_K_PRESHUFFLE_BLOCK_SIZE,
+                GFX1250_SCALE_KWIDTH,
+            )
         else:
             w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
 
         acc = tl.dot_scaled(
             x, x_scales, "e2m1", w, w_scales, "e2m1", acc=acc, fast_math=True
-        )
-
-    # scalar fp8 scale
-    if X_static_scale is not None:
-        # should not go in here since static scale fp4 is disabled
-        tl.static_assert(
-            X_static_scale is None,
-            f"Static scale is disabled for fp4 precision. got {X_static_scale}",
         )
 
     # bias
@@ -483,9 +470,6 @@ def _moe_gemm_a4w4(
     if Gammas is not None:
         gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
-    # quant
-    if Quant_static_scale is not None:
-        out = _compute_static_fp8_quant(out, tl.load(Quant_static_scale))
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m

@@ -14,8 +14,14 @@ import pytest
 import torch
 
 import aiter.ops.flydsl as flydsl_ops
-from aiter.ops.flydsl import is_flydsl_available
 from aiter.test_common import checkAllclose
+
+try:
+    import flydsl  # noqa: F401
+
+    _FLYDSL_AVAILABLE = True
+except ImportError:
+    _FLYDSL_AVAILABLE = False
 
 # CI runs this file as a script, so ``op_tests`` is not a package on sys.path;
 # under pytest from the repo root it is.
@@ -26,9 +32,7 @@ except ModuleNotFoundError as e:
         raise
     from op_tests.kda_ref import kda_gate, l2norm, naive_recurrent_kda
 
-pytestmark = pytest.mark.skipif(
-    not is_flydsl_available(), reason="flydsl is not installed"
-)
+pytestmark = pytest.mark.skipif(not _FLYDSL_AVAILABLE, reason="flydsl is not installed")
 
 # This import skips the whole module when flydsl or a GPU is missing.
 from aiter.ops.flydsl.test_flydsl_linear_attention import (
@@ -411,7 +415,6 @@ def test_tuned_config_lookup_is_keyed_by_gate_mode(monkeypatch):
     """
     from aiter.ops.flydsl import linear_attention_kernels as lak
 
-    fallback = {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
     kda_config = {"NUM_BLOCKS_PER_V_DIM": 4, "NUM_WARPS": 2, "WARP_THREADS_K": 32}
     gdr_config = {"NUM_BLOCKS_PER_V_DIM": 8, "NUM_WARPS": 4, "WARP_THREADS_K": 16}
     dtypes = ("torch.bfloat16", "torch.float32")
@@ -426,10 +429,12 @@ def test_tuned_config_lookup_is_keyed_by_gate_mode(monkeypatch):
     assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
     assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == gdr_config
 
-    # With only a per-channel row, the scalar gate must not inherit it.
+    # With only a per-channel row, the scalar gate falls to the tiling rule.
     monkeypatch.setattr(lak, "GDR_GLOBAL_CONFIG_MAP", {(*key, "kda"): kda_config})
     assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
-    assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == fallback
+    assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == lak._decode_tiling(
+        geometry[0], geometry[3], geometry[4], geometry[5], dtypes[1]
+    )
 
 
 @pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])

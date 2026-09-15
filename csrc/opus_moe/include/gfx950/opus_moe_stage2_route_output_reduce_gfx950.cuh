@@ -3,29 +3,22 @@
 #pragma once
 
 #include "../opus_moe_common.cuh"
+#ifdef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 #include "opus_moe_stage2_utils_gfx950.cuh"
-
-#include "aiter_hip_common.h"
-
 #include <cstdint>
 #include <hip/hip_bfloat16.h>
+#else
+#include "aiter_hip_common.h"
 #include <hip/hip_runtime.h>
+#endif
 
-constexpr int kOpusMoeStage2RouteOutputReduceAutoBlockN = -1;
+#ifndef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 constexpr int kOpusMoeStage2RouteOutputReduceBf16BlockN = 2048;
 constexpr int kOpusMoeStage2RouteOutputReduceDefaultBlockN = 4096;
 constexpr int kOpusMoeStage2RouteOutputReduceDefaultThreads = 256;
+#endif
 
-inline int opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
-    int model_dim,
-    int requested_block_n)
-{
-    if(requested_block_n > 0)
-        return requested_block_n;
-    const int auto_block_n = opus_moe::stage2_a8w4_route_reduce_auto_block_n(model_dim);
-    return auto_block_n > 0 ? auto_block_n : kOpusMoeStage2RouteOutputReduceDefaultBlockN;
-}
-
+#ifdef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 #ifdef __HIP_DEVICE_COMPILE__
 static __device__ __forceinline__ void
 opus_moe_stage2_route_reduce_accum_bf16x4(float* acc, int base, uint64_t packed)
@@ -197,43 +190,6 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
             }
         }
 
-        if(scalar_tail == 0)
-        {
-#pragma unroll
-            for(int slot = 0; slot < topk_loop; ++slot)
-            {
-                const int route_row = route_row_base + slot;
-#pragma unroll
-                for(int group = 0; group < groups_per_thread; ++group)
-                {
-                    if(group < valid_groups4)
-                    {
-                        const int col = col_base + group * 4;
-                        const uint64_t packed =
-                            *reinterpret_cast<const uint64_t*>(
-                                route_out_bf16 +
-                                static_cast<int64_t>(route_row) * kargs.stride_route_out_t + col);
-                        opus_moe_stage2_route_reduce_accum_bf16x4(acc, group * 4, packed);
-                    }
-                }
-            }
-
-#pragma unroll
-            for(int group = 0; group < groups_per_thread; ++group)
-            {
-                if(group < valid_groups4)
-                {
-                    const int col = col_base + group * 4;
-                    *reinterpret_cast<uint64_t*>(kargs.out_bf16 +
-                                                 static_cast<int64_t>(token) *
-                                                     kargs.stride_o_t +
-                                                 col) =
-                        opus_moe_stage2_route_reduce_pack_bf16x4(acc, group * 4);
-                }
-            }
-            return;
-        }
-
 #pragma unroll
         for(int tail = 0; tail < max_scalar_tail; ++tail)
         {
@@ -304,7 +260,14 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
 #endif
 #endif
 }
+#else
+template<int BLOCK_N, int BLOCK_THREADS, int TOPK = 0, bool ROUTE_FP8 = false>
+__global__ __launch_bounds__(BLOCK_THREADS, ROUTE_FP8 ? 2 : 4) void
+opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(
+    opus_moe_stage2_route_reduce_kargs kargs);
+#endif
 
+#ifndef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 template<int BLOCK_N, int BLOCK_THREADS, int TOPK, bool ROUTE_FP8>
 inline void opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950(
     const opus_moe_stage2_route_reduce_kargs& kargs,
@@ -377,8 +340,9 @@ inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
     hipStream_t stream,
     int requested_block_n)
 {
-    const int block_n = opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
-        kargs.model_dim, requested_block_n);
+    const int block_n = requested_block_n > 0
+                            ? requested_block_n
+                            : kOpusMoeStage2RouteOutputReduceDefaultBlockN;
     dim3 grid(kargs.token_num, (kargs.model_dim + block_n - 1) / block_n, 1);
     // Specialize for common topk values (unrolls the slot loop -> all loads
     // issued up front, hiding latency); otherwise fall back to the runtime-topk
@@ -403,3 +367,4 @@ inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
         break;
     }
 }
+#endif

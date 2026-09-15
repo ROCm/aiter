@@ -15,10 +15,14 @@ recompute_w_u_fwd             W/U recompute from Akk inverse.
 chunk_gate_cumsum             Fused gate (A_log/softplus/sigmoid) + chunk cumsum.
 beta_sigmoid_fwd              Elementwise sigmoid for beta gate.
 chunk_delta_attn_gate_fwd     Per-token gate without cumsum (forward only).
+flash_kda_fwd                 Two-kernel fused forward (opt-in, narrower shapes).
 """
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_fwd import (
     chunk_delta_attn_fwd,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
+    flash_kda_fwd,
 )
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import (
     beta_sigmoid_fwd,
@@ -44,5 +48,6 @@ __all__ = [
     "chunk_delta_attn_gate_fwd",
     "chunk_gate_cumsum",
     "chunk_gla_fwd_o",
+    "flash_kda_fwd",
     "recompute_w_u_fwd",
 ]

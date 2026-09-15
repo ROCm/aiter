@@ -72,24 +72,12 @@ Numbering convention:
 Synthetic balanced / round-robin and full-tile experiments were retired because
 they are not valid for general MoE routing.
 
-The source of truth for public ids, names, block shapes, output mode, and
-route-reduce tile width is
-`aiter/ops/opus/moe_stage2_a8w4_meta.py`. `-1` remains the direct-atomic auto
-selector.
+The source of truth for Stage1/Stage2 public ids, names, block shapes, output
+mode, and route-reduce tile width is `opus_moe_common.py`.
 
-In fused MoE tuned configs, the preferred A8W4 stage2 selection is a per-kid
-`kernelName2` value from metadata. The generic wrapper name
-`opus_moe_stage2_a8w4_decode` is still accepted for rows that carry explicit
-numeric columns:
-
-- `stage2_kernel_id`: `-1` for direct-atomic auto, or one of the A8W4 kids
-  above.
-- `stage2_block_m`: the kernel tile M passed to Opus stage2.
-- `stage2_route_out`: `1` when stage2 returns per-slot route output that needs
-  route-output reduce, otherwise `0`.
-- `stage2_reduce_block_n`: optional route-output reduce tile width. Per-kid
-  kernel names can also carry this as an `_rbn<N>` suffix, for example
-  `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072`.
+Fused MoE tuned configs select A8W4 Stage2 with a complete per-kid
+`kernelName2` from metadata. The name fixes the decode shape, sorting block,
+output mode, and route-reduce tile width as one immutable launch plan.
 
 Optional tuned CSV metadata columns `route_bucket`, `expected_sorted_blocks`,
 `min_sorted_blocks`, and `max_sorted_blocks` are carried to runtime and checked
@@ -104,12 +92,13 @@ Host and shared code:
   metadata helpers.
 - `include/opus_moe_arch.cuh`: runtime architecture probe wrapper.
 - `include/opus_moe_host_impl.cuh`: host validation and launch selection.
-- `opus_moe.cu`: pybind-facing translation unit.
+- `opus_moe.cu`: pybind-facing host-only translation unit. It deliberately
+  does not include any device pipeline in its device pass.
 
 gfx950 code:
 
-- `include/gfx950/opus_moe_arch_gfx950.cuh`: gfx950 launch wrappers and BF16
-  generated manifest dispatch.
+- `include/gfx950/opus_moe_arch_gfx950.cuh`: lightweight gfx950 BF16 host
+  launch and dispatch.
 - `include/gfx950/opus_moe_stage2_route_output_reduce_gfx950.cuh`: shared
   token/topk route-output reduction.
 - `include/gfx950/opus_moe_stage2_utils_gfx950.cuh`: small gfx950 device
@@ -127,15 +116,13 @@ gfx950 code:
 
 Python/JIT code:
 
-- `aiter/ops/opus/moe_stage2_a8w4_meta.py`: torch-free A8W4 stage2 kid
-  metadata shared by runtime wrapper and csrc tuner/codegen helpers.
-- `aiter/ops/opus/moe_stage2_a8w4.py`: A8W4 Python wrapper and route-output
-  reduce wrapper.
-- `aiter/ops/opus/moe_stage2_a8w4_fused_adapter.py`: fused MoE CSV parsing and
-  stage2 wrapper glue for A8W4.
-- `gen_instances.py`: JIT-time private BF16 and A8W4 manifest generator.
-- `opus_moe_common.py`: private BF16 metadata plus the A8W4 metadata bridge for
-  manifest codegen.
+- `aiter/ops/opus/moe_stage1_a8w4.py`: A8W4 Stage1 runtime binding and fused
+  MoE adapter.
+- `aiter/ops/opus/moe_stage2_a8w4.py`: A8W4 Stage2 runtime bindings, typed
+  tuned-config parsing, fused MoE adapter, and unified route-output reduction.
+- `gen_instances.py`: JIT-time private BF16 and A8W4 manifest/TU generator.
+- `opus_moe_common.py`: torch-free canonical Stage1/Stage2 contracts, kernel
+  instances, public names, and kid lookup shared by runtime, tuner, and codegen.
 
 ## Tuning and Dispatch
 
@@ -143,7 +130,15 @@ Python/JIT code:
 `opus_moe_stage2_a8w4_manifest.h` into the JIT build blob. The first generated
 header is consumed by private BF16 dispatch source; the second is consumed by
 the A8W4 dispatch wrapper for
-`kid -> OpusMoeStage2A8W4DecodeShape -> launcher` cases.
+`kid -> effective_inter_dim -> launch specialization` cases.
+
+Host launch templates stay in their C++ dispatch headers and see only kernel
+forward declarations. The generator emits device-only shards: one A8W4 stage2
+shard per effective inter dim, one Stage1 shard per pipeline family, one
+route-reduce shard per specialized topk, and one private BF16 shard. Each shard
+uses explicit kernel instantiation. This keeps the exact specialization set and
+GPU ISA while allowing Ninja to compile the otherwise independent device work
+in parallel; do not include device pipelines from `opus_moe.cu`.
 
 A8W4 production selection should be done through the fused MoE tuned
 configuration by adding `opus_...` stage2 kernel names only for measured cases

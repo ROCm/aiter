@@ -16,11 +16,11 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
+try:
+    import flydsl  # noqa: F401
+except ImportError:
     pytest.skip(
         "flydsl is not installed. Skipping FlyDSL Linear Attention tests.",
         allow_module_level=True,

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -33,6 +35,8 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 _LOGGER = AiterTritonLogger()
 
 DEVICE_ARCH = arch_info.get_arch()
+
+_BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
@@ -260,13 +264,8 @@ def fused_qk_rope_cat_and_cache_mla(
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
-        # The gfx1250 gluon kernel keeps an extra (unused) MAX_EMBD_POS positional
-        # arg for a uniform launch interface with the BLOCK kernel. Pass the
-        # cos/sin cache length to satisfy its signature.
-        _extra_uniform_args = (cos.shape[0],)
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
-        _extra_uniform_args = ()
 
     _kernel[grid](
         q_nope,
@@ -285,7 +284,6 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
-        *_extra_uniform_args,
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),
@@ -546,9 +544,20 @@ def fused_qk_rope_reshape_and_cache(
         _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
         _extra_args = {"BLOCK_T": BLOCK_T}
     else:
-        n_pid = t * qh + (t_slot - t) * kh
+        # 1 q-head per program is 2B/lane; tile heads once the grid is big enough.
+        BLOCK_H = 1
+        if t >= _BLOCK_H_MIN_TOKENS:
+            qh_per_kh = qh // kh
+            for cand in (16, 8, 4, 2):
+                if qh % cand == 0 and (cand % qh_per_kh == 0 or qh_per_kh % cand == 0):
+                    BLOCK_H = cand
+                    break
+        n_pid = t * (qh // BLOCK_H) + (t_slot - t) * kh
         _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
-        _extra_args = {}
+        _extra_args = {
+            "BLOCK_H": BLOCK_H,
+            "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
+        }
     grid = (n_pid, 1, 1)
     _kernel[grid](
         q,

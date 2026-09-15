@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
@@ -9,7 +14,6 @@
 #include "quant.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 
 const int32_t BlockSize           = 256;
@@ -95,7 +99,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
     }
-    absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+    absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
     // MX e8m0 path: use the project-wide default round mode
     // (``kDefaultMxScaleRoundMode``, currently RoundUp = NV / DSv4 RCEIL).
@@ -121,9 +125,15 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         inverted_scale = absMax * inverted_DTYPE_MAX;
     }
-    row_offset           = std::is_same_v<DTYPE_O, opus::fp4_t>
-                               ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
-                               : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
+    const int64_t out_row_offset =
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols;
+    const int32_t out_thread_offset =
+        (std::is_same_v<DTYPE_O, opus::fp4_t> ? y * group_size / 2
+                                              : y * group_size) +
+        (threadIdx.x % num_thread_per_group) * vec_size_o;
+    const int64_t out_linear_offset = out_row_offset + out_thread_offset;
+    // Fallback descriptor base for outputs beyond the global descriptor's
+    // 32-bit byte reach. Normal-size tensors retain the original global base.
     if(threadIdx.x % num_thread_per_group == 0)
     {
         if constexpr(use_e8m0_scale)
@@ -162,9 +172,24 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
-    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
-
-    store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, thread_data, row_offset, inverted_scale);
+    constexpr int64_t kDescriptorReach = (int64_t{1} << 32) - 1;
+    if(oob_size <= kDescriptorReach)
+    {
+        auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
+        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
+            buffer_o, thread_data, out_linear_offset, inverted_scale);
+    }
+    else
+    {
+        auto buffer_o = opus::make_gmem<DTYPE_STORE>(
+            out_ptr + out_row_offset,
+            static_cast<int64_t>(std::is_same_v<DTYPE_O, opus::fp4_t>
+                                     ? ori_cols / 2
+                                     : ori_cols) *
+                sizeof(DTYPE_STORE));
+        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
+            buffer_o, thread_data, out_thread_offset, inverted_scale);
+    }
 }
 
 __global__ void initializeScale(float *d_data, int size, float value)
@@ -233,10 +258,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     }
     // double load core loop end
 
-    // using BlockReduce = hipcub::BlockReduce<float, BlockSize>;
-    // __shared__ typename BlockReduce::TempStorage temp_storage;
-    // absMax = BlockReduce(temp_storage).Reduce(absMax, hipcub::Max());
-    absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
+    absMax = block_reduce<float, aiter::Max, BlockSize, true>(absMax, aiter::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -448,7 +470,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         absMax         = max(absMax, abs(smscale_cur[j]));
     }
 
-    absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
+    absMax = block_reduce<float, aiter::Max, block_size, true>(absMax, aiter::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -1539,7 +1561,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
                 vec_input_f[j] = vec_input_f[j] * smscale[j];
                 absMax         = max(absMax, abs(vec_input_f[j]));
             }
-            absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
+            absMax = block_reduce<float, aiter::Max, block_size, true>(absMax, aiter::Max());
 
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                                 ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -1841,7 +1863,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 vec_input_f[j] = static_cast<float>(vec_input[j]);
                 absMax         = max(absMax, abs(vec_input_f[j]));
             }
-            absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+            absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
             // MXFP4 / MXFP8 use the project-wide default round mode
             // (kDefaultMxScaleRoundMode, currently NV ROUND_UP =
@@ -1934,17 +1956,16 @@ __global__ void fused_mx_quant_moe_sort_kernel(
         AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
     }
 
-void fused_dynamic_mx_quant_moe_sort_hip(
-    aiter_tensor_t& output,
-    aiter_tensor_t& scale,
-    const aiter_tensor_t& input,
-    const aiter_tensor_t& sorted_ids,
-    const aiter_tensor_t& num_valid_ids,
-    int token_num,
-    int block_m,
-    int group_size,
-    std::optional<aiter_tensor_t> sorted_weights
-)
+static void fused_dynamic_mx_quant_moe_sort_hip_impl(aiter_tensor_t& output,
+                                                     aiter_tensor_t& scale,
+                                                     const aiter_tensor_t& input,
+                                                     const aiter_tensor_t& sorted_ids,
+                                                     const aiter_tensor_t& num_valid_ids,
+                                                     int token_num,
+                                                     int block_m,
+                                                     int group_size,
+                                                     std::optional<aiter_tensor_t> sorted_weights,
+                                                     int64_t padded_rows_upper_bound)
 {
     int cols = input.size(-1);
     int topk = input.numel() / (cols * token_num);
@@ -1965,7 +1986,24 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
     AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
     int tgs_per_block_m = block_m / sub_block_m;
-    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
+    const int64_t old_extent = sorted_ids.size(0);
+    int64_t effective_extent = old_extent;
+    if(padded_rows_upper_bound >= 0)
+    {
+        // An over-conservative host-side expert bound must never enlarge the
+        // old launch. This also preserves the legacy extent if the calculated
+        // upper bound is greater than the sorted_ids allocation.
+        effective_extent =
+            padded_rows_upper_bound < old_extent ? padded_rows_upper_bound : old_extent;
+    }
+    int num_blocks = (effective_extent + sub_block_m - 1) / sub_block_m;
+    if(num_blocks == 0 && old_extent > 0)
+    {
+        // HIP does not accept a zero-sized grid. One workgroup is enough to
+        // read num_valid_ids==0 and return; it is no larger than the legacy
+        // launch, which also contains at least one workgroup.
+        num_blocks = 1;
+    }
     const bool persistent_mode = false;
     const int input_stride     = input.stride(-2);
 
@@ -1986,6 +2024,58 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     {
         AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));
     }
+}
+
+void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& output,
+                                         aiter_tensor_t& scale,
+                                         const aiter_tensor_t& input,
+                                         const aiter_tensor_t& sorted_ids,
+                                         const aiter_tensor_t& num_valid_ids,
+                                         int token_num,
+                                         int block_m,
+                                         int group_size,
+                                         std::optional<aiter_tensor_t> sorted_weights)
+{
+    fused_dynamic_mx_quant_moe_sort_hip_impl(output,
+                                             scale,
+                                             input,
+                                             sorted_ids,
+                                             num_valid_ids,
+                                             token_num,
+                                             block_m,
+                                             group_size,
+                                             sorted_weights,
+                                             -1);
+}
+
+void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
+                                                 aiter_tensor_t& scale,
+                                                 const aiter_tensor_t& input,
+                                                 const aiter_tensor_t& sorted_ids,
+                                                 const aiter_tensor_t& num_valid_ids,
+                                                 int token_num,
+                                                 int block_m,
+                                                 int64_t total_routes,
+                                                 int64_t num_experts_upper_bound,
+                                                 int group_size,
+                                                 std::optional<aiter_tensor_t> sorted_weights)
+{
+    AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
+    // A non-positive bound clamps the launch extent to 0, silently skipping
+    // every row, so reject it instead of under-launching.
+    AITER_CHECK(num_experts_upper_bound > 0, __func__, " num_experts_upper_bound must be positive");
+    const int64_t padded_rows_upper_bound =
+        moe_quant_padded_rows_upper_bound(total_routes, num_experts_upper_bound, block_m);
+    fused_dynamic_mx_quant_moe_sort_hip_impl(output,
+                                             scale,
+                                             input,
+                                             sorted_ids,
+                                             num_valid_ids,
+                                             token_num,
+                                             block_m,
+                                             group_size,
+                                             sorted_weights,
+                                             padded_rows_upper_bound);
 }
 
 // Perf gate threshold for the coalesced LDS-staged store path in

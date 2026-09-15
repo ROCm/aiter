@@ -9,9 +9,9 @@ import inspect
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -42,45 +42,18 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
+AITER_PYTHON_ROOT_DIR = (
+    os.path.dirname(AITER_CORE_DIR)
+    if os.path.basename(AITER_CORE_DIR) == "aiter_meta"
+    else AITER_CORE_DIR
+)
+sys.path.insert(0, os.path.join(AITER_PYTHON_ROOT_DIR, "aiter", "jit", "utils"))
 
+from chip_info import get_gfx_runtime
 
-def get_amdgpu_arch() -> str:
-    """Detect one native GPU target across system and Python ROCm layouts."""
-    commands = []
-
-    amdgpu_arch = shutil.which("amdgpu-arch")
-    legacy_amdgpu_arch = "/opt/rocm/llvm/bin/amdgpu-arch"
-    if amdgpu_arch is None and os.access(legacy_amdgpu_arch, os.X_OK):
-        amdgpu_arch = legacy_amdgpu_arch
-    if amdgpu_arch is not None:
-        commands.append([amdgpu_arch])
-
-    rocm_agent_enumerator = shutil.which("rocm_agent_enumerator")
-    if rocm_agent_enumerator is not None:
-        commands.append([rocm_agent_enumerator, "-name"])
-
-    for command in commands:
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode != 0:
-            continue
-        for line in result.stdout.splitlines():
-            arch = line.strip().split(":", 1)[0].lower()
-            if re.fullmatch(r"gfx[0-9a-f]+", arch):
-                return arch
-    return ""
-
-
-DEFAULT_GPU_ARCH = get_amdgpu_arch()
-GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
+GPU_ARCH = os.environ.get("GPU_ARCHS")
+if GPU_ARCH is None:
+    GPU_ARCH = get_gfx_runtime()
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 HOME_PATH = os.environ.get("HOME")
@@ -188,7 +161,7 @@ def validate_and_update_archs():
     ), f"One of GPU archs of {archs} is invalid or not supported"
     for i in range(len(archs)):
         if archs[i] == "native":
-            archs[i] = DEFAULT_GPU_ARCH
+            archs[i] = get_gfx_runtime()
 
     return archs
 

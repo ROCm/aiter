@@ -343,6 +343,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     v_out: Tensor = None,  # Optional output buffer for v
     return_kv: bool = False,  # Whether to return k_out and v_out
     use_shuffle_layout: bool = False,  # Whether to use shuffle layout
+    use_strided_layout: bool = False,  # Whether to use vLLM's unified layout
     page_size: int = 0,  # Page size (block_size) for shuffle layout
     rotary_dim: int = 0,  # Partial rotary dim (0 = full rotary = head_size)
     gemma_norm: bool = False,
@@ -350,7 +351,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     # qkv = qkv.clone()  # inplace op
     # Calculate x for shuffle layout: x = 16 // k_cache.element_size()
     x = 0
-    block_size = page_size
+    block_size = page_size if use_shuffle_layout or use_strided_layout else 0
     if use_shuffle_layout:
         x = 16 // k_cache.element_size()
 
@@ -431,6 +432,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
     kv_cache_dtype=None,  # Optional: specify KV cache dtype (e.g., torch.float8_e4m3fn)
     test_return_kv=False,  # Whether to test k_out and v_out return
     use_shuffle_layout=False,  # Whether to test shuffle layout
+    use_strided_layout=False,  # Whether to test vLLM's unified layout
     page_size=0,  # Page size (block_size) for shuffle layout
     max_positions=10000,
     rotary_dim=0,  # Partial rotary dim (0 = full rotary = head_size)
@@ -490,6 +492,28 @@ def test_mrope_3d_rms_set_kv_shuffle(
         v_cache_ref_flat = v_cache_ref.view(
             num_blocks * page_size, num_heads_v, head_size
         )
+    elif use_strided_layout:
+        assert num_heads_k == num_heads_v
+        num_blocks = (max_positions + page_size - 1) // page_size
+        num_slots = num_blocks * page_size
+        k_cache_ref = torch.rand(num_slots, num_heads_k, head_size, device="cuda").to(
+            kv_cache_dtype
+        )
+        v_cache_ref = torch.rand(num_slots, num_heads_v, head_size, device="cuda").to(
+            kv_cache_dtype
+        )
+        kv_cache = torch.rand(
+            num_blocks,
+            num_heads_k,
+            page_size,
+            2 * head_size,
+            device="cuda",
+        ).to(kv_cache_dtype)
+        k_cache, v_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+        assert not k_cache.is_contiguous()
+        assert not v_cache.is_contiguous()
+        k_cache_ref_flat = k_cache_ref
+        v_cache_ref_flat = v_cache_ref
     else:
         k_cache_ref = torch.rand(
             max_positions, num_heads_k, head_size, device="cuda"
@@ -582,10 +606,59 @@ def test_mrope_3d_rms_set_kv_shuffle(
         v_out,
         test_return_kv,
         use_shuffle_layout,
+        use_strided_layout,
         page_size,
         rotary_dim,
         gemma_norm,
     )
+
+    if use_strided_layout:
+        q_out_contiguous = torch.empty_like(q_out)
+        k_cache_contiguous = torch.empty_like(k_cache_ref)
+        v_cache_contiguous = torch.empty_like(v_cache_ref)
+        run_fused_mrope_3d_rms_set_kv_shuffle(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            mrope_section,
+            is_interleaved,
+            eps,
+            q_out_contiguous,
+            k_cache_contiguous,
+            v_cache_contiguous,
+            kv_loc,
+            k_scale,
+            v_scale,
+            is_mrope,
+            None,
+            None,
+            False,
+            False,
+            False,
+            0,
+            rotary_dim,
+            gemma_norm,
+        )
+        torch.testing.assert_close(
+            k_cache.reshape(-1, num_heads_k, head_size)[kv_loc].float(),
+            k_cache_contiguous[kv_loc].float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            v_cache.reshape(-1, num_heads_v, head_size)[kv_loc].float(),
+            v_cache_contiguous[kv_loc].float(),
+            rtol=0,
+            atol=0,
+        )
 
     info = f"dtype:{dtype}, kv_cache_dtype:{kv_cache_dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
     if is_mrope:
@@ -594,6 +667,8 @@ def test_mrope_3d_rms_set_kv_shuffle(
         info += f", return_kv:{test_return_kv}"
     if use_shuffle_layout:
         info += f", use_shuffle_layout:{use_shuffle_layout}, page_size:{page_size}"
+    if use_strided_layout:
+        info += f", use_strided_layout:{use_strided_layout}, page_size:{page_size}"
     if rotary_dim > 0:
         info += f", rotary_dim:{rotary_dim}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
@@ -605,6 +680,23 @@ def test_mrope_3d_rms_set_kv_shuffle(
         # Reshape shuffle cache back to flat format for comparison
         k_cache_flat = k_cache.view(-1, num_heads_k, head_size)
         v_cache_flat = v_cache.view(-1, num_heads_v, head_size)
+        checkAllclose(
+            k_cache_ref_flat[kv_loc].float(),
+            k_cache_flat[kv_loc].float(),
+            msg="k_cache",
+            rtol=1e-2,
+            atol=0.05,
+        )
+        checkAllclose(
+            v_cache_ref_flat[kv_loc].float(),
+            v_cache_flat[kv_loc].float(),
+            msg="v_cache",
+            rtol=1e-2,
+            atol=0.05,
+        )
+    elif use_strided_layout:
+        k_cache_flat = k_cache.reshape(-1, num_heads_k, head_size)
+        v_cache_flat = v_cache.reshape(-1, num_heads_v, head_size)
         checkAllclose(
             k_cache_ref_flat[kv_loc].float(),
             k_cache_flat[kv_loc].float(),
@@ -747,6 +839,26 @@ if __name__ == "__main__":
     page_sizes = [16]  # Test two page sizes for shuffle layout
     partial_rotary_configs = [(256, 64), (128, 32)]
     partial_rotary_heads = [(32, 4), (8, 2)]
+
+    print("\n=== vLLM unified-attention strided KV layout ===", flush=True)
+    for kv_cache_dtype in args.kv_cache_dtypes:
+        test_mrope_3d_rms_set_kv_shuffle(
+            args.dtype,
+            min(127, args.max_positions),
+            32,
+            1,
+            1,
+            128,
+            True,
+            mrope_sections_dict[128],
+            True,
+            eps=1e-6,
+            is_mrope=True,
+            kv_cache_dtype=kv_cache_dtype,
+            use_strided_layout=True,
+            page_size=16,
+            max_positions=args.max_positions,
+        )
 
     for kv_cache_dtype in args.kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
