@@ -9,13 +9,6 @@ name: Stale branches
 #   gh-pages            the published documentation site
 #   open PRs            deleting the head branch breaks the review
 #   protected branches  main and anything else protected in settings
-#
-# Known limitation: the action reads each branch tip's author date, not the
-# date it was pushed, so a long-lived branch rebased onto main today still
-# looks as old as the work it carries. Of the 717 branches currently past 30
-# days, 4 are in that state. They get the same 7-day warning comment naming
-# their author, and anything under review is covered by the open-PR check
-# below, so a false positive costs a comment rather than a branch.
 
 on:
   schedule:
