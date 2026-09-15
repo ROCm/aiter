@@ -410,24 +410,24 @@ def compile_conv3d_implicit(
     KG = k // groups
 
     assert TILE_K == 32
-    assert TILE_M % (WAVE_M * MFMA_M) == 0, (
-        f"TILE_M={TILE_M} not divisible by WAVE_M*16"
-    )
-    assert TILE_N % (WAVE_N * MFMA_N) == 0, (
-        f"TILE_N={TILE_N} not divisible by WAVE_N*16"
-    )
-    assert (TILE_M * TILE_K) % BLOCK_VECS == 0, (
-        f"A tile {TILE_M}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
-    )
-    assert (TILE_N * TILE_K) % BLOCK_VECS == 0, (
-        f"B tile {TILE_N}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
-    )
+    assert (
+        TILE_M % (WAVE_M * MFMA_M) == 0
+    ), f"TILE_M={TILE_M} not divisible by WAVE_M*16"
+    assert (
+        TILE_N % (WAVE_N * MFMA_N) == 0
+    ), f"TILE_N={TILE_N} not divisible by WAVE_N*16"
+    assert (
+        TILE_M * TILE_K
+    ) % BLOCK_VECS == 0, f"A tile {TILE_M}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
+    assert (
+        TILE_N * TILE_K
+    ) % BLOCK_VECS == 0, f"B tile {TILE_N}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
     assert LDG_A_COUNT >= 1 and LDG_B_COUNT >= 1
     assert c % groups == 0, f"c={c} not divisible by groups={groups}"
     assert k % groups == 0, f"k={k} not divisible by groups={groups}"
-    assert CGP % LDG_VEC == 0, (
-        f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
-    )
+    assert (
+        CGP % LDG_VEC == 0
+    ), f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
 
     # Dilation only stretches the filter's footprint; the K axis (CRS) is unchanged.
@@ -450,9 +450,9 @@ def compile_conv3d_implicit(
     )
     OOB_SENTINEL_BYTES = OOB_SENTINEL_ELEM * BF16_BYTES
     BIG_IN_NR = 0x80000000  # 2 GB num_records for the rebased BIG_IN resource
-    assert W_BYTES < OOB_SENTINEL_BYTES, (
-        f"weight {W_BYTES}B exceeds limit {OOB_SENTINEL_BYTES}B"
-    )
+    assert (
+        W_BYTES < OOB_SENTINEL_BYTES
+    ), f"weight {W_BYTES}B exceeds limit {OOB_SENTINEL_BYTES}B"
     assert X_BYTES < OOB_SENTINEL_BYTES or BIG_IN, f"input {X_BYTES}B exceeds limit"
     BIG_IN_N1 = BIG_IN and n == 1
     BIG_IN_NM = BIG_IN and n > 1
@@ -474,12 +474,12 @@ def compile_conv3d_implicit(
             f"over N, or pass a narrower tile=(TILE_M, ...)."
         )
 
-    assert pad_mode in PADDING_MODES, (
-        f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
-    )
-    assert pad_mode == "zeros" or not BIG_IN, (
-        "non-zero pad_mode requires the non-BIG_IN address path"
-    )
+    assert (
+        pad_mode in PADDING_MODES
+    ), f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
+    assert (
+        pad_mode == "zeros" or not BIG_IN
+    ), "non-zero pad_mode requires the non-BIG_IN address path"
     X_SAMPLE_ELEMS = c * d * h * w
 
     tiles_per_group = (KG + TILE_N - 1) // TILE_N
@@ -492,9 +492,9 @@ def compile_conv3d_implicit(
 
     Y_BYTES = npq * k * (4 if use_splitk else BF16_BYTES)
 
-    assert not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES, (
-        f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
-    )
+    assert (
+        not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
+    ), f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
 
     PIPE_STAGES = 2 * TILES_PER_BARRIER
 
@@ -518,12 +518,12 @@ def compile_conv3d_implicit(
         and (not out_ndhwc)
     )
 
-    assert grid_n <= MAX_GRID_YZ, (
-        f"grid.y = {grid_n} exceeds the {MAX_GRID_YZ}-block limit"
-    )
-    assert m_chunks * splitk <= MAX_GRID_YZ, (
-        f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
-    )
+    assert (
+        grid_n <= MAX_GRID_YZ
+    ), f"grid.y = {grid_n} exceeds the {MAX_GRID_YZ}-block limit"
+    assert (
+        m_chunks * splitk <= MAX_GRID_YZ
+    ), f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
 
     WGM = 1 if m_chunks > 1 else max(1, int(wgm))
     elem_ty = fx.BFloat16
@@ -1127,7 +1127,7 @@ SPLITK_MAX_STAGING_BYTES = 0xFFFFFFFF
 def _num_cu(device):
     try:
         return torch.cuda.get_device_properties(device).multi_processor_count
-    except Exception:  # noqa: BLE001 -- any probe failure falls back to the gfx950 count
+    except Exception:  # noqa: BLE001 -- probe failure falls back to gfx950's count
         return 256
 
 
@@ -1295,9 +1295,9 @@ def _as_tuple(v, rank, name):
     t = tuple(v)
     if len(t) == 1:
         return t * rank
-    assert len(t) == rank, (
-        f"{name} must be an int or a sequence of 1 or {rank} ints, got {tuple(v)}"
-    )
+    assert (
+        len(t) == rank
+    ), f"{name} must be an int or a sequence of 1 or {rank} ints, got {tuple(v)}"
     return t
 
 
@@ -1311,9 +1311,9 @@ def _resolve_padding(padding, kernel, stride, dilation):
         return (0, 0, 0), (0, 0, 0)
     if padding != "same":
         raise ValueError(f"padding string must be 'same' or 'valid', got {padding!r}")
-    assert all(s == 1 for s in stride), (
-        f"padding='same' is not supported for strided convolutions, got stride {tuple(stride)}"
-    )
+    assert all(
+        s == 1 for s in stride
+    ), f"padding='same' is not supported for strided convolutions, got stride {tuple(stride)}"
     total = [dl * (kn - 1) for kn, dl in zip(kernel, dilation)]
     return tuple(t // 2 for t in total), tuple(t - t // 2 for t in total)
 
@@ -1343,12 +1343,12 @@ def _conv3d_impl(
     k, wc, kt, kh, kw = weight.shape
 
     for name, t in (("x", x), ("weight", weight), ("bias", bias)):
-        assert t is None or t.is_cuda, (
-            f"conv3d_implicit needs GPU tensors; {name} is on {t.device}"
-        )
-    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        f"conv3d_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
-    )
+        assert (
+            t is None or t.is_cuda
+        ), f"conv3d_implicit needs GPU tensors; {name} is on {t.device}"
+    assert (
+        x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    ), f"conv3d_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
     assert bias is None or (bias.dim() == 1 and bias.numel() == k), (
         f"bias must be a 1-D tensor of {k} elements, one per output channel; "
         f"got shape {tuple(bias.shape)}"
@@ -1360,27 +1360,27 @@ def _conv3d_impl(
     assert wc == c // groups, f"weight in-channels {wc} != C/groups = {c // groups}"
     st, sh, sw = _as_tuple(stride, 3, "stride")
 
-    assert min(st, sh, sw) >= 1, (
-        f"non-positive stride is not supported, got (st, sh, sw) = {(st, sh, sw)}"
-    )
+    assert (
+        min(st, sh, sw) >= 1
+    ), f"non-positive stride is not supported, got (st, sh, sw) = {(st, sh, sw)}"
     dt, dh, dw = _as_tuple(dilation, 3, "dilation")
     assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
     pad_lo, pad_hi = _resolve_padding(padding, (kt, kh, kw), (st, sh, sw), (dt, dh, dw))
     pt, ph, pw = pad_lo
-    assert padding_mode in PADDING_MODES, (
-        f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
-    )
+    assert (
+        padding_mode in PADDING_MODES
+    ), f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
 
     if padding_mode in ("reflect", "circular"):
         for ax, (p, ext) in enumerate(zip(map(max, pad_lo, pad_hi), (d, h, w))):
             if padding_mode == "reflect":
-                assert p < ext, (
-                    f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
-                )
+                assert (
+                    p < ext
+                ), f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
             else:
-                assert p <= ext, (
-                    f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
-                )
+                assert (
+                    p <= ext
+                ), f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
 
     # Key into the offline-tuned config table. Captured here, before the padding
     # and channel-padding paths below rewrite n/c/d/h/w, so that it describes the
@@ -1468,9 +1468,9 @@ def _conv3d_impl(
     do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
     ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
     wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
-    assert min(do, ho, wo) >= 1, (
-        f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
-    )
+    assert (
+        min(do, ho, wo) >= 1
+    ), f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
     npq = n * do * ho * wo
 
     if n == 0:
