@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for sparse_mla_fwd (gfx950 gluon MLA).
+"""Tests for sparse_mla_fwd (gluon MLA, gfx950 and gfx942).
 
 Covers both geometries: separated rope (DSV3.2, GLM-5.1, GLM-5.2) and
 rope-free (GLM-5.3-Flash), where the query is the latent alone.
@@ -11,22 +11,28 @@ import pytest
 import torch
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
-if arch_info.get_arch() == "gfx950":
-    import aiter.ops.triton.attention.sparse_mla as smd
-    from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+import aiter.ops.triton.attention.sparse_mla as smd
+from aiter.ops.triton.attention.sparse_mla import (
+    FP8_DOT_ARCHS,
+    SUPPORTED_ARCHS,
+    sparse_mla_fwd,
+)
 
-# The packed fp8_ds_mla record is OCP e4m3 by definition of the format.
-FP8_DTYPE = get_fp8_e4m3_dtype()
+# OCP e4m3, not the arch-native fp8: these records are OCP by definition and the
+# kernel's dequant reads OCP. gfx942's native fnuz would decode to garbage.
+FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 KV_LORA, ROPE = 512, 64
 D_QK = KV_LORA + ROPE
 
 
-def _skip_unless_gfx950():
-    if arch_info.get_arch() != "gfx950":
-        pytest.skip("sparse_mla_fwd is gfx950-only")
+def _skip_unless_supported(dots="bf16"):
+    arch = arch_info.get_arch()
+    if arch not in SUPPORTED_ARCHS:
+        pytest.skip(f"sparse_mla_fwd does not support {arch}")
+    if dots == "fp8" and arch not in FP8_DOT_ARCHS:
+        pytest.skip(f"fp8 matrix-core dots need OCP e4m3, absent on {arch}")
 
 
 def quantize_flat_fp8(kv):
@@ -141,14 +147,14 @@ def _run_and_check(
     ids=["topk2048", "ragged500", "prefill"],
 )
 def test_sparse_mla(fmt, dots, tol, H, C, topk, ragged, pool):
-    _skip_unless_gfx950()
+    _skip_unless_supported(dots)
     _run_and_check(
         fmt, C=C, H=H, topk=topk, ragged=ragged, pool=pool, tol=tol, dot_precision=dots
     )
 
 
 def test_ds_mla_format():
-    _skip_unless_gfx950()
+    _skip_unless_supported()
     _run_and_check("dsmla", C=8, H=16, topk=2048, ragged=True)
 
 
@@ -169,7 +175,7 @@ def reference_lse(q, kv_truth, indices, indptr, sm_scale):
     ids=["split", "split_ragged", "nosplit"],
 )
 def test_return_lse(fmt, C, topk, ragged, splits):
-    _skip_unless_gfx950()
+    _skip_unless_supported()
     H, pool = 16, 1 << 16
     sm = D_QK**-0.5
     q, cache, ks, idx, ptr, truth = _build(fmt, C, H, topk, pool, ragged)
@@ -190,7 +196,7 @@ def test_return_lse(fmt, C, topk, ragged, splits):
 
 def test_global_load_path():
     """A pool whose addressable span passes buffer_load's 2 GB offset limit."""
-    _skip_unless_gfx950()
+    _skip_unless_supported()
     live = 1 << 16
     sm = D_QK**-0.5
     q, cache, ks, idx, ptr, truth = _build("tensor", 8, 16, 2048, live, ragged=False)
@@ -214,7 +220,7 @@ def test_global_load_path():
     ids=["topk2048", "ragged500", "prefill"],
 )
 def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
-    _skip_unless_gfx950()
+    _skip_unless_supported(dots)
     _run_and_check(
         fmt,
         C=C,
