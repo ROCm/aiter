@@ -404,11 +404,16 @@ def compile_chunk_gated_delta_h(
         # is a single element rather than a vector.
         u_view = _gview(v_tensor, v_base, (T_local, V, 1), (stride_v, 1, 1))
 
-        if const_expr(IS_VARLEN):
-            vn_base = (i_h64 * t_flat64 + bos64) * V
+        if const_expr(WU_CONTIGUOUS):
+            if const_expr(IS_VARLEN):
+                vn_base = (i_h64 * t_flat64 + bos64) * V
+            else:
+                vn_base = ((i_n64 * H + i_h64) * t_flat64) * V
+            stride_vn = V
         else:
-            vn_base = ((i_n64 * H + i_h64) * t_flat64) * V
-        vn_view = _gview(v_new_tensor, vn_base, (T_local, V, 1), (V, 1, 1))
+            vn_base = (bos64 * H + i_h64) * V
+            stride_vn = H * V
+        vn_view = _gview(v_new_tensor, vn_base, (T_local, V, 1), (stride_vn, 1, 1))
 
         # h0/ht: the [V, K] state slot for this (state, head), K split into the
         # 4 contiguous elements of one state vector access.
