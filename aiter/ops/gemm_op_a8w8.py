@@ -167,6 +167,30 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split)
 
 
+_UNKNOWN_FLYDSL_BPRESHUFFLE_WARNED: set[str] = set()
+
+
+def _warn_unknown_flydsl_bpreshuffle_kernel(kernel_name: str) -> None:
+    """Report a tuned row naming a kernel this catalog cannot build.
+
+    A tuned CSV row that names an unparseable kernel is a dead row: the shape
+    runs on the CK default heuristic instead of the kernel it was tuned to, so
+    the tuning silently has no effect. Without a message the only symptom is
+    "tuning did not help", which is indistinguishable from a bad tuning result.
+
+    Warn once per name, not per call, because this sits on the GEMM dispatch
+    path.
+    """
+    if kernel_name in _UNKNOWN_FLYDSL_BPRESHUFFLE_WARNED:
+        return
+    _UNKNOWN_FLYDSL_BPRESHUFFLE_WARNED.add(kernel_name)
+    logger.warning(
+        f"FlyDSL kernel '{kernel_name}' from tuned config is not recognized by "
+        "the current catalog -- falling back to the CK default heuristic, so "
+        "this shape is running untuned. Re-run the tuner to regenerate the row."
+    )
+
+
 def gemm_a8w8_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -195,6 +219,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
 
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
+        _warn_unknown_flydsl_bpreshuffle_kernel(kernel_name)
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
     tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
 
