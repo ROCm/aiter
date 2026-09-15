@@ -93,14 +93,18 @@ def compact_row_capacity(
     topk: int,
     experts_per_rank: int,
     tile_m: int,
+    max_routes: int | None = None,
 ) -> int:
-    """Static CUDAGraph-safe bound matching grouped_moe contiguous_m."""
+    """Static CUDAGraph-safe bound matching grouped_moe contiguous_m.
+
+    Rows are per local route, each expert's run padded to ``tile_m``, so the
+    bound is (routes this rank can own) + the per-expert padding. Absent a
+    tighter ``max_routes``, every one of the arena's ``max_recv`` recv tokens is
+    assumed to route all ``topk`` ways into this rank.
+    """
     tile_m = int(tile_m)
-    ub = (
-        int(max_recv) * int(topk)
-        + int(experts_per_rank) * tile_m
-        - int(topk)
-    )
+    routes = int(max_recv) * int(topk) if max_routes is None else int(max_routes)
+    ub = routes + int(experts_per_rank) * tile_m - int(topk)
     aligned = ((ub + tile_m - 1) // tile_m) * tile_m
     return max(tile_m, aligned)
 
@@ -112,21 +116,26 @@ def compile_tdm_compact_plan(
     npes: int,
     experts_per_rank: int,
     topk: int,
-    tile_m: int,
     compact_cap: int,
     off_hist: int,
     off_done: int,
     hist_stride: int,
     max_routes: int,
 ):
-    """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``."""
+    """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
+
+    The per-expert tile alignment and the row cap are launch arguments, not
+    compile-time constants: the grouped GEMM picks its tile from the tuning CSV
+    per recv-token bucket, and a decode bucket's tile is not the arena
+    worst-case one. ``compact_cap`` here is only the arena's row capacity, used
+    to prove the packed row encoding still fits a positive i32.
+    """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
     epr = int(experts_per_rank)
     segs = int(npes) * epr
     if segs > 1024:
         raise ValueError(f"compact plan LDS hist supports at most 1024 segments, got {segs}")
-    tile_m = int(tile_m)
     compact_cap = int(compact_cap)
     max_routes = max(1, int(max_routes))
     peer_bits = max(1, (int(npes) - 1).bit_length())
@@ -165,6 +174,8 @@ def compile_tdm_compact_plan(
         addr_barrier: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
+        tile_mask: Int32,
+        row_cap: Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -464,8 +475,10 @@ def compile_tdm_compact_plan(
                         my_prefix = comm_ops.load_i32_lds(
                             lds_pref + fx.Int64(idx) * fx.Int64(4)
                         )
-                    aligned = (total + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
-                    aligned = aligned * fx.Int32(tile_m)
+                    # Round up to the launch's tile: tile_mask is tile_m-1 on a
+                    # power-of-two tile, so (x & ~mask) without a runtime divide.
+                    bumped = total + tile_mask
+                    aligned = bumped - (bumped & tile_mask)
                     inclusive = _wave32_inclusive_scan_i32(aligned, lane)
                     expert_start = carry + inclusive - aligned
                     if in_expert:
@@ -511,7 +524,7 @@ def compile_tdm_compact_plan(
                 lds_hist + fx.Int64(segment) * fx.Int64(4)
             )
             dest_row = send_base + intra
-            in_cap = dest_row < compact_cap
+            in_cap = dest_row < row_cap
             flat = (dest_row << fx.Int32(peer_bits)) | (
                 dest_pe & fx.Int32(peer_mask)
             )
@@ -533,6 +546,8 @@ def compile_tdm_compact_plan(
         addr_barrier: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
+        tile_mask: Int32,
+        row_cap: Int32,
         stream=fx.Stream(None),  # noqa: B008
     ):
         kernel(
@@ -546,6 +561,8 @@ def compile_tdm_compact_plan(
             addr_barrier,
             my_lsa_rank,
             inp_cur_tok,
+            tile_mask,
+            row_cap,
         ).launch(
             grid=(PLAN_BLOCKS, 1, 1),
             block=[PLAN_THREADS, 1, 1],

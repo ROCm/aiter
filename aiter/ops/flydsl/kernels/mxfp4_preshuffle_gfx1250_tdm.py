@@ -163,6 +163,17 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
+    if tdm_as_in_prologue and row_major_ascale:
+        # The prologue stages the whole K range in the 16-row-interleaved layout
+        # and wins every lookup below, so a row-major buffer would be read as if
+        # interleaved: wrong scales, not a slower kernel. Rejected here because
+        # the two arrive from unrelated decisions -- the prologue from the tuning
+        # CSV, row-major from whoever produced the A-scale -- and a caller that
+        # sets both has no way to see which one the kernel dropped.
+        raise ValueError(
+            "tdm_as_in_prologue stages a 16-row-interleaved A-scale and cannot "
+            "be combined with row_major_ascale; pick one layout"
+        )
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M

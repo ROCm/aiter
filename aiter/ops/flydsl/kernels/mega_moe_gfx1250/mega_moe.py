@@ -97,65 +97,117 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def _compact_gemm_align_m(
+@dataclass(frozen=True)
+class _CompactGeometry:
+    """Compact-layout shape planned for one step's batch.
+
+    ``csv_tokens`` is the bucket the grouped GEMM must key its tuning CSV lookup
+    off, ``tile_m`` the alignment that CSV row implies, and ``rows`` the static
+    row capacity that alignment needs. The three travel together because they
+    are not independent: the plan pads each expert's run to ``tile_m``, so a
+    GEMM that tiled by anything else would read ``psum`` starts that do not line
+    up with the rows.
+    """
+
+    csv_tokens: int
+    tile_m: int
+    rows: int
+
+
+# The knobs whose presence makes grouped_moe rebuild the whole tile set from
+# the environment instead of the CSV row; mirrored below so both sides agree on
+# the alignment.
+_TDM_TILE_ENV = (
+    "AITER_TDM_TILE_M",
+    "AITER_TDM_TILE_N",
+    "AITER_TDM_TILE_K",
+    "AITER_TDM_NUM_BUFFERS",
+    "AITER_TDM_TILE_M2",
+    "AITER_TDM_TILE_N2",
+    "AITER_TDM_TILE_K2",
+    "AITER_TDM_NUM_BUFFERS2",
+)
+
+
+def _tdm_tile_env(name: str) -> int | None:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return None
+    return int(v)
+
+
+def _compact_tuning_row(
     config: "MegaMoEConfig",
     *,
     activation: ActivationType,
     quant_type: QuantType,
     inter_dim: int,
-) -> int:
-    """Tile alignment for compact dest rows; must match GEMM ``max(tile_m, tile_m2)``.
+    recv_tokens: int,
+) -> tuple[int, int]:
+    """The tuning bucket the grouped GEMM should use, and the tile it implies.
 
-    Arena size is fixed at MegaMoE init. Honour ``AITER_TDM_TILE_M{,2}``, otherwise
-    use the same grouped-GEMM CSV row fused_moe will pick for this recv-token
-    bucket. Flooring at 64 used to pad compact_cap to EPR*64 even when the CSV
-    tile is 16/32, which launched a 3–4× GEMM grid at small tpr.
+    Returns the bucket and not just the tile because grouped_moe has to look up
+    the SAME CSV row: tile_n, cluster_n and the prefetch knobs come from there
+    too, and a bucket with no tuned row drops it onto the built-in defaults. So
+    the bucket is rounded up to the nearest tuned one here, once, and announced
+    through the scatter context -- a tiny decode batch lands on the smallest
+    measured row rather than on an untuned tile_m=64.
+
+    The alignment must equal the GEMM's ``max(tile_m, tile_m2)``, so
+    ``AITER_TDM_TILE_*`` is resolved exactly the way grouped_moe resolves it.
     """
-
-    def _env(name: str) -> int | None:
-        v = os.environ.get(name)
-        if v is None or v == "":
-            return None
-        return int(v)
-
-    ov_m = _env("AITER_TDM_TILE_M")
-    ov_m2 = _env("AITER_TDM_TILE_M2")
-    if ov_m is not None or ov_m2 is not None:
-        tile_m = 64 if ov_m is None else ov_m
-        tile_m2 = tile_m if ov_m2 is None else ov_m2
-        return max(int(tile_m), int(tile_m2))
-
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
         _find_grouped_config,
         _get_padded_m,
     )
 
+    bucket = _get_padded_m(int(recv_tokens))
+    ov_m = _tdm_tile_env("AITER_TDM_TILE_M")
+    ov_m2 = _tdm_tile_env("AITER_TDM_TILE_M2")
+    env_active = any(_tdm_tile_env(name) is not None for name in _TDM_TILE_ENV)
+
+    def _align(csv_m: int, csv_m2: int) -> int:
+        if not env_active:
+            return max(int(csv_m), int(csv_m2))
+        # grouped_moe's rule: stage2 ties to the (possibly overridden) stage1
+        # base unless its own override is set, discarding the CSV stage2 value.
+        base_m = int(csv_m) if ov_m is None else int(ov_m)
+        return max(base_m, base_m if ov_m2 is None else int(ov_m2))
+
     if config.dispatch_wire == "fp4":
         q_dtype_a = dtypes.fp4x2
     elif config.dispatch_wire == "fp8":
         q_dtype_a = dtypes.fp8
     else:
-        return 64
+        return bucket, _align(64, 64)
 
-    row = _find_grouped_config(
-        token_num=_get_padded_m(config.max_recv),
-        model_dim=config.hidden_dim,
-        inter_dim=int(inter_dim),
-        experts=config.experts_per_rank,
-        topk=-1,
-        activation=activation,
-        dtype=dtypes.bf16,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=dtypes.fp4x2,
-        quant_type=quant_type,
-    )
+    top = _get_padded_m(config.max_recv)
+    probe = min(bucket, top)
+    row = None
+    while True:
+        row = _find_grouped_config(
+            token_num=probe,
+            model_dim=config.hidden_dim,
+            inter_dim=int(inter_dim),
+            experts=config.experts_per_rank,
+            topk=-1,
+            activation=activation,
+            dtype=dtypes.bf16,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=quant_type,
+        )
+        if row is not None or probe >= top:
+            break
+        probe = _get_padded_m(probe + 1)
     tile_m = 64
     tile_m2 = 64
     if row is not None:
+        bucket = probe
         tile_m = _as_int(row.get("tile_m"), tile_m) or tile_m
         tile_m2 = _as_int(row.get("tile_m2"), tile_m) or tile_m
-    return max(int(tile_m), int(tile_m2))
+    return bucket, _align(tile_m, tile_m2)
 
 
 def _mori_dispatch_schedule(config) -> tuple:
@@ -323,7 +375,9 @@ class MegaMoEConfig:
             "True",
         )
 
-    def compact_row_cap(self, tile_m: int = 64) -> int:
+    def compact_row_cap(
+        self, tile_m: int = 64, *, max_routes: int | None = None
+    ) -> int:
         from .compact_plan import compact_row_capacity
 
         return compact_row_capacity(
@@ -331,6 +385,7 @@ class MegaMoEConfig:
             topk=self.topk,
             experts_per_rank=self.experts_per_rank,
             tile_m=tile_m,
+            max_routes=max_routes,
         )
 
     @property
@@ -562,6 +617,7 @@ class MegaMoEGfx1250:
         a1_scale: torch.Tensor | None = None,
         a2_scale: torch.Tensor | None = None,
         recv_token_bound: int | None = None,
+        global_token_bound: int | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -572,6 +628,13 @@ class MegaMoEGfx1250:
         so the shape stays static under graph capture, and must not cut below the
         received count -- the kernels skip the tail past the device-side count on
         their own.
+
+        ``global_token_bound`` is the compact layout's equivalent, and a
+        different quantity: how many tokens the whole EP group runs this step.
+        Compact rows are expert-grouped, so nothing can be sliced off the end of
+        them -- they have to be SIZED, and their count follows the group's route
+        count rather than this rank's recv count. Absent it, every step plans
+        for a full arena and runs the prefill-tuned kernel.
         """
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
@@ -634,16 +697,27 @@ class MegaMoEGfx1250:
                 f"topk_ids must have shape {expected_shape}, "
                 f"got {tuple(topk_ids.shape)}"
             )
-        recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids
+        bound = None if recv_token_bound is None else int(recv_token_bound)
+        if bound is not None and (bound <= 0 or bound > self._config.max_recv):
+            raise ValueError(
+                f"recv_token_bound must be in (0, {self._config.max_recv}], "
+                f"got {recv_token_bound}"
+            )
+        if global_token_bound is not None and int(global_token_bound) < token_count:
+            # The group runs at least what this rank runs. A bound below it
+            # would size the compact rows for fewer routes than arrive, and the
+            # plan drops the overflow silently.
+            raise ValueError(
+                f"global_token_bound={global_token_bound} is below this rank's "
+                f"own {token_count} tokens"
+            )
+        compact_geom = (
+            self._compact_geometry(global_token_bound) if self._compact_plan else None
         )
-        if recv_token_bound is not None and not self._compact_plan:
-            bound = int(recv_token_bound)
-            if bound <= 0 or bound > recv_x.shape[0]:
-                raise ValueError(
-                    f"recv_token_bound must be in (0, {recv_x.shape[0]}], "
-                    f"got {recv_token_bound}"
-                )
+        recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
+            hidden_states, topk_weights, topk_ids, compact_geom
+        )
+        if bound is not None and not self._compact_plan:
             recv_x = recv_x[:bound]
             recv_weights = recv_weights[:bound]
             recv_ids = recv_ids[:bound]
@@ -652,17 +726,23 @@ class MegaMoEGfx1250:
                 "a1_scale is produced by the quantizing dispatch wire itself; a "
                 "caller-supplied one would be silently discarded"
             )
-            a1_scale = self._recv_dispatch_scales()
-            if recv_token_bound is not None and not self._compact_plan:
-                a1_scale = a1_scale[: int(recv_token_bound)]
+            a1_scale = self._recv_dispatch_scales(
+                None if compact_geom is None else compact_geom.rows
+            )
+            if bound is not None and not self._compact_plan:
+                a1_scale = a1_scale[:bound]
         extra = {}
         if self.activation == ActivationType.Situv2:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
-        scatter = self._scatter_context(routing)
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import set_tdm_compact_plan
+        scatter = self._scatter_context(routing, compact_geom)
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            set_mega_dispatch_state,
+            set_tdm_compact_plan,
+        )
 
         set_tdm_compact_plan(scatter if self._compact_plan else None)
+        set_mega_dispatch_state(self._dispatch_state)
         moe_ids = self._compact_dummy_ids if self._compact_plan else recv_ids
         moe_wts = self._compact_dummy_wts if self._compact_plan else recv_weights
         try:
@@ -692,6 +772,7 @@ class MegaMoEGfx1250:
             )
         finally:
             set_tdm_compact_plan(None)
+            set_mega_dispatch_state(None)
         return self._combine(routing)
 
     __call__ = forward
@@ -708,17 +789,34 @@ class MegaMoEGfx1250:
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
         self._compact_plan = config.compact_plan
-        self._compact_tile_m = _compact_gemm_align_m(
+        # Decided here, once, and announced to grouped_moe per call: the
+        # dispatch kernel below is built with this exact clear_route_counter, so
+        # reading the env again on the consumer side could pair a route kernel
+        # that clears nothing with a dispatch that cleared nothing.
+        #
+        # Only the TDM dispatch kernel has the clearing tail, and its compact
+        # variant skips it (compact never runs the route kernel); every other
+        # backend leaves the shared route counter to the route kernel.
+        self._direct_ep_mask = config.dispatch_backend == "tdm" and os.environ.get(
+            "AITER_TDM_DIRECT_EP_MASK", "1"
+        ) in ("1", "true", "True")
+        self._clears_route_counter = self._direct_ep_mask and not self._compact_plan
+        # Arena worst case: the tile the GEMM picks for a full arena of recv
+        # tokens, and the rows that tile then needs. Per-call geometry (see
+        # ``_compact_geometry``) only ever shrinks inside this.
+        _, self._compact_tile_m = _compact_tuning_row(
             config,
             activation=self.activation,
             quant_type=self.quant_type,
             inter_dim=self.inter_dim,
+            recv_tokens=config.max_recv,
         )
         self._compact_cap = (
             config.compact_row_cap(self._compact_tile_m)
             if self._compact_plan
             else max_recv
         )
+        self._compact_geom_cache: dict[int, _CompactGeometry] = {}
         recv_rows = self._compact_cap if self._compact_plan else max_recv
         self._compact_wire_row = (
             _align_up(
@@ -780,9 +878,17 @@ class MegaMoEGfx1250:
         self._arena.zero()
         # Shared with grouped_moe_gfx1250. TDM dispatch clears this at its tail,
         # before the following route kernel starts issuing slot atomics.
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import route_counter_buffer
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            MegaDispatchState,
+            route_counter_buffer,
+        )
 
         self._route_counter = route_counter_buffer(config.experts_per_rank, device)
+        self._dispatch_state = MegaDispatchState(
+            backend=config.dispatch_backend,
+            clears_route_counter=self._clears_route_counter,
+            direct_ep_mask=self._direct_ep_mask,
+        )
 
         self._token_destination_map = torch.full(
             (config.max_tokens_per_rank * config.topk,),
@@ -816,7 +922,6 @@ class MegaMoEGfx1250:
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
                 topk=config.topk,
-                tile_m=self._compact_tile_m,
                 compact_cap=self._compact_cap,
                 off_hist=self._arena.offset("compact_hist"),
                 off_done=self._arena.offset("compact_done"),
@@ -1042,11 +1147,7 @@ class MegaMoEGfx1250:
                     scale_stride=config.dispatch_scale_dst_nbytes,
                     block_num=geom[0],
                     warp_num_per_block=geom[1],
-                    clear_route_counter=os.environ.get(
-                        "AITER_TDM_DIRECT_EP_MASK", "1"
-                    )
-                    in ("1", "true", "True")
-                    and not self._compact_plan,
+                    clear_route_counter=self._clears_route_counter,
                     compact_plan=self._compact_plan,
                     off_ep_rowmap=(
                         self._arena.offset("ep_rowmap") if self._compact_plan else 0
@@ -1168,7 +1269,71 @@ class MegaMoEGfx1250:
                 )
         return self._dispatch_specs[-1]
 
-    def _recv_tokens(self) -> torch.Tensor:
+    def _compact_geometry(self, global_token_bound: int | None) -> _CompactGeometry:
+        """Tuning bucket, tile alignment and row count for this step's batch.
+
+        Dispatch fills a worst-case arena, so absent a bound the only honest
+        bucket is that arena: the GEMM then takes the widest tuned tile and the
+        rows are padded to experts_per_rank of them, which is the prefill kernel
+        over half a million rows no matter how few tokens the step runs.
+
+        ``global_token_bound`` is how many tokens the whole EP group runs this
+        step. That is the quantity this needs, not the local count: rows are one
+        per local route, and worst case every one of the group's
+        ``tokens * topk`` routes lands on this rank. It also matches how the
+        grouped GEMM was tuned, whose bucket is a token count with the same
+        ``token * topk + experts * tile`` M behind it -- so the row count comes
+        out at the M its CSV row was measured at.
+
+        A python int, hence static per captured graph. Keyed on the padded
+        bucket rather than the raw count so a run sees a handful of shapes.
+        """
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import _get_padded_m
+
+        config = self._config
+        tokens = (
+            config.max_recv
+            if global_token_bound is None
+            else min(int(global_token_bound), config.max_recv)
+        )
+        # Rows are planned for the padded bucket, except at the top of the
+        # table: ``_get_padded_m`` clamps to a tier there and can land BELOW the
+        # count, which as a route bound would drop routes. Fall back to the
+        # arena for that one case. Computed before the CSV probe so the cache
+        # answers most calls on integer arithmetic alone.
+        padded = _get_padded_m(tokens)
+        plan_tokens = padded if padded >= tokens else config.max_recv
+        geom = self._compact_geom_cache.get(plan_tokens)
+        if geom is not None:
+            return geom
+        bucket, tile_m = _compact_tuning_row(
+            config,
+            activation=self.activation,
+            quant_type=self.quant_type,
+            inter_dim=self.inter_dim,
+            recv_tokens=tokens,
+        )
+        if tile_m <= 0 or (tile_m & (tile_m - 1)):
+            raise ValueError(
+                "compact dest rows align to the grouped GEMM tile, which the "
+                f"plan rounds up with a mask: tile {tile_m} is not a power of two"
+            )
+        rows = config.compact_row_cap(tile_m, max_routes=plan_tokens * config.topk)
+        if rows > self._compact_cap:
+            # Unreachable for a monotone CSV: a bucket below the arena's own
+            # drops far more routes than a wider tile can pad back. If it ever
+            # happens the arena is too small for the tile this bucket wants, and
+            # silently keeping the arena's tile would leave the GEMM tiling
+            # against a CSV row it did not plan for.
+            raise ValueError(
+                f"compact arena holds {self._compact_cap} rows but the tuning "
+                f"row for {bucket} tokens needs {rows} at tile {tile_m}"
+            )
+        geom = _CompactGeometry(csv_tokens=bucket, tile_m=tile_m, rows=rows)
+        self._compact_geom_cache[plan_tokens] = geom
+        return geom
+
+    def _recv_tokens(self, rows: int | None = None) -> torch.Tensor:
         config = self._config
         # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
         # fp4 -- see _DispatchWire.recv_dtype.
@@ -1176,7 +1341,8 @@ class MegaMoEGfx1250:
             config.dispatch_token_nbytes
             // config.dispatch_wire_spec.recv_dtype.itemsize
         )
-        rows = self._compact_cap if self._compact_plan else config.max_recv
+        if rows is None:
+            rows = self._compact_cap if self._compact_plan else config.max_recv
         if self._compact_plan:
             storage = _from_gpu_ptr(
                 self._arena.local_ptr("disp_out"),
@@ -1194,11 +1360,12 @@ class MegaMoEGfx1250:
             config.dispatch_wire_spec.recv_dtype,
         )
 
-    def _recv_dispatch_scales(self) -> torch.Tensor | None:
+    def _recv_dispatch_scales(self, rows: int | None = None) -> torch.Tensor | None:
         """The forwarded e8m0 rows, or None on the bf16 wire."""
         if not self._config.is_quant_dispatch_wire:
             return None
-        rows = self._compact_cap if self._compact_plan else self._config.max_recv
+        if rows is None:
+            rows = self._compact_cap if self._compact_plan else self._config.max_recv
         if self._compact_plan:
             span = (rows - 1) * self._compact_wire_row + self._compact_scale_row
             storage = _from_gpu_ptr(
@@ -1237,6 +1404,7 @@ class MegaMoEGfx1250:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        compact_geom: _CompactGeometry | None = None,
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
@@ -1259,6 +1427,10 @@ class MegaMoEGfx1250:
             # stages them, so there is no repack here.
             self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
         if self._compact_plan:
+            # A caller driving the transport directly (ATOM's triton path) states
+            # no bound, which is the arena worst case.
+            if compact_geom is None:
+                compact_geom = self._compact_geometry(None)
             self._compact_plan_launch(
                 self._arena.handle,
                 topk_ids.data_ptr(),
@@ -1270,6 +1442,8 @@ class MegaMoEGfx1250:
                 self._compact_barrier.data_ptr(),
                 self._config.rank,
                 token_count,
+                compact_geom.tile_m - 1,
+                compact_geom.rows,
                 stream,
             )
         self._dispatch_variants[spec](
@@ -1294,15 +1468,18 @@ class MegaMoEGfx1250:
             token_count=token_count,
             reverse_source_view=reverse_source_view,
         )
+        compact_rows = None if compact_geom is None else compact_geom.rows
         return (
-            self._recv_tokens(),
+            self._recv_tokens(compact_rows),
             self._recv_weights(),
             self._recv_indices(),
             self._total_recv,
             routing,
         )
 
-    def _scatter_context(self, routing: Routing) -> Stage2ScatterContext:
+    def _scatter_context(
+        self, routing: Routing, compact_geom: _CompactGeometry | None = None
+    ) -> Stage2ScatterContext:
         return Stage2ScatterContext(
             arena_handle=self._arena.handle,
             combine_input_offset=self._arena.offset("comb_inp"),
@@ -1325,6 +1502,11 @@ class MegaMoEGfx1250:
             compact_wire_row_stride=(
                 self._compact_wire_row if self._compact_plan else 0
             ),
+            # The two facts grouped_moe cannot rederive: which recv-token bucket
+            # these rows were planned for (its own topk_ids are the compact
+            # dummies), and the tile the plan padded each expert's run to.
+            compact_csv_tokens=(0 if compact_geom is None else compact_geom.csv_tokens),
+            compact_plan_tile_m=(0 if compact_geom is None else compact_geom.tile_m),
         )
 
     def _combine(self, routing: Routing) -> torch.Tensor:

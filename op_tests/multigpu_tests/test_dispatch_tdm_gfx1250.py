@@ -4,7 +4,7 @@
 
 """A/B the gfx1250 dispatch implementations under the MegaMoE E2E harness.
 
-Runs ``test_mega_moe_gfx1250.py`` once per dispatch implementation and prints one
+Runs ``test_mega_moe.py`` once per dispatch implementation and prints one
 table comparing them. Each run is a fresh torchrun, so the JIT cache, the cco
 arena and the CUDA graph of one implementation cannot colour another's numbers.
 
@@ -26,7 +26,7 @@ which says how much of that lands in the model. Both are means over ranks. Every
 run is also gated on the harness's fp32 accuracy check unless ``--acc_verify 0``.
 
 The E2E harness only routes MEGA_DISPATCH through ``MegaMoEGfx1250``, which is
-a8w4_mxfp4 + scatter_fused only -- so those two are fixed here and are not knobs.
+a8w4_mxfp4 + fused combine only -- so those two are fixed here and are not knobs.
 
     # default: all three, one token count
     python test_dispatch_tdm_gfx1250.py
@@ -47,7 +47,7 @@ import subprocess
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_E2E = os.path.join(_HERE, "test_mega_moe_gfx1250.py")
+_E2E = os.path.join(_HERE, "test_mega_moe.py")
 
 # MEGA_DISPATCH value + any extra env each implementation needs.
 _MODES = {
@@ -76,7 +76,7 @@ def _run_one(mode, args, num_tokens):
         "-q",
         "a8w4_mxfp4",
         "--combine",
-        "scatter_fused",
+        "fused",
         "-e",
         str(args.expert),
         "-k",

@@ -68,6 +68,12 @@ class Stage2ScatterContext:
     compact_psum: torch.Tensor | None = None
     compact_ep_rowmap: torch.Tensor | None = None
     compact_wire_row_stride: int = 0
+    # Recv-token bucket these compact rows were planned for (0 = unknown, fall
+    # back to the arena), and the per-expert tile the plan padded them to. The
+    # grouped GEMM must key its tuning CSV off the former and tile by the
+    # latter: its own topk_ids are compact dummies and carry neither.
+    compact_csv_tokens: int = 0
+    compact_plan_tile_m: int = 0
 
     def __post_init__(self):
         if self.arena_handle < 0:

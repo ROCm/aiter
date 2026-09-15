@@ -10,6 +10,7 @@ import csv
 import functools
 import os
 import threading
+from dataclasses import dataclass
 
 import torch
 
@@ -41,6 +42,49 @@ def set_tdm_compact_plan(ctx: Stage2ScatterContext | None):
 
 def _tdm_compact_plan():
     return getattr(_COMPACT_PLAN_TLS, "ctx", None)
+
+
+@dataclass(frozen=True)
+class MegaDispatchState:
+    """What the dispatch that just filled the arena left for the route path.
+
+    The route path below pairs with state a dispatch leaves behind -- a route
+    counter its tail already cleared, and an expert mask laid out as one aligned
+    contiguous slice -- so it has to key off the dispatch that actually ran.
+    $MEGA_DISPATCH is not that fact: MegaMoE takes ``dispatch_backend`` as a
+    constructor argument and a caller may pass something else (ATOM does),
+    leaving the env naming tdm while mori owns the arena. Believing the env
+    there is silently wrong rather than slow -- the route kernel starts from a
+    counter nobody cleared and hands out slots past ``masked_m``, and its
+    consumers write out of bounds.
+
+    Decided once, where the dispatch kernel is built with the matching
+    ``clear_route_counter``, so the two cannot drift on a mid-process env flip.
+    """
+
+    backend: str
+    clears_route_counter: bool
+    direct_ep_mask: bool
+
+
+def set_mega_dispatch_state(state: MegaDispatchState | None):
+    """Announce the dispatch behind the next grouped call."""
+    _COMPACT_PLAN_TLS.dispatch_state = state
+
+
+def _mega_dispatch_state() -> MegaDispatchState:
+    """The announced dispatch, or the self-sufficient default.
+
+    Absent an announcement no TDM dispatch ran: only MegaMoE launches one, and
+    it announces it around the grouped call. A caller driving ``fused_moe``
+    directly therefore gets the route path that clears its own counter.
+    """
+    state = getattr(_COMPACT_PLAN_TLS, "dispatch_state", None)
+    if state is None:
+        return MegaDispatchState(
+            backend="", clears_route_counter=False, direct_ep_mask=False
+        )
+    return state
 
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
@@ -303,10 +347,15 @@ _G2L_FUSED_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 def route_counter_buffer(E: int, device) -> torch.Tensor:
     """Return the persistent ``(E,)`` per-expert route counter.
 
-    Its stable address lets the preceding TDM dispatch clear it at the tail of
-    the existing launch. The route kernel therefore starts from zero without a
-    separate launch or a grid-wide barrier. Allocation is zeroed as well so the
-    first invocation is safe before a dispatch variant owns the reset.
+    Its stable address lets a preceding TDM dispatch clear it at the tail of the
+    existing launch, so the route kernel starts from zero without a separate
+    launch or a grid-wide barrier. Exactly one of the two clears it, picked from
+    the same announced ``MegaDispatchState``: the dispatch tail when it declares
+    ``clears_route_counter``, otherwise the route kernel itself. A counter no
+    one cleared makes the route kernel hand out slots past ``masked_m``, and its
+    consumers then write out of bounds -- so the default when nothing is
+    announced is for the route kernel to clear. Allocation is zeroed as well, so
+    the first call is safe before either owner has run.
     """
     key = (int(E), str(device))
     buf = _G2L_COUNTER_CACHE.get(key)
@@ -392,11 +441,7 @@ def _build_g2l_lut(
             )
             nvr = torch.empty(1, dtype=torch.int32, device=device)
             _get_compiled_g2l_lut(
-                clear_counter=not (
-                    os.environ.get("MEGA_DISPATCH", "") == "tdm"
-                    and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
-                    in ("1", "true", "True")
-                )
+                clear_counter=not _mega_dispatch_state().clears_route_counter
             )(
                 ptr_arg(mask),
                 ptr_arg(lut),
@@ -522,6 +567,7 @@ def _grouped_a8w4_tdm_moe(
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
     _compact_ctx = _tdm_compact_plan()
+    _dispatch_state = _mega_dispatch_state()
     _compact = bool(
         _compact_ctx is not None and getattr(_compact_ctx, "compact_layout", False)
     )
@@ -549,6 +595,23 @@ def _grouped_a8w4_tdm_moe(
     if _compact:
         contiguous_m = int(hidden_states.shape[0])
         max_m = contiguous_m
+        # The plan padded each expert's run to its own tile and published the
+        # resulting starts in psum, so a GEMM tiling by anything else walks rows
+        # that belong to the neighbouring expert. Both sides read the same
+        # tuning CSV row, and AITER_TDM_TILE_M{,2} overrides both, so a mismatch
+        # here means the two disagreed about the bucket -- wrong results, not a
+        # slow launch, hence the raise.
+        _plan_tile = int(getattr(_compact_ctx, "compact_plan_tile_m", 0))
+        if _plan_tile and _plan_tile != _align_m:
+            raise ValueError(
+                f"compact rows are aligned to tile {_plan_tile} but this GEMM "
+                f"tiles by max(tile_m={tile_m}, tile_m2={tile_m2})={_align_m}"
+            )
+        if contiguous_m % _align_m:
+            raise ValueError(
+                f"compact row count {contiguous_m} is not a multiple of the "
+                f"GEMM tile {_align_m}"
+            )
 
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
     # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
@@ -584,11 +647,7 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = (
-            os.environ.get("MEGA_DISPATCH", "") == "tdm"
-            and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
-            in ("1", "true", "True")
-        )
+        _direct_ep_mask = _dispatch_state.direct_ep_mask
         _fuse_ep_route_quant = (
             _direct_ep_mask
             and enable_ep_scatter
@@ -680,8 +739,8 @@ def _grouped_a8w4_tdm_moe(
         and not _fuse_ep_route_quant
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
-        and os.environ.get("MEGA_DISPATCH", "") == "tdm"
-        and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
+        and _dispatch_state.backend == "tdm"
+        and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in _TRUTHY_ENV
     )
     ep_psum_params = None
     if _compact:
@@ -812,6 +871,10 @@ def _grouped_a8w4_tdm_moe(
         if _compact and _prequantized
         else 0
     )
+    # The A-scale prologue stages the 16-row-interleaved layout and takes
+    # priority over row_major_ascale inside the kernel, so a row-major scale
+    # buffer -- which is what the compact wire delivers -- has to turn it off.
+    _gemm1_as_prologue = 0 if _row_major_ascale else tdm_as_in_prologue
     if _compact and _prequantized:
         a1_payload = hidden_states.reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
@@ -908,7 +971,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
-            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_as_in_prologue=_gemm1_as_prologue,
             tdm_b_th=tdm_b_th,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -943,7 +1006,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
-            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_as_in_prologue=_gemm1_as_prologue,
             tdm_b_th=tdm_b_th,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1277,8 +1340,14 @@ def grouped_gemm_gfx1250_a8w4(
     _csv_tokens = token_num
     if _cctx is not None and getattr(_cctx, "compact_layout", False):
         # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap
-        # as the token count. CSV still keys off the recv-token bucket.
-        _csv_tokens = int(_cctx.max_tokens_per_rank) * int(_cctx.world_size)
+        # as the token count. CSV still keys off the recv-token bucket, which
+        # only the planner knows: it sized the rows for that bucket's tile, so
+        # picking a row for any other bucket here would tile against the grain
+        # of psum. The arena worst case is the fallback when it went unstated,
+        # not a stand-in for a decode step.
+        _csv_tokens = int(getattr(_cctx, "compact_csv_tokens", 0)) or (
+            int(_cctx.max_tokens_per_rank) * int(_cctx.world_size)
+        )
     if token_num == 0:
         # No tokens to compute (common in EP when a rank receives 0 dispatched
         # tokens). The grouped route/GEMM kernels would launch with a zero-sized
