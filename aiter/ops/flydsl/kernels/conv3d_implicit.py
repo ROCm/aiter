@@ -33,7 +33,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 
@@ -289,7 +289,7 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
                 g = fx.Int32(rc * s + sv)
             else:
                 g = fx.Int32(in_base + cc * s + ss)
-            safe = arith.select(valid, g, fx.Int32(0))
+            safe = valid.select(g, fx.Int32(0))
             fx.copy(tr_atom, fx.slice(in_div, (None, safe)), tr_reg)
             v = fx.memref_load_vec(tr_reg)
             lds_store_vec8(rc * _TR_LDS_S + sv, v)
@@ -601,10 +601,7 @@ def compile_conv3d_implicit(
             blocks_per_swizzle = fx.Int64(WGM * grid_n)
             swizzle_id = pid // blocks_per_swizzle
             first_m = swizzle_id * fx.Int64(WGM)
-            swizzle_rows = fx.Int64(grid_m) - first_m
-            swizzle_rows = fx.Int64(
-                arith.select(swizzle_rows < fx.Int64(WGM), swizzle_rows, fx.Int64(WGM))
-            )
+            swizzle_rows = fx.min(fx.Int64(grid_m) - first_m, fx.Int64(WGM))
             local = pid % blocks_per_swizzle
             m_offset = fx.Int64(first_m + (local % swizzle_rows)) * TILE_M
             n_tile = fx.Int64(local // swizzle_rows)
@@ -634,12 +631,10 @@ def compile_conv3d_implicit(
             rem0 = m_offset % dhw
             ot_base0 = rem0 // hw_o
 
-            base_t = ot_base0 * fx.Int64(st) - fx.Int64(pt)
-            base_t = arith.select(base_t < fx.Int64(0), fx.Int64(0), base_t)
+            base_t = fx.max(ot_base0 * fx.Int64(st) - fx.Int64(pt), fx.Int64(0))
             if const_expr(_t_aligned):
                 oh_base0 = (rem0 % hw_o) // wo
-                base_h = oh_base0 * fx.Int64(sh) - fx.Int64(ph)
-                base_h = arith.select(base_h < fx.Int64(0), fx.Int64(0), base_h)
+                base_h = fx.max(oh_base0 * fx.Int64(sh) - fx.Int64(ph), fx.Int64(0))
             else:
                 base_h = fx.Int64(0)
             x_base_elem = (
@@ -704,16 +699,16 @@ def compile_conv3d_implicit(
             high = u >= fx.Int64(pad + ext)  # v >= ext
             mid = u - fx.Int64(pad)  # v, where in range
             if const_expr(pad_mode == "replicate"):
-                r = arith.select(high, fx.Int64(ext - 1), mid)
-                r = arith.select(low, fx.Int64(0), r)
+                r = high.select(fx.Int64(ext - 1), mid)
+                r = low.select(fx.Int64(0), r)
             elif const_expr(pad_mode == "reflect"):
                 # [a b c d e] pad 2 -> [c b a b c d e d c]: -v near, 2*(ext-1) - v far.
-                r = arith.select(high, fx.Int64(2 * (ext - 1) + pad) - u, mid)
-                r = arith.select(low, fx.Int64(pad) - u, r)
+                r = high.select(fx.Int64(2 * (ext - 1) + pad) - u, mid)
+                r = low.select(fx.Int64(pad) - u, r)
             else:  # circular: v + ext near, v - ext far
-                r = arith.select(high, u - fx.Int64(pad + ext), mid)
-                r = arith.select(low, u + fx.Int64(ext - pad), r)
-            return fx.Int64(r), None
+                r = high.select(u - fx.Int64(pad + ext), mid)
+                r = low.select(u + fx.Int64(ext - pad), r)
+            return r, None
 
         def gather_valid(base, *masks):
             for m in masks:
@@ -874,11 +869,11 @@ def compile_conv3d_implicit(
                     addr_ret = _a_addr(i, kbase_i, cc_base, ckk_base)
                     g_off_i, valid, n_idx_i = addr_ret
                     x_src_i = _x_rebased(fx.Int64(n_idx_i) * fx.Int64(X_SAMPLE_ELEMS))
-                    voff = fx.Int32(arith.select(valid, g_off_i, OOB_ELEM))
+                    voff = valid.select(g_off_i, OOB_ELEM)
                     _dma_to_lds(x_src_i, _lds_dma_ptr(a_lds, stage_tile, i), voff)
                 else:
                     g_off_i, valid = _a_addr(i, kbase_i, cc_base, ckk_base)
-                    voff = fx.Int32(arith.select(valid, g_off_i, OOB_ELEM))
+                    voff = valid.select(g_off_i, OOB_ELEM)
                     _dma_to_lds(x_src, _lds_dma_ptr(a_lds, stage_tile, i), voff)
 
         def _load_b(stage, k_base):
@@ -886,7 +881,7 @@ def compile_conv3d_implicit(
             for i in range_constexpr(LDG_B_COUNT):
                 g_off, col_valid = _b_addr(i, k_base)
                 if const_expr(n_tail):
-                    voff = fx.Int32(arith.select(col_valid, g_off, OOB_ELEM))
+                    voff = col_valid.select(g_off, OOB_ELEM)
                 else:
                     voff = g_off
                 _dma_to_lds(w_src, _lds_dma_ptr(b_lds, stage_tile, i), voff)
@@ -972,23 +967,19 @@ def compile_conv3d_implicit(
             addr = y_elem_base + off_nk_i64 * fx.Int64(BF16_BYTES)
             fx.ptr_store(value, fx.inttoptr(_big_st_ptr_ty, addr))
 
-        def _valid_raw(row, col_loc):
+        def _valid(row, col_loc):
             if const_expr(_row_chk and n_tail):
-                return arith.andi(row < fx.Int64(npq), col_loc < fx.Int64(KG))
+                return (row < fx.Int64(npq)) & (col_loc < fx.Int64(KG))
             if const_expr(_row_chk):
-                v = row < fx.Int64(npq)
-                return arith.andi(v, v)
-            v = col_loc < fx.Int64(KG)
-            return arith.andi(v, v)
+                return row < fx.Int64(npq)
+            return col_loc < fx.Int64(KG)
 
         _route_store = _need_chk and not use_splitk and not BIG_OUT
 
         def _route(off, row, col_loc):
             if const_expr(not _route_store):
                 return fx.Int32(off)
-            return fx.Int32(
-                arith.select(_valid_raw(row, col_loc), fx.Int32(off), OOB_ELEM)
-            )
+            return _valid(row, col_loc).select(fx.Int32(off), OOB_ELEM)
 
         def _cols(ni):
             """Global out-channel for MFMA column block ni, and its index within the group."""
@@ -1003,7 +994,7 @@ def compile_conv3d_implicit(
                     col, col_loc = _cols(ni)
                     col_i = fx.Int32(col)  # bias is indexed by the global out-channel
                     if const_expr(n_tail):
-                        col_i = arith.select(col_loc < fx.Int64(KG), col_i, fx.Int32(0))
+                        col_i = (col_loc < fx.Int64(KG)).select(col_i, fx.Int32(0))
                     fx.copy(bias_atom, fx.slice(bias_div, (None, col_i)), bias_reg)
                     bias_vals.append(fx.Float32(fx.memref_load_vec(bias_reg)[0]))
 
@@ -1039,7 +1030,7 @@ def compile_conv3d_implicit(
                             )
 
                         if const_expr(_need_chk and not _route_store):
-                            if _valid_raw(row0, col_loc):
+                            if _valid(row0, col_loc):
                                 _emit_vec()
                         else:
                             _emit_vec()
@@ -1088,7 +1079,7 @@ def compile_conv3d_implicit(
                                     )
 
                         if const_expr(_need_chk and not _route_store):
-                            if _valid_raw(row, col_loc):
+                            if _valid(row, col_loc):
                                 _emit()
                         else:
                             _emit()
