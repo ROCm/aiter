@@ -60,18 +60,14 @@ Example 3:
 
 **Verify performance**
 
-To verify that your tunned JSON config files actually is performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into the config tree. Where they go depends on whether the config family has been migrated to the nested layout yet (`<path_to_aiter_root>/aiter/ops/triton/configs/CLAUDE.md` is the authoritative rulebook):
+To verify that your tunned JSON config files actually is performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into the config tree. Every family lives in one nested layout, `configs/<arch>/<backend>/<op>/<d_type>/` (`<path_to_aiter_root>/aiter/ops/triton/configs/CLAUDE.md` is the authoritative rulebook). Files there carry **no arch prefix** — the arch is the directory — and the default file is named exactly `DEFAULT.json`, so drop the arch prefix when copying:
 
-- Migrated families (e.g. `GEMM-AFP4WFP4`, `GEMM-AFP4WFP4_PRESHUFFLED`) live in `configs/<arch>/<backend>/gemm/<d_type>/`. Files there carry **no arch prefix** and the default file is named exactly `DEFAULT.json`, so drop the arch prefix when copying:
+    cp GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json \
+        <path_to_aiter_root>/aiter/ops/triton/configs/gfx950/triton/gemm/gemm_afp4wfp4_preshuffled/
 
-      cp GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json \
-          <path_to_aiter_root>/aiter/ops/triton/configs/gfx950/triton/gemm/gemm_afp4wfp4_preshuffled/
+`<d_type>` is the config name lowercased with dashes folded to underscores (`GEMM-AFP4WFP4_PRESHUFFLED` → `gemm_afp4wfp4_preshuffled`), and `<backend>` is `triton` unless you tuned the gluon kernel — the two backends read separate directories and never fall back to each other.
 
-- Families still in the legacy flat layout keep the arch prefix and go to `configs/gemm/`:
-
-      cp *.json <path_to_aiter_root>/aiter/ops/triton/configs/gemm/
-
-Two gotchas: a `<d_type>/` directory is invisible to the resolver unless it contains a `DEFAULT.json`, and config reads are cached per path (including missing files), so restart the Python process after copying for the new files to be picked up.
+Two gotchas: a family's `DEFAULT.json` must be in place before any specialized file resolves, and config reads are cached per path (including missing files), so restart the Python process after copying for the new files to be picked up.
 
 then, you can run, for example,
 

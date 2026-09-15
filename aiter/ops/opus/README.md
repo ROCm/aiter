@@ -123,7 +123,7 @@ same table that powers `opus_gemm_a16w16_tune`). The kids the heuristic
 can return are listed in `HEURISTIC_DEFAULT_KIDS` in
 `csrc/opus_gemm/opus_gemm_common.py`; `gen_instances.py` asserts they
 are all in the subset-compile set `S` before writing
-`compiled_kids.json`.
+the generated compiled-kid sidecar.
 
 ### Subset compile
 
@@ -131,18 +131,26 @@ are all in the subset-compile set `S` before writing
 the full `kernels_list`. The compile set `S` is the union of:
 
 1. Kids referenced by the **global tuned CSVs** with `libtype == 'opus'`.
-2. Kids previously baked into the **sidecar** at
-   `~/.aiter/build/module_deepgemm_opus/blob/compiled_kids.json`.
-3. The **8 `HEURISTIC_DEFAULT_KIDS`** (200, 206, 208, 300 + their nooob
-   mirrors at +1000) so heuristic fallback always has a viable kernel.
-4. The **2 a8w8** kids (1, 2) since the opus `.so` also exposes the
-   a8w8 dispatch entry.
+2. Kids from the last successful **sidecar** at
+   `{bd_dir}/compiled_kids_opus.json`, outside the per-module build directory.
+3. The current target architectures' `HEURISTIC_DEFAULT_KIDS`, so heuristic
+   fallback always has a compiled kernel.
+4. The applicable a8w8 kids, since the opus `.so` also exposes a8w8 dispatch.
+5. Additional tuner candidates passed through `--extra_kids`.
 
-A typical build today is `|S| = 10` kids (~20 device TUs after
-× {bf16_t, fp32_t}); the full kernels_list has ~130 kids. Adding new
-shapes via tuning expands `S` automatically (the tuner writes new
-solidx rows to the global CSV + extends the sidecar, then triggers an
-`AITER_REBUILD`).
+The final set is restricted to valid kids and the target architectures. An
+explicit `--extra_kids` request that cannot survive these filters or a
+`--kernel_tag` restriction fails codegen; it is not silently omitted. The set
+size depends on the target architectures, CSVs and previous tuning requests.
+
+The tuner synchronously compiles new candidates before starting its workers.
+It does not expand the canonical sidecar in advance: JIT first installs the
+binary, then publishes the generated sidecar and a receipt binding its contents
+to that installed binary. The canonical files survive `clear_build`, while
+generated working files live in the module's `blob.staging` directory. Runtime
+dispatch uses the CSV/C++ lookup tables, not the sidecar. See
+[transactional JIT cache](../../../docs/jit_cache.md) for recovery, permissions
+and storage requirements.
 
 Explicit `kernelId=` bypass exists for tuning, debugging, and future
 integrations (e.g. `aiter.tuned_gemm.solMap["opus"]`). The C++
@@ -193,12 +201,16 @@ structural fallbacks force splitk-only: K not aligned for non-splitk
 launchers (need `K%64==0` and `ceil(K/64)%2==0`), and bias=True when
 the candidate set has no bias-aware non-splitk kids.
 
-**First tune triggers a rebuild**: the first time gradlib touches an
-opus kid not yet in the sidecar, it expands `compiled_kids.json` and
-forces `AITER_REBUILD=1`. The next call into `module_deepgemm_opus`
-re-runs codegen, which now includes the new kids. Expect ~11 s extra
-on the very first tune; subsequent tunes that hit the same kids are
-sidecar-cached and don't trigger a rebuild.
+**Missing candidates trigger a synchronous rebuild**: the tuner passes new
+kids through `--extra_kids` and waits for `module_deepgemm_opus` to finish
+building before spawning workers. A matching sidecar alone is insufficient
+to skip this step: its receipt must also match the current installed binary.
+Missing or stale metadata conservatively triggers a rebuild. An explicit
+`AITER_REBUILD` request is honored once in the parent even on a cache hit;
+successful preparation sets the environment to `AITER_REBUILD=0` for workers.
+On failure the original environment is restored and the canonical sidecar
+is not advanced by the failed compile. Build time depends on the requested
+set and available compiler resources.
 
 ### 3.2 Debug-only: `opus_gemm_tune.py` (single shape / kid)
 
@@ -410,11 +422,11 @@ kid through the same tune lookup that powers `opus_gemm_a16w16_tune`:
 | `M > 128`, N%16 + K%64 + loops even | 300 / 1300 | persistent `(256, 256, 64)` | Persistent + XCD swizzle wins large aligned |
 | `M > 128`, misaligned | 200 / 1200 | splitk `(64, 64, 64)` WG=2 | splitk tolerates arbitrary N (per-element tail store) |
 
-These 8 kids form `HEURISTIC_DEFAULT_KIDS` in
-`csrc/opus_gemm/opus_gemm_common.py`; `gen_instances.py` asserts they
-are all in the subset-compile set `S` before writing
-`compiled_kids.json`, so heuristic fallback is guaranteed never to
-return an unbakeable kid.
+These gfx950 fallback kids are represented in the architecture-specific
+heuristic sets in `csrc/opus_gemm/opus_gemm_common.py`. `gen_instances.py`
+asserts that all heuristic kids required by the target architectures are in
+the subset-compile set `S` before writing the generated sidecar, so fallback
+does not select a kid omitted from that build.
 
 The same heuristic kid function is used for both `<bf16_t>` and
 `<fp32_t>` dispatch specializations; splitk kids force the `<fp32_t>`
@@ -452,11 +464,15 @@ entries entirely (launcher `TORCH_CHECK`s `Y.dtype() == BFloat16`).
 1. `aiter.ops.opus.gemm_op_a16w16` triggers `compile_ops("module_deepgemm_opus")`.
 2. [aiter/jit/optCompilerConfig.json](../../jit/optCompilerConfig.json)
    invokes
-   `csrc/opus_gemm/gen_instances.py --working_path {blob_dir} --tune_files aiter/configs/bf16_tuned_gemm.csv:aiter/configs/model_configs/*_bf16_tuned_gemm.csv`
+   `csrc/opus_gemm/gen_instances.py --working_path {blob_staging_dir} --tune_files ... --compiled_kids_sidecar={blob_staging_dir}/compiled_kids_opus.json`.
+   JIT first seeds this staged file from `{bd_dir}/compiled_kids_opus.json`.
+   The tuner additionally supplies its candidate kids through `--extra_kids`.
 3. `gen_instances.py` computes the subset-compile set
-   `S = (CSV opus rows' solidx) ∪ (sidecar contents) ∪ HEURISTIC_DEFAULT_KIDS ∪ a8w8_kids`,
-   asserts `HEURISTIC_DEFAULT_KIDS ⊆ S`, then writes:
-   - `compiled_kids.json` — the sidecar listing every kid in `S` (~10 today)
+   `S = (CSV opus rows' solidx) ∪ (sidecar contents) ∪ (extra kids) ∪ HEURISTIC_DEFAULT_KIDS ∪ a8w8_kids`,
+   applies validity, target-architecture and optional family filters, then
+   checks that target-specific heuristic kids and all explicit extra kids
+   remain in `S`. It writes:
+   - `compiled_kids_opus.json` — the staged sidecar listing every kid in `S`
    - `impl/*.cuh` — per-kid kernel launcher templates (one per kid in `S`)
    - `instances/all_instances_host.cu` — fused host TU (one per build)
    - `instances/{kid_name}_C{bf16_t,fp32_t}.device.cu` — per-(kid, dtype) device TU
@@ -466,7 +482,18 @@ entries entirely (launcher `TORCH_CHECK`s `Y.dtype() == BFloat16`).
    - `opus_gemm_lookup.h` — **(M, N, K) → kernel** maps baked from CSV opus rows
      (two macros: `_BF16`, `_FP32`)
 4. `opus_gemm.cu` is compiled and linked against the generated
-   instances into `module_deepgemm_opus.so`.
+   instances into the fixed target `module_deepgemm_opus.so`. JIT invokes
+   Ninja's incremental dependency checks on every build request rather than
+   skipping through the Python extension versioner. This also permits retries
+   after a failed compile, header-only changes and missing build outputs.
+5. After checking that the codegen generation has not changed, JIT atomically
+   installs the `.so`, then publishes the canonical sidecar and its `.receipt`
+   independently of the best-effort source snapshot under `blob/`. A metadata
+   publication failure does not invalidate a successful compile, but a later
+   tuner cannot reuse an unmatched receipt.
+
+Direct generator use without `--compiled_kids_sidecar` retains the default
+`{working_path}/compiled_kids.json`; JIT supplies the explicit staged path above.
 
 ### 7.6 Compile-time techniques
 
@@ -1052,10 +1079,10 @@ design notes.
 | [aiter/configs/bf16_tuned_gemm.csv](../../configs/bf16_tuned_gemm.csv) | Global tuned BF16 GEMM CSV. Opus rows live here (`libtype=='opus'`) alongside asm / triton / skinny / flydsl / torch / hipblaslt rows. |
 | [aiter/configs/model_configs/](../../configs/model_configs/) | Per-model tuned BF16 GEMM CSVs (gptoss / dsv4 / glm5 / kimik2 / qwen / ...). Same schema; same `libtype` filter. |
 | [aiter/ops/deepgemm.py](../deepgemm.py) | CK backend (`deepgemm_ck` + `deepgemm()` forwarder). Also hosts the `opus_gemm_a16w16_tune` deprecation shim. |
-| [csrc/opus_gemm/opus_gemm_common.py](../../../csrc/opus_gemm/opus_gemm_common.py) | Kernel instance metadata + shared host helpers: `SPLITK_KIDS / NON_SPLITK_KIDS / BIAS_AWARE_KIDS / HEURISTIC_DEFAULT_KIDS`, `candidate_kids_for_shape()`, `candidate_splitK()`, `kid_rejects_shape() / kid_rejects_bias()`, `_ensure_kids_compiled()` |
-| [csrc/opus_gemm/opus_gemm_tune.py](../../../csrc/opus_gemm/opus_gemm_tune.py) | **Debug-only** single-shape tuner; default `-o /tmp/opus_debug_tuned.csv`. Production tuning uses gradlib. |
+| [csrc/opus_gemm/opus_gemm_common.py](../../../csrc/opus_gemm/opus_gemm_common.py) | Kernel instance metadata, architecture-specific heuristic sets and `_opus_sidecar_path()` |
+| [csrc/opus_gemm/opus_gemm_tune.py](../../../csrc/opus_gemm/opus_gemm_tune.py) | Candidate/shape helpers and synchronous `_ensure_kids_compiled()` shared with gradlib; also the debug tuner entry point |
 | [gradlib/gradlib/GemmTuner.py](../../../gradlib/gradlib/GemmTuner.py) | Production tuner; `--libtype opus` adds opus to the candidate sweep alongside other backends. |
-| [csrc/opus_gemm/gen_instances.py](../../../csrc/opus_gemm/gen_instances.py) | JIT codegen with subset-compile; `--tune_files` (glob) drives both the (M,N,K) lookup table and the compile set `S`. Writes `compiled_kids.json` sidecar. |
+| [csrc/opus_gemm/gen_instances.py](../../../csrc/opus_gemm/gen_instances.py) | Subset codegen: `--tune_files` drives the (M,N,K) lookup, while CSV/sidecar/heuristic/extra kids determine `S`; writes the staged sidecar for JIT publication |
 | [csrc/opus_gemm/opus_gemm.cu](../../../csrc/opus_gemm/opus_gemm.cu) | Pybind entries (`opus_gemm`, `opus_gemm_a16w16_tune`) + per-arch router |
 | [csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh) | gfx950 dispatch: (M,N,K) lookup + heuristic-kid fallback |
 | [csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh) | `opus_a16w16_heuristic_kid_gfx950(M,N,K) -> int` (single source: integer kid only, no launcher symbol names) |

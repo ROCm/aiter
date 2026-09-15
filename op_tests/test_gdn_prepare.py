@@ -26,7 +26,6 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -953,9 +952,6 @@ def main():
         aiter.logger.warning(
             "FlyDSL GDN prepare unsupported on %s; skipping", get_gfx()
         )
-        return
-    if not is_flydsl_available():
-        aiter.logger.warning("FlyDSL is unavailable; skipping GDN prepare")
         return
 
     _configure_noise_filters()

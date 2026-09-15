@@ -2,8 +2,10 @@
 
 #include <algorithm>
 
-using bf16_t = __bf16;
-using fp16_t = __fp16;
+#include <opus/dtypes.hpp>
+
+using bf16_t = opus::dtypes::bf16;
+using fp16_t = opus::dtypes::fp16;
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 

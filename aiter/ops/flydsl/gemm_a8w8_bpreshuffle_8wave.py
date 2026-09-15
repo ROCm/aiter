@@ -11,7 +11,7 @@ import re
 import torch
 from torch import Tensor
 
-from .utils import get_shared_memory_per_block
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile.
 BLOCK_K = 128
@@ -83,8 +83,12 @@ def _validate(
             f"[FlyDSL 8wave] waves_per_eu must be >=1 (the kernel always emits the "
             f"rocdl.waves_per_eu attribute; 'no hint' is not expressible), got {waves_per_eu}"
         )
+    # Local import: this module stays importable without flydsl so the tuner can
+    # read MIN_K/lds_bytes on hosts that cannot compile.
+    from flydsl.runtime.device import get_rocm_arch
+
     need = lds_bytes(block_m, block_n)
-    have = get_shared_memory_per_block(fallback_gfx="gfx950")
+    have = get_lds_capacity_bytes(get_rocm_arch().split(":", 1)[0])
     if need > have:
         raise ValueError(
             f"[FlyDSL 8wave] {block_m}x{block_n} needs {need} B of LDS, limit is {have} B"

@@ -19,14 +19,12 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
-from aiter.ops.triton.moe.quant_moe import (
-    downcast_to_mxfp,
-    upcast_from_mxfp,
-)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 
 def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
@@ -226,6 +224,8 @@ class Case:
             Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
             Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
+            Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
         ]
     ],
 )
@@ -318,9 +318,12 @@ def test_op(
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         elif get_arch() == "gfx950":
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+                w_scale_tri,
+                arch="gfx950",
+                preshuffle_factor=32,
+                scale_kwidth=8,
+                return_layout=True,
             )
         else:
             assert False, "Unsupported architecture"
