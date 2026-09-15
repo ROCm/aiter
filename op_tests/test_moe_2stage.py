@@ -1368,21 +1368,21 @@ def test_silu_a16w4_interleave_tiles():
     qwen = rows[(rows["model_dim"] == 2048) & (rows["token"] == 1)]
     torch.manual_seed(0)
     for _, row in qwen.iterrows():
-        kwargs = dict(
-            dtype=torch.bfloat16,
-            token=int(row["token"]),
-            model_dim=int(row["model_dim"]),
-            inter_dim=int(row["inter_dim"]),
-            E=int(row["expert"]),
-            topk=int(row["topk"]),
-            actType=aiter.ActivationType.Silu,
-            gateMode=GateMode.INTERLEAVE.value,
-            qType=aiter.QuantType.per_1x32,
-            AQDType=dtypes.bf16,
-            WQDType=dtypes.fp4x2,
-            use_g1u1=True,
-            doweight_stage1=False,
-        )
+        kwargs = {
+            "dtype": torch.bfloat16,
+            "token": int(row["token"]),
+            "model_dim": int(row["model_dim"]),
+            "inter_dim": int(row["inter_dim"]),
+            "E": int(row["expert"]),
+            "topk": int(row["topk"]),
+            "actType": aiter.ActivationType.Silu,
+            "gateMode": GateMode.INTERLEAVE.value,
+            "qType": aiter.QuantType.per_1x32,
+            "AQDType": dtypes.bf16,
+            "WQDType": dtypes.fp4x2,
+            "use_g1u1": True,
+            "doweight_stage1": False,
+        }
         skip_reason = _moe_2stage_skip_reason(kwargs)
         if skip_reason is not None:
             aiter.logger.warning(
