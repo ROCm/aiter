@@ -1179,12 +1179,15 @@ def _core_attention(
     def _tile_row0(t):  # clamped to the last tile, never guarded off the end
         return fx.min(t, last_tile) * fx.Int32(n_block)
 
-    def _kv_valid(blk_row0):
-        # How many rows of [blk_row0, blk_row0+n_block) are in-bounds, clamped to
-        # the WG's effective KV length kv_len_wg (0..n_block). Past the end -> 0 (a
-        # harmless clamped load that is never consumed).
-        rem = fx.max(kv_len_wg - blk_row0, fx.Int32(0))
-        return fx.min(rem, fx.Int32(n_block))
+    # How many rows of tile t are in-bounds: n_block for every tile but the last, whose
+    # tail is loop-invariant. Tiles past last_tile read as the last one, matching
+    # _tile_row0's clamp. A scalar select keeps this out of the VALU -- the min/max form
+    # folds to v_med3_i32, which has no scalar counterpart, so a uniform value would go
+    # out to a VGPR and come back through v_readfirstlane_b32 on every body.
+    tail_valid = kv_len_wg - last_tile * fx.Int32(n_block)
+
+    def _kv_valid(t):
+        return (t < last_tile).select(fx.Int32(n_block), tail_valid)
 
     # ---- Prologue (reordered for the mode-2 hang investigation): compute all K/V
     # addresses AND the loop-init in the Q global-load shadow, then run part2 (Q
@@ -1211,7 +1214,7 @@ def _core_attention(
     if USE_TDM_LOADER:
         # V2: build the TDM copy views (pure), run Q part2, fence Q's LDS dead, then
         # issue the copies and drain before the loop.
-        def _kv_views(slot, row0):
+        def _kv_views(slot, row0, tile):
             # This half's operand only: LO issues every K copy, HI every V copy.
             if warp_type.is_lo:
                 return k_mgr.load_views(
@@ -1221,7 +1224,7 @@ def _core_attention(
                     stride_k_head=stride_k_head,
                     kv_head=kv_head,
                     kv_row0=kv_start + row0,
-                    kv_valid=_kv_valid(row0),
+                    kv_valid=_kv_valid(tile),
                     num_warps=KV_PRODUCER_WARPS,
                     producer_warp=_producer_warp,
                 )
@@ -1232,7 +1235,7 @@ def _core_attention(
                 stride_v_head=stride_v_head,
                 kv_head=kv_head,
                 kv_row0=kv_start + row0,
-                kv_valid=_kv_valid(row0),
+                kv_valid=_kv_valid(tile),
                 num_warps=KV_PRODUCER_WARPS,
                 producer_warp=_producer_warp,
             )
@@ -1241,17 +1244,18 @@ def _core_attention(
             for _v in views:
                 fx.copy_atom_call(*_v)
 
-        kv0 = _kv_views(_k_lds_buf(_PSLOT[1]), start_row0)
+        kv0 = _kv_views(_k_lds_buf(_PSLOT[1]), start_row0, start_tile)
         # Built here, issued below: the views are pure, so the address VALU stays in the
         # Q global-load shadow. LO's second copy is K(start+1) into slot 2, the tile the
         # body no longer issues once K runs ahead; HI's is V(start) into slot 0, read by
         # body start's dead PV.
         if KV_K_AHEAD and warp_type.is_lo:
+            fill_tile = start_tile + fx.Int32(1)
             kv_fill = _kv_views(
-                _k_lds_buf(_PSLOT[2]), _tile_row0(start_tile + fx.Int32(1))
+                _k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), fill_tile
             )
         else:
-            kv_fill = _kv_views(_k_lds_buf(_PSLOT[0]), start_row0)
+            kv_fill = _kv_views(_k_lds_buf(_PSLOT[0]), start_row0, start_tile)
         num_tdm_copies = len(kv0)
         num_async_copies = -1  # nothing increments asynccnt under TDM
         _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
@@ -1278,7 +1282,7 @@ def _core_attention(
         _kv_fence(*_kv_drain)
     else:
 
-        def _kv_ptrs(slot, row0):
+        def _kv_ptrs(slot, row0, tile):
             return (
                 k_mgr.global_load_ptrs(
                     ptr_lds=slot,
@@ -1287,7 +1291,7 @@ def _core_attention(
                     stride_k_head=stride_k_head,
                     kv_head=kv_head,
                     kv_row0=kv_start + row0,
-                    kv_valid=_kv_valid(row0),
+                    kv_valid=_kv_valid(tile),
                     warp_idx=warp_idx,
                     lane_idx=lane_idx,
                 ),
@@ -1298,7 +1302,7 @@ def _core_attention(
                     stride_v_head=stride_v_head,
                     kv_head=kv_head,
                     kv_row0=kv_start + row0,
-                    kv_valid=_kv_valid(row0),
+                    kv_valid=_kv_valid(tile),
                     warp_idx=warp_idx,
                     lane_idx=lane_idx,
                 ),
@@ -1309,8 +1313,8 @@ def _core_attention(
             _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
             _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
 
-        kv0 = _kv_ptrs(_k_lds_buf(_PSLOT[1]), start_row0)
-        kv_fill = _kv_ptrs(_k_lds_buf(_PSLOT[0]), start_row0)
+        kv0 = _kv_ptrs(_k_lds_buf(_PSLOT[1]), start_row0, start_tile)
+        kv_fill = _kv_ptrs(_k_lds_buf(_PSLOT[0]), start_row0, start_tile)
         num_tdm_copies = -1  # nothing increments tensorcnt under V1
         num_async_copies = 0  # V1 has no per-tile count: its counter fully drains
         _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
@@ -1508,8 +1512,9 @@ def _core_attention(
         # is what this body reads, a different chunk), HI V(u+1) into slot 2 as before.
         _ahead = 2 if (KV_K_AHEAD and warp_type.is_lo) else 1
         wr_slot = slot_of[0] if _ahead == 2 else slot_of[N_KV_PP - 1]
-        pf_row0 = _tile_row0(u + fx.Int32(_ahead))
-        pf_valid = _kv_valid(pf_row0)
+        pf_tile = u + fx.Int32(_ahead)
+        pf_row0 = _tile_row0(pf_tile)
+        pf_valid = _kv_valid(pf_tile)
 
         def _addr_phase():
             # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
