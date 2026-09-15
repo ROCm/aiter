@@ -3496,12 +3496,15 @@ def compile_mixed_moe_gemm2_common(
             c_topk = arith.constant(topk, index=True)
 
             c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
+            x_elem = default_f8_type()
+            vec16_elems = 16 if a_elem_bytes == 1 else 8
+            x_rsrc = None
             if const_expr(not use_global_a):
                 x_rows = fx.Index(i32_x_rows)
-                x_elem = default_f8_type()
-                vec16_elems = 16 if a_elem_bytes == 1 else 8
                 c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
-                x_nbytes_idx = _div_pow2(x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack))
+                x_nbytes_idx = _div_pow2(
+                    x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack)
+                )
                 x_nbytes_i32 = fx.Int32(x_nbytes_idx)
                 x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
@@ -3721,7 +3724,9 @@ def compile_mixed_moe_gemm2_common(
                         # The 16B path uses element offsets; 8B/4B use bytes.
                         if const_expr(x_load_bytes == 16):
                             idx_elem = (
-                                idx_i32 if a_elem_bytes == 1 else (idx_i32 * arith.index(2))
+                                idx_i32
+                                if a_elem_bytes == 1
+                                else (idx_i32 * arith.index(2))
                             )
                             return buffer_copy_gmem16_dwordx4(
                                 buffer_ops,
@@ -4114,7 +4119,10 @@ def compile_mixed_moe_gemm2_common(
                                     + (tx + i * total_threads) * dma_bytes
                                 )
                                 rocdl.global_load_lds(
-                                    fx.to_llvm_ptr(src), fx.to_llvm_ptr(dst), dma_bytes, 0
+                                    fx.to_llvm_ptr(src),
+                                    fx.to_llvm_ptr(dst),
+                                    dma_bytes,
+                                    0,
                                 )
                             else:
                                 global_offset = fx.Int32(global_byte_idx)

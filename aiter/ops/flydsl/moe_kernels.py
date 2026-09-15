@@ -111,6 +111,11 @@ def requires_flydsl_stage2_reduce(
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
 
 
+def requires_flydsl_stage2_global_a(a: torch.Tensor) -> bool:
+    """Return whether A's stored bytes reach the 4 GiB buffer descriptor limit."""
+    return a.numel() * a.element_size() >= (1 << 32)
+
+
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
     """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value.
 
@@ -2264,7 +2269,7 @@ def _flydsl_moe_stage2_impl(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
-        use_global_a=inter_states.numel() * inter_states.element_size() >= (1 << 32),
+        use_global_a=requires_flydsl_stage2_global_a(inter_states),
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
