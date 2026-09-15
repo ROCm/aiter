@@ -18,6 +18,11 @@ from .oracle import (
     qsa_topk_blocks,
     qsa_visible_blocks,
 )
+from .paged import (
+    gather_paged_cache,
+    gather_qsa_family_a_caches,
+    pack_paged_cache,
+)
 from .shapes import (
     FAMILY_A_GQA,
     FAMILY_A_INDEXER,
@@ -39,6 +44,9 @@ __all__ = [
     "QsaGqaSpec",
     "QsaIndexerSpec",
     "QsaOracleResult",
+    "gather_paged_cache",
+    "gather_qsa_family_a_caches",
+    "pack_paged_cache",
     "qsa_expand_tail",
     "qsa_indexer_scores",
     "qsa_oracle",

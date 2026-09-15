@@ -3,9 +3,9 @@
 
 """FlyDSL QSA public surface (SILOTIGER-1047).
 
-Phase 0: fp32 oracle + shared family A/B shapes. K1 (scorer + fused top-k) and
-K2 (sparse GQA) are not implemented yet -- do not import a kernel launcher from
-this module.
+Phase 0: fp32 oracle + shared family A/B shapes.
+Phase 1a: family A paged caches + block tables. K1/K2 and live-vLLM columns
+are not implemented yet -- do not import a kernel launcher from this module.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
 
@@ -30,6 +30,9 @@ from .kernels.qsa import (
     QsaGqaSpec,
     QsaIndexerSpec,
     QsaOracleResult,
+    gather_paged_cache,
+    gather_qsa_family_a_caches,
+    pack_paged_cache,
     qsa_expand_tail,
     qsa_indexer_scores,
     qsa_oracle,
@@ -48,6 +51,9 @@ __all__ = [
     "QsaGqaSpec",
     "QsaIndexerSpec",
     "QsaOracleResult",
+    "gather_paged_cache",
+    "gather_qsa_family_a_caches",
+    "pack_paged_cache",
     "qsa_expand_tail",
     "qsa_indexer_scores",
     "qsa_oracle",
