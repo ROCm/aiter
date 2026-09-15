@@ -191,12 +191,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-        def _iter_end_bar():
-            _waitcnt_vm_n(DMA_PER_ITER)
-            rocdl.sched_barrier(0)
-            rocdl.s_barrier()
-            rocdl.sched_barrier(0)
-
         def _softmax_part(v_s, l_row, m_new):
             v_s = softmax_helper.sub_m(v_s, m_new)
             v_p = softmax_helper.exp2(v_s, 0)
@@ -331,7 +325,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
             _pp_prio(1)
             v_o = _pv_part(v_p_b, v_v_b, v_o)
-            _iter_end_bar()
+            _phase_bar()
             loop_results = yield [m_row, l_row] + v_o + [nn_a_buf]
         m_row = loop_results[0]
         l_row = loop_results[1]

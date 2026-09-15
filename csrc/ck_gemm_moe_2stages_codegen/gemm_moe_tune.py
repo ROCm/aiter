@@ -6218,10 +6218,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                             for xcd in self._G1_XCD_SWIZZLE:
                                 try:
                                     _assert_supported(
-                                        NE=ne,
                                         D_HIDDEN=h,
                                         D_INTER=e,
-                                        topk=topk,
                                         BM=bm,
                                         BN=bn,
                                         BK=256,
