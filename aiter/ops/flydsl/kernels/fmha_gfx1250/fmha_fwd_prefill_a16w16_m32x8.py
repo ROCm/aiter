@@ -401,6 +401,15 @@ def _wmma(a, b, c):
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
 
+def _p_to_elem(p_list, elem_dtype):
+    """Narrow softmax's f32 P^T to the wmma element type. Split out of ``_softmax`` so the
+    caller places it AFTER the next gemm's ring head: nothing in the head depends on P, so
+    the ds_loads issue first and the v_cvt batch fills their shadow instead of the SP
+    stalling on the cvts before the loads go out. Costs P a wider live range (f32, not the
+    narrowed form) across the head on both halves."""
+    return [[pv.to(elem_dtype) for pv in pt] for pt in p_list]
+
+
 def _keepalive(vals):
     """Empty side-effecting inline asm: emits no instruction but counts as a USE, so the
     operands stay live (VGPRs reserved) until this point. Load-bearing for the ring — a
@@ -603,7 +612,6 @@ def _softmax(
     q_max_list=None,
     q_min_list=None,
     kv_len=None,
-    elem_dtype,
 ):
     """Online-softmax update for one KV tile, for ALL R q-WMMA-tiles this wave owns.
 
@@ -636,8 +644,9 @@ def _softmax(
     are fx.Float32 shared by the l<->l^16 pair.
 
     Returns 4 length-R lists ``(p, m_new, d_new, corr)`` plus a scalar ``rescale_any`` —
-    per row: p = NKV v8 **bf16** P^T = exp(S^T - m_new); m_new = updated running max, STALE
-    (== m_prev) when that row's deferred-rescale ballot did not fire (FAv4 §9.1.1);
+    per row: p = NKV v8 **f32** P^T = exp(S^T - m_new), NOT narrowed to the wmma element
+    type -- the caller places that conversion with ``_p_to_elem``; m_new = updated running
+    max, STALE (== m_prev) when that row's ballot did not fire (FAv4 §9.1.1);
     d_new = corr*d_prev + rowsum(p); corr = exp(m_prev - m_new) (== 1 on the stale path).
     ``rescale_any`` is one wave-uniform i1 over ALL R rows (None when deferral is compiled
     out): staleness stays per-row, but the caller gets a single branch to test.
@@ -770,7 +779,7 @@ def _softmax(
         corr_list.append(corr)
     rescale_any = None if rescale_mask is None else (rescale_mask != fx.Int32(0))
 
-    # ---- Pass 2 (all R rows): p = exp(S - m_new) (bf16, per tile) + flat p for the sum
+    # ---- Pass 2 (all R rows): p = exp(S - m_new) (f32, per tile) + flat p for the sum
     # tree. Built for every row first so the row sum-trees below emit INTERLEAVED. ----
     p_list, p_flat_list = [], []
     for r in range(R):
@@ -783,7 +792,7 @@ def _softmax(
                 pe.append(pj)
                 p_flat.append(pj)
                 idx += 1
-            p.append(fx.Vector.from_elements(pe, fx.Float32).to(elem_dtype))
+            p.append(fx.Vector.from_elements(pe, fx.Float32))
         p_list.append(p)
         p_flat_list.append(p_flat)
 
@@ -1657,7 +1666,6 @@ def _core_attention(
                 q_max_list=q_max_list,
                 q_min_list=q_min_list,
                 kv_len=kv_len,
-                elem_dtype=elem_dtype,
             )
 
             # Rescale each q-tile's running O by this tile's corr. On the leading half the
@@ -1721,14 +1729,19 @@ def _core_attention(
             if not LAG_DRAIN_AFTER_GEMM:
                 _drain_barrier()
             _prefetch(addr)
-            p_list, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
-            # Anchor the f32->bf16 P conversion in THIS block. Its only real use is the
-            # wmma stream past the barrier, so MachineSink (which ignores sched_barrier)
-            # sinks all 32 v_cvt_pk_bf16_f32 into the gemm and interleaves them with the
-            # WMMA. A side-effecting use here is a real use, so they stay put.
-            _keepalive([v for pt in p_list for v in pt])
+            p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
+            # Ring head for the gemm below goes out BEFORE P is narrowed: the head is
+            # ds_loads with no dependence on P, so issuing it first puts the conversion in
+            # its shadow rather than behind it.
             rocdl.sched_barrier(0)
             pvqk_head = _pvqk_head()
+            rocdl.sched_barrier(0)
+            p_list = _p_to_elem(p_f32, elem_dtype)
+            # Anchor the conversion in THIS block. Its only real use is the wmma stream
+            # past the barrier, so MachineSink (which ignores sched_barrier) sinks all 32
+            # v_cvt_pk_bf16_f32 into the gemm and interleaves them with the WMMA. A
+            # side-effecting use here is a real use, so they stay put.
+            _keepalive([v for pt in p_list for v in pt])
             _phase_barrier()
             o_out, s_acc = _pv_qk_gemm(
                 v_emit=_v_emit,
@@ -1761,16 +1774,17 @@ def _core_attention(
             )
             s_list = _scale_s(s_list, _s_scale)
             _phase_barrier()
-            carry_next, m_new_list, d_new_list, o_out = _softmax_phase(s_list, o_acc)
+            carry_f32, m_new_list, d_new_list, o_out = _softmax_phase(s_list, o_acc)
             # Next body's ring head: V(u) from the slot this body read K from -- resident
             # and already fenced. Issued behind the softmax, mirroring the lagging half:
-            # both halves now issue the head immediately before the barrier that precedes
-            # the gemm consuming it.
+            # both halves issue the head immediately before the barrier that precedes the
+            # gemm consuming it, and ahead of the narrowing for the same reason as there.
             rocdl.sched_barrier(0)
             head_next = _issue_head(
                 lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _NH
             )
             rocdl.sched_barrier(0)
+            carry_next = _p_to_elem(carry_f32, elem_dtype)
 
         # Yield state — R updated (m, d, O, P) groups, then the K/V ds pointers and slot
         # bases left-rotated by one so slot 0 holds tile u (next body's PV) and the oldest
