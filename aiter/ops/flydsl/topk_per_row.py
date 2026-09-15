@@ -28,9 +28,6 @@ from .kernels.topk_per_row_decode_persistent import (
 # Measured crossover between the one-workgroup and multi-kernel paths.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
-# gfx950 has 160 KiB per CU; half of that (minus padding) keeps two 1024-thread
-# blocks resident. Other arches keep the original layout when this is 0.
-_ONE_BLOCK_LDS_BUDGET_BYTES = {"gfx950": 78 * 1024}
 
 
 @lru_cache(maxsize=16)
@@ -59,12 +56,7 @@ def _get_topk_workspace(
             torch.empty(hist_shape, device=device, dtype=torch.int32),
             torch.empty(state_shape, device=device, dtype=torch.int32),
         )
-    return _get_cached_workspace(
-        device,
-        stream_id,
-        hist_shape,
-        state_shape,
-    )
+    return _get_cached_workspace(device, stream_id, hist_shape, state_shape)
 
 
 def clear_topk_per_row_decode_workspace_cache() -> None:
@@ -215,41 +207,20 @@ def _validate_radix_topk_one_block_call(
 ) -> None:
     """Raise if this call cannot run the one-block radix kernel."""
     _validate_flydsl_topk_call(
-        logits,
-        next_n,
-        row_ends,
-        indices,
-        num_rows,
-        stride0,
-        stride1,
-        k,
-        values,
+        logits, next_n, row_ends, indices, num_rows, stride0, stride1, k, values
     )
     if row_starts is None:
         if not is_decode:
             raise ValueError("row_starts is required for prefill")
     elif row_starts is not row_ends:
         _validate_flydsl_topk_call(
-            logits,
-            next_n,
-            row_starts,
-            indices,
-            num_rows,
-            stride0,
-            stride1,
-            k,
-            values,
+            logits, next_n, row_starts, indices, num_rows, stride0, stride1, k, values
         )
     if logits.shape[1] > _MAX_ROW_ELEMENTS:
         raise ValueError("one logits row exceeds the AMD buffer descriptor span")
 
 
-_TensorSignature = tuple[
-    torch.Size,
-    tuple[int, ...],
-    torch.dtype,
-    torch.device,
-]
+_TensorSignature = tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device]
 
 
 def _tensor_signature(tensor: torch.Tensor) -> _TensorSignature:
@@ -281,10 +252,7 @@ def _is_flydsl_topk_call_supported(
         )
         if values_signature is not None:
             _validate_values_signature(
-                *values_signature,
-                logits_signature[0][0],
-                k,
-                logits_signature[3],
+                *values_signature, logits_signature[0][0], k, logits_signature[3]
             )
     except (RuntimeError, TypeError, ValueError):
         return False
@@ -412,15 +380,7 @@ def flydsl_top_k_per_row_decode(
     """Write per-row TopK indices using each request's effective context length."""
 
     _validate_flydsl_topk_call(
-        logits,
-        next_n,
-        seq_lens,
-        indices,
-        num_rows,
-        stride0,
-        stride1,
-        k,
-        values,
+        logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
     )
 
     rows, width = logits.shape
@@ -429,9 +389,7 @@ def flydsl_top_k_per_row_decode(
     stream = torch.cuda.current_stream(logits.device)
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
-            k,
-            wave_size=wave_size,
-            write_values=values is not None,
+            k, wave_size=wave_size, write_values=values is not None
         )
         _run_compiled(
             launcher,
@@ -453,10 +411,7 @@ def flydsl_top_k_per_row_decode(
     chunks = topk_per_row_decode_chunks(rows, width, wave_size)
     hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable, chunks)
     partial_hist, state = _get_topk_workspace(
-        logits.device,
-        stream.cuda_stream,
-        hist_shape,
-        state_shape,
+        logits.device, stream.cuda_stream, hist_shape, state_shape
     )
 
     launcher = build_topk_per_row_decode_module(
@@ -524,9 +479,7 @@ def flydsl_radix_topk_one_block(
     stream = torch.cuda.current_stream(logits.device)
     short_rows = width <= _COMPACT_CAPACITY
     block_threads = (
-        1024
-        if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS
-        else 256
+        1024 if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
     )
     launcher = build_radix_topk_one_block_module(
         k,
@@ -536,7 +489,6 @@ def flydsl_radix_topk_one_block(
         short_rows=short_rows,
         is_decode=is_decode,
         wave_size=wave_size,
-        lds_budget_bytes=_ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0),
         arch=arch,
     )
     _run_compiled(
@@ -551,4 +503,3 @@ def flydsl_radix_topk_one_block(
         num_rows,
         stream,
     )
-

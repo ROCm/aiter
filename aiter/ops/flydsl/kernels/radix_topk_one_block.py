@@ -12,12 +12,11 @@ from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from .kernels_common import atomic_add_i32
-from .topk_per_row_decode import _load_f32x4, _warp_inclusive_prefix_i32
+from .kernels_common import atomic_add_i32, atomic_or_i32
+from .topk_per_row_decode import _load_f32x4
 
 _VEC = 4
 _LOAD_UNROLL = 4
@@ -32,7 +31,6 @@ _KEY_BITS = 32
 # later levels, so the candidate buffer is unaffected.
 _LONG_RADIX_DEFAULT = ((12, 10, 10), _PASS1_HISTOGRAM_REPLICAS)
 _LONG_RADIX_BY_ARCH = {"gfx950": ((14, 10, 8), 1)}
-_LONG_RADIX_BITS = _LONG_RADIX_DEFAULT[0]
 _SHORT_RADIX_BITS = (11, 10, 11)
 _SHORT_RADIX_SHIFTS = (
     _SHORT_RADIX_BITS[1] + _SHORT_RADIX_BITS[2],
@@ -46,6 +44,9 @@ _LATER_BUCKETS = 1 << max(
 _SHORT_HIGH_BUCKETS = 1 << _SHORT_RADIX_BITS[0]
 _MAX_ROW_ELEMENTS = ((1 << 32) - 1) // 4
 _COMPACT_CAPACITY = 4096
+# gfx950 has 160 KiB per CU; half of that (minus padding) keeps two 1024-thread
+# blocks resident. Other arches keep the original layout when this is 0.
+_ONE_BLOCK_LDS_BUDGET_BYTES = {"gfx950": 78 * 1024}
 _STABLE_INDEX_SORT_MIN_ROW_LEN = 1 << 15
 _STABLE_COMPACT_SORT_MIN_ROW_LEN = 48 * 1024
 
@@ -88,15 +89,15 @@ def build_radix_topk_one_block_module(
     is_decode: bool = False,
     *,
     wave_size: int,
-    lds_budget_bytes: int = 0,
     arch: str = "",
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
 
     short_rows requires every effective row length <= 4096.
     wave_size must match the target architecture and is part of the cache key.
-    lds_budget_bytes only grows the candidate buffer; 0 keeps the original layout.
-    arch selects the first radix level from _LONG_RADIX_BY_ARCH.
+    arch selects the first radix level from _LONG_RADIX_BY_ARCH. gfx950 also
+    grows the candidate buffer from _ONE_BLOCK_LDS_BUDGET_BYTES; other arches
+    keep the original layout.
     """
     if k <= 0:
         raise ValueError("k must be positive")
@@ -146,8 +147,9 @@ def build_radix_topk_one_block_module(
     # reserves a power-of-two staging array (including its padding slots).
     histogram_bytes = _LATER_BUCKETS * 4
     stable_stage_bytes = stable_stage_capacity * 4
-    scratch_bytes = (num_waves * 2 + _METADATA_SIZE) * 4
+    scratch_bytes = (num_waves + _METADATA_SIZE) * 4
     candidate_entry_bytes = 4 + 4  # ordered key, column index
+    lds_budget_bytes = _ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0)
 
     spare_bytes = (
         lds_budget_bytes - histogram_bytes - stable_stage_bytes - scratch_bytes
@@ -158,6 +160,10 @@ def build_radix_topk_one_block_module(
     bitmap_capacity = min(
         candidate_capacity, stable_sort_capacity // 2 * len(stable_sort_sizes)
     )
+
+    # Block-wide prefix sums come from the cooperative library; its shared
+    # storage is one slot per wave.
+    block_scan = fx.coop.BlockScan[fx.Int32, block_threads]
 
     # LDS layouts
 
@@ -191,7 +197,7 @@ def build_radix_topk_one_block_module(
     @fx.struct
     class SharedStorage:
         arena: shared_arena_type
-        scan: fx.Array[fx.Int32, num_waves * 2, 16]
+        scan: block_scan.SharedStorage
         metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
 
     @flyc.kernel(
@@ -214,7 +220,6 @@ def build_radix_topk_one_block_module(
         row = fx.Int32(fx.block_idx.x)
         tid = fx.thread_idx.x
         lane = tid % wave_size
-        wave = tid // wave_size
 
         zero = fx.Int32(0)
         one = fx.Int32(1)
@@ -323,7 +328,7 @@ def build_radix_topk_one_block_module(
         full_key_tiles = fx.logical_divide(full_keys, fx.make_layout(_VEC, 1))
 
         # Shared scratch
-        scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
+        scan = storage.scan.peek()
         metadata = storage.metadata.peek().view(fx.make_layout(_METADATA_SIZE, 1))
 
         # Key encoding and classification
@@ -400,30 +405,6 @@ def build_radix_topk_one_block_module(
                 histograms[0][pos] = merged
             gpu.barrier()
 
-        def block_excl_prefix_i32(packed_local, scan):
-            """The caller must synchronize before the next reuse of scan."""
-            packed_inclusive = _warp_inclusive_prefix_i32(packed_local, lane, wave_size)
-            packed_exclusive = packed_inclusive - packed_local
-            if lane == wave_size - 1:
-                scan[wave] = packed_inclusive
-            gpu.barrier()
-
-            if wave == 0:
-                wave_val = zero
-                if lane < num_waves:
-                    wave_val = scan[lane]
-                wave_inclusive = _warp_inclusive_prefix_i32(wave_val, lane, wave_size)
-                wave_exclusive = wave_inclusive - wave_val
-                if lane < num_waves:
-                    scan[lane] = wave_exclusive
-                if lane == num_waves - 1:
-                    scan[num_waves] = wave_inclusive
-            gpu.barrier()
-
-            packed_prefix = scan[wave] + packed_exclusive
-            packed_total = scan[num_waves]
-            return packed_prefix, packed_total
-
         def choose_threshold(
             target_k,
             above_slot,
@@ -444,28 +425,10 @@ def build_radix_topk_one_block_module(
                     count = count + replicas[replica][first_bin + item]
                 counts[item] = count
                 local_total = local_total + count
-            wave_inclusive = _warp_inclusive_prefix_i32(local_total, lane, wave_size)
-            wave_exclusive = wave_inclusive - local_total
-
-            if lane == wave_size - 1:
-                scan[wave] = wave_inclusive
-            gpu.barrier()
-
-            if wave == 0:
-                active = lane < num_waves
-                safe_lane = active.select(lane, zero)
-                wave_total = active.select(scan[safe_lane], zero)
-                wave_prefix = (
-                    _warp_inclusive_prefix_i32(wave_total, lane, wave_size) - wave_total
-                )
-                if active:
-                    scan[lane + num_waves] = wave_prefix
-            gpu.barrier()
-
-            wave_offset = scan[wave + num_waves]
-            total = scan[num_waves - 1] + scan[num_waves * 2 - 1]
+            exclusive, total = block_scan.exclusive_with_aggregate(
+                local_total, fx.ReductionOp.ADD, storage=scan
+            )
             target_prefix = total - target_k
-            exclusive = wave_offset + wave_exclusive
             for item in range_constexpr(bins_per_thread):
                 inclusive = exclusive + counts[item]
                 if (exclusive <= target_prefix) & (inclusive > target_prefix):
@@ -537,7 +500,7 @@ def build_radix_topk_one_block_module(
                 active = vector_idx < row_vectors
                 safe_idx = active.select(vector_idx, zero)
                 fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
-                fx.copy_atom_call(
+                fx.copy(
                     full_key_load_atom,
                     fx.slice(full_key_tiles, (None, safe_idx)),
                     fragment,
@@ -564,10 +527,7 @@ def build_radix_topk_one_block_module(
                 # only separates waves that already ran concurrently.
                 replica = lane % fx.Int32(replicas)
                 atomic_add_i32(
-                    flat_histograms,
-                    one,
-                    replica * fx.Int32(bins) + bucket,
-                    "workgroup",
+                    flat_histograms, one, replica * fx.Int32(bins) + bucket, "workgroup"
                 )
 
         def preceding_prefix(key, shift, mask):
@@ -680,16 +640,8 @@ def build_radix_topk_one_block_module(
                     pos = tid + item * block_threads
                     if pos < top_k:
                         col = selected_local_indices[pos]
-                        ptr = fx.to_llvm_ptr(fx.get_iter(bitmap) + col // fx.Int32(32))
                         bit = one << (col % fx.Int32(32))
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp._or,
-                            ptr,
-                            fx.as_ir_value(bit),
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="workgroup",
-                            alignment=4,
-                        )
+                        atomic_or_i32(bitmap, bit, col // fx.Int32(32), "workgroup")
                 gpu.barrier()
 
                 output_base = zero
@@ -699,11 +651,13 @@ def build_radix_topk_one_block_module(
                     word = zero
                     if word_idx < num_words:
                         word = bitmap[word_idx]
-                    count = fx.Int32(llvm.intr_ctpop(fx.as_ir_value(word)))
-                    prefix, total = block_excl_prefix_i32(count, scan)
+                    count = fx.ctpop(word)
+                    prefix, total = block_scan.exclusive_with_aggregate(
+                        count, fx.ReductionOp.ADD, storage=scan
+                    )
                     out_pos = output_base + prefix
                     while word != zero:
-                        bit_idx = fx.Int32(llvm.intr_cttz(fx.as_ir_value(word), False))
+                        bit_idx = fx.math.cttz(word)
                         col = word_idx * fx.Int32(32) + bit_idx
                         row_indices[out_pos] = row_start + col
                         if const_expr(write_values):
@@ -740,11 +694,7 @@ def build_radix_topk_one_block_module(
             if source == "global_row":
                 reset_scatter_counters(metadata)
 
-            def collect(
-                col,
-                key,
-                output_local_indices,
-            ):
+            def collect(col, key, output_local_indices):
                 above, equal = classify_prefix(
                     key, long_shifts, prefix_threshold, levels, key_mask
                 )
@@ -768,9 +718,7 @@ def build_radix_topk_one_block_module(
             if source == "global_row":
                 scan_gm_row(
                     lambda col, value: collect(
-                        col,
-                        ordered_key(value),
-                        selected_local_indices,
+                        col, ordered_key(value), selected_local_indices
                     )
                 )
             else:
@@ -812,8 +760,8 @@ def build_radix_topk_one_block_module(
                             classes[item] = 1
                             packed_local = packed_local + 1
 
-                packed_prefix, packed_step_total = block_excl_prefix_i32(
-                    packed_local, scan
+                packed_prefix, packed_step_total = block_scan.exclusive_with_aggregate(
+                    packed_local, fx.ReductionOp.ADD, storage=scan
                 )
                 my_above = above_base + (packed_prefix >> _PACKED_COUNT_BITS)
                 my_eq = equal_base + (packed_prefix & fx.Int32(_PACKED_COUNT_MASK))
@@ -853,7 +801,7 @@ def build_radix_topk_one_block_module(
                     active_vector = vector_idx < row_vectors
                     safe_vector_idx = active_vector.select(vector_idx, 0)
                     fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
-                    fx.copy_atom_call(
+                    fx.copy(
                         full_key_load_atom,
                         fx.slice(full_key_tiles, (None, safe_vector_idx)),
                         fragment,
@@ -1089,7 +1037,7 @@ def build_radix_topk_one_block_module(
                     matching = fx.Uint64(fx.rocdl.ballot(T.i64, bucket == first_bucket))
                     all_same = matching == active_mask
                     leader = fx.Int32(fx.rocdl.readfirstlane(T.i32, lane))
-                    count = fx.Int32(llvm.intr_ctpop(fx.as_ir_value(active_mask)))
+                    count = fx.Int32(fx.ctpop(active_mask))  # ballot mask is 64-bit
                     if (matching != active_mask) | (lane == leader):
                         atomic_add_i32(
                             long_histograms_flat,
@@ -1384,7 +1332,7 @@ def build_radix_topk_one_block_module(
                             )
                         else:
                             fragment.store(fx.Vector.filled(_VEC, -1, fx.Int32))
-                    fx.copy_atom_call(
+                    fx.copy(
                         index_store_atom,
                         fragment,
                         fx.slice(row_index_tiles, (None, vector_idx)),
@@ -1417,7 +1365,7 @@ def build_radix_topk_one_block_module(
                                 value_fragment.store(
                                     fx.Vector.filled(_VEC, float("-inf"), fx.Float32)
                                 )
-                        fx.copy_atom_call(
+                        fx.copy(
                             value_store_atom,
                             value_fragment,
                             fx.slice(row_value_tiles, (None, vector_idx)),
