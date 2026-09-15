@@ -374,7 +374,12 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N]."""
+    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
+
+    Both backends take the preshuffled weight, so this entry point serves both;
+    the tuned row's libtype picks. Untuned shapes stay on flydsl, which is what
+    shipped before opus became a candidate here.
+    """
     from .flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_128_gfx1250
 
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
@@ -382,11 +387,28 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
 
     cfg = lookup_mxscale_bmm_config(g, m, n, k, bpreshuffle=True)
     libtype = cfg["libtype"] if cfg is not None else "flydsl"
+
+    if libtype == "opus":
+        from .opus.bmm_op import bmm_a8w8_mxscale_bpreshuffle_opus
+
+        # kernelId / splitK come off the tuned row; the opus wrapper runs the id
+        # verbatim rather than re-picking by shape.
+        return bmm_a8w8_mxscale_bpreshuffle_opus(
+            x,
+            wo_a,
+            x_scale,
+            w_scale,
+            out=torch.empty((m, g, n), dtype=dtype, device=x.device),
+            dtype=dtype,
+            kernelId=int(cfg["kernelId"]),
+            splitK=int(cfg["splitK"]),
+        )
+
     if libtype != "flydsl":
         raise NotImplementedError(
             f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
-            f"{libtype!r}, which takes a raw [G, N, K] weight; {libtype!r} rows "
-            "are served by batched_gemm_a8w8_mxscale"
+            f"{libtype!r}, which this entry point does not serve; raw "
+            "[G, N, K] weight rows are served by batched_gemm_a8w8_mxscale"
         )
 
     return run_bmm_a8w8_mxfp8_128_gfx1250(
