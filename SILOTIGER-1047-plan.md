@@ -187,9 +187,10 @@ Proposed layout (adjust only if a later lock says so):
 ### 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
 
 This phase answers **which kernel to land first** at 8k / 32k / 128k / 1M
-(open question in the ticket). No FlyDSL win is claimed here.
+(open question in the ticket). No FlyDSL win is claimed here. Land as
+separate steps (plumbing → live AMD → #4882 → rocprof → optional NVIDIA).
 
-- [ ] Family A plumbing only: paged indexer-K and GQA K/V, shuffled
+- [x] Family A plumbing only: paged indexer-K and GQA K/V, shuffled
       `block_table`, `M`/`L` sweep, oracle on dense vs gathered. No
       competitor kernels. Sweep lives in `bench_*`, not `test_*`. Gate:
       pytest `-q` then `HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py`
