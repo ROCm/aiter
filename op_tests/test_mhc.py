@@ -1070,35 +1070,33 @@ def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
         )
 
     repeated_ref, torch_repeat_us = run_perftest(repeat_ref, hidden_states, hc_mult)
-    repeated_triton, triton_repeat_us = run_perftest(
+    repeated_out, flydsl_repeat_us = run_perftest(
         mhc_res_repeat, hidden_states, hc_mult, True
     )
-    assert torch.equal(repeated_triton, repeated_ref)
+    assert torch.equal(repeated_out, repeated_ref)
 
     shuffled_ref, torch_shuffle_us = run_perftest(shuffle_ref, residual)
-    shuffled_triton, triton_shuffle_us = run_perftest(mhc_res_shuffle, residual)
-    assert torch.equal(shuffled_triton, shuffled_ref)
+    shuffled_out, flydsl_shuffle_us = run_perftest(mhc_res_shuffle, residual)
+    assert torch.equal(shuffled_out, shuffled_ref)
 
     unshuffled_ref, torch_unshuffle_us = run_perftest(unshuffle_ref, shuffled_ref)
-    unshuffled_triton, triton_unshuffle_us = run_perftest(
-        mhc_res_unshuffle, shuffled_triton
-    )
-    assert torch.equal(unshuffled_triton, unshuffled_ref)
-    assert torch.equal(unshuffled_triton, residual)
+    unshuffled_out, flydsl_unshuffle_us = run_perftest(mhc_res_unshuffle, shuffled_out)
+    assert torch.equal(unshuffled_out, unshuffled_ref)
+    assert torch.equal(unshuffled_out, residual)
 
     return {
         "M": m,
         "dtype": str(dtype),
         "N": hidden_size,
         "torch_repeat_us": torch_repeat_us,
-        "triton_repeat_us": triton_repeat_us,
-        "repeat_speedup": torch_repeat_us / triton_repeat_us,
+        "flydsl_repeat_us": flydsl_repeat_us,
+        "repeat_speedup": torch_repeat_us / flydsl_repeat_us,
         "torch_shuffle_us": torch_shuffle_us,
-        "triton_shuffle_us": triton_shuffle_us,
-        "shuffle_speedup": torch_shuffle_us / triton_shuffle_us,
+        "flydsl_shuffle_us": flydsl_shuffle_us,
+        "shuffle_speedup": torch_shuffle_us / flydsl_shuffle_us,
         "torch_unshuffle_us": torch_unshuffle_us,
-        "triton_unshuffle_us": triton_unshuffle_us,
-        "unshuffle_speedup": torch_unshuffle_us / triton_unshuffle_us,
+        "flydsl_unshuffle_us": flydsl_unshuffle_us,
+        "unshuffle_speedup": torch_unshuffle_us / flydsl_unshuffle_us,
     }
 
 
