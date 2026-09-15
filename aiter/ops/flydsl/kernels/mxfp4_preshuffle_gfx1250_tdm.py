@@ -567,7 +567,7 @@ def launch_gemm_a8w4_tdm(
                     # which the TDM drops -- the contiguous path clamps its
                     # extent instead.
                     _bound_a = a_gather_oob
-                gA_view = global_view(gA_base, 0, (_bound_a, A_KROW), (A_KROW, 1))
+                gA_view = tensor_view(gA_base, (_bound_a, A_KROW), (A_KROW, 1))
                 jobs.append(
                     Job(
                         None,
@@ -690,7 +690,7 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(j.gather is not None):
                     # Shape is the written extent, stride the padded pitch --
                     # same split as the contiguous path's destination view.
-                    lds_c = lds_view(pa + j.lds_off, (j.outer, j.inner), (j.lds_row, 1))
+                    lds_c = tensor_view(pa + j.lds_off, (j.outer, j.inner), (j.lds_row, 1))
                     desc = make_tensor_gather_descriptor(
                         j.gt,
                         lds_c,
