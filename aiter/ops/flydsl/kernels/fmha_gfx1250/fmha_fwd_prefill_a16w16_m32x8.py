@@ -658,18 +658,19 @@ def _softmax(
     length-R lists (R = WMMA_ROW_PER_WAVE); the q_*_list default to all-None. m_prev/d_prev
     are fx.Float32 shared by the l<->l^16 pair.
 
-    Returns 4 length-R lists ``(p, m_new, d_new, corr)`` plus a scalar ``rescale_any`` —
+    Returns 4 length-R lists ``(p, m_new, d_new, corr)`` plus ``rescale_masks`` —
     per row: p = NKV v8 **f32** P^T = exp(S^T - m_new), NOT narrowed to the wmma element
     type -- the caller places that conversion with ``_p_to_elem``; m_new = updated running
     max, STALE (== m_prev) when that row's ballot did not fire (FAv4 §9.1.1);
     d_new = corr*d_prev + rowsum(p); corr = exp(m_prev - m_new) (== 1 on the stale path).
-    ``rescale_any`` is one wave-uniform i1 over ALL R rows (None when deferral is compiled
-    out): staleness stays per-row, but the caller gets a single branch to test.
+    ``rescale_masks`` is the R raw ballots (None when deferral is compiled out); the
+    caller folds them into its one branch condition at the use site.
     """
     NKV = n_block // WMMA_N
     f32 = ir.F32Type.get()
     fast = arith.FastMathFlags.fast
     neg_inf = fx.Float32(float("-inf"))
+    _defer = ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0
 
     def fmax(a, b):
         return fx.Float32(arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fast).result)
@@ -762,7 +763,7 @@ def _softmax(
 
     # ---- Per row: peer reduce + deferred-rescale decision + corr. ----
     m_new_list, corr_list = [], []
-    rescale_mask = None
+    rescale_masks = None if not _defer else []
     for r in range(R):
         m_prev, q_min = m_prev_list[r], q_min_list[r]
         row_max = fmax(local_max_list[r], peer(local_max_list[r]))
@@ -773,15 +774,18 @@ def _softmax(
         # `o_acc *= corr` multiply. Ballot promotes the per-lane test to wave-uniform (non-
         # divergent branch). ORDERED OGT: a fully-masked lane's -inf - -inf = NaN never
         # forces a rescale. Safe stale path: row_max - m_prev <= 8 -> p <= e^8, no overflow.
-        if ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0:
+        if _defer:
             # `>` lowers to ordered OGT, so a fully-masked lane's -inf - -inf = NaN
             # compares false and never forces a rescale.
             need = fsub(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
-            mask = fx.Int32(rocdl.ballot(fx.Int32.ir_type, need))
-            m_new = (mask != fx.Int32(0)).select(m_full, m_prev)
-            # OR the raw ballots, not the per-row booleans: one s_or_b32 folds R rows into
-            # the single test the caller branches on.
-            rescale_mask = mask if rescale_mask is None else (rescale_mask | mask)
+            # Select on the per-lane `need`, not on the ballot: every lane owns its own q
+            # row (the l<->l^16 pair shares one and agrees after the peer reduce), so
+            # staleness is a per-lane decision and the ballot is only the caller's branch
+            # condition. This leaves that branch as the compare's only other consumer, so
+            # the whole fold sinks to the s_cbranch instead of sitting between the max tree
+            # and the exp chain as an s_cmp/s_cselect turnaround.
+            m_new = need.select(m_full, m_prev)
+            rescale_masks.append(fx.Int32(rocdl.ballot(fx.Int32.ir_type, need)))
         else:
             m_new = m_full
 
@@ -792,7 +796,6 @@ def _softmax(
         corr = exp2(fsub(m_prev, m_new))
         m_new_list.append(m_new)
         corr_list.append(corr)
-    rescale_any = None if rescale_mask is None else (rescale_mask != fx.Int32(0))
 
     # ---- Pass 2 (all R rows): p = exp(S - m_new) (f32, per tile) + flat p for the sum
     # tree. Built for every row first so the row sum-trees below emit INTERLEAVED. ----
@@ -824,7 +827,7 @@ def _softmax(
                 fadd(local_sum_list[r], peer(local_sum_list[r])),
             )
         )
-    return p_list, m_new_list, d_new_list, corr_list, rescale_any
+    return p_list, m_new_list, d_new_list, corr_list, rescale_masks
 
 
 def _pv_gemm(
@@ -1670,7 +1673,7 @@ def _core_attention(
                 seq_idx[qt] + causal_off - window_left if mask_left else None
                 for qt in range(R)
             ]
-            p_list, m_new_list, d_new_list, corr_list, rescale_any = _softmax(
+            p_list, m_new_list, d_new_list, corr_list, rescale_masks = _softmax(
                 s_list=s_in,
                 m_prev_list=m_prev,
                 d_prev_list=d_prev,
@@ -1693,7 +1696,7 @@ def _core_attention(
             # neither row moves in the common case, so the steady state is a single
             # not-taken s_cbranch_vccz. A row that stayed stale has m_new == m_prev, hence
             # corr == 1 exactly, so rescaling it inside the taken branch is the identity.
-            # rescale_any is None -> deferral compiled out, keep the plain multiply.
+            # rescale_masks is None -> deferral compiled out, keep the plain multiply.
             corr_vecs = [
                 fx.Vector.from_elements([corr_list[qt]], fx.Float32).broadcast_to(8)
                 for qt in range(R)
@@ -1702,14 +1705,21 @@ def _core_attention(
                 [fx.Vector(_ir(o_in[qt][dt])) for dt in range(d_tiles)]
                 for qt in range(R)
             ]
-            if rescale_any is None:
+            if rescale_masks is None:
                 o_resc_list = [
                     [ov * corr_vecs[qt] for ov in o_vecs[qt]] for qt in range(R)
                 ]
             else:
+                # The R ballots are folded HERE, not in _softmax: they are VALU-produced
+                # SGPRs, so keeping the s_or/s_cmp that read them at the use site leaves
+                # the whole row-max chain between the v_cmp and the turnaround. OR the raw
+                # masks, not the per-row booleans -- one s_or_b32 covers all R rows.
+                mask_any = rescale_masks[0]
+                for _m in rescale_masks[1:]:
+                    mask_any = mask_any | _m
                 o_flat = list(
                     scf_if_dispatch(
-                        rescale_any,
+                        mask_any != fx.Int32(0),
                         lambda *_a, _o=o_vecs, _c=corr_vecs: [
                             ov * _c[qt] for qt in range(R) for ov in _o[qt]
                         ],
