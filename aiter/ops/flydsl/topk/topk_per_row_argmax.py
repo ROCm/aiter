@@ -7,8 +7,8 @@ from functools import lru_cache
 
 import torch
 
-from .kernels.tensor_shim import _run_compiled
-from .kernels.topk.topk_per_row_argmax import (
+from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk.topk_per_row_argmax import (
     _VEC,
     build_topk_per_row_argmax_module,
     topk_per_row_argmax_splits,

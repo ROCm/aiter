@@ -9,19 +9,19 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .kernels.kernels_common import get_warp_size
-from .kernels.topk.radix_topk_one_block import (
+from ..kernels.kernels_common import get_warp_size
+from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
-from .kernels.tensor_shim import _run_compiled
-from .kernels.topk.topk_per_row_decode import (
+from ..kernels.topk.topk_per_row_decode import (
     build_topk_per_row_decode_module,
     topk_per_row_decode_chunks,
     topk_per_row_decode_workspace_shapes,
 )
-from .kernels.topk.topk_per_row_decode_persistent import (
+from ..kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
 )
 

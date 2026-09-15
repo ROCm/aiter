@@ -407,7 +407,7 @@ def top_k_per_row_prefill(
     use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
     # FlyDSL one-block outperforms HIP one-block on the remaining prefill cases.
     if not use_mulblocks and not _FLYDSL_TOPK_PREFILL_DISABLED:
-        from .flydsl.topk_per_row import (
+        from .flydsl.topk.topk_per_row import (
             _is_flydsl_radix_topk_one_block_supported,
         )
 
@@ -565,7 +565,7 @@ def _should_use_flydsl_topk_decode(
     ):
         return False
 
-    from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
+    from .flydsl.topk.topk_per_row import is_flydsl_top_k_per_row_decode_supported
 
     return is_flydsl_top_k_per_row_decode_supported(
         logits,
@@ -660,7 +660,7 @@ def top_k_per_row_decode(
 
     # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
     if not _FLYDSL_TOPK_DECODE_DISABLED:
-        from .flydsl.topk_per_row import (
+        from .flydsl.topk.topk_per_row import (
             _is_flydsl_radix_topk_one_block_supported,
         )
 
@@ -774,7 +774,7 @@ def flydsl_radix_topk_one_block_prefill(
     stable: bool = False,
 ) -> None:
     """Prefill wrapper with the same argument order as HIP top_k_per_row_prefill."""
-    from .flydsl.topk_per_row import flydsl_radix_topk_one_block
+    from .flydsl.topk.topk_per_row import flydsl_radix_topk_one_block
 
     return flydsl_radix_topk_one_block(
         logits,
@@ -805,7 +805,7 @@ def flydsl_radix_topk_one_block_decode(
     values: torch.Tensor | None = None,
 ) -> None:
     """Decode wrapper with the same argument order as HIP top_k_per_row_decode."""
-    from .flydsl.topk_per_row import flydsl_radix_topk_one_block
+    from .flydsl.topk.topk_per_row import flydsl_radix_topk_one_block
 
     return flydsl_radix_topk_one_block(
         logits,
@@ -840,7 +840,7 @@ def flydsl_top_k_per_row_decode(
     This path is optimized for long-context decode, where its multi-CTA radix
     selection typically outperforms the HIP one-block implementation.
     """
-    from .flydsl.topk_per_row import (
+    from .flydsl.topk.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
     )
 
