@@ -18,6 +18,8 @@
 #     --flydsl-weight-layout NAME
 #                     FlyDSL k_contiguous or preshuffled (default: k_contiguous);
 #                     CK always remains k-contiguous
+#     --flydsl-gate-up-map NAME
+#                     FlyDSL native or gather (default: native)
 #     --out-prefix P   artifact path prefix (default: tickets/667/g9_compare; files are ${P}_${backend}.{md,csv})
 #     --                everything after is passed through to compare.py
 #
@@ -45,6 +47,7 @@ REPEATS=3
 ITERS=1000
 COLD=20
 FLYDSL_WEIGHT_LAYOUT="k_contiguous"
+FLYDSL_GATE_UP_MAP="native"
 OUT_PREFIX="${REPO}/tickets/667/g9_compare"
 PASSTHRU=()
 
@@ -58,6 +61,7 @@ while [ $# -gt 0 ]; do
         --iters)      ITERS="$2"; shift 2 ;;
         --cold)       COLD="$2"; shift 2 ;;
         --flydsl-weight-layout) FLYDSL_WEIGHT_LAYOUT="$2"; shift 2 ;;
+        --flydsl-gate-up-map) FLYDSL_GATE_UP_MAP="$2"; shift 2 ;;
         --out-prefix) OUT_PREFIX="$2"; shift 2 ;;
         --)           shift; PASSTHRU=("$@"); break ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -67,6 +71,10 @@ done
 case "${FLYDSL_WEIGHT_LAYOUT}" in
     k_contiguous|preshuffled) ;;
     *) echo "invalid --flydsl-weight-layout: ${FLYDSL_WEIGHT_LAYOUT} (expected k_contiguous or preshuffled)" >&2; exit 2 ;;
+esac
+case "${FLYDSL_GATE_UP_MAP}" in
+    native|gather) ;;
+    *) echo "invalid --flydsl-gate-up-map: ${FLYDSL_GATE_UP_MAP} (expected native or gather)" >&2; exit 2 ;;
 esac
 
 if [ ! -x "${VENV_PY}" ]; then
@@ -100,12 +108,13 @@ MD_OUT="${OUT_PREFIX}_${BACKEND}.md"
 CSV_OUT="${OUT_PREFIX}_${BACKEND}.csv"
 
 echo "==> G9 compare: gpu=${GPU} backend=${BACKEND} repeats=${REPEATS} iters=${ITERS} cold=${COLD}"
-echo "    layouts: FlyDSL=${FLYDSL_WEIGHT_LAYOUT} ${BACKEND}=k_contiguous"
+echo "    layouts: FlyDSL=${FLYDSL_WEIGHT_LAYOUT} gate_up=${FLYDSL_GATE_UP_MAP} ${BACKEND}=k_contiguous"
 echo "    artifact -> ${MD_OUT} , ${CSV_OUT}"
 
 HIP_VISIBLE_DEVICES="${GPU}" "${VENV_PY}" "${COMPARE}" \
     --backend "${BACKEND}" \
     --flydsl-weight-layout "${FLYDSL_WEIGHT_LAYOUT}" \
+    --flydsl-gate-up-map "${FLYDSL_GATE_UP_MAP}" \
     --iters "${ITERS}" --cold "${COLD}" --repeats "${REPEATS}" \
     --md-out "${MD_OUT}" --csv-out "${CSV_OUT}" \
     "${PASSTHRU[@]}"

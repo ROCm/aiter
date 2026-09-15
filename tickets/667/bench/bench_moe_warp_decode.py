@@ -236,6 +236,7 @@ class WeightPack:
     # FlyDSL fused-MoE B (shuffle_weight / shuffle_weight_a16w4). Same logical
     # weights as the k-contiguous FP8/FP4 tensors; host permute is setup.
     flydsl_weight_layout: WeightLayout
+    flydsl_gate_up_map: str
     w_gate_fp8_ps: torch.Tensor
     w_up_fp8_ps: torch.Tensor
     w_down_fp8_ps: torch.Tensor
@@ -260,6 +261,7 @@ def build_weights(
     seed: int = 123,
     *,
     flydsl_weight_layout: WeightLayout = WeightLayout.PRESHUFFLED,
+    flydsl_gate_up_map: str = "native",
 ) -> WeightPack:
     torch.manual_seed(seed)
     HIDDEN, INTER, E = shape.HIDDEN, shape.INTER, shape.E
@@ -358,6 +360,7 @@ def build_weights(
         w_up_scale_fp4=w_up_scale_fp4,
         w_down_scale_fp4=w_down_scale_fp4,
         flydsl_weight_layout=flydsl_weight_layout,
+        flydsl_gate_up_map=flydsl_gate_up_map,
         w_gate_fp8_ps=w_gate_fp8_ps,
         w_up_fp8_ps=w_up_fp8_ps,
         w_down_fp8_ps=w_down_fp8_ps,
@@ -452,6 +455,7 @@ def flydsl_fp8_moe_block(
         ),
         out=torch.empty((B, wp.shape.HIDDEN), dtype=BF16, device=hidden_states.device),
         weight_layout=wp.flydsl_weight_layout,
+        gate_up_map=wp.flydsl_gate_up_map,
     )
 
 
@@ -480,6 +484,7 @@ def flydsl_bf16_moe_block(
         ),
         out=torch.empty((B, wp.shape.HIDDEN), dtype=BF16, device=hidden_states.device),
         weight_layout=wp.flydsl_weight_layout,
+        gate_up_map=wp.flydsl_gate_up_map,
     )
 
 
@@ -513,6 +518,7 @@ def _flydsl_moe(
     intermediate=None,
     out=None,
     weight_layout: WeightLayout = WeightLayout.PRESHUFFLED,
+    gate_up_map: str = "native",
 ):
     """Combined FlyDSL warp-decode MoE (gate_up + down) with bench scale layouts."""
     assert router_ids.dtype == I32, f"router_ids must be int32, got {router_ids.dtype}"
@@ -540,11 +546,20 @@ def _flydsl_moe(
         intermediate=intermediate,
         out=out,
         weight_layout=weight_layout,
+        gate_up_map=gate_up_map,
     )
 
 
 def _flydsl_gate_up_bf16(
-    x, w_gate, w_gate_scale, w_up, w_up_scale, router_ids, out, weight_layout
+    x,
+    w_gate,
+    w_gate_scale,
+    w_up,
+    w_up_scale,
+    router_ids,
+    out,
+    weight_layout,
+    gate_up_map="native",
 ):
     """Adapter for flydsl_warp_decode_gate_up (block2d)."""
     assert router_ids.dtype == I32, f"router_ids must be int32, got {router_ids.dtype}"
@@ -558,6 +573,7 @@ def _flydsl_gate_up_bf16(
         w_scale_mode="block2d",
         scale_block=_FLYDSL_SCALE_BLOCK,
         weight_layout=weight_layout,
+        gate_up_map=gate_up_map,
         out=out,
     )
 
@@ -572,6 +588,7 @@ def _flydsl_gate_up_fp8act(
     router_ids,
     out,
     weight_layout,
+    gate_up_map="native",
 ):
     """Adapter for flydsl_warp_decode_gate_up_fp8act."""
     assert router_ids.dtype == I32, f"router_ids must be int32, got {router_ids.dtype}"
@@ -587,6 +604,7 @@ def _flydsl_gate_up_fp8act(
         _flydsl_block2d_scale(w_up_scale),
         scale_block=_FLYDSL_SCALE_BLOCK,
         weight_layout=weight_layout,
+        gate_up_map=gate_up_map,
         out=out,
     )
 
@@ -611,7 +629,15 @@ def _flydsl_down(
 
 
 def _flydsl_gate_up_fp4(
-    x, w_gate, w_gate_scale, w_up, w_up_scale, router_ids, out, weight_layout
+    x,
+    w_gate,
+    w_gate_scale,
+    w_up,
+    w_up_scale,
+    router_ids,
+    out,
+    weight_layout,
+    gate_up_map="native",
 ):
     """Adapter for flydsl_warp_decode_gate_up_fp4 (E8M0 Block2D<1,32>)."""
     assert router_ids.dtype == I32, f"router_ids must be int32, got {router_ids.dtype}"
@@ -625,6 +651,7 @@ def _flydsl_gate_up_fp4(
         w_up_scale.contiguous(),
         scale_block=_MXFP4_SCALE_BLOCK,
         weight_layout=weight_layout,
+        gate_up_map=gate_up_map,
         out=out,
     )
 
@@ -671,6 +698,7 @@ def flydsl_fp4_moe_block(
         ),
         out=torch.empty((B, wp.shape.HIDDEN), dtype=BF16, device=hidden_states.device),
         weight_layout=wp.flydsl_weight_layout,
+        gate_up_map=wp.flydsl_gate_up_map,
     )
 
 
@@ -924,6 +952,7 @@ def bench_flydsl_fp8(
                 intermediate=inter,
                 out=y,
                 weight_layout=layout,
+                gate_up_map=wp.flydsl_gate_up_map,
             )
 
         _, tt.core_us = _time_rotated(core, rid_list, iters, warmup)
@@ -939,6 +968,7 @@ def bench_flydsl_fp8(
                 rid,
                 inter,
                 layout,
+                wp.flydsl_gate_up_map,
             ),
             rid_list,
             iters,
@@ -975,6 +1005,7 @@ def bench_flydsl_fp8(
             router_ids,
             inter,
             layout,
+            wp.flydsl_gate_up_map,
             iters=iters,
             warmup=warmup,
         )
@@ -1047,6 +1078,7 @@ def bench_flydsl_bf16(
                 intermediate=inter,
                 out=y,
                 weight_layout=layout,
+                gate_up_map=wp.flydsl_gate_up_map,
             )
 
         _, tt.core_us = _time_rotated(core, rid_list, iters, warmup)
@@ -1061,6 +1093,7 @@ def bench_flydsl_bf16(
                 rid,
                 inter,
                 layout,
+                wp.flydsl_gate_up_map,
             ),
             rid_list,
             iters,
@@ -1096,6 +1129,7 @@ def bench_flydsl_bf16(
             router_ids,
             inter,
             layout,
+            wp.flydsl_gate_up_map,
             iters=iters,
             warmup=warmup,
         )
@@ -1164,6 +1198,7 @@ def bench_flydsl_fp4(
                 intermediate=inter,
                 out=y,
                 weight_layout=layout,
+                gate_up_map=wp.flydsl_gate_up_map,
             )
 
         _, tt.core_us = _time_rotated(core, rid_list, iters, warmup)
@@ -1178,6 +1213,7 @@ def bench_flydsl_fp4(
                 rid,
                 inter,
                 layout,
+                wp.flydsl_gate_up_map,
             ),
             rid_list,
             iters,
@@ -1213,6 +1249,7 @@ def bench_flydsl_fp4(
             router_ids,
             inter,
             layout,
+            wp.flydsl_gate_up_map,
             iters=iters,
             warmup=warmup,
         )
@@ -1294,6 +1331,7 @@ def _provenance(args) -> str:
             f"flydsl: {getattr(flydsl, '__version__', '?')}",
             f"iters={args.iters} warmup={args.warmup} batches={list(args.batches)} shapes={list(args.shapes)}",
             f"flydsl_weight_layout={args.flydsl_weight_layout}",
+            f"flydsl_gate_up_map={args.flydsl_gate_up_map}",
             "policy: default-vs-default (each path uses its own shipped defaults)",
             "path configs:",
             *[f"  {p}: {path_cfg[p]}" for p in HEADLINE_PATHS],
@@ -1363,6 +1401,7 @@ def sweep(args):
             shape,
             device=device,
             flydsl_weight_layout=WeightLayout(args.flydsl_weight_layout),
+            flydsl_gate_up_map=args.flydsl_gate_up_map,
         )
         path_cfg = _path_config(wp.flydsl_weight_layout)
         torch.cuda.synchronize()
@@ -1538,6 +1577,12 @@ def main():
         choices=[WeightLayout.K_CONTIGUOUS.value, WeightLayout.PRESHUFFLED.value],
         default=WeightLayout.PRESHUFFLED.value,
         help="FlyDSL B layout. Default preshuffled (native 16x4); k_contiguous is gather.",
+    )
+    ap.add_argument(
+        "--flydsl-gate-up-map",
+        choices=["native", "gather"],
+        default="native",
+        help="Gate/up work map for preshuffled weights; down remains native.",
     )
     ap.add_argument(
         "--no-correctness",

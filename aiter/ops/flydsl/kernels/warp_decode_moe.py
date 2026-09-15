@@ -995,6 +995,7 @@ def build_gate_up_fp8_module(
     num_experts: int | None = None,
     dot2_acc: int = 1,
     preshuffled: bool = False,
+    preshuffled_native: bool = True,
     interleave_gate_up: bool = True,
     k_batch: int = 1,
 ):
@@ -1014,7 +1015,7 @@ def build_gate_up_fp8_module(
       * router_ids   [B, TOPK]           int32
       * out (inter)  [B, TOPK, INTER]    bf16      (row = b*TOPK + k)
     """
-    if preshuffled:
+    if preshuffled and preshuffled_native:
         return _build_gate_up_fp8_preshuffled_native(
             hidden,
             inter,
@@ -1430,6 +1431,7 @@ def build_gate_up_fp8_act_module(
     scale_bxk: int | None = None,
     num_experts: int | None = None,
     preshuffled: bool = False,
+    preshuffled_native: bool = True,
     k_batch: int = 1,
 ):
     """Build the gate_up launcher with **FP8 activation** (CK ``gate_fp8_d2`` peer).
@@ -1444,7 +1446,7 @@ def build_gate_up_fp8_act_module(
     """
     if scale_bxk is None:
         scale_bxk = scale_bk
-    if preshuffled:
+    if preshuffled and preshuffled_native:
         return _build_gate_up_fp8_act_preshuffled_native(
             hidden,
             inter,
@@ -2152,6 +2154,7 @@ def build_gate_up_fp4_module(
     scale_bk: int = 32,
     dot2_acc: int = 1,
     preshuffled: bool = False,
+    preshuffled_native: bool = True,
     interleave_gate_up: bool = True,
     k_batch: int = 1,
 ):
@@ -2189,7 +2192,7 @@ def build_gate_up_fp4_module(
       * router_ids   [B, TOPK]               int32
       * out (inter)  [B, TOPK, INTER]        bf16      (row = b*TOPK + k)
     """
-    if preshuffled:
+    if preshuffled and preshuffled_native:
         return _build_gate_up_fp4_preshuffled_native(
             hidden,
             inter,
@@ -2851,6 +2854,7 @@ def build_gate_up_bf16_module(
     serialize_dot2: bool = True,
     use_dot2: bool = True,
     preshuffled: bool = False,
+    preshuffled_native: bool = True,
     k_batch: int = 1,
 ):
     """Build the gate_up launcher with **BF16 weights** (BF16 activation too).
@@ -2868,7 +2872,7 @@ def build_gate_up_bf16_module(
       * router_ids   [B, TOPK]           int32
       * out (inter)  [B, TOPK, INTER]    bf16   (row = b*TOPK + k)
     """
-    if preshuffled:
+    if preshuffled and preshuffled_native:
         return _build_gate_up_bf16_preshuffled_native(
             hidden,
             inter,

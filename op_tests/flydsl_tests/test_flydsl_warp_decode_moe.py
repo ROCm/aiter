@@ -1417,22 +1417,35 @@ def _assert_match_k_contiguous(out_k, out_p, *, what: str, thresh: float = 0.999
 
 @pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
 def test_preshuffled_fp8_gate_up_matches_k_contiguous():
-    """Lane kpack gather on shuffled B matches k_contiguous v_dot2."""
+    """Native and fat-grid gather maps on shuffled B match k-contiguous."""
     _name, B, HIDDEN, INTER, E, TOPK, mode, scale_block = GATE_UP_CASES[2]
     x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
         B, HIDDEN, INTER, E, TOPK, mode, scale_block
     )
     out_k = flydsl_warp_decode_gate_up(x, w_gate, w_up, router_ids, wgs, wus)
-    out_p = flydsl_warp_decode_gate_up(
+    w_gate_p = _shuffle_warp_decode_b(w_gate)
+    w_up_p = _shuffle_warp_decode_b(w_up)
+    out_native = flydsl_warp_decode_gate_up(
         x,
-        _shuffle_warp_decode_b(w_gate),
-        _shuffle_warp_decode_b(w_up),
+        w_gate_p,
+        w_up_p,
         router_ids,
         wgs,
         wus,
         weight_layout=WeightLayout.PRESHUFFLED,
     )
-    _assert_match_k_contiguous(out_k, out_p, what="fp8 gate_up")
+    out_gather = flydsl_warp_decode_gate_up(
+        x,
+        w_gate_p,
+        w_up_p,
+        router_ids,
+        wgs,
+        wus,
+        weight_layout=WeightLayout.PRESHUFFLED,
+        gate_up_map="gather",
+    )
+    _assert_match_k_contiguous(out_k, out_native, what="fp8 gate_up native")
+    _assert_match_k_contiguous(out_k, out_gather, what="fp8 gate_up gather")
 
 
 @pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
@@ -1467,11 +1480,14 @@ def test_preshuffled_fp8_combined_matches_k_contiguous():
     out_k = flydsl_warp_decode_moe(
         x, w_gate, w_up, w_down, router_ids, router_wts, wgs, wus, wds
     )
-    out_p = flydsl_warp_decode_moe(
+    w_gate_p = _shuffle_warp_decode_b(w_gate)
+    w_up_p = _shuffle_warp_decode_b(w_up)
+    w_down_p = _shuffle_warp_decode_b(w_down)
+    out_native = flydsl_warp_decode_moe(
         x,
-        _shuffle_warp_decode_b(w_gate),
-        _shuffle_warp_decode_b(w_up),
-        _shuffle_warp_decode_b(w_down),
+        w_gate_p,
+        w_up_p,
+        w_down_p,
         router_ids,
         router_wts,
         wgs,
@@ -1479,7 +1495,21 @@ def test_preshuffled_fp8_combined_matches_k_contiguous():
         wds,
         weight_layout=WeightLayout.PRESHUFFLED,
     )
-    _assert_match_k_contiguous(out_k, out_p, what="fp8 combined")
+    out_gather = flydsl_warp_decode_moe(
+        x,
+        w_gate_p,
+        w_up_p,
+        w_down_p,
+        router_ids,
+        router_wts,
+        wgs,
+        wus,
+        wds,
+        weight_layout=WeightLayout.PRESHUFFLED,
+        gate_up_map="gather",
+    )
+    _assert_match_k_contiguous(out_k, out_native, what="fp8 combined native")
+    _assert_match_k_contiguous(out_k, out_gather, what="fp8 combined gather")
 
 
 def test_preshuffled_bf16_matches_k_contiguous():
@@ -1514,17 +1544,31 @@ def test_preshuffled_fp4_matches_k_contiguous():
     g_k = flydsl_warp_decode_gate_up_fp4(
         x, w_gate, w_up, router_ids, wgs, wus, kvector=kvector
     )
-    g_p = flydsl_warp_decode_gate_up_fp4(
+    w_gate_p = _shuffle_warp_decode_b(w_gate, mxfp4=True)
+    w_up_p = _shuffle_warp_decode_b(w_up, mxfp4=True)
+    g_native = flydsl_warp_decode_gate_up_fp4(
         x,
-        _shuffle_warp_decode_b(w_gate, mxfp4=True),
-        _shuffle_warp_decode_b(w_up, mxfp4=True),
+        w_gate_p,
+        w_up_p,
         router_ids,
         wgs,
         wus,
         kvector=kvector,
         weight_layout=WeightLayout.PRESHUFFLED,
     )
-    _assert_match_k_contiguous(g_k, g_p, what="fp4 gate_up")
+    g_gather = flydsl_warp_decode_gate_up_fp4(
+        x,
+        w_gate_p,
+        w_up_p,
+        router_ids,
+        wgs,
+        wus,
+        kvector=kvector,
+        weight_layout=WeightLayout.PRESHUFFLED,
+        gate_up_map="gather",
+    )
+    _assert_match_k_contiguous(g_k, g_native, what="fp4 gate_up native")
+    _assert_match_k_contiguous(g_k, g_gather, what="fp4 gate_up gather")
     name, B, INTER, HIDDEN, E, TOPK, kvector = DOWN_FP4_CASES[0]
     del name
     inter, w_down, w_scale, router_ids, router_wts, _deq = _gen_down_fp4(
@@ -2679,6 +2723,7 @@ def bench_gate_up_cold(
     num_iters,
     num_warmup,
     weight_layout=WeightLayout.K_CONTIGUOUS,
+    gate_up_map="native",
 ):
     """Cold-HBM A/B: FP4 vs FP8 `gate_up` at real E, router rotated over the pool.
 
@@ -2715,6 +2760,7 @@ def bench_gate_up_cold(
         wus,
         scale_block=(1, _MXFP4_BK),
         weight_layout=weight_layout,
+        gate_up_map=gate_up_map,
         out=out,
     )
     got4 = entry4(rid_list[0])
@@ -2750,6 +2796,7 @@ def bench_gate_up_cold(
             w_scale_mode="block2d",
             scale_block=_FP8_SCALE_BLOCK,
             weight_layout=weight_layout,
+            gate_up_map=gate_up_map,
             out=out8,
         )
         got8 = entry8(rid_list8[0])
@@ -2797,6 +2844,7 @@ def bench_gate_up_cold(
             wusa,
             scale_block=_FP8_SCALE_BLOCK,
             weight_layout=weight_layout,
+            gate_up_map=gate_up_map,
             out=outa,
         )
         gota = entrya(rid_lista[0])

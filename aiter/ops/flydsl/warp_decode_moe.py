@@ -45,6 +45,13 @@ class WeightLayout(str, Enum):
     PRESHUFFLED = "preshuffled"
 
 
+class GateUpMap(str, Enum):
+    """Work mapping used by gate/up when weights are preshuffled."""
+
+    NATIVE = "native"
+    GATHER = "gather"
+
+
 @dataclass(frozen=True)
 class _PreshuffleBSpec:
     """Pinned fused-MoE B contract (CDNA ``shuffle_weight``, not gfx1250 WMMA).
@@ -100,6 +107,25 @@ def _parse_weight_layout(weight_layout: str | WeightLayout) -> WeightLayout:
         ) from error
 
 
+def _parse_gate_up_map(gate_up_map: str | GateUpMap) -> GateUpMap:
+    try:
+        return GateUpMap(gate_up_map)
+    except ValueError as error:
+        raise ValueError(
+            f"unsupported gate_up_map: {gate_up_map!r} "
+            f"(expected {GateUpMap.NATIVE.value!r} or {GateUpMap.GATHER.value!r})"
+        ) from error
+
+
+def _native_gate_up_flag(
+    weight_layout: WeightLayout, gate_up_map: str | GateUpMap
+) -> bool:
+    gate_up_map = _parse_gate_up_map(gate_up_map)
+    if weight_layout is WeightLayout.K_CONTIGUOUS:
+        return False
+    return gate_up_map is GateUpMap.NATIVE
+
+
 def _require_preshuffled_b_shape(
     weight_layout: WeightLayout,
     *,
@@ -148,6 +174,7 @@ def _get_gate_up(
     num_experts,
     dot2_acc,
     preshuffled,
+    preshuffled_native,
     interleave_gate_up,
     k_batch,
 ):
@@ -163,6 +190,7 @@ def _get_gate_up(
         num_experts=num_experts,
         dot2_acc=dot2_acc,
         preshuffled=preshuffled,
+        preshuffled_native=preshuffled_native,
         interleave_gate_up=interleave_gate_up,
         k_batch=k_batch,
     )
@@ -212,6 +240,7 @@ def _get_gate_up_fp8_act(
     scale_bk,
     num_experts,
     preshuffled,
+    preshuffled_native,
     k_batch,
 ):
     return build_gate_up_fp8_act_module(
@@ -224,13 +253,22 @@ def _get_gate_up_fp8_act(
         scale_bk=scale_bk,
         num_experts=num_experts,
         preshuffled=preshuffled,
+        preshuffled_native=preshuffled_native,
         k_batch=k_batch,
     )
 
 
 @functools.lru_cache(maxsize=64)
 def _get_gate_up_bf16(
-    hidden, inter, top_k, kvector, serialize_dot2, use_dot2, preshuffled, k_batch
+    hidden,
+    inter,
+    top_k,
+    kvector,
+    serialize_dot2,
+    use_dot2,
+    preshuffled,
+    preshuffled_native,
+    k_batch,
 ):
     return build_gate_up_bf16_module(
         hidden,
@@ -240,6 +278,7 @@ def _get_gate_up_bf16(
         serialize_dot2=serialize_dot2,
         use_dot2=use_dot2,
         preshuffled=preshuffled,
+        preshuffled_native=preshuffled_native,
         k_batch=k_batch,
     )
 
@@ -271,6 +310,7 @@ def _get_gate_up_fp4(
     scale_bk,
     dot2_acc,
     preshuffled,
+    preshuffled_native,
     interleave_gate_up,
     k_batch,
 ):
@@ -284,6 +324,7 @@ def _get_gate_up_fp4(
         scale_bk=scale_bk,
         dot2_acc=dot2_acc,
         preshuffled=preshuffled,
+        preshuffled_native=preshuffled_native,
         interleave_gate_up=interleave_gate_up,
         k_batch=k_batch,
     )
@@ -440,6 +481,7 @@ def flydsl_warp_decode_gate_up(
     dot2_acc: int = 1,
     interleave_gate_up: bool = True,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    gate_up_map: str | GateUpMap = GateUpMap.NATIVE,
     split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -472,6 +514,9 @@ def flydsl_warp_decode_gate_up(
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
             from strides.
+        gate_up_map: ``native`` (default, 16 output rows/wave) or ``gather``
+            (one output row/wave) for preshuffled weights. K-contiguous always
+            uses gather.
         split_k: Native ``k0`` occupancy split. ``"auto"`` (default) is ``1``
             (Qwen B=1 ``k=2/4`` lost the G9 A/B). ``1`` is the direct silu
             store. ``>1`` atomic-adds gate/up partials (preshuffled only).
@@ -511,13 +556,14 @@ def flydsl_warp_decode_gate_up(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     preshuffled = _preshuffled_flag(weight_layout)
+    preshuffled_native = _native_gate_up_flag(weight_layout, gate_up_map)
     k_batch = _resolve_gate_up_k_batch(
         split_k,
         B=B,
         INTER=INTER,
         TOPK=TOPK,
         num_kpack=HIDDEN // 64,
-        preshuffled=preshuffled,
+        preshuffled=preshuffled_native,
         device=x.device,
     )
     launcher = _get_gate_up(
@@ -532,6 +578,7 @@ def flydsl_warp_decode_gate_up(
         E,
         dot2_acc,
         preshuffled,
+        preshuffled_native,
         interleave_gate_up,
         k_batch,
     )
@@ -566,6 +613,7 @@ def flydsl_warp_decode_gate_up_fp8act(
     x_scale_bk: int = 128,
     serialize_dot2: bool = True,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    gate_up_map: str | GateUpMap = GateUpMap.NATIVE,
     split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -590,6 +638,8 @@ def flydsl_warp_decode_gate_up_fp8act(
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
             from strides.
+        gate_up_map: ``native`` (default) or fat-grid ``gather`` for
+            preshuffled gate/up. K-contiguous always uses gather.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -624,13 +674,14 @@ def flydsl_warp_decode_gate_up_fp8act(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     preshuffled = _preshuffled_flag(weight_layout)
+    preshuffled_native = _native_gate_up_flag(weight_layout, gate_up_map)
     k_batch = _resolve_gate_up_k_batch(
         split_k,
         B=B,
         INTER=INTER,
         TOPK=TOPK,
         num_kpack=HIDDEN // 64,
-        preshuffled=preshuffled,
+        preshuffled=preshuffled_native,
         device=x.device,
     )
     launcher = _get_gate_up_fp8_act(
@@ -643,6 +694,7 @@ def flydsl_warp_decode_gate_up_fp8act(
         scale_bk,
         E,
         preshuffled,
+        preshuffled_native,
         k_batch,
     )
     return _run_native_gate_up(
@@ -678,6 +730,7 @@ def flydsl_warp_decode_gate_up_fp4(
     interleave_gate_up: bool = True,
     kvector: int | None = None,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    gate_up_map: str | GateUpMap = GateUpMap.NATIVE,
     split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -707,6 +760,8 @@ def flydsl_warp_decode_gate_up_fp4(
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
             from strides.
+        gate_up_map: ``native`` (default) or fat-grid ``gather`` for
+            preshuffled gate/up. K-contiguous always uses gather.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -742,13 +797,14 @@ def flydsl_warp_decode_gate_up_fp4(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     preshuffled = _preshuffled_flag(weight_layout)
+    preshuffled_native = _native_gate_up_flag(weight_layout, gate_up_map)
     k_batch = _resolve_gate_up_k_batch(
         split_k,
         B=B,
         INTER=INTER,
         TOPK=TOPK,
         num_kpack=HIDDEN // 128,
-        preshuffled=preshuffled,
+        preshuffled=preshuffled_native,
         device=x.device,
     )
     launcher = _get_gate_up_fp4(
@@ -761,6 +817,7 @@ def flydsl_warp_decode_gate_up_fp4(
         scale_bk,
         dot2_acc,
         preshuffled,
+        preshuffled_native,
         interleave_gate_up,
         k_batch,
     )
@@ -934,6 +991,7 @@ def flydsl_warp_decode_gate_up_bf16(
     serialize_dot2: bool = True,
     use_dot2: bool | None = None,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    gate_up_map: str | GateUpMap = GateUpMap.NATIVE,
     split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -956,6 +1014,8 @@ def flydsl_warp_decode_gate_up_bf16(
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
             from strides.
+        gate_up_map: ``native`` (default) or fat-grid ``gather`` for
+            preshuffled gate/up. K-contiguous always uses gather.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -986,13 +1046,14 @@ def flydsl_warp_decode_gate_up_bf16(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     preshuffled = _preshuffled_flag(weight_layout)
+    preshuffled_native = _native_gate_up_flag(weight_layout, gate_up_map)
     k_batch = _resolve_gate_up_k_batch(
         split_k,
         B=B,
         INTER=INTER,
         TOPK=TOPK,
         num_kpack=HIDDEN // 32,
-        preshuffled=preshuffled,
+        preshuffled=preshuffled_native,
         device=x.device,
     )
     launcher = _get_gate_up_bf16(
@@ -1003,6 +1064,7 @@ def flydsl_warp_decode_gate_up_bf16(
         serialize_dot2,
         use_dot2,
         preshuffled,
+        preshuffled_native,
         k_batch,
     )
     return _run_native_gate_up(
@@ -1270,6 +1332,7 @@ def flydsl_warp_decode_moe(
     gate_up_kwargs: dict | None = None,
     down_reduce_kwargs: dict | None = None,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    gate_up_map: str | GateUpMap = GateUpMap.NATIVE,
 ) -> torch.Tensor:
     """Run both stages of an unsorted, split-weight warp-decode MoE.
 
@@ -1295,7 +1358,9 @@ def flydsl_warp_decode_moe(
     ``[B, TOPK, INTER]`` and ``[B, HIDDEN]`` buffers respectively. Additional
     stage tuning options may be supplied through ``gate_up_kwargs`` and
     ``down_reduce_kwargs``; the wrapper owns their ``out`` and
-    ``weight_layout`` arguments.
+    ``weight_layout`` arguments. ``gate_up_map`` selects the native 16-row map
+    or the fat-grid gather map for preshuffled gate/up; down remains native on
+    legal preshuffled tiles.
     """
     weight_layout = _parse_weight_layout(weight_layout)
     assert (
@@ -1311,7 +1376,10 @@ def flydsl_warp_decode_moe(
         raise ValueError("pass intermediate=/out= to flydsl_warp_decode_moe")
     if "weight_layout" in gate_kwargs or "weight_layout" in down_kwargs:
         raise ValueError("pass weight_layout= to flydsl_warp_decode_moe")
+    if "gate_up_map" in gate_kwargs:
+        raise ValueError("pass gate_up_map= to flydsl_warp_decode_moe")
     gate_kwargs["weight_layout"] = weight_layout
+    gate_kwargs["gate_up_map"] = gate_up_map
     down_kwargs["weight_layout"] = weight_layout
 
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)

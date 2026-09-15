@@ -229,7 +229,7 @@ def load_flydsl_module():
     return mod
 
 
-def run_flydsl(mod, shapes, batches, iters, warmup, timing, weight_layout):
+def run_flydsl(mod, shapes, batches, iters, warmup, timing, weight_layout, gate_up_map):
     """Call the cold benches and melt merged rows into per-cell {key -> (us, cos)}."""
     records = {}
     for name in shapes:
@@ -265,6 +265,7 @@ def run_flydsl(mod, shapes, batches, iters, warmup, timing, weight_layout):
                 num_iters=iters,
                 num_warmup=warmup,
                 weight_layout=weight_layout,
+                gate_up_map=gate_up_map,
             )
             records[_key(H, I, E, K, B, "gate_up", "fp4", "bf16")] = (
                 gu.get("fp4_us"),
@@ -301,12 +302,21 @@ def run_backend_repeats(backend, shapes, batches, iters, cold, ck_bench, repeats
 
 
 def run_flydsl_repeats(
-    mod, shapes, batches, iters, warmup, timing, repeats, weight_layout
+    mod, shapes, batches, iters, warmup, timing, repeats, weight_layout, gate_up_map
 ):
     """Run the FlyDSL sweep `repeats` times; return {key -> ([us,...], cos)}."""
     agg: dict = {}
     for r in range(repeats):
-        records = run_flydsl(mod, shapes, batches, iters, warmup, timing, weight_layout)
+        records = run_flydsl(
+            mod,
+            shapes,
+            batches,
+            iters,
+            warmup,
+            timing,
+            weight_layout,
+            gate_up_map,
+        )
         for k, (us, cos) in records.items():
             lst, _ = agg.setdefault(k, ([], cos))
             lst.append(us)
@@ -515,6 +525,12 @@ def main() -> int:
         help="FlyDSL weight layout; CK remains k-contiguous (default: k_contiguous)",
     )
     ap.add_argument(
+        "--flydsl-gate-up-map",
+        default="native",
+        choices=["native", "gather"],
+        help="FlyDSL preshuffled gate/up work map (default: native)",
+    )
+    ap.add_argument(
         "--method", default="weight_stream", choices=["weight_stream", "total_traffic"]
     )
     ap.add_argument("--ck-bench", default=os.environ.get("CK_BENCH", CK_BENCH_DEFAULT))
@@ -579,6 +595,7 @@ def main() -> int:
             args.timing,
             args.repeats,
             args.flydsl_weight_layout,
+            args.flydsl_gate_up_map,
         )
     clk_summary = clk.summary()
 
@@ -595,6 +612,7 @@ def main() -> int:
         f"backend={args.backend}  ck_worktree={ck_worktree}",
         f"iters={args.iters} cold={args.cold} timing={args.timing} method={args.method} "
         f"repeats={args.repeats} flydsl_weight_layout={args.flydsl_weight_layout} "
+        f"flydsl_gate_up_map={args.flydsl_gate_up_map} "
         f"{args.backend}_weight_layout=k_contiguous",
         f"{args.backend} provenance: {peer_prov}",
         f"clocks: auto (unpinnable on this gfx950; D1) -- effective {clk_summary} on GPU "
