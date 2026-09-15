@@ -10,14 +10,14 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.common import load as _load
-from aiter.ops.flydsl.kernels.fmha_gfx950.paged_lds import (
+from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_epilog import DualwaveFp8StoreHelper
+from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_gemm import DualwaveFp8GemmHelper
+from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_lds import (
     DualwaveFp8KvGmemToLdsLoader,
     DualwaveFp8KvLdsToVgprLoader,
 )
-from aiter.ops.flydsl.kernels.fmha_gfx950.paged_ops import (
-    DualwaveFp8GemmHelper,
+from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_softmax import (
     DualwaveFp8SoftmaxHelper,
-    DualwaveFp8StoreHelper,
 )
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     PAGED_FP8_BUFFER_LIMIT_BYTES,
