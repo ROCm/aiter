@@ -49,6 +49,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 _CONFIG_NAME = "UNIFIED-ATTENTION"
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 
+# Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
 _ARCH_ALIAS = {
     "gfx1101": "gfx1100",
     "gfx1102": "gfx1100",
