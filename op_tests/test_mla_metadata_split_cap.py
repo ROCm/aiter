@@ -23,7 +23,6 @@ These are pure sizing queries -- no kernel is launched and no GPU work is done.
 """
 
 import pytest
-import torch
 
 import aiter
 from aiter import dtypes
@@ -31,10 +30,16 @@ from aiter import dtypes
 NHEAD = 128
 MAX_SEQLEN_QO = 4
 
-# Large enough that `cap * batch_size` exceeds max_splits for every cap tested,
-# so no cap can constrain the schedule. Derived from the device rather than
-# hardcoded: max_splits tracks the CU count and differs across parts.
-_LARGE_BATCH = 512
+# Large enough that no cap can constrain the schedule, AND that the saturated
+# fast-mode estimate sits below `tile_cnt + max_splits` so the min() picks the
+# fast-mode side. Both premises scale with max_splits, which tracks the CU count
+# and differs across parts -- 512 satisfies them on gfx950 (max_splits 256) but
+# NOT on gfx942 (304), where the capped bound comes out below the no-cap one and
+# the invariant below would fail. So derive it instead of hardcoding.
+_MAX_SPLITS = aiter.get_mla_decode_fwd_max_splits(
+    NHEAD, MAX_SEQLEN_QO, dtypes.fp8, dtypes.fp8
+)
+_LARGE_BATCH = 4 * _MAX_SPLITS
 
 
 def _reduce_partial_map_size(batch_size, max_split_per_batch, fast_mode=True):
@@ -141,3 +146,19 @@ def test_non_fast_mode_ignores_the_cap(batch_size):
             f"sizing, but get_mla_metadata_v1_1 does not honour a cap -- this "
             f"undersizes reduce_partial_map and faults the GPU"
         )
+
+
+def main():
+    """aiter's CI runs each op_tests module with `python3`, not pytest."""
+    for batch_size in (1, 8, 64):
+        test_a_cap_never_enlarges_the_allocation(batch_size)
+        test_a_tight_cap_actually_shrinks_the_allocation(batch_size)
+        test_non_fast_mode_ignores_the_cap(batch_size)
+    test_a_non_constraining_cap_does_not_change_the_size()
+    test_a_larger_cap_is_never_smaller_than_a_tighter_one()
+    test_no_cap_is_unchanged()
+    aiter.logger.info("mla metadata split-cap sizing tests: all passed")
+
+
+if __name__ == "__main__":
+    main()

@@ -203,4 +203,19 @@ def test_a_tight_buffer_matches_an_oversized_one(batch_size, cap, ctx_len, jitte
     ), f"batch={batch_size} cap={cap}: tight buffer differs from the roomy one"
 
 
+def main():
+    """aiter's CI runs each op_tests module with `python3`, not pytest."""
+    if not torch.cuda.is_available():
+        aiter.logger.warning("no GPU available; skipping metadata fill tests")
+        return
+    for row in ROWS:
+        batch_size, cap, ctx_len, jitter = row.values
+        test_the_planner_fits_the_sized_buffers(batch_size, cap, ctx_len, jitter)
+        test_the_fit_check_is_not_vacuous(batch_size, cap, ctx_len, jitter)
+        test_a_tight_buffer_matches_an_oversized_one(batch_size, cap, ctx_len, jitter)
+    test_the_tightest_allocation_does_not_overflow()
+    aiter.logger.info("mla metadata split-cap fill tests: all passed")
 
+
+if __name__ == "__main__":
+    main()
