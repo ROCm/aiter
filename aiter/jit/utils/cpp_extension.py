@@ -301,8 +301,15 @@ COMMON_HIP_FLAGS = [
 
 COMMON_HIPCC_FLAGS = [
     "-DCUDA_HAS_FP16=1",
-    "-D__HIP_NO_HALF_OPERATORS__=1",
-    "-D__HIP_NO_HALF_CONVERSIONS__=1",
+    # Undefine (do NOT force-define) the __half guards so JIT builds match the
+    # intent of aiter/jit/core.py, which already appends
+    # `-U__HIP_NO_HALF_OPERATORS__ -U__HIP_NO_HALF_CONVERSIONS__`. Force-defining
+    # them here (`=1`) disables every __half<->float conversion and breaks the
+    # cold JIT build of modules whose sources legitimately convert __half<->float
+    # (e.g. quant_mxfp4.cu, composable_kernel math_v2.hpp), causing
+    # ModuleNotFoundError at first use. See ROCm/hip#3764 and pytorch#163337.
+    "-U__HIP_NO_HALF_OPERATORS__",
+    "-U__HIP_NO_HALF_CONVERSIONS__",
     "-mcmodel=large",
     "-fno-unique-section-names",
     "-ffunction-sections",
