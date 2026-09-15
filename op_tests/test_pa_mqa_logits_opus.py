@@ -1,0 +1,921 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""MXFP4 paged MQA logits (OPUS, 32x32x64 MFMA) -- correctness and perf on gfx950.
+
+Emits three markdown tables: corner cases, the prefill sweep and the decode sweep.
+
+    python3 op_tests/test_pa_mqa_logits_opus.py                    # the full default sweep
+    python3 op_tests/test_pa_mqa_logits_opus.py -b 1 -s 8,1024,1   # a quick subset
+
+Correctness covers both compiled variants. The perf sweeps run each side at its OWN default
+``block_k`` -- ours 64, FlyDSL 256 -- which is what an untuned caller gets from either.
+
+WHY THIS TEST IS SHAPED THE WAY IT IS
+-------------------------------------
+The kernel's two E8M0 scale arrays carry a layout only it can read, and a wrong
+permutation of them is SILENT: the byte counts match every other fp4 scale layout, so
+the result is plausible-looking wrong logits rather than an error. Two consequences for
+this file, both deliberate:
+
+* **Every correctness case uses random data.** Uniform or all-ones inputs pass under any
+  permutation of K, because a dot product does not care what order it sums in. A
+  K-permutation bug is invisible to them and was historically found only on random data.
+* **FlyDSL is scored as a second opinion, not a nice-to-have.** It reads the SAME ``q``
+  and ``kv_cache`` bytes (our layout for those is byte-identical to its ABI) but builds
+  its scales in its OWN 16x16 layout from the same natural E8M0. So agreement between
+  the two is independent evidence that our scale permutation is right -- which the
+  dequantized reference alone cannot give, since it shares this file's understanding of
+  the layout. Both are checked.
+
+The reference is a dequantize-then-matmul in fp32 over the exact same quantized values
+the kernel sees, so it isolates layout and reduction from quantization error: `err` is
+expected at ~1e-6 (fp32 accumulation order), not at fp4 resolution.
+"""
+
+import argparse
+import itertools
+import math
+import random
+from dataclasses import dataclass
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.opus.pa_mqa_logits_opus import (
+    BLOCK_K_1WAVE,
+    compute_prefill_windows,
+    pa_mqa_logits_mxfp4_decode,
+    pa_mqa_logits_mxfp4_prefill,
+)
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+dev = "cuda"
+
+SUPPORTED_GFX = ["gfx950"]  # the kernel is gfx950-only; the wrapper enforces it too
+
+HEADS = 64
+HEAD_DIM = 128
+KV_BLOCK_SIZE = 64  # page size
+SCALE_BLOCK = 32  # E8M0 block
+WEIGHT_SCALE = 1.5
+
+# The 32x32x64 scale geometry: a lane's 4 E8M0 bytes live in one aligned dword, indexed
+# [.., g(K_CHUNKS), m(MFMA_N), byte]. See the wrapper's module docstring.
+K_TILES = HEAD_DIM // 64  # 2  (MFMA_K = 64)
+K_CHUNKS = 64 // SCALE_BLOCK  # 2  (32-K chunks per k-tile)
+MFMA_N = 32
+SCALE_BYTES = 4  # K_TILES * M_TILES == K_TILES * N_TILES == 4
+BLOCKS_ROW = HEAD_DIM // SCALE_BLOCK  # 4 natural E8M0 blocks per row
+
+# FlyDSL's own (16x16x128) scale geometry, used only to build its inputs.
+FLY_MFMA_M = 16
+FLY_KVS_NTPW = 4
+
+COMPILED_BLOCK_KS = (64, 256)  # the two compiled variants: 1 wave/CTA and 4
+FLYDSL_DEFAULT_BLOCK_K = (
+    256  # what FlyDSL's own signature defaults to, and what ATOM runs
+)
+# block_tables / max_seq_len / out are sized from the LARGER block_k whichever variant is
+# timed, because the two round up differently -- an 841-token window needs 14 pages at 64
+# but 16 at 256 -- so sizing from the active one would either under-size the other side or
+# hand the two candidates a different `out` footprint, and hence different store traffic.
+SIZING_BLOCK_K = max(COMPILED_BLOCK_KS)
+PREFILL_TOTAL_QLEN = 16384
+PREFILL_QMIN = 800
+DECODE_CTA_TARGET = 1024
+N_COS_SAMPLE = 8
+
+# Not a command-line knob on purpose: readings taken at different iteration counts are
+# not comparable on this kernel (20/5 reads ~4.6% faster than 50/10 on the short shapes,
+# a clean bias rather than noise), so the budget is pinned here.
+PERF_ITERS = 50
+PERF_WARMUP = 10
+
+# Per-row / per-page byte counts, for the traffic denominator (see `roofline_bytes`).
+Q_ROW_BYTES = HEADS * HEAD_DIM // 2  # 4096: one packed fp4 query row
+QS_ROW_BYTES = K_CHUNKS * MFMA_N * SCALE_BYTES  # 256: its E8M0 scales
+W_ROW_BYTES = HEADS * 2  # 128: bf16 per-head weights
+KV_PAGE_BYTES = KV_BLOCK_SIZE * HEAD_DIM // 2  # 4096: one packed fp4 page
+KVS_PAGE_BYTES = K_CHUNKS * MFMA_N * SCALE_BYTES  # 256: its E8M0 scales
+
+FP4_E2M1_MAX = 6.0
+_FP4_GRID_VALUES = [
+    -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+    0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+]  # fmt: skip
+_E2M1_LUT = [0xF, 0xE, 0xD, 0xC, 0xB, 0xA, 0x9, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7]
+_E2M1_INV_LUT = [7, 8, 9, 10, 11, 12, 13, 14, 7, 6, 5, 4, 3, 2, 1, 0]
+
+
+# ── MXFP4 quant / dequant ─────────────────────────────────────────────────────
+def fp4_quant(x, block_size=SCALE_BLOCK):
+    """[..., d] float -> (packed nibbles [..., d/2] uint8, e8m0 [..., d/block] uint8).
+
+    Low nibble = even element, matching the kernel and the FlyDSL fp4 ABI.
+    """
+    *prefix, d = x.shape
+    assert d % block_size == 0
+    x_blk = x.float().reshape(*prefix, d // block_size, block_size)
+    amax = x_blk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    exp_biased = (
+        (torch.ceil(torch.log2(amax / FP4_E2M1_MAX)) + 127.0)
+        .clamp(0.0, 255.0)
+        .to(torch.uint8)
+    )
+    e8m0 = exp_biased.squeeze(-1).contiguous()
+    x_scaled = x_blk / torch.pow(2.0, exp_biased.float() - 127.0)
+    grid = torch.tensor(_FP4_GRID_VALUES, dtype=torch.float32, device=x.device)
+    idx = (x_scaled.unsqueeze(-1) - grid).abs().argmin(dim=-1)
+    lut = torch.tensor(_E2M1_LUT, dtype=torch.uint8, device=x.device)
+    nibbles = lut[idx].reshape(*prefix, d)
+    packed = (nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)).to(torch.uint8)
+    return packed.contiguous(), e8m0
+
+
+def fp4_dequant(packed, e8m0, block_size=SCALE_BLOCK):
+    *prefix, d_half = packed.shape
+    d = d_half * 2
+    nibbles = torch.empty(*prefix, d, dtype=torch.uint8, device=packed.device)
+    nibbles[..., 0::2] = packed & 0xF
+    nibbles[..., 1::2] = (packed >> 4) & 0xF
+    inv = torch.tensor(_E2M1_INV_LUT, dtype=torch.long, device=packed.device)
+    grid = torch.tensor(_FP4_GRID_VALUES, dtype=torch.float32, device=packed.device)
+    vals = grid[inv[nibbles.long()]]
+    scale = torch.pow(2.0, e8m0.float() - 127.0)
+    return (
+        vals.reshape(*prefix, d // block_size, block_size) * scale.unsqueeze(-1)
+    ).reshape(*prefix, d)
+
+
+# ── the two scale layouts, from one natural E8M0 array ────────────────────────
+# Natural E8M0 is [rows, BLOCKS_ROW] with block b covering K[32b : 32b+32]. Both
+# shuffles below are pure permutations of it; neither drops or duplicates a byte.
+def scale_to_opus(e8_nat, rows_per_group):
+    """[rows, 4] -> [rows/rows_per_group, K_CHUNKS, MFMA_N, SCALE_BYTES].
+
+    `rows_per_group` is MFMA_N * n_tiles: 64 heads per query row for q_scale, 64 page
+    tokens per block for kv_scale. Within a group, row index i splits as
+    (tile, m) = divmod(i, MFMA_N) and block b as (kt, g) = divmod(b, K_CHUNKS); the
+    byte index is kt * n_tiles + tile.
+    """
+    n_tiles = rows_per_group // MFMA_N
+    groups = e8_nat.shape[0] // rows_per_group
+    return (
+        e8_nat.reshape(groups, n_tiles, MFMA_N, K_TILES, K_CHUNKS)
+        .permute(0, 4, 2, 3, 1)  # [group, g, m, kt, tile]
+        .reshape(groups, K_CHUNKS, MFMA_N, SCALE_BYTES)
+        .contiguous()
+    )
+
+
+def q_scale_flydsl(e8_nat, total_tokens):
+    """[T*H, 4] -> FlyDSL's [T, K_TILES_16, 4, 16, QS_PAD]; K_TILES_16 = D/128 = 1."""
+    m_tiles = HEADS // FLY_MFMA_M  # 4
+    qs_pad = ((m_tiles + 3) // 4) * 4
+    qe = (
+        e8_nat.reshape(total_tokens, m_tiles, FLY_MFMA_M, HEAD_DIM // 128, 4)
+        .permute(0, 3, 4, 2, 1)  # [T, K_TILES_16, 4, 16, M_TILES]
+        .contiguous()
+    )
+    return F.pad(qe, (0, qs_pad - m_tiles)).contiguous()
+
+
+def kv_scale_flydsl(e8_nat, num_blocks):
+    """[num_blocks*PAGE, 4] -> FlyDSL's [num_blocks, 1, 4, PAGE], sflat=(o%16)*4+(o//16)."""
+    o = torch.arange(KV_BLOCK_SIZE, device=e8_nat.device)
+    sflat = (o % FLY_MFMA_M) * FLY_KVS_NTPW + (o // FLY_MFMA_M)
+    out = torch.zeros(
+        num_blocks, 1, 4, KV_BLOCK_SIZE, dtype=torch.uint8, device=e8_nat.device
+    )
+    # src[blk, b, o] = e8m0(token o of page blk, block b); the advanced index on the
+    # last axis sends token o to slot sflat[o], leaving the other axes in place.
+    src = e8_nat.reshape(num_blocks, KV_BLOCK_SIZE, 4).permute(0, 2, 1)  # [nb, 4, PAGE]
+    out[:, 0, :, sflat] = src
+    return out.contiguous()
+
+
+# ── input builders ────────────────────────────────────────────────────────────
+@dataclass
+class Inputs:
+    q_packed: torch.Tensor  # [T, H, D/2]  natural
+    q_scale: torch.Tensor  # [T, 2, 32, 4] opus
+    q_scale_fly: torch.Tensor  # FlyDSL layout
+    q_dq: torch.Tensor  # [T, H, D]  dequantized, for the reference
+    weights: torch.Tensor  # [T, H] bf16 natural
+    kv_cache: torch.Tensor  # [num_blocks, 4, PAGE, 16]  FlyDSL/opus shared
+    kv_scale: torch.Tensor  # [num_blocks, 2, 32, 4] opus
+    kv_scale_fly: torch.Tensor
+    kv_dq: torch.Tensor  # [bs, t_max, D] dequantized
+    block_tables: torch.Tensor
+    max_seq_len: int
+
+
+def pages_for(max_end, block_k):
+    """Pages per sequence, rounded so a CTA never indexes past the table."""
+    chunks = max(1, (max_end + block_k - 1) // block_k)
+    return max(KV_BLOCK_SIZE // KV_BLOCK_SIZE, chunks * (block_k // KV_BLOCK_SIZE))
+
+
+def build_inputs(bs, max_end, total_tokens, block_k, seed):
+    g = torch.Generator(device=dev).manual_seed(seed)
+    mbps = pages_for(max_end, block_k)
+    t_max = mbps * KV_BLOCK_SIZE
+    num_blocks = bs * mbps
+
+    # --- KV: quantize natural rows, then write the two layouts -------------
+    kv = torch.randn(bs * t_max, HEAD_DIM, generator=g, device=dev, dtype=torch.float32)
+    kv_packed, kv_e8 = fp4_quant(kv)
+    kv_dq = fp4_dequant(kv_packed, kv_e8).reshape(bs, t_max, HEAD_DIM)
+    # kv_cache[blk, b, o, :] = 16 packed bytes of K[token o][32b:32b+32].
+    kv_cache = (
+        kv_packed.reshape(num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW, 16)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    kv_scale = scale_to_opus(kv_e8, KV_BLOCK_SIZE)
+    kv_scale_fly = kv_scale_flydsl(kv_e8, num_blocks)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=dev).reshape(
+        bs, mbps
+    )
+
+    # --- Q + weights ------------------------------------------------------
+    q = torch.randn(
+        total_tokens * HEADS, HEAD_DIM, generator=g, device=dev, dtype=torch.float32
+    )
+    q_packed_flat, q_e8 = fp4_quant(q)
+    q_dq = fp4_dequant(q_packed_flat, q_e8).reshape(total_tokens, HEADS, HEAD_DIM)
+    q_packed = q_packed_flat.reshape(total_tokens, HEADS, HEAD_DIM // 2).contiguous()
+    q_scale = scale_to_opus(q_e8, HEADS)
+    weights = torch.randn(
+        total_tokens, HEADS, generator=g, device=dev, dtype=torch.float32
+    ).to(torch.bfloat16)
+
+    return Inputs(
+        q_packed=q_packed,
+        q_scale=q_scale,
+        q_scale_fly=q_scale_flydsl(q_e8, total_tokens),
+        q_dq=q_dq,
+        weights=weights,
+        kv_cache=kv_cache,
+        kv_scale=kv_scale,
+        kv_scale_fly=kv_scale_fly,
+        kv_dq=kv_dq,
+        block_tables=block_tables,
+        max_seq_len=t_max,
+    )
+
+
+# ── reference ─────────────────────────────────────────────────────────────────
+def ref_rows(inp, rows, rb, ls, le):
+    """Reference logits for a few sampled rows: {row: (start, end, [values])}."""
+    w = inp.weights.float()
+    ref = {}
+    for r in rows:
+        b, s, e = int(rb[r]), int(ls[r]), int(le[r])
+        if e <= s:
+            ref[r] = (s, e, None)
+            continue
+        k = inp.kv_dq[b, s:e]  # [n, D]
+        scores = torch.relu(inp.q_dq[r] @ k.T)  # [H, n]
+        ref[r] = (s, e, (scores * w[r, :, None]).sum(0) * WEIGHT_SCALE)
+    return ref
+
+
+def check_rows(out, ref, msg):
+    """`checkAllclose` over the in-window cells of the sampled rows.
+
+    Every row has a different window, so they are concatenated into one flat pair rather
+    than compared as a rectangle. The bound is relative: a logit is a signed sum over 64
+    heads of a 128-long dot product, so the values run to ~1e4 and `atol` is there only
+    for the cells the weights cancel to near zero, where a relative bound says nothing.
+    """
+    got, want = [], []
+    for r, (s, e, vals) in ref.items():
+        if vals is None:
+            continue
+        got.append(out[r, s:e].float())
+        want.append(vals.float())
+    if not got:
+        return 0.0
+    return checkAllclose(
+        torch.cat(want), torch.cat(got), rtol=2e-5, atol=1e-2, msg=msg, printLog=False
+    )
+
+
+def roofline_bytes(rb, le, total_q, n_logits):
+    """Bytes a launch must move at least once -- NOT one K vector per output logit.
+
+    The per-logit count is what a naive roofline gives and it is meaningless here: every
+    query row of a batch scores against the same KV pages, so on a long-context shape it
+    implies a ~14000x reuse factor and reports a "TB/s" above the card's HBM peak.
+    Counting each page once instead makes the figure a lower bound on real traffic, which
+    is the reading that can be held against a hardware limit.
+    """
+    if rb.numel() == 0:
+        return 0
+    ends = torch.zeros(int(rb.max().item()) + 1, dtype=torch.int64, device=rb.device)
+    ends.scatter_reduce_(0, rb.long(), le.long().clamp(min=0), reduce="amax")
+    pages = int(((ends + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE).sum().item())
+    return (
+        total_q * (Q_ROW_BYTES + QS_ROW_BYTES + W_ROW_BYTES)
+        + pages * (KV_PAGE_BYTES + KVS_PAGE_BYTES)
+        + n_logits * 4
+    )
+
+
+def oob_is_neginf(out, rb, ls, le):
+    """Every cell outside [local_start, local_end) must be left at the -inf pre-fill."""
+    col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
+    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+    return bool(torch.isneginf(out[~inside]).all().item())
+
+
+def window_is_written(out, ls, le):
+    """Every cell inside [local_start, local_end) must have been stored to.
+
+    `check_rows` would also catch a dropped token -- an in-window -inf never compares
+    close -- but only on the rows `sample_rows` happened to pick, so it stops
+    being a guard as soon as a case has more rows than that. This scans every row.
+    """
+    col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
+    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+    return bool(torch.isfinite(out[inside]).all().item())
+
+
+def sample_rows(total, le, n=N_COS_SAMPLE, seed=0):
+    nonempty = torch.nonzero(le > 0).flatten().tolist()
+    if not nonempty:
+        return []
+    rng = random.Random(seed)
+    return sorted(rng.sample(nonempty, min(n, len(nonempty))))
+
+
+# ── FlyDSL candidates (second opinion on the scale layout) ────────────────────
+def flydsl_prefill(inp, rb, ls, le, total_q, block_k):
+    try:
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+            compute_prefill_schedule,
+            flydsl_pa_mqa_logits_fp4_prefill,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    msl = inp.max_seq_len
+    _, cta_info, n_ctas = compute_prefill_schedule(rb, ls, le, block_k, total_q, msl)
+    out = torch.full((total_q, msl), float("-inf"), dtype=torch.float32, device=dev)
+
+    def launch():
+        flydsl_pa_mqa_logits_fp4_prefill(
+            inp.q_packed, inp.q_scale_fly, inp.kv_cache.view(-1, 1, 4, KV_BLOCK_SIZE, 16),
+            inp.kv_scale_fly, inp.block_tables, inp.weights, rb, ls, le, msl,
+            weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+            num_warps=4 if block_k == 256 else 1, parallel_unit_num=total_q,
+            out=out, cta_info=cta_info, n_ctas=n_ctas,
+        )  # fmt: skip
+        return out
+
+    return launch
+
+
+def flydsl_decode(inp, ctx, batch, next_n, block_k):
+    """FlyDSL fp4 decode -- a DIFFERENT op from its prefill one, with its own ABI.
+
+    Its q / q_scale are [B, next_n, ...] where ours are packed [B*next_n, ...]; fixed
+    MTP packs rows in (b, n) order, so a reshape is the whole conversion. `weights`
+    stays packed. It runs a persistent grid from `compute_varctx_schedule` rather than
+    our schedule-free 3D grid, and gets it precomputed here so the timed region is a
+    pure launch on both sides. Fixed-MTP only -- there is no varqlen decode on that side.
+    """
+    try:
+        from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+            compute_varctx_schedule,
+        )
+    except Exception as e:  # noqa: BLE001
+        aiter.logger.warning("flydsl decode unavailable: %s: %s", type(e).__name__, e)
+        return None
+
+    msl = inp.max_seq_len
+    q_nn = inp.q_packed.reshape(batch, next_n, HEADS, HEAD_DIM // 2).contiguous()
+    qs_nn = inp.q_scale_fly.reshape(
+        batch, next_n, *inp.q_scale_fly.shape[1:]
+    ).contiguous()
+    _, cta_info, total_ctas = compute_varctx_schedule(
+        ctx, block_k, None, msl, next_n=next_n
+    )
+    out = torch.full(
+        (batch * next_n, msl), float("-inf"), dtype=torch.float32, device=dev
+    )
+
+    def launch():
+        flydsl_pa_mqa_logits_fp4(
+            q_nn, qs_nn, inp.kv_cache.view(-1, 1, 4, KV_BLOCK_SIZE, 16),
+            inp.kv_scale_fly, inp.block_tables, inp.weights, ctx, msl,
+            weight_scale=WEIGHT_SCALE, next_n=next_n, block_k=block_k,
+            kv_block_size=KV_BLOCK_SIZE, num_warps=4 if block_k == 256 else 1,
+            out=out, cta_info=cta_info, total_ctas=total_ctas,
+        )  # fmt: skip
+        return out
+
+    try:
+        launch()
+        torch.cuda.synchronize()
+    except Exception as e:  # noqa: BLE001
+        aiter.logger.warning("flydsl decode failed: %s: %s", type(e).__name__, e)
+        return None
+    return launch
+
+
+# ── correctness ───────────────────────────────────────────────────────────────
+def check_prefill(bs, windows_per_batch, seed, block_k, label, cross_flydsl=True):
+    """One ragged-prefill case: explicit per-row (start, end) windows, random data.
+
+    `cross_flydsl=False` drops the second opinion for windows FlyDSL itself gets wrong --
+    see the unaligned-start cases in `run_corner`.
+    """
+    qlens = [len(w) for w in windows_per_batch]
+    total_q = sum(qlens)
+    max_end = max(e for w in windows_per_batch for (_, e) in w)
+    inp = build_inputs(bs, max_end, total_q, block_k, seed)
+
+    rb, ls, le = [], [], []
+    for b, w in enumerate(windows_per_batch):
+        for s, e in w:
+            rb.append(b)
+            ls.append(s)
+            le.append(e)
+    rb = torch.tensor(rb, dtype=torch.int32, device=dev)
+    ls = torch.tensor(ls, dtype=torch.int32, device=dev)
+    le = torch.tensor(le, dtype=torch.int32, device=dev)
+
+    out = pa_mqa_logits_mxfp4_prefill(
+        inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+        inp.weights, rb, ls, le, inp.max_seq_len,
+        weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+    rows = sample_rows(total_q, le, seed=seed)
+    err = check_rows(
+        out, ref_rows(inp, rows, rb, ls, le), f"prefill {label} bk={block_k}"
+    )
+    oob = oob_is_neginf(out, rb, ls, le)
+    wr = window_is_written(out, ls, le)
+
+    fly_err = float("nan")
+    fly = flydsl_prefill(inp, rb, ls, le, total_q, block_k) if cross_flydsl else None
+    if fly is not None:
+        out_f = fly()
+        torch.cuda.synchronize()
+        col = torch.arange(inp.max_seq_len, device=dev).unsqueeze(0)
+        m = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+        fly_err = checkAllclose(
+            out[m].float(), out_f[m].float(), rtol=2e-5, atol=1e-2,
+            msg=f"flydsl {label} bk={block_k}", printLog=False,
+        )  # fmt: skip
+
+    ok = err == 0 and oob and wr and (math.isnan(fly_err) or fly_err == 0)
+    return {
+        "case": label, "block_k": block_k, "rows": total_q, "max_win": int(le.max()),
+        "err": err, "vs flydsl": fly_err, "oob -inf": oob, "window written": wr,
+        "pass": ok,
+    }  # fmt: skip
+
+
+def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None):
+    """One fixed-MTP decode case, scoring the kernel against the same host-built window the
+    reference uses. `local_ends` overrides the MTP tail-causal default with an arbitrary
+    per-row list in packed (b, n) order -- only such a case can tell a kernel that READS
+    the window from one that derives it.
+    """
+    total_q = bs * next_n
+    if local_ends is None:
+        # MTP tail-causal, packed row order (b, n).
+        local_ends = [
+            max(context_lens[b] - (next_n - 1 - n), 0)
+            for b in range(bs)
+            for n in range(next_n)
+        ]
+    assert len(local_ends) == total_q
+    max_end = max(max(local_ends), 1)
+    inp = build_inputs(bs, max_end, total_q, block_k, seed)
+
+    rb, ls, le = [], [], list(local_ends)
+    for b in range(bs):
+        for _ in range(next_n):
+            rb.append(b)
+            ls.append(0)
+    rb = torch.tensor(rb, dtype=torch.int32, device=dev)
+    ls = torch.tensor(ls, dtype=torch.int32, device=dev)
+    le = torch.tensor(le, dtype=torch.int32, device=dev)
+
+    # `cu_seq_q` left as None on purpose, so this covers the fixed-MTP convenience path
+    # where the wrapper derives it; `test_decode` passes one in and covers the other
+    # branch. Between them both forms of the argument are exercised.
+    out = pa_mqa_logits_mxfp4_decode(
+        inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+        inp.weights, le, inp.max_seq_len, next_n,
+        split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+        block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+    rows = sample_rows(total_q, le, seed=seed)
+    err = check_rows(
+        out, ref_rows(inp, rows, rb, ls, le), f"decode {label} bk={block_k}"
+    )
+    oob = oob_is_neginf(out, rb, ls, le)
+    wr = window_is_written(out, ls, le)
+    ok = err == 0 and oob and wr
+    return {
+        "case": label, "block_k": block_k, "rows": total_q, "max_win": int(le.max()),
+        "err": err, "vs flydsl": float("nan"), "oob -inf": oob, "window written": wr,
+        "pass": ok,
+    }  # fmt: skip
+
+
+def poison_kv_rows(kv_scale, block_tables, row_in_seq):
+    """A copy of `kv_scale` with row `row_in_seq` of EVERY batch set to 0xFF (NaN).
+
+    Every batch, because the block tables differ per batch and poisoning only batch 0's
+    would leave the others as an untested control.
+
+    Poisoned by MARKING in the natural layout and pushing the mark through
+    `scale_to_opus`, rather than by computing where those four bytes land. The
+    permutation is the thing under test's own ABI; rederiving it here would let the test
+    and the kernel agree on the wrong offsets.
+    """
+    mark = torch.zeros(
+        block_tables.numel() * KV_BLOCK_SIZE, BLOCKS_ROW, dtype=torch.uint8, device=dev
+    )
+    blk = block_tables[:, row_in_seq // KV_BLOCK_SIZE].long()
+    mark[blk * KV_BLOCK_SIZE + row_in_seq % KV_BLOCK_SIZE] = 1
+    out = kv_scale.clone()
+    out[scale_to_opus(mark, KV_BLOCK_SIZE) != 0] = 0xFF
+    return out
+
+
+def check_nan_scale(entry, bs, next_n, ends, seed, block_k, label, kv_row=0):
+    """A NaN E8M0 scale must reach the logits of every row that attends its KV row.
+
+    E8M0 0xFF is NaN and an E2M1 nibble cannot encode one, so a NaN scale is the only
+    way a non-finite value enters this kernel -- and the relu decides whether it comes
+    out again. Written as `x > 0.f ? x : 0.f` the relu is a compare-and-select and
+    silently returns 0 for a NaN input, which is indistinguishable downstream from a KV
+    row that genuinely scored zero; written as `maximum` it propagates. The kernel
+    promises the latter, and only under `-fno-finite-math-only` -- `-ffast-math` alone
+    lets the compiler assume no operand is NaN and fold the builtin back to a select.
+
+    Asserted as an exact SET, not a count: every row whose window contains `kv_row` has
+    a non-finite logit there, no other in-window cell is non-finite, and out-of-window
+    is still the -inf pre-fill. A kernel that propagated NaN too far would pass a count.
+    """
+    total_q = bs * next_n
+    assert len(ends) == total_q
+    inp = build_inputs(bs, max(max(ends), 1), total_q, block_k, seed)
+    rb = torch.tensor([b for b in range(bs) for _ in range(next_n)],
+                      dtype=torch.int32, device=dev)  # fmt: skip
+    ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
+    le = torch.tensor(ends, dtype=torch.int32, device=dev)
+
+    kvs = poison_kv_rows(inp.kv_scale, inp.block_tables, kv_row)
+
+    if entry == "prefill":
+        out = pa_mqa_logits_mxfp4_prefill(
+            inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
+            inp.weights, rb, ls, le, inp.max_seq_len,
+            weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+        )  # fmt: skip
+    else:
+        out = pa_mqa_logits_mxfp4_decode(
+            inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
+            inp.weights, le, inp.max_seq_len, next_n,
+            split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+        )  # fmt: skip
+    torch.cuda.synchronize()
+
+    col = torch.arange(out.shape[1], device=dev).unsqueeze(0)
+    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+    want = inside & (col == kv_row)
+    got = inside & ~torch.isfinite(out)
+    n_want, n_got = int(want.sum()), int(got.sum())
+    exact = bool(torch.equal(want, got))
+    oob = oob_is_neginf(out, rb, ls, le)
+    return {
+        "case": label, "entry": entry, "block_k": block_k, "rows": total_q,
+        "max_win": int(le.max()), "expect nan": n_want, "got nan": n_got,
+        "exact set": exact, "oob -inf": oob, "pass": exact and oob,
+    }  # fmt: skip
+
+
+def run_nan_scale():
+    """`check_nan_scale` over both entry points, both block_k, and a window edge case.
+
+    Separate from `run_corner` because its pass condition is the opposite one: these
+    cases REQUIRE non-finite in-window cells, so `window_is_written` -- which every
+    corner case asserts -- is deliberately false here.
+    """
+    oks = []
+    for block_k in COMPILED_BLOCK_KS:
+        # Ragged windows, all containing KV row 0.
+        oks.append(check_nan_scale("prefill", 2, 3, [50, 120, 200, 40, 100, 180],
+                                   20, block_k, "prefill, nan at kv row 0"))  # fmt: skip
+        # A window that EXCLUDES the poisoned row (le == 0 contributes nothing, and
+        # `kv_row` past `le` must leave the row finite) -- the control that says the
+        # NaN is not simply smeared across the output.
+        oks.append(check_nan_scale("prefill", 1, 4, [0, 1, 2, 3],
+                                   21, block_k, "prefill, nan at kv row 2",
+                                   kv_row=2))  # fmt: skip
+        # Decode, where a window spans several KV splits and only one holds the row.
+        oks.append(check_nan_scale("decode", 2, 4, [200, 201, 202, 203,
+                                                    block_k * 2 + 1] + [130] * 3,
+                                   22, block_k, "decode, nan at kv row 0"))  # fmt: skip
+    df = pd.DataFrame(oks)
+    aiter.logger.info(
+        "MXFP4 MQA logits NaN E8M0 scale propagation, %d/%d pass (markdown):\n%s",
+        int(df["pass"].sum()), len(df), df.to_markdown(index=False),
+    )  # fmt: skip
+    return bool(df["pass"].all())
+
+
+def run_corner():
+    """Cases chosen to hit the pipeline and window corners, all on random data.
+
+    Not a `@benchmark` function: its shape argument is a nested list of per-row windows,
+    which the decorator would render as one unreadable table cell. It builds its own row
+    dicts instead, and still ends in a summary table.
+
+    Every case runs at BOTH `block_k`. That is variant coverage, not a tuning sweep: the
+    two are separately compiled kernels with different CTA widths and KV split
+    granularities, they must produce identical results, and only 64 is ever shipped -- so
+    256 gets no exposure at all unless correctness exercises it here.
+    """
+    oks = []
+    for block_k in COMPILED_BLOCK_KS:
+        # ragged windows incl. non-zero starts and non-32-aligned bounds
+        oks.append(check_prefill(2, [[(0, 50), (0, 120), (0, 200)], [(0, 40), (0, 100)]],
+                                 0, block_k, "ragged, 2 batches"))  # fmt: skip
+        oks.append(check_prefill(3, [[(0, 30)], [(0, 200)], [(0, 100), (0, 150)]],
+                                 2, block_k, "ragged, 3 batches"))  # fmt: skip
+        oks.append(check_prefill(2, [[(10, 50), (64, 200)], [(0, 100), (130, 256)]],
+                                 4, block_k, "non-zero lower bounds"))  # fmt: skip
+        # tile-boundary +-1 for both block_k, and the 1-/2-tile pipeline corners
+        bounds = [(0, n) for n in (1, 63, 64, 65, 127, 128, 129, 191, 192, 193)]
+        oks.append(check_prefill(1, [bounds], 5, block_k, "tile boundaries +-1"))
+        # empty window (must early-out without storing) and qlen > ctx
+        oks.append(check_prefill(2, [[(0, 0), (0, 33)], [(0, 96), (0, 0)]],
+                                 6, block_k, "empty windows"))  # fmt: skip
+        # MFMA_N=32 alignment: windows that end mid-tile in every residue class
+        oks.append(check_prefill(1, [[(0, 32 * 3 + r) for r in range(1, 9)]],
+                                 7, block_k, "mid-tile ends"))  # fmt: skip
+        # Window starts whose byte address is not 16 B aligned. The out store folds
+        # local_start into the base, which is the shape
+        # `KNOWN_ISSUE_out_store_alignment.md` (opus-ops) reports dropping the leading
+        # (4 - start%4) % 4 in-window tokens on. Width 40 and starts past 16 are that
+        # doc's own experiment; it calls the sub-16 region an incidental exemption not to
+        # be relied on, so both are covered. `max_err` catches a dropped token (an
+        # in-window -inf makes it infinite) and `oob_is_neginf` catches the opposite
+        # failure, a store leaking past the window.
+        #
+        # No FlyDSL second opinion: at num_warps=1 it exhibits exactly that bug, dropping
+        # (4 - start%4) % 4 leading cells, so it cannot serve as a reference here. The
+        # dequantized CPU reference still scores every row.
+        oks.append(check_prefill(1, [[(s, s + 40) for s in (17, 18, 19, 20, 33, 34, 35, 36)]],
+                                 12, block_k, "unaligned starts >= 16",
+                                 cross_flydsl=False))  # fmt: skip
+        oks.append(check_prefill(1, [[(s, s + 40) for s in (1, 2, 3, 5, 6, 7, 9, 13)]],
+                                 13, block_k, "unaligned starts < 16",
+                                 cross_flydsl=False))  # fmt: skip
+        # decode: pure decode, MTP, and a context at a tile boundary
+        oks.append(check_decode(2, 1, [128, 200], 8, block_k, "decode next_n=1"))
+        oks.append(
+            check_decode(3, 4, [256, 129, 64], 9, block_k, "decode MTP next_n=4")
+        )
+        oks.append(check_decode(1, 8, [block_k * 2 + 1], 10, block_k, "decode tile+1"))
+        # COMPRESSED KV windows (CSA ratio 4): draft token n sees
+        # min((pos + n + 1) // 4, n_committed) rows. The floor makes that a STEP in n
+        # (50, 50, 51, 51) and the third batch is fully clamped (2, 2, 2, 2); neither shape
+        # is expressible as `ctx - (next_n - 1 - n)`.
+        csa = []
+        for pos, ncmt in ((201, 80), (98, 30), (7, 2)):
+            csa += [min((pos + n + 1) // 4, ncmt) for n in range(4)]
+        oks.append(check_decode(3, 4, None, 11, block_k,
+                                "decode CSA ratio-4 windows", local_ends=csa))  # fmt: skip
+    df = pd.DataFrame(oks)
+    aiter.logger.info(
+        "MXFP4 MQA logits corner cases, random data, %d/%d pass (markdown):\n%s",
+        int(df["pass"].sum()), len(df), df.to_markdown(index=False),
+    )  # fmt: skip
+    return bool(df["pass"].all())
+
+
+# ── perf ──────────────────────────────────────────────────────────────────────
+def gen_prefill_qlens(bs, total=PREFILL_TOTAL_QLEN, qmin=PREFILL_QMIN, seed=0):
+    g = random.Random(seed)
+    extra = total - bs * qmin
+    w = [g.random() for _ in range(bs)]
+    s = sum(w) or 1.0
+    parts = [qmin + int(extra * wi / s) for wi in w]
+    parts[0] += total - sum(parts)
+    return parts
+
+
+def score_candidates(candidates, inp, rb, ls, le, total_q, n_logits, seed):
+    """Time every candidate, then score them all against the sampled-row reference.
+
+    Scoring runs AFTER the last timed region and frees its temporaries: the reference
+    materializes a [heads, window] score matrix per sampled row -- ~1 GB on the longest
+    prefill shape -- and the caching allocator charges that churn to whichever kernel is
+    timed next, which is worth 4-9% to this kernel and nothing to FlyDSL.
+    """
+    flops = 2 * HEADS * HEAD_DIM * n_logits
+    nbytes = roofline_bytes(rb, le, total_q, n_logits)
+
+    outs, times = {}, {}
+    for name, fn in candidates.items():
+        outs[name], times[name] = run_perftest(
+            fn, num_iters=PERF_ITERS, num_warmup=PERF_WARMUP
+        )
+
+    ref = ref_rows(inp, sample_rows(total_q, le, seed=seed), rb, ls, le)
+    ret = {}
+    for name, us in times.items():
+        ret[f"{name} us"] = round(us, 2)
+        ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
+        ret[f"{name} TB per s"] = round(nbytes / us / 1e6, 3)
+        ret[f"{name} err"] = check_rows(outs[name], ref, name)
+    del ref, outs
+    torch.cuda.empty_cache()
+    return ret
+
+
+@benchmark()
+def test_prefill(bs):
+    """One causal prefill shape: 16384 query rows split across `bs` batches, ctx == qlen.
+
+    Each side runs at ITS OWN default -- ours 64, FlyDSL 256 -- which is what an untuned
+    caller gets from either and matches the convention the production numbers use. A
+    matched-`block_k` reading is a different measurement and moves the margin by ~10
+    points on prefill, so do not read one as the other. `block_k` is not a sweep axis
+    here; `run_corner` is what keeps the second compiled variant covered.
+    """
+    qlens = gen_prefill_qlens(bs, seed=bs)
+    total_q = sum(qlens)
+    inp = build_inputs(bs, max(qlens), total_q, SIZING_BLOCK_K, seed=bs)
+    cu = torch.tensor(
+        [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
+    )
+    ctx = torch.tensor(qlens, dtype=torch.int32, device=dev)
+    rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
+    out = torch.full(
+        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+
+    # Defaults, not closure capture: this is rebuilt per shape over names the sweep later
+    # drops, so late binding would read the next shape's buffers. `block_k` is left off
+    # so the timed call is the default one.
+    def ours(inp=inp, rb=rb, ls=ls, le=le, out=out):
+        return pa_mqa_logits_mxfp4_prefill(
+            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+            inp.weights, rb, ls, le, inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            kv_block_size=KV_BLOCK_SIZE, out=out,
+        )  # fmt: skip
+
+    candidates = {"ours": ours}
+    fly = flydsl_prefill(inp, rb, ls, le, total_q, FLYDSL_DEFAULT_BLOCK_K)
+    if fly is not None:
+        candidates["flydsl"] = fly
+
+    n_logits = int((le - ls).clamp(min=0).sum().item())
+    ret = {
+        "gfx": get_gfx(),
+        "total_q": total_q,
+        "max_win": int(le.max()),
+        "n_logits": n_logits,
+    }
+    ret.update(
+        score_candidates(candidates, inp, rb, ls, le, total_q, n_logits, seed=bs)
+    )
+    del inp, out
+    torch.cuda.empty_cache()
+    return ret
+
+
+@benchmark()
+def test_decode(batch, max_ctx, next_n):
+    """One fixed-MTP decode shape: `batch * next_n` packed rows over ragged contexts.
+
+    Each side at its own default, as in `test_prefill`. The config matters far more here
+    than on prefill -- FlyDSL's 64 is its weak decode setting and the choice is worth tens
+    of points, enough to flip the sign -- so 256 is the only honest baseline.
+    """
+    g = random.Random(batch + max_ctx + next_n)
+    ctxs = [
+        ((g.randint(int(0.9 * max_ctx), max_ctx) + KV_BLOCK_SIZE - 1)
+         // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
+        for _ in range(batch)
+    ]  # fmt: skip
+    total_q = batch * next_n
+    inp = build_inputs(batch, max(ctxs), total_q, SIZING_BLOCK_K, seed=batch + next_n)
+    ctx = torch.tensor(ctxs, dtype=torch.int32, device=dev)
+    # `cu_seq_q` and the window arrays are per-forward quantities while the kernel runs per
+    # layer, so both are built here and PASSED IN. Leaving `cu_seq_q` as None makes the
+    # wrapper rebuild it with a `torch.arange` on every call, and `get_trace_perf` sums
+    # every CUDA event in the region, so that fill kernel lands in the reported time --
+    # measured at 1.2-1.8 us, i.e. 8-21% of these shapes, all of it harness rather than
+    # kernel. FlyDSL gets its `cta_info` precomputed for the same reason.
+    cu = torch.arange(0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev)
+    rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
+    out = torch.full(
+        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+
+    # Bound as defaults for the same reason as test_prefill's.
+    def ours(inp=inp, cu=cu, le=le, next_n=next_n, out=out):
+        return pa_mqa_logits_mxfp4_decode(
+            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+            inp.weights, le, inp.max_seq_len, next_n,
+            split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            cu_seq_q=cu, kv_block_size=KV_BLOCK_SIZE, out=out,
+        )  # fmt: skip
+
+    candidates = {"ours": ours}
+    fly = flydsl_decode(inp, ctx, batch, next_n, FLYDSL_DEFAULT_BLOCK_K)
+    if fly is not None:
+        candidates["flydsl"] = fly
+
+    n_logits = int((le - ls).clamp(min=0).sum().item())
+    ret = {
+        "gfx": get_gfx(),
+        "total_q": total_q,
+        "max_win": int(le.max()),
+        "n_logits": n_logits,
+    }
+    ret.update(
+        score_candidates(candidates, inp, rb, ls, le, total_q, n_logits, seed=batch)
+    )
+    del inp, out
+    torch.cuda.empty_cache()
+    return ret
+
+
+def main():
+    # Whole-op arch gate, here rather than inside the @benchmark fns: CI discovers every
+    # op_tests/test_*.py and runs it on the gfx942 shard as well, where the wrapper's own
+    # gfx950 check would raise and fail the shard. Positive allow-list, so an unknown new
+    # card skips instead of launching a kernel that was never built for it.
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "pa_mqa_logits_mxfp4 is gfx950-only; skipping on %s", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-b", "--batch", type=int, nargs="*", default=[1, 2, 4, 8, 12, 16, 20],
+        help="prefill batch sizes; total_q is fixed at 16384 and split across them",
+    )  # fmt: skip
+    parser.add_argument(
+        "-s", "--decode-shapes", type=dtypes.str2tuple, nargs="*",
+        default=[(8, 8192, 8), (32, 8192, 4), (128, 8192, 1), (128, 1024, 8)],
+        help="decode shapes as batch,max_ctx,next_n triples",
+    )  # fmt: skip
+    args = parser.parse_args()
+
+    ok = run_corner()
+    ok = run_nan_scale() and ok
+
+    rows = [test_prefill(bs) for bs in args.batch]
+    aiter.logger.info(
+        "MXFP4 MQA logits prefill, causal (ctx == qlen), random data, each side at its "
+        "own default block_k (ours %d, flydsl %d) (markdown):\n%s",
+        BLOCK_K_1WAVE,
+        FLYDSL_DEFAULT_BLOCK_K,
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    rows = [
+        test_decode(batch, max_ctx, next_n)
+        for batch, max_ctx, next_n in args.decode_shapes
+    ]
+    aiter.logger.info(
+        "MXFP4 MQA logits decode, fixed MTP, random data, each side at its own default "
+        "block_k (ours %d, flydsl %d) (markdown):\n%s",
+        BLOCK_K_1WAVE,
+        FLYDSL_DEFAULT_BLOCK_K,
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
