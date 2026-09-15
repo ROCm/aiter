@@ -153,9 +153,7 @@ def _mfma_score(a_pack, b_pack):
     c_frag = fx.make_rmem_tensor(DREG, fx.Float32)
     c_frag.store(Vec.filled(DREG, 0.0, fx.Float32))
     ident = fx.Int32(_NEUTRAL_E8M0)
-    rocdl.s_setprio(3)
     fx.gemm(atom, c_frag, a_frag, b_frag, c_frag, scale_a=ident, scale_b=ident)
-    rocdl.s_setprio(0)
     return Vec(c_frag.load())
 
 
@@ -358,9 +356,11 @@ def _build_kernel():
                     _load_weight_frag_lds(w_lds_base, row, mi, lane_div_16)
                     for mi in range_constexpr(M_TILES)
                 ]
+                rocdl.s_setprio(3)
                 scores = [
                     _mfma_score(a_packs[mi], b_pack) for mi in range_constexpr(M_TILES)
                 ]
+                rocdl.s_setprio(0)
                 value = _reduce_scores(scores, weights_frag, scale)
                 _store_logit(
                     row,
