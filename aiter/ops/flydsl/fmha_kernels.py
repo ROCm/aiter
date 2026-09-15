@@ -21,6 +21,8 @@ CK/Triton.
 from __future__ import annotations
 
 import math
+import os
+import threading
 from functools import lru_cache
 
 import torch
@@ -46,6 +48,7 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_varlen_m32x8,
 )
 from .kernels.fp8_quant_gfx1201 import flydsl_fp8_pertensor_quant
+from .stream_readiness import register_ready, wait_ready
 
 __all__ = [
     "flydsl_flash_attn_batch_func",
@@ -57,10 +60,12 @@ __all__ = [
 
 _FP8_DTYPES = (torch.float8_e4m3fn,)
 _FP8_MAX = 448.0
+_GFX1201_LDS_CAPACITY_BYTES = 65536
+_GFX1201_KERNEL_INT32_MAX = (1 << 31) - 1
+_GFX1201_BUFFER_MAX_BYTES = 1 << 32
 _ROT_ROWS = 64
 _HADAMARD_CACHE: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
-
-
+_HADAMARD_CACHE_LOCK = threading.Lock()
 if _HAS_TRITON:
 
     @triton.jit
@@ -140,6 +145,15 @@ def _pick_gfx1201_tiles(seq_len: int, head_dim: int, causal: bool) -> tuple[int,
     return 256, 64
 
 
+def _gfx1201_fmha_lds_bytes(head_dim: int, block_n: int, *, fp8: bool) -> int:
+    """Return the exact static LDS allocation for a selected gfx1201 kernel."""
+    if fp8:
+        # K is [BN, D + 4] fp8. V is transposed [D, BN + 4] fp8.
+        return block_n * (head_dim + 4) + head_dim * (block_n + 4)
+    # BF16/F16 K and V are both [BN, D + 4], at two bytes per element.
+    return 2 * block_n * (head_dim + 4) * 2
+
+
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
     if dtype == torch.bfloat16:
         return "bf16"
@@ -148,8 +162,71 @@ def _torch_dtype_to_str(dtype: torch.dtype) -> str:
     raise ValueError(f"flydsl_flash_attn_func only supports bf16/f16, got {dtype!r}")
 
 
-@lru_cache(maxsize=32)
+def _storage_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    """Return the half-open byte range touched by a non-empty tensor view."""
+    storage_ptr = tensor.untyped_storage().data_ptr()
+    first = tensor.data_ptr() - storage_ptr
+    last = first
+    element_size = tensor.element_size()
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        delta = (size - 1) * stride * element_size
+        first += min(0, delta)
+        last += max(0, delta)
+    return first, last + element_size
+
+
+def _storage_overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    if lhs.device != rhs.device:
+        return False
+    if lhs.untyped_storage().data_ptr() != rhs.untyped_storage().data_ptr():
+        return False
+    lhs_first, lhs_last = _storage_byte_range(lhs)
+    rhs_first, rhs_last = _storage_byte_range(rhs)
+    return lhs_first < rhs_last and rhs_first < lhs_last
+
+
+def _has_unsupported_internal_overlap(tensor: torch.Tensor) -> bool:
+    checker = getattr(torch, "_debug_has_internal_overlap", None)
+    if checker is None:
+        # Older PyTorch versions do not expose the overlap checker. Accept only
+        # contiguous storage there rather than risk concurrent writes aliasing.
+        return not tensor.is_contiguous()
+    # 0 means no overlap. Treat both definite overlap and "too hard" as unsafe.
+    return int(checker(tensor)) != 0
+
+
+def _validate_gfx1201_launch_limits(
+    *,
+    seq_len: int,
+    seq_len_kv_real: int,
+    seq_len_kv: int,
+    num_heads: int,
+    head_dim: int,
+    fp8: bool,
+) -> None:
+    """Validate integer kernel arguments and BF16/F16 V descriptor capacity."""
+    for name, value in (
+        ("padded query sequence length", seq_len),
+        ("real KV sequence length", seq_len_kv_real),
+        ("padded KV sequence length", seq_len_kv),
+    ):
+        if value > _GFX1201_KERNEL_INT32_MAX:
+            raise ValueError(
+                f"{name}={value} exceeds the gfx1201 kernel Int32 limit "
+                f"({_GFX1201_KERNEL_INT32_MAX})"
+            )
+    if not fp8:
+        v_batch_bytes = seq_len_kv * num_heads * head_dim * 2
+        if v_batch_bytes >= _GFX1201_BUFFER_MAX_BYTES:
+            raise ValueError(
+                f"one BF16/F16 V batch requires {v_batch_bytes} bytes, but the "
+                "gfx1201 buffer descriptor requires a byte count below 2^32"
+            )
+
+
+@lru_cache(maxsize=64)
 def _get_kernel(
+    device_index: int,
     num_heads: int,
     head_dim: int,
     causal: bool,
@@ -161,7 +238,12 @@ def _get_kernel(
     softmax_scale: float | None,
     tail_mask: bool,
     cross_attn: bool,
+    lds_vec_width: int,
 ):
+    # device_index intentionally participates in the cache key; the builder
+    # observes the active device selected by the caller's device context.
+    # lds_vec_width also participates because the builder reads its diagnostic
+    # environment toggle while constructing the IR.
     return build_flash_attn_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
@@ -177,8 +259,9 @@ def _get_kernel(
     )
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=64)
 def _get_fp8_gfx1201_kernel(
+    device_index: int,
     num_heads: int,
     head_dim: int,
     causal: bool,
@@ -190,6 +273,7 @@ def _get_fp8_gfx1201_kernel(
     tail_mask: bool,
     cross_attn: bool,
 ):
+    # device_index intentionally participates in the cache key.
     return build_flash_attn_fp8_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
@@ -208,20 +292,28 @@ def _get_fp8_gfx1201_kernel(
 def _hadamard_matrix(head_dim: int, device, dtype) -> torch.Tensor | None:
     if head_dim <= 0 or head_dim & (head_dim - 1):
         return None
-    key = (head_dim, torch.device(device), dtype)
-    matrix = _HADAMARD_CACHE.get(key)
-    if matrix is None:
-        matrix = torch.ones((1, 1), dtype=torch.float32, device=device)
-        while matrix.shape[0] < head_dim:
-            matrix = torch.cat(
-                [
-                    torch.cat([matrix, matrix], dim=1),
-                    torch.cat([matrix, -matrix], dim=1),
-                ],
-                dim=0,
-            )
-        matrix = (matrix / math.sqrt(head_dim)).to(dtype)
-        _HADAMARD_CACHE[key] = matrix
+    device = torch.device(device)
+    stream = torch.cuda.current_stream(device)
+    key = (head_dim, device, dtype)
+    with _HADAMARD_CACHE_LOCK:
+        matrix = _HADAMARD_CACHE.get(key)
+        if matrix is None:
+            with torch.cuda.device(device.index), torch.cuda.stream(stream):
+                matrix = torch.ones((1, 1), dtype=torch.float32, device=device)
+                while matrix.shape[0] < head_dim:
+                    matrix = torch.cat(
+                        [
+                            torch.cat([matrix, matrix], dim=1),
+                            torch.cat([matrix, -matrix], dim=1),
+                        ],
+                        dim=0,
+                    )
+                matrix = (matrix / math.sqrt(head_dim)).to(dtype)
+                (matrix,) = register_ready((matrix,), stream=stream)
+                _HADAMARD_CACHE[key] = matrix
+        else:
+            wait_ready(stream, (matrix,))
+            matrix.record_stream(stream)
     return matrix
 
 
@@ -254,7 +346,11 @@ def flydsl_fp8_quant(
     rotation: bool = True,
     backend: str = "flydsl",
 ):
-    """Quantize bf16 Q/K/V for the gfx1201 per-tensor FP8 attention path."""
+    """Quantize bf16 Q/K/V for the gfx1201 per-tensor FP8 attention path.
+
+    ``backend`` is a preference: unsupported native or Triton configurations
+    fall back to another available implementation with the same result contract.
+    """
     if not isinstance(backend, str):
         raise TypeError(f"backend must be a string, got {type(backend).__name__}")
     backend = backend.lower()
@@ -273,8 +369,14 @@ def flydsl_fp8_quant(
         q.shape[-1] == k.shape[-1] == v.shape[-1]
     ):
         raise ValueError("q/k/v must share head_dim")
+    if any(x.numel() == 0 for x in (q, k, v)):
+        raise ValueError("q/k/v must be non-empty")
 
     head_dim = q.shape[-1]
+    operation_stream = torch.cuda.current_stream(q.device)
+    wait_ready(operation_stream, (q, k, v))
+    for tensor in (q, k, v):
+        tensor.record_stream(operation_stream)
     if (
         backend == "flydsl"
         and q.dtype == torch.bfloat16
@@ -284,49 +386,55 @@ def flydsl_fp8_quant(
         q8, sq = flydsl_fp8_pertensor_quant(q, rotate=rotation)
         k8, sk = flydsl_fp8_pertensor_quant(k, rotate=rotation)
         v8, sv = flydsl_fp8_pertensor_quant(v, rotate=False)
+        # Each low-level producer already registers its output and descale on
+        # operation_stream; retaining those three events avoids a redundant
+        # grouped event while preserving readiness for all six tensors.
         return q8, k8, v8, sq, sk, sv
 
-    matrix = _hadamard_matrix(head_dim, q.device, q.dtype) if rotation else None
-    same_size = q.numel() == k.numel() == v.numel()
-    if backend != "torch" and _HAS_TRITON and matrix is not None and same_size:
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        rows = q.numel() // head_dim
-        grid = (3 * triton.cdiv(rows, _ROT_ROWS),)
-        aq = torch.zeros(1, dtype=torch.float32, device=q.device)
-        ak = torch.zeros(1, dtype=torch.float32, device=q.device)
-        av = torch.zeros(1, dtype=torch.float32, device=q.device)
-        _rot_amax3[grid](
-            q, k, v, matrix, aq, ak, av, rows, D=head_dim, BLOCK_ROWS=_ROT_ROWS
-        )
-        sq = (aq / _FP8_MAX).clamp(min=1e-12)
-        sk = (ak / _FP8_MAX).clamp(min=1e-12)
-        sv = (av / _FP8_MAX).clamp(min=1e-12)
-        q8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
-        k8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
-        v8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
-        _rot_scale3[grid](
-            q,
-            k,
-            v,
-            matrix,
-            q8,
-            k8,
-            v8,
-            sq,
-            sk,
-            sv,
-            rows,
-            D=head_dim,
-            BLOCK_ROWS=_ROT_ROWS,
-        )
-        return q8, k8, v8, sq, sk, sv
+    with torch.cuda.device(q.device.index), torch.cuda.stream(operation_stream):
+        matrix = _hadamard_matrix(head_dim, q.device, q.dtype) if rotation else None
+        same_size = q.numel() == k.numel() == v.numel()
+        if backend != "torch" and _HAS_TRITON and matrix is not None and same_size:
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            for tensor in (q, k, v):
+                tensor.record_stream(operation_stream)
+            rows = q.numel() // head_dim
+            grid = (3 * triton.cdiv(rows, _ROT_ROWS),)
+            aq = torch.zeros(1, dtype=torch.float32, device=q.device)
+            ak = torch.zeros(1, dtype=torch.float32, device=q.device)
+            av = torch.zeros(1, dtype=torch.float32, device=q.device)
+            _rot_amax3[grid](
+                q, k, v, matrix, aq, ak, av, rows, D=head_dim, BLOCK_ROWS=_ROT_ROWS
+            )
+            sq = (aq / _FP8_MAX).clamp(min=1e-12)
+            sk = (ak / _FP8_MAX).clamp(min=1e-12)
+            sv = (av / _FP8_MAX).clamp(min=1e-12)
+            q8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+            k8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
+            v8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
+            _rot_scale3[grid](
+                q,
+                k,
+                v,
+                matrix,
+                q8,
+                k8,
+                v8,
+                sq,
+                sk,
+                sv,
+                rows,
+                D=head_dim,
+                BLOCK_ROWS=_ROT_ROWS,
+            )
+            return register_ready((q8, k8, v8, sq, sk, sv), stream=operation_stream)
 
-    q8, sq = _torch_fp8_quant(q, matrix)
-    k8, sk = _torch_fp8_quant(k, matrix)
-    v8, sv = _torch_fp8_quant(v, None)
-    return q8, k8, v8, sq, sk, sv
+        q8, sq = _torch_fp8_quant(q, matrix)
+        k8, sk = _torch_fp8_quant(k, matrix)
+        v8, sv = _torch_fp8_quant(v, None)
+        return register_ready((q8, k8, v8, sq, sk, sv), stream=operation_stream)
 
 
 def flydsl_flash_attn_func(
@@ -455,10 +563,30 @@ def flydsl_flash_attn_func(
             raise ValueError(f"out must have dtype {output_dtype}")
         if out.device != q.device:
             raise ValueError(f"out must be on {q.device}")
-        if any(torch._C._is_alias_of(out, tensor) for tensor in (q, k, v)):
-            raise ValueError("out must not alias q, k, or v")
+        if _has_unsupported_internal_overlap(out):
+            raise ValueError(
+                "out must not have internal overlap or unsupported striding"
+            )
+        alias_inputs = [q, k, v]
+        if is_fp8:
+            alias_inputs.extend((q_descale, k_descale, v_descale))
+        if any(_storage_overlaps(out, tensor) for tensor in alias_inputs):
+            raise ValueError("out must not overlap q, k, v, or FP8 descale storage")
 
     block_m, block_n = _pick_gfx1201_tiles(seq_len_real, head_dim, causal)
+    lds_bytes = _gfx1201_fmha_lds_bytes(head_dim, block_n, fp8=is_fp8)
+    if lds_bytes > _GFX1201_LDS_CAPACITY_BYTES and block_n != 32:
+        # Keep the selected query tile, but fall back to the narrower KV tile
+        # before rejecting a shape that the kernel can safely represent.
+        block_n = 32
+        lds_bytes = _gfx1201_fmha_lds_bytes(head_dim, block_n, fp8=is_fp8)
+    if lds_bytes > _GFX1201_LDS_CAPACITY_BYTES:
+        kernel_kind = "FP8" if is_fp8 else dtype_str.upper()
+        raise ValueError(
+            f"gfx1201 {kernel_kind} attention with head_dim={head_dim} and "
+            f"BLOCK_N={block_n} requires {lds_bytes} bytes of LDS, exceeding "
+            f"the {_GFX1201_LDS_CAPACITY_BYTES}-byte hardware limit"
+        )
 
     # Pad sequence lengths to their respective tile sizes. Non-causal padded
     # K/V columns are masked in the kernel; padded query rows are sliced off.
@@ -468,7 +596,15 @@ def flydsl_flash_attn_func(
         if not is_cross
         else ((seq_len_kv_real + block_n - 1) // block_n) * block_n
     )
-    tail_mask = not causal and seq_len_kv_real != seq_len_kv_pad
+    tail_mask = not causal and seq_len_kv_real % block_n != 0
+    _validate_gfx1201_launch_limits(
+        seq_len=seq_len_pad,
+        seq_len_kv_real=seq_len_kv_real,
+        seq_len_kv=seq_len_kv_pad,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        fp8=is_fp8,
+    )
 
     def _pad_seq(tensor: torch.Tensor, pad: int) -> torch.Tensor:
         tensor = tensor.contiguous()
@@ -487,6 +623,11 @@ def flydsl_flash_attn_func(
     # whose current device differs from q.device get the kernel compiled
     # and launched on the right device/stream.
     with torch.cuda.device(q.device.index):
+        if stream is not None and not isinstance(stream, torch.cuda.Stream):
+            raise TypeError(
+                "stream must be a torch.cuda.Stream or None, got "
+                f"{type(stream).__name__}"
+            )
         launch_stream = (
             torch.cuda.current_stream(q.device) if stream is None else stream
         )
@@ -497,6 +638,11 @@ def flydsl_flash_attn_func(
         producer_stream = torch.cuda.current_stream(q.device)
         if launch_stream != producer_stream:
             launch_stream.wait_stream(producer_stream)
+        wait_ready(launch_stream, (q, k, v))
+        if is_fp8:
+            wait_ready(launch_stream, (q_descale, k_descale, v_descale))
+        if out is not None:
+            wait_ready(launch_stream, (out,))
 
         with torch.cuda.stream(launch_stream):
             q_p = _pad_seq(q, seq_len_pad - seq_len_real)
@@ -509,6 +655,7 @@ def flydsl_flash_attn_func(
 
             if is_fp8:
                 exe = _get_fp8_gfx1201_kernel(
+                    device_index=q.device.index,
                     num_heads=num_heads,
                     head_dim=head_dim,
                     causal=causal,
@@ -536,6 +683,7 @@ def flydsl_flash_attn_func(
                 )
             else:
                 exe = _get_kernel(
+                    device_index=q.device.index,
                     num_heads=num_heads,
                     head_dim=head_dim,
                     causal=causal,
@@ -547,6 +695,12 @@ def flydsl_flash_attn_func(
                     softmax_scale=softmax_scale,
                     tail_mask=tail_mask,
                     cross_attn=is_cross,
+                    lds_vec_width=(
+                        16
+                        if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1")
+                        == "1"
+                        else 8
+                    ),
                 )
                 exe(
                     q_p.reshape(-1),
@@ -573,6 +727,7 @@ def flydsl_flash_attn_func(
             q_descale.record_stream(launch_stream)
             k_descale.record_stream(launch_stream)
             v_descale.record_stream(launch_stream)
+        (result,) = register_ready((result,), stream=launch_stream)
 
     return result
 

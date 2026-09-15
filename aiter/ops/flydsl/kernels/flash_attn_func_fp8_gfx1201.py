@@ -20,15 +20,13 @@ Performance-relevant choices:
    barrier, and the next K cooperative load.
 
 Approaches tried and dropped:
-  - V interleaved storage (ds_read_b32): the element-wise scatter store overhead
-    negates the read savings at BN=32; row-major V with pipelined scalar reads
-    is faster.
-  - V pre-transpose (scatter store to col-major LDS, vec8 GEMM2 read): the 16
-    scalar stores per thread in coop_store_v cost ~8.8% over the row-major
-    layout.
+  - Row-major/interleaved V layouts using scalar or gathered LDS reads. The
+    current kernel instead transposes V into LDS so GEMM2 consumes contiguous
+    packed FP8 fragments; this remains faster for the shape-selected tiles.
 
 WMMA 16x16x16 register layout (wave32):
-  - A/B operand: v8bf16 per lane (lane16 = row/col, klane*8 = K-offset)
+  - A/B operand: two i32 registers containing 8 packed fp8 values per lane
+    (lane16 = row/col, klane*8 = K-offset)
   - C/D result: v8f32 per lane, element si = C[klane*8+si][lane16]
 
 Layout: Q/K/V/O are 1D flattened from BSHD (batch, seq_len, num_heads, head_dim).
@@ -85,10 +83,9 @@ from .flash_attn_func_common_gfx1201 import (
 from .flash_attn_func_common_gfx1201 import (
     pointer_to_llvm_ptr as _pointer_to_llvm_ptr,
 )
+from .kernels_common import LOG2E as _LOG2E
 from .kernels_common import dtype_to_elem_type
 from .tensor_shim import _run_compiled
-
-_LOG2E = host_math.log2(host_math.e)
 
 
 def build_flash_attn_func_module(
@@ -107,7 +104,7 @@ def build_flash_attn_func_module(
     fast_fp_math=True,
     daz=True,
 ):
-    """Build gfx1201 flash_attn_func (BN=32 + rocdl.exp2 + pipelined GEMM2 + overlapped V load)."""
+    """Build shape-tiled gfx1201 FP8 attention with pipelined GEMM2/V loads."""
     gpu_arch = get_hip_arch()
 
     # ---- WMMA / wave32 constants ----
@@ -579,10 +576,10 @@ def build_flash_attn_func_module(
                     p_packs_st.append(_8p_to_pair_fp8(p_slice))
                 p_packs_all.append(p_packs_st)
 
-            # ==== GEMM2: O += V^T @ P (software pipelined, row-major V) ====
+            # ==== GEMM2: O += V^T @ P (software pipelined, transposed LDS V) ====
             # Prefetch the next V pack while the current WMMA executes.
 
-            def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val):
+            def _load_v_transposed(st_kv_base_val, pks_val, dc_val):
                 # Transposed V: 8 kv bytes are contiguous, so one ds_read_b64 (v2i32)
                 # mirrors the GEMM1 K load with no per-byte gather. d_pos selects the d-row.
                 d_pos = fx.Index(dc_val * D_CHUNK) + lane16
@@ -598,7 +595,7 @@ def build_flash_attn_func_module(
             # Software pipeline: preload first V pack
             cur_v_packs = []
             for st_idx in range_constexpr(N_SUB_TILES):
-                cur_v_packs.append(_load_v_rowmajor(st_idx * K_SUB_N, 0, 0))
+                cur_v_packs.append(_load_v_transposed(st_idx * K_SUB_N, 0, 0))
 
             for pks in range_constexpr(PV_K_STEPS):
                 for dc in range_constexpr(D_CHUNKS):
@@ -614,7 +611,7 @@ def build_flash_attn_func_module(
                     if const_expr(has_next):
                         for st_idx in range_constexpr(N_SUB_TILES):
                             next_v_packs.append(
-                                _load_v_rowmajor(st_idx * K_SUB_N, next_pks, next_dc)
+                                _load_v_transposed(st_idx * K_SUB_N, next_pks, next_dc)
                             )
 
                     for st_idx in range_constexpr(N_SUB_TILES):

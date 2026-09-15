@@ -40,10 +40,6 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 # The flydsl flash-attn kernels are gfx1201/RDNA4 only.
 SUPPORTED_GFX = ["gfx1201"]
 
-if torch.cuda.is_available():
-    # PyTorch exposes ROCm devices through its torch.cuda compatibility API.
-    torch.set_default_device("cuda")
-
 # (label, batch, seq_len, num_heads, head_dim) -- production diffusion shapes.
 SHAPES = [
     ("flux", 1, 1536, 24, 128),
@@ -79,10 +75,11 @@ def cosine_stats(out_bshd, ref_bshd, head_dim):
 @benchmark()
 def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
     torch.manual_seed(0)
+    device = torch.device("cuda", torch.cuda.current_device())
     shape = (batch, seq_len, num_heads, head_dim)
-    q = torch.randn(shape, dtype=dtype)
-    k = torch.randn(shape, dtype=dtype)
-    v = torch.randn(shape, dtype=dtype)
+    q = torch.randn(shape, dtype=dtype, device=device)
+    k = torch.randn(shape, dtype=dtype, device=device)
+    v = torch.randn(shape, dtype=dtype, device=device)
     ref = run_torch(q, k, v, causal)  # BSHD fp32 reference
 
     # SDPA baseline consumes BHSD; pre-transpose outside the timed region.

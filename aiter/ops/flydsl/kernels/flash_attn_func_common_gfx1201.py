@@ -20,8 +20,7 @@ def _llvm_value(value):
 
 
 def pointer_to_llvm_ptr(ptr):
-    ptr_i64 = fx.Int64(fx.ptrtoint(ptr)).ir_value()
-    return llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr"), ptr_i64).result
+    return fx.to_llvm_ptr(ptr)
 
 
 def pointer_load(result_type, ptr):

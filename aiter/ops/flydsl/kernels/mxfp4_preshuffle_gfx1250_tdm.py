@@ -24,6 +24,7 @@ from .gemm_common_gfx1250 import (
     situv2_consts,
     workgroup_barrier,
 )
+from .kernels_common import ceildiv
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -176,11 +177,11 @@ def launch_gemm_a8w4_tdm(
     LDS_PAD_A = 16
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
     B_LDS_ROW = PACK_TK * 16
-    STAGE_A = ((tile_m * A_LDS_ROW + 15) // 16) * 16
-    STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
+    STAGE_A = ceildiv(tile_m * A_LDS_ROW, 16) * 16
+    STAGE_B = ceildiv((tile_n // 16) * B_LDS_ROW, 16) * 16
 
     SC_INNER = tile_k // 4
-    _SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
+    SB_SUPERS = tile_n // 32
     AS_KSTEPS = tile_k // 128
     AS_INNER = AS_KSTEPS * wmma_m_rep * 16
     AS_SUPERS = m_warp
@@ -196,15 +197,15 @@ def launch_gemm_a8w4_tdm(
     # SA_KDW dwords -> a 2-way bank conflict on one b32 read per operand).
     SA_KDW = AS_KSTEPS  # scale dwords per row per k-tile (tile_k // 128)
     STAGE_SA = (
-        ((tile_m * SA_KDW * 4 + 15) // 16) * 16
+        ceildiv(tile_m * SA_KDW * 4, 16) * 16
         if row_major_ascale
-        else ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
+        else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
-    STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
+    STAGE_SB = ceildiv(SB_SUPERS * SC_INNER * 4, 16) * 16
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
     # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
-    PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
+    PITCH = ceildiv(STAGE_A + STAGE_B + STAGE_SA + STAGE_SB, 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
     # +16 cols: the bf16 passthrough epilogue stages C with a padded row pitch
@@ -214,13 +215,13 @@ def launch_gemm_a8w4_tdm(
     # take while still spreading the b128 writes off one bank.
     # Ternaries, not if/else: @flyc.jit does not let branch-local names escape.
     C_ROW_BYTES = tile_n * 2
-    _lds_row_bytes = ((C_ROW_BYTES + 15) // 16) * 16
+    _lds_row_bytes = ceildiv(C_ROW_BYTES, 16) * 16
     _lds_row_bytes = _lds_row_bytes + (16 if _lds_row_bytes % 32 == 0 else 0)
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
-    C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
+    C_STORE_B = ceildiv(tile_m * (tile_n + store_pad) * 2, 128) * 128
     AS_FULL_OFF = num_buffers * PITCH
-    AS_FULL_B = ((AS_SUPERS * AS_FULL_INNER * 4 + 127) // 128) * 128
+    AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -272,8 +273,6 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
     ):
-        # rocdl.disable_xdl_arb_stall()
-
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
@@ -291,8 +290,8 @@ def launch_gemm_a8w4_tdm(
         # DeepGEMM contiguous-M swizzle, run at cluster granularity so peers land
         # on one m_tile. Ternaries, not `if`: the rewriter would trace a branch.
         TILES_PER_GROUP = 16
-        total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
-        total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
+        total_n_tiles = ceildiv(i32_n, tile_n)
+        total_m_tiles = ceildiv(i32_m, tile_m)
         swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
         local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
         n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
@@ -332,8 +331,7 @@ def launch_gemm_a8w4_tdm(
         expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
-        N_SUPERS = (n64 + 31) // 32
-        AS_ROW = (K // 128) * wmma_m_rep * 16
+        N_SUPERS = ceildiv(n64, 32)
         SA_GROW = K // 128  # row-major: scale dwords per M row
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
@@ -352,7 +350,7 @@ def launch_gemm_a8w4_tdm(
         base_ptr = _smem.allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
-            return fx.index_cast(T.index, fx.ptrtoint(p))
+            return fx.Index(fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
         if const_expr(enable_ep_scatter):
@@ -365,10 +363,7 @@ def launch_gemm_a8w4_tdm(
         def buf_ptr(s):
             return base_ptr + s * PITCH
 
-        def global_view(base, off, shape, stride):
-            return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
-
-        def lds_view(ptr, shape, stride):
+        def tensor_view(ptr, shape, stride):
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
         lds_load_b32, lds_store_b32 = make_lds_copy_ops(32)
@@ -459,9 +454,13 @@ def launch_gemm_a8w4_tdm(
             inner_seg = inner // len(wv) if split_i else inner
             wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
             wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
-            gt = global_view(
-                g_base,
-                g_off + fx.Int64(wave_outer_off) * g_stride + fx.Int64(wave_inner_off),
+            gt = tensor_view(
+                g_base
+                + (
+                    g_off
+                    + fx.Int64(wave_outer_off) * g_stride
+                    + fx.Int64(wave_inner_off)
+                ),
                 (seg, inner_seg),
                 (g_stride, 1),
             )
@@ -528,8 +527,8 @@ def launch_gemm_a8w4_tdm(
         if const_expr(tdm_as_in_prologue):
             add_tdm_loads(
                 gSA_base,
-                (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
-                AS_ROW,
+                (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
+                AS_FULL_INNER,
                 None,
                 AS_FULL_INNER,
                 AS_SUPERS,
@@ -558,8 +557,8 @@ def launch_gemm_a8w4_tdm(
         else:
             add_tdm_loads(
                 gSA_base,
-                (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
-                AS_ROW,
+                (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
+                AS_FULL_INNER,
                 None,
                 AS_INNER,
                 AS_SUPERS,
@@ -601,7 +600,7 @@ def launch_gemm_a8w4_tdm(
 
             def emit(j):
                 base = base_i32 if j.on_i32 else pa
-                dst = lds_view(
+                dst = tensor_view(
                     base + j.lds_off + (so4 if j.on_i32 else 0),
                     (j.outer, j.inner),
                     (j.lds_row, 1),
@@ -628,7 +627,7 @@ def launch_gemm_a8w4_tdm(
             """Loads the full A-scale K range into its resident LDS buffer."""
             for job in as_prologue_jobs:
                 if owns(job.waves):
-                    destination = lds_view(
+                    destination = tensor_view(
                         base_i32 + job.lds_off,
                         (job.outer, job.inner),
                         (job.lds_row, 1),
@@ -656,16 +655,16 @@ def launch_gemm_a8w4_tdm(
         lds_sb_lane_off = SB_OFF + ((wnb // 32) * SC_INNER + lane) * 4
 
         def lds_a_base(buf):
-            return buf + fx.index_cast(T.index, lds_a_lane_off)
+            return buf + fx.Index(lds_a_lane_off)
 
         def lds_b_base(buf):
-            return buf + fx.index_cast(T.index, lds_b_lane_off)
+            return buf + fx.Index(lds_b_lane_off)
 
         def lds_sa_base(buf):
-            return buf + fx.index_cast(T.index, lds_sa_lane_off)
+            return buf + fx.Index(lds_sa_lane_off)
 
         def lds_sb_base(buf):
-            return buf + fx.index_cast(T.index, lds_sb_lane_off)
+            return buf + fx.Index(lds_sb_lane_off)
 
         def lds_bases(buf):
             """Return ``buf``'s four region bases, the handles keepalive pins."""
@@ -986,8 +985,8 @@ def launch_gemm_a8w4_tdm(
                 # clamps to this expert's valid rows; padding rows stay unloaded
                 # and are masked in the epilogue.
                 _rm_i32 = fx.get_iter(arg_ep_row_map)
-                _rm_gt = global_view(
-                    _rm_i32, blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
+                _rm_gt = tensor_view(
+                    _rm_i32 + blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
                 )
                 _rm_atom = fx.rocdl.make_tdm_atom(
                     _rm_gt,
@@ -995,7 +994,7 @@ def launch_gemm_a8w4_tdm(
                     strides=[fx.Int64(2), None],
                     num_warps=num_waves,
                 )
-                _rm_dst = lds_view(
+                _rm_dst = tensor_view(
                     fx.recast_iter(p32_shared, _rowmap_lds_ptr), (tile_m, 2), (2, 1)
                 )
             # Post-compute wins for decode and for shallow pipelines: at
@@ -1201,8 +1200,6 @@ def launch_gemm_a8w4_tdm(
                 v2i32_ty = T.vec(2, T.i32)
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
-                # Total activated elements per wm row = N_MX_BLKS * WN_PER_MX_BLOCK * 4
-                _N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
@@ -1429,10 +1426,10 @@ def launch_gemm_a8w4_tdm(
                     _comb_ptr_ty,
                     fx.Int64(ep_win.lsa_ptr(fx.Int32(0), ep_combine_input_offset)),
                 )
-                _comb_view = global_view(
-                    _comb_iter, 0, (_oob, STORE_N), (_stride_elems, 1)
+                _comb_view = tensor_view(
+                    _comb_iter, (_oob, STORE_N), (_stride_elems, 1)
                 )
-                _lds_c = lds_view(
+                _lds_c = tensor_view(
                     fx.recast_iter(oc, base_ptr),
                     (tile_m, STORE_PITCH),
                     (STORE_PITCH, 1),
@@ -1490,9 +1487,11 @@ def launch_gemm_a8w4_tdm(
                     c_iter = fx.get_iter(arg_c)
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                 if const_expr(STORE_PAD == 0):
-                    gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+                    gtC = tensor_view(
+                        c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
+                    )
                     atomC = make_tdm_store(gtC, mn_oob, out_stride)
-                    src = lds_view(
+                    src = tensor_view(
                         fx.recast_iter(oc_store, base_ptr),
                         (tile_m, STORE_N),
                         (STORE_N, 1),
@@ -1500,8 +1499,8 @@ def launch_gemm_a8w4_tdm(
                 else:
                     # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
                     # extent clamps the inner axis to STORE_N so the pad never lands.
-                    gtC = global_view(
-                        c_iter, c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
+                    gtC = tensor_view(
+                        c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
                     )
                     atomC = fx.rocdl.make_tdm_atom(
                         gtC,
@@ -1509,7 +1508,7 @@ def launch_gemm_a8w4_tdm(
                         strides=[out_stride, None],
                         num_warps=num_waves,
                     )
-                    src = lds_view(
+                    src = tensor_view(
                         fx.recast_iter(oc_store, base_ptr),
                         (tile_m, STORE_PITCH),
                         (STORE_PITCH, 1),
@@ -1519,8 +1518,8 @@ def launch_gemm_a8w4_tdm(
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)
 
-    m_tiles = (i32_m + (tile_m - 1)) // tile_m
-    n_tiles = (N + (tile_n - 1)) // tile_n
+    m_tiles = ceildiv(i32_m, tile_m)
+    n_tiles = ceildiv(N, tile_n)
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c
     kargs = (

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -70,6 +72,7 @@ def _make_qkv(
         (1, 1024, 512, 12, 128),  # Wan-style long Q, short text K/V.
         (1, 4096, 512, 12, 128),
         (1, 2048, 1400, 8, 128),  # K/V pad to BN=64 (1408), not BM=256 (1536).
+        (1, 500, 1400, 8, 128),  # Short, unaligned Q with longer unaligned K/V.
         (1, 2048, 500, 8, 64),  # unaligned K/V (500 % BLOCK_N != 0 -> tail mask).
     ],
 )
@@ -122,6 +125,7 @@ def test_flydsl_fmha_correctness_cross_attention(
     "batch,seq_q,seq_kv,num_heads,head_dim",
     [
         (1, 1024, 512, 12, 128),  # Wan-style long Q, short text K/V.
+        (1, 500, 1400, 8, 128),  # Short, unaligned Q with longer unaligned K/V.
         (1, 2048, 500, 8, 64),  # unaligned K/V (500 % BLOCK_N != 0 -> tail mask).
     ],
 )
@@ -329,6 +333,131 @@ def test_flydsl_fmha_partial_kv_load_batch(head_dim, use_fp8):
 
 
 @pytest.mark.parametrize(
+    "head_dim,use_fp8,expected_bytes",
+    [
+        (512, False, 66048),
+        (992, True, 67584),
+    ],
+)
+def test_flydsl_fmha_rejects_lds_overflow(head_dim, use_fp8, expected_bytes):
+    """Reject shapes whose narrowest supported KV tile still exceeds 64 KiB."""
+    batch, seq_len, num_heads = 1, 2048, 1  # non-causal selector uses BLOCK_N=64
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    kwargs = {}
+    if use_fp8:
+        q = q.to(torch.float8_e4m3fn)
+        k = k.to(torch.float8_e4m3fn)
+        v = v.to(torch.float8_e4m3fn)
+        scale = torch.ones(1, dtype=torch.float32, device=q.device)
+        kwargs = {"q_descale": scale, "k_descale": scale, "v_descale": scale}
+
+    with pytest.raises(
+        ValueError,
+        match=rf"requires {expected_bytes} bytes of LDS.*65536-byte hardware limit",
+    ):
+        flydsl_flash_attn_func(q, k, v, causal=False, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "head_dim,use_fp8,selected_bytes,fallback_bytes",
+    [
+        (256, False, 66560, 33280),
+        (512, True, 67840, 34944),
+    ],
+)
+def test_flydsl_fmha_lds_falls_back_to_block_n32(
+    monkeypatch, head_dim, use_fp8, selected_bytes, fallback_bytes
+):
+    """An oversized BN64 selection retries BN32 without changing BLOCK_M."""
+    from aiter.ops.flydsl import fmha_kernels
+
+    assert (
+        fmha_kernels._gfx1201_fmha_lds_bytes(head_dim, 64, fp8=use_fp8)
+        == selected_bytes
+    )
+    assert (
+        fmha_kernels._gfx1201_fmha_lds_bytes(head_dim, 32, fp8=use_fp8)
+        == fallback_bytes
+    )
+
+    calls = []
+
+    def _fake_get_kernel(**kwargs):
+        calls.append(kwargs)
+
+        def _launch(*args, **launch_kwargs):
+            return None
+
+        return _launch
+
+    cache_name = "_get_fp8_gfx1201_kernel" if use_fp8 else "_get_kernel"
+    monkeypatch.setattr(fmha_kernels, cache_name, _fake_get_kernel)
+
+    batch, seq_len, num_heads = 1, 2048, 1
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    kwargs = {}
+    if use_fp8:
+        q = q.to(torch.float8_e4m3fn)
+        k = k.to(torch.float8_e4m3fn)
+        v = v.to(torch.float8_e4m3fn)
+        scale = torch.ones(1, dtype=torch.float32, device=q.device)
+        kwargs = {"q_descale": scale, "k_descale": scale, "v_descale": scale}
+
+    flydsl_flash_attn_func(q, k, v, causal=False, **kwargs)
+    assert len(calls) == 1
+    assert calls[0]["block_m"] == 256
+    assert calls[0]["block_n"] == 32
+    assert calls[0]["head_dim"] == head_dim
+
+
+@pytest.mark.parametrize(
+    "head_dim,use_fp8,expected_bytes",
+    [
+        (224, False, 58368),
+        (480, True, 63616),
+    ],
+)
+def test_flydsl_fmha_accepts_nearest_lds_boundary(
+    monkeypatch, head_dim, use_fp8, expected_bytes
+):
+    """The nearest supported multiple-of-32 below each LDS limit remains valid."""
+    from aiter.ops.flydsl import fmha_kernels
+
+    assert (
+        fmha_kernels._gfx1201_fmha_lds_bytes(head_dim, 64, fp8=use_fp8)
+        == expected_bytes
+    )
+
+    calls = []
+
+    def _fake_get_kernel(**kwargs):
+        calls.append(kwargs)
+
+        def _launch(*args, **launch_kwargs):
+            return None
+
+        return _launch
+
+    cache_name = "_get_fp8_gfx1201_kernel" if use_fp8 else "_get_kernel"
+    monkeypatch.setattr(fmha_kernels, cache_name, _fake_get_kernel)
+
+    batch, seq_len, num_heads = 1, 2048, 1
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    kwargs = {}
+    if use_fp8:
+        q = q.to(torch.float8_e4m3fn)
+        k = k.to(torch.float8_e4m3fn)
+        v = v.to(torch.float8_e4m3fn)
+        scale = torch.ones(1, dtype=torch.float32, device=q.device)
+        kwargs = {"q_descale": scale, "k_descale": scale, "v_descale": scale}
+
+    flydsl_flash_attn_func(q, k, v, causal=False, **kwargs)
+    assert len(calls) == 1
+    assert calls[0]["block_n"] == 64
+    assert calls[0]["head_dim"] == head_dim
+
+
+@pytest.mark.parametrize(
     "batch,seq_len,num_heads,head_dim",
     [
         (1, 1536, 24, 128),  # Flux compute-bound shape (fp8's target win).
@@ -501,6 +630,118 @@ def test_flydsl_hadamard_matrix_uses_target_device():
         torch.cuda.set_device(current_device)
 
 
+def test_flydsl_hadamard_cache_concurrent_first_use_and_reuse():
+    """Concurrent streams share one fully-produced cached matrix."""
+    import threading
+
+    from aiter.ops.flydsl import fmha_kernels
+
+    device = torch.device("cuda", 0)
+    fmha_kernels._HADAMARD_CACHE.clear()
+    barrier = threading.Barrier(2)
+    results = [None, None]
+    errors = []
+
+    def _worker(index):
+        try:
+            torch.cuda.set_device(device)
+            stream = torch.cuda.Stream(device=device)
+            barrier.wait()
+            with torch.cuda.stream(stream):
+                matrix = fmha_kernels._hadamard_matrix(128, device, torch.bfloat16)
+                checksum = matrix.float().sum()
+            stream.synchronize()
+            results[index] = (matrix.data_ptr(), checksum.item())
+        except Exception as exc:  # noqa: BLE001 - surfaced in the main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert results[0][0] == results[1][0]
+    assert results[0][1] == pytest.approx(math.sqrt(128), rel=2e-2)
+    assert results[1][1] == pytest.approx(math.sqrt(128), rel=2e-2)
+
+    reuse_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(reuse_stream):
+        reused = fmha_kernels._hadamard_matrix(128, device, torch.bfloat16)
+        reused_checksum = reused.float().sum()
+    reuse_stream.synchronize()
+    assert reused.data_ptr() == results[0][0]
+    assert reused_checksum.item() == pytest.approx(math.sqrt(128), rel=2e-2)
+
+
+def test_stream_readiness_concurrent_producers_chain_same_storage():
+    """The latest registration covers every earlier in-flight producer."""
+    import threading
+
+    from aiter.ops.flydsl.stream_readiness import (
+        register_ready,
+        wait_ready,
+    )
+
+    device = torch.device("cuda", 0)
+    tensor = torch.zeros(2, dtype=torch.int32, device=device)
+    slow_stream = torch.cuda.Stream(device=device)
+    fast_stream = torch.cuda.Stream(device=device)
+    consumer_stream = torch.cuda.Stream(device=device)
+    source_stream = torch.cuda.current_stream(device)
+    lhs = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device) * 0.01
+    rhs = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device) * 0.01
+    slow_registered = threading.Event()
+    errors = []
+
+    def _slow_producer():
+        try:
+            torch.cuda.set_device(device)
+            slow_stream.wait_stream(source_stream)
+            with torch.cuda.stream(slow_stream):
+                work = lhs
+                for _ in range(3):
+                    work = work @ rhs
+                # The write cannot execute until all queued matrix work does.
+                tensor[0].copy_((work[0, 0] * 0).to(torch.int32) + 1)
+            register_ready((tensor,), stream=slow_stream)
+            slow_registered.set()
+        except Exception as exc:  # noqa: BLE001 - surfaced in main thread
+            errors.append(exc)
+            slow_registered.set()
+
+    def _fast_producer():
+        try:
+            torch.cuda.set_device(device)
+            slow_registered.wait()
+            fast_stream.wait_stream(source_stream)
+            with torch.cuda.stream(fast_stream):
+                tensor[1].fill_(2)
+            register_ready((tensor,), stream=fast_stream)
+        except Exception as exc:  # noqa: BLE001 - surfaced in main thread
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_slow_producer),
+        threading.Thread(target=_fast_producer),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+
+    wait_ready(consumer_stream, (tensor,))
+    with torch.cuda.stream(consumer_stream):
+        observed = tensor.clone()
+    # If the latest registration did not chain the slow producer, this clone
+    # would capture tensor[0] before its matrix-dependent write.
+    consumer_stream.synchronize()
+    slow_stream.synchronize()
+    torch.testing.assert_close(observed.cpu(), torch.tensor([1, 2], dtype=torch.int32))
+
+
 def test_flydsl_fp8_quant_rejects_unknown_backend():
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     with pytest.raises(ValueError, match="unsupported fp8 quant backend"):
@@ -529,6 +770,16 @@ def test_flydsl_fp8_quant_validates_input_contract():
         flydsl_fp8_quant(q.cpu(), k.cpu(), v.cpu())
 
 
+@pytest.mark.parametrize("backend", ["flydsl", "triton", "torch"])
+@pytest.mark.parametrize("empty_index", [0, 1, 2])
+def test_flydsl_fp8_quant_rejects_empty_inputs(backend, empty_index):
+    q, k, v = _make_qkv(1, 8, 2, 128, torch.bfloat16)
+    tensors = [q, k, v]
+    tensors[empty_index] = tensors[empty_index][:, :0]
+    with pytest.raises(ValueError, match="q/k/v must be non-empty"):
+        flydsl_fp8_quant(*tensors, backend=backend)
+
+
 def test_flydsl_fp8_quant_non_current_stream():
     from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
         flydsl_fp8_pertensor_quant,
@@ -553,6 +804,105 @@ def test_flydsl_fp8_quant_non_current_stream():
     assert cos.mean().item() > 0.99
 
 
+def test_flydsl_fp8_quant_reuses_out_across_non_current_streams():
+    """A second stream must wait before overwriting a registered output."""
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    shape = (1, 4096, 2, 128)
+    first = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    second = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(shape, dtype=torch.float8_e4m3fn, device="cuda")
+    first_stream = torch.cuda.Stream()
+    second_stream = torch.cuda.Stream()
+
+    flydsl_fp8_pertensor_quant(first, rotate=True, out=out, stream=first_stream)
+    result, scale = flydsl_fp8_pertensor_quant(
+        second, rotate=False, out=out, stream=second_stream
+    )
+    second_stream.synchronize()
+
+    assert result.data_ptr() == out.data_ptr()
+    cos = F.cosine_similarity(
+        second.float().reshape(-1, 128),
+        (result.float() * scale).reshape(-1, 128),
+        dim=1,
+    )
+    assert cos.mean().item() > 0.99
+
+
+def test_low_level_fp8_quant_waits_for_registered_attention_input():
+    """Low-level quant waits for an async attention producer on another stream."""
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    producer = torch.cuda.Stream(device=q.device)
+    consumer = torch.cuda.Stream(device=q.device)
+    attention = flydsl_flash_attn_func(q, k, v, stream=producer)
+
+    quantized, scale = flydsl_fp8_pertensor_quant(
+        attention, rotate=False, stream=consumer
+    )
+    consumer.synchronize()
+
+    cos = F.cosine_similarity(
+        attention.float().reshape(-1, 128),
+        (quantized.float() * scale).reshape(-1, 128),
+        dim=1,
+    )
+    assert cos.mean().item() > 0.99
+
+
+def test_flydsl_fp8_quant_cross_stream_consumer_needs_no_manual_sync():
+    """Attention waits for FP8 tensors produced on a different stream."""
+    device = torch.device("cuda")
+    producer = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(producer):
+        q = torch.randn(1, 129, 4, 128, dtype=torch.bfloat16, device=device)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(q, k, v)
+
+    # New tensor objects sharing the registered allocations must retain the
+    # producer dependency.
+    q8, k8, v8 = q8.view_as(q8), k8.view_as(k8), v8.view_as(v8)
+    sq, sk, sv = sq.view(1), sk.view(1), sv.view(1)
+
+    # Deliberately consume on the default/current stream without synchronizing
+    # or explicitly waiting for the producer stream.
+    out = flydsl_flash_attn_func(q8, k8, v8, q_descale=sq, k_descale=sk, v_descale=sv)
+    ref = _ref_sdpa_bshd(q, k, v)
+    cosine = F.cosine_similarity(
+        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
+    )
+    assert cosine.mean().item() > 0.998
+
+
+def test_low_level_fp8_quant_cross_stream_consumer_needs_no_manual_sync():
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    q, k, v = _make_qkv(1, 129, 4, 128, torch.bfloat16)
+    producer = torch.cuda.Stream(device=q.device)
+    q_out = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    k_out = torch.empty_like(k, dtype=torch.float8_e4m3fn)
+    v_out = torch.empty_like(v, dtype=torch.float8_e4m3fn)
+    q8, sq = flydsl_fp8_pertensor_quant(q, rotate=True, out=q_out, stream=producer)
+    k8, sk = flydsl_fp8_pertensor_quant(k, rotate=True, out=k_out, stream=producer)
+    v8, sv = flydsl_fp8_pertensor_quant(v, rotate=False, out=v_out, stream=producer)
+
+    out = flydsl_flash_attn_func(q8, k8, v8, q_descale=sq, k_descale=sk, v_descale=sv)
+    ref = _ref_sdpa_bshd(q, k, v)
+    cosine = F.cosine_similarity(
+        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
+    )
+    assert cosine.mean().item() > 0.998
+
+
 def test_flydsl_fp8_quant_validates_low_level_contract():
     from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
         flydsl_fp8_pertensor_quant,
@@ -571,6 +921,28 @@ def test_flydsl_fp8_quant_validates_low_level_contract():
 
     with pytest.raises(ValueError, match="head_dim=128"):
         flydsl_fp8_pertensor_quant(x[:, :64], rotate=False)
+
+
+def test_flydsl_fp8_quant_rejects_out_overlapping_input_storage():
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    x = torch.randn(1024, 128, dtype=torch.bfloat16, device="cuda")
+    # Reinterpret the first half of x's byte storage as a same-shaped FP8 view.
+    # It satisfies the output shape/dtype/contiguity contract but aliases x.
+    out = (
+        x.view(torch.uint8)
+        .reshape(-1)[: x.numel()]
+        .view(torch.float8_e4m3fn)
+        .reshape(x.shape)
+    )
+    assert (
+        out.is_contiguous()
+        and out.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+    )
+    with pytest.raises(ValueError, match="must not overlap input storage"):
+        flydsl_fp8_pertensor_quant(x, rotate=False, out=out)
 
 
 def test_flydsl_fp8_ignores_bf16_lds_vec_width_toggle(monkeypatch):
@@ -717,7 +1089,20 @@ def test_flydsl_fmha_rejects_bad_out_buffer():
     with pytest.raises(ValueError, match="dtype"):
         flydsl_flash_attn_func(q, k, v, out=bad_dtype)
     if torch.cuda.device_count() >= 2:
-        bad_device = torch.empty(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda:1")
+        q_index = (
+            q.device.index
+            if q.device.index is not None
+            else torch.cuda.current_device()
+        )
+        other_index = (q_index + 1) % torch.cuda.device_count()
+        bad_device = torch.empty(
+            1,
+            1024,
+            8,
+            128,
+            dtype=torch.bfloat16,
+            device=f"cuda:{other_index}",
+        )
         with pytest.raises(ValueError, match="must be on"):
             flydsl_flash_attn_func(q, k, v, out=bad_device)
 
@@ -749,6 +1134,83 @@ def test_flydsl_fmha_non_current_stream_padding_and_out():
     assert cos.min().item() > 0.99
 
 
+def test_flydsl_fmha_reused_out_orders_non_current_streams():
+    """A second asynchronous write waits for the first write to shared out."""
+    q1, k1, v1 = _make_qkv(1, 129, 2, 128, torch.bfloat16)
+    q2, k2, v2 = _make_qkv(1, 129, 2, 128, torch.bfloat16)
+    q2 = q2 + 0.5
+    k2 = k2 - 0.25
+    v2 = -v2
+    out = torch.empty_like(q1)
+    first_stream = torch.cuda.Stream(device=q1.device)
+    second_stream = torch.cuda.Stream(device=q1.device)
+
+    first = flydsl_flash_attn_func(q1, k1, v1, stream=first_stream, out=out)
+    second = flydsl_flash_attn_func(q2, k2, v2, stream=second_stream, out=out)
+
+    # Synchronizing only the second stream is sufficient because its write is
+    # chained after the first output event.
+    second_stream.synchronize()
+    ref = _ref_sdpa_bshd(q2, k2, v2)
+    assert first.data_ptr() == second.data_ptr() == out.data_ptr()
+    cosine = F.cosine_similarity(
+        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
+    )
+    assert cosine.min().item() > 0.99
+
+
+def test_bf16_attention_result_chains_across_streams():
+    """A BF16 result can immediately become Q/K/V on another stream."""
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    first_stream = torch.cuda.Stream(device=q.device)
+    second_stream = torch.cuda.Stream(device=q.device)
+
+    first = flydsl_flash_attn_func(q, k, v, stream=first_stream)
+    second = flydsl_flash_attn_func(first, first, first, stream=second_stream)
+
+    second_stream.synchronize()
+    first_ref = _ref_sdpa_bshd(q, k, v)
+    second_ref = _ref_sdpa_bshd(first_ref, first_ref, first_ref)
+    cosine = F.cosine_similarity(
+        second.float().reshape(-1, 128),
+        second_ref.float().reshape(-1, 128),
+        dim=1,
+    )
+    assert cosine.mean().item() > 0.999
+
+
+@pytest.mark.parametrize("backend", ["torch", "triton"])
+def test_async_attention_result_feeds_public_fp8_quant(backend):
+    """Public quant backends wait for an asynchronous attention producer."""
+    if backend == "triton":
+        from aiter.ops.flydsl import fmha_kernels
+
+        if not fmha_kernels._HAS_TRITON:
+            pytest.skip("Triton is unavailable")
+
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    produced_ref = _ref_sdpa_bshd(q, k, v)
+    producer = torch.cuda.Stream(device=q.device)
+    backing = torch.empty(1, 2, 128, 128, dtype=torch.bfloat16, device=q.device)
+    producer_out = backing.transpose(1, 2)
+    assert producer_out.shape == q.shape and not producer_out.is_contiguous()
+    produced = flydsl_flash_attn_func(q, k, v, stream=producer, out=producer_out)
+
+    q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(
+        produced, produced, produced, backend=backend
+    )
+    del q, k, v, produced, producer_out, backing
+    # Encourage reuse of both the producer allocation and quant staging
+    # allocations before any explicit synchronization occurs.
+    torch.empty(1, 128, 2, 128, dtype=torch.bfloat16, device="cuda").fill_(float("nan"))
+    out = flydsl_flash_attn_func(q8, k8, v8, q_descale=sq, k_descale=sk, v_descale=sv)
+    ref = _ref_sdpa_bshd(produced_ref, produced_ref, produced_ref)
+    cosine = F.cosine_similarity(
+        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
+    )
+    assert cosine.mean().item() > 0.998
+
+
 @pytest.mark.parametrize(
     "shape_q,shape_kv",
     [
@@ -770,8 +1232,39 @@ def test_flydsl_fmha_rejects_zero_dimensions(shape_q, shape_kv):
 def test_flydsl_fmha_rejects_out_alias(source):
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     out = {"q": q, "k": k, "v": v}[source]
-    with pytest.raises(ValueError, match="must not alias"):
+    with pytest.raises(ValueError, match="must not overlap"):
         flydsl_flash_attn_func(q, k, v, out=out)
+
+
+@pytest.mark.parametrize("layout", ["expanded", "strided"])
+def test_flydsl_fmha_rejects_unsafe_out_layout(layout):
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    if layout == "expanded":
+        out = torch.empty(1, 1, 1, 1, dtype=q.dtype, device=q.device).expand_as(q)
+    else:
+        backing = torch.empty(1, 128, 2, 256, dtype=q.dtype, device=q.device)
+        out = backing[..., ::2]
+    assert out.shape == q.shape and not out.is_contiguous()
+    with pytest.raises(ValueError, match="internal overlap or unsupported striding"):
+        flydsl_flash_attn_func(q, k, v, out=out)
+
+
+def test_flydsl_fmha_rejects_out_overlapping_fp8_descale():
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    q8, k8, v8, _sq, sk, sv = flydsl_fp8_quant(q, k, v)
+    out = torch.empty_like(q)
+    alias_scale = out.view(torch.uint8).reshape(-1)[:4].view(torch.float32)
+    assert alias_scale.shape == (1,)
+    with pytest.raises(ValueError, match="FP8 descale storage"):
+        flydsl_flash_attn_func(
+            q8,
+            k8,
+            v8,
+            q_descale=alias_scale,
+            k_descale=sk,
+            v_descale=sv,
+            out=out,
+        )
 
 
 @pytest.mark.parametrize("seq_len", [96, 1408])
@@ -786,6 +1279,114 @@ def test_flydsl_fmha_masks_block_m_padding_when_block_n_aligned(seq_len):
     assert cosine.mean().item() > 0.999
 
 
+@pytest.mark.parametrize("seq_len", [96, 1408])
+def test_flydsl_fmha_block_n_aligned_skips_tail_specialization(monkeypatch, seq_len):
+    """BLOCK_M-only padding must not compile unnecessary KV tail predicates."""
+    from aiter.ops.flydsl import fmha_kernels
+
+    calls = []
+
+    def _fake_get_kernel(**kwargs):
+        calls.append(kwargs)
+
+        def _launch(*args, **launch_kwargs):
+            return None
+
+        return _launch
+
+    monkeypatch.setattr(fmha_kernels, "_get_kernel", _fake_get_kernel)
+    q, k, v = _make_qkv(1, seq_len, 2, 128, torch.bfloat16)
+    flydsl_flash_attn_func(q, k, v, causal=False)
+    assert len(calls) == 1
+    assert calls[0]["tail_mask"] is False
+
+
+def test_flydsl_fmha_bf16_vec_width_participates_in_cache_key(monkeypatch):
+    from aiter.ops.flydsl import fmha_kernels
+
+    builds = []
+
+    def _fake_build(**kwargs):
+        builds.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(fmha_kernels, "build_flash_attn_func_module", _fake_build)
+    fmha_kernels._get_kernel.cache_clear()
+    common = {
+        "device_index": 0,
+        "num_heads": 2,
+        "head_dim": 128,
+        "causal": False,
+        "dtype_str": "bf16",
+        "waves_per_eu": 2,
+        "daz": True,
+        "block_m": 128,
+        "block_n": 32,
+        "softmax_scale": None,
+        "tail_mask": False,
+        "cross_attn": False,
+    }
+    fmha_kernels._get_kernel(**common, lds_vec_width=16)
+    fmha_kernels._get_kernel(**common, lds_vec_width=8)
+    fmha_kernels._get_kernel(**common, lds_vec_width=16)
+    assert len(builds) == 2
+    fmha_kernels._get_kernel.cache_clear()
+
+
+def test_flydsl_fmha_rejects_invalid_stream_type():
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    with pytest.raises(TypeError, match="torch.cuda.Stream or None"):
+        flydsl_flash_attn_func(q, k, v, stream=object())
+
+
+def test_low_level_fp8_quant_rejects_invalid_stream_type():
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(TypeError, match="torch.cuda.Stream or None"):
+        flydsl_fp8_pertensor_quant(x, rotate=False, stream=object())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["seq_len", "seq_len_kv_real", "seq_len_kv"],
+)
+def test_gfx1201_launch_limits_reject_int32_overflow(field):
+    from aiter.ops.flydsl import fmha_kernels
+
+    lengths = {"seq_len": 128, "seq_len_kv_real": 128, "seq_len_kv": 128}
+    lengths[field] = 1 << 31
+    with pytest.raises(ValueError, match=rf"{1 << 31}.*Int32 limit"):
+        fmha_kernels._validate_gfx1201_launch_limits(
+            **lengths, num_heads=1, head_dim=64, fp8=True
+        )
+
+
+def test_gfx1201_launch_limits_validate_bf16_buffer_descriptor():
+    from aiter.ops.flydsl import fmha_kernels
+
+    max_seq_below_limit = ((1 << 32) - 1) // (64 * 2)
+    fmha_kernels._validate_gfx1201_launch_limits(
+        seq_len=128,
+        seq_len_kv_real=max_seq_below_limit,
+        seq_len_kv=max_seq_below_limit,
+        num_heads=1,
+        head_dim=64,
+        fp8=False,
+    )
+    with pytest.raises(ValueError, match=r"byte count below 2\^32"):
+        fmha_kernels._validate_gfx1201_launch_limits(
+            seq_len=128,
+            seq_len_kv_real=max_seq_below_limit + 1,
+            seq_len_kv=max_seq_below_limit + 1,
+            num_heads=1,
+            head_dim=64,
+            fp8=False,
+        )
+
+
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_flydsl_fmha_cross_attention_batch_two(head_dim):
     q = torch.randn(2, 1000, 8, head_dim, dtype=torch.bfloat16, device="cuda")
@@ -798,3 +1399,84 @@ def test_flydsl_fmha_cross_attention_batch_two(head_dim):
     )
     assert cosine.min().item() > 0.99
     assert cosine.mean().item() > 0.999
+
+
+def test_gfx1201_compiled_caches_are_device_specific():
+    """Identical BF16, FP8, and producer configs compile per concrete GPU."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 visible GPUs")
+
+    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels import fp8_quant_gfx1201
+
+    fmha_kernels._get_kernel.cache_clear()
+    fmha_kernels._get_fp8_gfx1201_kernel.cache_clear()
+    fp8_quant_gfx1201._compile.cache_clear()
+
+    for index in (0, 1):
+        device = torch.device("cuda", index)
+        with torch.cuda.device(device):
+            q = torch.randn(1, 128, 2, 128, dtype=torch.bfloat16, device=device)
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+
+            bf16_out = flydsl_flash_attn_func(q, k, v)
+            ref = _ref_sdpa_bshd(q, k, v)
+            assert bf16_out.device == device
+            bf16_cos = F.cosine_similarity(
+                bf16_out.float().reshape(-1, 128),
+                ref.float().reshape(-1, 128),
+                dim=1,
+            )
+            assert bf16_cos.mean().item() > 0.999
+
+            q8, sq = fp8_quant_gfx1201.flydsl_fp8_pertensor_quant(q, rotate=True)
+            k8, sk = fp8_quant_gfx1201.flydsl_fp8_pertensor_quant(k, rotate=True)
+            v8, sv = fp8_quant_gfx1201.flydsl_fp8_pertensor_quant(v, rotate=False)
+            assert all(t.device == device for t in (q8, k8, v8, sq, sk, sv))
+
+            fp8_out = flydsl_flash_attn_func(
+                q8, k8, v8, q_descale=sq, k_descale=sk, v_descale=sv
+            )
+            assert fp8_out.device == device
+            fp8_cos = F.cosine_similarity(
+                fp8_out.float().reshape(-1, 128),
+                ref.float().reshape(-1, 128),
+                dim=1,
+            )
+            assert fp8_cos.mean().item() > 0.998
+
+
+def test_public_triton_quant_uses_input_device_when_current_device_differs():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 visible GPUs")
+    from aiter.ops.flydsl import fmha_kernels
+
+    if not fmha_kernels._HAS_TRITON:
+        pytest.skip("Triton is unavailable")
+
+    original_device = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(0)
+        for index in (1, 0, 1):
+            device = torch.device("cuda", index)
+            q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16, device=device)
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+            q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(q, k, v, backend="triton")
+
+            assert torch.cuda.current_device() == 0
+            assert all(t.device == device for t in (q8, k8, v8, sq, sk, sv))
+            assert all(torch.isfinite(s).all().item() for s in (sq, sk, sv))
+
+            out = flydsl_flash_attn_func(
+                q8, k8, v8, q_descale=sq, k_descale=sk, v_descale=sv
+            )
+            ref = _ref_sdpa_bshd(q, k, v)
+            cosine = F.cosine_similarity(
+                out.float().reshape(-1, 64), ref.float().reshape(-1, 64), dim=1
+            )
+            assert out.device == device
+            assert cosine.mean().item() > 0.998
+    finally:
+        torch.cuda.set_device(original_device)

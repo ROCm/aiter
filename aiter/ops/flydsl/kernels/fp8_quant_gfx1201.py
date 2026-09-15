@@ -49,11 +49,37 @@ try:
 except ImportError:
     from . import buffer_ops
 
+from ..stream_readiness import register_ready, wait_ready
 from .tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 32  # 1 wave32
 _FP8_MAX = 448.0  # e4m3fn max normal (gfx1201 native fp8)
 _FP8_DTYPE = torch.float8_e4m3fn
+
+
+def _storage_byte_range(tensor):
+    """Return the half-open byte range touched by a non-empty tensor view."""
+    storage_ptr = tensor.untyped_storage().data_ptr()
+    first = tensor.data_ptr() - storage_ptr
+    last = first
+    element_size = tensor.element_size()
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        delta = (size - 1) * stride * element_size
+        first += min(0, delta)
+        last += max(0, delta)
+    return first, last + element_size
+
+
+def _storage_overlaps(lhs, rhs):
+    if lhs.device != rhs.device:
+        return False
+    lhs_storage = lhs.untyped_storage()
+    rhs_storage = rhs.untyped_storage()
+    if lhs_storage.data_ptr() != rhs_storage.data_ptr():
+        return False
+    lhs_first, lhs_last = _storage_byte_range(lhs)
+    rhs_first, rhs_last = _storage_byte_range(rhs)
+    return lhs_first < rhs_last and rhs_first < lhs_last
 
 
 def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
@@ -195,8 +221,9 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
     return launch
 
 
-@lru_cache(maxsize=16)
-def _compile(*, head_dim: int, rotate: bool, mode: str):
+@lru_cache(maxsize=32)
+def _compile(*, device_index: int, head_dim: int, rotate: bool, mode: str):
+    # device_index scopes the cached compiled launcher to its HIP context.
     launcher = _build_kernel(head_dim=head_dim, rotate=rotate, mode=mode)
     launcher.compile_hints = {
         "waves_per_eu": 8,
@@ -236,6 +263,10 @@ def flydsl_fp8_pertensor_quant(
     producer_stream = torch.cuda.current_stream(x.device)
     if stream is None:
         stream = producer_stream
+    elif not isinstance(stream, torch.cuda.Stream):
+        raise TypeError(
+            f"stream must be a torch.cuda.Stream or None, got {type(stream).__name__}"
+        )
     if stream.device != x.device:
         raise ValueError(f"stream must be on {x.device}, got {stream.device}")
 
@@ -244,18 +275,31 @@ def flydsl_fp8_pertensor_quant(
         # the explicitly supplied launch stream. This must precede contiguous(),
         # which may itself enqueue a copy on the launch stream.
         stream.wait_stream(producer_stream)
+    # The input may itself have been returned by an asynchronous operation on a
+    # third stream. Its registered event is the authoritative dependency and
+    # must also be observed before any contiguous staging copy reads it.
+    wait_ready(stream, (original_x,))
 
     expected_shape = tuple(x.shape)
-    if out is not None and (
-        tuple(out.shape) != expected_shape
-        or out.dtype != _FP8_DTYPE
-        or out.device != x.device
-        or not out.is_contiguous()
+    caller_out = out
+    if caller_out is not None and (
+        tuple(caller_out.shape) != expected_shape
+        or caller_out.dtype != _FP8_DTYPE
+        or caller_out.device != x.device
+        or not caller_out.is_contiguous()
     ):
         raise ValueError(
             "out must be a contiguous float8_e4m3fn tensor with shape "
             f"{expected_shape} on {x.device}"
         )
+    if caller_out is not None and _storage_overlaps(x, caller_out):
+        raise ValueError("out must not overlap input storage")
+
+    # A caller may recycle an output previously produced asynchronously by this
+    # quantizer. Honor its registered completion event before writing the same
+    # storage from a different stream.
+    if caller_out is not None:
+        wait_ready(stream, (caller_out,))
 
     def _ptr(t):
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
@@ -263,26 +307,32 @@ def flydsl_fp8_pertensor_quant(
     with torch.cuda.device(x.device), torch.cuda.stream(stream):
         x = x.contiguous()
         M = x.numel() // D
-        if out is None:
+        if caller_out is None:
             out = torch.empty_like(x, dtype=_FP8_DTYPE)
+        else:
+            out = caller_out
         partials = torch.empty(M, dtype=torch.float32, device=x.device)
         fx_stream = Stream(stream)
 
         # Pass 1 writes per-row amax partials; x_out is unused.
-        amax_k = _compile(head_dim=D, rotate=rotate, mode="amax")
+        amax_k = _compile(
+            device_index=x.device.index, head_dim=D, rotate=rotate, mode="amax"
+        )
         _run_compiled(amax_k, _ptr(x), _ptr(x), _ptr(partials), M, fx_stream)
         scale = (partials.amax() / _FP8_MAX).clamp(min=1e-12).reshape(1)
 
         # Pass 2 scales, clamps, and casts using the global descale.
-        scale_k = _compile(head_dim=D, rotate=rotate, mode="scale")
+        scale_k = _compile(
+            device_index=x.device.index, head_dim=D, rotate=rotate, mode="scale"
+        )
         _run_compiled(scale_k, _ptr(x), _ptr(out), _ptr(scale), M, fx_stream)
 
-        # The caching allocator otherwise associates these outputs with the
-        # current stream. Keep their storage alive until an explicitly supplied
-        # non-current launch stream has completed its writes.
-        if stream != producer_stream:
-            original_x.record_stream(stream)
-            x.record_stream(stream)
-            out.record_stream(stream)
-            scale.record_stream(stream)
-    return out, scale
+        # Associate every participating allocation with the actual launch
+        # stream. This is required even when it is the current stream because a
+        # registered producer may have handed us storage from another stream.
+        original_x.record_stream(stream)
+        x.record_stream(stream)
+        out.record_stream(stream)
+        scale.record_stream(stream)
+        result = register_ready((out, scale), stream=stream)
+    return result
