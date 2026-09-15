@@ -2061,6 +2061,110 @@ def test_mtp_query_split_dispatch(monkeypatch, batch_size, overrides, expected_s
         assert compile_arguments[0]["prefetch_v"] is True
 
 
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,block_size,query_length,per_token,expected_prefetch,expected_splits",
+    [
+        pytest.param(1, 16, 1, False, (False, False), 1, id="scalar16-small"),
+        pytest.param(33, 16, 1, False, (False, False), 1, id="scalar16-large"),
+        pytest.param(32, 128, 1, False, (False, False), 1, id="scalar128-cu"),
+        pytest.param(33, 128, 1, False, (False, True), 1, id="scalar128-past-cu"),
+        pytest.param(64, 128, 1, False, (False, True), 1, id="scalar128-2cu"),
+        pytest.param(65, 128, 1, False, (False, False), 1, id="scalar128-past-2cu"),
+        pytest.param(33, 16, 1, True, (True, True), 1, id="per-token16"),
+        pytest.param(32, 128, 1, True, (True, True), 1, id="per-token128-cu"),
+        pytest.param(33, 128, 1, True, (True, False), 1, id="per-token128-past-cu"),
+        pytest.param(16, 16, 4, True, (True, True), 4, id="mtp4-page16-split"),
+        pytest.param(17, 16, 4, True, (False, False), 1, id="mtp4-page16-fused"),
+        pytest.param(16, 128, 4, True, (True, True), 4, id="mtp4-page128-split"),
+        pytest.param(17, 128, 4, True, (False, False), 1, id="mtp4-page128-fused"),
+    ],
+)
+def test_v_prefetch_dispatch_ignores_removed_environment_overrides(
+    monkeypatch,
+    trans_v,
+    batch_size,
+    block_size,
+    query_length,
+    per_token,
+    expected_prefetch,
+    expected_splits,
+):
+    """Legacy overrides cannot change the default automatic specialization."""
+    _require_gpu()
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_arguments = []
+
+    def capture_compile(**kwargs):
+        compile_arguments.append(kwargs)
+        return {"launch": object()}
+
+    monkeypatch.setattr(module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(module, "compile_pa_decode_tile", capture_compile)
+    monkeypatch.setattr(module, "_run_compiled", lambda *args: None)
+    monkeypatch.setattr(module, "ptr_arg", lambda tensor, dtype=None: tensor)
+    monkeypatch.setattr(
+        module, "launch_pa_decode_ps_reduce", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_args, **_kwargs: type("Props", (), {"multi_processor_count": 256})(),
+    )
+    parts, head_dim, query_group = 8, 128, 16
+    query = torch.empty(
+        batch_size * query_length, query_group, head_dim, dtype=dtypes.bf16
+    )
+    output = torch.empty_like(query)
+    key_cache = torch.empty(
+        batch_size, 1, head_dim // 16, block_size, 16, dtype=torch.float8_e4m3fn
+    )
+    value_shape = (
+        (batch_size, 1, block_size // 16, head_dim, 16)
+        if trans_v
+        else (batch_size, 1, head_dim, block_size)
+    )
+    value_cache = torch.empty(value_shape, dtype=torch.float8_e4m3fn)
+    scale_shape = (batch_size, 1, block_size, 1) if per_token else (1,)
+    scales = torch.ones(scale_shape, dtype=dtypes.fp32)
+    context_lengths = torch.full((batch_size,), block_size, dtype=dtypes.i32)
+    block_tables = torch.arange(batch_size, dtype=dtypes.i32).reshape(batch_size, 1)
+    legacy_environment_names = (
+        "AITER_FLYDSL_PA_PAGE16_VPIPE",
+        "AITER_FLYDSL_PA_PAGE16_VPIPE_IGLP",
+        "AITER_FLYDSL_PA_PAGE128_EARLY_V",
+    )
+    for enabled in (False, True):
+        for name in legacy_environment_names:
+            if enabled:
+                monkeypatch.setenv(name, "1")
+            else:
+                monkeypatch.delenv(name, raising=False)
+        pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            head_dim**-0.5,
+            query_length,
+            parts,
+            KV_COMPUTE_BLOCK,
+            torch.float8_e4m3fn,
+            None,
+            scales,
+            scales,
+        )
+
+    assert len(compile_arguments) == 2
+    assert compile_arguments[0] == compile_arguments[1]
+    # Expectations are indexed by the V layout: rank-4 plain, then rank-5 transposed.
+    assert compile_arguments[0]["prefetch_v"] is expected_prefetch[int(trans_v)]
+    assert compile_arguments[0]["query_splits"] == expected_splits
+    assert compile_arguments[0]["num_partitions"] == parts
+
+
 def main():
     torch.set_default_device("cuda")
     if not torch.cuda.is_available():

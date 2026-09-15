@@ -136,6 +136,7 @@ for file in "${sharded_files[@]}"; do
                         "${test_file}::test_recommended_splits_has_configurable_upper_clamp" \
                         "${test_file}::test_recommended_splits_rejects_invalid_upper_clamp" \
                         "${test_file}::test_v_prefetch_workgroup_interval" \
+                        "${test_file}::test_v_prefetch_dispatch_ignores_removed_environment_overrides" \
                         "${test_file}::test_pa_decode_fixed_length_accuracy" \
                         "${test_file}::test_pa_decode_variable_length_accuracy" \
                         "${test_file}::test_large_negative_logits_preserve_online_softmax" \
