@@ -11,12 +11,15 @@ import pytest
 import torch
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 if arch_info.get_arch() == "gfx950":
     import aiter.ops.triton.attention.sparse_mla as smd
     from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
 
-FP8_MAX = 448.0
+# The packed fp8_ds_mla record is OCP e4m3 by definition of the format.
+FP8_DTYPE = get_fp8_e4m3_dtype()
+FP8_MAX = torch.finfo(FP8_DTYPE).max
 KV_LORA, ROPE = 512, 64
 D_QK = KV_LORA + ROPE
 
@@ -29,7 +32,7 @@ def _skip_unless_gfx950():
 def quantize_flat_fp8(kv):
     """vLLM's production layout: whole row fp8 with one per-tensor scale."""
     scale = (kv.float().abs().amax() / FP8_MAX).clamp_min(1e-30).reshape(1)
-    q8 = (kv.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    q8 = (kv.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
     return q8.view(torch.uint8), scale.to(torch.float32)
 
 
@@ -40,7 +43,7 @@ def pack_ds_mla(kv, block_size=64):
     cache = torch.zeros(nb * block_size, 656, dtype=torch.uint8, device=kv.device)
     x = kv[:, :KV_LORA].float().reshape(T, 4, 128)
     scale = (x.abs().amax(-1) / FP8_MAX).clamp_min(1e-30)
-    q8 = (x / scale[..., None]).to(torch.float8_e4m3fn).view(torch.uint8)
+    q8 = (x / scale[..., None]).to(FP8_DTYPE).view(torch.uint8)
     cache[:T, :KV_LORA] = q8.reshape(T, KV_LORA)
     cache[:T, 512:528].view(torch.float32).copy_(scale)
     cache[:T, 528:].view(torch.bfloat16).copy_(kv[:, KV_LORA:])
@@ -48,12 +51,12 @@ def pack_ds_mla(kv, block_size=64):
 
 
 def dequant_flat_fp8(u8, scale):
-    return u8.view(torch.float8_e4m3fn).float() * scale
+    return u8.view(FP8_DTYPE).float() * scale
 
 
 def dequant_ds_mla(cache):
     flat = cache.reshape(-1, 656)
-    x = flat[:, :KV_LORA].view(torch.float8_e4m3fn).float().reshape(-1, 4, 128)
+    x = flat[:, :KV_LORA].view(FP8_DTYPE).float().reshape(-1, 4, 128)
     sc = flat[:, 512:528].view(torch.float32)
     nope = (x * sc[..., None]).reshape(-1, KV_LORA)
     rope = flat[:, 528:].view(torch.bfloat16).float()
