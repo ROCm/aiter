@@ -1558,3 +1558,31 @@ if __name__ == "__main__":
         )
         sys.exit(1)
     print("All fused_moe_router tests passed!")
+
+
+def test_arch_gate_is_the_explicit_predicate():
+    """The arch gate must be a predicate on the arch, not an inference from metadata.
+
+    A metadata miss does not refuse: get_2stage_cfgs falls through to default heuristics, so
+    "no tuned row" must never be read as "this arch cannot run it". This asserts the gate
+    against the SAME get_gfx the predicate itself closes over -- this module aliases
+    get_gfx_runtime to that name, which is a different function, and comparing against the
+    alias would let the test pass for the wrong reason.
+    """
+    from aiter.fused_moe import fused_moe_router_arch_supported
+    from aiter.fused_moe import get_gfx as predicate_get_gfx
+
+    assert fused_moe_router_arch_supported() == (predicate_get_gfx() == "gfx950")
+
+
+def test_max_validated_tokens_matches_validated_set():
+    """The shipped constant and the shipped validated set must describe one thing."""
+    from aiter.fused_moe import (
+        AITER_FUSED_ROUTER_MAX_VALIDATED_TOKENS as MAXT,
+        FUSED_MOE_ROUTER_VALIDATED_TOKENS as VT,
+    )
+
+    assert VT, "the validated token set must not be empty"
+    assert MAXT == max(VT)
+    assert list(VT) == sorted(set(VT)), "validated tokens must be sorted and unique"
+    assert all(t >= 1 for t in VT)

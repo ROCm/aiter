@@ -96,6 +96,24 @@ __device__ __forceinline__ float bf16f(const T& x)
     return opus::bf16_to_fp32(x);
 }
 
+// The reference sigmoid, computed the way aiter's own top-k reference computes it.
+//
+// The reference is 1/(1 + exp2(-log2(e) * x)) with the hardware reciprocal, and its log2(e)
+// is a *double*, so the multiply happens in double and is narrowed on the way into exp2f.
+// __expf(-x) with a float multiply is the fast approximate exponential and differs by about
+// an ulp on some inputs. That ulp propagates through the renormalised weight, and at the
+// top-k boundary it decides which expert is selected -- with E = 256 and topk = 8 the
+// 8th/9th scores land within an ulp of each other often enough that this is a routing
+// question, not a rounding one. Selection and weight must use the same form or the emitted
+// weight belongs to a different score than the one that won.
+#ifndef FMR_LOG2E
+#define FMR_LOG2E 1.44269504088896340736
+#endif
+__device__ __forceinline__ float ref_sigmoid(float x)
+{
+    return __builtin_amdgcn_rcpf(1.0f + exp2f(-FMR_LOG2E * x));
+}
+
 // Max experts per lane, covering E <= 512 (the entry's limit).
 static constexpr int kEptMax = 8;
 
@@ -251,7 +269,7 @@ __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ g
         const int e = lane_id + j * kWaveSize;
         // Out-of-range lanes get the minimum key and can never win.
         key[j] = pack_argmax_key(
-            (e < E) ? (1.0f / (1.0f + __expf(-bf16f(g[j]))) + bf16f(b[j])) : -INFINITY,
+            (e < E) ? (ref_sigmoid(bf16f(g[j])) + bf16f(b[j])) : -INFINITY,
             (e < E) ? e : INT_MAX);
     }
 
@@ -287,7 +305,7 @@ __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ g
 
     float w = 0.0f;
     if(lane_id < topk)
-        w = 1.0f / (1.0f + __expf(-bf16f(gating_row[winner_expert])));
+        w = ref_sigmoid(bf16f(gating_row[winner_expert]));
     if(need_renorm)
     {
         float s = w; // full 64-lane sum in DPP
@@ -389,23 +407,24 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
             CALL(8);                \
     } while(0)
 
-template <int BlockSize, int TD, int NSHARED, typename DTYPE_I, typename DTYPE_B>
+template <int BlockSize, int TD, int NSHARED, typename DTYPE_I, typename DTYPE_B,
+          typename DTYPE_G = DTYPE_I>
 __device__ __forceinline__ void
 phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
-             const DTYPE_I* __restrict__ hidden, const DTYPE_I* __restrict__ gating,
+             const DTYPE_I* __restrict__ hidden, const DTYPE_G* __restrict__ gating,
              const DTYPE_B* __restrict__ bias, float* __restrict__ topk_weights,
              int* __restrict__ topk_ids, int token, int E, int topk, int cols, int group_size,
              int scaleN_pad, bool need_renorm, float rsf, float shared_w, int ep_rank,
              int ep_size)
 {
-    const DTYPE_I* gating_row = gating + (int64_t)token * E;
+    const DTYPE_G* gating_row = gating + (int64_t)token * E;
     const bool     sel  = (threadIdx.x >> 6) == 0;
 
-    DTYPE_I g[kEptMax];
+    DTYPE_G g[kEptMax];
     DTYPE_B b[kEptMax];
     if(sel)
     {
-#define FMR_LOAD(EPT) phase1_topk_load<EPT, DTYPE_I, DTYPE_B>(gating_row, bias, E, g, b)
+#define FMR_LOAD(EPT) phase1_topk_load<EPT, DTYPE_G, DTYPE_B>(gating_row, bias, E, g, b)
         FMR_EPT_DISPATCH(FMR_LOAD);
 #undef FMR_LOAD
     }
@@ -416,7 +435,7 @@ phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
     if(sel)
     {
 #define FMR_SELECT(EPT)                                                                \
-    phase1_topk_select<EPT, NSHARED, DTYPE_I, DTYPE_B>(                                \
+    phase1_topk_select<EPT, NSHARED, DTYPE_G, DTYPE_B>(                                \
         gating_row, topk_weights, topk_ids, token, E, topk, need_renorm, rsf,          \
         shared_w, ep_rank, ep_size, g, b)
         FMR_EPT_DISPATCH(FMR_SELECT);
@@ -479,10 +498,15 @@ __device__ __forceinline__ void expert_rank_list(int* buf, const int* s_expert, 
 // The host picks by token count (kSplitMinTokens).
 enum FmrPart { kFused = 0, kPhase1 = 1, kPhase23 = 2 };
 
+// DTYPE_G is the router-logit type and is deliberately separate from DTYPE_I, the
+// activation type. sglang#35055 makes the ROCm router GEMM emit fp32 logits to match what
+// CUDA already computes, and rounding them to bf16 at the call to satisfy one shared type
+// would put back exactly the precision this kernel is supposed to preserve. The gate math
+// needs no change for it: bf16f() is the identity on float.
 template <int BlockSize, int TD, typename DTYPE_I, int PART = kFused,
-          typename DTYPE_B = DTYPE_I, int NSHARED = 0>
+          typename DTYPE_B = DTYPE_I, int NSHARED = 0, typename DTYPE_G = DTYPE_I>
 __global__ void __launch_bounds__(BlockSize)
-fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
+fused_moe_routing_kernel(const DTYPE_G* __restrict__ gating,   // [M, E] fp32 or bf16
                          const DTYPE_B* __restrict__ bias,     // [E] fp32 or bf16
                          const DTYPE_I* __restrict__ hidden,   // [M, cols]
                          float* __restrict__ topk_weights,     // [M, topk]
@@ -572,7 +596,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     if constexpr(PART != kPhase23)
     for(int t = blockIdx.x; t < M; t += gridDim.x)
     {
-        phase1_token<BlockSize, TD, NSHARED, DTYPE_I, DTYPE_B>(
+        phase1_token<BlockSize, TD, NSHARED, DTYPE_I, DTYPE_B, DTYPE_G>(
             out, tok_scale, hidden, gating, bias, topk_weights, topk_ids, t, E, topk, cols,
             group_size, scaleN_pad, need_renorm, rsf, shared_w, ep_rank, ep_size);
         __syncthreads(); // the aliased scratch is reused each iteration
@@ -616,8 +640,18 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     }
     __syncthreads();
 
+    // Bound the id before the histogram, as #5295 does in the stock sorting path. In the
+    // fused launch these ids are this kernel's own and are always in range, but kPhase23 is
+    // a separate launch that re-reads topk_ids from global memory, so an id the caller left
+    // there -- a -1 masked row, most obviously -- would be an out-of-bounds LDS atomic that
+    // corrupts a neighbouring counter rather than faulting. One compare in a latency-bound
+    // phase is the cheaper side of that trade.
     for(int i = tid; i < total_routed_rows; i += BlockSize)
-        atomicAdd(&s_cnt[s_expert[i]], 1);
+    {
+        const int eid = s_expert[i];
+        if(eid >= 0 && eid < E_tot)
+            atomicAdd(&s_cnt[eid], 1);
+    }
     __syncthreads();
 
     // Padded two-level inclusive scan over 2*BlockSize slots (>= E): each thread

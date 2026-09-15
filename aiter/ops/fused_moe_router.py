@@ -52,12 +52,12 @@ def fused_moe_router_impl(
     place and must be preallocated with exactly the shapes the stock path
     produces.
 
-    Constraints checked by the C++ entry: ``hidden.shape[1] == 4096``,
+    Constraints checked by the C++ entry: ``hidden.shape[1]`` in (4096, 6144),
     ``num_experts <= 512``, ``unit_size`` a power of two, bf16 inputs,
     ``num_expert_group == topk_group == 1``.
 
     Args:
-        gating: ``[M, num_experts]`` bf16 router logits.
+        gating: ``[M, num_experts]`` router logits, fp32 or bf16.
         bias: ``[num_experts]`` bf16 or fp32 e_score_correction_bias. Read as
             given; unlike the stock wrapper this path does not coerce it.
         hidden: ``[M, cols]`` bf16 activations to quantize.
