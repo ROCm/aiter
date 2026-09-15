@@ -371,11 +371,14 @@ def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
 
 
 def test_negative_slot_is_skipped_and_zero_is_not():
-    """A negative slot is skipped; slot 0 is valid and is decoded.
+    """A negative slot is padding; slot 0 is a live slot and is decoded.
 
-    The kernel guards each row on ``read_pool_idx >= 0 & write_pool_idx >= 0``,
-    so a negative index leaves both the output row and the pool untouched, while
-    slot 0 goes through like any other slot.
+    The kernel guards each row on ``read_pool_idx >= 0 & write_pool_idx >= 0``.
+    A negative index is graph padding: it writes positive zero to that output
+    row (so the caller can ``torch.empty`` ``out``) and does not index the
+    pool. Slot 0 still goes through like any other live slot; that is the
+    divergence from the KDA torch reference, which treats ``state_idx <= 0``
+    as invalid.
     """
     B, H, dt = 4, 12, torch.bfloat16
     args, pool, _ = _kda_inputs(B, H, dt, first_index=0, padded=False, shuffle=True)
@@ -399,10 +402,13 @@ def test_negative_slot_is_skipped_and_zero_is_not():
         need_shuffle_state=True,
     )
 
-    # Row 0 asked for slot -1: untouched, not zeroed.
-    assert (args["out"][0] == 7.0).all()
+    assert flydsl_ops.flydsl_gdr_decode.zeroes_invalid_output
+    # Row 0 asked for slot -1: zeroed, not left at the fill, not wrapped to
+    # the last pool row.
+    assert (args["out"][0] == 0).all()
+    assert torch.equal(kernel_pool[3], pool[3])
     # Slot 0 is valid here even though the reference would call it invalid.
-    assert not (args["out"][1] == 7.0).all()
+    assert not (args["out"][1] == 0).all()
     assert not torch.equal(kernel_pool[0], pool[0])
 
 
