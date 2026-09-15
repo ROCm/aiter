@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark for sparse_mla_fwd (gfx950 gluon, separated-rope MLA).
+"""Benchmark for sparse_mla_fwd (gluon, separated-rope MLA; gfx950 and gfx942).
 
 The cache is flushed between iterations by default, which matters: a decode shape
 runs up to twice as fast when the loop is allowed to re-read its KV out of cache.
@@ -19,7 +19,12 @@ import triton
 from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
-from aiter.ops.triton.attention.sparse_mla import _mla_num_splits, sparse_mla_fwd
+from aiter.ops.triton.attention.sparse_mla import (
+    SUPPORTED_ARCHS,
+    _arch_block_k,
+    _mla_num_splits,
+    sparse_mla_fwd,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -214,7 +219,12 @@ def run_benchmark(args):
             num_heads,
             nnz,
             1 if dots == "fp8" else 2,
-            _mla_num_splits(num_tokens, 1, nnz / num_tokens),
+            _mla_num_splits(
+                num_tokens,
+                1,
+                nnz / num_tokens,
+                block_k=_arch_block_k(arch_info.get_arch()),
+            ),
         )
 
         if metric == "time":
@@ -271,8 +281,8 @@ def main():
             f"--num_tokens {over} exceeds --context {args.context}: a sequence "
             "cannot prefill more tokens than its context holds"
         )
-    if arch_info.get_arch() != "gfx950":
-        raise SystemExit(f"sparse_mla_fwd is gfx950-only (got {arch_info.get_arch()})")
+    if arch_info.get_arch() not in SUPPORTED_ARCHS:
+        raise SystemExit(f"sparse_mla_fwd does not support {arch_info.get_arch()}")
     run_benchmark(args)
 
 
