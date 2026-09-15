@@ -48,7 +48,7 @@ struct mha_bwd_args
     void* dk_ptr;
     void* dv_ptr;
     void* dbias_ptr;
-    const void* sink_ptr   = nullptr; // sink scores [batch, nhead] log-space (LSEDataType=float); nullptr disables sink
+    const void* sink_ptr   = nullptr; // sink scores [nhead] log-space (LSEDataType=float); nullptr disables sink
     void*       d_sink_ptr = nullptr; // sink gradient accumulator [nhead] (LSEDataType=float); nullptr disables sink grad
     // Usage notes for sequence length pointer parameters:
     //
