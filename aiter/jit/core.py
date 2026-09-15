@@ -178,6 +178,11 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
     "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv",
 )
 
+AITER_CONFIG_GEMM_MXFP8 = os.getenv(
+    "AITER_CONFIG_GEMM_MXFP8",
+    f"{AITER_ROOT_DIR}/aiter/configs/model_configs/mxfp8_tuned_gemm_minimax_m3.csv",
+)
+
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
@@ -291,6 +296,12 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_MXFP8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_MXFP8", AITER_CONFIG_GEMM_MXFP8, "mxfp8_tuned_gemm"
+        )
+
+    @property
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
@@ -388,6 +399,12 @@ class AITER_CONFIG:
         # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
         untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if merge_name == "mxfp8_tuned_gemm":
+            # MXFP8 ships only a model table; use its real shape-key schema.
+            untuned_path = (
+                f"{AITER_ROOT_DIR}/aiter/configs/model_configs/"
+                "mxfp8_untuned_gemm_minimax_m3.csv"
+            )
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
@@ -478,7 +495,7 @@ class AITER_CONFIG:
             op_tuned_file_list = [
                 p
                 for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
+                if (p.is_file() and "untuned" not in p.name and str(p) != default_file)
             ]
 
             if not op_tuned_file_list:
