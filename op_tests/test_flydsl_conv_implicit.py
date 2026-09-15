@@ -317,6 +317,35 @@ KW_CASES = [
     ("3d_stride2", 3, _X3, _W3, {"stride": 2, "padding": 1}, None, False),
     ("3d_dilation2", 3, _X3, _W3, {"padding": 2, "dilation": 2}, None, False),
     ("3d_same", 3, _X3, _W3, {"padding": "same"}, None, False),
+    # One row per padding_mode: each takes its own branch of the kernel's tap
+    # coordinate fixup, and only "zeros" routes through the OOB sentinel.
+    (
+        "3d_pad_reflect",
+        3,
+        _X3,
+        _W3,
+        {"padding": 1, "padding_mode": "reflect"},
+        None,
+        False,
+    ),
+    (
+        "3d_pad_replicate",
+        3,
+        _X3,
+        _W3,
+        {"padding": 1, "padding_mode": "replicate"},
+        None,
+        False,
+    ),
+    (
+        "3d_pad_circular",
+        3,
+        _X3,
+        _W3,
+        {"padding": 1, "padding_mode": "circular"},
+        None,
+        False,
+    ),
     ("3d_groups4", 3, _X3, (48, 8, 3, 3, 3), {"padding": 1, "groups": 4}, None, False),
     ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
@@ -335,10 +364,32 @@ ALL_CASES = (
 )
 
 
-def _ref(x, w, bias, rank, **kw):
+def _ref(x, w, bias, rank, padding_mode="zeros", padding=0, **kw):
+    """torch reference.
+
+    The functional convs take no ``padding_mode``; ``nn.Conv*`` materializes the
+    pad and then convolves with ``padding=0``, so a non-zero mode does the same
+    here. torch's pad takes the axes in reverse, innermost first.
+    """
     fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank]
-    out = fn(x.float(), w.float(), None if bias is None else bias.float(), **kw)
-    return out.to(x.dtype)
+    dtype = x.dtype
+    if isinstance(padding, str):
+        p = ()
+    elif isinstance(padding, int):
+        p = (padding,) * rank
+    else:
+        p = tuple(padding)
+    if padding_mode != "zeros" and any(p):
+        pads = [v for axis in reversed(p) for v in (axis, axis)]
+        x, padding = F.pad(x.float(), tuple(pads), mode=padding_mode), 0
+    out = fn(
+        x.float(),
+        w.float(),
+        None if bias is None else bias.float(),
+        padding=padding,
+        **kw,
+    )
+    return out.to(dtype)
 
 
 def _roofline(x, w, ref):
