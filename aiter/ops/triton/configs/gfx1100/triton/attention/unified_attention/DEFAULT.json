@@ -30,8 +30,8 @@
       "num_warps": 4,
       "num_stages": 1,
       "waves_per_eu": 6,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 16
+      "TILE_SIZE_MIN": 32,
+      "TILE_SIZE_MAX": 32
     },
     "Q_LEQ_1": {
       "BLOCK_M": 16,
@@ -39,7 +39,7 @@
       "num_stages": 1,
       "waves_per_eu": 6,
       "TILE_SIZE_MIN": 1,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 32
     },
     "DT_fp8_fp8": {
       "BLOCK_M": 16,
@@ -54,14 +54,14 @@
       "num_warps": 2,
       "num_stages": 1,
       "waves_per_eu": 6,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 16
+      "TILE_SIZE_MIN": 32,
+      "TILE_SIZE_MAX": 32
     }
   },
   "attn_3d": {
     "BLOCK_M": 16,
-    "num_warps": 2,
-    "num_stages": 2,
+    "num_warps": 8,
+    "num_stages": 1,
     "waves_per_eu": 2
   },
   "reduce": {
