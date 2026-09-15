@@ -370,6 +370,53 @@ def _gluon_flash_attn_forward(
     return o
 
 
+def _varlen_int32_addressable(
+    tensors, max_seqlen_q, max_seqlen_k, batch, heads, config, sliding_window=0
+):
+    """Conservative metadata-only bound, including masked tile coordinates."""
+    limit = (1 << 31) - 1
+    block_m, block_n = int(config["BLOCK_M"]), int(config["BLOCK_N"])
+    if min(max_seqlen_q, max_seqlen_k, batch, heads, block_m, block_n) <= 0:
+        return False
+    # Stride-zero views can have small extents but overflowing sequence math.
+    # Cover Q/K deltas, cdiv/one-past tiles, and the left-window subtraction
+    # independently of address bounds (the latter disappear at stride zero).
+    coordinate_span = (
+        max_seqlen_q
+        + max_seqlen_k
+        + max(int(sliding_window), 0)
+        + 2 * max(block_m, block_n)
+    )
+    if coordinate_span > limit:
+        return False
+    if batch * heads * ((max_seqlen_q + block_m - 1) // block_m) > limit:
+        return False
+    # Include a full maximum sequence beyond storage extent: masked lanes and
+    # one-past tile advances may form addresses even when no load is performed.
+    padding = max(max_seqlen_q, max_seqlen_k) + 2 * max(block_m, block_n)
+    for tensor in tensors:
+        if tensor.ndim not in (2, 3) or tensor.numel() == 0:
+            return False
+        if any(int(n) <= 0 or int(n) > limit for n in tensor.shape):
+            return False
+        strides = tuple(int(s) for s in tensor.stride())
+        if any(s < 0 or s > limit for s in strides):
+            return False
+        extent = int(tensor.storage_offset()) + sum(
+            (int(n) - 1) * s for n, s in zip(tensor.shape, strides)
+        )
+        # Q/K/V/O use at least 16 lanes, even for head dimensions below 16.
+        last_dim = int(tensor.shape[-1])
+        padded_dim = 1 << (last_dim - 1).bit_length()
+        if tensor.ndim == 3:
+            padded_dim = max(padded_dim, 16)
+        head_padding = padded_dim - last_dim
+        extent += padding * strides[0] + head_padding * strides[-1]
+        if extent > limit:
+            return False
+    return True
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -392,6 +439,7 @@ def _flash_attn_forward(
     descale_v: torch.Tensor | None = None,
     sink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
+    prefer_int32_strides: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
 
     if bias is not None:
@@ -570,6 +618,31 @@ def _flash_attn_forward(
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 
+        use_int64_strides = _USE_INT64_STRIDES
+        if prefer_int32_strides:
+            supported = (
+                is_varlen
+                and not IS_FP8
+                and q.dtype == k.dtype == v.dtype == torch.bfloat16
+                and not enable_dropout
+                and not return_softmax
+                and alibi_slopes is None
+                and sink is None
+                and cu_seqlens_k is not None
+                and cu_seqlens_q.dtype == cu_seqlens_k.dtype == torch.int32
+                and q.shape[-1] == k.shape[-1] == v.shape[-1]
+                and _varlen_int32_addressable(
+                    (q, k, v, o, softmax_lse),
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    batch,
+                    num_q_heads,
+                    config,
+                    sliding_window,
+                )
+            )
+            use_int64_strides = not supported
+
         _attn_fwd[grid](
             q,
             k,
@@ -621,7 +694,7 @@ def _flash_attn_forward(
             BATCH=batch,
             NUM_XCD=get_num_xcds(),
             SWIZZLE=_MHA_SWIZZLE,
-            USE_INT64_STRIDES=_USE_INT64_STRIDES,
+            USE_INT64_STRIDES=use_int64_strides,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
             # Soundness precondition: only set when every Q/K/V head-axis
@@ -981,6 +1054,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         sink,
         is_grad_enabled,
         config=None,
+        prefer_int32_strides=False,
     ):
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
@@ -1012,6 +1086,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_k=cu_seqlens_k,
                 sink=sink,
                 config=config,
+                prefer_int32_strides=prefer_int32_strides and not is_grad,
             )
         )
         if is_grad:
@@ -1165,6 +1240,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             dsink,
             None,  # is_grad_enabled
             None,  # config
+            None,  # prefer_int32_strides
         )
 
 
@@ -1193,6 +1269,7 @@ def flash_attn_varlen_func(
     v_descale=None,
     config: dict[str, any] | None = None,
     backend: Literal["triton", "gluon"] | None = "triton",
+    prefer_int32_strides: bool = False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1250,6 +1327,14 @@ def flash_attn_varlen_func(
             window (no dropout/bias/alibi, no right window, no LSE/softmax return
             and no backward pass). For FP8, pass pre-quantized fp8 q/k/v with
             q_descale/k_descale/v_descale.
+        prefer_int32_strides: opt in to metadata-guarded int32 addressing for
+            the default Triton BF16 varlen inference implementation. Unsupported
+            Q/K/V layouts and training retain int64. Cumulative lengths must
+            be contiguous one-dimensional tensors; invalid metadata is
+            rejected because the kernel does not consume metadata strides.
+            Gluon and dao_ai reject this
+            option. Available through this Triton module, not the top-level
+            aiter.flash_attn_varlen_func router.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -1259,7 +1344,24 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # This opt-in affects only forward Triton varlen inference. AITER checks
+    # Q/K/V, output, LSE and masked coordinates and falls back to 64-bit when
+    # necessary. No global flag is changed; default dispatch is unchanged.
     backend = _resolve_backend(backend)
+    if prefer_int32_strides and backend != "triton":
+        raise ValueError("prefer_int32_strides is supported only by the Triton backend")
+    if prefer_int32_strides and _MHA_IMPL != "default":
+        raise ValueError(
+            "prefer_int32_strides requires the default Triton implementation"
+        )
+    if prefer_int32_strides:
+        for name, lengths in (
+            ("cu_seqlens_q", cu_seqlens_q),
+            ("cu_seqlens_k", cu_seqlens_k),
+        ):
+            # The kernel advances these pointers by one, regardless of index width.
+            if lengths.ndim != 1 or not lengths.is_contiguous():
+                raise ValueError(f"prefer_int32_strides requires contiguous 1D {name}")
     _LOGGER.info(
         f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
@@ -1315,6 +1417,7 @@ def flash_attn_varlen_func(
         sink,
         torch.is_grad_enabled(),
         config,
+        prefer_int32_strides,
     )
 
 
