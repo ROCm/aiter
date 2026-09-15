@@ -125,9 +125,15 @@ def mhc_pre_big_fuse_rmsnorm(
 # only the first residual in and the last one out need converting.
 MHC_RES_KS = 32
 
-_MHC_RES_LAYOUT_REPR = make_kernel_repr(
-    "_mhc_res_layout_kernel",
-    ["HC_MULT", "KS", "BLOCK_M", "BLOCK_KB"],
+_MHC_RES_LAYOUT_CONFIG_KEYS = ["HC_MULT", "KS", "BLOCK_M", "BLOCK_KB"]
+_MHC_RES_REPEAT_REPR = make_kernel_repr(
+    "_mhc_res_repeat_kernel", _MHC_RES_LAYOUT_CONFIG_KEYS
+)
+_MHC_RES_SHUFFLE_REPR = make_kernel_repr(
+    "_mhc_res_shuffle_kernel", _MHC_RES_LAYOUT_CONFIG_KEYS
+)
+_MHC_RES_UNSHUFFLE_REPR = make_kernel_repr(
+    "_mhc_res_unshuffle_kernel", _MHC_RES_LAYOUT_CONFIG_KEYS
 )
 _MHC_RES_REPEAT_TRITON_CONFIG = {
     "BLOCK_M": 32,
@@ -149,7 +155,7 @@ _MHC_RES_UNSHUFFLE_TRITON_CONFIG = {
 }
 
 
-@triton.jit(repr=_MHC_RES_LAYOUT_REPR)
+@triton.jit(repr=_MHC_RES_REPEAT_REPR)
 def _mhc_res_repeat_triton_kernel(
     hidden_states,
     out,
@@ -184,7 +190,7 @@ def _mhc_res_repeat_triton_kernel(
         tl.store(out + output_offsets, values_t, mask=output_mask)
 
 
-@triton.jit(repr=_MHC_RES_LAYOUT_REPR)
+@triton.jit(repr=_MHC_RES_SHUFFLE_REPR)
 def _mhc_res_shuffle_triton_kernel(
     residual,
     out,
@@ -220,7 +226,7 @@ def _mhc_res_shuffle_triton_kernel(
     tl.store(out + output_offsets, values_t, mask=output_mask)
 
 
-@triton.jit(repr=_MHC_RES_LAYOUT_REPR)
+@triton.jit(repr=_MHC_RES_UNSHUFFLE_REPR)
 def _mhc_res_unshuffle_triton_kernel(
     shuffled,
     out,
