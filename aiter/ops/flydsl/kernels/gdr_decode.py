@@ -98,6 +98,8 @@ def create_vk_gdr_decode_kernel(
         "f16": fx.Float16,
         "bf16": fx.BFloat16,
     }[dt_bias_dtype]
+    DT_BIAS_VALUES_PER_COPY = min(VALUES_PER_THREAD_K, 128 // dt_bias_num.width)
+    DT_BIAS_COPIES_PER_THREAD = VALUES_PER_THREAD_K // DT_BIAS_VALUES_PER_COPY
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -182,7 +184,7 @@ def create_vk_gdr_decode_kernel(
             fx.rocdl.BufferCopy(dt_bias_num.width), dt_bias_num
         )
         cp_dt_bias_vec = fx.make_copy_atom(
-            fx.rocdl.BufferCopy(dt_bias_num.width * VALUES_PER_THREAD_K),
+            fx.rocdl.BufferCopy(dt_bias_num.width * DT_BIAS_VALUES_PER_COPY),
             dt_bias_num,
         )
         cp_state_vec = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), state_num)
@@ -244,10 +246,10 @@ def create_vk_gdr_decode_kernel(
                 None,
                 (
                     num_v_heads,
-                    head_k_dim // VALUES_PER_THREAD_K,
-                    VALUES_PER_THREAD_K,
+                    head_k_dim // DT_BIAS_VALUES_PER_COPY,
+                    DT_BIAS_VALUES_PER_COPY,
                 ),
-                (head_k_dim, VALUES_PER_THREAD_K, 1),
+                (head_k_dim, DT_BIAS_VALUES_PER_COPY, 1),
             )
         else:
             a_view = _gview(
@@ -372,10 +374,30 @@ def create_vk_gdr_decode_kernel(
                             VALUES_PER_THREAD_K,
                             data_num,
                         ).to(fx.Float32)
-                        dt_bias_vec = _load_vec(
-                            cp_dt_bias_vec,
-                            fx.slice(dt_bias_view, (hv_i, k_tile, None)),
-                            VALUES_PER_THREAD_K,
+                        dt_bias_parts = [
+                            _load_vec(
+                                cp_dt_bias_vec,
+                                fx.slice(
+                                    dt_bias_view,
+                                    (
+                                        hv_i,
+                                        warp_k_vec_i // DT_BIAS_VALUES_PER_COPY
+                                        + copy_i,
+                                        None,
+                                    ),
+                                ),
+                                DT_BIAS_VALUES_PER_COPY,
+                                dt_bias_num,
+                            )
+                            for copy_i in range_constexpr(DT_BIAS_COPIES_PER_THREAD)
+                        ]
+                        dt_bias_vec = fx.Vector.from_elements(
+                            [
+                                dt_bias_parts[lane // DT_BIAS_VALUES_PER_COPY][
+                                    lane % DT_BIAS_VALUES_PER_COPY
+                                ]
+                                for lane in range_constexpr(VALUES_PER_THREAD_K)
+                            ],
                             dt_bias_num,
                         )
                         if const_expr("f32" not in dt_bias_dtype):

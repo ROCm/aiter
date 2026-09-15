@@ -5380,6 +5380,6 @@ gfx942,torch.bfloat16,torch.float32,4,1,12,12,128,128,32,1,32,8.94,kda
 gfx942,torch.bfloat16,torch.float32,64,1,12,12,128,128,8,1,16,37.97,kda
 gfx942,torch.bfloat16,torch.float32,256,1,12,12,128,128,2,4,32,131.82,kda
 gfx950,torch.bfloat16,torch.float32,1,1,12,12,128,128,32,2,32,6.61,kda
-gfx950,torch.bfloat16,torch.float32,4,1,12,12,128,128,4,4,16,7.31,kda
+gfx950,torch.bfloat16,torch.float32,4,1,12,12,128,128,4,8,32,7.23,kda
 gfx950,torch.bfloat16,torch.float32,64,1,12,12,128,128,1,4,16,21.57,kda
 gfx950,torch.bfloat16,torch.float32,256,1,12,12,128,128,4,4,16,75.24,kda

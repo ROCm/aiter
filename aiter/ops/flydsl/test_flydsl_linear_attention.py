@@ -523,6 +523,32 @@ def test_flydsl_gdr_decode_rejects_noncontiguous_vector_dimension(
         func(*inouts)
 
 
+def test_flydsl_gdr_decode_rejects_noncontiguous_output():
+    args = Args(
+        dtype=torch.bfloat16,
+        b=2,
+        sq=1,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+    )
+    inouts = list(create_inputs(args) + create_outputs(args))
+    out = inouts[-1]
+    storage = torch.empty(
+        *out.shape[:-1],
+        out.shape[-1] * 2,
+        dtype=out.dtype,
+        device=out.device,
+    )
+    inouts[-1] = storage[..., ::2]
+    assert inouts[-1].shape == out.shape
+    assert not inouts[-1].is_contiguous()
+
+    with pytest.raises(ValueError, match=r"`out` must be contiguous"):
+        func(*inouts)
+
+
 @pytest.mark.parametrize(
     "num_k_heads,num_v_heads",
     [(2, 8), (4, 8), (4, 16), (8, 16), (8, 32), (16, 32), (16, 64)],

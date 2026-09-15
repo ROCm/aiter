@@ -134,7 +134,8 @@ def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1
 
     if indices_stride > 1:
         # The serving stack passes a strided column of a wider index table, not
-        # a fresh contiguous array, so the kernel must honour the index stride.
+        # a fresh contiguous array. The wrapper must densify it correctly before
+        # the kernel's unit-stride load.
         storage = torch.zeros(B, indices_stride, dtype=torch.int32, device=dev)
         indices = storage[:, 0]
     else:
@@ -407,17 +408,22 @@ def test_negative_slot_is_skipped_and_zero_is_not():
     # the last pool row.
     assert (args["out"][0] == 0).all()
     assert torch.equal(kernel_pool[3], pool[3])
-    # Slot 0 is valid here even though the reference would call it invalid.
-    assert not (args["out"][1] == 0).all()
-    assert not torch.equal(kernel_pool[0], pool[0])
+
+    # Slots 0-2 are live here even though vLLM's packed-decode wrapper treats
+    # slot 0 as invalid. Check their decode, not merely that values changed.
+    live_args = dict(args)
+    for name in ("q", "k", "v", "a", "b"):
+        live_args[name] = args[name][1:]
+    ref_out, ref_state = _kda_reference(live_args, pool[:3])
+    assert_close("live o", ref_out, args["out"][1:])
+    assert_close("live ht", ref_state, kernel_pool[:3])
 
 
-def test_tuned_config_lookup_is_keyed_by_gate_mode(monkeypatch):
-    """Each gate picks its own tuned config, or the fallback when it has none.
+def test_only_kda_uses_the_restored_tuned_config_map(monkeypatch):
+    """KDA uses its tuned row while scalar GDR keeps main's tiling policy.
 
-    Both gates share (arch, dtypes, B, Sq, heads, dims), so without gate_mode in
-    the key a scalar call at a per-channel-tuned shape would inherit a config
-    tuned for a different binary.
+    Main removed the legacy CSV in favor of ``_decode_tiling`` for scalar GDR.
+    Restoring the table for KDA must not restore its old scalar dispatch.
     """
     from aiter.ops.flydsl import linear_attention_kernels as lak
 
@@ -432,11 +438,6 @@ def test_tuned_config_lookup_is_keyed_by_gate_mode(monkeypatch):
         "GDR_GLOBAL_CONFIG_MAP",
         {(*key, "kda"): kda_config, (*key, "gdr"): gdr_config},
     )
-    assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
-    assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == gdr_config
-
-    # With only a per-channel row, the scalar gate falls to the tiling rule.
-    monkeypatch.setattr(lak, "GDR_GLOBAL_CONFIG_MAP", {(*key, "kda"): kda_config})
     assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
     assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == lak._decode_tiling(
         geometry[0], geometry[3], geometry[4], geometry[5], dtypes[1]
@@ -486,6 +487,42 @@ def test_state_store_follows_the_pool_dtype_not_the_activations(act_dtype):
     got = run(torch.bfloat16)
     # bf16 keeps 8 mantissa bits, so rounding alone stays well inside 5%.
     assert (got - ref).abs().max() < 0.05 * ref.abs().max()
+
+
+def test_kda_supports_bf16_state():
+    """The per-channel path supports the wrapper's bf16 state contract."""
+
+    def run(state_dtype):
+        args, pool, indices = _kda_inputs(
+            B=2,
+            H=4,
+            dt=torch.bfloat16,
+            first_index=0,
+            padded=False,
+            shuffle=True,
+            seed=0,
+        )
+        pool = pool.to(state_dtype)
+        flydsl_ops.flydsl_gdr_decode(
+            args["q"],
+            args["k"],
+            args["v"],
+            args["a"],
+            args["b"],
+            args["dt_bias"],
+            args["A_log"],
+            indices,
+            pool,
+            args["out"],
+            use_qk_l2norm=True,
+            need_shuffle_state=True,
+        )
+        return args["out"].float(), pool.float()
+
+    ref_out, ref_state = run(torch.float32)
+    got_out, got_state = run(torch.bfloat16)
+    assert (got_out - ref_out).abs().max() < 0.05 * ref_out.abs().max()
+    assert (got_state - ref_state).abs().max() < 0.05 * ref_state.abs().max()
 
 
 def test_fp32_activations_are_rejected():

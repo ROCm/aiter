@@ -193,11 +193,16 @@ def get_default_kwargs(
     head_v_dim,
     gate_mode="gdr",
 ):
-    """The tuned config for this launch, else the tiling rule.
+    """The KDA-tuned config for this launch, else the tiling rule.
 
-    ``gate_mode`` is part of the key, so a per-channel row cannot be selected
-    for a scalar call at the same shape.
+    Main's scalar GDR path uses ``_decode_tiling``. Only KDA consults the
+    restored legacy table, so its scalar rows cannot override that newer
+    policy.
     """
+    if gate_mode != "kda":
+        return _decode_tiling(
+            batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str
+        )
     config = _load_gdr_config_map().get(
         (
             dtype_str,
@@ -442,6 +447,11 @@ def flydsl_gdr_decode(
         raise ValueError(
             "`key` must have a contiguous last dimension for vectorized loads; "
             f"got stride {key.stride()}."
+        )
+    if not out.is_contiguous():
+        raise ValueError(
+            "`out` must be contiguous because the kernel uses packed output strides; "
+            f"got stride {out.stride()}."
         )
 
     # `a`'s rank selects the gate; the shapes below follow from it.
