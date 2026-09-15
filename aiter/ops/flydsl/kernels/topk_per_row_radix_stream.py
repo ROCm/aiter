@@ -81,7 +81,7 @@ from flydsl.expr import (
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
     atomic_max_i32,
@@ -178,7 +178,9 @@ _LDS_SOLO_SLACK = 12 * 1024
 @cache
 def _lds_budgets() -> tuple[int, int]:
     """(two-resident, solo) LDS bytes one workgroup may claim on this device."""
-    cap = get_lds_capacity_bytes()
+    # Runtime arch, not `get_gfx()`: that honours `GPU_ARCHS` while FlyDSL
+    # compiles for the live device, so the two would size for different cards.
+    cap = get_lds_capacity_bytes(get_gfx_runtime())
     return cap // 2 - _LDS_RESIDENT_SLACK, cap - _LDS_SOLO_SLACK
 
 
