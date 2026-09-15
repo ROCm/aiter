@@ -18,7 +18,6 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm, rocdl
 from flydsl.expr import const_expr, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import FastMathFlags
@@ -38,24 +37,14 @@ from aiter.utility.mx_types import (
     MxDtypeInt as _D,
 )
 
-from .tensor_shim import GTensor, _run_compiled
-
-
-def _imin(a, b):
-    return (a < b).select(a, b)
-
-
-def _imax(a, b):
-    return (a > b).select(a, b)
+from .tensor_shim import GTensor, _run_compiled, ptr_buf_tensor
 
 
 def _idiv(a, b):
-    """Truncating signed integer divide. ``//`` maps to arith.floordivsi, a
-    longer expansion; every dividend here is already clamped non-negative, so
-    the truncating op is both correct and cheaper."""
-    from flydsl.expr import arith
-
-    return fx.Int32(arith.divsi(a.ir_value(), b.ir_value()))
+    """Truncating integer divide. Signed ``//`` maps to arith.floordivsi, a
+    longer expansion; every dividend here is provably non-negative, so an
+    unsigned divide (divui) is both correct and cheaper."""
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(b))
 
 
 _STATIC_ADAPTOR_CACHE = {}
@@ -173,7 +162,7 @@ def _scalar_load(base_i64, idx, fx_dt, copy_bits):
     buf = _scalar_view(base_i64, fx_dt)
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), fx_dt)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
-    fx.copy_atom_call(atom, fx.slice(buf, (idx, None)), r)
+    fx.copy(atom, fx.slice(buf, (idx, None)), r)
     return fx.memref_load_vec(r)[0]
 
 
@@ -182,14 +171,13 @@ def _scalar_store(base_i64, idx, val, fx_dt, copy_bits):
     buf = _scalar_view(base_i64, fx_dt)
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), fx_dt)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
-    fx.memref_store_vec(fx.Vector.from_elements([val.ir_value()], dtype=fx_dt), r)
-    fx.copy_atom_call(atom, r, fx.slice(buf, (idx, None)))
+    fx.memref_store_vec(fx.Vector.from_elements([val], dtype=fx_dt), r)
+    fx.copy(atom, r, fx.slice(buf, (idx, None)))
 
 
 def _store_bf16_tiled(vals_list, p_dst, copy, vec):
     """Convert VEC fp32 → bf16 and tiled-copy to ``p_dst``."""
-    raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
-    f32v = fx.Vector.from_elements(raw, dtype=fx.Float32)
+    f32v = fx.Vector.from_elements(vals_list, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
     frag = fx.make_fragment_like(p_dst)
     fx.memref_store_vec(bf16v, frag)
@@ -288,8 +276,8 @@ def _store_fp8_packed_w32(
     for dw_idx in range_constexpr(n_dwords):
         base = dw_idx * 4
         pk = fx.Int32(0).ir_value()
-        pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 0], safe[base + 1], pk, 0)
-        pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 2], safe[base + 3], pk, 1)
+        pk = fx.rocdl.cvt_pk_fp8_f32(i32, safe[base + 0], safe[base + 1], pk, 0)
+        pk = fx.rocdl.cvt_pk_fp8_f32(i32, safe[base + 2], safe[base + 3], pk, 1)
         dword_list.append(pk)
 
     off_bytes = row_base_bytes + idx * vec
@@ -405,7 +393,7 @@ def _build_kernel_w64(
             div_tensor, idx, *, layout=full_lay, atom=full_atom, dt=elem_dtype
         ):
             r = fx.make_rmem_tensor(layout, dt)
-            fx.copy_atom_call(atom, fx.slice(div_tensor, (None, idx)), r)
+            fx.copy(atom, fx.slice(div_tensor, (None, idx)), r)
             return fx.memref_load_vec(r)
 
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
@@ -534,8 +522,7 @@ def _build_kernel_w64(
                     scaled.append(xi * rstd)
 
             out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
-            scaled_raw = [s.ir_value() for s in scaled]
-            scaled_vec = fx.Vector.from_elements(scaled_raw, dtype=fx.Float32)
+            scaled_vec = fx.Vector.from_elements(scaled, dtype=fx.Float32)
             fx.memref_store_vec(scaled_vec, out_rmem)
 
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
@@ -553,8 +540,8 @@ def _build_kernel_w64(
                     o = cur[2 * k + 1]
                     c = cos_f32[k]
                     s = sin_f32[k]
-                    rope_elems.append((e * c - o * s).ir_value())
-                    rope_elems.append((e * s + o * c).ir_value())
+                    rope_elems.append(e * c - o * s)
+                    rope_elems.append(e * s + o * c)
                 rotated_vec = fx.Vector.from_elements(rope_elems, dtype=fx.Float32)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
@@ -938,10 +925,8 @@ def _build_kernel_w32(
                 wdiv = fx.logical_divide(wbuf, half_lay)
                 r0 = fx.make_rmem_tensor(half_lay, elem_dtype)
                 r1 = fx.make_rmem_tensor(half_lay, elem_dtype)
-                fx.copy_atom_call(half_atom, fx.slice(wdiv, (None, tid_val * 2)), r0)
-                fx.copy_atom_call(
-                    half_atom, fx.slice(wdiv, (None, tid_val * 2 + 1)), r1
-                )
+                fx.copy(half_atom, fx.slice(wdiv, (None, tid_val * 2)), r0)
+                fx.copy(half_atom, fx.slice(wdiv, (None, tid_val * 2 + 1)), r1)
                 v0 = fx.memref_load_vec(r0).to(fx.Float32)
                 v1 = fx.memref_load_vec(r1).to(fx.Float32)
                 combined = v0.shuffle(v1, list(range(VEC)))
@@ -980,9 +965,9 @@ def _build_kernel_w32(
         tid = fx.thread_idx.x
         tid_y = fx.thread_idx.y  # wave within workgroup -> token selector
 
-        tok = _imin(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
+        tok = fx.min(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
         bid_t = tok  # all downstream token offsets use the clamped token
-        bid_t_idx = fx.Index(tok)
+        bid_t_idx = fx.Int64(tok)
 
         def _ptr_buffer_resource(ptr, num_records_bytes=None):
             addr = fx.ptrtoint(ptr)
@@ -993,9 +978,8 @@ def _build_kernel_w32(
                 addr_i64, num_records_bytes=num_records_bytes
             )
 
-        pos_rsrc = _ptr_buffer_resource(positions)
-        pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
-        pos_i32 = fx.Int32(pos_val_i64.trunci(i32))
+        pos_t = ptr_buf_tensor(positions, fx.Int64)
+        pos_i32 = fx.Int32(pos_t[bid_t])
 
         rope_lay = fx.make_layout(PAIRS_PER_THREAD, 1)
         rope_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(PAIRS_PER_THREAD * 16), 16)
@@ -1031,11 +1015,11 @@ def _build_kernel_w32(
             held by this block. ``x_f32_vec`` and (optional) ``w_f32_vec`` are
             VEC-wide fp32 vectors already loaded by the caller."""
             is_rope_t = tid >= fx.Int32(ROPE_THREAD_LO)
-            rope_rel = _imax(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
+            rope_rel = fx.max(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
             cos_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
             sin_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
-            fx.copy_atom_call(rope_atom, fx.slice(cos_div, (None, rope_rel)), cos_rmem)
-            fx.copy_atom_call(rope_atom, fx.slice(sin_div, (None, rope_rel)), sin_rmem)
+            fx.copy(rope_atom, fx.slice(cos_div, (None, rope_rel)), cos_rmem)
+            fx.copy(rope_atom, fx.slice(sin_div, (None, rope_rel)), sin_rmem)
             cos_raw = fx.memref_load_vec(cos_rmem)
             sin_raw = fx.memref_load_vec(sin_rmem)
 
@@ -1084,9 +1068,7 @@ def _build_kernel_w32(
                     factor = rstd * quant_scale
                     scale_store = e8m0_biased.to(fx.Int8)
                 else:
-                    rcp_am = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [am_safe.ir_value()], [], []
-                    )
+                    rcp_am = fx.Float32(fx.rocdl.rcp(f32, am_safe))
                     _fc = _fp8_const()
                     factor = fx.Float32(_fc["max_over_sqrt2"]) * rcp_am
                     scale_store = am_safe * rstd * fx.Float32(_fc["inv_max_sqrt2"])
@@ -1147,7 +1129,7 @@ def _build_kernel_w32(
                         VEC,
                     )
 
-        q_tok_off_bytes = bid_t_idx * fx.Index(H * D * 2)
+        q_tok_off_bytes = bid_t_idx * fx.Int64(H * D * 2)
 
         if bid_x < H:
             head_idx = bid_x
@@ -1167,7 +1149,7 @@ def _build_kernel_w32(
                 qw_f32 = None
 
             if const_expr(quant):
-                q_tok_off_fp8 = bid_t_idx * fx.Index(H * D)
+                q_tok_off_fp8 = bid_t_idx * fx.Int64(H * D)
                 qo_g_tmp = GTensor(
                     q_out,
                     dtype=T.i8,
@@ -1222,7 +1204,7 @@ def _build_kernel_w32(
             w_f32 = w_vec.to(fx.Float32)
 
             if const_expr(quant):
-                kv_tok_off_fp8 = bid_t_idx * fx.Index(D)
+                kv_tok_off_fp8 = bid_t_idx * fx.Int64(D)
                 kvo_g_tmp = GTensor(
                     kv_out,
                     dtype=T.i8,
@@ -1244,7 +1226,7 @@ def _build_kernel_w32(
                     scale_base_off=scale_base_off_kv,
                 )
             else:
-                kv_tok_off_bf16 = bid_t_idx * fx.Index(D * 2)
+                kv_tok_off_bf16 = bid_t_idx * fx.Int64(D * 2)
                 kvo_g_tmp = GTensor(
                     kv_out,
                     dtype=T.bf16,
@@ -1258,9 +1240,8 @@ def _build_kernel_w32(
                 swa_row_base = None
                 do_swa = None
                 if const_expr(kv_write):
-                    bid_rsrc = _ptr_buffer_resource(batch_id_per_token)
                     bid_i32 = fx.Int32(
-                        buffer_ops.buffer_load(bid_rsrc, bid_t, vec_width=1, dtype=i32)
+                        ptr_buf_tensor(batch_id_per_token, fx.Int32)[bid_t]
                     )
                     # A stale token carries a negative position. `divsi`/`remsi`
                     # truncate toward zero, so pos=-300 with block_size=128 gives
@@ -1270,7 +1251,7 @@ def _build_kernel_w32(
                     # gate is `bid < 0 || pos < 0`; match it, in both modes.
                     pos_ok = pos_i32 >= 0
                     do_swa = (bid_i32 >= 0) & pos_ok
-                    bid_safe = _imax(bid_i32, fx.Int32(0))
+                    bid_safe = fx.max(bid_i32, fx.Int32(0))
                     pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                     if const_expr(paged):
                         blk = _idiv(pos_safe, swa_cache_size)
@@ -1367,7 +1348,7 @@ def _build_kernel_w32(
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_y = fx.Index(_idiv(num_tokens + ROWS_PER_WG - 1, fx.Int32(ROWS_PER_WG)))
+        grid_y = fx.Int64(_idiv(num_tokens + ROWS_PER_WG - 1, fx.Int32(ROWS_PER_WG)))
         k = kernel(
             q_in,
             kv_in,
@@ -1607,6 +1588,18 @@ def flydsl_qk_norm_rope_quant(
         ssm_arg = q.new_empty(1, dtype=torch.int32)
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
+    has_direct = False
+
+    def _ptr_arg(t):
+        return (
+            int(t.data_ptr())
+            if has_direct
+            else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+        )
+
+    def _stream_arg():
+        return stream if has_direct else Stream(stream)
+
     if is_gfx1250:
         tdm_quant = quant
         use_tdm = (
@@ -1644,32 +1637,25 @@ def flydsl_qk_norm_rope_quant(
                 stream = torch.cuda.current_stream()
             has_direct = getattr(launcher, "_direct_call_state", None) is not None
 
-            def _t_ptr(t):
-                return (
-                    int(t.data_ptr())
-                    if has_direct
-                    else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-                )
-
             q_2d = q_view.reshape(num_rows, D)
             per_wg = rows_per_tile * tiles_per_wg
             args = (
                 # q is a per-call activation: uncached, else the adaptor cache
                 # pins its allocation (see _cached_from_dlpack).
                 flyc.from_dlpack(q_2d),
-                _t_ptr(kv),
+                _ptr_arg(kv),
                 _cached_from_dlpack(cos_2d),
                 _cached_from_dlpack(sin_2d),
-                _t_ptr(positions),
-                _t_ptr(q_out.view(num_rows, D)),
-                _t_ptr(kv_out),
-                _t_ptr(q_scale_arg.view(-1)),
-                _t_ptr(kv_scale_arg.view(-1)),
+                _ptr_arg(positions),
+                _ptr_arg(q_out.view(num_rows, D)),
+                _ptr_arg(kv_out),
+                _ptr_arg(q_scale_arg.view(-1)),
+                _ptr_arg(kv_scale_arg.view(-1)),
                 _cached_from_dlpack(q_weight_arg.reshape(-1)),
                 _cached_from_dlpack(kv_weight.reshape(-1)),
-                _t_ptr(swa_kv_arg),
-                _t_ptr(ssm_arg),
-                _t_ptr(bid_arg),
+                _ptr_arg(swa_kv_arg),
+                _ptr_arg(ssm_arg),
+                _ptr_arg(bid_arg),
                 num_rows,
                 T_tok,
                 (num_rows + per_wg - 1) // per_wg,
@@ -1678,7 +1664,7 @@ def flydsl_qk_norm_rope_quant(
                 swa_pos_stride,
                 swa_num_rows,
                 swa_cache_size,
-                stream if has_direct else Stream(stream),
+                _stream_arg(),
             )
             _run_compiled(launcher, *args)
             return (
@@ -1724,25 +1710,8 @@ def flydsl_qk_norm_rope_quant(
         sin_static = _cached_from_dlpack(sin_2d)
         has_direct = getattr(launcher, "_direct_call_state", None) is not None
 
-        def _ptr_arg(t):
-            return (
-                int(t.data_ptr())
-                if has_direct
-                else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-            )
-
-        def _stream_arg():
-            return stream if has_direct else Stream(stream)
-
         wt_args = (q_weight_static, kv_weight_static, cos_static, sin_static)
     else:
-
-        def _ptr_arg(t):
-            return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
-        def _stream_arg():
-            return Stream(stream)
-
         wt_args = (q_weight_arg, kv_weight, cos_2d, sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP -> cap 65535 blocks/launch and
@@ -1906,14 +1875,14 @@ def _build_kernel_w32_tdm(
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
         is_rope = tid >= ROPE_LO
-        rope_rel = _imax(tid - ROPE_LO, fx.Int32(0))
+        rope_rel = fx.max(tid - ROPE_LO, fx.Int32(0))
 
         def _ptr_res(ptr):
             return buffer_ops.create_buffer_resource_from_addr(
                 fx.Int64(fx.ptrtoint(ptr))
             )
 
-        pos_rsrc = _ptr_res(positions)
+        pos_t = ptr_buf_tensor(positions, fx.Int64)
 
         def _concat(chunks):
             v = chunks[0]
@@ -1939,19 +1908,15 @@ def _build_kernel_w32_tdm(
             )
 
         def load_pos(tok):
-            return fx.Int32(
-                buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64).trunci(
-                    i32
-                )
-            )
+            return fx.Int32(pos_t[tok])
 
         def load_cs(tok):
             """cos/sin for this token, as PAIRS-wide f32 vectors."""
             return _cs_from_pos(load_pos(tok))
 
         def issue_pos(tok):
-            """Fire position buffer_load (returns raw i64, no wait)."""
-            return buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64)
+            """Fire the position load (returns i64, no wait)."""
+            return pos_t[tok]
 
         def _cs_from_pos(pos_i32):
             """Load cos/sin given an already-resolved position value."""
@@ -2010,9 +1975,7 @@ def _build_kernel_w32_tdm(
                 scale_store = e8m0_biased.to(fx.Int8)
             elif const_expr(quant):
                 am_safe = am.maximumf(fx.Float32(1e-12))
-                rcp_am = llvm.call_intrinsic(
-                    T.f32, "llvm.amdgcn.rcp.f32", [am_safe.ir_value()], [], []
-                )
+                rcp_am = fx.Float32(fx.rocdl.rcp(T.f32, am_safe))
                 fc = _fp8_const()
                 factor = fx.Float32(fc["max_over_sqrt2"]) * rcp_am
                 scaled = xw * factor
@@ -2102,7 +2065,7 @@ def _build_kernel_w32_tdm(
             )
 
             def row_of(tile_idx):
-                return _imin(tile_idx * RT + wave, nr_m1)
+                return fx.min(tile_idx * RT + wave, nr_m1)
 
             def issue(buf, tile_idx):
                 dst = fx.Tensor(
@@ -2161,9 +2124,7 @@ def _build_kernel_w32_tdm(
             cs_cache = [None, None]
             if const_expr(do_hoist):
                 pending_pos = [issue_pos(tok_of(tile_base + 0))]
-                cs_cache[0], cs_cache[1] = _cs_from_pos(
-                    fx.Int32(pending_pos[0].trunci(i32))
-                )
+                cs_cache[0], cs_cache[1] = _cs_from_pos(pending_pos[0].to(fx.Int32))
             for i in range_constexpr(CT):
                 # Tile i consumes TDM load #i (issued in tile order: K in the
                 # prologue, then one per iteration while i + K < CT). In steady
@@ -2175,7 +2136,7 @@ def _build_kernel_w32_tdm(
                 # not landed; it stays latent only while the per-tile compute
                 # happens to outlast the load.
                 tdm_ops.tensor_wait(min(K - 1, CT - 1 - i))
-                rocdl.s_wait_dscnt(0)
+                fx.rocdl.s_wait_dscnt(0)
                 if const_expr(do_hoist):
                     cosv, sinv = cs_cache[0], cs_cache[1]
                 else:
@@ -2185,13 +2146,11 @@ def _build_kernel_w32_tdm(
                     issue(bufs[i % K], tile_base + i + K)  # reuse after read
                 if const_expr(do_hoist and (i + 1) % GROUP == 0 and i + 1 < CT):
                     pending_pos[0] = issue_pos(tok_of(tile_base + i + 1))
-                    cs_cache[0], cs_cache[1] = _cs_from_pos(
-                        fx.Int32(pending_pos[0].trunci(i32))
-                    )
+                    cs_cache[0], cs_cache[1] = _cs_from_pos(pending_pos[0].to(fx.Int32))
 
         def emit_kv():
             gk = g - gx_q
-            tok = _imin(gk * RT + wave, num_tokens - 1)
+            tok = fx.min(gk * RT + wave, num_tokens - 1)
             kv_rsrc = _ptr_res(kv_in)
             xv = _concat(
                 [
@@ -2222,7 +2181,7 @@ def _build_kernel_w32_tdm(
                 )
                 pos_ok = pos_i32 >= 0
                 do_swa = (bid_i32 >= 0) & pos_ok
-                bid_safe = _imax(bid_i32, fx.Int32(0))
+                bid_safe = fx.max(bid_i32, fx.Int32(0))
                 pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                 if const_expr(paged):
                     blk = _idiv(pos_safe, swa_cache_size)
@@ -2332,7 +2291,7 @@ def _build_kernel_w32_tdm(
             swa_cache_size,
         )
         k.launch(
-            grid=(fx.Index(gx), 1, 1),
+            grid=(fx.Int64(gx), 1, 1),
             block=(BLOCK_THREADS, RT, 1),
             stream=stream,
         )

@@ -12,7 +12,6 @@ import aiter.fused_moe as fm
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -24,10 +23,6 @@ SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 def set_moe_sorting_backend(backend: str) -> None:
     """Force which moe_sorting backend `moe_sorting()` dispatches to."""
     if backend == "flydsl":
-        if not is_flydsl_available():
-            raise RuntimeError(
-                "backend=flydsl requested but FlyDSL is not available in this build"
-            )
         fm._USE_CK_MOE_SORTING = False
         fm._USE_FLYDSL_MOE_SORTING = True
     elif backend == "opus":
@@ -255,7 +250,7 @@ def test_moe_sorting(
         ),
     }
     # FlyDSL kernel only supports dispatch_policy=0 today.
-    if is_flydsl_available() and dispatch_policy == 0:
+    if dispatch_policy == 0:
         candidates["flydsl"] = lambda: moe_sorting(
             topk_ids,
             topk_weights,
@@ -317,10 +312,6 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
     host-side guard would still bake a stale capture-time count into the
     graph. This asserts real dynamic behavior survives across replay.
     """
-    if not is_flydsl_available():
-        aiter.logger.warning("flydsl unavailable; skipping cuda-graph capture test")
-        return
-
     set_moe_sorting_backend("flydsl")
 
     capture_tokens = token
@@ -433,7 +424,7 @@ def test_moe_sorting_decode_graph_perf(
         "capture_capacity": capture_capacity,
         "real_tokens": real_tokens,
     }
-    backends = ["opus", "ck"] + (["flydsl"] if is_flydsl_available() else [])
+    backends = ["opus", "ck", "flydsl"]
     for name in backends:
         set_moe_sorting_backend(name)
 
@@ -636,22 +627,19 @@ def main():
             "moe_sorting summary (markdown):\n%s", df.to_markdown(index=False)
         )
 
-        if is_flydsl_available():
-            for expert_mask, m in itertools.product(args.expert_mask, args.m):
-                if m < 2:
-                    continue  # need capture/replay token counts to differ
-                for E, topk in model_configs:
-                    test_moe_sorting_flydsl_cuda_graph_capture(
-                        dtype,
-                        m,
-                        args.model_dim,
-                        E,
-                        topk,
-                        has_expert_mask=expert_mask,
-                    )
-            aiter.logger.info(
-                "moe_sorting FlyDSL cuda-graph capture/replay: all passed"
-            )
+        for expert_mask, m in itertools.product(args.expert_mask, args.m):
+            if m < 2:
+                continue  # need capture/replay token counts to differ
+            for E, topk in model_configs:
+                test_moe_sorting_flydsl_cuda_graph_capture(
+                    dtype,
+                    m,
+                    args.model_dim,
+                    E,
+                    topk,
+                    has_expert_mask=expert_mask,
+                )
+        aiter.logger.info("moe_sorting FlyDSL cuda-graph capture/replay: all passed")
 
         if args.decode_graph:
             decode_rows = []

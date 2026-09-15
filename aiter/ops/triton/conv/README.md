@@ -208,15 +208,17 @@ Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`
 
 ### Tuning
 
-Per-kernel configs ship as JSON under `aiter/ops/triton/configs/conv/`, one
-file per `(arch, kernel)` — e.g. `gfx1201-CONV-3X3-NHWC.json` and
-`gfx1201-CONV-PREPACK.json`. The loader walks four tiers: layout-specific shape
-pin → generic shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
-runtime autotune in the hot path, so CI compile time stays predictable and
-the first call hits no tuning tax.
+Per-kernel configs ship as JSON in the nested config tree, one `DEFAULT.json`
+per `(arch, kernel)` under `aiter/ops/triton/configs/<arch>/triton/conv/` —
+e.g. `gfx1201/triton/conv/conv_3x3_nhwc/DEFAULT.json` and
+`gfx1201/triton/conv/conv_prepack/DEFAULT.json`. The loader walks four tiers:
+layout-specific shape pin → generic shape pin → `M_LEQ_x` bucket → `"any"`
+fallback. No runtime autotune in the hot path, so CI compile time stays
+predictable and the first call hits no tuning tax.
 
-RDNA configs are available for gfx1100, gfx1151, gfx1200, and gfx1201. The
-optional direct-NCHW table exists for gfx1100, gfx1151, and gfx1201. gfx1100
+Conv config trees ship for gfx1100, gfx1151, gfx1200, gfx1201 and gfx1250 on
+the RDNA side, and for gfx942 and gfx950 on CDNA. The optional direct-NCHW
+table exists for gfx1100, gfx1151, and gfx1201. gfx1100
 and gfx1151 use exact-shape routing, so shapes not measured faster than the
 complete NCHWc path remain on the cblocked fallback; gfx1201 uses the
 configurable spatial crossover.

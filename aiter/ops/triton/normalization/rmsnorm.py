@@ -14,8 +14,10 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _rmsnorm_bwd_triton,
     _rmsnorm_kernel_large_m_small_n,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
 from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
@@ -113,13 +115,14 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     M, N = x_.shape
 
-    if _should_use_large_m_small_n(M, N):
+    if _should_use_large_m_small_n(M, N, backward=True):
         # Row-parallel tiling for large-M / small-N (q/k per-head norm). Avoids
         # the generic kernel's get_num_sms()-capped grid that serializes rows.
         BLOCK_N = triton.next_power_of_2(N)
         BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
         num_prgms = triton.cdiv(M, BLOCK_M)
-        dg_tmp = torch.empty(num_prgms, N, device="cuda", dtype=torch.float32)
+        dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
+        _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
         _rmsnorm_bwd_kernel_large_m_small_n[(num_prgms,)](
             dz_,
             x_,
@@ -133,8 +136,10 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             N,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
-            num_warps=8,
-            num_stages=2,
+            NUM_WARPS=_cfg["num_warps"],
+            NUM_STAGES=_cfg["num_stages"],
+            num_warps=_cfg["num_warps"],
+            num_stages=_cfg["num_stages"],
         )
         grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
@@ -155,7 +160,11 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     dg_tmp = (
         torch.empty(
-            dg_tmp_rows(x_), N, device="cuda", dtype=torch.float32, requires_grad=False
+            dg_tmp_rows(x_),
+            N,
+            device=x_.device,
+            dtype=torch.float32,
+            requires_grad=False,
         )
         if need_reduction
         else None
@@ -194,9 +203,22 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     return dx, dgamma
 
 
-def _should_use_large_m_small_n(M: int, N: int) -> bool:
+def _should_use_large_m_small_n(M: int, N: int, backward: bool = False) -> bool:
+    """Return True when the large-M/small-N tiled kernel should be used.
 
-    return bool(M > 8192 and N <= 2048)
+    Forward and backward have different crossover points: the backward kernel
+    produces ceil(M/BLOCK_M) partial dgamma rows that must be reduced, so its
+    net benefit shrinks as N grows.  Benchmarks on MI308X (M=16384, bf16):
+
+      N=128  → fwd 13.6×, bwd 5.1×   N=512  → fwd 7.8×, bwd 3.0×
+      N=1024 → fwd 5.0×,  bwd 1.2×   N=1280 → fwd 2.6×, bwd ~1×
+
+    Forward benefit persists to N≈2048; backward benefit drops below noise at
+    N>1024, so separate thresholds avoid a regression for larger N.
+    """
+    if not (M > 8192):
+        return False
+    return N <= 1024 if backward else N <= 2048
 
 
 def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
@@ -614,6 +636,7 @@ def _rmsnorm_forward_large_m_small_n(
     BLOCK_M = min(16384 // BLOCK_N, 32)
     BLOCK_M = max(BLOCK_M, 8)
 
+    _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
     grid = (triton.cdiv(M, BLOCK_M),)
     _rmsnorm_kernel_large_m_small_n[grid](
         x,
@@ -629,7 +652,9 @@ def _rmsnorm_forward_large_m_small_n(
         y.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=8,
-        num_stages=2,
+        NUM_WARPS=_cfg["num_warps"],
+        NUM_STAGES=_cfg["num_stages"],
+        num_warps=_cfg["num_warps"],
+        num_stages=_cfg["num_stages"],
     )
     return (y, rsigma) if return_rsigma else y

@@ -18,48 +18,15 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.moe_gemm_mxfp8 import (
     _moe_gemm_mxfp8_kernel,
 )
+from aiter.ops.triton.moe.moe_utils import build_block_mapping
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+__all__ = ["moe_gemm_mxfp8"]
 
 _LOGGER = AiterTritonLogger()
 
 BLOCK_M = 64
 BLOCK_N = 128
-
-
-def _build_block_mapping(
-    group_sizes: torch.Tensor,
-    block_m: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Pre-compute per-M-block expert IDs and token offsets."""
-    expert_ids_list = []
-    offsets_list = []
-    offset = 0
-    for e in range(group_sizes.shape[0]):
-        size = int(group_sizes[e].item())
-        n_blocks = triton.cdiv(size, block_m)
-        for b in range(n_blocks):
-            expert_ids_list.append(e)
-            offsets_list.append(offset + b * block_m)
-        offset += size
-
-    if not expert_ids_list:
-        return (
-            torch.empty(0, dtype=torch.int32, device=group_sizes.device),
-            torch.empty(0, dtype=torch.int32, device=group_sizes.device),
-            0,
-        )
-
-    block_expert_ids = torch.tensor(
-        expert_ids_list,
-        dtype=torch.int32,
-        device=group_sizes.device,
-    )
-    block_token_offsets = torch.tensor(
-        offsets_list,
-        dtype=torch.int32,
-        device=group_sizes.device,
-    )
-    return block_expert_ids, block_token_offsets, len(expert_ids_list)
 
 
 def moe_gemm_mxfp8(
@@ -94,11 +61,13 @@ def moe_gemm_mxfp8(
     )
 
     total_tokens = lhs.shape[0]
-    rhs.shape[0]
     N = rhs.shape[1]
     K = rhs.shape[2]
 
     assert lhs.shape[1] == K, "K dimension mismatch"
+    assert (
+        quant_block_size > 0 and K % quant_block_size == 0
+    ), f"K ({K}) must be divisible by quant_block_size ({quant_block_size})"
 
     BLOCK_K = quant_block_size
     out = torch.empty(total_tokens, N, dtype=out_dtype, device=lhs.device)
@@ -106,9 +75,8 @@ def moe_gemm_mxfp8(
     if total_tokens == 0:
         return out
 
-    block_expert_ids, block_token_offsets, total_m_blocks = _build_block_mapping(
-        group_sizes,
-        BLOCK_M,
+    block_expert_ids, block_token_offsets, block_token_ends, total_m_blocks = (
+        build_block_mapping(group_sizes, BLOCK_M, total_tokens)
     )
 
     if total_m_blocks == 0:
@@ -126,6 +94,7 @@ def moe_gemm_mxfp8(
         bias,
         block_expert_ids,
         block_token_offsets,
+        block_token_ends,
         total_tokens,
         N,
         K,

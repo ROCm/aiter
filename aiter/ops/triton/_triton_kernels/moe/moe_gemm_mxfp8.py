@@ -45,6 +45,7 @@ def _moe_gemm_mxfp8_kernel(
     # Block-to-expert mapping
     block_expert_ids_ptr,  # [total_m_blocks]  int32
     block_token_offsets_ptr,  # [total_m_blocks]  int32
+    block_token_ends_ptr,  # [total_m_blocks]  int32  exclusive row end per block
     # Dimensions
     total_M,
     N,
@@ -71,7 +72,11 @@ def _moe_gemm_mxfp8_kernel(
     QUANT_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
 ):
-    """BLOCK_K must equal QUANT_BLOCK_SIZE for this kernel."""
+    tl.static_assert(
+        BLOCK_K == QUANT_BLOCK_SIZE,
+        "BLOCK_K must equal QUANT_BLOCK_SIZE: scale pointers advance by 1 per "
+        "K-iteration assuming each tile covers exactly one quantization block.",
+    )
 
     tl.assume(stride_lhs_m > 0)
     tl.assume(stride_lhs_k > 0)
@@ -86,8 +91,9 @@ def _moe_gemm_mxfp8_kernel(
     pid_mb = pid // num_n_blocks
     pid_n = pid % num_n_blocks
 
-    expert_id = tl.load(block_expert_ids_ptr + pid_mb)
+    expert_id = tl.load(block_expert_ids_ptr + pid_mb).to(tl.int64)
     token_offset = tl.load(block_token_offsets_ptr + pid_mb)
+    token_end = tl.load(block_token_ends_ptr + pid_mb)
 
     tl.assume(expert_id >= 0)
     tl.assume(token_offset >= 0)
@@ -96,7 +102,9 @@ def _moe_gemm_mxfp8_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    m_mask = offs_m < total_M
+    # Mask against the block's own valid row end, not total_M: prevents reading
+    # across expert-group boundaries when group_size < BLOCK_M.
+    m_mask = offs_m < token_end
     n_mask = offs_n < N
 
     # lhs pointers
