@@ -215,7 +215,7 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     so the split boundary never straddles a tile or a microscale word."""
     if K % 128 != 0:
         return False
-    if ki.tile_m == 16 and M != 1:
+    if ki.tile_m == 16 and M > 16:
         return False
     # blockscale is a8w8-only and needs whole 128-N blocks: shuffle_scale_blockscale_b
     # takes (N//128, K//128) and the kernel reads 4 dwords per 128-N block. fp4/fp6

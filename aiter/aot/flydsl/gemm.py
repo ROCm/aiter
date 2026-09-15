@@ -435,7 +435,7 @@ def _compile_mxscale_preshuffle_to_cache(
 
     ``blockscale`` selects the scale format; the two modes are distinct
     Constexprs and therefore distinct binaries, so each is its own job. Keep
-    the CSV's logical M so the M=1 fused split-K specialization is also AOT'd.
+    the CSV's logical M so the M<=16 fused split-K specializations are also AOT'd.
     """
     del kwargs
 

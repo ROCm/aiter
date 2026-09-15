@@ -36,7 +36,7 @@ _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
 @functools.cache
-def _gemm_exe(_cfg, fused):
+def _gemm_exe(_cfg, fused, _multi_row):
     import flydsl.compiler as flyc
 
     from .kernels.gemm.mxscale_preshuffle import launch_gemm, launch_gemm_fused
@@ -92,7 +92,7 @@ def flydsl_mxscale_preshuffle_gemm(
 
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
 
-    split_k>1 splits the K reduction across grid.z. The tuned M=1 blockscale
+    split_k>1 splits the K reduction across grid.z. The tuned M<=16 blockscale
     specialization writes BF16 partials to a small workspace, then the last
     arriving block for each output tile reduces them in FP32 and writes Out.
     Other shapes write fp32 partial slabs and launch a separate reduce kernel.
@@ -158,13 +158,13 @@ def flydsl_mxscale_preshuffle_gemm(
     # (shuffle_scale_blockscale_a/_b). No per-call repack here.
     bs_mode = "ab" if blockscale else "none"
     split_k = int(split_k)
-    # For the latency-sensitive M=1 path, keep the split partials in BF16 and
+    # For the latency-sensitive M<=16 path, keep the split partials in BF16 and
     # let the last arriving GEMM block reduce them. This avoids a second launch
     # without introducing output atomics or a grid-wide spin wait.
     splitk_fused = (
         blockscale
         and split_k > 1
-        and M == 1
+        and M <= 16
         and int(tile_m) == 16
         and out_dtype == "bf16"
         and int(tile_n) <= 128
@@ -205,7 +205,8 @@ def flydsl_mxscale_preshuffle_gemm(
         split_k,  # k_batch
         bs_mode,  # blockscale
     )
-    gemm_exe = _gemm_exe(cfg, splitk_fused)
+    multi_row = int(tile_m) == 16 and M > 1
+    gemm_exe = _gemm_exe(cfg, splitk_fused, multi_row)
     # Build each runtime pointer wrapper once per op.  The fused ABI carries two
     # additional pointer slots; re-wrapping Out (or the split workspace) for
     # those aliases measurably increases launch gaps on very short decode GEMMs.
@@ -227,6 +228,7 @@ def flydsl_mxscale_preshuffle_gemm(
             N,
             st,
             *cfg,
+            multi_row,
         )
         return Out
 
@@ -260,6 +262,7 @@ def flydsl_mxscale_preshuffle_gemm(
             N,
             st,
             *cfg,
+            multi_row,
         )
         return Out
 
@@ -277,6 +280,7 @@ def flydsl_mxscale_preshuffle_gemm(
         N,
         st,
         *cfg,
+        multi_row,
     )
     _run_compiled(
         _reduce_exe((split_k, out_dtype)),

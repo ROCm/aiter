@@ -130,6 +130,7 @@ def _launch_gemm_impl(
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
     blockscale: Constexpr[str] = "none",
+    multi_row_tile: Constexpr[bool] = False,
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -178,7 +179,7 @@ def _launch_gemm_impl(
     KH4 = b_row_bytes // 4  # i32 per N-row in preshuffled B (== (K//2)//4 for fp4)
     K_TILES = K // BK
     # split-K (k_batch>1): each grid.z split reduces k_tiles_local = K_TILES//k_batch
-    # K-tiles. The M=1 BF16 specialization writes a compact BF16 workspace and
+    # K-tiles. The M<=16 BF16 specialization writes a compact BF16 workspace and
     # reduces it in the last-arriving GEMM block; other variants write fp32 partial
     # slabs followed by a separate reduce kernel. K/k_batch is 256-K aligned (see
     # fits_shape), so a split boundary lands on whole tiles + scale chunks.
@@ -243,6 +244,8 @@ def _launch_gemm_impl(
     )
     if splitk_fused:
         _kname += "_fused_reduce"
+    if multi_row_tile:
+        _kname += "_multirow"
 
     def _kernel_body(
         arg_c: fx.Int64,
@@ -356,7 +359,7 @@ def _launch_gemm_impl(
             return fx.add_offset(sA0_i32, parity * lds_db_i32)
 
         if const_expr(BM == 16):
-            # The M=1-specialized tile uses layout algebra for both the global->LDS
+            # The small-M tile uses layout algebra for both the global->LDS
             # DMA and LDS reads. Keep the established arithmetic path below for the
             # wider tiles: materializing these layouts increases VGPR pressure on a
             # few existing CSV kernels and can reduce their occupancy.
@@ -695,11 +698,11 @@ def _launch_gemm_impl(
         accs = [results] if n_acc == 1 else results
 
         # Epilogue via fx.copy: a lane owns 4 rows per (mi,ni) accm (row
-        # m*16+(l//16)*4+ii, col base+l%16), c_stride apart. The M=1 fused
-        # split-K specialization packs adjacent lanes into a BF16 workspace;
-        # the dynamically last block for each output tile reduces all slabs.
+        # m*16+(l//16)*4+ii, col base+l%16), c_stride apart. The single-row
+        # specialization packs adjacent lanes; multi-row tiles use masked scalar
+        # stores. The dynamically last block for each output tile reduces all slabs.
         c_stride = N if c_row_stride < 0 else c_row_stride
-        # Regular split-K writes fp32 partial slabs. The M=1 fused path writes
+        # Regular split-K writes fp32 partial slabs. The small-M fused path writes
         # BF16 partials; no-split writes directly to the requested output type.
         if const_expr(splitk_fused):
             store_elem = BFloat16
@@ -751,16 +754,18 @@ def _launch_gemm_impl(
             ),
             fx.make_layout(1, 1),
         )
-        if const_expr(k_batch > 1 or small_m_bf16):
+        if const_expr(
+            (k_batch > 1 and not splitk_fused)
+            or (small_m_bf16 and not multi_row_tile)
+        ):
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), store_elem)
         else:
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), store_elem)
         c_rstride = fx.Int32(c_stride)
         col_w = by_n + wave * (BN // num_waves) + lane_mod_16
-        if const_expr(small_m_bf16):
-            # M=1: only row 0 is live. Avoid issuing the other 15 rows' masked
-            # stores (and their lane exchanges) from the nominal 16-row tile;
-            # this also gives the no-split path native packed BF16 stores.
+        if const_expr(small_m_bf16 and not multi_row_tile):
+            # Avoid issuing the other 15 rows' masked stores (and their lane
+            # exchanges) for the latency-critical single-row specialization.
             for ni in range_constexpr(num_acc_n):
                 col = col_w + ni * 16
                 acc_f32 = Vec(accs[ni])
@@ -774,9 +779,7 @@ def _launch_gemm_impl(
                     if lane_mod_16 % fx.Int32(2) == fx.Int32(0):
                         cf = fx.make_rmem_tensor(2, store_elem)
                         cf.store(
-                            Vec.from_elements([acc_f32[0], peer], Float32).to(
-                                store_elem
-                            )
+                            Vec.from_elements([acc_f32[0], peer], Float32).to(store_elem)
                         )
                         fx.copy(c_copy, cf, c_flat[None, col])
         else:
@@ -812,11 +815,23 @@ def _launch_gemm_impl(
                         arg_semaphore + fx.Int64(tile_idx) * fx.Int64(4), fx.Int32(1)
                     )
                 )
-            # BN<=128 fits in wave 0 at two BF16 values per lane. Broadcast
-            # lane 0's arrival result within that wave, avoiding an LDS round
-            # trip and block barrier.
-            arrival = fx.Int32(rocdl.readfirstlane(T.i32, arrival))
-            if (wave == fx.Int32(0)) & (arrival == fx.Int32(k_batch - 1)):
+            if const_expr(multi_row_tile):
+                # Reuse A LDS after the GEMM to broadcast the winning arrival
+                # to every wave.  All waves then share the M*BN reduction; a
+                # single wave becomes the bottleneck by M=8/16.
+                if tid == fx.Int32(0):
+                    fx.ptr_store(arrival, sA0_i32)
+                gpu.barrier()
+                arrival = fx.Int32(fx.ptr_load(sA0_i32))
+                owns_reduce = arrival == fx.Int32(k_batch - 1)
+            else:
+                # M=1 has only BN/2 packed outputs, which fit in wave 0. Avoid
+                # the LDS round trip and extra block barrier on that fast path.
+                arrival = fx.Int32(rocdl.readfirstlane(T.i32, arrival))
+                owns_reduce = (wave == fx.Int32(0)) & (
+                    arrival == fx.Int32(k_batch - 1)
+                )
+            if owns_reduce:
                 bf16_ptr_ty = fx.PointerType.get(
                     BFloat16.ir_type,
                     address_space=fx.AddressSpace.Global,
@@ -846,7 +861,38 @@ def _launch_gemm_impl(
                 # Follow the existing AITER split-K reduce's numeric path:
                 # extend BF16 partials to FP32, accumulate there, then truncate
                 # only the final result. Sequential loads minimize live VGPRs.
-                if tid < fx.Int32(BN // reduce_vec):
+                if const_expr(multi_row_tile):
+                    pairs_per_row = BN // reduce_vec
+                    reduce_pairs = i32_m * fx.Int32(pairs_per_row)
+                    for pair_idx in range(
+                        tid, reduce_pairs, fx.Int32(num_threads)
+                    ):
+                        row = pair_idx // fx.Int32(pairs_per_row)
+                        pair_in_row = pair_idx % fx.Int32(pairs_per_row)
+                        out_off = (
+                            row * fx.Int32(N)
+                            + by_n
+                            + pair_in_row * fx.Int32(reduce_vec)
+                        )
+                        reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
+                        for sk in range_constexpr(k_batch):
+                            partial_dw = fx.Int32(
+                                load_i32_nt(
+                                    arg_c,
+                                    (
+                                        out_off + fx.Int32(sk) * slab_stride
+                                    )
+                                    // fx.Int32(2),
+                                )
+                            )
+                            partial = Vec.from_elements([partial_dw], Int32).bitcast(
+                                BFloat16
+                            )
+                            reduced = reduced + partial.to(Float32)
+                        result = fx.make_rmem_tensor(reduce_vec, BFloat16)
+                        fx.memref_store_vec(reduced.truncf(vec_bf16), result)
+                        fx.copy(reduce_copy, result, out_flat[None, out_off])
+                elif tid < fx.Int32(BN // reduce_vec):
                     out_off = by_n + tid * fx.Int32(reduce_vec)
                     reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
                     for sk in range_constexpr(k_batch):
@@ -881,7 +927,7 @@ def _launch_gemm_impl(
                     fx.ptr_store(fx.Int32(0), sem_ptr)
 
     # Keep the established kernel ABI for every non-fused configuration.  The
-    # fused M=1 specialization needs two extra pointers, but carrying those
+    # fused small-M specialization needs two extra pointers, but carrying those
     # unused kernargs on all prefill/decode kernels can perturb kernarg preload
     # and regress a few latency-sensitive existing configurations.
     if const_expr(splitk_fused):
@@ -1003,6 +1049,7 @@ def launch_gemm(
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
     blockscale: Constexpr[str] = "none",
+    multi_row_tile: Constexpr[bool] = False,
 ):
     """Launch the established non-fused GEMM ABI used by existing configs."""
     _launch_gemm_impl(
@@ -1035,6 +1082,7 @@ def launch_gemm(
         xcd_swizzle,
         k_batch,
         blockscale,
+        multi_row_tile,
     )
 
 
@@ -1069,8 +1117,9 @@ def launch_gemm_fused(
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
     blockscale: Constexpr[str] = "none",
+    multi_row_tile: Constexpr[bool] = False,
 ):
-    """Launch the M=1 split-K GEMM with its fused reduction arguments."""
+    """Launch the M<=16 split-K GEMM with its fused reduction arguments."""
     _launch_gemm_impl(
         arg_c,
         arg_a,
@@ -1101,6 +1150,7 @@ def launch_gemm_fused(
         xcd_swizzle,
         k_batch,
         blockscale,
+        multi_row_tile,
     )
 
 
