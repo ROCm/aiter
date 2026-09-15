@@ -372,23 +372,23 @@ def build_pa_mqa_logits_fp4_prefill_module(
     block_threads_k = num_warps * WARP_SIZE
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
-    assert head_dim % 128 == 0, (
-        f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
-    )
+    assert (
+        head_dim % 128 == 0
+    ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
 
     N_TILES = block_k // MFMA_N
-    assert N_TILES % num_warps == 0, (
-        f"block_k={block_k} -> N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
-    )
+    assert (
+        N_TILES % num_warps == 0
+    ), f"block_k={block_k} -> N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
     N_TILES_PER_WARP = N_TILES // num_warps
 
-    assert kv_block_size % MFMA_N == 0, (
-        f"kv_block_size={kv_block_size} must be a multiple of MFMA_N={MFMA_N}"
-    )
-    assert block_k % kv_block_size == 0, (
-        f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
-    )
+    assert (
+        kv_block_size % MFMA_N == 0
+    ), f"kv_block_size={kv_block_size} must be a multiple of MFMA_N={MFMA_N}"
+    assert (
+        block_k % kv_block_size == 0
+    ), f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
     TILES_PER_BLOCK = kv_block_size // MFMA_N
     N_PHYS = (N_TILES_PER_WARP + TILES_PER_BLOCK - 1) // TILES_PER_BLOCK
 
@@ -639,16 +639,17 @@ def build_pa_mqa_logits_fp4_prefill_module(
             # the descriptor in i64, leaving only within-page buffer offsets.
             phys_shared = fx.Int64(_uniform(fx.Int32(phys_list[0])))
             kv_bt = _i32_buffer(
-                kv_cache_ptr, width=4,
+                kv_cache_ptr,
+                width=4,
                 byte_offset=phys_shared * fx.Int64(_stride_kv_block),
             )
             kvs_bt = _i32_buffer(
-                kv_scale_ptr, width=1,
+                kv_scale_ptr,
+                width=1,
                 byte_offset=phys_shared * fx.Int64(_stride_kvs_block),
             )
             kvs_base_off_elems = (
-                lane_div_16 * kv_block_size
-                + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
+                lane_div_16 * kv_block_size + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
             ) >> fx.Int32(2)
             for k_tile in range_constexpr(k_tiles):
                 kvs_packed = kvs_bt[
@@ -742,9 +743,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
             )
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
-            assert N_TILES_PER_WARP == 4, (
-                "pipelined-nt structure currently hardcoded for NTPW=4"
-            )
+            assert (
+                N_TILES_PER_WARP == 4
+            ), "pipelined-nt structure currently hardcoded for NTPW=4"
 
             accs_nt0 = (
                 _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 0)
