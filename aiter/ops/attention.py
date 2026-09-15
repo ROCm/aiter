@@ -1265,7 +1265,7 @@ def get_mla_metadata_info_v1(
         max_split_tiles = tile_cnt * max_splits
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:948-950). This is a GLOBAL
     # budget shared across all tiles, so the total number of partial reduce
     # entries is bounded by the base tiles (one per tile) plus at most the global
     # split budget of EXTRA splits distributed across them:
@@ -1277,7 +1277,24 @@ def get_mla_metadata_info_v1(
     # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
     if max_split_per_batch > 0:
         per_tile_cap = min(max_splits, max_split_per_batch * batch_size)
-        max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
+        # Take the min. `tile_cnt + per_tile_cap` is the cap-aware bound; the
+        # fast_mode estimate above assumes an unbounded per-batch split budget,
+        # so combining them with max() lets the loose estimate always win and a
+        # supplied cap has no effect on the allocation at all.
+        #
+        # The fast_mode estimate saturates at ((max_splits - 1) * 2) * tiles per
+        # batch, so at large batch it can sit below `tile_cnt + per_tile_cap`
+        # and this min() keeps the smaller of the two. That is supported by
+        # measurement rather than assumed: see
+        # op_tests/test_mla_metadata_split_cap_fill.py, where at batch 512 with
+        # jittered KV up to 64k the planner writes at most ~510 partials against
+        # a bound of ~2040 -- roughly 4x headroom either way.
+        #
+        # Only valid because the caller passes the SAME max_split_per_batch to
+        # get_mla_metadata_v1 at build time; the schedule is then built under
+        # the same cap the sizing assumed. The fill test drives both with one
+        # cap for exactly this reason.
+        max_split_tiles = min(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
