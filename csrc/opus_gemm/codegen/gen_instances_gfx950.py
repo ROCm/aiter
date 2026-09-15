@@ -1034,6 +1034,7 @@ def gen_noscale_instance_gfx950(
         cachectl_extra = f",\n    {k.cachectl_a}, {k.cachectl_b}"
     traits_alias_tail = f",\n    {has_oob_str}"
     if is_a16w16_split_barrier:
+        traits_alias_tail += f",\n    {build_num_xcd()}"
         traits_aliases = f"""
 template <typename D_C>
 using {k.name}_TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
