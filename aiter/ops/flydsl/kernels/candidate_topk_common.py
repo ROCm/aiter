@@ -152,6 +152,7 @@ def make_block_exclusive_prefix_i32(num_waves):
         exclusive = inclusive - value
         if lane == fx.Int32(WAVE_SIZE - 1):
             scan[wave] = inclusive
+        fly_rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
 
         cross_wave = fx.Int32(0)

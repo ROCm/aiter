@@ -155,8 +155,7 @@ def flydsl_fp8_paged_mqa_local_topk(
 ):
     """Compute exact H32D128 FP8 scores and retain local TopK per history split.
 
-    Live candidates are emitted in descending score order; equal scores are
-    unordered. Positions are logical history positions.
+    Live candidates are emitted unordered. Positions are logical history positions.
     Set ``preshuffled=True`` when ``kv_cache`` uses
     ``shuffle_weight(..., layout=(16,16))`` within each page. This experimental
     API never allocates a full-width logits tensor.
@@ -405,7 +404,6 @@ def flydsl_fp8_paged_mqa_topk(
             arch=arch,
             stream=stream,
             packed=packed,
-            ordered_emit=False,
             prepare_merge=workspace is not None,
             merge_histogram=workspace[0] if workspace is not None else None,
             merge_state=workspace[1] if workspace is not None else None,

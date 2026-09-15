@@ -53,14 +53,13 @@ def fp8_paged_mqa_local_topk_kernel_name(
     preshuffled: bool,
     packed: bool,
     prepare_merge: bool,
-    ordered_emit: bool = True,
 ) -> str:
     layout_name = "preshuffled" if preshuffled else "rowmajor"
     packed_tag = "_packed" if packed else ""
     return (
         f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
         f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
-        f"pm{int(prepare_merge)}_oe{int(ordered_emit)}_bitonic_{arch}"
+        f"pm{int(prepare_merge)}_scan2safe_{arch}"
     )
 
 
@@ -144,7 +143,6 @@ def compile_fp8_paged_mqa_local_topk(
     page_size: int,
     prepare_merge: bool = False,
     packed: bool = False,
-    ordered_emit: bool = True,
 ):
     """Compile an H32D128 Stage-A specialization."""
     if topk not in SUPPORTED_K:
@@ -169,7 +167,6 @@ def compile_fp8_paged_mqa_local_topk(
         preshuffled=preshuffled,
         packed=packed,
         prepare_merge=prepare_merge,
-        ordered_emit=ordered_emit,
     )
     page_index_dim = INDEX_DIM if packed else HEAD_DIM
     block_i32 = page_size * page_index_dim // 4
@@ -197,9 +194,10 @@ def compile_fp8_paged_mqa_local_topk(
     if preshuffled:
 
         def _load_k(kv_i32, page_i32, token_in_page, lane):
+            page_view = kv_i32.rebase_bytes(fx.Int64(page_i32) << fx.Int64(2))
             return _load_preshuffled_fp8x32(
-                kv_i32,
-                page_i32,
+                page_view,
+                fx.Int32(0),
                 token_in_page,
                 lane,
             )
@@ -207,13 +205,15 @@ def compile_fp8_paged_mqa_local_topk(
     else:
 
         def _load_k(kv_i32, page_i32, token_in_page, lane):
-            byte_base = (page_i32 << 2) + token_in_page * fx.Int32(HEAD_DIM)
-            return _load_fp8x32(kv_i32, byte_base, lane)
+            page_view = kv_i32.rebase_bytes(fx.Int64(page_i32) << fx.Int64(2))
+            byte_base = token_in_page * fx.Int32(HEAD_DIM)
+            return _load_fp8x32(page_view, byte_base, lane)
 
     if packed:
 
         def _load_scale(scales, page_i32, token_in_page):
-            return fx.Float32(scales[page_i32 + fx.Int32(scale_i32) + token_in_page])
+            page_view = scales.rebase_bytes(fx.Int64(page_i32) << fx.Int64(2))
+            return fx.Float32(page_view[fx.Int32(scale_i32) + token_in_page])
 
     else:
 
@@ -371,9 +371,9 @@ def compile_fp8_paged_mqa_local_topk(
                 equal = live & (score_ord == threshold)
                 better_i32 = better.select(fx.Int32(1), fx.Int32(0))
                 equal_i32 = equal.select(fx.Int32(1), fx.Int32(0))
-                packed = (better_i32 << fx.Int32(_PACK_SHIFT)) + equal_i32
+                packed_counts = (better_i32 << fx.Int32(_PACK_SHIFT)) + equal_i32
                 packed_before, packed_total = block_exclusive_prefix_i32(
-                    tid, packed, scan
+                    tid, packed_counts, scan
                 )
                 better_before = packed_before >> fx.Int32(_PACK_SHIFT)
                 equal_before = packed_before & fx.Int32(_PACK_MASK)
@@ -393,75 +393,8 @@ def compile_fp8_paged_mqa_local_topk(
                 equal_seen = equal_seen + equal_total
             if tid == 0:
                 state[_RETAINED] = fx.Int32(topk)
-            gpu.barrier()
-
-        def _sort_survivors(retained, pool_values, pool_indices):
-            """Sort the final bag into descending score order.
-
-            Compact already reduced to ``retained <= k`` in ``pool[0:retained)``.
-            Pad the unused ``[retained, k)`` slots with ``-inf`` so every
-            supported ``k`` (a power of two) can use a full bitonic network.
-            Each stage reads one k-wide LDS half and writes one value per lane
-            to the other half; waitcnt plus the block barrier separates stages.
-            Equal keys do not swap, so live ``-inf`` scores keep their indices
-            instead of exchanging with pad slots. Intermediate compact stays
-            unordered; only the emit bag is sorted.
-            """
-            for step in range_constexpr(output_steps):
-                slot = fx.Int32(step * BLOCK_THREADS) + tid
-                if (slot >= retained) & (slot < fx.Int32(topk)):
-                    pool_values[slot] = fx.Float32(float("-inf"))
             rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
-
-            source_offset = 0
-            destination_offset = topk
-            k_size = 2
-            while k_size <= topk:
-                j = k_size // 2
-                while j > 0:
-                    for step in range_constexpr(output_steps):
-                        i = fx.Int32(step * BLOCK_THREADS) + tid
-                        partner = i ^ fx.Int32(j)
-                        if i < fx.Int32(topk):
-                            va = pool_values[fx.Int32(source_offset) + i]
-                            vb = pool_values[fx.Int32(source_offset) + partner]
-                            ia = pool_indices[fx.Int32(source_offset) + i]
-                            ib = pool_indices[fx.Int32(source_offset) + partner]
-                            ka = f32_to_ordered_i32(va)
-                            kb = f32_to_ordered_i32(vb)
-                            descending_half = (i & fx.Int32(k_size)) == 0
-                            low_member = (i & fx.Int32(j)) == 0
-                            take_max = descending_half == low_member
-                            take_partner = take_max.select(
-                                kb > ka,
-                                kb < ka,
-                            )
-                            pool_values[fx.Int32(destination_offset) + i] = (
-                                take_partner.select(vb, va)
-                            )
-                            pool_indices[fx.Int32(destination_offset) + i] = (
-                                take_partner.select(ib, ia)
-                            )
-                    rocdl.s_waitcnt(lgkmcnt=0)
-                    gpu.barrier()
-                    source_offset, destination_offset = (
-                        destination_offset,
-                        source_offset,
-                    )
-                    j //= 2
-                k_size *= 2
-
-            if source_offset != 0:
-                for step in range_constexpr(output_steps):
-                    slot = fx.Int32(step * BLOCK_THREADS) + tid
-                    if slot < fx.Int32(topk):
-                        pool_values[slot] = pool_values[fx.Int32(source_offset) + slot]
-                        pool_indices[slot] = pool_indices[
-                            fx.Int32(source_offset) + slot
-                        ]
-                rocdl.s_waitcnt(lgkmcnt=0)
-                gpu.barrier()
 
         neutral = arith.constant(_NEUTRAL_E8M0, type=T.i32)
         result_type = fx.Vector.make_type(DREG, fx.Float32)
@@ -666,8 +599,6 @@ def compile_fp8_paged_mqa_local_topk(
             tile_number = tile_number + fx.Int32(1)
 
         retained = state[_RETAINED]
-        if const_expr(ordered_emit):
-            _sort_survivors(retained, pool_values, pool_indices)
         output_scores_row = fx.slice(
             candidate_scores,
             (row, split, None),
@@ -824,7 +755,6 @@ def launch_fp8_paged_mqa_local_topk(
     merge_histogram=None,
     merge_state=None,
     packed=False,
-    ordered_emit=True,
 ):
     page_size = kv_cache.shape[1]
     batch, next_n, _, _ = q_fp8.shape
@@ -836,7 +766,6 @@ def launch_fp8_paged_mqa_local_topk(
         page_size=page_size,
         prepare_merge=prepare_merge,
         packed=packed,
-        ordered_emit=ordered_emit,
     )
     max_pages = block_tables.shape[1]
     num_pages = kv_cache.shape[0]
