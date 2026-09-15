@@ -23,7 +23,7 @@
 //     workspace; a reduce kernel sums splits + casts to bf16 C.
 //
 //   opus_gemm_a16w16_persistent_traits_gfx950<..., TILE, WAVE, HAS_OOB,
-//                                              CACHECTL_A, CACHECTL_B>
+//                                              CACHECTL_A, CACHECTL_B, NUM_XCD>
 //     M-outer + N-fast XCD swizzle persistent pipeline.
 //
 //   opus_gemm_a16w16_mono_tile_traits_gfx950<..., DTYPE, VEC>
@@ -47,11 +47,11 @@ template<int BLOCK_SIZE_,
         bool HAS_BIAS_ = false,
         typename D_BIAS_ = void,
         bool HAS_OOB_ = true,
+        int NUM_XCD_ = 8,
         int CACHECTL_A_ = 0,
         int CACHECTL_B_ = 17,
         int SWIZZLE_W_ = 8,
-        int SWIZZLE_C_ = 32,
-        int NUM_XCD_ = 8>
+        int SWIZZLE_C_ = 32>
 struct opus_gemm_a16w16_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
