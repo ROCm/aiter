@@ -174,7 +174,7 @@ def _make_out_row_view(logits, stride_out, row):
         logits,
         dtype=T.f32,
         shape=(-1,),
-        cache_modifier=2,
+        cache_modifier=0,
         static_bytes_offset_i64=byte,
     )
 
@@ -324,7 +324,9 @@ def _build_kernel():
             )
 
             def _write(_out=out, _col=col, _value=value):
-                _out[_col] = _value
+                # Cached write-allocate so the following topk can hit L2.
+                # KV page DMA stays NT (aux=2) and does not evict these lines.
+                buffer_ops.buffer_store(_value, _out.rsrc, _col, cache_modifier=0)
 
             _guarded(
                 (lane_div_16 == 0)
@@ -341,6 +343,7 @@ def _build_kernel():
                 k_base,
                 KV_BLOCK_SIZE * HEAD_DIM + (token_base + lane_mod_16) * 4,
             )
+
             def _score_row(r):
                 a_packs = [
                     _load_q_pack_lds(
