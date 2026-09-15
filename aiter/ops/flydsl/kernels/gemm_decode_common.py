@@ -841,10 +841,7 @@ def dpp_move_f32(value, control: int):
 
 
 def reduce_mfma_scalar(accumulator):
-    components = [
-        raw(fx.Vector(accumulator)[i])
-        for i in range_constexpr(4)
-    ]
+    components = [raw(fx.Vector(accumulator)[i]) for i in range_constexpr(4)]
     result = fx.Float32(components[0])
     result = result + fx.Float32(dpp_move_f32(components[1], 0x101))
     result = result + fx.Float32(dpp_move_f32(components[2], 0x102))
