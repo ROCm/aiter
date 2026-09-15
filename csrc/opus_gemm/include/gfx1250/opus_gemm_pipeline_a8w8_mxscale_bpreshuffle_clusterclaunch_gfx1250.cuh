@@ -1182,6 +1182,62 @@ __global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
                       "the lane's N run must tile one kWmmaN block exactly");
         using CVec = opus::vector_t<D_OUT, kVec>;
 
+        if constexpr (T::kCViaLds) {
+            // Stage the tile in LDS and hand it to ONE TDM store, the same shape
+            // the nospec pipeline uses. The per-fragment `row >= m` / `col >= n`
+            // guards below are lane-divergent, so each becomes its own exec
+            // save/restore region, and in-flight global stores pin EXEC -- every
+            // region boundary drains them. ATT priced that at 25.5% of a nospec
+            // wave before the same change there (s_wait_xcnt 118,073 -> 6,871,
+            // kernel time -11%..-13%). The window's own extents clamp the partial
+            // tile, so the guards go away entirely.
+            //
+            // The ring's LDS is reused: by here the K loop is done and the reduce
+            // above has published and consumed its partials. The barrier is what
+            // makes that safe -- reduce reads lds_buf from its own base, so the
+            // last reader has to be past it before the first ds_write lands.
+            // WindowC is typed on the traits' DataC while the store is typed on
+            // D_OUT. Every shipped cc instantiation pairs them (TILE<bf16_t>
+            // with bf16_t, TILE<fp32_t> with fp32_t), but they are independent
+            // template parameters, so pin the invariant: a mixed pair would give
+            // the TDM descriptor the wrong element size and write garbage.
+            static_assert(std::is_same_v<D_OUT, typename T::DataC>,
+                          "C_VIA_LDS needs D_OUT == traits DataC: the TDM store "
+                          "window is typed on DataC");
+            __builtin_amdgcn_s_barrier();
+            D_OUT* smem_c = reinterpret_cast<D_OUT*>(lds_buf);
+            opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                constexpr int im = decltype(imN)::value;
+                opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in = decltype(inN)::value;
+                    auto reg_c = opus::cast<D_OUT>(acc[im][in]);
+                    const int r = (row_base - tile_row) + im * T::kWmmaM;
+                    const int c0 = (col_base - tile_col) + in * T::kWmmaN;
+                    D_OUT* q = smem_c + (size_t)r * T::kSmemPitchC + c0;
+                    opus::static_for<kFragC / kVec>([&](auto cN) __attribute__((always_inline)) {
+                        constexpr int c = decltype(cN)::value;
+                        CVec v;
+                        opus::static_for<kVec>([&](auto eN) __attribute__((always_inline)) {
+                            constexpr int e = decltype(eN)::value;
+                            v[e] = reg_c[c * kVec + e];
+                        });
+                        *reinterpret_cast<CVec*>(q + c * kVec) = v;
+                    });
+                });
+            });
+            opus::s_wait_dscnt<0>();
+            __builtin_amdgcn_s_barrier();
+            // One wave issues the whole tile. Consumers only: a producer wave
+            // never reached this branch, and its acc holds nothing.
+            if (wave_id == T::kNumProducerWaves) {
+                auto win_c = opus::make_tdm<typename T::WindowC>(
+                    (u32_t)reinterpret_cast<u64_t>(smem_c), ptr_c,
+                    (u32_t)kargs.n, (u32_t)kargs.m, (u64_t)kargs.stride_c,
+                    (u32_t)tile_col, (u32_t)tile_row);
+                win_c.async_store();
+                opus::s_wait_tensorcnt<0>();
+            }
+        } else {
         opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
             constexpr int im = decltype(imN)::value;
             const int row = row_base + im * T::kWmmaM;
@@ -1203,6 +1259,7 @@ __global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
                 });
             });
         });
+        }
     }
 #else
     (void)kargs;   // non-gfx1250 device pass: empty stub (multi-arch wheel safety)

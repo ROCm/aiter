@@ -1399,6 +1399,38 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_gfx1250 =
         /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
         /*SF_A_LDS*/true>;
 
+// kid64/kid65: the cluster-launch path's first GROUP_N=128 tiles.
+//
+// cc only ever instantiated kid 0/1/4/13, all GROUP_N=1 (per-column scale), so
+// the whole split-K + B-multicast path was unreachable for the DSV4 block scale
+// the model actually runs -- the launcher's w_scale.size(1) check rejects it.
+// Nothing structural: the cc launcher computes sfb_rows from T::kGroupN like
+// every other one, so a GROUP_N=128 tile just had to be declared.
+//
+// kid64 is kid13 with GROUP_N=128 (+ SF_B_LDS, which the block scale makes
+// worth staging). kid65 adds C_VIA_LDS on top, so the pair isolates the
+// write-out from the scale format.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/128, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true>;
+
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_ctdm_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/128, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/0, /*NO_SPEC*/false,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
+        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true>;
+
 // -- both scales in LDS (kid14) ---------------------------------------------
 // kid13 plus SF_B_LDS, so the kid13-vs-kid14 pair isolates the B side with
 // everything else -- tile shape, GROUP_N, panel geometry, fill mechanism --

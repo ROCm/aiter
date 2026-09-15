@@ -2118,6 +2118,9 @@ a8w8_mxscale_bmm_bpreshuffle_kernels_list = {
     56: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=256, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True),  # ns256_ctdm
     60: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True),  # ns128_ctdm
     63: _bpreshuf(B_M=128, B_N=64, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True),  # ns128_n64
+    # cluster-launch path, first GROUP_N=128 tiles (kid65 adds C_VIA_LDS).
+    64: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True),  # cc_gn128
+    65: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, c_via_lds=True),  # cc_gn128_ctdm
 }
 
 # The two BROKEN-by-construction kids, excluded from any sweep.

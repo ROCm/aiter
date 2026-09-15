@@ -254,6 +254,8 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
     {56, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_ctdm_gfx1250)},
     {60, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_gfx1250)},
     {63, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_n64_gfx1250)},
+    {64, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_gfx1250)},
+    {65, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_ctdm_gfx1250)},
   };
 #undef OPUS_BMM_BPRESHUF_ENTRY
 #undef OPUS_BMM_BPRESHUF_NS_ENTRY
@@ -385,9 +387,10 @@ void opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch(
   }
   aiter_detail::g_aiter_can_throw = true;
 
-  AITER_CHECK(kernelId == 0 || kernelId == 1 || kernelId == 4 || kernelId == 13,
+  AITER_CHECK(kernelId == 0 || kernelId == 1 || kernelId == 4 || kernelId == 13
+                  || kernelId == 64 || kernelId == 65,
               "opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch: kernelId must "
-              "be 0, 1, 4 or 13 (got ", kernelId,
+              "be 0, 1, 4, 13, 64 or 65 (got ", kernelId,
               "). Tile ids match the non-cluster entry point, but only these "
               "four are instantiated for the cluster path so far: 0 = prefill "
               "128x128x256, 1 = decode 16x32x256, 4 = decode 16x64x256 6-wave, "
@@ -481,6 +484,14 @@ void opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch(
     case 13:
       OPUS_BMM_CC_DISPATCH_PREFILL(
           opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_gfx1250);
+      break;
+    case 64:
+      OPUS_BMM_CC_DISPATCH_PREFILL(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_gfx1250);
+      break;
+    case 65:
+      OPUS_BMM_CC_DISPATCH_PREFILL(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_ctdm_gfx1250);
       break;
     default:
       OPUS_BMM_CC_DISPATCH_PREFILL(
