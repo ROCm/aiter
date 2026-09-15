@@ -44,7 +44,15 @@ ctypes_map = {
     str: ctypes.c_char_p,
 }
 
+# Device-agnostic torch.Stream exists from Torch 2.7+. Empty-tuple fallback
+# keeps isinstance(..., ()) False on older builds where the type is missing.
+_TORCH_STREAM = getattr(torch, "Stream", ())
+
 aiter_lib = Library("aiter", "FRAGMENT")
+
+
+def _c_void_p_from_cuda_stream(stream):
+    return ctypes.cast(stream.cuda_stream, ctypes.c_void_p)
 
 
 def torch_to_c_types(*args):
@@ -55,7 +63,22 @@ def torch_to_c_types(*args):
         elif isinstance(arg, torch.Tensor):
             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
         elif isinstance(arg, torch.cuda.Stream):
-            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+            c_args.append(_c_void_p_from_cuda_stream(arg))
+        elif isinstance(arg, _TORCH_STREAM):
+            # Dynamo may reconstruct a CUDA stream as the device-agnostic
+            # torch.Stream. Rebuild its CUDA wrapper to recover the raw handle;
+            # stream_id is a pool index, not the handle itself.
+            # Reject CPU/XPU streams: unpacking them as CUDA can silently
+            # allocate a new pool stream when stream_id, device_index, and
+            # device_type are all 0.
+            if getattr(arg.device, "type", None) != "cuda":
+                raise ValueError(f"Unsupported type: {type(arg)}")
+            stream = torch.cuda.Stream(
+                stream_id=arg.stream_id,
+                device_index=arg.device_index,
+                device_type=arg.device_type,
+            )
+            c_args.append(_c_void_p_from_cuda_stream(stream))
         else:
             if type(arg) not in ctypes_map:
                 raise ValueError(f"Unsupported type: {type(arg)}")
