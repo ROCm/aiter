@@ -304,7 +304,6 @@ def compile_fp8_paged_mqa_local_topk(
 
         if tid == 0:
             state[_RETAINED] = 0
-        gpu.barrier()
 
         q_tiles = [None] * M_TILES
         weight_frags = [[None] * DREG for _ in range_constexpr(M_TILES)]
@@ -332,7 +331,6 @@ def compile_fp8_paged_mqa_local_topk(
                 state[_SCORE_PREFIX] = 0
                 state[_SCORE_MASK] = 0
                 state[_REMAINING] = fx.Int32(topk)
-            gpu.barrier()
 
             for radix_pass in range_constexpr(NUM_RADIX_PASSES):
                 pass_bits = radix_pass_bits(radix_pass)
@@ -342,6 +340,7 @@ def compile_fp8_paged_mqa_local_topk(
                     (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
                 ):
                     histogram[hist_step * BLOCK_THREADS + tid] = 0
+                rocdl.s_waitcnt(lgkmcnt=0)
                 gpu.barrier()
                 score_prefix = state[_SCORE_PREFIX]
                 score_mask = state[_SCORE_MASK]
@@ -358,6 +357,7 @@ def compile_fp8_paged_mqa_local_topk(
                             xor_value
                         )
                         atomic_add_i32(histogram, 1, bucket, "workgroup")
+                rocdl.s_waitcnt(lgkmcnt=0)
                 gpu.barrier()
 
                 selected_high = fx.Int32(num_bins - 1) - tid * fx.Int32(bins_per_thread)
@@ -383,6 +383,7 @@ def compile_fp8_paged_mqa_local_topk(
                         state[_SCORE_MASK] = score_mask | pass_mask
                         state[_REMAINING] = remaining - before_bin
                     before_bin = before_bin + bin_count
+                rocdl.s_waitcnt(lgkmcnt=0)
                 gpu.barrier()
 
             threshold = state[_SCORE_PREFIX]
@@ -552,6 +553,10 @@ def compile_fp8_paged_mqa_local_topk(
             split_end,
         )
         tile_number = fx.Int32(0)
+        # Delay publication until the retained count is about to be consumed,
+        # overlapping the initialization with independent query setup.
+        rocdl.s_waitcnt(lgkmcnt=0)
+        gpu.barrier()
         for col0 in range(split_begin, paired_end, group_n):
             batch_tile = _umod(tile_number, TILES_PER_COMPACT)
             batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
@@ -581,6 +586,7 @@ def compile_fp8_paged_mqa_local_topk(
             )
             final_tile = col0 + group_n >= split_end
             if end_of_batch | final_tile:
+                rocdl.s_waitcnt(lgkmcnt=0)
                 gpu.barrier()
                 batch_end = _imin(col0 + group_n, split_end)
                 incoming_count = batch_end - batch_first
@@ -597,6 +603,7 @@ def compile_fp8_paged_mqa_local_topk(
                 else:
                     if tid == 0:
                         state[_RETAINED] = pool_count
+                    rocdl.s_waitcnt(lgkmcnt=0)
                     gpu.barrier()
             tile_number = tile_number + fx.Int32(tiles_per_group)
 
@@ -609,6 +616,7 @@ def compile_fp8_paged_mqa_local_topk(
             )
             _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles, chunk_oks)
 
+            rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
             incoming_count = split_end - batch_first
             pool_count = state[_RETAINED] + incoming_count
@@ -624,6 +632,7 @@ def compile_fp8_paged_mqa_local_topk(
             else:
                 if tid == 0:
                     state[_RETAINED] = pool_count
+                rocdl.s_waitcnt(lgkmcnt=0)
                 gpu.barrier()
             tile_number = tile_number + fx.Int32(1)
 
@@ -659,6 +668,7 @@ def compile_fp8_paged_mqa_local_topk(
                 merge_state_row[_MERGE_WRITE_COUNTER] = 0
                 merge_state_row[_MERGE_EQ_COUNTER] = 0
                 merge_state_row[_MERGE_DIRECT] = 0
+            rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
 
         for step in range_constexpr(output_steps):
@@ -697,6 +707,7 @@ def compile_fp8_paged_mqa_local_topk(
 
                     _count_candidate()
         if const_expr(prepare_merge):
+            rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
             for hist_step in range_constexpr(
                 (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -710,7 +721,6 @@ def compile_fp8_paged_mqa_local_topk(
                         hist_bin,
                         "agent",
                     )
-            gpu.barrier()
         if tid == 0:
             fx.ptr_store(
                 retained,

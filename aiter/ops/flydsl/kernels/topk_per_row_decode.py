@@ -517,11 +517,15 @@ def build_topk_per_row_decode_module(
     def reduce_select_body(
         partial_hist: fx.Tensor,
         state: fx.Tensor,
+        output_indices: fx.Tensor,
+        output_values: fx.Tensor,
         shift: fx.Int32,
         xor_val: fx.Int32,
         mask_value: fx.Int32,
         num_bins: fx.Constexpr[int],
         first_pass: fx.Int32,
+        initialize_outputs: fx.Constexpr[bool],
+        write_values: fx.Constexpr[bool],
     ):
         row = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -550,6 +554,7 @@ def build_topk_per_row_decode_module(
             exclusive = inclusive - val
             if lane == fx.Int32(wave_size - 1):
                 scan[warp] = inclusive
+            fly_rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
 
             if warp == 0:
@@ -561,6 +566,7 @@ def build_topk_per_row_decode_module(
                     scan[lane] = warp_inclusive - warp_val
                 if lane == fx.Int32(reduce_num_waves - 1):
                     scan[reduce_num_waves] = warp_inclusive
+            fly_rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
             result = scan[warp] + exclusive
             return result
@@ -618,6 +624,21 @@ def build_topk_per_row_decode_module(
                     row_state[_STATE_MASK] = decided_mask | mask_value
                     row_state[_STATE_REMAINING_K] = remaining_k - bin_elems_above
                 bin_elems_above = bin_elems_above + bin_count
+
+        # The skipped pass-0 path can have fewer than k live candidates. Clear
+        # reused outputs in the last per-row reduce so the following multi-CTA
+        # gather only has to overwrite admitted candidates.
+        if const_expr(initialize_outputs):
+            row_indices = fx.slice(output_indices, (row, None))
+            row_values = fx.slice(output_values, (row, None))
+            for output_step in range_constexpr(
+                (k + reduce_threads - 1) // reduce_threads
+            ):
+                out_pos = fx.Int32(output_step * reduce_threads) + tid
+                if out_pos < fx.Int32(k):
+                    row_indices[out_pos] = fx.Int32(-1)
+                    if const_expr(write_values):
+                        row_values[out_pos] = fx.Float32(float("-inf"))
 
     reduce_select_kernels = [
         flyc.kernel(
@@ -1053,11 +1074,15 @@ def build_topk_per_row_decode_module(
             reduce_first = reduce_select_kernels[0](
                 partial_hist,
                 state,
+                indices,
+                values,
                 fx.Int32(rp0.shift),
                 fx.Int32(rp0.xor_val),
                 fx.Int32(uint32_to_int32(rp0.radix_mask << rp0.shift)),
                 rp0.num_bins,
                 fx.Int32(1),
+                False,
+                write_values,
             )
             reduce_first.launch(
                 grid=(rows_m, 1, 1),
@@ -1098,11 +1123,15 @@ def build_topk_per_row_decode_module(
             reduce_select = reduce_select_kernels[pass_idx](
                 partial_hist,
                 state,
+                indices,
+                values,
                 fx.Int32(rp.shift),
                 fx.Int32(rp.xor_val),
                 fx.Int32(uint32_to_int32(rp.radix_mask << rp.shift)),
                 rp.num_bins,
                 fx.Int32(pass_idx == 0),
+                precomputed_first_pass and pass_idx == _NUM_RADIX_PASSES - 1,
+                write_values,
             )
             reduce_select.launch(
                 grid=(rows_m, 1, 1),

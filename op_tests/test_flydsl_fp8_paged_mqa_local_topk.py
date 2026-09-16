@@ -173,12 +173,16 @@ def _assert_topk_values(population, selected, count, *, msg):
     """
     expected = torch.topk(population.float(), count, sorted=True).values
     got = torch.sort(selected.float(), descending=True).values[:count]
-    torch.testing.assert_close(
-        got,
-        expected,
-        rtol=2e-4,
-        atol=2e-4,
-        msg=lambda detail: f"{msg}: selected values differ\n{detail}",
+    assert (
+        checkAllclose(
+            got,
+            expected,
+            rtol=2e-4,
+            atol=2e-4,
+            tol_err_ratio=0,
+            msg=msg,
+        )
+        == 0
     )
 
 
@@ -321,9 +325,20 @@ def test_preshuffled_page64_packed_matches_split():
     )
     _assert_candidates(case, *split_out, k=k, splits=splits)
     _assert_candidates(case, *packed_out, k=k, splits=splits)
-    torch.testing.assert_close(packed_out[0], split_out[0], rtol=0, atol=0)
-    torch.testing.assert_close(packed_out[1], split_out[1], rtol=0, atol=0)
-    torch.testing.assert_close(packed_out[2], split_out[2], rtol=0, atol=0)
+    for name, packed_tensor, split_tensor in zip(
+        ("scores", "positions", "counts"), packed_out, split_out
+    ):
+        assert (
+            checkAllclose(
+                packed_tensor,
+                split_tensor,
+                rtol=0,
+                atol=0,
+                tol_err_ratio=0,
+                msg=f"packed {name}",
+            )
+            == 0
+        )
 
 
 def _assert_compact_topk(case, scores, positions, k):
@@ -600,6 +615,37 @@ def test_caller_workspace_stays_zero_across_calls():
         )
         _assert_compact_topk(case, scores, positions, 128)
         assert torch.count_nonzero(workspace[0]) == 0
+
+
+@pytest.mark.parametrize("length", [0, 32])
+def test_caller_outputs_are_fully_overwritten_for_short_rows(length):
+    _require_supported_gpu()
+    rows, k, splits = 2, 128, 4
+    case = _make_case(rows, length, 64, seed=79)
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    workspace = alloc_split_topk_merge_workspace(case.q.device, rows)
+    out_scores = torch.full((rows, k), 7.0, dtype=torch.float32, device="cuda")
+    out_positions = torch.full((rows, k), 123, dtype=torch.int32, device="cuda")
+
+    for _ in range(3):
+        scores, positions = flydsl_fp8_paged_mqa_topk(
+            case.q,
+            packed,
+            None,
+            case.weights,
+            case.lengths,
+            case.block_tables,
+            k=k,
+            num_splits=splits,
+            workspace=workspace,
+            out_scores=out_scores,
+            out_positions=out_positions,
+        )
+        assert scores.data_ptr() == out_scores.data_ptr()
+        assert positions.data_ptr() == out_positions.data_ptr()
+        _assert_compact_topk(case, scores, positions, k)
+        out_scores.fill_(7.0)
+        out_positions.fill_(123)
 
 
 def test_k2048_reservoir_and_existing_stage_b():

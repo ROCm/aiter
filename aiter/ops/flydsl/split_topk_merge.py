@@ -194,22 +194,12 @@ def split_topk_merge(
     width = splits * k
     scores = candidate_scores.view(rows, width)
     positions = candidate_positions.view(rows, width)
-    # Skipping pass 0 means the gather can leave a slot untouched when a row
-    # has fewer than k live candidates, so those rows must start as (-inf, -1).
     if out_scores is None:
-        selected_scores = (
-            torch.full((rows, k), -float("inf"), dtype=torch.float32, device=device)
-            if precomputed_first_pass
-            else torch.empty((rows, k), dtype=torch.float32, device=device)
-        )
+        selected_scores = torch.empty((rows, k), dtype=torch.float32, device=device)
     else:
         selected_scores = out_scores
     if out_positions is None:
-        selected_positions = (
-            torch.full((rows, k), -1, dtype=torch.int32, device=device)
-            if precomputed_first_pass
-            else torch.empty((rows, k), dtype=torch.int32, device=device)
-        )
+        selected_positions = torch.empty((rows, k), dtype=torch.int32, device=device)
     else:
         selected_positions = out_positions
     row_ends = _row_ends(device, rows, width)
