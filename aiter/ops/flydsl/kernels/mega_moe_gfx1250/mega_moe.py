@@ -75,6 +75,11 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
             lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
             if lanes % _WAVE_SIZE:
                 continue
+            # The tile's copies pass the block's warp count to a TDM atom, which
+            # takes only a power of two.
+            warps = lanes // _WAVE_SIZE
+            if warps & (warps - 1):
+                continue
             if (
                 combine_reduce_lds_bytes(
                     experts_per_token=topk,
