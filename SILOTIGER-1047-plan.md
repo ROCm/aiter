@@ -322,21 +322,26 @@ Q heads, and a **4×512×128 MFMA** scorer on serial (16×16×16 BF16,
 512×16 K panels in LDS, ReLU-sum). The inter-wave bitonic merge fuses
 reverse-upper with the first cross-half compare, then LDS-XORs only
 strides `>= 64`; 32..1 use `shuffle_xor`. Prefill stays single-WG.
-Workspace is `[M, 8, 512]`, not `[M, n_blocks]`. Expand still separate.
+Workspace is `[M, S, 512]` with ``S=8`` while ``n_tiles<=8`` else ``S=16``,
+not `[M, n_blocks]`. Expand still separate.
 HIP `module_top_k_per_row.so` is loaded. Oracle set equality `err=0`.
 
-**Not checked:** `L<=2048` still beats HIP. Split K-reuse cuts decode
-8k/32k/128k ~28/54/149µs→~23/46/127µs vs HIP ~18/19/29. Serial MFMA
-keeps prefill 8k/32k ~89/352µs vs HIP ~83/250. Keep `m > _SPLITS` serial.
+**Not checked:** `L<=2048` still beats HIP. 8k stays S=8 (1 tile / live
+split) at ~23.4µs vs HIP ~19. Dynamic S=16 cuts decode 128k ~127→~90µs
+vs HIP ~30; 32k is ~50µs (was ~46 with S=8 two sequential tiles — the
+16-way merge tax). S=32 compiled on gfx950 (128KB merge LDS) but lost
+at 128k (~105µs): the 32-way tree costs more than dropping 4 sequential
+tiles to 2. Serial MFMA keeps prefill 8k/32k ~89/353µs vs HIP ~84/251.
+Keep `m > 8` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`, kernel-trace
 stats, raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}`). Mean µs, 35 launches
-(warmup+iters). Re-traced after split K-reuse. FlyDSL K1 is split+merge;
+(warmup+iters). Traced under **S=8**. FlyDSL K1 is split+merge;
 HIP select is MQA + radix top-k + expand (+ a ~3.2µs copy). Event-us
 under rocprof is inflated; these are kernel means. Split dropped
 ~16.9/34.1µs→~13.6/27.6µs; merge is unchanged (~9.9/19.0 vs HIP radix
-~8.2/10.2). The leftover vs HIP is still the **split** kernel (score +
-per-tile sort), not the live-heap tree:
+~8.2/10.2). After dynamic S the leftover at 32k/128k is **merge-tree +
+remaining sequential tiles**, not more S:
 
 | L | flydsl split | flydsl merge | HIP MQA | HIP radix top-k | HIP expand |
 |--:|-------------:|-------------:|--------:|----------------:|-----------:|
@@ -349,16 +354,16 @@ per-tile sort), not the live-heap tree:
 | 8 | 512 | 128 | 2.4 | 8.9 | 0 | 0 |
 | 1 | 2048 | 512 | 1.4 | 8.0 | 0 | 0 |
 | 8 | 2048 | 512 | 2.4 | 9.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 23.4 | 18.1 | 0 | 0 |
-| 8 | 8192 | 2048 | 24.0 | 20.0 | 0 | 0 |
-| 1 | 32768 | 8192 | 46.4 | 19.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 46.6 | 23.6 | 0 | 0 |
-| 1 | 131072 | 32768 | 127.3 | 28.8 | 0 | 0 |
-| 8 | 131072 | 32768 | 138.3 | 51.3 | 0 | 0 |
+| 1 | 8192 | 2048 | 23.4 | 19.0 | 0 | 0 |
+| 8 | 8192 | 2048 | 24.0 | 19.9 | 0 | 0 |
+| 1 | 32768 | 8192 | 49.8 | 20.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 50.9 | 23.6 | 0 | 0 |
+| 1 | 131072 | 32768 | 90.4 | 30.1 | 0 | 0 |
+| 8 | 131072 | 32768 | 99.5 | 52.7 | 0 | 0 |
 | 512 | 512 | 128 | 2.7 | 16.0 | 0 | 0 |
 | 512 | 2048 | 512 | 2.5 | 27.1 | 0 | 0 |
-| 512 | 8192 | 2048 | 88.8 | 82.6 | 0 | 0 |
-| 512 | 32768 | 8192 | 351.7 | 249.9 | 0 | 0 |
+| 512 | 8192 | 2048 | 89.0 | 83.9 | 0 | 0 |
+| 512 | 32768 | 8192 | 352.6 | 250.6 | 0 | 0 |
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.

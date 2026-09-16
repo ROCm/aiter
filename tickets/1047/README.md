@@ -261,20 +261,21 @@ this seed).
 
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` emit path**,
 a **wave-local tile sort**, a **per-tile pair merge**, a **column split**
-on decode rows with more than one tile, **pipelined vec8 `score_col` that
-loads each MQA K column once** across four Q heads, and a **4×512×128
-MFMA** scorer on serial (16×16×16 BF16, 512×16 K panels in LDS,
-ReLU-sum). Prefill stays single-WG. Workspace is `[M, 8, 512]`, not a
-score matrix.
-**2d stays unchecked:** short `L` beats HIP; split K-reuse cuts decode
-8k/32k/128k ~28/54/149→~23/46/127µs vs HIP ~18/19/29; serial MFMA keeps
-prefill 8k/32k ~89/352µs vs HIP ~83/250. Keep `m > _SPLITS` serial.
+on decode rows with more than one tile (`S=8` while `n_tiles<=8`, else
+`S=16`), **pipelined vec8 `score_col` that loads each MQA K column once**
+across four Q heads, and a **4×512×128 MFMA** scorer on serial (16×16×16
+BF16, 512×16 K panels in LDS, ReLU-sum). Prefill stays single-WG.
+Workspace is `[M, S, 512]`, not a score matrix.
+**2d stays unchecked:** short `L` beats HIP; 8k stays S=8 at ~23.4µs vs
+HIP ~19; S=16 cuts decode 128k ~127→~90µs vs HIP ~30; 32k is ~50µs
+(merge tax vs S=8 ~46). S=32 lost at 128k (~105µs). Serial MFMA keeps
+prefill 8k/32k ~89/353µs vs HIP ~84/251. Keep `m > 8` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`). Mean kernel µs
-(35 launches), re-traced after split K-reuse. Raw CSV in
+(35 launches), traced under **S=8**. Raw CSV in
 `/tmp/qsa_k1_rocprof_{8k,32k}` (not in git). Split dropped
-~16.9/34.1µs→~13.6/27.6µs; merge is unchanged. The gap vs HIP is still
-**split** (score + tile sort), not the live-heap merge:
+~16.9/34.1µs→~13.6/27.6µs; merge is unchanged. After dynamic S the gap
+at 32k/128k is **merge-tree + remaining sequential tiles**, not more S:
 
 | L | flydsl split | flydsl merge | HIP MQA | HIP radix top-k | HIP expand |
 |--:|-------------:|-------------:|--------:|----------------:|-----------:|
@@ -287,16 +288,16 @@ rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`). Mean kernel µs
 | 8 | 512 | 128 | 2.4 | 8.9 | 0 | 0 |
 | 1 | 2048 | 512 | 1.4 | 8.0 | 0 | 0 |
 | 8 | 2048 | 512 | 2.4 | 9.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 23.4 | 18.1 | 0 | 0 |
-| 8 | 8192 | 2048 | 24.0 | 20.0 | 0 | 0 |
-| 1 | 32768 | 8192 | 46.4 | 19.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 46.6 | 23.6 | 0 | 0 |
-| 1 | 131072 | 32768 | 127.3 | 28.8 | 0 | 0 |
-| 8 | 131072 | 32768 | 138.3 | 51.3 | 0 | 0 |
+| 1 | 8192 | 2048 | 23.4 | 19.0 | 0 | 0 |
+| 8 | 8192 | 2048 | 24.0 | 19.9 | 0 | 0 |
+| 1 | 32768 | 8192 | 49.8 | 20.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 50.9 | 23.6 | 0 | 0 |
+| 1 | 131072 | 32768 | 90.4 | 30.1 | 0 | 0 |
+| 8 | 131072 | 32768 | 99.5 | 52.7 | 0 | 0 |
 | 512 | 512 | 128 | 2.7 | 16.0 | 0 | 0 |
 | 512 | 2048 | 512 | 2.5 | 27.1 | 0 | 0 |
-| 512 | 8192 | 2048 | 88.8 | 82.6 | 0 | 0 |
-| 512 | 32768 | 8192 | 351.7 | 249.9 | 0 | 0 |
+| 512 | 8192 | 2048 | 89.0 | 83.9 | 0 | 0 |
+| 512 | 32768 | 8192 | 352.6 | 250.6 | 0 | 0 |
 
 
 

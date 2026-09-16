@@ -14,9 +14,9 @@ tiles use a pipelined vec8 scorer that loads each MQA K column once and
 reuses it across the four Q heads. Each tile is then wave-sorted
 and merged across eight waves (LDS XOR for strides ``>= 64``, shuffle
 for 32..1). Decode rows with more than one 512-slot tile split columns
-across eight workgroups (idle splits write ``-inf`` heaps) and
-pair-merge those sorted heaps. Prefill streams tiles in one workgroup
-per row.
+across ``S`` workgroups (``S`` is 8 when ``n_tiles <= 8``, else 16)
+and pair-merge those sorted heaps. Idle splits write ``-inf`` heaps.
+Prefill (``M > 8``) streams tiles in one workgroup per row.
 """
 
 from functools import lru_cache
@@ -35,7 +35,7 @@ _TILE = 512
 _K = FAMILY_A_INDEXER.block_budget
 _CANDIDATES = _K + _TILE
 _SPLITS = 8
-_MERGE = _SPLITS * _K
+_SPLIT_GRIDS = (8, 16, 32)
 _H = FAMILY_A_INDEXER.n_heads
 _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
@@ -411,10 +411,13 @@ def build_qsa_k1_family_a_serial(page_size: int):
     return launch_serial
 
 
-def build_qsa_k1_family_a_split_merge(page_size: int):
+def build_qsa_k1_family_a_split_merge(page_size: int, splits: int):
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
-    if _CANDIDATES % _BLOCK_THREADS or _MERGE % _BLOCK_THREADS:
+    if splits not in _SPLIT_GRIDS:
+        raise ValueError(f"splits must be one of {_SPLIT_GRIDS}, got {splits}")
+    merge = splits * _K
+    if _CANDIDATES % _BLOCK_THREADS or merge % _BLOCK_THREADS:
         raise ValueError("candidate buffers must be multiples of block threads")
     if _K != _TILE:
         raise ValueError("family A local heap is one tile (k=512)")
@@ -422,11 +425,12 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         raise ValueError("head dimension must be a multiple of vector width")
     if _H != 4:
         raise ValueError("split scorer unrolls four family A indexer heads")
-    if _SPLITS & (_SPLITS - 1) or _CANDIDATES != 2 * _K:
+    if splits & (splits - 1) or _CANDIDATES != 2 * _K:
         raise ValueError("heap tree merge needs 2^n sorted 512-heaps")
     tile_steps = _TILE // _BLOCK_THREADS
     candidate_steps = _CANDIDATES // _BLOCK_THREADS
     pair_steps = _CANDIDATES // _BLOCK_THREADS
+    pair_wins = tuple(1 << stage for stage in range(splits.bit_length() - 2, -1, -1))
     sig = kernel_signature(
         ps=page_size,
         tile=_TILE,
@@ -434,7 +438,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         h=_H,
         d=_D,
         blk=_BLOCK_THREADS,
-        spl=_SPLITS,
+        spl=splits,
         pair=2,
         wav=3,
         pipe=3,
@@ -450,8 +454,8 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
 
     @fx.struct
     class MergeStorage:
-        cand_s: fx.Array[Float32, _MERGE, 16]
-        cand_c: fx.Array[Int32, _MERGE, 16]
+        cand_s: fx.Array[Float32, merge, 16]
+        cand_c: fx.Array[Int32, merge, 16]
 
     @flyc.kernel(
         name="qsa_k1_family_a_split_" + sig,
@@ -503,7 +507,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         visible = (vis_q < vis_s).select(vis_q, vis_s)
         scored = (visible < n_col).select(visible, n_col)
         n_tiles = fx.ceildiv(scored, Int32(_TILE))
-        tiles_per = fx.ceildiv(n_tiles, Int32(_SPLITS))
+        tiles_per = fx.ceildiv(n_tiles, Int32(splits))
         start = split * tiles_per
         end_raw = start + tiles_per
         end = (end_raw < n_tiles).select(end_raw, n_tiles)
@@ -764,22 +768,22 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         visible = (vis_q < vis_s).select(vis_q, vis_s)
         scored = (visible < n_columns).select(visible, n_columns)
         n_tiles = fx.ceildiv(scored, Int32(_TILE))
-        live = (n_tiles < Int32(_SPLITS)).select(n_tiles, Int32(_SPLITS))
+        live = (n_tiles < Int32(splits)).select(n_tiles, Int32(splits))
         storage = fx.SharedAllocator().allocate(MergeStorage).peek()
-        cand_s = storage.cand_s.view(fx.make_layout(_MERGE, 1))
-        cand_c = storage.cand_c.view(fx.make_layout(_MERGE, 1))
+        cand_s = storage.cand_s.view(fx.make_layout(merge, 1))
+        cand_c = storage.cand_c.view(fx.make_layout(merge, 1))
 
         def better(s, c, bs, bc):
             return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
 
         if visible > Int32(_K):
-            for s in range_constexpr(_SPLITS):
+            for s in range_constexpr(splits):
                 for t in range_constexpr(tile_steps):
                     j = tid + Int32(t * _BLOCK_THREADS)
                     cand_s[Int32(s * _K) + j] = heap_s[row, s, j]
                     cand_c[Int32(s * _K) + j] = heap_c[row, s, j]
             gpu.barrier()
-            for n_win in (4, 2, 1):
+            for n_win in pair_wins:
                 take = live > Int32(n_win)
                 if take:
                     for w in range_constexpr(n_win):
@@ -817,31 +821,16 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                                     cand_s[peer] = swap.select(s0, s1)
                                     cand_c[peer] = swap.select(c0, c1)
                         gpu.barrier()
-                    if n_win == 4:
-                        for t in range_constexpr(tile_steps):
-                            local = tid + Int32(t * _BLOCK_THREADS)
-                            s1 = cand_s[Int32(_CANDIDATES) + local]
-                            c1 = cand_c[Int32(_CANDIDATES) + local]
-                            s2 = cand_s[Int32(2 * _CANDIDATES) + local]
-                            c2 = cand_c[Int32(2 * _CANDIDATES) + local]
-                            s3 = cand_s[Int32(3 * _CANDIDATES) + local]
-                            c3 = cand_c[Int32(3 * _CANDIDATES) + local]
-                            cand_s[Int32(_K) + local] = s1
-                            cand_c[Int32(_K) + local] = c1
-                            cand_s[Int32(2 * _K) + local] = s2
-                            cand_c[Int32(2 * _K) + local] = c2
-                            cand_s[Int32(3 * _K) + local] = s3
-                            cand_c[Int32(3 * _K) + local] = c3
-                        gpu.barrier()
-                    if n_win == 2:
-                        for t in range_constexpr(tile_steps):
-                            local = tid + Int32(t * _BLOCK_THREADS)
-                            cand_s[Int32(_K) + local] = cand_s[
-                                Int32(_CANDIDATES) + local
-                            ]
-                            cand_c[Int32(_K) + local] = cand_c[
-                                Int32(_CANDIDATES) + local
-                            ]
+                    if n_win > 1:
+                        for i in range(1, n_win):
+                            for t in range_constexpr(tile_steps):
+                                local = tid + Int32(t * _BLOCK_THREADS)
+                                cand_s[Int32(i * _K) + local] = cand_s[
+                                    Int32(i * _CANDIDATES) + local
+                                ]
+                                cand_c[Int32(i * _K) + local] = cand_c[
+                                    Int32(i * _CANDIDATES) + local
+                                ]
                         gpu.barrier()
             for t in range_constexpr(tile_steps):
                 j = tid + Int32(t * _BLOCK_THREADS)
@@ -882,7 +871,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
             n_req,
             score_scale,
         ).launch(
-            grid=(rows, _SPLITS, 1),
+            grid=(rows, splits, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -909,9 +898,21 @@ def _plan_serial(page_size: int):
     return build_qsa_k1_family_a_serial(page_size)
 
 
-@lru_cache(maxsize=8)
-def _plan_split_merge(page_size: int):
-    return build_qsa_k1_family_a_split_merge(page_size)
+@lru_cache(maxsize=16)
+def _plan_split_merge(page_size: int, splits: int):
+    return build_qsa_k1_family_a_split_merge(page_size, splits)
+
+
+def _decode_splits(n_columns: int) -> int:
+    """S=8 while n_tiles<=8 so 8k stays one tile per live split; else 16.
+
+    S=32 compiles and fits gfx950 LDS but lost at 128k: the 32-way merge
+    tree costs more than the extra column split (2 sequential tiles vs 4).
+    """
+    n_tiles = (n_columns + _TILE - 1) // _TILE
+    if n_tiles <= _SPLITS:
+        return _SPLITS
+    return 16
 
 
 def qsa_k1_family_a_serves(
@@ -952,12 +953,12 @@ def qsa_k1_family_a_block_ids(
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Short rows emit complete-block ids. Decode rows with more than one
-    512-slot tile split columns across eight workgroups, score with a
-    pipelined vec8 scorer that reuses each MQA K load across four heads,
-    and pair-merge those sorted heaps. Prefill streams tiles in one
-    workgroup and scores with a 4x512x128 MFMA.
-    Does not allocate a score matrix. Expand+tail is still a separate
-    launch.
+    512-slot tile split columns across ``S`` workgroups (8 while
+    ``n_tiles <= 8``, else 16), score with a pipelined vec8 scorer that reuses each MQA
+    K load across four heads, and pair-merge those sorted heaps. Prefill
+    (``M > 8``) streams tiles in one workgroup and scores with a 4x512x128
+    MFMA. Does not allocate a score matrix. Expand+tail is still a
+    separate launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
@@ -991,9 +992,10 @@ def qsa_k1_family_a_block_ids(
     n_req = int(context_lens.shape[0])
     stream = torch.cuda.current_stream(q.device)
     # Decode: split as soon as a row can have more than one tile. Idle
-    # splits write -inf heaps; the tree merge is cheap. Prefill already
-    # fills the GPU with one workgroup per row, so it stays serial.
-    # Short rows still emit inside the serial kernel.
+    # splits write -inf heaps. Prefill already fills the GPU with one
+    # workgroup per row (M>8), so it stays serial. Short rows still emit
+    # inside the serial kernel. S stays 8 while n_tiles<=8 so 8k is still
+    # one tile per live split; longer rows take S=16 (S=32 lost at 128k).
     if n_columns <= _TILE or m > _SPLITS:
         _run_compiled(
             _plan_serial(page_size),
@@ -1011,10 +1013,11 @@ def qsa_k1_family_a_block_ids(
             stream,
         )
         return out
-    heap_s = torch.empty(m, _SPLITS, _K, dtype=torch.float32, device=q.device)
-    heap_c = torch.empty(m, _SPLITS, _K, dtype=torch.int32, device=q.device)
+    splits = _decode_splits(n_columns)
+    heap_s = torch.empty(m, splits, _K, dtype=torch.float32, device=q.device)
+    heap_c = torch.empty(m, splits, _K, dtype=torch.int32, device=q.device)
     _run_compiled(
-        _plan_split_merge(page_size),
+        _plan_split_merge(page_size, splits),
         q,
         k_cache,
         page_table,
