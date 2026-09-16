@@ -399,7 +399,6 @@ def compile_conv3d_implicit(
     # Per-wave MFMA grid (flat acc[mi * MI_N + ni]); WARP_M/N is the per-wave tile span.
     MI_M = TILE_M // WAVE_M // MFMA_M
     MI_N = TILE_N // WAVE_N // MFMA_N
-    N_ACC = MI_M * MI_N
     WARP_M = MI_M * MFMA_M
     WARP_N = MI_N * MFMA_N
     BLOCK_VECS = LDG_VEC * BLOCK_THREADS
@@ -655,42 +654,41 @@ def compile_conv3d_implicit(
         lane = tid % WARP_SIZE
         wave_m = wid // WAVE_N
         wave_n = wid % WAVE_N
-
-        lane_m = lane % MFMA_M
-        lane_n = lane % MFMA_N
-        lane_k_a = lane // MFMA_M * MFMA_A_VALUES
-        lane_k_b = lane // MFMA_N * MFMA_B_VALUES
         c_m_vec = lane // MFMA_N * MFMA_C_VALUES
         c_n = lane % MFMA_N
 
         Vec = fx.Vector
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, TILE_K, elem_ty))
-        a_lds_div = fx.logical_divide(
-            a_lds.view(fx.make_layout(LDS_A_SIZE, 1)),
-            fx.make_layout(MFMA_A_VALUES, 1),
+        tiled_mma = fx.make_tiled_mma(
+            mma_atom, fx.make_layout((WAVE_M, WAVE_N, 1), (WAVE_N, 1, 0))
         )
-        b_lds_div = fx.logical_divide(
-            b_lds.view(fx.make_layout(LDS_B_SIZE, 1)),
-            fx.make_layout(MFMA_B_VALUES, 1),
+        thr_mma = tiled_mma.thr_slice(tid)
+        thr_copy_A = fx.make_tiled_copy_A(lds_copy, tiled_mma).get_slice(tid)
+        thr_copy_B = fx.make_tiled_copy_B(lds_copy, tiled_mma).get_slice(tid)
+        a_lds_layout = fx.make_layout((TILE_M, TILE_K), (TILE_K, 1))
+        b_lds_layout = fx.make_layout((TILE_N, TILE_K), (TILE_K, 1))
+
+        def stage_a(stage):
+            return fx.make_view(
+                fx.add_offset(a_lds.ptr, stage * TILE_M * TILE_K),
+                a_lds_layout,
+            )
+
+        def stage_b(stage):
+            return fx.make_view(
+                fx.add_offset(b_lds.ptr, stage * TILE_N * TILE_K),
+                b_lds_layout,
+            )
+
+        acc = thr_mma.make_fragment_C(
+            fx.make_view(fx.get_iter(y), fx.make_layout((TILE_M, TILE_N), (TILE_N, 1)))
         )
-
-        def zero_acc():
-            frag = fx.make_rmem_tensor(MFMA_C_VALUES, fx.Float32)
-            frag.fill(0.0)
-            return frag
-
-        acc = [zero_acc() for _ in range_constexpr(N_ACC)]
+        acc.fill(0.0)
 
         def barrier(vmcnt=0, lgkmcnt=None):
             rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
             rocdl.s_barrier()
-
-        def a_lds_off(stage, row, col):
-            return (fx.Int64(stage) * TILE_M + row) * TILE_K + col
-
-        def b_lds_off(stage, row, col):
-            return (fx.Int64(stage) * TILE_N + row) * TILE_K + col
 
         def in_range(v, hi):
             return (v >= 0) & (v < fx.Int64(hi))
@@ -900,48 +898,35 @@ def compile_conv3d_implicit(
                     voff = g_off
                 _dma_to_lds(w_src, _lds_dma_ptr(b_lds, stage_tile, i), voff)
 
-        # ---- single-atom LDS -> register copies, indexed by per-wave MFMA row ----
-        def read_a_frag(stage, mi):
-            a_row = wave_m * WARP_M + mi * MFMA_M + lane_m
-            vec_idx = (
-                a_lds_off(stage, fx.Int64(a_row), fx.Int64(lane_k_a)) // MFMA_A_VALUES
-            )
-            frag = fx.make_rmem_tensor(MFMA_A_VALUES, elem_ty)
-            fx.copy(lds_copy, fx.slice(a_lds_div, (None, vec_idx)), frag)
-            return frag
-
-        def read_b_frag(stage, ni):
-            b_row = wave_n * WARP_N + ni * MFMA_N + lane_n
-            vec_idx = (
-                b_lds_off(stage, fx.Int64(b_row), fx.Int64(lane_k_b)) // MFMA_B_VALUES
-            )
-            frag = fx.make_rmem_tensor(MFMA_B_VALUES, elem_ty)
-            fx.copy(lds_copy, fx.slice(b_lds_div, (None, vec_idx)), frag)
-            return frag
-
+        # ---- tiled LDS -> register copies (A/B TV comes from tiled_mma) ----
         def read_a_frags(stage):
-            frags = [read_a_frag(stage, mi) for mi in range_constexpr(MI_M)]
+            sA = stage_a(stage)
+            frag_A = thr_mma.make_fragment_A(sA)
+            fx.copy(
+                lds_copy, thr_copy_A.partition_S(sA), thr_copy_A.retile(frag_A)
+            )
             rocdl.sched_dsrd(MI_M)
-            return frags
+            return frag_A
 
         def read_b_frags(stage):
-            frags = [read_b_frag(stage, ni) for ni in range_constexpr(MI_N)]
+            sB = stage_b(stage)
+            frag_B = thr_mma.make_fragment_B(sB)
+            fx.copy(
+                lds_copy, thr_copy_B.partition_S(sB), thr_copy_B.retile(frag_B)
+            )
             rocdl.sched_dsrd(MI_N)
-            return frags
+            return frag_B
 
         def do_compute(acc_values, a_frag_values, b_frag_values):
             rocdl.s_setprio(1)
-            for mi in range_constexpr(MI_M):
-                for ni in range_constexpr(MI_N):
-                    idx = mi * MI_N + ni
-                    fx.gemm(
-                        mma_atom,
-                        acc_values[idx],
-                        a_frag_values[mi],
-                        b_frag_values[ni],
-                        acc_values[idx],
-                    )
-                rocdl.sched_mfma(MI_N)
+            fx.gemm(
+                tiled_mma,
+                acc_values,
+                a_frag_values,
+                b_frag_values,
+                acc_values,
+            )
+            rocdl.sched_mfma(MI_M * MI_N)
             rocdl.s_setprio(0)
             return acc_values
 
@@ -1020,7 +1005,7 @@ def compile_conv3d_implicit(
                 row_base = m_offset + wave_m * WARP_M + mi * MFMA_M + c_m_vec
                 for ni in range_constexpr(MI_N):
                     col, col_loc = _cols(ni)
-                    a = Vec(acc[mi * MI_N + ni].load())
+                    a = Vec(acc[None, mi, ni].load())
                     if const_expr(has_bias and not use_splitk):
                         bias_val = bias_vals[ni]
 
