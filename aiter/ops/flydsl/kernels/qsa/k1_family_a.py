@@ -10,7 +10,8 @@ complete causal blocks, and merges a running LDS top-512. Writes
 When ``visible <= 512`` the selected set is every complete block: one
 workgroup per row writes those ids. Serial (prefill) tiles are scored as
 a ``4 x 512 x 128`` BF16 GEMM (16x16x16 MFMA, ReLU-sum). Split (decode)
-tiles use the pipelined vec8 column scorer. Each tile is then wave-sorted
+tiles use a pipelined vec8 scorer that loads each MQA K column once and
+reuses it across the four Q heads. Each tile is then wave-sorted
 and merged across eight waves (LDS XOR for strides ``>= 64``, shuffle
 for 32..1). Decode rows with more than one 512-slot tile split columns
 across eight workgroups (idle splits write ``-inf`` heaps) and
@@ -419,6 +420,8 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         raise ValueError("family A local heap is one tile (k=512)")
     if _D % _VEC:
         raise ValueError("head dimension must be a multiple of vector width")
+    if _H != 4:
+        raise ValueError("split scorer unrolls four family A indexer heads")
     if _SPLITS & (_SPLITS - 1) or _CANDIDATES != 2 * _K:
         raise ValueError("heap tree merge needs 2^n sorted 512-heaps")
     tile_steps = _TILE // _BLOCK_THREADS
@@ -434,8 +437,9 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         spl=_SPLITS,
         pair=2,
         wav=3,
-        pipe=2,
+        pipe=3,
         liv=1,
+        kshare=1,
     )
 
     @fx.struct
@@ -515,33 +519,74 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
             phys = page_table[safe_req, logical_page]
             k_row = fx.slice(k_buf, (phys, off, zero, None))
             k_chunks = fx.logical_divide(k_row, vec_layout)
-            total = Float32(0.0)
-            for h in range_constexpr(_H):
-                q_chunks = fx.logical_divide(fx.slice(smem_q, (h, None)), vec_layout)
-                acc = Float32(0.0)
-                k_src = fx.slice(k_chunks, (None, 0))
-                q_src = fx.slice(q_chunks, (None, 0))
-                k_frag = fx.make_fragment_like(k_src)
-                q_frag = fx.make_fragment_like(q_src)
-                fx.copy(k_copy, k_src, k_frag)
-                fx.copy(q_store, q_src, q_frag)
-                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                q_vec = fx.Vector(fx.memref_load_vec(q_frag))
-                for chunk in range_constexpr(_D // _VEC - 1):
-                    nxt = chunk + 1
-                    nk_src = fx.slice(k_chunks, (None, nxt))
-                    nq_src = fx.slice(q_chunks, (None, nxt))
-                    nk_frag = fx.make_fragment_like(nk_src)
-                    nq_frag = fx.make_fragment_like(nq_src)
-                    fx.copy(k_copy, nk_src, nk_frag)
-                    fx.copy(q_store, nq_src, nq_frag)
-                    for j in range_constexpr(_VEC):
-                        acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
-                    k_vec = fx.Vector(fx.memref_load_vec(nk_frag))
-                    q_vec = fx.Vector(fx.memref_load_vec(nq_frag))
+            q0_chunks = fx.logical_divide(fx.slice(smem_q, (0, None)), vec_layout)
+            q1_chunks = fx.logical_divide(fx.slice(smem_q, (1, None)), vec_layout)
+            q2_chunks = fx.logical_divide(fx.slice(smem_q, (2, None)), vec_layout)
+            q3_chunks = fx.logical_divide(fx.slice(smem_q, (3, None)), vec_layout)
+            acc0 = Float32(0.0)
+            acc1 = Float32(0.0)
+            acc2 = Float32(0.0)
+            acc3 = Float32(0.0)
+            k_src = fx.slice(k_chunks, (None, 0))
+            k_frag = fx.make_fragment_like(k_src)
+            fx.copy(k_copy, k_src, k_frag)
+            k_vec = fx.Vector(fx.memref_load_vec(k_frag))
+            q0_src = fx.slice(q0_chunks, (None, 0))
+            q1_src = fx.slice(q1_chunks, (None, 0))
+            q2_src = fx.slice(q2_chunks, (None, 0))
+            q3_src = fx.slice(q3_chunks, (None, 0))
+            q0_frag = fx.make_fragment_like(q0_src)
+            q1_frag = fx.make_fragment_like(q1_src)
+            q2_frag = fx.make_fragment_like(q2_src)
+            q3_frag = fx.make_fragment_like(q3_src)
+            fx.copy(q_store, q0_src, q0_frag)
+            fx.copy(q_store, q1_src, q1_frag)
+            fx.copy(q_store, q2_src, q2_frag)
+            fx.copy(q_store, q3_src, q3_frag)
+            q0_vec = fx.Vector(fx.memref_load_vec(q0_frag))
+            q1_vec = fx.Vector(fx.memref_load_vec(q1_frag))
+            q2_vec = fx.Vector(fx.memref_load_vec(q2_frag))
+            q3_vec = fx.Vector(fx.memref_load_vec(q3_frag))
+            for chunk in range_constexpr(_D // _VEC - 1):
+                nxt = chunk + 1
+                nk_src = fx.slice(k_chunks, (None, nxt))
+                nk_frag = fx.make_fragment_like(nk_src)
+                fx.copy(k_copy, nk_src, nk_frag)
+                nq0_src = fx.slice(q0_chunks, (None, nxt))
+                nq1_src = fx.slice(q1_chunks, (None, nxt))
+                nq2_src = fx.slice(q2_chunks, (None, nxt))
+                nq3_src = fx.slice(q3_chunks, (None, nxt))
+                nq0_frag = fx.make_fragment_like(nq0_src)
+                nq1_frag = fx.make_fragment_like(nq1_src)
+                nq2_frag = fx.make_fragment_like(nq2_src)
+                nq3_frag = fx.make_fragment_like(nq3_src)
+                fx.copy(q_store, nq0_src, nq0_frag)
+                fx.copy(q_store, nq1_src, nq1_frag)
+                fx.copy(q_store, nq2_src, nq2_frag)
+                fx.copy(q_store, nq3_src, nq3_frag)
                 for j in range_constexpr(_VEC):
-                    acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
-                total = total + acc.maximumf(Float32(0.0))
+                    kj = k_vec[j].to(Float32)
+                    acc0 = acc0 + q0_vec[j].to(Float32) * kj
+                    acc1 = acc1 + q1_vec[j].to(Float32) * kj
+                    acc2 = acc2 + q2_vec[j].to(Float32) * kj
+                    acc3 = acc3 + q3_vec[j].to(Float32) * kj
+                k_vec = fx.Vector(fx.memref_load_vec(nk_frag))
+                q0_vec = fx.Vector(fx.memref_load_vec(nq0_frag))
+                q1_vec = fx.Vector(fx.memref_load_vec(nq1_frag))
+                q2_vec = fx.Vector(fx.memref_load_vec(nq2_frag))
+                q3_vec = fx.Vector(fx.memref_load_vec(nq3_frag))
+            for j in range_constexpr(_VEC):
+                kj = k_vec[j].to(Float32)
+                acc0 = acc0 + q0_vec[j].to(Float32) * kj
+                acc1 = acc1 + q1_vec[j].to(Float32) * kj
+                acc2 = acc2 + q2_vec[j].to(Float32) * kj
+                acc3 = acc3 + q3_vec[j].to(Float32) * kj
+            total = (
+                acc0.maximumf(Float32(0.0))
+                + acc1.maximumf(Float32(0.0))
+                + acc2.maximumf(Float32(0.0))
+                + acc3.maximumf(Float32(0.0))
+            )
             return total * score_scale
 
         if visible > Int32(_K):
@@ -907,9 +952,10 @@ def qsa_k1_family_a_block_ids(
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Short rows emit complete-block ids. Decode rows with more than one
-    512-slot tile split columns across eight workgroups, score with the
-    pipelined vec8 scorer, and pair-merge those sorted heaps. Prefill
-    streams tiles in one workgroup and scores with a 4x512x128 MFMA.
+    512-slot tile split columns across eight workgroups, score with a
+    pipelined vec8 scorer that reuses each MQA K load across four heads,
+    and pair-merge those sorted heaps. Prefill streams tiles in one
+    workgroup and scores with a 4x512x128 MFMA.
     Does not allocate a score matrix. Expand+tail is still a separate
     launch.
     """

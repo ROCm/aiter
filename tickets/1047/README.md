@@ -261,14 +261,14 @@ this seed).
 
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` emit path**,
 a **wave-local tile sort**, a **per-tile pair merge**, a **column split**
-on decode rows with more than one tile, **pipelined vec8 `score_col` on
-split**, and a **4×512×128 MFMA** scorer on serial (16×16×16 BF16, 512×16
-K panels in LDS, ReLU-sum). Prefill stays single-WG. Workspace is
-`[M, 8, 512]`, not a score matrix.
-**2d stays unchecked:** short `L` beats HIP; split vec8 recovers decode
-128k from all-MFMA ~164→~149µs (8k ~28µs this run; HIP also high);
-serial MFMA keeps prefill 8k/32k ~91/352µs vs HIP ~87/252. Keep
-`m > _SPLITS` serial.
+on decode rows with more than one tile, **pipelined vec8 `score_col` that
+loads each MQA K column once** across four Q heads, and a **4×512×128
+MFMA** scorer on serial (16×16×16 BF16, 512×16 K panels in LDS,
+ReLU-sum). Prefill stays single-WG. Workspace is `[M, 8, 512]`, not a
+score matrix.
+**2d stays unchecked:** short `L` beats HIP; split K-reuse cuts decode
+8k/32k/128k ~28/54/149→~23/46/127µs vs HIP ~18/19/29; serial MFMA keeps
+prefill 8k/32k ~89/352µs vs HIP ~83/250. Keep `m > _SPLITS` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`). Mean kernel µs
 (35 launches). Raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}` (not in git). The
@@ -281,20 +281,20 @@ gap vs HIP is **split** (score + tile sort), not the live-heap merge:
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 3.1 | 13.1 | 0 | 0 |
-| 8 | 512 | 128 | 3.6 | 14.8 | 0 | 0 |
-| 1 | 2048 | 512 | 3.1 | 14.0 | 0 | 0 |
-| 8 | 2048 | 512 | 3.6 | 14.9 | 0 | 0 |
-| 1 | 8192 | 2048 | 28.2 | 22.5 | 0 | 0 |
-| 8 | 8192 | 2048 | 29.4 | 25.2 | 0 | 0 |
-| 1 | 32768 | 8192 | 53.8 | 23.7 | 0 | 0 |
-| 8 | 32768 | 8192 | 54.1 | 28.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 149.3 | 33.4 | 0 | 0 |
-| 8 | 131072 | 32768 | 158.8 | 55.6 | 0 | 0 |
-| 512 | 512 | 128 | 3.8 | 20.8 | 0 | 0 |
-| 512 | 2048 | 512 | 3.8 | 31.9 | 0 | 0 |
-| 512 | 8192 | 2048 | 90.6 | 87.1 | 0 | 0 |
-| 512 | 32768 | 8192 | 352.4 | 251.5 | 0 | 0 |
+| 1 | 512 | 128 | 1.5 | 7.2 | 0 | 0 |
+| 8 | 512 | 128 | 2.4 | 8.9 | 0 | 0 |
+| 1 | 2048 | 512 | 1.4 | 8.0 | 0 | 0 |
+| 8 | 2048 | 512 | 2.4 | 9.1 | 0 | 0 |
+| 1 | 8192 | 2048 | 23.4 | 18.1 | 0 | 0 |
+| 8 | 8192 | 2048 | 24.0 | 20.0 | 0 | 0 |
+| 1 | 32768 | 8192 | 46.4 | 19.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 46.6 | 23.6 | 0 | 0 |
+| 1 | 131072 | 32768 | 127.3 | 28.8 | 0 | 0 |
+| 8 | 131072 | 32768 | 138.3 | 51.3 | 0 | 0 |
+| 512 | 512 | 128 | 2.7 | 16.0 | 0 | 0 |
+| 512 | 2048 | 512 | 2.5 | 27.1 | 0 | 0 |
+| 512 | 8192 | 2048 | 88.8 | 82.6 | 0 | 0 |
+| 512 | 32768 | 8192 | 351.7 | 249.9 | 0 | 0 |
 
 
 
