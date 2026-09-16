@@ -284,6 +284,23 @@ resume long-L scorer work.
 | 512 | 8192 | 2048 | 212.6 | 83.9 | 0 | 0 |
 | 512 | 32768 | 8192 | 831.6 | 252.4 | 0 | 0 |
 
+## Phase 2e — family B K1 H=4 emit (not a win)
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Kernel:
+`aiter/ops/flydsl/kernels/qsa/k1_family_b.py`. Public:
+`qsa_k1_family_b_block_ids` (``H=4`` only). Oracle set equality `err=0`.
+#4882 columns are Triton and Gluon select (HIP top-k on the competitor
+path). Expand still separate. Separate table from family A. **Not a win
+claim.** ``H=8`` is 2f; long-`L` is 2g.
+
+| m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 1 | 512 | 128 | 2.0 | 13.1 | 13.2 | 0 |
+| 8 | 512 | 128 | 3.0 | 15.7 | 15.7 | 0 |
+| 1 | 2048 | 512 | 2.0 | 10.3 | 10.3 | 0 |
+| 8 | 2048 | 512 | 3.0 | 11.4 | 11.4 | 0 |
+
+
 
 
 

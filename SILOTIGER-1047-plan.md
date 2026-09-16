@@ -347,6 +347,21 @@ equality. Do not resume long-L scorer work.
 | 512 | 32768 | 8192 | 831.6 | 252.4 | 0 | 0 |
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
+- [x] **2e.** Family B decode kernel, ``H=4`` only, correctness: paged
+      emit when ``n_blocks <= 512``, `block_ids [M, 512]`, no global score
+      matrix; oracle **set equality**; `us` vs #4882 Triton (and Gluon on
+      gfx950) recorded without a win claim. Expand still a separate launch.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Set equality `err=0`.
+HIP `module_top_k_per_row.so` is loaded. Separate table from family A.
+Times are **not** a win claim (2h). ``H=8`` is 2f; long-`L` is 2g.
+
+| m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 1 | 512 | 128 | 2.0 | 13.1 | 13.2 | 0 |
+| 8 | 512 | 128 | 3.0 | 15.7 | 15.7 | 0 |
+| 1 | 2048 | 512 | 2.0 | 10.3 | 10.3 | 0 |
+| 8 | 2048 | 512 | 3.0 | 11.4 | 11.4 | 0 |
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.
 - [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;
