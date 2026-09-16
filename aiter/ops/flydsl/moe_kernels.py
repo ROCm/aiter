@@ -3018,24 +3018,36 @@ def token_multidest_eligible(token_num: int, topk: int) -> bool:
 
 
 @functools.cache
-def _get_compiled_token_multidest_quant_fused(
+def _get_compiled_token_multidest_compact_quant(
     feat_dim: int,
     wmma_rep: int,
     topk: int,
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
 ):
-    """Compile and cache the quant + scale-preshuffle single-launch kernel."""
+    """Compile and cache the compact-scale quant kernel (first of the pair)."""
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
-        build_moe_token_multidest_quant_fused_module,
+        build_moe_token_multidest_compact_quant_module,
     )
 
-    return build_moe_token_multidest_quant_fused_module(
+    return build_moe_token_multidest_compact_quant_module(
         feat_dim=feat_dim,
         wmma_rep=wmma_rep,
         topk=topk,
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
+    )
+
+
+@functools.cache
+def _get_compiled_scale_rebuild(feat_dim: int, wmma_rep: int, quant_mode: str):
+    """Compile and cache the scale rebuild kernel (second of the pair)."""
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_scale_rebuild_module,
+    )
+
+    return build_moe_scale_rebuild_module(
+        feat_dim=feat_dim, wmma_rep=wmma_rep, quant_mode=quant_mode
     )
 
 
@@ -3109,20 +3121,16 @@ def flydsl_moe_fused_quant_preshuffle(
     # ``quant_mode``: the sender already quantized, so the kernel only scatters
     # + preshuffles.
     prequantized_scale: torch.Tensor | None = None,
-    # (contiguous_m,) int32: grouped row -> source token. Only the single-launch
-    # variant below needs it, to gather by destination after its barrier.
+    # (contiguous_m,) int32: grouped row -> source token, for the rebuild's gather
     row_to_token: torch.Tensor | None = None,
-    # When given, the compact scale and the WMMA rebuild run in ONE launch: the
-    # persistent grid quantizes every token, hits a grid-wide barrier, then
-    # rebuilds the interleaved layout into this buffer. ``out_scale`` is the
-    # compact staging buffer in that mode.
+    # When given, a second launch rebuilds the interleaved scale into this buffer
+    # and ``out_scale`` becomes the compact per-token staging buffer instead.
     fused_preshuffle_out: torch.Tensor | None = None,
-    fused_barrier: torch.Tensor | None = None,
-    fused_num_workers: int = 0,
 ):
-    """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
+    """Fused grouped quant + e8m0 scale-preshuffle.
 
-    Returns (payload, scale_preshuffle). Pass masked_m to skip padding rows.
+    Returns (payload, scale_preshuffle). Pass masked_m to skip padding rows, and
+    ``fused_preshuffle_out`` to take the compact-then-rebuild pair.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -3228,7 +3236,13 @@ def flydsl_moe_fused_quant_preshuffle(
 
             rows_per_tile = wmma_rep * 16
             num_tiles = int(fused_preshuffle_out.shape[-2]) * wmma_rep // rows_per_tile
-            launch = _get_compiled_token_multidest_quant_fused(
+            compact_p = ptr_arg(out_scale.view(-1))
+            wmma_p = ptr_arg(fused_preshuffle_out.view(-1))
+            row_map_p = ptr_arg(row_to_token.reshape(-1))
+            stream = torch.cuda.current_stream()
+
+            # Same stream: the rebuild must see every token quantized.
+            _get_compiled_token_multidest_compact_quant(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
                 topk=int(source_topk),
@@ -3236,19 +3250,23 @@ def flydsl_moe_fused_quant_preshuffle(
                 tdm_hidden_chunks=token_multidest_tdm_chunks(
                     feat_dim, wmma_rep, quant_mode, 1
                 ),
-            )
-            launch(
+            )(
                 ptr_arg(grouped_in.contiguous().view(-1)),
                 ptr_arg(out_payload.view(-1)),
-                ptr_arg(out_scale.view(-1)),
-                ptr_arg(fused_preshuffle_out.view(-1)),
+                compact_p,
                 ptr_arg(topids_to_rows_i32),
-                ptr_arg(row_to_token.reshape(-1)),
-                ptr_arg(fused_barrier.reshape(-1)),
+                row_map_p,
                 token_num,
+                (token_num + warps_per_block - 1) // warps_per_block,
+                stream=stream,
+            )
+            _get_compiled_scale_rebuild(feat_dim, wmma_rep, quant_mode)(
+                compact_p,
+                wmma_p,
+                row_map_p,
                 num_tiles,
-                int(fused_num_workers),
-                stream=torch.cuda.current_stream(),
+                num_tiles,
+                stream=stream,
             )
             return out_payload, fused_preshuffle_out
         if use_token_multidest:

@@ -270,36 +270,52 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+# The rebuild is an extra launch with a fixed cost, while coalescing the scale
+# write only pays off in proportion to the token count, so small batches are
+# better served by the inline interleaved write -- and wmma_rep=1, whose
+# interleave stride is narrower, stays better served for longer. Empirical rather
+# than derived; retune per arch and shape through the env override below.
+_COMPACT_MIN_TOKENS = 1024
+_COMPACT_MIN_TOKENS_NARROW_STRIDE = 2048
+
+
+def _compact_scale_min_tokens(wmma_rep: int) -> int:
+    """Smallest batch that takes the compact + rebuild path."""
+    default = (
+        _COMPACT_MIN_TOKENS_NARROW_STRIDE if wmma_rep == 1 else _COMPACT_MIN_TOKENS
+    )
+    raw = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS=%r is not an integer; using %d",
+            raw,
+            default,
+        )
+        return default
+
+
 def _use_fused_quant_preshuffle(
     model_dim: int, wmma_rep: int, quant_mode: str, token_num: int, topk: int
 ) -> bool:
-    """Can this call take the single-launch quant + preshuffle kernel?
+    """Can this call take the compact quant + scale-rebuild path?
 
-    Two gates: the routing has to reach the token-multidest quant at all, and
-    the kernel's phase 2 has to fit a whole scale row-tile in LDS. Both matter
-    to the caller, which sizes token-indexed buffers on the answer.
+    The caller sizes token-indexed buffers on the answer, so it needs it up front
+    rather than letting the launch decide.
     """
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         fused_quant_preshuffle_supported,
     )
     from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
 
-    return token_multidest_eligible(
-        token_num, topk
-    ) and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
-
-
-@functools.cache
-def _fused_preshuffle_workers() -> int:
-    """Resident workgroup count for the grid-barrier quant kernel.
-
-    The barrier deadlocks unless every worker is co-resident, and the kernel's
-    LDS leaves room for two blocks per CU. One block per CU also works but gives
-    up the cross-block latency hiding, which measured 93 us against 75.
-    """
-    from aiter.jit.utils.chip_info import get_cu_num
-
-    return int(get_cu_num()) * 2
+    return (
+        token_num >= _compact_scale_min_tokens(wmma_rep)
+        and token_multidest_eligible(token_num, topk)
+        and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
+    )
 
 
 @functools.cache
@@ -667,12 +683,6 @@ def _grouped_a8w4_tdm_moe(
             f"row at model_dim {model_dim}, got {_src_width}"
         )
 
-    # The scattered e8m0 write is what makes the quant pass bandwidth-bound: the
-    # WMMA layout spaces a row's consecutive blocks wmma_rep*16 dwords apart, so
-    # every store lands 4 useful bytes in a 64 B line, and topk routes repeat it.
-    # The kernel writes one compact row per token instead and rebuilds the layout
-    # after a grid-wide barrier, both sides coalesced, in the same launch. gemm1
-    # still reads the WMMA scale it always did.
     _compact = (
         not _prequantized
         and _ep_nvr is None
@@ -683,15 +693,12 @@ def _grouped_a8w4_tdm_moe(
     _compact_scale_buf = None
     _row_to_token = None
     _fused_out = None
-    _fused_barrier = None
-    _fused_workers = 0
     if _compact:
         scale_w = model_dim // 32
         _compact_scale_buf = torch.empty(
             (token_num, scale_w), dtype=torch.uint8, device=device
         )
-        # -1 marks tile padding: no route points at those rows, so phase 1 never
-        # writes them and phase 2 zero-fills them.
+        # -1 marks tile padding no route points at, which the rebuild zero-fills.
         _row_to_token = torch.full(
             (int(contiguous_m),), -1, dtype=torch.int32, device=device
         )
@@ -700,9 +707,6 @@ def _grouped_a8w4_tdm_moe(
             dtype=torch.uint8,
             device=device,
         )
-        # Arrival and release counters; both must start at zero.
-        _fused_barrier = torch.zeros(2, dtype=torch.int32, device=device)
-        _fused_workers = _fused_preshuffle_workers()
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
         hidden_states.reshape(1, token_num, _src_width),
@@ -718,8 +722,6 @@ def _grouped_a8w4_tdm_moe(
         out_scale=_compact_scale_buf,
         row_to_token=_row_to_token,
         fused_preshuffle_out=_fused_out,
-        fused_barrier=_fused_barrier,
-        fused_num_workers=_fused_workers,
     )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
