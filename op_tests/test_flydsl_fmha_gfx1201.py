@@ -1330,6 +1330,7 @@ def test_flydsl_fmha_bf16_vec_width_participates_in_cache_key(monkeypatch):
     fmha_kernels._get_kernel(**common, lds_vec_width=8)
     fmha_kernels._get_kernel(**common, lds_vec_width=16)
     assert len(builds) == 2
+    assert [build["lds_vec_width"] for build in builds] == [16, 8]
     fmha_kernels._get_kernel.cache_clear()
 
 

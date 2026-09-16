@@ -87,6 +87,16 @@ from .kernels_common import LOG2E as _LOG2E
 from .kernels_common import dtype_to_elem_type
 from .tensor_shim import _run_compiled
 
+NUM_PREFETCH_K = 1
+NUM_PREFETCH_V = 1
+
+
+def get_flash_attn_fp8_lds_bytes(head_dim: int, block_n: int) -> int:
+    """Return the FP8 kernel's exact static LDS allocation."""
+    k_bytes = NUM_PREFETCH_K * block_n * (head_dim + 4)
+    v_bytes = NUM_PREFETCH_V * head_dim * (block_n + 4)
+    return k_bytes + v_bytes
+
 
 def build_flash_attn_func_module(
     num_heads,
@@ -136,9 +146,6 @@ def build_flash_attn_func_module(
 
     PATH_TAG = f"M{BLOCK_M}N{BLOCK_N}_combined"
     BLOCK_N_OUT = BLOCK_N
-
-    NUM_PREFETCH_K = 1
-    NUM_PREFETCH_V = 1
 
     K_STEP_QK = WMMA_K
     K_STEPS_QK = head_dim // K_STEP_QK

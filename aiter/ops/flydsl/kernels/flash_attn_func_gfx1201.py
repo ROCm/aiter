@@ -26,6 +26,16 @@ from .kernels_common import LOG2E as _LOG2E
 from .tensor_shim import _run_compiled
 
 KERNEL_NAME = "flash_attn_func_gfx1201_kernel"
+NUM_PREFETCH_K = 1
+NUM_PREFETCH_V = 1
+
+
+def get_flash_attn_lds_bytes(head_dim: int, block_n: int) -> int:
+    """Return the BF16/F16 kernel's exact static LDS allocation."""
+    stride = head_dim + 4
+    elements = NUM_PREFETCH_K * block_n * stride
+    elements += NUM_PREFETCH_V * block_n * stride
+    return elements * 2
 
 
 def build_flash_attn_func_module_primary(
@@ -38,6 +48,7 @@ def build_flash_attn_func_module_primary(
     flat_work_group_size=None,
     block_m=None,
     block_n=None,
+    lds_vec_width=None,
     tail_mask=False,
     cross_attn=False,
     unsafe_fp_math=True,
@@ -75,9 +86,6 @@ def build_flash_attn_func_module_primary(
 
     BLOCK_N_OUT = BLOCK_N
 
-    NUM_PREFETCH_K = 1
-    NUM_PREFETCH_V = 1
-
     K_STEP_QK = WMMA_K
     K_STEPS_QK = head_dim // K_STEP_QK
     WMMA_LANE_K = 8
@@ -107,8 +115,15 @@ def build_flash_attn_func_module_primary(
     K_STRIDE = HEAD_DIM + 4
     V_STRIDE = HEAD_DIM + 4
 
-    ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
-    VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
+    if lds_vec_width is None:
+        lds_vec_width = (
+            16
+            if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
+            else 8
+        )
+    if lds_vec_width not in (8, 16):
+        raise ValueError(f"lds_vec_width must be 8 or 16, got {lds_vec_width}")
+    VEC_WIDTH = lds_vec_width
     (
         THREADS_PER_ROW_LOAD,
         NUM_BATCHES_KV,

@@ -42,7 +42,11 @@ from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.flash_attn_func_fp8_gfx1201 import (
     build_flash_attn_func_module as build_flash_attn_fp8_func_module,
 )
-from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
+from .kernels.flash_attn_func_fp8_gfx1201 import get_flash_attn_fp8_lds_bytes
+from .kernels.flash_attn_func_gfx1201 import (
+    build_flash_attn_func_module,
+    get_flash_attn_lds_bytes,
+)
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8,
     flash_attn_varlen_m32x8,
@@ -148,10 +152,8 @@ def _pick_gfx1201_tiles(seq_len: int, head_dim: int, causal: bool) -> tuple[int,
 def _gfx1201_fmha_lds_bytes(head_dim: int, block_n: int, *, fp8: bool) -> int:
     """Return the exact static LDS allocation for a selected gfx1201 kernel."""
     if fp8:
-        # K is [BN, D + 4] fp8. V is transposed [D, BN + 4] fp8.
-        return block_n * (head_dim + 4) + head_dim * (block_n + 4)
-    # BF16/F16 K and V are both [BN, D + 4], at two bytes per element.
-    return 2 * block_n * (head_dim + 4) * 2
+        return get_flash_attn_fp8_lds_bytes(head_dim, block_n)
+    return get_flash_attn_lds_bytes(head_dim, block_n)
 
 
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
@@ -242,8 +244,7 @@ def _get_kernel(
 ):
     # device_index intentionally participates in the cache key; the builder
     # observes the active device selected by the caller's device context.
-    # lds_vec_width also participates because the builder reads its diagnostic
-    # environment toggle while constructing the IR.
+    # lds_vec_width participates because it changes the cooperative load layout.
     return build_flash_attn_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
@@ -256,6 +257,7 @@ def _get_kernel(
         sm_scale=softmax_scale,
         tail_mask=tail_mask,
         cross_attn=cross_attn,
+        lds_vec_width=lds_vec_width,
     )
 
 
