@@ -662,6 +662,7 @@ def compile_flydsl_moe_stage1(
             k_wave=k_wave,
             # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
             use_k16="gfx95" not in str(get_rocm_arch()),
+            rocm_arch=str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -746,6 +747,7 @@ def compile_flydsl_moe_stage2(
             w_dtype=b_dtype,
             # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
             use_k16="gfx95" not in str(get_rocm_arch()),
+            rocm_arch=str(get_rocm_arch()),
             epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
             topk=topk,
         )

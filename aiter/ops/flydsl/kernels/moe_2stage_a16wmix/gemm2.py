@@ -281,6 +281,7 @@ def _gemm2_body_a16w4(
     b_cache_mod=2,
     w_dtype="fp4",
     use_k16=False,
+    rocm_arch="",
     use_reduce=False,
     topk=1,
 ):
@@ -327,6 +328,7 @@ def _gemm2_body_a16w4(
         w_dtype=w_dtype,
         b_cache_mod=b_cache_mod,
         use_k16=use_k16,
+        rocm_arch=rocm_arch,
     )
 
     # ---- A path (shared with gemm1, see utils.make_a_loader) -------------------
@@ -463,6 +465,7 @@ def compile_gemm2_a16w4_port(
     w_dtype="fp4",
     persist=False,
     use_k16,
+    rocm_arch,
     epilog="atomic",
     topk=1,
 ):
@@ -488,6 +491,7 @@ def compile_gemm2_a16w4_port(
     if _use_reduce and _topk < 1:
         raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
     _use_k16 = use_k16
+    _rocm_arch = rocm_arch
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert (
@@ -598,6 +602,7 @@ def compile_gemm2_a16w4_port(
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
                 use_k16=_use_k16,
+                rocm_arch=_rocm_arch,
                 use_reduce=_use_reduce,
                 topk=_topk,
             )

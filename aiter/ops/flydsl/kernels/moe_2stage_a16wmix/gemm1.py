@@ -57,6 +57,7 @@ def _gemm1_body_a16w4(
     w_layout="standard",
     k_wave=1,
     use_k16=False,
+    rocm_arch="",
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -126,6 +127,7 @@ def _gemm1_body_a16w4(
         w_dtype=w_dtype,
         b_cache_mod=b_cache_mod,
         use_k16=use_k16,
+        rocm_arch=rocm_arch,
     )
     # Intermediate [sorted_size, inter] bf16: num_records = cumsum0*inter*2, so masked
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
@@ -389,6 +391,7 @@ def compile_gemm1_a16w4_port(
     w_layout="standard",
     k_wave=1,
     use_k16,
+    rocm_arch,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -472,6 +475,7 @@ def compile_gemm1_a16w4_port(
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); resolved by the caller and passed in
     # (not in name_suffix -- ARCH is already in the JIT cache key).
     _use_k16 = use_k16
+    _rocm_arch = rocm_arch
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
@@ -574,6 +578,7 @@ def compile_gemm1_a16w4_port(
                 w_layout=w_layout,
                 k_wave=k_wave,
                 use_k16=_use_k16,
+                rocm_arch=_rocm_arch,
             )
 
     @flyc.jit
