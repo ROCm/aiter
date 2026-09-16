@@ -314,12 +314,12 @@ on both columns. **Not checked.** `aiter/jit/module_top_k_per_row.so` is
 loaded (`import [module_top_k_per_row]`; oracle-fallback warning did not
 fire). The AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand.
 
-The FlyDSL column is **eight-wave** scoring (`block=512`, one column per
-thread per tile) measured in this workspace. That kernel change is **not**
-on the branch at this measurement (committed K1 is still the 2c wave64
-instantiation). FlyDSL loses **every** harness row, including `L<=2048`
-(~25µs vs ~8µs at `M=1, L=512`). From 8k the per-tile bitonic still
-dominates K1.
+The FlyDSL column is the committed **eight-wave** K1 (`block=512`, one
+column per thread per tile; Q copy gated to the first 64 threads). Same
+`block_ids [M, 512]`; no score matrix; expand still separate. FlyDSL
+loses **every** harness row, including `L<=2048` (~25µs vs ~8µs at
+`M=1, L=512`). From 8k the per-tile bitonic still dominates K1. **2d
+stays unchecked.**
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
