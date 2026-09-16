@@ -7,7 +7,7 @@ Two layers:
   * Correctness (pytest gate): ``test_*`` unit cases.
   * Perf sweep (``__main__``): ``bench_qsa_family_a_plumbing``,
     ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
-    ``bench_qsa_family_b_4882_gluon``.
+    ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``.
 
 Usage::
 
@@ -564,18 +564,17 @@ def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype):
     }
 
 
-@benchmark()
-def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads):
-    """#4882 gfx950 Gluon QSA vs the oracle on family B (Gluon-validated) shapes.
-
-    Family A GQA (group 12 / D=256) is not launched here. Oracle is not timed.
-    """
+def _family_b_indexer(index_heads):
     if index_heads == FAMILY_B_INDEXER.n_heads:
-        idx = FAMILY_B_INDEXER
-    elif index_heads == FAMILY_B_INDEXER_H8.n_heads:
-        idx = FAMILY_B_INDEXER_H8
-    else:
-        raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
+        return FAMILY_B_INDEXER
+    if index_heads == FAMILY_B_INDEXER_H8.n_heads:
+        return FAMILY_B_INDEXER_H8
+    raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
+
+
+def _bench_qsa_family_b_4882(m, seq_len, page_size, dtype, index_heads, backend):
+    """Family B #4882 vs oracle. ``backend`` is ``triton`` or ``gluon``."""
+    idx = _family_b_indexer(index_heads)
     gqa = FAMILY_B_GQA
     device = torch.device("cuda")
     n_blocks = seq_len // idx.compress_ratio
@@ -627,15 +626,15 @@ def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads):
             slen,
             idx.token_budget,
             idx.compress_ratio,
-            backend="gluon",
+            backend=backend,
         )
 
     (indices, block_ids), select_us = run_perftest(select)
     block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
     index_err = _set_mismatch_ratio(ref.indices, indices)
-    if indices.shape[1] != 2051:
+    if indices.shape[1] != idx.index_width:
         raise AssertionError(
-            f"Gluon sparse GQA requires selection width 2051, got {indices.shape[1]}"
+            f"family B selection width {indices.shape[1]} != {idx.index_width}"
         )
 
     def attend():
@@ -646,18 +645,20 @@ def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads):
             indices,
             kv_table,
             token_to_req,
-            backend="gluon",
+            backend=backend,
         )
 
+    gqa_tol = 2e-2 if backend == "gluon" else 1e-2
     out, gqa_us = run_perftest(attend)
     gqa_err = checkAllclose(
         ref.output,
         out.to(dtypes.fp32),
-        rtol=2e-2,
-        atol=2e-2,
-        msg="4882 Gluon GQA vs oracle",
+        rtol=gqa_tol,
+        atol=gqa_tol,
+        msg=f"4882 {backend} GQA vs oracle",
     )
 
+    tag = backend
     w = idx.index_width
     flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
@@ -671,15 +672,38 @@ def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads):
         "gfx": get_gfx(),
         "aiter_4882_pin": AITER_4882_QSA_PIN,
         "n_blocks": n_blocks,
-        "4882_gluon_select us": select_us,
-        "4882_gluon_select TFLOPS": flops_select / select_us / 1e6,
-        "4882_gluon_select TB/s": bytes_select / select_us / 1e6,
-        "4882_gluon_select err": max(block_err, index_err),
-        "4882_gluon_gqa us": gqa_us,
-        "4882_gluon_gqa TFLOPS": flops_gqa / gqa_us / 1e6,
-        "4882_gluon_gqa TB/s": bytes_gqa / gqa_us / 1e6,
-        "4882_gluon_gqa err": gqa_err,
+        f"4882_{tag}_select us": select_us,
+        f"4882_{tag}_select TFLOPS": flops_select / select_us / 1e6,
+        f"4882_{tag}_select TB/s": bytes_select / select_us / 1e6,
+        f"4882_{tag}_select err": max(block_err, index_err),
+        f"4882_{tag}_gqa us": gqa_us,
+        f"4882_{tag}_gqa TFLOPS": flops_gqa / gqa_us / 1e6,
+        f"4882_{tag}_gqa TB/s": bytes_gqa / gqa_us / 1e6,
+        f"4882_{tag}_gqa err": gqa_err,
     }
+
+
+@benchmark()
+def bench_qsa_family_b_4882_triton(m, seq_len, page_size, dtype, index_heads):
+    """#4882 portable Triton QSA vs the oracle on family B shapes.
+
+    Separate table from family A Triton and from family B Gluon. Oracle is
+    not timed.
+    """
+    return _bench_qsa_family_b_4882(
+        m, seq_len, page_size, dtype, index_heads, backend="triton"
+    )
+
+
+@benchmark()
+def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads):
+    """#4882 gfx950 Gluon QSA vs the oracle on family B (Gluon-validated) shapes.
+
+    Family A GQA (group 12 / D=256) is not launched here. Oracle is not timed.
+    """
+    return _bench_qsa_family_b_4882(
+        m, seq_len, page_size, dtype, index_heads, backend="gluon"
+    )
 
 
 def _run_unit_cases():
@@ -698,7 +722,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Family A QSA + vLLM AMD + #4882 Triton; family B #4882 Gluon",
+        description="Family A QSA + vLLM AMD + #4882 Triton; family B #4882 Triton/Gluon",
     )
     parser.add_argument(
         "-d",
@@ -781,6 +805,23 @@ def main():
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "QSA family A #4882 Triton summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+        rows = []
+        for m, seq_len, page_size, index_heads in itertools.product(
+            args.batch, args.seq, args.page_size, (4, 8)
+        ):
+            if m > seq_len:
+                continue
+            rows.append(
+                bench_qsa_family_b_4882_triton(
+                    m, seq_len, page_size, dtype, index_heads
+                )
+            )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "QSA family B #4882 Triton summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
 
