@@ -636,12 +636,12 @@ class DeviceMoEPipeline:
                         f"--dispatch_wire={self.spec['dispatch_wire']} needs a "
                         f"hidden dim that is a multiple of it, got {self.hdim}"
                     )
-                wire_kw = dict(
-                    dispatch_data_type=wire_dtype,
-                    combine_data_type=self.transport_dtype,
-                    scale_dim=self.hdim // _MX_SCALE_BLOCK,
-                    scale_type_size=1,
-                )
+                wire_kw = {
+                    "dispatch_data_type": wire_dtype,
+                    "combine_data_type": self.transport_dtype,
+                    "scale_dim": self.hdim // _MX_SCALE_BLOCK,
+                    "scale_type_size": 1,
+                }
             cfg = EpDispatchCombineConfig(
                 rank=r,
                 world_size=self.dist_ctx.world,
