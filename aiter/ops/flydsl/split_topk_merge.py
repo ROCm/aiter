@@ -18,6 +18,16 @@ _BLOCK_THREADS = 256
 _WAVE_SIZE = 64
 
 
+def split_topk_merge_workspace_shapes(rows: int):
+    """``(histogram, state)`` shapes for a caller-owned merge workspace.
+
+    Histogram is ``[rows, 1, 2048]`` int32 (11-bit pass-0 bins). State is
+    ``[rows, 6]`` int32. Stage A adds into the histogram; a completed merge
+    writes every bin back to 0, so the pair is reusable with no ``zero_()``.
+    """
+    return (rows, 1, _RADIX_BINS), (rows, _STATE_SIZE)
+
+
 @cache
 def _full_widths(device_index: int, rows: int, width: int) -> torch.Tensor:
     return torch.full(
@@ -68,18 +78,53 @@ def _build_split_topk_merge(k: int, splits: int, precomputed_first_pass: bool):
     )
 
 
+def alloc_split_topk_merge_workspace(
+    device: torch.device, rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate a clean workspace once. Do not call this inside a CUDA graph."""
+    hist_shape, state_shape = split_topk_merge_workspace_shapes(rows)
+    return (
+        torch.zeros(hist_shape, dtype=torch.int32, device=device),
+        torch.empty(state_shape, dtype=torch.int32, device=device),
+    )
+
+
 def split_topk_merge_workspace(
     device: torch.device,
     rows: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the stream-local histogram and state used by split TopK."""
-    if torch.cuda.is_current_stream_capturing():
-        return (
-            torch.zeros((rows, 1, _RADIX_BINS), dtype=torch.int32, device=device),
-            torch.empty((rows, _STATE_SIZE), dtype=torch.int32, device=device),
-        )
+    """Return the cached histogram and state used when the caller passes none.
+
+    First miss allocates zeros. Capture reuses that tensor; it does not
+    ``zeros()`` again. Serving should pass its own pair instead of this cache.
+    """
     stream = torch.cuda.current_stream(device)
     return _split_workspace(device.index, stream.cuda_stream, rows)
+
+
+def _require_merge_workspace(
+    workspace: tuple[torch.Tensor, torch.Tensor],
+    *,
+    rows: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if len(workspace) != 2:
+        raise ValueError("workspace must be (histogram, state)")
+    histogram, state = workspace
+    hist_shape, state_shape = split_topk_merge_workspace_shapes(rows)
+    for name, tensor, expected in (
+        ("workspace histogram", histogram, hist_shape),
+        ("workspace state", state, state_shape),
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+        if tensor.dtype != torch.int32 or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous int32")
+        if tuple(tensor.shape) != expected:
+            raise ValueError(f"{name} must have shape {expected}, got {tuple(tensor.shape)}")
+    return histogram, state
 
 
 def _row_ends(device: torch.device, rows: int, width: int) -> torch.Tensor:
@@ -110,6 +155,9 @@ def split_topk_merge(
     slots Stage A left as ``(-inf, -1)`` are never read. Pass
     ``precomputed_first_pass`` when Stage A already filled the pass-0
     histogram in ``workspace``; the merge then skips that data pass.
+
+    A caller-owned ``workspace`` is not zeroed here. It must be zeros before
+    Stage A; after this merge it is zeros again.
     """
     if candidate_scores.ndim != 3:
         raise ValueError("candidate_scores must have shape [rows,splits,local_k]")
@@ -164,9 +212,12 @@ def split_topk_merge(
         selected_positions = out_positions
     row_ends = _row_ends(device, rows, width)
     stream = torch.cuda.current_stream(device)
-    partial_hist, state = (
-        split_topk_merge_workspace(device, rows) if workspace is None else workspace
-    )
+    if workspace is None:
+        partial_hist, state = split_topk_merge_workspace(device, rows)
+    else:
+        partial_hist, state = _require_merge_workspace(
+            workspace, rows=rows, device=device
+        )
     launcher = _build_split_topk_merge(k, splits, precomputed_first_pass)
     _run_compiled(
         launcher,

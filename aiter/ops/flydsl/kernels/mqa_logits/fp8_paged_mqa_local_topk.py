@@ -59,7 +59,7 @@ def fp8_paged_mqa_local_topk_kernel_name(
     return (
         f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
         f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
-        f"pm{int(prepare_merge)}_ptr64_scan3_{arch}"
+        f"pm{int(prepare_merge)}_ptr64_scan3_n1_{arch}"
     )
 
 
@@ -257,7 +257,6 @@ def compile_fp8_paged_mqa_local_topk(
         candidate_counts: fx.Tensor,
         merge_histogram: fx.Tensor,
         merge_state: fx.Tensor,
-        next_n: fx.Int32,
         num_splits: fx.Int32,
         max_pages: fx.Int32,
         num_pages: fx.Int32,
@@ -301,7 +300,7 @@ def compile_fp8_paged_mqa_local_topk(
             valid_len * (split + fx.Int32(1)),
             num_splits,
         )
-        request = _udiv(row, next_n)
+        request = row
 
         if tid == 0:
             state[_RETAINED] = 0
@@ -735,7 +734,6 @@ def compile_fp8_paged_mqa_local_topk(
         merge_histogram: fx.Tensor,
         merge_state: fx.Tensor,
         rows: fx.Int32,
-        next_n: fx.Int32,
         num_splits: fx.Int32,
         max_pages: fx.Int32,
         num_pages: fx.Int32,
@@ -755,7 +753,6 @@ def compile_fp8_paged_mqa_local_topk(
             candidate_counts,
             merge_histogram,
             merge_state,
-            next_n,
             num_splits,
             max_pages,
             num_pages,
@@ -787,8 +784,11 @@ def launch_fp8_paged_mqa_local_topk(
     packed=False,
 ):
     page_size = kv_cache.shape[1]
-    batch, next_n, _, _ = q_fp8.shape
-    rows = batch * next_n
+    if q_fp8.ndim != 4 or q_fp8.shape[1:] != (1, 32, 128):
+        raise ValueError(
+            f"q_fp8 must have shape [B,1,32,128], got {tuple(q_fp8.shape)}"
+        )
+    rows = q_fp8.shape[0]
     launcher = compile_fp8_paged_mqa_local_topk(
         topk=topk,
         arch=arch,
@@ -817,7 +817,6 @@ def launch_fp8_paged_mqa_local_topk(
         merge_histogram,
         merge_state,
         rows,
-        next_n,
         num_splits,
         max_pages,
         num_pages,

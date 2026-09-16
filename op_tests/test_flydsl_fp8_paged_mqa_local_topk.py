@@ -24,6 +24,7 @@ from aiter.ops.flydsl.fp8_paged_mqa_local_topk import (
     merge_local_topk_candidates,
 )
 from aiter.ops.flydsl.split_topk_merge import (
+    alloc_split_topk_merge_workspace,
     clear_split_topk_merge_workspace_cache,
     split_topk_merge,
 )
@@ -65,25 +66,21 @@ def _make_case(
     *,
     seed=17,
     ragged=False,
-    next_n=1,
 ):
     """Build one Stage A case.
 
     Every request owns its own physical pages, as serving does. Sharing one
     page set across requests would inflate L2 reuse and is not a case worth
-    measuring or validating.
+    measuring or validating. ``q`` is ``[rows,1,32,128]``.
     """
-    if rows % next_n:
-        raise ValueError("rows must be divisible by next_n")
-    batch = rows // next_n
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
     pages_per_request = max(1, (length + page_size - 1) // page_size)
-    pages = pages_per_request * batch
+    pages = pages_per_request * rows
     q = (
         torch.randn(
-            batch,
-            next_n,
+            rows,
+            1,
             HEADS,
             HEAD_DIM,
             device=device,
@@ -102,31 +99,14 @@ def _make_case(
         rows, HEADS, device=device, generator=generator, dtype=torch.float32
     )
     lengths = torch.full((rows,), length, device=device, dtype=torch.int32)
-    if next_n > 1:
-        causal_offsets = torch.arange(
-            1 - next_n,
-            1,
-            device=device,
-            dtype=torch.int32,
-        )
-        lengths = (
-            torch.full(
-                (batch, next_n),
-                length,
-                device=device,
-                dtype=torch.int32,
-            )
-            + causal_offsets
-        ).clamp_min_(0)
     if ragged and rows > 1:
-        flat_lengths = lengths.reshape(-1)
-        flat_lengths[0] = 0
-        flat_lengths[-1] = max(0, length - 3)
+        lengths[0] = 0
+        lengths[-1] = max(0, length - 3)
     block_tables = torch.stack(
         [
             torch.randperm(pages_per_request, device=device, generator=generator)
             + request * pages_per_request
-            for request in range(batch)
+            for request in range(rows)
         ]
     ).to(torch.int32)
     return Case(q, kv, scales, weights, lengths, block_tables)
@@ -150,10 +130,9 @@ def _pack_kv(kv, scales):
 
 def run_torch(case):
     """Independent FP32 oracle with explicit page mapping and epilogue order."""
-    batch, next_n = case.q.shape[:2]
-    rows = batch * next_n
+    rows = case.q.shape[0]
     q = case.q.reshape(rows, HEADS, HEAD_DIM)
-    lengths = case.lengths.reshape(-1)
+    lengths = case.lengths
     page_size = case.kv.shape[1]
     flat_kv = case.kv.reshape(-1, HEAD_DIM).float()
     flat_scales = case.scales.reshape(-1)
@@ -162,7 +141,7 @@ def run_torch(case):
         length = int(lengths[row].item())
         logical = torch.arange(length, device=case.q.device)
         physical = (
-            case.block_tables[row // next_n, logical // page_size] * page_size
+            case.block_tables[row, logical // page_size] * page_size
             + logical % page_size
         )
         # Walk the row in chunks: the head broadcast below is
@@ -219,11 +198,6 @@ def _assert_candidates(case, scores, positions, counts, *, k, splits):
             assert torch.all((got_positions >= begin) & (got_positions < end))
             if count:
                 local_scores = row_scores[begin:end]
-                # Compare selected values rather than index sets. At the k-th
-                # boundary the two neighbouring candidates can sit within fp8
-                # accumulation noise of each other, so which of them a kernel
-                # keeps is not determined; a genuine miss still fails here
-                # because it pulls in a materially smaller score.
                 _assert_topk_values(
                     local_scores,
                     row_scores[got_positions],
@@ -374,29 +348,25 @@ def _assert_compact_topk(case, scores, positions, k):
 
 
 @pytest.mark.parametrize(
-    "length,k,splits,next_n",
+    "length,k,splits",
     [
-        (4096, 128, 1, 1),
-        (8193, 128, 4, 2),
-        (8193, 512, 4, 1),
-        (8193, 1024, 4, 1),
-        (8193, 2048, 4, 1),
+        (4096, 128, 1),
+        (8193, 128, 4),
+        (8193, 512, 4),
+        (8193, 1024, 4),
+        (8193, 2048, 4),
     ],
 )
-def test_packed_page64_compact_topk(length, k, splits, next_n):
+def test_packed_page64_compact_topk(length, k, splits):
     _require_supported_gpu()
-    rows = 2 * next_n
-    case = _make_case(rows, length, 64, seed=43, next_n=next_n)
+    case = _make_case(2, length, 64, seed=43)
     packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
-    lengths = (
-        case.lengths[:, -1].contiguous() if case.lengths.ndim == 2 else case.lengths
-    )
     scores, positions = flydsl_fp8_paged_mqa_topk(
         case.q,
         packed,
         None,
         case.weights,
-        lengths,
+        case.lengths,
         case.block_tables,
         k=k,
         num_splits=splits,
@@ -472,45 +442,11 @@ def test_short_split_invalid_page_keeps_live_positions():
     assert torch.all(positions[0, 0, length:] == -1)
 
 
-@pytest.mark.parametrize(
-    "next_n,rows",
-    [(2, 8), (3, 6), (4, 8), (8, 8)],
-)
-def test_preshuffled_page64_mtp_causal_local_sets(next_n, rows):
+def test_preshuffled_page64_threshold_ties_and_nan_bottom():
     _require_supported_gpu()
-    length, k, splits = 8193, 128, 4
-    case = _make_case(
-        rows,
-        length,
-        64,
-        seed=42,
-        next_n=next_n,
-    )
-    outputs = flydsl_fp8_paged_mqa_local_topk(
-        case.q,
-        _preshuffle_kv(case.kv),
-        case.scales,
-        case.weights,
-        case.lengths,
-        case.block_tables,
-        k=k,
-        num_splits=splits,
-        preshuffled=True,
-    )
-    _assert_candidates(case, *outputs, k=k, splits=splits)
+    rows, length, k, splits = 2, 4096, 128, 1
 
-
-def test_preshuffled_page64_mtp_threshold_ties_and_nan_bottom():
-    _require_supported_gpu()
-    rows, next_n, length, k, splits = 2, 2, 4096, 128, 1
-
-    tie_case = _make_case(
-        rows,
-        length,
-        64,
-        seed=48,
-        next_n=next_n,
-    )
+    tie_case = _make_case(rows, length, 64, seed=48)
     tie_case.weights.zero_()
     tie_scores, tie_positions, tie_counts = flydsl_fp8_paged_mqa_local_topk(
         tie_case.q,
@@ -528,13 +464,7 @@ def test_preshuffled_page64_mtp_threshold_ties_and_nan_bottom():
     for row in range(rows):
         assert tie_positions[row, 0].unique().numel() == k
 
-    nan_case = _make_case(
-        rows,
-        length,
-        64,
-        seed=49,
-        next_n=next_n,
-    )
+    nan_case = _make_case(rows, length, 64, seed=49)
     nan_case.scales.reshape(-1)[1::2] = float("nan")
     nan_scores, nan_positions, _ = flydsl_fp8_paged_mqa_local_topk(
         nan_case.q,
@@ -566,8 +496,7 @@ def test_auto_split_plan():
 
 def test_preshuffled_page64_single_split_topk():
     _require_supported_gpu()
-    rows, next_n, length, k = 2, 2, 4096, 128
-    case = _make_case(rows, length, 64, seed=51, next_n=next_n)
+    case = _make_case(2, 4096, 64, seed=51)
     scores, positions = flydsl_fp8_paged_mqa_topk(
         case.q,
         _preshuffle_kv(case.kv),
@@ -575,64 +504,10 @@ def test_preshuffled_page64_single_split_topk():
         case.weights,
         case.lengths,
         case.block_tables,
-        k=k,
+        k=128,
         num_splits=1,
     )
-    reference = run_torch(case)
-    for row, row_scores in enumerate(reference):
-        got = positions[row].long()
-        assert got.unique().numel() == k
-        _assert_topk_values(
-            row_scores, row_scores[got], k, msg=f"row={row} single-split TopK"
-        )
-        checkAllclose(
-            row_scores[got].float(),
-            scores[row].float(),
-            rtol=2e-4,
-            atol=2e-4,
-            msg=f"row={row} single-split TopK",
-        )
-
-
-@pytest.mark.parametrize("next_n", [2, 3, 4, 8])
-def test_preshuffled_page64_mtp_compact_topk(next_n):
-    _require_supported_gpu()
-    rows, length, k, splits = next_n * 2, 8193, 128, 4
-    case = _make_case(
-        rows,
-        length,
-        64,
-        seed=44,
-        next_n=next_n,
-    )
-    scores, positions = flydsl_fp8_paged_mqa_topk(
-        case.q,
-        _preshuffle_kv(case.kv),
-        case.scales,
-        case.weights,
-        case.lengths[:, -1].contiguous(),
-        case.block_tables,
-        k=k,
-        num_splits=splits,
-    )
-    reference = run_torch(case)
-    for row, row_scores in enumerate(reference):
-        count = min(k, row_scores.numel())
-        got = positions[row, :count].long()
-        assert got.unique().numel() == count
-        _assert_topk_values(
-            row_scores,
-            row_scores[got],
-            count,
-            msg=f"row={row} next_n={next_n} compact TopK",
-        )
-        checkAllclose(
-            row_scores[got].float(),
-            scores[row, :count].float(),
-            rtol=2e-4,
-            atol=2e-4,
-            msg=f"row={row} next_n={next_n} compact TopK",
-        )
+    _assert_compact_topk(case, scores, positions, 128)
 
 
 @pytest.mark.parametrize(
@@ -641,8 +516,7 @@ def test_preshuffled_page64_mtp_compact_topk(next_n):
 )
 def test_preshuffled_page64_compact_topk(length, k):
     _require_supported_gpu()
-    rows = 2
-    case = _make_case(rows, length, 64, seed=43)
+    case = _make_case(2, length, 64, seed=43)
     scores, positions = flydsl_fp8_paged_mqa_topk(
         case.q,
         _preshuffle_kv(case.kv),
@@ -653,24 +527,7 @@ def test_preshuffled_page64_compact_topk(length, k):
         k=k,
         num_splits=4,
     )
-    reference = run_torch(case)
-    for row, row_scores in enumerate(reference):
-        count = min(k, length)
-        assert torch.all(positions[row, count:] == -1)
-        assert torch.all(torch.isneginf(scores[row, count:]))
-        if count:
-            got = positions[row, :count].long()
-            assert got.unique().numel() == count
-            _assert_topk_values(
-                row_scores, row_scores[got], count, msg=f"row={row} compact TopK"
-            )
-            checkAllclose(
-                row_scores[got].float(),
-                scores[row, :count].float(),
-                rtol=2e-4,
-                atol=2e-4,
-                msg=f"row={row} compact TopK",
-            )
+    _assert_compact_topk(case, scores, positions, k)
 
 
 def test_packed_page64_run_only_cache_hit():
@@ -706,7 +563,8 @@ def test_packed_page64_e2e_graph_replay():
         case.lengths,
         case.block_tables,
     )
-    flydsl_fp8_paged_mqa_topk(*args, k=128, num_splits=4)
+    workspace = alloc_split_topk_merge_workspace(case.q.device, case.q.shape[0])
+    flydsl_fp8_paged_mqa_topk(*args, k=128, num_splits=4, workspace=workspace)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -714,11 +572,34 @@ def test_packed_page64_e2e_graph_replay():
             *args,
             k=128,
             num_splits=4,
+            workspace=workspace,
         )
     for _ in range(5):
         graph.replay()
     torch.cuda.synchronize()
     _assert_compact_topk(case, scores, positions, 128)
+    assert torch.count_nonzero(workspace[0]) == 0
+
+
+def test_caller_workspace_stays_zero_across_calls():
+    _require_supported_gpu()
+    case = _make_case(2, 8193, 64, seed=71)
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    workspace = alloc_split_topk_merge_workspace(case.q.device, case.q.shape[0])
+    for _ in range(3):
+        scores, positions = flydsl_fp8_paged_mqa_topk(
+            case.q,
+            packed,
+            None,
+            case.weights,
+            case.lengths,
+            case.block_tables,
+            k=128,
+            num_splits=4,
+            workspace=workspace,
+        )
+        _assert_compact_topk(case, scores, positions, 128)
+        assert torch.count_nonzero(workspace[0]) == 0
 
 
 def test_k2048_reservoir_and_existing_stage_b():
@@ -837,7 +718,6 @@ def benchmark_auto_topk(rows, length):
         length,
         64,
         seed=73,
-        next_n=1,
     )
     reference = run_torch(case)
     packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
