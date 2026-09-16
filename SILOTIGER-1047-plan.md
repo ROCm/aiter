@@ -214,12 +214,19 @@ separate steps (plumbing → live AMD → #4882 → rocprof).
       Family A GQA is not launched on Gluon. Kernels:
       `aiter/ops/triton/_gluon_kernels/gfx950/attention/qsa_{paged_mqa_logits,sparse_paged_gqa}.py`.
 - [ ] Family A table and family B table; never merge them.
-- [ ] rocprof **one real QSA layer** (indexer through GQA) at short and long
-      `L`, including HIP graph replay at decode.
-- [ ] Record whether **indexer or GQA dominates** on this GPU at 8k / 32k /
-      128k (and 1M if the machine can hold it). That result **sets the order
-      of phases 2 vs 3** if it clearly disagrees with “K1 then K2”; note the
-      override here rather than silently swapping.
+- [x] rocprof **one real QSA layer** (indexer through GQA) at short and long
+      `L`, including HIP graph replay at decode. Driver:
+      `tickets/1047/profile_qsa_layer.py`; notes in `tickets/1047/README.md`
+      (phase 1e). Full layer HIP graph captured at decode `M=1`.
+- [x] Record whether **indexer or GQA dominates** on this GPU at 8k / 32k /
+      128k (and 1M if the machine can hold it). **No swap of phases 2 vs 3**
+      was the call at 1e. HIP `module_top_k_per_row.so` was **absent**; decode
+      select wall was oracle/`torch.topk` on MQA logits, not
+      `_hip_top_k_per_row_decode`. rocprof MQA was ~3 µs. That ranking does
+      **not** apply to production HIP select (a select-only measurement, not
+      a new full-layer rocprof, is what later phases compare against). Prefill
+      `M=512` under the fallback: GQA slightly ahead at 8k; select ahead at
+      32k. 128k decode fits; 1M not run.
 - [ ] **Done when:** both family tables exist with live AMD + oracle + #4882
       where it dispatches; a short note states which side of QSA dominates at
       the locked lengths on GPU 6.
@@ -301,6 +308,9 @@ the answer into **Locked decisions** and check the item.
 
 - [ ] Where indexer vs GQA dominates on this GPU at 8k / 32k / 128k / 1M
       (phase 1). Sets whether to land K1 or K2 first after the harness.
+      Phase 1e answered this under **fallback** top-k only. Production HIP
+      select is not a new full-layer rocprof; 2d/e2e must not use the
+      fallback AMD column.
 - [ ] Whether FlyDSL K1 should emit **block ids** or already-expanded **token
       ids** (phase 2/5).
 - [ ] Packed vs padded `M` (varlen) from a real vLLM prefill trace (phase 4).

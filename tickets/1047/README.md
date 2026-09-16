@@ -72,3 +72,46 @@ family A stays a Triton column. Forced Gluon on family A GQA (group 12 / D=256)
 errors. Family B table: `4882_gluon_select` / `4882_gluon_gqa` vs oracle,
 indexer H ∈ {4, 8}. Skip on non-gfx950 or failed Gluon import.
 
+## Phase 1e — rocprof one live-AMD QSA layer (GPU 6)
+
+Driver: `tickets/1047/profile_qsa_layer.py` (family A vLLM AMD select + sparse GQA;
+oracle not run). Device: Instinct MI355X, `HIP_VISIBLE_DEVICES=6`, rocprofv3 1.3.2.
+HIP `module_top_k_per_row.so` still missing; select top-k is the **oracle
+`torch.topk` fallback**, so decode select wall time includes many ATen/rocprim
+sort kernels, not production HIP radix top-k.
+
+HIP graph: `torch.cuda.CUDAGraph` capture of the **full layer** succeeded at
+decode `M=1` for `L ∈ {512, 8192, 32768, 131072}` (internal logits allocs are
+graph-pool safe). Replay is ~3× faster than eager layer (launch coalescing).
+
+Event times (eager, not under rocprof; `--warmup/--iters` as in the driver):
+
+| M | L | n_blocks | select_us | gqa_us | layer_us | graph_us |
+|--:|--:|---------:|----------:|-------:|---------:|---------:|
+| 1 | 512 | 128 | 148 | 37 | 192 | 56 |
+| 1 | 8192 | 2048 | 132 | 37 | 178 | 65 |
+| 1 | 32768 | 8192 | 143 | 37 | 188 | 76 |
+| 1 | 131072 | 32768 | 157 | 39 | 203 | 88 |
+| 8 | 8192 | 2048 | 126 | 37 | 167 | — |
+| 8 | 32768 | 8192 | 188 | 39 | 235 | — |
+| 512 | 8192 | 2048 | 157 | 266 | 407 | — |
+| 512 | 32768 | 8192 | 524 | 290 | 801 | — |
+
+rocprofv3 `--kernel-trace --stats` (includes warmup + eager + graph; named QSA
+kernels only, mean µs):
+
+| L | `_qsa_mqa_paged` | `_expand_qsa_indices` | `_qsa_sparse_paged_gqa_splitk` | `_qsa_merge_splitk` |
+|--:|-----------------:|----------------------:|-------------------------------:|--------------------:|
+| 512 | 3.31 | 2.95 | 6.29 | 3.60 |
+| 32768 | 3.68 | 3.13 | 6.56 | 3.60 |
+
+Raw CSVs were left in `/tmp/qsa_rocprof_{short,long}` (not in git).
+
+**Indexer vs GQA (this GPU, live AMD path, fallback top-k):** do **not** swap
+phases 2 vs 3 was the call at 1e. Decode select **wall** dominated GQA, but
+that wall was fallback top-k + copies, not MQA (~3 µs) and not HIP radix.
+That is **not** a ranking against production HIP select. “K1 must absorb the
+expensive decode top-k” described the missing `.so`, not
+`_hip_top_k_per_row_decode`. Prefill `M=512` under the same fallback: GQA
+slightly ahead at 8k; select ahead at 32k. K2 still matters at prefill 8k.
+
