@@ -366,6 +366,11 @@ def test_tuner_keeps_the_two_schedules_apart():
     the autotune key, and `cache_results` then persists whichever won.
     """
     kern = _flash_kda._flash_kda_segment_kernel
+    assert "NUM_SEGS_CLASS" in kern.keys, "the segment count left K2's autotune key"
+    # Triton builds a key, and fills `cache`, only when it has more than one
+    # config to choose between, so the rest of this needs a published shortlist.
+    if len(kern.configs) < 2:
+        pytest.skip("this arch publishes a single K2 schedule; the tuner never runs")
     args = make_inputs(1, 1024, 4)
     # An incoming state is what makes the two output passes otherwise identical:
     # without it the unsegmented one passes h_in=None and the key picks up the
@@ -388,6 +393,8 @@ def test_published_k2_schedules_can_split_their_tile():
     hold -- still correct, which is why nothing downstream catches it, and the
     pairs are now editable from a config file rather than derived.
     """
+    if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch never routes K2 to Gluon and publishes no schedules")
     reached = set()
     for W in (64, 128, 256):
         for num_segs in (1, 2, 8, 64, 512):
