@@ -30,8 +30,8 @@ from aiter.ops.triton.utils.tuned_config_utils import (
     get_tuned_kernel_config,
 )
 
-_FWD_FALLBACK = triton.Config({"PRE_LOAD_V": False}, num_warps=4, num_stages=1)
-_BWD_FALLBACK = triton.Config({}, num_warps=4, num_stages=1)
+_FWD_FALLBACK = triton.Config({"PRE_LOAD_V": False})
+_BWD_FALLBACK = triton.Config({})
 
 from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
     _calculate_scales,
