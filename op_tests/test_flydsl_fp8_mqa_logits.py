@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 import torch
+import triton
 
 import aiter
 from aiter import dtypes
@@ -404,6 +405,17 @@ def verify_fp8_mqa_logits(
     return ret
 
 
+_FLUSH_CACHE = None
+
+
+def _l2_flush_cache():
+    """The scratch buffer whose zeroing evicts the LLC, allocated once."""
+    global _FLUSH_CACHE
+    if _FLUSH_CACHE is None:
+        _FLUSH_CACHE = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+    return _FLUSH_CACHE
+
+
 def _captured_node_count(graph):
     """Captured node count, or None if this torch build does not expose it."""
     for attr in ("num_nodes", "_num_nodes"):
@@ -445,19 +457,28 @@ def _bench_graph_us(fn):
             "stream and was not captured"
         )
 
-    # Each sample brackets BENCH_REPLAYS back-to-back replays under one event
-    # pair and divides. Replays serialize on the stream FIFO, so this is serial
-    # device time; bracketing amortizes the per-replay event and dispatch cost.
+    # Each replay gets its own event pair, preceded by an LLC flush that stays
+    # outside that pair -- the same shape as Triton's `do_bench`.
+    #
+    # Replaying back-to-back without the flush instead leaves KV, the scales and
+    # the previous replay's output resident in the 256 MiB LLC. Everything is
+    # serialized on the stream FIFO, so the flush is complete before the replay
+    # it precedes starts, and its own cost falls outside the bracket.
+    cache = _l2_flush_cache()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(BENCH_REPLAYS)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(BENCH_REPLAYS)]
     samples = []
     for _ in range(BENCH_SAMPLES):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(BENCH_REPLAYS):
+        for i in range(BENCH_REPLAYS):
+            cache.zero_()
+            starts[i].record()
             graph.replay()
-        end.record()
+            ends[i].record()
         torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end) / BENCH_REPLAYS * 1000.0)  # ms -> us
+        # Mean within a sample (as do_bench reports), median across samples.
+        samples.append(
+            statistics.mean(s.elapsed_time(e) for s, e in zip(starts, ends)) * 1000.0
+        )  # ms -> us
     return statistics.median(samples)
 
 
@@ -690,7 +711,8 @@ def main():
         "--replay-iters",
         type=int,
         default=50,
-        help="graph replays bracketed under one event pair per sample",
+        help="individually timed graph replays per sample, each preceded by an\n"
+        "LLC flush (the flush itself is not timed)",
     )
     parser.add_argument(
         "--full",
@@ -785,8 +807,9 @@ def main():
         BENCH_SAMPLES = args.bench_samples
         BENCH_REPLAYS = args.replay_iters
         aiter.logger.info(
-            "fp8_mqa_logits: graph-replay timing, warmup=%d samples=%d "
-            "replays/sample=%d (us columns are medians)",
+            "fp8_mqa_logits: graph-replay timing with a per-replay LLC flush, "
+            "warmup=%d samples=%d replays/sample=%d (us columns are medians "
+            "over samples of the mean replay)",
             args.warmup,
             args.bench_samples,
             args.replay_iters,
