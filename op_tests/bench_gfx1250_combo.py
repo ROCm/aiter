@@ -179,8 +179,10 @@ step scans -- input + output/2 -- after CSA's 4x KV compression:
     16K in / 4K out  -> (16384 + 2048) / 4 =  4608
     32K in / 16K out -> (32768 + 8192) / 4 = 10240
 
-The DSv4 ``mla_v4_decode`` op runs sparse decode with GQA/H=128, batch=512 and
-q_seq=1 (M=512), sweeping KV lengths 256/512/1024 and split counts 1/2/4.
+The DSv4 ``mla_v4_decode`` op runs sparse decode with GQA/H=128, q_seq=1,
+batches 1/16/32/64/128/256/512/1024, KV lengths 140/256/512/1024/1152 and
+split counts 1/2/4. KV=140 is the HCA 1K-input/1K-output average-decode shape:
+128 SWA rows + floor((1024 + 512) / 128) compressed rows.
 
 The DSv4 ``mla_v4_prefill`` op runs eight performance cases at H=128 and
 D=512: compressed prefix-pool rows 4096/16384, crossed with dense/sparse CSR
@@ -642,13 +644,13 @@ _MLA_V4_KARGPRELD_SHAPES = [
 ]
 _MLA_V4_DSV4_SHAPES = [
     (128, 512, kv_seq_lens, num_kv_splits)
-    for kv_seq_lens in (256, 512, 1024, 1152)
+    for kv_seq_lens in (140, 256, 512, 1024, 1152)
     for num_kv_splits in (1, 2, 4)
 ] + [
     (128, tokens, kv_seq_lens, num_kv_splits)
     for tokens in _MLA_DECODE_TOKENS
     if tokens != 512
-    for kv_seq_lens in (256, 512, 1024, 1152)
+    for kv_seq_lens in (140, 256, 512, 1024, 1152)
     for num_kv_splits in (1, 2, 4)
 ]
 _MLA_V4_COMPARE_KEEP = [
