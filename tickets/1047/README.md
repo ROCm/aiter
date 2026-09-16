@@ -198,40 +198,41 @@ Kernel: `aiter/ops/flydsl/kernels/qsa/k1_family_a.py`. Public:
 `qsa_k1_family_a_block_ids`. Bound: 512 page-aligned slots (`L <= 2048` at
 `r=4`). No `[M, n_blocks]` score buffer. Expand still separate.
 
-GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality. After
-the FlyDSL authoring-guide audit, Q is staged once in LDS, BF16 K rows use
-128-bit buffer-copy fragments, and top-k uses a cooperative wave64 reduction.
-**Not a win claim** vs live AMD. This env still lacks
-`module_top_k_per_row.so`. These AMD microseconds are **not** the 2d bar.
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality. A static
+TV-layout tiled copy stages Q in LDS, BF16 K rows use 128-bit buffer-copy
+fragments, and a parallel bitonic merge keeps the best 512 of 1024 candidates.
+**Not a win claim** vs live AMD. This env still lacks `module_top_k_per_row.so`.
+These AMD microseconds are **not** the 2d bar.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 126.9 | 50.3 | 0 | 0 |
-| 8 | 512 | 128 | 127.8 | 62.4 | 0 | 0 |
-| 1 | 2048 | 512 | 500.1 | 49.5 | 0 | 0 |
-| 8 | 2048 | 512 | 506.0 | 58.2 | 0 | 0 |
+| 1 | 512 | 128 | 97.7 | 43.5 | 0 | 0 |
+| 8 | 512 | 128 | 102.0 | 54.5 | 0 | 0 |
+| 1 | 2048 | 512 | 117.1 | 51.0 | 0 | 0 |
+| 8 | 2048 | 512 | 121.5 | 67.4 | 0 | 0 |
 
 ## Phase 2b — family A FlyDSL K1 long-L merge
 
 Same kernel streams 512-slot tiles into a running LDS top-512. No global
 score matrix; no `topk_per_row_*` call. Expand still separate.
 
-GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality.
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality. Each
+tile is merged with the running top-512 by a 55-stage in-LDS bitonic network.
 **Not a win claim.** This env still lacks `module_top_k_per_row.so`.
 These AMD microseconds are **not** the 2d bar.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 796 | 50.6 | 0 | 0 |
-| 8 | 512 | 128 | 806 | 62.4 | 0 | 0 |
-| 1 | 2048 | 512 | 816 | 57.7 | 0 | 0 |
-| 8 | 2048 | 512 | 826 | 67.3 | 0 | 0 |
-| 1 | 8192 | 2048 | 3258 | 62.4 | 0 | 0 |
-| 8 | 8192 | 2048 | 3298 | 73.2 | 0 | 0 |
-| 1 | 32768 | 8192 | 13024 | 79.6 | 0 | 0 |
-| 8 | 32768 | 8192 | 13181 | 150.9 | 0 | 0 |
-| 1 | 131072 | 32768 | 52203 | 94.7 | 0 | 0 |
-| 8 | 131072 | 32768 | 52821 | 277.6 | 0 | 0 |
+| 1 | 512 | 128 | 97.7 | 43.5 | 0 | 0 |
+| 8 | 512 | 128 | 102.0 | 54.5 | 0 | 0 |
+| 1 | 2048 | 512 | 117.1 | 51.0 | 0 | 0 |
+| 8 | 2048 | 512 | 121.5 | 67.4 | 0 | 0 |
+| 1 | 8192 | 2048 | 459.8 | 56.0 | 0 | 0 |
+| 8 | 8192 | 2048 | 479.6 | 63.5 | 0 | 0 |
+| 1 | 32768 | 8192 | 1844.8 | 69.4 | 0 | 0 |
+| 8 | 32768 | 8192 | 1889.8 | 152.4 | 0 | 0 |
+| 1 | 131072 | 32768 | 7415.0 | 96.2 | 0 | 0 |
+| 8 | 131072 | 32768 | 7651.1 | 278.7 | 0 | 0 |
 
 
 
