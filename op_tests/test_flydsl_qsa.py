@@ -9,7 +9,7 @@ Two layers:
     ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
     ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table),
-    ``bench_qsa_family_b_k1`` (2e/2f emit; 2g long-``L`` tile merge).
+    ``bench_qsa_family_b_k1`` (2e/2f emit; 2g long-``L``; 2h published point).
 
 Usage::
 
@@ -739,6 +739,55 @@ def test_k1_family_b_set_equality_two_tiles_h8():
         )
 
 
+def test_k1_family_b_set_equality_published_indexer_point():
+    """#4882 published indexer point: M=32, H=4, D=128, page_size=8, n_blocks=512.
+
+    ``pages=512`` is 512 compressed keys packed at ``page_size=8`` (64 pages).
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_B_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 32, 2048, 8
+    n_blocks = seq_len // idx.compress_ratio
+    assert n_blocks == 512
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    assert index_cache.shape[0] == 64
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=idx.head_dim**-0.5,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_k1_family_b_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+    )
+    if _set_mismatch_ratio(ref_ids, got) != 0.0:
+        raise AssertionError(
+            "family B K1 published-indexer block-id set diverged from the oracle"
+        )
+
+
 @benchmark()
 def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads):
     """Family B FlyDSL K1 vs oracle set equality; us vs #4882 select.
@@ -1214,6 +1263,7 @@ def _run_unit_cases():
     test_k1_family_b_set_equality_short_decode_h8()
     test_k1_family_b_set_equality_two_tiles()
     test_k1_family_b_set_equality_two_tiles_h8()
+    test_k1_family_b_set_equality_published_indexer_point()
     aiter.logger.info("QSA oracle + K1 unit cases passed")
 
 
@@ -1388,6 +1438,14 @@ def main():
                 "QSA family B FlyDSL K1 H=8 summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
+
+        # #4882 published indexer point: M=32, H=4, page_size=8, n_blocks=512.
+        rows = [bench_qsa_family_b_k1(32, 2048, 8, dtype, 4)]
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "QSA family B FlyDSL K1 published indexer point (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
 
         rows = []
         for m, seq_len, page_size, index_heads in itertools.product(
