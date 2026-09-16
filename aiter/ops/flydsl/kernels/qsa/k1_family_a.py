@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K1 (SILOTIGER-1047 2b): paged ReLU-sum + tiled top-512.
+"""Family A FlyDSL QSA K1 (SILOTIGER-1047 2c): paged ReLU-sum + tiled top-512.
 
 Streams compressed index-K from the paged cache in 512-slot tiles, scores
 complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
+
+Decode (``M=1..8``) and prefill (``M=512``) share this instantiation: one
+wave64 block per query row. Prefill occupancy did not die relative to decode,
+so there is no second compile.
 """
 
 from functools import lru_cache
