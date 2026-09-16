@@ -28,7 +28,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import aiter.ops.triton.attention.unified_attention as ua
 from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
 from op_tests.flydsl_tests._common import assert_attn_close
-from op_tests.flydsl_tests.test_flydsl_unified_attention import _build
+from op_tests.flydsl_tests.test_flydsl_unified_attention import (
+    _build,
+    _shuffle_k_to_vectorized,
+    _shuffle_v_to_vectorized,
+)
 from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
@@ -198,6 +202,31 @@ def test_routes_across_shape_regimes(query_lens, kv_lens):
     assert seen.get("served") is True
 
 
+@pytest.mark.parametrize("vectorized", [True, False], ids=["5d-default", "4d-flag"])
+def test_cache_rank_routes_to_flydsl(vectorized):
+    """Cache rank overrides the flag for both K and V."""
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    _, k, v, _, _, _, _, _, _, _ = _build([256], [256], 64, 4)
+    if vectorized:
+        over = {"k": _shuffle_k_to_vectorized(k), "v": _shuffle_v_to_vectorized(v)}
+    else:
+        over = {"shuffled_kv_cache": True}
+
+    real = uak.flydsl_unified_attention
+    seen = {}
+
+    def spy(*a, **kw):
+        r = real(*a, **kw)
+        seen["served"] = r is not None
+        return r
+
+    with mock.patch.object(uak, "flydsl_unified_attention", spy):
+        got, want = _call_with_ref([256], [256], **over)
+    assert seen.get("served") is True
+    _assert_close(got, want)
+
+
 # --- 2. parity with Triton ---------------------------------------------------
 
 
@@ -263,6 +292,59 @@ def test_declined_configs_match_triton_bitwise(name):
         f"{name} was expected to fall through to Triton, but the result differs "
         "-- the support gate is letting an unsupported config through"
     )
+
+
+@pytest.mark.parametrize("query_len", [1, 256], ids=["decode", "prefill"])
+@pytest.mark.parametrize("vectorized", [False, True], ids=["linear", "vectorized"])
+def test_padded_block_table_declines_to_triton(query_len, vectorized):
+    """A compacting reshape must not invalidate the original row stride."""
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    query_lens, kv_lens = [query_len] * 2, [256] * 2
+    _, k, v, _, _, _, bt, _, _, _ = _build(query_lens, kv_lens, 64, 4)
+    storage = torch.full(
+        (bt.shape[0], bt.shape[1] + 3), -1, device=bt.device, dtype=bt.dtype
+    )
+    padded_bt = storage[:, : bt.shape[1]]
+    padded_bt.copy_(bt)
+    assert padded_bt.stride(0) > padded_bt.shape[1]
+    over = {"block_table": padded_bt}
+    if vectorized:
+        over.update(k=_shuffle_k_to_vectorized(k), v=_shuffle_v_to_vectorized(v))
+
+    real = uak.flydsl_unified_attention
+    seen = {}
+
+    def spy(*a, **kw):
+        r = real(*a, **kw)
+        seen["served"] = r is not None
+        return r
+
+    with mock.patch.object(uak, "flydsl_unified_attention", spy):
+        got, want = _call_with_ref(query_lens, kv_lens, **over)
+    assert seen.get("served") is False
+    _assert_close(got, want)
+
+
+@pytest.mark.parametrize("window_size", [(-1, 0), (-1, 32), (-2, -1)])
+def test_non_causal_bounded_window_declines(window_size):
+    """Declining is required even though the fallback is causal-only."""
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    real = uak.flydsl_unified_attention
+    seen = {}
+
+    def spy(*a, **kw):
+        r = real(*a, **kw)
+        seen["served"] = r is not None
+        return r
+
+    with (
+        mock.patch.object(uak, "flydsl_unified_attention", spy),
+        pytest.raises(AssertionError, match="Only causal attention is supported"),
+    ):
+        _call([256], [256], causal=False, window_size=window_size)
+    assert seen.get("served") is False
 
 
 @pytest.mark.parametrize("num_kv_heads", [64, 16, 4, 1])

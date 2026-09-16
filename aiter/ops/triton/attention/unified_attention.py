@@ -185,9 +185,15 @@ def unified_attention(
         assert q_scales is not None and q_scales.dtype == e4m3_dtype
         head_size = head_size * 2
 
-    if shuffled_kv_cache:
-        SCALE_K_WIDTH = 4
-        if kv_cache_dtype == torch.uint8:
+    SCALE_K_WIDTH = 4
+    if k.dim() == 5:
+        # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
+        # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
+        num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
+        shuffled_kv_cache = True
+    elif k.dim() == 4:
+        if shuffled_kv_cache and kv_cache_dtype == torch.uint8:
+            # Packed FP4 uses a distinct 4D shuffled layout.
             num_blocks, num_kv_heads, block_size, _ = k.shape
             K_WIDTH = 16
             SCALE_K = head_size // 16
@@ -195,14 +201,10 @@ def unified_attention(
                 min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
             )
         else:
-            # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
-            # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
-            num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
-    else:
-        # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
-        num_blocks, block_size, num_kv_heads, _ = k.shape
-        K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
-        SCALE_K_WIDTH = 4
+            # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
+            num_blocks, block_size, num_kv_heads, _ = k.shape
+            K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
+            shuffled_kv_cache = False
 
     if shuffled_kv_cache:
         # A shuffled tile is exactly one page (the kernels index the block table

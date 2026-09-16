@@ -504,6 +504,9 @@ def _strides_ok(
     # num_records bounds (init_descriptors), so Q and O must agree on it.
     if q.stride(0) != out.stride(0):
         return False
+    # Flattening must remain a view with the row stride passed to the kernel.
+    if block_table.stride(1) != 1 or block_table.stride(0) != block_table.shape[1]:
+        return False
     # `_run_compiled` launches on `q.reshape(-1)` / `out.reshape(-1)`, baking
     # the tensor's full memref into the kernel cache signature. A padded
     # (non-flattenable) layout would make reshape return a silent COPY --
@@ -524,10 +527,7 @@ def _strides_ok(
     if shuffled_kv_cache:
         if k.dim() != 5 or v.dim() != 5:
             return False
-        return (
-            _kv_strides_ok_5d(k, v, num_kv_heads, head_size)
-            and block_table.stride(1) == 1
-        )
+        return _kv_strides_ok_5d(k, v, num_kv_heads, head_size)
     if k.dim() != 4 or v.dim() != 4:
         return False
     page_row = num_kv_heads * head_size
@@ -536,7 +536,7 @@ def _strides_ok(
             return False
         if t.stride(1) != page_row or t.stride(0) != _PAGE_SIZE * page_row:
             return False
-    return block_table.stride(1) == 1
+    return True
 
 
 def _dispatch_mode_ok(window_size, block_table, skip_reduce) -> bool:
@@ -549,7 +549,7 @@ def _dispatch_mode_ok(window_size, block_table, skip_reduce) -> bool:
     against a torch reference, and ``_get_kernel``/``_strides_ok`` route a
     shuffled call to the vectorized builder and validate its 5D K/V shape.
     """
-    return window_size[0] < 0 and block_table is not None and not skip_reduce
+    return window_size == (-1, -1) and block_table is not None and not skip_reduce
 
 
 def _page_geometry_ok(block_size, max_seqlen_k) -> bool:
