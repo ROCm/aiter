@@ -530,7 +530,6 @@ def compile_conv3d_implicit(
 
     WGM = 1 if m_chunks > 1 else max(1, int(wgm))
     elem_ty = fx.BFloat16
-    mfma_fn = rocdl.mfma_f32_16x16x32_bf16
     temporal_only_fast = (
         kh == 1
         and kw == 1
@@ -665,20 +664,27 @@ def compile_conv3d_implicit(
         c_n = lane % MFMA_N
 
         Vec = fx.Vector
+        lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, TILE_K, elem_ty))
+        a_lds_div = fx.logical_divide(
+            a_lds.view(fx.make_layout(LDS_A_SIZE, 1)),
+            fx.make_layout(MFMA_A_VALUES, 1),
+        )
+        b_lds_div = fx.logical_divide(
+            b_lds.view(fx.make_layout(LDS_B_SIZE, 1)),
+            fx.make_layout(MFMA_B_VALUES, 1),
+        )
 
-        class Vec8Ty:
-            ir_type = Vec.make_type(8, elem_ty)
+        def zero_acc():
+            frag = fx.make_rmem_tensor(MFMA_C_VALUES, fx.Float32)
+            frag.fill(0.0)
+            return frag
 
-        acc0 = Vec.filled(MFMA_C_VALUES, 0.0, fx.Float32)
-        acc = [acc0 for _ in range_constexpr(N_ACC)]
+        acc = [zero_acc() for _ in range_constexpr(N_ACC)]
 
         def barrier(vmcnt=0, lgkmcnt=None):
             rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
             rocdl.s_barrier()
-
-        def lds_load_vec8(lds_array, elem_offset):
-            u8_ptr = fx.recast_iter(fx.Uint8, lds_array.ptr)
-            return fx.ptr_load(u8_ptr + fx.Int32(elem_offset * 2), result_type=Vec8Ty)
 
         def a_lds_off(stage, row, col):
             return (fx.Int64(stage) * TILE_M + row) * TILE_K + col
@@ -894,32 +900,32 @@ def compile_conv3d_implicit(
                     voff = g_off
                 _dma_to_lds(w_src, _lds_dma_ptr(b_lds, stage_tile, i), voff)
 
-        # ---- single-vec ds_read (LDS -> register), indexed by per-wave MFMA row ----
-        def read_a_vec(stage, mi):
+        # ---- single-atom LDS -> register copies, indexed by per-wave MFMA row ----
+        def read_a_frag(stage, mi):
             a_row = wave_m * WARP_M + mi * MFMA_M + lane_m
-            return lds_load_vec8(
-                a_lds, a_lds_off(stage, fx.Int64(a_row), fx.Int64(lane_k_a))
+            vec_idx = (
+                a_lds_off(stage, fx.Int64(a_row), fx.Int64(lane_k_a)) // MFMA_A_VALUES
             )
+            frag = fx.make_rmem_tensor(MFMA_A_VALUES, elem_ty)
+            fx.copy(lds_copy, fx.slice(a_lds_div, (None, vec_idx)), frag)
+            return frag
 
-        def read_b_vec(stage, ni):
+        def read_b_frag(stage, ni):
             b_row = wave_n * WARP_N + ni * MFMA_N + lane_n
-            return lds_load_vec8(
-                b_lds, b_lds_off(stage, fx.Int64(b_row), fx.Int64(lane_k_b))
+            vec_idx = (
+                b_lds_off(stage, fx.Int64(b_row), fx.Int64(lane_k_b)) // MFMA_B_VALUES
             )
-
-        def mfma_one(a_frag, b_frag, c_frag):
-            return mfma_fn(
-                T.vec(MFMA_C_VALUES, T.f32),
-                [a_frag, b_frag, c_frag, 0, 0, 0],
-            )
+            frag = fx.make_rmem_tensor(MFMA_B_VALUES, elem_ty)
+            fx.copy(lds_copy, fx.slice(b_lds_div, (None, vec_idx)), frag)
+            return frag
 
         def read_a_frags(stage):
-            frags = [read_a_vec(stage, mi) for mi in range_constexpr(MI_M)]
+            frags = [read_a_frag(stage, mi) for mi in range_constexpr(MI_M)]
             rocdl.sched_dsrd(MI_M)
             return frags
 
         def read_b_frags(stage):
-            frags = [read_b_vec(stage, ni) for ni in range_constexpr(MI_N)]
+            frags = [read_b_frag(stage, ni) for ni in range_constexpr(MI_N)]
             rocdl.sched_dsrd(MI_N)
             return frags
 
@@ -928,8 +934,12 @@ def compile_conv3d_implicit(
             for mi in range_constexpr(MI_M):
                 for ni in range_constexpr(MI_N):
                     idx = mi * MI_N + ni
-                    acc_values[idx] = mfma_one(
-                        a_frag_values[mi], b_frag_values[ni], acc_values[idx]
+                    fx.gemm(
+                        mma_atom,
+                        acc_values[idx],
+                        a_frag_values[mi],
+                        b_frag_values[ni],
+                        acc_values[idx],
                     )
                 rocdl.sched_mfma(MI_N)
             rocdl.s_setprio(0)
@@ -1010,7 +1020,7 @@ def compile_conv3d_implicit(
                 row_base = m_offset + wave_m * WARP_M + mi * MFMA_M + c_m_vec
                 for ni in range_constexpr(MI_N):
                     col, col_loc = _cols(ni)
-                    a = Vec(acc[mi * MI_N + ni])
+                    a = Vec(acc[mi * MI_N + ni].load())
                     if const_expr(has_bias and not use_splitk):
                         bias_val = bias_vals[ni]
 
