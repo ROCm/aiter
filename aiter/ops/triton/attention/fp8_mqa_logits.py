@@ -269,7 +269,7 @@ def fp8_mqa_logits(
                 # two KV tiles per loop body for the scheduler to interleave
                 "UNROLL": 2,
                 "RELAXED_STORE": relaxed_store,
-                "NUM_KV_SPLITS": num_kv_splits,
+                "HAS_KV_SPLIT": 1 if num_kv_splits > 1 else 0,
             }
             grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
@@ -294,6 +294,7 @@ def fp8_mqa_logits(
             logits_ptr=logits,
             seq_len=seq_len,
             seq_len_kv=seq_len_kv,
+            num_kv_splits=num_kv_splits,
             NUM_HEADS=num_heads,
             HEAD_SIZE=head_size,
             stride_q_s=stride_q_s,

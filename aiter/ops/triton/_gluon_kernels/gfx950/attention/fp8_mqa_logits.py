@@ -886,7 +886,7 @@ _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
         "M_CHUNK",
         "UNROLL",
         "RELAXED_STORE",
-        "NUM_KV_SPLITS",
+        "HAS_KV_SPLIT",
     ],
 )
 
@@ -902,6 +902,7 @@ def _gluon_fp8_mqa_logits_kernel(
     logits_ptr,  # fp32   [seq_len, seq_len_kv]
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
+    num_kv_splits: gl.int32,  # runtime value to remove unexpected compilations
     NUM_HEADS: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     stride_q_s: gl.int32,
@@ -925,7 +926,7 @@ def _gluon_fp8_mqa_logits_kernel(
     M_CHUNK: gl.constexpr = 0,  # heads folded per MFMA group (0 = whole tile)
     UNROLL: gl.constexpr = 1,  # KV tiles per loop body (1 = backend default)
     RELAXED_STORE: gl.constexpr = 0,  # BLOCK_M > 1: drop the per-row store mask
-    NUM_KV_SPLITS: gl.constexpr = 1,  # workgroups sharing one query row block
+    HAS_KV_SPLIT: gl.constexpr = 0,  # 1 when num_kv_splits > 1
 ):
 
     gl.static_assert(
@@ -960,7 +961,7 @@ def _gluon_fp8_mqa_logits_kernel(
     stride_logits_s = stride_logits_s.to(gl.int64)
 
     # a split re-reads Q and the weights once per split, so keep them in L1
-    Q_CACHE: gl.constexpr = "" if NUM_KV_SPLITS > 1 else ".cg"
+    Q_CACHE: gl.constexpr = "" if HAS_KV_SPLIT else ".cg"
 
     WARP_SIZE: gl.constexpr = 64
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -1002,9 +1003,9 @@ def _gluon_fp8_mqa_logits_kernel(
         union_start = start_ind
         union_end = end_ind
 
-    if NUM_KV_SPLITS > 1:
+    if HAS_KV_SPLIT:
         tiles = (union_end - union_start + BLOCK_KV - 1) // BLOCK_KV
-        tiles_per_split = (tiles + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
+        tiles_per_split = (tiles + num_kv_splits - 1) // num_kv_splits
         split_start = union_start + split_id * tiles_per_split * BLOCK_KV
         if split_start >= union_end:
             return  # row shorter than the split count reaches
@@ -1094,7 +1095,7 @@ def _gluon_fp8_mqa_logits_kernel(
         w_blocks = (w_block, w_block1)
         row_starts = (start_ind, start_ind1)
         row_ends = (end_ind, end_ind1)
-        if NUM_KV_SPLITS > 1:
+        if HAS_KV_SPLIT:
             # This store mask is absolute, and the loop's tail peel runs one
             # tile past the split. Without the clamp that tile would land on
             # the next split's first tile.
