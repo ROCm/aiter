@@ -26,7 +26,6 @@ import os
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton.arch_info import is_cdna4
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.tuned_config_utils import (
     autotune_configs,
@@ -65,71 +64,6 @@ FIXED_BLOCK_M = 64
 FIXED_BLOCK_N = 64
 
 
-def get_shape_from_layout(
-    q,
-    k,
-    v,
-    layout,
-    cu_seqlens_q=None,
-    cu_seqlens_k=None,
-    max_seqlen_q=None,
-    max_seqlen_k=None,
-):
-    if layout == "bhsd":
-        batch_q, nheads_q, max_seqlen_q, head_size_q = q.shape
-        batch_k, nheads_k, max_seqlen_k, head_size_k = k.shape
-        _batch_v, _nheads_v, _max_seqlen_v, head_size_v = v.shape
-    elif layout == "bshd":
-        batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
-        batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
-        _batch_v, _max_seqlen_v, _nheads_v, head_size_v = v.shape
-    elif layout == "thd":
-        batch_q, nheads_q, head_size_q = (
-            len(cu_seqlens_q) - 1,
-            q.shape[1],
-            q.shape[2],
-        )
-        batch_k, nheads_k, head_size_k = (
-            len(cu_seqlens_k) - 1,
-            k.shape[1],
-            k.shape[2],
-        )
-        _batch_v, _max_seqlen_v, _nheads_v, head_size_v = (
-            len(cu_seqlens_k) - 1,
-            max_seqlen_k,
-            v.shape[1],
-            v.shape[2],
-        )
-    else:
-        assert False, "Got unsupported layout."
-
-    # assert
-    assert batch_q == batch_k
-    assert head_size_q == head_size_k
-
-    return (
-        batch_q,
-        nheads_q,
-        nheads_k,
-        head_size_q,
-        head_size_v,
-        max_seqlen_q,
-        max_seqlen_k,
-    )
-
-
-def get_strides_from_layout(q, layout):
-    if layout == "thd":
-        q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
-    elif layout == "bhsd":
-        q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
-    elif layout == "bshd":
-        q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
-    else:
-        assert False, "Got unsupported layout."
-    return q_strides
-
-
 def get_padded_headsize(size):
     # Get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (size - 1).bit_length()
@@ -137,45 +71,6 @@ def get_padded_headsize(size):
     # kernel is padded - there is no padding in memory for any dims.
     padded_d_model = max(padded_d_model, 16)
     return padded_d_model
-
-
-def get_input_shapes():
-    cases = [(max(1, 2 ** (16 - i)), 1, 2**i, 16, 1, 128) for i in range(8, 18)] + [
-        (max(1, 2 ** (16 - i)), 1, 2**i, 16, 2, 128) for i in range(8, 18)
-    ]
-    return cases
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-def is_cdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
-        "gfx950",
-        "gfx940",
-        "gfx941",
-        "gfx942",
-        "gfx90a",
-        "gfx908",
-    )
-
-
-def is_rdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
-        "gfx1030",
-        "gfx1100",
-        "gfx1101",
-        "gfx1102",
-        "gfx1200",
-        "gfx1201",
-    )
-
-
-def get_tl_f8_bwd_dtype():
-    if USE_FP8E5M2_BWD:
-        return tl.float8e5b16 if is_hip() and not is_cdna4() else tl.float8e5
-    return tl.float8e4b8 if is_hip() and not is_cdna4() else tl.float8e4nv
 
 
 @triton.jit
@@ -1009,15 +904,6 @@ def attn_fwd(
     if PADDED_HEAD_V:
         o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
     tl.store(o_ptrs, acc.to(Out.type.element_ty), mask=o_ptrs_mask)
-
-
-def get_padded_head_dim(head_size: int):
-    # Get closest power of 2 over or equal to 32.
-    padded_d_model = 1 << (head_size - 1).bit_length()
-    # Smallest head_dim supported is 16. If smaller, the tile in the
-    # kernel is padded - there is no padding in memory for any dims.
-    padded_d_model = max(padded_d_model, 16)
-    return padded_d_model
 
 
 _compute_fp8_scaling_factors_repr = make_kernel_repr(
