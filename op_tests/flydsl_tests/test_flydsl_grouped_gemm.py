@@ -575,12 +575,14 @@ def _gemm_work_metrics(
     inter_dim: int,
     data_format: str,
 ) -> dict[str, tuple[float, float]]:
-    """Return conventional GEMM FLOPs and effective bytes for both stages.
+    """Return conventional GEMM FLOPs and effective fused-MoE bytes.
 
     The byte model matches the grouped-MoE tuner: logical quantized inputs and
-    weights plus BF16 outputs. It excludes routing, quantization, scales, bias,
-    and other fused-MoE auxiliary traffic, so the reported bandwidth is an
-    effective GEMM bandwidth rather than measured HBM transactions.
+    weights, their E8M0 block scales, and BF16 outputs. GEMM1 counts the
+    post-activation output, whose width is ``inter_dim``; GEMM2 counts its
+    per-route output before gather-reduce. The model excludes routing,
+    quantization, bias, and other fused-MoE auxiliary traffic, so the reported
+    bandwidth is effective bandwidth rather than measured HBM traffic.
     """
     input_bytes = 0.5 if data_format == "a4w4" else 1.0
     weight_bytes = 0.5
@@ -591,14 +593,18 @@ def _gemm_work_metrics(
     gemm1_flops = routed_rows * stage1_n * model_dim * 2
     gemm1_bytes = (
         routed_rows * model_dim * input_bytes
-        + routed_rows * stage1_n * output_bytes
+        + routed_rows * model_dim // SCALE_BLOCK
+        + routed_rows * inter_dim * output_bytes
         + experts * model_dim * stage1_n * weight_bytes
+        + experts * model_dim * stage1_n // SCALE_BLOCK
     )
     gemm2_flops = tokens * topk * model_dim * inter_dim * 2
     gemm2_bytes = (
         tokens * topk * inter_dim * input_bytes
-        + tokens * model_dim * output_bytes
+        + routed_rows * inter_dim // SCALE_BLOCK
+        + routed_rows * model_dim * output_bytes
         + experts * inter_dim * model_dim * weight_bytes
+        + experts * inter_dim * model_dim // SCALE_BLOCK
     )
     return {
         "gemm1": (gemm1_flops, gemm1_bytes),

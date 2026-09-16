@@ -6,7 +6,9 @@ import os
 import sys
 from dataclasses import dataclass, field
 
-_A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
+_A16W16_CO_TAGS = frozenset(
+    {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
+)
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).
@@ -234,13 +236,14 @@ class OpusGemmInstance:
             # can distinguish two pre-built images in this stable name.
             parts.insert(
                 tag_at,
-                (
-                    "4wave_wl_co"
-                    if self.kernel_tag == "a16w16_4wave_wl_co"
-                    else "4wave_co"
-                ),
+                {
+                    "a16w16_4wave_wl_co": "4wave_wl_co",
+                    "a16w16_4wave_wlr_co": "4wave_wlr_co",
+                }.get(self.kernel_tag, "4wave_co"),
             )
-            if self.kernel_tag == "a16w16_4wave_wl_co":
+            # Wave layout only shows up for the families that can vary it, so the
+            # 4wave_co names already on disk are untouched.
+            if self.kernel_tag in ("a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"):
                 parts.append(f"w{self.co_wave_layout[0]}x{self.co_wave_layout[1]}")
             parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
             parts.append(f"p{self.num_slots}")
@@ -1968,6 +1971,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a16w16_clusterlaunch_tdm_splitk_ws",
                 "a16w16_4wave_co",
                 "a16w16_4wave_wl_co",
+                "a16w16_4wave_wlr_co",
             }
         ),
         "a8w8": frozenset(),

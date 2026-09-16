@@ -96,7 +96,9 @@ GFX1250_SPLITK_BIAS = 0.02  # tiny per-extra-split bias (splitk stays dynamic)
 GFX1250_SPLITK_WINDOW_HI_MULT = 4
 GFX1250_CO_TOP_TILES = 6
 GFX1250_CO_TOP_CLUSTERS = 6
-_A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
+_A16W16_CO_TAGS = frozenset(
+    {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
+)
 
 # Tune-time host helpers (defined here, not in opus_gemm_common.py).
 

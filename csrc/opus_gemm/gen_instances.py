@@ -1185,6 +1185,11 @@ if __name__ == "__main__":
             for kid, instance in gfx1250_4wave_co_kernels_list.items()
             if instance.kernel_tag == "a16w16_4wave_wl_co"
         },
+        "a16w16_4wave_wlr_co": {
+            kid: instance
+            for kid, instance in gfx1250_4wave_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_wlr_co"
+        },
     }
 
     # --- Compute the subset-compile set S ------------------------------------ S = (CSV opus rows'

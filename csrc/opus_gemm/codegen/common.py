@@ -30,7 +30,11 @@ _GFX942_A16W16_TAGS = (
     )
     + _NOSPLIT
 )
-_A16W16_CO_TAGS = ("a16w16_4wave_co", "a16w16_4wave_wl_co")
+_A16W16_CO_TAGS = (
+    "a16w16_4wave_co",
+    "a16w16_4wave_wl_co",
+    "a16w16_4wave_wlr_co",
+)
 _A16W16_TAGS = (
     "a16w16",
     "a16w16_flatmm",

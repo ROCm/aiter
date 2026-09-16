@@ -151,10 +151,10 @@ def test_co_manifest_uses_supported_architecture_keys():
 
 
 def test_gfx1250_co_registry_and_launch_contract():
-    assert len(gfx1250_4wave_co_kernels_list) == 219
+    assert len(gfx1250_4wave_co_kernels_list) == 221
     assert GFX1250_4WAVE_CO_KIDS == frozenset(gfx1250_4wave_co_kernels_list)
     assert min(GFX1250_4WAVE_CO_KIDS) == 21016
-    assert max(GFX1250_4WAVE_CO_KIDS) == 21315
+    assert max(GFX1250_4WAVE_CO_KIDS) == 21317
     assert GFX1250_4WAVE_CO_KIDS <= NON_SPLITK_KIDS
     assert GFX1250_4WAVE_CO_KIDS <= DEFAULT_COMPILED_KIDS_BY_ARCH[GFX1250]
     assert GFX1250_4WAVE_CO_KIDS.isdisjoint(SPLITK_KIDS)
@@ -162,6 +162,7 @@ def test_gfx1250_co_registry_and_launch_contract():
     assert {
         "a16w16_4wave_co",
         "a16w16_4wave_wl_co",
+        "a16w16_4wave_wlr_co",
     } <= OPUS_KERNEL_TAGS_BY_ARCH_FAMILY[GFX1250]["a16w16"]
 
     kid = min(GFX1250_4WAVE_CO_KIDS)
@@ -235,7 +236,7 @@ def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):
     symbols_by_kid = {
         kid: instance.name for kid, instance in gfx1250_4wave_co_kernels_list.items()
     }
-    assert len(set(symbols_by_kid.values())) == 219
+    assert len(set(symbols_by_kid.values())) == 221
 
     for instance in gfx1250_4wave_co_kernels_list.values():
         image = Path(co_image_path(CO_KERNELS_JSON, instance))
@@ -245,7 +246,7 @@ def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):
 
     image_dir = Path(CO_KERNELS_JSON).parent / GFX1250
     build_info = json.loads((image_dir / "build_info.json").read_text())
-    assert len(build_info["kernels"]) == 219
+    assert len(build_info["kernels"]) == 221
     assert {entry["kernarg_segment_size"] for entry in build_info["kernels"]} == {64}
     assert {
         entry["kid"]: entry["symbol"] for entry in build_info["kernels"]
