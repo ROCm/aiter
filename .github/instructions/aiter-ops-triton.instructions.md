@@ -212,6 +212,36 @@ values for either backend live in JSON, never in Python. Flag:
   that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
   fallback is the one documented exception and it goes through the `arch=`
   override, not through a probe.
+- A raw config list handed to `@triton.autotune`. Route it through
+  `autotune_configs` from `aiter.ops.triton.utils.tuned_config_utils`:
+
+  ```python
+  @triton.autotune(
+      configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+      key=[...],
+  )
+  ```
+
+  That returns every candidate only while `<FAMILY>_TRITON_AUTOTUNE=1`, and a
+  single config otherwise, so nothing benchmarks at launch. A raw list searches
+  on every new key: it costs compile time, breaks CUDA-graph capture, and leaves
+  a unit test's numerics dependent on whichever config the timing happened to
+  pick that run. Pass `default_config=` when the list's first entry is not the
+  one to pin.
+
+  A family that already published its own variable name keeps it by passing
+  `env=` (and `default=` for what unset means), as `flash_attn_triton_amd/` does
+  with `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE` — it still goes through this helper.
+
+  What is being forbidden is an *unbounded* list: a Python grid handed straight
+  to `@triton.autotune`, nothing keyed, nothing published. A shortlist read from
+  the config JSON and dispatched on the autotune key is fine as it stands —
+  `flash_kda_segment_kernel` keys on `NUM_SEGS_CLASS` because the best `BW`
+  moves with the segment count, and the kernel records a 2.3x penalty for
+  choosing wrong, so those candidates are a validated per-shape dispatch rather
+  than a search. Do not collapse one to a single config: Triton consults its
+  autotune cache only when the list holds more than one entry, so a one-element
+  list stops the `key` being read at all.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 

@@ -239,6 +239,57 @@ single default tile per arch via
 kernel_name, fallback, backend)`, which reads the nested-layout
 `DEFAULT.json`. The `fallback` must be launchable on any arch, not fast on one.
 
+### Autotune search spaces — `autotune_configs()`
+
+Every `@triton.autotune` takes its config list from
+`utils/tuned_config_utils.py::autotune_configs(family, configs,
+default_config=None, env=None, default="0")`. Never hand it a raw list:
+
+```python
+@triton.autotune(
+    configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+    key=[...],
+)
+```
+
+It returns every candidate while `<FAMILY>_TRITON_AUTOTUNE=1`, and exactly one
+config otherwise, so nothing benchmarks at launch. A raw list searches on every
+new key: it costs compile time, breaks CUDA-graph capture, and leaves a unit
+test's numerics dependent on whichever config the timing happened to pick that
+run. Which one gets pinned is `configs[0]` unless `default_config=` says
+otherwise, and that default should come from `get_tuned_kernel_config` so
+retuning it is a JSON edit rather than a code change.
+
+`env=` names the variable for a family that published its own before this
+convention existed, and `default=` is what an unset variable means for it —
+together they let such a family route through this helper without changing what
+it did before. `flash_attn_triton_amd/` uses both, for
+`FLASH_ATTENTION_TRITON_AMD_AUTOTUNE`, which is on by default where every other
+family is off. This covers the kernel that applies `triton.autotune()` as a call
+rather than a decorator too (`_triton_kernels/fusions/attn_res.py`, behind
+`ATTN_RES_TRITON_AUTOTUNE=1`) — a grep for the decorator misses that one.
+
+The one other shape a config list may take is a **published, key-dispatched
+shortlist**: candidates read from the config JSON and selected per autotune key,
+as `flash_kda_segment_kernel` does through
+`chunk_delta_attn_tuned_config_shortlist`. Its `key` carries `NUM_SEGS_CLASS`
+because the best `BW` moves with the segment count — the kernel records a 2.3x
+penalty for getting that wrong — so the candidates are a validated per-shape
+dispatch, not a search, and collapsing them to one would be a regression. What
+the rule forbids is an *unbounded* list: a Python grid handed straight to
+`@triton.autotune` with nothing keyed and nothing published.
+
+Collapsing such a shortlist is not a silent no-op, either. Triton consults its
+autotune cache only when the config list holds more than one entry; with one
+entry it takes `configs[0]` and never reads the `key` at all. Routing this
+kernel through `autotune_configs` therefore stops `NUM_SEGS_CLASS` from being
+consulted and leaves the cache empty, which is what
+`test_tuner_keeps_the_two_schedules_apart` fails on.
+
+The unit tests do not rely on any of it: `op_tests/triton_tests/__init__.py`
+pins one config per kernel for the whole suite, so a test's numerics never
+depend on a benchmark.
+
 ### Config naming
 
 | Kind             | Pattern                                                        |
