@@ -13,7 +13,7 @@ the gather, a row range handed to the backend that reads it as a whole-row
 selection, and a `sorted_index` that reordered the indices without the values --
 and all three returned plausible tensors. Each has an assertion here.
 
-    python op_tests/test_topk_select.py
+    python op_tests/topk/test_topk_select.py
 """
 
 import argparse

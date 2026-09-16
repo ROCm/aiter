@@ -3,11 +3,11 @@
 """End-to-end regression of gemm_a16w16_opus vs torch.bmm; prints TFLOPs.
 
 Usage:
-    python3 op_tests/test_opus_a16w16_gemm.py [-m M -n N -k K -b B]
-    python3 op_tests/test_opus_a16w16_gemm.py --csv_file <shape_csv>
+    python3 op_tests/gemm/test_opus_a16w16_gemm.py [-m M -n N -k K -b B]
+    python3 op_tests/gemm/test_opus_a16w16_gemm.py --csv_file <shape_csv>
 
     # opus-only sweep in CUDA-graph mode, golden-checked (default entry):
-    python3 op_tests/test_opus_a16w16_gemm.py --opus_sweep -n 2048 -k 7168
+    python3 op_tests/gemm/test_opus_a16w16_gemm.py --opus_sweep -n 2048 -k 7168
 """
 
 import argparse
@@ -554,7 +554,7 @@ if __name__ == "__main__":
 
     # Default action (no -m and no --csv_file): auto-sweep the opus shapes in
     # CUDA-graph mode and print the vs-CSV latency table. So a bare
-    # `python3 op_tests/test_opus_a16w16_gemm.py` reproduces the table.
+    # `python3 op_tests/gemm/test_opus_a16w16_gemm.py` reproduces the table.
     run_opus_sweep = args.opus_sweep or (args.m is None and args.csv_file is None)
 
     if run_opus_sweep:

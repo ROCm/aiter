@@ -7,7 +7,7 @@ The stable contract for DSA + tensor parallel: identical input -> identical,
 ascending-index-ordered, smallest-index tie-broken output, run after run and
 byte-identical across ranks.
 
-    python op_tests/test_topk_per_row_stable.py
+    python op_tests/topk/test_topk_per_row_stable.py
 """
 
 import argparse

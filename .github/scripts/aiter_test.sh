@@ -129,7 +129,7 @@ for file in "${sharded_files[@]}"; do
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
-        op_tests/test_gemm_a6w6.py)
+        op_tests/gemm/test_gemm_a6w6.py)
             {
                 echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
             } | tee -a latest_test.log
