@@ -362,6 +362,21 @@ Times are **not** a win claim (2h). ``H=8`` is 2f; long-`L` is 2g.
 | 8 | 512 | 128 | 3.0 | 15.7 | 15.7 | 0 |
 | 1 | 2048 | 512 | 2.0 | 10.3 | 10.3 | 0 |
 | 8 | 2048 | 512 | 3.0 | 11.4 | 11.4 | 0 |
+
+- [x] **2f.** Family B ``H=8`` is a **second compile**, same emit path as 2e
+      (``n_blocks <= 512``), oracle set equality; `us` vs #4882 Triton and
+      Gluon recorded without a win claim.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Set equality `err=0`.
+``qsa_k1_family_b_block_ids`` dispatches ``H`` from ``q.shape[1]``. Times
+are **not** a win claim (2h). Long-`L` is 2g.
+
+| m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 1 | 512 | 128 | 1.5 | 11.0 | 10.3 | 0 |
+| 8 | 512 | 128 | 2.4 | 13.7 | 12.9 | 0 |
+| 1 | 2048 | 512 | 1.5 | 8.9 | 8.2 | 0 |
+| 8 | 2048 | 512 | 2.4 | 9.8 | 9.1 | 0 |
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.
 - [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;
