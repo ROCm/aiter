@@ -232,7 +232,7 @@ def _combined_routing(
         if tl.load(ExpertHist + pid) == 0:
             return
 
-    _expt_data_compute_stage1(
+    tile_start = _expt_data_compute_stage1(
         pid,
         ExpertHist,
         n_expts_tot,
@@ -247,7 +247,9 @@ def _combined_routing(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2(
+            pid, ExpertHist, tile_start, MDTileInfo, tile_dim_log2
+        )
     else:
         pid -= blocks1a
         _routing_compute_indx(
@@ -337,7 +339,7 @@ def _combined_routing_fused(
         if n_tokens == 0:
             return
 
-    _expt_data_compute_stage1(
+    tile_start = _expt_data_compute_stage1(
         pid,
         ExpertHist,
         N_EXPTS_TOT,
@@ -352,7 +354,7 @@ def _combined_routing_fused(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2_fused(pid, ExpertHist, TileStart, MDTileInfo)
+        _expt_data_compute_stage2_fused(pid, ExpertHist, tile_start, MDTileInfo)
     else:
         _routing_compute_indx_fused(
             GatherIndx,
@@ -482,7 +484,9 @@ def _ep_gate_prep_scan_kernel(
         tl.store(Hist + bins, h)
         # Exclusive prefix over bins == where each expert's run starts. The
         # scatter takes this as its initial cursor and bumps it per gate.
-        tl.store(Cursor + bins, tl.cumsum(h, 0) - h)
+        bin_base = tl.cumsum(h, 0) - h
+        tl.store(Cursor + bins, bin_base)
+        tl.store(TokenStart + bins, bin_base, mask=bins < N_EXPTS)
         # Re-arm the scratch for the next call. Safe here and only here: drawing
         # the last ticket means every other CTA is done with both buffers.
         tl.store(HistAtomic + bins, 0)
@@ -494,6 +498,7 @@ def _ep_gate_prep_scan_kernel(
         # writes and the 0xFFFFFFFF tail memset, which are exactly what the
         # `pid == 0` guard inside it selects. One CTA is enough -- letting all
         # N_EXPTS of them recompute the identical prefix sums buys nothing.
+        n_rows = tl.sum(tl.where(bins < N_EXPTS, h, 0), 0)
         _expt_data_compute_stage1(
             0,
             Hist,
@@ -502,7 +507,7 @@ def _ep_gate_prep_scan_kernel(
             TileStart,
             MDTileInfo,
             max_num_tiles,
-            n_gates,
+            n_rows,
             tile_dim_log2,
             BLOCK_A,
             EQUAL_A,
@@ -588,6 +593,7 @@ def _ep_scatter_atomic_expt_data_kernel(
             dst = origin_pe * PEER_ROWS + origin_lid * TOPK + k
             tl.store(DstRow + pos, dst.to(tl.int32), mask=live)
     else:
+        tile_start = tl.load(TileStart + pid)
         # Last statement in the branch on purpose: stage2 early-returns for empty
         # experts, so nothing may follow it.
-        _expt_data_compute_stage2(pid, Hist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2(pid, Hist, tile_start, MDTileInfo, tile_dim_log2)

@@ -19,14 +19,12 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
-from aiter.ops.triton.moe.quant_moe import (
-    downcast_to_mxfp,
-    upcast_from_mxfp,
-)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 
 def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
@@ -226,6 +224,8 @@ class Case:
             Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
             Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
+            Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
         ]
     ],
 )

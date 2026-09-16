@@ -9,18 +9,17 @@ import re
 
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled as _dispatch_compiled,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    ptr_arg,
+)
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
 # HIP limits grid.y/grid.z to 65535.
 _HIP_MAX_GRID_DIM_Y = 65535
-
-
-def _get_dtypes():
-    from aiter.utility import dtypes
-
-    return dtypes
 
 
 @functools.lru_cache(maxsize=256)
@@ -34,7 +33,7 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
 
     logger.warning(
         "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
-        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "
+        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape -- any tuned "
         "config naming tile=%d here actually runs %d.",
         axis,
         requested,
@@ -110,6 +109,11 @@ def requires_flydsl_stage2_reduce(
 ) -> bool:
     """Return whether stage2 atomic output exceeds 32-bit byte offsets."""
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
+
+
+def requires_flydsl_stage2_global_a(a: torch.Tensor) -> bool:
+    """Return whether A's stored bytes reach the 4 GiB buffer descriptor limit."""
+    return a.numel() * a.element_size() >= (1 << 32)
 
 
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
@@ -724,6 +728,7 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mode: str = "atomic",
+    use_global_a: bool = True,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -770,6 +775,7 @@ def compile_flydsl_moe_stage2(
             sort_block_m=sort_block_m,
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
+            use_global_a=use_global_a,
             cu_num_mul=cu_num_mul,
             # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
             # from the kernel-name parser. They are accepted as ignored
@@ -921,6 +927,7 @@ def _s2_args_fp4(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -947,6 +954,7 @@ def _s2_args_fp4(
         ptr_arg(num_valid_ids),
         ptr_arg(_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,
@@ -991,29 +999,8 @@ def _s2_args_std(
 
 
 def _run_compiled(exe, args):
-    """JIT-compile on first call, then dispatch via cached CompiledFunction."""
-    import flydsl.compiler as flyc
-
-    cf = getattr(exe, "_cf", None)
-    if cf is not None:
-        cf(*args)
-        return
-    try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
-    except Exception:
-        # JitFunction.__call__ leaks ir.Context on compilation failure,
-        # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext → gpu_module_body error).
-        # Clean up leaked contexts to isolate failures.
-        try:
-            from flydsl._mlir import ir
-
-            while ir.Context.current is not None:
-                ir.Context.current.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001,S110 - best-effort context cleanup
-            pass
-        raise
+    """Tuple-argument adapter for the existing MoE and AOT launch callers."""
+    return _dispatch_compiled(exe, *args)
 
 
 _S2_LEGACY_FP8_SCALE_BLK = 8
@@ -1051,7 +1038,7 @@ def _run_moe_reduction(
         _reduce_dtype_str = None
 
     if _reduce_dtype_str is None:
-        # Unsupported dtype for the masked kernel — fall back to torch.sum.
+        # Unsupported dtype for the masked kernel -- fall back to torch.sum.
         # This drops the EP mask, so only valid for non-EP runs.
         if use_mask:
             raise NotImplementedError(
@@ -1096,7 +1083,7 @@ def _run_moe_reduction(
     )
     if stream is None:
         stream = torch.cuda.current_stream()
-    # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
+    # expert_mask is sized by the global expert count (!= w2.shape[0] under EP).
     num_experts = int(expert_mask.numel()) if use_mask else 0
     reduce_exe = compile_moe_reduction(
         topk=topk,
@@ -1137,7 +1124,7 @@ def _run_moe_reduction(
 # largest legal tile_n that divides the required N dims, and (b) zero-pad
 # activations, weights and scales on the K dim to the next multiple of
 # tile_k. Zero padding is algebraically safe for mx-quantized GEMM (the
-# extra K-slice contributes 0·anything = 0), and is cheap relative to the
+# extra K-slice contributes 0 * anything = 0), and is cheap relative to the
 # kernel cost (~2% for 2944 vs 2880).
 # ---------------------------------------------------------------------------
 
@@ -1504,7 +1491,7 @@ def _flydsl_moe_stage1_impl(
     _need_fp8 = out_dtype == "fp8"
     _fuse_any_quant = _need_fp4 or _need_fp8
     _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
-    dtypes = _get_dtypes()
+    from aiter.utility import dtypes
 
     if _need_fp4:
         torch_out_dtype = dtypes.fp4x2
@@ -2106,7 +2093,13 @@ def _flydsl_moe_stage2_impl(
             )
         return out
 
+    if inter_states.ndim != 3:
+        raise ValueError(
+            "stage2 intermediate must be 3D "
+            f"[token_num, topk, inter_dim], got shape={tuple(inter_states.shape)}"
+        )
     token_num = inter_states.shape[0]
+    x_rows = inter_states.shape[0] * inter_states.shape[1]
     E = w2.shape[0]
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
@@ -2235,6 +2228,7 @@ def _flydsl_moe_stage2_impl(
             sw,
             num_valid_ids,
             token_num,
+            x_rows,
             _n_in,
             _k_in,
             m_blocks,
@@ -2275,6 +2269,7 @@ def _flydsl_moe_stage2_impl(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=requires_flydsl_stage2_global_a(inter_states),
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
@@ -2297,8 +2292,8 @@ def _flydsl_moe_stage2_impl(
             token_num,
             topk,
             model_dim,
-            expert_mask,
-            topk_ids,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
@@ -2988,6 +2983,38 @@ def _get_compiled_fused_quant_preshuffle(
 
 
 _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
+# Below this the route-ksplit kernel wins: both split along K, but one warp per
+# token cannot fill a grid out of a handful of tokens whatever the split, while
+# one warp per route starts with topk times as many.
+_TOKEN_MULTIDEST_MIN_TOKENS = 64
+# Every destination costs a buffer descriptor held live across the store pass,
+# so the saving stops being free once they crowd the register budget.
+_TOKEN_MULTIDEST_MAX_TOPK = 8
+
+
+@functools.cache
+def _get_compiled_token_multidest_quant(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    quant_mode: str,
+    row_major_scale: bool = False,
+    tdm_hidden_chunks: int = 4,
+    ksplit: int = 1,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_token_multidest_quant_module,
+    )
+
+    return build_moe_token_multidest_quant_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        topk=topk,
+        quant_mode=quant_mode,
+        row_major_scale=row_major_scale,
+        tdm_hidden_chunks=tdm_hidden_chunks,
+        ksplit=ksplit,
+    )
 
 
 @functools.cache
@@ -3037,6 +3064,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # ``quant_mode``: the sender already quantized, so the kernel only scatters
     # + preshuffles.
     prequantized_scale: torch.Tensor | None = None,
+    # When True, write the e8m0 scale as (row, feat_dim//32) instead of the
+    # 16-row-interleaved WMMA form. The consuming GEMM must be built with
+    # row_major_ascale so it does the interleave on its LDS->register read.
+    row_major_scale: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -3129,6 +3160,52 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
+        token_num = numel // int(source_topk) if source_topk > 0 else 0
+        use_token_multidest = (
+            not prequantized
+            and not remap_rows
+            and num_valid_routes is None
+            and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
+            and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
+            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
+            in ("1", "true", "True")
+        )
+        if row_major_scale and not use_token_multidest:
+            raise ValueError(
+                "row_major_scale is only implemented on the token-multidest "
+                "quant path"
+            )
+        if use_token_multidest:
+            from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+                token_multidest_ksplit,
+                token_multidest_tdm_chunks,
+            )
+
+            md_ksplit = token_multidest_ksplit(
+                feat_dim, wmma_rep, quant_mode, token_num
+            )
+            launch = _get_compiled_token_multidest_quant(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                topk=int(source_topk),
+                quant_mode=quant_mode,
+                row_major_scale=bool(row_major_scale),
+                tdm_hidden_chunks=token_multidest_tdm_chunks(
+                    feat_dim, wmma_rep, quant_mode, md_ksplit
+                ),
+                ksplit=md_ksplit,
+            )
+            token_grid = (token_num + warps_per_block - 1) // warps_per_block
+            launch(
+                ptr_arg(grouped_in.contiguous().view(-1)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(out_scale.view(-1)),
+                ptr_arg(topids_to_rows_i32),
+                token_num,
+                token_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
         use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
