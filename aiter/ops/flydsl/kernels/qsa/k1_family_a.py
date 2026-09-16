@@ -7,10 +7,10 @@ Streams compressed index-K from the paged cache in 512-slot tiles, scores
 complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
 
-One query row is eight wave64s (512 threads): each lane scores one column of
-the tile. When ``visible <= 512`` the selected set is every complete block, so
-the kernel writes those ids and skips the 1024-wide bitonic. Decode and
-prefill share this instantiation.
+When ``visible <= 512`` the selected set is every complete block: one
+workgroup per row writes those ids. Page tables of at most eight 512-slot
+tiles stream in one workgroup. Wider tables split columns across eight
+workgroups, each keeping a local top-512, then merge the heaps.
 """
 
 from functools import lru_cache
@@ -28,6 +28,8 @@ _BLOCK_THREADS = 512
 _TILE = 512
 _K = FAMILY_A_INDEXER.block_budget
 _CANDIDATES = _K + _TILE
+_SPLITS = 8
+_MERGE = _SPLITS * _K
 _H = FAMILY_A_INDEXER.n_heads
 _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
@@ -36,6 +38,11 @@ _Q_THREADS = _H * (_D // _VEC)
 _BITONIC_STAGES = tuple(
     (span, stride)
     for span in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+    for stride in tuple(1 << shift for shift in range(span.bit_length() - 2, -1, -1))
+)
+_MERGE_STAGES = tuple(
+    (span, stride)
+    for span in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
     for stride in tuple(1 << shift for shift in range(span.bit_length() - 2, -1, -1))
 )
 
@@ -48,7 +55,7 @@ def _neg_inf():
     return Float32(float("-inf"))
 
 
-def build_qsa_k1_family_a_module(page_size: int):
+def build_qsa_k1_family_a_serial(page_size: int):
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
     if _CANDIDATES % _BLOCK_THREADS:
@@ -67,13 +74,13 @@ def build_qsa_k1_family_a_module(page_size: int):
         cand_c: fx.Array[Int32, _CANDIDATES, 16]
 
     @flyc.kernel(
-        name="qsa_k1_family_a_"
+        name="qsa_k1_family_a_serial_"
         + kernel_signature(
             ps=page_size, tile=_TILE, k=_K, h=_H, d=_D, blk=_BLOCK_THREADS
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
-    def qsa_k1_family_a_kernel(
+    def qsa_k1_family_a_serial(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -102,12 +109,10 @@ def build_qsa_k1_family_a_module(page_size: int):
             fx.make_layout((_H, _D // _VEC), (_D // _VEC, 1)),
             fx.make_layout((1, _VEC), (_VEC, 1)),
         )
-
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         smem_q = storage.q.view(fx.make_layout((_H, _D), (_D, 1)))
         cand_s = storage.cand_s.view(fx.make_layout(_CANDIDATES, 1))
         cand_c = storage.cand_c.view(fx.make_layout(_CANDIDATES, 1))
-
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
         safe_req = valid_req.select(req, zero)
@@ -116,7 +121,8 @@ def build_qsa_k1_family_a_module(page_size: int):
         vis_q = _idiv(qpos + one, Int32(_R))
         vis_s = _idiv(slen, Int32(_R))
         visible = (vis_q < vis_s).select(vis_q, vis_s)
-        n_tiles = fx.ceildiv(n_col, Int32(_TILE))
+        scored = (visible < n_col).select(visible, n_col)
+        n_tiles = fx.ceildiv(scored, Int32(_TILE))
 
         def better(s, c, bs, bc):
             return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
@@ -145,11 +151,215 @@ def build_qsa_k1_family_a_module(page_size: int):
                 total = total + fx.max(acc, Float32(0.0))
             return total * score_scale
 
-        # visible <= k: every complete block is in the top-512. Emit those
-        # ids and skip scoring plus the 55-stage bitonic.
         if visible > Int32(_K):
-            # 64 threads own the [H=4, D=128] BF16x8 TV layout; the other
-            # waves in this 512-thread block only score columns.
+            if tid < Int32(_Q_THREADS):
+                q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
+                q_row = fx.slice(q_buf, (row, None, None))
+                q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
+                q_src = q_thr.partition_S(q_block)
+                q_dst = q_thr.partition_D(smem_q)
+                q_frag = fx.make_fragment_like(q_src)
+                fx.copy(q_load, q_src, q_frag)
+                fx.copy(q_store, q_frag, q_dst)
+            for t in range_constexpr(candidate_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
+                cand_s[j] = _neg_inf()
+                cand_c[j] = neg_one
+            gpu.barrier()
+            for tile in range(zero, n_tiles, one):
+                tile_base = tile * Int32(_TILE)
+                for t in range_constexpr(tile_steps):
+                    local = tid + Int32(t * _BLOCK_THREADS)
+                    blk = tile_base + local
+                    candidate = Int32(_K) + local
+                    live = (blk < n_col) & (blk < visible) & valid_req
+                    if live:
+                        cand_s[candidate] = score_col(blk)
+                        cand_c[candidate] = blk
+                    else:
+                        cand_s[candidate] = _neg_inf()
+                        cand_c[candidate] = neg_one
+                gpu.barrier()
+                for span, stride in _BITONIC_STAGES:
+                    for t in range_constexpr(candidate_steps):
+                        j = tid + Int32(t * _BLOCK_THREADS)
+                        peer = j ^ Int32(stride)
+                        if j < peer:
+                            s0 = cand_s[j]
+                            c0 = cand_c[j]
+                            s1 = cand_s[peer]
+                            c1 = cand_c[peer]
+                            best_first = (j & Int32(span)) == zero
+                            swap = best_first.select(
+                                better(s1, c1, s0, c0),
+                                better(s0, c0, s1, c1),
+                            )
+                            cand_s[j] = swap.select(s1, s0)
+                            cand_c[j] = swap.select(c1, c0)
+                            cand_s[peer] = swap.select(s0, s1)
+                            cand_c[peer] = swap.select(c0, c1)
+                    gpu.barrier()
+            for t in range_constexpr(tile_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
+                block_ids[row, j] = cand_c[j]
+        else:
+            for t in range_constexpr(tile_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
+                take = (j < visible) & (j < n_col) & valid_req
+                block_ids[row, j] = take.select(j, neg_one)
+
+    @flyc.jit
+    def launch_serial(
+        q: fx.Tensor,
+        k_cache: fx.Tensor,
+        page_table: fx.Tensor,
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        block_ids: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+        score_scale: Float32,
+        rows: Int32,
+        stream: fx.Stream,
+    ):
+        qsa_k1_family_a_serial(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            block_ids,
+            n_columns,
+            n_req,
+            score_scale,
+        ).launch(
+            grid=(rows, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_serial
+
+
+def build_qsa_k1_family_a_split_merge(page_size: int):
+    if page_size < 1:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if _CANDIDATES % _BLOCK_THREADS or _MERGE % _BLOCK_THREADS:
+        raise ValueError("candidate buffers must be multiples of block threads")
+    if _K != _TILE:
+        raise ValueError("family A local heap is one tile (k=512)")
+    if _D % _VEC:
+        raise ValueError("head dimension must be a multiple of vector width")
+    tile_steps = _TILE // _BLOCK_THREADS
+    candidate_steps = _CANDIDATES // _BLOCK_THREADS
+    merge_steps = _MERGE // _BLOCK_THREADS
+    sig = kernel_signature(
+        ps=page_size,
+        tile=_TILE,
+        k=_K,
+        h=_H,
+        d=_D,
+        blk=_BLOCK_THREADS,
+        spl=_SPLITS,
+    )
+
+    @fx.struct
+    class SplitStorage:
+        q: fx.Array[BFloat16, _H * _D, 16]
+        cand_s: fx.Array[Float32, _CANDIDATES, 16]
+        cand_c: fx.Array[Int32, _CANDIDATES, 16]
+
+    @fx.struct
+    class MergeStorage:
+        cand_s: fx.Array[Float32, _MERGE, 16]
+        cand_c: fx.Array[Int32, _MERGE, 16]
+
+    @flyc.kernel(
+        name="qsa_k1_family_a_split_" + sig,
+        known_block_size=[_BLOCK_THREADS, 1, 1],
+    )
+    def qsa_k1_family_a_split(
+        q: fx.Tensor,
+        k_cache: fx.Tensor,
+        page_table: fx.Tensor,
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        heap_s: fx.Tensor,
+        heap_c: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+        score_scale: Float32,
+    ):
+        row = Int32(gpu.block_id("x"))
+        split = Int32(gpu.block_id("y"))
+        tid = Int32(gpu.thread_id("x"))
+        zero = Int32(0)
+        one = Int32(1)
+        neg_one = Int32(-1)
+        page = Int32(page_size)
+        n_col = n_columns
+        vec_layout = fx.make_layout(_VEC, 1)
+        k_copy = buf_copy_atom(16, BFloat16)
+        q_load = buf_copy_atom(16, BFloat16)
+        q_store = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+        q_buf = fx.rocdl.make_buffer_tensor(q)
+        k_buf = fx.rocdl.make_buffer_tensor(k_cache)
+        q_tile, q_tv = fx.make_layout_tv(
+            fx.make_layout((_H, _D // _VEC), (_D // _VEC, 1)),
+            fx.make_layout((1, _VEC), (_VEC, 1)),
+        )
+        storage = fx.SharedAllocator().allocate(SplitStorage).peek()
+        smem_q = storage.q.view(fx.make_layout((_H, _D), (_D, 1)))
+        cand_s = storage.cand_s.view(fx.make_layout(_CANDIDATES, 1))
+        cand_c = storage.cand_c.view(fx.make_layout(_CANDIDATES, 1))
+
+        req = token_to_req[row]
+        valid_req = (req >= zero) & (req < n_req)
+        safe_req = valid_req.select(req, zero)
+        qpos = query_positions[row]
+        slen = valid_req.select(context_lens[safe_req], zero)
+        vis_q = _idiv(qpos + one, Int32(_R))
+        vis_s = _idiv(slen, Int32(_R))
+        visible = (vis_q < vis_s).select(vis_q, vis_s)
+        scored = (visible < n_col).select(visible, n_col)
+        n_tiles = fx.ceildiv(scored, Int32(_TILE))
+        tiles_per = fx.ceildiv(n_tiles, Int32(_SPLITS))
+        start = split * tiles_per
+        end_raw = start + tiles_per
+        end = (end_raw < n_tiles).select(end_raw, n_tiles)
+        start = (start < n_tiles).select(start, n_tiles)
+
+        def better(s, c, bs, bc):
+            return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
+
+        def score_col(col):
+            logical_page = _idiv(col, page)
+            off = col - logical_page * page
+            phys = page_table[safe_req, logical_page]
+            k_row = fx.slice(k_buf, (phys, off, zero, None))
+            k_chunks = fx.logical_divide(k_row, vec_layout)
+            total = Float32(0.0)
+            for h in range_constexpr(_H):
+                q_chunks = fx.logical_divide(fx.slice(smem_q, (h, None)), vec_layout)
+                acc = Float32(0.0)
+                for chunk in range_constexpr(_D // _VEC):
+                    k_src = fx.slice(k_chunks, (None, chunk))
+                    q_src = fx.slice(q_chunks, (None, chunk))
+                    k_frag = fx.make_fragment_like(k_src)
+                    q_frag = fx.make_fragment_like(q_src)
+                    fx.copy(k_copy, k_src, k_frag)
+                    fx.copy(q_store, q_src, q_frag)
+                    k_vec = fx.Vector(fx.memref_load_vec(k_frag))
+                    q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+                    for j in range_constexpr(_VEC):
+                        acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
+                total = total + fx.max(acc, Float32(0.0))
+            return total * score_scale
+
+        if visible > Int32(_K):
             if tid < Int32(_Q_THREADS):
                 q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
                 q_row = fx.slice(q_buf, (row, None, None))
@@ -165,7 +375,7 @@ def build_qsa_k1_family_a_module(page_size: int):
                 cand_c[j] = neg_one
             gpu.barrier()
 
-            for tile in range(zero, n_tiles, one):
+            for tile in range(start, end, one):
                 tile_base = tile * Int32(_TILE)
                 for t in range_constexpr(tile_steps):
                     local = tid + Int32(t * _BLOCK_THREADS)
@@ -179,9 +389,6 @@ def build_qsa_k1_family_a_module(page_size: int):
                         cand_s[candidate] = _neg_inf()
                         cand_c[candidate] = neg_one
                 gpu.barrier()
-
-                # Sort the running top-512 plus this 512-slot tile in-place.
-                # Best-first: the lower half becomes the next heap.
                 for span, stride in _BITONIC_STAGES:
                     for t in range_constexpr(candidate_steps):
                         j = tid + Int32(t * _BLOCK_THREADS)
@@ -204,21 +411,93 @@ def build_qsa_k1_family_a_module(page_size: int):
 
             for t in range_constexpr(tile_steps):
                 j = tid + Int32(t * _BLOCK_THREADS)
+                heap_s[row, split, j] = cand_s[j]
+                heap_c[row, split, j] = cand_c[j]
+        else:
+            for t in range_constexpr(tile_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
+                heap_s[row, split, j] = _neg_inf()
+                heap_c[row, split, j] = neg_one
+
+    @flyc.kernel(
+        name="qsa_k1_family_a_merge_" + sig,
+        known_block_size=[_BLOCK_THREADS, 1, 1],
+    )
+    def qsa_k1_family_a_merge(
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        heap_s: fx.Tensor,
+        heap_c: fx.Tensor,
+        block_ids: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+    ):
+        row = Int32(gpu.block_id("x"))
+        tid = Int32(gpu.thread_id("x"))
+        zero = Int32(0)
+        one = Int32(1)
+        neg_one = Int32(-1)
+        req = token_to_req[row]
+        valid_req = (req >= zero) & (req < n_req)
+        safe_req = valid_req.select(req, zero)
+        qpos = query_positions[row]
+        slen = valid_req.select(context_lens[safe_req], zero)
+        vis_q = _idiv(qpos + one, Int32(_R))
+        vis_s = _idiv(slen, Int32(_R))
+        visible = (vis_q < vis_s).select(vis_q, vis_s)
+        storage = fx.SharedAllocator().allocate(MergeStorage).peek()
+        cand_s = storage.cand_s.view(fx.make_layout(_MERGE, 1))
+        cand_c = storage.cand_c.view(fx.make_layout(_MERGE, 1))
+
+        def better(s, c, bs, bc):
+            return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
+
+        if visible > Int32(_K):
+            for s in range_constexpr(_SPLITS):
+                for t in range_constexpr(tile_steps):
+                    j = tid + Int32(t * _BLOCK_THREADS)
+                    cand_s[Int32(s * _K) + j] = heap_s[row, s, j]
+                    cand_c[Int32(s * _K) + j] = heap_c[row, s, j]
+            gpu.barrier()
+            for span, stride in _MERGE_STAGES:
+                for t in range_constexpr(merge_steps):
+                    j = tid + Int32(t * _BLOCK_THREADS)
+                    peer = j ^ Int32(stride)
+                    if j < peer:
+                        s0 = cand_s[j]
+                        c0 = cand_c[j]
+                        s1 = cand_s[peer]
+                        c1 = cand_c[peer]
+                        best_first = (j & Int32(span)) == zero
+                        swap = best_first.select(
+                            better(s1, c1, s0, c0),
+                            better(s0, c0, s1, c1),
+                        )
+                        cand_s[j] = swap.select(s1, s0)
+                        cand_c[j] = swap.select(c1, c0)
+                        cand_s[peer] = swap.select(s0, s1)
+                        cand_c[peer] = swap.select(c0, c1)
+                gpu.barrier()
+            for t in range_constexpr(tile_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
                 block_ids[row, j] = cand_c[j]
         else:
             for t in range_constexpr(tile_steps):
                 j = tid + Int32(t * _BLOCK_THREADS)
-                take = (j < visible) & (j < n_col) & valid_req
+                take = (j < visible) & (j < n_columns) & valid_req
                 block_ids[row, j] = take.select(j, neg_one)
 
     @flyc.jit
-    def launch_qsa_k1_family_a(
+    def launch_split_merge(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
+        heap_s: fx.Tensor,
+        heap_c: fx.Tensor,
         block_ids: fx.Tensor,
         n_columns: Int32,
         n_req: Int32,
@@ -226,29 +505,49 @@ def build_qsa_k1_family_a_module(page_size: int):
         rows: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_family_a_kernel(
+        qsa_k1_family_a_split(
             q,
             k_cache,
             page_table,
             token_to_req,
             query_positions,
             context_lens,
-            block_ids,
+            heap_s,
+            heap_c,
             n_columns,
             n_req,
             score_scale,
+        ).launch(
+            grid=(rows, _SPLITS, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+        qsa_k1_family_a_merge(
+            token_to_req,
+            query_positions,
+            context_lens,
+            heap_s,
+            heap_c,
+            block_ids,
+            n_columns,
+            n_req,
         ).launch(
             grid=(rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
-    return launch_qsa_k1_family_a
+    return launch_split_merge
 
 
 @lru_cache(maxsize=8)
-def _plan(page_size: int):
-    return build_qsa_k1_family_a_module(page_size)
+def _plan_serial(page_size: int):
+    return build_qsa_k1_family_a_serial(page_size)
+
+
+@lru_cache(maxsize=8)
+def _plan_split_merge(page_size: int):
+    return build_qsa_k1_family_a_split_merge(page_size)
 
 
 def qsa_k1_family_a_serves(
@@ -288,9 +587,10 @@ def qsa_k1_family_a_block_ids(
 ) -> torch.Tensor:
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
-    Streams 512-slot tiles and merges a running LDS top-512. When every
-    complete block fits in the budget, writes those ids and skips the merge.
-    Does not allocate a score matrix. Expand+tail is still a separate launch.
+    Short rows emit complete-block ids. Mid-length and prefill rows stream
+    tiles in one workgroup per row. Decode-shaped long rows split columns
+    across eight workgroups and merge local heaps. Does not allocate a
+    score matrix. Expand+tail is still a separate launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
@@ -321,19 +621,46 @@ def qsa_k1_family_a_block_ids(
     context_lens = context_lens.contiguous()
     page_size = k_cache.shape[1]
     n_columns = page_table.shape[1] * page_size
+    n_req = int(context_lens.shape[0])
+    stream = torch.cuda.current_stream(q.device)
+    # Split only when a row can have more tiles than _SPLITS and there are
+    # few enough rows that extra workgroups help. Prefill already fills the
+    # GPU with one workgroup per row; the 4096-wide merge then costs more
+    # than streaming tiles serially. Short rows still emit inside serial.
+    if n_columns <= _SPLITS * _TILE or m > _SPLITS:
+        _run_compiled(
+            _plan_serial(page_size),
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            int(n_columns),
+            n_req,
+            float(score_scale),
+            m,
+            stream,
+        )
+        return out
+    heap_s = torch.empty(m, _SPLITS, _K, dtype=torch.float32, device=q.device)
+    heap_c = torch.empty(m, _SPLITS, _K, dtype=torch.int32, device=q.device)
     _run_compiled(
-        _plan(page_size),
+        _plan_split_merge(page_size),
         q,
         k_cache,
         page_table,
         token_to_req,
         query_positions,
         context_lens,
+        heap_s,
+        heap_c,
         out,
         int(n_columns),
-        int(context_lens.shape[0]),
+        n_req,
         float(score_scale),
         m,
-        torch.cuda.current_stream(q.device),
+        stream,
     )
     return out

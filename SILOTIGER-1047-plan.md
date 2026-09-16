@@ -314,32 +314,35 @@ on both columns. **Not checked.** `aiter/jit/module_top_k_per_row.so` is
 loaded (`import [module_top_k_per_row]`; oracle-fallback warning did not
 fire). The AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand.
 
-The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
-every complete block is in the top-512, so the kernel writes those ids and
-skips scoring and the 1024-wide bitonic. Same `block_ids [M, 512]`; no
-score matrix; expand still separate. HIP `module_top_k_per_row.so` is
-loaded. Oracle set equality `err=0` on both columns.
+The FlyDSL column is eight-wave K1 plus a **`visible <= 512` emit path**
+and a **column split** on decode-shaped long rows (`M<=8` and more than
+eight 512-slot tiles): eight workgroups stream local top-512 heaps, then
+one workgroup merges 4096 candidates into `block_ids`. Prefill (`M=512`)
+and 8k (four tiles) stay on the single-WG stream. Workspace is
+`[M, 8, 512]`, not `[M, n_blocks]`. Expand still separate. HIP
+`module_top_k_per_row.so` is loaded. Oracle set equality `err=0` on both
+columns.
 
-**Not checked:** `L<=2048` now beats HIP select (~1.4µs vs ~7.6µs at
-`M=1, L=512`). From 8k `visible > k` and the per-tile bitonic still
-dominates (~106µs vs ~16µs at `M=1, L=8192`).
+**Not checked:** `L<=2048` still beats HIP select. Split cuts decode 32k
+~419µs→~149µs and 128k ~1718µs→~310µs, still behind HIP (~19µs / ~29µs).
+8k stays serial (~106µs vs ~17µs).
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
-| 8 | 512 | 128 | 2.3 | 9.0 | 0 | 0 |
-| 1 | 2048 | 512 | 1.5 | 8.1 | 0 | 0 |
-| 8 | 2048 | 512 | 2.3 | 9.0 | 0 | 0 |
-| 1 | 8192 | 2048 | 106.4 | 16.1 | 0 | 0 |
-| 8 | 8192 | 2048 | 107.7 | 18.5 | 0 | 0 |
-| 1 | 32768 | 8192 | 419.2 | 19.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 423.0 | 23.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 1718.5 | 29.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 1736.3 | 52.1 | 0 | 0 |
-| 512 | 512 | 128 | 2.9 | 16.0 | 0 | 0 |
-| 512 | 2048 | 512 | 3.0 | 26.9 | 0 | 0 |
-| 512 | 8192 | 2048 | 212.6 | 83.9 | 0 | 0 |
-| 512 | 32768 | 8192 | 831.6 | 252.4 | 0 | 0 |
+| 1 | 512 | 128 | 2.0 | 9.3 | 0 | 0 |
+| 8 | 512 | 128 | 2.9 | 11.3 | 0 | 0 |
+| 1 | 2048 | 512 | 2.0 | 10.1 | 0 | 0 |
+| 8 | 2048 | 512 | 2.9 | 11.3 | 0 | 0 |
+| 1 | 8192 | 2048 | 106.4 | 17.2 | 0 | 0 |
+| 8 | 8192 | 2048 | 107.8 | 22.0 | 0 | 0 |
+| 1 | 32768 | 8192 | 149.1 | 19.2 | 0 | 0 |
+| 8 | 32768 | 8192 | 149.8 | 23.6 | 0 | 0 |
+| 1 | 131072 | 32768 | 309.8 | 28.9 | 0 | 0 |
+| 8 | 131072 | 32768 | 323.7 | 51.2 | 0 | 0 |
+| 512 | 512 | 128 | 3.5 | 18.2 | 0 | 0 |
+| 512 | 2048 | 512 | 3.6 | 29.3 | 0 | 0 |
+| 512 | 8192 | 2048 | 211.9 | 82.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 830.0 | 248.0 | 0 | 0 |
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
