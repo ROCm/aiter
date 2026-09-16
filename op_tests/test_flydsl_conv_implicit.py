@@ -4,7 +4,7 @@
 
 """Correctness and perf for the FlyDSL implicit-GEMM convolution.
 
-Four sweeps, one table each. The first covers the keyword surface: the entry point
+Five sweeps, one table each. The first covers the keyword surface: the entry point
 dispatches 1D/2D/3D off the filter rank, so every rank is here along with stride,
 padding (incl. "same"), dilation, groups, bias and split-K.
 
@@ -15,6 +15,8 @@ The rest are the shapes two real VAEs run, traced rather than assumed:
 * Wan2.1, the spatial resamplers and the two time_conv -- the calls that are not
   cached conv3d but do, or plausibly should, reach this kernel. The 125 genuine
   1x1 calls of an encode never do and are left to the keyword surface.
+* Wan2.1 decode, only the 8 shapes it adds: 560 of its 600 cached conv3d calls
+  reuse encoder shapes, since the channel ladder is mirrored at the same extents.
 * Qwen-Image, which is the same architecture run at T=1. There the causal Conv3d
   collapses to an exact conv2d and the model never calls a 3-D kernel, so those
   rows are conv2d -- testing them as conv3d would measure something else.
@@ -232,6 +234,83 @@ def wan_vae_aux(height, width, frames):
     ]
 
 
+# Wan2.1 VAE decoder -- the shapes decode adds that encode does not already cover.
+#
+# Decode is 797 further conv calls per clip, but 560 of its 600 cached conv3d calls
+# land on shapes the encoder tables already carry: the channel ladder is mirrored at
+# the same extents, and the decoder's channel reduction happens in the upsampler's
+# Conv2d rather than in a resnet, so every resnet on the way up is same-channel. What
+# is left is these 8, which is also what the untuned config gained for decode.
+#
+# `conv_in`/`conv_out` are the cached causal convs with no encoder counterpart: 16
+# channels in at the latent extent, 3 out at full extent. Their T follows decode's own
+# chunking -- one latent frame plus 2 cache for conv_in, a 4-frame group plus 2 for
+# conv_out.
+#
+# The upsamplers are WanResample's 3x3 Conv2d after the interpolate, so unlike the
+# encoder's downsamplers they are stride 1 padding 1 on the unpadded extent. Their
+# batch is time folded in again, and time grows on the way up (1 -> 2 -> 4), which is
+# why L2 pairs N=1 with N=2 while L1 and L0 pair N=1 with N=4.
+def wan_vae_decode(height, width, frames):
+    """(case, bucket, x, weight, stride, padding, calls) for one decode.
+
+    The ``w`` prefix is not decoration: -c labels are one global namespace and the
+    Qwen table already owns ``dec_conv_in``, ``dec_up_384_L2`` and friends.
+    """
+    h, w = _levels(height), _levels(width)
+    c = (frames - 1) // 4
+    return [
+        (
+            "wdec_conv_in",
+            "kernel3d",
+            (1, 16, 3, h[3] + 2, w[3] + 2),
+            (384, 16, 3, 3, 3),
+            1,
+            0,
+            c,
+        ),
+        (
+            "wdec_up_384_L2_t1",
+            "plain2d",
+            (1, 384, h[2], w[2]),
+            (192, 384, 3, 3),
+            1,
+            1,
+            1,
+        ),
+        ("wdec_up_384_L2", "plain2d", (2, 384, h[2], w[2]), (192, 384, 3, 3), 1, 1, c),
+        (
+            "wdec_up_384_L1_t1",
+            "plain2d",
+            (1, 384, h[1], w[1]),
+            (192, 384, 3, 3),
+            1,
+            1,
+            1,
+        ),
+        ("wdec_up_384_L1", "plain2d", (4, 384, h[1], w[1]), (192, 384, 3, 3), 1, 1, c),
+        (
+            "wdec_up_192_L0_t1",
+            "plain2d",
+            (1, 192, h[0], w[0]),
+            (96, 192, 3, 3),
+            1,
+            1,
+            1,
+        ),
+        ("wdec_up_192_L0", "plain2d", (4, 192, h[0], w[0]), (96, 192, 3, 3), 1, 1, c),
+        (
+            "wdec_conv_out",
+            "kernel3d",
+            (1, 96, 6, h[0] + 2, w[0] + 2),
+            (3, 96, 3, 3, 3),
+            1,
+            0,
+            c,
+        ),
+    ]
+
+
 # Qwen-Image VAE -- the same architecture as Wan's (identical vae/config.json:
 # base_dim 96, dim_mult [1,2,4,4], temperal_downsample [F,T,T]), fine-tuned and run
 # at T=1. That degeneracy is the whole story: with one frame and no cache, every
@@ -422,7 +501,13 @@ ALL_CASES = (
     [c[0] for c in KW_CASES]
     + [c[0] for c in wan_vae_conv3d(64, 64, 5)]
     + [c[0] for c in wan_vae_aux(64, 64, 5)]
+    + [c[0] for c in wan_vae_decode(64, 64, 5)]
     + [c[0] for c in qwen_vae_conv2d(64, 64)]
+)
+# One namespace across all five tables: a label reused by two of them would make -c
+# silently select both, and argparse would list it twice.
+assert len(ALL_CASES) == len(set(ALL_CASES)), (
+    f"duplicate case labels: {sorted({c for c in ALL_CASES if ALL_CASES.count(c) > 1})}"
 )
 
 
@@ -522,12 +607,15 @@ def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=
     return ret
 
 
-def _bench_vs_torch(case, xshape, wshape, dtype, calls, stride=1, padding=0):
+def _bench_vs_torch(
+    case, xshape, wshape, dtype, calls, stride=1, padding=0, per="encode"
+):
     """One model shape, both kernels, as the row of a summary table.
 
     Rank comes off the filter. Every VAE convolution here carries a bias. torch is
     a candidate rather than only the reference: MIOpen is the baseline the Lumen
-    patch replaces, so its number belongs in the table.
+    patch replaces, so its number belongs in the table. ``per`` names the pass the
+    call count belongs to, so a decode table does not claim to weight an encode.
     """
     torch.manual_seed(0)
     rank = len(wshape) - 2
@@ -551,9 +639,9 @@ def _bench_vs_torch(case, xshape, wshape, dtype, calls, stride=1, padding=0):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        # Weight the row by how often one encode runs this shape, so the column
-        # sums to that bucket's share of an encode instead of to a single call.
-        ret[f"{name} ms/encode"] = us * calls / 1e3
+        # Weight the row by how often one pass runs this shape, so the column sums
+        # to that bucket's share of the pass instead of to a single call.
+        ret[f"{name} ms/{per}"] = us * calls / 1e3
         ret[f"{name} err"] = checkAllclose(
             ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case} {name}: ", **TOL
         )
@@ -569,6 +657,16 @@ def test_wan_vae_conv3d(case, clip, xshape, wshape, dtype, calls):
 @benchmark()
 def test_wan_vae_aux(case, clip, bucket, xshape, wshape, stride, padding, dtype, calls):
     return _bench_vs_torch(case, xshape, wshape, dtype, calls, stride, padding)
+
+
+@benchmark()
+def test_wan_vae_decode(
+    case, clip, bucket, xshape, wshape, stride, padding, dtype, calls
+):
+    # calls weight a decode, not an encode, so the column is named for it.
+    return _bench_vs_torch(
+        case, xshape, wshape, dtype, calls, stride, padding, per="decode"
+    )
 
 
 @benchmark()
@@ -680,6 +778,18 @@ def main():
             if case in args.cases
         ]
         summarize(f"Wan2.1 VAE encode, resamplers and time_conv ({name})", rows)
+
+        rows = [
+            test_wan_vae_decode(
+                case, clip, bucket, xshape, wshape, stride, pad, dtype, calls
+            )
+            for clip, h, w, frames in wan_clips
+            for case, bucket, xshape, wshape, stride, pad, calls in wan_vae_decode(
+                h, w, frames
+            )
+            if case in args.cases
+        ]
+        summarize(f"Wan2.1 VAE decode, shapes encode does not cover ({name})", rows)
 
         rows = [
             test_qwen_vae_conv2d(case, res, xshape, wshape, stride, pad, dtype, calls)
