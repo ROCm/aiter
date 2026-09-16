@@ -4,7 +4,7 @@
 """Benchmark the FlyDSL varlen FMHA backward on gfx942.
 
 Times -- and checks against the same fp32 torch reference
-op_tests/test_mha_flydsl_varlen_bwd.py uses -- two groups of backends on
+op_tests/attention/mha/test_mha_flydsl_varlen_bwd.py uses -- two groups of backends on
 identical causal bf16 THD batches.  Both groups run the same tokens, sequence
 pattern and head count, so only the head dims differ between them:
 
@@ -36,7 +36,7 @@ table; a p80 well above the median is the visible symptom.
 
 Shapes here are uniform batches (`num_seqs` x `seqlen`); the ragged model
 patterns and the pytest accuracy gate live in
-op_tests/test_mha_flydsl_varlen_bwd.py, which this module imports its input
+op_tests/attention/mha/test_mha_flydsl_varlen_bwd.py, which this module imports its input
 builder, reference and roofline helpers from.
 
 Usage -- run from the repo root, which has to be on ``sys.path`` for the
@@ -69,7 +69,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
 from aiter.ops.mha import fmha_v3_varlen_bwd, mha_varlen_bwd
 from aiter.test_common import checkAllclose
-from op_tests.test_mha_flydsl_varlen_bwd import (
+from op_tests.attention.mha.test_mha_flydsl_varlen_bwd import (
     ATOL,
     HEAD_DIM_QK,
     HEAD_DIM_V,

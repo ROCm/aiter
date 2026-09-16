@@ -148,7 +148,7 @@ Next steps:
   2. Rebuild:  $LLVM_BIN/clang -x assembler -target amdgcn-amd-amdhsa -mcpu=$MCPU -o my_kernel.co $S_FILE
   3. Test:     replace the original file with my_kernel.co (in a develop install that is the
                checkout's hsa/ tree -- git restores it) and run the family's op test, e.g.
-               python3 op_tests/test_pa.py
+               python3 op_tests/attention/pa/test_pa.py
                (the "[aiter] LoadKernel: ... hsaco: <path>" log line confirms which file was loaded)
   4. Profile:  rocprofv3 --kernel-trace --stats --kernel-include-regex '<kernel name>' -- python3 ...
 EOF

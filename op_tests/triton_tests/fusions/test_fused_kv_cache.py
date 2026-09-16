@@ -10,7 +10,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
-from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
+from op_tests.rope.test_rope import RotateStyle, ref_rope_sbhd_fwd
 from op_tests.triton_tests.attention.test_mla import (
     dynamic_nvfp4_quant_kv_buffer,
     shuffle_kv_buffer,

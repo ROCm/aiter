@@ -156,10 +156,10 @@ AITER tests are standalone Python scripts in the `op_tests/` directory:
 bash .github/scripts/aiter_test.sh
 
 # Run a specific test file directly
-python op_tests/test_rmsnorm2d.py
+python op_tests/normalization/test_rmsnorm2d.py
 
 # Run with specific parameters
-python op_tests/test_rmsnorm2d.py --dtype bf16 --m 1024 --n 4096
+python op_tests/normalization/test_rmsnorm2d.py --dtype bf16 --m 1024 --n 4096
 
 # Run Triton-specific tests
 python op_tests/triton_tests/normalization/test_rmsnorm.py
@@ -276,7 +276,7 @@ When developing or modifying HIP kernels:
 2. **Profile Memory Access Patterns**:
    ```bash
    # Use AITER_LOG_MORE=1 to analyze kernel performance
-   AITER_LOG_MORE=1 python3 op_tests/test_gemm_a8w8.py
+   AITER_LOG_MORE=1 python3 op_tests/gemm/test_gemm_a8w8.py
    ```
 
 3. **Check Roofline Model**:

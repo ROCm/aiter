@@ -12,7 +12,7 @@ mxfp4-weight configuration, against a bf16 SiTUv2 torch reference with a strict
 cos/logits_diff gate.
 
 This is the explicit FlyDSL-side test complementing the routed a16w4 rows of
-``op_tests/test_moe_2stage.py``. It goes through ``fused_moe`` (or
+``op_tests/moe/test_moe_2stage.py``. It goes through ``fused_moe`` (or
 ``flydsl_a16w4_gemm1/2``), NOT the removed low-level ``compile_mixed_moe_gemm1_a16w4``
 API.
 

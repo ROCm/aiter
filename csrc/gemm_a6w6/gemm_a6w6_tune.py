@@ -145,7 +145,7 @@ def generate_data(
     # Candidate kernels share the same quantized math. Use the safe production
     # fallback as the tuning reference so large diffusion sweeps do not allocate
     # multi-gigabyte fp32 dequantized operands/results. Independent numerical
-    # validation remains in op_tests/test_gemm_a6w6.py.
+    # validation remains in op_tests/gemm/test_gemm_a6w6.py.
     from aiter.ops.gemm_op_a6w6 import _default_gemm_a6w6_kernel
 
     reference_out = torch.empty_like(out)
