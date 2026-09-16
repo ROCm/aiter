@@ -265,15 +265,15 @@ def launch_gemm_a8w4_tdm(
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
     def kernel(
-        arg_c: fx.Tensor,
+        arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
         arg_m_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
-        arg_quant_scale: fx.Tensor,
-        arg_ep_row_map: fx.Tensor,
+        arg_quant_scale: fx.Pointer,
+        arg_ep_row_map: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -391,7 +391,8 @@ def launch_gemm_a8w4_tdm(
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
-        gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
+        gSA_base = fx.recast_iter(fx.Int32, arg_scale_a)
+        gSB_base = fx.recast_iter(fx.Int32, arg_scale_b)
         if const_expr(enable_ep_scatter):
             # Resolve every remote-scatter base before entering the GEMM
             # pipeline.  cco_lsa_ptr reads winBase/stride4G from window metadata;
@@ -400,7 +401,7 @@ def launch_gemm_a8w4_tdm(
             import mori.cco.device.flydsl as _cco
 
             ep_win = _cco.Window(fx.Int64(ep_arena_handle))
-            _rm_i32 = fx.get_iter(arg_ep_row_map)
+            _rm_i32 = fx.recast_iter(fx.Int32, arg_ep_row_map)
             _rm_addr = fx.Int64(fx.ptrtoint(_rm_i32))
             # get_iter is otherwise pure, so LLVM sinks its kernarg pointer load
             # to the drain where the rowmap descriptor first consumes it.  This
@@ -1247,7 +1248,7 @@ def launch_gemm_a8w4_tdm(
                     address_space=fx.AddressSpace.Global,
                     alignment=1,
                 )
-                scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
+                scale_ptr = fx.recast_iter(i32_ptr_g, arg_quant_scale)
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                 # i32_n is the pre-activation gate+up width; the quantized
                 # output has half as many columns and one scale dword per K128.
@@ -1556,10 +1557,10 @@ def launch_gemm_a8w4_tdm(
                     out_col_off = c_inner_off
                 if const_expr(stage1_quant_out and stage1_act):
                     oc_store = fx.Int8
-                    c_iter = fx.recast_iter(fx.Int8, fx.get_iter(arg_c))
+                    c_iter = fx.recast_iter(fx.Int8, arg_c)
                 else:
                     oc_store = oc
-                    c_iter = fx.get_iter(arg_c)
+                    c_iter = fx.recast_iter(oc, arg_c)
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                 if const_expr(STORE_PAD == 0):
                     gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
@@ -1595,16 +1596,18 @@ def launch_gemm_a8w4_tdm(
     n_tiles = (N + (tile_n - 1)) // tile_n
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c
+    if arg_quant_scale is None:
+        arg_quant_scale = arg_c
     kargs = (
-        arg_c,
+        fx.get_iter(arg_c),
         arg_a,
         arg_b,
-        arg_scale_a,
-        arg_scale_b,
+        fx.get_iter(arg_scale_a),
+        fx.get_iter(arg_scale_b),
         arg_m_tile_map,
         arg_bias,
-        arg_quant_scale,
-        arg_ep_row_map,
+        fx.get_iter(arg_quant_scale),
+        fx.get_iter(arg_ep_row_map),
         i32_m,
         N,
         f32_swiglu_limit,
