@@ -16,8 +16,12 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.mxfp8_attention import mxfp8_attention_forward
+from aiter.ops.triton.quant.quant_mxfp8 import convert_to_mxfp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+
+_QUANT_BLOCK = 32
+_FP8 = torch.float8_e4m3fn
 
 # Representative shapes: (B, H, S, D)
 _SHAPES = [
@@ -30,14 +34,32 @@ _SHAPES = [
 ]
 
 
-def _make_inputs(B, H, S, D, dtype, quant_block_size=32, device="cuda"):
-    q = torch.randn(B, S, H, D, dtype=dtype, device=device) * 0.1
-    k = torch.randn(B, S, H, D, dtype=dtype, device=device) * 0.1
-    v = torch.randn(B, S, H, D, dtype=dtype, device=device) * 0.1
-    scale_blocks = (D + quant_block_size - 1) // quant_block_size
-    q_scale = torch.full((B, H, S, scale_blocks), 127, dtype=torch.uint8, device=device)
-    k_scale = q_scale.clone()
-    v_scale = q_scale.clone()
+def _quantize_bshd(x, quant_block_size=_QUANT_BLOCK):
+    """2D-block MXFP8 quantize (B, S, H, D) -> fp8 + e8m0 (B, S/qbs, H, D/qbs)."""
+    b, s, h, d = x.shape
+    x2 = x.permute(0, 2, 1, 3).contiguous().reshape(b * h * s, d)
+    y, scale = convert_to_mxfp8(
+        x2,
+        _FP8,
+        quant_block_size=quant_block_size,
+        is_2d_block=True,
+    )
+    y = y.reshape(b, h, s, d).permute(0, 2, 1, 3).contiguous()
+    scale = (
+        scale.reshape(b, h, s // quant_block_size, d // quant_block_size)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    return y, scale
+
+
+def _make_inputs(B, H, S, D, dtype, quant_block_size=_QUANT_BLOCK, device="cuda"):
+    q_hp = torch.randn(B, S, H, D, dtype=dtype, device=device) * 0.1
+    k_hp = torch.randn(B, S, H, D, dtype=dtype, device=device) * 0.1
+    v_hp = torch.randn(B, S, H, D, dtype=dtype, device=device) * 0.1
+    q, q_scale = _quantize_bshd(q_hp, quant_block_size)
+    k, k_scale = _quantize_bshd(k_hp, quant_block_size)
+    v, v_scale = _quantize_bshd(v_hp, quant_block_size)
     return q, k, v, q_scale, k_scale, v_scale
 
 
@@ -83,15 +105,16 @@ def benchmark(args):
             v_scale=v_scale,
             sm_scale=sm_scale,
             causal=causal,
-            use_mxfp8=False,
+            use_mxfp8=True,
             block_m=64,
             block_n=64,
             quant_block_size=quant_block_size,
             layout="bshd",
         )
-        # reads: Q + K + V; writes: Out
-        elem = q.element_size()
-        mem = (B * H * S * D * 3 + B * H * S * D) * elem
+        # reads: Q/K/V (fp8) + e8m0 scales; writes: Out (bf16)
+        n_elem = B * H * S * D
+        n_scale = B * H * (S // quant_block_size) * (D // quant_block_size)
+        mem = n_elem * 3 * q.element_size() + n_scale * 3 + n_elem * 2
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         if args.metric == "time":
