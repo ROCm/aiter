@@ -165,7 +165,7 @@ jobs:
           echo "============================================================"
 
           # Basic test suite (5 tests)
-          TEST_FILES="op_tests/test_aiter_add.py op_tests/test_aiter_sigmoid.py op_tests/gemm/test_gemm_a16w16.py op_tests/test_activation.py op_tests/test_layernorm2d.py"
+          TEST_FILES="op_tests/elementwise/test_aiter_add.py op_tests/elementwise/test_aiter_sigmoid.py op_tests/gemm/test_gemm_a16w16.py op_tests/activation/test_activation.py op_tests/normalization/test_layernorm2d.py"
 
           docker exec aiter_test bash -c "
             set -eo pipefail

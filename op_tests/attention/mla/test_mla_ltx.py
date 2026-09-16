@@ -4,7 +4,7 @@
 """MLA decode: large page_id, KV byte offset, and >4GB pools (gfx950 asm).
 
 Compares torch golden vs mla_decode_fwd (gfx950 asm).
-Follows op_tests/test_quant.py layout (aiter-op-test SKILL).
+Follows op_tests/quant/test_quant.py layout (aiter-op-test SKILL).
 
 Examples:
   python op_tests/attention/mla/test_mla_ltx.py

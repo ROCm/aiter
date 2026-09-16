@@ -4,7 +4,7 @@
 """aiter op_test for the gfx1250 v4 'nm' MLA decode pipeline (mla_decode_fwd_v4_nm).
 
 Structured per `.claude/skills/aiter-op-test/SKILL.md` (mirrors
-`op_tests/test_quant.py` / `op_tests/gemm/test_batched_gemm_bf16.py`):
+`op_tests/quant/test_quant.py` / `op_tests/gemm/test_batched_gemm_bf16.py`):
 
   - `test_mla_v4_nm` is the `@benchmark()` perf+accuracy fn. Its call args
     (batch, kv_seq_lens, q_seq_logical, num_kv_splits, gqa_ratio, attn_sink)

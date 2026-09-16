@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.fused_qk_concat import fused_qk_cat, fused_qk_rope_cat
-from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
+from op_tests.rope.test_rope import RotateStyle, ref_rope_sbhd_fwd
 
 
 def generate_qk_inputs(B: int, QH_PER_KH: int, KH: int, D_nope: int, D_pe: int, dtype):

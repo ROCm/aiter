@@ -32,7 +32,7 @@ from aiter.ops.triton.rope.rope import (
     rope_thd_fwd,
     rope_thd_fwd_inplace,
 )
-from op_tests.test_rope import (
+from op_tests.rope.test_rope import (
     RotateStyle,
     ref_rope_2d_fwd,
     ref_rope_sbhd_fwd,
