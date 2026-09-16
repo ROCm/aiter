@@ -25,24 +25,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
-from ..kernels_common import create_llvm_ptr
+from ..kernels_common import ceildiv, create_llvm_ptr
 from ..tensor_shim import GTensor
 
 Vec = fx.Vector
-
-
-def _imax(a, b):
-    return (a > b).select(a, b)
-
-
-def _imin(a, b):
-    return (a < b).select(a, b)
-
-
-def _uceildiv(a, b):
-    a = fx.Uint32(a)
-    b = fx.Uint32(b)
-    return fx.Int32((a + b - fx.Uint32(1)) // b)
 
 
 def _make_out_row_t(logits, stride_i64, row_i32):
@@ -188,14 +174,14 @@ def _emit_row_neg_inf_fill(
 
     def _split(lo, hi):
         """This block's chunk of ``[lo, hi)``: the ``by``-th of num_splits."""
-        chunk = _uceildiv(hi - lo, num_splits)
-        b_lo = _imin(lo + by_i32 * chunk, hi)
-        return b_lo, _imin(b_lo + chunk, hi)
+        chunk = fx.Int32(ceildiv(fx.Uint32(hi - lo), fx.Uint32(num_splits)))
+        b_lo = fx.min(lo + by_i32 * chunk, hi)
+        return b_lo, fx.min(b_lo + chunk, hi)
 
     for j in range_constexpr(len(rows)):
         out_row_t = _make_out_row_t(logits, stride_i64, rows[j])
-        s = _imin(starts[j], slk)
-        e = _imax(ends[j], s)
+        s = fx.min(starts[j], slk)
+        e = fx.max(ends[j], s)
         for lo_i32, hi_i32 in ((fx.Int32(0), s), (e, slk)):
             b_lo, b_hi = _split(lo_i32, hi_i32)
             fill_range(out_row_t, b_lo, b_hi)
@@ -453,7 +439,7 @@ def _build_kernel_mfma_r_w(
         # Rows are handed out in reverse (bid=0 -> last rows) as a load-balancing
         # heuristic: KV windows tend to be longer for later query rows, so this
         # gets the heaviest work scheduled first instead of last.
-        n_blocks = _uceildiv(seq_len, fx.Int32(RPB))
+        n_blocks = fx.Int32(ceildiv(fx.Uint32(seq_len), fx.Uint32(RPB)))
         r0 = (n_blocks - bid - fx.Int32(1)) * fx.Int32(RPB)
 
         # Decompose tid into wave index and in-wave lane.
@@ -533,8 +519,8 @@ def _build_kernel_mfma_r_w(
 
         for j in range_constexpr(RPB):
             row = r0 + fx.Int32(j)
-            starts[j] = _imax(fx.Int32(cs_t[row]), fx.Int32(0))
-            ends[j] = _imin(fx.Int32(ce_t[row]), seq_len_kv)
+            starts[j] = fx.max(fx.Int32(cs_t[row]), fx.Int32(0))
+            ends[j] = fx.min(fx.Int32(ce_t[row]), seq_len_kv)
 
             # lane -> Q[row, h = mi*MFMA_M + lane%MFMA_N,
             #            d = kk*MFMA_K + (lane//MFMA_N)*8 + 0..7]
@@ -557,15 +543,15 @@ def _build_kernel_mfma_r_w(
         tile_start = starts[0]
         tile_end = ends[0]
         for j in range_constexpr(1, RPB):
-            tile_start = _imin(tile_start, starts[j])
-            tile_end = _imax(tile_end, ends[j])
+            tile_start = fx.min(tile_start, starts[j])
+            tile_end = fx.max(tile_end, ends[j])
         # Align tile_start down to BKV boundary.
         tile_start = (tile_start // fx.Int32(BKV)) * fx.Int32(BKV)
         # Collapse an empty union window to a zero-width one at tile_start.
         # ``ends`` is clamped above by seq_len_kv but not below, so a row whose
         # cu_ends is negative or any row with cu_ends <= cu_starts
         # can leave tile_end < tile_start.
-        tile_end = _imax(tile_end, tile_start)
+        tile_end = fx.max(tile_end, tile_start)
 
         # ---- KV-column split across grid.y. Block (.,by) takes a BKV-aligned
         # slice of the union window; logits[m,n] are independent across n, so
@@ -573,10 +559,12 @@ def _build_kernel_mfma_r_w(
         # exactly (disjoint, gap-free), so each column has one writer.
         # num_splits==1 collapses to the full window (by==0). ----
         by = fx.block_idx.y
-        win_tiles = _uceildiv(tile_end - tile_start, fx.Int32(BKV))
-        split_cols = _uceildiv(win_tiles, num_splits) * fx.Int32(BKV)
+        win_tiles = fx.Int32(ceildiv(fx.Uint32(tile_end - tile_start), fx.Uint32(BKV)))
+        split_cols = fx.Int32(
+            ceildiv(fx.Uint32(win_tiles), fx.Uint32(num_splits))
+        ) * fx.Int32(BKV)
         tile_start = tile_start + by * split_cols
-        tile_end = _imin(tile_start + split_cols, tile_end)
+        tile_end = fx.min(tile_start + split_cols, tile_end)
 
         for col0_iv in range(tile_start, tile_end, fx.Int32(BKV)):
             col0 = fx.Int32(col0_iv)
@@ -591,7 +579,7 @@ def _build_kernel_mfma_r_w(
                 abs_ni = wave_ni_base + fx.Int32(ni)
                 col = col0 + abs_ni * fx.Int32(MFMA_N) + lane_mod_N
                 cols[ni] = col
-                col_clamped = _imin(col, seq_len_kv - fx.Int32(1))
+                col_clamped = fx.min(col, seq_len_kv - fx.Int32(1))
                 kv_scales_tile[ni] = fx.Float32(sc_t[col_clamped])
                 base_b = col_clamped * fx.Int32(D)
                 for kk in range_constexpr(K_STEPS):
@@ -681,7 +669,7 @@ def _build_kernel_mfma_r_w(
         num_splits: fx.Int32,
         stream: fx.Stream,
     ):
-        gx = fx.Int64(_uceildiv(seq_len, fx.Int32(RPB)))
+        gx = fx.Int64(fx.Int32(ceildiv(fx.Uint32(seq_len), fx.Uint32(RPB))))
         gy = fx.Int64(num_splits)
         kernel._func.__name__ = _kname
         kernel(
@@ -850,7 +838,7 @@ def _build_kernel_mfma_lds_pipe(
         bid = fx.block_idx.x
 
         # Reverse row order -- see the direct-load builder for the rationale.
-        n_blocks = _uceildiv(seq_len, fx.Int32(ROWS_PER_BLOCK))
+        n_blocks = fx.Int32(ceildiv(fx.Uint32(seq_len), fx.Uint32(ROWS_PER_BLOCK)))
         block_row0 = fx.Int32((n_blocks - bid - fx.Int32(1)) * fx.Int32(ROWS_PER_BLOCK))
 
         wave = tid // fx.Int32(64)
@@ -919,7 +907,7 @@ def _build_kernel_mfma_lds_pipe(
                     d_off = d_off ^ _mask_b
 
                 col = col0_i32 + row_local
-                col_cl = _imin(col, seq_len_kv_m_1)
+                col_cl = fx.min(col, seq_len_kv_m_1)
                 voffset = col_cl * d + d_off
                 if const_expr(i > 0):
                     lds_ptr = buffer_ops.get_element_ptr(
@@ -945,8 +933,8 @@ def _build_kernel_mfma_lds_pipe(
         # Loop over the rows owned by this wave.
         for j in range_constexpr(RPW):
             row = wave_row0 + fx.Int32(j)
-            starts[j] = _imax(fx.Int32(cs_t[row]), fx.Int32(0))
-            ends[j] = _imin(fx.Int32(ce_t[row]), seq_len_kv)
+            starts[j] = fx.max(fx.Int32(cs_t[row]), fx.Int32(0))
+            ends[j] = fx.min(fx.Int32(ce_t[row]), seq_len_kv)
 
             # Load A-frags:
             # Q[
@@ -982,17 +970,17 @@ def _build_kernel_mfma_lds_pipe(
         #   u_end = max(cu_ends[rows]).
         for jj in range_constexpr(ROWS_PER_BLOCK):
             rr = block_row0 + fx.Int32(jj)
-            ss = _imax(fx.Int32(cs_t[rr]), fx.Int32(0))
-            ee = _imin(fx.Int32(ce_t[rr]), seq_len_kv)
+            ss = fx.max(fx.Int32(cs_t[rr]), fx.Int32(0))
+            ee = fx.min(fx.Int32(ce_t[rr]), seq_len_kv)
             if jj == 0:
                 u_start = ss
                 u_end = ee
             else:
-                u_start = _imin(u_start, ss)
-                u_end = _imax(u_end, ee)
+                u_start = fx.min(u_start, ss)
+                u_end = fx.max(u_end, ee)
         tile_start = (u_start // fx.Int32(BKV)) * fx.Int32(BKV)
         # Collapse an empty union window to zero width.
-        tile_end = _imax(u_end, tile_start)
+        tile_end = fx.max(u_end, tile_start)
 
         # KV-column split across grid.y
         # Each (grid.x, grid.y) block owns a disjoint vertical slice of the output logits [seq_len_q, seq_len_kv]:
@@ -1001,16 +989,22 @@ def _build_kernel_mfma_lds_pipe(
         block_y = fx.block_idx.y
 
         # How many tiles of BKV columns are in the union window.
-        win_tiles = _uceildiv(tile_end - tile_start, fx.Int32(BKV))
+        win_tiles = fx.Int32(ceildiv(fx.Uint32(tile_end - tile_start), fx.Uint32(BKV)))
 
         # How many KV columns (bytes/positions, rounded up to full tiles) each grid.y split owns.
-        split_cols = _uceildiv(win_tiles, num_splits) * fx.Int32(BKV)
+        split_cols = fx.Int32(
+            ceildiv(fx.Uint32(win_tiles), fx.Uint32(num_splits))
+        ) * fx.Int32(BKV)
 
         # Each grid.y block (block_y) shifts its start forward by block_y * split_cols:
         tile_start = tile_start + block_y * split_cols
-        tile_end = _imin(tile_start + split_cols, tile_end)
+        tile_end = fx.min(tile_start + split_cols, tile_end)
 
-        n_tiles = _uceildiv(_imax(tile_end - tile_start, fx.Int32(0)), fx.Int32(BKV))
+        n_tiles = fx.Int32(
+            ceildiv(
+                fx.Uint32(fx.max(tile_end - tile_start, fx.Int32(0))), fx.Uint32(BKV)
+            )
+        )
 
         # ---- Prologue: prefetch tiles 0..PREFETCH_DEPTH-1 into buffers ----
         for _p in range_constexpr(PREFETCH_DEPTH):
@@ -1045,7 +1039,7 @@ def _build_kernel_mfma_lds_pipe(
             for ni in range_constexpr(N_TILES):
                 col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 cols[ni] = col
-                col_cl = _imin(col, seq_len_kv - fx.Int32(1))
+                col_cl = fx.min(col, seq_len_kv - fx.Int32(1))
                 kv_scales_tile[ni] = fx.Float32(sc_t[col_cl])
                 col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 for kk in range_constexpr(K_STEPS):
@@ -1161,7 +1155,7 @@ def _build_kernel_mfma_lds_pipe(
         num_splits: fx.Int32,
         stream: fx.Stream,
     ):
-        gx = fx.Int64(_uceildiv(seq_len, fx.Int32(ROWS_PER_BLOCK)))
+        gx = fx.Int64(fx.Int32(ceildiv(fx.Uint32(seq_len), fx.Uint32(ROWS_PER_BLOCK))))
         gy = fx.Int64(num_splits)
         kernel._func.__name__ = _kname
         kernel(

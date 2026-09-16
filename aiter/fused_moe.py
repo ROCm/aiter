@@ -2018,16 +2018,16 @@ def _mxfp4_a4w4_stage1(
     inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
     if native_scale_layout:
         # The native BM16 layout addresses one *padded* chunk per M block:
-        # out_as_per_chunk_dw_for pads scale-N up to a multiple of 8 columns, so
+        # kas_per_chunk_dw_for pads scale-N up to a multiple of 8 columns, so
         # the kernel's stride between chunks exceeds inter_scale_cols whenever
         # D_INTER // 32 is not a multiple of 8. Sizing on the unpadded width
         # under-allocates and the last blocks write past the buffer (D_INTER=1408
         # spans 49152 B where the unpadded figure gives 45056 B).
-        from aiter.ops.flydsl.kernels.mxfp4_gemm1 import out_as_per_chunk_dw_for
+        from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
 
         chunks = (max_sorted + BM - 1) // BM
         inter_scale_bytes = max(
-            inter_scale_bytes, chunks * out_as_per_chunk_dw_for(D_INTER) * 4
+            inter_scale_bytes, chunks * kas_per_chunk_dw_for(D_INTER) * 4
         )
     inter_dtype = dtypes.fp8 if out_dtype == "fp8" else torch.uint8
     inter_sorted_quant = torch.empty(
