@@ -26,6 +26,7 @@ import os
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.arch_info import is_cdna4
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.tuned_config_utils import (
     autotune_configs,
@@ -158,11 +159,6 @@ def is_cdna():
         "gfx90a",
         "gfx908",
     )
-
-
-def is_cdna4():
-    target = triton.runtime.driver.active.get_current_target()
-    return target is not None and target.backend == "hip" and target.arch == "gfx950"
 
 
 def is_rdna():
