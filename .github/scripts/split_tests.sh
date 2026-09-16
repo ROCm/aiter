@@ -49,8 +49,15 @@ TEST_DIR="${TEST_DIR%/}"
 # ------------------------------
 # scan test files in TEST_DIR
 # ------------------------------
+# Directories under op_tests/ that are NOT the aiter suite: each has its own
+# CI job. Everything else under op_tests/ is aiter, including the op-family
+# folders, so collection recurses instead of stopping at the top level.
+NOT_AITER=(triton_tests multigpu_tests flydsl_tests tuning_tests tuners opus cpp op_benchmarks configs)
+aiter_prune=()
+for d in "${NOT_AITER[@]}"; do aiter_prune+=(-path "op_tests/${d}" -prune -o); done
+
 if [[ "$TEST_TYPE" == "aiter" ]]; then
-    mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    mapfile -t ALL_FILES < <(find "$TEST_DIR" "${aiter_prune[@]}" -name 'test_*.py' -type f -print | LC_ALL=C sort)
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
@@ -93,7 +100,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_kvcache.py]=78
     FILE_TIMES[op_tests/test_flydsl_gdr_mtp.py]=73
     FILE_TIMES[op_tests/test_mhc.py]=65
-    FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=64
+    FILE_TIMES[op_tests/_infra/test_jit_dir_with_enum.py]=64
     FILE_TIMES[op_tests/test_topk_plain.py]=63
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=61
     FILE_TIMES[op_tests/test_flydsl_compress_attn.py]=58
@@ -176,8 +183,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fmha_fwd_with_sink_varlen_asm.py]=4
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=4
     FILE_TIMES[op_tests/test_gemm_a8w8_bpreshuffle_pad_k.py]=4
-    FILE_TIMES[op_tests/test_gemm_codegen.py]=4
-    FILE_TIMES[op_tests/test_jit_arch_guard.py]=4
+    FILE_TIMES[op_tests/_infra/test_gemm_codegen.py]=4
+    FILE_TIMES[op_tests/_infra/test_jit_arch_guard.py]=4
     FILE_TIMES[op_tests/test_layernorm2d.py]=4
     FILE_TIMES[op_tests/test_mha_flydsl.py]=4
     FILE_TIMES[op_tests/test_mha_fp8.py]=4
@@ -195,7 +202,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_split_gdr_update.py]=4
     FILE_TIMES[op_tests/test_topk_softmax.py]=4
     FILE_TIMES[op_tests/test_vsa_sparse_attention.py]=4
-    FILE_TIMES[op_tests/test_pretune.py]=1
+    FILE_TIMES[op_tests/_infra/test_pretune.py]=1
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     echo "Triton test files:"
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_v3.py]=1358

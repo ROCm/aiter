@@ -5,7 +5,7 @@ Unit tests for aiter/utility/pretune.py.
 
 No GPU or torch required — tests exercise file-system and config resolution
 logic only.  Run with:
-    python op_tests/test_pretune.py
+    python op_tests/_infra/test_pretune.py
 """
 
 import json
