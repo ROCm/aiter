@@ -37,7 +37,6 @@ _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
 _VEC = 8
 _Q_THREADS = _H * (_D // _VEC)
-_D_PIPE = tuple(range(_D // _VEC - 1))
 _WAVE = 64
 _WAVE_STAGES = tuple(
     (span, stride)
@@ -89,7 +88,7 @@ def build_qsa_k1_family_a_serial(page_size: int):
             blk=_BLOCK_THREADS,
             pair=1,
             wav=1,
-            pipe=1,
+            pipe=2,
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
@@ -156,7 +155,9 @@ def build_qsa_k1_family_a_serial(page_size: int):
                 q_frag = fx.make_fragment_like(q_src)
                 fx.copy(k_copy, k_src, k_frag)
                 fx.copy(q_store, q_src, q_frag)
-                for chunk in _D_PIPE:
+                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
+                q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+                for chunk in range_constexpr(_D // _VEC - 1):
                     nxt = chunk + 1
                     nk_src = fx.slice(k_chunks, (None, nxt))
                     nq_src = fx.slice(q_chunks, (None, nxt))
@@ -164,17 +165,13 @@ def build_qsa_k1_family_a_serial(page_size: int):
                     nq_frag = fx.make_fragment_like(nq_src)
                     fx.copy(k_copy, nk_src, nk_frag)
                     fx.copy(q_store, nq_src, nq_frag)
-                    k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                    q_vec = fx.Vector(fx.memref_load_vec(q_frag))
                     for j in range_constexpr(_VEC):
                         acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
-                    k_frag = nk_frag
-                    q_frag = nq_frag
-                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+                    k_vec = fx.Vector(fx.memref_load_vec(nk_frag))
+                    q_vec = fx.Vector(fx.memref_load_vec(nq_frag))
                 for j in range_constexpr(_VEC):
                     acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
-                total = total + fx.max(acc, Float32(0.0))
+                total = total + acc.maximumf(Float32(0.0))
             return total * score_scale
 
         if visible > Int32(_K):
@@ -364,7 +361,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         spl=_SPLITS,
         pair=2,
         wav=1,
-        pipe=1,
+        pipe=2,
     )
 
     @fx.struct
@@ -453,7 +450,9 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                 q_frag = fx.make_fragment_like(q_src)
                 fx.copy(k_copy, k_src, k_frag)
                 fx.copy(q_store, q_src, q_frag)
-                for chunk in _D_PIPE:
+                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
+                q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+                for chunk in range_constexpr(_D // _VEC - 1):
                     nxt = chunk + 1
                     nk_src = fx.slice(k_chunks, (None, nxt))
                     nq_src = fx.slice(q_chunks, (None, nxt))
@@ -461,17 +460,13 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                     nq_frag = fx.make_fragment_like(nq_src)
                     fx.copy(k_copy, nk_src, nk_frag)
                     fx.copy(q_store, nq_src, nq_frag)
-                    k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                    q_vec = fx.Vector(fx.memref_load_vec(q_frag))
                     for j in range_constexpr(_VEC):
                         acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
-                    k_frag = nk_frag
-                    q_frag = nq_frag
-                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+                    k_vec = fx.Vector(fx.memref_load_vec(nk_frag))
+                    q_vec = fx.Vector(fx.memref_load_vec(nq_frag))
                 for j in range_constexpr(_VEC):
                     acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
-                total = total + fx.max(acc, Float32(0.0))
+                total = total + acc.maximumf(Float32(0.0))
             return total * score_scale
 
         if visible > Int32(_K):
