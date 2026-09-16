@@ -34,6 +34,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
+        reuse_from: "CudaCommunicator | None" = None,
     ):
         self._all2all_manager = None
         self._all2all_manager_created = False
@@ -43,6 +44,34 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
         self.use_torch_symm_mem = False
+
+        if reuse_from is not None:
+            # Identical-rank group: share the source's allreduce communicators
+            # instead of allocating a second set. Keeps our own unique_name, so
+            # is_ep_communicator/use_all2all still apply to this group.
+            #
+            # reuse_from is a public kwarg: validate rather than trust the
+            # caller's dedup key, since a mismatch silently addresses the wrong
+            # peers instead of raising.
+            assert reuse_from.world_size == self.world_size, (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} has "
+                f"world_size {reuse_from.world_size}, this group has "
+                f"{self.world_size}"
+            )
+            assert list(reuse_from.ranks) == list(self.ranks), (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} spans "
+                f"{reuse_from.ranks}, this group spans {self.ranks}; reuse "
+                "requires an identical rank list in identical order"
+            )
+            assert reuse_from.device == self.device, (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} is on "
+                f"{reuse_from.device}, this group is on {self.device}"
+            )
+            self.pynccl_comm = reuse_from.pynccl_comm
+            self.ca_comm = reuse_from.ca_comm
+            self.qr_comm = reuse_from.qr_comm
+            self.symm_mem_comm = reuse_from.symm_mem_comm
+            return
 
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (

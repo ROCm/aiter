@@ -159,7 +159,6 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch):
         return Y
 
     monkeypatch.setattr(gemm_mod, "get_GEMM_config_with_quant_type", fake_config)
-    monkeypatch.setattr(gemm_mod, "is_flydsl_available", lambda: True)
     monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_flydsl", fake_flydsl)
 
     out = gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=torch.bfloat16)

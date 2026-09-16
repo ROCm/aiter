@@ -20,12 +20,12 @@ from aiter.ops.triton.moe.quant_moe import (
     downcast_to_mxfp,
     downcast_to_static_fp8,
     downcast_to_static_fp8_3d,
-    upcast_from_mxfp,
 )
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 # ---------------
 # initialize data
@@ -357,9 +357,12 @@ def test_op(
         w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
         w_static_scale = None
         if hbm_swizzling:
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+                w_scale_tri,
+                arch="gfx950",
+                preshuffle_factor=32,
+                scale_kwidth=8,
+                return_layout=True,
             )
         else:
             swizzle_mx_scale = None

@@ -26,7 +26,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import aiter.ops.triton.attention.unified_attention as ua
-from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
 from op_tests.flydsl_tests._common import assert_attn_close
 from op_tests.flydsl_tests.test_flydsl_unified_attention import _build
 from op_tests.triton_tests.attention.test_unified_attention import (

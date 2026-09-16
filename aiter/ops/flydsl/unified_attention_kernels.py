@@ -32,6 +32,7 @@ lengths combine correctly.
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import os
 from collections import OrderedDict
@@ -45,9 +46,19 @@ from .kernels.flash_attn_fp8_decode_gfx950 import (
     plan_num_kv_splits,
 )
 from .kernels.flash_attn_fp8_gfx950 import build_flash_attn_dualwave_swp_fp8_module
-from .utils import is_flydsl_available
 
 __all__ = ["flydsl_unified_attention"]
+
+
+@lru_cache(maxsize=1)
+def is_flydsl_available() -> bool:
+    if importlib.util.find_spec("flydsl") is None:
+        return False
+    # Unsupported architectures can fail during kernel config registration.
+    from flydsl.runtime.device import get_rocm_arch
+    from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+
+    return get_rocm_arch() in SMEM_CAPACITY_MAP
 
 
 # Page size is structural, not a builder parameter: the paged path addresses KV

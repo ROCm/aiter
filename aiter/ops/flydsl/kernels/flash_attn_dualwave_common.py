@@ -38,7 +38,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops, kernels_common
 
 
 def dtype_to_elem_type(dtype_str: str):
@@ -1132,20 +1132,20 @@ class DualwaveFp8KernelContext:
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
         self.lds_kv_base_idx = fx.Int32(fx.ptrtoint(lds.kv.ptr))
-        self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(
+        self.lds_kv_base_ptr = kernels_common.create_llvm_ptr(
             self.lds_kv_base_idx, address_space=3
         )
         self.lds_vt_base_idx = fx.Int32(fx.ptrtoint(lds.vt.ptr))
-        self.lds_vt_base_ptr = buffer_ops.create_llvm_ptr(
+        self.lds_vt_base_ptr = kernels_common.create_llvm_ptr(
             self.lds_vt_base_idx, address_space=3
         )
         self.lds_q_base_idx = fx.Int32(fx.ptrtoint(lds.q.ptr))
-        self.lds_q_base_ptr = buffer_ops.create_llvm_ptr(
+        self.lds_q_base_ptr = kernels_common.create_llvm_ptr(
             self.lds_q_base_idx, address_space=3
         )
         if const_expr(self.traits.PAGED):
             self.lds_bt_base_idx = fx.Int32(fx.ptrtoint(lds.bt.ptr))
-            self.lds_bt_base_ptr = buffer_ops.create_llvm_ptr(
+            self.lds_bt_base_ptr = kernels_common.create_llvm_ptr(
                 self.lds_bt_base_idx, address_space=3
             )
         else:
@@ -2100,7 +2100,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         per = total // (traits.BLOCK_SIZE)  # bytes per thread
         for i in range_constexpr(per // 16):
             off = aligned_base + self.tid * fx.Int32(per) + fx.Int32(i * 16)
-            p = buffer_ops.create_llvm_ptr(off, address_space=3)
+            p = kernels_common.create_llvm_ptr(off, address_space=3)
             llvm.StoreOp(as_mlir_value(zero), p, alignment=16)
 
     def _stage_v_fp8_block_dma(self, tile_start, buf_id, page_id=None):
@@ -2190,7 +2190,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
             # Hand-tuned bank-conflict mod-rotation, kept as raw arithmetic (a
             # SwizzleType composition for it is unresolved), not a layout crd2idx.
             col = ((qglobal + dmask) % fx.Int32(nquads)) * fx.Int32(4)
-            p = buffer_ops.create_llvm_ptr(row + col, address_space=3)
+            p = kernels_common.create_llvm_ptr(row + col, address_space=3)
             llvm.StoreOp(as_mlir_value(fx.Int32(v4[qi])), p, alignment=4)
 
     def _stage_vt_dequant_fp8(self, tile_start, buf_id):
@@ -2386,7 +2386,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
         i32x1 = Vec.make_type(1, fx.Int32)
 
         def _read32(byte_off):
-            p = buffer_ops.create_llvm_ptr(byte_off, address_space=3)
+            p = kernels_common.create_llvm_ptr(byte_off, address_space=3)
             return Vec(llvm.LoadOp(i32x1, p, alignment=4).result)
 
         packs = [[None] * traits.D_CHUNKS for _ in range(4)]

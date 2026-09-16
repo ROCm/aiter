@@ -2,13 +2,30 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_gluon_moe_gemm_int8_smoothquant_repr = make_kernel_repr(
+    "_gluon_moe_gemm_int8_smoothquant",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "EVEN_K",
+        "N_EXPTS_ACT",
+        "APPLY_ACTIVATION",
+        "SWIGLU_ADD_RESIDUAL",
+        "num_warps",
+    ],
+)
+
 
 @triton.heuristics(
     {
         "UNROLL_TIMES": lambda args: triton.cdiv(args["K"], args["BLOCK_K"]),
     }
 )
-@gluon.jit
+@gluon.jit(repr=_gluon_moe_gemm_int8_smoothquant_repr)
 def _gluon_moe_gemm_int8_smoothquant(
     Y,
     stride_y_k,
