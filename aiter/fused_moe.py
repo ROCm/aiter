@@ -1160,7 +1160,8 @@ def _fused_moe_impl(
             q_dtype_w=q_dtype_w,
             q_type=quant_type,
             activation=activation,
-            is_shuffled=isShuffled,
+            is_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
             use_g1u1=isG1U1,
             doweight_stage1=doweight_stage1,
             gate_mode=gate_mode,
@@ -2677,6 +2678,12 @@ def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode):
     ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
 
 
+def _is_cktile_mxfp4_stage2_name(kernel_name):
+    return kernel_name.startswith("cktile_") or (
+        kernel_name == "swiglu_mxfp4_bf16_cktile"
+    )
+
+
 def _can_reroute_mxfp4_to_flydsl(
     *,
     model_dim,
@@ -2745,7 +2752,7 @@ def get_2stage_cfgs(
         q_dtype_w=q_dtype_w,
         q_type=q_type,
         activation=activation,
-        is_shuffled=is_shuffled,
+        is_shuffled=bool(opus_weights_shuffled),
         use_g1u1=use_g1u1,
         doweight_stage1=doweight_stage1,
         gate_mode=gate_mode,
@@ -3051,7 +3058,7 @@ def get_2stage_cfgs(
 
     if cfg is not None:
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
-        if cktile_mxfp4_unsafe and kn2.startswith("cktile_"):
+        if cktile_mxfp4_unsafe and _is_cktile_mxfp4_stage2_name(kn2):
             cfg = None
             logger.warning(
                 "[fused_moe] discarding unsafe CK-Tile MXFP4 stage2 config "

@@ -44,6 +44,7 @@ def _dispatch(
     inter_dim=INTER_DIM,
     gate_mode=GateMode.SEPARATED,
     q_dtype_a=dtypes.bf16,
+    both_weights_shuffled=True,
 ):
     get_2stage_cfgs.cache_clear()
     return get_2stage_cfgs(
@@ -63,6 +64,7 @@ def _dispatch(
         0,
         is_shuffled=True,
         gate_mode=gate_mode,
+        opus_weights_shuffled=both_weights_shuffled,
     )
 
 
@@ -131,7 +133,17 @@ def test_mxfp4_swiglu_split_k_does_not_bypass_reroute(monkeypatch):
 
 
 @_SKIP
-def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch):
+def test_mxfp4_takeover_requires_both_weights_shuffled():
+    meta = _dispatch(both_weights_shuffled=False)
+    assert _stage_backend(meta.stage2) == "cktile"
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    "kernel_name2",
+    ["cktile_test", "swiglu_mxfp4_bf16_cktile"],
+)
+def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
     key = (
         fused_moe_module.get_gfx_runtime(),
         fused_moe_module.get_cu_num(),
@@ -152,7 +164,7 @@ def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch):
         "block_m": 32,
         "ksplit": 2,
         "kernelName1": "flydsl_test",
-        "kernelName2": "cktile_test",
+        "kernelName2": kernel_name2,
         "run_1stage": False,
     }
     monkeypatch.setattr(fused_moe_module, "cfg_2stages", ({key: cfg}, {}))
