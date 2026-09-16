@@ -640,7 +640,8 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "'-mllvm -enable-post-misched=1'"
+            "'-mllvm -enable-post-misched=1'",
+            "'-mllvm -amdgpu-mfma-vgpr-form=1'"
         ],
         "flags_extra_hip_per_source": {
             "*pa_decode_opus_kernels.cu": [
