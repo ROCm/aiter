@@ -6,10 +6,7 @@
 from __future__ import annotations
 
 import collections
-import csv
 import functools
-import os
-from pathlib import Path
 
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
@@ -35,45 +32,6 @@ __all__ = [
 # _MTP_BY_ARCH is keyed on the base name; the hardware path already drops the
 # feature suffix, but an arch set by hand through the environment keeps it.
 GDR_GPU_ARCH = get_rocm_arch().split(":")[0]
-
-GDR_GLOBAL_CONFIG_MAP = None
-
-
-def _load_gdr_config_map():
-    """Parse ``gdr_decode_tuned.csv`` into a lookup keyed by shape and gate mode.
-
-    A row without ``gate_mode`` is scalar, so an old-format table still parses.
-    """
-    global GDR_GLOBAL_CONFIG_MAP
-    if GDR_GLOBAL_CONFIG_MAP is not None:
-        return GDR_GLOBAL_CONFIG_MAP
-    _dict = {}
-    fname = os.path.join(Path(__file__).resolve().parent, "gdr_decode_tuned.csv")
-    with open(fname, "r", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            obj = dict(row)
-            if float(obj["duration"]) >= 10000.0:
-                continue
-            _dict[
-                (
-                    obj["dtype"],
-                    obj["state_dtype"],
-                    obj["arch"],
-                    int(obj["b"]),
-                    int(obj["sq"]),
-                    int(obj["num_k_heads"]),
-                    int(obj["num_v_heads"]),
-                    int(obj["head_k_dim"]),
-                    int(obj["head_v_dim"]),
-                    obj.get("gate_mode") or "gdr",
-                )
-            ] = {
-                "NUM_BLOCKS_PER_V_DIM": int(obj["NUM_BLOCKS_PER_V_DIM"]),
-                "NUM_WARPS": int(obj["NUM_WARPS"]),
-                "WARP_THREADS_K": int(obj["WARP_THREADS_K"]),
-            }
-    GDR_GLOBAL_CONFIG_MAP = _dict
-    return GDR_GLOBAL_CONFIG_MAP
 
 
 def _mtp_variant(mode, has_tree):
@@ -125,6 +83,14 @@ _DECODE_WARP_SHAPE = {
     (32, True): (4, 16),
     (16, False): (2, 8),
     (16, True): (4, 16),
+}
+
+# Measured (NUM_BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K) for K3's 12:12
+# bf16/f32 decode, keyed like `_MTP_BY_ARCH`. Other KDA shapes use
+# `_decode_tiling`.
+_KDA_DECODE_BY_ARCH = {
+    "gfx942": {1: (8, 4, 32), 4: (32, 1, 32), 64: (8, 1, 16), 256: (2, 4, 32)},
+    "gfx950": {1: (32, 2, 32), 4: (4, 8, 32), 64: (1, 4, 16), 256: (4, 4, 16)},
 }
 
 
@@ -182,6 +148,38 @@ def _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_
     return {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
 
 
+def _kda_tiling(
+    dtype_str,
+    state_dtype_str,
+    batch_size,
+    seq_length,
+    num_k_heads,
+    num_v_heads,
+    head_k_dim,
+    head_v_dim,
+):
+    """The measured K3 tiling, or None so the caller can use `_decode_tiling`."""
+    if (
+        dtype_str != "torch.bfloat16"
+        or state_dtype_str != "torch.float32"
+        or seq_length != 1
+        or num_k_heads != 12
+        or num_v_heads != 12
+        or head_k_dim != 128
+        or head_v_dim != 128
+    ):
+        return None
+    cfg = _KDA_DECODE_BY_ARCH.get(GDR_GPU_ARCH, {}).get(batch_size)
+    if cfg is None:
+        return None
+    num_blocks, num_warps, warp_threads_k = cfg
+    return {
+        "NUM_BLOCKS_PER_V_DIM": num_blocks,
+        "NUM_WARPS": num_warps,
+        "WARP_THREADS_K": warp_threads_k,
+    }
+
+
 def get_default_kwargs(
     dtype_str,
     state_dtype_str,
@@ -195,30 +193,22 @@ def get_default_kwargs(
 ):
     """The KDA-tuned config for this launch, else the tiling rule.
 
-    Main's scalar GDR path uses ``_decode_tiling``. Only KDA consults the
-    restored legacy table, so its scalar rows cannot override that newer
-    policy.
+    Main's scalar GDR path uses ``_decode_tiling``. KDA uses
+    ``_kda_tiling`` for the measured K3 shapes, else the same heuristic.
     """
-    if gate_mode != "kda":
-        return _decode_tiling(
-            batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str
-        )
-    config = _load_gdr_config_map().get(
-        (
+    if gate_mode == "kda":
+        config = _kda_tiling(
             dtype_str,
             state_dtype_str,
-            GDR_GPU_ARCH,
             batch_size,
             seq_length,
             num_k_heads,
             num_v_heads,
             head_k_dim,
             head_v_dim,
-            gate_mode,
         )
-    )
-    if config is not None:
-        return dict(config)
+        if config is not None:
+            return config
     return _decode_tiling(
         batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str
     )

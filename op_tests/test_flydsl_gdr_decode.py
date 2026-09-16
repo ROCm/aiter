@@ -419,25 +419,15 @@ def test_negative_slot_is_skipped_and_zero_is_not():
     assert_close("live ht", ref_state, kernel_pool[:3])
 
 
-def test_only_kda_uses_the_restored_tuned_config_map(monkeypatch):
-    """KDA uses its tuned row while scalar GDR keeps main's tiling policy.
-
-    Main removed the legacy CSV in favor of ``_decode_tiling`` for scalar GDR.
-    Restoring the table for KDA must not restore its old scalar dispatch.
-    """
+def test_only_kda_uses_the_kda_tiling_table(monkeypatch):
+    """KDA uses its tuned row while scalar GDR keeps main's tiling policy."""
     from aiter.ops.flydsl import linear_attention_kernels as lak
 
     kda_config = {"NUM_BLOCKS_PER_V_DIM": 4, "NUM_WARPS": 2, "WARP_THREADS_K": 32}
-    gdr_config = {"NUM_BLOCKS_PER_V_DIM": 8, "NUM_WARPS": 4, "WARP_THREADS_K": 16}
     dtypes = ("torch.bfloat16", "torch.float32")
     geometry = (4, 1, 12, 12, 128, 128)
-    key = (*dtypes, lak.GDR_GPU_ARCH, *geometry)
 
-    monkeypatch.setattr(
-        lak,
-        "GDR_GLOBAL_CONFIG_MAP",
-        {(*key, "kda"): kda_config, (*key, "gdr"): gdr_config},
-    )
+    monkeypatch.setattr(lak, "_KDA_DECODE_BY_ARCH", {lak.GDR_GPU_ARCH: {4: (4, 2, 32)}})
     assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
     assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == lak._decode_tiling(
         geometry[0], geometry[3], geometry[4], geometry[5], dtypes[1]

@@ -4,10 +4,11 @@
 
 """Tuning sweep and A/B benchmark for the KDA (per-channel) FlyDSL GDR decode.
 
-Kimi-K3 decodes at a 1:1 head ratio. ``--sweep`` produces KDA-tuned rows;
-``--bench`` compares them with both main's shape-based tiling policy and vLLM's
-standalone Triton packed-decode fallback. Rows go out as ``gate_mode=kda``, so
-they never affect scalar GDR dispatch.
+Kimi-K3 decodes at a 1:1 head ratio. ``--sweep`` prints the winning
+``(NUM_BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K)`` triples to paste into
+``_KDA_DECODE_BY_ARCH`` in ``linear_attention_kernels.py``. ``--bench`` compares
+those rows with both main's shape-based tiling policy and vLLM's standalone
+Triton packed-decode fallback. Scalar GDR never consults this table.
 
 ``--bench`` reports device time (``kernel_us``): vLLM launches this kernel in a
 graph with other kernels, so host-side wall clock is not the serving number.
@@ -16,8 +17,8 @@ is a few percent, which is the size of the drift, so a number without its spread
 cannot be quoted as a win.
 
 Usage:
-    # Tuning sweep, emits rows in gdr_decode_tuned.csv format
-    python bench_gdr_decode_kda.py --sweep -o rows.csv
+    # Tuning sweep, prints triples to paste into `_KDA_DECODE_BY_ARCH`
+    python bench_gdr_decode_kda.py --sweep
 
     # A/B against vLLM's fused_recurrent_kda_packed_decode
     python bench_gdr_decode_kda.py --bench
@@ -158,9 +159,9 @@ def make_inputs(B, device="cuda", seed=0):
 
 
 def flydsl_runner(inp, config):
-    """Bind one explicit config, bypassing the wrapper's CSV lookup.
+    """Bind one explicit config, bypassing the wrapper's KDA tiling table.
 
-    ``flydsl_gdr_decode`` resolves its config from ``gdr_decode_tuned.csv``, so a
+    ``flydsl_gdr_decode`` resolves its config from ``_KDA_DECODE_BY_ARCH``, so a
     sweep must build the kernel directly. need_shuffle_state=False, K3's layout.
 
     q/k/v stay views into ``mixed_qkv``, the same buffer the Triton comparator
