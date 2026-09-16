@@ -259,27 +259,29 @@ AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand. Oracle
 set equality `err=0` on both columns (HIP `stable=False` still matched
 this seed).
 
-The FlyDSL column is the committed **eight-wave** K1 (`block=512`, one
-column per thread per tile; Q copy gated to the first 64 threads). Same
+The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
+write every complete-block id and skip scoring/bitonic. Same
 `block_ids [M, 512]`; no score matrix; expand still separate. **2d stays
-unchecked:** FlyDSL loses every harness row.
+unchecked:** `L<=2048` beats HIP select; from 8k the per-tile bitonic still
+loses.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 24.7 | 7.5 | 0 | 0 |
-| 8 | 512 | 128 | 25.2 | 9.0 | 0 | 0 |
-| 1 | 2048 | 512 | 28.0 | 8.0 | 0 | 0 |
-| 8 | 2048 | 512 | 28.5 | 9.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 105.9 | 17.1 | 0 | 0 |
-| 8 | 8192 | 2048 | 107.0 | 20.0 | 0 | 0 |
-| 1 | 32768 | 8192 | 417.3 | 19.4 | 0 | 0 |
-| 8 | 32768 | 8192 | 421.0 | 23.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 1729.8 | 29.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 1745.4 | 51.9 | 0 | 0 |
-| 512 | 512 | 128 | 48.3 | 16.0 | 0 | 0 |
-| 512 | 2048 | 512 | 56.6 | 27.0 | 0 | 0 |
-| 512 | 8192 | 2048 | 213.3 | 82.5 | 0 | 0 |
-| 512 | 32768 | 8192 | 832.7 | 248.1 | 0 | 0 |
+| 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
+| 8 | 512 | 128 | 2.3 | 9.0 | 0 | 0 |
+| 1 | 2048 | 512 | 1.5 | 8.1 | 0 | 0 |
+| 8 | 2048 | 512 | 2.3 | 9.0 | 0 | 0 |
+| 1 | 8192 | 2048 | 106.4 | 16.1 | 0 | 0 |
+| 8 | 8192 | 2048 | 107.7 | 18.5 | 0 | 0 |
+| 1 | 32768 | 8192 | 419.2 | 19.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 423.0 | 23.7 | 0 | 0 |
+| 1 | 131072 | 32768 | 1718.5 | 29.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 1736.3 | 52.1 | 0 | 0 |
+| 512 | 512 | 128 | 2.9 | 16.0 | 0 | 0 |
+| 512 | 2048 | 512 | 3.0 | 26.9 | 0 | 0 |
+| 512 | 8192 | 2048 | 212.6 | 83.9 | 0 | 0 |
+| 512 | 32768 | 8192 | 831.6 | 252.4 | 0 | 0 |
+
 
 
 
