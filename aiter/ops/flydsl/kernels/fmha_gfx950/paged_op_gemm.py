@@ -19,55 +19,36 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
 class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
     def __init__(self, ctx):
         super().__init__(ctx)
-        if const_expr(self.traits.PAGED):
-            self.fp8_mma = fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(32, 32, 64, fx.Float8E4M3FN)
-            )
+        self.fp8_mma = fx.make_mma_atom(
+            fx.rocdl.cdna4.MFMA_Scale(32, 32, 64, fx.Float8E4M3FN)
+        )
 
     def _pack_p_fp8(self, f32):
         # P words must follow vectorized K's four-token groups for paged P*V.
         packed = self._pack_fp8_i32x8(f32)
-        if const_expr(self.traits.PAGED):
-            words = Vec(packed, (8,), fx.Int32)
-            return Vec.from_elements(
-                [words[i] for i in (0, 2, 1, 3, 4, 6, 5, 7)],
-                fx.Int32,
-            ).ir_value()
-        return packed
+        words = Vec(packed, (8,), fx.Int32)
+        return Vec.from_elements(
+            [words[i] for i in (0, 2, 1, 3, 4, 6, 5, 7)],
+            fx.Int32,
+        ).ir_value()
 
     def _mfma_acc_fp8_wide(self, a_i32x8, b_i32x8, c_v16):
-        if const_expr(self.traits.PAGED):
-            a = fx.make_rmem_tensor(8, fx.Int32)
-            b = fx.make_rmem_tensor(8, fx.Int32)
-            c = fx.make_rmem_tensor(16, fx.Float32)
-            a.store(Vec(a_i32x8))
-            b.store(Vec(b_i32x8))
-            c.store(Vec(c_v16))
-            fx.gemm(
-                self.fp8_mma,
-                c,
-                a,
-                b,
-                c,
-                scale_a=fx.Int32(0x7F7F7F7F),
-                scale_b=fx.Int32(0x7F7F7F7F),
-            )
-            return c.load().ir_value()
-        # Wide fp8 QK: mfma_scale (32x32x64) with unit E8M0 scales, i32x8 operands.
-        return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
-            self.v16f32_type,
-            [
-                as_mlir_value(a_i32x8),
-                as_mlir_value(b_i32x8),
-                as_mlir_value(c_v16),
-                0,
-                0,
-                0,
-                as_mlir_value(fx.Int32(0x7F7F7F7F)),
-                0,
-                as_mlir_value(fx.Int32(0x7F7F7F7F)),
-            ],
+        a = fx.make_rmem_tensor(8, fx.Int32)
+        b = fx.make_rmem_tensor(8, fx.Int32)
+        c = fx.make_rmem_tensor(16, fx.Float32)
+        a.store(Vec(a_i32x8))
+        b.store(Vec(b_i32x8))
+        c.store(Vec(c_v16))
+        fx.gemm(
+            self.fp8_mma,
+            c,
+            a,
+            b,
+            c,
+            scale_a=fx.Int32(0x7F7F7F7F),
+            scale_b=fx.Int32(0x7F7F7F7F),
         )
+        return c.load().ir_value()
 
     def _pack_fp8_i32x8(self, f32_vals):
         c0 = llvm.mlir_poison(T.i32)
@@ -99,19 +80,7 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             words.append(fx.Int32(v2[1]))
         return Vec.from_elements(words, fx.Int32).ir_value()
 
-    def _load_q_wide_lds(self):
-        traits = self.traits
-        q_row_in_block = self.ctx_ref.q_row_in_block
-        d_base = self.lane_div_32 * 32
-        packs = []
-        for ws in range_constexpr(traits.HEAD_DIM // 64):
-            byte_row = (
-                q_row_in_block * fx.Index(traits.HEAD_DIM) + fx.Index(ws * 64) + d_base
-            )
-            packs.append(self.read_i32x8_lds(self.lds_q_base_ptr, fx.Int32(byte_row)))
-        return packs
-
-    def _load_q_wide_global(self):
+    def load_q_wide(self):
         """Pull this lane's Q operands straight from global into VGPRs."""
         traits = self.traits
         d_base = self.lane_div_32 * 32
@@ -123,19 +92,13 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             packs.append(Vec(lo).shuffle(Vec(hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value())
         return packs
 
-    def load_q_wide(self):
-        if const_expr(self.traits.QLDS):
-            return self._load_q_wide_lds()
-        return self._load_q_wide_global()
-
-    def qk(self, v_k, q_wide=None):
+    def qk(self, v_k, q_wide):
         traits = self.traits
         k_lo, k_hi = v_k
-        q_all_wide = self._load_q_wide_lds() if q_wide is None else q_wide
         v_s_lo = self.c_zero_v16f32
         v_s_hi = self.c_zero_v16f32
         for ws in range_constexpr(traits.HEAD_DIM // 64):
-            q_w = q_all_wide[ws]
+            q_w = q_wide[ws]
             v_s_lo = self._mfma_acc_fp8_wide(k_lo[ws], q_w, v_s_lo)
             v_s_hi = self._mfma_acc_fp8_wide(k_hi[ws], q_w, v_s_hi)
         n_ds = const_expr(traits.HEAD_DIM // 64 * 4)

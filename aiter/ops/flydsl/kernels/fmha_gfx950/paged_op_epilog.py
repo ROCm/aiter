@@ -23,17 +23,13 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
 
     def _o_pack_2dw(self, v_o, dc, store_group):
         r_base = store_group * 4
-        if const_expr(self.traits.PAGED):
-            values = Vec(v_o[dc])
-            packed = (
-                values.shuffle(values, list(range(r_base, r_base + 4)))
-                .to(fx.BFloat16)
-                .bitcast(fx.Int32)
-            )
-            return packed[0].ir_value(), packed[1].ir_value()
-        lo = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
-        hi = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
-        return lo, hi
+        values = Vec(v_o[dc])
+        packed = (
+            values.shuffle(values, list(range(r_base, r_base + 4)))
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)
+        )
+        return packed[0].ir_value(), packed[1].ir_value()
 
     def _swap_half_partner(self, dw):
         pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
@@ -62,9 +58,16 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         )
 
     def store_final_o(self, v_o, q_row):
+        if const_expr(self.traits.GUARD_OUTPUT_ROWS):
+            live_row = q_row < self.seqlen_q_v
+            end_elem = self.q_tok_end * self.stride_o_n_v
         for dc in range_constexpr(self.traits.D_CHUNKS):
             for g in range_constexpr(2):
                 o_pack = self._packed_o_128_vec(v_o, dc, g)
                 d_col = (dc * self.traits.D_CHUNK) + (2 * g + self.lane_div_32) * 8
                 o_global = self.global_idx_o(q_row, d_col)
+                # Inactive rows can wrap a 32-bit byte offset before the buffer
+                # bound is checked. The exact descriptor end is always OOB.
+                if const_expr(self.traits.GUARD_OUTPUT_ROWS):
+                    o_global = live_row.select(o_global, end_elem)
                 self.buffer_store_128(o_pack, o_global)

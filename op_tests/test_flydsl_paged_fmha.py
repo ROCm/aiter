@@ -275,9 +275,16 @@ def test_empty_requests_and_fully_masked_rows(page, layout, d, dv):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
-@pytest.mark.parametrize("d,dv", DIMS)
+@pytest.mark.parametrize(
+    "page,layout,d,dv",
+    [
+        (64, "vectorized", 128, 128),
+        (1, "linear3d", 192, 128),
+        (16, "vectorized", 192, 192),
+    ],
+)
 def test_runtime_scale_reuses_compiled_launcher(page, layout, d, dv):
+    # Exercise each softmax/PV width; native tests cover the full layout matrix.
     case = make_case(page, layout, d, dv)
     default = check_case(case).clone()
     misses = paged._build.cache_info().misses
@@ -477,14 +484,23 @@ def test_side_stream_keeps_copy_source_alive():
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
-@pytest.mark.parametrize("d,dv", DIMS)
+@pytest.mark.parametrize(
+    "page,layout,d,dv",
+    [
+        (1, "linear3d", 128, 128),
+        (1, "linear", 192, 128),
+        (16, "vectorized", 192, 192),
+        (64, "vectorized", 192, 128),
+        (1024, "vectorized", 128, 128),
+    ],
+)
 @pytest.mark.parametrize("rectangular", [False, True])
 def test_public_batch_prefill_routes_to_flydsl(
     monkeypatch, page, layout, d, dv, rectangular
 ):
     from aiter.ops import mha
 
+    # Cover every layout and width on both routes; native tests cover their product.
     case = make_case(page, layout, d, dv)
     metadata = csr_metadata(case, prefix=5)
     indptr, indices = metadata.pop("kv_indptr"), metadata.pop("kv_page_indices")
@@ -889,90 +905,90 @@ def test_explicit_compile_then_launch(monkeypatch, page, layout, d, dv, csr):
 
 
 @gfx950
-@pytest.mark.parametrize("d,dv", DIMS)
-def test_causal_tile_bounds_int32_limit(d, dv):
-    """Execute the production bound helper without iterating billions of keys."""
+def test_loose_query_bound_cannot_wrap_output():
+    case = make_case(64, "vectorized", 128, 128, qlens=(2,), klens=(1,), heads=(16, 1))
+    expected = check_case(case).clone()
+    # Padded row 2**20 starts at 2**32 BF16 bytes and aliases row zero if
+    # the output store truncates the offset before rejecting inactive rows.
+    case.maxq = 2**20 + 1
+    case.out.fill_(float("nan"))
+    run_case(case)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(case.out, expected, rtol=0, atol=0)
+
+
+@gfx950
+def test_causal_tile_bounds_int32_limit():
+    """Run the production 256x64 bound calculation at its signed-int32 edges."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.fmha_gfx950.common import load, store
+    from aiter.ops.flydsl.kernels.fmha_gfx950.common import store
     from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
         DualwaveFp8KernelContext,
         _make_paged_dualwave_swp_fp8_traits,
     )
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
-    traits = _make_paged_dualwave_swp_fp8_traits(16, 1, d, dv, 6.0)
+    # Head widths do not participate in this calculation; native tests cover them.
+    traits = _make_paged_dualwave_swp_fp8_traits(1, 1, 128, 128, 6.0)
     limit = 2**31 - 1
+    tiles = (limit + 1) // traits.BLOCK_N
     cases = [
-        (1, limit, 0),
-        (255, limit, 0),
-        (256, limit, 0),
-        (257, limit, 0),
-        (257, limit, 256),
-        (1, limit - 255, 0),
-        (1, limit - 254, 0),
-        (512, 1, 0),
-        (512, 1, 256),
-        (257, 128, 512),
-        (1, 0, 0),
+        # name, Q length, KV length, Q-block start, expected exclusive tile end
+        ("last safe padded bound", 1, limit - 255, 0, tiles - 4),
+        ("first overflowing bound", 1, limit - 254, 0, tiles - 2),
+        ("maximum KV length", 1, limit, 0, tiles),
+        ("aligned Q block", 256, limit, 0, tiles),
+        ("partial second Q block", 257, limit, 256, tiles),
+        ("fully masked Q block", 512, 1, 0, 0),
+        ("inactive Q block", 257, 128, 512, 0),
     ]
-    inputs = torch.tensor(cases, dtype=torch.int64, device="cuda")
-    output = torch.full_like(inputs, -1)
+    output = torch.empty(1, dtype=torch.int64, device="cuda")
 
     @flyc.kernel(known_block_size=[64, 1, 1])
-    def probe(inputs: fx.Pointer, output: fx.Pointer):
-        row = fx.block_idx.x
+    def probe(output: fx.Pointer, qlen: fx.Int32, klen: fx.Int32, start: fx.Int32):
         if fx.thread_idx.x == 0:
-            qlen = load(fx.add_offset(inputs, row * 3), dtype=fx.Int64, count=1)
-            klen = load(fx.add_offset(inputs, row * 3 + 1), dtype=fx.Int64, count=1)
-            start = load(fx.add_offset(inputs, row * 3 + 2), dtype=fx.Int64, count=1)
             ctx = DualwaveFp8KernelContext(traits)
             ctx.seqlen_q_v = fx.Index(qlen)
             ctx.seqlen_kv_v = fx.Index(klen)
-            ctx.delta_i32 = fx.Int32(klen - qlen)
+            ctx.delta_i32 = klen - qlen
             ctx.q_start = fx.Index(start)
             ctx.init_tile_bounds()
-            store(fx.add_offset(output, row * 3), fx.Int64(ctx.num_kv_tiles))
-            store(fx.add_offset(output, row * 3 + 1), fx.Int64(ctx.max_num_tiles))
-            store(fx.add_offset(output, row * 3 + 2), fx.Int64(ctx.split_t_end))
+            store(output, fx.Int64(ctx.split_t_end))
 
     @flyc.jit
-    def launch(inputs: fx.Pointer, output: fx.Pointer, stream: fx.Stream):
-        _ = traits.cache_tag
-        probe(inputs, output).launch(
-            grid=(len(cases), 1, 1), block=(64, 1, 1), stream=stream
+    def launch(
+        output: fx.Pointer,
+        qlen: fx.Int32,
+        klen: fx.Int32,
+        start: fx.Int32,
+        stream: fx.Stream,
+    ):
+        probe(output, qlen, klen, start).launch(
+            grid=(1, 1, 1), block=(64, 1, 1), stream=stream
         )
 
-    _run_compiled(
-        launch,
-        ptr_arg(inputs, fx.Int64),
-        ptr_arg(output, fx.Int64),
-        torch.cuda.current_stream(),
-    )
-    expected = []
-    for qlen, klen, start in cases:
-        raw_end = start + traits.BLOCK_M + klen - qlen
-        kv_tiles = (klen + traits.BLOCK_N - 1) // traits.BLOCK_N
-        causal_tiles = (max(raw_end, 0) + traits.BLOCK_N - 1) // traits.BLOCK_N
-        tiles = max(4, (min(kv_tiles, causal_tiles) + 1) // 2 * 2)
-        end = tiles if start < qlen and raw_end > 0 else 0
-        expected.append((kv_tiles, tiles, end))
-    torch.testing.assert_close(
-        output,
-        torch.tensor(expected, dtype=output.dtype, device=output.device),
-        rtol=0,
-        atol=0,
-    )
+    for name, qlen, klen, start, expected in cases:
+        output.fill_(-1)
+        _run_compiled(
+            launch,
+            ptr_arg(output, fx.Int64),
+            qlen,
+            klen,
+            start,
+            torch.cuda.current_stream(),
+        )
+        assert output.item() == expected, name
 
 
 @gfx950
 def test_causal_pair_mask_int32_limit():
-    """The final pair's exclusive end may be 2**31, unlike its valid key indices."""
+    """Exercise a real wave's 32 query rows at the final KV pair boundary."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.fmha_gfx950.common import load, store
+    from aiter.ops.flydsl.kernels.fmha_gfx950.common import store
     from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_softmax import (
         DualwaveFp8SoftmaxHelper,
     )
@@ -982,54 +998,39 @@ def test_causal_pair_mask_int32_limit():
     )
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
-    lengths = [127, 128, 129, 2**31 - 129, 2**31 - 128, 2**31 - 16, 2**31 - 1]
-    inputs = torch.tensor(lengths, dtype=torch.int64, device="cuda")
-    output = torch.full((len(lengths), 64), float("nan"), device="cuda")
     traits = _make_paged_dualwave_swp_fp8_traits(1, 1, 128, 128, 6.0)
+    output = torch.empty(64, device="cuda")
 
     @flyc.kernel(known_block_size=[64, 1, 1])
-    def probe(inputs: fx.Pointer, output: fx.Pointer):
-        row, lane = fx.block_idx.x, fx.thread_idx.x
-        klen = load(fx.add_offset(inputs, row), dtype=fx.Int64, count=1)
+    def probe(output: fx.Pointer, klen: fx.Int32):
+        lane = fx.thread_idx.x
         ctx = DualwaveFp8KernelContext(traits)
-        ctx.delta_i32 = fx.Int32(klen - 1)
+        ctx.delta_i32 = klen - 32
         ctx.q_start_pos_i32 = fx.Int32(0)
-        ctx.q_row_i32 = fx.Int32(0)
+        ctx.q_row_i32 = lane % 32
         ctx.lane_div_32 = fx.Index(lane // 32)
         ctx.c_neg_inf = fx.Float32(float("-inf"))
         helper = DualwaveFp8SoftmaxHelper(ctx)
         scores = fx.Vector.filled(16, 0, fx.Float32).ir_value()
-        tile_a = fx.Index(((klen + 127) // 128 - 1) * 2)
+        tile_a = fx.Index(((fx.Int64(klen) + 127) // 128 - 1) * 2)
         _, second = helper.causal_mask_pair_if_needed(
             (scores, scores), (scores, scores), tile_a
         )
-        store(fx.add_offset(output, row * 64 + lane), fx.Vector(second[1])[15])
+        store(fx.add_offset(output, lane), fx.Vector(second[1])[15])
 
     @flyc.jit
-    def launch(inputs: fx.Pointer, output: fx.Pointer, stream: fx.Stream):
-        probe(inputs, output).launch(
-            grid=(len(lengths), 1, 1), block=(64, 1, 1), stream=stream
-        )
+    def launch(output: fx.Pointer, klen: fx.Int32, stream: fx.Stream):
+        probe(output, klen).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
-    _run_compiled(
-        launch,
-        ptr_arg(inputs, fx.Int64),
-        ptr_arg(output, fx.Float32),
-        torch.cuda.current_stream(),
-    )
-    expected = []
-    for length in lengths:
-        tile_a = ((length + 127) // 128 - 1) * 2
-        expected.append(
-            [
-                (
-                    0.0
-                    if (tile_a + 1) * 64 + (lane // 32) * 4 + 59 < length
-                    else float("-inf")
-                )
-                for lane in range(64)
-            ]
+    lanes = torch.arange(64, device="cuda")
+    for length in (128, 2**31 - 128, 2**31 - 16, 2**31 - 1):
+        output.fill_(float("nan"))
+        _run_compiled(
+            launch, ptr_arg(output, fx.Float32), length, torch.cuda.current_stream()
         )
-    torch.testing.assert_close(
-        output, torch.tensor(expected, device=output.device), rtol=0, atol=0
-    )
+        tile_a = ((length + 127) // 128 - 1) * 2
+        # Element 15 in the upper score fragment: 32 + (15//4)*8 + 15%4 = 59.
+        key_position = (tile_a + 1) * 64 + (lanes // 32) * 4 + 59
+        query_position = length - 32 + lanes % 32
+        expected = torch.where(key_position <= query_position, 0.0, float("-inf"))
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)

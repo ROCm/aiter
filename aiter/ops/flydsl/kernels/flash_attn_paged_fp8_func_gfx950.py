@@ -15,6 +15,7 @@ from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
     _is_valid_softmax_scale,
 )
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
+    PAGED_FP8_BLOCK_M,
     PAGED_FP8_BUFFER_LIMIT_BYTES,
 )
 
@@ -89,6 +90,7 @@ def _build(
     lazy,
     metadata_mode,
     has_last_page_lens,
+    guard_output_rows,
 ):
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_paged_fp8_gfx950 import (
         build_flash_attn_paged_fp8_module,
@@ -112,6 +114,7 @@ def _build(
         dualwave_swp_lazy_rescale=lazy,
         metadata_mode=metadata_mode,
         has_last_page_lens=has_last_page_lens,
+        guard_output_rows=guard_output_rows,
     )
 
 
@@ -300,6 +303,16 @@ def flydsl_flash_attn_paged_fp8_func(
                 page_size in (1, 16)
                 and max(k.numel(), v.numel()) <= PAGED_FP8_BUFFER_LIMIT_BYTES
             )
+            # Include any packed request base and every padded launch row.
+            # Below this byte bound, descriptor checking alone cannot wrap.
+            padded_q = (
+                (int(max_seqlen_q) + PAGED_FP8_BLOCK_M - 1)
+                // PAGED_FP8_BLOCK_M
+                * PAGED_FP8_BLOCK_M
+            )
+            guard_output_rows = (q.shape[0] + padded_q) * q.shape[
+                1
+            ] * value_dim * out.element_size() > (1 << 32)
             launch = _build(
                 num_heads=q.shape[1],
                 num_kv_heads=kv_heads,
@@ -313,6 +326,7 @@ def flydsl_flash_attn_paged_fp8_func(
                 lazy=dualwave_swp_lazy_rescale,
                 metadata_mode="csr" if csr else "block_table",
                 has_last_page_lens=has_last,
+                guard_output_rows=guard_output_rows,
             )
             if stream is not None:
                 # Copies must keep their caller-owned sources alive too, even

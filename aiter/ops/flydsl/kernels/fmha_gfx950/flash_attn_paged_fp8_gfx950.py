@@ -62,6 +62,7 @@ def build_flash_attn_paged_fp8_module(
     cache_buffered=False,
     metadata_mode="block_table",
     has_last_page_lens=False,
+    guard_output_rows=True,
 ):
     """Build the gfx950 packed-varlen paged FP8 attention launcher.
 
@@ -71,6 +72,8 @@ def build_flash_attn_paged_fp8_module(
     callers supply native cache tensors, flat contiguous Q/O, int32 metadata
     and one-element fp32 descales for both launch and explicit compilation;
     the public interface owns shape validation, copies and empty outputs.
+    Only disable output-row guarding when the caller proves that every
+    launched row's byte offset fits the hardware's 32-bit buffer offset.
     """
     gpu_arch = get_hip_arch()
     if value_head_dim is None:
@@ -135,6 +138,7 @@ def build_flash_attn_paged_fp8_module(
         cache_buffered=cache_buffered,
         metadata_mode=metadata_mode,
         has_last_page_lens=has_last_page_lens,
+        guard_output_rows=guard_output_rows,
     )
     BLOCK_M = traits.BLOCK_M
     BLOCK_SIZE = traits.BLOCK_SIZE
@@ -144,7 +148,6 @@ def build_flash_attn_paged_fp8_module(
     BATCH_INTERLEAVE_GROUP = traits.BATCH_INTERLEAVE_GROUP
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_O_N = traits.NUM_HEADS_Q * traits.HEAD_DIM_V
-    DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
     _dualwave_swp_fp8_cache_tag = traits.cache_tag
 
     @fx.struct
@@ -185,10 +188,7 @@ def build_flash_attn_paged_fp8_module(
             QDescale=QDescale,
             KDescale=KDescale,
             VDescale=VDescale,
-            seq_len=seq_len,
-            seq_len_kv=seq_len_kv,
             stride_q_n=stride_q_n,
-            stride_kv_n=DEFAULT_STRIDE_KV_N,
             softmax_scale=softmax_scale,
             stride_o_n=DEFAULT_STRIDE_O_N if PAIRED_PAGE_IDS else stride_o_n,
             BlockTable=BlockTable,
@@ -227,8 +227,8 @@ def build_flash_attn_paged_fp8_module(
 
         def _softmax_part(v_s, l_row, m_new):
             v_s = softmax_helper.sub_m(v_s, m_new)
-            v_p = softmax_helper.exp2(v_s, 0, 16)
-            v_p = softmax_helper.exp2(v_p, 16, 16)
+            v_p = softmax_helper.exp2(v_s, 0)
+            v_p = softmax_helper.exp2(v_p, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p)
             v_p = gemm_helper.cast_p_fp8_direct(v_p)
             return v_p, l_row
