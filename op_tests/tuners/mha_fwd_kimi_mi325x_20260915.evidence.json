@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "family": "mha_fwd",
+  "run_state": "verified",
+  "strategy": "exhaustive",
+  "hardware": {
+    "gfx": "gfx942",
+    "gpu_model": "mi325x",
+    "cu_num": 304,
+    "device_name": "AMD Instinct MI325X",
+    "visible_devices": [0, 1, 2, 3, 6, 7]
+  },
+  "software": {
+    "aiter_revision": "8262bb4a1926b1a822cc26b31d0818d104157e5b",
+    "working_tree": "dirty; measured split-KV and tuner changes are in the contribution diff",
+    "torch": "2.12.0+rocm7.14.0",
+    "rocm": "7.14.60850"
+  },
+  "catalogue": "op_tests/tuners/_full_kimi_mha.csv",
+  "command": "PYTHONPATH=. HIP_VISIBLE_DEVICES=0,1,2,3,6,7 python op_tests/tuners/tune_mha_fwd.py -i op_tests/tuners/_full_kimi_mha.csv -o /tmp/mha_full_tuned.csv -o2 /tmp/mha_full_all.csv --mp 6",
+  "measurement": {
+    "started_at": "2026-09-15T12:53:10.635Z",
+    "elapsed_seconds": 4834.006,
+    "warmup_iterations": 5,
+    "timed_iterations": 101,
+    "problem_signatures": 2,
+    "candidates_per_signature": 1449,
+    "candidate_results": 2898,
+    "ok": 2178,
+    "failed_legacy_untyped": 720,
+    "error_metric": "fraction failing elementwise allclose",
+    "maximum_error_ratio": 0.0,
+    "rtol": 0.02,
+    "atol": 0.02
+  },
+  "winners": [
+    {
+      "return_lse": false,
+      "backend": "asm_v3",
+      "num_splits": 3,
+      "latency_us": 2137.1321,
+      "errRatio": 0.0,
+      "tflops": 628.5179357888079
+    },
+    {
+      "return_lse": true,
+      "backend": "asm_v3",
+      "num_splits": 3,
+      "latency_us": 2137.1336,
+      "errRatio": 0.0,
+      "tflops": 628.5174946479714
+    }
+  ],
+  "matched_baselines": [
+    {
+      "return_lse": false,
+      "backend": "asm_v3",
+      "num_splits": 1,
+      "latency_us": 2805.2829,
+      "split3_latency_reduction_pct": 23.817591
+    },
+    {
+      "return_lse": true,
+      "backend": "asm_v3",
+      "num_splits": 1,
+      "latency_us": 2811.1835,
+      "split3_latency_reduction_pct": 23.977442
+    }
+  ],
+  "result_artifacts": [
+    {
+      "path": "/tmp/mha_full_tuned.csv",
+      "sha256": "27f50550dc79c605f9165eb46c09caca9dbce968620e4a1f3895c96c66106ae8"
+    },
+    {
+      "path": "/tmp/mha_full_all.csv",
+      "sha256": "6f8c222233f0502fe1ffc0d12dcab6c95532196a225475dc0910e34208a28ac2"
+    }
+  ],
+  "selection_proof": {
+    "command": "python op_tests/tuners/tune_mha_fwd.py -i aiter/configs/untuned_mha_fwd.csv -o aiter/configs/tuned_mha_fwd.csv --run_config aiter/configs/tuned_mha_fwd.csv --warmup 2 --iters 5 --timeout 600",
+    "fresh_process_per_signature": true,
+    "public_operator": "aiter.ops.mha.flash_attn_varlen_func",
+    "expected_backend": "asm_v3",
+    "expected_num_splits": 3,
+    "observed_backend": "asm_v3",
+    "observed_num_splits": 3,
+    "correctness": "ok"
+  },
+  "limitations": [
+    "The completed exhaustive run predates typed candidate failure statuses, so its 720 Triton failures remain classified only as failed.",
+    "CK runtime configuration remains owned by Aiter PR #5024 JSON.",
+    "Triton and Gluon runtime configuration remains owned by the nested JSON resolver."
+  ]
+}
