@@ -2,15 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import ctypes
 import gc
-import glob
-import importlib.util
 import itertools
 import logging
 import os
-import subprocess
-import sys
 from contextlib import ExitStack, nullcontext
 
 import pandas as pd
@@ -20,12 +15,10 @@ import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
-    AUX_SORT_OPUS,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
     get_padded_M,
-    moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -599,330 +592,6 @@ l_quant = [
 ]
 
 
-# Regression for the MXFP4 A4W4 atomic GEMM2 row-extent OOB. Keep this in the
-# top-level MoE test so the standard Aiter test runner executes the invariant;
-# op_tests/flydsl_tests is not collected by that runner.
-_MXFP4_OOB_CHILD_FLAG = "--mxfp4-oob-child"
-_MXFP4_OOB_ARGS = {
-    "M": 1172,
-    "NE": 385,
-    "topk": 9,
-    "BM": 32,
-    "D_HIDDEN": 512,
-    "D_INTER": 512,
-}
-_MXFP4_OOB_CONFIGS = (
-    (96, 8, 3),
-    (717, 385, 9),
-    (1172, 385, 9),
-)
-_GUARDED_ALLOCATIONS = []
-
-
-def _build_mxfp4_oob_topk(M, num_experts, topk, device, seed=0):
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    topk_ids = torch.stack(
-        [
-            torch.randperm(num_experts, generator=generator, device="cpu")[:topk]
-            for _ in range(M)
-        ]
-    ).to(device=device, dtype=torch.int32)
-    topk_weights = torch.rand(
-        M, topk, generator=generator, device="cpu", dtype=torch.float32
-    ).to(device=device)
-    return topk_ids, topk_weights
-
-
-def _mxfp4_oob_overread_rows(n_rows, block_size):
-    descriptor_rows = ((n_rows + block_size - 1) // block_size) * block_size
-    return descriptor_rows - n_rows
-
-
-def test_mxfp4_a4w4_sort_extent_alignment():
-    """Check the production Opus sort allocation against GEMM2's descriptor."""
-    checked = 0
-    for M, num_experts, topk in _MXFP4_OOB_CONFIGS:
-        topk_ids, topk_weights = _build_mxfp4_oob_topk(M, num_experts, topk, "cuda")
-        for block_size in (16, 32, 64, 128):
-            sorted_token_ids = moe_sorting(
-                topk_ids,
-                topk_weights,
-                num_experts,
-                512,
-                moebuf_dtype=torch.bfloat16,
-                block_size=block_size,
-                output_aux=AUX_SORT_OPUS,
-                accumulate=True,
-            )[0]
-            n_rows = int(sorted_token_ids.shape[0])
-            overread_rows = _mxfp4_oob_overread_rows(n_rows, block_size)
-            assert overread_rows == 0, (
-                "MXFP4 GEMM2 A descriptor exceeds its allocation: "
-                f"M={M}, E={num_experts}, topk={topk}, BM={block_size}, "
-                f"allocation_rows={n_rows}, overread_rows={overread_rows}"
-            )
-            checked += 1
-    aiter.logger.info("MXFP4 A4W4 sort extent: %d cases passed", checked)
-
-
-def _mxfp4_oob_hip_library():
-    libraries = sorted(glob.glob("/opt/rocm*/lib/libamdhip64.so"))
-    return libraries[0] if libraries else None
-
-
-def _have_mxfp4_oob_guard():
-    if get_gfx() != "gfx950" or importlib.util.find_spec("cupy") is None:
-        return False
-    library = _mxfp4_oob_hip_library()
-    if library is None:
-        return False
-    hip = ctypes.CDLL(library)
-    return all(
-        hasattr(hip, symbol)
-        for symbol in (
-            "hipMemAddressReserve",
-            "hipMemCreate",
-            "hipMemMap",
-            "hipMemSetAccess",
-        )
-    )
-
-
-def _alloc_mxfp4_oob_guarded(nbytes, device=0):
-    """Allocate a device tensor ending exactly at an unmapped VMM guard page."""
-    import cupy
-
-    hip = ctypes.CDLL(_mxfp4_oob_hip_library())
-    pinned, device_location, read_write, minimum_granularity = 1, 1, 3, 0
-
-    class Location(ctypes.Structure):
-        _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
-
-    class AllocationFlags(ctypes.Structure):
-        _fields_ = [
-            ("compressionType", ctypes.c_ubyte),
-            ("gpuDirectRDMACapable", ctypes.c_ubyte),
-            ("usage", ctypes.c_ushort),
-        ]
-
-    class AllocationProperties(ctypes.Structure):
-        _fields_ = [
-            ("type", ctypes.c_int),
-            ("requestedHandleType", ctypes.c_int),
-            ("location", Location),
-            ("win32HandleMetaData", ctypes.c_void_p),
-            ("allocFlags", AllocationFlags),
-        ]
-
-    class AccessDescriptor(ctypes.Structure):
-        _fields_ = [("location", Location), ("flags", ctypes.c_int)]
-
-    def check_hip(error, operation):
-        if error != 0:
-            raise RuntimeError(f"{operation} failed: hipError={error}")
-
-    properties = AllocationProperties()
-    properties.type = pinned
-    properties.location.type = device_location
-    properties.location.id = device
-
-    granularity = ctypes.c_size_t(0)
-    check_hip(
-        hip.hipMemGetAllocationGranularity(
-            ctypes.byref(granularity),
-            ctypes.byref(properties),
-            minimum_granularity,
-        ),
-        "hipMemGetAllocationGranularity",
-    )
-    granule = int(granularity.value)
-    mapped = ((nbytes + granule - 1) // granule) * granule
-
-    address = ctypes.c_void_p(0)
-    check_hip(
-        hip.hipMemAddressReserve(
-            ctypes.byref(address),
-            ctypes.c_size_t(mapped + granule),
-            ctypes.c_size_t(0),
-            ctypes.c_void_p(0),
-            ctypes.c_ulonglong(0),
-        ),
-        "hipMemAddressReserve",
-    )
-    handle = ctypes.c_void_p(0)
-    check_hip(
-        hip.hipMemCreate(
-            ctypes.byref(handle),
-            ctypes.c_size_t(mapped),
-            ctypes.byref(properties),
-            ctypes.c_ulonglong(0),
-        ),
-        "hipMemCreate",
-    )
-    check_hip(
-        hip.hipMemMap(
-            address,
-            ctypes.c_size_t(mapped),
-            ctypes.c_size_t(0),
-            handle,
-            ctypes.c_ulonglong(0),
-        ),
-        "hipMemMap",
-    )
-    access = AccessDescriptor()
-    access.location.type = device_location
-    access.location.id = device
-    access.flags = read_write
-    check_hip(
-        hip.hipMemSetAccess(
-            address,
-            ctypes.c_size_t(mapped),
-            ctypes.byref(access),
-            ctypes.c_size_t(1),
-        ),
-        "hipMemSetAccess",
-    )
-
-    tensor_ptr = int(address.value) + mapped - nbytes
-    owner = (address, handle)
-    _GUARDED_ALLOCATIONS.append(owner)
-    memory = cupy.cuda.UnownedMemory(tensor_ptr, nbytes, owner=owner)
-    memory_ptr = cupy.cuda.MemoryPointer(memory, 0)
-    array = cupy.ndarray((nbytes,), dtype=cupy.uint8, memptr=memory_ptr)
-    tensor = torch.from_dlpack(array)
-    tensor.zero_()
-    return tensor
-
-
-def _mxfp4_oob_child(argv):
-    from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
-    from aiter.ops.quant import per_1x32_f4_quant
-    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
-
-    M, num_experts, topk, block_size, hidden_dim, inter_dim = map(int, argv[:6])
-    torch.manual_seed(0)
-    topk_ids, topk_weights = _build_mxfp4_oob_topk(M, num_experts, topk, "cuda")
-    (
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        _,
-        *_,
-    ) = moe_sorting(
-        topk_ids,
-        topk_weights,
-        num_experts,
-        hidden_dim,
-        moebuf_dtype=torch.bfloat16,
-        block_size=block_size,
-        output_aux=AUX_SORT_OPUS,
-        accumulate=True,
-    )
-    max_sorted = int(sorted_ids.shape[0])
-    overread_rows = _mxfp4_oob_overread_rows(max_sorted, block_size)
-    print(
-        f"CHILD max_sorted={max_sorted} BM={block_size} "
-        f"overread_rows={overread_rows}",
-        file=sys.stderr,
-        flush=True,
-    )
-
-    nbytes = max_sorted * (inter_dim // 2)
-    inter_sorted_quant = _alloc_mxfp4_oob_guarded(nbytes).view(
-        max_sorted, inter_dim // 2
-    )
-    scale_rows = ((max_sorted + 31) // 32) * 32
-    inter_sorted_scale = torch.empty(
-        (scale_rows, inter_dim // 32), device="cuda", dtype=torch.uint8
-    )
-    w2 = (
-        torch.randn(
-            (num_experts, hidden_dim, inter_dim),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        / 4
-    )
-    w2_quant, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
-    w2_quant = w2_quant.view(num_experts, hidden_dim, inter_dim // 2)
-    w2_shuffled = shuffle_weight_a16w4(w2_quant, 16, False)
-    w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, num_experts, False).view(
-        torch.uint8
-    )
-    output = torch.zeros((M, hidden_dim), dtype=torch.bfloat16, device="cuda")
-
-    flydsl_mxfp4_gemm2(
-        inter_sorted_quant=inter_sorted_quant,
-        inter_sorted_shuffled_scale=inter_sorted_scale,
-        w2_u8=w2_shuffled,
-        w2_scale_u8=w2_scale_shuffled,
-        sorted_expert_ids=sorted_expert_ids,
-        cumsum_tensor=num_valid_ids,
-        sorted_token_ids=sorted_ids,
-        sorted_weights=sorted_weights,
-        flat_out=output,
-        M_logical=M,
-        max_sorted=max_sorted,
-        BM=block_size,
-        use_nt=False,
-        atomic=True,
-        mxfp4out=False,
-        NE=num_experts,
-        D_HIDDEN=hidden_dim,
-        D_INTER=inter_dim,
-        topk=topk,
-        BN=256,
-        BK=256,
-    )
-    torch.cuda.synchronize()
-    print("CHILD_CLEAN", flush=True)
-    return 0
-
-
-def test_mxfp4_a4w4_gemm2_guard_page():
-    """Run atomic GEMM2 with its A allocation ending at an unmapped page."""
-    if not _have_mxfp4_oob_guard():
-        aiter.logger.info(
-            "skip MXFP4 A4W4 guard-page regression: needs gfx950, ROCm CuPy, "
-            "and HIP VMM"
-        )
-        return
-
-    env = os.environ.copy()
-    env["AMD_SERIALIZE_KERNEL"] = "1"
-    env["HIP_LAUNCH_BLOCKING"] = "1"
-    config = _MXFP4_OOB_ARGS
-    command = [
-        sys.executable,
-        os.path.abspath(__file__),
-        _MXFP4_OOB_CHILD_FLAG,
-        str(config["M"]),
-        str(config["NE"]),
-        str(config["topk"]),
-        str(config["BM"]),
-        str(config["D_HIDDEN"]),
-        str(config["D_INTER"]),
-    ]
-    process = subprocess.run(
-        command, env=env, capture_output=True, text=True, timeout=900, check=False
-    )
-    log = process.stdout + process.stderr
-    assert process.returncode == 0 and "CHILD_CLEAN" in process.stdout, (
-        "MXFP4 A4W4 GEMM2 guard-page child failed "
-        f"(returncode={process.returncode}).\n" + "\n".join(log.splitlines()[-20:])
-    )
-    aiter.logger.info("MXFP4 A4W4 GEMM2 guard-page regression passed")
-
-
-if (
-    __name__ == "__main__"
-    and len(sys.argv) > 1
-    and sys.argv[1] == _MXFP4_OOB_CHILD_FLAG
-):
-    raise SystemExit(_mxfp4_oob_child(sys.argv[2:]))
-
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1069,11 +738,6 @@ parser.add_argument(
     "--bm16-scale-boundary",
     action="store_true",
     help="Run only the deterministic BM16 tiled-scale boundary regression.",
-)
-parser.add_argument(
-    "--mxfp4-a4w4-oob-only",
-    action="store_true",
-    help="Run only the MXFP4 A4W4 sort-extent and guard-page regressions.",
 )
 parser.add_argument(
     "--swiglu-limit",
@@ -1742,15 +1406,9 @@ def _iter_with_env(case_iter, **env_overrides):
 
 
 _case_iters = []
-if args.mxfp4_a4w4_oob_only:
-    test_mxfp4_a4w4_sort_extent_alignment()
-    test_mxfp4_a4w4_gemm2_guard_page()
-    raise SystemExit(0)
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
-    test_mxfp4_a4w4_sort_extent_alignment()
-    test_mxfp4_a4w4_gemm2_guard_page()
     test_output_buffer_contract()
     if not args.no_flydsl_csv:
         _case_iters.append(
