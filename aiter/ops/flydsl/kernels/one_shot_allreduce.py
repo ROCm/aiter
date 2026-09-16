@@ -567,7 +567,7 @@ def make_one_shot_allreduce_kernel(
         "lds_bytes": 0,
         "tile_bytes": tile_bytes,
         "wire_tile_bytes": wire_tile_bytes,
-        # Shims for ``quick_allreduce_int4._StEngine``, which is reused verbatim for the IPC
+        # Shims for ``quick_allreduce._StEngine``, which is reused verbatim for the IPC
         # inbox and peer table. This schedule has no super-tile (one round per
         # tile, nothing to batch) and no per-rank tile split (every rank sends
         # the whole tile), so the two are 1 and the full tile respectively.

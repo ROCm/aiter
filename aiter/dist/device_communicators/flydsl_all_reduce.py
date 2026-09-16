@@ -42,15 +42,15 @@ logger = logging.getLogger(__name__)
 try:
     from aiter.ops.flydsl import allreduce_policy as policy
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
-    from aiter.ops.flydsl.quick_allreduce_int4 import (
-        QuickAllReduceInt4,
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduce,
         has_xgmi_peer_links,
     )
 
     _IMPORT_OK = True
 except Exception:  # noqa: BLE001
     policy = None
-    OneShotAllReduce = QuickAllReduceInt4 = has_xgmi_peer_links = None
+    OneShotAllReduce = FlyQuickAllReduce = has_xgmi_peer_links = None
     _IMPORT_OK = False
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
@@ -182,10 +182,10 @@ class FlyDSLAllReduce:
             # own guard and the two cannot disagree.
             return OneShotAllReduce(**common, max_bytes=self.policy.oneshot_max)
         # min_bytes=0: the family boundary above already decided this engine is
-        # the right one for the payload, and QuickAllReduceInt4's own floor is
+        # the right one for the payload, and FlyQuickAllReduce's own floor is
         # a standalone guard rail that would otherwise reject sizes the policy
         # just chose it for.
-        return QuickAllReduceInt4(
+        return FlyQuickAllReduce(
             **common,
             algorithm="mesh" if family == "mesh" else "ring",
             min_bytes=0,

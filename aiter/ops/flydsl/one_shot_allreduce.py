@@ -30,7 +30,7 @@ from .kernels.one_shot_allreduce import (
 )
 from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _run_compiled
-from .quick_allreduce_int4 import (
+from .quick_allreduce import (
     _SUPPORTED_ARCHS,
     _cuda_index,
     _resolve_inbox_flags,
@@ -55,7 +55,7 @@ class OneShotAllReduce:
     """IPC inbox + launch wrapper for ``one_shot_allreduce``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange,
-    the same constraint ``QuickAllReduceInt4`` has and for the same reason.
+    the same constraint ``FlyQuickAllReduce`` has and for the same reason.
 
     ``atoms``, ``grid_cap`` and ``fanout`` are the tuning surface.
 
@@ -64,7 +64,7 @@ class OneShotAllReduce:
     That ceiling is the point of the class: wire volume is ``(N-1)*S`` against a
     two-shot's ``2(N-1)/N*S``, so where it stops paying is a function of ``N``.
 
-    ``inbox_memory`` follows ``QuickAllReduceInt4``: ``"auto"`` picks ``uncached`` on xGMI
+    ``inbox_memory`` follows ``FlyQuickAllReduce``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
     MI350X and MI350P both report ``gfx950`` and want opposite answers.
     """
@@ -292,7 +292,7 @@ class OneShotAllReduce:
         """Identity of the binary an *nbytes* payload would run.
 
         ``<jit symbol>/g<grid_cap>/x<grid_x>``, matching
-        ``QuickAllReduceInt4.variant``. Resolves the rung through the same ``_pick_cfg`` the launch path uses,
+        ``FlyQuickAllReduce.variant``. Resolves the rung through the same ``_pick_cfg`` the launch path uses,
         so for a ladder-driven engine this is the only way to see which rung a
         given size takes.
         """
@@ -319,7 +319,7 @@ class OneShotAllReduce:
                 f"{self.max_bytes} B ceiling: this kernel pushes the whole "
                 "payload to every peer, so its wire volume is (N-1)x the "
                 "message where a mesh schedule moves 2(N-1)/N. Route large messages "
-                "to QuickAllReduceInt4 or cross_device_reduce, or pass max_bytes to "
+                "to FlyQuickAllReduce or cross_device_reduce, or pass max_bytes to "
                 "override."
             )
         self._launch(inp, out, stream, live_bytes=live_bytes)

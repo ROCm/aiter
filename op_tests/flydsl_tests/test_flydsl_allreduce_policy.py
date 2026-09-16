@@ -19,8 +19,12 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     SUPPORTED_ATOMS,
     oneshot_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import MESH_ST_LADDER, SUPER_TILES
-from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import (
+from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
+    MESH_ST_LADDER,
+    SUPER_TILES,
+    mesh_st_ladder,
+)
+from aiter.ops.flydsl.kernels.quick_allreduce_ring import (
     RING_SUPER_TILES,
     ring_st_ladder,
 )
@@ -104,9 +108,15 @@ def test_ladders_are_well_formed(ws):
     A ladder that does not start at 0 leaves the smallest payloads with no rung;
     one that is not ascending makes ``_pick_st``/``_pick_cfg`` -- which take the
     *last* rung at or below the payload -- select something arbitrary.
+
+    The mesh has one ladder per codec, and every one of them has to hold.
     """
+    mesh_ladders = [
+        (f"mesh/{codec}", mesh_st_ladder(codec, ws), SUPER_TILES)
+        for codec in MESH_ST_LADDER
+    ]
     for name, rungs, valid_st in (
-        ("mesh", MESH_ST_LADDER[ws], SUPER_TILES),
+        *mesh_ladders,
         ("ring", ring_st_ladder(ws), RING_SUPER_TILES),
     ):
         assert rungs, name
@@ -140,10 +150,14 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
     p = P.resolve("pcie", ws, mode="fast")
     for _floor, *_ in oneshot_ladder(ws)[1:]:
         assert _floor < p.oneshot_max, ("oneshot", ws, _floor)
-    for floor, *_ in MESH_ST_LADDER[ws][1:]:
-        assert floor < p.mesh_max, ("mesh", ws, floor)
-    # Ring rungs are offsets into an unbounded window, so only the ordering
-    # above constrains them.
+    # The INT4 mesh ladder is the one the dispatcher walks: it is what the
+    # per-N codec defaults resolve to, and it was fitted against this window.
+    for floor, *_ in mesh_st_ladder("int4", ws)[1:]:
+        assert floor < p.mesh_max, ("mesh/int4", ws, floor)
+    # INT6's rungs are not checked here. They sit far above the PCIe mesh
+    # window (38 MiB against a 3-12 MiB ``mesh_max``) because INT6 is shipped
+    # on xGMI, where ``mesh_max`` is unbounded and the ring is never
+    # auto-selected. Like the ring's, only the ordering above constrains them.
 
 
 def _env(**kw):
