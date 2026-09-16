@@ -548,14 +548,8 @@ def _flash_attn_forward(
             device=q.device,
             dtype=torch.float32,
         )
-        dropout_mask = torch.zeros(
-            (batch, num_q_heads, max_seqlen_q, max_seqlen_k),
-            device=q.device,
-            dtype=torch.float32,
-        )
     else:
         s_dmask = None
-        dropout_mask = None
 
     if _MHA_IMPL == "dao_ai":
         assert sink is None, "dao_ai impl does not support attention sink."
@@ -635,7 +629,6 @@ def _flash_attn_forward(
             o,
             alibi_slopes,
             s_dmask,
-            dropout_mask,
             softmax_lse,
             sink,
             *q_strides,

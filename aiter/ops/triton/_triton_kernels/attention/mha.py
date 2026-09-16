@@ -92,7 +92,6 @@ def _attn_fwd_inner(
     seqlen_q,
     dropout_p,
     sd_mask_ptrs,
-    dropout_mask_ptrs,
     philox_seed,
     philox_ptrs,
     block_min,
@@ -225,14 +224,32 @@ def _attn_fwd_inner(
                 philox_seed, philox_ptrs
             )  # TODO: use tl.randint for better performance
             dropout_mask = rng_output > dropout_p
-            tl.store(dropout_mask_ptrs, dropout_mask, mask=p_mask)
+
+            # WORKAROUND for a gfx950 backend miscompile. `p_kept` is
+            # materialized *before* `sd_mask`; both are selects on
+            # `dropout_mask` over `p`. With the sd_mask select emitted first,
+            # `v`'s data leaks into `p`, so `sd_mask` and `lse` -- which cannot
+            # depend on `v` -- change when only `v` changes.
+            #
+            # The reordering is semantically a no-op: identical TTGIR op
+            # multiset, and the LLVM IR differs only by +32 integer `add`.
+            #
+            # It is NOT a complete fix. The defect is codegen-sensitive, and
+            # other BLOCK_M/num_warps combinations still reproduce it (e.g.
+            # BLOCK_M=128 at num_warps=8 fails test_mha_varlen_with_pe for
+            # 96/64 4/4 64-128). It is also not simply register pressure: a
+            # variant with 98% fewer VGPR spills still miscompiles. Only the
+            # combination of this ordering with the shipped `pe_dropout_or_fp32`
+            # entry (BLOCK_M=256, BLOCK_N=64, num_warps=8, PRELOAD_V=True) is
+            # validated. See isa_dump/COMPILER_BUG.md.
+            p_kept = tl.where(dropout_mask, p, 0.0)
 
             # return scores with negative values for dropped vals
             sd_mask = tl.where(dropout_mask, p, -p)
             tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
 
             # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
+            p = p_kept
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             tl.store(sd_mask_ptrs, p, mask=p_mask)
@@ -268,7 +285,6 @@ def _attn_fwd_inner(
             sd_mask_ptrs += BLOCK_N * stride_sn
 
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += BLOCK_N * stride_sn
             philox_ptrs += BLOCK_N * stride_sn
 
     return acc, l_i, m_i
@@ -306,7 +322,6 @@ def _attn_fwd(
     out_ptr: torch.Tensor,
     alibi_slopes_ptr: torch.Tensor,
     s_dmask_ptr: torch.Tensor,
-    dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
     sink_ptr: torch.Tensor,
     stride_qz_in,
@@ -662,14 +677,7 @@ def _attn_fwd(
         s_dmask_ptrs = None
 
     # dropout
-    if dropout_mask_ptr is not None:
-        dropout_mask_offs = (
-            off_z * stride_sd_z
-            + off_q_head * stride_sd_h
-            + offs_m[:, None] * stride_sd_m
-            + offs_n[None, :] * stride_sd_n
-        )
-        dropout_mask_ptrs = dropout_mask_ptr + dropout_mask_offs
+    if ENABLE_DROPOUT:
         philox_ptrs = (
             philox_offset_base
             + off_z * stride_sd_z
@@ -678,7 +686,6 @@ def _attn_fwd(
             + offs_n[None, :] * stride_sd_n
         )
     else:
-        dropout_mask_ptrs = None
         philox_ptrs = None
 
     if ENABLE_SINK:
@@ -752,7 +759,6 @@ def _attn_fwd(
         if RETURN_SCORES:
             s_dmask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
             philox_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
@@ -775,7 +781,6 @@ def _attn_fwd(
             seqlen_q,
             dropout_p,
             s_dmask_ptrs,
-            dropout_mask_ptrs,
             philox_seed,
             philox_ptrs,
             block_min,
@@ -822,7 +827,7 @@ def _attn_fwd(
         if RETURN_SCORES:
             s_dmask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
+            philox_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
@@ -840,7 +845,6 @@ def _attn_fwd(
             seqlen_q,
             dropout_p,
             s_dmask_ptrs,
-            dropout_mask_ptrs,
             philox_seed,
             philox_ptrs,
             block_min,
@@ -955,7 +959,12 @@ def _get_config(
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
     fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
-    # TODO: pe + dropout is not tuned
+    # TODO: pe + dropout is not tuned.
+    # WARNING: on gfx950 the `pe_dropout_or_fp32` entry cannot be retuned freely
+    # -- it interacts with a backend miscompile (see isa_dump/COMPILER_BUG.md).
+    # BLOCK_M=128 and num_warps=4 were both measured and both miscompile. Any
+    # change here must be re-validated with the FULL mha test suite; a targeted
+    # sweep is not sufficient (it missed both regressions).
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
         return fwd_cfg["pe_dropout_or_fp32"]
     elif has_pe and "pe" in fwd_cfg:
