@@ -233,15 +233,11 @@ values for either backend live in JSON, never in Python. Flag:
   `env=` (and `default=` for what unset means), as `flash_attn_triton_amd/` does
   with `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE` — it still goes through this helper.
 
-  What is being forbidden is an *unbounded* list: a Python grid handed straight
-  to `@triton.autotune`, nothing keyed, nothing published. A shortlist read from
-  the config JSON and dispatched on the autotune key is fine as it stands —
-  `flash_kda_segment_kernel` keys on `NUM_SEGS_CLASS` because the best `BW`
-  moves with the segment count, and the kernel records a 2.3x penalty for
-  choosing wrong, so those candidates are a validated per-shape dispatch rather
-  than a search. Do not collapse one to a single config: Triton consults its
-  autotune cache only when the list holds more than one entry, so a one-element
-  list stops the `key` being read at all.
+  There are no exemptions. A candidate list read from the config JSON is a
+  search space for a tuning build, not a launch-time list — handed to
+  `@triton.autotune` it still benchmarks every entry on every new key. Pass it
+  as `configs` and pin the launch with `default_config=`, as
+  `chunk_delta_attn/flash_kda.py` does with its published K2 candidates.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 

@@ -269,22 +269,19 @@ family is off. This covers the kernel that applies `triton.autotune()` as a call
 rather than a decorator too (`_triton_kernels/fusions/attn_res.py`, behind
 `ATTN_RES_TRITON_AUTOTUNE=1`) — a grep for the decorator misses that one.
 
-The one other shape a config list may take is a **published, key-dispatched
-shortlist**: candidates read from the config JSON and selected per autotune key,
-as `flash_kda_segment_kernel` does through
-`chunk_delta_attn_tuned_config_shortlist`. Its `key` carries `NUM_SEGS_CLASS`
-because the best `BW` moves with the segment count — the kernel records a 2.3x
-penalty for getting that wrong — so the candidates are a validated per-shape
-dispatch, not a search, and collapsing them to one would be a regression. What
-the rule forbids is an *unbounded* list: a Python grid handed straight to
-`@triton.autotune` with nothing keyed and nothing published.
+A candidate list published in the config JSON is a **search space**, not a
+launch-time list: handed straight to `@triton.autotune` it still benchmarks
+every entry on every new key. It goes to `configs`, and `default_config=` pins
+what launches — `chunk_delta_attn/flash_kda.py` reads its six K2 candidates
+through `chunk_delta_attn_tuned_config_shortlist` and pins
+`_K2_FALLBACK_CONFIG`. There are no exemptions: all 41 `@triton.autotune` sites
+under `aiter/ops/triton/` go through the helper.
 
-Collapsing such a shortlist is not a silent no-op, either. Triton consults its
-autotune cache only when the config list holds more than one entry; with one
-entry it takes `configs[0]` and never reads the `key` at all. Routing this
-kernel through `autotune_configs` therefore stops `NUM_SEGS_CLASS` from being
-consulted and leaves the cache empty, which is what
-`test_tuner_keeps_the_two_schedules_apart` fails on.
+One consequence to know when reading the tuner: Triton consults its autotune
+cache only when the config list holds more than one entry (`autotuner.py:235`);
+with one config it takes `configs[0]` and never reads the `key`. A test about
+the `key` therefore has to hand the autotuner a config space first — see
+`test_tuner_keeps_the_two_schedules_apart`.
 
 The unit tests do not rely on any of it: `op_tests/triton_tests/__init__.py`
 pins one config per kernel for the whole suite, so a test's numerics never
