@@ -13,11 +13,11 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.attention.fp8_attention_kernel import (
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton.attention.fp8_attention import (
     attn_fwd,
     get_padded_headsize,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 pytestmark = pytest.mark.skipif(
@@ -67,7 +67,8 @@ def _call_attn_fwd(q, k, v, causal=False, sm_scale=None):
     v_p = _pad(v, D_pad).contiguous()
 
     out = torch.zeros(B, HQ, S_q, D_pad, dtype=q.dtype, device=q.device)
-    lse = torch.zeros(B, HQ, S_q, dtype=torch.float32, device=q.device)
+    # Kernel writes LSE at start_m * BLOCK_M * 2; second half reserved for backward delta.
+    lse = torch.zeros(B, HQ, 2 * S_q, dtype=torch.float32, device=q.device)
 
     grid = (triton.cdiv(S_q, BLOCK_M), HQ, B)
 
