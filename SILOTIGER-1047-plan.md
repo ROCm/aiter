@@ -368,8 +368,8 @@ Times are **not** a win claim (2h). ``H=8`` is 2f; long-`L` is 2g.
       Gluon recorded without a win claim.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Set equality `err=0`.
-``qsa_k1_family_b_block_ids`` dispatches ``H`` from ``q.shape[1]``. Times
-are **not** a win claim (2h). Long-`L` is 2g.
+``H=4`` and ``H=8`` are separate compiles. Times are **not** a win claim
+(2h).
 
 | m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
@@ -377,6 +377,30 @@ are **not** a win claim (2h). Long-`L` is 2g.
 | 8 | 512 | 128 | 2.4 | 13.7 | 12.9 | 0 |
 | 1 | 2048 | 512 | 1.5 | 8.9 | 8.2 | 0 |
 | 8 | 2048 | 512 | 2.4 | 9.8 | 9.1 | 0 |
+
+- [x] **2g.** Long-`L` merge in the same family B kernel: 512-slot tiles,
+      running top-512 in LDS, no `[M, n_blocks]` score buffer. Oracle set
+      equality at 8k / 32k / 128k for ``H`` 4 and 8. Times vs #4882 recorded;
+      **not** a win claim.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. Same bitonic
+tile merge as family A 2b. ``n_blocks > 512`` loses to #4882 MQA + HIP
+radix. Do not chase a select win. 2h is emit / short-L only.
+
+| m | seq_len | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 1 | 8192 | 4 | 2048 | 106.4 | 16.3 | 16.2 | 0 |
+| 8 | 8192 | 4 | 2048 | 107.7 | 18.3 | 18.1 | 0 |
+| 1 | 32768 | 4 | 8192 | 418.8 | 18.4 | 18.4 | 0 |
+| 8 | 32768 | 4 | 8192 | 422.9 | 23.1 | 21.6 | 0 |
+| 1 | 131072 | 4 | 32768 | 1716.1 | 27.7 | 27.2 | 0 |
+| 8 | 131072 | 4 | 32768 | 1734.2 | 49.5 | 47.7 | 0 |
+| 1 | 8192 | 8 | 2048 | 123.4 | 17.0 | 16.2 | 0 |
+| 8 | 8192 | 8 | 2048 | 124.8 | 19.4 | 18.2 | 0 |
+| 1 | 32768 | 8 | 8192 | 487.2 | 19.4 | 18.5 | 0 |
+| 8 | 32768 | 8 | 8192 | 492.2 | 26.4 | 22.1 | 0 |
+| 1 | 131072 | 8 | 32768 | 2022.0 | 29.9 | 27.4 | 0 |
+| 8 | 131072 | 8 | 32768 | 2036.2 | 56.2 | 45.3 | 0 |
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.
 - [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;

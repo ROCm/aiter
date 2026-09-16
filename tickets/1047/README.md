@@ -305,7 +305,6 @@ claim.** Long-`L` is 2g.
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Same kernel file; ``H=8``
 is a second compile (``q.shape[1]``). Oracle set equality `err=0`. #4882
 Triton and Gluon select. Expand still separate. **Not a win claim.**
-Long-`L` is 2g.
 
 | m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
@@ -313,6 +312,29 @@ Long-`L` is 2g.
 | 8 | 512 | 128 | 2.4 | 13.7 | 12.9 | 0 |
 | 1 | 2048 | 512 | 1.5 | 8.9 | 8.2 | 0 |
 | 8 | 2048 | 512 | 2.4 | 9.8 | 9.1 | 0 |
+
+## Phase 2g — family B K1 long-L tile merge (not a win)
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Same kernel: 512-slot
+tiles, running LDS top-512, no score matrix. Oracle set equality `err=0`
+at 8k / 32k / 128k for ``H`` 4 and 8. #4882 Triton and Gluon select.
+**Recorded loss**; do not chase a select win. 2h is emit / short-L only.
+
+| m | seq_len | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 1 | 8192 | 4 | 2048 | 106.4 | 16.3 | 16.2 | 0 |
+| 8 | 8192 | 4 | 2048 | 107.7 | 18.3 | 18.1 | 0 |
+| 1 | 32768 | 4 | 8192 | 418.8 | 18.4 | 18.4 | 0 |
+| 8 | 32768 | 4 | 8192 | 422.9 | 23.1 | 21.6 | 0 |
+| 1 | 131072 | 4 | 32768 | 1716.1 | 27.7 | 27.2 | 0 |
+| 8 | 131072 | 4 | 32768 | 1734.2 | 49.5 | 47.7 | 0 |
+| 1 | 8192 | 8 | 2048 | 123.4 | 17.0 | 16.2 | 0 |
+| 8 | 8192 | 8 | 2048 | 124.8 | 19.4 | 18.2 | 0 |
+| 1 | 32768 | 8 | 8192 | 487.2 | 19.4 | 18.5 | 0 |
+| 8 | 32768 | 8 | 8192 | 492.2 | 26.4 | 22.1 | 0 |
+| 1 | 131072 | 8 | 32768 | 2022.0 | 29.9 | 27.4 | 0 |
+| 8 | 131072 | 8 | 32768 | 2036.2 | 56.2 | 45.3 | 0 |
+
 
 
 
