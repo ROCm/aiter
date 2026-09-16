@@ -288,6 +288,24 @@ This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
 oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
 2d bar.
 
+- [x] **2c.** Prefill `M=512` uses the **same** wave64-per-row instantiation.
+      Occupancy did not die vs decode, so there is no second compile. Separate
+      prefill table; oracle set equality; times recorded, not a win claim.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. Wall time at
+`M=512` matches decode `M=1` at the same `L` (the GPU was idle at decode):
+
+| m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
+|--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
+| 512 | 512 | 128 | 97.2 | 72.0 | 0 | 0 |
+| 512 | 2048 | 512 | 117.3 | 92.0 | 0 | 0 |
+| 512 | 8192 | 2048 | 458.4 | 161.1 | 0 | 0 |
+| 512 | 32768 | 8192 | 1826.2 | 509.2 | 0 | 0 |
+
+This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
+oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
+2d bar.
+
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.
