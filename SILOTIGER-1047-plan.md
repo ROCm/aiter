@@ -263,6 +263,31 @@ This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
 oracle tie-break on vLLM MQA logits, same as phase 1. These AMD microseconds
 are **not** the 2d bar.
 
+- [x] **2b.** Long-`L` merge in the same kernel: 512-slot tiles, running
+      top-512 in LDS, no `[M, n_blocks]` score buffer, no call into
+      `topk_per_row_*`. Oracle set equality at 8k / 32k / 128k. Times
+      recorded, not a win claim.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. In-kernel tile
+merge (not production-fast):
+
+| m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
+|--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
+| 1 | 512 | 128 | 796 | 50.6 | 0 | 0 |
+| 8 | 512 | 128 | 806 | 62.4 | 0 | 0 |
+| 1 | 2048 | 512 | 816 | 57.7 | 0 | 0 |
+| 8 | 2048 | 512 | 826 | 67.3 | 0 | 0 |
+| 1 | 8192 | 2048 | 3258 | 62.4 | 0 | 0 |
+| 8 | 8192 | 2048 | 3298 | 73.2 | 0 | 0 |
+| 1 | 32768 | 8192 | 13024 | 79.6 | 0 | 0 |
+| 8 | 32768 | 8192 | 13181 | 150.9 | 0 | 0 |
+| 1 | 131072 | 32768 | 52203 | 94.7 | 0 | 0 |
+| 8 | 131072 | 32768 | 52821 | 277.6 | 0 | 0 |
+
+This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
+oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
+2d bar.
+
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.
