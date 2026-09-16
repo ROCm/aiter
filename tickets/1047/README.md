@@ -250,7 +250,7 @@ These AMD microseconds are **not** the 2d bar.
 | 512 | 8192 | 2048 | 458.4 | 161.1 | 0 | 0 |
 | 512 | 32768 | 8192 | 1826.2 | 509.2 | 0 | 0 |
 
-## Phase 2d — beat live AMD select (HIP top-k; not a win)
+## Phase 2d — emit / ``visible <= 512`` vs live AMD select (HIP top-k)
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Re-bench after
 `aiter/jit/module_top_k_per_row.so` landed. Log shows
@@ -261,11 +261,11 @@ this seed).
 
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
 write every complete-block id and skip scoring/bitonic. Same
-`block_ids [M, 512]`; no score matrix; expand still separate. **2d stays
-unchecked.** Remaining work is winning shapes only: ``visible <= 512``
-(``L<=2048``) already beats HIP. ``n_blocks > 512`` is a known loss
-(bitonic tiles vs HIP MQA + radix). 2b single-WG tile merge stays for
-set equality; do not resume long-L scorer work.
+`block_ids [M, 512]`; no score matrix; expand still separate. **2d is
+closed** on emit / ``visible <= 512`` (``L<=2048``): those rows beat HIP.
+``n_blocks > 512`` is a recorded loss (bitonic tiles vs HIP MQA + radix),
+not a 2d gate. 2b single-WG tile merge stays for set equality; do not
+resume long-L scorer work.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|

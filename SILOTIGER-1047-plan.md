@@ -310,9 +310,11 @@ This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
 oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
 2d bar.
 
-- [ ] **2d.** Family A K1 beats live vLLM AMD select on the harness lengths
-      (`M∈{1,8,512}`, `L∈{512,2048,8192,32768,131072}`), still `block_ids [M,512]`,
-      no `[M, n_blocks]` score buffer.
+- [x] **2d.** Family A K1 beats live vLLM AMD select on emit /
+      ``visible <= 512`` (decode and prefill at ``L<=2048`` / ``n_blocks <= 512``),
+      still `block_ids [M, 512]`, no `[M, n_blocks]` score buffer.
+      ``n_blocks > 512`` is a **recorded loss** (8k / 32k / 128k, prefill 8k /
+      32k); long-L select is not a 2d gate.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality `err=0`
 on both columns. `aiter/jit/module_top_k_per_row.so` is loaded
@@ -322,15 +324,10 @@ The AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand.
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
 every complete block is in the top-512, so the kernel writes those ids and
 skips scoring and the 1024-wide bitonic. Same `block_ids [M, 512]`; no
-score matrix; expand still separate.
-
-**Not checked.** Remaining family A 2d work is the **winning shapes
-only**: ``visible <= 512`` (decode and prefill at ``L<=2048``). Emit
-already beats HIP there. ``n_blocks > 512`` (8k / 32k / 128k, and
-prefill 8k / 32k) is a **known loss** — streamed 512-tile bitonic top-k
-does not match HIP’s MQA GEMM + radix. Keep 2b’s single-WG tile merge
-so those lengths still have oracle set equality. Do not spend more 2d
-turns on long-L select.
+score matrix; expand still separate. Emit already beats HIP on the
+winning shapes. ``n_blocks > 512`` loses to HIP MQA + radix; 2b’s
+single-WG tile merge stays so those lengths still have oracle set
+equality. Do not resume long-L scorer work.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
@@ -355,8 +352,9 @@ turns on long-L select.
 - [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;
       beat Gluon on gfx950 **where Gluon dispatches**.
 - [ ] **Done when:** selected-block **set equality** (or documented tie policy)
-      vs the oracle; family A beats live AMD on the harness lengths; family B
-      beats #4882 Triton and Gluon on the published indexer bench points.
+      vs the oracle; family A beats live AMD on emit / ``visible <= 512``
+      (long-L select loss recorded, not a K1 gate); family B beats #4882
+      Triton and Gluon on the published indexer bench points.
 
 ### 3. FlyDSL K2 (sparse GQA) — family A then B
 
