@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import csv
+import functools
+import json
 import os
 from typing import Any
 
@@ -8,19 +11,182 @@ import torch
 from torch import Generator, Tensor
 
 from ..jit.core import (
+    AITER_CONFIGS,
     AITER_META_DIR,
     CK_DIR,
     ENABLE_CK,
     compile_ops,
     is_experimental_enabled,
 )
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime, get_gpu_model
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from .mha_fwd_policy import (
+    MHA_FWD_BACKENDS,
+    MHA_FWD_RUNTIME_CSV_FIELDS,
+    MHA_FWD_TUNING_KEY_FIELDS,
+    MhaFwdPlan,
+    MhaFwdProblem,
+    csv_scalar,
+    parse_backend_config,
+)
+
+_MHA_FWD_RECORDED_SELECTIONS: set[tuple[str, int]] = set()
+
+
+def _mha_csv_scalar(value: Any) -> str:
+    return csv_scalar(value)
+
+
+@functools.lru_cache(maxsize=8)
+def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], dict[str, Any]]:
+    table: dict[tuple[str, ...], dict[str, Any]] = {}
+    if not os.path.isfile(path):
+        return table
+    with open(path, encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        fieldnames = tuple(reader.fieldnames or ())
+        missing = [
+            field for field in MHA_FWD_RUNTIME_CSV_FIELDS if field not in fieldnames
+        ]
+        if missing:
+            raise ValueError(f"{path} is missing MHA runtime columns: {missing}")
+        extra = [
+            field for field in fieldnames if field not in MHA_FWD_RUNTIME_CSV_FIELDS
+        ]
+        if extra:
+            raise ValueError(
+                f"{path} contains non-runtime MHA columns: {extra}; "
+                "measurement evidence must be stored separately"
+            )
+        for line, row in enumerate(reader, start=2):
+            backend = str(row.get("backend", "")).strip()
+            try:
+                num_splits = int(row.get("num_splits", 0) or 0)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line}: invalid num_splits") from exc
+            try:
+                backend_config = parse_backend_config(row.get("backend_config", ""))
+                problem = MhaFwdProblem.from_mapping(row)
+                plan = MhaFwdPlan(
+                    backend=backend,
+                    num_splits=num_splits,
+                    backend_config=backend_config,
+                )
+                plan.validate_for(problem)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line}: {exc}") from exc
+            key = problem.key()
+            if key in table:
+                raise ValueError(f"{path}:{line}: duplicate exact MHA tuning key {key}")
+            table[key] = {
+                "backend": backend,
+                "num_splits": num_splits,
+                "backend_config": backend_config,
+            }
+    return table
+
+
+def _mha_fwd_tuning_key(
+    *,
+    mode: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    causal: bool,
+    window_size: tuple[int, ...],
+    dropout_p: float,
+    logits_soft_cap: float,
+    how_v3_bf16_cvt: int,
+    return_lse: bool,
+    return_attn_probs: bool,
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    sink_ptr: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    cu_seqlens_q_padded: torch.Tensor | None,
+    cu_seqlens_k_padded: torch.Tensor | None,
+) -> tuple[str, ...]:
+    device_id = q.device.index if q.device.index is not None else 0
+    values = {
+        "gfx": get_gfx_runtime(),
+        "gpu_model": get_gpu_model(device_id),
+        "cu_num": torch.cuda.get_device_properties(device_id).multi_processor_count,
+        "mode": mode,
+        "batch": batch,
+        "total_q": q.shape[0] if mode == "varlen" else batch * q.shape[1],
+        "total_k": k.shape[0] if mode == "varlen" else batch * k.shape[1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+        "min_seqlen_q": min_seqlen_q,
+        "nhead_q": q.shape[-2],
+        "nhead_k": k.shape[-2],
+        "hdim_q": q.shape[-1],
+        "hdim_v": v.shape[-1],
+        "dtype": str(q.dtype).removeprefix("torch."),
+        "causal": causal,
+        "window_left": window_size[0],
+        "window_right": window_size[1],
+        "sink_size": window_size[2] if len(window_size) > 2 else 0,
+        "dropout_p": dropout_p,
+        "logits_soft_cap": logits_soft_cap,
+        "how_v3_bf16_cvt": how_v3_bf16_cvt,
+        "return_lse": return_lse,
+        "return_attn_probs": return_attn_probs,
+        "has_bias": bias is not None,
+        "has_alibi": alibi_slopes is not None,
+        "has_sink": sink_ptr is not None,
+        "has_block_table": block_table is not None,
+        "has_q_descale": q_descale is not None,
+        "has_physical_padding": (
+            cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
+        ),
+        "is_grad": torch.is_grad_enabled()
+        and any(t.requires_grad for t in (q, k, v)),
+    }
+    return tuple(_mha_csv_scalar(values[field]) for field in MHA_FWD_TUNING_KEY_FIELDS)
+
+
+@torch._dynamo.assume_constant_result
+def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
+    path = AITER_CONFIGS.AITER_CONFIG_MHA_FWD_FILE
+    key = _mha_fwd_tuning_key(**key_args)
+    return _load_mha_fwd_tuning_table(os.path.abspath(path)).get(key)
+
+
+def _record_mha_fwd_selection(backend: str, num_splits: int = 0) -> None:
+    """Append the actual public-path selection when a proof file is requested."""
+
+    path = os.getenv("AITER_MHA_FWD_SELECTION_PROOF_FILE", "").strip()
+    if not path:
+        return
+    identity = (backend, int(num_splits))
+    if identity in _MHA_FWD_RECORDED_SELECTIONS:
+        return
+    _MHA_FWD_RECORDED_SELECTIONS.add(identity)
+    payload = json.dumps(
+        {
+            "backend": backend,
+            "num_splits": int(num_splits),
+            "pid": os.getpid(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, f"{payload}\n".encode("utf-8"))
+    finally:
+        os.close(descriptor)
 
 
 def _fmha_kv_byte_extent_ge_u32(
@@ -2983,6 +3149,9 @@ def _flash_attn_varlen_forward(
     out: torch.Tensor | None = None,
     zero_tensors: bool = False,
     sink_ptr: Tensor | None = None,
+    num_splits: int = 0,
+    selected_backend: str | None = None,
+    backend_config: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, nhead_q, hdim_q = q.shape
     batch_size = cu_seqlens_q.numel() - 1
@@ -3103,7 +3272,11 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+    if (
+        selected_backend in (None, "opus")
+        and can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen()
+    ):
+        _record_mha_fwd_selection("opus")
         # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
         # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
         # offsets (KV padding). When no padded arrays are given, physical == real.
@@ -3129,7 +3302,11 @@ def _flash_attn_varlen_forward(
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_fwd_with_sink_varlen_asm():
+    elif (
+        selected_backend in (None, "asm_v3")
+        and can_impl_fmha_fwd_with_sink_varlen_asm()
+    ):
+        _record_mha_fwd_selection("asm_v3", num_splits)
         # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
         # requires dense packing (the wrapper calls `.contiguous()` defensively)
         # and carries no strides.  softmax_scale is forwarded as-is (the kernel
@@ -3156,39 +3333,54 @@ def _flash_attn_varlen_forward(
         softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_v3_fwd():
-        out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            min_seqlen_q,
-            dropout_p,
-            softmax_scale,
-            logits_soft_cap,
-            zero_tensors,
-            causal,
-            window_size_left,
-            window_size_right,
-            return_lse,
-            return_softmax,
-            how_v3_bf16_cvt,
-            out,
-            block_table,
-            bias,
-            alibi_slopes,
-            q_descale,
-            k_descale,
-            v_descale,
-            None,
-            cu_seqlens_q_padded,
-            cu_seqlens_k_padded,
-            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
-        )
-    else:
+    elif selected_backend in (None, "asm_v3") and can_impl_fmha_v3_fwd():
+        _record_mha_fwd_selection("asm_v3", num_splits)
+        if int(num_splits) >= 1:
+            out, softmax_lse, S_dmask, rng_state = _fmha_v3_varlen_splitkv_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                return_lse,
+                int(num_splits),
+            )
+        else:
+            out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                min_seqlen_q,
+                dropout_p,
+                softmax_scale,
+                logits_soft_cap,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                how_v3_bf16_cvt,
+                out,
+                block_table,
+                bias,
+                alibi_slopes,
+                q_descale,
+                k_descale,
+                v_descale,
+                None,
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
+            )
+    elif selected_backend in (None, "ck"):
+        _record_mha_fwd_selection("ck")
         # Input validation for padded cumulative arrays if provided
         def _validate(name: str, t: torch.Tensor):
             assert t.dim() == 1, f"{name} must be 1D"
@@ -3235,6 +3427,10 @@ def _flash_attn_varlen_forward(
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_k_padded=cu_seqlens_k_padded,
             sink_ptr=sink_ptr,
+        )
+    else:
+        raise ValueError(
+            f"tuned MHA backend {selected_backend!r} is incompatible with this call"
         )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -3513,6 +3709,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_v3_atomic_fp32: bool | None = True,
         how_v3_bf16_cvt: int | None = 1,
         sink_ptr=None,
+        num_splits: int = 0,
+        selected_backend: str | None = None,
+        backend_config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3553,6 +3752,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_table=block_table,
             out=out,
             sink_ptr=sink_ptr,
+            num_splits=num_splits,
+            selected_backend=selected_backend,
+            backend_config=backend_config,
         )
         if is_grad:
             assert return_lse
@@ -3657,6 +3859,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # sink_ptr (fwd-only sink scores; not differentiable via autograd.
         #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
         #           not returned here as a positional gradient.)
+        # num_splits (forward dispatch only)
+        # selected_backend (forward dispatch only)
+        # backend_config (forward dispatch only)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
         return (
             dq,  # q
@@ -3685,6 +3890,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # is_v3_atomic_fp32
             None,  # how_v3_bf16_cvt
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # num_splits
+            None,  # selected_backend
+            None,  # backend_config
         )
 
 
@@ -3777,6 +3985,35 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    tuned_plan = _get_mha_fwd_tuned_plan(
+        mode="varlen",
+        q=q,
+        k=k,
+        v=v,
+        batch=cu_seqlens_q.numel() - 1,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_q=min_seqlen_q,
+        causal=causal,
+        window_size=window_size,
+        dropout_p=dropout_p,
+        logits_soft_cap=logits_soft_cap,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink_ptr=sink_ptr,
+        block_table=block_table,
+        q_descale=None,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
+    )
+    tuned_backend = tuned_plan["backend"] if tuned_plan is not None else None
+    num_splits = int(tuned_plan["num_splits"]) if tuned_plan is not None else 0
+    backend_config = tuned_plan.get("backend_config") if tuned_plan is not None else None
+    if tuned_backend is not None and tuned_backend not in MHA_FWD_BACKENDS:
+        raise ValueError(f"unknown tuned MHA backend {tuned_backend!r}")
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3812,7 +4049,10 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    if (
+        tuned_backend in (None, "asm_v3")
+        and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm()
+    ):
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -3840,12 +4080,17 @@ def flash_attn_varlen_func(
             True,
             how_v3_bf16_cvt,
             sink_ptr,
+            num_splits,
+            tuned_backend,
+            backend_config,
         )
 
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
-    if len(window_size) < 3 or window_size[2] == 0:
+    if tuned_backend in (None, "flydsl") and (
+        len(window_size) < 3 or window_size[2] == 0
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
@@ -3870,14 +4115,22 @@ def flash_attn_varlen_func(
             sink=sink_ptr,
         )
         if _flydsl_result is not None:
+            _record_mha_fwd_selection("flydsl")
             return _flydsl_result
+        if tuned_backend == "flydsl":
+            raise ValueError("tuned flydsl backend rejected this MHA call")
 
-    if not ENABLE_CK:
+    if tuned_backend in ("triton", "gluon") or (
+        tuned_backend is None and not ENABLE_CK
+    ):
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
 
-        return flash_attn_varlen_func_triton(
+        triton_backend = (
+            tuned_backend if tuned_backend in ("triton", "gluon") else "triton"
+        )
+        result = flash_attn_varlen_func_triton(
             q=q,
             k=k,
             v=v,
@@ -3897,7 +4150,11 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            config=parse_backend_config(backend_config),
+            backend=triton_backend,
         )
+        _record_mha_fwd_selection(triton_backend)
+        return result
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -3925,6 +4182,9 @@ def flash_attn_varlen_func(
         True,
         how_v3_bf16_cvt,
         sink_ptr,
+        num_splits,
+        tuned_backend,
+        backend_config,
     )
 
 

@@ -4,11 +4,13 @@
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 
 import math
+from unittest import mock
 
 import pytest
 import torch
 
 import aiter
+from aiter.ops import mha as mha_ops
 from aiter.ops.mha import (
     _fmha_v3_varlen_splitkv_fwd,
     flash_attn_varlen_func,
@@ -59,20 +61,22 @@ def _split_asm(q, k, v, cu_q, cu_k, scale, num_splits=3, *, return_lse=False):
     return _run_v3(q, k, v, cu_q, cu_k, scale, num_splits, return_lse=return_lse)
 
 
-def _public_asm(q, k, v, cu_q, cu_k, scale, *, return_lse=False, out=None):
-    result = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        q.shape[0],
-        k.shape[0],
-        softmax_scale=scale,
-        causal=False,
-        return_lse=return_lse,
-        out=out,
-    )
+def _public_asm(q, k, v, cu_q, cu_k, scale, *, return_lse=False, out=None, plan=None):
+    # plan=None is the no-CSV path: C++ num_splits=0 auto-select.
+    with mock.patch.object(mha_ops, "_get_mha_fwd_tuned_plan", return_value=plan):
+        result = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            q.shape[0],
+            k.shape[0],
+            softmax_scale=scale,
+            causal=False,
+            return_lse=return_lse,
+            out=out,
+        )
     return result
 
 
@@ -158,7 +162,7 @@ def test_splitkv_counts(num_splits):
 @pytest.mark.parametrize(
     "sq,sk,h", [(4096, 8192, 12), (3969, 8192, 12), (4096, 131072, 12)]
 )
-def test_public_dispatch_uses_split3_on_long_kv(sq, sk, h):
+def test_public_dispatch_uses_cpp_auto_split3_on_long_kv(sq, sk, h):
     q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=sk + sq)
     scale = 1.0 / math.sqrt(192)
     split1 = _production_asm(q, k, v, cu_q, cu_k, scale)
@@ -168,6 +172,25 @@ def test_public_dispatch_uses_split3_on_long_kv(sq, sk, h):
     assert torch.equal(actual_lse, split3_lse)
     assert not torch.equal(actual, split1)
     _assert_close(split1, actual)
+
+
+def test_public_dispatch_csv_override_uses_explicit_split():
+    sq, sk, h = 4096, 8192, 12
+    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=42)
+    scale = 1.0 / math.sqrt(192)
+    split2 = _split_asm(q, k, v, cu_q, cu_k, scale, 2)
+    split3 = _split_asm(q, k, v, cu_q, cu_k, scale, 3)
+    actual = _public_asm(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        scale,
+        plan={"backend": "asm_v3", "num_splits": 2, "backend_config": None},
+    )
+    assert torch.equal(actual, split2)
+    assert not torch.equal(actual, split3)
 
 
 def test_public_dispatch_keeps_unsplit_outside_heuristic():
@@ -217,6 +240,8 @@ def test_public_splitkv_fullgraph_compile():
             return_lse=True,
         )
 
+    # This shape has no CSV row, so public dispatch uses C++ auto-select.
+    # Do not mock the lookup: torch.compile cannot trace unittest.mock.
     eager = call(q, k, v)
     compiled = torch.compile(call, fullgraph=True)(q, k, v)
     _assert_close(eager[0], compiled[0])
@@ -254,17 +279,18 @@ def test_public_splitkv_cuda_graph_replay():
     scale = 1.0 / math.sqrt(192)
     reference = _production_asm(q, k, v, cu_q, cu_k, scale)
 
-    for _ in range(3):
-        flash_attn_varlen_func(
-            q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
-        )
-    torch.cuda.synchronize()
+    with mock.patch.object(mha_ops, "_get_mha_fwd_tuned_plan", return_value=None):
+        for _ in range(3):
+            flash_attn_varlen_func(
+                q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
+            )
+        torch.cuda.synchronize()
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = flash_attn_varlen_func(
-            q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
-        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = flash_attn_varlen_func(
+                q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
+            )
     graph.replay()
     first = captured.clone()
     graph.replay()
