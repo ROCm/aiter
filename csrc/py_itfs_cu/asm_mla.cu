@@ -980,18 +980,19 @@ void mla_decode_stage1_asm_fwd(
     // gqa_ratio=96 packs 96 valid rows into the 128-row tile of the shared gqaratio32 build, so
     // its 4th wave owns no valid Q row at all. The gqaratio96 build is the same kernel with
     // IDLE_WAVE_SKIP=1, which runs that wave at exec=0 (KV DMA only) to give back its share of
-    // LDS bandwidth.
-    // AITER_MLA_QH96: 1 (default) the gqaratio96 build, 0 the shared gqaratio32 build, 2 the
-    // qh32ctl A/B control build (same code, idle-wave mask disabled, so 1-vs-2 isolates the skip
-    // and 2-vs-0 measures the code-layout shift). Measured on gfx950, bf16 gqa=96 qlen=4
-    // ctx=8192: 5.5% / 10.6% / 7.7% faster than the gqaratio32 build at batch 8 / 32 / 128, so
-    // this is unconditional.
-    const char* qh96_env = std::getenv("AITER_MLA_QH96");
-    const int qh96_mode  = (qh96_env == nullptr) ? 1 : std::atoi(qh96_env);
+    // LDS bandwidth. Measured on gfx950 bf16 gqa=96 at 5.5-11.3% faster than the gqaratio32
+    // build across batch 8-128, so it is unconditional.
+    //
+    // config_max_seqlen_q is pinned to 4 here, so every max_seqlen_q maps onto the same qseqlen4
+    // build and there is no upper bound to respect. config_causal == 1 is still required:
+    // mla_asm.csv registers gqa=96 only at causal=1, so a non-causal gqa=96 request has to keep
+    // falling through to the gqaratio32 msk0 build or the lookup finds nothing and
+    // get_heuristic_kernel_mla aborts. max_seqlen_q == 1 forces config_causal to 1 further up,
+    // so non-causal single-token decode still lands here.
     if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
-        && qh96_mode != 0 && gqa_ratio == 96 && max_seqlen_q <= 4 && config_causal == 1){
+        && gqa_ratio == 96 && config_causal == 1){
         config_max_seqlen_q = 4;
-        config_gqa_ratio = (qh96_mode == 2) ? 97 : 96;
+        config_gqa_ratio = 96;
         args.s_MQA = gqa_ratio;
     } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
