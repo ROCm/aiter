@@ -24,12 +24,12 @@ The planner writes two contiguous int32 CUDA tensors:
 - `work_info[capacity, 4]`: request index, first tile, exclusive last tile, context length.
 - `reduce_info[batch, 2]`: first packed task slot and actual partition count.
 
-The launch grid has a fixed capacity for graph capture. Padded work records have
-zero context length and write separate unused scratch slots. Each real task
-processes one contiguous KV range; ranges cover each request exactly once.
-Reduction reads only the request's valid partitions and produces zero for empty
-contexts. No GPU-to-CPU readback, dynamic allocation, or CPU length inspection is
-required when refreshing a preallocated plan.
+The launch grid has a fixed capacity for graph capture. Padded work records are
+zeroed and skipped by the attention kernel, leaving their scratch slots untouched.
+Each real task processes one contiguous KV range; ranges cover each request exactly
+once. Reduction reads only the request's valid partitions and produces zero for
+empty contexts. No GPU-to-CPU readback, dynamic allocation, or CPU length
+inspection is required when refreshing a preallocated plan.
 
 Planned scratch is packed as `[num_kv_heads, capacity, query_rows]` for max/sum and
 `[num_kv_heads, capacity, query_rows, head_dim]` for partial outputs, where

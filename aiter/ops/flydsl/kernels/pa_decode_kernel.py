@@ -289,8 +289,8 @@ def compile_pa_decode_tile(
     class SharedStorage:
         buf: fx.Array[fx.Int32, total_bytes // 4, 16]
 
-    @flyc.kernel(known_block_size=(BLOCK_THREADS, 1, 1))
-    def pa_decode_tile_kernel(
+    @flyc.jit
+    def _pa_decode_tile_task(
         output_ptr: fx.Pointer,  # [num_seqs*query_length, num_q_heads, head_dim]  (written directly when NP==1)
         # per-partition partial outputs (combined by the reduce kernel when NP>1):
         pmax_ptr: fx.Pointer,  # [num_seqs, num_kv_heads, num_partitions, query_length*query_group_size] row max
@@ -310,8 +310,11 @@ def compile_pa_decode_tile(
         stride_o_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
-        work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
+        planned_seq: fx.Int32,
+        planned_start: fx.Int32,
+        planned_end: fx.Int32,
+        planned_context: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         warp = tid // WAVE  # 0..NWARP-1
@@ -324,15 +327,7 @@ def compile_pa_decode_tile(
         n_kv = fx.Int32(gpu.grid_dim.y) // query_splits
         if const_expr(use_work_plan):
             part = seq  # Packed work slot, shared by all KV heads.
-            work = fx.recast_iter(fx.Int32, work_info_ptr)
-            task = fx.ptr_load(
-                fx.add_offset(work, part * 4),
-                result_type=fx.Vector.make_type(4, fx.Int32),
-            )
-            seq = fx.Int32(task[0])
-            planned_start = fx.Int32(task[1])
-            planned_end = fx.Int32(task[2])
-            planned_context = fx.Int32(task[3])
+            seq = planned_seq
             partial_slot = kv_h * fx.Int32(gpu.grid_dim.x) + part
         else:
             partial_slot = (seq * n_kv + kv_h) * NP + part
@@ -420,24 +415,21 @@ def compile_pa_decode_tile(
                 gs_head = flat_idx - qi * query_group_size
                 q_units_prefetched.append(_load_q_row(qi, gs_head))
 
-        ctx_buf = ptr_buf_tensor(context_lengths_ptr, fx.Int32)
-        ctx_tiled = fx.logical_divide(ctx_buf, fx.make_layout(1, 1))
-        ctx_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-        ctx_reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-
-        def _ctxlen_load(elem_idx):
-            fx.copy(ctx_copy_atom, fx.slice(ctx_tiled, (None, elem_idx)), ctx_reg)
-            return fx.Vector(fx.memref_load_vec(ctx_reg))
-
         def _k_load16(byte_off):
             return _k_load_fp8x16(byte_off).bitcast(fx.Int64)
 
         def _v_load16(byte_off):
             return _v_load_fp8x16(byte_off).bitcast(fx.Int64)
 
-        context_len = fx.Int32(_ctxlen_load(seq)[0])
         if const_expr(use_work_plan):
             context_len = planned_context
+        else:
+            ctx_buf = ptr_buf_tensor(context_lengths_ptr, fx.Int32)
+            ctx_tiled = fx.logical_divide(ctx_buf, fx.make_layout(1, 1))
+            ctx_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+            ctx_reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+            fx.copy(ctx_copy_atom, fx.slice(ctx_tiled, (None, seq)), ctx_reg)
+            context_len = fx.Int32(fx.Vector(fx.memref_load_vec(ctx_reg))[0])
         # Bound block_tables to its real extent: the last (partial) 256-token tile
         # can index a page past ceil(context/block_size); the bounded resource
         # returns page 0 for that out-of-range read instead of faulting (those
@@ -461,17 +453,18 @@ def compile_pa_decode_tile(
             key_scale = fx.Float32(key_scale_buf[0])
             value_scale = fx.Float32(value_scale_buf[0])
 
-        num_tiles = (context_len + TILE_TOK - 1) // TILE_TOK
         num_pages = (
             context_len + block_size - 1
         ) // block_size  # pages this sequence really owns
-        tiles_per_part = (num_tiles + NP - 1) // NP
-        part_start = part * tiles_per_part
-        part_end_raw = part_start + tiles_per_part
-        part_end = (part_end_raw < num_tiles).select(part_end_raw, num_tiles)
         if const_expr(use_work_plan):
             part_start = planned_start
             part_end = planned_end
+        else:
+            num_tiles = (context_len + TILE_TOK - 1) // TILE_TOK
+            tiles_per_part = (num_tiles + NP - 1) // NP
+            part_start = part * tiles_per_part
+            part_end_raw = part_start + tiles_per_part
+            part_end = (part_end_raw < num_tiles).select(part_end_raw, num_tiles)
 
         # One i8 blob carved into typed byte-offset pointers. `lds_base` is an
         # ir.Value pointer (safe inside scf control flow); the Python `lds`
@@ -1817,6 +1810,76 @@ def compile_pa_decode_tile(
                         # re-applies LOG2E itself when combining partitions.
                         pmax[base] = o_final[_m_slot(m)] * fx.Float32(1.0 / LOG2E)
                         psum[base] = l_row
+
+    @flyc.kernel(known_block_size=(BLOCK_THREADS, 1, 1))
+    def pa_decode_tile_kernel(
+        output_ptr: fx.Pointer,
+        pmax_ptr: fx.Pointer,
+        psum_ptr: fx.Pointer,
+        pout_ptr: fx.Pointer,
+        query_ptr: fx.Pointer,
+        key_cache_ptr: fx.Pointer,
+        value_cache_ptr: fx.Pointer,
+        block_tables_ptr: fx.Pointer,
+        context_lengths_ptr: fx.Pointer,
+        key_scale_ptr: fx.Pointer,
+        value_scale_ptr: fx.Pointer,
+        max_blocks_per_seq: fx.Int32,
+        stride_ks_block: fx.Int32,
+        stride_ks_head: fx.Int32,
+        stride_o_row: fx.Int32,
+        stride_o_head: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+        work_info_ptr: fx.Pointer,
+        num_sequences: fx.Int32,
+    ):
+        def _run_task(seq, start, end, context):
+            _pa_decode_tile_task(
+                output_ptr,
+                pmax_ptr,
+                psum_ptr,
+                pout_ptr,
+                query_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                block_tables_ptr,
+                context_lengths_ptr,
+                key_scale_ptr,
+                value_scale_ptr,
+                max_blocks_per_seq,
+                stride_ks_block,
+                stride_ks_head,
+                stride_o_row,
+                stride_o_head,
+                stride_q_row,
+                stride_q_head,
+                num_sequences,
+                seq,
+                start,
+                end,
+                context,
+            )
+
+        if const_expr(use_work_plan):
+            # Capacity is fixed for graph capture, so the planner clears any
+            # unused tail records.  The reducer never consumes those slots;
+            # guard the whole task body to avoid Q processing and scratch
+            # writes for an empty record.  The condition is CTA-uniform, so
+            # all barriers in the task body remain convergent.
+            slot = fx.Int32(gpu.block_id("x"))
+            work = fx.recast_iter(fx.Int32, work_info_ptr)
+            task = fx.ptr_load(
+                fx.add_offset(work, slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            start = fx.Int32(task[1])
+            end = fx.Int32(task[2])
+            if start < end:
+                _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
+        else:
+            zero = fx.Int32(0)
+            _run_task(zero, zero, zero, zero)
 
     @flyc.jit
     def pa_decode_tile_launch(

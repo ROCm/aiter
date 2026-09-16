@@ -24,19 +24,52 @@ def cuda_device():
 def _assert_plan(plan, lengths):
     work = plan.work_info.cpu().tolist()
     reductions = plan.reduce_info.cpu().tolist()
+    tiles_per_sequence = [(max(length, 0) + 255) // 256 for length in lengths]
+    nonempty = [int(tiles > 0) for tiles in tiles_per_sequence]
+    total_tiles = max(sum(tiles_per_sequence), 1)
+    remaining = plan.capacity - sum(nonempty)
+    cumulative_tiles = 0
+    expected_counts = []
+    for tiles, is_nonempty in zip(tiles_per_sequence, nonempty):
+        lower = cumulative_tiles * remaining // total_tiles
+        cumulative_tiles += tiles
+        upper = cumulative_tiles * remaining // total_tiles
+        expected_counts.append(
+            min(is_nonempty + upper - lower, tiles, plan.max_partitions)
+        )
+
+    expected_reductions = []
+    expected_work = []
     offset = 0
-    for seq, (length, (start, count)) in enumerate(zip(lengths, reductions)):
-        tiles = (length + 255) // 256
-        assert start == offset
-        assert 0 <= count <= min(tiles, plan.max_partitions)
-        assert (count > 0) == (length > 0)
+    for seq, (length, tiles, count) in enumerate(
+        zip(lengths, tiles_per_sequence, expected_counts)
+    ):
+        start = offset
+        expected_reductions.append([start, count])
+        for part in range(count):
+            expected_work.append(
+                [
+                    seq,
+                    part * tiles // count,
+                    (part + 1) * tiles // count,
+                    length,
+                ]
+            )
+
+        actual_start, actual_count = reductions[seq]
+        assert (actual_start, actual_count) == (start, count)
+        assert 0 <= actual_count <= min(tiles, plan.max_partitions)
+        assert (actual_count > 0) == (length > 0)
         previous_end = 0
-        for task in work[start : start + count]:
+        for task in work[actual_start : actual_start + actual_count]:
             assert task[0] == seq and task[3] == length
             assert task[1] == previous_end and task[1] < task[2] <= tiles
             previous_end = task[2]
         assert previous_end == tiles
-        offset += count
+        offset += actual_count
+    expected_work.extend([[0, 0, 0, 0]] * (plan.capacity - offset))
+    assert reductions == expected_reductions
+    assert work == expected_work
     assert offset <= plan.capacity
     assert all(row == [0, 0, 0, 0] for row in work[offset:])
 
@@ -126,9 +159,26 @@ def test_planned_decode_other_reducer_paths(
     )
 
 
+@pytest.mark.parametrize("long_context", [16384, 16385])
+def test_planned_decode_register_reducer_chunk_boundary(monkeypatch, long_context):
+    """Exercise the generic reducer with 64 and 65 active partitions."""
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", _planned_call)
+    reference_tests._run_accuracy_case(
+        [0, 1, 257, long_context],
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=256,
+        block_size=64,
+        query_dtype=torch.float16,
+        num_partitions=86,
+        tolerance=0.005,
+        trans_v=True,
+    )
+
+
 def test_planned_decode_graph_replay_with_poisoned_scratch(monkeypatch):
     def capture_and_replay(*args, **kwargs):
-        output, query, key, value, context = args[:5]
+        output, query, key, _value, context = args[:5]
         heads, rows = (
             key.shape[1],
             query.shape[0] // context.numel() * query.shape[1] // key.shape[1],
@@ -154,12 +204,22 @@ def test_planned_decode_graph_replay_with_poisoned_scratch(monkeypatch):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
+        active_tasks = int(plan.reduce_info[:, 1].sum().item())
+        assert active_tasks < plan.capacity
+        for scratch in (pmax, psum, pout):
+            assert torch.isnan(scratch[:, active_tasks:]).all()
         original = context.clone()
+        for scratch in (pmax, psum, pout):
+            scratch.fill_(float("nan"))
         context.zero_()
         graph.replay()
         assert torch.equal(output, torch.zeros_like(output))
+        for scratch in (pmax, psum, pout):
+            assert torch.isnan(scratch).all()
         context.copy_(original)
         graph.replay()
+        for scratch in (pmax, psum, pout):
+            assert torch.isnan(scratch[:, active_tasks:]).all()
 
     monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", capture_and_replay)
     reference_tests._run_mtp4_fused_reference_case(

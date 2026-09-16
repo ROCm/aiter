@@ -37,12 +37,10 @@ def _plan_pa_decode(
     upper = cumulative * remaining // total
     lower = (cumulative - tiles) * remaining // total
     counts = tl.minimum(tl.minimum(nonempty + upper - lower, tiles), MAX_PARTS)
-    ends = tl.cumsum(counts, 0)
-    starts = ends - counts
     count = tl.sum(tl.where(b == seq, counts, 0), 0).to(tl.int32)
-    start = tl.sum(tl.where(b == seq, starts, 0), 0).to(tl.int32)
-    seq_tiles = tl.sum(tl.where(b == seq, tiles, 0), 0)
-    seq_ctx = tl.sum(tl.where(b == seq, ctx, 0), 0)
+    start = tl.sum(tl.where(b < seq, counts, 0), 0).to(tl.int32)
+    seq_ctx = tl.load(lengths + seq)
+    seq_tiles = (tl.maximum(seq_ctx, 0).to(tl.int64) + 255) // 256
     total_tasks = tl.sum(counts, 0).to(tl.int32)
     tl.store(reduce_info + seq * 2, start)
     tl.store(reduce_info + seq * 2 + 1, count)
@@ -57,9 +55,10 @@ def _plan_pa_decode(
     tl.store(work + slot * 4 + 2, end, active)
     tl.store(work + slot * 4 + 3, seq_ctx, active)
 
-    # The launch capacity is static for graph capture. Padded tasks run an
-    # empty context and write distinct unused scratch slots. These stores and
-    # the active stores are disjoint, including when every context is empty.
+    # The launch capacity is static for graph capture. Clear every padded work
+    # record so the attention kernel can skip it without touching stale scratch.
+    # These stores and the active stores are disjoint, including when every
+    # context is empty.
     pad = seq * BLOCK_P + part
     padding = (pad >= total_tasks) & (pad < CAPACITY)
     for field in tl.static_range(4):
