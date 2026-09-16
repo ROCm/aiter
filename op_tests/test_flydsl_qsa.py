@@ -8,7 +8,7 @@ Two layers:
   * Perf sweep (``__main__``): ``bench_qsa_family_a_plumbing``,
     ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
     ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
-    ``bench_qsa_family_a_k1``.
+    ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table).
 
 Usage::
 
@@ -440,12 +440,55 @@ def test_k1_family_a_set_equality_two_tiles():
         raise AssertionError("K1 two-tile block-id set diverged from the oracle")
 
 
+def test_k1_family_a_set_equality_prefill():
+    """Same K1 instantiation matches the oracle at prefill M=512."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 512, 512, 16
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FAMILY_A_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_k1_family_a_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+    )
+    if _set_mismatch_ratio(ref_ids, got) != 0.0:
+        raise AssertionError("K1 prefill block-id set diverged from the oracle")
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
 
-    2b does not claim a win. Expand is not fused. Long ``L`` streams 512-slot
-    tiles into a running LDS top-512 (no score matrix).
+    2c does not claim a win. Decode and prefill share one instantiation.
+    Expand is not fused. Long ``L`` streams 512-slot tiles into a running
+    LDS top-512 (no score matrix).
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -883,6 +926,7 @@ def _run_unit_cases():
     test_paged_roundtrip_tiny()
     test_k1_family_a_set_equality_short_decode()
     test_k1_family_a_set_equality_two_tiles()
+    test_k1_family_a_set_equality_prefill()
     aiter.logger.info("QSA oracle + K1 unit cases passed")
 
 
@@ -1007,6 +1051,22 @@ def main():
             df = pd.DataFrame(rows)
             aiter.logger.info(
                 "QSA family A FlyDSL K1 summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size in itertools.product(
+            [b for b in args.batch if b == 512],
+            args.seq,
+            args.page_size,
+        ):
+            if m > seq_len:
+                continue
+            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype))
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family A FlyDSL K1 prefill summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
