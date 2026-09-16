@@ -234,5 +234,22 @@ These AMD microseconds are **not** the 2d bar.
 | 1 | 131072 | 32768 | 7415.0 | 96.2 | 0 | 0 |
 | 8 | 131072 | 32768 | 7651.1 | 278.7 | 0 | 0 |
 
+## Phase 2c — family A FlyDSL K1 prefill
+
+Same wave64-per-row kernel as decode. Occupancy did not die at `M=512`, so
+there is no second compile. Expand still separate.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality.
+**Not a win claim.** This env still lacks `module_top_k_per_row.so`.
+These AMD microseconds are **not** the 2d bar.
+
+| m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
+|--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
+| 512 | 512 | 128 | 97.2 | 72.0 | 0 | 0 |
+| 512 | 2048 | 512 | 117.3 | 92.0 | 0 | 0 |
+| 512 | 8192 | 2048 | 458.4 | 161.1 | 0 | 0 |
+| 512 | 32768 | 8192 | 1826.2 | 509.2 | 0 | 0 |
+
+
 
 
