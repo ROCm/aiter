@@ -8,10 +8,10 @@ complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
 
 When ``visible <= 512`` the selected set is every complete block: one
-workgroup per row writes those ids. Otherwise each new 512-slot tile is
-sorted on its own and bitonic-merged into a sorted running top-512. Page
-tables of at most eight tiles stream in one workgroup; wider decode rows
-split columns across eight workgroups and pair-merge those sorted heaps.
+workgroup per row writes those ids. Decode rows with more than one
+512-slot tile split columns across eight workgroups (idle splits write
+``-inf`` heaps) and pair-merge those sorted heaps. Prefill streams tiles
+in one workgroup per row.
 """
 
 from functools import lru_cache
@@ -702,11 +702,11 @@ def qsa_k1_family_a_block_ids(
 ) -> torch.Tensor:
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
-    Short rows emit complete-block ids. Mid-length and prefill rows stream
-    tiles in one workgroup per row, sorting each new tile and merging it
-    into a running top-512. Decode-shaped long rows split columns across
-    eight workgroups and pair-merge those sorted heaps. Does not allocate a
-    score matrix. Expand+tail is still a separate launch.
+    Short rows emit complete-block ids. Decode rows with more than one
+    512-slot tile split columns across eight workgroups and pair-merge
+    those sorted heaps. Prefill streams tiles in one workgroup per row.
+    Does not allocate a score matrix. Expand+tail is still a separate
+    launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
@@ -739,11 +739,11 @@ def qsa_k1_family_a_block_ids(
     n_columns = page_table.shape[1] * page_size
     n_req = int(context_lens.shape[0])
     stream = torch.cuda.current_stream(q.device)
-    # Split only when a row can have more tiles than _SPLITS and there are
-    # few enough rows that extra workgroups help. Prefill already fills the
-    # GPU with one workgroup per row; the 4096-wide merge then costs more
-    # than streaming tiles serially. Short rows still emit inside serial.
-    if n_columns <= _SPLITS * _TILE or m > _SPLITS:
+    # Decode: split as soon as a row can have more than one tile. Idle
+    # splits write -inf heaps; the tree merge is cheap. Prefill already
+    # fills the GPU with one workgroup per row, so it stays serial.
+    # Short rows still emit inside the serial kernel.
+    if n_columns <= _TILE or m > _SPLITS:
         _run_compiled(
             _plan_serial(page_size),
             q,
