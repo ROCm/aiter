@@ -17,16 +17,13 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
-from aiter.ops.triton.moe.quant_moe import (
-    # downcast_to_static_fp8,
-    downcast_to_mxfp,
-    upcast_from_mxfp,
-)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 # ---------------
 # initialize data
@@ -282,17 +279,9 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        if arch_info.get_arch() == "gfx1250":
-            swizzle_mx_scale = "GFX1250_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
-            )
-        else:
-            assert arch_info.get_arch() == "gfx950"
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-            )
+        w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+            w_scale_tri, preshuffle_factor=32, scale_kwidth=8, return_layout=True
+        )
     else:
         swizzle_mx_scale = None
 

@@ -54,7 +54,7 @@ AITER is the **default kernel backend for LLM inference on AMD GPUs**, integrate
 | Operator | Speedup |
 |---|---|
 | MLA decode kernel | up to **17x** |
-| MHA prefill kernel | up to **14x** |
+| [MHA prefill kernel](op_tests/cpp/mha/README.md) | up to **14x** |
 | Block-scaled Fused MoE | up to **3x** |
 | Block-scaled GEMM | up to **2x** |
 | DeepSeek-R1 e2e (SGLang) | 6,484 → **13,704** tok/s (2.1x) |

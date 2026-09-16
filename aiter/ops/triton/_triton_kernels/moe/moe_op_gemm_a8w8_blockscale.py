@@ -7,6 +7,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
@@ -91,7 +92,29 @@ def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
     return new_pid
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+_moe_gemm_a8w8_blockscale_repr = make_kernel_repr(
+    "_moe_gemm_a8w8_blockscale",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "XCD_SWIZZLE",
+        "EVEN_K",
+        "BLOCKSCALE_M",
+        "BLOCKSCALE_N",
+        "BLOCKSCALE_K",
+        "PER_ROW_X_SCALE",
+        "W_CACHE_MODIFIER",
+        "N_EXPTS_ACT",
+        "APPLY_SWIGLU",
+        "SWIGLU_ADD_RESIDUAL",
+    ],
+)
+
+
+@triton.jit(repr=_moe_gemm_a8w8_blockscale_repr, launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w8_blockscale(
     Y,
     stride_y_k,

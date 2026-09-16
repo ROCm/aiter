@@ -430,15 +430,14 @@ class OpusGemmInstance:
             # they differ ONLY in device_flags, co_variant separates them.
             parts.insert(
                 tag_at,
-                (
-                    "4wave_wl_co"
-                    if self.kernel_tag == "a16w16_4wave_wl_co"
-                    else "4wave_co"
-                ),
+                {
+                    "a16w16_4wave_wl_co": "4wave_wl_co",
+                    "a16w16_4wave_wlr_co": "4wave_wlr_co",
+                }.get(self.kernel_tag, "4wave_co"),
             )
-            # Wave layout only shows up for the family that can vary it, so the
+            # Wave layout only shows up for the families that can vary it, so the
             # 4wave_co names already on disk are untouched.
-            if self.kernel_tag == "a16w16_4wave_wl_co":
+            if self.kernel_tag in ("a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"):
                 parts.append(f"w{self.co_wave_layout[0]}x{self.co_wave_layout[1]}")
             parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
             parts.append(f"p{self.num_slots}")
@@ -3469,9 +3468,10 @@ CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.
 # here is rejected outright rather than landing on some other family's kids.
 _CO_KID_BANDS = {
     "a16w16_4wave_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
-    # Same band: kids are explicit in the JSON, so the two co families just
+    # Same band: kids are explicit in the JSON, so the co families just
     # continue the numbering rather than each reserving a sub-range.
     "a16w16_4wave_wl_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
+    "a16w16_4wave_wlr_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
 }
 
 
@@ -3845,10 +3845,13 @@ def _opus_sidecar_path():
     Lives in ``{bd_dir}/`` (one level above the per-module build dir) so
     it survives ``aiter.jit.core.clear_build("module_deepgemm_opus")`` --
     which ``build_module()`` calls when ``AITER_REBUILD == 1`` -- and is
-    therefore the canonical "what kids should be in the next .so" source
-    that ``gen_instances.py`` consumes. The tuner expands this sidecar
-    BEFORE triggering the rebuild; if it lived inside the build dir,
-    clear_build would wipe it out before gen_instances could read it.
+    therefore seeds the last successfully compiled set into the next codegen.
+    The tuner passes new candidates through ``--extra_kids``; it does not
+    advance this file before compiling. JIT atomically copies the generated
+    sidecar back here after installing the .so, independently of source-cache
+    publication. Its adjacent ``.receipt`` binds the contents to that binary;
+    the tuner requires both to match before skipping a rebuild. A plain runtime
+    dispatch uses the CSV/C++ lookup, not this file.
     """
     # Import lazily to avoid circular import at module load (aiter imports
     # opus_gemm_common, opus_gemm_common imports aiter.jit.core).

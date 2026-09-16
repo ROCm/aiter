@@ -1,0 +1,14 @@
+{
+    "fwd": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
+        "waves_per_eu": 2,
+        "PRE_LOAD_V": false,
+        "num_stages": 3,
+        "num_warps": 8
+    },
+    "fwd_a3_tuned": {
+        "num_warps": 4,
+        "waves_per_eu": 2
+    }
+}

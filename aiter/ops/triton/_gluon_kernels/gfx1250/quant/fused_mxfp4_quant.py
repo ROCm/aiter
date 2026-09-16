@@ -3,6 +3,8 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 # rms norm op copied from triton
 @triton.jit
@@ -124,13 +126,34 @@ def _mxfp4_quant_op(
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
 
+_gluon_fused_rms_mxfp4_quant_repr = make_kernel_repr(
+    "_gluon_fused_rms_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_N2",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "HAS_SECOND_INPUT",
+        "FIRST_INPUT_RES",
+        "FIRST_INPUT_OUT",
+        "SCALE_N",
+        "SCALE_M_PAD",
+        "SCALE_N_PAD",
+        "SHUFFLE",
+        "SHUFFLE_PAD",
+        "EVEN_M_N",
+        "ROWS_PER_CTA",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["ROWS_PER_CTA"] == 0
         and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
     }
 )
-@gluon.jit
+@gluon.jit(repr=_gluon_fused_rms_mxfp4_quant_repr)
 def _gluon_fused_rms_mxfp4_quant_kernel(
     x1_ptr,
     w1_ptr,
@@ -879,7 +902,19 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
-@gluon.jit
+_gluon_fused_dynamic_mxfp4_quant_moe_sort_repr = make_kernel_repr(
+    "_gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel",
+    [
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "BLOCK_SIZE_Mx",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "TOPK",
+    ],
+)
+
+
+@gluon.jit(repr=_gluon_fused_dynamic_mxfp4_quant_moe_sort_repr)
 def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
     x_ptr,
     x_fp4_ptr,
