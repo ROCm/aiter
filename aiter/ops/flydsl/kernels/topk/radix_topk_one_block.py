@@ -15,7 +15,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from ..kernels_common import atomic_add_i32, atomic_or_i32, ord_signed_f32
+from ..kernels_common import atomic_add_i32, atomic_or_i32
 from .topk_per_row_decode import _load_f32x4, _row_length
 
 _VEC = 4
@@ -332,11 +332,8 @@ def build_radix_topk_one_block_module(
 
         # Key encoding and classification
         def ordered_key(value):
-            # Shared with the other per-row selectors: which one serves a call
-            # is a shape decision, so a row holding NaN or -0.0 must not answer
-            # differently for it. sign_bit turns that signed order into the
-            # unsigned one the radix digits below compare.
-            return ord_signed_f32(value) ^ sign_bit
+            bits = value.bitcast(fx.Int32)
+            return bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF)) ^ sign_bit
 
         def radix_bucket(key, shift, mask):
             return (key >> fx.Int32(shift)) & fx.Int32(mask)
