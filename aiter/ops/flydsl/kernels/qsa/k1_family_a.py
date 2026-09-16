@@ -8,7 +8,9 @@ complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
 
 One query row is eight wave64s (512 threads): each lane scores one column of
-the tile. Decode and prefill share this instantiation.
+the tile. When ``visible <= 512`` the selected set is every complete block, so
+the kernel writes those ids and skips the 1024-wide bitonic. Decode and
+prefill share this instantiation.
 """
 
 from functools import lru_cache
@@ -119,23 +121,6 @@ def build_qsa_k1_family_a_module(page_size: int):
         def better(s, c, bs, bc):
             return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
 
-        # 64 threads own the [H=4, D=128] BF16x8 TV layout; the other waves
-        # in this 512-thread block only score columns.
-        if tid < Int32(_Q_THREADS):
-            q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
-            q_row = fx.slice(q_buf, (row, None, None))
-            q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
-            q_src = q_thr.partition_S(q_block)
-            q_dst = q_thr.partition_D(smem_q)
-            q_frag = fx.make_fragment_like(q_src)
-            fx.copy(q_load, q_src, q_frag)
-            fx.copy(q_store, q_frag, q_dst)
-        for t in range_constexpr(candidate_steps):
-            j = tid + Int32(t * _BLOCK_THREADS)
-            cand_s[j] = _neg_inf()
-            cand_c[j] = neg_one
-        gpu.barrier()
-
         def score_col(col):
             logical_page = _idiv(col, page)
             off = col - logical_page * page
@@ -160,46 +145,71 @@ def build_qsa_k1_family_a_module(page_size: int):
                 total = total + fx.max(acc, Float32(0.0))
             return total * score_scale
 
-        for tile in range(zero, n_tiles, one):
-            tile_base = tile * Int32(_TILE)
-            for t in range_constexpr(tile_steps):
-                local = tid + Int32(t * _BLOCK_THREADS)
-                blk = tile_base + local
-                candidate = Int32(_K) + local
-                live = (blk < n_col) & (blk < visible) & valid_req
-                if live:
-                    cand_s[candidate] = score_col(blk)
-                    cand_c[candidate] = blk
-                else:
-                    cand_s[candidate] = _neg_inf()
-                    cand_c[candidate] = neg_one
+        # visible <= k: every complete block is in the top-512. Emit those
+        # ids and skip scoring plus the 55-stage bitonic.
+        if visible > Int32(_K):
+            # 64 threads own the [H=4, D=128] BF16x8 TV layout; the other
+            # waves in this 512-thread block only score columns.
+            if tid < Int32(_Q_THREADS):
+                q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
+                q_row = fx.slice(q_buf, (row, None, None))
+                q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
+                q_src = q_thr.partition_S(q_block)
+                q_dst = q_thr.partition_D(smem_q)
+                q_frag = fx.make_fragment_like(q_src)
+                fx.copy(q_load, q_src, q_frag)
+                fx.copy(q_store, q_frag, q_dst)
+            for t in range_constexpr(candidate_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
+                cand_s[j] = _neg_inf()
+                cand_c[j] = neg_one
             gpu.barrier()
 
-            # Sort the running top-512 plus this 512-slot tile in-place. The
-            # final order is best-first, so the lower half becomes the next heap.
-            for span, stride in _BITONIC_STAGES:
-                for t in range_constexpr(candidate_steps):
-                    j = tid + Int32(t * _BLOCK_THREADS)
-                    peer = j ^ Int32(stride)
-                    if j < peer:
-                        s0 = cand_s[j]
-                        c0 = cand_c[j]
-                        s1 = cand_s[peer]
-                        c1 = cand_c[peer]
-                        best_first = (j & Int32(span)) == zero
-                        swap = best_first.select(
-                            better(s1, c1, s0, c0),
-                            better(s0, c0, s1, c1),
-                        )
-                        cand_s[j] = swap.select(s1, s0)
-                        cand_c[j] = swap.select(c1, c0)
-                        cand_s[peer] = swap.select(s0, s1)
-                        cand_c[peer] = swap.select(c0, c1)
+            for tile in range(zero, n_tiles, one):
+                tile_base = tile * Int32(_TILE)
+                for t in range_constexpr(tile_steps):
+                    local = tid + Int32(t * _BLOCK_THREADS)
+                    blk = tile_base + local
+                    candidate = Int32(_K) + local
+                    live = (blk < n_col) & (blk < visible) & valid_req
+                    if live:
+                        cand_s[candidate] = score_col(blk)
+                        cand_c[candidate] = blk
+                    else:
+                        cand_s[candidate] = _neg_inf()
+                        cand_c[candidate] = neg_one
                 gpu.barrier()
 
-        for t in range_constexpr(tile_steps):
-            j = tid + Int32(t * _BLOCK_THREADS)
-            block_ids[row, j] = cand_c[j]
+                # Sort the running top-512 plus this 512-slot tile in-place.
+                # Best-first: the lower half becomes the next heap.
+                for span, stride in _BITONIC_STAGES:
+                    for t in range_constexpr(candidate_steps):
+                        j = tid + Int32(t * _BLOCK_THREADS)
+                        peer = j ^ Int32(stride)
+                        if j < peer:
+                            s0 = cand_s[j]
+                            c0 = cand_c[j]
+                            s1 = cand_s[peer]
+                            c1 = cand_c[peer]
+                            best_first = (j & Int32(span)) == zero
+                            swap = best_first.select(
+                                better(s1, c1, s0, c0),
+                                better(s0, c0, s1, c1),
+                            )
+                            cand_s[j] = swap.select(s1, s0)
+                            cand_c[j] = swap.select(c1, c0)
+                            cand_s[peer] = swap.select(s0, s1)
+                            cand_c[peer] = swap.select(c0, c1)
+                    gpu.barrier()
+
+            for t in range_constexpr(tile_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
+                block_ids[row, j] = cand_c[j]
+        else:
+            for t in range_constexpr(tile_steps):
+                j = tid + Int32(t * _BLOCK_THREADS)
+                take = (j < visible) & (j < n_col) & valid_req
+                block_ids[row, j] = take.select(j, neg_one)
 
     @flyc.jit
     def launch_qsa_k1_family_a(
@@ -278,8 +288,9 @@ def qsa_k1_family_a_block_ids(
 ) -> torch.Tensor:
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
-    Streams 512-slot tiles and merges a running LDS top-512. Does not allocate
-    a score matrix. Expand+tail is still a separate launch.
+    Streams 512-slot tiles and merges a running LDS top-512. When every
+    complete block fits in the budget, writes those ids and skips the merge.
+    Does not allocate a score matrix. Expand+tail is still a separate launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
