@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K1 (SILOTIGER-1047 2c): paged ReLU-sum + tiled top-512.
+"""Family A FlyDSL QSA K1 (SILOTIGER-1047 2d): paged ReLU-sum + tiled top-512.
 
 Streams compressed index-K from the paged cache in 512-slot tiles, scores
 complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
 
-Decode (``M=1..8``) and prefill (``M=512``) share this instantiation: one
-wave64 block per query row. Prefill occupancy did not die relative to decode,
-so there is no second compile.
+One query row is eight wave64s (512 threads): each lane scores one column of
+the tile. Decode and prefill share this instantiation.
 """
 
 from functools import lru_cache
@@ -23,7 +22,7 @@ from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_INDEXER, FAMILY_A_SCORE_SCALE
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 
-_BLOCK_THREADS = 64
+_BLOCK_THREADS = 512
 _TILE = 512
 _K = FAMILY_A_INDEXER.block_budget
 _CANDIDATES = _K + _TILE
@@ -31,6 +30,7 @@ _H = FAMILY_A_INDEXER.n_heads
 _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
 _VEC = 8
+_Q_THREADS = _H * (_D // _VEC)
 _BITONIC_STAGES = tuple(
     (span, stride)
     for span in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
@@ -49,8 +49,8 @@ def _neg_inf():
 def build_qsa_k1_family_a_module(page_size: int):
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
-    if _TILE % _BLOCK_THREADS:
-        raise ValueError("tile size must be a multiple of block threads")
+    if _CANDIDATES % _BLOCK_THREADS:
+        raise ValueError("candidate buffer must be a multiple of block threads")
     if _K != _TILE:
         raise ValueError("family A local heap is one tile (k=512)")
     if _D % _VEC:
@@ -66,7 +66,9 @@ def build_qsa_k1_family_a_module(page_size: int):
 
     @flyc.kernel(
         name="qsa_k1_family_a_"
-        + kernel_signature(ps=page_size, tile=_TILE, k=_K, h=_H, d=_D),
+        + kernel_signature(
+            ps=page_size, tile=_TILE, k=_K, h=_H, d=_D, blk=_BLOCK_THREADS
+        ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def qsa_k1_family_a_kernel(
@@ -94,6 +96,10 @@ def build_qsa_k1_family_a_module(page_size: int):
         q_store = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
         q_buf = fx.rocdl.make_buffer_tensor(q)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
+        q_tile, q_tv = fx.make_layout_tv(
+            fx.make_layout((_H, _D // _VEC), (_D // _VEC, 1)),
+            fx.make_layout((1, _VEC), (_VEC, 1)),
+        )
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         smem_q = storage.q.view(fx.make_layout((_H, _D), (_D, 1)))
@@ -113,21 +119,18 @@ def build_qsa_k1_family_a_module(page_size: int):
         def better(s, c, bs, bc):
             return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
 
-        # One thread owns one contiguous BF16x8 Q vector. The TV layout maps
-        # 4x16 threads onto the exact [H=4,D=128] row.
-        q_tile, q_tv = fx.make_layout_tv(
-            fx.make_layout((_H, _D // _VEC), (_D // _VEC, 1)),
-            fx.make_layout((1, _VEC), (_VEC, 1)),
-        )
-        q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
-        q_row = fx.slice(q_buf, (row, None, None))
-        q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
-        q_src = q_thr.partition_S(q_block)
-        q_dst = q_thr.partition_D(smem_q)
-        q_frag = fx.make_fragment_like(q_src)
-        fx.copy(q_load, q_src, q_frag)
-        fx.copy(q_store, q_frag, q_dst)
-        for t in range_constexpr(tile_steps):
+        # 64 threads own the [H=4, D=128] BF16x8 TV layout; the other waves
+        # in this 512-thread block only score columns.
+        if tid < Int32(_Q_THREADS):
+            q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
+            q_row = fx.slice(q_buf, (row, None, None))
+            q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
+            q_src = q_thr.partition_S(q_block)
+            q_dst = q_thr.partition_D(smem_q)
+            q_frag = fx.make_fragment_like(q_src)
+            fx.copy(q_load, q_src, q_frag)
+            fx.copy(q_store, q_frag, q_dst)
+        for t in range_constexpr(candidate_steps):
             j = tid + Int32(t * _BLOCK_THREADS)
             cand_s[j] = _neg_inf()
             cand_c[j] = neg_one
