@@ -67,6 +67,19 @@ FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 _GFX942_CU_LDS_BYTES = 64 * 1024
 
 
+def _gfx950_kv_splits(seq_len, seq_len_kv, block_m):
+    """How many workgroups to put on one query row block's KV walk."""
+    _TARGET_WGS = 4096
+    _MIN_SPLIT_KV = 16384
+    num_blocks = triton.cdiv(seq_len, block_m)
+    if num_blocks >= _TARGET_WGS:
+        return 1
+    return min(
+        triton.cdiv(_TARGET_WGS, num_blocks),
+        max(1, triton.cdiv(seq_len_kv, _MIN_SPLIT_KV)),
+    )
+
+
 def _gfx942_tile_fits_lds(
     block_kv: int, head_size: int, num_stages: int, occupancy: int
 ) -> bool:
@@ -236,6 +249,7 @@ def fp8_mqa_logits(
             num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
             # Relax the store masking if we don't have to provide clean logits
             relaxed_store = 0 if clean_logits else 1
+            num_kv_splits = _gfx950_kv_splits(seq_len, seq_len_kv, block_m)
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
@@ -244,6 +258,7 @@ def fp8_mqa_logits(
                 # two KV tiles per loop body for the scheduler to interleave
                 "UNROLL": 2,
                 "RELAXED_STORE": relaxed_store,
+                "NUM_KV_SPLITS": num_kv_splits,
             }
         else:
             loop_variant = 1
@@ -253,9 +268,11 @@ def fp8_mqa_logits(
             block_kv = 128
             # This kernel has no BLOCK_M: it walks one query row per program.
             block_m = 1
+            num_kv_splits = 1  # gfx1250 kernel has no split support
             other = {"LOOP_VARIANT": loop_variant}
 
-        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
+        grid = ((seq_len + block_m - 1) // block_m * num_kv_splits,)
+        _gluon_fp8_mqa_logits_kernel[grid](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,

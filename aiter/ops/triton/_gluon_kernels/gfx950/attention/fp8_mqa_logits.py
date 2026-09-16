@@ -885,6 +885,7 @@ _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
         "M_CHUNK",
         "UNROLL",
         "RELAXED_STORE",
+        "NUM_KV_SPLITS",
     ],
 )
 
@@ -923,6 +924,7 @@ def _gluon_fp8_mqa_logits_kernel(
     M_CHUNK: gl.constexpr = 0,  # heads folded per MFMA group (0 = whole tile)
     UNROLL: gl.constexpr = 1,  # KV tiles per loop body (1 = backend default)
     RELAXED_STORE: gl.constexpr = 0,  # BLOCK_M > 1: drop the per-row store mask
+    NUM_KV_SPLITS: gl.constexpr = 1,  # workgroups sharing one query row block
 ):
 
     gl.static_assert(
@@ -943,7 +945,17 @@ def _gluon_fp8_mqa_logits_kernel(
 
     # Reversed so the longest segments (highest row ids in a causal layout) are
     # dispatched first. With BLOCK_M > 1 the reversal is at block granularity.
-    block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
+    if NUM_KV_SPLITS == 1:
+        split_id = 0
+        block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
+    else:
+        # Split-major: one split's workgroups are consecutive program ids, and
+        # program ids go to XCDs round-robin, so every split spreads over all
+        # eight of them. Pinning a split to one XCD instead, so its slice of KV
+        # stays in that XCD's L2, was tried and measured neutral.
+        num_blocks = gl.num_programs(0) // NUM_KV_SPLITS
+        split_id = gl.program_id(axis=0) // num_blocks
+        block_id = num_blocks - (gl.program_id(axis=0) % num_blocks) - 1
     if BLOCK_M == 1:
         row_id = block_id
     else:
@@ -991,6 +1003,18 @@ def _gluon_fp8_mqa_logits_kernel(
         end_ind1 = gl.minimum(gl.load(cu_end_ptr + row_id + 1), seq_len_kv)
         union_start = gl.minimum(start_ind, start_ind1)
         union_end = gl.maximum(end_ind, end_ind1)
+    else:
+        union_start = start_ind
+        union_end = end_ind
+
+    if NUM_KV_SPLITS > 1:
+        tiles = (union_end - union_start + BLOCK_KV - 1) // BLOCK_KV
+        tiles_per_split = (tiles + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
+        split_start = union_start + split_id * tiles_per_split * BLOCK_KV
+        if split_start >= union_end:
+            return  # row shorter than the split count reaches
+        union_end = gl.minimum(union_end, split_start + tiles_per_split * BLOCK_KV)
+        union_start = split_start
 
     KVLoader: gl.constexpr = MQAAsyncKVLoader
 
@@ -1052,8 +1076,6 @@ def _gluon_fp8_mqa_logits_kernel(
         w_blocks = (w_block,)
         row_starts = (start_ind,)
         row_ends = (end_ind,)
-        union_start = start_ind
-        union_end = end_ind
     else:
         mfma_q1, w_block1 = _load_row_operands(
             Q_ptr,
@@ -1074,6 +1096,14 @@ def _gluon_fp8_mqa_logits_kernel(
         w_blocks = (w_block, w_block1)
         row_starts = (start_ind, start_ind1)
         row_ends = (end_ind, end_ind1)
+        if NUM_KV_SPLITS > 1:
+            # This store mask is absolute, and the loop's tail peel runs one
+            # tile past the split. Without the clamp that tile would land on
+            # the next split's first tile.
+            row_ends = (
+                gl.minimum(end_ind, union_end),
+                gl.minimum(end_ind1, union_end),
+            )
 
     num_full_tiles = (union_end - union_start) // BLOCK_KV
 
