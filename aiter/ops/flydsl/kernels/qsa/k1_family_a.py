@@ -22,10 +22,16 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 _BLOCK_THREADS = 64
 _TILE = 512
 _K = FAMILY_A_INDEXER.block_budget
+_CANDIDATES = _K + _TILE
 _H = FAMILY_A_INDEXER.n_heads
 _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
 _VEC = 8
+_BITONIC_STAGES = tuple(
+    (span, stride)
+    for span in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+    for stride in tuple(1 << shift for shift in range(span.bit_length() - 2, -1, -1))
+)
 
 
 def _idiv(a, b):
@@ -45,17 +51,14 @@ def build_qsa_k1_family_a_module(page_size: int):
         raise ValueError("family A local heap is one tile (k=512)")
     if _D % _VEC:
         raise ValueError("head dimension must be a multiple of vector width")
-    steps = _TILE // _BLOCK_THREADS
+    tile_steps = _TILE // _BLOCK_THREADS
+    candidate_steps = _CANDIDATES // _BLOCK_THREADS
 
     @fx.struct
     class SharedStorage:
         q: fx.Array[BFloat16, _H * _D, 16]
-        heap_s: fx.Array[Float32, _TILE, 16]
-        heap_c: fx.Array[Int32, _TILE, 16]
-        tile_s: fx.Array[Float32, _TILE, 16]
-        tile_c: fx.Array[Int32, _TILE, 16]
-        pack_s: fx.Array[Float32, _TILE, 16]
-        pack_c: fx.Array[Int32, _TILE, 16]
+        cand_s: fx.Array[Float32, _CANDIDATES, 16]
+        cand_c: fx.Array[Int32, _CANDIDATES, 16]
 
     @flyc.kernel(
         name="qsa_k1_family_a_"
@@ -83,17 +86,15 @@ def build_qsa_k1_family_a_module(page_size: int):
         n_col = n_columns
         vec_layout = fx.make_layout(_VEC, 1)
         k_copy = buf_copy_atom(16, BFloat16)
-        q_copy = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+        q_load = buf_copy_atom(16, BFloat16)
+        q_store = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+        q_buf = fx.rocdl.make_buffer_tensor(q)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         smem_q = storage.q.view(fx.make_layout((_H, _D), (_D, 1)))
-        heap_s = storage.heap_s.view(fx.make_layout(_TILE, 1))
-        heap_c = storage.heap_c.view(fx.make_layout(_TILE, 1))
-        tile_s = storage.tile_s.view(fx.make_layout(_TILE, 1))
-        tile_c = storage.tile_c.view(fx.make_layout(_TILE, 1))
-        pack_s = storage.pack_s.view(fx.make_layout(_TILE, 1))
-        pack_c = storage.pack_c.view(fx.make_layout(_TILE, 1))
+        cand_s = storage.cand_s.view(fx.make_layout(_CANDIDATES, 1))
+        cand_c = storage.cand_c.view(fx.make_layout(_CANDIDATES, 1))
 
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
@@ -108,16 +109,24 @@ def build_qsa_k1_family_a_module(page_size: int):
         def better(s, c, bs, bc):
             return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
 
-        # Q is reused across tiles. Stage it once in LDS.
-        for t in range_constexpr(steps):
-            flat = tid + Int32(t * _BLOCK_THREADS)
-            h = _idiv(flat, Int32(_D))
-            d = flat - h * Int32(_D)
-            smem_q[h, d] = q[row, h, d]
-            heap_s[flat] = _neg_inf()
-            heap_c[flat] = neg_one
-            pack_s[flat] = _neg_inf()
-            pack_c[flat] = neg_one
+        # One thread owns one contiguous BF16x8 Q vector. The TV layout maps
+        # 4x16 threads onto the exact [H=4,D=128] row.
+        q_tile, q_tv = fx.make_layout_tv(
+            fx.make_layout((_H, _D // _VEC), (_D // _VEC, 1)),
+            fx.make_layout((1, _VEC), (_VEC, 1)),
+        )
+        q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
+        q_row = fx.slice(q_buf, (row, None, None))
+        q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
+        q_src = q_thr.partition_S(q_block)
+        q_dst = q_thr.partition_D(smem_q)
+        q_frag = fx.make_fragment_like(q_src)
+        fx.copy(q_load, q_src, q_frag)
+        fx.copy(q_store, q_frag, q_dst)
+        for t in range_constexpr(tile_steps):
+            j = tid + Int32(t * _BLOCK_THREADS)
+            cand_s[j] = _neg_inf()
+            cand_c[j] = neg_one
         gpu.barrier()
 
         def score_col(col):
@@ -136,7 +145,7 @@ def build_qsa_k1_family_a_module(page_size: int):
                     k_frag = fx.make_fragment_like(k_src)
                     q_frag = fx.make_fragment_like(q_src)
                     fx.copy(k_copy, k_src, k_frag)
-                    fx.copy(q_copy, q_src, q_frag)
+                    fx.copy(q_store, q_src, q_frag)
                     k_vec = fx.Vector(fx.memref_load_vec(k_frag))
                     q_vec = fx.Vector(fx.memref_load_vec(q_frag))
                     for j in range_constexpr(_VEC):
@@ -146,72 +155,44 @@ def build_qsa_k1_family_a_module(page_size: int):
 
         for tile in range(zero, n_tiles, one):
             tile_base = tile * Int32(_TILE)
-            for t in range_constexpr(steps):
+            for t in range_constexpr(tile_steps):
                 local = tid + Int32(t * _BLOCK_THREADS)
                 blk = tile_base + local
+                candidate = Int32(_K) + local
                 live = (blk < n_col) & (blk < visible) & valid_req
                 if live:
-                    tile_s[local] = score_col(blk)
-                    tile_c[local] = blk
+                    cand_s[candidate] = score_col(blk)
+                    cand_c[candidate] = blk
                 else:
-                    tile_s[local] = _neg_inf()
-                    tile_c[local] = neg_one
+                    cand_s[candidate] = _neg_inf()
+                    cand_c[candidate] = neg_one
             gpu.barrier()
 
-            # Top-512 of running heap ? this tile. Smaller column wins ties.
-            for slot in range(zero, Int32(_K), one):
-                best_s = _neg_inf()
-                best_c = neg_one
-                best_j = neg_one
-                best_src = zero
-                for t in range_constexpr(steps):
+            # Sort the running top-512 plus this 512-slot tile in-place. The
+            # final order is best-first, so the lower half becomes the next heap.
+            for span, stride in _BITONIC_STAGES:
+                for t in range_constexpr(candidate_steps):
                     j = tid + Int32(t * _BLOCK_THREADS)
-                    hs = heap_s[j]
-                    hc = heap_c[j]
-                    take_h = better(hs, hc, best_s, best_c)
-                    best_s = take_h.select(hs, best_s)
-                    best_c = take_h.select(hc, best_c)
-                    best_j = take_h.select(j, best_j)
-                    best_src = take_h.select(zero, best_src)
-                    ts = tile_s[j]
-                    tc = tile_c[j]
-                    take_t = better(ts, tc, best_s, best_c)
-                    best_s = take_t.select(ts, best_s)
-                    best_c = take_t.select(tc, best_c)
-                    best_j = take_t.select(j, best_j)
-                    best_src = take_t.select(one, best_src)
-                for shift in (32, 16, 8, 4, 2, 1):
-                    peer_s = best_s.shuffle_xor(Int32(shift), Int32(_BLOCK_THREADS))
-                    peer_c = best_c.shuffle_xor(Int32(shift), Int32(_BLOCK_THREADS))
-                    peer_j = best_j.shuffle_xor(Int32(shift), Int32(_BLOCK_THREADS))
-                    peer_src = best_src.shuffle_xor(Int32(shift), Int32(_BLOCK_THREADS))
-                    take = better(peer_s, peer_c, best_s, best_c)
-                    best_s = take.select(peer_s, best_s)
-                    best_c = take.select(peer_c, best_c)
-                    best_j = take.select(peer_j, best_j)
-                    best_src = take.select(peer_src, best_src)
-                if tid == zero:
-                    pack_s[slot] = best_s
-                    pack_c[slot] = best_c
-                for t in range_constexpr(steps):
-                    j = tid + Int32(t * _BLOCK_THREADS)
-                    hit = (best_j >= zero) & (j == best_j)
-                    hit_h = hit & (best_src == zero)
-                    hit_t = hit & (best_src == one)
-                    heap_c[j] = hit_h.select(neg_one, heap_c[j])
-                    heap_s[j] = hit_h.select(_neg_inf(), heap_s[j])
-                    tile_c[j] = hit_t.select(neg_one, tile_c[j])
-                    tile_s[j] = hit_t.select(_neg_inf(), tile_s[j])
+                    peer = j ^ Int32(stride)
+                    if j < peer:
+                        s0 = cand_s[j]
+                        c0 = cand_c[j]
+                        s1 = cand_s[peer]
+                        c1 = cand_c[peer]
+                        best_first = (j & Int32(span)) == zero
+                        swap = best_first.select(
+                            better(s1, c1, s0, c0),
+                            better(s0, c0, s1, c1),
+                        )
+                        cand_s[j] = swap.select(s1, s0)
+                        cand_c[j] = swap.select(c1, c0)
+                        cand_s[peer] = swap.select(s0, s1)
+                        cand_c[peer] = swap.select(c0, c1)
                 gpu.barrier()
-            for t in range_constexpr(steps):
-                j = tid + Int32(t * _BLOCK_THREADS)
-                heap_s[j] = pack_s[j]
-                heap_c[j] = pack_c[j]
-            gpu.barrier()
 
-        for t in range_constexpr(steps):
+        for t in range_constexpr(tile_steps):
             j = tid + Int32(t * _BLOCK_THREADS)
-            block_ids[row, j] = pack_c[j]
+            block_ids[row, j] = cand_c[j]
 
     @flyc.jit
     def launch_qsa_k1_family_a(
@@ -261,7 +242,7 @@ def qsa_k1_family_a_serves(
     """Why this K1 kernel cannot serve these tensors, or None if it can."""
     idx = FAMILY_A_INDEXER
     if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
-        return "q and k_cache must be bfloat16, got " f"{q.dtype} and {k_cache.dtype}"
+        return f"q and k_cache must be bfloat16, got {q.dtype} and {k_cache.dtype}"
     if q.dim() != 3 or q.shape[1] != idx.n_heads or q.shape[2] != idx.head_dim:
         return f"q must be [M, {idx.n_heads}, {idx.head_dim}], got {tuple(q.shape)}"
     if k_cache.dim() != 4:
@@ -271,7 +252,6 @@ def qsa_k1_family_a_serves(
             f"k_cache KV/D must be ({idx.kv_heads}, {idx.head_dim}), "
             f"got {k_cache.shape[2:]}"
         )
-    page_size = k_cache.shape[1]
     if page_table.dim() != 2 or page_table.dtype != torch.int32:
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
