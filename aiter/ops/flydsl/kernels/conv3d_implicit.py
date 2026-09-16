@@ -11,11 +11,19 @@
 
 """Double-buffered implicit-GEMM conv3d (BF16), vendored into aiter.
 
-Upstream: FlyDSL ``kernels/conv/conv3d_implicit.py``. The public entry point and
-its keyword surface are unchanged; the only edit is ``buffer_atomic_add``, which
-upstream imports from ``kernels/common/`` -- a directory flydsl's wheel does not
-ship -- and which is therefore defined here, as with the vendored ``buffer_ops``
-and ``vector`` modules.
+Upstream is FlyDSL ``kernels/conv/conv3d_implicit.py`` and the public entry point
+still matches its keyword surface, but the body has diverged. aiter-only here:
+the offline tuned-config lookup (``_load_tuned_table`` / ``_lookup_tuned_tile``
+and the ``aiter/configs`` tables they read), the autotune hook, the tile
+heuristics, and ``buffer_atomic_add`` -- which upstream imports from
+``kernels/common/``, a directory flydsl's wheel does not ship, as with the
+vendored ``buffer_ops`` and ``vector`` modules.
+
+Launching goes through the local ``_dispatch`` rather than aiter's
+``tensor_shim._run_compiled``: keeping the launcher shape comparable to upstream
+is what makes a re-sync a readable diff, and a conv is launched once per layer
+rather than in a tight loop, so the per-call dispatch ``_run_compiled`` saves
+does not pay for that divergence.
 
 x: (N, C, D, H, W) bf16 NCDHW by default, weight: (K, C/groups, T, R, S) bf16 KCTRS.
 Returns (N, K, Do, Ho, Wo) bf16 by default. ``input_layout`` / ``output_layout`` select
@@ -272,6 +280,10 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
         )
 
         def lds_store_vec8(elem_offset, value):
+            # Destination is a raw LDS byte offset with no tensor form to copy
+            # into, so the pointer is built by hand. _lds_st_ptr_ty carries the
+            # 16-byte alignment, which is what keeps this one ds_write_b128
+            # instead of eight scalar writes.
             base = fx.Int64(fx.ptrtoint(lds.ptr)) + fx.Int64(elem_offset * 2)
             fx.ptr_store(value, fx.inttoptr(_lds_st_ptr_ty, base))
 
@@ -969,6 +981,10 @@ def compile_conv3d_implicit(
         )
 
         def _big_store(off_nk_i64, value):
+            # BIG_OUT means y is past what a buffer descriptor's 32-bit voffset
+            # reaches, so there is no buffer-resource form to route this through
+            # and the store is addressed by a flat 64-bit address instead. That
+            # is also why this path gives up y_div and the store copy atoms.
             addr = y_elem_base + off_nk_i64 * fx.Int64(BF16_BYTES)
             fx.ptr_store(value, fx.inttoptr(_big_st_ptr_ty, addr))
 
