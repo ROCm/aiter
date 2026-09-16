@@ -201,9 +201,8 @@ separate steps (plumbing → live AMD → #4882 → rocprof).
       `aiter/ops/triton/_triton_kernels/attention/qsa_vllm_amd.py`
       (vLLM `836bb3839ffe`). HIP top-k via
       `aiter.ops.topk._hip_top_k_per_row_decode` (not FlyDSL top-k) when
-      `module_top_k_per_row.so` is present. This environment has no such
-      module at pin time, so the harness uses the oracle tie-break on MQA
-      logits instead.
+      `module_top_k_per_row.so` is present. Phase 1 tables were recorded
+      without that module (oracle tie-break on MQA logits).
 - [x] Pin **#4882 Triton** (`qsa_paged_mqa_logits` / expand /
       `qsa_sparse_paged_gqa`) onto family A paged tensors. PR head
       `150c7bc12b45`; Triton-only launchers in
