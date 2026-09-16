@@ -397,9 +397,8 @@ def compile_conv3d_implicit(
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
     # MFMA atoms per wave. tiled_mma replicates the atom over the (WAVE_M, WAVE_N) wave
     # grid and tiles THAT over (TILE_M, TILE_N), so a wave's atoms are strided by the
-    # whole wave grid rather than contiguous: acc[None, mi, ni] is atom (mi, ni) of the
-    # wave at (wave_m, wave_n), which owns rows (mi * WAVE_M + wave_m) * MFMA_M and
-    # columns (ni * WAVE_N + wave_n) * MFMA_N. The epilogue's row/col math must match.
+    # whole wave grid rather than contiguous. The epilogue takes its row/col from
+    # partition_C rather than rederiving that.
     MI_M = TILE_M // WAVE_M // MFMA_M
     MI_N = TILE_N // WAVE_N // MFMA_N
     BLOCK_VECS = LDG_VEC * BLOCK_THREADS
@@ -655,13 +654,6 @@ def compile_conv3d_implicit(
             )
             x_src = _x_rebased(fx.Int64(x_base_elem))
 
-        wid = tid // WARP_SIZE
-        lane = tid % WARP_SIZE
-        wave_m = wid // WAVE_N
-        wave_n = wid % WAVE_N
-        c_m_vec = lane // MFMA_N * MFMA_C_VALUES
-        c_n = lane % MFMA_N
-
         Vec = fx.Vector
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, TILE_K, elem_ty))
@@ -690,6 +682,23 @@ def compile_conv3d_implicit(
             fx.make_view(fx.get_iter(y), fx.make_layout((TILE_M, TILE_N), (TILE_N, 1)))
         )
         acc.fill(0.0)
+
+        # Tile-local (row, col) of each accumulator element, taken from the same
+        # tiled_mma that owns acc so the epilogue cannot drift from the MMA's own
+        # partitioning. Each view's layout IS the coordinate, so partition_C
+        # hands back coordinates rather than data.
+        #
+        # They have to be indexed flat: acc is ((MFMA_C_VALUES, 1), MI_M, MI_N),
+        # and the hierarchical spellings trip a rank assertion in the layout
+        # algebra. Flat index is v + MFMA_C_VALUES * (mi + MI_M * ni); a lane
+        # holds one column and MFMA_C_VALUES consecutive rows per atom, so v = 0
+        # of atom (mi, ni) is all the epilogue needs.
+        c_row = thr_mma.partition_C(
+            fx.make_view(0, fx.make_layout((TILE_M, TILE_N), (1, 0)))
+        )
+        c_col = thr_mma.partition_C(
+            fx.make_view(0, fx.make_layout((TILE_M, TILE_N), (0, 1)))
+        )
 
         def barrier(vmcnt=0, lgkmcnt=None):
             rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
@@ -979,7 +988,7 @@ def compile_conv3d_implicit(
 
         def _cols(ni):
             """Global out-channel for MFMA column block ni, and its index within the group."""
-            col_off = fx.Int64((ni * WAVE_N + wave_n) * MFMA_N + c_n)
+            col_off = fx.Int64(fx.get_scalar(c_col[MFMA_C_VALUES * MI_M * ni]))
             col = n_offset + col_off
             return col, ((n_local + col_off) if const_expr(groups > 1) else col)
 
@@ -995,7 +1004,7 @@ def compile_conv3d_implicit(
                     bias_vals.append(fx.Float32(fx.memref_load_vec(bias_reg)[0]))
 
             for mi in range_constexpr(MI_M):
-                row_base = m_offset + (mi * WAVE_M + wave_m) * MFMA_M + c_m_vec
+                row_base = m_offset + fx.get_scalar(c_row[MFMA_C_VALUES * mi])
                 for ni in range_constexpr(MI_N):
                     col, col_loc = _cols(ni)
                     a = Vec(acc[None, mi, ni].load())
