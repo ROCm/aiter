@@ -44,17 +44,6 @@ from .mxfp4_gemm_common import (
 ACC_LDS_PAD_DW = 4
 
 
-def k_g2_half_for(inter):
-    return inter // 2
-
-
-def out_as_per_chunk_dw_for(inter):
-    scale_cols = inter // 32
-    # Match fused_dynamic_mx_quant_moe_sort: scale-N is padded to eight bytes.
-    scale_cols_padded = ((scale_cols + 7) // 8) * 8
-    return scale_cols_padded * 8
-
-
 def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
     num_n_blocks = 2 * INTER // BN
     if BM == 128:
@@ -120,8 +109,8 @@ def _gemm1_body(
     BSCALE_BYTES = bscale_bytes_for(NE, N_OUT, K)
     NUM_N_BLOCKS = N_OUT // BN
     inter = N_OUT // 2
-    OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(inter)
-    OUT_ROW_BYTES = inter if out_dtype == "fp8" else k_g2_half_for(inter)
+    OUT_AS_PER_CHUNK_DW = kas_per_chunk_dw_for(inter)
+    OUT_ROW_BYTES = inter if out_dtype == "fp8" else k_half_for(inter)
     kAStages, kSubBlocks, kMChunks, _ = _bm_constants(
         BM, BN, KH_TILE, K_TILES_TOTAL, k_wave
     )
@@ -155,10 +144,10 @@ def _gemm1_body(
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
 
-    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, mem_4x1)
+    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
 
-    bscale_tiles = _global_i32_buffer_tiles(arg_bscale, BSCALE_BYTES, mem_1x1)
+    bscale_tiles = _global_i32_buffer_tiles(arg_bscale, BSCALE_BYTES, 1)
     bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
 
     # aq/ascale: global->LDS async DMA (no register fragment), via BufferCopyLDS.
@@ -175,7 +164,7 @@ def _gemm1_body(
 
     if const_expr(inline_quant):
         hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
-        hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, mem_4x1)
+        hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
 
     # Union LDS region [s_aq | s_asc], reused as lds_acc (f32 accumulator) in the
@@ -348,7 +337,7 @@ def _gemm1_body(
                         r,
                         soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
                     )
-                    fx.copy_atom_call(
+                    fx.copy(
                         i32x4_copy_atom,
                         r,
                         fx.slice(s_aq_i32x4_tiles, (None, dst_off // fx.Int32(16))),
@@ -374,9 +363,7 @@ def _gemm1_body(
         # ds_read_b128 straight into an i32[4] register fragment (kept as a tensor
         # so it can feed fx.gemm directly).
         r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
-        fx.copy_atom_call(
-            i32x4_copy_atom, fx.slice(s_aq_i32x4_tiles, (None, tile_idx)), r
-        )
+        fx.copy(i32x4_copy_atom, fx.slice(s_aq_i32x4_tiles, (None, tile_idx)), r)
         return r
 
     def issue_a_ds_read(slot):
@@ -694,10 +681,7 @@ def _gemm1_body(
 
     def _inline_quant_core_batch(specs, slot, scale_accum):
         n = len(specs)
-        h_dw = [
-            [fx.Int32(as_ir_value(h_v[j])) for j in range_constexpr(4)]
-            for (_b, _s, h_v) in specs
-        ]
+        h_dw = [[h_v[j] for j in range_constexpr(4)] for (_b, _s, h_v) in specs]
         a = [_iq_block_amax(h_dw[i]) for i in range_constexpr(n)]
         s1 = [
             fx.Int32(
@@ -733,9 +717,7 @@ def _gemm1_body(
         ]
         for i in range_constexpr(n):
             B128_IDX, SUB, _hv = specs[i]
-            qs_raw = as_ir_value(
-                fx.Float32(as_ir_value(e8[i] << fx.Int32(23)).bitcast(T.f32))
-            )
+            qs_raw = as_ir_value((e8[i] << fx.Int32(23)).bitcast(fx.Float32))
             _iq_pack_store(h_dw[i], qs_raw, B128_IDX, SUB, slot)
             pack_byte = B128_IDX * 2 + SUB
             scale_accum = scale_accum | (e8[i] << fx.Int32(pack_byte * 8))
@@ -1012,11 +994,11 @@ def _gemm1_body(
     def acc_store(idx, value):
         r = fx.make_rmem_tensor(mem_1x1, fx.Float32)
         r.store(fx.Vector.from_elements([fx.Float32(value)], fx.Float32))
-        fx.copy_atom_call(acc_copy_atom, r, fx.slice(acc_flat_tiles, (None, idx)))
+        fx.copy(acc_copy_atom, r, fx.slice(acc_flat_tiles, (None, idx)))
 
     def acc_load(idx):
         r = fx.make_rmem_tensor(mem_1x1, fx.Float32)
-        fx.copy_atom_call(acc_copy_atom, fx.slice(acc_flat_tiles, (None, idx)), r)
+        fx.copy(acc_copy_atom, fx.slice(acc_flat_tiles, (None, idx)), r)
         return r.load()[0]
 
     def acc_load_sum(row, col):
@@ -1108,9 +1090,6 @@ def _gemm1_body(
                     fx.Int32,
                 )
 
-        def store_output(sorted_row, packed0, packed1):
-            store_payload(sorted_row, packed0, packed1)
-
         if const_expr(enable_bias):
             bias_gate = [None] * 8
             bias_up = [None] * 8
@@ -1154,10 +1133,8 @@ def _gemm1_body(
             local_max = _fabs_f32(result[0])
             for ee in range_constexpr(1, 8):
                 local_max = local_max.maximumf(_fabs_f32(result[ee]))
-            lm_i = _inline_dpp_quad_amax(
-                fx.Int32(as_ir_value(local_max).bitcast(T.i32))
-            )
-            local_max = fx.Float32(as_ir_value(lm_i).bitcast(T.f32))
+            lm_i = _inline_dpp_quad_amax(local_max.bitcast(fx.Int32))
+            local_max = lm_i.bitcast(fx.Float32)
 
             e8m0, qscale = _e8m0_from_amax(
                 local_max, max_norm=448.0 if out_dtype == "fp8" else 6.0
@@ -1201,7 +1178,7 @@ def _gemm1_body(
                     qscale_raw,
                     1,
                 )
-                store_output(
+                store_payload(
                     sorted_out_row,
                     fx.Vector(packed0).bitcast(fx.Int32)[0],
                     fx.Vector(packed1).bitcast(fx.Int32)[0],
@@ -1217,7 +1194,7 @@ def _gemm1_body(
                         qscale_raw,
                         w,
                     )
-                store_output(
+                store_payload(
                     sorted_out_row,
                     fx.Int32(packed_i32),
                     fx.Int32(0),
