@@ -67,15 +67,17 @@ FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 _GFX942_CU_LDS_BYTES = 64 * 1024
 
 
-def _gfx950_kv_splits(seq_len, seq_len_kv, block_m=1):
+def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
     """How many workgroups to put on one query row block's KV walk."""
-    TARGET_WGS = 8192
     MIN_SPLIT_KV = 16384
+    GFX950_SIMDS = 256 * 4
+    SPLIT_ROUNDS = 8
+    target_wgs = SPLIT_ROUNDS * waves_per_eu * GFX950_SIMDS // num_warps
     num_blocks = triton.cdiv(seq_len, block_m)
-    if num_blocks >= TARGET_WGS:
+    if num_blocks >= target_wgs:
         return 1
     return min(
-        TARGET_WGS // num_blocks,
+        target_wgs // num_blocks,
         max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)),
     )
 
@@ -236,7 +238,9 @@ def fp8_mqa_logits(
             block_kv = 64
             # BLOCK_M=2 halves the grid, so it only pays once there are enough
             # rows to spare or the split puts the workgroups back.
-            num_kv_splits = _gfx950_kv_splits(seq_len, seq_len_kv, 2)
+            num_kv_splits = _gfx950_kv_splits(
+                seq_len, seq_len_kv, 2, num_warps, waves_per_eu
+            )
             if num_heads <= 32 and seq_len >= 2 and (
                 seq_len > 4096
                 or triton.cdiv(seq_len, 2) * num_kv_splits >= MIN_BLOCK_M2_WGS
@@ -244,11 +248,16 @@ def fp8_mqa_logits(
                 block_m = 2
             else:
                 block_m = 1
-                num_kv_splits = _gfx950_kv_splits(seq_len, seq_len_kv, 1)
+                num_kv_splits = _gfx950_kv_splits(
+                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+                )
             # Single warp to save barrier cycles
             if block_m == 1 and seq_len > 4096:
                 num_warps = 1
                 block_kv = 32
+                num_kv_splits = _gfx950_kv_splits(
+                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+                )
             # 32x32x64 over 16x16x128: its output layout leaves only one head
             # bit in lanes, so the head sum needs one cross-lane step
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads >= 32) else 16
