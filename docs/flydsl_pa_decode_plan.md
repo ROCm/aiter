@@ -81,19 +81,11 @@ the planner, not edited independently. The planner accepts contiguous int32 CUDA
 length vectors with 1 through 4096 requests. Lengths and block-table indices must
 satisfy the same validity requirements as static attention.
 
-## Verification and performance
+## Verification
 
 ```bash
 python -m pytest -q op_tests/test_flydsl_pa_decode.py
-python -m op_tests.benchmark_flydsl_pa_decode_plan --output plan_results.json
 ```
-
-The benchmark uses the repository timer with allocation rotation on identical
-inputs, checks the planned output against a causal FP32 reference, and reports
-static, plan-per-call, reused-plan and standalone-plan timings separately.
-Its default cases cover uniform contexts, ramps, a long request mixed with short
-requests at batches 8/32/200, and short contexts. All use BF16 MTP4, Hq16/Hkv1/D128,
-per-token FP8 scales, page16/page128 and both V layouts.
 
 Tests cover exact work ownership, sparse pages, empty requests, causal tails,
 non-power-of-two partition caps, multiple KV heads, supported reducer branches,
