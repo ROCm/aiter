@@ -13,7 +13,10 @@ import torch
 
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops import gemm_op_a4w6, gemm_op_a6w4
-from aiter.ops.gemm_op_mixed_mxfp import _load_mixed_mxfp_configs
+from aiter.ops.gemm_op_mixed_mxfp import (
+    _get_device_gfx_cu,
+    _load_mixed_mxfp_configs,
+)
 from csrc.gemm_mixed_mxfp import gemm_mixed_mxfp_tune
 from csrc.gemm_mixed_mxfp.gemm_mixed_mxfp_tune import (
     GemmMixedMxfpTuner,
@@ -209,6 +212,23 @@ class TestMixedMxfpTuningLookup(unittest.TestCase):
                     )
                 self.assertEqual(first["kernelName"], gfx950_kernel)
                 self.assertEqual(second["kernelName"], gfx942_kernel)
+
+    def test_device_identity_honors_cu_num_override(self):
+        properties = SimpleNamespace(
+            gcnArchName="gfx950:sramecc+:xnack-",
+            multi_processor_count=256,
+        )
+        with (
+            mock.patch.dict(os.environ, {"CU_NUM": "80"}),
+            mock.patch.object(
+                torch.cuda, "get_device_properties", return_value=properties
+            ),
+        ):
+            _get_device_gfx_cu.cache_clear()
+            try:
+                self.assertEqual(_get_device_gfx_cu(0), ("gfx950", 80))
+            finally:
+                _get_device_gfx_cu.cache_clear()
 
     def test_nonzero_splitk_and_duplicate_shapes_are_rejected(self):
         for family, _module in FAMILIES:

@@ -31,7 +31,9 @@ def _get_device_gfx_cu(device_index: int) -> tuple[str, int]:
     gfx = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
     if not gfx:
         raise RuntimeError(f"device {device_index} does not report a gfx architecture")
-    return gfx, int(properties.multi_processor_count)
+    cu_override = int((os.getenv("CU_NUM") or "0").strip())
+    cu_num = cu_override if cu_override != 0 else int(properties.multi_processor_count)
+    return gfx, cu_num
 
 
 @functools.lru_cache(maxsize=16)

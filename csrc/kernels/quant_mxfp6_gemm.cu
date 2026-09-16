@@ -30,6 +30,10 @@ constexpr int kLargeKStepsPerBlock = 3;
 constexpr uintptr_t kOutputAlignment = 16;
 // _hadamard32_np().astype(bfloat16), represented exactly as fp32.
 constexpr float kHadamard32Norm = 0.1767578125f;
+// Keep every intermediate finite even for an all-max BF16 block. The output
+// scale exponent is biased back by the same power of two before storage.
+constexpr int kHadamardSafetyShift = 3;
+constexpr float kHadamard32WorkNorm = kHadamard32Norm * 0.125f;
 
 using packed_u16x8_t  = opus::vector_t<uint16_t, 8>;
 using packed_fp6x32_t = uint32_t __attribute__((ext_vector_type(6)));
@@ -103,6 +107,24 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
         }
     }
 
+    float local_input_amax = 0.0f;
+#pragma unroll
+    for(int i = 0; i < kValuesPerThread; ++i)
+        local_input_amax = fmaxf(local_input_amax, fabsf(values[i]));
+    local_input_amax = fmaxf(local_input_amax, swap_adjacent_lane(local_input_amax));
+    const float input_amax =
+        fmaxf(local_input_amax, swap_lane_distance_two(local_input_amax));
+    const int safety_shift = input_amax >= 0x1p125f ? kHadamardSafetyShift : 0;
+    const float hadamard_norm =
+        safety_shift == 0 ? kHadamard32Norm : kHadamard32WorkNorm;
+
+    // Normalize before any addition so finite inputs cannot create inf-inf
+    // cancellation inside the butterfly. Only extreme groups take the extra
+    // power-of-two shift, avoiding underflow for tiny BF16 values.
+#pragma unroll
+    for(int i = 0; i < kValuesPerThread; ++i)
+        values[i] *= hadamard_norm;
+
     // H8 within each lane, followed by two lane butterflies to form H32.
     opus::static_for<3>([&](auto stage) {
         constexpr int h = 1 << stage.value;
@@ -128,7 +150,7 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
     for(int i = 0; i < kValuesPerThread; ++i)
     {
         const float peer = swap_lane_distance_two(values[i]);
-        values[i]        = (lane < 2 ? values[i] + peer : peer - values[i]) * kHadamard32Norm;
+        values[i]        = lane < 2 ? values[i] + peer : peer - values[i];
     }
 
     float local_amax = 0.0f;
@@ -137,22 +159,6 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
         local_amax = fmaxf(local_amax, fabsf(values[i]));
     local_amax       = fmaxf(local_amax, swap_adjacent_lane(local_amax));
     const float amax = fmaxf(local_amax, swap_lane_distance_two(local_amax));
-
-    int32_t scale_unbiased;
-    if(amax == 0.0f)
-    {
-        scale_unbiased = 0;
-    }
-    else
-    {
-        const uint32_t exponent = (__builtin_bit_cast(uint32_t, amax) >> 23) & 0xFFu;
-        scale_unbiased          = exponent == 0u
-                                      ? -127
-                                      : (exponent == 0xFFu ? 127 : static_cast<int32_t>(exponent) - 129);
-        scale_unbiased          = scale_unbiased < -127 ? -127 : scale_unbiased;
-        scale_unbiased          = scale_unbiased > 127 ? 127 : scale_unbiased;
-    }
-    const uint8_t scale_exp = static_cast<uint8_t>(scale_unbiased + 127);
 
     // Gather contiguous lane chunks into the even/odd vectors expected by the
     // gfx950 conversion. The instruction interleaves src0/src1 fields, yielding
@@ -183,8 +189,30 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
     if(lane != 0)
         return;
 
-    const uint32_t scale_bits =
-        scale_exp == 0 ? 0x00400000u : static_cast<uint32_t>(scale_exp) << 23;
+    uint8_t scale_exp;
+    uint8_t conversion_scale_exp;
+    if(amax == 0.0f)
+    {
+        scale_exp            = 127;
+        conversion_scale_exp = 127;
+    }
+    else
+    {
+        const uint32_t exponent = (__builtin_bit_cast(uint32_t, amax) >> 23) & 0xFFu;
+        int32_t stored =
+            exponent == 0u
+                ? 0
+                : static_cast<int32_t>(exponent) - 2 + safety_shift;
+        stored   = stored < 0 ? 0 : stored;
+        stored   = stored > 254 ? 254 : stored;
+        scale_exp = static_cast<uint8_t>(stored);
+        conversion_scale_exp =
+            static_cast<uint8_t>(stored - safety_shift);
+    }
+
+    const uint32_t scale_bits = conversion_scale_exp == 0
+                                    ? 0x00400000u
+                                    : static_cast<uint32_t>(conversion_scale_exp) << 23;
     const float mx_scale = __builtin_bit_cast(float, scale_bits);
 #if defined(__gfx950__)
     const packed_fp6x32_t fp6 =

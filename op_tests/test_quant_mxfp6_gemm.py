@@ -168,6 +168,46 @@ def test_hip_packer_rounding_boundary_is_adjacent_to_triton(
     assert int(((hip_codes & 0x1F) - (triton_codes & 0x1F)).abs().max()) <= 1
 
 
+def test_hip_packer_avoids_hadamard_intermediate_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    max_bf16 = torch.finfo(torch.bfloat16).max
+
+    # This transform is finite, but delaying normalization until after the
+    # butterfly overflowed its intermediate H8 sums.
+    finite = torch.full((1, 32), max_bf16 / 8, dtype=torch.bfloat16, device="cuda")
+    monkeypatch.setattr(mxfp6, "_QUANT_BACKEND", "hip")
+    hip_packed, hip_scale = _pack_out(finite, "hip")
+    triton_packed, triton_scale = _pack_out(finite, "triton")
+    assert torch.equal(
+        _unpack_first_block(hip_packed), _unpack_first_block(triton_packed)
+    )
+    assert hip_scale[0] == triton_scale[0]
+
+    # The DC coefficient of an all-max block exceeds fp32/MXFP6 range. It must
+    # saturate positively without inf-inf cancellation creating spurious signs.
+    extreme = torch.full((1, 32), max_bf16, dtype=torch.bfloat16, device="cuda")
+    packed, scale = _pack_out(extreme, "hip")
+    codes = _unpack_first_block(packed)
+    assert int(scale[0]) == 254
+    assert int(codes[0]) == 31
+    assert torch.count_nonzero(codes[1:]).item() == 0
+
+
+@pytest.mark.parametrize("exponent", [-119, -120, -121, -122])
+def test_hip_packer_preserves_low_e8m0_scales(
+    monkeypatch: pytest.MonkeyPatch,
+    exponent: int,
+):
+    x = torch.zeros((1, 32), dtype=torch.bfloat16, device="cuda")
+    x[0, 0] = 2.0**exponent
+    monkeypatch.setattr(mxfp6, "_QUANT_BACKEND", "hip")
+    packed, scale = _pack_out(x, "hip")
+
+    assert torch.all(_unpack_first_block(packed) == 27)
+    assert int(scale[0]) == exponent + 122
+
+
 def test_hip_packer_handles_misaligned_contiguous_input(
     monkeypatch: pytest.MonkeyPatch,
 ):
