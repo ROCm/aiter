@@ -978,7 +978,7 @@ void mla_decode_stage1_asm_fwd(
     }
 
     if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
-        && gqa_ratio == 96 && config_causal == 1){
+        && gqa_ratio == 96){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 96;
         args.s_MQA = gqa_ratio;

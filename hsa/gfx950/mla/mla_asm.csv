@@ -71,3 +71,7 @@ bf16,bf16,96,1,4,0,1,0,0,_ZN5aiter38mla_a16w16_qh32_qseqlen4_gqaratio96_psE,mla_
 bf16,bf16,96,1,4,0,1,1,0,_ZN5aiter42mla_a16w16_qh32_qseqlen4_gqaratio96_lse_psE,mla_a16w16_qh32_qseqlen4_gqaratio96_lse_ps.co
 bf16,bf16,96,1,4,0,1,0,1,_ZN5aiter43mla_a16w16_qh32_qseqlen4_gqaratio96_cprr_psE,mla_a16w16_qh32_qseqlen4_gqaratio96_cprr_ps.co
 bf16,bf16,96,1,4,0,1,1,1,_ZN5aiter47mla_a16w16_qh32_qseqlen4_gqaratio96_lse_cprr_psE,mla_a16w16_qh32_qseqlen4_gqaratio96_lse_cprr_ps.co
+bf16,bf16,96,1,4,0,0,0,0,_ZN5aiter43mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_psE,mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_ps.co
+bf16,bf16,96,1,4,0,0,1,0,_ZN5aiter47mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_lse_psE,mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_lse_ps.co
+bf16,bf16,96,1,4,0,0,0,1,_ZN5aiter48mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_cprr_psE,mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_cprr_ps.co
+bf16,bf16,96,1,4,0,0,1,1,_ZN5aiter52mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_lse_cprr_psE,mla_a16w16_qh32_qseqlen4_gqaratio96_msk0_lse_cprr_ps.co
