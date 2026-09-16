@@ -26,6 +26,8 @@ import os
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 # Seed the RNG so we get reproducible results for testing.
 philox_seed: tl.constexpr = 0x1BF52
 philox_offset: tl.constexpr = 0x1D4B42
@@ -481,12 +483,26 @@ def get_autotune_fwd_configs():
 
 autotune_fwd_configs, autotune_fwd_keys = get_autotune_fwd_configs()
 
+_attn_fwd_repr = make_kernel_repr(
+    "attn_fwd",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_DMODEL_QK",
+        "BLOCK_DMODEL_V",
+        "USE_FP8",
+        "IS_CAUSAL",
+        "VARLEN",
+        "USE_EXP2",
+    ],
+)
+
 
 @triton.autotune(
     configs=autotune_fwd_configs,
     key=autotune_fwd_keys,
 )
-@triton.jit
+@triton.jit(repr=_attn_fwd_repr)
 def attn_fwd(
     Q,
     K,
@@ -1008,14 +1024,26 @@ def get_padded_head_dim(head_size: int):
     return padded_d_model
 
 
-@triton.jit
+_compute_fp8_scaling_factors_repr = make_kernel_repr(
+    "compute_fp8_scaling_factors",
+    ["fp8_max"],
+)
+
+
+@triton.jit(repr=_compute_fp8_scaling_factors_repr)
 def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
     x_amax = tl.max(tl.abs(x))
     scale_x = fp8_max / (x_amax + 1e-7)
     return scale_x
 
 
-@triton.jit
+_bwd_preprocess_use_o_repr = make_kernel_repr(
+    "_bwd_preprocess_use_o",
+    ["USE_FP8", "BLOCK_M", "BLOCK_DMODEL_V", "ACTUAL_BLOCK_DMODEL_V", "IS_VARLEN"],
+)
+
+
+@triton.jit(repr=_bwd_preprocess_use_o_repr)
 def _bwd_preprocess_use_o(
     Out,
     DO,
@@ -1143,12 +1171,26 @@ def get_autotune_bwd_configs():
 
 autotune_bwd_configs, autotune_bwd_keys = get_autotune_bwd_configs()
 
+_bwd_kernel_dkdv_repr = make_kernel_repr(
+    "_bwd_kernel_dkdv",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_DMODEL_QK",
+        "BLOCK_DMODEL_V",
+        "USE_FP8",
+        "CAUSAL",
+        "IS_VARLEN",
+        "USE_EXP2",
+    ],
+)
+
 
 @triton.autotune(
     configs=autotune_bwd_configs,
     key=autotune_bwd_keys,
 )
-@triton.jit
+@triton.jit(repr=_bwd_kernel_dkdv_repr)
 def _bwd_kernel_dkdv(
     Q,
     K,
@@ -1381,7 +1423,13 @@ def _bwd_kernel_dkdv(
     tl.store(dv_ptrs, dv, mask=v_mask)
 
 
-@triton.jit
+_attn_bwd_dkdv_repr = make_kernel_repr(
+    "_attn_bwd_dkdv",
+    ["BLOCK_M", "BLOCK_N", "USE_FP8", "CAUSAL", "USE_EXP2"],
+)
+
+
+@triton.jit(repr=_attn_bwd_dkdv_repr)
 def _attn_bwd_dkdv(
     k,
     v,
@@ -1513,11 +1561,26 @@ def _attn_bwd_dkdv(
     return dk, dv
 
 
+_bwd_kernel_dq_repr = make_kernel_repr(
+    "_bwd_kernel_dq",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_DMODEL_QK",
+        "BLOCK_DMODEL_V",
+        "USE_FP8",
+        "CAUSAL",
+        "IS_VARLEN",
+        "USE_EXP2",
+    ],
+)
+
+
 @triton.autotune(
     configs=autotune_bwd_configs,
     key=autotune_bwd_keys,
 )
-@triton.jit
+@triton.jit(repr=_bwd_kernel_dq_repr)
 def _bwd_kernel_dq(
     Q,
     K,
@@ -1742,7 +1805,13 @@ def _bwd_kernel_dq(
     tl.store(dq_ptrs, dq, mask=mask_q)
 
 
-@triton.jit
+_attn_bwd_dq_repr = make_kernel_repr(
+    "_attn_bwd_dq",
+    ["BLOCK_M", "BLOCK_N", "USE_FP8", "CAUSAL", "USE_EXP2"],
+)
+
+
+@triton.jit(repr=_attn_bwd_dq_repr)
 def _attn_bwd_dq(
     dq,
     q,
