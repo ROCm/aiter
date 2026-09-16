@@ -69,8 +69,9 @@ Same pin **`150c7bc12b45`**. gfx950 Gluon kernels under
 `aiter/ops/triton/_gluon_kernels/gfx950/attention/`. Launchers in
 `qsa_4882.py` accept `backend="triton"|"gluon"|"auto"`; default is Triton so
 family A stays a Triton column. Forced Gluon on family A GQA (group 12 / D=256)
-errors. Family B table: `4882_gluon_select` / `4882_gluon_gqa` vs oracle,
-indexer H ∈ {4, 8}. Skip on non-gfx950 or failed Gluon import.
+errors. Family B Gluon table: `4882_gluon_select` / `4882_gluon_gqa` vs oracle,
+indexer H ∈ {4, 8}. Skip on non-gfx950 or failed Gluon import. Family B
+**Triton** is a separate table (phase 1f).
 
 ## Phase 1e — rocprof one live-AMD QSA layer (GPU 6)
 
@@ -114,4 +115,80 @@ That is **not** a ranking against production HIP select. “K1 must absorb the
 expensive decode top-k” described the missing `.so`, not
 `_hip_top_k_per_row_decode`. Prefill `M=512` under the same fallback: GQA
 slightly ahead at 8k; select ahead at 32k. K2 still matters at prefill 8k.
+
+## Phase 1f — family A vs family B tables (never merged)
+
+GPU 6 / gfx950 / MI355X. Sweep: `M ∈ {1, 8}`, `L ∈ {512, 8192, 32768}`,
+`page_size=16`, BF16. All `err` columns were 0 vs the oracle. Prefill `M=512`
+and `L=2048` were not in this paste; re-run the script defaults for those.
+
+Family A: live AMD + #4882 Triton (Gluon does not dispatch GQA). Family B:
+#4882 Triton and #4882 Gluon (no live-AMD column). Plumbing is family A only.
+
+### Family A plumbing
+
+|   m |   seq_len |   page_size | dtype          | gfx    |   n_blocks |   index_width |   paged_gather us |   paged_gather TFLOPS |   paged_gather TB/s |   paged_gather err |
+|----:|----------:|------------:|:---------------|:-------|-----------:|--------------:|------------------:|----------------------:|--------------------:|-------------------:|
+|   1 |       512 |          16 | torch.bfloat16 | gfx950 |        128 |          2051 |           48.113  |                     0 |           0.0224751 |                  0 |
+|   1 |      8192 |          16 | torch.bfloat16 | gfx950 |       2048 |          2051 |           94.5615 |                     0 |           0.182966  |                  0 |
+|   1 |     32768 |          16 | torch.bfloat16 | gfx950 |       8192 |          2051 |          189.415  |                     0 |           0.365368  |                  0 |
+|   8 |       512 |          16 | torch.bfloat16 | gfx950 |        128 |          2051 |           48.4092 |                     0 |           0.0223376 |                  0 |
+|   8 |      8192 |          16 | torch.bfloat16 | gfx950 |       2048 |          2051 |           94.8563 |                     0 |           0.182397  |                  0 |
+|   8 |     32768 |          16 | torch.bfloat16 | gfx950 |       8192 |          2051 |          189.347  |                     0 |           0.365498  |                  0 |
+
+### Family A vLLM AMD
+
+|   m |   seq_len |   page_size | dtype          | gfx    | vllm_pin     |   n_blocks |   vllm_amd_select us |   vllm_amd_select TFLOPS |   vllm_amd_select TB/s |   vllm_amd_select err |   vllm_amd_gqa us |   vllm_amd_gqa TFLOPS |   vllm_amd_gqa TB/s |   vllm_amd_gqa err |
+|----:|----------:|------------:|:---------------|:-------|:-------------|-----------:|---------------------:|-------------------------:|-----------------------:|----------------------:|------------------:|----------------------:|--------------------:|-------------------:|
+|   1 |       512 |          16 | torch.bfloat16 | gfx950 | 836bb3839ffe |        128 |              50.8827 |               0.00257597 |            0.000664116 |                     0 |           10.9761 |               4.59231 |           0.0977721 |                  0 |
+|   1 |      8192 |          16 | torch.bfloat16 | gfx950 | 836bb3839ffe |       2048 |              62.4135 |               0.0336009  |            0.00841664  |                     0 |           11.2938 |               4.46309 |           1.4877    |                  0 |
+|   1 |     32768 |          16 | torch.bfloat16 | gfx950 | 836bb3839ffe |       8192 |              79.0028 |               0.106181   |            0.0265582   |                     0 |           11.0797 |               4.54935 |           6.05915   |                  0 |
+|   8 |       512 |          16 | torch.bfloat16 | gfx950 | 836bb3839ffe |        128 |              62.0036 |               0.0169115  |            0.000660606 |                     0 |           14.2894 |              28.2197  |           0.0871404 |                  0 |
+|   8 |      8192 |          16 | torch.bfloat16 | gfx950 | 836bb3839ffe |       2048 |              73.4565 |               0.228397   |            0.00724892  |                     0 |           16.3966 |              24.5931  |           1.0352    |                  0 |
+|   8 |     32768 |          16 | torch.bfloat16 | gfx950 | 836bb3839ffe |       8192 |             153.06   |               0.438447   |            0.013755    |                     0 |           15.8577 |              25.4288  |           4.24433   |                  0 |
+
+### Family A #4882 Triton
+
+|   m |   seq_len |   page_size | dtype          | gfx    | aiter_4882_pin                           |   n_blocks |   4882_triton_select us |   4882_triton_select TFLOPS |   4882_triton_select TB/s |   4882_triton_select err |   4882_triton_gqa us |   4882_triton_gqa TFLOPS |   4882_triton_gqa TB/s |   4882_triton_gqa err |
+|----:|----------:|------------:|:---------------|:-------|:-----------------------------------------|-----------:|------------------------:|----------------------------:|--------------------------:|-------------------------:|---------------------:|-------------------------:|-----------------------:|----------------------:|
+|   1 |       512 |          16 | torch.bfloat16 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                 59.1434 |                  0.00221617 |               0.000571357 |                        0 |              112.964 |                 0.446206 |             0.00949991 |                     0 |
+|   1 |      8192 |          16 | torch.bfloat16 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                 63.0328 |                  0.0332708  |               0.00833394  |                        0 |              118.899 |                 0.423934 |             0.141311   |                     0 |
+|   1 |     32768 |          16 | torch.bfloat16 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                 78.6155 |                  0.106704   |               0.0266891   |                        0 |              118.914 |                 0.423879 |             0.564552   |                     0 |
+|   8 |       512 |          16 | torch.bfloat16 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                 71.6257 |                  0.0146397  |               0.000571862 |                        0 |              114.999 |                 3.50648  |             0.0108278  |                     0 |
+|   8 |      8192 |          16 | torch.bfloat16 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                 73.3887 |                  0.228607   |               0.00725561  |                        0 |              125.665 |                 3.20888  |             0.135072   |                     0 |
+|   8 |     32768 |          16 | torch.bfloat16 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                152.781  |                  0.439249   |               0.0137802   |                        0 |              127.384 |                 3.16558  |             0.528368   |                     0 |
+
+### Family B #4882 Triton
+
+|   m |   seq_len |   page_size | dtype          |   index_heads | gfx    | aiter_4882_pin                           |   n_blocks |   4882_triton_select us |   4882_triton_select TFLOPS |   4882_triton_select TB/s |   4882_triton_select err |   4882_triton_gqa us |   4882_triton_gqa TFLOPS |   4882_triton_gqa TB/s |   4882_triton_gqa err |
+|----:|----------:|------------:|:---------------|--------------:|:-------|:-----------------------------------------|-----------:|------------------------:|----------------------------:|--------------------------:|-------------------------:|---------------------:|-------------------------:|-----------------------:|----------------------:|
+|   1 |       512 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                 60.6191 |                  0.00216222 |               0.000557448 |                        0 |              88.5576 |                 0.11858  |             0.00597812 |                     0 |
+|   1 |       512 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                 60.7462 |                  0.0043154  |               0.000573138 |                        0 |              88.5548 |                 0.118583 |             0.00597831 |                     0 |
+|   1 |      8192 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                 62.1363 |                  0.0337508  |               0.00845419  |                        0 |              92.783  |                 0.113179 |             0.0904662  |                     0 |
+|   1 |      8192 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                 63.2424 |                  0.0663211  |               0.00832252  |                        0 |              92.4382 |                 0.113602 |             0.0908037  |                     0 |
+|   1 |     32768 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                 77.4369 |                  0.108328   |               0.0270953   |                        0 |              94.1222 |                 0.111569 |             0.356553   |                     0 |
+|   1 |     32768 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                 78.8529 |                  0.212766   |               0.0266217   |                        0 |              94.2358 |                 0.111434 |             0.356123   |                     0 |
+|   8 |       512 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                 71.8155 |                  0.014601   |               0.00057035  |                        0 |              88.8031 |                 0.946014 |             0.00636518 |                     0 |
+|   8 |       512 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                 72.6163 |                  0.0288799  |               0.000676872 |                        0 |              88.8235 |                 0.945797 |             0.00636372 |                     0 |
+|   8 |      8192 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                 73.2568 |                  0.229019   |               0.00726867  |                        0 |              94.3934 |                 0.889987 |             0.0893025  |                     0 |
+|   8 |      8192 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                 74.3066 |                  0.451567   |               0.00727623  |                        0 |              94.3178 |                 0.890701 |             0.0893741  |                     0 |
+|   8 |     32768 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                153.279  |                  0.437821   |               0.0137354   |                        0 |              94.9122 |                 0.885123 |             0.353963   |                     0 |
+|   8 |     32768 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                155.385  |                  0.863774   |               0.0136019   |                        0 |              94.7417 |                 0.886716 |             0.3546     |                     0 |
+
+### Family B #4882 Gluon
+
+|   m |   seq_len |   page_size | dtype          |   index_heads | gfx    | aiter_4882_pin                           |   n_blocks |   4882_gluon_select us |   4882_gluon_select TFLOPS |   4882_gluon_select TB/s |   4882_gluon_select err |   4882_gluon_gqa us |   4882_gluon_gqa TFLOPS |   4882_gluon_gqa TB/s |   4882_gluon_gqa err |
+|----:|----------:|------------:|:---------------|--------------:|:-------|:-----------------------------------------|-----------:|-----------------------:|---------------------------:|-------------------------:|------------------------:|--------------------:|------------------------:|----------------------:|---------------------:|
+|   1 |       512 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                58.9352 |                 0.002224   |              0.000573376 |                       0 |             75.3928 |                0.139285 |            0.007022   |                    0 |
+|   1 |       512 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                58.8476 |                 0.00445463 |              0.00059163  |                       0 |             75.3687 |                0.13933  |            0.00702424 |                    0 |
+|   1 |      8192 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                62.4264 |                 0.033594   |              0.00841491  |                       0 |             81.9377 |                0.12816  |            0.10244    |                    0 |
+|   1 |      8192 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                62.8791 |                 0.0667043  |              0.00837061  |                       0 |             81.5724 |                0.128734 |            0.102899   |                    0 |
+|   1 |     32768 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                77.6398 |                 0.108045   |              0.0270245   |                       0 |             82.8506 |                0.126748 |            0.405061   |                    0 |
+|   1 |     32768 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |                78.3119 |                 0.214236   |              0.0268056   |                       0 |             83.0514 |                0.126441 |            0.404081   |                    0 |
+|   8 |       512 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                71.0751 |                 0.0147531  |              0.000576292 |                       0 |             75.6902 |                1.10991  |            0.00746792 |                    0 |
+|   8 |       512 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |        128 |                72.0242 |                 0.0291173  |              0.000682437 |                       0 |             75.6503 |                1.11049  |            0.00747186 |                    0 |
+|   8 |      8192 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                72.8378 |                 0.230337   |              0.00731049  |                       0 |             83.4849 |                1.00628  |            0.100971   |                    0 |
+|   8 |      8192 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                73.2527 |                 0.458064   |              0.00738092  |                       0 |             82.7189 |                1.0156   |            0.101906   |                    0 |
+|   8 |     32768 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |               152.23   |                 0.440837   |              0.01383     |                       0 |             84.9735 |                0.988649 |            0.395363   |                    0 |
+|   8 |     32768 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |               151.431  |                 0.886332   |              0.0139571   |                       0 |             84.2029 |                0.997696 |            0.398981   |                    0 |
 
