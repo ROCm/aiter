@@ -2047,6 +2047,7 @@ class OpusBmmBpreshufInstance:
     c_via_lds: bool = False
     ds_fine_wait: bool = False
     issue_mid: bool = False
+    quadrant: bool = False
     kernel_tag: str = "bmm_a8w8_mxscale_bpreshuffle"
     arch_prefix: str = "gfx1250"
     has_oob: bool = True
@@ -2123,6 +2124,13 @@ a8w8_mxscale_bmm_bpreshuffle_kernels_list = {
     # cluster-launch path, first GROUP_N=128 tiles (kid65 adds C_VIA_LDS).
     64: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True),  # cc_gn128
     65: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, c_via_lds=True),  # cc_gn128_ctdm
+    # Quadrant K-step family. 72 is the shipped shape; 75/76 are the FlyDSL
+    # geometry kept as the ablation that says not to adopt it; 77 adds the TDM
+    # scale panel and is the fastest of them.
+    72: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True, quadrant=True),
+    75: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=128, num_slots=4, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True, quadrant=True, issue_mid=True),
+    76: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=128, num_slots=4, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True, quadrant=True),
+    77: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, sf_a_tdm_kg=32, tile_m=2, no_spec=True, c_via_lds=True, quadrant=True),
     # depth experiments against kid60: 66 pays kExpK, 67 pays reuse.
     # DS_FINE_WAIT: one wait per row instead of the front/back pair.
     # issue_mid: the ring's TDM issue moved between the front and back WMMAs,
