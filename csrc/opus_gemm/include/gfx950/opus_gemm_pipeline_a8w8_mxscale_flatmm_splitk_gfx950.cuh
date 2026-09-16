@@ -1056,6 +1056,15 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     constexpr int SHUF_B_WORDS  = SF_SHUF_IN_LDS ? T::N_SCALE_GROUPS * SHUF_K1_MAX : 0;
     constexpr int SHUF_WORDS    = SHUF_A_WORDS + SHUF_B_WORDS;
     __shared__ __align__(16) int smem_sf_shuf[SHUF_WORDS > 0 ? SHUF_WORDS : 1];
+    // kid397's panel is small enough that only one wave actually has live words
+    // in the grid-stride fill below. Put that work on a consumer wave while the
+    // producer pair issues the initial A/B ring. Their existing stage-0 barrier
+    // then publishes both, replacing the panel-only barrier and hiding its fixed
+    // prologue behind useful VMEM.
+    constexpr bool SF_SHUF_OVERLAP_PROLOGUE =
+        SF_SHUF_IN_LDS && T::BLOCK_SIZE == 256 && T::B_N == 32
+        && ((!T::B_DIRECT_REG && T::B_M == 32 && T::B_K == 256)
+            || (T::B_DIRECT_REG && T::B_M == 16 && T::B_K == 512));
 
     auto smem_a_at = [&](int slot_k, int m_block, int k_group) -> D_A* {
         return reinterpret_cast<D_A*>(smem_a
@@ -1280,43 +1289,58 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         // the wide copy stays naturally aligned.
         constexpr int SF_FILL_VEC  = (SFG::SUB % 4 == 0) ? 4 : 1;
         constexpr int SF_FILL_WAVE = 64 * SF_FILL_VEC;
-        constexpr int SF_FILL_NW   = T::BLOCK_SIZE / 64;
-        opus::static_for<T::SF_N1_BLOCKS>([&](auto b_c) {
-            constexpr int b = decltype(b_c)::value;
-            // The global base drops row % SF_SUB -- see the static_assert at the
-            // top: at SF_SUB = 16 that term is identically 0 for every tile that
-            // can be here, and the read's shuf_r_word adds it back in the panel's
-            // own coordinates.
-            const int gbase = ((row / (2 * SFG::SUB) + b) * shuf_k1 + shuf_k1_start) * SFG::SUB;
-            const int dbase = b * (SHUF_K1_MAX * SFG::SUB);
-            for (int off = wave_id * SF_FILL_WAVE; off < a_run;
-                 off += SF_FILL_NW * SF_FILL_WAVE) {
-                const int lane_off = off + lane_id * SF_FILL_VEC;
-                if (lane_off < a_run)
-                    g_sfa_shuf.template async_load<SF_FILL_VEC>(
-                        smem_sf_shuf + dbase + lane_off, gbase + lane_off);
-            }
-        });
-        // B is one word per (scale group, K1) -- no M axis and no SUB stride --
-        // so it copies one word per lane. The loop is over *all* N_SCALE_GROUPS,
-        // not the wave's SFB_GROUPS slice, because the fill is cooperative and
-        // the read indexes the panel by absolute group (sfb_group_base + ng).
-        for (int g = 0; g < T::N_SCALE_GROUPS; ++g) {
-            const int gbase = (col / T::GROUP_N + g) * shuf_k1 + shuf_k1_start;
-            const int dbase = SHUF_A_WORDS + g * SHUF_K1_MAX;
-            for (int off = wave_id * 64; off < k1n; off += SF_FILL_NW * 64) {
-                const int lane_off = off + lane_id;
-                if (lane_off < k1n)
-                    g_sfb_shuf.template async_load<1>(
-                        smem_sf_shuf + dbase + lane_off, gbase + lane_off);
+        constexpr int SF_FILL_NW   =
+            SF_SHUF_OVERLAP_PROLOGUE ? T::BLOCK_SIZE / 128 : T::BLOCK_SIZE / 64;
+        const int sf_fill_wave =
+            SF_SHUF_OVERLAP_PROLOGUE ? wave_id / 2 : wave_id;
+        // Under the overlap arm producers skip the panel entirely. For kid397
+        // only sf_fill_wave 0 has live work, so this moves (rather than duplicates)
+        // the same copies to whichever physical wave is a consumer for this WG.
+        if (!SF_SHUF_OVERLAP_PROLOGUE || role == 1) {
+            opus::static_for<T::SF_N1_BLOCKS>([&](auto b_c) {
+                constexpr int b = decltype(b_c)::value;
+                // The global base drops row % SF_SUB -- see the static_assert at the
+                // top: at SF_SUB = 16 that term is identically 0 for every tile that
+                // can be here, and the read's shuf_r_word adds it back in the panel's
+                // own coordinates.
+                const int gbase = ((row / (2 * SFG::SUB) + b) * shuf_k1 + shuf_k1_start) * SFG::SUB;
+                const int dbase = b * (SHUF_K1_MAX * SFG::SUB);
+                for (int off = sf_fill_wave * SF_FILL_WAVE; off < a_run;
+                     off += SF_FILL_NW * SF_FILL_WAVE) {
+                    const int lane_off = off + lane_id * SF_FILL_VEC;
+                    if (lane_off < a_run)
+                        g_sfa_shuf.template async_load<SF_FILL_VEC>(
+                            smem_sf_shuf + dbase + lane_off, gbase + lane_off);
+                }
+            });
+            // B is one word per (scale group, K1) -- no M axis and no SUB stride --
+            // so it copies one word per lane. The loop is over *all* N_SCALE_GROUPS,
+            // not the wave's SFB_GROUPS slice, because the fill is cooperative and
+            // the read indexes the panel by absolute group (sfb_group_base + ng).
+            for (int g = 0; g < T::N_SCALE_GROUPS; ++g) {
+                const int gbase = (col / T::GROUP_N + g) * shuf_k1 + shuf_k1_start;
+                const int dbase = SHUF_A_WORDS + g * SHUF_K1_MAX;
+                for (int off = sf_fill_wave * 64; off < k1n; off += SF_FILL_NW * 64) {
+                    const int lane_off = off + lane_id;
+                    if (lane_off < k1n)
+                        g_sfb_shuf.template async_load<1>(
+                            smem_sf_shuf + dbase + lane_off, gbase + lane_off);
+                }
             }
         }
         // vmcnt alone, unlike the plain fill above: `buffer_load ... lds` is VMEM
         // end to end and retires on vmcnt, so there is no ds_write on lgkmcnt to
         // wait for. Waiting on lgkmcnt here would be harmless but would also be a
         // lie about which counter publishes the panel.
-        s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        if constexpr (SF_SHUF_OVERLAP_PROLOGUE) {
+            // Each consumer must retire its own buffer_load_lds before joining
+            // stage_barrier(0). Producers have only the A/B ring in vmcnt and
+            // retain its existing counted waits.
+            if (role == 1) s_waitcnt_vmcnt(0_I);
+        } else {
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
     }
 
     if (role == 0) {
