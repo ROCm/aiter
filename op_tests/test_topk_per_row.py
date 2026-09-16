@@ -564,6 +564,7 @@ for data_generation in args.data_generation:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
+assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
 
 
 df = []
@@ -611,3 +612,4 @@ for data_generation in args.data_generation:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
+assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
