@@ -6,7 +6,8 @@
 Phase 0: fp32 oracle + shared family A/B shapes.
 Phase 2d: family A FlyDSL K1 writes ``block_ids [M, 512]`` from paged
 compressed K (512-slot tiles, eight waves per row, no score matrix).
-Phase 2e/2f: family B FlyDSL K1 ``H`` 4 or 8 on the same emit path.
+Phase 2e/2f: family B FlyDSL K1 ``H`` 4 or 8 emit. Phase 2g: same kernel
+streams 512-slot tiles for long ``L``.
 Expand+tail and K2 are still separate.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
