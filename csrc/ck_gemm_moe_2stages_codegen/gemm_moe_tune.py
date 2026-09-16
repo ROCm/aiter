@@ -46,6 +46,7 @@ from aiter.int4_utils import (
 )
 from aiter.jit.core import (
     AITER_CONFIG_FMOE,
+    AITER_CONFIG_FHMOE,
     AITER_CONFIG_GROUPED_FMOE,
     AITER_CSRC_DIR,
     AITER_ROOT_DIR,
@@ -55,6 +56,7 @@ from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.moe_kernels import (
@@ -492,17 +494,24 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
-        self.parser.add_argument(
+        tuner_mode = self.parser.add_mutually_exclusive_group()
+        tuner_mode.add_argument(
             "--grouped-gemm",
             action="store_true",
             required=False,
             help="On gfx1250, tune the FlyDSL grouped-GEMM MoE path instead of the normal fmoe tuner.",
         )
-        self.parser.add_argument(
+        tuner_mode.add_argument(
             "--mxfp4-flydsl",
             action="store_true",
             required=False,
             help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
+        )
+        tuner_mode.add_argument(
+            "--fhmoe",
+            action="store_true",
+            required=False,
+            help="Tune fused heterogeneous MoE (FHMoE) instead of the normal fmoe tuner.",
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
@@ -6399,6 +6408,216 @@ class GroupedFmoeTuner(FmoeTuner):
         resultdf.to_csv(file, index=False)
 
 
+class FhmoeTuner(FmoeTuner):
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **FmoeTuner.ARG_DEFAULTS,
+        "tune_file": f"{AITER_CONFIG_FHMOE}",
+        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_fhmoe.csv",
+        "config_env_name": "AITER_CONFIG_FHMOE",
+    }
+
+    @staticmethod
+    def _parse_fhmoe_row(row):
+        return {
+            "gfx": str(row["gfx"]),
+            "cu_num": int(row["cu_num"]),
+            "token": int(row["token"]),
+            "model_dim": int(row["model_dim"]),
+            "inter_dim": int(row["inter_dim"]),
+            "expert": int(row["expert"]),
+            "topk": int(row["topk"]),
+            "shared_expert_id": int(row["shared_expert_id"]),
+            "act_type": eval(row["act_type"]),
+            "dtype": eval(row["dtype"]),
+            "q_dtype_a": eval(row["q_dtype_a"]),
+            "q_dtype_w": eval(row["q_dtype_w"]),
+            "q_type": eval(row["q_type"]),
+            "use_g1u1": int(row["use_g1u1"]),
+            "doweight_stage1": int(row["doweight_stage1"]),
+            "hidden_pad": int(row["hidden_pad"]),
+            "intermediate_pad": int(row["intermediate_pad"]),
+            "gate_mode": eval(row["gate_mode"]),
+        }
+
+    @staticmethod
+    def _pad_dummy_expert(tensor, n_experts=None):
+        if tensor.ndim == 2:
+            rows_per_expert = tensor.shape[0] // n_experts
+            dummy_shape = (rows_per_expert, tensor.shape[1])
+        else:
+            dummy_shape = (1, *tensor.shape[1:])
+        dummy = tensor.new_empty(dummy_shape)
+        dummy.view(torch.uint8).zero_()
+        return torch.cat([tensor, dummy], dim=0)
+
+    @staticmethod
+    def generate_fhmoe_data(shape, block_m=32, device="cuda"):
+        expert = shape["expert"]
+        topk = shape["topk"]
+        shared_expert_id = shape["shared_expert_id"]
+        if topk < 2:
+            raise ValueError(f"FHMoE topk must include the shared expert; got {topk=}")
+
+        routed_expert = expert - 1
+        routed_topk = topk - 1
+        data = FmoeTuner.generate_data(
+            shape["token"],
+            shape["model_dim"],
+            shape["inter_dim"],
+            routed_expert,
+            routed_topk,
+            shape["dtype"],
+            shape["q_dtype_a"],
+            shape["q_dtype_w"],
+            shape["q_type"],
+            shape["use_g1u1"],
+            block_m,
+            device,
+        )
+        w1 = FhmoeTuner._pad_dummy_expert(data["w1_qt"])
+        w2 = FhmoeTuner._pad_dummy_expert(data["w2_qt"])
+        w1_scale = FhmoeTuner._pad_dummy_expert(data["w1_scale"], routed_expert)
+        w2_scale = FhmoeTuner._pad_dummy_expert(data["w2_scale"], routed_expert)
+
+        shared_device = w1.device
+        shared_w1_dense = (
+            torch.randn(
+                (1, 2 * shape["inter_dim"], shape["model_dim"]),
+                dtype=shape["dtype"],
+                device=shared_device,
+            )
+            / 10
+        )
+        shared_w2_dense = (
+            torch.randn(
+                (1, shape["model_dim"], shape["inter_dim"]),
+                dtype=shape["dtype"],
+                device=shared_device,
+            )
+            / 10
+        )
+        shared_w1, shared_w1_scale = FmoeTuner.weight_quant(
+            shared_w1_dense, shape["q_type"], quant_dtype=dtypes.fp8
+        )
+        shared_w2, shared_w2_scale = FmoeTuner.weight_quant(
+            shared_w2_dense, shape["q_type"], quant_dtype=dtypes.fp8
+        )
+        del shared_w1_dense, shared_w2_dense
+
+        shared_ids = torch.full(
+            (shape["token"], 1),
+            shared_expert_id,
+            dtype=data["topk_ids"].dtype,
+            device=data["topk_ids"].device,
+        )
+        shared_weights = torch.ones(
+            (shape["token"], 1),
+            dtype=data["topk_weights"].dtype,
+            device=data["topk_weights"].device,
+        )
+        topk_ids = torch.cat([data["topk_ids"], shared_ids], dim=1)
+        topk_weights = torch.cat([data["topk_weights"], shared_weights], dim=1)
+
+        if shape["gate_mode"] == GateMode.INTERLEAVE:
+            w1 = shuffle_weight_a16w4(w1, 16, True)
+            w1_scale = shuffle_scale_a16w4(w1_scale, expert, True)
+            w2 = shuffle_weight_a16w4(w2, 16, False)
+            w2_scale = shuffle_scale_a16w4(w2_scale, expert, False)
+            shared_w1 = shuffle_weight_a16w4(shared_w1, 16, True)
+            shared_w1_scale = shuffle_scale_a16w4(shared_w1_scale, 1, True)
+            shared_w2 = shuffle_weight_a16w4(shared_w2, 16, False)
+            shared_w2_scale = shuffle_scale_a16w4(shared_w2_scale, 1, False)
+        else:
+            w1 = shuffle_weight(w1, layout=(16, 16))
+            w1_scale = shuffle_scale(w1_scale)
+            w2 = shuffle_weight(w2, layout=(16, 16))
+            w2_scale = shuffle_scale(w2_scale)
+            shared_w1 = shuffle_weight(shared_w1, layout=(16, 16))
+            shared_w1_scale = shuffle_scale(shared_w1_scale)
+            shared_w2 = shuffle_weight(shared_w2, layout=(16, 16))
+            shared_w2_scale = shuffle_scale(shared_w2_scale)
+        w1.is_shuffled = True
+        w2.is_shuffled = True
+
+        return {
+            "hidden": data["input"],
+            "w1": w1,
+            "w2": w2,
+            "w1_scale": w1_scale,
+            "w2_scale": w2_scale,
+            "shared_w1": shared_w1,
+            "shared_w2": shared_w2,
+            "shared_w1_scale": shared_w1_scale,
+            "shared_w2_scale": shared_w2_scale,
+            "topk_ids": topk_ids,
+            "topk_weights": topk_weights,
+            "a1_qt": data["a1_qt"],
+            "a1_scale": data["a1_scale"],
+            "gate_mode": shape["gate_mode"],
+            "hidden_pad": shape["hidden_pad"],
+            "intermediate_pad": shape["intermediate_pad"],
+            "shared_expert_id": shared_expert_id,
+        }
+
+    @staticmethod
+    def _run_fhmoe(shape, data):
+        gate_mode = shape["gate_mode"]
+        if not isinstance(gate_mode, str):
+            gate_mode = gate_mode.value
+
+        def _cuda(tensor):
+            if tensor is None or not torch.is_tensor(tensor):
+                return tensor
+            return tensor.cuda()
+
+        w1 = _cuda(data["w1"])
+        w2 = _cuda(data["w2"])
+        w1.is_shuffled = True
+        w2.is_shuffled = True
+        return fused_moe(
+            _cuda(data["hidden"]),
+            w1,
+            w2,
+            _cuda(data["topk_weights"]),
+            _cuda(data["topk_ids"]),
+            activation=shape["act_type"],
+            quant_type=shape["q_type"],
+            doweight_stage1=bool(shape["doweight_stage1"]),
+            w1_scale=_cuda(data["w1_scale"]),
+            w2_scale=_cuda(data["w2_scale"]),
+            dtype=shape["dtype"],
+            hidden_pad=shape["hidden_pad"],
+            intermediate_pad=shape["intermediate_pad"],
+            gate_mode=gate_mode,
+            shared_w1=_cuda(data["shared_w1"]),
+            shared_w2=_cuda(data["shared_w2"]),
+            shared_w1_scale=_cuda(data["shared_w1_scale"]),
+            shared_w2_scale=_cuda(data["shared_w2_scale"]),
+            shared_expert_id=data["shared_expert_id"],
+        )
+
+    def tune(self, untunedf, tunedf, args):
+        del tunedf, args
+        for _, row in untunedf.iterrows():
+            shape = self._parse_fhmoe_row(row)
+            print("\nStart tuning FHMoE", [shape[k] for k in self.keys])
+            data = self.generate_fhmoe_data(shape)
+            print(
+                f"[fhmoe] token={shape['token']} "
+                f"w1={tuple(data['w1'].shape)} {data['w1'].dtype} "
+                f"shared_w1={tuple(data['shared_w1'].shape)} {data['shared_w1'].dtype} "
+                f"topk_ids={tuple(data['topk_ids'].shape)}",
+                flush=True,
+            )
+            out = self._run_fhmoe(shape, data)
+            print(
+                f"[fhmoe] fused_moe out={tuple(out.shape)} {out.dtype}",
+                flush=True,
+            )
+            del data, out
+        return []
+
+
 class Mxfp4FlydslTuner(FmoeTuner):
     """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
     unit.
@@ -7070,6 +7289,12 @@ if __name__ == "__main__":
     # the stage2 tile optimum), so it must be in the dedup key or the write-back
     # collapses an ep_fused row into the generic one for the same shape.
     grouped_key = key + ["gate_mode", "ep_fused"]
+    fhmoe_key = key + [
+        "shared_expert_id",
+        "hidden_pad",
+        "intermediate_pad",
+        "gate_mode",
+    ]
     resultList = [
         "block_m",
         "ksplit",
@@ -7105,6 +7330,7 @@ if __name__ == "__main__":
     ]
     use_grouped = "--grouped-gemm" in sys.argv
     use_mxfp4_flydsl = "--mxfp4-flydsl" in sys.argv
+    use_fhmoe = "--fhmoe" in sys.argv
     if use_grouped:
         if get_gfx() != "gfx1250":
             raise SystemExit("--grouped-gemm is only supported on gfx1250")
@@ -7117,6 +7343,15 @@ if __name__ == "__main__":
     elif use_mxfp4_flydsl:
         tuner = Mxfp4FlydslTuner(
             "mxfp4FlydslTuner", key, resultList, "mxfp4 a4w4 flydsl port fmoe tuner"
+        )
+    elif use_fhmoe:
+        if get_gfx() != "gfx950":
+            raise SystemExit("--fhmoe is only supported on gfx950")
+        tuner = FhmoeTuner(
+            "fhmoeTuner",
+            fhmoe_key,
+            resultList,
+            "fhmoe tuner",
         )
     else:
         tuner = FmoeTuner("fmoeTuner", key, resultList + ["nt"], "fmoe tuner")
