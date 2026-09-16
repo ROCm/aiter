@@ -395,10 +395,13 @@ def compile_conv3d_implicit(
 ):
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
+    # MFMA atoms per wave. tiled_mma replicates the atom over the (WAVE_M, WAVE_N) wave
+    # grid and tiles THAT over (TILE_M, TILE_N), so a wave's atoms are strided by the
+    # whole wave grid rather than contiguous: acc[None, mi, ni] is atom (mi, ni) of the
+    # wave at (wave_m, wave_n), which owns rows (mi * WAVE_M + wave_m) * MFMA_M and
+    # columns (ni * WAVE_N + wave_n) * MFMA_N. The epilogue's row/col math must match.
     MI_M = TILE_M // WAVE_M // MFMA_M
     MI_N = TILE_N // WAVE_N // MFMA_N
-    WARP_M = MI_M * MFMA_M
-    WARP_N = MI_N * MFMA_N
     BLOCK_VECS = LDG_VEC * BLOCK_THREADS
     LDG_A_COUNT = TILE_M * TILE_K // BLOCK_VECS
     LDG_B_COUNT = TILE_N * TILE_K // BLOCK_VECS
@@ -976,7 +979,7 @@ def compile_conv3d_implicit(
 
         def _cols(ni):
             """Global out-channel for MFMA column block ni, and its index within the group."""
-            col_off = fx.Int64(wave_n * WARP_N + ni * MFMA_N + c_n)
+            col_off = fx.Int64((ni * WAVE_N + wave_n) * MFMA_N + c_n)
             col = n_offset + col_off
             return col, ((n_local + col_off) if const_expr(groups > 1) else col)
 
@@ -992,7 +995,7 @@ def compile_conv3d_implicit(
                     bias_vals.append(fx.Float32(fx.memref_load_vec(bias_reg)[0]))
 
             for mi in range_constexpr(MI_M):
-                row_base = m_offset + wave_m * WARP_M + mi * MFMA_M + c_m_vec
+                row_base = m_offset + (mi * WAVE_M + wave_m) * MFMA_M + c_m_vec
                 for ni in range_constexpr(MI_N):
                     col, col_loc = _cols(ni)
                     a = Vec(acc[None, mi, ni].load())
