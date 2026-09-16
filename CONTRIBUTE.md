@@ -276,7 +276,7 @@ When developing or modifying HIP kernels:
 2. **Profile Memory Access Patterns**:
    ```bash
    # Use AITER_LOG_MORE=1 to analyze kernel performance
-   AITER_LOG_MORE=1 python3 op_tests/test_gemm_a8w8.py
+   AITER_LOG_MORE=1 python3 op_tests/gemm/test_gemm_a8w8.py
    ```
 
 3. **Check Roofline Model**:

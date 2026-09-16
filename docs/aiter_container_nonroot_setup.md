@@ -74,7 +74,7 @@ Agent 1
 ## Run the aiter tests to check the permission:
 
 ```
-newuser@0d2817135822:~/aiter$ python3 op_tests/test_gemm_a8w8_blockscale.py
+newuser@0d2817135822:~/aiter$ python3 op_tests/gemm/test_gemm_a8w8_blockscale.py
 [aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
 [aiter] start build [module_aiter_enum] under /home/newuser/aiter/aiter/jit/build/module_aiter_enum
 Successfully preprocessed all matching files.

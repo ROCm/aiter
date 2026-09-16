@@ -28,11 +28,11 @@ python3 analyze_kernel.py isa ../../../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2
     -o ../../../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co ./work/kernel.s
 
 # Test it -- the "[aiter] LoadKernel: ... hsaco: <path>" log line shows which file was loaded
-python3 ../../../op_tests/test_pa.py
+python3 ../../../op_tests/attention/pa/test_pa.py
 git checkout -- ../../../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co   # restore
 
 # Profile
-rocprofv3 --kernel-trace --stats -d ./profile_out -- python3 ../../../op_tests/test_pa.py
+rocprofv3 --kernel-trace --stats -d ./profile_out -- python3 ../../../op_tests/attention/pa/test_pa.py
 python3 analyze_kernel.py profile ./profile_out --filter pa_
 ```
 

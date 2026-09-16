@@ -153,7 +153,7 @@ of the same code object may remain exact where determinism is part of the test.
 
 ## Validation
 
-Run `pytest op_tests/test_mha_v4.py` for entrypoint changes. Quantizer/layout changes additionally
+Run `pytest op_tests/attention/mha/test_mha_v4.py` for entrypoint changes. Quantizer/layout changes additionally
 require byte-level checks at aligned and ragged sequence lengths, eager/fullgraph parity, allocator
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.

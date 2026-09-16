@@ -82,10 +82,10 @@ AITER provides optimized kernels for attention, MoE, GEMM, normalization, quanti
 
 ```bash
 # Example: run a single operator test
-python3 op_tests/test_mha.py
-python3 op_tests/test_mla.py
+python3 op_tests/attention/mha/test_mha.py
+python3 op_tests/attention/mla/test_mla.py
 python3 op_tests/test_moe.py
-python3 op_tests/test_gemm_a8w8.py
+python3 op_tests/gemm/test_gemm_a8w8.py
 python3 op_tests/test_rmsnorm2d.py
 
 # See all available operator tests

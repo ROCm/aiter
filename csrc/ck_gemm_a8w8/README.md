@@ -20,9 +20,9 @@ You can find the results of this tuning in `aiter/configs/a8w8_tuned_gemm.csv`, 
     `gfx` identifies the GPU architecture (e.g. `gfx942`, `gfx950`). `cu_num` is the number of compute units and distinguishes partitioned or binned variants of the same architecture (e.g. MI308X vs MI300X both use `gfx942`).
 
 4. Build tuned kernels and test:
-Test the performance, modify the test instance in `op_tests/test_gemm_a8w8.py` and run it, please wait a few minutes as it will build gemm_a8w8 tuned kernels in `aiter/configs/a8w8_tuned_gemm.csv` via jit:
-`python3 op_tests/test_gemm_a8w8.py`
-If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8.py`. It will rebuild kernels from `AITER_CONFIG_GEMM_A8W8`, the default one will be results merged from `aiter/configs/a8w8_tuned_gemm.csv` and tuned fmoe csv under `aiter/configs/model_configs/xx_a8w8_tuned_gemm_xx.csv`, the merged result is store in `/tmp/aiter_configs/a8w8_tuned_gemm.csv`.
+Test the performance, modify the test instance in `op_tests/gemm/test_gemm_a8w8.py` and run it, please wait a few minutes as it will build gemm_a8w8 tuned kernels in `aiter/configs/a8w8_tuned_gemm.csv` via jit:
+`python3 op_tests/gemm/test_gemm_a8w8.py`
+If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/gemm/test_gemm_a8w8.py`. It will rebuild kernels from `AITER_CONFIG_GEMM_A8W8`, the default one will be results merged from `aiter/configs/a8w8_tuned_gemm.csv` and tuned fmoe csv under `aiter/configs/model_configs/xx_a8w8_tuned_gemm_xx.csv`, the merged result is store in `/tmp/aiter_configs/a8w8_tuned_gemm.csv`.
 
 ## More Options
 

@@ -26,8 +26,13 @@ if [[ "$MULTIGPU" == "TRUE" ]]; then
 else
     if [[ -z "${AITER_TEST:-}" ]]; then
         echo "AITER_TEST is not set"
-        # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-        mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py" | sort)
+# Directories under op_tests/ that are NOT the aiter suite: each has its own
+        # CI job. Everything else under op_tests/ is aiter, including the op-family
+        # folders, so collection recurses instead of stopping at the top level.
+        NOT_AITER=(triton_tests multigpu_tests flydsl_tests tuning_tests tuners opus cpp op_benchmarks configs)
+        aiter_prune=()
+        for d in "${NOT_AITER[@]}"; do aiter_prune+=(-path "op_tests/${d}" -prune -o); done
+        mapfile -t files < <(find op_tests "${aiter_prune[@]}" -type f -name "*.py" -print | sort)
     else
         # If AITER_TEST contains multiple files separated by whitespace, convert to an array
         read -r -a files <<< "$AITER_TEST"
@@ -118,13 +123,13 @@ for file in "${sharded_files[@]}"; do
                 "$file"
             )
             ;;
-        op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
+        op_tests/attention/mla/test_mla_persistent.py|op_tests/attention/mla/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
-        op_tests/test_gemm_a6w6.py)
+        op_tests/gemm/test_gemm_a6w6.py)
             {
                 echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
             } | tee -a latest_test.log
@@ -170,7 +175,7 @@ done
 # are added/removed, so we can't hardcode SHARD_IDX.
 mla_in_shard=false
 for f in "${sharded_files[@]}"; do
-    if [[ "$f" == "op_tests/test_mla.py" ]]; then
+    if [[ "$f" == "op_tests/attention/mla/test_mla.py" ]]; then
         mla_in_shard=true
         break
     fi
@@ -184,7 +189,7 @@ if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
         "-c 16384 -b 4 -n 16,8 16,17 -kvd bf16" \
         "-c 260 388 -b 1 2 -n 16,8 -kvd bf16"; do
         echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
-        if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
+        if ! timeout 10m python3 op_tests/attention/mla/test_mla.py $args 2>&1 | tee -a latest_test.log; then
             testFailed=true
             failedFiles+=("test_mla.py $args")
         fi
