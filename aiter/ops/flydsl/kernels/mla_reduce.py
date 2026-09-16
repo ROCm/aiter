@@ -440,7 +440,14 @@ def compile_mla_reduce(
                 fx.gpu.barrier()
 
             # Collapse the sequence bound so inactive tiles never gather or store.
-            has_work = (n_splits > fx.Int32(1)) & (t0 != last)
+            # A single-split tile still needs reducing when it carries a real partial slot
+            # (need_lse); -1 is the only "nothing to reduce" case. Mirrors reduce.cu.
+            tile_live = t0 != last
+            slot0 = g_pmap[tile_live.select(t0, fx.Int32(0))]
+            single_split_has_partial = (n_splits == fx.Int32(1)) & (
+                slot0 != fx.Int32(-1)
+            )
+            has_work = tile_live & ((n_splits > fx.Int32(1)) | single_split_has_partial)
 
             if fx.const_expr(use_reduce_final_map):
                 q_start = g_fmap[tile, 0]

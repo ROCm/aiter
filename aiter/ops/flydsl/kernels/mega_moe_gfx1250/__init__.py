@@ -5,11 +5,11 @@
 
 import importlib
 
-__all__ = ["MegaMoEGfx1250"]
+__all__ = ["MegaMoEGfx1250", "read_dispatch_wire_env"]
 
 
 def __getattr__(name):
-    if name != "MegaMoEGfx1250":
+    if name not in __all__:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     return getattr(importlib.import_module(f"{__name__}.mega_moe"), name)
 

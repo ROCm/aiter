@@ -44,7 +44,7 @@ sys.path.insert(
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.k5_variants import (
+from aiter.ops.flydsl.kernels.gdr_prefill.k5_variants import (
     K5_VARIANTS,
     _bv_of_variant,
     _legal_bv_candidates,
@@ -681,7 +681,7 @@ def bench_k5(
     Candidates: ``triton``, ``hip`` (hand-written HIP/C++), ``flydsl_opt``
     (kernel 1, the HIP-aligned FlyDSL port) and one ``flydsl_vk[...]`` per
     requested instance (kernel 2, the gfx942-tuned build reached through
-    ``chunk_gated_delta_rule_fwd_h_flydsl``). ``flydsl_opt`` vs ``flydsl_vk``
+    ``chunk_gated_delta_rule_fwd_h_flydsl_vk``). ``flydsl_opt`` vs ``flydsl_vk``
     is the comparison that decides whether kernel (2) should be routed into
     production.
 
@@ -698,7 +698,7 @@ def bench_k5(
         chunk_gated_delta_rule_fwd_h_hip_fn,
     )
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        chunk_gated_delta_rule_fwd_h_flydsl,
+        chunk_gated_delta_rule_fwd_h_flydsl_vk,
         chunk_gated_delta_rule_fwd_h_flydsl_opt,
     )
     from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
@@ -746,7 +746,7 @@ def bench_k5(
 
     def _make_flydsl_vk(variant):
         def _run():
-            return chunk_gated_delta_rule_fwd_h_flydsl(
+            return chunk_gated_delta_rule_fwd_h_flydsl_vk(
                 g=inp["g"], gk=inp["gk"], variant=variant, **common
             )
 

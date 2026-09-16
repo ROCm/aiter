@@ -55,23 +55,21 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL Linear Attention Prefill tests.",
-        allow_module_level=True,
-    )
 
+# flydsl is a hard dependency of ``aiter.ops.flydsl`` since #5116, so a missing
+# or too-old install surfaces as the ImportError caught below rather than
+# through a separate availability probe.
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        chunk_gated_delta_rule_fwd_h_flydsl,
         chunk_gated_delta_rule_fwd_h_flydsl_opt,
+        chunk_gated_delta_rule_fwd_h_flydsl_vk,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
@@ -84,16 +82,6 @@ except ImportError as exc:
         f"Unable to import FlyDSL Linear Attention Prefill kernels: {exc}",
         allow_module_level=True,
     )
-
-try:
-    from vllm.model_executor.layers.fla.ops.chunk_delta_h import (
-        chunk_gated_delta_rule_fwd_h as chunk_gated_delta_rule_fwd_h_vllm,
-    )
-
-    _HAS_VLLM_K5 = True
-except ImportError:
-    chunk_gated_delta_rule_fwd_h_vllm = None
-    _HAS_VLLM_K5 = False
 
 # HIP/C++ K5 (chunk_gated_delta_rule_fwd_h.cu). JIT-compiled on first call.
 # Same public VK outputs as the FlyDSL / Triton opt_vk backends, but it
@@ -110,6 +98,10 @@ except ImportError:
     _HAS_HIP_K5 = False
 
 torch.set_default_device("cuda")
+
+# Arches the FlyDSL GDN prefill kernels are built for. The VK/fused gfx942 path
+# narrows this further at the individual test.
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 
 # -- Global test configuration ------------------------------------------
@@ -897,24 +889,6 @@ def _normalize_opt_v_new(vn_opt):
     return vn_opt.permute(0, 2, 1, 3).contiguous()
 
 
-def _is_gfx950() -> bool:
-    """Whether the current GPU is CDNA4 / gfx950 (MI350).
-
-    The baseline / ``naive`` / ``naive_opt`` FlyDSL K5 forks emit the
-    ``mfma_f32_16x16x32_bf16`` (K=32 bf16) MFMA and ``mfma32_vk`` emits
-    ``mfma_f32_32x32x16_bf16`` -- both are gfx950-only instructions. On gfx942
-    (CDNA3 / MI300) they fail to compile with an LLVM ``Cannot select``
-    abort, so the perf harness skips them there. The remaining forks
-    (``kv`` / ``opt`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
-    use the K=16 ``mfma_f32_16x16x16bf16_1k`` and run on both.
-    """
-    try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:  # noqa: BLE001
-        return False
-    return "gfx950" in arch
-
-
 def _hip_k5_supported(args: PrefillArgs) -> bool:
     """The HIP K5 kernel only handles K=V=128, bf16 inputs, chunk_size=64."""
     return (
@@ -1211,7 +1185,7 @@ class TestCorrectness:
         if g is not None and not args.g_head_major:
             g_hm = g.transpose(1, 2).contiguous()
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -1615,8 +1589,13 @@ class TestCorrectness:
                 initial_state_indices=state_indices,
             )
 
-    def test_initial_state_indices_rank_and_device_validation(self):
-        """Indexed state-pool indices must be 1-D and colocated with the pool."""
+    def test_initial_state_indices_rank_and_device_validation(self, monkeypatch):
+        """Indexed state-pool indices must be 1-D and colocated with the pool.
+
+        Both checks sit behind ``_opt_check()`` (see
+        ``test_mfma16_input_validation``), so enable the audit explicitly.
+        """
+        monkeypatch.setenv("AITER_K5_OPT_CHECK", "1")
         k, w, u = self._minimal_inputs()
         H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
         h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
@@ -1686,8 +1665,16 @@ class TestCorrectness:
             ("g_device", "g must be on k's device"),
         ],
     )
-    def test_mfma16_input_validation(self, case, match):
-        """Raw-buffer kernel inputs fail early on invalid dtype/layout/shape."""
+    def test_mfma16_input_validation(self, case, match, monkeypatch):
+        """Raw-buffer kernel inputs fail early on invalid dtype/layout/shape.
+
+        Every check below lives behind ``_opt_check()`` (upstream #5116 made the
+        opt wrapper's dtype/shape/device audit opt-in, default off, so the hot
+        path skips it). Enable it explicitly: this test exists to cover exactly
+        that audit, and without the env var the wrapper would forward malformed
+        inputs to the kernel instead of raising.
+        """
+        monkeypatch.setenv("AITER_K5_OPT_CHECK", "1")
         k, w, u = self._minimal_inputs()
         kwargs = {}
         if case == "rank":
@@ -1771,7 +1758,7 @@ class TestCorrectness:
         """FlyDSL K5 with per-channel gate (USE_GK, KDA/Kimi-K3 path)."""
         k, w_orig, u_orig, w_c, u_c, gk, h0, cu, _ = _make_inputs_kda(args)
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -1829,7 +1816,7 @@ class TestCorrectness:
         )
         h0 = torch.randn(1, H, V, K, dtype=torch.float32, device="cuda") * 0.01
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -1906,7 +1893,7 @@ class TestCorrectness:
             )
             g = gh.cumsum(dim=-1).contiguous()
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -1999,7 +1986,7 @@ class TestCorrectness:
                 .contiguous()
             )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -2081,7 +2068,7 @@ class TestCorrectness:
             .contiguous()
         )
 
-        _h_fly, vn_fly, _fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+        _h_fly, vn_fly, _fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -2296,7 +2283,7 @@ class TestStateDtypeBF16:
         h0_f32 = h0_f32.to(torch.float32)
         h0_bf16 = h0_f32.to(torch.bfloat16)
 
-        h_f32, vn_f32, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_f32, vn_f32, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -2305,7 +2292,7 @@ class TestStateDtypeBF16:
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
         )
-        h_bf16, vn_bf16, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_bf16, vn_bf16, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -2372,7 +2359,7 @@ class TestStateDtypeBF16:
         if g is not None:
             g = g.transpose(1, 2).contiguous()
 
-        _, _, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
+        _, _, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -2384,7 +2371,7 @@ class TestStateDtypeBF16:
         )
         assert fs_f32 is not None and fs_f32.dtype == torch.float32
 
-        _, _, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
+        _, _, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k,
             w_c,
             u_c,
@@ -2405,7 +2392,7 @@ class TestStateDtypeBF16:
             g = g.transpose(1, 2).contiguous()
         h0_f32 = h0.to(torch.float32)
         with pytest.raises(ValueError):
-            chunk_gated_delta_rule_fwd_h_flydsl(
+            chunk_gated_delta_rule_fwd_h_flydsl_vk(
                 k,
                 w_c,
                 u_c,
@@ -2424,7 +2411,7 @@ class TestStateDtypeBF16:
             context_lens, args=args, with_initial_state=False
         )
         with pytest.raises(ValueError):
-            chunk_gated_delta_rule_fwd_h_flydsl(
+            chunk_gated_delta_rule_fwd_h_flydsl_vk(
                 k,
                 w_c,
                 u_c,
@@ -2546,7 +2533,9 @@ def _assert_class(vals, kind, label):
         assert torch.isneginf(f).all(), f"{label}: expected -Inf, got {f.tolist()}"
 
 
-@pytest.mark.skipif(not is_flydsl_available(), reason="flydsl not available")
+@pytest.mark.skipif(
+    get_gfx() != "gfx942", reason="VK / fused K5+K6 converters are gfx942-only"
+)
 class TestBf16NanClassification:
     """The f32 -> bf16 converter must preserve NaN/Inf classification."""
 
@@ -2565,7 +2554,7 @@ class TestBf16NanClassification:
         """VK K5: the bf16 h snapshot must keep the class of every h0 element."""
         H, Hg, K, V, T = 4, 2, 128, 128, 64
         k, w, u, h0 = self._inputs(H, Hg, K, V, T, bits)
-        h, _, _ = chunk_gated_delta_rule_fwd_h_flydsl(
+        h, _, _ = chunk_gated_delta_rule_fwd_h_flydsl_vk(
             k, w, u, initial_state=h0, output_final_state=False, save_new_value=False
         )
         assert (

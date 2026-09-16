@@ -23,13 +23,13 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_rebased_cu_seqlens,
 )
 from . import linear_attention_prefill_kernels as _host
-from .kernels.chunk_gated_delta_h_gfx942 import (
+from .kernels.gdr_prefill.chunk_gated_delta_h_gfx942 import (
     compile_chunk_gated_delta_h_gfx942,
 )
-from .kernels.chunk_gated_delta_h_gfx942 import (
+from .kernels.gdr_prefill.chunk_gated_delta_h_gfx942 import (
     select_fused_variant as _gfx942_select_fused_variant,
 )
-from .kernels.k5_variants import _bv_waves_of_variant, _legal_bv_candidates
+from .kernels.gdr_prefill.k5_variants import _bv_waves_of_variant, _legal_bv_candidates
 from .kernels.tensor_shim import _run_compiled
 from .linear_attention_prefill_kernels import (
     _GFX942_MIN_FILL,
@@ -38,7 +38,7 @@ from .linear_attention_prefill_kernels import (
     _check_gk_shape,
     _grid_ctas,
     _select_bv_for_grid,
-    chunk_gated_delta_rule_fwd_h_flydsl,
+    chunk_gated_delta_rule_fwd_h_flydsl_vk,
 )
 
 GatedDeltaRulePrefillMetadata = _pbm.GatedDeltaRulePrefillMetadata
@@ -370,7 +370,7 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
     """FlyDSL fused K5+K6 host wrapper (GDN inter-chunk scan + output).
 
     Fuses the inter-chunk hidden-state recurrence (K5,
-    ``chunk_gated_delta_rule_fwd_h_flydsl``) with the inter/intra-chunk output
+    ``chunk_gated_delta_rule_fwd_h_flydsl_vk``) with the inter/intra-chunk output
     (K6, ``chunk_fwd_o_opt_vk``) into a single call. The fused kernel eliminates
     the ``h`` snapshot and ``v_new`` HBM round-trips between the two stages.
 
@@ -382,7 +382,7 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
         u: [B, H, T_flat, V] bf16, head-major contiguous (K5 input).
         g: [B, H, T_flat] or [H, T_flat] f32 cumulative scalar gate, head-major
             contiguous, or None. Same convention as
-            ``chunk_gated_delta_rule_fwd_h_flydsl``: when ``use_exp2=True`` the
+            ``chunk_gated_delta_rule_fwd_h_flydsl_vk``: when ``use_exp2=True`` the
             caller must have pre-scaled ``g`` to log2 space. Drives both the K5
             decay and the K6 output gate.
         gk: [T_flat, H, K] f32 per-channel cumulative gate (KDA), or None.
@@ -555,7 +555,7 @@ def chunk_gated_delta_rule_fwd_h_o_auto(
         )
 
     # Separate path: FlyDSL K5 + Triton K6.
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_vk(
         k=k,
         w=w,
         u=u,

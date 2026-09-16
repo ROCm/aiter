@@ -24,6 +24,40 @@ struct MlaMetadataV12Traits
 
 static constexpr int32_t MLA_V12_FILL_WARPS = 8;
 
+// Scales the sqrt(workload) split-K law; absorbs the arch reduction/compute
+// cost ratio. 1.2 tuned on gfx950; retune per arch if needed.
+static constexpr float MLA_V12_SPLIT_COEF = 1.2f;
+
+// Workload-adaptive KV-split count for "auto" mode (max_split_per_batch < 0).
+// The legacy cap of 16 under-splits long ctx, so the count is derived from the
+// workload instead. Both terms of the cost are spread over the machine: stage1
+// wall ~ a*W/e (e workgroups run concurrently, W = sum_blocks total) and the
+// reduction wall ~ b*e/num_clusters (e partials over the same clusters), so the
+// optimum is e* = sqrt((a/b) * W * num_clusters) -- it scales with the WIDTH of
+// the machine, not just the work. In auto mode num_splits is num_clusters, so it
+// doubles as that width here. eff is clamped to [1, num_splits]; eff <=
+// num_splits keeps the reduce-buffer worst-case reservation valid (CUDA-graph
+// safe). coef is MLA_V12_SPLIT_COEF.
+//
+// A per-unit sum(sqrt(w_i)) instead of sqrt(W * num_clusters) is only equivalent
+// when the unit count already equals num_clusters; with n units it is off by
+// sqrt(num_clusters / n), i.e. 16x low for a single unit on a 256-CU part, which
+// starves exactly the low-concurrency decode it is meant to serve.
+//
+// Explicit (>= 0) requests keep the exact count asked for.
+__device__ __forceinline__ int32_t
+mla_v12_effective_splits(const MlaMetadataV1KernelParameter& params, const int32_t sum_blocks)
+{
+    if(!params.auto_split)
+    {
+        return params.num_splits;
+    }
+    const float work = static_cast<float>(max(1, sum_blocks)) *
+                       static_cast<float>(max(1, params.num_splits));
+    int32_t eff = static_cast<int32_t>(lrintf(MLA_V12_SPLIT_COEF * sqrtf(work)));
+    return max(1, min(eff, params.num_splits));
+}
+
 template <typename Traits>
 __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1KernelParameter& params,
                                                         QoState<Traits>& qo_state,
@@ -74,7 +108,8 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
-        sum_blocks += (num_blocks + params.fixed_over_head_num_blocks) * num_qo_tiles;
+        const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
+        sum_blocks += unit_blocks * num_qo_tiles;
 
         if constexpr(QoState<Traits>::is_unique() == false)
         {
@@ -136,7 +171,8 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                                                                       num_batches,
                                                                       lane_idx);
 
-        const int32_t payload       = integer_divide_ceil(sum_blocks, params.num_splits) + overhead;
+        const int32_t eff_splits    = mla_v12_effective_splits(params, sum_blocks);
+        const int32_t payload       = integer_divide_ceil(sum_blocks, eff_splits) + overhead;
         const int32_t blocks_per_cu = payload - overhead;
 
         if(lane_idx == 0)
@@ -395,8 +431,13 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
-    const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(
-        params, qo_state, p_lds_seqlens_qo, p_lds_seqlens_kv, ori_seqlen_qo, num_batches, lane_idx);
+    const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(params,
+                                                                  qo_state,
+                                                                  p_lds_seqlens_qo,
+                                                                  p_lds_seqlens_kv,
+                                                                  ori_seqlen_qo,
+                                                                  num_batches,
+                                                                  lane_idx);
 
     if(lane_idx == 0)
     {
@@ -408,9 +449,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_work_info_set));
     }
 
-    // expected payload handled by each cu part.
+    // same eff_splits as the phase-1 count so fill and count agree
+    const int32_t eff_splits = mla_v12_effective_splits(params, sum_blocks);
     const int32_t payload =
-        integer_divide_ceil(sum_blocks, params.num_splits) + params.fixed_over_head_num_blocks;
+        integer_divide_ceil(sum_blocks, eff_splits) + params.fixed_over_head_num_blocks;
     const int32_t page_size   = params.page_size;
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -860,6 +902,8 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
+        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
+         (max_seqlen_qo <= 6)) ||
         hk_mtp_experimental;
 
     if(!natively_supported && (num_heads % 16 == 0))
@@ -891,6 +935,9 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
                              ? num_clusters
                              : min(num_clusters, max_split_per_batch * num_batches);
 
+    // auto mode: device derives the split count; num_splits above only caps it
+    const bool auto_split = (max_split_per_batch < 0);
+
     MlaMetadataV1KernelParameter params = {};
     params.p_work_metadata_ptrs         = static_cast<uint64_t*>(work_metadata_ptrs.data_ptr());
     params.p_work_indptr                = static_cast<int32_t*>(work_indptr.data_ptr());
@@ -905,6 +952,7 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     params.num_heads                    = num_heads;
     params.num_cu                       = num_clusters;
     params.num_splits                   = num_splits;
+    params.auto_split                   = auto_split;
     params.reduce_indptr_size           = reduce_indptr.size(0);
     params.page_size                    = page_size;
     params.kv_granularity               = kv_granularity;

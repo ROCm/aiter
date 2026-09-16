@@ -76,7 +76,7 @@ def convert():
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import _to_bf16
+    from aiter.ops.flydsl.kernels.gdr_prefill.chunk_gated_delta_h_gfx942 import _to_bf16
 
     THREADS = 64
 

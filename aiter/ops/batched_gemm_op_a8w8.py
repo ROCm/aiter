@@ -164,10 +164,21 @@ def batched_gemm_a8w8_CK(
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
+def _mxscale_bmm_tuned_path(bpreshuffle: bool) -> str:
+    """Tuned table for one weight layout; preshuffled rows live in their own CSV."""
+    return (
+        AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
+        if bpreshuffle
+        else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    )
+
+
 @functools.cache
-def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
+def _load_mxscale_bmm_tuned(
+    libtype: str | None = None, bpreshuffle: bool = False
+) -> dict:
     """{(gfx,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
     try:
         df = pd.read_csv(path).drop_duplicates()
     except FileNotFoundError:
@@ -180,7 +191,13 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
 
 @functools.lru_cache(maxsize=1024)
 def lookup_mxscale_bmm_config(
-    b: int, m: int, n: int, k: int, *, libtype: str | None = None
+    b: int,
+    m: int,
+    n: int,
+    k: int,
+    *,
+    libtype: str | None = None,
+    bpreshuffle: bool = False,
 ):
     """Exact tuned row for this shape, else one at a padded M.
 
@@ -202,8 +219,8 @@ def lookup_mxscale_bmm_config(
     reported without this layer knowing which column holds it.
     """
     gfx = get_gfx()
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
-    tuned = _load_mxscale_bmm_tuned(libtype)
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
+    tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
 
     row, padded_m = None, m
     for gl in (None, 0, 1):
@@ -280,7 +297,8 @@ def _batched_gemm_a8w8_mxscale_impl(
     if libtype != "opus":
         raise NotImplementedError(
             f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
-            f"{libtype!r}, which has no batched mxscale backend here yet"
+            f"{libtype!r}, which does not take a raw [G, N, K] weight; "
+            f"{libtype!r} rows are served by batched_gemm_a8w8_mxscale_bpreshuffle"
         )
 
     # Reading opus columns is this branch's job; whether that kernel can run
@@ -346,6 +364,64 @@ def batched_gemm_a8w8_mxscale(
     backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
     """
     return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+
+
+# Same family, preshuffled weight.
+def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N]."""
+    from .flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_128_gfx1250
+
+    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    n = int(wo_a.shape[1])
+
+    cfg = lookup_mxscale_bmm_config(g, m, n, k, bpreshuffle=True)
+    libtype = cfg["libtype"] if cfg is not None else "flydsl"
+    if libtype != "flydsl":
+        raise NotImplementedError(
+            f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
+            f"{libtype!r}, which takes a raw [G, N, K] weight; {libtype!r} rows "
+            "are served by batched_gemm_a8w8_mxscale"
+        )
+
+    return run_bmm_a8w8_mxfp8_128_gfx1250(
+        x,
+        wo_a,
+        x_scale,
+        w_scale,
+        torch.empty((m, g, n), dtype=dtype, device=x.device),
+        kernel_name=str(cfg["kernelName"]) if cfg is not None else None,
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+def batched_gemm_a8w8_mxscale_bpreshuffle(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """fp8 e8m0 mxscale batched GEMM with a preshuffled weight (gfx1250).
+
+    * ``x``       : [M, G, K] fp8 activation, token-major and contiguous.
+    * ``wo_a``    : [G, N, K] fp8 weight, preshuffled as above.
+    * ``x_scale`` : [M, G, K/128] uint8 e8m0, row-major -- exactly what
+                    ``inverse_rope_group_quant(..., quant_group_size=128,
+                    scale_layout="row")`` emits, so no transpose on this path.
+    * ``w_scale`` : [G, N/128, K/128] uint8 e8m0.
+
+    Returns a fresh token-major [M, G, N]. A caller that must write into its own
+    buffer calls ``run_bmm_a8w8_mxfp8_128_gfx1250`` directly (it keeps ``out=``).
+    """
+    return _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype
+    )
 
 
 def gen_batched_gemm_a8w8_tune_fake_tensors(

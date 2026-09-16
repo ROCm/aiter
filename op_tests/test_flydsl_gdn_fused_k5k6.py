@@ -50,16 +50,13 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL fused K5+K6 tests.",
-        allow_module_level=True,
-    )
 
+# flydsl is a hard dependency of ``aiter.ops.flydsl`` since #5116, so a missing
+# or too-old install surfaces as the ImportError caught below rather than
+# through a separate availability probe.
 try:
     from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
         chunk_gated_delta_rule_fwd_h_o_flydsl,
@@ -551,7 +548,7 @@ def test_fused_always_overrides_the_perf_heuristic():
 def test_fused_variant_hn_rule():
     """``select_fused_variant`` is the H*N tile rule: <=32 bv16, <=80 bv32, else
     bv64w8; None only if BV illegal for V."""
-    from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import (
+    from aiter.ops.flydsl.kernels.gdr_prefill.chunk_gated_delta_h_gfx942 import (
         select_fused_variant,
     )
 
@@ -586,10 +583,10 @@ def test_fused_selection_heuristic():
         _FUSED_MIN_FILL,
         should_use_fused_k5k6_gfx942,
     )
-    from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import (
+    from aiter.ops.flydsl.kernels.gdr_prefill.chunk_gated_delta_h_gfx942 import (
         select_fused_variant,
     )
-    from aiter.ops.flydsl.kernels.k5_variants import _bv_of_variant
+    from aiter.ops.flydsl.kernels.gdr_prefill.k5_variants import _bv_of_variant
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         _ARCH,
         _device_cu_count,

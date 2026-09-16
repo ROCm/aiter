@@ -7,6 +7,13 @@ The module exposes hidden-state and prepare kernels. The prepare wrapper matches
 the Triton prepare layout and exponent-domain contract, so both paths can be
 selected independently through ``chunk_gated_delta_rule_opt_vk``. Call
 ``gdn_prepare_flydsl_supported`` before selecting the fused prepare path.
+
+Two hidden-state (K5) entry points:
+
+* ``chunk_gated_delta_rule_fwd_h_flydsl_opt`` -- the HIP-aligned fork, every arch.
+* ``chunk_gated_delta_rule_fwd_h_flydsl_vk`` -- gfx942-only; the K5-only build of
+  the shared gfx942 builder whose fused K5+K6 build is reached through
+  ``aiter.ops.flydsl.gdn_fused_gfx942_kernels``.
 """
 
 from __future__ import annotations
@@ -18,15 +25,13 @@ import os
 import warnings
 from collections.abc import Sequence
 
-# NOTE (opt fork): ``get_rocm_arch`` is imported here for the additive
-# HIP-aligned fork below. It is side-effect-free (``flydsl`` is already a hard
-# dependency of the baseline ``compile_chunk_gated_delta_h``) and does NOT raise
-# on flydsl <0.2.0 -- the opt-only ``>=0.2.0`` requirement is enforced
-# lazily in ``_get_or_compile_opt`` so the baseline path keeps its
-# original ``>=0.1.8`` compatibility.
+# NOTE: ``get_rocm_arch`` is side-effect-free and does NOT raise on
+# flydsl <0.2.0. The hidden-state kernel's ``>=0.2.0`` requirement is enforced
+# lazily in ``_get_or_compile_opt``, so importing this module for the prepare
+# wrapper alone still works on older flydsl.
 import torch
 import triton
-from flydsl.runtime.device import get_rocm_arch as _get_rocm_arch
+from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
 
@@ -40,19 +45,18 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
-from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-from .kernels.chunk_gated_delta_h_gfx942 import (
+from .kernels.gdr_prefill import (
     compile_chunk_gated_delta_h_gfx942,
+    compile_gdn_prepare,
 )
-from .kernels.chunk_gated_delta_h_gfx942 import (
+from .kernels.gdr_prefill.chunk_gated_delta_h_gfx942 import (
     select_variant as _gfx942_select_variant,
 )
-from .kernels.gdn_prepare import compile_gdn_prepare
 
 # Arch-agnostic K5 variant tag grammar + legality (shared with the gfx942 kernel
 # module -- kept in its own module to avoid an import cycle). Re-exported here so
 # existing callers (bench, AOT, tests) keep importing them from this wrapper.
-from .kernels.k5_variants import (  # noqa: F401  (re-exported)
+from .kernels.gdr_prefill.k5_variants import (  # noqa: F401  (re-exported)
     _BV_CANDIDATES,
     _DEFAULT_BV,
     K5_DEFAULT_VARIANT,
@@ -65,7 +69,7 @@ from .kernels.tensor_shim import _run_compiled
 
 # Arch detected once at import time; used by _get_or_compile to select the
 # right compile backend.
-_ARCH: str = _get_rocm_arch()
+_ARCH: str = get_rocm_arch()
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
 # place of exp(g) (matches the Triton VK / HIP convention).
@@ -74,8 +78,8 @@ _RCP_LN2 = math.log2(math.e)
 
 __all__ = [
     "K5K6Fusion",
-    "chunk_gated_delta_rule_fwd_h_flydsl",
     "chunk_gated_delta_rule_fwd_h_flydsl_opt",
+    "chunk_gated_delta_rule_fwd_h_flydsl_vk",
     "gdn_prepare_flydsl_supported",
     "gdn_prepare_fwd_flydsl",
 ]
@@ -507,39 +511,34 @@ def _get_or_compile(
             "STATE_DTYPE_BF16": state_bf16,
             "G_IS_LOG2_SCALED": g_log2_scaled,
         }
-        if _ARCH == "gfx950":
-            if num_waves != 4:
-                raise ValueError(
-                    "the wave-widening variant axis (w8/w16) is gfx942-only; "
-                    f"got num_waves={num_waves} on {_ARCH}"
-                )
-            _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
-                **_compile_kwargs
-            )
-        elif _ARCH == "gfx942":
-            # COMPUTE_OUTPUT=False selects the K5-only build of the shared
-            # gfx942 builder (the fused K5+K6 build is reached via
-            # _run_fused_gfx942).
-            _compiled_kernels[cache_key] = compile_chunk_gated_delta_h_gfx942(
-                **_compile_kwargs,
-                NR_SPLIT=num_waves // (BT // 16),
-                COMPUTE_OUTPUT=False,
-                STORE_H=True,
-            )
-        else:
+        if _ARCH != "gfx942":
+            # The gfx950 VK kernel this wrapper used to dispatch to was removed
+            # upstream in #5116 (it was superseded by the opt fork and had no
+            # callers). Non-gfx942 callers go through
+            # ``chunk_gated_delta_rule_fwd_h_flydsl_opt`` instead.
             raise ValueError(
-                f"FlyDSL GDN K5 is not supported on arch '{_ARCH}'. "
-                f"Supported arches: gfx942, gfx950."
+                f"FlyDSL GDN K5 (vk) is not supported on arch '{_ARCH}'; "
+                f"only gfx942 is. Use chunk_gated_delta_rule_fwd_h_flydsl_opt."
             )
+        # COMPUTE_OUTPUT=False selects the K5-only build of the shared
+        # gfx942 builder (the fused K5+K6 build is reached via
+        # _run_fused_gfx942).
+        _compiled_kernels[cache_key] = compile_chunk_gated_delta_h_gfx942(
+            **_compile_kwargs,
+            NR_SPLIT=num_waves // (BT // 16),
+            COMPUTE_OUTPUT=False,
+            STORE_H=True,
+        )
     return _compiled_kernels[cache_key]
 
 
 def _build_declares_qo() -> bool:
     """Whether the K5 build ``_get_or_compile`` selects declares ``q``/``o``.
 
-    Only the shared gfx942 builder does. The gfx950 builder has no such parameters.
+    Only the shared gfx942 builder does, and it is now the only builder this
+    wrapper can select, so this is unconditionally true.
     """
-    return _ARCH == "gfx942"
+    return True
 
 
 def _launch_kernel(
@@ -591,7 +590,7 @@ def _launch_kernel(
     )
 
 
-def chunk_gated_delta_rule_fwd_h_flydsl(
+def chunk_gated_delta_rule_fwd_h_flydsl_vk(
     k: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
@@ -859,14 +858,56 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     return h, v_new, final_state
 
 
-# opt fork below (flydsl>=0.2.0, lazy-checked); baseline above unchanged.
+# -- Hidden-state host wrapper (K5 opt kernel) ---------------------------
 _OPT_MIN_FLYDSL_VERSION = "0.2.0"
 
 # gfx942 gate for SCHED_GFX942; normalize feature-suffixed arch strings first.
-# NOTE: this module imports ``get_rocm_arch`` under the ``_get_rocm_arch`` alias
+# NOTE: this module imports ``get_rocm_arch``
 # (see the import block); ``_ARCH`` above is already that call's result.
 _GFX_ARCH = _ARCH.split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
+
+# Host-path knobs. Heavy dtype/shape/device audit is off by default; set
+# ``AITER_K5_OPT_CHECK=1`` to enable it. k/w/u must still be contiguous.
+_OPT_BV_ENV = os.environ.get("FLYDSL_K5_OPT_BV")
+
+
+def _opt_check() -> bool:
+    return os.environ.get("AITER_K5_OPT_CHECK", "0") in ("1", "true", "True")
+
+
+_OPT_PLACEHOLDERS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_TUNED_BV_RUNTIME: tuple[str, int] | None = None
+
+
+def _placeholder_pair(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _OPT_PLACEHOLDERS.get(idx)
+    if cached is not None:
+        return cached
+    dummy = torch.empty(1, device=device, dtype=torch.float32)
+    int32_dummy = torch.empty(1, device=device, dtype=torch.int32)
+    _OPT_PLACEHOLDERS[idx] = (dummy, int32_dummy)
+    return dummy, int32_dummy
+
+
+def _tuned_bv_runtime() -> tuple[str, int]:
+    global _TUNED_BV_RUNTIME
+    if _TUNED_BV_RUNTIME is None:
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+        _TUNED_BV_RUNTIME = (get_gfx_runtime(), get_cu_num())
+    return _TUNED_BV_RUNTIME
+
+
+def _require_contiguous(t: torch.Tensor, name: str) -> torch.Tensor:
+    if not t.is_contiguous():
+        raise ValueError(f"FlyDSL K5 opt: `{name}` must be contiguous")
+    return t
+
+
+def _as_contiguous(t: torch.Tensor) -> torch.Tensor:
+    return t if t.is_contiguous() else t.contiguous()
 
 
 def _load_tuned_bv_table() -> dict[tuple, int]:
@@ -950,21 +991,23 @@ def _tuned_bv(
     """
     if not _BV_TUNED_TABLE:
         return None
-    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-
-    shape_key = (
-        H,
-        Hg,
-        V,
-        is_varlen,
-        use_h0,
-        store_fs,
-        snapshot_bf16,
-        state_bf16,
-        total_chunks,
-        max_seq_chunks,
+    gfx, cu_num = _tuned_bv_runtime()
+    return _BV_TUNED_TABLE.get(
+        (
+            gfx,
+            cu_num,
+            H,
+            Hg,
+            V,
+            is_varlen,
+            use_h0,
+            store_fs,
+            snapshot_bf16,
+            state_bf16,
+            total_chunks,
+            max_seq_chunks,
+        )
     )
-    return _BV_TUNED_TABLE.get((get_gfx_runtime(), get_cu_num(), *shape_key))
 
 
 _INT32_ATTR = "_flydsl_int32_view"
@@ -1122,7 +1165,8 @@ def _get_or_compile_opt(
     final-state write-back into the same pool slot), mirroring the HIP kernel.
 
     The hip compile module + its flydsl>=0.2.0 requirement are imported lazily
-    here so the baseline path is unaffected.
+    here, so importing this module for the prepare wrapper alone stays cheap
+    and works on older flydsl.
     """
     import flydsl
     from packaging.version import Version
@@ -1135,11 +1179,9 @@ def _get_or_compile_opt(
             f"tiled-copy API), but got `{getattr(flydsl, '__version__', 'unknown')}`."
         )
 
-    from .kernels.chunk_gated_delta_h_opt import (
-        compile_chunk_gated_delta_h_opt,
-    )
+    from .kernels.gdr_prefill import compile_chunk_gated_delta_h
 
-    return compile_chunk_gated_delta_h_opt(
+    return compile_chunk_gated_delta_h(
         K=K,
         V=V,
         BT=BT,
@@ -1190,12 +1232,14 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
     across waves, V not split across warps) as the hand-tuned HIP/C++ K5 kernel,
     writing the public VK layout [..., V, K]. API-compatible with
-    ``chunk_gated_delta_rule_fwd_h_flydsl`` (plus the indexed state-pool
+    ``chunk_gated_delta_rule_fwd_h_opt_vk`` (plus the indexed state-pool
     contract via ``initial_state_indices`` / ``inplace_final_state``, matching
     ``chunk_gated_delta_rule_fwd_h_hip_fn``).
 
-    Unlike the baseline wrapper, BV is ``_tuned_bv`` then ``_hipeq_select_bv``;
-    ``FLYDSL_K5_OPT_BV`` (in {16,32,64}) overrides both for A/B sweeps.
+    BV is ``_tuned_bv`` then ``_hipeq_select_bv``; ``FLYDSL_K5_OPT_BV``
+    (in {16,32,64}) overrides both for A/B sweeps.
+    ``AITER_K5_OPT_CHECK=1`` enables the dtype/shape/device audit (off by
+    default). k/w/u must still be contiguous.
 
     ``state_dtype`` controls the persistent initial/final state, while
     ``snapshot_dtype`` independently controls the per-chunk ``h`` snapshots and
@@ -1247,20 +1291,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     resolved_snapshot_dtype = _resolve_snapshot_dtype(snapshot_dtype, k.dtype)
     snapshot_bf16 = resolved_snapshot_dtype is torch.bfloat16
 
-    # opt keeps the token-major [B, T_flat, Hg, K] k layout (no
-    # host-side pre-transpose), matching the Triton VK convention.
-    if k.dim() != 4 or w.dim() != 4 or u.dim() != 4:
-        raise ValueError(
-            "FlyDSL K5 opt: k/w/u must be 4-D (k=[B,T,Hg,K], "
-            f"w=[B,H,T,K], u=[B,H,T,V]); got k={tuple(k.shape)}, "
-            f"w={tuple(w.shape)}, u={tuple(u.shape)}."
-        )
     B, T, Hg, K = k.shape
     H = w.shape[1]
     V = u.shape[-1]
     T_flat = w.shape[2]
     BT = chunk_size
     is_varlen = cu_seqlens is not None
+
+    k = _require_contiguous(k, "k")
+    w = _require_contiguous(w, "w")
+    u = _require_contiguous(u, "u")
 
     if is_varlen and prefill_metadata is None and seq_lens_cpu is not None:
         prefill_metadata = build_gated_delta_rule_prefill_metadata(
@@ -1271,122 +1311,117 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
             num_decode_tokens=num_decode_tokens,
         )
 
-    # -- Input validation (k/w/u/gk). These feed the kernel's raw buffer loads
-    # with no further checks, so a dtype / layout / shape mismatch would
-    # silently read OOB or return wrong results. Fail early with a clear error.
-    if not (k.dtype == w.dtype == u.dtype):
-        raise ValueError(
-            f"FlyDSL K5 opt: k/w/u dtype must match; got k={k.dtype}, "
-            f"w={w.dtype}, u={u.dtype}."
-        )
-    if k.dtype != torch.bfloat16:
-        raise ValueError(
-            "FlyDSL K5 opt: k/w/u must be bfloat16 (the 16x16x16 bf16 "
-            f"MFMA path), got {k.dtype}."
-        )
-    if not (w.device == k.device and u.device == k.device):
-        raise ValueError(
-            "FlyDSL K5 opt: k/w/u must be on the same device; got "
-            f"k={k.device}, w={w.device}, u={u.device}."
-        )
-    k = k.contiguous()
-    w = w.contiguous()
-    u = u.contiguous()
-    if k.shape[1] != T_flat:
-        raise ValueError(
-            f"FlyDSL K5 opt: k T dim ({k.shape[1]}) must equal w/u T ({T_flat})."
-        )
-    if w.shape != (B, H, T_flat, K):
-        raise ValueError(
-            f"FlyDSL K5 opt: expected w=[B,H,T,K]=({B},{H},{T_flat},{K}), "
-            f"got {tuple(w.shape)}."
-        )
-    if u.shape != (B, H, T_flat, V):
-        raise ValueError(
-            f"FlyDSL K5 opt: expected u=[B,H,T,V]=({B},{H},{T_flat},{V}), "
-            f"got {tuple(u.shape)}."
-        )
-    if H % Hg != 0:
-        raise ValueError(f"FlyDSL K5 opt: H ({H}) must be a multiple of Hg ({Hg}).")
-    if gk is not None:
-        if gk.device != k.device:
+    if _opt_check():
+        if k.dim() != 4 or w.dim() != 4 or u.dim() != 4:
             raise ValueError(
-                f"FlyDSL K5 opt: gk must be on k's device ({k.device}); "
-                f"got {gk.device}."
+                "FlyDSL K5 opt: k/w/u must be 4-D (k=[B,T,Hg,K], "
+                f"w=[B,H,T,K], u=[B,H,T,V]); got k={tuple(k.shape)}, "
+                f"w={tuple(w.shape)}, u={tuple(u.shape)}."
             )
-        if gk.dtype != torch.float32:
-            raise ValueError(f"FlyDSL K5 opt: gk must be float32, got {gk.dtype}.")
-        token_major_shape = (B, T_flat, H, K)
-        flat_shape = (T_flat if is_varlen else B * T_flat, H, K)
-        if tuple(gk.shape) == token_major_shape:
-            pass
-        elif tuple(gk.shape) == flat_shape:
-            gk = gk.reshape(token_major_shape)
-        else:
+        if not (k.dtype == w.dtype == u.dtype):
             raise ValueError(
-                "FlyDSL K5 opt: gk shape mismatch; expected "
-                f"{token_major_shape} (token-major) or {flat_shape} (HIP flat), "
-                f"got {tuple(gk.shape)}."
+                f"FlyDSL K5 opt: k/w/u dtype must match; got k={k.dtype}, "
+                f"w={w.dtype}, u={u.dtype}."
             )
+        if k.dtype != torch.bfloat16:
+            raise ValueError(
+                "FlyDSL K5 opt: k/w/u must be bfloat16 (the 16x16x16 bf16 "
+                f"MFMA path), got {k.dtype}."
+            )
+        if not (w.device == k.device and u.device == k.device):
+            raise ValueError(
+                "FlyDSL K5 opt: k/w/u must be on the same device; got "
+                f"k={k.device}, w={w.device}, u={u.device}."
+            )
+        if k.shape[1] != T_flat:
+            raise ValueError(
+                f"FlyDSL K5 opt: k T dim ({k.shape[1]}) must equal w/u T ({T_flat})."
+            )
+        if w.shape != (B, H, T_flat, K):
+            raise ValueError(
+                f"FlyDSL K5 opt: expected w=[B,H,T,K]=({B},{H},{T_flat},{K}), "
+                f"got {tuple(w.shape)}."
+            )
+        if u.shape != (B, H, T_flat, V):
+            raise ValueError(
+                f"FlyDSL K5 opt: expected u=[B,H,T,V]=({B},{H},{T_flat},{V}), "
+                f"got {tuple(u.shape)}."
+            )
+        if H % Hg != 0:
+            raise ValueError(f"FlyDSL K5 opt: H ({H}) must be a multiple of Hg ({Hg}).")
+        if BT != 64:
+            raise ValueError(
+                f"FlyDSL K5 opt: only chunk_size=64 is supported, got chunk_size={BT}."
+            )
+        if K != 128:
+            raise ValueError(f"FlyDSL K5 opt: only K=128 is supported, got K={K}.")
+        if V != 128:
+            raise ValueError(f"FlyDSL K5 opt: only V=128 is supported, got V={V}.")
+        if gk is not None:
+            if gk.device != k.device:
+                raise ValueError(
+                    f"FlyDSL K5 opt: gk must be on k's device ({k.device}); "
+                    f"got {gk.device}."
+                )
+            if gk.dtype != torch.float32:
+                raise ValueError(f"FlyDSL K5 opt: gk must be float32, got {gk.dtype}.")
+            token_major_shape = (B, T_flat, H, K)
+            flat_shape = (T_flat if is_varlen else B * T_flat, H, K)
+            if tuple(gk.shape) == token_major_shape:
+                pass
+            elif tuple(gk.shape) == flat_shape:
+                gk = gk.reshape(token_major_shape)
+            else:
+                raise ValueError(
+                    "FlyDSL K5 opt: gk shape mismatch; expected "
+                    f"{token_major_shape} (token-major) or {flat_shape} (HIP flat), "
+                    f"got {tuple(gk.shape)}."
+                )
+    elif gk is not None and gk.dim() == 3:
+        gk = gk.reshape(B, T_flat, H, K)
 
-    # Explicitly reject unvalidated configs: this kernel's wave mapping
-    # (wid*16, 4 waves cover 64 rows), the gated_v alias-reuse of h_state
-    # panel1 (needs NUM_K_BLOCKS>=2), and the LDS layout are only validated
-    # for K=128, BT=64 (see the asserts inside the kernel). Other values would
-    # trigger LDS aliasing OOB, out-of-bounds stores, or excessive LDS usage,
-    # so fail early with a clear error instead of silently producing wrong
-    # results.
-    if BT != 64:
-        raise ValueError(
-            f"FlyDSL K5 opt: only chunk_size=64 is supported, got " f"chunk_size={BT}."
-        )
-    if K != 128:
-        raise ValueError(f"FlyDSL K5 opt: only K=128 is supported, got K={K}.")
-    if V != 128:
-        raise ValueError(f"FlyDSL K5 opt: only V=128 is supported, got V={V}.")
-
-    # BV selector counts from the caller's metadata; None = read off chunk_offsets.
     host_chunk_meta = None
     if cu_seqlens is None:
-        N = B
-        NT = triton.cdiv(T, BT)
-        chunk_offsets = None
+        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
         kernel_cu_seqlens = None
         is_varlen = False
     else:
-        if B != 1:
-            raise ValueError(f"FlyDSL K5 opt: varlen mode requires B=1, got B={B}.")
-        if cu_seqlens.device != k.device:
-            raise ValueError(
-                "FlyDSL K5 opt: cu_seqlens must be on k's device "
-                f"({k.device}), got {cu_seqlens.device}."
-            )
-        if cu_seqlens.dtype not in (torch.int32, torch.int64):
-            raise ValueError(
-                "FlyDSL K5 opt: cu_seqlens must be int32 or int64, "
-                f"got {cu_seqlens.dtype}."
-            )
-        if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
-            raise ValueError(
-                "FlyDSL K5 opt: cu_seqlens must be a 1-D tensor with "
-                f"at least two elements, got shape {tuple(cu_seqlens.shape)}."
-            )
-        if not cu_seqlens.is_contiguous():
-            raise ValueError("FlyDSL K5 opt: cu_seqlens must be contiguous.")
+        if _opt_check():
+            if B != 1:
+                raise ValueError(f"FlyDSL K5 opt: varlen mode requires B=1, got B={B}.")
+            if cu_seqlens.device != k.device:
+                raise ValueError(
+                    "FlyDSL K5 opt: cu_seqlens must be on k's device "
+                    f"({k.device}), got {cu_seqlens.device}."
+                )
+            if cu_seqlens.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    "FlyDSL K5 opt: cu_seqlens must be int32 or int64, "
+                    f"got {cu_seqlens.dtype}."
+                )
+            if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+                raise ValueError(
+                    "FlyDSL K5 opt: cu_seqlens must be a 1-D tensor with "
+                    f"at least two elements, got shape {tuple(cu_seqlens.shape)}."
+                )
+            if not cu_seqlens.is_contiguous():
+                raise ValueError("FlyDSL K5 opt: cu_seqlens must be contiguous.")
         if prefill_metadata is not None:
-            prefill_metadata.validate(
-                cu_seqlens=cu_seqlens,
-                chunk_size=BT,
-                num_decodes=num_decodes,
-                num_decode_tokens=num_decode_tokens,
-                total_prefill_tokens=T_flat,
-                num_sequences=len(cu_seqlens) - 1,
-            )
+            if _opt_check():
+                prefill_metadata.layout.validate(
+                    cu_seqlens, num_sequences=cu_seqlens.shape[0] - 1
+                )
             schedule = prefill_metadata.get_chunk_schedule(
                 BT,
                 num_decodes=num_decodes,
                 num_decode_tokens=num_decode_tokens,
             )
+            if _opt_check() and schedule.total_prefill_tokens != T_flat:
+                raise ValueError(
+                    "The GDR metadata describes "
+                    f"{schedule.total_prefill_tokens} prefill tokens, "
+                    f"expected {T_flat}."
+                )
             NT = schedule.total_chunks
             chunk_offsets = schedule.chunk_offsets
             kernel_cu_seqlens = schedule.kernel_cu_seqlens
@@ -1398,7 +1433,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
             )
         is_varlen = True
 
-    if initial_state is not None:
+    if _opt_check() and initial_state is not None:
         if initial_state.device != k.device:
             raise ValueError(
                 "FlyDSL K5 opt: initial_state must be on k's device "
@@ -1418,31 +1453,29 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
                 f"must equal N={N}, got {initial_state.shape[0]}."
             )
 
-    # Indexed pool: gather/scatter through ``initial_state[pool_size, H, V, K]``.
-    # Layout checks fail early; index *values* are the caller's responsibility,
-    # matching the HIP/Triton wrappers (int32 narrow + contiguous only).
     if use_state_indices:
         indices = initial_state_indices
-        if indices.dim() != 1:
-            raise ValueError(
-                "FlyDSL K5: initial_state_indices must be 1-D, "
-                f"got shape {tuple(indices.shape)}."
-            )
-        if initial_state.device != k.device:
-            raise ValueError(
-                "FlyDSL K5: initial_state must be on the same device as k; "
-                f"got initial_state={initial_state.device}, k={k.device}."
-            )
-        if indices.device != k.device:
-            raise ValueError(
-                "FlyDSL K5: initial_state_indices must be on the same device as "
-                f"k and initial_state; got indices={indices.device}, k={k.device}."
-            )
-        if indices.numel() != N:
-            raise ValueError(
-                "FlyDSL K5: initial_state_indices length "
-                f"({indices.numel()}) must equal the number of sequences N={N}."
-            )
+        if _opt_check():
+            if indices.dim() != 1:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices must be 1-D, "
+                    f"got shape {tuple(indices.shape)}."
+                )
+            if initial_state.device != k.device:
+                raise ValueError(
+                    "FlyDSL K5: initial_state must be on the same device as k; "
+                    f"got initial_state={initial_state.device}, k={k.device}."
+                )
+            if indices.device != k.device:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices must be on the same device as "
+                    f"k and initial_state; got indices={indices.device}, k={k.device}."
+                )
+            if indices.numel() != N:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices length "
+                    f"({indices.numel()}) must equal the number of sequences N={N}."
+                )
         si_i32 = _as_state_indices(indices)
     else:
         si_i32 = None
@@ -1471,15 +1504,12 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     if BV is None:
         BV = _hipeq_select_bv(k.device, H, _total_chunks, _max_seq_chunks)
 
-    # Env override for A/B BV sweeps; the hand-tuned HIP K5 reference is fixed
-    # at BV=16 (FLYDSL_K5_OPT_BV=16 reproduces it).
-    _bv_env = os.environ.get("FLYDSL_K5_OPT_BV")
-    if _bv_env:
+    if _OPT_BV_ENV:
         try:
-            BV = int(_bv_env)
+            BV = int(_OPT_BV_ENV)
         except ValueError as exc:
             raise ValueError(
-                f"FLYDSL_K5_OPT_BV must be one of 16, 32, or 64, got {_bv_env!r}."
+                f"FLYDSL_K5_OPT_BV must be one of 16, 32, or 64, got {_OPT_BV_ENV!r}."
             ) from exc
     if BV not in (16, 32, 64):
         raise ValueError(f"opt BV must be in {{16,32,64}}, got {BV}.")
@@ -1512,15 +1542,12 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         snapshot_bf16=snapshot_bf16,
     )
 
-    # Null-arg placeholders for the @flyc.jit slots ignored on this path. Sized
-    # 1 (not 0) for a non-null ``data_ptr()``; allocated, not cast, to avoid a copy.
-    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
-    int32_dummy = torch.empty(1, device=k.device, dtype=torch.int32)
+    dummy, int32_dummy = _placeholder_pair(k.device)
     cu_arg = (
         _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
     )
     co_arg = _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
-    stream = torch.cuda.current_stream(k.device)
+    stream = torch.cuda.current_stream()
 
     grid_v = triton.cdiv(V, BV)
     grid_nh = N * H
@@ -1533,37 +1560,32 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     fs_dtype = resolved_state_dtype if output_final_state else None
     save_vn = save_new_value
 
-    # g layout validation, strictly matching the HIP kernel's contract
-    # (aiter.ops.chunk_gated_delta_rule_fwd_h._normalize_g_tensor): g must be a
-    # 3-D tensor whose shape exactly matches the selected layout --
-    #   g_head_major=True  -> head-major  [B, H, T_flat]
-    #   g_head_major=False -> token-major [B, T_flat, H]   (default, == HIP)
-    # In varlen mode the batch dim is 1 (flattened input, N segments live in
-    # cu_seqlens), so B is k.shape[0] (==1). g=None keeps the USE_G=False path.
     if g is not None:
-        if g.device != k.device:
-            raise ValueError(
-                f"FlyDSL K5 opt: g must be on k's device ({k.device}), "
-                f"got {g.device}."
-            )
+        if _opt_check():
+            if g.device != k.device:
+                raise ValueError(
+                    f"FlyDSL K5 opt: g must be on k's device ({k.device}), "
+                    f"got {g.device}."
+                )
+            if g.dim() != 3:
+                raise ValueError(
+                    f"FlyDSL K5 opt: `g` must be 3-D, got shape {tuple(g.shape)}."
+                )
+            expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
+            if tuple(g.shape) != expected_g_shape:
+                layout = (
+                    "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
+                )
+                raise ValueError(
+                    f"FlyDSL K5 opt: `g` shape mismatch, expected "
+                    f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
+                )
         if g.dtype != torch.float32:
             g = g.to(torch.float32)
-        if g.dim() != 3:
-            raise ValueError(
-                f"FlyDSL K5 opt: `g` must be 3-D, got shape {tuple(g.shape)}."
-            )
-        expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
-        if tuple(g.shape) != expected_g_shape:
-            layout = "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
-            raise ValueError(
-                f"FlyDSL K5 opt: `g` shape mismatch, expected "
-                f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
-            )
-        g = g.contiguous()
+        g = _as_contiguous(g)
 
-    # gk pre-scaling to log2 space (mirrors the Triton VK wrapper).
     if gk is not None:
-        gk = gk.contiguous()
+        gk = _as_contiguous(gk)
         if g_log2_scaled:
             gk = gk * _RCP_LN2
         gk = _canonical_gate_rank(gk, (-1, T_flat, H, K))

@@ -14,7 +14,23 @@ from collections.abc import Sequence
 
 import torch
 
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+    chunk_gated_delta_rule_fwd_h_opt,
+    chunk_gated_delta_rule_fwd_h_opt_vk,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+    chunk_fwd_o,
+    chunk_fwd_o_opt,
+    chunk_fwd_o_opt_vk,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.fused_cumsum_kkt import (
+    fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.fused_solve_tril_recompute import (
+    fused_solve_tril_recompute_w_u,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     K5K6Fusion,
     build_gated_delta_rule_prefill_metadata,
@@ -23,14 +39,6 @@ from ..utils import (
     recompute_w_u_fwd,
     solve_tril,
 )
-from .chunk_delta_h import (
-    chunk_gated_delta_rule_fwd_h,
-    chunk_gated_delta_rule_fwd_h_opt,
-    chunk_gated_delta_rule_fwd_h_opt_vk,
-)
-from .chunk_o import chunk_fwd_o, chunk_fwd_o_opt, chunk_fwd_o_opt_vk
-from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
-from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
 
 _SUPPORTED_GFX12_ARCHS = frozenset({"gfx1200", "gfx1201"})
 
@@ -534,15 +542,15 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     elif use_chunk_flydsl:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             _device_cu_count,
-            chunk_gated_delta_rule_fwd_h_flydsl,
             chunk_gated_delta_rule_fwd_h_flydsl_opt,
+            chunk_gated_delta_rule_fwd_h_flydsl_vk,
         )
 
         # Use the VK kernel on large-CU gfx942 (MI300X/MI325X, ≥304 CUs).
         # Fall back to flydsl_opt on other chips (e.g. MI308)
         # and for calls that require flydsl_opt-only features (indexed state
-        # pool, non-default snapshot dtype).
-        # TODO: Benchmark gfx950 to see what kernel is best.
+        # pool, non-default snapshot dtype). The VK wrapper is gfx942-only by
+        # construction, so every other arch takes the opt path here.
         _use_vk = (
             _device_cu_count() >= 304
             and _get_arch_name(q.device) == "gfx942"
@@ -551,7 +559,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             and (snapshot_dtype is None or snapshot_dtype == k.dtype)
         )
         if _use_vk:
-            h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+            h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_vk(
                 k=k,
                 w=w,
                 u=u,
