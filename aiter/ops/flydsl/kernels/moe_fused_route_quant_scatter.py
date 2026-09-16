@@ -807,10 +807,10 @@ def build_moe_fused_route_quant_scatter_module(
         grouped_scale: fx.Pointer,  # preshuffled e8m0 out
         expert_row_base: fx.Pointer,  # (E,) int32 per-expert dst row base
         numel: Int32,
-        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local, sentinel=n_buckets
+        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local; negative=dropped
         weight_in: fx.Pointer,  # (numel,) f32 route weights in (used iff use_g2l)
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
-        n_buckets: Int32,  # sentinel value (== dropped) / local expert count
+        n_buckets: Int32,  # local expert count; other map values are dropped
     ):
         """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
@@ -860,7 +860,7 @@ def build_moe_fused_route_quant_scatter_module(
             is_drop = None
             if const_expr(use_g2l):
                 le = ptr_buf_tensor(g2l_lut)[expert]
-                is_drop = le == fx.Uint32(n_buckets)
+                is_drop = fx.Uint32(le) >= fx.Uint32(n_buckets)
                 expert = fx.Uint32(is_drop.select(c0_i32, le))
                 # Fused weight cast+mask (warp-uniform: every lane writes the same
                 # value to gather_w[route], redundant but race-free). Reads f32
@@ -998,7 +998,7 @@ def build_moe_fused_route_quant_scatter_module(
                 # Scattering a dropped route would overwrite the payload of the
                 # route that owns that row. is_drop is warp-uniform, so the whole
                 # warp branches together and the amax shuffles stay well defined.
-                is_kept = le != fx.Uint32(n_buckets)
+                is_kept = fx.Uint32(le) < fx.Uint32(n_buckets)
                 if is_kept:
                     _emit_row_quant_scatter()
             else:

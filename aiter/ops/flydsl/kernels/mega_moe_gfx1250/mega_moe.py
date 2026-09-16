@@ -93,6 +93,14 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _build_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+    """Build a canonical global-to-local expert map from an ownership mask."""
+    mask = expert_mask.reshape(-1).to(dtype=torch.bool)
+    local_expert_hash = torch.cumsum(mask, dim=0, dtype=torch.int32) - 1
+    local_expert_hash.masked_fill_(~mask, -1)
+    return local_expert_hash
+
+
 def _mori_dispatch_schedule(config) -> tuple:
     """mori's own tuned buckets, as this package's (bound, block, warp) triples.
 
@@ -436,6 +444,7 @@ class MegaMoEGfx1250:
         self.expert_mask = torch.zeros(self.experts, dtype=torch.int32, device=device)
         first_expert = rank * self.experts_per_rank
         self.expert_mask[first_expert : first_expert + self.experts_per_rank] = 1
+        self.local_expert_hash = _build_local_expert_hash(self.expert_mask)
 
         self._initialize_pipeline(
             MegaMoEConfig(
@@ -469,6 +478,8 @@ class MegaMoEGfx1250:
         w2: torch.Tensor,
         w1_scale: torch.Tensor,
         w2_scale: torch.Tensor,
+        expert_mask: torch.Tensor | None = None,
+        local_expert_hash: torch.Tensor | None = None,
         bias1: torch.Tensor | None = None,
         bias2: torch.Tensor | None = None,
         a1_scale: torch.Tensor | None = None,
@@ -485,6 +496,17 @@ class MegaMoEGfx1250:
         received count -- the kernels skip the tail past the device-side count on
         their own.
         """
+        if expert_mask is None:
+            # Callers without per-layer placement retain the contiguous rank map.
+            expert_mask = self.expert_mask
+        if local_expert_hash is None:
+            if expert_mask is self.expert_mask:
+                local_expert_hash = self.local_expert_hash
+            else:
+                local_expert_hash = _build_local_expert_hash(
+                    expert_mask.to(device=hidden_states.device)
+                )
+
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
@@ -577,7 +599,8 @@ class MegaMoEGfx1250:
             w2,
             recv_weights,
             recv_ids,
-            expert_mask=self.expert_mask,
+            expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             activation=self.activation,
             gate_mode=self.gate_mode,
             quant_type=self.quant_type,

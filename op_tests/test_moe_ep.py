@@ -485,6 +485,8 @@ def test_fmoe_ep_mxfp4(
     fake_expertid = expert_mask.numel() - 1
     expert_mask[-1] = 0
     expert_mask[E:-1] = 1
+    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
+    local_expert_hash[expert_mask == 0] = -1
 
     dtype = dtypes.bf16
 
@@ -749,6 +751,7 @@ def test_fmoe_ep_mxfp4(
                 topk_weights,
                 topk_ids,
                 expert_mask=expert_mask,
+                local_expert_hash=local_expert_hash,
                 activation=act,
                 gate_mode=gate_mode,
                 quant_type=QuantType.per_1x32,
@@ -782,6 +785,7 @@ def test_fmoe_ep_mxfp4(
             topk_weights,
             topk_ids,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             activation=act,
             gate_mode=gate_mode,
             quant_type=QuantType.per_1x32,

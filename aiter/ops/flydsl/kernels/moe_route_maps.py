@@ -205,10 +205,10 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     """topids_to_rows with a fused EP global->local expert remap.
 
     ``topk_ids`` holds GLOBAL expert ids; ``g2l_lut[global_id]`` gives the local
-    bucket in [0, n_route_buckets) for enabled experts, or the sentinel value
-    ``n_route_buckets`` for dropped (non-local) routes. Dropped routes claim no
-    atomic slot and are tagged with ``DROPPED_ROUTE_ROW``, so they never occupy a
-    grouped row: ``atomic_buffer`` (== masked_m) counts local routes only.
+    bucket in [0, n_route_buckets) for enabled experts. Negative or out-of-range
+    entries denote dropped (non-local) routes. Dropped routes claim no atomic
+    slot and are tagged with ``DROPPED_ROUTE_ROW``, so they never occupy a grouped
+    row: ``atomic_buffer`` (== masked_m) counts local routes only.
 
     The route weights are cast from f32 ``weight_in`` to ``gather_w`` in
     ``weight_dtype`` in the same pass (kept -> cast, dropped -> 0), folding the
@@ -221,12 +221,15 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     @flyc.kernel(name="moe_route_g2l")
     def route_kernel(
         topk_ids: fx.Pointer,  # (numel,) int32 GLOBAL expert ids
-        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local, sentinel=n_buckets
+        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local; negative=dropped
         atomic_buffer: fx.Pointer,  # (n_buckets,) int32, init 0
         topids_to_rows: fx.Pointer,  # (numel,) int32 out
         weight_in: fx.Pointer,  # (numel,) f32 route weights in
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
-        num_valid_routes: fx.Pointer,  # (1,) int32; routes >= this are the EP dead-tail (skipped)
+        num_local_tokens: fx.Pointer,  # (1,) int32; used to compute nvr when requested
+        num_valid_routes: fx.Pointer,  # (1,) int32 nvr input/output
+        compute_num_valid_routes: Int32,
+        topk: Int32,
         numel: Int32,
         max_m: Int32,
         n_buckets: Int32,  # sentinel value == dropped
@@ -245,7 +248,14 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         # kernel (every downstream consumer is bounded by the same nvr/nvt). When
         # truncation is disabled the caller passes numel here, so nothing is oob.
         nvr_p = ptr_buf_tensor(num_valid_routes)
-        nvr = nvr_p[c0]
+        nvr = fx.Int32(numel)
+        if compute_num_valid_routes != 0:
+            nvt_p = ptr_buf_tensor(num_local_tokens)
+            nvr = fx.Int32(nvt_p[c0] * topk)
+            if route == 0:
+                nvr_p[c0] = nvr
+        else:
+            nvr = nvr_p[c0]
         in_range = route < fx.Uint32(nvr)
         if in_range:
             topk_p = ptr_buf_tensor(topk_ids)
@@ -256,7 +266,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
 
             ge = fx.Uint32(topk_p[route])
             le = fx.Uint32(g2l_p[ge])
-            is_drop = le == fx.Uint32(n_buckets)
+            is_drop = le >= fx.Uint32(n_buckets)
             # Dropped routes address bucket 0 to keep the atomic in bounds, but
             # add 0 to it (incr below) and keep the sentinel instead of the row.
             eff_e = is_drop.select(fx.Uint32(0), le)
@@ -293,7 +303,10 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         topids_to_rows: fx.Pointer,
         weight_in: fx.Pointer,
         gather_w: fx.Pointer,
+        num_local_tokens: fx.Pointer,
         num_valid_routes: fx.Pointer,
+        compute_num_valid_routes: fx.Int32,
+        topk: fx.Int32,
         numel: fx.Int32,
         max_m: fx.Int32,
         n_buckets: fx.Int32,
@@ -307,7 +320,10 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
             topids_to_rows,
             weight_in,
             gather_w,
+            num_local_tokens,
             num_valid_routes,
+            compute_num_valid_routes,
+            topk,
             numel,
             max_m,
             n_buckets,
@@ -358,12 +374,15 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
     )
     def route_kernel(
         topk_ids: fx.Pointer,  # (numel,) int32 GLOBAL expert ids
-        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local, sentinel=n_buckets
+        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local; negative=dropped
         atomic_buffer: fx.Pointer,  # (n_buckets,) int32, init 0 (== masked_m out)
         topids_to_rows: fx.Pointer,  # (numel,) int32 out
         weight_in: fx.Pointer,  # (numel,) f32 route weights in
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
-        num_valid_routes: fx.Pointer,  # (1,) int32; routes >= this are the EP dead-tail
+        num_local_tokens: fx.Pointer,  # (1,) int32; used to compute nvr when requested
+        num_valid_routes: fx.Pointer,  # (1,) int32 nvr input/output
+        compute_num_valid_routes: Int32,
+        topk: Int32,
         numel: Int32,
         max_m: Int32,
         n_buckets: Int32,  # local bucket count / sentinel value; <= MAX_ROUTE_BUCKETS
@@ -388,7 +407,14 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         out_p = ptr_buf_tensor(topids_to_rows)
 
         nvr_p = ptr_buf_tensor(num_valid_routes)
-        nvr = nvr_p[c0]
+        nvr = fx.Int32(numel)
+        if compute_num_valid_routes != 0:
+            nvt_p = ptr_buf_tensor(num_local_tokens)
+            nvr = fx.Int32(nvt_p[c0] * topk)
+            if route == 0:
+                nvr_p[c0] = nvr
+        else:
+            nvr = nvr_p[c0]
 
         n_buckets_i32 = fx.Uint32(n_buckets)
         nvr_i32 = fx.Uint32(nvr)
@@ -414,7 +440,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             ge = fx.Uint32(tk_p[route])
 
         le = fx.Uint32(g2l_p[ge])
-        is_drop = (le == n_buckets_i32) | oob
+        is_drop = (le >= n_buckets_i32) | oob
         is_kept = ~is_drop
         eff_e = is_drop.select(fx.Uint32(0), le)
 
@@ -482,7 +508,10 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         topids_to_rows: fx.Pointer,
         weight_in: fx.Pointer,
         gather_w: fx.Pointer,
+        num_local_tokens: fx.Pointer,
         num_valid_routes: fx.Pointer,
+        compute_num_valid_routes: fx.Int32,
+        topk: fx.Int32,
         numel: fx.Int32,
         max_m: fx.Int32,
         n_buckets: fx.Int32,
@@ -496,7 +525,10 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             topids_to_rows,
             weight_in,
             gather_w,
+            num_local_tokens,
             num_valid_routes,
+            compute_num_valid_routes,
+            topk,
             numel,
             max_m,
             n_buckets,
@@ -544,7 +576,10 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         counter: fx.Pointer,  # (E,) int32 out (== masked_m), zeroed then atomic'd
         topids_to_rows: fx.Pointer,  # (numel,) int32 out
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drop->0
-        num_valid_routes: fx.Pointer,  # (1,) int32; routes >= this are treated as dropped (EP dynamic token count)
+        num_local_tokens: fx.Pointer,  # (1,) int32; used to compute nvr when requested
+        num_valid_routes: fx.Pointer,  # (1,) int32 nvr input/output
+        compute_num_valid_routes: Int32,
+        topk: Int32,
         n: Int32,  # E_global (mask length)
         numel: Int32,
         max_m: Int32,
@@ -618,7 +653,14 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         # they reuse the existing drop path (gather_w=0, folded to bucket 0). When
         # truncation is disabled the caller passes numel here, so nothing is oob.
         nvr_p = ptr_buf_tensor(num_valid_routes)
-        nvr = nvr_p[c0]
+        nvr = fx.Int32(numel)
+        if compute_num_valid_routes != 0:
+            nvt_p = ptr_buf_tensor(num_local_tokens)
+            nvr = fx.Int32(nvt_p[c0] * topk)
+            if tid == 0:
+                nvr_p[c0] = nvr
+        else:
+            nvr = nvr_p[c0]
 
         # Iterate only the valid routes ([0, nvr)); the dead-tail padding routes
         # (>= num_valid_routes) are skipped entirely, so topids_to_rows/gather_w
@@ -669,7 +711,10 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         counter: fx.Pointer,
         topids_to_rows: fx.Pointer,
         gather_w: fx.Pointer,
+        num_local_tokens: fx.Pointer,
         num_valid_routes: fx.Pointer,
+        compute_num_valid_routes: fx.Int32,
+        topk: fx.Int32,
         n: fx.Int32,
         numel: fx.Int32,
         max_m: fx.Int32,
@@ -683,7 +728,10 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             counter,
             topids_to_rows,
             gather_w,
+            num_local_tokens,
             num_valid_routes,
+            compute_num_valid_routes,
+            topk,
             n,
             numel,
             max_m,

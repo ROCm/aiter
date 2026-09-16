@@ -270,104 +270,6 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
-@functools.cache
-def _get_compiled_g2l_lut():
-    """Compile and cache the single-block FlyDSL g2l-LUT builder."""
-    from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
-
-    return build_moe_g2l_lut_module()
-
-
-# Single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS); larger
-# masks fall back to the torch chain.
-_G2L_MAX_N = 512
-
-
-def _build_g2l_lut(
-    expert_mask: torch.Tensor,
-    E: int,
-    device,
-    nvt: torch.Tensor | None = None,
-    topk: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Build the EP global->local expert LUT (and zero the route counter).
-
-    Returns ``(g2l_lut, counter, nvr)`` where ``counter`` is the zero-inited
-    ``(E,)`` per-bucket route counter produced by the fused kernel (or ``None``
-    on the torch fallback, so callers allocate/zero it themselves) and ``nvr`` is
-    the ``(1,)`` int32 ``num_valid_routes = nvt * topk`` scalar the same kernel
-    computes on-device (or ``None`` when ``nvt``/``topk`` are not supplied or the
-    torch fallback is taken, so callers compute it themselves). Folding the
-    ``nvt * topk`` into this pre-route kernel removes the standalone torch
-    elementwise ``* topk`` launch on the EP decode hot path.
-
-    ``g2l_lut[global_id]`` gives the local bucket in [0, E) for enabled experts
-    or the sentinel ``E`` for dropped (non-local) routes. Result is int32 on
-    ``device``.
-
-    Fast path: a single FlyDSL kernel (``moe_g2l_lut``) does ``ne + cumsum + sub
-    + where`` in one pass -- one launch instead of ~6 elementwise/scan kernels,
-    and on the same compiler/runtime as the rest of the gfx1250 grouped path
-    (no Triton in the decode hot path). This depends only on ``expert_mask``
-    (static per rank) but cannot be memoised here: ``fused_moe`` is dispatched
-    through ``torch.ops.aiter.*``, so the op layer hands this function a fresh
-    copy of ``expert_mask`` (new object *and* storage) on essentially every call,
-    so neither object- nor data_ptr-keyed caching hits. Collapsing the chain into
-    one kernel is the portable win; fully removing it would require precomputing
-    the LUT at ``expert_mask`` creation and threading it through the op schema.
-    """
-    n = expert_mask.numel()
-    # nvr is only folded in when both the dynamic-token scalar and topk are known.
-    _want_nvr = nvt is not None and topk is not None
-    if os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
-        try:
-            mask = (
-                expert_mask.to(device=device, dtype=torch.int32)
-                .reshape(-1)
-                .contiguous()
-            )
-            lut = torch.empty(n, dtype=torch.int32, device=device)
-            # The kernel also zero-inits this per-bucket route counter (folds the
-            # separate host torch.zeros(E) that moe_route_g2l increments).
-            counter = torch.empty(E, dtype=torch.int32, device=device)
-            # (1,) int32 num_valid_routes = nvt * topk, computed on-device by the
-            # same single-block kernel (folds the standalone torch ``* topk``). A
-            # valid nvt pointer is always passed so the kernel store is uniform;
-            # the result is only surfaced to the caller when nvr was requested.
-            nvt_i32 = (
-                nvt.reshape(-1)[:1].to(device=device, dtype=torch.int32).contiguous()
-                if _want_nvr
-                else torch.zeros(1, dtype=torch.int32, device=device)
-            )
-            nvr = torch.empty(1, dtype=torch.int32, device=device)
-            _get_compiled_g2l_lut()(
-                ptr_arg(mask),
-                ptr_arg(lut),
-                ptr_arg(counter),
-                ptr_arg(nvt_i32),
-                ptr_arg(nvr),
-                int(n),
-                int(E),
-                int(topk) if _want_nvr else 0,
-                stream=torch.cuda.current_stream(),
-            )
-            return lut, counter, (nvr if _want_nvr else None)
-        except Exception as exc:  # noqa: BLE001  # pragma: no cover
-            logger.debug(
-                "[grouped_a8w4] flydsl g2l build unavailable (%s); "
-                "falling back to torch",
-                exc,
-            )
-    mask_bool = expert_mask.to(device=device).reshape(-1) != 0
-    lut = torch.cumsum(mask_bool.to(torch.int32), 0) - 1
-    lut = (
-        torch.where(mask_bool, lut, torch.full_like(lut, E))
-        .to(torch.int32)
-        .contiguous()
-    )
-    return lut, None, None
-
-
 def _tdm_align_up(x: int, a: int) -> int:
     return ((int(x) + a - 1) // a) * a
 
@@ -444,6 +346,7 @@ def _grouped_a8w4_tdm_moe(
     tdm_b_th=0,
     data_format="a8w4",
     expert_mask=None,
+    local_expert_hash=None,
     num_local_tokens=None,
     stage2_scatter: Stage2ScatterContext | None = None,
     situ_beta=1.0,
@@ -484,8 +387,8 @@ def _grouped_a8w4_tdm_moe(
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
 
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
-    # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
-    # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
+    # route kernel remaps them through the framework-owned ``local_expert_hash``
+    # (-1 means dropped/non-local), and casts f32 weights into ``_gather_w_buf``
     # (kept -> weight_dtype, dropped -> 0), and skips the EP dead-tail (routes >=
     # num_valid_routes / tokens >= num_valid_tokens). Non-local routes claim no
     # per-expert slot, so ``_masked_m`` / ``psum`` -- and the rows the GEMMs
@@ -494,8 +397,6 @@ def _grouped_a8w4_tdm_moe(
     # surplus tiles fall past ``psum`` and exit early. The TDM batched GEMMs
     # themselves are EP-agnostic: they operate on the routed contiguous layout.
     _is_ep = expert_mask is not None
-    _g2l_lut = None
-    _g2l_counter = None
     _gather_w_buf = None
     _ep_nvr = None
     _ep_nvt = None
@@ -512,28 +413,22 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
-            expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
-        )
-        _ep_nvr = (
-            _g2l_nvr if _g2l_nvr is not None else (_ep_nvt * int(topk)).contiguous()
-        )
         # Route kernel writes every entry (kept -> weight_dtype cast, dropped -> 0),
         # so the buffer is left uninitialised (fully kernel-written).
         _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
-        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
+        _masked_m, topids_to_rows, _ep_nvr = flydsl_moe_topids_to_rows(
             topk_ids,
             E,
             max_m,
-            g2l_lut=_g2l_lut,
+            g2l_lut=local_expert_hash,
             gather_w=_gather_w_buf,
             weight_in=topk_weight,
-            counter=_g2l_counter,
-            num_local_tokens=num_local_tokens,
-            num_valid_routes=_ep_nvr,
+            num_local_tokens=_ep_nvt,
         )
     else:
-        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+        _masked_m, topids_to_rows, _ = flydsl_moe_topids_to_rows(
+            topk_ids, E, max_m
+        )
     # EP gemm2-fused scatter: build the ep_rowmap inside the remap pass, which
     # already knows each route's final contiguous row, so the gemm2 TDM epilogue
     # can P2P each weighted row into peers' comb_inp.
@@ -643,7 +538,7 @@ def _grouped_a8w4_tdm_moe(
         not _prequantized
         and int(topk) == 6
         and not tdm_as_in_prologue
-        and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "1") in ("1", "true", "True")
+        and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "0") in ("1", "true", "True")
     )
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
@@ -950,6 +845,7 @@ def grouped_gemm_gfx1250_a8w4(
     w1_scale: torch.Tensor | None,
     w2_scale: torch.Tensor | None,
     expert_mask: torch.Tensor | None,
+    local_expert_hash: torch.Tensor | None,
     hidden_pad: int,
     intermediate_pad: int,
     bias1: torch.Tensor | None,
@@ -967,6 +863,10 @@ def grouped_gemm_gfx1250_a8w4(
     ``moe_shuffle_weight(..., is_guinterleave=True, gate_up=True)`` produces.
     The TDM kernel reads that layout unconditionally -- passing GGUU (separated
     gate/up) weights is not detected and yields wrong results.
+
+    For EP, ``local_expert_hash`` is a framework-owned int32 global-to-local
+    map with negative entries for experts not owned by this rank. It is consumed
+    only by this gfx1250 grouped path.
 
     Returns ``None`` when the shape/dtype/arch is not served here, so the caller
     can fall back to the generic MoE.
@@ -1015,6 +915,7 @@ def grouped_gemm_gfx1250_a8w4(
                 ("w1_scale", w1_scale),
                 ("w2_scale", w2_scale),
                 ("expert_mask", expert_mask),
+                ("local_expert_hash", local_expert_hash),
                 ("hidden_pad", hidden_pad),
                 ("intermediate_pad", intermediate_pad),
                 ("bias1", bias1),
@@ -1069,6 +970,22 @@ def grouped_gemm_gfx1250_a8w4(
     _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
     if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
         return None
+
+    if _is_ep:
+        if local_expert_hash is None:
+            _grouped_dbg("local_expert_hash missing; skip gfx1250 grouped EP")
+            return None
+        if local_expert_hash.device != hidden_states.device:
+            raise ValueError("local_expert_hash must be on the input device")
+        if local_expert_hash.dtype != torch.int32:
+            raise TypeError("local_expert_hash must have dtype torch.int32")
+        if not local_expert_hash.is_contiguous():
+            raise ValueError("local_expert_hash must be contiguous")
+        if local_expert_hash.numel() != expert_mask.numel():
+            raise ValueError(
+                "local_expert_hash and expert_mask must have the same number "
+                "of global experts"
+            )
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
@@ -1227,6 +1144,7 @@ def grouped_gemm_gfx1250_a8w4(
             doweight_stage1=doweight_stage1,
             data_format=data_format,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             num_local_tokens=num_local_tokens,
             stage2_scatter=stage2_scatter,
             situ_beta=situ_beta,

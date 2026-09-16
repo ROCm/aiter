@@ -838,6 +838,9 @@ def fused_moe(
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
+    # Optional framework-owned global-to-local expert map. Only the gfx1250
+    # grouped EP path consumes it; negative entries denote non-local experts.
+    local_expert_hash: torch.Tensor | None = None,
 ):
     if (
         any(
@@ -922,6 +925,7 @@ def fused_moe(
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
         output=output,
+        local_expert_hash=local_expert_hash,
     )
 
 
@@ -960,6 +964,7 @@ def fused_moe_fake(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    local_expert_hash: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1017,6 +1022,7 @@ def fused_moe_(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    local_expert_hash: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1056,6 +1062,7 @@ def fused_moe_(
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
         output=output,
+        local_expert_hash=local_expert_hash,
     )
 
 
@@ -1087,6 +1094,7 @@ def _fused_moe_impl(
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
     output: torch.Tensor | None = None,
+    local_expert_hash: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1180,6 +1188,7 @@ def _fused_moe_impl(
             # the gfx1250 path uses it to skip a quant it would redo.
             a1_scale=a1_scale,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             hidden_pad=hidden_pad,
             intermediate_pad=intermediate_pad,
             bias1=bias1,
