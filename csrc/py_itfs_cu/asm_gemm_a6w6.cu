@@ -21,8 +21,10 @@ constexpr char kDefaultKernelName[] = "f6gemm_dmabig_kernel_func";
 
 // KernelArgs layout is identical to the a4w4 asm gemm ABI; the mxfp6 dmabig
 // kernel was assembled against the same kernarg struct (0x180 bytes). Fields
-// the fp6 kernel does not consume (ptr_C, beta, A/B strides, k-split) are left
-// zeroed and ignored by the kernel.
+// the fp6 kernel does not consume (beta, A/B strides, k-split) are left
+// zeroed and ignored by the kernel. ptr_C and stride_C1 used to be two of
+// them and now carry the optional bias vector and its byte length, which is
+// why adding a bias epilogue needed no ABI change on either side.
 struct __attribute__((packed)) KernelArgs
 {
     void* ptr_D;
@@ -109,8 +111,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int K,                   // padded contraction dim consumed by the packed layout
      const char* kernelName,
      float alpha,
+     aiter_tensor_t* bias,    // optional bias:[N] bf16, folded into the store epilogue
      hipStream_t stream),
-    (A, B, A_scale, B_scale, out, K, kernelName, alpha, stream))
+    (A, B, A_scale, B_scale, out, K, kernelName, alpha, bias, stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
     AITER_CHECK(out->dim() == 2 && out->is_contiguous(),
@@ -150,10 +153,40 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 __func__,
                 " packed scale buffer sizes must exactly match the launch dimensions");
 
+    // The bias rides in ptr_C and its byte length in stride_C1, both slots this ABI carries and
+    // the fp6 kernel used to ignore. The kernel bounds-checks against that length, so a length
+    // of zero is the unbiased path and one code object serves both, and nothing needs padding:
+    // a bias shorter than a padded N reads zeros past its end.
+    //
+    // That path is correct but it is not free, which the design note here used to claim. The
+    // eight bias loads still issue and still wait once per output tile even when they are out
+    // of range, and on call sites that pass no bias that costs 1.4% aggregate and up to 3.0%
+    // on one shape. Selecting a _nobias sibling below recovers it; see the kname block.
+    //
+    // ptr_C as the bias pointer follows a4w4, which already does exactly that. The length goes
+    // in stride_C1 rather than stride_C0 because a4w4 sets stride_C0 to the output row stride,
+    // and one offset must not carry two readings across families that share this struct.
+    unsigned int bias_bytes = 0;
+    if(bias != nullptr)
+    {
+        AITER_CHECK(bias->dtype() == AITER_DTYPE_bf16,
+                    __func__,
+                    " bias must be BFloat16 to match the output");
+        AITER_CHECK(bias->dim() == 1 && bias->is_contiguous(),
+                    __func__,
+                    " bias must be a contiguous 1D tensor");
+        AITER_CHECK(bias->numel() <= Ndim, __func__, " bias length must not exceed N");
+        AITER_CHECK(bias->device_id == A->device_id,
+                    __func__,
+                    " bias must be on the same GPU as the operands");
+        bias_bytes = static_cast<unsigned int>(bias->numel() * 2);
+    }
+
     KernelArgs args{};
     size_t arg_size     = sizeof(args);
     args.ptr_D          = out->ptr;
-    args.ptr_C          = nullptr;
+    args.ptr_C          = bias != nullptr ? bias->ptr : nullptr;
+    args.stride_C1      = bias_bytes;
     args.ptr_A          = A->ptr;
     args.ptr_B          = B->ptr;
     args.alpha          = alpha;
@@ -178,6 +211,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     std::string arch_id = get_gpu_arch();
     std::string kname   = (kernelName && kernelName[0] != 0) ? (arch_id + kernelName)
                                                              : (arch_id + kDefaultKernelName);
+
+    // An unbiased call site pays for a bias epilogue it never uses. Route it to the sibling
+    // built without one when the manifest registers it, and keep the biased build otherwise,
+    // so which shapes have a sibling is a manifest decision rather than one baked in here.
+    // The tuned table stays bias-agnostic: it names the biased symbol and this rewrites it.
+    if(bias == nullptr)
+    {
+        constexpr std::string_view kSuffix = "_kernel_func";
+        if(kname.size() > kSuffix.size() &&
+           std::string_view(kname).substr(kname.size() - kSuffix.size()) == kSuffix)
+        {
+            std::string unbiased = kname.substr(0, kname.size() - kSuffix.size());
+            unbiased += "_nobias";
+            unbiased += kSuffix;
+            if(config_map->find(unbiased) != config_map->end())
+                kname = std::move(unbiased);
+        }
+    }
 
     AiterAsmKernel* impl_ptr = nullptr;
     int SUBM                 = 0;
