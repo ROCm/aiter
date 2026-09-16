@@ -16,7 +16,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from ..kernels_common import atomic_add_i32, atomic_or_i32
-from .topk_per_row_decode import _load_f32x4
+from .topk_per_row_decode import _load_f32x4, _row_length
 
 _VEC = 4
 _LOAD_UNROLL = 4
@@ -92,9 +92,9 @@ def build_radix_topk_one_block_module(
 
     short_rows requires every effective row length <= 4096.
     wave_size must match the target architecture and is part of the cache key.
-    arch selects the first radix level from _LONG_RADIX_BY_ARCH. gfx950 also
-    grows the candidate buffer from _ONE_BLOCK_LDS_BUDGET_BYTES; other arches
-    keep the original layout.
+    arch selects the first radix level from _LONG_RADIX_BY_ARCH; the arches
+    listed in _ONE_BLOCK_LDS_BUDGET_BYTES also grow the candidate buffer into
+    whatever that budget leaves over. The rest keep the original layout.
     """
     if k <= 0:
         raise ValueError("k must be positive")
@@ -107,6 +107,10 @@ def build_radix_topk_one_block_module(
 
     num_waves = block_threads // wave_size
     long_radix_bits, pass1_replicas = _LONG_RADIX_BY_ARCH.get(arch, _LONG_RADIX_DEFAULT)
+    if sum(long_radix_bits) != _KEY_BITS:
+        # Level 1 masks off whatever the three levels do not cover, and the later
+        # levels never see it.
+        raise ValueError(f"radix levels {long_radix_bits} must cover {_KEY_BITS} bits")
     high_buckets = 1 << long_radix_bits[0]
     long_shifts = (long_radix_bits[1] + long_radix_bits[2], long_radix_bits[2], 0)
     long_masks = tuple((1 << bits) - 1 for bits in long_radix_bits)
@@ -128,7 +132,6 @@ def build_radix_topk_one_block_module(
         stable_sort_min_row_len, _STABLE_COMPACT_SORT_MIN_ROW_LEN
     )
     stable_sort_capacity = 1 << (k - 1).bit_length() if stable_sort_enabled else 1
-    stable_stage_capacity = stable_sort_capacity
     stable_sort_items_per_thread = (
         stable_sort_capacity + block_threads - 1
     ) // block_threads
@@ -144,15 +147,18 @@ def build_radix_topk_one_block_module(
     # buffer gets every byte the budget leaves over. Stable index sorting
     # reserves a power-of-two staging array (including its padding slots).
     histogram_bytes = later_buckets * 4
-    stable_stage_bytes = stable_stage_capacity * 4
+    stable_stage_bytes = stable_sort_capacity * 4
     scratch_bytes = (num_waves + _METADATA_SIZE) * 4
-    candidate_entry_bytes = 4 + 4  # ordered key, column index
+    # Writer and readers of the candidate columns are all gated on this.
+    candidate_columns_used = not stable or stable_sort_enabled
+    candidate_entry_bytes = 4 + (4 if candidate_columns_used else 0)
     lds_budget_bytes = _ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0)
 
     spare_bytes = (
         lds_budget_bytes - histogram_bytes - stable_stage_bytes - scratch_bytes
     )
     candidate_capacity = max(_COMPACT_CAPACITY, spare_bytes // candidate_entry_bytes)
+    candidate_index_capacity = candidate_capacity if candidate_columns_used else 1
     # Compare bitmap word work with the compare/exchanges in the sorting
     # network. Tiny k should retain its short register sorting network.
     bitmap_capacity = min(
@@ -172,8 +178,8 @@ def build_radix_topk_one_block_module(
     class LongLaterStorage:
         histogram: fx.Array[fx.Int32, later_buckets, 16]
         candidate_ordered_keys: fx.Array[fx.Int32, candidate_capacity, 16]
-        candidate_local_indices: fx.Array[fx.Int32, candidate_capacity, 16]
-        stable_data: fx.Array[fx.Int32, stable_stage_capacity, 16]
+        candidate_local_indices: fx.Array[fx.Int32, candidate_index_capacity, 16]
+        stable_data: fx.Array[fx.Int32, stable_sort_capacity, 16]
 
     @fx.struct
     class ShortPass1Storage:
@@ -227,12 +233,8 @@ def build_radix_topk_one_block_module(
 
         # Row bounds
         if const_expr(is_decode):
-            request = row // next_n
-            offset = row % next_n
             row_start = zero
-            row_end = row_ends[request] - next_n + offset + one
-            row_end = (row_end < zero).select(zero, row_end)
-            row_end = (row_end > width).select(width, row_end)
+            row_end = _row_length(row, row_ends, width, next_n)
         else:
             row_start = row_starts[row]
             row_end = row_ends[row]
@@ -297,11 +299,11 @@ def build_radix_topk_one_block_module(
             )
             candidate_local_indices = (
                 storage.arena.long_later.candidate_local_indices.peek().view(
-                    fx.make_layout(candidate_capacity, 1)
+                    fx.make_layout(candidate_index_capacity, 1)
                 )
             )
             staged_local_indices = storage.arena.long_later.stable_data.peek().view(
-                fx.make_layout(stable_stage_capacity, 1)
+                fx.make_layout(stable_sort_capacity, 1)
             )
             short_storage = storage.arena.short_pass1
 
@@ -312,9 +314,9 @@ def build_radix_topk_one_block_module(
                 (_SHORT_HIGH_BUCKETS, 1),
             )
         )
-        short_histograms = (
-            fx.slice(short_histogram_matrix, (0, None)),
-            fx.slice(short_histogram_matrix, (1, None)),
+        short_histograms = tuple(
+            fx.slice(short_histogram_matrix, (replica, None))
+            for replica in range(_PASS1_HISTOGRAM_REPLICAS)
         )
         short_histograms_flat = short_storage.histograms.peek().view(
             fx.make_layout(_PASS1_HISTOGRAM_REPLICAS * _SHORT_HIGH_BUCKETS, 1)
@@ -394,22 +396,22 @@ def build_radix_topk_one_block_module(
             gpu.barrier()
 
         def merge_histograms(histograms, bins_per_thread):
-            for item in range_constexpr(bins_per_thread):
-                pos = tid + item * block_threads
-                merged = histograms[0][pos]
-                for replica in range_constexpr(1, len(histograms)):
-                    merged = merged + histograms[replica][pos]
-                histograms[0][pos] = merged
-            gpu.barrier()
+            # One replica is already merged; folding it into itself is not free.
+            if const_expr(len(histograms) > 1):
+                for item in range_constexpr(bins_per_thread):
+                    pos = tid + item * block_threads
+                    merged = histograms[0][pos]
+                    for replica in range_constexpr(1, len(histograms)):
+                        merged = merged + histograms[replica][pos]
+                    histograms[0][pos] = merged
+                gpu.barrier()
 
         def choose_threshold(
             target_k,
             above_slot,
             threshold_slot,
-            count_slot,
             histogram,
             bins_per_thread,
-            scan,
             metadata,
             replicas=(),
         ):
@@ -431,7 +433,9 @@ def build_radix_topk_one_block_module(
                 if (exclusive <= target_prefix) & (inclusive > target_prefix):
                     metadata[threshold_slot] = first_bin + item  # Kth bucket
                     metadata[above_slot] = total - inclusive  # Higher-bucket count
-                    metadata[count_slot] = inclusive - exclusive  # Bucket count
+                    metadata[_SELECTED_BUCKET_COUNT] = (
+                        inclusive - exclusive
+                    )  # Bucket count
                 exclusive = inclusive
             gpu.barrier()
 
@@ -532,13 +536,9 @@ def build_radix_topk_one_block_module(
             prefix_mask = (1 << (_KEY_BITS - prefix_shift)) - 1
             return radix_bucket(key, prefix_shift, prefix_mask)
 
-        def accumulate_prefix_histogram(
-            col, key, shift, mask, histogram, prefix_threshold
-        ):
-            active = col < row_len
-            prefix = preceding_prefix(key, shift, mask)
-            active = active & (prefix == prefix_threshold)
-            if active:
+        def accumulate_prefix_histogram(key, shift, mask, histogram, prefix_threshold):
+            # Callers visit only columns inside the row.
+            if preceding_prefix(key, shift, mask) == prefix_threshold:
                 bucket = radix_bucket(key, shift, mask)
                 atomic_add_i32(histogram, one, bucket, "workgroup")
 
@@ -934,10 +934,8 @@ def build_radix_topk_one_block_module(
                 top_k,
                 _FIRST_ABOVE,
                 _FIRST_THRESHOLD,
-                _SELECTED_BUCKET_COUNT,
                 histograms[0],
                 short_bins_per_thread,
-                scan,
                 metadata,
                 replicas=histograms[1:] if block_threads != 256 else (),
             )
@@ -951,8 +949,7 @@ def build_radix_topk_one_block_module(
                 # Second radix pass.
                 clear_histograms((histograms[0],), short_bins_per_thread)
                 scan_lds_keys(
-                    lambda col, key: accumulate_prefix_histogram(
-                        col,
+                    lambda _col, key: accumulate_prefix_histogram(
                         key,
                         _SHORT_RADIX_SHIFTS[1],
                         _SHORT_RADIX_MASKS[1],
@@ -965,10 +962,8 @@ def build_radix_topk_one_block_module(
                     remaining_k,
                     _SECOND_ABOVE,
                     _SECOND_THRESHOLD,
-                    _SELECTED_BUCKET_COUNT,
                     histograms[0],
                     short_bins_per_thread,
-                    scan,
                     metadata,
                 )
 
@@ -983,8 +978,7 @@ def build_radix_topk_one_block_module(
                     # Third radix pass.
                     clear_histograms((histograms[0],), short_bins_per_thread)
                     scan_lds_keys(
-                        lambda col, key: accumulate_prefix_histogram(
-                            col,
+                        lambda _col, key: accumulate_prefix_histogram(
                             key,
                             _SHORT_RADIX_SHIFTS[2],
                             _SHORT_RADIX_MASKS[2],
@@ -997,10 +991,8 @@ def build_radix_topk_one_block_module(
                         remaining_k,
                         _THIRD_ABOVE,
                         _THIRD_THRESHOLD,
-                        _SELECTED_BUCKET_COUNT,
                         histograms[0],
                         short_bins_per_thread,
-                        scan,
                         metadata,
                     )
 
@@ -1124,10 +1116,8 @@ def build_radix_topk_one_block_module(
                 top_k,
                 _FIRST_ABOVE,
                 _FIRST_THRESHOLD,
-                _SELECTED_BUCKET_COUNT,
                 histograms[0],
                 high_bins_per_thread,
-                scan,
                 metadata,
                 replicas=histograms[1:] if stable and k > 1024 else (),
             )
@@ -1178,10 +1168,8 @@ def build_radix_topk_one_block_module(
                     remaining_k,
                     _SECOND_ABOVE,
                     _SECOND_THRESHOLD,
-                    _SELECTED_BUCKET_COUNT,
                     histogram,
                     later_bins_per_thread,
-                    scan,
                     metadata,
                 )
 
@@ -1222,7 +1210,6 @@ def build_radix_topk_one_block_module(
                     if candidate_count <= fx.Int32(candidate_capacity):
                         for pos in range(tid, candidate_count, block_size):
                             accumulate_prefix_histogram(
-                                pos,
                                 candidate_ordered_keys[pos],
                                 long_shifts[2],
                                 long_masks[2],
@@ -1231,8 +1218,7 @@ def build_radix_topk_one_block_module(
                             )
                     else:
                         scan_gm_row(
-                            lambda col, value: accumulate_prefix_histogram(
-                                col,
+                            lambda _col, value: accumulate_prefix_histogram(
                                 ordered_key(value),
                                 long_shifts[2],
                                 long_masks[2],
@@ -1245,10 +1231,8 @@ def build_radix_topk_one_block_module(
                         remaining_k,
                         _THIRD_ABOVE,
                         _THIRD_THRESHOLD,
-                        _SELECTED_BUCKET_COUNT,
                         histogram,
                         later_bins_per_thread,
-                        scan,
                         metadata,
                     )
 
@@ -1291,17 +1275,15 @@ def build_radix_topk_one_block_module(
                     )
 
         def write_direct_scalar(row_indices, row_values):
-            for step in range_constexpr((k + block_threads - 1) // block_threads):
-                col = step * block_threads + tid
-                if col < k:
-                    row_indices[col] = (col < row_len).select(
-                        row_start + col, fx.Int32(-1)
-                    )
-                    if const_expr(write_values):
-                        value = fx.Float32(float("-inf"))
-                        if col < row_len:
-                            value = physical_row[row_start + col]
-                        row_values[col] = value
+            # One column per thread: only reached when k <= block_threads.
+            col = tid
+            if col < k:
+                row_indices[col] = (col < row_len).select(row_start + col, fx.Int32(-1))
+                if const_expr(write_values):
+                    value = fx.Float32(float("-inf"))
+                    if col < row_len:
+                        value = physical_row[row_start + col]
+                    row_values[col] = value
 
         def write_direct_vector(row_indices, row_values):
             for step in range_constexpr(output_vector_steps):
