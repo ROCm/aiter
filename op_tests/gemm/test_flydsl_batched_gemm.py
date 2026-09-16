@@ -21,8 +21,8 @@ Shape mapping (V4-Pro, ``config.json``):
   k = n_heads * head_dim // o_groups = 4096
 
 Run:
-    python op_tests/test_flydsl_batched_gemm.py
-    python op_tests/test_flydsl_batched_gemm.py -s 128,1024,4096 -b 2
+    python op_tests/gemm/test_flydsl_batched_gemm.py
+    python op_tests/gemm/test_flydsl_batched_gemm.py -s 128,1024,4096 -b 2
 """
 
 import argparse

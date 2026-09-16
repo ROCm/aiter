@@ -1,4 +1,4 @@
-# op_tests/test_topk_softmax.py
+# op_tests/topk/test_topk_softmax.py
 import pytest
 import torch
 

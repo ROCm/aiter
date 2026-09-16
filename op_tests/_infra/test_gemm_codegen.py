@@ -20,8 +20,8 @@ Scenarios:
   4. Runtime dispatch key selection — (gfx, cu_num, M, N, K) lookup
 
 Usage:
-    python op_tests/test_gemm_codegen.py
-    GPU_ARCHS=gfx942 python op_tests/test_gemm_codegen.py
+    python op_tests/_infra/test_gemm_codegen.py
+    GPU_ARCHS=gfx942 python op_tests/_infra/test_gemm_codegen.py
 """
 
 import contextlib

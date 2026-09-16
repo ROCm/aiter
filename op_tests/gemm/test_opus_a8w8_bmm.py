@@ -15,9 +15,9 @@ guard that OpusGemmInstance.m_align still matches launcher behaviour (see
 launch failures and needs no timing.
 
 Usage:
-    python3 op_tests/test_opus_a8w8_bmm.py
-    python3 op_tests/test_opus_a8w8_bmm.py -s 512,1024,4096 -g 2 -d bf16
-    python3 op_tests/test_opus_a8w8_bmm.py --check-m-align
+    python3 op_tests/gemm/test_opus_a8w8_bmm.py
+    python3 op_tests/gemm/test_opus_a8w8_bmm.py -s 512,1024,4096 -g 2 -d bf16
+    python3 op_tests/gemm/test_opus_a8w8_bmm.py --check-m-align
 """
 
 import argparse

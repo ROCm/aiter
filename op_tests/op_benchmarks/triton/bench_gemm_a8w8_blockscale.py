@@ -198,7 +198,7 @@ def parse_args(args: list[str] | None = None):
         "-test",
         action="store_true",
         help="Run a correctness check for each benchmarked shape against a "
-        "torch reference (mirrors op_tests/test_gemm_a8w8_blockscale.py).",
+        "torch reference (mirrors op_tests/gemm/test_gemm_a8w8_blockscale.py).",
     )
     return get_ff_args(parser, args=args)
 

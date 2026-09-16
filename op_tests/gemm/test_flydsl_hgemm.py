@@ -11,9 +11,9 @@ The model path (``tuned_gemm.flydsl_gemm``) is BF16 x BF16:
     y    = flydsl_hgemm(a, w, out=out, ...)   # kernel sees w.t() as NT
 
 Run:
-    python op_tests/test_flydsl_hgemm.py
-    python op_tests/test_flydsl_hgemm.py -s 128,4096,4096
-    python op_tests/test_flydsl_hgemm.py -s 32,384,7168
+    python op_tests/gemm/test_flydsl_hgemm.py
+    python op_tests/gemm/test_flydsl_hgemm.py -s 128,4096,4096
+    python op_tests/gemm/test_flydsl_hgemm.py -s 32,384,7168
 """
 
 import argparse
