@@ -8,10 +8,11 @@ complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
 
 When ``visible <= 512`` the selected set is every complete block: one
-workgroup per row writes those ids. Decode rows with more than one
-512-slot tile split columns across eight workgroups (idle splits write
-``-inf`` heaps) and pair-merge those sorted heaps. Prefill streams tiles
-in one workgroup per row.
+workgroup per row writes those ids. Each new tile is wave-sorted then
+LDS-merged across eight waves. Decode rows with more than one 512-slot
+tile split columns across eight workgroups (idle splits write ``-inf``
+heaps) and pair-merge those sorted heaps. Prefill streams tiles in one
+workgroup per row.
 """
 
 from functools import lru_cache
@@ -36,10 +37,16 @@ _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
 _VEC = 8
 _Q_THREADS = _H * (_D // _VEC)
-_TILE_STAGES = tuple(
+_WAVE = 64
+_WAVE_STAGES = tuple(
     (span, stride)
-    for span in (2, 4, 8, 16, 32, 64, 128, 256, 512)
+    for span in (2, 4, 8, 16, 32, 64)
     for stride in tuple(1 << shift for shift in range(span.bit_length() - 2, -1, -1))
+)
+_INTERWAVE = (
+    (128, (64, 32, 16, 8, 4, 2, 1)),
+    (256, (128, 64, 32, 16, 8, 4, 2, 1)),
+    (512, (256, 128, 64, 32, 16, 8, 4, 2, 1)),
 )
 _PAIR_MERGE_STRIDES = tuple(1 << shift for shift in range(_K.bit_length() - 1, -1, -1))
 
@@ -73,7 +80,14 @@ def build_qsa_k1_family_a_serial(page_size: int):
     @flyc.kernel(
         name="qsa_k1_family_a_serial_"
         + kernel_signature(
-            ps=page_size, tile=_TILE, k=_K, h=_H, d=_D, blk=_BLOCK_THREADS, pair=1
+            ps=page_size,
+            tile=_TILE,
+            k=_K,
+            h=_H,
+            d=_D,
+            blk=_BLOCK_THREADS,
+            pair=1,
+            wav=1,
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
@@ -177,27 +191,60 @@ def build_qsa_k1_family_a_serial(page_size: int):
                         cand_s[candidate] = _neg_inf()
                         cand_c[candidate] = neg_one
                 gpu.barrier()
-                for span, stride in _TILE_STAGES:
-                    for t in range_constexpr(tile_steps):
-                        local = tid + Int32(t * _BLOCK_THREADS)
-                        peer_local = local ^ Int32(stride)
-                        if local < peer_local:
-                            j = Int32(_K) + local
+                ws = cand_s[Int32(_K) + tid]
+                wc = cand_c[Int32(_K) + tid]
+                lane = gpu.lane_id()
+                for span, stride in _WAVE_STAGES:
+                    ps = ws.shuffle_xor(stride, _WAVE)
+                    pc = wc.shuffle_xor(stride, _WAVE)
+                    is_lo = lane < (lane ^ Int32(stride))
+                    best_first = (lane & Int32(span)) == zero
+                    take_peer = is_lo.select(
+                        best_first.select(
+                            better(ps, pc, ws, wc),
+                            better(ws, wc, ps, pc),
+                        ),
+                        best_first.select(
+                            better(ws, wc, ps, pc),
+                            better(ps, pc, ws, wc),
+                        ),
+                    )
+                    ws = take_peer.select(ps, ws)
+                    wc = take_peer.select(pc, wc)
+                cand_s[Int32(_K) + tid] = ws
+                cand_c[Int32(_K) + tid] = wc
+                gpu.barrier()
+                for win_size, strides in _INTERWAVE:
+                    half = win_size // 2
+                    wbase = (tid // Int32(win_size)) * Int32(win_size)
+                    i_up = tid - wbase - Int32(half)
+                    if (i_up >= zero) & (i_up < Int32(half // 2)):
+                        a = Int32(_K) + wbase + Int32(half) + i_up
+                        b = Int32(_K) + wbase + Int32(win_size - 1) - i_up
+                        sa = cand_s[a]
+                        ca = cand_c[a]
+                        sb = cand_s[b]
+                        cb = cand_c[b]
+                        cand_s[a] = sb
+                        cand_c[a] = cb
+                        cand_s[b] = sa
+                        cand_c[b] = ca
+                    gpu.barrier()
+                    for stride in strides:
+                        peer_local = tid ^ Int32(stride)
+                        if tid < peer_local:
+                            j = Int32(_K) + tid
                             peer = Int32(_K) + peer_local
                             s0 = cand_s[j]
                             c0 = cand_c[j]
                             s1 = cand_s[peer]
                             c1 = cand_c[peer]
-                            best_first = (local & Int32(span)) == zero
-                            swap = best_first.select(
-                                better(s1, c1, s0, c0),
-                                better(s0, c0, s1, c1),
-                            )
+                            swap = better(s1, c1, s0, c0)
                             cand_s[j] = swap.select(s1, s0)
                             cand_c[j] = swap.select(c1, c0)
                             cand_s[peer] = swap.select(s0, s1)
                             cand_c[peer] = swap.select(c0, c1)
-                    gpu.barrier()
+                        gpu.barrier()
                 if tile == zero:
                     for t in range_constexpr(tile_steps):
                         local = tid + Int32(t * _BLOCK_THREADS)
@@ -301,6 +348,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         blk=_BLOCK_THREADS,
         spl=_SPLITS,
         pair=2,
+        wav=1,
     )
 
     @fx.struct
@@ -427,27 +475,60 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                         cand_s[candidate] = _neg_inf()
                         cand_c[candidate] = neg_one
                 gpu.barrier()
-                for span, stride in _TILE_STAGES:
-                    for t in range_constexpr(tile_steps):
-                        local = tid + Int32(t * _BLOCK_THREADS)
-                        peer_local = local ^ Int32(stride)
-                        if local < peer_local:
-                            j = Int32(_K) + local
+                ws = cand_s[Int32(_K) + tid]
+                wc = cand_c[Int32(_K) + tid]
+                lane = gpu.lane_id()
+                for span, stride in _WAVE_STAGES:
+                    ps = ws.shuffle_xor(stride, _WAVE)
+                    pc = wc.shuffle_xor(stride, _WAVE)
+                    is_lo = lane < (lane ^ Int32(stride))
+                    best_first = (lane & Int32(span)) == zero
+                    take_peer = is_lo.select(
+                        best_first.select(
+                            better(ps, pc, ws, wc),
+                            better(ws, wc, ps, pc),
+                        ),
+                        best_first.select(
+                            better(ws, wc, ps, pc),
+                            better(ps, pc, ws, wc),
+                        ),
+                    )
+                    ws = take_peer.select(ps, ws)
+                    wc = take_peer.select(pc, wc)
+                cand_s[Int32(_K) + tid] = ws
+                cand_c[Int32(_K) + tid] = wc
+                gpu.barrier()
+                for win_size, strides in _INTERWAVE:
+                    half = win_size // 2
+                    wbase = (tid // Int32(win_size)) * Int32(win_size)
+                    i_up = tid - wbase - Int32(half)
+                    if (i_up >= zero) & (i_up < Int32(half // 2)):
+                        a = Int32(_K) + wbase + Int32(half) + i_up
+                        b = Int32(_K) + wbase + Int32(win_size - 1) - i_up
+                        sa = cand_s[a]
+                        ca = cand_c[a]
+                        sb = cand_s[b]
+                        cb = cand_c[b]
+                        cand_s[a] = sb
+                        cand_c[a] = cb
+                        cand_s[b] = sa
+                        cand_c[b] = ca
+                    gpu.barrier()
+                    for stride in strides:
+                        peer_local = tid ^ Int32(stride)
+                        if tid < peer_local:
+                            j = Int32(_K) + tid
                             peer = Int32(_K) + peer_local
                             s0 = cand_s[j]
                             c0 = cand_c[j]
                             s1 = cand_s[peer]
                             c1 = cand_c[peer]
-                            best_first = (local & Int32(span)) == zero
-                            swap = best_first.select(
-                                better(s1, c1, s0, c0),
-                                better(s0, c0, s1, c1),
-                            )
+                            swap = better(s1, c1, s0, c0)
                             cand_s[j] = swap.select(s1, s0)
                             cand_c[j] = swap.select(c1, c0)
                             cand_s[peer] = swap.select(s0, s1)
                             cand_c[peer] = swap.select(c0, c1)
-                    gpu.barrier()
+                        gpu.barrier()
                 if tile == start:
                     for t in range_constexpr(tile_steps):
                         local = tid + Int32(t * _BLOCK_THREADS)

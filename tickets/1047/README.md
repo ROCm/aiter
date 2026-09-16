@@ -260,28 +260,29 @@ set equality `err=0` on both columns (HIP `stable=False` still matched
 this seed).
 
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` emit path**,
-a **per-tile pair merge**, and a **column split** on decode rows with
-more than one 512-slot tile (`S=8`; idle splits write `-inf`). Heaps are
-**pair-merged**. Prefill stays single-WG. Workspace is `[M, 8, 512]`, not
-a score matrix. **2d stays unchecked:** short `L` beats HIP; splitting
-8k cuts ~77µs→~38µs but still loses HIP; 32k/128k unchanged.
+a **wave-local tile sort** plus LDS merge across eight waves, a
+**per-tile pair merge**, and a **column split** on decode rows with more
+than one 512-slot tile. Heaps are **pair-merged**. Prefill stays
+single-WG. Workspace is `[M, 8, 512]`, not a score matrix. **2d stays
+unchecked:** short `L` beats HIP; wave-local sort trims decode 8k/32k/128k
+but still loses HIP; prefill serial is unchanged.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 2.6 | 8.2 | 0 | 0 |
-| 8 | 512 | 128 | 2.4 | 9.6 | 0 | 0 |
-| 1 | 2048 | 512 | 1.5 | 8.1 | 0 | 0 |
-| 8 | 2048 | 512 | 2.4 | 9.0 | 0 | 0 |
-| 1 | 8192 | 2048 | 38.3 | 18.0 | 0 | 0 |
-| 8 | 8192 | 2048 | 38.8 | 20.0 | 0 | 0 |
-| 1 | 32768 | 8192 | 58.7 | 19.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 58.7 | 24.3 | 0 | 0 |
-| 1 | 131072 | 32768 | 179.5 | 28.9 | 0 | 0 |
-| 8 | 131072 | 32768 | 188.5 | 51.7 | 0 | 0 |
-| 512 | 512 | 128 | 3.0 | 16.1 | 0 | 0 |
-| 512 | 2048 | 512 | 3.1 | 26.9 | 0 | 0 |
-| 512 | 8192 | 2048 | 153.7 | 83.4 | 0 | 0 |
-| 512 | 32768 | 8192 | 610.7 | 246.1 | 0 | 0 |
+| 1 | 512 | 128 | 2.0 | 9.4 | 0 | 0 |
+| 8 | 512 | 128 | 2.9 | 11.5 | 0 | 0 |
+| 1 | 2048 | 512 | 2.0 | 10.2 | 0 | 0 |
+| 8 | 2048 | 512 | 2.9 | 11.4 | 0 | 0 |
+| 1 | 8192 | 2048 | 35.7 | 19.3 | 0 | 0 |
+| 8 | 8192 | 2048 | 36.0 | 21.8 | 0 | 0 |
+| 1 | 32768 | 8192 | 53.1 | 20.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 53.4 | 25.2 | 0 | 0 |
+| 1 | 131072 | 32768 | 156.3 | 30.1 | 0 | 0 |
+| 8 | 131072 | 32768 | 166.5 | 52.9 | 0 | 0 |
+| 512 | 512 | 128 | 3.7 | 18.3 | 0 | 0 |
+| 512 | 2048 | 512 | 3.5 | 29.1 | 0 | 0 |
+| 512 | 8192 | 2048 | 156.6 | 83.7 | 0 | 0 |
+| 512 | 32768 | 8192 | 609.6 | 243.8 | 0 | 0 |
 
 
 
