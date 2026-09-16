@@ -15,9 +15,9 @@ def _fused_moe_router_impl_fake(*args, **kwargs) -> None:
     return
 
 
-# The C++ entry takes torch::Tensor directly (see fused_moe_router_entry.cu),
-# so no develop=True aiter_tensor_t conversion.
-@compile_ops("module_fused_moe_router", gen_fake=_fused_moe_router_impl_fake)
+# develop=True converts torch.Tensor -> aiter_tensor_t: the module is built
+# torch_exclude, so the C++ entry takes aiter_tensor_t (see fused_moe_router.cu).
+@compile_ops(MD_NAME, gen_fake=_fused_moe_router_impl_fake, develop=True)
 def fused_moe_router_impl(
     gating: torch.Tensor,
     bias: torch.Tensor,
@@ -97,7 +97,7 @@ def fused_moe_router_impl(
     """
 
 
-@compile_ops("module_fused_moe_router")
+@compile_ops(MD_NAME, develop=True)
 def fused_moe_router_workspace_size(max_tokens: int) -> int:
     """Workspace bytes needed to serve every ``M`` up to ``max_tokens``."""
 

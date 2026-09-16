@@ -15,7 +15,7 @@ one of them:
 
   * the barrier semaphore -- one u32 in the caller's workspace, zeroed once at
     allocation and rearmed only by the sense flip
-    (see the workspace layout note in fused_moe_router_entry.cu). A flip bug
+    (see the workspace layout note in csrc/kernels/fused_moe_router.cu). A flip bug
     corrupts the NEXT launch, so
     nothing that syncs between launches can see it.
   * the tok_scale scratch -- the rest of that workspace, uninitialised and
