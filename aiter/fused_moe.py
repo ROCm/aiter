@@ -951,8 +951,10 @@ def _resolve_quant_dtypes(
 ):
     """Pick the activation/weight quant dtypes for a 2-stage MoE launch.
 
-    Shared by ``fused_moe_`` and ``fused_moe_router`` so both agree on the
-    dtype that sizes the sorted buffers and keys the tuned config lookup.
+    Thin wrapper over :func:`resolve_activation_dtype` that also settles the
+    output dtype and the remapped quant type. Shared by ``fused_moe_`` and
+    ``fused_moe_router`` so both agree on the dtype that sizes the sorted
+    buffers and keys the tuned config lookup.
 
     Returns:
         ``(dtype, quant_type, q_dtype_a, q_dtype_w)`` -- the resolved output
@@ -966,52 +968,15 @@ def _resolve_quant_dtypes(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
-    # use FP8 as activation dtype to skip redundant re-quantization
-    if (
-        quant_type == QuantType.per_1x128
-        and hidden_states.dtype == dtypes.fp8
-        and a1_scale is not None
-    ):
-        q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        q_dtype_a = dtypes.bf16
-    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
-        # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
-        q_dtype_a = dtypes.fp8
-    elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Situv2:
-            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
-            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
-            # fp8 / fp4 activation instead; each has its own tuned config
-            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
-            # branch below, which would otherwise claim SiTUv2 and pick the
-            # activation dtype itself.
-            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
-                q_dtype_a = dtypes.fp8
-            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
-                q_dtype_a = dtypes.fp4x2
-            else:
-                q_dtype_a = dtypes.bf16
-        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                q_dtype_a = dtypes.bf16
-            else:
-                q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
-
-    if get_gfx() == "gfx1250":
-        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
-            q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
-
+    q_dtype_a = resolve_activation_dtype(
+        quant_type,
+        q_dtype_w,
+        activation=activation,
+        gate_mode=gate_mode,
+        M=M,
+        hidden_dtype=hidden_states.dtype,
+        has_a1_scale=a1_scale is not None,
+    )
     return dtype, quant_type, q_dtype_a, q_dtype_w
 
 
@@ -1643,7 +1608,7 @@ def _fused_moe_impl(
 # 160 KB at M=154, so raising this past ~153 needs that check mirrored here.
 FUSED_MOE_ROUTER_MAX_TOKENS = 128
 
-# Mirror fused_moe_router_entry.cu. Phase 1 selects within one wave and the
+# Mirror csrc/kernels/fused_moe_router.cu. Phase 1 selects within one wave and the
 # shared rows take the lanes just past topk, so both must fit kWaveSize. The
 # pair scan gives each of BlockSize threads two expert slots.
 FUSED_MOE_ROUTER_MAX_TOPK = 64  # kWaveSize

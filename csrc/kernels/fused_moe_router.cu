@@ -9,17 +9,26 @@
 //   wave 0 : biased-sigmoid top-k -> topk_ids/topk_weights
 //   all    : MXFP4 quant of hidden[t] -> out[t], group e8m0 -> tok_scale[t]
 // ---- grid barrier (the only one) ----
-// Phase 2 : reload topk into LDS, histogram + scan -> per-expert base offsets
+// Phase 2 : reload topk into LDS, histogram + scan -> per-expert base offsets.
+//           Redundant in every block on purpose: a few hundred LDS elements is
+//           cheaper than a second grid barrier.
 // Phase 3 : each block takes a unit-aligned slice of the sorted output and per
 //           expert ballot-ranks its routed ids -> sorted_ids/weights/expert_ids,
 //           pads rows, scatters the token's e8m0 scales into swizzled layout.
-//
-// Phase 2 runs redundantly in every block on purpose: a few hundred LDS
-// elements is cheaper than a second grid barrier.
 
+// Torch-free TU: AITER_NO_TORCH_TYPES must precede any aiter header so the opus
+// includes do not pull in the c10 half/bfloat16 types.
+#define AITER_NO_TORCH_TYPES
+#include <algorithm>
 #include <climits>
+#include <cstdlib>
+#include <type_traits>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include "aiter_hip_common.h"
+#include "aiter_stream.h"
+#include "aiter_tensor.h"
+#include "fused_moe_router.h"
 #include "opus/opus.hpp"
 #include "warp_sort.h" // aiter::mov_dpp_
 #include "quant_kernels.cu" // device helpers: scaled_quant_vgpr_impl, load_vector_nbytes,
@@ -31,8 +40,8 @@ namespace fmr {
 static constexpr int kWaveSize = 64;
 
 // Scales per thread in the phase-3 scatter, and the alignment the scale row
-// must satisfy: mx_scale_shuffle_idx's y terms are periodic in this, so it is
-// the smallest span over which the scatter's OFF[] table is complete.
+// must satisfy: mx_scale_shuffle_idx's y terms are periodic in this, the
+// smallest span over which the scatter's OFF[] table is complete.
 static constexpr int kScalesPerThread = 8;
 
 // Token count at and above which the split launch beats the grid barrier.
@@ -42,8 +51,7 @@ static constexpr int kSplitMinTokens = 104;
 //
 // Sense-flip (as in CUDA cooperative groups): block 0 contributes
 // 0x80000000-(N-1), every other block 1, so the counter's high bit flips
-// exactly when all N blocks arrive and the counter walks 0 -> 2^31 -> 0 on its
-// own. No reset needed, so the host never memsets the semaphore.
+// exactly when all N blocks arrive and walks 0 -> 2^31 -> 0 on its own.
 //
 // The release on arrive and the acquire after the spin are the data fence, so
 // no __threadfence(); __syncthreads() on both sides extends it to the block.
@@ -67,8 +75,8 @@ __device__ __forceinline__ void grid_wait(unsigned int* sem, const unsigned int*
         const unsigned int old = *s_old;
         // s_sleep between polls: unthrottled loads from every block on this one
         // cacheline starve the atomics that would end the barrier. Relaxed spin
-        // plus one acquire fence after -- an acquire *load* would emit a
-        // buffer_inv sc1 every poll, which dominates the barrier cost.
+        // plus one acquire fence after -- an acquire *load* emits a buffer_inv
+        // sc1 every poll, which dominates the barrier cost.
         while(((old ^ __hip_atomic_load(sem, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) &
                0x80000000u) == 0u)
         {
@@ -99,26 +107,25 @@ __device__ __forceinline__ float bf16f(const T& x)
 // Max experts per lane, covering E <= 512 (the entry's limit).
 static constexpr int kEptMax = 8;
 
-// Expert-id slots the routing map spans: the routed experts, the fused shared
-// experts (replicated, so every rank holds all of them), and -- under EP only --
-// one trailing sentinel that ranks not owning a token park its shared row on.
-// Host and device both call this so the histogram width cannot drift.
+// Expert-id slots the routing map spans: routed experts, fused shared experts
+// (replicated on every rank), and -- under EP only -- one trailing sentinel for
+// shared rows this rank does not own. Host and device share it so the histogram
+// width cannot drift.
 __host__ __device__ constexpr int expert_slots(int E, int n_shared, bool ep)
 {
     return E + n_shared + ((ep && n_shared > 0) ? 1 : 0);
 }
 
 // Single source of truth for the LDS layout: the kernel carves its pointers out
-// of the dynamic allocation and the host asks this for the byte count, so the
-// two cannot drift. Every slot is 4 bytes, offsets in elements.
+// of the dynamic allocation and the host asks this for the byte count. Every
+// slot is 4 bytes, offsets in elements.
 struct LdsLayout
 {
     int    s_weight, s_cnt, s_scan, s_buf, s_unit, s_lid;
     size_t bytes;
 
-    // E_tot: expert_slots(...). ep: an expert_mask was supplied. s_lid is
-    // allocated only then, so the non-EP footprint (and its occupancy) is
-    // untouched.
+    // ep: an expert_mask was supplied. s_lid is allocated only then, so the
+    // non-EP footprint (and its occupancy) is untouched.
     __host__ __device__ constexpr LdsLayout(int BlockSize, int total_routed_rows, int E_tot,
                                             bool ep)
         : s_weight(total_routed_rows) // s_expert is at 0
@@ -187,7 +194,7 @@ __device__ __forceinline__ uint64_t readlane_u64(uint64_t v, int l)
     return (static_cast<uint64_t>(hi) << 32) | lo;
 }
 
-// Full 64-lane argmax, no LDS: six DPP permutes plus one readlane pair.
+// Full 64-lane argmax: six DPP permutes plus one readlane pair.
 //
 // ROW_BCAST15/31 are CDNA-only (dropped on RDNA3+) and give the 16->32->64 fold
 // in the VALU. Folding the row winners with readlane instead costs 2 wait
@@ -208,11 +215,10 @@ __device__ __forceinline__ uint64_t wave_argmax(uint64_t k)
 
 // O(topk*E) wave argmax: lane l holds experts l, l+64, ..
 //
-// Split into _load and _select on purpose. The gating/bias loads dominate phase
-// 1 and only wave 0 issues them. The caller runs _load, the
+// Split into _load and _select on purpose: the caller runs _load, the
 // whole-block quant, then _select, so the s_waitcnt sinks into _select and the
-// latency hides behind the quant. So _load must issue the loads and nothing
-// that consumes them -- the sigmoid lives in _select.
+// load latency hides behind the quant. _load must therefore issue the loads and
+// nothing that consumes them -- the sigmoid lives in _select.
 template <int EPT, typename DTYPE_I, typename DTYPE_B>
 __device__ __forceinline__ void phase1_topk_load(const DTYPE_I* __restrict__ gating_row,
                                                  const DTYPE_B* __restrict__ bias, int E,
@@ -317,12 +323,11 @@ __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ g
         const int s = lane_id - topk;
         if(s >= 0 && s < NSHARED)
         {
-            // The shared weights are replicated on every rank and every rank
-            // sees every token, so emitting the shared row unconditionally
-            // would make the post-MoE all-reduce sum ep_size copies of it.
-            // Round-robin token ownership instead; non-owners park the row on
-            // the always-masked sentinel slot, which contributes nothing.
-            // ep_size == 1 makes every rank the owner, i.e. the non-EP case.
+            // Shared weights are replicated and every rank sees every token, so
+            // emitting the row unconditionally would make the post-MoE
+            // all-reduce sum ep_size copies. Round-robin ownership instead;
+            // non-owners park on the always-masked sentinel slot. ep_size == 1
+            // makes every rank the owner, i.e. the non-EP case.
             const bool owner = (token % ep_size) == ep_rank;
             topk_ids[token * topk_total + lane_id] = owner ? (E + s) : (E + NSHARED);
             topk_weights[token * topk_total + lane_id] = shared_w;
@@ -376,8 +381,8 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
 // One token of phase 1: load, quant, select (see phase1_topk_load for why that
 // order). Not templated on EPT even though the halves are -- that would inline
 // three copies of the quant -- so g[]/b[] are sized to kEptMax and the dispatch
-// is pushed down. Both halves need the same tier ladder, and a
-// tier added to one and not the other corrupts registers silently.
+// is pushed down. Both halves must share the tier ladder: a tier added to one
+// and not the other corrupts registers silently.
 #define FMR_EPT_DISPATCH(CALL)      \
     do                              \
     {                               \
@@ -425,7 +430,7 @@ phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
 }
 #undef FMR_EPT_DISPATCH
 
-// Inclusive add-scan over a wave's 64 lanes, DPP only -- no LDS, no barrier.
+// Inclusive add-scan over a wave's 64 lanes, DPP only.
 // ROW_SR{1,2,4,8} scans each row of 16 (bound_ctrl=1 shifts in 0, the add
 // identity); the three row totals are then readlane-broadcast and folded in.
 __device__ __forceinline__ int wave_scan_incl(int v, int lane_id)
@@ -494,9 +499,8 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          opus::fp4_t* __restrict__ out,        // [M, cols/2]
                          uint8_t* __restrict__ out_scale,      // swizzled e8m0
                          uint8_t* __restrict__ tok_scale,      // [M, scaleN_pad] scratch
-                         // stage2 accumulates into moe_buf atomically, so it must start
-                         // zeroed; doing it here saves a separate fill launch. Never read
-                         // here, so it needs no ordering. nullptr = already zeroed.
+                         // Zeroed here rather than in a separate fill launch;
+                         // never read here, so it needs no ordering.
                          DTYPE_I* __restrict__ moe_buf,        // [M, model_dim] or nullptr
                          int moe_buf_elems,                    // M * model_dim
                          unsigned int* __restrict__ sem,       // [1] persistent
@@ -506,9 +510,8 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          int max_blocks, // length of sorted_expert_ids
                          int max_tokens, // length of sorted_ids
                          bool need_renorm, float rsf,
-                         // Fused shared experts (NSHARED > 0): the weight every
-                         // token gives each shared expert, and this rank's slot
-                         // in the round-robin that keeps them un-duplicated.
+                         // NSHARED > 0: per-token shared weight, plus this
+                         // rank's slot in the de-duplicating round-robin.
                          float shared_w, int ep_rank, int ep_size)
 {
     extern __shared__ char smem_raw[];
@@ -550,8 +553,8 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     const int umask = ~(unit_size - 1);
 
     // moe_buf clear: grid-stride, 16B stores, issued before phase 1 so the
-    // writes drain while phase 1 stalls on its loads. The PART guard stops the
-    // split path from clearing twice.
+    // writes drain while it stalls on its loads. The PART guard stops the split
+    // path from clearing twice.
     if constexpr(PART != kPhase23)
     if(moe_buf != nullptr)
     {
@@ -626,13 +629,11 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     // the Hillis-Steele form.
     int* s_wtot = s_buf;            // s_buf is not live until phase 3
     int* s_mtot = s_buf + NWAVE;    // EP mask-scan wave totals
-    // Under EP this rank owns only the masked-in experts and the GEMM indexes
-    // sorted_expert_ids by *local* id, so phase 2 must additionally give
-    // masked-out experts zero units and emit local(e) = exclusive cumsum of the
-    // mask (matching moe_align_block_size_kernel_ex in moe_sorting_opus.h). The
-    // mask cumsum is a second DPP scan riding the same data path and the same
-    // __syncthreads, so it adds no barrier -- what matters, since phase 2 is
-    // latency-bound.
+    // Under EP the GEMM indexes sorted_expert_ids by *local* id, so phase 2
+    // must give masked-out experts zero units and emit local(e) = exclusive
+    // cumsum of the mask (matching moe_align_block_size_kernel_ex in
+    // moe_sorting_opus.h). That cumsum rides the same data path and the same
+    // __syncthreads, so it adds no barrier.
     const int owned0 = (2 * tid < E_tot) ? (ep ? (expert_mask[2 * tid] != 0) : 1) : 0;
     const int owned1 = (2 * tid + 1 < E_tot) ? (ep ? (expert_mask[2 * tid + 1] != 0) : 1) : 0;
     // Unit counts, not padded row counts: the unit table below needs them.
@@ -642,8 +643,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     const int rows1     = units1 * unit_size;
     const int pair_rows = rows0 + rows1;
     const int rows_incl = wave_scan_incl(pair_rows, lane_id);
-    // Mask cumsum, only when EP is on -- `ep` is grid-uniform, so the branch is
-    // free and the non-EP path keeps exactly its old instruction count.
+    // Mask cumsum, EP only; `ep` is grid-uniform so the branch is free.
     const int pair_owned = ep ? (owned0 + owned1) : 0;
     const int owned_incl = ep ? wave_scan_incl(pair_owned, lane_id) : 0;
     if(lane_id == kWaveSize - 1)
@@ -731,10 +731,8 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     // token index for every block before it checks num_valid_ids, so the region
     // past num_valid must be initialized: left alone it holds whatever shared
     // the allocator pool, which under vLLM's graph capture is another graph's
-    // activations reinterpreted as int32, indexing far out of bounds. Zero is a
-    // valid expert id and pack_id(M, topk_total) is the "no token" sentinel the stock
-    // path also writes. Grid-strided, and cannot race phase 3, which only
-    // writes below num_valid.
+    // activations reinterpreted as int32, indexing far out of bounds.
+    // Grid-strided, and cannot race phase 3, which only writes below num_valid.
     const int global_tid    = (int)blockIdx.x * BlockSize + tid;
     const int global_stride = (int)gridDim.x * BlockSize;
 
@@ -749,13 +747,10 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     }
 
     // Phase 3: sorted map + scale scatter, barrier-free, partitioned by
-    // position in the sorted output rather than by expert.
-    //
-    // Partitioning by expert cannot scale: the routing is sparse, so it caps at
-    // one wave per non-empty expert however wide the grid. And an output
-    // partition needs no grid barrier despite appearances -- every block has
-    // already rebuilt the whole map, so it derives its own slice's tokens
-    // locally.
+    // position in the sorted output rather than by expert. Partitioning by
+    // expert caps at one wave per non-empty expert however wide the grid; an
+    // output partition needs no barrier because every block already rebuilt the
+    // whole map.
     //
     // Ceil in UNITS, not rows, so slices never split an expert's
     // sorted_expert_ids block: rounding a truncated row quotient up to a unit
@@ -821,7 +816,6 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                 const int row         = row_begin + slice_row;
                 const int scale_begin = (idx - slice_row * chunk) * thread_data;
                 const int expert_row  = row - base;
-                // pad rows -> zeros
                 const int token = (expert_row < cnt) ? (s_buf[expert_row] / topk_total) : M;
                 const uint8_t* src =
                     (token < M) ? (tok_scale + (int64_t)token * scaleN_pad + scale_begin)
@@ -847,4 +841,315 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
 }
 
 } // namespace fmr
+} // namespace aiter
+
+namespace aiter {
+namespace {
+// Workspace layout, owned by the caller (see get_fused_moe_router_workspace):
+//   [0, kTokScaleOffset)  barrier semaphore, one u32
+//   [kTokScaleOffset, .)  tok_scale, tokens rows of kMaxScaleNPad bytes
+// The semaphore is self-resetting, so the caller zeroes it once at allocation
+// and no launch ever memsets it.
+//
+// Rows are sized to the scaleN_pad bound (pad8(cols / group_size) <= 256)
+// rather than the call's own, so a quant-config change cannot resize the
+// workspace.
+constexpr int kMaxScaleNPad   = 256;
+constexpr int kTokScaleOffset = 256; // keeps tok_scale 256B-aligned
+
+// Typed view of an out-param. aiter_tensor_t::data_ptr() is untyped, so unlike
+// torch's data_ptr<T>() nothing here would catch a wrong dtype on its own.
+template <typename T>
+T* typed_ptr(const aiter_tensor_t& t, AiterDtype expected, const char* name)
+{
+    AITER_CHECK(t.dtype() == expected,
+                "fused_moe_router_impl: ",
+                name,
+                " must be ",
+                AiterDtype_to_str(expected),
+                ", got ",
+                AiterDtype_to_str(t.dtype()));
+    return reinterpret_cast<T*>(t.data_ptr());
+}
+} // namespace
+
+int64_t fused_moe_router_workspace_size(int64_t max_tokens)
+{
+    // pybind path: make AITER_CHECK throw (-> Python RuntimeError) instead of
+    // abort(). g_aiter_can_throw is otherwise only set by the ctypes wrapper.
+    aiter_detail::g_aiter_can_throw = true;
+    AITER_CHECK(max_tokens > 0,
+                "fused_moe_router_workspace_size: max_tokens must be positive, got ",
+                max_tokens);
+    return kTokScaleOffset + max_tokens * (int64_t)kMaxScaleNPad;
+}
+
+void fused_moe_router_impl(aiter_tensor_t& gating,
+                           aiter_tensor_t& bias,
+                           aiter_tensor_t& hidden,
+                           aiter_tensor_t& topk_ids,
+                           aiter_tensor_t& topk_weights,
+                           aiter_tensor_t& sorted_ids,
+                           aiter_tensor_t& sorted_weights,
+                           aiter_tensor_t& sorted_expert_ids,
+                           aiter_tensor_t& num_valid_ids,
+                           aiter_tensor_t& out_fp4,
+                           aiter_tensor_t& out_scale,
+                           int64_t num_experts,
+                           int64_t topk,
+                           int64_t unit_size,
+                           int64_t group_size,
+                           bool need_renorm,
+                           double routed_scaling_factor,
+                           aiter_tensor_t& workspace,
+                           std::optional<aiter_tensor_t> expert_mask,
+                           std::optional<aiter_tensor_t> moe_buf,
+                           int64_t num_fused_shared_experts,
+                           double shared_expert_weight,
+                           int64_t ep_rank,
+                           int64_t ep_size)
+{
+    // See fused_moe_router_workspace_size.
+    aiter_detail::g_aiter_can_throw = true;
+    using namespace aiter::fmr;
+    opus::bf16_t* moe_buf_ptr   = nullptr;
+    int           moe_buf_elems = 0;
+    if(moe_buf.has_value() && moe_buf->numel() > 0)
+    {
+        AITER_CHECK(moe_buf->is_contiguous(),
+                    "fused_moe_router_impl: moe_buf must be contiguous");
+        moe_buf_ptr   = typed_ptr<opus::bf16_t>(*moe_buf, AITER_DTYPE_bf16, "moe_buf");
+        moe_buf_elems = (int)moe_buf->numel();
+    }
+    const int M    = gating.size(0);
+    const int E    = num_experts;
+    const int cols = hidden.size(1);
+    constexpr int BlockSize = 256;
+    constexpr int TD        = 16; // cols / TD must equal BlockSize
+    // Every model that fuses shared experts today has exactly one; a wider
+    // ladder is dead template instantiations.
+    constexpr int kMaxShared = 1;
+    const int     n_shared   = (int)num_fused_shared_experts;
+    AITER_CHECK(n_shared >= 0 && n_shared <= kMaxShared,
+                "fused_moe_router_impl: num_fused_shared_experts must be in 0..",
+                kMaxShared, ", got ", n_shared);
+    AITER_CHECK(ep_size >= 1 && ep_rank >= 0 && ep_rank < ep_size,
+                "fused_moe_router_impl: need 0 <= ep_rank < ep_size, got ep_rank=",
+                ep_rank, " ep_size=", ep_size);
+    AITER_CHECK(cols == BlockSize * TD, "fused_moe_router_impl: cols must be ", BlockSize * TD);
+    const bool ep    = expert_mask.has_value();
+    const int  E_tot = expert_slots(E, n_shared, ep);
+    // Without a mask there is no slot to park the non-owner shared row on, so
+    // the histogram would take an out-of-range atomicAdd.
+    AITER_CHECK(n_shared == 0 || ep || ep_size == 1,
+                "fused_moe_router_impl: ep_size=", ep_size,
+                " needs an expert_mask (the shared sentinel slot lives in it)");
+    // Routed experts only: the pair scan reaches 2*BlockSize slots, and the
+    // fused shared tail past that is filled serially rather than scanned.
+    AITER_CHECK(E <= 2 * BlockSize,
+                "fused_moe_router_impl: num_experts must be <= ", 2 * BlockSize,
+                ", got ", E);
+    // A partial group would make the abs-max reduction span the wrong lanes.
+    AITER_CHECK(group_size % TD == 0,
+                "fused_moe_router_impl: group_size must be a multiple of ", TD,
+                ", got ", group_size);
+    // Phase 3's hoisted swizzle table is only complete on an aligned column
+    // span; a partial span leaves trailing scale columns holding stale
+    // allocator memory read back as e8m0 exponents. Implied by
+    // cols == BlockSize * TD, checked so the coupling cannot be lost silently.
+    AITER_CHECK((cols + group_size - 1) / group_size % kScalesPerThread == 0,
+                "fused_moe_router_impl: scales per row (ceil(cols/group_size)) must be a "
+                "multiple of ", kScalesPerThread, ", got ",
+                (cols + group_size - 1) / group_size, " for cols=", cols,
+                " group_size=", group_size);
+    AITER_CHECK(unit_size > 0 && (unit_size & (unit_size - 1)) == 0,
+                "fused_moe_router_impl: unit_size must be a power of two, got ", unit_size);
+    const int topk_total = (int)topk + n_shared;
+    AITER_CHECK(topk > 0 && topk_total <= 64,
+                "fused_moe_router_impl: topk + fused shared experts must be in "
+                "1..64 (phase 1 selects within one wave), got ", topk_total);
+    // Rounds past E elect a sentinel lane (expert == INT_MAX), which the weight
+    // recompute would then use to index the gating row.
+    AITER_CHECK(topk <= E,
+                "fused_moe_router_impl: topk must be <= num_experts, got topk=", topk,
+                " num_experts=", E);
+    AITER_CHECK(workspace.dtype() == AITER_DTYPE_u8 && workspace.is_contiguous(),
+                "fused_moe_router_impl: workspace must be contiguous uint8");
+    AITER_CHECK(workspace.device_id == gating.device_id,
+                "fused_moe_router_impl: workspace is on device ", workspace.device_id,
+                " but the inputs are on ", gating.device_id);
+    AITER_CHECK((int64_t)workspace.numel() >= fused_moe_router_workspace_size(M),
+                "fused_moe_router_impl: workspace has ", workspace.numel(),
+                " B, need ", fused_moe_router_workspace_size(M), " B for num_tokens=", M,
+                "; size it with fused_moe_router_workspace_size");
+
+    // Indexed by global expert id, matching vLLM's global_num_experts + shared
+    // + 1 layout (expert_map_manager.py): sentinel zero, shared slots owned.
+    // Local ids still match the stock path since local(e) is an *exclusive*
+    // prefix.
+    const int* mask_ptr = nullptr;
+    if(ep)
+    {
+        AITER_CHECK((int64_t)expert_mask->numel() >= E_tot,
+                    "fused_moe_router_impl: expert_mask must have at least ", E_tot,
+                    " entries (num_experts + fused shared + sentinel), got ",
+                    expert_mask->numel());
+        AITER_CHECK(expert_mask->is_contiguous(),
+                    "fused_moe_router_impl: expert_mask must be contiguous");
+        AITER_CHECK(expert_mask->device_id == gating.device_id,
+                    "fused_moe_router_impl: expert_mask is on device ",
+                    expert_mask->device_id, " but the inputs are on ",
+                    gating.device_id);
+        mask_ptr = typed_ptr<const int>(*expert_mask, AITER_DTYPE_i32, "expert_mask");
+    }
+
+    // Stream and device props must come from the tensors' device, not the
+    // ambient one.
+    const HipDeviceGuard device_guard(gating.device_id);
+    const hipStream_t stream = getCurrentHIPStream();
+
+    // Grid width multiplies barrier cost; size it to the work and keep it under
+    // num_cu so every block stays resident. Phase 3's rows do not shrink with
+    // M, hence the floor.
+    int GRID = std::max(M, 16);
+    GRID     = std::max(1, std::min(GRID, (int)get_num_cu_func()));
+
+    const int max_blocks = (int)sorted_expert_ids.numel();
+    const int max_tokens = (int)sorted_ids.numel();
+
+    const size_t shmem =
+        LdsLayout(BlockSize, M * topk_total, E_tot, mask_ptr != nullptr).bytes;
+
+    // LDS grows as ~16 * M * topk; without this the launch fails with an opaque
+    // hipErrorInvalidValue.
+    const size_t lds_per_block = get_lds_per_block_func();
+    AITER_CHECK(shmem <= lds_per_block,
+                "fused_moe_router_impl: shared memory request ", shmem,
+                " B exceeds the per-block limit of ", lds_per_block,
+                " B (num_tokens=", M, ", topk=", topk, ", num_experts=", E,
+                "); reduce the token count");
+
+    auto* ws_base      = reinterpret_cast<uint8_t*>(workspace.data_ptr());
+    auto* ws_sem       = reinterpret_cast<unsigned int*>(ws_base);
+    auto* ws_tok_scale = ws_base + kTokScaleOffset;
+
+    // The kernel indexes with computed strides, so a non-contiguous tensor
+    // reads the wrong elements rather than failing.
+    for(const auto& p : {std::make_pair(&gating, "gating"),
+                         std::make_pair(&hidden, "hidden"),
+                         std::make_pair(&out_fp4, "out_fp4"),
+                         std::make_pair(&out_scale, "out_scale"),
+                         std::make_pair(&bias, "bias"),
+                         std::make_pair(&topk_ids, "topk_ids"),
+                         std::make_pair(&topk_weights, "topk_weights"),
+                         std::make_pair(&sorted_ids, "sorted_ids"),
+                         std::make_pair(&sorted_weights, "sorted_weights"),
+                         std::make_pair(&sorted_expert_ids, "sorted_expert_ids"),
+                         std::make_pair(&num_valid_ids, "num_valid_ids")})
+        AITER_CHECK(p.first->is_contiguous(),
+                    "fused_moe_router_impl: ", p.second, " must be contiguous");
+    // The shared rows extend each token's stride, and the kernel indexes these
+    // with the widened stride; a caller that sized them [M, topk] would have
+    // every token past the first write out of bounds.
+    for(const auto& p : {std::make_pair(&topk_ids, "topk_ids"),
+                         std::make_pair(&topk_weights, "topk_weights")})
+        AITER_CHECK((int64_t)p.first->numel() >= (int64_t)M * topk_total,
+                    "fused_moe_router_impl: ", p.second, " has ", p.first->numel(),
+                    " elements, need M * (topk + fused shared) = ",
+                    (int64_t)M * topk_total);
+
+    const opus::bf16_t* g = typed_ptr<const opus::bf16_t>(gating, AITER_DTYPE_bf16, "gating");
+    const opus::bf16_t* h = typed_ptr<const opus::bf16_t>(hidden, AITER_DTYPE_bf16, "hidden");
+    auto* w_out  = typed_ptr<float>(topk_weights, AITER_DTYPE_fp32, "topk_weights");
+    auto* id_out = typed_ptr<int>(topk_ids, AITER_DTYPE_i32, "topk_ids");
+    auto* s_ids  = typed_ptr<int>(sorted_ids, AITER_DTYPE_i32, "sorted_ids");
+    auto* s_w    = typed_ptr<float>(sorted_weights, AITER_DTYPE_fp32, "sorted_weights");
+    auto* s_eids = typed_ptr<int>(sorted_expert_ids, AITER_DTYPE_i32, "sorted_expert_ids");
+    auto* n_vids = typed_ptr<int>(num_valid_ids, AITER_DTYPE_i32, "num_valid_ids");
+    auto* o_fp4  = reinterpret_cast<opus::fp4_t*>(out_fp4.data_ptr());
+    auto* o_scl  = reinterpret_cast<uint8_t*>(out_scale.data_ptr());
+
+    // Unlike the stock biased_grouped_topk wrapper this path does not coerce
+    // the bias; it dispatches on the real dtype instead, which is cheap since
+    // the bias is only read in phase 1's top-k.
+    AITER_CHECK(bias.dtype() == AITER_DTYPE_fp32 || bias.dtype() == AITER_DTYPE_bf16,
+                "fused_moe_router_impl: correction bias must be float32 or "
+                "bfloat16, got ", AiterDtype_to_str(bias.dtype()));
+    const bool bias_is_f32 = bias.dtype() == AITER_DTYPE_fp32;
+
+    // One body, instantiated per (bias dtype, shared-expert count).
+    auto launch_all = [&](auto bias_tag, auto nshared_tag) {
+        using DB                = decltype(bias_tag);
+        constexpr int NSHARED   = decltype(nshared_tag)::value;
+        const DB* b = reinterpret_cast<const DB*>(bias.data_ptr());
+        auto* kern  = fused_moe_routing_kernel<
+            BlockSize, TD, opus::bf16_t, kFused, DB, NSHARED>;
+        (void)hipFuncSetAttribute(reinterpret_cast<const void*>(kern),
+                                  hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
+        // The grid barrier deadlocks unless every block is co-resident.
+        int max_blocks_per_cu = 0;
+        (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_cu, reinterpret_cast<const void*>(kern), BlockSize, shmem);
+        AITER_CHECK(max_blocks_per_cu >= 1,
+                    "fused_moe_router_impl: kernel not resident (shmem=", shmem, ")");
+        // Above the crossover, run the halves as separate launches: a kernel
+        // boundary needs no co-residency, so each half gets a grid sized to its
+        // own parallelism.
+        //
+        // AITER_MOE_ROUTING_SPLIT overrides the threshold, not the decision.
+        // Read per call: the tests flip it between launches in one process.
+        int split_min = kSplitMinTokens;
+        if(const char* ev = std::getenv("AITER_MOE_ROUTING_SPLIT"); ev && *ev)
+        {
+            char*      end = nullptr;
+            const long v   = std::strtol(ev, &end, 10);
+            AITER_CHECK(end != ev && *end == '\0' && v >= 0 && v <= INT_MAX,
+                        "AITER_MOE_ROUTING_SPLIT must be a non-negative token "
+                        "count, got '", ev, "'");
+            split_min = (int)v;
+        }
+#define FMR_ARGS                                                                      \
+    g, b, h, w_out, id_out, s_ids, s_w, s_eids, n_vids, o_fp4, o_scl, ws_tok_scale,   \
+        moe_buf_ptr, moe_buf_elems, ws_sem, mask_ptr, M, E, topk, unit_size,          \
+        group_size, cols, max_blocks, max_tokens, need_renorm,                        \
+        (float)routed_scaling_factor, (float)shared_expert_weight, (int)ep_rank,      \
+        (int)ep_size
+        if(M >= split_min)
+        {
+            auto* k1  = fused_moe_routing_kernel<
+                BlockSize, TD, opus::bf16_t, kPhase1, DB, NSHARED>;
+            auto* k23 = fused_moe_routing_kernel<
+                BlockSize, TD, opus::bf16_t, kPhase23, DB, NSHARED>;
+            (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k1),
+                                      hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
+            (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k23),
+                                      hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
+            const int G1 = std::max(1, std::min(M, (int)get_num_cu_func()));
+            k1<<<G1, BlockSize, shmem, stream>>>(FMR_ARGS);
+            k23<<<GRID, BlockSize, shmem, stream>>>(FMR_ARGS);
+            return; // returns from the lambda, not fused_moe_router_impl
+        }
+        // Only the fused path grid-barriers, so only it needs co-residency.
+        AITER_CHECK(GRID <= max_blocks_per_cu * (int)get_num_cu_func(),
+                    "fused_moe_router_impl: GRID ", GRID, " exceeds co-resident capacity");
+        kern<<<GRID, BlockSize, shmem, stream>>>(FMR_ARGS);
+#undef FMR_ARGS
+    };
+
+    // NSHARED == 0 must reach the same instantiation as before this feature
+    // existed, so the shared-expert lanes fold out entirely and the no-shared
+    // config keeps its register count.
+    auto dispatch_shared = [&](auto bias_tag) {
+        if(n_shared == 0)
+            launch_all(bias_tag, std::integral_constant<int, 0>{});
+        else
+            launch_all(bias_tag, std::integral_constant<int, 1>{});
+    };
+
+    if(bias_is_f32)
+        dispatch_shared(float{});
+    else
+        dispatch_shared(opus::bf16_t{});
+}
+
 } // namespace aiter
