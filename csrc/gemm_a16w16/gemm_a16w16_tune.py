@@ -60,25 +60,6 @@ except ImportError as exc:
     FLYDSL_TUNE_ERROR = str(exc)
 
 
-def _try_vllm_wvsplitk():
-    """Resolve wvSplitK only when the experimental tuner flag is on."""
-    try:
-        from vllm._custom_ops import wvSplitK as wrapper
-    except Exception:  # noqa: BLE001
-        wrapper = None
-    if callable(wrapper):
-        return lambda weight, activation, bias, cu_count: wrapper(
-            weight, activation, cu_count, bias
-        )
-    try:
-        op = torch.ops._rocm_C.wvSplitK
-    except Exception:  # noqa: BLE001
-        return None
-    return lambda weight, activation, bias, cu_count: op(
-        weight, activation, bias, cu_count
-    )
-
-
 OPUS_TUNE_ERROR = None
 try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../opus_gemm")
@@ -132,8 +113,6 @@ except Exception as _hipb_exc:  # noqa: BLE001
     HipblasltGemm = None
     HIPBLASLT_TUNE_ERROR = str(_hipb_exc)
 
-
-_VLLM_WVSPLITK_OP = None
 
 # ---------------------------------------------------------------------------
 # Tolerance helpers
@@ -360,13 +339,6 @@ def run_flydsl_gemm_bf16(
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
-
-
-def run_vllm_wvsplitk_bf16(input, weight, bias=None, otype=dtypes.bf16):
-    del otype
-    if _VLLM_WVSPLITK_OP is None:
-        raise RuntimeError("vLLM wvSplitK was not resolved")
-    return _VLLM_WVSPLITK_OP(weight, input, bias, get_cu_num())
 
 
 def run_flydsl_decode_bf16(input, weight, output, bias, otype, arch, config):
@@ -605,8 +577,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default=["all"],
             required=False,
             help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, "
-            "flydsl_decode, torch, skinny, opus. "
-            "hipblaslt requires --with-hipblaslt; vLLM wvSplitK is a separate flag.",
+            "flydsl_decode, torch, skinny, opus. ",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
@@ -622,13 +593,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default="bounded",
             help="Decode candidate breadth. 'bounded' keeps a small default set; "
             "'deep' times the full decode registry.",
-        )
-        self.parser.add_argument(
-            "--with-vllm-wvsplitk",
-            action="store_true",
-            default=False,
-            dest="with_vllm_wvsplitk",
-            help="Optionally time vLLM wvSplitK. Comparison-only; never promoted.",
         )
 
     def _clear_op_caches(self):
@@ -1027,41 +991,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
         )
         return tasks
 
-    def _get_vllm_wvsplitk_tasks(
-        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
-    ):
-        M, N, K = map(int, info_keys[2:5])
-        if (
-            _VLLM_WVSPLITK_OP is None
-            or scaleAB
-            or is_shuffle
-            or indtype != dtypes.bf16
-            or outdtype != dtypes.bf16
-            or not 1 <= M <= 5
-        ):
-            return []
-        info = (info_keys, 0, 0, "vllm_wvsplitk", "vllm_wvsplitk", False)
-        return [
-            (
-                info,
-                generate_data,
-                (M, N, K, indtype, outdtype, False, False, 0, has_bias),
-                run_vllm_wvsplitk_bf16,
-                (["inp", "weights", "bias"], outdtype),
-                dict(run_kwargs),
-                get_gemm_ref,
-                (
-                    ["inp", "weights", "bias", "x_scale", "w_scale"],
-                    indtype,
-                    outdtype,
-                ),
-                {},
-                None,
-                0.01,
-                0.125,
-            )
-        ]
-
     def _get_skinny_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
@@ -1202,12 +1131,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
     # -------------------------------------------------------------------
 
     def tune(self, untunedf, tunedf, args):
-        global _VLLM_WVSPLITK_OP
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
-        with_vllm_wvsplitk = getattr(args, "with_vllm_wvsplitk", False)
         self.candidate_policy = getattr(args, "candidate_policy", "bounded")
-        _VLLM_WVSPLITK_OP = _try_vllm_wvsplitk() if with_vllm_wvsplitk else None
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         # Time every provider on the shared profiler path, which reports
@@ -1262,8 +1188,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_flydsl_tasks(*common))
             if "all" in libtype or "flydsl_decode" in libtype:
                 task.extend(self._get_flydsl_decode_tasks(*common))
-            if with_vllm_wvsplitk:
-                task.extend(self._get_vllm_wvsplitk_tasks(*common))
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
             if "all" in libtype or "torch" in libtype:
@@ -1304,7 +1228,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         # Comparison-only vLLM rows must not win the tuned CSV.
-        rets = [result for result in rets if result[0][4] != "vllm_wvsplitk"]
         return super().post_process(rets, args, topk, fast_mode)
 
     def result_to_df(self, results):
