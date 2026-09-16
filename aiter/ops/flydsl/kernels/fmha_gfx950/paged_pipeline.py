@@ -846,13 +846,13 @@ class DualwaveFp8KernelContext:
         num_kv_tiles = (self.seqlen_kv_v + kv_tile_size - 1) // kv_tile_size
         self.num_kv_tiles = num_kv_tiles
         if const_expr(traits.CAUSAL):
-            causal_end_raw_i32 = (
-                fx.Int32(self.q_start + traits.BLOCK_M) + self.delta_i32
+            # The padded Q block can extend past INT32_MAX even when both
+            # sequence lengths fit int32. Clamp before narrowing the bound.
+            causal_end_raw = (
+                fx.Int64(self.q_start) + traits.BLOCK_M + fx.Int64(self.delta_i32)
             )
             causal_end_i32 = fx.Int32(
-                (causal_end_raw_i32 > fx.Int32(0)).select(
-                    causal_end_raw_i32, fx.Int32(0)
-                )
+                fx.min(fx.max(causal_end_raw, fx.Int64(0)), fx.Int64((1 << 31) - 1))
             )
             causal_num_tiles = (
                 fx.Index(causal_end_i32) + kv_tile_size - 1
@@ -861,7 +861,7 @@ class DualwaveFp8KernelContext:
                 (causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles)
             )
         else:
-            causal_end_raw_i32 = None
+            causal_end_raw = None
             max_num_tiles = num_kv_tiles
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
         max_num_tiles = ((max_num_tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
@@ -900,7 +900,7 @@ class DualwaveFp8KernelContext:
             if const_expr(traits.VARLEN):
                 active = self.q_start < self.seqlen_q_v
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
-                in_mask = causal_end_raw_i32 > fx.Int32(0)
+                in_mask = causal_end_raw > fx.Int64(0)
                 active = in_mask if active is None else (active & in_mask)
             split_t_end = fx.Index(active.select(split_t_end, split_t0))
 

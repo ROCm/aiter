@@ -76,7 +76,9 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         @flyc.jit
         def _run(v_s, tile_idx=tile_idx, kv_end_pos=kv_end_pos):
             s_lo, s_hi = v_s
-            if self.ctx_ref.q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos):
+            if self.ctx_ref.q_start_pos_i32 + self.delta_i32 <= fx.Int32(
+                kv_end_pos - 1
+            ):
                 lo_list, hi_list = self.v_s_vec_to_lists(v_s)
                 self._causal_mask_inplace((lo_list, hi_list), tile_idx)
                 s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
@@ -105,7 +107,10 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         def _run(v_s_a, v_s_b, tile_a=tile_a, kv_end_pos=kv_end_pos):
             a_lo, a_hi = v_s_a
             b_lo, b_hi = v_s_b
-            if self.ctx_ref.q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos):
+            # The inclusive last key fits int32 even when the exclusive end is 2**31.
+            if self.ctx_ref.q_start_pos_i32 + self.delta_i32 <= fx.Int32(
+                kv_end_pos - 1
+            ):
                 a_l, a_h = self.v_s_vec_to_lists(v_s_a)
                 self._causal_mask_inplace((a_l, a_h), tile_a)
                 a_lo, a_hi = _score_lists_to_vecs((a_l, a_h))
