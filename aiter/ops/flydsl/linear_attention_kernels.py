@@ -85,12 +85,19 @@ _DECODE_WARP_SHAPE = {
     (16, True): (4, 16),
 }
 
-# Measured (NUM_BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K) for K3's 12:12
-# bf16/f32 decode, keyed like `_MTP_BY_ARCH`. Other KDA shapes use
-# `_decode_tiling`.
-_KDA_DECODE_BY_ARCH = {
-    "gfx942": {1: (8, 4, 32), 4: (32, 1, 32), 64: (8, 1, 16), 256: (2, 4, 32)},
-    "gfx950": {1: (32, 2, 32), 4: (4, 8, 32), 64: (1, 4, 16), 256: (4, 4, 16)},
+# Measured (NUM_BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K) per batch size, for
+# the single shape `_kda_tiling` accepts: 12 key and value heads, 128 wide, bf16
+# activations over an f32 state. A row splits the value dimension to fill one
+# part's CUs, and the arch does not fix those: MI308X and MI300X are both gfx942,
+# at 80 CUs and 304. An unlisted part falls through to `_decode_tiling`; so sweep
+# it and add its own row.
+_KDA_DECODE_BY_PART = {
+    # MI300X
+    ("gfx942", 304): {1: (8, 4, 32), 4: (32, 1, 32), 64: (8, 1, 16), 256: (2, 4, 32)},
+    # MI308X
+    ("gfx942", 80): {1: (32, 1, 32), 4: (2, 4, 16), 64: (1, 4, 16), 256: (4, 1, 16)},
+    # MI355X
+    ("gfx950", 256): {1: (32, 2, 32), 4: (4, 8, 32), 64: (1, 4, 16), 256: (4, 4, 16)},
 }
 
 
@@ -158,7 +165,11 @@ def _kda_tiling(
     head_k_dim,
     head_v_dim,
 ):
-    """The measured K3 tiling, or None so the caller can use `_decode_tiling`."""
+    """The measured K3 tiling, or None so the caller can use `_decode_tiling`.
+
+    Callers run this inside ``torch.cuda.device(...)``, so ``get_num_sms()``
+    reads the launch device.
+    """
     if (
         dtype_str != "torch.bfloat16"
         or state_dtype_str != "torch.float32"
@@ -169,7 +180,7 @@ def _kda_tiling(
         or head_v_dim != 128
     ):
         return None
-    cfg = _KDA_DECODE_BY_ARCH.get(GDR_GPU_ARCH, {}).get(batch_size)
+    cfg = _KDA_DECODE_BY_PART.get((GDR_GPU_ARCH, get_num_sms()), {}).get(batch_size)
     if cfg is None:
         return None
     num_blocks, num_warps, warp_threads_k = cfg

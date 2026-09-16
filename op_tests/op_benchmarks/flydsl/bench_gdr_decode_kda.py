@@ -6,7 +6,7 @@
 
 Kimi-K3 decodes at a 1:1 head ratio. ``--sweep`` prints the winning
 ``(NUM_BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K)`` triples to paste into
-``_KDA_DECODE_BY_ARCH`` in ``linear_attention_kernels.py``. ``--bench`` compares
+``_KDA_DECODE_BY_PART`` in ``linear_attention_kernels.py``. ``--bench`` compares
 those rows with both main's shape-based tiling policy and vLLM's standalone
 Triton packed-decode fallback. Scalar GDR never consults this table.
 
@@ -17,7 +17,7 @@ is a few percent, which is the size of the drift, so a number without its spread
 cannot be quoted as a win.
 
 Usage:
-    # Tuning sweep, prints triples to paste into `_KDA_DECODE_BY_ARCH`
+    # Tuning sweep, prints triples to paste into `_KDA_DECODE_BY_PART`
     python bench_gdr_decode_kda.py --sweep
 
     # A/B against vLLM's fused_recurrent_kda_packed_decode
@@ -48,7 +48,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.gdr_decode import create_vk_gdr_decode_kernel
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, get_dtype_str
-from aiter.ops.flydsl.linear_attention_kernels import _decode_tiling
+from aiter.ops.flydsl.linear_attention_kernels import _decode_tiling, get_num_sms
 
 # The KDA oracle is test-only, so it ships with op_tests rather than with aiter
 # and is not importable from an installed wheel.
@@ -78,8 +78,8 @@ WARP_THREADS_K_CHOICES = (1, 2, 4, 8, 16, 32)
 TOP_N = 5
 TRIALS = 5
 
-# What `_KDA_DECODE_BY_ARCH` holds, so the sweep emits a pasteable entry.
-TABLE_NAME = "_KDA_DECODE_BY_ARCH"
+# What `_KDA_DECODE_BY_PART` holds, so the sweep emits a pasteable entry.
+TABLE_NAME = "_KDA_DECODE_BY_PART"
 
 
 def valid_configs():
@@ -159,7 +159,7 @@ def make_inputs(B, device="cuda", seed=0):
 def flydsl_runner(inp, config):
     """Bind one explicit config, bypassing the wrapper's KDA tiling table.
 
-    ``flydsl_gdr_decode`` resolves its config from ``_KDA_DECODE_BY_ARCH``, so a
+    ``flydsl_gdr_decode`` resolves its config from ``_KDA_DECODE_BY_PART``, so a
     sweep must build the kernel directly. need_shuffle_state=False, K3's layout.
 
     q/k/v stay views into ``mixed_qkv``, the same buffer the Triton comparator
@@ -346,9 +346,10 @@ def sweep(args):
         rows.append(f"{B}: ({nbpv}, {nw}, {wtk})")
 
     # One line, shaped like the table it goes into; the durations above are the
-    # evidence for it and are not stored.
-    entry = f'    "{arch}": {{{", ".join(rows)}}},'
-    print(f"\npaste into {TABLE_NAME}, replacing this arch's row:\n")
+    # evidence for it and are not stored. Keyed by CU count as well as arch,
+    # because the split is chosen against this part's grid.
+    entry = f'    ("{arch}", {get_num_sms()}): {{{", ".join(rows)}}},'
+    print(f"\npaste into {TABLE_NAME}, replacing this part's row:\n")
     print(entry)
     if args.output:
         Path(args.output).write_text(entry + "\n", encoding="utf-8")

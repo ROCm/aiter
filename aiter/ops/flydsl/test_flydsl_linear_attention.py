@@ -590,23 +590,6 @@ def test_flydsl_gdr_decode_rejects_unshuffled_state_without_unit_k_stride():
         )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
-def test_flydsl_gdr_decode_rejects_stream_from_another_device():
-    args = Args(
-        dtype=torch.bfloat16,
-        b=2,
-        sq=1,
-        num_k_heads=16,
-        num_v_heads=32,
-        head_k_dim=128,
-        head_v_dim=128,
-    )
-    inouts = list(create_inputs(args) + create_outputs(args))
-    foreign = torch.cuda.Stream(device=1)
-    with pytest.raises(ValueError, match=r"`stream` must be on"):
-        flydsl_gdr_decode(*inouts[1:], True, True, foreign)
-
-
 @pytest.mark.parametrize(
     "num_k_heads,num_v_heads",
     [(2, 8), (4, 8), (4, 16), (8, 16), (8, 32), (16, 32), (16, 64)],

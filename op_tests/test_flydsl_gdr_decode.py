@@ -426,10 +426,30 @@ def test_only_kda_uses_the_kda_tiling_table(monkeypatch):
     kda_config = {"NUM_BLOCKS_PER_V_DIM": 4, "NUM_WARPS": 2, "WARP_THREADS_K": 32}
     dtypes = ("torch.bfloat16", "torch.float32")
     geometry = (4, 1, 12, 12, 128, 128)
+    part = (lak.GDR_GPU_ARCH, lak.get_num_sms())
 
-    monkeypatch.setattr(lak, "_KDA_DECODE_BY_ARCH", {lak.GDR_GPU_ARCH: {4: (4, 2, 32)}})
+    monkeypatch.setattr(lak, "_KDA_DECODE_BY_PART", {part: {4: (4, 2, 32)}})
     assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
     assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == lak._decode_tiling(
+        geometry[0], geometry[3], geometry[4], geometry[5], dtypes[1]
+    )
+
+
+def test_a_row_swept_on_another_part_is_not_reused(monkeypatch):
+    """A tuned row belongs to the CU count it was swept on.
+
+    Keyed on the arch name alone, an 80-CU MI308X picked up MI300X's 304-CU row
+    and lost to the shape-based tiling it was meant to beat. A part with no row
+    of its own has to fall through to `_decode_tiling`.
+    """
+    from aiter.ops.flydsl import linear_attention_kernels as lak
+
+    dtypes = ("torch.bfloat16", "torch.float32")
+    geometry = (4, 1, 12, 12, 128, 128)
+    foreign = (lak.GDR_GPU_ARCH, lak.get_num_sms() + 1)
+
+    monkeypatch.setattr(lak, "_KDA_DECODE_BY_PART", {foreign: {4: (4, 2, 32)}})
+    assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == lak._decode_tiling(
         geometry[0], geometry[3], geometry[4], geometry[5], dtypes[1]
     )
 
