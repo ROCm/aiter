@@ -1,7 +1,21 @@
 name: Stale branches
 
 # Comments on branches with no commits for 30 days and deletes them 7 days
-# later if nothing changes, so the first run only ever warns.
+# later if nothing changes.
+#
+# Deletion is off by default. Until STALE_BRANCHES_ENFORCE is set to 'true'
+# every run, scheduled or manual, only lists what it would do -- a dry run
+# posts no comments at all, so nobody is notified while the exemption list is
+# being tuned. Two facts make that safe to turn on later: the 7-day delete
+# clock is measured from the warning comment, which a dry run never writes, so
+# enabling enforcement starts everyone at day zero; and a branch can only be
+# deleted if a stale comment already exists, so the first enforcing run can
+# only warn. Earliest possible deletion is the run after that, a week on.
+#
+# Opting a single branch out needs no admin: delete the bot's comment on it and
+# the clock resets, which is what the comment itself tells the author. Branch
+# protection, an open pull request, and the regex below do the same thing
+# permanently.
 #
 # The exemptions below are not preferences, they are things that break if
 # deleted. Measured against the repo on 2026-09-15:
@@ -38,10 +52,22 @@ jobs:
       - uses: fpicalausa/remove-stale-branches@7c4f2afe88a36c0f9114cd958380979b9d7323fb  # v2.4.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Manual runs default to a dry run; the schedule acts for real.
-          dry-run: ${{ inputs.dry_run || false }}
+          # Deletion is opt-in and off until someone turns it on: every run is
+          # a dry run unless the repository variable STALE_BRANCHES_ENFORCE is
+          # set to 'true' (Settings > Secrets and variables > Actions). Review a
+          # dry-run listing, tune the exemptions above, then set it. The manual
+          # input still forces a dry run after that, for re-checking the list.
+          dry-run: ${{ inputs.dry_run == true || vars.STALE_BRANCHES_ENFORCE != 'true' }}
           days-before-branch-stale: 30
           days-before-branch-delete: 7
+          # Upstream defaults this to 10, which is not a rate limit so much as
+          # a standstill here: roughly 700 branches are past 30 days, so at ten
+          # per weekly run the backlog would take over a year, and a dry run
+          # would only ever list the first ten of it. Only branches it acts on
+          # count, so 300 works the backlog off over about three runs while
+          # still spreading the notifications rather than sending 700 in one
+          # morning. Matches the pull-request workflow.
+          operations-per-run: 300
           # Upstream default is false: without this, branches with an open
           # pull request would be deleted out from under the review.
           ignore-branches-with-open-prs: true
