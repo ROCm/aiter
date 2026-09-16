@@ -78,10 +78,8 @@ WARP_THREADS_K_CHOICES = (1, 2, 4, 8, 16, 32)
 TOP_N = 5
 TRIALS = 5
 
-CSV_HEADER = (
-    "arch,dtype,state_dtype,b,sq,num_k_heads,num_v_heads,head_k_dim,head_v_dim,"
-    "NUM_BLOCKS_PER_V_DIM,NUM_WARPS,WARP_THREADS_K,duration,gate_mode"
-)
+# What `_KDA_DECODE_BY_ARCH` holds, so the sweep emits a pasteable entry.
+TABLE_NAME = "_KDA_DECODE_BY_ARCH"
 
 
 def valid_configs():
@@ -342,23 +340,20 @@ def sweep(args):
 
         # The single-shot argmin is not trustworthy: the leaders land within a
         # few percent, the same order as run-to-run drift. Rank on the median.
-        best_us, best_cfg, _ = confirm(B, [c for _, c, _ in results[:TOP_N]])
+        _, best_cfg, _ = confirm(B, [c for _, c, _ in results[:TOP_N]])
 
         nbpv, nw, wtk = best_cfg
-        rows.append(
-            f"{arch},{DTYPE},{STATE_DTYPE},{B},1,{H},{H},{K},{V},"
-            f"{nbpv},{nw},{wtk},{best_us},kda"
-        )
+        rows.append(f"{B}: ({nbpv}, {nw}, {wtk})")
 
-    print(CSV_HEADER)
-    for r in rows:
-        print(r)
+    # One line, shaped like the table it goes into; the durations above are the
+    # evidence for it and are not stored.
+    entry = f'    "{arch}": {{{", ".join(rows)}}},'
+    print(f"\npaste into {TABLE_NAME}, replacing this arch's row:\n")
+    print(entry)
     if args.output:
-        Path(args.output).write_text(
-            CSV_HEADER + "\n" + "\n".join(rows) + "\n", encoding="utf-8"
-        )
+        Path(args.output).write_text(entry + "\n", encoding="utf-8")
         print(f"\nwrote {args.output}")
-    return rows
+    return entry
 
 
 _COMPARATOR_REL = Path("vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py")
@@ -646,7 +641,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--sweep", action="store_true", help="tune for the 1:1 head ratio")
     p.add_argument("--bench", action="store_true", help="A/B against Triton")
-    p.add_argument("-o", "--output", help="write the winning CSV rows here")
+    p.add_argument("-o", "--output", help="write the winning table entry here")
     p.add_argument(
         "--vllm",
         help="path to a vLLM checkout (default: vllm_vllm-project/, then vllm/)",
