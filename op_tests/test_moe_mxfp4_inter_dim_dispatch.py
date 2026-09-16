@@ -117,6 +117,20 @@ def test_mxfp4_swiglu_takeover_matches_weight_layout(q_dtype_a, gate_mode, want)
 
 
 @_SKIP
+def test_mxfp4_swiglu_split_k_does_not_bypass_reroute(monkeypatch):
+    monkeypatch.setenv("AITER_KSPLIT", "2")
+    fused_moe_module.get_ksplit.cache_clear()
+    get_2stage_cfgs.cache_clear()
+    try:
+        meta = _dispatch()
+    finally:
+        fused_moe_module.get_ksplit.cache_clear()
+        get_2stage_cfgs.cache_clear()
+
+    assert _stage_backend(meta.stage2) == "flydsl"
+
+
+@_SKIP
 def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch):
     key = (
         fused_moe_module.get_gfx_runtime(),
