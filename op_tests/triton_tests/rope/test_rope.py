@@ -1202,7 +1202,7 @@ def test_rope_fwd_3d(
         x.clone(), grid_sizes.clone(), freqs.clone(), sp_size, sp_rank
     )
 
-    logger.info("the result compare: sp_rank=%s", sp_rank)
+    logger.info("the result compare: sp_rank=%d", sp_rank)
     logger.info("=" * 50)
     shape_ok = out_orig.shape == out_triton.shape
     sum_orig = out_orig.sum().item()
@@ -1225,7 +1225,7 @@ def test_rope_fwd_3d(
     logger.info("   - max diff: %.6f", feat_diff)
 
     if shape_ok and sum_ok and feat_ok:
-        logger.info("\n sp_rank=%s test success", sp_rank)
+        logger.info("\n sp_rank=%d test success", sp_rank)
     else:
-        logger.info("\n sp_rank=%s test failed", sp_rank)
+        logger.info("\n sp_rank=%d test failed", sp_rank)
     logger.info("=" * 60)

@@ -165,8 +165,8 @@ def test_mha_varlen(
     logger.debug("q_unpad.shape=%s q_unpad=%s", q_unpad.shape, q_unpad)
     logger.debug("k_unpad.shape=%s k_unpad=%s", k_unpad.shape, k_unpad)
     logger.debug("v_unpad.shape=%s v_unpad=%s", v_unpad.shape, v_unpad)
-    logger.debug("max_seqlens_q=%s", max_seqlen_q)
-    logger.debug("max_seqlens_k=%s", max_seqlen_k)
+    logger.debug("max_seqlens_q=%d", max_seqlen_q)
+    logger.debug("max_seqlens_k=%d", max_seqlen_k)
     logger.debug("cu_seqlens_q=%s", cu_seqlens_q)
     logger.debug("cu_seqlens_k=%s", cu_seqlens_k)
 

@@ -360,7 +360,7 @@ def test_gather_kv_b_proj(
 
         logger.info(">>> Performance gather_kv_b_proj:")
         logger.info(
-            ">>>   batch %s, block_size %s, tp_k_head_num %s, kv_c_dim %s, qk_nope_head_dim %s, kv_length %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
             batch_size,
             block_size,
             tp_k_head_num,
@@ -511,7 +511,7 @@ def test_gather_kv_b_proj_per_row_scale(
 
         logger.info(">>> Performance gather_kv_b_proj_per_row_scale:")
         logger.info(
-            ">>>   batch %s, block_size %s, tp_k_head_num %s, kv_c_dim %s, qk_nope_head_dim %s, kv_length %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
             batch_size,
             block_size,
             tp_k_head_num,
@@ -675,7 +675,7 @@ def test_gather_kv_b_proj_bf16_weight(
 
         logger.info(">>> Performance gather_kv_b_proj_bf16_weight:")
         logger.info(
-            ">>>   batch %s, block_size %s, tp_k_head_num %s, kv_c_dim %s, qk_nope_head_dim %s, kv_length %s, scale_mode %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d, scale_mode %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
             batch_size,
             block_size,
             tp_k_head_num,
@@ -1185,7 +1185,7 @@ def test_gather_kv_b_proj_shuffled_kv(
             shuffled_kv_cache=True,
         )
         logger.info(
-            ">>> Performance gather_kv_b_proj_shuffled_kv (%s):\n>>>   batch %s, block_size %s, tp_k_head_num %s, kv_length %s, ktype %s\n>>>       elapsed=%.2fus",
+            ">>> Performance gather_kv_b_proj_shuffled_kv (%s):\n>>>   batch %d, block_size %d, tp_k_head_num %d, kv_length %d, ktype %s\n>>>       elapsed=%.2fus",
             scale_mode,
             batch_size,
             block_size,

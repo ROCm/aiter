@@ -347,7 +347,7 @@ def test_paged_attn_per_token_quant(
     )
 
     logger.debug(
-        "B=%s H_Q=%s, H_KV=%s D=%s, KV_BLK_SZ=%s, SEQ_LEN=%s, NUM_BLK=%s",
+        "B=%d H_Q=%d, H_KV=%d D=%d, KV_BLK_SZ=%d, SEQ_LEN=%d, NUM_BLK=%d",
         B,
         H_Q,
         H_KV,

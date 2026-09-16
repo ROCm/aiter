@@ -123,14 +123,14 @@ def compare_arrays(
         result["nan_info"]["arr1_nan_count"] = np.sum(nan_mask1)
         result["nan_info"]["arr1_nan_positions"] = np.argwhere(nan_mask1)
         logger.info(
-            "Warning: arr1 contains %s NaN values", result["nan_info"]["arr1_nan_count"]
+            "Warning: arr1 contains %d NaN values", result["nan_info"]["arr1_nan_count"]
         )
 
     if np.any(nan_mask2):
         result["nan_info"]["arr2_nan_count"] = np.sum(nan_mask2)
         result["nan_info"]["arr2_nan_positions"] = np.argwhere(nan_mask2)
         logger.info(
-            "Warning: arr2 contains %s NaN values", result["nan_info"]["arr2_nan_count"]
+            "Warning: arr2 contains %d NaN values", result["nan_info"]["arr2_nan_count"]
         )
 
     # Compute absolute differences
@@ -139,8 +139,8 @@ def compare_arrays(
 
     max_diff_thr = diff / (1.0 + np.abs(arr2))
     max_diff_thr = max_diff_thr.max()
-    logger.info("diff.abs.max=%s", diff.max())
-    logger.info("max_diff_thr=%s", max_diff_thr)
+    logger.info("diff.abs.max=%f", diff.max())
+    logger.info("max_diff_thr=%f", max_diff_thr)
     result["max_diff"] = diff.max()
     result["max_diff_thr"] = max_diff_thr
 
@@ -1741,7 +1741,7 @@ def _run_single_test(args):
     test_config, current, total = args
 
     logger.info(
-        "\n[%s/%s] Testing: use_torch_flash_ref=%s, compute_type=%s, quant_q_and_kv=(%s, %s), trans_v=%s, kv_varlen=%s, context_partition_size=%s, quant_mode=%s, block_size=%s, num_heads=%s, context_lengths=%s, batch_size=%s, query_length=%s, head_size=%s, sinks=%s, sliding_window=%s,ps=%s",
+        "\n[%d/%d] Testing: use_torch_flash_ref=%s, compute_type=%s, quant_q_and_kv=(%s, %s), trans_v=%s, kv_varlen=%s, context_partition_size=%d, quant_mode=%s, block_size=%d, num_heads=%s, context_lengths=%d, batch_size=%d, query_length=%d, head_size=%d, sinks=%s, sliding_window=%d,ps=%s",
         current,
         total,
         test_config["use_torch_flash_ref"],
@@ -1863,7 +1863,7 @@ def run_multi_pa_gluon_test(
                                                                     test_config
                                                                 )
     total = len(test_configs)
-    logger.info("\nTotal test cases: %s", total)
+    logger.info("\nTotal test cases: %d", total)
 
     # Run tests with random sampling
     if sample_rate < 1.0:
@@ -1872,14 +1872,14 @@ def run_multi_pa_gluon_test(
             config for config in test_configs if random.random() < sample_rate
         ]
         logger.info(
-            "Using random sampling: running %s out of %s test cases (sample_rate=%.2f%%)",
+            "Using random sampling: running %d out of %d test cases (sample_rate=%.2f%%)",
             len(test_configs_to_run),
             total,
             (sample_rate) * 100,
         )
     else:
         test_configs_to_run = test_configs
-        logger.info("Running all %s test cases (sample_rate=100%%)", total)
+        logger.info("Running all %d test cases (sample_rate=100%%)", total)
 
     results = []
     for idx, test_config in enumerate(test_configs_to_run):
@@ -2031,7 +2031,7 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     total_errors = results_df["err_gluon"].sum()
     if total_errors > 0:
         logger.info(
-            "\nTests failed! %s test case(s) exceeded the error threshold. ",
+            "\nTests failed! %d test case(s) exceeded the error threshold. ",
             total_errors,
         )
         logger.info("Please check rows with non-zero err_gluon in %s.", output_file)
