@@ -2187,6 +2187,7 @@ A8W8_MXSCALE_BMM_BPRESHUFFLE_INSTANCES = [
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_im_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_full_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_quad_gfx1250"),
+    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_sfatdm_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_arf_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_gfx1250"),

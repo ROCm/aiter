@@ -129,17 +129,20 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
     // pad is what keeps 16 lanes reading 16 consecutive rows off one bank, and
     // rounding to 16 is what lets the fill keep its 16-byte store.
     //
-    // Under kSfATdm the pitch is the D#'s own padding, so it is compile-time and
-    // the runtime expression would disagree with the layout the engine wrote.
-    // Only A can be on TDM (asserted in the traits), so there is no ambiguity
-    // about which panel this pitch belongs to.
-    const int sf_pitch =
-        T::kSfATdm
-            ? T::kSfAPitchFixed
-            : ((T::kSfALds || T::kSfBLds)
-                   ? (((sf_kg + T::kSfPanelPad - 1) & ~(T::kSfPanelPad - 1))
-                      + T::kSfPanelPad)
-                   : 0);
+    // ONE PITCH PER PANEL. They used to share a single value, which forced
+    // SF_A_TDM_KG_ and SF_B_LDS_ to be mutually exclusive: the TDM panel's pitch
+    // is the D#'s own padding and so compile-time, while a cooperatively filled
+    // panel's tracks the runtime K-group count. Carrying both is what lets the A
+    // panel move to TDM while B stays cooperative -- and that move is the point,
+    // because the cooperative fill is a global load and its drain is the
+    // kernel's whole s_wait_loadcnt bill: ATT puts it at 926 cycles a hit
+    // against FlyDSL's zero, which pays for its panels with TDM (its `pre32`).
+    const int sf_pitch_run = (T::kSfALds || T::kSfBLds)
+                                 ? (((sf_kg + T::kSfPanelPad - 1)
+                                     & ~(T::kSfPanelPad - 1)) + T::kSfPanelPad)
+                                 : 0;
+    const int sf_pitch_a = T::kSfATdm ? T::kSfAPitchFixed : sf_pitch_run;
+    const int sf_pitch_b = sf_pitch_run;
     // First kGroupN block this tile's N range touches; the B panel is indexed
     // relative to it. Blocks, not columns: tile_col need not be a multiple of
     // kGroupN, which is what kSfBPanelRows' +1 covers.
@@ -178,13 +181,27 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
     // tile_row gives the partial-M tail a zero-extent DMA instead of a fault,
     // exactly as the A-tile window gets it.
     if constexpr (T::kSfATdm) {
+        // WAVE 0 MOVES THE WHOLE PANEL. Striping it one slice per wave was
+        // tried and measured: s_barrier_wait did fall (140 -> 94.7 cycles a hit,
+        // -13,802) because the other waves stop waiting one out, but every wave
+        // then carries a panel DMA of its own and tensorcnt is per-wave, so the
+        // ring's own wait grew by more than that (426 -> 473.7, +12,888) and the
+        // kernel lost 0.3%. The panel is kBlockM x sf_kg bytes -- small enough
+        // that four transfers' startup costs more than the extra width saves.
         if (wave_id == 0) {
             auto w = opus::make_tdm<typename T::WindowSfA>(
                 (u32_t)reinterpret_cast<u64_t>(smem_sfa), ptr_sfa,
                 (u32_t)sf_kg, (u32_t)kargs.m, (u64_t)kargs.stride_sfa,
                 (u32_t)0, (u32_t)tile_row);
             w.async_load((u32_t)0);
-            opus::s_wait_tensorcnt<0>();
+            // NO WAIT HERE. Draining beside the issue makes wave 0 sit through a
+            // cold global->LDS round trip before it has even primed the ring,
+            // while waves 1..n-1 skip this block and pile up on the barrier
+            // below waiting for it: ATT measured s_barrier_wait going 108 -> 306
+            // cycles a hit, +60,117 in total, which swallowed the 49,157 that
+            // moving the panel off the cooperative global load had just saved.
+            // The drain moves to just before that barrier instead, so the panel
+            // transfer overlaps the ring prime that every wave is issuing.
         }
     }
     // Defined here, CALLED after the ring prime. Only the definition can sit
@@ -203,7 +220,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         // keeps the alignment the load has, which is the whole reason the pad is
         // a power of two rather than the 4 that would minimise bank conflicts.
         auto fill_panel = [&](const DataSf* src, int src_pitch, DataSf* dst,
-                              int rows, unsigned bound)
+                              int dst_pitch, int rows, unsigned bound)
             __attribute__((always_inline)) {
             auto g = opus::make_gmem(src, bound);
             auto s = opus::make_smem(dst);
@@ -239,7 +256,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                         const int idx = base + u * kStr;
                         if (idx < total) {
                             const int r = idx / sf_kg;
-                            opus::store<VEC>(s, v[u], r * sf_pitch + (idx - r * sf_kg));
+                            opus::store<VEC>(s, v[u], r * dst_pitch + (idx - r * sf_kg));
                         }
                     });
                 }
@@ -258,7 +275,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         if constexpr (T::kSfACoop) {
             const int rows_avail = kargs.m - tile_row;      // > 0: tile_row < m
             fill_panel(ptr_sfa + (size_t)tile_row * kargs.stride_sfa,
-                       kargs.stride_sfa, smem_sfa, T::kBlockM,
+                       kargs.stride_sfa, smem_sfa, sf_pitch_a, T::kBlockM,
                        (unsigned)((rows_avail - 1) * kargs.stride_sfa + sf_kg));
         }
         // B: rows are kGroupN BLOCKS, sfb_nb_base .. + kSfBPanelRows - 1. The
@@ -268,7 +285,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         if constexpr (T::kSfBLds) {
             const int nb_max = (kargs.n + T::kGroupN - 1) / T::kGroupN - 1;
             fill_panel(ptr_sfb + (size_t)sfb_nb_base * kargs.stride_sfb,
-                       kargs.stride_sfb, smem_sfb, T::kSfBPanelRows,
+                       kargs.stride_sfb, smem_sfb, sf_pitch_b, T::kSfBPanelRows,
                        (unsigned)((nb_max - sfb_nb_base) * kargs.stride_sfb + sf_kg));
         }
     };
@@ -532,7 +549,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                 constexpr int im = decltype(imN)::value;
                 const int r = wave_m * (T::kExpM * T::kWmmaM) + im * T::kWmmaM
                               + (lane_id % T::kWmmaM);
-                sa_w[im] = wide_read(smem_sfa + (size_t)r * sf_pitch
+                sa_w[im] = wide_read(smem_sfa + (size_t)r * sf_pitch_a
                                      + (size_t)k_step * T::kExpK);
             });
         }
@@ -543,7 +560,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             opus::static_for<T::kSfBLoadsPerK>([&](auto inN) __attribute__((always_inline)) {
                 constexpr int in = decltype(inN)::value;
                 const int nb = sfb_nb(in) - sfb_nb_base;
-                sb_w[in] = wide_read(smem_sfb + (size_t)nb * sf_pitch
+                sb_w[in] = wide_read(smem_sfb + (size_t)nb * sf_pitch_b
                                      + (size_t)k_step * T::kExpK);
             });
         }
@@ -599,7 +616,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                     // row r's byte only ever reaches row r's accumulators, and an
                     // out-of-range row's C store is dropped. A zero exponent
                     // there cannot reach a valid row -- it is not a reduction.
-                    return pack_sf(smem_sfa, r, sf_pitch, kg);
+                    return pack_sf(smem_sfa, r, sf_pitch_a, kg);
                 } else {
                     return pack_sf(ptr_sfa,
                                    opus_bmm_mx_min_i(tile_row + r, kargs.m - 1),
@@ -634,7 +651,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                     // and at most the block of the span's last column, which is
                     // inside kSfBPanelRows by construction.
                     sb_v[in] = pack_sf(smem_sfb, sfb_nb(in) - sfb_nb_base,
-                                       sf_pitch, kg);
+                                       sf_pitch_b, kg);
                 } else {
                     sb_v[in] = pack_sf(ptr_sfb, sfb_nb(in), kargs.stride_sfb, kg);
                 }
@@ -932,6 +949,13 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             opus::s_wait_loadcnt<0>();
             opus::s_wait_dscnt<0>();
         }
+        // The A panel's TDM, issued before the prime and drained only now, so it
+        // ran under it.
+        //
+        // tensorcnt is per-wave and only wave 0 issued the panel, so this also
+        // retires that wave's primed slots. Leaving the prime in flight instead
+        // is the obvious refinement and is NOT what this line does yet.
+        if constexpr (T::kSfATdm) opus::s_wait_tensorcnt<0>();
         __builtin_amdgcn_s_barrier();
 
         for (int k = 0; k < k_steps; ++k) {

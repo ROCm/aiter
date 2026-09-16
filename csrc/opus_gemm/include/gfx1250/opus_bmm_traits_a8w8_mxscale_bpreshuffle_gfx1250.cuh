@@ -896,12 +896,14 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
                   "SF_A_TDM_KG_ * 1 byte must be >= 8 (pad interval field floor)");
     static_assert(!kSfATdm || (kSfATdmPad >= 4 && kSfATdmPad % 4 == 0),
                   "SF_A_TDM_PAD_ must be a whole DWORD >= 4");
-    // Both panels are indexed with ONE pitch in the pipeline, and the TDM one is
-    // compile-time while the cooperative one tracks K. Rather than carry two,
-    // keep the experiment A-only -- which is also the only side it asks about.
-    static_assert(!kSfATdm || !SF_B_LDS_,
-                  "SF_A_TDM_KG_ with SF_B_LDS_: the two panels would need "
-                  "different row pitches; measure the A fill on its own");
+    // The two panels now carry their own pitches (sf_pitch_a / sf_pitch_b in the
+    // pipeline), so a TDM-filled A panel and a cooperatively filled B panel can
+    // coexist. They could not before: one shared pitch cannot be both the D#'s
+    // compile-time padding and the runtime K-group count, and rather than carry
+    // two the TDM path was scoped to A-only tiles. What makes it worth carrying
+    // now is the measurement -- the cooperative fill is a global load, and its
+    // drain is this kernel's entire s_wait_loadcnt bill (926 cycles a hit)
+    // against FlyDSL's zero, which fills both its panels with TDM.
     // The cooperative fill covers A only when TDM has not taken it over.
     static constexpr bool kSfACoop = kSfALds && !kSfATdm;
 
@@ -2278,6 +2280,23 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_full_gfx1250 =
 template <typename DataC>
 using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_quad_gfx1250 =
     opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<_FLY_BASE(false)>;
+
+// kid77: kid72 with the A scale panel filled by TDM instead of the cooperative
+// global load. SF_A_TDM_KG = 32 -- a power of two, >= 8, and 32 * 128 = 4096 is
+// the K this is measured at, so the panel is exactly covered. Everything else
+// matches kid72, so the pair attributes the fill path alone.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_sfatdm_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/32, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
+        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true, /*DS_FINE_WAIT*/false,
+        /*ISSUE_MID*/false, /*QUADRANT*/true, /*ISSUE_MID_IK*/0>;
 
 // kid63: kid31's reuse at twice the grid. B_N=64 halves the tile's N span, so
 // n=1024 cuts into 16 n-tiles instead of 8 and the grid doubles -- at b=16 m=32
