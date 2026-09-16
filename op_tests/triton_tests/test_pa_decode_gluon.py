@@ -1895,12 +1895,7 @@ def _preserved_default_device():
     """Put torch's default device back on the way out.
 
     run_single_pa_gluon_test() calls torch.set_default_device() per case and
-    never restores it. Without the finally, a raised exception -- or the
-    assert at the end of a failing run -- would leave every later test in the
-    same pytest shard running with a mutated global.
-
-    This only preserves; it does not select a device, so nothing here forces
-    CUDA the way the old module-scope torch.set_default_device("cuda") did.
+    never restores it.
     """
     prev_device = torch.get_default_device()
     try:
