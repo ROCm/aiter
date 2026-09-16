@@ -407,7 +407,19 @@ def test_published_k2_schedules_can_split_their_tile():
     Above BW // 16 the extra warps recompute columns their neighbours already
     hold -- still correct, which is why nothing downstream catches it, and the
     pairs are now editable from a config file rather than derived.
+
+    An arch that publishes neither schedule has nothing here to check. Both
+    lookups then return _K2_GLUON_FALLBACK, whose MIN_BLOCKS_PER_CU of 0 makes
+    the occupancy test vacuous, so the wide branch is taken for every shape and
+    exactly one pair is reachable by construction rather than by choice.
     """
+    if (
+        _flash_kda.chunk_delta_attn_tuned_config(
+            "k2_ab_fused_gluon_wide", _flash_kda._K2_GLUON_FALLBACK, backend="gluon"
+        )
+        is _flash_kda._K2_GLUON_FALLBACK
+    ):
+        pytest.skip("this arch publishes no Gluon K2 schedules")
     reached = set()
     for W in (64, 128, 256):
         for num_segs in (1, 2, 8, 64, 512):
