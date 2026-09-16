@@ -2671,6 +2671,12 @@ def _make_mxfp4_metadata(
     )
 
 
+def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode):
+    return (
+        q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
+    ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
+
+
 def _can_reroute_mxfp4_to_flydsl(
     *,
     model_dim,
@@ -2694,13 +2700,7 @@ def _can_reroute_mxfp4_to_flydsl(
         and activation == ActivationType.Swiglu
         and inter_dim % 128 == 0
         and model_dim % 256 == 0
-        and (
-            (
-                q_dtype_a in (dtypes.bf16, dtypes.fp4x2)
-                and gate_mode == GateMode.SEPARATED
-            )
-            or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
-        )
+        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -3447,6 +3447,7 @@ def get_2stage_cfgs(
             q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
             and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
         )
+        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
