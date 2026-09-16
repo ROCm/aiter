@@ -2135,28 +2135,48 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
         auto const kth_value_bits    = counter->kth_value_bits;
         int const previous_start_bit = calc_start_bit<T, BitsPerPass>(pass - 1);
 
-        auto process_hist = [histogram, out_buf, out_idx_buf, out, out_idx,
-                             in_idx_buf, select_min, start_bit, mask,
-                             kth_value_bits, previous_start_bit,
-                             p_filter_cnt, p_out_cnt](T value, IdxT idx) {
-            auto const bits = twiddle_in(value, select_min);
-            auto const pb = (bits >> previous_start_bit) << previous_start_bit;
-            if(pb == kth_value_bits)
-            {
-                IdxT pos         = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
-                out_buf[pos]     = value;
-                out_idx_buf[pos] = in_idx_buf ? in_idx_buf[idx] : idx;
-                int bucket = __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(start_bit), static_cast<unsigned>(BitsPerPass));
-                atomicAdd(histogram + bucket, static_cast<IdxT>(1));
-            }
-            else if(pb < kth_value_bits)
-            {
-                IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-                if(WRITE_TOPK_VALUES) { out[pos] = value; }
-                out_idx[pos] = in_idx_buf ? in_idx_buf[idx] : idx;
-            }
+        // The index source is resolved outside the scan, the way last_filter
+        // does it. Left as `in_idx_buf ? in_idx_buf[idx] : idx` inside the
+        // loop it compiles to a gather whose *merge* path carries an
+        // unconditional `s_waitcnt vmcnt(0)`, so it is paid even when
+        // in_idx_buf is null. That drains the four wide loads
+        // vectorized_process keeps in flight, i.e. every wave holding a
+        // candidate stalls the whole streaming scan. Pass 1 -- the one pass
+        // that still reads the full row -- always has a null in_idx_buf, so
+        // specialising it is free and buys the overlap back.
+        auto scan_with = [&](auto index_of) {
+            auto process_hist = [histogram, out_buf, out_idx_buf, out, out_idx,
+                                 select_min, start_bit,
+                                 kth_value_bits, previous_start_bit,
+                                 p_filter_cnt, p_out_cnt, index_of](T value, IdxT idx) {
+                auto const bits = twiddle_in(value, select_min);
+                auto const pb = (bits >> previous_start_bit) << previous_start_bit;
+                if(pb == kth_value_bits)
+                {
+                    IdxT pos         = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
+                    out_buf[pos]     = value;
+                    out_idx_buf[pos] = index_of(idx);
+                    int bucket = __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(start_bit), static_cast<unsigned>(BitsPerPass));
+                    atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+                }
+                else if(pb < kth_value_bits)
+                {
+                    IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+                    if(WRITE_TOPK_VALUES) { out[pos] = value; }
+                    out_idx[pos] = index_of(idx);
+                }
+            };
+            vectorized_process(threadIdx.x, blockDim.x, in_buf, previous_len, process_hist);
         };
-        vectorized_process(threadIdx.x, blockDim.x, in_buf, previous_len, process_hist);
+
+        if(in_idx_buf)
+        {
+            scan_with([in_idx_buf](IdxT i) { return in_idx_buf[i]; });
+        }
+        else
+        {
+            scan_with([](IdxT i) { return i; });
+        }
     }
 
     return false;
@@ -2269,35 +2289,23 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
 
     // Compaction stages the surviving candidates in `bufs`, so every pass after
-    // the first reads ~k elements instead of re-scanning the whole row. Measured
-    // on MI355X at M=4096/N=131072/k=2048 this cuts HBM reads from 3.07x the
-    // logits array to 1.97x (rocprofv3 FETCH_SIZE) and the kernel from 923us to
-    // 818us.
+    // the first reads ~k elements instead of re-scanning the whole row.
+    // Measured on MI355X at M=4096/N=131072/k=2048 it cuts HBM reads from 3.07x
+    // the logits array to 1.97x (rocprofv3 FETCH_SIZE) and the kernel from
+    // 926us to 688us (indices only) / 924us to 740us (with values).
     //
-    // Two instantiations opt out:
-    //
-    //  * STABLE -- incompatible, not just slower: the stable emits recover an
-    //    element's original index from its position in the buffer they scan,
-    //    which only holds for the original input, and they take no index buffer
-    //    to carry it through a compaction.
-    //
-    //  * WRITE_TOPK_VALUES -- correct but slower (923us -> 1282us at the shape
-    //    above). Compacting moves the emit of the definite winners out of the
-    //    final pass and into the pass-1 scan loop, where each one costs an
-    //    LDS atomic plus a dependent scattered store. With values that is two
-    //    stores per winner instead of one, and the extra ~2k dependent stores
-    //    per row cost more than the full-row pass they save. Traffic is
-    //    identical either way (FETCH_SIZE 4.240GB both, WRITE_SIZE +33MB), so
-    //    this is store/atomic serialisation in the scan loop, not bandwidth.
-    //    Aggregating the emit counters per wave would likely lift the
-    //    restriction; until then only the indices-only instantiation compacts.
+    // STABLE opts out, and it is a correctness constraint rather than a
+    // performance one: the stable emits recover an element's original index
+    // from its position in the buffer they scan, which only holds for the
+    // original input, and they take no index buffer to carry it through a
+    // compaction.
     //
     // COMPACT itself is chosen by the launcher, not here: it has to stay a
     // compile-time constant, because the whole pass loop is unrolled and every
     // buffer pointer is folded per pass. Deciding it in the kernel from row_len
     // costs more than compaction saves -- measured at M=4096 it regressed every
     // N, e.g. N=131072 820us -> 1110us.
-    constexpr bool kCompact = COMPACT && !STABLE && !WRITE_TOPK_VALUES;
+    constexpr bool kCompact = COMPACT && !STABLE;
 
     T const* in_buf        = in;
     IdxT const* in_idx_buf = in_idx;
@@ -2677,18 +2685,18 @@ void standalone_stable_radix_topk_one_block_(void* buf,
     }
 
     // Compaction trades one full-row scan (cost ~ len) for staging the
-    // candidates plus emitting ~k winners (cost ~ k, each a dependent LDS
-    // atomic and scattered store), on top of a fixed per-pass cost (histogram
-    // clear, 4096-bucket scan, barriers) that a short row cannot amortise.
-    // Both terms show up in the measured crossover (MI355X, fp32, M=4096,
-    // indices-only, us without -> with compaction):
-    //   k=2048  N= 8192  92->105   16384 135->153   32768 236->242
-    //           N=65536 453->420  131072 926->820  262144 2184->1671
-    //   k= 512  N= 8192  92->102   16384 127->135   32768 230->223
-    //   k= 128  N= 8192  91-> 97   16384 122->121   32768 223->192
+    // candidates plus emitting ~k winners (cost ~ k), on top of a fixed
+    // per-pass cost (histogram clear, 4096-bucket scan, barriers) that a short
+    // row cannot amortise. Both terms show up in the measured crossover
+    // (MI355X, fp32, M=4096, indices only, us without -> with compaction):
+    //   k=2048  N= 8192  92-> 97   16384 135->138   32768 237->209
+    //           N=65536 450->355  131072 926->688
+    //   k=1024  N= 8192  94-> 96   16384 131->130   32768 234->202
+    //   k= 512  N= 8192  92-> 95   16384 127->123   32768 229->196
+    //   k= 128  N= 8192  90-> 90   16384 122->115   32768 222->175
     // so require the row to be long both absolutely and relative to k. Ragged
     // rows are gated on the padded length, which only affects speed.
-    if(!STABLE && !WRITE_TOPK_VALUES && len >= 32768 && len >= int64_t(24) * k)
+    if(!STABLE && len >= 16384 && len >= int64_t(16) * k)
     {
         radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
                                     false, phase, STABLE, /*COMPACT=*/true>
