@@ -6,7 +6,7 @@ Unit tests for mp_tuner polling loop logic.
 Simulates async_result behavior without GPU/multiprocessing to verify:
 1. consecutive_timeouts tracks correctly and resets on success
 2. half-GPU threshold triggers break at the right time
-3. KeyError tasks stay in remaining_tasks and get retried after root-cause restart
+3. stale PID mappings trigger an immediate restart and retry
 
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
@@ -15,7 +15,10 @@ import importlib
 import multiprocessing as mp
 import time
 import unittest
+import warnings
 from multiprocessing import TimeoutError as MPTimeoutError
+
+import triton  # noqa: F401  # ROCm environments may require Triton before torch.
 
 
 def _wait_for_release(release, value):
@@ -90,6 +93,9 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
 
             if is_mapping_error:
                 dummy_failed_tasks.append((k, "mapping error"))
+                pool_restart_needed = True
+                broke_early = True
+                break
             elif error_type == "AcceleratorError":
                 completed_this_round.append((k, async_result))
                 pool_restart_needed = True
@@ -225,12 +231,12 @@ class TestKeyErrorHandling(unittest.TestCase):
         )
         completed_ids = {k for k, _ in completed}
         self.assertNotIn(0, completed_ids, "KeyError task should NOT be completed")
-        self.assertIn(1, completed_ids, "OK task should be completed")
+        self.assertNotIn(1, completed_ids, "Polling stops for immediate remap")
         self.assertEqual(len(dummy), 1, "KeyError task should be in dummy_failed")
-        self.assertFalse(restart, "KeyError alone should NOT trigger restart")
+        self.assertTrue(restart, "Stale PID mapping must trigger restart")
 
     def test_keyerror_with_timeout_gets_resubmitted(self):
-        """KeyError tasks wait for root-cause timeout to trigger restart."""
+        """Mapping errors restart before unrelated timeout polling."""
         mp_num = 2
         timeout = 0.0
         now = time.time()
@@ -245,17 +251,14 @@ class TestKeyErrorHandling(unittest.TestCase):
         )
         completed_ids = {k for k, _ in completed}
         self.assertNotIn(0, completed_ids, "KeyError task stays for resubmit")
-        self.assertIn(1, completed_ids, "Root-cause timeout is completed")
-        self.assertTrue(restart, "Timeout should trigger restart")
+        self.assertNotIn(1, completed_ids, "Polling stops before the timeout task")
+        self.assertTrue(restart, "Mapping error should trigger restart")
 
         new_remaining = [(k, ar) for k, ar in remaining if k not in completed_ids]
-        self.assertEqual(len(new_remaining), 1)
-        self.assertEqual(
-            new_remaining[0][0], 0, "Only KeyError task remains for resubmit"
-        )
+        self.assertEqual(len(new_remaining), 2)
 
-    def test_keyerror_no_restart_without_root_cause(self):
-        """If only KeyError tasks remain, no restart, they keep polling."""
+    def test_keyerror_restarts_without_another_failure(self):
+        """A mapping error is sufficient cause to rebuild the PID map."""
         mp_num = 4
         timeout = 100.0
         now = time.time()
@@ -268,9 +271,9 @@ class TestKeyErrorHandling(unittest.TestCase):
         completed, dummy, restart, _broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
-        self.assertFalse(restart, "No restart without root cause")
+        self.assertTrue(restart, "Mapping errors are themselves a restart cause")
         self.assertEqual(len(completed), 0, "Nothing completed")
-        self.assertEqual(len(dummy), 2, "Both are mapping errors")
+        self.assertEqual(len(dummy), 1, "Polling stops at the first mapping error")
 
 
 class TestAcceleratorError(unittest.TestCase):
@@ -319,11 +322,21 @@ class TestTaskExecutionTiming(unittest.TestCase):
         self.assertIsNotNone(init_start_times)
         self.assertIsNotNone(run_with_tracking)
 
-        ctx = mp.get_context("spawn")
+        # Importing the ROCm torch/Triton stack in a spawned test worker can
+        # abort in the dynamic loader before this helper runs. The queue
+        # timing behavior under test is independent of the start method.
+        start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+        ctx = mp.get_context(start_method)
         start_times = ctx.RawArray("d", 2)
-        manager = ctx.Manager()
-        release = manager.Event()
-        pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"This process .* is multi-threaded, use of fork.*",
+                category=DeprecationWarning,
+            )
+            manager = ctx.Manager()
+            release = manager.Event()
+            pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
         try:
             first = pool.apply_async(
                 run_with_tracking, (0, _wait_for_release, (release, "first"))
@@ -370,6 +383,17 @@ class TestTaskStartTimeReset(unittest.TestCase):
         self.assertEqual(list(slots), [0, 22.0, 0])
 
 
+class TestShapeGroupedContract(unittest.TestCase):
+
+    def test_declared_kernel_count_must_match_group_size(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+        with self.assertRaisesRegex(
+            ValueError, "declares 2 kernels but contains 1 tasks"
+        ):
+            tuner.work_group({}, False, 0.0, (2, (None,)), [("only-task",)])
+
+
 class TestWorkerErrorRatio(unittest.TestCase):
 
     def test_nonfinite_error_ratio_is_rejected(self):
@@ -391,6 +415,23 @@ class TestWorkerErrorRatio(unittest.TestCase):
         self.assertIsNotNone(merge_error_ratio)
         self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
         self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
+
+
+class TestTypedCandidateStatus(unittest.TestCase):
+
+    def test_failure_classification_preserves_oom_and_unsupported(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        classify = tuner._candidate_failure_status
+        self.assertEqual(classify(RuntimeError("HIP out of memory")), "oom_runtime")
+        self.assertEqual(classify(ValueError("unsupported layout")), "unsupported")
+        self.assertEqual(classify(RuntimeError("kernel launch failed")), "crash")
+
+    def test_status_extension_is_opt_in(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        legacy = tuner._format_worker_result("shape", 1.0, 0.0, "ok", False)
+        typed = tuner._format_worker_result("shape", 1.0, 0.0, "ok", True)
+        self.assertEqual(legacy, ("shape", 1.0, 0.0))
+        self.assertEqual(typed, ("shape", 1.0, 0.0, "ok"))
 
 
 if __name__ == "__main__":

@@ -203,6 +203,12 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
 )
 
+# Exact hardware/problem keyed MHA forward runtime dispatch.
+AITER_CONFIG_MHA_FWD = os.getenv(
+    "AITER_CONFIG_MHA_FWD",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mha_fwd.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -323,6 +329,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_MHA_FWD_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MHA_FWD",
+            AITER_CONFIG_MHA_FWD,
+            "tuned_mha_fwd",
         )
 
     @property

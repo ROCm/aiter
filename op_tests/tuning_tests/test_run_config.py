@@ -19,6 +19,8 @@ import subprocess
 import sys
 import unittest
 
+import triton  # noqa: F401  # ROCm environments may require Triton before torch.
+
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
@@ -334,6 +336,12 @@ TUNER_FAMILIES = {
         "timeout": 1800,
         "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
     },
+    "mha_fwd": {
+        "script": "op_tests/tuners/tune_mha_fwd.py",
+        "csv_pattern": "tuned_mha_fwd",
+        "exclude_patterns": ["untuned"],
+        "config_property": "AITER_CONFIG_MHA_FWD",
+    },
 }
 
 
@@ -434,6 +442,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._test_family("gdn_k5_opt")
+
+    def test_mha_fwd(self):
+        self._test_family("mha_fwd")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
