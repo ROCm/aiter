@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL fused gather + kv_b_proj (DeepSeek MLA prefix expansion) tests.
+"""FlyDSL fused gather + kv_b_proj (MLA prefix expansion) tests.
 
 Covers the one configuration the FlyDSL backend implements: page_size 1, fp8 KV
 cache, fp8 ``shuffle_weight((16,16))`` weight, per-output-row weight scale,
-per-tensor activation scale, bf16 outputs, gfx950.
+per-tensor activation scale, bf16 outputs, gfx950 -- at both the DeepSeek
+128+128 head and the GLM-5.2 192+256 one.
 
 Checked against two independent references:
   * a float32 torch reference (ground truth), and
@@ -39,6 +40,11 @@ KV_PE_DIM = 64
 QK_NOPE_HEAD_DIM = 128
 V_HEAD_DIM = 128
 
+# (qk_nope_head_dim, v_head_dim). DeepSeek fills both B LDS halves exactly; GLM-5.2
+# is unequal, so the k half pads to 256 and its last 64 columns must be dropped.
+DIMS_DEEPSEEK = (QK_NOPE_HEAD_DIM, V_HEAD_DIM)
+DIMS_GLM = (192, 256)
+
 SUPPORTED_GFX = ("gfx950",)
 
 _SKIP = pytest.mark.skipif(
@@ -57,6 +63,7 @@ def _make_case(
     num_blocks=None,
     seed=0,
     device="cuda",
+    dims=DIMS_DEEPSEEK,
 ):
     """Build one page_size-1 gather case.
 
@@ -64,9 +71,10 @@ def _make_case(
     maximum and only ``num_tokens`` rows are live.
     """
     torch.manual_seed(seed)
+    nope, v_dim = dims
     alloc = alloc or num_tokens
     num_blocks = num_blocks or max(alloc, 64)
-    weight_n = n_heads * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)
+    weight_n = n_heads * (nope + v_dim)
 
     if num_blocks > 1 << 17:
         tile = (
@@ -109,13 +117,11 @@ def _make_case(
         )
 
     k_prefix = torch.zeros(
-        (alloc, n_heads, QK_NOPE_HEAD_DIM + KV_PE_DIM),
+        (alloc, n_heads, nope + KV_PE_DIM),
         device=device,
         dtype=torch.bfloat16,
     )
-    v_prefix = torch.zeros(
-        (alloc, n_heads, V_HEAD_DIM), device=device, dtype=torch.bfloat16
-    )
+    v_prefix = torch.zeros((alloc, n_heads, v_dim), device=device, dtype=torch.bfloat16)
     return {
         "k_buffer": k_buffer,
         "k_scale": k_scale,
@@ -129,6 +135,8 @@ def _make_case(
         "num_tokens": num_tokens,
         "n_heads": n_heads,
         "scale_mode": scale_mode,
+        "nope": nope,
+        "v_dim": v_dim,
     }
 
 
@@ -149,8 +157,9 @@ def _torch_ref(case):
             * ws[:, None, :, None]
         ).reshape(case["weight"].shape)
     scale = case["k_scale"].float()
-    proj = ((kv_c @ w.T) * scale).view(m, n_heads, QK_NOPE_HEAD_DIM + V_HEAD_DIM)
-    k_nope, v = proj.split([QK_NOPE_HEAD_DIM, V_HEAD_DIM], dim=-1)
+    nope, v_dim = case["nope"], case["v_dim"]
+    proj = ((kv_c @ w.T) * scale).view(m, n_heads, nope + v_dim)
+    k_nope, v = proj.split([nope, v_dim], dim=-1)
     rope = (k_pe * scale).unsqueeze(1).expand(-1, n_heads, -1)
     return torch.cat([k_nope, rope], dim=-1), v
 
@@ -178,26 +187,27 @@ def _run_flydsl(case, weight_preshuffle=True, **kw):
 
 
 @_SKIP
+@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
 @pytest.mark.parametrize(
     "num_tokens, n_heads, alloc, duplicate_indices, k_scale_value",
     [
         (512, 12, None, False, 1.0),
-        (2048, 12, None, False, 1.0),
-        (8192, 12, None, False, 1.0),
-        # M not a multiple of BLOCK_M=256: exercises the row tail.
-        (1000, 12, 1024, False, 1.0),
-        (1, 12, 256, False, 1.0),
+        # Enough tiles that the default BLOCK_M steps up to 256 for either head.
+        (4096, 12, None, False, 1.0),
+        # M not a multiple of BLOCK_M, and k_scale is 1.0 in the current
+        # deployment but must not be assumed.
+        (1000, 12, 1024, False, 0.37),
         # The prefix cache repeats slot ids.
-        (777, 12, 1024, True, 1.0),
-        # k_scale is 1.0 in the current deployment but must not be assumed.
-        (512, 12, None, False, 0.37),
-        (512, 16, None, False, 1.0),
+        (777, 16, 1024, True, 1.0),
+        (1, 12, 256, False, 1.0),
     ],
 )
 def test_gather_kv_b_proj_flydsl(
-    num_tokens, n_heads, alloc, duplicate_indices, k_scale_value
+    num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims
 ):
-    case = _make_case(num_tokens, n_heads, alloc, duplicate_indices, k_scale_value)
+    case = _make_case(
+        num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims=dims
+    )
     _run_flydsl(case)
     m = num_tokens
     k_ref, v_ref = _torch_ref(case)
@@ -264,13 +274,15 @@ def test_gather_kv_b_proj_flydsl_block_scale(num_tokens, n_heads, alloc, k_scale
 
 @_SKIP
 @pytest.mark.parametrize("num_tokens", [512, 1000])
-def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens):
+@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
+def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens, dims):
     """Row-major (un-preshuffled) weight must match the preshuffled path exactly.
 
     Same GEMM, only the B-side global->LDS address map and the K-tile stride
-    differ, so any difference here is an addressing bug, not arithmetic.
+    differ, so any difference here is an addressing bug, not arithmetic. The v
+    half starts at weight row ``nope``, which the two layouts reach differently.
     """
-    case = _make_case(num_tokens, 12)
+    case = _make_case(num_tokens, 12, dims=dims)
     _run_flydsl(case, weight_preshuffle=False)
     k_ref, v_ref = _torch_ref(case)
     m = num_tokens
@@ -289,7 +301,7 @@ def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens):
         msg="v_prefix, row-major weight",
     )
 
-    shuffled = _make_case(num_tokens, 12)
+    shuffled = _make_case(num_tokens, 12, dims=dims)
     _run_flydsl(shuffled, weight_preshuffle=True)
     assert torch.equal(
         case["k_prefix"], shuffled["k_prefix"]
@@ -326,14 +338,15 @@ def _supported(case, **kw):
 
 
 @_SKIP
-def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op():
+@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
+def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op(dims):
     """The predicate and the op must never disagree about a configuration.
 
     Both read one ``_unsupported_reason``; this pins that they keep doing so,
     because the failure mode of a second copy is a caller routing a shape here
     that the kernel then refuses mid-forward.
     """
-    ok = _make_case(256, 12)
+    ok = _make_case(256, 12, dims=dims)
     assert _supported(ok)
     _run_flydsl(ok)  # and it really runs
 
@@ -368,7 +381,7 @@ def test_gather_kv_b_proj_flydsl_declines_what_triton_covers(break_it):
         _run_flydsl(case)
 
 
-def _sparse_case(num_blocks, m, n_heads, lo):
+def _sparse_case(num_blocks, m, n_heads, lo, dims=DIMS_DEEPSEEK):
     """A case whose cache is zero except the ``m`` rows it gathers, all at or
     above row ``lo``.
 
@@ -386,7 +399,7 @@ def _sparse_case(num_blocks, m, n_heads, lo):
     k_buffer[kv_indices.long()] = torch.randint(
         1, 0x77, (m, 1, row), device="cuda", dtype=torch.uint8
     )
-    case = _make_case(m, n_heads, num_blocks=4096)
+    case = _make_case(m, n_heads, num_blocks=4096, dims=dims)
     case["k_buffer"] = k_buffer.view(dtypes.fp8)
     case["kv_indices"] = kv_indices
     return case
@@ -433,16 +446,20 @@ def test_gather_kv_b_proj_flydsl_spans_past_2gib():
 
 @_SKIP
 @pytest.mark.parametrize(
-    "num_blocks, wide",
+    "num_blocks, wide, dims",
     [
         # Brackets the switch: the widest cache one descriptor still spans, then
         # the narrowest it does not. Both gather only from the top of the cache.
-        ((2**32 - 1) // (KV_C_DIM + KV_PE_DIM), False),
-        (2**32 // (KV_C_DIM + KV_PE_DIM) + 1, True),
-        (9_000_000, True),  # 4.83 GiB -- well past, not just over
+        ((2**32 - 1) // (KV_C_DIM + KV_PE_DIM), False, DIMS_DEEPSEEK),
+        (2**32 // (KV_C_DIM + KV_PE_DIM) + 1, True, DIMS_DEEPSEEK),
+        (9_000_000, True, DIMS_DEEPSEEK),  # 4.83 GiB -- well past, not just over
+        # The wide A path addresses the cache; a split head moves B and the
+        # epilogue's column origin. Nothing is shared but the rope copy, whose
+        # source one changes and destination the other, so pin them composing.
+        (9_000_000, True, DIMS_GLM),
     ],
 )
-def test_gather_kv_b_proj_flydsl_brackets_the_descriptor_span(num_blocks, wide):
+def test_gather_kv_b_proj_flydsl_brackets_the_descriptor_span(num_blocks, wide, dims):
     """Either side of 4 GiB must agree with the reference.
 
     Past it the kernel drops the buffer descriptor for ``global_load_lds`` over
@@ -452,7 +469,17 @@ def test_gather_kv_b_proj_flydsl_brackets_the_descriptor_span(num_blocks, wide):
     row = KV_C_DIM + KV_PE_DIM
     assert (num_blocks * row >= 2**32) == wide
     lo = 2**31 // row + 1
-    _check_sparse_case(_sparse_case(num_blocks, 256, 12, lo))
+    _check_sparse_case(_sparse_case(num_blocks, 256, 12, lo, dims=dims))
+
+
+@_SKIP
+def test_gather_kv_b_proj_flydsl_rejects_block_scale_unequal_dims():
+    """A 128x128 block scale cuts across the k/v split unless both halves are 128,
+    which the one-scalar-per-half epilogue cannot represent."""
+    case = _make_case(256, 8, scale_mode="block", dims=DIMS_GLM)
+    assert not _supported(case)
+    with pytest.raises(ValueError, match="block scale"):
+        _run_flydsl(case)
 
 
 @_SKIP
@@ -473,21 +500,24 @@ def test_gather_kv_b_proj_flydsl_determinism_large_m(num_tokens, block_m):
 
 @_SKIP
 @pytest.mark.parametrize("block_m", [128, 256, 384])
-def test_gather_kv_b_proj_flydsl_rope_is_complete(block_m):
+@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
+def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m):
     """Every rope row must be written, and be a bitwise copy, for any BLOCK_M.
 
     The fused rope copy maps 512 threads onto 256 rows per pass, so BLOCK_M > 256
     needs more than one pass. A single pass leaves rows 256.. of every tile
     unwritten while the GEMM half stays perfectly correct -- silent missing data
-    that an accuracy check on k_nope / v cannot see.
+    that an accuracy check on k_nope / v cannot see. On GLM-5.2 dims the rope
+    columns sit right behind the k half's dropped ones, and every tile of a
+    split head writes them, so a mis-dropped store lands here.
     """
     # 1536 is divisible by all three block_m under test, so no tail masking
     # confounds the completeness check.
-    case = _make_case(1536, 12)
+    case = _make_case(1536, 12, dims=dims)
     case["k_prefix"].fill_(float("nan"))
     _run_flydsl(case, block_m=block_m)
 
-    rope = case["k_prefix"][:, :, QK_NOPE_HEAD_DIM:]
+    rope = case["k_prefix"][:, :, case["nope"] :]
     assert not torch.isnan(rope).any(), f"block_m={block_m}: rope rows left unwritten"
 
     idx = case["kv_indices"][: case["num_tokens"]].long()
@@ -498,16 +528,18 @@ def test_gather_kv_b_proj_flydsl_rope_is_complete(block_m):
 
 
 @_SKIP
-def test_gather_kv_b_proj_flydsl_tail_is_untouched():
+@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
+def test_gather_kv_b_proj_flydsl_tail_is_untouched(dims):
     """Rows past ``num_tokens`` must not be written.
 
     This is the check that catches a wrong ``num_records_bytes``: the caller
     preallocates the workspace at its maximum, so a bound derived from the
     tensor extent instead of the live row count would let tail workgroups
-    scribble on data the caller still owns.
+    scribble on data the caller still owns. The dropped k columns are steered
+    to exactly that bound, so an off-by-one there shows up here too.
     """
     m, alloc = 1000, 1024
-    case = _make_case(m, 12, alloc)
+    case = _make_case(m, 12, alloc, dims=dims)
     case["k_prefix"].fill_(float("nan"))
     case["v_prefix"].fill_(float("nan"))
     _run_flydsl(case)
@@ -519,10 +551,11 @@ def test_gather_kv_b_proj_flydsl_tail_is_untouched():
 
 @_SKIP
 @pytest.mark.parametrize("num_tokens", [512, 2048])
-def test_gather_kv_b_proj_flydsl_matches_triton(num_tokens):
+@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
+def test_gather_kv_b_proj_flydsl_matches_triton(num_tokens, dims):
     """Both backends consume the same preshuffled weight tensor."""
     n_heads = 12
-    case = _make_case(num_tokens, n_heads)
+    case = _make_case(num_tokens, n_heads, dims=dims)
     w_shuffled = shuffle_weight(case["weight"], layout=(16, 16))
     _run_flydsl(case)
 
@@ -556,8 +589,8 @@ def test_gather_kv_b_proj_flydsl_matches_triton(num_tokens):
     )
 
 
-def _bench(num_tokens, n_heads):
-    case = _make_case(num_tokens, n_heads)
+def _bench(num_tokens, n_heads, dims):
+    case = _make_case(num_tokens, n_heads, dims=dims)
     w_shuffled = shuffle_weight(case["weight"], layout=(16, 16))
     args = (
         case["k_buffer"],
@@ -572,16 +605,10 @@ def _bench(num_tokens, n_heads):
     )
     _, us_tri = run_perftest(triton_gather_kv_b_proj, *args, weight_preshuffle=True)
     _, us_fly = run_perftest(gather_kv_b_proj_flydsl, *args, num_tokens=num_tokens)
-    weight_n = n_heads * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)
+    nope, v_dim = dims
+    weight_n = n_heads * (nope + v_dim)
     tflops = 2 * num_tokens * weight_n * KV_C_DIM / us_fly * 1e-6
-    out_gb = (
-        num_tokens
-        * n_heads
-        * (QK_NOPE_HEAD_DIM + KV_PE_DIM + V_HEAD_DIM)
-        * 2
-        / us_fly
-        * 1e-3
-    )
+    out_gb = num_tokens * n_heads * (nope + KV_PE_DIM + v_dim) * 2 / us_fly * 1e-3
     return us_tri, us_fly, tflops, out_gb
 
 
@@ -594,13 +621,17 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-heads", type=int, default=12, help="tp_k_head_num")
+    parser.add_argument(
+        "-dims", type=int, nargs=2, default=DIMS_GLM, help="qk_nope_head_dim v_head_dim"
+    )
     args = parser.parse_args()
+    dims = tuple(args.dims)
 
     rows = []
     for m in (2048, 8192, 16384):
-        rows.append((m, *_bench(m, args.heads)))
+        rows.append((m, *_bench(m, args.heads, dims)))
 
-    print(f"\n## gather_kv_b_proj, {args.heads} heads, K=512\n")
+    print(f"\n## gather_kv_b_proj {dims[0]}+{dims[1]}, {args.heads} heads, K=512\n")
     print("| M | triton us | flydsl us | speedup | flydsl TFLOPS | out GB/s |")
     print("|---|---|---|---|---|---|")
     for m, us_t, us_f, tf, gb in rows:
