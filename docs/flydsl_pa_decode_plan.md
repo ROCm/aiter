@@ -84,7 +84,7 @@ satisfy the same validity requirements as static attention.
 ## Verification and performance
 
 ```bash
-python -m pytest -q op_tests/test_flydsl_pa_decode_plan.py
+python -m pytest -q op_tests/test_flydsl_pa_decode.py
 python -m op_tests.benchmark_flydsl_pa_decode_plan --output plan_results.json
 ```
 

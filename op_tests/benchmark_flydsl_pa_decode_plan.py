@@ -21,7 +21,7 @@ from aiter.ops.flydsl.pa_decode import (
     plan_pa_decode,
 )
 from aiter.test_common import run_perftest
-from op_tests import flydsl_pa_decode_test_utils as reference_tests
+from op_tests import test_flydsl_pa_decode as reference_tests
 
 CASES = {
     "b1_uniform": [200000],
