@@ -6,6 +6,7 @@
 Phase 0: fp32 oracle + shared family A/B shapes.
 Phase 2d: family A FlyDSL K1 writes ``block_ids [M, 512]`` from paged
 compressed K (512-slot tiles, eight waves per row, no score matrix).
+Phase 2e: family B FlyDSL K1 ``H=4`` on the same emit path.
 Expand+tail and K2 are still separate.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
@@ -42,6 +43,7 @@ from .kernels.qsa import (
     qsa_visible_blocks,
 )
 from .kernels.qsa.k1_family_a import qsa_k1_family_a_block_ids
+from .kernels.qsa.k1_family_b import qsa_k1_family_b_block_ids
 
 __all__ = [
     "FAMILY_A_GQA",
@@ -59,6 +61,7 @@ __all__ = [
     "qsa_expand_tail",
     "qsa_indexer_scores",
     "qsa_k1_family_a_block_ids",
+    "qsa_k1_family_b_block_ids",
     "qsa_oracle",
     "qsa_sparse_gqa",
     "qsa_topk_blocks",
