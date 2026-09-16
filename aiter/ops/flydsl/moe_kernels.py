@@ -111,6 +111,11 @@ def requires_flydsl_stage2_reduce(
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
 
 
+def requires_flydsl_stage2_global_a(a: torch.Tensor) -> bool:
+    """Return whether A's stored bytes reach the 4 GiB buffer descriptor limit."""
+    return a.numel() * a.element_size() >= (1 << 32)
+
+
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
     """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value.
 
@@ -723,6 +728,7 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mode: str = "atomic",
+    use_global_a: bool = True,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -769,6 +775,7 @@ def compile_flydsl_moe_stage2(
             sort_block_m=sort_block_m,
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
+            use_global_a=use_global_a,
             cu_num_mul=cu_num_mul,
             # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
             # from the kernel-name parser. They are accepted as ignored
@@ -2262,6 +2269,7 @@ def _flydsl_moe_stage2_impl(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=requires_flydsl_stage2_global_a(inter_states),
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
