@@ -1039,7 +1039,8 @@ def get_autotune_bwd_configs():
         "attention", "FP8_ATTN", "_bwd_kernels", _BWD_FALLBACK
     )
     return autotune_configs("FP8_ATTN_BWD", [pinned], pinned), [
-        "BLOCK_DMODEL",
+        "BLOCK_DMODEL_QK",
+        "BLOCK_DMODEL_V",
         "ACTUAL_BLOCK_DMODEL_QK",
         "ACTUAL_BLOCK_DMODEL_V",
         "SEQUENCE_PARALLEL",
