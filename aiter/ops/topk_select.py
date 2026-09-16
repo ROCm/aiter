@@ -61,7 +61,11 @@ from aiter.ops.topk import (
     top_k_per_row_prefill_sampled,
     topk_sampled_supports,
 )
-from aiter.ops.topk_plain import topk_plain, topk_plain_batches_ragged_rows
+from aiter.ops.topk_plain import (
+    topk_plain,
+    topk_plain_batches_ragged_rows,
+    topk_plain_values_optional,
+)
 
 __all__ = ["topk_select", "topk_select_backend"]
 
@@ -792,10 +796,18 @@ def _dispatch(
         # `rowStarts` with a real `rowEnds` reads as "no range" -- silently over
         # the whole row. Pass the pair only when the rows really differ: uniform
         # rows through the ranged overload cost 294918 launches against 25.
-        # Write-only scratch: the caller never sees these values. Left to the
-        # caching allocator rather than kept, the way `get_topk_scratch_workspace`
-        # argues for -- a kept buffer would be shared across streams.
-        vals = torch.empty_like(idx, dtype=input.dtype)
+        # The values are never read: whatever this entry returns is gathered
+        # from `input` at `idx` below, because that is the only form that stays
+        # consistent through the reorderings. So ask for the build that does not
+        # write them. Outside the radix path there is no such build and the
+        # buffer is real, left to the caching allocator rather than kept, the
+        # way `get_topk_scratch_workspace` argues for: a kept buffer would be
+        # shared across streams.
+        vals = (
+            None
+            if topk_plain_values_optional(input.shape[-1], topk)
+            else torch.empty_like(idx, dtype=input.dtype)
+        )
         if ragged:
             starts = torch.zeros_like(row_lens)
             topk_plain(input, idx, vals, topk, True, starts, row_lens, -1, 1)
