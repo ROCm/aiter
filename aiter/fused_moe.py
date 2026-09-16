@@ -444,6 +444,16 @@ def _moe_sorting_impl(
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    # ROOT-CAUSE FIX (HIP illegal memory access in flydsl mxfp4 A4W4 atomic gemm2):
+    # Pad the sorted/intermediate row extent to a full block_size multiple. The
+    # flydsl mxfp4 gemm kernels size their A buffer-descriptor num_records to
+    # max_num_m_blocks*block_size rows and, on the non-persistent (atomic) path,
+    # issue A-loads for EVERY grid block (incl. the trailing padding block) before
+    # the in-bounds (bx < bound) check, relying on the descriptor to clamp. If the
+    # buffers are not padded to a full block multiple, that descriptor over-runs the
+    # allocation and faults on an unmapped page. _adaptive_moe_sort already keeps
+    # this multiple; the opus/flydsl sort paths must match it.
+    max_num_tokens_padded = max_num_m_blocks * block_size
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
@@ -550,6 +560,16 @@ def _flydsl_moe_sorting(
     M, topk = topk_ids.shape
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    # ROOT-CAUSE FIX (HIP illegal memory access in flydsl mxfp4 A4W4 atomic gemm2):
+    # Pad the sorted/intermediate row extent to a full block_size multiple. The
+    # flydsl mxfp4 gemm kernels size their A buffer-descriptor num_records to
+    # max_num_m_blocks*block_size rows and, on the non-persistent (atomic) path,
+    # issue A-loads for EVERY grid block (incl. the trailing padding block) before
+    # the in-bounds (bx < bound) check, relying on the descriptor to clamp. If the
+    # buffers are not padded to a full block multiple, that descriptor over-runs the
+    # allocation and faults on an unmapped page. _adaptive_moe_sort already keeps
+    # this multiple; the opus/flydsl sort paths must match it.
+    max_num_tokens_padded = max_num_m_blocks * block_size
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
