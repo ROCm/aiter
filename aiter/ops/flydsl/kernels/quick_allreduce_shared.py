@@ -220,7 +220,7 @@ def _acquire_inbox():
     A flag load that carries ``sc0 sc1`` can never be answered from a stale
     line, so the retry loop needs no fence of its own; what needs one is the
     payload read that follows, and that needs it exactly once. See
-    :func:`quick_allreduce_int4.make_quick_allreduce_int4_kernel._wait_release`.
+    :func:`quick_allreduce_mesh.make_quick_allreduce_mesh_kernel._wait_release`.
     """
     llvm.fence(llvm.AtomicOrdering.acquire, syncscope="one-as")
 
