@@ -467,6 +467,21 @@ def compile_conv3d_implicit(
     assert X_BYTES < OOB_SENTINEL_BYTES or BIG_IN, f"input {X_BYTES}B exceeds limit"
     BIG_IN_N1 = BIG_IN and n == 1
     BIG_IN_NM = BIG_IN and n > 1
+    X_SAMPLE_ELEMS = c * d * h * w
+
+    # n > 1 rebases the descriptor once per sample, so a tap can sit anywhere in
+    # the sample and the whole sample has to fit the 2 GB num_records -- unlike
+    # the per-tile rebasing below, whose reach is bounded by the tile. Without
+    # this check, taps past 2 GB fall outside num_records and read as zero, which
+    # is silently wrong rather than an error. Note how little room that leaves:
+    # BIG_IN needs n * sample > 2 GiB of elements, so at n == 2 the only sample
+    # size that both trips BIG_IN and fits is exactly 2 GB.
+    assert not BIG_IN_NM or X_SAMPLE_ELEMS * BF16_BYTES <= BIG_IN_NR, (
+        f"batched input sample too large for the 32-bit gather: one sample spans "
+        f"{X_SAMPLE_ELEMS * BF16_BYTES / 2**30:.2f} GiB, past the "
+        f"{BIG_IN_NR / 2**30:.0f} GiB the per-sample buffer descriptor addresses. "
+        f"Loop over N instead of batching."
+    )
 
     _t_aligned = BIG_IN_N1 and hw_o % TILE_M == 0
     if BIG_IN_N1:
@@ -491,7 +506,6 @@ def compile_conv3d_implicit(
     assert (
         pad_mode == "zeros" or not BIG_IN
     ), "non-zero pad_mode requires the non-BIG_IN address path"
-    X_SAMPLE_ELEMS = c * d * h * w
 
     tiles_per_group = (KG + TILE_N - 1) // TILE_N
     n_tail = KG % TILE_N != 0
