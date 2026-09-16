@@ -118,9 +118,13 @@ class GpuArch:
 # Global Variables
 # -------------------------------
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+# Default off, matching every other autotuned family in the tree: a search at
+# launch costs compile time, breaks CUDA-graph capture, and makes a test's
+# numerics depend on which config the timing picked. The variable name is
+# upstream's and is exported by flash_attention_integration.yaml, so it stays.
 AUTOTUNE: AutotuneMode = (
     "on"
-    if os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "1").lower()
+    if os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0").lower()
     in ("1", "true", "yes", "on")
     else "off"
 )

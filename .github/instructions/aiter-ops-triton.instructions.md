@@ -229,11 +229,9 @@ values for either backend live in JSON, never in Python. Flag:
   pick that run. Pass `default_config=` when the list's first entry is not the
   one to pin.
 
-  Two exemptions, both already equivalent: `flash_attn_triton_amd/` is a
-  vendored port gated by `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE`, and
-  `chunk_delta_attn`'s `_K2_CONFIGS` comes from
-  `chunk_delta_attn_tuned_config_shortlist` under
-  `CHUNK_DELTA_ATTN_TRITON_AUTOTUNE`. Anything new follows the rule above.
+  There are no exemptions. A family that already published its own variable
+  name keeps it by passing `env=`, as `flash_attn_triton_amd/` does with
+  `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE` — it still goes through this helper.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 
