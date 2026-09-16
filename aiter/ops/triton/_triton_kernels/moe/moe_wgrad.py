@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
 def _get_autotune_configs():
@@ -49,7 +50,15 @@ def _get_autotune_configs():
 
 
 @triton.autotune(
-    configs=_get_autotune_configs(),
+    configs=autotune_configs(
+        "MOE_WGRAD",
+        _get_autotune_configs(),
+        default_config=triton.Config(
+            {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ),
     key=["N", "K"],
     # dW is accumulated via tl.atomic_add; reset it to zero before each
     # benchmark trial so timing runs don't corrupt the final result.
