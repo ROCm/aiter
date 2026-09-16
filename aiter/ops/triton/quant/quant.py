@@ -22,7 +22,11 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_tuned_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -234,33 +238,19 @@ def dynamic_mxfp4_quant(
     if arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16:
         cfg_dir = resolve_config_dir("quant", "MXFP4_QUANT", backend="gluon")
         tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+        cfg = select_tuned_config(tuned, M=M, N=N)
+        NUM_ITER = cfg["NUM_ITER"]
+        BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+        NUM_WARPS = cfg["NUM_WARPS"]
+        NUM_STAGES = cfg["NUM_STAGES"]
 
+        # Shape-derived, not tunable via JSON.
         if M <= 32:
-            bucket = tuned["M_LEQ_32"]
-            NUM_ITER = bucket["NUM_ITER"]
-            NUM_WARPS = bucket["NUM_WARPS"]
-            NUM_STAGES = bucket["NUM_STAGES"]
             BLOCK_SIZE_M = triton.next_power_of_2(M)
             BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
-        else:
-            bucket = tuned["default"]
-            NUM_ITER = bucket["NUM_ITER"]
-            BLOCK_SIZE_M = bucket["BLOCK_SIZE_M"]
-            BLOCK_SIZE_N = bucket["BLOCK_SIZE_N"]
-            NUM_WARPS = bucket["NUM_WARPS"]
-            NUM_STAGES = bucket["NUM_STAGES"]
-
-            if N <= 16384:
-                bucket = tuned["N_LEQ_16384"]
-                BLOCK_SIZE_M = bucket["BLOCK_SIZE_M"]
-                BLOCK_SIZE_N = bucket["BLOCK_SIZE_N"]
 
         if N <= 1024:
-            bucket = tuned["N_LEQ_1024"]
-            NUM_ITER = bucket["NUM_ITER"]
-            NUM_WARPS = bucket["NUM_WARPS"]
-            NUM_STAGES = bucket["NUM_STAGES"]
-            # BLOCK_SIZE_N needs to be multiple of 32
             BLOCK_SIZE_N = max(32, min(128, triton.next_power_of_2(N)))
             BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
 
@@ -396,33 +386,17 @@ def dynamic_mxfp8_quant(
     ):
         cfg_dir = resolve_config_dir("quant", "MXFP8_QUANT", backend="gluon")
         tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+        cfg = select_tuned_config(tuned, M=M, K=K)
 
-        if M <= 32:
-            cfg = dict(tuned["M_LEQ_32"])
-            cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
+        # Shape-derived; K<=1024's BLOCK_SIZE_M=8 must win when both apply.
+        if M <= 32 and K > 1024:
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            cfg["BLOCK_SIZE_M"] = BLOCK_SIZE_M
             cfg["BLOCK_SIZE_N"] = max(
-                32, min(4096 // cfg["BLOCK_SIZE_M"], triton.next_power_of_2(K))
+                32, min(4096 // BLOCK_SIZE_M, triton.next_power_of_2(K))
             )
-        else:
-            cfg = dict(tuned["default"])
-            if K <= 16384:
-                cfg.update(tuned["K_LEQ_16384"])
-                if M >= 8192:
-                    # Larger M benefits from bigger, fewer tiles.
-                    cfg.update(tuned["K_LEQ_16384_M_GEQ_8192"])
-                if K > 4096 and M >= 1024:
-                    # Wider K wants a bigger BLOCK_SIZE_N / fewer warps, but
-                    # only once M is large enough (regresses at M<1024 or
-                    # K<=4096).
-                    cfg.update(tuned["K_GT_4096_M_GEQ_1024"])
 
         if K <= 1024:
-            # Narrow K: uncap BLOCK_SIZE_N to next_pow2(K) instead of capping
-            # at 128; drop NUM_WARPS once M is large enough to keep occupancy
-            # up despite grid_N collapsing to 1.
-            cfg.update(
-                tuned["K_LEQ_1024_M_GEQ_8192"] if M >= 8192 else tuned["K_LEQ_1024"]
-            )
             cfg["BLOCK_SIZE_N"] = max(32, min(1024, triton.next_power_of_2(K)))
 
         NUM_ITER = cfg["NUM_ITER"]
