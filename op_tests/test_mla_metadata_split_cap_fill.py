@@ -59,19 +59,25 @@ def _kv_lens(batch_size, ctx_len, jitter):
     return [rng.randint(max(1, ctx_len // 2), ctx_len) for _ in range(batch_size)]
 
 
-def _plan(batch_size, cap, ctx_len, jitter, slack=1):
+def _plan(
+    batch_size, cap, ctx_len, jitter, slack=1, nhead=NHEAD, qlen=MAX_SEQLEN_QO, topk=-1
+):
     """Allocate from the sizing, run the planner, return the buffers.
 
     `slack` multiplies every buffer so a tight allocation can be compared
-    against a roomy one.
+    against a roomy one. `qlen` selects the planner: v1.2 takes its parallel
+    path only at max_seqlen_qo == 1 (v1_2_device.cuh:757-760). `topk >= 0`
+    switches both calls to the sparse path -- the C++ derives is_sparse from
+    topk, so sizing and fill must agree on it or they describe different shapes.
     """
+    is_sparse = topk >= 0
     sizes = aiter.get_mla_metadata_info_v1(
         batch_size,
-        MAX_SEQLEN_QO,
-        NHEAD,
+        qlen,
+        nhead,
         dtypes.fp8,
         dtypes.fp8,
-        is_sparse=False,
+        is_sparse=is_sparse,
         fast_mode=True,
         max_split_per_batch=cap,
     )
@@ -85,22 +91,20 @@ def _plan(batch_size, cap, ctx_len, jitter, slack=1):
     kv_lens = _kv_lens(batch_size, ctx_len, jitter)
     qo_indptr = torch.arange(
         0,
-        (batch_size + 1) * MAX_SEQLEN_QO,
-        MAX_SEQLEN_QO,
+        (batch_size + 1) * qlen,
+        qlen,
         dtype=torch.int32,
         device="cuda",
     )
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
-    kv_indptr[1:] = torch.tensor(
-        kv_lens, dtype=torch.int32, device="cuda"
-    ).cumsum(0)
+    kv_indptr[1:] = torch.tensor(kv_lens, dtype=torch.int32, device="cuda").cumsum(0)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int32, device="cuda")
 
     aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         kv_last_page_lens,
-        NHEAD // KIMI_NHEAD_KV,
+        nhead // KIMI_NHEAD_KV,
         KIMI_NHEAD_KV,
         IS_CAUSAL,
         outs["work_meta_data"],
@@ -111,10 +115,18 @@ def _plan(batch_size, cap, ctx_len, jitter, slack=1):
         outs["reduce_partial_map"],
         page_size=PAGE_SIZE,
         kv_granularity=KV_GRANULARITY,
-        max_seqlen_qo=MAX_SEQLEN_QO,
-        uni_seqlen_qo=UNI_SEQLEN_QO,
+        max_seqlen_qo=qlen,
+        uni_seqlen_qo=qlen,
         fast_mode=True,
         max_split_per_batch=cap,
+        topk=topk,
+        # MUST match the dtypes the sizing call above used. Omitting these makes
+        # the C++ planner default BOTH to bf16 (csrc/kernels/mla/metadata.cu:89),
+        # and the native-support gate is dtype-dependent: on gfx942 nhead=128 is
+        # native in fp8 but folds to 16 heads in bf16, so a sized-for-fp8 buffer
+        # would be filled by a planner using an 8x larger effective batch.
+        dtype_q_nope=dtypes.fp8,
+        dtype_kv_nope=dtypes.fp8,
     )
     torch.cuda.synchronize()
     return outs
@@ -203,4 +215,105 @@ def test_a_tight_buffer_matches_an_oversized_one(batch_size, cap, ctx_len, jitte
     ), f"batch={batch_size} cap={cap}: tight buffer differs from the roomy one"
 
 
+def main():
+    """aiter's CI runs each op_tests module with `python3`, not pytest."""
+    if not torch.cuda.is_available():
+        aiter.logger.warning("no GPU available; skipping metadata fill tests")
+        return
+    for row in ROWS:
+        batch_size, cap, ctx_len, jitter = row.values
+        test_the_planner_fits_the_sized_buffers(batch_size, cap, ctx_len, jitter)
+        test_the_fit_check_is_not_vacuous(batch_size, cap, ctx_len, jitter)
+        test_a_tight_buffer_matches_an_oversized_one(batch_size, cap, ctx_len, jitter)
+    test_the_tightest_allocation_does_not_overflow()
+    for nhead, cap in ((48, 16), (48, 256)):
+        test_a_folded_head_count_still_fits(nhead, cap)
+    for batch_size, cap, jitter in (
+        (1, 256, False),
+        (8, 256, False),
+        (64, 256, False),
+        (512, 256, True),
+    ):
+        test_the_parallel_planner_fits_at_qlen_one(batch_size, cap, jitter)
+    for batch_size, cap, topk in ((1, 256, 2048), (8, 256, 2048)):
+        test_a_sparse_shape_fits_the_capped_bound(batch_size, cap, topk)
+    aiter.logger.info("mla metadata split-cap fill tests: all passed")
 
+
+# gfx950 fp8 serves 32/64/128 heads natively but NOT 48, so the planner folds 48
+# to 16 and triples its batch count before applying the cap
+# (v1_2_device.cuh:910-928). Only cap=256 is used: cap 1 and 4 write ZERO
+# partials at this shape, so `0 <= bound` would pass for any bound at all.
+#
+# cap=16 is the row that DISCRIMINATES the fold: the planner writes 48 partials
+# there (exactly cap x qk_batch_ratio), against an unfolded bound of 28, so
+# dropping the fold overflows. cap=256 does not discriminate -- per_tile_cap
+# saturates at max_splits either way -- but it is kept as the non-overflow check
+# at the largest capped shape.
+@pytest.mark.parametrize("nhead,cap", [(48, 16), (48, 256)])
+def test_a_folded_head_count_still_fits(nhead, cap):
+    outs = _plan(1, cap, 65536, jitter=False, nhead=nhead)
+    filled = int(outs["reduce_indptr"][-1])
+    bound = outs["reduce_partial_map"].numel()
+    assert filled <= bound, (
+        f"nhead={nhead} cap={cap}: planner wrote {filled} partials into a "
+        f"{bound}-entry reduce_partial_map -- the qk_batch_ratio fold was not "
+        f"applied to the sizing"
+    )
+    print(f"\n  nhead={nhead:>4} cap={cap:>4}  partials={filled:>5}/{bound:<5}")
+
+
+# v1.2 selects its parallel planner only at max_seqlen_qo == 1
+# (v1_2_device.cuh:757-760), which every other row here misses because they all
+# use qlen 4. It also packs the bound far tighter: batch 8 fills 262 of 263, a
+# single entry of headroom, against 256/260 on the qlen=4 path. An off-by-one in
+# the cap-aware bound shows up here and nowhere else.
+@pytest.mark.parametrize(
+    "batch_size,cap,jitter",
+    [(1, 256, False), (8, 256, False), (64, 256, False), (512, 256, True)],
+)
+def test_the_parallel_planner_fits_at_qlen_one(batch_size, cap, jitter):
+    outs = _plan(batch_size, cap, 65536, jitter=jitter, qlen=1)
+    filled = int(outs["reduce_indptr"][-1])
+    bound = outs["reduce_partial_map"].numel()
+    assert filled > 0, f"batch={batch_size} qlen=1 wrote no partials -- vacuous row"
+    assert filled <= bound, (
+        f"batch={batch_size} cap={cap} qlen=1: planner wrote {filled} partials "
+        f"into a {bound}-entry reduce_partial_map"
+    )
+    assert int(outs["work_indptr"][-1]) <= outs["work_info_set"].size(0)
+    print(
+        f"\n  qlen=1 batch={batch_size:>4} cap={cap:>4}  partials={filled:>5}/{bound:<5}"
+    )
+
+
+# The cap-aware branch is reachable with is_sparse=True as well, and sizing
+# there uses the raw KV batch count rather than the sparse-expanded one
+# (v1_2_device.cuh:860).
+#
+# NOTE this proves the sparse bound is not *under*-sized, but it cannot catch
+# the reverse: sizing from the expanded batch over-reserves, so nothing
+# overflows and this still passes. Pinning that would mean asserting an exact
+# size, i.e. restating the formula the test is meant to check independently.
+# The raw-count requirement rests on v1_2_device.cuh:860. Drives both calls from one topk so they describe the
+# same shape. batch 64 and small caps are excluded: measured, they write zero
+# partials, and `0 <= bound` proves nothing.
+@pytest.mark.parametrize("batch_size,cap,topk", [(1, 256, 2048), (8, 256, 2048)])
+def test_a_sparse_shape_fits_the_capped_bound(batch_size, cap, topk):
+    outs = _plan(batch_size, cap, 65536, jitter=False, topk=topk)
+    filled = int(outs["reduce_indptr"][-1])
+    bound = outs["reduce_partial_map"].numel()
+    assert filled > 0, f"sparse batch={batch_size} wrote no partials -- vacuous row"
+    assert filled <= bound, (
+        f"sparse batch={batch_size} cap={cap} topk={topk}: planner wrote "
+        f"{filled} partials into a {bound}-entry reduce_partial_map -- the cap "
+        f"must be derived from the raw KV batch count, not the expanded one"
+    )
+    assert int(outs["work_indptr"][-1]) <= outs["work_info_set"].size(0)
+    print(
+        f"\n  sparse batch={batch_size:>4} cap={cap:>4}  partials={filled:>5}/{bound:<5}"
+    )
+
+
+if __name__ == "__main__":
+    main()
