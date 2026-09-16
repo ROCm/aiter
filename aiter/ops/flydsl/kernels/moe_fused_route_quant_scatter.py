@@ -94,9 +94,9 @@ from aiter.utility.mx_types import (
 )
 
 BLOCK_THREADS = 256
-# LDS the fused kernel's phase-2 scale tile may take. Sized so a whole scale row
-# stages at once: slicing k costs nothing on the store side but makes the
-# gathered loads shorter, which is what that pass is short of.
+# LDS the scale rebuild's row-tile may take. Sized so a whole scale row stages at
+# once: slicing k costs nothing on the store side but makes the gathered loads
+# shorter, which is what that pass is short of.
 _PRESHUF_LDS = 32768
 # Nominal extent of a live destination descriptor; a dead one gets 0 instead.
 # It only has to exceed any real buffer, and stays under 2 GiB because the
@@ -2144,10 +2144,10 @@ def build_moe_token_multidest_quant_module(
 def fused_quant_preshuffle_supported(
     feat_dim: int, wmma_rep: int, quant_mode: str
 ) -> bool:
-    """Whether ``build_moe_token_multidest_quant_fused_module`` accepts a shape.
+    """Whether the compact-quant + scale-rebuild pair accepts a shape.
 
     Geometry only -- whether the routing takes the token-multidest path at all
-    is the dispatcher's call. Cheaper than building the module and catching the
+    is the dispatcher's call. Cheaper than building the modules and catching the
     error, and the caller has to size the extra buffers before it launches.
     """
     try:
@@ -2173,29 +2173,19 @@ def _fused_preshuffle_k_chunks(L) -> int:
     return src_dwords // k_chunk
 
 
-def build_moe_token_multidest_quant_fused_module(
+def build_moe_token_multidest_compact_quant_module(
     feat_dim: int,
     wmma_rep: int,
     topk: int,
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
 ):
-    """Quant and scale-preshuffle in one launch, split by a grid-wide barrier.
+    """Token-multidest quant writing a COMPACT per-token e8m0 scale.
 
-    The compact scale the quant pass writes is per source token, while the GEMM
-    reads a 16-row-interleaved layout whose cache line spans 16 consecutive
-    grouped rows -- rows that belong to 16 unrelated tokens. No workgroup owns
-    them, so the rebuild cannot run inside the token loop; it needs every token
-    quantized first. A persistent grid plus the spin barrier below buys that
-    ordering without a second launch.
-
-    Phase 1 (all workers): strided token loop -- quantize once, scatter the
-             payload to ``topk`` grouped rows, write the compact scale row and
-             the grouped-row -> token map.
-    Barrier : every block-leader arrives on ``barrier[0]``; the last arriver
-             publishes ``barrier[1]``, the rest spin on it.
-    Phase 2 (all workers): strided tile loop -- gather the tile's compact rows
-             through LDS and write the interleaved layout, both sides coalesced.
+    Like ``build_moe_token_multidest_quant_module`` except the scale goes out one
+    contiguous row per source token instead of interleaved, so the stores
+    coalesce; ``build_moe_scale_rebuild_module`` converts it and consumes the
+    ``row_to_token`` map written here. Grid-stride over tokens.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -2213,13 +2203,11 @@ def build_moe_token_multidest_quant_fused_module(
     warps_per_block = L.warps_per_block
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
-    rows_per_tile = L.rows_per_tile
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
-    _is_gfx12 = str(L.arch).startswith("gfx12")
 
     if lanes_per_mx_block != 4:
-        raise NotImplementedError("fused preshuffle needs the pk8 4-lane MX block")
+        raise NotImplementedError("compact quant needs the pk8 4-lane MX block")
     if tdm_hidden_chunks and (
         block_iters % tdm_hidden_chunks or (feat_dim * 2) % (tdm_hidden_chunks * 16)
     ):
@@ -2228,44 +2216,26 @@ def build_moe_token_multidest_quant_fused_module(
             f"{block_iters} and leave a 16 B-aligned chunk of {feat_dim * 2} B"
         )
     hidden_chunk_bytes = feat_dim * 2 // tdm_hidden_chunks if tdm_hidden_chunks else 0
-
-    # --- phase 2 geometry (mirrors build_moe_gather_preshuffle_scale_lds_module) ---
-    src_dwords = mx_blocks_per_row // 4
-    units_per_tile = 16 * src_dwords * wmma_rep
+    # Checked here too: this kernel sizes the buffer the rebuild has to stage.
     if _fused_preshuffle_k_chunks(L) != 1:
-        # A k-sliced tile would need its slices on separate blocks, which the
-        # one-block-per-tile loop below cannot express.
-        raise NotImplementedError("fused preshuffle needs the whole row in LDS")
-    k_chunk = src_dwords
-    # One dword of padding per row: the store pass reads an LDS column, whose
-    # natural stride would share banks, and an odd pitch is coprime with 32.
-    lds_pitch = k_chunk + 1
-    units_per_chunk = rows_per_tile * k_chunk
-    VEC = 4 if (k_chunk % 4 == 0) else 1
-    pre_iters = ((units_per_chunk // VEC) + BLOCK_THREADS - 1) // BLOCK_THREADS
-
-    @fx.struct
-    class _ScaleTileStorage:
-        buf: fx.Array[fx.Int32, rows_per_tile * lds_pitch, 16]
+        raise NotImplementedError("compact scale needs the whole row in LDS")
 
     module_name = (
         f"moe_token_multidest_quant_fusepre_k{topk}_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
+        "_quant"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-    def fused_quant_preshuffle_kernel(
+    def compact_quant_kernel(
         hidden: fx.Pointer,
         grouped_payload: fx.Pointer,
         compact_scale_buf: fx.Pointer,
-        wmma_scale_out: fx.Pointer,
         topids_to_rows: fx.Pointer,
         row_to_token: fx.Pointer,
-        barrier: fx.Pointer,
         token_num: Int32,
-        num_tiles: Int32,
-        num_workers: Int32,
+        grid_blocks: Int32,
     ):
         i32 = T.i32
         f32 = T.f32
@@ -2281,7 +2251,6 @@ def build_moe_token_multidest_quant_fused_module(
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
-        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
         c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
         c_wpb = arith.constant(warps_per_block, type=i32)
@@ -2291,17 +2260,12 @@ def build_moe_token_multidest_quant_fused_module(
         warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
         lane = tid - warp_in_block * c_wave
 
-        # LDS is allocated once and used by both phases; the barrier between
-        # them is what makes the reuse safe.
         hslot = warps_per_block * hidden_chunk_bytes if tdm_hidden_chunks else 0
         h_lds = None
         hidden_lds_idx = None
         hidden_lds_load = None
         hidden_lds_row_off = c0_i32
         is_loader = warp_in_block == fx.Uint32(c0_i32)
-        # One allocator per kernel, so both phases carve out of it. The phases
-        # are separated by the grid barrier, but keep the regions disjoint: the
-        # barrier orders the two phases, not one block's own LDS reuse.
         _lds = fx.SharedAllocator()
         if const_expr(tdm_hidden_chunks):
             h_lds = _lds.allocate(2 * hslot)._ptr
@@ -2310,31 +2274,7 @@ def build_moe_token_multidest_quant_fused_module(
             hidden_lds_row_off = warp_in_block * arith.constant(
                 hidden_chunk_bytes, type=i32
             )
-        tile_lds = _lds.allocate(_ScaleTileStorage).peek().buf.ptr
 
-        def _wait_mem():
-            if const_expr(_is_gfx12):
-                rocdl.s_wait_loadcnt(0)
-                rocdl.s_wait_storecnt(0)
-            else:
-                rocdl.s_waitcnt(0)
-
-        def _atomic_add(tensor, elem_idx_i32, addend):
-            addr = fx.Int64(ptrtoint(tensor)) + fx.Int64(elem_idx_i32) * 4
-            p = create_llvm_ptr(addr)
-            ptr = p._value if hasattr(p, "_value") else p
-            return fx.Uint32(
-                llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    ptr,
-                    addend,
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                ).result
-            )
-
-        # ===================== Phase 1: quant + scatter =====================
         def _quant_token_group(token0):
             """Quantize one block's worth of tokens and emit every copy."""
             token = token0 + warp_in_block
@@ -2478,40 +2418,107 @@ def build_moe_token_multidest_quant_fused_module(
             )
             _emit_quant_block_loop(qc)
 
-        step = fx.Uint32(num_workers) * c_wpb
+        step = fx.Uint32(grid_blocks) * c_wpb
         for token0 in range(bid * c_wpb, fx.Uint32(token_num), step):
             _quant_token_group(token0)
 
-        # ============================= Barrier ==============================
-        gpu.barrier()
-        _wait_mem()
-        rocdl.sched_barrier(0)
+    @flyc.jit
+    def launch_compact_quant(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        compact_scale_buf: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        row_to_token: fx.Pointer,
+        token_num: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        compact_quant_kernel(
+            hidden,
+            grouped_payload,
+            compact_scale_buf,
+            topids_to_rows,
+            row_to_token,
+            token_num,
+            grid_blocks,
+        ).launch(
+            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
 
-        is_block_leader = tid == c0_i32
-        if is_block_leader:
-            my_arrival = _atomic_add(barrier, c0_i32, c1_i32)
-            nwm1 = fx.Uint32(num_workers) - 1
-            is_last = my_arrival == nwm1
-            is_not_last = my_arrival != nwm1
-            if is_last:
-                # Every block's compact-scale stores are committed to L2 before
-                # its arrival atomic, so releasing here publishes all of them.
-                _wait_mem()
-                _atomic_add(barrier, c1_i32, c1_i32)
-            if is_not_last:
-                rel = fx.Uint32(0)
-                while rel == 0:
-                    rel = _atomic_add(barrier, c1_i32, c0_i32)
+    launch_compact_quant.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_compact_quant
 
-        gpu.barrier()
-        _wait_mem()
-        rocdl.sched_barrier(0)
 
-        # ======================= Phase 2: preshuffle ========================
+def build_moe_scale_rebuild_module(
+    feat_dim: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Rebuild the 16-row-interleaved e8m0 scale from the compact per-token one.
+
+    One workgroup per destination tile, gathering through LDS so both sides move
+    whole cache lines. ``row_to_token`` maps grouped row -> source token, its -1
+    rows being tile padding to zero-fill. Grid-stride over tiles.
+
+    Its own launch rather than a phase of the quant kernel: an interleaved cache
+    line spans 16 grouped rows from 16 unrelated tokens, so it cannot start until
+    every token is quantized.
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if not L.use_pk8:
+        raise NotImplementedError("scale rebuild requires gfx1250 pk8")
+    if L.lanes_per_mx_block != 4:
+        raise NotImplementedError("scale rebuild needs the pk8 4-lane MX block")
+    if _fused_preshuffle_k_chunks(L) != 1:
+        # A k-sliced tile would need its slices on separate blocks, which the
+        # one-block-per-tile loop below cannot express.
+        raise NotImplementedError("scale rebuild needs the whole row in LDS")
+
+    rows_per_tile = L.rows_per_tile
+    src_dwords = L.mx_blocks_per_row // 4
+    units_per_tile = 16 * src_dwords * wmma_rep
+    k_chunk = src_dwords
+    # One dword of padding per row: the store pass reads an LDS column, whose
+    # natural stride would share banks, and an odd pitch is coprime with 32.
+    lds_pitch = k_chunk + 1
+    units_per_chunk = rows_per_tile * k_chunk
+    VEC = 4 if (k_chunk % 4 == 0) else 1
+    pre_iters = ((units_per_chunk // VEC) + BLOCK_THREADS - 1) // BLOCK_THREADS
+
+    @fx.struct
+    class _ScaleTileStorage:
+        buf: fx.Array[fx.Int32, rows_per_tile * lds_pitch, 16]
+
+    module_name = (
+        f"moe_scale_rebuild_fd{feat_dim}_r{wmma_rep}_{quant_mode}_{L.native_tag}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def scale_rebuild_kernel(
+        compact_scale_buf: fx.Pointer,
+        wmma_scale_out: fx.Pointer,
+        row_to_token: fx.Pointer,
+        num_tiles: Int32,
+        grid_blocks: Int32,
+    ):
+        i32 = T.i32
+        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
+
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        tile_lds = fx.SharedAllocator().allocate(_ScaleTileStorage).peek().buf.ptr
+
         map_p = ptr_buf_tensor(row_to_token)
         src_p = ptr_buf_tensor(compact_scale_buf)
         dst_p = ptr_buf_tensor(wmma_scale_out)
-        for tile in range(bid, fx.Uint32(num_tiles), fx.Uint32(num_workers)):
+        for tile in range(bid, fx.Uint32(num_tiles), fx.Uint32(grid_blocks)):
             row_base = tile * c_rows_per_tile
             tile_dword_base = tile * arith.constant(units_per_tile, type=i32)
 
@@ -2547,43 +2554,33 @@ def build_moe_token_multidest_quant_fused_module(
             gpu.barrier()
 
     @flyc.jit
-    def launch_fused_quant_preshuffle(
-        hidden: fx.Pointer,
-        grouped_payload: fx.Pointer,
+    def launch_scale_rebuild(
         compact_scale_buf: fx.Pointer,
         wmma_scale_out: fx.Pointer,
-        topids_to_rows: fx.Pointer,
         row_to_token: fx.Pointer,
-        barrier: fx.Pointer,
-        token_num: fx.Int32,
         num_tiles: fx.Int32,
-        num_workers: fx.Int32,
+        grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        fused_quant_preshuffle_kernel(
-            hidden,
-            grouped_payload,
+        scale_rebuild_kernel(
             compact_scale_buf,
             wmma_scale_out,
-            topids_to_rows,
             row_to_token,
-            barrier,
-            token_num,
             num_tiles,
-            num_workers,
+            grid_blocks,
         ).launch(
-            grid=(arith.index_cast(T.index, num_workers), 1, 1),
+            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
-    launch_fused_quant_preshuffle.compile_hints = {
+    launch_scale_rebuild.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
-    return launch_fused_quant_preshuffle
+    return launch_scale_rebuild
 
 
 def build_moe_fused_route_psum_quant_scatter_module(
