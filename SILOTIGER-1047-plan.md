@@ -242,6 +242,27 @@ a local top-k, merges globally. Output: `block_ids [M, 512]` on family A
 
 - [ ] Family A (`H=4`, `D=128`, `k=512`, paged compressed blocks, complete-block
       causal bound).
+- [x] **2a.** Family A decode kernel, correctness only: paged stream + local
+      top-512, `block_ids [M, 512]`, no global score matrix; oracle **set
+      equality** on short `L` (`n_blocks <= 512`); `us` vs live AMD recorded
+      without a win claim. Expand still a separate launch.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Set equality `err=0`.
+After the FlyDSL authoring-guide audit, Q is staged once in LDS, BF16 K rows
+use 128-bit buffer-copy fragments, and top-k uses a cooperative wave64
+reduction. Times are **not** a win claim:
+
+| m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
+|--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
+| 1 | 512 | 128 | 126.9 | 50.3 | 0 | 0 |
+| 8 | 512 | 128 | 127.8 | 62.4 | 0 | 0 |
+| 1 | 2048 | 512 | 500.1 | 49.5 | 0 | 0 |
+| 8 | 2048 | 512 | 506.0 | 58.2 | 0 | 0 |
+
+This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
+oracle tie-break on vLLM MQA logits, same as phase 1. These AMD microseconds
+are **not** the 2d bar.
+
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.

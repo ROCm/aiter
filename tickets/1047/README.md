@@ -6,7 +6,7 @@ Harness pins, rocprof, and pasted tables live here from phase 1 onward.
 
 - Oracle: `aiter/ops/flydsl/kernels/qsa/oracle.py`
 - Shapes: `aiter/ops/flydsl/kernels/qsa/shapes.py`
-- Surface: `aiter/ops/flydsl/qsa.py` (no K1/K2 launcher yet)
+- Surface: `aiter/ops/flydsl/qsa.py`
 - Gate: `HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py`
 
 Tie-break: smaller block index on equal finite scores (`top_k_per_row_decode`).
@@ -191,4 +191,24 @@ Family A: live AMD + #4882 Triton (Gluon does not dispatch GQA). Family B:
 |   8 |      8192 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       2048 |                73.2527 |                 0.458064   |              0.00738092  |                       0 |             82.7189 |                1.0156   |            0.101906   |                    0 |
 |   8 |     32768 |          16 | torch.bfloat16 |             4 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |               152.23   |                 0.440837   |              0.01383     |                       0 |             84.9735 |                0.988649 |            0.395363   |                    0 |
 |   8 |     32768 |          16 | torch.bfloat16 |             8 | gfx950 | 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba |       8192 |               151.431  |                 0.886332   |              0.0139571   |                       0 |             84.2029 |                0.997696 |            0.398981   |                    0 |
+
+## Phase 2a — family A FlyDSL K1 (correctness)
+
+Kernel: `aiter/ops/flydsl/kernels/qsa/k1_family_a.py`. Public:
+`qsa_k1_family_a_block_ids`. Bound: 512 page-aligned slots (`L <= 2048` at
+`r=4`). No `[M, n_blocks]` score buffer. Expand still separate.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality. After
+the FlyDSL authoring-guide audit, Q is staged once in LDS, BF16 K rows use
+128-bit buffer-copy fragments, and top-k uses a cooperative wave64 reduction.
+**Not a win claim** vs live AMD. This env still lacks
+`module_top_k_per_row.so`. These AMD microseconds are **not** the 2d bar.
+
+| m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
+|--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
+| 1 | 512 | 128 | 126.9 | 50.3 | 0 | 0 |
+| 8 | 512 | 128 | 127.8 | 62.4 | 0 | 0 |
+| 1 | 2048 | 512 | 500.1 | 49.5 | 0 | 0 |
+| 8 | 2048 | 512 | 506.0 | 58.2 | 0 | 0 |
+
 
