@@ -29,6 +29,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+
 from op_tests.flydsl_tests._common import assert_attn_close, q8
 from op_tests.flydsl_tests._common import build_fp8_gfx950 as _vendored_build
 from op_tests.flydsl_tests._common import dense_fp8_reference as torch_reference
