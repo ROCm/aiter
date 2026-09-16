@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Pinned AITER #4882 Triton QSA operators (no Gluon).
+"""Pinned AITER #4882 QSA operators (Triton + gfx950 Gluon).
 
 Pin: ROCm/aiter#4882 @ 150c7bc12b45ced1529a5512bf4ac30ecf9f35ba
 (parent 2462d5b6427b71619f2d6f09e68a9ce3ea2e9d2f). Portable Triton launchers
-from ``aiter/ops/triton/attention/qsa.py`` with Gluon dispatch stripped.
-HIP top-k matches the live AMD harness: ``top_k_per_row_decode`` when
-``module_top_k_per_row.so`` exists, else oracle smaller-index tie-break.
+from ``aiter/ops/triton/attention/qsa.py``; Gluon kernels from
+``_gluon_kernels/gfx950/attention/``. Default ``backend`` is ``\"triton\"`` so
+family A never silently scores on Gluon. Forced ``\"gluon\"`` errors on a
+dispatch miss (family A GQA group 12 / D=256 does not dispatch). HIP top-k:
+``top_k_per_row_decode`` when ``module_top_k_per_row.so`` exists, else oracle
+smaller-index tie-break.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from pathlib import Path
 
 import torch
 import triton
+from packaging.version import InvalidVersion, Version
 
 from aiter.ops.flydsl.kernels.qsa.oracle import qsa_topk_blocks
 from aiter.ops.topk import _hip_top_k_per_row_decode
@@ -31,7 +35,65 @@ from aiter.ops.triton._triton_kernels.attention.qsa_sparse_paged_gqa import (
 
 AITER_4882_QSA_PIN = "150c7bc12b45ced1529a5512bf4ac30ecf9f35ba"
 _DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+_MAX_INT32 = (1 << 31) - 1
+_GLUON_MQA_HEAD_COUNTS = (4, 8)
+_GLUON_HEAD_DIM = 128
+_GLUON_GQA_GROUP_SIZE = 5
+_GLUON_SPARSE_WIDTH = 2051
+_GLUON_SPARSE_AUTO_ENABLED = True
 _HIP_TOPK_OK: bool | None = None
+
+_gluon_qsa_paged_mqa_logits_kernel = None
+_gluon_qsa_sparse_paged_gqa_kernel = None
+try:
+    _triton_version = Version(Version(triton.__version__).base_version)
+except (InvalidVersion, TypeError):
+    _triton_version = Version("0")
+
+if _triton_version >= Version("3.6.0"):
+    try:
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        if get_arch() == "gfx950":
+            from aiter.ops.triton._gluon_kernels.gfx950.attention.qsa_paged_mqa_logits import (
+                _gluon_qsa_paged_mqa_logits_kernel,
+            )
+            from aiter.ops.triton._gluon_kernels.gfx950.attention.qsa_sparse_paged_gqa import (
+                _qsa_sparse_paged_gqa_kernel as _gluon_qsa_sparse_paged_gqa_kernel,
+            )
+    except Exception:  # noqa: BLE001
+        _gluon_qsa_paged_mqa_logits_kernel = None
+        _gluon_qsa_sparse_paged_gqa_kernel = None
+
+
+def gluon_qsa_available() -> bool:
+    return (
+        _gluon_qsa_paged_mqa_logits_kernel is not None
+        and _gluon_qsa_sparse_paged_gqa_kernel is not None
+    )
+
+
+def _normalize_backend(backend: str | None) -> str:
+    if backend is None:
+        return "triton"
+    normalized = backend.lower()
+    if normalized not in ("auto", "triton", "gluon"):
+        raise ValueError("backend must be one of: auto, triton, gluon")
+    return normalized
+
+
+def _has_safe_buffer_offsets(*tensors: torch.Tensor) -> bool:
+    for tensor in tensors:
+        if tensor.numel() == 0:
+            continue
+        if any(stride < 0 for stride in tensor.stride()):
+            return False
+        max_element_offset = sum(
+            (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        if max_element_offset > _MAX_INT32 // tensor.element_size():
+            return False
+    return True
 
 
 def _hip_topk_available() -> bool:
@@ -113,8 +175,10 @@ def qsa_paged_mqa_logits(
     compress_ratio: int = 4,
     num_columns: int | None = None,
     score_divisor: float | None = None,
+    *,
+    backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triton paged ReLU-sum scores. Cache is ``[pages, page_size, 1, head_dim]``."""
+    """Paged ReLU-sum scores. Cache is ``[pages, page_size, 1, head_dim]``."""
     _validate_positive_integer("compress_ratio", compress_ratio)
     _require_hip_tensor("q", q)
     if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
@@ -156,6 +220,63 @@ def qsa_paged_mqa_logits(
         return logits, visible_groups
 
     block_n = 32
+    selected_backend = _normalize_backend(backend)
+    gluon_compatible = (
+        _gluon_qsa_paged_mqa_logits_kernel is not None
+        and q.shape[1] in _GLUON_MQA_HEAD_COUNTS
+        and q.shape[2] == _GLUON_HEAD_DIM
+        and compress_ratio == 4
+        and _has_safe_buffer_offsets(q, compressed_k_cache, logits)
+    )
+    if selected_backend == "gluon" and not gluon_compatible:
+        raise RuntimeError(
+            "forced Gluon QSA scoring requires gfx950, Triton >= 3.6, "
+            "BF16 [tokens, 4 or 8, 128] queries, compress_ratio=4, and "
+            "signed-32-bit buffer offsets"
+        )
+    use_gluon = selected_backend != "triton" and gluon_compatible
+    if use_gluon:
+        try:
+            _gluon_qsa_paged_mqa_logits_kernel[
+                (q.shape[0], triton.cdiv(columns, block_n))
+            ](
+                q,
+                compressed_k_cache,
+                page_table,
+                token_to_request,
+                query_positions,
+                context_lens,
+                visible_groups,
+                logits,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                compressed_k_cache.stride(0),
+                compressed_k_cache.stride(1),
+                compressed_k_cache.stride(3),
+                page_table.stride(0),
+                page_table.stride(1),
+                logits.stride(0),
+                q.shape[0],
+                columns,
+                compressed_k_cache.shape[0],
+                page_table.shape[0],
+                float(divisor),
+                PAGE_SIZE=compressed_k_cache.shape[1],
+                PAGE_TABLE_WIDTH=page_table.shape[1],
+                NUM_HEADS=q.shape[1],
+                HEAD_DIM=q.shape[2],
+                COMPRESS_RATIO=compress_ratio,
+                BLOCK_H=16,
+                BLOCK_N=block_n,
+                BLOCK_D=q.shape[2],
+                num_warps=4,
+            )
+            return logits, visible_groups
+        except Exception:
+            if selected_backend == "gluon":
+                raise
+
     _qsa_paged_mqa_logits_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         compressed_k_cache,
@@ -268,6 +389,8 @@ def qsa_select_paged_tokens(
     compress_ratio: int = 4,
     out: torch.Tensor | None = None,
     logits_workspace_bytes: int = _DEFAULT_LOGITS_WORKSPACE_BYTES,
+    *,
+    backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paged MQA + HIP/oracle top-k + expand. Returns ``(indices, block_ids)``."""
     _validate_positive_integer("token_topk", token_topk)
@@ -303,6 +426,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             context_lens,
             compress_ratio,
+            backend=backend,
         )
         if columns < block_topk:
             padded_logits = torch.full(
@@ -336,8 +460,10 @@ def qsa_sparse_paged_gqa(
     token_to_request: torch.Tensor,
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
 ) -> torch.Tensor:
-    """#4882 Triton sparse GQA (``num_stages=2``)."""
+    """#4882 sparse GQA. Triton uses ``num_stages=2``; Gluon is gfx950-only."""
     _require_hip_tensor("q", q)
     if q.ndim != 3 or q.dtype != torch.bfloat16:
         raise ValueError("q must be bfloat16 [tokens, query_heads, head_dim]")
@@ -377,6 +503,74 @@ def qsa_sparse_paged_gqa(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = max(16, triton.next_power_of_2(group_size))
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
+    selected_backend = _normalize_backend(backend)
+    gluon_compatible = (
+        _gluon_qsa_sparse_paged_gqa_kernel is not None
+        and q.shape[2] == _GLUON_HEAD_DIM
+        and group_size == _GLUON_GQA_GROUP_SIZE
+        and logical_indices.shape[1] == _GLUON_SPARSE_WIDTH
+        and _has_safe_buffer_offsets(q, k_cache, v_cache, out)
+    )
+    if selected_backend == "gluon" and not gluon_compatible:
+        raise RuntimeError(
+            "forced Gluon sparse QSA requires gfx950, Triton >= 3.6, "
+            "BF16 head_dim=128, GQA group_size=5, selection_width=2051, "
+            "and signed-32-bit buffer offsets"
+        )
+    use_gluon = gluon_compatible and (
+        selected_backend == "gluon"
+        or (selected_backend == "auto" and _GLUON_SPARSE_AUTO_ENABLED)
+    )
+    if use_gluon:
+        try:
+            _gluon_qsa_sparse_paged_gqa_kernel[(q.shape[0], k_cache.shape[2])](
+                q,
+                k_cache,
+                v_cache,
+                logical_indices,
+                block_table,
+                token_to_request,
+                out,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k_cache.stride(0),
+                k_cache.stride(1),
+                k_cache.stride(2),
+                k_cache.stride(3),
+                v_cache.stride(0),
+                v_cache.stride(1),
+                v_cache.stride(2),
+                v_cache.stride(3),
+                logical_indices.stride(0),
+                logical_indices.stride(1),
+                block_table.stride(0),
+                block_table.stride(1),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                q.shape[0],
+                k_cache.shape[0],
+                block_table.shape[0],
+                logical_indices.shape[1],
+                float(scale),
+                TOPK=logical_indices.shape[1],
+                PAGE_SIZE=k_cache.shape[1],
+                PAGE_TABLE_WIDTH=block_table.shape[1],
+                NUM_KV_HEADS=k_cache.shape[2],
+                GROUP_SIZE=group_size,
+                HEAD_DIM=q.shape[2],
+                BLOCK_M=block_m,
+                BLOCK_N=64,
+                BLOCK_D=block_d,
+                USE_BUFFER_LOAD=True,
+                num_warps=4,
+            )
+            return out
+        except Exception:
+            if selected_backend == "gluon":
+                raise
+
     _qsa_sparse_paged_gqa_kernel[(q.shape[0], k_cache.shape[2])](
         q,
         k_cache,
