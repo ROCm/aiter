@@ -256,6 +256,17 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
     {63, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_n64_gfx1250)},
     {64, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_gfx1250)},
     {65, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_cc_gn128_ctdm_gfx1250)},
+    {66, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_gfx1250)},
+    {67, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128x256_nb3_ctdm_gfx1250)},
+    {68, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_fw_gfx1250)},
+    {69, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_fw_gfx1250)},
+    {70, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_im_gfx1250)},
+    {71, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_im_gfx1250)},
+    {72, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_gfx1250)},
+    {73, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_im0_gfx1250)},
+    {74, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_im1_gfx1250)},
+    {75, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_full_gfx1250)},
+    {76, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_quad_gfx1250)},
   };
 #undef OPUS_BMM_BPRESHUF_ENTRY
 #undef OPUS_BMM_BPRESHUF_NS_ENTRY

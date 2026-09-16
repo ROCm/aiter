@@ -478,7 +478,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
     // does NO synchronisation of its own -- the slot is already published when
     // it is called and the caller owns the WAR barrier afterwards. Keeping the
     // sync in one place is what makes the loop below auditable.
-    auto consume_slot = [&](auto Sn, int k_step) __attribute__((always_inline)) {
+    auto consume_slot = [&](auto Sn, int k_step, auto&& mid_issue) __attribute__((always_inline)) {
         constexpr int s = Sn.value;
         asm volatile("" ::: "memory");
 
@@ -674,12 +674,38 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
 
             FragA va[T::kExpM];
             FragB vb[T::kExpN];
+            constexpr int kHM = T::kExpM / 2, kHN = T::kExpN / 2;
+            constexpr int kDsB = (int)sizeof(FragB) / 16;
+            if constexpr (T::kQuadrant) {
+                // ISSUE ORDER IS THE WAIT SCHEDULE. Four batches, in the order
+                // the four quadrants consume them, so a dscnt bound retires
+                // exactly one batch: b_left, a_top, a_bot, b_right. Issued all
+                // up front -- the staging is in the waits below, not here, so
+                // the reads keep the same cover they have today.
+                static_assert(T::kExpM % 2 == 0 && T::kExpN % 2 == 0,
+                              "quadrant needs an even fragment grid");
+                opus::static_for<kHN>([&](auto inN) __attribute__((always_inline)) {
+                    vb[decltype(inN)::value] = frag_b(s, decltype(inN)::value, ik);
+                });
+                opus::static_for<kHM>([&](auto imN) __attribute__((always_inline)) {
+                    va[decltype(imN)::value] = frag_a(s, decltype(imN)::value, ik);
+                });
+                opus::static_for<kHM>([&](auto imN) __attribute__((always_inline)) {
+                    constexpr int im = kHM + decltype(imN)::value;
+                    va[im] = frag_a(s, im, ik);
+                });
+                opus::static_for<kHN>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in = kHN + decltype(inN)::value;
+                    vb[in] = frag_b(s, in, ik);
+                });
+            } else {
             opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
                 vb[decltype(inN)::value] = frag_b(s, decltype(inN)::value, ik);
             });
             opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
                 va[decltype(imN)::value] = frag_a(s, decltype(imN)::value, ik);
             });
+            }
 
             if constexpr (!T::kSfBEarly) {
                 opus::s_wait_dscnt(opus::number<0>{});
@@ -726,6 +752,87 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                 });
             };
 
+            // One accumulator quadrant: kHM x kHN, N outer and M serpentined
+            // inside, which is mma_rows' order restricted to an N window.
+            auto mma_quad = [&](auto IM0, auto IN0) __attribute__((always_inline)) {
+                constexpr int im0 = IM0.value, in0 = IN0.value;
+                if constexpr (!T::kSfAEarly) {
+                    opus::static_for<kHM>([&](auto jN) __attribute__((always_inline)) {
+                        sa_v[im0 + decltype(jN)::value] = pack_sfa(im0 + decltype(jN)::value);
+                    });
+                }
+                opus::static_for<kHN>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in = in0 + decltype(inN)::value;
+                    opus::static_for<kHM>([&](auto jN) __attribute__((always_inline)) {
+                        constexpr int j  = decltype(jN)::value;
+                        constexpr int im = im0 + ((in % 2 == 1) ? (kHM - 1 - j) : j);
+                        acc[im][in] = mma(va[im], vb[in], acc[im][in], sa_v[im], sb_v[in],
+                                          opus::number<0>{}, opus::number<0>{});
+                    });
+                });
+            };
+
+            if constexpr (T::kQuadrant) {
+                // Staged drain: each bound retires exactly the batch the next
+                // quadrant needs, so no wait covers more than a quarter of the
+                // reads.
+                constexpr int w1 = kHM * kDsPerFrag + kHN * kDsB;  // a_bot + b_right
+                constexpr int w2 = kHN * kDsB;                     // b_right
+                opus::s_wait_dscnt(opus::number<(w1 < 15 ? w1 : 15)>{});
+                mma_quad(opus::number<0>{},   opus::number<0>{});
+                opus::s_wait_dscnt(opus::number<(w2 < 15 ? w2 : 15)>{});
+                mma_quad(opus::number<kHM>{}, opus::number<0>{});
+                // Only when kIssueMid asked for it: mid_issue() is a no-op
+                // otherwise, and the fences would split the region for nothing.
+                if constexpr (ik == T::kIssueMidIk && T::kIssueMid) {
+                    __builtin_amdgcn_sched_barrier(0);
+                    mid_issue();
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+                opus::s_wait_dscnt(opus::number<0>{});
+                mma_quad(opus::number<0>{},   opus::number<kHN>{});
+                mma_quad(opus::number<kHM>{}, opus::number<kHN>{});
+            } else if constexpr (T::kIssueMid) {
+                // FlyDSL's shape: front WMMAs, then the ring's TDM issue, then
+                // the back half's drain. The issue's instructions are the cover
+                // the A-back ds_reads never had when it sat ahead of them.
+                //
+                // The mid sched_barrier SPLITS the scheduling region, so the
+                // group-barrier chain has to be emitted in two pieces here --
+                // a single trailing chain would describe only the back region
+                // and leave the front unconstrained.
+                opus::s_wait_dscnt(opus::number<kDsPerFrag * kBack < 15
+                                                ? kDsPerFrag * kBack : 15>{});
+                mma_rows(opus::number<0>{}, opus::number<kFront>{});
+                __builtin_amdgcn_sched_group_barrier(
+                    kDsRead, kDsPerFrag * (T::kExpN + kFront), 0);
+                __builtin_amdgcn_sched_group_barrier(kMfma, kFront * T::kExpN, 0);
+                // ONCE per K-step, not once per ik: at kExpK=2 this lambda runs
+                // twice and the ring must not be issued twice.
+                if constexpr (ik == T::kIssueMidIk) {
+                    __builtin_amdgcn_sched_barrier(0);
+                    mid_issue();
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+                if constexpr (kBack > 0) {
+                    opus::s_wait_dscnt(opus::number<0>{});
+                    mma_rows(opus::number<kFront>{}, opus::number<kBack>{});
+                    __builtin_amdgcn_sched_group_barrier(kDsRead, kDsPerFrag * kBack, 0);
+                    __builtin_amdgcn_sched_group_barrier(kMfma, kBack * T::kExpN, 0);
+                }
+            } else if constexpr (T::kDsFineWait) {
+                // One row per wait. The reads went out as every B fragment then
+                // A0..A(kExpM-1), so after row im's WMMAs the only ones still
+                // owed are A(im+1).. -- wait for exactly that many rather than
+                // draining to the front/back boundary. Each wait then covers one
+                // fragment's worth of latency instead of half the tile's.
+                opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                    constexpr int im   = decltype(imN)::value;
+                    constexpr int left = kDsPerFrag * (T::kExpM - 1 - im);
+                    opus::s_wait_dscnt(opus::number<(left < 15 ? left : 15)>{});
+                    mma_rows(opus::number<im>{}, opus::number<1>{});
+                });
+            } else {
             // Front: everything but A-back has to have landed.
             opus::s_wait_dscnt(opus::number<kDsPerFrag * kBack < 15
                                             ? kDsPerFrag * kBack : 15>{});
@@ -733,6 +840,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             if constexpr (kBack > 0) {
                 opus::s_wait_dscnt(opus::number<0>{});
                 mma_rows(opus::number<kFront>{}, opus::number<kBack>{});
+            }
             }
 
             // The order the solver must produce. Counts are what the code above
@@ -745,7 +853,12 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             // forced 18 extra ds_reads, which is why measuring it there gave a
             // 1% regression that says nothing about the schedule itself. Only
             // worth asking on a tile with register room.
-            if constexpr (T::kDsLookahead >= 0) {
+            if constexpr (T::kQuadrant) {
+                // The staged waits already pin the order; a group chain on top
+                // would only fight them, and the mid issue splits the region.
+            } else if constexpr (T::kIssueMid) {
+                // emitted above, in two pieces around the issue
+            } else if constexpr (T::kDsLookahead >= 0) {
                 // Spread the ds_reads across the WMMAs instead of clumping them,
                 // keeping kDsLookahead A-fragments in flight ahead of the row
                 // that consumes them. The prologue group covers every B fragment
@@ -768,7 +881,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                     }
                     __builtin_amdgcn_sched_group_barrier(kMfma, T::kExpN, 0);
                 });
-            } else if constexpr (T::kAllReadsFirst) {
+            } else if constexpr (T::kDsFineWait || T::kAllReadsFirst) {
                 __builtin_amdgcn_sched_group_barrier(
                     kDsRead, kDsPerFrag * (T::kExpN + T::kExpM), 0);
                 opus::static_for<T::kExpM>([&](auto) __attribute__((always_inline)) {
@@ -847,11 +960,22 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             // s_wait_dscnt(0), and every wave passed the barrier above after
             // finishing consume_slot(k-1), so slot (k-1) % kNumSlots is free.
             // That also drops the second barrier this loop used to take.
+            //
+            // kIssueMid hands the same issue to consume_slot instead, which runs
+            // it between the front and back WMMAs. Same slot, same safety
+            // argument -- only later, so the A-back ds_reads get covered.
             const int kfill = k + T::kNumSlots - 1;
-            if (kfill < k_steps) issue_slot(kfill % T::kNumSlots, true);
+            if constexpr (!T::kIssueMid) {
+                if (kfill < k_steps) issue_slot(kfill % T::kNumSlots, true);
+            }
+            auto mid_issue = [&]() __attribute__((always_inline)) {
+                if constexpr (T::kIssueMid) {
+                    if (kfill < k_steps) issue_slot(kfill % T::kNumSlots, true);
+                }
+            };
 
             opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
-                if ((int)decltype(sN)::value == s) consume_slot(sN, k);
+                if ((int)decltype(sN)::value == s) consume_slot(sN, k, mid_issue);
             });
         }
     }
