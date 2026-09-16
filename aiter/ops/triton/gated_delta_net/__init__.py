@@ -18,6 +18,10 @@ from .causal_conv1d_prefill import (
     causal_conv1d_split_qkv_triton_fn,
     causal_conv1d_split_qkv_triton_tile_fn,
 )
+from .fused_gdn_prefill_qkvz import (
+    fused_gdn_prefill_qkvz,
+    fused_gdn_prefill_qkvz_supported,
+)
 from .fused_rearrange_sigmoid_gdr import fused_rearrange_sigmoid_gated_delta_rule
 from .gated_delta_rule import (
     chunk_gated_delta_rule,
@@ -35,6 +39,8 @@ __all__ = [
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_opt",
     "chunk_gated_delta_rule_opt_vk",
+    "fused_gdn_prefill_qkvz",
+    "fused_gdn_prefill_qkvz_supported",
     "fused_rearrange_sigmoid_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
 ]
