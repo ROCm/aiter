@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family B FlyDSL QSA K1 (SILOTIGER-1047 2f): paged ReLU-sum + tiled top-512.
+"""Family B FlyDSL QSA K1 (SILOTIGER-1047 2g): paged ReLU-sum + tiled top-512.
 
 Gluon-parity indexer: ``H`` is a compile-time 4 or 8, ``D=128``, ``k=512``.
 Writes ``block_ids [M, 512]``. Scores never land in a global
 ``[M, n_blocks]`` buffer. ``H=4`` and ``H=8`` are separate instantiations.
+When ``visible <= 512`` the kernel emits ids; otherwise it streams 512-slot
+tiles into a running LDS top-512.
 
 One query row is eight wave64s (512 threads). When ``visible <= 512`` the
 selected set is every complete block, so the kernel writes those ids and
