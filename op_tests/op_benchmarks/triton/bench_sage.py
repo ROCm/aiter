@@ -1387,9 +1387,9 @@ def make_kernel_runner(
                 "MXFP6 Hadamard preprocessing requires block_r=128 "
                 "and does not support --qsmooth"
             )
-        # MXFP6 Q/K/V ships an FP6-P object in both modes; MXFP4-V sparse is still a pre-FP6-P
-        # build, so it keeps canonical V. The quantizer and the launcher must agree on this.
-        uses_fp6_p = is_mxfp6 or (is_f6f4 and block_lut is None)
+        # Every MXFP6-Q row ships an FP6-P object in both modes. The quantizer and the launcher
+        # must agree on this.
+        uses_fp6_p = is_mxfp6 or is_f6f4
 
         def _quantize_mxfp6():
             quant_q, quant_k = q_bshd, k_bshd

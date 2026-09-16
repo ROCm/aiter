@@ -275,7 +275,7 @@ def test_mha_v4_bf16fp8_scale_recipe():
             AttentionFormat.MXFP4,
             True,
             _RawRecipeKind.MXFP6,
-            AttentionPack.DEFAULT,
+            AttentionPack.V_FOR_FP6_P,
         ),
         # MXFP6 Q/K/V ships an FP6-P object in both modes, so sparse keeps the repacked V.
         (
