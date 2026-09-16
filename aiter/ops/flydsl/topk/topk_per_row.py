@@ -188,7 +188,7 @@ def _validate_flydsl_topk_call(
         )
 
 
-_FLYDSL_TOPK_ONE_BLOCK_ARCHES = ("gfx942", "gfx950", "gfx1250")
+_FLYDSL_TOPK_ONE_BLOCK_ARCHES = ("gfx950", "gfx1250")
 
 
 def _validate_radix_topk_one_block_call(
