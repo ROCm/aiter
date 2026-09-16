@@ -998,7 +998,9 @@ is_a_power_of_two(I val) noexcept
     return ((val - 1) & val) == 0;
 }
 
-// Compact buffer length estimate (compact disabled; kept for workspace sizing).
+// Per-row capacity of the compact ping-pong buffer, and the workspace size it
+// implies. A candidate set larger than this is not staged and the next pass
+// re-scans the row instead.
 template <typename T, typename IdxT, typename RATIO_T = float>
 __host__ __device__ IdxT calc_buf_len(IdxT len)
 {
@@ -2066,7 +2068,8 @@ __device__ void set_buf_pointers(T const* in,
 
 /**
  * One-block histogram build + optional compact.
- * Compact is disabled in the one-block path; all passes re-scan from the original input.
+ * out_buf == nullptr re-scans from the original input (pass 0, or a candidate
+ * set too large to stage); otherwise the survivors are compacted into out_buf.
  */
 template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES, int BlockSize>
 __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
@@ -2127,7 +2130,7 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
     }
     else
     {
-        // Compact enabled path (not used by one-block).
+        // Compact enabled path.
         IdxT* p_out_cnt              = &counter->out_cnt;
         auto const kth_value_bits    = counter->kth_value_bits;
         int const previous_start_bit = calc_start_bit<T, BitsPerPass>(pass - 1);
@@ -2161,7 +2164,9 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
 
 /**
  * One-block radix top-k kernel: all passes complete in a single block.
- * Compact is disabled; each pass re-scans the full row via vectorized_process.
+ * Pass 0 histograms the full row; later passes read the candidates the previous
+ * pass compacted into `bufs` (falling back to a full re-scan when the candidate
+ * set does not fit, and always when STABLE).
  */
 template <typename T,
           typename IdxT,
@@ -2170,7 +2175,8 @@ template <typename T,
           bool WRITE_TOPK_VALUES,
           bool prioritize_smaller_indice = false,
           Phase phase                    = Phase::Prefill,
-          bool STABLE                    = false>
+          bool STABLE                    = false,
+          bool COMPACT                   = false>
 __global__ void radix_topk_one_block_kernel(T const* in,
                                             IdxT const* in_idx,
                                             const int64_t len,
@@ -2261,19 +2267,87 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
 
     constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
+
+    // Compaction stages the surviving candidates in `bufs`, so every pass after
+    // the first reads ~k elements instead of re-scanning the whole row. Measured
+    // on MI355X at M=4096/N=131072/k=2048 this cuts HBM reads from 3.07x the
+    // logits array to 1.97x (rocprofv3 FETCH_SIZE) and the kernel from 923us to
+    // 818us.
+    //
+    // Two instantiations opt out:
+    //
+    //  * STABLE -- incompatible, not just slower: the stable emits recover an
+    //    element's original index from its position in the buffer they scan,
+    //    which only holds for the original input, and they take no index buffer
+    //    to carry it through a compaction.
+    //
+    //  * WRITE_TOPK_VALUES -- correct but slower (923us -> 1282us at the shape
+    //    above). Compacting moves the emit of the definite winners out of the
+    //    final pass and into the pass-1 scan loop, where each one costs an
+    //    LDS atomic plus a dependent scattered store. With values that is two
+    //    stores per winner instead of one, and the extra ~2k dependent stores
+    //    per row cost more than the full-row pass they save. Traffic is
+    //    identical either way (FETCH_SIZE 4.240GB both, WRITE_SIZE +33MB), so
+    //    this is store/atomic serialisation in the scan loop, not bandwidth.
+    //    Aggregating the emit counters per wave would likely lift the
+    //    restriction; until then only the indices-only instantiation compacts.
+    //
+    // COMPACT itself is chosen by the launcher, not here: it has to stay a
+    // compile-time constant, because the whole pass loop is unrolled and every
+    // buffer pointer is folded per pass. Deciding it in the kernel from row_len
+    // costs more than compaction saves -- measured at M=4096 it regressed every
+    // N, e.g. N=131072 820us -> 1110us.
+    constexpr bool kCompact = COMPACT && !STABLE && !WRITE_TOPK_VALUES;
+
+    T const* in_buf        = in;
+    IdxT const* in_idx_buf = in_idx;
+    T* out_buf             = nullptr;
+    IdxT* out_idx_buf      = nullptr;
+
 #pragma unroll
     for(int pass = 0; pass < num_passes; ++pass)
     {
         const IdxT current_k = (pass == 0) ? k : counter.k;
+        // Candidates entering this pass, i.e. how many elements the compaction
+        // below will stage.
+        const IdxT current_len = (pass == 0) ? row_len : counter.len;
+        IdxT previous_len      = row_len;
+
+        // Left at (in, in_idx, nullptr, nullptr) when not compacting, which is
+        // the original full-re-scan behaviour.
+        if constexpr(kCompact)
+        {
+            set_buf_pointers<T, IdxT>(
+                in, in_idx, bufs, buf_len, pass, in_buf, in_idx_buf, out_buf, out_idx_buf);
+
+            // Read the compacted buffer only if the previous pass actually
+            // staged into it. Pass 0 cannot compact (the pivot is unknown), and
+            // a candidate set larger than buf_len is left unstaged, so both fall
+            // back to re-scanning the row.
+            if(pass > 1 && counter.previous_len <= buf_len)
+            {
+                previous_len = counter.previous_len;
+            }
+            else
+            {
+                in_buf     = in;
+                in_idx_buf = in_idx;
+            }
+            if(current_len > buf_len)
+            {
+                out_buf     = nullptr;
+                out_idx_buf = nullptr;
+            }
+        }
 
         filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, BlockSize>(
-                in,
-                in_idx,
-                nullptr,
-                nullptr,
+                in_buf,
+                in_idx_buf,
+                out_buf,
+                out_idx_buf,
                 out,
                 out_idx,
-                row_len,
+                previous_len,
                 &counter,
                 histogram,
                 select_min,
@@ -2290,9 +2364,21 @@ __global__ void radix_topk_one_block_kernel(T const* in,
                                             pass);
         if(threadIdx.x == 0)
         {
-            counter.previous_len = counter.len;
+            // What the next pass will scan: the length of the buffer THIS pass
+            // compacted into, not the size of the bucket just chosen. Taking it
+            // from the register copy read before choose_bucket also removes a
+            // read of counter.len that raced with choose_bucket's store (the
+            // writing thread is whichever owns the crossing bucket, not
+            // thread 0, and there is no barrier in between).
+            counter.previous_len = current_len;
         }
         __syncthreads();
+
+        // Final emit reads the buffer this pass compacted into; if nothing was
+        // staged, in_buf is the original row and previous_len is row_len.
+        T const* final_in       = out_buf ? out_buf : in_buf;
+        IdxT const* final_inidx = out_buf ? out_idx_buf : in_idx_buf;
+        const IdxT final_len    = out_buf ? current_len : previous_len;
 
         if(pass == num_passes - 1)
         {
@@ -2323,7 +2409,8 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             else
             {
                 last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, prioritize_smaller_indice>(
-                    in, in_idx, out, out_idx, row_len, k, &counter, select_min, pass, false);
+                    final_in, final_inidx, out, out_idx, final_len, k, &counter, select_min,
+                    pass, false);
             }
             break;
         }
@@ -2356,7 +2443,8 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             else
             {
                 last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
-                    in, in_idx, out, out_idx, row_len, k, &counter, select_min, pass);
+                    final_in, final_inidx, out, out_idx, final_len, k, &counter, select_min,
+                    pass);
             }
             break;
         }
@@ -2588,9 +2676,32 @@ void standalone_stable_radix_topk_one_block_(void* buf,
         bufs                                = static_cast<decltype(bufs)>(aligned_pointers[0]);
     }
 
-    radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase, STABLE>
-        <<<batch_size, BlockSize, 0, stream>>>(
-            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
+    // Compaction trades one full-row scan (cost ~ len) for staging the
+    // candidates plus emitting ~k winners (cost ~ k, each a dependent LDS
+    // atomic and scattered store), on top of a fixed per-pass cost (histogram
+    // clear, 4096-bucket scan, barriers) that a short row cannot amortise.
+    // Both terms show up in the measured crossover (MI355X, fp32, M=4096,
+    // indices-only, us without -> with compaction):
+    //   k=2048  N= 8192  92->105   16384 135->153   32768 236->242
+    //           N=65536 453->420  131072 926->820  262144 2184->1671
+    //   k= 512  N= 8192  92->102   16384 127->135   32768 230->223
+    //   k= 128  N= 8192  91-> 97   16384 122->121   32768 223->192
+    // so require the row to be long both absolutely and relative to k. Ragged
+    // rows are gated on the padded length, which only affects speed.
+    if(!STABLE && !WRITE_TOPK_VALUES && len >= 32768 && len >= int64_t(24) * k)
+    {
+        radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
+                                    false, phase, STABLE, /*COMPACT=*/true>
+            <<<batch_size, BlockSize, 0, stream>>>(
+                in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
+    }
+    else
+    {
+        radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
+                                    false, phase, STABLE, /*COMPACT=*/false>
+            <<<batch_size, BlockSize, 0, stream>>>(
+                in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
+    }
 }
 
 // Runtime BPP dispatch for ob: CU >= 128 || LDS/CU >= 128KB selects BPP=12, otherwise BPP=11.
