@@ -32,10 +32,10 @@ import flydsl.expr as fx
 from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
     validate_hstu_attention_bwd,
 )
-from aiter.ops.flydsl.kernels.hstu_attention_common import (
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
     _LOG2E,
     MFMA_ELEMS_PER_LANE,
     MFMA_K,

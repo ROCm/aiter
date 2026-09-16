@@ -187,7 +187,7 @@ def run_benchmark(args):
             # (dq, dk, dv) (recomputes S internally, launches dV/dK/dQ). No
             # autograd wrapper needed. Same alpha / inputs / FLOPs formula as the
             # aiter_triton path for an apples-to-apples comparison.
-            from aiter.ops.flydsl.hstu_attention_kernels import (
+            from aiter.ops.flydsl.hstu_attention import (
                 flydsl_hstu_attention_bwd,
                 flydsl_hstu_attention_fwd,
             )

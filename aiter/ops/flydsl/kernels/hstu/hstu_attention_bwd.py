@@ -41,7 +41,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels.hstu_attention_common import (
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
     _LOG2E,
     MFMA_ELEMS_PER_LANE,
     MFMA_K,

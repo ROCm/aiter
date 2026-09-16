@@ -31,15 +31,15 @@ import pytest
 import torch
 
 import aiter
-import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
+import aiter.ops.flydsl.hstu_attention as hstu_kernels
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.hstu_attention_kernels import (
+from aiter.ops.flydsl.hstu_attention import (
     _validate_bwd_inputs,
     flydsl_hstu_attention,
     flydsl_hstu_attention_bwd,
 )
-from aiter.ops.flydsl.kernels.hstu_attention_bwd import validate_hstu_attention_bwd
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import validate_hstu_attention_bwd
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # Reuse the forward test's self-contained input generator and torch-reference
