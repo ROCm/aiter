@@ -61,8 +61,9 @@ them.
   (`HIP_VISIBLE_DEVICES=6`).
 - **Primary vs secondary.** The must-beat path is **live vLLM AMD** (Triton MQA
   + HIP top-k + Triton expand+tail + Triton sparse GQA `num_stages=1`). #4882
-  Triton/Gluon is a named competitor column. NVIDIA `qwen4_exp/nvidia/ops/qsa.py`
-  is an optional column only — never the AMD gate.
+  Triton/Gluon is a named competitor column. NVIDIA
+  `qwen4_exp/nvidia/ops/qsa.py` is not a harness column and is never the AMD
+  gate.
 - **Do not hide a loss.** Report each named backend separately. A win vs #4882
   does not cover a loss to live vLLM, or the reverse.
 - **Family A is the production must-win.** Flash-Next / `Qwen/Qwen3.8-Flash-Next`:
@@ -188,7 +189,7 @@ Proposed layout (adjust only if a later lock says so):
 
 This phase answers **which kernel to land first** at 8k / 32k / 128k / 1M
 (open question in the ticket). No FlyDSL win is claimed here. Land as
-separate steps (plumbing → live AMD → #4882 → rocprof → optional NVIDIA).
+separate steps (plumbing → live AMD → #4882 → rocprof).
 
 - [x] Family A plumbing only: paged indexer-K and GQA K/V, shuffled
       `block_table`, `M`/`L` sweep, oracle on dense vs gathered. No
@@ -212,8 +213,6 @@ separate steps (plumbing → live AMD → #4882 → rocprof → optional NVIDIA)
       on family B: indexer H 4/8 D=128, GQA group 5 / D=128 / width 2051).
       Family A GQA is not launched on Gluon. Kernels:
       `aiter/ops/triton/_gluon_kernels/gfx950/attention/qsa_{paged_mqa_logits,sparse_paged_gqa}.py`.
-- [ ] Optional NVIDIA QSA column — labeled so it cannot be mistaken for the
-      AMD bar.
 - [ ] Family A table and family B table; never merge them.
 - [ ] rocprof **one real QSA layer** (indexer through GQA) at short and long
       `L`, including HIP graph replay at decode.
