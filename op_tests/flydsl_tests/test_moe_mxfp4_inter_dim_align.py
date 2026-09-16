@@ -1,30 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MXFP4 MoE dispatch and numerics across inter_dim 256-alignment.
+"""MXFP4 MoE numerics across inter_dim 256-alignment.
 
 CK-Tile's 2-stage MXFP4 stage-2 (``moe_cktile2stages_gemm2``) reduces over
 ``inter_dim`` and indexes its e8m0 weight scales in groups of 8 blocks
 (8 * 32 = 256 elements). When ``inter_dim`` is not a multiple of 256 the host
 pads the scale group dimension (``shuffle_scale`` rounds it up to a multiple of
 8) and the kernel reads the wrong groups, silently returning a badly wrong
-result -- no error, no NaN, only wrong numbers. ``get_2stage_cfgs`` therefore
-steers those shapes onto the FlyDSL a16w4 kernels, which are correct at any
-128-aligned ``inter_dim``.
-
-An ``inter_dim`` that is not 128-aligned either is mis-indexed by CK-Tile just
-the same, but no FlyDSL gemm1 port accepts it -- they require
-``2*D_INTER % 256 == 0`` -- so it is left on CK-Tile rather than re-routed into
-a kernel assertion. That is a deliberate gap, and the dispatch test pins it.
-
-Two tests, deliberately split by what they need:
-
-* ``test_mxfp4_swiglu_dispatch_by_inter_dim_alignment`` only inspects the
-  ``MOEMetadata`` that ``get_2stage_cfgs`` returns. It compiles and runs no
-  kernel, so it holds on any FlyDSL/toolchain combination.
-* ``test_mxfp4_swiglu_non_256_aligned_numerics`` runs the re-routed shapes end
-  to end through ``fused_moe`` against ``torch_moe_stage1``/``torch_moe_stage2``.
-  Before the dispatch guard this fails with a rel L2 error around 0.7-10; after
-  it, it lands near the ordinary mxfp4 quantisation error.
+result -- no error, no NaN, only wrong numbers. The dispatch-only coverage is
+in ``op_tests/test_moe_mxfp4_inter_dim_dispatch.py`` so standard Aiter CI
+collects it. This file keeps the GPU numerics cases for FlyDSL toolchains that
+can compile the a16w4 port.
 
 Weights are prepared the way the production vLLM AITER_MXFP4_MXFP4 path prepares
 them (``shuffle_weight(..., (16, 16))`` + ``e8m0_shuffle``), not with the
@@ -35,8 +21,6 @@ Run:
     pytest op_tests/flydsl_tests/test_moe_mxfp4_inter_dim_align.py -q
 """
 
-import functools
-
 import pytest
 import torch
 
@@ -45,7 +29,6 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
-    get_2stage_cfgs,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -58,15 +41,7 @@ _SKIP = pytest.mark.skipif(
     reason="CDNA (gfx942/gfx950) required for the MXFP4 2-stage MoE kernels",
 )
 
-# inter_dim values that CK-Tile mis-indexes and that must be re-routed.
 NON_256_ALIGNED = [128, 384, 640]
-# inter_dim values CK-Tile handles correctly and must keep.
-ALIGNED_256 = [256, 512, 768]
-# CK-Tile mis-indexes these too, but no FlyDSL gemm1 port accepts them either:
-# both require 2*D_INTER % 256 == 0, i.e. a 128-aligned inter_dim. Re-routing
-# them would trade a wrong answer for an assertion inside the kernel, so they
-# stay on CK-Tile. Here to pin that decision, not to endorse the result.
-NON_128_ALIGNED = [192, 320]
 
 MODEL_DIM = 6144
 E = 32
@@ -76,57 +51,6 @@ TOKEN = 32
 
 def _rel_l2(actual, ref):
     return ((actual.float() - ref.float()).norm() / ref.float().norm()).item()
-
-
-def _stage_backend(fn):
-    """'flydsl' / 'cktile' / the raw name, from a MOEMetadata stage callable."""
-    target = fn.func if isinstance(fn, functools.partial) else fn
-    name = getattr(target, "__name__", str(target))
-    if "flydsl" in name:
-        return "flydsl"
-    if "cktile" in name:
-        return "cktile"
-    return name
-
-
-def _dispatch(inter_dim):
-    """The metadata get_2stage_cfgs picks for bf16 A x mxfp4 W + Swiglu."""
-    return get_2stage_cfgs(
-        TOKEN,
-        MODEL_DIM,
-        inter_dim,
-        E,
-        TOPK,
-        dtypes.bf16,
-        dtypes.bf16,  # q_dtype_a: bf16 activations, i.e. the a16w4 case
-        dtypes.fp4x2,  # q_dtype_w
-        QuantType.per_1x32,
-        True,  # use_g1u1
-        ActivationType.Swiglu,
-        False,  # doweight_stage1
-        0,  # hidden_pad
-        0,  # intermediate_pad
-        is_shuffled=True,
-    )
-
-
-@_SKIP
-@pytest.mark.parametrize("inter_dim", NON_256_ALIGNED + ALIGNED_256 + NON_128_ALIGNED)
-def test_mxfp4_swiglu_dispatch_by_inter_dim_alignment(inter_dim):
-    """Only a 128-aligned, non-256-aligned inter_dim is steered off CK-Tile.
-
-    Compiles nothing, so this is the assertion that survives a FlyDSL version
-    the local toolchain cannot build.
-    """
-    meta = _dispatch(inter_dim)
-    got = (_stage_backend(meta.stage1), _stage_backend(meta.stage2))
-    want = "flydsl" if inter_dim % 256 and inter_dim % 128 == 0 else "cktile"
-
-    assert got == (want, want), (
-        f"inter_dim={inter_dim} (256-aligned={not inter_dim % 256}, "
-        f"128-aligned={not inter_dim % 128}): "
-        f"expected both stages on {want}, got stage1={got[0]} stage2={got[1]}"
-    )
 
 
 @_SKIP

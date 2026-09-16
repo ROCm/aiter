@@ -1147,22 +1147,24 @@ def _fused_moe_impl(
         and q_dtype_a == dtypes.bf16
         and activation == ActivationType.Situv2
     )
-    # Swiglu with a non-256-aligned inter_dim is re-routed off CK-Tile onto the
-    # same a16w4 FlyDSL kernels (see cktile_mxfp4_ok in get_2stage_cfgs), so it
-    # inherits their constraints and has to be validated here too -- otherwise
-    # the re-routed shape reaches a kernel that cannot honour the request. The
-    # trailing four terms mirror get_2stage_cfgs' _flydsl_can_take_over: when
-    # they do not hold the shape stays on CK-Tile and must not be rejected here.
+    # Validate the Swiglu shapes that get re-routed onto the a16w4 FlyDSL port
+    # against the runtime-only constraints that get_2stage_cfgs cannot see.
     _is_a16w4_swiglu_rerouted = (
-        quant_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.fp4x2
+        inter_dim % 256 != 0
         and q_dtype_a == dtypes.bf16
-        and activation == ActivationType.Swiglu
-        and inter_dim % 256 != 0
-        and inter_dim % 128 == 0
-        and isShuffled
-        and isG1U1
-        and not doweight_stage1
+        and _can_reroute_mxfp4_to_flydsl(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            dtype=dtype,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            q_type=quant_type,
+            activation=activation,
+            is_shuffled=isShuffled,
+            use_g1u1=isG1U1,
+            doweight_stage1=doweight_stage1,
+            gate_mode=gate_mode,
+        )
     )
     if _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted:
         _a16w4_why = (
@@ -1259,6 +1261,18 @@ def _fused_moe_impl(
             )
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
+
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if (
+        q_dtype_w == dtypes.fp4x2
+        and inter_dim % 256 != 0
+        and stage2_func is cktile_moe_stage2
+    ):
+        raise NotImplementedError(
+            "No safe MXFP4 MoE backend for this shape and layout: CK-Tile "
+            f"stage2 mis-indexes scales at inter_dim={inter_dim}, and the "
+            "FlyDSL fallback cannot accept this invocation."
+        )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -2657,6 +2671,36 @@ def _make_mxfp4_metadata(
     )
 
 
+def _can_reroute_mxfp4_to_flydsl(
+    *,
+    model_dim,
+    inter_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    activation,
+    is_shuffled,
+    use_g1u1,
+    doweight_stage1,
+    gate_mode,
+):
+    """Whether the heuristic FlyDSL path accepts this MXFP4 shape and layout."""
+    return (
+        dtype in (dtypes.bf16, dtypes.fp16)
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a in (dtypes.bf16, dtypes.fp4x2, dtypes.fp8)
+        and activation == ActivationType.Swiglu
+        and inter_dim % 128 == 0
+        and model_dim % 256 == 0
+        and (gate_mode == GateMode.SEPARATED or q_dtype_a == dtypes.fp8)
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -2686,6 +2730,20 @@ def get_2stage_cfgs(
     _disable_inline_sort=False,
 ):
     gate_mode = GateMode(gate_mode)
+    cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
+    flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        activation=activation,
+        is_shuffled=is_shuffled,
+        use_g1u1=use_g1u1,
+        doweight_stage1=doweight_stage1,
+        gate_mode=gate_mode,
+    )
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
     # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
     # without a `gfx` column are backfilled from cu_num at load time via
@@ -2987,7 +3045,13 @@ def get_2stage_cfgs(
 
     if cfg is not None:
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
-        if kn2.startswith("opus_"):
+        if cktile_mxfp4_unsafe and kn2.startswith("cktile_"):
+            cfg = None
+            logger.warning(
+                "[fused_moe] discarding unsafe CK-Tile MXFP4 stage2 config "
+                f"for inter_dim={inter_dim}; using default heuristics"
+            )
+        elif kn2.startswith("opus_"):
             opus_supported, opus_reason = _opus_a8w4.cfg_is_supported(
                 kn2,
                 cfg=cfg,
@@ -3258,32 +3322,10 @@ def get_2stage_cfgs(
     # pads the scale group dimension (shuffle_scale rounds it up to a multiple
     # of 8) and the kernel reads the wrong groups, silently returning a badly
     # wrong result. Stage-1 is unaffected -- it reduces over model_dim.
-    _cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
-    # Only steer away from CK-Tile when a FlyDSL path can actually take the
-    # shape, otherwise it would be left with no backend at all. These are the
-    # preconditions shared by the a16w4 (bf16 A) and a4w4/a8w4 (fp4/fp8 A)
-    # branches below; note fp16 A has no FlyDSL mxfp4 kernel here, so it keeps
-    # its current routing.
-    #
-    # inter_dim % 128 is one of those preconditions: both FlyDSL gemm1 ports
-    # require 2*D_INTER to be a multiple of 256 (moe_2stage_a16wmix/gemm1.py
-    # and mxfp4_gemm1_kernels.py), i.e. a 128-aligned inter_dim, and assert
-    # otherwise. A shape that is neither 128- nor 256-aligned therefore stays
-    # on CK-Tile and keeps the wrong result this guard exists to avoid; there
-    # is no backend here that computes it correctly, and crashing in the
-    # kernel would not make it one.
-    _flydsl_can_take_over = (
-        dtype in [dtypes.bf16, dtypes.fp16]
-        and q_type == QuantType.per_1x32
-        and q_dtype_a in (dtypes.bf16, dtypes.fp4x2, dtypes.fp8)
-        and inter_dim % 128 == 0
-        and is_shuffled
-        and use_g1u1
-        and not doweight_stage1
-    )
-    # True for every shape CK-Tile handles correctly today, so all of those keep
-    # their existing routing unchanged.
-    cktile_mxfp4_ok = not (_cktile_mxfp4_unsafe and _flydsl_can_take_over)
+    # Correct shapes keep their existing routing. Unsafe shapes leave CK-Tile
+    # only when the target FlyDSL kernel accepts the shape and weight layout.
+    # Calls with no safe fallback are rejected before the CK-Tile launch.
+    cktile_mxfp4_ok = not (cktile_mxfp4_unsafe and flydsl_can_take_over)
     if (
         gate_mode != GateMode.SEPARATED
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -4811,6 +4853,13 @@ def cktile_moe_stage2(
     bias2=None,
     kernel_name="",
 ):
+    inter_dim = a2.shape[-1]
+    # Defense in depth for direct callers and tuned metadata.
+    if w2.dtype == dtypes.fp4x2 and inter_dim % 256 != 0:
+        raise NotImplementedError(
+            "CK-Tile MXFP4 stage2 requires inter_dim to be a multiple of 256; "
+            f"got {inter_dim}"
+        )
     bias2 = _normalize_bias_for_kernel(bias2)
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
