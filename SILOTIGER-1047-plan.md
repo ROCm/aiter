@@ -318,31 +318,33 @@ The FlyDSL column is eight-wave K1 plus a **`visible <= 512` emit path**,
 a **wave-local tile sort**, a **per-tile pair merge**, a **column split**
 on decode rows with more than one 512-slot tile, and a **software-pipelined
 score_col** (prefetch next D-chunk of paged K while the current ReLU-sum
-runs). Prefill stays single-WG. Workspace is `[M, 8, 512]`, not
-`[M, n_blocks]`. Expand still separate. HIP `module_top_k_per_row.so` is
-loaded. Oracle set equality `err=0` on both columns.
+runs). The inter-wave bitonic merge fuses each reverse-upper step with its
+first cross-half compare, removing three workgroup barriers per tile. Prefill
+stays single-WG. Workspace is `[M, 8, 512]`, not `[M, n_blocks]`. Expand still
+separate. HIP `module_top_k_per_row.so` is loaded. Oracle set equality `err=0`
+on both columns.
 
 **Not checked:** `L<=2048` still beats HIP select. Pipelined scoring
-barely moves decode 8k/32k/128k (~35 / ~53 / ~156µs vs HIP ~18 / ~19 /
-~29µs). Prefill serial 8k/32k drop ~157µs→~139µs and ~610µs→~542µs, still
-behind HIP (~83µs / ~247µs).
+plus the fused first inter-wave compare leave decode 8k/32k/128k at
+~35 / ~52 / ~153µs vs HIP ~19 / ~20 / ~30µs. Prefill serial 8k/32k is
+~137 / ~537µs, still behind HIP (~84 / ~250µs).
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 1.5 | 7.5 | 0 | 0 |
-| 8 | 512 | 128 | 2.3 | 9.1 | 0 | 0 |
-| 1 | 2048 | 512 | 1.5 | 8.2 | 0 | 0 |
-| 8 | 2048 | 512 | 2.3 | 9.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 35.4 | 18.3 | 0 | 0 |
-| 8 | 8192 | 2048 | 35.8 | 19.9 | 0 | 0 |
-| 1 | 32768 | 8192 | 52.8 | 19.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 52.6 | 23.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 155.7 | 29.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 163.8 | 51.9 | 0 | 0 |
-| 512 | 512 | 128 | 3.1 | 16.0 | 0 | 0 |
-| 512 | 2048 | 512 | 3.0 | 27.2 | 0 | 0 |
-| 512 | 8192 | 2048 | 139.2 | 82.7 | 0 | 0 |
-| 512 | 32768 | 8192 | 542.2 | 247.4 | 0 | 0 |
+| 1 | 512 | 128 | 2.0 | 9.4 | 0 | 0 |
+| 8 | 512 | 128 | 2.9 | 11.4 | 0 | 0 |
+| 1 | 2048 | 512 | 2.0 | 10.2 | 0 | 0 |
+| 8 | 2048 | 512 | 2.9 | 11.4 | 0 | 0 |
+| 1 | 8192 | 2048 | 35.2 | 19.0 | 0 | 0 |
+| 8 | 8192 | 2048 | 35.4 | 21.6 | 0 | 0 |
+| 1 | 32768 | 8192 | 52.3 | 20.4 | 0 | 0 |
+| 8 | 32768 | 8192 | 52.0 | 25.2 | 0 | 0 |
+| 1 | 131072 | 32768 | 153.4 | 30.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 161.2 | 53.1 | 0 | 0 |
+| 512 | 512 | 128 | 3.6 | 18.7 | 0 | 0 |
+| 512 | 2048 | 512 | 3.5 | 29.3 | 0 | 0 |
+| 512 | 8192 | 2048 | 137.4 | 83.5 | 0 | 0 |
+| 512 | 32768 | 8192 | 536.9 | 249.5 | 0 | 0 |
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.

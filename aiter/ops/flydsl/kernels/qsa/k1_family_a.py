@@ -43,10 +43,10 @@ _WAVE_STAGES = tuple(
     for span in (2, 4, 8, 16, 32, 64)
     for stride in tuple(1 << shift for shift in range(span.bit_length() - 2, -1, -1))
 )
-_INTERWAVE = (
-    (128, (64, 32, 16, 8, 4, 2, 1)),
-    (256, (128, 64, 32, 16, 8, 4, 2, 1)),
-    (512, (256, 128, 64, 32, 16, 8, 4, 2, 1)),
+_INTERWAVE_LDS = (
+    (128, (32, 16, 8, 4, 2, 1)),
+    (256, (64, 32, 16, 8, 4, 2, 1)),
+    (512, (128, 64, 32, 16, 8, 4, 2, 1)),
 )
 _PAIR_MERGE_STRIDES = tuple(1 << shift for shift in range(_K.bit_length() - 1, -1, -1))
 
@@ -87,7 +87,7 @@ def build_qsa_k1_family_a_serial(page_size: int):
             d=_D,
             blk=_BLOCK_THREADS,
             pair=1,
-            wav=1,
+            wav=2,
             pipe=2,
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
@@ -226,23 +226,24 @@ def build_qsa_k1_family_a_serial(page_size: int):
                 cand_s[Int32(_K) + tid] = ws
                 cand_c[Int32(_K) + tid] = wc
                 gpu.barrier()
-                for win_size, strides in _INTERWAVE:
+                for win_size, lds_strides in _INTERWAVE_LDS:
                     half = win_size // 2
                     wbase = (tid // Int32(win_size)) * Int32(win_size)
-                    i_up = tid - wbase - Int32(half)
-                    if (i_up >= zero) & (i_up < Int32(half // 2)):
-                        a = Int32(_K) + wbase + Int32(half) + i_up
-                        b = Int32(_K) + wbase + Int32(win_size - 1) - i_up
-                        sa = cand_s[a]
-                        ca = cand_c[a]
-                        sb = cand_s[b]
-                        cb = cand_c[b]
-                        cand_s[a] = sb
-                        cand_c[a] = cb
-                        cand_s[b] = sa
-                        cand_c[b] = ca
+                    local = tid - wbase
+                    if local < Int32(half):
+                        j = Int32(_K) + tid
+                        peer = Int32(_K) + wbase + Int32(win_size - 1) - local
+                        s0 = cand_s[j]
+                        c0 = cand_c[j]
+                        s1 = cand_s[peer]
+                        c1 = cand_c[peer]
+                        swap = better(s1, c1, s0, c0)
+                        cand_s[j] = swap.select(s1, s0)
+                        cand_c[j] = swap.select(c1, c0)
+                        cand_s[peer] = swap.select(s0, s1)
+                        cand_c[peer] = swap.select(c0, c1)
                     gpu.barrier()
-                    for stride in strides:
+                    for stride in lds_strides:
                         peer_local = tid ^ Int32(stride)
                         if tid < peer_local:
                             j = Int32(_K) + tid
@@ -360,7 +361,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         blk=_BLOCK_THREADS,
         spl=_SPLITS,
         pair=2,
-        wav=1,
+        wav=2,
         pipe=2,
     )
 
@@ -522,23 +523,24 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                 cand_s[Int32(_K) + tid] = ws
                 cand_c[Int32(_K) + tid] = wc
                 gpu.barrier()
-                for win_size, strides in _INTERWAVE:
+                for win_size, lds_strides in _INTERWAVE_LDS:
                     half = win_size // 2
                     wbase = (tid // Int32(win_size)) * Int32(win_size)
-                    i_up = tid - wbase - Int32(half)
-                    if (i_up >= zero) & (i_up < Int32(half // 2)):
-                        a = Int32(_K) + wbase + Int32(half) + i_up
-                        b = Int32(_K) + wbase + Int32(win_size - 1) - i_up
-                        sa = cand_s[a]
-                        ca = cand_c[a]
-                        sb = cand_s[b]
-                        cb = cand_c[b]
-                        cand_s[a] = sb
-                        cand_c[a] = cb
-                        cand_s[b] = sa
-                        cand_c[b] = ca
+                    local = tid - wbase
+                    if local < Int32(half):
+                        j = Int32(_K) + tid
+                        peer = Int32(_K) + wbase + Int32(win_size - 1) - local
+                        s0 = cand_s[j]
+                        c0 = cand_c[j]
+                        s1 = cand_s[peer]
+                        c1 = cand_c[peer]
+                        swap = better(s1, c1, s0, c0)
+                        cand_s[j] = swap.select(s1, s0)
+                        cand_c[j] = swap.select(c1, c0)
+                        cand_s[peer] = swap.select(s0, s1)
+                        cand_c[peer] = swap.select(c0, c1)
                     gpu.barrier()
-                    for stride in strides:
+                    for stride in lds_strides:
                         peer_local = tid ^ Int32(stride)
                         if tid < peer_local:
                             j = Int32(_K) + tid
