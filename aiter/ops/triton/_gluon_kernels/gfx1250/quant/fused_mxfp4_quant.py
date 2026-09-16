@@ -6,12 +6,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-
-def _even_m_n(args, block_m, n, block_n):
-    # Python 3.10 inspect can truncate decorated source at inline lambdas,
-    # preventing Gluon JIT from finding the following function definition.
-    return args["M"] % args[block_m] == 0 and args[n] % args[block_n] == 0
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
 
 # rms norm op copied from triton

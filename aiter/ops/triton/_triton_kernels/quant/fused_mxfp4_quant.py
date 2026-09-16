@@ -5,12 +5,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-
-def _even_m_n(args, block_m, n, block_n, num_iter=None):
-    # Avoid Python 3.10 inspect truncating decorated source at inline lambdas.
-    block_n_size = args[block_n] * (args[num_iter] if num_iter is not None else 1)
-    return args["M"] % args[block_m] == 0 and args[n] % block_n_size == 0
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
 
 @triton.jit
