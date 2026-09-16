@@ -63,3 +63,12 @@ would not auto-dispatch here anyway.
 Table: `4882_triton_select` / `4882_triton_gqa` vs oracle (separate from the
 vLLM AMD table). Do not merge family A vs B.
 
+## Phase 1d — AITER #4882 Gluon (family B only)
+
+Same pin **`150c7bc12b45`**. gfx950 Gluon kernels under
+`aiter/ops/triton/_gluon_kernels/gfx950/attention/`. Launchers in
+`qsa_4882.py` accept `backend="triton"|"gluon"|"auto"`; default is Triton so
+family A stays a Triton column. Forced Gluon on family A GQA (group 12 / D=256)
+errors. Family B table: `4882_gluon_select` / `4882_gluon_gqa` vs oracle,
+indexer H ∈ {4, 8}. Skip on non-gfx950 or failed Gluon import.
+

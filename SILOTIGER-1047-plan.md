@@ -208,8 +208,10 @@ separate steps (plumbing → live AMD → #4882 → rocprof → optional NVIDIA)
       `150c7bc12b45`; Triton-only launchers in
       `aiter/ops/triton/attention/qsa_4882.py`. Separate markdown table vs
       oracle. Gluon not imported.
-- [ ] Pin **#4882 Gluon** (gfx950, Triton `>= 3.6`, auto-dispatch only;
-      family B shapes — Gluon does not auto-dispatch family A GQA).
+- [x] Pin **#4882 Gluon** (gfx950, Triton `>= 3.6`, forced `backend="gluon"`
+      on family B: indexer H 4/8 D=128, GQA group 5 / D=128 / width 2051).
+      Family A GQA is not launched on Gluon. Kernels:
+      `aiter/ops/triton/_gluon_kernels/gfx950/attention/qsa_{paged_mqa_logits,sparse_paged_gqa}.py`.
 - [ ] Optional NVIDIA QSA column — labeled so it cannot be mistaken for the
       AMD bar.
 - [ ] Family A table and family B table; never merge them.
