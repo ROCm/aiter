@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT6 **mesh** all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} **mesh** all-reduce.
 
 Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
-INT6 code: [-32,+31], −1/32, 1664 B rank-tile. Scale is
-group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
-walks ``MESH_ST_LADDER`` (ST=1 until the occupancy-clamped grid is
-full of tiles, then ST=8).
-Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
-``ATOMS / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
-stays ``ATOMS * rank_tile_bytes``.
+Wire format is a parameter, not a property of this file: ``MESH_CODECS``
+names the ones it can build, and the tile geometry that follows from each
+lives in ``quick_allreduce_codec`` (INT4 nibble [-8,+7], 1152 B rank-tile;
+INT6 bit-plane pair [-32,+31], 1664 B; both with group-16 signed E4M3
+scales in the 128 B tail).
+
+Super-tile ST∈{1,8}, from the per-codec ``MESH_ST_LADDER``. Payload HBM is
+bf16; in-kernel math is packed fp16. Each rank owns ``ATOMS / world_size``
+atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays
+``ATOMS * rank_tile_bytes``.
 
 Geometry, cache policy and the wire codec live in
-``quick_allreduce_shared`` and ``quick_allreduce_codec``.
+``quick_allreduce_shared`` and ``quick_allreduce_codec``, which the ring
+and one-shot schedules share byte for byte.
 """
 
 import flydsl.compiler as flyc
@@ -68,16 +72,21 @@ __all__ = [
     "TILE_BYTES",
     "WORLD",
     "clamp_grid_cap",
-    "make_quick_allreduce_int6_kernel",
+    "make_quick_allreduce_mesh_kernel",
+    "mesh_st_ladder",
 ]
 
 PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
 
-# (world_size, super_tile) → VGPR-limited workgroups per CU.
-# Super-tile widens the live atom list, so residency falls as it grows;
-# world size narrows each rank's share of a tile, so it rises with N.
+# (world_size, super_tile) → VGPR-limited workgroups per CU, measured on the
+# mesh kernel. Super-tile widens the live atom list, so residency falls as it
+# grows; world size narrows each rank's share of a tile, so it rises with N.
+#
+# Not keyed on the codec: INT6's wider rank-tile costs LDS rather than VGPRs,
+# and it runs at these counts on gfx942/gfx950. Over-launching a persistent
+# kernel deadlocks, so a codec that ever needs fewer has to be added here.
 _RESIDENT_WGS_PER_CU = {
     (2, 1): 3,
     (2, 8): 4,
@@ -102,7 +111,8 @@ def clamp_grid_cap(
     co-resident, so the cap has to respect VGPR-limited occupancy rather than
     the caller's wish.
 
-    An unmeasured *super_tile* falls back to the smallest measurement for that
+    An unmeasured *super_tile* -- the ring runs ST=16 and ST=32, which this
+    table does not cover -- falls back to the smallest measurement for that
     world size rather than raising. Under-launching a persistent kernel is
     always safe (each block simply loops over more tiles); over-launching is
     the failure mode, so the fallback has to err small. An unknown *arch* or
@@ -113,7 +123,7 @@ def clamp_grid_cap(
         raise ValueError("grid_cap and cu_count must be positive")
     if arch not in ("gfx942", "gfx950"):
         raise ValueError(
-            f"quick_allreduce_int6 has no residency measurement for {arch!r}"
+            f"quick_allreduce_mesh has no residency measurement for {arch!r}"
         )
     key = (int(world_size), int(super_tile))
     resident = _RESIDENT_WGS_PER_CU.get(key)
@@ -121,34 +131,66 @@ def clamp_grid_cap(
         for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
         if not for_world:
             raise ValueError(
-                "quick_allreduce_int6 has no residency measurement for "
+                "quick_allreduce_mesh has no residency measurement for "
                 f"world_size={world_size}"
             )
         resident = min(for_world)
     return min(int(requested), resident * int(cu_count))
 
 
-# Per-world-size tuning ladder: ``(min_bytes, super_tile, grid_cap)`` rungs.
+# Tuning ladder: ``(min_bytes, super_tile, grid_cap)`` rungs, per codec and
+# per world size.
 #
-#   All TP  ST=1 up to 38 MiB (1216 tiles) then ST=8.
+# Keyed on the codec because the two do not want the same schedule, and a
+# ladder fitted to one picks the wrong super-tile for the other. INT4:
 #
-# ``grid_cap`` is 1216; the host occupancy-clamps it at build.
+#   TP2  ST=1 everywhere.
+#   TP4  ST=8 everywhere.
+#   TP8  ST=1 up to 768 KiB then ST=8.
+#
+# with ``grid_cap`` 128 on every rung, against the ``DEFAULT_GRID_CAP`` of
+# 1216. INT6 moves 1664 B per rank-tile against INT4's 1152, and measured the
+# other way round: ST=1 well past where INT4 has switched, at the full grid.
+#
+#   All TP  ST=1 up to 38 MiB then ST=8.
+#
+# 38 MiB is 1216 tiles, which is also the grid cap. That is deliberate: the
+# no-fence branch of ``FlyQuickAllReduce._pick_st`` confirms a rung by
+# comparing tiles against the grid, so siting the rung there makes the ladder
+# and that check agree.
 MESH_ST_LADDER = {
-    2: ((0, 1, 1216), (38 << 20, 8, 1216)),
-    4: ((0, 1, 1216), (38 << 20, 8, 1216)),
-    8: ((0, 1, 1216), (38 << 20, 8, 1216)),
+    "int4": {
+        2: ((0, 1, 128),),
+        4: ((0, 8, 128),),
+        8: ((0, 1, 128), (768 << 10, 8, 128)),
+    },
+    "int6": {
+        2: ((0, 1, 1216), (38 << 20, 8, 1216)),
+        4: ((0, 1, 1216), (38 << 20, 8, 1216)),
+        8: ((0, 1, 1216), (38 << 20, 8, 1216)),
+    },
 }
-# Wire formats the INT6 mesh can build.
-MESH_CODECS = ("int6", "fp16")
+# Wire formats the mesh can build. The mesh carries one across both laps.
+MESH_CODECS = ("int4", "int6", "fp16")
 
 
-def make_quick_allreduce_int6_kernel(
+def mesh_st_ladder(codec: str, world_size: int):
+    """Rungs for *codec* at *world_size*.
+
+    ``fp16`` rides the INT4 table: it is a lossless passthrough used by the
+    transport tests, which pin ``super_tile`` and so never walk a ladder.
+    """
+    per_world = MESH_ST_LADDER.get(codec, MESH_ST_LADDER["int4"])
+    return per_world.get(int(world_size), ())
+
+
+def make_quick_allreduce_mesh_kernel(
     *,
     world_size: int = WORLD,
     super_tile: int = 1,
     grid: int,
     inbox_memory: str = "uncached",
-    codec: str = "int6",
+    codec: str = "int4",
 ):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
@@ -182,9 +224,9 @@ def make_quick_allreduce_int6_kernel(
     wire_tile_bytes = wire_tile_i32 * 4
 
     # A rank-tile's sectors, in stripes of up to 8 (a workgroup has 64 quads,
-    # and world_size*8 of them cover one full stripe at TP8). INT6 is 8+8+8+2;
-    # fp16, with no scale tail, is eight full stripes. One fanout layout per
-    # distinct stripe width.
+    # and world_size*8 of them cover one full stripe at TP8). INT4 is 8+8+2,
+    # INT6 is 8+8+8+2; fp16, with no scale tail, is eight full stripes. One
+    # fanout layout per distinct stripe width.
     stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
     _fanout_stride = {
         w: (w, 1) if policy["fanout"] == "peer" else (1, world_size)
@@ -199,7 +241,7 @@ def make_quick_allreduce_int6_kernel(
     flags_i32 = PHASES * grid * world_size
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
-    def quick_allreduce_int6(
+    def quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -242,10 +284,12 @@ def make_quick_allreduce_int6_kernel(
         #
         # Which axis runs fastest across consecutive quads is a fabric
         # question. "sector": consecutive quads target consecutive peers of
-        # one sector -- one store hits every GPU, which xGMI wants (native
-        # packet is the 64 B a quad writes). "peer": consecutive quads walk
-        # the sectors of one peer, so each destination gets a 512 B
-        # contiguous run, which PCIe wants.
+        # one sector, so a single store instruction hits every GPU -- ideal
+        # on xGMI, whose native packet is exactly the 64 B a quad writes.
+        # "peer": consecutive quads walk the sectors of one peer, giving each
+        # destination a 512 B contiguous run. PCIe wants that -- interleaving
+        # destinations every 64 B costs ~1.5x against >=256 B runs (36.25 vs
+        # 54.03 GB/s measured on MI350P).
         fanout_layouts = {
             w: fx.make_layout((world_size, w), stride)
             for w, stride in _fanout_stride.items()
@@ -379,10 +423,10 @@ def make_quick_allreduce_int6_kernel(
         def _fanout_nt(phase, inbox_src, sub):
             """NT-store one rank-tile from LDS to every peer's inbox.
 
-            Lockstep stripes of up to 8 sectors cover the rank-tile: INT6 is
-            8+8+8+2 (24 payload sectors then the 2-sector E4M3 tail), fp16 is
-            eight full stripes. ``sector_base`` is the first sector of each
-            stripe.
+            Lockstep stripes of up to 8 sectors cover the rank-tile: INT4 is
+            8+8+2 (16 nibble sectors then the 2-sector E4M3 tail), INT6 is
+            8+8+8+2 (24 payload sectors then the same tail), fp16 is eight
+            full stripes. ``sector_base`` is the first sector of each stripe.
             """
             for k in range_constexpr(rank_atoms):
                 for sector_base, width in stripes:
@@ -512,7 +556,8 @@ def make_quick_allreduce_int6_kernel(
             return gathered
 
         # Stride by the *launched* grid, not the compile-time cap. The host
-        # launches min(num_tiles, grid) blocks; striding by the cap instead would
+        # launches fewer blocks than `grid` whenever it wants each block to own
+        # several tiles (see FlyQuickAllReduce._grid_x); striding by the cap instead would
         # silently leave every tile above n_blocks unprocessed. `grid` still
         # sizes the wire slots and colour array, so n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
@@ -592,7 +637,7 @@ def make_quick_allreduce_int6_kernel(
     flat_wg = f"{BLOCK},{BLOCK}"
 
     @flyc.jit
-    def launch_quick_allreduce_int6(
+    def launch_quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -603,7 +648,7 @@ def make_quick_allreduce_int6_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int6(
+        quick_allreduce_mesh(
             rank,
             nbytes,
             num_tiles,
@@ -623,13 +668,13 @@ def make_quick_allreduce_int6_kernel(
     # both have to be part of the symbol name -- two variants that differ only
     # in cache bits or wire format must not collide in the JIT cache.
     tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_{codec}"
-    launch_quick_allreduce_int6.func.__name__ = f"launch_quick_allreduce_int6_{tag}"
+    launch_quick_allreduce_mesh.func.__name__ = f"launch_quick_allreduce_mesh_{tag}"
     try:
-        quick_allreduce_int6.func.__name__ = f"quick_allreduce_int6_{tag}"
+        quick_allreduce_mesh.func.__name__ = f"quick_allreduce_mesh_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_quick_allreduce_int6,
+        "launch": launch_quick_allreduce_mesh,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": lds_bytes,

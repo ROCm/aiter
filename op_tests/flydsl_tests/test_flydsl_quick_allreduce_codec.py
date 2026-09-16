@@ -3,7 +3,7 @@
 
 """Codec-level tests for the quick-allreduce wire formats.
 
-Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce_int4.py``
+Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce.py``
 covers the schedules that carry it.
 
 Two properties are load-bearing:
@@ -438,7 +438,7 @@ def test_fp16_codec_memory_path_matches_register_path():
 
 
 def _resolve(monkeypatch, algorithm, world_size, env=None, rs=None, ag=None):
-    from aiter.ops.flydsl import quick_allreduce_int4 as host
+    from aiter.ops.flydsl import quick_allreduce as host
 
     # Patch the parsed value rather than os.environ: the variable is read once
     # at import, which is the behaviour under test everywhere else.
@@ -458,7 +458,14 @@ def test_ring_codec_defaults_widen_only_at_tp8(monkeypatch, world_size, expected
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_mesh_is_int4_at_every_world_size(monkeypatch, world_size):
-    """The mesh has no separable lap, so the per-N default must not leak into it."""
+    """The mesh has no separable lap, so the per-N default must not leak into it.
+
+    The mesh can build INT6 -- it is the same kernel -- which is exactly why
+    this has to be asserted rather than left to ``MESH_CODECS`` to enforce.
+    Widening only the reduce-scatter lap is meaningless on a schedule that
+    carries one format across both, so ``single_codec`` opts it out of the
+    ring's per-N widening.
+    """
     assert _resolve(monkeypatch, "mesh", world_size) == ("int4", "int4")
 
 
@@ -474,11 +481,39 @@ def test_explicit_argument_outranks_the_environment(monkeypatch):
 
 
 def test_env_that_the_schedule_cannot_build_falls_back(monkeypatch):
-    """A process-wide variable must not break an unrelated call site."""
-    assert _resolve(monkeypatch, "mesh", 8, env="int6") == ("int4", "int4")
+    """A process-wide variable must not break an unrelated call site.
+
+    Every codec now builds on both schedules, so reaching this branch takes a
+    name no schedule knows -- one ``_parse_codec_env`` would itself have
+    dropped, which is why the value is patched in past it. The branch stays
+    for the next codec that only one schedule can carry.
+    """
+    assert _resolve(monkeypatch, "ring", 8, env="nosuch") == ("int6", "int4")
 
 
-def test_explicit_codec_the_schedule_cannot_build_raises(monkeypatch):
-    """Unlike the environment: naming it in code is a programming error."""
+def test_explicit_codec_no_schedule_can_build_raises(monkeypatch):
+    """Unlike the environment: naming it in code is a programming error.
+
+    A name no schedule knows, for the same reason as the fall-back test above:
+    every real codec builds on both schedules now, so there is no longer a
+    supported format one of them has to refuse.
+    """
     with pytest.raises(ValueError, match="rs_codec"):
-        _resolve(monkeypatch, "mesh", 8, rs="int6")
+        _resolve(monkeypatch, "mesh", 8, rs="nosuch")
+
+
+@pytest.mark.parametrize("lap", ("rs", "ag"))
+def test_mesh_mirrors_a_single_named_lap(monkeypatch, lap):
+    """One format spans both mesh laps, so naming either names both.
+
+    Pairing the named lap with the *other* lap's default would hand the build
+    a mismatch it can only reject, which is how INT6 on the mesh would be
+    unreachable without this.
+    """
+    assert _resolve(monkeypatch, "mesh", 8, **{lap: "int6"}) == ("int6", "int6")
+
+
+def test_mesh_rejects_two_different_laps(monkeypatch):
+    """The mesh cannot carry one format out and a different one back."""
+    with pytest.raises(ValueError, match="one wire format"):
+        _resolve(monkeypatch, "mesh", 8, rs="int6", ag="int4")

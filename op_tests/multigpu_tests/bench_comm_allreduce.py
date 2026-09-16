@@ -239,7 +239,7 @@ _QR_ENABLING_REGIME = "FP"
 _QR_WORLDS = (2, 4, 8)
 _QR_DTYPES = (dtypes.fp16, dtypes.bf16)
 
-# QuickAllReduceInt4 (FlyDSL) constraints, from aiter/ops/flydsl/quick_allreduce_int4.py.
+# FlyQuickAllReduce (FlyDSL) constraints, from aiter/ops/flydsl/quick_allreduce.py.
 _FLY_ARCHS = ("gfx942", "gfx950")
 _FLY_WORLDS = (2, 4, 8)
 
@@ -253,27 +253,27 @@ _FP8_MIN_NUMEL = 128 * 2048
 # separate availability predicate to mirror.
 try:
     from aiter.dist.device_communicators.flydsl_all_reduce import FlyDSLAllReduce
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
     from aiter.ops.flydsl.one_shot_allreduce import (
         OneShotAllReduce,
     )
-    from aiter.ops.flydsl.quick_allreduce_int4 import (
+    from aiter.ops.flydsl.quick_allreduce import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
         _resolve_codecs,
         has_xgmi_peer_links,
     )
 
-    HAS_FLY_INT4 = True
+    HAS_FLY_QR = True
 except Exception:  # noqa: BLE001
-    QuickAllReduceInt4 = None
+    FlyQuickAllReduce = None
     OneShotAllReduce = None
     MIN_PAYLOAD_BYTES = 0
     ALGORITHMS = {}
     _resolve_codecs = None
     has_xgmi_peer_links = None
     FlyDSLAllReduce = None
-    HAS_FLY_INT4 = False
+    HAS_FLY_QR = False
 
 # FlyDSLAllReduce is opt-in and self-disabling; the bench turns it on for its
 # own `fly_auto` row the same way it forces a quick-reduce regime for the qr_*
@@ -323,7 +323,7 @@ def _aiter_origin() -> str:
 def _peer_link_type() -> str:
     """GPU-to-GPU link type for the provenance header.
 
-    Shares QuickAllReduceInt4's KFD probe rather than reimplementing it, so the report can
+    Shares FlyQuickAllReduce's KFD probe rather than reimplementing it, so the report can
     never disagree with the dispatch decision the kernel actually made. Says so
     plainly when flydsl is absent and the probe is unavailable, rather than
     guessing -- a wrong link type here would misattribute a whole class of
@@ -380,13 +380,13 @@ class Candidate:
     quant: str | None = None  # QuickReduceRegime name, family == "qr"
     use_new: bool = True  # family == "cdr"
     fp8: bool = False  # family == "cdr"
-    algorithm: str = "mesh"  # QuickAllReduceInt4 schedule, family == "fly"
-    # QuickAllReduceInt4 tuning knobs, family == "fly". None means "leave the constructor
+    algorithm: str = "mesh"  # FlyQuickAllReduce schedule, family == "fly"
+    # FlyQuickAllReduce tuning knobs, family == "fly". None means "leave the constructor
     # default alone"; a value makes this candidate a distinct engine with its
     # own IPC inbox, so two rows can differ only in tuning.
     super_tile: int | None = None
     grid_cap: int | None = None
-    # Wire format per lap, family == "fly". None means QuickAllReduceInt4's own per-world
+    # Wire format per lap, family == "fly". None means FlyQuickAllReduce's own per-world
     # default, which is *not* constant across the sweep: the ring's
     # reduce-scatter lap widens to INT6 at TP8 (_RS_INT6_MIN_WORLD) because it
     # requantizes N-1 times. That is the right production default and the wrong
@@ -402,7 +402,7 @@ class Candidate:
 
     @property
     def fly_cfg(self) -> tuple:
-        """Identity of the QuickAllReduceInt4 engine this candidate needs."""
+        """Identity of the FlyQuickAllReduce engine this candidate needs."""
         return (
             self.algorithm,
             self.super_tile,
@@ -485,8 +485,8 @@ CANDIDATES = (
     # than the mesh at TP2 (22.2 dB) where the all-gather lap's verbatim
     # forwarding dominates. At TP8 INT4 would land ~15 dB, which is why the
     # ring defaults to an INT6 reduce-scatter lap there (~21 dB); see
-    # QuickAllReduceInt4's rs_codec. 14 dB leaves the usual ~5 dB of headroom.
-    # Auto: no pinned super_tile, so QuickAllReduceInt4 walks RING_ST_LADDER and picks by
+    # FlyQuickAllReduce's rs_codec. 14 dB leaves the usual ~5 dB of headroom.
+    # Auto: no pinned super_tile, so FlyQuickAllReduce walks RING_ST_LADDER and picks by
     # payload size at launch. This is what production gets.
     Candidate("fly_int4_ring", "fly", 14.0, False, algorithm="ring"),  # 18.7 / n/a
     # Super-tile variants of the ring with the ladder *disabled* -- pinning
@@ -532,7 +532,7 @@ CANDIDATES = (
         grid_cap=128,
     ),
     # The same two rungs with the reduce-scatter lap pinned to INT6. The rows
-    # above leave `rs_codec=None`, i.e. QuickAllReduceInt4's per-world default, which is
+    # above leave `rs_codec=None`, i.e. FlyQuickAllReduce's per-world default, which is
     # INT4 below TP8 and INT6 at TP8 -- so the TP4 and TP8 reports are not
     # comparing the same wire, and the TP8 ring's 21.6 dB against TP4's 18.7 is
     # a codec difference reported as a schedule difference. These rows hold the
@@ -641,10 +641,10 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
         # codec -- it lands at the bf16 rounding floor alongside cdr.
         return cand.quant == "FP" or _bench_fly_accuracy_mode() == "fast"
     if cand.family == "fly":
-        # Deliberately *not* gated on QuickAllReduceInt4's own payload floor, which the
+        # Deliberately *not* gated on FlyQuickAllReduce's own payload floor, which the
         # engines here disable with min_bytes=0.
         return (
-            HAS_FLY_INT4
+            HAS_FLY_QR
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
@@ -654,7 +654,7 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
         # Gated by the dispatcher's own policy rather than by a constant here:
         # the whole point of the row is that its window is the shipped one.
         return (
-            HAS_FLY_INT4
+            HAS_FLY_QR
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
@@ -663,7 +663,7 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
         # Gated from above, not below: OneShotAllReduce.allreduce refuses
         # payloads over its ceiling because wire volume is (N-1)x the message.
         return (
-            HAS_FLY_INT4
+            HAS_FLY_QR
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
@@ -698,10 +698,10 @@ def _fly1s_ceiling(world_size: int) -> int:
     kb = os.environ.get("AITER_BENCH_FLY1S_MAX_KB")
     if kb:
         return int(kb) << 10
-    # HAS_FLY_INT4, not `_fly1s_max_bytes is not None`: the ceiling no longer
+    # HAS_FLY_QR, not `_fly1s_max_bytes is not None`: the ceiling no longer
     # derives from the shipped policy, so the import is only an availability
     # probe and saying so directly is clearer.
-    return _FLY1S_DEFAULT_CEILING if HAS_FLY_INT4 else 0
+    return _FLY1S_DEFAULT_CEILING if HAS_FLY_QR else 0
 
 
 def sqnr_db(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -946,7 +946,7 @@ def _fly_kwargs(cfg: tuple, names: tuple) -> dict:
     """Non-``None`` fields of *cfg* as constructor kwargs, named by *names*.
 
     ``None`` means "leave the constructor default alone", which is not the same
-    as passing the default explicitly: ``QuickAllReduceInt4`` distinguishes an unset
+    as passing the default explicitly: ``FlyQuickAllReduce`` distinguishes an unset
     ``super_tile`` (walk the ladder) from a pinned one (this value at every
     size), and an unset codec from a pinned one.
     """
@@ -1292,7 +1292,7 @@ def _worker(
     dist.all_reduce(torch.zeros(1, device=device), group=group)
     torch.cuda.synchronize()
 
-    fly = {}  # QuickAllReduceInt4 config tuple -> engine
+    fly = {}  # FlyQuickAllReduce config tuple -> engine
     # One engine per distinct (schedule, super_tile, grid_cap, rs_codec,
     # ag_codec): each owns its own IPC inbox, whose layout depends on all five.
     # Sorted so every rank performs its handle exchanges in the same sequence --
@@ -1305,16 +1305,16 @@ def _worker(
     )
     if (
         wanted_cfgs
-        and HAS_FLY_INT4
+        and HAS_FLY_QR
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
         and dtype == dtypes.bf16
         and _bench_fly_accuracy_mode() == "fast"
     ):
         for cfg in wanted_cfgs:
-            # QuickAllReduceInt4 exchanges IPC handles via broadcast_object_list, so it
+            # FlyQuickAllReduce exchanges IPC handles via broadcast_object_list, so it
             # needs the gloo (CPU) group -- it rejects an NCCL group outright.
-            fly[cfg] = QuickAllReduceInt4(
+            fly[cfg] = FlyQuickAllReduce(
                 group=tp_group.cpu_group,
                 device=device,
                 rank=rank,
@@ -1327,7 +1327,7 @@ def _worker(
                 ),
             )
         # compile() JIT-compiles every super-tile engine without launching any
-        # of them (quick_allreduce_int4.compile_only), so one call at any shape keeps every
+        # of them (quick_allreduce.compile_only), so one call at any shape keeps every
         # timed region below free of a first-call JIT stall.
         warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
         for cfg in wanted_cfgs:
@@ -1336,7 +1336,7 @@ def _worker(
         del warm
 
     fly1s = {}  # (atoms, grid_cap, fanout) -> OneShotAllReduce engine
-    # Same rules as the QuickAllReduceInt4 engines above: one per distinct config, each with
+    # Same rules as the FlyQuickAllReduce engines above: one per distinct config, each with
     # its own IPC inbox, constructed in a total order because the handle
     # exchange is a collective.
     wanted_1s = sorted(
@@ -1345,7 +1345,7 @@ def _worker(
     )
     if (
         wanted_1s
-        and HAS_FLY_INT4
+        and HAS_FLY_QR
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
         and dtype == dtypes.bf16
@@ -1374,7 +1374,7 @@ def _worker(
     flyauto = None
     if (
         any(c.family == "flyauto" and c.key in keys for c in CANDIDATES)
-        and HAS_FLY_INT4
+        and HAS_FLY_QR
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
         and dtype == dtypes.bf16
@@ -2105,8 +2105,8 @@ def roofline_table(df, keys, measured):
 
 
 def _fly_floor_note(world_sizes) -> str:
-    """``QuickAllReduceInt4.allreduce``'s own size floor per (schedule, world size)."""
-    if not HAS_FLY_INT4:
+    """``FlyQuickAllReduce.allreduce``'s own size floor per (schedule, world size)."""
+    if not HAS_FLY_QR:
         return "n/a"
     parts = []
     for algorithm in sorted(ALGORITHMS):
@@ -2190,9 +2190,9 @@ def _write_report(
         ),
         f"- FlyDSL accuracy regime: {args.fly_accuracy}",
         f"- baseline: {args.baseline}",
-        f"- fly_int4 available: {HAS_FLY_INT4}",
+        f"- FlyDSL quick-allreduce available: {HAS_FLY_QR}",
         (
-            "- QuickAllReduceInt4 deployment floors (not enforced here): "
+            "- FlyQuickAllReduce deployment floors (not enforced here): "
             f"{_fly_floor_note(args.tp if args.tp else [4])}"
         ),
         (
