@@ -34,7 +34,8 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.kernels.conv3d_implicit import _pad_channels
 
-SUPPORTED_GFX = ("gfx942", "gfx950")
+# Same gate as test_flydsl_conv_implicit.py: conv3d_implicit is gfx950-only.
+SUPPORTED_GFX = ("gfx950",)
 
 
 def _rows_for_this_device():
