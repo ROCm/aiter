@@ -57,7 +57,6 @@ def buffer_atomic_add(vdata, rsrc, offset, soffset, aux):
 
 
 TILE_K = 32
-STAGES = 2
 WARP_SIZE = 64
 
 # K tiles consumed between two barriers. Each one is MI_M * MI_N MFMAs, and that product
@@ -71,8 +70,6 @@ TILES_PER_BARRIER = 2
 
 MFMA_M = 16
 MFMA_N = 16
-MFMA_A_VALUES = 8
-MFMA_B_VALUES = 8
 MFMA_C_VALUES = 4
 
 LDG_VEC = 8
