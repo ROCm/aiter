@@ -434,6 +434,49 @@ def test_copies_follow_nondefault_stream(page, layout, d, dv):
 
 
 @gfx950
+def test_side_stream_keeps_copy_source_alive():
+    case = make_case(64, "vectorized", 128, 128)
+    stream = torch.cuda.Stream()
+    expected = check_case(case, stream=stream).clone()
+    storage_shape = (*case.v.shape[:-1], case.v.shape[-1] * 2)
+    storage = torch.empty(storage_shape, dtype=case.v.dtype, device="cuda")
+    strided = storage[..., ::2]
+    strided.copy_(case.v)
+    case.v = strided
+    source_begin = storage.data_ptr()
+    source_end = source_begin + storage.numel() * storage.element_size()
+    del storage, strided
+    torch.cuda.synchronize()
+
+    # Delay the copy so the caller can release its source and pressure the
+    # creation-stream allocator before the side stream consumes the bytes.
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(3_000_000_000)
+    run_case(case, stream=stream)
+    del case.v
+    replacements = []
+    source_reused = False
+    pending = False
+    try:
+        for _ in range(32):
+            replacement = torch.empty(
+                storage_shape, dtype=torch.float8_e4m3fn, device="cuda"
+            )
+            replacements.append(replacement)
+            if not stream.query():
+                pending = True
+                begin = replacement.data_ptr()
+                end = begin + replacement.numel() * replacement.element_size()
+                source_reused |= begin < source_end and end > source_begin
+            replacement.zero_()
+    finally:
+        torch.cuda.synchronize()
+    assert pending, "side stream completed before allocator pressure"
+    assert not source_reused, "copy source was recycled while side stream was pending"
+    torch.testing.assert_close(case.out, expected, rtol=0, atol=0)
+
+
+@gfx950
 @pytest.mark.parametrize("page,layout", LAYOUTS)
 @pytest.mark.parametrize("d,dv", DIMS)
 @pytest.mark.parametrize("rectangular", [False, True])

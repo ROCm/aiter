@@ -916,12 +916,6 @@ class DualwaveFp8KernelContext:
             return traits.DUALWAVE_SWP_K_BUF_BASE[buf_id]
         return buf_id * traits.DUALWAVE_SWP_KV_PER_BUFFER
 
-    def v_buf_base(self, buf_id):
-        traits = self.traits
-        if const_expr(isinstance(buf_id, int)):
-            return traits.DUALWAVE_SWP_V_BUF_BASE[buf_id]
-        return traits.SMEM_K_TILE_ELEMS + buf_id * traits.DUALWAVE_SWP_KV_PER_BUFFER
-
     def v_pair_to_vec32(self, v):
         return _v_pair_to_vec32(v)
 

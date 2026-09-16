@@ -314,6 +314,13 @@ def flydsl_flash_attn_paged_fp8_func(
                 metadata_mode="csr" if csr else "block_table",
                 has_last_page_lens=has_last,
             )
+            if stream is not None:
+                # Copies must keep their caller-owned sources alive too, even
+                # if compilation or launch raises after a copy is queued.
+                for tensor in (q, k, v, page_indices, cu_seqlens_q, metadata):
+                    tensor.record_stream(launch_stream)
+                if has_last:
+                    kv_last_page_lens.record_stream(launch_stream)
             query = q.contiguous().view(-1)
             key, value = k.contiguous(), v.contiguous()
             table = page_indices.contiguous().view(-1)
