@@ -329,7 +329,10 @@ columns.
 **Not checked:** `L<=2048` still beats HIP select. Live-heap merge drops
 decode 8k ~35µs→~27µs vs HIP ~19µs. Decode 32k/128k stay ~53 / ~154µs vs
 HIP ~20 / ~30µs. Prefill serial 8k/32k is ~138 / ~536µs, still behind HIP
-(~84 / ~249µs).
+(~84 / ~249µs). Re-measured split vs serial with the live 4+2+1 tree
+(`err=0` both): decode 8k still wants split (27 vs 66µs); prefill `M=512`
+does not (`L=8k` 149 vs 136µs, `L=32k` 550 vs 537µs; short `L=2048` split
+is 17 vs 3.5µs). Keep `m > _SPLITS` serial.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|

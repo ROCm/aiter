@@ -269,7 +269,9 @@ workgroup barriers per tile. The split-merge tree pair-merges only
 stays single-WG. Workspace is `[M, 8, 512]`, not a score matrix.
 **2d stays unchecked:** short `L` beats HIP; decode 8k drops ~35→~27µs
 (still behind HIP ~19µs); 32k/128k stay ~53/~154µs; prefill 8k/32k is
-~138/~536µs.
+~138/~536µs. Re-measured split vs serial against the live 4+2+1 tree:
+decode 8k still wants split (27 vs 66µs); prefill `M=512` does not (8k
+149 vs 136µs, 32k 550 vs 537µs). Keep `m > _SPLITS` serial.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
