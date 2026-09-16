@@ -40,7 +40,8 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
-from .kernels.pa_decode_plan import PADecodePlan, plan_pa_decode as plan_pa_decode
+from .kernels.pa_decode_plan import PADecodePlan
+from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     MAX_CONTEXT_PARTITIONS,
     compile_pa_decode_ps_reduce,
