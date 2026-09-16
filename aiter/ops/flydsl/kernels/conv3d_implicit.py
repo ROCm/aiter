@@ -902,18 +902,14 @@ def compile_conv3d_implicit(
         def read_a_frags(stage):
             sA = stage_a(stage)
             frag_A = thr_mma.make_fragment_A(sA)
-            fx.copy(
-                lds_copy, thr_copy_A.partition_S(sA), thr_copy_A.retile(frag_A)
-            )
+            fx.copy(lds_copy, thr_copy_A.partition_S(sA), thr_copy_A.retile(frag_A))
             rocdl.sched_dsrd(MI_M)
             return frag_A
 
         def read_b_frags(stage):
             sB = stage_b(stage)
             frag_B = thr_mma.make_fragment_B(sB)
-            fx.copy(
-                lds_copy, thr_copy_B.partition_S(sB), thr_copy_B.retile(frag_B)
-            )
+            fx.copy(lds_copy, thr_copy_B.partition_S(sB), thr_copy_B.retile(frag_B))
             rocdl.sched_dsrd(MI_N)
             return frag_B
 
