@@ -264,27 +264,29 @@ a **wave-local tile sort**, a **per-tile pair merge**, a **column split**
 on decode rows with more than one tile, and **pipelined score_col**
 (prefetch next D-chunk of paged K). Each inter-wave merge fuses its
 reverse-upper step with the first cross-half compare, removing three
-workgroup barriers per tile. Prefill stays single-WG. Workspace is
-`[M, 8, 512]`, not a score matrix. **2d stays unchecked:** short `L`
-beats HIP; decode 8k/32k/128k is ~35/~52/~153µs and prefill 8k/32k is
-~137/~537µs, still behind HIP.
+workgroup barriers per tile. The split-merge tree pair-merges only
+`min(n_tiles, 8)` live heaps (decode 8k skips the idle 4-way stage). Prefill
+stays single-WG. Workspace is `[M, 8, 512]`, not a score matrix.
+**2d stays unchecked:** short `L` beats HIP; decode 8k drops ~35→~27µs
+(still behind HIP ~19µs); 32k/128k stay ~53/~154µs; prefill 8k/32k is
+~138/~536µs.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 2.0 | 9.4 | 0 | 0 |
-| 8 | 512 | 128 | 2.9 | 11.4 | 0 | 0 |
-| 1 | 2048 | 512 | 2.0 | 10.2 | 0 | 0 |
-| 8 | 2048 | 512 | 2.9 | 11.4 | 0 | 0 |
-| 1 | 8192 | 2048 | 35.2 | 19.0 | 0 | 0 |
-| 8 | 8192 | 2048 | 35.4 | 21.6 | 0 | 0 |
-| 1 | 32768 | 8192 | 52.3 | 20.4 | 0 | 0 |
-| 8 | 32768 | 8192 | 52.0 | 25.2 | 0 | 0 |
-| 1 | 131072 | 32768 | 153.4 | 30.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 161.2 | 53.1 | 0 | 0 |
-| 512 | 512 | 128 | 3.6 | 18.7 | 0 | 0 |
-| 512 | 2048 | 512 | 3.5 | 29.3 | 0 | 0 |
-| 512 | 8192 | 2048 | 137.4 | 83.5 | 0 | 0 |
-| 512 | 32768 | 8192 | 536.9 | 249.5 | 0 | 0 |
+| 1 | 512 | 128 | 2.0 | 9.3 | 0 | 0 |
+| 8 | 512 | 128 | 3.0 | 11.2 | 0 | 0 |
+| 1 | 2048 | 512 | 2.0 | 10.0 | 0 | 0 |
+| 8 | 2048 | 512 | 3.0 | 11.4 | 0 | 0 |
+| 1 | 8192 | 2048 | 26.9 | 19.2 | 0 | 0 |
+| 8 | 8192 | 2048 | 27.7 | 22.0 | 0 | 0 |
+| 1 | 32768 | 8192 | 53.0 | 20.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 52.9 | 25.3 | 0 | 0 |
+| 1 | 131072 | 32768 | 153.8 | 29.9 | 0 | 0 |
+| 8 | 131072 | 32768 | 162.7 | 52.8 | 0 | 0 |
+| 512 | 512 | 128 | 3.5 | 18.3 | 0 | 0 |
+| 512 | 2048 | 512 | 3.6 | 29.3 | 0 | 0 |
+| 512 | 8192 | 2048 | 137.6 | 83.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 535.6 | 248.5 | 0 | 0 |
 
 
 
