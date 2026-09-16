@@ -7,6 +7,7 @@
 #include "aiter_stream.h"
 #include "quant.h"
 
+#include <cstdint>
 #include <type_traits>
 
 namespace aiter {
@@ -19,12 +20,14 @@ constexpr int kGroupsPerKTile      = kKTile / kGroupSize;
 constexpr int kKGuardTiles         = 2;
 constexpr int kPackedTileBytes     = 24576;
 constexpr int kScaleTileBytes      = 1024;
+constexpr int64_t kMaxBufferBytes  = int64_t{1} << 31;
 constexpr int kBlockThreads        = 256;
 constexpr int kThreadsPerGroup     = 4;
 constexpr int kValuesPerThread     = kGroupSize / kThreadsPerGroup;
 constexpr int kLargeKThreshold     = 8192;
 constexpr int kSmallKStepsPerBlock = 2;
 constexpr int kLargeKStepsPerBlock = 3;
+constexpr uintptr_t kOutputAlignment = 16;
 // _hadamard32_np().astype(bfloat16), represented exactly as fp32.
 constexpr float kHadamard32Norm = 0.1767578125f;
 
@@ -68,13 +71,25 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
     opus::vector_t<float, kValuesPerThread> values;
     if(col + kValuesPerThread <= cols && (cols % kValuesPerThread) == 0)
     {
-        const packed_u16x8_t input_bits = *reinterpret_cast<const packed_u16x8_t*>(
-            input + row * static_cast<int64_t>(cols) + col);
-        const input_t* input_values = reinterpret_cast<const input_t*>(&input_bits);
-#pragma unroll
-        for(int i = 0; i < kValuesPerThread; ++i)
+        const input_t* input_ptr = input + row * static_cast<int64_t>(cols) + col;
+        if(reinterpret_cast<uintptr_t>(input_ptr) % alignof(packed_u16x8_t) == 0)
         {
-            values[i] = to_bf16_dot_operand(input_values[i]);
+            const packed_u16x8_t input_bits =
+                *reinterpret_cast<const packed_u16x8_t*>(input_ptr);
+            const input_t* input_values = reinterpret_cast<const input_t*>(&input_bits);
+#pragma unroll
+            for(int i = 0; i < kValuesPerThread; ++i)
+            {
+                values[i] = to_bf16_dot_operand(input_values[i]);
+            }
+        }
+        else
+        {
+#pragma unroll
+            for(int i = 0; i < kValuesPerThread; ++i)
+            {
+                values[i] = to_bf16_dot_operand(input_ptr[i]);
+            }
         }
     }
     else
@@ -255,22 +270,34 @@ void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
     AITER_CHECK(packed.dtype() == AITER_DTYPE_u8, __func__, " expected uint8 packed output");
     AITER_CHECK(
         packed_scale.dtype() == AITER_DTYPE_u8, __func__, " expected uint8 packed-scale output");
+    AITER_CHECK(
+        reinterpret_cast<uintptr_t>(packed.data_ptr()) % kOutputAlignment == 0 &&
+            reinterpret_cast<uintptr_t>(packed_scale.data_ptr()) % kOutputAlignment == 0,
+        __func__,
+        " expected 16-byte-aligned outputs");
     AITER_CHECK(input.dtype() == AITER_DTYPE_bf16 || input.dtype() == AITER_DTYPE_fp16,
                 __func__,
                 " expected bf16 or fp16 input");
 
-    const int64_t rows = input.size(0);
-    const int32_t cols = input.size(1);
-    AITER_CHECK(rows > 0 && cols > 0, __func__, " expected non-empty input");
+    const int64_t rows64 = input.size(0);
+    const int64_t cols64 = input.size(1);
+    AITER_CHECK(rows64 > 0 && cols64 > 0, __func__, " expected non-empty input");
+    AITER_CHECK(rows64 <= INT64_MAX - (kTileRows - 1), __func__, " rows exceed int64 range");
+    AITER_CHECK(cols64 <= INT32_MAX - (kKTile - 1), __func__, " K exceeds int32 range");
+    const int32_t cols = static_cast<int32_t>(cols64);
 
     const int32_t pad_cols   = (cols + kKTile - 1) / kKTile * kKTile;
-    const int64_t pad_rows   = (rows + kTileRows - 1) / kTileRows * kTileRows;
+    const int64_t pad_rows   = (rows64 + kTileRows - 1) / kTileRows * kTileRows;
     const int32_t num_groups = pad_cols / kGroupSize;
     const int32_t nk_pad     = pad_cols / kKTile + kKGuardTiles;
+    const int64_t tile_rows  = pad_rows / kTileRows;
+    AITER_CHECK(tile_rows <= kMaxBufferBytes / (static_cast<int64_t>(nk_pad) * kPackedTileBytes),
+                __func__,
+                " packed output exceeds the 2 GiB address range");
     const int64_t expected_packed =
-        pad_rows / kTileRows * static_cast<int64_t>(nk_pad) * kPackedTileBytes;
+        tile_rows * static_cast<int64_t>(nk_pad) * kPackedTileBytes;
     const int64_t expected_scale =
-        pad_rows / kTileRows * static_cast<int64_t>(nk_pad) * kScaleTileBytes;
+        tile_rows * static_cast<int64_t>(nk_pad) * kScaleTileBytes;
     AITER_CHECK(packed.numel() == expected_packed,
                 __func__,
                 " packed output has ",
@@ -284,7 +311,7 @@ void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
                 " bytes, expected ",
                 expected_scale);
 
-    const int64_t row_blocks = (rows + 15) / 16;
+    const int64_t row_blocks = (rows64 + 15) / 16;
     const int32_t num_steps  = num_groups / kGroupsPerKTile;
     const int32_t k_steps_per_block =
         cols >= kLargeKThreshold ? kLargeKStepsPerBlock : kSmallKStepsPerBlock;
@@ -301,7 +328,7 @@ void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
                     reinterpret_cast<const scalar_t*>(input.data_ptr()),
                     reinterpret_cast<uint8_t*>(packed.data_ptr()),
                     reinterpret_cast<uint8_t*>(packed_scale.data_ptr()),
-                    rows,
+                    rows64,
                     cols,
                     num_groups,
                     nk_pad);
@@ -313,7 +340,7 @@ void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
                     reinterpret_cast<const scalar_t*>(input.data_ptr()),
                     reinterpret_cast<uint8_t*>(packed.data_ptr()),
                     reinterpret_cast<uint8_t*>(packed_scale.data_ptr()),
-                    rows,
+                    rows64,
                     cols,
                     num_groups,
                     nk_pad);

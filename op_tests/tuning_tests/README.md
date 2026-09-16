@@ -30,6 +30,11 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 | `gdn_k5_opt` | `csrc/gdn_k5/chunk_gdn_h_opt_tune.py` | `model_configs/*_chunk_gdn_h_opt_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
 
+Mixed-MXFP coverage is provided by
+`csrc/gemm_a6w4/gemm_a6w4_tune.py` and
+`csrc/gemm_a4w6/gemm_a4w6_tune.py`. Both families have static CSV validation,
+runtime-config validation, and single-/multi-GPU pipeline smoke tests.
+
 ## Config resolution
 
 `test_run_config` resolves tuned config files through `AITER_CONFIGS` in `aiter/jit/core.py` — the same path used by production operators at runtime. This validates that:
@@ -47,6 +52,7 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
+  op_tests.tuning_tests.test_mixed_mxfp_tuning \
   op_tests.tuning_tests.test_online_tune -v
 
 # Level 2: pipeline smoke (~10min)
@@ -105,6 +111,9 @@ TUNE_TEST_CONFIG="aiter/configs/a8w8_blockscale_tuned_gemm.csv:aiter/configs/mod
 python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
 ```
 
-Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`, `gradlib_bf16`, `gdn_k5_opt`
+Available families include `a8w8`, `a8w8_bpreshuffle`,
+`a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`,
+`a6w4_asm`, `a4w6_asm`, `batched_a8w8`, `batched_bf16`,
+`fmoe`, `gradlib_bf16`, and `gdn_k5_opt`.
 
 The test checks both **exit code** and **per-shape status** — shapes with `ERROR` (kernel crash) or `MISMATCH` (accuracy exceeded errRatio) will fail the test.
