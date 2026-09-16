@@ -306,6 +306,39 @@ This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
 oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
 2d bar.
 
+- [ ] **2d.** Family A K1 beats live vLLM AMD select on the harness lengths
+      (`M∈{1,8,512}`, `L∈{512,2048,8192,32768,131072}`), still `block_ids [M,512]`,
+      no `[M, n_blocks]` score buffer.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality `err=0`
+on both columns. **Not checked.** `aiter/jit/module_top_k_per_row.so` is
+loaded (`import [module_top_k_per_row]`; oracle-fallback warning did not
+fire). The AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand.
+
+The FlyDSL column is **eight-wave** scoring (`block=512`, one column per
+thread per tile) measured in this workspace. That kernel change is **not**
+on the branch at this measurement (committed K1 is still the 2c wave64
+instantiation). FlyDSL loses **every** harness row, including `L<=2048`
+(~25µs vs ~8µs at `M=1, L=512`). From 8k the per-tile bitonic still
+dominates K1.
+
+| m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
+|--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
+| 1 | 512 | 128 | 24.7 | 7.5 | 0 | 0 |
+| 8 | 512 | 128 | 25.2 | 9.0 | 0 | 0 |
+| 1 | 2048 | 512 | 28.0 | 8.0 | 0 | 0 |
+| 8 | 2048 | 512 | 28.5 | 9.1 | 0 | 0 |
+| 1 | 8192 | 2048 | 105.9 | 17.1 | 0 | 0 |
+| 8 | 8192 | 2048 | 107.0 | 20.0 | 0 | 0 |
+| 1 | 32768 | 8192 | 417.3 | 19.4 | 0 | 0 |
+| 8 | 32768 | 8192 | 421.0 | 23.7 | 0 | 0 |
+| 1 | 131072 | 32768 | 1729.8 | 29.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 1745.4 | 51.9 | 0 | 0 |
+| 512 | 512 | 128 | 48.3 | 16.0 | 0 | 0 |
+| 512 | 2048 | 512 | 56.6 | 27.0 | 0 | 0 |
+| 512 | 8192 | 2048 | 213.3 | 82.5 | 0 | 0 |
+| 512 | 32768 | 8192 | 832.7 | 248.1 | 0 | 0 |
+
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.
