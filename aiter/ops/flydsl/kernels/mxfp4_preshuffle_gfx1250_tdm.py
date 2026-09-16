@@ -1273,6 +1273,8 @@ def launch_gemm_a8w4_tdm(
 
                         e8m0_bytes = []
                         mx_blk_is = []
+                        _FP4_DEPTH = min(2, N_MX_BLKS)
+                        _fp4_store_q = []
                         for mx_blk in range_constexpr(N_MX_BLKS):
                             # Gather (gate, up) pairs for this MX block.
                             pairs = []
@@ -1312,6 +1314,7 @@ def launch_gemm_a8w4_tdm(
                             mx_blk_is.append(mx_blk_i)
 
                             if const_expr(is_fp4_quant):
+                                packed_dwords = []
                                 for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                     wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
                                     local_vals = all_vals[sub_wn * 4 : sub_wn * 4 + 4]
@@ -1322,17 +1325,26 @@ def launch_gemm_a8w4_tdm(
                                     src = Vec.from_elements(
                                         local_vals + peer_vals, fx.Float32
                                     )
-                                    packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
-                                        src.to(fx.BFloat16).ir_value(),
-                                        scale_f32,
-                                        i32_ty=T.i32,
+                                    packed_dwords.append(
+                                        emit_cvt_scalef32_pk8_fp4_bf16(
+                                            src.to(fx.BFloat16).ir_value(),
+                                            scale_f32,
+                                            i32_ty=T.i32,
+                                        )
                                     )
+                                _fp4_store_q.append((
+                                    (wnb + mx_blk * WN_PER_MX_BLOCK * 16) // 4,
+                                    Vec.from_elements(
+                                        packed_dwords, fx.Int32
+                                    ).ir_value(),
+                                ))
+                                if const_expr(mx_blk >= _FP4_DEPTH):
+                                    _d = mx_blk - _FP4_DEPTH
                                     if kgrp == 0:
-                                        col_fp4 = (wnb + wn * 16) // 4
-                                        lds_store_b32(
+                                        lds_store_b128(
                                             stC_idx,
-                                            row_rel * STORE_N + col_fp4,
-                                            Vec.from_elements([packed_i32], fx.Int32),
+                                            row_rel * STORE_N + _fp4_store_q[_d][0],
+                                            _fp4_store_q[_d][1],
                                         )
                             else:
                                 for half in range_constexpr(WN_PER_MX_BLOCK // 2):
@@ -1356,6 +1368,17 @@ def launch_gemm_a8w4_tdm(
                                             row_rel * STORE_N + col_fp8,
                                             Vec.from_elements([packed_i32], fx.Int32),
                                         )
+
+                        if const_expr(is_fp4_quant):
+                            if kgrp == 0:
+                                for _i in range_constexpr(
+                                    max(0, N_MX_BLKS - _FP4_DEPTH), N_MX_BLKS
+                                ):
+                                    lds_store_b128(
+                                        stC_idx,
+                                        row_rel * STORE_N + _fp4_store_q[_i][0],
+                                        _fp4_store_q[_i][1],
+                                    )
 
                         # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                         if row_rel < mn_oob and is_kgrp0:

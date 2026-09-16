@@ -157,20 +157,24 @@ def fclamp_f32(x, lo, hi):
 
 
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
-    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp).
+
+    Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
+        sigmoid(x) = 0.5*(1 + tanh(x/2))
+    """
     import flydsl.expr as _fx
 
     _one = _fx.Float32(1.0)
+    _half = _fx.Float32(0.5)
     g = fmin_f32(g, limit_f32)
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
     if swiglu:
-        nlog2e = _fx.Float32(-1.702 * LOG2E)
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-        sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+        _half_beta = _fx.Float32(1.702 * 0.5)
+        th = _fx.Float32(rocdl.tanh(T.f32, _raw(g * _half_beta)))
+        sig = _half * (_one + th)
         return g * sig * (u + _one)
-    nlog2e = _fx.Float32(-LOG2E)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    th = _fx.Float32(rocdl.tanh(T.f32, _raw(g * _half)))
+    sig = _half * (_one + th)
     return g * sig * u
 
 
@@ -294,7 +298,15 @@ def batched_situv2(pairs, *, consts, range_constexpr):
 
 
 def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
-    """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
+    """Batched silu/swiglu with pipelined tanh for better TRANS utilisation.
+
+    Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
+        sigmoid(x) = 0.5*(1 + tanh(x/2))
+
+    Tanh is issued in groups of CHUNK; after each group a sched_barrier
+    lets the compiler interleave the previous group's VALU consumers
+    (add-one, mul-half, final products) with the next group's TRANS
+    latency, avoiding a long TRANS-only stall.
 
     Args:
         pairs: list of (gate, up) f32 value pairs.
@@ -308,37 +320,47 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     import flydsl.expr as _fx
 
     _one = _fx.Float32(1.0)
-    nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    _half = _fx.Float32(0.5)
+    _half_scale = _fx.Float32((1.702 * 0.5) if swiglu else 0.5)
     N = len(pairs)
-    # Stage 1: clamp + exp2
-    gs, us, exp_vals = [], [], []
+    CHUNK = 4
+    # Stage 1: clamp all pairs
+    gs, us = [], []
     for i in range_constexpr(N):
         g = fmin_f32(pairs[i][0], limit_f32)
         u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
         gs.append(g)
         us.append(u)
     rocdl.sched_barrier(0)
-    for i in range_constexpr(N):
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
-        exp_vals.append(exp_val)
-    # Stage 2a: add 1+exp
-    rocdl.sched_barrier(0)
-    sum_vals = []
-    for i in range_constexpr(N):
-        sum_vals.append(_one + exp_vals[i])
-    # Stage 2b: rcp
-    rocdl.sched_barrier(0)
-    rcp_vals = []
-    for i in range_constexpr(N):
-        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
-    # Stage 3: final mul
-    rocdl.sched_barrier(0)
-    results = []
-    for i in range_constexpr(N):
+    # Stage 2+3 interleaved: issue CHUNK tanh, then consume previous CHUNK.
+    tanh_vals = [None] * N
+    results = [None] * N
+    n_chunks = (N + CHUNK - 1) // CHUNK
+    for c in range_constexpr(n_chunks):
+        lo = c * CHUNK
+        hi = min(lo + CHUNK, N)
+        for i in range_constexpr(lo, hi):
+            tanh_vals[i] = _fx.Float32(
+                rocdl.tanh(T.f32, _raw(gs[i] * _half_scale))
+            )
+        rocdl.sched_barrier(0)
+        prev_lo = (c - 1) * CHUNK if c > 0 else None
+        prev_hi = lo if c > 0 else None
+        if prev_lo is not None:
+            for i in range_constexpr(prev_lo, prev_hi):
+                sig = _half * (_one + tanh_vals[i])
+                if swiglu:
+                    results[i] = gs[i] * sig * (us[i] + _one)
+                else:
+                    results[i] = gs[i] * sig * us[i]
+    # Drain last chunk's VALU
+    drain_lo = (n_chunks - 1) * CHUNK
+    for i in range_constexpr(drain_lo, N):
+        sig = _half * (_one + tanh_vals[i])
         if swiglu:
-            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+            results[i] = gs[i] * sig * (us[i] + _one)
         else:
-            results.append(gs[i] * rcp_vals[i] * us[i])
+            results[i] = gs[i] * sig * us[i]
     return results
 
 
