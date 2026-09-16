@@ -27,6 +27,13 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.tuned_config_utils import (
+    autotune_configs,
+    get_tuned_kernel_config,
+)
+
+_FWD_FALLBACK = triton.Config({"PRE_LOAD_V": False}, num_warps=4, num_stages=1)
+_BWD_FALLBACK = triton.Config({}, num_warps=4, num_stages=1)
 
 # Seed the RNG so we get reproducible results for testing.
 philox_seed: tl.constexpr = 0x1BF52
@@ -459,15 +466,8 @@ def _attn_fwd_inner(
 
 
 def get_autotune_fwd_configs():
-    return [
-        triton.Config(
-            {
-                "PRE_LOAD_V": False,
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-    ], [
+    pinned = get_tuned_kernel_config("attention", "FP8_ATTN", "attn_fwd", _FWD_FALLBACK)
+    return autotune_configs("FP8_ATTN_FWD", [pinned], pinned), [
         "IS_CAUSAL",
         "dropout_p",
         "MAX_SEQLENS_Q",
@@ -1153,13 +1153,10 @@ def _bwd_preprocess_use_o(
 
 
 def get_autotune_bwd_configs():
-    return [
-        triton.Config(
-            {},
-            num_stages=1,
-            num_warps=4,
-        ),
-    ], [
+    pinned = get_tuned_kernel_config(
+        "attention", "FP8_ATTN", "_bwd_kernels", _BWD_FALLBACK
+    )
+    return autotune_configs("FP8_ATTN_BWD", [pinned], pinned), [
         "BLOCK_DMODEL",
         "ACTUAL_BLOCK_DMODEL_QK",
         "ACTUAL_BLOCK_DMODEL_V",
