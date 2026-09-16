@@ -5,6 +5,7 @@ import inspect
 import json
 import multiprocessing as mp
 import os
+from collections import Counter
 from contextvars import ContextVar
 from enum import Enum
 
@@ -200,6 +201,14 @@ def perftest(
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             avg = get_trace_perf(prof, num_iters)
+            # Benchmark evidence: raw device-event counts before native outlier filtering.
+            run_perftest.last_gpu_kernels = dict(
+                Counter(
+                    event.name
+                    for event in prof.events()
+                    if str(event.device_type).split(".")[-1] == "CUDA"
+                )
+            )
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -227,7 +236,9 @@ def perftest(
                 fn_name = getattr(func, "__name__", "kernel")
                 skipped = {
                     name.strip()
-                    for name in os.environ.get("AITER_SMI_SKIP_FUNCTIONS", "").split(",")
+                    for name in os.environ.get("AITER_SMI_SKIP_FUNCTIONS", "").split(
+                        ","
+                    )
                     if name.strip()
                 }
                 if fn_name in skipped:
@@ -748,7 +759,15 @@ E8M0_NEUTRAL = 0x7F  # 2^0 = 1.0
 E4M3_NEUTRAL = 0x38  # e4m3 exp bias -> 1.0
 E4M3_SCALE_MEAN, E4M3_SCALE_STD = 0.34375, 0.08
 POW2_BINOMIAL_N = 10
-E8M0_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto", "pow2_binomial", "poc")
+E8M0_SCALE_DISTS = (
+    "zero",
+    "constant",
+    "uniform",
+    "norm",
+    "auto",
+    "pow2_binomial",
+    "poc",
+)
 E4M3_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto")
 _STAGE_ELEMS = 1 << 28  # 256M f32 = 1 GiB per chunk
 

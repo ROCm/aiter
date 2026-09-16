@@ -73,6 +73,16 @@ struct __attribute__((packed)) KernelArgs
 };
 static_assert(sizeof(KernelArgs) == 80, "mxfp8fp4 preload KernelArgs must be 80B");
 
+// The 128x128 K128/PF8 variant preloads eight K stages and does not implement
+// split-K. Initially expose full output tiles only; shorter K and edge tiles
+// must keep using the existing variants until separately validated.
+static bool kernel_shape_is_valid(int M, int N, int K, const mxfp8fp4gemmConfig& cfg)
+{
+    if(cfg.tile_m == 128 && cfg.tile_n == 128)
+        return M > 0 && M % 128 == 0 && N > 0 && N % 128 == 0 && K >= 1024 && K % 128 == 0;
+    return true;
+}
+
 // Pick the best registered kernel variant for (M,N,K) given the B dtype and
 // a_preshuffle.
 static std::tuple<std::string, int> get_heuristic_kernel(int M,
@@ -95,7 +105,15 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
     static const int tp_m16[][2] = {{16, 512}, {64, 512}, {256, 256}};
     static const int tp_m64[][2] = {{64, 512}, {256, 256}};
     static const int tp_big[][2] = {{256, 256}, {64, 512}};
-    if(M <= 16)
+    static const int tp_indexer[][2] = {{128, 128}, {256, 256}, {64, 512}};
+    // Measured K128/PF8 win. Keep the preference local to the validated shape
+    // and input layout; registration alone must not retune other workloads.
+    if(M == 512 && N == 8192 && K == 1536 && b_intype == "mxfp8" && a_preshuffle == 1)
+    {
+        tile_prefs   = tp_indexer;
+        n_tile_prefs = 3;
+    }
+    else if(M <= 16)
     {
         tile_prefs   = tp_m16;
         n_tile_prefs = 3;
@@ -128,6 +146,8 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
         if(cfg.outtype != outtype)
             continue;
         if(!align_ok)
+            continue;
+        if(!kernel_shape_is_valid(M, N, K, cfg))
             continue;
 
         // Remember the first valid variant so an odd combo that ships one tile resolves.
@@ -278,6 +298,16 @@ static const mxfp8fp4gemmConfig& resolve_kernel(int M,
                 cfg.outtype,
                 ", requested ",
                 out_type,
+                ")");
+    AITER_CHECK(kernel_shape_is_valid(M, N, K, cfg),
+                __func__,
+                " 128x128 K128/PF8 requires positive M/N multiples of 128 and K>=1024, K%128==0",
+                " (got M=",
+                M,
+                ", N=",
+                N,
+                ", K=",
+                K,
                 ")");
     return cfg;
 }

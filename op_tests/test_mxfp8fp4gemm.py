@@ -20,16 +20,18 @@
 # ===============================================================================
 
 import argparse
+import csv
 import itertools
 import sys
+from pathlib import Path
 
 import pandas as pd
 import torch
 
 import aiter
-from aiter.ops.mxfp8fp4gemm_common import mxfp8fp4_gemm_splitk
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.mxfp8fp4gemm_common import mxfp8fp4_gemm_splitk
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
@@ -64,6 +66,7 @@ PERSISTENT_TG = 256
 # sync with the cover in poc_kl/mi400/mxfp8fp4gemm/run.sh COVER_CONFIGS so the reported
 # label names the .co the cpp heuristic (get_heuristic_kernel) actually dispatches to.
 _CLUSTERS = {
+    (128, 128): [(4, 4)],
     (256, 256): [(4, 4), (2, 4), (4, 2), (2, 2), (1, 1)],
     (64, 512): [(4, 1), (2, 1), (1, 1)],
     (16, 512): [(4, 1), (2, 1), (1, 1)],
@@ -74,17 +77,22 @@ def _tiles_for(intype, apre):
     """Tiles registered in the csv for this combo. 16x512 is FP4-only (its master
     asserts B_DTYPE_FP4) and is deployed with a_preshuffle=0 only."""
     tiles = [(256, 256), (64, 512)]
+    if intype == "a8w8" and apre:
+        tiles.append((128, 128))
     if intype == "a8w4" and not apre:
         tiles.append((16, 512))
     return tiles
 
 
-def _heuristic_tile(M, intype, apre):
+def _heuristic_tile(M, N, K, intype, apre):
     """Tile (tile_m, tile_n) the cpp dispatch picks (mirrors get_heuristic_kernel in
     asm_mxfp8fp4gemm.cu): a tiny M wastes a taller tile's rows, so M<=16 prefers the
     16x512 decode tile, M<=64 the 64x512 one, larger M 256x256 -- restricted to the
-    tiles actually registered for this (intype, apre)."""
-    if M <= 16:
+    tiles actually registered for this (intype, apre). The FP8/AP1 indexer shape
+    (512,8192,1536) prefers the 128x128 K128/PF8 variant."""
+    if (M, N, K) == (512, 8192, 1536) and intype == "a8w8" and apre:
+        prefs = [(128, 128), (256, 256), (64, 512)]
+    elif M <= 16:
         prefs = [(16, 512), (64, 512), (256, 256)]
     elif M <= 64:
         prefs = [(64, 512), (256, 256)]
@@ -172,6 +180,7 @@ FUNC_SHAPES = [
     (256, 8192, 1024),
     (320, 8192, 1024),
     (512, 8192, 1024),
+    (512, 8192, 1536),  # K128/PF8 128x128 automatic dispatch
     (1024, 8192, 1024),
     (2048, 8192, 1024),
     (4096, 8192, 1024),
@@ -224,7 +233,7 @@ def _support_reason(outtype, apre, M, N, K):
     return None
 
 
-def _ref(intype, A, B, sA, sB, M, N):
+def _ref(intype, A, B, sA, sB, M, N, splitk=1):
     # Reference only: fp32 math, cast back. Not timed, not in the table.
     A_f32 = A.to(torch.float32)[:M]
     if intype == "a8w4":
@@ -233,11 +242,29 @@ def _ref(intype, A, B, sA, sB, M, N):
         B_f32 = B.to(torch.float32)[:N]
     sA_f = fp4_utils.e8m0_to_f32(sA).repeat_interleave(MX_SCALE_BLOCK, dim=1)
     sB_f = fp4_utils.e8m0_to_f32(sB).repeat_interleave(MX_SCALE_BLOCK, dim=1)
-    return (A_f32 * sA_f) @ (B_f32 * sB_f).T
+    lhs, rhs = A_f32 * sA_f, B_f32 * sB_f
+    if splitk > 1:
+        assert lhs.shape[1] % splitk == 0
+        step = lhs.shape[1] // splitk
+        return torch.stack(
+            [
+                lhs[:, s * step : (s + 1) * step] @ rhs[:, s * step : (s + 1) * step].T
+                for s in range(splitk)
+            ]
+        )
+    return lhs @ rhs.T
 
 
 def _prep(
-    intype: str, M: int, N: int, K: int, apre: int, data_init: str, scale_init: str, gen
+    intype: str,
+    M: int,
+    N: int,
+    K: int,
+    apre: int,
+    data_init: str,
+    scale_init: str,
+    gen,
+    reference_splitk=1,
 ):
     """Build raw + shuffled device tensors and the f32 golden reference.
 
@@ -263,7 +290,7 @@ def _prep(
     sB = fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
     # fp32 golden; the caller casts/quantizes it to the requested outtype.
-    ref_f32 = _ref(intype, A, B, sA, sB, M, N)
+    ref_f32 = _ref(intype, A, B, sA, sB, M, N, reference_splitk)
 
     inp = {
         "A": shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
@@ -288,6 +315,7 @@ def test_gemm(
     mode="perf",
     knl_name=None,
     splitk=0,
+    no_reduce=False,
     num_warmup=2,
     num_iters=None,
     test_graph=False,
@@ -307,7 +335,7 @@ def test_gemm(
             N,
             K,
         )
-        _tm, _tn = _heuristic_tile(M, intype, apre)
+        _tm, _tn = _heuristic_tile(M, N, K, intype, apre)
         _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
         return {
             "gfx": get_gfx(),
@@ -325,7 +353,19 @@ def test_gemm(
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
     out_dtype = _OUT_DTYPE[outtype]
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
-    inp, ref_f32 = _prep(intype, M, N, K, apre, data_init, scale_init, gen)
+    if no_reduce and (intype != "a8w8" or splitk < 1):
+        raise ValueError("--no-reduce requires a8w8 and an explicit positive --splitk")
+    inp, ref_f32 = _prep(
+        intype,
+        M,
+        N,
+        K,
+        apre,
+        data_init,
+        scale_init,
+        gen,
+        reference_splitk=splitk if no_reduce else 1,
+    )
     ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
     # --iters overrides; unset keeps the mode default (func=5, perf/profile=101).
@@ -344,14 +384,29 @@ def test_gemm(
     elif knl_name == "auto":
         middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
         pre = "ABpreShuffle" if apre else "BpreShuffle"
-        _tm, _tn = _heuristic_tile(M, intype, apre)
+        _tm, _tn = _heuristic_tile(M, N, K, intype, apre)
         _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
         base = f"f8gemm_{outtype}_{middle}_{pre}_{_tm}x{_tn}_{_cx}x{_cy}_ps"
         knl = f"_ZN5aiter{len(base)}{base}E"
     else:
         knl = knl_name
 
+    if no_reduce:
+        from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
+
+        # One output buffer, as in the POC host. Allocation and reference are untimed.
+        partials = torch.empty(
+            (splitk, M, N) if splitk > 1 else (M, N),
+            dtype=out_dtype,
+            device=inp["A"].device,
+        )
+
     def run_asm(A, B, sA, sB):
+        if no_reduce:
+            _mxfp8_mxfp8_gemm_asm(
+                A, B, sA, sB, partials, knl or None, int(apre), splitk
+            )
+            return partials
         return kern(
             A,
             B,
@@ -375,11 +430,24 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
+    ret["reference_splitk"] = splitk if no_reduce else 1
     # Report TG occupancy for the tile+cluster the cpp dispatch picks.
     _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
     _pre = "ABpreShuffle" if apre else "BpreShuffle"
-    _tile_m, _tile_n = _heuristic_tile(M, intype, apre)
+    _tile_m, _tile_n = _heuristic_tile(M, N, K, intype, apre)
     _cx, _cy = _heuristic_cluster(_tile_m, _tile_n, M, N)
+    if knl:
+        catalog = (
+            Path(__file__).resolve().parents[1]
+            / "hsa/gfx1250/mxfp8fp4gemm/mxfp8fp4gemm.csv"
+        )
+        with catalog.open() as source:
+            cfg = next(
+                (row for row in csv.DictReader(source) if row["knl_name"] == knl), None
+            )
+        if cfg is not None:
+            _tile_m, _tile_n = int(cfg["tile_m"]), int(cfg["tile_n"])
+            _cx, _cy = int(cfg["cluster_x"]), int(cfg["cluster_y"])
     _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
     _report_active_tg(M, N, _tile_m, _tile_n, _label)
     # Structured algo details (mxfp8fp4gemm.csv columns): the cpp-dispatch tile,
@@ -388,8 +456,10 @@ def test_gemm(
     ret["tile"] = f"{_tile_m}x{_tile_n}"
     ret["cluster"] = f"{_cx}x{_cy}"
     ret["splitk"] = splitk or mxfp8fp4_gemm_splitk(
-        M, N, K, int(intype == "a8w4"), apre, knl_name or None
+        M, N, K, int(intype == "a8w4"), apre, knl or None
     )
+    ret["reduced"] = not no_reduce and ret["splitk"] > 1
+    ret["timing_scope"] = "gemm_with_reduce" if ret["reduced"] else "gemm_only"
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
@@ -431,6 +501,7 @@ def test_gemm(
             ret[f"{name} err"] = float("nan")
             ret[f"{name} result"] = "not support"
             continue
+        ret["profile_gpu_kernels"] = run_perftest.last_gpu_kernels
         # a8w8 (mxfp8xmxfp8) can show a "warning" on ~1 element in 5e5: an
         # ill-conditioned output where sum|terms| (~2.7e5) cancels to a ~0.2
         # residual (ratio ~9e-7). The fp32 accumulation noise floor there is
@@ -586,6 +657,11 @@ def main():
         "constraints are checked, so a count deeper than the dispatch would pick "
         "is allowed; 256x256 only.",
     )
+    parser.add_argument(
+        "--no-reduce",
+        action="store_true",
+        help="Time ASM GEMM only and validate each split-K plane independently",
+    )
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
@@ -651,6 +727,7 @@ def main():
             mode=args.mode,
             knl_name=args.knl_name,
             splitk=splitk,
+            no_reduce=args.no_reduce,
             num_warmup=args.warmup,
             num_iters=args.iters,
             test_graph=args.graph,
