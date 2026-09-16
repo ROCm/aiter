@@ -225,23 +225,8 @@ def _attn_fwd_inner(
             )  # TODO: use tl.randint for better performance
             dropout_mask = rng_output > dropout_p
 
-            # WORKAROUND for a gfx950 backend miscompile. `p_kept` is
-            # materialized *before* `sd_mask`; both are selects on
-            # `dropout_mask` over `p`. With the sd_mask select emitted first,
-            # `v`'s data leaks into `p`, so `sd_mask` and `lse` -- which cannot
-            # depend on `v` -- change when only `v` changes.
-            #
-            # The reordering is semantically a no-op: identical TTGIR op
-            # multiset, and the LLVM IR differs only by +32 integer `add`.
-            #
-            # It is NOT a complete fix. The defect is codegen-sensitive, and
-            # other BLOCK_M/num_warps combinations still reproduce it (e.g.
-            # BLOCK_M=128 at num_warps=8 fails test_mha_varlen_with_pe for
-            # 96/64 4/4 64-128). It is also not simply register pressure: a
-            # variant with 98% fewer VGPR spills still miscompiles. Only the
-            # combination of this ordering with the shipped `pe_dropout_or_fp32`
-            # entry (BLOCK_M=256, BLOCK_N=64, num_warps=8, PRELOAD_V=True) is
-            # validated. See isa_dump/COMPILER_BUG.md.
+            # Keep `p_kept` ahead of `sd_mask`. This is a workaround to the backend compiler
+            # instruction reordering miscompile, which leads to elements mismatch.  
             p_kept = tl.where(dropout_mask, p, 0.0)
 
             if RETURN_SCORES:
@@ -960,12 +945,7 @@ def _get_config(
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
     fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
-    # TODO: pe + dropout is not tuned.
-    # WARNING: on gfx950 the `pe_dropout_or_fp32` entry cannot be retuned freely
-    # -- it interacts with a backend miscompile (see isa_dump/COMPILER_BUG.md).
-    # BLOCK_M=128 and num_warps=4 were both measured and both miscompile. Any
-    # change here must be re-validated with the FULL mha test suite; a targeted
-    # sweep is not sufficient (it missed both regressions).
+    # TODO: pe + dropout is not tuned on every arch.
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
         return fwd_cfg["pe_dropout_or_fp32"]
     elif has_pe and "pe" in fwd_cfg:

@@ -542,15 +542,6 @@ def _flash_attn_forward(
     else:
         philox_seed = 0
         philox_offset = 0
-    # Only allocate when the caller actually asks for the scores: `S_dmask` is
-    # surfaced solely under `return_softmax`, so allocating it for every dropout
-    # call wrote a [B, H, Sq, Sk] fp32 tensor that was then discarded.
-    #
-    # NOTE: the philox coordinate is derived from these strides, so they must be
-    # passed even when the tensor itself is not allocated -- otherwise every
-    # element collapses onto the same RNG offset and dropout degenerates. They
-    # are the strides of a contiguous [batch, nheads, max_seqlen_q, max_seqlen_k]
-    # tensor, i.e. exactly what `s_dmask.stride()` used to return.
     sd_strides = (
         num_q_heads * max_seqlen_q * max_seqlen_k,
         max_seqlen_q * max_seqlen_k,
