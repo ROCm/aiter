@@ -254,6 +254,7 @@ _FP8_MIN_NUMEL = 128 * 2048
 try:
     from aiter.dist.device_communicators.flydsl_all_reduce import FlyDSLAllReduce
     from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import allreduce_policy as policy
     from aiter.ops.flydsl.one_shot_allreduce import (
         OneShotAllReduce,
     )
@@ -273,6 +274,7 @@ except Exception:  # noqa: BLE001
     _resolve_codecs = None
     has_xgmi_peer_links = None
     FlyDSLAllReduce = None
+    policy = None
     HAS_FLY_INT4 = False
 
 # FlyDSLAllReduce is opt-in and self-disabling; the bench turns it on for its
@@ -1400,20 +1402,30 @@ def _worker(
                 "mesh": max(1, flyauto.policy.oneshot_max // tok + 1),
                 "ring": max(1, flyauto.policy.mesh_max // tok + 1),
             }
+            # Only the families this policy can actually select, which is the
+            # same list FlyDSLAllReduce built engines from. A family it
+            # disables is disabled by a *sentinel* ceiling mesh_max = NO_MAX (1 << 62) 
+            # so the ring is never auto-selected. A probe sized from that ceiling asks
+            # for an exabyte and dies in torch.zeros below, before any of the
+            # guards downstream get to reject it.
+            reachable = policy.families_reachable(flyauto.policy)
             for family, m in probes.items():
-                t = torch.zeros((m, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
-                # Both conditions matter: family_for's window math doesn't
-                # know about max_bytes, so past the ceiling (e.g. every
-                # payload above oneshot_max in the default accuracy=exact
-                # policy, which never builds a mesh/ring engine at all) it
-                # still names "mesh"/"ring" for a family this object never
-                # built -- should_fly_all_reduce is what actually gates on
-                # self._engines and is safe to trust here.
-                if flyauto.family_for(
-                    m * tok
-                ) != family or not flyauto.should_fly_all_reduce(t):
-                    del t
+                # Everything decidable from the byte count is decided before
+                # the allocation.
+                nbytes = m * tok
+                if (
+                    family not in reachable
+                    or nbytes > flyauto.policy.max_bytes
+                    or flyauto.family_for(nbytes) != family
+                ):
                     continue  # window too narrow, or this policy never reaches `family`
+                t = torch.zeros((m, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
+                # The residual tensor-shaped checks (dtype, contiguity, and
+                # the family actually having an engine) only
+                # should_fly_all_reduce can make.
+                if not flyauto.should_fly_all_reduce(t):
+                    del t
+                    continue
                 dist.barrier(group=group)
                 flyauto.fly_all_reduce(t, out=torch.empty_like(t))
                 del t
@@ -1465,7 +1477,10 @@ def _worker(
             for tokens, hidden in shapes
         ]
     finally:
-        for eng in fly.values():
+        # Every engine built above, not just the two-shot ones: each holds an
+        # IPC inbox and a peer mapping per rank, and a wide sweep builds tens
+        # of them.
+        for eng in (*fly.values(), *fly1s.values()):
             eng.close()
         if flyauto is not None:
             flyauto.close()
