@@ -68,7 +68,6 @@ def validate_hstu_attention_bwd(
     num_heads: int,
     head_dim: int,
     hidden_dim: int,
-    batch: int,
     causal: bool,
     max_attn_len: int,
     contextual_seq_len: int,
@@ -101,8 +100,6 @@ def validate_hstu_attention_bwd(
     if max_attn_len < 0:
         raise ValueError(f"max_attn_len must be non-negative, got {max_attn_len}")
 
-    if batch <= 0:
-        raise ValueError(f"batch must be positive, got {batch}")
     if num_heads <= 0:
         raise ValueError(f"num_heads must be positive, got {num_heads}")
     if max_seq_len <= 0:
@@ -173,7 +170,6 @@ def build_hstu_attention_bwd_dvdk(
     num_heads: int,
     head_dim: int,
     hidden_dim: int,
-    batch: int,
     causal: bool,
     max_attn_len: int,
     contextual_seq_len: int,
@@ -192,7 +188,6 @@ def build_hstu_attention_bwd_dvdk(
         num_heads,
         head_dim,
         hidden_dim,
-        batch,
         causal,
         max_attn_len,
         contextual_seq_len,
@@ -232,10 +227,9 @@ def build_hstu_attention_bwd_dvdk(
     HC_CHUNKS = head_dim // MFMA_M
 
     num_kv_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    HZ_TOTAL = batch * num_heads
-    # Ceil, so batch*num_heads need not divide NUM_GRID_GROUPS; the last group is
-    # padded and its out-of-range blocks retire without doing work (see the decode).
-    hz_per_group = (HZ_TOTAL + NUM_GRID_GROUPS - 1) // NUM_GRID_GROUPS
+    # HZ_TOTAL = batch * num_heads and its group ceil are batch-dependent, so they
+    # are passed as runtime scalars (hz_total, hz_per_group) rather than baked in;
+    # this keeps `batch` out of the build cache key (one binary serves all batches).
     stride_qk_n = num_heads * head_dim
 
     Q_STRIDE = HEAD_DIM_K
@@ -281,6 +275,8 @@ def build_hstu_attention_bwd_dvdk(
         perm: fx.Tensor,
         out_dv: fx.Tensor,
         out_dk: fx.Tensor,
+        hz_per_group: fx.Int32,
+        hz_total: fx.Int32,
     ) -> None:
         elem_type = elem_dtype.ir_type
         c_zero_qk_pack = Vec.filled(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
@@ -307,13 +303,13 @@ def build_hstu_attention_bwd_dvdk(
         pos_in_group = block_id // fx.Int32(NUM_GRID_GROUPS)
         local_hz_idx = pos_in_group // fx.Int32(num_kv_tiles)
         kv_tile_idx = pos_in_group % fx.Int32(num_kv_tiles)
-        hz_idx = grid_group * fx.Int32(hz_per_group) + local_hz_idx
+        hz_idx = grid_group * hz_per_group + local_hz_idx
         # hz_per_group is a ceil, so the padded tail of the last group runs past
         # batch*num_heads. Those blocks clamp to hz_idx=0 to keep the seq_offsets /
         # perm / num_targets reads in bounds, then take seq_len=0 below: every KV tile
         # is then inactive, so they stream no query tiles and store nothing (rows past
         # seq_len belong to the next sequence in the packed layout).
-        block_valid = hz_idx < fx.Int32(HZ_TOTAL)
+        block_valid = hz_idx < hz_total
         hz_idx = block_valid.select(hz_idx, fx.Int32(0))
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
@@ -813,6 +809,7 @@ def build_hstu_attention_bwd_dvdk(
 
     @flyc.jit
     def launch_hstu_attention_bwd_dvdk(
+        batch: fx.Int32,
         q: fx.Tensor,
         k: fx.Tensor,
         v: fx.Tensor,
@@ -824,7 +821,10 @@ def build_hstu_attention_bwd_dvdk(
         out_dk: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
-        grid = num_kv_tiles * hz_per_group * NUM_GRID_GROUPS
+        c_ngg = fx.Int32(NUM_GRID_GROUPS)
+        hz_total = batch * fx.Int32(num_heads)
+        hz_per_group = (hz_total + fx.Int32(NUM_GRID_GROUPS - 1)) // c_ngg
+        grid = fx.Int32(num_kv_tiles) * hz_per_group * c_ngg
         hstu_attention_bwd_dvdk(
             q,
             k,
@@ -835,6 +835,8 @@ def build_hstu_attention_bwd_dvdk(
             perm,
             out_dv,
             out_dk,
+            hz_per_group,
+            hz_total,
             value_attrs={
                 "passthrough": [
                     ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],

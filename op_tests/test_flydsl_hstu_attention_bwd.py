@@ -448,7 +448,6 @@ def test_bwd_default_config_validates(arch, kernel, head_dim, hidden_dim):
         1,
         head_dim,
         hidden_dim,
-        1,
         True,
         0,
         0,
@@ -469,7 +468,7 @@ def test_bwd_validation_honors_arch_argument():
     would agree with whichever device happens to be running the suite.
     """
     config = {"block_m": 128, "block_n": 32, "num_waves": 4, "waves_per_eu": 0}
-    args = (1, 128, 16, 1, True, 0, 0, False, 1.0, "bf16", 512)
+    args = (1, 128, 16, True, 0, 0, False, 1.0, "bf16", 512)
     validate_hstu_attention_bwd(*args, arch="gfx942", **config)
     with pytest.raises(ValueError, match="dO DMA tile"):
         validate_hstu_attention_bwd(*args, arch="gfx950", **config)

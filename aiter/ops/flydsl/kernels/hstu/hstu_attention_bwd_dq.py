@@ -65,7 +65,6 @@ def build_hstu_attention_bwd_dq(
     num_heads: int,
     head_dim: int,
     hidden_dim: int,
-    batch: int,
     causal: bool,
     max_attn_len: int,
     contextual_seq_len: int,
@@ -84,7 +83,6 @@ def build_hstu_attention_bwd_dq(
         num_heads,
         head_dim,
         hidden_dim,
-        batch,
         causal,
         max_attn_len,
         contextual_seq_len,
@@ -124,10 +122,9 @@ def build_hstu_attention_bwd_dq(
     HC_CHUNKS = head_dim // MFMA_M  # dQ accumulator chunks (over head_dim)
 
     num_q_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    HZ_TOTAL = batch * num_heads
-    # Ceil (see hstu_attention_bwd.py): batch*num_heads need not divide
-    # NUM_GRID_GROUPS; the padded tail of the last group retires without work.
-    hz_per_group = (HZ_TOTAL + NUM_GRID_GROUPS - 1) // NUM_GRID_GROUPS
+    # HZ_TOTAL = batch * num_heads and its group ceil are batch-dependent, so they
+    # are passed as runtime scalars (hz_total, hz_per_group) rather than baked in;
+    # this keeps `batch` out of the build cache key (one binary serves all batches).
 
     stride_qk_n = num_heads * head_dim
 
@@ -179,6 +176,8 @@ def build_hstu_attention_bwd_dq(
         num_targets: fx.Tensor,
         perm: fx.Tensor,
         dq: fx.Tensor,
+        hz_per_group: fx.Int32,
+        hz_total: fx.Int32,
     ) -> None:
         elem_type = elem_dtype.ir_type
         c_zero_qk_pack = Vec.filled(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
@@ -205,10 +204,10 @@ def build_hstu_attention_bwd_dq(
         pos_in_group = block_id // fx.Int32(NUM_GRID_GROUPS)
         local_hz_idx = pos_in_group // fx.Int32(num_q_tiles)
         q_tile_idx = pos_in_group % fx.Int32(num_q_tiles)
-        hz_idx = grid_group * fx.Int32(hz_per_group) + local_hz_idx
+        hz_idx = grid_group * hz_per_group + local_hz_idx
         # Padded tail of the last group (see hstu_attention_bwd.py): clamp to hz_idx=0
         # for in-bounds reads, then seq_len=0 makes every query tile inactive.
-        block_valid = hz_idx < fx.Int32(HZ_TOTAL)
+        block_valid = hz_idx < hz_total
         hz_idx = block_valid.select(hz_idx, fx.Int32(0))
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
@@ -669,6 +668,7 @@ def build_hstu_attention_bwd_dq(
 
     @flyc.jit
     def launch_hstu_attention_bwd_dq(
+        batch: fx.Int32,
         q: fx.Tensor,
         k: fx.Tensor,
         v: fx.Tensor,
@@ -679,7 +679,10 @@ def build_hstu_attention_bwd_dq(
         dq: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
-        grid = num_q_tiles * hz_per_group * NUM_GRID_GROUPS
+        c_ngg = fx.Int32(NUM_GRID_GROUPS)
+        hz_total = batch * fx.Int32(num_heads)
+        hz_per_group = (hz_total + fx.Int32(NUM_GRID_GROUPS - 1)) // c_ngg
+        grid = fx.Int32(num_q_tiles) * hz_per_group * c_ngg
         hstu_attention_bwd_dq(
             q,
             k,
@@ -689,6 +692,8 @@ def build_hstu_attention_bwd_dq(
             num_targets,
             perm,
             dq,
+            hz_per_group,
+            hz_total,
             value_attrs={
                 "passthrough": [
                     ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],

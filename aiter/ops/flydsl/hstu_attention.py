@@ -719,7 +719,6 @@ def _get_bwd_default_config(
                 1,
                 head_dim,
                 hidden_dim,
-                1,
                 True,
                 0,
                 0,
@@ -803,7 +802,6 @@ def _compile_bwd_launcher(
         "num_heads": num_heads,
         "head_dim": head_dim,
         "hidden_dim": hidden_dim,
-        "batch": batch,
         "causal": causal,
         "max_attn_len": max_attn_len,
         "contextual_seq_len": contextual_seq_len,
@@ -909,6 +907,7 @@ def flydsl_hstu_attention_bwd(
     with torch.cuda.device(q.device.index):
         _run_compiled(
             dvdk_launcher,
+            batch,
             q_c,
             k_c,
             v_c,
@@ -922,6 +921,7 @@ def flydsl_hstu_attention_bwd(
         )
         _run_compiled(
             dq_launcher,
+            batch,
             q_c,
             k_c,
             v_c,
@@ -1019,6 +1019,7 @@ def _make_bwd_kernel_runners(
         with torch.cuda.device(q.device.index):
             _run_compiled(
                 dvdk_launcher,
+                batch,
                 q_c,
                 k_c,
                 v_c,
@@ -1035,6 +1036,7 @@ def _make_bwd_kernel_runners(
         with torch.cuda.device(q.device.index):
             _run_compiled(
                 dq_launcher,
+                batch,
                 q_c,
                 k_c,
                 v_c,
