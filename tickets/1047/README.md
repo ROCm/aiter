@@ -273,6 +273,15 @@ stays single-WG. Workspace is `[M, 8, 512]`, not a score matrix.
 decode 8k still wants split (27 vs 66µs); prefill `M=512` does not (8k
 149 vs 136µs, 32k 550 vs 537µs). Keep `m > _SPLITS` serial.
 
+rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`). Mean kernel µs
+(35 launches). Raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}` (not in git). The
+gap vs HIP is **split** (score + tile sort), not the live-heap merge:
+
+| L | flydsl split | flydsl merge | HIP MQA | HIP radix top-k | HIP expand |
+|--:|-------------:|-------------:|--------:|----------------:|-----------:|
+| 8192 | 16.9 | 10.2 | 3.8 | 8.4 | 3.0 |
+| 32768 | 34.1 | 19.1 | 4.0 | 10.2 | 2.7 |
+
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 2.0 | 9.3 | 0 | 0 |

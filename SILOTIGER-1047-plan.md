@@ -334,6 +334,17 @@ HIP ~20 / ~30µs. Prefill serial 8k/32k is ~138 / ~536µs, still behind HIP
 does not (`L=8k` 149 vs 136µs, `L=32k` 550 vs 537µs; short `L=2048` split
 is 17 vs 3.5µs). Keep `m > _SPLITS` serial.
 
+rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`, kernel-trace
+stats, raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}`). Mean µs, 35 launches
+(warmup+iters). FlyDSL K1 is split+merge; HIP select is MQA + radix
+top-k + expand (+ a ~3.5µs copy). The leftover vs HIP is the **split**
+kernel (score + per-tile sort), not the live-heap tree:
+
+| L | flydsl split | flydsl merge | HIP MQA | HIP radix top-k | HIP expand |
+|--:|-------------:|-------------:|--------:|----------------:|-----------:|
+| 8192 | 16.9 | 10.2 | 3.8 | 8.4 | 3.0 |
+| 32768 | 34.1 | 19.1 | 4.0 | 10.2 | 2.7 |
+
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 2.0 | 9.3 | 0 | 0 |
