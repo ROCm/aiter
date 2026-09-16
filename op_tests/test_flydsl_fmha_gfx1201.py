@@ -1481,3 +1481,7 @@ def test_public_triton_quant_uses_input_device_when_current_device_differs():
             assert cosine.mean().item() > 0.998
     finally:
         torch.cuda.set_device(original_device)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
