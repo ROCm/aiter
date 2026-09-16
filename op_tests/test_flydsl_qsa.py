@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA oracle, family A plumbing, live vLLM AMD, #4882 Triton, #4882 Gluon.
+"""QSA oracle, family A plumbing, live vLLM AMD, #4882 Triton/Gluon, FlyDSL K1.
 
 Two layers:
   * Correctness (pytest gate): ``test_*`` unit cases.
   * Perf sweep (``__main__``): ``bench_qsa_family_a_plumbing``,
     ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
-    ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``.
+    ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
+    ``bench_qsa_family_a_k1``.
 
 Usage::
 
@@ -39,6 +40,7 @@ from aiter.ops.flydsl.qsa import (
     pack_paged_cache,
     qsa_expand_tail,
     qsa_indexer_scores,
+    qsa_k1_family_a_block_ids,
     qsa_oracle,
     qsa_sparse_gqa,
     qsa_topk_blocks,
@@ -351,6 +353,128 @@ def _set_mismatch_ratio(ref: torch.Tensor, got: torch.Tensor) -> float:
         if a != b:
             miss += 1
     return miss / rows if rows else 0.0
+
+
+def test_k1_family_a_set_equality_short_decode():
+    """FlyDSL K1 block-id sets match the oracle on short family A decode."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 4, 512, 16
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FAMILY_A_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_k1_family_a_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+    )
+    if _set_mismatch_ratio(ref_ids, got) != 0.0:
+        raise AssertionError("K1 block-id set diverged from the oracle")
+
+
+@benchmark()
+def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
+    """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
+
+    2a does not claim a win. Expand is not fused. ``n_blocks`` must fit the
+    512-slot K1 row bound (``L <= 2048`` at ``r=4``, page-aligned).
+    """
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    index_cache = index_cache.contiguous()
+    index_table = index_table.contiguous()
+
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FAMILY_A_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+
+    def k1():
+        return qsa_k1_family_a_block_ids(
+            q_indexer,
+            index_cache,
+            index_table,
+            token_to_req,
+            qpos,
+            slen,
+        )
+
+    block_ids, k1_us = run_perftest(k1)
+    k1_err = _set_mismatch_ratio(ref_ids, block_ids)
+
+    def select():
+        return qsa_select_paged_tokens(
+            q_indexer,
+            index_cache,
+            index_table,
+            token_to_req,
+            qpos,
+            slen,
+            idx.token_budget,
+            idx.compress_ratio,
+        )
+
+    (_indices, vllm_ids), vllm_us = run_perftest(select)
+    vllm_err = _set_mismatch_ratio(ref_ids, vllm_ids)
+
+    flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
+    nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
+    return {
+        "gfx": get_gfx(),
+        "n_blocks": n_blocks,
+        "flydsl_k1 us": k1_us,
+        "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
+        "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
+        "flydsl_k1 err": k1_err,
+        "vllm_amd_select us": vllm_us,
+        "vllm_amd_select TFLOPS": flops / vllm_us / 1e6,
+        "vllm_amd_select TB/s": nbytes / vllm_us / 1e6,
+        "vllm_amd_select err": vllm_err,
+    }
 
 
 @benchmark()
@@ -714,7 +838,8 @@ def _run_unit_cases():
     test_family_a_shapes_smoke()
     test_family_b_shape_constants()
     test_paged_roundtrip_tiny()
-    aiter.logger.info("QSA phase-0 oracle: all unit cases passed")
+    test_k1_family_a_set_equality_short_decode()
+    aiter.logger.info("QSA oracle + K1 unit cases passed")
 
 
 def main():
@@ -722,7 +847,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Family A QSA + vLLM AMD + #4882 Triton; family B #4882 Triton/Gluon",
+        description="Family A QSA + vLLM AMD + #4882 + FlyDSL K1; family B #4882",
     )
     parser.add_argument(
         "-d",
@@ -824,6 +949,27 @@ def main():
             "QSA family B #4882 Triton summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
+
+        rows = []
+        for m, seq_len, page_size in itertools.product(
+            [b for b in args.batch if b <= 8],
+            [s for s in args.seq if s // FAMILY_A_INDEXER.compress_ratio <= 512],
+            args.page_size,
+        ):
+            if m > seq_len:
+                continue
+            n_pages = (
+                seq_len // FAMILY_A_INDEXER.compress_ratio + page_size - 1
+            ) // page_size
+            if n_pages * page_size > 512:
+                continue
+            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype))
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family A FlyDSL K1 summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
 
         if get_gfx() != "gfx950" or not gluon_qsa_available():
             aiter.logger.warning(
