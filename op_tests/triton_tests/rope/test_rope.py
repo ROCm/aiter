@@ -1224,8 +1224,11 @@ def test_rope_fwd_3d(
     logger.info("   - Triton:   %s", feat_triton.cpu().numpy())
     logger.info("   - max diff: %.6f", feat_diff)
 
-    if shape_ok and sum_ok and feat_ok:
-        logger.info("\n sp_rank=%d test success", sp_rank)
-    else:
-        logger.info("\n sp_rank=%d test failed", sp_rank)
+    assert shape_ok and sum_ok and feat_ok, (
+        f"sp_rank={sp_rank}: shape_ok={shape_ok} "
+        f"(torch {tuple(out_orig.shape)} vs triton {tuple(out_triton.shape)}), "
+        f"sum_ok={sum_ok} (diff {sum_diff:.2%}, threshold 1%), "
+        f"feat_ok={feat_ok} (max diff {feat_diff:.3e}, threshold 1e-3)"
+    )
+    logger.info("\n sp_rank=%d test success", sp_rank)
     logger.info("=" * 60)

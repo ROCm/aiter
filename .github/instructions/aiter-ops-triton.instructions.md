@@ -334,6 +334,16 @@ All weight/scale pre-shuffle helpers are unified in
   or on a tuple raises *at log time*, and logging reports that as
   `--- Logging error ---` on stderr rather than failing the test, so flag a
   numeric specifier on a value that can be either.
+- Failure diagnostics go at WARNING or ERROR, never INFO. Under pytest
+  `op_tests/triton_tests/__init__.py` pins `AITER_LOG_LEVEL=WARNING`, so an
+  INFO message is invisible in CI. Flag `logger.info(...)` that reports a
+  mismatch, a NaN, a "FAILED", or the detail behind an assertion that is
+  about to fire — converting a `print` of that kind to INFO deletes the only
+  evidence a failing run leaves behind. Detail a reader needs in order to act
+  belongs in the assertion message itself, where pytest always shows it.
+- A test that logs its verdict instead of asserting it is broken, and the
+  level change makes that visible. Flag any `if ok: log("pass") else:
+  log("fail")` with no assert on the same condition: the test cannot fail.
 - Debug output is gated by level, not by an `if` around the call, and not by
   a module constant. Flag `if DEBUG_MODE: logger.info(...)` and any new
   `DEBUG_MODE`-style flag: write `logger.debug(...)` and run with

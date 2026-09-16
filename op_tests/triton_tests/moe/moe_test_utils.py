@@ -67,7 +67,7 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
-        logger.info(
+        logger.warning(
             "%d / %d mismatched elements (shape = %s) at coords %s",
             num_nonzero,
             rel_err.numel(),
@@ -76,8 +76,8 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
         )
 
         bad_idxs = bad_idxs.unbind(-1)
-        logger.info("ref values: %s", ref[tuple(bad_idxs)].cpu())
-        logger.info("tri values: %s", tri[tuple(bad_idxs)].cpu())
+        logger.warning("ref values: %s", ref[tuple(bad_idxs)].cpu())
+        logger.warning("tri values: %s", tri[tuple(bad_idxs)].cpu())
 
     assert max_err <= maxtol
     assert rms_err <= rmstol

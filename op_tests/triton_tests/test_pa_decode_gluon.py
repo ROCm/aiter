@@ -24,8 +24,8 @@ try:
     from triton.experimental import gluon  # noqa: F401
     from triton.experimental.gluon import language as gl  # noqa: F401
 except ImportError:
-    logger.info(
-        "Warning: pa_decode_gluon tests require triton.experimental.gluon and "
+    logger.warning(
+        "pa_decode_gluon tests require triton.experimental.gluon and "
         "triton.experimental.gluon.language!"
     )
     pa_decode_gluon = None
@@ -122,15 +122,15 @@ def compare_arrays(
     if np.any(nan_mask1):
         result["nan_info"]["arr1_nan_count"] = np.sum(nan_mask1)
         result["nan_info"]["arr1_nan_positions"] = np.argwhere(nan_mask1)
-        logger.info(
-            "Warning: arr1 contains %d NaN values", result["nan_info"]["arr1_nan_count"]
+        logger.warning(
+            "arr1 contains %d NaN values", result["nan_info"]["arr1_nan_count"]
         )
 
     if np.any(nan_mask2):
         result["nan_info"]["arr2_nan_count"] = np.sum(nan_mask2)
         result["nan_info"]["arr2_nan_positions"] = np.argwhere(nan_mask2)
-        logger.info(
-            "Warning: arr2 contains %d NaN values", result["nan_info"]["arr2_nan_count"]
+        logger.warning(
+            "arr2 contains %d NaN values", result["nan_info"]["arr2_nan_count"]
         )
 
     # Compute absolute differences
@@ -1513,7 +1513,7 @@ def run_pa_gluon_test(
     if diff_result["max_diff_thr"] < diff_tolerance:
         logger.info("gluon_vs_torch_ref PASSED")
     else:
-        logger.info("gluon_vs_torch_ref FAILED")
+        logger.warning("gluon_vs_torch_ref FAILED")
     # Track results based on implementation type
     results["us_gluon"] = gluon_time
     results["err_gluon"] = err_gluon
@@ -1527,7 +1527,7 @@ def run_pa_gluon_test(
         if diff_result["max_diff_thr"] < flash_style_diff_tolerance:
             logger.info("gluon_vs_torch_flash_ref PASSED")
         else:
-            logger.info("gluon_vs_torch_flash_ref FAILED")
+            logger.warning("gluon_vs_torch_flash_ref FAILED")
 
     # MD5 hash
     out_ref_md5 = hashlib.md5(
@@ -2030,11 +2030,11 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     # Check if all tests passed
     total_errors = results_df["err_gluon"].sum()
     if total_errors > 0:
-        logger.info(
+        logger.warning(
             "\nTests failed! %d test case(s) exceeded the error threshold. ",
             total_errors,
         )
-        logger.info("Please check rows with non-zero err_gluon in %s.", output_file)
+        logger.warning("Please check rows with non-zero err_gluon in %s.", output_file)
         assert False, f"{total_errors} test case(s) exceeded the error threshold"
     else:
         logger.info("\nAll tests passed!")

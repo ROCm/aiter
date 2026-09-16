@@ -39,3 +39,9 @@ to its console handler. Don't try to lower the level from inside a test with
 `AITER_LOG_LEVEL`, and a handler drops any record below its own level, so nothing is printed.
 Don't call `logging.basicConfig(...)` either — it reconfigures the root logger for the whole
 process at import.
+
+5. Anything that explains a failure goes at `logger.warning(...)` or above, and the detail a reader
+needs in order to act goes in the assertion message. Under pytest the aiter handler sits at
+`WARNING`, so an `INFO` line is invisible in CI precisely when it matters — a mismatch, a NaN, the
+coordinates behind a failed comparison. And a test that *logs* its verdict rather than asserting it
+cannot fail at all; the log is not a check.
