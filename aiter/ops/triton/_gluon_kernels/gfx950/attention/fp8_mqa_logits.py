@@ -464,6 +464,7 @@ def _load_row_operands(
     mfma_layout: gl.constexpr,
     dot_a_layout: gl.constexpr,
     HEAD_OFFSET: gl.constexpr = 0,
+    Q_CACHE: gl.constexpr = ".cg",
 ):
     """Q tile (in dot-operand layout) and weights for NUM_HEADS heads of a row.
 
@@ -482,12 +483,12 @@ def _load_row_operands(
         + (gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, layout_q)) * stride_q_d)[
             None, :
         ],
-        cache=".cg",
+        cache=Q_CACHE,
     )
     w_block = gl.amd.cdna4.buffer_load(
         ptr=weights_ptr + row_id * stride_w_s,
         offsets=(heads_w * stride_w_h)[:, None],
-        cache=".cg",
+        cache=Q_CACHE,
     )
     return gl.convert_layout(q, dot_a_layout), w_block
 
@@ -967,6 +968,9 @@ def _gluon_fp8_mqa_logits_kernel(
     stride_w_s = stride_w_s.to(gl.int64)
     stride_logits_s = stride_logits_s.to(gl.int64)
 
+    # a split re-reads Q and the weights once per split, so keep them in L1
+    Q_CACHE: gl.constexpr = "" if NUM_KV_SPLITS > 1 else ".cg"
+
     WARP_SIZE: gl.constexpr = 64
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -1051,6 +1055,7 @@ def _gluon_fp8_mqa_logits_kernel(
                 mfma_layout,
                 dot_a_layout,
                 _c * M_CHUNK,
+                Q_CACHE,
             )
             mfma_q = mfma_q + (_qc,)
             w_block = w_block + (_wc,)
@@ -1069,6 +1074,7 @@ def _gluon_fp8_mqa_logits_kernel(
             layout_q,
             mfma_layout,
             dot_a_layout,
+            Q_CACHE=Q_CACHE,
         )
 
     if BLOCK_M == 1:
@@ -1091,6 +1097,7 @@ def _gluon_fp8_mqa_logits_kernel(
             layout_q,
             mfma_layout,
             dot_a_layout,
+            Q_CACHE=Q_CACHE,
         )
         mfma_qs = (mfma_q, mfma_q1)
         w_blocks = (w_block, w_block1)

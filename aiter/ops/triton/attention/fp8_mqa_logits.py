@@ -67,16 +67,16 @@ FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 _GFX942_CU_LDS_BYTES = 64 * 1024
 
 
-def _gfx950_kv_splits(seq_len, seq_len_kv, block_m):
+def _gfx950_kv_splits(seq_len, seq_len_kv, block_m=1):
     """How many workgroups to put on one query row block's KV walk."""
-    _TARGET_WGS = 4096
-    _MIN_SPLIT_KV = 16384
+    TARGET_WGS = 8192
+    MIN_SPLIT_KV = 16384
     num_blocks = triton.cdiv(seq_len, block_m)
-    if num_blocks >= _TARGET_WGS:
+    if num_blocks >= TARGET_WGS:
         return 1
     return min(
-        triton.cdiv(_TARGET_WGS, num_blocks),
-        max(1, triton.cdiv(seq_len_kv, _MIN_SPLIT_KV)),
+        triton.cdiv(TARGET_WGS, num_blocks),
+        max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)),
     )
 
 
@@ -222,6 +222,8 @@ def fp8_mqa_logits(
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
         if arch == "gfx950":
+            MIN_BLOCK_M2_WGS = 1024
+
             # Buffer store/load issues are resolved via changing pointer arithmetic
             # so offsets are localized on a shifted pointer
             use_buffer_load = True
@@ -232,7 +234,17 @@ def fp8_mqa_logits(
             waves_per_eu = 2 if TRITON_GE_38 else 3
             num_warps = 2
             block_kv = 64
-            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+            # BLOCK_M=2 halves the grid, so it only pays once there are enough
+            # rows to spare or the split puts the workgroups back.
+            num_kv_splits = _gfx950_kv_splits(seq_len, seq_len_kv, 2)
+            if num_heads <= 32 and seq_len >= 2 and (
+                seq_len > 4096
+                or triton.cdiv(seq_len, 2) * num_kv_splits >= MIN_BLOCK_M2_WGS
+            ):
+                block_m = 2
+            else:
+                block_m = 1
+                num_kv_splits = _gfx950_kv_splits(seq_len, seq_len_kv, 1)
             # Single warp to save barrier cycles
             if block_m == 1 and seq_len > 4096:
                 num_warps = 1
@@ -249,7 +261,6 @@ def fp8_mqa_logits(
             num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
             # Relax the store masking if we don't have to provide clean logits
             relaxed_store = 0 if clean_logits else 1
-            num_kv_splits = _gfx950_kv_splits(seq_len, seq_len_kv, block_m)
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
