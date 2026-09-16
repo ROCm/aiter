@@ -12,13 +12,20 @@ The rest are the shapes two real VAEs run, traced rather than assumed:
 
 * Wan2.1, the causal Conv3d calls carrying a feature cache -- 440 of one encode's
   650 convolutions, and the reason a 3-D kernel is needed at all.
-* Wan2.1, the remaining resamplers and pointwise layers, so the three tables
-  together account for every convolution one encode performs.
+* Wan2.1, the remaining resamplers and pointwise layers. With the 22 reducible
+  first-chunk calls, which are a T=1 conv2d and so belong to the Qwen form, the
+  three Wan tables account for every convolution one encode performs.
 * Qwen-Image, which is the same architecture run at T=1. There the causal Conv3d
   collapses to an exact conv2d and the model never calls a 3-D kernel, so those
   rows are conv2d -- testing them as conv3d would measure something else.
 
-See `docs_flydsl_conv_0826/wan21_vae_conv3d_shapes.md` for the derivation.
+The coverage the model tables owe is the tuner's own shape set,
+`aiter/configs/model_configs/{wan21,qwenimage}_vae_*_conv3d_bf16_untuned.csv`: at the
+default resolutions every row of all four files is a row of a table here. The Wan
+files hold only the 8 cached conv3d shapes; the Qwen files also hold the encoder
+downsamplers and decoder upsamplers, which is why that table carries stride and
+padding columns. See `docs_flydsl_conv_0826/wan21_vae_conv3d_shapes.md` for the
+derivation.
 
 Both VAEs downsample space by 8 and their shapes are generated from the input
 resolution, so the sweeps take one. Time is not a free variable on the Wan side:
@@ -29,8 +36,8 @@ Usage::
 
     python op_tests/test_flydsl_conv_implicit.py
     python op_tests/test_flydsl_conv_implicit.py -c down_0_1 res_96_L0   # hot shapes
-    python op_tests/test_flydsl_conv_implicit.py --wan-res 480x832 368x544
-    python op_tests/test_flydsl_conv_implicit.py --qwen-res 1024x1024 1328x1328
+    python op_tests/test_flydsl_conv_implicit.py --wan-res 480x832 --wan-frames 17
+    python op_tests/test_flydsl_conv_implicit.py --qwen-res 1664x928
 """
 
 import argparse
@@ -278,32 +285,52 @@ def wan_vae_aux(height, width, frames):
 #
 #     conv3d(causal_pad(x), w) == conv2d(x[:,:,0], w[:,:,-1])
 #
-# and the model never runs a 3-D kernel. These are therefore conv2d shapes with
+# and the model never runs a 3-D kernel. The causal rows are therefore conv2d with
 # ordinary padding=1 -- the input is NOT pre-padded, unlike Wan's T>1 calls above.
 # Testing them as conv3d would measure something the model does not do.
 #
-# Encode and decode together: 52 calls collapsing to 10 shapes, since the encoder
-# and decoder resnets meet at the same extents. The 6 plain Conv2d resamplers and 9
-# pointwise layers are skipped by vae_conv (image mode), so they are not here.
+# Encode and decode together: 58 calls collapsing to 16 shapes, since the encoder and
+# decoder resnets meet at the same extents. That is row for row the shape set in
+# aiter/configs/model_configs/qwenimage_vae_<res>_conv3d_bf16_untuned.csv, which is
+# what the tuner enumerates and therefore the coverage this test owes. Two kinds are
+# not causal convs and so do not follow the padding=1 form:
+#
+# * `enc_down_*` are WanResample's spatial downsamplers, stride 2 over a ZeroPad2d'd
+#   input -- hence the +1 extent and padding=0, exactly as in the Wan aux table.
+# * `dec_up_*` are the decoder upsamplers' 3x3 Conv2d after the interpolate. They halve
+#   channels one level later than the encoder raises them, so 384->192 appears at both
+#   L2 and L1 and none of them shares a shape with an encoder row.
+#
+# The 9 remaining calls of an encode+decode are pointwise (3 conv_shortcut 1x1x1, 4
+# attention 1x1, quant_conv + post_quant_conv) and are out of both this table and the
+# CSV. The 4 (3,1,1) time_conv never run at T=1 -- the resample time branch is skipped
+# with one frame, confirmed by tracing encode+decode on meta device.
 def qwen_vae_conv2d(height, width):
-    """(case, x, weight, calls) for the T=1 rewritten conv2d of encode+decode."""
+    """(case, x, weight, stride, padding, calls) for the conv2d the T=1 path runs."""
     h, w = _levels(height), _levels(width)
-    # name, level, Cin, Cout, calls per encode+decode
+    # name, level, extra input extent, Cin, Cout, stride, padding, calls per
+    # encode+decode. Ordered to match the untuned CSV row for row.
     layers = [
-        ("enc_conv_in", 0, 3, 96, 1),
-        ("res_96_L0", 0, 96, 96, 10),
-        ("down_96_192", 1, 96, 192, 1),
-        ("res_192_L1", 1, 192, 192, 9),
-        ("down_192_384", 2, 192, 384, 2),
-        ("res_384_L2", 2, 384, 384, 8),
-        ("res_384_L3", 3, 384, 384, 18),
-        ("enc_conv_out", 3, 384, 32, 1),
-        ("dec_conv_in", 3, 16, 384, 1),
-        ("dec_conv_out", 0, 96, 3, 1),
+        ("enc_conv_in", 0, 0, 3, 96, 1, 1, 1),
+        ("res_96_L0", 0, 0, 96, 96, 1, 1, 10),
+        ("enc_down_96", 0, 1, 96, 96, 2, 0, 1),
+        ("down_96_192", 1, 0, 96, 192, 1, 1, 1),
+        ("res_192_L1", 1, 0, 192, 192, 1, 1, 9),
+        ("enc_down_192", 1, 1, 192, 192, 2, 0, 1),
+        ("down_192_384", 2, 0, 192, 384, 1, 1, 2),
+        ("res_384_L2", 2, 0, 384, 384, 1, 1, 8),
+        ("enc_down_384", 2, 1, 384, 384, 2, 0, 1),
+        ("res_384_L3", 3, 0, 384, 384, 1, 1, 18),
+        ("enc_conv_out", 3, 0, 384, 32, 1, 1, 1),
+        ("dec_conv_in", 3, 0, 16, 384, 1, 1, 1),
+        ("dec_up_384_L2", 2, 0, 384, 192, 1, 1, 1),
+        ("dec_up_384_L1", 1, 0, 384, 192, 1, 1, 1),
+        ("dec_up_192_L0", 0, 0, 192, 96, 1, 1, 1),
+        ("dec_conv_out", 0, 0, 96, 3, 1, 1, 1),
     ]
     return [
-        (name, (1, cin, h[lv], w[lv]), (cout, cin, 3, 3), n)
-        for name, lv, cin, cout, n in layers
+        (name, (1, cin, h[lv] + e, w[lv] + e), (cout, cin, 3, 3), st, pad, n)
+        for name, lv, e, cin, cout, st, pad, n in layers
     ]
 
 
@@ -354,6 +381,30 @@ KW_CASES = [
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
     ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
     ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
+    # The launch config is otherwise chosen by problem size, and every shape
+    # above is small enough that _pick_tile lands on the narrowest tile, whose
+    # single MFMA column block makes the epilogue's row/col mapping degenerate.
+    # The VAE sweeps below do exercise the wider tiles, but only at model
+    # resolutions; pin them here so this table stands on its own. torch has no
+    # `tile`, hence the ref_kw.
+    (
+        "3d_tile_128",
+        3,
+        _X3,
+        _W3,
+        {"padding": 1, "tile": (128, 128, 2, 4)},
+        {"padding": 1},
+        False,
+    ),
+    (
+        "2d_tile_256",
+        2,
+        _X2,
+        _W2,
+        {"padding": 1, "tile": (256, 256, 2, 4)},
+        {"padding": 1},
+        False,
+    ),
 ]
 
 # -c labels, read back off the sweep builders so the choices cannot drift from the
@@ -488,9 +539,10 @@ def test_wan_vae_aux(case, clip, bucket, xshape, wshape, stride, padding, dtype,
 
 
 @benchmark()
-def test_qwen_vae_conv2d(case, res, xshape, wshape, dtype, calls):
-    # The T=1 rewrite hands conv2d the unpadded input and the module's spatial pad.
-    return _bench_vs_torch(case, xshape, wshape, dtype, calls, padding=1)
+def test_qwen_vae_conv2d(case, res, xshape, wshape, stride, padding, dtype, calls):
+    # The T=1 rewrite hands conv2d the unpadded input and the module's spatial pad;
+    # the resamplers instead get a pre-padded input at stride 2, so both are swept.
+    return _bench_vs_torch(case, xshape, wshape, dtype, calls, stride, padding)
 
 
 def summarize(title, rows):
@@ -529,9 +581,10 @@ def main():
     p.add_argument(
         "--wan-res",
         nargs="*",
-        default=["480x832"],
-        help="Wan clip HxW, multiples of 8. 480x832 is what the integration report "
-        "benchmarks; 368x544 is what its 8-GPU training run actually feeds the VAE.",
+        default=["480x832", "368x544"],
+        help="Wan clip HxW, multiples of 8. The two defaults are the ones with a tuned "
+        "config in aiter/configs/model_configs: 480x832 is what the integration report "
+        "benchmarks, 368x544 what its 8-GPU training run actually feeds the VAE.",
     )
     p.add_argument(
         "--wan-frames",
@@ -544,8 +597,10 @@ def main():
     p.add_argument(
         "--qwen-res",
         nargs="*",
-        default=["1024x1024"],
-        help="Qwen-Image HxW, multiples of 8 (1024x1024, 1328x1328, 1664x928, ...)",
+        default=["1024x1024", "1328x1328"],
+        help="Qwen-Image HxW, multiples of 8. The two defaults are the ones with a "
+        "tuned config in aiter/configs/model_configs; any other legal size (1664x928, "
+        "...) runs the same 16 shapes at different extents.",
     )
     args = p.parse_args()
 
@@ -594,9 +649,11 @@ def main():
         summarize(f"Wan2.1 VAE encode, resamplers and pointwise ({name})", rows)
 
         rows = [
-            test_qwen_vae_conv2d(case, res, xshape, wshape, dtype, calls)
+            test_qwen_vae_conv2d(case, res, xshape, wshape, stride, pad, dtype, calls)
             for res in args.qwen_res
-            for case, xshape, wshape, calls in qwen_vae_conv2d(*parse_res(res))
+            for case, xshape, wshape, stride, pad, calls in qwen_vae_conv2d(
+                *parse_res(res)
+            )
             if case in args.cases
         ]
         summarize(f"Qwen-Image VAE encode+decode, T=1 rewritten conv2d ({name})", rows)
