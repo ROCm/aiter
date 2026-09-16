@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import contextlib
 import hashlib
 import os
 import random
@@ -1185,7 +1184,6 @@ def run_pa_gluon_test(
     seed = 123
     setup_seed(seed)
     device = "cuda:0"
-    torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
     assert (
         num_query_heads % num_kv_heads == 0
@@ -1204,7 +1202,11 @@ def run_pa_gluon_test(
     total_queries = query_output_indptr[-1].item()
 
     qkv_tensor = torch.randn(
-        total_queries, num_query_heads + 2 * num_kv_heads, head_size, dtype=data_type
+        total_queries,
+        num_query_heads + 2 * num_kv_heads,
+        head_size,
+        dtype=data_type,
+        device=device,
     )
     query, _key, _value = torch.split(
         qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
@@ -1890,20 +1892,6 @@ def run_multi_pa_gluon_test(
     return pd.DataFrame(results)
 
 
-@contextlib.contextmanager
-def _preserved_default_device():
-    """Put torch's default device back on the way out.
-
-    run_single_pa_gluon_test() calls torch.set_default_device() per case and
-    never restores it.
-    """
-    prev_device = torch.get_default_device()
-    try:
-        yield
-    finally:
-        torch.set_default_device(prev_device)
-
-
 def parse_arg_and_run_test(sample_rate0: float | None = None):
     """Parse arguments and run tests."""
     logger.info("Triton location: %s", triton)
@@ -1939,25 +1927,24 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     else:
         sample_rate = sample_rate0
 
-    with _preserved_default_device():
-        results_df = run_multi_pa_gluon_test(
-            block_sizes,
-            head_configs,
-            context_lengths,
-            batch_sizes,
-            head_sizes,
-            query_lengths,
-            quant_mode,
-            trans_v,
-            kv_varlen,
-            compute_types_quant_q_and_kv,
-            use_torch_flash_ref_options,
-            context_partition_size_options,
-            sample_rate,
-            sinks_options,
-            sliding_window_options,
-            ps_options,
-        )
+    results_df = run_multi_pa_gluon_test(
+        block_sizes,
+        head_configs,
+        context_lengths,
+        batch_sizes,
+        head_sizes,
+        query_lengths,
+        quant_mode,
+        trans_v,
+        kv_varlen,
+        compute_types_quant_q_and_kv,
+        use_torch_flash_ref_options,
+        context_partition_size_options,
+        sample_rate,
+        sinks_options,
+        sliding_window_options,
+        ps_options,
+    )
 
     # Unit tests only check pass/fail; only a CLI run keeps the CSV report.
     write_output_file = "PYTEST_CURRENT_TEST" not in os.environ
