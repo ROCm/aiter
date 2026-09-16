@@ -262,8 +262,10 @@ this seed).
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
 write every complete-block id and skip scoring/bitonic. Same
 `block_ids [M, 512]`; no score matrix; expand still separate. **2d stays
-unchecked:** `L<=2048` beats HIP select; from 8k the per-tile bitonic still
-loses.
+unchecked.** Remaining work is winning shapes only: ``visible <= 512``
+(``L<=2048``) already beats HIP. ``n_blocks > 512`` is a known loss
+(bitonic tiles vs HIP MQA + radix). 2b single-WG tile merge stays for
+set equality; do not resume long-L scorer work.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
