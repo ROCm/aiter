@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL port of the MLA decode reduce/combine epilogue.
+"""FlyDSL MLA decode reduce/combine epilogue.
 
-Faithful port of the HIP kernel ``kn_mla_reduce_v1`` / ``kn_mla_reduce_v1_ps``
-(``csrc/kernels/mla/reduce.cu``). Stage-2 of split-KV MLA decode: merges per-split
-partial outputs ``O_i`` (fp32) weighted by ``exp(LSE_i - LSE_max)`` (online softmax)
-into the final output (bf16/fp16), and optionally the merged LSE.
+Stage-2 of split-KV MLA decode: merges per-split partial outputs ``O_i`` (fp32)
+weighted by ``exp(LSE_i - LSE_max)`` (online softmax) into the final output
+(bf16/fp16), and optionally the merged LSE. Two variants share the load/store
+and math helpers below:
+
+  * :func:`compile_mla_reduce` (plus :func:`compile_mla_reduce_splitk`) -- a
+    faithful port of the HIP kernel ``kn_mla_reduce_v1`` / ``kn_mla_reduce_v1_ps``
+    (``csrc/kernels/mla/reduce.cu``), driven by the planner's CSR metadata. The
+    contract below describes this one.
+  * :func:`compile_mla_decode_reduce` -- the gfx1250 decode variant, which takes
+    no CSR metadata: split rows are dense and the valid split count is derived
+    from ``seq_lens`` on device.
 
 Layout / contract (matches the HIP kernel):
   partial_output : fp32 [max_partial_row, H, Dv]  contiguous
@@ -31,14 +39,14 @@ Two launch modes (mirrors the HIP kernel):
 
 import enum
 import functools
-import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import T
 
-_LOG2E = math.log2(math.e)
+from .kernels_common import LOG2E as _LOG2E
+
 fm_fast = "fast"
 
 # Matches MlaReduceKernelV1Traits (reduce.cu:13)
@@ -173,6 +181,10 @@ def _store_final_out(buf, row, head_idx, tid, elems_f32, vec, out_numeric_t):
     fx.copy_atom_call(
         _out_copy_atom(vec, out_numeric_t), frag, fx.slice(row_tiled, (None, tid))
     )
+
+
+def _store_lse(lse, row, head_idx, value):
+    lse[row, head_idx] = value
 
 
 def _exp(x):
@@ -414,9 +426,6 @@ def compile_mla_reduce(
         def store_lse_scale(split_idx, value):
             lds_scale[split_idx] = value
 
-        def store_lse_value(lse, row, head_idx, value):
-            lse[row, head_idx] = value
-
         def process_work_item(head, block_idx, tile, ntg):
             """Reduce one (head, q-pos-group, tile) work item into final_output.
 
@@ -440,7 +449,14 @@ def compile_mla_reduce(
                 fx.gpu.barrier()
 
             # Collapse the sequence bound so inactive tiles never gather or store.
-            has_work = (n_splits > fx.Int32(1)) & (t0 != last)
+            # A single-split tile still needs reducing when it carries a real partial slot
+            # (need_lse); -1 is the only "nothing to reduce" case. Mirrors reduce.cu.
+            tile_live = t0 != last
+            slot0 = g_pmap[tile_live.select(t0, fx.Int32(0))]
+            single_split_has_partial = (n_splits == fx.Int32(1)) & (
+                slot0 != fx.Int32(-1)
+            )
+            has_work = tile_live & ((n_splits > fx.Int32(1)) | single_split_has_partial)
 
             if fx.const_expr(use_reduce_final_map):
                 q_start = g_fmap[tile, 0]
@@ -513,7 +529,7 @@ def compile_mla_reduce(
                     inf = fx.Float32(float("inf"))
                     final_lse_val = bad.select(inf, lse_val)
                     if tid == fx.Int32(0):
-                        store_lse_value(g_flse, seq, head, final_lse_val)
+                        _store_lse(g_flse, seq, head, final_lse_val)
 
             # Runtime range without carried state lets scheduling overlap the
             # split-loop VMEM loads with compute.
@@ -607,7 +623,7 @@ def compile_mla_reduce(
                         sc = _exp(local_lses[j] - global_lse)
                         store_lse_scale(split_idx, in_rng.select(sc, zero_f))
                     if fx.const_expr(output_lse) and lane == fx.Int32(0):
-                        store_lse_value(g_flse, seq_i32, head, global_lse)
+                        _store_lse(g_flse, seq_i32, head, global_lse)
 
                 # Keep GRP output loads in flight while computing the prior group.
                 # Tail gathers use slot zero and the scale select zeros invalid
@@ -890,6 +906,146 @@ def compile_mla_reduce(
 
     launch_mla_reduce.compile_hints = dict(kernel_compile_hints)
     return launch_mla_reduce
+
+
+# KV page size the gfx1250 decode stage 1 splits by. The valid split count below
+# has to be derived exactly the way that kernel hands pages to splits.
+LOG2_PAGE_SIZE = 6
+
+
+@functools.lru_cache(maxsize=32)
+def compile_mla_decode_reduce(
+    *,
+    H: int,
+    Dv: int,
+    out_dtype: str = "bf16",
+    num_threads: int = 128,
+    waves_per_eu: int = _DEFAULT_WAVES_PER_EU,
+):
+    """Compile the gfx1250 MLA decode reduce for fixed (H, Dv, out_dtype).
+
+    Takes no CSR metadata, unlike :func:`compile_mla_reduce`: split rows are
+    dense (``token * num_splits + split``) and the valid split count comes from
+    ``seq_lens`` on device, so the decode path needs no host-side planner and no
+    gather map. That leaves one body -- the register online softmax the CSR
+    kernel calls its SIMPLE tier -- with no LDS staging, tiers, or LSE output.
+    """
+    assert (
+        Dv % num_threads == 0
+    ), f"Dv ({Dv}) must be divisible by num_threads ({num_threads})"
+    VEC = Dv // num_threads
+
+    kernel_value_attrs = (
+        {"rocdl.waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
+    )
+    kernel_compile_hints = (
+        {"waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
+    )
+
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
+    def mla_decode_reduce_kernel(
+        split_data: fx.Pointer,  # fp32 [total_tokens * num_splits, H, Dv]
+        split_lse: fx.Pointer,  # fp32 [total_tokens * num_splits, H]
+        seq_lens: fx.Pointer,  # i32  [num_seqs]
+        final_output: fx.Pointer,  # out  [total_tokens, H, Dv]
+        total_tokens: fx.Int32,
+        num_seqs: fx.Int32,
+        num_splits: fx.Int32,
+        num_tokens_per_seq: fx.Int32,
+    ):
+        out_numeric_t = _out_numeric_t(out_dtype)
+
+        tid = fx.thread_idx.x
+        head = fx.block_idx.x
+        token = fx.block_idx.y
+
+        num_rows = total_tokens * num_splits
+        data_buf = _pointer_buffer_tensor(
+            split_data, fx.Float32, (num_rows, H, Dv), (H * Dv, Dv, 1)
+        )
+        lse_buf = _pointer_buffer_tensor(split_lse, fx.Float32, (num_rows, H), (H, 1))
+        out_buf = _pointer_buffer_tensor(
+            final_output, out_numeric_t, (total_tokens, H, Dv), (H * Dv, Dv, 1)
+        )
+        seq_buf = _pointer_buffer_tensor(seq_lens, fx.Int32, (num_seqs,), (1,))
+
+        token_i32 = fx.Int32(token)
+        seq_id = token_i32 // num_tokens_per_seq
+        token_in_seq = token_i32 - seq_id * num_tokens_per_seq
+        seq_len = seq_buf[seq_id] - num_tokens_per_seq + token_in_seq + fx.Int32(1)
+        num_pages = (seq_len + fx.Int32((1 << LOG2_PAGE_SIZE) - 1)) >> fx.Int32(
+            LOG2_PAGE_SIZE
+        )
+        over = num_splits > num_pages
+        valid_splits = over.select(num_pages, num_splits)
+
+        row_base = token_i32 * num_splits
+
+        partial0 = _load_partial_out(data_buf, row_base, head, tid, VEC)
+        lse0 = lse_buf[row_base, head]
+        init = [partial0[i].ir_value() for i in fx.range_constexpr(VEC)]
+        init += [fx.Float32(lse0).ir_value(), fx.Float32(1.0).ir_value()]
+
+        results = init
+        for split, state in range(fx.Int32(1), valid_splits, fx.Int32(1), init=init):
+            acc = [state[i] for i in fx.range_constexpr(VEC)]
+            running_max = state[VEC]
+            running_sum = state[VEC + 1]
+
+            row = row_base + fx.Int32(split)
+            partial = _load_partial_out(data_buf, row, head, tid, VEC)
+            lse = lse_buf[row, head]
+
+            new_max = fx.Float32(running_max).maximumf(lse)
+            rescale = _exp(fx.Float32(running_max) - new_max)
+            weight = _exp(lse - new_max)
+            new_acc = [
+                (fx.Float32(acc[i]) * rescale + partial[i] * weight).ir_value()
+                for i in fx.range_constexpr(VEC)
+            ]
+            results = yield new_acc + [
+                new_max.ir_value(),
+                (fx.Float32(running_sum) * rescale + weight).ir_value(),
+            ]
+
+        acc = [results[i] for i in fx.range_constexpr(VEC)]
+        running_sum = fx.Float32(results[VEC + 1])
+        inv_sum = fx.rocdl.rcp(T.f32, running_sum.ir_value())
+        out_elems = [fx.Float32(acc[i]) * inv_sum for i in fx.range_constexpr(VEC)]
+        _store_final_out(out_buf, token, head, tid, out_elems, VEC, out_numeric_t)
+
+    decode_default_stream = fx.Stream(None)
+
+    @flyc.jit
+    def launch_mla_decode_reduce(
+        split_data: fx.Pointer,
+        split_lse: fx.Pointer,
+        seq_lens: fx.Pointer,
+        final_output: fx.Pointer,
+        total_tokens: fx.Int32,
+        num_seqs: fx.Int32,
+        num_splits: fx.Int32,
+        num_tokens_per_seq: fx.Int32,
+        stream: fx.Stream = decode_default_stream,
+    ):
+        mla_decode_reduce_kernel(
+            split_data,
+            split_lse,
+            seq_lens,
+            final_output,
+            total_tokens,
+            num_seqs,
+            num_splits,
+            num_tokens_per_seq,
+            value_attrs=kernel_value_attrs,
+        ).launch(
+            grid=(H, total_tokens, 1),
+            block=(num_threads, 1, 1),
+            stream=stream,
+        )
+
+    launch_mla_decode_reduce.compile_hints = dict(kernel_compile_hints)
+    return launch_mla_decode_reduce
 
 
 # Split-K scratch is cached for CUDA-graph replay; active tiles form a CSR prefix.
@@ -1240,9 +1396,6 @@ def compile_mla_reduce_splitk(
             (H, 1),
         )
 
-        def store_combined_lse(lse, row, head_idx, value):
-            lse[row, head_idx] = value
-
         c_H = fx.Int32(H)
         c_K = fx.Int32(K)
         slot = fx.block_idx.x
@@ -1294,7 +1447,7 @@ def compile_mla_reduce_splitk(
                     inf = fx.Float32(float("inf"))
                     lse_val = bad.select(inf, fly_math.log(den, fastmath=fm_fast) + M)
                     if tid == fx.Int32(0):
-                        store_combined_lse(g_flse, q_start, head, lse_val)
+                        _store_lse(g_flse, q_start, head, lse_val)
 
     @flyc.jit
     def launch_partial(
