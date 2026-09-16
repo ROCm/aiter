@@ -263,15 +263,16 @@ The FlyDSL column is eight-wave K1 plus a **`visible <= 512` emit path**,
 a **wave-local tile sort**, a **per-tile pair merge**, a **column split**
 on decode rows with more than one tile, and **pipelined score_col**
 (prefetch next D-chunk of paged K). Each inter-wave merge fuses its
-reverse-upper step with the first cross-half compare, removing three
-workgroup barriers per tile. The split-merge tree pair-merges only
-`min(n_tiles, 8)` live heaps (decode 8k skips the idle 4-way stage). Prefill
-stays single-WG. Workspace is `[M, 8, 512]`, not a score matrix.
-**2d stays unchecked:** short `L` beats HIP; decode 8k drops ~35→~27µs
-(still behind HIP ~19µs); 32k/128k stay ~53/~154µs; prefill 8k/32k is
-~138/~536µs. Re-measured split vs serial against the live 4+2+1 tree:
-decode 8k still wants split (27 vs 66µs); prefill `M=512` does not (8k
-149 vs 136µs, 32k 550 vs 537µs). Keep `m > _SPLITS` serial.
+reverse-upper step with the first cross-half compare, then LDS-XORs only
+strides `>= 64`; 32..1 use `shuffle_xor`. The split-merge tree pair-merges
+only `min(n_tiles, 8)` live heaps (decode 8k skips the idle 4-way stage).
+Prefill stays single-WG. Workspace is `[M, 8, 512]`, not a score matrix.
+**2d stays unchecked:** short `L` beats HIP; intra-wave shuffle on the
+remaining XOR stages drops decode 8k ~26.9→~26.0µs (still behind HIP
+~18µs); 32k/128k ~51/~147µs; prefill 8k/32k ~132/~515µs. Re-measured split
+vs serial against the live 4+2+1 tree: decode 8k still wants split (27 vs
+66µs); prefill `M=512` does not (8k 149 vs 136µs, 32k 550 vs 537µs). Keep
+`m > _SPLITS` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`). Mean kernel µs
 (35 launches). Raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}` (not in git). The
@@ -284,20 +285,20 @@ gap vs HIP is **split** (score + tile sort), not the live-heap merge:
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 2.0 | 9.3 | 0 | 0 |
-| 8 | 512 | 128 | 3.0 | 11.2 | 0 | 0 |
-| 1 | 2048 | 512 | 2.0 | 10.0 | 0 | 0 |
-| 8 | 2048 | 512 | 3.0 | 11.4 | 0 | 0 |
-| 1 | 8192 | 2048 | 26.9 | 19.2 | 0 | 0 |
-| 8 | 8192 | 2048 | 27.7 | 22.0 | 0 | 0 |
-| 1 | 32768 | 8192 | 53.0 | 20.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 52.9 | 25.3 | 0 | 0 |
-| 1 | 131072 | 32768 | 153.8 | 29.9 | 0 | 0 |
-| 8 | 131072 | 32768 | 162.7 | 52.8 | 0 | 0 |
-| 512 | 512 | 128 | 3.5 | 18.3 | 0 | 0 |
-| 512 | 2048 | 512 | 3.6 | 29.3 | 0 | 0 |
-| 512 | 8192 | 2048 | 137.6 | 83.8 | 0 | 0 |
-| 512 | 32768 | 8192 | 535.6 | 248.5 | 0 | 0 |
+| 1 | 512 | 128 | 1.5 | 7.3 | 0 | 0 |
+| 8 | 512 | 128 | 2.4 | 9.0 | 0 | 0 |
+| 1 | 2048 | 512 | 1.4 | 8.0 | 0 | 0 |
+| 8 | 2048 | 512 | 2.4 | 9.1 | 0 | 0 |
+| 1 | 8192 | 2048 | 26.0 | 18.3 | 0 | 0 |
+| 8 | 8192 | 2048 | 26.5 | 20.1 | 0 | 0 |
+| 1 | 32768 | 8192 | 51.3 | 19.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 51.2 | 23.6 | 0 | 0 |
+| 1 | 131072 | 32768 | 146.8 | 29.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 156.4 | 51.4 | 0 | 0 |
+| 512 | 512 | 128 | 3.1 | 16.0 | 0 | 0 |
+| 512 | 2048 | 512 | 2.9 | 27.3 | 0 | 0 |
+| 512 | 8192 | 2048 | 132.3 | 83.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 515.1 | 253.5 | 0 | 0 |
 
 
 

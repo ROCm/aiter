@@ -9,10 +9,11 @@ complete causal blocks, and merges a running LDS top-512. Writes
 
 When ``visible <= 512`` the selected set is every complete block: one
 workgroup per row writes those ids. Each new tile is wave-sorted then
-LDS-merged across eight waves. Decode rows with more than one 512-slot
-tile split columns across eight workgroups (idle splits write ``-inf``
-heaps) and pair-merge those sorted heaps. Prefill streams tiles in one
-workgroup per row.
+merged across eight waves (LDS XOR for strides ``>= 64``, shuffle for
+32..1). Decode rows with more than one 512-slot tile split columns
+across eight workgroups (idle splits write ``-inf`` heaps) and
+pair-merge those sorted heaps. Prefill streams tiles in one workgroup
+per row.
 """
 
 from functools import lru_cache
@@ -43,11 +44,14 @@ _WAVE_STAGES = tuple(
     for span in (2, 4, 8, 16, 32, 64)
     for stride in tuple(1 << shift for shift in range(span.bit_length() - 2, -1, -1))
 )
+# Reverse-upper + LDS XOR for strides >= wave size. Strides 32..1 stay
+# in-register (shuffle); they used to be one workgroup barrier each.
 _INTERWAVE_LDS = (
-    (128, (32, 16, 8, 4, 2, 1)),
-    (256, (64, 32, 16, 8, 4, 2, 1)),
-    (512, (128, 64, 32, 16, 8, 4, 2, 1)),
+    (128, ()),
+    (256, (64,)),
+    (512, (128, 64)),
 )
+_INTRAWAVE_XOR = (32, 16, 8, 4, 2, 1)
 _PAIR_MERGE_STRIDES = tuple(1 << shift for shift in range(_K.bit_length() - 1, -1, -1))
 
 
@@ -87,7 +91,7 @@ def build_qsa_k1_family_a_serial(page_size: int):
             d=_D,
             blk=_BLOCK_THREADS,
             pair=1,
-            wav=2,
+            wav=3,
             pipe=2,
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
@@ -258,6 +262,21 @@ def build_qsa_k1_family_a_serial(page_size: int):
                             cand_s[peer] = swap.select(s0, s1)
                             cand_c[peer] = swap.select(c0, c1)
                         gpu.barrier()
+                    xs = cand_s[Int32(_K) + tid]
+                    xc = cand_c[Int32(_K) + tid]
+                    for stride in _INTRAWAVE_XOR:
+                        ps = xs.shuffle_xor(stride, _WAVE)
+                        pc = xc.shuffle_xor(stride, _WAVE)
+                        is_lo = lane < (lane ^ Int32(stride))
+                        take_peer = is_lo.select(
+                            better(ps, pc, xs, xc),
+                            better(xs, xc, ps, pc),
+                        )
+                        xs = take_peer.select(ps, xs)
+                        xc = take_peer.select(pc, xc)
+                    cand_s[Int32(_K) + tid] = xs
+                    cand_c[Int32(_K) + tid] = xc
+                    gpu.barrier()
                 if tile == zero:
                     for t in range_constexpr(tile_steps):
                         local = tid + Int32(t * _BLOCK_THREADS)
@@ -361,7 +380,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         blk=_BLOCK_THREADS,
         spl=_SPLITS,
         pair=2,
-        wav=2,
+        wav=3,
         pipe=2,
         liv=1,
     )
@@ -556,6 +575,21 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                             cand_s[peer] = swap.select(s0, s1)
                             cand_c[peer] = swap.select(c0, c1)
                         gpu.barrier()
+                    xs = cand_s[Int32(_K) + tid]
+                    xc = cand_c[Int32(_K) + tid]
+                    for stride in _INTRAWAVE_XOR:
+                        ps = xs.shuffle_xor(stride, _WAVE)
+                        pc = xc.shuffle_xor(stride, _WAVE)
+                        is_lo = lane < (lane ^ Int32(stride))
+                        take_peer = is_lo.select(
+                            better(ps, pc, xs, xc),
+                            better(xs, xc, ps, pc),
+                        )
+                        xs = take_peer.select(ps, xs)
+                        xc = take_peer.select(pc, xc)
+                    cand_s[Int32(_K) + tid] = xs
+                    cand_c[Int32(_K) + tid] = xc
+                    gpu.barrier()
                 if tile == start:
                     for t in range_constexpr(tile_steps):
                         local = tid + Int32(t * _BLOCK_THREADS)

@@ -319,20 +319,22 @@ a **wave-local tile sort**, a **per-tile pair merge**, a **column split**
 on decode rows with more than one 512-slot tile, and a **software-pipelined
 score_col** (prefetch next D-chunk of paged K while the current ReLU-sum
 runs). The inter-wave bitonic merge fuses each reverse-upper step with its
-first cross-half compare, removing three workgroup barriers per tile. The
+first cross-half compare, then keeps only LDS XOR for strides `>= 64`;
+strides 32..1 use `shuffle_xor` (no workgroup barrier per stride). The
 split-merge tree pair-merges only `min(n_tiles, 8)` live heaps (decode 8k
 skips the idle 4-way stage). Prefill stays single-WG. Workspace is
 `[M, 8, 512]`, not `[M, n_blocks]`. Expand still separate. HIP
 `module_top_k_per_row.so` is loaded. Oracle set equality `err=0` on both
 columns.
 
-**Not checked:** `L<=2048` still beats HIP select. Live-heap merge drops
-decode 8k ~35µs→~27µs vs HIP ~19µs. Decode 32k/128k stay ~53 / ~154µs vs
-HIP ~20 / ~30µs. Prefill serial 8k/32k is ~138 / ~536µs, still behind HIP
-(~84 / ~249µs). Re-measured split vs serial with the live 4+2+1 tree
-(`err=0` both): decode 8k still wants split (27 vs 66µs); prefill `M=512`
-does not (`L=8k` 149 vs 136µs, `L=32k` 550 vs 537µs; short `L=2048` split
-is 17 vs 3.5µs). Keep `m > _SPLITS` serial.
+**Not checked:** `L<=2048` still beats HIP select. Intra-wave shuffle on
+the remaining inter-wave XOR cuts decode 8k ~26.9µs→~26.0µs vs HIP
+~18µs (still behind). Decode 32k/128k ~51 / ~147µs vs HIP ~19 / ~29µs.
+Prefill serial 8k/32k ~132 / ~515µs vs HIP ~84 / ~254µs. Re-measured
+split vs serial with the live 4+2+1 tree (`err=0` both): decode 8k still
+wants split (27 vs 66µs); prefill `M=512` does not (`L=8k` 149 vs 136µs,
+`L=32k` 550 vs 537µs; short `L=2048` split is 17 vs 3.5µs). Keep
+`m > _SPLITS` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`, kernel-trace
 stats, raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}`). Mean µs, 35 launches
@@ -347,20 +349,20 @@ kernel (score + per-tile sort), not the live-heap tree:
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 2.0 | 9.3 | 0 | 0 |
-| 8 | 512 | 128 | 3.0 | 11.2 | 0 | 0 |
-| 1 | 2048 | 512 | 2.0 | 10.0 | 0 | 0 |
-| 8 | 2048 | 512 | 3.0 | 11.4 | 0 | 0 |
-| 1 | 8192 | 2048 | 26.9 | 19.2 | 0 | 0 |
-| 8 | 8192 | 2048 | 27.7 | 22.0 | 0 | 0 |
-| 1 | 32768 | 8192 | 53.0 | 20.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 52.9 | 25.3 | 0 | 0 |
-| 1 | 131072 | 32768 | 153.8 | 29.9 | 0 | 0 |
-| 8 | 131072 | 32768 | 162.7 | 52.8 | 0 | 0 |
-| 512 | 512 | 128 | 3.5 | 18.3 | 0 | 0 |
-| 512 | 2048 | 512 | 3.6 | 29.3 | 0 | 0 |
-| 512 | 8192 | 2048 | 137.6 | 83.8 | 0 | 0 |
-| 512 | 32768 | 8192 | 535.6 | 248.5 | 0 | 0 |
+| 1 | 512 | 128 | 1.5 | 7.3 | 0 | 0 |
+| 8 | 512 | 128 | 2.4 | 9.0 | 0 | 0 |
+| 1 | 2048 | 512 | 1.4 | 8.0 | 0 | 0 |
+| 8 | 2048 | 512 | 2.4 | 9.1 | 0 | 0 |
+| 1 | 8192 | 2048 | 26.0 | 18.3 | 0 | 0 |
+| 8 | 8192 | 2048 | 26.5 | 20.1 | 0 | 0 |
+| 1 | 32768 | 8192 | 51.3 | 19.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 51.2 | 23.6 | 0 | 0 |
+| 1 | 131072 | 32768 | 146.8 | 29.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 156.4 | 51.4 | 0 | 0 |
+| 512 | 512 | 128 | 3.1 | 16.0 | 0 | 0 |
+| 512 | 2048 | 512 | 2.9 | 27.3 | 0 | 0 |
+| 512 | 8192 | 2048 | 132.3 | 83.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 515.1 | 253.5 | 0 | 0 |
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
