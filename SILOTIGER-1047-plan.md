@@ -83,6 +83,11 @@ them.
   ReLU-sum per complete block, keep a **local** top-512 (or local top-k on
   family B), merge to a global 512 (or k). Same “score-plus-top-k” idea as DSA
   fused indexer work; different ABI.
+- **Family A K1 perf is emit / short-L only.** Winning shapes are
+  ``visible <= 512`` (``n_blocks <= 512``, ``L <= 2048`` at ``r=4``). Do not
+  resume long-L scorer work (column split, extra S, heap radix, GEMM+full
+  logits) to chase 8k / 32k / 128k select. Those lengths keep 2b single-WG
+  tile-merge **set equality**; the loss vs HIP is accepted and recorded.
 - **Score math.** `I_ib = sum_h ReLU(dot(q[h], k_bar[b]))` for complete blocks
   only (`p_b + r - 1 <= i`). Optional serving scale `1/sqrt(128)` is allowed
   **only if it cannot change top-k argmax**. `eps` is unused.
@@ -310,19 +315,22 @@ oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
       no `[M, n_blocks]` score buffer.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality `err=0`
-on both columns. **Not checked.** `aiter/jit/module_top_k_per_row.so` is
-loaded (`import [module_top_k_per_row]`; oracle-fallback warning did not
-fire). The AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand.
+on both columns. `aiter/jit/module_top_k_per_row.so` is loaded
+(`import [module_top_k_per_row]`; oracle-fallback warning did not fire).
+The AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand.
 
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
 every complete block is in the top-512, so the kernel writes those ids and
 skips scoring and the 1024-wide bitonic. Same `block_ids [M, 512]`; no
-score matrix; expand still separate. HIP `module_top_k_per_row.so` is
-loaded. Oracle set equality `err=0` on both columns.
+score matrix; expand still separate.
 
-**Not checked:** `L<=2048` now beats HIP select (~1.4µs vs ~7.6µs at
-`M=1, L=512`). From 8k `visible > k` and the per-tile bitonic still
-dominates (~106µs vs ~16µs at `M=1, L=8192`).
+**Not checked.** Remaining family A 2d work is the **winning shapes
+only**: ``visible <= 512`` (decode and prefill at ``L<=2048``). Emit
+already beats HIP there. ``n_blocks > 512`` (8k / 32k / 128k, and
+prefill 8k / 32k) is a **known loss** — streamed 512-tile bitonic top-k
+does not match HIP’s MQA GEMM + radix. Keep 2b’s single-WG tile merge
+so those lengths still have oracle set equality. Do not spend more 2d
+turns on long-L select.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
