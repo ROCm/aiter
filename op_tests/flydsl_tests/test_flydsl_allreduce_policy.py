@@ -24,6 +24,7 @@ from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import (
     RING_SUPER_TILES,
     ring_st_ladder,
 )
+from aiter.ops.flydsl.one_shot_allreduce import max_payload_bytes
 
 WORLDS = P.SUPPORTED_WORLDS
 CELLS = [(link, ws) for link in P.LINKS for ws in WORLDS]
@@ -42,17 +43,39 @@ def test_thresholds_partition_by_size(cell):
     overlap. ``FamilyPolicy.__post_init__`` enforces it; this pins that the
     shipped values actually satisfy it rather than that the check exists."""
     p = P.FAMILY_POLICY[cell]
-    assert 0 < p.oneshot_max <= p.oneshot_max_exact <= p.mesh_max <= p.max_bytes
+    assert 0 < p.oneshot_max <= p.mesh_max <= p.max_bytes
+    assert 0 < p.oneshot_max_exact
     assert p.min_bytes <= p.oneshot_max
 
 
-def test_exact_window_is_never_narrower():
-    """Preferring the bit-exact schedule can only widen its window. A row where
-    the exact boundary sat *below* the speed one would mean the default policy
-    is both slower and less accurate, which is not a trade anyone chose."""
-    for cell in CELLS:
-        p = P.FAMILY_POLICY[cell]
-        assert p.oneshot_max_exact >= p.oneshot_max, cell
+@pytest.mark.parametrize("cell", CELLS)
+def test_resolved_policy_partitions_by_size(cell):
+    """Whatever the two raw ceilings do relative to each other, the policy a
+    dispatch path actually sees must still tile the size axis in order.
+
+    This is the invariant that matters: ``resolve`` collapses ``oneshot_max``
+    and ``oneshot_max_exact`` onto a single boundary per mode, so no caller ever
+    observes the two disagreeing."""
+    for mode in P.ACCURACY_MODES:
+        p = P.resolve(cell[0], cell[1], mode=mode)
+        assert 0 < p.oneshot_max <= p.oneshot_max_exact <= p.mesh_max <= p.max_bytes
+        assert p.min_bytes <= p.oneshot_max
+
+
+def test_exact_and_fast_ceilings_need_not_order():
+    """The two one-shot ceilings are measured against *different* alternatives,
+    so neither bounds the other.
+
+    ``oneshot_max`` is where the quantized mesh overtakes the one-shot;
+    ``oneshot_max_exact`` is where the fallback the caller would otherwise use
+    overtakes it, since exact mode declines rather than quantizing.
+    """
+    assert P.FAMILY_POLICY[("pcie", 4)].oneshot_max_exact > P.FAMILY_POLICY[
+        ("pcie", 4)
+    ].oneshot_max
+    assert P.FAMILY_POLICY[("xgmi", 4)].oneshot_max_exact < P.FAMILY_POLICY[
+        ("xgmi", 4)
+    ].oneshot_max
 
 
 def test_oneshot_ceiling_shrinks_with_world_size():
@@ -62,19 +85,11 @@ def test_oneshot_ceiling_shrinks_with_world_size():
     the table is keyed on world size at all."""
     for link in P.LINKS:
         ceilings = [P.FAMILY_POLICY[(link, ws)].oneshot_max for ws in sorted(WORLDS)]
-        if link == "xgmi":
-            # Placeholder rows are flat by construction; assert that, so this
-            # test starts failing the moment they are replaced by a real fit
-            # that does not obey the trend.
-            assert len(set(ceilings)) == 1
-        else:
-            assert ceilings == sorted(ceilings, reverse=True), ceilings
+        assert ceilings == sorted(ceilings, reverse=True), (link, ceilings)
 
 
 def test_xgmi_never_selects_the_ring():
-    """The xGMI rows are an unmeasured placeholder. Conservative there means the
-    mesh -- the documented default on a meshed fabric -- and never the ring,
-    which trades fanout for the per-destination locality a PCIe host wants."""
+    """On xGMI the ring is never dispatched at any size or world."""
     for ws in WORLDS:
         p = P.resolve("xgmi", ws, mode="fast")
         assert "ring" not in P.families_reachable(p)
@@ -116,13 +131,36 @@ def test_ladders_are_well_formed(ws):
             assert st in valid_st, (name, st)
             assert cap >= 1, (name, cap)
 
-    one = oneshot_ladder(ws)
-    assert one and one[0][0] == 0
-    assert [r[0] for r in one] == sorted(r[0] for r in one)
-    for _floor, atoms, cap, fanout in one:
-        assert atoms in SUPPORTED_ATOMS
-        assert cap >= 1
-        assert fanout in ("peer", "atom")
+    for link in P.LINKS:
+        one = oneshot_ladder(ws, link)
+        assert one and one[0][0] == 0, link
+        assert [r[0] for r in one] == sorted(r[0] for r in one), link
+        for _floor, atoms, cap, fanout in one:
+            assert atoms in SUPPORTED_ATOMS, (link, atoms)
+            assert cap >= 1, (link, cap)
+            assert fanout in ("peer", "atom"), (link, fanout)
+
+
+@pytest.mark.parametrize("ws", WORLDS)
+def test_oneshot_ladder_is_keyed_on_the_fabric(ws):
+    """The one-shot tuning ladder must differ by link, not just by world size."""
+    assert oneshot_ladder(ws, "pcie") != oneshot_ladder(ws, "xgmi"), ws
+    # An unknown fabric falls back to a single conservative rung rather than
+    # silently borrowing another fabric's table.
+    assert len(oneshot_ladder(ws, "nosuchlink")) == 1
+
+
+def test_max_payload_bytes_is_keyed_on_the_fabric():
+    """The default ceiling is where the fallback overtakes the one-shot, which
+    is a property of the fabric. 
+    """
+    for ws in WORLDS:
+        for link in P.LINKS:
+            assert (
+                max_payload_bytes(ws, link)
+                == P.FAMILY_POLICY[(link, ws)].oneshot_max_exact
+            )
+    assert max_payload_bytes(2, "xgmi") > max_payload_bytes(2, "pcie")
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -133,15 +171,19 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
     This is exactly the bug the windowed refit removed: fitted over the whole
     sweep, the TP8 one-shot ladder wanted a second rung at 192 KiB, four times
     above anything that schedule is dispatched at.
+
+    The one-shot window is the wider of the two ceilings.
     """
-    # "fast" mode: exact mode has no mesh/ring window at all (mesh_max ==
-    # oneshot_max there by design), which would make every mesh rung above the
-    # smallest look like it fails this check for the wrong reason.
-    p = P.resolve("pcie", ws, mode="fast")
-    for _floor, *_ in oneshot_ladder(ws)[1:]:
-        assert _floor < p.oneshot_max, ("oneshot", ws, _floor)
-    for floor, *_ in MESH_ST_LADDER[ws][1:]:
-        assert floor < p.mesh_max, ("mesh", ws, floor)
+    for link in P.LINKS:
+        # "fast" mode: exact mode has no mesh/ring window at all (mesh_max ==
+        # oneshot_max there by design), which would make every mesh rung above
+        # the smallest look like it fails this check for the wrong reason.
+        p = P.resolve(link, ws, mode="fast")
+        one_hi = max(p.oneshot_max, P.FAMILY_POLICY[(link, ws)].oneshot_max_exact)
+        for _floor, *_ in oneshot_ladder(ws, link)[1:]:
+            assert _floor < one_hi, ("oneshot", link, ws, _floor)
+        for floor, *_ in MESH_ST_LADDER[ws][1:]:
+            assert floor < p.mesh_max, ("mesh", link, ws, floor)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.
 
@@ -176,10 +218,7 @@ def test_exact_mode_is_oneshot_only():
             assert exact.mesh_max == exact.oneshot_max
             assert exact.max_bytes == exact.oneshot_max
             assert P.families_reachable(exact) == ("oneshot",)
-            # oneshot_max itself is still the *wider* (oneshot_max_exact)
-            # boundary, same as before this policy shape existed.
-            fast = P.resolve(link, ws, mode="fast")
-            assert exact.oneshot_max >= fast.oneshot_max
+            assert exact.oneshot_max == P.FAMILY_POLICY[(link, ws)].oneshot_max_exact
 
 
 def test_fast_mode_still_prefers_exactness_where_free():

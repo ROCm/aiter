@@ -179,8 +179,12 @@ class FlyDSLAllReduce:
         if family == "oneshot":
             # max_bytes from the resolved policy rather than the class default,
             # so an AITER_FLY_AR_ONESHOT_MAX_BYTES override reaches the engine's
-            # own guard and the two cannot disagree.
-            return OneShotAllReduce(**common, max_bytes=self.policy.oneshot_max)
+            # own guard and the two cannot disagree. ``link`` is passed rather
+            # than left to re-detection so the engine's tuning ladder is keyed
+            # on the same fabric this object resolved its policy against.
+            return OneShotAllReduce(
+                **common, max_bytes=self.policy.oneshot_max, link=self.link
+            )
         # min_bytes=0: the family boundary above already decided this engine is
         # the right one for the payload, and QuickAllReduceInt4's own floor is
         # a standalone guard rail that would otherwise reject sizes the policy

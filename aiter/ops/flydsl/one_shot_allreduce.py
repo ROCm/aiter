@@ -36,19 +36,22 @@ from .quick_allreduce_int4 import (
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
+    has_xgmi_peer_links,
     kernel_symbol,
 )
 
 logger = logging.getLogger("aiter")
 
-# Largest payload this kernel should be asked to move, per world size.
-MAX_PAYLOAD_BYTES_BY_WORLD = {
-    ws: FAMILY_POLICY[("pcie", ws)].oneshot_max_exact for ws in SUPPORTED_WORLDS
+# Largest payload this kernel should be asked to move, per (link, world size).
+MAX_PAYLOAD_BYTES = {
+    (link, ws): FAMILY_POLICY[(link, ws)].oneshot_max_exact
+    for link in ("pcie", "xgmi")
+    for ws in SUPPORTED_WORLDS
 }
 
 
-def max_payload_bytes(world_size: int) -> int:
-    return MAX_PAYLOAD_BYTES_BY_WORLD[int(world_size)]
+def max_payload_bytes(world_size: int, link: str = "pcie") -> int:
+    return MAX_PAYLOAD_BYTES[(str(link), int(world_size))]
 
 
 class OneShotAllReduce:
@@ -60,9 +63,12 @@ class OneShotAllReduce:
     ``atoms``, ``grid_cap`` and ``fanout`` are the tuning surface.
 
     ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
-    defaulting to this world size's entry in ``MAX_PAYLOAD_BYTES_BY_WORLD``.
+    defaulting to this ``(link, world_size)``'s entry in ``MAX_PAYLOAD_BYTES``.
     That ceiling is the point of the class: wire volume is ``(N-1)*S`` against a
     two-shot's ``2(N-1)/N*S``, so where it stops paying is a function of ``N``.
+
+    ``link`` selects both the tuning ladder and that default ceiling, and is
+    detected from the KFD topology when not given.
 
     ``inbox_memory`` follows ``QuickAllReduceInt4``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
@@ -81,6 +87,7 @@ class OneShotAllReduce:
         inbox_memory: str = "auto",
         fanout: str | None = None,
         max_bytes: int | None = None,
+        link: str | None = None,
         probe: str = "full",
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
     ):
@@ -88,6 +95,11 @@ class OneShotAllReduce:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
+        if link is None:
+            link = "xgmi" if has_xgmi_peer_links() else "pcie"
+        if link not in ("pcie", "xgmi"):
+            raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
+        self.link = link
         pinned = atoms is not None or grid_cap is not None or fanout is not None
         if atoms is None:
             atoms = DEFAULT_ATOMS
@@ -124,7 +136,9 @@ class OneShotAllReduce:
         self.world_size = int(world_size)
         self.inbox_memory = resolved_inbox
         self.max_bytes = (
-            max_payload_bytes(world_size) if max_bytes is None else int(max_bytes)
+            max_payload_bytes(world_size, link)
+            if max_bytes is None
+            else int(max_bytes)
         )
         self.probe = probe
         self.spin_sleep = int(spin_sleep)
@@ -135,17 +149,17 @@ class OneShotAllReduce:
             ceiling = cap if grid_cap is not None else None
             self._ladder = tuple(
                 (floor, a, rung_cap if ceiling is None else min(rung_cap, ceiling), f)
-                for floor, a, rung_cap, f in oneshot_ladder(world_size)
+                for floor, a, rung_cap, f in oneshot_ladder(world_size, link)
             )
 
         # One engine per distinct rung config, built in a fixed sorted order:
         # each does its own IPC handle exchange, which is a collective, so ranks
         # disagreeing on the order would deadlock.
         #
-        # No ``clamp_grid_cap`` here, unlike the two-shot schedules: every rung
-        # caps the grid at 64 or below, which is two orders of magnitude under
-        # the residency of any supported device, so the clamp could only ever
-        # be a no-op bought with an extra collective per engine.
+        # No ``clamp_grid_cap`` here, unlike the two-shot schedules: no rung
+        # caps the grid above 128, which is more than an order of magnitude
+        # under the residency of any supported device, so the clamp could only
+        # ever be a no-op bought with an extra collective per engine.
         self._by_cfg = {}
         try:
             for _floor, a, c, f in self._ladder:
