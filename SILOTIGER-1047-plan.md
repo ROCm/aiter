@@ -225,8 +225,8 @@ separate steps (plumbing → live AMD → #4882 → rocprof).
       was the call at 1e. HIP `module_top_k_per_row.so` was **absent**; decode
       select wall was oracle/`torch.topk` on MQA logits, not
       `_hip_top_k_per_row_decode`. rocprof MQA was ~3 µs. That ranking does
-      **not** apply to production HIP select (a select-only measurement, not
-      a new full-layer rocprof, is what later phases compare against). Prefill
+      **not** apply to production HIP select (later select-only 2d times are
+      a different measurement, not a new full-layer rocprof). Prefill
       `M=512` under the fallback: GQA slightly ahead at 8k; select ahead at
       32k. 128k decode fits; 1M not run.
 - [x] **Done when:** both family tables exist with live AMD + oracle + #4882
