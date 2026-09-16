@@ -6,6 +6,8 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.test_common import benchmark, perftest
 
 
@@ -535,7 +537,11 @@ args = parser.parse_args()
 test_mb_workspace_reuse()
 
 
-flydsl_available = get_gfx() in ("gfx942", "gfx950", "gfx1250")
+# Ask each path which arches it serves rather than keeping a second copy
+# here: a copy drifts, and a test that drives a kernel production never
+# dispatches reports on something nobody runs.
+one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
 
 df = []
 for data_generation in args.data_generation:
@@ -546,7 +552,7 @@ for data_generation in args.data_generation:
                 df.append(ret)
                 # Cover the one-block radix kernel directly, so a dispatch
                 # change cannot hide a kernel regression.
-                if not flydsl_available:
+                if not one_block_available:
                     continue
                 for stable in (False, True):
                     for write_values in (False, True):
@@ -585,7 +591,7 @@ for data_generation in args.data_generation:
                                 write_values=write_values,
                             )
                             df.append(ret)
-                            if flydsl_available:
+                            if flydsl_decode_available:
                                 ret = test_top_k_per_row_decode(
                                     m,
                                     ctx,
