@@ -25,6 +25,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
+from ..kernels_common import create_llvm_ptr
 from ..tensor_shim import GTensor
 
 Vec = fx.Vector
@@ -876,7 +877,7 @@ def _build_kernel_mfma_lds_pipe(
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().slots.ptr
         # ptrtoint on a Shared pointer yields i32; address space 3 is LDS, which
         # is what raw_ptr_buffer_load_lds wants.
-        lds_ptr0 = buffer_ops.create_llvm_ptr(
+        lds_ptr0 = create_llvm_ptr(
             fx.Int64(fx.Uint32(fx.ptrtoint(lds_ptr))), address_space=3
         )
         _frag_ty = Vec.make_type(8, fx.Int32)

@@ -353,14 +353,12 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
 
     gfx950 H>=128: mfma32x32x64 at r=1 always -- ample compute, more blocks.
 
-    gfx950 H<=32: mfma32x32x64 with WPB=4 for small/square shapes,
-        WPB=2 r=2 for streaming / large-square.
+    gfx950 H<=32: mfma32x32x64 r=2 with WPB=4 everywhere except streaming
+        shapes, which keep WPB=2.
         K64 gives M_TILES=1 at H=32 -- half the compute of H=64 -- so the
         smaller tile grid benefits from extra wavefronts per block (WPB=4)
         rather than more blocks (WPB=2), which keeps the SIMD units busier
-        when the row grid alone under-saturates the device.  For large or
-        streaming shapes the row grid is already sufficient to fill the device,
-        so WPB=2 with r=2 (more row reuse per KV load) is preferred.
+        when the row grid alone under-saturates the device.
 
     gfx950 H in (32, 128): mfma32x32x64 with r=2 for streaming / large-square
         shapes (KV pressure high), r=1 otherwise.
@@ -374,7 +372,7 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         streaming = seq_len_kv > 2 * seq_len
         large_square = seq_len >= 8192 and seq_len_kv >= seq_len
         if num_heads <= 32:
-            if streaming or large_square:
+            if streaming:
                 return "mfma32x32x64_bkv64_r2_w2_lds3"
             return "mfma32x32x64_bkv64_r2_w4_lds3"
         r = 2 if streaming or large_square else 1
