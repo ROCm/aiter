@@ -421,7 +421,6 @@ def top_k_per_row_prefill(
             stride0,
             stride1,
             k,
-            stable,
         ):
             return flydsl_radix_topk_one_block_prefill(
                 logits,
@@ -674,7 +673,6 @@ def top_k_per_row_decode(
             stride0,
             stride1,
             k,
-            stable,
             is_decode=True,
             next_n=next_n,
         ):

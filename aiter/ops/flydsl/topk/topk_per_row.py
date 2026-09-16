@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -193,7 +193,7 @@ _FLYDSL_TOPK_ONE_BLOCK_ARCHES = ("gfx942", "gfx950", "gfx1250")
 
 def _validate_radix_topk_one_block_call(
     logits: torch.Tensor,
-    row_starts: torch.Tensor | None,
+    row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     indices: torch.Tensor,
     values: torch.Tensor | None,
@@ -209,10 +209,7 @@ def _validate_radix_topk_one_block_call(
     _validate_flydsl_topk_call(
         logits, next_n, row_ends, indices, num_rows, stride0, stride1, k, values
     )
-    if row_starts is None:
-        if not is_decode:
-            raise ValueError("row_starts is required for prefill")
-    elif row_starts is not row_ends:
+    if row_starts is not row_ends:
         _validate_flydsl_topk_call(
             logits, next_n, row_starts, indices, num_rows, stride0, stride1, k, values
         )
@@ -317,13 +314,11 @@ def _is_flydsl_radix_topk_one_block_supported(
     stride0: int,
     stride1: int,
     k: int,
-    stable: bool = False,
     *,
     is_decode: bool = False,
     next_n: int = 1,
 ) -> bool:
     """Return whether the one-block radix kernel supports this call."""
-    del stable
     return _is_flydsl_radix_topk_one_block_call_supported(
         _tensor_signature(logits),
         None if row_starts is None else _tensor_signature(row_starts),
@@ -336,7 +331,7 @@ def _is_flydsl_radix_topk_one_block_supported(
         k,
         None if values is None else _tensor_signature(values),
         is_decode,
-        get_gfx(),
+        get_gfx_runtime(),
     )
 
 
@@ -473,7 +468,7 @@ def flydsl_radix_topk_one_block(
     if num_rows == 0:
         return
 
-    arch = get_gfx()
+    arch = get_gfx_runtime()
     width = logits.shape[1]
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
