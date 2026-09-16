@@ -6460,63 +6460,108 @@ class FhmoeTuner(FmoeTuner):
 
         routed_expert = expert - 1
         routed_topk = topk - 1
-        data = FmoeTuner.generate_data(
-            shape["token"],
-            shape["model_dim"],
-            shape["inter_dim"],
-            routed_expert,
-            routed_topk,
-            shape["dtype"],
-            shape["q_dtype_a"],
-            shape["q_dtype_w"],
-            shape["q_type"],
-            shape["use_g1u1"],
-            block_m,
-            device,
+        token = shape["token"]
+        model_dim = shape["model_dim"]
+        inter_dim = shape["inter_dim"]
+        dtype = shape["dtype"]
+        q_type = shape["q_type"]
+        q_dtype_w = shape["q_dtype_w"]
+        torch.manual_seed(0)
+        hidden = torch.randn((token, model_dim), dtype=dtype, device="cpu") / 10
+        if shape["use_g1u1"]:
+            w1_dense = (
+                torch.randn(
+                    (routed_expert, inter_dim * 2, model_dim),
+                    dtype=dtype,
+                    device="cpu",
+                )
+                / 10
+            )
+        else:
+            w1_dense = torch.randn(
+                (routed_expert, inter_dim, model_dim),
+                dtype=dtype,
+                device="cpu",
+            ) / 10
+        w2_dense = torch.randn(
+            (routed_expert, model_dim, inter_dim), dtype=dtype, device="cpu"
         )
-        w1 = FhmoeTuner._pad_dummy_expert(data["w1_qt"])
-        w2 = FhmoeTuner._pad_dummy_expert(data["w2_qt"])
-        w1_scale = FhmoeTuner._pad_dummy_expert(data["w1_scale"], routed_expert)
-        w2_scale = FhmoeTuner._pad_dummy_expert(data["w2_scale"], routed_expert)
-
-        shared_device = w1.device
+        w1_shape = w1_dense.shape
+        w2_shape = w2_dense.shape
+        with torch.device("cpu"):
+            w1, w1_scale = FmoeTuner.weight_quant(
+                w1_dense, q_type, quant_dtype=q_dtype_w
+            )
+            w2, w2_scale = FmoeTuner.weight_quant(
+                w2_dense, q_type, quant_dtype=q_dtype_w
+            )
+        del w1_dense, w2_dense
+        if q_dtype_w is not dtypes.fp4x2:
+            w1 = w1.view(w1_shape)
+            w2 = w2.view(w2_shape)
+        else:
+            w1 = w1.view(w1_shape[0], w1_shape[1], w1_shape[2] // 2)
+            w2 = w2.view(w2_shape[0], w2_shape[1], w2_shape[2] // 2)
+        if TUNE_MOE_EXPERT_BALANCE:
+            score = torch.zeros(
+                (token, routed_expert), dtype=dtype, device="cpu"
+            )
+            start_col = 0
+            end_col = routed_topk
+            for token_id in range(token):
+                score[token_id, start_col:end_col] = 1.0
+                start_col = end_col % routed_expert
+                end_col = start_col + routed_topk
+        else:
+            routing_seed = os.environ.get("TUNE_MOE_ROUTING_SEED")
+            if routing_seed is not None:
+                torch.manual_seed(int(routing_seed))
+            score = torch.randn(
+                (token, routed_expert), dtype=dtype, device="cpu"
+            )
         shared_w1_dense = (
             torch.randn(
-                (1, 2 * shape["inter_dim"], shape["model_dim"]),
-                dtype=shape["dtype"],
-                device=shared_device,
+                (1, 2 * inter_dim, model_dim), dtype=dtype, device="cpu"
             )
             / 10
         )
         shared_w2_dense = (
-            torch.randn(
-                (1, shape["model_dim"], shape["inter_dim"]),
-                dtype=shape["dtype"],
-                device=shared_device,
-            )
+            torch.randn((1, model_dim, inter_dim), dtype=dtype, device="cpu")
             / 10
         )
-        shared_w1, shared_w1_scale = FmoeTuner.weight_quant(
-            shared_w1_dense, shape["q_type"], quant_dtype=dtypes.fp8
-        )
-        shared_w2, shared_w2_scale = FmoeTuner.weight_quant(
-            shared_w2_dense, shape["q_type"], quant_dtype=dtypes.fp8
-        )
+        with torch.device("cpu"):
+            shared_w1, shared_w1_scale = FmoeTuner.weight_quant(
+                shared_w1_dense, q_type, quant_dtype=dtypes.fp8
+            )
+            shared_w2, shared_w2_scale = FmoeTuner.weight_quant(
+                shared_w2_dense, q_type, quant_dtype=dtypes.fp8
+            )
         del shared_w1_dense, shared_w2_dense
+        topk_weights, topk_ids = fused_topk(
+            hidden.to(device), score.to(device), routed_topk, True
+        )
+        del score
+        topk_weights = topk_weights.cpu()
+        topk_ids = topk_ids.cpu()
+
+        w1 = FhmoeTuner._pad_dummy_expert(w1)
+        w2 = FhmoeTuner._pad_dummy_expert(w2)
+        w1_scale = FhmoeTuner._pad_dummy_expert(w1_scale, routed_expert)
+        w2_scale = FhmoeTuner._pad_dummy_expert(w2_scale, routed_expert)
 
         shared_ids = torch.full(
-            (shape["token"], 1),
+            (token, 1),
             shared_expert_id,
-            dtype=data["topk_ids"].dtype,
-            device=data["topk_ids"].device,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
         )
         shared_weights = torch.ones(
-            (shape["token"], 1),
-            dtype=data["topk_weights"].dtype,
-            device=data["topk_weights"].device,
+            (token, 1),
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
         )
-        topk_ids = torch.cat([data["topk_ids"], shared_ids], dim=1)
-        topk_weights = torch.cat([data["topk_weights"], shared_weights], dim=1)
+        topk_ids = torch.cat([topk_ids, shared_ids], dim=1)
+        topk_weights = torch.cat([topk_weights, shared_weights], dim=1)
 
         if shape["gate_mode"] == GateMode.INTERLEAVE:
             w1 = shuffle_weight_a16w4(w1, 16, True)
@@ -6540,7 +6585,7 @@ class FhmoeTuner(FmoeTuner):
         w2.is_shuffled = True
 
         return {
-            "hidden": data["input"],
+            "hidden": hidden,
             "w1": w1,
             "w2": w2,
             "w1_scale": w1_scale,
@@ -6551,8 +6596,8 @@ class FhmoeTuner(FmoeTuner):
             "shared_w2_scale": shared_w2_scale,
             "topk_ids": topk_ids,
             "topk_weights": topk_weights,
-            "a1_qt": data["a1_qt"],
-            "a1_scale": data["a1_scale"],
+            "a1_qt": hidden,
+            "a1_scale": None,
             "gate_mode": shape["gate_mode"],
             "hidden_pad": shape["hidden_pad"],
             "intermediate_pad": shape["intermediate_pad"],
@@ -6596,25 +6641,90 @@ class FhmoeTuner(FmoeTuner):
             shared_expert_id=data["shared_expert_id"],
         )
 
+    _FHMOE_MP_DATA_KEYS = (
+        "hidden",
+        "w1",
+        "w2",
+        "topk_weights",
+        "topk_ids",
+        "w1_scale",
+        "w2_scale",
+        "shared_w1",
+        "shared_w2",
+        "shared_w1_scale",
+        "shared_w2_scale",
+    )
+
+    @staticmethod
+    def _run_fhmoe_mp(
+        hidden,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w2,
+        shared_w1_scale,
+        shared_w2_scale,
+        shape,
+    ):
+        return FhmoeTuner._run_fhmoe(
+            shape,
+            {
+                "hidden": hidden,
+                "w1": w1,
+                "w2": w2,
+                "topk_weights": topk_weights,
+                "topk_ids": topk_ids,
+                "w1_scale": w1_scale,
+                "w2_scale": w2_scale,
+                "shared_w1": shared_w1,
+                "shared_w2": shared_w2,
+                "shared_w1_scale": shared_w1_scale,
+                "shared_w2_scale": shared_w2_scale,
+                "shared_expert_id": shape["shared_expert_id"],
+            },
+        )
+
     def tune(self, untunedf, tunedf, args):
-        del tunedf, args
+        del tunedf
+        tasks = []
         for _, row in untunedf.iterrows():
             shape = self._parse_fhmoe_row(row)
-            print("\nStart tuning FHMoE", [shape[k] for k in self.keys])
-            data = self.generate_fhmoe_data(shape)
-            print(
-                f"[fhmoe] token={shape['token']} "
-                f"w1={tuple(data['w1'].shape)} {data['w1'].dtype} "
-                f"shared_w1={tuple(data['shared_w1'].shape)} {data['shared_w1'].dtype} "
-                f"topk_ids={tuple(data['topk_ids'].shape)}",
-                flush=True,
+            info = tuple(shape[k] for k in self.keys)
+            block_m = 32
+            print("\nStart tuning FHMoE", info, flush=True)
+            tasks.append(
+                (
+                    (info, "fused", "", block_m),
+                    FhmoeTuner.generate_fhmoe_data,
+                    (shape, block_m),
+                    FhmoeTuner._run_fhmoe_mp,
+                    (list(self._FHMOE_MP_DATA_KEYS), shape),
+                    {},
+                    None,
+                    ([],),
+                    {},
+                    None,
+                    0.01,
+                    0.01,
+                )
             )
-            out = self._run_fhmoe(shape, data)
-            print(
-                f"[fhmoe] fused_moe out={tuple(out.shape)} {out.dtype}",
-                flush=True,
-            )
-            del data, out
+        if not tasks:
+            return []
+        rets = mp_tuner(
+            tasks,
+            [(len(tasks), ())],
+            args.mp,
+            True,
+            False,
+            timeout=args.timeout,
+            verbose=args.verbose,
+        )
+        for info, us, err in rets:
+            print(f"[fhmoe] mp_tuner us={us} err={err} info={info}", flush=True)
         return []
 
 
