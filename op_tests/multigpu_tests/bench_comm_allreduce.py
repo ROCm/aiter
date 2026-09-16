@@ -905,6 +905,27 @@ def _variant_of(cand: Candidate, fly, fly1s, flyauto, nbytes: int) -> str | None
     return eng.variant(int(nbytes)) if eng is not None else None
 
 
+def _ran_exact(cand: Candidate, flyauto, nbytes: int) -> bool:
+    """Whether *cand* is bit-accurate **at this shape**.
+
+    For every other family exactness is a property of the candidate, because
+    the candidate names one kernel. ``fly_auto`` names a *policy*: it dispatches
+    to the bit-exact one-shot below its ceiling and to a quantized mesh/ring
+    above it, so a single ``Candidate.exact`` flag cannot describe it.
+
+    ``Candidate.exact`` stays the static answer and still drives the accuracy
+    *floor*: ``fly_auto``'s floor has to stay the quantized one, since one
+    column spans both accuracy classes and the floor has to admit the worst of
+    them.
+    """
+    if cand.family != "flyauto":
+        return cand.exact
+    # The policy object is the only thing that knows which family this payload
+    # reaches; "oneshot" is the exact one (bf16 widened to fp32, accumulated in
+    # rank order, one rounding on output).
+    return flyauto is not None and flyauto.family_for(int(nbytes)) == "oneshot"
+
+
 # The ring bakes its rank into the kernel at compile time, so its symbol carries
 # an ``_r<n>_`` field and every rank legitimately reports a different string for
 # the same variant. Collapse that one field before comparing.
@@ -1203,7 +1224,10 @@ def _bench_shape(
             f"{cand.key} tp{tp_size} {tokens}x{hidden} rank{rank}: "
             f"SQNR {sqnr:.2f} dB below the {cand.sqnr_floor} dB floor"
         )
-        if cand.exact:
+        # Per shape, not per candidate: fly_auto is exact only where its policy
+        # reaches the one-shot.
+        ran_exact = _ran_exact(cand, flyauto, nbytes)
+        if ran_exact:
             checkAllclose(
                 ref,
                 got.to(dtypes.fp32),
@@ -1213,6 +1237,7 @@ def _bench_shape(
             )
         ret[f"{cand.key}_us"] = us
         ret[f"{cand.key}_sqnr"] = sqnr
+        ret[f"{cand.key}_exact"] = ran_exact
         # Resolved after the run, not before: for a ladder-driven engine the
         # variant is a function of the payload, and asking the engine is the
         # only way to learn which rung this size took.
@@ -1539,6 +1564,11 @@ def _row(tp_size, tokens, hidden, dtype, rank_rets):
             [r.get(f"{cand.key}_variant") for r in rank_rets]
         )
         row[f"{cand.key} SQNR dB"] = min(r[f"{cand.key}_sqnr"] for r in rank_rets)
+        # Per shape, because fly_auto's accuracy class is a function of the
+        # payload.
+        row[f"{cand.key} exact"] = all(
+            r.get(f"{cand.key}_exact", False) for r in rank_rets
+        )
         # Rank spread, per candidate. Reported for every row rather than only
         # for PRIMARY: skew is mostly a property of the barrier, but not
         # entirely, and a candidate that compiles a *different kernel per rank*
@@ -1897,10 +1927,12 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
       nearly every shape -- ``qr_int3`` at ~12 dB is ~25% relative error and
       beats everything on speed.
     * ``fastest exact collective`` is the fastest of the bit-accurate
-      candidates (``Candidate.exact``), i.e. the fastest option that does not
-      change the model's numerics at all. Omitted when every candidate in the
-      sweep is already exact, since it would just repeat ``fastest
-      collective``.
+      candidates, i.e. the fastest option that does not change the model's
+      numerics at all. Membership is decided **per shape**, not per candidate:
+      ``fly_auto`` dispatches to the exact one-shot below its policy ceiling
+      and to a quantized schedule above it, so it belongs in this column on
+      some rows and not others. Omitted when every candidate in the sweep is
+      exact at every shape, since it would just repeat ``fastest collective``.
 
     A candidate excluded by the floor is not hidden: it keeps its row in that
     shape's ``latency & accuracy by case`` table, and the count of rows where
@@ -1924,11 +1956,25 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
     signature of a candidate that is winning on payload reduction rather than
     on using the fabric well.
     """
-    exact_keys = {c.key for c in CANDIDATES if c.exact}
     live = [k for k in keys if f"{k} us" in df.columns]
+
+    def _exact_here(row, k) -> bool:
+        """Whether *k* was bit-accurate on *row*'s shape.
+
+        Read per row from the ``<k> exact`` column rather than from
+        ``Candidate.exact``, because ``fly_auto`` changes accuracy class with
+        the payload.
+        """
+        v = row.get(f"{k} exact")
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return next((c.exact for c in CANDIDATES if c.key == k), False)
+        return bool(v)
+
     # Only worth a separate column when the sweep actually mixes accuracy
     # classes; with -c cdr rccl every candidate is exact and it would duplicate.
-    want_exact = any(k not in exact_keys for k in live)
+    want_exact = any(
+        not _exact_here(r, k) for _, r in df.iterrows() for k in live if pd.notna(r.get(f"{k} us"))
+    )
 
     def _pick(row, pool, floor):
         """Fastest candidate in *pool* that ran here and clears *floor*.
@@ -1988,7 +2034,7 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
             gated[ungated] = gated.get(ungated, 0) + 1
 
         if want_exact:
-            k, us = _pick(r, [x for x in live if x in exact_keys], min_sqnr)
+            k, us = _pick(r, [x for x in live if _exact_here(r, x)], min_sqnr)
             out["fastest exact collective"] = k or "-"
             out["fastest exact time (us)"] = us
             out["fastest exact vs prod"] = (
