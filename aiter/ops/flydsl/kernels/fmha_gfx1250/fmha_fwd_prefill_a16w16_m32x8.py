@@ -787,22 +787,22 @@ def _softmax(
         m_new_list.append(m_new)
         corr_list.append(corr)
 
-    # ---- Pass 2 (all R rows): p = exp(S - m_new) (f32, per tile) + flat p for the sum
-    # tree. Built for every row first so the row sum-trees below emit INTERLEAVED. ----
-    p_list, p_flat_list = [], []
-    for r in range(R):
-        m_new, s_masked = m_new_list[r], s_masked_list[r]
-        p, p_flat, idx = [], [], 0
-        for kvt in range(NKV):
-            pe = []
-            for i in range(8):
-                pj = exp2(fsub_inf(s_masked[idx], m_new))
-                pe.append(pj)
-                p_flat.append(pj)
-                idx += 1
-            p.append(fx.Vector.from_elements(pe, fx.Float32))
-        p_list.append(p)
-        p_flat_list.append(p_flat)
+    # ---- Pass 2 (all R rows): p = exp2(S - m_new), every row's subs emitted before any
+    # exp. The subs then pair into v_dual_sub_f32 against their row's shared m_new, and the
+    # exp run is pure TRANS -- the coexecution hazard is TRANS followed by a non-TRANS VALU,
+    # so an uninterrupted run needs none of the ~36 v_nop the backend pads in when it
+    # interleaves the two. ----
+    diff_list = [
+        [fsub_inf(sv, m_new_list[r]) for sv in s_masked_list[r]] for r in range(R)
+    ]
+    p_flat_list = [[exp2(d) for d in diff] for diff in diff_list]
+    p_list = [
+        [
+            fx.Vector.from_elements(pf[kvt * 8 : (kvt + 1) * 8], fx.Float32)
+            for kvt in range(NKV)
+        ]
+        for pf in p_flat_list
+    ]
 
     # ---- Row sum: R rows' balanced sum-trees emitted INTERLEAVED. fadd_t (fast-math minus
     # reassoc) so LLVM's Reassociate does NOT re-linearize the tree into a serial chain. ----
