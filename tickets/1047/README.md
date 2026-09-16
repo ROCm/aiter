@@ -266,10 +266,11 @@ on decode rows with more than one tile (`S=8` while `n_tiles<=8`, else
 across four Q heads, and a **4×512×128 MFMA** scorer on serial (16×16×16
 BF16, 512×16 K panels in LDS, ReLU-sum). Prefill stays single-WG.
 Workspace is `[M, S, 512]`, not a score matrix.
-**2d stays unchecked:** short `L` beats HIP; 8k stays S=8 at ~23.4µs vs
-HIP ~19; S=16 cuts decode 128k ~127→~90µs vs HIP ~30; 32k is ~50µs
-(merge tax vs S=8 ~46). S=32 lost at 128k (~105µs). Serial MFMA keeps
-prefill 8k/32k ~89/353µs vs HIP ~84/251. Keep `m > 8` serial.
+**2d stays unchecked:** short `L` beats HIP; 8k stays S=8 at ~22.3µs vs
+HIP ~18; merge-kernel pair-merge shuffles strides 32..1. S=16 plus that
+tail: decode 128k ~88µs vs HIP ~29; 32k ~48µs vs HIP ~19. S=32 lost at
+128k (~105µs). Serial MFMA keeps prefill 8k/32k ~89/351µs vs HIP
+~83/244. Keep `m > 8` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`). Mean kernel µs
 (35 launches), traced under **S=8**. Raw CSV in
@@ -288,16 +289,16 @@ at 32k/128k is **merge-tree + remaining sequential tiles**, not more S:
 | 8 | 512 | 128 | 2.4 | 8.9 | 0 | 0 |
 | 1 | 2048 | 512 | 1.4 | 8.0 | 0 | 0 |
 | 8 | 2048 | 512 | 2.4 | 9.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 23.4 | 19.0 | 0 | 0 |
+| 1 | 8192 | 2048 | 22.3 | 18.2 | 0 | 0 |
 | 8 | 8192 | 2048 | 24.0 | 19.9 | 0 | 0 |
-| 1 | 32768 | 8192 | 49.8 | 20.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 50.9 | 23.6 | 0 | 0 |
-| 1 | 131072 | 32768 | 90.4 | 30.1 | 0 | 0 |
-| 8 | 131072 | 32768 | 99.5 | 52.7 | 0 | 0 |
+| 1 | 32768 | 8192 | 47.8 | 19.4 | 0 | 0 |
+| 8 | 32768 | 8192 | 48.6 | 24.0 | 0 | 0 |
+| 1 | 131072 | 32768 | 88.4 | 29.1 | 0 | 0 |
+| 8 | 131072 | 32768 | 97.2 | 52.2 | 0 | 0 |
 | 512 | 512 | 128 | 2.7 | 16.0 | 0 | 0 |
 | 512 | 2048 | 512 | 2.5 | 27.1 | 0 | 0 |
-| 512 | 8192 | 2048 | 89.0 | 83.9 | 0 | 0 |
-| 512 | 32768 | 8192 | 352.6 | 250.6 | 0 | 0 |
+| 512 | 8192 | 2048 | 89.2 | 82.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 350.5 | 243.9 | 0 | 0 |
 
 
 

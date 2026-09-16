@@ -59,6 +59,7 @@ _INTERWAVE_LDS = (
 )
 _INTRAWAVE_XOR = (32, 16, 8, 4, 2, 1)
 _PAIR_MERGE_STRIDES = tuple(1 << shift for shift in range(_K.bit_length() - 1, -1, -1))
+_PAIR_MERGE_LDS = tuple(s for s in _PAIR_MERGE_STRIDES if s >= _WAVE)
 
 
 def _idiv(a, b):
@@ -444,6 +445,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int, splits: int):
         pipe=3,
         liv=1,
         kshare=1,
+        psh=1,
     )
 
     @fx.struct
@@ -755,6 +757,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int, splits: int):
     ):
         row = Int32(gpu.block_id("x"))
         tid = Int32(gpu.thread_id("x"))
+        lane = gpu.lane_id()
         zero = Int32(0)
         one = Int32(1)
         neg_one = Int32(-1)
@@ -802,7 +805,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int, splits: int):
                                 cand_s[b] = sa
                                 cand_c[b] = ca
                     gpu.barrier()
-                    for stride in _PAIR_MERGE_STRIDES:
+                    for stride in _PAIR_MERGE_LDS:
                         for w in range_constexpr(n_win):
                             base = Int32(w * _CANDIDATES)
                             for t in range_constexpr(pair_steps):
@@ -821,6 +824,35 @@ def build_qsa_k1_family_a_split_merge(page_size: int, splits: int):
                                     cand_s[peer] = swap.select(s0, s1)
                                     cand_c[peer] = swap.select(c0, c1)
                         gpu.barrier()
+                    for w in range_constexpr(n_win):
+                        base = Int32(w * _CANDIDATES)
+                        xs0 = cand_s[base + tid]
+                        xc0 = cand_c[base + tid]
+                        xs1 = cand_s[base + Int32(_K) + tid]
+                        xc1 = cand_c[base + Int32(_K) + tid]
+                        for stride in _INTRAWAVE_XOR:
+                            ps0 = xs0.shuffle_xor(stride, _WAVE)
+                            pc0 = xc0.shuffle_xor(stride, _WAVE)
+                            is_lo = lane < (lane ^ Int32(stride))
+                            take0 = is_lo.select(
+                                better(ps0, pc0, xs0, xc0),
+                                better(xs0, xc0, ps0, pc0),
+                            )
+                            xs0 = take0.select(ps0, xs0)
+                            xc0 = take0.select(pc0, xc0)
+                            ps1 = xs1.shuffle_xor(stride, _WAVE)
+                            pc1 = xc1.shuffle_xor(stride, _WAVE)
+                            take1 = is_lo.select(
+                                better(ps1, pc1, xs1, xc1),
+                                better(xs1, xc1, ps1, pc1),
+                            )
+                            xs1 = take1.select(ps1, xs1)
+                            xc1 = take1.select(pc1, xc1)
+                        cand_s[base + tid] = xs0
+                        cand_c[base + tid] = xc0
+                        cand_s[base + Int32(_K) + tid] = xs1
+                        cand_c[base + Int32(_K) + tid] = xc1
+                    gpu.barrier()
                     if n_win > 1:
                         for i in range(1, n_win):
                             for t in range_constexpr(tile_steps):
