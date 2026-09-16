@@ -4,12 +4,13 @@
 
 """Matched wall-clock benchmark for production ASM versus split-KV ASM."""
 
+import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
+
 import argparse
 import math
 import statistics
 import time
 
-import triton  # noqa: F401  # Must precede torch on this ROCm environment.
 import torch
 
 from aiter.ops.mha import _fmha_v3_varlen_splitkv_fwd
@@ -81,28 +82,20 @@ def main():
 
     if not 2 <= args.splits <= 8:
         raise ValueError("splits must be between 2 and 8")
-    run = lambda num_splits: production_asm(
-        q, k, v, cu_q, cu_k, scale, num_splits
-    )
+    run = lambda num_splits: production_asm(q, k, v, cu_q, cu_k, scale, num_splits)
     reference = run(1)
     actual = run(args.splits)
-    cosine_difference = (
-        1.0
-        - 2.0
-        * (reference.double() * actual.double()).sum().item()
-        / (
-            reference.double().square().sum().item()
-            + actual.double().square().sum().item()
-        )
+    cosine_difference = 1.0 - 2.0 * (
+        reference.double() * actual.double()
+    ).sum().item() / (
+        reference.double().square().sum().item() + actual.double().square().sum().item()
     )
     if cosine_difference >= 1e-4:
         raise RuntimeError(
             f"correctness gate failed: cosine difference={cosine_difference}"
         )
 
-    baseline_ms, split_ms = measure_paired(
-        run, args.splits, args.warmup, args.samples
-    )
+    baseline_ms, split_ms = measure_paired(run, args.splits, args.warmup, args.samples)
     flop = args.heads * 2 * args.sq * args.sk * (192 + 128)
     baseline_median = statistics.median(baseline_ms)
     split_median = statistics.median(split_ms)
