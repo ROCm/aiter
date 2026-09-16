@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import gc
 import math
 import multiprocessing as mp
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
+from queue import Empty
 
 import torch
 
@@ -18,7 +20,18 @@ def _is_mapping_error(exc: BaseException) -> bool:
 
 
 def _is_accelerator_error(exc: BaseException) -> bool:
-    return type(exc).__name__ == "AcceleratorError"
+    if type(exc).__name__ == "AcceleratorError":
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "illegal memory access",
+            "memory access fault",
+            "device-side assert",
+            "hip error 700",
+        )
+    )
 
 
 def _init_task_start_times(task_start_times):
@@ -54,6 +67,25 @@ def _merge_error_ratio(current, observed):
     return max(current, observed)
 
 
+def _candidate_failure_status(exc: BaseException, default: str = "crash") -> str:
+    message = str(exc).lower()
+    if isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in message:
+        return "oom_runtime"
+    if isinstance(exc, (ValueError, NotImplementedError)) or any(
+        marker in message
+        for marker in ("not support", "unsupported", "invalid argument", "rejected")
+    ):
+        return "unsupported"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    return default
+
+
+def _format_worker_result(info, us, max_err_ratio, status, return_status):
+    result = (info, us, round(max_err_ratio, 4))
+    return (*result, status) if return_status else result
+
+
 def worker(
     gpu_id,
     info,
@@ -70,12 +102,14 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
+    return_status=False,
 ):
     from aiter.test_common import run_perftest
 
     pid = mp.current_process().pid
     device = torch.device(f"cuda:{gpu_id}")
     max_err_ratio = 0.0
+    status = "ok"
     try:
         torch.cuda.set_device(device)
         args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
@@ -98,9 +132,12 @@ def worker(
             us = round(us, 4)
 
         except (RuntimeError, ValueError) as e:
+            if _is_accelerator_error(e):
+                raise
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
             us = -1  # not support or error
             max_err_ratio = 1.0
+            status = _candidate_failure_status(e)
         max_retries = 3
         retry_count = 0
 
@@ -110,9 +147,14 @@ def worker(
             retry_count += 1
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
+            us = -1
+            max_err_ratio = 1.0
+            status = "crash"
         torch.cuda.synchronize()
         if us == -1 or res is None:
-            return info, us, round(max_err_ratio, 4)
+            return _format_worker_result(
+                info, us, max_err_ratio, status, return_status
+            )
         if ref is not None:
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
@@ -156,7 +198,11 @@ def worker(
                             catastrophic_check=catastrophic_check,
                         )
                     max_err_ratio = _merge_error_ratio(max_err_ratio, err_ratio)
+            if max_err_ratio > tol_err_ratio:
+                status = "mismatch"
     except RuntimeError as e:
+        if _is_accelerator_error(e):
+            raise
         if "CUDA" in str(e) or "HIP" in str(e) or "out of memory" in str(e).lower():
             if printLog:
                 print(f"GPU Runtime Error in process:{pid} info:{info}: {e}")
@@ -171,11 +217,13 @@ def worker(
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
         us = -1  # float("inf")
         max_err_ratio = 1.0
+        status = _candidate_failure_status(e)
     except TimeoutError as e:
         if printLog:
             print(f"Timeout in process:{pid} info:{info}: {e}")
         us = float("inf")
         max_err_ratio = 1.0
+        status = "timeout"
     except Exception as e:  # noqa: BLE001
         if printLog:
             print(f"Unexpected Error in process:{pid} info:{info}: {e}")
@@ -184,14 +232,31 @@ def worker(
             traceback.print_exc()
         us = -1  # float("inf")
         max_err_ratio = 1.0
+        status = _candidate_failure_status(e)
 
-    return info, us, round(max_err_ratio, 4)
+    return _format_worker_result(info, us, max_err_ratio, status, return_status)
 
 
-def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
+def work_group(
+    GPUIDMap,
+    fast_mode,
+    err_ratio,
+    in_data,
+    tasks,
+    verbose=False,
+    return_status=False,
+    progress_queue=None,
+):
     """Work group that processes a batch of related tasks."""
-    group_task = [tasks] if not isinstance(tasks, list) else tasks
+    shape_grouped = isinstance(tasks, list)
+    group_task = tasks if shape_grouped else [tasks]
     kernels_num, (input_data) = in_data
+    expected_tasks = kernels_num if shape_grouped else 1
+    if len(group_task) != expected_tasks:
+        raise ValueError(
+            f"work group declares {kernels_num} kernels but contains "
+            f"{len(group_task)} tasks"
+        )
     (
         info,
         gen_data,
@@ -247,26 +312,9 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         return data
 
     try:
-        # Retrieve GPU ID from the map
-        pid = mp.current_process().pid
-        # if pid not in GPUIDMap:
-        #    # Fallback: Use round-robin GPU assignment based on PID
-        #    gpu_num = torch.cuda.device_count()
-        #    gpu_id = pid % gpu_num
-        #    warning_msg = (
-        #        f"[Warning] Process {pid} not found in GPUIDMap. "
-        #        f"Available PIDs: {list(GPUIDMap.keys())}. "
-        #        f"Using fallback GPU assignment: GPU {gpu_id}"
-        #    )
-        #    print(warning_msg)
-        #    # Still raise KeyError to trigger pool restart in parent process
-        #    raise KeyError(
-        #        f"Process {pid} not found in GPUIDMap. Available PIDs: {list(GPUIDMap.keys())}"
-        #    )
-        gpu_id = GPUIDMap[pid]
+        gpu_id = gpuID
 
         rets = []
-        shape_grouped = isinstance(tasks, list)
         solutions = 1 if not shape_grouped else kernels_num
         for i in range(solutions):
             (
@@ -338,25 +386,66 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 max_abs_delta,
                 output_keys,
                 arg_key_list,
+                True,
+                return_status,
             )
 
             # Run worker with explicit GPU ID
             ret = worker(*work_args)
             rets.append(ret)
+            if progress_queue is not None:
+                progress_queue.put(ret)
         return rets
 
     except Exception as e:  # noqa: BLE001
         import traceback
 
+        if _is_accelerator_error(e):
+            raise
         print(f"Critical error in work_group: {e!r}")
         traceback.print_exc()
-        # Return dummy failed results for all tasks in the group
+        # Allocation failed before any candidate launched.
+        status = (
+            "oom_preflight"
+            if isinstance(e, torch.cuda.OutOfMemoryError)
+            or "out of memory" in str(e).lower()
+            else "crash"
+        )
+        # Return dummy failed results for all tasks in the group.
         if isinstance(tasks, list):
-            return [
-                (task[0] if task else "unknown", float("inf"), 1.0) for task in tasks
+            results = [
+                _format_worker_result(
+                    task[0] if task else "unknown",
+                    float("inf"),
+                    1.0,
+                    status,
+                    return_status,
+                )
+                for task in tasks
             ]
         else:
-            return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
+            results = [
+                _format_worker_result(
+                    tasks[0] if tasks else "unknown",
+                    float("inf"),
+                    1.0,
+                    status,
+                    return_status,
+                )
+            ]
+        if progress_queue is not None:
+            for result in results:
+                progress_queue.put(result)
+        return results
+    finally:
+        data = None
+        cached_ref = None
+        ref = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - a faulted HIP context may reject cleanup
+            pass
 
 
 def get_pid():
@@ -373,12 +462,15 @@ def mp_tuner(
     err_ratio=0.05,
     timeout=None,
     verbose=False,  # print verbose log
+    return_status=False,
+    result_callback=None,
 ):
-    """Multi-process tuner with GPU fault isolation.
+    """Multi-process tuner with one long-lived worker per selected GPU.
 
-    Each task runs in an isolated process (maxtasksperchild=1) to ensure that
-    GPU memory faults or hangs in one task don't affect others. The process pool
-    automatically spawns new workers after each task completes or crashes.
+    Shape-grouped callers reuse one input/reference allocation for every
+    candidate of a shape. GPU faults and hangs trigger a full pool restart;
+    each group releases its tensors and allocator cache before the worker takes
+    another shape.
 
     Args:
         tasks: List of tuning tasks
@@ -393,6 +485,8 @@ def mp_tuner(
         List of (info, latency, error_ratio) tuples
     """
     gpu_num = torch.cuda.device_count()
+    if gpu_num < 1:
+        raise RuntimeError("mp_tuner requires at least one visible GPU")
     mp.set_start_method("spawn", force=True)
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
     parallel_num = mp_num
@@ -436,6 +530,25 @@ def mp_tuner(
 
     print(f"Distributing {len(task_group)} task groups across {mp_num} GPUs")
 
+    manager = mp.Manager() if result_callback is not None else None
+    progress_queue = manager.Queue() if manager is not None else None
+    progress_results = {}
+
+    def publish_progress(result):
+        info = result[0]
+        progress_results[info] = result
+        if result_callback is not None:
+            result_callback(result)
+
+    def drain_progress():
+        if progress_queue is None:
+            return
+        while True:
+            try:
+                publish_progress(progress_queue.get_nowait())
+            except Empty:
+                return
+
     # Helper function to submit tasks to pool
     def submit_tasks(pool, gpu_map, task_indices):
         """Submit tasks to the pool and return async results as a dict"""
@@ -454,6 +567,8 @@ def mp_tuner(
                         in_datas[ref_data_index[k]],
                         task_group[k],
                         verbose,
+                        return_status,
+                        progress_queue,
                     ),
                 ),
             )
@@ -478,26 +593,48 @@ def mp_tuner(
     failed_tasks = []
     remaining_tasks = list(enumerate(rets))
 
-    check_interval = 10  # Check every 10 seconds for responsive polling
+    # Checkpoint-enabled callers drain per-candidate progress every second so
+    # an abrupt parent failure loses at most a small in-flight window.
+    check_interval = 1 if result_callback is not None else 10
 
     timeout_msg = (
         f"timeout={timeout}s each" if timeout is not None else "no timeout limit"
     )
     print(f"Waiting for {len(remaining_tasks)} tasks to complete ({timeout_msg})...")
 
-    def add_dummy_result(k, results_list):
+    def add_dummy_result(k, results_list, status="crash"):
         """Helper function to add dummy failed result"""
         if shape_grouped:
             task_info = (
                 task_group[k] if isinstance(task_group[k], list) else [task_group[k]]
             )
+            published_failure = False
             for task in task_info:
                 info = task[0] if len(task) > 0 else f"task_{k}"
-                results_list.append((info, float("inf"), 1.0))
+                if info in progress_results:
+                    results_list.append(progress_results[info])
+                    continue
+                result = _format_worker_result(
+                    info, float("inf"), 1.0, status, return_status
+                )
+                results_list.append(result)
+                # The first unfinished candidate is the one that faulted or
+                # timed out. Later candidates never ran; leave them out of the
+                # checkpoint so a resume loop can continue with them.
+                if not published_failure:
+                    publish_progress(result)
+                    published_failure = True
         else:
             task = task_group[k]
             info = task[0] if len(task) > 0 else f"task_{k}"
-            results_list.append((info, float("inf"), 1.0))
+            if info in progress_results:
+                results_list.append(progress_results[info])
+                return
+            result = _format_worker_result(
+                info, float("inf"), 1.0, status, return_status
+            )
+            results_list.append(result)
+            publish_progress(result)
 
     # Process tasks as they complete
     pool_restart_needed = False
@@ -506,6 +643,7 @@ def mp_tuner(
     )  # Track error types that already logged to avoid duplicates
 
     while remaining_tasks:
+        drain_progress()
         completed_this_round = []
         dummy_failed_tasks = []
         consecutive_timeouts = 0
@@ -554,8 +692,9 @@ def mp_tuner(
                         failed_tasks.append((k, "timeout"))
 
                         # Add dummy result
+                        drain_progress()
                         dummy_results = []
-                        add_dummy_result(k, dummy_results)
+                        add_dummy_result(k, dummy_results, "timeout")
                         result_dict[k] = (
                             dummy_results if shape_grouped else [dummy_results[0]]
                         )
@@ -583,6 +722,10 @@ def mp_tuner(
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
+                    # A worker was replaced behind the PID-to-GPU map. Restart
+                    # the pool and retry this unfinished group with a fresh map.
+                    pool_restart_needed = True
+                    break
                 elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
@@ -592,8 +735,9 @@ def mp_tuner(
                     error_msg = f"\033[1;31m[GPU Fault]\033[0m Task {k} failed with {error_type}: {e}"
                     print(error_msg, flush=True)
                     failed_tasks.append((k, "accelerator error"))
+                    drain_progress()
                     dummy_results = []
-                    add_dummy_result(k, dummy_results)
+                    add_dummy_result(k, dummy_results, "crash")
                     result_dict[k] = (
                         dummy_results if shape_grouped else [dummy_results[0]]
                     )
@@ -606,6 +750,7 @@ def mp_tuner(
 
                     # Always record a dummy result so reconstruction never sees an empty list
                     # (previously only timeout path did this; async.get() failures left no result_dict[k]).
+                    drain_progress()
                     dummy_results = []
                     add_dummy_result(k, dummy_results)
                     result_dict[k] = (
@@ -670,6 +815,7 @@ def mp_tuner(
             time.sleep(1)
 
     # Reconstruct results in original task order
+    drain_progress()
     result = []
     for k in range(len(rets)):
         task_result = result_dict.get(k, [])
@@ -689,6 +835,9 @@ def mp_tuner(
         pool.join()
     except Exception as e:  # noqa: BLE001
         print(f"Warning: Error during pool cleanup: {e}")
+    if manager is not None:
+        drain_progress()
+        manager.shutdown()
 
     # Print summary
     if failed_tasks:

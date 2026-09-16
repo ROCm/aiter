@@ -20,6 +20,7 @@ import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm en
 import argparse
 import itertools
 import math
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -27,6 +28,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_device_name, get_gfx
+from aiter.ops import mha as mha_ops
 from aiter.ops.mha import flash_attn_varlen_func, fmha_v3_varlen_fwd
 from aiter.test_common import assertAllclose, benchmark, run_perftest
 
@@ -137,23 +139,27 @@ def _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, return_lse, out=None, causal
     )
 
 
-def _public(q, k, v, cu_q, cu_k, scale, return_lse, out=None):
+def _public(q, k, v, cu_q, cu_k, scale, return_lse, out=None, plan=None):
+    # A tuned CSV row for this shape would take precedence over the C++
+    # auto-select this file measures, and aiter ships one for the ticket shape.
+    # plan=None pins the no-row path; plan={...} forces a row instead.
     # Preallocated out= is the buffer the model can pass through the public API.
     if out is None:
         out = torch.empty(q.shape[0], q.shape[1], HD_V, dtype=q.dtype, device=q.device)
-    result = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        q.shape[0],
-        k.shape[0],
-        softmax_scale=scale,
-        causal=False,
-        return_lse=return_lse,
-        out=out,
-    )
+    with mock.patch.object(mha_ops, "_get_mha_fwd_tuned_plan", return_value=plan):
+        result = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            q.shape[0],
+            k.shape[0],
+            softmax_scale=scale,
+            causal=False,
+            return_lse=return_lse,
+            out=out,
+        )
     if return_lse:
         return result[0], result[1]
     return result, None
@@ -333,16 +339,19 @@ def _check_cuda_graph():
     # sk=8192 is the first auto-select length; this captures split producer + combine.
     q, k, v, cu_q, cu_k, scale = _inputs(129, 8192, 4)
     sq, sk = q.shape[0], k.shape[0]
-    for _ in range(3):
-        flash_attn_varlen_func(
-            q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
-        )
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = flash_attn_varlen_func(
-            q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
-        )
+    # aiter ships a tuned row for this arch, and this case is about what
+    # auto-select captures, so pin the no-row path.
+    with mock.patch.object(mha_ops, "_get_mha_fwd_tuned_plan", return_value=None):
+        for _ in range(3):
+            flash_attn_varlen_func(
+                q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
+            )
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = flash_attn_varlen_func(
+                q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
+            )
     graph.replay()
     first = captured.clone()
     graph.replay()
@@ -390,6 +399,31 @@ def _check_non_lse():
         atol=2e-2,
         msg="forced split return_lse=False",
     )
+
+
+def _check_csv_override():
+    # Sk=8192 is the first length auto-select splits 3 ways, so a row forcing 2
+    # proves the row displaces auto-select rather than agreeing with it by luck.
+    q, k, v, cu_q, cu_k, scale = _inputs(4096, 8192, 12)
+    split2 = _v3_fwd(q, k, v, cu_q, cu_k, scale, 2, False)[0]
+    split3 = _v3_fwd(q, k, v, cu_q, cu_k, scale, 3, False)[0]
+    # A tuned row must reach the kernel with the caller's out=, not around it.
+    out = torch.empty(q.shape[0], q.shape[1], HD_V, dtype=q.dtype)
+    sentinel = out.data_ptr()
+    actual, _ = _public(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        scale,
+        False,
+        out=out,
+        plan={"backend": "asm_v3", "num_splits": 2, "backend_config": None},
+    )
+    assert actual.data_ptr() == sentinel, "tuned row bypassed the caller out="
+    assert torch.equal(out, split2), "tuned row did not force num_splits=2"
+    assert not torch.equal(out, split3), "forced split-2 matched auto split-3"
 
 
 def main():
@@ -472,6 +506,7 @@ def main():
     _check_non_lse()
     _check_compile_outputs()
     _check_cuda_graph()
+    _check_csv_override()
 
 
 if __name__ == "__main__":
