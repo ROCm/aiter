@@ -40,6 +40,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_plan import PADecodePlan, plan_pa_decode as plan_pa_decode
 from .kernels.pa_decode_reduce import (
     MAX_CONTEXT_PARTITIONS,
     compile_pa_decode_ps_reduce,
@@ -51,14 +52,30 @@ def get_recommended_splits(
     num_sequences: int,
     num_kv_heads: int,
     split_kv_blocks: int = 1,
-    max_partitions: int = 8,
+    max_partitions: int | None = None,
+    *,
+    max_context_length: int | None = None,
 ) -> int:
-    """Choose a split count, with a caller-configurable upper clamp.
+    """Choose a split count before allocating partition scratch buffers.
 
-    The default of eight preserves the existing policy. Long-context callers
-    can opt into the FlyDSL reducer's larger domain with, for example,
-    ``max_partitions=256``.
+    Without a host-side ``max_context_length`` hint, retain the legacy policy
+    and default upper clamp of eight. With a hint, target two CTAs per CU,
+    capped by the number of 256-token compute tiles and the reducer's limit.
+    This lets small, long-context batches use more KV partitions without
+    multiplying the partition count by the number of physical pages per tile.
+    Short contexts and already large grids retain the legacy recommendation.
+
+    An explicit ``max_partitions`` remains an upper clamp in either mode.
+    The hint is a scheduling bound, not a replacement for the GPU-resident
+    per-sequence lengths; no tensor readback or planning kernel is needed.
+    Callers must allocate scratch for the returned count and pass that exact
+    count to ``pa_decode``. For heterogeneous lengths this still uses the same
+    partition count per sequence; it is not a variable-work scheduler.
     """
+    if max_context_length is not None and max_context_length < 0:
+        raise ValueError("max_context_length must be non-negative")
+    if max_partitions is None:
+        max_partitions = 8 if max_context_length is None else MAX_CONTEXT_PARTITIONS
     if not 4 <= max_partitions <= MAX_CONTEXT_PARTITIONS:
         raise ValueError(
             f"max_partitions must be in [4, {MAX_CONTEXT_PARTITIONS}], "
@@ -68,6 +85,16 @@ def get_recommended_splits(
     num_sm = props.multi_processor_count * 2
     denom = max(1, num_sequences * num_kv_heads * split_kv_blocks)
     n = ((num_sm + denom - 1) // denom) * split_kv_blocks
+    if max_context_length is not None:
+        legacy = max(4, min(n, 8))
+        # KV partitions consist of compute tiles, regardless of physical page
+        # size. Keep a short-context floor of eight to preserve the existing
+        # query-split launch and avoid perturbing already tuned small grids.
+        context_tiles = (max_context_length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+        work_limit = max(8, context_tiles)
+        sequence_heads = max(1, num_sequences * num_kv_heads)
+        occupancy_limit = (num_sm + sequence_heads - 1) // sequence_heads
+        n = max(legacy, min(work_limit, occupancy_limit))
     return max(4, min(n, max_partitions))
 
 
@@ -121,6 +148,7 @@ def launch_pa_decode_ps_reduce(
     head_size: int,
     context_partition_num: int,
     stream: torch.cuda.Stream,
+    reduce_info: torch.Tensor | None = None,
 ) -> None:
     if context_partition_num > MAX_CONTEXT_PARTITIONS:
         raise ImportError(
@@ -137,6 +165,7 @@ def launch_pa_decode_ps_reduce(
             output.dtype if sink_token is None else sink_token.dtype
         ),
         use_sinks=use_sinks,
+        use_work_plan=reduce_info is not None,
     )
     sink_ptr = (
         ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
@@ -165,6 +194,11 @@ def launch_pa_decode_ps_reduce(
         query_group_size,
         output.shape[0],
         output.shape[2],
+        (
+            ptr_arg(reduce_info, fx.Int32)
+            if reduce_info is not None
+            else flyc.from_c_void_p(fx.Int32, 0)
+        ),
         stream,
     )
 
@@ -191,6 +225,7 @@ def pa_decode(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     ps: bool = True,
+    work_plan: PADecodePlan | None = None,
 ) -> None:
     """FlyDSL paged-attention fp8 decode.
 
@@ -211,6 +246,12 @@ def pa_decode(
     that every block-table entry used by a sequence is a physical block index in
     ``[0, min(key_cache.shape[0], value_cache.shape[0]))`` -- a packed cache
     reaches V through a shifted view that spans fewer blocks than K.
+
+    ``work_plan`` opts into GPU-planned variable partition counts. Build or
+    refresh it with ``plan_pa_decode`` on the current stream after updating
+    lengths. Its ``max_partitions`` must equal ``max_context_partition_num``.
+    Planned scratch is packed as [KV heads, plan.capacity, query rows (, D)];
+    the static API's dense per-sequence scratch layout remains unchanged.
     """
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
@@ -507,6 +548,14 @@ def pa_decode(
             )
 
     num_partitions = max_context_partition_num
+    if work_plan is not None:
+        if not isinstance(work_plan, PADecodePlan):
+            raise TypeError("work_plan must be a PADecodePlan")
+        work_plan.validate(num_seqs, num_kv_heads, dev)
+        if work_plan.max_partitions != num_partitions:
+            raise ValueError(
+                "max_context_partition_num must match work_plan.max_partitions"
+            )
     pmax = max_logits
     psum = exp_sums
     pout = temporary_output
@@ -564,7 +613,8 @@ def pa_decode(
     # supported split counts (1, 2, 4) must divide query_length.
     query_splits = 1
     if (
-        arch == "gfx950"
+        work_plan is None
+        and arch == "gfx950"
         and per_token_kv
         and head_dim == 128
         and query.dtype == torch.bfloat16
@@ -593,15 +643,18 @@ def pa_decode(
             wide_kv_addressing=wide_kv_addressing,
             prefetch_v=prefetch_v,
             query_splits=query_splits,
+            use_work_plan=work_plan is not None,
         )
 
-    if num_partitions == 1:
+    if num_partitions == 1 and work_plan is None:
         # NP==1 writes output directly; partials unused (caller buffers ignored).
         dummy = torch.empty(1, dtype=torch.float32, device=dev)
         pmax = psum = pout = dummy
     else:
         total_rows = query_length * query_group_size
         expected_scalar_shape = (num_seqs, num_kv_heads, num_partitions, total_rows)
+        if work_plan is not None:
+            expected_scalar_shape = (num_kv_heads, work_plan.capacity, total_rows)
         if pmax is None or psum is None or pout is None:
             if pmax is None:
                 pmax = torch.empty(
@@ -682,9 +735,15 @@ def pa_decode(
             int(output.stride(1)),
             int(query.stride(0)),
             int(query.stride(1)),
+            (
+                ptr_arg(work_plan.work_info, fx.Int32)
+                if work_plan is not None
+                else flyc.from_c_void_p(fx.Int32, 0)
+            ),
+            work_plan.capacity if work_plan is not None else 0,
             s,
         )
-        if num_partitions > 1:
+        if num_partitions > 1 or work_plan is not None:
             output_5d = output.reshape(
                 num_seqs, query_length, num_kv_heads, query_group_size, head_dim
             )
@@ -698,16 +757,17 @@ def pa_decode(
                 output_5d.stride(1),
                 output_5d.stride(2),
                 output_5d.stride(3),
-                pmax.stride(0),
-                pmax.stride(1),
-                pmax.stride(2),
-                pout.stride(0),
-                pout.stride(1),
-                pout.stride(2),
-                pout.stride(3),
+                pmax.stride(0) if work_plan is None else 0,
+                pmax.stride(1) if work_plan is None else pmax.stride(0),
+                pmax.stride(2) if work_plan is None else pmax.stride(1),
+                pout.stride(0) if work_plan is None else 0,
+                pout.stride(1) if work_plan is None else pout.stride(0),
+                pout.stride(2) if work_plan is None else pout.stride(1),
+                pout.stride(3) if work_plan is None else pout.stride(2),
                 query_seq_len=query_length,
                 query_group_size=query_group_size,
                 head_size=head_dim,
                 context_partition_num=num_partitions,
                 stream=s,
+                reduce_info=work_plan.reduce_info if work_plan is not None else None,
             )

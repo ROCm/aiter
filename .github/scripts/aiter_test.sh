@@ -131,7 +131,7 @@ for file in "${sharded_files[@]}"; do
                 bash -c '
                     set -euo pipefail
                     test_file=$1
-                    python3 -m pytest -q "${test_file}::test_pa_decode"
+                    python3 -m pytest -q "$test_file"
                     python3 "$test_file"
                 '
                 _ "$file"
