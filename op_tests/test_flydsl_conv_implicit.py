@@ -339,6 +339,56 @@ KW_CASES = [
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
     ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
     ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
+    # Channels-last is the kernel's own layout, and the two sides are independent
+    # keywords, so each direction takes its own row: a channels-last input skips
+    # the pre-transpose, a channels-last output skips the split-K epilogue's
+    # transpose and, at n == 1 as here, gives up the vectorized store. torch has
+    # no such argument, hence the ref_kw.
+    (
+        "3d_in_ndhwc",
+        3,
+        _X3,
+        _W3,
+        {"padding": 1, "input_layout": "NDHWC"},
+        {"padding": 1},
+        False,
+    ),
+    (
+        "3d_out_ndhwc",
+        3,
+        _X3,
+        _W3,
+        {"padding": 1, "output_layout": "NDHWC"},
+        {"padding": 1},
+        False,
+    ),
+    (
+        "3d_ndhwc",
+        3,
+        _X3,
+        _W3,
+        {"padding": 1, "input_layout": "NDHWC", "output_layout": "NDHWC"},
+        {"padding": 1},
+        True,
+    ),
+    (
+        "2d_nhwc",
+        2,
+        _X2,
+        _W2,
+        {"padding": 1, "input_layout": "NHWC", "output_layout": "NHWC"},
+        {"padding": 1},
+        False,
+    ),
+    (
+        "1d_nwc",
+        1,
+        (1, 32, 128),
+        (64, 32, 3),
+        {"padding": 1, "input_layout": "NWC", "output_layout": "NWC"},
+        {"padding": 1},
+        False,
+    ),
     # The launch config is otherwise chosen by problem size, and every shape
     # above is small enough that _pick_tile lands on the narrowest tile, whose
     # single MFMA column block makes the epilogue's row/col mapping degenerate.
@@ -404,6 +454,23 @@ def _ref(x, w, bias, rank, padding_mode="zeros", padding=0, **kw):
     return out.to(dtype)
 
 
+_CHANNELS_LAST = {1: "NWC", 2: "NHWC", 3: "NDHWC"}
+
+
+def _channels_last(t, rank):
+    """(N,C,*spatial) -> a tensor that is really (N,*spatial,C) in memory.
+
+    The 1D/2D entries ``reshape`` their input up to 5D and the gather reads a flat
+    buffer, so a permuted view would not do -- it has to be materialized.
+    """
+    return t.permute(0, *range(2, rank + 2), 1).contiguous()
+
+
+def _channels_first(t, rank):
+    """(N,*spatial,C) -> (N,C,*spatial), to compare against the NCDHW reference."""
+    return t.permute(0, rank + 1, *range(1, rank + 1))
+
+
 def _roofline(x, w, ref):
     """The convolution's implicit-GEMM (M, N, K), and the FLOPs and bytes it implies.
 
@@ -431,13 +498,21 @@ def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=
     ref = _ref(x, w, b, rank, **(kw if ref_kw is None else ref_kw))
     m, n, k, flops, nbytes = _roofline(x, w, ref)
 
+    # The reference stays channels-first; only what the kernel is handed follows the
+    # swept layout, and a channels-last result is rotated back before the compare.
+    cl = _CHANNELS_LAST[rank]
+    xk = _channels_last(x, rank) if kw.get("input_layout") == cl else x
+    out_cl = kw.get("output_layout") == cl
+
     # Keyword surface, so torch is the reference only. The model-shape sweeps below
     # are where it also runs as a candidate, because there MIOpen is the baseline.
-    candidates = {"flydsl": lambda: flydsl_conv_implicit(x, w, b, **kw)}
+    candidates = {"flydsl": lambda: flydsl_conv_implicit(xk, w, b, **kw)}
 
     ret = {"gfx": get_gfx(), "M": m, "N": n, "K": k}
     for name, fn in candidates.items():
         out, us = run_perftest(fn, num_rotate_args=1)
+        if out_cl:
+            out = _channels_first(out, rank)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
