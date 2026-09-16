@@ -33,7 +33,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 
@@ -45,7 +45,7 @@ def buffer_atomic_add(vdata, rsrc, offset, soffset, aux):
     the vendored ``buffer_ops`` / ``vector`` modules. Operates on a buffer
     resource plus byte offset, not an ``!llvm.ptr``.
     """
-    return rocdl.raw_ptr_buffer_atomic_fadd(vdata, rsrc, offset, soffset, aux)
+    return fx.rocdl.raw_ptr_buffer_atomic_fadd(vdata, rsrc, offset, soffset, aux)
 
 
 TILE_K = 32
@@ -296,8 +296,8 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             v = fx.memref_load_vec(tr_reg)
             lds_store_vec8(rc * _TR_LDS_S + sv, v)
 
-        rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.s_barrier()
+        fx.rocdl.s_waitcnt(lgkmcnt=0)
+        fx.rocdl.s_barrier()
 
         for i in range_constexpr(_TR_ITERS):
             lin = tid + i * TR_THREADS
@@ -599,15 +599,15 @@ def compile_conv3d_implicit(
 
         tid = fx.Int32(gpu.thread_id("x"))
         if const_expr(m_chunks > 1):
-            m_chunk = fx.Int64(fx.Int32(gpu.block_id("z"))) % fx.Int64(m_chunks)
+            m_chunk = fx.Int64(gpu.block_id("z")) % fx.Int64(m_chunks)
             m_offset = (
-                fx.Int64(fx.Int32(gpu.block_id("x"))) + m_chunk * fx.Int64(grid_x)
+                fx.Int64(gpu.block_id("x")) + m_chunk * fx.Int64(grid_x)
             ) * TILE_M
             n_tile = fx.Int32(gpu.block_id("y"))
         elif const_expr(WGM > 1):
-            pid = fx.Int64(fx.Int32(gpu.block_id("x"))) + fx.Int64(
-                fx.Int32(gpu.block_id("y"))
-            ) * fx.Int64(grid_m)
+            pid = fx.Int64(gpu.block_id("x")) + fx.Int64(gpu.block_id("y")) * fx.Int64(
+                grid_m
+            )
             blocks_per_swizzle = fx.Int64(WGM * grid_n)
             swizzle_id = pid // blocks_per_swizzle
             first_m = swizzle_id * fx.Int64(WGM)
@@ -629,9 +629,9 @@ def compile_conv3d_implicit(
             n_local = n_offset
         if const_expr(use_splitk):
             if const_expr(m_chunks > 1):
-                split_idx = fx.Int64(fx.Int32(gpu.block_id("z"))) // fx.Int64(m_chunks)
+                split_idx = fx.Int64(gpu.block_id("z")) // fx.Int64(m_chunks)
             else:
-                split_idx = fx.Int64(fx.Int32(gpu.block_id("z")))
+                split_idx = fx.Int64(gpu.block_id("z"))
             k_off = split_idx * (tiles_per_split * TILE_K)
         else:
             k_off = 0
@@ -701,8 +701,8 @@ def compile_conv3d_implicit(
         )
 
         def barrier(vmcnt=0, lgkmcnt=None):
-            rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
-            rocdl.s_barrier()
+            fx.rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
+            fx.rocdl.s_barrier()
 
         def in_range(v, hi):
             return (v >= 0) & (v < fx.Int64(hi))
@@ -858,7 +858,7 @@ def compile_conv3d_implicit(
         )
 
         def sgpr(x):
-            return fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(x)))
+            return fx.Int64(fx.rocdl.readfirstlane(T.i64, fx.Int64(x)))
 
         _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), DMA_BYTES * 8)
 
@@ -912,18 +912,18 @@ def compile_conv3d_implicit(
             sA = stage_a(stage)
             frag_A = thr_mma.make_fragment_A(sA)
             fx.copy(lds_copy, thr_copy_A.partition_S(sA), thr_copy_A.retile(frag_A))
-            rocdl.sched_dsrd(MI_M)
+            fx.rocdl.sched_dsrd(MI_M)
             return frag_A
 
         def read_b_frags(stage):
             sB = stage_b(stage)
             frag_B = thr_mma.make_fragment_B(sB)
             fx.copy(lds_copy, thr_copy_B.partition_S(sB), thr_copy_B.retile(frag_B))
-            rocdl.sched_dsrd(MI_N)
+            fx.rocdl.sched_dsrd(MI_N)
             return frag_B
 
         def do_compute(acc_values, a_frag_values, b_frag_values):
-            rocdl.s_setprio(1)
+            fx.rocdl.s_setprio(1)
             fx.gemm(
                 tiled_mma,
                 acc_values,
@@ -931,8 +931,8 @@ def compile_conv3d_implicit(
                 b_frag_values,
                 acc_values,
             )
-            rocdl.sched_mfma(MI_M * MI_N)
-            rocdl.s_setprio(0)
+            fx.rocdl.sched_mfma(MI_M * MI_N)
+            fx.rocdl.s_setprio(0)
             return acc_values
 
         PREFETCH = TILES_PER_BARRIER
@@ -957,7 +957,7 @@ def compile_conv3d_implicit(
                     _load_b(nxt % PIPE_STAGES, k_off + nxt * TILE_K)
                     issued += LDG_A_COUNT + LDG_B_COUNT
             if const_expr(issued):
-                rocdl.sched_vmem(issued)
+                fx.rocdl.sched_vmem(issued)
             for j in range_constexpr(len(batch)):
                 acc = do_compute(acc, a_frags[j], b_frags[j])
 
