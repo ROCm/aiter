@@ -4,8 +4,8 @@
 """FlyDSL QSA public surface (SILOTIGER-1047).
 
 Phase 0: fp32 oracle + shared family A/B shapes.
-Phase 1a: family A paged caches + block tables. K1/K2 and live-vLLM columns
-are not implemented yet -- do not import a kernel launcher from this module.
+Phase 2a: family A FlyDSL K1 writes ``block_ids [M, 512]`` from paged
+compressed K (no score matrix). Expand+tail and K2 are still separate.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
 
@@ -40,6 +40,7 @@ from .kernels.qsa import (
     qsa_topk_blocks,
     qsa_visible_blocks,
 )
+from .kernels.qsa.k1_family_a import qsa_k1_family_a_block_ids
 
 __all__ = [
     "FAMILY_A_GQA",
@@ -56,6 +57,7 @@ __all__ = [
     "pack_paged_cache",
     "qsa_expand_tail",
     "qsa_indexer_scores",
+    "qsa_k1_family_a_block_ids",
     "qsa_oracle",
     "qsa_sparse_gqa",
     "qsa_topk_blocks",
