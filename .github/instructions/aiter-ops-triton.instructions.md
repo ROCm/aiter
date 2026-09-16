@@ -212,6 +212,28 @@ values for either backend live in JSON, never in Python. Flag:
   that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
   fallback is the one documented exception and it goes through the `arch=`
   override, not through a probe.
+- A raw config list handed to `@triton.autotune`. Route it through
+  `autotune_configs` from `aiter.ops.triton.utils.tuned_config_utils`:
+
+  ```python
+  @triton.autotune(
+      configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+      key=[...],
+  )
+  ```
+
+  That returns every candidate only while `<FAMILY>_TRITON_AUTOTUNE=1`, and a
+  single config otherwise, so nothing benchmarks at launch. A raw list searches
+  on every new key: it costs compile time, breaks CUDA-graph capture, and leaves
+  a unit test's numerics dependent on whichever config the timing happened to
+  pick that run. Pass `default_config=` when the list's first entry is not the
+  one to pin.
+
+  Two exemptions, both already equivalent: `flash_attn_triton_amd/` is a
+  vendored port gated by `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE`, and
+  `chunk_delta_attn`'s `_K2_CONFIGS` comes from
+  `chunk_delta_attn_tuned_config_shortlist` under
+  `CHUNK_DELTA_ATTN_TRITON_AUTOTUNE`. Anything new follows the rule above.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 
