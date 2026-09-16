@@ -331,14 +331,17 @@ keeps prefill 8k/32k ~89/352µs vs HIP ~83/250. Keep `m > _SPLITS` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`, kernel-trace
 stats, raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}`). Mean µs, 35 launches
-(warmup+iters). FlyDSL K1 is split+merge; HIP select is MQA + radix
-top-k + expand (+ a ~3.5µs copy). The leftover vs HIP is the **split**
-kernel (score + per-tile sort), not the live-heap tree:
+(warmup+iters). Re-traced after split K-reuse. FlyDSL K1 is split+merge;
+HIP select is MQA + radix top-k + expand (+ a ~3.2µs copy). Event-us
+under rocprof is inflated; these are kernel means. Split dropped
+~16.9/34.1µs→~13.6/27.6µs; merge is unchanged (~9.9/19.0 vs HIP radix
+~8.2/10.2). The leftover vs HIP is still the **split** kernel (score +
+per-tile sort), not the live-heap tree:
 
 | L | flydsl split | flydsl merge | HIP MQA | HIP radix top-k | HIP expand |
 |--:|-------------:|-------------:|--------:|----------------:|-----------:|
-| 8192 | 16.9 | 10.2 | 3.8 | 8.4 | 3.0 |
-| 32768 | 34.1 | 19.1 | 4.0 | 10.2 | 2.7 |
+| 8192 | 13.6 | 9.9 | 3.3 | 8.2 | 2.4 |
+| 32768 | 27.6 | 19.0 | 3.3 | 10.2 | 2.3 |
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|

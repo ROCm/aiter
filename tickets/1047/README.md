@@ -271,13 +271,15 @@ score matrix.
 prefill 8k/32k ~89/352µs vs HIP ~83/250. Keep `m > _SPLITS` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`). Mean kernel µs
-(35 launches). Raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}` (not in git). The
-gap vs HIP is **split** (score + tile sort), not the live-heap merge:
+(35 launches), re-traced after split K-reuse. Raw CSV in
+`/tmp/qsa_k1_rocprof_{8k,32k}` (not in git). Split dropped
+~16.9/34.1µs→~13.6/27.6µs; merge is unchanged. The gap vs HIP is still
+**split** (score + tile sort), not the live-heap merge:
 
 | L | flydsl split | flydsl merge | HIP MQA | HIP radix top-k | HIP expand |
 |--:|-------------:|-------------:|--------:|----------------:|-----------:|
-| 8192 | 16.9 | 10.2 | 3.8 | 8.4 | 3.0 |
-| 32768 | 34.1 | 19.1 | 4.0 | 10.2 | 2.7 |
+| 8192 | 13.6 | 9.9 | 3.3 | 8.2 | 2.4 |
+| 32768 | 27.6 | 19.0 | 3.3 | 10.2 | 2.3 |
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
