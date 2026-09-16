@@ -531,8 +531,8 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
 
     2d: eight waves per row, one column per thread per tile. Decode and
     prefill share one instantiation. Expand is not fused. Short rows emit
-    ids; mid-length rows stream tiles in one workgroup; longer rows split
-    columns across eight workgroups and merge local heaps (no score matrix).
+    ids; longer rows sort each 512-slot tile and merge it into a running
+    top-512 (decode long-L also splits columns; no score matrix).
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")

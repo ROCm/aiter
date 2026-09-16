@@ -8,9 +8,10 @@ complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
 
 When ``visible <= 512`` the selected set is every complete block: one
-workgroup per row writes those ids. Page tables of at most eight 512-slot
-tiles stream in one workgroup. Wider tables split columns across eight
-workgroups, each keeping a local top-512, then merge the heaps.
+workgroup per row writes those ids. Otherwise each new 512-slot tile is
+sorted on its own and bitonic-merged into a sorted running top-512. Page
+tables of at most eight tiles stream in one workgroup; wider decode rows
+split columns across eight workgroups and merge those heaps.
 """
 
 from functools import lru_cache
@@ -35,11 +36,12 @@ _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
 _VEC = 8
 _Q_THREADS = _H * (_D // _VEC)
-_BITONIC_STAGES = tuple(
+_TILE_STAGES = tuple(
     (span, stride)
-    for span in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+    for span in (2, 4, 8, 16, 32, 64, 128, 256, 512)
     for stride in tuple(1 << shift for shift in range(span.bit_length() - 2, -1, -1))
 )
+_PAIR_MERGE_STRIDES = tuple(1 << shift for shift in range(_K.bit_length() - 1, -1, -1))
 _MERGE_STAGES = tuple(
     (span, stride)
     for span in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
@@ -76,7 +78,7 @@ def build_qsa_k1_family_a_serial(page_size: int):
     @flyc.kernel(
         name="qsa_k1_family_a_serial_"
         + kernel_signature(
-            ps=page_size, tile=_TILE, k=_K, h=_H, d=_D, blk=_BLOCK_THREADS
+            ps=page_size, tile=_TILE, k=_K, h=_H, d=_D, blk=_BLOCK_THREADS, pair=1
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
@@ -180,16 +182,18 @@ def build_qsa_k1_family_a_serial(page_size: int):
                         cand_s[candidate] = _neg_inf()
                         cand_c[candidate] = neg_one
                 gpu.barrier()
-                for span, stride in _BITONIC_STAGES:
-                    for t in range_constexpr(candidate_steps):
-                        j = tid + Int32(t * _BLOCK_THREADS)
-                        peer = j ^ Int32(stride)
-                        if j < peer:
+                for span, stride in _TILE_STAGES:
+                    for t in range_constexpr(tile_steps):
+                        local = tid + Int32(t * _BLOCK_THREADS)
+                        peer_local = local ^ Int32(stride)
+                        if local < peer_local:
+                            j = Int32(_K) + local
+                            peer = Int32(_K) + peer_local
                             s0 = cand_s[j]
                             c0 = cand_c[j]
                             s1 = cand_s[peer]
                             c1 = cand_c[peer]
-                            best_first = (j & Int32(span)) == zero
+                            best_first = (local & Int32(span)) == zero
                             swap = best_first.select(
                                 better(s1, c1, s0, c0),
                                 better(s0, c0, s1, c1),
@@ -199,6 +203,42 @@ def build_qsa_k1_family_a_serial(page_size: int):
                             cand_s[peer] = swap.select(s0, s1)
                             cand_c[peer] = swap.select(c0, c1)
                     gpu.barrier()
+                if tile == zero:
+                    for t in range_constexpr(tile_steps):
+                        local = tid + Int32(t * _BLOCK_THREADS)
+                        cand_s[local] = cand_s[Int32(_K) + local]
+                        cand_c[local] = cand_c[Int32(_K) + local]
+                else:
+                    for t in range_constexpr(tile_steps):
+                        local = tid + Int32(t * _BLOCK_THREADS)
+                        if local < Int32(_K // 2):
+                            a = Int32(_K) + local
+                            b = Int32(_CANDIDATES - 1) - local
+                            sa = cand_s[a]
+                            ca = cand_c[a]
+                            sb = cand_s[b]
+                            cb = cand_c[b]
+                            cand_s[a] = sb
+                            cand_c[a] = cb
+                            cand_s[b] = sa
+                            cand_c[b] = ca
+                    gpu.barrier()
+                    for stride in _PAIR_MERGE_STRIDES:
+                        for t in range_constexpr(candidate_steps):
+                            j = tid + Int32(t * _BLOCK_THREADS)
+                            peer = j ^ Int32(stride)
+                            if j < peer:
+                                s0 = cand_s[j]
+                                c0 = cand_c[j]
+                                s1 = cand_s[peer]
+                                c1 = cand_c[peer]
+                                swap = better(s1, c1, s0, c0)
+                                cand_s[j] = swap.select(s1, s0)
+                                cand_c[j] = swap.select(c1, c0)
+                                cand_s[peer] = swap.select(s0, s1)
+                                cand_c[peer] = swap.select(c0, c1)
+                        gpu.barrier()
+                gpu.barrier()
             for t in range_constexpr(tile_steps):
                 j = tid + Int32(t * _BLOCK_THREADS)
                 block_ids[row, j] = cand_c[j]
@@ -263,6 +303,7 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         d=_D,
         blk=_BLOCK_THREADS,
         spl=_SPLITS,
+        pair=1,
     )
 
     @fx.struct
@@ -389,16 +430,18 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                         cand_s[candidate] = _neg_inf()
                         cand_c[candidate] = neg_one
                 gpu.barrier()
-                for span, stride in _BITONIC_STAGES:
-                    for t in range_constexpr(candidate_steps):
-                        j = tid + Int32(t * _BLOCK_THREADS)
-                        peer = j ^ Int32(stride)
-                        if j < peer:
+                for span, stride in _TILE_STAGES:
+                    for t in range_constexpr(tile_steps):
+                        local = tid + Int32(t * _BLOCK_THREADS)
+                        peer_local = local ^ Int32(stride)
+                        if local < peer_local:
+                            j = Int32(_K) + local
+                            peer = Int32(_K) + peer_local
                             s0 = cand_s[j]
                             c0 = cand_c[j]
                             s1 = cand_s[peer]
                             c1 = cand_c[peer]
-                            best_first = (j & Int32(span)) == zero
+                            best_first = (local & Int32(span)) == zero
                             swap = best_first.select(
                                 better(s1, c1, s0, c0),
                                 better(s0, c0, s1, c1),
@@ -408,6 +451,42 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
                             cand_s[peer] = swap.select(s0, s1)
                             cand_c[peer] = swap.select(c0, c1)
                     gpu.barrier()
+                if tile == start:
+                    for t in range_constexpr(tile_steps):
+                        local = tid + Int32(t * _BLOCK_THREADS)
+                        cand_s[local] = cand_s[Int32(_K) + local]
+                        cand_c[local] = cand_c[Int32(_K) + local]
+                else:
+                    for t in range_constexpr(tile_steps):
+                        local = tid + Int32(t * _BLOCK_THREADS)
+                        if local < Int32(_K // 2):
+                            a = Int32(_K) + local
+                            b = Int32(_CANDIDATES - 1) - local
+                            sa = cand_s[a]
+                            ca = cand_c[a]
+                            sb = cand_s[b]
+                            cb = cand_c[b]
+                            cand_s[a] = sb
+                            cand_c[a] = cb
+                            cand_s[b] = sa
+                            cand_c[b] = ca
+                    gpu.barrier()
+                    for stride in _PAIR_MERGE_STRIDES:
+                        for t in range_constexpr(candidate_steps):
+                            j = tid + Int32(t * _BLOCK_THREADS)
+                            peer = j ^ Int32(stride)
+                            if j < peer:
+                                s0 = cand_s[j]
+                                c0 = cand_c[j]
+                                s1 = cand_s[peer]
+                                c1 = cand_c[peer]
+                                swap = better(s1, c1, s0, c0)
+                                cand_s[j] = swap.select(s1, s0)
+                                cand_c[j] = swap.select(c1, c0)
+                                cand_s[peer] = swap.select(s0, s1)
+                                cand_c[peer] = swap.select(c0, c1)
+                        gpu.barrier()
+                gpu.barrier()
 
             for t in range_constexpr(tile_steps):
                 j = tid + Int32(t * _BLOCK_THREADS)
@@ -588,9 +667,10 @@ def qsa_k1_family_a_block_ids(
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Short rows emit complete-block ids. Mid-length and prefill rows stream
-    tiles in one workgroup per row. Decode-shaped long rows split columns
-    across eight workgroups and merge local heaps. Does not allocate a
-    score matrix. Expand+tail is still a separate launch.
+    tiles in one workgroup per row, sorting each new tile and merging it
+    into a running top-512. Decode-shaped long rows split columns across
+    eight workgroups and merge local heaps. Does not allocate a score
+    matrix. Expand+tail is still a separate launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
