@@ -100,7 +100,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_kvcache.py]=78
     FILE_TIMES[op_tests/test_flydsl_gdr_mtp.py]=73
     FILE_TIMES[op_tests/test_mhc.py]=65
-    FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=64
+    FILE_TIMES[op_tests/_infra/test_jit_dir_with_enum.py]=64
     FILE_TIMES[op_tests/test_topk_plain.py]=63
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=61
     FILE_TIMES[op_tests/test_flydsl_compress_attn.py]=58
@@ -183,8 +183,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fmha_fwd_with_sink_varlen_asm.py]=4
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=4
     FILE_TIMES[op_tests/test_gemm_a8w8_bpreshuffle_pad_k.py]=4
-    FILE_TIMES[op_tests/test_gemm_codegen.py]=4
-    FILE_TIMES[op_tests/test_jit_arch_guard.py]=4
+    FILE_TIMES[op_tests/_infra/test_gemm_codegen.py]=4
+    FILE_TIMES[op_tests/_infra/test_jit_arch_guard.py]=4
     FILE_TIMES[op_tests/test_layernorm2d.py]=4
     FILE_TIMES[op_tests/test_mha_flydsl.py]=4
     FILE_TIMES[op_tests/test_mha_fp8.py]=4
@@ -202,7 +202,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_split_gdr_update.py]=4
     FILE_TIMES[op_tests/test_topk_softmax.py]=4
     FILE_TIMES[op_tests/test_vsa_sparse_attention.py]=4
-    FILE_TIMES[op_tests/test_pretune.py]=1
+    FILE_TIMES[op_tests/_infra/test_pretune.py]=1
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     echo "Triton test files:"
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_v3.py]=1358
