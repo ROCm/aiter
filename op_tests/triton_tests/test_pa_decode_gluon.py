@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import contextlib
 import hashlib
+import os
 import random
 import sys
 
@@ -37,7 +39,6 @@ TEST_NAME = "main.normal_accuracy_performance.jit"
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
 
-torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 # Global configuration
@@ -1889,6 +1890,25 @@ def run_multi_pa_gluon_test(
     return pd.DataFrame(results)
 
 
+@contextlib.contextmanager
+def _preserved_default_device():
+    """Put torch's default device back on the way out.
+
+    run_single_pa_gluon_test() calls torch.set_default_device() per case and
+    never restores it. Without the finally, a raised exception -- or the
+    assert at the end of a failing run -- would leave every later test in the
+    same pytest shard running with a mutated global.
+
+    This only preserves; it does not select a device, so nothing here forces
+    CUDA the way the old module-scope torch.set_default_device("cuda") did.
+    """
+    prev_device = torch.get_default_device()
+    try:
+        yield
+    finally:
+        torch.set_default_device(prev_device)
+
+
 def parse_arg_and_run_test(sample_rate0: float | None = None):
     """Parse arguments and run tests."""
     logger.info("Triton location: %s", triton)
@@ -1924,29 +1944,32 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     else:
         sample_rate = sample_rate0
 
-    results_df = run_multi_pa_gluon_test(
-        block_sizes,
-        head_configs,
-        context_lengths,
-        batch_sizes,
-        head_sizes,
-        query_lengths,
-        quant_mode,
-        trans_v,
-        kv_varlen,
-        compute_types_quant_q_and_kv,
-        use_torch_flash_ref_options,
-        context_partition_size_options,
-        sample_rate,
-        sinks_options,
-        sliding_window_options,
-        ps_options,
-    )
+    with _preserved_default_device():
+        results_df = run_multi_pa_gluon_test(
+            block_sizes,
+            head_configs,
+            context_lengths,
+            batch_sizes,
+            head_sizes,
+            query_lengths,
+            quant_mode,
+            trans_v,
+            kv_varlen,
+            compute_types_quant_q_and_kv,
+            use_torch_flash_ref_options,
+            context_partition_size_options,
+            sample_rate,
+            sinks_options,
+            sliding_window_options,
+            ps_options,
+        )
 
+    # Unit tests only check pass/fail; only a CLI run keeps the CSV report.
+    write_output_file = "PYTEST_CURRENT_TEST" not in os.environ
     output_file = f"run_pa_gluon_test.{TEST_NAME}.block_size_{block_sizes[0]}.triton.{TRITON_VERSION}.csv"
-    results_df.to_csv(output_file, index=False)
-
-    logger.info("\nResults saved to %s", output_file)
+    if write_output_file:
+        results_df.to_csv(output_file, index=False)
+        logger.info("\nResults saved to %s", output_file)
     logger.info("\nSummary:\n%s", results_df)
 
     # Print mean of selected columns grouped by compute_type
@@ -2034,7 +2057,10 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
             "\nTests failed! %d test case(s) exceeded the error threshold. ",
             total_errors,
         )
-        logger.warning("Please check rows with non-zero err_gluon in %s.", output_file)
+        if write_output_file:
+            logger.warning(
+                "Please check rows with non-zero err_gluon in %s.", output_file
+            )
         assert False, f"{total_errors} test case(s) exceeded the error threshold"
     else:
         logger.info("\nAll tests passed!")
