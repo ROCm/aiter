@@ -13,7 +13,12 @@ import sys
 import pytest
 import torch
 
-from aiter.benchmark_data_init import fill
+from aiter.benchmark_data_init import (
+    DATA_DISTS,
+    add_data_init_args,
+    fill,
+    make_generator,
+)
 
 # Skip on unsupported arch via the same probe opus uses at import time.
 from aiter.ops.opus._arch import _detect_arch, _device_arch_and_cu
@@ -33,8 +38,14 @@ def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
     return torch.bmm(A.float(), B.float().transpose(-1, -2)).to(out_dtype)
 
 
+# Keep the benchmark's public initialization choices available to external
+# power/debug scripts. A16W16 has no scale tensor, so scale initialization is
+# accepted by the shared CLI for compatibility but is not consumed here.
+DATA_INITS = DATA_DISTS
+
+
 def _make_tensor(shape, dist="norm", gen=None, const_val=1.0):
-    """Build one reproducible BF16 operand for the benchmark paths."""
+    """Build a reproducible BF16 operand under the requested distribution."""
     return fill(
         shape,
         dist,
@@ -44,6 +55,18 @@ def _make_tensor(shape, dist="norm", gen=None, const_val=1.0):
         uniform=(-1.0, 1.0),
         constant=const_val,
     )
+
+
+def _make_a(
+    batch: int,
+    M: int,
+    K: int,
+    dist: str = "norm",
+    gen=None,
+    const_val: float = 1.0,
+) -> torch.Tensor:
+    """Build batch-first activations under the requested distribution."""
+    return _make_tensor((batch, M, K), dist, gen, const_val)
 
 
 def _make_b(
@@ -123,9 +146,12 @@ def run_a16w16_case(
     split_k: int = 0,
     out_dtype=torch.bfloat16,
     use_graph: bool = False,
+    dist: str = "norm",
+    gen=None,
+    const_val: float = 1.0,
 ):
-    A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-    B = _make_b(batch, N, K)
+    A = _make_a(batch, M, K, dist, gen, const_val)
+    B = _make_b(batch, N, K, dist, gen, const_val)
     Y = torch.empty((batch, M, N), device="cuda", dtype=out_dtype)
 
     ref = _torch_ref(A, B, out_dtype)
@@ -193,6 +219,9 @@ def run_a16w16_csv_sweep(
     split_k: int = 0,
     out_dtype=torch.bfloat16,
     use_graph: bool = False,
+    dist: str = "norm",
+    gen=None,
+    const_val: float = 1.0,
 ):
     shapes = load_shapes_from_csv(csv_path, default_kid=kid, default_split_k=split_k)
     return _run_a16w16_sweep(
@@ -201,6 +230,9 @@ def run_a16w16_csv_sweep(
         batch=batch,
         out_dtype=out_dtype,
         use_graph=use_graph,
+        dist=dist,
+        gen=gen,
+        const_val=const_val,
     )
 
 
@@ -211,6 +243,9 @@ def _run_a16w16_sweep(
     batch: int,
     out_dtype: torch.dtype,
     use_graph: bool,
+    dist: str,
+    gen,
+    const_val: float,
 ):
     print(f"\n{'=' * 80}")
     mode = "graph" if use_graph else "eager"
@@ -226,8 +261,8 @@ def _run_a16w16_sweep(
             f"kid={row_kid} split_k={row_split_k}"
         )
         try:
-            A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-            B = _make_b(batch, N, K)
+            A = _make_a(batch, M, K, dist, gen, const_val)
+            B = _make_b(batch, N, K, dist, gen, const_val)
             Y = torch.empty((batch, M, N), device="cuda", dtype=out_dtype)
             ref = _torch_ref(A, B, out_dtype)
             Y, us = _run_exact_a16w16(
@@ -931,9 +966,23 @@ if __name__ == "__main__":
         action="store_true",
         help="Use CUDA-graph mode for the single-shape / --csv_file paths too.",
     )
+    add_data_init_args(parser, default_dist="norm")
+    parser.add_argument(
+        "--const-val",
+        type=float,
+        default=1.0,
+        help="Fill value used by --data-init constant (default: 1.0).",
+    )
     args = parser.parse_args()
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+    if len(args.data_init) != 1:
+        parser.error("--data-init accepts exactly one distribution")
+    init_kwargs = {
+        "dist": args.data_init[0],
+        "gen": make_generator(args.seed),
+        "const_val": args.const_val,
+    }
     if args.csv_file is not None and args.m is not None:
         parser.error("--csv_file cannot be combined with -m")
 
@@ -945,6 +994,7 @@ if __name__ == "__main__":
             split_k=args.split_k,
             out_dtype=out_dtype,
             use_graph=args.graph,
+            **init_kwargs,
         )
         sys.exit(0 if ok else 1)
     else:
@@ -963,4 +1013,5 @@ if __name__ == "__main__":
             split_k=args.split_k,
             out_dtype=out_dtype,
             use_graph=args.graph,
+            **init_kwargs,
         )
