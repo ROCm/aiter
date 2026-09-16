@@ -20,12 +20,12 @@ from aiter.ops.triton.moe.quant_moe import (
     downcast_to_mxfp,
     downcast_to_static_fp8,
     downcast_to_static_fp8_3d,
-    upcast_from_mxfp,
 )
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 # ---------------
 # initialize data

@@ -278,15 +278,14 @@ class OpusGemmInstance:
             # they differ ONLY in device_flags, co_variant separates them.
             parts.insert(
                 tag_at,
-                (
-                    "4wave_wl_co"
-                    if self.kernel_tag == "a16w16_4wave_wl_co"
-                    else "4wave_co"
-                ),
+                {
+                    "a16w16_4wave_wl_co": "4wave_wl_co",
+                    "a16w16_4wave_wlr_co": "4wave_wlr_co",
+                }.get(self.kernel_tag, "4wave_co"),
             )
-            # Wave layout only shows up for the family that can vary it, so the
+            # Wave layout only shows up for the families that can vary it, so the
             # 4wave_co names already on disk are untouched.
-            if self.kernel_tag == "a16w16_4wave_wl_co":
+            if self.kernel_tag in ("a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"):
                 parts.append(f"w{self.co_wave_layout[0]}x{self.co_wave_layout[1]}")
             parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
             parts.append(f"p{self.num_slots}")
@@ -1641,9 +1640,10 @@ CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.
 # here is rejected outright rather than landing on some other family's kids.
 _CO_KID_BANDS = {
     "a16w16_4wave_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
-    # Same band: kids are explicit in the JSON, so the two co families just
+    # Same band: kids are explicit in the JSON, so the co families just
     # continue the numbering rather than each reserving a sub-range.
     "a16w16_4wave_wl_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
+    "a16w16_4wave_wlr_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
 }
 
 
