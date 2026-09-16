@@ -33,7 +33,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 
@@ -123,7 +123,6 @@ def _pad_channels(c):
     return (c + LDG_VEC - 1) // LDG_VEC * LDG_VEC
 
 
-# Layout names accepted per spatial rank.
 LAYOUTS = {
     3: ("NCDHW", "NDHWC"),
     2: ("NCHW", "NHWC"),
@@ -229,10 +228,10 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
         class BF16Ty:
             ir_type = elem_ty.ir_type
 
-        tid = fx.thread_idx.x
-        s0 = fx.block_idx.x * TR_TILE
-        c0 = fx.block_idx.y * TR_TILE
-        nb = fx.block_idx.z
+        tid = fx.Int32(gpu.thread_id("x"))
+        s0 = fx.Int32(gpu.block_id("x")) * TR_TILE
+        c0 = fx.Int32(gpu.block_id("y")) * TR_TILE
+        nb = fx.Int32(gpu.block_id("z"))
         if const_expr(BIG):
             # Rebase onto this block's tile origin so the per-tile offsets stay in i32.
             GPtrTy = fx.PointerType.get(
@@ -396,7 +395,6 @@ def compile_conv3d_implicit(
 ):
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
-    # Per-wave MFMA grid (flat acc[mi * MI_N + ni]); WARP_M/N is the per-wave tile span.
     MI_M = TILE_M // WAVE_M // MFMA_M
     MI_N = TILE_N // WAVE_N // MFMA_N
     WARP_M = MI_M * MFMA_M
@@ -597,13 +595,17 @@ def compile_conv3d_implicit(
         a_lds = lds.a
         b_lds = lds.b
 
-        tid = fx.thread_idx.x
+        tid = fx.Int32(gpu.thread_id("x"))
         if const_expr(m_chunks > 1):
-            m_chunk = fx.Int64(fx.block_idx.z) % fx.Int64(m_chunks)
-            m_offset = (fx.Int64(fx.block_idx.x) + m_chunk * fx.Int64(grid_x)) * TILE_M
-            n_tile = fx.block_idx.y
+            m_chunk = fx.Int64(fx.Int32(gpu.block_id("z"))) % fx.Int64(m_chunks)
+            m_offset = (
+                fx.Int64(fx.Int32(gpu.block_id("x"))) + m_chunk * fx.Int64(grid_x)
+            ) * TILE_M
+            n_tile = fx.Int32(gpu.block_id("y"))
         elif const_expr(WGM > 1):
-            pid = fx.Int64(fx.block_idx.x) + fx.Int64(fx.block_idx.y) * fx.Int64(grid_m)
+            pid = fx.Int64(fx.Int32(gpu.block_id("x"))) + fx.Int64(
+                fx.Int32(gpu.block_id("y"))
+            ) * fx.Int64(grid_m)
             blocks_per_swizzle = fx.Int64(WGM * grid_n)
             swizzle_id = pid // blocks_per_swizzle
             first_m = swizzle_id * fx.Int64(WGM)
@@ -612,8 +614,8 @@ def compile_conv3d_implicit(
             m_offset = fx.Int64(first_m + (local % swizzle_rows)) * TILE_M
             n_tile = fx.Int64(local // swizzle_rows)
         else:
-            m_offset = fx.block_idx.x * TILE_M
-            n_tile = fx.block_idx.y
+            m_offset = fx.Int32(gpu.block_id("x")) * TILE_M
+            n_tile = fx.Int32(gpu.block_id("y"))
 
         if const_expr(groups > 1):
             gi = n_tile // tiles_per_group
@@ -625,9 +627,9 @@ def compile_conv3d_implicit(
             n_local = n_offset
         if const_expr(use_splitk):
             if const_expr(m_chunks > 1):
-                split_idx = fx.Int64(fx.block_idx.z) // fx.Int64(m_chunks)
+                split_idx = fx.Int64(fx.Int32(gpu.block_id("z"))) // fx.Int64(m_chunks)
             else:
-                split_idx = fx.Int64(fx.block_idx.z)
+                split_idx = fx.Int64(fx.Int32(gpu.block_id("z")))
             k_off = split_idx * (tiles_per_split * TILE_K)
         else:
             k_off = 0
@@ -728,8 +730,7 @@ def compile_conv3d_implicit(
                     base = base & m
             return base
 
-        # ---- Per-thread row decomposition (loop-invariant across K) ----
-        _row_dec = []  # per-i tuple of precomputed row terms
+        _row_dec = []
         for i in range_constexpr(LDG_A_COUNT):
             linear = (tid + i * BLOCK_THREADS) * LDG_VEC
             local_m = linear // TILE_K
@@ -759,7 +760,6 @@ def compile_conv3d_implicit(
 
         SCALAR_K = CGP % TILE_K == 0
 
-        # ---- 3D im2col address math ----
         # The K axis decomposes against CGP (per-group channels) while every g_off below
         # keeps `c` (padded total channels) as the NDHWC row stride. `cc` is the absolute
         # input channel: the group base plus the offset within the group.
@@ -838,7 +838,6 @@ def compile_conv3d_implicit(
             )
             return g_off, col_valid
 
-        # ---- global -> LDS DMA copy, masking via OOB routing ----
         DMA_BYTES = LDG_VEC * BF16_BYTES  # 16
         OOB_ELEM = fx.Int32(OOB_SENTINEL_ELEM)
 
@@ -847,7 +846,6 @@ def compile_conv3d_implicit(
         )
 
         def sgpr(x):
-            # Hoist a wave-uniform value into an SGPR (readfirstlane).
             return fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(x)))
 
         _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), DMA_BYTES * 8)
@@ -898,7 +896,6 @@ def compile_conv3d_implicit(
                     voff = g_off
                 _dma_to_lds(w_src, _lds_dma_ptr(b_lds, stage_tile, i), voff)
 
-        # ---- tiled LDS -> register copies (A/B TV comes from tiled_mma) ----
         def read_a_frags(stage):
             sA = stage_a(stage)
             frag_A = thr_mma.make_fragment_A(sA)
@@ -926,15 +923,12 @@ def compile_conv3d_implicit(
             rocdl.s_setprio(0)
             return acc_values
 
-        # global->LDS software pipeline
-        # ---- prologue: fill the pipeline with the first PREFETCH tiles' DMAs ----
         PREFETCH = TILES_PER_BARRIER
         for s in range_constexpr(PREFETCH):
             if const_expr(s < tiles_per_split):
                 _load_a(s, k_off + s * TILE_K)
                 _load_b(s, k_off + s * TILE_K)
 
-        # ---- main loop
         for kt_idx in range_constexpr(0, tiles_per_split, TILES_PER_BARRIER):
             batch = range_constexpr(
                 kt_idx, min(kt_idx + TILES_PER_BARRIER, tiles_per_split)
@@ -1009,10 +1003,6 @@ def compile_conv3d_implicit(
                         row0 = fx.Int64(row_base)
                         off_nk0 = col * dhw + row0
 
-                        # Invoked below within this same iteration, so the loop
-                        # variables it closes over always hold the current value
-                        # (hence the B023 waivers). Default-argument binding is
-                        # not an option: `bias_val` only exists when has_bias.
                         def _emit_vec():
                             vals = []
                             for i in range_constexpr(MFMA_C_VALUES):
@@ -1051,7 +1041,6 @@ def compile_conv3d_implicit(
                             sp = row % dhw
                             off_nk = n_idx * (k * dhw) + col * dhw + sp
 
-                        # Immediately invoked, as with _emit_vec above.
                         def _emit():
                             if const_expr(use_splitk):
                                 off_b = fx.Int32(off_sk * 4)
