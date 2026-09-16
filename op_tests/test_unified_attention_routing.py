@@ -23,7 +23,7 @@ from unittest import mock
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import aiter.ops.triton.attention.unified_attention as ua
 from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
@@ -915,3 +915,7 @@ def test_mixed_split_decode_half_never_cedes():
         causal=1,
     )
     _assert_close(got.float(), want.float().reshape(got.shape))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-rs", "-v"]))
