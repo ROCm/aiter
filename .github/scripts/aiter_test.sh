@@ -123,7 +123,7 @@ for file in "${sharded_files[@]}"; do
                 "$file"
             )
             ;;
-        op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
+        op_tests/attention/mla/test_mla_persistent.py|op_tests/attention/mla/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
             } | tee -a latest_test.log
@@ -175,7 +175,7 @@ done
 # are added/removed, so we can't hardcode SHARD_IDX.
 mla_in_shard=false
 for f in "${sharded_files[@]}"; do
-    if [[ "$f" == "op_tests/test_mla.py" ]]; then
+    if [[ "$f" == "op_tests/attention/mla/test_mla.py" ]]; then
         mla_in_shard=true
         break
     fi
@@ -189,7 +189,7 @@ if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
         "-c 16384 -b 4 -n 16,8 16,17 -kvd bf16" \
         "-c 260 388 -b 1 2 -n 16,8 -kvd bf16"; do
         echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
-        if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
+        if ! timeout 10m python3 op_tests/attention/mla/test_mla.py $args 2>&1 | tee -a latest_test.log; then
             testFailed=true
             failedFiles+=("test_mla.py $args")
         fi

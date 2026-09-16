@@ -3,7 +3,7 @@
 
 """
 Reference test for the DeepSeek-V4 (MODEL1_FP8Sparse) MLA decode path,
-mirroring op_tests/test_mla_persistent.py but without an aiter v4 kernel
+mirroring op_tests/attention/mla/test_mla_persistent.py but without an aiter v4 kernel
 comparison (the aiter v4 kernel only ships the qh64/qseqlen4/gqa16 ASM
 variant today; this file establishes the torch reference + metadata call so
 the kernel comparison can be wired in once available).

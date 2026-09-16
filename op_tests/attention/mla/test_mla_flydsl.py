@@ -12,10 +12,10 @@ Modes:
 
 Examples:
 
-  python3 op_tests/test_mla_flydsl.py --mode ps1
-  python3 op_tests/test_mla_flydsl.py --mode ps1 -b 1 -c 1 63 64 65
-  python3 op_tests/test_mla_flydsl.py --mode ps64 --split-kv 0 1 2
-  python3 op_tests/test_mla_flydsl.py --mode ps1-vs-asm \
+  python3 op_tests/attention/mla/test_mla_flydsl.py --mode ps1
+  python3 op_tests/attention/mla/test_mla_flydsl.py --mode ps1 -b 1 -c 1 63 64 65
+  python3 op_tests/attention/mla/test_mla_flydsl.py --mode ps64 --split-kv 0 1 2
+  python3 op_tests/attention/mla/test_mla_flydsl.py --mode ps1-vs-asm \
       --num-heads 32 --q-seq-len 1 --varlen
 """
 

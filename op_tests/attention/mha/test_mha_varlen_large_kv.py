@@ -18,10 +18,10 @@ Reference checks only the last ``check_rows`` query rows (global positions near
 S-1). Cost is O(check_rows * S), not O(S^2).
 
 Examples:
-    python3 op_tests/test_mha_varlen_large_kv.py
-    python3 op_tests/test_mha_varlen_large_kv.py -n 8 -s 2200000 -c 0 1
-    python3 op_tests/test_mha_varlen_large_kv.py -n 1 -s 16777216 -c 0  # single head
-    python3 op_tests/test_mha_varlen_large_kv.py -n 8 -s 900000 -c 0    # fails: span < 4GiB
+    python3 op_tests/attention/mha/test_mha_varlen_large_kv.py
+    python3 op_tests/attention/mha/test_mha_varlen_large_kv.py -n 8 -s 2200000 -c 0 1
+    python3 op_tests/attention/mha/test_mha_varlen_large_kv.py -n 1 -s 16777216 -c 0  # single head
+    python3 op_tests/attention/mha/test_mha_varlen_large_kv.py -n 8 -s 900000 -c 0    # fails: span < 4GiB
 """
 
 import argparse
@@ -136,7 +136,7 @@ def _run_varlen(q, k, v, cu_q, cu_k, max_seqlen, scale, causal):
 
 
 def _flops_bytes(S, nheads, nheads_k, dq, dv, causal, elem_size):
-    # 2 flops per MAC, over QK^T (dq deep) and PV (dv deep); matches op_tests/test_mha.py.
+    # 2 flops per MAC, over QK^T (dq deep) and PV (dv deep); matches op_tests/attention/mha/test_mha.py.
     flops = 2.0 * nheads * S * S * (dq + dv)
     if causal:
         flops /= 2.0

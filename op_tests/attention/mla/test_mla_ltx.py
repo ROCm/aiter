@@ -7,12 +7,12 @@ Compares torch golden vs mla_decode_fwd (gfx950 asm).
 Follows op_tests/test_quant.py layout (aiter-op-test SKILL).
 
 Examples:
-  python op_tests/test_mla_ltx.py
+  python op_tests/attention/mla/test_mla_ltx.py
     # default on gfx950: PR global-load .co sweep (8 presets, ps, boundary+page16m)
-  python op_tests/test_mla_ltx.py --preset qh64_fp8_q1 --ps ps --lse off --page-base 19000000 --ctx 4
-  python op_tests/test_mla_ltx.py --preset qh16_fp8_q1 qh64_bf16_q1 --suites boundary --ps ps --lse off
-  python op_tests/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off --ctx 4
-  MLA_PAGE_OOB_NUM_PAGES=3800000 python op_tests/test_mla_ltx.py --suites over4g
+  python op_tests/attention/mla/test_mla_ltx.py --preset qh64_fp8_q1 --ps ps --lse off --page-base 19000000 --ctx 4
+  python op_tests/attention/mla/test_mla_ltx.py --preset qh16_fp8_q1 qh64_bf16_q1 --suites boundary --ps ps --lse off
+  python op_tests/attention/mla/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off --ctx 4
+  MLA_PAGE_OOB_NUM_PAGES=3800000 python op_tests/attention/mla/test_mla_ltx.py --suites over4g
 """
 
 from __future__ import annotations

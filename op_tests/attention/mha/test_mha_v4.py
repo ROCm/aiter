@@ -2466,7 +2466,7 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
 def test_mha_v4_sparse_validation_rejects_malformed_lut(mutation, message):
     """Enable opt-in validation before AITER loads, without slowing the parent test process."""
     probe = f"""
-from op_tests.test_mha_v4 import (
+from op_tests.attention.mha.test_mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
     _sparse_fp8_operands,

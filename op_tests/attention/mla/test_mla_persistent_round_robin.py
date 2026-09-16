@@ -11,7 +11,7 @@ online softmax and compared against the full-KV causal golden.
 This was split out of test_mla_persistent.py into its own file.
 
 Example:
-    python3 op_tests/test_mla_persistent_round_robin.py -d bf16 -kvd bf16 \
+    python3 op_tests/attention/mla/test_mla_persistent_round_robin.py -d bf16 -kvd bf16 \
         -n 16,4 -b 1 -c 13 -cpw 4
 """
 

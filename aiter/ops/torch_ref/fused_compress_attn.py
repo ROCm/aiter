@@ -8,7 +8,7 @@ Mirrors the kernel's plan-driven per-boundary online-softmax pool -> RMSNorm
 -> GPT-J RoPE -> paged cache scatter (BF16 or per-row FP8 with optional ue8m0
 scale + MFMA 16x16 preshuffle).
 
-Used by ``op_tests/test_flydsl_compress_attn.py`` to gate numerical
+Used by ``op_tests/attention/sparse/test_flydsl_compress_attn.py`` to gate numerical
 correctness against the flydsl kernels. Not on the inference hot path --
 the Python-side per-boundary loop makes it ~100x slower than the kernel.
 """

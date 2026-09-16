@@ -3,7 +3,7 @@
 
 """Tests for the v4 MLA pipeline (mla_decode_fwd_v4_nm).
 Usage:
-  pytest -xvs op_tests/test_mla_v4_nm.py
+  pytest -xvs op_tests/attention/mla/test_mla_v4_nm.py
 """
 
 import os
@@ -314,7 +314,7 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Torch golden + accuracy + perf tests (resolves the TODO #1 in the file
-# docstring). Mirrors op_tests/rui.py's torch reference and op_tests/test_mla.py's
+# docstring). Mirrors op_tests/rui.py's torch reference and op_tests/attention/mla/test_mla.py's
 # checkAllclose/run_perftest pattern. The ATOM-style wrapper below mirrors
 # ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode
 # so the asm op can drop in as a replacement for the triton fallback there.
@@ -643,7 +643,7 @@ def _build_bf16_inputs(
     total_q = batch * q_seq_logical
     num_page = batch * (kv_seq_lens // PAGE_SIZE)
 
-    # Bare randn (~N(0,1)), matching op_tests/test_mla.py's input convention.
+    # Bare randn (~N(0,1)), matching op_tests/attention/mla/test_mla.py's input convention.
     # No /10 scaling or clamp: under the strict 1% checkAllclose tolerance this
     # leaves some elements over the bound (FP8 quant noise on the full dynamic
     # range), reported as `failed!` — that is expected and double-checked by eye,
@@ -1950,7 +1950,7 @@ if __name__ == "__main__":
         description=(
             "v4 nm MLA DIY driver: for each shape in the (batch x kv x q_seq)\n"
             "cartesian product, run accuracy then perf. For the pytest smoke /\n"
-            "determinism / kernarg suite, invoke `pytest op_tests/test_mla_v4_nm.py`\n"
+            "determinism / kernarg suite, invoke `pytest op_tests/attention/mla/test_mla_v4_nm.py`\n"
             "directly."
         ),
     )

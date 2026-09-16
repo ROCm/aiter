@@ -3720,14 +3720,14 @@ def test_batch_prefill_aick1171_hard_fault_via_guard_page(total_blocks):
         import sys
         sys.path.insert(0, {aiter_root!r})
         import torch
-        from op_tests.test_batch_prefill import (
+        from op_tests.attention.mha.test_batch_prefill import (
             _build_aick1171_paged_kv_cache,
             build_q_tensor, convert_lens_to_indptr,
             extract_kv_caches, apply_kv_layout, get_vector_size,
             build_reference_output, run_ck,
             get_tolerances, assert_output_matches_reference,
         )
-        from op_tests.test_batch_prefill import make_guarded_int32_tensor
+        from op_tests.attention.mha.test_batch_prefill import make_guarded_int32_tensor
 
         torch.manual_seed(42)
 

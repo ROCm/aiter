@@ -4,8 +4,8 @@
 
 """aiter op-test + benchmark for ``flydsl_pa_mqa_logits_fp4`` (decode / varctx).
 Usage:
-    python op_tests/test_flydsl_pa_mqa_logits_fp4.py
-    python op_tests/test_flydsl_pa_mqa_logits_fp4.py --batch 8 --ctx 131072 --next_n 1
+    python op_tests/attention/pa/test_flydsl_pa_mqa_logits_fp4.py
+    python op_tests/attention/pa/test_flydsl_pa_mqa_logits_fp4.py --batch 8 --ctx 131072 --next_n 1
 """
 
 import argparse

@@ -59,10 +59,10 @@ Empirical (pre-fix) result on gfx950 (MI355X), aiter built 2026-04-20:
   configuration.
 
 Run:
-    pytest /root/aiter/op_tests/test_pa_block_id_truncation.py -v -s
+    pytest /root/aiter/op_tests/attention/pa/test_pa_block_id_truncation.py -v -s
 
 Or as a script:
-    python /root/aiter/op_tests/test_pa_block_id_truncation.py
+    python /root/aiter/op_tests/attention/pa/test_pa_block_id_truncation.py
 """
 
 import pytest
@@ -161,7 +161,7 @@ _KV_CACHE_BY_QUANT = {}
 def _pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype):
     """Per-token symmetric quantization of the KV pool, producing the ASM
     kernel's expected layout + per-token scales. Mirrors the helper in
-    op_tests/test_pa_mtp.py."""
+    op_tests/attention/pa/test_pa_mtp.py."""
     num_blocks = k_cache.shape[0]
     num_heads = k_cache.shape[1]
     head_dim = v_cache.shape[2]
@@ -200,7 +200,7 @@ def _pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype):
 
 def _asm_V_shuffle(VC):
     """Reshape V into the (block_size/x, head_size, x) layout the ASM kernel
-    expects. Mirrors op_tests/test_pa_mtp.py:asm_V_shuffle."""
+    expects. Mirrors op_tests/attention/pa/test_pa_mtp.py:asm_V_shuffle."""
     x = 16 // VC.element_size()
     num_blocks, num_kv_heads, head_size, block_size = VC.shape
     VC = VC.view(num_blocks, num_kv_heads, head_size, block_size // x, x)

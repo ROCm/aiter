@@ -20,9 +20,9 @@ Both are gfx1250-only here and drop out of the sweep elsewhere.
 
 Example CLI usage::
 
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --mode dense
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --backend opus \\
+    PYTHONPATH=. python3 op_tests/attention/sparse/test_pa_sparse_prefill.py
+    PYTHONPATH=. python3 op_tests/attention/sparse/test_pa_sparse_prefill.py --mode dense
+    PYTHONPATH=. python3 op_tests/attention/sparse/test_pa_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec fp8 --no-verify
 """
 

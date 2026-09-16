@@ -4,13 +4,13 @@
 # gfx1250 / mi400 MLA fp8 decode test.
 #
 #   # Single public dispatch case:
-#   python3 op_tests/test_mla_decode_pagesize64.py -n 8,1
+#   python3 op_tests/attention/mla/test_mla_decode_pagesize64.py -n 8,1
 #
 #   # Sweep all supported public dispatch cases:
-#   python3 op_tests/test_mla_decode_pagesize64.py
+#   python3 op_tests/attention/mla/test_mla_decode_pagesize64.py
 #
 #   # Peak-performance sweep from the gfx1250 MLA report:
-#   python3 op_tests/test_mla_decode_pagesize64.py -n 8,1 8，2 16，1 32，1 -b 1024 -c 16384 --split_kv auto
+#   python3 op_tests/attention/mla/test_mla_decode_pagesize64.py -n 8,1 8，2 16，1 32，1 -b 1024 -c 16384 --split_kv auto
 
 
 import argparse

@@ -394,7 +394,7 @@ $LLVM/clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 \
     -o hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co kernel.s
 
 # run the family's test (see --help for dtype / head-count / context-length selection)
-python3 op_tests/test_pa.py
+python3 op_tests/attention/pa/test_pa.py
 # [aiter] LoadKernel: _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE hsaco: .../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co
 
 git checkout -- hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co     # back to the original
@@ -414,10 +414,10 @@ kernel you changed — the `LoadKernel` log line names the file, and
 
 ```bash
 rocprofv3 --kernel-trace --stats --kernel-include-regex 'pa_bf16_pertokenFp8_gqa16' \
-          -d ./prof_orig -- python3 op_tests/test_pa.py
+          -d ./prof_orig -- python3 op_tests/attention/pa/test_pa.py
 # swap in the modified .co (Step 6), then
 rocprofv3 --kernel-trace --stats --kernel-include-regex 'pa_bf16_pertokenFp8_gqa16' \
-          -d ./prof_mod  -- python3 op_tests/test_pa.py
+          -d ./prof_mod  -- python3 op_tests/attention/pa/test_pa.py
 ```
 
 `--stats` writes a per-kernel summary (count, total/mean/min/max duration) next
@@ -464,7 +464,7 @@ matching kernel is traced; pick a warmed-up iteration explicitly:
 
 ```bash
 rocprofv3 --att --kernel-include-regex 'pa_bf16_pertokenFp8_gqa16' --kernel-iteration-range 5-5 \
-          --att-target-cu 1 -d ./att_out -- python3 op_tests/test_pa.py
+          --att-target-cu 1 -d ./att_out -- python3 op_tests/attention/pa/test_pa.py
 ```
 
 Useful options: `--att-target-cu` (which CU to trace, default 1),

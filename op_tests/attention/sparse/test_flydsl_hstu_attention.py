@@ -171,7 +171,7 @@ def _padded_qk_bytes(batch_size, max_seq_len, num_heads, elem_size) -> int:
 
 
 @pytest.mark.skip(
-    reason="perf sweep: run via python op_tests/test_flydsl_hstu_attention.py"
+    reason="perf sweep: run via python op_tests/attention/sparse/test_flydsl_hstu_attention.py"
 )
 @benchmark()
 def test_flydsl_hstu_attention_perf(

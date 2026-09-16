@@ -25,7 +25,7 @@ math error to FP8 quant noise, which is sufficient for CI.
 
 Usage:
   # perf+accuracy sweep (prints the markdown table — the deliverable):
-  ENABLE_CK=0 python op_tests/test_mla_v4_kargpreld.py
+  ENABLE_CK=0 python op_tests/attention/mla/test_mla_v4_kargpreld.py
 """
 
 import argparse

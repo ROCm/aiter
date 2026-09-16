@@ -25,8 +25,8 @@ Performance (vs the ATOM FP8 path, if importable):
   Timed against the single fp4 paged kernel (which eliminates the gather).
 
 Usage:
-    python op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py
-    python op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py --bench --bs 4 --ctx 2048 --n_q 64
+    python op_tests/attention/pa/test_flydsl_pa_mqa_logits_fp4_prefill.py
+    python op_tests/attention/pa/test_flydsl_pa_mqa_logits_fp4_prefill.py --bench --bs 4 --ctx 2048 --n_q 64
 """
 
 import argparse

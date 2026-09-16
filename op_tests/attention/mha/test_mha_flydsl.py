@@ -15,7 +15,7 @@ swept when the routing in ``aiter/ops/mha.py`` + ``aiter/ops/flydsl/fmha_kernels
 lands on the FlyDSL m32x8 kernel; anything else would be testing CK/ASM/Triton.
 
 Usage:
-    python op_tests/test_mha_flydsl.py
+    python op_tests/attention/mha/test_mha_flydsl.py
 """
 
 import argparse
