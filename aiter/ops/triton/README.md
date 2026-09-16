@@ -140,7 +140,7 @@ module on top of it, and every function has exactly one home:
 | `utils/conv_config_utils.py` | `get_conv_config` + the shape-key formatters and table probes |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` — the only MOE config fetcher |
-| `utils/tuned_config_utils.py` | `get_tuned_kernel_config` |
+| `utils/tuned_config_utils.py` | `get_tuned_kernel_config`, `autotune_configs`, `autotune_enabled` |
 
 Attention and GMM kernels read their single `DEFAULT.json` straight off the
 core (`resolve_config_dir()` + `load_config_json()`); a family module earns
@@ -238,6 +238,32 @@ single default tile per arch via
 `utils/tuned_config_utils.py::get_tuned_kernel_config(op, config_name,
 kernel_name, fallback, backend)`, which reads the nested-layout
 `DEFAULT.json`. The `fallback` must be launchable on any arch, not fast on one.
+
+### Autotune lists are opt-in — `autotune_configs()`
+
+A config list never goes to `@triton.autotune` raw. Route it through
+`utils/tuned_config_utils.py::autotune_configs(family, configs,
+default_config=None, env=None)`:
+
+```python
+@triton.autotune(
+    configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+    key=[...],
+)
+```
+
+It returns every candidate only while `<FAMILY>_TRITON_AUTOTUNE=1` (also
+`true`/`yes`/`on`), and a single config otherwise — `default_config` when
+given, else `configs[0]` — so nothing is benchmarked at launch. A raw list
+searches on every new key: it costs compile time, breaks CUDA-graph capture,
+and leaves a unit test's numerics dependent on whichever config the timing
+happened to pick that run.
+
+There are no exemptions. A family that already published its own variable name
+keeps it by passing `env=`, as `flash_attn_triton_amd/` does with
+`FLASH_ATTENTION_TRITON_AMD_AUTOTUNE` — it still goes through this helper.
+`autotune_enabled(family, env=None)` exposes the same check for wrapper code
+that must branch on it outside a decorator.
 
 ### Config naming
 
@@ -369,6 +395,8 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
   `compute_splitk_params()`. No tuning values in Python.
 - Config JSON in the **nested layout** (`configs/<arch>/<backend>/<op>/<d_type>/`),
   `M_LEQ/M_GEQ/any` keys, all required params present.
+- Any `@triton.autotune` config list wrapped in `autotune_configs(...)`, so
+  tuning stays opt-in behind `<FAMILY>_TRITON_AUTOTUNE=1`.
 - `make_kernel_repr(...)` + `@triton.jit(repr=...)` for Triton entry kernels,
   `@gluon.jit(repr=...)` for Gluon entry kernels.
 - Weight/scale shuffling imported from `utils/shuffle.py`.
