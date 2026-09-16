@@ -30,7 +30,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 <tr>
   <td rowspan="5"><code>mla_gluon</code></td><td rowspan="5">MLA</td><td rowspan="5">CDNA4</td>
   <td rowspan="2" nowrap>(bh64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size in {64, 128, 256}<br>nhead in {64, 128}<br>PAGE_SIZE=1<br>BLOCK_H=BLOCK_N=64</td>
-  <td>python op_tests/test_mla.py \<br>-c 16384 -b 64 128 \<br>-n 64,1 128,1 \<br>-d bf16 -kvd bf16</td>
+  <td>python op_tests/attention/mla/test_mla.py \<br>-c 16384 -b 64 128 \<br>-n 64,1 128,1 \<br>-d bf16 -kvd bf16</td>
   <td>~563<br>TFLOPS</td><td>~477<br>TFLOPS</td><td>—</td>
 </tr>
 <tr>
@@ -39,16 +39,16 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 </tr>
 <tr>
   <td nowrap>(bh16bn128)<br>Q: bf16, KV: fp8, Out: bf16<br>batch_size = 1<br>nhead &le; 16<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=128</td>
-  <td>python op_tests/test_mla.py \<br>-c 10000000 -b 1 -n 16,1 \<br>-d bf16 -kvd fp8</td>
+  <td>python op_tests/attention/mla/test_mla.py \<br>-c 10000000 -b 1 -n 16,1 \<br>-d bf16 -kvd fp8</td>
   <td>~4.58<br>TB/s</td><td>—</td><td>—</td>
 </tr>
 <tr>
   <td rowspan="2" nowrap>(bh16bn64)<br>Q: bf16, KV: bf16<br>Out: bf16 (+fp32 lse<br>with -lse)<br>nhead &le; 16<br>batch_size &ge; 1<br>NUM_KV_SPLITS=<br>max(1,min(256//B,<br>cdiv(seq,64)))<br>(B*splits &le; 256)<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=64</td>
-  <td>python op_tests/test_mla.py \<br>-c 10000000 -b 1 -n 16,1 \<br>-d bf16 -kvd bf16<br>(full decode)</td>
+  <td>python op_tests/attention/mla/test_mla.py \<br>-c 10000000 -b 1 -n 16,1 \<br>-d bf16 -kvd bf16<br>(full decode)</td>
   <td>~5.33<br>TB/s</td><td>~0.69<br>TB/s</td><td>—</td>
 </tr>
 <tr>
-  <td>python op_tests/test_mla.py \<br>-c 100000 -b 4 -n 16,1 \<br>-d bf16 -kvd bf16 \<br>-lse<br>(full decode + lse)</td>
+  <td>python op_tests/attention/mla/test_mla.py \<br>-c 100000 -b 4 -n 16,1 \<br>-d bf16 -kvd bf16 \<br>-lse<br>(full decode + lse)</td>
   <td>~4.31<br>TB/s</td><td>—</td><td>—</td>
 </tr>
 <tr>
@@ -198,7 +198,7 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 **`bh64` perf** (MI350, ctx=16384, bf16 Q + bf16 KV; compute-bound):
 
 ```
-python op_tests/test_mla.py -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
+python op_tests/attention/mla/test_mla.py -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
 ```
 
 | batch | nhead | ASM TFLOPS | Gluon TFLOPS | Speedup |
@@ -211,7 +211,7 @@ python op_tests/test_mla.py -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
 **`bh16bn128` perf** (MI350, ctx=10M, bf16 Q + fp8 KV; memory-bound):
 
 ```
-python op_tests/test_mla.py -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
+python op_tests/attention/mla/test_mla.py -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
 ```
 
 | batch | nhead | ASM TB/s | Gluon TB/s | Speedup |
@@ -223,7 +223,7 @@ ASM does not support this regime (bf16 Q + fp8 KV → "don't support this case")
 **`bh16bn64` perf** (MI350, ctx=10M, bf16 Q + bf16 KV; memory-bound):
 
 ```
-python op_tests/test_mla.py -c 10000000 -b 1 -n 16,1 -d bf16 -kvd bf16
+python op_tests/attention/mla/test_mla.py -c 10000000 -b 1 -n 16,1 -d bf16 -kvd bf16
 ```
 
 | batch | nhead | ASM TB/s | Gluon TB/s | Speedup |
@@ -235,7 +235,7 @@ Gluon reaches ~82% of MI350's 6.5 TB/s HBM peak (wall-clock 2162 &mu;s vs ASM 16
 **`return_lse` perf** (MI350, bf16 Q + bf16 KV; memory-bound; full decode + lse):
 
 ```
-python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -lse
+python op_tests/attention/mla/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -lse
 ```
 
 | ctx_lens | batch | NUM_KV_SPLITS | num_iter / split | us | TB/s |

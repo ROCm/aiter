@@ -228,7 +228,7 @@ which is discouraged -- use gradlib for that.
 Verify winners with the end-to-end test:
 
 ```bash
-python3 op_tests/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
+python3 op_tests/gemm/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
 # expected: allclose passed
 ```
 
@@ -302,16 +302,16 @@ the gptoss untuned set).
 
 | Test | Purpose | Pass criterion |
 |---|---|---|
-| `op_tests/test_opus_a16w16_gemm.py` | End-to-end test of `gemm_a16w16_opus` (shape-driven API); supports single-shape smoke and CSV sweep | `allclose` passes on all shapes |
+| `op_tests/gemm/test_opus_a16w16_gemm.py` | End-to-end test of `gemm_a16w16_opus` (shape-driven API); supports single-shape smoke and CSV sweep | `allclose` passes on all shapes |
 
 Examples:
 
 ```bash
 # single-shape smoke
-python3 op_tests/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
+python3 op_tests/gemm/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
 
 # CSV sweep (each row is one (M, N, K, batch) shape)
-python3 op_tests/test_opus_a16w16_gemm.py --csv /path/to/shapes.csv
+python3 op_tests/gemm/test_opus_a16w16_gemm.py --csv /path/to/shapes.csv
 ```
 
 ---
@@ -614,7 +614,7 @@ dsv3+gptoss bf16 benchmark is unchanged across rounds 6+7
 (geomean +0.37% per shape, well within measurement noise; total
 +0.27% sum of best-kernel us).
 
-Functional regression: `op_tests/test_opus_a16w16_gemm.py` end-to-end
+Functional regression: `op_tests/gemm/test_opus_a16w16_gemm.py` end-to-end
 shape sweep still passes (`allclose` on every shape).
 
 **Per-TU breakdown** (single-TU `-ftime-report` wall):
@@ -1087,7 +1087,7 @@ design notes.
 | [csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh) | gfx950 dispatch: (M,N,K) lookup + heuristic-kid fallback |
 | [csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh) | `opus_a16w16_heuristic_kid_gfx950(M,N,K) -> int` (single source: integer kid only, no launcher symbol names) |
 | [csrc/opus_gemm/include/gfx950/](../../../csrc/opus_gemm/include/gfx950/) | Kernel source (a16w16, flatmm, flatmm_splitk, persistent) for gfx950 |
-| [op_tests/test_opus_a16w16_gemm.py](../../../op_tests/test_opus_a16w16_gemm.py) | End-to-end `gemm_a16w16_opus` (single-shape + CSV sweep) |
+| [op_tests/gemm/test_opus_a16w16_gemm.py](../../../op_tests/gemm/test_opus_a16w16_gemm.py) | End-to-end `gemm_a16w16_opus` (single-shape + CSV sweep) |
 
 ---
 

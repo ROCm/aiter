@@ -534,7 +534,9 @@ def test_indexer_fp4_e2e_pa_mqa_logits(
     except ModuleNotFoundError as e:
         if e.name != "test_flydsl_pa_mqa_logits_fp4":
             raise
-        from op_tests.test_flydsl_pa_mqa_logits_fp4 import ref_mqa_logits_mixed
+        from op_tests.attention.pa.test_flydsl_pa_mqa_logits_fp4 import (
+            ref_mqa_logits_mixed,
+        )
 
     torch.manual_seed(3)
     max_blocks_per_seq = max(

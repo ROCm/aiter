@@ -100,7 +100,7 @@ AITER_FLYDSL_AOT_WORKERS=16 python -m aiter.aot.flydsl.moe
 
 Compiling successfully is not enough — you also want to verify that the **runtime
 actually hits the AOT cache** (no cache miss). That is done by
-`op_tests/test_moe_2stage.py`, which wraps test cases with
+`op_tests/moe/test_moe_2stage.py`, which wraps test cases with
 `aiter.aot.flydsl.common.fail_on_aot_cache_miss`: if the runtime falls back to
 JIT compilation, the case fails.
 
@@ -115,7 +115,7 @@ python -m aiter.aot.flydsl.moe
 # (2) Then run the MoE 2stage test with cache checking.
 #     When a case has check_aot_cache=True it routes through
 #     test_fmoe_with_aot_cache_check, which raises AssertionError on a cache miss.
-python op_tests/test_moe_2stage.py
+python op_tests/moe/test_moe_2stage.py
 ```
 
 > Note: both steps must use the **same** `FLYDSL_RUNTIME_CACHE_DIR` and run on

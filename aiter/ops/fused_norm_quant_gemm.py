@@ -81,7 +81,7 @@ def fused_rmsnorm_quant_gemm(
             )
 
     from aiter.ops.gradlib import hipb_mm
-    from aiter.ops.rmsnorm_quant import rmsnorm_quant as _rmsnorm_quant
+    from aiter.ops.rmsnorm import rmsnorm_quant as _rmsnorm_quant
 
     _rmsnorm_quant(fp8_workspace, input_2d, scale_a, norm_w, eps)
 
