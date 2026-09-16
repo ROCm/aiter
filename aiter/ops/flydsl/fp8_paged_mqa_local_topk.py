@@ -17,10 +17,8 @@ from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
 )
 from .split_topk_merge import (
     _require_merge_workspace,
-    alloc_split_topk_merge_workspace,
     split_topk_merge,
     split_topk_merge_workspace,
-    split_topk_merge_workspace_shapes,
 )
 
 SUPPORTED_ARCHES = ("gfx950",)
@@ -252,9 +250,7 @@ def _prepare_stage_a(
     )
 
 
-def _merge_workspace(
-    workspace, *, rows, device, num_splits, default_cache: bool
-):
+def _merge_workspace(workspace, *, rows, device, num_splits, default_cache: bool):
     if num_splits <= 1:
         if workspace is not None:
             raise ValueError("workspace is only used when num_splits > 1")

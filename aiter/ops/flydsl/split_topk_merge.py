@@ -123,7 +123,9 @@ def _require_merge_workspace(
         if tensor.dtype != torch.int32 or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous int32")
         if tuple(tensor.shape) != expected:
-            raise ValueError(f"{name} must have shape {expected}, got {tuple(tensor.shape)}")
+            raise ValueError(
+                f"{name} must have shape {expected}, got {tuple(tensor.shape)}"
+            )
     return histogram, state
 
 
