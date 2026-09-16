@@ -376,8 +376,9 @@ DEFAULT_VARIANT = "mfma_r2_w4"
 def _auto_variant(seq_len, seq_len_kv):
     """Pick (RPB, WPB) from the problem shape.
 
-    RPB from ``seq_len * seq_len_kv`` thresholds; step down to a divisor of
-    ``seq_len`` when padding overhead would dominate. WPB unchanged.
+    RPB from ``seq_len * seq_len_kv`` thresholds; in the middle band an odd
+    ``seq_len`` drops RPB to 1, since padding costs a fixed host-side overhead
+    that only the largest shapes outgrow. WPB unchanged.
     """
     rpb2_min_elems = 2**19
     rpb4_min_elems = 2**21
