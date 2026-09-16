@@ -23,7 +23,6 @@ from aiter.test_mha_common import (
     attention_ref_block_sparse,
 )
 
-DEBUG_MODE = False
 ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
 
@@ -283,8 +282,7 @@ def test_sage(
         layout=layout,
     )
 
-    if DEBUG_MODE:
-        logger.info("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -299,13 +297,12 @@ def test_sage(
 
     assert torch_out.shape == triton_out.shape
 
-    if DEBUG_MODE:
-        logger.info("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
-        logger.info(
-            "attention_scores.shape=%s, attention_scores=%s",
-            attention_scores.shape,
-            attention_scores,
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     check_attention_outputs(
         triton_out,
@@ -915,8 +912,7 @@ def test_sage_mxfp4(
         hadamard_rotation=hadamard_rotate,
     )
 
-    if DEBUG_MODE:
-        logger.info("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -931,13 +927,12 @@ def test_sage_mxfp4(
 
     assert torch_out.shape == triton_out.shape
 
-    if DEBUG_MODE:
-        logger.info("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
-        logger.info(
-            "attention_scores.shape=%s, attention_scores=%s",
-            attention_scores.shape,
-            attention_scores,
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     check_attention_outputs(
         triton_out,
