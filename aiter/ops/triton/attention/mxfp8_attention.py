@@ -94,6 +94,18 @@ def mxfp8_attention_forward(
     assert is_cdna4(), "mxfp8 attention requires gfx950 or newer"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert q_scale.is_contiguous() and k_scale.is_contiguous()
+    if layout == "thd":
+        raise NotImplementedError(
+            "layout='thd' (varlen) is not yet supported in mxfp8_attention_forward"
+        )
+    if bias is not None:
+        raise NotImplementedError(
+            "bias is not supported in mxfp8_attention_forward backward path"
+        )
+    if dropout_p > 0.0:
+        raise NotImplementedError(
+            "dropout is not supported in mxfp8_attention_forward backward path"
+        )
 
     cu_seqlens_q = 0
     cu_seqlens_k = 0
@@ -101,6 +113,17 @@ def mxfp8_attention_forward(
     max_seqlens_k = k.shape[1] if layout == "bshd" else k.shape[2]
     use_exp2 = True
     quant_size = 32
+
+    # Shape validation
+    _, nheads_q, nheads_k, _head_size_q, _head_size_v, _, _ = get_shape_from_layout(
+        q, k, v, layout
+    )
+    if nheads_q % nheads_k != 0:
+        raise ValueError(
+            f"num_q_heads ({nheads_q}) must be divisible by num_kv_heads ({nheads_k}) for GQA"
+        )
+    if v.shape[0] != q.shape[0]:
+        raise ValueError("Q and V must have the same batch size")
 
     o_shape = list(q.shape)
     o_shape[-1] = v.shape[-1]
@@ -297,11 +320,38 @@ def mxfp8_attention_backward(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Backward pass of MXFP8 Flash Attention v2.
+    """Backward pass of MXFP8 Flash Attention v2.
+
+    Args:
+        q, k, v: Query/Key/Value in FP8 format, same layout as forward.
+        o:       Forward output tensor.
+        do:      Gradient of the output.
+        lse:     Log-sum-exp saved from forward.
+        dq, dk, dv: Optional pre-allocated gradient buffers (bhsd layout).
+        q_scale, k_scale, v_scale: E8M0 block scales from forward.
+        sm_scale: Softmax scale (must match forward).
+        p_scale:  Attention probability quantisation scale from forward.
+        causal:   Must match the forward call.
+        layout:   Only "bshd" and "bhsd" are supported; "thd" raises.
+        alibi_slopes: Not supported; raises NotImplementedError if set.
+
+    Returns:
+        (dq, dk, dv) gradient tensors in fp32.
+
+    Not supported: alibi_slopes, layout='thd'.
+    bias and dropout are handled in the forward but have no backward
+    implementation; pass bias=None and dropout_p=0 to avoid silent errors.
     """
     _LOGGER.info(f"MXFP8_ATTENTION_BWD: q={tuple(q.shape)}, k={tuple(k.shape)}")
     assert is_cdna4(), "mxfp8 attention requires gfx950 or newer"
+    if layout == "thd":
+        raise NotImplementedError(
+            "layout='thd' (varlen) is not yet supported in mxfp8_attention_backward"
+        )
+    if alibi_slopes is not None:
+        raise NotImplementedError(
+            "alibi_slopes is not supported in mxfp8_attention_backward"
+        )
 
     use_exp2 = True
     quant_size = 32
@@ -453,7 +503,8 @@ def mxfp8_attention_backward(
 
     p_scale_t = math.pow(2.0, int(p_scale - 127))
     log_p_scale = math.log(p_scale_t)
-    num_block_m = triton.cdiv(max_seqlen_q, block_m_dq_bwd)
+    num_block_m_dq = triton.cdiv(max_seqlen_q, block_m_dq_bwd)
+    num_block_m_dkdv = triton.cdiv(max_seqlen_q, block_m_dkv_bwd)
 
     kernel_kwargs = {}
     if (
@@ -463,7 +514,7 @@ def mxfp8_attention_backward(
     ):
         kernel_kwargs["matrix_instr_nonkdim"] = 16
 
-    grid_bwd = (batch_headsize_q, num_block_m)
+    grid_bwd = (batch_headsize_q, num_block_m_dq)
     _bwd_kernel_dq_mxfp8[grid_bwd](
         q,
         k,
@@ -524,7 +575,7 @@ def mxfp8_attention_backward(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        num_block_m=num_block_m,
+        num_block_m=num_block_m_dq,
         BLOCK_M=block_m_dq_bwd,
         BLOCK_N=block_n_dq_bwd,
         BLOCK_DMODEL_QK=padded_d_model_qk,
@@ -611,7 +662,7 @@ def mxfp8_attention_backward(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        num_block_m=num_block_m,
+        num_block_m=num_block_m_dkdv,
         BLOCK_M=block_m_dkv_bwd,
         BLOCK_N=block_n_dkv_bwd,
         BLOCK_DMODEL_QK=padded_d_model_qk,
