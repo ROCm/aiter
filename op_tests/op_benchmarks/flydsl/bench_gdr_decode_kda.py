@@ -263,9 +263,10 @@ def kernel_us(fn):
 def confirm(B, candidates):
     """Re-time the sweep's leaders over independent trials, rank on median.
 
-    Also times current main's shape-based tiling, so the sweep reports what it
-    bought and not just what it picked. Candidates come from this GPU's sweep --
-    the winning set differs between gfx942 and gfx950.
+    Also times the untuned config, the one `_decode_tiling()` picks with no
+    tuned row, so the sweep reports what it bought and not just what it picked.
+    Candidates come from this GPU's sweep -- the winning set differs between
+    gfx942 and gfx950.
     """
     print(f"    re-timing the top {len(candidates)} over {TRIALS} trials:")
     baseline_config = main_tiling(B)
@@ -287,16 +288,16 @@ def confirm(B, candidates):
     baseline = next(r[0] for r in rows if r[3] == baseline_config)
     rows.sort()
     for med, lo, hi, cfg, _ in rows:
-        tag = "   <-- main tiling" if cfg == baseline_config else ""
+        tag = "   <-- untuned" if cfg == baseline_config else ""
         print(
             f"      {cfg!s:<12} median {med:8.2f}  min {lo:8.2f}  max {hi:8.2f}"
             f"  spread {(hi - lo) / med * 100:4.1f}%"
-            f"  vs main {baseline / med:.2f}x{tag}"
+            f"  vs untuned {baseline / med:.2f}x{tag}"
         )
     best_med, _, _, best_cfg, best_err = rows[0]
     print(
         f"    winner {best_cfg} at {best_med:.2f} us"
-        f" ({baseline / best_med:.2f}x main's tiling, err {best_err:.1e})\n"
+        f" ({baseline / best_med:.2f}x the untuned config, err {best_err:.1e})\n"
     )
     return best_med, best_cfg, best_err
 
@@ -611,6 +612,7 @@ def bench(args):
     triton_fn = load_triton(args.vllm)
     print(f"\narch {arch} · H={H} K=V={K} bf16 · f32 state · all times us")
     print("baseline: vLLM Triton packed decode (not HIP fused KDA decode)")
+    print("untuned:  FlyDSL on the config `_decode_tiling()` picks with no tuned row")
 
     table = [bench_trials(B, flydsl_gdr_decode, triton_fn) for B in BATCHES]
 
@@ -621,7 +623,7 @@ def bench(args):
             ("Triton", 14, "tri_kernel"),
             ("FlyDSL", 14, "fly_kernel"),
             ("speedup", 14, "kernel_speedup"),
-            ("FlyDSL main tiling", 19, "untuned_kernel"),
+            ("FlyDSL untuned", 15, "untuned_kernel"),
         ],
         table,
     )
