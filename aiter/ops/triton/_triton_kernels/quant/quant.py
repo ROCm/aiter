@@ -9,7 +9,8 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 _static_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
     "_static_per_tensor_quant_fp8_i8_kernel",
     [
-        "NUM_COL_POW2",
+        "BLOCK_M",
+        "BLOCK_N",
     ],
 )
 
@@ -19,24 +20,42 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     qx_ptr,
     x_in_ptr,
     scale_in_ptr,
+    rows: int,
     cols: int,
-    x_in_stride_r: int,
-    NUM_COL_POW2: tl.constexpr,
+    stride_x_m,
+    stride_x_n,
+    stride_q_m,
+    stride_q_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    tl.assume(pid > 0)
-    tl.assume(x_in_stride_r > 0)
+    # Fold the block origin into the base pointers in int64 so only the in-tile
+    # offsets, which always fit, stay 32-bit.
+    start_m = tl.program_id(axis=0).to(tl.int64) * BLOCK_M
+    start_n = tl.program_id(axis=1).to(tl.int64) * BLOCK_N
+    x_in_ptr += start_m * stride_x_m + start_n * stride_x_n
+    qx_ptr += start_m * stride_q_m + start_n * stride_q_n
 
-    offs = pid * x_in_stride_r + tl.arange(0, NUM_COL_POW2)
-    mask = tl.arange(0, NUM_COL_POW2) < cols
-    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
+    offs_m = tl.arange(0, BLOCK_M)[:, None]
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
+    mask = (start_m + offs_m < rows) & (start_n + offs_n < cols)
+
+    x = tl.load(
+        x_in_ptr + offs_m * stride_x_m + offs_n * stride_x_n,
+        mask=mask,
+        cache_modifier=".cg",
+    )
 
     scale = tl.load(scale_in_ptr)
-    scale_recip = 1 / scale
+    # This only applies NR on 1/scale which is much faster than NR on qx result,
+    # while not hurting accuracy substantially
+    qx = x * (1 / scale)
 
-    qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
-
-    tl.store(qx_ptr + offs, qx, mask=mask)
+    tl.store(
+        qx_ptr + offs_m * stride_q_m + offs_n * stride_q_n,
+        qx.to(qx_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 _dynamic_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
@@ -322,7 +341,6 @@ _dynamic_mxfp4_quant_repr = make_kernel_repr(
         "EVEN_M_N",
         "SCALING_MODE",
         "num_warps",
-        "num_stages",
     ],
 )
 
@@ -353,6 +371,9 @@ def _dynamic_mxfp4_quant_kernel(
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     EVEN_M_N: tl.constexpr,
     SCALING_MODE: tl.constexpr,
+    # Declared so the launch warp count reaches the repr and distinguishes the
+    # compiled artifacts; Triton still applies it as the launch option.
+    num_warps: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -418,7 +439,9 @@ def _dynamic_mxfp4_quant_kernel(
 
 
 @triton.jit
-def _mxfp8_quant_op(x_grouped, QUANT_AXIS: tl.constexpr):
+def _mxfp8_quant_op(
+    x_grouped, QUANT_AXIS: tl.constexpr, LOG2_DTYPE_MAX: tl.constexpr = 8
+):
     """Shared MXFP8 (1x32 e8m0) scale derivation.
 
     Given a fp32 tile where the QUANT_AXIS dim is sized QUANT_BLOCK_SIZE (=32),
@@ -430,7 +453,7 @@ def _mxfp8_quant_op(x_grouped, QUANT_AXIS: tl.constexpr):
     amax_i32 = amax.to(tl.int32, bitcast=True)
     amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
     amax_p2 = amax_i32.to(tl.float32, bitcast=True)
-    scale_unbiased = tl.log2(amax_p2).floor() - 8
+    scale_unbiased = tl.log2(amax_p2).floor() - LOG2_DTYPE_MAX
     scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
     scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)
     quant_scale = tl.exp2(-scale_unbiased)

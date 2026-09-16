@@ -11,6 +11,7 @@ from .kernels.kernels_common import get_warp_size
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_decode import (
     build_topk_per_row_decode_module,
+    topk_per_row_decode_chunks,
     topk_per_row_decode_workspace_shapes,
 )
 from .kernels.topk_per_row_decode_persistent import (
@@ -91,6 +92,14 @@ def _validate_topk_signature(
     rows = logits_shape[0]
     if num_rows != rows:
         raise ValueError("num_rows must equal logits.shape[0]")
+    # There used to be a refusal here at 4 GiB. The kernels built one buffer
+    # descriptor over the whole logits tensor, and both `num_records` and the
+    # load's voffset in it are 32-bit byte quantities, so a row past 4 GiB was
+    # unaddressable and read as zero -- silently wrong rather than faulting, at
+    # 4096 x 262144 but not 4095 x 262144. They now slice the row before
+    # building the descriptor, which puts the row's base in the descriptor's
+    # 48-bit base address and leaves only an offset within the row, so the
+    # tensor as a whole is no longer bounded. The refusal went with it.
     if (stride0, stride1) != logits_stride:
         raise ValueError("stride0 and stride1 must match logits strides")
 
@@ -298,7 +307,11 @@ def flydsl_top_k_per_row_decode(
         )
         return
 
-    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable)
+    # One row is `chunks` blocks, so the split has to follow the row count: at
+    # one row, 16 chunks leaves all but a handful of CUs idle, and at many rows
+    # it makes the single-block reduce walk counters nobody needed.
+    chunks = topk_per_row_decode_chunks(rows, width, wave_size)
+    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable, chunks)
     partial_hist, state = _get_topk_workspace(
         logits.device,
         stream.cuda_stream,
@@ -311,6 +324,7 @@ def flydsl_top_k_per_row_decode(
         stable,
         wave_size=wave_size,
         write_values=values is not None,
+        chunks_per_row=chunks,
     )
     _run_compiled(
         launcher,
