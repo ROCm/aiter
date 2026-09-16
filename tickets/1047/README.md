@@ -335,6 +335,18 @@ at 8k / 32k / 128k for ``H`` 4 and 8. #4882 Triton and Gluon select.
 | 1 | 131072 | 8 | 32768 | 2022.0 | 29.9 | 27.4 | 0 |
 | 8 | 131072 | 8 | 32768 | 2036.2 | 56.2 | 45.3 | 0 |
 
+## Phase 2h — family B K1 emit vs #4882 (closed)
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. **2h is closed** on emit /
+``visible <= 512`` (``H`` 4 and 8, 2e/2f tables) plus the published
+indexer point: ``M=32``, ``H=4``, ``D=128``, ``page_size=8``,
+``n_blocks=512`` (512 compressed keys, 64 pages). Oracle set equality
+`err=0`. Long-L remains a 2g recorded loss.
+
+| m | seq_len | page_size | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|----------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 32 | 2048 | 8 | 4 | 512 | 2.3 | 9.7 | 9.6 | 0 |
+
 
 
 
