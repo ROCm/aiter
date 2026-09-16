@@ -15,7 +15,6 @@ import math
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 from aiter.ops.triton.attention.mxfp8_attention import mxfp8_attention_forward
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
@@ -44,8 +43,8 @@ def _make_inputs(B, H, S, D, dtype, quant_block_size=32, device="cuda"):
 
 def benchmark(args):
     arch = get_arch()
-    if arch not in FP8_ARCHS:
-        print(f"Skipping: MXFP8 attention not supported on {arch}")
+    if arch != "gfx950":
+        print(f"Skipping: MXFP8 attention requires gfx950 (CDNA4), got {arch}")
         return
 
     causal = args.causal
