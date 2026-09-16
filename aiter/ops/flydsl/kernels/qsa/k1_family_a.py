@@ -8,13 +8,14 @@ complete causal blocks, and merges a running LDS top-512. Writes
 ``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
 
 When ``visible <= 512`` the selected set is every complete block: one
-workgroup per row writes those ids. Each new tile is scored as a
-``4 x 512 x 128`` BF16 GEMM (16x16x16 MFMA, ReLU-sum over heads), then
-wave-sorted and merged across eight waves (LDS XOR for strides
-``>= 64``, shuffle for 32..1). Decode rows with more than one 512-slot
-tile split columns across eight workgroups (idle splits write ``-inf``
-heaps) and pair-merge those sorted heaps. Prefill streams tiles in one
-workgroup per row.
+workgroup per row writes those ids. Serial (prefill) tiles are scored as
+a ``4 x 512 x 128`` BF16 GEMM (16x16x16 MFMA, ReLU-sum). Split (decode)
+tiles use the pipelined vec8 column scorer. Each tile is then wave-sorted
+and merged across eight waves (LDS XOR for strides ``>= 64``, shuffle
+for 32..1). Decode rows with more than one 512-slot tile split columns
+across eight workgroups (idle splits write ``-inf`` heaps) and
+pair-merge those sorted heaps. Prefill streams tiles in one workgroup
+per row.
 """
 
 from functools import lru_cache
@@ -418,8 +419,6 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         raise ValueError("family A local heap is one tile (k=512)")
     if _D % _VEC:
         raise ValueError("head dimension must be a multiple of vector width")
-    if _D % _MFMA or _H > _MFMA or _N_ROUNDS != 4:
-        raise ValueError("family A indexer GEMM needs 4x512x128 with 16x16x16 MFMA")
     if _SPLITS & (_SPLITS - 1) or _CANDIDATES != 2 * _K:
         raise ValueError("heap tree merge needs 2^n sorted 512-heaps")
     tile_steps = _TILE // _BLOCK_THREADS
@@ -437,13 +436,11 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         wav=3,
         pipe=2,
         liv=1,
-        mma=1,
     )
 
     @fx.struct
     class SplitStorage:
         q: fx.Array[BFloat16, _H * _D, 16]
-        k: fx.Array[BFloat16, _TILE * _MFMA, 16]
         cand_s: fx.Array[Float32, _CANDIDATES, 16]
         cand_c: fx.Array[Int32, _CANDIDATES, 16]
 
@@ -489,7 +486,6 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         )
         storage = fx.SharedAllocator().allocate(SplitStorage).peek()
         smem_q = storage.q.view(fx.make_layout((_H, _D), (_D, 1)))
-        smem_k = storage.k.view(fx.make_layout((_TILE, _MFMA), (_MFMA, 1)))
         cand_s = storage.cand_s.view(fx.make_layout(_CANDIDATES, 1))
         cand_c = storage.cand_c.view(fx.make_layout(_CANDIDATES, 1))
 
@@ -509,11 +505,44 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
         end = (end_raw < n_tiles).select(end_raw, n_tiles)
         start = (start < n_tiles).select(start, n_tiles)
         lane = gpu.lane_id()
-        wave = tid // Int32(_WAVE)
-        z16 = BFloat16(0)
 
         def better(s, c, bs, bc):
             return (c >= zero) & ((s > bs) | ((s == bs) & ((bc < zero) | (c < bc))))
+
+        def score_col(col):
+            logical_page = _idiv(col, page)
+            off = col - logical_page * page
+            phys = page_table[safe_req, logical_page]
+            k_row = fx.slice(k_buf, (phys, off, zero, None))
+            k_chunks = fx.logical_divide(k_row, vec_layout)
+            total = Float32(0.0)
+            for h in range_constexpr(_H):
+                q_chunks = fx.logical_divide(fx.slice(smem_q, (h, None)), vec_layout)
+                acc = Float32(0.0)
+                k_src = fx.slice(k_chunks, (None, 0))
+                q_src = fx.slice(q_chunks, (None, 0))
+                k_frag = fx.make_fragment_like(k_src)
+                q_frag = fx.make_fragment_like(q_src)
+                fx.copy(k_copy, k_src, k_frag)
+                fx.copy(q_store, q_src, q_frag)
+                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
+                q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+                for chunk in range_constexpr(_D // _VEC - 1):
+                    nxt = chunk + 1
+                    nk_src = fx.slice(k_chunks, (None, nxt))
+                    nq_src = fx.slice(q_chunks, (None, nxt))
+                    nk_frag = fx.make_fragment_like(nk_src)
+                    nq_frag = fx.make_fragment_like(nq_src)
+                    fx.copy(k_copy, nk_src, nk_frag)
+                    fx.copy(q_store, nq_src, nq_frag)
+                    for j in range_constexpr(_VEC):
+                        acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
+                    k_vec = fx.Vector(fx.memref_load_vec(nk_frag))
+                    q_vec = fx.Vector(fx.memref_load_vec(nq_frag))
+                for j in range_constexpr(_VEC):
+                    acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
+                total = total + acc.maximumf(Float32(0.0))
+            return total * score_scale
 
         if visible > Int32(_K):
             if tid < Int32(_Q_THREADS):
@@ -533,81 +562,17 @@ def build_qsa_k1_family_a_split_merge(page_size: int):
 
             for tile in range(start, end, one):
                 tile_base = tile * Int32(_TILE)
-                acc0 = fx.Float32x4(0.0)
-                acc1 = fx.Float32x4(0.0)
-                acc2 = fx.Float32x4(0.0)
-                acc3 = fx.Float32x4(0.0)
-                for kt in range_constexpr(_D // _MFMA):
-                    local = tid
-                    col = tile_base + local
-                    live = (col < n_col) & (col < visible) & valid_req
-                    k_dst_chunks = fx.logical_divide(
-                        fx.slice(smem_k, (local, None)), vec_layout
-                    )
+                for t in range_constexpr(tile_steps):
+                    local = tid + Int32(t * _BLOCK_THREADS)
+                    blk = tile_base + local
+                    candidate = Int32(_K) + local
+                    live = (blk < n_col) & (blk < visible) & valid_req
                     if live:
-                        logical_page = _idiv(col, page)
-                        off = col - logical_page * page
-                        phys = page_table[safe_req, logical_page]
-                        k_chunks = fx.logical_divide(
-                            fx.slice(k_buf, (phys, off, zero, None)), vec_layout
-                        )
-                        for v in range_constexpr(_MFMA // _VEC):
-                            src = fx.slice(k_chunks, (None, kt * (_MFMA // _VEC) + v))
-                            dst = fx.slice(k_dst_chunks, (None, v))
-                            frag = fx.make_fragment_like(src)
-                            fx.copy(k_copy, src, frag)
-                            fx.copy(q_store, frag, dst)
+                        cand_s[candidate] = score_col(blk)
+                        cand_c[candidate] = blk
                     else:
-                        for v in range_constexpr(_MFMA):
-                            smem_k[local, Int32(v)] = z16
-                    gpu.barrier()
-                    m_a = lane % Int32(_MFMA)
-                    k0 = (lane // Int32(_MFMA)) * Int32(4)
-                    is_q = m_a < Int32(_H)
-                    sm = is_q.select(m_a, zero)
-                    kd = Int32(kt * _MFMA) + k0
-                    a_elems = [
-                        is_q.select(smem_q[sm, kd], z16),
-                        is_q.select(smem_q[sm, kd + one], z16),
-                        is_q.select(smem_q[sm, kd + Int32(2)], z16),
-                        is_q.select(smem_q[sm, kd + Int32(3)], z16),
-                    ]
-
-                    def k_elems(n_round):
-                        n_in = lane % Int32(_MFMA)
-                        brow = (
-                            Int32(n_round * _WAVES * _MFMA) + wave * Int32(_MFMA) + n_in
-                        )
-                        return [
-                            smem_k[brow, k0],
-                            smem_k[brow, k0 + one],
-                            smem_k[brow, k0 + Int32(2)],
-                            smem_k[brow, k0 + Int32(3)],
-                        ]
-
-                    acc0 = _mfma_bf16_16x16x16(a_elems, k_elems(0), acc0)
-                    acc1 = _mfma_bf16_16x16x16(a_elems, k_elems(1), acc1)
-                    acc2 = _mfma_bf16_16x16x16(a_elems, k_elems(2), acc2)
-                    acc3 = _mfma_bf16_16x16x16(a_elems, k_elems(3), acc3)
-                    gpu.barrier()
-                if lane < Int32(_MFMA):
-                    accs = (acc0, acc1, acc2, acc3)
-                    n_in = lane
-                    for nr in range_constexpr(_N_ROUNDS):
-                        acc = accs[nr]
-                        total = (
-                            acc[0].maximumf(Float32(0.0))
-                            + acc[1].maximumf(Float32(0.0))
-                            + acc[2].maximumf(Float32(0.0))
-                            + acc[3].maximumf(Float32(0.0))
-                        )
-                        local = Int32(nr * _WAVES * _MFMA) + wave * Int32(_MFMA) + n_in
-                        col = tile_base + local
-                        live = (col < n_col) & (col < visible) & valid_req
-                        cand_s[Int32(_K) + local] = live.select(
-                            total * score_scale, _neg_inf()
-                        )
-                        cand_c[Int32(_K) + local] = live.select(col, neg_one)
+                        cand_s[candidate] = _neg_inf()
+                        cand_c[candidate] = neg_one
                 gpu.barrier()
                 ws = cand_s[Int32(_K) + tid]
                 wc = cand_c[Int32(_K) + tid]
@@ -942,8 +907,9 @@ def qsa_k1_family_a_block_ids(
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Short rows emit complete-block ids. Decode rows with more than one
-    512-slot tile split columns across eight workgroups and pair-merge
-    those sorted heaps. Prefill streams tiles in one workgroup per row.
+    512-slot tile split columns across eight workgroups, score with the
+    pipelined vec8 scorer, and pair-merge those sorted heaps. Prefill
+    streams tiles in one workgroup and scores with a 4x512x128 MFMA.
     Does not allocate a score matrix. Expand+tail is still a separate
     launch.
     """
