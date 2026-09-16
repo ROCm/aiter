@@ -2124,15 +2124,9 @@ a8w8_mxscale_bmm_bpreshuffle_kernels_list = {
     64: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True),  # cc_gn128
     65: _bpreshuf(B_M=128, B_N=128, B_K=256, BLOCK_SIZE=128, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, c_via_lds=True),  # cc_gn128_ctdm
     # depth experiments against kid60: 66 pays kExpK, 67 pays reuse.
-    66: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=128, num_slots=4, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True),  # fly256_nb4_ctdm
-    67: _bpreshuf(B_M=128, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=3, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True),  # ns128x256_nb3_ctdm
     # DS_FINE_WAIT: one wait per row instead of the front/back pair.
-    68: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True, ds_fine_wait=True),  # kid60 + fine wait
-    69: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=128, num_slots=4, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True, ds_fine_wait=True),  # kid66 + fine wait
     # issue_mid: the ring's TDM issue moved between the front and back WMMAs,
     # where FlyDSL puts its own. Geometry is otherwise the parent's exactly.
-    70: _bpreshuf(B_M=256, B_N=256, B_K=128, BLOCK_SIZE=128, num_slots=4, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True, issue_mid=True),  # kid66 + issue mid
-    71: _bpreshuf(B_M=256, B_N=256, B_K=256, BLOCK_SIZE=128, num_slots=2, WG_PER_CU=1, GROUP_N=128, sf_a_lds=True, sf_b_lds=True, tile_m=2, no_spec=True, c_via_lds=True, issue_mid=True),  # kid60 + issue mid
 }
 
 # The two BROKEN-by-construction kids, excluded from any sweep.
@@ -2182,20 +2176,13 @@ A8W8_MXSCALE_BMM_BPRESHUFFLE_INSTANCES = [
     ("OPUS_BMM_BPRESHUF_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfab_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_fw_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_im_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_full_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly_quad_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_sfatdm_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_arf_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_fw_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_im_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_im0_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_im1_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_sf_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_sf_bk256_gfx1250"),
@@ -2203,7 +2190,6 @@ A8W8_MXSCALE_BMM_BPRESHUFFLE_INSTANCES = [
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_la4_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_n128_s3_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_n64_gfx1250"),
-    ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128x256_nb3_ctdm_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128x512_gn128_sf_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gfx1250"),
     ("OPUS_BMM_BPRESHUF_NS_INST", "opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_bk256_gfx1250"),

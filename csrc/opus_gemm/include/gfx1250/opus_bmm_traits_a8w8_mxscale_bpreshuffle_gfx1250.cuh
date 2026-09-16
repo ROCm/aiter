@@ -228,6 +228,9 @@ template<int BLOCK_SIZE_,
          // The A fragments are issued last and in row order, so waiting for one
          // more of them per row turns each drain into "one fragment" instead of
          // "half the tile".
+         // Measured at +-1% across the tiles that carried it (two were built
+         // and both landed inside the noise), so it is kept as a knob rather
+         // than a recommendation.
          bool DS_FINE_WAIT_ = false,
          // Where the ring's TDM issue sits relative to the K-step's WMMAs.
          // false keeps it ahead of consume_slot, which is what drove
@@ -242,6 +245,16 @@ template<int BLOCK_SIZE_,
          // the reads are waited on the instruction after they are posted:
          // ATT measures 35 cycles a dscnt hit here against FlyDSL's 7.
          // Costs some of the tensorcnt lead, so it is the trade, not a win.
+         // MEASURED, AND IT LOSES ON A SHALLOW RING. Three tiles carried this
+         // and all three regressed at b=16 M=16384: a 2-slot ring +8.5% with
+         // the issue at the half-K-step boundary, +10.5% and +25.8% with it at
+         // the quarter and three-quarter points of a quadrant body. The reason
+         // is not the body's shape, which is what the third attempt was meant
+         // to rule out: 2 slots leave ONE step of TDM lookahead, so whatever
+         // the issue is delayed by lands on the critical path directly. It
+         // pays only where there is depth to spend -- a 4-slot B_K=128 tile
+         // gained 1.9% -- and that tile is 12% off the 2-slot one to begin
+         // with. Do not re-try this on the shipped geometry.
          bool ISSUE_MID_ = false,
          // Compute the K-step as FOUR kExpM/2 x kExpN/2 accumulator quadrants
          // with a staged drain before each, instead of TWO kExpM/2 x kExpN full
@@ -258,6 +271,19 @@ template<int BLOCK_SIZE_,
          //   * the accumulator is touched in 16-register blocks rather than 32,
          //     which matters because acc is kExpM*kExpN*8 = 512 VGPRs and the
          //     hardware reaches past v255 through s_set_vgpr_msb.
+         // WORTH 2.5% ON THE SHIPPED TILE, and the reason is the staged drain,
+         // not the accumulator blocking: ATT has s_wait_dscnt going from 5392
+         // hits at 28.6 cycles to 6032 at 14.3 (-44% in total) while
+         // s_set_vgpr_msb in the loop body went the WRONG way, 56 -> 64. The
+         // bank-locality argument for 16-register blocks over 32 is therefore
+         // not what pays.
+         //
+         // Copying FlyDSL's whole configuration was tried once the pieces were
+         // in place -- B_K=128, 4 slots, quadrants, the mid issue -- and it
+         // came out at 452.1us against 406.9 for this tile's own 2-slot
+         // B_K=256 shape. The K-direction reuse a deep B_K buys is worth more
+         // here than the lookahead a wide ring buys. Take FlyDSL's methods,
+         // not its geometry.
          bool QUADRANT_ = false,
          // Which ik fires the ring's TDM issue when ISSUE_MID is on. At kExpK=2
          // the quadrant 2/3 boundary of ik 0 is only a quarter of the way into
@@ -1941,56 +1967,12 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_gfx1250 =
 //           1.5 ds_reads per WMMA against kid60's 1.0.
 //
 // So the pair separates "is depth worth it" from "which side should pay".
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
-        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/128,
-        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
-        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
-        /*GROUP_K*/128, /*NUM_SLOTS*/4, /*WG_PER_CU*/1, /*GROUP_N*/128,
-        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
-        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
-        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
-        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true>;
 
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128x256_nb3_ctdm_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
-        /*BLOCK_SIZE*/128, /*B_M*/128, /*B_N*/256, /*B_K*/256,
-        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
-        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
-        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
-        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
-        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
-        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
-        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true>;
 
 // kid68/kid69: DS_FINE_WAIT on the two tiles worth asking about -- kid60,
 // which the heuristic actually routes to, and kid66, where the ATT evidence
 // for the change came from. See DS_FINE_WAIT_ for that measurement.
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_fw_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
-        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
-        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
-        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
-        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
-        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
-        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
-        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
-        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true, /*DS_FINE_WAIT*/true>;
 
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_fw_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
-        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/128,
-        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
-        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
-        /*GROUP_K*/128, /*NUM_SLOTS*/4, /*WG_PER_CU*/1, /*GROUP_N*/128,
-        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
-        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
-        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
-        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true, /*DS_FINE_WAIT*/true>;
 
 // kid34: FlyDSL's ACTUAL shape at the prefill point, which kid32/33 miss.
 //
@@ -2181,31 +2163,7 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_gfx1250 =
 // asked for this: at M=16384 our s_wait_dscnt costs 35 cycles a hit against
 // FlyDSL's 7, and the reason is that our issue sat AHEAD of every ds_read, so
 // the wait came on the instruction after the reads were posted.
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_ctdm_im_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
-        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/128,
-        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
-        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
-        /*GROUP_K*/128, /*NUM_SLOTS*/4, /*WG_PER_CU*/1, /*GROUP_N*/128,
-        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
-        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
-        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
-        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true, /*DS_FINE_WAIT*/false,
-        /*ISSUE_MID*/true>;
 
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_im_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
-        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
-        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
-        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
-        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
-        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
-        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
-        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
-        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true, /*DS_FINE_WAIT*/false,
-        /*ISSUE_MID*/true>;
 
 // kid72: kid60 with the K-step computed as four accumulator quadrants.
 // ISSUE_MID stays false so this measures the quadrant split alone -- kid71
@@ -2230,24 +2188,7 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_gfx1250 =
 // FlyDSL pays only 128.3 there, and its issue() sits exactly at this boundary.
 // kid71 is not a counter-example: that moved the issue inside a TWO-block body,
 // where the midpoint is half a K-step later rather than a quarter.
-#define _QUAD_BASE(IM, IK)                                                     \
-        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,                 \
-        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,                              \
-        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,  \
-        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,        \
-        /*SF_A_LDS*/true, /*SF_B_LDS*/true,                                    \
-        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,    \
-        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,    \
-        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true, /*DS_FINE_WAIT*/false,              \
-        /*ISSUE_MID*/IM, /*QUADRANT*/true, /*ISSUE_MID_IK*/IK
 
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_im0_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<_QUAD_BASE(true, 0)>;
-
-template <typename DataC>
-using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_im1_gfx1250 =
-    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<_QUAD_BASE(true, 1)>;
 
 // kid75 / kid76: FlyDSL's configuration, assembled rather than approached.
 // t256x256x128_mw2_nw2_nb4 is B_K = 128 with FOUR slots, the quadrant body and
