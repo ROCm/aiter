@@ -37,7 +37,7 @@ the relevant phase as evidence.
 ## Progress
 
 - [x] 0. Repo layout + oracle (no kernel yet)
-- [ ] 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
+- [x] 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
 - [ ] 2. FlyDSL K1 (scorer + fused top-k) — family A then B
 - [ ] 3. FlyDSL K2 (sparse GQA) — family A then B
 - [ ] 4. Wire `aiter/ops/flydsl/` + vLLM `qwen4_exp` opt-in
@@ -213,7 +213,10 @@ separate steps (plumbing → live AMD → #4882 → rocprof).
       on family B: indexer H 4/8 D=128, GQA group 5 / D=128 / width 2051).
       Family A GQA is not launched on Gluon. Kernels:
       `aiter/ops/triton/_gluon_kernels/gfx950/attention/qsa_{paged_mqa_logits,sparse_paged_gqa}.py`.
-- [ ] Family A table and family B table; never merge them.
+- [x] Family A table and family B table; never merge them. Family A:
+      plumbing, live AMD, #4882 Triton. Family B: #4882 Triton and Gluon
+      (`bench_qsa_family_b_4882_triton` is a separate table). Pasted in
+      `tickets/1047/README.md` phase 1f (`M∈{1,8}`, `L∈{512,8192,32768}`).
 - [x] rocprof **one real QSA layer** (indexer through GQA) at short and long
       `L`, including HIP graph replay at decode. Driver:
       `tickets/1047/profile_qsa_layer.py`; notes in `tickets/1047/README.md`
@@ -227,7 +230,7 @@ separate steps (plumbing → live AMD → #4882 → rocprof).
       a new full-layer rocprof, is what later phases compare against). Prefill
       `M=512` under the fallback: GQA slightly ahead at 8k; select ahead at
       32k. 128k decode fits; 1M not run.
-- [ ] **Done when:** both family tables exist with live AMD + oracle + #4882
+- [x] **Done when:** both family tables exist with live AMD + oracle + #4882
       where it dispatches; a short note states which side of QSA dominates at
       the locked lengths on GPU 6.
 
