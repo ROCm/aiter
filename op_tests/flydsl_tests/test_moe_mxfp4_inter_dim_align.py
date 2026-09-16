@@ -126,6 +126,5 @@ def test_mxfp4_swiglu_non_256_aligned_numerics(inter_dim):
 
     assert not out.isnan().any().item(), f"inter_dim={inter_dim}: output has NaN"
     err = _rel_l2(out, ref)
-    # mxfp4 quantisation alone lands near 5e-3; the CK-Tile scale mis-indexing
-    # this test guards against produces 0.7 or more.
+    # MXFP4 quantisation lands near 5e-3; broken CK-Tile scale indexing is >=0.7.
     assert err < 5e-2, f"inter_dim={inter_dim}: rel L2 {err:.6f} too large"

@@ -6,6 +6,7 @@ import functools
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import aiter
 import aiter.fused_moe as fused_moe_module
@@ -13,6 +14,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import cktile_moe_stage2, get_2stage_cfgs
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.shuffle import shuffle_scale
 
 _SKIP = pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
@@ -41,6 +43,7 @@ def _dispatch(
     model_dim=MODEL_DIM,
     inter_dim=INTER_DIM,
     gate_mode=GateMode.SEPARATED,
+    q_dtype_a=dtypes.bf16,
 ):
     get_2stage_cfgs.cache_clear()
     return get_2stage_cfgs(
@@ -50,7 +53,7 @@ def _dispatch(
         E,
         TOPK,
         dtypes.bf16,
-        dtypes.bf16,
+        q_dtype_a,
         dtypes.fp4x2,
         QuantType.per_1x32,
         True,
@@ -94,6 +97,23 @@ def test_mxfp4_swiglu_dispatch_by_inter_dim_alignment(inter_dim, want):
 def test_mxfp4_swiglu_does_not_reroute_to_unsupported_a16w4(kwargs):
     meta = _dispatch(**kwargs)
     assert _stage_backend(meta.stage2) == "cktile"
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    ("q_dtype_a", "gate_mode", "want"),
+    [
+        (dtypes.bf16, GateMode.SEPARATED, "flydsl"),
+        (dtypes.bf16, GateMode.INTERLEAVE, "cktile"),
+        (dtypes.fp4x2, GateMode.SEPARATED, "flydsl"),
+        (dtypes.fp4x2, GateMode.INTERLEAVE, "cktile"),
+        (dtypes.fp8, GateMode.SEPARATED, "cktile"),
+        (dtypes.fp8, GateMode.INTERLEAVE, "flydsl"),
+    ],
+)
+def test_mxfp4_swiglu_takeover_matches_weight_layout(q_dtype_a, gate_mode, want):
+    meta = _dispatch(q_dtype_a=q_dtype_a, gate_mode=gate_mode)
+    assert _stage_backend(meta.stage2) == want
 
 
 @_SKIP
@@ -145,13 +165,17 @@ def test_cktile_stage2_rejects_unsafe_mxfp4_shape(monkeypatch):
         "moe_cktile2stages_gemm2",
         lambda *args, **kwargs: pytest.fail("unsafe CK-Tile kernel was called"),
     )
-    a2 = SimpleNamespace(shape=(TOKEN, TOPK, INTER_DIM))
-    w2 = SimpleNamespace(dtype=dtypes.fp4x2)
+    a2 = SimpleNamespace(shape=(TOKEN, TOPK, INTER_DIM // 2))
+    w1 = SimpleNamespace(shape=(E, INTER_DIM * 2, MODEL_DIM // 2))
+    w2 = SimpleNamespace(
+        dtype=dtypes.fp4x2,
+        shape=(E, MODEL_DIM, INTER_DIM // 2),
+    )
 
     with pytest.raises(NotImplementedError, match="inter_dim.*multiple of 256"):
         cktile_moe_stage2(
             a2,
-            None,
+            w1,
             w2,
             None,
             None,
@@ -172,12 +196,13 @@ def test_cktile_stage2_allows_aligned_mxfp4_shape(monkeypatch):
         "moe_cktile2stages_gemm2",
         lambda *args, **kwargs: called.append(True),
     )
-    a2 = SimpleNamespace(shape=(TOKEN, TOPK, 512))
-    w2 = SimpleNamespace(dtype=dtypes.fp4x2)
+    a2 = SimpleNamespace(shape=(TOKEN, TOPK, 128))
+    w1 = SimpleNamespace(shape=(E, 512, MODEL_DIM // 2))
+    w2 = SimpleNamespace(dtype=dtypes.fp4x2, shape=(E, MODEL_DIM, 128))
 
     cktile_moe_stage2(
         a2,
-        None,
+        w1,
         w2,
         None,
         None,
@@ -189,6 +214,32 @@ def test_cktile_stage2_allows_aligned_mxfp4_shape(monkeypatch):
         32,
     )
     assert called == [True]
+
+
+def _undo_shuffle_scale(scale):
+    sm, sn = scale.shape
+    return (
+        scale.view(sm // 32, sn // 8, 4, 16, 2, 2)
+        .permute(0, 5, 3, 1, 4, 2)
+        .contiguous()
+        .view(sm, sn)
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "src_value", "pad_value"),
+    [
+        (torch.uint8, 0x22, 0x7F),
+        (torch.bfloat16, 2.0, 1.0),
+    ],
+)
+def test_shuffle_scale_standard_layout_initializes_padding(dtype, src_value, pad_value):
+    src = torch.tensor([[src_value]], dtype=dtype)
+    padded = _undo_shuffle_scale(shuffle_scale(src))
+
+    assert padded[0, 0].item() == src_value
+    padded[0, 0] = pad_value
+    assert torch.all(padded == pad_value)
 
 
 if __name__ == "__main__":

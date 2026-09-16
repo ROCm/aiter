@@ -2694,7 +2694,13 @@ def _can_reroute_mxfp4_to_flydsl(
         and activation == ActivationType.Swiglu
         and inter_dim % 128 == 0
         and model_dim % 256 == 0
-        and (gate_mode == GateMode.SEPARATED or q_dtype_a == dtypes.fp8)
+        and (
+            (
+                q_dtype_a in (dtypes.bf16, dtypes.fp4x2)
+                and gate_mode == GateMode.SEPARATED
+            )
+            or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
+        )
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -4853,7 +4859,7 @@ def cktile_moe_stage2(
     bias2=None,
     kernel_name="",
 ):
-    inter_dim = a2.shape[-1]
+    _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
     # Defense in depth for direct callers and tuned metadata.
     if w2.dtype == dtypes.fp4x2 and inter_dim % 256 != 0:
         raise NotImplementedError(
