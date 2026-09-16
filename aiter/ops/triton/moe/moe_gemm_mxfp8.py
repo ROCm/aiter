@@ -55,9 +55,12 @@ def moe_gemm_mxfp8(
         Output tensor ``[total_tokens, N]``.
     """
     _LOGGER.info(
-        f"MOE_GEMM_MXFP8: lhs={tuple(lhs.shape)} rhs={tuple(rhs.shape)} "
-        f"x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)} "
-        f"block_size={quant_block_size}"
+        "MOE_GEMM_MXFP8: lhs=%s rhs=%s x_scale=%s w_scale=%s block_size=%s",
+        tuple(lhs.shape),
+        tuple(rhs.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
+        quant_block_size,
     )
 
     total_tokens = lhs.shape[0]

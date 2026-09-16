@@ -196,7 +196,7 @@ def pa_decode_sparse(
 
     T, H, D = q.shape
     _LOGGER.info(
-        f"PA_DECODE_SPARSE T={T} H={H} D={D} " f"total_indices={kv_indices.shape[0]}"
+        "PA_DECODE_SPARSE T=%d H=%d D=%d total_indices=%d", T, H, D, kv_indices.shape[0]
     )
 
     out = torch.empty_like(q)

@@ -109,14 +109,26 @@ def calculate_heap_size(
     total_with_overhead = math.ceil(total_bytes * overhead_factor)
 
     logger.debug(
-        f"Heap size calculation: M={M}, N={N}, dtype={dtype}, world_size={world_size}, "
-        f"quant_mode={quant_mode}, all_gather={all_gather}\n"
-        f"  Input: {mem_input:,} bytes\n"
-        f"  RS buffer: {mem_rs:,} bytes\n"
-        f"  Quant buffer: {mem_quant:,} bytes\n"
-        f"  Gather buffer: {mem_gather:,} bytes\n"
-        f"  Total (with {overhead_factor}x overhead): {total_with_overhead:,} bytes "
-        f"({total_with_overhead / (1024**3):.2f} GB)"
+        "Heap size calculation: M=%d, N=%d, dtype=%s, world_size=%d, "
+        "quant_mode=%s, all_gather=%s\n"
+        "  Input: %d bytes\n"
+        "  RS buffer: %d bytes\n"
+        "  Quant buffer: %d bytes\n"
+        "  Gather buffer: %d bytes\n"
+        "  Total (with %sx overhead): %d bytes (%.2f GB)",
+        M,
+        N,
+        dtype,
+        world_size,
+        quant_mode,
+        all_gather,
+        mem_input,
+        mem_rs,
+        mem_quant,
+        mem_gather,
+        overhead_factor,
+        total_with_overhead,
+        total_with_overhead / (1024**3),
     )
 
     return total_with_overhead
@@ -178,7 +190,10 @@ class IrisCommContext:
             self.num_ranks = self.iris_ctx.num_ranks
 
             logger.info(
-                f"Iris context initialized: rank {self.cur_rank}/{self.num_ranks}, heap_size={self.heap_size}"
+                "Iris context initialized: rank %d/%d, heap_size=%d",
+                self.cur_rank,
+                self.num_ranks,
+                self.heap_size,
             )
         return self
 

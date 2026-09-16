@@ -58,7 +58,7 @@ def static_per_tensor_quant_fp8_i8(
     Returns:
     - qx: Quantized output values.
     """
-    _LOGGER.info(f"STAIC_PER_TENSOR_QUANT_FP8_I8: x={tuple(x_in.shape)}")
+    _LOGGER.info("STAIC_PER_TENSOR_QUANT_FP8_I8: x=%s", tuple(x_in.shape))
     assert scale_in.numel() == 1  # only single scale value
     # per_tensor_quant_triton hands in a 2D x with an N-D qx, so view both as 2D
     # rather than trusting qx.stride(0); .view still writes the caller's buffer.
@@ -111,7 +111,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     - qx: Quantized output values of shape (M, N) with dtype fp8 or int8
     - scale_out: Single scale value of shape (1,)
     """
-    _LOGGER.info(f"DYNAMIC_PER_TENSOR_QUANT_FP8_I8: x={tuple(x_in.shape)}")
+    _LOGGER.info("DYNAMIC_PER_TENSOR_QUANT_FP8_I8: x=%s", tuple(x_in.shape))
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
@@ -151,7 +151,7 @@ def dynamic_per_token_quant_fp8_i8(
     - qx: Quantized output values.
     - scale_out: Scale tensor of shape (M, )
     """
-    _LOGGER.info(f"DYNAMIC_PER_TOKEN_QUANT_FP8_I8: x={tuple(x_in.shape)}")
+    _LOGGER.info("DYNAMIC_PER_TOKEN_QUANT_FP8_I8: x=%s", tuple(x_in.shape))
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
@@ -195,7 +195,7 @@ def dynamic_mxfp4_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
-    _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info("DYNAMIC_MXFP4_QUANT: x=%s", tuple(x.shape))
     # Assume x is 2D-Tensor for now
     M, N = x.shape
 
@@ -472,7 +472,7 @@ def dynamic_nvfp4_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e4m3).
     """
-    _LOGGER.info(f"DYNAMIC_NVFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info("DYNAMIC_NVFP4_QUANT: x=%s", tuple(x.shape))
     # Assume x is 2D-Tensor for now
     M, N = x.shape
 

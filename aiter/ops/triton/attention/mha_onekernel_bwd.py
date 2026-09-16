@@ -101,8 +101,14 @@ def flash_attn_onekernel_backward(
         torch.Tensor: Delta tensor (element-wise product of do and o) with shape matching softmax_lse.
     """
     _LOGGER.info(
-        f"FLASH_ATTN_ONEKERNEL_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
-        + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+        "FLASH_ATTN_ONEKERNEL_BKWD: do=%s q=%s  k=%s  v=%s dq=%s  dk=%s  dv=%s",
+        tuple(do.shape),
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(dq.shape),
+        tuple(dk.shape),
+        tuple(dv.shape),
     )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
