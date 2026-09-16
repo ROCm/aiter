@@ -79,6 +79,7 @@ def _make_out_scale(
     sorted_expert_ids: Tensor,
     block_m: int,
     inter_dim: int,
+    zero_init: bool = False,
 ) -> Tensor:
     sorted_size = max(
         int(sorted_token_ids.numel()),
@@ -88,7 +89,8 @@ def _make_out_scale(
     scale_cols = inter_dim // _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP
     padded_cols = (scale_cols + 7) // 8 * 8
     # Stage1 writes every valid-route scale, and Stage2 discards padding-route results.
-    return torch.empty(
+    alloc = torch.zeros if zero_init else torch.empty
+    return alloc(
         (padded_rows, padded_cols),
         dtype=torch.float8_e8m0fnu,
         device=sorted_token_ids.device,
@@ -134,7 +136,12 @@ def opus_moe_stage1_a8w4_fwd(
             if output_sorted
             else (hidden_states.shape[0], int(topk), inter_dim)
         )
-        out = torch.empty(
+        # Stage1 computes only inter_dim - inter_dim_pad columns, so the pad columns
+        # keep allocator garbage. The sorted layout feeds the v2
+        # (flydsl_moe2_layout_) Stage2, which has no K-pad skip and contracts over
+        # the full inter_dim -- a stale FP8 NaN there NaNs the whole output row.
+        _pad_zero = output_sorted and int(inter_dim_pad) > 0
+        out = (torch.zeros if _pad_zero else torch.empty)(
             out_shape,
             dtype=torch.float8_e4m3fn,
             device=hidden_states.device,
@@ -145,6 +152,8 @@ def opus_moe_stage1_a8w4_fwd(
             sorted_expert_ids=sorted_expert_ids,
             block_m=block_m,
             inter_dim=out.shape[-1],
+            # Match the payload: an unwritten 0xFF pad byte is an E8M0 NaN.
+            zero_init=output_sorted and int(inter_dim_pad) > 0,
         )
 
     _opus_moe_stage1_a8w4_fwd_raw(

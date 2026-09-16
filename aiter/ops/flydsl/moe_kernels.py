@@ -1566,12 +1566,22 @@ def _flydsl_moe_stage1_impl(
             _sorted_rows = max(
                 sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m
             )
+            # This GEMM1 stops its N grid at inter_dim - inter_dim_pad, so the pad
+            # columns of every intermediate row keep whatever the caching allocator
+            # handed us. The ordinary stage2 skips those K columns (`base_k <
+            # inter_dim - inter_dim_pad`), but the v2/layout stage2 (gemm2_body_v2)
+            # has no K-pad skip and contracts over the full inter_dim -- one stale
+            # FP8 NaN byte there turns the whole output row into NaN, however w2's
+            # pad columns are zeroed. Hand the padded case a zeroed buffer so those
+            # K columns contribute 0; the GEMM overwrites everything it computes.
+            # Costs one extra memset (~2.5us) and only when inter_dim_pad > 0.
+            _v2_alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
             if _need_fp4:
-                out = torch.empty(
+                out = _v2_alloc(
                     (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
                 )
             else:
-                out = torch.empty(
+                out = _v2_alloc(
                     (_sorted_rows, inter_dim), dtype=dtypes.fp8, device=dev
                 )
         elif _need_fp4 or (_gui_sk_fused and _need_fp4):
@@ -1628,7 +1638,13 @@ def _flydsl_moe_stage1_impl(
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
     out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        # Same reason as the padded v2 payload above: the pad columns get no E8M0
+        # byte, and an unwritten 0xFF there is an E8M0 NaN that the v2 stage2
+        # would multiply the (now zeroed) pad values by. The whole buffer is a
+        # few hundred KB, so zero it rather than chase the tiled layout.
+        (torch.zeros if (_v2_output_layout and inter_dim_pad > 0) else torch.empty)(
+            padded_rows * padded_cols, dtype=torch.uint8, device=dev
+        )
         if _need_sort
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )

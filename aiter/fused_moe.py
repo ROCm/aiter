@@ -2553,6 +2553,21 @@ def _flydsl_v2_stage2_wrapper(
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
     epilog = cfg["epilog"]
     max_sorted = inter_states.shape[0]
+    # gemm2_body_v2 resolves a block's expert as sorted_expert_ids[m_row // SBM],
+    # so SBM (from the kernel name) has to be the block size moe_sorting padded
+    # with. A mismatch is not a slow path, it reads the wrong expert weights and
+    # walks off the sorted arrays -- the non-layout stage2 rejects it (see
+    # _flydsl_stage2_wrapper), so reject it here too instead of faulting.
+    if block_m is not None and int(block_m) != sbm:
+        raise ValueError(
+            "FlyDSL v2 stage2 sorting layout mismatch: "
+            f"moe_sorting uses block_m={int(block_m)}, but {kernelName} expects "
+            f"sort_block_m={sbm}. Select a kernel with _sbm{int(block_m)}."
+        )
+    # NOTE: this kernel has no K-pad skip and deliberately contracts over the
+    # full inter_dim, including intermediate_pad columns. That is only sound
+    # because stage1 zeroes those columns of its v2 sorted intermediate (see
+    # _flydsl_moe_stage1_impl); w2's pad columns are then multiplied by 0.
 
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
