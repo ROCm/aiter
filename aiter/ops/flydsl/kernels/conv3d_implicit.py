@@ -218,10 +218,13 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             fx.make_layout(1, 1),
         )
 
+    @fx.struct
+    class SharedStorage:
+        tile: fx.Array[elem_ty, TR_TILE * _TR_LDS_S, 16]
+
     @flyc.kernel(known_block_size=[TR_THREADS, 1, 1])
     def transpose_kernel(out: fx.Tensor, inp: fx.Tensor):
-        lds_alloc = fx.SharedAllocator(static=False)
-        lds = lds_alloc.allocate(fx.Array[elem_ty, TR_TILE * _TR_LDS_S, 16]).peek()
+        lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek().tile
 
         class BF16Ty:
             ir_type = elem_ty.ir_type
@@ -541,6 +544,11 @@ def compile_conv3d_implicit(
         and wo == w
     )
 
+    @fx.struct
+    class SharedStorage:
+        a: fx.Array[elem_ty, LDS_A_SIZE, 16]
+        b: fx.Array[elem_ty, LDS_B_SIZE, 16]
+
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def conv3d_implicit_kernel(
         y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
@@ -587,9 +595,9 @@ def compile_conv3d_implicit(
             bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             bias_reg = fx.make_rmem_tensor(1, fx.Float32)
 
-        lds_alloc = fx.SharedAllocator(static=False)
-        a_lds = lds_alloc.allocate(fx.Array[elem_ty, LDS_A_SIZE, 16]).peek()
-        b_lds = lds_alloc.allocate(fx.Array[elem_ty, LDS_B_SIZE, 16]).peek()
+        lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek()
+        a_lds = lds.a
+        b_lds = lds.b
 
         tid = fx.thread_idx.x
         if const_expr(m_chunks > 1):
