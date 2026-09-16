@@ -636,8 +636,8 @@ def compile_conv3d_implicit(
             first_m = swizzle_id * fx.Int64(WGM)
             swizzle_rows = fx.min(fx.Int64(grid_m) - first_m, fx.Int64(WGM))
             local = pid % blocks_per_swizzle
-            m_offset = fx.Int64(first_m + (local % swizzle_rows)) * TILE_M
-            n_tile = fx.Int64(local // swizzle_rows)
+            m_offset = (first_m + (local % swizzle_rows)) * TILE_M
+            n_tile = local // swizzle_rows
         else:
             m_offset = fx.Int32(gpu.block_id("x")) * TILE_M
             n_tile = fx.Int32(gpu.block_id("y"))
@@ -724,6 +724,10 @@ def compile_conv3d_implicit(
         )
 
         def barrier(vmcnt=0, lgkmcnt=None):
+            # Not gpu.barrier(): which counters this waits on is the whole point.
+            # The caller names only the ones it needs, so the DMAs prefetching the
+            # next K tiles stay in flight across the barrier instead of being
+            # drained by it. Naming a counter here is a scheduling decision.
             fx.rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
             fx.rocdl.s_barrier()
 
