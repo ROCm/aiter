@@ -34,8 +34,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
+from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
 from op_tests.flydsl_tests._common import assert_attn_close, q8
 from op_tests.flydsl_tests._common import build_fp8_gfx950_with_ws_elems as _build_mods
 
