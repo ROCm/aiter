@@ -12,9 +12,9 @@ The rest are the shapes two real VAEs run, traced rather than assumed:
 
 * Wan2.1, the causal Conv3d calls carrying a feature cache -- 440 of one encode's
   650 convolutions, and the reason a 3-D kernel is needed at all.
-* Wan2.1, the remaining resamplers and pointwise layers. With the 22 reducible
-  first-chunk calls, which are a T=1 conv2d and so belong to the Qwen form, the
-  three Wan tables account for every convolution one encode performs.
+* Wan2.1, the spatial resamplers and the two time_conv -- the calls that are not
+  cached conv3d but do, or plausibly should, reach this kernel. The 125 genuine
+  1x1 calls of an encode never do and are left to the keyword surface.
 * Qwen-Image, which is the same architecture run at T=1. There the causal Conv3d
   collapses to an exact conv2d and the model never calls a 3-D kernel, so those
   rows are conv2d -- testing them as conv3d would measure something else.
@@ -129,19 +129,24 @@ def wan_vae_conv3d(height, width, frames):
     ]
 
 
-# Wan2.1 VAE encoder -- everything else one encode runs, so the tables cover all
-# 650 calls rather than only the 440 that need the 3-D kernel.
+# Wan2.1 VAE encoder -- the calls that are not cached conv3d but still reach, or could
+# reach, this kernel. One encode's remaining 125 pointwise calls are a genuine 1x1 in
+# every dimension (3 conv_shortcut, attention qkv/proj, quant_conv), measure 0.96-1.20x
+# here and are never dispatched, so they are not worth a row; the 5D 1x1x1 path is
+# covered for correctness by the keyword surface instead.
 #
 # `plain2d` are WanResample's spatial downsamplers. WanResample folds time into
 # batch, so these are ordinary nn.Conv2d over N*T images, and the ZeroPad2d((0,1,0,1))
 # ahead of them is a separate Sequential entry -- hence the odd H+1 input and
-# padding=0. vae_conv_video does replace these (1.19-1.86x at Wan resolutions).
+# padding=0. vae_conv_video does replace these (0.54-0.86x of torch here). They have no
+# row in the Wan tuned config, so they run on _pick_tile's heuristic.
 #
-# `pointwise` have a spatial kernel of 1: the two time_conv (3x1x1), the residual
-# conv_shortcut, mid_block attention's qkv/proj, and quant_conv. min_spatial_kernel
-# leaves them on torch because they measure 0.88-1.05x through the kernel; they are
-# here to keep that decision backed by numbers instead of assumed. time_conv is the
-# interesting one: kT=3 makes K = C*3, so it is only pointwise in space.
+# `time1x1` is pointwise in space only: kT=3 makes K = C*3, which is why it behaves
+# nothing like the true 1x1 layers it used to be bucketed with. min_spatial_kernel=2
+# leaves it on torch, but it measures 0.41-0.66x through the kernel, i.e. ~0.8 ms per
+# encode at 480x832 and ~1.3 ms at 368x544 left on the table. Both sides here are
+# 12-85 us launch-bound kernels timed L2-warm, and torch's 368x544 number is slower
+# than its larger 480x832 one, so re-measure cleanly before moving the gate.
 #
 # The `_t1` rows are the first chunk (1 frame, no cache) and so run once per encode
 # whatever the clip length -- a different batch/time extent, hence a separate shape.
@@ -205,47 +210,10 @@ def wan_vae_aux(height, width, frames):
             0,
             c,
         ),
-        # residual shortcuts
-        (
-            "shortcut_96_t1",
-            "pointwise",
-            (1, 96, 1, h[1], w[1]),
-            (192, 96, 1, 1, 1),
-            1,
-            0,
-            1,
-        ),
-        (
-            "shortcut_96",
-            "pointwise",
-            (1, 96, 4, h[1], w[1]),
-            (192, 96, 1, 1, 1),
-            1,
-            0,
-            c,
-        ),
-        (
-            "shortcut_192_t1",
-            "pointwise",
-            (1, 192, 1, h[2], w[2]),
-            (384, 192, 1, 1, 1),
-            1,
-            0,
-            1,
-        ),
-        (
-            "shortcut_192",
-            "pointwise",
-            (1, 192, 2, h[2], w[2]),
-            (384, 192, 1, 1, 1),
-            1,
-            0,
-            c,
-        ),
         # the two temporal downsamples
         (
             "time_conv_192",
-            "pointwise",
+            "time1x1",
             (1, 192, 5, h[2], w[2]),
             (192, 192, 3, 1, 1),
             (2, 1, 1),
@@ -254,25 +222,12 @@ def wan_vae_aux(height, width, frames):
         ),
         (
             "time_conv_384",
-            "pointwise",
+            "time1x1",
             (1, 384, 3, h[3], w[3]),
             (384, 384, 3, 1, 1),
             (2, 1, 1),
             0,
             c,
-        ),
-        # mid-block attention runs on every chunk including the T=1 one
-        ("attn_qkv", "pointwise", (1, 384, h[3], w[3]), (1152, 384, 1, 1), 1, 0, c + 1),
-        ("attn_proj", "pointwise", (1, 384, h[3], w[3]), (384, 384, 1, 1), 1, 0, c + 1),
-        # once per encode, over the whole assembled latent
-        (
-            "quant_conv",
-            "pointwise",
-            (1, 32, c + 1, h[3], w[3]),
-            (32, 32, 1, 1, 1),
-            1,
-            0,
-            1,
         ),
     ]
 
@@ -377,6 +332,9 @@ KW_CASES = [
         False,
     ),
     ("3d_groups4", 3, _X3, (48, 8, 3, 3, 3), {"padding": 1, "groups": 4}, None, False),
+    # The VAEs' pointwise layers stay on torch, so this row is what keeps the 5D
+    # 1x1x1 path -- no pad, no tap fixup, K = C -- under test at all.
+    ("3d_1x1x1", 3, _X3, (48, 32, 1, 1, 1), {}, None, True),
     ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
     ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
@@ -646,7 +604,7 @@ def main():
             )
             if case in args.cases
         ]
-        summarize(f"Wan2.1 VAE encode, resamplers and pointwise ({name})", rows)
+        summarize(f"Wan2.1 VAE encode, resamplers and time_conv ({name})", rows)
 
         rows = [
             test_qwen_vae_conv2d(case, res, xshape, wshape, stride, pad, dtype, calls)
