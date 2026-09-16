@@ -585,8 +585,7 @@ _MODELS = {"dsv4": 64, "glm5.2": 32}
 
 
 def _model_set(args):
-    """Measurement grid for DSv4 and GLM 5.2: 6 shapes x 2 q-head counts.
-    """
+    """Measurement grid for DSv4 and GLM 5.2: 6 shapes x 2 q-head counts."""
     cases = []
     for cl in args.clean_logits:
         for _, nh in sorted(_MODELS.items()):
