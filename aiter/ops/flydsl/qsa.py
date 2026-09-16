@@ -6,7 +6,8 @@
 Phase 0: fp32 oracle + shared family A/B shapes.
 Phase 2d: family A FlyDSL K1 writes ``block_ids [M, 512]`` from paged
 compressed K (short-row emit, else sort-each-tile + pair-merge into a
-running top-512, or eight column-splits + heap merge, no score matrix). Expand+tail and K2 are still separate.
+running top-512, or eight column-splits + sorted-heap pair-merge, no
+score matrix). Expand+tail and K2 are still separate.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
 

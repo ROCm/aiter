@@ -260,28 +260,28 @@ set equality `err=0` on both columns (HIP `stable=False` still matched
 this seed).
 
 The FlyDSL column is eight-wave K1 plus a **`visible <= 512` emit path**,
-a **per-tile pair merge** (sort the new 512, merge into a sorted running
-top-512), and a **column split** on decode-shaped long rows. Prefill and
-8k stay single-WG. Workspace is `[M, 8, 512]`, not a score matrix. **2d
-stays unchecked:** short `L` beats HIP; pair-merge improves 8k/32k/128k
-but still loses HIP.
+a **per-tile pair merge**, and a **column split** whose eight sorted
+heaps are **pair-merged** instead of a 4096-wide bitonic. Prefill and 8k
+stay single-WG. Workspace is `[M, 8, 512]`, not a score matrix. **2d
+stays unchecked:** short `L` beats HIP; heap pair-merge improves decode
+32k/128k but still loses HIP; 8k serial is unchanged.
 
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
-| 1 | 512 | 128 | 2.0 | 9.4 | 0 | 0 |
+| 1 | 512 | 128 | 2.0 | 9.3 | 0 | 0 |
 | 8 | 512 | 128 | 2.9 | 11.3 | 0 | 0 |
 | 1 | 2048 | 512 | 2.0 | 10.2 | 0 | 0 |
 | 8 | 2048 | 512 | 2.9 | 11.4 | 0 | 0 |
-| 1 | 8192 | 2048 | 76.8 | 17.0 | 0 | 0 |
-| 8 | 8192 | 2048 | 78.4 | 22.0 | 0 | 0 |
-| 1 | 32768 | 8192 | 133.4 | 20.4 | 0 | 0 |
-| 8 | 32768 | 8192 | 133.7 | 25.3 | 0 | 0 |
-| 1 | 131072 | 32768 | 254.4 | 30.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 266.9 | 52.9 | 0 | 0 |
-| 512 | 512 | 128 | 3.5 | 18.2 | 0 | 0 |
-| 512 | 2048 | 512 | 3.6 | 29.2 | 0 | 0 |
-| 512 | 8192 | 2048 | 152.4 | 83.9 | 0 | 0 |
-| 512 | 32768 | 8192 | 610.8 | 247.4 | 0 | 0 |
+| 1 | 8192 | 2048 | 76.9 | 17.1 | 0 | 0 |
+| 8 | 8192 | 2048 | 78.4 | 21.9 | 0 | 0 |
+| 1 | 32768 | 8192 | 58.6 | 20.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 58.8 | 25.7 | 0 | 0 |
+| 1 | 131072 | 32768 | 180.0 | 30.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 188.6 | 53.1 | 0 | 0 |
+| 512 | 512 | 128 | 3.5 | 18.1 | 0 | 0 |
+| 512 | 2048 | 512 | 3.6 | 29.4 | 0 | 0 |
+| 512 | 8192 | 2048 | 152.9 | 84.5 | 0 | 0 |
+| 512 | 32768 | 8192 | 611.3 | 249.9 | 0 | 0 |
 
 
 
