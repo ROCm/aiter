@@ -2048,6 +2048,7 @@ class OpusBmmBpreshufInstance:
     ds_fine_wait: bool = False
     issue_mid: bool = False
     quadrant: bool = False
+    quad_nsplit: int = 2
     kernel_tag: str = "bmm_a8w8_mxscale_bpreshuffle"
     arch_prefix: str = "gfx1250"
     has_oob: bool = True

@@ -289,7 +289,26 @@ template<int BLOCK_SIZE_,
          // the quadrant 2/3 boundary of ik 0 is only a quarter of the way into
          // the K-step; 1 moves it to three quarters. Ignored at kExpK == 1,
          // where the two coincide.
-         int ISSUE_MID_IK_ = 0>
+         int ISSUE_MID_IK_ = 0,
+         // How many chunks the quadrant body splits B into. 2 is the shipped
+         // two-half split; 4 halves each chunk again, giving one dscnt bound per
+         // chunk instead of a single full drain for the back half.
+         //
+         // 4 WAS MEASURED AND LOST, 0.4% at b=16 M=16384, but only half of what
+         // it was aimed at went the wrong way and the split is worth keeping as
+         // a knob. It DOES unbunch the reads -- ds_load_b128 issues in 1.8
+         // cycles against 2.3 at NSPLIT=2, half the way to FlyDSL's 1.4 -- and
+         // s_wait_tensorcnt fell 290 -> 213. What killed it is s_wait_dscnt:
+         // 6,048 hits at 15.8 cycles became 7,072 at 20.8, +51,919, more than
+         // the 36,678 the other two saved.
+         //
+         // The lesson is that adding wait POINTS is not the same as FlyDSL's
+         // arrangement. It takes 10,672 bounds at 7 cycles because each batch of
+         // reads sits next to the block that consumes it; this knob only moved
+         // the waits, leaving the issues where they were, so every bound covers
+         // a wider spread and is harder to satisfy early. Moving the ISSUES to
+         // follow the consumers is the change that is actually implied here.
+         int QUAD_NSPLIT_ = 2>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -987,6 +1006,9 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr bool kIssueMid      = ISSUE_MID_;
     static constexpr bool kQuadrant      = QUADRANT_;
     static constexpr int  kIssueMidIk    = ISSUE_MID_IK_ < kExpK ? ISSUE_MID_IK_ : 0;
+    static constexpr int  kQuadNSplit    = QUAD_NSPLIT_;
+    static_assert(!QUADRANT_ || (kExpN % kQuadNSplit == 0 && kQuadNSplit >= 2),
+                  "QUAD_NSPLIT_ must divide kExpN and be at least 2");
     static constexpr int  kTdmCachePol   = opus::tdm_traits::make_cache_policy(
         opus::tdm_traits::load_temporal_hint::regular,
         (opus::tdm_traits::scope)TDM_SCOPE_);
@@ -2238,6 +2260,7 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_quad_sfatdm_gfx1250 =
         /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
         /*TDM_SCOPE*/0, /*C_VIA_LDS*/true, /*DS_FINE_WAIT*/false,
         /*ISSUE_MID*/false, /*QUADRANT*/true, /*ISSUE_MID_IK*/0>;
+
 
 // kid63: kid31's reuse at twice the grid. B_N=64 halves the tile's N span, so
 // n=1024 cuts into 16 n-tiles instead of 8 and the grid doubles -- at b=16 m=32

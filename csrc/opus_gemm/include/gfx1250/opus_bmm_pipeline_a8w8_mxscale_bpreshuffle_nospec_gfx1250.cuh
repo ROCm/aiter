@@ -692,6 +692,9 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             FragA va[T::kExpM];
             FragB vb[T::kExpN];
             constexpr int kHM = T::kExpM / 2, kHN = T::kExpN / 2;
+            // Columns per B chunk. kQuadNSplit == 2 reproduces the shipped
+            // two-half split exactly, so the knob defaults to a no-op.
+            constexpr int kNW = T::kExpN / T::kQuadNSplit;
             constexpr int kDsB = (int)sizeof(FragB) / 16;
             if constexpr (T::kQuadrant) {
                 // ISSUE ORDER IS THE WAIT SCHEDULE. Four batches, in the order
@@ -701,7 +704,13 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                 // the reads keep the same cover they have today.
                 static_assert(T::kExpM % 2 == 0 && T::kExpN % 2 == 0,
                               "quadrant needs an even fragment grid");
-                opus::static_for<kHN>([&](auto inN) __attribute__((always_inline)) {
+                // B goes out in kNSplit chunks, A in its two halves between the
+                // first chunk and the rest. Finer chunks mean more, smaller
+                // dscnt bounds: FlyDSL takes 10,672 of them at 7 cycles where
+                // this kernel took 6,048 at 15.8, and its ds_load_b128 issues in
+                // 1.4 cycles against our 2.3 for the identical 32,768 reads --
+                // the reads are not slower, they are just bunched.
+                opus::static_for<kNW>([&](auto inN) __attribute__((always_inline)) {
                     vb[decltype(inN)::value] = frag_b(s, decltype(inN)::value, ik);
                 });
                 opus::static_for<kHM>([&](auto imN) __attribute__((always_inline)) {
@@ -711,8 +720,8 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                     constexpr int im = kHM + decltype(imN)::value;
                     va[im] = frag_a(s, im, ik);
                 });
-                opus::static_for<kHN>([&](auto inN) __attribute__((always_inline)) {
-                    constexpr int in = kHN + decltype(inN)::value;
+                opus::static_for<T::kExpN - kNW>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in = kNW + decltype(inN)::value;
                     vb[in] = frag_b(s, in, ik);
                 });
             } else {
@@ -771,14 +780,14 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
 
             // One accumulator quadrant: kHM x kHN, N outer and M serpentined
             // inside, which is mma_rows' order restricted to an N window.
-            auto mma_quad = [&](auto IM0, auto IN0) __attribute__((always_inline)) {
-                constexpr int im0 = IM0.value, in0 = IN0.value;
+            auto mma_quad = [&](auto IM0, auto IN0, auto NW) __attribute__((always_inline)) {
+                constexpr int im0 = IM0.value, in0 = IN0.value, nw = NW.value;
                 if constexpr (!T::kSfAEarly) {
                     opus::static_for<kHM>([&](auto jN) __attribute__((always_inline)) {
                         sa_v[im0 + decltype(jN)::value] = pack_sfa(im0 + decltype(jN)::value);
                     });
                 }
-                opus::static_for<kHN>([&](auto inN) __attribute__((always_inline)) {
+                opus::static_for<nw>([&](auto inN) __attribute__((always_inline)) {
                     constexpr int in = in0 + decltype(inN)::value;
                     opus::static_for<kHM>([&](auto jN) __attribute__((always_inline)) {
                         constexpr int j  = decltype(jN)::value;
@@ -793,12 +802,13 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                 // Staged drain: each bound retires exactly the batch the next
                 // quadrant needs, so no wait covers more than a quarter of the
                 // reads.
-                constexpr int w1 = kHM * kDsPerFrag + kHN * kDsB;  // a_bot + b_right
-                constexpr int w2 = kHN * kDsB;                     // b_right
+                constexpr int kRest = T::kQuadNSplit - 1;          // B chunks after the first
+                constexpr int w1 = kHM * kDsPerFrag + kRest * kNW * kDsB;
+                constexpr int w2 = kRest * kNW * kDsB;
                 opus::s_wait_dscnt(opus::number<(w1 < 15 ? w1 : 15)>{});
-                mma_quad(opus::number<0>{},   opus::number<0>{});
+                mma_quad(opus::number<0>{},   opus::number<0>{}, opus::number<kNW>{});
                 opus::s_wait_dscnt(opus::number<(w2 < 15 ? w2 : 15)>{});
-                mma_quad(opus::number<kHM>{}, opus::number<0>{});
+                mma_quad(opus::number<kHM>{}, opus::number<0>{}, opus::number<kNW>{});
                 // Only when kIssueMid asked for it: mid_issue() is a no-op
                 // otherwise, and the fences would split the region for nothing.
                 if constexpr (ik == T::kIssueMidIk && T::kIssueMid) {
@@ -806,9 +816,15 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                     mid_issue();
                     __builtin_amdgcn_sched_barrier(0);
                 }
-                opus::s_wait_dscnt(opus::number<0>{});
-                mma_quad(opus::number<0>{},   opus::number<kHN>{});
-                mma_quad(opus::number<kHM>{}, opus::number<kHN>{});
+                // One bound per remaining chunk instead of a single full drain.
+                opus::static_for<kRest>([&](auto cN) __attribute__((always_inline)) {
+                    constexpr int c    = decltype(cN)::value;
+                    constexpr int in0  = (c + 1) * kNW;
+                    constexpr int left = (kRest - 1 - c) * kNW * kDsB;
+                    opus::s_wait_dscnt(opus::number<(left < 15 ? left : 15)>{});
+                    mma_quad(opus::number<0>{},   opus::number<in0>{}, opus::number<kNW>{});
+                    mma_quad(opus::number<kHM>{}, opus::number<in0>{}, opus::number<kNW>{});
+                });
             } else if constexpr (T::kIssueMid) {
                 // FlyDSL's shape: front WMMAs, then the ring's TDM issue, then
                 // the back half's drain. The issue's instructions are the cover
