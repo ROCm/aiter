@@ -263,12 +263,12 @@ _FP8_MIN_NUMEL = 128 * 2048
 # flydsl's SMEM_CAPACITY_MAP). A failed import here is that gate -- there is no
 # separate availability predicate to mirror.
 try:
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce as QuickAllReduceInt4
     from aiter.ops.flydsl import allreduce_policy as policy
     from aiter.ops.flydsl.one_shot_allreduce import (
         OneShotAllReduce,
     )
-    from aiter.ops.flydsl.quick_allreduce_int4 import (
+    from aiter.ops.flydsl.quick_allreduce import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
         _resolve_codecs,

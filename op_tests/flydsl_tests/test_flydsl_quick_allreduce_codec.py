@@ -3,7 +3,7 @@
 
 """Codec-level tests for the quick-allreduce wire formats.
 
-Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce_int4.py``
+Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce.py``
 covers the schedules that carry it.
 
 Two properties are load-bearing:
@@ -492,8 +492,9 @@ def test_fp16_codec_memory_path_matches_register_path(block):
     assert torch.equal(through_lds, in_regs)
 
 
+
 def _resolve(algorithm, world_size, rs=None, ag=None):
-    from aiter.ops.flydsl import quick_allreduce_int4 as host
+    from aiter.ops.flydsl import quick_allreduce as host
 
     return host._resolve_codecs(host.ALGORITHMS[algorithm], world_size, rs, ag)
 
@@ -503,55 +504,39 @@ def _resolve(algorithm, world_size, rs=None, ag=None):
     ((2, ("int4", "int4")), (4, ("int4", "int4")), (8, ("int6", "int4"))),
 )
 def test_ring_codec_defaults_widen_only_at_tp8(world_size, expected):
-    """TP8 is the only world size where INT4 misses the floor.
-
-    Production dispatch passes ``None`` for both laps precisely to land here --
-    see ``_FLY_REGIMES`` in ``quick_all_reduce.py``.
-    """
     assert _resolve("ring", world_size) == expected
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_mesh_is_int4_at_every_world_size(world_size):
-    """The mesh has no separable lap, so the per-N default must not leak into it.
-
-    It also has no INT6 kernel at all, which is why the TP8 reduce-scatter
-    default narrows back to INT4 here rather than raising.
-    """
     assert _resolve("mesh", world_size) == ("int4", "int4")
 
 
 @pytest.mark.parametrize("codec", ("int4", "int6"))
 def test_explicit_arguments_set_both_laps(codec):
-    """Pinning a wire format is per-lap and explicit.
-
-    This is the path that replaced ``AITER_ALL_REDUCE_CODEC``: the all-gather
-    lap has no other way to reach INT6, and at TP8 an explicit ``"int4"`` is a
-    real downgrade of the reduce-scatter lap rather than a restatement of its
-    default.
-    """
     assert _resolve("ring", 8, rs=codec, ag=codec) == (codec, codec)
 
 
 def test_explicit_argument_outranks_the_per_world_default():
-    """TP8's reduce-scatter lap defaults to INT6; asking for INT4 must get it."""
     assert _resolve("ring", 8) == ("int6", "int4")
     assert _resolve("ring", 8, rs="int4") == ("int4", "int4")
 
 
 def test_one_lap_can_be_pinned_without_disturbing_the_other():
-    """The laps resolve independently, so pinning the cheap one leaves the
-    reduce-scatter lap on its per-world default."""
     assert _resolve("ring", 8, ag="int6") == ("int6", "int6")
     assert _resolve("ring", 8, ag="int4") == ("int6", "int4")
 
 
 def test_explicit_codec_the_schedule_cannot_build_raises():
-    """Naming a codec the schedule has no kernel for is a programming error.
-
-    Only the per-world *default* narrows silently (see
-    ``test_mesh_is_int4_at_every_world_size``); an explicit argument raises, so
-    a caller never believes it pinned a wire format it did not get.
-    """
     with pytest.raises(ValueError, match="rs_codec"):
-        _resolve("mesh", 8, rs="int6")
+        _resolve("mesh", 8, rs="nosuch")
+
+
+@pytest.mark.parametrize("lap", ("rs", "ag"))
+def test_mesh_mirrors_a_single_named_lap(lap):
+    assert _resolve("mesh", 8, **{lap: "int6"}) == ("int6", "int6")
+
+
+def test_mesh_rejects_two_different_laps():
+    with pytest.raises(ValueError, match="one wire format"):
+        _resolve("mesh", 8, rs="int6", ag="int4")

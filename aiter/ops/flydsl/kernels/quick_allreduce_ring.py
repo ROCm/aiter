@@ -157,7 +157,7 @@ def ring_steps(world_size: int) -> int:
     return 2 * (world_size - 1)
 
 
-def make_quick_allreduce_int4_ring_kernel(
+def make_quick_allreduce_ring_kernel(
     *,
     world_size: int,
     rank: int,
@@ -274,7 +274,7 @@ def make_quick_allreduce_int4_ring_kernel(
         return (rank - j) % world_size
 
     @flyc.kernel(known_block_size=[block, 1, 1])
-    def quick_allreduce_int4_ring(
+    def quick_allreduce_ring(
         rank_unused: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -661,7 +661,7 @@ def make_quick_allreduce_int4_ring_kernel(
     flat_wg = f"{block},{block}"
 
     @flyc.jit
-    def launch_quick_allreduce_int4_ring(
+    def launch_quick_allreduce_ring(
         rank_arg: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -672,7 +672,7 @@ def make_quick_allreduce_int4_ring_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4_ring(
+        quick_allreduce_ring(
             rank_arg,
             nbytes,
             num_tiles,
@@ -693,15 +693,15 @@ def make_quick_allreduce_int4_ring_kernel(
         f"_{rs_codec}_{ag_codec}"
     )
     tag += f"_b{block}"
-    launch_quick_allreduce_int4_ring.func.__name__ = (
-        f"launch_quick_allreduce_int4_ring_{tag}"
+    launch_quick_allreduce_ring.func.__name__ = (
+        f"launch_quick_allreduce_ring_{tag}"
     )
     try:
-        quick_allreduce_int4_ring.func.__name__ = f"quick_allreduce_int4_ring_{tag}"
+        quick_allreduce_ring.func.__name__ = f"quick_allreduce_ring_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_quick_allreduce_int4_ring,
+        "launch": launch_quick_allreduce_ring,
         "flags_bytes": 0,  # the handshake rides in each slot's 64 B tail
         "data_bytes": inbox_bytes,
         "lds_bytes": lds_bytes,

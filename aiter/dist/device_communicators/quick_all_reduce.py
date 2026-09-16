@@ -43,7 +43,7 @@ except Exception:  # noqa: BLE001
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.quick_allreduce_int4 import QuickAllReduceInt4
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduce as QuickAllReduceInt4
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
