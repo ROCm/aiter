@@ -179,6 +179,43 @@ def test_supported_config_routes_to_flydsl():
 
 
 @pytest.mark.parametrize(
+    "num_cus,served", [(128, False), (256, True)], ids=["half-chip", "full-chip"]
+)
+def test_device_cu_count_gates_flydsl(monkeypatch, num_cus, served):
+    """gfx950 alone is insufficient: only full-chip devices may serve FlyDSL."""
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    real_properties = torch.cuda.get_device_properties
+    queried_devices = []
+
+    def properties(device=None):
+        queried_devices.append(device)
+        return mock.Mock(wraps=real_properties(device), multi_processor_count=num_cus)
+
+    real = uak.flydsl_unified_attention
+    seen = {}
+
+    def spy(*a, **kw):
+        seen["device"] = a[0].device
+        r = real(*a, **kw)
+        seen["served"] = r is not None
+        return r
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "get_device_properties", properties)
+        patch.setattr(uak, "flydsl_unified_attention", spy)
+        got = _call([256], [256], seed=7)
+
+    assert seen.get("served") is served
+    assert seen["device"] in queried_devices
+    want = _triton_only([256], [256], seed=7)
+    if served:
+        _assert_close(got.float(), want.float())
+    else:
+        assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize(
     "query_lens,kv_lens",
     [
         ([256], [256]),  # single prefill
@@ -341,7 +378,9 @@ def test_non_causal_bounded_window_declines(window_size):
 
     with (
         mock.patch.object(uak, "flydsl_unified_attention", spy),
-        pytest.raises(AssertionError, match="Only causal attention is supported"),
+        pytest.raises(
+            NotImplementedError, match="Triton fallback supports only causal attention"
+        ),
     ):
         _call([256], [256], causal=False, window_size=window_size)
     assert seen.get("served") is False

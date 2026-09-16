@@ -271,7 +271,8 @@ def unified_attention(
             )
 
     # Only FlyDSL supports non-causal attention.
-    assert causal, "Only causal attention is supported"
+    if not causal:
+        raise NotImplementedError("Triton fallback supports only causal attention")
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
     if backend == "gluon":

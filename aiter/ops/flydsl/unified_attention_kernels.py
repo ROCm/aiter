@@ -42,6 +42,7 @@ import torch
 
 from .kernels.flash_attn_dualwave_common import dualwave_splitk_workspace_elems
 from .kernels.flash_attn_fp8_decode_gfx950 import (
+    GFX950_CUS,
     build_flash_attn_fp8_decode_module,
     plan_num_kv_splits,
 )
@@ -844,6 +845,10 @@ def flydsl_unified_attention(
     Returns ``out`` (written in place) if this configuration is supported, or
     ``None`` so the caller falls through to Triton.
     """
+    # MI350P is gfx950 with half the CUs; the decode planner assumes full chip.
+    if torch.cuda.get_device_properties(q.device).multi_processor_count < GFX950_CUS:
+        return None
+
     # Widen 0-dim scalar descales to [1] before the gate, the recursion, and the
     # kernel see them (vLLM passes per-tensor descales as scalars; FlyDSL's
     # from_dlpack rejects a shape-() tensor). A view, not a copy.
@@ -982,7 +987,7 @@ def flydsl_unified_attention(
                 # behavior.
                 _remember_split_decline(memo_key)
         if part is not None and part[5] >= _SPLIT_MIN_DECODE_KV:
-            split_point, prefill_first, n_pre, n_dec, pre_max_q, _dec_max_kv = part
+            split_point, prefill_first, n_pre, n_dec, pre_max_q, dec_max_kv = part
             row_split = int(cu_seqlens_q[split_point])
             total_q = q.shape[0]
             if prefill_first:
@@ -992,7 +997,7 @@ def flydsl_unified_attention(
                 dec_rows, pre_rows = (0, row_split), (row_split, total_q)
                 dec_seqs, pre_seqs = (0, split_point), (split_point, num_seqs)
 
-            def _sub(rows, seqs, n_sub, max_q_sub):
+            def _sub(rows, seqs, n_sub, max_q_sub, max_kv_sub):
                 r0, r1 = rows
                 s0, s1 = seqs
                 return flydsl_unified_attention(
@@ -1003,7 +1008,7 @@ def flydsl_unified_attention(
                     cu_seqlens_q[s0 : s1 + 1] - cu_seqlens_q[s0],
                     max_q_sub,
                     seqused_k[s0:s1],
-                    max_seqlen_k,
+                    max_kv_sub,
                     softmax_scale,
                     causal,
                     window_size,
@@ -1041,10 +1046,12 @@ def flydsl_unified_attention(
             # `out`, so check it the same way as the prefill half rather than
             # dropping the return value.
             if (
-                _sub(pre_rows, pre_seqs, n_pre, pre_max_q) is None
+                _sub(pre_rows, pre_seqs, n_pre, pre_max_q, max_seqlen_k) is None
             ):  # prefill -> single-pass 2d
                 return None
-            if _sub(dec_rows, dec_seqs, n_dec, 1) is None:  # decode -> split-K 3d
+            if (
+                _sub(dec_rows, dec_seqs, n_dec, 1, dec_max_kv) is None
+            ):  # decode -> split-K 3d
                 return None
             return out
 
