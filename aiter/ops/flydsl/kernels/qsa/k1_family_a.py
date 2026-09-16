@@ -29,6 +29,7 @@ from flydsl.expr import BFloat16, Float32, Int32, gpu, range_constexpr
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_INDEXER, FAMILY_A_SCORE_SCALE
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
+from aiter.ops.topk import _hip_top_k_per_row_decode
 
 _BLOCK_THREADS = 512
 _TILE = 512
@@ -922,7 +923,41 @@ def build_qsa_k1_family_a_split_merge(page_size: int, splits: int):
             stream=stream,
         )
 
-    return launch_split_merge
+    @flyc.jit
+    def launch_split(
+        q: fx.Tensor,
+        k_cache: fx.Tensor,
+        page_table: fx.Tensor,
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        heap_s: fx.Tensor,
+        heap_c: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+        score_scale: Float32,
+        rows: Int32,
+        stream: fx.Stream,
+    ):
+        qsa_k1_family_a_split(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            heap_s,
+            heap_c,
+            n_columns,
+            n_req,
+            score_scale,
+        ).launch(
+            grid=(rows, splits, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_split_merge, launch_split
 
 
 @lru_cache(maxsize=8)
@@ -931,7 +966,7 @@ def _plan_serial(page_size: int):
 
 
 @lru_cache(maxsize=16)
-def _plan_split_merge(page_size: int, splits: int):
+def _plans_split(page_size: int, splits: int):
     return build_qsa_k1_family_a_split_merge(page_size, splits)
 
 
@@ -945,6 +980,29 @@ def _decode_splits(n_columns: int) -> int:
     if n_tiles <= _SPLITS:
         return _SPLITS
     return 16
+
+
+def _radix_block_ids(heap_s: torch.Tensor, heap_c: torch.Tensor, out: torch.Tensor):
+    """HIP radix top-512 on flattened [M, S*512] heap scores; gather block ids."""
+    rows, splits, k = heap_s.shape
+    n_cand = splits * k
+    logits = heap_s.reshape(rows, n_cand).contiguous()
+    ids = heap_c.reshape(rows, n_cand).contiguous()
+    seq_lens = torch.full((rows,), n_cand, dtype=torch.int32, device=heap_s.device)
+    slots = torch.empty(rows, k, dtype=torch.int32, device=heap_s.device)
+    _hip_top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        slots,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        k,
+        False,
+        None,
+    )
+    out.copy_(ids.gather(1, slots.to(torch.int64)))
 
 
 def qsa_k1_family_a_serves(
@@ -987,7 +1045,8 @@ def qsa_k1_family_a_block_ids(
     Short rows emit complete-block ids. Decode rows with more than one
     512-slot tile split columns across ``S`` workgroups (8 while
     ``n_tiles <= 8``, else 16), score with a pipelined vec8 scorer that reuses each MQA
-    K load across four heads, and pair-merge those sorted heaps. Prefill
+    K load across four heads, and pair-merge those sorted heaps (S=8) or
+    HIP-radix the flattened ``S*512`` scores (S=16). Prefill
     (``M > 8``) streams tiles in one workgroup and scores with a 4x512x128
     MFMA. Does not allocate a score matrix. Expand+tail is still a
     separate launch.
@@ -1027,7 +1086,8 @@ def qsa_k1_family_a_block_ids(
     # splits write -inf heaps. Prefill already fills the GPU with one
     # workgroup per row (M>8), so it stays serial. Short rows still emit
     # inside the serial kernel. S stays 8 while n_tiles<=8 so 8k is still
-    # one tile per live split; longer rows take S=16 (S=32 lost at 128k).
+    # one tile per live split; longer rows take S=16 and HIP-radix the
+    # S*512 heap scores (S=32 lost at 128k).
     if n_columns <= _TILE or m > _SPLITS:
         _run_compiled(
             _plan_serial(page_size),
@@ -1048,8 +1108,28 @@ def qsa_k1_family_a_block_ids(
     splits = _decode_splits(n_columns)
     heap_s = torch.empty(m, splits, _K, dtype=torch.float32, device=q.device)
     heap_c = torch.empty(m, splits, _K, dtype=torch.int32, device=q.device)
+    launch_tree, launch_split = _plans_split(page_size, splits)
+    if splits <= _SPLITS:
+        _run_compiled(
+            launch_tree,
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            heap_s,
+            heap_c,
+            out,
+            int(n_columns),
+            n_req,
+            float(score_scale),
+            m,
+            stream,
+        )
+        return out
     _run_compiled(
-        _plan_split_merge(page_size, splits),
+        launch_split,
         q,
         k_cache,
         page_table,
@@ -1058,11 +1138,11 @@ def qsa_k1_family_a_block_ids(
         context_lens,
         heap_s,
         heap_c,
-        out,
         int(n_columns),
         n_req,
         float(score_scale),
         m,
         stream,
     )
+    _radix_block_ids(heap_s, heap_c, out)
     return out

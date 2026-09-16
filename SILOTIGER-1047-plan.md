@@ -327,12 +327,12 @@ not `[M, n_blocks]`. Expand still separate.
 HIP `module_top_k_per_row.so` is loaded. Oracle set equality `err=0`.
 
 **Not checked:** `L<=2048` still beats HIP. 8k stays S=8 (1 tile / live
-split) at ~22.3µs vs HIP ~18. Heap pair-merge in the merge kernel now
-LDS-XORs only strides `>= 64` and `shuffle_xor`s 32..1 (same tail as
-the tile sort). Dynamic S=16 plus that tail: decode 128k ~88µs vs HIP
-~29; 32k ~48µs vs HIP ~19. S=32 compiled on gfx950 (128KB merge LDS)
-but lost at 128k (~105µs). Serial MFMA keeps prefill 8k/32k ~89/351µs
-vs HIP ~83/244. Keep `m > 8` serial.
+split) plus the bitonic heap tree at ~22.5µs vs HIP ~19. Longer decode
+uses S=16 and HIP radix on the flattened ``S*512`` heaps (not
+``[M, n_blocks]``): 32k ~36.5µs vs HIP ~20 (was ~48 with the 16-way
+tree); 128k ~84µs vs HIP ~30 (still four sequential score tiles). S=32
+lost at 128k (~105µs). Serial MFMA keeps prefill 8k/32k ~89/352µs vs
+HIP ~83/249. Keep `m > 8` serial.
 
 rocprofv3 1.3.2 / GPU 6 (`tickets/1047/profile_qsa_k1.py`, kernel-trace
 stats, raw CSV in `/tmp/qsa_k1_rocprof_{8k,32k}`). Mean µs, 35 launches
@@ -354,16 +354,16 @@ remaining sequential tiles**, not more S:
 | 8 | 512 | 128 | 2.4 | 8.9 | 0 | 0 |
 | 1 | 2048 | 512 | 1.4 | 8.0 | 0 | 0 |
 | 8 | 2048 | 512 | 2.4 | 9.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 22.3 | 18.2 | 0 | 0 |
+| 1 | 8192 | 2048 | 22.5 | 19.0 | 0 | 0 |
 | 8 | 8192 | 2048 | 24.0 | 19.9 | 0 | 0 |
-| 1 | 32768 | 8192 | 47.8 | 19.4 | 0 | 0 |
-| 8 | 32768 | 8192 | 48.6 | 24.0 | 0 | 0 |
-| 1 | 131072 | 32768 | 88.4 | 29.1 | 0 | 0 |
-| 8 | 131072 | 32768 | 97.2 | 52.2 | 0 | 0 |
+| 1 | 32768 | 8192 | 36.5 | 20.2 | 0 | 0 |
+| 8 | 32768 | 8192 | 41.3 | 25.5 | 0 | 0 |
+| 1 | 131072 | 32768 | 84.1 | 29.8 | 0 | 0 |
+| 8 | 131072 | 32768 | 95.4 | 52.5 | 0 | 0 |
 | 512 | 512 | 128 | 2.7 | 16.0 | 0 | 0 |
 | 512 | 2048 | 512 | 2.5 | 27.1 | 0 | 0 |
-| 512 | 8192 | 2048 | 89.2 | 82.8 | 0 | 0 |
-| 512 | 32768 | 8192 | 350.5 | 243.9 | 0 | 0 |
+| 512 | 8192 | 2048 | 89.0 | 83.1 | 0 | 0 |
+| 512 | 32768 | 8192 | 351.6 | 248.9 | 0 | 0 |
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
