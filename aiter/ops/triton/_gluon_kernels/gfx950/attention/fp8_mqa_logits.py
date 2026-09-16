@@ -946,17 +946,8 @@ def _gluon_fp8_mqa_logits_kernel(
 
     # Reversed so the longest segments (highest row ids in a causal layout) are
     # dispatched first. With BLOCK_M > 1 the reversal is at block granularity.
-    if NUM_KV_SPLITS == 1:
-        split_id = 0
-        block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
-    else:
-        # Split-major: one split's workgroups are consecutive program ids, and
-        # program ids go to XCDs round-robin, so every split spreads over all
-        # eight of them. Pinning a split to one XCD instead, so its slice of KV
-        # stays in that XCD's L2, was tried and measured neutral.
-        num_blocks = gl.num_programs(0) // NUM_KV_SPLITS
-        split_id = gl.program_id(axis=0) // num_blocks
-        block_id = num_blocks - (gl.program_id(axis=0) % num_blocks) - 1
+    split_id = gl.program_id(axis=1)
+    block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
     if BLOCK_M == 1:
         row_id = block_id
     else:

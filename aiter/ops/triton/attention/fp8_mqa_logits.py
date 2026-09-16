@@ -75,7 +75,7 @@ def _gfx950_kv_splits(seq_len, seq_len_kv, block_m=1):
     if num_blocks >= TARGET_WGS:
         return 1
     return min(
-        triton.cdiv(TARGET_WGS, num_blocks),
+        TARGET_WGS // num_blocks,
         max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)),
     )
 
@@ -271,6 +271,7 @@ def fp8_mqa_logits(
                 "RELAXED_STORE": relaxed_store,
                 "NUM_KV_SPLITS": num_kv_splits,
             }
+            grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -281,8 +282,8 @@ def fp8_mqa_logits(
             block_m = 1
             num_kv_splits = 1  # gfx1250 kernel has no split support
             other = {"LOOP_VARIANT": loop_variant}
+            grid = ((seq_len + block_m - 1) // block_m,)
 
-        grid = ((seq_len + block_m - 1) // block_m * num_kv_splits,)
         _gluon_fp8_mqa_logits_kernel[grid](
             Q_ptr=Q,
             KV_ptr=KV,
