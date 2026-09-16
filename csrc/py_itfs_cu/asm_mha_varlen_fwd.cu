@@ -567,6 +567,7 @@ static fmha_v3_varlen_fwd_impl(at::Tensor &q,      // [total_q, hq, d]
         if(use_hd192_splitkv)
         {
             t = aiter::fmha_fwd_v3_splitkv(args, num_splits, stream_config);
+            TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd");
             aiter::launch_fmha_fwd_v3_splitkv_combine(
                 o_parts.data_ptr(),
                 lse_parts.data_ptr(),
