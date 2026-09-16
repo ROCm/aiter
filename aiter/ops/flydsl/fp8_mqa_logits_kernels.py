@@ -496,10 +496,7 @@ def flydsl_fp8_mqa_logits(
 
     # The gfx950 launcher assumes flat, contiguous row-major Q/KV: it derives
     # per-row/per-column byte offsets from the logical shape alone, with no
-    # stride operand forwarded to the kernel (unlike the Triton launcher,
-    # which does pass strides). A strided view (e.g. ``base[:, ::2]``) would
-    # silently be read at the wrong offsets, so make both contiguous here --
-    # a no-op copy in the common already-contiguous case.
+    # stride operand forwarded to the kernel. For the contiguous case, this is a no-op.
     Q = Q.contiguous()
     KV = KV.contiguous()
 
