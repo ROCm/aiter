@@ -24,9 +24,9 @@ Q outputs (fp8): same split -- q_nope_scale_buff [T, H, 512], plus a separate
 q_rope_buff [T, H, 64] bf16. bf16 Q: q_nope_scale_buff is [T, H, 512] bf16, no q_rope_buff.
 
 Usage:
-    python op_tests/test_fused_qk_norm_rope_group_quant.py
-    python op_tests/test_fused_qk_norm_rope_group_quant.py -T 64 256 1024 --H 16 128
-    python op_tests/test_fused_qk_norm_rope_group_quant.py --no-flydsl   # skip the perf compare
+    python op_tests/fusions/test_fused_qk_norm_rope_group_quant.py
+    python op_tests/fusions/test_fused_qk_norm_rope_group_quant.py -T 64 256 1024 --H 16 128
+    python op_tests/fusions/test_fused_qk_norm_rope_group_quant.py --no-flydsl   # skip the perf compare
 """
 
 import argparse

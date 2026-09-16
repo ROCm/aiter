@@ -14,11 +14,11 @@ Sweeps:
 - with vs without optional ``q_weight``
 
 Usage:
-    python op_tests/test_flydsl_qk_norm_rope_quant.py
-    python op_tests/test_flydsl_qk_norm_rope_quant.py -T 64 256 1024 -q fp8_1x128_e8m0
-    python op_tests/test_flydsl_qk_norm_rope_quant.py --no-quant   # bf16 only
-    python op_tests/test_flydsl_qk_norm_rope_quant.py --data-init zero
-    python op_tests/test_flydsl_qk_norm_rope_quant.py --seed 42 --data-init uniform
+    python op_tests/fusions/test_flydsl_qk_norm_rope_quant.py
+    python op_tests/fusions/test_flydsl_qk_norm_rope_quant.py -T 64 256 1024 -q fp8_1x128_e8m0
+    python op_tests/fusions/test_flydsl_qk_norm_rope_quant.py --no-quant   # bf16 only
+    python op_tests/fusions/test_flydsl_qk_norm_rope_quant.py --data-init zero
+    python op_tests/fusions/test_flydsl_qk_norm_rope_quant.py --seed 42 --data-init uniform
 """
 
 import argparse

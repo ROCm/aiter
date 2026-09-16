@@ -12,17 +12,17 @@ consumed by ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py``.
 
 Run the default sweep::
 
-    python op_tests/test_flydsl_linear_attention_prefill.py
+    python op_tests/gated_delta_rule/test_flydsl_linear_attention_prefill.py
 
 Filter to one model / TP / shape family::
 
-    python op_tests/test_flydsl_linear_attention_prefill.py \\
+    python op_tests/gated_delta_rule/test_flydsl_linear_attention_prefill.py \\
         --model 397b --tp 4 --seqlen 8192 --total-tokens 32768 \\
         --mode varlen --snapshot-dtype bf16 fp32
 
 Reproduce the whole tuner catalog (slow -- the torch reference is O(T*H))::
 
-    python op_tests/test_flydsl_linear_attention_prefill.py \\
+    python op_tests/gated_delta_rule/test_flydsl_linear_attention_prefill.py \\
         --model 35b 397b --tp 1 2 4 8 --mode dense varlen \\
         --seqlen 1024 2048 4096 8192 16384 32768 65536 \\
         --total-tokens 8192 16384 32768 65536 --snapshot-dtype bf16 fp32

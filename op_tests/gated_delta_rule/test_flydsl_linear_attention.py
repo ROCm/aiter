@@ -4,8 +4,8 @@
 """Unit tests for FlyDSL Linear Attention regressions.
 
 Usage:
-    python op_tests/test_flydsl_linear_attention.py
-    pytest -sv op_tests/test_flydsl_linear_attention.py
+    python op_tests/gated_delta_rule/test_flydsl_linear_attention.py
+    pytest -sv op_tests/gated_delta_rule/test_flydsl_linear_attention.py
 """
 
 from __future__ import annotations

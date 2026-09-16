@@ -47,14 +47,14 @@ from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.utility import dtypes, fp4_utils
 
-# Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
+# Build every tensor straight on the device (like op_tests/moe/test_moe_2stage.py) so
 # the test body has no `.cuda()` / `.float().cuda()` plumbing.
 torch.set_default_device("cuda")
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
 # Routing: normal (random) by default; round-robin balanced only when
-# AITER_MOE_EXPERT_BALANCE=1 (mirrors op_tests/test_moe_2stage.py).
+# AITER_MOE_EXPERT_BALANCE=1 (mirrors op_tests/moe/test_moe_2stage.py).
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
@@ -84,7 +84,7 @@ _ACT_BY_NAME = {
 
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
-# Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
+# Production MoE accuracy gate (matches op_tests/moe/test_moe_2stage.py calc_diff):
 # logits_diff = ||x-y||^2 / (||x||^2 + ||y||^2).  rel_l2 is kept as an
 # informational print only; logits_diff < 0.01 is the actual pass/fail gate.
 LOGITS_DIFF_TOL = 0.01
@@ -318,7 +318,7 @@ def _make_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route via ``fused_topk``: normal (random gating) by default; round-robin
     balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
-    op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
+    op_tests/moe/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
     priority) restricts topk to the first n experts. Returns
     ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
     tokens = hidden_states.shape[0]
@@ -553,7 +553,7 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
-    """MoE accuracy metric from op_tests/test_moe_2stage.py (calc_diff):
+    """MoE accuracy metric from op_tests/moe/test_moe_2stage.py (calc_diff):
 
         1 - 2*<x,y>/(||x||^2 + ||y||^2)  ==  ||x-y||^2 / (||x||^2 + ||y||^2)
 
@@ -655,7 +655,7 @@ def run_moe(
     verify checks the eager path.
 
     Correctness gate: production-consistent logits_diff < LOGITS_DIFF_TOL
-    (op_tests/test_moe_2stage.py).  rel_l2 (~= sqrt(2*logits_diff)) is printed
+    (op_tests/moe/test_moe_2stage.py).  rel_l2 (~= sqrt(2*logits_diff)) is printed
     for reference only.  Returns a metrics dict (with ``us`` when benched).
     """
     _require_gfx1250()
@@ -963,7 +963,7 @@ def _mock_grouped_gemm() -> None:
 def summarize(rows: list):
     """Build a precision summary table from per-case metrics and print it.
 
-    Mirrors the pandas DataFrame reporting in op_tests/test_moe_2stage.py.
+    Mirrors the pandas DataFrame reporting in op_tests/moe/test_moe_2stage.py.
     Returns the DataFrame (or the raw rows if pandas is unavailable).
     """
     if not rows:

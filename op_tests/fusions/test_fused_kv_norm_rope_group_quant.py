@@ -29,10 +29,10 @@ C++ side); pass --D/--RD/--G to pin a single shape.
 
 Usage::
 
-    python op_tests/test_fused_kv_norm_rope_group_quant.py
-    python op_tests/test_fused_kv_norm_rope_group_quant.py -T 64 256 1024
-    python op_tests/test_fused_kv_norm_rope_group_quant.py --D 192 --RD 64
-    python op_tests/test_fused_kv_norm_rope_group_quant.py --neox
+    python op_tests/fusions/test_fused_kv_norm_rope_group_quant.py
+    python op_tests/fusions/test_fused_kv_norm_rope_group_quant.py -T 64 256 1024
+    python op_tests/fusions/test_fused_kv_norm_rope_group_quant.py --D 192 --RD 64
+    python op_tests/fusions/test_fused_kv_norm_rope_group_quant.py --neox
 """
 
 import argparse

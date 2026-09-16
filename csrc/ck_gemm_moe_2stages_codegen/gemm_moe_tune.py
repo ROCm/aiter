@@ -1754,7 +1754,7 @@ class FmoeTuner(TunerCommon):
             and q_type == QuantType.per_1x32
         ):  # mxfp8 (a8w8); per_1x128/per_Token fp8 must use the standard
             # shuffle_weight((16,16)) + e8m0_shuffle scale path (see else below),
-            # matching op_tests/test_moe_2stage.py is_mxfp8 routing.
+            # matching op_tests/moe/test_moe_2stage.py is_mxfp8 routing.
             w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
@@ -1775,7 +1775,7 @@ class FmoeTuner(TunerCommon):
             # a16wi4 consumes the OLD FlyDSL int4 kernel's preshuffle:
             # pack_int8_to_packed_int4(shuffle_weight(w.i8, (16,16))) kpack=8 +
             # shuffle_scale_for_int4 (E,G//2,N,2). Byte-identical caller contract to the
-            # replaced kernel -- MUST match op_tests/test_moe_2stage.py / production.
+            # replaced kernel -- MUST match op_tests/moe/test_moe_2stage.py / production.
             E1, N1, K1 = w1_qt.shape
             E2, N2, K2 = w2_qt.shape
             w1_qt_shffle_flydsl = (
@@ -4613,7 +4613,7 @@ class FmoeTuner(TunerCommon):
                     w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
                     w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
-                # Match the production/test path used by op_tests/test_moe_2stage.py.
+                # Match the production/test path used by op_tests/moe/test_moe_2stage.py.
                 w1_qt_fmoe = w1_qt
                 w2_qt_fmoe = w2_qt
                 w1_scale_fmoe = w1_scale
@@ -4672,7 +4672,7 @@ class FmoeTuner(TunerCommon):
                 ):
                     # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
                     # weight layout follows the *config* activation dtype, not the
-                    # runtime-effective one (mirror op_tests/test_moe_2stage.py).
+                    # runtime-effective one (mirror op_tests/moe/test_moe_2stage.py).
                     w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
                     w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
@@ -4695,7 +4695,7 @@ class FmoeTuner(TunerCommon):
                 ):
                     # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
                     # a16w4 interleave, w2 scale uses plain e8m0 (mirror
-                    # op_tests/test_moe_2stage.py is_mxfp8).
+                    # op_tests/moe/test_moe_2stage.py is_mxfp8).
                     w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
                     w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
@@ -4797,7 +4797,7 @@ class FmoeTuner(TunerCommon):
                 # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
                 # The torch reference detects int4 weights by the i4x2 dtype, so
                 # pass an i4x2-reinterpreted view to the reference only (the kernel
-                # path above consumes the int8 w*_qt). Mirrors op_tests/test_moe_2stage.py.
+                # path above consumes the int8 w*_qt). Mirrors op_tests/moe/test_moe_2stage.py.
                 w1_qt_ref, w2_qt_ref = w1_qt, w2_qt
                 if q_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8:
                     w1_qt_ref = w1_qt.view(dtypes.i4x2)
@@ -4827,7 +4827,7 @@ class FmoeTuner(TunerCommon):
                     err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
                     # Element-wise err_ratio (atol/rtol) is overly strict for lossy
                     # fp4/fp8 MoE: even a correct kernel differs on most elements
-                    # vs the higher-precision reference. op_tests/test_moe_2stage.py
+                    # vs the higher-precision reference. op_tests/moe/test_moe_2stage.py
                     # judges these paths by cosine similarity (logits_diff) instead,
                     # so accept a shape if either metric passes. A genuinely wrong
                     # (uncorrelated) kernel still has large logits_diff and fails.
