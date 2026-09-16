@@ -288,10 +288,10 @@ resume long-L scorer work.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Kernel:
 `aiter/ops/flydsl/kernels/qsa/k1_family_b.py`. Public:
-`qsa_k1_family_b_block_ids` (``H=4`` only). Oracle set equality `err=0`.
+`qsa_k1_family_b_block_ids` (``H=4`` in 2e). Oracle set equality `err=0`.
 #4882 columns are Triton and Gluon select (HIP top-k on the competitor
 path). Expand still separate. Separate table from family A. **Not a win
-claim.** ``H=8`` is 2f; long-`L` is 2g.
+claim.** Long-`L` is 2g.
 
 | m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
@@ -299,6 +299,21 @@ claim.** ``H=8`` is 2f; long-`L` is 2g.
 | 8 | 512 | 128 | 3.0 | 15.7 | 15.7 | 0 |
 | 1 | 2048 | 512 | 2.0 | 10.3 | 10.3 | 0 |
 | 8 | 2048 | 512 | 3.0 | 11.4 | 11.4 | 0 |
+
+## Phase 2f — family B K1 H=8 emit (not a win)
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Same kernel file; ``H=8``
+is a second compile (``q.shape[1]``). Oracle set equality `err=0`. #4882
+Triton and Gluon select. Expand still separate. **Not a win claim.**
+Long-`L` is 2g.
+
+| m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 1 | 512 | 128 | 1.5 | 11.0 | 10.3 | 0 |
+| 8 | 512 | 128 | 2.4 | 13.7 | 12.9 | 0 |
+| 1 | 2048 | 512 | 1.5 | 8.9 | 8.2 | 0 |
+| 8 | 2048 | 512 | 2.4 | 9.8 | 9.1 | 0 |
+
 
 
 
