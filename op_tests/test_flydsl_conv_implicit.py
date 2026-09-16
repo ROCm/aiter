@@ -468,6 +468,24 @@ KW_CASES = [
         {"padding": 1},
         False,
     ),
+    # "valid" takes its own early return out of _resolve_padding, ahead of the
+    # "same" arithmetic, and torch spells it the same way.
+    ("3d_valid", 3, _X3, _W3, {"padding": "valid"}, None, False),
+    # An input one rank short goes through the entry's unsqueeze/squeeze, which
+    # nothing else here exercises. torch's functional convs accept it too.
+    ("3d_unbatched", 3, (32, 4, 16, 16), _W3, {"padding": 1}, None, False),
+    # True depthwise: C/groups == 1 pads to the gather's 8-wide vector and K/groups
+    # leaves all but one column of the N tile masked, which the entry documents as
+    # the one ~0.5x case. Slow is expected; wrong is not, and only a row says which.
+    (
+        "3d_depthwise",
+        3,
+        _X3,
+        (32, 1, 3, 3, 3),
+        {"padding": 1, "groups": 32},
+        None,
+        True,
+    ),
     # The launch config is otherwise chosen by problem size, and every shape
     # above is small enough that _pick_tile lands on the narrowest tile, whose
     # single MFMA column block makes the epilogue's row/col mapping degenerate.
@@ -506,9 +524,8 @@ ALL_CASES = (
 )
 # One namespace across all five tables: a label reused by two of them would make -c
 # silently select both, and argparse would list it twice.
-assert len(ALL_CASES) == len(set(ALL_CASES)), (
-    f"duplicate case labels: {sorted({c for c in ALL_CASES if ALL_CASES.count(c) > 1})}"
-)
+_DUPE_CASES = sorted({c for c in ALL_CASES if ALL_CASES.count(c) > 1})
+assert not _DUPE_CASES, f"duplicate case labels: {_DUPE_CASES}"
 
 
 def _ref(x, w, bias, rank, padding_mode="zeros", padding=0, **kw):
@@ -556,14 +573,16 @@ def _channels_first(t, rank):
     return t.permute(0, rank + 1, *range(1, rank + 1))
 
 
-def _roofline(x, w, ref):
+def _roofline(x, w, ref, rank):
     """The convolution's implicit-GEMM (M, N, K), and the FLOPs and bytes it implies.
 
     N is the full out-channel count while K is C/groups * prod(filter), so M*N*K
-    already accounts for a grouped conv summing only over its own group.
+    already accounts for a grouped conv summing only over its own group. An
+    unbatched call has no N axis in the output, so M is then the spatial extent
+    alone.
     """
-    m = ref.shape[0]
-    for d in ref.shape[2:]:
+    m = ref.shape[0] if ref.dim() == rank + 2 else 1
+    for d in ref.shape[-rank:]:
         m *= d
     n = w.shape[0]
     k = w.shape[1]
@@ -581,7 +600,7 @@ def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=
     b = torch.randn(wshape[0], device="cuda", dtype=dtype) if bias else None
 
     ref = _ref(x, w, b, rank, **(kw if ref_kw is None else ref_kw))
-    m, n, k, flops, nbytes = _roofline(x, w, ref)
+    m, n, k, flops, nbytes = _roofline(x, w, ref, rank)
 
     # The reference stays channels-first; only what the kernel is handed follows the
     # swept layout, and a channels-last result is rotated back before the compare.
@@ -625,7 +644,7 @@ def _bench_vs_torch(
 
     kw = {"stride": stride, "padding": padding}
     ref = _ref(x, w, b, rank, **kw)
-    m, n, k, flops, nbytes = _roofline(x, w, ref)
+    m, n, k, flops, nbytes = _roofline(x, w, ref, rank)
 
     torch_conv = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank]
     candidates = {
