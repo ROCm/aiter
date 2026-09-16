@@ -397,12 +397,55 @@ def test_k1_family_a_set_equality_short_decode():
         raise AssertionError("K1 block-id set diverged from the oracle")
 
 
+def test_k1_family_a_set_equality_two_tiles():
+    """FlyDSL K1 still matches the oracle when n_blocks exceeds one 512-slot tile."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 2, 4096, 16
+    n_blocks = seq_len // idx.compress_ratio
+    assert n_blocks > 512
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FAMILY_A_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_k1_family_a_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+    )
+    if _set_mismatch_ratio(ref_ids, got) != 0.0:
+        raise AssertionError("K1 two-tile block-id set diverged from the oracle")
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
 
-    2a does not claim a win. Expand is not fused. ``n_blocks`` must fit the
-    512-slot K1 row bound (``L <= 2048`` at ``r=4``, page-aligned).
+    2b does not claim a win. Expand is not fused. Long ``L`` streams 512-slot
+    tiles into a running LDS top-512 (no score matrix).
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -839,6 +882,7 @@ def _run_unit_cases():
     test_family_b_shape_constants()
     test_paged_roundtrip_tiny()
     test_k1_family_a_set_equality_short_decode()
+    test_k1_family_a_set_equality_two_tiles()
     aiter.logger.info("QSA oracle + K1 unit cases passed")
 
 
@@ -953,15 +997,10 @@ def main():
         rows = []
         for m, seq_len, page_size in itertools.product(
             [b for b in args.batch if b <= 8],
-            [s for s in args.seq if s // FAMILY_A_INDEXER.compress_ratio <= 512],
+            args.seq,
             args.page_size,
         ):
             if m > seq_len:
-                continue
-            n_pages = (
-                seq_len // FAMILY_A_INDEXER.compress_ratio + page_size - 1
-            ) // page_size
-            if n_pages * page_size > 512:
                 continue
             rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype))
         if rows:
