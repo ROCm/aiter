@@ -3,6 +3,7 @@
 import copy
 import multiprocessing as mp
 import os
+from collections import Counter
 from functools import wraps
 
 import numpy as np
@@ -109,6 +110,14 @@ def perftest(
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             avg = get_trace_perf(prof, num_iters)
+            # Benchmark evidence: raw device-event counts before native outlier filtering.
+            run_perftest.last_gpu_kernels = dict(
+                Counter(
+                    event.name
+                    for event in prof.events()
+                    if str(event.device_type).split(".")[-1] == "CUDA"
+                )
+            )
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
