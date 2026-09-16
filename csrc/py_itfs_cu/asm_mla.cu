@@ -977,18 +977,6 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    // gqa_ratio=96 packs 96 valid rows into the 128-row tile of the shared gqaratio32 build, so
-    // its 4th wave owns no valid Q row at all. The gqaratio96 build is the same kernel with
-    // IDLE_WAVE_SKIP=1, which runs that wave at exec=0 (KV DMA only) to give back its share of
-    // LDS bandwidth. Measured on gfx950 bf16 gqa=96 at 5.5-11.3% faster than the gqaratio32
-    // build across batch 8-128, so it is unconditional.
-    //
-    // config_max_seqlen_q is pinned to 4 here, so every max_seqlen_q maps onto the same qseqlen4
-    // build and there is no upper bound to respect. config_causal == 1 is still required:
-    // mla_asm.csv registers gqa=96 only at causal=1, so a non-causal gqa=96 request has to keep
-    // falling through to the gqaratio32 msk0 build or the lookup finds nothing and
-    // get_heuristic_kernel_mla aborts. max_seqlen_q == 1 forces config_causal to 1 further up,
-    // so non-causal single-token decode still lands here.
     if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
         && gqa_ratio == 96 && config_causal == 1){
         config_max_seqlen_q = 4;

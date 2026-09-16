@@ -883,15 +883,6 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     // strictly inside the extent. The total below is then what the batches actually took -- a
     // phantom group would send a lane past the last batch and scatter LDS and reduce_indptr out
     // of bounds.
-    //
-    // Nothing here tries to even out the per-workgroup work count. A lane hands its
-    // w = q * qo_tiles works to `rows` workgroups in whole units, so when rows does not divide
-    // w the busiest workgroup carries ceil(w / rows) against an average of w / rows -- a 1.78x
-    // tail at qo_tiles 3, which is what used to lose this planner up to 19% against the
-    // batch-major packer. Cutting KV finer does shrink that quantum, but it costs a reduce
-    // partial per extra fragment and measured out at +0.08 percentage points over simply not
-    // planning those shapes at all. So the host gate declines them instead (see
-    // xcd_multi_tile), and this path only ever runs where rows already divides q * qo_tiles.
     int32_t raw_groups = 0;
     for(int32_t b = lane_idx; b < num_batches; b += opus::get_warp_size())
     {
@@ -1344,25 +1335,6 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
         kPackedQoLenPerWg = 64;
     }
 
-    // The planner is only worth anything when a batch is cut into several qo tiles that all
-    // reread the same KV, which is exactly the num_heads*2 > kPackedQoLenPerWg branch of
-    // mla_v12_num_qo_tiles (compared against the value picked just above, not a literal 128:
-    // num_heads=48 runs with kPackedQoLenPerWg=64 and does get several tiles) with
-    // max_seqlen_qo > 1. Restricted to natively_supported shapes on top of that -- everything
-    // else was folded to num_heads = 16 with qk_batch_ratio > 1, where a "batch" is one q head
-    // group rather than one sequence, so its tiles do not share KV and there is nothing to win.
-    //
-    // On top of that, the qo tile count has to divide the rows each XCD gets
-    // (num_cu / num_xcd, so 32 on a 256-CU part). A lane deals its works to those rows in whole
-    // units, so a tile count that does not divide them leaves the busiest workgroup carrying
-    // ceil(w / rows) works against an average of w / rows -- 2 against 1.125 at qo_tiles 3,
-    // which cost up to 19% against the batch-major packer no matter how good the XCD affinity
-    // was. Splitting KV finer flattens that, but each extra fragment is another reduce partial,
-    // and across 23 measured shapes it came out +0.08 percentage points ahead of just declining
-    // those shapes -- inside the +-0.1% resolution of the measurement. So decline them: qo_tiles
-    // 2, 4 and 8 keep the planner and its 2.3-4.7%, the rest run the batch-major packer exactly
-    // as before. In this branch qo_tiles == max_seqlen_qo (see mla_v12_num_qo_tiles), and
-    // num_clusters is what the kernel sees as num_cu.
     const int32_t xcd_rows_per_lane =
         (params.num_xcd > 0) ? (num_clusters / params.num_xcd) : 0;
     const bool xcd_multi_tile = (num_heads * 2 > kPackedQoLenPerWg) && (max_seqlen_qo > 1) &&
