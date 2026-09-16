@@ -528,11 +528,15 @@ def _make_combine_fused_reduce(
         # and its parity picks the buffer -- trip 0 reads what this load writes.
         issue_load(bid, 0, bid <= last_work)
         # A trip issues a load then a store, so from trip 1 on there are two
-        # newer TDMs sitting behind the load being waited for. Pad the prologue
-        # with a one-row copy into buffer 1 -- overwritten by trip 0's prefetch
-        # before anyone reads it -- so trip 0 has that depth too and the wait
-        # count stays uniform without peeling the loop.
-        issue_load(bid, 1, False)
+        # newer TDMs sitting behind the load being waited for. Repeat the prime
+        # so trip 0 carries that depth too and the wait count stays uniform
+        # without peeling the loop.
+        #
+        # It has to be this same load, into this same buffer. ``row_oob`` is the
+        # copy's row extent, and the rows past it land zero-filled, so a short
+        # copy aimed at buffer 1 wipes most of the tile trip 1 is about to read
+        # -- the two copies race, and whichever retires last wins.
+        issue_load(bid, 0, bid <= last_work)
         for work in range(bid, total_work, block_num):
             buf = (work // block_num) % 2
             nxt = work + block_num
