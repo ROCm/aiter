@@ -88,6 +88,10 @@ them.
   resume long-L scorer work (column split, extra S, heap radix, GEMM+full
   logits) to chase 8k / 32k / 128k select. Those lengths keep 2b single-WG
   tile-merge **set equality**; the loss vs HIP is accepted and recorded.
+- **Family B K1 perf is emit / short-L only.** Winning shapes are
+  ``visible <= 512`` for ``H`` 4 and 8, plus the #4882 published indexer
+  point (``M=32``, ``H=4``, ``D=128``, ``page_size=8``, ``n_blocks=512``).
+  Long-L select vs #4882 is a recorded 2g loss; do not resume it.
 - **Score math.** `I_ib = sum_h ReLU(dot(q[h], k_bar[b]))` for complete blocks
   only (`p_b + r - 1 <= i`). Optional serving scale `1/sqrt(128)` is allowed
   **only if it cannot change top-k argmax**. `eps` is unused.
@@ -401,6 +405,21 @@ radix. Do not chase a select win. 2h is emit / short-L only.
 | 8 | 32768 | 8 | 8192 | 492.2 | 26.4 | 22.1 | 0 |
 | 1 | 131072 | 8 | 32768 | 2022.0 | 29.9 | 27.4 | 0 |
 | 8 | 131072 | 8 | 32768 | 2036.2 | 56.2 | 45.3 | 0 |
+
+- [x] **2h.** Family B K1 beats #4882 Triton and Gluon on emit /
+      ``visible <= 512`` (``H`` 4 and 8) and on the published indexer point
+      (``M=32``, ``H=4``, ``D=128``, ``page_size=8``, ``n_blocks=512``).
+      Same `block_ids [M, 512]`; no score matrix. Long-L is a 2g recorded
+      loss, not a 2h gate.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality
+`err=0`. Emit already beats both #4882 columns in 2e/2f. Published point
+maps ``pages=512`` to 512 compressed keys packed at ``page_size=8``
+(64 pages, ``L=2048``), so emit applies. Expand still separate.
+
+| m | seq_len | page_size | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|----------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 32 | 2048 | 8 | 4 | 512 | 2.3 | 9.7 | 9.6 | 0 |
 - [ ] No `[rows, n_blocks]` FP32 score buffer.
 - [ ] gfx942 and gfx950.
 - [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;
@@ -408,7 +427,8 @@ radix. Do not chase a select win. 2h is emit / short-L only.
 - [ ] **Done when:** selected-block **set equality** (or documented tie policy)
       vs the oracle; family A beats live AMD on emit / ``visible <= 512``
       (long-L select loss recorded, not a K1 gate); family B beats #4882
-      Triton and Gluon on the published indexer bench points.
+      Triton and Gluon on emit / ``visible <= 512`` and on the published
+      indexer point (long-L select loss recorded in 2g).
 
 ### 3. FlyDSL K2 (sparse GQA) — family A then B
 
