@@ -50,6 +50,10 @@ def run_torch_moe_sorting(
     m, topk = topk_ids.shape
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    # The GEMM consumers describe this allocation as max_num_m_blocks full
+    # blocks. Keep the reference capacity block-aligned so the sorting test also
+    # enforces that descriptor/allocation contract.
+    max_num_tokens_padded = max_num_m_blocks * block_size
     init_val = topk << 24 | m
     sorted_ids = torch.full(
         (max_num_tokens_padded,), init_val, dtype=dtypes.i32, device=device
@@ -98,6 +102,7 @@ def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     """Crude roofline estimates for a memory-bound sort (not exact kernel traffic)."""
     max_num_tokens_padded = token * topk + E * BLOCK_SIZE_M - topk
     max_num_m_blocks = (max_num_tokens_padded + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    max_num_tokens_padded = max_num_m_blocks * BLOCK_SIZE_M
     elem_bytes = torch.empty((), dtype=dtype).element_size()
     nbytes = (
         token * topk * 4
@@ -126,6 +131,19 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
         _moe_buf,
     ) = out
 
+    assert sorted_ids_b.shape == sorted_ids_a.shape, (
+        "sorted_ids capacity must cover every full GEMM block: "
+        f"expected {sorted_ids_a.shape}, got {sorted_ids_b.shape}"
+    )
+    assert sorted_weights_b.shape == sorted_weights_a.shape, (
+        "sorted_weights capacity must match sorted_ids: "
+        f"expected {sorted_weights_a.shape}, got {sorted_weights_b.shape}"
+    )
+    assert sorted_expert_ids_b.shape == sorted_expert_ids_a.shape, (
+        "sorted_expert_ids capacity mismatch: "
+        f"expected {sorted_expert_ids_a.shape}, got {sorted_expert_ids_b.shape}"
+    )
+
     errs = {}
     errs["num_tokens_post_padded"] = checkAllclose(
         num_tokens_post_padded_a,
@@ -152,6 +170,54 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
         msg="sorted_expert_ids",
     )
     return errs
+
+
+def test_moe_sorting_opus_aux_capacity(dtype, model_dim):
+    """Cover the production MXFP4 auxiliary-sort route with a small OOB case.
+
+    At block size 32, the old formula allocated 1054 rows while GEMM described
+    1056 rows.
+    """
+    token, E, topk = 7, 32, 5
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        token,
+        model_dim,
+        E,
+        topk,
+        dtype,
+        has_expert_mask=False,
+        padding_extra=0,
+    )
+    for block_size in (16, 32, 64, 128):
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+            block_size,
+            output_aux=fm.AUX_SORT_OPUS,
+        )
+
+        errs = _compare_moe_sorting_outputs(ref, out[:5], topk, token)
+        bad = {name: err for name, err in errs.items() if err}
+        mismatch = f"Opus auxiliary sort mismatch at block_size={block_size}: {bad}"
+        assert not bad, mismatch
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            _,
+            _,
+            aux_m_indices,
+            aux_reverse_sorted,
+        ) = out
+        expected_capacity = sorted_expert_ids.numel() * block_size
+        assert sorted_ids.numel() == expected_capacity
+        assert sorted_weights.numel() == expected_capacity
+        assert aux_m_indices.numel() == expected_capacity
+        assert aux_reverse_sorted.numel() == topk_ids.numel()
 
 
 def _build_moe_sorting_inputs(
@@ -593,6 +659,7 @@ def main():
     model_configs = list(zip(args.expert, args.topk))
 
     for dtype in args.dtype:
+        test_moe_sorting_opus_aux_capacity(dtype, args.model_dim)
         df = []
         for (
             padding_extra,
