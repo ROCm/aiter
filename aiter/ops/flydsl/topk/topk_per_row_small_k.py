@@ -9,8 +9,8 @@ import torch
 
 from ..kernels.tensor_shim import _run_compiled, wave_size_of
 from ..kernels.topk.topk_per_row_small_k import (
-    _LDS_LIMIT,
     build_topk_per_row_small_k_module,
+    lds_limit,
     topk_per_row_small_k_shape,
 )
 
@@ -44,10 +44,10 @@ def topk_per_row_small_k_serves(k: int, width: int, wave_size: int) -> str | Non
     # this has to be a decline rather than a crash.
     bucket = _row_bucket(width)
     _, _, lds_bytes = topk_per_row_small_k_shape(k, bucket, wave_size)
-    if lds_bytes > _LDS_LIMIT:
+    if lds_bytes > lds_limit():
         return (
             f"k={k} over a {bucket}-wide row bound needs {lds_bytes} bytes of "
-            f"LDS, over the {_LDS_LIMIT} limit"
+            f"LDS, over the {lds_limit()} limit"
         )
     return None
 
