@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
+
 import math
 
 import pytest
-import triton  # noqa: F401  # Must precede torch on this ROCm environment.
 import torch
 
 import aiter
@@ -55,9 +56,7 @@ def _production_asm(q, k, v, cu_q, cu_k, scale, *, return_lse=False):
 
 
 def _split_asm(q, k, v, cu_q, cu_k, scale, num_splits=3, *, return_lse=False):
-    return _run_v3(
-        q, k, v, cu_q, cu_k, scale, num_splits, return_lse=return_lse
-    )
+    return _run_v3(q, k, v, cu_q, cu_k, scale, num_splits, return_lse=return_lse)
 
 
 def _public_asm(q, k, v, cu_q, cu_k, scale, *, return_lse=False, out=None):
@@ -114,9 +113,7 @@ def test_splitkv_one_matches_unsplit_kernel():
         False,
         1,
     )
-    actual, actual_lse = _production_asm(
-        q, k, v, cu_q, cu_k, scale, return_lse=True
-    )
+    actual, actual_lse = _production_asm(q, k, v, cu_q, cu_k, scale, return_lse=True)
     assert torch.equal(actual, reference)
     assert torch.equal(actual_lse, reference_lse)
 
@@ -158,17 +155,15 @@ def test_splitkv_counts(num_splits):
     torch.testing.assert_close(actual_lse, reference_lse, rtol=2e-4, atol=2e-4)
 
 
-@pytest.mark.parametrize("sq,sk,h", [(4096, 8192, 12), (3969, 8192, 12), (4096, 131072, 12)])
+@pytest.mark.parametrize(
+    "sq,sk,h", [(4096, 8192, 12), (3969, 8192, 12), (4096, 131072, 12)]
+)
 def test_public_dispatch_uses_split3_on_long_kv(sq, sk, h):
     q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=sk + sq)
     scale = 1.0 / math.sqrt(192)
     split1 = _production_asm(q, k, v, cu_q, cu_k, scale)
-    split3, split3_lse = _split_asm(
-        q, k, v, cu_q, cu_k, scale, 3, return_lse=True
-    )
-    actual, actual_lse = _public_asm(
-        q, k, v, cu_q, cu_k, scale, return_lse=True
-    )
+    split3, split3_lse = _split_asm(q, k, v, cu_q, cu_k, scale, 3, return_lse=True)
+    actual, actual_lse = _public_asm(q, k, v, cu_q, cu_k, scale, return_lse=True)
     assert torch.equal(actual, split3)
     assert torch.equal(actual_lse, split3_lse)
     assert not torch.equal(actual, split1)
@@ -177,10 +172,10 @@ def test_public_dispatch_uses_split3_on_long_kv(sq, sk, h):
 
 def test_public_dispatch_keeps_unsplit_outside_heuristic():
     scale = 1.0 / math.sqrt(192)
-    # Short KV stays unsplit. High Q occupancy (24 heads * 32 Q tiles > 2*304 CUs)
-    # also stays unsplit so extra K-splits cannot flood the device.
+    # Sk=8191 is the last length below 256 full KV tiles. High Q occupancy
+    # (24 heads * 32 Q tiles > 2*304 CUs) also stays unsplit.
     cases = [
-        (4096, 8160, 12),
+        (4096, 8191, 12),
         (4096, 8192, 24),
     ]
     for sq, sk, h in cases:
@@ -188,6 +183,19 @@ def test_public_dispatch_keeps_unsplit_outside_heuristic():
         split1 = _production_asm(q, k, v, cu_q, cu_k, scale)
         actual = _public_asm(q, k, v, cu_q, cu_k, scale)
         assert torch.equal(actual, split1), (sq, sk, h)
+
+
+def test_forced_splitkv_empty_k_matches_unsplit():
+    sq, h = 129, 4
+    q = torch.randn(sq, h, 192, dtype=torch.bfloat16, device="cuda")
+    k = torch.empty(0, h, 192, dtype=torch.bfloat16, device="cuda")
+    v = torch.empty(0, h, 128, dtype=torch.bfloat16, device="cuda")
+    cu_q = torch.tensor([0, sq], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+    scale = 1.0 / math.sqrt(192)
+    reference = _production_asm(q, k, v, cu_q, cu_k, scale)
+    actual = _split_asm(q, k, v, cu_q, cu_k, scale, 3)
+    assert torch.equal(actual, reference)
 
 
 def test_public_splitkv_fullgraph_compile():
@@ -232,9 +240,7 @@ def test_splitkv_operator_torch_compile():
     scale = 1.0 / math.sqrt(192)
 
     def call(q, k, v):
-        return _fmha_v3_varlen_splitkv_fwd(
-            q, k, v, cu_q, cu_k, sq, sk, scale, True, 3
-        )
+        return _fmha_v3_varlen_splitkv_fwd(q, k, v, cu_q, cu_k, sq, sk, scale, True, 3)
 
     eager = call(q, k, v)
     compiled = torch.compile(call, fullgraph=True)(q, k, v)
@@ -282,9 +288,7 @@ def test_splitkv_lse_and_determinism():
     reference, reference_lse = _production_asm(
         q, k, v, cu_q, cu_k, scale, return_lse=True
     )
-    actual, actual_lse = _split_asm(
-        q, k, v, cu_q, cu_k, scale, return_lse=True
-    )
+    actual, actual_lse = _split_asm(q, k, v, cu_q, cu_k, scale, return_lse=True)
     _assert_close(reference, actual)
     torch.testing.assert_close(actual_lse, reference_lse, rtol=2e-4, atol=2e-4)
     for _ in range(100):

@@ -16,8 +16,8 @@ constexpr int kHd192SplitKvTile           = 32;
 constexpr int kHd192SplitKvAutoMinKvTiles = 256;
 
 // 0: auto. 1: force the unsplit production kernel. 2-8: force that split count.
-// Auto uses split-3 when KV is long enough to amortize extra grid (measured
-// floor: 256 KV tiles) and Q occupancy is not already past 2x CU count.
+// Auto uses split-3 when KV has at least 256 full 32-token tiles (Sk >= 8192)
+// and Q occupancy is not already past 2x CU count.
 int select_hd192_splitkv_num_splits(
     int num_splits, bool kernel_compatible, int seqlen_q, int nhead, int seqlen_k)
 {
@@ -25,8 +25,7 @@ int select_hd192_splitkv_num_splits(
         return num_splits;
     if(num_splits == 1 || !kernel_compatible)
         return 1;
-    const int kv_tiles = (seqlen_k + kHd192SplitKvTile - 1) / kHd192SplitKvTile;
-    if(kv_tiles < kHd192SplitKvAutoMinKvTiles)
+    if(seqlen_k < kHd192SplitKvAutoMinKvTiles * kHd192SplitKvTile)
         return 1;
     const int q_wgs = ((seqlen_q + kHd192SplitKvQTile - 1) / kHd192SplitKvQTile) * nhead;
     if(q_wgs > static_cast<int>(2 * get_num_cu_func()))
@@ -500,7 +499,7 @@ static fmha_v3_varlen_fwd_impl(at::Tensor &q,      // [total_q, hq, d]
     num_splits = select_hd192_splitkv_num_splits(
         num_splits, splitkv_compatible, max_seqlen_q, num_heads, max_seqlen_k);
     const bool use_hd192_splitkv = num_splits > 1;
-    if(use_hd192_splitkv)
+    if(use_hd192_splitkv && max_seqlen_k > 0)
     {
         const int kv_tiles    = (max_seqlen_k + kHd192SplitKvTile - 1) / kHd192SplitKvTile;
         const int split_tiles = (kv_tiles + num_splits - 1) / num_splits;
