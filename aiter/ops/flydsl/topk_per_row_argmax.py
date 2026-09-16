@@ -6,15 +6,32 @@
 from functools import lru_cache
 
 import torch
+from flydsl.expr import BFloat16, Float16, Float32
 
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_argmax import (
-    _VEC,
+    VEC_BY_ELEM,
     build_topk_per_row_argmax_module,
     topk_per_row_argmax_splits,
 )
 
-__all__ = ["topk_per_row_argmax", "topk_per_row_argmax_serves"]
+__all__ = [
+    "ARGMAX_DTYPES",
+    "topk_per_row_argmax",
+    "topk_per_row_argmax_serves",
+]
+
+# The dtypes with a build. The half formats are here and nowhere else among the
+# selectors, because only this one reduces rather than selects: its partials are
+# int32 ordering keys, so widening each element as it is read costs nothing that
+# survives the load -- and the row stays half the bytes that casting the tensor
+# to fp32 first would make it.
+_ELEM_BY_DTYPE = {
+    torch.float32: Float32,
+    torch.bfloat16: BFloat16,
+    torch.float16: Float16,
+}
+ARGMAX_DTYPES = frozenset(_ELEM_BY_DTYPE)
 
 
 @lru_cache(maxsize=8)
@@ -23,7 +40,8 @@ def topk_per_row_argmax_serves(k: int) -> str | None:
 
     Nothing here is sized by the row width or the row count -- the split is a
     runtime grid dimension and the partials follow it -- so k is the whole
-    question.
+    question. The dtype is not: `ARGMAX_DTYPES` is a fact about which builds
+    exist, and the caller checks it before the geometry.
     """
     if k != 1:
         return f"this selector is the k=1 reduction, got k={k}"
@@ -36,19 +54,33 @@ def topk_per_row_argmax(
     """Write each row's argmax column.
 
     Args:
-        scores: ``[rows, width]`` float32, inner stride 1.
+        scores: ``[rows, width]``, inner stride 1, dtype in `ARGMAX_DTYPES`
+            (float32, bfloat16 or float16).
         row_lens: ``[rows]`` int32; columns at or past a row's length are
             invisible to it. A row of length 0 yields -1.
         indices: ``[rows, 1]`` int32, written in place.
 
     Ties go to the smallest column, as ``torch.argmax`` does. NaN outranks
     +inf, which ``torch.argmax`` does not promise.
+
+    Both hold for the half formats without a second ordering rule to keep in
+    step with the first: fp32 covers the range AND the precision of bf16 and of
+    fp16, subnormals included, so widening either one is exact, hence injective
+    and order-preserving. The one rule therefore lands on the same answer, and
+    the elements are widened as they are read rather than the tensor being cast.
     """
+    elem = _ELEM_BY_DTYPE.get(scores.dtype)
+    if elem is None:
+        raise ValueError(
+            f"scores must be one of {sorted(str(d) for d in ARGMAX_DTYPES)}; "
+            f"got {scores.dtype}"
+        )
     rows, width = scores.shape
-    splits = topk_per_row_argmax_splits(rows, width)
-    slice_launch, fold_launch = build_topk_per_row_argmax_module(splits)
+    vec = VEC_BY_ELEM[elem]
+    splits = topk_per_row_argmax_splits(rows, width, vec)
+    slice_launch, fold_launch = build_topk_per_row_argmax_module(splits, elem)
     stream = torch.cuda.current_stream(scores.device)
-    vectors = (width + _VEC - 1) // _VEC
+    vectors = (width + vec - 1) // vec
 
     if fold_launch is None:
         # One split writes the answer directly; the partials are unread, so pass
