@@ -10,9 +10,9 @@ import torch.nn.functional as F
 
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
 from aiter.ops.activation import silu_and_mul
-from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
 from aiter.ops.rmsnorm import rms_norm
+from aiter.ops.shuffle import shuffle_weight
 
 assert torch.version.hip, "Install a ROCm build of PyTorch"
 assert torch.cuda.is_available(), "No accessible GPU"
