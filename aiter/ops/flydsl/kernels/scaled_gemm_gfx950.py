@@ -12,12 +12,15 @@ from flydsl.runtime.device import get_rocm_arch
 
 from .gemm_a16w16_gfx950 import (
     _dynamic_tensor_arg,
+    get_split_k_buffers,
     write_cshuffle_vec_to_global,
 )
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
+    SPLIT_K_SEMAPHORE_MAX_LEN,
     BlockSwizzle,
+    SplitKProtocol,
     get_wave_lds_offset,
     wait_vmcnt_and_barrier,
 )
@@ -40,6 +43,7 @@ class ScaledGemmGfx950Param:
     block_k: fx.Constexpr[int]
     stages: fx.Constexpr[int]
     is_split_k: fx.Constexpr[bool]
+    use_split_k_semaphore: fx.Constexpr[bool]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
@@ -179,6 +183,7 @@ def make_scaled_gemm_gfx950_param(
     block_k: int = 128,
     stages: int = 2,
     split_k: int = 1,
+    use_split_k_semaphore: bool = False,
     m_waves: int = 2,
     n_waves: int = 4,
     k_waves: int = 1,
@@ -193,6 +198,10 @@ def make_scaled_gemm_gfx950_param(
     mma_n: int = 16,
     mma_k: int = 128,
 ) -> ScaledGemmGfx950Param:
+    if not isinstance(use_split_k_semaphore, bool):
+        raise TypeError("use_split_k_semaphore must be bool")
+    if use_split_k_semaphore and split_k <= 1:
+        raise ValueError("use_split_k_semaphore requires split_k > 1")
     if not isinstance(direct_b, bool):
         raise TypeError("direct_b must be bool")
     if direct_b and not uses_direct_b(bpreshuffle, use_half_tile_interleaved, mma_k):
@@ -246,6 +255,10 @@ def make_scaled_gemm_gfx950_param(
             else max_cshuffle_r2g_vec_size
         )
         assert block_n % cshuffle_r2g_vec_size == 0
+    if use_split_k_semaphore and block_m * block_n % (
+        block_threads * cshuffle_r2g_vec_size
+    ):
+        raise ValueError("semaphore Split-K requires whole-thread vector coverage")
     smem_bytes = stages * block_m * block_k * in_dbytes + (
         16 if direct_b else stages * block_n * block_k * in_dbytes
     )
@@ -398,6 +411,7 @@ def make_scaled_gemm_gfx950_param(
         block_k=block_k,
         stages=stages,
         is_split_k=split_k > 1,
+        use_split_k_semaphore=use_split_k_semaphore,
         m_waves=m_waves,
         n_waves=n_waves,
         k_waves=k_waves,
@@ -426,6 +440,8 @@ def make_scaled_gemm_gfx950_kernel_name(param: ScaledGemmGfx950Param):
     out_suffix = "_fp32" if param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_ksd" if param.is_split_k else "_ks1"
+    if param.use_split_k_semaphore:
+        name += "_sem1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
@@ -615,17 +631,20 @@ def scaled_gemm_gfx950_kernel(
     scale_b: fx.Tensor,
     bias: fx.Tensor,
     workspace: fx.Tensor,
+    signal: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
     working_k: fx.Int32,
+    split_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     param: ScaledGemmGfx950Param,
 ):
     tiled_mma = make_scaled_tiled_mma(param)
     direct_b = param.direct_b
-    partial_split = param.is_split_k
+    atomic_split = param.use_split_k_semaphore
+    partial_split = param.is_split_k and not atomic_split
     if const_expr(partial_split):
         out = fx.make_view(
             fx.get_iter(workspace)
@@ -654,7 +673,7 @@ def scaled_gemm_gfx950_kernel(
         if const_expr(
             param.out_dtype_id == SCALED_GEMM_DTYPE_FP32
             or param.k_waves > 1
-            or partial_split
+            or param.is_split_k
         )
         else fx.BFloat16
     )
@@ -714,10 +733,36 @@ def scaled_gemm_gfx950_kernel(
             .peek()
             .ptr
         )
-    if const_expr(param.has_bias and not partial_split):
+    if const_expr(param.has_bias and not param.is_split_k):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
+
+    if const_expr(atomic_split):
+        # In semaphore mode workspace is the completion counter, not partials.
+        splitk_protocol = SplitKProtocol(
+            block_m,
+            block_n,
+            cshuffle_r2g_vec_size,
+            4 if param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 else 2,
+            block_threads,
+            param.has_bias,
+        )
+        splitk_protocol.init(
+            workspace,
+            signal,
+            out,
+            bias,
+            tid,
+            ks_idx,
+            m,
+            n,
+            block_m_offset,
+            block_n_offset,
+            global_output_dtype,
+            fx.block_idx.x,
+            n,
+        )
 
     ab_load_context = make_gemm_ab_load_context(
         elem_dtype,
@@ -784,8 +829,10 @@ def scaled_gemm_gfx950_kernel(
     thr_mma_cRow = thr_mma.partition_C(row_coords)
     thr_mma_cCol = thr_mma.partition_C(col_coords)
 
-    # Accumulate in FP32. With split-K, bias is added once by the reducer.
+    # Split-K adds bias once, via the reducer or semaphore initializer.
     frag_C.fill(0.0)
+    if const_expr(atomic_split):
+        splitk_protocol.zero_c()
 
     def async_load_a_to_lds(k_tile, stage):
         async_load_operand(
@@ -932,7 +979,7 @@ def scaled_gemm_gfx950_kernel(
         global_col = block_n_offset + col
         safe_n = (global_col < n).select(global_col, 0)
         acc = frag_C[i]
-        if const_expr(param.has_bias and not partial_split):
+        if const_expr(param.has_bias and not param.is_split_k):
             bias_val = bias_buf[safe_n].to(fx.Float32)
             if const_expr(is_slice_k):
                 bias_val = (k_wave_idx == 0).select(bias_val, fx.Float32(0.0))
@@ -945,7 +992,10 @@ def scaled_gemm_gfx950_kernel(
         col = fx.get_scalar(thr_mma_cCol[i])
         sC_write[row, col] = frag_C_out[i]
 
-    gpu.barrier()
+    if const_expr(atomic_split):
+        splitk_protocol.wait_until_initialized()
+    else:
+        gpu.barrier()
 
     cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
     cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
@@ -980,9 +1030,12 @@ def scaled_gemm_gfx950_kernel(
                     out_buf,
                     global_row * n + global_col,
                     c_vec.to(global_output_dtype),
-                    False,
+                    atomic_split,
                     param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or partial_split,
                 )
+
+    if const_expr(atomic_split):
+        splitk_protocol.finish_split(split_k)
 
 
 @flyc.kernel
@@ -994,16 +1047,19 @@ def scaled_gemm_hti_gfx950_kernel(
     scale_b: fx.Tensor,
     bias: fx.Tensor,
     workspace: fx.Tensor,
+    signal: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
     working_k: fx.Int32,
+    split_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     param: ScaledGemmGfx950Param,
 ):
     tiled_mma = make_scaled_tiled_mma(param)
-    partial_split = param.is_split_k
+    atomic_split = param.use_split_k_semaphore
+    partial_split = param.is_split_k and not atomic_split
     if const_expr(partial_split):
         out = fx.make_view(
             fx.get_iter(workspace)
@@ -1032,7 +1088,7 @@ def scaled_gemm_hti_gfx950_kernel(
         if const_expr(
             param.out_dtype_id == SCALED_GEMM_DTYPE_FP32
             or param.k_waves > 1
-            or partial_split
+            or param.is_split_k
         )
         else fx.BFloat16
     )
@@ -1110,10 +1166,36 @@ def scaled_gemm_hti_gfx950_kernel(
         if const_expr(not use_scale_chunk):
             half_ldg_a_iters += scale_a_stage_bytes // (block_threads * 4)
             half_ldg_b_iters += scale_b_stage_bytes // (block_threads * 4)
-    if const_expr(param.has_bias and not partial_split):
+    if const_expr(param.has_bias and not param.is_split_k):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
+
+    if const_expr(atomic_split):
+        # In semaphore mode workspace is the completion counter, not partials.
+        splitk_protocol = SplitKProtocol(
+            block_m,
+            block_n,
+            cshuffle_r2g_vec_size,
+            4 if param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 else 2,
+            block_threads,
+            param.has_bias,
+        )
+        splitk_protocol.init(
+            workspace,
+            signal,
+            out,
+            bias,
+            tid,
+            ks_idx,
+            m,
+            n,
+            block_m_offset,
+            block_n_offset,
+            global_output_dtype,
+            fx.block_idx.x,
+            n,
+        )
 
     ab_load_context = make_gemm_ab_load_context(
         elem_dtype,
@@ -1392,7 +1474,7 @@ def scaled_gemm_hti_gfx950_kernel(
             global_col = block_n_offset + n_part * half_block_n + col
             safe_n = (global_col < n).select(global_col, 0)
             acc = frag_C[i]
-            if const_expr(param.has_bias and not partial_split):
+            if const_expr(param.has_bias and not param.is_split_k):
                 acc = acc + bias_buf[safe_n].to(fx.Float32)
             sC[row, col] = acc.to(shuffle_dtype)
 
@@ -1420,7 +1502,7 @@ def scaled_gemm_hti_gfx950_kernel(
                         out_buf,
                         global_row * n + global_col,
                         c_vec.to(global_output_dtype),
-                        False,
+                        atomic_split,
                         param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or partial_split,
                     )
 
@@ -1429,11 +1511,13 @@ def scaled_gemm_hti_gfx950_kernel(
     c10 = make_c_fragment(1, 0)
     c11 = make_c_fragment(1, 1)
 
-    # Bias is added in the epilogue or, for split-K, once in the reducer.
+    # Bias is added once: epilogue, reducer, or semaphore initializer.
     c00.fill(0.0)
     c01.fill(0.0)
     c10.fill(0.0)
     c11.fill(0.0)
+    if const_expr(atomic_split):
+        splitk_protocol.zero_c()
 
     if const_expr(use_scale_chunk):
         # Prime the first slot while all waves are aligned, before the
@@ -1552,6 +1636,8 @@ def scaled_gemm_hti_gfx950_kernel(
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
+    if const_expr(atomic_split):
+        splitk_protocol.wait_until_initialized()
     store_half_tile_to_global(0, 0)
     store_half_tile_to_global(0, 1)
     store_half_tile_to_lds(1, 0, c10)
@@ -1562,6 +1648,8 @@ def scaled_gemm_hti_gfx950_kernel(
     store_half_tile_to_lds(1, 1, c11)
     rocdl.s_barrier()
     store_half_tile_to_global(1, 1)
+    if const_expr(atomic_split):
+        splitk_protocol.finish_split(split_k)
 
 
 @flyc.kernel
@@ -1603,6 +1691,7 @@ def scaled_gemm_gfx950(
     scale_b: fx.Tensor,
     bias: fx.Tensor,
     workspace: fx.Tensor,
+    signal: fx.Tensor,
     split_k: fx.Int32,
     param: ScaledGemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL signature
@@ -1636,10 +1725,12 @@ def scaled_gemm_gfx950(
         scale_b,
         bias,
         workspace,
+        signal,
         m,
         n,
         k,
         working_k,
+        split_k,
         a_leading_stride,
         b_leading_stride,
         param,
@@ -1649,7 +1740,7 @@ def scaled_gemm_gfx950(
         stream=stream,
     )
 
-    if const_expr(param.is_split_k):
+    if const_expr(param.is_split_k and not param.use_split_k_semaphore):
         scaled_gemm_splitk_reduce._known_block_size = [256, 1, 1]
         scaled_gemm_splitk_reduce(workspace, out, bias, m, n, split_k, param).launch(
             grid=((m * n + 1023) // 1024, 1, 1), block=(256, 1, 1), stream=stream
@@ -1682,7 +1773,13 @@ def make_scaled_gemm_param_and_validate(m, n, k, kwargs):
         return None
     if result.b_is_transposed and k % async_load_vec_size != 0:
         return None
-    if split_k > 1 and split_k * m * n * 4 > 1 << 32:
+    if result.use_split_k_semaphore:
+        tiles = ((m + result.block_m - 1) // result.block_m) * (
+            (n + result.block_n - 1) // result.block_n
+        )
+        if tiles > SPLIT_K_SEMAPHORE_MAX_LEN:
+            return None
+    elif split_k > 1 and split_k * m * n * 4 > 1 << 32:
         return None
     return result
 
@@ -1742,7 +1839,9 @@ def scaled_gemm(
     """Standard MXFP8: E4M3 data, unshuffled E8M0 [outer,K/32] scales.
 
     Logical A[M,K], B[K,N]; layout describes data strides only. Optional
-    bias has the output dtype. Split-K writes FP32 partials and reduces once.
+    bias has the output dtype. Split-K defaults to FP32 partials plus reduction;
+    use_split_k_semaphore=True instead initializes and atomically adds to out.
+    BF16 atomics round each partition and are not numerically equivalent.
     """
     user_kwargs = {} if user_kwargs is None else user_kwargs
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
@@ -1907,7 +2006,21 @@ def scaled_gemm_dispatch_args(
     sb_arg = _dynamic_tensor_arg(scale_b, 1)
     bias_arg = sa_arg if bias is None else _dynamic_tensor_arg(bias, 0)
     workspace = out_arg
-    if param.is_split_k:
+    signal = sa_arg
+    if param.use_split_k_semaphore:
+        if out.is_cuda:
+            # Per-stream buffers reset after every invocation, including replay.
+            with torch.cuda.stream(stream):
+                semaphore_tensor, signal_tensor = get_split_k_buffers(
+                    stream, out.device
+                )
+        else:
+            # AOT needs only pointer/layout metadata, never a GPU allocation.
+            semaphore_tensor = torch.zeros(8, dtype=torch.int32, device="cpu")
+            signal_tensor = torch.zeros_like(semaphore_tensor)
+        workspace = _dynamic_tensor_arg(semaphore_tensor, 0)
+        signal = _dynamic_tensor_arg(signal_tensor, 0)
+    elif param.is_split_k:
         partials = torch.empty(
             (split_k * out.shape[0], out.shape[1]),
             device=out.device,
@@ -1922,6 +2035,7 @@ def scaled_gemm_dispatch_args(
         sb_arg,
         bias_arg,
         workspace,
+        signal,
         split_k,
         param,
         stream,

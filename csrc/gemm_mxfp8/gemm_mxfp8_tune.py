@@ -146,12 +146,17 @@ def screen_tasks(tasks, topk):
             end.synchronize()
             if torch.allclose(y, ref, rtol=0.03, atol=0.1):
                 ranked.append((start.elapsed_time(end), task))
-    # Reserve finalists per split/slice/B-loading regime so a hot-cache screen does not
-    # eliminate an entire reduction family before rotating-buffer profiling.
+    # Reserve finalists per split/reduction/slice/B-loading regime so screening
+    # cannot eliminate a reduction family before rotating-buffer profiling.
     selected = {}
     for _, task in sorted(ranked, key=lambda item: item[0]):
         c = task[4][1]
-        regime = (c["split_k"] > 1, c["k_waves"] > 1, c["direct_b"])
+        regime = (
+            c["split_k"] > 1,
+            c["use_split_k_semaphore"],
+            c["k_waves"] > 1,
+            c["direct_b"],
+        )
         bucket = selected.setdefault(regime, [])
         if len(bucket) < topk:
             bucket.append(task)
@@ -173,7 +178,7 @@ def check_splitk_stability(results):
     data_key, data, ref = None, None, None
     for info, us, error in results:
         keys, _kid, split_k, name = info
-        if us > 0 and error == 0 and split_k > 1 and keys[5] == "torch.bfloat16":
+        if us > 0 and error == 0 and split_k > 1:
             if data_key != keys:
                 _gfx, _cu, m, n, k, dtype, bias, bp = keys
                 data = generate_data(m, n, k, output_dtype(dtype), bias, bp)
@@ -245,7 +250,7 @@ class GemmMXFP8Tuner(GemmCommonTuner):
             type=int,
             default=0,
             help="Graph-screen the full space; profile this many finalists per "
-            "split/slice/B-loading regime (0 profiles every candidate).",
+            "split/reduction/slice/B-loading regime (0 profiles every candidate).",
         )
 
     def _clear_op_caches(self):

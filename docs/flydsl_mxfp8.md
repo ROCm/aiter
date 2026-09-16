@@ -48,14 +48,40 @@ FT/HTI pipelines, local slice-K and dynamic split-K are supported. Full-tile
 it through LDS. The internal `direct_b` policy is selected by the tuned table,
 not by the caller. `_bd1` / `_bd0` in kernelName and the constexpr ABI distinguish
 these two binaries. HTI, plain B and MMA32 only support LDS (`direct_b=False`);
-unsupported direct combinations are rejected. Split-K writes FP32
-partial slabs and reduces once, applying bias and output conversion only at the
-end. Names encode `ks1`/`ksd`, while the runtime count is stored in CSV `splitK`.
+unsupported direct combinations are rejected.
+
+Split-K reduction is also a tuning axis, `use_split_k_semaphore`:
+
+- `False` (default): write FP32 partial slabs, then reduce once, applying bias
+  and output conversion only at the end.
+- `True`: use the HGEMM semaphore protocol to initialize output (including bias)
+  once, atomically accumulate K partitions, and reset the synchronization state.
+  There is no separate reduction kernel or FP32 partial workspace. This mode
+  supports FT/HTI, including valid slice-K and direct-B combinations.
+
+Names retain `ks1`/`ksd` for the default mode and encode `ksd_sem1` for the
+semaphore mode; the actual split count remains dynamic in CSV `splitK`.
+Old names/CSV rows without `_sem1` keep the partials/reduce behavior.
+`split_k=1` only enumerates `use_split_k_semaphore=False`; explicitly requesting
+semaphores without splitting is rejected. Production callers still select both
+the reduction mode and split count through the tuned row, not API overrides.
+
+BF16 atomics round each partition and their accumulation order can vary, so
+this mode is not numerically equivalent to FP32 partials. The tuner retains
+the existing `rtol=.03, atol=.1` checks (default zero error fraction), screens
+the two modes separately, and rechecks successful split candidates over 16
+dirty-output invocations before selection. Inaccurate candidates are rejected,
+not accepted by relaxing tolerances. FP32 output uses FP32 atomics.
 
 Positive dimensions and vector alignment are required. There is no K-tail:
 tile, stage and split partitions must pass validation. HTI uses two stages,
-two M waves, no slice-K and even K-tile counts per partition. Split workspace
-is limited to 4 GiB. AITER's unrelated blockscale operators are unchanged.
+two M waves, no slice-K and even K-tile counts per partition. Partial workspace
+is limited to 4 GiB. Semaphore mode instead requires at most 256 output tiles
+and whole-workgroup vector coverage for output initialization; invalid
+candidates are removed before compilation. Its two 256-element int32 buffers
+are stream-local and reused after reset (2 KiB total per cached stream/device).
+CPU-only AOT uses tiny CPU buffers with the same dynamic pointer/layout ABI.
+AITER's unrelated blockscale operators are unchanged.
 
 ## MiniMax-M3 tuning only
 
@@ -84,7 +110,9 @@ The tuner defaults to these MiniMax-M3 input/output files. Override `-i/-o`
 for custom experiments. `AITER_CONFIG_GEMM_MXFP8` overrides runtime/AOT lookup.
 HGEMM-style tile/stage/wave axes include K tiles 128/256/512, slice-K 1/2/4,
 and legal split divisors through 32. Optional graph screening retains finalists
-per split/slice/B-loading regime; `mp_tuner` profiles them with three rotating tensor sets.
+per split/reduction/slice/B-loading regime; `mp_tuner` profiles them with three
+rotating tensor sets. Both legal semaphore and partials variants are enumerated
+for split counts above one; unsplit candidates are not duplicated.
 `--screen-topk 0` skips screening and profiles the full valid space.
 
 ### Pruning and the B-loading axis
@@ -103,15 +131,17 @@ Yes, the search is pruned before timing:
 `direct_b=False/True` is independently enumerated for preshuffled full-tile
 MMA16. A retained direct policy's matching LDS policy is kept whenever it is
 also resource-legal; neither pruning nor screening merges them. Screening
-reserves separate finalist slots for each B path as well as split/slice regime.
-For example, `(M,N,K)=(32,2304,6144)` currently retains 2974 matched pairs and
-1251 additional direct-only policies. A direct-only policy is not evidence of
-timing preference: the corresponding LDS policy exceeds resource limits.
+reserves separate finalist slots for each B path, reduction mode and
+split/slice regime. A direct-only policy is not evidence of timing preference:
+the corresponding LDS policy exceeds resource limits.
 
 The existing MiniMax-M3 table was migrated to explicit `_bd0/_bd1` names while
 preserving its previous B path, selected tiles and measured timings (75 direct,
 25 HTI/LDS). This is **not** a full retune of the expanded B-loading space.
-A real tuner smoke with `--screen-topk 1` profiled both paths; integration
+The table has not been retuned with the semaphore axis either: existing rows
+still select partials/reduce, and their old timings have not been relabeled as
+semaphore measurements. A real tuner smoke with `--screen-topk 1` profiled both
+B paths; integration
 tests cover their distinct cache signatures, CPU-only AOT/run-only execution,
 public table-driven calls and preservation through pruning.
 
@@ -135,6 +165,14 @@ with runtime; tests cover new-process run-only, dynamic split reuse, actual
 MXFP8 quantization, out/graph/inductor, rejected coarse scales and architecture
 dispatch isolation. gfx1250 dispatch tests stub the ASM call on gfx950; they
 do not claim GPU execution coverage on gfx1250.
+
+Local semaphore validation covered old-name compatibility, separate cache
+identities, hard legality bounds, tuning/screening mode preservation,
+precision-failure filtering, exact BF16/FP32 bias and dirty-output checks,
+two-stream graph replay/reset, and CPU AOT followed by public run-only dispatch
+with multiple dynamic split counts. The standalone semaphore test file is not
+included. Updating this ABI requires rebuilding the FlyDSL AOT cache before
+running with `FLYDSL_RUNTIME_RUN_ONLY=1`.
 
 
 ## MiniMax-M3 verification
@@ -231,11 +269,13 @@ The checked-in 100-row MiniMax-M3 table passed a fresh-cache AOT build and
 public-entry/tgemm/dirty-output verification with all error columns zero.
 Existing HGEMM split-K and BF16/ordinary FP8 eager/inductor smoke tests passed.
 
-Removed unused split_k arguments from the two main GEMM kernels (the launcher
-and reducer still use the dynamic count), unused output-byte metadata and
-no-effect shape expressions. Host input validation now rejects invalid
-data/device/output/bias before launch. AOT checks that dtype/bias/layout/target
-CSV fields agree with kernelName rather than producing an unusable cache entry.
+Both main GEMM kernels now receive the dynamic `split_k` count for semaphore
+completion/reset. The default partials path still uses it in the launcher and
+standalone reducer. Only split presence and the semaphore/partials choice are
+constexpr, so counts above one share the corresponding AOT binary.
+Host input validation rejects invalid data/device/output/bias before launch.
+AOT checks that dtype/bias/layout/target CSV fields agree with kernelName
+rather than producing an unusable cache entry.
 
 Limits of this review:
 - gfx1250 hardware was not exercised; its original ASM function body and ABI

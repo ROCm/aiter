@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "block_k": 128,
     "stages": 2,
     "split_k": 1,
+    "use_split_k_semaphore": False,
     "m_waves": 1,
     "n_waves": 2,
     "k_waves": 1,
@@ -43,7 +44,8 @@ _NAME_RE = re.compile(
     r"^flydsl_mxfp8_(?P<out_dtype>bf16|fp32)"
     r"_bp(?P<bpreshuffle>[01])_bd(?P<direct_b>[01])"
     r"_t(?P<block_m>\d+)x(?P<block_n>\d+)x(?P<block_k>\d+)x(?P<stages>\d+)"
-    r"_ks(?P<split_mode>1|d)_w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)"
+    r"_ks(?P<split_mode>1|d)(?:_sem(?P<use_split_k_semaphore>[01]))?"
+    r"_w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)"
     r"_mma(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k>\d+)"
     r"_bias(?P<has_bias>[01])_gm(?P<group_m>\d+)_p(?P<policy>ft|hti)"
     r"_(?P<target_gfx>gfx950)$"
@@ -60,11 +62,19 @@ def flydsl_mxfp8_kernel_name(
     c = {**DEFAULT_CONFIG, **config}
     if out_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("MXFP8 output must be bf16 or fp32")
+    if not isinstance(c["use_split_k_semaphore"], bool):
+        raise TypeError("use_split_k_semaphore must be bool")
+    if c["use_split_k_semaphore"] and c["split_k"] <= 1:
+        raise ValueError("use_split_k_semaphore requires split_k > 1")
     dt = "bf16" if out_dtype == torch.bfloat16 else "fp32"
+    # Preserve existing CSV names for the default partials/reduce path.
+    split_mode = "d" if c["split_k"] > 1 else "1"
+    if c["use_split_k_semaphore"]:
+        split_mode += "_sem1"
     return (
         f"flydsl_mxfp8_{dt}_bp{int(bpreshuffle)}_bd{int(c['direct_b'])}"
         f"_t{c['block_m']}x{c['block_n']}x{c['block_k']}x{c['stages']}"
-        f"_ks{'d' if c['split_k'] > 1 else 1}_w{c['m_waves']}x{c['n_waves']}x{c['k_waves']}"
+        f"_ks{split_mode}_w{c['m_waves']}x{c['n_waves']}x{c['k_waves']}"
         f"_mma{c['mma_m']}x{c['mma_n']}x{c['mma_k']}"
         f"_bias{int(has_bias)}_gm{c['group_m']}"
         f"_p{'hti' if c['use_half_tile_interleaved'] else 'ft'}_gfx950"
@@ -85,8 +95,15 @@ def get_flydsl_mxfp8_kernel_params(name, split_k=1):
     if (p.pop("split_mode") == "d") != (value > 1):
         return None
     p["split_k"] = value
+    p["use_split_k_semaphore"] = p["use_split_k_semaphore"] == "1"
+    if p["use_split_k_semaphore"] and value == 1:
+        return None
     for key in CONFIG_KEYS:
-        if key not in ("use_half_tile_interleaved", "direct_b"):
+        if key not in (
+            "use_half_tile_interleaved",
+            "direct_b",
+            "use_split_k_semaphore",
+        ):
             p[key] = int(p[key])
             if key != "group_m" and p[key] <= 0:
                 return None
@@ -185,12 +202,15 @@ def _mxfp8_base_configs(out_dtype, has_bias, bpreshuffle):
     selections = gemm_config_space(1, block_k=(128, 256, 512), k_waves=(1, 2, 4))
     # Only the presence of split-K is constexpr. Expand its actual count later.
     selections["split_k"] = (1, 2)
+    selections["use_split_k_semaphore"] = (False, True)
     # Input layout and B loading strategy are separate axes. HTI has no direct
     # B implementation; invalid combinations are removed before codegen.
     selections["direct_b"] = (False, True) if bpreshuffle else (False,)
     valid = []
     for combo in itertools.product(*selections.values()):
         c = dict(zip(selections, combo))
+        if c["use_split_k_semaphore"] and c["split_k"] == 1:
+            continue
         bm, bn, bk = c["block_m"], c["block_n"], c["block_k"]
         mw, nw, kw = c["m_waves"], c["n_waves"], c["k_waves"]
         if c["direct_b"] and c["use_half_tile_interleaved"]:
@@ -222,7 +242,7 @@ def get_flydsl_mxfp8_configs(
     has_bias=False,
     bpreshuffle=False,
 ):
-    """HGEMM axes plus independent B LDS/direct strategy for preshuffled FT."""
+    """HGEMM axes plus independent B-loading and Split-K reduction strategies."""
     from .gemm_a16w16_policy import GemmConfigPruner, gemm_config_space
 
     if get_gfx() != "gfx950" or min(m, n, k) <= 0:
