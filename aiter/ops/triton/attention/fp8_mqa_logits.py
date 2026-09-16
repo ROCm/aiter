@@ -241,9 +241,13 @@ def fp8_mqa_logits(
             num_kv_splits = _gfx950_kv_splits(
                 seq_len, seq_len_kv, 2, num_warps, waves_per_eu
             )
-            if num_heads <= 32 and seq_len >= 2 and (
-                seq_len > 4096
-                or triton.cdiv(seq_len, 2) * num_kv_splits >= MIN_BLOCK_M2_WGS
+            if (
+                num_heads <= 32
+                and seq_len >= 2
+                and (
+                    seq_len > 4096
+                    or triton.cdiv(seq_len, 2) * num_kv_splits >= MIN_BLOCK_M2_WGS
+                )
             ):
                 block_m = 2
             else:
