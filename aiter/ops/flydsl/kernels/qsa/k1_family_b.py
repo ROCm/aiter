@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family B FlyDSL QSA K1 (SILOTIGER-1047 2e): paged ReLU-sum + tiled top-512.
+"""Family B FlyDSL QSA K1 (SILOTIGER-1047 2f): paged ReLU-sum + tiled top-512.
 
 Gluon-parity indexer: ``H`` is a compile-time 4 or 8, ``D=128``, ``k=512``.
-2e ships ``H=4`` only. Writes ``block_ids [M, 512]``. Scores never land in a
-global ``[M, n_blocks]`` buffer.
+Writes ``block_ids [M, 512]``. Scores never land in a global
+``[M, n_blocks]`` buffer. ``H=4`` and ``H=8`` are separate instantiations.
 
 One query row is eight wave64s (512 threads). When ``visible <= 512`` the
 selected set is every complete block, so the kernel writes those ids and
@@ -20,7 +20,10 @@ import torch
 from flydsl.expr import BFloat16, Float32, Int32, gpu, range_constexpr
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_B_INDEXER
+from aiter.ops.flydsl.kernels.qsa.shapes import (
+    FAMILY_B_INDEXER,
+    FAMILY_B_INDEXER_H8,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 
 _BLOCK_THREADS = 512
@@ -252,17 +255,14 @@ def qsa_k1_family_b_serves(
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
 ) -> str | None:
-    """Why this K1 kernel cannot serve these tensors, or None if it can.
-
-    2e: ``H=4`` only. ``H=8`` is 2f.
-    """
-    idx = FAMILY_B_INDEXER
+    """Why this K1 kernel cannot serve these tensors, or None if it can."""
     if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
         return f"q and k_cache must be bfloat16, got {q.dtype} and {k_cache.dtype}"
-    if q.dim() != 3 or q.shape[1] != idx.n_heads or q.shape[2] != idx.head_dim:
-        return f"q must be [M, {idx.n_heads}, {idx.head_dim}], got {tuple(q.shape)}"
+    if q.dim() != 3 or q.shape[1] not in (4, 8) or q.shape[2] != _D:
+        return f"q must be [M, 4|8, {_D}], got {tuple(q.shape)}"
     if k_cache.dim() != 4:
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
+    idx = FAMILY_B_INDEXER if q.shape[1] == 4 else FAMILY_B_INDEXER_H8
     if k_cache.shape[2] != idx.kv_heads or k_cache.shape[3] != idx.head_dim:
         return (
             f"k_cache KV/D must be ({idx.kv_heads}, {idx.head_dim}), "
@@ -287,8 +287,9 @@ def qsa_k1_family_b_block_ids(
 ) -> torch.Tensor:
     """Write family B indexer ``block_ids [M, 512]`` from paged compressed K.
 
-    2e: ``H=4``. Emit when every complete block fits in the budget. Does not
-    allocate a score matrix. Expand+tail is still a separate launch.
+    ``H`` is 4 or 8 (separate compiles). Emit when every complete block
+    fits in the budget. Does not allocate a score matrix. Expand+tail is
+    still a separate launch.
     """
     reason = qsa_k1_family_b_serves(q, k_cache, page_table)
     if reason is not None:
@@ -320,7 +321,7 @@ def qsa_k1_family_b_block_ids(
     page_size = k_cache.shape[1]
     n_columns = page_table.shape[1] * page_size
     _run_compiled(
-        _plan(page_size, FAMILY_B_INDEXER.n_heads),
+        _plan(page_size, int(q.shape[1])),
         q,
         k_cache,
         page_table,
