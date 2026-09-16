@@ -6,7 +6,8 @@
 Two layers:
   * Correctness (pytest gate): ``test_*`` unit cases.
   * Perf sweep (``__main__``): ``bench_qsa_family_a_plumbing``,
-    ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``.
+    ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
+    ``bench_qsa_family_b_4882_gluon``.
 
 Usage::
 
