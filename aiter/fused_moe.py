@@ -795,7 +795,7 @@ def fused_moe(
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
         output=output,
-        quant_type_a=None if quant_type_a is None else QuantType(quant_type_a).value,
+        quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
     )
@@ -836,6 +836,9 @@ def fused_moe_fake(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
