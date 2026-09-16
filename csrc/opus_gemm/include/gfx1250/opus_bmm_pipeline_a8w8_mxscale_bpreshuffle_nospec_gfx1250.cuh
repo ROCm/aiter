@@ -952,10 +952,22 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         // The A panel's TDM, issued before the prime and drained only now, so it
         // ran under it.
         //
-        // tensorcnt is per-wave and only wave 0 issued the panel, so this also
-        // retires that wave's primed slots. Leaving the prime in flight instead
-        // is the obvious refinement and is NOT what this line does yet.
-        if constexpr (T::kSfATdm) opus::s_wait_tensorcnt<0>();
+        // RETIRE THE PANEL, NOT THE PRIME. tensorcnt counts this wave's own
+        // transfers in order and the panel went out FIRST, so leaving `prime`
+        // outstanding lands exactly the panel and keeps every primed slot in
+        // flight. Draining to 0 here instead -- which is what this line did at
+        // first -- throws away wave 0's entire lookahead while waves 1..n-1
+        // keep theirs, and they then wait for it at the top of the loop. Those
+        // waves never issued a panel, so their count is already `prime` and
+        // this costs them nothing.
+        if constexpr (T::kSfATdm) {
+            switch (prime) {
+                case 0:  opus::s_wait_tensorcnt<0>(); break;
+                case 1:  opus::s_wait_tensorcnt<1>(); break;
+                case 2:  opus::s_wait_tensorcnt<2>(); break;
+                default: opus::s_wait_tensorcnt<3>(); break;
+            }
+        }
         __builtin_amdgcn_s_barrier();
 
         for (int k = 0; k < k_steps; ++k) {
