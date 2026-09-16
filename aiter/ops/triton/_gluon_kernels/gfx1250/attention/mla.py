@@ -73,6 +73,7 @@ class MLAConfig:
 
     USE_LOAD_BUFFER_OP: gl.constexpr
     USE_STORE_BUFFER_OP: gl.constexpr
+    USE_TDM_OUT_STORE: gl.constexpr
 
     NUM_STAGES: gl.constexpr
     SHUFFLED_KV_CACHE: gl.constexpr
@@ -139,6 +140,11 @@ class MLAConfig:
         self.QK_SCALE = gl.constexpr(SCALE * self.RCP_LN2)
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
+        self.USE_TDM_OUT_STORE = gl.constexpr(
+            BLOCK_Q == 1
+            and KV_CACHE_DTYPE != "nvfp4"
+            and NUM_SEGMENTS_PER_SEQ > 1
+        )
         self.HEAD_SIZE_SPLIT = gl.constexpr(2)
 
         assert WARP_SIZE == 32
@@ -1299,41 +1305,78 @@ class MLAProgram:
                 )
 
     @gluon.jit
-    def store_output_3D(self, acc, M, L, segm_idx):
-        offs_q_d_lora_pv = gl.arange(
-            0,
-            self.cfg.KV_LORA_RANK,
-            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
-        )
-        mask = self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None]
+    def store_output_3D(self, acc, M, L, segm_idx, token_idx, q_head_base):
+        if self.cfg.USE_TDM_OUT_STORE:
+            OUT_SMEM: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+            out_shared = gl.allocate_shared_memory(
+                self.output_ptr.type.element_ty,
+                [self.cfg.BLOCK_M, self.cfg.KV_LORA_RANK],
+                OUT_SMEM,
+            )
+            out_shared.store(acc.to(self.output_ptr.type.element_ty))
+            gl.barrier()
 
-        segm_output_offset = (
-            self.query_offset_0_pv[:, None]
-            * (
+            out_base = self.output_ptr + token_idx.to(gl.int64) * (
                 self.cfg.NUM_QUERY_HEADS
                 * self.cfg.NUM_SEGMENTS_PER_SEQ
                 * self.cfg.KV_LORA_RANK
             )
-            + self.query_offset_1_pv[:, None]
-            * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.KV_LORA_RANK)
-            + segm_idx * self.cfg.KV_LORA_RANK
-            + offs_q_d_lora_pv[None, :]
-        )
-        if self.cfg.USE_STORE_BUFFER_OP:
-            gl.amd.cdna4.buffer_store(
-                stored_value=acc.to(self.output_ptr.type.element_ty),
-                ptr=self.output_ptr,
-                offsets=segm_output_offset,
-                mask=mask,
+            out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=out_base,
+                shape=(
+                    self.cfg.NUM_QUERY_HEADS,
+                    self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.KV_LORA_RANK,
+                ),
+                strides=(
+                    self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.KV_LORA_RANK,
+                    1,
+                ),
+                block_shape=(self.cfg.BLOCK_M, self.cfg.KV_LORA_RANK),
+                layout=OUT_SMEM,
             )
+            gl.amd.gfx1250.tdm.async_store(
+                out_desc,
+                [q_head_base, segm_idx * self.cfg.KV_LORA_RANK],
+                out_shared,
+            )
+            # store_L_M first, so its two scalar stores overlap the TDM latency.
+            self.store_L_M(L, M, segm_idx)
+            gl.amd.gfx1250.tdm.async_wait(0)
         else:
-            gl.store(
-                self.output_ptr + segm_output_offset.to(gl.int64),
-                acc.to(self.output_ptr.type.element_ty),
-                mask=mask,
+            offs_q_d_lora_pv = gl.arange(
+                0,
+                self.cfg.KV_LORA_RANK,
+                layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
             )
+            mask = self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None]
 
-        self.store_L_M(L, M, segm_idx)
+            segm_output_offset = (
+                self.query_offset_0_pv[:, None]
+                * (
+                    self.cfg.NUM_QUERY_HEADS
+                    * self.cfg.NUM_SEGMENTS_PER_SEQ
+                    * self.cfg.KV_LORA_RANK
+                )
+                + self.query_offset_1_pv[:, None]
+                * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.KV_LORA_RANK)
+                + segm_idx * self.cfg.KV_LORA_RANK
+                + offs_q_d_lora_pv[None, :]
+            )
+            if self.cfg.USE_STORE_BUFFER_OP:
+                gl.amd.cdna4.buffer_store(
+                    stored_value=acc.to(self.output_ptr.type.element_ty),
+                    ptr=self.output_ptr,
+                    offsets=segm_output_offset,
+                    mask=mask,
+                )
+            else:
+                gl.store(
+                    self.output_ptr + segm_output_offset.to(gl.int64),
+                    acc.to(self.output_ptr.type.element_ty),
+                    mask=mask,
+                )
+
+            self.store_L_M(L, M, segm_idx)
 
     @gluon.jit
     def store_output_3D_split_head(self, acc0, acc1, M, L, segm_idx):
@@ -1662,54 +1705,94 @@ def _mla_decode_fwd_kernel(
         0, QK_ROPE_HEAD_DIM_LOAD, layout=gl.SliceLayout(0, cfg.Q_ROPE_LOAD_LAYOUT)
     )
 
-    query_pos_lora = (
-        token_q_block_local_idx * BLOCK_Q + offs_q_m_lora // cfg.NUM_QUERIES_PER_KV
-    )
-    query_offset_0_lora = q_start_idx + query_pos_lora
-    query_offset_1_lora = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV
-        + head_offset
-        + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
-    )
-    query_offset_lora = (
-        query_offset_0_lora[:, None] * query_stride_0
-        + query_offset_1_lora[:, None] * query_stride_1
-    )
-    query_mask_0_lora = query_pos_lora < num_tokens_per_seq
-    query_mask_1_lora = query_offset_1_lora < num_query_heads
+    USE_TDM_Q_LOAD: gl.constexpr = BLOCK_Q == 1 and QUERY_DTYPE != "nvfp4"
 
-    # Q_lora : (BLOCK_M, KV_LORA_RANK)
-    Q_lora_load = gl.load(
-        query_ptr + query_offset_lora + offs_q_d_lora[None, :],
-        mask=query_mask_0_lora[:, None] & query_mask_1_lora[:, None],
-        other=0.0,
-    )
-    q_lora_shared.store(Q_lora_load)
+    if USE_TDM_Q_LOAD:
+        QK_HEAD_DIM: gl.constexpr = KV_LORA_RANK_LOAD + QK_ROPE_HEAD_DIM_LOAD
+        # BLOCK_Q == 1 => offs_q_m // NUM_QUERIES_PER_KV == 0 for every row, so
+        # the token index is uniform across the block and folds into the base.
+        q_base = query_ptr + (q_start_idx + token_q_block_local_idx).to(
+            gl.int64
+        ) * query_stride_0
+        # head_offset carries NUM_HEAD_BLOCKS > 1; it is a pure head-axis shift,
+        # so it folds into the block offset and needs no extra gating.
+        q_head_base = kv_head_idx * cfg.NUM_QUERIES_PER_KV + head_offset
+
+        # `shape` bounds the head axis, so a partially-filled last head block is
+        # clamped by the descriptor rather than by a load mask. Rows past
+        # num_query_heads compute garbage that the already-masked epilogue store
+        # drops, exactly as query_mask_1 did.
+        q_lora_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=q_base,
+            shape=(num_query_heads, QK_HEAD_DIM),
+            strides=(query_stride_1, 1),
+            block_shape=(BLOCK_M, KV_LORA_RANK_LOAD),
+            layout=cfg.Q_LORA_SHARED_LAYOUT,
+        )
+        q_rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=q_base,
+            shape=(num_query_heads, QK_HEAD_DIM),
+            strides=(query_stride_1, 1),
+            block_shape=(BLOCK_M, QK_ROPE_HEAD_DIM_LOAD),
+            layout=cfg.Q_ROPE_SHARED_LAYOUT,
+        )
+        gl.amd.gfx1250.tdm.async_load(q_lora_desc, [q_head_base, 0], q_lora_shared)
+        gl.amd.gfx1250.tdm.async_load(
+            q_rope_desc, [q_head_base, KV_LORA_RANK_LOAD], q_rope_shared
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
+    else:
+        query_pos_lora = (
+            token_q_block_local_idx * BLOCK_Q + offs_q_m_lora // cfg.NUM_QUERIES_PER_KV
+        )
+        query_offset_0_lora = q_start_idx + query_pos_lora
+        query_offset_1_lora = (
+            kv_head_idx * cfg.NUM_QUERIES_PER_KV
+            + head_offset
+            + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
+        )
+        query_offset_lora = (
+            query_offset_0_lora[:, None] * query_stride_0
+            + query_offset_1_lora[:, None] * query_stride_1
+        )
+        query_mask_0_lora = query_pos_lora < num_tokens_per_seq
+        query_mask_1_lora = query_offset_1_lora < num_query_heads
+
+        # Q_lora : (BLOCK_M, KV_LORA_RANK)
+        Q_lora_load = gl.load(
+            query_ptr + query_offset_lora + offs_q_d_lora[None, :],
+            mask=query_mask_0_lora[:, None] & query_mask_1_lora[:, None],
+            other=0.0,
+        )
+        q_lora_shared.store(Q_lora_load)
+
+        query_pos_rope = (
+            token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
+        )
+        query_offset_0_rope = q_start_idx + query_pos_rope
+        query_offset_1_rope = (
+            kv_head_idx * cfg.NUM_QUERIES_PER_KV
+            + head_offset
+            + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
+        )
+        query_offset_rope = (
+            query_offset_0_rope[:, None] * query_stride_0
+            + query_offset_1_rope[:, None] * query_stride_1
+        )
+        query_mask_0_rope = query_pos_rope < num_tokens_per_seq
+        query_mask_1_rope = query_offset_1_rope < num_query_heads
+
+        # Q_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
+        Q_rope_load = gl.load(
+            query_ptr
+            + query_offset_rope
+            + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :],
+            mask=query_mask_0_rope[:, None] & query_mask_1_rope[:, None],
+            other=0.0,
+        )
+        q_rope_shared.store(Q_rope_load)
+
     Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
-
-    query_pos_rope = (
-        token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
-    )
-    query_offset_0_rope = q_start_idx + query_pos_rope
-    query_offset_1_rope = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV
-        + head_offset
-        + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
-    )
-    query_offset_rope = (
-        query_offset_0_rope[:, None] * query_stride_0
-        + query_offset_1_rope[:, None] * query_stride_1
-    )
-    query_mask_0_rope = query_pos_rope < num_tokens_per_seq
-    query_mask_1_rope = query_offset_1_rope < num_query_heads
-
-    # Q_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
-    Q_rope_load = gl.load(
-        query_ptr + query_offset_rope + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :],
-        mask=query_mask_0_rope[:, None] & query_mask_1_rope[:, None],
-        other=0.0,
-    )
-    q_rope_shared.store(Q_rope_load)
     Q_rope = q_rope_shared.load(layout=cfg.Q_DOT_LAYOUT)
 
     if QUERY_DTYPE == "nvfp4":
@@ -2035,6 +2118,12 @@ def _mla_decode_fwd_kernel(
             M,
             L,
             segm_idx,
+            # Scalars the TDM output descriptor needs. Both are uniform across
+            # the block; recomputed here rather than threaded onto MLAProgram so
+            # its 34-arg positional constructor stays untouched. Unused on the
+            # gl.store path.
+            q_start_idx + token_q_block_local_idx,
+            kv_head_idx * cfg.NUM_QUERIES_PER_KV + head_offset,
         )
 
 

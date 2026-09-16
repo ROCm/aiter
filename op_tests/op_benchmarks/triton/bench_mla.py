@@ -12,6 +12,7 @@ import triton
 from aiter.ops.triton.attention.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import run_perftest
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -19,6 +20,39 @@ from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+
+
+def mla_decode_mem_bytes(
+    query, seq_lens_kv, num_kv_heads, kv_lora_rank, qk_rope_head_dim, kv_dtype, output
+):
+    """Bytes moved by one MLA decode call.
+
+    KV is counted **once** -- V is a slice of the same (kv_lora_rank +
+    qk_rope_head_dim) MLA rows K is read from, so the page crosses the bus once.
+    Single definition: other harnesses import this rather than re-deriving it.
+    """
+    mem_in = (
+        query.numel() * query.itemsize
+        + seq_lens_kv.sum().item()
+        * num_kv_heads
+        * (kv_lora_rank + qk_rope_head_dim)
+        * kv_dtype.itemsize
+    )
+    mem_out = output.numel() * output.itemsize
+    return mem_in + mem_out
+
+
+def mla_decode_flops(seq_lens_kv, num_query_heads, kv_lora_rank, qk_rope_head_dim):
+    """FLOPs for one MLA decode call.
+
+    QK spans the full head dim, PV only the lora half; 2 flops per MAC.
+    """
+    return (
+        2
+        * seq_lens_kv.sum().item()
+        * num_query_heads
+        * ((kv_lora_rank + qk_rope_head_dim) + kv_lora_rank)
+    )
 
 
 def benchmark(args):
@@ -125,8 +159,8 @@ def benchmark(args):
         shuffled_kv_cache: bool,
         provider,
     ):
-        warmup = 25
-        rep = 100
+        num_warmup = 10
+        num_iters = 101
 
         cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
         seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
@@ -231,27 +265,18 @@ def benchmark(args):
                 shuffled_kv_cache=shuffled_kv_cache,
             )
 
-        mem_in = (
-            query.numel() * query.itemsize
-            + seq_lens_kv.sum().item()
-            * num_kv_heads
-            * (kv_lora_rank + qk_rope_head_dim)
-            * 2
-            * kv_dtype.itemsize
-        )
-        if decode_qlen > 0 and skip_reduce:
-            assert (
-                isinstance(out, tuple) and len(out) == 3
-            ), "Output should be a tuple of 3 tensors for skip_reduce and decode_qlen > 0 1"
-            segm_output, segm_max, segm_expsum = out
-            mem_out = (
-                segm_output.numel() * segm_output.itemsize
-                + segm_max.numel() * segm_max.itemsize
-                + segm_expsum.numel() * segm_expsum.itemsize
+        mem = (
+            mla_decode_mem_bytes(
+                query,
+                seq_lens_kv,
+                num_kv_heads,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                kv_dtype,
+                output,
             )
-        else:
-            mem_out = out.numel() * query.itemsize
-        mem = (mem_in + mem_out) * 1e-12
+            * 1e-12
+        )
 
         def fn():
             if decode_qlen > 0:
@@ -291,8 +316,9 @@ def benchmark(args):
                     shuffled_kv_cache=shuffled_kv_cache,
                 )
 
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-        if "ms" in provider:
+        _, us = run_perftest(fn, num_iters=num_iters, num_warmup=num_warmup)
+        ms = us * 1e-3
+        if provider == "time":
             return ms
         else:  # BW TB/s
             return mem / ms * 1e3

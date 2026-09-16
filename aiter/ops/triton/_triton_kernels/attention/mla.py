@@ -755,3 +755,106 @@ def _mla_decode_fwd_reduce_kernel(
         + tl.arange(0, KV_LORA_RANK)
     )
     tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
+
+
+@triton.jit
+def _mla_decode_fwd_reduce_lse_kernel(
+    output_ptr,  # [num_tokens, num_query_heads, head_size]
+    segm_output_ptr,
+    # [num_tokens, num_query_heads, max_num_segments, KV_LORA_RANK], low precision
+    segm_lse_ptr,  # [num_tokens, num_query_heads, max_num_segments], fp32
+    seq_lens_ptr,  # [num_seqs]
+    out_scale_ptr,  # float32
+    num_seqs,  # int
+    num_query_heads: tl.constexpr,  # int
+    output_stride_0: tl.int64,  # int
+    output_stride_1: tl.int64,  # int, should be equal to head_size
+    block_tables_stride: tl.int64,  # int
+    num_tokens_per_seq: tl.int32,
+    total_num_tokens: tl.int32,
+    TILE_SIZE: tl.constexpr,  # int
+    KV_LORA_RANK: tl.constexpr,  # int
+    query_start_len_ptr,  # [num_seqs+1]
+    BLOCK_Q: tl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    ALL_DECODE: tl.constexpr = False,  # int
+    FP8_MIN: tl.constexpr = float8_info.min,
+    FP8_MAX: tl.constexpr = float8_info.max,
+):
+    """Split-K combine for attention kernels that emit a fused log-sum-exp.
+
+    Same merge as _mla_decode_fwd_reduce_kernel, against a different stage-1
+    contract: one fp32 `lse = M + log2(L)` per segment instead of the (max,
+    expsum) pair, and per-segment partials that stage 1 already normalised by
+    their own expsum -- so the lse weight alone re-weights them, with no second
+    division. Base-2 throughout, matching the kernels (log2(e) is folded into
+    SCALE), which is why this is exp2/log2 and not exp/log.
+
+    Halves the split-K scratch: the partials can be stored at low precision
+    because they are normalised, and two fp32 stat arrays collapse to one.
+    """
+    query_token_idx = tl.program_id(0)
+    query_head_idx = tl.program_id(1)
+
+    if ALL_DECODE:
+        seq_idx = query_token_idx
+    else:
+        seq_idx = query_token_idx // num_tokens_per_seq
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    out_scale = None
+    if out_scale_ptr is not None:
+        out_scale = 1 / tl.load(out_scale_ptr)
+
+    # Mirror stage 1's partition so both agree on which segments hold data.
+    # Segments starting past the sequence end early-return and never write, so
+    # their scratch slots are uninitialised and must be masked, not read.
+    num_segments = NUM_SEGMENTS_PER_SEQ
+    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+    )
+
+    segm_offset = (
+        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+    )
+    lse = tl.load(segm_lse_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
+    overall_max = tl.max(lse)
+
+    # w_i = exp2(M_i + log2(L_i) - max) = L_i * exp2(M_i - max): the weight the
+    # (max, expsum) form applies as expsum * exp2(max - overall), recovered from
+    # the packed lse. Inactive segments are -inf -> 0 and drop out of both sums.
+    w = tl.where(segm_mask, tl.math.exp2(lse - overall_max), 0.0)
+    overall_expsum = tl.sum(w)
+
+    segm_output_offset = (
+        query_token_idx.to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
+        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
+        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * KV_LORA_RANK
+        + tl.arange(0, KV_LORA_RANK)[None, :]
+    )
+    segm_output = tl.load(
+        segm_output_ptr + segm_output_offset,
+        mask=segm_mask[:, None],
+        other=0.0,
+    )
+    acc_sum = tl.sum(segm_output.to(tl.float32) * w[:, None], axis=0)
+    acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+
+    if out_scale_ptr is not None:
+        acc = acc * out_scale
+
+    if output_ptr.type.element_ty.is_fp8():
+        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+    output_offset = (
+        query_token_idx * output_stride_0
+        + query_head_idx * output_stride_1
+        + tl.arange(0, KV_LORA_RANK)
+    )
+    tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))

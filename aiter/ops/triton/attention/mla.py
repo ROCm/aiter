@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import math
+import os
 
 import torch
 import triton
@@ -10,6 +11,9 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 )
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_reduce_kernel as triton_mla_decode_fwd_reduce_kernel,
+)
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_decode_fwd_reduce_lse_kernel as triton_mla_decode_fwd_reduce_lse_kernel,
 )
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
@@ -29,7 +33,11 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla_decode_my import (
+        _mla_decode_fwd_kernel_my as gluon_mla_decode_fwd_kernel_my,
+    )
 except:  # noqa: E722
+    gluon_mla_decode_fwd_kernel_my = None
     gluon_mla_prefill_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None
@@ -41,6 +49,14 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+
+# Escape hatch for A/B measurement and for bisecting a suspected decode_my
+# bug: set AITER_TRITON_MLA_DECODE_MY=0 to force every config onto the
+# general kernel, leaving the rest of the dispatch untouched. Read once at
+# import, so it cannot change per call.
+_MLA_DECODE_MY_ENABLED: bool = os.getenv(
+    "AITER_TRITON_MLA_DECODE_MY", "1"
+).lower() not in ("0", "false")
 
 
 def select_2d_config(
@@ -373,13 +389,39 @@ def mla_decode_fwd(
     )
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
+
+    # The decode_my kernel is a specialised rewrite of the pipelined gluon
+    # kernel: TDM Q load, unified QK/PV warp tiling, TDM store epilogue, and a
+    # split-K contract of bf16 partials + one fused fp32 lse instead of fp32
+    # partials + (max, expsum). It is measurably faster but only covers the
+    # configurations it static_asserts, so everything outside that envelope stays
+    # on the general kernel. Keep this predicate in sync with the asserts at the
+    # top of _mla_decode_fwd_kernel_my.
+    USE_DECODE_MY = (
+        _MLA_DECODE_MY_ENABLED
+        and IS_DEVICE_ARCH_GFX12
+        and gluon_mla_decode_fwd_kernel_my is not None
+        and shuffled_kv_cache
+        and BLOCK_Q == 1
+        and attn_config["num_stages"] == 2
+        and WARP_SIZE == 32
+        and QUERY_DTYPE in ("bf16", "fp8")
+        and KV_CACHE_DTYPE in ("bf16", "fp8")
+        and q_scales is None
+    )
+
+    # bf16 partials are only sound because stage 1 normalises each segment by its
+    # own expsum before storing, so the stored values are O(1) and the exponent
+    # range lives in the fp32 lse. The fp32 contract cannot do that -- its
+    # partials carry the raw, unnormalised magnitude.
+    segm_dtype = torch.bfloat16 if USE_DECODE_MY else torch.float32
     if NUM_SEGMENTS > 1:
         segm_output = torch.empty(
             total_num_tokens,
             num_query_heads,
             NUM_SEGMENTS,
             triton.next_power_of_2(kv_lora_rank),
-            dtype=torch.float32,
+            dtype=segm_dtype,
             device=q.device,
         )
         segm_max = torch.empty(
@@ -389,19 +431,62 @@ def mla_decode_fwd(
             dtype=torch.float32,
             device=q.device,
         )
-        segm_expsum = torch.empty(
-            total_num_tokens,
-            num_query_heads,
-            NUM_SEGMENTS,
-            dtype=torch.float32,
-            device=q.device,
+        # The decode_my kernel packs (max, expsum) into a single lse, so segm_max
+        # carries it and the second array is not allocated at all.
+        segm_expsum = (
+            segm_max
+            if USE_DECODE_MY
+            else torch.empty(
+                total_num_tokens,
+                num_query_heads,
+                NUM_SEGMENTS,
+                dtype=torch.float32,
+                device=q.device,
+            )
         )
     else:
         segm_output = out
         segm_max = out  # dummy ptr
         segm_expsum = out  # dummy ptr
 
-    if IS_DEVICE_ARCH_GFX12:
+    if USE_DECODE_MY:
+        gluon_mla_decode_fwd_kernel_my[
+            (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
+        ](
+            segm_output_ptr=segm_output,
+            segm_lse_ptr=segm_max,
+            query_ptr=q,
+            kv_buffer_ptr=kv_buffer,
+            block_tables_ptr=block_tables,
+            seq_lens_ptr=seqused_k,
+            SCALE=softmax_scale,
+            q_scale_ptr=q_descale,
+            kv_scale_ptr=kv_descale,
+            out_scale_ptr=(
+                out_scale if (out_scale is not None and NUM_SEGMENTS == 1) else None
+            ),
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            block_tables_stride=block_tables.stride(0),
+            query_stride_0=q.stride(0),
+            query_stride_1=q.stride(1),
+            KV_LORA_RANK=kv_lora_rank,
+            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+            stride_kv_buffer_1=kv_buffer.stride(1),
+            query_start_len_ptr=cu_seqlens_q,
+            num_tokens_per_seq=num_tokens_per_seq,
+            num_blocks=num_blocks,
+            BLOCK_Q=BLOCK_Q,
+            BLOCK_M=BLOCK_M,
+            WARP_SIZE=WARP_SIZE,
+            ALL_DECODE=ALL_DECODE,
+            K_WIDTH=K_WIDTH,
+            QUERY_DTYPE=QUERY_DTYPE,
+            KV_CACHE_DTYPE=KV_CACHE_DTYPE,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
+            **attn_config,
+        )
+    elif IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
             impl = gluon_mla_decode_fwd_kernel
         else:
@@ -501,13 +586,22 @@ def mla_decode_fwd(
     # else:
     #     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
 
-    _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+    if USE_DECODE_MY:
+        # Stage 1 wrote bf16 partials + a fused lse (in segm_max); the paired
+        # (max, expsum) reduce cannot read that contract.
+        _reduce_kernel = triton_mla_decode_fwd_reduce_lse_kernel
+        extra_reduce_args = {"segm_lse_ptr": segm_max}
+    else:
+        _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+        extra_reduce_args = {
+            "segm_max_ptr": segm_max,
+            "segm_expsum_ptr": segm_expsum,
+        }
 
     _reduce_kernel[(total_num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
+        **extra_reduce_args,
         seq_lens_ptr=seqused_k,
         out_scale_ptr=out_scale,
         num_seqs=num_seqs,
