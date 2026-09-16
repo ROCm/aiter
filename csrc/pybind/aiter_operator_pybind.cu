@@ -4,7 +4,7 @@
 #include "aiter_stream.h"
 #include "aiter_operator.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     AITER_OPERATOR_PYBIND;

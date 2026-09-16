@@ -4,11 +4,12 @@
 
 import argparse
 
-import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
+from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import (
     benchmark,
@@ -37,7 +38,6 @@ except ImportError:
 TRITON_MHC_POST_PRE_MAX_M = 4096
 
 torch.set_default_device("cuda")
-# torch.cuda.manual_seed_all(0)
 # torch.set_printoptions(precision=3, linewidth=200, sci_mode=False)
 
 
@@ -460,7 +460,15 @@ def mhc_pre_norm_split_hip(
 
 @benchmark()
 def test_mhc_pre(
-    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, fn_pack_bf16=False
+    m,
+    hidden_size,
+    hc_mult,
+    test_hc_head=False,
+    fuse_rmsnorm=False,
+    w_preshuffle_bf16=False,
+    dtype=dtypes.bf16,
+    data_init="norm",
+    seed=0,
 ):
     if fuse_rmsnorm and test_hc_head:
         raise ValueError("fuse_rmsnorm and hc_head are mutually exclusive")
@@ -468,13 +476,14 @@ def test_mhc_pre(
     hc_mult2 = hc_mult * hc_mult
     hc_mult3 = hc_mult * 2 + hc_mult2 if not test_hc_head else hc_mult
     hc_hidden_size = hc_mult * hidden_size
-    residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
-    hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
-    hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
+    gen = make_generator(seed)
+    residual = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    fn = fill((hc_mult3, hc_hidden_size), data_init, gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), data_init, gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), data_init, gen, dtype=dtypes.fp32) * 0.1
     norm_weight = None
     if fuse_rmsnorm:
-        norm_weight = torch.randn(hidden_size, dtype=dtypes.bf16)
+        norm_weight = fill((hidden_size,), data_init, gen, dtype=dtype)
     extra_args = {
         "rms_eps": 1e-6,
         "hc_pre_eps": 1e-6,
@@ -526,10 +535,14 @@ def test_mhc_pre(
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
 
-    # bf16 (fn hi/lo pack) GEMM path: same mhc_pre but is_fn_pack_bf16=1. On gfx950 this
-    # uses the native bf16 MFMA; on gfx1250 the wave32 bf16 WMMA (UNVERIFIED); on other
-    # arches it falls back to fp32 (so err/us == the fp32 columns).
-    if fn_pack_bf16:
+    # bf16 GEMM path: pre-pack fn (fp32) -> int32 BF16 hi/lo ONCE via mhc_shuffle_fn
+    # (fn are constant weights), then run mhc_pre with w_preshuffle_bf16=1 so the gemm
+    # bit-extracts hi/lo instead of recomputing the fp32->bf16 split per (m_block, k).
+    # On gfx950 this uses the native bf16 MFMA; gfx1250 the wave32 bf16 WMMA (UNVERIFIED).
+    if w_preshuffle_bf16:
+        from aiter.ops.mhc import mhc_shuffle_fn
+
+        fn_packed = mhc_shuffle_fn(fn)
         (
             _post_mix_bf16,
             _comb_mix_bf16,
@@ -537,18 +550,16 @@ def test_mhc_pre(
         ), hip_bf16_us = run_perftest(
             aiter.mhc_pre,
             residual,
-            fn,
+            fn_packed,
             hc_scale,
             hc_base,
-            is_fn_pack_bf16=1,
+            w_preshuffle_bf16=1,
             **hip_kwargs,
         )
         ret["hip_bf16_err"] = checkAllclose(
             layer_input_ref, layer_input_bf16, msg="layer_input(bf16)"
         )
         ret["hip_bf16_us"] = hip_bf16_us
-        if hip_us and hip_bf16_us:
-            ret["bf16_speedup"] = hip_us / hip_bf16_us
     if fuse_rmsnorm:
         ret["hip_nofuse_us"] = hip_nofuse_us
         ret["TB/s"] = (
@@ -680,11 +691,12 @@ def mhc_post_ref(
 
 
 @benchmark()
-def test_mhc_post(m, hidden_size, hc_mult):
-    x = torch.randn(m, hidden_size, dtype=dtypes.bf16)
-    residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    post_layer_mix = torch.randn(m, hc_mult, 1, dtype=dtypes.fp32)
-    comb_res_mix = torch.randn(m, hc_mult, hc_mult, dtype=dtypes.fp32)
+def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", seed=0):
+    gen = make_generator(seed)
+    x = fill((m, hidden_size), data_init, gen, dtype=dtype)
+    residual = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), data_init, gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), data_init, gen, dtype=dtypes.fp32)
     out_ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
     out_hip, hip_us = run_perftest(
         mhc_post_hip,
@@ -784,9 +796,22 @@ def mhc_post_pre_unfused_hip(
 
 @benchmark()
 def test_mhc_post_pre(
-    m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False, fn_pack_bf16=False
+    m,
+    hidden_size,
+    hc_mult,
+    fuse_rmsnorm=False,
+    large_m=False,
+    w_preshuffle_bf16=False,
+    res_preshuffle=False,
+    dtype=dtypes.bf16,
+    data_init="norm",
+    seed=0,
 ):
-    """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton."""
+    """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton.
+
+    --w_preshuffle_bf16 selects packed BF16 hi/lo compute for all HIP paths.
+    --res_shuffle requests the runtime fuse-aligned residual layout on gfx1250.
+    """
     if hidden_size < 512:
         aiter.logger.info(
             "skip mhc_post_pre: hidden_size=%s < 512 (big_fuse dispatch)", hidden_size
@@ -800,16 +825,17 @@ def test_mhc_post_pre(
     hc_mult3 = hc_mult * 2 + hc_mult2
     hc_hidden_size = hc_mult * hidden_size
 
-    layer_input = torch.randn(m, hidden_size, dtype=dtypes.bf16)
-    residual_in = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    post_layer_mix = torch.randn(m, hc_mult, 1, dtype=dtypes.fp32)
-    comb_res_mix = torch.randn(m, hc_mult, hc_mult, dtype=dtypes.fp32)
-    fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
-    hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
-    hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
+    gen = make_generator(seed)
+    layer_input = fill((m, hidden_size), data_init, gen, dtype=dtype)
+    residual_in = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), data_init, gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), data_init, gen, dtype=dtypes.fp32)
+    fn = fill((hc_mult3, hc_hidden_size), data_init, gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), data_init, gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), data_init, gen, dtype=dtypes.fp32) * 0.1
     norm_weight = None
     if fuse_rmsnorm:
-        norm_weight = torch.randn(hidden_size, dtype=dtypes.bf16)
+        norm_weight = fill((hidden_size,), data_init, gen, dtype=dtype)
 
     extra_args = {
         "rms_eps": 1e-6,
@@ -842,6 +868,28 @@ def test_mhc_post_pre(
     if fuse_rmsnorm:
         hip_kwargs["norm_weight"] = norm_weight
 
+    from aiter.ops.mhc import (
+        mhc_res_shuffle,
+        mhc_res_shuffle_enabled,
+        mhc_res_unshuffle,
+        mhc_shuffle_fn,
+    )
+
+    packed = w_preshuffle_bf16
+    shuffled = res_preshuffle and mhc_res_shuffle_enabled(m)
+    ret = {
+        "fuse_rmsnorm": fuse_rmsnorm,
+        "w_preshuffle_bf16": bool(packed),
+        "res_preshuffle": bool(shuffled),
+    }
+    pack_flag = int(packed)
+    # Pack weights and change residual layout independently, outside the timed call.
+    if packed:
+        fn_gemm = mhc_shuffle_fn(fn)
+    else:
+        fn_gemm = fn
+    residual_in_fused = mhc_res_shuffle(residual_in) if shuffled else residual_in
+
     (
         post_mix_unfused,
         comb_mix_unfused,
@@ -853,9 +901,10 @@ def test_mhc_post_pre(
         residual_in,
         post_layer_mix,
         comb_res_mix,
-        fn,
+        fn_gemm,
         hc_scale,
         hc_base,
+        w_preshuffle_bf16=pack_flag,
         **hip_kwargs,
     )
 
@@ -867,13 +916,15 @@ def test_mhc_post_pre(
     ), fused_us = run_perftest(
         aiter.mhc_fused_post_pre,
         layer_input,
-        residual_in,
+        residual_in_fused,
         post_layer_mix,
         comb_res_mix,
-        fn,
+        fn_gemm,
         hc_scale,
         hc_base,
         force_fused=True,
+        w_preshuffle_bf16=w_preshuffle_bf16,
+        res_preshuffle=res_preshuffle,
         **hip_kwargs,
     )
 
@@ -883,49 +934,18 @@ def test_mhc_post_pre(
         layer_input_ref, layer_input_unfused, msg="unfused/layer_input"
     )
     checkAllclose(next_residual_ref, next_residual_unfused, msg="unfused/next_residual")
+    if shuffled:
+        next_residual_fused = mhc_res_unshuffle(next_residual_fused)
     checkAllclose(post_mix_ref, post_mix_fused, msg="fused/post_mix")
     checkAllclose(comb_mix_ref, comb_mix_fused, msg="fused/comb_mix")
     hip_fused_err = checkAllclose(
         layer_input_ref, layer_input_fused, msg="fused/layer_input"
     )
     checkAllclose(next_residual_ref, next_residual_fused, msg="fused/next_residual")
-    ret = {"fuse_rmsnorm": fuse_rmsnorm}
     ret["unfused_us"] = unfused_us
     ret["hip_unfused_err"] = hip_unfused_err
     ret["fused_us"] = fused_us
     ret["hip_fused_err"] = hip_fused_err
-
-    # bf16 (fn hi/lo pack) compute path: same fused kernel but is_fn_pack_bf16=1. gfx950
-    # native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); other arches fall back to
-    # fp32 (err/us == the fp32 fused columns).
-    if fn_pack_bf16:
-        (
-            _post_mix_bf16,
-            _comb_mix_bf16,
-            layer_input_bf16,
-            next_residual_bf16,
-        ), fused_bf16_us = run_perftest(
-            aiter.mhc_fused_post_pre,
-            layer_input,
-            residual_in,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            force_fused=True,
-            is_fn_pack_bf16=1,
-            **hip_kwargs,
-        )
-        ret["fused_bf16_err"] = checkAllclose(
-            layer_input_ref, layer_input_bf16, msg="fused/layer_input(bf16)"
-        )
-        checkAllclose(
-            next_residual_ref, next_residual_bf16, msg="fused/next_residual(bf16)"
-        )
-        ret["fused_bf16_us"] = fused_bf16_us
-        if fused_us and fused_bf16_us:
-            ret["bf16_speedup"] = fused_us / fused_bf16_us
     # print(f"next_residual_ref: {next_residual_ref}")
     # print(f"next_residual_fused: {next_residual_fused}")
 
@@ -994,9 +1014,11 @@ def test_mhc_post_pre(
                 residual_in,
                 post_layer_mix,
                 comb_res_mix,
-                fn,
+                fn_gemm,
                 hc_scale,
                 hc_base,
+                w_preshuffle_bf16=w_preshuffle_bf16,
+                res_preshuffle=False,
                 **hip_kwargs,
             )
             ret["large_m_us"] = large_m_us
@@ -1005,6 +1027,77 @@ def test_mhc_post_pre(
             )
 
     return ret
+
+
+def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
+    from aiter.ops.mhc import (
+        MHC_RES_KS,
+        mhc_res_repeat,
+        mhc_res_shuffle,
+        mhc_res_unshuffle,
+    )
+
+    hidden_states = torch.randn(m, hidden_size, dtype=dtype)
+    residual = hidden_states.unsqueeze(1).repeat(1, hc_mult, 1)
+
+    def repeat_ref(x, mult):
+        rows, width = x.shape
+        return (
+            x.view(rows, width // MHC_RES_KS, MHC_RES_KS)
+            .permute(1, 0, 2)
+            .unsqueeze(1)
+            .expand(-1, mult, -1, -1)
+            .contiguous()
+            .view(rows, mult, width)
+        )
+
+    def shuffle_ref(x):
+        rows, mult, width = x.shape
+        return (
+            x.view(rows, mult, width // MHC_RES_KS, MHC_RES_KS)
+            .permute(2, 1, 0, 3)
+            .contiguous()
+            .view(rows, mult, width)
+        )
+
+    def unshuffle_ref(x):
+        rows, mult, width = x.shape
+        return (
+            x.view(width // MHC_RES_KS, mult, rows, MHC_RES_KS)
+            .permute(2, 1, 0, 3)
+            .contiguous()
+            .view(rows, mult, width)
+        )
+
+    repeated_ref, torch_repeat_us = run_perftest(repeat_ref, hidden_states, hc_mult)
+    repeated_out, flydsl_repeat_us = run_perftest(
+        mhc_res_repeat, hidden_states, hc_mult, True
+    )
+    assert torch.equal(repeated_out, repeated_ref)
+
+    shuffled_ref, torch_shuffle_us = run_perftest(shuffle_ref, residual)
+    shuffled_out, flydsl_shuffle_us = run_perftest(mhc_res_shuffle, residual)
+    assert torch.equal(shuffled_out, shuffled_ref)
+
+    unshuffled_ref, torch_unshuffle_us = run_perftest(unshuffle_ref, shuffled_ref)
+    unshuffled_out, flydsl_unshuffle_us = run_perftest(mhc_res_unshuffle, shuffled_out)
+    assert torch.equal(unshuffled_out, unshuffled_ref)
+    assert torch.equal(unshuffled_out, residual)
+
+    return {
+        "M": m,
+        "dtype": str(dtype),
+        "N": hidden_size,
+        "torch_repeat_us": torch_repeat_us,
+        "flydsl_repeat_us": flydsl_repeat_us,
+        "repeat_speedup": torch_repeat_us / flydsl_repeat_us,
+        "torch_shuffle_us": torch_shuffle_us,
+        "flydsl_shuffle_us": flydsl_shuffle_us,
+        "shuffle_speedup": torch_shuffle_us / flydsl_shuffle_us,
+        "torch_unshuffle_us": torch_unshuffle_us,
+        "flydsl_unshuffle_us": flydsl_unshuffle_us,
+        "unshuffle_speedup": torch_unshuffle_us / flydsl_unshuffle_us,
+    }
 
 
 parser = argparse.ArgumentParser(
@@ -1018,7 +1111,7 @@ parser.add_argument(
     choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
     nargs="*",
     metavar="{fp16, bf16}",
-    default=["bf16"],
+    default=[dtypes.bf16],
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -1035,10 +1128,10 @@ parser.add_argument(
     "--hidden_size",
     type=int,
     nargs="*",
-    choices=[1280, 2560, 4096, 7168],
-    default=[1280, 2560, 4096, 7168],
+    choices=[4096, 5120, 7168],
+    default=[4096, 5120, 7168],
     help="""hidden_size.
-    e.g.: -hidden_size 1024""",
+    e.g.: -n 5120""",
 )
 _mode_group = parser.add_mutually_exclusive_group()
 _mode_group.add_argument(
@@ -1058,65 +1151,107 @@ parser.add_argument(
     "(gfx950, M>1024, mhc_fused_post_pre_large_m).",
 )
 parser.add_argument(
-    "--fn_pack_bf16",
-    action="store_true",
-    help="Also run the bf16 (fn hi/lo pack) compute path (is_fn_pack_bf16=1) and add "
-    "hip_bf16_err/hip_bf16_us (mhc_pre) and fused_bf16_err/fused_bf16_us + bf16_speedup "
-    "(mhc_post_pre). gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); "
-    "other arches fall back to fp32.",
+    "--w_preshuffle_bf16",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable BF16 hi/lo GEMM with pre-packed weights, independently of residual layout.",
 )
+parser.add_argument(
+    "--res_shuffle",
+    "--res_preshuffle",
+    dest="res_preshuffle",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Request shuffled residual input/output when the runtime policy uses "
+    "the fused path (gfx1250 only), independently of GEMM compute.",
+)
+add_data_init_args(parser, default_dist="norm")
 
 args = parser.parse_args()
+if args.res_preshuffle and get_gfx_runtime() != "gfx1250":
+    parser.error("residual shuffle is only supported on gfx1250; use --no-res_shuffle")
+
+if args.res_preshuffle and not args.hc_head:
+    from aiter.ops.mhc import mhc_res_shuffle_enabled
+
+    df = []
+    for dtype in args.dtype:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                if not mhc_res_shuffle_enabled(m):
+                    continue
+                for hc_mult in [4]:
+                    df.append(
+                        test_mhc_res_layout(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=hc_mult,
+                            dtype=dtype,
+                        )
+                    )
+    print_json_table("mhc_res_layout summary", df)
+
 
 df = []
 for dtype in args.dtype:
-    for hidden_size in args.hidden_size:
-        for m in args.m:
-            for hc_mult in [4]:
-                ret = test_mhc_pre(
-                    m=m,
-                    hidden_size=hidden_size,
-                    hc_mult=hc_mult,
-                    test_hc_head=args.hc_head,
-                    fuse_rmsnorm=args.fuse_rmsnorm,
-                    fn_pack_bf16=args.fn_pack_bf16,
-                )
-                df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+    for data_init in args.data_init:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_pre(
+                        m=m,
+                        hidden_size=hidden_size,
+                        hc_mult=hc_mult,
+                        test_hc_head=args.hc_head,
+                        fuse_rmsnorm=args.fuse_rmsnorm,
+                        w_preshuffle_bf16=args.w_preshuffle_bf16,
+                        dtype=dtype,
+                        data_init=data_init,
+                        seed=args.seed,
+                    )
+                    df.append(ret)
+print_json_table("mhc_pre summary", df)
 
 if not args.hc_head:
     df = []
     for dtype in args.dtype:
-        for hidden_size in args.hidden_size:
-            for m in args.m:
-                for hc_mult in [4]:
-                    ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
-                    df.append(ret)
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+        for data_init in args.data_init:
+            for hidden_size in args.hidden_size:
+                for m in args.m:
+                    for hc_mult in [4]:
+                        ret = test_mhc_post(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=hc_mult,
+                            dtype=dtype,
+                            data_init=data_init,
+                            seed=args.seed,
+                        )
+                        df.append(ret)
+    print_json_table("mhc_post summary", df)
 
     df = []
     for dtype in args.dtype:
-        for hidden_size in args.hidden_size:
-            for m in args.m:
-                for hc_mult in [4]:
-                    ret = test_mhc_post_pre(
-                        m=m,
-                        hidden_size=hidden_size,
-                        hc_mult=hc_mult,
-                        fuse_rmsnorm=args.fuse_rmsnorm,
-                        large_m=args.largeM,
-                        fn_pack_bf16=args.fn_pack_bf16,
-                    )
-                    if ret.get("skipped"):
-                        continue
-                    df.append(ret)
+        for data_init in args.data_init:
+            for hidden_size in args.hidden_size:
+                for m in args.m:
+                    for hc_mult in [4]:
+                        ret = test_mhc_post_pre(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=hc_mult,
+                            fuse_rmsnorm=args.fuse_rmsnorm,
+                            large_m=args.largeM,
+                            w_preshuffle_bf16=args.w_preshuffle_bf16,
+                            res_preshuffle=args.res_preshuffle,
+                            dtype=dtype,
+                            data_init=data_init,
+                            seed=args.seed,
+                        )
+                        if ret.get("skipped"):
+                            continue
+                        df.append(ret)
     if df:
-        df = pd.DataFrame(df)
-        df_md = df.to_markdown(index=False)
-        aiter.logger.info("mhc_post_pre summary (markdown):\n%s", df_md)
+        print_json_table("mhc_post_pre summary", df)
     else:
         aiter.logger.info("mhc_post_pre: all cases skipped")
