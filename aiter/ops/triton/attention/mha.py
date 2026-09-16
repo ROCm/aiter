@@ -542,7 +542,22 @@ def _flash_attn_forward(
     else:
         philox_seed = 0
         philox_offset = 0
-    if return_softmax or enable_dropout:
+    # Only allocate when the caller actually asks for the scores: `S_dmask` is
+    # surfaced solely under `return_softmax`, so allocating it for every dropout
+    # call wrote a [B, H, Sq, Sk] fp32 tensor that was then discarded.
+    #
+    # NOTE: the philox coordinate is derived from these strides, so they must be
+    # passed even when the tensor itself is not allocated -- otherwise every
+    # element collapses onto the same RNG offset and dropout degenerates. They
+    # are the strides of a contiguous [batch, nheads, max_seqlen_q, max_seqlen_k]
+    # tensor, i.e. exactly what `s_dmask.stride()` used to return.
+    sd_strides = (
+        num_q_heads * max_seqlen_q * max_seqlen_k,
+        max_seqlen_q * max_seqlen_k,
+        max_seqlen_k,
+        1,
+    )
+    if return_softmax:
         s_dmask = torch.zeros(
             (batch, num_q_heads, max_seqlen_q, max_seqlen_k),
             device=q.device,
@@ -640,10 +655,10 @@ def _flash_attn_forward(
             *o_strides,
             alibi_slopes.stride(0) if alibi_slopes is not None else 0,
             alibi_slopes.stride(1) if alibi_slopes is not None else 0,
-            s_dmask.stride(0) if s_dmask is not None else 0,
-            s_dmask.stride(1) if s_dmask is not None else 0,
-            s_dmask.stride(2) if s_dmask is not None else 0,
-            s_dmask.stride(3) if s_dmask is not None else 0,
+            sd_strides[0],
+            sd_strides[1],
+            sd_strides[2],
+            sd_strides[3],
             stride_lse_z if softmax_lse is not None else 0,
             stride_lse_h if softmax_lse is not None else 0,
             stride_lse_m if softmax_lse is not None else 0,

@@ -244,9 +244,10 @@ def _attn_fwd_inner(
             # validated. See isa_dump/COMPILER_BUG.md.
             p_kept = tl.where(dropout_mask, p, 0.0)
 
-            # return scores with negative values for dropped vals
-            sd_mask = tl.where(dropout_mask, p, -p)
-            tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
+            if RETURN_SCORES:
+                # return scores with negative values for dropped vals
+                sd_mask = tl.where(dropout_mask, p, -p)
+                tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
 
             # apply dropout mask in place
             p = p_kept
