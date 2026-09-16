@@ -179,34 +179,31 @@ def compile_pa_decode_tile(
     # The wrapper selects earlier V loads for tuned gfx950 decode shapes.
     # Page 16 additionally delays next K until PV and uses IGLP to overlap
     # groups of V loads with QK MFMA instructions.
-    tune_page128 = (
+    TUNED_V_PATH = (
         is_gfx950
         and head_dim == 128
-        and block_size == 128
-        and (trans_v or PER_TOKEN_M1)
-        and (not per_token_kv or PER_TOKEN_M1)
+        and block_size in (16, 128)
+        and (PER_TOKEN_M1 or (trans_v and not per_token_kv))
     )
-    tune_page16_vpipe = (
-        is_gfx950
-        and head_dim == 128
-        and block_size == 16
-        and (trans_v or PER_TOKEN_M1)
-        and (not per_token_kv or PER_TOKEN_M1)
-    )
-    EARLY_V = prefetch_v and (tune_page128 or tune_page16_vpipe) and M_TILES == 1
-    PAGE16_VPIPE = prefetch_v and tune_page16_vpipe and M_TILES == 1
+    TUNE_PAGE128 = TUNED_V_PATH and block_size == 128
+    EARLY_V = prefetch_v and TUNED_V_PATH and M_TILES == 1
+    PAGE16_VPIPE = EARLY_V and block_size == 16
     SCALES_BEFORE_CURRENT_V = WIDE_FP8_MFMA and (
         PAGE16_VPIPE or (PER_TOKEN_M1 and not trans_v)
     )
     # Apply score scales before the -inf mask on the tuned single-M-tile
     # paths. This removes the second mask without introducing -inf * 0.
     M1_SCALE_BEFORE_MASK = PAGE16_VPIPE or SCALAR_FP8_DECODE or PER_TOKEN_M1
-    P_BUFFERS = M_TILES if MTP4_FUSED else 2 if tune_page128 and M_TILES == 3 else 1
+    P_BUFFERS = M_TILES if MTP4_FUSED else 2 if TUNE_PAGE128 and M_TILES == 3 else 1
     # PV layout: V=A, P=B -> output [head-dim (row), query-row (col=lane16)],
     # generalized over head_dim via the VHE_CHUNKS loop.
     NWARP = 4  # 4 waves / CTA
-    TOK_PER_WARP = 64  # tokens each warp owns per compute block (matches production KV_COMPUTE_BLOCK)
-    TILE_TOK = NWARP * TOK_PER_WARP  # 256 tokens / compute block
+    TILE_TOK = KV_COMPUTE_BLOCK
+    TOK_PER_WARP = TILE_TOK // NWARP
+    assert TILE_TOK == NWARP * TOK_PER_WARP, "KV tile must split evenly across warps"
+    assert (
+        TOK_PER_WARP == NWARP * MFMA_MNK
+    ), "per-warp token ownership must match the MFMA chunk layout"
     # A warp owns 64 tokens: four page-16s, one page-64, or half a page-128.
     PAGES_PER_CHUNK = (TOK_PER_WARP + block_size - 1) // block_size
     assert (
@@ -262,7 +259,7 @@ def compile_pa_decode_tile(
     sQscale_bytes = 0 if SCALAR_FP8_DECODE else ROWS_PADDED * f32
     # Keep tuned cross-wave reduction rows 16-byte aligned for vector reads.
     # Other paths retain the original bank-conflict padding.
-    NWARP_PAD = NWARP if tune_page128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
+    NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
     # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
     sLmax_off = sQscale_off + sQscale_bytes
     sLsum_off = sLmax_off + M_TILES * MFMA_MNK * NWARP_PAD * f32
@@ -489,8 +486,7 @@ def compile_pa_decode_tile(
         def _lds_store(byte_off, elem_ty, vec):
             fx.ptr_store(vec, _lds_ptr(byte_off, elem_ty))
 
-        TOK_CHUNK = NWARP * MFMA_MNK  # 64
-        NCHUNK = TILE_TOK // TOK_CHUNK  # 4
+        NCHUNK = TOK_PER_WARP // MFMA_MNK  # 4
 
         if const_expr(per_token_kv):
             scale_load_width = NCHUNK if block_size >= 64 else 1
@@ -620,7 +616,7 @@ def compile_pa_decode_tile(
 
         def _load_scale_vec(base_off, a, buf_off=0):
             # This lane's 4 per-token scales for chunk `a` from an LDS scale region.
-            slot = (warp * TOK_CHUNK + a * c16 + rgroup * 4) * f32
+            slot = (warp * TOK_PER_WARP + a * c16 + rgroup * 4) * f32
             return _lds_load(base_off + buf_off + slot, fx.Float32, 4)
 
         def _load_kv_scale_vecs(a, buf_off=0):
@@ -662,7 +658,7 @@ def compile_pa_decode_tile(
             return acc
 
         # -- raw dwordx4 K load (A operand) --
-        # token = warp*TOK_CHUNK + a*c16 + lane16 (the softmax mask and P-pack
+        # token = warp*TOK_PER_WARP + a*c16 + lane16 (the softmax mask and P-pack
         # write position below must encode this same formula).
         def _k_ops(phys, a):
             within_page_tok = (warp * TOK_PER_WARP + a * c16 + lane16) % block_size
@@ -1015,7 +1011,7 @@ def compile_pa_decode_tile(
                 ctx_thr = fx.Vector.from_elements(
                     [
                         tile_valid.to(fx.Float32)
-                        - fx.Int32(warp * TOK_CHUNK + rgroup * 4).to(fx.Float32)
+                        - fx.Int32(warp * TOK_PER_WARP + rgroup * 4).to(fx.Float32)
                     ],
                     dtype=fx.Float32,
                 ).broadcast_to(4)
@@ -1098,7 +1094,9 @@ def compile_pa_decode_tile(
 
                     scale = scale_qk * fx.Float32(q_scale_vec[m])
                     n_valid_tile = (causal_bound[m] - tok0).to(fx.Float32)
-                    base_tok_f = fx.Int32(warp * TOK_CHUNK + rgroup * 4).to(fx.Float32)
+                    base_tok_f = fx.Int32(warp * TOK_PER_WARP + rgroup * 4).to(
+                        fx.Float32
+                    )
                     thr = fx.Vector.from_elements(
                         [n_valid_tile - base_tok_f], dtype=fx.Float32
                     ).broadcast_to(4)
@@ -1265,7 +1263,7 @@ def compile_pa_decode_tile(
                                 sP_off
                                 + m * MFMA_MNK * SP_ROW_BYTES
                                 + lane16 * SP_ROW_BYTES
-                                + warp * TOK_CHUNK
+                                + warp * TOK_PER_WARP
                                 + rgroup * 4
                                 + a * (c16 // 4) * f32
                             )
@@ -1417,7 +1415,7 @@ def compile_pa_decode_tile(
                         p_off0 = (
                             p_base
                             + lane16 * SP_ROW_BYTES
-                            + warp * TOK_CHUNK
+                            + warp * TOK_PER_WARP
                             + rgroup * 4
                         )
                         # The NCHUNK P words scatter across the row at stride c16//4
@@ -1524,7 +1522,7 @@ def compile_pa_decode_tile(
                     else scale_qk * _ld1(sQscale_off, lane16)
                 )  # per-qhead positive score scale
                 n_valid_tile = (causal_bound[0] - tok0).to(fx.Float32)
-                base_tok_f = fx.Int32(warp * TOK_CHUNK + rgroup * 4).to(fx.Float32)
+                base_tok_f = fx.Int32(warp * TOK_PER_WARP + rgroup * 4).to(fx.Float32)
                 thr = fx.Vector.from_elements(
                     [n_valid_tile - base_tok_f], dtype=fx.Float32
                 ).broadcast_to(4)
@@ -1693,7 +1691,9 @@ def compile_pa_decode_tile(
                     else:
                         p_scaled = Pa * fx.Vector.filled(4, FP8_MAX, fx.Float32)
                     words.append(_f32_to_fp8_words(p_scaled)[0])
-                p_off0 = sP_off + lane16 * SP_ROW_BYTES + warp * TOK_CHUNK + rgroup * 4
+                p_off0 = (
+                    sP_off + lane16 * SP_ROW_BYTES + warp * TOK_PER_WARP + rgroup * 4
+                )
                 # NCHUNK P words scatter at stride c16//4 i32 (see phase-split).
                 for a in range_constexpr(NCHUNK):
                     _lds_store(
