@@ -486,9 +486,9 @@ def test_k1_family_a_set_equality_prefill():
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
 
-    2c does not claim a win. Decode and prefill share one instantiation.
-    Expand is not fused. Long ``L`` streams 512-slot tiles into a running
-    LDS top-512 (no score matrix).
+    2d: eight waves per row, one column per thread per tile. Decode and
+    prefill share one instantiation. Expand is not fused. Long ``L`` streams
+    512-slot tiles into a running LDS top-512 (no score matrix).
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
