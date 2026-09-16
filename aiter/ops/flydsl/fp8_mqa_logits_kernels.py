@@ -35,8 +35,8 @@ from .kernels.mqa_logits.fp8_mqa_logits import (
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
-    "KERNEL_VARIANTS",
     "DEFAULT_VARIANT",
+    "KERNEL_VARIANTS",
     "compile_fp8_mqa_logits",
     "flydsl_fp8_mqa_logits",
 ]
@@ -183,11 +183,11 @@ def _mk_builder(
     """
     extra = {} if bkv is None else {"block_kv": bkv}
     if lds is None:
-        builder = lambda **kw: _build_kernel_mfma_r_w(  # noqa: E731
+        builder = lambda **kw: _build_kernel_mfma_r_w(
             **{**kw, **extra}, rows_per_block=rpb, waves_per_block=wpb, mfma=mfma
         )
     else:
-        builder = lambda **kw: _build_kernel_mfma_lds_pipe(  # noqa: E731
+        builder = lambda **kw: _build_kernel_mfma_lds_pipe(
             **{**kw, **extra},
             rows_per_block=rpb,
             waves_per_block=wpb,
