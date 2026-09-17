@@ -510,6 +510,33 @@ class TestSmokeStrategy(unittest.TestCase):
                     with self.subTest(backend=backend, axis=key):
                         self.assertGreater(len(sampled), 1)
 
+    def test_a_sampled_grid_does_not_lock_axes_to_each_other(self):
+        """Varying every axis is not enough. Advancing all axes together
+        varies each one while walking a single diagonal, which leaves whole
+        regions of the grid unreachable -- BLOCK_N=64 with num_warps=8 never
+        appears. Require each pair of axes to take more joint values than
+        either takes alone, which a diagonal cannot satisfy."""
+        for backend in ("triton", "gluon"):
+            sample = [
+                c.backend_config
+                for c in enumerate_mha_fwd_candidates("gfx950", "smoke")
+                if c.backend == backend
+            ]
+            axes = sorted(sample[0])
+            for i, left in enumerate(axes):
+                for right in axes[i + 1 :]:
+                    distinct_left = {cfg[left] for cfg in sample}
+                    distinct_right = {cfg[right] for cfg in sample}
+                    if len(distinct_left) < 2 or len(distinct_right) < 2:
+                        continue
+                    joint = {(cfg[left], cfg[right]) for cfg in sample}
+                    with self.subTest(backend=backend, pair=(left, right)):
+                        self.assertGreater(
+                            len(joint),
+                            max(len(distinct_left), len(distinct_right)),
+                            f"{left} and {right} advance in lockstep",
+                        )
+
     def test_smoke_is_deterministic(self):
         first = [c.identity for c in enumerate_mha_fwd_candidates("gfx950", "smoke")]
         second = [c.identity for c in enumerate_mha_fwd_candidates("gfx950", "smoke")]

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import statistics
 from dataclasses import dataclass
 from hashlib import sha256
@@ -492,24 +493,35 @@ MHA_FWD_SEARCH_STRATEGIES = ("exhaustive", "smoke")
 # How many configurations the smoke strategy keeps per dict-config backend.
 # Small enough that a full two-arm run finishes in minutes, large enough that
 # the winner is still chosen between genuinely different tile shapes.
+MHA_FWD_SMOKE_SEED = 20240917
 MHA_FWD_SMOKE_PER_BACKEND = 8
 
 
 def _tile_grid(axes: tuple[tuple, ...], strategy: str) -> list[tuple]:
     """Expand tuning axes into configurations for the requested strategy.
 
-    Exhaustive is the full cartesian product. Smoke advances every axis at
-    once, taking value ``i % len(axis)`` from each, so a short sample still
-    varies warps and stages rather than only the outer block sizes. Striding
-    the flattened product cannot do this: the product's inner axes cycle with
-    a period that a stride tends to land on, silently pinning them.
+    Exhaustive is the full cartesian product. Smoke draws a short sample, and
+    the sample has to be spread rather than merely varied. Every arithmetic
+    scheme tried here has had a lattice artifact. Striding the flattened
+    product lands on the period of the product's inner axes and pins warps and
+    stages to a single value. Advancing all axes together unpins them but locks
+    them to each other, walking one diagonal so BLOCK_N=64 with num_warps=8
+    stays unreachable. Per-axis coprime strides still collide whenever two axes
+    of equal length draw the same stride modulo that length.
+
+    A seeded sample of the product has no such structure, is reproducible, and
+    is obviously unbiased. The product is at most a few thousand tuples here,
+    so materializing it to sample from costs nothing worth saving.
     """
     if strategy != "smoke":
         return list(product(*axes))
-    return [
-        tuple(axis[index % len(axis)] for axis in axes)
-        for index in range(MHA_FWD_SMOKE_PER_BACKEND)
-    ]
+
+    population = list(product(*axes))
+    if len(population) <= MHA_FWD_SMOKE_PER_BACKEND:
+        return population
+    return random.Random(MHA_FWD_SMOKE_SEED).sample(
+        population, MHA_FWD_SMOKE_PER_BACKEND
+    )
 
 
 def enumerate_mha_fwd_candidates(
