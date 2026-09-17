@@ -1514,21 +1514,28 @@ using indexer_qk_out_t = std::conditional_t<FP4_OUT, uint8_t, cache_t>;
 template <bool FP4_OUT, typename scalar_t>
 using indexer_weights_out_t = std::conditional_t<FP4_OUT, scalar_t, float>;
 
-// One wave per block: the Q phase gives each lane VEC_BYTES of a q row, the K
+// One wave per block: the Q phase gives each lane VEC elements of a q row, the K
 // phase spans the whole wave. The dispatch also instantiates 4-byte scalars, so
 // per-lane element counts have to follow sizeof(scalar_t).
-constexpr int INDEXER_THREADS        = 64;
 constexpr int INDEXER_VEC_BYTES_WIDE = 16;
-// Elements, not bytes: 4 bytes leaves a 4-byte scalar_t with one element per lane,
-// which cannot tile a 64-lane wave into whole head rows.
-constexpr int INDEXER_NARROW_VEC_ELEMS = 2;
 // Measured crossover of the two instantiations.
 constexpr int INDEXER_NARROW_MAX_TOKENS = 256;
 
-template <typename scalar_t, int HEAD_DIM, int THREADS, int VEC_BYTES>
-__host__ __device__ constexpr int indexer_heads_per_block()
+// WARP_SIZE is a device-pass constant; a constant-evaluated read of it always
+// answers 64, whatever the target. It must therefore never reach a template
+// argument or a const host variable, or a wave32 build registers a host stub
+// under a kernel name its device binary does not define. The kernel is templated
+// on NARROW alone and both passes recompute the shape from the wave they see.
+__host__ __device__ constexpr int
+indexer_vec_elems(bool narrow, int threads, int head_dim, int elem_bytes)
 {
-    return THREADS / (HEAD_DIM / (VEC_BYTES / static_cast<int>(sizeof(scalar_t))));
+    return narrow ? head_dim / threads : INDEXER_VEC_BYTES_WIDE / elem_bytes;
+}
+
+__host__ __device__ constexpr int
+indexer_heads_per_block(int threads, int head_dim, int vec_elems)
+{
+    return threads * vec_elems / head_dim;
 }
 
 // Folds the per-element wave results in element order, so the caller's
@@ -1559,8 +1566,7 @@ template <typename scalar_t,
           int HEAD_DIM,
           int ROPE_DIM,
           bool FP4_OUT,
-          int THREADS,
-          int VEC_BYTES>
+          bool NARROW>
 __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const scalar_t* __restrict__ q,           // [num_tokens, n_heads, head_dim]
     indexer_qk_out_t<FP4_OUT, cache_t>* __restrict__ q_out,
@@ -1606,19 +1612,21 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
 {
     static_assert(HEAD_DIM == 128, "Indexer fused qk cache currently supports head_dim=128");
     static_assert(ROPE_DIM == 64, "Indexer fused qk cache currently supports rope_dim=64");
-    static_assert(THREADS <= WARP_SIZE && HEAD_DIM % THREADS == 0,
-                  "every reduction here is wave-level, so a block must be one wave or less");
-    static_assert(THREADS == ROPE_DIM,
-                  "the K RoPE partner is lane ^ (ROPE_DIM / 2), which needs dim = lane + e * ROPE_DIM");
+    constexpr int THREADS = WARP_SIZE;
+    static_assert(HEAD_DIM % THREADS == 0,
+                  "every reduction here is wave-level, so a block is exactly one wave");
+    static_assert((ROPE_DIM / 2) % THREADS == 0 || THREADS % (ROPE_DIM / 2) == 0,
+                  "K splits as dim = lane + e * THREADS, so dim ^ (ROPE_DIM / 2) has to fall "
+                  "wholly on the lane axis or wholly on the element axis");
     constexpr int ELEMS = HEAD_DIM / THREADS;
 
-    constexpr int VEC            = VEC_BYTES / static_cast<int>(sizeof(scalar_t));
+    constexpr int VEC =
+        indexer_vec_elems(NARROW, THREADS, HEAD_DIM, static_cast<int>(sizeof(scalar_t)));
     constexpr int LANES_PER_HEAD = HEAD_DIM / VEC;
     // Only the narrow instantiation keeps shared memory: its 1-64 token band is
     // latency-bound, where a lane exchange costs more than a shared round trip.
-    constexpr bool SHARED_ROPE = VEC_BYTES < INDEXER_VEC_BYTES_WIDE;
-    constexpr int HEADS_PER_BLOCK =
-        indexer_heads_per_block<scalar_t, HEAD_DIM, THREADS, VEC_BYTES>();
+    constexpr bool SHARED_ROPE    = NARROW;
+    constexpr int HEADS_PER_BLOCK = indexer_heads_per_block(THREADS, HEAD_DIM, VEC);
     static_assert(HEAD_DIM % VEC == 0 && THREADS % LANES_PER_HEAD == 0,
                   "the wave must split evenly into whole head rows");
     static_assert(HEADS_PER_BLOCK >= 1, "a wave must cover at least one head row");
@@ -1833,6 +1841,14 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
         for(int e = 0; e < ELEMS; ++e)
         {
             k_pair[e] = normed[(lane + e * THREADS) ^ (is_neox ? K_HALF : 1)];
+        }
+    }
+    else if constexpr(K_HALF >= THREADS)
+    {
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
+        {
+            k_pair[e] = is_neox ? k_val[e ^ (K_HALF / THREADS)] : __shfl_xor(k_val[e], 1);
         }
     }
     else
@@ -3868,20 +3884,15 @@ void reshape_and_cache_flash(
                                      use_ue8m0,                                                   \
                                      do_preshuffle);
 
-#define INDEXER_TPB aiter::INDEXER_THREADS
-
-#define INDEXER_QK_LAUNCH_ONE(KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T, VEC_B)          \
+#define INDEXER_QK_LAUNCH_ONE(KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T, NARROW)         \
     aiter::indexer_qk_rope_quant_and_cache_kernel<KV_T,                                           \
                                                  CACHE_T,                                         \
                                                  KV_DTYPE,                                        \
                                                  128,                                             \
                                                  64,                                              \
                                                  FP4_OUT,                                         \
-                                                 aiter::INDEXER_THREADS,                          \
-                                                 VEC_B>                                           \
-        <<<dim3(num_tokens,                                                                       \
-                (n_heads + aiter::indexer_heads_per_block<KV_T, 128, INDEXER_TPB, VEC_B>() - 1) /  \
-                    aiter::indexer_heads_per_block<KV_T, 128, INDEXER_TPB, VEC_B>()),             \
+                                                 NARROW>                                          \
+        <<<dim3(num_tokens, (n_heads + heads_per_block - 1) / heads_per_block),                   \
            block,                                                                                 \
            0,                                                                                     \
            stream>>>(reinterpret_cast<KV_T*>(q.data_ptr()),                                       \
@@ -3927,25 +3938,13 @@ void reshape_and_cache_flash(
 
 #define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_IMPL(                                                \
     KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T)                                           \
-    if(num_tokens <= aiter::INDEXER_NARROW_MAX_TOKENS)                                            \
+    if(narrow)                                                                                    \
     {                                                                                             \
-        INDEXER_QK_LAUNCH_ONE(KV_T,                                                               \
-                              CACHE_T,                                                            \
-                              KV_DTYPE,                                                           \
-                              FP4_OUT,                                                            \
-                              Q_OUT_T,                                                            \
-                              W_OUT_T,                                                            \
-                              static_cast<int>(sizeof(KV_T)) * aiter::INDEXER_NARROW_VEC_ELEMS)   \
+        INDEXER_QK_LAUNCH_ONE(KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T, true)           \
     }                                                                                             \
     else                                                                                          \
     {                                                                                             \
-        INDEXER_QK_LAUNCH_ONE(KV_T,                                                               \
-                              CACHE_T,                                                            \
-                              KV_DTYPE,                                                           \
-                              FP4_OUT,                                                            \
-                              Q_OUT_T,                                                            \
-                              W_OUT_T,                                                            \
-                              aiter::INDEXER_VEC_BYTES_WIDE)                                      \
+        INDEXER_QK_LAUNCH_ONE(KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T, false)          \
     }
 
 #define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                             \
@@ -4609,9 +4608,10 @@ void indexer_qk_rope_quant_and_cache(
     // is q + token * stride0 + head * stride1 + dim0, and dim0 is already a
     // multiple of the width, so both strides have to be too.
     const int64_t q_elem_bytes = q.dtype() == AITER_DTYPE_fp32 ? 4 : 2;
-    const int64_t q_vec_elems  = num_tokens <= aiter::INDEXER_NARROW_MAX_TOKENS
-                                     ? aiter::INDEXER_NARROW_VEC_ELEMS
-                                     : aiter::INDEXER_VEC_BYTES_WIDE / q_elem_bytes;
+    int threads                = WARP_SIZE;
+    const bool narrow          = num_tokens <= aiter::INDEXER_NARROW_MAX_TOKENS;
+    const int64_t q_vec_elems  = aiter::indexer_vec_elems(
+        narrow, threads, static_cast<int>(head_dim), static_cast<int>(q_elem_bytes));
     AITER_CHECK(q.stride(2) == 1, "q must be contiguous along head_dim");
     AITER_CHECK(q.stride(0) % q_vec_elems == 0 && q.stride(1) % q_vec_elems == 0,
                 "q strides must be multiples of the vector width ",
@@ -4625,9 +4625,10 @@ void indexer_qk_rope_quant_and_cache(
                 q_vec_elems * q_elem_bytes,
                 " bytes");
 
-    // grid.y counts head groups, whose size depends on the q dtype, so the launch
-    // macro builds it from KV_T.
-    dim3 block(aiter::INDEXER_THREADS);
+    // grid.y counts head groups, whose size follows the vector width.
+    const int heads_per_block = aiter::indexer_heads_per_block(
+        threads, static_cast<int>(head_dim), static_cast<int>(q_vec_elems));
+    dim3 block(threads);
     HipDeviceGuard device_guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     float eps = static_cast<float>(epsilon);
