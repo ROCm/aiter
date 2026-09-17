@@ -16,6 +16,7 @@ Usage::
 
     pytest -q op_tests/test_flydsl_qsa.py
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --rotate 1 0
 """
 
 from __future__ import annotations
@@ -66,6 +67,19 @@ from aiter.ops.triton.attention.qsa_vllm_amd import (
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+
+
+def _time(fn, *args, rotate, **kwargs):
+    """Time ``fn`` under one cache policy for every candidate in the row.
+
+    ``rotate`` is ``run_perftest`` ``num_rotate_args``: ``1`` reuses one
+    buffer set (hot; default, matches existing 1047 tables), ``0`` auto-sizes
+    extra copies from L2, ``N>1`` uses that many copies. Callers must pass
+    paged caches as ``*args`` so deepcopy clones them -- a zero-arg closure
+    cannot rotate closed-over tensors. HIP-graph replay is not combined with
+    rotation.
+    """
+    return run_perftest(fn, *args, num_rotate_args=rotate, **kwargs)
 
 
 def test_indexer_hand_checked_one_row():
@@ -242,7 +256,7 @@ def _pack_family_a(k_bar, k, v, page_size, device):
 
 
 @benchmark()
-def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype):
+def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate=1):
     """Paged family A tensors + block tables; oracle on gather vs dense.
 
     No competitor kernel. ``paged_gather`` is the only timed candidate (copy
@@ -269,18 +283,17 @@ def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype):
     assert k_cache.shape[2] == gqa.kv_heads
     assert k_cache.shape[-1] == gqa.head_dim
 
-    def paged_gather():
-        return gather_qsa_family_a_caches(
-            index_cache,
-            index_table,
-            k_cache,
-            v_cache,
-            kv_table,
-            n_blocks,
-            seq_len,
-        )
-
-    (k_bar_g, k_g, v_g), us = run_perftest(paged_gather)
+    (k_bar_g, k_g, v_g), us = _time(
+        gather_qsa_family_a_caches,
+        index_cache,
+        index_table,
+        k_cache,
+        v_cache,
+        kv_table,
+        n_blocks,
+        seq_len,
+        rotate=rotate,
+    )
     err_kbar = checkAllclose(
         k_bar.to(dtypes.fp32),
         k_bar_g.to(dtypes.fp32),
@@ -603,13 +616,14 @@ def test_k2_family_a_prefill_matches_oracle():
 
 
 @benchmark()
-def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
+def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=1):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
     and streaming radix at or above that width. Single-request prefill scores
-    16 query rows per workgroup. Expand is not fused.
+    16 query rows per workgroup. Expand is not fused. Same ``rotate`` on both
+    columns.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -640,32 +654,30 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
-    def k1():
-        return qsa_k1_family_a_block_ids(
-            q_indexer,
-            index_cache,
-            index_table,
-            token_to_req,
-            qpos,
-            slen,
-        )
-
-    block_ids, k1_us = run_perftest(k1)
+    block_ids, k1_us = _time(
+        qsa_k1_family_a_block_ids,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        rotate=rotate,
+    )
     k1_err = _set_mismatch_ratio(ref_ids, block_ids)
 
-    def select():
-        return qsa_select_paged_tokens(
-            q_indexer,
-            index_cache,
-            index_table,
-            token_to_req,
-            qpos,
-            slen,
-            idx.token_budget,
-            idx.compress_ratio,
-        )
-
-    (_indices, vllm_ids), vllm_us = run_perftest(select)
+    (_indices, vllm_ids), vllm_us = _time(
+        qsa_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+    )
     vllm_err = _set_mismatch_ratio(ref_ids, vllm_ids)
 
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
@@ -685,11 +697,11 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
 
 
 @benchmark()
-def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
+def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=1):
     """Family A FlyDSL K2 vs oracle GQA; us vs live AMD and #4882 Triton.
 
     3d: tiled MFMA QK/PV, register-prefetched paged gather, one-wave merge.
-    Expand and sigmoid stay unfused.
+    Expand and sigmoid stay unfused. Same ``rotate`` on every GQA column.
     """
     idx = FAMILY_A_INDEXER
     gqa = FAMILY_A_GQA
@@ -730,10 +742,16 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
     )
     indices = ref.indices.contiguous()
 
-    def k2():
-        return qsa_k2_family_a(q_gqa, k_cache, v_cache, indices, kv_table, token_to_req)
-
-    out, k2_us = run_perftest(k2)
+    out, k2_us = _time(
+        qsa_k2_family_a,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+    )
     k2_err = checkAllclose(
         ref.output,
         out.to(dtypes.fp32),
@@ -742,12 +760,16 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
         msg="flydsl K2 vs oracle GQA",
     )
 
-    def attend():
-        return qsa_sparse_paged_attention(
-            q_gqa, k_cache, v_cache, indices, kv_table, token_to_req
-        )
-
-    vllm_out, vllm_us = run_perftest(attend)
+    vllm_out, vllm_us = _time(
+        qsa_sparse_paged_attention,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+    )
     vllm_err = checkAllclose(
         ref.output,
         vllm_out.to(dtypes.fp32),
@@ -756,18 +778,17 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
         msg="vllm_amd GQA vs oracle",
     )
 
-    def attend_4882():
-        return qsa_sparse_paged_gqa(
-            q_gqa,
-            k_cache,
-            v_cache,
-            indices,
-            kv_table,
-            token_to_req,
-            backend="triton",
-        )
-
-    t4882_out, t4882_us = run_perftest(attend_4882)
+    t4882_out, t4882_us = _time(
+        qsa_sparse_paged_gqa,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+        backend="triton",
+    )
     t4882_err = checkAllclose(
         ref.output,
         t4882_out.to(dtypes.fp32),
@@ -1024,12 +1045,13 @@ def test_k1_family_b_set_equality_published_indexer_point():
 
 
 @benchmark()
-def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads):
+def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=1):
     """Family B FlyDSL K1 vs oracle set equality; us vs #4882 select.
 
     2e/2f: emit on ``n_blocks <= 512``. 2g: 512-tile LDS merge when
     ``n_blocks > 512``. ``H`` 4 and 8 are separate compiles. Separate table
-    from family A. Expand is not fused. Oracle is not timed.
+    from family A. Expand is not fused. Oracle is not timed. Same ``rotate``
+    on FlyDSL and #4882 columns.
     """
     idx = _family_b_indexer(index_heads)
     device = torch.device("cuda")
@@ -1061,34 +1083,32 @@ def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads):
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
-    def k1():
-        return qsa_k1_family_b_block_ids(
-            q_indexer,
-            index_cache,
-            index_table,
-            token_to_req,
-            qpos,
-            slen,
-            score_scale=score_scale,
-        )
-
-    block_ids, k1_us = run_perftest(k1)
+    block_ids, k1_us = _time(
+        qsa_k1_family_b_block_ids,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        rotate=rotate,
+        score_scale=score_scale,
+    )
     k1_err = _set_mismatch_ratio(ref_ids, block_ids)
 
-    def select_triton():
-        return qsa_4882_select_paged_tokens(
-            q_indexer,
-            index_cache,
-            index_table,
-            token_to_req,
-            qpos,
-            slen,
-            idx.token_budget,
-            idx.compress_ratio,
-            backend="triton",
-        )
-
-    (_indices, triton_ids), triton_us = run_perftest(select_triton)
+    (_indices, triton_ids), triton_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend="triton",
+    )
     triton_err = _set_mismatch_ratio(ref_ids, triton_ids)
 
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
@@ -1109,20 +1129,19 @@ def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads):
     # Gluon indexer dispatches on family B H in {4, 8}, D=128; skip off gfx950.
     if get_gfx() == "gfx950" and gluon_qsa_available():
 
-        def select_gluon():
-            return qsa_4882_select_paged_tokens(
-                q_indexer,
-                index_cache,
-                index_table,
-                token_to_req,
-                qpos,
-                slen,
-                idx.token_budget,
-                idx.compress_ratio,
-                backend="gluon",
-            )
-
-        (_g_indices, gluon_ids), gluon_us = run_perftest(select_gluon)
+        (_g_indices, gluon_ids), gluon_us = _time(
+            qsa_4882_select_paged_tokens,
+            q_indexer,
+            index_cache,
+            index_table,
+            token_to_req,
+            qpos,
+            slen,
+            idx.token_budget,
+            idx.compress_ratio,
+            rotate=rotate,
+            backend="gluon",
+        )
         ret["4882_gluon_select us"] = gluon_us
         ret["4882_gluon_select TFLOPS"] = flops / gluon_us / 1e6
         ret["4882_gluon_select TB/s"] = nbytes / gluon_us / 1e6
@@ -1131,10 +1150,11 @@ def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads):
 
 
 @benchmark()
-def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype):
+def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=1):
     """Live AMD path (vLLM Triton MQA + HIP top-k + Triton GQA) vs the oracle.
 
     Indexer chain and sparse GQA are timed separately. Oracle is not timed.
+    Same ``rotate`` on select and GQA.
     """
     idx = FAMILY_A_INDEXER
     gqa = FAMILY_A_GQA
@@ -1178,28 +1198,31 @@ def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype):
         out_dtype=dtypes.fp32,
     )
 
-    def select():
-        return qsa_select_paged_tokens(
-            q_indexer,
-            index_cache,
-            index_table,
-            token_to_req,
-            qpos,
-            slen,
-            idx.token_budget,
-            idx.compress_ratio,
-        )
-
-    (indices, block_ids), select_us = run_perftest(select)
+    (indices, block_ids), select_us = _time(
+        qsa_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+    )
     block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
     index_err = _set_mismatch_ratio(ref.indices, indices)
 
-    def attend():
-        return qsa_sparse_paged_attention(
-            q_gqa, k_cache, v_cache, indices, kv_table, token_to_req
-        )
-
-    out, gqa_us = run_perftest(attend)
+    out, gqa_us = _time(
+        qsa_sparse_paged_attention,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+    )
     gqa_err = checkAllclose(
         ref.output,
         out.to(dtypes.fp32),
@@ -1233,10 +1256,11 @@ def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype):
 
 
 @benchmark()
-def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype):
+def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate=1):
     """#4882 portable Triton QSA vs the oracle. Gluon is not launched.
 
     Indexer chain and sparse GQA are timed separately. Oracle is not timed.
+    Same ``rotate`` on select and GQA.
     """
     idx = FAMILY_A_INDEXER
     gqa = FAMILY_A_GQA
@@ -1280,35 +1304,33 @@ def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype):
         out_dtype=dtypes.fp32,
     )
 
-    def select():
-        return qsa_4882_select_paged_tokens(
-            q_indexer,
-            index_cache,
-            index_table,
-            token_to_req,
-            qpos,
-            slen,
-            idx.token_budget,
-            idx.compress_ratio,
-            backend="triton",
-        )
-
-    (indices, block_ids), select_us = run_perftest(select)
+    (indices, block_ids), select_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend="triton",
+    )
     block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
     index_err = _set_mismatch_ratio(ref.indices, indices)
 
-    def attend():
-        return qsa_sparse_paged_gqa(
-            q_gqa,
-            k_cache,
-            v_cache,
-            indices,
-            kv_table,
-            token_to_req,
-            backend="triton",
-        )
-
-    out, gqa_us = run_perftest(attend)
+    out, gqa_us = _time(
+        qsa_sparse_paged_gqa,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+        backend="triton",
+    )
     gqa_err = checkAllclose(
         ref.output,
         out.to(dtypes.fp32),
@@ -1349,7 +1371,9 @@ def _family_b_indexer(index_heads):
     raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
 
 
-def _bench_qsa_family_b_4882(m, seq_len, page_size, dtype, index_heads, backend):
+def _bench_qsa_family_b_4882(
+    m, seq_len, page_size, dtype, index_heads, backend, rotate=1
+):
     """Family B #4882 vs oracle. ``backend`` is ``triton`` or ``gluon``."""
     idx = _family_b_indexer(index_heads)
     gqa = FAMILY_B_GQA
@@ -1393,20 +1417,19 @@ def _bench_qsa_family_b_4882(m, seq_len, page_size, dtype, index_heads, backend)
         out_dtype=dtypes.fp32,
     )
 
-    def select():
-        return qsa_4882_select_paged_tokens(
-            q_indexer,
-            index_cache,
-            index_table,
-            token_to_req,
-            qpos,
-            slen,
-            idx.token_budget,
-            idx.compress_ratio,
-            backend=backend,
-        )
-
-    (indices, block_ids), select_us = run_perftest(select)
+    (indices, block_ids), select_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend=backend,
+    )
     block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
     index_err = _set_mismatch_ratio(ref.indices, indices)
     if indices.shape[1] != idx.index_width:
@@ -1414,19 +1437,18 @@ def _bench_qsa_family_b_4882(m, seq_len, page_size, dtype, index_heads, backend)
             f"family B selection width {indices.shape[1]} != {idx.index_width}"
         )
 
-    def attend():
-        return qsa_sparse_paged_gqa(
-            q_gqa,
-            k_cache,
-            v_cache,
-            indices,
-            kv_table,
-            token_to_req,
-            backend=backend,
-        )
-
     gqa_tol = 2e-2 if backend == "gluon" else 1e-2
-    out, gqa_us = run_perftest(attend)
+    out, gqa_us = _time(
+        qsa_sparse_paged_gqa,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+        backend=backend,
+    )
     gqa_err = checkAllclose(
         ref.output,
         out.to(dtypes.fp32),
@@ -1461,25 +1483,25 @@ def _bench_qsa_family_b_4882(m, seq_len, page_size, dtype, index_heads, backend)
 
 
 @benchmark()
-def bench_qsa_family_b_4882_triton(m, seq_len, page_size, dtype, index_heads):
+def bench_qsa_family_b_4882_triton(m, seq_len, page_size, dtype, index_heads, rotate=1):
     """#4882 portable Triton QSA vs the oracle on family B shapes.
 
     Separate table from family A Triton and from family B Gluon. Oracle is
     not timed.
     """
     return _bench_qsa_family_b_4882(
-        m, seq_len, page_size, dtype, index_heads, backend="triton"
+        m, seq_len, page_size, dtype, index_heads, backend="triton", rotate=rotate
     )
 
 
 @benchmark()
-def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads):
+def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads, rotate=1):
     """#4882 gfx950 Gluon QSA vs the oracle on family B (Gluon-validated) shapes.
 
     Family A GQA (group 12 / D=256) is not launched here. Oracle is not timed.
     """
     return _bench_qsa_family_b_4882(
-        m, seq_len, page_size, dtype, index_heads, backend="gluon"
+        m, seq_len, page_size, dtype, index_heads, backend="gluon", rotate=rotate
     )
 
 
@@ -1544,6 +1566,16 @@ def main():
         default=[16],
         help="vLLM-style page size (indexer slots and GQA tokens)",
     )
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        nargs="*",
+        default=[1],
+        help="run_perftest num_rotate_args (copies of timed tensors).\n"
+        "1 = hot cache (default; matches existing 1047 tables).\n"
+        "0 = auto-size from L2. N>1 = that many copies.\n"
+        "Same value on every named backend in a row. Not combined with HIP graphs.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -1555,15 +1587,17 @@ def main():
 
     for dtype in args.dtype:
         rows = []
-        for m, seq_len, page_size in itertools.product(
-            args.batch, args.seq, args.page_size
+        for m, seq_len, page_size, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, args.rotate
         ):
             if m > seq_len:
                 aiter.logger.warning(
                     "skip m=%s seq_len=%s (M must fit in L)", m, seq_len
                 )
                 continue
-            rows.append(bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype))
+            rows.append(
+                bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate)
+            )
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "QSA family A plumbing summary (markdown):\n%s",
@@ -1571,12 +1605,14 @@ def main():
         )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
-            args.batch, args.seq, args.page_size
+        for m, seq_len, page_size, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, args.rotate
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype))
+            rows.append(
+                bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate)
+            )
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "QSA family A vLLM AMD summary (markdown):\n%s",
@@ -1584,12 +1620,14 @@ def main():
         )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
-            args.batch, args.seq, args.page_size
+        for m, seq_len, page_size, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, args.rotate
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype))
+            rows.append(
+                bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate)
+            )
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "QSA family A #4882 Triton summary (markdown):\n%s",
@@ -1597,14 +1635,14 @@ def main():
         )
 
         rows = []
-        for m, seq_len, page_size, index_heads in itertools.product(
-            args.batch, args.seq, args.page_size, (4, 8)
+        for m, seq_len, page_size, index_heads, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, (4, 8), args.rotate
         ):
             if m > seq_len:
                 continue
             rows.append(
                 bench_qsa_family_b_4882_triton(
-                    m, seq_len, page_size, dtype, index_heads
+                    m, seq_len, page_size, dtype, index_heads, rotate
                 )
             )
         df = pd.DataFrame(rows)
@@ -1614,14 +1652,15 @@ def main():
         )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
+        for m, seq_len, page_size, rotate in itertools.product(
             [b for b in args.batch if b <= 8],
             args.seq,
             args.page_size,
+            args.rotate,
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype))
+            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate))
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -1630,14 +1669,15 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
+        for m, seq_len, page_size, rotate in itertools.product(
             [b for b in args.batch if b <= 8],
             args.seq,
             args.page_size,
+            args.rotate,
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype))
+            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate))
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -1646,14 +1686,15 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
+        for m, seq_len, page_size, rotate in itertools.product(
             [b for b in args.batch if b == 512],
             args.seq,
             args.page_size,
+            args.rotate,
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype))
+            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate))
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -1662,14 +1703,15 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
+        for m, seq_len, page_size, rotate in itertools.product(
             [b for b in args.batch if b == 512],
             args.seq,
             args.page_size,
+            args.rotate,
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype))
+            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate))
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -1678,14 +1720,15 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
+        for m, seq_len, page_size, rotate in itertools.product(
             [b for b in args.batch if b <= 8],
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio <= 512],
             args.page_size,
+            args.rotate,
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 4))
+            rows.append(bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 4, rotate))
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -1694,14 +1737,15 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
+        for m, seq_len, page_size, rotate in itertools.product(
             [b for b in args.batch if b <= 8],
             [s for s in args.seq if s // FAMILY_B_INDEXER_H8.compress_ratio <= 512],
             args.page_size,
+            args.rotate,
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 8))
+            rows.append(bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 8, rotate))
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -1710,7 +1754,10 @@ def main():
             )
 
         # #4882 published indexer point: M=32, H=4, page_size=8, n_blocks=512.
-        rows = [bench_qsa_family_b_k1(32, 2048, 8, dtype, 4)]
+        rows = [
+            bench_qsa_family_b_k1(32, 2048, 8, dtype, 4, rotate)
+            for rotate in args.rotate
+        ]
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "QSA family B FlyDSL K1 published indexer point (markdown):\n%s",
@@ -1718,16 +1765,17 @@ def main():
         )
 
         rows = []
-        for m, seq_len, page_size, index_heads in itertools.product(
+        for m, seq_len, page_size, index_heads, rotate in itertools.product(
             [b for b in args.batch if b <= 8],
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio > 512],
             args.page_size,
             (4, 8),
+            args.rotate,
         ):
             if m > seq_len:
                 continue
             rows.append(
-                bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads)
+                bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate)
             )
         if rows:
             df = pd.DataFrame(rows)
@@ -1743,13 +1791,15 @@ def main():
             )
             continue
         rows = []
-        for m, seq_len, page_size, index_heads in itertools.product(
-            args.batch, args.seq, args.page_size, (4, 8)
+        for m, seq_len, page_size, index_heads, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, (4, 8), args.rotate
         ):
             if m > seq_len:
                 continue
             rows.append(
-                bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads)
+                bench_qsa_family_b_4882_gluon(
+                    m, seq_len, page_size, dtype, index_heads, rotate
+                )
             )
         df = pd.DataFrame(rows)
         aiter.logger.info(
