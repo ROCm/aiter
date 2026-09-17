@@ -46,15 +46,28 @@ def na3d_flash_attn(
     Returns:
         Output tensor ``(B, T, H, W, NH, HD)`` bfloat16.
 
+    Supported domain (all asserted):
+        - Device : running arch in ``{gfx942, gfx950}``; q/k/v on the current
+          CUDA/HIP device.
+        - dtype  : ``bfloat16`` for q, k, and v (shared).
+        - Shape  : k and v match q's ``(B, T, H, W, NH, HD)``.
+        - head_dim ``HD`` : power of two and ``>= 16`` (``tl.dot`` needs matrix
+          dims of at least 16).
+        - Window : ``0 < KT <= T``, ``0 < KH <= H``, ``0 < KW <= W``.
+        - Width  : ``W >= 16`` (the smallest configured ``BLOCK_Q``).  ``KW <= 33``,
+          and ``KW > 17`` additionally requires ``W >= 32`` -- large KW is served
+          only by the ``BLOCK_Q=32/BLOCK_KV=64`` config, whose ``BLOCK_KV`` must
+          cover ``BLOCK_Q + KW - 1``.
+
     Notes:
         **Inference / forward-pass only.** No autograd backward is implemented.
         Inputs with ``requires_grad=True`` will produce an output that is detached
         from the autograd graph, silently dropping gradients.
 
-        Input tensors are consumed in their native ``(B, T, H, W, NH, HD)`` layout
-        without staging copies. Only a ``contiguous()`` call is made if a tensor is
-        not already contiguous in that order.  ``W >= 16`` is required so that all
-        queries in a BLOCK_Q=16 program share the same (t, h) grid row.
+        Tensors are consumed in their native ``(B, T, H, W, NH, HD)`` layout; a
+        ``contiguous()`` copy is made only for an input not already contiguous in
+        that order.  The tile (BLOCK_Q, BLOCK_KV, num_warps, num_stages) is read
+        from the per-arch config file (no runtime autotune).
     """
     B, T, H, W, NH, HD = q.shape
     KT, KH, KW = kernel_size
@@ -115,7 +128,7 @@ def na3d_flash_attn(
         f"head_dim {HD} must be a power of 2 and >= 16 "
         f"(tl.dot requires matrix dimensions of at least 16)."
     )
-    assert W >= 16, f"W={W} is too small; kernel requires W >= BLOCK_Q (default 16)."
+    assert W >= 16, f"W={W} is too small; W must be >= the smallest BLOCK_Q (16)."
 
     # Ensure contiguous layout
     q = q.contiguous()
