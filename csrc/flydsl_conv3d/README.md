@@ -70,16 +70,17 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
 # Correctness and per-shape timings
 python3 op_tests/test_flydsl_conv_implicit.py
 
-# Every tuned row is reachable by the AOT pass
-python3 -m pytest op_tests/tuning_tests/test_conv3d_aot.py
-
 # No two config tables claim the same shape
 python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 ```
 
    The AOT pass (`aiter/aot/flydsl/conv.py`, run from `setup.py` at build time)
    compiles exactly what the tuned CSV holds, so new rows widen AOT coverage and
-   removed rows narrow it.
+   removed rows narrow it. Its compile keys are derived separately from the
+   runtime's, and a disagreement is silent -- the shape just falls back to JIT.
+   Nothing checks that automatically; `aiter.aot.flydsl.common.run_only_env()`
+   makes FlyDSL raise on a JIT rather than fall back, which is how to verify a
+   row by hand after changing the padding, channel-padding or split-K rules.
 
    To see which tile a given conv actually picked, run with
    `AITER_LOG_TUNED_CONFIG=1`. A shape that falls back to the heuristic says so

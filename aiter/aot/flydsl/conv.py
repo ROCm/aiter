@@ -35,10 +35,11 @@ Coverage is otherwise exactly the CSV, with no generalisation.
 ``compile_conv3d_implicit`` takes the whole problem shape as compile-time
 constants -- the im2col div/mod folding against ``(kT, kH, kW)`` and
 ``C/groups`` is where this kernel's performance comes from -- so a resolution,
-frame count or bias flag outside the table still JITs.
-``op_tests/tuning_tests/test_conv3d_aot.py`` pins that down by re-running the op
-under ``run_only_env()``, where an uncovered shape raises instead of silently
-falling back.
+frame count or bias flag outside the table still JITs. These compile keys are
+derived here and again in ``_conv3d_impl``, and a disagreement between the two
+is silent: the shape just falls back to JIT. Nothing checks that automatically
+-- ``run_only_env()`` makes FlyDSL raise on a JIT rather than fall back, which
+is how to verify a row by hand.
 
 Usage::
 
@@ -208,7 +209,7 @@ def _probe(rank: int, dtype_is_fp32: bool = False):
 
     The rank does matter, though: a rank-1 stand-in compiles fine and then
     misses at runtime, which is silent because the miss just falls back to JIT.
-    ``op_tests/tuning_tests/test_conv3d_aot.py`` is what catches that.
+    Nothing catches that automatically; see the module docstring.
     """
     import torch
 
