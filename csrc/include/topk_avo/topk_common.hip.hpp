@@ -469,6 +469,135 @@ constexpr int CAND_SLOTS_PER_ROW = 8192;
 // never larger than the number of elements matching the fixed prefix); rows
 // where that does not hold are routed to the fallback and their output is
 // discarded, and the pre-initialised {0,0} keeps them in bounds regardless.
+// Wave-aggregated histogram increment: lanes sharing a bucket combine into one
+// atomicAdd instead of one per element.
+//
+// Same idea as aiter's LDS-histogram-then-global-flush
+// (topk_per_row_kernels.cu:490), pushed one level down. aiter needs that flush
+// because its multi-block path has several blocks per row and must combine in
+// global memory; these kernels are one block per row, so the histogram never
+// leaves LDS and there is no global stage to aggregate. What is left to
+// aggregate is the per-element LDS atomic, which serialises because a sortable
+// fp32's top byte is sign+exponent and roughly half of uniform[-1,1] lands in
+// ONE of the 256 buckets (see the HIST_REP note above).
+//
+// Iterative leader election rather than a full match_any: an 8-bit match_any
+// costs 8 ballots for EVERY element, whereas the pathology here is one dominant
+// bucket, so a couple of rounds already removes most of the conflict. Each
+// round elects the lowest outstanding lane, groups the lanes sharing its
+// bucket, and has the leader add that group's count. Whatever is left after
+// `rounds` falls back to individual atomics, so correctness never depends on
+// how well the aggregation guessed.
+//
+// The group's count goes into the LEADER's replica slot, which is correct
+// because the scan sums all HIST_REP replicas per bucket anyway.
+__device__ __forceinline__ void hist_add_aggregated(
+    uint32_t* __restrict__ s_hist, uint32_t bucket, int rep, bool active, int rounds)
+{
+    const int lane = threadIdx.x & (WAVE_SIZE - 1);
+    uint64_t todo  = __ballot(active);
+    for(int r = 0; r < rounds && todo != 0ull; r++)
+    {
+        const int leader    = __builtin_ctzll(todo);
+        const uint32_t cand = (uint32_t)__shfl((int)bucket, leader);
+        const uint64_t grp  = todo & __ballot(active && bucket == cand);
+        if(lane == leader)
+            atomicAdd(&s_hist[cand * HIST_REP + rep], (uint32_t)__popcll(grp));
+        todo &= ~grp;
+    }
+    if(todo & (1ull << lane))
+        atomicAdd(&s_hist[bucket * HIST_REP + rep], 1u);
+}
+
+// Single-wave form of the scan: wave 0 alone reduces the replicas, scans all 256
+// buckets and publishes the pivot, so a radix pass needs 2 block barriers
+// instead of 3.
+//
+// Why that works. The `_rep` form below needs TWO barriers for two different
+// reasons: one to publish `s_wavetot`, the cross-wave partial sums that exist
+// only because 256 buckets span 4 waves, and one to publish `s_scan` to the
+// block. Confine the scan to one wave and the first reason disappears entirely
+// -- 256 buckets at 4 per lane fit in one wave, so the whole suffix scan is
+// shuffles with no barrier. The second barrier stays, and CLEAR still rides on
+// it for free, because wave 0 is now the only reader of the histogram and can
+// zero each slot as it reads it.
+//
+// Costs no LDS and reads no slot twice; what it does do is concentrate 1024 slot
+// reads onto 64 lanes (16 per lane, against 4 per lane spread over 4 waves), so
+// it trades block-barrier latency for LDS-read depth on one wave. g_14 showed
+// that trade can go either way by regime, so measure both ends before shipping.
+//
+// Rejected alternative: let EVERY wave scan the whole histogram redundantly,
+// which removes both barriers. It does not help -- with all waves reading all
+// slots, no wave may zero anything until all have finished, so the clear needs
+// its own before-and-after barrier pair and the pass is back to 3, now with 4x
+// the LDS reads. Reaching 2 that way needs a double-buffered histogram (+4 KB),
+// which takes phase_a from 4 to 3 blocks/CU at S=8192 (163840/42008 vs
+// 163840/37912) for a barrier that g_14 measured at -0.35% on the anchor.
+template <bool CLEAR = false>
+__device__ __forceinline__ void
+block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_scan, int ek)
+{
+    constexpr int PER_LANE = 256 / WAVE_SIZE;
+    if(threadIdx.x < WAVE_SIZE)
+    {
+        const int lane = (int)threadIdx.x;
+        uint32_t v[PER_LANE];
+        uint32_t tot = 0;
+#pragma unroll
+        for(int j = 0; j < PER_LANE; j++)
+        {
+            const int b = lane * PER_LANE + j;
+            uint32_t s  = 0;
+#pragma unroll
+            for(int r = 0; r < HIST_REP; r++)
+            {
+                s += s_hist[b * HIST_REP + r];
+                if constexpr(CLEAR)
+                    s_hist[b * HIST_REP + r] = 0u;
+            }
+            v[j] = s;
+            tot += s;
+        }
+        // Inclusive suffix sum of the per-lane totals, so above_lane is everything
+        // in buckets above this lane's group.
+        uint32_t inc = tot;
+#pragma unroll
+        for(int off = 1; off < WAVE_SIZE; off <<= 1)
+        {
+            const uint32_t up = (uint32_t)__shfl_down((int)inc, off);
+            if(lane + off < WAVE_SIZE)
+                inc += up;
+        }
+        uint32_t acc       = inc - tot;
+        int hit_j          = -1;
+        uint32_t hit_above = 0;
+#pragma unroll
+        for(int j = PER_LANE - 1; j >= 0; j--)
+        {
+            const uint32_t nxt = acc; // suffix sum at bucket b+1
+            acc += v[j];              // suffix sum at bucket b
+            if(ek > 0 && acc >= (uint32_t)ek && nxt < (uint32_t)ek)
+            {
+                hit_j     = j;
+                hit_above = nxt;
+            }
+        }
+        // Shuffles run on every lane, outside the lane-0 store, or the ones that
+        // did not elect themselves would not participate.
+        const uint64_t bal       = __ballot(hit_j >= 0);
+        const int src            = bal != 0ull ? __builtin_ctzll(bal) : 0;
+        const int j_sel          = __shfl(hit_j, src);
+        const uint32_t above_sel = (uint32_t)__shfl((int)hit_above, src);
+        if(bal != 0ull && lane == 0)
+        {
+            s_scan[0] = (uint32_t)(src * PER_LANE + j_sel);
+            s_scan[1] = above_sel;
+        }
+    }
+    __syncthreads();
+}
+
 // Replica-reducing form of the scan below: folds the HIST_REP replicas of each
 // bucket in as it reads them, instead of having the caller run a separate
 // block-wide reduction loop into s_red first.

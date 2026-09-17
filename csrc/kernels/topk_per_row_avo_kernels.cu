@@ -120,6 +120,45 @@ static int g_phase_a_compact = 0;
 #ifndef SELECT_CLEAR_ON_READ
 #define SELECT_CLEAR_ON_READ 1
 #endif
+
+// Diagnostic only, PRODUCES WRONG RESULTS: drops the atomicity of the histogram
+// increment so the per-element LDS atomic can be priced. Never ship non-zero.
+// Measured ceiling for any aggregation of that atomic: phase_a 61.7 -> 53.0 us
+// at the anchor (-14.1%), and -9.3%/-13.0% of wall on small_n M=4096 N=8192 /
+// M=2048 N=4096. It says nothing about phase_c: a wrong Phase A threshold blows
+// up the candidate counts and sends rows to the exact fallback, which took
+// phase_c 67.3 -> 2119 us. An ablation is only a price when it leaves the path
+// alone.
+#ifndef ABLATE_HIST_ATOMIC
+#define ABLATE_HIST_ATOMIC 0
+#endif
+
+// Rounds of wave-level aggregation before falling back to per-element atomics
+// (0 = off, the shipped form). See hist_add_aggregated in topk_common.hip.hpp.
+#ifndef HIST_AGG_ROUNDS
+#define HIST_AGG_ROUNDS 0
+#endif
+
+// Third barrier removal: wave 0 alone scans all 256 buckets, so the cross-wave
+// partial sums and their barrier disappear and a pass runs 2 barriers, not 3.
+// See block_find_pivot_bucket_wave0 in topk_common.hip.hpp for why the
+// everyone-scans-redundantly variant cannot reach 2 without +4 KB of LDS.
+//
+// Shipped on. It is close to the MIRROR of SELECT_CLEAR_ON_READ's regime trade:
+// that one bought the anchor and cost small_n, this one buys small_n and the
+// latency-bound small-M shapes and costs the anchor slightly.
+//   M=4096 N=8192    0.0964 -> 0.0943 ms  (-2.2%, small_n)
+//   M=1    N=1048576 0.0305 -> 0.0300 ms  (-1.6%)
+//   M=2048 N=4096    0.0352 -> 0.0347 ms  (-1.4%)
+//   M=4096 N=1048576 3.1647 -> 3.1616 ms  (neutral)
+//   M=1024 N=65536   0.0776 -> 0.0776 ms  (neutral)
+//   M=4096 N=131072  0.6071 -> 0.6095 ms  (**+0.4%, the anchor**)
+// Inner geomean 62.66 -> 61.96/61.98 us (-1.1%, two runs) with small_n -2.3%,
+// decode -1.3% and prefill neutral, so the aggregate is a clear win and the one
+// regressing point sits far inside POINT_REGRESS_PCT.
+#ifndef SELECT_WAVE0_SCAN
+#define SELECT_WAVE0_SCAN 1
+#endif
 #if SELECT_CLEAR_ON_READ && !SELECT_FUSED_REDUCE
 #error "SELECT_CLEAR_ON_READ needs SELECT_FUSED_REDUCE: only the fused scan clears"
 #endif
@@ -224,14 +263,37 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
         // SLOWER and the anchor 615.5 -> 662.8 us. The two extra barriers per pass
         // in the reduction, plus the register pressure in this loop, cost far more
         // than the single pass the exit saves. See knowledge/known_bad.md.
+#if HIST_AGG_ROUNDS
+        // Uniform trip count, because the aggregation ballots need every lane of the
+        // wave in the same iteration; the strided form below exits at different
+        // iterations per lane. Same shape as block_gather_topk's loop.
+        for(int i0 = 0; i0 < c; i0 += blockDim.x)
+        {
+            const int i      = i0 + threadIdx.x;
+            const bool live  = (i < c);
+            const uint32_t k = live ? s_keys[i] : 0u;
+            const bool act   = live && (!filter || (k >> hshift) == (pivot >> hshift));
+            hist_add_aggregated(s_hist, (k >> sh) & 0xFFu, rep, act, HIST_AGG_ROUNDS);
+        }
+#else
         for(int i = threadIdx.x; i < c; i += blockDim.x)
         {
             uint32_t k = s_keys[i];
             if(!filter || (k >> hshift) == (pivot >> hshift))
+#if ABLATE_HIST_ATOMIC
+                // TIMING ABLATION, WRONG RESULTS: same address pattern and LDS traffic,
+                // but no atomicity, so the delta is exactly what the atomic plus its
+                // bucket conflict costs. Prices the ceiling of any wave-aggregation.
+                s_hist[((k >> sh) & 0xFFu) * HIST_REP + rep] = 1u;
+#else
                 atomicAdd(&s_hist[((k >> sh) & 0xFFu) * HIST_REP + rep], 1u);
+#endif
         }
+#endif
         __syncthreads();
-#if SELECT_FUSED_REDUCE
+#if SELECT_WAVE0_SCAN
+        block_find_pivot_bucket_wave0<SELECT_CLEAR_ON_READ != 0>(s_hist, s_scan, ek);
+#elif SELECT_FUSED_REDUCE
         block_find_pivot_bucket_rep<SELECT_CLEAR_ON_READ != 0>(s_hist, s_scan, ek);
 #else
         if(HIST_REP > 1)
