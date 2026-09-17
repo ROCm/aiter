@@ -11,6 +11,9 @@ import unittest
 from unittest import mock
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
+import pandas as pd
+
+from op_tests.tuners.tune_mha_fwd import MhaFwdTuner
 
 from aiter.ops.mha_fwd_policy import (
     MHA_FWD_TILE_CONFIG_BACKENDS,
@@ -469,6 +472,118 @@ class TestTileConfigVocabulary(unittest.TestCase):
     def test_a_name_is_config_backend_still_refuses_any_config(self):
         with self.assertRaisesRegex(ValueError, "does not accept backend_config"):
             MhaFwdPlan(backend="opus", backend_config={"BLOCK_M": 128})
+
+
+class TestIncumbentGate(unittest.TestCase):
+    """A tuning run must be able to tell an improvement from a regression."""
+
+    KEY = ("gfx950", 256, "mi355x")
+    INCUMBENT_CONFIG = '{"BLOCK_M":128,"BLOCK_N":64}'
+    CHALLENGER_CONFIG = '{"BLOCK_M":256,"BLOCK_N":64}'
+
+    def _tuner(self):
+        tuner = MhaFwdTuner.__new__(MhaFwdTuner)
+        tuner._incumbents_by_key = {self.KEY: {("gluon", self.INCUMBENT_CONFIG)}}
+        tuner._promotions = []
+        return tuner
+
+    def _frame(self, challenger_us, incumbent_us, samples=(1000.0, 1001.0)):
+        return pd.DataFrame(
+            [
+                {
+                    "backend": "gluon",
+                    "backend_config": self.CHALLENGER_CONFIG,
+                    "us": challenger_us,
+                    "samples_us": json.dumps(list(samples)),
+                },
+                {
+                    "backend": "gluon",
+                    "backend_config": self.INCUMBENT_CONFIG,
+                    "us": incumbent_us,
+                    "samples_us": json.dumps(list(samples)),
+                },
+            ]
+        ).sort_values("us")
+
+    def test_a_clear_improvement_is_published(self):
+        winner = self._tuner()._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=800.0, incumbent_us=1000.0)
+        )
+        self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
+        self.assertIn("beat incumbent", winner["detail"])
+
+    def test_a_winner_inside_measurement_spread_does_not_displace_the_incumbent(self):
+        """The margin here is 0.1%, far under the spread of the samples, so
+        the two configurations have not been told apart and the run should
+        change nothing rather than churn the published table."""
+        winner = self._tuner()._gate_against_incumbent(
+            self.KEY,
+            self._frame(
+                challenger_us=999.0, incumbent_us=1000.0, samples=(950.0, 1050.0)
+            ),
+        )
+        self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
+        self.assertIn("incumbent retained", winner["detail"])
+
+    def test_the_incumbent_winning_outright_is_recorded_as_such(self):
+        winner = self._tuner()._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=1200.0, incumbent_us=1000.0)
+        )
+        self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
+        self.assertIn("nothing measured beat it", winner["detail"])
+
+    def test_an_unmeasured_incumbent_is_flagged_rather_than_assumed_beaten(self):
+        tuner = self._tuner()
+        frame = pd.DataFrame(
+            [
+                {
+                    "backend": "gluon",
+                    "backend_config": self.CHALLENGER_CONFIG,
+                    "us": 800.0,
+                    "samples_us": "[800.0,801.0]",
+                }
+            ]
+        )
+        winner = tuner._gate_against_incumbent(self.KEY, frame)
+        self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
+        self.assertIn("improvement unverified", winner["detail"])
+
+    def test_the_regression_this_gate_exists_to_stop(self):
+        """The real case: a sampler gap meant the published winner was 17%
+        slower than the shipped default. With the default measured in the same
+        sweep the gate keeps it."""
+        tuner = self._tuner()
+        winner = tuner._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=2206.0, incumbent_us=1831.0)
+        )
+        self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
+        self.assertEqual(tuner._promotions[0]["decision"], "incumbent_fastest")
+
+    def test_every_decision_is_recorded_for_the_evidence_file(self):
+        tuner = self._tuner()
+        tuner._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=800.0, incumbent_us=1000.0)
+        )
+        record = tuner._promotions[0]
+        self.assertEqual(record["decision"], "promoted")
+        self.assertAlmostEqual(record["margin"], 0.2, places=6)
+        self.assertEqual(record["incumbent"]["us"], 1000.0)
+
+
+class TestLatencyReduction(unittest.TestCase):
+    def test_the_median_ignores_a_one_sided_excursion_the_mean_carries(self):
+        from aiter.test_common import _reduce_latencies
+
+        clean = [100.0] * 100
+        contended = clean + [10000.0]
+        self.assertEqual(_reduce_latencies(contended, "median"), 100.0)
+        self.assertGreater(_reduce_latencies(contended, "mean"), 100.0)
+
+    def test_an_unknown_reduction_is_rejected(self):
+        from aiter.test_common import _reduce_latencies
+
+        with self.assertRaisesRegex(ValueError, "unknown latency reduction"):
+            _reduce_latencies([1.0], "p99")
 
 
 class TestSmokeStrategy(unittest.TestCase):
