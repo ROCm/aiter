@@ -11,9 +11,11 @@ padded block-table rows, nonzero storage offsets, and tail/empty windows.
 Pools are allocated sequentially; the largest backing store is about 4.61 GB.
 
 Usage:
-    python op_tests/test_flydsl_pa_mqa_logits_fp4_strided_pages.py --graph
+    python op_tests/test_flydsl_pa_mqa_logits_fp4_strided_pages.py
     python op_tests/test_flydsl_pa_mqa_logits_fp4_strided_pages.py --case small \
-        --graph --sensitivity --benchmark --json-output results.json
+        --benchmark --json-output results.json
+    python op_tests/test_flydsl_pa_mqa_logits_fp4_strided_pages.py --case small \
+        --no-graph --no-sensitivity
 
 Run the same file with separate before/after AITER source mounts and distinct
 --label values. Benchmark numbers time the AITER public API, not vLLM gather.
@@ -455,8 +457,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--graph",
-        action="store_true",
-        help="Capture and replay BOTH prefill and decode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Capture and replay BOTH prefill and decode (enabled by default)",
     )
     parser.add_argument("--case", choices=("all", *CASES), default="all")
     parser.add_argument("--path", choices=("both", "prefill", "decode"), default="both")
@@ -468,8 +471,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--sensitivity",
-        action="store_true",
-        help="Require wrong page-map and scale permutations to disagree",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require wrong page-map and scale permutations to disagree (enabled by default)",
     )
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--rows", type=int, default=12)
@@ -489,8 +493,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.rows < 4 or args.context < 65 or args.iters < 1 or args.warmup < 1:
         parser.error("rows >= 4, context >= 65, iters >= 1, warmup >= 1 required")
-    if get_arch() != "gfx950":
-        raise SystemExit(f"gfx950 required; current architecture: {get_arch()}")
+    arch = get_arch()
+    if arch != "gfx950":
+        print(f"[skip] this kernel only supports gfx950 (current: {arch}).")
+        return
     source = Path(
         __import__(flydsl_pa_mqa_logits_fp4.__module__, fromlist=["__file__"]).__file__
     ).resolve()
