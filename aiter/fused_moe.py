@@ -100,6 +100,14 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
+
+def _resolve_tuning_topk(
+    topk: int, *, is_ep: bool, ep_has_fake_expert: bool = True
+) -> int:
+    """Map runtime top-k to the value used by tuned-config keys."""
+    return topk - int(is_ep and ep_has_fake_expert)
+
+
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
 
@@ -843,6 +851,7 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_expert: bool = True,
 ):
     if (
         any(
@@ -930,6 +939,7 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        ep_has_fake_expert=ep_has_fake_expert,
     )
 
 
@@ -971,6 +981,7 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_expert: bool = True,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1031,6 +1042,7 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_expert: bool = True,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1073,6 +1085,7 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        ep_has_fake_expert=ep_has_fake_expert,
     )
 
 
@@ -1107,6 +1120,7 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_expert: bool = True,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1272,6 +1286,7 @@ def _fused_moe_impl(
             isShuffled,
             gate_mode,
             is_ep=expert_mask is not None,
+            ep_has_fake_expert=ep_has_fake_expert,
             has_stage1_bias=bias1 is not None,
             has_stage2_bias=bias2 is not None,
             situ_beta=config_situ_beta,
@@ -1476,6 +1491,7 @@ def _fused_moe_impl(
             linear_beta=linear_beta,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            ep_has_fake_expert=ep_has_fake_expert,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
             # Reuse the capability-validated row selected above. Re-looking it
@@ -2737,6 +2753,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    ep_has_fake_expert=True,
     has_stage1_bias=False,
     has_stage2_bias=False,
     situ_beta=1.0,
@@ -2854,10 +2871,11 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # Legacy EP callers append one always-masked fake-expert slot. Callers
+    # without that slot preserve their routed top-k explicitly.
+    topk = _resolve_tuning_topk(
+        topk, is_ep=is_ep, ep_has_fake_expert=ep_has_fake_expert
+    )
     keys = (
         gfx,
         cu_num,
@@ -3729,6 +3747,7 @@ def fused_moe_2stages(
     output=None,
     _stage2_override: Callable | None = None,
     routing_num_experts: int | None = None,
+    ep_has_fake_expert: bool = True,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -3767,6 +3786,7 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_expert=ep_has_fake_expert,
         has_stage1_bias=bias1 is not None,
         has_stage2_bias=bias2 is not None,
         situ_beta=config_situ_beta,

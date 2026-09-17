@@ -59,6 +59,7 @@ from aiter.ops.flydsl.moe_common import (
 from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
     flydsl_moe_stage2,
+    get_flydsl_kernel_params,
     get_flydsl_stage1_kernels,
     get_flydsl_stage1_kernels_int4_bf16,
     get_flydsl_stage2_kernels,
@@ -958,6 +959,12 @@ class FmoeTuner(TunerCommon):
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+        reference_v = {
+            **v,
+            "isq": torch.zeros_like(v["isq"]),
+            "iss": torch.zeros_like(v["iss"]),
+        }
+        _v2_populate_stage2(d, reference_v, token, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
         a1_scale_sort = moe_mxfp4_sort(
             d["a1_scale"][:token, :].view(token, 1, -1),
@@ -966,14 +973,8 @@ class FmoeTuner(TunerCommon):
             token_num=token,
             block_size=blockM,
         )
-        # The a8w4 a_scale_one=True variant uses an unscaled bf16->fp8 cast.
-        # The a8w8 path uses the real per-1x32 payload and E8M0 scale instead.
-        a1_qt_fp8_cast = (
-            d["inp"].to(dtypes.fp8) if adtype == "fp8" and b_dtype == "fp4" else None
-        )
         return {
             "a1_qt": d["a1_qt"],
-            "a1_qt_fp8_cast": a1_qt_fp8_cast,
             "w1_shuf": d["base"]["w1_qt_shuf"],
             "w1_scale_shuf": d["base"]["w1_scale_shuf"],
             "a1_scale_sort": a1_scale_sort,
@@ -983,6 +984,7 @@ class FmoeTuner(TunerCommon):
             "isq": v["isq"],
             "n": v["n"],
             "ref1": d["ref1"],
+            "ref1_scale": reference_v["iss"],
             "topk_ids": d["topk_ids"],
         }
 
@@ -1008,7 +1010,7 @@ class FmoeTuner(TunerCommon):
     ):
         # Time ONLY the runtime v2 gemm1 kernel: flydsl_moe_stage1(v2_output_layout=True).
         # a1_scale_sort is precomputed in generate_v2_stage1_data (not timed).
-        out, _scale = flydsl_moe_stage1(
+        out, scale = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_shuf,
             out=isq,
@@ -1038,7 +1040,7 @@ class FmoeTuner(TunerCommon):
             k_wave=kparams.get("k_wave", 1),
             v2_output_layout=True,
         )
-        return out.view(torch.uint8).view_as(isq)
+        return out.view(torch.uint8).view_as(isq), scale.view(torch.uint8)
 
     @staticmethod
     def generate_v2_stage2_data(
@@ -1154,17 +1156,22 @@ class FmoeTuner(TunerCommon):
         return ref2
 
     @staticmethod
-    def run_v2_stage1_sorted_ref(ref1, topk_ids, sti, sei, n, token, inter_dim, bm_s1):
-        return _v2_stage1_ref(
-            ref1,
-            topk_ids,
-            sti,
-            sei,
-            n,
-            token=token,
-            inter_dim=inter_dim,
-            bm_s1=bm_s1,
-            max_sorted=sti.numel(),
+    def run_v2_stage1_sorted_ref(
+        ref1, ref1_scale, topk_ids, sti, sei, n, token, inter_dim, bm_s1
+    ):
+        return (
+            _v2_stage1_ref(
+                ref1,
+                topk_ids,
+                sti,
+                sei,
+                n,
+                token=token,
+                inter_dim=inter_dim,
+                bm_s1=bm_s1,
+                max_sorted=sti.numel(),
+            ),
+            ref1_scale,
         )
 
     @staticmethod
@@ -1830,7 +1837,9 @@ class FmoeTuner(TunerCommon):
             else:
                 a1_scale_fp4_sort = a1_scale
 
-            # For the _fp8 FlyDSL variant (a_scale_one=True): cast bf16 input to fp8.
+            # Legacy A8W4/Opus fixtures use an unscaled bf16->fp8 cast. FlyDSL
+            # runtime-contract tasks set use_real_mxfp8=True below so they read
+            # the same per-1x32 payload and E8M0 scales as production.
             a1_qt_fp8_cast = input.to(dtypes.fp8)
             a1_scale_e8m0_one_sort = None
             if (
@@ -3540,19 +3549,12 @@ class FmoeTuner(TunerCommon):
                 if s1_tile_m != blockM:
                     continue
                 if a_dtype_str == "fp8":
-                    fp8_params = {
-                        **kparams,
-                        "out_dtype": "fp8",
-                        "a_scale_one": True,
-                        "gate_mode": "interleave",
-                    }
-                    nonfused_params = {**kparams, "a_scale_one": True}
                     if is_splitk:
-                        s1_variants = [(kname + "_fp8", fp8_params, False, True)]
+                        s1_variants = [(kname + "_fp8", False, True)]
                     else:
                         s1_variants = [
-                            (kname, nonfused_params, False, False),
-                            (kname + "_fp8", fp8_params, False, True),
+                            (kname, False, False),
+                            (kname + "_fp8", False, True),
                         ]
                 elif a_dtype_str in ("bf16", "fp16"):
                     # a16w4 (bf16/fp16 activation): stage1 emits a bf16
@@ -3560,18 +3562,25 @@ class FmoeTuner(TunerCommon):
                     # inter-stage fp4 quant). Only the bf16-output variant is
                     # valid; a fp4-output stage1 would be mispaired with the
                     # bf16-input stage2.
-                    s1_variants = [(kname, kparams, False, False)]
+                    s1_variants = [(kname, False, False)]
                 else:
-                    fp4_params = {**kparams, "out_dtype": "fp4"}
                     if is_splitk:
-                        s1_variants = [(kname + "_fp4", fp4_params, True, False)]
+                        s1_variants = [(kname + "_fp4", True, False)]
                     else:
                         s1_variants = [
-                            (kname, kparams, False, False),
-                            (kname + "_fp4", fp4_params, True, False),
+                            (kname, False, False),
+                            (kname + "_fp4", True, False),
                         ]
 
-                for s1_name, s1_params, is_fp4, is_fp8 in s1_variants:
+                for s1_name, is_fp4, is_fp8 in s1_variants:
+                    # The serialized kernel name is the runtime contract. Resolve
+                    # params back through the production registry so the tuner
+                    # cannot benchmark hidden flags that the CSV cannot encode.
+                    s1_params = get_flydsl_kernel_params(s1_name)
+                    if s1_params is None:
+                        raise ValueError(
+                            f"FlyDSL stage1 candidate is not runtime-dispatchable: {s1_name}"
+                        )
                     s1_compare_fn = None
                     if is_fp8 or is_fp4 or a_dtype_str in ("fp8", "fp4"):
                         # Fused stage1 emits packed mx values; the default
@@ -3633,7 +3642,11 @@ class FmoeTuner(TunerCommon):
                     s1_ref_kwargs = {}
                     s1_ref = None
 
-                    a1_key = "a1_qt_fp8_cast" if is_fp8 else "a1_qt"
+                    is_a8w4 = a_dtype_str == "fp8" and b_dtype_str == "fp4"
+                    a1_key = "a1_qt_fp8_cast" if is_a8w4 else "a1_qt"
+                    a1_scale_key = (
+                        "a1_scale_e8m0_one_sort" if is_a8w4 else "a1_scale_fp4_sort"
+                    )
                     tasks_flydsl.append(
                         (
                             (info, "stage1", s1_name, blockM),
@@ -3653,6 +3666,7 @@ class FmoeTuner(TunerCommon):
                                 doweight_stage1,
                                 blockM,
                                 1,
+                                is_a8w4,
                             ),
                             FmoeTuner.run_flydsl_stage1_out,
                             (
@@ -3664,7 +3678,7 @@ class FmoeTuner(TunerCommon):
                                     "sorted_weights",
                                     "num_valid_ids",
                                     "w1_scale_aiter",
-                                    "a1_scale_fp4_sort",
+                                    a1_scale_key,
                                     "bias",
                                 ],
                                 dtype,
@@ -3842,11 +3856,11 @@ class FmoeTuner(TunerCommon):
         s1_kernels = get_flydsl_stage1_kernels(adtype, bdtype, out_dtype_str)
 
         from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
-            v2_stage1_dequant_cosine_err,
+            v2_stage1_output_error,
         )
 
         for blockM in blockMs:
-            if blockM not in (32, 64, 128):
+            if blockM not in (16, 32, 64, 128):
                 continue
             # ---- v2 stage1 tasks: sweep the FULL fused stage1 candidate set ----
             # Mirror gen_flydsl_2stages_task's fused-variant construction so
@@ -3855,29 +3869,23 @@ class FmoeTuner(TunerCommon):
             # non-splitk (k_batch==1: _v2_output_layout = _fuse_any_quant and
             # not _is_splitk, moe_kernels.py:1179) and tile_m == blockM.
             s1_compare = functools.partial(
-                v2_stage1_dequant_cosine_err, inter_dim=inter_dim, adtype=adtype
+                v2_stage1_output_error, inter_dim=inter_dim, adtype=adtype
             )
             for kname, kparams in s1_kernels.items():
                 if kparams.get("tile_m") != blockM:
                     continue
                 if kparams.get("k_batch", 1) != 1:
                     continue
-                # Only the FUSED variant (v2 always fuses quant). Fused name and
-                # params exactly as gen_flydsl_2stages_task builds them.
+                # Only the FUSED variant (v2 always fuses quant).
                 if adtype == "fp8":
                     s1_name = kname + "_fp8"
-                    s1_params = {
-                        **kparams,
-                        "out_dtype": "fp8",
-                        "a_scale_one": bdtype == "fp4",
-                        "gate_mode": "interleave",
-                    }
                 else:
                     s1_name = kname + "_fp4"
-                    s1_params = {**kparams, "out_dtype": "fp4"}
-                a1_key = (
-                    "a1_qt_fp8_cast" if adtype == "fp8" and bdtype == "fp4" else "a1_qt"
-                )
+                s1_params = get_flydsl_kernel_params(s1_name)
+                if s1_params is None:
+                    raise ValueError(
+                        f"FlyDSL v2 stage1 candidate is not runtime-dispatchable: {s1_name}"
+                    )
                 # info tag: (..., blockM, flat_flag=0, v2=1) -- tail[3]=flat (post_process int(tail[3]) default), tail[4]=v2 marker
                 tasks.append(
                     (
@@ -3897,7 +3905,7 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_v2_stage1_out,
                         (
                             [
-                                a1_key,
+                                "a1_qt",
                                 "w1_shuf",
                                 "w1_scale_shuf",
                                 "a1_scale_sort",
@@ -3919,7 +3927,7 @@ class FmoeTuner(TunerCommon):
                         {},
                         FmoeTuner.run_v2_stage1_sorted_ref,
                         (
-                            ["ref1", "topk_ids", "sti", "sei", "n"],
+                            ["ref1", "ref1_scale", "topk_ids", "sti", "sei", "n"],
                             token,
                             inter_dim,
                             blockM,

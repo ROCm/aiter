@@ -644,3 +644,29 @@ def v2_stage1_dequant_cosine_err(ref, res, msg="", printLog=True, *, inter_dim, 
     if printLog:
         print(f"{msg}[v2_stage1 cos={cos:.4f} err={err:.4f}]")
     return max(err, 0.0)
+
+
+def v2_stage1_output_error(ref, res, msg="", printLog=True, *, inter_dim, adtype):
+    """Validate both the quantized payload and its E8M0 scale output.
+
+    Payload rows retain the existing group-normalized cosine metric. Scale
+    tensors are compared as E8M0 exponents; a one-exponent difference is
+    tolerated, while larger differences count toward the error ratio.
+    """
+    if ref.dtype == torch.uint8 and res.dtype == torch.uint8 and ref.shape == res.shape:
+        valid = ref != 0
+        if not valid.any():
+            return 0.0
+        exponent_delta = (ref[valid].to(torch.int16) - res[valid].to(torch.int16)).abs()
+        err = (exponent_delta > 1).float().mean().item()
+        if printLog:
+            print(f"{msg}[v2_stage1 scale_err={err:.4f}]")
+        return err
+    return v2_stage1_dequant_cosine_err(
+        ref,
+        res,
+        msg=msg,
+        printLog=printLog,
+        inter_dim=inter_dim,
+        adtype=adtype,
+    )

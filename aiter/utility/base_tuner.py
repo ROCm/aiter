@@ -224,14 +224,14 @@ class TunerCommon:
             "--update_improved",
             action="store_true",
             required=False,
-            help="With --compare, update the final tuned CSV for shapes improved by at least --min_improvement_pct, or when pre-run has no valid baseline but post-run passes.",
+            help="With --compare, update the final tuned CSV only for shapes with a valid pre/post benchmark improved by at least --min_improvement_pct.",
         )
         self.parser.add_argument(
             "--min_improvement_pct",
             dest="min_improvement_pct",
             type=float,
             default=defaults.get("min_improvement_pct", 3.0),
-            help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
+            help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement.",
         )
 
     def parse_args(self):
@@ -972,7 +972,7 @@ class TunerCommon:
             "update_reason",
         ] = "threshold_met"
         comparison.loc[no_baseline, "update_reason"] = "no_baseline"
-        comparison["update"] = comparison["update_reason"] != "skip"
+        comparison["update"] = comparison["update_reason"] == "threshold_met"
         return comparison[columns]
 
     def _print_compare_update_plan(
@@ -1004,21 +1004,21 @@ class TunerCommon:
         lines = [
             "============= Compare Report =============",
             (
-                f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
-                f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}"
+                f"Total shapes: {total} | {verb}: {update_count} | "
+                f"No valid baseline: {no_baseline_count} | Skipped: {skip_count}"
             ),
             f"Threshold: >= {threshold_percent:.1f}% improvement to update {target_desc}",
             "",
         ]
 
         # Updated shapes first
-        if update_count + no_baseline_count > 0:
-            lines.append(f"--- {verb} ({update_count + no_baseline_count} shapes) ---")
+        if update_count > 0:
+            lines.append(f"--- {verb} ({update_count} shapes) ---")
             header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>18}"
             lines.append(header)
             lines.append("-" * len(header))
             for row in comparison.itertuples(index=False):
-                if row.update_reason == "skip":
+                if not row.update:
                     continue
                 pre_str = (
                     f"{row.pre_us:.2f}"
@@ -1035,20 +1035,20 @@ class TunerCommon:
                     if pd.notna(row.improvement_pct)
                     else "N/A"
                 )
-                action = "UPDATE" if row.update_reason == "threshold_met" else "NEW"
                 lines.append(
-                    f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
+                    f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {'UPDATE':>18}"
                 )
             lines.append("")
 
         # Skipped shapes
-        if skip_count > 0:
-            lines.append(f"--- Skipped ({skip_count} shapes) ---")
+        blocked_count = skip_count + no_baseline_count
+        if blocked_count > 0:
+            lines.append(f"--- Skipped ({blocked_count} shapes) ---")
             header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Reason':>18}"
             lines.append(header)
             lines.append("-" * len(header))
             for row in comparison.itertuples(index=False):
-                if row.update_reason != "skip":
+                if row.update:
                     continue
                 pre_str = (
                     f"{row.pre_us:.2f}"
@@ -1069,7 +1069,9 @@ class TunerCommon:
                 post_summary, _post_detail = self._split_benchmark_status(
                     row.post_status
                 )
-                if post_summary in ("ERROR", "MISMATCH"):
+                if row.update_reason == "no_baseline":
+                    reason = "no valid baseline"
+                elif post_summary in ("ERROR", "MISMATCH"):
                     reason = f"post-{post_summary.lower()}"
                 elif (
                     pd.notna(row.improvement_pct)

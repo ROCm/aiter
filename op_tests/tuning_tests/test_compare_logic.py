@@ -111,13 +111,13 @@ class TestBuildCompareUpdatePlan(unittest.TestCase):
         self.assertEqual(plan.iloc[0]["update_reason"], "skip")
 
     def test_no_baseline(self):
-        """Pre has error, post is ok -> update with 'no_baseline' reason."""
+        """A failed pre-run cannot establish an improvement."""
         shapes = [(1, 1024, 512)]
         pre = [_make_bench_result("(1,1024,512)", "error:crash", -1)]
         post = [_make_bench_result("(1,1024,512)", "ok", 50.0)]
         plan = self._build_plan(shapes, pre, post, threshold=3.0)
         self.assertEqual(len(plan), 1)
-        self.assertTrue(plan.iloc[0]["update"])
+        self.assertFalse(plan.iloc[0]["update"])
         self.assertEqual(plan.iloc[0]["update_reason"], "no_baseline")
 
     def test_post_error(self):
