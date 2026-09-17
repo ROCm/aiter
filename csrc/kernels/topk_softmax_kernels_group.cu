@@ -34,6 +34,12 @@
 #define AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE_USE_INLINE_ASM 1
 #endif
 
+// Minimum topk for the register-resident path. Tunable so the crossover can be
+// re-measured per arch rather than guessed.
+#ifndef AITER_TOPK_REG_MIN_TOPK
+#define AITER_TOPK_REG_MIN_TOPK 4
+#endif
+
 #ifndef C_LOG2E
 #define C_LOG2E 1.44269504088896340736 // log2(e)
 #endif
@@ -608,6 +614,224 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     {
         topk_weights[token_idx * stride_tk + k] = topk_value * sum;
         topk_ids[token_idx * stride_tk + k]     = topk_indice;
+    }
+}
+
+// Single-group biased top-k that keeps the (sigmoid + bias) scores in VGPRs.
+// The generic grouped_topk_kernel re-reads every score from LDS on each of the
+// topk argmax rounds; here each lane owns EXPERTS_PER_LANE experts for the whole
+// kernel, so the rounds only cost VALU plus the wave reduce. Selection order and
+// the returned weights match grouped_topk_kernel exactly: the pre-bias sigmoid
+// still comes from LDS rather than from (score - bias).
+template <typename DTYPE_I, int EXPERTS_PER_LANE, bool need_renorm>
+__global__ void biased_topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
+                                       const DTYPE_I* __restrict__ correction_bias,
+                                       float* __restrict__ topk_weights,
+                                       int* __restrict__ topk_ids,
+                                       const size_t stride_gating,
+                                       const size_t stride_tk,
+                                       const int num_experts,
+                                       const int topk,
+                                       const int num_tokens,
+                                       const float routed_scaling_factor)
+{
+    static constexpr int NVEC     = EXPERTS_PER_LANE / 2;
+    static constexpr bool HAS_TAIL = (EXPERTS_PER_LANE % 2) != 0;
+
+    using cktype_i = typename aiter::hip2opus<DTYPE_I>::type;
+    using vec_i    = opus::vector_t<cktype_i, 2>;
+
+    extern __shared__ char shared_mem[];
+    const int lane      = threadIdx.x;
+    const int token_idx = blockIdx.x;
+    float* sig_scores   = reinterpret_cast<float*>(shared_mem);
+
+    auto const* input_ptr = gating_output + token_idx * stride_gating;
+
+    // Lane-owned scores. Vec2 rounds first (coalesced pairs), then one scalar
+    // tail when EXPERTS_PER_LANE is odd: lane L owns expert
+    // 2 * NVEC * WARP_SIZE + L.
+    float s[NVEC == 0 ? 1 : NVEC][2];
+    float s_tail = -INFINITY;
+
+    // Visits every score this lane owns as (score&, expert id). Fully unrolled
+    // with compile-time indices so s[][] stays in registers -- a dynamic index
+    // would push it to scratch -- and so the id arithmetic lives in one place.
+    auto for_each_owned = [&](auto&& fn) {
+        if constexpr(NVEC > 0)
+        {
+            opus::static_for<NVEC>([&](auto j) {
+                opus::static_for<2>([&](auto i) {
+                    fn(s[j.value][i.value], (lane + j.value * WARP_SIZE) * 2 + i.value);
+                });
+            });
+        }
+        if constexpr(HAS_TAIL)
+        {
+            fn(s_tail, 2 * NVEC * WARP_SIZE + lane);
+        }
+    };
+
+    auto load_sig_bias = [&](auto g, auto b, int eid, float& dst) {
+        float sig       = static_cast<float>(g);
+        sig             = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * sig));
+        sig_scores[eid] = sig;
+        dst             = sig + static_cast<float>(b);
+    };
+
+#pragma unroll
+    for(int j = 0; j < NVEC; j++)
+    {
+        const int e2 = lane + j * WARP_SIZE;
+        vec_i g      = reinterpret_cast<vec_i const*>(input_ptr)[e2];
+        vec_i b      = reinterpret_cast<vec_i const*>(correction_bias)[e2];
+#pragma unroll
+        for(int i = 0; i < 2; i++)
+        {
+            load_sig_bias(g[i], b[i], e2 * 2 + i, s[j][i]);
+        }
+    }
+    if constexpr(HAS_TAIL)
+    {
+        const int eid = 2 * NVEC * WARP_SIZE + lane;
+        load_sig_bias(input_ptr[eid], correction_bias[eid], eid, s_tail);
+    }
+    // Pivot fast path. The topk largest lane-local maxima sit on topk distinct
+    // lanes, so the topk-th of them is a lower bound on the true topk-th score:
+    // every true winner survives the >= pivot filter. Compacting those few
+    // candidates and selecting among them replaces topk wave argmax rounds
+    // (each a 6-stage dependent bpermute chain) with two wave sorts.
+    float* cand_val = sig_scores + num_experts;
+    int* cand_idx   = reinterpret_cast<int*>(cand_val + WARP_SIZE);
+    int* final_idx  = cand_idx + WARP_SIZE;
+
+    float lmax = -INFINITY;
+    for_each_owned([&](float& v, int) { lmax = dev_max_(lmax, v); });
+    const float pivot =
+        __shfl(warp_bitonic_merge_sort_to_reg(lmax, opus::number<WARP_SIZE>{}), topk - 1);
+
+    // Rank candidates: all elements above the pivot first, then the ties, so a
+    // plateau at the pivot cannot hand out the same slot twice.
+    int my_gt = 0;
+    for_each_owned([&](float& v, int) { my_gt += v > pivot ? 1 : 0; });
+    int gt_base = my_gt;
+    warp_cumsum(gt_base, opus::number<WARP_SIZE>{});
+    const int n_gt = __builtin_amdgcn_readlane(gt_base, WARP_SIZE - 1);
+    gt_base -= my_gt;
+
+    int my_eq = 0;
+    for_each_owned([&](float& v, int) { my_eq += v == pivot ? 1 : 0; });
+    int eq_base = my_eq;
+    warp_cumsum(eq_base, opus::number<WARP_SIZE>{});
+    const int n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
+    eq_base += n_gt - my_eq;
+
+    if(n_cand <= WARP_SIZE)
+    {
+        int slot_gt = gt_base;
+        int slot_eq = eq_base;
+        for_each_owned([&](float& v, int id) {
+            if(v > pivot)
+            {
+                cand_val[slot_gt] = v;
+                cand_idx[slot_gt] = id;
+                slot_gt++;
+            }
+            else if(v == pivot)
+            {
+                cand_val[slot_eq] = v;
+                cand_idx[slot_eq] = id;
+                slot_eq++;
+            }
+        });
+
+        const float cv = lane < n_cand ? cand_val[lane] : -INFINITY;
+        const float pivot2 =
+            __shfl(warp_bitonic_merge_sort_to_reg(cv, opus::number<WARP_SIZE>{}), topk - 1);
+        const int local_cnt = cumsum_topk_with_pivot(cv, pivot2, opus::number<WARP_SIZE>{});
+        if(lane < n_cand && cv >= pivot2 && local_cnt <= topk)
+        {
+            final_idx[local_cnt - 1] = cand_idx[lane];
+        }
+
+        int out_idx = 0;
+        float w     = 0.0f;
+        if(lane < topk)
+        {
+            out_idx = final_idx[lane];
+            w       = sig_scores[out_idx];
+        }
+        if constexpr(need_renorm)
+        {
+            auto add_op = [](float a, float b) { return a + b; };
+            // Reduce across the whole wave with non-winners contributing zero:
+            // works for any topk, unlike a power-of-two lane-group reduce.
+            const float total =
+                wave_reduce<float, decltype(add_op), WARP_SIZE, true>(w, add_op);
+            w *= routed_scaling_factor / total;
+        }
+        else
+        {
+            w *= routed_scaling_factor;
+        }
+        if(lane < topk)
+        {
+            topk_weights[token_idx * stride_tk + lane] = w;
+            topk_ids[token_idx * stride_tk + lane]     = out_idx;
+        }
+        return;
+    }
+
+    // Fallback for more candidates than the wave can stage one per lane. Rare --
+    // a poison probe measured zero hits over 4096 rows of the benchmark
+    // distribution -- but correctness depends on it, so it stays. Still register
+    // resident; it only gives up the pivot, not the VGPR-held scores.
+    float sum       = 0.0f;
+    int topk_indice = 0;
+    float topk_value = 0.0f;
+    for(int k = 0; k < topk; ++k)
+    {
+        float max_val = -INFINITY;
+        int max_idx   = k;
+        for_each_owned([&](float& v, int id) {
+            if(v > max_val)
+            {
+                max_val = v;
+                max_idx = id;
+            }
+        });
+
+        warpReduceMax(max_val, max_idx);
+
+        // Retire the winner in place: compare-and-select, no dynamic index.
+        for_each_owned([&](float& v, int id) { v = id == max_idx ? -INFINITY : v; });
+
+        max_val     = sig_scores[max_idx];
+        topk_indice = lane == k ? max_idx : topk_indice;
+        topk_value  = lane == k ? max_val : topk_value;
+        if constexpr(need_renorm)
+        {
+            sum += max_val;
+        }
+    }
+
+    if constexpr(need_renorm)
+    {
+        sum = routed_scaling_factor / sum;
+    }
+    else
+    {
+        sum = routed_scaling_factor;
+    }
+
+    // One winner per lane: topk_indice/topk_value are single registers written
+    // under `lane == k`, so lanes beyond topk-1 hold nothing. The gate's
+    // topk <= lanes/2 keeps that in range; a strided loop here would just
+    // re-write lane 0's winner and silently corrupt the tail.
+    if(lane < topk)
+    {
+        topk_weights[token_idx * stride_tk + lane] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane]     = topk_indice;
     }
 }
 
@@ -1270,6 +1494,68 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
 
     HipDeviceGuard device_guard(gating_output.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    // Register-resident path (biased_topk_reg_kernel). Gates:
+    // - no group filter: topk_grp == num_expert_group
+    // - wave64 only (wave32 untested)
+    // - num_experts % 64 == 0 (odd EPL uses a scalar tail after vec2 prefix)
+    // - experts-per-lane in [1, 32], avoid VGPR spilling
+    // - topk in [AITER_TOPK_REG_MIN_TOPK, 32]
+    // - stride_gating even when EPL >= 2 (vec2 prefix)
+    constexpr int kMaxExpertsPerLane = 32;
+    const int reg_lanes        = static_cast<int>(get_warp_size_func());
+    const int experts_per_lane = reg_lanes > 0 ? num_experts / reg_lanes : 0;
+    if(topk_grp == num_expert_group &&
+       reg_lanes == 64 &&
+       (num_experts % reg_lanes) == 0 &&
+       experts_per_lane >= 1 &&
+       experts_per_lane <= kMaxExpertsPerLane &&
+       topk <= reg_lanes / 2 &&
+       topk >= AITER_TOPK_REG_MIN_TOPK &&
+       (experts_per_lane < 2 || (stride_gating % 2) == 0))
+    {
+        const size_t reg_shared_mem_size = num_experts * sizeof(float) +
+                                           reg_lanes * sizeof(float) +
+                                           2 * reg_lanes * sizeof(int);
+
+        auto launch = [&](auto epl_c, auto renorm_c) {
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                gating_output.dtype(), "biased_topk_reg_kernel", [&] {
+                    hipLaunchKernelGGL((aiter::biased_topk_reg_kernel<scalar_t,
+                                                                      epl_c.value,
+                                                                      renorm_c.value != 0>),
+                                       dim3(grid),
+                                       dim3(block),
+                                       reg_shared_mem_size,
+                                       stream,
+                                       reinterpret_cast<scalar_t*>(gating_output.data_ptr()),
+                                       reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),
+                                       reinterpret_cast<float*>(topk_weights.data_ptr()),
+                                       reinterpret_cast<int*>(topk_ids.data_ptr()),
+                                       stride_gating,
+                                       stride_tk,
+                                       num_experts,
+                                       topk,
+                                       num_tokens,
+                                       routed_scaling_factor);
+                });
+        };
+
+        // Instantiated for every experts-per-lane in [1, kMaxExpertsPerLane].
+        bool launched = false;
+        opus::static_for<kMaxExpertsPerLane>([&](auto i) {
+            constexpr int epl = i.value + 1;
+            if(launched || experts_per_lane != epl)
+                return;
+            if(need_renorm)
+                launch(opus::number<epl>{}, opus::number<1>{});
+            else
+                launch(opus::number<epl>{}, opus::number<0>{});
+            launched = true;
+        });
+        if(launched)
+            return;
+    }
 
     LAUNCH_KERNEL()
 }
