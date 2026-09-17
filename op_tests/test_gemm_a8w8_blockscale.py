@@ -25,6 +25,11 @@ from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
+TEST_NUM_ROTATE = int(os.environ.get("GEMM_BENCH_ROTATE", "0"))
+TEST_GRAPH = os.environ.get("GEMM_BENCH_GRAPH", "0") == "1"
+
+if os.environ.get("GEMM_BENCH_EXTERNAL", "0") == "1":
+    from hipblaslt_winner import external_perftest as perftest
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -61,19 +66,25 @@ def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
-def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+@perftest(
+    num_iters=TEST_NUM_ITERS, num_rotate_args=TEST_NUM_ROTATE, testGraph=TEST_GRAPH
+)
+def run_gemm_bpreshuffle(
+    x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, out=None
+):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
-        x, weightshuffle, x_scale, w_scale, dtype
+        x, weightshuffle, x_scale, w_scale, dtype, out=out
     )
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
+@perftest(
+    num_iters=TEST_NUM_ITERS, num_rotate_args=TEST_NUM_ROTATE, testGraph=TEST_GRAPH
+)
 def run_gemm_abpreshuffle(
-    x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16
+    x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, out=None
 ):
     return aiter.gemm_a8w8_blockscale_abpreshuffle(
-        x_shuffled, weightshuffle, x_scale, w_scale, dtype
+        x_shuffled, weightshuffle, x_scale, w_scale, dtype, out=out
     )
 
 
@@ -109,8 +120,14 @@ def test_gemm(
     scale_init="auto",
     seed=0,
     apre=False,
+    hipblaslt_winner_dir=None,
+    hipblaslt_bridge=None,
 ):
     ret = {}
+    if hipblaslt_winner_dir and (
+        not use_flydsl or not ck_preshuffle or dtype != dtypes.bf16
+    ):
+        raise ValueError("Winner comparison requires --flydsl, preshuffle, BF16")
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -153,7 +170,13 @@ def test_gemm(
     gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+    # Explicit outputs make input AND output rotation identical in a comparison.
+    # Otherwise FlyDSL could reuse an allocator output while Tensile rotates D.
+    if hipblaslt_winner_dir:
+        fly_out = torch.empty((m, n), dtype=dtype, device=x.device)
+        b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype, fly_out)
+    else:
+        b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
     if ck_preshuffle:
@@ -181,13 +204,58 @@ def test_gemm(
         else:
             x_apre = x
         e, avg_e = run_gemm_abpreshuffle(
-            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype
+            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype,
+            torch.empty((m, n), dtype=dtype, device=x.device)
+            if hipblaslt_winner_dir else None,
         )
         ret["apre us"] = avg_e
         ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
         ret["apre TB/s"] = (x_apre.nbytes + weight.nbytes) / avg_e / 1e6
         ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
         ret["apre/ck"] = avg_e / avg_b
+
+    if hipblaslt_winner_dir:
+        from hipblaslt_winner import HipblasltWinner, pack_scales
+
+        if m % 128 or n % 128 or k % 128:
+            raise ValueError("Winner comparison requires dimensions divisible by 128")
+        winner = HipblasltWinner(hipblaslt_winner_dir, hipblaslt_bridge, m, n, k)
+        print(f"hipBLASLt/Tensile explicit winner: {winner.name}", flush=True)
+        # Packing is excluded for both implementations, as in the existing test.
+        scale_a_mx32 = pack_scales(x_scale_raw)
+        scale_b_mx32 = pack_scales(w_scale_raw, repeat_rows=128)
+        out_lt = torch.empty((n, m), dtype=dtype, device=x.device).t()
+        workspace = torch.empty(
+            (max(winner.workspace_size, 1),), dtype=torch.uint8, device=x.device
+        )
+        synchronizer = torch.zeros((4096,), dtype=torch.int32, device=x.device)
+        lt_args = (
+            x, weight, scale_a_mx32, scale_b_mx32, out_lt, workspace, synchronizer
+        )
+        try:
+            c = winner.run(*lt_args)
+            torch.cuda.synchronize()
+            expected_lt = c.clone()
+            ret["hipblaslt err"] = checkAllclose(
+                a, c, msg="hipblaslt winner", catastrophic_check=True
+            )
+            ret["hipblaslt/flydsl diff"] = (c != b).float().mean().item()
+            if apre:
+                ret["hipblaslt/apre diff"] = (c != e).float().mean().item()
+            run_lt = perftest(
+                num_iters=TEST_NUM_ITERS,
+                num_rotate_args=TEST_NUM_ROTATE,
+                testGraph=TEST_GRAPH,
+            )(winner.run)
+            c, avg_lt = run_lt(*lt_args)
+            if not torch.equal(c, expected_lt):
+                raise RuntimeError("Tensile result changed during repeated launches")
+            ret["hipblaslt us"] = avg_lt
+            ret["hipblaslt TFLOPS"] = m * n * k * 2 / avg_lt / 1e6
+            ret["flydsl/hipblaslt"] = avg_b / avg_lt
+        finally:
+            torch.cuda.synchronize()
+            winner.close()
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
@@ -300,6 +368,12 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
+    epilog=(
+        "Comparison timing: GEMM_BENCH_ROTATE=1 for hot buffers or 100 to rotate;\n"
+        "GEMM_BENCH_GRAPH=1 enables graph replay for both GEMMs.\n"
+        "With rocprofv3, set GEMM_BENCH_EXTERNAL=1 to avoid nesting profilers;\n"
+        "read timings from its CSV, not the NaN times in the Python summary."
+    ),
 )
 parser.add_argument(
     "-d",
@@ -440,7 +514,18 @@ parser.add_argument(
     e.g.: --suffix branch""",
 )
 
+parser.add_argument(
+    "--hipblaslt-winner-dir",
+    help="Root containing generated Tensile winner ClientParameters.ini files",
+)
+parser.add_argument(
+    "--hipblaslt-bridge",
+    help="Path to libwinner_bridge.so built against the winner's Tensile checkout",
+)
+
 args = parser.parse_args()
+if args.hipblaslt_winner_dir and not args.hipblaslt_bridge:
+    parser.error("--hipblaslt-winner-dir requires --hipblaslt-bridge")
 
 data_init_list = args.data_init or ["constant", "uniform"]
 scale_init_list = args.scale_init or ["constant", "auto"]
@@ -484,6 +569,8 @@ if args.csv is not None:
                             scale_init=scale_init,
                             seed=args.seed,
                             apre=apre,
+                            hipblaslt_winner_dir=args.hipblaslt_winner_dir,
+                            hipblaslt_bridge=args.hipblaslt_bridge,
                         )
                         df.append(ret)
 else:
@@ -504,6 +591,8 @@ else:
                                 scale_init=scale_init,
                                 seed=args.seed,
                                 apre=apre,
+                                hipblaslt_winner_dir=args.hipblaslt_winner_dir,
+                                hipblaslt_bridge=args.hipblaslt_bridge,
                             )
                             df.append(ret)
 
