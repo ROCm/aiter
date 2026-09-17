@@ -272,12 +272,14 @@ def compile_mixed_moe_gemm1_common(
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
+    wpe_tag = f"_w{waves_per_eu}" if waves_per_eu is not None else ""
+    bnt_tag = f"_bnt{b_nt}" if b_nt else ""
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{wpe_tag}{bnt_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -2893,6 +2895,7 @@ def compile_mixed_moe_gemm1_common(
         use_async_copy,
         waves_per_eu,
         k_batch,
+        b_nt,
         gate_mode,
         a_scale_one,
         xcd_swizzle,
