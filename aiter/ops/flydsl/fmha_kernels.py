@@ -28,12 +28,12 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 
 from __future__ import annotations
 
-import math
 from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
 
+from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8,
@@ -43,6 +43,7 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 __all__ = [
     "flydsl_flash_attn_batch_func",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_func",
 ]
 
@@ -253,14 +254,15 @@ def _fp8_gfx950_supported(
 ) -> bool:
     """Gate for the gfx950 fp8 kernel.
 
-    It needs e4m3fn Q/K/V with per-tensor descales, hard-wires ``1/sqrt(D)``,
-    and writes bf16. Reject anything else so it falls through rather than
+    It needs e4m3fn Q/K/V with per-tensor descales and a positive, finite
+    softmax scale, and writes bf16. Reject anything else so it falls through rather than
     silently dropping the feature.
     """
     if q.dtype is not torch.float8_e4m3fn or q_descale is None:
         return False
 
     from ...jit.utils.chip_info import get_gfx
+    from .kernels.flash_attn_func_fp8_gfx950 import _is_valid_softmax_scale
 
     if get_gfx() != "gfx950":
         return False
@@ -280,9 +282,7 @@ def _fp8_gfx950_supported(
     ):
         return False
     qk_hdim = q.shape[-1]
-    if softmax_scale is not None and not math.isclose(
-        softmax_scale, 1.0 / math.sqrt(qk_hdim), rel_tol=1e-6
-    ):
+    if not _is_valid_softmax_scale(softmax_scale):
         return False
     if not _fp8_gfx950_buildable(qk_hdim, v.shape[-1]):
         return False
@@ -361,6 +361,7 @@ def flydsl_flash_attn_varlen_func(
             q,
             k,
             v,
+            softmax_scale=softmax_scale,
             causal=causal,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_k,
@@ -489,6 +490,7 @@ def flydsl_flash_attn_batch_func(
             q,
             k,
             v,
+            softmax_scale=softmax_scale,
             causal=causal,
             q_descale=q_descale,
             k_descale=k_descale,
@@ -540,3 +542,52 @@ def flydsl_flash_attn_batch_func(
         return_lse=return_lse,
         sink=sink,
     )
+
+
+def flydsl_flash_attn_varlen_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+):
+    """FlyDSL MHA backward, varlen THD layout.
+
+    Returns ``(dq, dk, dv, softmax_d)`` to match ``mha_varlen_bwd`` and
+    ``fmha_v3_varlen_bwd``.  The gradients are the same tensors that were passed
+    in -- the kernel fills them in place -- and ``softmax_d`` is the ``[H, T]``
+    fp32 ``rowsum(dO*O)`` those two also return.
+
+    PRECONDITION: the caller has established this configuration is supported --
+    causal varlen THD self-attention, d_qk=192 / d_v=128, bf16, no GQA,
+    contiguous, ``[H, T]`` fp32 LSE, no dropout / sliding window / alibi / sink /
+    padded cu_seqlens, on gfx942.  The authoritative gate is
+    ``can_impl_fmha_bwd_flydsl`` inside ``_flash_attn_varlen_backward`` in
+    ``aiter/ops/mha.py``; the screened feature arguments are absent from this
+    signature precisely because that gate has already established they are unset,
+    leaving no configuration for this function to branch on.
+    """
+    dq, dk, dv, softmax_d = flash_attn_varlen_bwd_d192_gfx942(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+    )
+    return dq, dk, dv, softmax_d

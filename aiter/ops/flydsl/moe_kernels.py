@@ -9,18 +9,17 @@ import re
 
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled as _dispatch_compiled,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    ptr_arg,
+)
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
 # HIP limits grid.y/grid.z to 65535.
 _HIP_MAX_GRID_DIM_Y = 65535
-
-
-def _get_dtypes():
-    from aiter.utility import dtypes
-
-    return dtypes
 
 
 @functools.lru_cache(maxsize=256)
@@ -110,6 +109,11 @@ def requires_flydsl_stage2_reduce(
 ) -> bool:
     """Return whether stage2 atomic output exceeds 32-bit byte offsets."""
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
+
+
+def requires_flydsl_stage2_global_a(a: torch.Tensor) -> bool:
+    """Return whether A's stored bytes reach the 4 GiB buffer descriptor limit."""
+    return a.numel() * a.element_size() >= (1 << 32)
 
 
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
@@ -724,6 +728,7 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mode: str = "atomic",
+    use_global_a: bool = True,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -770,6 +775,7 @@ def compile_flydsl_moe_stage2(
             sort_block_m=sort_block_m,
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
+            use_global_a=use_global_a,
             cu_num_mul=cu_num_mul,
             # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
             # from the kernel-name parser. They are accepted as ignored
@@ -993,29 +999,8 @@ def _s2_args_std(
 
 
 def _run_compiled(exe, args):
-    """JIT-compile on first call, then dispatch via cached CompiledFunction."""
-    import flydsl.compiler as flyc
-
-    cf = getattr(exe, "_cf", None)
-    if cf is not None:
-        cf(*args)
-        return
-    try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
-    except Exception:
-        # JitFunction.__call__ leaks ir.Context on compilation failure,
-        # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext -> gpu_module_body error).
-        # Clean up leaked contexts to isolate failures.
-        try:
-            from flydsl._mlir import ir
-
-            while ir.Context.current is not None:
-                ir.Context.current.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001,S110 - best-effort context cleanup
-            pass
-        raise
+    """Tuple-argument adapter for the existing MoE and AOT launch callers."""
+    return _dispatch_compiled(exe, *args)
 
 
 _S2_LEGACY_FP8_SCALE_BLK = 8
@@ -1506,7 +1491,7 @@ def _flydsl_moe_stage1_impl(
     _need_fp8 = out_dtype == "fp8"
     _fuse_any_quant = _need_fp4 or _need_fp8
     _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
-    dtypes = _get_dtypes()
+    from aiter.utility import dtypes
 
     if _need_fp4:
         torch_out_dtype = dtypes.fp4x2
@@ -2284,6 +2269,7 @@ def _flydsl_moe_stage2_impl(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=requires_flydsl_stage2_global_a(inter_states),
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
@@ -2503,6 +2489,7 @@ def flydsl_moe_topids_to_rows(
     counter: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     num_valid_routes: torch.Tensor | None = None,
+    ep_rowmap: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -2594,6 +2581,16 @@ def flydsl_moe_topids_to_rows(
             os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
+        # ep_rowmap sentinel fill: the g2l_lds kernel interleaves i64 fill stores
+        # with route work (fire-and-forget, no extra barrier), eliminating the
+        # standalone .fill_() launch between g2l_lds and psum_remap_ep.  When
+        # ep_rowmap is None the kernel receives a null pointer and skips the fill.
+        _ep_rowmap_ptr = (
+            ep_rowmap.reshape(-1)
+            if ep_rowmap is not None
+            else torch.empty(0, dtype=torch.int32, device=device)
+        )
+        _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
         if _use_lds_reduce:
             topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
         else:
@@ -2610,6 +2607,8 @@ def flydsl_moe_topids_to_rows(
             int(max_m),
             int(E),
             route_grid,
+            ptr_arg(_ep_rowmap_ptr),
+            int(_ep_rowmap_cap),
             stream=torch.cuda.current_stream(),
         )
     else:
