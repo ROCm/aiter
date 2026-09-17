@@ -6,7 +6,7 @@
 Follows the csrc tuner pattern (like gemm_a16w16, ck_gemm_a8w8): read shapes
 from an untuned CSV, sweep the launch configs ``conv3d_policy`` enumerates for
 each shape, and write the winner to a checked-in tuned CSV that
-``conv3d_implicit._lookup_tuned_tile`` reads at runtime.
+``conv3d_tuned_config._lookup_tuned_tile`` reads at runtime.
 
 Differences from the GEMM tuners, all forced by the operator rather than by
 preference:
@@ -49,7 +49,7 @@ from aiter.ops.flydsl.conv3d_policy import (
     get_flydsl_conv3d_configs,
     tile_kernel_name,
 )
-from aiter.ops.flydsl.kernels.conv3d_implicit import (
+from aiter.ops.flydsl.conv3d_tuned_config import (
     TUNED_DEVICE_COLUMNS,
     TUNED_KEY_COLUMNS,
     TUNED_RESULT_COLUMNS,
@@ -411,10 +411,10 @@ class Conv3dTuner(TunerCommon):
         out.to_csv(file, index=False, na_rep="Null")
 
     def _clear_op_caches(self):
-        from aiter.ops.flydsl.kernels import conv3d_implicit
+        from aiter.ops.flydsl import conv3d_tuned_config
 
-        conv3d_implicit._load_tuned_table.cache_clear()
-        conv3d_implicit._TUNED_LOOKUP_LOGGED.clear()
+        conv3d_tuned_config._load_tuned_table.cache_clear()
+        conv3d_tuned_config._TUNED_LOOKUP_LOGGED.clear()
 
     @staticmethod
     def _ramp_clocks(seconds=2.0):
