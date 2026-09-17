@@ -99,22 +99,6 @@ def get_recommended_splits(
     return max(4, min(n, max_partitions))
 
 
-def _workgroup_count_enables_v_prefetch(
-    num_sequences: int,
-    num_kv_heads: int,
-    num_partitions: int,
-    num_compute_units: int,
-) -> bool:
-    """Return whether the launch is in the tuned one-to-two-CTA-per-CU window.
-
-    This result is a kernel specialization and therefore part of the compile
-    cache key. Applications serving shapes on both sides of this interval must
-    materialize both variants before graph capture or latency-sensitive use.
-    """
-    workgroups = num_sequences * num_kv_heads * num_partitions
-    return num_compute_units < workgroups <= 2 * num_compute_units
-
-
 def _flydsl_pointer_dtype(dtype: torch.dtype):
     return {
         torch.float32: fx.Float32,
@@ -567,68 +551,79 @@ def pa_decode(
     # if either does.
     wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
 
-    # Scalar page-16 decode keeps its non-prefetch schedule. Per-token paths
-    # select their tuned pipelines below without environment overrides.
-    prefetch_v = False
-    # Early V loads help the measured one-to-two-workgroup-per-CU regime.
-    # Keep other scalar page-128 grids on the non-prefetch schedule.
-    if (
-        arch == "gfx950"
-        and head_dim == 128
+    dense_partition_workgroups = num_seqs * num_kv_heads * num_partitions
+    gfx950_d128 = arch == "gfx950" and head_dim == 128
+    scalar_prefetch_candidate = (
+        gfx950_d128
         and block_size == 128
         and trans_v
         and not per_token_kv
         and query_length * query_group_size <= 16
-    ):
-        num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
-        prefetch_v = _workgroup_count_enables_v_prefetch(
-            num_seqs,
-            num_kv_heads,
-            num_partitions,
-            num_cus,
-        )
-
-    # Per-token decode benefits from overlapping V with QK. Page 16 also
-    # delays next K until PV; page 128 stages next scales before issuing K.
-    # With transposed page-128 V, more than one workgroup per CU already hides
-    # latency: retain the lower-register schedule in that regime.
-    if (
-        arch == "gfx950"
+    )
+    tuned_per_token_shape = (
+        gfx950_d128
         and per_token_kv
-        and head_dim == 128
-        and query.dtype == torch.bfloat16
-        and num_kv_heads == 1
+        and query_dtype == "bf16"
+        and block_size in (16, 128)
+    )
+    # Hkv2 static decode is covered by the same workgroup/layout policy.
+    # Planned Hkv2 and larger KV-head counts retain their existing schedule.
+    tuned_m1_heads = num_kv_heads == 1 or (work_plan is None and num_kv_heads == 2)
+    per_token_single_query = (
+        tuned_per_token_shape
+        and tuned_m1_heads
         and query_length == 1
         and query_group_size in (8, 16)
-        and block_size in (16, 128)
-    ):
-        if block_size == 16 or not trans_v:
-            prefetch_v = True
-        else:
-            num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
-            prefetch_v = num_seqs * num_kv_heads * num_partitions <= num_cus
-
-    # Split small MTP2/MTP4 grids into one query per CTA, retaining the original
-    # partial layout and partition count. Larger grids amortize KV loads by
-    # processing all queries together. MTP3 stays fused because the kernel's
-    # supported split counts (1, 2, 4) must divide query_length.
-    query_splits = 1
-    if (
+    )
+    query_split_candidate = (
         work_plan is None
-        and arch == "gfx950"
-        and per_token_kv
-        and head_dim == 128
-        and query.dtype == torch.bfloat16
+        and tuned_per_token_shape
         and num_kv_heads == 1
         and query_length in (2, 4)
         and query_group_size == 16
-        and block_size in (16, 128)
-    ):
-        num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
-        base_workgroups = num_seqs * num_kv_heads * num_partitions
-        if query_length * base_workgroups <= 2 * num_cus:
-            query_splits = query_length
-            prefetch_v = True
+    )
+    needs_num_cus = (
+        scalar_prefetch_candidate
+        or query_split_candidate
+        or (per_token_single_query and block_size == 128 and trans_v)
+    )
+    num_cus = (
+        torch.cuda.get_device_properties(dev).multi_processor_count
+        if needs_num_cus
+        else 0
+    )
+
+    # Split small MTP2/MTP4 grids into one query per CTA. MTP3 stays fused
+    # because the supported split counts (1, 2, 4) must divide query_length.
+    query_splits = (
+        query_length
+        if query_split_candidate
+        and query_length * dense_partition_workgroups <= 2 * num_cus
+        else 1
+    )
+    queries_per_cta = query_length // query_splits
+    total_workgroups = dense_partition_workgroups * query_splits
+    per_token_m1 = (
+        tuned_per_token_shape
+        and queries_per_cta == 1
+        and query_group_size in (8, 16)
+        and (query_splits > 1 or per_token_single_query)
+    )
+
+    # Use one policy for the single-M-tile per-token pipelines. Page16 and
+    # plain V tolerate high occupancy; unsplit transposed page128 retains its
+    # lower-register schedule above one workgroup per CU.
+    per_token_prefetch = per_token_m1 and (
+        query_splits > 1
+        or block_size == 16
+        or not trans_v
+        or total_workgroups <= num_cus
+    )
+    scalar_prefetch = (
+        scalar_prefetch_candidate
+        and num_cus < dense_partition_workgroups <= 2 * num_cus
+    )
+    prefetch_v = scalar_prefetch or per_token_prefetch
 
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(

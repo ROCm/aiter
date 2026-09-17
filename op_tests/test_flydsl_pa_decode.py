@@ -701,6 +701,74 @@ PA_DECODE_TEST_CASES = [
     ),
     pytest.param(
         {
+            "batch_size": 16,
+            "num_query_heads": 16,
+            "num_kv_heads": 2,
+            "head_dim": 128,
+            "context_length": 257,
+            "block_size": 128,
+            "dtype": dtypes.bf16,
+            "trans_v": True,
+            "per_token": True,
+            "query_length": 1,
+            "num_partitions": 8,
+            "gfx950_prefetch_v": "occupancy",
+        },
+        id="decode-hkv2-one-wg-per-cu-prefetch",
+    ),
+    pytest.param(
+        {
+            "batch_size": 32,
+            "num_query_heads": 16,
+            "num_kv_heads": 2,
+            "head_dim": 128,
+            "context_length": 257,
+            "block_size": 128,
+            "dtype": dtypes.bf16,
+            "trans_v": True,
+            "per_token": True,
+            "query_length": 1,
+            "num_partitions": 8,
+            "gfx950_prefetch_v": "occupancy",
+        },
+        id="decode-hkv2-two-wg-per-cu-no-prefetch",
+    ),
+    pytest.param(
+        {
+            "batch_size": 32,
+            "num_query_heads": 16,
+            "num_kv_heads": 2,
+            "head_dim": 128,
+            "context_length": 257,
+            "block_size": 16,
+            "dtype": dtypes.bf16,
+            "trans_v": True,
+            "per_token": True,
+            "query_length": 1,
+            "num_partitions": 8,
+            "gfx950_prefetch_v": True,
+        },
+        id="decode-hkv2-page16-prefetch",
+    ),
+    pytest.param(
+        {
+            "batch_size": 32,
+            "num_query_heads": 32,
+            "num_kv_heads": 2,
+            "head_dim": 128,
+            "context_length": 257,
+            "block_size": 128,
+            "dtype": dtypes.bf16,
+            "trans_v": False,
+            "per_token": True,
+            "query_length": 1,
+            "num_partitions": 8,
+            "gfx950_prefetch_v": True,
+        },
+        id="decode-hkv2-plain-v-prefetch",
+    ),
+    pytest.param(
+        {
             "batch_size": 2,
             "num_query_heads": 16,
             "num_kv_heads": 1,
@@ -713,6 +781,7 @@ PA_DECODE_TEST_CASES = [
             "query_length": 2,
             "num_partitions": 3,
             "gfx950_query_splits": 2,
+            "gfx950_prefetch_v": True,
         },
         id="mtp2-query-split-page128-per-token",
     ),
@@ -747,6 +816,7 @@ PA_DECODE_TEST_CASES = [
             "query_length": 4,
             "num_partitions": 3,
             "gfx950_query_splits": 4,
+            "gfx950_prefetch_v": True,
         },
         id="mtp4-query-split-page16-per-token",
     ),
@@ -826,14 +896,17 @@ def test_pa_decode(case, monkeypatch):
     _require_gpu()
     case = case.copy()
     expected_query_splits = case.pop("gfx950_query_splits", None)
+    expected_prefetch_v = case.pop("gfx950_prefetch_v", None)
     selected_query_splits = []
+    selected_prefetch_v = []
 
-    if expected_query_splits is not None:
+    if expected_query_splits is not None or expected_prefetch_v is not None:
         module = importlib.import_module("aiter.ops.flydsl.pa_decode")
         compile_tile = module.compile_pa_decode_tile
 
         def capture_compile(**kwargs):
             selected_query_splits.append(kwargs["query_splits"])
+            selected_prefetch_v.append(kwargs["prefetch_v"])
             return compile_tile(**kwargs)
 
         monkeypatch.setattr(module, "compile_pa_decode_tile", capture_compile)
@@ -872,6 +945,18 @@ def test_pa_decode(case, monkeypatch):
         expected = expected_query_splits if get_gfx_runtime() == "gfx950" else 1
         assert selected_query_splits
         assert set(selected_query_splits) == {expected}
+    if expected_prefetch_v is not None:
+        if expected_prefetch_v == "occupancy":
+            workgroups = case["batch_size"] * case["num_kv_heads"] * expected_partitions
+            expected_prefetch_v = (
+                workgroups
+                <= torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            )
+        expected = expected_prefetch_v if get_gfx_runtime() == "gfx950" else False
+        assert selected_prefetch_v
+        assert set(selected_prefetch_v) == {expected}
 
 
 def _assert_plan(plan, lengths):
