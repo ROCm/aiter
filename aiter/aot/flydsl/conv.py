@@ -76,12 +76,14 @@ from aiter.ops.flydsl.conv3d_tuned_config import (
     TUNED_KEY_COLUMNS,
     TUNED_RESULT_COLUMNS,
 )
+from aiter.ops.flydsl.kernels.conv3d_common import _dispatch
 from aiter.ops.flydsl.kernels.conv3d_implicit import (
-    TR_MAX_BIG_S,
-    TR_VEC,
-    _dispatch,
     _pad_channels,
     compile_conv3d_implicit,
+)
+from aiter.ops.flydsl.kernels.conv3d_transpose import (
+    TR_MAX_BIG_S,
+    TR_VEC,
     compile_transpose_ncdhw_ndhwc,
 )
 
