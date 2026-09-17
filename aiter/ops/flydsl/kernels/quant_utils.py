@@ -254,35 +254,62 @@ def emit_f32_to_e2m1(qx_f32):
     return (s >> c28_i32) | e2m1
 
 
-def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
+def emit_amax_e8m0_native_scale(
+    all_vals, *, wave_size, dtype=_D.FP8_E4M3, amax_gain=None
+):
     """Like :func:`emit_amax_e8m0_recip` but returns the *forward* scale
     ``2^(e8m0-127)`` needed by native gfx1250 ``v_cvt_scalef32_pk8_*``
     instructions (HW divides by the scale internally).
 
+    ``amax_gain`` is an optional f32 the block amax is multiplied by before the
+    scale is derived. It exists so a caller whose block is a uniform multiple of
+    what it holds in registers -- an MoE tile row scaled by one route weight, say
+    -- can pay a single multiply here instead of one per element, and fold the
+    reciprocal into the ``v_cvt_scalef32`` scale operand. Applied AFTER the peer
+    reduction: every lane in a block shares the gain, so the order is
+    equivalent, and keeping it off the shuffle's input shortens that dependency
+    chain. Must be non-negative; pass ``abs()`` of a signed factor. A gain above
+    one can in principle push the amax past FLT_MAX; the e8m0 exponent clamp in
+    :func:`emit_mx_e8m0_scale` absorbs that rather than this function paying a
+    second clamp per block.
+
     Returns:
         ``(scale_f32, e8m0_byte)`` — f32 forward scale and i8 E8M0 byte.
     """
+    if not all_vals:
+        raise ValueError("emit_amax_e8m0_native_scale needs at least one value")
     c_flt_max = arith.constant(3.4028234663852886e38, type=T.f32)
     c16 = arith.constant(16, type=T.i32)
     c23 = arith.constant(23, type=T.i32)
     c_wave = arith.constant(wave_size, type=T.i32)
 
-    # Pairwise tree, not a linear accumulate: a chain of N maxes is N deep and
-    # every step stalls on the last (one s_delay_alu each). The tree is log2(N)
-    # deep with N/2 independent maxes per level for the scheduler to interleave.
-    level = [arith.constant(0.0, type=T.f32)] + [
-        abs(fx.Float32(v)).ir_value() for v in all_vals
-    ]
+    # A tree, not a linear accumulate: a chain of N maxes is N deep and every
+    # step stalls on the last (one s_delay_alu each), while a tree is log-deep
+    # with independent maxes per level for the scheduler to interleave.
+    #
+    # Ternary groups rather than pairs: the AMDGPU backend contracts
+    # max(max(a, b), c) into one v_max3_f32, so a group of three costs the same
+    # single instruction a pair does. That is 8 instructions for 16 values
+    # instead of 15, and three levels instead of four. If the contraction ever
+    # stops firing this degrades to the pairwise count, never worse.
+    #
+    # No 0.0 seed: abs() already floors the inputs at zero, so it only bought an
+    # extra level.
+    level = [abs(fx.Float32(v)).ir_value() for v in all_vals]
     while len(level) > 1:
-        nxt = [
-            arith.maxnumf(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)
-        ]
-        if len(level) % 2:
-            nxt.append(level[-1])
+        nxt = []
+        for i in range(0, len(level), 3):
+            grp = level[i : i + 3]
+            acc = grp[0]
+            for v in grp[1:]:
+                acc = arith.maxnumf(acc, v)
+            nxt.append(acc)
         level = nxt
     block_amax = arith.minnumf(level[0], c_flt_max)
     peer = block_amax.shuffle_xor(c16, c_wave)
     block_amax = arith.maxnumf(block_amax, peer)
+    if amax_gain is not None:
+        block_amax = _raw(fx.Float32(block_amax) * fx.Float32(amax_gain))
 
     e8m0 = emit_mx_e8m0_scale(block_amax, dtype=dtype)
     scale_f32 = (e8m0 << c23).bitcast(T.f32)
