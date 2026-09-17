@@ -683,6 +683,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     constexpr int SF_FILL_VEC  = (SF_SUB % 4 == 0) ? 4 : 1;   // dwords per lane
     constexpr int SF_FILL_WAVE = 64 * SF_FILL_VEC;            // dwords per instruction
     constexpr int SF_FILL_NW   = T::BLOCK_SIZE / 64;
+    constexpr bool SF_SHUF_OVERLAP_PROLOGUE =
+        SF_SHUF_IN_LDS && T::B_M == 128 && T::B_K == 256
+        && (T::B_N == 64 || T::B_N == 128);
     if constexpr (SF_SHUF_IN_LDS) {
         // This panel's own bound, smaller than the plain panel's. The launcher
         // checks it with AITER_CHECK, so reaching this return means a caller went
@@ -720,13 +723,15 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                 }
             }
         }
-        // vmcnt alone. buffer_load ... offen lds is VMEM and its counter only
-        // drops once the data is in LDS, so this covers the whole DMA -- same
-        // budget the A ring buffer's async_loads sit in (A_MB below). The plain
-        // panel needs lgkmcnt too because it fills through ds_write; this path
-        // has no ds_write to wait on.
-        s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        // On the gated geometries, leave these older VMEM operations in flight
+        // while the A ring and B(0) are issued below. Tile 0's existing wait down
+        // to A_MB+B_MB retires the panel first (VMEM is ordered), then A(0), and
+        // its barrier publishes both LDS regions. Other geometries keep their
+        // established standalone panel publication.
+        if constexpr (!SF_SHUF_OVERLAP_PROLOGUE) {
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
     }
 
     // A tile issue, always a whole tile: an index past the end re-reads the last
