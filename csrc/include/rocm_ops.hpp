@@ -290,72 +290,62 @@ namespace py = pybind11;
           py::arg("x_scale") = std::nullopt, \
           py::arg("w_scale") = std::nullopt);
 
-#define OPUS_GEMM_PYBIND                          \
-    m.def("opus_gemm",                            \
-          &opus_gemm,                             \
-          "opus_gemm",                            \
-          py::arg("XQ"),                          \
-          py::arg("WQ"),                          \
-          py::arg("Y"),                           \
-          py::arg("group_layout") = std::nullopt, \
-          py::arg("x_scale")      = std::nullopt, \
-          py::arg("w_scale")      = std::nullopt, \
-          py::arg("bias")         = std::nullopt);
-
-#define OPUS_GEMM_A16W16_TUNE_PYBIND          \
-    m.def("opus_gemm_a16w16_tune",            \
-          &opus_gemm_a16w16_tune,             \
-          "opus_gemm_a16w16_tune",            \
+// OPUS exact-kid bindings; blockscale scale tensors are required.
+#define OPUS_GEMM_A16W16_LAUNCH_PYBIND        \
+    m.def("opus_gemm_a16w16_launch",          \
+          &opus_gemm_a16w16_launch,            \
+          "opus_gemm_a16w16_launch",          \
           py::arg("XQ"),                      \
           py::arg("WQ"),                      \
           py::arg("Y"),                       \
-          py::arg("bias")      = std::nullopt, \
-          py::arg("workspace") = std::nullopt, \
-          py::arg("kernelId")  = 0,            \
-          py::arg("splitK")    = 0);
+          py::arg("bias"),                    \
+          py::arg("workspace"),               \
+          py::arg("kid"),                     \
+          py::arg("split_k"));
 
-#define OPUS_BMM_A8W8_MXSCALE_PYBIND \
-    m.def("opus_bmm_a8w8_mxscale",   \
-          &opus_bmm_a8w8_mxscale,    \
-          "mmajor fp8 e8m0 mxscale (block-scale) BMM with native "  \
-          "scaled MFMA; kid-dispatched flatmm split-K backend", \
-          py::arg("O"),                                  \
-          py::arg("wo_a"),                               \
-          py::arg("Y"),                                  \
-          py::arg("x_scale"),                            \
-          py::arg("w_scale"),                            \
-          py::arg("splitK") = 2,                         \
-          py::arg("kernelId") = 0);
-#define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
-    m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
-          &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \
-          "opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
+#define OPUS_GEMM_A8W8_LAUNCH_PYBIND     \
+    m.def("opus_gemm_a8w8_launch",       \
+          &opus_gemm_a8w8_launch,        \
+          "opus_gemm_a8w8_launch",       \
+          py::arg("XQ"),                 \
+          py::arg("WQ"),                 \
+          py::arg("Y"),                  \
+          py::arg("kid"));
+
+#define OPUS_GEMM_A8W8_BLOCKSCALE_LAUNCH_PYBIND \
+    m.def("opus_gemm_a8w8_blockscale_launch",   \
+          &opus_gemm_a8w8_blockscale_launch,    \
+          "opus_gemm_a8w8_blockscale_launch",   \
+          py::arg("XQ"),                        \
+          py::arg("WQ"),                        \
+          py::arg("Y"),                         \
+          py::arg("x_scale"),                   \
+          py::arg("w_scale"),                   \
+          py::arg("kid"));
+
+#define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_LAUNCH_PYBIND \
+    m.def("opus_gemm_a8w8_blockscale_bpreshuffle_launch",   \
+          &opus_gemm_a8w8_blockscale_bpreshuffle_launch,    \
+          "opus_gemm_a8w8_blockscale_bpreshuffle_launch",   \
+          py::arg("XQ"),                                    \
+          py::arg("WQ"),                                    \
+          py::arg("x_scale"),                               \
+          py::arg("w_scale"),                               \
+          py::arg("Y"),                                     \
+          py::arg("kid"));
+
+#define OPUS_GEMM_A8W8_MXSCALE_BMM_LAUNCH_PYBIND          \
+    m.def("opus_gemm_a8w8_mxscale_bmm_launch",           \
+          &opus_gemm_a8w8_mxscale_bmm_launch,             \
+          "opus_gemm_a8w8_mxscale_bmm_launch",           \
           py::arg("XQ"),                                  \
           py::arg("WQ"),                                  \
+          py::arg("Y"),                                   \
           py::arg("x_scale"),                             \
           py::arg("w_scale"),                             \
-          py::arg("Y"),                                   \
-          py::arg("kernelId"));
-
-#define OPUS_GEMM_WORKSPACE_INIT_PYBIND                              \
-    m.def("opus_gemm_workspace_init",                                \
-          &opus_gemm_workspace_init,                                 \
-          "Register a splitk fp32 workspace handle for the current " \
-          "CUDA stream. Call once per stream eagerly (outside HIP "  \
-          "graph capture) before capturing graphs that include "     \
-          "opus_gemm splitk kernels under TBO.");
-
-#define OPUS_GEMM_WORKSPACE_RELEASE_PYBIND                             \
-    m.def("opus_gemm_workspace_release",                              \
-          &opus_gemm_workspace_release,                               \
-          "Free the splitk workspace (buffer + handles + registry "  \
-          "entry) for the current CUDA stream. Eager mode only; "    \
-          "no-op if the stream was never registered.");               \
-    m.def("opus_gemm_workspace_release_all",                          \
-          &opus_gemm_workspace_release_all,                           \
-          "Free the splitk workspace for all registered streams and " \
-          "clear the registry. Eager mode only. Use for explicit "   \
-          "teardown before a framework reclaims its stream pool.");
+          py::arg("workspace"),                           \
+          py::arg("kid"),                                 \
+          py::arg("split_k"));
 
 #define OPUS_MOE_PYBIND                                                            \
     m.def("opus_moe_stage2_a8w4_decode_fwd",                                        \
