@@ -543,6 +543,53 @@ def _apply_a4_tuning(
                 stage1_patch["tile_n"] = 256
             config = _replace_config(config, stage1=stage1_patch)
 
+    # Stage2 fields that drifted away from the pre-rebase tuning.  Measured on
+    # MI355X at mtpr=8192 against the pre-rebase tree: restoring them recovers
+    # 92% of the end-to-end regression at bucket 2048, 87% at 8192 and about
+    # half of it at 256 and 512.  Two of the three also unblock the deep
+    # Stage2 path below, which the drifted geometry was suppressing.
+    #
+    # Scoped to the large-MTPR class because that is the regime whose base
+    # Stage2 table these numbers were measured against.
+    if mtpr_config_class(mtpr) == MAX_MTPR_CLASS:
+        restore_stage2: dict[str, object] = {}
+        if bucket == 256:
+            restore_stage2 = {
+                "block_m": 64,
+                "block_n": 256,
+                "persist_cu": 128,
+                "b2stage": True,
+                "deep_a_pipeline": True,
+            }
+        elif bucket == 512:
+            restore_stage2 = {
+                "block_m": 64,
+                "b2stage": True,
+                "deep_a_pipeline": True,
+            }
+        elif bucket == 2048:
+            restore_stage2 = {"block_m": 64}
+        elif bucket == 8192 and config.stage2.aligned_pair:
+            # Aligned-pair and the deep path are mutually exclusive.  The deep
+            # path measured faster here, so give aligned-pair up rather than
+            # lose both.
+            restore_stage2 = {"aligned_pair": False, "pair_cu": 0, "skew_cu": 96}
+        block_m = restore_stage2.get("block_m")
+        if block_m is not None:
+            sbm = config.stage1.sort_block_m
+            if block_m > sbm or sbm % block_m:
+                # block_m has to tile the Stage1 sort block.  Skip the field
+                # rather than raise if a later Stage1 change breaks that.
+                restore_stage2.pop("block_m")
+        if restore_stage2:
+            config = _replace_config(config, stage2=restore_stage2)
+    elif bucket == 256:
+        # Bounded MTPR keeps BN128 with the deep pipeline off, so the table
+        # above does not carry over and was measured separately here.  b2stage
+        # is worth 2.3% at bucket 256; at 512 it measured slightly negative,
+        # so it is deliberately not applied there.
+        config = _replace_config(config, stage2={"b2stage": True})
+
     # The measured deep Stage2 path is enabled only for A4 and only where the
     # base geometry uses BN256. A8 therefore remains byte-for-byte mainline.
     if (
