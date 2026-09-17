@@ -44,14 +44,17 @@ from .conv3d_gfx950_utils import (
     OOB_SENTINEL_BYTES,
     OOB_SENTINEL_ELEM,
     WARP_SIZE,
+    OutputScatter,
     _as_stream,
     barrier,
+    block_coords,
     flat_buffer_view,
+    make_conv_geometry,
+    make_launch_grid,
+    make_output_scatter_plan,
     sgpr,
 )
-from .conv3d_grid import block_coords, make_launch_grid
-from .conv3d_im2col import Im2colGather, make_conv_geometry, make_im2col_plan
-from .conv3d_scatter import OutputScatter, make_output_scatter_plan
+from .conv3d_im2col import Im2colGather, make_im2col_plan
 
 TILE_K = 32
 
