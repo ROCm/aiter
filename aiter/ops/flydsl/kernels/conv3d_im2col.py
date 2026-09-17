@@ -43,6 +43,50 @@ PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 BIG_IN_NR = 0x80000000
 
 
+class ConvGeometry(NamedTuple):
+    """The implicit GEMM's shape, as the convolution's own shape implies it.
+
+    A row is one output element, so there are ``npq = N * Do * Ho * Wo`` of
+    them, and the K axis is one group's filter footprint, ``crs``. That makes
+    this both what the gather maps between and what the grid and the epilogue
+    are sized by, which is why it is derived once and shared: two derivations
+    that drifted apart would put the epilogue on a different grid than the
+    gather, for no visible reason.
+    """
+
+    do: int
+    ho: int
+    wo: int
+    dhw: int
+    hw_o: int
+    npq: int
+    cgp: int
+    crs: int
+
+
+def make_conv_geometry(param):
+    """The ConvGeometry of one ``Conv3dImplicitParam``.
+
+    Dilation only stretches the filter's footprint, so it moves the output
+    extents but leaves the K axis (CRS) alone.
+    """
+    cgp = param.c // param.groups
+    do = (param.d + 2 * param.pt - (param.dt * (param.kt - 1) + 1)) // param.st + 1
+    ho = (param.h + 2 * param.ph - (param.dh * (param.kh - 1) + 1)) // param.sh + 1
+    wo = (param.w + 2 * param.pw - (param.dw * (param.kw - 1) + 1)) // param.sw + 1
+    dhw = do * ho * wo
+    return ConvGeometry(
+        do=do,
+        ho=ho,
+        wo=wo,
+        dhw=dhw,
+        hw_o=ho * wo,
+        npq=param.n * dhw,
+        cgp=cgp,
+        crs=cgp * param.kt * param.kh * param.kw,
+    )
+
+
 class Im2colPlan(NamedTuple):
     """What one conv's gather knows before the kernel runs.
 
@@ -60,7 +104,8 @@ class Im2colPlan(NamedTuple):
     differ only in padding mode or dilation would silently share one binary.
     """
 
-    # Input and filter, and the output extents the rows decompose against.
+    # Input and filter. Flat rather than the param struct they come from,
+    # because only tuples and scalars reach the cache key (see above).
     c: int
     d: int
     h: int
@@ -78,12 +123,10 @@ class Im2colPlan(NamedTuple):
     dw: int
     pad_mode: str
     groups: int
-    cgp: int
-    crs: int
-    npq: int
-    dhw: int
-    hw_o: int
-    wo: int
+
+    # The output grid the rows decompose against. Nested, which a NamedTuple
+    # may be: it is a tuple, so its own fields still reach the cache key.
+    geom: ConvGeometry
 
     # The A tile this gather fills, taken from the launch config.
     tile_m: int
@@ -102,47 +145,26 @@ class Im2colPlan(NamedTuple):
     x_sample_elems: int
 
 
-def make_im2col_plan(
-    *,
-    n,
-    c,
-    d,
-    h,
-    w,
-    kt,
-    kh,
-    kw,
-    st,
-    sh,
-    sw,
-    pt,
-    ph,
-    pw,
-    dt,
-    dh,
-    dw,
-    pad_mode,
-    groups,
-    cgp,
-    crs,
-    do,
-    ho,
-    wo,
-    npq,
-    dhw,
-    hw_o,
-    tile_m,
-    tile_k,
-    block_threads,
-    ldg_a_count,
-):
+def make_im2col_plan(param, geom, *, tile_m, tile_k, block_threads, ldg_a_count):
     """An Im2colPlan for one problem and launch config, or an assertion.
+
+    Takes the problem as the ``Conv3dImplicitParam`` the caller already has,
+    and the grid as the ``ConvGeometry`` it already derived, so the two cannot
+    disagree with what the rest of the kernel was built against.
 
     The asserts here are the ones about reach: whether the input fits what a
     buffer descriptor addresses, on its own and as rebased per sample or per
     tile. They are the gather's, not the launch config's, so they cannot move
     into ``validate_launch_config``.
     """
+    n, c, d, h, w = param.n, param.c, param.d, param.h, param.w
+    kt, kh, kw = param.kt, param.kh, param.kw
+    st, sh, sw = param.st, param.sh, param.sw
+    pt, ph, pw = param.pt, param.ph, param.pw
+    dt, dh, dw = param.dt, param.dh, param.dw
+    pad_mode, groups = param.pad_mode, param.groups
+    do, ho, wo, hw_o = geom.do, geom.ho, geom.wo, geom.hw_o
+
     assert pad_mode in PADDING_MODES, (
         f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
     )
@@ -208,12 +230,7 @@ def make_im2col_plan(
         dw=dw,
         pad_mode=pad_mode,
         groups=groups,
-        cgp=cgp,
-        crs=crs,
-        npq=npq,
-        dhw=dhw,
-        hw_o=hw_o,
-        wo=wo,
+        geom=geom,
         tile_m=tile_m,
         tile_k=tile_k,
         block_threads=block_threads,
@@ -236,7 +253,7 @@ def make_im2col_plan(
         # A K tile that never straddles a channel boundary makes the channel and
         # the filter tap uniform across the tile, so they are hoisted per tile
         # rather than recomputed per tap.
-        scalar_k=cgp % tile_k == 0,
+        scalar_k=geom.cgp % tile_k == 0,
         big_in=big_in,
         big_in_n1=big_in_n1,
         big_in_nm=big_in_nm,
@@ -286,14 +303,14 @@ class Im2colGather:
     def taps(self, k_base):
         """Yield ``(i, src, voff)`` per A vector of the K tile at ``k_base``."""
         assert self._rows is not None, "bind_block() before taps()"
-        plan = self._plan
+        plan, geom = self._plan, self._plan.geom
         kbase_i = fx.Int64(k_base)
         cc_base = ckk_base = None
         if const_expr(plan.scalar_k):
-            cc_base = kbase_i % plan.cgp
+            cc_base = kbase_i % geom.cgp
             if const_expr(plan.groups > 1):
                 cc_base = self._ch_base + cc_base
-            ckk_base = kbase_i // plan.cgp
+            ckk_base = kbase_i // geom.cgp
         for i in range_constexpr(plan.ldg_a_count):
             g_off, valid, sample = self._tap_addr(i, kbase_i, cc_base, ckk_base)
             yield (
@@ -308,16 +325,16 @@ class Im2colGather:
         return flat_buffer_view(ptr, BIG_IN_NR // BF16_BYTES, BIG_IN_NR)
 
     def _rebase_on_tile(self, m_offset):
-        plan = self._plan
-        self._nbase = m_offset // plan.dhw
-        rem0 = m_offset % plan.dhw
-        ot_base0 = rem0 // plan.hw_o
+        plan, geom = self._plan, self._plan.geom
+        self._nbase = m_offset // geom.dhw
+        rem0 = m_offset % geom.dhw
+        ot_base0 = rem0 // geom.hw_o
 
         self._base_t = fx.max(
             ot_base0 * fx.Int64(plan.st) - fx.Int64(plan.pt), fx.Int64(0)
         )
         if const_expr(plan.t_aligned):
-            oh_base0 = (rem0 % plan.hw_o) // plan.wo
+            oh_base0 = (rem0 % geom.hw_o) // geom.wo
             self._base_h = fx.max(
                 oh_base0 * fx.Int64(plan.sh) - fx.Int64(plan.ph), fx.Int64(0)
             )
@@ -340,24 +357,24 @@ class Im2colGather:
         Held as the input coordinate each of those taps starts from, since the
         filter tap is all that is added per K tile.
         """
-        plan = self._plan
+        plan, geom = self._plan, self._plan.geom
         rows = []
         for i in range_constexpr(plan.ldg_a_count):
             linear = (self._tid + i * plan.block_threads) * LDG_VEC
             local_m = linear // plan.tile_k
             local_k = linear % plan.tile_k
             row = m_offset + local_m
-            row_valid = row < fx.Int64(plan.npq)
+            row_valid = row < fx.Int64(geom.npq)
             if const_expr(plan.temporal_only_fast):
-                out_t = (row // plan.hw_o) % plan.d
+                out_t = (row // geom.hw_o) % plan.d
                 rows.append((local_k, row, row_valid, out_t))
             else:
-                n_idx = row // plan.dhw
-                rem = row % plan.dhw
-                ot = rem // plan.hw_o
-                rem2 = rem % plan.hw_o
-                oh = rem2 // plan.wo
-                ow = rem2 % plan.wo
+                n_idx = row // geom.dhw
+                rem = row % geom.dhw
+                ot = rem // geom.hw_o
+                rem2 = rem % geom.hw_o
+                oh = rem2 // geom.wo
+                ow = rem2 % geom.wo
                 in_t0 = ot * plan.st - plan.pt
                 in_h0 = oh * plan.sh - plan.ph
                 in_w0 = ow * plan.sw - plan.pw
@@ -402,21 +419,21 @@ class Im2colGather:
         offset within the group. ``sample`` is which sample to rebase on, and
         only the per-sample descriptor path has one.
         """
-        plan = self._plan
+        plan, geom = self._plan, self._plan.geom
         dec = self._rows[i]
         local_k = dec[0]
         k_abs = kbase_i + fx.Int64(local_k)
         if const_expr(plan.scalar_k):
             cc = cc_base + fx.Int64(local_k)  # cc_base already carries ch_base
         else:
-            cc = k_abs % plan.cgp
+            cc = k_abs % geom.cgp
             if const_expr(plan.groups > 1):
                 cc = self._ch_base + cc
-        k_valid = k_abs < fx.Int64(plan.crs)
+        k_valid = k_abs < fx.Int64(geom.crs)
 
         if const_expr(plan.temporal_only_fast):
             _, row, row_valid, out_t = dec
-            kt_i = ckk_base if const_expr(plan.scalar_k) else k_abs // plan.cgp
+            kt_i = ckk_base if const_expr(plan.scalar_k) else k_abs // geom.cgp
             temporal_delta = dil(kt_i, plan.dt) - plan.pt
             in_t, m_t = self._pad_coord(out_t + temporal_delta, plan.d, plan.pt)
             valid = gather_valid(row_valid & k_valid, m_t)
@@ -428,14 +445,14 @@ class Im2colGather:
             )
             if const_expr(plan.big_in_n1):
                 g_off = (
-                    (row + delta * plan.hw_o)
-                    - (fx.Int64(self._nbase) * plan.dhw + self._base_t * plan.hw_o)
+                    (row + delta * geom.hw_o)
+                    - (fx.Int64(self._nbase) * geom.dhw + self._base_t * geom.hw_o)
                 ) * plan.c + cc
             else:
-                g_off = (row + delta * plan.hw_o) * plan.c + cc
+                g_off = (row + delta * geom.hw_o) * plan.c + cc
             return fx.Int32(g_off), valid, None
 
-        ckk = ckk_base if const_expr(plan.scalar_k) else k_abs // plan.cgp
+        ckk = ckk_base if const_expr(plan.scalar_k) else k_abs // geom.cgp
         kw_i = ckk % plan.kw
         ckk2 = ckk // plan.kw
         kh_i = ckk2 % plan.kh
