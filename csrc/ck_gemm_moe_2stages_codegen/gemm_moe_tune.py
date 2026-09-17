@@ -5050,6 +5050,8 @@ class FmoeTuner(TunerCommon):
                 False,
                 timeout=args.timeout,
                 verbose=args.verbose,
+                num_iters=args.iters,
+                num_warmup=args.warmup,
             )
 
         # Identify failed cases

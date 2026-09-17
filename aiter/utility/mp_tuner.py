@@ -70,6 +70,8 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
+    num_iters=101,
+    num_warmup=2,
 ):
     from aiter.test_common import run_perftest
 
@@ -94,7 +96,13 @@ def worker(
         res = None
         us = float("inf")
         try:
-            res, us = run_perftest(func, *args, **kwargs)
+            res, us = run_perftest(
+                func,
+                *args,
+                num_iters=num_iters,
+                num_warmup=num_warmup,
+                **kwargs,
+            )
             us = round(us, 4)
 
         except (RuntimeError, ValueError) as e:
@@ -106,7 +114,13 @@ def worker(
 
         while us == 0 and retry_count < max_retries:
             print(f"!!!! us = 0, try {retry_count + 1} run")
-            res, us = run_perftest(func, *args, **kwargs)
+            res, us = run_perftest(
+                func,
+                *args,
+                num_iters=num_iters,
+                num_warmup=num_warmup,
+                **kwargs,
+            )
             retry_count += 1
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
@@ -188,7 +202,16 @@ def worker(
     return info, us, round(max_err_ratio, 4)
 
 
-def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
+def work_group(
+    GPUIDMap,
+    fast_mode,
+    err_ratio,
+    in_data,
+    tasks,
+    verbose=False,
+    num_iters=101,
+    num_warmup=2,
+):
     """Work group that processes a batch of related tasks."""
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
@@ -338,6 +361,9 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 max_abs_delta,
                 output_keys,
                 arg_key_list,
+                True,
+                num_iters,
+                num_warmup,
             )
 
             # Run worker with explicit GPU ID
@@ -373,6 +399,8 @@ def mp_tuner(
     err_ratio=0.05,
     timeout=None,
     verbose=False,  # print verbose log
+    num_iters=101,
+    num_warmup=2,
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -454,6 +482,8 @@ def mp_tuner(
                         in_datas[ref_data_index[k]],
                         task_group[k],
                         verbose,
+                        num_iters,
+                        num_warmup,
                     ),
                 ),
             )
