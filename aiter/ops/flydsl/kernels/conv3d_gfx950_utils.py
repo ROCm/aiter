@@ -34,6 +34,14 @@ BF16_BYTES = 2
 # moves per lane, and the width ds_write_b128 wants on the far side.
 LDG_VEC = 8
 
+# An offset no buffer descriptor can hold a record for, so the access is
+# dropped rather than performed: *2 = 0xFFFFFF00 bytes (~4.2950 GB), just under
+# the 2^32 a voffset spans. The gather sends a padded tap here to read zero,
+# and the epilogue a masked element to write nowhere -- in both cases turning
+# a predicate into an address, which needs no branch.
+OOB_SENTINEL_ELEM = 0x7FFFFF80
+OOB_SENTINEL_BYTES = OOB_SENTINEL_ELEM * BF16_BYTES
+
 # Compile hints applied to both conv3d kernels. Empty by default; a caller that
 # needs to pass FlyDSL a hint sets it before the first compile.
 CONV_COMPILE_HINTS = {}
@@ -69,6 +77,22 @@ def barrier(vmcnt=0, lgkmcnt=None):
 def sgpr(x):
     """Broadcast lane 0's value into a scalar register."""
     return fx.Int64(fx.rocdl.readfirstlane(T.i64, fx.Int64(x)))
+
+
+def flat_buffer_view(ptr, elems, num_records_bytes):
+    """A 1-D buffer view, on which ``slice(view, (None, off))`` is element ``off``.
+
+    Both the gather and the epilogue address their buffer by a flat element
+    index, so the view is one-dimensional over the buffer rather than the
+    tensor's own n-D layout: dividing that by a 1-element tile makes a slice
+    exactly one element, with no coordinate decomposition. ``elems`` only
+    shapes the view -- the sentinel above deliberately points past it, and
+    num_records, not the layout, is what turns that into a zero-fill.
+    """
+    buf = fx.rocdl.make_buffer_ptr(ptr, num_records_bytes=num_records_bytes)
+    return fx.logical_divide(
+        fx.make_view(buf, fx.make_layout(elems, 1)), fx.make_layout(1, 1)
+    )
 
 
 def in_range(v, hi):
