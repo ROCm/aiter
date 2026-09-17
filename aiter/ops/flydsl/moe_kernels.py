@@ -2469,12 +2469,12 @@ def _get_compiled_route_g2l_fused(weight_dtype: str):
 
 
 @functools.cache
-def _get_compiled_route_g2l_lds(weight_dtype: str):
+def _get_compiled_route_g2l_lds(weight_dtype: str, direct_mask: bool = False):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_route_g2l_lds_module,
     )
 
-    return build_moe_route_g2l_lds_module(weight_dtype)
+    return build_moe_route_g2l_lds_module(weight_dtype, direct_mask=direct_mask)
 
 
 def flydsl_moe_topids_to_rows(
@@ -2490,6 +2490,7 @@ def flydsl_moe_topids_to_rows(
     num_local_tokens: torch.Tensor | None = None,
     num_valid_routes: torch.Tensor | None = None,
     ep_rowmap: torch.Tensor | None = None,
+    contiguous_expert_mask: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -2592,25 +2593,49 @@ def flydsl_moe_topids_to_rows(
         )
         _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
         if _use_lds_reduce:
-            topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
+            topids_to_rows_kernel = _get_compiled_route_g2l_lds(
+                wdt, direct_mask=contiguous_expert_mask
+            )
+            route_args = [
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(g2l_lut),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+                ptr_arg(gather_w.reshape(-1)),
+                ptr_arg(num_valid_routes),
+            ]
+            if contiguous_expert_mask:
+                assert num_local_tokens is not None
+                route_args.append(ptr_arg(num_local_tokens.reshape(-1)[:1]))
+                route_args.extend(
+                    [numel, int(max_m), int(E), int(topk), route_grid]
+                )
+            else:
+                route_args.extend([numel, int(max_m), int(E), route_grid])
+            route_args.extend([ptr_arg(_ep_rowmap_ptr), int(_ep_rowmap_cap)])
+            topids_to_rows_kernel(
+                *route_args,
+                stream=torch.cuda.current_stream(),
+            )
         else:
+            # The plain device-atomic kernel has no ep_rowmap operands; passing
+            # them here would bind to stream.
             topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
-        topids_to_rows_kernel(
-            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-            ptr_arg(g2l_lut),
-            ptr_arg(counter),
-            ptr_arg(topids_to_rows),
-            ptr_arg(weight_in.to(torch.float32).reshape(-1)),
-            ptr_arg(gather_w.reshape(-1)),
-            ptr_arg(num_valid_routes),
-            numel,
-            int(max_m),
-            int(E),
-            route_grid,
-            ptr_arg(_ep_rowmap_ptr),
-            int(_ep_rowmap_cap),
-            stream=torch.cuda.current_stream(),
-        )
+            topids_to_rows_kernel(
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(g2l_lut),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+                ptr_arg(gather_w.reshape(-1)),
+                ptr_arg(num_valid_routes),
+                numel,
+                int(max_m),
+                int(E),
+                route_grid,
+                stream=torch.cuda.current_stream(),
+            )
     else:
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
@@ -2770,6 +2795,7 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(_null_i32),
             # src_scale: read only by the prequantized build, which this is not.
             ptr_arg(grouped_a1_scale.view(-1)),
+            *_routeks_ep_psum_args(device, None),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )
@@ -2858,6 +2884,9 @@ def _get_compiled_fused_route_psum_quant_scatter(
     topk: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    direct_ep: bool = False,
+    prequantized: bool = False,
+    src_scale_bytes_per_row: int = 0,
 ):
     """Compile and cache the fully-fused route+psum+quant+scatter kernel."""
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -2869,6 +2898,9 @@ def _get_compiled_fused_route_psum_quant_scatter(
         topk=topk,
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
+        direct_ep=direct_ep,
+        prequantized=prequantized,
+        src_scale_bytes_per_row=src_scale_bytes_per_row,
     )
 
 
@@ -2918,7 +2950,7 @@ def flydsl_moe_fused_route_psum_quant_scatter(
     # Zero-init defensively; in-kernel prefix sum writes these.
     starts = torch.zeros(E, dtype=torch.int32, device=device)
     psum = torch.zeros(E, dtype=torch.int32, device=device)
-    barrier = torch.zeros(2, dtype=torch.int32, device=device)
+    barrier = torch.zeros(5, dtype=torch.int32, device=device)
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
 
     grouped_a1 = torch.empty(
@@ -2956,10 +2988,19 @@ def flydsl_moe_fused_route_psum_quant_scatter(
         ptr_arg(hidden_flat),
         ptr_arg(grouped_a1.view(-1)),
         ptr_arg(grouped_a1_scale.view(-1)),
+        ptr_arg(count),
+        ptr_arg(grouped_a1_scale.view(-1)),
+        ptr_arg(count),
+        ptr_arg(count),
+        ptr_arg(count),
         numel,
         int(E),
         int(tile_m),
         num_workers,
+        0,
+        0,
+        1,
+        1,
         num_workers,
         stream=torch.cuda.current_stream(),
     )
@@ -2971,6 +3012,84 @@ def flydsl_moe_fused_route_psum_quant_scatter(
         starts,
         psum,
     )
+
+
+def flydsl_moe_fused_ep_route_quant_compact(
+    packed_input: torch.Tensor,
+    src_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weight: torch.Tensor,
+    num_valid_tokens: torch.Tensor,
+    *,
+    E: int,
+    tile_m: int,
+    contiguous_m: int,
+    wmma_rep: int,
+    quant_mode: str,
+    route_workspace,
+    tis: torch.Tensor,
+    ep_rowmap: torch.Tensor,
+    max_tok: int,
+    slot_stride: int,
+):
+    """Fuse direct-EP route, compact prefix, prequant scatter and rowmap."""
+    device = packed_input.device
+    token_num, topk = topk_ids.shape
+    model_dim = packed_input.shape[-1] * (2 if quant_mode == "fp4" else 1)
+    payload_bytes = model_dim // 2 if quant_mode == "fp4" else model_dim
+    scale_bytes = model_dim // 32
+    count, barrier, slots, starts, psum = route_workspace
+    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
+    grouped_payload = torch.empty(
+        (1, int(contiguous_m), payload_bytes), dtype=torch.uint8, device=device
+    )
+    grouped_scale = torch.empty(
+        (1, int(contiguous_m) // int(wmma_rep), scale_bytes * int(wmma_rep)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    cu_num = int(get_cu_num())
+    route_workers = min(32, cu_num)
+    quant_workers = (3 * cu_num) // 2
+    launch = _get_compiled_fused_route_psum_quant_scatter(
+        model_dim=model_dim,
+        topk=int(topk),
+        wmma_rep=int(wmma_rep),
+        quant_mode=quant_mode,
+        direct_ep=True,
+        prequantized=True,
+        src_scale_bytes_per_row=int(src_scale.shape[-1]),
+    )
+    launch(
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(count),
+        ptr_arg(slots),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        ptr_arg(barrier),
+        ptr_arg(topids_to_rows),
+        ptr_arg(packed_input.contiguous().view(-1)),
+        ptr_arg(grouped_payload.view(-1)),
+        ptr_arg(grouped_scale.view(-1)),
+        ptr_arg(num_valid_tokens.reshape(-1)[:1]),
+        ptr_arg(src_scale.contiguous().view(-1)),
+        ptr_arg(topk_weight.to(torch.float32).reshape(-1)),
+        ptr_arg(tis.reshape(-1)),
+        ptr_arg(ep_rowmap.reshape(-1)),
+        int(token_num * topk),
+        int(E),
+        int(tile_m),
+        route_workers,
+        quant_workers,
+        int(torch.cuda.current_device()),
+        int(max_tok),
+        int(slot_stride),
+        route_workers + quant_workers,
+        stream=torch.cuda.current_stream(),
+    )
+    return grouped_payload, grouped_scale, count, topids_to_rows, starts, psum
 
 
 # Fused grouped MX quant + scale-preshuffle (stage2 input prep)
@@ -3040,6 +3159,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     ksplit: bool = True,
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
+    fuse_ep_psum: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -3054,6 +3174,38 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         ksplit=ksplit,
         prequantized=prequantized,
         src_scale_bytes_per_row=src_scale_bytes_per_row,
+        fuse_ep_psum=fuse_ep_psum,
+    )
+
+
+def _routeks_ep_psum_args(device, ep_psum_params: dict | None):
+    """Extra routeks operands: live EP psum fusion, or compile-away dummies."""
+    if ep_psum_params is None:
+        empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=device)
+        return (
+            ptr_arg(empty_i32),
+            ptr_arg(empty_i32),
+            ptr_arg(empty_bf16),
+            ptr_arg(empty_i32),
+            ptr_arg(empty_i32),
+            0,
+            1,
+            1,
+            1,
+            1,
+        )
+    return (
+        ptr_arg(ep_psum_params["masked_m"].reshape(-1)),
+        ptr_arg(ep_psum_params["psum"].reshape(-1)),
+        ptr_arg(ep_psum_params["gather_w"].reshape(-1)),
+        ptr_arg(ep_psum_params["tis"].reshape(-1)),
+        ptr_arg(ep_psum_params["ep_rowmap"].reshape(-1)),
+        int(ep_psum_params["experts"]),
+        int(ep_psum_params["tile_m"]),
+        int(ep_psum_params["topk"]),
+        int(ep_psum_params["max_tok"]),
+        int(ep_psum_params["slot_stride"]),
     )
 
 
@@ -3081,6 +3233,7 @@ def flydsl_moe_fused_quant_preshuffle(
     # 16-row-interleaved WMMA form. The consuming GEMM must be built with
     # row_major_ascale so it does the interleave on its LDS->register read.
     row_major_scale: bool = False,
+    ep_psum_params: dict | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -3163,7 +3316,18 @@ def flydsl_moe_fused_quant_preshuffle(
         numel = int(topids_to_rows_i32.numel())
         grid_blocks = (numel + warps_per_block - 1) // warps_per_block
         remap_rows = row_starts is not None
-        if remap_rows:
+        fuse_ep_psum = ep_psum_params is not None
+        if fuse_ep_psum:
+            if int(ep_psum_params["experts"]) > 256:
+                raise ValueError(
+                    "ep_psum fusion requires experts_per_rank <= 256, "
+                    f"got {ep_psum_params['experts']}"
+                )
+            route_max_m_arg = int(ep_psum_params["route_max_m"])
+            if route_max_m_arg <= 0:
+                raise ValueError("ep_psum_params.route_max_m must be positive")
+            row_starts_i32 = masked_m
+        elif remap_rows:
             row_starts_i32 = row_starts.to(device=device, dtype=torch.int32).reshape(-1)
             route_max_m_arg = int(route_max_m)
             if route_max_m_arg <= 0:
@@ -3177,6 +3341,7 @@ def flydsl_moe_fused_quant_preshuffle(
         use_token_multidest = (
             not prequantized
             and not remap_rows
+            and not fuse_ep_psum
             and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
@@ -3231,6 +3396,7 @@ def flydsl_moe_fused_quant_preshuffle(
             src_scale_bytes_per_row=(
                 int(prequantized_scale.shape[-1]) if prequantized else 0
             ),
+            fuse_ep_psum=fuse_ep_psum,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
@@ -3256,6 +3422,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ptr_arg(
                 prequantized_scale.view(-1) if prequantized else out_scale.view(-1)
             ),
+            *_routeks_ep_psum_args(device, ep_psum_params),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )
