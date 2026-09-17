@@ -10,7 +10,7 @@ Two layers:
     ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table),
     ``bench_qsa_family_b_k1`` (2e/2f emit; 2g long-``L``; 2h published point),
-    ``bench_qsa_family_a_k2`` (3b decode ``M<=8`` and a separate 3c prefill table).
+    ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table).
 
 Usage::
 
@@ -641,11 +641,10 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
 
 @benchmark()
 def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
-    """Family A FlyDSL K2 decode vs oracle GQA; us vs live AMD sparse GQA.
+    """Family A FlyDSL K2 vs oracle GQA; us vs live AMD and #4882 Triton.
 
-    3b/3c: split-K plus LSE merge, group 12, D=256. Decode and prefill
-    share one instantiation. Expand and sigmoid stay unfused. Times are
-    recorded; this is not a win claim.
+    3d: tiled BLOCK_N MFMA QK, split-K plus LSE merge, group 12, D=256.
+    Expand and sigmoid stay unfused.
     """
     idx = FAMILY_A_INDEXER
     gqa = FAMILY_A_GQA
@@ -712,6 +711,26 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
         msg="vllm_amd GQA vs oracle",
     )
 
+    def attend_4882():
+        return qsa_sparse_paged_gqa(
+            q_gqa,
+            k_cache,
+            v_cache,
+            indices,
+            kv_table,
+            token_to_req,
+            backend="triton",
+        )
+
+    t4882_out, t4882_us = run_perftest(attend_4882)
+    t4882_err = checkAllclose(
+        ref.output,
+        t4882_out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 Triton GQA vs oracle",
+    )
+
     w = indices.shape[1]
     flops = 4 * m * gqa.n_heads * gqa.head_dim * w
     nbytes = (
@@ -729,6 +748,10 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
         "vllm_amd_gqa TFLOPS": flops / vllm_us / 1e6,
         "vllm_amd_gqa TB/s": nbytes / vllm_us / 1e6,
         "vllm_amd_gqa err": vllm_err,
+        "4882_triton_gqa us": t4882_us,
+        "4882_triton_gqa TFLOPS": flops / t4882_us / 1e6,
+        "4882_triton_gqa TB/s": nbytes / t4882_us / 1e6,
+        "4882_triton_gqa err": t4882_err,
     }
 
 
