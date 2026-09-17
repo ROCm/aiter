@@ -179,10 +179,12 @@ step scans -- input + output/2 -- after CSA's 4x KV compression:
     16K in / 4K out  -> (16384 + 2048) / 4 =  4608
     32K in / 16K out -> (32768 + 8192) / 4 = 10240
 
-The DSv4 ``mla_v4_decode`` op runs sparse decode with GQA/H=128, q_seq=1,
-batches 1/16/32/64/128/256/512/1024, KV lengths 140/256/384/512/1024/1152 and
-split counts 1/2/4. KV=140 is the HCA 1K-input/1K-output average-decode shape:
-128 SWA rows + floor((1024 + 512) / 128) compressed rows.
+The DSv4 ``mla_v4_decode`` entry runs both serving paths without requiring a
+separate EP/TP selector. The EP result uses ``test_pa_sparse_prefill.py`` at
+H=128 and N=512 for the CSA/HCA KV pools. The TP result keeps the
+``test_mla_v4_kargpreld.py`` asm-vs-Triton decode sweep. TP currently retains
+the shipped H=128 kernel coverage; the model-local H=32 path is not enabled by
+the kargpreld test/dispatcher yet.
 
 The DSv4 ``mla_v4_prefill`` op runs eight performance cases at H=128 and
 D=512: compressed prefix-pool rows 4096/16384, crossed with dense/sparse CSR
@@ -653,7 +655,36 @@ _MLA_V4_DSV4_SHAPES = [
     for kv_seq_lens in (140, 256, 384, 512, 1024, 1152)
     for num_kv_splits in (1, 2, 4)
 ]
+# EP uses the sparse-prefill test path at the model's unsharded H=128. These
+# are the CSA/HCA KV pools from the decode workload; the group label remains in
+# the result even where a KV length overlaps the TP kargpreld sweep.
+_MLA_V4_EP_HEADS = 128
+_MLA_V4_EP_BATCH = 512
+_MLA_V4_EP_KV_GROUPS = (
+    ("CSA", (384, 448, 512, 583, 640)),
+    ("HCA", (136, 138, 140, 142, 144)),
+)
+
+_MLA_V4_EP_KEEP = [
+    "scenario",
+    "kv_group",
+    "prec",
+    "mode",
+    "h",
+    "n",
+    "kv_seq_lens",
+    "total_tokens",
+    "opus us",
+    "opus TFLOPS",
+    "asm us",
+    "asm TFLOPS",
+    "opus/asm",
+    "kernel",
+]
+
 _MLA_V4_COMPARE_KEEP = [
+    "scenario",
+    "kv_group",
     "dtype",
     "data_init",
     "seed",
@@ -1770,17 +1801,108 @@ def _perf_ratio(num, den):
 
 
 def run_mla_v4_decode(args):
-    # Side-by-side asm (kargpreld) vs Triton sparse decode on the same shape grid.
+    """Run the EP and TP MLA decode paths from the existing combo trigger."""
     _unused_scale_init(args, "mla_v4_decode")
-    iters = args.mla_v4_kargpreld_iters
-    warmup = args.mla_v4_kargpreld_warmup
+    _run_mla_v4_decode_ep(args)
+    _run_mla_v4_decode_tp(args)
+
+
+def _run_mla_v4_decode_ep(args):
+    """Run the EP sparse-attention path over the CSA/HCA KV pools."""
+    try:
+        with _silence():
+            import test_pa_sparse_prefill as mla_v4_ep_mod
+    except Exception as exc:  # noqa: BLE001 - TP should still run if EP import fails
+        reason = f"{type(exc).__name__}: {exc}"
+        _print_table(
+            "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)",
+            [{"scenario": "EP", "err_msg": reason}],
+        )
+        _note_failure("mla_v4_decode [EP]", reason)
+        return
+
+    if args.data_init is not None:
+        print(
+            "[data init] mla_v4_decode [EP]: test_pa_sparse_prefill.py uses "
+            "its native initializer; --data-init still applies to the TP result",
+            flush=True,
+        )
+
+    rows = []
+    with _silence():
+        for group, kv_seq_lens in _MLA_V4_EP_KV_GROUPS:
+            for ctx in kv_seq_lens:
+                box = []
+                row = {
+                    "scenario": "EP",
+                    "kv_group": group,
+                    "kv_seq_lens": ctx,
+                }
+                try:
+                    with _smi_case(
+                        f"mla_v4_decode/scenario=EP/group={group}/"
+                        f"heads={_MLA_V4_EP_HEADS}/batch={_MLA_V4_EP_BATCH}/"
+                        f"ctx={ctx}/data=native/seed={args.seed}"
+                    ), _capture() as box:
+                        result = mla_v4_ep_mod.run_pa_sparse_prefill(
+                            n=_MLA_V4_EP_BATCH,
+                            h=_MLA_V4_EP_HEADS,
+                            d=512,
+                            total_pages=ctx,
+                            total_tokens=_MLA_V4_EP_BATCH,
+                            prec="fp8",
+                            mode="sparse",
+                            backends=("opus", "asm"),
+                            seed=args.seed,
+                            verify=False,
+                            bench=True,
+                        )
+                    if result is None:
+                        row["err_msg"] = "no supported EP backend"
+                    else:
+                        row.update(result)
+                        if (
+                            row.get("opus us") is not None
+                            and row.get("asm us") is not None
+                        ):
+                            row["opus/asm"] = _perf_ratio(
+                                row["opus us"], row["asm us"]
+                            )
+                except (RuntimeError, AssertionError, ValueError) as exc:
+                    msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+                    row["err_msg"] = msg
+                if box:
+                    _attach_kernel_profiles(
+                        {"rows": [row]}, _profile_kernel_blocks(box[0].splitlines())
+                    )
+                rows.append(row)
+
+    _print_table(
+        "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)",
+        rows,
+        keep=_MLA_V4_EP_KEEP,
+    )
+
+
+def _run_mla_v4_decode_tp(args):
+    """Run the existing kargpreld asm/Triton MLA decode comparison."""
     for mod in (mla_v4_kargpreld_mod, mla_v4_triton_mod):
-        mod._PERF["num_iters"] = iters
-        mod._PERF["num_warmup"] = warmup
+        mod._PERF["num_iters"] = args.mla_v4_kargpreld_iters
+        mod._PERF["num_warmup"] = args.mla_v4_kargpreld_warmup
     default_shapes = (
         _MLA_V4_DSV4_SHAPES if args.suite == "dsv4" else _MLA_V4_KARGPRELD_SHAPES
     )
     shapes = args.mla_v4_kargpreld_shapes or default_shapes
+    group = "custom" if args.mla_v4_kargpreld_shapes else "default"
+
+    # TODO: the model-local TP head count is 32, but the current gfx1250
+    # test_mla_v4_kargpreld.py test and dispatcher do not enable qh32-q1.
+    # Keep the existing supported head values until that kernel path is wired up.
+    _run_mla_v4_decode_tp_block(args, shapes, group)
+
+
+def _run_mla_v4_decode_tp_block(args, shapes, group):
+    """Run the TP asm/Triton comparison and emit its table and SMI labels."""
     data_inits = args.data_init or ["norm"]
     rows = []
     with _silence():
@@ -1789,6 +1911,8 @@ def run_mla_v4_decode(args):
         ):
             box = []
             row = {
+                "scenario": "TP",
+                "kv_group": group,
                 "data_init": data_init,
                 "seed": args.seed,
                 "gqa_ratio": gqa,
@@ -1798,7 +1922,8 @@ def run_mla_v4_decode(args):
             }
             try:
                 with _smi_case(
-                    f"mla_v4_decode/gqa={gqa}/batch={batch}/ctx={ctx}/"
+                    f"mla_v4_decode/scenario=TP/group={group}/gqa={gqa}/"
+                    f"batch={batch}/ctx={ctx}/"
                     f"split={split_kv}/data={data_init}/seed={args.seed}"
                 ), _capture() as box:
                     asm = mla_v4_kargpreld_mod.test_mla_v4_nm(
@@ -1820,7 +1945,10 @@ def run_mla_v4_decode(args):
                         seed=args.seed,
                     )
                 # Keep each UT's measured metrics together; no extra perf pass.
-                for candidate, prefix in (("v4_nm", "asm"), ("v4_nm_o16", "asm o16")):
+                for candidate, prefix in (
+                    ("v4_nm", "asm"),
+                    ("v4_nm_o16", "asm o16"),
+                ):
                     for metric in ("us", "TFLOPS", "TB/s", "err"):
                         key = f"{candidate} {metric}"
                         if key in asm:
@@ -1843,7 +1971,7 @@ def run_mla_v4_decode(args):
     for row in rows:
         row["dtype"] = "bf16"
     _print_table(
-        "mla_v4 decode (bf16, asm vs triton)",
+        "mla_v4 decode [TP] (bf16, asm vs triton)",
         rows,
         keep=_MLA_V4_COMPARE_KEEP,
     )
@@ -2152,8 +2280,8 @@ def main():
         nargs="*",
         default=None,
         metavar="GQA,BATCH,CTX,SPLIT",
-        help="Override curated shape grid as gqa,batch,ctx,split tuples "
-        "(default: suite-specific built-in grid)",
+        help="Override the TP kargpreld grid as gqa,batch,ctx,split tuples; "
+        "the DSv4 EP CSA/HCA grid remains fixed",
     )
     p.add_argument(
         "--mla-v4-kargpreld-iters",
