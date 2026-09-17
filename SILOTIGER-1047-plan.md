@@ -333,6 +333,13 @@ winning shapes. ``n_blocks > 512`` loses to HIP MQA + radix; 2b’s
 single-WG tile merge stays so those lengths still have oracle set
 equality. Do not resume long-L scorer work.
 
+A 64-bit MSD binary radix-select on the 1024-candidate tile (score order,
+then inverted id, 32 bits each, wave reduce + two barriers per bit) was
+measured and **not shipped**. Set equality held. Decode ``M=1`` at 8k /
+32k was ~126 / ~497 µs vs the kept bitonic ~106 / ~419 µs in the 2d
+HIP-loaded table. Sixty-four digit passes cost more barriers than the
+55-stage sort.
+
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
