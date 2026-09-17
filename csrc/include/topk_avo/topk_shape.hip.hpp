@@ -9,13 +9,18 @@
 // This is benchmark_topk.hip.cpp up to its AITER_EXPORT_END marker (the kernels
 // and their dispatch) followed by csrc/topk_aiter_entry.inc.hip (the aiter op
 // entry). The harness half of that file -- CPU/GPU verification oracles, timing,
-// CLI -- is deliberately not here.
+// CLI -- is deliberately not here. The source repo indents at 2; what you are
+// reading was reformatted to aiter's .clang-format on the way in, so this file
+// does not line up line-for-line with the source.
+//
+// Formatted by: AMD clang-format version 22.0.0git
+
 #pragma once
 
 #include "topk_common.hip.hpp"
 
 constexpr int SAMPLE_S_MIN = 4096;
-constexpr int R_TARGET = 179;
+constexpr int R_TARGET     = 179;
 // small_n stages the WHOLE row in LDS, so N sets its LDS footprint directly and
 // the boundary is a measured occupancy tradeoff, not a capacity one.
 //
@@ -28,8 +33,8 @@ constexpr int R_TARGET = 179;
 //
 // At N=32768 (128 KB per row) small_n loses at EVERY M (+3.8% to +45.7%), so
 // 16384 is the end of it, not a point on a continuing trend.
-constexpr int N_LDS_MAX = 8192;             // small_n at any M
-constexpr int N_LDS_MAX_SMALL_M = 16384;    // small_n only while M is small
+constexpr int N_LDS_MAX           = 8192;  // small_n at any M
+constexpr int N_LDS_MAX_SMALL_M   = 16384; // small_n only while M is small
 constexpr int N_LDS_SMALL_M_LIMIT = 256;
 
 // Hardware cap on the dynamic LDS one block may request. Asking for more makes
@@ -38,14 +43,14 @@ constexpr int N_LDS_SMALL_M_LIMIT = 256;
 constexpr int LDS_BYTES_PER_BLOCK_MAX = 160 * 1024;
 
 constexpr int PHASE_C_CAP_MAX = 8192;
-constexpr int WSTAGE_WAVES = 8;
-constexpr int WSTAGE_CAP = 320;
+constexpr int WSTAGE_WAVES    = 8;
+constexpr int WSTAGE_CAP      = 320;
 
 // gfx950 occupancy inputs for the small_n launch geometry. SMALL_N_STATIC_LDS is
 // the kernel's static __shared__ footprint, read off .group_segment_fixed_size
 // with the dynamic row buffer excluded.
-constexpr int LDS_BYTES_PER_CU = 160 * 1024;
-constexpr int CU_COUNT = 256;
+constexpr int LDS_BYTES_PER_CU    = 160 * 1024;
+constexpr int CU_COUNT            = 256;
 constexpr int TARGET_WAVES_PER_CU = 32;
 
 // Static __shared__ footprints, read off .group_segment_fixed_size with the
@@ -56,13 +61,15 @@ constexpr int PHASE_C_STATIC_LDS = 5408;
 
 static inline int grid_blocks_per_cu(int M) { return std::max(1, (M + CU_COUNT - 1) / CU_COUNT); }
 
-static inline int ilog2_floor(int v) {
-  int r = 0;
-  while (v > 1) {
-    v >>= 1;
-    r++;
-  }
-  return r;
+static inline int ilog2_floor(int v)
+{
+    int r = 0;
+    while(v > 1)
+    {
+        v >>= 1;
+        r++;
+    }
+    return r;
 }
 
 // Block size for the one-block-per-row select kernels, from measured occupancy
@@ -100,8 +107,8 @@ static inline int ilog2_floor(int v) {
 // Note the entries of 12 waves: the measured optimum is not always a power of
 // two (M=512 N=8192 wants 768 threads, 21.2 us, against 23.0 us at 512), which
 // the pow2-rounding formula cannot produce at all.
-constexpr int SMALLN_TAB_M = 13;
-constexpr int SMALLN_TAB_N = 3;
+constexpr int SMALLN_TAB_M       = 13;
+constexpr int SMALLN_TAB_N       = 3;
 constexpr int SMALLN_N_LOG2_BASE = 11;
 
 static const signed char kSmallNWaves[SMALLN_TAB_M][SMALLN_TAB_N] = {
@@ -114,32 +121,38 @@ static const signed char kSmallNWaves[SMALLN_TAB_M][SMALLN_TAB_N] = {
     /* M=64   */ {16, 16, 16},
     /* M=128  */ {16, 16, 16},
     /* M=256  */ {16, 16, 16},
-    /* M=512  */ { 8, 12, 12},
-    /* M=1024 */ { 6,  8,  8},
-    /* M=2048 */ { 4,  8,  8},
-    /* M=4096 */ { 4,  4,  8},
+    /* M=512  */ {8, 12, 12},
+    /* M=1024 */ {6, 8, 8},
+    /* M=2048 */ {4, 8, 8},
+    /* M=4096 */ {4, 4, 8},
 };
 
 // Returns threads, or -1 when the shape is off the table. Shapes between grid
 // points round DOWN on both axes. Every entry is >= 4 waves because
 // block_find_pivot_bucket indexes the 256 radix buckets by threadIdx.x and
 // silently drops the upper ones below 256 threads.
-static inline int small_n_threads_from_table(int M, int N) {
-  if (M < 1 || N < (1 << SMALLN_N_LOG2_BASE)) return -1;
-  const int mi = ilog2_floor(M);
-  const int ni = ilog2_floor(N) - SMALLN_N_LOG2_BASE;
-  if (mi >= SMALLN_TAB_M || ni < 0 || ni >= SMALLN_TAB_N) return -1;
-  return (int)kSmallNWaves[mi][ni] * WAVE_SIZE;
+static inline int small_n_threads_from_table(int M, int N)
+{
+    if(M < 1 || N < (1 << SMALLN_N_LOG2_BASE))
+        return -1;
+    const int mi = ilog2_floor(M);
+    const int ni = ilog2_floor(N) - SMALLN_N_LOG2_BASE;
+    if(mi >= SMALLN_TAB_M || ni < 0 || ni >= SMALLN_TAB_N)
+        return -1;
+    return (int)kSmallNWaves[mi][ni] * WAVE_SIZE;
 }
 
-static inline int occupancy_block_threads(int M, int lds_per_block, int load_cap_waves) {
-  const int lds_blocks = std::max(1, LDS_BYTES_PER_CU / std::max(1, lds_per_block));
-  const int g = grid_blocks_per_cu(M);
-  int waves = std::max(1, TARGET_WAVES_PER_CU / std::min(lds_blocks, g));
-  if (load_cap_waves > 0 && g > 1) waves = std::min(waves, load_cap_waves);
-  int pow2 = 1;
-  while (pow2 * 2 <= waves) pow2 *= 2;
-  return std::max(4, std::min(16, pow2)) * WAVE_SIZE;
+static inline int occupancy_block_threads(int M, int lds_per_block, int load_cap_waves)
+{
+    const int lds_blocks = std::max(1, LDS_BYTES_PER_CU / std::max(1, lds_per_block));
+    const int g          = grid_blocks_per_cu(M);
+    int waves            = std::max(1, TARGET_WAVES_PER_CU / std::min(lds_blocks, g));
+    if(load_cap_waves > 0 && g > 1)
+        waves = std::min(waves, load_cap_waves);
+    int pow2 = 1;
+    while(pow2 * 2 <= waves)
+        pow2 *= 2;
+    return std::max(4, std::min(16, pow2)) * WAVE_SIZE;
 }
 
 // Over-collection factor. The candidate count is the number of row elements
@@ -165,47 +178,56 @@ static inline int occupancy_block_threads(int M, int lds_per_block, int load_cap
 // M-dependence back explicitly, and nothing here does.
 //
 // See knowledge/known_bad.md ("A statistically tighter margin fails the gate").
-static float auto_margin(int K, int S, int N) {
-  const double r0 = (double)K * S / (double)N;
-  if (r0 < 9.0) return 4.0f;   // too few samples for the 3-sigma rule to mean anything
-  const double m = 1.0 / (1.0 - 3.0 / std::sqrt(r0));
-  return (float)std::min(std::max(m, 1.4), 3.0);
+static float auto_margin(int K, int S, int N)
+{
+    const double r0 = (double)K * S / (double)N;
+    if(r0 < 9.0)
+        return 4.0f; // too few samples for the 3-sigma rule to mean anything
+    const double m = 1.0 / (1.0 - 3.0 / std::sqrt(r0));
+    return (float)std::min(std::max(m, 1.4), 3.0);
 }
 
 // Upper edge of the same 3-sigma window, in candidates.
-static inline double candidate_hi(int K, int S, int N, double margin) {
-  const double R = std::max(1.0, margin * (double)K * (double)S / (double)N);
-  return margin * (double)K * (1.0 + 3.0 / std::sqrt(R));
+static inline double candidate_hi(int K, int S, int N, double margin)
+{
+    const double R = std::max(1.0, margin * (double)K * (double)S / (double)N);
+    return margin * (double)K * (1.0 + 3.0 / std::sqrt(R));
 }
 
-enum TopkPath : int {
-  PATH_AUTO = 0,
-  PATH_SMALL_N = 1,
-  PATH_PREFILL = 2,
-  PATH_DECODE = 3,
+enum TopkPath : int
+{
+    PATH_AUTO    = 0,
+    PATH_SMALL_N = 1,
+    PATH_PREFILL = 2,
+    PATH_DECODE  = 3,
 };
 
-struct ShapeParams {
-  TopkPath path;
-  int S;
-  float margin;
-  int rank;
-  int cap;
-  int coop_g;
-  bool keys_only_c;
-  bool geom_ok;
+struct ShapeParams
+{
+    TopkPath path;
+    int S;
+    float margin;
+    int rank;
+    int cap;
+    int coop_g;
+    bool keys_only_c;
+    bool geom_ok;
 };
 
-static inline int align_sample_s(int s) {
-  s = std::max(SAMPLE_S_MIN, std::min(SAMPLE_S_MAX, s));
-  return ((s + SAMPLE_CHUNK_ELEMS - 1) / SAMPLE_CHUNK_ELEMS) * SAMPLE_CHUNK_ELEMS;
+static inline int align_sample_s(int s)
+{
+    s = std::max(SAMPLE_S_MIN, std::min(SAMPLE_S_MAX, s));
+    return ((s + SAMPLE_CHUNK_ELEMS - 1) / SAMPLE_CHUNK_ELEMS) * SAMPLE_CHUNK_ELEMS;
 }
 
-static inline bool sampling_geometry_ok(int N, int S) {
-  if (S > SAMPLE_S_MAX || S % SAMPLE_CHUNK_ELEMS != 0) return false;
-  if (N % FP32_EPT != 0) return false;
-  const int chunks = S / SAMPLE_CHUNK_ELEMS;
-  return sample_chunk_stride(N, chunks) >= SAMPLE_CHUNK_ELEMS;
+static inline bool sampling_geometry_ok(int N, int S)
+{
+    if(S > SAMPLE_S_MAX || S % SAMPLE_CHUNK_ELEMS != 0)
+        return false;
+    if(N % FP32_EPT != 0)
+        return false;
+    const int chunks = S / SAMPLE_CHUNK_ELEMS;
+    return sample_chunk_stride(N, chunks) >= SAMPLE_CHUNK_ELEMS;
 }
 
 // Whether the chunk spacing divides N exactly, i.e. whether sample_chunk_stride()
@@ -220,12 +242,15 @@ static inline bool sampling_geometry_ok(int N, int S) {
 // runs, per-point sd 0.04-0.08%). The S the old rule forced was simply the
 // better one, so an exact stride still decides the choice and the mask only
 // widens what can be served at all.
-static inline bool sample_stride_exact(int N, int S) {
-  if (S > SAMPLE_S_MAX || S % SAMPLE_CHUNK_ELEMS != 0) return false;
-  if (N % FP32_EPT != 0) return false;
-  const int chunks = S / SAMPLE_CHUNK_ELEMS;
-  const int stride = N / chunks;
-  return stride >= SAMPLE_CHUNK_ELEMS && stride % FP32_EPT == 0;
+static inline bool sample_stride_exact(int N, int S)
+{
+    if(S > SAMPLE_S_MAX || S % SAMPLE_CHUNK_ELEMS != 0)
+        return false;
+    if(N % FP32_EPT != 0)
+        return false;
+    const int chunks = S / SAMPLE_CHUNK_ELEMS;
+    const int stride = N / chunks;
+    return stride >= SAMPLE_CHUNK_ELEMS && stride % FP32_EPT == 0;
 }
 
 // 0 = constant R_TARGET (shipped), 1 = derive S from the acceptance window.
@@ -252,30 +277,38 @@ static int g_s_rule = 0;
 // Only powers of two are reachable: the sampling geometry needs
 // (N / (S/64)) % 4 == 0, so for a power-of-two N the chunk count must also be a
 // power of two.
-static inline int derive_sample_s_for_n(int N, int K, float margin_unused) {
-  (void)margin_unused;
-  if (N < SAMPLE_S_MIN) {
-    const int chunks = std::max(1, N / SAMPLE_CHUNK_ELEMS);
-    return align_sample_s(chunks * SAMPLE_CHUNK_ELEMS);
-  }
-  if (g_s_rule == 0) {
-    const float m = auto_margin(K, SAMPLE_S_MAX, N);
-    const double s = R_TARGET * (double)N / ((double)m * (double)K);
-    return align_sample_s((int)std::lround(s));
-  }
-  for (int S = SAMPLE_S_MIN; S <= SAMPLE_S_MAX; S *= 2) {
-    if (!sample_stride_exact(N, S)) continue;
-    const double m = auto_margin(K, S, N);
-    if (candidate_hi(K, S, N, m) <= (double)PHASE_C_CAP_MAX) return S;
-  }
-  return SAMPLE_S_MAX;
+static inline int derive_sample_s_for_n(int N, int K, float margin_unused)
+{
+    (void)margin_unused;
+    if(N < SAMPLE_S_MIN)
+    {
+        const int chunks = std::max(1, N / SAMPLE_CHUNK_ELEMS);
+        return align_sample_s(chunks * SAMPLE_CHUNK_ELEMS);
+    }
+    if(g_s_rule == 0)
+    {
+        const float m  = auto_margin(K, SAMPLE_S_MAX, N);
+        const double s = R_TARGET * (double)N / ((double)m * (double)K);
+        return align_sample_s((int)std::lround(s));
+    }
+    for(int S = SAMPLE_S_MIN; S <= SAMPLE_S_MAX; S *= 2)
+    {
+        if(!sample_stride_exact(N, S))
+            continue;
+        const double m = auto_margin(K, S, N);
+        if(candidate_hi(K, S, N, m) <= (double)PHASE_C_CAP_MAX)
+            return S;
+    }
+    return SAMPLE_S_MAX;
 }
 
-static inline int derive_cap(int K, float margin, int S, int N) {
-  const double hi = candidate_hi(K, S, N, margin);
-  int cap = PHASE_C_CAP;
-  while (cap < (int)hi && cap < PHASE_C_CAP_MAX) cap *= 2;
-  return std::min(cap, PHASE_C_CAP_MAX);
+static inline int derive_cap(int K, float margin, int S, int N)
+{
+    const double hi = candidate_hi(K, S, N, margin);
+    int cap         = PHASE_C_CAP;
+    while(cap < (int)hi && cap < PHASE_C_CAP_MAX)
+        cap *= 2;
+    return std::min(cap, PHASE_C_CAP_MAX);
 }
 
 // Snap to a power of two. This used to skip G=2 and G=8 entirely, as a
@@ -285,10 +318,12 @@ static inline int derive_cap(int K, float margin, int S, int N) {
 // any G once a wave produced more than WSTAGE_CAP passers. With that fixed,
 // every G from 1 to 256 gives identical, correct candidate counts, so the
 // restriction is gone and G is a free tuning knob again.
-static inline int snap_coop_g(int g, int max_g) {
-  int p = 1;
-  while (p * 2 <= g) p *= 2;
-  return std::max(1, std::min(p, max_g));
+static inline int snap_coop_g(int g, int max_g)
+{
+    int p = 1;
+    while(p * 2 <= g)
+        p *= 2;
+    return std::max(1, std::min(p, max_g));
 }
 
 // Measured best log2(coop_g) over the customer pow2 grid: a full sweep of
@@ -305,8 +340,8 @@ static inline int snap_coop_g(int g, int max_g) {
 // Rows are log2(M) for M = 1..128; M >= 256 has enough rows to fill the GPU
 // without splitting any of them. Columns are log2(N) for N = 16384..1048576;
 // N <= 8192 takes the small_n path and never reaches here.
-constexpr int COOP_TAB_M = 8;
-constexpr int COOP_TAB_N = 7;
+constexpr int COOP_TAB_M       = 8;
+constexpr int COOP_TAB_N       = 7;
 constexpr int COOP_N_LOG2_BASE = 14;
 
 static const signed char kCoopLog2G[COOP_TAB_M][COOP_TAB_N] = {
@@ -321,101 +356,126 @@ static const signed char kCoopLog2G[COOP_TAB_M][COOP_TAB_N] = {
 };
 
 // Off-grid fallback, fitted to the same sweep: worst +27%, mean +6.1%.
-constexpr int COOP_TARGET_BLOCKS = 1024;
+constexpr int COOP_TARGET_BLOCKS      = 1024;
 constexpr int COOP_MIN_VEC4_PER_BLOCK = 256;
 
 // Shapes between grid points round DOWN on both axes, which keeps the value on
 // the conservative side of the measured optimum.
-static inline int coop_g_from_table(int M, int N, int max_g) {
-  if (M < 1 || M > 128 || N < (1 << COOP_N_LOG2_BASE)) return -1;
-  const int mi = ilog2_floor(M);
-  int ni = ilog2_floor(N) - COOP_N_LOG2_BASE;
-  if (mi >= COOP_TAB_M || ni < 0) return -1;
-  if (ni >= COOP_TAB_N) ni = COOP_TAB_N - 1;
-  return std::max(1, std::min(1 << (int)kCoopLog2G[mi][ni], max_g));
+static inline int coop_g_from_table(int M, int N, int max_g)
+{
+    if(M < 1 || M > 128 || N < (1 << COOP_N_LOG2_BASE))
+        return -1;
+    const int mi = ilog2_floor(M);
+    int ni       = ilog2_floor(N) - COOP_N_LOG2_BASE;
+    if(mi >= COOP_TAB_M || ni < 0)
+        return -1;
+    if(ni >= COOP_TAB_N)
+        ni = COOP_TAB_N - 1;
+    return std::max(1, std::min(1 << (int)kCoopLog2G[mi][ni], max_g));
 }
 
-static inline int choose_coop_g(int M, int N, int n4_per_row, int block, int override_g) {
-  const int max_g = std::max(1, n4_per_row / block);
-  if (override_g > 0) return snap_coop_g(override_g, max_g);
-  if (N <= N_LDS_MAX) return 1;
-  if (M >= 256) return 1;
-  const int t = coop_g_from_table(M, N, max_g);
-  if (t > 0) return t;
-  const int by_target = (M <= COOP_TARGET_BLOCKS) ? (COOP_TARGET_BLOCKS / M) : 1;
-  const int by_work = std::max(1, n4_per_row / COOP_MIN_VEC4_PER_BLOCK);
-  return snap_coop_g(std::min(by_target, by_work), max_g);
+static inline int choose_coop_g(int M, int N, int n4_per_row, int block, int override_g)
+{
+    const int max_g = std::max(1, n4_per_row / block);
+    if(override_g > 0)
+        return snap_coop_g(override_g, max_g);
+    if(N <= N_LDS_MAX)
+        return 1;
+    if(M >= 256)
+        return 1;
+    const int t = coop_g_from_table(M, N, max_g);
+    if(t > 0)
+        return t;
+    const int by_target = (M <= COOP_TARGET_BLOCKS) ? (COOP_TARGET_BLOCKS / M) : 1;
+    const int by_work   = std::max(1, n4_per_row / COOP_MIN_VEC4_PER_BLOCK);
+    return snap_coop_g(std::min(by_target, by_work), max_g);
 }
 
-static inline ShapeParams derive_shape_params(int M, int N, int K, float margin_override,
-                                              int sample_s_override, int coop_g_override,
-                                              TopkPath path_override) {
-  ShapeParams p{};
-  p.path = path_override;
-  const bool small_n_fits =
-      (N * (int)sizeof(uint32_t)) <= (LDS_BYTES_PER_BLOCK_MAX - SMALL_N_STATIC_LDS);
-  const bool small_n_wins = N <= N_LDS_MAX ||
-                            (N <= N_LDS_MAX_SMALL_M && M <= N_LDS_SMALL_M_LIMIT);
-  if (small_n_fits && (small_n_wins || path_override == PATH_SMALL_N) &&
-      (path_override == PATH_AUTO || path_override == PATH_SMALL_N)) {
-    p.path = PATH_SMALL_N;
-    p.S = 0;
-    p.margin = 1.f;
-    p.rank = 0;
-    p.cap = N;
-    p.coop_g = 1;
-    p.keys_only_c = false;
-    p.geom_ok = (N % FP32_EPT == 0 && K <= N);
-    return p;
-  }
-  if (path_override == PATH_SMALL_N && !small_n_fits) {
-    // Refuse rather than launch a kernel that cannot start.
-    p.path = PATH_SMALL_N;
-    p.geom_ok = false;
-    return p;
-  }
-
-  float margin = margin_override;
-  if (margin <= 0.f) {
-    int s0 = sample_s_override > 0 ? sample_s_override : derive_sample_s_for_n(N, K, 1.4f);
-    margin = auto_margin(K, s0, N);
-  }
-  int S = sample_s_override > 0 ? align_sample_s(sample_s_override) : derive_sample_s_for_n(N, K, margin);
-  if (!sample_stride_exact(N, S)) {
-    const int chunks = std::max(1, N / SAMPLE_CHUNK_ELEMS);
-    const int repaired = align_sample_s(chunks * SAMPLE_CHUNK_ELEMS);
-    // Take the repair when it buys an exact stride, which is every shape the
-    // old rule served and is why those keep their measured behaviour. When it
-    // does not -- N = 131328 repairs to 256 chunks of stride 513, still not a
-    // multiple of 4 -- the repair only inflates S for nothing, and the masked
-    // stride serves the S the law asked for. That shape used to be refused.
-    if (sample_stride_exact(N, repaired) || !sampling_geometry_ok(N, S)) S = repaired;
-  }
-  margin = margin_override > 0.f ? margin_override : auto_margin(K, S, N);
-  const double cap_margin = 0.85 * (double)PHASE_C_CAP_MAX / (double)K;
-  const double eff_margin = std::min((double)margin, cap_margin);
-  const int rank = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
-  const int cap = derive_cap(K, margin, S, N);
-
-  p.S = S;
-  p.margin = margin;
-  p.rank = rank;
-  p.cap = cap;
-  p.keys_only_c = cap > PHASE_C_CAP;
-  p.geom_ok = sampling_geometry_ok(N, S) && K <= cap;
-
-  const int n4 = N / FP32_EPT;
-  p.coop_g = choose_coop_g(M, N, n4, 512, coop_g_override);
-
-  if (path_override == PATH_AUTO) {
-    if (p.coop_g > 1 && M <= 256)
-      p.path = PATH_DECODE;
-    else
-      p.path = PATH_PREFILL;
-  } else {
+static inline ShapeParams derive_shape_params(int M,
+                                              int N,
+                                              int K,
+                                              float margin_override,
+                                              int sample_s_override,
+                                              int coop_g_override,
+                                              TopkPath path_override)
+{
+    ShapeParams p{};
     p.path = path_override;
-    if (p.path == PATH_DECODE && p.coop_g <= 1) p.coop_g = choose_coop_g(M, N, n4, 512, 64);
-    if (p.path == PATH_PREFILL) p.coop_g = 1;
-  }
-  return p;
+    const bool small_n_fits =
+        (N * (int)sizeof(uint32_t)) <= (LDS_BYTES_PER_BLOCK_MAX - SMALL_N_STATIC_LDS);
+    const bool small_n_wins =
+        N <= N_LDS_MAX || (N <= N_LDS_MAX_SMALL_M && M <= N_LDS_SMALL_M_LIMIT);
+    if(small_n_fits && (small_n_wins || path_override == PATH_SMALL_N) &&
+       (path_override == PATH_AUTO || path_override == PATH_SMALL_N))
+    {
+        p.path        = PATH_SMALL_N;
+        p.S           = 0;
+        p.margin      = 1.f;
+        p.rank        = 0;
+        p.cap         = N;
+        p.coop_g      = 1;
+        p.keys_only_c = false;
+        p.geom_ok     = (N % FP32_EPT == 0 && K <= N);
+        return p;
+    }
+    if(path_override == PATH_SMALL_N && !small_n_fits)
+    {
+        // Refuse rather than launch a kernel that cannot start.
+        p.path    = PATH_SMALL_N;
+        p.geom_ok = false;
+        return p;
+    }
+
+    float margin = margin_override;
+    if(margin <= 0.f)
+    {
+        int s0 = sample_s_override > 0 ? sample_s_override : derive_sample_s_for_n(N, K, 1.4f);
+        margin = auto_margin(K, s0, N);
+    }
+    int S = sample_s_override > 0 ? align_sample_s(sample_s_override)
+                                  : derive_sample_s_for_n(N, K, margin);
+    if(!sample_stride_exact(N, S))
+    {
+        const int chunks   = std::max(1, N / SAMPLE_CHUNK_ELEMS);
+        const int repaired = align_sample_s(chunks * SAMPLE_CHUNK_ELEMS);
+        // Take the repair when it buys an exact stride, which is every shape the
+        // old rule served and is why those keep their measured behaviour. When it
+        // does not -- N = 131328 repairs to 256 chunks of stride 513, still not a
+        // multiple of 4 -- the repair only inflates S for nothing, and the masked
+        // stride serves the S the law asked for. That shape used to be refused.
+        if(sample_stride_exact(N, repaired) || !sampling_geometry_ok(N, S))
+            S = repaired;
+    }
+    margin                  = margin_override > 0.f ? margin_override : auto_margin(K, S, N);
+    const double cap_margin = 0.85 * (double)PHASE_C_CAP_MAX / (double)K;
+    const double eff_margin = std::min((double)margin, cap_margin);
+    const int rank          = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
+    const int cap           = derive_cap(K, margin, S, N);
+
+    p.S           = S;
+    p.margin      = margin;
+    p.rank        = rank;
+    p.cap         = cap;
+    p.keys_only_c = cap > PHASE_C_CAP;
+    p.geom_ok     = sampling_geometry_ok(N, S) && K <= cap;
+
+    const int n4 = N / FP32_EPT;
+    p.coop_g     = choose_coop_g(M, N, n4, 512, coop_g_override);
+
+    if(path_override == PATH_AUTO)
+    {
+        if(p.coop_g > 1 && M <= 256)
+            p.path = PATH_DECODE;
+        else
+            p.path = PATH_PREFILL;
+    }
+    else
+    {
+        p.path = path_override;
+        if(p.path == PATH_DECODE && p.coop_g <= 1)
+            p.coop_g = choose_coop_g(M, N, n4, 512, 64);
+        if(p.path == PATH_PREFILL)
+            p.coop_g = 1;
+    }
+    return p;
 }
