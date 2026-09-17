@@ -493,6 +493,11 @@ class FmoeTuner(TunerCommon):
             help="GEMM1 search mode: prune by M_est (default) or search all legal "
             "variants (full); requires --mxfp4-flydsl.",
         )
+        self.parser.add_argument(
+            "--require-deterministic-reduction",
+            action="store_true",
+            help="Exclude atomic stage2 candidates whose route accumulation is not replay-deterministic.",
+        )
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
@@ -3938,6 +3943,11 @@ class FmoeTuner(TunerCommon):
                 model_dim=model_dim,
                 inter_dim=inter_dim,
             ).items():
+                if (
+                    getattr(self, "_require_deterministic_reduction", False)
+                    and kp["epilog"] == "atomic"
+                ):
+                    continue
                 kp = {**kp, "a_dtype": adtype}
                 # flat=0, v2=1
                 tasks.append(
@@ -4916,6 +4926,7 @@ class FmoeTuner(TunerCommon):
         args,
     ):
         mp_num = args.mp
+        self._require_deterministic_reduction = args.require_deterministic_reduction
         blockMs = [16, 32, 64, 128]
         keys = self.keys
         tasks = []
