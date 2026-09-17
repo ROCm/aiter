@@ -170,14 +170,13 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
     }
 #if (HIPBLASLT_VERSION_MAJOR >= 1) || \
     (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
-    if(bpreshuffle)
+    if(bpreshuffle && static_cast<int>(intype) != HIP_R_4F_E2M1)
     {
-        hipblasLtOrder_t orderA;
-        if(scaleA != nullptr)
-            orderA = HIPBLASLT_ORDER_COL16_4R16;
-        else
-            orderA = HIPBLASLT_ORDER_COL16_4R8;
-
+        // fp8/bf16 bpreshuffle swizzles matA (weight via the transpose trick).
+        // fp4 (MXFP4) swizzles matB instead — applied after matB is created —
+        // to match hipblaslt-bench's swizzleB convention.
+        hipblasLtOrder_t orderA
+            = (scaleA != nullptr) ? HIPBLASLT_ORDER_COL16_4R16 : HIPBLASLT_ORDER_COL16_4R8;
         CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
             matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
     }
@@ -197,8 +196,30 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, n, k, ldb));
     }
+#if (HIPBLASLT_VERSION_MAJOR >= 1) || \
+    (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
+    // MXFP4 STB kernels swizzle Tensile's B operand: put the COL16_4R32 order on
+    // matB (the preshuffled weight), matching hipblaslt-bench --swizzleB.
+    if(bpreshuffle && static_cast<int>(intype) == HIP_R_4F_E2M1)
+    {
+        hipblasLtOrder_t orderB = HIPBLASLT_ORDER_COL16_4R32;
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matB, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderB, sizeof(orderB)));
+    }
+#endif
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matC, outtype, m, n, ldc));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+    // MXFP4 (BLK32 scale) kernels require the compute-input type to be set
+    // explicitly; hipBLASLt-bench sets it to computeTypeToRealDataType(COMPUTE_32F)
+    // = HIP_R_32F. Without it the F4BS matmul returns INVALID_VALUE.
+    if(static_cast<int>(intype) == HIP_R_4F_E2M1)
+    {
+        hipDataType tci = HIP_R_32F;
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_COMPUTE_INPUT_TYPE_A_EXT, &tci, sizeof(void*)));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_COMPUTE_INPUT_TYPE_B_EXT, &tci, sizeof(void*)));
+    }
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &op_A, sizeof(int32_t)));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
@@ -217,8 +238,15 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA, sizeof(scaleA)));
+        if(bpreshuffle)
+        {
+            // MXFP4 block-32 e8m0 scales (hipblaslt-bench --scaleA 1001)
+            auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT;
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+                matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode_a, sizeof(scale_mode_a)));
+        }
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
+        else if(use_rowwise)
         {
             auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
             CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
@@ -230,8 +258,14 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB, sizeof(scaleB)));
+        if(bpreshuffle)
+        {
+            auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT;
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+                matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode_b, sizeof(scale_mode_b)));
+        }
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
+        else if(use_rowwise)
         {
             auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
             CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
@@ -266,20 +300,14 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
 
     std::vector<int> algoIndex;
     int returned_algo_count = heuristicResult.size();
-    // for (int i = 0; i < returnedAlgoCount; i++) {
+    // Match hipblaslt-bench's discoverValidIndices: take every algo returned by
+    // getAllAlgos and record its index, without a matmulIsAlgoSupported gate. That
+    // gate rejects all F4BS/MXFP4 algos on gfx950 (the run path in
+    // hipblasLtMatmul_sol_wrapper does not gate either — hipblasLtMatmul errors at
+    // dispatch if a chosen algo genuinely cannot serve the problem).
     for(int i = 0; i < returned_algo_count; i++)
     {
-        auto algo                 = heuristicResult[i].algo;
-        size_t ret_workspace_size = 0;
-        auto status               = hipblaslt_ext::matmulIsAlgoSupported(
-            handle, matmul, alpha, matA, matB, beta, matC, matC, algo, ret_workspace_size);
-        if(status == HIPBLAS_STATUS_SUCCESS)
-        {
-            if(ret_workspace_size < workspace_size)
-            {
-                algoIndex.push_back(hipblaslt_ext::getIndexFromAlgo(algo));
-            }
-        }
+        algoIndex.push_back(hipblaslt_ext::getIndexFromAlgo(heuristicResult[i].algo));
     }
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
@@ -759,14 +787,13 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     }
 #if (HIPBLASLT_VERSION_MAJOR >= 1) || \
     (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
-    if(bpreshuffle)
+    if(bpreshuffle && static_cast<int>(intype) != HIP_R_4F_E2M1)
     {
-        hipblasLtOrder_t orderA;
-        if(scaleA != nullptr)
-            orderA = HIPBLASLT_ORDER_COL16_4R16;
-        else
-            orderA = HIPBLASLT_ORDER_COL16_4R8;
-
+        // fp8/bf16 bpreshuffle swizzles matA (weight via the transpose trick).
+        // fp4 (MXFP4) swizzles matB instead — applied after matB is created —
+        // to match hipblaslt-bench's swizzleB convention.
+        hipblasLtOrder_t orderA
+            = (scaleA != nullptr) ? HIPBLASLT_ORDER_COL16_4R16 : HIPBLASLT_ORDER_COL16_4R8;
         CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
             matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
     }
@@ -786,23 +813,53 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, n, k, ldb));
     }
+#if (HIPBLASLT_VERSION_MAJOR >= 1) || \
+    (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
+    // MXFP4 STB kernels swizzle Tensile's B operand: put the COL16_4R32 order on
+    // matB (the preshuffled weight), matching hipblaslt-bench --swizzleB.
+    if(bpreshuffle && static_cast<int>(intype) == HIP_R_4F_E2M1)
+    {
+        hipblasLtOrder_t orderB = HIPBLASLT_ORDER_COL16_4R32;
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matB, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderB, sizeof(orderB)));
+    }
+#endif
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matC, outtype, m, n, ldc));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+    // MXFP4 (BLK32 scale) kernels require the compute-input type to be set
+    // explicitly; hipBLASLt-bench sets it to computeTypeToRealDataType(COMPUTE_32F)
+    // = HIP_R_32F. Without it the F4BS matmul returns INVALID_VALUE.
+    if(static_cast<int>(intype) == HIP_R_4F_E2M1)
+    {
+        hipDataType tci = HIP_R_32F;
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_COMPUTE_INPUT_TYPE_A_EXT, &tci, sizeof(void*)));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_COMPUTE_INPUT_TYPE_B_EXT, &tci, sizeof(void*)));
+    }
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &op_A, sizeof(int32_t)));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &op_B, sizeof(int32_t)));
 
-    // Set scale attributes with proper rowwise support
-    // hipBLASLt >= 1.0 supports rowwise scaling via OUTER_VEC mode
+    // Set scale attributes. Two modes:
+    //   use_rowwise=true  → OUTER_VEC_32F (FP8 per-row scaling)
+    //   bpreshuffle=true  → BLK32_UE8M0_32_8_EXT (MXFP4 per-block-32 e8m0 scaling,
+    //                        scaleA=1001 in hipblaslt-bench CLI terminology)
+    // These are mutually exclusive: bpreshuffle takes priority if both are set.
     if(scaleA != nullptr)
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA, sizeof(scaleA)));
-#if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
+        if(bpreshuffle)
         {
-            // Set the scale mode to OUTER_VEC for rowwise scaling on A
+            auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT;
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+                matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode_a, sizeof(scale_mode_a)));
+        }
+#if (HIPBLASLT_VERSION_MAJOR >= 1)
+        else if(use_rowwise)
+        {
             auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
             CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
                 matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode_a, sizeof(scale_mode_a)));
@@ -813,10 +870,15 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB, sizeof(scaleB)));
-#if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
+        if(bpreshuffle)
         {
-            // Set the scale mode to OUTER_VEC for rowwise scaling on B
+            auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT;
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+                matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode_b, sizeof(scale_mode_b)));
+        }
+#if (HIPBLASLT_VERSION_MAJOR >= 1)
+        else if(use_rowwise)
+        {
             auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
             CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
                 matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode_b, sizeof(scale_mode_b)));
@@ -1159,9 +1221,10 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     void *d_scaleA = nullptr, *d_scaleB = nullptr, *d_scaleOut = nullptr;
     bool use_rowwise = false;
 
-    // Determine scaling type if scales are provided
-    // The API expects scaleA for mat1 and scaleB for mat2 in the original orientation
-    if(scaleA.has_value() && scaleB.has_value())
+    // Determine scaling type if scales are provided.
+    // bpreshuffle implies MXFP4 block-scale mode (e8m0fnu scales) — skip get_scaling_type
+    // which hard-requires fp32 and is only relevant for per-tensor / rowwise FP8 paths.
+    if(!bpreshuffle_flag && scaleA.has_value() && scaleB.has_value())
     {
         // Determine scaling type based on original input dimensions (before transpose_result)
         // The scales should match mat1 (m_orig x k) and mat2 (k x n_orig)
@@ -1286,57 +1349,99 @@ void hipb_mm_out(const torch::Tensor&              mat1,
     auto mat2_sizes{mat2.sizes()};
 
     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
-    TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+    // For bpreshuffle (MXFP4): caller passes mat1=A[M,K//2], mat2=B[N,K//2].
+    // matA=activation(mat1, transA=T), matB=weight(mat2, transB=N, COL16_4R32
+    // swizzle) — exactly hipblaslt-bench's --transA T --transB N --swizzleB. These
+    // STB kernels emit D[M,N] COLUMN-major (ORDER_ROW is ignored), so the row-major
+    // result buffer receives Dᵀ. The caller therefore allocates result as [N, M]
+    // (row-major, ldc = M); result[n,m] = D[m,n]. This is the zero-copy contract —
+    // no transpose in the timed path — verify against ref.T.
+    // For non-bpreshuffle: caller passes mat1[M,K] mat2[K,N] and the original
+    // transpose_result=true trick applies as before, producing row-major [M,N].
+    TORCH_CHECK(bpreshuffle_flag
+                    ? (mat1_sizes[1] == mat2_sizes[1])   // A[M,K//2], B[N,K//2] — same K dim
+                    : (mat1_sizes[1] == mat2_sizes[0]),   // standard mat1[M,K] mat2[K,N]
+                "dimension mismatch");
 
     auto inDtype{mat1.options().dtype().toScalarType()};
     auto outDtype{result.options().dtype().toScalarType()};
 
+    // bpreshuffle output is col-major D[M,N] → result holds Dᵀ, shape [N, M].
+    // Non-bpreshuffle output is row-major, shape [M, N].
     TORCH_CHECK(result.dim() == 2
-                && result.sizes()[0] == mat1_sizes[0]
-                && result.sizes()[1] == mat2_sizes[1],
-                "result shape must be [", mat1_sizes[0], ", ", mat2_sizes[1], "]");
-
-    bool transpose_result = true;
-    bool transpose_mat1;
-    bool transpose_mat2;
-    if((mat2_strides[0] == 1) && (mat2_strides[1] >= std::max<int64_t>(1, mat2_sizes[0])))
-        transpose_mat2 = false;
-    else if((mat2_strides[1] == 1) && (mat2_strides[0] >= std::max<int64_t>(1, mat2_sizes[1])))
-        transpose_mat2 = true;
-    else
-        TORCH_CHECK(false, "unusual mat2 strides");
-
-    if((mat1_strides[0] == 1) && (mat1_strides[1] >= std::max<int64_t>(1, mat1_sizes[0])))
-        transpose_mat1 = false;
-    else if((mat1_strides[1] == 1) && (mat1_strides[0] >= std::max<int64_t>(1, mat1_sizes[1])))
-        transpose_mat1 = true;
-    else
-        TORCH_CHECK(false, "unusual mat1 strides");
-
-    if(transpose_result)
-    {
-        bool tmp       = transpose_mat1;
-        transpose_mat1 = !transpose_mat2;
-        transpose_mat2 = !tmp;
-        mat1_strides   = mat2.strides();
-        mat2_strides   = mat1.strides();
-        mat1_sizes     = mat2.sizes();
-        mat2_sizes     = mat1.sizes();
-    }
+                && result.sizes()[0] == (bpreshuffle_flag ? mat2_sizes[0] : mat1_sizes[0])
+                && result.sizes()[1] == (bpreshuffle_flag ? mat1_sizes[0] : mat2_sizes[0]),
+                bpreshuffle_flag ? "bpreshuffle result shape must be [N, M] (holds Dᵀ)"
+                                 : "result shape must be [M, N]");
 
     float one{1.0f};
     float zero{0.0f};
-    int64_t m         = mat1_sizes[transpose_result ? 1 : 0];
-    int64_t k         = mat1_sizes[transpose_result ? 0 : 1];
-    int64_t n         = mat2_sizes[transpose_result ? 0 : 1];
-    int64_t mat1_ld   = mat1_strides[(transpose_mat1 == transpose_result) ? 1 : 0];
-    int64_t mat2_ld   = mat2_strides[(transpose_mat2 == transpose_result) ? 1 : 0];
-    int64_t result_ld = result.stride(transpose_result ? 0 : 1);
+
+    int64_t m, n, k;
+    int64_t mat1_ld, mat2_ld, result_ld;
+    hipblasOperation_t op_A_direct, op_B_direct;
+
+    if(bpreshuffle_flag)
+    {
+        // Match hipblaslt-bench's MXFP4 convention exactly: matA = activation
+        // (mat1, transA=T, unswizzled), matB = weight (mat2, transB=N, swizzled
+        // with COL16_4R32). The STB kernels swizzle Tensile's B operand, so the
+        // preshuffled weight MUST be matB — placing it in matA (a transpose trick)
+        // lands the swizzle on the wrong operand and gives wrong results. The
+        // output D[M,N] is produced row-major via ORDER_ROW on matC/matD in
+        // hipblasLtMatmul_sol_wrapper, so no transpose is needed.
+        //
+        // hipBLASLt fp4 layouts count dims in LOGICAL fp4 elements, not packed
+        // bytes: K = 2 * (K//2). Leading dims are logical too (lda=ldb=K). Passing
+        // the packed K//2 makes the BLK32 scale check expect ceil((K//2)/32) blocks
+        // while we supply ceil(K/32) → hipblasLtMatmul returns INVALID_VALUE.
+        m = mat1_sizes[0];        // M (activation rows) → matC rows
+        n = mat2_sizes[0];        // N (weight rows)     → matC cols
+        k = mat1_sizes[1] * 2;    // K (logical fp4 elements)
+        mat1_ld   = k;            // lda = K (logical) for matA(activation), transA=T
+        mat2_ld   = k;            // ldb = K (logical) for matB(weight), transB=N
+        result_ld = result.stride(0); // ldd = N (row stride of row-major result[M,N])
+        op_A_direct = HIPBLAS_OP_T;   // activation [M,K//2] row-major → K×M
+        op_B_direct = HIPBLAS_OP_N;   // weight preshuffled, no additional transpose
+    }
+    else
+    {
+        // Original transpose_result=true path for non-bpreshuffle
+        bool transpose_mat1, transpose_mat2;
+        if((mat2_strides[0] == 1) && (mat2_strides[1] >= std::max<int64_t>(1, mat2_sizes[0])))
+            transpose_mat2 = false;
+        else if((mat2_strides[1] == 1) && (mat2_strides[0] >= std::max<int64_t>(1, mat2_sizes[1])))
+            transpose_mat2 = true;
+        else
+            TORCH_CHECK(false, "unusual mat2 strides");
+        if((mat1_strides[0] == 1) && (mat1_strides[1] >= std::max<int64_t>(1, mat1_sizes[0])))
+            transpose_mat1 = false;
+        else if((mat1_strides[1] == 1) && (mat1_strides[0] >= std::max<int64_t>(1, mat1_sizes[1])))
+            transpose_mat1 = true;
+        else
+            TORCH_CHECK(false, "unusual mat1 strides");
+
+        bool tmp       = transpose_mat1;
+        transpose_mat1 = !transpose_mat2;
+        transpose_mat2 = !tmp;
+        auto s1 = mat2.strides(); auto s2 = mat1.strides();
+        auto z1 = mat2.sizes();   auto z2 = mat1.sizes();
+
+        m         = z1[1];
+        k         = z1[0];
+        n         = z2[0];
+        mat1_ld   = s1[(transpose_mat1 == true) ? 1 : 0];
+        mat2_ld   = s2[(transpose_mat2 == true) ? 1 : 0];
+        result_ld = result.stride(0);
+        op_A_direct = transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        op_B_direct = transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+    }
 
     void *d_scaleA = nullptr, *d_scaleB = nullptr, *d_scaleOut = nullptr;
     bool use_rowwise = false;
 
-    if(scaleA.has_value() && scaleB.has_value())
+    // bpreshuffle → MXFP4 block-scale mode (e8m0fnu scales); skip fp32 check.
+    if(!bpreshuffle_flag && scaleA.has_value() && scaleB.has_value())
     {
         int64_t m_orig = mat1.sizes()[0];
         int64_t n_orig = mat2.sizes()[1];
@@ -1354,14 +1459,21 @@ void hipb_mm_out(const torch::Tensor&              mat1,
     if(scaleOut.has_value())
         d_scaleOut = static_cast<void*>(scaleOut.value().data_ptr());
 
-    if(transpose_result)
+    // Non-bpreshuffle uses the transpose_result trick (matA = weight = mat2), which
+    // also exchanges the scale pointers. bpreshuffle keeps bench's natural mapping
+    // (matA = activation = mat1, matB = weight = mat2), so no scale swap.
+    if(!bpreshuffle_flag)
         std::swap(d_scaleA, d_scaleB);
 
     auto hipblasInType  = dtype_map.at(inDtype);
     auto hipblasOutType = dtype_map.at(outDtype);
 
-    void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
-    void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
+    // bpreshuffle: matA = activation (mat1),   matB = weight (mat2, preshuffled).
+    // else:        matA = weight (mat2),       matB = activation (mat1) [transpose trick].
+    void* ptrA = bpreshuffle_flag ? static_cast<void*>(mat1.data_ptr())
+                                  : static_cast<void*>(mat2.data_ptr());
+    void* ptrB = bpreshuffle_flag ? static_cast<void*>(mat2.data_ptr())
+                                  : static_cast<void*>(mat1.data_ptr());
     void* ptrC{static_cast<void*>(result.data_ptr())};
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
@@ -1369,8 +1481,8 @@ void hipb_mm_out(const torch::Tensor&              mat1,
     void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
-                                                    transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
-                                                    transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                                                    op_A_direct,
+                                                    op_B_direct,
                                                     m, n, k,
                                                     &one,
                                                     ptrA, mat1_ld, d_scaleA,
@@ -1408,114 +1520,107 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                 mat1.dtype(),
                 " != ",
                 mat2.dtype());
-    TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+    // bpreshuffle: mat1=A[M,K//2], mat2=B[N,K//2] — same inner dim (K//2), direct layout.
+    // Standard:    mat1[M,K], mat2[K,N] — mat1.dim1 must equal mat2.dim0.
+    TORCH_CHECK(bpreshuffle
+                    ? (mat1_sizes[1] == mat2_sizes[1])
+                    : (mat1_sizes[1] == mat2_sizes[0]),
+                "dimension mismatch for K axis");
     TORCH_CHECK(!use_gelu || bias.has_value(),
                 "hipb_findallsols(use_gelu=True) currently requires bias for GELU_BIAS epilogue");
 
     auto inType{mat1.options().dtype().toScalarType()};
     auto outType{out_dtype.has_value() ? out_dtype.value() : inType};
 
+    // result shape: [M, N] where M=mat1.size(0), N=mat2.size(0) for bpreshuffle, mat2.size(1) otherwise
+    int64_t result_N = bpreshuffle ? mat2_sizes[0] : mat2_sizes[1];
     auto options{at::TensorOptions().dtype(outType).device(at::kCUDA)};
-    auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
-    bool transpose_result = true;
-    bool transpose_mat1;
-    bool transpose_mat2;
-    if((mat2_strides[0] == 1) && (mat2_strides[1] >= std::max<int64_t>(1, mat2_sizes[0])))
+    auto result{torch::empty({mat1_sizes[0], result_N}, options)};
+
+    float one{1.0f};
+    float zero{0.0f};
+    int64_t m, k, n, mat1_ld, mat2_ld, result_ld;
+    hipblasOperation_t op_A_fwd, op_B_fwd;
+
+    if(bpreshuffle)
     {
-        transpose_mat2 = false;
-    }
-    else if((mat2_strides[1] == 1) && (mat2_strides[0] >= std::max<int64_t>(1, mat2_sizes[1])))
-    {
-        transpose_mat2 = true;
-    }
-    else
-    {
-        assert(false && "unusual strides detected, may need to clone a contiguous tensor");
-    }
-    if((mat1_strides[0] == 1) && (mat1_strides[1] >= std::max<int64_t>(1, mat1_sizes[0])))
-    {
-        transpose_mat1 = false;
-    }
-    else if((mat1_strides[1] == 1) && (mat1_strides[0] >= std::max<int64_t>(1, mat1_sizes[1])))
-    {
-        transpose_mat1 = true;
+        m = mat1_sizes[0]; k = mat1_sizes[1]; n = mat2_sizes[0];
+        mat1_ld   = mat1_strides[0];
+        mat2_ld   = mat2_strides[0];
+        result_ld = result.stride(0);
+        op_A_fwd  = HIPBLAS_OP_T;
+        op_B_fwd  = HIPBLAS_OP_N;
     }
     else
     {
-        assert(false && "unusual strides detected, may need to clone a contiguous tensor");
-    }
-    if(transpose_result)
-    {
+        bool transpose_mat1, transpose_mat2;
+        bool transpose_result = true;
+        if((mat2_strides[0] == 1) && (mat2_strides[1] >= std::max<int64_t>(1, mat2_sizes[0])))
+            transpose_mat2 = false;
+        else if((mat2_strides[1] == 1) && (mat2_strides[0] >= std::max<int64_t>(1, mat2_sizes[1])))
+            transpose_mat2 = true;
+        else { assert(false); transpose_mat2 = false; }
+        if((mat1_strides[0] == 1) && (mat1_strides[1] >= std::max<int64_t>(1, mat1_sizes[0])))
+            transpose_mat1 = false;
+        else if((mat1_strides[1] == 1) && (mat1_strides[0] >= std::max<int64_t>(1, mat1_sizes[1])))
+            transpose_mat1 = true;
+        else { assert(false); transpose_mat1 = false; }
+
         bool tmp       = transpose_mat1;
         transpose_mat1 = !transpose_mat2;
         transpose_mat2 = !tmp;
-        mat1_strides   = mat2.strides();
-        mat2_strides   = mat1.strides();
-        mat1_sizes     = mat2.sizes();
-        mat2_sizes     = mat1.sizes();
+        auto s1 = mat2.strides(); auto s2 = mat1.strides();
+        auto z1 = mat2.sizes();   auto z2 = mat1.sizes();
+        m = z1[1]; k = z1[0]; n = z2[0];
+        mat1_ld   = s1[(transpose_mat1 == transpose_result) ? 1 : 0];
+        mat2_ld   = s2[(transpose_mat2 == transpose_result) ? 1 : 0];
+        result_ld = result.stride(0);
+        op_A_fwd  = transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        op_B_fwd  = transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     }
-    float one{1.0f};
-    float zero{0.0f};
-    int64_t m                  = mat1_sizes[transpose_result ? 1 : 0];
-    int64_t k                  = mat1_sizes[transpose_result ? 0 : 1];
-    int64_t n                  = mat2_sizes[transpose_result ? 0 : 1];
-    int64_t mat1_ld            = mat1_strides[(transpose_mat1 == transpose_result) ? 1 : 0];
-    int64_t mat2_ld            = mat2_strides[(transpose_mat2 == transpose_result) ? 1 : 0];
-    int64_t result_ld          = result.stride(transpose_result ? 0 : 1);
+
     hipDataType hipblasInType  = dtype_map.at(inType);
     hipDataType hipblasOutType = dtype_map.at(outType);
 
-    void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
-    void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
+    // bpreshuffle: A=mat1, B=mat2 direct. Non-bpreshuffle: transpose_result swapped.
+    void* ptrA = bpreshuffle ? static_cast<void*>(mat1.data_ptr())
+                             : static_cast<void*>(mat2.data_ptr());
+    void* ptrB = bpreshuffle ? static_cast<void*>(mat2.data_ptr())
+                             : static_cast<void*>(mat1.data_ptr());
     void* ptrC{static_cast<void*>(result.data_ptr())};
     auto current_stream{torch::hip::getCurrentHIPStream().stream()};
 
     auto bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
 
     auto scaleA_ptr = scaleA.has_value() ? static_cast<void*>(scaleA.value().data_ptr()) : nullptr;
-
     auto scaleB_ptr = scaleB.has_value() ? static_cast<void*>(scaleB.value().data_ptr()) : nullptr;
-
     auto scaleC_ptr = scaleC.has_value() ? static_cast<void*>(scaleC.value().data_ptr()) : nullptr;
 
+    // Non-bpreshuffle transpose_result swap also exchanges scale pointers.
+    if(!bpreshuffle) std::swap(scaleA_ptr, scaleB_ptr);
+
     bool use_rowwise = false;
-    if(scaleA.has_value() && scaleB.has_value())
+    if(!bpreshuffle && scaleA.has_value() && scaleB.has_value())
     {
         int64_t m_orig = mat1.sizes()[0];
         int64_t n_orig = mat2.sizes()[1];
-
         ScalingType scaling_type = get_scaling_type(scaleA.value(), scaleB.value(), m_orig, n_orig);
-
-        if(scaling_type == ScalingType::RowWise)
-        {
-            use_rowwise = true;
-        }
+        if(scaling_type == ScalingType::RowWise) use_rowwise = true;
     }
 
     return hipblasLtMatmul_findallsols_wrapper(hipblaslt_handle,
-                                               transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
-                                               transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
-                                               m,
-                                               n,
-                                               k,
+                                               op_A_fwd, op_B_fwd,
+                                               m, n, k,
                                                &one,
-                                               ptrA,
-                                               mat1_ld,
-                                               ptrB,
-                                               mat2_ld,
+                                               ptrA, mat1_ld,
+                                               ptrB, mat2_ld,
                                                &zero,
-                                               ptrC,
-                                               result_ld,
+                                               ptrC, result_ld,
                                                bias_ptr,
-                                               hipblasInType,
-                                               hipblasOutType,
-                                               scaleA_ptr,
-                                               scaleB_ptr,
-                                               scaleC_ptr,
+                                               hipblasInType, hipblasOutType,
+                                               scaleA_ptr, scaleB_ptr, scaleC_ptr,
                                                current_stream,
-                                               use_rowwise,
-                                               bpreshuffle,
-                                               use_gelu);
+                                               use_rowwise, bpreshuffle, use_gelu);
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
