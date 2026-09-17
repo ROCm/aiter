@@ -419,6 +419,71 @@ def top_k_per_row_prefill(
     )
 
 
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill_avo", develop=True)
+def _top_k_per_row_prefill_avo(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    workspace: torch.Tensor | None = None,
+) -> None: ...
+
+
+@compile_ops("module_top_k_per_row")
+def topk_avo_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
+
+
+@compile_ops("module_top_k_per_row")
+def topk_avo_supports(numRows: int, stride0: int, k: int) -> bool: ...
+
+
+def top_k_per_row_prefill_avo(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+) -> None:
+    """Per-row top-k (prefill) via the topk-prefill-avo kernels.
+
+    Same call shape as top_k_per_row_prefill, and the same workspace rule: this
+    allocates on the Python side so the C++ never allocates device scratch. The
+    buffer is plain scratch rather than the zeroed, self-resetting kind the mb
+    path needs -- Phase A clears the counters it shares before anything reads
+    them, and the small_n path uses no workspace at all.
+
+    Two restrictions, both reported rather than assumed. `values` must be None:
+    these kernels emit indices only. And rows are selected over their full
+    `stride0` extent, so rowStarts/rowEnds are checked for shape but their
+    contents are ignored; ragged rows need the per-row extent threaded into each
+    phase kernel and are not served yet. Call topk_avo_supports() first -- the
+    shapes it declines (k above the Phase C LDS cap, a row width that is not a
+    multiple of 4) raise rather than fall back."""
+    size = topk_avo_workspace_size(numRows, stride0, k)
+    workspace = get_topk_scratch_workspace(logits.device, size)
+    return _top_k_per_row_prefill_avo(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        workspace,
+    )
+
+
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,

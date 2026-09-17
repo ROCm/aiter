@@ -177,6 +177,38 @@ def run_top_k_per_row_prefill(
 
 
 @perftest()
+def run_top_k_per_row_prefill_avo(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    num_rows: int,
+    stride_row: int,
+    stride_col: int,
+    k: int = 2048,
+) -> None:
+    """Run the topk-prefill-avo kernels through the same timing harness.
+
+    Same arguments as run_top_k_per_row_prefill so the two are measured under
+    one decorator rather than two, which is the only way the numbers are
+    comparable: @perftest() sizes its argument rotation from the input, so a
+    separately written loop would not defeat L2 the same way.
+    """
+    return aiter.top_k_per_row_prefill_avo(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values,
+        num_rows,
+        stride_row,
+        stride_col,
+        k=k,
+    )
+
+
+@perftest()
 def run_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -241,10 +273,19 @@ def run_top_k_per_row_decode(
 
 @benchmark()
 def test_top_k_per_row_prefill(
-    num_rows: int, num_prefix: int, top_k: int, data_generation: str = "random"
+    num_rows: int,
+    num_prefix: int,
+    top_k: int,
+    data_generation: str = "random",
+    backend: str = "aiter",
 ) -> dict:
     """
     Test topk_per_row_prefill.
+
+    `backend` picks which selector runs: "aiter" for top_k_per_row_prefill,
+    "avo" for the topk-prefill-avo kernels. Both go through the same data,
+    the same torch.topk reference and the same @perftest timing, so the `us`
+    column is comparable across the two rows of the summary table.
     """
     ret = {}
     torch.set_default_device("cuda:0")
@@ -260,18 +301,46 @@ def test_top_k_per_row_prefill(
 
     torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
 
-    # Run the kernel
-    _, us = run_top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices,
-        None,  # values
-        num_rows,
-        logits.stride(0),
-        logits.stride(1),
-        k=top_k,
-    )
+    # The avo kernels select over the full `stride0` extent and emit indices
+    # only, so record up front the two things that decide whether this shape is
+    # inside their contract: whether they accept the geometry at all, and
+    # whether any row is shorter than top_k (which is what needs the per-row
+    # extent honoured and the -1 padding emitted).
+    min_row_len = int((row_ends - row_starts).min())
+    ret["backend"] = backend
+    ret["min_row_len"] = min_row_len
+    if backend == "avo":
+        if not aiter.topk_avo_supports(num_rows, logits.stride(0), top_k):
+            ret["context_len"] = logits.shape[1]
+            ret["all_close"] = None
+            ret["us"] = float("nan")
+            ret["note"] = "unsupported geometry"
+            return ret
+        _, us = run_top_k_per_row_prefill_avo(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            None,  # values: these kernels emit indices only
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=top_k,
+        )
+        ret["note"] = "" if min_row_len >= top_k else "needs ragged rows"
+    else:
+        _, us = run_top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            None,  # values
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=top_k,
+        )
+        ret["note"] = ""
 
     # Run reference implementation
     torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)[1]
@@ -459,6 +528,18 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--prefill_backend",
+    type=str,
+    default=["aiter"],
+    choices=["aiter", "avo"],
+    nargs="+",
+    help="""which prefill selector to measure: `aiter` for
+    top_k_per_row_prefill, `avo` for the topk-prefill-avo kernels. Pass both to
+    get one summary table with a row per backend per shape.
+    e.g.: --prefill_backend aiter avo""",
+)
+
+parser.add_argument(
     "-b",
     "--decode_batch_size",
     type=int,
@@ -500,8 +581,11 @@ for data_generation in args.data_generation:
     for m in args.context_len:
         for k in args.top_k:
             for num_prefix in args.num_prefix:
-                ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
-                df.append(ret)
+                for backend in args.prefill_backend:
+                    ret = test_top_k_per_row_prefill(
+                        m, num_prefix, k, data_generation, backend=backend
+                    )
+                    df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)

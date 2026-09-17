@@ -2312,7 +2312,29 @@ namespace py = pybind11;
           py::arg("stride0"),                    \
           py::arg("k"),                          \
           py::arg("is_decode"));                 \
-    m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
+    m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0")); \
+    m.def("top_k_per_row_prefill_avo",           \
+          &top_k_per_row_prefill_avo,            \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("indices"),                    \
+          py::arg("values"),                     \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt);  \
+    m.def("topk_avo_workspace_size",             \
+          &topk_avo_workspace_size,              \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"));                         \
+    m.def("topk_avo_supports",                   \
+          &topk_avo_supports,                    \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"));
 
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \
