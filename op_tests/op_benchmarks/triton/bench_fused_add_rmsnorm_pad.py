@@ -78,7 +78,12 @@ def run_benchmark(args):
         eps = 1e-6
 
         fn = lambda: fused_add_rmsnorm_pad(
-            x, weight, eps, res, pad_to_multiple, backend
+            x,
+            weight,
+            eps,
+            res=res,
+            x_pad_to_multiple=pad_to_multiple,
+            backend=backend,
         )
 
         n_out = (
