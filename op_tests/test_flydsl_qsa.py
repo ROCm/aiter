@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA oracle, family A plumbing, live vLLM AMD, #4882 Triton/Gluon, FlyDSL K1.
+"""QSA oracle, family A plumbing, live vLLM AMD, #4882 Triton/Gluon, FlyDSL K1/K2.
 
 Two layers:
   * Correctness (pytest gate): ``test_*`` unit cases.
@@ -9,7 +9,8 @@ Two layers:
     ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
     ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table),
-    ``bench_qsa_family_b_k1`` (2e/2f emit; 2g long-``L``; 2h published point).
+    ``bench_qsa_family_b_k1`` (2e/2f emit; 2g long-``L``; 2h published point),
+    ``bench_qsa_family_a_k2`` (3a decode ``M<=8`` vs live AMD GQA).
 
 Usage::
 
@@ -43,6 +44,7 @@ from aiter.ops.flydsl.qsa import (
     qsa_indexer_scores,
     qsa_k1_family_a_block_ids,
     qsa_k1_family_b_block_ids,
+    qsa_k2_family_a,
     qsa_oracle,
     qsa_sparse_gqa,
     qsa_topk_blocks,
@@ -484,6 +486,42 @@ def test_k1_family_a_set_equality_prefill():
         raise AssertionError("K1 prefill block-id set diverged from the oracle")
 
 
+def test_k2_family_a_decode_matches_oracle():
+    """Family A FlyDSL K2 decode matches qsa_sparse_gqa on paged K/V."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 2, 64, 16, 8
+    torch.manual_seed(0)
+    q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    assert torch.equal(kv_table, kv_table_v)
+    ref = qsa_sparse_gqa(q, k, v, indices)
+    out = qsa_k2_family_a(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="flydsl K2 vs oracle GQA",
+    )
+    if err != 0:
+        raise AssertionError(f"K2 decode diverged from the oracle (err={err})")
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
@@ -562,6 +600,98 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
         "vllm_amd_select TFLOPS": flops / vllm_us / 1e6,
         "vllm_amd_select TB/s": nbytes / vllm_us / 1e6,
         "vllm_amd_select err": vllm_err,
+    }
+
+
+@benchmark()
+def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
+    """Family A FlyDSL K2 decode vs oracle GQA; us vs live AMD sparse GQA.
+
+    3a: one WG per (row, kv_head), group 12, D=256. Expand and sigmoid stay
+    unfused. Times are recorded; this is not a win claim.
+    """
+    idx = FAMILY_A_INDEXER
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_family_a(
+        k_bar, k, v, page_size, device
+    )
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    kv_table = kv_table.contiguous()
+    ref = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=FAMILY_A_SCORE_SCALE,
+        out_dtype=dtypes.fp32,
+    )
+    indices = ref.indices.contiguous()
+
+    def k2():
+        return qsa_k2_family_a(q_gqa, k_cache, v_cache, indices, kv_table, token_to_req)
+
+    out, k2_us = run_perftest(k2)
+    k2_err = checkAllclose(
+        ref.output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="flydsl K2 vs oracle GQA",
+    )
+
+    def attend():
+        return qsa_sparse_paged_attention(
+            q_gqa, k_cache, v_cache, indices, kv_table, token_to_req
+        )
+
+    vllm_out, vllm_us = run_perftest(attend)
+    vllm_err = checkAllclose(
+        ref.output,
+        vllm_out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="vllm_amd GQA vs oracle",
+    )
+
+    w = indices.shape[1]
+    flops = 4 * m * gqa.n_heads * gqa.head_dim * w
+    nbytes = (
+        m * gqa.n_heads * gqa.head_dim * 2 + 2 * w * gqa.kv_heads * gqa.head_dim
+    ) * dtype.itemsize
+    return {
+        "gfx": get_gfx(),
+        "n_blocks": n_blocks,
+        "width": w,
+        "flydsl_k2 us": k2_us,
+        "flydsl_k2 TFLOPS": flops / k2_us / 1e6,
+        "flydsl_k2 TB/s": nbytes / k2_us / 1e6,
+        "flydsl_k2 err": k2_err,
+        "vllm_amd_gqa us": vllm_us,
+        "vllm_amd_gqa TFLOPS": flops / vllm_us / 1e6,
+        "vllm_amd_gqa TB/s": nbytes / vllm_us / 1e6,
+        "vllm_amd_gqa err": vllm_err,
     }
 
 
@@ -1264,7 +1394,8 @@ def _run_unit_cases():
     test_k1_family_b_set_equality_two_tiles()
     test_k1_family_b_set_equality_two_tiles_h8()
     test_k1_family_b_set_equality_published_indexer_point()
-    aiter.logger.info("QSA oracle + K1 unit cases passed")
+    test_k2_family_a_decode_matches_oracle()
+    aiter.logger.info("QSA oracle + K1 + K2 unit cases passed")
 
 
 def main():
@@ -1272,7 +1403,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Family A QSA + vLLM AMD + #4882 + FlyDSL K1; family B #4882 + K1",
+        description="Family A QSA + vLLM AMD + #4882 + FlyDSL K1/K2; family B #4882 + K1",
     )
     parser.add_argument(
         "-d",
@@ -1388,6 +1519,22 @@ def main():
             df = pd.DataFrame(rows)
             aiter.logger.info(
                 "QSA family A FlyDSL K1 summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size in itertools.product(
+            [b for b in args.batch if b <= 8],
+            args.seq,
+            args.page_size,
+        ):
+            if m > seq_len:
+                continue
+            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype))
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family A FlyDSL K2 decode summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
