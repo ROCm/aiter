@@ -58,6 +58,8 @@ def pa_decode_flydsl(
 
     Pass ``work_plan`` by keyword. The ``ps`` compatibility argument precedes
     ``sinks`` and is accepted and ignored.
+    ``work_plan`` is available through this Python API; the registered
+    ``torch.ops.aiter.pa_decode_flydsl`` operator uses static scheduling.
     """
     del ps
     if _pa_decode_flydsl is None:
@@ -97,6 +99,7 @@ direct_register_custom_op(
     "pa_decode_flydsl",
     pa_decode_flydsl,
     ["output", "exp_sums", "max_logits", "temporary_output"],
+    python_only_args=("work_plan",),
 )
 
 
