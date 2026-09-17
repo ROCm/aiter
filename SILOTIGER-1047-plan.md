@@ -146,6 +146,13 @@ them.
   indexer win from DSA `H=32` FP8 numbers. End-to-end gate is the **whole
   chain** (launches, bytes, and fused K1/K2), not a single kernel vs its Triton
   twin in isolation.
+- **Cache policy (`--rotate`).** Perf rows share one `run_perftest`
+  `num_rotate_args` across every named backend. Default `[1]` is hot (reuse
+  one buffer set; existing GPU-6 tables). `0` auto-sizes extra copies from
+  L2; `N>1` is explicit copies. Timed calls pass paged caches as args so
+  deepcopy actually clones them — zero-arg closures cannot rotate. Do not
+  compare a cold FlyDSL cell to a hot rival or to #4882's published
+  `do_bench` µs. HIP-graph replay stays hot (addresses are captured).
 - **AITER fused MoE / tgemm / vision FA** may be on in the same process; they
   are **not** QSA baselines.
 - **Gate (after a kernel exists).** Both layers:
