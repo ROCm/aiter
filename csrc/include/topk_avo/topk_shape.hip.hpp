@@ -265,17 +265,42 @@ static inline bool sample_stride_exact(int N, int S)
     return stride >= SAMPLE_CHUNK_ELEMS && stride % FP32_EPT == 0;
 }
 
-// 0 = constant R_TARGET (shipped), 1 = derive S from the acceptance window.
+// How S is chosen: 0 = constant R_TARGET, 1 = derive S from the acceptance
+// window, -1 = per-region (shipped).
 //
-// Rule 1 is FALSIFIED as a global replacement and kept only so the measurement
-// can be reproduced: it wins 5-7.5% at M <= 8 but regresses the anchor
-// M=4096 N=131072 by +3.9% (615.5 -> 639.4 us, over the 620 us limit) and
-// M=64 N=262144 by +17.4%, for an overall geomean of just -0.91%.
-// Why: a smaller S forces a larger margin and a larger cap, so it trades
-// phase_a work for candidate volume. At small M phase_a's single-block cost
-// dominates and the trade pays; at large M the extra 52% of candidates that
-// Phase B writes and Phase C selects costs more than phase_a saves.
-static int g_s_rule = 0;
+// Rule 1 is FALSIFIED as a GLOBAL replacement and always was: it regresses
+// M=64 N=262144 and M=256 N=262144 hard. But it is right in a region, and the
+// region is larger than the v3-era note claimed ("wins 5-7.5% at M <= 8").
+// Re-measured on g_22, rule 1 against rule 0, warmup 20 / iters 100 / repeats 9:
+//
+//   M       N=131072   N=262144   N=524288
+//   1         -5.8%      -6.9%      -6.1%
+//   2         -3.0%      -7.7%      -6.2%
+//   4         -1.2%      -7.2%      -5.9%
+//   8         -1.6%      -7.7%      -7.7%
+//   16        -1.5%     -10.8%      -6.8%
+//   32        -2.8%      -9.5%      -4.0%
+//   64        -1.7%     +17.2%      -3.3%
+//   128       +0.6%     +19.6%      +5.6%
+//   256       +1.3%     +23.9%      +4.0%
+//   1024      +3.6%      +5.3%      +1.9%
+//   4096      +1.6%      +3.4%      +0.9%
+//
+// So the boundary is M, and M=64 is where it turns: it wins at two of the three
+// N and loses 17.2% at the third, so it stays on rule 0. M <= 32 takes rule 1.
+//
+// Why there is a boundary at all: a smaller S forces a larger margin and a
+// larger cap, trading phase_a work for candidate volume. At small M phase_a's
+// single-block cost dominates and the trade pays; at large M the extra
+// candidates Phase B writes and Phase C selects cost more than phase_a saves.
+//
+// The v3-era note also reported the anchor at +3.9% under rule 1; it measures
+// +1.7% on g_22. Either way the anchor keeps rule 0.
+static int g_s_rule         = -1;
+constexpr int S_RULE1_M_MAX = 32;
+
+static inline int effective_s_rule(int M)
+{ return g_s_rule >= 0 ? g_s_rule : (M <= S_RULE1_M_MAX ? 1 : 0); }
 
 // 1 = search for the smallest exact-stride S at or above the law's S (v5
 // Stage 3); 0 = the v4 behaviour, which offered a single candidate and so took
@@ -294,7 +319,7 @@ static int g_s_repair_search = 1;
 // Only powers of two are reachable: the sampling geometry needs
 // (N / (S/64)) % 4 == 0, so for a power-of-two N the chunk count must also be a
 // power of two.
-static inline int derive_sample_s_for_n(int N, int K, float margin_unused)
+static inline int derive_sample_s_for_n(int M, int N, int K, float margin_unused)
 {
     (void)margin_unused;
     if(N < SAMPLE_S_MIN)
@@ -302,13 +327,21 @@ static inline int derive_sample_s_for_n(int N, int K, float margin_unused)
         const int chunks = std::max(1, N / SAMPLE_CHUNK_ELEMS);
         return align_sample_s(chunks * SAMPLE_CHUNK_ELEMS);
     }
-    if(g_s_rule == 0)
+    if(effective_s_rule(M) == 0)
     {
         const float m  = auto_margin(K, SAMPLE_S_MAX, N);
         const double s = R_TARGET * (double)N / ((double)m * (double)K);
         return align_sample_s((int)std::lround(s));
     }
-    for(int S = SAMPLE_S_MIN; S <= SAMPLE_S_MAX; S *= 2)
+    // Steps by SAMPLE_CHUNK_ELEMS, not by doubling. Doubling only ever considers
+    // powers of two, and a non-pow2 N has no exact stride at those, so the loop
+    // walked all the way to SAMPLE_S_MAX and rule 1 ended up asking for MORE
+    // sampling than rule 0 -- the opposite of its purpose. Measured at M=1 with
+    // the doubling form: N=65532 4160 -> 16384 (+21.5%), N=131068 8256 -> 16384
+    // (+13.2%), N=32832 4608 -> 8192 (+8.1%), against -4.6% to -7.3% everywhere
+    // it actually reduced S. Same fix as the exact-stride repair in v5 Stage 3;
+    // that one was applied to the repair and this search was left behind.
+    for(int S = SAMPLE_S_MIN; S <= SAMPLE_S_MAX; S += SAMPLE_CHUNK_ELEMS)
     {
         if(!sample_stride_exact(N, S))
             continue;
@@ -479,11 +512,11 @@ static inline ShapeParams derive_shape_params(int M,
     float margin = margin_override;
     if(margin <= 0.f)
     {
-        int s0 = sample_s_override > 0 ? sample_s_override : derive_sample_s_for_n(N, K, 1.4f);
+        int s0 = sample_s_override > 0 ? sample_s_override : derive_sample_s_for_n(M, N, K, 1.4f);
         margin = auto_margin(K, s0, N);
     }
     int S = sample_s_override > 0 ? align_sample_s(sample_s_override)
-                                  : derive_sample_s_for_n(N, K, margin);
+                                  : derive_sample_s_for_n(M, N, K, margin);
     if(!sample_stride_exact(N, S))
     {
         const int chunks   = std::max(1, N / SAMPLE_CHUNK_ELEMS);
