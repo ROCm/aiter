@@ -26,7 +26,9 @@ from aiter import (
     dtype2str_dict,
     dtypes,
 )
+from aiter.fhmoe import _use_fhmoe_wrappers
 from aiter.fused_moe import (
+    _fused_moe_impl,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
@@ -34,6 +36,7 @@ from aiter.fused_moe import (
     cktile_moe_stage2,
     fused_moe,
     fused_topk,
+    get_padded_M,
     moe_sorting,
     torch_moe,
     torch_moe_stage1,
@@ -6604,11 +6607,110 @@ class FhmoeTuner(FmoeTuner):
             "shared_expert_id": shared_expert_id,
         }
 
+    BLOCK_MS: ClassVar[tuple[int, ...]] = (16, 32, 64, 128)
+
     @staticmethod
-    def _run_fhmoe(shape, data):
+    def _csv_cell(value):
+        if isinstance(value, torch.dtype):
+            return str(value)
+        if isinstance(value, GateMode):
+            return f"GateMode.{value.name}"
+        if isinstance(value, ActivationType):
+            return f"ActivationType.{value.name}"
+        if isinstance(value, QuantType):
+            return f"QuantType.{value.name}"
+        return value
+
+    @staticmethod
+    def _kernel_pairs(shape):
+        model_dim = shape["model_dim"]
+        inter_dim = shape["inter_dim"]
+        if shape["gate_mode"] == GateMode.INTERLEAVE:
+            a_dtype, b_dtype = "fp8", "fp4"
+        else:
+            a_dtype, b_dtype = "fp4", "fp4"
+        s1_all = get_flydsl_stage1_kernels(a_dtype, b_dtype, "bf16")
+        s2_all = get_flydsl_stage2_kernels(a_dtype, b_dtype, "bf16")
+        pairs = []
+        for block_m in FhmoeTuner.BLOCK_MS:
+            s1_names = []
+            for kname, kparams in s1_all.items():
+                if kparams.get("tile_m") != block_m:
+                    continue
+                k_batch = kparams.get("k_batch", 1)
+                k_wave = kparams.get("k_wave", 1)
+                tile_k = kparams["tile_k"]
+                if k_batch != 1 or model_dim % k_batch != 0:
+                    continue
+                k_per_batch = model_dim // k_batch
+                if k_per_batch % tile_k != 0:
+                    continue
+                if k_wave > 1 and (
+                    k_per_batch % k_wave != 0 or (k_per_batch // k_wave) % tile_k != 0
+                ):
+                    continue
+                s1_names.append(kname + ("_fp8" if a_dtype == "fp8" else "_fp4"))
+            s2_names = []
+            for kname, kparams in s2_all.items():
+                if kparams.get("tile_m") != block_m:
+                    continue
+                # Same stage2 cuts as FmoeTuner.gen_flydsl_2stages_task:
+                #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
+                #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out;
+                #  - LDS is tile_m*(tile_k*2 + tile_n*4); over 160 KiB (gfx950
+                #    workgroup LDS) the build fails.
+                if inter_dim % kparams["tile_k"] != 0:
+                    continue
+                lds = block_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
+                if lds > 160 * 1024:
+                    continue
+                s2_names.append(kname)
+            for kn1 in s1_names:
+                for kn2 in s2_names:
+                    pairs.append((block_m, kn1, kn2))
+        kernel_regex = os.environ.get("TUNE_MOE_KERNEL_REGEX")
+        if kernel_regex:
+            pattern = re.compile(kernel_regex)
+            pairs = [p for p in pairs if pattern.search(f"{p[1]} {p[2]}")]
+        return pairs
+
+    @staticmethod
+    def _write_candidate_csv(path, shape, block_m, kn1, kn2):
+        gate_mode = shape["gate_mode"]
+        row = {
+            "gfx": shape["gfx"],
+            "cu_num": shape["cu_num"],
+            "token": get_padded_M(shape["token"]),
+            "model_dim": shape["model_dim"],
+            "inter_dim": shape["inter_dim"],
+            "expert": shape["expert"],
+            "topk": shape["topk"],
+            "act_type": FhmoeTuner._csv_cell(shape["act_type"]),
+            "dtype": FhmoeTuner._csv_cell(shape["dtype"]),
+            "q_dtype_a": FhmoeTuner._csv_cell(shape["q_dtype_a"]),
+            "q_dtype_w": FhmoeTuner._csv_cell(shape["q_dtype_w"]),
+            "q_type": FhmoeTuner._csv_cell(shape["q_type"]),
+            "use_g1u1": int(shape["use_g1u1"]),
+            "doweight_stage1": int(shape["doweight_stage1"]),
+            "shared_expert_id": shape["shared_expert_id"],
+            "hidden_pad": shape["hidden_pad"],
+            "intermediate_pad": shape["intermediate_pad"],
+            "gate_mode": FhmoeTuner._csv_cell(gate_mode),
+            "block_m": block_m,
+            "ksplit": 0,
+            "kernelName1": kn1,
+            "kernelName2": kn2,
+        }
+        pd.DataFrame([row]).to_csv(path, index=False)
+
+    @staticmethod
+    def _run_fhmoe(shape, data, kn1, kn2, block_m):
         gate_mode = shape["gate_mode"]
         if not isinstance(gate_mode, str):
             gate_mode = gate_mode.value
+        q_dtype_a = (
+            dtypes.fp8 if gate_mode == GateMode.INTERLEAVE.value else dtypes.fp4x2
+        )
 
         def _cuda(tensor):
             if tensor is None or not torch.is_tensor(tensor):
@@ -6619,27 +6721,45 @@ class FhmoeTuner(FmoeTuner):
         w2 = _cuda(data["w2"])
         w1.is_shuffled = True
         w2.is_shuffled = True
-        return fused_moe(
-            _cuda(data["hidden"]),
-            w1,
-            w2,
-            _cuda(data["topk_weights"]),
-            _cuda(data["topk_ids"]),
-            activation=shape["act_type"],
-            quant_type=shape["q_type"],
-            doweight_stage1=bool(shape["doweight_stage1"]),
-            w1_scale=_cuda(data["w1_scale"]),
-            w2_scale=_cuda(data["w2_scale"]),
-            dtype=shape["dtype"],
-            hidden_pad=shape["hidden_pad"],
-            intermediate_pad=shape["intermediate_pad"],
-            gate_mode=gate_mode,
-            shared_w1=_cuda(data["shared_w1"]),
-            shared_w2=_cuda(data["shared_w2"]),
-            shared_w1_scale=_cuda(data["shared_w1_scale"]),
-            shared_w2_scale=_cuda(data["shared_w2_scale"]),
-            shared_expert_id=data["shared_expert_id"],
-        )
+        cfg_fd, cfg_path = tempfile.mkstemp(suffix="_fhmoe_tune.csv")
+        os.close(cfg_fd)
+        FhmoeTuner._write_candidate_csv(cfg_path, shape, block_m, kn1, kn2)
+        import aiter.fused_moe as fmoe_mod
+
+        try:
+            return _fused_moe_impl(
+                hidden_states=_cuda(data["hidden"]),
+                w1=w1,
+                w2=w2,
+                topk_weight=_cuda(data["topk_weights"]),
+                topk_ids=_cuda(data["topk_ids"]),
+                activation=shape["act_type"].value,
+                quant_type=shape["q_type"].value,
+                doweight_stage1=bool(shape["doweight_stage1"]),
+                w1_scale=_cuda(data["w1_scale"]),
+                w2_scale=_cuda(data["w2_scale"]),
+                block_size_M=block_m,
+                dtype=shape["dtype"],
+                hidden_pad=shape["hidden_pad"],
+                intermediate_pad=shape["intermediate_pad"],
+                gate_mode=gate_mode,
+                _q_dtype_a=q_dtype_a,
+                _metadata_transform=_use_fhmoe_wrappers,
+                _metadata_config_file=cfg_path,
+                _stage1_extra_args={
+                    "shared_w1": _cuda(data["shared_w1"]),
+                    "shared_w1_scale": _cuda(data["shared_w1_scale"]),
+                    "shared_expert_id": data["shared_expert_id"],
+                },
+                _stage2_extra_args={
+                    "shared_w2": _cuda(data["shared_w2"]),
+                    "shared_w2_scale": _cuda(data["shared_w2_scale"]),
+                    "shared_expert_id": data["shared_expert_id"],
+                },
+            )
+        finally:
+            fmoe_mod.cfg_2stages_by_file.pop(cfg_path, None)
+            os.unlink(cfg_path)
 
     _FHMOE_MP_DATA_KEYS = (
         "hidden",
@@ -6669,6 +6789,9 @@ class FhmoeTuner(FmoeTuner):
         shared_w1_scale,
         shared_w2_scale,
         shape,
+        kn1,
+        kn2,
+        block_m,
     ):
         return FhmoeTuner._run_fhmoe(
             shape,
@@ -6686,6 +6809,9 @@ class FhmoeTuner(FmoeTuner):
                 "shared_w2_scale": shared_w2_scale,
                 "shared_expert_id": shape["shared_expert_id"],
             },
+            kn1,
+            kn2,
+            block_m,
         )
 
     def tune(self, untunedf, tunedf, args):
@@ -6694,24 +6820,28 @@ class FhmoeTuner(FmoeTuner):
         for _, row in untunedf.iterrows():
             shape = self._parse_fhmoe_row(row)
             info = tuple(shape[k] for k in self.keys)
-            block_m = 32
-            print("\nStart tuning FHMoE", info, flush=True)
-            tasks.append(
-                (
-                    (info, "fused", "", block_m),
-                    FhmoeTuner.generate_fhmoe_data,
-                    (shape, block_m),
-                    FhmoeTuner._run_fhmoe_mp,
-                    (list(self._FHMOE_MP_DATA_KEYS), shape),
-                    {},
-                    None,
-                    ([],),
-                    {},
-                    None,
-                    0.01,
-                    0.01,
-                )
+            pairs = self._kernel_pairs(shape)
+            print(
+                f"\nStart tuning FHMoE {info} candidates={len(pairs)}",
+                flush=True,
             )
+            for block_m, kn1, kn2 in pairs:
+                tasks.append(
+                    (
+                        (info, kn1, kn2, block_m),
+                        FhmoeTuner.generate_fhmoe_data,
+                        (shape,),
+                        FhmoeTuner._run_fhmoe_mp,
+                        (list(self._FHMOE_MP_DATA_KEYS), shape, kn1, kn2, block_m),
+                        {},
+                        None,
+                        ([],),
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                    )
+                )
         if not tasks:
             return []
         rets = mp_tuner(
@@ -6723,9 +6853,88 @@ class FhmoeTuner(FmoeTuner):
             timeout=args.timeout,
             verbose=args.verbose,
         )
-        for info, us, err in rets:
-            print(f"[fhmoe] mp_tuner us={us} err={err} info={info}", flush=True)
-        return []
+        return rets
+
+    def post_process(self, results, args, topk=-1, fast_mode=False):
+        del topk, fast_mode
+        from collections import defaultdict
+
+        grouped = defaultdict(list)
+        profile_rows = []
+        for info, us, err in results:
+            key = tuple(info[0])
+            kn1, kn2, block_m = info[1], info[2], info[3]
+            grouped[key].append((kn1, kn2, block_m, us, err))
+            profile_rows.append(
+                {
+                    **dict(zip(self.keys, key)),
+                    "block_m": block_m,
+                    "ksplit": 0,
+                    "kernelName1": kn1,
+                    "kernelName2": kn2,
+                    "us": us,
+                    "err": err,
+                }
+            )
+        if args.profile_file:
+            profile_df = pd.DataFrame(profile_rows)
+            for col in ("act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type", "gate_mode"):
+                if col in profile_df.columns:
+                    profile_df[col] = profile_df[col].map(self._csv_cell)
+            if os.path.exists(args.profile_file):
+                profile_df = pd.concat(
+                    [pd.read_csv(args.profile_file), profile_df], ignore_index=True
+                )
+            profile_df.to_csv(args.profile_file, index=False)
+        bests = []
+        for key, rets in grouped.items():
+            valid = [
+                r
+                for r in rets
+                if r[3] not in (self.INVALID_TIME, self.INF_TIME) and r[3] >= 0
+            ]
+            if not valid:
+                print(f"Tuning result for {key} is none", flush=True)
+                continue
+            kn1, kn2, block_m, us, err = min(valid, key=lambda r: r[3])
+            row = dict(zip(self.keys, key))
+            for col in ("act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type", "gate_mode"):
+                row[col] = self._csv_cell(row[col])
+            row.update(
+                {
+                    "block_m": block_m,
+                    "ksplit": 0,
+                    "kernelName1": kn1,
+                    "kernelName2": kn2,
+                    "us": us,
+                }
+            )
+            print(
+                f"Tuning result for {key} is {block_m, kn1, kn2} {us} us err={err}",
+                flush=True,
+            )
+            bests.append(row)
+        if not bests:
+            return pd.DataFrame(columns=self.columns)
+        return pd.DataFrame(bests, columns=self.columns)
+
+    def result_to_csv(self, results, file, concat=False):
+        del concat
+        old_tunedf = self.get_tuned_gemm_list(file, self.columns)
+        for col in self.columns:
+            if col not in old_tunedf.columns:
+                old_tunedf[col] = ""
+        valid = results[
+            (results["us"] != self.INVALID_TIME) & (results["us"] != self.INF_TIME)
+        ]
+        invalid = results[
+            (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
+        ]
+        resultdf = self.update_tunedf(old_tunedf, valid)
+        self.success = pd.concat([self.success, valid], ignore_index=True)
+        self.failed = pd.concat([self.failed, invalid], ignore_index=True)
+        resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
+        resultdf.to_csv(file, index=False)
 
 
 class Mxfp4FlydslTuner(FmoeTuner):
@@ -7422,6 +7631,13 @@ if __name__ == "__main__":
         "tflops",
         "bw",
     ]
+    fhmoe_result_list = [
+        "block_m",
+        "ksplit",
+        "kernelName1",
+        "kernelName2",
+        "us",
+    ]
     grouped_result_list = [
         "max_m",
         "tile_m",
@@ -7460,7 +7676,7 @@ if __name__ == "__main__":
         tuner = FhmoeTuner(
             "fhmoeTuner",
             fhmoe_key,
-            resultList,
+            fhmoe_result_list,
             "fhmoe tuner",
         )
     else:
