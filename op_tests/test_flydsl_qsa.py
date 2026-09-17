@@ -444,6 +444,49 @@ def test_k1_family_a_set_equality_two_tiles():
         raise AssertionError("K1 two-tile block-id set diverged from the oracle")
 
 
+def test_k1_family_a_set_equality_wide_stream():
+    """FlyDSL K1 matches the oracle on 128k rows that take streaming radix."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 1, 131072, 16
+    n_blocks = seq_len // idx.compress_ratio
+    assert n_blocks >= 32768
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FAMILY_A_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_k1_family_a_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+    )
+    if _set_mismatch_ratio(ref_ids, got) != 0.0:
+        raise AssertionError("K1 wide-row block-id set diverged from the oracle")
+
+
 def test_k1_family_a_set_equality_prefill():
     """Same K1 instantiation matches the oracle at prefill M=512."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -563,8 +606,8 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
-    into an fp32 score matrix followed by stable FlyDSL radix top-k. Decode
-    and prefill share one scorer instantiation. Expand is not fused.
+    into an fp32 score matrix. Selection is decode radix below 32768 columns
+    and streaming radix at or above that width. Expand is not fused.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -1448,6 +1491,7 @@ def _run_unit_cases():
     test_paged_roundtrip_tiny()
     test_k1_family_a_set_equality_short_decode()
     test_k1_family_a_set_equality_two_tiles()
+    test_k1_family_a_set_equality_wide_stream()
     test_k1_family_a_set_equality_prefill()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
