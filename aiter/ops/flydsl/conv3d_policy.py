@@ -29,7 +29,7 @@ from .kernels.conv3d_implicit import (
     MFMA_N,
     TILE_K,
     TILES_PER_BARRIER,
-    WARP_SIZE,
+    validate_launch_config,
 )
 
 __all__ = [
@@ -84,19 +84,14 @@ MAX_WAVES = 16
 
 
 def is_legal_tile(tile_m, tile_n, wave_m, wave_n):
-    """Closed form of ``compile_conv3d_implicit``'s launch-config asserts.
+    """Would ``compile_conv3d_implicit`` accept this launch config?
 
-    With ``TILE_K == 32`` and ``BLOCK_VECS == LDG_VEC * WAVE_M * WAVE_N *
-    WARP_SIZE``, the two ``BLOCK_VECS`` divisibility asserts reduce to
-    ``TILE_{M,N} % (16 * WAVE_M * WAVE_N) == 0``, which implies the separate
-    ``TILE_M % (WAVE_M * 16)`` / ``TILE_N % (WAVE_N * 16)`` asserts and
-    guarantees ``LDG_{A,B}_COUNT >= 1``.
+    Asks the kernel rather than restating its asserts, as
+    ``gemm_a16w16_policy`` asks ``make_gemm_a16w16_param_and_validate``: a
+    second copy of the arithmetic here would prune compilable configs the day
+    it drifted, and a sweep that never measures a config leaves no trace.
     """
-    waves = wave_m * wave_n
-    if waves * WARP_SIZE > 1024:  # BLOCK_THREADS <= 1024
-        return False
-    step = MFMA_M * waves
-    return tile_m % step == 0 and tile_n % step == 0
+    return validate_launch_config(tile_m, tile_n, wave_m, wave_n) is None
 
 
 def tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm):

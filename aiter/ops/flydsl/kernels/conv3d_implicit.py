@@ -85,6 +85,40 @@ PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 CONV_COMPILE_HINTS = {}
 
 
+def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
+    """Why this (TILE_M, TILE_N, WAVE_M, WAVE_N) cannot compile, or None.
+
+    The launch-config half of compile_conv3d_implicit's asserts, in a function
+    that costs nothing to call, so a candidate sweep can filter on it instead of
+    paying a compile per rejected config. conv3d_policy used to carry its own
+    closed form of the same arithmetic -- the two agreed over all 8281
+    combinations of its enumeration, but nothing made them, and a policy that
+    drifts stricter prunes configs that would have compiled, which shows up as
+    neither an error nor a wrong answer, only as a tuned pick that could have
+    been faster.
+
+    Only the tile-shape constraints live here. c/groups and the channel padding
+    are properties of the problem, not of the launch config, so they stay as
+    asserts at their point of use.
+    """
+    block_threads = wave_m * wave_n * WARP_SIZE
+    if block_threads > 1024:
+        return f"BLOCK_THREADS={block_threads} exceeds 1024"
+    if tile_m % (wave_m * MFMA_M):
+        return f"TILE_M={tile_m} not divisible by WAVE_M*{MFMA_M}"
+    if tile_n % (wave_n * MFMA_N):
+        return f"TILE_N={tile_n} not divisible by WAVE_N*{MFMA_N}"
+    # LDG_{A,B}_COUNT >= 1 needs no check of its own: TILE_K is 32 and BLOCK_VECS
+    # is 8*BLOCK_THREADS, so both divisibility tests already imply a count of at
+    # least one for any positive tile.
+    block_vecs = LDG_VEC * block_threads
+    if (tile_m * TILE_K) % block_vecs:
+        return f"A tile {tile_m}x{TILE_K} not a multiple of {block_vecs} vecs"
+    if (tile_n * TILE_K) % block_vecs:
+        return f"B tile {tile_n}x{TILE_K} not a multiple of {block_vecs} vecs"
+    return None
+
+
 def _as_stream(stream):
     return stream if hasattr(stream, "_is_stream_param") else fx.Stream(stream)
 
@@ -398,19 +432,8 @@ def compile_conv3d_implicit(
     KG = k // groups
 
     assert TILE_K == 32
-    assert (
-        TILE_M % (WAVE_M * MFMA_M) == 0
-    ), f"TILE_M={TILE_M} not divisible by WAVE_M*16"
-    assert (
-        TILE_N % (WAVE_N * MFMA_N) == 0
-    ), f"TILE_N={TILE_N} not divisible by WAVE_N*16"
-    assert (
-        TILE_M * TILE_K
-    ) % BLOCK_VECS == 0, f"A tile {TILE_M}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
-    assert (
-        TILE_N * TILE_K
-    ) % BLOCK_VECS == 0, f"B tile {TILE_N}x{TILE_K} not a multiple of {BLOCK_VECS} vecs"
-    assert LDG_A_COUNT >= 1 and LDG_B_COUNT >= 1
+    _invalid = validate_launch_config(TILE_M, TILE_N, WAVE_M, WAVE_N)
+    assert _invalid is None, _invalid
     assert c % groups == 0, f"c={c} not divisible by groups={groups}"
     assert k % groups == 0, f"k={k} not divisible by groups={groups}"
     assert (
