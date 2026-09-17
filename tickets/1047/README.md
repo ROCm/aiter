@@ -265,7 +265,9 @@ scorer workgroups and a global fp32 `[M, n_blocks]` score buffer. Selection
 is `flydsl_top_k_per_row_decode(stable=True)` below 32768 columns and
 `topk_select(..., tie='low')` streaming radix at or above that width. H=4
 is padded to 16 MFMA rows; D=128 is split across two waves. BLOCK_N=16
-remains buildable but lost on prefill. Expand remains separate.
+remains buildable but lost on prefill. Single-request prefill uses the MFMA M
+dimension for 16 query rows and reuses each K tile across them; decode and
+multi-request inputs keep the one-row scorer. Expand remains separate.
 
 A 64-bit MSD binary radix-select on the 1024-candidate tile was measured
 and not shipped. Set equality held. Decode ``M=1`` 8k / 32k ~126 / ~497 µs
@@ -283,13 +285,13 @@ vs kept bitonic ~106 / ~419 µs. Sixty-four digit passes vs 55 sort stages.
 | 8 | 131072 | 32768 | 46.3 | 52.9 | 0 | 0 |
 | 512 | 512 | 128 | 3.5 | 18.1 | 0 | 0 |
 | 512 | 2048 | 512 | 3.6 | 29.1 | 0 | 0 |
-| 512 | 8192 | 2048 | 83.2 | 83.1 | 0 | 0 |
-| 512 | 32768 | 8192 | 288.7 | 245.6 | 0 | 0 |
+| 512 | 8192 | 2048 | 29.3 | 83.1 | 0 | 0 |
+| 512 | 32768 | 8192 | 68.2 | 247.7 | 0 | 0 |
 
 Streaming radix at 32768 columns moves 128k decode from 33.7 / 54.4 us to
-28.3 / 46.3 us (`M=1` / `M=8`) and crosses live AMD. Prefill 32k stays
-scorer-bound (288.7 vs 245.6). Decode still wins through 32k; 8k prefill
-stays tied.
+28.3 / 46.3 us (`M=1` / `M=8`) and crosses live AMD. The 16-row scorer moves
+8k / 32k prefill from 83.2 / 288.7 us to 29.3 / 68.2 us and beats live AMD
+at both points.
 
 ## Phase 2e — family B K1 H=4 emit (not a win)
 
