@@ -465,11 +465,9 @@ def top_k_per_row_prefill_avo(
     shorter than k emits min(k, row_len) indices followed by -1, the same
     padding top_k_per_row_prefill writes.
 
-    rowStarts must be zero, and is checked for shape only. A nonzero start is
-    well defined -- top_k_per_row_prefill scans [rowStart, rowEnd) and emits
-    absolute column indices (topk_per_row_kernels.cu:377 and :404) -- but these
-    kernels do not implement it yet, and every prefill caller in-tree passes
-    zeros.
+    rowStarts and rowEnds bound each row's window [rowStart, rowEnd); emitted
+    indices are absolute column numbers, matching top_k_per_row_prefill
+    (topk_per_row_kernels.cu:377 and :404).
 
     `values` is optional: pass an fp32 numRows*k tensor to also receive the
     selected scores, or None to skip the stores entirely (it is a template

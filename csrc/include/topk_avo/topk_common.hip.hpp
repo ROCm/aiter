@@ -90,11 +90,35 @@ constexpr int SAMPLE_S_MAX       = 16384;
 __host__ __device__ inline int sample_chunk_stride(int N, int chunks)
 { return (N / chunks) & ~(FP32_EPT - 1); }
 
-// Per-row extent for ragged rows. row_ends[row] is the exclusive end column
-// (rowStarts must be 0; see topk_aiter_entry.inc.hip). When row_ends is null the
-// row length equals the pitch, which is the uniform-matrix contract.
+// Per-row window bundled like TopkOut: uniform keeps one 8 B null ends pointer;
+// ragged carries starts+ends (16 B). Valid slice is [starts[row], ends[row]).
+template <bool RAGGED>
+struct RowExtents;
+template <>
+struct RowExtents<false>
+{
+    const int* ends;
+    __device__ __forceinline__ int row_start(int) const { return 0; }
+};
+template <>
+struct RowExtents<true>
+{
+    const int* starts;
+    const int* ends;
+    __device__ __forceinline__ int row_start(int row) const { return starts[row]; }
+    __device__ __forceinline__ int row_len(int row) const { return ends[row] - starts[row]; }
+};
+
 __device__ __forceinline__ int row_len_dev(int row, int pitch, const int* row_ends)
 { return row_ends ? row_ends[row] : pitch; }
+
+template <bool RAGGED>
+__device__ __forceinline__ int row_len_of(int row, int pitch, RowExtents<RAGGED> ext)
+{
+    if constexpr(RAGGED)
+        return ext.row_len(row);
+    return pitch;
+}
 
 __device__ __forceinline__ int n4_cover(int len) { return (len + FP32_EPT - 1) / FP32_EPT; }
 
@@ -161,9 +185,6 @@ pad_topk_tail(int* __restrict__ out, float* __restrict__ out_val, int k_take, in
 // so the padding and the emit have to agree or the same call would mean
 // different things at a batch-size boundary.
 //
-// rowStarts is zero by this op's contract, so the column index IS the output
-// index; aiter adds rowStart here.
-//
 // This is the one emit path that has to READ the row to produce values: there
 // is no select here, so no key is sitting in a register the way it is inside
 // block_gather_topk. aiter reads the row here too.
@@ -171,13 +192,14 @@ template <bool WRITE_VALUES>
 __device__ __forceinline__ void emit_identity_row(int* __restrict__ out,
                                                   float* __restrict__ out_val,
                                                   const float* __restrict__ row,
+                                                  int row_start,
                                                   int len,
                                                   int K)
 {
     for(int i = threadIdx.x; i < K; i += blockDim.x)
     {
         const bool live = (i < len);
-        out[i]          = live ? i : -1;
+        out[i]          = live ? (row_start + i) : -1;
         if(WRITE_VALUES)
             out_val[i] = live ? row[i] : -__builtin_inff();
     }

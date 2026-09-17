@@ -23,18 +23,23 @@
 template <bool RAGGED, bool WRITE_VALUES>
 __global__ void phase_small_n_topk(const float* __restrict__ input,
                                    int pitch,
-                                   const int* __restrict__ row_ends,
+                                   RowExtents<RAGGED> extents,
                                    int K,
                                    TopkOut<WRITE_VALUES> dst,
                                    int npasses)
 {
-    const int row   = blockIdx.x;
-    const int len   = row_len_dev(row, pitch, row_ends);
-    const float* ri = input + (size_t)row * pitch;
+    const int row       = blockIdx.x;
+    const int row_start = RAGGED ? extents.row_start(row) : 0;
+    int len;
+    if constexpr(RAGGED)
+        len = extents.row_len(row);
+    else
+        len = pitch;
+    const float* ri = input + (size_t)row * pitch + row_start;
     float* val      = dst.val_row(row, K);
     if(RAGGED && len <= K)
     {
-        emit_identity_row<WRITE_VALUES>(dst.idx_row(row, K), val, ri, len, K);
+        emit_identity_row<WRITE_VALUES>(dst.idx_row(row, K), val, ri, row_start, len, K);
         return;
     }
     extern __shared__ uint32_t s_keys[];
@@ -69,17 +74,34 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
         s_weq = 0;
     }
     __syncthreads();
-    block_gather_topk<WRITE_VALUES>(
-        len,
-        pivot,
-        k_out - eq_needed,
-        eq_needed,
-        out,
-        val,
-        &s_wgt,
-        &s_weq,
-        [&](int i) { return s_keys[i]; },
-        [](int i) { return i; });
+    if constexpr(RAGGED)
+    {
+        block_gather_topk<WRITE_VALUES>(
+            len,
+            pivot,
+            k_out - eq_needed,
+            eq_needed,
+            out,
+            val,
+            &s_wgt,
+            &s_weq,
+            [&](int i) { return s_keys[i]; },
+            [&](int i) { return row_start + i; });
+    }
+    else
+    {
+        block_gather_topk<WRITE_VALUES>(
+            len,
+            pivot,
+            k_out - eq_needed,
+            eq_needed,
+            out,
+            val,
+            &s_wgt,
+            &s_weq,
+            [&](int i) { return s_keys[i]; },
+            [](int i) { return i; });
+    }
     if(RAGGED && k_out < K)
     {
         __syncthreads();
@@ -90,7 +112,7 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
 template <bool RAGGED>
 __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     int pitch,
-                                    const int* __restrict__ row_ends,
+                                    RowExtents<RAGGED> extents,
                                     int n4_per_row,
                                     const float* __restrict__ threshold_f,
                                     uint64_t* __restrict__ cand_pack,
@@ -99,8 +121,9 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     int cap)
 {
     const int row     = blockIdx.y;
-    const int len     = row_len_dev(row, pitch, row_ends);
-    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch);
+    const int len     = row_len_of<RAGGED>(row, pitch, extents);
+    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch +
+                                                         (RAGGED ? extents.row_start(row) : 0));
     const float th    = threshold_f[row];
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
     const int wid     = threadIdx.x / WAVE_SIZE;
@@ -240,7 +263,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 template <bool RAGGED, bool WRITE_VALUES>
 __global__ void phase_c_select_contig(const float* __restrict__ input,
                                       int pitch,
-                                      const int* __restrict__ row_ends,
+                                      RowExtents<RAGGED> extents,
                                       const uint64_t* __restrict__ cand_pack,
                                       const unsigned int* __restrict__ cand_reserved,
                                       const unsigned int* __restrict__ cand_bad,
@@ -254,7 +277,8 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
                                       bool keys_only)
 {
     const int row            = blockIdx.x;
-    const int len            = row_len_dev(row, pitch, row_ends);
+    const int row_start      = RAGGED ? extents.row_start(row) : 0;
+    const int len            = row_len_of<RAGGED>(row, pitch, extents);
     const unsigned int c_raw = cand_bad[row] ? 0xFFFFFFFFu : cand_reserved[row];
     if(threadIdx.x == 0)
         cand_count[row] = c_raw;
@@ -278,7 +302,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;
         exact_row_select<RAGGED, WRITE_VALUES>(
-            input, pitch, len, K, row, out, val, s_hist, s_red, s_scan, &s_wgt, &s_weq);
+            input, pitch, extents, K, row, out, val, s_hist, s_red, s_scan, &s_wgt, &s_weq);
         return;
     }
     const int c          = (int)c_raw;
@@ -317,7 +341,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
             &s_wgt,
             &s_weq,
             [&](int i) { return s_keys_ext[i]; },
-            [&](int i) { return (int)(uint32_t)(base[i] & 0xFFFFFFFFull); });
+            [&](int i) { return row_start + (int)(uint32_t)(base[i] & 0xFFFFFFFFull); });
     }
     else
     {
@@ -331,7 +355,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
             &s_wgt,
             &s_weq,
             [&](int i) { return s_keys_ext[i]; },
-            [&](int i) { return s_idx[i]; });
+            [&](int i) { return row_start + s_idx[i]; });
     }
     if(RAGGED && k_out < K)
     {
@@ -343,7 +367,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
 template <bool RAGGED>
 __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__ input,
                                                        int pitch,
-                                                       const int* __restrict__ row_ends,
+                                                       RowExtents<RAGGED> extents,
                                                        int rank,
                                                        int S,
                                                        int npasses,
@@ -356,8 +380,8 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
                                                        int K)
 {
     const int row   = blockIdx.x;
-    const int len   = row_len_dev(row, pitch, row_ends);
-    const float* ri = input + (size_t)row * pitch;
+    const int len   = row_len_of<RAGGED>(row, pitch, extents);
+    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
 
     if(threadIdx.x == 0 && row == 0)
         *fb_count = 0;

@@ -89,8 +89,9 @@ static int g_ragged             = 0;
 // the identity/exact path and the SAMPLER never sees a ragged row at all
 // (M=512 N=131072 reported fallback_rows for all 512 rows). aiter's real
 // prefill config uses prefix 131072, where every extent is long and ragged.
-static int g_ragged_prefix = 0;
-static int g_values        = 0; // also emit the selected scores
+static int g_ragged_prefix     = 0;
+static int g_row_starts_stride = 0;
+static int g_values            = 0; // also emit the selected scores
 
 // ---------------------------------------------------------------------------
 // Block-wide exact radix select over keys already resident in LDS.
@@ -253,7 +254,7 @@ __device__ __forceinline__ void block_select_stream(const vfloat4* __restrict__ 
 template <bool RAGGED, bool WRITE_VALUES>
 __device__ __forceinline__ void exact_row_select(const float* __restrict__ input,
                                                  int pitch,
-                                                 int len,
+                                                 RowExtents<RAGGED> extents,
                                                  int K,
                                                  int row,
                                                  int* __restrict__ out,
@@ -264,10 +265,12 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
                                                  unsigned* __restrict__ s_wgt,
                                                  unsigned* __restrict__ s_weq)
 {
-    const float* rif0 = input + (size_t)row * pitch;
+    const int row_start = RAGGED ? extents.row_start(row) : 0;
+    const int len       = row_len_of<RAGGED>(row, pitch, extents);
+    const float* rif0   = input + (size_t)row * pitch + row_start;
     if(RAGGED && len <= K)
     {
-        emit_identity_row<WRITE_VALUES>(out, out_val, rif0, len, K);
+        emit_identity_row<WRITE_VALUES>(out, out_val, rif0, row_start, len, K);
         return;
     }
     const int k_out    = RAGGED ? k_take_dev(K, len) : K;
@@ -283,17 +286,34 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
     }
     __syncthreads();
     const float* rif = reinterpret_cast<const float*>(ri4);
-    block_gather_topk<WRITE_VALUES>(
-        len,
-        pivot,
-        k_out - eq_needed,
-        eq_needed,
-        out,
-        out_val,
-        s_wgt,
-        s_weq,
-        [&](int i) { return fp32_to_sortable(rif[i]); },
-        [](int i) { return i; });
+    if constexpr(RAGGED)
+    {
+        block_gather_topk<WRITE_VALUES>(
+            len,
+            pivot,
+            k_out - eq_needed,
+            eq_needed,
+            out,
+            out_val,
+            s_wgt,
+            s_weq,
+            [&](int i) { return fp32_to_sortable(rif[i]); },
+            [&](int i) { return row_start + i; });
+    }
+    else
+    {
+        block_gather_topk<WRITE_VALUES>(
+            len,
+            pivot,
+            k_out - eq_needed,
+            eq_needed,
+            out,
+            out_val,
+            s_wgt,
+            s_weq,
+            [&](int i) { return fp32_to_sortable(rif[i]); },
+            [](int i) { return i; });
+    }
     if(RAGGED && k_out < K)
     {
         __syncthreads();
@@ -314,7 +334,7 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
 template <bool RAGGED>
 __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restrict__ input,
                                                           int pitch,
-                                                          const int* __restrict__ row_ends,
+                                                          RowExtents<RAGGED> extents,
                                                           int rank,
                                                           int S,
                                                           int npasses,
@@ -327,8 +347,8 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
                                                           int K)
 {
     const int row   = blockIdx.x;
-    const int len   = row_len_dev(row, pitch, row_ends);
-    const float* ri = input + (size_t)row * pitch;
+    const int len   = row_len_of<RAGGED>(row, pitch, extents);
+    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
 
     if(threadIdx.x == 0)
     {
@@ -407,7 +427,7 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
 template <int ABLATE, bool RAGGED>
 __global__ void phase_b_filter_waveseg(const float* __restrict__ input,
                                        int pitch,
-                                       const int* __restrict__ row_ends,
+                                       RowExtents<RAGGED> extents,
                                        const float* __restrict__ threshold_f,
                                        uint64_t* __restrict__ cand_pack,
                                        int* __restrict__ cand_seg,
@@ -415,8 +435,9 @@ __global__ void phase_b_filter_waveseg(const float* __restrict__ input,
                                        int seg_stride)
 {
     const int row     = blockIdx.x;
-    const int len     = row_len_dev(row, pitch, row_ends);
-    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch);
+    const int len     = row_len_of<RAGGED>(row, pitch, extents);
+    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch +
+                                                         (RAGGED ? extents.row_start(row) : 0));
     const float th    = threshold_f[row];
 
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
@@ -528,7 +549,7 @@ template <bool RAGGED>
 __global__
     __launch_bounds__(512) void phase_b_filter_wavestage(const float* __restrict__ input,
                                                          int pitch,
-                                                         const int* __restrict__ row_ends,
+                                                         RowExtents<RAGGED> extents,
                                                          const float* __restrict__ threshold_f,
                                                          uint64_t* __restrict__ cand_pack,
                                                          int* __restrict__ cand_seg,
@@ -536,8 +557,9 @@ __global__
                                                          int seg_stride)
 {
     const int row     = blockIdx.x;
-    const int len     = row_len_dev(row, pitch, row_ends);
-    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch);
+    const int len     = row_len_of<RAGGED>(row, pitch, extents);
+    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch +
+                                                         (RAGGED ? extents.row_start(row) : 0));
     const float th    = threshold_f[row];
 
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
@@ -660,7 +682,7 @@ __global__
 template <bool STATIC_CAP, bool RAGGED, bool WRITE_VALUES>
 __global__ void phase_c_select_waveseg(const float* __restrict__ input,
                                        int pitch,
-                                       const int* __restrict__ row_ends,
+                                       RowExtents<RAGGED> extents,
                                        const uint64_t* __restrict__ cand_pack,
                                        const int* __restrict__ cand_seg,
                                        const unsigned int* __restrict__ cand_count,
@@ -674,7 +696,8 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
                                        int npasses)
 {
     const int row            = blockIdx.x;
-    const int len            = row_len_dev(row, pitch, row_ends);
+    const int row_start      = RAGGED ? extents.row_start(row) : 0;
+    const int len            = row_len_of<RAGGED>(row, pitch, extents);
     const unsigned int c_raw = cand_count[row];
     const int k_out          = RAGGED ? k_take_dev(K, len) : K;
 
@@ -703,7 +726,7 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;
         exact_row_select<RAGGED, WRITE_VALUES>(
-            input, pitch, len, K, row, out_row, val_row, s_hist, s_red, s_scan, &s_wgt, &s_weq);
+            input, pitch, extents, K, row, out_row, val_row, s_hist, s_red, s_scan, &s_wgt, &s_weq);
         return;
     }
     const int c = (int)c_raw;
@@ -752,17 +775,34 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
                      npasses,
                      /*prefix_skip=*/true);
 
-    block_gather_topk<WRITE_VALUES>(
-        c,
-        pivot,
-        k_out - eq_needed,
-        eq_needed,
-        out_row,
-        val_row,
-        &s_wgt,
-        &s_weq,
-        [&](int i) { return s_keys[i]; },
-        [&](int i) { return s_idx[i]; });
+    if constexpr(RAGGED)
+    {
+        block_gather_topk<WRITE_VALUES>(
+            c,
+            pivot,
+            k_out - eq_needed,
+            eq_needed,
+            out_row,
+            val_row,
+            &s_wgt,
+            &s_weq,
+            [&](int i) { return s_keys[i]; },
+            [&](int i) { return row_start + s_idx[i]; });
+    }
+    else
+    {
+        block_gather_topk<WRITE_VALUES>(
+            c,
+            pivot,
+            k_out - eq_needed,
+            eq_needed,
+            out_row,
+            val_row,
+            &s_wgt,
+            &s_weq,
+            [&](int i) { return s_keys[i]; },
+            [&](int i) { return s_idx[i]; });
+    }
     if(RAGGED && k_out < K)
     {
         __syncthreads();
@@ -778,7 +818,7 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
 template <bool RAGGED, bool WRITE_VALUES>
 __global__ __launch_bounds__(1024) void phase_d_fallback(const float* __restrict__ input,
                                                          int pitch,
-                                                         const int* __restrict__ row_ends,
+                                                         RowExtents<RAGGED> extents,
                                                          int K,
                                                          const int* __restrict__ fb_rows,
                                                          const int* __restrict__ fb_count,
@@ -795,10 +835,10 @@ __global__ __launch_bounds__(1024) void phase_d_fallback(const float* __restrict
     for(int slot = blockIdx.y; slot < count; slot += gridDim.y)
     {
         const int row = fb_rows[slot];
-        const int len = row_len_dev(row, pitch, row_ends);
+        const int len = row_len_of<RAGGED>(row, pitch, extents);
         exact_row_select<RAGGED, WRITE_VALUES>(input,
                                                pitch,
-                                               len,
+                                               extents,
                                                K,
                                                row,
                                                dst.idx_row(row, K),
@@ -951,10 +991,20 @@ template <>
 TopkOut<true> make_topk_out<true>(int* d_idx, float* d_val)
 { return TopkOut<true>{d_idx, d_val}; }
 
+template <bool RAGGED>
+static RowExtents<RAGGED> make_row_extents(const int* d_starts, const int* d_ends);
+template <>
+RowExtents<false> make_row_extents<false>(const int*, const int*)
+{ return RowExtents<false>{nullptr}; }
+template <>
+RowExtents<true> make_row_extents<true>(const int* d_starts, const int* d_ends)
+{ return RowExtents<true>{d_starts, d_ends}; }
+
 template <bool RAGGED, bool WRITE_VALUES>
 static void topk_small_n(const float* d_in,
                          int M,
                          int pitch,
+                         const int* d_row_starts,
                          const int* d_row_ends,
                          int K,
                          int* d_idx,
@@ -965,7 +1015,7 @@ static void topk_small_n(const float* d_in,
         <<<M, small_n_block(M, pitch), (size_t)pitch * sizeof(uint32_t), s>>>(
             d_in,
             pitch,
-            d_row_ends,
+            make_row_extents<RAGGED>(d_row_starts, d_row_ends),
             K,
             make_topk_out<WRITE_VALUES>(d_idx, d_val),
             g_small_n_passes);
@@ -975,6 +1025,7 @@ template <bool RAGGED, bool WRITE_VALUES>
 static void topk_fused_impl(const float* d_in,
                             int M,
                             int pitch,
+                            const int* d_row_starts,
                             const int* d_row_ends,
                             int K,
                             int* d_idx,
@@ -983,15 +1034,16 @@ static void topk_fused_impl(const float* d_in,
                             const ShapeParams& sp,
                             hipStream_t s)
 {
-    const auto dst       = make_topk_out<WRITE_VALUES>(d_idx, d_val);
-    const int S          = sp.S;
-    const float margin   = sp.margin;
-    const int rank       = g_sample_rank > 0 ? g_sample_rank : sp.rank;
-    const int cap        = sp.cap;
-    const int n4         = pitch / FP32_EPT;
-    const int gx         = std::max(1, std::min(g_cf_gx, n4 / g_cf_block));
-    const int nwaves_b   = std::max(1, g_cf_block / WAVE_SIZE);
-    const int seg_stride = CAND_SLOTS_PER_ROW / nwaves_b;
+    const RowExtents<RAGGED> ext = make_row_extents<RAGGED>(d_row_starts, d_row_ends);
+    const auto dst               = make_topk_out<WRITE_VALUES>(d_idx, d_val);
+    const int S                  = sp.S;
+    const float margin           = sp.margin;
+    const int rank               = g_sample_rank > 0 ? g_sample_rank : sp.rank;
+    const int cap                = sp.cap;
+    const int n4                 = pitch / FP32_EPT;
+    const int gx                 = std::max(1, std::min(g_cf_gx, n4 / g_cf_block));
+    const int nwaves_b           = std::max(1, g_cf_block / WAVE_SIZE);
+    const int seg_stride         = CAND_SLOTS_PER_ROW / nwaves_b;
 
     const int a_block = g_phase_a_block > 0
                             ? g_phase_a_block
@@ -1008,7 +1060,7 @@ static void topk_fused_impl(const float* d_in,
     {
         phase_ab_fused<RAGGED><<<M, a_block, (size_t)S * sizeof(uint32_t), s>>>(d_in,
                                                                                 pitch,
-                                                                                d_row_ends,
+                                                                                ext,
                                                                                 rank,
                                                                                 S,
                                                                                 g_phase_a_passes,
@@ -1025,7 +1077,7 @@ static void topk_fused_impl(const float* d_in,
         phase_a_threshold<RAGGED>
             <<<M, a_block, (size_t)S * sizeof(uint32_t), s>>>(d_in,
                                                               pitch,
-                                                              d_row_ends,
+                                                              ext,
                                                               rank,
                                                               S,
                                                               g_phase_a_passes,
@@ -1039,37 +1091,18 @@ static void topk_fused_impl(const float* d_in,
 
         if(coop)
         {
-            phase_b_filter_coop<RAGGED><<<dim3(sp.coop_g, M), g_cf_block, 0, s>>>(d_in,
-                                                                                  pitch,
-                                                                                  d_row_ends,
-                                                                                  n4,
-                                                                                  b.threshold_f,
-                                                                                  b.cand_pack,
-                                                                                  b.cand_reserved,
-                                                                                  b.cand_bad,
-                                                                                  cap);
+            phase_b_filter_coop<RAGGED><<<dim3(sp.coop_g, M), g_cf_block, 0, s>>>(
+                d_in, pitch, ext, n4, b.threshold_f, b.cand_pack, b.cand_reserved, b.cand_bad, cap);
         }
         else if(g_phase_b == 4)
         {
-            phase_b_filter_wavestage<RAGGED><<<M, g_cf_block, 0, s>>>(d_in,
-                                                                      pitch,
-                                                                      d_row_ends,
-                                                                      b.threshold_f,
-                                                                      b.cand_pack,
-                                                                      b.cand_seg,
-                                                                      b.cand_count,
-                                                                      seg_stride);
+            phase_b_filter_wavestage<RAGGED><<<M, g_cf_block, 0, s>>>(
+                d_in, pitch, ext, b.threshold_f, b.cand_pack, b.cand_seg, b.cand_count, seg_stride);
         }
         else
         {
-            phase_b_filter_waveseg<0, RAGGED><<<M, g_cf_block, 0, s>>>(d_in,
-                                                                       pitch,
-                                                                       d_row_ends,
-                                                                       b.threshold_f,
-                                                                       b.cand_pack,
-                                                                       b.cand_seg,
-                                                                       b.cand_count,
-                                                                       seg_stride);
+            phase_b_filter_waveseg<0, RAGGED><<<M, g_cf_block, 0, s>>>(
+                d_in, pitch, ext, b.threshold_f, b.cand_pack, b.cand_seg, b.cand_count, seg_stride);
         }
     }
 
@@ -1079,7 +1112,7 @@ static void topk_fused_impl(const float* d_in,
             (size_t)cap * (sp.keys_only_c ? sizeof(uint32_t) : sizeof(uint32_t) + sizeof(int));
         phase_c_select_contig<RAGGED, WRITE_VALUES><<<M, c_block, lds_c, s>>>(d_in,
                                                                               pitch,
-                                                                              d_row_ends,
+                                                                              ext,
                                                                               b.cand_pack,
                                                                               b.cand_reserved,
                                                                               b.cand_bad,
@@ -1096,7 +1129,7 @@ static void topk_fused_impl(const float* d_in,
     {
         phase_c_select_waveseg<true, RAGGED, WRITE_VALUES><<<M, c_block, 0, s>>>(d_in,
                                                                                  pitch,
-                                                                                 d_row_ends,
+                                                                                 ext,
                                                                                  b.cand_pack,
                                                                                  b.cand_seg,
                                                                                  b.cand_count,
@@ -1115,7 +1148,7 @@ static void topk_fused_impl(const float* d_in,
         phase_c_select_waveseg<false, RAGGED, WRITE_VALUES>
             <<<M, c_block, lds_c, s>>>(d_in,
                                        pitch,
-                                       d_row_ends,
+                                       ext,
                                        b.cand_pack,
                                        b.cand_seg,
                                        b.cand_count,
@@ -1142,6 +1175,7 @@ template <bool RAGGED, bool WRITE_VALUES>
 static void topk_indices_inst(const float* d_in,
                               int M,
                               int pitch,
+                              const int* d_row_starts,
                               const int* d_row_ends,
                               int K,
                               int* d_idx,
@@ -1150,18 +1184,20 @@ static void topk_indices_inst(const float* d_in,
                               const ShapeParams& sp,
                               hipStream_t s)
 {
-    const int* re = RAGGED ? d_row_ends : nullptr;
     if(sp.path == PATH_SMALL_N)
     {
-        topk_small_n<RAGGED, WRITE_VALUES>(d_in, M, pitch, re, K, d_idx, d_val, s);
+        topk_small_n<RAGGED, WRITE_VALUES>(
+            d_in, M, pitch, d_row_starts, d_row_ends, K, d_idx, d_val, s);
         return;
     }
-    topk_fused_impl<RAGGED, WRITE_VALUES>(d_in, M, pitch, re, K, d_idx, d_val, b, sp, s);
+    topk_fused_impl<RAGGED, WRITE_VALUES>(
+        d_in, M, pitch, d_row_starts, d_row_ends, K, d_idx, d_val, b, sp, s);
 }
 
 static void topk_indices(const float* d_in,
                          int M,
                          int pitch,
+                         const int* d_row_starts,
                          const int* d_row_ends,
                          int K,
                          int* d_idx,
@@ -1177,16 +1213,20 @@ static void topk_indices(const float* d_in,
     if(g_ragged)
     {
         if(d_val)
-            topk_indices_inst<true, true>(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, sp, s);
+            topk_indices_inst<true, true>(
+                d_in, M, pitch, d_row_starts, d_row_ends, K, d_idx, d_val, b, sp, s);
         else
-            topk_indices_inst<true, false>(d_in, M, pitch, d_row_ends, K, d_idx, nullptr, b, sp, s);
+            topk_indices_inst<true, false>(
+                d_in, M, pitch, d_row_starts, d_row_ends, K, d_idx, nullptr, b, sp, s);
     }
     else
     {
         if(d_val)
-            topk_indices_inst<false, true>(d_in, M, pitch, nullptr, K, d_idx, d_val, b, sp, s);
+            topk_indices_inst<false, true>(
+                d_in, M, pitch, nullptr, nullptr, K, d_idx, d_val, b, sp, s);
         else
-            topk_indices_inst<false, false>(d_in, M, pitch, nullptr, K, d_idx, nullptr, b, sp, s);
+            topk_indices_inst<false, false>(
+                d_in, M, pitch, nullptr, nullptr, K, d_idx, nullptr, b, sp, s);
     }
     (void)smc;
 }
@@ -1194,6 +1234,7 @@ static void topk_indices(const float* d_in,
 static void topk_fused(const float* d_in,
                        int M,
                        int pitch,
+                       const int* d_row_starts,
                        const int* d_row_ends,
                        int K,
                        int* d_idx,
@@ -1201,11 +1242,12 @@ static void topk_fused(const float* d_in,
                        Bufs& b,
                        int smc,
                        hipStream_t s)
-{ topk_indices(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, smc, s); }
+{ topk_indices(d_in, M, pitch, d_row_starts, d_row_ends, K, d_idx, d_val, b, smc, s); }
 
 static void topk_direct(const float* d_in,
                         int M,
                         int pitch,
+                        const int* d_row_starts,
                         const int* d_row_ends,
                         int K,
                         int* d_idx,
@@ -1217,42 +1259,30 @@ static void topk_direct(const float* d_in,
     const dim3 g(1, FB_GRID);
     if(g_ragged)
     {
+        const RowExtents<true> ext = make_row_extents<true>(d_row_starts, d_row_ends);
         if(d_val)
-            phase_d_fallback<true, true><<<g, 1024, 0, s>>>(d_in,
-                                                            pitch,
-                                                            d_row_ends,
-                                                            K,
-                                                            b.fb_rows,
-                                                            b.fb_count,
-                                                            make_topk_out<true>(d_idx, d_val));
+            phase_d_fallback<true, true><<<g, 1024, 0, s>>>(
+                d_in, pitch, ext, K, b.fb_rows, b.fb_count, make_topk_out<true>(d_idx, d_val));
         else
-            phase_d_fallback<true, false><<<g, 1024, 0, s>>>(d_in,
-                                                             pitch,
-                                                             d_row_ends,
-                                                             K,
-                                                             b.fb_rows,
-                                                             b.fb_count,
-                                                             make_topk_out<false>(d_idx, nullptr));
+            phase_d_fallback<true, false><<<g, 1024, 0, s>>>(
+                d_in, pitch, ext, K, b.fb_rows, b.fb_count, make_topk_out<false>(d_idx, nullptr));
     }
     else
     {
+        const RowExtents<false> ext = make_row_extents<false>(nullptr, nullptr);
         if(d_val)
             phase_d_fallback<false, true><<<g, 1024, 0, s>>>(
-                d_in, pitch, nullptr, K, b.fb_rows, b.fb_count, make_topk_out<true>(d_idx, d_val));
+                d_in, pitch, ext, K, b.fb_rows, b.fb_count, make_topk_out<true>(d_idx, d_val));
         else
-            phase_d_fallback<false, false><<<g, 1024, 0, s>>>(d_in,
-                                                              pitch,
-                                                              nullptr,
-                                                              K,
-                                                              b.fb_rows,
-                                                              b.fb_count,
-                                                              make_topk_out<false>(d_idx, nullptr));
+            phase_d_fallback<false, false><<<g, 1024, 0, s>>>(
+                d_in, pitch, ext, K, b.fb_rows, b.fb_count, make_topk_out<false>(d_idx, nullptr));
     }
 }
 
 static void run_topk(const float* d_in,
                      int M,
                      int pitch,
+                     const int* d_row_starts,
                      const int* d_row_ends,
                      int K,
                      int* d_idx,
@@ -1262,9 +1292,9 @@ static void run_topk(const float* d_in,
                      hipStream_t s)
 {
     if(g_pipeline_direct)
-        topk_direct(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, s);
+        topk_direct(d_in, M, pitch, d_row_starts, d_row_ends, K, d_idx, d_val, b, s);
     else
-        topk_fused(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, smc, s);
+        topk_fused(d_in, M, pitch, d_row_starts, d_row_ends, K, d_idx, d_val, b, smc, s);
 }
 
 // aiter op entry for the AVO fp32 per-row top-k kernels.
@@ -1386,8 +1416,7 @@ bool topk_avo_supports(int64_t numRows, int64_t stride0, int64_t k)
         .geom_ok;
 }
 
-// rowStarts must be zero (aiter prefill passes zeros). rowEnds[row] is the
-// exclusive end column; indices are relative to the row base in the buffer.
+// rowStarts[row] and rowEnds[row] bound [start, end); indices are absolute columns.
 void top_k_per_row_prefill_avo(const aiter_tensor_t& logits,
                                const aiter_tensor_t& rowStarts,
                                const aiter_tensor_t& rowEnds,
@@ -1436,18 +1465,19 @@ void top_k_per_row_prefill_avo(const aiter_tensor_t& logits,
     HipDeviceGuard device_guard(logits.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const ShapeParams sp = avo::params_for(M, N, K);
-    const float* in      = static_cast<const float*>(logits.data_ptr());
-    const int* row_ends  = static_cast<const int*>(rowEnds.data_ptr());
-    int* idx             = static_cast<int*>(indices.data_ptr());
+    const ShapeParams sp  = avo::params_for(M, N, K);
+    const float* in       = static_cast<const float*>(logits.data_ptr());
+    const int* row_starts = static_cast<const int*>(rowStarts.data_ptr());
+    const int* row_ends   = static_cast<const int*>(rowEnds.data_ptr());
+    int* idx              = static_cast<int*>(indices.data_ptr());
     float* val = values.has_value() ? static_cast<float*>(values.value().data_ptr()) : nullptr;
 
     if(sp.path == PATH_SMALL_N)
     {
         if(val)
-            topk_small_n<true, true>(in, M, N, row_ends, K, idx, val, stream);
+            topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
         else
-            topk_small_n<true, false>(in, M, N, row_ends, K, idx, nullptr, stream);
+            topk_small_n<true, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
         return;
     }
 
@@ -1458,7 +1488,8 @@ void top_k_per_row_prefill_avo(const aiter_tensor_t& logits,
                 L.total);
     Bufs b = avo::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
     if(val)
-        topk_fused_impl<true, true>(in, M, N, row_ends, K, idx, val, b, sp, stream);
+        topk_fused_impl<true, true>(in, M, N, row_starts, row_ends, K, idx, val, b, sp, stream);
     else
-        topk_fused_impl<true, false>(in, M, N, row_ends, K, idx, nullptr, b, sp, stream);
+        topk_fused_impl<true, false>(
+            in, M, N, row_starts, row_ends, K, idx, nullptr, b, sp, stream);
 }
