@@ -252,6 +252,33 @@ def ref_sha(api: Api, name: str) -> str | None:
     return ref["object"]["sha"]
 
 
+def still_exempt(api: Api, name: str) -> str | None:
+    """Why this branch must not be touched right now, or None.
+
+    The repo-wide skip set is gathered once and a run walks many branches, so a
+    pull request can be opened, or protection added, in between. The lease only
+    compares the SHA, which such a change does not move, so it would not stop
+    the delete on its own. Called immediately before each destructive push.
+    That narrows the window to one call rather than closing it: git leases a
+    ref against a SHA, and there is no equivalent server-side guard for "is
+    this branch some pull request's base".
+    """
+    try:
+        branch = api.get(f"/branches/{urllib.parse.quote(name, safe='/')}")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        return "it no longer exists"
+    if (branch or {}).get("protected"):
+        return "it is protected"
+    quoted = urllib.parse.quote(name, safe="")
+    owner = urllib.parse.quote(api.owner, safe="")
+    for role, query in (("base", f"base={quoted}"), ("head", f"head={owner}:{quoted}")):
+        if api.get(f"/pulls?state=open&per_page=1&{query}"):
+            return f"it is the {role} of an open pull request"
+    return None
+
+
 def comments(api: Api, sha: str) -> list[dict]:
     return api.get(f"/commits/{sha}/comments?per_page=100") or []
 
@@ -281,6 +308,9 @@ def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
     name, sha = branch["name"], branch["sha"]
     if ref_sha(api, name) != sha:
         return f"skipped {name}: moved since the scan"
+    reason = still_exempt(api, name)
+    if reason:
+        return f"skipped {name}: {reason}"
     target = f"{ARCHIVE_PREFIX}{today.isoformat()}/{name}"
     existing = ref_sha(api, target)
     if existing is None:
@@ -314,6 +344,9 @@ def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
 
 
 def _finish_archive(api: Api, name: str, sha: str, target: str) -> str:
+    reason = still_exempt(api, name)
+    if reason:
+        return f"archived {name} -> {target}; original kept, {reason}"
     if api.delete_branch(name, sha):
         return f"archived {name} -> {target}"
     return f"archived {name} -> {target}; original kept, it moved mid-run"
@@ -405,8 +438,15 @@ def main() -> int:
             is None
         ):
             return None
-        # Against the name it had, so a line added later still rescues it.
-        if original in skip or exempt(original, exempt_names, exempt_patterns):
+        # Both names: the one it had, so a line added to the list later still
+        # rescues it, and the one it has, which can itself end up protected or
+        # referenced by a pull request.
+        if (
+            name in skip
+            or original in skip
+            or exempt(name, exempt_names, exempt_patterns)
+            or exempt(original, exempt_names, exempt_patterns)
+        ):
             return None
         notice = find_marker(
             api, branch["sha"], marker("delete-notice", name), args.bot_login
@@ -421,6 +461,9 @@ def main() -> int:
 
         if (now - _parse(notice["created_at"])).days < args.notice_days:
             return None
+        reason = still_exempt(api, name)
+        if reason:
+            return f"skipped {name}: {reason}"
         if not api.delete_branch(name, branch["sha"]):
             return f"skipped {name}: moved since the scan"
         return f"deleted {name}"
@@ -432,8 +475,8 @@ def main() -> int:
         # but it is a reason for the job to go red.
         try:
             done = act(branch)
-        except urllib.error.HTTPError as error:
-            failures.append(f"{branch['name']}: HTTP {error.code} {error.reason}")
+        except (urllib.error.HTTPError, RuntimeError) as error:
+            failures.append(f"{branch['name']}: {error}")
             continue
         if done:
             actions.append(done)
