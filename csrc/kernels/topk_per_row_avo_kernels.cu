@@ -93,6 +93,36 @@ static int g_phase_a_compact = 0;
 #ifndef SELECT_FUSED_REDUCE
 #define SELECT_FUSED_REDUCE 1
 #endif
+
+// Second barrier removal on the same lever: the scan re-zeroes each histogram
+// bucket as it reads it, so the per-pass clear loop and its barrier disappear
+// and a radix pass goes from 4 barriers to 3. Costs no LDS, unlike
+// double-buffering the histogram (+4 KB, which would cut phase_a from 4 to 3
+// blocks/CU at S=8192). Requires SELECT_FUSED_REDUCE.
+//
+// Shipped on, but it is a REGIME TRADE, not a free win, so read this before
+// moving it. Wall time, 3 runs each at warmup 20 / iters 100 / repeats 9:
+//   M=4096 N=131072  0.6090 -> 0.6069 ms  (-0.35%, the anchor)
+//   M=1    N=1048576 0.0308 -> 0.0306 ms  (-0.8%)
+//   M=4096 N=1048576 3.1658 -> 3.1652 ms  (neutral)
+//   M=1024 N=65536   0.0781 -> 0.0782 ms  (neutral)
+//   M=2048 N=4096    0.0354 -> 0.0353 ms  (neutral)
+//   M=4096 N=8192    0.0948 -> 0.0965 ms  (**+1.8%, small_n**)
+// Inner geomean -0.40% with decode -0.8% and prefill -0.8% against small_n
+// +0.40%, which stays inside PATH_NOISE_BAND_PCT. Taken because the large-N
+// paths are the target and N <= 32768 is routed to aiter's own prefill by the
+// stride0 >= 32768 dispatch in aiter/ops/topk.py.
+//
+// [unverified hypothesis] for the small_n point: the clear now runs on the 256
+// threads that also carry the wave-scan, where the old loop spread it over all
+// blockDim.x threads (512 at that shape), so the work moved onto the critical
+// path instead of disappearing.
+#ifndef SELECT_CLEAR_ON_READ
+#define SELECT_CLEAR_ON_READ 1
+#endif
+#if SELECT_CLEAR_ON_READ && !SELECT_FUSED_REDUCE
+#error "SELECT_CLEAR_ON_READ needs SELECT_FUSED_REDUCE: only the fused scan clears"
+#endif
 static int g_pipeline_direct = 0;
 static int g_inject_fault    = 0;
 static int g_dump_stats      = 0;
@@ -171,14 +201,23 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
     }
 
     int ek = K;
+#if SELECT_CLEAR_ON_READ
+    // Zeroed once here; from then on the scan re-zeroes each bucket as it reads
+    // it, so the per-pass clear loop and its barrier are gone.
+    for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
+        s_hist[i] = 0;
+    __syncthreads();
+#endif
     for(int p = start; p < npasses; p++)
     {
         const int sh      = radix_shift(p);
         const int hshift  = sh + 8;
         const bool filter = (p > 0);
+#if !SELECT_CLEAR_ON_READ
         for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
             s_hist[i] = 0;
         __syncthreads();
+#endif
         // Do NOT add an active-set min/max here to exit early once the pivot is
         // pinned. It was tried: accumulating amn/amx in this loop (the reads are
         // already happening) and breaking when they agree made small_n 21-39%
@@ -193,7 +232,7 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
         }
         __syncthreads();
 #if SELECT_FUSED_REDUCE
-        block_find_pivot_bucket_rep(s_hist, s_scan, ek);
+        block_find_pivot_bucket_rep<SELECT_CLEAR_ON_READ != 0>(s_hist, s_scan, ek);
 #else
         if(HIST_REP > 1)
         {

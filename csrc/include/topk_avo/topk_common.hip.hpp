@@ -479,9 +479,20 @@ constexpr int CAND_SLOTS_PER_ROW = 8192;
 // per block). The select's cost is the serial depth of one row -- passes x
 // barriers over the keys in LDS -- not read throughput, which is why barrier
 // count is the lever here (knowledge/known_bad.md).
-__device__ __forceinline__ void block_find_pivot_bucket_rep(const uint32_t* __restrict__ s_hist,
-                                                            uint32_t* __restrict__ s_scan,
-                                                            int ek)
+// CLEAR additionally zeroes each bucket as it is read, which removes the
+// caller's per-pass clear loop AND the barrier that loop needs, at no LDS cost.
+//
+// It is exact rather than opportunistic: HIST_SLOTS is 256 * HIST_REP and
+// thread t owns exactly slots [t*HIST_REP, (t+1)*HIST_REP), so the 256 threads
+// that read the histogram cover every slot once. Blocks are always >= 256
+// threads here (the scan indexes buckets by threadIdx.x and would silently drop
+// the upper ones below that, which is why every entry of the block-size tables
+// is >= 4 waves), so no slot is left behind. The zeroed state is published by
+// this function's closing barrier, which already has to separate the scan from
+// the next pass's histogram.
+template <bool CLEAR = false>
+__device__ __forceinline__ void
+block_find_pivot_bucket_rep(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_scan, int ek)
 {
     const int t = threadIdx.x;
     __shared__ uint32_t s_wavetot[256 / WAVE_SIZE];
@@ -493,6 +504,12 @@ __device__ __forceinline__ void block_find_pivot_bucket_rep(const uint32_t* __re
 #pragma unroll
         for(int r = 0; r < HIST_REP; r++)
             x += s_hist[t * HIST_REP + r];
+        if constexpr(CLEAR)
+        {
+#pragma unroll
+            for(int r = 0; r < HIST_REP; r++)
+                s_hist[t * HIST_REP + r] = 0u;
+        }
 #pragma unroll
         for(int off = 1; off < WAVE_SIZE; off <<= 1)
         {
