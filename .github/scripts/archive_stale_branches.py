@@ -3,38 +3,18 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Archive stale branches, then delete the archives after notice.
 
-Three stages, so that nothing is removed without somewhere to get it back from:
+30 days without commits: copy to ``archive/<YYYY-MM-DD>/<name>``, comment, drop
+the original ref. +30 days: comment giving notice. +14: delete the archive ref.
+74 days end to end, 44 of them restorable by name with the command both comments
+print, ``git push origin archive/<date>/<name>:<name>``.
 
-  day 0    the branch has had no commits for --stale-days
-           -> copy it to ``archive/<YYYY-MM-DD>/<name>``, comment on the tip
-              commit saying where it went, delete the original ref
-  day 30   it has sat in the archive for --archive-days
-           -> comment again, this time announcing deletion
-  day 74   the notice has stood for --notice-days
-           -> delete the archive ref
+No state is stored -- the archive date is in the ref name, the notice date is
+the notice comment's own -- so deleting that comment stops the deletion. That is
+the per-branch opt-out, and it needs no admin.
 
-74 days from the last commit to the ref going away, 44 of them with the commits
-still reachable under a name someone can find.
-
-The dates are not stored anywhere. The archive date is the one in the ref name,
-and the notice date is the creation date of the notice comment, so a run holds
-no state and two runs cannot disagree. Deleting the notice comment resets the
-last clock, which is the per-branch opt-out: it needs no admin, and the comment
-says so.
-
-Recovering an archived branch is one command, whatever stage it is in:
-
-    git push origin archive/<date>/<name>:<name>
-
-Exempt, and skipped before anything is written: protected branches, the head or
-base branch of any open pull request, and everything listed in
-.github/stale-branch-exemptions.txt. Base branches matter as much as head
-branches -- deleting the base of an open PR retargets or closes it.
-
-The exemption list is checked at every stage against the branch's original
-name, so adding a line to it rescues a branch that has already been archived:
-the copy stops receiving notices and is never deleted. It does not restore the
-ref, which stays a deliberate one-command step.
+Never touched: protected branches, the head or base branch of an open pull
+request, and anything in .github/stale-branch-exemptions.txt, re-checked at
+every stage against the original name so a new line rescues an archived branch.
 
 Nothing is written unless --apply is passed.
 """
@@ -107,9 +87,8 @@ class Api:
 def load_exemptions(path: str) -> tuple[set[str], list[re.Pattern]]:
     """Exact names and ``re:`` patterns from the checked-in list.
 
-    A missing file is fatal rather than an empty list. "No exemptions" and "the
-    file moved" look identical at the call site, and only one of them should
-    let this script near a branch called main.
+    Missing or empty is fatal: it is indistinguishable from "no exemptions",
+    and only one of those should let this near a branch called main.
     """
     try:
         lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
@@ -153,13 +132,10 @@ query($owner:String!, $name:String!, $cursor:String) {
 
 
 def list_branches(api: Api) -> list[dict]:
-    """Every branch with its tip SHA and commit date, 100 per request.
+    """Every branch with its tip SHA and committer date, 100 per request.
 
-    The date is the committer date, not the author date: a rebased or
-    cherry-picked branch keeps its original author date, so authoring is a
-    measure of when the work was written rather than when the branch last
-    moved, and a branch someone rebased onto main this morning would read as
-    months old.
+    Committer, not author: a rebase keeps the author date, so a branch moved
+    onto main this morning would otherwise read as months old.
     """
     out: list[dict] = []
     cursor = None
@@ -199,8 +175,7 @@ def protected_branches(api: Api) -> set[str]:
 def pr_branches(api: Api) -> set[str]:
     """Head *and* base refs of every open pull request.
 
-    A base branch is usually the head of another open PR in a stack, but not
-    always -- an integration branch several PRs target has no PR of its own,
+    Base too: an integration branch several PRs target has no PR of its own,
     and removing it retargets or closes all of them.
     """
     names, page = set(), 1
@@ -325,8 +300,7 @@ def main() -> int:
         # An archive ref. Its date is in its name; the original name follows.
         archived_on = dt.date.fromisoformat(archived.group(1))
         original = archived.group(2)
-        # Checked again here, against the name the branch had: a line added to
-        # the list after the archiving run still rescues the copy.
+        # Against the name it had, so a line added later still rescues it.
         if original in skip or exempt(original, exempt_names, exempt_patterns):
             continue
         notice = find_marker(api, branch["sha"], NOTICE_MARKER)

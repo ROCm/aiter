@@ -1,30 +1,19 @@
 name: Archive stale branches
 
-# Archives branches with no commits for 30 days, holds them for 30 more, then
-# gives two weeks' notice before the archive copy goes: 74 days from the last
-# commit to the ref going away, 44 of them with the commits still reachable
-# under a name someone can find. Replaces the comment-only stale-branches.yml,
-# whose action can delete but cannot archive.
+# Archives branches with no commits for 30 days, holds them 30 more, then gives
+# two weeks' notice: 74 days from last commit to ref removal, 44 of them still
+# reachable under archive/<date>/<name>. Replaces the comment-only
+# stale-branches.yml, whose action can delete but cannot archive.
 #
-# The point of the archive step is that every stage is one command away from
-# undone. A branch is copied to archive/<date>/<name> before its original ref
-# goes, so the commits stay reachable and named for 44 days rather than living
-# in a reflog nobody can reach. The bot comments say how to restore.
+# Off until STALE_BRANCHES_ARCHIVE is 'true' -- every run reports and writes
+# nothing until then. --max-actions caps each run, so the ~700 branches already
+# past 30 days are worked off over weeks rather than in one morning.
 #
-# Both stages are off until someone turns them on: without the repository
-# variable STALE_BRANCHES_ARCHIVE set to 'true' (Settings > Secrets and
-# variables > Actions) every run reports what it would do and writes nothing.
-# Run it by hand first and read the listing -- roughly 700 branches are past
-# 30 days, and --max-actions caps how many any single run touches so the
-# backlog is worked off over weeks instead of in one morning.
-#
-# Exempt before anything is written: protected branches, the head or base
-# branch of any open pull request, and everything in
-# .github/stale-branch-exemptions.txt -- a checked-in list of exact branch
-# names and re: patterns, edited by pull request like any other file. That list
-# is consulted at every stage against the branch's original name, so adding a
-# line to it also rescues a branch that has already been archived. The script
-# refuses to run if the list is missing or empty.
+# Exempt: protected branches, the head or base branch of an open pull request,
+# and .github/stale-branch-exemptions.txt -- a checked-in list of names and re:
+# patterns, edited by pull request, consulted at every stage against the
+# original name so a new line also rescues an already-archived branch. The
+# script refuses to run if that list is missing or empty.
 
 on:
   schedule:
