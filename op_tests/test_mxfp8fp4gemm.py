@@ -163,12 +163,12 @@ PERF_SHAPES = {
 # Defaults for the six a8w8/AP1 cases used by the native GEMM-only benchmark.
 # An explicit --splitk (including 0 for the operator heuristic) takes precedence.
 F8GEMM_BENCHMARK_SPLITK = {
-    (512, 2048, 7168): 8,    # wqkv_a
-    (512, 7168, 16384): 4,   # wo_b
-    (512, 6144, 7168): 4,    # gate_up_proj
-    (512, 7168, 3072): 4,    # w2
+    (512, 2048, 7168): 8,  # wqkv_a
+    (512, 7168, 16384): 4,  # wo_b
+    (512, 6144, 7168): 4,  # gate_up_proj
+    (512, 7168, 3072): 4,  # w2
     (512, 65536, 1536): 1,  # wq_b
-    (512, 8192, 1536): 1,   # indexer_wq_b
+    (512, 8192, 1536): 1,  # indexer_wq_b
 }
 
 
@@ -320,7 +320,15 @@ def _prep(
         aiter.logger.info("prebenchmark begin: native Torch reference")
         torch_start_ns = time.monotonic_ns()
         ref_f32, ref_us = run_perftest(
-            _ref, intype, A, B, sA, sB, M, N, reference_splitk,
+            _ref,
+            intype,
+            A,
+            B,
+            sA,
+            sB,
+            M,
+            N,
+            reference_splitk,
             num_warmup=pre_benchmark_warmup,
             num_iters=pre_benchmark_iters,
             testGraph=False,
@@ -359,7 +367,11 @@ def _prep(
 
         ap0_start_ns = time.monotonic_ns()
         pre_out, pre_us = run_perftest(
-            run_pre_ap0, A, inp["B"], inp["sA"], inp["sB"],
+            run_pre_ap0,
+            A,
+            inp["B"],
+            inp["sA"],
+            inp["sB"],
             num_warmup=pre_benchmark_warmup,
             num_iters=pre_benchmark_iters,
             testGraph=False,
@@ -367,13 +379,17 @@ def _prep(
         )
         ap0_end_ns = time.monotonic_ns()
         pre_results["stage_windows"]["ap0"] = {
-            "start_mono_ns": ap0_start_ns, "end_mono_ns": ap0_end_ns
+            "start_mono_ns": ap0_start_ns,
+            "end_mono_ns": ap0_end_ns,
         }
         pre_results["ap0 us"] = pre_us
         pre_results["ap0 profile_gpu_kernels"] = dict(run_perftest.last_gpu_kernels)
         pre_err = checkAllclose(
-            ref_f32.to(dtypes.bf16).to(dtypes.fp32), pre_out.to(dtypes.fp32),
-            rtol=1e-1, atol=1.0, msg="prebenchmark AP0",
+            ref_f32.to(dtypes.bf16).to(dtypes.fp32),
+            pre_out.to(dtypes.fp32),
+            rtol=1e-1,
+            atol=1.0,
+            msg="prebenchmark AP0",
         )
         pre_results["ap0 err"] = pre_err
         pre_results["ap0 result"] = _verdict(pre_err)
@@ -439,12 +455,20 @@ def test_gemm(
     out_dtype = _OUT_DTYPE[outtype]
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     if no_reduce and (intype != "a8w8" or splitk < 1):
-        raise ValueError("--no-reduce requires a8w8 and a positive split-K; pass --splitk for shapes without a benchmark default")
+        raise ValueError(
+            "--no-reduce requires a8w8 and a positive split-K; pass --splitk for shapes without a benchmark default"
+        )
     if pre_benchmark and not (
-        intype == "a8w8" and apre == 1 and no_reduce and splitk > 0
-        and pre_benchmark_warmup >= 0 and pre_benchmark_iters > 1
+        intype == "a8w8"
+        and apre == 1
+        and no_reduce
+        and splitk > 0
+        and pre_benchmark_warmup >= 0
+        and pre_benchmark_iters > 1
     ):
-        raise ValueError("--pre-benchmark requires a8w8/AP1/--no-reduce/positive split-K and valid pre-benchmark counts")
+        raise ValueError(
+            "--pre-benchmark requires a8w8/AP1/--no-reduce/positive split-K and valid pre-benchmark counts"
+        )
     inp, ref_f32, pre_results = _prep(
         intype,
         M,
@@ -581,7 +605,8 @@ def test_gemm(
             if pre_benchmark:
                 ap1_end_ns = time.monotonic_ns()
                 pre_results["stage_windows"]["ap1"] = {
-                    "start_mono_ns": ap1_start_ns, "end_mono_ns": ap1_end_ns
+                    "start_mono_ns": ap1_start_ns,
+                    "end_mono_ns": ap1_end_ns,
                 }
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
@@ -767,11 +792,18 @@ def main():
         help="Time ASM GEMM only and validate each split-K plane independently",
     )
     parser.add_argument(
-        "--pre-benchmark", action="store_true",
+        "--pre-benchmark",
+        action="store_true",
         help="Before each AP1 test, benchmark the native Torch reference and native ASM AP0",
     )
     parser.add_argument("--pre-benchmark-warmup", type=int, default=2)
     parser.add_argument("--pre-benchmark-iters", type=int, default=100)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Repeat the complete preparation/prebenchmark/formal test per configuration",
+    )
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
@@ -784,6 +816,8 @@ def main():
         "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
     )
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be positive")
     if args.iters is None:
         args.iters = 5 if args.mode == "func" else 100
 
@@ -824,33 +858,37 @@ def main():
         return [_benchmark_splitk(intype, apre, M, N, K)]
 
     rows = [
-        test_gemm(
-            intype,
-            M,
-            N,
-            K,
-            apre,
-            outtype,
-            di,
-            si,
-            seed=args.seed,
-            mode=args.mode,
-            knl_name=args.knl_name,
-            splitk=splitk,
-            no_reduce=args.no_reduce,
-            num_warmup=args.warmup,
-            num_iters=args.iters,
-            test_graph=args.graph,
-            num_rotate=args.rotate,
-            pre_benchmark=args.pre_benchmark,
-            pre_benchmark_warmup=args.pre_benchmark_warmup,
-            pre_benchmark_iters=args.pre_benchmark_iters,
+        dict(
+            test_gemm(
+                intype,
+                M,
+                N,
+                K,
+                apre,
+                outtype,
+                di,
+                si,
+                seed=args.seed,
+                mode=args.mode,
+                knl_name=args.knl_name,
+                splitk=splitk,
+                no_reduce=args.no_reduce,
+                num_warmup=args.warmup,
+                num_iters=args.iters,
+                test_graph=args.graph,
+                num_rotate=args.rotate,
+                pre_benchmark=args.pre_benchmark,
+                pre_benchmark_warmup=args.pre_benchmark_warmup,
+                pre_benchmark_iters=args.pre_benchmark_iters,
+            ),
+            repeat=repeat,
         )
         for apre, (di, si), intype, outtype in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype
         )
         for (M, N, K) in shapes_for(intype)
         for splitk in splitks_for(intype, apre, M, N, K)
+        for repeat in range(1, args.repeat + 1)
     ]
     df_full = pd.DataFrame(rows)
     # JSON keeps every column (config + algo details + results) so each record is
