@@ -31,6 +31,7 @@ from .conv3d_gfx950_utils import (
     LDG_VEC,
     OOB_SENTINEL_BYTES,
     OOB_SENTINEL_ELEM,
+    ConvGeometry,
     dil,
     flat_buffer_view,
     gather_valid,
@@ -41,50 +42,6 @@ PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 
 # num_records of a rebased BIG_IN resource: the most a 32-bit voffset reaches.
 BIG_IN_NR = 0x80000000
-
-
-class ConvGeometry(NamedTuple):
-    """The implicit GEMM's shape, as the convolution's own shape implies it.
-
-    A row is one output element, so there are ``npq = N * Do * Ho * Wo`` of
-    them, and the K axis is one group's filter footprint, ``crs``. That makes
-    this both what the gather maps between and what the grid and the epilogue
-    are sized by, which is why it is derived once and shared: two derivations
-    that drifted apart would put the epilogue on a different grid than the
-    gather, for no visible reason.
-    """
-
-    do: int
-    ho: int
-    wo: int
-    dhw: int
-    hw_o: int
-    npq: int
-    cgp: int
-    crs: int
-
-
-def make_conv_geometry(param):
-    """The ConvGeometry of one ``Conv3dImplicitParam``.
-
-    Dilation only stretches the filter's footprint, so it moves the output
-    extents but leaves the K axis (CRS) alone.
-    """
-    cgp = param.c // param.groups
-    do = (param.d + 2 * param.pt - (param.dt * (param.kt - 1) + 1)) // param.st + 1
-    ho = (param.h + 2 * param.ph - (param.dh * (param.kh - 1) + 1)) // param.sh + 1
-    wo = (param.w + 2 * param.pw - (param.dw * (param.kw - 1) + 1)) // param.sw + 1
-    dhw = do * ho * wo
-    return ConvGeometry(
-        do=do,
-        ho=ho,
-        wo=wo,
-        dhw=dhw,
-        hw_o=ho * wo,
-        npq=param.n * dhw,
-        cgp=cgp,
-        crs=cgp * param.kt * param.kh * param.kw,
-    )
 
 
 class Im2colPlan(NamedTuple):

@@ -28,7 +28,7 @@ import weakref
 
 import torch
 
-from .kernels.conv3d_gfx950_utils import _as_stream
+from .kernels.conv3d_gfx950_utils import SPLITK_MAX_STAGING_BYTES, _as_stream
 from .kernels.conv3d_im2col import PADDING_MODES
 from .kernels.conv3d_implicit_gfx950 import (
     DEFAULT_TILE,
@@ -37,7 +37,6 @@ from .kernels.conv3d_implicit_gfx950 import (
     compile_conv3d_implicit,
     make_conv3d_implicit_param,
 )
-from .kernels.conv3d_scatter import SPLITK_MAX_STAGING_BYTES
 from .kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,
