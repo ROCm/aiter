@@ -254,6 +254,11 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
                                                  unsigned* __restrict__ s_wgt,
                                                  unsigned* __restrict__ s_weq)
 {
+    if(RAGGED && len <= K)
+    {
+        emit_identity_row(out, len, K);
+        return;
+    }
     const int k_out    = RAGGED ? k_take_dev(K, len) : K;
     const int n4       = RAGGED ? n4_cover(len) : (pitch / FP32_EPT);
     const vfloat4* ri4 = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch);
@@ -324,7 +329,12 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
             *fb_count = 0;
     }
 
-    if(RAGGED && len < max(S, K))
+    // Two separate reasons a row cannot go through the sampler, and they do not
+    // coincide: len <= K means every element is selected so there is nothing to
+    // rank (aiter's identity case), while len < S means the sampler would read
+    // past the row. Either way Phase B must collect nothing for this row, so the
+    // threshold is +inf and Phase C takes it through the exact/identity path.
+    if(RAGGED && (len <= K || len < S))
     {
         if(threadIdx.x == 0)
         {
@@ -1081,8 +1091,9 @@ static void topk_indices(const float* d_in,
                          int smc,
                          hipStream_t s)
 {
-    ShapeParams sp =
-        derive_shape_params(M, pitch, K, g_margin, g_sample_s, g_coop_g, (TopkPath)g_path_override);
+    const int k_geom = g_ragged ? geometry_k_ragged(K, pitch) : K;
+    ShapeParams sp   = derive_shape_params(
+        M, pitch, k_geom, g_margin, g_sample_s, g_coop_g, (TopkPath)g_path_override);
     g_sample_s = sp.S > 0 ? sp.S : g_sample_s;
     if(sp.path == PATH_SMALL_N)
     {
@@ -1205,8 +1216,10 @@ static inline WsLayout ws_layout(int M, int cap)
 // library that write is a bug: the next call on a different shape would be
 // handed the previous shape's S as an override and derive different parameters,
 // making the result depend on call order.
+// Every call here is ragged, so the geometry is sized by geometry_k_ragged()
+// (topk_shape.hip.hpp) rather than the caller's k.
 static inline ShapeParams params_for(int M, int N, int K)
-{ return derive_shape_params(M, N, K, 0.0f, 0, 0, PATH_AUTO); }
+{ return derive_shape_params(M, N, geometry_k_ragged(K, N), 0.0f, 0, 0, PATH_AUTO); }
 
 static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
 {
@@ -1252,7 +1265,7 @@ bool topk_avo_supports(int64_t numRows, int64_t stride0, int64_t k)
 {
     if(numRows <= 0 || stride0 <= 0 || k <= 0)
         return false;
-    if(k > PHASE_C_CAP_MAX || k > stride0)
+    if(k > PHASE_C_CAP_MAX)
         return false;
     if(stride0 % FP32_EPT != 0)
         return false;

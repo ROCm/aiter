@@ -46,6 +46,18 @@ constexpr int PHASE_C_CAP_MAX = 8192;
 constexpr int WSTAGE_WAVES    = 8;
 constexpr int WSTAGE_CAP      = 320;
 
+// The K the GEOMETRY has to serve on a ragged launch, which is not the caller's
+// K. A ragged row ranks min(K, row_len) <= min(K, N) elements and pads the rest
+// of its output with -1, so asking derive_shape_params for a K above the pitch
+// requests a candidate capacity that cannot exist and gets the shape refused.
+// aiter's own top_k_per_row_prefill has no k <= stride0 guard and emits the
+// identity for such rows (topk_per_row_kernels.cu:398, :2241), so refusing here
+// would be this op declining a shape the one it replaces accepts.
+//
+// One definition, used by both the harness dispatcher and the aiter entry: a
+// second copy is a way for the two to disagree about which shapes are servable.
+__host__ inline int geometry_k_ragged(int K, int N) { return K < N ? K : N; }
+
 // gfx950 occupancy inputs for the small_n launch geometry. SMALL_N_STATIC_LDS is
 // the kernel's static __shared__ footprint, read off .group_segment_fixed_size
 // with the dynamic row buffer excluded.

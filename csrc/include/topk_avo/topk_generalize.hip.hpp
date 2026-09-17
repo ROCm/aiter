@@ -31,6 +31,11 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     const int row   = blockIdx.x;
     const int len   = row_len_dev(row, pitch, row_ends);
     const float* ri = input + (size_t)row * pitch;
+    if(RAGGED && len <= K)
+    {
+        emit_identity_row(out_idx + (size_t)row * K, len, K);
+        return;
+    }
     extern __shared__ uint32_t s_keys[];
     __shared__ uint32_t s_hist[HIST_SLOTS];
     __shared__ uint32_t s_red[256];

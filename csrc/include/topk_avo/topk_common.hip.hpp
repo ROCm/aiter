@@ -106,6 +106,22 @@ __device__ __forceinline__ void pad_topk_tail(int* out, int k_take, int K)
         out[i] = -1;
 }
 
+// A row with row_len <= K has every element selected, so there is nothing to
+// rank: emit the columns in index order and pad the tail with -1. This is
+// aiter's own convention for the case, in both of its kernels
+// (topk_per_row_kernels.cu:398 mb path, :2241 ob path), and matching it is not
+// cosmetic -- which of those kernels runs is a perf heuristic on aiter's side,
+// so the padding and the emit have to agree or the same call would mean
+// different things at a batch-size boundary.
+//
+// rowStarts is zero by this op's contract, so the column index IS the output
+// index; aiter adds rowStart here.
+__device__ __forceinline__ void emit_identity_row(int* __restrict__ out, int len, int K)
+{
+    for(int i = threadIdx.x; i < K; i += blockDim.x)
+        out[i] = (i < len) ? i : -1;
+}
+
 // LDS capacity for the Phase C candidate set (keys + indices).
 constexpr int PHASE_C_CAP = 4096; // 4096 * (4+4) B = 32 KB LDS
 
