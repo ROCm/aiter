@@ -236,6 +236,35 @@ def fp8_mqa_logits(
             num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
             # Relax the store masking if we don't have to provide clean logits
             relaxed_store = 0 if clean_logits else 1
+            # Sweep-selected prefill buckets; retain the heuristic outside
+            # the measured shapes, input layouts, and compiler version.
+            if (
+                seq_len == 4096
+                and num_heads == 32
+                and head_size == 128
+                and seq_len_kv in (4096, 16384, 65664, 131072)
+                and TRITON_VERSION.release[:2] == (3, 7)
+                and ASYNC_COPY_SUPPORTS_DISTRIBUTED
+                and USE_FOLDED_REDUCTION
+                and Q.dtype == KV.dtype == torch.float8_e4m3fn
+                and kv_scales.dtype == weights.dtype == torch.float32
+                and cu_starts.dtype == cu_ends.dtype == torch.int32
+                and all(
+                    tensor.is_contiguous()
+                    for tensor in (Q, KV, kv_scales, weights, cu_starts, cu_ends)
+                )
+            ):
+                block_m = 2
+                waves_per_eu = 2
+                if seq_len_kv in (65664, 131072):
+                    block_kv = 128
+                    num_chains = 2 if clean_logits else 4
+                elif clean_logits:
+                    num_chains = 1
+                else:
+                    num_chains = 2
+                    if seq_len_kv == 4096:
+                        waves_per_eu = 3
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
