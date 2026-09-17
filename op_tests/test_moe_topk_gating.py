@@ -775,8 +775,8 @@ def main():
     parser.add_argument(
         "--num-experts",
         type=str2tuple,
-        default=[64, 128, 256, 384],
-        help="Comma-separated list of number of experts (default: 64,128,256,384)",
+        default=[64, 128, 256, 384, 512, 640],
+        help="Comma-separated list of number of experts (default: 64,128,256,384,512,640)",
     )
     parser.add_argument(
         "--num-tokens",
