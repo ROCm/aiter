@@ -514,15 +514,48 @@ class TestMhaCheckpointJournal(unittest.TestCase):
             tuner._args = argparse.Namespace(resume=True)
             tuner._append_journal_result("first", (info, 2.1, 0.0, "ok"))
             tuner._append_journal_result(
-                "finalist:0", (info, float("inf"), 1.0, "timeout")
+                "finalist:0",
+                (info, float("inf"), 1.0, "timeout", "exceeded 60s after 61.2s"),
             )
             with open(tuner._journal_path, "a", encoding="utf-8") as file:
                 file.write('{"incomplete":')
             records = tuner._load_journal()
         key = (mha_fwd_candidate_id(problem, candidate), "first")
-        self.assertEqual(records[key][1:], (2.1, 0.0, "ok"))
+        self.assertEqual(records[key][1:], (2.1, 0.0, "ok", ""))
         failed_key = (mha_fwd_candidate_id(problem, candidate), "finalist:0")
-        self.assertEqual(records[failed_key][1:], (float("inf"), 1.0, "timeout"))
+        self.assertEqual(
+            records[failed_key][1:],
+            (float("inf"), 1.0, "timeout", "exceeded 60s after 61.2s"),
+        )
+
+    def test_journal_reads_records_written_before_details_existed(self):
+        """A schema 1 journal must still resume rather than be discarded."""
+        tuner = _TUNER.MhaFwdTuner()
+        problem = MhaFwdProblem.from_mapping(_problem_row())
+        candidate = MhaFwdCandidate("asm_v3", 3)
+        legacy = {
+            "schema_version": 1,
+            "candidate_id": mha_fwd_candidate_id(problem, candidate),
+            "phase": "first",
+            "problem": problem.as_row(),
+            "candidate": {
+                "backend": candidate.backend,
+                "num_splits": candidate.num_splits,
+                "backend_config": "",
+            },
+            "status": "crash",
+            "us": None,
+            "errRatio": 1.0,
+            "recorded_at_unix_s": 0.0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            tuner._journal_path = os.path.join(directory, "run.jsonl")
+            tuner._args = argparse.Namespace(resume=True)
+            with open(tuner._journal_path, "w", encoding="utf-8") as file:
+                file.write(json.dumps(legacy) + "\n")
+            records = tuner._load_journal()
+        key = (mha_fwd_candidate_id(problem, candidate), "first")
+        self.assertEqual(records[key][1:], (float("inf"), 1.0, "crash", ""))
 
     def test_selection_trace_is_append_only_json(self):
         with tempfile.TemporaryDirectory() as directory:
