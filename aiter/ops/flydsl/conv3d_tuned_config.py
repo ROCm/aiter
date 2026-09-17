@@ -183,10 +183,11 @@ def _lookup_tuned_tile(key, device):
 #
 # These live here rather than in conv3d_policy because they are the runtime
 # decision, as tuned_gemm's default_config is, while the policy module is the
-# tuner's candidate enumeration -- and because the kernel module calls them, so
-# putting them in the policy would make the kernel import a module that imports
-# the kernel back. _resolve_splitk stays in the kernel: its window is asserted
-# inside the kernel body, and it keys on TILE_K and DEFAULT_TILE.
+# tuner's candidate enumeration -- and because conv_kernels calls them on the
+# path that dispatches a conv, next to the table lookup they back up.
+# _resolve_splitk is the third runtime decision but sits in conv_kernels
+# instead: it keys on TILE_K and DEFAULT_TILE, and the staging window it
+# respects is asserted inside the kernel body.
 # ---------------------------------------------------------------------------
 
 TILE_LADDER = ((128, 128, 2, 4), (64, 64, 2, 2), (32, 32, 1, 2))

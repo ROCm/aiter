@@ -205,7 +205,7 @@ class Conv3dTuner(TunerCommon):
     # -------------------------------------------------------------------
 
     def _shape_tasks(self, keys, max_configs):
-        from aiter.ops.flydsl.kernels.conv3d_implicit import _resolve_splitk
+        from aiter.ops.flydsl.conv_kernels import _resolve_splitk
 
         kv = dict(zip(self.keys, keys))
         n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
