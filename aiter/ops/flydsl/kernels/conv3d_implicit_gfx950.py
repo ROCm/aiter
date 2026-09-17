@@ -183,9 +183,9 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     # problem's own constraints, which no tile can satisfy on its behalf.
     assert c % groups == 0, f"c={c} not divisible by groups={groups}"
     assert k % groups == 0, f"k={k} not divisible by groups={groups}"
-    assert CGP % LDG_VEC == 0, (
-        f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
-    )
+    assert (
+        CGP % LDG_VEC == 0
+    ), f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
 
     W_BYTES = weight_bytes(param, geom)
 

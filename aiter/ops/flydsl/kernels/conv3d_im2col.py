@@ -122,17 +122,17 @@ def make_im2col_plan(param, geom, cfg):
     pad_mode, groups = param.pad_mode, param.groups
     do, ho, wo, hw_o = geom.do, geom.ho, geom.wo, geom.hw_o
 
-    assert pad_mode in PADDING_MODES, (
-        f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
-    )
+    assert (
+        pad_mode in PADDING_MODES
+    ), f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
 
     x_elems = n * c * d * h * w
     x_bytes = x_elems * BF16_BYTES
     big_in = x_elems > 0x7FFFFFFF
     assert x_bytes < OOB_SENTINEL_BYTES or big_in, f"input {x_bytes}B exceeds limit"
-    assert pad_mode == "zeros" or not big_in, (
-        "non-zero pad_mode requires the non-BIG_IN address path"
-    )
+    assert (
+        pad_mode == "zeros" or not big_in
+    ), "non-zero pad_mode requires the non-BIG_IN address path"
 
     big_in_n1 = big_in and n == 1
     big_in_nm = big_in and n > 1
