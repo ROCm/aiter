@@ -502,39 +502,45 @@ decode 3b ~103 µs at ``M=1`` (64 splits). 3d owns tiles/MFMA.
 | 512 | 32768 | 8192 | 2051 | 11884.8 | 284.6 | 0 | 0 |
 
 - [ ] **3d.** Family A ``BLOCK_N=16`` QK/PV MFMA (group padded to 16),
+      128-bit paged K/V gather (one page translate per column owner),
       same split-K ABI. gfx950 QK uses ``16x16x32``; gfx942 retains
-      ``16x16x16``. One wave computes split weights in the merge instead
-      of every output thread. Decode beats #4882 Triton GQA but **does not**
-      beat live AMD (~1.5–1.8× at ``M=8``, ~1.8× at ``M=1``). Prefill is
-      ~2× AMD/#4882. Not a win claim; gfx950 extra LDS remains 3g.
+      ``16x16x16``. Softmax runs on wave 0 off the reduced C fragment,
+      so the ``s`` LDS tile is gone. A **loop-top barrier** keeps the
+      next gather from overwriting ``k``/``v``/``p`` LDS while the
+      previous tile's PV is still reading them — without it prefill
+      ``M=512`` shows ~0.05% of elements outside ``1e-2``. One wave
+      computes split weights in the merge. Decode beats #4882 Triton GQA
+      but **does not** beat live AMD (~1.6–1.8× at ``M=8``, ~1.8× at
+      ``M=1``). Prefill is ~2× AMD/#4882. Not a win claim; gfx950 extra
+      LDS remains 3g.
 
-GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. Host splits
-keep decode at 64 and cap prefill at 8. MFMA PV, gfx950 K32 QK, fast math,
-BF16 split outputs, and one-wave merge weights reduce decode ``M=1`` to
-~20 µs (3d QK-only: ~51 µs; 3b: ~103 µs). Prefill drops to ~0.54–0.57 ms
-(3d QK-only: ~4.3 ms; 3c: ~11.7 ms).
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0` on decode and
+prefill. Host splits keep decode at 64 and cap prefill at 8. The
+vectorized gather buys ~2–4% at decode over the previous 3d point
+(~20.1–20.5 µs at ``M=1``) and leaves prefill flat; it does not close
+the gap to live AMD.
 
 Decode:
 
 | m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
 |--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
-| 1 | 512 | 128 | 2051 | 20.1 | 11.0 | 113.0 | 0 |
-| 8 | 512 | 128 | 2051 | 24.4 | 14.3 | 115.5 | 0 |
-| 1 | 2048 | 512 | 2051 | 20.3 | 11.2 | 115.5 | 0 |
-| 8 | 2048 | 512 | 2051 | 26.9 | 18.0 | 125.4 | 0 |
-| 1 | 8192 | 2048 | 2051 | 20.5 | 11.2 | 117.7 | 0 |
-| 8 | 8192 | 2048 | 2051 | 27.2 | 16.8 | 124.1 | 0 |
-| 1 | 32768 | 8192 | 2051 | 20.4 | 11.2 | 119.2 | 0 |
-| 8 | 32768 | 8192 | 2051 | 27.6 | 17.3 | 124.7 | 0 |
+| 1 | 512 | 128 | 2051 | 19.6 | 11.0 | 112.9 | 0 |
+| 8 | 512 | 128 | 2051 | 24.0 | 14.5 | 115.5 | 0 |
+| 1 | 2048 | 512 | 2051 | 19.9 | 11.3 | 116.0 | 0 |
+| 8 | 2048 | 512 | 2051 | 26.4 | 17.1 | 125.7 | 0 |
+| 1 | 8192 | 2048 | 2051 | 20.0 | 11.3 | 117.2 | 0 |
+| 8 | 8192 | 2048 | 2051 | 26.2 | 17.1 | 122.6 | 0 |
+| 1 | 32768 | 8192 | 2051 | 20.0 | 11.3 | 119.1 | 0 |
+| 8 | 32768 | 8192 | 2051 | 26.5 | 16.9 | 122.5 | 0 |
 
 Prefill:
 
 | m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
 |--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
-| 512 | 512 | 128 | 2051 | 536.1 | 204.7 | 225.0 | 0 |
-| 512 | 2048 | 512 | 2051 | 549.7 | 214.5 | 238.6 | 0 |
-| 512 | 8192 | 2048 | 2051 | 564.1 | 247.2 | 260.5 | 0 |
-| 512 | 32768 | 8192 | 2051 | 568.9 | 286.8 | 281.6 | 0 |
+| 512 | 512 | 128 | 2051 | 538.0 | 204.0 | 222.3 | 0 |
+| 512 | 2048 | 512 | 2051 | 559.9 | 214.9 | 237.6 | 0 |
+| 512 | 8192 | 2048 | 2051 | 570.6 | 248.5 | 260.9 | 0 |
+| 512 | 32768 | 8192 | 2051 | 573.5 | 286.9 | 282.4 | 0 |
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
