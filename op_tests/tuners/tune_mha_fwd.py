@@ -464,6 +464,16 @@ class MhaFwdTuner(TunerCommon):
                 "each tile grid, for exercising the pipeline end to end"
             ),
         )
+        self.parser.add_argument(
+            "--backends",
+            default="",
+            help=(
+                "comma-separated backends this run may measure (default: all "
+                "legal ones). A control for comparing storage contracts, not a "
+                "tuning mode: the winner is the fastest of what was allowed, "
+                "not the fastest available"
+            ),
+        )
 
     def _setup_common_arguments(self):
         super()._setup_common_arguments()
@@ -717,7 +727,7 @@ class MhaFwdTuner(TunerCommon):
             key = problem.key()
             softmax_scale = int(row.hdim_q) ** -0.5
             candidates = enumerate_mha_fwd_candidates(
-                str(row.gfx), self._args.strategy
+                str(row.gfx), self._args.strategy, self._restricted_backends()
             )
             print(
                 f"tuning MHA row {row_index}: {len(candidates)} candidates for {key}",
@@ -1120,6 +1130,11 @@ class MhaFwdTuner(TunerCommon):
             frame = frame.sort_values(list(MHA_FWD_TUNING_KEY_FIELDS))
         self._atomic_write_csv(frame[list(MHA_FWD_RUNTIME_CSV_FIELDS)], tune_file)
 
+    def _restricted_backends(self) -> list[str] | None:
+        """Backends this run is allowed to measure, or None for all of them."""
+        value = (getattr(self._args, "backends", "") or "").strip()
+        return [name.strip() for name in value.split(",") if name.strip()] or None
+
     def _publish_backend_configs(self, runtime):
         """Hand each winner's launch configuration to the configured store.
 
@@ -1304,6 +1319,7 @@ class MhaFwdTuner(TunerCommon):
             },
             "selection_proofs": self._selection_proofs,
             "config_store": get_mha_fwd_store().describe(),
+            "restricted_backends": self._restricted_backends(),
             "coverage_limits": [
                 "CK tile recipes remain the default CK launch; this tuner does not dump PR #5024 JSON",
             ],

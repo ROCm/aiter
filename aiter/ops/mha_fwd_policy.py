@@ -513,7 +513,9 @@ def _tile_grid(axes: tuple[tuple, ...], strategy: str) -> list[tuple]:
 
 
 def enumerate_mha_fwd_candidates(
-    gfx: str, strategy: str = "exhaustive"
+    gfx: str,
+    strategy: str = "exhaustive",
+    backends: Sequence[str] | None = None,
 ) -> tuple[MhaFwdCandidate, ...]:
     """Return the legal offline search catalogue for one architecture.
 
@@ -523,12 +525,21 @@ def enumerate_mha_fwd_candidates(
     the measure-publish-replay path end to end without paying for thousands of
     launches; its evidence identifies it so a sampled run is never mistaken
     for a complete search.
+
+    ``backends`` restricts the catalogue to the named backends. This is a
+    control for comparing storage contracts, not a tuning mode: a winner drawn
+    from a restricted field is the fastest of what was allowed to run, not the
+    fastest available, so its evidence records the restriction.
     """
     if strategy not in MHA_FWD_SEARCH_STRATEGIES:
         raise ValueError(
             f"unknown MHA search strategy {strategy!r}; "
             f"expected one of {list(MHA_FWD_SEARCH_STRATEGIES)}"
         )
+    if backends is not None:
+        unknown = sorted(set(backends) - MHA_FWD_BACKENDS)
+        if unknown:
+            raise ValueError(f"unknown MHA backends {unknown}")
 
     candidates: list[MhaFwdCandidate] = []
     if gfx in ("gfx942", "gfx950"):
@@ -583,6 +594,12 @@ def enumerate_mha_fwd_candidates(
         candidates.append(MhaFwdCandidate("opus"))
     if gfx == "gfx1250":
         candidates.append(MhaFwdCandidate("flydsl"))
+
+    if backends is not None:
+        allowed = set(backends)
+        candidates = [
+            candidate for candidate in candidates if candidate.backend in allowed
+        ]
 
     identities = [candidate.identity for candidate in candidates]
     if len(identities) != len(set(identities)):
