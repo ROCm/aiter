@@ -13,11 +13,10 @@ from __future__ import annotations
 
 import torch
 
+from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx950 import MAX_NN
 from op_tests.flydsl_tests.test_flydsl_fp8_paged_mqa_logits import (
     ref_fp8_paged_mqa_logits,
 )
-
-MAX_NN = 8
 
 
 def sample_next_n_lens(nq: int, max_nn: int = MAX_NN, seed: int = 1079) -> torch.Tensor:

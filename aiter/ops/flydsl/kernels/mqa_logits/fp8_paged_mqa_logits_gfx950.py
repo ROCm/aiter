@@ -13,7 +13,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -21,7 +21,7 @@ from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 from .. import buffer_ops
 from ..mxfp4_gemm_common import _lds_ptr3
-from ..tensor_shim import GTensor, _run_compiled, _to_raw
+from ..tensor_shim import GTensor, _run_compiled
 
 Vec = fx.Vector
 
@@ -34,7 +34,6 @@ MFMA_M = MFMA_N = 16
 MFMA_K = HEAD_DIM
 M_TILES = NUM_HEADS // MFMA_M
 DREG = 4
-B_RING = KV_BLOCK_SIZE // MFMA_N
 TILE_I32 = HEAD_DIM * MFMA_N // 4
 HALF_I32 = MFMA_N * 16 // 4
 LANE_K_I32 = (HEAD_DIM // (64 // MFMA_N)) * MFMA_N // 4
@@ -71,11 +70,6 @@ def umod(a, b):
 def uceildiv(a, b):
     a, b = fx.Int32(a), fx.Int32(b)
     return fx.Int32((fx.Uint32(a) + fx.Uint32(b) - 1) // fx.Uint32(b))
-
-
-def imin(a, b):
-    a, b = fx.Int32(a), fx.Int32(b)
-    return (a <= b).select(a, b)
 
 
 def _wait_all():
@@ -174,7 +168,6 @@ def _make_out_row_view(logits, stride_out, row):
         logits,
         dtype=T.f32,
         shape=(-1,),
-        cache_modifier=0,
         static_bytes_offset_i64=byte,
     )
 
@@ -231,13 +224,16 @@ def _build_kernel():
         table_t = GTensor(kv_indices, dtype=T.i32, shape=(-1,))
         nn_t = GTensor(next_n_lens, dtype=T.i32, shape=(-1,))
 
-        ragged_nn = imin(fx.Int32(nn_t[pid_batch]), rows_per_batch)
+        def _imin(a, b):
+            return (a <= b).select(a, b)
+
+        ragged_nn = _imin(fx.Int32(nn_t[pid_batch]), rows_per_batch)
         nn = (has_next_n_lens != 0).select(ragged_nn, rows_per_batch)
         context_len = fx.Int32(context_t[pid_batch])
         page_count = uceildiv(context_len, fx.Int32(KV_BLOCK_SIZE))
         pages_per_split = uceildiv(page_count, split_kv)
         page_lo = pid_split * pages_per_split
-        page_hi = imin(page_lo + pages_per_split, page_count)
+        page_hi = _imin(page_lo + pages_per_split, page_count)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base = fx.Int32(fx.ptrtoint(lds.raw.ptr))
@@ -291,7 +287,7 @@ def _build_kernel():
         gpu.barrier()
 
         def _load_physical(page):
-            safe_page = imin(page, page_hi - fx.Int32(1))
+            safe_page = _imin(page, page_hi - fx.Int32(1))
             return fx.Int32(
                 buffer_ops.buffer_load(
                     table_t.rsrc,
@@ -324,9 +320,7 @@ def _build_kernel():
             )
 
             def _write(_out=out, _col=col, _value=value):
-                # Cached write-allocate so the following topk can hit L2.
-                # KV page DMA stays NT (aux=2) and does not evict these lines.
-                buffer_ops.buffer_store(_value, _out.rsrc, _col, cache_modifier=0)
+                _out[_col] = _value
 
             _guarded(
                 (lane_div_16 == 0)
@@ -464,7 +458,7 @@ def _build_kernel():
             max_block_len,
             stride_out,
         ).launch(
-            grid=(arith.index_cast(T.index, _to_raw(grid_blocks)), 1, 1),
+            grid=(fx.Int64(grid_blocks), 1, 1),
             block=(THREADS, 1, 1),
             stream=stream,
         )
