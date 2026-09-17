@@ -122,6 +122,13 @@ class MegaMoEV2:
         )
 
         self.sort_block_m = 32
+        # Opt-in hardware bounds checking for the Stage1 control buffers.  Off
+        # by default so production keeps today's descriptors; turn it on while
+        # sweeping configurations, where an indexing mistake would otherwise
+        # page-fault and can leave a GPU needing a privileged reset.
+        self._s1_bounds_check = (
+            os.environ.get("AITER_MEGA_MOE_BOUNDS_CHECK", "0") == "1"
+        )
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -627,6 +634,7 @@ class MegaMoEV2:
             "swiglu_limit": self.swiglu_limit,
             "a_dtype": self._a_dtype,
             "out_dtype": self._a_dtype,
+            "bounds_check": self._s1_bounds_check,
         }
         entry = self._active_bundle_entry
         use_bundle = (
