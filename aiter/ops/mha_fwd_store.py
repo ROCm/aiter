@@ -32,6 +32,7 @@ from typing import Any, Mapping, Protocol
 
 from aiter.ops.mha_fwd_policy import (
     MHA_FWD_TILE_CONFIG_BACKENDS,
+    MHA_FWD_TILE_CONFIG_KEYS,
     MhaFwdProblem,
     canonical_backend_config,
 )
@@ -119,7 +120,6 @@ class JsonShapeStore:
         # Imported here so the op layer does not pull the Triton config
         # machinery in at module import time.
         from aiter.ops.triton.utils.attention_config_utils import (
-            MHA_TUNABLE_KEYS,
             format_mha_shape_key,
             mha_config_relpath,
         )
@@ -135,7 +135,7 @@ class JsonShapeStore:
         entry = validate_config_entry(
             config,
             required=(),
-            optional=MHA_TUNABLE_KEYS[backend],
+            optional=MHA_FWD_TILE_CONFIG_KEYS[backend],
             where=f"{backend} MHA winner for {problem.key()}",
         )
         relpath = mha_config_relpath(backend, arch=problem.gfx)

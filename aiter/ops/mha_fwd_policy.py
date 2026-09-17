@@ -361,6 +361,24 @@ MHA_FWD_SELECTION_PROOF_ENV = "AITER_MHA_FWD_SELECTION_PROOF_FILE"
 # why the selection proof has to observe the config as well as the backend.
 MHA_FWD_TILE_CONFIG_BACKENDS = frozenset({"gluon", "triton"})
 
+# The launch keys the tuner is able to choose, per dict-config backend. This is
+# the closed vocabulary a loaded backend_config is validated against, and it is
+# kept honest by a test asserting it matches what enumeration actually emits.
+MHA_FWD_TILE_CONFIG_KEYS = {
+    "triton": frozenset(
+        {
+            "BLOCK_M",
+            "BLOCK_N",
+            "PRELOAD_V",
+            "num_warps",
+            "waves_per_eu",
+            "num_stages",
+            "num_ctas",
+        }
+    ),
+    "gluon": frozenset({"BLOCK_M", "BLOCK_N", "num_warps", "waves_per_eu"}),
+}
+
 _RECORDED_SELECTIONS: set[str] = set()
 
 
@@ -441,8 +459,19 @@ def validate_mha_fwd_plan_fields(
             raise ValueError("asm_v3 requires an explicit split count in [1, 8]")
     elif int(num_splits) != 0:
         raise ValueError(f"{backend} does not accept an external split count")
-    if backend_config and backend not in ("triton", "gluon"):
-        raise ValueError(f"{backend} does not accept backend_config")
+    if backend_config:
+        if backend not in MHA_FWD_TILE_CONFIG_BACKENDS:
+            raise ValueError(f"{backend} does not accept backend_config")
+        # Every other field of a loaded row is checked against a closed
+        # vocabulary; without this the one free-form field would reach the
+        # kernel unchecked, and a stale or misspelled key would surface as a
+        # launch TypeError on the deployment that read the CSV.
+        unknown = sorted(set(backend_config) - MHA_FWD_TILE_CONFIG_KEYS[backend])
+        if unknown:
+            raise ValueError(
+                f"{backend} backend_config carries keys the tuner never "
+                f"chooses: {unknown}"
+            )
 
 
 def validate_mha_fwd_backend_arch(backend: str, gfx: str) -> None:
@@ -458,8 +487,48 @@ def validate_mha_fwd_backend_arch(backend: str, gfx: str) -> None:
         raise ValueError(f"MHA backend {backend!r} does not support {gfx!r}")
 
 
-def enumerate_mha_fwd_candidates(gfx: str) -> tuple[MhaFwdCandidate, ...]:
-    """Return the complete legal offline search catalogue for one architecture."""
+MHA_FWD_SEARCH_STRATEGIES = ("exhaustive", "smoke")
+
+# How many configurations the smoke strategy keeps per dict-config backend.
+# Small enough that a full two-arm run finishes in minutes, large enough that
+# the winner is still chosen between genuinely different tile shapes.
+MHA_FWD_SMOKE_PER_BACKEND = 8
+
+
+def _tile_grid(axes: tuple[tuple, ...], strategy: str) -> list[tuple]:
+    """Expand tuning axes into configurations for the requested strategy.
+
+    Exhaustive is the full cartesian product. Smoke advances every axis at
+    once, taking value ``i % len(axis)`` from each, so a short sample still
+    varies warps and stages rather than only the outer block sizes. Striding
+    the flattened product cannot do this: the product's inner axes cycle with
+    a period that a stride tends to land on, silently pinning them.
+    """
+    if strategy != "smoke":
+        return list(product(*axes))
+    return [
+        tuple(axis[index % len(axis)] for axis in axes)
+        for index in range(MHA_FWD_SMOKE_PER_BACKEND)
+    ]
+
+
+def enumerate_mha_fwd_candidates(
+    gfx: str, strategy: str = "exhaustive"
+) -> tuple[MhaFwdCandidate, ...]:
+    """Return the legal offline search catalogue for one architecture.
+
+    ``exhaustive`` is the full catalogue and the only strategy whose evidence
+    may claim the fastest legal configuration was found. ``smoke`` keeps every
+    name-is-config backend but only a slice of each tile grid, for exercising
+    the measure-publish-replay path end to end without paying for thousands of
+    launches; its evidence identifies it so a sampled run is never mistaken
+    for a complete search.
+    """
+    if strategy not in MHA_FWD_SEARCH_STRATEGIES:
+        raise ValueError(
+            f"unknown MHA search strategy {strategy!r}; "
+            f"expected one of {list(MHA_FWD_SEARCH_STRATEGIES)}"
+        )
 
     candidates: list[MhaFwdCandidate] = []
     if gfx in ("gfx942", "gfx950"):
@@ -474,7 +543,9 @@ def enumerate_mha_fwd_candidates(gfx: str) -> tuple[MhaFwdCandidate, ...]:
         (1, 2, 3, 4),
         (1, 2, 3),
     )
-    for block_m, block_n, preload_v, warps, waves, stages in product(*triton_axes):
+    for block_m, block_n, preload_v, warps, waves, stages in _tile_grid(
+        triton_axes, strategy
+    ):
         candidates.append(
             MhaFwdCandidate(
                 "triton",
@@ -497,7 +568,7 @@ def enumerate_mha_fwd_candidates(gfx: str) -> tuple[MhaFwdCandidate, ...]:
             (2, 4, 8),
             (1, 2, 3, 4),
         )
-        for block_m, block_n, warps, waves in product(*gluon_axes):
+        for block_m, block_n, warps, waves in _tile_grid(gluon_axes, strategy):
             candidates.append(
                 MhaFwdCandidate(
                     "gluon",

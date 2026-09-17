@@ -43,7 +43,6 @@ logger = AiterTritonLogger()
 
 __all__ = [
     "MHA_CONFIG_NAME",
-    "MHA_TUNABLE_KEYS",
     "current_mha_hardware_key",
     "format_mha_shape_key",
     "get_mha_config",
@@ -56,23 +55,6 @@ MHA_CONFIG_NAME = "MHA"
 # The two backends spell their family file differently; the tree layout is
 # otherwise identical, so the difference is confined to this table.
 _MHA_CONFIG_FILENAME = {"triton": "DEFAULT.json", "gluon": "mha.json"}
-
-# Tunable keys the MHA forward tuner is allowed to publish, per backend. These
-# mirror the axes enumerate_mha_fwd_candidates() sweeps. The writer validates
-# against them, so a typo lands as a failed tuning run rather than as a
-# silently ignored entry in a config file.
-MHA_TUNABLE_KEYS = {
-    "triton": (
-        "BLOCK_M",
-        "BLOCK_N",
-        "PRELOAD_V",
-        "num_warps",
-        "num_stages",
-        "num_ctas",
-        "waves_per_eu",
-    ),
-    "gluon": ("BLOCK_M", "BLOCK_N", "num_warps", "waves_per_eu"),
-}
 
 
 def mha_config_relpath(backend: str, arch: str | None = None) -> str:

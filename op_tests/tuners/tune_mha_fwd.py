@@ -41,6 +41,7 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_HARDWARE_KEY_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
+    MHA_FWD_SEARCH_STRATEGIES,
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdCandidate,
     MhaFwdProblem,
@@ -454,9 +455,14 @@ class MhaFwdTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--strategy",
-            choices=("exhaustive",),
+            choices=MHA_FWD_SEARCH_STRATEGIES,
             default="exhaustive",
-            help="candidate search strategy (only exhaustive is currently supported)",
+            help=(
+                "candidate search strategy. exhaustive measures every legal "
+                "configuration and is the only one whose winner may be called "
+                "fastest; smoke keeps every name-is-config backend but samples "
+                "each tile grid, for exercising the pipeline end to end"
+            ),
         )
 
     def _setup_common_arguments(self):
@@ -710,7 +716,9 @@ class MhaFwdTuner(TunerCommon):
             )
             key = problem.key()
             softmax_scale = int(row.hdim_q) ** -0.5
-            candidates = enumerate_mha_fwd_candidates(str(row.gfx))
+            candidates = enumerate_mha_fwd_candidates(
+                str(row.gfx), self._args.strategy
+            )
             print(
                 f"tuning MHA row {row_index}: {len(candidates)} candidates for {key}",
                 flush=True,

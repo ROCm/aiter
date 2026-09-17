@@ -3,6 +3,7 @@
 """CPU-only tests for MHA config persistence: the writer, the tier walk, and
 the two candidate storage contracts behind the store seam."""
 
+import collections
 import json
 import os
 import tempfile
@@ -12,7 +13,11 @@ from unittest import mock
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 
 from aiter.ops.mha_fwd_policy import (
+    MHA_FWD_TILE_CONFIG_BACKENDS,
+    MHA_FWD_TILE_CONFIG_KEYS,
+    MhaFwdPlan,
     MhaFwdProblem,
+    enumerate_mha_fwd_candidates,
     fold_mha_fwd_selection_records,
     mha_fwd_config_matches,
 )
@@ -29,7 +34,7 @@ from aiter.ops.triton.utils.config_writer import (
     write_config_json,
 )
 
-_TRITON_KEYS = attn_cfg.MHA_TUNABLE_KEYS["triton"]
+_TRITON_KEYS = tuple(sorted(MHA_FWD_TILE_CONFIG_KEYS["triton"]))
 _SHAPE = dict(
     mode="varlen",
     hdim_q=192,
@@ -433,6 +438,86 @@ class TestWinnerRoundTrip(unittest.TestCase):
                 False, torch.bfloat16, head_dim_v=128, shape_key=other_key
             )
         self.assertEqual(after, baseline)
+
+
+class TestTileConfigVocabulary(unittest.TestCase):
+    """A loaded backend_config is the only free-form field in the runtime CSV,
+    so it is the one field a closed vocabulary has to be enforced on."""
+
+    def test_the_vocabulary_matches_what_enumeration_actually_emits(self):
+        for gfx in ("gfx942", "gfx950", "gfx1250"):
+            emitted = collections.defaultdict(set)
+            for candidate in enumerate_mha_fwd_candidates(gfx):
+                if candidate.backend_config:
+                    emitted[candidate.backend].update(candidate.backend_config)
+            for backend, keys in emitted.items():
+                with self.subTest(gfx=gfx, backend=backend):
+                    self.assertEqual(keys, set(MHA_FWD_TILE_CONFIG_KEYS[backend]))
+
+    def test_a_misspelled_key_is_rejected_at_load_rather_than_at_launch(self):
+        with self.assertRaisesRegex(ValueError, "never chooses"):
+            MhaFwdPlan(backend="triton", backend_config={"BLOCK_MM": 128})
+
+    def test_a_gluon_plan_rejects_a_triton_only_key(self):
+        with self.assertRaisesRegex(ValueError, "never chooses"):
+            MhaFwdPlan(backend="gluon", backend_config={"num_stages": 2})
+
+    def test_a_legal_config_still_loads(self):
+        plan = MhaFwdPlan(backend="triton", backend_config={"BLOCK_M": 128})
+        self.assertEqual(plan.backend_config, {"BLOCK_M": 128})
+
+    def test_a_name_is_config_backend_still_refuses_any_config(self):
+        with self.assertRaisesRegex(ValueError, "does not accept backend_config"):
+            MhaFwdPlan(backend="opus", backend_config={"BLOCK_M": 128})
+
+
+class TestSmokeStrategy(unittest.TestCase):
+    def test_smoke_is_a_strict_subset_of_the_exhaustive_catalogue(self):
+        for gfx in ("gfx942", "gfx950", "gfx1250"):
+            with self.subTest(gfx=gfx):
+                full = {c.identity for c in enumerate_mha_fwd_candidates(gfx)}
+                smoke = {c.identity for c in enumerate_mha_fwd_candidates(gfx, "smoke")}
+                self.assertTrue(smoke <= full)
+
+    def test_smoke_keeps_every_name_is_config_backend(self):
+        full = collections.Counter(
+            c.backend for c in enumerate_mha_fwd_candidates("gfx950")
+        )
+        smoke = collections.Counter(
+            c.backend for c in enumerate_mha_fwd_candidates("gfx950", "smoke")
+        )
+        for backend, count in full.items():
+            if backend not in MHA_FWD_TILE_CONFIG_BACKENDS:
+                with self.subTest(backend=backend):
+                    self.assertEqual(smoke[backend], count)
+
+    def test_a_sampled_grid_still_varies_every_tuning_axis(self):
+        """A stride over the flattened product pins the inner axes; if that
+        regresses, a smoke run would only ever sample block sizes."""
+        for backend in ("triton", "gluon"):
+            values = collections.defaultdict(set)
+            for candidate in enumerate_mha_fwd_candidates("gfx950", "smoke"):
+                if candidate.backend == backend:
+                    for key, value in candidate.backend_config.items():
+                        values[key].add(value)
+            full_axes = collections.defaultdict(set)
+            for candidate in enumerate_mha_fwd_candidates("gfx950"):
+                if candidate.backend == backend:
+                    for key, value in candidate.backend_config.items():
+                        full_axes[key].add(value)
+            for key, sampled in values.items():
+                if len(full_axes[key]) > 1:
+                    with self.subTest(backend=backend, axis=key):
+                        self.assertGreater(len(sampled), 1)
+
+    def test_smoke_is_deterministic(self):
+        first = [c.identity for c in enumerate_mha_fwd_candidates("gfx950", "smoke")]
+        second = [c.identity for c in enumerate_mha_fwd_candidates("gfx950", "smoke")]
+        self.assertEqual(first, second)
+
+    def test_an_unknown_strategy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown MHA search strategy"):
+            enumerate_mha_fwd_candidates("gfx950", "random")
 
 
 class TestSelectionProof(unittest.TestCase):
