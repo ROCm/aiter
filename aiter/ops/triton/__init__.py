@@ -109,6 +109,7 @@ _BACKWARD_COMPAT_MAP = {
     "fused_gemm_a8w8_blockscale_split_cat": "gemm.fused.fused_gemm_a8w8_blockscale_split_cat",
     # Conv modules (conv/)
     "conv2d": "conv.conv2d",
+    "conv3d": "conv.conv3d",
     # Attention modules (attention/)
     "chunked_pa_prefill": "attention.chunked_pa_prefill",
     "extend_attention": "attention.extend_attention",

@@ -5,7 +5,6 @@ import os
 from enum import Enum
 
 import torch
-import triton
 
 from aiter.ops.triton.conv._launch import (
     _launch_1x1,
@@ -26,12 +25,15 @@ from aiter.ops.triton.conv._utils import (
     BLOCK_K,
     _alloc_output,
     _conv_dims,
+    _ensure_layout,
     _is_1x1_conv,
     _is_3x3_conv,
-    _is_winograd_eligible,
+    _is_amd_wave32,
+    _is_winograd_2d_eligible,
+    _normalize_conv2d_params,
     _out_hw,
     _prep_bias,
-    _require_winograd_eligible,
+    _require_winograd_2d_eligible,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
     conv_config_uses_exact_routes,
@@ -54,11 +56,6 @@ class Route(Enum):
     CBLOCKED_NCHW = "_conv2d_3x3_cblocked_kernel"
     NHWC_3X3 = "_conv2d_3x3_nhwc_kernel"
     GENERAL = "_conv2d_general_kernel"
-
-
-def _is_amd_wave32():
-    target = triton.runtime.driver.active.get_current_target()
-    return target.backend == "hip" and target.warp_size == 32
 
 
 # On gfx1201, cblocked wins at 196 pixels while direct NCHW wins at 784.
@@ -117,7 +114,7 @@ def _select_3x3_method(N, C, H, W, K_out, stride, dilation, block_c=BLOCK_K):
     """
     if C < block_c:
         return "general"
-    if not _is_winograd_eligible(3, 3, stride, dilation, C):
+    if not _is_winograd_2d_eligible(3, 3, stride, dilation, C):
         return "cblocked"
     P, Q = _out_hw(H, W, 3, 3, stride, (1, 1), dilation)
     tile_H = (P + 3) // 4
@@ -204,6 +201,7 @@ def conv2d(
     layout = layout.lower()
     if layout not in ("nchw", "nhwc"):
         raise ValueError(f"layout must be 'nchw' or 'nhwc', got '{layout}'")
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
 
     _LOGGER.get_logger().info(
         "CONV2D: x=%s w=%s stride=%s padding=%s dilation=%s "
@@ -237,8 +235,9 @@ def conv2d_winograd_f4x3(
     layout="nchw",
 ):
     """NCHW/NHWC conv2d using Winograd F(4x4,3x3). Raises ValueError for non-eligible convs."""
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
-    _require_winograd_eligible("conv2d_winograd_f4x3", R, S, stride, dilation, C)
+    _require_winograd_2d_eligible("conv2d_winograd_f4x3", R, S, stride, dilation, C)
 
     y = _alloc_output(N, K_out, P, Q, x, layout)
     bias = _prep_bias(bias)
@@ -279,8 +278,9 @@ def conv2d_winograd_f4x3_cblocked(
 
     x_blocked: optional pre-packed NCHWc input. Routed execution supplies it
     explicitly; direct method calls may leave it unset to include packing."""
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
-    _require_winograd_eligible(
+    _require_winograd_2d_eligible(
         "conv2d_winograd_f4x3_cblocked", R, S, stride, dilation, C
     )
 
@@ -329,6 +329,7 @@ def conv2d_1x1(
     layout="nchw",
 ):
     """NCHW/NHWC conv2d for 1x1 kernels. Raises ValueError for non-1x1."""
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_1x1_conv(R, S, dilation):
         raise ValueError(f"conv2d_1x1 requires 1x1 kernel, got {R}x{S}")
@@ -367,6 +368,7 @@ def conv2d_general(
     layout="nchw",
 ):
     """NCHW/NHWC conv2d using general kernel with prepacked weights (5x5, 7x7, etc.)."""
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     y = _alloc_output(N, K_out, P, Q, x, layout)
@@ -408,6 +410,7 @@ def conv2d_nhwc_3x3(
     block_k=BLOCK_K,
 ):
     """NHWC conv2d for 3x3 kernels. Raises ValueError for non-3x3."""
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_3x3_conv(R, S):
         raise ValueError(f"conv2d_nhwc_3x3 requires 3x3 kernel, got {R}x{S}")
@@ -539,8 +542,8 @@ def conv2d_nchw(
 ):
     """Hybrid NCHW conv2d: routes to specialized 1x1, 3x3, or general kernel."""
     assert x.is_cuda and w_oihw.is_cuda
-    if not x.is_contiguous():
-        x = x.contiguous()
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x = _ensure_layout(x, "nchw")
     return _route_and_run(
         x,
         w_oihw,
@@ -571,8 +574,8 @@ def conv2d_nhwc(
     in logical NCHW shape with channels_last strides.
     """
     assert x.is_cuda and w_oihw.is_cuda
-    if not x.is_contiguous(memory_format=torch.channels_last):
-        x = x.contiguous(memory_format=torch.channels_last)
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x = _ensure_layout(x, "nhwc")
     return _route_and_run(
         x,
         w_oihw,
@@ -598,8 +601,8 @@ def conv2d_nchw_3x3_direct(
 ):
     """NCHW 3x3 convolution that reads the activation without repacking."""
     assert x.is_cuda and w_oihw.is_cuda
-    if not x.is_contiguous():
-        x = x.contiguous()
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x = _ensure_layout(x, "nchw")
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_3x3_conv(R, S):
         raise ValueError(f"conv2d_nchw_3x3_direct requires 3x3 kernel, got {R}x{S}")
@@ -644,6 +647,7 @@ def conv2d_nchw_cblocked(
 
     x_blocked: optional pre-packed NCHWc input. Routed execution supplies it
     explicitly; direct method calls may leave it unset to include packing."""
+    stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     if not _is_3x3_conv(R, S):
