@@ -146,6 +146,7 @@ else:
     from . import mla  # noqa: F401
 
 if AITER_TRITON_ONLY:
+
     def is_gfx1250_asm_supported() -> bool:
         return True
 
