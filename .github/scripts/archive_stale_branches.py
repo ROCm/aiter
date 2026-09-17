@@ -27,17 +27,43 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
-NOTICE_MARKER = "<!-- stale-branch-delete-notice -->"
-ARCHIVE_MARKER = "<!-- stale-branch-archived -->"
 ARCHIVE_PREFIX = "archive/"
 BOT_LOGIN = "github-actions[bot]"
 _ARCHIVED = re.compile(r"^archive/(\d{4}-\d{2}-\d{2})/(.+)$")
+
+
+def marker(kind: str, ref: str) -> str:
+    """Marker naming the archive ref it belongs to.
+
+    Two branches can point at one commit, and commit comments hang off the
+    commit, so a marker that did not name its ref would let one archive's
+    notice start the clock for the other -- and print the wrong branch in the
+    restore command.
+    """
+    return f"<!-- stale-branch-{kind}: {ref} -->"
+
+
+def archive_date(name: str) -> dt.date | None:
+    """The date in an archive ref's name, or None if it is not one of ours.
+
+    The pattern alone is not enough: archive/2026-02-30/x matches it and is not
+    a date, and raising out of the loop over a branch somebody else named would
+    strand the whole backlog.
+    """
+    found = _ARCHIVED.match(name)
+    if not found:
+        return None
+    try:
+        return dt.date.fromisoformat(found.group(1))
+    except ValueError:
+        return None
 
 
 class Api:
@@ -70,6 +96,30 @@ class Api:
         if not self.apply:
             return None
         return self._call(method, f"{API}/repos/{self.owner}/{self.name}{path}", body)
+
+    def delete_branch(self, name: str, expect: str) -> bool:
+        """Delete a branch, server-side, only if its tip is still ``expect``.
+
+        Through git rather than REST: ``--force-with-lease`` sends old-oid ->
+        zero-oid and the receiving end rejects the delete if the ref has moved,
+        so a push landing mid-run cannot be lost. The REST API has no
+        conditional delete, and a read-then-DELETE would still race.
+        """
+        self.writes += 1
+        if not self.apply:
+            return True
+        ref = f"refs/heads/{name}"
+        done = subprocess.run(
+            ["git", "push", f"--force-with-lease={ref}:{expect}", "origin", f":{ref}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode == 0:
+            return True
+        if "stale info" in done.stderr or "[rejected]" in done.stderr:
+            return False
+        raise RuntimeError(f"git push failed for {name}: {done.stderr.strip()}")
 
     def graphql(self, query: str, variables: dict) -> dict:
         req = urllib.request.Request(
@@ -202,19 +252,6 @@ def ref_sha(api: Api, name: str) -> str | None:
     return ref["object"]["sha"]
 
 
-def delete_ref(api: Api, name: str, expect: str) -> bool:
-    """Delete a branch only if its tip is still ``expect``.
-
-    The REST API has no compare-and-delete for refs, so this re-reads first.
-    That does not close the window between the scan and the delete, it narrows
-    it to one round trip; a push landing inside it leaves the branch alone.
-    """
-    if ref_sha(api, name) != expect:
-        return False
-    api.write("DELETE", f"/git/refs/heads/{name}")
-    return True
-
-
 def comments(api: Api, sha: str) -> list[dict]:
     return api.get(f"/commits/{sha}/comments?per_page=100") or []
 
@@ -255,14 +292,14 @@ def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
             existing = ref_sha(api, target)
     if existing is not None and existing != sha:
         return f"skipped {name}: {target} already exists at another commit"
-    if find_marker(api, sha, ARCHIVE_MARKER, author) is not None:
+    if find_marker(api, sha, marker("archived", target), author) is not None:
         return _finish_archive(api, name, sha, target)
     api.write(
         "POST",
         f"/commits/{sha}/comments",
         {
             "body": (
-                f"{ARCHIVE_MARKER}\n"
+                f"{marker('archived', target)}\n"
                 f"`{name}` has had no new commits since "
                 f"{branch['date'].date().isoformat()}, so it has been moved to "
                 f"`{target}`. Nothing is lost -- this commit is still here, and "
@@ -277,7 +314,7 @@ def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
 
 
 def _finish_archive(api: Api, name: str, sha: str, target: str) -> str:
-    if delete_ref(api, name, sha):
+    if api.delete_branch(name, sha):
         return f"archived {name} -> {target}"
     return f"archived {name} -> {target}; original kept, it moved mid-run"
 
@@ -288,7 +325,7 @@ def give_notice(api: Api, branch: dict, original: str, delete_on: dt.date) -> st
         f"/commits/{branch['sha']}/comments",
         {
             "body": (
-                f"{NOTICE_MARKER}\n"
+                f"{marker('delete-notice', branch['name'])}\n"
                 f"`{branch['name']}` is due to be deleted on "
                 f"{delete_on.isoformat()}.\n\n"
                 f"To keep it, restore the branch:\n\n"
@@ -344,9 +381,9 @@ def main() -> int:
 
     def act(branch: dict) -> str | None:
         name = branch["name"]
-        archived = _ARCHIVED.match(name)
+        archived_on = archive_date(name)
 
-        if not archived:
+        if archived_on is None:
             if (
                 name in skip
                 or exempt(name, exempt_names, exempt_patterns)
@@ -357,13 +394,23 @@ def main() -> int:
                 return None
             return archive(api, branch, today, args.bot_login)
 
-        # An archive ref. Its date is in its name; the original name follows.
-        archived_on = dt.date.fromisoformat(archived.group(1))
-        original = archived.group(2)
+        # An archive ref -- but only if this workflow made it. Anyone may name
+        # a branch archive/<date>/x, and adopting one would put a stranger's
+        # branch on a deletion clock. Our own archiving comment, on this commit,
+        # naming this ref, is the provenance. Deleting that comment therefore
+        # also opts a branch out, permanently.
+        original = _ARCHIVED.match(name).group(2)
+        if (
+            find_marker(api, branch["sha"], marker("archived", name), args.bot_login)
+            is None
+        ):
+            return None
         # Against the name it had, so a line added later still rescues it.
         if original in skip or exempt(original, exempt_names, exempt_patterns):
             return None
-        notice = find_marker(api, branch["sha"], NOTICE_MARKER, args.bot_login)
+        notice = find_marker(
+            api, branch["sha"], marker("delete-notice", name), args.bot_login
+        )
 
         if notice is None:
             if (today - archived_on).days < args.archive_days:
@@ -374,7 +421,7 @@ def main() -> int:
 
         if (now - _parse(notice["created_at"])).days < args.notice_days:
             return None
-        if not delete_ref(api, name, branch["sha"]):
+        if not api.delete_branch(name, branch["sha"]):
             return f"skipped {name}: moved since the scan"
         return f"deleted {name}"
 

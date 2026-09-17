@@ -43,6 +43,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Deletion goes through git push --force-with-lease, which is the
+          # only compare-and-swap available -- the REST API has no conditional
+          # delete -- so the checkout's credentials are what the script pushes
+          # with. Default, stated because the delete stage depends on it.
+          persist-credentials: true
           sparse-checkout: |
             .github/scripts/archive_stale_branches.py
             .github/stale-branch-exemptions.txt
