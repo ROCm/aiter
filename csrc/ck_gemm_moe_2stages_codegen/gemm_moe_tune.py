@@ -3860,7 +3860,9 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in (16, 32, 64, 128):
+            # The v2 scale-sort producer requires a multiple of 32. BM16 must
+            # not enter this path until it has a matching scale layout.
+            if blockM not in (32, 64, 128):
                 continue
             # ---- v2 stage1 tasks: sweep the FULL fused stage1 candidate set ----
             # Mirror gen_flydsl_2stages_task's fused-variant construction so
