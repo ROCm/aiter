@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K2 (SILOTIGER-1047 3b): sparse GQA decode with split-K.
+"""Family A FlyDSL QSA K2 (SILOTIGER-1047 3c): sparse GQA with split-K.
 
 One workgroup per ``(row, kv_head, split)`` attends a slice of the expanded
 token list in the paged K/V cache, then a merge kernel combines the partial
-softmax states. Group size 12, ``D=256``. Same ABI as 3a; sigmoid gate and
-expand+tail stay unfused. Prefill occupancy is 3c.
+softmax states. Group size 12, ``D=256``. Decode and prefill share this
+instantiation. Sigmoid gate and expand+tail stay unfused.
 """
 
 from functools import lru_cache
