@@ -113,11 +113,8 @@ def asm_mla_decode_fwd(
 ):
     import torch
 
-    from csrc.cpp_itfs.torch_utils import torch_to_c_types
-
-    # Imported here to avoid a circular import with aiter/__init__.py. run_lib()
-    # uses a bare ctypes.CDLL that cannot carry a C++ exception, so gate here.
     from aiter.jit.utils.asm_guard import require_gfx1250_asm
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     require_gfx1250_asm("asm_mla_decode_fwd")
 
