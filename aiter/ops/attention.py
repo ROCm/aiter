@@ -22,6 +22,7 @@ from ..jit.core import compile_ops, is_experimental_enabled
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 try:
+    from aiter.ops.flydsl.pa_decode import PADecodePlan
     from aiter.ops.flydsl.pa_decode import pa_decode as _pa_decode_flydsl
 except (ImportError, AttributeError, RuntimeError, OSError):
     _pa_decode_flydsl = None
@@ -48,10 +49,17 @@ def pa_decode_flydsl(
     max_logits: torch.Tensor = None,
     temporary_output: torch.Tensor = None,
     alibi_slopes: torch.Tensor = None,
+    ps: bool = True,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
-    ps: bool = True,
+    work_plan: "PADecodePlan | None" = None,
 ) -> None:
+    """FlyDSL decode with an optional work plan.
+
+    Pass ``work_plan`` by keyword. The ``ps`` compatibility argument precedes
+    ``sinks`` and is accepted and ignored.
+    """
+    del ps
     if _pa_decode_flydsl is None:
         raise RuntimeError("pa_decode_flydsl requires the `flydsl` package")
     _pa_decode_flydsl(
@@ -75,7 +83,7 @@ def pa_decode_flydsl(
         alibi_slopes,
         sinks,
         sliding_window,
-        ps,
+        work_plan=work_plan,
     )
 
 

@@ -26,6 +26,7 @@ import torch
 import aiter
 from aiter import dtypes, per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.attention import pa_decode_flydsl
 from aiter.test_common import benchmark, run_perftest
 
 try:
@@ -350,6 +351,8 @@ def _make_inputs(case, planned=False):
 
 
 def _run_flydsl(*args, sliding_window=0, work_plan=None):
+    # Fixtures use the core signature; the wrapper inserts ps before sinks.
+    args = (*args[:-1], True, args[-1])
     if work_plan is None:
         torch.ops.aiter.pa_decode_flydsl(*args, sliding_window=sliding_window)
     else:
@@ -361,7 +364,7 @@ def _run_flydsl(*args, sliding_window=0, work_plan=None):
             sliding_window=sliding_window,
             plan=work_plan,
         )
-        pa_decode(*args, sliding_window=sliding_window, work_plan=work_plan)
+        pa_decode_flydsl(*args, sliding_window=sliding_window, work_plan=work_plan)
     return args[0]
 
 

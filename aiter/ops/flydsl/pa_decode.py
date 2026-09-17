@@ -209,7 +209,6 @@ def pa_decode(
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
-    ps: bool = True,
     work_plan: PADecodePlan | None = None,
 ) -> None:
     """FlyDSL paged-attention fp8 decode.
@@ -227,8 +226,8 @@ def pa_decode(
     Each entry is an unscaled, zero-value attention logit shared across batch
     and MTP positions. It contributes to the denominator once, independently
     of the window; -inf disables a head's sink and +inf suppresses its output.
-    ALiBi and externally quantized FP8 queries are not supported. The ``ps=False``
-    partitioning policy is also not supported.
+    ALiBi and externally quantized FP8 queries are not supported. Partitioning
+    is controlled by ``max_context_partition_num`` and ``work_plan``.
 
     ``context_lengths`` and ``block_tables`` are GPU-resident, so their values
     are not inspected here (which would synchronize the device). Callers must
@@ -261,10 +260,6 @@ def pa_decode(
     if sliding_window < -1:
         raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
-    if not isinstance(ps, bool):
-        raise TypeError(f"ps must be a bool, got {type(ps).__name__}")
-    if not ps:
-        raise NotImplementedError("pa_decode does not support ps=False")
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
     if query_length < 1:

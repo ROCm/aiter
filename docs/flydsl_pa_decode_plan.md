@@ -72,8 +72,12 @@ rebuilding a plan, provided the context lengths remain unchanged.
 
 ## Usage
 
-Use the Python FlyDSL entry point for planned execution. The shared
-`torch.ops.aiter.pa_decode_flydsl` entry point retains its existing static interface.
+Use the Python FlyDSL entry point for planned execution. Its signature ends
+with `sliding_window, work_plan` and does not accept `ps`. The Python wrapper
+`aiter.ops.attention.pa_decode_flydsl` also accepts `work_plan` by keyword.
+Its trailing arguments are `alibi_slopes, ps, sinks, sliding_window, work_plan`;
+`ps` is accepted and ignored. Prefer keyword arguments for `sinks`,
+`sliding_window`, and `work_plan` when switching between these entry points.
 
 ```python
 import torch
