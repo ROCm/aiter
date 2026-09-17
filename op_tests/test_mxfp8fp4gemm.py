@@ -159,6 +159,25 @@ PERF_SHAPES = {
         (2, 1048576, 16384),  # memory-bound
     ],
 }
+
+# Defaults for the six a8w8/AP1 cases used by the native GEMM-only benchmark.
+# An explicit --splitk (including 0 for the operator heuristic) takes precedence.
+F8GEMM_BENCHMARK_SPLITK = {
+    (512, 2048, 7168): 8,    # wqkv_a
+    (512, 7168, 16384): 4,   # wo_b
+    (512, 6144, 7168): 4,    # gate_up_proj
+    (512, 7168, 3072): 4,    # w2
+    (512, 65536, 1536): 1,  # wq_b
+    (512, 8192, 1536): 1,   # indexer_wq_b
+}
+
+
+def _benchmark_splitk(intype, apre, M, N, K):
+    if intype == "a8w8" and apre == 1:
+        return F8GEMM_BENCHMARK_SPLITK.get((M, N, K), 0)
+    return 0
+
+
 FUNC_SHAPES = [
     # qkv_proj
     (1, 1280, 8192),
@@ -368,14 +387,14 @@ def test_gemm(
     M,
     N,
     K,
-    apre,
+    apre=1,
     outtype="bf16",
     data_init="uniform",
     scale_init="auto",
     seed=0,
     mode="perf",
     knl_name=None,
-    splitk=0,
+    splitk=None,
     no_reduce=False,
     num_warmup=2,
     num_iters=None,
@@ -385,6 +404,8 @@ def test_gemm(
     pre_benchmark_warmup=2,
     pre_benchmark_iters=100,
 ):
+    if splitk is None:
+        splitk = _benchmark_splitk(intype, apre, M, N, K)
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
     reason = _support_reason(outtype, apre, M, N, K)
@@ -418,7 +439,7 @@ def test_gemm(
     out_dtype = _OUT_DTYPE[outtype]
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     if no_reduce and (intype != "a8w8" or splitk < 1):
-        raise ValueError("--no-reduce requires a8w8 and an explicit positive --splitk")
+        raise ValueError("--no-reduce requires a8w8 and a positive split-K; pass --splitk for shapes without a benchmark default")
     if pre_benchmark and not (
         intype == "a8w8" and apre == 1 and no_reduce and splitk > 0
         and pre_benchmark_warmup >= 0 and pre_benchmark_iters > 1
@@ -440,8 +461,8 @@ def test_gemm(
     )
     ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
-    # --iters overrides; unset keeps the mode default (func=5, perf/profile=101).
-    num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 101)
+    # --iters overrides; unset keeps the mode default (func=5, perf/profile=100).
+    num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 100)
 
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
     # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
@@ -638,9 +659,9 @@ def main():
         type=int,
         nargs="*",
         choices=[1, 0],
-        default=None,
+        default=[1],
         help="A-preshuffle sweep list: 1 preshuffles A (M%%2), 0 sends it "
-        "row-major (M%%1). Default (unset): perf/profile = [1], func = [1, 0].",
+        "row-major (M%%1). Default: [1]. Pass --apre 1 0 to sweep both.",
     )
     parser.add_argument(
         "--outtype",
@@ -698,7 +719,7 @@ def main():
         type=int,
         default=None,
         help="timed iterations (run_perftest num_iters); unset -> mode default "
-        "(func=5, perf/profile=101)",
+        "(func=5, perf/profile=100)",
     )
     parser.add_argument(
         "--graph",
@@ -732,8 +753,10 @@ def main():
         "--splitk",
         type=int,
         nargs="*",
-        default=[0],
-        help="split-K counts to run (0 = the count choose_splitk picks). Several "
+        default=None,
+        help="split-K counts to run. Unset: six a8w8/AP1 benchmark shapes use "
+        "8/4/4/4/1/1; other shapes use the operator heuristic. "
+        "Explicit 0 always uses the count choose_splitk picks. Several "
         "values sweep them, e.g. --splitk 1 2 4 8. Only the kernel's hard "
         "constraints are checked, so a count deeper than the dispatch would pick "
         "is allowed; 256x256 only.",
@@ -761,6 +784,8 @@ def main():
         "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
     )
     args = parser.parse_args()
+    if args.iters is None:
+        args.iters = 5 if args.mode == "func" else 100
 
     # DATA and SCALE init are paired position-wise (NOT crossed). Mode-aware
     # defaults when unset: perf/profile run constant+constant and uniform+auto;
@@ -784,14 +809,7 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
-    # A-preshuffle sweep. Mode-aware default when unset: perf/profile exercise only
-    # the preshuffled path ([1]); func sweeps both ([1, 0]).
-    if args.apre is not None:
-        apre_list = args.apre
-    elif args.mode in ("perf", "profile"):
-        apre_list = [1]
-    else:
-        apre_list = [1, 0]
+    apre_list = args.apre
 
     def shapes_for(intype):
         if args.shape is not None:
@@ -799,6 +817,11 @@ def main():
         if args.mode == "func":
             return FUNC_SHAPES
         return PERF_SHAPES[intype]
+
+    def splitks_for(intype, apre, M, N, K):
+        if args.splitk is not None:
+            return args.splitk
+        return [_benchmark_splitk(intype, apre, M, N, K)]
 
     rows = [
         test_gemm(
@@ -827,7 +850,7 @@ def main():
             apre_list, init_pairs, args.intype, args.outtype
         )
         for (M, N, K) in shapes_for(intype)
-        for splitk in args.splitk
+        for splitk in splitks_for(intype, apre, M, N, K)
     ]
     df_full = pd.DataFrame(rows)
     # JSON keeps every column (config + algo details + results) so each record is
