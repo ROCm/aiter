@@ -40,7 +40,6 @@ def _physical_indices(
     rows: int, K: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return logical gathers and masks for initialized physical output slots."""
-    pad_rows = _ceil(rows, _TILE_ROWS)
     pad_k = _ceil(K, _K_TILE)
     nk = pad_k // _K_TILE
     nk_pad = nk + _GUARD_TILES
@@ -50,7 +49,7 @@ def _physical_indices(
     packed_written = torch.zeros(packed_size, dtype=torch.bool)
     scale_written = torch.zeros(scale_size, dtype=torch.bool)
 
-    for row in range(pad_rows):
+    for row in range(rows):
         tile_row = row // _TILE_ROWS
         rem = row % _TILE_ROWS
         row_block, row16 = divmod(rem, 16)
@@ -79,8 +78,8 @@ def _physical_indices(
                     )
                     scale_indices[row, logical_group] = scale_index
 
-    assert packed_written.sum().item() == pad_rows * pad_k // 2
-    assert scale_written.sum().item() == pad_rows * pad_k // 32
+    assert packed_written.sum().item() == rows * pad_k // 2
+    assert scale_written.sum().item() == rows * pad_k // 32
     return (
         packed_indices.to(device),
         scale_indices.to(device),

@@ -58,17 +58,8 @@ __device__ __forceinline__ void load_group_values(const input_t* __restrict__ in
                                                   opus::vector_t<float, kValuesPerThread>& values,
                                                   int64_t row,
                                                   int32_t cols,
-                                                  int32_t col,
-                                                  bool valid_row)
+                                                  int32_t col)
 {
-    if(!valid_row)
-    {
-#pragma unroll
-        for(int i = 0; i < kValuesPerThread; ++i)
-            values[i] = 0.0f;
-        return;
-    }
-
     const int64_t row_offset = row * static_cast<int64_t>(cols);
     if(col + kValuesPerThread <= cols && (cols % kValuesPerThread) == 0)
     {
@@ -166,14 +157,13 @@ __device__ __forceinline__ void quant_mxfp4_gemm_group(const input_t* __restrict
                                                        int64_t row,
                                                        int32_t cols,
                                                        int32_t group,
-                                                       int32_t nk_pad,
-                                                       bool valid_row)
+                                                       int32_t nk_pad)
 {
     const int32_t lane = threadIdx.x & (kThreadsPerGroup - 1);
     const int32_t col  = group * kGroupSize + lane * kValuesPerThread;
 
     opus::vector_t<float, kValuesPerThread> values;
-    load_group_values(input, values, row, cols, col, valid_row);
+    load_group_values(input, values, row, cols, col);
     hadamard32<false>(values, lane);
     float amax = group_amax<RoundMode>(values);
     int safety_shift = 0;
@@ -182,7 +172,7 @@ __device__ __forceinline__ void quant_mxfp4_gemm_group(const input_t* __restrict
         (__builtin_bit_cast(uint32_t, amax) >> 23) & 0xFFu;
     if(__builtin_expect(amax_exponent == 0xFFu, 0))
     {
-        load_group_values(input, values, row, cols, col, valid_row);
+        load_group_values(input, values, row, cols, col);
         hadamard32<true>(values, lane);
         amax         = group_amax<RoundMode>(values);
         safety_shift = kHadamardSafetyShift;
@@ -259,10 +249,8 @@ quant_mxfp4_gemm_kernel(const input_t* __restrict__ input,
     const int32_t wave            = group_local / 16;
     const int32_t within_wave     = group_local % 16;
     const int64_t row             = work_row_block * 16 + wave * 4 + within_wave / 4;
-    const int64_t pad_rows         = (rows + kTileRows - 1) / kTileRows * kTileRows;
-    if(row >= pad_rows)
+    if(row >= rows)
         return;
-    const bool valid_row = row < rows;
 
     for(int32_t local_step = 0; local_step < KStepsPerBlock; ++local_step)
     {
@@ -271,7 +259,7 @@ quant_mxfp4_gemm_kernel(const input_t* __restrict__ input,
         {
             const int32_t group = step * kGroupsPerKTile + within_wave % 4;
             quant_mxfp4_gemm_group<input_t, RoundMode>(
-                input, packed, packed_scale, row, cols, group, nk_pad, valid_row);
+                input, packed, packed_scale, row, cols, group, nk_pad);
         }
     }
 }
@@ -377,7 +365,7 @@ void quant_mxfp4_gemm_hip_out(const aiter_tensor_t& input,
                 " bytes, expected ",
                 expected_scale);
 
-    const int64_t row_blocks = pad_rows / 16;
+    const int64_t row_blocks = (rows64 + 15) / 16;
     const int32_t num_steps  = num_groups / kGroupsPerKTile;
     const int32_t k_steps_per_block =
         rows64 < 2048 || cols >= kLargeKThreshold ? kLargeKStepsPerBlock
