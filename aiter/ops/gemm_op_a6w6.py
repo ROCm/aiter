@@ -168,6 +168,8 @@ def _hadamard32_np() -> np.ndarray:
 
 _HAD32_NP = _hadamard32_np()
 _HAD32_T: dict[torch.device, Tensor] = {}
+_HADAMARD_SAFETY_THRESHOLD = float.fromhex("0x1p123")
+_HADAMARD_SAFETY_SHIFT = 3.0
 
 
 def _had32_t(device: torch.device) -> Tensor:
@@ -186,6 +188,21 @@ def _rotate_k32_torch(x: Tensor) -> Tensor:
     return (
         x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE) @ h
     ).reshape(R, K)
+
+
+def _rotate_k32_quant_work(x: Tensor) -> tuple[Tensor, Tensor]:
+    """Return overflow-safe H32 work values and per-block exponent shifts."""
+    R, K = x.shape
+    blocks = x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE)
+    input_amax = blocks.abs().amax(dim=2)
+    safety_shift = torch.where(
+        input_amax >= _HADAMARD_SAFETY_THRESHOLD,
+        _HADAMARD_SAFETY_SHIFT,
+        0.0,
+    )
+    work = blocks * torch.exp2(-safety_shift).unsqueeze(-1)
+    h = _had32_t(x.device).to(torch.bfloat16).float()
+    return (work @ h).reshape(R, K), safety_shift
 
 
 def _rotate_k32_np(x: np.ndarray) -> np.ndarray:
@@ -248,6 +265,13 @@ if _HAS_TRITON:
             mask=rm[:, None],
             other=0.0,
         )
+        input_amax = tl.max(tl.abs(xall), 1)
+        safety_shift = tl.where(
+            input_amax >= 1.0633823966279327e37,
+            3.0,
+            0.0,
+        )
+        xall *= tl.exp2(-safety_shift)[:, None]
         # 32x32 Hadamard rotation FUSED in-register (no extra memory pass): mixes the
         # 32 K-elements of this block so mxfp6's per-block scale keeps precision.
         # bf16 MFMA (fp32 accum) -- fast, and plenty since the result feeds a 3-mantissa
@@ -257,11 +281,13 @@ if _HAS_TRITON:
         ).to(tl.bfloat16)
         xall = tl.dot(xall.to(tl.bfloat16), h)
         amax = tl.max(tl.abs(xall), 1)
-        safe = tl.maximum(amax, 1e-30)
-        se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
-        se = tl.where(amax > 0.0, se, 0.0)
+        safe = tl.where(amax > 0.0, amax, 1.0)
+        work_se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
+        work_se = tl.where(amax > 0.0, work_se, 0.0)
+        se = tl.minimum(tl.maximum(work_se + safety_shift, -127.0), 127.0)
+        conversion_se = se - safety_shift
         e8 = (se + 127.0).to(tl.uint8)
-        codes = _e2m3_dev(xall * tl.exp2(-se)[:, None])  # [BM,32]
+        codes = _e2m3_dev(xall * tl.exp2(-conversion_se)[:, None])  # [BM,32]
         cc = tl.reshape(codes, [BLOCK_M, 8, 2, 2])
         lo, hi = tl.split(cc)  # lo=b0-bit {s0,s2}, hi {s1,s3}
         c0, c2 = tl.split(lo)  # phase 0, 2
@@ -337,16 +363,25 @@ if _HAS_TRITON:
             mask=rm[:, None],
             other=0.0,
         )
+        input_amax = tl.max(tl.abs(xall), 1)
+        safety_shift = tl.where(
+            input_amax >= 1.0633823966279327e37,
+            3.0,
+            0.0,
+        )
+        xall *= tl.exp2(-safety_shift)[:, None]
         h = tl.load(
             h_ptr + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
         ).to(tl.bfloat16)
         xall = tl.dot(xall.to(tl.bfloat16), h)
         amax = tl.max(tl.abs(xall), 1)
-        safe = tl.maximum(amax, 1e-30)
-        se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
-        se = tl.where(amax > 0.0, se, 0.0)
+        safe = tl.where(amax > 0.0, amax, 1.0)
+        work_se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
+        work_se = tl.where(amax > 0.0, work_se, 0.0)
+        se = tl.minimum(tl.maximum(work_se + safety_shift, -127.0), 127.0)
+        conversion_se = se - safety_shift
         e8 = (se + 127.0).to(tl.uint8)
-        codes = _e2m3_dev(xall * tl.exp2(-se)[:, None])
+        codes = _e2m3_dev(xall * tl.exp2(-conversion_se)[:, None])
         cc = tl.reshape(codes, [BLOCK_M * 4, 8, 2, 2])
         lo, hi = tl.split(cc)
         c0, c2 = tl.split(lo)
@@ -506,21 +541,22 @@ def quant_mxfp6_torch(x: Tensor) -> tuple[Tensor, Tensor]:
             "quant_mxfp6_torch requires K to be a positive multiple of "
             f"{_SCALE_GROUP_SIZE}, got {x.shape[1]}"
         )
-    x = x.float()
-    x = _rotate_k32_torch(x)
+    x, safety_shift = _rotate_k32_quant_work(x)
     R, K = x.shape
     NB = K // _SCALE_GROUP_SIZE
     blk = x.reshape(R, NB, _SCALE_GROUP_SIZE)
     amax = blk.abs().amax(dim=2)
     safe = torch.where(amax > 0, amax, torch.ones_like(amax))
     exp = torch.floor(torch.log2(safe))
-    scale_exp = torch.clamp(exp - _E2M3_MAX_EXP, -127, 127)
-    scale_exp = torch.where(amax > 0, scale_exp, torch.zeros_like(scale_exp))
+    work_scale_exp = torch.clamp(exp - _E2M3_MAX_EXP, -127, 127)
+    work_scale_exp = torch.where(
+        amax > 0, work_scale_exp, torch.zeros_like(work_scale_exp)
+    )
+    scale_exp = torch.clamp(work_scale_exp + safety_shift, -127, 127)
+    conversion_scale_exp = scale_exp - safety_shift
     scales = (scale_exp + 127).to(torch.uint8)
 
-    scaled = blk / torch.pow(torch.tensor(2.0, device=x.device), scale_exp).unsqueeze(
-        -1
-    )
+    scaled = blk * torch.exp2(-conversion_scale_exp).unsqueeze(-1)
     # arithmetic E2M3 round-to-nearest (identical to the fused Triton _e2m3_dev)
     a = scaled.abs().clamp(max=7.5)
     isn = a >= 1.0

@@ -208,6 +208,28 @@ def test_fused_hadamard_avoids_finite_intermediate_overflow():
     assert torch.equal(fused_scale_payload, legacy_scale_payload)
 
 
+@torch.no_grad()
+def test_fused_hadamard_saturates_all_max_bf16_without_nan():
+    rows, K = 1, 32
+    x = torch.full(
+        (rows, K),
+        torch.finfo(torch.bfloat16).max,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    packed, packed_scale = quant_mxfp4_gemm(x, round_mode=2)
+    packed_indices, scale_indices, _, _ = _physical_indices(rows, K, x.device)
+    payload, scales = _logical_payload(
+        packed, packed_scale, packed_indices, scale_indices
+    )
+    codes = fp4_utils.mxfp4_to_f32(payload[:, :16].contiguous().view(dtypes.fp4x2))
+
+    assert int(scales[0, 0]) == 254
+    assert float(codes[0, 0]) == 6.0
+    assert torch.count_nonzero(codes[0, 1:]).item() == 0
+    assert torch.isfinite(codes).all()
+
+
 @pytest.mark.parametrize("rows,K", [(1, 1), (16, 31), (17, 32), (255, 127), (257, 128)])
 @torch.no_grad()
 def test_fused_tail_layout_and_unwritten_canaries(rows, K):

@@ -59,6 +59,7 @@ def test_mixed_mxfp_manifest_objects(module, manifest_name, pack_layout, tuned_n
     tuned_path = _REPO_ROOT / "aiter" / "configs" / tuned_name
     with tuned_path.open(newline="") as tuned_file:
         tuned_rows = list(csv.DictReader(tuned_file))
+    assert all(row["kernelName"].startswith(f"{module}_") for row in tuned_rows)
     assert {row["kernelName"] for row in tuned_rows} <= kernel_names
     assert all(row["splitK"] == "0" for row in tuned_rows)
 

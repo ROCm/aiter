@@ -30,8 +30,8 @@ constexpr int kLargeKStepsPerBlock = 3;
 constexpr uintptr_t kOutputAlignment = 16;
 // _hadamard32_np().astype(bfloat16), represented exactly as fp32.
 constexpr float kHadamard32Norm = 0.1767578125f;
-// Keep every intermediate finite even for an all-max BF16 block. The output
-// scale exponent is biased back by the same power of two before storage.
+// Shift groups above 2^123 before the unnormalized butterfly, whose worst-case
+// growth is 32x. The output scale exponent is biased back before storage.
 constexpr int kHadamardSafetyShift = 3;
 constexpr float kHadamard32WorkNorm = kHadamard32Norm * 0.125f;
 
@@ -61,18 +61,13 @@ __device__ __forceinline__ float to_bf16_dot_operand(input_t input)
 }
 
 template <typename input_t>
-__device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ input,
-                                                  uint8_t* __restrict__ packed,
-                                                  uint8_t* __restrict__ packed_scale,
-                                                  int64_t row,
-                                                  int32_t cols,
-                                                  int32_t group,
-                                                  int32_t nk_pad)
+__device__ __forceinline__ void load_group_values(
+    const input_t* __restrict__ input,
+    opus::vector_t<float, kValuesPerThread>& values,
+    int64_t row,
+    int32_t cols,
+    int32_t col)
 {
-    const int32_t lane = threadIdx.x & (kThreadsPerGroup - 1);
-    const int32_t col  = group * kGroupSize + lane * kValuesPerThread;
-
-    opus::vector_t<float, kValuesPerThread> values;
     if(col + kValuesPerThread <= cols && (cols % kValuesPerThread) == 0)
     {
         const input_t* input_ptr = input + row * static_cast<int64_t>(cols) + col;
@@ -83,49 +78,35 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
             const input_t* input_values = reinterpret_cast<const input_t*>(&input_bits);
 #pragma unroll
             for(int i = 0; i < kValuesPerThread; ++i)
-            {
                 values[i] = to_bf16_dot_operand(input_values[i]);
-            }
+            return;
         }
-        else
-        {
 #pragma unroll
-            for(int i = 0; i < kValuesPerThread; ++i)
-            {
-                values[i] = to_bf16_dot_operand(input_ptr[i]);
-            }
-        }
+        for(int i = 0; i < kValuesPerThread; ++i)
+            values[i] = to_bf16_dot_operand(input_ptr[i]);
+        return;
     }
-    else
+
+#pragma unroll
+    for(int i = 0; i < kValuesPerThread; ++i)
+    {
+        const int32_t k = col + i;
+        values[i] =
+            k < cols ? to_bf16_dot_operand(input[row * static_cast<int64_t>(cols) + k]) : 0.0f;
+    }
+}
+
+template <bool Safe>
+__device__ __forceinline__ void
+hadamard32(opus::vector_t<float, kValuesPerThread>& values, int32_t lane)
+{
+    if constexpr(Safe)
     {
 #pragma unroll
         for(int i = 0; i < kValuesPerThread; ++i)
-        {
-            const int32_t k = col + i;
-            values[i] =
-                k < cols ? to_bf16_dot_operand(input[row * static_cast<int64_t>(cols) + k]) : 0.0f;
-        }
+            values[i] *= kHadamard32WorkNorm;
     }
 
-    float local_input_amax = 0.0f;
-#pragma unroll
-    for(int i = 0; i < kValuesPerThread; ++i)
-        local_input_amax = fmaxf(local_input_amax, fabsf(values[i]));
-    local_input_amax = fmaxf(local_input_amax, swap_adjacent_lane(local_input_amax));
-    const float input_amax =
-        fmaxf(local_input_amax, swap_lane_distance_two(local_input_amax));
-    const int safety_shift = input_amax >= 0x1p125f ? kHadamardSafetyShift : 0;
-    const float hadamard_norm =
-        safety_shift == 0 ? kHadamard32Norm : kHadamard32WorkNorm;
-
-    // Normalize before any addition so finite inputs cannot create inf-inf
-    // cancellation inside the butterfly. Only extreme groups take the extra
-    // power-of-two shift, avoiding underflow for tiny BF16 values.
-#pragma unroll
-    for(int i = 0; i < kValuesPerThread; ++i)
-        values[i] *= hadamard_norm;
-
-    // H8 within each lane, followed by two lane butterflies to form H32.
     opus::static_for<3>([&](auto stage) {
         constexpr int h = 1 << stage.value;
         opus::static_for<kValuesPerThread / 2>([&](auto pair) {
@@ -149,16 +130,159 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
 #pragma unroll
     for(int i = 0; i < kValuesPerThread; ++i)
     {
-        const float peer = swap_lane_distance_two(values[i]);
-        values[i]        = lane < 2 ? values[i] + peer : peer - values[i];
+        const float peer    = swap_lane_distance_two(values[i]);
+        const float rotated = lane < 2 ? values[i] + peer : peer - values[i];
+        if constexpr(Safe)
+            values[i] = rotated;
+        else
+            values[i] = rotated * kHadamard32Norm;
     }
+}
 
+__device__ __forceinline__ float
+group_amax(const opus::vector_t<float, kValuesPerThread>& values)
+{
     float local_amax = 0.0f;
 #pragma unroll
     for(int i = 0; i < kValuesPerThread; ++i)
         local_amax = fmaxf(local_amax, fabsf(values[i]));
-    local_amax       = fmaxf(local_amax, swap_adjacent_lane(local_amax));
-    const float amax = fmaxf(local_amax, swap_lane_distance_two(local_amax));
+    local_amax = fmaxf(local_amax, swap_adjacent_lane(local_amax));
+    return fmaxf(local_amax, swap_lane_distance_two(local_amax));
+}
+
+// Keep the repair in a separate, immediately-returning CFG path. Merging its
+// scale compensation into the ordinary path extends live ranges and measurably
+// slows production-sized activation packing.
+template <typename input_t>
+__device__ __forceinline__ void
+quant_mxfp6_extreme_group(const input_t* __restrict__ input,
+                          uint8_t* __restrict__ packed,
+                          uint8_t* __restrict__ packed_scale,
+                          int64_t row,
+                          int32_t cols,
+                          int32_t group,
+                          int32_t nk_pad)
+{
+    const int32_t lane = threadIdx.x & (kThreadsPerGroup - 1);
+    const int32_t col  = group * kGroupSize + lane * kValuesPerThread;
+
+    opus::vector_t<float, kValuesPerThread> values;
+    load_group_values(input, values, row, cols, col);
+    hadamard32<true>(values, lane);
+    const float amax = group_amax(values);
+
+    const uint32_t exponent = (__builtin_bit_cast(uint32_t, amax) >> 23) & 0xFFu;
+    int32_t work_scale_unbiased =
+        exponent == 0u
+            ? -127
+            : (exponent == 0xFFu ? 127 : static_cast<int32_t>(exponent) - 129);
+    work_scale_unbiased = work_scale_unbiased < -127 ? -127 : work_scale_unbiased;
+    work_scale_unbiased = work_scale_unbiased > 127 ? 127 : work_scale_unbiased;
+    int32_t scale_unbiased = work_scale_unbiased + kHadamardSafetyShift;
+    scale_unbiased         = scale_unbiased < -127 ? -127 : scale_unbiased;
+    scale_unbiased         = scale_unbiased > 127 ? 127 : scale_unbiased;
+    const int32_t conversion_scale_unbiased =
+        scale_unbiased - kHadamardSafetyShift;
+    const uint8_t scale_exp = static_cast<uint8_t>(scale_unbiased + 127);
+    const uint8_t conversion_scale_exp =
+        static_cast<uint8_t>(conversion_scale_unbiased + 127);
+
+    float16_t even;
+    float16_t odd;
+#pragma unroll
+    for(int i = 0; i < kValuesPerThread / 2; ++i)
+    {
+        const float v0_even = values[2 * i];
+        const float v0_odd  = values[2 * i + 1];
+        const float v1_even = swap_adjacent_lane(v0_even);
+        const float v1_odd  = swap_adjacent_lane(v0_odd);
+        const float v2_even = swap_lane_distance_two(v0_even);
+        const float v2_odd  = swap_lane_distance_two(v0_odd);
+        const float v3_even = swap_adjacent_lane(v2_even);
+        const float v3_odd  = swap_adjacent_lane(v2_odd);
+        even[i]             = v0_even;
+        odd[i]              = v0_odd;
+        even[4 + i]         = v1_even;
+        odd[4 + i]          = v1_odd;
+        even[8 + i]         = v2_even;
+        odd[8 + i]          = v2_odd;
+        even[12 + i]        = v3_even;
+        odd[12 + i]         = v3_odd;
+    }
+
+    if(lane != 0)
+        return;
+
+    const uint32_t scale_bits = conversion_scale_exp == 0
+                                    ? 0x00400000u
+                                    : static_cast<uint32_t>(conversion_scale_exp) << 23;
+    const float mx_scale = __builtin_bit_cast(float, scale_bits);
+#if defined(__gfx950__)
+    const packed_fp6x32_t fp6 =
+        __builtin_amdgcn_cvt_scalef32_2xpk16_fp6_f32(even, odd, mx_scale);
+#else
+    const packed_fp6x32_t fp6{};
+#endif
+
+    const int32_t tile_row  = static_cast<int32_t>(row / kTileRows);
+    const int32_t rem       = static_cast<int32_t>(row % kTileRows);
+    const int32_t row_block = rem / 16;
+    const int32_t row16     = rem % 16;
+    const int32_t step      = group / kGroupsPerKTile;
+    const int32_t k_group   = group % kGroupsPerKTile;
+    const int32_t block     = row_block * 64 + k_group * 16 + row16;
+    const int64_t tile_base =
+        (static_cast<int64_t>(tile_row) * nk_pad + step) * kPackedTileBytes;
+    const int64_t c0_base = tile_base + block * 16;
+    const int64_t c1_base = tile_base + 16384 + block * 8;
+    *reinterpret_cast<uint4_t*>(packed + c0_base) =
+        *reinterpret_cast<const uint4_t*>(&fp6);
+    *reinterpret_cast<uint2_t*>(packed + c1_base) =
+        *reinterpret_cast<const uint2_t*>(reinterpret_cast<const uint8_t*>(&fp6) + 16);
+
+    const int32_t scale_upper = rem / 128;
+    const int32_t scale_sub   = (rem % 128) / 16;
+    const int64_t scale_address =
+        (static_cast<int64_t>(tile_row) * nk_pad + step) * kScaleTileBytes +
+        scale_upper * 512 + k_group * 128 + row16 * 8 + scale_sub;
+    packed_scale[scale_address] = scale_exp;
+}
+
+template <typename input_t>
+__device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ input,
+                                                  uint8_t* __restrict__ packed,
+                                                  uint8_t* __restrict__ packed_scale,
+                                                  int64_t row,
+                                                  int32_t cols,
+                                                  int32_t group,
+                                                  int32_t nk_pad)
+{
+    const int32_t lane = threadIdx.x & (kThreadsPerGroup - 1);
+    const int32_t col  = group * kGroupSize + lane * kValuesPerThread;
+
+    opus::vector_t<float, kValuesPerThread> values;
+    load_group_values(input, values, row, cols, col);
+    hadamard32<false>(values, lane);
+    const float amax = group_amax(values);
+
+    int32_t scale_unbiased;
+    if(amax == 0.0f)
+    {
+        scale_unbiased = 0;
+    }
+    else
+    {
+        const uint32_t exponent = (__builtin_bit_cast(uint32_t, amax) >> 23) & 0xFFu;
+        if(__builtin_expect(exponent == 0xFFu, 0))
+        {
+            quant_mxfp6_extreme_group(input, packed, packed_scale, row, cols, group, nk_pad);
+            return;
+        }
+        scale_unbiased = exponent == 0u ? -127 : static_cast<int32_t>(exponent) - 129;
+        scale_unbiased = scale_unbiased < -127 ? -127 : scale_unbiased;
+        scale_unbiased = scale_unbiased > 127 ? 127 : scale_unbiased;
+    }
+    const uint8_t scale_exp = static_cast<uint8_t>(scale_unbiased + 127);
 
     // Gather contiguous lane chunks into the even/odd vectors expected by the
     // gfx950 conversion. The instruction interleaves src0/src1 fields, yielding
@@ -189,30 +313,8 @@ __device__ __forceinline__ void quant_mxfp6_group(const input_t* __restrict__ in
     if(lane != 0)
         return;
 
-    uint8_t scale_exp;
-    uint8_t conversion_scale_exp;
-    if(amax == 0.0f)
-    {
-        scale_exp            = 127;
-        conversion_scale_exp = 127;
-    }
-    else
-    {
-        const uint32_t exponent = (__builtin_bit_cast(uint32_t, amax) >> 23) & 0xFFu;
-        int32_t stored =
-            exponent == 0u
-                ? 0
-                : static_cast<int32_t>(exponent) - 2 + safety_shift;
-        stored   = stored < 0 ? 0 : stored;
-        stored   = stored > 254 ? 254 : stored;
-        scale_exp = static_cast<uint8_t>(stored);
-        conversion_scale_exp =
-            static_cast<uint8_t>(stored - safety_shift);
-    }
-
-    const uint32_t scale_bits = conversion_scale_exp == 0
-                                    ? 0x00400000u
-                                    : static_cast<uint32_t>(conversion_scale_exp) << 23;
+    const uint32_t scale_bits =
+        scale_exp == 0 ? 0x00400000u : static_cast<uint32_t>(scale_exp) << 23;
     const float mx_scale = __builtin_bit_cast(float, scale_bits);
 #if defined(__gfx950__)
     const packed_fp6x32_t fp6 =

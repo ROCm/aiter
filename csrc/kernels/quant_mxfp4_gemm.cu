@@ -31,6 +31,8 @@ constexpr int kLargeKStepsPerBlock = 3;
 constexpr uintptr_t kOutputAlignment = 16;
 // _hadamard32_np().astype(bfloat16), represented exactly as fp32.
 constexpr float kHadamard32Norm = 0.1767578125f;
+constexpr int kHadamardSafetyShift = 3;
+constexpr float kHadamard32WorkNorm = kHadamard32Norm * 0.125f;
 
 using packed_u16x8_t = opus::vector_t<uint16_t, 8>;
 using packed_f32x8_t = opus::vector_t<float, 8>;
@@ -107,29 +109,15 @@ __device__ __forceinline__ void load_group_values(const input_t* __restrict__ in
     }
 }
 
-template <typename input_t, MxScaleRoundMode RoundMode>
-__device__ __forceinline__ void quant_mxfp4_gemm_group(const input_t* __restrict__ input,
-                                                       uint8_t* __restrict__ packed,
-                                                       uint8_t* __restrict__ packed_scale,
-                                                       int64_t row,
-                                                       int32_t cols,
-                                                       int32_t group,
-                                                       int32_t nk_pad,
-                                                       bool valid_row)
+template <bool Safe>
+__device__ __forceinline__ void
+hadamard32(opus::vector_t<float, kValuesPerThread>& values, int32_t lane)
 {
-    const int32_t lane = threadIdx.x & (kThreadsPerGroup - 1);
-    const int32_t col  = group * kGroupSize + lane * kValuesPerThread;
-
-    opus::vector_t<float, kValuesPerThread> values;
-    load_group_values(input, values, row, cols, col, valid_row);
-
-    // Scale before the butterfly, matching the legacy matrix product and
-    // avoiding intermediate overflow when the normalized H32 result is finite.
+    const float norm = Safe ? kHadamard32WorkNorm : kHadamard32Norm;
 #pragma unroll
     for(int i = 0; i < kValuesPerThread; ++i)
-        values[i] *= kHadamard32Norm;
+        values[i] *= norm;
 
-    // H8 within each lane, followed by two lane butterflies to form H32.
     opus::static_for<3>([&](auto stage) {
         constexpr int h = 1 << stage.value;
         opus::static_for<kValuesPerThread / 2>([&](auto pair) {
@@ -153,29 +141,69 @@ __device__ __forceinline__ void quant_mxfp4_gemm_group(const input_t* __restrict
 #pragma unroll
     for(int i = 0; i < kValuesPerThread; ++i)
     {
-        const float peer = swap_lane_distance_two(values[i]);
+        const float peer    = swap_lane_distance_two(values[i]);
         const float rotated = lane < 2 ? values[i] + peer : peer - values[i];
-        // The legacy path explicitly rounds the H32 result to BF16 before
-        // computing amax and converting to E2M1.
-        values[i] = __bfloat162float(__float2bfloat16(rotated));
+        values[i]           = __bfloat162float(__float2bfloat16(rotated));
     }
+}
 
-    // quant_mxfp4_hip's production RoundUp path seeds amax with 1e-10. Keep
-    // that legacy minimum for all-zero groups (including padded K groups).
+template <MxScaleRoundMode RoundMode>
+__device__ __forceinline__ float
+group_amax(const opus::vector_t<float, kValuesPerThread>& values)
+{
     float local_amax = RoundMode == MxScaleRoundMode::RoundUp ? 1.0e-10f : 0.0f;
 #pragma unroll
     for(int i = 0; i < kValuesPerThread; ++i)
         local_amax = fmaxf(local_amax, fabsf(values[i]));
-    local_amax       = fmaxf(local_amax, swap_adjacent_lane(local_amax));
-    const float amax = fmaxf(local_amax, swap_lane_distance_two(local_amax));
+    local_amax = fmaxf(local_amax, swap_adjacent_lane(local_amax));
+    return fmaxf(local_amax, swap_lane_distance_two(local_amax));
+}
+
+template <typename input_t, MxScaleRoundMode RoundMode>
+__device__ __forceinline__ void quant_mxfp4_gemm_group(const input_t* __restrict__ input,
+                                                       uint8_t* __restrict__ packed,
+                                                       uint8_t* __restrict__ packed_scale,
+                                                       int64_t row,
+                                                       int32_t cols,
+                                                       int32_t group,
+                                                       int32_t nk_pad,
+                                                       bool valid_row)
+{
+    const int32_t lane = threadIdx.x & (kThreadsPerGroup - 1);
+    const int32_t col  = group * kGroupSize + lane * kValuesPerThread;
+
+    opus::vector_t<float, kValuesPerThread> values;
+    load_group_values(input, values, row, cols, col, valid_row);
+    hadamard32<false>(values, lane);
+    float amax = group_amax<RoundMode>(values);
+    int safety_shift = 0;
+
+    const uint32_t amax_exponent =
+        (__builtin_bit_cast(uint32_t, amax) >> 23) & 0xFFu;
+    if(__builtin_expect(amax_exponent == 0xFFu, 0))
+    {
+        load_group_values(input, values, row, cols, col, valid_row);
+        hadamard32<true>(values, lane);
+        amax         = group_amax<RoundMode>(values);
+        safety_shift = kHadamardSafetyShift;
+    }
 
     const E8m0BlockScale block_scale =
         fp_f32_to_e8m0_block_scale<RoundMode, MxDtype::FP4_E2M1>(amax);
+    const uint32_t unclamped_stored_scale =
+        static_cast<uint32_t>(block_scale.byte) + safety_shift;
+    const uint32_t stored_scale =
+        unclamped_stored_scale > 254u ? 254u : unclamped_stored_scale;
+    const uint8_t stored_scale_byte = static_cast<uint8_t>(stored_scale);
+    const uint8_t conversion_scale_byte =
+        static_cast<uint8_t>(stored_scale - safety_shift);
     // E8M0 byte zero represents the minimum scale 2^-127. The f32 value with
     // exponent field zero is numeric zero, so use the minimum normal/subnormal
     // boundary when feeding the hardware conversion instruction.
     const uint32_t conversion_scale_bits =
-        block_scale.byte == 0 ? 0x00400000u : static_cast<uint32_t>(block_scale.byte) << 23;
+        conversion_scale_byte == 0
+            ? 0x00400000u
+            : static_cast<uint32_t>(conversion_scale_byte) << 23;
     const float conversion_scale = __builtin_bit_cast(float, conversion_scale_bits);
 
     uint32_t packed_word = 0;
@@ -209,7 +237,7 @@ __device__ __forceinline__ void quant_mxfp4_gemm_group(const input_t* __restrict
         const int64_t scale_address =
             (static_cast<int64_t>(tile_row) * nk_pad + step) * kScaleTileBytes +
             scale_upper * 512 + k_group * 128 + row16 * 8 + scale_sub;
-        packed_scale[scale_address] = block_scale.byte;
+        packed_scale[scale_address] = stored_scale_byte;
     }
 }
 

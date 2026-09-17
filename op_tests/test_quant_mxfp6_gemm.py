@@ -187,11 +187,17 @@ def test_hip_packer_avoids_hadamard_intermediate_overflow(
     # The DC coefficient of an all-max block exceeds fp32/MXFP6 range. It must
     # saturate positively without inf-inf cancellation creating spurious signs.
     extreme = torch.full((1, 32), max_bf16, dtype=torch.bfloat16, device="cuda")
-    packed, scale = _pack_out(extreme, "hip")
-    codes = _unpack_first_block(packed)
-    assert int(scale[0]) == 254
-    assert int(codes[0]) == 31
-    assert torch.count_nonzero(codes[1:]).item() == 0
+    for backend in ("hip", "triton"):
+        packed, scale = _pack_out(extreme, backend)
+        codes = _unpack_first_block(packed)
+        assert int(scale[0]) == 254, backend
+        assert int(codes[0]) == 31, backend
+        assert torch.count_nonzero(codes[1:]).item() == 0, backend
+
+    torch_codes, torch_scales = mxfp6.quant_mxfp6_torch(extreme)
+    assert int(torch_scales[0, 0]) == 254
+    assert int(torch_codes[0, 0]) == 31
+    assert torch.count_nonzero(torch_codes[0, 1:]).item() == 0
 
 
 @pytest.mark.parametrize("exponent", [-119, -120, -121, -122])
@@ -202,10 +208,14 @@ def test_hip_packer_preserves_low_e8m0_scales(
     x = torch.zeros((1, 32), dtype=torch.bfloat16, device="cuda")
     x[0, 0] = 2.0**exponent
     monkeypatch.setattr(mxfp6, "_QUANT_BACKEND", "hip")
-    packed, scale = _pack_out(x, "hip")
+    for backend in ("hip", "triton"):
+        packed, scale = _pack_out(x, backend)
+        assert torch.all(_unpack_first_block(packed) == 27), backend
+        assert int(scale[0]) == exponent + 122, backend
 
-    assert torch.all(_unpack_first_block(packed) == 27)
-    assert int(scale[0]) == exponent + 122
+    torch_codes, torch_scales = mxfp6.quant_mxfp6_torch(x)
+    assert torch.all(torch_codes[0] == 27)
+    assert int(torch_scales[0, 0]) == exponent + 122
 
 
 def test_hip_packer_handles_misaligned_contiguous_input(
