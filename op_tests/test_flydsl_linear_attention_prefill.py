@@ -391,6 +391,25 @@ _PREFILL_GROUPS = [
     *_k5_dense_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
+    # Keep the partial-chunk boundary out of the broad production sweep.
+    PrefillGroup(
+        model_name="review-unaligned-varlen",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[1000],
+        max_num_batched_tokens="full_prompt_len",
+    ),
+    # Exercise dense token-major addressing with a non-unit batch stride.
+    PrefillGroup(
+        model_name="review-dense-b2",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[1024],
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens="full_prompt_len",
+        dense_batch=2,
+    ),
 ]
 
 # Full tuner catalog. ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py`` loads this module
@@ -649,13 +668,7 @@ def _build_case(model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dty
     )
 
 
-@benchmark()
-def test_chunk_gdn_prefill_h(
-    model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
-):
-    case = _build_case(
-        model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
-    )
+def _run_prefill_h_case(case: PrefillArgs):
     context_lens = case.resolve_context_lens()
     k, w_orig, u_orig, w_c, u_c, g, h0, cu = _make_inputs(case, context_lens)
     ofs = case.output_final_state
@@ -726,6 +739,7 @@ def test_chunk_gdn_prefill_h(
     )
 
     ret = {"gfx": get_gfx(), "B": B, "N": N, "H": H, "T_flat": T_flat}
+    flydsl_layout_outputs = {}
     for wu_hm in (True, False):
         w_in, u_in = (w_c, u_c) if wu_hm else (w_orig, u_orig)
         candidates = {
@@ -807,8 +821,31 @@ def test_chunk_gdn_prefill_h(
             ret[f"{ret_name} TFLOPS"] = flops / us / 1e6
             ret[f"{ret_name} TB/s"] = nbytes / us / 1e6
             ret[f"{ret_name} err"] = err
+            if name == "flydsl":
+                flydsl_layout_outputs[wu_hm] = (h, vn, fs)
+
+    h_hm, vn_hm, fs_hm = flydsl_layout_outputs[True]
+    h_tm, vn_tm, fs_tm = flydsl_layout_outputs[False]
+    assert torch.equal(h_tm, h_hm), "FlyDSL token-major h differs from head-major"
+    assert torch.equal(
+        vn_tm, _normalize_opt_v_new(vn_hm)
+    ), "FlyDSL token-major v_new differs from head-major"
+    if ofs:
+        assert torch.equal(
+            fs_tm, fs_hm
+        ), "FlyDSL token-major final_state differs from head-major"
 
     return ret
+
+
+@benchmark()
+def test_chunk_gdn_prefill_h(
+    model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
+):
+    case = _build_case(
+        model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
+    )
+    return _run_prefill_h_case(case)
 
 
 def _sweep_rows(args, model):
@@ -925,6 +962,14 @@ def main():
             K5_MODELS[model]["label"],
             df.to_markdown(index=False),
         )
+
+    review_names = {"review-unaligned-varlen", "review-dense-b2"}
+    review_cases = expand_groups(
+        [group for group in _PREFILL_GROUPS if group.model_name in review_names]
+    )
+    for case in review_cases:
+        aiter.logger.info("running review case: %s", case)
+        _run_prefill_h_case(case)
 
 
 if __name__ == "__main__":
