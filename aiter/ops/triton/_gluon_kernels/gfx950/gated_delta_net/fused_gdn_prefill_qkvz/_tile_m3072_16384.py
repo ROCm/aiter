@@ -11,6 +11,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.extra import libdevice
 from triton.language.core import range as loop_range
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _convolve_sliding_repr = make_kernel_repr(
@@ -151,33 +152,32 @@ def _convolve_sliding(
         x2 = gl.where(token - 1 >= begin, x2, h2)
         for step in gl.static_range(TOKENS):
             current_token = token + step
-            if BATCH > 1 and step > 0:
-                if current_token >= end:
-                    low, high = 0, BATCH
-                    for _ in gl.static_range(SEARCH_STEPS):
-                        middle = (low + high) // 2
-                        right = gl.load(starts + middle) <= current_token
-                        low = gl.where(right, middle + 1, low)
-                        high = gl.where(right, high, middle)
-                    sequence = gl.minimum(low - 1, BATCH - 1)
-                    end = gl.load(starts + sequence + 1)
-                    slot = gl.load(indices + sequence)
-                    cached = gl.load(initial + sequence)
-                    x0 = gl.load(
-                        pool + (slot * 2048 + channel) * 3,
-                        cached & (current_token < M),
-                        other=0,
-                    ).to(gl.float32)
-                    x1 = gl.load(
-                        pool + (slot * 2048 + channel) * 3 + 1,
-                        cached & (current_token < M),
-                        other=0,
-                    ).to(gl.float32)
-                    x2 = gl.load(
-                        pool + (slot * 2048 + channel) * 3 + 2,
-                        cached & (current_token < M),
-                        other=0,
-                    ).to(gl.float32)
+            if BATCH > 1 and step > 0 and current_token >= end:
+                low, high = 0, BATCH
+                for _ in gl.static_range(SEARCH_STEPS):
+                    middle = (low + high) // 2
+                    right = gl.load(starts + middle) <= current_token
+                    low = gl.where(right, middle + 1, low)
+                    high = gl.where(right, high, middle)
+                sequence = gl.minimum(low - 1, BATCH - 1)
+                end = gl.load(starts + sequence + 1)
+                slot = gl.load(indices + sequence)
+                cached = gl.load(initial + sequence)
+                x0 = gl.load(
+                    pool + (slot * 2048 + channel) * 3,
+                    cached & (current_token < M),
+                    other=0,
+                ).to(gl.float32)
+                x1 = gl.load(
+                    pool + (slot * 2048 + channel) * 3 + 1,
+                    cached & (current_token < M),
+                    other=0,
+                ).to(gl.float32)
+                x2 = gl.load(
+                    pool + (slot * 2048 + channel) * 3 + 2,
+                    cached & (current_token < M),
+                    other=0,
+                ).to(gl.float32)
             x3 = gl.load(
                 packed + current_token * 3072 + packed_channel,
                 current_token < M,

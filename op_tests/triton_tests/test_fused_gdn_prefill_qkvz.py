@@ -203,22 +203,22 @@ def make_inputs(seqlens, num_k_heads=4, head_dim=128, width=4, seed=0):
     cu = torch.zeros(batch + 1, dtype=torch.int32, device=device)
     cu[1:] = torch.tensor(seqlens, dtype=torch.int32, device=device).cumsum(0)
 
-    return dict(
-        projected_qkvz=(
+    return {
+        "projected_qkvz": (
             torch.randn(
                 m, num_k_heads * group_width, dtype=torch.bfloat16, device=device
             )
             * 0.1
         ),
-        projected_ba=torch.randn(
+        "projected_ba": torch.randn(
             m, 2 * num_v_heads, dtype=torch.bfloat16, device=device
         )
         * 0.1,
-        conv_state=torch.randn(
+        "conv_state": torch.randn(
             num_slots, channels, width - 1, dtype=torch.bfloat16, device=device
         )
         * 0.1,
-        delta_state=torch.randn(
+        "delta_state": torch.randn(
             num_slots,
             num_v_heads,
             head_dim,
@@ -227,22 +227,22 @@ def make_inputs(seqlens, num_k_heads=4, head_dim=128, width=4, seed=0):
             device=device,
         )
         * 0.1,
-        cache_indices=torch.arange(1, batch + 1, dtype=torch.int32, device=device),
-        cu_seqlens=cu,
-        has_initial_state=torch.ones(batch, dtype=torch.bool, device=device),
-        conv_weight=torch.randn(channels, width, dtype=torch.bfloat16, device=device)
+        "cache_indices": torch.arange(1, batch + 1, dtype=torch.int32, device=device),
+        "cu_seqlens": cu,
+        "has_initial_state": torch.ones(batch, dtype=torch.bool, device=device),
+        "conv_weight": torch.randn(channels, width, dtype=torch.bfloat16, device=device)
         * 0.1,
-        conv_bias=torch.randn(channels, dtype=torch.bfloat16, device=device) * 0.1,
-        A_log=torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1,
-        dt_bias=torch.randn(num_v_heads, dtype=torch.bfloat16, device=device) * 0.1,
-        norm_weight=torch.ones(head_dim, dtype=torch.bfloat16, device=device),
-        scale=head_dim**-0.5,
-        norm_eps=1e-6,
-        num_k_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        head_k_dim=head_dim,
-        head_v_dim=head_dim,
-    )
+        "conv_bias": torch.randn(channels, dtype=torch.bfloat16, device=device) * 0.1,
+        "A_log": torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1,
+        "dt_bias": torch.randn(num_v_heads, dtype=torch.bfloat16, device=device) * 0.1,
+        "norm_weight": torch.ones(head_dim, dtype=torch.bfloat16, device=device),
+        "scale": head_dim**-0.5,
+        "norm_eps": 1e-6,
+        "num_k_heads": num_k_heads,
+        "num_v_heads": num_v_heads,
+        "head_k_dim": head_dim,
+        "head_v_dim": head_dim,
+    }
 
 
 def _require_supported(inp):

@@ -36,7 +36,6 @@ back to the four-kernel chain instead of crashing. Two hard gates:
 
 import functools
 import re
-from typing import Optional, Tuple
 
 import torch
 
@@ -70,7 +69,7 @@ _MAX_TOKENS = 16384
 _MAX_BATCH = 64
 
 
-def _arch_supported() -> Tuple[bool, str]:
+def _arch_supported() -> tuple[bool, str]:
     """gfx950 probe, guarded so architecture detection never raises at import.
 
     ``arch_info`` detection can touch the driver (and has an unguarded GPU
@@ -82,7 +81,8 @@ def _arch_supported() -> Tuple[bool, str]:
         from aiter.ops.triton.utils._triton.arch_info import get_arch
 
         arch = get_arch()
-    except Exception as exc:  # pragma: no cover - detection is environment-specific
+    except Exception as exc:  # noqa: BLE001
+        # Defensive: any detection failure (driver/subprocess/import) => unsupported.
         return False, f"architecture detection failed ({exc})"
     if arch != "gfx950":
         return False, f"gfx950 only, got {arch}"
@@ -90,7 +90,7 @@ def _arch_supported() -> Tuple[bool, str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _gluon_supported() -> Tuple[bool, str]:
+def _gluon_supported() -> tuple[bool, str]:
     """Cached probe: can this Triton compile the tiles' Gluon dialect?
 
     gfx950 alone is not enough. The tiles use the Gluon dialect as it stands in
@@ -109,13 +109,13 @@ def _gluon_supported() -> Tuple[bool, str]:
     if matched is None or (int(matched.group(1)), int(matched.group(2))) < (3, 8):
         return False, f"Triton >= 3.8 required for this Gluon dialect, got {version}"
     try:
-        import triton.experimental.gluon  # noqa: F401
+        import triton.experimental.gluon
     except ImportError:
         return False, f"triton.experimental.gluon unavailable (Triton {version})"
     return True, ""
 
 
-def _select_tile_key(tokens: int, batch: int) -> Optional[str]:
+def _select_tile_key(tokens: int, batch: int) -> str | None:
     """Return the tile key for a covered (tokens, batch), else ``None``.
 
     Pure -- no Gluon import -- so the coverage decision is shared cheaply by
@@ -164,13 +164,13 @@ def fused_gdn_prefill_qkvz_supported(
     cu_seqlens: torch.Tensor,
     has_initial_state: torch.Tensor,
     conv_weight: torch.Tensor,
-    conv_bias: Optional[torch.Tensor],
-    quant_dtype: Optional[torch.dtype] = None,
+    conv_bias: torch.Tensor | None,
+    quant_dtype: torch.dtype | None = None,
     *,
-    a_log: Optional[torch.Tensor] = None,
-    dt_bias: Optional[torch.Tensor] = None,
-    norm_weight: Optional[torch.Tensor] = None,
-) -> Tuple[bool, str]:
+    a_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+) -> tuple[bool, str]:
     """Report whether this call is covered, and if not, why.
 
     Returns ``(True, "")`` or ``(False, reason)``. The reason is meant to be
@@ -220,8 +220,10 @@ def fused_gdn_prefill_qkvz_supported(
     if delta_state.ndim != 4 or conv_state.ndim != 3:
         return (
             False,
-            f"expected delta_state rank-4 and conv_state rank-3, got "
-            f"{delta_state.ndim}/{conv_state.ndim}",
+            (
+                f"expected delta_state rank-4 and conv_state rank-3, got "
+                f"{delta_state.ndim}/{conv_state.ndim}"
+            ),
         )
 
     tokens = projected_qkvz.shape[0]
@@ -231,44 +233,56 @@ def fused_gdn_prefill_qkvz_supported(
     if _select_tile_key(tokens, batch) is None:
         return (
             False,
-            f"(tokens={tokens}, batch={batch}) outside covered tiles "
-            f"(tokens {_MIN_TOKENS}..{_MAX_TOKENS}, batch 1..{_MAX_BATCH})",
+            (
+                f"(tokens={tokens}, batch={batch}) outside covered tiles "
+                f"(tokens {_MIN_TOKENS}..{_MAX_TOKENS}, batch 1..{_MAX_BATCH})"
+            ),
         )
 
     # --- baked head topology (tiles hard-code _K_HEADS/_V_HEADS/_HEAD_DIM) -----
     if tuple(delta_state.shape[1:]) != (_V_HEADS, _HEAD_DIM, _HEAD_DIM):
         return (
             False,
-            f"delta_state must be [N, {_V_HEADS}, {_HEAD_DIM}, {_HEAD_DIM}], got "
-            f"{tuple(delta_state.shape)}",
+            (
+                f"delta_state must be [N, {_V_HEADS}, {_HEAD_DIM}, {_HEAD_DIM}], got "
+                f"{tuple(delta_state.shape)}"
+            ),
         )
     if conv_state.shape[1] != _CONV_CHANNELS or conv_state.shape[2] != _CONV_WIDTH - 1:
         return (
             False,
-            f"conv_state must be [N, {_CONV_CHANNELS}, {_CONV_WIDTH - 1}], got "
-            f"{tuple(conv_state.shape)}",
+            (
+                f"conv_state must be [N, {_CONV_CHANNELS}, {_CONV_WIDTH - 1}], got "
+                f"{tuple(conv_state.shape)}"
+            ),
         )
 
     # --- packed projection widths (fixed-stride addressing) -------------------
     if projected_qkvz.shape != (tokens, _QKVZ_WIDTH):
         return (
             False,
-            f"projected_qkvz must be [{tokens}, {_QKVZ_WIDTH}], got "
-            f"{tuple(projected_qkvz.shape)}",
+            (
+                f"projected_qkvz must be [{tokens}, {_QKVZ_WIDTH}], got "
+                f"{tuple(projected_qkvz.shape)}"
+            ),
         )
     if projected_ba.shape != (tokens, _BA_WIDTH):
         return (
             False,
-            f"projected_ba must be [{tokens}, {_BA_WIDTH}], got "
-            f"{tuple(projected_ba.shape)}",
+            (
+                f"projected_ba must be [{tokens}, {_BA_WIDTH}], got "
+                f"{tuple(projected_ba.shape)}"
+            ),
         )
 
     # --- convolution weight/bias layout ---------------------------------------
     if conv_weight.shape != (_CONV_CHANNELS, _CONV_WIDTH):
         return (
             False,
-            f"conv_weight must be [{_CONV_CHANNELS}, {_CONV_WIDTH}], got "
-            f"{tuple(conv_weight.shape)}",
+            (
+                f"conv_weight must be [{_CONV_CHANNELS}, {_CONV_WIDTH}], got "
+                f"{tuple(conv_weight.shape)}"
+            ),
         )
     if conv_bias.shape != (_CONV_CHANNELS,):
         return (
@@ -280,8 +294,10 @@ def fused_gdn_prefill_qkvz_supported(
     if cu_seqlens.dtype is not torch.int32 or cu_seqlens.shape != (batch + 1,):
         return (
             False,
-            f"cu_seqlens must be int32 [{batch + 1}], got {cu_seqlens.dtype} "
-            f"{tuple(cu_seqlens.shape)}",
+            (
+                f"cu_seqlens must be int32 [{batch + 1}], got {cu_seqlens.dtype} "
+                f"{tuple(cu_seqlens.shape)}"
+            ),
         )
     if cache_indices.dtype is not torch.int32:
         return False, f"cache_indices must be int32, got {cache_indices.dtype}"
@@ -313,16 +329,20 @@ def fused_gdn_prefill_qkvz_supported(
     ):
         return (
             False,
-            f"dt_bias must be bf16 [{_V_HEADS}], got {dt_bias.dtype} "
-            f"{tuple(dt_bias.shape)}",
+            (
+                f"dt_bias must be bf16 [{_V_HEADS}], got {dt_bias.dtype} "
+                f"{tuple(dt_bias.shape)}"
+            ),
         )
     if norm_weight is not None and (
         norm_weight.shape != (_HEAD_DIM,) or norm_weight.dtype is not torch.bfloat16
     ):
         return (
             False,
-            f"norm_weight must be bf16 [{_HEAD_DIM}], got {norm_weight.dtype} "
-            f"{tuple(norm_weight.shape)}",
+            (
+                f"norm_weight must be bf16 [{_HEAD_DIM}], got {norm_weight.dtype} "
+                f"{tuple(norm_weight.shape)}"
+            ),
         )
 
     if quant_dtype is not None and quant_dtype is not _QUANT_DTYPE:
@@ -347,7 +367,7 @@ def fused_gdn_prefill_qkvz(
     *,
     scale: float,
     eps: float = 1.0e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused Qwen3-Next GDN prefill (conv + gating + chunked delta + gated
     RMSNorm + group-128 FP8 quant) as a tight set of Gluon launches -- the win is
     the intra-launch fusion and the dropped intermediate HBM traffic, not a single

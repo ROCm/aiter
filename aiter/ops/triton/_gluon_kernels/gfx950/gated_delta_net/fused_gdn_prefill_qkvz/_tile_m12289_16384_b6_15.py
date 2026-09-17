@@ -11,6 +11,7 @@ the invocation, including ragged tails.
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.extra import libdevice
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -376,7 +377,7 @@ def _prepare_chunks_compact(
 ):
     chunk = gl.program_id(0)
     head = gl.program_id(1)
-    q, key, inverse, prefix, suffix, beta, token_begin, end = _chunk_coefficients(
+    _q, _key, inverse, prefix, suffix, _beta, _token_begin, _end = _chunk_coefficients(
         prepared, gates, starts, chunk_c, M, BATCH, BT
     )
     layout: gl.constexpr = inverse.type.layout

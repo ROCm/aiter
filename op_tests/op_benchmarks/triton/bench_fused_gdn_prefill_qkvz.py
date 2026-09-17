@@ -46,24 +46,24 @@ def make_inputs(batch, seqlen, num_k_heads, head_dim, device="cuda"):
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
     m = batch * seqlen
     slots = batch + 1
-    bf16 = dict(dtype=torch.bfloat16, device=device)
+    bf16 = {"dtype": torch.bfloat16, "device": device}
     cu = torch.arange(0, m + 1, seqlen, dtype=torch.int32, device=device)
-    return dict(
-        projected_qkvz=torch.randn(m, num_k_heads * group_width, **bf16),
-        projected_ba=torch.randn(m, 2 * num_v_heads, **bf16),
-        conv_state=torch.randn(slots, channels, _CONV_WIDTH - 1, **bf16),
-        delta_state=torch.randn(
+    return {
+        "projected_qkvz": torch.randn(m, num_k_heads * group_width, **bf16),
+        "projected_ba": torch.randn(m, 2 * num_v_heads, **bf16),
+        "conv_state": torch.randn(slots, channels, _CONV_WIDTH - 1, **bf16),
+        "delta_state": torch.randn(
             slots, num_v_heads, head_dim, head_dim, dtype=torch.float32, device=device
         ),
-        cache_indices=torch.arange(1, batch + 1, dtype=torch.int32, device=device),
-        cu_seqlens=cu,
-        has_initial_state=torch.ones(batch, dtype=torch.bool, device=device),
-        conv_weight=torch.randn(channels, _CONV_WIDTH, **bf16),
-        conv_bias=torch.randn(channels, **bf16),
-        A_log=torch.randn(num_v_heads, dtype=torch.float32, device=device),
-        dt_bias=torch.randn(num_v_heads, **bf16),
-        norm_weight=torch.randn(head_dim, **bf16),
-    )
+        "cache_indices": torch.arange(1, batch + 1, dtype=torch.int32, device=device),
+        "cu_seqlens": cu,
+        "has_initial_state": torch.ones(batch, dtype=torch.bool, device=device),
+        "conv_weight": torch.randn(channels, _CONV_WIDTH, **bf16),
+        "conv_bias": torch.randn(channels, **bf16),
+        "A_log": torch.randn(num_v_heads, dtype=torch.float32, device=device),
+        "dt_bias": torch.randn(num_v_heads, **bf16),
+        "norm_weight": torch.randn(head_dim, **bf16),
+    }
 
 
 def bytes_moved(m, batch, num_k_heads, head_dim):
@@ -83,12 +83,20 @@ def bytes_moved(m, batch, num_k_heads, head_dim):
 def bench_one(batch, seqlen, num_k_heads, head_dim, iters, warmup=25):
     inp = make_inputs(batch, seqlen, num_k_heads, head_dim)
     args = (
-        inp["projected_qkvz"], inp["projected_ba"], inp["conv_state"],
-        inp["delta_state"], inp["cache_indices"], inp["cu_seqlens"],
-        inp["has_initial_state"], inp["conv_weight"], inp["conv_bias"],
-        inp["A_log"], inp["dt_bias"], inp["norm_weight"],
+        inp["projected_qkvz"],
+        inp["projected_ba"],
+        inp["conv_state"],
+        inp["delta_state"],
+        inp["cache_indices"],
+        inp["cu_seqlens"],
+        inp["has_initial_state"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
     )
-    kwargs = dict(scale=head_dim**-0.5, eps=1e-6)
+    kwargs = {"scale": head_dim**-0.5, "eps": 1e-6}
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -137,8 +145,10 @@ def main():
         return 0
 
     peak = _PEAK_BW.get(arch)
-    print(f"fused_gdn_prefill_qkvz on {torch.cuda.get_device_name(0)} ({arch}), "
-          f"num_k_heads={args.num_k_heads} head_dim={args.head_dim}")
+    print(
+        f"fused_gdn_prefill_qkvz on {torch.cuda.get_device_name(0)} ({arch}), "
+        f"num_k_heads={args.num_k_heads} head_dim={args.head_dim}"
+    )
     hdr = f"{'batch':>6}{'seqlen':>8}{'tokens':>8}{'tile':>20}{'us':>10}{'Mtok/s':>9}{'TB/s':>8}{'%pk':>6}"
     print(hdr)
     for spec in args.shapes.split(","):

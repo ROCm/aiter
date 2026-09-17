@@ -9,6 +9,7 @@ and normalized output retain the reference's BF16 rounding boundaries.
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.extra import libdevice
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 

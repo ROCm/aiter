@@ -15,6 +15,7 @@ scratch is initialized on every invocation and reused only after its final reade
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.extra import libdevice
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -60,10 +61,9 @@ def _prepare_qkv_window(
     tile = work // (32 // BT)
     part = work % (32 // BT)
     seq, first, end = _chunk_bounds(Starts, tile, BATCH, 32)
-    if Bounds is not None:
-        if (group == 0) & (part == 0):
-            gl.store(Bounds + tile * 2, first)
-            gl.store(Bounds + tile * 2 + 1, end)
+    if Bounds is not None and (group == 0) & (part == 0):
+        gl.store(Bounds + tile * 2, first)
+        gl.store(Bounds + tile * 2 + 1, end)
     first += part * BT
     begin = gl.load(Starts + seq)
     layout: gl.constexpr = gl.BlockedLayout(
@@ -171,7 +171,7 @@ def _prepare_gates(
 ):
     chunk = gl.program_id(0)
     if Bounds is None:
-        seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
+        _seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
     else:
         first = gl.load(Bounds + chunk * 2)
         end = gl.load(Bounds + chunk * 2 + 1)
@@ -390,7 +390,7 @@ def _chunk_transform(
         key = gl.load(QKV + ((4 + head // 2) * M + t[:, None]) * 128 + k[None, :])
         if FUSED_GATES:
             if Bounds is None:
-                seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
+                _seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
             token = first + i
             ba_base = token * 16 + (head // 2) * 4 + head % 2
             av = gl.load(BA + ba_base + 2, token < end, 0).to(gl.float32)
@@ -993,7 +993,7 @@ def _chunk_output_quant(
 ):
     chunk = gl.program_id(0)
     head = gl.program_id(1)
-    seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
+    _seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
     if first < end:
         layout: gl.constexpr = gl.BlockedLayout([1, 2], [4, 16], [4, 1], [1, 0])
         state_layout: gl.constexpr = gl.BlockedLayout([2, 1], [64, 1], [1, 4], [0, 1])
