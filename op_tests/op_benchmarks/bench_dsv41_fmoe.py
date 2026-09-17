@@ -3,6 +3,7 @@
 """Benchmark DSV4.1 Flash EP4 A8W4 FMoE with production-shaped routing."""
 
 import argparse
+import gc
 import importlib
 import json
 import os
@@ -235,6 +236,9 @@ def main():
                     order = tuple(reversed(order))
                 for arm in order:
                     _install_config(fused_moe, arms[arm])
+                    if args.execution == "eager":
+                        launchers[arm]()
+                        torch.cuda.synchronize()
                     samples[arm].append(
                         _event_latency_us(launchers[arm], args.iterations)
                     )
@@ -262,6 +266,12 @@ def main():
                 ),
                 flush=True,
             )
+            del launchers, outputs, metadata, mask
+            gc.collect()
+            torch.cuda.empty_cache()
+        del hidden, expert_ids, routing_weights
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
