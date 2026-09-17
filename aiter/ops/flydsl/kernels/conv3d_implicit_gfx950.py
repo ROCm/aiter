@@ -58,7 +58,7 @@ from .conv3d_gfx950_utils import (
     flat_buffer_view,
     sgpr,
 )
-from .conv3d_im2col import Im2colGather, make_im2col_plan
+from .conv3d_im2col import Im2colGather, make_conv_geometry, make_im2col_plan
 
 TILE_K = 32
 
@@ -213,12 +213,11 @@ def make_conv3d_implicit_param(
 # would evict entries that the same process still needs.
 @functools.lru_cache(maxsize=1024)
 def compile_conv3d_implicit(param: Conv3dImplicitParam):
-    n, c, d, h, w, k = param.n, param.c, param.d, param.h, param.w, param.k
-    kt, kh, kw = param.kt, param.kh, param.kw
-    st, sh, sw = param.st, param.sh, param.sw
-    pt, ph, pw = param.pt, param.ph, param.pw
-    dt, dh, dw = param.dt, param.dh, param.dw
-    pad_mode, has_bias, splitk = param.pad_mode, param.has_bias, param.splitk
+    # Only what shapes the GEMM, the grid and the epilogue. The filter extents,
+    # strides, padding and dilation are the gather's alone and reach it through
+    # the im2col plan below, which is why they are not unpacked here.
+    n, c, k = param.n, param.c, param.k
+    has_bias, splitk = param.has_bias, param.splitk
     tile, wgm, groups, out_ndhwc = param.tile, param.wgm, param.groups, param.out_ndhwc
 
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
@@ -233,10 +232,15 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     LDG_A_COUNT = TILE_M * TILE_K // BLOCK_VECS
     LDG_B_COUNT = TILE_N * TILE_K // BLOCK_VECS
 
-    # `c` is the padded TOTAL channel count and stays the NDHWC row stride. CGP is the
-    # per-group channel count and is what the GEMM K axis decomposes against; the two
-    # coincide only when groups == 1.
-    CGP = c // groups
+    # The implicit GEMM this convolution is, derived once and shared with the
+    # gather so the grid the epilogue writes cannot drift from the one A is
+    # read against. `c` is the padded TOTAL channel count and stays the NDHWC
+    # row stride, while CGP is the per-group channel count the GEMM K axis
+    # decomposes against; the two coincide only when groups == 1.
+    geom = make_conv_geometry(param)
+    do, ho, wo = geom.do, geom.ho, geom.wo
+    dhw, npq, crs = geom.dhw, geom.npq, geom.crs
+    CGP = geom.cgp
     KG = k // groups
 
     assert TILE_K == 32
@@ -249,14 +253,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     )
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
 
-    # Dilation only stretches the filter's footprint; the K axis (CRS) is unchanged.
-    do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
-    ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
-    wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
-    dhw = do * ho * wo
-    hw_o = ho * wo
-    npq = n * dhw
-    crs = CGP * kt * kh * kw
     k_tiles = (crs + TILE_K - 1) // TILE_K
 
     BIG_OUT = (n * k * do * ho * wo * BF16_BYTES) > 0x7FFFFFFF
@@ -269,33 +265,8 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     # How A is read: everything about the gather, including whether the input
     # fits what a buffer descriptor reaches and how it is rebased if not.
     im2col_plan = make_im2col_plan(
-        n=n,
-        c=c,
-        d=d,
-        h=h,
-        w=w,
-        kt=kt,
-        kh=kh,
-        kw=kw,
-        st=st,
-        sh=sh,
-        sw=sw,
-        pt=pt,
-        ph=ph,
-        pw=pw,
-        dt=dt,
-        dh=dh,
-        dw=dw,
-        pad_mode=pad_mode,
-        groups=groups,
-        cgp=CGP,
-        crs=crs,
-        do=do,
-        ho=ho,
-        wo=wo,
-        npq=npq,
-        dhw=dhw,
-        hw_o=hw_o,
+        param,
+        geom,
         tile_m=TILE_M,
         tile_k=TILE_K,
         block_threads=BLOCK_THREADS,
