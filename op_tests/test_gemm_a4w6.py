@@ -268,6 +268,8 @@ def test_a4w6_rejects_unsupported_launch_contracts_before_allocation():
         gemm_a4w6(*args, 65792, 16384, 128)
     with pytest.raises(ValueError, match="int32"):
         gemm_a4w6(*args, 1, 1, (1 << 32) + 128)
+    with pytest.raises(ValueError, match="padded K"):
+        gemm_a4w6(*args, 1, 1, (1 << 31) - 1)
 
 
 if __name__ == "__main__":

@@ -248,8 +248,11 @@ def gemm_a4w6(
         raise ValueError(f"gemm_a4w6 requires positive dimensions, got {(M, N, K)}")
     if K > _MAX_KERNEL_K:
         raise ValueError(f"gemm_a4w6 K is outside the int32 kernel ABI: {K}")
+    padK = _ceil(K, _K_TILE)
+    if padK > _MAX_KERNEL_K:
+        raise ValueError(f"gemm_a4w6 padded K is outside the int32 kernel ABI: {padK}")
     selected_kernel = _select_gemm_a4w6_kernel(M, N, K, kernelName, device=A.device)
-    padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
+    padM, padN = _ceil(M, _TILE), _ceil(N, _TILE)
     if padM * padN * torch.bfloat16.itemsize > _MAX_BUFFER_BYTES:
         raise ValueError("gemm_a4w6 output exceeds the kernel's 2 GiB address range")
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)

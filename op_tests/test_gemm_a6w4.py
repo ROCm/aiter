@@ -270,6 +270,8 @@ def test_a6w4_rejects_unsupported_launch_contracts_before_allocation():
         gemm_a6w4(*args, 65792, 16384, 128)
     with pytest.raises(ValueError, match="int32"):
         gemm_a6w4(*args, 1, 1, (1 << 32) + 128)
+    with pytest.raises(ValueError, match="padded K"):
+        gemm_a6w4(*args, 1, 1, (1 << 31) - 1)
 
 
 @pytest.mark.parametrize("pack_size", [mxfp4_gemm_pack_size, mxfp6_gemm_pack_size])
