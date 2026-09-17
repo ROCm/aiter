@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K2 (SILOTIGER-1047 3c): sparse GQA with split-K.
+"""Family A FlyDSL QSA K2 (SILOTIGER-1047 3d): tiled sparse GQA.
 
-One workgroup per ``(row, kv_head, split)`` attends a slice of the expanded
-token list in the paged K/V cache, then a merge kernel combines the partial
-softmax states. Group size 12, ``D=256``. Decode and prefill share this
-instantiation. Sigmoid gate and expand+tail stay unfused.
+One workgroup per ``(row, kv_head, split)`` gathers ``BLOCK_N`` paged K/V
+columns, scores them with ``MFMA 16x16x16`` (group padded to 16), and
+updates online softmax on that tile. Split-K plus LSE merge is unchanged.
+Decode and prefill share this instantiation. Sigmoid and expand+tail stay
+unfused.
 """
 
 from functools import lru_cache
@@ -22,6 +23,7 @@ from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_GQA
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 
 _BLOCK_THREADS = 256
+_BLOCK_N = 16
 _HQ = FAMILY_A_GQA.n_heads
 _HK = FAMILY_A_GQA.kv_heads
 _GROUP = FAMILY_A_GQA.group_size
@@ -39,9 +41,10 @@ def _neg_inf():
 
 
 def _choose_splits(rows: int, n_sel: int) -> int:
-    """Match live AMD decode occupancy: many splits when ``M * Hk`` is small."""
+    """Keep decode occupancy; cap prefill serial tiles at ~4 per split."""
     if n_sel < 1:
         return 1
+    tiles = (n_sel + _BLOCK_N - 1) // _BLOCK_N
     base = rows * _HK
     if base <= 8:
         target = 64
@@ -52,8 +55,9 @@ def _choose_splits(rows: int, n_sel: int) -> int:
     elif base <= 512:
         target = 4
     else:
-        target = 1
-    return max(1, min(target, n_sel))
+        target = max(1, tiles // 4)
+        target = min(32, target)
+    return max(1, min(target, tiles, n_sel))
 
 
 def build_qsa_k2_family_a_module(page_size: int):
@@ -64,9 +68,15 @@ def build_qsa_k2_family_a_module(page_size: int):
     if _HQ != _HK * _GROUP:
         raise ValueError("family A GQA head counts do not form groups")
 
+    _HEAD_PAD = 16
+    _K_STEPS = _D // 64  # 4 MFMA K-steps per wave's 64-wide D slice
+
     @fx.struct
     class SharedStorage:
-        red: fx.Array[Float32, _GROUP * 4, 16]
+        q: fx.Array[BFloat16, _HEAD_PAD * _D, 16]
+        k: fx.Array[BFloat16, _BLOCK_N * _D, 16]
+        s: fx.Array[Float32, _HEAD_PAD * _BLOCK_N, 16]
+        c: fx.Array[Float32, 4 * 64 * 4, 16]
 
     @flyc.kernel(
         name="qsa_k2_family_a_split_"
@@ -76,6 +86,8 @@ def build_qsa_k2_family_a_module(page_size: int):
             hk=_HK,
             d=_D,
             blk=_BLOCK_THREADS,
+            bn=_BLOCK_N,
+            mm=16,
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
@@ -102,6 +114,9 @@ def build_qsa_k2_family_a_module(page_size: int):
         one = Int32(1)
         page = Int32(page_size)
         wave = _idiv(tid, Int32(64))
+        lane = tid - wave * Int32(64)
+        lane_m = lane % Int32(16)
+        lane_kg = _idiv(lane, Int32(16))
         elem_layout = fx.make_layout(1, 1)
         g_copy = buf_copy_atom(2, BFloat16)
         q_buf = fx.rocdl.make_buffer_tensor(q)
@@ -109,7 +124,21 @@ def build_qsa_k2_family_a_module(page_size: int):
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        red = storage.red.view(fx.make_layout((_GROUP, 4), (4, 1)))
+        q_lds = storage.q.view(fx.make_layout((_HEAD_PAD, _D), (_D, 1)))
+        k_lds = storage.k.view(fx.make_layout((_BLOCK_N, _D), (_D, 1)))
+        s_lds = storage.s.view(fx.make_layout((_HEAD_PAD, _BLOCK_N), (_BLOCK_N, 1)))
+        c_lds = storage.c.view(fx.make_layout((4, 64, 4), (64 * 4, 4, 1)))
+        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, BFloat16))
+        fa = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
+        fb = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
+        fc = fx.make_rmem_tensor(fx.make_layout(4, 1), Float32)
+
+        def mfma_acc(a_vec, b_vec, c_vec):
+            fx.memref_store_vec(a_vec, fa)
+            fx.memref_store_vec(b_vec, fb)
+            fx.memref_store_vec(c_vec, fc)
+            fx.mma_atom_call(mma, fc, fa, fb, fc)
+            return fx.memref_load_vec(fc)
 
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
@@ -127,63 +156,121 @@ def build_qsa_k2_family_a_module(page_size: int):
             q_frag = fx.make_fragment_like(q_src)
             fx.copy(g_copy, q_src, q_frag)
             q_regs.append(fx.Vector(fx.memref_load_vec(q_frag))[0].to(Float32))
+        for h in range_constexpr(_HEAD_PAD):
+            qv = q_regs[h] if h < _GROUP else Float32(0.0)
+            q_lds[h, tid] = qv.to(BFloat16)
+        gpu.barrier()
 
         init_state = (
             [_neg_inf() for _h in range(_GROUP)]
             + [Float32(0.0) for _h in range(_GROUP)]
             + [Float32(0.0) for _h in range(_GROUP)]
         )
-        _start = fx.Int64(col_start)
-        _stop = fx.Int64(col_end)
+        span = col_end - col_start
+        n_tiles = _idiv(span + Int32(_BLOCK_N - 1), Int32(_BLOCK_N))
+        _start = fx.Int64(0)
+        _stop = fx.Int64(n_tiles)
         _step = fx.Int64(1)
-        for col64, state in range(_start, _stop, _step, init=init_state):
-            col = Int32(col64)
-            tok = indices[row, col]
-            live = valid_req & (tok >= zero)
-            safe_tok = (tok >= zero).select(tok, zero)
-            logical_page = _idiv(safe_tok, page)
-            off = safe_tok - logical_page * page
-            in_table = logical_page < n_pages
-            page_idx = in_table.select(logical_page, zero)
-            phys = page_table[safe_req, page_idx]
-            k_chunks = fx.logical_divide(
-                fx.slice(k_buf, (phys, off, kv_h, None)), elem_layout
-            )
-            v_chunks = fx.logical_divide(
-                fx.slice(v_buf, (phys, off, kv_h, None)), elem_layout
-            )
-            k_src = fx.slice(k_chunks, (None, tid))
-            v_src = fx.slice(v_chunks, (None, tid))
-            k_frag = fx.make_fragment_like(k_src)
-            v_frag = fx.make_fragment_like(v_src)
-            fx.copy(g_copy, k_src, k_frag)
-            fx.copy(g_copy, v_src, v_frag)
-            k_f = fx.Vector(fx.memref_load_vec(k_frag))[0].to(Float32)
-            v_f = fx.Vector(fx.memref_load_vec(v_frag))[0].to(Float32)
-            for h in range_constexpr(_GROUP):
-                val = q_regs[h] * k_f
-                for sh in (32, 16, 8, 4, 2, 1):
-                    val = val + val.shuffle_xor(Int32(sh), Int32(64))
-                red[h, wave] = val
+        for t64, state in range(_start, _stop, _step, init=init_state):
+            base = col_start + Int32(t64) * Int32(_BLOCK_N)
+            k_regs = []
+            v_regs = []
+            live_n = []
+            for n in range_constexpr(_BLOCK_N):
+                col = base + Int32(n)
+                in_col = col < col_end
+                safe_col = in_col.select(col, col_start)
+                tok = indices[row, safe_col]
+                live = valid_req & in_col & (tok >= zero)
+                safe_tok = (tok >= zero).select(tok, zero)
+                logical_page = _idiv(safe_tok, page)
+                off = safe_tok - logical_page * page
+                in_table = logical_page < n_pages
+                page_idx = in_table.select(logical_page, zero)
+                phys = page_table[safe_req, page_idx]
+                k_chunks = fx.logical_divide(
+                    fx.slice(k_buf, (phys, off, kv_h, None)), elem_layout
+                )
+                v_chunks = fx.logical_divide(
+                    fx.slice(v_buf, (phys, off, kv_h, None)), elem_layout
+                )
+                k_src = fx.slice(k_chunks, (None, tid))
+                v_src = fx.slice(v_chunks, (None, tid))
+                k_frag = fx.make_fragment_like(k_src)
+                v_frag = fx.make_fragment_like(v_src)
+                fx.copy(g_copy, k_src, k_frag)
+                fx.copy(g_copy, v_src, v_frag)
+                k_regs.append(fx.Vector(fx.memref_load_vec(k_frag))[0].to(Float32))
+                v_regs.append(fx.Vector(fx.memref_load_vec(v_frag))[0].to(Float32))
+                live_n.append(live)
+            for n in range_constexpr(_BLOCK_N):
+                k_lds[n, tid] = k_regs[n].to(BFloat16)
             gpu.barrier()
+            acc4 = fx.Vector.filled(4, 0.0, Float32)
+            for ks in range_constexpr(_K_STEPS):
+                d0 = wave * Int32(64) + Int32(ks * 16) + lane_kg * Int32(4)
+                a_vec = fx.Vector.from_elements(
+                    [
+                        q_lds[lane_m, d0],
+                        q_lds[lane_m, d0 + one],
+                        q_lds[lane_m, d0 + Int32(2)],
+                        q_lds[lane_m, d0 + Int32(3)],
+                    ],
+                    BFloat16,
+                )
+                b_vec = fx.Vector.from_elements(
+                    [
+                        k_lds[lane_m, d0],
+                        k_lds[lane_m, d0 + one],
+                        k_lds[lane_m, d0 + Int32(2)],
+                        k_lds[lane_m, d0 + Int32(3)],
+                    ],
+                    BFloat16,
+                )
+                acc4 = fx.Vector(mfma_acc(a_vec, b_vec, acc4))
+            for i in range_constexpr(4):
+                c_lds[wave, lane, i] = acc4[i]
+            gpu.barrier()
+            # CDNA 16x16x16 C fragment: C[i] is S[4*(lane//16)+i, lane%16].
+            for i in range_constexpr(4):
+                s_i = (
+                    c_lds[zero, lane, i]
+                    + c_lds[one, lane, i]
+                    + c_lds[Int32(2), lane, i]
+                    + c_lds[Int32(3), lane, i]
+                )
+                s_lds[lane_kg * Int32(4) + Int32(i), lane_m] = s_i
+            gpu.barrier()
+            any_live = live_n[0]
+            for n in range_constexpr(1, _BLOCK_N):
+                any_live = any_live | live_n[n]
             new_m = []
             new_l = []
             new_a = []
             for h in range_constexpr(_GROUP):
-                score = (
-                    red[h, zero] + red[h, one] + red[h, Int32(2)] + red[h, Int32(3)]
-                ) * softmax_scale
+                scores = []
+                for n in range_constexpr(_BLOCK_N):
+                    score = s_lds[h, n] * softmax_scale
+                    scores.append(live_n[n].select(score, _neg_inf()))
+                tile_max = scores[0]
+                for n in range_constexpr(1, _BLOCK_N):
+                    tile_max = tile_max.maximumf(scores[n])
                 m_prev = state[h]
                 l_prev = state[_GROUP + h]
                 acc = state[2 * _GROUP + h]
-                m_new = m_prev.maximumf(score)
+                m_new = m_prev.maximumf(tile_max)
                 alpha = fxmath.exp(m_prev - m_new)
-                p = fxmath.exp(score - m_new)
-                l_new = l_prev * alpha + p
-                acc_new = acc * alpha + p * v_f
-                new_m.append(live.select(m_new, m_prev))
-                new_l.append(live.select(l_new, l_prev))
-                new_a.append(live.select(acc_new, acc))
+                p_sum = Float32(0.0)
+                acc_add = Float32(0.0)
+                for n in range_constexpr(_BLOCK_N):
+                    p = live_n[n].select(fxmath.exp(scores[n] - m_new), Float32(0.0))
+                    p_sum = p_sum + p
+                    acc_add = acc_add + p * v_regs[n]
+                l_new = l_prev * alpha + p_sum
+                acc_new = acc * alpha + acc_add
+                new_m.append(any_live.select(m_new, m_prev))
+                new_l.append(any_live.select(l_new, l_prev))
+                new_a.append(any_live.select(acc_new, acc))
             gpu.barrier()
             results = yield new_m + new_l + new_a
 
@@ -343,8 +430,8 @@ def qsa_k2_family_a(
 ) -> torch.Tensor:
     """Write family A sparse GQA ``o [M, 24, 256]`` from paged K/V.
 
-    Attends ``indices [M, W]`` (``-1`` padded). Split-K plus LSE merge when
-    decode occupancy is low. Does not apply RoPE or the sigmoid gate.
+    Attends ``indices [M, W]`` (``-1`` padded). Tiled ``BLOCK_N`` MFMA QK with
+    split-K plus LSE merge. Does not apply RoPE or the sigmoid gate.
     Expand+tail is still a separate launch.
     """
     reason = qsa_k2_family_a_serves(q, k_cache, v_cache, indices, page_table)

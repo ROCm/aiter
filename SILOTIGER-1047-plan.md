@@ -501,6 +501,39 @@ decode 3b ~103 µs at ``M=1`` (64 splits). 3d owns tiles/MFMA.
 | 512 | 8192 | 2048 | 2051 | 11831.8 | 246.8 | 0 | 0 |
 | 512 | 32768 | 8192 | 2051 | 11884.8 | 284.6 | 0 | 0 |
 
+- [ ] **3d.** Family A tiled ``BLOCK_N=16`` QK via ``MFMA 16x16x16`` bf16
+      (group padded to 16), same split-K ABI, no GEMV/MFMA occupancy union.
+      Decode beats #4882 Triton GQA; **does not** beat live AMD (~5× on
+      ``M=1``). Prefill still ~20× both. Not a win claim. PV is still a
+      scalar tile FMA; gfx950 extra LDS is 3g.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. Host splits
+keep decode at 64 and cap prefill serial tiles (~32 splits). Decode
+``M=1`` ~51 µs vs 3b ~103 µs and vs #4882 ~113 µs; live AMD remains
+~11 µs. Prefill ``M=512`` ~4.3 ms vs live AMD ~201–284 µs and vs 3c ~11.7 ms.
+
+Decode:
+
+| m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
+|--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
+| 1 | 512 | 128 | 2051 | 50.9 | 10.9 | 113.0 | 0 |
+| 8 | 512 | 128 | 2051 | 95.9 | 14.4 | 115.5 | 0 |
+| 1 | 2048 | 512 | 2051 | 51.6 | 11.1 | 116.1 | 0 |
+| 8 | 2048 | 512 | 2051 | 98.7 | 17.2 | 125.8 | 0 |
+| 1 | 8192 | 2048 | 2051 | 51.2 | 11.1 | 118.9 | 0 |
+| 8 | 8192 | 2048 | 2051 | 97.7 | 16.4 | 123.2 | 0 |
+| 1 | 32768 | 8192 | 2051 | 51.6 | 11.2 | 118.9 | 0 |
+| 8 | 32768 | 8192 | 2051 | 97.7 | 17.4 | 124.1 | 0 |
+
+Prefill:
+
+| m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
+|--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
+| 512 | 512 | 128 | 2051 | 4352.5 | 201.4 | 220.5 | 0 |
+| 512 | 2048 | 512 | 2051 | 4336.6 | 212.2 | 233.7 | 0 |
+| 512 | 8192 | 2048 | 2051 | 4332.7 | 245.9 | 257.4 | 0 |
+| 512 | 32768 | 8192 | 2051 | 4360.4 | 284.4 | 281.0 | 0 |
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
