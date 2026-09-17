@@ -21,6 +21,17 @@ enumeration below includes 48/96/192 so an exact fit can be expressed at all.
 
 import itertools
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+from .kernels.conv3d_implicit import (
+    BF16_BYTES,
+    MFMA_M,
+    MFMA_N,
+    TILE_K,
+    TILES_PER_BARRIER,
+    WARP_SIZE,
+)
+
 __all__ = [
     "TILE_K",
     "get_flydsl_conv3d_configs",
@@ -28,16 +39,11 @@ __all__ = [
     "tile_kernel_name",
 ]
 
-# Mirrors the module-level constants in kernels/conv3d_implicit.py. TILE_K is
-# asserted equal to 32 by the kernel; the rest follow from the MFMA shape.
-TILE_K = 32
-LDG_VEC = 8
-MFMA_M = 16
-MFMA_N = 16
-WARP_SIZE = 64
-BF16_BYTES = 2
-# PIPE_STAGES = 2 * TILES_PER_BARRIER, both fixed in the kernel.
-PIPE_STAGES = 4
+# Taken from the kernel rather than restated here, as gemm_a16w16_policy takes its
+# from gemm_a16w16_gfx950: each of these is fixed next to the assert or the MFMA
+# shape that decides it, and a second copy would drift without any symptom other
+# than a candidate sweep quietly disagreeing with what can compile.
+PIPE_STAGES = 2 * TILES_PER_BARRIER
 
 TILE_M_VALUES = (64, 96, 128, 192, 256, 384)
 TILE_N_VALUES = (32, 48, 64, 96, 128, 192, 256)
@@ -45,12 +51,14 @@ WAVE_M_VALUES = (1, 2, 3, 4)
 WAVE_N_VALUES = (1, 2, 3, 4, 6)
 WGM_VALUES = (1, 4, 8)
 
-# Kernel default, used as the guaranteed-present fallback.
-DEFAULT_TILE = (128, 128, 2, 4)
-
 # The kernel's own candidate table and heuristic ladder. These are unioned into
 # every sweep so that the tuned pick can never come out worse than the shipped
 # default -- whatever ``_pick_tile`` would have chosen is always measured too.
+#
+# Spelled out rather than spliced from the kernel's ``TILE_LADDER``: this order is
+# the order the tuner measures them in, and ties are broken by whoever is timed
+# first, so re-ordering it would make a re-tune disagree with the checked-in CSVs
+# for no gain. ``test_conv3d_policy`` asserts the ladder stays a subset instead.
 BASELINE_TILES = (
     (128, 128, 2, 4),
     (128, 256, 2, 4),
@@ -62,11 +70,6 @@ BASELINE_TILES = (
     (64, 64, 2, 2),
     (32, 32, 1, 2),
 )
-
-# Per-CU LDS on CDNA3/4. A candidate above half of this cannot keep two
-# workgroups resident, which costs more latency hiding than a wider tile buys.
-LDS_CAPACITY_BYTES = 160 * 1024
-MAX_LDS_BYTES = LDS_CAPACITY_BYTES // 2
 
 # acc VGPRs = 4 * MI_M * MI_N per lane. Past this the kernel spills and the
 # config is slower than anything it could win on tile shape.
@@ -102,6 +105,17 @@ def lds_bytes(tile_m, tile_n):
     return PIPE_STAGES * (tile_m + tile_n) * TILE_K * BF16_BYTES
 
 
+def max_lds_bytes():
+    """Half the per-workgroup LDS the chip table reports for this arch.
+
+    A candidate above half cannot keep two workgroups resident, which costs more
+    latency hiding than a wider tile buys. Read at call time, not import: the
+    figure is per-arch, and hardcoding CDNA3/4's 160 KiB here would silently
+    mis-prune anywhere else.
+    """
+    return get_lds_capacity_bytes() // 2
+
+
 def _ceil_div(value, divisor):
     return (value + divisor - 1) // divisor
 
@@ -118,6 +132,7 @@ def _n_fill(tile_n, kg):
 def _sweep(npq, kg, groups, num_cu, min_n_fill, min_waves, check_waste, check_grid):
     """One filtering pass. Returns ``[(sort_key, config), ...]``, unsorted."""
     scored = []
+    lds_limit = max_lds_bytes()
     for tile_m, tile_n, wave_m, wave_n in itertools.product(
         TILE_M_VALUES, TILE_N_VALUES, WAVE_M_VALUES, WAVE_N_VALUES
     ):
@@ -132,7 +147,7 @@ def _sweep(npq, kg, groups, num_cu, min_n_fill, min_waves, check_waste, check_gr
         if n_acc > MAX_N_ACC:
             continue
 
-        if lds_bytes(tile_m, tile_n) > MAX_LDS_BYTES:
+        if lds_bytes(tile_m, tile_n) > lds_limit:
             continue
 
         fill = _n_fill(tile_n, kg)

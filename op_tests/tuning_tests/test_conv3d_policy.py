@@ -102,6 +102,23 @@ class TestConv3dPolicy(unittest.TestCase):
                         f"npq={npq} kg={kg} missing baseline {tile} at wgm={wgm}",
                     )
 
+    def test_baseline_contains_the_kernel_ladder(self):
+        """BASELINE_TILES is spelled out, so nothing stops the ladder drifting off it.
+
+        ``_pick_tile`` demotes through ``TILE_LADDER``; a rung that is not also a
+        baseline tile is an incumbent the sweep would never measure, which is the
+        same hole test_incumbent_is_always_a_candidate covers for these shapes and
+        this one covers for every shape at once.
+        """
+        from aiter.ops.flydsl.kernels.conv3d_implicit import TILE_LADDER
+
+        for tile in TILE_LADDER:
+            self.assertIn(
+                tile,
+                BASELINE_TILES,
+                f"kernel ladder rung {tile} is not a baseline candidate",
+            )
+
     def test_every_candidate_is_legal(self):
         """A candidate that cannot compile wastes a sweep slot and logs a failure."""
         for npq, kg in SHAPES:
