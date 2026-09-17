@@ -209,6 +209,11 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 1,
                 numel,
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                # src_scale: read only by the prequantized build, which this job
+                # does not emit; the pointer still has to be passed. Missing it
+                # would not fail loudly -- compile_one_config swallows the
+                # TypeError and the routeks kernels just stop being precompiled.
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
                 grid,
                 stream=0,
             )

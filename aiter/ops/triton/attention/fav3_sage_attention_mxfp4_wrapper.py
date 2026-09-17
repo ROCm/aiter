@@ -13,22 +13,26 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+
+_CONFIG_NAME = "FAV3_SAGE_MXFP4"
+_MXFP4_ARCH = "gfx950"
+
+
+_SAGE_FWD_MXFP4_TABLE = load_config_json(
+    resolve_config_dir("attention", _CONFIG_NAME, backend="triton", arch=_MXFP4_ARCH)
+    + "/DEFAULT.json"
+)
 
 
 def get_sage_fwd_configs_mxfp4():
     """Returns tuned config for MXFP4 on supported architectures."""
     arch = arch_info.get_arch()
     # MXFP4 is primarily targeted at gfx950
-    if arch != "gfx950":
+    if arch != _MXFP4_ARCH:
         raise RuntimeError(f"MXFP4 is not supported on {arch}")
-    return {
-        "BLOCK_M": 256,
-        "BLOCK_N": 128,
-        "waves_per_eu": 2,
-        "PRE_LOAD_V": False,
-        "num_stages": 3,
-        "num_warps": 8,
-    }
+    # The table is shared module state; copy before returning.
+    return dict(_SAGE_FWD_MXFP4_TABLE["fwd"])
 
 
 class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):

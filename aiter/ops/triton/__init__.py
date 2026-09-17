@@ -8,16 +8,16 @@ from types import SimpleNamespace
 
 # Try to import quant module
 try:
-    from . import quant
+    from aiter.ops.triton import quant
 except (ImportError, AttributeError):
     quant = None
 
 # Try to import comms module (requires iris)
 try:
-    from . import comms
+    from aiter.ops.triton import comms
 
     # Re-export communication primitives at this level for convenience
-    from .comms import (  # noqa: F401  deliberate re-export for convenience
+    from aiter.ops.triton.comms import (  # noqa: F401  deliberate re-export for convenience
         IRIS_COMM_AVAILABLE,
         IrisCommContext,
         all_gather,
@@ -35,18 +35,6 @@ except ImportError:
 __all__ = []
 if quant is not None:
     __all__.append("quant")
-
-try:
-    from .cross_entropy import (
-        cross_entropy_backward as cross_entropy_backward,
-    )
-    from .cross_entropy import (
-        cross_entropy_forward as cross_entropy_forward,
-    )
-
-    __all__.extend(["cross_entropy_backward", "cross_entropy_forward"])
-except (ImportError, AttributeError):
-    pass
 
 if _COMMS_AVAILABLE:
     __all__.extend(
@@ -66,7 +54,11 @@ for modules that were reorganized so that external repos (like sglang for exampl
 which depend on the old module names, can still import it the old "way" of importing.
 """
 # Paths that only exist for backward compatibility and are on their way out.
-_DEPRECATED_COMPAT_PATHS = ("gluon.gemm_a8w8", "gluon.gemm_a8w8_blockscale")
+_DEPRECATED_COMPAT_PATHS = (
+    "gluon.gemm_a8w8",
+    "gluon.gemm_a8w8_blockscale",
+    "gluon.gemm_afp4wfp4",
+)
 
 
 def _warn_if_deprecated(name, new_path):
@@ -103,6 +95,7 @@ _BACKWARD_COMPAT_MAP = {
     "gemm_a8wfp4": "gemm.basic.gemm_a8wfp4",
     "gemm_afp4wfp4_pre_quant_atomic": "gemm.basic.gemm_afp4wfp4_pre_quant_atomic",
     "gemm_afp4wfp4": "gemm.basic.gemm_afp4wfp4",
+    "gluon.gemm_afp4wfp4": "gemm.basic.gemm_afp4wfp4",
     # Feed-forward modules (gemm/feed_forward/)
     "ff_a16w16_fused_gated": "gemm.feed_forward.ff_a16w16_fused_gated",
     "ff_a16w16_fused_ungated": "gemm.feed_forward.ff_a16w16_fused_ungated",
@@ -135,7 +128,6 @@ _BACKWARD_COMPAT_MAP = {
     "prefill_attention": "attention.prefill_attention",
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
-    "mxfp8_attention": "attention.mxfp8_attention",
     # Fusions modules (fusions/)
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",

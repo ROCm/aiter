@@ -7,11 +7,6 @@ Performs all expert GEMMs in a single Triton kernel launch, applying
 per-token activation scales and per-expert weight scales after the
 FP8 dot-product accumulation.
 
-This kernel is designed for the ``group_sizes``-based interface used
-by frameworks like Lumen, where expert routing is expressed as a
-simple 1-D tensor of per-expert token counts rather than the more
-complex ``RoutingData`` structure.
-
 Convention (TN layout):
     ``out[tokens_for_e] = lhs[tokens_for_e] @ rhs[e]^T * x_scale * w_scale``
 """
@@ -22,53 +17,16 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.moe_gemm_per_token import (
     _moe_gemm_per_token_kernel,
 )
+from aiter.ops.triton.moe.moe_utils import build_block_mapping
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+__all__ = ["moe_gemm_per_token"]
 
 _LOGGER = AiterTritonLogger()
 
 BLOCK_M = 64
 BLOCK_N = 128
 BLOCK_K = 128
-
-
-def _build_block_mapping(
-    group_sizes: torch.Tensor,
-    block_m: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Pre-compute per-M-block expert IDs and token offsets.
-
-    Returns:
-        (block_expert_ids, block_token_offsets, total_m_blocks)
-    """
-    expert_ids_list = []
-    offsets_list = []
-    offset = 0
-    for e in range(group_sizes.shape[0]):
-        size = int(group_sizes[e].item())
-        n_blocks = triton.cdiv(size, block_m)
-        for b in range(n_blocks):
-            expert_ids_list.append(e)
-            offsets_list.append(offset + b * block_m)
-        offset += size
-
-    if not expert_ids_list:
-        return (
-            torch.empty(0, dtype=torch.int32, device=group_sizes.device),
-            torch.empty(0, dtype=torch.int32, device=group_sizes.device),
-            0,
-        )
-
-    block_expert_ids = torch.tensor(
-        expert_ids_list,
-        dtype=torch.int32,
-        device=group_sizes.device,
-    )
-    block_token_offsets = torch.tensor(
-        offsets_list,
-        dtype=torch.int32,
-        device=group_sizes.device,
-    )
-    return block_expert_ids, block_token_offsets, len(expert_ids_list)
 
 
 def moe_gemm_per_token(
@@ -101,7 +59,6 @@ def moe_gemm_per_token(
     )
 
     total_tokens = lhs.shape[0]
-    rhs.shape[0]
     N = rhs.shape[1]
     K = rhs.shape[2]
 
@@ -115,9 +72,8 @@ def moe_gemm_per_token(
     if total_tokens == 0:
         return out
 
-    block_expert_ids, block_token_offsets, total_m_blocks = _build_block_mapping(
-        group_sizes,
-        BLOCK_M,
+    block_expert_ids, block_token_offsets, block_token_ends, total_m_blocks = (
+        build_block_mapping(group_sizes, BLOCK_M, total_tokens)
     )
 
     if total_m_blocks == 0:
@@ -135,6 +91,7 @@ def moe_gemm_per_token(
         bias,
         block_expert_ids,
         block_token_offsets,
+        block_token_ends,
         total_tokens,
         N,
         K,

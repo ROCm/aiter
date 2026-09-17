@@ -45,6 +45,7 @@ def _moe_gemm_per_token_kernel(
     # Block-to-expert mapping (pre-computed on host)
     block_expert_ids_ptr,  # [total_m_blocks]  int32
     block_token_offsets_ptr,  # [total_m_blocks]  int32
+    block_token_ends_ptr,  # [total_m_blocks]  int32  exclusive row end per block
     # Dimensions
     total_M,
     N,
@@ -78,8 +79,9 @@ def _moe_gemm_per_token_kernel(
     pid_mb = pid // num_n_blocks
     pid_n = pid % num_n_blocks
 
-    expert_id = tl.load(block_expert_ids_ptr + pid_mb)
+    expert_id = tl.load(block_expert_ids_ptr + pid_mb).to(tl.int64)
     token_offset = tl.load(block_token_offsets_ptr + pid_mb)
+    token_end = tl.load(block_token_ends_ptr + pid_mb)
 
     tl.assume(expert_id >= 0)
     tl.assume(token_offset >= 0)
@@ -98,7 +100,8 @@ def _moe_gemm_per_token_kernel(
         + offs_n[None, :] * stride_rhs_n
     )
 
-    m_mask = offs_m < total_M
+    # Mask against the block's own valid row end, not total_M.
+    m_mask = offs_m < token_end
     n_mask = offs_n < N
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)

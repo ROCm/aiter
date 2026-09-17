@@ -8,29 +8,15 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train import (
+    _FWD_FALLBACK,
     _bwd_dkv_gather_kernel,
     _bwd_dkv_interm_kernel,
     _bwd_dq_store_dp_kernel,
     _sparse_mla_fwd_kernel,
 )
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
-
-def _get_lds_limit():
-    try:
-        prop = torch.cuda.get_device_properties(torch.cuda.current_device())
-        gcn_arch = getattr(prop, "gcnArchName", "")
-        if "gfx950" in gcn_arch:
-            return 163840
-    except (OSError, RuntimeError, AttributeError):
-        return 65536
-    return 65536
-
-
-def _select_bwd_tiles():
-    lds = _get_lds_limit()
-    if lds <= 65536:
-        return 16, 32, 4
-    return 32, 32, 4
+_BWD_FALLBACK = triton.Config({"BLOCK_H": 16, "BLOCK_K": 32}, num_warps=4, num_stages=1)
 
 
 # =====================================================================
@@ -51,7 +37,7 @@ def _build_inverted_topk(indices, num_kv):
     """
     N, topk = indices.shape
     flat = indices.reshape(-1).long()
-    valid = flat >= 0
+    valid = (flat >= 0) & (flat < num_kv)
 
     positions = torch.arange(N * topk, device=indices.device, dtype=torch.int64)
     valid_pos = positions[valid]
@@ -93,7 +79,12 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
     out = torch.empty(N, H, D, device=q.device, dtype=q.dtype)
     lse = torch.empty(N, H, device=q.device, dtype=torch.float32)
 
-    grid = lambda META: (N, triton.cdiv(H, META["BLOCK_H"]))
+    fwd_cfg = get_tuned_kernel_config(
+        "attention", "SPARSE_MLA_DSV4_TRAIN", "_sparse_mla_fwd_kernel", _FWD_FALLBACK
+    )
+    BLOCK_H_fwd = fwd_cfg.kwargs["BLOCK_H"]
+    BLOCK_K_fwd = fwd_cfg.kwargs["BLOCK_K"]
+    grid = (N, triton.cdiv(H, BLOCK_H_fwd))
 
     _sparse_mla_fwd_kernel[grid](
         q,
@@ -116,6 +107,10 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
         scale,
         HAS_ATTN_SINK=has_sink,
         BLOCK_D=BLOCK_D,
+        BLOCK_H=BLOCK_H_fwd,
+        BLOCK_K=BLOCK_K_fwd,
+        num_warps=fwd_cfg.num_warps,
+        num_stages=fwd_cfg.num_stages,
     )
 
     return out, lse
@@ -134,7 +129,12 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     if scale is None:
         scale = 1.0 / (D**0.5)
 
-    BLOCK_H, BLOCK_K, num_warps = _select_bwd_tiles()
+    bwd_cfg = get_tuned_kernel_config(
+        "attention", "SPARSE_MLA_DSV4_TRAIN", "_bwd_kernels", _BWD_FALLBACK
+    )
+    BLOCK_H = bwd_cfg.kwargs["BLOCK_H"]
+    BLOCK_K = bwd_cfg.kwargs["BLOCK_K"]
+    num_warps = bwd_cfg.num_warps
     BLOCK_D = triton.next_power_of_2(D)
 
     has_sink = attn_sink is not None
@@ -252,6 +252,8 @@ class SparseMLADSV4Function(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, attn_sink, indices, scale):
         out, lse = sparse_mla_fwd(q, kv, attn_sink, indices, scale)
+        if attn_sink is None:
+            attn_sink = torch.empty(0, device=q.device, dtype=torch.float32)
         ctx.save_for_backward(q, kv, out, indices, lse, attn_sink)
         ctx.scale = scale
         return out
@@ -259,7 +261,7 @@ class SparseMLADSV4Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, kv, o, indices, lse, attn_sink = ctx.saved_tensors
-        has_sink = attn_sink is not None and attn_sink.numel() > 1
+        has_sink = attn_sink.numel() > 0
 
         dq, dkv, d_sink = sparse_mla_bwd(
             q,

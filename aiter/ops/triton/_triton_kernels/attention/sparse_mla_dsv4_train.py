@@ -10,51 +10,22 @@
 import triton
 import triton.language as tl
 
-# =====================================================================
-# Forward — autotune configs
-# =====================================================================
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-
-def _fwd_configs():
-    configs = []
-    for BLOCK_H in [16, 32, 64]:
-        for BLOCK_K in [16, 32]:
-            for num_stages in [1, 2, 3, 4]:
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K},
-                        num_warps=4,
-                        num_stages=num_stages,
-                    )
-                )
-    return configs
-
-
-def _fwd_prune(configs, named_args, **kwargs):
-    D = named_args["head_dim"]
-    BLOCK_D = kwargs.get("BLOCK_D", D)
-    BLOCK_D = max(BLOCK_D, D)
-    pruned = []
-    for c in configs:
-        bk = c.kwargs["BLOCK_K"]
-        ns = c.num_stages
-        lds = BLOCK_D * bk * 2 * ns
-        if lds <= 65536:
-            pruned.append(c)
-    return pruned
-
+_FWD_FALLBACK = triton.Config({"BLOCK_H": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2)
 
 # =====================================================================
 # Forward kernel — sparse MLA with LSE output
 # =====================================================================
 
 
-@triton.autotune(
-    configs=_fwd_configs(),
-    key=["num_heads", "topk", "head_dim"],
-    prune_configs_by={"early_config_prune": _fwd_prune},
+_sparse_mla_fwd_kernel_repr = make_kernel_repr(
+    "_sparse_mla_fwd_kernel",
+    ["HAS_ATTN_SINK", "BLOCK_D", "BLOCK_H", "BLOCK_K"],
 )
-@triton.jit
+
+
+@triton.jit(repr=_sparse_mla_fwd_kernel_repr)
 def _sparse_mla_fwd_kernel(
     q_ptr,
     kv_ptr,
@@ -79,7 +50,7 @@ def _sparse_mla_fwd_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    query_idx = tl.program_id(0)
+    query_idx = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -107,7 +78,7 @@ def _sparse_mla_fwd_kernel(
         in_range = k_pos < topk
         slot = tl.load(
             indices_ptr + query_idx * idx_stride_t + k_pos, mask=in_range, other=-1
-        )
+        ).to(tl.int64)
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
         kv = tl.load(
@@ -168,7 +139,13 @@ def _sparse_mla_fwd_kernel(
 # Reads pre-computed delta. Stores P and dP to buffers for kernel 2.
 
 
-@triton.jit
+_bwd_dq_store_dp_kernel_repr = make_kernel_repr(
+    "_bwd_dq_store_dp_kernel",
+    ["HAS_ATTN_SINK", "BLOCK_H", "BLOCK_D", "BLOCK_K"],
+)
+
+
+@triton.jit(repr=_bwd_dq_store_dp_kernel_repr)
 def _bwd_dq_store_dp_kernel(
     q_ptr,
     kv_ptr,
@@ -291,7 +268,13 @@ def _bwd_dq_store_dp_kernel(
 # Reads P_buf, dP_buf, Q, dO → computes interm[tok, k, :D].
 
 
-@triton.jit
+_bwd_dkv_interm_kernel_repr = make_kernel_repr(
+    "_bwd_dkv_interm_kernel",
+    ["BLOCK_H", "BLOCK_D", "BLOCK_K", "NUM_HG"],
+)
+
+
+@triton.jit(repr=_bwd_dkv_interm_kernel_repr)
 def _bwd_dkv_interm_kernel(
     q_ptr,
     do_ptr,
@@ -371,7 +354,13 @@ def _bwd_dkv_interm_kernel(
 # =====================================================================
 
 
-@triton.jit
+_bwd_dkv_gather_kernel_repr = make_kernel_repr(
+    "_bwd_dkv_gather_kernel",
+    ["BLOCK_D", "BLOCK_G"],
+)
+
+
+@triton.jit(repr=_bwd_dkv_gather_kernel_repr)
 def _bwd_dkv_gather_kernel(
     interm_ptr,
     inv_ptr_ptr,

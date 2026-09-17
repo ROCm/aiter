@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _per_token_quant(
@@ -40,7 +42,17 @@ def _per_token_quant(
     return qx
 
 
-@triton.jit
+_rms_norm_kernel_repr = make_kernel_repr(
+    "_rms_norm_kernel",
+    [
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+        "NUM_PRGMS",
+    ],
+)
+
+
+@triton.jit(repr=_rms_norm_kernel_repr)
 def _rms_norm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -158,7 +170,22 @@ def _rms_norm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_quant_rms_norm_kernel_repr = make_kernel_repr(
+    "_quant_rms_norm_kernel",
+    [
+        "DTYPE_MAX",
+        "CLAMP_MAX",
+        "IS_SMOOTH",
+        "CLAMP_OUT",
+        "DUMP_INTERMEDIATE",
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+        "NUM_PRGMS",
+    ],
+)
+
+
+@triton.jit(repr=_quant_rms_norm_kernel_repr)
 def _quant_rms_norm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -389,7 +416,17 @@ def _quant_rms_norm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_fused_add_rmsnorm_kernel_repr = make_kernel_repr(
+    "_fused_add_rmsnorm_kernel",
+    [
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+        "NUM_PRGMS",
+    ],
+)
+
+
+@triton.jit(repr=_fused_add_rmsnorm_kernel_repr)
 def _fused_add_rmsnorm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -538,7 +575,19 @@ def _fused_add_rmsnorm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_quant_fused_add_rmsnorm_kernel_repr = make_kernel_repr(
+    "_quant_fused_add_rmsnorm_kernel",
+    [
+        "DTYPE_MAX",
+        "IS_SMOOTH",
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+        "NUM_PRGMS",
+    ],
+)
+
+
+@triton.jit(repr=_quant_fused_add_rmsnorm_kernel_repr)
 def _quant_fused_add_rmsnorm_kernel(
     # Pointers to matrices
     input_ptr,
@@ -767,7 +816,17 @@ def _quant_fused_add_rmsnorm_kernel(
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_rmsnorm_bwd_triton_repr = make_kernel_repr(
+    "_rmsnorm_bwd_triton",
+    [
+        "BLOCK_SIZE",
+        "USE_BLOCKED",
+        "NUM_PRGMS",
+    ],
+)
+
+
+@triton.jit(repr=_rmsnorm_bwd_triton_repr)
 def _rmsnorm_bwd_triton(
     grad_output_ptr,
     input_ptr,
@@ -909,7 +968,16 @@ def _rmsnorm_bwd_triton(
         )
 
 
-@triton.jit
+_rmsnorm_bwd_dg_reduce_triton_repr = make_kernel_repr(
+    "_rmsnorm_bwd_dg_reduce_triton",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+    ],
+)
+
+
+@triton.jit(repr=_rmsnorm_bwd_dg_reduce_triton_repr)
 def _rmsnorm_bwd_dg_reduce_triton(
     dg_in_ptr,
     dg_out_ptr,
@@ -939,7 +1007,18 @@ def _rmsnorm_bwd_dg_reduce_triton(
     )
 
 
-@triton.jit
+_rmsnorm_kernel_large_m_small_n_repr = make_kernel_repr(
+    "_rmsnorm_kernel_large_m_small_n",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "NUM_WARPS",
+        "NUM_STAGES",
+    ],
+)
+
+
+@triton.jit(repr=_rmsnorm_kernel_large_m_small_n_repr)
 def _rmsnorm_kernel_large_m_small_n(
     X,
     Y,
@@ -954,10 +1033,12 @@ def _rmsnorm_kernel_large_m_small_n(
     stride_yn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_off = tl.arange(0, BLOCK_N)
+    m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
+    n_off = tl.cast(tl.arange(0, BLOCK_N), tl.int64)
 
     mask_m = m_off < M
     mask_n = n_off < N
@@ -986,7 +1067,13 @@ def _rmsnorm_kernel_large_m_small_n(
         tl.store(RSIGMA + m_off, rsigma, mask=mask_m)
 
 
-@triton.jit
+_rmsnorm_bwd_kernel_large_m_small_n_repr = make_kernel_repr(
+    "_rmsnorm_bwd_kernel_large_m_small_n",
+    ["BLOCK_M", "BLOCK_N", "NUM_WARPS", "NUM_STAGES"],
+)
+
+
+@triton.jit(repr=_rmsnorm_bwd_kernel_large_m_small_n_repr)
 def _rmsnorm_bwd_kernel_large_m_small_n(
     grad_output_ptr,  # [M, N]
     input_ptr,  # [M, N]
@@ -1000,6 +1087,8 @@ def _rmsnorm_bwd_kernel_large_m_small_n(
     N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     # Specialization for large-M / small-N (e.g. Qwen3 per-head q/k norm,
     # M=b*s*heads, N=head_dim). The generic _rmsnorm_bwd_triton caps the grid at
@@ -1009,8 +1098,8 @@ def _rmsnorm_bwd_kernel_large_m_small_n(
     # _rmsnorm_kernel_large_m_small_n). dgamma is reduced over rows within the
     # block into a per-program partial, then finished by _rmsnorm_bwd_dg_reduce.
     pid_m = tl.program_id(0)
-    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_off = tl.arange(0, BLOCK_N)
+    m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
+    n_off = tl.cast(tl.arange(0, BLOCK_N), tl.int64)
 
     mask_m = m_off < M
     mask_n = n_off < N
@@ -1044,4 +1133,4 @@ def _rmsnorm_bwd_kernel_large_m_small_n(
     dg = grad_output * x * norm_factor[:, None]
     dg = tl.where(mask, dg, 0.0)
     dg_partial = tl.sum(dg, axis=0)  # [BLOCK_N]
-    tl.store(dg_ptr + pid_m * N + n_off, dg_partial, mask=mask_n)
+    tl.store(dg_ptr + tl.cast(pid_m, tl.int64) * N + n_off, dg_partial, mask=mask_n)

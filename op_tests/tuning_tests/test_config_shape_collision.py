@@ -68,6 +68,10 @@ FAMILIES = [
         "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
         "batched_gemm_a8w8_blockscale_mxscale_tuned",
     ),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+    ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
@@ -217,6 +221,32 @@ class TestConfigShapeCollision(unittest.TestCase):
         self._check_family(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
             "batched_gemm_a8w8_blockscale_mxscale_tuned",
+        )
+
+        # The generic config registry owns file discovery and merging; the
+        # dedicated caller policy still owns public-kid normalization.
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        rows = policy._load_mxscale_bmm_tuned("opus")
+        self.assertTrue(rows)
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(
+            rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"],
+            8311,
+            "legacy local OPUS kid 311 must become public global kid 8311",
+        )
+        self.assertEqual(
+            rows[("gfx950", 8, 128, 1024, 4096)]["kernelId"],
+            8653,
+            "legacy local OPUS kid 653 must become public global kid 8653",
+        )
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+    def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
 
     def test_bf16(self):

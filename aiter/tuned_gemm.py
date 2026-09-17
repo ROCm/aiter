@@ -21,46 +21,28 @@ import os
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
-import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-from torch import Tensor
-
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
-    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
+    from aiter.ops.opus import opus_gemm as _opus_launch
 except Exception:  # noqa: BLE001  blanket catch is intentional here
-    _opus_tune = None
+    _opus_launch = None
 
-# NOTE: gfx1250 split-K kids allocate their partial-sum workspace as a plain
-# torch.empty tensor (see aiter.ops.opus.gemm_op_a16w16._get_opus_workspace)
-# passed explicitly to the launcher. torch's caching allocator is HIP graph-
-# capture aware, so that single torch.empty path serves both eager and capture
-# (a buffer first touched inside capture comes from the graph mempool with a
-# replay-stable address) and no eager pre-warm of the shape is required. (The
-# old per-stream hipMalloc registry -- opus_gemm_workspace_init /
-# opus_splitk_ws_get -- used by the gfx942/gfx950 a16w16 split-K path still needs
-# an eager warm before capture; if that path is ever exercised under cudagraphs,
-# warm it via aiter.opus_gemm_workspace_init() on the capture stream. It fails
-# loudly ("splitk workspace not initialized") rather than silently corrupting,
-# so its absence here is safe to detect.)
+
+@functools.lru_cache(maxsize=1)
+def _get_flydsl_gemm_kernels():
+    from aiter.ops.flydsl import gemm_kernels
+
+    return gemm_kernels
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-
 
 extensions_created = False
 untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
@@ -142,6 +124,7 @@ def get_GEMM_A16W16_config(
     padded_M = M
     config = None
     gfx = get_gfx()
+    warned_invalid_opus = set()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
@@ -161,20 +144,67 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                flydsl_config = (
+                    _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
                         config["kernelName"]
                     )
-                    if flydsl_config is None:
-                        logger.warning(
-                            f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                            "recognized by the current catalog; falling back to next candidate."
-                        )
-                        config = None
-                else:
+                )
+                # None means the tuned CSV names a kernel absent from this
+                # catalog version; it is unrelated to FlyDSL import availability.
+                if flydsl_config is None:
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
+                        "recognized by the current catalog; falling back to next candidate."
+                    )
                     config = None
             if config is None:
                 continue
+            if config["libtype"] == "opus":
+                if _opus_launch is None:
+                    resolved = None
+                else:
+                    from aiter.ops.opus.policy import (
+                        resolve_a16w16_tuned_candidate,
+                    )
+
+                    resolved = resolve_a16w16_tuned_candidate(
+                        arch=gfx,
+                        M=M,
+                        N=N,
+                        K=K,
+                        batch=1,
+                        cu_num=cu_num,
+                        has_bias=bias,
+                        input_dtype=eval(dtype),
+                        output_dtype=eval(otype),
+                        requested_kid=config.get("solidx"),
+                        requested_split_k=config.get("splitK"),
+                    )
+                if resolved is None:
+                    # Discard the whole stale (kid, split-K) pair before
+                    # trying another padded row or the default fallback.
+                    invalid_row = (
+                        padded_M,
+                        config.get("solidx"),
+                        config.get("splitK"),
+                    )
+                    if invalid_row not in warned_invalid_opus:
+                        logger.warning(
+                            "Ignoring invalid OPUS tuned row for gfx=%s, "
+                            "shape=(%d,%d,%d), kid=%r, splitK=%r; trying "
+                            "the next padded row or default backend",
+                            gfx,
+                            padded_M,
+                            N,
+                            K,
+                            config.get("solidx"),
+                            config.get("splitK"),
+                        )
+                        warned_invalid_opus.add(invalid_row)
+                    config = None
+                    continue
+                config = dict(config)
+                config["solidx"] = int(resolved.resolved_kid)
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = (
                     config["kernelName"] if config["libtype"] != "hipblaslt" else ""
@@ -209,6 +239,7 @@ def get_GEMM_A16W16_config(
         elif gfx in ("gfx90a", "gfx942", "gfx950") and is_skinny_default_shape(
             M, N, K, dtype, cu_num
         ):
+            # soltype, solution_idx = 3, 2
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
@@ -486,10 +517,10 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
         config["kernelName"]
     )
-    stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
     if (
         bias is not None
@@ -497,27 +528,21 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+    out = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
         bias=fused_bias,
-        kernel_family=flydsl_config.get("kernel_family"),
-        tile_m=flydsl_config["tile_m"],
-        tile_n=flydsl_config["tile_n"],
-        tile_k=flydsl_config["tile_k"],
+        block_m=flydsl_config["block_m"],
+        block_n=flydsl_config["block_n"],
+        block_k=flydsl_config["block_k"],
         split_k=flydsl_config["split_k"],
-        block_m_warps=flydsl_config["block_m_warps"],
-        block_n_warps=flydsl_config["block_n_warps"],
-        block_k_warps=flydsl_config.get("block_k_warps", 1),
-        n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
-        persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
-        waves_per_eu=flydsl_config.get("waves_per_eu", 0),
-        b_to_lds_unroll=flydsl_config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=flydsl_config.get("async_copy", False),
-        b_to_lds=flydsl_config["b_to_lds"],
-        b_preshuffle=flydsl_config.get("b_preshuffle", False),
-        c_to_lds=flydsl_config.get("c_to_lds", False),
+        m_waves=flydsl_config["m_waves"],
+        n_waves=flydsl_config["n_waves"],
+        k_waves=flydsl_config["k_waves"],
+        stages=flydsl_config["stages"],
+        group_m=flydsl_config["group_m"],
+        policy=("ht" if flydsl_config["use_half_tile_interleaved"] else "ft"),
+        out_dtype=otype,
     )
 
     if bias is not None and fused_bias is None:
@@ -539,7 +564,8 @@ def opus_gemm(
     bpreshuffle: bool | None = False,
     config: dict | None = None,
 ):
-    if _opus_tune is None:
+    """Run one tuned OPUS A16W16 row through the exact-kid interface."""
+    if _opus_launch is None:
         logger.warning(
             "opus tuned config found but opus is not available; falling back to torch"
         )
@@ -562,22 +588,16 @@ def opus_gemm(
     splitK = int(config.get("splitK", 0)) if config is not None else 0
     m, _k = inp.shape
     n = weights.shape[0]
-    # The split-K workspace (if any) is allocated capture-safely inside
-    # opus_gemm_a16w16_tune -> _get_opus_workspace; no eager pre-warm needed.
     Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
-    _opus_tune(
-        inp.unsqueeze(0),
-        weights.unsqueeze(0),
-        Y.unsqueeze(0),
+    _opus_launch(
+        inp,
+        weights,
+        Y,
+        kid=int(solidx),
         bias=bias,
-        kernelId=int(solidx),
-        splitK=splitK,
+        split_k=splitK,
     )
-    # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
-    # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
-    # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +
-    # 2*bias), causing ~54% miscompare (maxabs ~= bias range) for every bias!=None
-    # opus shape under tgemm (e.g. ATOM's bf16 linear).
+    # The OPUS launcher already applies bias, including split-K reduction.
     return Y
 
 

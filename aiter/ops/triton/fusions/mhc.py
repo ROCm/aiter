@@ -21,6 +21,12 @@ from aiter.ops.triton.utils.mhc_config_utils import (
     get_mhc_config,
     get_mhc_post_config,
 )
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
+_SINKHORN_FALLBACK = triton.Config({}, num_warps=1, num_stages=1)
+_HEAD_FALLBACK = triton.Config(
+    {"BLOCK_M": 16, "BLOCK_K": 64, "BLOCK_C": 128}, num_warps=4, num_stages=1
+)
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -959,10 +965,14 @@ def _validate_dsv4_parameters(
         raise TypeError("fn, scale, and base must be float32")
     if not (residual.device == fn.device == scale.device == base.device):
         raise ValueError("residual, fn, scale, and base must be on the same device")
-    if not residual.is_contiguous():
-        raise ValueError("residual must be contiguous for CUDA-graph-safe execution")
-    if not fn.is_contiguous():
-        raise ValueError("fn must be contiguous for CUDA-graph-safe execution")
+    if not residual.is_contiguous() or not fn.is_contiguous():
+        raise ValueError(
+            "residual and fn must be contiguous for CUDA-graph-safe execution"
+        )
+    if not scale.is_contiguous() or not base.is_contiguous():
+        raise ValueError(
+            "scale and base must be contiguous for CUDA-graph-safe execution"
+        )
     if residual.device.type != "cuda":
         raise ValueError("DSV4 MHC Triton forward requires a CUDA device")
     if not head and n * n != triton.next_power_of_2(n * n):
@@ -983,6 +993,12 @@ def _mhc_pre_dsv4_forward(
     config: dict | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, n, C = _validate_dsv4_parameters(residual, fn, scale, base, head=False)
+    if M == 0:
+        return (
+            torch.empty((0, n, 1), dtype=torch.float32, device=residual.device),
+            torch.empty((0, n, n), dtype=torch.float32, device=residual.device),
+            torch.empty((0, C), dtype=residual.dtype, device=residual.device),
+        )
     x = residual.view(M, n * C)
     post, raw_comb, layer_input = mhc(
         x,
@@ -1004,6 +1020,9 @@ def _mhc_pre_dsv4_forward(
     raw_comb_flat = raw_comb.view(M, n * n)
     comb = torch.empty((M, n, n), dtype=raw_comb.dtype, device=raw_comb.device)
     comb_flat = comb.view(M, n * n)
+    sink_cfg = get_tuned_kernel_config(
+        "fusions", "MHC_DSV4", "_mhc_asymmetric_sinkhorn_kernel", _SINKHORN_FALLBACK
+    )
     _mhc_asymmetric_sinkhorn_kernel[(M,)](
         raw_comb_flat,
         comb_flat,
@@ -1016,7 +1035,7 @@ def _mhc_pre_dsv4_forward(
         N_POW2_RES=triton.next_power_of_2(n * n),
         NUM_SINKHORN_ITERS=sinkhorn_iters,
         eps=sinkhorn_eps,
-        num_warps=1,
+        num_warps=sink_cfg.num_warps,
     )
     return post, comb, layer_input
 
@@ -1140,6 +1159,8 @@ def mhc_post_dsv4(
     Shapes are ``layer_input=[M,C]``, ``residual=[M,n,C]``,
     ``post_mix=[M,n,1]`` (or ``[M,n]``), and ``comb_mix=[M,n,n]``.
     """
+    if residual.shape[0] == 0:
+        return torch.empty_like(residual)
     return _MHCPostDSV4.apply(layer_input, residual, post_mix, comb_mix, config)
 
 
@@ -1153,13 +1174,23 @@ def _mhc_head_dsv4_forward(
     config: dict | None,
 ) -> torch.Tensor:
     M, n, C = _validate_dsv4_parameters(residual, fn, scale, base, head=True)
+    if M == 0:
+        return torch.empty((0, C), dtype=residual.dtype, device=residual.device)
     x = residual.view(M, n * C)
-    config = {} if config is None else dict(config)
-    _validate_dot_config(config, name="mhc_head_dsv4")
-    BLOCK_M = max(16, config.pop("BLOCK_M", 16))
-    BLOCK_K = config.pop("BLOCK_K", min(64, triton.next_power_of_2(n * C)))
+    extra = {} if config is None else dict(config)
+    _validate_dot_config(extra, name="mhc_head_dsv4")
+    head_cfg = get_tuned_kernel_config(
+        "fusions", "MHC_DSV4", "_mhc_head_kernel", _HEAD_FALLBACK
+    )
+    BLOCK_M = max(16, extra.pop("BLOCK_M", head_cfg.kwargs.get("BLOCK_M", 16)))
+    BLOCK_K = extra.pop(
+        "BLOCK_K",
+        head_cfg.kwargs.get("BLOCK_K", min(64, triton.next_power_of_2(n * C))),
+    )
     BLOCK_K = max(16, min(BLOCK_K, triton.next_power_of_2(n * C)))
-    BLOCK_C = config.pop("BLOCK_C", min(128, triton.next_power_of_2(C)))
+    BLOCK_C = extra.pop(
+        "BLOCK_C", head_cfg.kwargs.get("BLOCK_C", min(128, triton.next_power_of_2(C)))
+    )
     out = torch.empty(M, C, dtype=residual.dtype, device=residual.device)
     _mhc_head_kernel[(triton.cdiv(M, BLOCK_M),)](
         x,
@@ -1183,7 +1214,9 @@ def _mhc_head_dsv4_forward(
         BLOCK_K=BLOCK_K,
         BLOCK_C=BLOCK_C,
         N_TILE=max(16, triton.next_power_of_2(n)),
-        **config,
+        num_warps=head_cfg.num_warps,
+        num_stages=head_cfg.num_stages,
+        **extra,
     )
     return out
 

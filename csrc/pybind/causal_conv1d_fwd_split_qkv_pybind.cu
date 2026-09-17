@@ -5,7 +5,7 @@
 #include "aiter_stream.h"
 #include "causal_conv1d_fwd_split_qkv.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     CAUSAL_CONV1D_FWD_SPLIT_QKV_PYBIND;

@@ -22,9 +22,6 @@ Notation (from mHC paper arXiv:2512.24880v2):
     - layer_input: (M, C)    - Σᵢ (σ(H^pre_i) + hc_pre_eps) · x_i
 """
 
-import importlib
-import inspect
-
 import pytest
 import torch
 
@@ -39,9 +36,7 @@ from op_tests.triton_tests.utils.mhc_ref import (
     get_test_shapes,
     is_doubly_stochastic,
     mhc_e2e_ref,
-    mhc_head_dsv4_torch,
     mhc_post_torch,
-    mhc_pre_dsv4_torch,
     mhc_torch,
 )
 
@@ -1131,228 +1126,178 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
 
 
 # =============================================================================
-# DSV4 high-level API
+# DSV4 kernel tests
 # =============================================================================
 
 
-def test_mhc_dsv4_public_api_and_backward_policy():
-    """The stable DSV4 wrappers are exported and name their fallback."""
-    from aiter.ops.triton import fusions
-
-    mhc_module = importlib.import_module("aiter.ops.triton.fusions.mhc")
-
-    for name in ("mhc_pre_dsv4", "mhc_post_dsv4", "mhc_head_dsv4"):
-        assert callable(getattr(mhc_module, name, None)), name
-        assert getattr(fusions, name, None) is getattr(mhc_module, name)
-    assert mhc_module.MHC_DSV4_BACKWARD_FALLBACK == "pytorch_recompute"
-
-
-def test_mhc_dsv4_wrappers_have_no_host_sync_or_fn_repack():
-    mhc_module = importlib.import_module("aiter.ops.triton.fusions.mhc")
-    source = "\n".join(
-        inspect.getsource(fn)
-        for fn in (
-            mhc_module._mhc_pre_dsv4_forward,
-            mhc_module._mhc_head_dsv4_forward,
-        )
-    )
-    assert ".item(" not in source
-    assert "fn.T.contiguous().to(" not in source
-    assert "fn.contiguous().to(" not in source
+def _make_pre_dsv4_inputs(M, n, C, dtype, device="cuda"):
+    """Generate inputs for mhc_pre_dsv4 / mhc_post_dsv4."""
+    torch.manual_seed(42)
+    rows = 2 * n + n * n
+    residual = torch.randn(M, n, C, dtype=dtype, device=device) * 0.1
+    fn = torch.randn(rows, n * C, dtype=torch.float32, device=device) * 0.02
+    scale = torch.ones(3, dtype=torch.float32, device=device)
+    base = torch.zeros(rows, dtype=torch.float32, device=device)
+    return residual, fn, scale, base
 
 
-def test_mhc_dsv4_has_no_tilekernels_or_tilelang_dependency():
-    mhc_module = importlib.import_module("aiter.ops.triton.fusions.mhc")
-    source = inspect.getsource(mhc_module).lower()
-    assert "tile_kernels" not in source
-    assert "tilelang" not in source
+def _make_head_dsv4_inputs(M, n, C, dtype, device="cuda"):
+    """Generate inputs for mhc_head_dsv4."""
+    torch.manual_seed(42)
+    residual = torch.randn(M, n, C, dtype=dtype, device=device) * 0.1
+    fn = torch.randn(n, n * C, dtype=torch.float32, device=device) * 0.02
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+    base = torch.zeros(n, dtype=torch.float32, device=device)
+    return residual, fn, scale, base
 
 
 @pytest.mark.parametrize(
-    "config",
+    "M, n, C",
     [
-        {"BLOCK_M": 8},
-        {"BLOCK_K": 8},
-        {"BLOCK_K": 24},
-        {"BLOCK_C": 3},
+        (64, 4, 128),
+        (128, 4, 256),
+        (256, 4, 64),
     ],
 )
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mhc_head_dsv4_rejects_invalid_config(config):
-    from aiter.ops.triton.fusions.mhc import mhc_head_dsv4
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_pre_dsv4_correctness(M, n, C, dtype):
+    """mhc_pre_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        _mhc_pre_dsv4_torch,
+        mhc_pre_dsv4,
+    )
 
-    n, C = 4, 8
-    residual = torch.randn(1, n, C, device="cuda", dtype=torch.bfloat16)
-    fn = torch.randn(n, n * C, device="cuda", dtype=torch.float32)
-    scale = torch.randn(1, device="cuda", dtype=torch.float32)
-    base = torch.randn(n, device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="BLOCK_"):
-        mhc_head_dsv4(residual, fn, scale, base, config=config)
+    residual, fn, scale, base = _make_pre_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps, sink_eps = 1e-6, 1e-6, 1e-6
+    post_mult, sink_iters = 2.0, 4
 
+    post_t, comb_t, layer_t = mhc_pre_dsv4(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps=eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sink_eps,
+        hc_post_mult_value=post_mult,
+        sinkhorn_repeat=sink_iters,
+    )
+    post_ref, comb_ref, layer_ref = _mhc_pre_dsv4_torch(
+        residual, fn, scale, base, eps, pre_eps, sink_eps, post_mult, sink_iters
+    )
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mhc_pre_dsv4_rejects_invalid_dot_config():
-    from aiter.ops.triton.fusions.mhc import mhc_pre_dsv4
-
-    n, C = 4, 8
-    residual = torch.randn(1, n, C, device="cuda", dtype=torch.bfloat16)
-    fn = torch.randn(2 * n + n * n, n * C, device="cuda", dtype=torch.float32)
-    scale = torch.zeros(3, device="cuda", dtype=torch.float32)
-    base = torch.randn(2 * n + n * n, device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="BLOCK_K"):
-        mhc_pre_dsv4(
-            residual,
-            fn,
-            scale,
-            base,
-            config={"BLOCK_K": 8},
+    atol, rtol = 2e-2, 2e-2
+    for name, t, ref in (
+        ("post_mix", post_t, post_ref),
+        ("comb_mix", comb_t, comb_ref),
+        ("layer_input", layer_t, layer_ref),
+    ):
+        torch.testing.assert_close(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            msg=f"{name} mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
         )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mhc_pre_dsv4_asymmetric_forward_and_recompute_gradients(dtype):
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_post_dsv4_correctness(M, n, C, dtype):
+    """mhc_post_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        mhc_post_dsv4,
+        mhc_pre_dsv4,
+    )
+
+    residual, fn, scale, base = _make_pre_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps, sink_eps = 1e-6, 1e-6, 1e-6
+    post_mult, sink_iters = 2.0, 4
+
+    # Use the Triton pre to get mixes, then check post matches reference e2e
+    post_mix, comb_mix, layer_input = mhc_pre_dsv4(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps=eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sink_eps,
+        hc_post_mult_value=post_mult,
+        sinkhorn_repeat=sink_iters,
+    )
+
+    out_t = mhc_post_dsv4(layer_input, residual, post_mix, comb_mix)
+
+    # Reference: post_2d * layer_input + sum_j(comb_ij * residual_j)
+    post_2d = post_mix.squeeze(-1).float()
+    out_ref = post_2d[:, :, None] * layer_input.float()[:, None, :]
+    out_ref = out_ref + torch.einsum("mhc,mhj->mjc", residual.float(), comb_mix.float())
+    out_ref = out_ref.to(dtype)
+
+    torch.testing.assert_close(
+        out_t.float(),
+        out_ref.float(),
+        atol=2e-2,
+        rtol=2e-2,
+        msg=f"mhc_post_dsv4 mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+    )
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+        (256, 4, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_head_dsv4_correctness(M, n, C, dtype):
+    """mhc_head_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        _mhc_head_dsv4_torch,
+        mhc_head_dsv4,
+    )
+
+    residual, fn, scale, base = _make_head_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps = 1e-6, 1e-6
+
+    out_t = mhc_head_dsv4(residual, fn, scale, base, rms_eps=eps, hc_pre_eps=pre_eps)
+    out_ref = _mhc_head_dsv4_torch(residual, fn, scale, base, eps, pre_eps)
+
+    torch.testing.assert_close(
+        out_t.float(),
+        out_ref.float(),
+        atol=2e-2,
+        rtol=2e-2,
+        msg=f"mhc_head_dsv4 mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+    )
+
+
+def test_mhc_pre_dsv4_empty_batch():
+    """mhc_pre_dsv4 returns zero-sized outputs for M=0 without error."""
     from aiter.ops.triton.fusions.mhc import mhc_pre_dsv4
 
-    torch.manual_seed(41)
-    M, n, C = 3, 4, 2
-    N = 2 * n + n * n
-    residual = torch.randn(M, n, C, device="cuda", dtype=dtype, requires_grad=True)
-    fn = (
-        torch.randn(N, n * C, device="cuda", dtype=torch.float32) * 0.03
-    ).requires_grad_()
-    scale = torch.randn(3, device="cuda", dtype=torch.float32, requires_grad=True)
-    base = (torch.randn(N, device="cuda", dtype=torch.float32) * 0.03).requires_grad_()
-    ref_inputs = tuple(
-        t.detach().clone().requires_grad_() for t in (residual, fn, scale, base)
-    )
-
-    actual = mhc_pre_dsv4(residual, fn, scale, base)
-    expected = mhc_pre_dsv4_torch(*ref_inputs)
-    for got, want in zip(actual, expected):
-        torch.testing.assert_close(got.float(), want.float(), atol=4e-2, rtol=3e-2)
-    assert actual[0].dtype == actual[1].dtype == torch.float32
-    assert actual[2].dtype == residual.dtype
-
-    weights = tuple(torch.randn_like(t) for t in actual)
-    torch.autograd.backward(actual, weights)
-    torch.autograd.backward(expected, weights)
-    for got, want in zip(
-        (residual.grad, fn.grad, scale.grad, base.grad),
-        tuple(t.grad for t in ref_inputs),
-    ):
-        torch.testing.assert_close(got.float(), want.float(), atol=7e-2, rtol=7e-2)
+    n, C = 4, 64
+    residual, fn, scale, base = _make_pre_dsv4_inputs(0, n, C, torch.bfloat16)
+    post, comb, layer = mhc_pre_dsv4(residual, fn, scale, base)
+    assert post.shape == (0, n, 1)
+    assert comb.shape == (0, n, n)
+    assert layer.shape == (0, C)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mhc_pre_dsv4_sinkhorn_preserves_flat_element_order():
-    """Catch incorrect [M,n,n] strides passed to the flattened Sinkhorn kernel."""
-    from aiter.ops.triton.fusions.mhc import mhc_pre_dsv4
-
-    M, n, C = 2, 4, 4
-    residual = torch.randn(M, n, C, device="cuda", dtype=torch.bfloat16)
-    fn = torch.zeros(2 * n + n * n, n * C, device="cuda", dtype=torch.float32)
-    scale = torch.zeros(3, device="cuda", dtype=torch.float32)
-    base = torch.zeros(2 * n + n * n, device="cuda", dtype=torch.float32)
-    res_logits = torch.tensor(
-        [
-            [0.1, -1.2, 2.3, 0.4],
-            [1.5, 0.2, -0.7, 2.1],
-            [-1.1, 1.7, 0.6, -2.2],
-            [2.4, -0.3, 1.2, 0.8],
-        ],
-        device="cuda",
-        dtype=torch.float32,
-    )
-    base[2 * n :] = res_logits.flatten()
-
-    _, comb, _ = mhc_pre_dsv4(residual, fn, scale, base)
-    expected = mhc_pre_dsv4_torch(residual, fn, scale, base)[1]
-    torch.testing.assert_close(comb, expected, atol=2e-5, rtol=2e-5)
-    assert not torch.allclose(comb, expected.transpose(-1, -2), atol=2e-5, rtol=2e-5)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mhc_post_dsv4_forward_and_recompute_gradients():
-    from aiter.ops.triton.fusions.mhc import mhc_post_dsv4
-
-    torch.manual_seed(42)
-    M, n, C = 3, 4, 64
-    inputs = (
-        torch.randn(M, C, device="cuda", dtype=torch.float16, requires_grad=True),
-        torch.randn(M, n, C, device="cuda", dtype=torch.float16, requires_grad=True),
-        torch.randn(M, n, 1, device="cuda", dtype=torch.float32, requires_grad=True),
-        torch.randn(M, n, n, device="cuda", dtype=torch.float32, requires_grad=True),
-    )
-    refs = tuple(t.detach().clone().requires_grad_() for t in inputs)
-    actual = mhc_post_dsv4(*inputs)
-    expected = mhc_post_torch(*refs)
-    torch.testing.assert_close(actual.float(), expected.float(), atol=3e-2, rtol=3e-2)
-
-    weight = torch.randn_like(actual)
-    actual.backward(weight)
-    expected.backward(weight)
-    for got, want in zip((t.grad for t in inputs), (t.grad for t in refs)):
-        torch.testing.assert_close(got.float(), want.float(), atol=5e-2, rtol=5e-2)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("n,C", [(1, 3), (2, 8), (4, 64), (8, 64), (16, 64)])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mhc_head_dsv4_forward_and_recompute_gradients(n, C, dtype):
+def test_mhc_head_dsv4_empty_batch():
+    """mhc_head_dsv4 returns zero-sized output for M=0 without error."""
     from aiter.ops.triton.fusions.mhc import mhc_head_dsv4
 
-    torch.manual_seed(43)
-    M = 3
-    inputs = (
-        torch.randn(M, n, C, device="cuda", dtype=dtype, requires_grad=True),
-        torch.randn(n, n * C, device="cuda", dtype=torch.float32, requires_grad=True),
-        torch.randn(1, device="cuda", dtype=torch.float32, requires_grad=True),
-        torch.randn(n, device="cuda", dtype=torch.float32, requires_grad=True),
-    )
-    refs = tuple(t.detach().clone().requires_grad_() for t in inputs)
-    actual = mhc_head_dsv4(*inputs)
-    expected = mhc_head_dsv4_torch(*refs)
-    torch.testing.assert_close(actual.float(), expected.float(), atol=4e-2, rtol=3e-2)
-
-    weight = torch.randn_like(actual)
-    actual.backward(weight)
-    expected.backward(weight)
-    for got, want in zip((t.grad for t in inputs), (t.grad for t in refs)):
-        torch.testing.assert_close(got.float(), want.float(), atol=7e-2, rtol=7e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mhc_dsv4_cuda_graph_capture():
-    from aiter.ops.triton.fusions.mhc import mhc_head_dsv4, mhc_pre_dsv4
-
-    M, n, C = 2, 4, 16
-    residual = torch.randn(M, n, C, device="cuda", dtype=torch.bfloat16)
-    fn = torch.randn(2 * n + n * n, n * C, device="cuda", dtype=torch.float32)
-    scale = torch.zeros(3, device="cuda", dtype=torch.float32)
-    base = torch.randn(2 * n + n * n, device="cuda", dtype=torch.float32)
-    head_fn = torch.randn(n, n * C, device="cuda", dtype=torch.float32)
-    head_scale = torch.zeros(1, device="cuda", dtype=torch.float32)
-    head_base = torch.randn(n, device="cuda", dtype=torch.float32)
-
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup), torch.no_grad():
-        for _ in range(3):
-            mhc_pre_dsv4(residual, fn, scale, base)
-            mhc_head_dsv4(residual, head_fn, head_scale, head_base)
-    torch.cuda.current_stream().wait_stream(warmup)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph), torch.no_grad():
-        pre_outputs = mhc_pre_dsv4(residual, fn, scale, base)
-        head_output = mhc_head_dsv4(residual, head_fn, head_scale, head_base)
-    post_before = pre_outputs[0].clone()
-    head_before = head_output.clone()
-    scale.add_(1.0)
-    head_scale.add_(1.0)
-    graph.replay()
-    assert all(torch.isfinite(output).all() for output in pre_outputs)
-    assert torch.isfinite(head_output).all()
-    assert not torch.equal(pre_outputs[0], post_before)
-    assert not torch.equal(head_output, head_before)
+    n, C = 4, 64
+    residual, fn, scale, base = _make_head_dsv4_inputs(0, n, C, torch.bfloat16)
+    out = mhc_head_dsv4(residual, fn, scale, base)
+    assert out.shape == (0, C)

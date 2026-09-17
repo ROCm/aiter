@@ -1,0 +1,13 @@
+{
+    "_sparse_mla_fwd_kernel": {
+        "BLOCK_H": 32,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "_bwd_kernels": {
+        "BLOCK_H": 32,
+        "BLOCK_K": 32,
+        "num_warps": 4
+    }
+}
