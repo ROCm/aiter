@@ -8,7 +8,7 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
@@ -58,6 +58,20 @@ EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
 WN_PER_MX_BLOCK_EP = 2
+
+
+def _pack_bytes_i32(byte_vals):
+    """Pack up to four i8 IR values into one i32, first value in the low byte."""
+    assert 1 <= len(byte_vals) <= 4, len(byte_vals)
+    packed = None
+    for n, b in enumerate(byte_vals):
+        w = fx.Int32(arith.extui(T.i32, _raw(b)))
+        if n:
+            w = w << fx.Int32(8 * n)
+        packed = w if packed is None else packed | w
+    return packed
+
+
 # The staging loop emits one e8m0 per WN_PER_MX_BLOCK_EP subtiles of 16 columns
 # and the wire reads one per EP_SCALE_BLOCK columns; drift and the scale plane
 # silently describes the wrong columns.
@@ -264,6 +278,7 @@ def launch_gemm_a8w4_tdm(
     PITCH = ceildiv(STAGE_A + STAGE_B + STAGE_SA + STAGE_SB, 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
+
     # The bf16 passthrough epilogue stages C with a padded row pitch to break the
     # ds_store bank conflict; reserve it so the padded tile fits.  On gfx1250's
     # 64-bank LDS, scatter uses the smallest 16B-aligned row that is not a
@@ -1493,6 +1508,10 @@ def launch_gemm_a8w4_tdm(
                         MxDtype.FP8_E4M3 if ep_quant_bits == 8 else MxDtype.FP4_E2M1
                     )
                     _n_mx_blks = output_n_rep // WN_PER_MX_BLOCK_EP
+                    # Whole dwords only: a warp owning a byte count that is not a
+                    # multiple of four starts mid-dword, and a wider store would
+                    # reach into the next warp's scales.
+                    _e8m0_pack_dwords = _n_mx_blks // 4 if _n_mx_blks % 4 == 0 else 0
                     _is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                     _p8_scale = fx.PointerType.get(
                         elem_ty=fx.Int8.ir_type,
@@ -1504,18 +1523,26 @@ def launch_gemm_a8w4_tdm(
                         row_rel = wmb + wm * 16 + lane16
                         _wf = _wf_rows[wm]
                         _row_byte = row_rel * _lds_row_bytes
+                        _e8m0_blks = []
                         for mx_blk in range_constexpr(_n_mx_blks):
                             _vals = []
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
                                 wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
                                 col_rel = wnb + wn * 16 + kgrp * 8
                                 acc = _biased_acc(wm, wn, col_rel)
-                                # Weight before quantizing: combine sums unweighted.
+                                # Weight before quantizing: combine sums
+                                # unweighted. It cannot ride the cvt scale
+                                # operand instead -- v_cvt_scalef32 takes only
+                                # the exponent of that f32, so a weight that is
+                                # not a power of two would be rounded to one.
+                                # Measured: folding it there costs 0.180 -> 0.292
+                                # logits_diff over 8 layers at 16k tokens/rank.
                                 for i in range_constexpr(8):
                                     _vals.append(acc[i] * _wf)
                             _scale_f32, _e8m0 = emit_amax_e8m0_native_scale(
                                 _vals, wave_size=WAVE, dtype=_mx_dt
                             )
+                            _e8m0_blks.append(_e8m0)
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
                                 wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
                                 col_rel = wnb + wn * 16 + kgrp * 8
@@ -1553,18 +1580,34 @@ def launch_gemm_a8w4_tdm(
                                             fx.Int32,
                                         ),
                                     )
-                            # Both kgrp lanes hold the same block scale; one stores.
-                            _sc_col = wnb + mx_blk * WN_PER_MX_BLOCK_EP * 16
-                            if _is_kgrp0:
-                                fx.ptr_store(
-                                    _e8m0,
-                                    _scale_lds
-                                    + (
-                                        row_rel * _lds_scale_row_bytes
-                                        + _sc_col // EP_SCALE_BLOCK
-                                        + _ep_scale_lds_off
-                                    ),
-                                )
+                        # Both kgrp lanes hold the same block scales; one stores.
+                        # This row's e8m0 bytes are contiguous -- block b sits at
+                        # wnb/32 + b -- so they go out as whole dwords instead of
+                        # one masked byte store per block. Each warp owns
+                        # warp_tile_n/32 bytes starting at a multiple of that, so
+                        # a dword store stays inside this warp's own run.
+                        _sc_byte = (
+                            row_rel * _lds_scale_row_bytes
+                            + wnb // EP_SCALE_BLOCK
+                            + _ep_scale_lds_off
+                        )
+                        if _is_kgrp0:
+                            if const_expr(_e8m0_pack_dwords):
+                                for dw in range_constexpr(_e8m0_pack_dwords):
+                                    _packed = _pack_bytes_i32(
+                                        _e8m0_blks[dw * 4 : dw * 4 + 4]
+                                    )
+                                    lds_store_b32(
+                                        stC_idx,
+                                        _sc_byte + dw * 4,
+                                        Vec.from_elements([_packed], fx.Int32),
+                                    )
+                            else:
+                                for mx_blk in range_constexpr(_n_mx_blks):
+                                    fx.ptr_store(
+                                        _e8m0_blks[mx_blk],
+                                        _scale_lds + (_sc_byte + mx_blk),
+                                    )
                 else:
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
