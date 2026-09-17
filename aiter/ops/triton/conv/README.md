@@ -1,4 +1,4 @@
-# conv2d (Triton, AMD ROCm)
+# Conv2D and Conv3D (Triton, AMD ROCm)
 
 > **`Conv2d` for AMD ROCm — a drop-in replacement for `torch.nn.Conv2d`,
 > optimized for AMD RDNA GPUs.**
@@ -12,6 +12,11 @@ A hand-written Triton 2-D convolution library optimized for AMD RDNA
 GPUs. Six kernel families (1×1, direct NCHW 3×3, 3×3 cblocked, 3×3
 NHWC, Winograd F(4×4, 3×3), general) behind one shape-driven router and one entry
 point. Drop-in for the forward path of `nn.Conv2d`.
+
+The package also provides Conv3D for video-VAE workloads, organized into public
+routing, launch, prepack, utility, and kernel layers. Dimension-specific
+functions retain explicit names, and Conv3D uses independent packing caches and
+routing logic.
 
 ---
 
@@ -33,41 +38,10 @@ an ordinary contiguous input requested with `layout="nhwc"` is converted once),
 and gets reasonable performance across the
 full matrix **without per-architecture kernel implementations** (one
 set of Triton kernels for every arch, with a thin per-arch JSON config
-layer — see Tuning). A shape-driven
+layer). A shape-driven
 router picks between six kernel families so the right kernel runs per layer
 automatically. Weight transforms are LRU-cached. Tuned NCHW 3×3 activations
 can be read directly; other eligible shapes use one fused Triton NCHWc pack.
-
----
-
-## Performance
-
-Designed to deliver strong throughput on AMD RDNA4 across both fp16 and
-bf16. The bench harness logs which MIOpen solver was selected per layer
-and reports aggregate TFLOPS for both backends, so you can verify the
-behavior on your stack.
-
-To measure on your stack:
-
-```bash
-python -m op_tests.op_benchmarks.triton.bench_conv2d \
-    --model <resnet50|"stable-diffusion-3.5-medium"|"FLUX.2-klein-9B"> \
-    --dtype <fp16|bf16> \
-    [--miopen-solvers]   # opt-in; ~60-120s upfront subprocess
-```
-
-The bench harness produces three box-drawn tables: LAYER-BY-LAYER (per-layer
-Triton vs MIOpen TFLOPS, Triton kernel name, optionally MIOpen solver,
-kernel+repack column for shapes that prepack), MIOpen SOLVER SUMMARY (only
-with `--miopen-solvers`), and OVERALL PERFORMANCE (mean/median/aggregate
-TFLOPS, total time, layer wins, correctness).
-
-> **Note on TFLOPS**: numbers are *direct-convolution-equivalent* throughput
-> (the standard convention used by cuDNN, MIOpen, and the Winograd
-> literature), applied identically to both backends. Winograd kernels —
-> Triton's F(4×4, 3×3) and MIOpen's F(2×2, 3×3) / Fury alike — execute
-> fewer literal hardware MACs than this denominator counts (≈4× fewer for
-> F(4,3), ≈2.25× for F(2,3)). The comparison is apples-to-apples.
 
 ---
 
@@ -90,16 +64,42 @@ y = conv2d(
 )
 ```
 
+### Conv3D
+
+```python
+import torch
+from aiter.ops.triton.conv.conv3d import conv3d
+
+x = torch.randn(1, 384, 3, 46, 51, device="cuda", dtype=torch.float16)
+w = torch.randn(384, 384, 3, 3, 3, device="cuda", dtype=torch.float16)
+
+y = conv3d(
+    x, w, bias=None,
+    stride=1, padding=1, dilation=1,
+    activation="none",
+    layout="ncdhw",           # "ncdhw" or "ndhwc"
+)
+```
+
+The Conv3D router selects among specialized 1×1×1, NCDHWc 3×3×3, NDHWC
+3×3×3, general im2col-free, and two 2.5-D Winograd input paths. The Winograd
+paths transform only H/W with F(4×4,3×3) and perform the three depth taps
+directly; one reads NCDHW and the other first packs input to NCDHWc. This avoids
+the numerical amplification and temporary size of full 3-D Winograd. Weight
+packs and filter transforms are version-aware LRU cached.
+
+### Conv2D routing
+
 A shape-driven router picks one of six kernel families:
 
 | Family | When it runs |
 |---|---|
-| 1×1 GEMM | `R==1, S==1` |
+| 1×1 GEMM | `R==1, S==1` with unit dilation |
 | Direct NCHW 3×3 | Tuned NCHW shapes selected by a crossover or exact-route table; no input repack |
 | 3×3 cblocked (NCHW) | Eligible NCHW shapes not routed direct; uses a fused NCHWc pack |
 | 3×3 NHWC | 3×3 with channels-last input — no input repack |
 | Winograd F(4×4, 3×3) | Eligible non-wave32 targets where transforms amortize |
-| General | non-1×1/3×3 and narrow-channel NCHW 3×3 |
+| General | All other kernels, plus narrow-channel NCHW 3×3 |
 
 ### Use as `nn.Conv2d` drop-in
 
@@ -118,9 +118,9 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 - Only `groups=1` is implemented; callers must send depthwise or grouped
   convolutions to another backend.
-- Only zero padding is implemented. The height and width pad amounts may
-  differ, for example `(0, 2)`, but callers must send `"reflect"`,
-  `"replicate"`, and `"circular"` padding modes to PyTorch/MIOpen.
+- Only zero padding is implemented. Per-axis pad amounts may differ, for
+  example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D, but callers must send
+  `"reflect"`, `"replicate"`, and `"circular"` padding modes to PyTorch/MIOpen.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 
@@ -128,24 +128,46 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 ## Reproducing the tests and benchmarks
 
-Run from the AITER repo root (`/app/aiter` in this tree, or `PYTHONPATH=/app/aiter`).
+Run these commands from the AITER repository root (`/app/aiter` in this tree).
+If AITER is not installed in the active environment, prefix a command with
+`PYTHONPATH=/app/aiter`.
 
-### Correctness (CI-collected; skipped on unsupported archs)
+### Tests
+
+Numerical Conv2D and Conv3D tests are CI-collected and skip at module level on
+unsupported GPU architectures. The Conv3D configuration and benchmark/CLI
+tests do not launch kernels.
 
 ```bash
-pytest op_tests/triton_tests/conv/                                # full matrix, 81 tests
-pytest op_tests/triton_tests/conv/ -k "no_bias and fp16_nchw"     # subset
-pytest op_tests/triton_tests/conv/ -k "test_edge"                 # one test family
+python -m pytest op_tests/triton_tests/conv/                       # all Conv1D/2D/3D tests
+python -m pytest op_tests/triton_tests/conv/test_conv2d.py         # Conv2D, 83 tests
+python -m pytest op_tests/triton_tests/conv/test_conv2d.py \
+  -k "no_bias and fp16_nchw"                                      # five-test subset
+python -m pytest op_tests/triton_tests/conv/test_conv2d.py \
+  -k "test_edge"                                                  # 12-test family
 ```
 
-Tests are parametrized over `(dtype, layout, method)`. Every kernel in
+The Conv2D tests are parametrized over `(dtype, layout, method)`. Every kernel in
 `_helpers.ORDERED_METHODS` is exercised against fp16 and bf16 on NCHW.
 NHWC is single-dispatch (only `conv2d_nhwc`), so each NHWC test runs once
 per dtype.
 
+The complete Conv3D suite contains numerical/routing, installed-config, and
+benchmark/CLI tests. To run all 200 cases:
+
+```bash
+python -m pytest \
+  op_tests/triton_tests/conv/test_conv3d.py \
+  op_tests/triton_tests/conv/test_conv3d_config.py \
+  op_tests/triton_tests/conv/test_bench_conv3d.py
+```
+
+Run only `test_conv3d.py` for the 140 numerical, prepack, cache, validation,
+and routing cases, including all four Wan-style VAE shapes.
+
 ### Benchmark
 
-Three modes, all in `bench_conv2d.py`.
+The Conv2D benchmark has three modes, all in `bench_conv2d.py`.
 
 **Single shape** (one parseable result line — for ad-hoc measurements):
 
@@ -169,7 +191,53 @@ NOT representative of production):
 python -m op_tests.op_benchmarks.triton.bench_conv2d --dtype fp16 --smoke
 ```
 
-Cross-axis flags:
+The Conv3D benchmark uses the same frozen-shape-database approach as Conv2D.
+It defaults to the Wan2.2 A14B-style VAE workload and accepts a
+case-insensitive model-name substring with `--model`:
+
+```bash
+python -m op_tests.op_benchmarks.triton.bench_conv3d                         # Wan2.2 A14B-style
+python -m op_tests.op_benchmarks.triton.bench_conv3d --model ltx25
+python -m op_tests.op_benchmarks.triton.bench_conv3d --model vision-patch
+python -m op_tests.op_benchmarks.triton.bench_conv3d --model ti2v
+```
+
+The available Conv3D databases are `wan22-a14b-vae`, `ltx25-conv-vae`,
+`vision-patch-embed`, and `wan22-ti2v-5b-vae`. VAE sweeps report per-shape
+results, mean/median/aggregate throughput, layer winners, and call-count-weighted
+encoder/decoder totals when the trace provides those counts. Pass
+`--miopen-solvers` to add MIOpen solver names and a solver summary. The benchmark
+always calls the production `conv3d` router unless `--method` explicitly forces
+another supported path. `--batch-size N` overrides the batch dimension across a
+model sweep.
+
+The LTX trace uses the documented 121-frame 544×960 workload (latent
+`[1,128,16,17,30]`). The Wan TI2V trace uses 121 frames at 704×1280 (latent
+`[1,48,31,44,80]`) and includes both first-chunk and steady-state causal-cache
+calls. `vision-patch-embed` covers InternVideo2 and Qwen-family tubelet/patch
+projection shapes.
+
+As with Conv2D, `--smoke` selects a compact edge-case sweep instead of a model:
+
+```bash
+python -m op_tests.op_benchmarks.triton.bench_conv3d --smoke
+python -m op_tests.op_benchmarks.triton.bench_conv3d --model ltx25 --miopen-solvers
+python -m op_tests.op_benchmarks.triton.bench_conv3d --model ti2v --batch-size 2
+```
+
+For a single shape, provide all nine dimension flags. Depth, height, and width
+parameters are independent, matching the Conv2D single-shape interface with the
+additional depth axis:
+
+```bash
+python -m op_tests.op_benchmarks.triton.bench_conv3d \
+  --N 1 --C 64 --D 4 --H 16 --W 16 --K 128 --T 1 --R 1 --S 1 \
+  --stride-d 1 --stride-h 1 --stride-w 1 \
+  --pad-d 0 --pad-h 0 --pad-w 0 \
+  --dilation-d 1 --dilation-h 1 --dilation-w 1
+```
+
+Conv2D cross-axis flags:
 
 ```
 --dtype {fp16,bf16}                           # default fp16
@@ -179,63 +247,26 @@ Cross-axis flags:
 --no-bias                                     # bench the bias=None code path
 --miopen-solvers                              # detect MIOpen solver names (sweep mode; ~60-120s subprocess)
 --show-kernel-name                            # include routed kernel name in single-shape output
+--model MODEL                                 # select a model workload by name substring
+--smoke                                       # use the edge-case sweep
+--batch-size N                                # override N for every swept shape
 ```
 
-Real-model shapes are pre-extracted into `conv_shapes.json` (no
-torchvision/diffusers needed at bench time). Each conv layer's
-`(N, C, H, W, K, R, S, stride, pad, dilation)` was captured offline once per
-model via forward hooks, deduped, and frozen there. To add a new model, append
-a `"<ModelName>": {"conv2d": [...]}` entry to `conv_shapes.json` with the same
-shape-dict fields.
+Conv3D cross-axis flags:
 
-**Why the layer count in JSON is smaller than the model's name suggests.**
-An entry in `conv_shapes.json` is a *unique convolution shape*, not a physical
-layer. The extractor walks every `nn.Conv2d` in the model, records its
-`(N, C, H, W, K, R, S, stride, pad, dilation)` tuple, and dedupes — identical
-tuples collapse to one entry. So the count reflects distinct kernel *work
-items*, which is what the bench actually needs to measure (kernel TFLOPS is a
-function of shape, so benchmarking the same shape twice adds nothing).
-
-The gap is large because model names count *all* layers (conv + linear + norm +
-…), while the JSON holds only *conv* layers, and only the *distinct-shaped*
-ones. "ResNet-50" means ~50 weight layers total; of those, 53 are convs, but
-they collapse to **23 unique shapes** (15 × 1×1, 7 × 3×3, 1 × 7×7) because the
-network stacks many identically-shaped bottleneck blocks (e.g. all three 256→64
-1×1 reductions in `layer1` share one shape). The bench iterates the 23; the
-per-layer table therefore has 23 rows, one per unique shape.
-
-Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`).
-
-### Tuning
-
-Per-kernel configs ship as JSON in the nested config tree, one `DEFAULT.json`
-per `(arch, kernel)` under `aiter/ops/triton/configs/<arch>/triton/conv/` —
-e.g. `gfx1201/triton/conv/conv_3x3_nhwc/DEFAULT.json` and
-`gfx1201/triton/conv/conv_prepack/DEFAULT.json`. The loader walks four tiers:
-layout-specific shape pin → generic shape pin → `M_LEQ_x` bucket → `"any"`
-fallback. No runtime autotune in the hot path, so CI compile time stays
-predictable and the first call hits no tuning tax.
-
-Conv config trees ship for gfx1100, gfx1151, gfx1200, gfx1201 and gfx1250 on
-the RDNA side, and for gfx942 and gfx950 on CDNA. The optional direct-NCHW
-table exists for gfx1100, gfx1151, and gfx1201. gfx1100
-and gfx1151 use exact-shape routing, so shapes not measured faster than the
-complete NCHWc path remain on the cblocked fallback; gfx1201 uses the
-configurable spatial crossover.
-
-Retuning is an offline development workflow. Candidate search spaces and the
-tuning driver live outside the production package; only the resulting JSON
-files are shipped with the kernels.
-
----
-
-## Documentation
-
-- **[`DESIGN.md`](DESIGN.md)** — architecture, per-kernel deep-dive, full
-  Winograd F(4,3) derivation (G/Bᵀ/Aᵀ matrices, 361× amplification
-  analysis, why Winograd is disabled for `C < 4`), the
-  `_select_3x3_method` heuristic, memory layouts and repacking,
-  numerical model, extension guide.
+```
+--dtype {fp16,bf16}                           # default fp16
+--layout {ncdhw,ndhwc}                        # default ncdhw
+--method {auto,general,1x1x1,cblocked,ndhwc_3x3x3,winograd,winograd_cblocked}
+--metric {time,throughput}                    # default throughput
+--activation {none,relu,relu6,gelu}           # default none
+--no-bias                                     # bench the bias=None code path
+--miopen-solvers                              # detect MIOpen solver names (sweep mode)
+--show-kernel-name                            # include routed kernel name in single-shape output
+--model MODEL                                 # select a model workload by name substring
+--smoke                                       # use the edge-case sweep
+--batch-size N                                # override N for every swept shape
+```
 
 ---
 
@@ -244,20 +275,36 @@ files are shipped with the kernels.
 ```
 aiter/ops/triton/conv/                Kernel library
   conv2d.py                           Public API + smart routing
-  _launch.py                          Triton launches, grids + config selection
-  _prepack.py                         Pack allocation/transforms + weight caches
-  _utils.py                           Shape math, eligibility predicates
-  README.md, DESIGN.md
+  _launch.py                          Shared 2-D/3-D launches, grids + configs
+  _prepack.py                         Shared pack transforms + separate caches
+  _utils.py                           Shared constants and dimension-named helpers
+  conv3d.py                           Conv3D public API + router
+  README.md
 
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
-  (1x1, direct NCHW/cblocked/NHWC 3x3, general, 4 Winograd kernels)
+  conv_1x1.py                            Conv2D 1x1 kernel
+  conv_3x3.py                            Conv2D direct/cblocked/NHWC 3x3 kernels
+  conv_general.py                        General Conv2D kernel
+  conv_3x3_winograd_f4x3.py              Conv2D Winograd transforms and GEMM
   nchw_to_cblocked.py                    Fused NCHW-to-NCHWc layout kernel
+  conv3d_1x1x1.py                        Conv3D 1x1x1 kernel
+  conv3d_3x3x3.py                        Conv3D cblocked/NDHWC 3x3x3 kernels
+  conv3d_general.py                      General Conv3D kernel
+  conv3d_winograd_hw_f4x3.py             Conv3D H/W Winograd transforms and GEMM
+  ncdhw_to_cblocked.py                   Fused NCDHW-to-NCDHWc pack
 
-op_tests/triton_tests/conv/           Pytest unit tests (CI-collected; skipped on unsupported archs)
-  test_conv2d.py                      The only collected test file
+aiter/ops/triton/configs/<arch>/triton/conv/
+  <kernel>/DEFAULT.json                  Per-architecture launch parameters
+
+op_tests/triton_tests/conv/           Pytest correctness and integration tests
+  test_conv2d.py                      Conv2D correctness and routing
+  test_conv3d.py                      Conv3D correctness and routing
+  test_conv3d_config.py               Conv3D config selection and launch keys
+  test_bench_conv3d.py                Conv3D model database and CLI checks
   _helpers.py                         TestSuite, registry, shape generators
 
 op_tests/op_benchmarks/triton/
   bench_conv2d.py                     Self-contained bench tool (single + sweep)
-  conv_shapes.json                    Pre-extracted conv shapes (resnet50, SD3.5, FLUX2)
+  bench_conv3d.py                     Self-contained Conv3D bench tool (single + sweep)
+  conv_shapes.json                    Pre-extracted Conv2D and Conv3D model shapes
 ```

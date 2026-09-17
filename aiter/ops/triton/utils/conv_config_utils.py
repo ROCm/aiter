@@ -9,15 +9,14 @@ on top of the shared core in ``config_utils``.
 import functools
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-logger = AiterTritonLogger()
-
 from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
     resolve_config_dir,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
 
 CONV_STANDARD_M_BOUNDS: tuple[int, ...] = (
     4,
@@ -67,6 +66,39 @@ def format_shape_key(
 def format_prepack_shape_key(N: int, C: int, H: int, W: int, CB: int) -> str:
     """Canonical key for an NCHW-to-NCHWc activation pack."""
     return f"N={N},C={C},H={H},W={W},CB={CB}"
+
+
+def format_shape_key_3d(
+    N: int,
+    C: int,
+    D: int,
+    H: int,
+    W: int,
+    K: int,
+    T: int,
+    R: int,
+    S: int,
+    sd: int,
+    sh: int,
+    sw: int,
+    pd: int,
+    ph: int,
+    pw: int,
+    dd: int,
+    dh: int,
+    dw: int,
+) -> str:
+    """Canonical string key for a user-visible Conv3D call."""
+    return (
+        f"N={N},C={C},D={D},H={H},W={W},K={K},T={T},R={R},S={S},"
+        f"sd={sd},sh={sh},sw={sw},pd={pd},ph={ph},pw={pw},"
+        f"dd={dd},dh={dh},dw={dw}"
+    )
+
+
+def format_prepack_shape_key_3d(N: int, C: int, D: int, H: int, W: int, CB: int) -> str:
+    """Canonical key for an NCDHW-to-NCDHWc activation pack."""
+    return f"N={N},C={C},D={D},H={H},W={W},CB={CB}"
 
 
 def _conv_config_path(config_name: str) -> str:
