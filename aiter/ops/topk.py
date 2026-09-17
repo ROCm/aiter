@@ -461,13 +461,18 @@ def top_k_per_row_prefill_avo(
     path needs -- Phase A clears the counters it shares before anything reads
     them, and the small_n path uses no workspace at all.
 
-    Two restrictions, both reported rather than assumed. `values` must be None:
-    these kernels emit indices only. And rows are selected over their full
-    `stride0` extent, so rowStarts/rowEnds are checked for shape but their
-    contents are ignored; ragged rows need the per-row extent threaded into each
-    phase kernel and are not served yet. Call topk_avo_supports() first -- the
-    shapes it declines (k above the Phase C LDS cap, a row width that is not a
-    multiple of 4) raise rather than fall back."""
+    Ragged rows are served: rowEnds[row] is the exclusive end column and a row
+    shorter than k emits min(k, row_len) indices followed by -1, the same
+    padding top_k_per_row_prefill writes. rowStarts must be zero, which is what
+    the prefill callers pass; it is checked for shape only, because nothing
+    in-tree pins whether a nonzero start means the index is relative to the row
+    or absolute in the buffer.
+
+    One restriction, reported rather than assumed: `values` must be None, as
+    these kernels emit indices only (the selected scores are a gather away on
+    the caller side). Call topk_avo_supports() first -- the shapes it declines
+    (k above the Phase C LDS cap, a row width that is not a multiple of 4)
+    raise rather than fall back."""
     size = topk_avo_workspace_size(numRows, stride0, k)
     workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_prefill_avo(
