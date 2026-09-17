@@ -90,6 +90,7 @@ static int g_ragged             = 0;
 // (M=512 N=131072 reported fallback_rows for all 512 rows). aiter's real
 // prefill config uses prefix 131072, where every extent is long and ragged.
 static int g_ragged_prefix = 0;
+static int g_values        = 0; // also emit the selected scores
 
 // ---------------------------------------------------------------------------
 // Block-wide exact radix select over keys already resident in LDS.
@@ -249,27 +250,29 @@ __device__ __forceinline__ void block_select_stream(const vfloat4* __restrict__ 
 // Exact full-row select for ONE row, streaming it from global memory. Shared by
 // the fallback branch inside Phase C and by the standalone Phase D oracle, so
 // the two can never drift apart. All threads of the block must call.
-template <bool RAGGED>
+template <bool RAGGED, bool WRITE_VALUES>
 __device__ __forceinline__ void exact_row_select(const float* __restrict__ input,
                                                  int pitch,
                                                  int len,
                                                  int K,
                                                  int row,
                                                  int* __restrict__ out,
+                                                 float* __restrict__ out_val,
                                                  uint32_t* __restrict__ s_hist,
                                                  uint32_t* __restrict__ s_red,
                                                  uint32_t* __restrict__ s_scan,
                                                  unsigned* __restrict__ s_wgt,
                                                  unsigned* __restrict__ s_weq)
 {
+    const float* rif0 = input + (size_t)row * pitch;
     if(RAGGED && len <= K)
     {
-        emit_identity_row(out, len, K);
+        emit_identity_row<WRITE_VALUES>(out, out_val, rif0, len, K);
         return;
     }
     const int k_out    = RAGGED ? k_take_dev(K, len) : K;
     const int n4       = RAGGED ? n4_cover(len) : (pitch / FP32_EPT);
-    const vfloat4* ri4 = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch);
+    const vfloat4* ri4 = reinterpret_cast<const vfloat4*>(rif0);
     uint32_t pivot;
     int eq_needed;
     block_select_stream<RAGGED>(ri4, n4, len, k_out, s_hist, s_red, s_scan, pivot, eq_needed);
@@ -280,12 +283,13 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
     }
     __syncthreads();
     const float* rif = reinterpret_cast<const float*>(ri4);
-    block_gather_topk(
+    block_gather_topk<WRITE_VALUES>(
         len,
         pivot,
         k_out - eq_needed,
         eq_needed,
         out,
+        out_val,
         s_wgt,
         s_weq,
         [&](int i) { return fp32_to_sortable(rif[i]); },
@@ -293,7 +297,7 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
     if(RAGGED && k_out < K)
     {
         __syncthreads();
-        pad_topk_tail(out, k_out, K);
+        pad_topk_tail<WRITE_VALUES>(out, out_val, k_out, K);
     }
 }
 
@@ -653,7 +657,7 @@ __global__
 // unconditionally and halves occupancy (measured 0.6215 -> 0.6702 ms); making
 // the main config pay the runtime split instead costs the +0.6% that the
 // runtime base offset adds (measured 0.6254 vs 0.6215 ms).
-template <bool STATIC_CAP, bool RAGGED>
+template <bool STATIC_CAP, bool RAGGED, bool WRITE_VALUES>
 __global__ void phase_c_select_waveseg(const float* __restrict__ input,
                                        int pitch,
                                        const int* __restrict__ row_ends,
@@ -664,7 +668,7 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
                                        int nwaves_b,
                                        int K,
                                        int cap,
-                                       int* __restrict__ out_idx,
+                                       TopkOut<WRITE_VALUES> dst,
                                        int* __restrict__ fb_rows,
                                        int* __restrict__ fb_count,
                                        int npasses)
@@ -687,7 +691,8 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
     __shared__ int s_off[MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_wgt, s_weq;
 
-    int* out_row = out_idx + (size_t)row * K;
+    int* out_row   = dst.idx_row(row, K);
+    float* val_row = dst.val_row(row, K);
     // `len <= K` is routed unconditionally rather than via cand_count, so the
     // identity emit does not depend on how many candidates Phase B happened to
     // keep: under the `inf` distribution a row of +inf values passes the +inf
@@ -697,8 +702,8 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
     {
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;
-        exact_row_select<RAGGED>(
-            input, pitch, len, K, row, out_row, s_hist, s_red, s_scan, &s_wgt, &s_weq);
+        exact_row_select<RAGGED, WRITE_VALUES>(
+            input, pitch, len, K, row, out_row, val_row, s_hist, s_red, s_scan, &s_wgt, &s_weq);
         return;
     }
     const int c = (int)c_raw;
@@ -747,12 +752,13 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
                      npasses,
                      /*prefix_skip=*/true);
 
-    block_gather_topk(
+    block_gather_topk<WRITE_VALUES>(
         c,
         pivot,
         k_out - eq_needed,
         eq_needed,
         out_row,
+        val_row,
         &s_wgt,
         &s_weq,
         [&](int i) { return s_keys[i]; },
@@ -760,7 +766,7 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
     if(RAGGED && k_out < K)
     {
         __syncthreads();
-        pad_topk_tail(out_row, k_out, K);
+        pad_topk_tail<WRITE_VALUES>(out_row, val_row, k_out, K);
     }
 }
 
@@ -769,14 +775,14 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
 // --pipeline direct as the independent oracle; the fused path folds the same
 // work into Phase C to save a dispatch.
 // ---------------------------------------------------------------------------
-template <bool RAGGED>
+template <bool RAGGED, bool WRITE_VALUES>
 __global__ __launch_bounds__(1024) void phase_d_fallback(const float* __restrict__ input,
                                                          int pitch,
                                                          const int* __restrict__ row_ends,
                                                          int K,
                                                          const int* __restrict__ fb_rows,
                                                          const int* __restrict__ fb_count,
-                                                         int* __restrict__ out_idx)
+                                                         TopkOut<WRITE_VALUES> dst)
 {
     const int count = *fb_count;
 
@@ -790,17 +796,18 @@ __global__ __launch_bounds__(1024) void phase_d_fallback(const float* __restrict
     {
         const int row = fb_rows[slot];
         const int len = row_len_dev(row, pitch, row_ends);
-        exact_row_select<RAGGED>(input,
-                                 pitch,
-                                 len,
-                                 K,
-                                 row,
-                                 out_idx + (size_t)row * K,
-                                 s_hist,
-                                 s_red,
-                                 s_scan,
-                                 &s_wgt,
-                                 &s_weq);
+        exact_row_select<RAGGED, WRITE_VALUES>(input,
+                                               pitch,
+                                               len,
+                                               K,
+                                               row,
+                                               dst.idx_row(row, K),
+                                               dst.val_row(row, K),
+                                               s_hist,
+                                               s_red,
+                                               s_scan,
+                                               &s_wgt,
+                                               &s_weq);
         __syncthreads();
     }
 }
@@ -930,25 +937,53 @@ static int small_n_block(int M, int N)
         M, SMALL_N_STATIC_LDS + N * (int)sizeof(uint32_t), std::max(1, (N / FP32_EPT) / WAVE_SIZE));
 }
 
-template <bool RAGGED>
-static void topk_small_n(
-    const float* d_in, int M, int pitch, const int* d_row_ends, int K, int* d_idx, hipStream_t s)
+// Builds the output bundle for the requested instantiation. The WRITE_VALUES
+// =false form ignores d_val, so a stray non-null pointer cannot quietly turn
+// into stores the caller did not ask for.
+template <bool WRITE_VALUES>
+static TopkOut<WRITE_VALUES> make_topk_out(int* d_idx, float* d_val);
+
+template <>
+TopkOut<false> make_topk_out<false>(int* d_idx, float*)
+{ return TopkOut<false>{d_idx}; }
+
+template <>
+TopkOut<true> make_topk_out<true>(int* d_idx, float* d_val)
+{ return TopkOut<true>{d_idx, d_val}; }
+
+template <bool RAGGED, bool WRITE_VALUES>
+static void topk_small_n(const float* d_in,
+                         int M,
+                         int pitch,
+                         const int* d_row_ends,
+                         int K,
+                         int* d_idx,
+                         float* d_val,
+                         hipStream_t s)
 {
-    phase_small_n_topk<RAGGED><<<M, small_n_block(M, pitch), (size_t)pitch * sizeof(uint32_t), s>>>(
-        d_in, pitch, d_row_ends, K, d_idx, g_small_n_passes);
+    phase_small_n_topk<RAGGED, WRITE_VALUES>
+        <<<M, small_n_block(M, pitch), (size_t)pitch * sizeof(uint32_t), s>>>(
+            d_in,
+            pitch,
+            d_row_ends,
+            K,
+            make_topk_out<WRITE_VALUES>(d_idx, d_val),
+            g_small_n_passes);
 }
 
-template <bool RAGGED>
+template <bool RAGGED, bool WRITE_VALUES>
 static void topk_fused_impl(const float* d_in,
                             int M,
                             int pitch,
                             const int* d_row_ends,
                             int K,
                             int* d_idx,
+                            float* d_val,
                             Bufs& b,
                             const ShapeParams& sp,
                             hipStream_t s)
 {
+    const auto dst       = make_topk_out<WRITE_VALUES>(d_idx, d_val);
     const int S          = sp.S;
     const float margin   = sp.margin;
     const int rank       = g_sample_rank > 0 ? g_sample_rank : sp.rank;
@@ -1042,59 +1077,86 @@ static void topk_fused_impl(const float* d_in,
     {
         const size_t lds_c =
             (size_t)cap * (sp.keys_only_c ? sizeof(uint32_t) : sizeof(uint32_t) + sizeof(int));
-        phase_c_select_contig<RAGGED><<<M, c_block, lds_c, s>>>(d_in,
-                                                                pitch,
-                                                                d_row_ends,
-                                                                b.cand_pack,
-                                                                b.cand_reserved,
-                                                                b.cand_bad,
-                                                                b.cand_count,
-                                                                cap,
-                                                                K,
-                                                                d_idx,
-                                                                b.fb_rows,
-                                                                b.fb_count,
-                                                                g_phase_c_passes,
-                                                                sp.keys_only_c);
+        phase_c_select_contig<RAGGED, WRITE_VALUES><<<M, c_block, lds_c, s>>>(d_in,
+                                                                              pitch,
+                                                                              d_row_ends,
+                                                                              b.cand_pack,
+                                                                              b.cand_reserved,
+                                                                              b.cand_bad,
+                                                                              b.cand_count,
+                                                                              cap,
+                                                                              K,
+                                                                              dst,
+                                                                              b.fb_rows,
+                                                                              b.fb_count,
+                                                                              g_phase_c_passes,
+                                                                              sp.keys_only_c);
     }
     else if(cap <= PHASE_C_CAP)
     {
-        phase_c_select_waveseg<true, RAGGED><<<M, c_block, 0, s>>>(d_in,
-                                                                   pitch,
-                                                                   d_row_ends,
-                                                                   b.cand_pack,
-                                                                   b.cand_seg,
-                                                                   b.cand_count,
-                                                                   seg_stride,
-                                                                   nwaves_b,
-                                                                   K,
-                                                                   cap,
-                                                                   d_idx,
-                                                                   b.fb_rows,
-                                                                   b.fb_count,
-                                                                   g_phase_c_passes);
+        phase_c_select_waveseg<true, RAGGED, WRITE_VALUES><<<M, c_block, 0, s>>>(d_in,
+                                                                                 pitch,
+                                                                                 d_row_ends,
+                                                                                 b.cand_pack,
+                                                                                 b.cand_seg,
+                                                                                 b.cand_count,
+                                                                                 seg_stride,
+                                                                                 nwaves_b,
+                                                                                 K,
+                                                                                 cap,
+                                                                                 dst,
+                                                                                 b.fb_rows,
+                                                                                 b.fb_count,
+                                                                                 g_phase_c_passes);
     }
     else
     {
         const size_t lds_c = (size_t)cap * (sizeof(uint32_t) + sizeof(int));
-        phase_c_select_waveseg<false, RAGGED><<<M, c_block, lds_c, s>>>(d_in,
-                                                                        pitch,
-                                                                        d_row_ends,
-                                                                        b.cand_pack,
-                                                                        b.cand_seg,
-                                                                        b.cand_count,
-                                                                        seg_stride,
-                                                                        nwaves_b,
-                                                                        K,
-                                                                        cap,
-                                                                        d_idx,
-                                                                        b.fb_rows,
-                                                                        b.fb_count,
-                                                                        g_phase_c_passes);
+        phase_c_select_waveseg<false, RAGGED, WRITE_VALUES>
+            <<<M, c_block, lds_c, s>>>(d_in,
+                                       pitch,
+                                       d_row_ends,
+                                       b.cand_pack,
+                                       b.cand_seg,
+                                       b.cand_count,
+                                       seg_stride,
+                                       nwaves_b,
+                                       K,
+                                       cap,
+                                       dst,
+                                       b.fb_rows,
+                                       b.fb_count,
+                                       g_phase_c_passes);
     }
 
     (void)margin;
     (void)gx;
+}
+
+// RAGGED and WRITE_VALUES are both compile-time, so a runtime dispatcher has to
+// pick one of four instantiations. It is expanded in ONE place, here, rather
+// than at each launch site: the four phase kernels would otherwise each carry
+// the same 4-way if-tree, and the launch-site version is where a missed branch
+// silently runs the wrong instantiation.
+template <bool RAGGED, bool WRITE_VALUES>
+static void topk_indices_inst(const float* d_in,
+                              int M,
+                              int pitch,
+                              const int* d_row_ends,
+                              int K,
+                              int* d_idx,
+                              float* d_val,
+                              Bufs& b,
+                              const ShapeParams& sp,
+                              hipStream_t s)
+{
+    const int* re = RAGGED ? d_row_ends : nullptr;
+    if(sp.path == PATH_SMALL_N)
+    {
+        topk_small_n<RAGGED, WRITE_VALUES>(d_in, M, pitch, re, K, d_idx, d_val, s);
+        return;
+    }
+    topk_fused_impl<RAGGED, WRITE_VALUES>(d_in, M, pitch, re, K, d_idx, d_val, b, sp, s);
 }
 
 static void topk_indices(const float* d_in,
@@ -1103,6 +1165,7 @@ static void topk_indices(const float* d_in,
                          const int* d_row_ends,
                          int K,
                          int* d_idx,
+                         float* d_val,
                          Bufs& b,
                          int smc,
                          hipStream_t s)
@@ -1111,18 +1174,20 @@ static void topk_indices(const float* d_in,
     ShapeParams sp   = derive_shape_params(
         M, pitch, k_geom, g_margin, g_sample_s, g_coop_g, (TopkPath)g_path_override);
     g_sample_s = sp.S > 0 ? sp.S : g_sample_s;
-    if(sp.path == PATH_SMALL_N)
-    {
-        if(g_ragged)
-            topk_small_n<true>(d_in, M, pitch, d_row_ends, K, d_idx, s);
-        else
-            topk_small_n<false>(d_in, M, pitch, nullptr, K, d_idx, s);
-        return;
-    }
     if(g_ragged)
-        topk_fused_impl<true>(d_in, M, pitch, d_row_ends, K, d_idx, b, sp, s);
+    {
+        if(d_val)
+            topk_indices_inst<true, true>(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, sp, s);
+        else
+            topk_indices_inst<true, false>(d_in, M, pitch, d_row_ends, K, d_idx, nullptr, b, sp, s);
+    }
     else
-        topk_fused_impl<false>(d_in, M, pitch, nullptr, K, d_idx, b, sp, s);
+    {
+        if(d_val)
+            topk_indices_inst<false, true>(d_in, M, pitch, nullptr, K, d_idx, d_val, b, sp, s);
+        else
+            topk_indices_inst<false, false>(d_in, M, pitch, nullptr, K, d_idx, nullptr, b, sp, s);
+    }
     (void)smc;
 }
 
@@ -1132,10 +1197,11 @@ static void topk_fused(const float* d_in,
                        const int* d_row_ends,
                        int K,
                        int* d_idx,
+                       float* d_val,
                        Bufs& b,
                        int smc,
                        hipStream_t s)
-{ topk_indices(d_in, M, pitch, d_row_ends, K, d_idx, b, smc, s); }
+{ topk_indices(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, smc, s); }
 
 static void topk_direct(const float* d_in,
                         int M,
@@ -1143,16 +1209,45 @@ static void topk_direct(const float* d_in,
                         const int* d_row_ends,
                         int K,
                         int* d_idx,
+                        float* d_val,
                         Bufs& b,
                         hipStream_t s)
 {
     fill_identity_rows<<<(M + 255) / 256, 256, 0, s>>>(b.fb_rows, b.fb_count, M);
+    const dim3 g(1, FB_GRID);
     if(g_ragged)
-        phase_d_fallback<true><<<dim3(1, FB_GRID), 1024, 0, s>>>(
-            d_in, pitch, d_row_ends, K, b.fb_rows, b.fb_count, d_idx);
+    {
+        if(d_val)
+            phase_d_fallback<true, true><<<g, 1024, 0, s>>>(d_in,
+                                                            pitch,
+                                                            d_row_ends,
+                                                            K,
+                                                            b.fb_rows,
+                                                            b.fb_count,
+                                                            make_topk_out<true>(d_idx, d_val));
+        else
+            phase_d_fallback<true, false><<<g, 1024, 0, s>>>(d_in,
+                                                             pitch,
+                                                             d_row_ends,
+                                                             K,
+                                                             b.fb_rows,
+                                                             b.fb_count,
+                                                             make_topk_out<false>(d_idx, nullptr));
+    }
     else
-        phase_d_fallback<false><<<dim3(1, FB_GRID), 1024, 0, s>>>(
-            d_in, pitch, nullptr, K, b.fb_rows, b.fb_count, d_idx);
+    {
+        if(d_val)
+            phase_d_fallback<false, true><<<g, 1024, 0, s>>>(
+                d_in, pitch, nullptr, K, b.fb_rows, b.fb_count, make_topk_out<true>(d_idx, d_val));
+        else
+            phase_d_fallback<false, false><<<g, 1024, 0, s>>>(d_in,
+                                                              pitch,
+                                                              nullptr,
+                                                              K,
+                                                              b.fb_rows,
+                                                              b.fb_count,
+                                                              make_topk_out<false>(d_idx, nullptr));
+    }
 }
 
 static void run_topk(const float* d_in,
@@ -1161,14 +1256,15 @@ static void run_topk(const float* d_in,
                      const int* d_row_ends,
                      int K,
                      int* d_idx,
+                     float* d_val,
                      Bufs& b,
                      int smc,
                      hipStream_t s)
 {
     if(g_pipeline_direct)
-        topk_direct(d_in, M, pitch, d_row_ends, K, d_idx, b, s);
+        topk_direct(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, s);
     else
-        topk_fused(d_in, M, pitch, d_row_ends, K, d_idx, b, smc, s);
+        topk_fused(d_in, M, pitch, d_row_ends, K, d_idx, d_val, b, smc, s);
 }
 
 // aiter op entry for the AVO fp32 per-row top-k kernels.
@@ -1313,9 +1409,13 @@ void top_k_per_row_prefill_avo(const aiter_tensor_t& logits,
                 "top_k_per_row_prefill_avo: indices must be int32");
     AITER_CHECK(indices.numel() >= static_cast<size_t>(numRows) * static_cast<size_t>(k),
                 "top_k_per_row_prefill_avo: indices must hold numRows*k entries");
-    AITER_CHECK(!values.has_value(),
-                "top_k_per_row_prefill_avo: these kernels emit indices only; pass "
-                "values=None (the selected scores are a gather away on the caller side)");
+    if(values.has_value())
+    {
+        AITER_CHECK(values.value().dtype() == AITER_DTYPE_fp32,
+                    "top_k_per_row_prefill_avo: values must be fp32");
+        AITER_CHECK(values.value().numel() >= static_cast<size_t>(numRows) * static_cast<size_t>(k),
+                    "top_k_per_row_prefill_avo: values must hold numRows*k entries");
+    }
     AITER_CHECK(rowStarts.numel() >= static_cast<size_t>(numRows) &&
                     rowEnds.numel() >= static_cast<size_t>(numRows),
                 "top_k_per_row_prefill_avo: rowStarts/rowEnds must have numRows entries");
@@ -1340,10 +1440,14 @@ void top_k_per_row_prefill_avo(const aiter_tensor_t& logits,
     const float* in      = static_cast<const float*>(logits.data_ptr());
     const int* row_ends  = static_cast<const int*>(rowEnds.data_ptr());
     int* idx             = static_cast<int*>(indices.data_ptr());
+    float* val = values.has_value() ? static_cast<float*>(values.value().data_ptr()) : nullptr;
 
     if(sp.path == PATH_SMALL_N)
     {
-        topk_small_n<true>(in, M, N, row_ends, K, idx, stream);
+        if(val)
+            topk_small_n<true, true>(in, M, N, row_ends, K, idx, val, stream);
+        else
+            topk_small_n<true, false>(in, M, N, row_ends, K, idx, nullptr, stream);
         return;
     }
 
@@ -1353,5 +1457,8 @@ void top_k_per_row_prefill_avo(const aiter_tensor_t& logits,
                 workspace.value().numel() * workspace.value().element_size(),
                 L.total);
     Bufs b = avo::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
-    topk_fused_impl<true>(in, M, N, row_ends, K, idx, b, sp, stream);
+    if(val)
+        topk_fused_impl<true, true>(in, M, N, row_ends, K, idx, val, b, sp, stream);
+    else
+        topk_fused_impl<true, false>(in, M, N, row_ends, K, idx, nullptr, b, sp, stream);
 }

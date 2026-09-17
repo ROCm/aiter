@@ -100,10 +100,57 @@ __device__ __forceinline__ int n4_cover(int len) { return (len + FP32_EPT - 1) /
 
 __device__ __forceinline__ int k_take_dev(int K, int len) { return len < K ? len : K; }
 
-__device__ __forceinline__ void pad_topk_tail(int* out, int k_take, int K)
+// The two output buffers, bundled so that the SIZE of the kernel argument
+// depends on WRITE_VALUES.
+//
+// This is not tidiness. The no-values instantiation has to be kernarg-IDENTICAL
+// to the version from before values existed, not merely free of the stores: one
+// extra UNUSED float* kernarg on phase_small_n_topk alone, with no other change
+// at all, moved the small_n geomean from 28.51/28.54 to 28.82/28.85 us (+1.0%,
+// two runs each, interleaved A/B on this box), which is over the scoring gate's
+// 0.5% band. small_n runs one short block per row, so its kernarg prologue is a
+// real share of the kernel rather than noise.
+//
+// TopkOut<false> holds a single pointer, so it is 8 bytes with 8-byte alignment
+// -- exactly the `int* out_idx` it replaces -- and every later argument keeps
+// its old offset. Only a caller that asks for values pays the extra 8.
+template <bool WRITE_VALUES>
+struct TopkOut;
+
+template <>
+struct TopkOut<false>
+{
+    int* idx;
+    __device__ __forceinline__ int* idx_row(int row, int K) const { return idx + (size_t)row * K; }
+    __device__ __forceinline__ float* val_row(int, int) const { return nullptr; }
+};
+
+template <>
+struct TopkOut<true>
+{
+    int* idx;
+    float* val;
+    __device__ __forceinline__ int* idx_row(int row, int K) const { return idx + (size_t)row * K; }
+    __device__ __forceinline__ float* val_row(int row, int K) const
+    { return val + (size_t)row * K; }
+};
+
+// The value padding is -inf, NOT 0, and that is aiter's rule rather than a
+// preference (topk_per_row_kernels.cu:2249 states it): the index slot is -1, so
+// its score has to sort below every real one. Logits are routinely negative, so
+// a 0.0 pad outranks them, and a consumer that ranks these scores -- DCP merges
+// the exchanged top-k across ranks -- would let padding steal a real
+// candidate's slot.
+template <bool WRITE_VALUES>
+__device__ __forceinline__ void
+pad_topk_tail(int* __restrict__ out, float* __restrict__ out_val, int k_take, int K)
 {
     for(int i = k_take + threadIdx.x; i < K; i += blockDim.x)
+    {
         out[i] = -1;
+        if(WRITE_VALUES)
+            out_val[i] = -__builtin_inff();
+    }
 }
 
 // A row with row_len <= K has every element selected, so there is nothing to
@@ -116,10 +163,24 @@ __device__ __forceinline__ void pad_topk_tail(int* out, int k_take, int K)
 //
 // rowStarts is zero by this op's contract, so the column index IS the output
 // index; aiter adds rowStart here.
-__device__ __forceinline__ void emit_identity_row(int* __restrict__ out, int len, int K)
+//
+// This is the one emit path that has to READ the row to produce values: there
+// is no select here, so no key is sitting in a register the way it is inside
+// block_gather_topk. aiter reads the row here too.
+template <bool WRITE_VALUES>
+__device__ __forceinline__ void emit_identity_row(int* __restrict__ out,
+                                                  float* __restrict__ out_val,
+                                                  const float* __restrict__ row,
+                                                  int len,
+                                                  int K)
 {
     for(int i = threadIdx.x; i < K; i += blockDim.x)
-        out[i] = (i < len) ? i : -1;
+    {
+        const bool live = (i < len);
+        out[i]          = live ? i : -1;
+        if(WRITE_VALUES)
+            out_val[i] = live ? row[i] : -__builtin_inff();
+    }
 }
 
 // LDS capacity for the Phase C candidate set (keys + indices).
@@ -282,12 +343,20 @@ __device__ __host__ __forceinline__ int common_prefix_passes(uint32_t mn, uint32
 // address inside every Phase C block.
 //
 // KeyFn(i) -> sortable key, IdxFn(i) -> output index. All threads must call.
-template <typename KeyFn, typename IdxFn>
+//
+// WRITE_VALUES costs one store per emitted element and NOT a second read of the
+// row: the key is already in a register here, and sortable_to_fp32() inverts
+// fp32_to_sortable_bits() exactly (both are bijective bit ops, same file), so
+// the selected score is recovered arithmetically. Every caller's KeyFn yields a
+// sortable key -- s_keys / s_keys_ext are stored that way, and the streaming
+// path applies fp32_to_sortable() in its lambda -- so this holds on all four.
+template <bool WRITE_VALUES, typename KeyFn, typename IdxFn>
 __device__ __forceinline__ void block_gather_topk(int c,
                                                   uint32_t pivot,
                                                   int ngt,
                                                   int eq_needed,
                                                   int* __restrict__ out,
+                                                  float* __restrict__ out_val,
                                                   unsigned* __restrict__ s_wgt,
                                                   unsigned* __restrict__ s_weq,
                                                   KeyFn key_at,
@@ -320,13 +389,21 @@ __device__ __forceinline__ void block_gather_topk(int c,
         {
             unsigned p = baseg + (unsigned)__popcll(bg & lt);
             if(p < (unsigned)ngt)
+            {
                 out[p] = idx_at(i);
+                if(WRITE_VALUES)
+                    out_val[p] = sortable_to_fp32(k);
+            }
         }
         if(eq)
         {
             unsigned p = basee + (unsigned)__popcll(be & lt);
             if(p < (unsigned)eq_needed)
+            {
                 out[ngt + p] = idx_at(i);
+                if(WRITE_VALUES)
+                    out_val[ngt + p] = sortable_to_fp32(k);
+            }
         }
     }
 }

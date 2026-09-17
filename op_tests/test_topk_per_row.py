@@ -278,6 +278,7 @@ def test_top_k_per_row_prefill(
     top_k: int,
     data_generation: str = "random",
     backend: str = "aiter",
+    write_values: bool = False,
 ) -> dict:
     """
     Test topk_per_row_prefill.
@@ -286,6 +287,10 @@ def test_top_k_per_row_prefill(
     "avo" for the topk-prefill-avo kernels. Both go through the same data,
     the same torch.topk reference and the same @perftest timing, so the `us`
     column is comparable across the two rows of the summary table.
+
+    `write_values` also requests the selected scores. They are checked by
+    gathering the logits at the indices the SAME call returned, so a score that
+    is self-consistently wrong cannot pass.
     """
     ret = {}
     torch.set_default_device("cuda:0")
@@ -298,8 +303,11 @@ def test_top_k_per_row_prefill(
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-
-    torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
+    values = (
+        torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+        if write_values
+        else None
+    )
 
     # The avo kernels honour rowEnds per row and emit indices only, so record
     # the shortest row: it is what exercises the per-row extent and the -1
@@ -307,6 +315,7 @@ def test_top_k_per_row_prefill(
     min_row_len = int((row_ends - row_starts).min())
     ret["backend"] = backend
     ret["min_row_len"] = min_row_len
+    ret["write_values"] = write_values
     if backend == "avo":
         if not aiter.topk_avo_supports(num_rows, logits.stride(0), top_k):
             ret["context_len"] = logits.shape[1]
@@ -319,7 +328,7 @@ def test_top_k_per_row_prefill(
             row_starts,
             row_ends,
             indices,
-            None,  # values: these kernels emit indices only
+            values,
             num_rows,
             logits.stride(0),
             logits.stride(1),
@@ -332,7 +341,7 @@ def test_top_k_per_row_prefill(
             row_starts,
             row_ends,
             indices,
-            None,  # values
+            values,
             num_rows,
             logits.stride(0),
             logits.stride(1),
@@ -349,7 +358,7 @@ def test_top_k_per_row_prefill(
 
     # Compare results
     all_close = compare_topk_results(
-        logits, indices, torch_indices, row_starts, row_ends, top_k
+        logits, indices, torch_indices, row_starts, row_ends, top_k, values=values
     )
 
     # measure performance
@@ -580,10 +589,19 @@ for data_generation in args.data_generation:
         for k in args.top_k:
             for num_prefix in args.num_prefix:
                 for backend in args.prefill_backend:
-                    ret = test_top_k_per_row_prefill(
-                        m, num_prefix, k, data_generation, backend=backend
-                    )
-                    df.append(ret)
+                    # Both ways round, matching the decode loop: the value
+                    # stores are a separate instantiation of the output
+                    # kernels, so skipping one leaves half of them untested.
+                    for write_values in (False, True):
+                        ret = test_top_k_per_row_prefill(
+                            m,
+                            num_prefix,
+                            k,
+                            data_generation,
+                            backend=backend,
+                            write_values=write_values,
+                        )
+                        df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)

@@ -468,11 +468,16 @@ def top_k_per_row_prefill_avo(
     in-tree pins whether a nonzero start means the index is relative to the row
     or absolute in the buffer.
 
-    One restriction, reported rather than assumed: `values` must be None, as
-    these kernels emit indices only (the selected scores are a gather away on
-    the caller side). Call topk_avo_supports() first -- the shapes it declines
-    (k above the Phase C LDS cap, a row width that is not a multiple of 4)
-    raise rather than fall back."""
+    `values` is optional: pass an fp32 numRows*k tensor to also receive the
+    selected scores, or None to skip the stores entirely (it is a template
+    parameter on the four output kernels, not a runtime branch). Padded slots
+    get -inf rather than 0, matching top_k_per_row_prefill, so a consumer that
+    ranks these scores across ranks cannot have padding outrank a real
+    negative logit.
+
+    Call topk_avo_supports() first -- the shapes it declines (k above the
+    Phase C LDS cap, a row width that is not a multiple of 4) raise rather
+    than fall back."""
     size = topk_avo_workspace_size(numRows, stride0, k)
     workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_prefill_avo(
