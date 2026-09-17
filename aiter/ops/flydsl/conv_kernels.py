@@ -27,7 +27,7 @@ import weakref
 import torch
 
 from .conv3d_tuned_config import _lookup_tuned_tile, _num_cu, _pick_tile, _pick_wgm
-from .kernels.conv3d_common import _dispatch
+from .kernels.conv3d_common import _as_stream
 from .kernels.conv3d_implicit import (
     DEFAULT_TILE,
     LDG_VEC,
@@ -36,7 +36,38 @@ from .kernels.conv3d_implicit import (
     TILE_K,
     compile_conv3d_implicit,
 )
-from .kernels.conv3d_transpose import _ncdhw_to_ndhwc
+from .kernels.conv3d_transpose import (
+    TR_MAX_BIG_S,
+    TR_VEC,
+    compile_transpose_ncdhw_ndhwc,
+)
+
+
+def _dispatch(exe, *args, stream=None):
+    """Run a builder's launcher, pre-compiling on first use."""
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        exe._cf = exe.compile(*args, stream=stream)
+        return
+    cf(*args, _as_stream(stream))
+
+
+def _ncdhw_to_ndhwc(x, stream):
+    """Fast NCDHW->NDHWC via the tiled transpose kernel; falls back to torch."""
+    n, c, t, h, w = x.shape
+    s = t * h * w
+    big = n * c * s > 0x7FFFFFFF
+    if not (x.is_contiguous() and x.dtype == torch.bfloat16 and c % TR_VEC == 0):
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+    if big and s > TR_MAX_BIG_S:
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+    out = torch.empty((n, t, h, w, c), device=x.device, dtype=x.dtype)
+    exe = compile_transpose_ncdhw_ndhwc(n, c, s)
+    _dispatch(
+        exe, out, x, stream=torch.cuda.current_stream() if stream is None else stream
+    )
+    return out
+
 
 _WEIGHT_CACHE = {}
 

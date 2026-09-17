@@ -21,11 +21,10 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .conv3d_common import BF16_BYTES, CONV_COMPILE_HINTS, _as_stream, _dispatch
+from .conv3d_common import BF16_BYTES, CONV_COMPILE_HINTS, _as_stream
 
 TR_TILE = 64
 TR_VEC = 8
@@ -188,20 +187,3 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
 
     _launch.compile = _compile
     return _launch
-
-
-def _ncdhw_to_ndhwc(x, stream):
-    """Fast NCDHW->NDHWC via the tiled transpose kernel; falls back to torch."""
-    n, c, t, h, w = x.shape
-    s = t * h * w
-    big = n * c * s > 0x7FFFFFFF
-    if not (x.is_contiguous() and x.dtype == torch.bfloat16 and c % TR_VEC == 0):
-        return x.permute(0, 2, 3, 4, 1).contiguous()
-    if big and s > TR_MAX_BIG_S:
-        return x.permute(0, 2, 3, 4, 1).contiguous()
-    out = torch.empty((n, t, h, w, c), device=x.device, dtype=x.dtype)
-    exe = compile_transpose_ncdhw_ndhwc(n, c, s)
-    _dispatch(
-        exe, out, x, stream=torch.cuda.current_stream() if stream is None else stream
-    )
-    return out
