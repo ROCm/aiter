@@ -384,6 +384,8 @@ def skinny_gemm(
         ops.wv_splitk_small_fp16_bf16(weights, inp, out, inp.shape[0], get_cu_num())
     if bias is not None:
         out += bias
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
     return out
 
 
@@ -446,6 +448,8 @@ def torch_gemm(
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
     out = F.linear(inp, weights, bias)
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
     return out
 
 
