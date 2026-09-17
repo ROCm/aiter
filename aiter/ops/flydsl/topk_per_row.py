@@ -329,6 +329,10 @@ def flydsl_top_k_per_row_decode(
     _run_compiled(
         launcher,
         logits,
+        # Payload and split counts are merge-only inputs; this build reads
+        # neither, so they bind to tensors that are already resident.
+        logits,
+        seq_lens,
         seq_lens,
         indices,
         values if values is not None else logits,
