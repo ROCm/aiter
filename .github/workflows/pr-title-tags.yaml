@@ -36,7 +36,9 @@ on:
     branches: [main]
 
 permissions:
-  contents: read  # the PR's commit list
+  # No contents scope: nothing here checks out, and every call -- listFiles,
+  # listCommits, listEvents, the assignee probe, addAssignees -- is covered by
+  # the two below.
   pull-requests: write
   issues: write   # labels and assignees on PRs go through the issues API
 
@@ -225,13 +227,27 @@ jobs:
       - name: Assign the PR to everyone who committed to it
         # Add-only, and it honours a removal: contributors can appear at any
         # point, but anyone taken off by hand stays off.
-        if: ${{ vars.PR_ASSIGN_COMMITTERS == 'true' && (contains(fromJSON('["opened", "ready_for_review", "reopened", "synchronize"]'), github.event.action) || (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-title')) }}
+        #
+        # Deliberately not filtered by event action. This workflow cancels its
+        # own in-flight runs, so a label added while this step is running
+        # cancels it, and a step that skipped label events would drop the
+        # assignment until the next push. Running on every event that reaches
+        # here means the replacement run finishes the job; the checks below
+        # make a repeat harmless.
+        if: ${{ vars.PR_ASSIGN_COMMITTERS == 'true' }}
         uses: actions/github-script@v7
         with:
           script: |
             const MAX_ASSIGNEES = 10;   // GitHub's hard cap per PR
 
-            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            // Re-read rather than trust context.payload: that is the state at
+            // event time, and this runs after a queue and the step above it.
+            // A label added in that window would otherwise be invisible, and
+            // the slot count computed against a stale assignee list.
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: context.payload.pull_request.number,
+            });
             if (pr.labels.some(l => l.name === 'no-auto-title')) {
               core.info("Label 'no-auto-title' set — skipping.");
               return;
@@ -243,7 +259,6 @@ jobs:
               return;
             }
 
-            const { owner, repo } = context.repo;
             // The commits on this PR, not the history of the files it
             // touches. `author` is GitHub's own resolution of commit to
             // account -- no email guessing -- and null when none matches.
