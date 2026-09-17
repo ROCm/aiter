@@ -38,6 +38,10 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
     ),
+    "flydsl_flash_attn_fp8_func": (
+        ".kernels.flash_attn_func_fp8_gfx950",
+        "flydsl_flash_attn_fp8_func",
+    ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_fp8_mqa_logits": (
         ".kernels.mqa_logits.fp8_mqa_logits",
@@ -71,6 +75,14 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "gather_kv_b_proj_flydsl": (
+        ".gather_kv_b_proj",
+        "gather_kv_b_proj_flydsl",
+    ),
+    "gather_kv_b_proj_flydsl_supported": (
+        ".gather_kv_b_proj",
+        "gather_kv_b_proj_flydsl_supported",
+    ),
 }
 
 __all__ = [
@@ -79,6 +91,7 @@ __all__ = [
     "GateMode",
     "QuickAllReduceInt4",
     "compute_varqlen_windows",
+    "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
@@ -91,6 +104,8 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "gather_kv_b_proj_flydsl",
+    "gather_kv_b_proj_flydsl_supported",
 ]
 
 
