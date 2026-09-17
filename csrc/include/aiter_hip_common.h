@@ -208,12 +208,14 @@ static inline bool is_gfx1250_asm_supported()
 
 // Kernels verified to ALSO run on gfx1250 A0, matched by EXACT name. Empty
 // today (all shipped gfx1250 asm is B0-only); add an exact kernel name to allow.
+// Keep in sync with _A0_ALLOWLIST in aiter/jit/utils/asm_guard.py, which is
+// keyed by op name instead.
 static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
 {
     if(kernel_name == nullptr)
         return false;
     static const char* const kA0AllowList[] = {
-        nullptr, // sentinel — keep last; add "exact_kernel_name" entries above
+        nullptr, // sentinel -- keep last; add "exact_kernel_name" entries above
     };
     const std::string_view name{kernel_name};
     for(const char* const* p = kA0AllowList; *p != nullptr; ++p)
@@ -242,7 +244,14 @@ class AiterAsmKernelFast
 
     protected:
     AiterAsmKernelFast() = default;
+    // Gate here, not in the ctors: every asm load funnels through init().
     void init(const char* kernel_name, const void* hsaco)
+    {
+        require_gfx1250_asm_or_throw(kernel_name);
+        init_ungated(kernel_name, hsaco);
+    }
+
+    void init_ungated(const char* kernel_name, const void* hsaco)
     {
         aiter_detail::FatBinaryWrapper fat_bin{};
         fat_bin.binary = hsaco;
@@ -268,7 +277,18 @@ class AiterAsmKernelFast
     }
 
     public:
+    // Opt-out tag for OPUS-managed .co: compiler output, not shipped asm, so
+    // the gfx1250 B0-only contract does not apply to it.
+    struct SkipGfx1250Gate
+    {
+    };
+
     AiterAsmKernelFast(const char* kernel_name, const void* hsaco) { init(kernel_name, hsaco); };
+
+    AiterAsmKernelFast(const char* kernel_name, const void* hsaco, SkipGfx1250Gate)
+    {
+        init_ungated(kernel_name, hsaco);
+    };
 
     ~AiterAsmKernelFast() { aiter_detail::__hipUnregisterFatBinary(module); }
 
@@ -471,20 +491,17 @@ class AiterAsmKernel : private AiterAsmKernelFast
     }
 
     public:
-    // Opt-out tag for OPUS-managed .co that reuse this loader but are not gated.
-    struct SkipGfx1250Gate
-    {
-    };
+    // Private inheritance hides the base's tag; re-export it for OPUS callers.
+    using SkipGfx1250Gate = AiterAsmKernelFast::SkipGfx1250Gate;
 
     AiterAsmKernel(const char* kernel_name, const char* hsaco_path)
     {
-        require_gfx1250_asm_or_throw(kernel_name);
         init(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
     };
 
     AiterAsmKernel(const char* kernel_name, const char* hsaco_path, SkipGfx1250Gate)
     {
-        init(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
+        init_ungated(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
     };
 
     using AiterAsmKernelFast::launch_kernel;
@@ -525,16 +542,6 @@ static inline bool is_fp8_ocp_arch()
         if(arch == a)
             return true;
     return false;
-}
-
-// Silicon stepping of the current device: 0=A0, 1=B0, 2=C0, ...
-static inline int get_asic_revision()
-{
-    int dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    return dev_prop.asicRevision;
 }
 
 static uint32_t get_num_cu_func()

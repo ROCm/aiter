@@ -14,7 +14,7 @@ from ..jit.core import (
     compile_ops,
     is_experimental_enabled,
 )
-from ..jit.utils.asm_guard import is_gfx1250_asm_supported
+from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -610,6 +610,7 @@ def fmha_fwd_with_sink_asm(
         allocated even when `return_lse=False`; in that case the contents are
         undefined and callers should ignore the returned `lse`.
     """
+    require_gfx1250_asm("fmha_fwd_with_sink_asm")
     batch, q_seq_len, q_head_num, _qk_head_dim = q.shape
     v_head_dim = v.size(3)
 
@@ -694,6 +695,7 @@ def fmha_fwd_with_sink_varlen_asm(
       * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
         allocated even when `return_lse=False`; in that case ignore the result.
     """
+    require_gfx1250_asm("fmha_fwd_with_sink_varlen_asm")
     q, k, v = (x.contiguous() for x in (q, k, v))
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
@@ -789,6 +791,7 @@ def fmha_fwd_mxfp8_asm(
         (out, lse). The kernel always touches the lse buffer; when
         return_lse=False its contents are undefined and should be ignored.
     """
+    require_gfx1250_asm("fmha_fwd_mxfp8_asm")
     batch, q_seq_len, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(3)
 

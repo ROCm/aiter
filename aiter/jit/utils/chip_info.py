@@ -19,16 +19,17 @@ logger = logging.getLogger("aiter")
 
 
 @functools.lru_cache(maxsize=1)
+def _rocminfo_output() -> str:
+    """rocminfo stdout, run once and shared by every parser below."""
+    rocminfo = executable_path("rocminfo")
+    result = subprocess.run([rocminfo], capture_output=True, text=True, check=True)
+    return result.stdout
+
+
+@functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
     try:
-        rocminfo = executable_path("rocminfo")
-        result = subprocess.run(
-            [rocminfo],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        for line in result.stdout.splitlines():
+        for line in _rocminfo_output().splitlines():
             match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
@@ -107,60 +108,61 @@ def get_gfx_runtime() -> str:
     return gfx_arch
 
 
-def _current_hip_device() -> int:
-    """Current HIP device index (honours HIP_VISIBLE_DEVICES / set_device)."""
-    try:
-        import torch
+@functools.lru_cache(maxsize=1)
+def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
+    """(arch, asicRevision) of every GPU agent rocminfo reports.
 
-        if torch.cuda.is_available():
-            return torch.cuda.current_device()
-    except Exception:  # noqa: BLE001
-        return 0
-    return 0
-
-
-def _asic_revision_via_hip(device_id: int) -> int:
-    # CDLL(None): resolve HIP symbols already loaded by torch, not by soname
-    # (libamdhip64.so isn't under /opt/rocm in a torch-wheel container).
-    # 10012 = hipDeviceAttributeAsicRevision on the ROCm 7.x line aiter targets.
-    import ctypes
-
-    import torch  # noqa: F401  ensure HIP is loaded into the process
-
-    lib = ctypes.CDLL(None)
-    rev = ctypes.c_int(-1)
-    hipDeviceAttributeAsicRevision = 10012
-    err = lib.hipDeviceGetAttribute(
-        ctypes.byref(rev), hipDeviceAttributeAsicRevision, int(device_id)
-    )
-    if err != 0:
-        raise RuntimeError(f"hipDeviceGetAttribute(AsicRevision) failed: {err}")
-    return rev.value
-
-
-def _asic_revision_via_torch(device_id: int) -> int | None:
-    # Version-proof if torch ever exposes asicRevision; None otherwise.
-    try:
-        import torch
-
-        rev = getattr(torch.cuda.get_device_properties(device_id), "asicRevision", None)
-        return None if rev is None else int(rev)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-@functools.cache
-def _asic_revision_cached(device_id: int) -> int:
-    rev = _asic_revision_via_torch(device_id)
-    return rev if rev is not None else _asic_revision_via_hip(device_id)
-
-
-def get_asic_revision() -> int:
-    """Stepping of the current HIP device via HIP (not rocminfo): 0=A0, 1=B0, ...
-
-    Raises on total failure so the asm gate can fail closed.
+    rocminfo's `ASIC Revision:` is HSA_AMD_AGENT_INFO_ASIC_REVISION, the same
+    value hipDeviceGetAttribute(hipDeviceAttributeAsicRevision) returns.
     """
-    return _asic_revision_cached(_current_hip_device())
+    agents: list[tuple[str, int]] = []
+    name = kind = None
+    rev = None
+    for line in _rocminfo_output().splitlines():
+        if re.match(r"^\s*Agent\s+\d+\s*$", line):
+            name = kind = rev = None
+            continue
+        # 2-space indent = agent header; ISA/pool sub-blocks nest deeper.
+        m = re.match(r"^  (Name|Device Type|ASIC Revision):\s+(.*?)\s*$", line)
+        if m is None:
+            continue
+        key, value = m.group(1), m.group(2)
+        if key == "Name" and name is None:
+            # Agent names can carry target-id features ("gfx942:sramecc+").
+            m2 = re.search(r"\b(gfx\w+)\b", value, re.IGNORECASE)
+            name = m2.group(1) if m2 else value
+        elif key == "Device Type":
+            kind = value
+        elif key == "ASIC Revision":
+            rev = int(value.split("(")[0])
+        if kind == "GPU" and name is not None and rev is not None:
+            agents.append((name.lower(), rev))
+            name = kind = rev = None
+    return agents
+
+
+@functools.lru_cache(maxsize=1)
+def get_asic_revision() -> int:
+    """Silicon stepping of this node's GPUs: 0=A0, 1=B0, 2=C0, ...
+
+    Node-wide, not per-device: rocminfo enumerates HSA agents, which
+    HIP_VISIBLE_DEVICES does not filter, so agent index and HIP device index
+    can disagree. The lowest stepping is reported, so the asm gate on a
+    mixed-stepping node fails closed. Raises when nothing can be read.
+    """
+    agents = _rocminfo_gpu_agents()
+    arch = get_gfx_runtime()
+    revs = [rev for name, rev in agents if name == arch]
+    if not revs:
+        raise RuntimeError(
+            f"rocminfo reported no ASIC Revision for a {arch} agent "
+            f"(GPU agents seen: {agents})"
+        )
+    rev = min(revs)
+    # A bogus parse must not read as A0 and disable asm on good silicon.
+    if not 0 <= rev <= 15:
+        raise RuntimeError(f"implausible ASIC Revision {rev} parsed from rocminfo")
+    return rev
 
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
@@ -216,12 +218,7 @@ def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
         try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], capture_output=True, text=True, check=False
-            )
-            output = result.stdout
-            devices = re.split(r"Agent\s*\d+", output)
+            devices = re.split(r"Agent\s*\d+", _rocminfo_output())
             gpu_compute_units = []
             for device in devices:
                 for line in device.split("\n"):

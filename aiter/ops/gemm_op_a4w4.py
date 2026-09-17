@@ -192,6 +192,7 @@ def gemm_a4w4(
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
+        require_gfx1250_asm("gemm_a4w4")
         out = _f4gemm_asm_dispatch(
             A,
             B,
