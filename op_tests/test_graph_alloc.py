@@ -16,7 +16,11 @@ Run:
 import pytest
 import torch
 
-from aiter.utility.graph_alloc import _persistent_pool, persistent_alloc
+from aiter.utility.graph_alloc import (
+    ROUTES_INSIDE_CAPTURE,
+    _persistent_pool,
+    persistent_alloc,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a GPU to capture a graph"
@@ -25,6 +29,10 @@ pytestmark = pytest.mark.skipif(
 BIG, CANARY, NUM_GRAPHS = 1 << 20, 777.0, 4
 
 
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE,
+    reason=f"torch {torch.__version__} ignores use_mem_pool inside a capture",
+)
 def test_buffer_survives_replay_of_graphs_sharing_a_pool():
     device = torch.device("cuda:0")
     pool = torch.cuda.graph_pool_handle()

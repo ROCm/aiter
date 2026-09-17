@@ -21,6 +21,7 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+from ..utility.graph_alloc import persistent_alloc
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -395,7 +396,10 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
 def get_zero_bias_buf_keyed(
     device: torch.device, stream_id: int, out_shape: int
 ) -> Tensor:
-    return torch.zeros(1, out_shape, dtype=torch.float32, device=device)
+    # Allocated from a private MemPool because this key can first miss inside a
+    # CUDA graph capture -- see persistent_alloc.
+    with persistent_alloc(device):
+        return torch.zeros(1, out_shape, dtype=torch.float32, device=device)
 
 
 def get_zero_bias_buf(B: Tensor) -> Tensor:
