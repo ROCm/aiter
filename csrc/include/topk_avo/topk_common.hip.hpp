@@ -90,6 +90,22 @@ constexpr int SAMPLE_S_MAX       = 16384;
 __host__ __device__ inline int sample_chunk_stride(int N, int chunks)
 { return (N / chunks) & ~(FP32_EPT - 1); }
 
+// Per-row extent for ragged rows. row_ends[row] is the exclusive end column
+// (rowStarts must be 0; see topk_aiter_entry.inc.hip). When row_ends is null the
+// row length equals the pitch, which is the uniform-matrix contract.
+__device__ __forceinline__ int row_len_dev(int row, int pitch, const int* row_ends)
+{ return row_ends ? row_ends[row] : pitch; }
+
+__device__ __forceinline__ int n4_cover(int len) { return (len + FP32_EPT - 1) / FP32_EPT; }
+
+__device__ __forceinline__ int k_take_dev(int K, int len) { return len < K ? len : K; }
+
+__device__ __forceinline__ void pad_topk_tail(int* out, int k_take, int K)
+{
+    for(int i = k_take + threadIdx.x; i < K; i += blockDim.x)
+        out[i] = -1;
+}
+
 // LDS capacity for the Phase C candidate set (keys + indices).
 constexpr int PHASE_C_CAP = 4096; // 4096 * (4+4) B = 32 KB LDS
 

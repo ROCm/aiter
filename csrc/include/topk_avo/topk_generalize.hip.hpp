@@ -20,13 +20,17 @@
 // GPU kernels for generalized top-k paths. Include AFTER block_select_lds / block_gather_topk
 // are visible in the translation unit.
 
-__global__ void phase_small_n_topk(
-    const float* __restrict__ input, int N, int K, int* __restrict__ out_idx, int npasses)
+template <bool RAGGED>
+__global__ void phase_small_n_topk(const float* __restrict__ input,
+                                   int pitch,
+                                   const int* __restrict__ row_ends,
+                                   int K,
+                                   int* __restrict__ out_idx,
+                                   int npasses)
 {
     const int row   = blockIdx.x;
-    const float* ri = input + (size_t)row * N;
-    // No index array: the whole row is resident, so LDS slot i IS column i. A
-    // [N_LDS_MAX] index array would cost 32 KB of LDS to store the identity.
+    const int len   = row_len_dev(row, pitch, row_ends);
+    const float* ri = input + (size_t)row * pitch;
     extern __shared__ uint32_t s_keys[];
     __shared__ uint32_t s_hist[HIST_SLOTS];
     __shared__ uint32_t s_red[256];
@@ -34,7 +38,7 @@ __global__ void phase_small_n_topk(
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_wgt, s_weq;
 
-    const int n4 = N / FP32_EPT;
+    const int n4 = RAGGED ? n4_cover(len) : (pitch / FP32_EPT);
     for(int u = threadIdx.x; u < n4; u += blockDim.x)
     {
         vfloat4 v        = *(reinterpret_cast<const vfloat4*>(ri) + u);
@@ -46,9 +50,11 @@ __global__ void phase_small_n_topk(
     }
     __syncthreads();
 
+    const int k_out = RAGGED ? k_take_dev(K, len) : K;
     uint32_t pivot;
     int eq_needed;
-    block_select_lds(s_keys, N, K, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses, true);
+    block_select_lds(
+        s_keys, len, k_out, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses, true);
 
     int* out = out_idx + (size_t)row * K;
     if(threadIdx.x == 0)
@@ -58,19 +64,26 @@ __global__ void phase_small_n_topk(
     }
     __syncthreads();
     block_gather_topk(
-        N,
+        len,
         pivot,
-        K - eq_needed,
+        k_out - eq_needed,
         eq_needed,
         out,
         &s_wgt,
         &s_weq,
         [&](int i) { return s_keys[i]; },
         [](int i) { return i; });
+    if(RAGGED && k_out < K)
+    {
+        __syncthreads();
+        pad_topk_tail(out, k_out, K);
+    }
 }
 
+template <bool RAGGED>
 __global__ void phase_b_filter_coop(const float* __restrict__ input,
-                                    int N,
+                                    int pitch,
+                                    const int* __restrict__ row_ends,
                                     int n4_per_row,
                                     const float* __restrict__ threshold_f,
                                     uint64_t* __restrict__ cand_pack,
@@ -79,8 +92,8 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     int cap)
 {
     const int row     = blockIdx.y;
-    const int bid     = blockIdx.x;
-    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * N);
+    const int len     = row_len_dev(row, pitch, row_ends);
+    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch);
     const float th    = threshold_f[row];
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
     const int wid     = threadIdx.x / WAVE_SIZE;
@@ -93,37 +106,15 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     (void)nwaves;
 
     const int G        = gridDim.x;
+    const int bid      = blockIdx.x;
     const int chunk_n4 = (n4_per_row + G - 1) / G;
     const int i0       = bid * chunk_n4;
     const int i1       = min(i0 + chunk_n4, n4_per_row);
     const int stride   = blockDim.x;
-    // All lanes must run the same number of iterations: with
-    // `for (i = i0 + tid; i < i1; i += stride)` the tail iteration leaves some
-    // lanes inactive, and then __ballot sees only the active lanes, so bcnt stops
-    // being wave-uniform and every flush offset below is wrong. Mask with `live`
-    // instead, exactly as phase_b_filter_wavestage does.
-    const int iters = (i1 > i0) ? ((i1 - i0) + stride - 1) / stride : 0;
+    const int iters    = (i1 > i0) ? ((i1 - i0) + stride - 1) / stride : 0;
 
     int bcnt = 0;
 
-    // Overflow valve, NOT the normal path. The original version accumulated the
-    // block's whole chunk into `buf` with no bound check against WSTAGE_CAP=320,
-    // so any wave producing more than 320 passers wrote into the next wave's
-    // slice and the last wave wrote past wbuf onto the count variables (measured:
-    // M=128 N=65536 adversarial -> rows_fail=4, 124 rows with garbage counts that
-    // CHANGED between identical runs).
-    //
-    // Draining per-wave on every >=64 candidates fixes that but is 1.5-2x slower
-    // (M=8 N=524288: 34.8 -> 54.0 us), because at normal density a wave holds
-    // only ~6 candidates, so every wave ends up doing one 48-byte scattered write
-    // instead of the block doing one contiguous ~400-byte write. Small scattered
-    // stores are this kernel's known pathology.
-    //
-    // So: keep the block-level aggregation below as the fast path, and only drain
-    // a wave mid-loop when its buffer is actually about to overflow. An iteration
-    // can add at most 4*64 = 256, so draining once bcnt exceeds
-    // WSTAGE_CAP - 256 = 64 keeps the write in bounds. At normal density bcnt
-    // never reaches that and the valve never fires.
 #define COOP_DRAIN_WAVE()                                          \
     do                                                             \
     {                                                              \
@@ -150,17 +141,17 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         const bool live = (i < i1);
         if(live)
             v = load_f4(ri + i);
-        const uint64_t b0 = __ballot(live && !(v[0] < th));
-        const uint64_t b1 = __ballot(live && !(v[1] < th));
-        const uint64_t b2 = __ballot(live && !(v[2] < th));
-        const uint64_t b3 = __ballot(live && !(v[3] < th));
-        const int t0      = __popcll(b0);
-        const int t1      = t0 + __popcll(b1);
-        const int t2      = t1 + __popcll(b2);
-        const int wtotal  = t2 + __popcll(b3);
+        const int base_idx = i * FP32_EPT;
+        const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
+        const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));
+        const uint64_t b2  = __ballot(live && !(v[2] < th) && (!RAGGED || base_idx + 2 < len));
+        const uint64_t b3  = __ballot(live && !(v[3] < th) && (!RAGGED || base_idx + 3 < len));
+        const int t0       = __popcll(b0);
+        const int t1       = t0 + __popcll(b1);
+        const int t2       = t1 + __popcll(b2);
+        const int wtotal   = t2 + __popcll(b3);
         if(wtotal > 0)
         {
-            const int base_idx = i * FP32_EPT;
             if(b0 & (1ull << lane))
                 buf[bcnt + __popcll(b0 & lt)] =
                     ((uint64_t)__float_as_uint(v[0]) << 32) | (uint32_t)(base_idx + 0);
@@ -183,8 +174,6 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     }
 #undef COOP_DRAIN_WAVE
 
-    // Fast path: one atomic and one contiguous region per BLOCK for everything
-    // still staged. bcnt < 0 marks a wave that already tripped the cap.
     __shared__ int s_local[MAX_WAVES_PER_BLOCK];
     __shared__ int s_off[MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_base;
@@ -213,7 +202,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         }
         else if(total == 0)
         {
-            s_base = 0xFFFFFFFEu; // nothing to write
+            s_base = 0xFFFFFFFEu;
         }
         else
         {
@@ -229,7 +218,6 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     if(s_base == 0xFFFFFFFFu || s_base == 0xFFFFFFFEu)
         return;
 
-    // Whole block writes one contiguous run; wave w owns [s_off[w], +s_local[w]).
     for(int w = 0; w < nwaves; w++)
     {
         const int cnt = s_local[w];
@@ -242,12 +230,10 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     }
 }
 
-// Folds what used to be a separate finalize_coop_counts kernel: the reserved
-// total and the overflow flag are reduced to the usable candidate count right
-// here, saving a dispatch. cand_count is still written so --dump-stats keeps
-// working, which costs one store rather than a kernel.
+template <bool RAGGED>
 __global__ void phase_c_select_contig(const float* __restrict__ input,
-                                      int N,
+                                      int pitch,
+                                      const int* __restrict__ row_ends,
                                       const uint64_t* __restrict__ cand_pack,
                                       const unsigned int* __restrict__ cand_reserved,
                                       const unsigned int* __restrict__ cand_bad,
@@ -261,13 +247,11 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
                                       bool keys_only)
 {
     const int row            = blockIdx.x;
+    const int len            = row_len_dev(row, pitch, row_ends);
     const unsigned int c_raw = cand_bad[row] ? 0xFFFFFFFFu : cand_reserved[row];
     if(threadIdx.x == 0)
         cand_count[row] = c_raw;
 
-    // Dynamic LDS: cap keys, plus cap indices unless the keys-only variant
-    // re-reads them from global. Sizing either statically at PHASE_C_CAP_MAX costs
-    // 32 KB unconditionally and halves occupancy.
     extern __shared__ uint32_t s_dyn[];
     uint32_t* s_keys_ext = s_dyn;
     int* s_idx           = reinterpret_cast<int*>(s_dyn + cap);
@@ -277,15 +261,14 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_wgt, s_weq;
 
-    int* out = out_idx + (size_t)row * K;
-    if(c_raw < (unsigned)K || c_raw > (unsigned)cap)
+    int* out        = out_idx + (size_t)row * K;
+    const int k_out = RAGGED ? k_take_dev(K, len) : K;
+    if(c_raw < (unsigned)k_out || c_raw > (unsigned)cap)
     {
-        // Unusable candidate set: exact full-row select right here instead of in a
-        // separate fallback kernel. Saves the 4th dispatch on every call, and is
-        // more parallel in the worst case (M blocks instead of FB_GRID=64).
         if(threadIdx.x == 0)
-            fb_rows[atomicAdd(fb_count, 1)] = row; // diagnostics only
-        exact_row_select(input, N, K, row, out, s_hist, s_red, s_scan, &s_wgt, &s_weq);
+            fb_rows[atomicAdd(fb_count, 1)] = row;
+        exact_row_select<RAGGED>(
+            input, pitch, len, K, row, out, s_hist, s_red, s_scan, &s_wgt, &s_weq);
         return;
     }
     const int c          = (int)c_raw;
@@ -303,7 +286,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
     uint32_t pivot;
     int eq_needed;
     block_select_lds(
-        s_keys_ext, c, K, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses, true);
+        s_keys_ext, c, k_out, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses, true);
 
     if(threadIdx.x == 0)
     {
@@ -317,7 +300,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
         block_gather_topk(
             c,
             pivot,
-            K - eq_needed,
+            k_out - eq_needed,
             eq_needed,
             out,
             &s_wgt,
@@ -330,7 +313,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
         block_gather_topk(
             c,
             pivot,
-            K - eq_needed,
+            k_out - eq_needed,
             eq_needed,
             out,
             &s_wgt,
@@ -338,22 +321,31 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
             [&](int i) { return s_keys_ext[i]; },
             [&](int i) { return s_idx[i]; });
     }
+    if(RAGGED && k_out < K)
+    {
+        __syncthreads();
+        pad_topk_tail(out, k_out, K);
+    }
 }
 
+template <bool RAGGED>
 __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__ input,
-                                                       int N,
+                                                       int pitch,
+                                                       const int* __restrict__ row_ends,
                                                        int rank,
                                                        int S,
                                                        int npasses,
-                                                       int chunk_stride,
+                                                       int chunk_stride_host,
                                                        int seg_stride,
                                                        uint64_t* __restrict__ cand_pack,
                                                        int* __restrict__ cand_seg,
                                                        unsigned int* __restrict__ cand_count,
-                                                       int* __restrict__ fb_count)
+                                                       int* __restrict__ fb_count,
+                                                       int K)
 {
     const int row   = blockIdx.x;
-    const float* ri = input + (size_t)row * N;
+    const int len   = row_len_dev(row, pitch, row_ends);
+    const float* ri = input + (size_t)row * pitch;
 
     if(threadIdx.x == 0 && row == 0)
         *fb_count = 0;
@@ -364,7 +356,10 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
     __shared__ uint32_t s_scan[2];
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
 
-    // From the host, for the reason spelled out in phase_a_threshold.
+    const int chunks       = S / SAMPLE_CHUNK_ELEMS;
+    const int chunk_stride = RAGGED ? sample_chunk_stride(len, chunks) : chunk_stride_host;
+    const int rank_row = RAGGED && len != pitch ? max(1, (int)((double)rank * pitch / len)) : rank;
+
     const int v4_per_chunk = SAMPLE_CHUNK_ELEMS / FP32_EPT;
     const int total_v4     = S / FP32_EPT;
     for(int u = threadIdx.x; u < total_v4; u += blockDim.x)
@@ -382,7 +377,7 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
 
     uint32_t pivot;
     int eq_needed;
-    block_select_lds(s_keys, S, rank, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses);
+    block_select_lds(s_keys, S, rank_row, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses);
     const float th = sortable_to_fp32(pivot);
 
     const vfloat4* ri4 = reinterpret_cast<const vfloat4*>(ri);
@@ -393,7 +388,7 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
     __shared__ uint64_t wbuf[WSTAGE_WAVES * WSTAGE_CAP];
     uint64_t* buf    = wbuf + (size_t)wid * WSTAGE_CAP;
     uint64_t* seg    = cand_pack + (size_t)row * CAND_SLOTS_PER_ROW + (size_t)wid * seg_stride;
-    const int n4     = N / FP32_EPT;
+    const int n4     = RAGGED ? n4_cover(len) : (pitch / FP32_EPT);
     const int stride = blockDim.x;
     const int iters  = (n4 + stride - 1) / stride;
     int wcnt = 0, bcnt = 0;
@@ -405,17 +400,17 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
         const bool live = (i < n4);
         if(live)
             v = load_f4(ri4 + i);
-        const uint64_t b0 = __ballot(live && !(v[0] < th));
-        const uint64_t b1 = __ballot(live && !(v[1] < th));
-        const uint64_t b2 = __ballot(live && !(v[2] < th));
-        const uint64_t b3 = __ballot(live && !(v[3] < th));
-        const int t0      = __popcll(b0);
-        const int t1      = t0 + __popcll(b1);
-        const int t2      = t1 + __popcll(b2);
-        const int wtotal  = t2 + __popcll(b3);
+        const int base_idx = i * FP32_EPT;
+        const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
+        const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));
+        const uint64_t b2  = __ballot(live && !(v[2] < th) && (!RAGGED || base_idx + 2 < len));
+        const uint64_t b3  = __ballot(live && !(v[3] < th) && (!RAGGED || base_idx + 3 < len));
+        const int t0       = __popcll(b0);
+        const int t1       = t0 + __popcll(b1);
+        const int t2       = t1 + __popcll(b2);
+        const int wtotal   = t2 + __popcll(b3);
         if(wtotal > 0)
         {
-            const int base_idx = i * FP32_EPT;
             if(b0 & (1ull << lane))
                 buf[bcnt + __popcll(b0 & lt)] =
                     ((uint64_t)__float_as_uint(v[0]) << 32) | (uint32_t)(base_idx + 0);
@@ -478,4 +473,6 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
         }
         cand_count[row] = bad ? 0xFFFFFFFFu : total;
     }
+    (void)K;
+    (void)fb_count;
 }
