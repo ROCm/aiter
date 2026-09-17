@@ -309,7 +309,6 @@ with _silence():
     import pandas as pd
     import test_f4gemm as gemm_mod
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
-    import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     import test_mxfp8fp4gemm as f8gemm_mod
     import torch
     from flydsl_tests import test_flydsl_grouped_gemm as moe_mod
@@ -1886,6 +1885,21 @@ def _run_mla_v4_decode_ep(args):
 
 def _run_mla_v4_decode_tp(args):
     """Run the existing kargpreld asm/Triton MLA decode comparison."""
+    try:
+        # This test sets torch's process-wide default device to CUDA at import.
+        # Import it only after the EP sparse-prefill block has completed, since
+        # that test intentionally builds its random CSR indices with a CPU RNG.
+        with _silence():
+            import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
+    except Exception as exc:  # noqa: BLE001 - report a TP-local import failure
+        reason = f"{type(exc).__name__}: {exc}"
+        _print_table(
+            "mla_v4 decode [TP] (bf16, asm vs triton)",
+            [{"scenario": "TP", "err_msg": reason}],
+        )
+        _note_failure("mla_v4_decode [TP]", reason)
+        return
+
     for mod in (mla_v4_kargpreld_mod, mla_v4_triton_mod):
         mod._PERF["num_iters"] = args.mla_v4_kargpreld_iters
         mod._PERF["num_warmup"] = args.mla_v4_kargpreld_warmup
