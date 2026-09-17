@@ -58,7 +58,9 @@ WGM_VALUES = (1, 4, 8)
 # Spelled out rather than spliced from the kernel's ``TILE_LADDER``: this order is
 # the order the tuner measures them in, and ties are broken by whoever is timed
 # first, so re-ordering it would make a re-tune disagree with the checked-in CSVs
-# for no gain. ``test_conv3d_policy`` asserts the ladder stays a subset instead.
+# for no gain. The cost is that a ladder rung added there and not here becomes an
+# incumbent the sweep never measures, which is how a tuned pick ends up slower
+# than the default -- keep the two in step by hand.
 BASELINE_TILES = (
     (128, 128, 2, 4),
     (128, 256, 2, 4),
