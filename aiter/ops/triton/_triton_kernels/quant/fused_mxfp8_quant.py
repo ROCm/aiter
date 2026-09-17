@@ -4,9 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-from .quant import _mxfp8_quant_op
 
 # Fused RMSNorm + MXFP8 (1x32 e8m0) quant. Replaces the separate
 # rmsnorm_quant(fp8 fnuz + fp32 1x128) + transcode-to-MXFP8 sequence used

@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import (
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
     DEBUG,
     AutotuneMode,
@@ -13,10 +13,11 @@ from .utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 PREPROCESS_AUTOTUNE_KEYS = [
     "max_seqlen_q",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
 ]
 
@@ -24,7 +25,8 @@ CAUSAL_AUTOTUNE_KEYS = [
     "dropout_p",
     "max_seqlen_q",
     "max_seqlen_k",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_QK",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
     "HQ",
     "HK",
@@ -34,7 +36,8 @@ NONCAUSAL_AUTOTUNE_KEYS = [
     "dropout_p",
     "max_seqlen_q",
     "max_seqlen_k",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_QK",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
     "HQ",
     "HK",
@@ -758,10 +761,28 @@ def get_bwd_configs(mode: AutotuneMode):
 
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 (
-    preprocess_autotune_configs,
-    causal_autotune_configs,
-    noncausal_autotune_configs,
+    _bwd_preprocess_cfgs,
+    _bwd_causal_cfgs,
+    _bwd_noncausal_cfgs,
 ) = get_bwd_configs(AUTOTUNE)
+preprocess_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_preprocess_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
+causal_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_causal_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
+noncausal_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_noncausal_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
 
 
 @triton.jit
@@ -2744,7 +2765,6 @@ def _bwd_kernel_split_dq_noncausal(
 @triton.autotune(
     configs=preprocess_autotune_configs,
     key=PREPROCESS_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def _bwd_preprocess(
@@ -2970,19 +2990,19 @@ def _bwd_dkdv_inner(
                     # cap, if any, is applied separately via MASK above)
                     window_mask = offs_n[:, None] >= 0
                 elif WINDOW_SIZE_LEFT < 0:
-                    window_mask = offs_n[:, None] <= (
-                        offs_m[None, :] + causal_offset + WINDOW_SIZE_RIGHT
-                    )
+                    rel = offs_n[:, None] - offs_m[None, :] - causal_offset
+                    window_mask = rel <= WINDOW_SIZE_RIGHT
                 elif WINDOW_SIZE_RIGHT < 0:
                     # unbounded right, finite left (mirror of infinite-left)
-                    window_mask = offs_n[:, None] >= (
-                        offs_m[None, :] + causal_offset - WINDOW_SIZE_LEFT
-                    )
+                    rel = offs_n[:, None] - offs_m[None, :] - causal_offset
+                    window_mask = rel >= -WINDOW_SIZE_LEFT
                 else:
-                    left_bound = offs_m[None, :] + causal_offset - WINDOW_SIZE_LEFT
-                    right_bound = offs_m[None, :] + causal_offset + WINDOW_SIZE_RIGHT
-                    window_mask = (offs_n[:, None] >= left_bound) & (
-                        offs_n[:, None] <= right_bound
+                    # Keep the relative-distance form:
+                    # broadcasting explicit left/right bound tiles potentially makes the
+                    # gfx950 backend spill the buffer descriptors and return silently wrong dK/dV.
+                    rel = offs_n[:, None] - offs_m[None, :] - causal_offset
+                    window_mask = (rel >= -WINDOW_SIZE_LEFT) & (
+                        rel <= WINDOW_SIZE_RIGHT
                     )
                 mask = window_mask & mask
             if DEBUG_TRITON_DETAIL and start_n == 256:
@@ -3310,7 +3330,6 @@ def _sliding_window_k_bounds(
 @triton.autotune(
     configs=causal_autotune_configs,
     key=CAUSAL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), batch)
@@ -3932,7 +3951,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 @triton.autotune(
     configs=noncausal_autotune_configs,
     key=NONCAUSAL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def bwd_kernel_fused_noncausal(

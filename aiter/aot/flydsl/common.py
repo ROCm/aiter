@@ -34,6 +34,7 @@ class OpKind(enum.Enum):
     GEMM = "gemm"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
+    MEGA_MOE = "mega_moe"
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,10 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     runs their module-level imports, which pull in FlyDSL (e.g.
     ``flydsl.expr``). Job collection is therefore not free in the
     parent process, just shifted once out of every child."""
+    if kind is OpKind.MEGA_MOE:
+        from .mega_moe import default_jobs
+
+        return default_jobs()
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.MXFP4_MOE:
@@ -152,7 +157,9 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 
 
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
-    if kind is OpKind.MOE:
+    if kind is OpKind.MEGA_MOE:
+        from .mega_moe import compile_one_config
+    elif kind is OpKind.MOE:
         from .moe import compile_one_config
     elif kind is OpKind.MXFP4_MOE:
         from .mxfp4_moe import compile_one_config
@@ -162,10 +169,6 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
-    elif kind is OpKind.GROUPED_MOE:
-        # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a
-        # trivial stub so the dispatch is total.
-        return lambda **_kw: {}
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return compile_one_config

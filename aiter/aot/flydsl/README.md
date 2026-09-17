@@ -11,6 +11,7 @@ the JIT path hits the cache instead of compiling again.
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
+| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -47,7 +48,17 @@ python -m aiter.aot.flydsl.grouped_moe
 
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
+
+# MegaMoE profile bundles (all token buckets and all eight ranks)
+python -m aiter.aot.flydsl.mega_moe
+
+# Restrict the deployment profiles when building a smaller custom image.
+python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 ```
+
+MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
+(`experts_per_rank=48/52/56`). The expert count is part of the compiled ABI, so
+one profile cannot safely reuse another profile's bundle.
 
 ### Common arguments
 

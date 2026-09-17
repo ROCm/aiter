@@ -8,6 +8,7 @@ missing untuned files.
 """
 
 import os
+import re
 import unittest
 from typing import Any, ClassVar
 
@@ -122,6 +123,46 @@ class TestCSVValidation(unittest.TestCase):
                 "doweight_stage1",
                 "_tag",
             ],
+        )
+
+    def test_flydsl_stage2_sort_block_matches_fmoe_config(self):
+        """Stage2 must consume the same sorting layout emitted by stage1."""
+        tile_pattern = re.compile(r"_t([0-9]+)x[0-9]+x[0-9]+")
+        sort_block_pattern = re.compile(r"_sbm([0-9]+)(?:_|$)")
+        mismatches = []
+
+        for root, _, files in os.walk(CONFIGS_DIR):
+            for filename in files:
+                if "tuned_fmoe" not in filename or not filename.endswith(".csv"):
+                    continue
+                path = os.path.join(root, filename)
+                df = pd.read_csv(path)
+                if "block_m" not in df.columns or "kernelName2" not in df.columns:
+                    continue
+                for index, row in df.iterrows():
+                    kernel_name = str(row["kernelName2"])
+                    if not kernel_name.startswith("flydsl_moe2_"):
+                        continue
+                    tile_match = tile_pattern.search(kernel_name)
+                    if tile_match is None:
+                        continue
+                    sort_block_match = sort_block_pattern.search(kernel_name)
+                    sort_block_m = int(
+                        sort_block_match.group(1)
+                        if sort_block_match is not None
+                        else tile_match.group(1)
+                    )
+                    block_m = int(row["block_m"])
+                    if sort_block_m != block_m:
+                        relative_path = os.path.relpath(path, AITER_ROOT)
+                        mismatches.append(
+                            f"{relative_path}:{index + 2}: block_m={block_m}, "
+                            f"sort_block_m={sort_block_m}, kernelName2={kernel_name}"
+                        )
+
+        self.assertFalse(
+            mismatches,
+            "FlyDSL stage2 sorting layout mismatches:\n" + "\n".join(mismatches),
         )
 
     def test_no_git_conflict_markers(self):

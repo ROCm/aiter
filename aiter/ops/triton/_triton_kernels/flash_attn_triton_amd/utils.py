@@ -149,7 +149,8 @@ except Exception as e:  # noqa: BLE001
 #
 # Set via: FLASH_ATTENTION_TRITON_AMD_DEBUG=0|1|2
 DEBUG: int = int(os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0"))
-if AUTOTUNE != "off" or DEBUG > 0:
+# Printing every autotune result is debug output; it must not be forced on for the whole process.
+if DEBUG > 0:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 if DEBUG >= 2:
     os.environ["TRITON_INTERPRET"] = "1"

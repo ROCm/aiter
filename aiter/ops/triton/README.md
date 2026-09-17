@@ -50,6 +50,33 @@ import from the categorized path** (`aiter.ops.triton.gemm.basic.gemm_a16w16`).
 
 ---
 
+## Framework portability — what may import `torch`
+
+`utils/_triton/` is the torch-free half of the shared machinery. The split
+exists so the Triton kernels and their tuned configs can be imported — or
+snapshotted into another repo — by a framework that is not PyTorch. The live
+case is JAX-Triton (ROCm-supported), where the tensors are created by JAX and
+handed to the same `@triton.jit` kernel.
+
+| Layer | May import `torch`? |
+| ----- | ------------------- |
+| `utils/_triton/` — arch info, `kernel_repr`, pid preprocessing, kernel-side helpers | **No** |
+| Config loading (`utils/config_utils.py`, the `*_config_utils.py` family modules) and `configs/*.json` | **No** |
+| Kernel modules under `_triton_kernels/` and `_gluon_kernels/` | **No** for new modules — a jit body cannot call torch anyway; keep host-side allocation and dtype glue in the wrapper. Modules that already import torch are grandfathered. |
+| `utils/` torch helpers (`shuffle.py`, `types.py`, `common_utils.py`, ...) and every public wrapper | **Yes** — this is where torch belongs |
+
+- A helper both sides need is split, not duplicated: the torch-free part under
+  `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
+  places for exactly this reason.
+- `utils/_triton/tunning/` is exempt — those are standalone tuning harnesses
+  that run in a PyTorch environment, not part of the importable surface.
+- Non-PyTorch users still write their own wrappers. Their framework creates
+  the tensors, so allocation, dtype and layout checks, and the launch belong
+  to them; what crosses the boundary from AITER is the kernel plus its tuned
+  config, not the wrapper.
+
+---
+
 ## Tuned configs
 
 ### One layout, one path builder
@@ -212,6 +239,54 @@ single default tile per arch via
 kernel_name, fallback, backend)`, which reads the nested-layout
 `DEFAULT.json`. The `fallback` must be launchable on any arch, not fast on one.
 
+### Autotune search spaces — `autotune_configs()`
+
+Every `@triton.autotune` takes its config list from
+`utils/tuned_config_utils.py::autotune_configs(family, configs,
+default_config=None, env=None, default="0")`. Never hand it a raw list:
+
+```python
+@triton.autotune(
+    configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+    key=[...],
+)
+```
+
+It returns every candidate while `<FAMILY>_TRITON_AUTOTUNE=1`, and exactly one
+config otherwise, so nothing benchmarks at launch. A raw list searches on every
+new key: it costs compile time, breaks CUDA-graph capture, and leaves a unit
+test's numerics dependent on whichever config the timing happened to pick that
+run. Which one gets pinned is `configs[0]` unless `default_config=` says
+otherwise, and that default should come from `get_tuned_kernel_config` so
+retuning it is a JSON edit rather than a code change.
+
+`env=` names the variable for a family that published its own before this
+convention existed, and `default=` is what an unset variable means for it —
+together they let such a family route through this helper without changing what
+it did before. `flash_attn_triton_amd/` uses both, for
+`FLASH_ATTENTION_TRITON_AMD_AUTOTUNE`, which is on by default where every other
+family is off. This covers the kernel that applies `triton.autotune()` as a call
+rather than a decorator too (`_triton_kernels/fusions/attn_res.py`, behind
+`ATTN_RES_TRITON_AUTOTUNE=1`) — a grep for the decorator misses that one.
+
+A candidate list published in the config JSON is a **search space**, not a
+launch-time list: handed straight to `@triton.autotune` it still benchmarks
+every entry on every new key. It goes to `configs`, and `default_config=` pins
+what launches — `chunk_delta_attn/flash_kda.py` reads its six K2 candidates
+through `chunk_delta_attn_tuned_config_shortlist` and pins
+`_K2_FALLBACK_CONFIG`. There are no exemptions: all 41 `@triton.autotune` sites
+under `aiter/ops/triton/` go through the helper.
+
+One consequence to know when reading the tuner: Triton consults its autotune
+cache only when the config list holds more than one entry (`autotuner.py:235`);
+with one config it takes `configs[0]` and never reads the `key`. A test about
+the `key` therefore has to hand the autotuner a config space first — see
+`test_tuner_keeps_the_two_schedules_apart`.
+
+The unit tests do not rely on any of it: `op_tests/triton_tests/__init__.py`
+pins one config per kernel for the whole suite, so a test's numerics never
+depend on a benchmark.
+
 ### Config naming
 
 | Kind             | Pattern                                                        |
@@ -315,6 +390,33 @@ return value, and any special considerations (unsupported options, layout
 expectations such as "weights must be pre-shuffled", etc.).
 
 ---
+
+## Logging
+
+Use the aiter logger, not `print`, and pass the values rather than formatting
+them into the message:
+
+```python
+from aiter import logger
+
+logger.info("resolved config for M=%d N=%d: %s", M, N, config)   # lazy
+# not: logger.info(f"resolved config for M={M} N={N}: {config}") # built every call
+```
+
+An f-string is evaluated before the level check, so it costs a full format on
+every call even when the record is below the configured level — and for a
+kernel wrapper that can mean formatting a tensor repr per launch. Match the
+placeholder to the value: `%d` for counts and dimensions, `%f` for thresholds
+and real scalars, `%s` for tensors, `torch.Size` shapes, tuples and strings.
+`%d` or `%f` on `None` raises when the record is emitted, which logging
+reports as `--- Logging error ---` on stderr instead of raising, so use `%s`
+for anything optional.
+
+Gate verbose output with `logger.debug(...)`, not with an `if` around the
+call; `AITER_LOG_LEVEL=DEBUG` turns it on, and `aiter/__init__.py` applies
+that to the logger and its handler together. Never lower the level by hand
+after import (`logger.setLevel(...)` leaves the handler where it was) and
+never call `logging.basicConfig(...)` from library code.
 
 ## Tests
 

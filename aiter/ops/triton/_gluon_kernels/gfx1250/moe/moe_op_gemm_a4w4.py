@@ -4,6 +4,7 @@ from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
@@ -15,10 +16,18 @@ _MOE_GEMM_A4W4_REPR_KEYS = [
     "APPLY_SWIGLU",
     "num_warps",
     "NUM_BUFFERS",
+    "HAS_MX_OUT",
+    "EP_SCATTER",
+]
+
+_MOE_GEMM_A4W4_PREFILL_REPR_KEYS = _MOE_GEMM_A4W4_REPR_KEYS + [
+    "PRELOAD_X_SCALES",
+    "XS_SLAB_COLS",
+    "L2_PREFETCH_DISTANCE",
 ]
 
 _moe_gemm_a4w4_prefill_repr = make_kernel_repr(
-    "_moe_gemm_a4w4_prefill", _MOE_GEMM_A4W4_REPR_KEYS
+    "_moe_gemm_a4w4_prefill", _MOE_GEMM_A4W4_PREFILL_REPR_KEYS
 )
 
 _moe_gemm_a4w4_decode_repr = make_kernel_repr(
@@ -607,13 +616,34 @@ def _moe_gemm_a4w4_prefill(
     # metaparameters
     num_warps: gl.constexpr,
     num_ctas: gl.constexpr,
+    # MXFP4 output quant (GEMM1-style): emit e2m1 nibbles + e8m0 scales straight
+    # from the epilogue so GEMM2 consumes them with no separate quant launch.
+    YMxScale=None,
+    stride_y_mx_m=0,
+    stride_y_mx_n=0,
+    HAS_MX_OUT: gl.constexpr = False,
+    # Expert-parallel combine (GEMM2-style): per-row destination row in a peer
+    # combine-staging window, negative where the row must not be delivered.
+    DstRow=None,
+    EP_SCATTER: gl.constexpr = False,
+    # Row extent of the combine window, so an out-of-range index is droppable.
+    Y_ROWS=0,
+    PRELOAD_X_SCALES: gl.constexpr = False,
+    XS_SLAB_COLS: gl.constexpr = 0,
+    # Warm L2 with the first this-many K-tiles of w during the prologue.
+    # 0 disables. Costs no LDS, unlike raising NUM_BUFFERS, which would
+    # cost a whole workgroup per CU on both prefill GEMMs.
+    L2_PREFETCH_DISTANCE: gl.constexpr = 0,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
     )
 
-    if X_SCALES_TDM:
+    # Preloading takes x scales out of the loop entirely
+    if PRELOAD_X_SCALES:
+        NUM_TDM_OPS: gl.constexpr = 3
+    elif X_SCALES_TDM:
         # via TDM: w, w scales, x, x scales
         NUM_TDM_OPS: gl.constexpr = 4
     else:
@@ -794,11 +824,51 @@ def _moe_gemm_a4w4_prefill(
     w_buffer = gl.allocate_shared_memory(
         w_desc.dtype, shape=[NUM_BUFFERS] + w_desc.block_shape, layout=w_desc.layout
     )
-    x_scales_buffer = gl.allocate_shared_memory(
-        x_scales_desc.dtype,
-        shape=[NUM_BUFFERS] + x_scales_desc.block_shape,
-        layout=x_scales_desc.layout,
-    )
+    if PRELOAD_X_SCALES:
+        XS_SLAB_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        XS_SLOTS: gl.constexpr = XS_SLAB_COLS // MX_SCALE_BLOCK_K
+        xs_offs_kg = gl.arange(
+            0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_X_SCALES)
+        )
+        xs_zeros_row = gl.zeros(
+            (PACKED_BLOCK_M_X,),
+            dtype=gl.int32,
+            layout=gl.SliceLayout(1, DOT_LAYOUT_X_SCALES),
+        )
+        gl.static_assert(
+            XS_SLAB_COLS % MX_SCALE_BLOCK_K == 0,
+            "XS_SLAB_COLS must be a whole number of MX_SCALE_BLOCK_K tiles",
+        )
+        gl.static_assert(XS_SLOTS >= 1, "x-scale slab needs at least one slot")
+        x_scales_slab = gl.allocate_shared_memory(
+            x_scales_desc.dtype,
+            shape=[PACKED_BLOCK_M_X, XS_SLAB_COLS],
+            layout=XS_SLAB_LAYOUT,
+        )
+        if GatherIndx is None:
+            xs_slab_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=XMxScale,
+                shape=(M, gl.cdiv(K, MX_PACK_DIVISOR)),
+                strides=(stride_x_mx_m, stride_x_mx_k),
+                block_shape=(PACKED_BLOCK_M_X, XS_SLAB_COLS),
+                layout=XS_SLAB_LAYOUT,
+            )
+        else:
+            xs_slab_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=XMxScale,
+                shape=(num_tokens, gl.cdiv(K, MX_PACK_DIVISOR)),
+                strides=(stride_x_mx_m, stride_x_mx_k),
+                block_shape=(PACKED_BLOCK_M_X, XS_SLAB_COLS),
+                layout=XS_SLAB_LAYOUT,
+            )
+    else:
+        x_scales_buffer = gl.allocate_shared_memory(
+            x_scales_desc.dtype,
+            shape=[NUM_BUFFERS] + x_scales_desc.block_shape,
+            layout=x_scales_desc.layout,
+        )
     w_scales_buffer = gl.allocate_shared_memory(
         w_scales_desc.dtype,
         shape=[NUM_BUFFERS] + w_scales_desc.block_shape,
@@ -810,6 +880,12 @@ def _moe_gemm_a4w4_prefill(
 
     num_k_iter = gl.cdiv(K, BLOCK_K)
 
+    if PRELOAD_X_SCALES:
+        if GatherIndx is None:
+            gl.amd.gfx1250.tdm.async_load(xs_slab_desc, [offs_x_m, 0], x_scales_slab)
+        else:
+            gl.amd.gfx1250.tdm.async_gather(xs_slab_desc, offs_x_m, x_scales_slab)
+
     # prologue: fill NUM_BUFFERS LDS slots via TDM
     for _ in gl.static_range(NUM_BUFFERS):
         if GatherIndx is None:
@@ -818,7 +894,7 @@ def _moe_gemm_a4w4_prefill(
                 [offs_x_m, 0],
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            if X_SCALES_TDM:
+            if X_SCALES_TDM and not PRELOAD_X_SCALES:
                 gl.amd.gfx1250.tdm.async_load(
                     x_scales_desc,
                     [offs_x_m, 0],
@@ -830,7 +906,7 @@ def _moe_gemm_a4w4_prefill(
                 offs_x_m,
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            if X_SCALES_TDM:
+            if X_SCALES_TDM and not PRELOAD_X_SCALES:
                 gl.amd.gfx1250.tdm.async_gather(
                     x_scales_desc,
                     offs_x_m,
@@ -846,7 +922,7 @@ def _moe_gemm_a4w4_prefill(
             [offs_w_n_scale, 0],
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
-        if not X_SCALES_TDM:
+        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
             gl.amd.gfx1250.async_copy.global_to_shared(
                 x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 x_scales_ptrs,
@@ -858,7 +934,7 @@ def _moe_gemm_a4w4_prefill(
         x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             x_desc, add_offsets=[0, PACKED_BLOCK_K_X], clamp_bounds=CLAMP_BOUNDS
         )
-        if X_SCALES_TDM:
+        if X_SCALES_TDM and not PRELOAD_X_SCALES:
             x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_scales_desc,
                 add_offsets=[0, MX_SCALE_BLOCK_K],
@@ -875,9 +951,13 @@ def _moe_gemm_a4w4_prefill(
 
         load_idx += 1
 
+    if L2_PREFETCH_DISTANCE > 0:
+        for pf_j in gl.static_range(L2_PREFETCH_DISTANCE):
+            gl.amd.gfx1250.tdm.prefetch(w_desc, [offs_w_n, pf_j * SHUFFLED_BLOCK_K_W])
+
     # preload tile 0 from LDS into registers
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-    if not X_SCALES_TDM:
+    if not X_SCALES_TDM and not PRELOAD_X_SCALES:
         gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
     cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
     if PRESHUFFLE_WEIGHTS:
@@ -898,9 +978,16 @@ def _moe_gemm_a4w4_prefill(
             .permute((1, 0))
             .load(layout=DOT_LAYOUT_W)
         )
-    cur_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-        layout=DOT_LAYOUT_X_SCALES
-    )
+    if PRELOAD_X_SCALES:
+        cur_x_scales = x_scales_slab.gather(
+            ((wmma_idx % XS_SLOTS) * MX_SCALE_BLOCK_K + xs_offs_kg)[None, :]
+            + xs_zeros_row[:, None],
+            1,
+        )
+    else:
+        cur_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
+            layout=DOT_LAYOUT_X_SCALES
+        )
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         cur_w_scales = (
             unswizzle_scales_gfx1250(
@@ -935,7 +1022,7 @@ def _moe_gemm_a4w4_prefill(
                 [offs_x_m, 0],
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            if X_SCALES_TDM:
+            if X_SCALES_TDM and not PRELOAD_X_SCALES:
                 gl.amd.gfx1250.tdm.async_load(
                     x_scales_desc,
                     [offs_x_m, 0],
@@ -947,7 +1034,7 @@ def _moe_gemm_a4w4_prefill(
                 offs_x_m,
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            if X_SCALES_TDM:
+            if X_SCALES_TDM and not PRELOAD_X_SCALES:
                 gl.amd.gfx1250.tdm.async_gather(
                     x_scales_desc,
                     offs_x_m,
@@ -963,7 +1050,7 @@ def _moe_gemm_a4w4_prefill(
             [offs_w_n_scale, 0],
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
-        if not X_SCALES_TDM:
+        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
             gl.amd.gfx1250.async_copy.global_to_shared(
                 x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 x_scales_ptrs,
@@ -975,7 +1062,7 @@ def _moe_gemm_a4w4_prefill(
         x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             x_desc, add_offsets=[0, PACKED_BLOCK_K_X], clamp_bounds=CLAMP_BOUNDS
         )
-        if X_SCALES_TDM:
+        if X_SCALES_TDM and not PRELOAD_X_SCALES:
             x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_scales_desc,
                 add_offsets=[0, MX_SCALE_BLOCK_K],
@@ -993,7 +1080,7 @@ def _moe_gemm_a4w4_prefill(
 
         # wait for next tile to be filled
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-        if not X_SCALES_TDM:
+        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
             gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
 
         # load next tile from LDS into registers
@@ -1016,9 +1103,16 @@ def _moe_gemm_a4w4_prefill(
                 .permute((1, 0))
                 .load(layout=DOT_LAYOUT_W)
             )
-        next_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-            layout=DOT_LAYOUT_X_SCALES
-        )
+        if PRELOAD_X_SCALES:
+            next_x_scales = x_scales_slab.gather(
+                ((wmma_idx % XS_SLOTS) * MX_SCALE_BLOCK_K + xs_offs_kg)[None, :]
+                + xs_zeros_row[:, None],
+                1,
+            )
+        else:
+            next_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
+                layout=DOT_LAYOUT_X_SCALES
+            )
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             next_w_scales = (
                 unswizzle_scales_gfx1250(
@@ -1080,7 +1174,7 @@ def _moe_gemm_a4w4_prefill(
         gl.amd.gfx1250.tdm.async_wait(
             (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
         )
-        if not X_SCALES_TDM:
+        if not X_SCALES_TDM and not PRELOAD_X_SCALES:
             gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
         # load next tile from LDS into registers
@@ -1103,9 +1197,16 @@ def _moe_gemm_a4w4_prefill(
                 .permute((1, 0))
                 .load(layout=DOT_LAYOUT_W)
             )
-        next_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
-            layout=DOT_LAYOUT_X_SCALES
-        )
+        if PRELOAD_X_SCALES:
+            next_x_scales = x_scales_slab.gather(
+                ((wmma_idx % XS_SLOTS) * MX_SCALE_BLOCK_K + xs_offs_kg)[None, :]
+                + xs_zeros_row[:, None],
+                1,
+            )
+        else:
+            next_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
+                layout=DOT_LAYOUT_X_SCALES
+            )
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             next_w_scales = (
                 unswizzle_scales_gfx1250(
@@ -1165,26 +1266,130 @@ def _moe_gemm_a4w4_prefill(
         )
         out *= gammas[:, None]
 
-    # write-back via TDM store: registers -> shared memory -> global memory
-    out = out.to(gl.bfloat16)
-    Y += start_m.to(index_type) * stride_y_m
-    y_buffer = gl.allocate_shared_memory(
-        Y.type.element_ty,
-        shape=[BLOCK_M, OUT_BLOCK_N],
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=Y,
-        shape=(M, yN),
-        strides=(stride_y_m, stride_y_n),
-        block_shape=(BLOCK_M, OUT_BLOCK_N),
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_buffer.store(out)
-    gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
+    if HAS_MX_OUT:
+        # MXFP4 emit. The consuming GEMM reads ACTIVATION scales unswizzled in
+        # every branch -- SWIZZLE_MX_SCALE gates only w_scales -- so plain
+        # row-major [M, yN/32] e8m0 is exactly the layout it wants. And
+        # _mxfp4_quant_op is the same device function `mxfp4_quant` calls, so
+        # the nibble packing is byte-identical to the standalone launch this
+        # replaces.
+        gl.static_assert(
+            OUT_BLOCK_N % 32 == 0, "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0"
+        )
+        NUM_QB: gl.constexpr = OUT_BLOCK_N // 32
+        # Quant groups are 32 wide along N and OUT_BLOCK_N % 32 == 0, so every
+        # group lies inside this tile: no cross-program reduction, and the
+        # amax of a padding row can only ever affect that same padding row.
+        packed, bs_e8m0 = _mxfp4_quant_op(
+            out.to(gl.bfloat16).to(gl.float32), OUT_BLOCK_N, BLOCK_M, 32
+        )
+        # The two stores get their own row offsets rather than sharing one. The
+        # values and the scales come off different tails of the reshape/split
+        # chain and so carry different layouts; a shared offset tensor would have
+        # to resolve to both at once, which fails auto-encoding resolution with
+        # "'tt.addptr' op found conflicting encodings for value".
+        #
+        # packed is [BLOCK_M, OUT_BLOCK_N // 2] -- two nibbles per byte along N,
+        # so both the column offset and the row-length bound halve.
+        offs_m_p = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        offs_n_p = pid_n * (OUT_BLOCK_N // 2) + gl.arange(0, OUT_BLOCK_N // 2)
+        gl.store(
+            Y
+            + (start_m + offs_m_p).to(index_type)[:, None] * stride_y_m
+            + offs_n_p[None, :] * stride_y_n,
+            packed,
+            mask=(offs_m_p[:, None] < M) & (offs_n_p[None, :] < yN // 2),
+        )
+        offs_m_s = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        offs_n_s = pid_n * NUM_QB + gl.arange(0, NUM_QB)
+        gl.store(
+            YMxScale
+            + (start_m + offs_m_s).to(index_type)[:, None] * stride_y_mx_m
+            + offs_n_s[None, :] * stride_y_mx_n,
+            bs_e8m0,
+            mask=(offs_m_s[:, None] < M) & (offs_n_s[None, :] < gl.cdiv(yN, 32)),
+        )
+    elif EP_SCATTER:
+        # Expert-parallel combine: these rows leave for arbitrary rows of a peer
+        # combine-staging window rather than for their slot in a contiguous Y
+        # tile, so there is no block move left to hand TDM -- address each row
+        # from its own destination. The rows are already in registers here, so
+        # the separate `scatter_grouped` pass over (M x hidden) disappears.
+        #
+        # Gammas was applied above, exactly as on the reduce path, so rows land
+        # already route-weighted and the peer's combine sum stays unweighted.
+        out = out.to(gl.bfloat16)
+        # Build the row offsets DIRECTLY in the layout async_scatter wants, so
+        # there is one layout end to end. Letting the arange auto-resolve and
+        # converting `dst` afterwards makes it feed two conflicting consumers
+        # (buffer_load and the scatter), and auto-encoding cannot pick:
+        # "'tt.make_range' op Failed to infer return type".
+        THREADS_PER_WARP: gl.constexpr = 32
+        NUM_WARPS: gl.constexpr = gl.num_warps()
+        M_PER_WARP: gl.constexpr = BLOCK_M // NUM_WARPS if BLOCK_M >= NUM_WARPS else 1
+        idx_base: gl.constexpr = gl.BlockedLayout(
+            [M_PER_WARP, 1], [1, THREADS_PER_WARP], [NUM_WARPS, 1], [1, 0]
+        )
+        idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
+        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
+        dst = gl.amd.gfx1250.buffer_load(
+            DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
+        )
+        # Delivered by TDM scatter through LDS, not by per-thread global stores.
+        #
+        # This matters ONLY because the destination is remote. ~3/4 of these rows
+        # land in a peer's HBM over xGMI, where the transaction shape dominates:
+        # per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile (256 B at
+        # BLOCK_N=128) as many small independent writes, while TDM moves whole
+        # rows, 8 per instruction with int32 indices. flydsl's a8w4 GEMM2 does
+        # exactly this and delivers the same rows for ~13us on top of its GEMM,
+        # against ~177us for the per-thread version measured here.
+        #
+        # Rows this rank must not deliver, and the tile's padding rows, are aimed
+        # at Y_ROWS -- the first row past the window -- so the bounds check drops
+        # them instead of a mask doing it. Same trick flydsl uses.
+        dst = gl.where(dst >= 0, dst, Y_ROWS)
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_buffer.store(out)
+        # Rows are addressed by index, so the descriptor carries only the column
+        # position; no start_m bias applies, dst is already absolute.
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(Y_ROWS, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            y_desc, add_offsets=[0, pid_n * OUT_BLOCK_N], clamp_bounds=True
+        )
+        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
+        gl.amd.gfx1250.tdm.async_wait(0)
+    else:
+        # write-back via TDM store: registers -> shared memory -> global memory
+        out = out.to(gl.bfloat16)
+        Y += start_m.to(index_type) * stride_y_m
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(M, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_buffer.store(out)
+        gl.amd.gfx1250.tdm.async_store(
+            y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 @gluon.jit(
@@ -1261,6 +1466,18 @@ def _moe_gemm_a4w4_decode(
     SHARED_LAYOUT_Y: gl.constexpr,
     # metaparameters
     num_warps: gl.constexpr,
+    # MXFP4 output quant (GEMM1-style): emit e2m1 nibbles + e8m0 scales straight
+    # from the epilogue so GEMM2 consumes them with no separate quant launch.
+    YMxScale=None,
+    stride_y_mx_m=0,
+    stride_y_mx_n=0,
+    HAS_MX_OUT: gl.constexpr = False,
+    # Expert-parallel combine (GEMM2-style): per-row destination row in a peer
+    # combine-staging window, negative where the row must not be delivered.
+    DstRow=None,
+    EP_SCATTER: gl.constexpr = False,
+    # Row extent of the combine window, so an out-of-range index is droppable.
+    Y_ROWS=0,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
@@ -1884,23 +2101,127 @@ def _moe_gemm_a4w4_decode(
         )
         out *= gammas[:, None]
 
-    # write-back via TDM store: registers -> shared memory -> global memory
-    out = out.to(gl.bfloat16)
-    Y += start_m.to(index_type) * stride_y_m
-    y_buffer = gl.allocate_shared_memory(
-        Y.type.element_ty,
-        shape=[BLOCK_M, OUT_BLOCK_N],
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=Y,
-        shape=(M, yN),
-        strides=(stride_y_m, stride_y_n),
-        block_shape=(BLOCK_M, OUT_BLOCK_N),
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_buffer.store(out)
-    gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
+    if HAS_MX_OUT:
+        # MXFP4 emit. The consuming GEMM reads ACTIVATION scales unswizzled in
+        # every branch -- SWIZZLE_MX_SCALE gates only w_scales -- so plain
+        # row-major [M, yN/32] e8m0 is exactly the layout it wants. And
+        # _mxfp4_quant_op is the same device function `mxfp4_quant` calls, so
+        # the nibble packing is byte-identical to the standalone launch this
+        # replaces.
+        gl.static_assert(
+            OUT_BLOCK_N % 32 == 0, "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0"
+        )
+        NUM_QB: gl.constexpr = OUT_BLOCK_N // 32
+        # Quant groups are 32 wide along N and OUT_BLOCK_N % 32 == 0, so every
+        # group lies inside this tile: no cross-program reduction, and the
+        # amax of a padding row can only ever affect that same padding row.
+        packed, bs_e8m0 = _mxfp4_quant_op(
+            out.to(gl.bfloat16).to(gl.float32), OUT_BLOCK_N, BLOCK_M, 32
+        )
+        # The two stores get their own row offsets rather than sharing one. The
+        # values and the scales come off different tails of the reshape/split
+        # chain and so carry different layouts; a shared offset tensor would have
+        # to resolve to both at once, which fails auto-encoding resolution with
+        # "'tt.addptr' op found conflicting encodings for value".
+        #
+        # packed is [BLOCK_M, OUT_BLOCK_N // 2] -- two nibbles per byte along N,
+        # so both the column offset and the row-length bound halve.
+        offs_m_p = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        offs_n_p = pid_n * (OUT_BLOCK_N // 2) + gl.arange(0, OUT_BLOCK_N // 2)
+        gl.store(
+            Y
+            + (start_m + offs_m_p).to(index_type)[:, None] * stride_y_m
+            + offs_n_p[None, :] * stride_y_n,
+            packed,
+            mask=(offs_m_p[:, None] < M) & (offs_n_p[None, :] < yN // 2),
+        )
+        offs_m_s = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        offs_n_s = pid_n * NUM_QB + gl.arange(0, NUM_QB)
+        gl.store(
+            YMxScale
+            + (start_m + offs_m_s).to(index_type)[:, None] * stride_y_mx_m
+            + offs_n_s[None, :] * stride_y_mx_n,
+            bs_e8m0,
+            mask=(offs_m_s[:, None] < M) & (offs_n_s[None, :] < gl.cdiv(yN, 32)),
+        )
+    elif EP_SCATTER:
+        # Expert-parallel combine: these rows leave for arbitrary rows of a peer
+        # combine-staging window rather than for their slot in a contiguous Y
+        # tile, so there is no block move left to hand TDM -- address each row
+        # from its own destination. The rows are already in registers here, so
+        # the separate `scatter_grouped` pass over (M x hidden) disappears.
+        #
+        # Gammas was applied above, exactly as on the reduce path, so rows land
+        # already route-weighted and the peer's combine sum stays unweighted.
+        out = out.to(gl.bfloat16)
+        # Build the row offsets DIRECTLY in the layout async_scatter wants, so
+        # there is one layout end to end. Letting the arange auto-resolve and
+        # converting `dst` afterwards makes it feed two conflicting consumers
+        # (buffer_load and the scatter), and auto-encoding cannot pick:
+        # "'tt.make_range' op Failed to infer return type".
+        THREADS_PER_WARP: gl.constexpr = 32
+        NUM_WARPS: gl.constexpr = gl.num_warps()
+        M_PER_WARP: gl.constexpr = BLOCK_M // NUM_WARPS if BLOCK_M >= NUM_WARPS else 1
+        idx_base: gl.constexpr = gl.BlockedLayout(
+            [M_PER_WARP, 1], [1, THREADS_PER_WARP], [NUM_WARPS, 1], [1, 0]
+        )
+        idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
+        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
+        dst = gl.amd.gfx1250.buffer_load(
+            DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
+        )
+        # Delivered by TDM scatter through LDS, not by per-thread global stores.
+        #
+        # This matters ONLY because the destination is remote. ~3/4 of these rows
+        # land in a peer's HBM over xGMI, where the transaction shape dominates:
+        # per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile (256 B at
+        # BLOCK_N=128) as many small independent writes, while TDM moves whole
+        # rows, 8 per instruction with int32 indices. flydsl's a8w4 GEMM2 does
+        # exactly this and delivers the same rows for ~13us on top of its GEMM,
+        # against ~177us for the per-thread version measured here.
+        #
+        # Rows this rank must not deliver, and the tile's padding rows, are aimed
+        # at Y_ROWS -- the first row past the window -- so the bounds check drops
+        # them instead of a mask doing it. Same trick flydsl uses.
+        dst = gl.where(dst >= 0, dst, Y_ROWS)
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_buffer.store(out)
+        # Rows are addressed by index, so the descriptor carries only the column
+        # position; no start_m bias applies, dst is already absolute.
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(Y_ROWS, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            y_desc, add_offsets=[0, pid_n * OUT_BLOCK_N], clamp_bounds=True
+        )
+        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
+        gl.amd.gfx1250.tdm.async_wait(0)
+    else:
+        # write-back via TDM store: registers -> shared memory -> global memory
+        out = out.to(gl.bfloat16)
+        Y += start_m.to(index_type) * stride_y_m
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(M, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_buffer.store(out)
+        gl.amd.gfx1250.tdm.async_store(
+            y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)

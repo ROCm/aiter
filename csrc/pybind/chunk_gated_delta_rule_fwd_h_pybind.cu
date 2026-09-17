@@ -5,7 +5,7 @@
 #include "aiter_stream.h"
 #include "chunk_gated_delta_rule_fwd_h.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     CHUNK_GDR_FWD_H_PYBIND;

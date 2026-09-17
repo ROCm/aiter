@@ -4,7 +4,7 @@
 #include "aiter_stream.h"
 #include "rmsnorm_quant.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     RMSNORM_QUANT_PYBIND;
 }

@@ -122,11 +122,12 @@ def indexer_k_quant_and_cache(
 @compile_ops("module_cache", develop=True)
 def indexer_qk_rope_quant_and_cache(
     q: Tensor,
-    q_out: Tensor,
+    q_out: Tensor,  # fp8 [T, H, head_dim] | fp4 u8 [T, H, head_dim // 2]
     weights: Tensor,
-    weights_out: Tensor,
+    weights_out: Tensor,  # fp8: fp32 w * q_scale * weights_scale; fp4: q.dtype plain w
     k: Tensor,
-    kv_cache: Tensor,
+    kv_cache: Tensor,  # fp8 [num_blocks, block_size, cache_stride]
+    # fp4 u8 [num_blocks, k_tiles, 4, kv_block_size, 16]
     slot_mapping: Tensor,
     norm_weight: Tensor,
     norm_bias: Tensor,
@@ -134,7 +135,7 @@ def indexer_qk_rope_quant_and_cache(
     cos_cache: Tensor,
     sin_cache: Tensor,
     epsilon: float,
-    quant_block_size: int,
+    quant_block_size: int,  # fp8: head_dim; fp4: 32
     scale_fmt: str,
     weights_scale: float,
     preshuffle: bool = False,
@@ -142,6 +143,10 @@ def indexer_qk_rope_quant_and_cache(
     # False (default): slot<0 rows skip the whole fused op.
     # True (DCP): compute Q/weights for every row; only valid slots write K cache.
     compute_all_q_rope: bool = False,
+    # Supplying both scale buffers switches the op to the packed e2m1 + e8m0
+    # layout that flydsl_pa_mqa_logits_fp4 consumes directly.
+    q_scale_out: Tensor | None = None,  # u8 [T, k_tiles, 4, 16, round_up(H // 16, 4)]
+    kv_cache_scale: Tensor | None = None,  # u8 [num_blocks, k_tiles, 4, kv_block_size]
 ) -> None: ...
 
 

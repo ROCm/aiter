@@ -38,6 +38,51 @@ def _get_semaphore_workspace_keyed(device: torch.device, stream_id: int) -> Tens
     return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
 
 
+# A graph records launches, not the allocation that zeroed the counter. Give
+# each recorded launch its own slot and record the zero-fill inside the graph.
+# Public: a host that records more than this raises it before its first launch.
+CAPTURE_SEMAPHORE_POOL_SLOTS = 4096
+_capture_rings: dict[torch.device, Tensor] = {}
+_capture_ring_next: dict[torch.device, int] = {}
+
+
+def _prime_capture_pool(device: torch.device) -> Tensor:
+    """Allocate the capture pool. Never called from inside a capture."""
+    ring = _capture_rings.get(device)
+    if ring is None:
+        ring = torch.zeros(
+            (CAPTURE_SEMAPHORE_POOL_SLOTS, *_SEMA_SHAPE),
+            dtype=torch.uint32,
+            device=device,
+        )
+        _capture_rings[device] = ring
+    return ring
+
+
+def _get_captured_semaphore_workspace(device: torch.device) -> Tensor:
+    ring = _capture_rings.get(device)
+    if ring is None:
+        raise RuntimeError(
+            f"no split-K a16w16 semaphore pool on {device}: the pool is "
+            "allocated by an eager call that takes the splitK path (splitK "
+            "None or > 1); make one on this device before capturing a graph."
+        )
+    idx = _capture_ring_next.get(device, 0)
+    # Bound against the pool as allocated, not the constant: raising the
+    # constant after allocation must not let idx past the end of the tensor.
+    if idx >= ring.shape[0]:
+        raise RuntimeError(
+            f"split-K a16w16 capture semaphore pool exhausted on {device}: "
+            f"{ring.shape[0]} slots recorded. Raise "
+            "aiter.ops.gemm_op_a16w16.CAPTURE_SEMAPHORE_POOL_SLOTS before the "
+            "first split-K launch; the pool is sized when it is allocated."
+        )
+    _capture_ring_next[device] = idx + 1
+    sema = ring[idx]
+    sema.zero_()  # a graph node, so every replay starts from zero
+    return sema
+
+
 def get_semaphore_workspace(device: torch.device) -> Tensor:
     """Return a per-(device, stream) zero-initialized semaphore workspace.
 
@@ -53,7 +98,30 @@ def get_semaphore_workspace(device: torch.device) -> Tensor:
     Workspace size is small (~4 KB) and stream count per process is typically
     < 8, so the LRU cap of 64 leaves plenty of headroom before any in-flight
     workspace risks being evicted.
+
+    Under capture this returns a slot from a per-device pool instead, with the
+    zero-fill recorded as a graph node so replay restores counter == 0. That
+    pool has to exist before capture starts, so the first eager splitK call on
+    a device allocates it: a fixed CAPTURE_SEMAPHORE_POOL_SLOTS * 4 KiB, paid
+    once per device even by a process that never captures a graph.
     """
+    # torch.device("cuda") means "the current device", which is not a stable
+    # key: resolve it now so the pool is keyed and allocated per GPU.
+    if device.index is None:
+        device = torch.device(device.type, torch.cuda.current_device())
+
+    # is_current_stream_capturing() answers about the current device; only pay
+    # the device switch (~1us, and this is a per-GEMM path) when it differs.
+    if device.index == torch.cuda.current_device():
+        capturing = torch.cuda.is_current_stream_capturing()
+    else:
+        with torch.cuda.device(device):
+            capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        return _get_captured_semaphore_workspace(device)
+
+    # Allocate here, never under capture: graph-pool memory cannot be freed.
+    _prime_capture_pool(device)
     stream = torch.cuda.current_stream(device)
     return _get_semaphore_workspace_keyed(device, stream.cuda_stream)
 

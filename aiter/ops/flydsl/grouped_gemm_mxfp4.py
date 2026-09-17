@@ -15,15 +15,24 @@ from .kernels.tensor_shim import ptr_arg
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
 
 
-def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
-    """Selects the environment override or the CSV setting."""
-    value = os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH")
+def _select_bool_env(name: str, csv_value: int) -> int:
+    """Select a strict 0/1 environment override or the CSV setting."""
+    value = os.environ.get(name)
     if value is None:
-        return int(bool(csv_next_stage_prefetch))
+        return int(bool(csv_value))
     value = value.strip()
     if value not in ("0", "1"):
-        raise ValueError("AITER_TDM_NEXT_STAGE_PREFETCH must be 0 or 1")
+        raise ValueError(f"{name} must be 0 or 1")
     return int(value)
+
+
+def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
+    """Selects the B-only TDM temporal hint."""
+    value = os.environ.get("AITER_TDM_B_TH")
+    temporal_hint = int(csv_tdm_b_th) if value is None else int(value.strip())
+    if not 0 <= temporal_hint <= 6:
+        raise ValueError("AITER_TDM_B_TH must be between 0 and 6")
+    return temporal_hint
 
 
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
@@ -91,11 +100,14 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    tdm_as_in_prologue=0,
+    tdm_b_th=0,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    row_major_ascale=0,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -149,8 +161,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         cluster_n,
-        _select_next_stage_prefetch(next_stage_prefetch),
+        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
         waves_per_tensor_tdm,
+        _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
+        _select_tdm_b_th(tdm_b_th),
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
         ep_combine_input_offset=(
@@ -164,5 +178,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
+        row_major_ascale=int(row_major_ascale),
     )
     return out

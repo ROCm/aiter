@@ -80,3 +80,9 @@ fallback_version = "0.1.0"
 # v0.1.16.post1 -> 0.1.16.post1) but drop arbitrary hyphen suffixes such as
 # v0.1.17-longctx -> 0.1.17 (which the default regex fails to parse).
 tag_regex = "^(?:[\\w-]+-)?(?P<version>[vV]?\\d+(?:\\.\\d+){0,2}[^-+]*(?:-(?:preview|alpha|beta|post|pre|dev|rev|rc|a|b|c|r)\\d*)?)(?:-.*)?(?:\\+.*)?$"
+
+[tool.pytest.ini_options]
+# torch.compile imports torch/utils/mkldnn.py, which uses the deprecated torch.jit.script_method.
+filterwarnings = [
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",
+]

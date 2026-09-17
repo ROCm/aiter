@@ -123,8 +123,45 @@ def test_allreduce_custom(
     }
 
 
-l_dtype = ["fp16", "bf16"]
-l_shape = [(2, 7168), (128, 8192)]
+# Custom-AR size cutoff (bytes). Mirrors _DEFAULT_CAR_MAX_SIZE in
+# aiter/dist/device_communicators/custom_all_reduce.py and honors the same
+# AITER_CUSTOM_AR_MAX_SIZE override. Inputs at or below this run on the custom
+# kernels (larger ones fall back to RCCL), so the swept size list stops here.
+_DEFAULT_CAR_MAX_BYTES = 8192 * 8192
+
+
+def _car_max_bytes() -> int:
+    e = os.environ.get("AITER_CUSTOM_AR_MAX_SIZE", "")
+    try:
+        v = int(e)
+        if v > 0:
+            return v
+    except ValueError:
+        pass
+    return _DEFAULT_CAR_MAX_BYTES
+
+
+def gen_sizes(dtype) -> list[int]:
+    """Element counts to sweep: [1024, 2048, 4096] then 7168*k / 8192*k for
+    k = 1, 2, 4, 8, ... up to the largest size custom_all_reduce serves."""
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    max_numel = _car_max_bytes() // itemsize
+    sizes = [n for n in (1024, 2048, 4096) if n <= max_numel]
+    k = 1
+    while True:
+        added = False
+        for base in (7168, 8192):
+            n = base * k
+            if n <= max_numel:
+                sizes.append(n)
+                added = True
+        if not added:
+            break
+        k *= 2
+    return sizes
+
+
+l_dtype = ["bf16", "fp16", "fp32"]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -132,10 +169,24 @@ parser.add_argument(
     "--dtype",
     type=str,
     choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="data type",
+    default="bf16",
+    help="data type (default: bf16)",
+)
+parser.add_argument(
+    "-t",
+    "--tp-size",
+    type=int,
+    choices=[2, 4, 6, 8],
+    default=8,
+    help="number of GPUs / tensor-parallel size (default: 8)",
+)
+parser.add_argument(
+    "-m",
+    "--mode",
+    type=str,
+    choices=["graph", "eager"],
+    default="graph",
+    help="execution mode (default: graph)",
 )
 parser.add_argument(
     "-s",
@@ -144,40 +195,32 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="shape. e.g. -s 128,8192",
-)
-parser.add_argument(
-    "-g",
-    "--with-graph",
-    type=lambda x: str(x).lower() in ["true", "1", "yes"],
-    default=True,
-    help="use CUDA graph (default: True). e.g. -g true or -g false",
+    help="single shape override, e.g. -s 128,8192 (default: swept size list)",
 )
 
 
 if __name__ == "__main__":
     freeze_support()
     args = parser.parse_args()
-    if args.dtype is None:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-    else:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    dtype = dtypes.d_dtypes[args.dtype]
+    with_graph = args.mode == "graph"
     if args.shape is not None:
         l_shape = [args.shape]
+    else:
+        l_shape = gen_sizes(dtype)
     df = []
-    for dtype in l_dtype:
-        for shape in l_shape:
-            ret = test_allreduce_custom(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=args.with_graph,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-            )
-            df.append(ret)
+    for shape in l_shape:
+        ret = test_allreduce_custom(
+            args.tp_size,
+            1,
+            shape,
+            dtype,
+            withGraph=with_graph,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        df.append(ret)
     df = pd.DataFrame(df)
     show_cols = [
         "tp_size",

@@ -505,6 +505,8 @@ def test_route_g2l(numel, E_global, n_buckets, variant, w_dtype):
             max_m,
             n_buckets,
             blocks,
+            ptr_arg(torch.empty(0, dtype=I32)),
+            0,
             stream=torch.cuda.current_stream().cuda_stream,
         )
 

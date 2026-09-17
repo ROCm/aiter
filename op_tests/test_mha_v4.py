@@ -1,44 +1,65 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
 import math
 import os
+import subprocess
+import sys
 from typing import NamedTuple
 
+import pandas as pd
 import pytest
 import torch
 import torch._dynamo
 
+import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
-    MHA_V4_LOG2E,
     AttentionFormat,
+    AttentionPack,
     AttentionScaleMode,
+    _RawRecipeKind,
+    _resolve_raw_recipe,
     mha_v4,
     mha_v4_kv_tile,
     mha_v4_mxfp8,
     mha_v4_packed,
-    mha_v4_q_multiplier,
     mha_v4_sparse_work_table,
+    native_fp8_format,
+    scale_modes_for_formats,
+)
+from aiter.ops.mha_v4_quant import (
+    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+    MHA_V4_KV_TILE_ROWS,
+    MHA_V4_LOG2E,
+    MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
+    MHA_V4_MXFP4_V_SCALE_TILE_BYTES,
+    MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
+    MHA_V4_QUERY_TILE_ROWS,
+    mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
-    native_fp8_format,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
+    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_mxfp4,
+    quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
+    quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
-    scale_modes_for_formats,
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
@@ -52,7 +73,9 @@ from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
+    pack_v_mxfp4_colmajor_raw,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
 def _e2m1_code_ties_low(value):
@@ -170,6 +193,8 @@ def test_attention_format_ids_are_stable():
     assert int(AttentionFormat.UINT8) == 11
     assert int(AttentionFormat.INT4) == 12
     assert int(AttentionFormat.UINT4) == 13
+    assert int(AttentionPack.DEFAULT) == 0
+    assert int(AttentionPack.V_FOR_FP6_P) == 1
 
 
 def test_mha_v4_q_multiplier_recipe():
@@ -195,6 +220,122 @@ def test_mha_v4_bf16_scale_recipe():
         AttentionScaleMode.NONE,
         AttentionScaleMode.NONE,
     )
+
+
+def test_mha_v4_bf16fp8_scale_recipe():
+    assert scale_modes_for_formats(
+        AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8
+    ) == (
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+
+
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "sparse", "kind", "v_pack"),
+    [
+        (
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            False,
+            _RawRecipeKind.BF16,
+            AttentionPack.DEFAULT,
+        ),
+        (
+            AttentionFormat.FP8,
+            AttentionFormat.MXFP6,
+            False,
+            _RawRecipeKind.FP8,
+            AttentionPack.V_FOR_FP6_P,
+        ),
+        (
+            AttentionFormat.FP8,
+            AttentionFormat.MXFP6,
+            True,
+            _RawRecipeKind.FP8,
+            AttentionPack.DEFAULT,
+        ),
+        (
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            False,
+            _RawRecipeKind.MXFP4,
+            AttentionPack.DEFAULT,
+        ),
+        (
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP4,
+            False,
+            _RawRecipeKind.MXFP6,
+            AttentionPack.V_FOR_FP6_P,
+        ),
+        (
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP4,
+            True,
+            _RawRecipeKind.MXFP6,
+            AttentionPack.DEFAULT,
+        ),
+    ],
+)
+def test_mha_v4_resolves_raw_recipe(q_format, v_format, sparse, kind, v_pack):
+    recipe = _resolve_raw_recipe(
+        q_format,
+        q_format,
+        v_format,
+        None,
+        None,
+        None,
+        sparse=sparse,
+    )
+    assert recipe.kind == kind
+    assert recipe.v_pack == v_pack
+    assert recipe.scale_modes == scale_modes_for_formats(q_format, q_format, v_format)
+
+
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "message"),
+    [
+        (
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            "does not have a BF16 manifest row",
+        ),
+        (
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            "MXFP6 Q/K/V",
+        ),
+    ],
+)
+def test_mha_v4_rejects_unavailable_sparse_recipe(q_format, v_format, message):
+    with pytest.raises(NotImplementedError, match=message):
+        _resolve_raw_recipe(
+            q_format,
+            q_format,
+            v_format,
+            None,
+            None,
+            None,
+            sparse=True,
+        )
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_mha_v4_rejects_unimplemented_mxfp4_mxfp6_recipe(sparse):
+    with pytest.raises(
+        NotImplementedError, match="raw preprocessing is not implemented"
+    ):
+        _resolve_raw_recipe(
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP6,
+            None,
+            None,
+            None,
+            sparse=sparse,
+        )
 
 
 def test_mha_v4_rejects_f8f4_format_pair():
@@ -233,6 +374,84 @@ def test_mha_v4_mxfp6_v_layout_contract():
     assert packed.stride() == (2 * 2 * 12288, 96, 2 * 12288, 1)
     assert scale.shape == (1, 2, 2 * 512)
     assert scale.dtype == torch.uint8
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+@pytest.mark.parametrize("sequence", [256, 257])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mha_v4_mxfp6_fp6_p_layout_matches_permuted_canonical(sequence, dtype):
+    torch.manual_seed(41)
+    value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=dtype)
+
+    canonical, canonical_scale = quantize_v_mxfp6(value)
+    packed, scale = quantize_v_mxfp6_fp6_p(value)
+    token = torch.arange(value.shape[1], device=value.device)
+    within_block = token % 64
+    paired = (
+        (within_block & ~0x24)
+        | ((within_block & 0x04) << 3)
+        | ((within_block & 0x20) >> 3)
+    )
+    source_token = torch.minimum(
+        token - within_block + paired, token.new_tensor(sequence - 1)
+    )
+    permuted = value[:, source_token].contiguous()
+    expected, expected_scale = quantize_v_mxfp6(permuted)
+    tiles = (sequence + 127) // 128
+    data_size = value.shape[0] * value.shape[2] * tiles * 12288
+
+    assert torch.equal(
+        packed.as_strided((data_size,), (1,)),
+        expected.as_strided((data_size,), (1,)),
+    )
+    assert torch.equal(scale.reshape(-1), expected_scale.reshape(-1))
+    assert not torch.equal(packed, canonical)
+    assert not torch.equal(scale, canonical_scale)
+
+    # The producer zeroes trailing slack for the ASM's speculative reads, and comparing only
+    # data_size bytes would let a regression there pass unnoticed.
+    slack = MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES
+    assert packed.untyped_storage().nbytes() == data_size + slack
+    assert torch.equal(
+        packed.as_strided((slack,), (1,), data_size),
+        torch.zeros(slack, device=packed.device, dtype=torch.uint8),
+    )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 F8F6 kernel")
+def test_mha_v4_f8f6_raw_compile_parity():
+    torch.manual_seed(43)
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    eager_out = torch.empty_like(q)
+    compiled_out = torch.empty_like(q)
+    fp8_format = native_fp8_format()
+
+    eager = mha_v4(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        AttentionFormat.MXFP6,
+        out=eager_out,
+    )
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        AttentionFormat.MXFP6,
+        out=compiled_out,
+    )
+    torch.cuda.synchronize()
+
+    assert eager.data_ptr() == eager_out.data_ptr()
+    assert compiled.data_ptr() == compiled_out.data_ptr()
+    assert torch.equal(compiled, eager)
+    assert torch.isfinite(compiled).all()
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
@@ -523,7 +742,7 @@ def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, hea
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
-@pytest.mark.parametrize("sequence", [1, 127, 128, 129, 257])
+@pytest.mark.parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
 def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -538,6 +757,10 @@ def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
     assert torch.equal(scale, expected_scale)
     assert torch.equal(raw, raw_again)
     assert torch.equal(scale, scale_again)
+    # The HIP producer replaced a Triton packer; keep the retired one as a second oracle.
+    triton_raw, triton_scale = pack_v_mxfp4_colmajor_raw(value)
+    assert torch.equal(raw, triton_raw)
+    assert torch.equal(scale, triton_scale)
     assert torch.count_nonzero(raw[-64:]) == 0
     logical = mxfp4_v_view(raw, scale, sequence)
     assert logical.shape == value.shape
@@ -547,6 +770,44 @@ def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
         fp4_v_padded_sequence(sequence) * 64,
         1,
     )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
+@pytest.mark.parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
+def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
+    torch.manual_seed(sequence)
+    value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
+    token = torch.arange(sequence, device=value.device)
+    within_block = token % 64
+    paired = (
+        (within_block & ~0x24)
+        | ((within_block & 0x04) << 3)
+        | ((within_block & 0x20) >> 3)
+    )
+    source_token = torch.minimum(
+        token - within_block + paired, token.new_tensor(sequence - 1)
+    )
+
+    production_raw, production_scale = quantize_v_mxfp4_fp6_p(value)
+    compiled_raw, compiled_scale = torch.compile(
+        quantize_v_mxfp4_fp6_p, fullgraph=True
+    )(value)
+    expected_raw, expected_scale = pack_v_mxfp4_colmajor_raw(
+        value[:, source_token].contiguous()
+    )
+
+    assert torch.equal(production_raw, expected_raw)
+    assert torch.equal(production_scale, expected_scale)
+    slack = MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
+    assert (
+        production_scale.untyped_storage().nbytes() == production_scale.numel() + slack
+    )
+    assert torch.equal(
+        production_scale.as_strided((slack,), (1,), production_scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
+    assert torch.equal(compiled_raw, expected_raw)
+    assert torch.equal(compiled_scale, expected_scale)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 K validation")
@@ -608,7 +869,79 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     assert torch.equal(raw[raw_offset], expected)
 
     assert torch.equal(scale, dense_scale)
+    # The gather addresses whole KV tiles plus the producer lookahead, so the backing storage has to
+    # cover those rows and read as zero.
+    padded = tiles * MHA_V4_KV_TILE_ROWS + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+    slack = (padded - sequence) * 3 * 4 + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
+    assert torch.equal(
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
     assert coalesced.stride() == (3 * tiles * 8192, 64, tiles * 8192, 1)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
+@pytest.mark.parametrize("sequence", [1, 255, 256, 257, 513])
+@pytest.mark.parametrize(
+    "quantize",
+    [
+        lambda t: quantize_mxfp8_q(t, 1.0),
+        lambda t: quantize_mxfp4_q(t, 1.0),
+        lambda t: quantize_mxfp6_q(t, 1.0),
+    ],
+    ids=["mxfp8", "mxfp4", "mxfp6"],
+)
+def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
+    """The ASM Q-scale gather addresses all 256 rows of the tile it is running.
+
+    A partial final tile therefore reads past the logical sequence, so the backing storage must
+    cover the padded tile and read as zero. Without it those loads walk off the tensor and fault
+    the GPU at an unrelated later synchronization.
+    """
+    heads = 3
+    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    _, scale = quantize(value)
+
+    padded = -(-sequence // MHA_V4_QUERY_TILE_ROWS) * MHA_V4_QUERY_TILE_ROWS
+    slack = (padded - sequence) * heads * 4
+    assert scale.shape == (2, sequence, heads, 4)
+    assert scale.is_contiguous()
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
+    assert torch.equal(
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
+@pytest.mark.parametrize("sequence", [1, 128, 129, 257, 512])
+@pytest.mark.parametrize(
+    "quantize",
+    [quantize_v_mxfp4, quantize_v_mxfp4_fp6_p],
+    ids=["canonical", "fp6_p"],
+)
+def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
+    quantize, sequence
+):
+    """The MXFP4 Q/K rows gather V scales two 512-byte tiles ahead of the running tile.
+
+    The lead does not shrink at the end of the sequence, so the last tiles address scale bytes
+    past the final one whatever the length. Measured on gfx950: 1023 trailing mapped bytes still
+    fault, 1024 do not.
+    """
+    heads = 3
+    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    _, scale = quantize(value)
+
+    slack = MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
+    assert slack == 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    assert scale.is_contiguous()
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
+    assert torch.equal(
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
 
 
 def test_mha_v4_rejects_unsupported_contracts():
@@ -658,6 +991,36 @@ def test_mha_v4_rejects_reserved_raw_formats(q_format):
         )
 
 
+def test_mha_v4_raw_rejects_partial_scale_recipe():
+    q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="must all be set or all omitted"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        )
+
+
+def test_mha_v4_raw_rejects_unsupported_scale_recipe():
+    q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="unsupported scale recipe"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            v_scale_mode=AttentionScaleMode.F32_PER_CHANNEL,
+        )
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_packed_rejects_wrong_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.int8)
@@ -683,7 +1046,11 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
+    # The Q-scale gather covers the whole 256-row query tile, so back the view with those rows.
+    scale_storage = torch.ones(
+        MHA_V4_QUERY_TILE_ROWS * 2 * 4, device="cuda", dtype=torch.uint8
+    )
+    qk_scale = scale_storage[: 128 * 2 * 4].view(1, 128, 2, 4)
     v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
     mha_v4_packed(
         q,
@@ -761,11 +1128,78 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     assert coalesced_k.stride() == (16384, 64, 8192, 1)
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
+def test_mha_v4_packed_rejects_unbacked_mx_scales():
+    """An external caller passing exact-size scales would fault the speculative gathers.
+
+    clone() keeps the logical shape the size checks look at but drops the producer's
+    zeroed slack, which is exactly the shape of a caller-supplied tensor.
+    """
+    torch.manual_seed(5)
+    value = torch.randn((1, 257, 2, 128), device="cuda", dtype=torch.bfloat16)
+    fp8_format = native_fp8_format()
+
+    q_packed, q_scale = quantize_mxfp8_q(value, 1.0)
+    k_packed, k_scale = quantize_mxfp8_k(value)
+    v_packed, v_scale = quantize_fp8(value)
+    with pytest.raises(RuntimeError, match="speculative tile gather"):
+        mha_v4_packed(
+            q_packed,
+            k_packed,
+            v_packed,
+            q_scale.clone(),
+            k_scale,
+            v_scale,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.F32_PER_TENSOR,
+        )
+
+    mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
+    mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)
+    mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4(value)
+    with pytest.raises(RuntimeError, match="speculative tile gather"):
+        mha_v4_packed(
+            mxfp4_q,
+            mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
+            mxfp4_v_view(mxfp4_v_raw, mxfp4_v_scale, value.shape[1]),
+            mxfp4_q_scale,
+            mxfp4_k_scale.clone(),
+            mxfp4_v_scale,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+        )
+
+    with pytest.raises(RuntimeError, match="MX V descale needs"):
+        mha_v4_packed(
+            mxfp4_q,
+            mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
+            mxfp4_v_view(mxfp4_v_raw, mxfp4_v_scale, value.shape[1]),
+            mxfp4_q_scale,
+            mxfp4_k_scale,
+            mxfp4_v_scale.clone(),
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+        )
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8),
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
     ],
@@ -776,6 +1210,40 @@ def test_mha_v4_zero_inputs_are_finite(q_format, v_format):
     torch.cuda.synchronize()
     assert torch.count_nonzero(out) == 0
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
+@pytest.mark.parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
+def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
+    torch.manual_seed(sequence_q + sequence_k)
+    q = torch.randn((1, sequence_q, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, sequence_k, 5, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    v_quantized, v_descale = quantize_fp8(v)
+    v_dequantized = v_quantized.float() * v_descale
+    scores = torch.matmul(
+        q.transpose(1, 2).float(), k.transpose(1, 2).float().transpose(-1, -2)
+    ) * (128**-0.5)
+    reference = torch.matmul(
+        torch.softmax(scores, dim=-1), v_dequantized.transpose(1, 2)
+    ).transpose(1, 2)
+
+    actual = mha_v4(
+        q,
+        k,
+        v,
+        AttentionFormat.BF16,
+        AttentionFormat.BF16,
+        AttentionFormat.FP8,
+    )
+    torch.cuda.synchronize()
+
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), reference.flatten(), dim=0
+    )
+    assert torch.isfinite(actual).all()
+    assert cosine > 0.998
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
@@ -791,7 +1259,7 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
         v,
         AttentionFormat.MXFP4,
         AttentionFormat.MXFP4,
-        AttentionFormat.FP8,
+        AttentionFormat.MXFP4,
     )
     mha = mha_v4(
         q,
@@ -799,7 +1267,7 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
         v.repeat_interleave(16, dim=2),
         AttentionFormat.MXFP4,
         AttentionFormat.MXFP4,
-        AttentionFormat.FP8,
+        AttentionFormat.MXFP4,
     )
     torch.cuda.synchronize()
 
@@ -931,12 +1399,13 @@ def test_mha_v4_native_schema_mutates_only_out():
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8),
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.MXFP6),
-        (AttentionFormat.MXFP4, AttentionFormat.FP8),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4),
     ],
 )
@@ -965,7 +1434,33 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
-def test_mha_v4_mxfp8_raw_compile_parity():
+def test_mha_v4_mxfp8_deprecated_alias_matches_mha_v4():
+    torch.manual_seed(41)
+    q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    fp8_format = native_fp8_format()
+
+    expected = mha_v4(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+    )
+    with pytest.deprecated_call():
+        actual = mha_v4_mxfp8(q, k, v)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+def test_mha_v4_raw_mxfp8_compile_parity():
     torch.manual_seed(41)
     q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
@@ -973,8 +1468,36 @@ def test_mha_v4_mxfp8_raw_compile_parity():
     eager_out = torch.empty_like(q)
     compiled_out = torch.empty_like(q)
 
-    eager = mha_v4_mxfp8(q, k, v, out=eager_out)
-    compiled = torch.compile(mha_v4_mxfp8, fullgraph=True)(q, k, v, out=compiled_out)
+    fp8_format = native_fp8_format()
+    scale_modes = (
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+    eager = mha_v4(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        out=eager_out,
+        q_scale_mode=scale_modes[0],
+        k_scale_mode=scale_modes[1],
+        v_scale_mode=scale_modes[2],
+    )
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        out=compiled_out,
+        q_scale_mode=scale_modes[0],
+        k_scale_mode=scale_modes[1],
+        v_scale_mode=scale_modes[2],
+    )
     torch.cuda.synchronize()
 
     assert eager.data_ptr() == eager_out.data_ptr()
@@ -1165,48 +1688,188 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
 @pytest.mark.parametrize(
-    ("q_format", "v_format"),
+    "launch",
     [
         pytest.param(
-            native_fp8_format(),
-            native_fp8_format(),
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                native_fp8_format(),
+                native_fp8_format(),
+                native_fp8_format(),
+                block_mask=mask,
+            ),
             id="fp8",
         ),
         pytest.param(
-            AttentionFormat.FP8,
-            AttentionFormat.MXFP6,
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MXFP6 sparse"
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.INT8,
+                AttentionFormat.INT8,
+                native_fp8_format(),
+                block_mask=mask,
             ),
+            id="i8fp8",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                native_fp8_format(),
+                native_fp8_format(),
+                native_fp8_format(),
+                block_mask=mask,
+                q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+                k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+                v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            id="mxfp8",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                native_fp8_format(),
+                native_fp8_format(),
+                AttentionFormat.MXFP6,
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
             id="f8f6",
         ),
         pytest.param(
-            AttentionFormat.INT8,
-            native_fp8_format(),
-            id="i8fp8",
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.MXFP6,
+                AttentionFormat.MXFP6,
+                native_fp8_format(),
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            id="f6f8",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.MXFP6,
+                AttentionFormat.MXFP6,
+                AttentionFormat.MXFP4,
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            id="f6f4",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.MXFP4,
+                AttentionFormat.MXFP4,
+                AttentionFormat.MXFP4 if mask is None else native_fp8_format(),
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            id="mxfp4",
         ),
     ],
 )
-def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
+def test_mha_v4_sparse_all_true_mask_matches_dense(launch):
     torch.manual_seed(41)
-    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    kv_tiles = 256 // mha_v4_kv_tile()
-    mask = torch.ones((1, 2, 1, kv_tiles), device="cuda", dtype=torch.bool)
-    dense = mha_v4(q, k, v, q_format, q_format, v_format)
-    sparse = mha_v4(
-        q,
-        k,
-        v,
-        q_format,
-        q_format,
-        v_format,
-        block_mask=mask,
+    mask = torch.ones(
+        (1, 5, 2, 512 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
     )
+    dense = launch(q, k, v, None)
+    sparse = launch(q, k, v, mask)
     torch.cuda.synchronize()
-    assert torch.equal(dense, sparse)
+    _assert_sparse_matches_dense(sparse, dense)
+
+
+def _assert_sparse_matches_dense(sparse, dense, message=None):
+    """Compare code objects that use different softmax reduction schedules."""
+    cosine = torch.nn.functional.cosine_similarity(
+        sparse.float().flatten(), dense.float().flatten(), dim=0
+    )
+    assert cosine > 0.99, message
     assert torch.isfinite(sparse).all()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
+    """Retained FP8-P sparse F4F4 remains close to dense FP6-P on an all-true mask."""
+    torch.manual_seed(41)
+    q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = torch.ones(
+        (1, 5, 2, 512 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+    )
+    args = (AttentionFormat.MXFP4,) * 3
+    dense = mha_v4(q, k, v, *args)
+    sparse = mha_v4(q, k, v, *args, block_mask=mask)
+    torch.cuda.synchronize()
+
+    _assert_sparse_matches_dense(sparse, dense)
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.parametrize(
+    "v_format",
+    [
+        pytest.param(AttentionFormat.BF16, id="bf16"),
+        pytest.param(native_fp8_format(), id="bf16fp8"),
+    ],
+)
+def test_mha_v4_sparse_dense_only_formats_reject_block_mask(v_format):
+    q = torch.zeros((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(
+        (1, 2, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+    )
+    with pytest.raises(NotImplementedError, match="does not have a BF16 manifest row"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            v_format,
+            block_mask=mask,
+        )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 validation")
+def test_mha_v4_mxfp6_rejects_block_mask():
+    q = torch.zeros((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(
+        (1, 2, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+    )
+    with pytest.raises(NotImplementedError, match="MXFP6 Q/K/V"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            block_mask=mask,
+        )
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
@@ -1280,9 +1943,7 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     k_repeated = k.repeat_interleave(gqa_ratio, dim=2)
     v_repeated = v.repeat_interleave(gqa_ratio, dim=2)
 
-    gqa_dense = mha_v4(q, k, v, q_format, q_format, v_format)
     gqa_sparse = mha_v4(q, k, v, q_format, q_format, v_format, block_mask=mask)
-    mha_dense = mha_v4(q, k_repeated, v_repeated, q_format, q_format, v_format)
     mha_sparse = mha_v4(
         q,
         k_repeated,
@@ -1294,10 +1955,13 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(gqa_dense, mha_dense)
-    assert torch.equal(gqa_sparse, gqa_dense)
     assert torch.equal(gqa_sparse, mha_sparse)
-    assert torch.isfinite(gqa_sparse).all()
+    if q_format != AttentionFormat.MXFP4:
+        gqa_dense = mha_v4(q, k, v, q_format, q_format, v_format)
+        mha_dense = mha_v4(q, k_repeated, v_repeated, q_format, q_format, v_format)
+        assert torch.equal(gqa_dense, mha_dense)
+        _assert_sparse_matches_dense(gqa_sparse, gqa_dense)
+    assert torch.equal(gqa_sparse, mha_sparse)
 
 
 class _Operand(NamedTuple):
@@ -1400,8 +2064,7 @@ def test_mha_v4_sparse_reads_only_the_kv_tiles_the_lut_names(tiles):
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(sparse, dense)
-    assert torch.isfinite(sparse).all()
+    _assert_sparse_matches_dense(sparse, dense)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
@@ -1454,9 +2117,11 @@ def test_mha_v4_sparse_gives_each_head_its_own_kv_tiles():
             q, _gather_kv_tiles(k, tiles), _gather_kv_tiles(v, tiles)
         )
         torch.cuda.synchronize()
-        assert torch.equal(
-            sparse[:, :, head], dense[:, :, head]
-        ), f"head {head} did not attend to tiles {tiles}"
+        _assert_sparse_matches_dense(
+            sparse[:, :, head],
+            dense[:, :, head],
+            f"head {head} did not attend to tiles {tiles}",
+        )
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
@@ -1486,9 +2151,11 @@ def test_mha_v4_sparse_follows_the_lut_across_query_tiles():
         )
         torch.cuda.synchronize()
         rows = slice(q_tile * 256, (q_tile + 1) * 256)
-        assert torch.equal(
-            sparse[:, rows], dense[:, rows]
-        ), f"query tile {q_tile} did not attend to tiles {tiles}"
+        _assert_sparse_matches_dense(
+            sparse[:, rows],
+            dense[:, rows],
+            f"query tile {q_tile} did not attend to tiles {tiles}",
+        )
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
@@ -1531,9 +2198,11 @@ def test_mha_v4_sparse_partial_query_tile_follows_the_lut(tail_rows):
         torch.cuda.synchronize()
         rows = slice(q_tile * 256, min((q_tile + 1) * 256, sparse.shape[1]))
         live_heads = 1 if q_tile == q_tiles - 1 else heads
-        assert torch.equal(
-            sparse[:, rows, :live_heads], dense[:, rows, :live_heads]
-        ), f"query tile {q_tile} did not attend to tiles {tiles}"
+        _assert_sparse_matches_dense(
+            sparse[:, rows, :live_heads],
+            dense[:, rows, :live_heads],
+            f"query tile {q_tile} did not attend to tiles {tiles}",
+        )
 
     tail = slice((q_tiles - 1) * 256, sparse.shape[1])
     assert torch.equal(
@@ -1555,8 +2224,6 @@ def _gfx950_only(launch, label):
     )
 
 
-# An FP8 Q always canonicalizes to per-tensor scales, so MXFP8 is unreachable through raw mha_v4
-# and goes through its own entry point instead.
 _EMPTY_ROW_LAUNCHES = [
     pytest.param(
         lambda q, k, v, m: mha_v4(
@@ -1582,7 +2249,21 @@ _EMPTY_ROW_LAUNCHES = [
         ),
         id="i8fp8",
     ),
-    _gfx950_only(lambda q, k, v, m: mha_v4_mxfp8(q, k, v, block_mask=m), "mxfp8"),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            native_fp8_format(),
+            native_fp8_format(),
+            native_fp8_format(),
+            block_mask=m,
+            q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+        ),
+        "mxfp8",
+    ),
     _gfx950_only(
         lambda q, k, v, m: mha_v4(
             q,
@@ -1605,7 +2286,7 @@ _EMPTY_ROW_LAUNCHES = [
             native_fp8_format(),
             block_mask=m,
         ),
-        "mxfp6",
+        "f6f8",
     ),
     _gfx950_only(
         lambda q, k, v, m: mha_v4(
@@ -1767,52 +2448,166 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.skipif(
-    os.environ.get("AITER_MHA_V4_VALIDATE_LUT", "0") in ("0", ""),
-    reason="opt-in LUT validation is disabled",
-)
 @pytest.mark.parametrize(
-    "mutate,message",
+    "mutation,message",
     [
         pytest.param(
-            lambda indices, start, count: indices.fill_(9999),
+            "indices.fill_(9999)",
             "outside",
             id="index_out_of_range",
         ),
         pytest.param(
-            lambda indices, start, count: start.fill_(-1),
+            "start.fill_(-1)",
             "negative",
             id="negative_start",
         ),
     ],
 )
-def test_mha_v4_sparse_validation_rejects_malformed_lut(mutate, message):
-    """Only reachable with AITER_MHA_V4_VALIDATE_LUT=1; otherwise these fault in the ASM."""
-    heads = 2
-    kv_tile = mha_v4_kv_tile()
-    kv_tiles = 4
-    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
-    mask = _tile_mask(heads, kv_tiles, (0, 1))
-    indices, start, count = block_attn_mask_to_ragged_lut(
-        mask, num_heads=heads, return_none_if_dense=False
+def test_mha_v4_sparse_validation_rejects_malformed_lut(mutation, message):
+    """Enable opt-in validation before AITER loads, without slowing the parent test process."""
+    probe = f"""
+from op_tests.test_mha_v4 import (
+    AttentionFormat,
+    AttentionScaleMode,
+    _sparse_fp8_operands,
+    _tile_mask,
+    block_attn_mask_to_ragged_lut,
+    mha_v4_kv_tile,
+    mha_v4_packed,
+    native_fp8_format,
+)
+
+heads = 2
+kv_tiles = 4
+q, k, v = _sparse_fp8_operands(
+    sequence_k=kv_tiles * mha_v4_kv_tile(), heads=heads
+)
+mask = _tile_mask(heads, kv_tiles, (0, 1))
+indices, start, count = block_attn_mask_to_ragged_lut(
+    mask, num_heads=heads, return_none_if_dense=False
+)
+{mutation}
+fp8_format = native_fp8_format()
+mha_v4_packed(
+    q.quantized,
+    k.quantized,
+    v.quantized,
+    q.descale,
+    k.descale,
+    v.descale,
+    fp8_format,
+    fp8_format,
+    fp8_format,
+    AttentionScaleMode.F32_PER_TENSOR,
+    AttentionScaleMode.F32_PER_TENSOR,
+    AttentionScaleMode.F32_PER_TENSOR,
+    kv_block_indices=indices,
+    lut_start=start,
+    lut_count=count,
+)
+"""
+    env = {**os.environ, "AITER_MHA_V4_VALIDATE_LUT": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=AITER_ROOT_DIR,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    mutate(indices, start, count)
-    fp8_format = native_fp8_format()
-    with pytest.raises(RuntimeError, match=message):
-        mha_v4_packed(
-            q.quantized,
-            k.quantized,
-            v.quantized,
-            q.descale,
-            k.descale,
-            v.descale,
-            fp8_format,
-            fp8_format,
-            fp8_format,
-            AttentionScaleMode.F32_PER_TENSOR,
-            AttentionScaleMode.F32_PER_TENSOR,
-            AttentionScaleMode.F32_PER_TENSOR,
-            kv_block_indices=indices,
-            lut_start=start,
-            lut_count=count,
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def run_torch_mha_v4(q, k, v, softmax_scale):
+    """Compute dense BSHD attention in FP32 for benchmark validation."""
+    scores = (
+        torch.matmul(
+            q.transpose(1, 2).float(), k.transpose(1, 2).float().transpose(-1, -2)
         )
+        * softmax_scale
+    )
+    return torch.matmul(
+        torch.softmax(scores, dim=-1), v.transpose(1, 2).float()
+    ).transpose(1, 2)
+
+
+@benchmark()
+def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
+    """Benchmark the public dense BF16 MHA v4 path against a Torch reference."""
+    head_dim = 128
+    softmax_scale = head_dim**-0.5
+    torch.manual_seed(batch + sequence_q + sequence_k + heads)
+    q = torch.randn((batch, sequence_q, heads, head_dim), device="cuda", dtype=dtype)
+    k = torch.randn((batch, sequence_k, heads, head_dim), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    reference = run_torch_mha_v4(q, k, v, softmax_scale)
+    candidates = {
+        "mha_v4": lambda: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            softmax_scale=softmax_scale,
+        )
+    }
+    flops = 4 * batch * heads * sequence_q * sequence_k * head_dim
+    elements = batch * heads * head_dim * (sequence_q * 2 + sequence_k * 2)
+    nbytes = elements * q.element_size()
+    ret = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        output, us = run_perftest(candidate)
+        err = checkAllclose(
+            reference,
+            output.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{name}: dense BF16",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "MHA v4 BF16 benchmark unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark dense BF16 MHA v4",
+    )
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1])
+    parser.add_argument("--sequence-q", type=int, nargs="*", default=[128, 256])
+    parser.add_argument("--sequence-k", type=int, nargs="*", default=[128, 256])
+    parser.add_argument("--heads", type=int, nargs="*", default=[2, 8])
+    parser.add_argument(
+        "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for batch, sequence_q, sequence_k, heads, dtype in itertools.product(
+        args.batch, args.sequence_q, args.sequence_k, args.heads, args.dtype
+    ):
+        if dtype != dtypes.bf16:
+            aiter.logger.warning("MHA v4 BF16 benchmark skips dtype %s", dtype)
+            continue
+        rows.append(benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype))
+    if rows:
+        frame = pd.DataFrame(rows)
+        aiter.logger.info(
+            "MHA v4 dense BF16 summary (markdown):\n%s",
+            frame.to_markdown(index=False),
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -34,11 +34,12 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 
 from __future__ import annotations
 
-from flydsl._mlir.dialects import llvm
+import flydsl.expr as fx
 from flydsl.expr import arith, rocdl
 from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
@@ -115,6 +116,7 @@ def emit_mx_e8m0_scale(
     """
     # Normalise int / pybind enum into a plain int -- pybind11 enum classes
     # don't auto-compare equal to ``int`` (unlike ``IntEnum``).
+    local_max = _raw(local_max)
     mode_int = int(mode)
     dtype_int = int(dtype)
     if dtype_int not in _DTYPE_CFG:
@@ -135,7 +137,7 @@ def emit_mx_e8m0_scale(
         # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological
         # inputs (denormals, fp32 inf, mantissa bump from 0xFF -> 0x100) can
         # otherwise corrupt the stored uint8.
-        return arith.minsi(arith.maxsi(x, c0_i32), c0xFF_i32)
+        return fx.min(fx.max(fx.Int32(x), fx.Int32(0)), fx.Int32(0xFF)).ir_value()
 
     if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
@@ -269,7 +271,7 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     # every step stalls on the last (one s_delay_alu each). The tree is log2(N)
     # deep with N/2 independent maxes per level for the scheduler to interleave.
     level = [arith.constant(0.0, type=T.f32)] + [
-        llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], []) for v in all_vals
+        abs(fx.Float32(v)).ir_value() for v in all_vals
     ]
     while len(level) > 1:
         nxt = [
@@ -286,11 +288,6 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     scale_f32 = (e8m0 << c23).bitcast(T.f32)
     e8m0_byte = arith.trunci(T.i8, e8m0)
     return scale_f32, e8m0_byte
-
-
-def _raw(value):
-    """Unwrap a DSL Numeric to a raw ir.Value (rocdl/inline_asm need raw operands)."""
-    return value.ir_value() if hasattr(value, "ir_value") else value
 
 
 def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):

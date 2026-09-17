@@ -4,6 +4,7 @@
 """FlyDSL variable-length decode TopK."""
 
 from functools import cache
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -25,6 +26,7 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
+    kernel_signature,
     uint32_to_int32,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
@@ -40,6 +42,18 @@ _DPP_BANK_MASK = 0xF
 _BLOCK_THREADS = 1024
 _REDUCE_THREADS = 256
 _CHUNKS_PER_ROW = 16
+# Chunks trade the two halves of the algorithm against each other: more chunks
+# read the row with more of the machine, and make the single-block reduce --
+# which walks chunks * num_bins counters -- proportionally dearer. 16 was not
+# chosen on that curve; it is the largest value the stable path's
+# one-wave-per-chunk prefix could express before `fused_prefix_num_waves` was
+# capped. Measured at N=1M, k=512, M=1: 16 -> 58.1us, 32 -> 39.6us, 64 -> 46.3,
+# 128 -> 138. At M=64 the balance inverts and 8 wins, so the host picks a value
+# per shape; see `topk_per_row_decode_chunks`.
+_MAX_BLOCK_THREADS = 1024
+# The cross-chunk prefix at the end of `stable_count_prefix_kernel` is a single
+# wave, so it cannot carry more chunks than a wave has lanes.
+_MAX_CHUNKS_PER_ROW = 64
 _STATE_PREFIX = 0
 _STATE_MASK = 1
 _STATE_REMAINING_K = 2
@@ -49,9 +63,91 @@ _STATE_DIRECT = 5
 _STATE_SIZE = 6
 
 
-def topk_per_row_decode_workspace_shapes(rows: int, stable: bool):
+def topk_per_row_decode_workspace_shapes(
+    rows: int, stable: bool, chunks_per_row: int = _CHUNKS_PER_ROW
+):
     hist_bins = (1 << _RADIX_BITS) + 2 * int(stable)
-    return (rows, _CHUNKS_PER_ROW, hist_bins), (rows, _STATE_SIZE)
+    return (rows, chunks_per_row, hist_bins), (rows, _STATE_SIZE)
+
+
+def _pow2_floor(value: int) -> int:
+    return 1 << max(0, max(1, int(value)).bit_length() - 1)
+
+
+def topk_per_row_decode_chunks(rows: int, width: int, wave_size: int) -> int:
+    """How many blocks per row to give the histogram and gather passes.
+
+    One row is `chunks_per_row` blocks, so the grid is `rows * chunks_per_row`.
+    Chunks buy parallelism in the two passes that read the row and cost
+    parallelism in the reduce, which is one block per row walking
+    `chunks * num_bins` counters. Which side wins moves with both the row count
+    and the row width, so a constant -- 16, as this was -- is right almost
+    nowhere:
+
+        N=32768,  M=1024: 16 -> 436.7us,  4 ->  166.8us   (2.62x)
+        N=32768,  M=256:  16 -> 123.6us,  4 ->   60.5us   (2.04x)
+        N=1048576, M=4:   16 ->  68.3us, 32 ->   50.7us   (1.35x)
+        N=1048576, M=1:   16 ->  67.4us, 32 ->   51.0us   (1.32x)
+
+    Two independent caps, both fitted to that sweep:
+
+    * `512 // rows` -- once the rows alone fill the machine, more chunks only
+      lengthens the reduce. This is the term that carries the large-M wins.
+    * `vectors // 4096` -- a chunk of a narrow row does not have the work to
+      cover its own histogram sweep and its share of the reduce.
+
+    Powers of two only: the reduce is unrolled over chunks, and a ragged count
+    splits the row's vectors unevenly. Capped at 32 because 64 was not the best
+    value at any measured shape, and floored at 4 because that is the smallest
+    value measured -- below it the curve is unknown, not known to be flat.
+
+    Worst case against a per-shape oracle over the sweep is 1.08x, and the worst
+    regression against the old constant is 1.4us on a 33us shape.
+    """
+    vectors = (width + _VEC - 1) // _VEC
+    chunks = min(
+        _pow2_floor(512 // max(1, rows)),
+        _pow2_floor(max(1, vectors // 4096)),
+    )
+    # 32 is the policy ceiling; `_MAX_CHUNKS_PER_ROW` and the wave size are the
+    # structural ones the stable path's single-wave prefix imposes.
+    return max(4, min(chunks, 32, _MAX_CHUNKS_PER_ROW, wave_size))
+
+
+class _RadixPass(NamedTuple):
+    """The constants one radix pass runs on.
+
+    ``num_bins`` and ``previous_num_bins`` are compile-time: the pass over the
+    low 10 bits specializes to a body roughly half the size of an 11-bit pass.
+    They are derived here rather than in the launcher so the same values can
+    name the kernels at build time.
+    """
+
+    shift: int
+    radix_mask: int
+    xor_val: int
+    num_bins: int
+    previous_shift: int
+    previous_mask: int
+    previous_xor: int
+    previous_num_bins: int
+
+
+def _radix_pass(pass_idx: int) -> _RadixPass:
+    remaining_bits = _KEY_BITS - pass_idx * _RADIX_BITS
+    radix_bits = min(_RADIX_BITS, remaining_bits)
+    shift = remaining_bits - radix_bits
+    previous_radix_bits = 0 if pass_idx == 0 else _RADIX_BITS
+    return _RadixPass(
+        shift=shift,
+        radix_mask=(1 << radix_bits) - 1,
+        xor_val=1 << (radix_bits - 1) if pass_idx == 0 else 0,
+        num_bins=1 << radix_bits,
+        previous_shift=0 if pass_idx == 0 else shift + radix_bits,
+        previous_mask=0 if pass_idx == 0 else (1 << previous_radix_bits) - 1,
+        previous_xor=1 << (previous_radix_bits - 1) if pass_idx == 1 else 0,
+        previous_num_bins=0 if pass_idx == 0 else 1 << previous_radix_bits,
+    )
 
 
 def _f32_to_ord(val):
@@ -156,6 +252,7 @@ def build_topk_per_row_decode_module(
     stable: bool,
     wave_size: int,
     write_values: bool = False,
+    chunks_per_row: int = _CHUNKS_PER_ROW,
 ):
     """Build a multi-launch radix TopK with runtime row width and MTP geometry."""
     if wave_size not in (32, 64):
@@ -169,16 +266,45 @@ def build_topk_per_row_decode_module(
     # stays at 256 threads to retain vectorized partial-histogram loads.
     block_threads = _BLOCK_THREADS
     reduce_threads = _REDUCE_THREADS
-    chunks_per_row = _CHUNKS_PER_ROW
+    if not 1 <= chunks_per_row <= _MAX_CHUNKS_PER_ROW:
+        raise ValueError(
+            f"chunks_per_row must be in [1, {_MAX_CHUNKS_PER_ROW}], got "
+            f"{chunks_per_row}; the stable path's cross-chunk prefix is one wave"
+        )
+    if stable and chunks_per_row > wave_size:
+        raise ValueError(
+            f"chunks_per_row={chunks_per_row} exceeds the wave size "
+            f"({wave_size}), which the stable cross-chunk prefix cannot span"
+        )
     block_num_waves = block_threads // wave_size
     reduce_num_waves = reduce_threads // wave_size
-    fused_prefix_num_waves = chunks_per_row
+    # One wave per chunk, but never a wider workgroup than the hardware takes.
+    # Beyond that the kernel's `chunk_group` loop walks the chunks in rounds,
+    # which is why raising `chunks_per_row` past 16 needed no new code here.
+    fused_prefix_num_waves = min(chunks_per_row, _MAX_BLOCK_THREADS // wave_size)
     fused_prefix_threads = fused_prefix_num_waves * wave_size
     vecs_per_grid_step = chunks_per_row * block_threads
     output_steps = (k + block_threads - 1) // block_threads
+    # Every value that shapes a kernel body, including the two module constants:
+    # they are constants only by default, and a build that varies one must not
+    # land on the symbol of a build that did not.
+    sig = kernel_signature(
+        k=k,
+        stable=stable,
+        wave=wave_size,
+        wv=write_values,
+        chunks=chunks_per_row,
+        blk=block_threads,
+    )
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
-    def histogram_kernel(
+    # The histogram and reduce-select bodies are each instantiated once per
+    # radix pass, with different compile-time bin counts. Decorating one body
+    # per pass -- rather than decorating once and calling it three times -- is
+    # what puts the pass in the symbol. Left to itself the compiler reserves the
+    # repeated name and appends `_2`, `_4`, ... in emission order, so inserting
+    # or reordering a pass silently remaps every later symbol and a profile
+    # taken before the change cannot be compared with one taken after.
+    def histogram_body(
         input: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
@@ -203,9 +329,15 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        # Slice the row first, then build the descriptor over it. Built over
+        # the whole tensor and sliced afterwards, the row offset has to fit the
+        # descriptor's 32-bit byte count and its 32-bit voffset, so anything at
+        # or past 4 GiB is unaddressable -- measured on the small-k selector,
+        # which had the same shape: at exactly 4 GiB every row came back wrong
+        # with nothing raised. A row is 4 MiB at the widest width here.
         input_rsrc = fx.logical_divide(
-            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+            fx.rocdl.make_buffer_tensor(fx.slice(input, (row, None)), max_size=False),
+            fx.make_layout(_VEC, 1),
         )
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
@@ -323,8 +455,16 @@ def build_topk_per_row_decode_module(
                 if hist_bin < num_bins:
                     chunk_hist[hist_bin] = s_hist[hist_bin]
 
-    @flyc.kernel(known_block_size=[reduce_threads, 1, 1])
-    def reduce_select_kernel(
+    histogram_kernels = [
+        flyc.kernel(
+            name=f"topk_per_row_decode_histogram_{sig}"
+            f"_p{p}_bins{_radix_pass(p).num_bins}",
+            known_block_size=[block_threads, 1, 1],
+        )(histogram_body)
+        for p in range(_NUM_RADIX_PASSES)
+    ]
+
+    def reduce_select_body(
         partial_hist: fx.Tensor,
         state: fx.Tensor,
         shift: fx.Int32,
@@ -336,8 +476,11 @@ def build_topk_per_row_decode_module(
         row = fx.block_idx.x
         tid = fx.thread_idx.x
         row_state = fx.slice(state, (row, None))
-        partial_hist_buf = fx.rocdl.make_buffer_tensor(partial_hist)
-        row_hist = fx.slice(partial_hist_buf, (row, None, None))
+        # Sliced before the descriptor is built, for the reason above: the
+        # workspace is rows x chunks x bins and passes 4 GiB on a large batch.
+        row_hist = fx.rocdl.make_buffer_tensor(
+            fx.slice(partial_hist, (row, None, None))
+        )
         copy_atom_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
 
         storage = fx.SharedAllocator().allocate(_make_scan_storage(reduce_num_waves))
@@ -347,11 +490,7 @@ def build_topk_per_row_decode_module(
             chunk_hist = fx.slice(row_hist, (chunk, None))
             chunk_hist_div = fx.logical_divide(chunk_hist, fx.make_layout(_VEC, 1))
             r = fx.make_rmem_tensor(_VEC, Int32)
-            fx.copy_atom_call(
-                copy_atom_i32,
-                fx.slice(chunk_hist_div, (None, vec_idx)),
-                r,
-            )
+            fx.copy(copy_atom_i32, fx.slice(chunk_hist_div, (None, vec_idx)), r)
             return fx.memref_load_vec(r)
 
         def block_exclusive_prefix_i32(val, scan):
@@ -424,7 +563,19 @@ def build_topk_per_row_decode_module(
                     row_state[_STATE_REMAINING_K] = remaining_k - bin_elems_above
                 bin_elems_above = bin_elems_above + bin_count
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    reduce_select_kernels = [
+        flyc.kernel(
+            name=f"topk_per_row_decode_reduce_select_{sig}"
+            f"_p{p}_bins{_radix_pass(p).num_bins}",
+            known_block_size=[reduce_threads, 1, 1],
+        )(reduce_select_body)
+        for p in range(_NUM_RADIX_PASSES)
+    ]
+
+    @flyc.kernel(
+        name=f"topk_per_row_decode_gather_{sig}",
+        known_block_size=[block_threads, 1, 1],
+    )
     def gather_kernel(
         input: fx.Tensor,
         row_ends: fx.Tensor,
@@ -440,9 +591,15 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        # Slice the row first, then build the descriptor over it. Built over
+        # the whole tensor and sliced afterwards, the row offset has to fit the
+        # descriptor's 32-bit byte count and its 32-bit voffset, so anything at
+        # or past 4 GiB is unaddressable -- measured on the small-k selector,
+        # which had the same shape: at exactly 4 GiB every row came back wrong
+        # with nothing raised. A row is 4 MiB at the widest width here.
         input_rsrc = fx.logical_divide(
-            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+            fx.rocdl.make_buffer_tensor(fx.slice(input, (row, None)), max_size=False),
+            fx.make_layout(_VEC, 1),
         )
         row_len = _row_length(row, row_ends, n, next_n)
         row_indices = fx.slice(indices, (row, None))
@@ -544,7 +701,10 @@ def build_topk_per_row_decode_module(
                     if const_expr(write_values):
                         row_values[out_pos] = input[row, idx]
 
-    @flyc.kernel(known_block_size=[fused_prefix_threads, 1, 1])
+    @flyc.kernel(
+        name=f"topk_per_row_decode_stable_count_prefix_{sig}",
+        known_block_size=[fused_prefix_threads, 1, 1],
+    )
     def stable_count_prefix_kernel(
         partial_hist: fx.Tensor,
         state: fx.Tensor,
@@ -566,6 +726,10 @@ def build_topk_per_row_decode_module(
                 (chunks_per_row + fused_prefix_num_waves - 1) // fused_prefix_num_waves
             ):
                 chunk = warp + fx.Int32(chunk_group * fused_prefix_num_waves)
+                # The last round is short whenever the chunk count is not a
+                # multiple of the wave count.
+                in_range = chunk < fx.Int32(chunks_per_row)
+                safe_chunk = in_range.select(chunk, fx.Int32(0))
                 count = fx.Int32(0)
                 for hist_item in range_constexpr(
                     (final_n_hist_bins + wave_size - 1) // wave_size
@@ -573,14 +737,14 @@ def build_topk_per_row_decode_module(
                     hist_bin = lane + fx.Int32(hist_item * wave_size)
                     if hist_bin < fx.Int32(final_n_hist_bins):
                         count = count + (hist_bin > threshold_bin).select(
-                            partial_hist[row, chunk, hist_bin], fx.Int32(0)
+                            partial_hist[row, safe_chunk, hist_bin], fx.Int32(0)
                         )
                 wave_total = _warp_inclusive_prefix_i32(count, lane, wave_size)
-                if lane == fx.Int32(wave_size - 1):
-                    s_above[chunk] = (
-                        partial_hist[row, chunk, stable_above_bin] + wave_total
+                if lane == fx.Int32(wave_size - 1) and in_range:
+                    s_above[safe_chunk] = (
+                        partial_hist[row, safe_chunk, stable_above_bin] + wave_total
                     )
-                    s_equal[chunk] = partial_hist[row, chunk, threshold_bin]
+                    s_equal[safe_chunk] = partial_hist[row, safe_chunk, threshold_bin]
             gpu.barrier()
 
             if warp == 0:
@@ -600,7 +764,10 @@ def build_topk_per_row_decode_module(
                     partial_hist[row, lane, stable_above_bin] = above_prefix
                     partial_hist[row, lane, stable_equal_bin] = equal_prefix
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    @flyc.kernel(
+        name=f"topk_per_row_decode_stable_write_{sig}",
+        known_block_size=[block_threads, 1, 1],
+    )
     def stable_write_kernel(
         input: fx.Tensor,
         row_ends: fx.Tensor,
@@ -620,9 +787,17 @@ def build_topk_per_row_decode_module(
         chunk_i32 = fx.Int32(chunk)
         tid_i32 = fx.Int32(tid)
 
-        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        # Slice the row first, then build the descriptor over it. Built over
+        # the whole tensor and sliced afterwards, the row offset has to fit the
+        # descriptor's 32-bit byte count and its 32-bit voffset, so anything at
+        # or past 4 GiB is unaddressable -- measured on the small-k selector,
+        # which had the same shape: at exactly 4 GiB every row came back wrong
+        # with nothing raised. A row is 4 MiB at the widest width here.
         input_rsrc = fx.logical_divide(
-            fx.slice(input_buffer, (row_i32, None)), fx.make_layout(_VEC, 1)
+            fx.rocdl.make_buffer_tensor(
+                fx.slice(input, (row_i32, None)), max_size=False
+            ),
+            fx.make_layout(_VEC, 1),
         )
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
@@ -803,32 +978,22 @@ def build_topk_per_row_decode_module(
         stream: fx.Stream,
     ):
         for pass_idx in range_constexpr(_NUM_RADIX_PASSES):
-            remaining_bits = _KEY_BITS - pass_idx * _RADIX_BITS
-            radix_bits = min(_RADIX_BITS, remaining_bits)
-            shift = remaining_bits - radix_bits
-            radix_mask = (1 << radix_bits) - 1
-            xor_val = 1 << (radix_bits - 1) if pass_idx == 0 else 0
-            num_bins = 1 << radix_bits
-            previous_shift = 0 if pass_idx == 0 else shift + radix_bits
-            previous_radix_bits = 0 if pass_idx == 0 else _RADIX_BITS
-            previous_mask = 0 if pass_idx == 0 else (1 << previous_radix_bits) - 1
-            previous_xor = 1 << (previous_radix_bits - 1) if pass_idx == 1 else 0
-            previous_num_bins = 0 if pass_idx == 0 else 1 << previous_radix_bits
-            histogram = histogram_kernel(
+            rp = _radix_pass(pass_idx)
+            histogram = histogram_kernels[pass_idx](
                 input,
                 row_ends,
                 indices,
                 values,
                 partial_hist,
                 state,
-                fx.Int32(shift),
-                fx.Int32(radix_mask),
-                fx.Int32(xor_val),
-                num_bins,
-                fx.Int32(previous_shift),
-                fx.Int32(previous_mask),
-                fx.Int32(previous_xor),
-                previous_num_bins,
+                fx.Int32(rp.shift),
+                fx.Int32(rp.radix_mask),
+                fx.Int32(rp.xor_val),
+                rp.num_bins,
+                fx.Int32(rp.previous_shift),
+                fx.Int32(rp.previous_mask),
+                fx.Int32(rp.previous_xor),
+                rp.previous_num_bins,
                 fx.Int32(pass_idx == 0),
                 n,
                 next_n,
@@ -840,13 +1005,13 @@ def build_topk_per_row_decode_module(
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
-            reduce_select = reduce_select_kernel(
+            reduce_select = reduce_select_kernels[pass_idx](
                 partial_hist,
                 state,
-                fx.Int32(shift),
-                fx.Int32(xor_val),
-                fx.Int32(uint32_to_int32(radix_mask << shift)),
-                num_bins,
+                fx.Int32(rp.shift),
+                fx.Int32(rp.xor_val),
+                fx.Int32(uint32_to_int32(rp.radix_mask << rp.shift)),
+                rp.num_bins,
                 fx.Int32(pass_idx == 0),
             )
             reduce_select.launch(
