@@ -30,7 +30,7 @@ K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
 K3_LOWER_BOUND = -5.0
 
 
-def make_inputs(B, T, H, D, dtype, device, paged, gate, num_accepted=0):
+def make_inputs(B, T, H, D, dtype, device, paged, gate, num_accepted=0, fused=False, W=4):
     """K3 serves `full_k3`: raw q/k/g/beta, gate chain and l2norm fused in."""
     total_T = B * T
     q = torch.rand(1, total_T, H, D, dtype=dtype, device=device)
@@ -67,6 +67,18 @@ def make_inputs(B, T, H, D, dtype, device, paged, gate, num_accepted=0):
     else:
         accepted = None
 
+    extra = {}
+    if fused:
+        extra = {
+            "conv_state": torch.randn(
+                state.shape[0], 3 * H * D, W - 1, dtype=dtype, device=device
+            ),
+            "conv_weight": torch.randn(3, W, H * D, dtype=torch.float32, device=device)
+            * 0.1,
+            "out_gate": torch.randn_like(v),
+            "norm_weight": torch.rand(D, dtype=torch.float32, device=device) + 0.5,
+        }
+
     return {
         "q": q,
         "k": k,
@@ -83,10 +95,11 @@ def make_inputs(B, T, H, D, dtype, device, paged, gate, num_accepted=0):
         "cu_seqlens": cu_seqlens,
         "ssm_state_indices": indices,
         "num_accepted_tokens": accepted,
+        **extra,
     }
 
 
-def traffic_bytes(B, T, H, D, dtype, paged, csu=False, BV=32):
+def traffic_bytes(B, T, H, D, dtype, paged, csu=False, BV=32, fused=False, W=4):
     slab = H * D * D * 4
     if csu:
         record = H * (D // BV) * (2 * D + BV) * 4
@@ -95,6 +108,8 @@ def traffic_bytes(B, T, H, D, dtype, paged, csu=False, BV=32):
         writes = B * T * slab if paged else B * slab
     e = torch.tensor([], dtype=dtype).element_size()
     per_tok = 3 * H * D * e + H * D * 4 + H * 4 + H * D * e
+    if fused:
+        per_tok += 3 * H * D * (W - 1) * e * 2 + H * D * e
     return B * slab + writes + B * T * per_tok
 
 
@@ -155,6 +170,8 @@ def gluon_lines(args):
         bv, nw, sk = (int(x) for x in spec.split(","))
         if (bv * sk) % (32 * nw):
             sys.exit(f"illegal gluon config {spec}: BV*SK must be a multiple of 32*NW")
+        if args.fused and bv != args.head_dim:
+            sys.exit(f"--fused needs BV == head_dim ({args.head_dim}), got {spec}")
         for nb in args.num_buffers:
             for ts in args.tdm_store:
                 for tl in args.tdm_load:
@@ -206,7 +223,8 @@ def benchmark(args):
     def bench_kda(H, B, T, provider):
         torch.manual_seed(0)
         inputs = make_inputs(
-            B, T, H, D, dtype, args.device, args.paged, args.gate, args.num_accepted
+            B, T, H, D, dtype, args.device, args.paged, args.gate, args.num_accepted,
+            fused=args.fused,
         )
         shared = dict(
             inputs,
@@ -220,7 +238,9 @@ def benchmark(args):
             bv, nw, sk, nb, ts, tl, csu, tf = (
                 int(x) for x in provider.split(":")[1].split(",")
             )
-            mem = traffic_bytes(B, T, H, D, dtype, args.paged, csu=bool(csu), BV=bv)
+            mem = traffic_bytes(
+                B, T, H, D, dtype, args.paged, csu=bool(csu), BV=bv, fused=args.fused
+            )
 
             def fn():
                 fused_recurrent_kda(
@@ -351,6 +371,7 @@ def parse_args():
     parser.add_argument("--no_gate", dest="gate", action="store_false")
     parser.add_argument("--state_k_first", action="store_true", default=False)
     parser.add_argument("--paged", action="store_true", default=False)
+    parser.add_argument("--fused", action="store_true", default=False)
     parser.add_argument(
         "--backends",
         type=str,

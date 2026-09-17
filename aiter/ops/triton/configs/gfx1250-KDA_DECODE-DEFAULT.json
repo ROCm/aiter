@@ -1,4 +1,10 @@
 {
+  "fused": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 2
+  },
   "t_gt1_seq_heads_geq_3072": {
     "BV": 128,
     "SK": 16,

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT 
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
@@ -151,6 +151,68 @@ def _staged_token(
 
 
 @gluon.jit
+def _conv_token(xp, hb, wb, ho, wo, xo, m, s_pos, LP: gl.constexpr):
+    # x: raw token; h0/1/2: history x[t-3/2/1]; w0/1/2/3: conv weight
+    x = gl.amd.gfx1250.buffer_load(xp, xo, mask=m, other=0)
+
+    h0 = gl.amd.gfx1250.buffer_load(hb, ho, mask=m, other=0)
+    h1 = gl.amd.gfx1250.buffer_load(hb, ho + s_pos, mask=m, other=0)
+    h2 = gl.amd.gfx1250.buffer_load(hb, ho + 2 * s_pos, mask=m, other=0)
+
+    w0 = gl.amd.gfx1250.buffer_load(wb, wo, mask=m, other=0).to(gl.float32)
+    w1 = gl.amd.gfx1250.buffer_load(wb, wo + LP, mask=m, other=0).to(gl.float32)
+    w2 = gl.amd.gfx1250.buffer_load(wb, wo + 2 * LP, mask=m, other=0).to(gl.float32)
+    w3 = gl.amd.gfx1250.buffer_load(wb, wo + 3 * LP, mask=m, other=0).to(gl.float32)
+    # causal conv
+    acc = h0.to(gl.float32) * w0 + h1.to(gl.float32) * w1
+    acc += h2.to(gl.float32) * w2 + x.to(gl.float32) * w3
+
+    gl.amd.gfx1250.buffer_store(h1, hb, ho, mask=m)
+    gl.amd.gfx1250.buffer_store(h2, hb, ho + s_pos, mask=m)
+    gl.amd.gfx1250.buffer_store(x.to(hb.dtype.element_ty), hb, ho + 2 * s_pos, mask=m)
+    return acc * sigmoid(acc)  # SiLU
+
+
+@gluon.jit
+def _conv_qkv(
+    raw,
+    q_p,
+    k_p,
+    v_p,
+    hb,
+    wb,
+    i_h,
+    i_hv,
+    s_dim,
+    s_pos,
+    LP: gl.constexpr,
+    W: gl.constexpr,
+    CR: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    FLATK: gl.constexpr,
+    FLATV: gl.constexpr,
+    K_LAYOUT: gl.constexpr,
+    V_LAYOUT: gl.constexpr,
+):
+    _, _, _, gr, br = raw
+    rk = gl.arange(0, CR, layout=gl.SliceLayout(1, FLATK))[:, None]
+    rv = gl.arange(0, CR, layout=gl.SliceLayout(1, FLATV))[:, None]
+    fk = gl.arange(0, K, layout=gl.SliceLayout(0, FLATK))[None, :] + rk * 0
+    fv = gl.arange(0, V, layout=gl.SliceLayout(0, FLATV))[None, :] + rv * 0
+    mk = rk + fk * 0 == 0
+    mv = rv + fv * 0 == 0
+    cq = i_h * K + fk
+    cv = i_hv * V + fv
+    q = _conv_token(q_p, hb, wb, cq * s_dim, cq, fk, mk, s_pos, LP)
+    k = _conv_token(k_p, hb, wb, (LP + cq) * s_dim, W * LP + cq, fk, mk, s_pos, LP)
+    v = _conv_token(v_p, hb, wb, (2 * LP + cv) * s_dim, 2 * W * LP + cv, fv, mv, s_pos, LP)
+    q = gl.convert_layout(gl.sum(q, axis=0), K_LAYOUT)
+    k = gl.convert_layout(gl.sum(k, axis=0), K_LAYOUT)
+    return q, k, gl.convert_layout(gl.sum(v, axis=0), V_LAYOUT), gr, br
+
+
+@gluon.jit
 def _process_token(
     raw,
     a_exp,
@@ -210,6 +272,8 @@ _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
         "USE_TDM_FUSED_LOAD",
         "CACHE_STATE_UPDATES",
         "PAD_SLOT_GUARD",
+        "USE_CONV",
+        "USE_RMS_GATE",
     ],
 )
 
@@ -229,7 +293,12 @@ def fused_recurrent_kda_packed_decode_kernel(
     cu_seqlens_ptr,
     state_indices_ptr,
     num_accepted_ptr,
+    conv_state_ptr,
+    conv_weight_ptr,
+    out_gate_ptr,
+    norm_weight_ptr,
     lower_bound,
+    norm_eps,
     T,
     stride_indices_seq,
     stride_q_token: gl.constexpr,
@@ -238,10 +307,14 @@ def fused_recurrent_kda_packed_decode_kernel(
     stride_g_token: gl.constexpr,
     stride_beta_token: gl.constexpr,
     stride_o_token: gl.constexpr,
+    stride_og_token: gl.constexpr,
     stride_state_slot_rows,
     stride_state_out_slot_rows,
     state_rows,
     state_out_rows,
+    stride_cs_slot,
+    stride_cs_dim,
+    stride_cs_pos,
     scale: gl.constexpr,
     H: gl.constexpr,
     HV: gl.constexpr,
@@ -270,6 +343,9 @@ def fused_recurrent_kda_packed_decode_kernel(
     CACHE_STATE_UPDATES: gl.constexpr = False,  # per-token (a, k, err), needs ssm_state_indices and no tdm_store
     USE_TDM_FUSED_LOAD: gl.constexpr = False,  # token operands via one fused TDM + LDS
     PAD_SLOT_GUARD: gl.constexpr = False,
+    W: gl.constexpr = 4,
+    USE_CONV: gl.constexpr = False,
+    USE_RMS_GATE: gl.constexpr = False,
 ):
     gl.static_assert(V % BV == 0, "BV must divide V")
     gl.static_assert(32 % SK == 0, "SK must divide the wave")
@@ -288,6 +364,21 @@ def fused_recurrent_kda_packed_decode_kernel(
     gl.static_assert(
         (not CACHE_STATE_UPDATES) or (V // BV) * (2 * K + BV) <= V * K,
         "per-tile (a, k, err) updates must fit in a state slot",
+    )
+    gl.static_assert(
+        (not (USE_CONV or USE_RMS_GATE)) or BV == V, "USE_CONV/USE_RMS_GATE need BV == V"
+    )
+    gl.static_assert((not USE_CONV) or W == 4, "USE_CONV needs W == 4")
+    gl.static_assert(
+        (not (USE_CONV or USE_RMS_GATE)) or (NUM_BUFFERS == 2 and not USE_TDM_FUSED_LOAD),
+        "USE_CONV/USE_RMS_GATE run on the register-prefetch path",
+    )
+    gl.static_assert((not USE_CONV) or USE_INITIAL_STATE, "USE_CONV needs a state slot")
+    CR: gl.constexpr = (32 * NUM_WARPS) // K if 32 * NUM_WARPS > K else 1
+    gl.static_assert(
+        (not USE_CONV)
+        or ((K * CR) % (32 * NUM_WARPS) == 0 and (V * CR) % (32 * NUM_WARPS) == 0),
+        "USE_CONV needs K and V to tile 32*NUM_WARPS lanes",
     )
 
     ROWS: gl.constexpr = (BV * SK) // (32 * NUM_WARPS)
@@ -367,6 +458,10 @@ def fused_recurrent_kda_packed_decode_kernel(
     g_p = g_ptr + tok0 * stride_g_token + i_hv * K
     v_p = v_ptr + tok0 * stride_v_token + i_hv * V + i_v * BV
     o_p = o_ptr + tok0 * stride_o_token + i_hv * V + i_v * BV
+    if USE_RMS_GATE:
+        nw = gl.amd.gfx1250.buffer_load(norm_weight_ptr, off_v).to(gl.float32)
+        og_p = out_gate_ptr + tok0 * stride_og_token + i_hv * V + i_v * BV
+        og_nxt = gl.amd.gfx1250.buffer_load(og_p, off_v)
     if IS_BETA_HEADWISE:
         b_p = beta_ptr + tok0 * stride_beta_token + i_hv * V + i_v * BV
     else:
@@ -436,6 +531,18 @@ def fused_recurrent_kda_packed_decode_kernel(
                 )
         else:
             slot = i_n
+        if USE_CONV:
+            FLATK: gl.constexpr = gl.BlockedLayout(
+                [1, (K * CR) // (32 * NUM_WARPS)], [1, 32], [CR, NUM_WARPS // CR], [1, 0]
+            )
+            FLATV: gl.constexpr = gl.BlockedLayout(
+                [1, (V * CR) // (32 * NUM_WARPS)], [1, 32], [CR, NUM_WARPS // CR], [1, 0]
+            )
+            hb = conv_state_ptr + slot.to(gl.int64) * stride_cs_slot
+            nxt = _conv_qkv(
+                nxt, q_p, k_p, v_p, hb, conv_weight_ptr, i_h, i_hv, stride_cs_dim,
+                stride_cs_pos, H * K, W, CR, K, V, FLATK, FLATV, K_LAYOUT, V_LAYOUT,
+            )
         row_in = _state_row(
             slot, stride_state_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
         )
@@ -573,33 +680,10 @@ def fused_recurrent_kda_packed_decode_kernel(
                     b_nxt = gl.amd.gfx1250.buffer_load(b_p, off_v)
                 else:
                     b_nxt = gl.load(b_p)
-                a, kv, qv, vv, b = _process_token(
-                    raw,
-                    a_exp,
-                    b_bias,
-                    gate_c,
-                    scale,
-                    USE_QK_L2NORM_IN_KERNEL,
-                    USE_GATE_IN_KERNEL,
-                    HAS_DT_BIAS,
-                    USE_LOWER_BOUND,
-                    APPLY_BETA_SIGMOID,
-                    ALLOW_NEG_EIGVAL,
-                )
             elif NUM_BUFFERS >= 2:
-                a, kv, qv, vv, b = _process_token(
-                    nxt,
-                    a_exp,
-                    b_bias,
-                    gate_c,
-                    scale,
-                    USE_QK_L2NORM_IN_KERNEL,
-                    USE_GATE_IN_KERNEL,
-                    HAS_DT_BIAS,
-                    USE_LOWER_BOUND,
-                    APPLY_BETA_SIGMOID,
-                    ALLOW_NEG_EIGVAL,
-                )
+                raw = nxt
+                if USE_RMS_GATE:
+                    og = og_nxt
                 if PHASE == 0:
                     q_p += stride_q_token
                     k_p += stride_k_token
@@ -609,6 +693,14 @@ def fused_recurrent_kda_packed_decode_kernel(
                     nxt = _fetch_token(
                         q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE
                     )
+                    if USE_CONV:
+                        nxt = _conv_qkv(
+                            nxt, q_p, k_p, v_p, hb, conv_weight_ptr, i_h, i_hv, stride_cs_dim,
+                            stride_cs_pos, H * K, W, CR, K, V, FLATK, FLATV, K_LAYOUT, V_LAYOUT,
+                        )
+                    if USE_RMS_GATE:
+                        og_p += stride_og_token
+                        og_nxt = gl.amd.gfx1250.buffer_load(og_p, off_v)
             else:
                 raw = _fetch_token(
                     q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE
@@ -618,19 +710,19 @@ def fused_recurrent_kda_packed_decode_kernel(
                 v_p += stride_v_token
                 g_p += stride_g_token
                 b_p += stride_beta_token
-                a, kv, qv, vv, b = _process_token(
-                    raw,
-                    a_exp,
-                    b_bias,
-                    gate_c,
-                    scale,
-                    USE_QK_L2NORM_IN_KERNEL,
-                    USE_GATE_IN_KERNEL,
-                    HAS_DT_BIAS,
-                    USE_LOWER_BOUND,
-                    APPLY_BETA_SIGMOID,
-                    ALLOW_NEG_EIGVAL,
-                )
+            a, kv, qv, vv, b = _process_token(
+                raw,
+                a_exp,
+                b_bias,
+                gate_c,
+                scale,
+                USE_QK_L2NORM_IN_KERNEL,
+                USE_GATE_IN_KERNEL,
+                HAS_DT_BIAS,
+                USE_LOWER_BOUND,
+                APPLY_BETA_SIGMOID,
+                ALLOW_NEG_EIGVAL,
+            )
 
             if STATE_V_FIRST:
                 S = S * a[None, :]  # decay:  Diag(alpha) S
@@ -708,6 +800,10 @@ def fused_recurrent_kda_packed_decode_kernel(
                 o = gl.sum(S * qv[None, :], axis=1)  # output: S^T q, post-write
             else:
                 o = gl.sum(S * qv[:, None], axis=0)  # output: S^T q, post-write
+            if USE_RMS_GATE:
+                o = o.to(o_ptr.dtype.element_ty).to(gl.float32)
+                o = o * gl.rsqrt(gl.sum(o * o, axis=0) / V + norm_eps) * nw
+                o = o * sigmoid(og.to(gl.float32))
             gl.amd.gfx1250.buffer_store(o.to(o_ptr.dtype.element_ty), o_p, off_v)
             o_p += stride_o_token
 

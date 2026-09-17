@@ -6,7 +6,6 @@ import math
 
 import torch
 import triton
-from packaging.version import Version
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
@@ -18,11 +17,10 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 _LOG_INFO = _LOGGER._logger.isEnabledFor(logging.INFO)
 
-_TRITON_GE_36 = Version(triton.__version__.split("+")[0]) >= Version("3.6.0")
 _ARCH = arch_info.get_arch()
 
 fused_recurrent_kda_packed_decode_kernel = None
-if _TRITON_GE_36 and _ARCH == "gfx1250":
+if _ARCH == "gfx1250":
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
     )
@@ -35,19 +33,16 @@ def get_kda_config(
     K: int,
     V: int,
     overrides: dict | None = None,
+    fused: bool = False,
 ) -> dict:
-    """Route a shape to its published bucket. Every bucket in the config JSON
-    is complete (BV, SK, num_warps, num_buffers), so tuning values and their
-    fallbacks live there, not here. A partial ``overrides`` dict (config=)
-    inherits the resolved bucket's remaining values. For K outside the tuned
-    buckets, SK is shrunk to a legal divisor of the wave and K, with
-    num_warps refitted to the shrunken tile."""
     tuned = load_config_json(
         f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-KDA_DECODE-DEFAULT.json"
     )
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
-    if avg_T > 1:
+    if fused:
+        bucket = "fused"
+    elif avg_T > 1:
         if aligned and num_seq_heads >= 3072 and V % 128 == 0:
             bucket = "t_gt1_seq_heads_geq_3072"
         elif aligned and num_seq_heads >= 384:
@@ -98,6 +93,11 @@ def fused_recurrent_kda(
     cache_state_updates: bool = False,
     pad_slot_guard: bool = False,
     config: dict | None = None,
+    conv_state: torch.Tensor | None = None,
+    conv_weight: torch.Tensor | None = None,
+    out_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused recurrent Kimi Delta Attention (KDA), gfx1250 Gluon decode path.
 
@@ -107,8 +107,7 @@ def fused_recurrent_kda(
     Args:
         q: [B, T, H, K] queries
         k: [B, T, H, K] keys
-        v: [B, T, HV, V] values; HV must be a multiple of H (q/k heads are
-            broadcast across HV // H value heads).
+        v: [B, T, HV, V] values
         g: [B, T, HV, K] log-space decay gates
         beta: [B, T, HV] scalar or [B, T, HV, V] headwise write strengths.
         A_log: [HV] gate parameter
@@ -117,8 +116,7 @@ def fused_recurrent_kda(
             ``state_v_first`` (default) else [slots, HV, K, V]
         scale: q scale factor; defaults to K**-0.5.
         output_final_state: return the post-recurrence state
-        inplace_final_state: update ``initial_state``'s slabs in place;
-            requires ``initial_state``.
+        inplace_final_state: update ``initial_state``'s slabs in place
         state_v_first: state slab layout, [V, K] (True, default) or [K, V].
         cu_seqlens: [N + 1] varlen offsets; requires B == 1 with all tokens
             flattened into T.
@@ -145,16 +143,13 @@ def fused_recurrent_kda(
 
     Returns:
         (o, final_state): o is [B, T, HV, V] in v's dtype. final_state is
-        the fp32 state tensor (``initial_state`` itself when in-place, else
-        ``state_out`` or a fresh [N, HV, ., .] tensor), or None when
+        the fp32 state tensor (initial_state itself when in-place, else
+        state_out or a fresh [N, HV, ., .] tensor), or None when
         neither ``output_final_state`` nor ``inplace_final_state`` is set.
     """
 
     if fused_recurrent_kda_packed_decode_kernel is None:
-        raise RuntimeError(
-            f"kda gluon decode requires triton>=3.6.0 on gfx1250 "
-            f"(found triton {triton.__version__} on {_ARCH})"
-        )
+        raise RuntimeError(f"kda gluon decode requires gfx1250 (found {_ARCH})")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError(
             "allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True"
@@ -166,6 +161,16 @@ def fused_recurrent_kda(
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    use_conv = conv_state is not None
+    use_rms_gate = out_gate is not None
+    W = conv_weight.shape[1] if use_conv else 4
+    if use_conv:
+        assert conv_weight.shape == (3, W, H * K) and conv_weight.is_contiguous()
+        assert conv_state.shape[1:] == (3 * H * K, W - 1) and HV * V == H * K
+    if use_rms_gate:
+        assert out_gate.shape == v.shape and out_gate.stride()[2:] == (V, 1)
+        assert B == 1 or out_gate.stride(0) == T * out_gate.stride(1)
+        assert norm_weight.numel() == V and norm_weight.is_contiguous()
     if scale is None:
         scale = K**-0.5
 
@@ -218,7 +223,9 @@ def fused_recurrent_kda(
         avg_T = max(1, T // max(1, N))
     else:
         avg_T = T
-    config = get_kda_config(avg_T, N, HV, K, V, overrides=config)
+    config = get_kda_config(
+        avg_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
+    )
     BV = config["BV"]
     SK = config["SK"]
     num_warps = config["num_warps"]
@@ -333,7 +340,12 @@ def fused_recurrent_kda(
         cu_seqlens_ptr=cu_seqlens,
         state_indices_ptr=ssm_state_indices,
         num_accepted_ptr=num_accepted_tokens,
+        conv_state_ptr=conv_state,
+        conv_weight_ptr=conv_weight,
+        out_gate_ptr=out_gate,
+        norm_weight_ptr=norm_weight,
         lower_bound=lower_bound if lower_bound is not None else 0.0,
+        norm_eps=norm_eps,
         T=T,
         stride_indices_seq=stride_indices_seq,
         stride_q_token=q.stride(1),
@@ -342,10 +354,14 @@ def fused_recurrent_kda(
         stride_g_token=g.stride(1),
         stride_beta_token=beta.stride(1),
         stride_o_token=out.stride(1),
+        stride_og_token=out_gate.stride(1) if use_rms_gate else 0,
         stride_state_slot_rows=slot_rows_in,
         stride_state_out_slot_rows=slot_rows_out,
         state_rows=rows_in,
         state_out_rows=rows_out,
+        stride_cs_slot=conv_state.stride(0) if use_conv else 0,
+        stride_cs_dim=conv_state.stride(1) if use_conv else 0,
+        stride_cs_pos=conv_state.stride(2) if use_conv else 0,
         scale=scale,
         H=H,
         HV=HV,
@@ -374,6 +390,66 @@ def fused_recurrent_kda(
         CACHE_STATE_UPDATES=cache_state_updates,
         PAD_SLOT_GUARD=pad_slot_guard,
         USE_TDM_FUSED_LOAD=use_tdm_fused_load,
+        W=W,
+        USE_CONV=use_conv,
+        USE_RMS_GATE=use_rms_gate,
         num_warps=num_warps,
     )
     return out, final_state
+
+
+def fused_recurrent_kda_packed_decode(
+    mixed_qkv: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    initial_state: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    out_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    out: torch.Tensor,
+    config: dict | None = None,
+) -> torch.Tensor:
+    n, H, K = g.shape
+    s = mixed_qkv.stride(0)
+
+    def qkv(off: int) -> torch.Tensor:
+        return mixed_qkv.as_strided(
+            (n, 1, H, K), (s, s, K, 1), mixed_qkv.storage_offset() + off
+        )
+
+    def tok(x: torch.Tensor) -> torch.Tensor:
+        st = x.stride(0)
+        return x.as_strided(
+            (n, 1, *x.shape[1:]), (st, st, *x.stride()[1:]), x.storage_offset()
+        )
+
+    fused_recurrent_kda(
+        q=qkv(0),
+        k=qkv(H * K),
+        v=qkv(2 * H * K),
+        g=tok(g),
+        beta=tok(beta),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        initial_state=initial_state,
+        ssm_state_indices=ssm_state_indices,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        pad_slot_guard=True,
+        conv_state=conv_state,
+        conv_weight=conv_weight,
+        out_gate=tok(out_gate),
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        out=tok(out),
+        config=config,
+    )
+    return out

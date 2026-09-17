@@ -8,7 +8,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton.attention.kda import fused_recurrent_kda
+from aiter.ops.triton.attention.kda import (
+    fused_recurrent_kda,
+    fused_recurrent_kda_packed_decode,
+)
 from aiter.ops.triton.utils import config_utils as triton_core
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -1380,3 +1383,128 @@ def test_sk_guards():
         fused_recurrent_kda(**args, config={"SK": 3})
     with pytest.raises(AssertionError):  # BV*SK must cover 32*num_warps
         fused_recurrent_kda(**args, config={"BV": 32, "SK": 2, "num_warps": 4})
+
+
+@pytest.mark.parametrize("N, T, H", [(16, 1, 24), (3, 1, 8), (4, 2, 8)])
+def test_fused_conv_rms_gate(N, T, H):
+    D, W, eps, lb = 128, 4, 1e-6, -5.0
+    lp, NS, TT = H * D, N + 2, N * T
+    torch.manual_seed(N * 7 + T)
+    mixed = torch.randn(TT, 3 * lp, dtype=torch.bfloat16, device=DEVICE)
+    cw = torch.randn(3 * lp, W, dtype=torch.bfloat16, device=DEVICE) * 0.1
+    cs = torch.randn(NS, 3 * lp, W - 1, dtype=torch.bfloat16, device=DEVICE) * 0.1
+    g = torch.randn(TT, H, D, dtype=torch.bfloat16, device=DEVICE) * 0.5
+    beta = torch.randn(TT, H, dtype=torch.bfloat16, device=DEVICE)
+    og = torch.randn(TT, H, D, dtype=torch.bfloat16, device=DEVICE)
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
+    dt_bias = torch.randn(lp, dtype=torch.float32, device=DEVICE) * 0.1
+    S = torch.randn(NS, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01
+    nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
+    idx = torch.arange(1, N + 1, dtype=torch.int32, device=DEVICE)
+    if T == 1:
+        view = lambda off: mixed.as_strided((N, 1, H, D), (3 * lp, 3 * lp, D, 1), off)
+        shp = lambda t: t.view(N, 1, *t.shape[1:])
+        paged = {"ssm_state_indices": idx}
+    else:
+        view = lambda off: mixed.as_strided((1, TT, H, D), (TT * 3 * lp, 3 * lp, D, 1), off)
+        shp = lambda t: t[None]
+        paged = {
+            "ssm_state_indices": idx[:, None].expand(N, T).contiguous(),
+            "cu_seqlens": torch.arange(0, TT + 1, T, dtype=torch.int64, device=DEVICE),
+        }
+    kw = dict(
+        g=shp(g),
+        beta=shp(beta),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lb,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        pad_slot_guard=True,
+        cache_state_updates=False,
+        **paged,
+    )
+    S1, cs1 = S.clone(), cs.clone()
+    o1, _ = fused_recurrent_kda(
+        q=view(0),
+        k=view(lp),
+        v=view(2 * lp),
+        initial_state=S1,
+        conv_state=cs1,
+        conv_weight=cw.view(3, lp, W).permute(0, 2, 1).contiguous().float(),
+        out_gate=shp(og),
+        norm_weight=nw,
+        norm_eps=eps,
+        **kw,
+    )
+    x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
+    y = torch.empty(TT, 3 * lp, device=DEVICE)
+    for t in range(T):
+        rows = torch.arange(t, TT, T, device=DEVICE)
+        h = cs2[idx.long()].float()
+        y[rows] = (h * w[None, :, : W - 1]).sum(-1) + x[rows] * w[None, :, W - 1]
+        cs2[idx.long()] = torch.cat([h[..., 1:], x[rows, :, None]], -1).to(cs.dtype)
+    y = y * torch.sigmoid(y)
+    q2, k2, v2 = (
+        shp(y[:, i * lp : (i + 1) * lp].reshape(TT, H, D).contiguous()) for i in range(3)
+    )
+    o2, _ = fused_recurrent_kda(q=q2, k=k2, v=v2, initial_state=S2, **kw)
+    ob = o2.to(torch.bfloat16).float()
+    ref = ob * torch.rsqrt(ob.square().mean(-1, keepdim=True) + eps) * nw
+    ref = ref * torch.sigmoid(shp(og).float())
+    assert torch.equal(cs1, cs2), "conv state roll"
+    assert_close("o", ref, o1)
+    assert_close("ht", S2, S1)
+
+
+def test_fused_recurrent_kda_packed_decode():
+    N, H, D, W, NS, pad = 16, 24, 128, 4, 40, 16
+    lp = H * D
+    torch.manual_seed(3)
+    projected = torch.randn(N, 4 * lp + D + H + pad, dtype=torch.bfloat16, device=DEVICE)
+    mixed, g2, _, beta = projected.split([3 * lp, lp, D, H, pad], dim=-1)[:4]
+    g2 = g2.view(N, H, D)
+    g = torch.randn(N, H, D, dtype=torch.bfloat16, device=DEVICE) * 0.5
+    cs = torch.randn(NS, W - 1, 3 * lp, dtype=torch.bfloat16, device=DEVICE)
+    cs = cs.transpose(-1, -2) * 0.1
+    S = torch.randn(NS, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01
+    cw = torch.randn(3, W, lp, dtype=torch.float32, device=DEVICE) * 0.1
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
+    dt_bias = torch.randn(lp, dtype=torch.float32, device=DEVICE) * 0.1
+    nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
+    idx = torch.randperm(NS - 1, device=DEVICE)[:N].to(torch.int32) + 1
+    idx[-2:] = 0
+    out = torch.empty(N, H, D, dtype=torch.bfloat16, device=DEVICE)
+    S1, cs1 = S.clone(), cs.clone()
+    fused_recurrent_kda_packed_decode(
+        mixed, g, beta, A_log, dt_bias, -5.0, S1, idx, cs1, cw, g2, nw, 1e-5, out
+    )
+    s = mixed.stride(0)
+    view = lambda off: mixed.as_strided(
+        (N, 1, H, D), (s, s, D, 1), mixed.storage_offset() + off
+    )
+    S2, cs2 = S.clone(), cs.clone()
+    ref, _ = fused_recurrent_kda(
+        q=view(0),
+        k=view(lp),
+        v=view(2 * lp),
+        g=g.unsqueeze(1),
+        beta=beta.contiguous().unsqueeze(1),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+        initial_state=S2,
+        ssm_state_indices=idx,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        pad_slot_guard=True,
+        conv_state=cs2,
+        conv_weight=cw,
+        out_gate=g2.contiguous().unsqueeze(1),
+        norm_weight=nw,
+        norm_eps=1e-5,
+    )
+    assert torch.equal(out, ref[:, 0]) and torch.equal(S1, S2) and torch.equal(cs1, cs2)
+    assert (out[-2:] == 0).all() and torch.equal(S1[0], S[0])
