@@ -49,6 +49,7 @@ from .conv3d_gfx950_utils import (
     flat_buffer_view,
     sgpr,
 )
+from .conv3d_grid import block_coords, make_launch_grid
 from .conv3d_im2col import Im2colGather, make_conv_geometry, make_im2col_plan
 from .conv3d_scatter import OutputScatter, make_output_scatter_plan
 
@@ -209,8 +210,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     # padding and dilation belong to the gather, and the output layout and
     # bias to the scatter; each reaches its own plan below from `param`
     # directly, which is why none of them is unpacked here.
-    c, k = param.c, param.k
-    splitk, tile, wgm, groups = param.splitk, param.tile, param.wgm, param.groups
+    c, k, tile, groups = param.c, param.k, param.tile, param.groups
 
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
@@ -230,8 +230,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     # row stride, while CGP is the per-group channel count the GEMM K axis
     # decomposes against; the two coincide only when groups == 1.
     geom = make_conv_geometry(param)
-    npq, crs, CGP = geom.npq, geom.crs, geom.cgp
-    KG = k // groups
+    crs, CGP = geom.crs, geom.cgp
 
     assert TILE_K == 32
     _invalid = validate_launch_config(TILE_M, TILE_N, WAVE_M, WAVE_N)
@@ -242,8 +241,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
     )
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
-
-    k_tiles = (crs + TILE_K - 1) // TILE_K
 
     W_BYTES = k * crs * BF16_BYTES
     assert W_BYTES < OOB_SENTINEL_BYTES, (
@@ -261,47 +258,35 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         ldg_a_count=LDG_A_COUNT,
     )
 
-    tiles_per_group = (KG + TILE_N - 1) // TILE_N
-    n_tail = KG % TILE_N != 0
-    grid_n = groups * tiles_per_group
-
-    splitk = max(1, min(splitk, k_tiles))
-    tiles_per_split = k_tiles // splitk
-    use_splitk = splitk > 1
-
-    PIPE_STAGES = 2 * TILES_PER_BARRIER
-
-    LDS_A_SIZE = PIPE_STAGES * TILE_M * TILE_K
-    LDS_B_SIZE = PIPE_STAGES * TILE_N * TILE_K
-
-    grid_m = (npq + TILE_M - 1) // TILE_M
-
-    MAX_GRID_X = 0xFFFFFFFF // BLOCK_THREADS
-    MAX_GRID_YZ = 65535
-    grid_x = min(grid_m, MAX_GRID_X)
-    m_chunks = (grid_m + grid_x - 1) // grid_x
+    # How the work is spread: the grid, its limits, and what a block decodes
+    # to find its own (M, N, K) tile.
+    grid = make_launch_grid(
+        param,
+        geom,
+        tile_m=TILE_M,
+        tile_n=TILE_N,
+        tile_k=TILE_K,
+        block_threads=BLOCK_THREADS,
+    )
 
     # How C is written back: the 5D scatter, the tail masking and the split-K
     # staging, against the same grid the gather reads A on.
     scatter_plan = make_output_scatter_plan(
         param,
         geom,
-        kg=KG,
+        kg=grid.kg,
         mi_m=MI_M,
         mi_n=MI_N,
-        use_splitk=use_splitk,
-        row_chk=(npq % TILE_M != 0) or (grid_x * m_chunks > grid_m),
-        n_tail=n_tail,
+        use_splitk=grid.use_splitk,
+        row_chk=grid.row_chk,
+        n_tail=grid.n_tail,
     )
 
-    assert grid_n <= MAX_GRID_YZ, (
-        f"grid.y = {grid_n} exceeds the {MAX_GRID_YZ}-block limit"
-    )
-    assert m_chunks * splitk <= MAX_GRID_YZ, (
-        f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
-    )
+    PIPE_STAGES = 2 * TILES_PER_BARRIER
 
-    WGM = 1 if m_chunks > 1 else max(1, int(wgm))
+    LDS_A_SIZE = PIPE_STAGES * TILE_M * TILE_K
+    LDS_B_SIZE = PIPE_STAGES * TILE_N * TILE_K
+
     elem_ty = fx.BFloat16
 
     @fx.struct
@@ -329,45 +314,11 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         b_lds = lds.b
 
         tid = fx.Int32(gpu.thread_id("x"))
-        # Block (m_offset, n_tile): WGM swizzle, then grouped N, then split-K.
-        if const_expr(m_chunks > 1):
-            m_chunk = fx.Int64(gpu.block_id("z")) % fx.Int64(m_chunks)
-            m_offset = (
-                fx.Int64(gpu.block_id("x")) + m_chunk * fx.Int64(grid_x)
-            ) * TILE_M
-            n_tile = fx.Int32(gpu.block_id("y"))
-        elif const_expr(WGM > 1):
-            pid = fx.Int64(gpu.block_id("x")) + fx.Int64(gpu.block_id("y")) * fx.Int64(
-                grid_m
-            )
-            blocks_per_swizzle = fx.Int64(WGM * grid_n)
-            swizzle_id = pid // blocks_per_swizzle
-            first_m = swizzle_id * fx.Int64(WGM)
-            swizzle_rows = fx.min(fx.Int64(grid_m) - first_m, fx.Int64(WGM))
-            local = pid % blocks_per_swizzle
-            m_offset = (first_m + (local % swizzle_rows)) * TILE_M
-            n_tile = local // swizzle_rows
-        else:
-            m_offset = fx.Int32(gpu.block_id("x")) * TILE_M
-            n_tile = fx.Int32(gpu.block_id("y"))
-
-        if const_expr(groups > 1):
-            gi = n_tile // tiles_per_group
-            n_local = (n_tile % tiles_per_group) * TILE_N
-            n_offset = gi * KG + n_local
-            ch_base = gi * CGP
-        else:
-            n_offset = n_tile * TILE_N
-            n_local = n_offset
-            ch_base = None
-        if const_expr(use_splitk):
-            if const_expr(m_chunks > 1):
-                split_idx = fx.Int64(gpu.block_id("z")) // fx.Int64(m_chunks)
-            else:
-                split_idx = fx.Int64(gpu.block_id("z"))
-            k_off = split_idx * (tiles_per_split * TILE_K)
-        else:
-            k_off = 0
+        # Which (M, N, K) tile this block owns: WGM swizzle or M chunking,
+        # then grouped N, then split-K.
+        blk = block_coords(grid)
+        m_offset, n_offset, n_local = blk.m_offset, blk.n_offset, blk.n_local
+        k_off = blk.k_off
 
         # MMA fragments + LDS stage views.
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
@@ -415,7 +366,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             fx.make_view(0, fx.make_layout((TILE_M, TILE_N), (0, 1)))
         )
 
-        im2col.bind_block(tid, m_offset, ch_base)
+        im2col.bind_block(tid, m_offset, blk.ch_base)
 
         def weight_addr(i, k_base):
             linear = (tid + i * BLOCK_THREADS) * LDG_VEC
@@ -425,8 +376,8 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             g_off = fx.Int32(col * crs + (fx.Int64(k_base) + fx.Int64(local_k)))
             # Tail is per group: the N grid is over-provisioned to groups*tiles_per_group.
             col_valid = (
-                ((n_local + fx.Int64(local_n)) < fx.Int64(KG))
-                if const_expr(n_tail)
+                ((n_local + fx.Int64(local_n)) < fx.Int64(grid.kg))
+                if const_expr(grid.n_tail)
                 else None
             )
             return g_off, col_valid
@@ -465,7 +416,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             stage_tile = fx.Int64(stage) * TILE_N * TILE_K
             for i in range_constexpr(LDG_B_COUNT):
                 g_off, col_valid = weight_addr(i, k_base)
-                if const_expr(n_tail):
+                if const_expr(grid.n_tail):
                     voff = col_valid.select(g_off, OOB_ELEM)
                 else:
                     voff = g_off
@@ -502,13 +453,13 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         # while issuing the next DMA.
         PREFETCH = TILES_PER_BARRIER
         for s in range_constexpr(PREFETCH):
-            if const_expr(s < tiles_per_split):
+            if const_expr(s < grid.tiles_per_split):
                 async_load_a_to_lds(s, s)
                 async_load_b_to_lds(s, s)
 
-        for kt_idx in range_constexpr(0, tiles_per_split, TILES_PER_BARRIER):
+        for kt_idx in range_constexpr(0, grid.tiles_per_split, TILES_PER_BARRIER):
             batch = range_constexpr(
-                kt_idx, min(kt_idx + TILES_PER_BARRIER, tiles_per_split)
+                kt_idx, min(kt_idx + TILES_PER_BARRIER, grid.tiles_per_split)
             )
 
             barrier(vmcnt=0, lgkmcnt=0)
@@ -517,7 +468,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             issued = 0
             for k_tile in batch:
                 nxt = k_tile + PREFETCH
-                if const_expr(nxt < tiles_per_split):
+                if const_expr(nxt < grid.tiles_per_split):
                     async_load_a_to_lds(nxt, nxt % PIPE_STAGES)
                     async_load_b_to_lds(nxt, nxt % PIPE_STAGES)
                     issued += LDG_A_COUNT + LDG_B_COUNT
@@ -544,7 +495,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         conv3d_implicit_kernel(y, x, weight, bias).launch(
-            grid=(grid_x, grid_n, m_chunks * splitk),
+            grid=(grid.grid_x, grid.grid_y, grid.grid_z),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
