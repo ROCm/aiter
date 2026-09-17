@@ -134,6 +134,325 @@ def gather_valid(base, *masks):
 
 
 # ---------------------------------------------------------------------------
+# The launch config: one (TILE_M, TILE_N, WAVE_M, WAVE_N) and what follows
+# from it
+# ---------------------------------------------------------------------------
+
+TILE_K = 32
+
+# K tiles consumed between two barriers. Each one is MI_M * MI_N MFMAs, and that
+# product is the only thing that hides global latency here -- the pipeline depth
+# cannot. Costs no LDS (the tiles are stages that already exist) and no extra
+# ds_read/DMA traffic; it just halves the number of barriers. Worth +8..16% on
+# the 3x3 conv2d/conv3d shapes at 2. Reaching the same ratio through TILE_K = 64
+# instead is a trap: it makes the LDS row stride 128B, exactly one bank rotation,
+# and the resulting ds_read_b128 conflicts cost more than the batching wins
+# (measured ~15% slower).
+TILES_PER_BARRIER = 2
+
+DEFAULT_TILE = (128, 128, 2, 4)
+
+
+def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
+    """Why this (TILE_M, TILE_N, WAVE_M, WAVE_N) cannot compile, or None.
+
+    The launch-config half of ``compile_conv3d_implicit``'s asserts, in a
+    function that costs nothing to call, so a candidate sweep can filter on it
+    instead of paying a compile per rejected config. ``conv3d_policy`` used to
+    carry its own closed form of the same arithmetic -- the two agreed over all
+    8281 combinations of its enumeration, but nothing made them, and a policy
+    that drifts stricter prunes configs that would have compiled, which shows
+    up as neither an error nor a wrong answer, only as a tuned pick that could
+    have been faster.
+
+    Only the tile-shape constraints live here. c/groups and the channel padding
+    are properties of the problem, not of the launch config, so they stay as
+    asserts at their point of use.
+    """
+    block_threads = wave_m * wave_n * WARP_SIZE
+    if block_threads > 1024:
+        return f"BLOCK_THREADS={block_threads} exceeds 1024"
+    if tile_m % (wave_m * MFMA_M):
+        return f"TILE_M={tile_m} not divisible by WAVE_M*{MFMA_M}"
+    if tile_n % (wave_n * MFMA_N):
+        return f"TILE_N={tile_n} not divisible by WAVE_N*{MFMA_N}"
+    # LDG_{A,B}_COUNT >= 1 needs no check of its own: TILE_K is 32 and BLOCK_VECS
+    # is 8*BLOCK_THREADS, so both divisibility tests already imply a count of at
+    # least one for any positive tile.
+    block_vecs = LDG_VEC * block_threads
+    if (tile_m * TILE_K) % block_vecs:
+        return f"A tile {tile_m}x{TILE_K} not a multiple of {block_vecs} vecs"
+    if (tile_n * TILE_K) % block_vecs:
+        return f"B tile {tile_n}x{TILE_K} not a multiple of {block_vecs} vecs"
+    return None
+
+
+class TileConfig(NamedTuple):
+    """One launch config, with everything the kernel derives from it.
+
+    Derived next to the validation of the same arithmetic so the two cannot
+    disagree about what a tile implies -- which is the failure mode the
+    docstring above describes, one level down.
+    """
+
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    wave_m: int
+    wave_n: int
+    block_threads: int
+
+    # MFMA atoms per wave. tiled_mma replicates the atom over the
+    # (WAVE_M, WAVE_N) wave grid and tiles THAT over (TILE_M, TILE_N), so a
+    # wave's atoms are strided by the whole wave grid rather than contiguous.
+    # The epilogue takes its row/col from partition_C rather than rederiving it.
+    mi_m: int
+    mi_n: int
+
+    # Vectors one block loads per K tile, per operand.
+    ldg_a_count: int
+    ldg_b_count: int
+
+    # LDS stages, and the elements each operand's staging buffer holds.
+    pipe_stages: int
+    lds_a_elems: int
+    lds_b_elems: int
+
+
+def make_tile_config(tile):
+    """The TileConfig for one (TILE_M, TILE_N, WAVE_M, WAVE_N), or an assertion."""
+    tile_m, tile_n, wave_m, wave_n = tile
+    invalid = validate_launch_config(tile_m, tile_n, wave_m, wave_n)
+    assert invalid is None, invalid
+
+    block_threads = wave_m * wave_n * WARP_SIZE
+    block_vecs = LDG_VEC * block_threads
+    pipe_stages = 2 * TILES_PER_BARRIER
+    return TileConfig(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=TILE_K,
+        wave_m=wave_m,
+        wave_n=wave_n,
+        block_threads=block_threads,
+        mi_m=tile_m // wave_m // MFMA_M,
+        mi_n=tile_n // wave_n // MFMA_N,
+        ldg_a_count=tile_m * TILE_K // block_vecs,
+        ldg_b_count=tile_n * TILE_K // block_vecs,
+        pipe_stages=pipe_stages,
+        lds_a_elems=pipe_stages * tile_m * TILE_K,
+        lds_b_elems=pipe_stages * tile_n * TILE_K,
+    )
+
+
+# ---------------------------------------------------------------------------
+# B: the weight, which is already the matrix the GEMM wants
+# ---------------------------------------------------------------------------
+
+
+def weight_bytes(param, geom):
+    """Bytes of the packed (K, CRS) weight, checked against a descriptor's reach."""
+    w_bytes = param.k * geom.crs * BF16_BYTES
+    assert w_bytes < OOB_SENTINEL_BYTES, (
+        f"weight {w_bytes}B exceeds limit {OOB_SENTINEL_BYTES}B"
+    )
+    return w_bytes
+
+
+class WeightLoader:
+    """B's counterpart to ``Im2colGather``, and much the smaller of the two.
+
+    ``_prep_weight`` already packed the filter as a (K, CRS) row-major matrix,
+    so a tap is one multiply-add rather than a coordinate decomposition -- the
+    asymmetry between this and the gather is the whole difference between an
+    implicit GEMM and a real one.
+
+    Two stages for the same reason the gather has them: the descriptor is the
+    kernel's, the columns are the block's.
+    """
+
+    def __init__(self, cfg, grid, geom, weight, w_bytes):
+        self._cfg, self._grid, self._crs = cfg, grid, geom.crs
+        self._src = flat_buffer_view(
+            fx.get_iter(weight), w_bytes // BF16_BYTES, w_bytes
+        )
+        self._tid = self._n_offset = self._n_local = None
+
+    def bind_block(self, tid, n_offset, n_local):
+        self._tid, self._n_offset, self._n_local = tid, n_offset, n_local
+
+    def taps(self, k_base):
+        """Yield ``(i, src, voff)`` per B vector of the K tile at ``k_base``."""
+        assert self._n_offset is not None, "bind_block() before taps()"
+        cfg, grid = self._cfg, self._grid
+        for i in range_constexpr(cfg.ldg_b_count):
+            linear = (self._tid + i * cfg.block_threads) * LDG_VEC
+            local_n = linear // cfg.tile_k
+            local_k = linear % cfg.tile_k
+            col = self._n_offset + fx.Int64(local_n)
+            g_off = fx.Int32(col * self._crs + (fx.Int64(k_base) + fx.Int64(local_k)))
+            if const_expr(grid.n_tail):
+                # The tail is per group: the N grid is over-provisioned to
+                # groups * tiles_per_group, so a block past this group's last
+                # out-channel reads zero rather than the next group's weights.
+                in_group = (self._n_local + fx.Int64(local_n)) < fx.Int64(grid.kg)
+                g_off = in_group.select(g_off, fx.Int32(OOB_SENTINEL_ELEM))
+            yield i, self._src, g_off
+
+
+# ---------------------------------------------------------------------------
+# LDS staging: the DMA that fills a stage, and the MMA that reads it back
+# ---------------------------------------------------------------------------
+
+
+def make_shared_storage(elem_ty, cfg):
+    """The LDS struct one block allocates: ``pipe_stages`` tiles of A and of B."""
+
+    @fx.struct
+    class SharedStorage:
+        a: fx.Array[elem_ty, cfg.lds_a_elems, 16]
+        b: fx.Array[elem_ty, cfg.lds_b_elems, 16]
+
+    return SharedStorage
+
+
+class LdsStager:
+    """Where a block's DMAs land, for both operands.
+
+    One instance per kernel, shared by the gather and the weight loader: what
+    differs between them is where the data comes from, not how a stage is
+    addressed.
+    """
+
+    def __init__(self, cfg, elem_ty, tid):
+        self._cfg = cfg
+        self._tid = tid
+        dma_bytes = LDG_VEC * BF16_BYTES  # 16
+        self._lds_ptr_ty = fx.PointerType.get(
+            elem_ty.ir_type, fx.AddressSpace.Shared, dma_bytes
+        )
+        self._atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), dma_bytes * 8)
+
+    def dst(self, lds_array, stage_tile, i):
+        """The LDS address vector ``i`` of this stage writes to."""
+        # buffer_load_lds takes one wave-uniform LDS base and fans the wave's
+        # lanes out from it, so the lane-0 address is the base the whole wave
+        # writes from.
+        off_elems = fx.Int64(stage_tile) + (
+            fx.Int64(self._tid) + fx.Int64(i * self._cfg.block_threads)
+        ) * fx.Int64(LDG_VEC)
+        base_bytes = off_elems * fx.Int64(BF16_BYTES)
+        addr = fx.Int64(fx.ptrtoint(lds_array.ptr)) + fx.Int64(base_bytes)
+        return fx.make_view(
+            fx.inttoptr(self._lds_ptr_ty, sgpr(addr)), fx.make_layout(1, 1)
+        )
+
+    def copy(self, src, dst, voff_elem):
+        """Issue one async global-to-LDS DMA."""
+        fx.copy(self._atom, fx.slice(src, (None, voff_elem)), dst)
+
+
+class MmaTiling:
+    """The MFMA assembly of one block: who computes what, and out of which LDS.
+
+    Holds the tiled MMA and the two LDS-to-register copies derived from it,
+    the accumulator, and the tile-local coordinates of the accumulator's
+    elements -- all from one ``tiled_mma``, so the epilogue cannot drift from
+    the MMA's own partitioning.
+    """
+
+    def __init__(self, cfg, elem_ty, tid, lds, scratch):
+        self._cfg = cfg
+        self._lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, cfg.tile_k, elem_ty))
+        self.tiled_mma = fx.make_tiled_mma(
+            mma_atom,
+            fx.make_layout((cfg.wave_m, cfg.wave_n, 1), (cfg.wave_n, 1, 0)),
+        )
+        self._thr_mma = self.tiled_mma.thr_slice(tid)
+        self._thr_copy_a = fx.make_tiled_copy_A(
+            self._lds_copy, self.tiled_mma
+        ).get_slice(tid)
+        self._thr_copy_b = fx.make_tiled_copy_B(
+            self._lds_copy, self.tiled_mma
+        ).get_slice(tid)
+
+        self._a_lds, self._b_lds = lds.a, lds.b
+        self._a_layout = fx.make_layout((cfg.tile_m, cfg.tile_k), (cfg.tile_k, 1))
+        self._b_layout = fx.make_layout((cfg.tile_n, cfg.tile_k), (cfg.tile_k, 1))
+
+        # `scratch` is a pointer to give the fragment a view to be shaped by;
+        # make_fragment_C reads the layout, never the memory, so any live
+        # buffer does -- the accumulator lives in registers.
+        self.acc = self._thr_mma.make_fragment_C(
+            fx.make_view(
+                fx.get_iter(scratch),
+                fx.make_layout((cfg.tile_m, cfg.tile_n), (cfg.tile_n, 1)),
+            )
+        )
+        self.acc.fill(0.0)
+
+        # Each view's layout IS the coordinate, so partition_C hands back
+        # coordinates rather than data.
+        #
+        # They have to be indexed flat: acc is ((MFMA_C_VALUES, 1), MI_M, MI_N),
+        # and the hierarchical spellings trip a rank assertion in the layout
+        # algebra. Flat index is v + MFMA_C_VALUES * (mi + MI_M * ni); a lane
+        # holds one column and MFMA_C_VALUES consecutive rows per atom, so v = 0
+        # of atom (mi, ni) is all the epilogue needs.
+        self.c_row = self._thr_mma.partition_C(
+            fx.make_view(0, fx.make_layout((cfg.tile_m, cfg.tile_n), (1, 0)))
+        )
+        self.c_col = self._thr_mma.partition_C(
+            fx.make_view(0, fx.make_layout((cfg.tile_m, cfg.tile_n), (0, 1)))
+        )
+
+    # A and B are read into separate fragments and returned separately, never
+    # as one tuple: combining them once took the compile wall from ~5s to ~2h.
+    def read_a(self, stage):
+        sA = fx.make_view(
+            fx.add_offset(self._a_lds.ptr, stage * self._cfg.tile_m * self._cfg.tile_k),
+            self._a_layout,
+        )
+        frag_a = self._thr_mma.make_fragment_A(sA)
+        fx.copy(
+            self._lds_copy,
+            self._thr_copy_a.partition_S(sA),
+            self._thr_copy_a.retile(frag_a),
+        )
+        fx.rocdl.sched_dsrd(self._cfg.mi_m)
+        return frag_a
+
+    def read_b(self, stage):
+        sB = fx.make_view(
+            fx.add_offset(self._b_lds.ptr, stage * self._cfg.tile_n * self._cfg.tile_k),
+            self._b_layout,
+        )
+        frag_b = self._thr_mma.make_fragment_B(sB)
+        fx.copy(
+            self._lds_copy,
+            self._thr_copy_b.partition_S(sB),
+            self._thr_copy_b.retile(frag_b),
+        )
+        fx.rocdl.sched_dsrd(self._cfg.mi_n)
+        return frag_b
+
+    def compute(self, acc_values, a_frag_values, b_frag_values):
+        """One K tile's MFMAs, at raised priority so they are not interleaved."""
+        fx.rocdl.s_setprio(1)
+        fx.gemm(
+            self.tiled_mma,
+            acc_values,
+            a_frag_values,
+            b_frag_values,
+            acc_values,
+        )
+        fx.rocdl.sched_mfma(self._cfg.mi_m * self._cfg.mi_n)
+        fx.rocdl.s_setprio(0)
+        return acc_values
+
+
+# ---------------------------------------------------------------------------
 # The implicit GEMM's shape
 # ---------------------------------------------------------------------------
 
@@ -241,8 +560,10 @@ class LaunchGrid(NamedTuple):
     use_splitk: bool
 
 
-def make_launch_grid(param, geom, *, tile_m, tile_n, tile_k, block_threads):
+def make_launch_grid(param, geom, cfg):
     """The LaunchGrid for one problem and launch config, or an assertion."""
+    tile_m, tile_n, tile_k = cfg.tile_m, cfg.tile_n, cfg.tile_k
+    block_threads = cfg.block_threads
     k, groups = param.k, param.groups
     kg = k // groups
     npq = geom.npq
@@ -416,15 +737,16 @@ class OutputScatterPlan(NamedTuple):
     vec_store: bool
 
 
-def make_output_scatter_plan(
-    param, geom, *, kg, mi_m, mi_n, use_splitk, row_chk, n_tail
-):
+def make_output_scatter_plan(param, geom, cfg, grid):
     """An OutputScatterPlan for one problem and launch config, or an assertion.
 
-    ``row_chk`` and ``n_tail`` say whether the grid over-provisions M and N,
-    which only the caller's grid arithmetic knows; everything else about how C
-    is written follows from the problem and is derived here.
+    Takes the grid because whether M and N are over-provisioned -- and so what
+    the tail must not write -- is the grid's arithmetic, not the problem's;
+    everything else about how C is written follows from the problem.
     """
+    kg, use_splitk = grid.kg, grid.use_splitk
+    row_chk, n_tail = grid.row_chk, grid.n_tail
+    mi_m, mi_n = cfg.mi_m, cfg.mi_n
     n, k, out_ndhwc = param.n, param.k, param.out_ndhwc
     npq, dhw = geom.npq, geom.dhw
 
