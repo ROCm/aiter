@@ -1,0 +1,36 @@
+# Branches the stale-branch cleanup never archives, and never deletes once
+# archived. Read by .github/scripts/archive_stale_branches.py.
+#
+# One entry per line. A line beginning with "re:" is a regular expression,
+# searched anywhere in the branch name -- anchor it with ^ and $ to mean the
+# whole name, as the entries below do. An unanchored pattern matches more
+# branches than it looks like it does, which errs toward exempting too many
+# rather than too few. Any other line is an exact name. Blank lines and lines
+# beginning with "#" are ignored.
+#
+# An entry added here after a branch has already been archived still rescues
+# it: the archive copy stops receiving notices and is never deleted, and
+#     git push origin archive/<date>/<name>:<name>
+# puts it back. Restoring it is not automatic, on purpose -- adding a line here
+# should not resurrect refs on its own.
+#
+# Protected branches and the head or base branch of any open pull request are
+# exempt without being listed, so this file is for the cases neither of those
+# covers. These are not preferences: every line is something that breaks if the
+# branch moves, and the note above it says what, so the next person can tell a
+# stale entry from a live one.
+
+# Default branch, and the name it goes by in older clones and forks.
+main
+master
+
+# The published documentation site. Deleting it takes the docs offline.
+gh-pages
+
+# Long-lived integration branch; several teams cut from it.
+stable
+
+# Release branches. 16 of these were already past 30 days on 2026-09-15, and
+# being untouched for a year is what a shipped release looks like.
+re:^release/.*$
+re:^v[0-9].*$

@@ -1,0 +1,73 @@
+name: Archive stale branches
+
+# Archives branches with no commits for 30 days, holds them for 30 more, then
+# gives two weeks' notice before the archive copy goes: 74 days from the last
+# commit to the ref going away, 44 of them with the commits still reachable
+# under a name someone can find. Replaces the comment-only stale-branches.yml,
+# whose action can delete but cannot archive.
+#
+# The point of the archive step is that every stage is one command away from
+# undone. A branch is copied to archive/<date>/<name> before its original ref
+# goes, so the commits stay reachable and named for 44 days rather than living
+# in a reflog nobody can reach. The bot comments say how to restore.
+#
+# Both stages are off until someone turns them on: without the repository
+# variable STALE_BRANCHES_ARCHIVE set to 'true' (Settings > Secrets and
+# variables > Actions) every run reports what it would do and writes nothing.
+# Run it by hand first and read the listing -- roughly 700 branches are past
+# 30 days, and --max-actions caps how many any single run touches so the
+# backlog is worked off over weeks instead of in one morning.
+#
+# Exempt before anything is written: protected branches, the head or base
+# branch of any open pull request, and everything in
+# .github/stale-branch-exemptions.txt -- a checked-in list of exact branch
+# names and re: patterns, edited by pull request like any other file. That list
+# is consulted at every stage against the branch's original name, so adding a
+# line to it also rescues a branch that has already been archived. The script
+# refuses to run if the list is missing or empty.
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'   # Mondays, 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would happen without changing anything'
+        type: boolean
+        default: true
+      max_actions:
+        description: 'Most branches to touch in this run'
+        type: string
+        default: '50'
+
+permissions:
+  contents: write       # create and delete refs, comment on commits
+  pull-requests: read   # head and base branches of open PRs are exempt
+
+concurrency:
+  group: stale-branches-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/scripts/archive_stale_branches.py
+            .github/stale-branch-exemptions.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Archive, give notice, delete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 .github/scripts/archive_stale_branches.py \
+            --stale-days 30 \
+            --archive-days 30 \
+            --notice-days 14 \
+            --exemptions .github/stale-branch-exemptions.txt \
+            --max-actions "${{ inputs.max_actions || 50 }}" \
+            ${{ (inputs.dry_run != true && vars.STALE_BRANCHES_ARCHIVE == 'true') && '--apply' || '' }}
