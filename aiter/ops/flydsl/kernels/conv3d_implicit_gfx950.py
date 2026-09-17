@@ -384,12 +384,9 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     def conv3d_implicit_kernel(
         y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
     ):
-        # The im2col gather addresses its source by a flat element index, so the DMA source
-        # is a 1-D view over the buffer rather than the tensor's own n-D layout: dividing
-        # that by a 1-element tile makes slice(src, (None, off)) exactly element `off`,
-        # with no coordinate decomposition. `elems` only shapes the view -- the sentinel
-        # offset that masks a tap deliberately points past it, and num_records (not the
-        # layout) is what turns that into a zero-fill.
+        # 1-D buffer views so slice(src, (None, off)) is element `off`. `elems`
+        # only shapes the view; the OOB sentinel is past it, and num_records
+        # (not the layout) is what turns that into a zero-fill.
         def _dma_src(ptr, elems, num_records_bytes):
             buf = fx.rocdl.make_buffer_ptr(ptr, num_records_bytes=num_records_bytes)
             return fx.logical_divide(
@@ -397,8 +394,8 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             )
 
         def _x_rebased(off_elems):
-            # BIG_IN moves the descriptor base to the block's own origin so a 32-bit
-            # voffset still reaches the tile; num_records bounds it at 2 GB from there.
+            # BIG_IN rebases the descriptor to this block so a 32-bit voffset
+            # still reaches the tile; num_records caps it at 2 GB from there.
             ptr = fx.add_offset(fx.get_iter(x), fx.make_int_tuple(off_elems))
             return _dma_src(ptr, BIG_IN_NR // BF16_BYTES, BIG_IN_NR)
 
@@ -431,6 +428,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         b_lds = lds.b
 
         tid = fx.Int32(gpu.thread_id("x"))
+        # Block (m_offset, n_tile): WGM swizzle, then grouped N, then split-K.
         if const_expr(m_chunks > 1):
             m_chunk = fx.Int64(gpu.block_id("z")) % fx.Int64(m_chunks)
             m_offset = (
@@ -487,6 +485,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             )
             x_src = _x_rebased(fx.Int64(x_base_elem))
 
+        # MMA fragments + LDS stage views.
         Vec = fx.Vector
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, TILE_K, elem_ty))
@@ -499,13 +498,13 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         a_lds_layout = fx.make_layout((TILE_M, TILE_K), (TILE_K, 1))
         b_lds_layout = fx.make_layout((TILE_N, TILE_K), (TILE_K, 1))
 
-        def stage_a(stage):
+        def a_stage_view(stage):
             return fx.make_view(
                 fx.add_offset(a_lds.ptr, stage * TILE_M * TILE_K),
                 a_lds_layout,
             )
 
-        def stage_b(stage):
+        def b_stage_view(stage):
             return fx.make_view(
                 fx.add_offset(b_lds.ptr, stage * TILE_N * TILE_K),
                 b_lds_layout,
@@ -558,6 +557,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                 r = low.select(u + fx.Int64(ext - pad), r)
             return r, None
 
+        # One gather tap per A-vector: decode GEMM row -> (n, ot, oh, ow).
         _row_dec = []
         for i in range_constexpr(LDG_A_COUNT):
             linear = (tid + i * BLOCK_THREADS) * LDG_VEC
@@ -578,20 +578,14 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                 in_t0 = ot * st - pt
                 in_h0 = oh * sh - ph
                 in_w0 = ow * sw - pw
-                if const_expr(BIG_IN_N1):
-                    di = n_idx - nbase
-                    _row_dec.append((local_k, row_valid, di, in_t0, in_h0, in_w0))
-                elif const_expr(BIG_IN_NM):
-                    _row_dec.append((local_k, row_valid, n_idx, in_t0, in_h0, in_w0))
-                else:
-                    _row_dec.append((local_k, row_valid, n_idx, in_t0, in_h0, in_w0))
+                n_or_di = (n_idx - nbase) if const_expr(BIG_IN_N1) else n_idx
+                _row_dec.append((local_k, row_valid, n_or_di, in_t0, in_h0, in_w0))
 
         SCALAR_K = CGP % TILE_K == 0
 
-        # The K axis decomposes against CGP (per-group channels) while every g_off below
-        # keeps `c` (padded total channels) as the NDHWC row stride. `cc` is the absolute
-        # input channel: the group base plus the offset within the group.
-        def _a_addr(i, kbase_i, cc_base, ckk_base):
+        # Im2col: K axis is CGP (per-group channels); g_off uses `c` as the
+        # NDHWC row stride. `cc` is the absolute input channel.
+        def im2col_addr(i, kbase_i, cc_base, ckk_base):
             dec = _row_dec[i]
             local_k = dec[0]
             k_abs = kbase_i + fx.Int64(local_k)
@@ -620,39 +614,30 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                     ) * c + cc
                 else:
                     g_off = (row + delta * hw_o) * c + cc
-            else:
-                ckk = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
-                kw_i = ckk % kw
-                ckk2 = ckk // kw
-                kh_i = ckk2 % kh
-                kt_i = ckk2 // kh
-                if const_expr(BIG_IN_N1):
-                    _, row_valid, di, in_t0, in_h0, in_w0 = dec
-                    in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
-                    in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
-                    in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
-                    valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
-                    g_off = (
-                        ((di * d + (in_t - base_t)) * h + (in_h - base_h)) * w + in_w
-                    ) * c + cc
-                elif const_expr(BIG_IN_NM):
-                    _, row_valid, n_idx, in_t0, in_h0, in_w0 = dec
-                    in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
-                    in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
-                    in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
-                    valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
-                    g_off = ((in_t * h + in_h) * w + in_w) * c + cc
-                    return fx.Int32(g_off), valid, n_idx
-                else:
-                    _, row_valid, n_idx, in_t0, in_h0, in_w0 = dec
-                    in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
-                    in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
-                    in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
-                    valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
-                    g_off = (((n_idx * d + in_t) * h + in_h) * w + in_w) * c + cc
+                return fx.Int32(g_off), valid
+
+            ckk = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
+            kw_i = ckk % kw
+            ckk2 = ckk // kw
+            kh_i = ckk2 % kh
+            kt_i = ckk2 // kh
+            _, row_valid, n_or_di, in_t0, in_h0, in_w0 = dec
+            in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
+            in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
+            in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
+            valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
+            if const_expr(BIG_IN_N1):
+                g_off = (
+                    ((n_or_di * d + (in_t - base_t)) * h + (in_h - base_h)) * w + in_w
+                ) * c + cc
+                return fx.Int32(g_off), valid
+            if const_expr(BIG_IN_NM):
+                g_off = ((in_t * h + in_h) * w + in_w) * c + cc
+                return fx.Int32(g_off), valid, n_or_di
+            g_off = (((n_or_di * d + in_t) * h + in_h) * w + in_w) * c + cc
             return fx.Int32(g_off), valid
 
-        def _b_addr(i, k_base):
+        def weight_addr(i, k_base):
             linear = (tid + i * BLOCK_THREADS) * LDG_VEC
             local_n = linear // TILE_K
             local_k = linear % TILE_K
@@ -675,7 +660,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
         _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), DMA_BYTES * 8)
 
-        def _lds_dma_ptr(lds_array, stage_tile, i):
+        def stage_dma_dst(lds_array, stage_tile, i):
             # buffer_load_lds takes one wave-uniform LDS base and fans the wave's lanes
             # out from it, so the lane-0 address is the base the whole wave writes from.
             off_elems = fx.Int64(stage_tile) + (
@@ -687,10 +672,11 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                 fx.inttoptr(_lds_dma_ptr_ty, sgpr(addr)), fx.make_layout(1, 1)
             )
 
-        def _dma_to_lds(src, dst, voff_elem):
+        def async_copy_to_lds(src, dst, voff_elem):
             fx.copy(_dma_atom, fx.slice(src, (None, voff_elem)), dst)
 
-        def _load_a(stage, k_base):
+        def async_load_a_to_lds(k_tile, stage):
+            k_base = k_off + k_tile * TILE_K
             kbase_i = fx.Int64(k_base)
             cc_base = ckk_base = None
             if const_expr(SCALAR_K):
@@ -701,41 +687,44 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             stage_tile = fx.Int64(stage) * TILE_M * TILE_K
             for i in range_constexpr(LDG_A_COUNT):
                 if const_expr(BIG_IN_NM):
-                    addr_ret = _a_addr(i, kbase_i, cc_base, ckk_base)
+                    addr_ret = im2col_addr(i, kbase_i, cc_base, ckk_base)
                     g_off_i, valid, n_idx_i = addr_ret
                     x_src_i = _x_rebased(fx.Int64(n_idx_i) * fx.Int64(X_SAMPLE_ELEMS))
                     voff = valid.select(g_off_i, OOB_ELEM)
-                    _dma_to_lds(x_src_i, _lds_dma_ptr(a_lds, stage_tile, i), voff)
+                    async_copy_to_lds(
+                        x_src_i, stage_dma_dst(a_lds, stage_tile, i), voff
+                    )
                 else:
-                    g_off_i, valid = _a_addr(i, kbase_i, cc_base, ckk_base)
+                    g_off_i, valid = im2col_addr(i, kbase_i, cc_base, ckk_base)
                     voff = valid.select(g_off_i, OOB_ELEM)
-                    _dma_to_lds(x_src, _lds_dma_ptr(a_lds, stage_tile, i), voff)
+                    async_copy_to_lds(x_src, stage_dma_dst(a_lds, stage_tile, i), voff)
 
-        def _load_b(stage, k_base):
+        def async_load_b_to_lds(k_tile, stage):
+            k_base = k_off + k_tile * TILE_K
             stage_tile = fx.Int64(stage) * TILE_N * TILE_K
             for i in range_constexpr(LDG_B_COUNT):
-                g_off, col_valid = _b_addr(i, k_base)
+                g_off, col_valid = weight_addr(i, k_base)
                 if const_expr(n_tail):
                     voff = col_valid.select(g_off, OOB_ELEM)
                 else:
                     voff = g_off
-                _dma_to_lds(w_src, _lds_dma_ptr(b_lds, stage_tile, i), voff)
+                async_copy_to_lds(w_src, stage_dma_dst(b_lds, stage_tile, i), voff)
 
-        def read_a_frags(stage):
-            sA = stage_a(stage)
+        def read_a_stage(stage):
+            sA = a_stage_view(stage)
             frag_A = thr_mma.make_fragment_A(sA)
             fx.copy(lds_copy, thr_copy_A.partition_S(sA), thr_copy_A.retile(frag_A))
             fx.rocdl.sched_dsrd(MI_M)
             return frag_A
 
-        def read_b_frags(stage):
-            sB = stage_b(stage)
+        def read_b_stage(stage):
+            sB = b_stage_view(stage)
             frag_B = thr_mma.make_fragment_B(sB)
             fx.copy(lds_copy, thr_copy_B.partition_S(sB), thr_copy_B.retile(frag_B))
             fx.rocdl.sched_dsrd(MI_N)
             return frag_B
 
-        def do_compute(acc_values, a_frag_values, b_frag_values):
+        def compute_stage(acc_values, a_frag_values, b_frag_values):
             fx.rocdl.s_setprio(1)
             fx.gemm(
                 tiled_mma,
@@ -748,11 +737,13 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             fx.rocdl.s_setprio(0)
             return acc_values
 
+        # Double-buffer TILES_PER_BARRIER K-tiles: prefetch, then compute
+        # while issuing the next DMA.
         PREFETCH = TILES_PER_BARRIER
         for s in range_constexpr(PREFETCH):
             if const_expr(s < tiles_per_split):
-                _load_a(s, k_off + s * TILE_K)
-                _load_b(s, k_off + s * TILE_K)
+                async_load_a_to_lds(s, s)
+                async_load_b_to_lds(s, s)
 
         for kt_idx in range_constexpr(0, tiles_per_split, TILES_PER_BARRIER):
             batch = range_constexpr(
@@ -760,19 +751,19 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             )
 
             barrier(vmcnt=0, lgkmcnt=0)
-            a_frags = [read_a_frags(k_tile % PIPE_STAGES) for k_tile in batch]
-            b_frags = [read_b_frags(k_tile % PIPE_STAGES) for k_tile in batch]
+            a_frags = [read_a_stage(k_tile % PIPE_STAGES) for k_tile in batch]
+            b_frags = [read_b_stage(k_tile % PIPE_STAGES) for k_tile in batch]
             issued = 0
             for k_tile in batch:
                 nxt = k_tile + PREFETCH
                 if const_expr(nxt < tiles_per_split):
-                    _load_a(nxt % PIPE_STAGES, k_off + nxt * TILE_K)
-                    _load_b(nxt % PIPE_STAGES, k_off + nxt * TILE_K)
+                    async_load_a_to_lds(nxt, nxt % PIPE_STAGES)
+                    async_load_b_to_lds(nxt, nxt % PIPE_STAGES)
                     issued += LDG_A_COUNT + LDG_B_COUNT
             if const_expr(issued):
                 fx.rocdl.sched_vmem(issued)
             for j in range_constexpr(len(batch)):
-                acc = do_compute(acc, a_frags[j], b_frags[j])
+                acc = compute_stage(acc, a_frags[j], b_frags[j])
 
         if const_expr(BIG_OUT):
             y_elem_base = fx.Int64(fx.ptrtoint(fx.get_iter(y)))
@@ -809,7 +800,16 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             col = n_offset + col_off
             return col, ((n_local + col_off) if const_expr(groups > 1) else col)
 
-        def store_acc():
+        def _off_nk(row, col, off_sk):
+            # NDHWC is already (npq, k) row-major, so the scatter is off_sk.
+            if const_expr(out_ndhwc):
+                return off_sk
+            if const_expr(n == 1):
+                return col * dhw + row
+            n_idx = row // dhw
+            return n_idx * (k * dhw) + col * dhw + (row % dhw)
+
+        def store_output():
             if const_expr(has_bias and not use_splitk):
                 bias_vals = []
                 for ni in range_constexpr(MI_N):
@@ -857,18 +857,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                     for i in range_constexpr(MFMA_C_VALUES):
                         row = fx.Int64(row_base + i)
                         off_sk = row * k + col
-
-                        if const_expr(out_ndhwc):
-                            # (n, do, ho, wo, k) is row-major over exactly the GEMM's own
-                            # (npq, k) index space, so the scatter collapses to off_sk and
-                            # the row decomposition disappears.
-                            off_nk = off_sk
-                        elif const_expr(n == 1):
-                            off_nk = col * dhw + row
-                        else:
-                            n_idx = row // dhw
-                            sp = row % dhw
-                            off_nk = n_idx * (k * dhw) + col * dhw + sp
+                        off_nk = _off_nk(row, col, off_sk)
 
                         def _emit():
                             if const_expr(use_splitk):
@@ -901,7 +890,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                         else:
                             _emit()
 
-        store_acc()
+        store_output()
 
     @flyc.jit
     def launch(
