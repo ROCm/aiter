@@ -41,6 +41,33 @@ BATCH, SEQ_Q, SEQ_KV = 1, 8192, 32768
 KERNEL_NAME = "_gluon_fp8_mqa_logits_kernel"
 
 
+def _build_id():
+    """Something that identifies the compiler beyond its version string.
+
+    A wheel carries its commit in the local version (`+amd.rocm7.2.0.gitXXXX`);
+    a source build does not, so fall back to the git HEAD of the tree it was
+    built from if that is still around.
+    """
+    import triton
+
+    v = triton.__version__
+    if "+" in v:
+        return v
+    import os
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(triton.__file__)))
+    for guess in (root, "/opt/triton-tot"):
+        try:
+            out = subprocess.run(["git", "-C", guess, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                return f"{v}+git{out.stdout.strip()[:10]}"
+        except Exception:
+            pass
+    return v
+
+
 def print_irs_to_files(compiled_kernel, prefix):
     """Every textual IR stage, one file each. `hsaco` is the ELF, so it is
     written as bytes rather than as its Python repr."""
@@ -160,28 +187,28 @@ def count_insts(asm):
     return out
 
 
-def run_one(packing, warmup, iters, reps, force_agpr_on=False):
+def run_one(packing, warmup, iters, reps, unroll=1, label=None):
     """Compile + dump + time one arm. Returns the result dict."""
     import triton  # noqa: F401  (import after TRITON_CACHE_DIR is set)
     import torch
 
     sys.path.insert(0, HERE)
+    # Pin the loop shape first: at aiter's shipped UNROLL=2 the two packing arms
+    # do not compile to the same body on 3.7.0, which would leave the unroll
+    # factor varying alongside the thing under test.
+    import force_unroll
+
+    force_unroll.enable(unroll)
     if not packing:
         import no_packed_fp32
 
         no_packed_fp32.enable(KERNEL_NAME)
-    if force_agpr_on:
-        import force_agpr
-
-        force_agpr.enable(KERNEL_NAME)
 
     from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
     import aiter.ops.triton.attention.fp8_mqa_logits as mod
 
-    ver = triton.__version__.split("+")[0]
+    ver = label or triton.__version__.split("+")[0]
     tag = "with_packing" if packing else "without_packing"
-    if force_agpr_on:
-        tag += "_agpr"
     outdir = os.path.join(HERE, f"{ver}_triton", tag)
     os.makedirs(outdir, exist_ok=True)
 
@@ -227,8 +254,10 @@ def run_one(packing, warmup, iters, reps, force_agpr_on=False):
 
     res = {
         "triton": triton.__version__,
+        "triton_build": _build_id(),
         "packing": packing,
         "shape": f"{BATCH}x{SEQ_Q}x{SEQ_KV}",
+        "unroll": unroll,
         "num_heads": NUM_HEADS,
         "head_size": HEAD_SIZE,
         "us": us,
@@ -243,6 +272,7 @@ def run_one(packing, warmup, iters, reps, force_agpr_on=False):
     print(f"  kernel         {KERNEL_NAME}")
     print(f"  packed-fp32    {'ENABLED (default)' if packing else 'DISABLED'}")
     print(f"  shape          {res['shape']}, {NUM_HEADS} heads, head_size {HEAD_SIZE}")
+    print(f"  UNROLL         {unroll}")
     print(f"  time           {us:.1f} us   ({res['tflops']:.0f} TFLOP/s)")
     print(f"  vgpr / agpr    {stats['vgpr']} / {stats['agpr']}   spill {stats['spill']}")
     print(f"  IRs            {outdir}/")
@@ -258,8 +288,13 @@ def run_one(packing, warmup, iters, reps, force_agpr_on=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--packing", choices=["on", "off"], default="on")
-    ap.add_argument("--agpr", action="store_true",
-                    help="also undo 3.8.0's amdgpu-agpr-alloc=0 (no-op on 3.7.0)")
+    ap.add_argument("--label", default=None,
+                    help="output folder name instead of the triton version "
+                         "(a source build's version string does not say which "
+                         "commit it is)")
+    ap.add_argument("--unroll", type=int, default=1,
+                    help="pin the KV loop unroll factor (1 = every arm gets the "
+                         "same 4-MFMA body; 2 = what aiter ships)")
     ap.add_argument("--both", action="store_true",
                     help="run both arms, each in its own process and cache")
     ap.add_argument("--warmup", type=int, default=10)
@@ -271,7 +306,7 @@ def main():
 
     if args.both:
         import triton
-        ver = triton.__version__.split("+")[0]
+        ver = args.label or triton.__version__.split("+")[0]
         # Alternate the arms across rounds instead of running each once. This
         # box is shared, and identical shapes have measured 30% apart on it
         # within half an hour; alternating means a drift in load lands on both
@@ -286,7 +321,10 @@ def main():
                     HERE, ".triton_cache", f"packing_{packing}")
                 cmd = [sys.executable, os.path.abspath(__file__),
                        "--packing", packing, "--warmup", str(args.warmup),
-                       "--iters", str(args.iters), "--reps", str(args.reps)]
+                       "--iters", str(args.iters), "--reps", str(args.reps),
+                       "--unroll", str(args.unroll)]
+                if args.label:
+                    cmd += ["--label", args.label]
                 label = "ENABLED" if packing == "on" else "DISABLED"
                 print(f"\n=== round {rnd + 1}/{args.rounds}: packed-fp32-ops "
                       f"{label} ===", flush=True)
@@ -294,8 +332,6 @@ def main():
                 if r.returncode:
                     return r.returncode
                 tag = "with_packing" if packing == "on" else "without_packing"
-                if args.agpr:
-                    tag += "_agpr"
                 f = os.path.join(HERE, f"{ver}_triton", f"result_{tag}.json")
                 rec = json.load(open(f))
                 seen[packing].append(rec["us"])
@@ -308,8 +344,6 @@ def main():
                 rec["us"] = statistics.median(seen[packing])
                 rec["tflops"] = rec["tflops"] * last[packing]["us"] / rec["us"]
                 tag = "with_packing" if packing == "on" else "without_packing"
-                if args.agpr:
-                    tag += "_agpr"
                 json.dump(rec, open(os.path.join(
                     HERE, f"{ver}_triton", f"result_{tag}.json"), "w"), indent=1)
                 results.append(rec)
@@ -362,7 +396,7 @@ def main():
         os.environ["TRITON_CACHE_DIR"] = os.path.join(
             HERE, ".triton_cache", f"packing_{args.packing}")
     run_one(args.packing == "on", args.warmup, args.iters, args.reps,
-            args.agpr)
+            args.unroll, args.label)
     return 0
 
 
