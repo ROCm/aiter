@@ -14,7 +14,7 @@
 Upstream is FlyDSL ``kernels/conv/conv3d_implicit.py`` and the public entry point
 still matches its keyword surface, but the body has diverged. aiter-only here:
 the offline tuned-config lookup (``_load_tuned_table`` / ``_lookup_tuned_tile``
-and the ``aiter/configs`` tables they read), the autotune hook, the tile
+and the ``aiter/configs`` tables they read), the tile
 heuristics, and ``buffer_atomic_add`` -- which upstream imports from
 ``kernels/common/``, a directory flydsl's wheel does not ship, as with the
 vendored ``buffer_ops`` and ``vector`` modules.
@@ -115,10 +115,6 @@ def _dispatch(exe, *args, stream=None):
         exe._cf = exe.compile(*args, stream=stream)
         return
     cf(*args, _as_stream(stream))
-
-
-def _autotune_enabled():
-    return os.environ.get("FLYDSL_CONV3D_AUTOTUNE", "0").lower() in ("1", "true", "yes")
 
 
 _WEIGHT_CACHE = {}
@@ -1425,7 +1421,6 @@ def _conv3d_impl(
     stream=None,
     tile=None,
     wgm=None,
-    autotune=None,
     input_layout="NCDHW",
     output_layout="NCDHW",
 ):
@@ -1598,31 +1593,6 @@ def _conv3d_impl(
     x_ndhwc = x.contiguous() if in_ndhwc else _ncdhw_to_ndhwc(x, stream)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
-    shape = (
-        n,
-        c,
-        d,
-        h,
-        w,
-        k,
-        kt,
-        kh,
-        kw,
-        st,
-        sh,
-        sw,
-        pt,
-        ph,
-        pw,
-        dt,
-        dh,
-        dw,
-        pad_mode,
-        has_bias,
-        groups,
-        out_ndhwc,
-    )
-
     def _run(the_tile, the_wgm=1):
         sk = _resolve_splitk(splitk, npq, crs, k, x.device, the_tile, groups)
         if sk > 1:
@@ -1664,26 +1634,6 @@ def _conv3d_impl(
     if tile is not None:
         chosen_tile = tuple(tile)
         chosen_wgm = 1 if forced_wgm is None else forced_wgm
-    elif autotune or (autotune is None and _autotune_enabled()):
-        from aiter.ops.flydsl.conv3d_policy import get_flydsl_conv3d_configs
-
-        from .conv3d_autotune import autotune_conv3d
-
-        candidates = [
-            ((tm, tn, wm, wn), g)
-            for tm, tn, wm, wn, g in get_flydsl_conv3d_configs(
-                npq, k // groups, groups, _num_cu(x.device)
-            )
-        ]
-        best = autotune_conv3d(
-            "bf16",
-            shape,
-            "bf16",
-            candidates,
-            x.device,
-            lambda tw: _run(tw[0], tw[1])[0],
-        )
-        chosen_tile, chosen_wgm = best
     else:
         hit = _lookup_tuned_tile(tuned_key, x.device)
         if hit is not None:
