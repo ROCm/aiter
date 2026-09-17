@@ -259,13 +259,11 @@ AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand. Oracle
 set equality `err=0` on both columns (HIP `stable=False` still matched
 this seed).
 
-The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
-write every complete-block id and skip scoring/bitonic. Same
-`block_ids [M, 512]`; no score matrix; expand still separate. **2d is
-closed** on emit / ``visible <= 512`` (``L<=2048``): those rows beat HIP.
-``n_blocks > 512`` is a recorded loss (bitonic tiles vs HIP MQA + radix),
-not a 2d gate. 2b single-WG tile merge stays for set equality; do not
-resume long-L scorer work.
+The FlyDSL column keeps the **`n_blocks <= 512` fast path**: write every
+complete-block id and skip scoring. Longer rows now use independent
+512-column FlyDSL scorer workgroups, a global fp32 `[M, n_blocks]` score
+buffer, and `flydsl_top_k_per_row_decode(stable=True)`. Expand remains
+separate.
 
 A 64-bit MSD binary radix-select on the 1024-candidate tile was measured
 and not shipped. Set equality held. Decode ``M=1`` 8k / 32k ~126 / ~497 µs
@@ -274,19 +272,23 @@ vs kept bitonic ~106 / ~419 µs. Sixty-four digit passes vs 55 sort stages.
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
-| 8 | 512 | 128 | 2.3 | 9.0 | 0 | 0 |
 | 1 | 2048 | 512 | 1.5 | 8.1 | 0 | 0 |
-| 8 | 2048 | 512 | 2.3 | 9.0 | 0 | 0 |
-| 1 | 8192 | 2048 | 106.4 | 16.1 | 0 | 0 |
-| 8 | 8192 | 2048 | 107.7 | 18.5 | 0 | 0 |
-| 1 | 32768 | 8192 | 419.2 | 19.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 423.0 | 23.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 1718.5 | 29.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 1736.3 | 52.1 | 0 | 0 |
-| 512 | 512 | 128 | 2.9 | 16.0 | 0 | 0 |
+| 1 | 8192 | 2048 | 16.0 | 17.5 | 0 | 0 |
+| 8 | 8192 | 2048 | 18.2 | 22.1 | 0 | 0 |
+| 1 | 32768 | 8192 | 20.6 | 20.9 | 0 | 0 |
+| 8 | 32768 | 8192 | 23.6 | 25.7 | 0 | 0 |
+| 1 | 131072 | 32768 | 38.7 | 30.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 59.8 | 52.4 | 0 | 0 |
+| 512 | 512 | 128 | 3.1 | 15.9 | 0 | 0 |
 | 512 | 2048 | 512 | 3.0 | 26.9 | 0 | 0 |
-| 512 | 8192 | 2048 | 212.6 | 83.9 | 0 | 0 |
-| 512 | 32768 | 8192 | 831.6 | 252.4 | 0 | 0 |
+| 512 | 8192 | 2048 | 105.5 | 82.4 | 0 | 0 |
+| 512 | 32768 | 8192 | 363.8 | 249.3 | 0 | 0 |
+
+Against the previous bitonic dispatch, `M=1` improves from
+106.4 / 419.2 / 1718.5 us to 16.0 / 20.6 / 38.7 us at
+8k / 32k / 128k. `M=512` improves from 212.6 / 831.6 us to
+105.5 / 363.8 us at 8k / 32k. This run beats live AMD through 32k decode,
+but not at 128k decode or long prefill.
 
 ## Phase 2e — family B K1 H=4 emit (not a win)
 

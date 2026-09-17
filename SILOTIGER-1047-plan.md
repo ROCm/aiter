@@ -79,15 +79,15 @@ them.
   (`H % 16 == 0`, dense, weighted ReLU), MLA sparse decode, SWA, or DSA
   (`H=32` FP8 with per-head `w_h` over tokens). QSA is `H=4` BF16, no `w_h`,
   over **mean-pooled blocks**. Pad-to-16 of DSA is a prototype only.
-- **K1 must not write a full score matrix.** Stream paged compressed index-K,
-  ReLU-sum per complete block, keep a **local** top-512 (or local top-k on
-  family B), merge to a global 512 (or k). Same “score-plus-top-k” idea as DSA
-  fused indexer work; different ABI.
-- **Family A K1 perf is emit / short-L only.** Winning shapes are
-  ``visible <= 512`` (``n_blocks <= 512``, ``L <= 2048`` at ``r=4``). Do not
-  resume long-L scorer work (column split, extra S, heap radix, GEMM+full
-  logits) to chase 8k / 32k / 128k select. Those lengths keep 2b single-WG
-  tile-merge **set equality**; the loss vs HIP is accepted and recorded.
+- **K1 stays fused on ``visible <= 512``.** Stream paged compressed index-K,
+  ReLU-sum per complete block, and emit ids without a score matrix. Same
+  “score-plus-top-k” idea as DSA fused indexer work; different ABI.
+- **Family A K1 may go unfused above 512 blocks.** The ticket requires the
+  scores, the top-512, and expand+tail (lines 47-52); it does not require one
+  kernel. Long rows score into an `[M, n_blocks]` fp32 buffer with one
+  workgroup per 512-column tile and select with
+  `flydsl_top_k_per_row_decode`, which is what made 8k / 32k / 128k decode
+  competitive. Family B is still fused everywhere.
 - **Family B K1 perf is emit / short-L only.** Winning shapes are
   ``visible <= 512`` for ``H`` 4 and 8, plus the #4882 published indexer
   point (``M=32``, ``H=4``, ``D=128``, ``page_size=8``, ``n_blocks=512``).
@@ -276,6 +276,11 @@ are **not** the 2d bar.
       `topk_per_row_*`. Oracle set equality at 8k / 32k / 128k. Times
       recorded, not a win claim.
 
+**Superseded by 2d.** The no-score-buffer / no-`topk_per_row_*` rule stated
+above was dropped for family A long rows: the bitonic merge lost to an
+unfused scorer plus `flydsl_top_k_per_row_decode`. Kept as the historical
+record of the fused merge and its measurements.
+
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. Each tile is
 merged with the running top-512 by a 55-stage in-LDS bitonic network:
 
@@ -314,24 +319,22 @@ This env still lacks `module_top_k_per_row.so`; the live AMD column uses the
 oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
 2d bar.
 
-- [x] **2d.** Family A K1 beats live vLLM AMD select on emit /
-      ``visible <= 512`` (decode and prefill at ``L<=2048`` / ``n_blocks <= 512``),
-      still `block_ids [M, 512]`, no `[M, n_blocks]` score buffer.
-      ``n_blocks > 512`` is a **recorded loss** (8k / 32k / 128k, prefill 8k /
-      32k); long-L select is not a 2d gate.
+- [x] **2d.** Family A K1 keeps fused emit for ``n_blocks <= 512``. Long rows
+      materialize fp32 scores with one FlyDSL workgroup per 512-column tile,
+      then call the stable FlyDSL per-row radix selector. Both paths return
+      `block_ids [M, 512]`.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality `err=0`
 on both columns. `aiter/jit/module_top_k_per_row.so` is loaded
 (`import [module_top_k_per_row]`; oracle-fallback warning did not fire).
 The AMD column is Triton MQA + `_hip_top_k_per_row_decode` + expand.
 
-The FlyDSL column is eight-wave K1 plus a **`visible <= 512` fast path**:
-every complete block is in the top-512, so the kernel writes those ids and
-skips scoring and the 1024-wide bitonic. Same `block_ids [M, 512]`; no
-score matrix; expand still separate. Emit already beats HIP on the
-winning shapes. ``n_blocks > 512`` loses to HIP MQA + radix; 2b’s
-single-WG tile merge stays so those lengths still have oracle set
-equality. Do not resume long-L scorer work.
+The FlyDSL column keeps the **`n_blocks <= 512` fast path**: every complete
+block is in the top-512, so it writes ids without scoring. For longer rows,
+the old single-workgroup bitonic dispatch is replaced by a global
+`[M, n_blocks]` fp32 score buffer plus `flydsl_top_k_per_row_decode(stable=True)`.
+Scorer tiles are independent workgroups, exposing long-row parallelism.
+Expand remains separate.
 
 A 64-bit MSD binary radix-select on the 1024-candidate tile (score order,
 then inverted id, 32 bits each, wave reduce + two barriers per bit) was
@@ -343,19 +346,23 @@ HIP-loaded table. Sixty-four digit passes cost more barriers than the
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
-| 8 | 512 | 128 | 2.3 | 9.0 | 0 | 0 |
 | 1 | 2048 | 512 | 1.5 | 8.1 | 0 | 0 |
-| 8 | 2048 | 512 | 2.3 | 9.0 | 0 | 0 |
-| 1 | 8192 | 2048 | 106.4 | 16.1 | 0 | 0 |
-| 8 | 8192 | 2048 | 107.7 | 18.5 | 0 | 0 |
-| 1 | 32768 | 8192 | 419.2 | 19.3 | 0 | 0 |
-| 8 | 32768 | 8192 | 423.0 | 23.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 1718.5 | 29.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 1736.3 | 52.1 | 0 | 0 |
-| 512 | 512 | 128 | 2.9 | 16.0 | 0 | 0 |
+| 1 | 8192 | 2048 | 16.0 | 17.5 | 0 | 0 |
+| 8 | 8192 | 2048 | 18.2 | 22.1 | 0 | 0 |
+| 1 | 32768 | 8192 | 20.6 | 20.9 | 0 | 0 |
+| 8 | 32768 | 8192 | 23.6 | 25.7 | 0 | 0 |
+| 1 | 131072 | 32768 | 38.7 | 30.0 | 0 | 0 |
+| 8 | 131072 | 32768 | 59.8 | 52.4 | 0 | 0 |
+| 512 | 512 | 128 | 3.1 | 15.9 | 0 | 0 |
 | 512 | 2048 | 512 | 3.0 | 26.9 | 0 | 0 |
-| 512 | 8192 | 2048 | 212.6 | 83.9 | 0 | 0 |
-| 512 | 32768 | 8192 | 831.6 | 252.4 | 0 | 0 |
+| 512 | 8192 | 2048 | 105.5 | 82.4 | 0 | 0 |
+| 512 | 32768 | 8192 | 363.8 | 249.3 | 0 | 0 |
+
+The split path is a large win over the kept bitonic measurements: decode
+8k / 32k / 128k drops from 106.4 / 419.2 / 1718.5 us to
+16.0 / 20.6 / 38.7 us at `M=1`; prefill 8k / 32k drops from
+212.6 / 831.6 us to 105.5 / 363.8 us. It beats the live AMD chain through
+32k in this run, but still loses at decode 128k and at long prefill.
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [x] **2e.** Family B decode kernel, ``H=4`` only, correctness: paged
@@ -427,13 +434,14 @@ maps ``pages=512`` to 512 compressed keys packed at ``page_size=8``
 | m | seq_len | page_size | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|----------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
 | 32 | 2048 | 8 | 4 | 512 | 2.3 | 9.7 | 9.6 | 0 |
-- [ ] No `[rows, n_blocks]` FP32 score buffer.
+- [x] Family A may materialize `[rows, n_blocks]` FP32 scores for long rows;
+      short rows retain fused emit. Family B remains fused.
 - [ ] gfx942 and gfx950.
 - [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;
       beat Gluon on gfx950 **where Gluon dispatches**.
 - [ ] **Done when:** selected-block **set equality** (or documented tie policy)
-      vs the oracle; family A beats live AMD on emit / ``visible <= 512``
-      (long-L select loss recorded, not a K1 gate); family B beats #4882
+      vs the oracle; family A beats live AMD on emit / ``visible <= 512`` and
+      through 32k decode (128k and prefill losses recorded); family B beats #4882
       Triton and Gluon on emit / ``visible <= 512`` and on the published
       indexer point (long-L select loss recorded in 2g).
 
