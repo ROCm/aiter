@@ -130,9 +130,7 @@ def write_config_json(fpath: str, payload: Mapping[str, Any]) -> None:
     invalidate_config_cache(fpath)
 
 
-def _insert_ordered(
-    container: dict[str, Any], key: str, value: Any
-) -> dict[str, Any]:
+def _insert_ordered(container: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
     """Set ``key`` without disturbing the order of keys already in the file.
 
     A container that is already sorted stays sorted, so a generated table

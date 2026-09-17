@@ -21,7 +21,7 @@ import zlib
 from collections import Counter
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
 import pandas as pd
 import triton  # noqa: F401  # ROCm environments may require Triton before torch.
@@ -46,8 +46,12 @@ from aiter.ops.mha_fwd_policy import (
     MhaFwdProblem,
     canonical_backend_config,
     enumerate_mha_fwd_candidates,
+    fold_mha_fwd_selection_records,
     mha_fwd_candidate_id,
+    mha_fwd_config_matches,
+    parse_backend_config,
 )
+from aiter.ops.mha_fwd_store import get_mha_fwd_store
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -1025,9 +1029,11 @@ class MhaFwdTuner(TunerCommon):
     def result_to_csv(self, resultdf, file, concat=False):
         if resultdf is None or resultdf.empty:
             runtime = pd.DataFrame(columns=MHA_FWD_RUNTIME_CSV_FIELDS)
+            expected_configs = []
         else:
             runtime = resultdf.loc[:, list(MHA_FWD_RUNTIME_CSV_FIELDS)].copy()
             runtime.loc[:, "backend_config"] = runtime["backend_config"].fillna("")
+            runtime, expected_configs = self._publish_backend_configs(runtime)
         if os.path.exists(file):
             old = pd.read_csv(file)
             if old.empty:
@@ -1059,7 +1065,8 @@ class MhaFwdTuner(TunerCommon):
         self._atomic_write_csv(combined, file)
 
         self._selection_proofs.extend(
-            self._run_fresh_probe(row, file) for _, row in runtime.iterrows()
+            self._run_fresh_probe(row, file, expected_config)
+            for (_, row), expected_config in zip(runtime.iterrows(), expected_configs)
         )
         failed_proofs = [
             proof for proof in self._selection_proofs if proof["status"] != "verified"
@@ -1105,7 +1112,38 @@ class MhaFwdTuner(TunerCommon):
             frame = frame.sort_values(list(MHA_FWD_TUNING_KEY_FIELDS))
         self._atomic_write_csv(frame[list(MHA_FWD_RUNTIME_CSV_FIELDS)], tune_file)
 
-    def _run_fresh_probe(self, row, config_file: str) -> dict[str, Any]:
+    def _publish_backend_configs(self, runtime):
+        """Hand each winner's launch configuration to the configured store.
+
+        The store decides where a Triton or Gluon tile dict is persisted and
+        returns whatever should sit in the runtime CSV's backend_config cell:
+        the canonical blob under the CSV contract, an empty cell under the
+        JSON contract because the tiles went into the config tree instead.
+        Either way the routing row is written by the caller, unchanged.
+        """
+        store = get_mha_fwd_store()
+        cells = []
+        expected = []
+        for _, row in runtime.iterrows():
+            config = parse_backend_config(row["backend_config"])
+            expected.append(config)
+            cells.append(
+                store.publish(
+                    MhaFwdProblem.from_mapping(row), str(row["backend"]), config
+                )
+            )
+        runtime.loc[:, "backend_config"] = cells
+        # The winners are returned alongside the frame because the JSON store
+        # empties the column it just published elsewhere, and the proof still
+        # has to assert those exact tiles were the ones the runtime used.
+        return runtime, expected
+
+    def _run_fresh_probe(
+        self,
+        row,
+        config_file: str,
+        expected_config: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         descriptor, proof_path = tempfile.mkstemp(prefix="mha-selection-", suffix=".jsonl")
         os.close(descriptor)
         os.unlink(proof_path)
@@ -1146,10 +1184,11 @@ class MhaFwdTuner(TunerCommon):
             if os.path.exists(proof_path):
                 with open(proof_path, encoding="utf-8") as file:
                     records = [json.loads(line) for line in file if line.strip()]
-            selected = records[-1] if records else {}
+            selected = fold_mha_fwd_selection_records(records)
             observed = {
                 "backend": selected.get("backend"),
                 "num_splits": selected.get("num_splits"),
+                "config": selected.get("config"),
             }
             probe_line = next(
                 (
@@ -1160,15 +1199,26 @@ class MhaFwdTuner(TunerCommon):
                 "",
             )
             probe_result = json.loads(probe_line) if probe_line else {}
+            routed = expected is None or (
+                observed["backend"] == expected["backend"]
+                and observed["num_splits"] == expected["num_splits"]
+            )
+            # Routing to the winning backend is not the same as running the
+            # winning launch. For a backend whose tiles are a runtime dict,
+            # the proof only holds if those tiles were the ones observed.
+            applied = mha_fwd_config_matches(expected_config, observed["config"])
             verified = (
                 completed.returncode == 0
-                and (expected is None or observed == expected)
+                and routed
+                and applied
                 and probe_result.get("correctness") == "ok"
             )
             return {
                 "status": "verified" if verified else "failed",
                 "expected": expected,
+                "expected_config": dict(expected_config) if expected_config else None,
                 "observed": observed,
+                "config_applied": applied,
                 "latency_us": probe_result.get("latency_us"),
                 "correctness": probe_result.get("correctness", "failed"),
                 "returncode": completed.returncode,
@@ -1245,6 +1295,7 @@ class MhaFwdTuner(TunerCommon):
                 ),
             },
             "selection_proofs": self._selection_proofs,
+            "config_store": get_mha_fwd_store().describe(),
             "coverage_limits": [
                 "CK tile recipes remain the default CK launch; this tuner does not dump PR #5024 JSON",
             ],

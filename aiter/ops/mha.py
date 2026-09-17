@@ -3,9 +3,8 @@
 
 import csv
 import functools
-import json
 import os
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import Generator, Tensor
@@ -33,9 +32,8 @@ from .mha_fwd_policy import (
     MhaFwdProblem,
     csv_scalar,
     parse_backend_config,
+    record_mha_fwd_selection,
 )
-
-_MHA_FWD_RECORDED_SELECTIONS: set[tuple[str, int]] = set()
 
 
 def _mha_csv_scalar(value: Any) -> str:
@@ -163,30 +161,24 @@ def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     return _load_mha_fwd_tuning_table(os.path.abspath(path)).get(key)
 
 
-def _record_mha_fwd_selection(backend: str, num_splits: int = 0) -> None:
-    """Append the actual public-path selection when a proof file is requested."""
+def _record_mha_fwd_selection(
+    backend: str,
+    num_splits: int = 0,
+    config: Mapping[str, Any] | None = None,
+) -> None:
+    """Append the actual public-path selection when a proof file is requested.
 
-    path = os.getenv("AITER_MHA_FWD_SELECTION_PROOF_FILE", "").strip()
-    if not path:
-        return
-    identity = (backend, int(num_splits))
-    if identity in _MHA_FWD_RECORDED_SELECTIONS:
-        return
-    _MHA_FWD_RECORDED_SELECTIONS.add(identity)
-    payload = json.dumps(
-        {
-            "backend": backend,
-            "num_splits": int(num_splits),
-            "pid": os.getpid(),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    ``config`` is recorded when this router is the layer that decided the
+    launch configuration, which is the case when a tuned dict is injected from
+    the runtime CSV. When the configuration is instead resolved downstream by
+    the backend's own loader, that loader reports it and this call carries the
+    backend alone; the probe folds the two records together.
+    """
+    record_mha_fwd_selection(
+        backend=backend,
+        num_splits=int(num_splits),
+        **({"config": dict(config)} if config else {}),
     )
-    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        os.write(descriptor, f"{payload}\n".encode("utf-8"))
-    finally:
-        os.close(descriptor)
 
 
 def _fmha_kv_byte_extent_ge_u32(
@@ -4130,6 +4122,7 @@ def flash_attn_varlen_func(
         triton_backend = (
             tuned_backend if tuned_backend in ("triton", "gluon") else "triton"
         )
+        tuned_config = parse_backend_config(backend_config)
         result = flash_attn_varlen_func_triton(
             q=q,
             k=k,
@@ -4150,10 +4143,13 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
-            config=parse_backend_config(backend_config),
+            config=tuned_config,
             backend=triton_backend,
         )
-        _record_mha_fwd_selection(triton_backend)
+        # Only report the config when this router supplied it. If it is None
+        # the backend's own loader resolved the tiles and reports them itself,
+        # so claiming a config here would assert something unobserved.
+        _record_mha_fwd_selection(triton_backend, config=tuned_config)
         return result
     return FlashAttnVarlenFunc.apply(
         q,
