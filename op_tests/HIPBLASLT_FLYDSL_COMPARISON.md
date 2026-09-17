@@ -83,6 +83,88 @@ the current test's JSON summary. The Tensile configs use `KernelTime: false`,
 1000 enqueues, hot buffers, and TrigSin/TrigCos input initialization, rather than
 the current test's initialization/rotation/timing settings.
 
+## Are the supplied tuning results used by hipBLASLt?
+
+The installed stock hipBLASLt does **not** use the six supplied winners. The
+artifact configs and `run_tuning.sh` write standalone Tensile build and timing
+outputs; they do not merge the resulting exact mappings into the installed
+hipBLASLt database or rebuild the library.
+
+The requested command:
+
+```bash
+TENSILE_DB2=1 ./run_tuning.sh run1
+```
+
+cannot produce valid kernel timings. Bit 0 of `TENSILE_DB2` is implemented as
+`Debug::skipKernelLaunch()`. Every enqueue printed `DEBUG: Skip kernel
+execution`; the reported 0.16–1.34 us values were launch-skipping overhead and
+the winner-validation passes failed.
+
+Running the script again without `TENSILE_DB2` produced real timings:
+
+| N | K | Tensile client time (us) |
+|---:|---:|---:|
+| 6144 | 7168 | 16.3235 |
+| 7168 | 3072 | 10.0779 |
+| 8192 | 1536 | 6.77071 |
+| 2048 | 7168 | 12.5212 |
+| 65536 | 1536 | 25.1202 |
+| 7168 | 16384 | 30.1493 |
+
+The 65536x1536 value is the initial `NO_CHECK` pass. Its later full-validation
+pass was an anomalous 121.883 us. Each log says `Actual Solutions: 1 / 1`, so
+this run recompiles and retimes the already specified winner. It does not search
+for a better solution.
+
+I then queried the public hipBLASLt heuristic using FP8 E4M3 A/B, BF16 D, FP32
+accumulation, TN layouts, MX32 E8M0 scales, and a 128 MiB workspace limit. The
+stock library returned the same index-193 `MT128x128x256` solution for every
+shape. Its decompressed msgpack database contains that solution and none of the
+three supplied winner tile signatures: `MT64x192x512`, `MT128x128x512`, or
+`MT256x256x256`.
+
+The six exact mappings were then merged into one gfx1250 logic file and hipBLASLt
+was rebuilt. `TensileLogic --check-all` retained all six solutions and rejected
+none. The public heuristic selected every expected winner. The rebuilt indices
+below are local to this six-solution test library.
+
+These are rocprof GPU-duration means for 100 hot-buffer graph calls after two
+warmups. The GSU4 result includes its reduction helper.
+
+| N | K | Stock selection | Stock (us) | Rebuilt selection | Rebuilt (us) | Speedup |
+|---:|---:|---|---:|---|---:|---:|
+| 6144 | 7168 | 193 / MT128x128x256 | 44.729 | 1 / MT64x192x512 | 14.010 | 3.19x |
+| 7168 | 3072 | 193 / MT128x128x256 | 22.038 | 2 / MT128x128x512 | 8.356 | 2.64x |
+| 8192 | 1536 | 193 / MT128x128x256 | 13.507 | 4 / MT128x128x512 | 5.826 | 2.32x |
+| 2048 | 7168 | 193 / MT128x128x256 | 43.294 | 0 / MT128x128x512, GSU4 | 10.828 | 4.00x |
+| 65536 | 1536 | 193 / MT128x128x256 | 96.456 | 5 / MT256x256x256 | 20.339 | 4.74x |
+| 7168 | 16384 | 193 / MT128x128x256 | 95.714 | 3 / MT128x128x512 | 24.889 | 3.85x |
+
+This confirms a large database-selection problem in the stock public path:
+installing a library rebuilt with the supplied exact mappings improves these
+shapes by 2.32x–4.74x. It does not establish that the supplied winners are the
+best possible Tensile kernels, because the provided configs contain only one
+candidate each. A real tuning pass must enumerate alternatives, merge its
+winning logic into the production logic tree, and rebuild or redistribute the
+hipBLASLt device library.
+
+The public probe uses zero operands and constant scales to isolate selection and
+kernel timing. The earlier same-process table uses matched random operands and
+is the stronger FlyDSL-versus-winner comparison: there, the exact supplied
+Tensile kernels remained slower on four of six shapes. The rebuilt public probe
+therefore explains the much larger stock-library regression without erasing the
+remaining kernel-level gap. The split-K precision qualification under
+**Correctness and precision** still applies to the three larger-K FlyDSL
+results.
+
+The first custom build used `HIPBLASLT_ENABLE_YAML=ON`; in this checkout that
+left `libhipblaslt.so` referring to msgpack loader symbols that the YAML-mode
+`libtensilelite-host.so` did not provide. The working build uses the production
+configuration, `HIPBLASLT_ENABLE_YAML=OFF` and
+`HIPBLASLT_ENABLE_LAZY_LOAD=ON`, with `msgpack-cxx`. This loader issue is
+independent of kernel performance.
+
 ## Correctness and precision
 
 The target's constant-data case passes the reference check, and random outputs
@@ -248,3 +330,21 @@ Authoritative matched-output artifacts in that directory:
 
 Earlier `same_python*`, `six_same_python*`, and `profile_six*` artifacts predate
 matched output rotation and are **not** the final comparison.
+
+The public heuristic probe is `op_tests/csrc/hipblaslt_public_bench.cc`, built
+with `op_tests/build_hipblaslt_public_bench.sh`. For example:
+
+```bash
+ROCM_PATH=/path/to/rocm \
+bash op_tests/build_hipblaslt_public_bench.sh /path/to/hipblaslt-prefix \
+  /tmp/hipblaslt_public_bench
+
+HIPBLASLT_TENSILE_LIBPATH=/path/to/hipblaslt/library/gfx1250 \
+LD_LIBRARY_PATH=/path/to/hipblaslt/lib:/path/to/rocm/lib \
+/tmp/hipblaslt_public_bench 512 8192 1536 100 1
+```
+
+The stock and rebuilt public traces and their parsed summary are under
+`/tmp/hipblaslt_public_profiles`. The working custom msgpack build and install
+trees are `/tmp/hipblaslt_six_msgpack/release2` and
+`/tmp/hipblaslt_six_msgpack/install2`.
