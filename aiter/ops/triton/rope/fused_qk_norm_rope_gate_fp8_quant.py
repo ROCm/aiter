@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Qwen3.8 exact Q/K preparation with grouped FP8 Q/K/V outputs.
+"""Fused Q/K RMSNorm, RoPE, gate extraction, and grouped FP8 Q/K/V quantization.
 
 This operator is intentionally cache-independent. Sequence metadata and the
 decode-prefix boundary are explicit inputs so framework integrations retain
@@ -14,7 +14,8 @@ import triton
 import triton.language as tl
 
 import aiter
-from aiter.ops.triton._triton_kernels.rope.qwen3_next_fp8_qkv import (
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.triton._triton_kernels.rope.fused_qk_norm_rope_gate_fp8_quant import (
     persistent_qk_norm_rope_gate_token_amax_kernel,
     quantize_qk_grouped_kernel,
     quantize_qk_grouped_offset_kernel,
@@ -26,13 +27,14 @@ from aiter.ops.triton._triton_kernels.rope.qwen3_next_fp8_qkv import (
 
 MAX_QUERY_TOKENS = 8192
 MAX_SEQUENCES = 256
-FP8_MAX = 448.0
+FP8_DTYPE = torch.float8_e4m3fn
+FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 SCALE_BLOCK_T = 256
 SCALE_NUM_BLOCKS = MAX_QUERY_TOKENS // SCALE_BLOCK_T
 QK_TOKENS_PER_PROGRAM = 4
 
 
-class Qwen3NextFp8QKVPrepOutput(NamedTuple):
+class FusedQKNormRopeGateFp8QuantOutput(NamedTuple):
     query: torch.Tensor
     key: torch.Tensor
     gate: torch.Tensor
@@ -44,7 +46,25 @@ class Qwen3NextFp8QKVPrepOutput(NamedTuple):
     value_descale: torch.Tensor
 
 
-def qwen3_next_fp8_qkv_prep(
+def _validate_gfx950_fp8() -> None:
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        raise RuntimeError(
+            f"fused_qk_norm_rope_gate_fp8_quant is supported only on gfx950, got {gfx}"
+        )
+    if aiter.dtypes.fp8 != FP8_DTYPE:
+        raise RuntimeError(
+            "fused_qk_norm_rope_gate_fp8_quant requires float8_e4m3fn "
+            f"outputs on gfx950, got {aiter.dtypes.fp8}"
+        )
+
+
+def _require_inner_contiguous(name: str, tensor: torch.Tensor) -> None:
+    if tensor.ndim > 0 and tensor.stride(-1) != 1:
+        raise ValueError(f"{name} must have a contiguous innermost dimension")
+
+
+def fused_qk_norm_rope_gate_fp8_quant(
     q_gate: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -71,10 +91,10 @@ def qwen3_next_fp8_qkv_prep(
     query_descale_out: torch.Tensor | None = None,
     key_descale_out: torch.Tensor | None = None,
     value_descale_out: torch.Tensor | None = None,
-) -> Qwen3NextFp8QKVPrepOutput:
-    """Prepare Qwen3.8 full-attention Q/K/V for dynamic FP8 FMHA.
+) -> FusedQKNormRopeGateFp8QuantOutput:
+    """Prepare normalized and rotated Q/K/V for dynamic FP8 FMHA.
 
-    ``q_gate`` uses the Qwen3.8 interleaved per-head ``[Q, gate]`` layout.
+    ``q_gate`` uses an interleaved per-head ``[Q, gate]`` layout.
     ``query_norm_weight`` and ``key_norm_weight`` are raw zero-centered Gemma
     RMSNorm parameters; the exact FP32 ``+1`` is applied in the kernel.
 
@@ -94,7 +114,8 @@ def qwen3_next_fp8_qkv_prep(
     num_quant_sequences = num_sequences - quant_sequence_start
 
     if q_gate.device.type != "cuda":
-        raise ValueError("qwen3_next_fp8_qkv_prep requires a CUDA/HIP device")
+        raise ValueError("fused_qk_norm_rope_gate_fp8_quant requires a CUDA/HIP device")
+    _validate_gfx950_fp8()
     if q_gate.ndim != 2 or key.ndim != 2 or value.ndim != 2:
         raise ValueError("q_gate, key, and value must be two-dimensional")
     if q_gate.shape[1] != 2 * num_query_heads * head_dim:
@@ -132,7 +153,8 @@ def qwen3_next_fp8_qkv_prep(
         )
     if num_quant_tokens == 0:
         raise ValueError(
-            "qwen3_next_fp8_qkv_prep requires at least one prefill/extend token"
+            "fused_qk_norm_rope_gate_fp8_quant requires at least one "
+            "prefill/extend token"
         )
     if total_tokens > MAX_QUERY_TOKENS:
         raise ValueError(
@@ -144,8 +166,8 @@ def qwen3_next_fp8_qkv_prep(
         raise ValueError("num_query_heads must be divisible by num_kv_heads")
     if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
         raise ValueError("rotary_dim must be positive, even, and <= head_dim")
-    if q_gate.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("q_gate must use bfloat16 or float16")
+    if q_gate.dtype != torch.bfloat16:
+        raise ValueError("q_gate must use bfloat16")
     if key.dtype != q_gate.dtype or value.dtype != q_gate.dtype:
         raise ValueError("q_gate, key, and value must have the same dtype")
     tensors = (
@@ -159,6 +181,17 @@ def qwen3_next_fp8_qkv_prep(
     )
     if any(tensor.device != q_gate.device for tensor in tensors):
         raise ValueError("all inputs must be on the same device")
+    for name, tensor in (
+        ("q_gate", q_gate),
+        ("key", key),
+        ("value", value),
+        ("query_norm_weight", query_norm_weight),
+        ("key_norm_weight", key_norm_weight),
+        ("cos_sin_cache", cos_sin_cache),
+        ("positions", positions),
+        ("cu_seqlens", cu_seqlens),
+    ):
+        _require_inner_contiguous(name, tensor)
 
     provided_outputs = (
         query_out,
@@ -173,9 +206,7 @@ def qwen3_next_fp8_qkv_prep(
     )
     if any(output is not None for output in provided_outputs):
         if not all(output is not None for output in provided_outputs):
-            raise ValueError(
-                "Qwen3 FP8 QKV output buffers must be all set or all unset"
-            )
+            raise ValueError("FP8 QKV output buffers must be all set or all unset")
         query = query_out
         output_key = key_out
         gate = gate_out
@@ -194,6 +225,74 @@ def qwen3_next_fp8_qkv_prep(
         assert query_descale is not None
         assert key_descale is not None
         assert value_descale is not None
+        expected_outputs = (
+            (
+                "query_out",
+                query,
+                (total_tokens, num_query_heads * head_dim),
+                q_gate.dtype,
+            ),
+            (
+                "key_out",
+                output_key,
+                (total_tokens, num_kv_heads * head_dim),
+                key.dtype,
+            ),
+            (
+                "gate_out",
+                gate,
+                (total_tokens, num_query_heads * head_dim),
+                q_gate.dtype,
+            ),
+            (
+                "query_fp8_out",
+                query_fp8,
+                (total_tokens, num_query_heads, head_dim),
+                FP8_DTYPE,
+            ),
+            (
+                "key_fp8_out",
+                key_fp8,
+                (total_tokens, num_kv_heads, head_dim),
+                FP8_DTYPE,
+            ),
+            (
+                "value_fp8_out",
+                value_fp8,
+                (total_tokens, num_kv_heads, head_dim),
+                FP8_DTYPE,
+            ),
+            (
+                "query_descale_out",
+                query_descale,
+                (MAX_SEQUENCES, num_kv_heads),
+                torch.float32,
+            ),
+            (
+                "key_descale_out",
+                key_descale,
+                (MAX_SEQUENCES, num_kv_heads),
+                torch.float32,
+            ),
+            (
+                "value_descale_out",
+                value_descale,
+                (MAX_SEQUENCES, num_kv_heads),
+                torch.float32,
+            ),
+        )
+        for name, tensor, expected_shape, expected_dtype in expected_outputs:
+            if tensor.shape != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"{name} must have dtype {expected_dtype}, got {tensor.dtype}"
+                )
+            if tensor.device != q_gate.device:
+                raise ValueError(f"{name} must be on the same device as q_gate")
+            _require_inner_contiguous(name, tensor)
     else:
         query = torch.empty(
             (total_tokens, num_query_heads * head_dim),
@@ -206,20 +305,19 @@ def qwen3_next_fp8_qkv_prep(
             device=key.device,
         )
         gate = torch.empty_like(query)
-        fp8_dtype = aiter.dtypes.fp8
         query_fp8 = torch.empty(
             (total_tokens, num_query_heads, head_dim),
-            dtype=fp8_dtype,
+            dtype=FP8_DTYPE,
             device=q_gate.device,
         )
         key_fp8 = torch.empty(
             (total_tokens, num_kv_heads, head_dim),
-            dtype=fp8_dtype,
+            dtype=FP8_DTYPE,
             device=key.device,
         )
         value_fp8 = torch.empty(
             (total_tokens, num_kv_heads, head_dim),
-            dtype=fp8_dtype,
+            dtype=FP8_DTYPE,
             device=value.device,
         )
         query_descale = torch.empty(
@@ -284,7 +382,7 @@ def qwen3_next_fp8_qkv_prep(
         rotary_dim=rotary_dim,
         half_rotary=half_rotary,
         eps=eps,
-        INPUT_DTYPE=(tl.bfloat16 if q_gate.dtype == torch.bfloat16 else tl.float16),
+        INPUT_DTYPE=tl.bfloat16,
         HEAD_BLOCK=head_block,
         ROT_HALF_BLOCK=rotary_half_block,
         HAS_PASS=rotary_dim < head_dim,
@@ -320,6 +418,8 @@ def qwen3_next_fp8_qkv_prep(
         cu_seqlens,
         partial_amax,
         quant_sequence_start,
+        quant_token_start,
+        num_actual_tokens,
         num_q_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
         gqa_ratio=gqa_ratio,
@@ -344,6 +444,7 @@ def qwen3_next_fp8_qkv_prep(
 
     query_view = query.view(total_tokens, num_query_heads, head_dim)
     key_view = output_key.view(total_tokens, num_kv_heads, head_dim)
+    search_steps = max(0, (num_sequences - 1).bit_length())
     if quant_token_start == 0 and quant_sequence_start == 0:
         quantize_qk_grouped_kernel[(num_actual_tokens, num_query_heads + num_kv_heads)](
             query_view,
@@ -369,12 +470,10 @@ def qwen3_next_fp8_qkv_prep(
             head_dim=head_dim,
             FP8_MAX_VALUE=FP8_MAX,
             BLOCK_D=triton.next_power_of_2(head_dim),
-            SEARCH_STEPS=8,
+            SEARCH_STEPS=search_steps,
             num_warps=4,
         )
-        search_steps = max(0, (num_quant_sequences - 1).bit_length())
     else:
-        search_steps = max(0, (num_quant_sequences - 1).bit_length())
         quantize_qk_grouped_offset_kernel[
             (num_quant_tokens, num_query_heads + num_kv_heads)
         ](
@@ -387,8 +486,9 @@ def qwen3_next_fp8_qkv_prep(
             cu_seqlens,
             quant_token_start,
             num_quant_tokens,
+            num_actual_tokens,
             quant_sequence_start,
-            num_quant_sequences,
+            num_sequences,
             query_view.stride(0),
             query_view.stride(1),
             key_view.stride(0),
@@ -415,8 +515,9 @@ def qwen3_next_fp8_qkv_prep(
         cu_seqlens,
         quant_token_start,
         num_quant_tokens,
+        num_actual_tokens,
         quant_sequence_start,
-        num_quant_sequences,
+        num_sequences,
         value_view.stride(0),
         value_view.stride(1),
         value_fp8.stride(0),
@@ -430,7 +531,7 @@ def qwen3_next_fp8_qkv_prep(
         num_warps=4,
     )
 
-    return Qwen3NextFp8QKVPrepOutput(
+    return FusedQKNormRopeGateFp8QuantOutput(
         query=query,
         key=output_key,
         gate=gate,
