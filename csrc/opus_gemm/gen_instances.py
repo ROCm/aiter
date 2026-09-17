@@ -101,6 +101,25 @@ SPLITK_REDUCE_ARCHES = tuple(SPLITK_REDUCE_ABI_MAP)
 LEGACY_OPUS_ARCH = "gfx950"
 
 
+def _bpreshuf_macro_defs(path):
+    """The six OPUS_BMM_BPRESHUF_* macro definitions, read from the one file that
+    still owns them. Read rather than duplicated here so the macros keep a single
+    definition site: a TU that instantiates through a macro must see that macro's
+    current text, not a copy that drifted."""
+    out, lines = [], open(path).read().splitlines(True)
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("#define OPUS_BMM_BPRESHUF"):
+            while True:
+                out.append(lines[i])
+                if not lines[i].rstrip("\n").endswith("\\"):
+                    break
+                i += 1
+            out.append("\n")
+        i += 1
+    return "".join(out)
+
+
 def _kid_name_arch(kid_name):
     """Resolve a kid's arch from its symbol name.
 
@@ -1122,6 +1141,101 @@ void
                 os.path.join(self.instances_path, f"all_instances_host_{arch}.cu")
             ).write_text(contents)
 
+
+    def _emit_bpreshuffle_tus(self):
+        """One device TU per bpreshuffle instantiation, into the blob.
+
+        These tiles are hand-written aliases in the traits header rather than
+        codegen'd kids, so there is no impl/*.cuh to include and no geometry to
+        re-emit -- the TU carries the same includes and the ONE macro its entry
+        needs, and nothing else. What this buys is purely build parallelism:
+        all 65 instantiations used to share opus_bmm_..._gfx1250.cu, and ninja
+        can only hand one file to one compiler process, so every trait change
+        cost 14 minutes on one core of a 256-core box. Split, it is 45 seconds.
+
+        Emitted rather than checked in, for the same reason the a16w16 families
+        are: 65 files each repeating six macro definitions is a list to keep
+        aligned by hand, which is what this generator exists to avoid.
+        """
+        from opus_gemm_common import A8W8_MXSCALE_BMM_BPRESHUFFLE_INSTANCES
+
+        # ONE pipeline header per TU, chosen by the macro. Pulling all three --
+        # which is what the monolithic file did, because it instantiated out of
+        # all three -- makes every TU parse two pipelines it never names, and
+        # they define same-named inline __device__ helpers besides.
+        _PIPELINE = {
+            "OPUS_BMM_BPRESHUF_INST":
+                "gfx1250/opus_bmm_pipeline_a8w8_mxscale_bpreshuffle_gfx1250.cuh",
+            "OPUS_BMM_BPRESHUF_NS_INST":
+                "gfx1250/opus_bmm_pipeline_a8w8_mxscale_bpreshuffle_nospec_gfx1250.cuh",
+            "OPUS_BMM_BPRESHUF_CC_INST_PREFILL":
+                "gfx1250/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle"
+                "_clusterclaunch_gfx1250.cuh",
+            "OPUS_BMM_BPRESHUF_CC_INST_DECODE":
+                "gfx1250/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle"
+                "_clusterclaunch_gfx1250.cuh",
+        }
+        src = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "opus_bmm_a8w8_mxscale_bpreshuffle_gfx1250.cu",
+        )
+        macro_text = _bpreshuf_macro_defs(src)
+        out_dir = self.instances_path
+        os.makedirs(out_dir, exist_ok=True)
+        # CC_INST_PREFILL expands to SIXTEEN kernels (multicast 1|2 x bf16|fp32 x
+        # splitK 1|2|4|8) and CC_INST_DECODE to eight, so those TUs were the
+        # build wall on their own: ninja's log had them at 36s each while every
+        # other bpreshuffle TU finished in 2.6s. Emit one CC_ONE per TU instead,
+        # which is the same total codegen spread over 16 jobs rather than 1.
+        _CC_SK = (1, 2, 4, 8)
+        _CC_DC = ("bf16_t", "fp32_t")
+        _CC_MC = {
+            "OPUS_BMM_BPRESHUF_CC_INST_PREFILL": (1, 2),
+            "OPUS_BMM_BPRESHUF_CC_INST_DECODE": (1,),
+        }
+        work = []
+        for macro, alias in A8W8_MXSCALE_BMM_BPRESHUFFLE_INSTANCES:
+            if macro in _CC_MC:
+                for mc in _CC_MC[macro]:
+                    for sk in _CC_SK:
+                        for dc in _CC_DC:
+                            work.append(
+                                (
+                                    macro,
+                                    alias,
+                                    f"OPUS_BMM_BPRESHUF_CC_ONE({alias}, {dc}, {sk}, {mc})",
+                                    f"_{dc[:4]}_sk{sk}_mc{mc}",
+                                )
+                            )
+            else:
+                work.append((macro, alias, f"{macro}({alias})", ""))
+
+        for macro, alias, call, suffix in work:
+            short = alias.replace("opus_bmm_a8w8_mxscale_bpreshuffle_", "").replace(
+                "_gfx1250", ""
+            )
+            fn = (
+                f"bpreshuf_{macro.replace('OPUS_BMM_BPRESHUF_', '').lower()}"
+                f"_{short}{suffix}.device.cu"
+            )
+            includes = (
+                '#include "opus_gemm_utils.cuh"\n'
+                f'#include "{_PIPELINE[macro]}"\n'
+            )
+            body = (
+                "// SPDX-License-Identifier: MIT\n"
+                "// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+                "//\n"
+                "// Auto-generated. Do not edit. See gen_instances.py:_emit_bpreshuffle_tus.\n"
+                + includes
+                + "\n"
+                + macro_text
+                + "\n"
+                + f"{call};\n"
+            )
+            with open(os.path.join(out_dir, fn), "w") as f:
+                f.write(body)
+
     def _emit_device_tus(self):
         """Emit one device-only .device.cu per (kid, dtype).
 
@@ -1286,6 +1400,7 @@ void
         # Emit one fused HOST TU + N device TUs (one per kid, dtype) + one dedicated splitk_reduce.device.cu.
         self._emit_fused_host_tu()
         self._emit_device_tus()
+        self._emit_bpreshuffle_tus()
         # Only emit the standalone reduce TU if the build actually has a splitk kid (otherwise the fused
         # host TU will never reference any...
         needs_reduce_tu = any(
