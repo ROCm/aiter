@@ -391,7 +391,7 @@ _PREFILL_GROUPS = [
     *_k5_dense_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
-    # Keep the partial-chunk boundary out of the broad production sweep.
+    # Dedicated review case: varlen with a non-multiple-of-BT tail (T=1000 for BT=64).
     PrefillGroup(
         model_name="review-unaligned-varlen",
         Hv=32,
