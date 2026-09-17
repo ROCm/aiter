@@ -660,8 +660,8 @@ def compile_flydsl_moe_stage1(
             w_dtype=b_dtype,
             w_layout="standard",
             k_wave=k_wave,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
+            # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
+            # fp4 byte-LUT decode, LDS staging) from this arch string.
             rocm_arch=str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
@@ -745,8 +745,8 @@ def compile_flydsl_moe_stage2(
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
             w_dtype=b_dtype,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
+            # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
+            # fp4 byte-LUT decode, atomic epilogue) from this arch string.
             rocm_arch=str(get_rocm_arch()),
             epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
             topk=topk,

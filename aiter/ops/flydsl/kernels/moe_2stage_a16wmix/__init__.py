@@ -139,7 +139,6 @@ def flydsl_a16w4_gemm1(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
-        use_k16="gfx95" not in str(get_rocm_arch()),
         rocm_arch=str(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
@@ -247,7 +246,6 @@ def flydsl_a16w4_gemm2(
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
         persist=_persist,
-        use_k16="gfx95" not in str(get_rocm_arch()),
         rocm_arch=str(get_rocm_arch()),
         epilog=epilog,
         topk=topk,

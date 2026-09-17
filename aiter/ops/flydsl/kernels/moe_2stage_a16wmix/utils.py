@@ -94,12 +94,12 @@ def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
     )
 
 
-def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False):
+def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=False):
     """int4 (signed) -> bf16 upconvert for one MFMA K32 step (8 nibbles -> v8bf16).
 
     ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
     unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
-    ``eff = scale*16``. ``use_k16`` (gfx942): pack two f32 high-16s into a bf16
+    ``eff = scale*16``. ``is_gfx942``: pack two f32 high-16s into a bf16
     pair with lshr-16 (no ``v_cvt_pk_bf16_f32`` on this arch).
 
     ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
@@ -113,7 +113,7 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
     eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
-    if use_k16:
+    if is_gfx942:
         # gfx942: pack two f32 high-16s into a bf16 pair. Exact for scaled int4.
         los = []
         his = []
@@ -189,9 +189,9 @@ def _bf16_frag4(v8, half):
     return t
 
 
-def _mma_bf16(mma_atom, use_k16, acc, a8, b8):
-    """One K32 MFMA from v8bf16 A/B fragments; gfx942 (use_k16) splits it into 2x K16."""
-    if const_expr(use_k16):
+def _mma_bf16(mma_atom, is_gfx942, acc, a8, b8):
+    """One K32 MFMA from v8bf16 A/B fragments; gfx942 splits it into 2x K16."""
+    if const_expr(is_gfx942):
         for h in range_constexpr(2):
             fx.gemm(mma_atom, acc, _bf16_frag4(a8, h), _bf16_frag4(b8, h), acc)
     else:
@@ -258,7 +258,7 @@ def make_a_loader(
                              entirely -- stage2 has a single, unslotted A region.
       * ``a_load_threads``   threads cooperating on one tile (< 256 when k_wave > 1
                              splits the block into per-k-group loader sets).
-      * ``dma_via_vgpr``     gfx942 (use_k16) staging fallback, see below.
+      * ``dma_via_vgpr``     gfx942 staging fallback, see below.
     """
     elem_bytes = 2  # bf16
     # Per-thread A gather: each thread moves 16 B (v8bf16) per pass.
@@ -486,7 +486,6 @@ def make_b_loader(
     TILE_K,
     w_dtype,
     b_cache_mod,
-    use_k16,
     rocm_arch,
 ):
     """Build the shared B (weight) operand path for gemm1 and gemm2.
@@ -510,11 +509,13 @@ def make_b_loader(
     here rather than inline in the kernel body does not perturb instruction order.
 
     Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
-    gfx942 a16wi4 W upconvert is lshr-16 bf16 pack in ``_int4_nibble_to_bf16x8``.
+    On gfx942 the a16wi4 W upconvert is the lshr-16 bf16 pack in
+    ``_int4_nibble_to_bf16x8``; a16wfp4 uses ``_fp4_nibble_to_bf16x8`` instead of
+    ``v_cvt_scalef32_pk_bf16_fp4``.
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
-    is_gfx942 = str(rocm_arch).startswith("gfx942")
+    _is_gfx942 = str(rocm_arch).startswith("gfx942")
     # Emitted before the layouts/resources below: this is where the stages used to
     # compute it, and the ISA is sensitive to the order operands are materialized in.
     expert_off = e * fx.Int32(N_OUT)
@@ -806,11 +807,10 @@ def make_b_loader(
         i32_val = _raw(raw[ku // 4][ku % 4])
         if const_expr(_is_int4):
             return _int4_nibble_to_bf16x8(
-                fx.Int32(i32_val), scale_f32, use_k16=use_k16, old_pack=True
+                fx.Int32(i32_val), scale_f32, is_gfx942=_is_gfx942, old_pack=True
             )
-        if const_expr(is_gfx942):
-            # CDNA3 has neither v_cvt_scalef32_pk_bf16_fp4 nor an fp4 MFMA: decode
-            # E2M1 to bf16 with a v_perm_b32 byte lookup instead.
+        if const_expr(_is_gfx942):
+            # gfx942: no v_cvt_scalef32_pk_bf16_fp4; decode E2M1 via v_perm_b32.
             return _fp4_nibble_to_bf16x8(fx.Int32(i32_val), scale_f32)
         # raw[ku//4][ku%4] i32 holds 8 fp4 -> 4x cvt (v2bf16, sel 0..3) -> v8bf16.
         s_raw = _raw(scale_f32)
