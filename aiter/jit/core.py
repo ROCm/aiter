@@ -420,14 +420,19 @@ class AITER_CONFIG:
                     .index
                 )
 
-                # Runtime config discovery must be read-only. Resolve duplicate
-                # rows in the merged temporary view instead of rewriting
-                # shipped or user-provided source CSVs as an import side effect.
+                # Runtime config discovery must be read-only, so the duplicates
+                # are resolved in the merged temporary view rather than by
+                # rewriting shipped or user-provided source CSVs as an import
+                # side effect. The error still has to be raised: a duplicate
+                # shape means two configs disagree about the same key, and
+                # which one wins would otherwise depend on merge order. Silently
+                # picking the lowest 'us' hides that from whoever added the row.
                 merge_df = merge_df.loc[sorted(best_row_index)].reset_index(drop=True)
-                logger.warning(
+                raise RuntimeError(
                     f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    "Resolved the temporary merged view by keeping the lowest-'us' "
-                    "entry per shape; source config files were left unchanged."
+                    f"Remove the duplicates from the source config files; the lowest-'us' "
+                    f"entry per shape is the one to keep. Source files were left unchanged.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
                 )
         else:
             logger.warning(
