@@ -43,7 +43,7 @@ def gemm_a16w8_blockscale(
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
     _LOGGER.info(
-        "GEMM_A8W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
+        "GEMM_A16W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
         tuple(x.shape),
         tuple(w.shape),
         tuple(w_scale.shape),
@@ -177,7 +177,7 @@ def gemm_a16w8_blockscale_preshuffle(
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
     _LOGGER.info(
-        "GEMM_A8W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
+        "GEMM_A16W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
         tuple(x.shape),
         tuple(w.shape),
         tuple(w_scale.shape),

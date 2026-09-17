@@ -58,7 +58,7 @@ def static_per_tensor_quant_fp8_i8(
     Returns:
     - qx: Quantized output values.
     """
-    _LOGGER.info("STAIC_PER_TENSOR_QUANT_FP8_I8: x=%s", tuple(x_in.shape))
+    _LOGGER.info("STATIC_PER_TENSOR_QUANT_FP8_I8: x=%s", tuple(x_in.shape))
     assert scale_in.numel() == 1  # only single scale value
     # per_tensor_quant_triton hands in a 2D x with an N-D qx, so view both as 2D
     # rather than trusting qx.stride(0); .view still writes the caller's buffer.

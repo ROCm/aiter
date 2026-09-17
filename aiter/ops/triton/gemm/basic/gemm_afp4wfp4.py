@@ -147,7 +147,7 @@ def gemm_afp4wfp4_(
         y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
     _LOGGER.info(
-        "GEMM_AFPWFP4: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
+        "GEMM_AFP4WFP4: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
         tuple(x.shape),
         tuple(w.shape),
         tuple(x_scales.shape),

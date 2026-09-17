@@ -100,7 +100,7 @@ def fused_gemm_afp4wfp4_mul_add(
     """
 
     _LOGGER.info(
-        "FUSED_GEMM_AFPWFP4_MUL_ADD: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
+        "FUSED_GEMM_AFP4WFP4_MUL_ADD: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
         tuple(x.shape),
         tuple(w.shape),
         tuple(x_scales.shape),

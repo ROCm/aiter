@@ -287,7 +287,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         A tuple of (y, y_scale).
     """
     _LOGGER.info(
-        "ACT_MUL_MXFP4_QUANT: x=%s activation=%s shuffle=%s",
+        "FUSED_REDUCE_ACT_MUL_MXFP4_QUANT: x=%s activation=%s shuffle=%s",
         tuple(x.shape),
         activation,
         shuffle,

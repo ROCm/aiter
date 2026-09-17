@@ -400,7 +400,7 @@ def layernorm2d_fwd_with_smoothquant(
     - Output: The output tensor with shape (M, N).
     """
     _LOGGER.info(
-        "RMSNORM_2D_FWD_SMOOTHQUANT: input=%s weight=%s xscale=%s yscale=%s  ",
+        "LAYERNORM_2D_FWD_SMOOTHQUANT: input=%s weight=%s xscale=%s yscale=%s  ",
         tuple(input.shape),
         tuple(weight.shape),
         tuple(xscale.shape),

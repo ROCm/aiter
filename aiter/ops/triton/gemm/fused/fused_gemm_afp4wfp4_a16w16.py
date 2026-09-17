@@ -62,7 +62,7 @@ def fused_gemm_afp4wfp4_a16w16(
 
     """
     _LOGGER.info(
-        "FUSED_GEMM_A8W8_BLOCKSCALE_A16W16: x_fp4=%s w_fp4=%s x_fp4_scale=%s w_fp4_scale=%s x_bf16=%s w_bf16=%s",
+        "FUSED_GEMM_AFP4WFP4_A16W16: x_fp4=%s w_fp4=%s x_fp4_scale=%s w_fp4_scale=%s x_bf16=%s w_bf16=%s",
         tuple(x_fp4.shape),
         tuple(w_fp4.shape),
         tuple(x_fp4_scale.shape),

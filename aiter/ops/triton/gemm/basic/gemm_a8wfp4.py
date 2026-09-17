@@ -57,7 +57,7 @@ def gemm_a8wfp4(
         torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
-        "GEMM_A8FP4: x=%s w=%s x_scale=%s w_scale=%s  ",
+        "GEMM_A8WFP4: x=%s w=%s x_scale=%s w_scale=%s  ",
         tuple(x.shape),
         tuple(w.shape),
         tuple(x_scales.shape),
