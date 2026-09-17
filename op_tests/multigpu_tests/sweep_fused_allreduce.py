@@ -9,9 +9,15 @@ Two questions, one sweep:
    baseline -- the same all-reduce followed by ``rmsnorm2d_fwd_with_add``. Pairing
    each kernel with itself is what isolates the fusion from the schedule: a
    fused mesh beating a separate ring says nothing about fusion.
-2. **Do the new FlyDSL fused kernels beat the ones aiter ships?** Best
-   FlyDSL-fused against best aiter-fused, per shape, with the accuracy each
-   one bought.
+2. **Do the new FlyDSL fused kernels beat the ones aiter ships?** Two answers,
+   not one, because they are different questions: best FlyDSL-fused against
+   what aiter's own dispatch heuristic (``production_fused_path()``) would
+   actually run at that shape (``_prod_dispatch_table`` -- "what changes if
+   you swap these kernels in today"), and separately against the fastest of
+   *every* aiter-fused candidate measured regardless of whether aiter's
+   dispatch would pick it (``_winner_table`` -- an oracle ceiling that isolates
+   the kernel comparison from the dispatch one). They can disagree a lot: aiter
+   sometimes dispatches to a kernel that is not its own fastest option.
 
 This drives ``bench_comm_allreduce.py`` once per (TP, hidden) and reduces the
 per-run CSVs; it measures nothing itself, so the numbers are exactly what the
@@ -62,6 +68,13 @@ import pandas as pd
 _HERE = Path(__file__).resolve().parent
 _BENCH = _HERE / "bench_comm_allreduce.py"
 
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+# Reuse the bench's own prod-path parser rather than re-deriving it: it
+# already handles every `production_fused_path()` string, including
+# `qr_fused:<regime>` for any regime, not just the ones this sweep exercises.
+from bench_comm_allreduce import _prod_candidate_key
+
 # Decode through prefill. The gap between 128 and 512 is deliberate: nothing
 # dispatches there, and the crossover this sweep is looking for sits inside it.
 DEFAULT_M = (8, 16, 32, 64, 128, 512, 1024, 2048, 4096, 8192)
@@ -92,7 +105,14 @@ FUSION_PAIRS = {
 }
 
 FLYDSL_FUSED = ("fused_fly_1stage", "fused_fly_ring", "fused_fly_mesh")
+FLYDSL_SEPARATE = ("separate_fly1s", "separate_flyring", "separate_flymesh")
 AITER_FUSED = ("fused_cdr_1stage", "fused_cdr_2stage", "fused_qr_int4", "fused_qr_fp8")
+AITER_SEPARATE = ("separate_cdr", "separate_rccl", "separate_qr_int4")
+#: aiter candidates with no accuracy loss (``Candidate.exact`` in the bench).
+#: Quantized aiter candidates (``fused_qr_*``, ``separate_qr_int4``) are
+#: deliberately excluded here -- see :func:`_category_table`.
+AITER_EXACT = ("fused_cdr_1stage", "fused_cdr_2stage", "separate_cdr", "separate_rccl")
+AITER_ALL = tuple(sorted(set(AITER_FUSED) | set(AITER_SEPARATE)))
 
 CANDIDATES = sorted(
     {c for pair in FUSION_PAIRS.values() for c in pair}
@@ -190,31 +210,39 @@ def _fusion_table(df: pd.DataFrame, min_gain: float) -> pd.DataFrame:
     return out
 
 
+def _best(r, cands, min_sqnr):
+    """Fastest of *cands* applicable at this row, above *min_sqnr* if given."""
+    best, best_us, best_db = None, float("inf"), float("nan")
+    for c in cands:
+        us, db = r.get(f"{c} us"), r.get(f"{c} SQNR dB")
+        if pd.isna(us):
+            continue
+        if min_sqnr is not None and (pd.isna(db) or db < min_sqnr):
+            continue
+        if us < best_us:
+            best, best_us, best_db = c, us, db
+    return best, best_us, best_db
+
+
 def _winner_table(df: pd.DataFrame, min_sqnr: float | None) -> pd.DataFrame:
-    """Best FlyDSL-fused against best aiter-fused, per shape.
+    """Best FlyDSL-fused against best *of every aiter-fused candidate measured*,
+    per shape -- an oracle ceiling, not what aiter's own dispatch would pick.
 
     Ranked on time alone unless ``--min-sqnr`` is given: the quantized
     candidates buy their speed with accuracy, so a table that ranks a 15 dB
     kernel above a 40 dB one without saying so is a trap. Both winners carry
     their own dB for exactly that reason.
+
+    This is deliberately optimistic about aiter: it picks whichever of
+    ``fused_cdr_1stage``/``fused_cdr_2stage``/``fused_qr_*`` measured fastest
+    at this exact shape, regardless of which one aiter's own size-based
+    heuristic would actually select. See :func:`_prod_dispatch_table` for the
+    comparison against what a deployment running today's aiter would get.
     """
-
-    def _best(r, cands):
-        best, best_us, best_db = None, float("inf"), float("nan")
-        for c in cands:
-            us, db = r.get(f"{c} us"), r.get(f"{c} SQNR dB")
-            if pd.isna(us):
-                continue
-            if min_sqnr is not None and (pd.isna(db) or db < min_sqnr):
-                continue
-            if us < best_us:
-                best, best_us, best_db = c, us, db
-        return best, best_us, best_db
-
     rows = []
     for _, r in df.iterrows():
-        fly, fly_us, fly_db = _best(r, FLYDSL_FUSED)
-        ait, ait_us, ait_db = _best(r, AITER_FUSED)
+        fly, fly_us, fly_db = _best(r, FLYDSL_FUSED, min_sqnr)
+        ait, ait_us, ait_db = _best(r, AITER_FUSED, min_sqnr)
         rows.append(
             {
                 "timing": r["timing"],
@@ -236,24 +264,89 @@ def _winner_table(df: pd.DataFrame, min_sqnr: float | None) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _prod_dispatch_table(df: pd.DataFrame, min_sqnr: float | None) -> pd.DataFrame:
+    """Best FlyDSL-fused against what aiter's *actual dispatch heuristic*
+    would run at this shape today -- the fair comparison, not an oracle.
+
+    ``prod path`` (from ``bench_comm_allreduce.py``'s own
+    ``production_fused_path()``) says which kernel ``CudaCommunicator``
+    would pick, independent of which one happens to measure fastest; this
+    looks up *that* candidate's own measured time and SQNR rather than
+    :func:`_winner_table`'s best-of-every-fused-candidate. The two can and do
+    disagree: at every TP/hidden in this sweep, aiter's heuristic dispatches
+    to ``fused_cdr_2stage`` for nearly every mid-to-large shape even though
+    ``fused_cdr_1stage`` measures 3-4x faster there -- so the oracle table
+    understates today's real gap and this one is what a user actually gets.
+    """
+    rows = []
+    for _, r in df.iterrows():
+        fly, fly_us, fly_db = _best(r, FLYDSL_FUSED, min_sqnr)
+        path = r.get("prod path")
+        cand = _prod_candidate_key(path) if isinstance(path, str) else None
+        ait_us = r.get(f"{cand} us") if cand else float("nan")
+        ait_db = r.get(f"{cand} SQNR dB") if cand else float("nan")
+        rows.append(
+            {
+                "timing": r["timing"],
+                "TP": r["TP"],
+                "K": r["K"],
+                "M": r["M"],
+                "KiB": r["payload size (KiB)"],
+                "flydsl": fly,
+                "flydsl us": fly_us if fly else float("nan"),
+                "flydsl dB": fly_db,
+                "prod path": path,
+                "aiter us": ait_us,
+                "aiter dB": ait_db,
+                "speedup": (ait_us / fly_us)
+                if (fly and pd.notna(ait_us) and fly_us > 0)
+                else float("nan"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _analyze(args) -> None:
     df = _load(Path(args.outdir))
     sort = ["timing", "TP", "K", "M"]
 
     fusion = _fusion_table(df, args.min_gain).sort_values(sort)
     winner = _winner_table(df, args.min_sqnr).sort_values(sort)
+    prod = _prod_dispatch_table(df, args.min_sqnr).sort_values(sort)
 
     print("\n## Is fusing beneficial? (separate us / fused us; > 1.00 = fuse)\n")
     print(fusion.to_markdown(index=False, floatfmt=".2f"))
 
-    print("\n## FlyDSL fused vs aiter fused (speedup > 1.00 = FlyDSL wins)\n")
+    print(
+        "\n## FlyDSL fused vs aiter's actual dispatch (speedup > 1.00 = FlyDSL wins)\n"
+    )
+    print(
+        "The fair comparison: `aiter us`/`aiter dB` is whichever kernel "
+        "`production_fused_path()` says a real deployment would run at this "
+        "shape today (`prod path`), not the fastest aiter candidate measured.\n"
+    )
+    print(prod.to_markdown(index=False, floatfmt=".2f"))
+
+    print(
+        "\n## FlyDSL fused vs best-of-aiter-fused, oracle ceiling (speedup > "
+        "1.00 = FlyDSL wins)\n"
+    )
+    print(
+        "Not what aiter's dispatch would pick -- the fastest of every "
+        "*measured* aiter-fused candidate at this shape, regardless of "
+        "whether aiter's own heuristic would ever choose it. Compare against "
+        "the table above: where they disagree, aiter's dispatch is leaving "
+        "its own better kernel on the table.\n"
+    )
     print(winner.to_markdown(index=False, floatfmt=".2f"))
 
     combined = Path(args.outdir) / "summary.csv"
     fusion.to_csv(combined.with_name("fusion_benefit.csv"), index=False)
-    winner.to_csv(combined.with_name("flydsl_vs_aiter.csv"), index=False)
+    winner.to_csv(combined.with_name("flydsl_vs_aiter_oracle.csv"), index=False)
+    prod.to_csv(combined.with_name("flydsl_vs_aiter_prod_dispatch.csv"), index=False)
     print(f"\nwrote {combined.with_name('fusion_benefit.csv')}")
-    print(f"wrote {combined.with_name('flydsl_vs_aiter.csv')}")
+    print(f"wrote {combined.with_name('flydsl_vs_aiter_prod_dispatch.csv')}")
+    print(f"wrote {combined.with_name('flydsl_vs_aiter_oracle.csv')}")
 
     # The one-line answers, so the tables do not have to be read to get them.
     wins = fusion.melt(
