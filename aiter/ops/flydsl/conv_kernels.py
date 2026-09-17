@@ -29,10 +29,10 @@ import weakref
 import torch
 
 from .kernels.conv3d_gfx950_utils import _as_stream
+from .kernels.conv3d_im2col import PADDING_MODES
 from .kernels.conv3d_implicit_gfx950 import (
     DEFAULT_TILE,
     LDG_VEC,
-    PADDING_MODES,
     SPLITK_MAX_STAGING_BYTES,
     TILE_K,
     compile_conv3d_implicit,

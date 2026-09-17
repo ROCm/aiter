@@ -49,15 +49,16 @@ from .conv3d_gfx950_utils import (
     MFMA_C_VALUES,
     MFMA_M,
     MFMA_N,
+    OOB_SENTINEL_BYTES,
+    OOB_SENTINEL_ELEM,
     WARP_SIZE,
     _as_stream,
     barrier,
     buffer_atomic_add,
-    dil,
-    gather_valid,
-    in_range,
+    flat_buffer_view,
     sgpr,
 )
+from .conv3d_im2col import Im2colGather, make_im2col_plan
 
 TILE_K = 32
 
@@ -71,9 +72,6 @@ TILE_K = 32
 TILES_PER_BARRIER = 2
 
 DEFAULT_TILE = (128, 128, 2, 4)
-
-
-PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 
 
 def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
@@ -246,9 +244,9 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     assert _invalid is None, _invalid
     assert c % groups == 0, f"c={c} not divisible by groups={groups}"
     assert k % groups == 0, f"k={k} not divisible by groups={groups}"
-    assert (
-        CGP % LDG_VEC == 0
-    ), f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
+    assert CGP % LDG_VEC == 0, (
+        f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
+    )
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
 
     # Dilation only stretches the filter's footprint; the K axis (CRS) is unchanged.
@@ -261,61 +259,48 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     crs = CGP * kt * kh * kw
     k_tiles = (crs + TILE_K - 1) // TILE_K
 
-    BIG_IN = (n * c * d * h * w) > 0x7FFFFFFF
     BIG_OUT = (n * k * do * ho * wo * BF16_BYTES) > 0x7FFFFFFF
 
-    X_BYTES = n * c * d * h * w * BF16_BYTES
     W_BYTES = k * crs * BF16_BYTES
-    OOB_SENTINEL_ELEM = (
-        0x7FFFFF80  # *2 = 0xFFFFFF00 bytes (~4.2950 GB), just under 2^32
-    )
-    OOB_SENTINEL_BYTES = OOB_SENTINEL_ELEM * BF16_BYTES
-    BIG_IN_NR = 0x80000000  # 2 GB num_records for the rebased BIG_IN resource
-    assert (
-        W_BYTES < OOB_SENTINEL_BYTES
-    ), f"weight {W_BYTES}B exceeds limit {OOB_SENTINEL_BYTES}B"
-    assert X_BYTES < OOB_SENTINEL_BYTES or BIG_IN, f"input {X_BYTES}B exceeds limit"
-    BIG_IN_N1 = BIG_IN and n == 1
-    BIG_IN_NM = BIG_IN and n > 1
-    X_SAMPLE_ELEMS = c * d * h * w
-
-    # n > 1 rebases the descriptor once per sample, so a tap can sit anywhere in
-    # the sample and the whole sample has to fit the 2 GB num_records -- unlike
-    # the per-tile rebasing below, whose reach is bounded by the tile. Without
-    # this check, taps past 2 GB fall outside num_records and read as zero, which
-    # is silently wrong rather than an error. Note how little room that leaves:
-    # BIG_IN needs n * sample > 2 GiB of elements, so at n == 2 the only sample
-    # size that both trips BIG_IN and fits is exactly 2 GB.
-    assert not BIG_IN_NM or X_SAMPLE_ELEMS * BF16_BYTES <= BIG_IN_NR, (
-        f"batched input sample too large for the 32-bit gather: one sample spans "
-        f"{X_SAMPLE_ELEMS * BF16_BYTES / 2**30:.2f} GiB, past the "
-        f"{BIG_IN_NR / 2**30:.0f} GiB the per-sample buffer descriptor addresses. "
-        f"Loop over N instead of batching."
+    assert W_BYTES < OOB_SENTINEL_BYTES, (
+        f"weight {W_BYTES}B exceeds limit {OOB_SENTINEL_BYTES}B"
     )
 
-    _t_aligned = BIG_IN_N1 and hw_o % TILE_M == 0
-    if BIG_IN_N1:
-        _ot_span = (TILE_M - 1) // hw_o + (1 if _t_aligned else 2)
-        _t_span = min(d - 1, (_ot_span - 1) * st + dt * (kt - 1))
-        _h_span = (
-            min(h - 1, ((TILE_M - 1) // wo + 1) * sh + dh * (kh - 1))
-            if _t_aligned
-            else h - 1
-        )
-        _span = (((_t_span * h + _h_span) * w + (w - 1)) * c + c) * BF16_BYTES
-        assert _span <= BIG_IN_NR, (
-            f"input sample too large for the 32-bit gather: a {TILE_M}-row tile reaches "
-            f"{_span / 2**30:.2f} GiB from its rebased origin, past the "
-            f"{BIG_IN_NR / 2**30:.0f} GiB the buffer descriptor addresses. Split the batch "
-            f"over N, or pass a narrower tile=(TILE_M, ...)."
-        )
-
-    assert (
-        pad_mode in PADDING_MODES
-    ), f"pad_mode must be one of {PADDING_MODES}, got {pad_mode!r}"
-    assert (
-        pad_mode == "zeros" or not BIG_IN
-    ), "non-zero pad_mode requires the non-BIG_IN address path"
+    # How A is read: everything about the gather, including whether the input
+    # fits what a buffer descriptor reaches and how it is rebased if not.
+    im2col_plan = make_im2col_plan(
+        n=n,
+        c=c,
+        d=d,
+        h=h,
+        w=w,
+        kt=kt,
+        kh=kh,
+        kw=kw,
+        st=st,
+        sh=sh,
+        sw=sw,
+        pt=pt,
+        ph=ph,
+        pw=pw,
+        dt=dt,
+        dh=dh,
+        dw=dw,
+        pad_mode=pad_mode,
+        groups=groups,
+        cgp=CGP,
+        crs=crs,
+        do=do,
+        ho=ho,
+        wo=wo,
+        npq=npq,
+        dhw=dhw,
+        hw_o=hw_o,
+        tile_m=TILE_M,
+        tile_k=TILE_K,
+        block_threads=BLOCK_THREADS,
+        ldg_a_count=LDG_A_COUNT,
+    )
 
     tiles_per_group = (KG + TILE_N - 1) // TILE_N
     n_tail = KG % TILE_N != 0
@@ -327,9 +312,9 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
     Y_BYTES = npq * k * (4 if use_splitk else BF16_BYTES)
 
-    assert (
-        not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
-    ), f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
+    assert not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES, (
+        f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
+    )
 
     PIPE_STAGES = 2 * TILES_PER_BARRIER
 
@@ -353,27 +338,15 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         and (not out_ndhwc)
     )
 
-    assert (
-        grid_n <= MAX_GRID_YZ
-    ), f"grid.y = {grid_n} exceeds the {MAX_GRID_YZ}-block limit"
-    assert (
-        m_chunks * splitk <= MAX_GRID_YZ
-    ), f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
+    assert grid_n <= MAX_GRID_YZ, (
+        f"grid.y = {grid_n} exceeds the {MAX_GRID_YZ}-block limit"
+    )
+    assert m_chunks * splitk <= MAX_GRID_YZ, (
+        f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
+    )
 
     WGM = 1 if m_chunks > 1 else max(1, int(wgm))
     elem_ty = fx.BFloat16
-    temporal_only_fast = (
-        kh == 1
-        and kw == 1
-        and st == 1
-        and sh == 1
-        and sw == 1
-        and ph == 0
-        and pw == 0
-        and do == d
-        and ho == h
-        and wo == w
-    )
 
     @fx.struct
     class SharedStorage:
@@ -384,24 +357,12 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     def conv3d_implicit_kernel(
         y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
     ):
-        # 1-D buffer views so slice(src, (None, off)) is element `off`. `elems`
-        # only shapes the view; the OOB sentinel is past it, and num_records
-        # (not the layout) is what turns that into a zero-fill.
-        def _dma_src(ptr, elems, num_records_bytes):
-            buf = fx.rocdl.make_buffer_ptr(ptr, num_records_bytes=num_records_bytes)
-            return fx.logical_divide(
-                fx.make_view(buf, fx.make_layout(elems, 1)), fx.make_layout(1, 1)
-            )
+        # A's whole convolution: which input element each A vector taps, and
+        # through which descriptor. Everything downstream of the gather treats
+        # A as an ordinary GEMM operand.
+        im2col = Im2colGather(im2col_plan, x)
 
-        def _x_rebased(off_elems):
-            # BIG_IN rebases the descriptor to this block so a 32-bit voffset
-            # still reaches the tile; num_records caps it at 2 GB from there.
-            ptr = fx.add_offset(fx.get_iter(x), fx.make_int_tuple(off_elems))
-            return _dma_src(ptr, BIG_IN_NR // BF16_BYTES, BIG_IN_NR)
-
-        w_src = _dma_src(fx.get_iter(weight), W_BYTES // BF16_BYTES, W_BYTES)
-        if const_expr(not BIG_IN):
-            x_src = _dma_src(fx.get_iter(x), X_BYTES // BF16_BYTES, X_BYTES)
+        w_src = flat_buffer_view(fx.get_iter(weight), W_BYTES // BF16_BYTES, W_BYTES)
         y_buf = fx.rocdl.make_buffer_tensor(y, num_records_bytes=Y_BYTES)
         if const_expr(use_splitk):
             # buffer_atomic_add needs the raw !llvm.ptr<8> descriptor, not a tensor.
@@ -458,6 +419,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         else:
             n_offset = n_tile * TILE_N
             n_local = n_offset
+            ch_base = None
         if const_expr(use_splitk):
             if const_expr(m_chunks > 1):
                 split_idx = fx.Int64(gpu.block_id("z")) // fx.Int64(m_chunks)
@@ -466,24 +428,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             k_off = split_idx * (tiles_per_split * TILE_K)
         else:
             k_off = 0
-
-        if const_expr(BIG_IN_N1):
-            nbase = m_offset // dhw
-            rem0 = m_offset % dhw
-            ot_base0 = rem0 // hw_o
-
-            base_t = fx.max(ot_base0 * fx.Int64(st) - fx.Int64(pt), fx.Int64(0))
-            if const_expr(_t_aligned):
-                oh_base0 = (rem0 % hw_o) // wo
-                base_h = fx.max(oh_base0 * fx.Int64(sh) - fx.Int64(ph), fx.Int64(0))
-            else:
-                base_h = fx.Int64(0)
-            x_base_elem = (
-                ((nbase * fx.Int64(d) + base_t) * fx.Int64(h) + base_h)
-                * fx.Int64(w)
-                * fx.Int64(c)
-            )
-            x_src = _x_rebased(fx.Int64(x_base_elem))
 
         # MMA fragments + LDS stage views.
         Vec = fx.Vector
@@ -532,110 +476,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             fx.make_view(0, fx.make_layout((TILE_M, TILE_N), (0, 1)))
         )
 
-        def pad_coord(v, ext, pad):
-            """Tap coordinate -> in-bounds input coordinate; returns (coord, mask).
-
-            "zeros" leaves the coordinate alone and returns a range mask, which the
-            caller folds into the OOB-sentinel routing so the load reads as zero. Every
-            other mode resolves the coordinate into [0, ext) instead and returns no mask
-            """
-            if const_expr(pad_mode == "zeros"):
-                return v, in_range(v, ext)
-            u = v + fx.Int64(pad)
-            low = u < fx.Int64(pad)  # v < 0
-            high = u >= fx.Int64(pad + ext)  # v >= ext
-            mid = u - fx.Int64(pad)  # v, where in range
-            if const_expr(pad_mode == "replicate"):
-                r = high.select(fx.Int64(ext - 1), mid)
-                r = low.select(fx.Int64(0), r)
-            elif const_expr(pad_mode == "reflect"):
-                # [a b c d e] pad 2 -> [c b a b c d e d c]: -v near, 2*(ext-1) - v far.
-                r = high.select(fx.Int64(2 * (ext - 1) + pad) - u, mid)
-                r = low.select(fx.Int64(pad) - u, r)
-            else:  # circular: v + ext near, v - ext far
-                r = high.select(u - fx.Int64(pad + ext), mid)
-                r = low.select(u + fx.Int64(ext - pad), r)
-            return r, None
-
-        # One gather tap per A-vector: decode GEMM row -> (n, ot, oh, ow).
-        _row_dec = []
-        for i in range_constexpr(LDG_A_COUNT):
-            linear = (tid + i * BLOCK_THREADS) * LDG_VEC
-            local_m = linear // TILE_K
-            local_k = linear % TILE_K
-            row = m_offset + local_m
-            row_valid = row < fx.Int64(npq)
-            if const_expr(temporal_only_fast):
-                out_t = (row // hw_o) % d
-                _row_dec.append((local_k, row, row_valid, out_t))
-            else:
-                n_idx = row // dhw
-                rem = row % dhw
-                ot = rem // hw_o
-                rem2 = rem % hw_o
-                oh = rem2 // wo
-                ow = rem2 % wo
-                in_t0 = ot * st - pt
-                in_h0 = oh * sh - ph
-                in_w0 = ow * sw - pw
-                n_or_di = (n_idx - nbase) if const_expr(BIG_IN_N1) else n_idx
-                _row_dec.append((local_k, row_valid, n_or_di, in_t0, in_h0, in_w0))
-
-        SCALAR_K = CGP % TILE_K == 0
-
-        # Im2col: K axis is CGP (per-group channels); g_off uses `c` as the
-        # NDHWC row stride. `cc` is the absolute input channel.
-        def im2col_addr(i, kbase_i, cc_base, ckk_base):
-            dec = _row_dec[i]
-            local_k = dec[0]
-            k_abs = kbase_i + fx.Int64(local_k)
-            if const_expr(SCALAR_K):
-                cc = cc_base + fx.Int64(local_k)  # cc_base already carries ch_base
-            else:
-                cc = k_abs % CGP
-                if const_expr(groups > 1):
-                    cc = ch_base + cc
-            k_valid = k_abs < fx.Int64(crs)
-            if const_expr(temporal_only_fast):
-                _, row, row_valid, out_t = dec
-                kt_i = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
-                temporal_delta = dil(kt_i, dt) - pt
-                in_t, m_t = pad_coord(out_t + temporal_delta, d, pt)
-                valid = gather_valid(row_valid & k_valid, m_t)
-
-                delta = (
-                    temporal_delta
-                    if const_expr(pad_mode == "zeros")
-                    else (in_t - out_t)
-                )
-                if const_expr(BIG_IN_N1):
-                    g_off = (
-                        (row + delta * hw_o) - (fx.Int64(nbase) * dhw + base_t * hw_o)
-                    ) * c + cc
-                else:
-                    g_off = (row + delta * hw_o) * c + cc
-                return fx.Int32(g_off), valid
-
-            ckk = ckk_base if const_expr(SCALAR_K) else k_abs // CGP
-            kw_i = ckk % kw
-            ckk2 = ckk // kw
-            kh_i = ckk2 % kh
-            kt_i = ckk2 // kh
-            _, row_valid, n_or_di, in_t0, in_h0, in_w0 = dec
-            in_t, m_t = pad_coord(in_t0 + dil(kt_i, dt), d, pt)
-            in_h, m_h = pad_coord(in_h0 + dil(kh_i, dh), h, ph)
-            in_w, m_w = pad_coord(in_w0 + dil(kw_i, dw), w, pw)
-            valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
-            if const_expr(BIG_IN_N1):
-                g_off = (
-                    ((n_or_di * d + (in_t - base_t)) * h + (in_h - base_h)) * w + in_w
-                ) * c + cc
-                return fx.Int32(g_off), valid
-            if const_expr(BIG_IN_NM):
-                g_off = ((in_t * h + in_h) * w + in_w) * c + cc
-                return fx.Int32(g_off), valid, n_or_di
-            g_off = (((n_or_di * d + in_t) * h + in_h) * w + in_w) * c + cc
-            return fx.Int32(g_off), valid
+        im2col.bind_block(tid, m_offset, ch_base)
 
         def weight_addr(i, k_base):
             linear = (tid + i * BLOCK_THREADS) * LDG_VEC
@@ -676,28 +517,9 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             fx.copy(_dma_atom, fx.slice(src, (None, voff_elem)), dst)
 
         def async_load_a_to_lds(k_tile, stage):
-            k_base = k_off + k_tile * TILE_K
-            kbase_i = fx.Int64(k_base)
-            cc_base = ckk_base = None
-            if const_expr(SCALAR_K):
-                cc_base = kbase_i % CGP
-                if const_expr(groups > 1):
-                    cc_base = ch_base + cc_base
-                ckk_base = kbase_i // CGP
             stage_tile = fx.Int64(stage) * TILE_M * TILE_K
-            for i in range_constexpr(LDG_A_COUNT):
-                if const_expr(BIG_IN_NM):
-                    addr_ret = im2col_addr(i, kbase_i, cc_base, ckk_base)
-                    g_off_i, valid, n_idx_i = addr_ret
-                    x_src_i = _x_rebased(fx.Int64(n_idx_i) * fx.Int64(X_SAMPLE_ELEMS))
-                    voff = valid.select(g_off_i, OOB_ELEM)
-                    async_copy_to_lds(
-                        x_src_i, stage_dma_dst(a_lds, stage_tile, i), voff
-                    )
-                else:
-                    g_off_i, valid = im2col_addr(i, kbase_i, cc_base, ckk_base)
-                    voff = valid.select(g_off_i, OOB_ELEM)
-                    async_copy_to_lds(x_src, stage_dma_dst(a_lds, stage_tile, i), voff)
+            for i, src, voff in im2col.taps(k_off + k_tile * TILE_K):
+                async_copy_to_lds(src, stage_dma_dst(a_lds, stage_tile, i), voff)
 
         def async_load_b_to_lds(k_tile, stage):
             k_base = k_off + k_tile * TILE_K
