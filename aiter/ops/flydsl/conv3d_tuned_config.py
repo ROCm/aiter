@@ -176,3 +176,84 @@ def _lookup_tuned_tile(key, device):
     hit = table.get((*dev, *key))
     _log_tuned_lookup(table, dev, key, hit)
     return hit
+
+
+# ---------------------------------------------------------------------------
+# Fallback heuristic: the tile and WGM to run when the table has no row.
+#
+# These live here rather than in conv3d_policy because they are the runtime
+# decision, as tuned_gemm's default_config is, while the policy module is the
+# tuner's candidate enumeration -- and because the kernel module calls them, so
+# putting them in the policy would make the kernel import a module that imports
+# the kernel back. _resolve_splitk stays in the kernel: its window is asserted
+# inside the kernel body, and it keys on TILE_K and DEFAULT_TILE.
+# ---------------------------------------------------------------------------
+
+TILE_LADDER = ((128, 128, 2, 4), (64, 64, 2, 2), (32, 32, 1, 2))
+
+TILE_MIN_WAVES_PER_CU = 6
+
+TILE_MIN_N_FILL = 0.75
+
+# A 256-wide N tile only pays when it spans K/groups in ONE tile: it halves the M tiles
+# (and with them the A traffic per output element) for at most 1/(1-TILE_MIN_N_FILL) of
+# masked columns. Past 256 the second tile is mostly mask -- measured on gfx950, K/groups
+# = 384 is 1.5x slower on 256x256 than on three clean 128-wide tiles, while K/groups = 192
+# is 1.08-1.17x faster. Hence a closed range, not a "wider is better" ladder step.
+TILE_WIDE_N = (256, 256, 2, 4)
+TILE_WIDE_N_MIN_KG = int(TILE_WIDE_N[1] * TILE_MIN_N_FILL)
+
+# Grouped-M L2 swizzle. It only has something to reuse when the N grid has more than one
+# tile (with a single n-tile the regrouping is a no-op that still costs index math), and
+# it needs enough blocks in flight for the grouped weight tile to stay hot. Below this it
+# measured neutral-to-negative on every VAE shape.
+WGM_L2_SWIZZLE = 8
+WGM_MIN_BLOCKS_PER_CU = 4
+
+
+def _num_cu(device):
+    try:
+        return torch.cuda.get_device_properties(device).multi_processor_count
+    except Exception:  # noqa: BLE001 -- probe failure falls back to gfx950's count
+        return 256
+
+
+def _blocks(npq, kg, groups, tile):
+    tile_m, tile_n = tile[0], tile[1]
+    return ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
+
+
+def _pick_tile(npq, k, groups, device):
+    kg = k // groups
+    target = TILE_MIN_WAVES_PER_CU * _num_cu(device)
+
+    # Single-n-tile wide case first; see TILE_WIDE_N. The wave check keeps it off
+    # problems too small to fill the device, where the halved M grid would hurt.
+    if (
+        TILE_WIDE_N_MIN_KG <= kg <= TILE_WIDE_N[1]
+        and _blocks(npq, kg, groups, TILE_WIDE_N) * TILE_WIDE_N[2] * TILE_WIDE_N[3]
+        >= target
+    ):
+        return TILE_WIDE_N
+
+    # A tile wider than kg is still worth its masked columns: it keeps more waves per
+    # block and halves the A traffic per output element. Below TILE_MIN_N_FILL the
+    # wasted columns take over; the wave-count check below demotes it again when the
+    # problem is too small to fill the device.
+    legal = [t for t in TILE_LADDER if kg >= t[1] * TILE_MIN_N_FILL] or [
+        TILE_LADDER[-1]
+    ]
+    for tile_m, tile_n, wave_m, wave_n in legal:
+        if _blocks(npq, kg, groups, (tile_m, tile_n)) * wave_m * wave_n >= target:
+            return (tile_m, tile_n, wave_m, wave_n)
+    return legal[-1]
+
+
+def _pick_wgm(npq, k, groups, tile, device):
+    """L2 swizzle grouping for the chosen tile; see WGM_L2_SWIZZLE."""
+    kg = k // groups
+    if (kg + tile[1] - 1) // tile[1] < 2:
+        return 1
+    if _blocks(npq, kg, groups, tile) < WGM_MIN_BLOCKS_PER_CU * _num_cu(device):
+        return 1
+    return WGM_L2_SWIZZLE

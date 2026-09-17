@@ -13,7 +13,7 @@ by try/except would pay a full compile per rejected config. :func:`is_legal_tile
 is the closed form of those asserts.
 
 The reason this exists rather than the fixed eight-entry table it replaces: the
-kernel's own ``TILE_LADDER`` only offers N tiles of 128/64/32 plus a 256 wide
+runtime's own ``TILE_LADDER`` only offers N tiles of 128/64/32 plus a 256 wide
 case, all powers of two. A VAE whose ``Cout`` ladder is 96/192/384 lands two of
 its three rungs on 75% N occupancy, and the masked columns still issue MFMA. The
 enumeration below includes 48/96/192 so an exact fit can be expressed at all.
@@ -55,7 +55,7 @@ WGM_VALUES = (1, 4, 8)
 # every sweep so that the tuned pick can never come out worse than the shipped
 # default -- whatever ``_pick_tile`` would have chosen is always measured too.
 #
-# Spelled out rather than spliced from the kernel's ``TILE_LADDER``: this order is
+# Spelled out rather than spliced from ``conv3d_tuned_config.TILE_LADDER``: this order is
 # the order the tuner measures them in, and ties are broken by whoever is timed
 # first, so re-ordering it would make a re-tune disagree with the checked-in CSVs
 # for no gain. The cost is that a ladder rung added there and not here becomes an
