@@ -7,7 +7,7 @@ The runtime counterpart to ``csrc/flydsl_conv3d/conv3d_tune.py``: it reads the
 rows that tuner writes and hands ``_conv3d_impl`` the tile and WGM to launch
 with, or nothing when this shape was never tuned on this device.
 
-Split out of ``kernels/conv3d_implicit.py`` so the kernel module holds the DSL
+Split out of ``kernels/conv3d_implicit_gfx950.py`` so the kernel module holds the DSL
 and its host dispatch, the way ``tuned_gemm.py`` keeps the GEMM lookups out of
 ``kernels/gemm_a16w16_gfx950.py``. Nothing here touches FlyDSL, and nothing here
 imports the kernel module, so the tuner and the AOT pass can read the column

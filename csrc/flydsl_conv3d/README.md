@@ -3,7 +3,7 @@
 Offline tile tuner for `flydsl_conv_implicit`, the implicit-GEMM convolution. It
 reads shapes from an untuned CSV, sweeps the launch configs
 `aiter/ops/flydsl/conv3d_policy.py` enumerates for each one, and writes the
-winner to a checked-in tuned CSV that `conv3d_implicit._lookup_tuned_tile` reads
+winner to a checked-in tuned CSV that `conv3d_tuned_config._lookup_tuned_tile` reads
 at runtime. A shape with no tuned row falls back to the heuristic tile ladder,
 so tuning is an optimization rather than a prerequisite.
 
@@ -24,7 +24,7 @@ python3 setup.py develop
 
 2. Add conv shapes to a per-model untuned table under
    `aiter/configs/model_configs/`. The header is the 20-column problem key --
-   the same columns `conv3d_implicit.TUNED_KEY_COLUMNS` looks up on:
+   the same columns `conv3d_tuned_config.TUNED_KEY_COLUMNS` looks up on:
 
     |**N**|**C**|**D**|**H**|**W**|**K**|**kT**|**kH**|**kW**|**stride_d**|**stride_h**|**stride_w**|**pad_d**|**pad_h**|**pad_w**|**dil_d**|**dil_h**|**dil_w**|**groups**|**bias**|
     |-----|-----|-----|-----|-----|-----|------|------|------|------------|------------|------------|---------|---------|---------|---------|---------|---------|----------|--------|

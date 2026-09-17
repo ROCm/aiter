@@ -24,7 +24,7 @@ import itertools
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .kernels.conv3d_gfx950_utils import BF16_BYTES, MFMA_M, MFMA_N
-from .kernels.conv3d_implicit import (
+from .kernels.conv3d_implicit_gfx950 import (
     TILE_K,
     TILES_PER_BARRIER,
     validate_launch_config,

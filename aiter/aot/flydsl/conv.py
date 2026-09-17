@@ -77,7 +77,7 @@ from aiter.ops.flydsl.conv3d_tuned_config import (
     TUNED_RESULT_COLUMNS,
 )
 from aiter.ops.flydsl.conv_kernels import _dispatch, _pad_channels
-from aiter.ops.flydsl.kernels.conv3d_implicit import compile_conv3d_implicit
+from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,

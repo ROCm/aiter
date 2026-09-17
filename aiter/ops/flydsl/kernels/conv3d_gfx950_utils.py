@@ -9,7 +9,7 @@ What the machine fixes rather than what this operator chose: the MFMA shape,
 the wave width, the vector widths a gfx950 load and an LDS write come in, and
 the thin wrappers over the rocdl intrinsics that spell a barrier, a scalar
 broadcast or a buffer atomic. The tile sizes, the barrier interval and the
-padding modes are the algorithm's own and stay in ``conv3d_implicit.py``.
+padding modes are the algorithm's own and stay in ``conv3d_implicit_gfx950.py``.
 
 Running a compiled launcher is a host concern and lives in
 ``../conv_kernels.py`` with the rest of the dispatch; only the stream coercion

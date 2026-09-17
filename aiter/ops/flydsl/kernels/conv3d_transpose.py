@@ -8,7 +8,7 @@ The convolution is channels-last inside, so an NCDHW input -- what diffusers
 hands us -- is staged through this first. It is a separate kernel and a
 separate ``lru_cache`` from the convolution, which is why the AOT pass emits a
 job for each, and why it lives in its own module rather than inside
-``conv3d_implicit.py``.
+``conv3d_implicit_gfx950.py``.
 
 Measured on gfx950, the transpose is 8-22% of the pair's runtime. Passing
 ``input_layout="NDHWC"`` skips it outright, which is the way to avoid the cost

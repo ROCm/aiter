@@ -9,7 +9,7 @@ keyword surface and its validation, layout and padding normalisation, the
 weight repack cache, the split-K decision, and the rank dispatch that sends a
 call to the 1-D, 2-D or 3-D path. Nothing here emits DSL.
 
-Split out of ``kernels/conv3d_implicit.py`` so that module is the kernel and
+Split out of ``kernels/conv3d_implicit_gfx950.py`` so that module is the kernel and
 its compile, the way ``gemm_kernels.py`` sits in front of
 ``kernels/gemm_a16w16_gfx950.py``.
 
@@ -28,7 +28,7 @@ import torch
 
 from .conv3d_tuned_config import _lookup_tuned_tile, _num_cu, _pick_tile, _pick_wgm
 from .kernels.conv3d_gfx950_utils import _as_stream
-from .kernels.conv3d_implicit import (
+from .kernels.conv3d_implicit_gfx950 import (
     DEFAULT_TILE,
     LDG_VEC,
     PADDING_MODES,
