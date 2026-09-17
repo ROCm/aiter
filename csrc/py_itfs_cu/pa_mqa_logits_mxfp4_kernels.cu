@@ -46,6 +46,12 @@ static void pa_mqa_logits_mxfp4_check_shapes(aiter_tensor_t& q,
     AITER_CHECK(weights.size(0) >= q.size(0),
                 "weights is per query row; need at least ", q.size(0), " rows, got ",
                 weights.size(0));
+    // Not redundant with the H check below: the kernel strides weights by the COMPILE-TIME
+    // W_ROW_ELEMS, so a narrower row (a contiguous [T, 1], say) passes every other check here
+    // and then reads W_ROW_ELEMS - size(1) elements past each row.
+    AITER_CHECK(weights.size(1) == Traits::W_ROW_ELEMS,
+                "weights is [T, H] and the kernel strides it by ", (int)Traits::W_ROW_ELEMS,
+                "; got ", weights.size(1), " per row");
     // The kernel bounds its store by the WINDOW, not by max_seq_len -- `max_seq_len` is
     // carried in kargs and never read, only `stride_out_row` is. So these two are the only
     // place an undersized `out` can be caught at all; a `local_ends` entry past out.size(1)
