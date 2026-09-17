@@ -13,10 +13,13 @@ import pandas as pd
 import torch
 
 from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_schedule import (
+    chunk_gemm_overlap_schedule,
+    chunk_of_m_tile,
     dense_row_index,
     expected_token_counts,
     make_tile_row_base,
     min_expert_ids,
+    num_publish_chunks,
     pack_rows_by_sorted_ids,
     partition_counts_by_min_expert,
     publish_order_from_topk,
@@ -196,6 +199,40 @@ def test_make_tile_row_base_stride():
     torch.testing.assert_close(base, torch.tensor([0, 32, 64], dtype=torch.int32))
 
 
+def test_chunk_mapping_front_loads_early_tiles():
+    assert num_publish_chunks(64, 32) == 2
+    assert num_publish_chunks(1, 32) == 1
+    assert num_publish_chunks(256, 32) == 8
+    assert chunk_of_m_tile(0, n_m=10, num_chunks=2) == 0
+    assert chunk_of_m_tile(4, n_m=10, num_chunks=2) == 0
+    assert chunk_of_m_tile(5, n_m=10, num_chunks=2) == 1
+    assert chunk_of_m_tile(9, n_m=10, num_chunks=2) == 1
+
+
+def test_chunk_gemm_overlap_wave2_does_not_wait():
+    s64 = chunk_gemm_overlap_schedule(
+        m_local=64, chunk_rows=32, gemm1_us=227.0, n_m=384, n_tiles=3
+    )
+    s256 = chunk_gemm_overlap_schedule(
+        m_local=256, chunk_rows=32, gemm1_us=286.0, n_m=384, n_tiles=3
+    )
+    for sched in (s64, s256):
+        assert sched["producers_wait_for_gemm"] is False
+        assert sched["num_producers"] == 32
+        assert sched["producer_cus"] == 32
+        assert sched["consumer_cus_during_send"] == 224
+        assert abs(sched["send_later_us"] - 9.68) < 1e-6
+    assert s64["num_chunks"] == 2
+    assert s256["num_chunks"] == 8
+    assert s64["m_tiles_ready_after_wave0"] == 384 // 2
+    assert s256["m_tiles_ready_after_wave0"] == 384 // 8
+    # Later-wave send is ~10 µs; consumers finish ~11–15 experts in that window.
+    # Wave 2 is not gated on GEMM — it starts as soon as wave 1 copy+signal ends.
+    assert 10 < s64["experts_during_later_wave"] < 20
+    assert 8 < s256["experts_during_later_wave"] < 15
+    return s64, s256
+
+
 def _schedule_row(name: str, ids: torch.Tensor, num_experts: int) -> dict:
     parts = partition_counts_by_min_expert(ids, num_experts)
     expected, _, _, first = simulate_incremental_publish(ids, num_experts)
@@ -230,10 +267,38 @@ def main():
         test_publish_order_is_stable_min_expert_argsort,
         test_pack_rows_uses_padding_row_for_sentinel,
         test_make_tile_row_base_stride,
+        test_chunk_mapping_front_loads_early_tiles,
+        test_chunk_gemm_overlap_wave2_does_not_wait,
     ]
+    overlap = None
     for fn in tests:
-        fn()
+        out = fn()
         print(f"ok  {fn.__name__}")
+        if fn is test_chunk_gemm_overlap_wave2_does_not_wait:
+            overlap = out
+    if overlap is not None:
+        print("\n## chunk vs GEMM1 overlap schedule\n")
+        rows = []
+        for name, sched in (("tokens=64 gemm1=227us", overlap[0]), ("tokens=256 gemm1=286us", overlap[1])):
+            rows.append(
+                {
+                    "case": name,
+                    "producers": sched["num_producers"],
+                    "consumers_during_send": sched["consumer_cus_during_send"],
+                    "waves": sched["num_chunks"],
+                    "send_first_us": round(sched["send_first_us"], 2),
+                    "send_later_us": round(sched["send_later_us"], 2),
+                    "gemm_expert_us": round(sched["gemm_expert_us"], 3),
+                    "gemm_expert_us_during_send": round(
+                        sched["gemm_expert_us_during_send"], 3
+                    ),
+                    "experts_during_later_wave": round(
+                        sched["experts_during_later_wave"], 2
+                    ),
+                    "wait_gemm": sched["producers_wait_for_gemm"],
+                }
+            )
+        print(pd.DataFrame(rows).to_markdown(index=False))
 
     rows = [
         _schedule_row("small_uniform", _uniform_topk(128, 64, 6, 0), 64),

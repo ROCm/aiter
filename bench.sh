@@ -10,8 +10,7 @@ torchrun \
   --nproc-per-node=8 \
   op_tests/multigpu_tests/bench_mega_moe_v2.py \
   --tokens 64 \
-  --mtpr 2048 \
+  --mtpr 64 \
   --iters 30 \
   --route uniform \
   --tp \
-  --tp-sweep 64,256,512,2048

@@ -140,6 +140,83 @@ def pack_rows_by_sorted_ids(
     return dense.index_select(0, tok)
 
 
+def num_publish_chunks(m_local: int, chunk_rows: int) -> int:
+    """How many ordered all-gather sends cover ``m_local`` rows."""
+    m_local = int(m_local)
+    chunk_rows = int(chunk_rows)
+    if chunk_rows <= 0:
+        raise ValueError(f"chunk_rows must be positive, got {chunk_rows}")
+    if m_local <= 0:
+        return 0
+    return (m_local + chunk_rows - 1) // chunk_rows
+
+
+def chunk_of_m_tile(m_tile: int, n_m: int, num_chunks: int) -> int:
+    """Map a GEMM M-tile onto a constructed send chunk (early-compute upper bound)."""
+    n_m = int(n_m)
+    num_chunks = int(num_chunks)
+    if n_m <= 0 or num_chunks <= 0:
+        raise ValueError("n_m and num_chunks must be positive")
+    return min(int(m_tile) * num_chunks // n_m, num_chunks - 1)
+
+
+def chunk_gemm_overlap_schedule(
+    *,
+    m_local: int,
+    chunk_rows: int,
+    gemm1_us: float,
+    n_m: int,
+    n_tiles: int = 3,
+    num_cu: int = 256,
+    num_producers: int = 32,
+    send_fixed_us: float = 38.0,
+    send_us_per_row: float = 0.24,
+    send_handshake_us: float = 2.0,
+):
+    """Host model of chunked AG vs GEMM1. Producers do not wait on GEMM.
+
+    Measured H=7168 8-GPU defaults: ~38 µs kernel/setup, ~0.24 µs/row copy,
+    ~2 µs handshake per wave. ``gemm1_us`` is standalone token-id GEMM1 for
+    this shape (all CUs). Padded routing makes one M-tile per live expert.
+
+    Wave 2 starts when producers finish wave 1, not after N experts.
+    ``experts_during_later_wave`` is how many experts consumers finish in one
+    later-wave send interval while ``num_producers`` CTAs are still sending.
+    """
+    n_m = int(n_m)
+    n_tiles = int(n_tiles)
+    num_chunks = num_publish_chunks(m_local, chunk_rows)
+    if n_m <= 0 or n_tiles <= 0 or num_chunks <= 0:
+        raise ValueError("n_m, n_tiles, and num_chunks must be positive")
+    rows_per_wave = min(int(chunk_rows), int(m_local))
+    send_copy_us = float(send_us_per_row) * rows_per_wave
+    send_later_us = send_copy_us + float(send_handshake_us)
+    send_first_us = float(send_fixed_us) + send_later_us
+    producer_cus = min(int(num_producers), int(num_cu))
+    consumer_cus = max(int(num_cu) - producer_cus, 1)
+    gemm_expert_us = float(gemm1_us) / n_m
+    gemm_expert_us_during_send = gemm_expert_us * int(num_cu) / consumer_cus
+    experts_during_later = send_later_us / gemm_expert_us_during_send
+    m_tiles_ready_after_wave0 = sum(
+        1 for m_tile in range(n_m) if chunk_of_m_tile(m_tile, n_m, num_chunks) == 0
+    )
+    return {
+        "num_chunks": num_chunks,
+        "num_producers": int(num_producers),
+        "producer_cus": producer_cus,
+        "consumer_cus_during_send": consumer_cus,
+        "send_copy_us": send_copy_us,
+        "send_first_us": send_first_us,
+        "send_later_us": send_later_us,
+        "gemm_expert_us": gemm_expert_us,
+        "gemm_expert_us_during_send": gemm_expert_us_during_send,
+        "m_tiles_ready_after_wave0": m_tiles_ready_after_wave0,
+        "experts_during_later_wave": experts_during_later,
+        "tiles_during_later_wave": experts_during_later * n_tiles,
+        "producers_wait_for_gemm": False,
+    }
+
+
 def make_tile_row_base(num_valid: int, sort_block_m: int, device=None) -> torch.Tensor:
     """Contiguous M-tile starts: ``[0, 32, 64, ...]`` for packed / sorted rows."""
     if num_valid % int(sort_block_m):

@@ -70,7 +70,15 @@ class TpIncrementalWorkspace:
         self.rx_scale = mori_shmem_create_tensor((n_rows, model_dim // 32), torch.uint8)
         self.received = mori_shmem_create_tensor((num_experts,), torch.int32)
         self.ranks_done = mori_shmem_create_tensor((1,), torch.int32)
+        self.max_chunks = self.max_m_local
+        self.chunk_ready = mori_shmem_create_tensor((self.max_chunks,), torch.int32)
+        self.launch_ready = mori_shmem_create_tensor((self.npes,), torch.int32)
+        self.epoch_gate = torch.zeros(1, dtype=torch.int32, device=device)
+        self.entry_count = torch.zeros(1, dtype=torch.int64, device=device)
         self.local_prod_done = torch.zeros(1, dtype=torch.int32, device=device)
+        self.local_chunk_done = torch.zeros(
+            self.npes * self.max_chunks, dtype=torch.int32, device=device
+        )
         self.work_cursor = torch.zeros(1, dtype=torch.int32, device=device)
         self.expert0_done = torch.zeros(1, dtype=torch.int32, device=device)
         self.overlap = torch.zeros(1, dtype=torch.int32, device=device)
@@ -78,17 +86,30 @@ class TpIncrementalWorkspace:
         self.rx_scale.zero_()
         self.received.zero_()
         self.ranks_done.zero_()
+        self.chunk_ready.zero_()
+        self.launch_ready.zero_()
         ms.shmem_barrier_all()
         self.p2p_rx = _p2p_table(self.rx_u8, self.rank, self.npes, device)
         self.p2p_scale = _p2p_table(self.rx_scale, self.rank, self.npes, device)
         self.p2p_received = _p2p_table(self.received, self.rank, self.npes, device)
         self.p2p_ranks_done = _p2p_table(self.ranks_done, self.rank, self.npes, device)
+        self.p2p_chunk_ready = _p2p_table(
+            self.chunk_ready, self.rank, self.npes, device
+        )
+        self.p2p_launch_ready = _p2p_table(
+            self.launch_ready, self.rank, self.npes, device
+        )
 
     def zero_handshake(self):
-        """Clear per-replay flags. Caller must cross-rank sync before producers."""
+        """Reset epoch/flags. Chunk all-gather does not need this between graph replays."""
         self.received.zero_()
         self.ranks_done.zero_()
+        self.chunk_ready.zero_()
+        self.launch_ready.zero_()
+        self.epoch_gate.zero_()
+        self.entry_count.zero_()
         self.local_prod_done.zero_()
+        self.local_chunk_done.zero_()
         self.work_cursor.zero_()
         self.expert0_done.zero_()
         self.overlap.zero_()
@@ -102,7 +123,12 @@ class TpIncrementalWorkspace:
         self.rx_scale.zero_()
         self.received.zero_()
         self.ranks_done.zero_()
+        self.chunk_ready.zero_()
+        self.launch_ready.zero_()
+        self.epoch_gate.zero_()
+        self.entry_count.zero_()
         self.local_prod_done.zero_()
+        self.local_chunk_done.zero_()
         self.work_cursor.zero_()
         self.expert0_done.zero_()
         self.overlap.zero_()

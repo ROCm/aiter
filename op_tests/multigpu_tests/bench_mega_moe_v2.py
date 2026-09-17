@@ -580,6 +580,10 @@ def main():
             moe_sorting,
         )
         from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
+        from aiter.ops.flydsl.kernels.mega_moe.tp_chunk_fused import (
+            compile_tp_chunk_fused,
+            run_tp_chunk_fused,
+        )
         from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_push import (
             TpIncrementalWorkspace,
             compile_tp_incremental_push,
@@ -634,6 +638,15 @@ def main():
             row_major=False,
             num_producers=32,
             num_waves=4,
+        )
+        compile_tp_chunk_fused(
+            model_dim=args.model_dim,
+            inter_dim=inter_shard,
+            npes=world,
+            num_producers=32,
+            chunk_rows=32,
+            early_compute=True,
+            swiglu_limit=SWIGLU_LIMIT,
         )
         compile_tp_token_gemm1(
             model_dim=args.model_dim,
@@ -803,6 +816,27 @@ def main():
                     **fused_kwargs,
                 )
 
+            def _run_chunk_fused_stage1():
+                return run_tp_chunk_fused(
+                    workspace,
+                    x_fp8,
+                    x_scale,
+                    gemm1_out,
+                    w1_tp,
+                    w1_scale_tp,
+                    tile_row_base,
+                    expert_ids0,
+                    sorted_ids0,
+                    gemm1_scale,
+                    num_valid,
+                    world_tokens,
+                    m_local,
+                    _fx_stream(),
+                    chunk_rows=32,
+                    early_compute=True,
+                    **fused_kwargs,
+                )
+
             def _run_push():
                 return run_tp_incremental_push(
                     workspace,
@@ -937,6 +971,9 @@ def main():
                 _handshake_sync()
                 _run_fused_stage1()
 
+            def tp_chunk_fused_k_body():
+                _run_chunk_fused_stage1()
+
             def tp_gather_k_body():
                 _handshake_sync()
                 _run_push()
@@ -958,6 +995,7 @@ def main():
             ag_meta = _time(tp_ag_meta_body, f"tp-ag-meta-{tag}")
             _quant_local_x()
             fused_k = _time(tp_fused_k_body, f"tp-fused-k-{tag}")
+            chunk_fused_k = _time(tp_chunk_fused_k_body, f"tp-chunk-fused-k-{tag}")
             gather_k = _time(tp_gather_k_body, f"tp-gather-k-{tag}")
             two_launch = _time(tp_two_launch_body, f"tp-two-launch-{tag}")
             gemm1_k = _time(tp_gemm1_k_body, f"tp-gemm1-k-{tag}")
@@ -969,6 +1007,7 @@ def main():
                 "quant": quant,
                 "ag_meta": ag_meta,
                 "fused_k": fused_k,
+                "chunk_fused_k": chunk_fused_k,
                 "gather_k": gather_k,
                 "two_launch": two_launch,
                 "gemm1_k": gemm1_k,
@@ -979,6 +1018,7 @@ def main():
                     f"nccl_e2e={_fmt_ms(nccl_e2e)} two_e2e={_fmt_ms(two_e2e)} "
                     f"lumped_s1={_fmt_ms(lumped_s1)} quant={_fmt_ms(quant)} "
                     f"ag_meta={_fmt_ms(ag_meta)} fused_k={_fmt_ms(fused_k)} "
+                    f"chunk_fused_k={_fmt_ms(chunk_fused_k)} "
                     f"gather_k={_fmt_ms(gather_k)} two_launch={_fmt_ms(two_launch)} "
                     f"gemm1_k={_fmt_ms(gemm1_k)}",
                     flush=True,
@@ -1055,7 +1095,7 @@ def main():
         if tp_rows:
             print(
                 "[TP-TABLE] tokens nccl_e2e two_e2e lumped_s1 quant ag_meta "
-                "fused_k gather_k two_launch gemm1_k",
+                "fused_k chunk_fused_k gather_k two_launch gemm1_k",
                 flush=True,
             )
             for row in tp_rows:
@@ -1064,6 +1104,7 @@ def main():
                     f"{_fmt_ms(row['nccl_e2e'])} {_fmt_ms(row['two_e2e'])} "
                     f"{_fmt_ms(row['lumped_s1'])} {_fmt_ms(row['quant'])} "
                     f"{_fmt_ms(row['ag_meta'])} {_fmt_ms(row['fused_k'])} "
+                    f"{_fmt_ms(row['chunk_fused_k'])} "
                     f"{_fmt_ms(row['gather_k'])} {_fmt_ms(row['two_launch'])} "
                     f"{_fmt_ms(row['gemm1_k'])}",
                     flush=True,
