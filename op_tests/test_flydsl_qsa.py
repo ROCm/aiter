@@ -10,7 +10,7 @@ Two layers:
     ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table),
     ``bench_qsa_family_b_k1`` (2e/2f emit; 2g long-``L``; 2h published point),
-    ``bench_qsa_family_a_k2`` (3a decode ``M<=8`` vs live AMD GQA).
+    ``bench_qsa_family_a_k2`` (3b decode ``M<=8`` and a separate 3c prefill table).
 
 Usage::
 
@@ -522,6 +522,42 @@ def test_k2_family_a_decode_matches_oracle():
         raise AssertionError(f"K2 decode diverged from the oracle (err={err})")
 
 
+def test_k2_family_a_prefill_matches_oracle():
+    """Same K2 instantiation matches qsa_sparse_gqa at prefill M=512."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 512, 64, 16, 8
+    torch.manual_seed(0)
+    q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    assert torch.equal(kv_table, kv_table_v)
+    ref = qsa_sparse_gqa(q, k, v, indices)
+    out = qsa_k2_family_a(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="flydsl K2 prefill vs oracle GQA",
+    )
+    if err != 0:
+        raise AssertionError(f"K2 prefill diverged from the oracle (err={err})")
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
@@ -607,8 +643,9 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
 def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
     """Family A FlyDSL K2 decode vs oracle GQA; us vs live AMD sparse GQA.
 
-    3b: split-K plus LSE merge, group 12, D=256. Expand and sigmoid stay
-    unfused. Times are recorded; this is not a win claim.
+    3b/3c: split-K plus LSE merge, group 12, D=256. Decode and prefill
+    share one instantiation. Expand and sigmoid stay unfused. Times are
+    recorded; this is not a win claim.
     """
     idx = FAMILY_A_INDEXER
     gqa = FAMILY_A_GQA
@@ -1395,6 +1432,7 @@ def _run_unit_cases():
     test_k1_family_b_set_equality_two_tiles_h8()
     test_k1_family_b_set_equality_published_indexer_point()
     test_k2_family_a_decode_matches_oracle()
+    test_k2_family_a_prefill_matches_oracle()
     aiter.logger.info("QSA oracle + K1 + K2 unit cases passed")
 
 
@@ -1551,6 +1589,22 @@ def main():
             df = pd.DataFrame(rows)
             aiter.logger.info(
                 "QSA family A FlyDSL K1 prefill summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size in itertools.product(
+            [b for b in args.batch if b == 512],
+            args.seq,
+            args.page_size,
+        ):
+            if m > seq_len:
+                continue
+            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype))
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family A FlyDSL K2 prefill summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
