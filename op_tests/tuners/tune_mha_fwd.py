@@ -625,10 +625,11 @@ class MhaFwdTuner(TunerCommon):
                 os.unlink(temporary)
 
     def _append_journal_result(self, phase: str, result) -> None:
-        info, us, err_ratio, status = result
+        info, us, err_ratio, status = result[:4]
+        detail = result[4] if len(result) > 4 else ""
         problem, candidate = self._problem_and_candidate(info)
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "candidate_id": mha_fwd_candidate_id(problem, candidate),
             "phase": phase,
             "problem": problem.as_row(),
@@ -638,6 +639,7 @@ class MhaFwdTuner(TunerCommon):
                 "backend_config": candidate.config_json,
             },
             "status": status,
+            "detail": str(detail),
             "us": float(us) if math.isfinite(float(us)) else None,
             "errRatio": float(err_ratio),
             "recorded_at_unix_s": time.time(),
@@ -702,6 +704,8 @@ class MhaFwdTuner(TunerCommon):
                         candidate.num_splits,
                         candidate.config_json,
                     )
+                    # Schema 1 records carry no detail; default it so a journal
+                    # written before this change still resumes.
                     result = (
                         info,
                         (
@@ -711,6 +715,7 @@ class MhaFwdTuner(TunerCommon):
                         ),
                         float(record["errRatio"]),
                         str(record["status"]),
+                        str(record.get("detail", "")),
                     )
                     records[(candidate_id, str(record["phase"]))] = result
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -885,7 +890,7 @@ class MhaFwdTuner(TunerCommon):
 
         finalists_by_key: dict[tuple, list[tuple]] = {}
         for result in first_pass:
-            info, us, err_ratio, status = result
+            info, us, err_ratio, status = result[:4]
             if (
                 status == "ok"
                 and us > 0
@@ -964,11 +969,21 @@ class MhaFwdTuner(TunerCommon):
             if failed_status is not None or len(samples) != args.finalist_rounds:
                 status = failed_status or "crash"
                 us = float("inf")
+                detail = next(
+                    (
+                        str(result[4])
+                        for result in results
+                        if len(result) > 4 and result[3] != "ok" and result[4]
+                    ),
+                    f"only {len(samples)} of {args.finalist_rounds} "
+                    "finalist rounds produced a measurement",
+                )
             else:
                 status = "ok"
                 us = float(statistics.median(samples))
+                detail = ""
             err_ratio = max((float(result[2]) for result in results), default=1.0)
-            final_by_info[info] = (info, us, err_ratio, status)
+            final_by_info[info] = (info, us, err_ratio, status, detail)
 
         return [final_by_info.get(result[0], result) for result in first_pass]
 
@@ -1003,7 +1018,17 @@ class MhaFwdTuner(TunerCommon):
                     "us": us,
                     "errRatio": err_ratio,
                     "status": status,
-                    "detail": "" if status == "ok" else f"candidate {status}",
+                    "detail": (
+                        ""
+                        if status == "ok"
+                        else (
+                            str(result[4])
+                            if len(result) > 4 and result[4]
+                            # No diagnostic reached us, which is itself worth
+                            # saying rather than restating the status.
+                            else f"candidate {status} with no diagnostic recorded"
+                        )
+                    ),
                     "samples_us": json.dumps(samples, separators=(",", ":")),
                     "tflops": self.calculate((info, us, err_ratio)),
                 }
@@ -1374,6 +1399,13 @@ class MhaFwdTuner(TunerCommon):
         }
         problem["_proof_warmup"] = int(self._args.warmup)
         problem["_proof_iters"] = int(self._args.iters)
+        # Run the child as a module from the repository root, not as a file
+        # path. Executing a path puts op_tests/tuners/ on sys.path instead of
+        # the root, and "import aiter" then resolves to whatever copy is
+        # installed in site-packages -- so the probe either dies on
+        # aiter.jit or, worse, silently proves a claim about a different
+        # checkout than the one being tuned.
+        repository_root = Path(__file__).parents[2]
         environment = os.environ.copy()
         environment.update(
             {
@@ -1381,6 +1413,9 @@ class MhaFwdTuner(TunerCommon):
                 "AITER_GPU_MODEL": str(row["gpu_model"]),
                 "AITER_MHA_FWD_SELECTION_PROOF_FILE": proof_path,
                 "AITER_MHA_FWD_PROBE_PROBLEM": json.dumps(problem),
+                "PYTHONPATH": os.pathsep.join(
+                    [str(repository_root), os.environ.get("PYTHONPATH", "")]
+                ).rstrip(os.pathsep),
             }
         )
         started = time.time()
@@ -1394,7 +1429,13 @@ class MhaFwdTuner(TunerCommon):
         )
         try:
             completed = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), "--_selection_probe"],
+                [
+                    sys.executable,
+                    "-m",
+                    "op_tests.tuners.tune_mha_fwd",
+                    "--_selection_probe",
+                ],
+                cwd=str(repository_root),
                 env=environment,
                 capture_output=True,
                 text=True,
