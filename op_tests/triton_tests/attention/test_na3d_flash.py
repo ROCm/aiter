@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.triton.attention.na3d_flash import na3d_flash_attn
-from aiter.test_common import checkAllclose
+from aiter.test_common import assertAllclose
 
 
 @pytest.fixture(autouse=True)
@@ -313,15 +313,16 @@ def test_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
     ref = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))
     out = na3d_flash_attn(q, k, v, kernel_size=(KT, KH, KW))
 
-    assert (
-        checkAllclose(
-            ref.float(),
-            out.float(),
-            rtol=1e-2,
-            atol=5e-2,
-            msg=f"na3d_flash (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
-        )
-        <= 0.01
+    # assertAllclose threads one tol_err_ratio into both the assertion and
+    # checkAllclose's diagnostics, so a 1-5% regression fails AND logs the mismatch
+    # report at ERROR (survives pytest's WARNING-level logger).
+    assertAllclose(
+        ref.float(),
+        out.float(),
+        rtol=1e-2,
+        atol=5e-2,
+        tol_err_ratio=0.01,
+        msg=f"na3d_flash (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
     )
 
 
@@ -349,13 +350,11 @@ def test_na3d_sdpa_exact_vs_ref(B, T, H, W, NH, HD, KT, KH, KW):
     ref = na3d_sdpa_ref(q, k, v, kernel_size=(KT, KH, KW))
     exact = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))  # w_offset=0 default
 
-    assert (
-        checkAllclose(
-            ref.float(),
-            exact.float(),
-            rtol=1e-2,
-            atol=5e-2,
-            msg=f"_na3d_sdpa_exact vs na3d_sdpa_ref (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
-        )
-        <= 0.05
+    assertAllclose(
+        ref.float(),
+        exact.float(),
+        rtol=1e-2,
+        atol=5e-2,
+        tol_err_ratio=0.05,
+        msg=f"_na3d_sdpa_exact vs na3d_sdpa_ref (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
     )
