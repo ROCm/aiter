@@ -10,7 +10,8 @@ Phase 2e/2f: family B FlyDSL K1 ``H`` 4 or 8 emit. Phase 2g: same kernel
 streams 512-slot tiles for long ``L``. Phase 2h: emit vs #4882 plus the
 published indexer point.
 Phase 3a: family A FlyDSL K2 decode sparse GQA (group 12, ``D=256``).
-Phase 3b: same ABI with split-K plus LSE merge for decode occupancy;
+Phase 3b: same ABI with split-K plus LSE merge for decode occupancy.
+Phase 3c: prefill ``M=512`` uses that same instantiation (no second compile);
 expand+tail and the sigmoid gate stay unfused.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
