@@ -20,7 +20,10 @@ import torch
 import triton
 
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.triton._triton_kernels.attention.na3d_flash import _na3d_flash_fwd
+from aiter.ops.triton._triton_kernels.attention.na3d_flash import (
+    _get_config,
+    _na3d_flash_fwd,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -99,11 +102,11 @@ def na3d_flash_attn(
         KT <= T and KH <= H and KW <= W
     ), f"na3d_flash_attn: kernel_size=({KT},{KH},{KW}) must be <= (T,H,W)=({T},{H},{W})"
     assert KW <= 33, (
-        f"na3d_flash_attn: KW={KW} is too large for the current autotune configs "
+        f"na3d_flash_attn: KW={KW} is too large for the published configs "
         f"(max supported KW is 33 with BLOCK_Q=32/BLOCK_KV=64)."
     )
-    # Config coverage: BLOCK_Q=16/BLOCK_KV=32 supports KW <= 17; larger KW requires
-    # BLOCK_Q=32/BLOCK_KV=64 which the pruner keeps only when W >= 32.
+    # Config coverage: BLOCK_Q=16/BLOCK_KV=32 (na3d_flash_small_kw) supports KW <= 17;
+    # larger KW uses BLOCK_Q=32/BLOCK_KV=64 (na3d_flash_large_kw), which needs W >= 32.
     assert KW <= 17 or W >= 32, (
         f"na3d_flash_attn: KW={KW} > 17 requires W >= 32 "
         f"(only the BLOCK_Q=32/BLOCK_KV=64 config covers KW > 17); got W={W}."
@@ -124,9 +127,15 @@ def na3d_flash_attn(
     stride_nh = HD  # elements between heads
     stride_seq = NH * HD  # elements between tokens
 
+    # Per-arch tile from the config file (no runtime autotune).  The KW-based
+    # selection guarantees BLOCK_Q <= W and BLOCK_KV >= BLOCK_Q + KW - 1 given the
+    # asserts above (W >= 16; KW <= 17 or W >= 32; KW <= 33).
+    cfg = _get_config(KW)
+    block_q = cfg["BLOCK_Q"]
+
     # Grid: one program per (t, h) row per W-block.  This guarantees each
     # program covers queries from exactly one (t, h) row regardless of W % BLOCK_Q.
-    grid = lambda meta: (T * H * triton.cdiv(W, meta["BLOCK_Q"]), B * NH)
+    grid = (T * H * triton.cdiv(W, block_q), B * NH)
 
     _na3d_flash_fwd[grid](
         q,
@@ -144,6 +153,10 @@ def na3d_flash_attn(
         KT=KT,
         KH=KH,
         KW=KW,
+        BLOCK_Q=block_q,
+        BLOCK_KV=cfg["BLOCK_KV"],
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
     )
 
     return out

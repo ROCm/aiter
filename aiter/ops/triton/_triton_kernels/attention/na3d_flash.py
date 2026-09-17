@@ -11,110 +11,32 @@ Algorithm:
 - Q is loaded once into registers and held for all KT x KH inner iterations.
 - Each iteration loads one (t_kv, h_kv) row of K and V at the shared W window.
 - Running online softmax in log2 space (exp2, log2(e) folded into scale).
-- Optionally autotuned (NA3D_FLASH_TRITON_AUTOTUNE=1) over BLOCK_Q (16, 32),
-  num_stages (2, 3, 4), num_warps (4, 8).
+- Tile (BLOCK_Q, BLOCK_KV, num_warps, num_stages) is read from the per-arch config
+  configs/<arch>/triton/attention/na3d_flash/DEFAULT.json (no runtime autotune).
 """
 
-import os
+import functools
 
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 
-def _na3d_autotune_configs():
-    """Full autotune search space (opt-in via NA3D_FLASH_TRITON_AUTOTUNE=1).
+@functools.cache
+def _get_config(KW: int) -> dict:
+    """Per-arch tile from configs/<arch>/triton/attention/na3d_flash/DEFAULT.json.
 
-    BLOCK_KV = next_pow2(BLOCK_Q + KW - 1) covers the union of all BLOCK_Q queries'
-    W windows in one chunk (BLOCK_Q=16 -> 32, BLOCK_Q=32 -> 64). The BLOCK_Q=32
-    family halves program count but doubles BLOCK_KV (more masked compute), so it
-    is only swept at num_stages=2. W >= BLOCK_Q is enforced by the pruner below.
+    Two published entries cover the two KW families:
+      - na3d_flash_small_kw (BLOCK_Q=16, BLOCK_KV=32) for KW <= 17
+      - na3d_flash_large_kw (BLOCK_Q=32, BLOCK_KV=64) for KW in [18, 33]
+    BLOCK_KV must satisfy BLOCK_KV >= BLOCK_Q + KW - 1 so the KV tile covers the
+    union of all BLOCK_Q query windows; both entries meet that at their KW bound.
     """
-    configs = []
-    for block_q, block_kv, stages in ((16, 32, (2, 3, 4)), (32, 64, (2,))):
-        for ns in stages:
-            for nw in (4, 8):
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_Q": block_q, "BLOCK_KV": block_kv},
-                        num_warps=nw,
-                        num_stages=ns,
-                    )
-                )
-    return configs
-
-
-_NA3D_AUTOTUNE_CONFIGS = _na3d_autotune_configs()
-
-# Live-search opt-in.  Default (unset) uses the per-arch tiles published in
-# configs/<arch>/triton/attention/na3d_flash/DEFAULT.json; set to 1 to re-tune
-# over the full _na3d_autotune_configs() search space.
-_NA3D_FLASH_TRITON_AUTOTUNE = os.getenv("NA3D_FLASH_TRITON_AUTOTUNE", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
-# Always-launchable per-KW-family fallbacks, used only when an arch has no published
-# DEFAULT.json entry (no accelerator at import, unpublished arch, or unreadable file).
-# get_tuned_kernel_config() requires a Python triton.Config fallback by design: this is
-# the mandated not-JSON path -- a conservative correctness floor, not a copy of the tuned
-# defaults. Derived from the single search-space source so there are no parallel literals
-# to drift: the minimal tile (fewest num_stages) of each BLOCK_Q family. The pruner then
-# keeps BLOCK_Q=16 for KW <= 17 and BLOCK_Q=32 for KW > 17.
-_FALLBACK_SMALL_KW = next(
-    c for c in _NA3D_AUTOTUNE_CONFIGS if c.kwargs["BLOCK_Q"] == 16
-)
-_FALLBACK_LARGE_KW = next(
-    c for c in _NA3D_AUTOTUNE_CONFIGS if c.kwargs["BLOCK_Q"] == 32
-)
-
-
-def _na3d_default_configs():
-    """Per-arch default tiles from JSON, one per KW-family.
-
-    Both are returned; the pruner keeps only the family valid for the runtime KW
-    (BLOCK_Q=16 for KW <= 17, BLOCK_Q=32 for KW > 17), so this is at most a 2-way
-    select for KW <= 17 and a single config for KW > 17 -- not a full search.
-    A single pinned tile cannot serve both branches (a KW > 17 shape with only the
-    BLOCK_Q=16 tile would leave the pruner with an empty config set).
-    """
-    return [
-        get_tuned_kernel_config(
-            "attention", "NA3D_FLASH", "na3d_flash_small_kw", _FALLBACK_SMALL_KW
-        ),
-        get_tuned_kernel_config(
-            "attention", "NA3D_FLASH", "na3d_flash_large_kw", _FALLBACK_LARGE_KW
-        ),
-    ]
-
-
-_NA3D_ACTIVE_CONFIGS = (
-    _NA3D_AUTOTUNE_CONFIGS if _NA3D_FLASH_TRITON_AUTOTUNE else _na3d_default_configs()
-)
-
-
-def _prune_configs(configs, named_args, **kwargs):
-    """Remove configs where BLOCK_Q > W or BLOCK_KV is too small for KW.
-
-    Performance constraint: BLOCK_Q > W would leave most of every block masked,
-    wasting compute. Correctness also requires BLOCK_KV >= (BLOCK_Q + KW - 1)
-    so the KV tile covers the union of all BLOCK_Q query windows.
-    """
-    # Triton routes positional launch args into named_args and keyword launch args
-    # into kwargs.  This launcher passes W positionally and KW as a keyword, but read
-    # from both so the size check stays active regardless of how either is passed.
-    W = named_args.get("W", kwargs.get("W"))
-    KW = named_args.get("KW", kwargs.get("KW"))
-    return [
-        c
-        for c in configs
-        if c.kwargs["BLOCK_Q"] <= W
-        and (KW is None or c.kwargs["BLOCK_KV"] >= c.kwargs["BLOCK_Q"] + KW - 1)
-    ]
+    cfg_dir = resolve_config_dir("attention", "NA3D_FLASH", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    return config["na3d_flash_small_kw" if KW <= 17 else "na3d_flash_large_kw"]
 
 
 _na3d_flash_fwd_repr = make_kernel_repr(
@@ -123,11 +45,6 @@ _na3d_flash_fwd_repr = make_kernel_repr(
 )
 
 
-@triton.autotune(
-    configs=_NA3D_ACTIVE_CONFIGS,
-    key=["KT", "KH", "KW", "HD", "W"],
-    prune_configs_by={"early_config_prune": _prune_configs},
-)
 @triton.jit(repr=_na3d_flash_fwd_repr)
 def _na3d_flash_fwd(
     Q_ptr,
