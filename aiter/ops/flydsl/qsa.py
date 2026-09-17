@@ -9,7 +9,8 @@ compressed K (512-slot tiles, eight waves per row, no score matrix).
 Phase 2e/2f: family B FlyDSL K1 ``H`` 4 or 8 emit. Phase 2g: same kernel
 streams 512-slot tiles for long ``L``. Phase 2h: emit vs #4882 plus the
 published indexer point.
-Expand+tail and K2 are still separate.
+Phase 3a: family A FlyDSL K2 decode sparse GQA (group 12, ``D=256``);
+expand+tail and the sigmoid gate stay unfused.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
 
@@ -46,6 +47,7 @@ from .kernels.qsa import (
 )
 from .kernels.qsa.k1_family_a import qsa_k1_family_a_block_ids
 from .kernels.qsa.k1_family_b import qsa_k1_family_b_block_ids
+from .kernels.qsa.k2_family_a import qsa_k2_family_a
 
 __all__ = [
     "FAMILY_A_GQA",
@@ -64,6 +66,7 @@ __all__ = [
     "qsa_indexer_scores",
     "qsa_k1_family_a_block_ids",
     "qsa_k1_family_b_block_ids",
+    "qsa_k2_family_a",
     "qsa_oracle",
     "qsa_sparse_gqa",
     "qsa_topk_blocks",
