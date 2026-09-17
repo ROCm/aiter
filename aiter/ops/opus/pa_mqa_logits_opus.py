@@ -125,6 +125,12 @@ SCHED_RECORD_INTS = 8
 SCHED_SCRATCH_RECORDS = 96
 
 
+def _require_gfx950(name):
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        raise RuntimeError(f"{name} requires gfx950, got {gfx}")
+
+
 def pa_mqa_logits_mxfp4_sched_slots(num_rows: int, cta_cap: int = SCHED_CTA_CAP) -> int:
     """CTA slots to launch, i.e. the ``num_ctas`` GRID. For the BUFFER use
     :func:`pa_mqa_logits_mxfp4_sched_buffer_ints`.
@@ -175,6 +181,7 @@ def pa_mqa_logits_mxfp4_build_sched(
     forwards -- every slot is written, surplus ones included. A caller supplying its own must
     size it with :func:`pa_mqa_logits_mxfp4_sched_buffer_ints`.
     """
+    _require_gfx950("pa_mqa_logits_mxfp4_build_sched")
     n = int(num_rows)
     slots = pa_mqa_logits_mxfp4_sched_slots(n) if num_ctas is None else int(num_ctas)
     if cta_info is None:
@@ -195,12 +202,6 @@ def pa_mqa_logits_mxfp4_build_sched(
         int(cta_target),
     )
     return cta_info, slots
-
-
-def _require_gfx950(name):
-    gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"{name} requires gfx950, got {gfx}")
 
 
 def pa_mqa_logits_mxfp4_sched(
