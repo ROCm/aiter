@@ -17,6 +17,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,6 +72,34 @@ def complete_profile(row):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def print_summary(summaries):
+    columns = ["case", "M,N,K", "data_init", "scale_init", "splitk"]
+    columns += [f"us_{i}" for i in range(1, len(summaries[0]["values_us"]) + 1)]
+    columns += ["mean_us", "correctness"]
+    rows = []
+    for item in summaries:
+        verdicts = Counter(item["correctness"])
+        rows.append(
+            [
+                item["case"],
+                ",".join(map(str, CASES[item["case"]])),
+                item["data_init"],
+                INPUTS[item["data_init"]],
+                str(item["splitk"]),
+                *[f"{value:.2f}" for value in item["values_us"]],
+                f"{item['mean_us']:.4f}",
+                ", ".join(f"{verdict}: {count}" for verdict, count in verdicts.items()),
+            ]
+        )
+    widths = [max(map(len, cells)) for cells in zip(columns, *rows)]
+    print("\nF8GEMM performance summary (accepted attempts, GEMM-only, us):", flush=True)
+    for row in [columns, ["-" * width for width in widths], *rows]:
+        print(
+            "| " + " | ".join(cell.ljust(width) for cell, width in zip(row, widths)) + " |",
+            flush=True,
+        )
 
 
 def main():
@@ -138,14 +167,19 @@ def main():
                 }
                 attempts.append(entry)
                 write_json(output / "attempts.json", attempts)
-                with log_path.open("w") as log:
-                    result = subprocess.run(
+                with log_path.open("w", buffering=1) as log:
+                    with subprocess.Popen(
                         command,
                         cwd=ROOT,
-                        stdout=log,
+                        stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
-                        check=False,
-                    )
+                        text=True,
+                        bufsize=1,
+                    ) as result:
+                        for line in result.stdout:
+                            log.write(line)
+                            print(line, end="", flush=True)
+                        result.wait()
                 entry["exit_code"] = result.returncode
                 write_json(output / "attempts.json", attempts)
                 if result.returncode:
@@ -161,7 +195,8 @@ def main():
                 write_json(output / "attempts.json", attempts)
                 if not accepted:
                     print(
-                        f"Incomplete formal profiler records: {stem}, counts={counts}; retained",
+                        f"Incomplete formal profiler records: {stem}, counts={counts}; "
+                        "logs retained, excluded from final summary",
                         flush=True,
                     )
                     continue
@@ -209,6 +244,7 @@ def main():
                 raise RuntimeError(
                     f"No complete profiler group after {args.max_attempts} attempts: {case}/{data_init}; all attempts retained in {output}"
                 )
+    print_summary(summaries)
     print(f"Summary: {output / 'perf.csv'}", flush=True)
 
 

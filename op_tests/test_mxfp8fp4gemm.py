@@ -855,31 +855,54 @@ def main():
             return args.splitk
         return [_benchmark_splitk(intype, apre, M, N, K)]
 
+    def run_once(repeat, *test_args, **test_kwargs):
+        aiter.logger.info("repeat %d/%d begin", repeat, args.repeat)
+        row = dict(test_gemm(*test_args, **test_kwargs), repeat=repeat)
+        aiter.logger.info(
+            "repeat %d/%d result: %s M,N,K=%s,%s,%s %s/%s AP%s splitk=%s "
+            "asm=%s us, %s TFLOPS, correctness=%s, err=%s, GPU events=%s/%s",
+            repeat,
+            args.repeat,
+            row["intype"],
+            row["M"],
+            row["N"],
+            row["K"],
+            row["data_init"],
+            row["scale_init"],
+            row["apre"],
+            row.get("splitk"),
+            row.get("asm us"),
+            row.get("asm TFLOPS"),
+            row.get("asm result"),
+            row.get("asm err"),
+            sum(row.get("profile_gpu_kernels", {}).values()),
+            row["num_iters"],
+        )
+        return row
+
     rows = [
-        dict(
-            test_gemm(
-                intype,
-                M,
-                N,
-                K,
-                apre,
-                outtype,
-                di,
-                si,
-                seed=args.seed,
-                mode=args.mode,
-                knl_name=args.knl_name,
-                splitk=splitk,
-                no_reduce=args.no_reduce,
-                num_warmup=args.warmup,
-                num_iters=args.iters,
-                test_graph=args.graph,
-                num_rotate=args.rotate,
-                pre_benchmark=args.pre_benchmark,
-                pre_benchmark_warmup=args.pre_benchmark_warmup,
-                pre_benchmark_iters=args.pre_benchmark_iters,
-            ),
-            repeat=repeat,
+        run_once(
+            repeat,
+            intype,
+            M,
+            N,
+            K,
+            apre,
+            outtype,
+            di,
+            si,
+            seed=args.seed,
+            mode=args.mode,
+            knl_name=args.knl_name,
+            splitk=splitk,
+            no_reduce=args.no_reduce,
+            num_warmup=args.warmup,
+            num_iters=args.iters,
+            test_graph=args.graph,
+            num_rotate=args.rotate,
+            pre_benchmark=args.pre_benchmark,
+            pre_benchmark_warmup=args.pre_benchmark_warmup,
+            pre_benchmark_iters=args.pre_benchmark_iters,
         )
         for apre, (di, si), intype, outtype in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype
@@ -899,6 +922,7 @@ def main():
         )
     # Keep knl_name (the actual .co) + tile + cluster; drop columns constant within a
     # table (cluster now varies with shape via the aspect heuristic, so it is kept).
+    # Nested profiling details stay in JSON; omit them from the terminal table.
     df = df_full.drop(
         columns=[
             "seed",
@@ -908,6 +932,8 @@ def main():
             "num_iters",
             "test_graph",
             "num_rotate",
+            "pre_benchmark_results",
+            "profile_gpu_kernels",
         ],
         errors="ignore",
     )
