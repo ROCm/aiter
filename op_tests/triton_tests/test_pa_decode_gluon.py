@@ -1209,6 +1209,11 @@ def run_pa_gluon_test(
     num_query_heads, num_kv_heads = num_heads
     if value_head_size is None:
         value_head_size = head_size
+    if USE_TORCH_FLASH_REF and value_head_size != head_size:
+        raise ValueError(
+            "The flash-style reference requires equal Q/K and V head sizes; "
+            "set USE_TORCH_FLASH_REF=False to use the standard PyTorch reference"
+        )
     assert (
         num_query_heads % num_kv_heads == 0
     ), "Query heads must be divisible by KV heads"
@@ -1367,7 +1372,7 @@ def run_pa_gluon_test(
     pa_rw_bytes = sum(kv_len_list) * num_kv_heads * (
         head_size * quantized_keys.dtype.itemsize
         + value_head_size * quantized_values.dtype.itemsize
-    ) + query_length * num_query_heads * (
+    ) + batch_size * query_length * num_query_heads * (
         head_size * quantized_query.dtype.itemsize
         + value_head_size * reference_output_quant.dtype.itemsize
     )
