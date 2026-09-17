@@ -27,6 +27,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import urllib.error
@@ -317,9 +318,21 @@ def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
         try:
             api.write("POST", "/git/refs", {"ref": f"refs/heads/{target}", "sha": sha})
         except urllib.error.HTTPError as error:
+            # 422 is how the already-exists race arrives, and also how every
+            # other validation failure arrives; the status alone does not tell
+            # them apart. So read the ref back instead of assuming, on the
+            # quiet path as well: believing the wrong one deletes a branch
+            # whose archive was never written, the one outcome this workflow
+            # exists to prevent.
             if error.code != 422:
                 raise
+        if api.apply:
             existing = ref_sha(api, target)
+            if existing is None:
+                raise RuntimeError(
+                    f"{target} does not exist after trying to create it, "
+                    f"so {name} was left alone"
+                )
     if existing is not None and existing != sha:
         return f"skipped {name}: {target} already exists at another commit"
     if find_marker(api, sha, marker("archived", target), author) is not None:
@@ -334,7 +347,7 @@ def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
                 f"{branch['date'].date().isoformat()}, so it has been moved to "
                 f"`{target}`. Nothing is lost -- this commit is still here, and "
                 f"one command puts the branch back:\n\n"
-                f"```\ngit push origin {target}:{name}\n```\n\n"
+                f"```\ngit push origin {shlex.quote(target + ':' + name)}\n```\n\n"
                 f"The archive copy is kept for a while and then removed, with a "
                 f"separate comment here giving notice first."
             )
@@ -362,7 +375,7 @@ def give_notice(api: Api, branch: dict, original: str, delete_on: dt.date) -> st
                 f"`{branch['name']}` is due to be deleted on "
                 f"{delete_on.isoformat()}.\n\n"
                 f"To keep it, restore the branch:\n\n"
-                f"```\ngit push origin {branch['name']}:{original}\n```\n\n"
+                f"```\ngit push origin {shlex.quote(branch['name'] + ':' + original)}\n```\n\n"
                 f"To stop the clock without restoring anything, delete this "
                 f"comment -- the deletion only happens while it stands."
             )

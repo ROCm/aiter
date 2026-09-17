@@ -9,6 +9,13 @@ name: Archive stale branches
 # nothing until then. --max-actions caps each run, so the ~700 branches already
 # past 30 days are worked off over weeks rather than in one morning.
 #
+# A workflow_dispatch run can start from any branch, and this job holds
+# contents: write and then runs the script and list it checked out. So the
+# checkout is pinned to the default branch, and --apply is passed only when the
+# run itself is on the default branch: a dispatch from a feature branch reports
+# and writes nothing, whatever that branch's copy of the policy says. Changing
+# what this deletes stays a reviewed change to main.
+#
 # Exempt: protected branches, the head or base branch of an open pull request,
 # and .github/stale-branch-exemptions.txt -- a checked-in list of names and re:
 # patterns, edited by pull request, consulted at every stage against the
@@ -43,8 +50,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Deletion goes through git push --force-with-lease, which is the
-          # only compare-and-swap available -- the REST API has no conditional
+          # Not the dispatching ref: the policy this enforces comes from the
+          # default branch or not at all.
+          ref: ${{ github.event.repository.default_branch }}
+          # Deletion goes through git push --force-with-lease, the only
+          # compare-and-swap available -- the REST API has no conditional
           # delete -- so the checkout's credentials are what the script pushes
           # with. Default, stated because the delete stage depends on it.
           persist-credentials: true
@@ -68,4 +78,4 @@ jobs:
             --notice-days 14 \
             --exemptions .github/stale-branch-exemptions.txt \
             --max-actions "$MAX_ACTIONS" \
-            ${{ (inputs.dry_run != true && vars.STALE_BRANCHES_ARCHIVE == 'true') && '--apply' || '' }}
+            ${{ (inputs.dry_run != true && vars.STALE_BRANCHES_ARCHIVE == 'true' && github.ref_name == github.event.repository.default_branch) && '--apply' || '' }}
