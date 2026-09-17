@@ -353,29 +353,55 @@ static inline int snap_coop_g(int g, int max_g)
 // +77% -- measured at M=128 N=1048576, where it picked G=2 for 225 us against
 // 127 us at G=16.
 //
-// Rows are log2(M) for M = 1..4096. Columns are log2(N) for N = 16384..1048576;
-// N <= 8192 takes the small_n path and never reaches here. For M >= 256 the
-// ni <= 2 columns (N <= 65536) are 0 (coop_g=1): the v4 sweep only measured
-// N >= 131072 and M=256 N=32768 has no win at any G.
+// Rows are log2(M) for M = 1..4096. Columns are HALF-octaves of N from 16384:
+// column 2i is [2^k, 1.5 * 2^k) and column 2i+1 is [1.5 * 2^k, 2^(k+1)), with
+// k = 14 + i. N <= 8192 takes the small_n path and never reaches here.
+//
+// A full octave per column is measurably too coarse. Refitting this same data
+// with one column per octave costs up to **+5.42%** (M=64 over [16384, 32768))
+// and more than 1% on 12 of the (M, octave) pairs, worst in
+// [524288, 1048576) at large M -- which is exactly where the octave table put
+// M=1024 N=1048572 on G=1 and paid +8.2%.
+//
+// Fitted by bench/coop_fit.py from 2093 measured points across 13 M, 23 N and 7
+// G (log/coop_sweep_{half,hole,mid,base16k}.tsv). Two rules, both there because
+// a cell serves EVERY N in its bucket and not just the one it was measured at:
+//   - minimax, not argmin: the G with the smallest worst-case cost over the
+//     bucket's measured N. Argmin at a single N is how M=1024 col11 first came
+//     out as G=1, which led G=16 by 0.2% at N=786432 and lost 12.6% at
+//     N=1048572 in the same bucket.
+//   - ties within 1% resolved toward monotone-in-N, evaluated across the bucket
+//     as well. Cells where monotonicity costs more are left alone, which is why
+//     M=32 and M=64 still dip at column 1 (G=16 costs +5.2% and +9.4% there).
+// Residual: no fitted cell is worse than +3.4% against any N measured inside it.
 constexpr int COOP_TAB_M       = 13;
-constexpr int COOP_TAB_N       = 7;
+constexpr int COOP_TAB_N       = 13;
 constexpr int COOP_N_LOG2_BASE = 14;
 
 static const signed char kCoopLog2G[COOP_TAB_M][COOP_TAB_N] = {
-    /* M=1    */ {2, 4, 5, 6, 6, 6, 7},
-    /* M=2    */ {2, 4, 4, 5, 6, 6, 6},
-    /* M=4    */ {3, 4, 4, 5, 5, 5, 6},
-    /* M=8    */ {3, 3, 4, 4, 5, 5, 6},
-    /* M=16   */ {3, 3, 3, 4, 5, 5, 5},
-    /* M=32   */ {3, 3, 3, 3, 4, 4, 4},
-    /* M=64   */ {3, 3, 3, 3, 3, 4, 4},
-    /* M=128  */ {0, 3, 3, 3, 3, 3, 4},
-    /* M=256  */ {0, 0, 0, 3, 3, 3, 4},
-    /* M=512  */ {0, 0, 0, 1, 2, 3, 4},
-    /* M=1024 */ {0, 0, 0, 1, 3, 3, 4},
-    /* M=2048 */ {0, 0, 0, 3, 3, 3, 4},
-    /* M=4096 */ {0, 0, 0, 3, 3, 3, 4},
+    /* M=1    */ {4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6},
+    /* M=2    */ {4, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6},
+    /* M=4    */ {4, 4, 5, 5, 4, 4, 5, 5, 5, 5, 6, 6, 6},
+    /* M=8    */ {5, 5, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6},
+    /* M=16   */ {4, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5},
+    /* M=32   */ {5, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4},
+    /* M=64   */ {4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4},
+    /* M=128  */ {0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4},
+    /* M=256  */ {0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4},
+    /* M=512  */ {0, 0, 0, 0, 0, 1, 1, 3, 2, 3, 3, 4, 4},
+    /* M=1024 */ {0, 0, 0, 0, 0, 1, 1, 3, 3, 3, 3, 4, 4},
+    /* M=2048 */ {0, 0, 0, 1, 1, 1, 3, 3, 3, 3, 3, 4, 4},
+    /* M=4096 */ {0, 0, 1, 1, 1, 1, 3, 3, 3, 3, 3, 4, 4},
 };
+
+// Half-octave column for N: 0 = [16384, 24576), 1 = [24576, 32768),
+// 2 = [32768, 49152), 3 = [49152, 65536), and so on.
+static inline int coop_bucket_of(int N)
+{
+    const int k  = ilog2_floor(N);
+    const int lo = 1 << k;
+    return 2 * (k - COOP_N_LOG2_BASE) + (N >= lo + (lo >> 1) ? 1 : 0);
+}
 
 // Off-grid fallback, fitted to the same sweep: worst +27%, mean +6.1%.
 constexpr int COOP_TARGET_BLOCKS      = 1024;
@@ -388,7 +414,7 @@ static inline int coop_g_from_table(int M, int N, int max_g)
     if(M < 1 || M > 4096 || N < (1 << COOP_N_LOG2_BASE))
         return -1;
     const int mi = ilog2_floor(M);
-    int ni       = ilog2_floor(N) - COOP_N_LOG2_BASE;
+    int ni       = coop_bucket_of(N);
     if(mi >= COOP_TAB_M || ni < 0)
         return -1;
     if(ni >= COOP_TAB_N)
