@@ -420,19 +420,29 @@ class AITER_CONFIG:
                     .index
                 )
 
-                # Runtime config discovery must be read-only, so the duplicates
-                # are resolved in the merged temporary view rather than by
-                # rewriting shipped or user-provided source CSVs as an import
-                # side effect. The error still has to be raised: a duplicate
-                # shape means two configs disagree about the same key, and
-                # which one wins would otherwise depend on merge order. Silently
-                # picking the lowest 'us' hides that from whoever added the row.
-                merge_df = merge_df.loc[sorted(best_row_index)].reset_index(drop=True)
+                saved_files = []
+                offset = 0
+                for src_path, src_df in source_pairs:
+                    start, end = offset, offset + len(src_df)
+                    offset = end
+                    file_rows = merge_df.iloc[start:end]
+                    new_src_df = file_rows[
+                        file_rows.index.isin(best_row_index)
+                    ].reset_index(drop=True)
+                    if len(new_src_df) < len(src_df):
+                        new_src_df.to_csv(src_path, index=False)
+                        saved_files.append(
+                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
+                        )
+                saved_info = (
+                    "\n".join(saved_files) if saved_files else "  (no files updated)"
+                )
                 raise RuntimeError(
                     f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Remove the duplicates from the source config files; the lowest-'us' "
-                    f"entry per shape is the one to keep. Source files were left unchanged.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
+                    f"and saved back to source config files. Please re-run.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+                    f"Updated files:\n{saved_info}"
                 )
         else:
             logger.warning(
