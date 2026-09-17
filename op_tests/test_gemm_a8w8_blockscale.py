@@ -119,12 +119,18 @@ def test_gemm(
     apre=False,
     hipblaslt_winner_dir=None,
     hipblaslt_bridge=None,
+    hipblaslt_public_bridge=None,
 ):
     ret = {}
-    if hipblaslt_winner_dir and (
+    compare_hipblaslt = hipblaslt_winner_dir or hipblaslt_public_bridge
+    if compare_hipblaslt and (
         not use_flydsl or not ck_preshuffle or dtype != dtypes.bf16
     ):
-        raise ValueError("Winner comparison requires --flydsl, preshuffle, BF16")
+        raise ValueError("hipBLASLt comparison requires --flydsl, preshuffle, BF16")
+    if hipblaslt_public_bridge:
+        # A tuned device library may contain only the target FP8 problem.
+        # Keep the untimed FP32 reference GEMM on hipBLAS/rocBLAS.
+        torch.backends.cuda.preferred_blas_library("hipblas")
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -169,7 +175,7 @@ def test_gemm(
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     # Explicit outputs make input AND output rotation identical in a comparison.
     # Otherwise FlyDSL could reuse an allocator output while Tensile rotates D.
-    if hipblaslt_winner_dir:
+    if compare_hipblaslt:
         fly_out = torch.empty((m, n), dtype=dtype, device=x.device)
         b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype, fly_out)
     else:
@@ -208,7 +214,7 @@ def test_gemm(
             dtype,
             (
                 torch.empty((m, n), dtype=dtype, device=x.device)
-                if hipblaslt_winner_dir
+                if compare_hipblaslt
                 else None
             ),
         )
@@ -218,16 +224,22 @@ def test_gemm(
         ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
         ret["apre/ck"] = avg_e / avg_b
 
-    if hipblaslt_winner_dir:
-        from hipblaslt_winner import HipblasltWinner, pack_scales
+    if compare_hipblaslt:
+        from hipblaslt_winner import pack_scales
 
         if m % 128 or n % 128 or k % 128:
-            raise ValueError("Winner comparison requires dimensions divisible by 128")
+            raise ValueError(
+                "hipBLASLt comparison requires dimensions divisible by 128"
+            )
+        scale_a_mx32 = pack_scales(x_scale_raw)
+        scale_b_mx32 = pack_scales(w_scale_raw, repeat_rows=128)
+
+    if hipblaslt_winner_dir:
+        from hipblaslt_winner import HipblasltWinner
+
         winner = HipblasltWinner(hipblaslt_winner_dir, hipblaslt_bridge, m, n, k)
         print(f"hipBLASLt/Tensile explicit winner: {winner.name}", flush=True)
         # Packing is excluded for both implementations, as in the existing test.
-        scale_a_mx32 = pack_scales(x_scale_raw)
-        scale_b_mx32 = pack_scales(w_scale_raw, repeat_rows=128)
         out_lt = torch.empty((n, m), dtype=dtype, device=x.device).t()
         workspace = torch.empty(
             (max(winner.workspace_size, 1),), dtype=torch.uint8, device=x.device
@@ -266,6 +278,63 @@ def test_gemm(
         finally:
             torch.cuda.synchronize()
             winner.close()
+
+    if hipblaslt_public_bridge:
+        from hipblaslt_winner import HipblasltPublic
+
+        public = HipblasltPublic(hipblaslt_public_bridge, m, n, k)
+        print(
+            f"hipBLASLt public heuristic: index={public.index} "
+            f"solution={public.name}",
+            flush=True,
+        )
+        public_out = torch.empty((n, m), dtype=dtype, device=x.device).t()
+        public_workspace = torch.empty(
+            (max(public.workspace_size, 1),), dtype=torch.uint8, device=x.device
+        )
+        public_args = (
+            x,
+            weight,
+            scale_a_mx32,
+            scale_b_mx32,
+            public_out,
+            public_workspace,
+        )
+        try:
+            public_result = public.run(*public_args)
+            torch.cuda.synchronize()
+            expected_public = public_result.clone()
+            ret["hipblaslt public index"] = public.index
+            ret["hipblaslt public solution"] = public.name
+            ret["hipblaslt public err"] = checkAllclose(
+                a,
+                public_result,
+                msg="hipblaslt public",
+                catastrophic_check=True,
+            )
+            ret["hipblaslt public/flydsl diff"] = (
+                (public_result != b).float().mean().item()
+            )
+            if apre:
+                ret["hipblaslt public/apre diff"] = (
+                    (public_result != e).float().mean().item()
+                )
+            run_public = perftest(
+                num_iters=TEST_NUM_ITERS,
+                num_rotate_args=TEST_NUM_ROTATE,
+                testGraph=TEST_GRAPH,
+            )(public.run)
+            public_result, avg_public = run_public(*public_args)
+            if not torch.equal(public_result, expected_public):
+                raise RuntimeError(
+                    "public hipBLASLt result changed during repeated launches"
+                )
+            ret["hipblaslt public us"] = avg_public
+            ret["hipblaslt public TFLOPS"] = m * n * k * 2 / avg_public / 1e6
+            ret["flydsl/hipblaslt public"] = avg_b / avg_public
+        finally:
+            torch.cuda.synchronize()
+            public.close()
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
@@ -530,10 +599,16 @@ parser.add_argument(
     "--hipblaslt-bridge",
     help="Path to libwinner_bridge.so built against the winner's Tensile checkout",
 )
+parser.add_argument(
+    "--hipblaslt-public-bridge",
+    help="Path to a public hipBLASLt pybind module",
+)
 
 args = parser.parse_args()
 if args.hipblaslt_winner_dir and not args.hipblaslt_bridge:
     parser.error("--hipblaslt-winner-dir requires --hipblaslt-bridge")
+if args.hipblaslt_winner_dir and args.hipblaslt_public_bridge:
+    parser.error("choose either the direct winner or public hipBLASLt comparison")
 
 data_init_list = args.data_init or ["constant", "uniform"]
 scale_init_list = args.scale_init or ["constant", "auto"]
@@ -579,6 +654,7 @@ if args.csv is not None:
                             apre=apre,
                             hipblaslt_winner_dir=args.hipblaslt_winner_dir,
                             hipblaslt_bridge=args.hipblaslt_bridge,
+                            hipblaslt_public_bridge=args.hipblaslt_public_bridge,
                         )
                         df.append(ret)
 else:
@@ -601,6 +677,7 @@ else:
                                 apre=apre,
                                 hipblaslt_winner_dir=args.hipblaslt_winner_dir,
                                 hipblaslt_bridge=args.hipblaslt_bridge,
+                                hipblaslt_public_bridge=args.hipblaslt_public_bridge,
                             )
                             df.append(ret)
 
