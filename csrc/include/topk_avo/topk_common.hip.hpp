@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // GENERATED FILE -- DO NOT EDIT.
 //
 // Source of truth: the topk-prefill-avo repo. Regenerate with
