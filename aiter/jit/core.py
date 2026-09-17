@@ -150,6 +150,11 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
     "AITER_CONFIG_A8W8_BATCHED_GEMM",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
@@ -181,11 +186,6 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
-)
-
-AITER_CONFIG_GDR_DECODE = os.getenv(
-    "AITER_CONFIG_GDR_DECODE",
-    f"{AITER_ROOT_DIR}/aiter/configs/gdr_decode_tuned.csv",
 )
 
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
@@ -280,6 +280,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE,
+            "a8w8_blockscale_abpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_A8W8_BATCHED_GEMM_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_A8W8_BATCHED_GEMM",
@@ -300,10 +308,6 @@ class AITER_CONFIG:
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
         )
-
-    @property
-    def AITER_CONFIG_GDR_DECODE_FILE(self):
-        return AITER_CONFIG_GDR_DECODE
 
     @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):

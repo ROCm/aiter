@@ -1,0 +1,7 @@
+{
+    "N_LEQ_32": { "num_warps": 1 },
+    "N_LEQ_64": { "num_warps": 2 },
+    "N_LEQ_128": { "num_warps": 4 },
+    "N_LEQ_256": { "num_warps": 8 },
+    "any": { "num_warps": 8 }
+}

@@ -440,6 +440,8 @@ def _grouped_a8w4_tdm_moe(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    tdm_as_in_prologue=0,
+    tdm_b_th=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -519,6 +521,14 @@ def _grouped_a8w4_tdm_moe(
         # Route kernel writes every entry (kept -> weight_dtype cast, dropped -> 0),
         # so the buffer is left uninitialised (fully kernel-written).
         _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
+        # Pre-allocate ep_rowmap so the route kernel can fuse its sentinel fill
+        # (fire-and-forget stores interleaved with route work, no extra barrier).
+        _ep_rowmap_for_route = None
+        if enable_ep_scatter:
+            ep_rowmap = torch.empty(
+                (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
+            )
+            _ep_rowmap_for_route = ep_rowmap
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
             topk_ids,
             E,
@@ -529,18 +539,15 @@ def _grouped_a8w4_tdm_moe(
             counter=_g2l_counter,
             num_local_tokens=num_local_tokens,
             num_valid_routes=_ep_nvr,
+            ep_rowmap=_ep_rowmap_for_route,
         )
     else:
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-    # EP gemm2-fused scatter: build the ep_rowmap inside the remap pass, which
-    # already knows each route's final contiguous row, so the gemm2 TDM epilogue
-    # can P2P each weighted row into peers' comb_inp.
+        ep_rowmap = None
+    # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
+    # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
     ep_scatter_params = None
-    ep_rowmap = None
     if enable_ep_scatter:
-        ep_rowmap = torch.empty(
-            (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
-        )
         ep_scatter_params = {
             "gather_w": _gather_w_buf,
             "tis": stage2_scatter.source_token_map,
@@ -640,6 +647,7 @@ def _grouped_a8w4_tdm_moe(
     _row_major_ascale = (
         not _prequantized
         and int(topk) == 6
+        and not tdm_as_in_prologue
         and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "1") in ("1", "true", "True")
     )
 
@@ -708,6 +716,8 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
             row_major_ascale=int(_row_major_ascale),
             **_situ_kw,
         )
@@ -739,6 +749,8 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
             row_major_ascale=int(_row_major_ascale),
             **_situ_kw,
         )
@@ -779,6 +791,8 @@ def _grouped_a8w4_tdm_moe(
         cluster_n=cluster_n,
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
+        tdm_as_in_prologue=tdm_as_in_prologue,
+        tdm_b_th=tdm_b_th,
         **_ep_gemm2_kwargs,
     )
 
@@ -816,6 +830,8 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        tdm_as_in_prologue=tdm_as_in_prologue,
+                        tdm_b_th=tdm_b_th,
                         **_situ_kw,
                     ),
                 )
@@ -850,6 +866,8 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        tdm_as_in_prologue=tdm_as_in_prologue,
+                        tdm_b_th=tdm_b_th,
                         **_situ_kw,
                     ),
                 )
@@ -882,6 +900,8 @@ def _grouped_a8w4_tdm_moe(
                     cluster_n=cluster_n,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
+                    tdm_as_in_prologue=tdm_as_in_prologue,
+                    tdm_b_th=tdm_b_th,
                 ),
             )
         )
@@ -1133,6 +1153,10 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["next_stage_prefetch"] = _as_int(
                 cfg_row.get("next_stage_prefetch"), 0
             )
+            _tdm_kw["tdm_as_in_prologue"] = _as_int(
+                cfg_row.get("tdm_as_in_prologue"), 0
+            )
+            _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
@@ -1412,9 +1436,8 @@ def contiguous_psum_remap(
         )
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
-        # Init ep_rowmap to (-1, 0) with one int64 fill (low i32 = -1, high = 0);
-        # stream-ordered before the launch, whose scatter overwrites the kept rows.
-        ep_scatter_params["ep_rowmap"].view(torch.int64).fill_(0xFFFFFFFF)
+        # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
+        # interleaved with route work for free.  No host .fill_() needed.
         launch(
             ptr_arg(masked_m_i32),
             ptr_arg(topids_flat),
