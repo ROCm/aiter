@@ -194,6 +194,7 @@ def main():
         for rank in args.ep_ranks:
             mask = _expert_mask(rank)
             launchers = {}
+            live_outputs = {}
             outputs = {}
             metadata = {}
             for arm, files in arms.items():
@@ -223,8 +224,15 @@ def main():
                     for _ in range(3):
                         launch()
                     launchers[arm] = launch
+                live_outputs[arm] = output
                 outputs[arm] = output.clone()
 
+            repeats = {}
+            for arm, files in arms.items():
+                _install_config(fused_moe, files)
+                launchers[arm]()
+                torch.cuda.synchronize()
+                repeats[arm] = live_outputs[arm].clone()
             baseline_f64 = outputs["baseline"].double()
             candidate_f64 = outputs["candidate"].double()
             delta = candidate_f64 - baseline_f64
@@ -261,12 +269,25 @@ def main():
                             "baseline": bool(torch.isfinite(baseline_f64).all()),
                             "candidate": bool(torch.isfinite(candidate_f64).all()),
                         },
+                        "repeat": {
+                            arm: {
+                                "bitwise_equal": bool(
+                                    torch.equal(outputs[arm], repeats[arm])
+                                ),
+                                "max_abs_delta": float(
+                                    (outputs[arm].double() - repeats[arm].double())
+                                    .abs()
+                                    .max()
+                                ),
+                            }
+                            for arm in arms
+                        },
                         "samples_us": samples,
                     }
                 ),
                 flush=True,
             )
-            del launchers, outputs, metadata, mask
+            del launchers, live_outputs, outputs, repeats, metadata, mask
             gc.collect()
             torch.cuda.empty_cache()
         del hidden, expert_ids, routing_weights
