@@ -32,6 +32,7 @@ from .conv3d_gfx950_utils import (
     OOB_SENTINEL_BYTES,
     OOB_SENTINEL_ELEM,
     ConvGeometry,
+    TileConfig,
     dil,
     flat_buffer_view,
     gather_valid,
@@ -85,11 +86,9 @@ class Im2colPlan(NamedTuple):
     # may be: it is a tuple, so its own fields still reach the cache key.
     geom: ConvGeometry
 
-    # The A tile this gather fills, taken from the launch config.
-    tile_m: int
-    tile_k: int
-    block_threads: int
-    ldg_a_count: int
+    # The A tile this gather fills. Nested, which a NamedTuple may be: it is
+    # a tuple, so its own fields still reach the cache key.
+    cfg: TileConfig
 
     # Addressing decisions derived from the above.
     temporal_only_fast: bool
@@ -102,7 +101,7 @@ class Im2colPlan(NamedTuple):
     x_sample_elems: int
 
 
-def make_im2col_plan(param, geom, *, tile_m, tile_k, block_threads, ldg_a_count):
+def make_im2col_plan(param, geom, cfg):
     """An Im2colPlan for one problem and launch config, or an assertion.
 
     Takes the problem as the ``Conv3dImplicitParam`` the caller already has,
@@ -114,6 +113,7 @@ def make_im2col_plan(param, geom, *, tile_m, tile_k, block_threads, ldg_a_count)
     tile. They are the gather's, not the launch config's, so they cannot move
     into ``validate_launch_config``.
     """
+    tile_m, tile_k = cfg.tile_m, cfg.tile_k
     n, c, d, h, w = param.n, param.c, param.d, param.h, param.w
     kt, kh, kw = param.kt, param.kh, param.kw
     st, sh, sw = param.st, param.sh, param.sw
@@ -188,10 +188,7 @@ def make_im2col_plan(param, geom, *, tile_m, tile_k, block_threads, ldg_a_count)
         pad_mode=pad_mode,
         groups=groups,
         geom=geom,
-        tile_m=tile_m,
-        tile_k=tile_k,
-        block_threads=block_threads,
-        ldg_a_count=ldg_a_count,
+        cfg=cfg,
         # A 1x1 filter at unit stride and no spatial padding leaves the H and W
         # taps fixed, so the row's own offset already addresses them and only
         # the T tap moves: a whole filter's worth of division collapses.
@@ -260,7 +257,7 @@ class Im2colGather:
     def taps(self, k_base):
         """Yield ``(i, src, voff)`` per A vector of the K tile at ``k_base``."""
         assert self._rows is not None, "bind_block() before taps()"
-        plan, geom = self._plan, self._plan.geom
+        plan, geom, cfg = self._plan, self._plan.geom, self._plan.cfg
         kbase_i = fx.Int64(k_base)
         cc_base = ckk_base = None
         if const_expr(plan.scalar_k):
@@ -268,7 +265,7 @@ class Im2colGather:
             if const_expr(plan.groups > 1):
                 cc_base = self._ch_base + cc_base
             ckk_base = kbase_i // geom.cgp
-        for i in range_constexpr(plan.ldg_a_count):
+        for i in range_constexpr(cfg.ldg_a_count):
             g_off, valid, sample = self._tap_addr(i, kbase_i, cc_base, ckk_base)
             yield (
                 i,
@@ -314,12 +311,12 @@ class Im2colGather:
         Held as the input coordinate each of those taps starts from, since the
         filter tap is all that is added per K tile.
         """
-        plan, geom = self._plan, self._plan.geom
+        plan, geom, cfg = self._plan, self._plan.geom, self._plan.cfg
         rows = []
-        for i in range_constexpr(plan.ldg_a_count):
-            linear = (self._tid + i * plan.block_threads) * LDG_VEC
-            local_m = linear // plan.tile_k
-            local_k = linear % plan.tile_k
+        for i in range_constexpr(cfg.ldg_a_count):
+            linear = (self._tid + i * cfg.block_threads) * LDG_VEC
+            local_m = linear // cfg.tile_k
+            local_k = linear % cfg.tile_k
             row = m_offset + local_m
             row_valid = row < fx.Int64(geom.npq)
             if const_expr(plan.temporal_only_fast):
