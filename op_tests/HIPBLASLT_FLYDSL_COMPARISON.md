@@ -51,6 +51,31 @@ that the pybind module binds to the rebuilt library. The public comparison uses
 check confirmed that the bridge's `hipblasLtMatmulAlgoGetHeuristic` and
 `hipblasLtMatmul` symbols resolve to that rebuilt file.
 
+## Native profile/config check
+
+A second run enabled hipBLASLt's own profile logger with
+`HIPBLASLT_LOG_MASK=64`; it did not use rocprofv3. The run used the same rebuilt
+host library, generated device-library directory, Python benchmark, and input
+configuration as the main comparison. The native log emitted one aggregated
+entry per shape with 203 calls per entry.
+
+| N | K | YAML `ExactLogic` index | Native profile index | Match | FlyDSL B (us) | Rebuilt hipBLASLt (us) |
+|---:|---:|---:|---:|:---:|---:|---:|
+| 6144 | 7168 | 0 | 0 | yes | 14.057 | 15.531 |
+| 7168 | 3072 | 1 | 1 | yes | 8.276 | 8.808 |
+| 7168 | 16384 | 2 | 2 | yes | 24.662 | 29.071 |
+| 65536 | 1536 | 3 | 3 | yes | 21.707 | 22.136 |
+| 2048 | 7168 | 4 | 4 | yes | 9.416 | 10.982 |
+| 8192 | 1536 | 5 | 5 | yes | 5.471 | 5.801 |
+
+The compact profile check is in
+[the native profile CSV](hipblaslt_tuning/rebuilt_public_profile_check.csv).
+The full solution name reported through the public API also equals
+`Solutions[index].SolutionNameMin` for every row. These two checks confirm that
+the rebuilt public API used all six entries from the merged config. The clean
+timings above remain the primary performance result; this logged run is an
+independent selection check.
+
 ## Why tuning did not broadly improve performance
 
 Every tuning input contains one candidate and every run reports
