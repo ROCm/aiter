@@ -366,6 +366,25 @@ win claim.
 | 1 | 32768 | 8192 | 2051 | 10706.1 | 11.2 | 0 | 0 |
 | 8 | 32768 | 8192 | 2051 | 11013.9 | 16.2 | 0 | 0 |
 
+## Phase 3b — family A FlyDSL K2 split-K (decode occupancy)
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Same `qsa_k2_family_a`
+ABI: split-K along the expanded list (64 splits when ``M * Hk <= 8``)
+plus an LSE merge. Oracle `err=0`. ~100× vs 3a at ``M=1`` (~103 µs vs
+~10.6 ms); still ~10× live AMD (~10 µs). Not a win claim.
+
+| m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | flydsl_k2 err | vllm_amd_gqa err |
+|--:|--------:|---------:|------:|-------------:|----------------:|--------------:|-----------------:|
+| 1 | 512 | 128 | 2051 | 101.3 | 10.0 | 0 | 0 |
+| 8 | 512 | 128 | 2051 | 236.8 | 13.3 | 0 | 0 |
+| 1 | 2048 | 512 | 2051 | 103.3 | 10.2 | 0 | 0 |
+| 8 | 2048 | 512 | 2051 | 247.9 | 16.0 | 0 | 0 |
+| 1 | 8192 | 2048 | 2051 | 103.6 | 10.3 | 0 | 0 |
+| 8 | 8192 | 2048 | 2051 | 245.7 | 16.2 | 0 | 0 |
+| 1 | 32768 | 8192 | 2051 | 103.7 | 10.2 | 0 | 0 |
+| 8 | 32768 | 8192 | 2051 | 245.0 | 16.2 | 0 | 0 |
+
+
 
 
 
