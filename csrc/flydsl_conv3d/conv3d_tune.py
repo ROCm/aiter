@@ -54,6 +54,9 @@ from aiter.ops.flydsl.conv_kernels import (
     TUNED_DEVICE_COLUMNS,
     TUNED_KEY_COLUMNS,
     TUNED_RESULT_COLUMNS,
+    _is_matmul_fast_path,
+    _pad_channels,
+    _parse_tuned_bool,
 )
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
@@ -97,9 +100,9 @@ def _row_params(row):
     }
 
 
-def generate_data(
-    n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device="cuda:0"
-):
+def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device=None):
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(seed)
     x = torch.randn((n, c, d, h, w), device=device, dtype=dtypes.bf16)
     weight = torch.randn((k, c // groups, kt, kh, kw), device=device, dtype=dtypes.bf16)
@@ -119,8 +122,7 @@ def conv3d_ref(x, weight, bias, params):
 def _shape_key(row):
     """One row's shape identity, normalized so both CSVs hash the same way."""
     return tuple(
-        str(v).strip().lower() == "true" if c == "bias" else int(v)
-        for c, v in zip(SHAPE_KEYS, row)
+        _parse_tuned_bool(v) if c == "bias" else int(v) for c, v in zip(SHAPE_KEYS, row)
     )
 
 
@@ -179,6 +181,18 @@ class Conv3dTuner(TunerCommon):
         k = (int(kv["C"]) // groups) * int(kv["kT"]) * int(kv["kH"]) * int(kv["kW"])
         return m, n, k, (do, ho, wo)
 
+    def _drop_matmul_fast_path(self):
+        if self.untunedf is None or self.untunedf.empty:
+            return
+        skip = self.untunedf.apply(_is_matmul_fast_path, axis=1)
+        n_matmul = int(skip.sum())
+        if n_matmul:
+            logger.info(
+                f"skipping {n_matmul} 1x1 stride-1 pad-0 shapes "
+                "(torch.matmul fast path; no kernel to tune)"
+            )
+            self.untunedf = self.untunedf[~skip].reset_index(drop=True)
+
     def pre_process(self, args):
         """Load untuned shapes, stamp the device keys, drop already-tuned rows."""
         # sortResults reorders against this file, and by then untunedf has had
@@ -186,11 +200,13 @@ class Conv3dTuner(TunerCommon):
         self._untune_file = args.untune_file
         if args.all:
             self.get_retune_gemm_list(args)
+            self._drop_matmul_fast_path()
             return
         self.untunedf = self.get_untuned_gemm_list(args.untune_file)
         self.untunedf["gfx"] = self.get_gfx()
         self.untunedf["cu_num"] = self.get_cu_num()
         self.untunedf = self.untunedf[self.keys]
+        self._drop_matmul_fast_path()
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
         if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
             self.tunedf.insert(0, "gfx", self.get_gfx())
@@ -215,7 +231,7 @@ class Conv3dTuner(TunerCommon):
         n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
         k, kt, kh, kw = (int(kv[x]) for x in ("K", "kT", "kH", "kW"))
         groups = int(kv["groups"])
-        has_bias = str(kv["bias"]).lower() == "true"
+        has_bias = _parse_tuned_bool(kv["bias"])
         params = _row_params(kv)
         m_gemm, n_gemm, _k_gemm, _ = self._gemm_dims(keys)
 
@@ -225,7 +241,7 @@ class Conv3dTuner(TunerCommon):
 
         # crs is built from the *padded* per-group channel count, matching what
         # the kernel computes; splitK divisibility depends on it.
-        cgp = -(-(c // groups) // 8) * 8
+        cgp = _pad_channels(c // groups)
         crs = cgp * kt * kh * kw
 
         tasks = []
@@ -453,13 +469,11 @@ class Conv3dTuner(TunerCommon):
             n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
             k, kt, kh, kw = (int(kv[x]) for x in ("K", "kT", "kH", "kW"))
             groups = int(kv["groups"])
-            has_bias = str(kv["bias"]).lower() == "true"
+            has_bias = _parse_tuned_bool(kv["bias"])
             params = _row_params(kv)
             shape = f"{n}x{c}x{d}x{h}x{w}->{k} {kt}x{kh}x{kw}"
             try:
-                data = generate_data(
-                    n, c, d, h, w, k, kt, kh, kw, groups, has_bias, device="cuda:0"
-                )
+                data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
                 # Best of a few, not a single reading: the gate's threshold is
                 # 3%, so a one-shot measurement whose own spread exceeds that
                 # decides by noise.
