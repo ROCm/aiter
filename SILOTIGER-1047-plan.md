@@ -549,6 +549,14 @@ here; keeping the 8-split cap is ~1.12–1.29 ms. Both lose to the
 ~90 KB LDS (over gfx942's 64 KB) and four N-subtiles of QK/PV. Decode
 stays ``BLOCK_N=16``.
 
+Folding the P LDS barrier by running softmax on every wave and
+``shuffle_idx``-transposing P into the PV A fragment was measured and
+**not shipped**. Decode was flat-to-worse (~19.8–20.1 µs at ``M=1``).
+Prefill ~0.66 ms vs the kept ~0.52–0.55 ms, with ~0.002–0.007% of
+elements outside ``1e-2`` at ``M=512``. The four-wave ``exp`` plus
+per-lane shuffles cost more than the barrier they replaced. Loop-top +
+K/V + C + P barriers stay.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
