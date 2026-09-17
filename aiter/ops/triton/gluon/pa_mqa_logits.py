@@ -209,37 +209,70 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
         >= 0
     )
+    # Preserve scalar-first address arithmetic for per-token paging. Grouping
+    # the token offsets first increases register pressure on that path.
+    kv_table_offsets = (
+        pid_batch * max_block_len
+        + split_context_start
+        - residual_context
+        + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+    )
+    if KVBlockSize > 1:
+        logical_kv_idx_next = (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+        )
+        kv_table_offsets = (
+            pid_batch * max_block_len + logical_kv_idx_next // KVBlockSize
+        )
     context_kv_idx_next = gl.amd.cdna3.buffer_load(
         ptr=kv_indices,
-        offsets=pid_batch * max_block_len
-        + split_context_start
-        - residual_context
-        + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
+        offsets=kv_table_offsets,
         mask=mask_kv_next,
     )
-    context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
-        ptr=kv_indices,
-        offsets=pid_batch * max_block_len
+    scale_table_offsets = (
+        pid_batch * max_block_len
         + split_context_start
         - residual_context
-        + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
+        + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+    )
+    if KVBlockSize > 1:
+        logical_kv_scale_idx_next = (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+        )
+        scale_table_offsets = (
+            pid_batch * max_block_len + logical_kv_scale_idx_next // KVBlockSize
+        )
+    context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
+        ptr=kv_indices,
+        offsets=scale_table_offsets,
         mask=mask_kv_scale_next,
     )
 
     mfma_q = gl.convert_layout(q, mfma_layout_a)
 
+    # The backward-shifted first tile can contain negative token positions.
+    # Send those masked lanes to token 0 of block 0, including its scale.
     context_kv_idx_next = tl.where(mask_kv_next, context_kv_idx_next, 0)
-    k_next = gl.amd.cdna3.buffer_load(
-        ptr=KV_buffer,
-        offsets=context_kv_idx_next[:, None] * stride_k_seq
-        + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :],
+    kv_offsets = (
+        context_kv_idx_next[:, None] * stride_k_seq
+        + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :]
     )
+    if KVBlockSize > 1:
+        kv_offsets += (gl.maximum(logical_kv_idx_next, 0) % KVBlockSize)[
+            :, None
+        ] * HiddenDim
+    k_next = gl.amd.cdna3.buffer_load(ptr=KV_buffer, offsets=kv_offsets)
     context_kv_scale_idx_next = tl.where(
         mask_kv_scale_next, context_kv_scale_idx_next, 0
     )
-    k_scale_f_next = gl.amd.cdna3.buffer_load(
-        ptr=scale_buffer, offsets=context_kv_scale_idx_next * stride_scale_seq
-    )
+    scale_offsets = context_kv_scale_idx_next * stride_scale_seq
+    if KVBlockSize > 1:
+        scale_offsets += gl.maximum(logical_kv_scale_idx_next, 0) % KVBlockSize
+    k_scale_f_next = gl.amd.cdna3.buffer_load(ptr=scale_buffer, offsets=scale_offsets)
 
     zero = gl.zeros((ChunkQ, ChunkK), dtype=tl.float32, layout=mfma_layout)
     for context_idx in range(
@@ -250,19 +283,42 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         k = k_next
         k_scale_f = k_scale_f_next
 
+        kv_table_offsets = (
+            pid_batch * max_block_len
+            + context_idx
+            + ChunkK
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+        )
+        if KVBlockSize > 1:
+            logical_kv_idx_next = (
+                context_idx
+                + ChunkK
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+            )
+            kv_table_offsets = (
+                pid_batch * max_block_len + logical_kv_idx_next // KVBlockSize
+            )
         context_kv_idx_next = gl.amd.cdna3.buffer_load(
             ptr=kv_indices,
-            offsets=pid_batch * max_block_len
-            + context_idx
-            + ChunkK
-            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
+            offsets=kv_table_offsets,
         )
-        context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
-            ptr=kv_indices,
-            offsets=pid_batch * max_block_len
+        scale_table_offsets = (
+            pid_batch * max_block_len
             + context_idx
             + ChunkK
-            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+        )
+        if KVBlockSize > 1:
+            logical_kv_scale_idx_next = (
+                context_idx
+                + ChunkK
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            )
+            scale_table_offsets = (
+                pid_batch * max_block_len + logical_kv_scale_idx_next // KVBlockSize
+            )
+        context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
+            ptr=kv_indices, offsets=scale_table_offsets
         )
 
         #!=----------------------------
@@ -279,19 +335,24 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
         #!=----------------------------
-        k_next = gl.amd.cdna3.buffer_load(
-            ptr=KV_buffer,
-            offsets=context_kv_idx_next[:, None] * stride_k_seq
-            + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :],
+        kv_offsets = (
+            context_kv_idx_next[:, None] * stride_k_seq
+            + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :]
         )
+        if KVBlockSize > 1:
+            kv_offsets += (logical_kv_idx_next % KVBlockSize)[:, None] * HiddenDim
+        k_next = gl.amd.cdna3.buffer_load(ptr=KV_buffer, offsets=kv_offsets)
         o = gl.maximum(o, 0.0)
         o = o * scale_weight[:, None]
 
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
         #!=----------------------------
+        scale_offsets = context_kv_scale_idx_next * stride_scale_seq
+        if KVBlockSize > 1:
+            scale_offsets += logical_kv_scale_idx_next % KVBlockSize
         k_scale_f_next = gl.amd.cdna3.buffer_load(
-            ptr=scale_buffer, offsets=context_kv_scale_idx_next * stride_scale_seq
+            ptr=scale_buffer, offsets=scale_offsets
         )
 
         mask = (
