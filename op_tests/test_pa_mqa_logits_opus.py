@@ -337,8 +337,8 @@ def window_is_written(out, ls, le):
     """Every cell inside [local_start, local_end) must have been stored to.
 
     `check_rows` would also catch a dropped token -- an in-window -inf never compares
-    close -- but only on the rows `sample_rows` happened to pick, so it stops
-    being a guard as soon as a case has more rows than that. This scans every row.
+    close -- but only on the rows it was handed, which the perf sweeps sample down to
+    `N_COS_SAMPLE`. This scans every row regardless of what was scored.
     """
     col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
     inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
@@ -351,6 +351,18 @@ def sample_rows(total, le, n=N_COS_SAMPLE, seed=0):
         return []
     rng = random.Random(seed)
     return sorted(rng.sample(nonempty, min(n, len(nonempty))))
+
+
+def nonempty_rows(le):
+    """Every row with a window. What the CORNER cases score against the reference.
+
+    `sample_rows` exists for the perf sweeps, where a 16384-row shape materializes a
+    ~1 GB score matrix per row and scoring all of them is not affordable. A corner case is
+    at most 12 rows, so sampling 8 of them there buys nothing and means a wrong value in an
+    unpicked row passes -- `window_is_written` and `oob_is_neginf` already scan every row,
+    but they check finite-vs--inf state, not the logit.
+    """
+    return torch.nonzero(le > 0).flatten().tolist()
 
 
 # ── FlyDSL candidates (second opinion on the scale layout) ────────────────────
@@ -460,7 +472,7 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label, cross_flydsl=True
     )  # fmt: skip
     torch.cuda.synchronize()
 
-    rows = sample_rows(total_q, le, seed=seed)
+    rows = nonempty_rows(le)
     err = check_rows(
         out, ref_rows(inp, rows, rb, ls, le), f"prefill {label} bk={block_k}"
     )
@@ -527,7 +539,7 @@ def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None
     )  # fmt: skip
     torch.cuda.synchronize()
 
-    rows = sample_rows(total_q, le, seed=seed)
+    rows = nonempty_rows(le)
     err = check_rows(
         out, ref_rows(inp, rows, rb, ls, le), f"decode {label} bk={block_k}"
     )
@@ -680,8 +692,8 @@ def run_corner():
         # `KNOWN_ISSUE_out_store_alignment.md` (opus-ops) reports dropping the leading
         # (4 - start%4) % 4 in-window tokens on. Width 40 and starts past 16 are that
         # doc's own experiment; it calls the sub-16 region an incidental exemption not to
-        # be relied on, so both are covered. `max_err` catches a dropped token (an
-        # in-window -inf makes it infinite) and `oob_is_neginf` catches the opposite
+        # be relied on, so both are covered. `check_rows` catches a dropped token (an
+        # in-window -inf never compares close) and `oob_is_neginf` catches the opposite
         # failure, a store leaking past the window.
         #
         # No FlyDSL second opinion: at num_warps=1 it exhibits exactly that bug, dropping
