@@ -653,7 +653,11 @@ def v2_stage1_output_error(ref, res, msg="", printLog=True, *, inter_dim, adtype
     tensors are compared as E8M0 exponents; a one-exponent difference is
     tolerated, while larger differences count toward the error ratio.
     """
-    if ref.dtype == torch.uint8 and res.dtype == torch.uint8 and ref.shape == res.shape:
+    if ref.dtype == torch.uint8 and res.dtype == torch.uint8:
+        if ref.numel() != res.numel():
+            return 1.0
+        ref = ref.flatten()
+        res = res.flatten()
         valid = ref != 0
         if not valid.any():
             return 0.0

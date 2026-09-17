@@ -30,7 +30,7 @@ def test_a8w4_stage1_runtime_contract_uses_real_scales():
 
 def test_v2_stage1_scale_oracle_rejects_large_exponent_errors():
     reference = torch.tensor([120, 121, 122, 123], dtype=torch.uint8)
-    within_one_exponent = torch.tensor([119, 122, 121, 124], dtype=torch.uint8)
+    within_one_exponent = torch.tensor([[119, 122], [121, 124]], dtype=torch.uint8)
     wrong_scale = torch.tensor([127, 127, 127, 127], dtype=torch.uint8)
 
     assert (
