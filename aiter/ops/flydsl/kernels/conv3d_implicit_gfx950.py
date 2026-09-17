@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
-#
-# ruff: noqa: B023
-# The epilogue builds small closures over the tile loops and calls each one
-# inside the same iteration, so the loop variable always holds the current
-# value. Binding them as default arguments is not possible -- `bias_val` only
-# exists on the has_bias path -- and per-line waivers do not survive
-# `ruff format`, which moves the flagged column onto continuation lines.
 
 """Double-buffered implicit-GEMM conv3d (BF16), vendored into aiter.
 
@@ -46,7 +39,6 @@ from .conv3d_gfx950_utils import (
     BF16_BYTES,
     CONV_COMPILE_HINTS,
     LDG_VEC,
-    MFMA_C_VALUES,
     MFMA_M,
     MFMA_N,
     OOB_SENTINEL_BYTES,
@@ -54,11 +46,11 @@ from .conv3d_gfx950_utils import (
     WARP_SIZE,
     _as_stream,
     barrier,
-    buffer_atomic_add,
     flat_buffer_view,
     sgpr,
 )
 from .conv3d_im2col import Im2colGather, make_conv_geometry, make_im2col_plan
+from .conv3d_scatter import OutputScatter, make_output_scatter_plan
 
 TILE_K = 32
 
@@ -213,12 +205,12 @@ def make_conv3d_implicit_param(
 # would evict entries that the same process still needs.
 @functools.lru_cache(maxsize=1024)
 def compile_conv3d_implicit(param: Conv3dImplicitParam):
-    # Only what shapes the GEMM, the grid and the epilogue. The filter extents,
-    # strides, padding and dilation are the gather's alone and reach it through
-    # the im2col plan below, which is why they are not unpacked here.
-    n, c, k = param.n, param.c, param.k
-    has_bias, splitk = param.has_bias, param.splitk
-    tile, wgm, groups, out_ndhwc = param.tile, param.wgm, param.groups, param.out_ndhwc
+    # Only what sizes the GEMM and its grid. The filter extents, strides,
+    # padding and dilation belong to the gather, and the output layout and
+    # bias to the scatter; each reaches its own plan below from `param`
+    # directly, which is why none of them is unpacked here.
+    c, k = param.c, param.k
+    splitk, tile, wgm, groups = param.splitk, param.tile, param.wgm, param.groups
 
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
@@ -238,9 +230,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     # row stride, while CGP is the per-group channel count the GEMM K axis
     # decomposes against; the two coincide only when groups == 1.
     geom = make_conv_geometry(param)
-    do, ho, wo = geom.do, geom.ho, geom.wo
-    dhw, npq, crs = geom.dhw, geom.npq, geom.crs
-    CGP = geom.cgp
+    npq, crs, CGP = geom.npq, geom.crs, geom.cgp
     KG = k // groups
 
     assert TILE_K == 32
@@ -254,8 +244,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
 
     k_tiles = (crs + TILE_K - 1) // TILE_K
-
-    BIG_OUT = (n * k * do * ho * wo * BF16_BYTES) > 0x7FFFFFFF
 
     W_BYTES = k * crs * BF16_BYTES
     assert W_BYTES < OOB_SENTINEL_BYTES, (
@@ -281,12 +269,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     tiles_per_split = k_tiles // splitk
     use_splitk = splitk > 1
 
-    Y_BYTES = npq * k * (4 if use_splitk else BF16_BYTES)
-
-    assert not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES, (
-        f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
-    )
-
     PIPE_STAGES = 2 * TILES_PER_BARRIER
 
     LDS_A_SIZE = PIPE_STAGES * TILE_M * TILE_K
@@ -299,14 +281,17 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     grid_x = min(grid_m, MAX_GRID_X)
     m_chunks = (grid_m + grid_x - 1) // grid_x
 
-    _row_chk = (npq % TILE_M != 0) or (grid_x * m_chunks > grid_m)
-    _need_chk = _row_chk or n_tail
-    _vec_store = (
-        (n == 1)
-        and (not use_splitk)
-        and (dhw % MFMA_C_VALUES == 0)
-        and (not BIG_OUT)
-        and (not out_ndhwc)
+    # How C is written back: the 5D scatter, the tail masking and the split-K
+    # staging, against the same grid the gather reads A on.
+    scatter_plan = make_output_scatter_plan(
+        param,
+        geom,
+        kg=KG,
+        mi_m=MI_M,
+        mi_n=MI_N,
+        use_splitk=use_splitk,
+        row_chk=(npq % TILE_M != 0) or (grid_x * m_chunks > grid_m),
+        n_tail=n_tail,
     )
 
     assert grid_n <= MAX_GRID_YZ, (
@@ -334,26 +319,10 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         im2col = Im2colGather(im2col_plan, x)
 
         w_src = flat_buffer_view(fx.get_iter(weight), W_BYTES // BF16_BYTES, W_BYTES)
-        y_buf = fx.rocdl.make_buffer_tensor(y, num_records_bytes=Y_BYTES)
-        if const_expr(use_splitk):
-            # buffer_atomic_add needs the raw !llvm.ptr<8> descriptor, not a tensor.
-            y_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(y_buf))
-        else:
-            y_div = fx.logical_divide(
-                fx.Tensor(fx.make_view(fx.get_iter(y_buf), fx.make_layout(npq * k, 1))),
-                fx.make_layout(1, 1),
-            )
-            y_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), elem_ty)
-            y_reg_1 = fx.make_rmem_tensor(1, elem_ty)
-            if const_expr(_vec_store):
-                y_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem_ty)
-                y_reg_4 = fx.make_rmem_tensor(MFMA_C_VALUES, elem_ty)
-        if const_expr(has_bias):
-            bias_div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(bias), fx.make_layout(1, 1)
-            )
-            bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            bias_reg = fx.make_rmem_tensor(1, fx.Float32)
+
+        # And how C goes back: the epilogue's descriptors and copy atoms, built
+        # here with the others; the store itself happens at the end.
+        scatter = OutputScatter(scatter_plan, y, bias, elem_ty)
 
         lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek()
         a_lds = lds.a
@@ -401,7 +370,6 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             k_off = 0
 
         # MMA fragments + LDS stage views.
-        Vec = fx.Vector
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, TILE_K, elem_ty))
         tiled_mma = fx.make_tiled_mma(
@@ -558,132 +526,14 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             for j in range_constexpr(len(batch)):
                 acc = compute_stage(acc, a_frags[j], b_frags[j])
 
-        if const_expr(BIG_OUT):
-            y_elem_base = fx.Int64(fx.ptrtoint(fx.get_iter(y)))
-
-        _big_st_ptr_ty = fx.PointerType.get(
-            elem_ty.ir_type, fx.AddressSpace.Global, BF16_BYTES
+        scatter.store(
+            acc,
+            m_offset=m_offset,
+            n_offset=n_offset,
+            n_local=n_local,
+            c_row=c_row,
+            c_col=c_col,
         )
-
-        def _big_store(off_nk_i64, value):
-            # BIG_OUT means y is past what a buffer descriptor's 32-bit voffset
-            # reaches, so there is no buffer-resource form to route this through
-            # and the store is addressed by a flat 64-bit address instead. That
-            # is also why this path gives up y_div and the store copy atoms.
-            addr = y_elem_base + off_nk_i64 * fx.Int64(BF16_BYTES)
-            fx.ptr_store(value, fx.inttoptr(_big_st_ptr_ty, addr))
-
-        def _valid(row, col_loc):
-            if const_expr(_row_chk and n_tail):
-                return (row < fx.Int64(npq)) & (col_loc < fx.Int64(KG))
-            if const_expr(_row_chk):
-                return row < fx.Int64(npq)
-            return col_loc < fx.Int64(KG)
-
-        _route_store = _need_chk and not use_splitk and not BIG_OUT
-
-        def _route(off, row, col_loc):
-            if const_expr(not _route_store):
-                return fx.Int32(off)
-            return _valid(row, col_loc).select(fx.Int32(off), OOB_ELEM)
-
-        def _cols(ni):
-            """Global out-channel for MFMA column block ni, and its index within the group."""
-            col_off = fx.Int64(fx.get_scalar(c_col[MFMA_C_VALUES * MI_M * ni]))
-            col = n_offset + col_off
-            return col, ((n_local + col_off) if const_expr(groups > 1) else col)
-
-        def _off_nk(row, col, off_sk):
-            # NDHWC is already (npq, k) row-major, so the scatter is off_sk.
-            if const_expr(out_ndhwc):
-                return off_sk
-            if const_expr(n == 1):
-                return col * dhw + row
-            n_idx = row // dhw
-            return n_idx * (k * dhw) + col * dhw + (row % dhw)
-
-        def store_output():
-            if const_expr(has_bias and not use_splitk):
-                bias_vals = []
-                for ni in range_constexpr(MI_N):
-                    col, col_loc = _cols(ni)
-                    col_i = fx.Int32(col)  # bias is indexed by the global out-channel
-                    if const_expr(n_tail):
-                        col_i = (col_loc < fx.Int64(KG)).select(col_i, fx.Int32(0))
-                    fx.copy(bias_atom, fx.slice(bias_div, (None, col_i)), bias_reg)
-                    bias_vals.append(fx.Float32(fx.memref_load_vec(bias_reg)[0]))
-
-            for mi in range_constexpr(MI_M):
-                row_base = m_offset + fx.get_scalar(c_row[MFMA_C_VALUES * mi])
-                for ni in range_constexpr(MI_N):
-                    col, col_loc = _cols(ni)
-                    a = Vec(acc[None, mi, ni].load())
-                    if const_expr(has_bias and not use_splitk):
-                        bias_val = bias_vals[ni]
-
-                    if const_expr(_vec_store):
-                        row0 = fx.Int64(row_base)
-                        off_nk0 = col * dhw + row0
-
-                        def _emit_vec():
-                            vals = []
-                            for i in range_constexpr(MFMA_C_VALUES):
-                                cval = (
-                                    (a[i] + bias_val) if const_expr(has_bias) else a[i]
-                                )
-                                vals.append(cval.to(elem_ty))
-                            v4 = fx.Vector.from_elements(vals, dtype=elem_ty)
-                            fx.memref_store_vec(v4, y_reg_4)
-                            fx.copy(
-                                y_atom_4,
-                                y_reg_4,
-                                fx.slice(y_div, (None, _route(off_nk0, row0, col_loc))),
-                            )
-
-                        if const_expr(_need_chk and not _route_store):
-                            if _valid(row0, col_loc):
-                                _emit_vec()
-                        else:
-                            _emit_vec()
-                        continue
-
-                    for i in range_constexpr(MFMA_C_VALUES):
-                        row = fx.Int64(row_base + i)
-                        off_sk = row * k + col
-                        off_nk = _off_nk(row, col, off_sk)
-
-                        def _emit():
-                            if const_expr(use_splitk):
-                                off_b = fx.Int32(off_sk * 4)
-                                z0 = fx.Int32(0)
-                                buffer_atomic_add(a[i], y_rsrc, off_b, z0, z0)
-                            else:
-                                cval = (
-                                    (a[i] + bias_val).to(elem_ty)
-                                    if const_expr(has_bias)
-                                    else a[i].to(elem_ty)
-                                )
-                                if const_expr(BIG_OUT):
-                                    _big_store(fx.Int64(off_nk), cval)
-                                else:
-                                    fx.memref_store_vec(
-                                        fx.Vector.filled(1, cval, elem_ty), y_reg_1
-                                    )
-                                    fx.copy(
-                                        y_atom_1,
-                                        y_reg_1,
-                                        fx.slice(
-                                            y_div, (None, _route(off_nk, row, col_loc))
-                                        ),
-                                    )
-
-                        if const_expr(_need_chk and not _route_store):
-                            if _valid(row, col_loc):
-                                _emit()
-                        else:
-                            _emit()
-
-        store_output()
 
     @flyc.jit
     def launch(
@@ -709,6 +559,3 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
     _launch.compile = _compile
     return _launch
-
-
-SPLITK_MAX_STAGING_BYTES = 0xFFFFFFFF
