@@ -5,8 +5,13 @@ on:
     - cron: "0 16 * * *"  # 12:00 AM Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
+      atom_repository:
+        description: "ATOM repo to checkout (e.g. ROCm/ATOM or lcskrishna/ATOM for a catalog PR branch)"
+        required: false
+        type: string
+        default: "ROCm/ATOM"
       atom_ref:
-        description: "ROCm/ATOM ref with ATOMesh Spur support"
+        description: "ATOM git ref (branch, tag, or SHA); use minimax-m3-fp8-2p1d-tp8-catalog until catalog merges"
         required: false
         type: string
         default: "main"
@@ -30,6 +35,26 @@ on:
         required: false
         default: true
         type: boolean
+      run_minimax_m3_fp8_2p1d_tp8:
+        description: "Run MiniMax-M3-MXFP8 2P+1D TP8 and DPA-TP8 ATOMesh nightly cases (3 nodes)"
+        required: false
+        default: false
+        type: boolean
+      minimax_mxfp8_model_path:
+        description: "MiniMax-M3-MXFP8 model path visible on Spur nodes"
+        required: false
+        type: string
+        default: "/data/models2/MiniMax-M3-MXFP8"
+      minimax_conc_list:
+        description: "Benchmark concurrency for MiniMax 2P+1D smoke"
+        required: false
+        type: string
+        default: "16"
+      minimax_eval_conc_list:
+        description: "GSM8K eval concurrency for MiniMax 2P+1D smoke"
+        required: false
+        type: string
+        default: "128"
       log_root:
         description: "Root directory for ATOMesh logs"
         required: false
@@ -64,6 +89,7 @@ permissions:
   contents: read
 
 env:
+  ATOM_REPOSITORY_DEFAULT: ROCm/ATOM
   ATOM_REF_DEFAULT: main
   ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
   ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
@@ -78,6 +104,11 @@ env:
   GLM_OSL_DEFAULT: "1024"
   GLM_CONC_LIST_DEFAULT: "16"
   GLM_EVAL_CONC_LIST_DEFAULT: "16"
+  MINIMAX_ISL_LIST_DEFAULT: "8192"
+  MINIMAX_OSL_DEFAULT: "1024"
+  MINIMAX_CONC_LIST_DEFAULT: "16"
+  MINIMAX_EVAL_CONC_LIST_DEFAULT: "128"
+  MINIMAX_MXFP8_MODEL_PATH_DEFAULT: /data/models2/MiniMax-M3-MXFP8
   ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
   ATOMESH_SLURM_ACCOUNT: ""
   ATOMESH_SLURM_PARTITION: ""
@@ -121,7 +152,9 @@ jobs:
           # Include GLM in scheduled runs; workflow_dispatch can disable it for
           # targeted DeepSeek-only debugging.
           run_glm = bool_input("run_glm_5_2_fp8", True)
+          run_minimax = bool_input("run_minimax_m3_fp8_2p1d_tp8", False)
 
+          print(f"ATOM_REPOSITORY={value('atom_repository', 'ATOM_REPOSITORY_DEFAULT')}")
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
           print(
@@ -133,6 +166,21 @@ jobs:
               + value("glm_5_2_fp8_model_path", "ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT")
           )
           print(f"RUN_GLM_5_2_FP8={str(run_glm).lower()}")
+          print(f"RUN_MINIMAX_M3_FP8_2P1D_TP8={str(run_minimax).lower()}")
+          print(
+              "MINIMAX_MXFP8_MODEL_PATH="
+              + value("minimax_mxfp8_model_path", "MINIMAX_MXFP8_MODEL_PATH_DEFAULT")
+          )
+          print(f"MINIMAX_ISL_LIST={os.environ['MINIMAX_ISL_LIST_DEFAULT']}")
+          print(f"MINIMAX_OSL={os.environ['MINIMAX_OSL_DEFAULT']}")
+          print(
+              "MINIMAX_CONC_LIST="
+              + value("minimax_conc_list", "MINIMAX_CONC_LIST_DEFAULT")
+          )
+          print(
+              "MINIMAX_EVAL_CONC_LIST="
+              + value("minimax_eval_conc_list", "MINIMAX_EVAL_CONC_LIST_DEFAULT")
+          )
           print(f"ATOMESH_LOG_ROOT={value('log_root', 'ATOMESH_LOG_ROOT_DEFAULT')}")
           print(
               "ATOMESH_SHARED_WORKSPACE_ROOT="
@@ -158,19 +206,16 @@ jobs:
       - name: Checkout ATOM source
         uses: actions/checkout@v4
         with:
-          repository: ROCm/ATOM
-          ref: main
+          repository: ${{ env.ATOM_REPOSITORY }}
+          ref: ${{ env.ATOM_REF }}
           path: ATOM
 
-      - name: Select ATOM ref
+      - name: Record ATOM checkout
         run: |
           set -euo pipefail
           cd ATOM
-          if [[ "${ATOM_REF}" != "main" ]]; then
-            git fetch --depth=1 origin "${ATOM_REF}"
-            git checkout FETCH_HEAD
-          fi
           git rev-parse HEAD
+          git log -1 --oneline
 
       - name: Patch ATOMesh smoke config
         run: |
@@ -427,6 +472,23 @@ jobs:
                       "run_eval": True,
                   }
               )
+          if os.environ.get("RUN_MINIMAX_M3_FP8_2P1D_TP8", "false") == "true":
+              for case, topology in (
+                  ("minimax-m3-fp8-2p1d-tp8", "2p1d"),
+                  ("minimax-m3-fp8-2p1d-dpa-tp8", "2p1d_dpa"),
+              ):
+                  requested.append(
+                      {
+                          "model": "MiniMax-M3-MXFP8",
+                          "case": case,
+                          "topology": topology,
+                          "isl_list": os.environ["MINIMAX_ISL_LIST"],
+                          "osl": os.environ["MINIMAX_OSL"],
+                          "conc": os.environ["MINIMAX_CONC_LIST"],
+                          "eval_conc": os.environ["MINIMAX_EVAL_CONC_LIST"],
+                          "run_eval": True,
+                      }
+                  )
 
           node_pool = [
               node.strip()
@@ -454,7 +516,10 @@ jobs:
 
               cell = matches[0]
               conc = parse_int_list(cfg["conc"])
-              cell["isl"] = isl
+              if "isl_list" in cfg:
+                  cell["isl"] = parse_int_list(cfg["isl_list"])
+              else:
+                  cell["isl"] = isl
               cell["osl"] = int(cfg["osl"])
               cell["concurrency"] = conc
               cell["concurrency_x"] = "x".join(str(value) for value in conc)
