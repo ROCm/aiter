@@ -2700,10 +2700,10 @@ def _can_reroute_mxfp4_to_flydsl(
 ):
     """Whether the heuristic FlyDSL path accepts this MXFP4 shape and layout."""
     return (
-        dtype in (dtypes.bf16, dtypes.fp16)
+        dtype == dtypes.bf16
         and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
-        and q_dtype_a in (dtypes.bf16, dtypes.fp4x2, dtypes.fp8)
+        and q_dtype_a == dtypes.bf16
         and activation == ActivationType.Swiglu
         and inter_dim % 128 == 0
         and model_dim % 256 == 0

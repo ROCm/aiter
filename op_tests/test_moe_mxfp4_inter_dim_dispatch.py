@@ -45,6 +45,7 @@ def _dispatch(
     gate_mode=GateMode.SEPARATED,
     q_dtype_a=dtypes.bf16,
     both_weights_shuffled=True,
+    dtype=dtypes.bf16,
 ):
     get_2stage_cfgs.cache_clear()
     return get_2stage_cfgs(
@@ -53,7 +54,7 @@ def _dispatch(
         inter_dim,
         E,
         TOPK,
-        dtypes.bf16,
+        dtype,
         q_dtype_a,
         dtypes.fp4x2,
         QuantType.per_1x32,
@@ -110,12 +111,18 @@ def test_mxfp4_swiglu_does_not_reroute_to_unsupported_a16w4(kwargs):
         (dtypes.fp4x2, GateMode.SEPARATED, "flydsl"),
         (dtypes.fp4x2, GateMode.INTERLEAVE, "cktile"),
         (dtypes.fp8, GateMode.SEPARATED, "cktile"),
-        (dtypes.fp8, GateMode.INTERLEAVE, "flydsl"),
+        (dtypes.fp8, GateMode.INTERLEAVE, "cktile"),
     ],
 )
-def test_mxfp4_swiglu_takeover_matches_weight_layout(q_dtype_a, gate_mode, want):
+def test_mxfp4_swiglu_fallback_matches_weight_layout(q_dtype_a, gate_mode, want):
     meta = _dispatch(q_dtype_a=q_dtype_a, gate_mode=gate_mode)
     assert _stage_backend(meta.stage2) == want
+
+
+@_SKIP
+def test_mxfp4_swiglu_fp16_output_does_not_use_a16w4():
+    meta = _dispatch(dtype=dtypes.fp16)
+    assert _stage_backend(meta.stage2) == "cktile"
 
 
 @_SKIP
