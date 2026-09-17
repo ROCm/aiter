@@ -253,9 +253,9 @@ def make_tile_config(tile):
 def weight_bytes(param, geom):
     """Bytes of the packed (K, CRS) weight, checked against a descriptor's reach."""
     w_bytes = param.k * geom.crs * BF16_BYTES
-    assert w_bytes < OOB_SENTINEL_BYTES, (
-        f"weight {w_bytes}B exceeds limit {OOB_SENTINEL_BYTES}B"
-    )
+    assert (
+        w_bytes < OOB_SENTINEL_BYTES
+    ), f"weight {w_bytes}B exceeds limit {OOB_SENTINEL_BYTES}B"
     return w_bytes
 
 
@@ -581,12 +581,12 @@ def make_launch_grid(param, geom, cfg):
     grid_x = min(grid_m, max_grid_x)
     m_chunks = (grid_m + grid_x - 1) // grid_x
 
-    assert grid_y <= MAX_GRID_YZ, (
-        f"grid.y = {grid_y} exceeds the {MAX_GRID_YZ}-block limit"
-    )
-    assert m_chunks * splitk <= MAX_GRID_YZ, (
-        f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
-    )
+    assert (
+        grid_y <= MAX_GRID_YZ
+    ), f"grid.y = {grid_y} exceeds the {MAX_GRID_YZ}-block limit"
+    assert (
+        m_chunks * splitk <= MAX_GRID_YZ
+    ), f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
 
     return LaunchGrid(
         grid_x=grid_x,
@@ -753,9 +753,9 @@ def make_output_scatter_plan(param, geom, cfg, grid):
     big_out = (n * k * geom.do * geom.ho * geom.wo * BF16_BYTES) > 0x7FFFFFFF
     y_bytes = npq * k * (4 if use_splitk else BF16_BYTES)
 
-    assert not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES, (
-        f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
-    )
+    assert (
+        not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
+    ), f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
 
     need_chk = row_chk or n_tail
     return OutputScatterPlan(

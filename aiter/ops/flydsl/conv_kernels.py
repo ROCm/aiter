@@ -559,9 +559,9 @@ def _as_tuple(v, rank, name):
     t = tuple(v)
     if len(t) == 1:
         return t * rank
-    assert len(t) == rank, (
-        f"{name} must be an int or a sequence of 1 or {rank} ints, got {tuple(v)}"
-    )
+    assert (
+        len(t) == rank
+    ), f"{name} must be an int or a sequence of 1 or {rank} ints, got {tuple(v)}"
     return t
 
 
@@ -575,9 +575,9 @@ def _resolve_padding(padding, kernel, stride, dilation):
         return (0, 0, 0), (0, 0, 0)
     if padding != "same":
         raise ValueError(f"padding string must be 'same' or 'valid', got {padding!r}")
-    assert all(s == 1 for s in stride), (
-        f"padding='same' is not supported for strided convolutions, got stride {tuple(stride)}"
-    )
+    assert all(
+        s == 1 for s in stride
+    ), f"padding='same' is not supported for strided convolutions, got stride {tuple(stride)}"
     total = [dl * (kn - 1) for kn, dl in zip(kernel, dilation)]
     return tuple(t // 2 for t in total), tuple(t - t // 2 for t in total)
 
@@ -606,12 +606,12 @@ def _conv3d_impl(
     k, wc, kt, kh, kw = weight.shape
 
     for name, t in (("x", x), ("weight", weight), ("bias", bias)):
-        assert t is None or t.is_cuda, (
-            f"flydsl_conv_implicit needs GPU tensors; {name} is on {t.device}"
-        )
-    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        f"flydsl_conv_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
-    )
+        assert (
+            t is None or t.is_cuda
+        ), f"flydsl_conv_implicit needs GPU tensors; {name} is on {t.device}"
+    assert (
+        x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    ), f"flydsl_conv_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
     assert bias is None or (bias.dim() == 1 and bias.numel() == k), (
         f"bias must be a 1-D tensor of {k} elements, one per output channel; "
         f"got shape {tuple(bias.shape)}"
@@ -623,27 +623,27 @@ def _conv3d_impl(
     assert wc == c // groups, f"weight in-channels {wc} != C/groups = {c // groups}"
     st, sh, sw = _as_tuple(stride, 3, "stride")
 
-    assert min(st, sh, sw) >= 1, (
-        f"non-positive stride is not supported, got (st, sh, sw) = {(st, sh, sw)}"
-    )
+    assert (
+        min(st, sh, sw) >= 1
+    ), f"non-positive stride is not supported, got (st, sh, sw) = {(st, sh, sw)}"
     dt, dh, dw = _as_tuple(dilation, 3, "dilation")
     assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
     pad_lo, pad_hi = _resolve_padding(padding, (kt, kh, kw), (st, sh, sw), (dt, dh, dw))
     pt, ph, pw = pad_lo
-    assert padding_mode in PADDING_MODES, (
-        f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
-    )
+    assert (
+        padding_mode in PADDING_MODES
+    ), f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
 
     if padding_mode in ("reflect", "circular"):
         for ax, (p, ext) in enumerate(zip(map(max, pad_lo, pad_hi), (d, h, w))):
             if padding_mode == "reflect":
-                assert p < ext, (
-                    f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
-                )
+                assert (
+                    p < ext
+                ), f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
             else:
-                assert p <= ext, (
-                    f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
-                )
+                assert (
+                    p <= ext
+                ), f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
 
     # Key into the offline-tuned config table. Captured here, before the padding
     # and channel-padding paths below rewrite n/c/d/h/w, so that it describes the
@@ -731,9 +731,9 @@ def _conv3d_impl(
     do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
     ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
     wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
-    assert min(do, ho, wo) >= 1, (
-        f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
-    )
+    assert (
+        min(do, ho, wo) >= 1
+    ), f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
     npq = n * do * ho * wo
 
     if n == 0:
