@@ -30,6 +30,52 @@ WARP_SIZE = 64
 DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 
 
+def default_varctx_parallel_unit_num(
+    batch_size: int,
+    max_seq_len: int,
+    next_n: int = 1,
+) -> int:
+    """Return the tuned gfx950 persistent-grid size without reading the GPU.
+
+    Context lengths stay device-side so graph replay never synchronizes with
+    the host. The grid can therefore depend only on the host-known row count
+    and maximum sequence length. These buckets are process-level medians from
+    8K/32K/64K/128K sweeps on a 256-CU MI355X; callers can still pass an
+    explicit ``parallel_unit_num`` to override them.
+    """
+    if batch_size < 1 or max_seq_len < 1 or next_n < 1:
+        raise ValueError(
+            "batch_size, max_seq_len, and next_n must all be positive; "
+            f"got {batch_size=}, {max_seq_len=}, {next_n=}."
+        )
+
+    rows = batch_size * next_n
+    if rows <= 1:
+        row_bucket = 0
+    elif rows <= 2:
+        row_bucket = 1
+    elif rows <= 4:
+        row_bucket = 2
+    elif rows <= 8:
+        row_bucket = 3
+    elif rows <= 32:
+        row_bucket = 4
+    else:
+        row_bucket = 5
+
+    if max_seq_len <= 16384:
+        targets = (64, 96, 256, 256, 512, 512)
+    elif max_seq_len <= 49152:
+        targets = (128, 256, 256, 512, 1024, 2048)
+    elif max_seq_len <= 98304:
+        targets = (256, 512, 1024, 1280, 1536, 2048)
+    else:
+        targets = (256, 512, 1280, 1280, 2048, 4096)
+
+    target = max(rows, targets[row_bucket])
+    return ((target + next_n - 1) // next_n) * next_n
+
+
 @triton.jit
 def _varctx_cta_info_kernel(
     ctx_ptr,  # [B] int32
@@ -113,8 +159,9 @@ def compute_varctx_schedule(
 ):
     B = context_lens.shape[0]
     if parallel_unit_num is None:
-        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
-        parallel_unit_num = B * next_n * chunks_per_seq
+        parallel_unit_num = default_varctx_parallel_unit_num(
+            B, max_seq_len, next_n=next_n
+        )
     P = parallel_unit_num
     if P % next_n != 0:
         raise ValueError(f"parallel_unit_num={P} must be a multiple of next_n={next_n}")
@@ -134,6 +181,11 @@ def compute_varctx_schedule(
     if cta_info_out is None:
         cta_info = torch.empty(P, 4, dtype=torch.int32, device=dev)
     else:
+        if cta_info_out.shape[0] < P or cta_info_out.shape[1:] != (4,):
+            raise ValueError(
+                f"cta_info_out must have shape (at least {P}, 4), "
+                f"got {tuple(cta_info_out.shape)}."
+            )
         cta_info = cta_info_out
     safe_out = torch.empty(1, dtype=torch.int32, device=dev)
     BLOCK_B = triton.next_power_of_2(max(int(B), 1))
@@ -717,10 +769,9 @@ def flydsl_pa_mqa_logits_fp4(
     """Decode/varctx FP4 paged MQA logits (gfx950).
 
     ``parallel_unit_num`` is the persistent-grid CTA count; when ``None`` it is
-    auto-derived (cudagraph-safe, no device→host sync) as
-    ``batch * next_n * ceil(max_seq_len / block_k)``, which is a multiple of
-    ``next_n`` and ``>= batch*next_n`` by construction. Pass a smaller explicit
-    value to trade parallelism for fewer no-op CTAs.
+    selected by :func:`default_varctx_parallel_unit_num` from host-known shape
+    buckets (cudagraph-safe, no device→host sync). Pass an explicit value to
+    override the tuned default.
     """
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2

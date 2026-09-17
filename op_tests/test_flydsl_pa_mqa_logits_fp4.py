@@ -14,6 +14,9 @@ import random
 import torch
 
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+    default_varctx_parallel_unit_num,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -468,9 +471,8 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     # The persistent-grid schedule has S = parallel_unit_num // next_n batch
     # slots; if batch_size exceeds S the surplus batches are silently dropped
     # (their out stays -inf -> NaN cosine). For an explicit value grow the grid
-    # so every (batch, next_n) gets at least one slot; when None, let the
-    # scheduler auto-derive a cudagraph-safe grid (= batch*next_n*ceil(t_max/
-    # block_k)), which already satisfies both constraints.
+    # so every (batch, next_n) gets at least one slot; when None, use the tuned
+    # cudagraph-safe gfx950 grid, which already satisfies both constraints.
     if parallel_unit_num is not None:
         parallel_unit_num = max(parallel_unit_num, batch_size * next_n)
     safe, cta_info, total_ctas = compute_varctx_schedule(
@@ -643,6 +645,27 @@ def _print_perf_summary():
     print()
 
 
+def test_default_varctx_parallel_unit_num():
+    expected = {
+        8192: (64, 96, 256, 256, 512, 512),
+        32768: (128, 256, 256, 512, 1024, 2048),
+        65536: (256, 512, 1024, 1280, 1536, 2048),
+        131072: (256, 512, 1280, 1280, 2048, 4096),
+    }
+    batches = (1, 2, 4, 8, 16, 64)
+    for context, targets in expected.items():
+        actual = tuple(
+            default_varctx_parallel_unit_num(batch, context) for batch in batches
+        )
+        assert actual == targets, f"{context=}: {actual=} != {targets=}"
+
+    # MTP rows share the same tuning buckets; the launch grid remains a
+    # multiple of next_n and can never drop a row.
+    for next_n in (2, 3, 5):
+        ctas = default_varctx_parallel_unit_num(3, 131072, next_n=next_n)
+        assert ctas >= 3 * next_n and ctas % next_n == 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MQA Logits (Q FP4, KV FP4) decode Test + Benchmark (gfx950)",
@@ -673,8 +696,7 @@ def main():
         "--parallel_unit_num",
         type=int,
         default=None,
-        help="target CTA count for host schedule "
-        "(default: auto = batch*next_n*ceil(max_seq_len/block_k))",
+        help="target CTA count for host schedule (default: tuned gfx950 auto grid)",
     )
     parser.add_argument(
         "--next_n",
@@ -695,6 +717,7 @@ def main():
         help=f"Per-head dim (multiple of 128). Default {DEFAULT_HEAD_DIM}.",
     )
     args = parser.parse_args()
+    test_default_varctx_parallel_unit_num()
 
     if get_arch() != "gfx950":
         print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
