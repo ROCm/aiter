@@ -51,6 +51,15 @@ TEST_DIR="${TEST_DIR%/}"
 # ------------------------------
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    FLYDSL_GEMM_TESTS=(
+        "op_tests/flydsl_tests/test_flydsl_decode_gemm.py"
+        "op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py"
+    )
+    for test_file in "${FLYDSL_GEMM_TESTS[@]}"; do
+        if [[ -f "$test_file" ]]; then
+            ALL_FILES+=("$test_file")
+        fi
+    done
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
@@ -96,6 +105,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=64
     FILE_TIMES[op_tests/test_topk_plain.py]=63
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=61
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py]=60
     FILE_TIMES[op_tests/test_flydsl_compress_attn.py]=58
     FILE_TIMES[op_tests/test_gdn_prepare.py]=58
     FILE_TIMES[op_tests/test_pa_ps.py]=57
@@ -106,6 +116,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_rmsnorm2d.py]=52
     FILE_TIMES[op_tests/test_batched_gemm_a8w8.py]=48
     FILE_TIMES[op_tests/test_causal_conv1d_update.py]=47
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_decode_gemm.py]=45
     FILE_TIMES[op_tests/test_pa_sparse_prefill.py]=41
     FILE_TIMES[op_tests/test_mla_reduce.py]=40
     FILE_TIMES[op_tests/test_msa_block_select.py]=39

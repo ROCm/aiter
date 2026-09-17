@@ -13,6 +13,10 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
+from ..ops.flydsl.gemm_tune.flydsl_gemm_a4w4_bpreshuffle_common import (
+    parse_a4w4_splitk_kernel_name as _parse_flydsl_a4w4_splitk_kernel_name,
+)
+from ..ops.flydsl.splitk_bpreshuffle_common import dispatch_flydsl_splitk
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
@@ -37,6 +41,14 @@ def get_GEMM_config(M: int, N: int, K: int):
         gemm_dict = pd.read_csv(
             AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
         ).drop_duplicates()
+        # "libtype" is a newer column (mirrors the a8w8 CSVs) that a future
+        # dispatch branch will use to pick "flydsl" candidates. Rows tuned
+        # before it existed have no value here; normalize missing/blank to ""
+        # so a later `config["libtype"] == "flydsl"` check is always False for
+        # them instead of comparing against NaN -- i.e. they keep dispatching
+        # through the pre-existing kernelName-based CK/ASM routing unchanged.
+        if "libtype" in gemm_dict.columns:
+            gemm_dict["libtype"] = gemm_dict["libtype"].fillna("")
         # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
         # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
         if "gfx" in gemm_dict.columns:
@@ -215,9 +227,80 @@ def gemm_a4w4(
     # splitK = None
     splitK = 0
     kernelName = ""
+    libtype = ""
     if ck_config is not None:
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
+        libtype = ck_config.get("libtype", "")
+    if libtype == "flydsl" and kernelName.startswith("flydsl_a4w4_splitk_"):
+        parsed = _parse_flydsl_a4w4_splitk_kernel_name(kernelName)
+        if parsed is not None and n % 32 == 0:
+            (
+                tm,
+                tn,
+                tk,
+                sk,
+                acp,
+                wpe,
+                xcd_swizzle,
+                lds_stage,
+                scheduler,
+                use_m_bounded_store,
+            ) = parsed
+            from .shuffle import shuffle_scale_w4_cdna4, shuffle_weight_w4_cdna4
+
+            def _shuffle_mxfp4_operands(XQ, WQ, x_scale, w_scale):
+                # The flydsl mxfp4 splitk kernel expects the CDNA4 scaled-MFMA
+                # preshuffle: B (and both operands' 32-block E8M0 scales) in the
+                # shuffle_{weight,scale}_w4_cdna4 layout -- see
+                # op_tests/bench_mxfp4_splitk_check.py. Neither the CK nor asm
+                # dispatch above needs this (B arrives pre-shuffled by the CK
+                # convention; CK's own scale layout differs), so there is no
+                # existing shuffled-checkpoint convention to reuse yet: shuffle
+                # inline here. This is a real per-call cost on the hot path --
+                # hoisting it to a one-time weight-prep step is left to a later
+                # chunk once this path is actually tuned/shipped.
+                a_scale = x_scale
+                m_pad = ((m + 31) // 32) * 32
+                if a_scale.shape[0] != m_pad:
+                    a_scale_padded = torch.zeros(
+                        (m_pad, a_scale.shape[1]),
+                        dtype=a_scale.dtype,
+                        device=a_scale.device,
+                    )
+                    a_scale_padded[:m] = a_scale
+                    a_scale = a_scale_padded
+                a_scale_shuf = shuffle_scale_w4_cdna4(a_scale).view(torch.int8)
+                b_shuf = shuffle_weight_w4_cdna4(WQ).view(torch.int8)
+                b_scale_shuf = shuffle_scale_w4_cdna4(w_scale).view(torch.int8)
+                return (
+                    XQ.view(m, k // 2).view(torch.int8),
+                    b_shuf,
+                    a_scale_shuf,
+                    b_scale_shuf,
+                )
+
+            dispatch_flydsl_splitk(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                tm,
+                tn,
+                tk,
+                sk,
+                use_async_copy=acp,
+                waves_per_eu=wpe,
+                xcd_swizzle=xcd_swizzle,
+                lds_stage=lds_stage,
+                scheduler=scheduler,
+                scale_mode="mxfp4",
+                use_m_bounded_store=use_m_bounded_store,
+                in_dtype="fp4",
+                preshuffle=_shuffle_mxfp4_operands,
+            )
+            return out[:m].view(*A.shape[:-1], n)
     if (
         ck_config is not None
         and kernelName.find("_ZN") == -1
