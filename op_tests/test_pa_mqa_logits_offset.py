@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Regression tests for paged MQA logits block paging and output offsets.
+"""Regression tests for paged MQA logits block paging and input/output offsets.
 
-The non-preshuffle cases check block tables and per-token scales against FP32.
+The non-preshuffle cases check block tables, per-token scales and large KV
+offsets against FP32.
 
 Background
 ----------
@@ -257,6 +258,96 @@ def test_paged_mqa_logits_non_preshuffle(
     torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
     assert torch.all(storage[:, :guard] == sentinel)
     assert torch.all(storage[:, -guard:] == sentinel)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="Requires the CDNA Gluon JIT paged MQA kernel",
+)
+@pytest.mark.parametrize("block_size", [1, 64])
+@pytest.mark.parametrize("boundary_bits", [31, 32, 33], ids=["2GiB", "4GiB", "8GiB"])
+@torch.inference_mode()
+def test_paged_mqa_logits_large_kv_offsets(
+    block_size: int,
+    boundary_bits: int,
+) -> None:
+    """Cross buffer bounds and K/FP32-scale offset overflow with a small batch."""
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(5614)
+    heads, hidden_dim = 32, 128
+    context_lengths = (3001, 513)
+    batch, max_context = len(context_lengths), max(context_lengths)
+    block_bytes = block_size * (hidden_dim + 4)
+    boundary_page = (1 << boundary_bits) // block_bytes
+    physical_pages = torch.tensor(
+        [0, boundary_page - 1, boundary_page, boundary_page + 1],
+        device=device,
+    )
+
+    q = torch.randn(
+        batch,
+        1,
+        heads,
+        hidden_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).to(dtypes.fp8)
+    kv = torch.randn(
+        len(physical_pages),
+        block_size,
+        hidden_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).to(dtypes.fp8)
+    scales = 0.25 + torch.rand(
+        len(physical_pages), block_size, device=device, generator=generator
+    )
+    weights = torch.randn(batch, heads, device=device, generator=generator)
+    compact = torch.empty(
+        len(physical_pages), block_bytes, dtype=torch.uint8, device=device
+    )
+    value_bytes = block_size * hidden_dim
+    compact[:, :value_bytes] = kv.view(len(physical_pages), -1).view(torch.uint8)
+    compact[:, value_bytes:] = scales.view(torch.uint8)
+    # Only four pages are referenced. Place them around the address boundary
+    # without constructing a multi-GiB FP32 reference or initializing other pages.
+    packed = torch.empty(
+        boundary_page + 2, block_bytes, dtype=torch.uint8, device=device
+    )
+    packed[physical_pages] = compact
+    cache = packed.view(-1, block_size, 1, hidden_dim + 4)
+    table_width = (max_context + block_size - 1) // block_size
+    compact_tables = torch.randint(
+        len(physical_pages), (batch, table_width), device=device, generator=generator
+    )
+    block_tables = physical_pages[compact_tables].to(torch.int32)
+    context_lens = torch.tensor(context_lengths, dtype=torch.int32, device=device)
+    out = torch.full((batch, max_context), float("-inf"), device=device)
+    deepgemm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        out,
+        context_lens,
+        block_tables,
+        max_context,
+        Preshuffle=False,
+        KVBlockSize=block_size,
+        # More than ten chunks force both the initial loads and loop prefetch.
+        TotalCuCount=1,
+    )
+
+    reference = torch.full_like(out, float("-inf"))
+    dequantized_kv = kv.float() * scales[..., None]
+    for b, context_length in enumerate(context_lengths):
+        pages = (context_length + block_size - 1) // block_size
+        keys = dequantized_kv[compact_tables[b, :pages]]
+        keys = keys.reshape(-1, hidden_dim)[:context_length]
+        scores = (q[b, 0].float() @ keys.T).relu()
+        reference[b, :context_length] = (scores * weights[b, :, None]).sum(dim=0)
+    torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
