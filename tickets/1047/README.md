@@ -405,33 +405,34 @@ GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Same ABI:
 split-K + LSE merge. gfx950 uses K32 QK; gfx942 retains K16. Softmax
 runs on wave 0 off the reduced C fragment (no ``s`` LDS tile), and a
 loop-top barrier separates the next gather from the previous tile's PV
-reads. Split outputs are BF16 and one merge wave computes LSE weights
-once. Oracle `err=0` at decode and prefill. Decode **beats #4882
-Triton** (~19.6 µs vs ~113 µs at ``M=1``) but **does not** beat live
-AMD (~11 µs). Prefill ~0.54–0.57 ms vs ~204–287 µs AMD / ~222–282 µs
-#4882. Not a win claim.
+reads. The next K/V tile is prefetched into registers before current QK
+and carried across the runtime loop. Split outputs are BF16 and one merge
+wave computes LSE weights once. Oracle `err=0` at decode and prefill.
+Decode **beats #4882 Triton** (~18.7 µs vs ~113 µs at ``M=1``) but
+**does not** beat live AMD (~10 µs). Prefill ~0.52–0.55 ms vs
+~203–286 µs AMD / ~222–282 µs #4882. Not a win claim.
 
 Decode:
 
 | m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
 |--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
-| 1 | 512 | 128 | 2051 | 19.6 | 11.0 | 112.9 | 0 |
-| 8 | 512 | 128 | 2051 | 24.0 | 14.5 | 115.5 | 0 |
-| 1 | 2048 | 512 | 2051 | 19.9 | 11.3 | 116.0 | 0 |
-| 8 | 2048 | 512 | 2051 | 26.4 | 17.1 | 125.7 | 0 |
-| 1 | 8192 | 2048 | 2051 | 20.0 | 11.3 | 117.2 | 0 |
-| 8 | 8192 | 2048 | 2051 | 26.2 | 17.1 | 122.6 | 0 |
-| 1 | 32768 | 8192 | 2051 | 20.0 | 11.3 | 119.1 | 0 |
-| 8 | 32768 | 8192 | 2051 | 26.5 | 16.9 | 122.5 | 0 |
+| 1 | 512 | 128 | 2051 | 18.7 | 10.0 | 112.9 | 0 |
+| 8 | 512 | 128 | 2051 | 23.0 | 13.3 | 115.5 | 0 |
+| 1 | 2048 | 512 | 2051 | 19.1 | 10.3 | 115.9 | 0 |
+| 8 | 2048 | 512 | 2051 | 24.5 | 16.0 | 126.3 | 0 |
+| 1 | 8192 | 2048 | 2051 | 19.1 | 10.3 | 117.4 | 0 |
+| 8 | 8192 | 2048 | 2051 | 24.7 | 15.1 | 121.9 | 0 |
+| 1 | 32768 | 8192 | 2051 | 19.0 | 10.2 | 118.7 | 0 |
+| 8 | 32768 | 8192 | 2051 | 25.0 | 15.4 | 123.1 | 0 |
 
 Prefill:
 
 | m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
 |--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
-| 512 | 512 | 128 | 2051 | 538.0 | 204.0 | 222.3 | 0 |
-| 512 | 2048 | 512 | 2051 | 559.9 | 214.9 | 237.6 | 0 |
-| 512 | 8192 | 2048 | 2051 | 570.6 | 248.5 | 260.9 | 0 |
-| 512 | 32768 | 8192 | 2051 | 573.5 | 286.9 | 282.4 | 0 |
+| 512 | 512 | 128 | 2051 | 516.5 | 203.2 | 222.2 | 0 |
+| 512 | 2048 | 512 | 2051 | 530.7 | 214.1 | 236.9 | 0 |
+| 512 | 8192 | 2048 | 2051 | 546.5 | 248.3 | 260.3 | 0 |
+| 512 | 32768 | 8192 | 2051 | 548.7 | 285.7 | 281.5 | 0 |
 
 A gfx950 ``BLOCK_N=64`` second compile was measured and not shipped:
 ``splits=1`` ~1.01–1.17 ms, ``splits=8`` ~1.12–1.29 ms, both slower than
