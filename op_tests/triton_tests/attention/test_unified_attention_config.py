@@ -85,6 +85,18 @@ _DT_CASES = [
     # small-head control: standalone Q_GEQ_256 still serves head<=128 prefill
     (128, 16384, torch.bfloat16, torch.bfloat16, "Q_GEQ_256", 128),
     (128, 16384, e4m3_dtype, e4m3_dtype, "Q_GEQ_256", 128),
+    # Q boundary: the composite keys bind at exactly Q>=256. Just below the
+    # threshold the pre-existing D-only (bf16) and D+DT (fp8) entries still
+    # serve the call at BLOCK_M=16; asserting both sides of 255/256 pins the
+    # threshold so a future re-tune cannot silently move it.
+    (512, 255, torch.bfloat16, torch.bfloat16, "D_GEQ_512", 16),
+    (512, 255, e4m3_dtype, e4m3_dtype, "D_GEQ_512.DT_fp8_fp8", 16),
+    (512, 256, torch.bfloat16, torch.bfloat16, "D_GEQ_512.Q_GEQ_256", 128),
+    (512, 256, e4m3_dtype, e4m3_dtype, "D_GEQ_512.Q_GEQ_256", 128),
+    (256, 255, torch.bfloat16, torch.bfloat16, "D_GEQ_256", 16),
+    (256, 255, e4m3_dtype, e4m3_dtype, "D_GEQ_256", 16),
+    (256, 256, torch.bfloat16, torch.bfloat16, "D_GEQ_256.Q_GEQ_256", 128),
+    (256, 256, e4m3_dtype, e4m3_dtype, "D_GEQ_256.Q_GEQ_256", 128),
 ]
 
 
