@@ -1157,7 +1157,7 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 8 == 0
+    assert num_head_qo % 4 == 0
     max_splits = get_mla_decode_fwd_max_splits(
         num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
@@ -1243,6 +1243,12 @@ def get_mla_metadata_info_v1(
         and kv_dtype == dtypes.fp8
         and num_head_qo == 96
         and effective_seqlen_qo <= 6
+    ) or (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and num_head_qo % 16 != 0
+        and packed_qo_len <= 128
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1667,6 +1673,13 @@ def decode_update_mla_metadata_v1(
             and kv_is_fp8
             and num_heads_per_head_k in (32, 64, 128)
             and max_seqlen_qo == 1
+        )
+        or (
+            arch_id == "gfx950"
+            and q_is_fp8
+            and kv_is_fp8
+            and num_heads_per_head_k % 16 != 0
+            and num_heads_per_head_k * max_seqlen_qo <= 128
         )
     )
     cu_num = work_indptr.shape[0] - 1
