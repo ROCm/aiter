@@ -488,13 +488,14 @@ def test_k1_family_a_set_equality_wide_stream():
 
 
 def test_k1_family_a_set_equality_prefill():
-    """Same K1 instantiation matches the oracle at prefill M=512."""
+    """The 16-row single-request scorer matches the oracle at prefill M=512."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
-    m, seq_len, page_size = 512, 512, 16
+    m, seq_len, page_size = 512, 4096, 16
     n_blocks = seq_len // idx.compress_ratio
+    assert n_blocks > 512
     torch.manual_seed(0)
     q_indexer = torch.randn(
         m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
@@ -607,7 +608,8 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
-    and streaming radix at or above that width. Expand is not fused.
+    and streaming radix at or above that width. Single-request prefill scores
+    16 query rows per workgroup. Expand is not fused.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
