@@ -118,11 +118,23 @@ def build_inputs(
     )
     context_lens = torch.full((batch,), ctx, dtype=torch.int32, device=device)
     if per_token:
-        k_scale = make_token_scales(num_blocks, num_kv_heads, page_size, device, generator)
-        v_scale = make_token_scales(num_blocks, num_kv_heads, page_size, device, generator)
+        k_scale = make_token_scales(
+            num_blocks, num_kv_heads, page_size, device, generator
+        )
+        v_scale = make_token_scales(
+            num_blocks, num_kv_heads, page_size, device, generator
+        )
     else:
         k_scale = v_scale = None
-    return q.to(torch.bfloat16), k_cache, v_cache, block_tables, context_lens, k_scale, v_scale
+    return (
+        q.to(torch.bfloat16),
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens,
+        k_scale,
+        v_scale,
+    )
 
 
 def _unpack_k(k_cache, pages, k_scale):
@@ -142,7 +154,9 @@ def _unpack_v(v_cache, pages, v_scale):
     if v.dim() == 5:
         _, _, page_over_x, _, x = v.shape
         page_size = page_over_x * x
-        v = v.permute(0, 1, 2, 4, 3).reshape(pages.numel(), num_kv_heads, page_size, HEAD_DIM)
+        v = v.permute(0, 1, 2, 4, 3).reshape(
+            pages.numel(), num_kv_heads, page_size, HEAD_DIM
+        )
         if v_scale is None:
             v = v * KV_SCALE
         else:
@@ -155,11 +169,15 @@ def _unpack_v(v_cache, pages, v_scale):
     return v.permute(1, 0, 3, 2).reshape(num_kv_heads, -1, HEAD_DIM)
 
 
-def reference(q, k_cache, v_cache, block_tables, context_lens, scale, rows, k_scale, v_scale):
+def reference(
+    q, k_cache, v_cache, block_tables, context_lens, scale, rows, k_scale, v_scale
+):
     q4 = q.unsqueeze(1) if q.dim() == 3 else q
     _, qlen, num_heads, _ = q4.shape
     num_kv_heads = k_cache.shape[1]
-    page_size = v_cache.shape[2] * v_cache.shape[4] if v_cache.dim() == 5 else v_cache.shape[3]
+    page_size = (
+        v_cache.shape[2] * v_cache.shape[4] if v_cache.dim() == 5 else v_cache.shape[3]
+    )
     gqa = num_heads // num_kv_heads
     out = {}
     for s in rows:
@@ -175,7 +193,9 @@ def reference(q, k_cache, v_cache, block_tables, context_lens, scale, rows, k_sc
             score = torch.bmm(qs, k_t) * scale
             if valid < ctx:
                 score[..., valid:] = float("-inf")
-            seq.append(torch.bmm(torch.softmax(score, dim=-1), v).reshape(num_heads, HEAD_DIM))
+            seq.append(
+                torch.bmm(torch.softmax(score, dim=-1), v).reshape(num_heads, HEAD_DIM)
+            )
         stacked = torch.stack(seq, dim=0)
         out[s] = stacked[0] if q.dim() == 3 else stacked
     return out
@@ -185,7 +205,9 @@ def rms_rel(got, ref):
     return float((got - ref).pow(2).mean().sqrt() / ref.abs().mean().clamp_min(1e-9))
 
 
-def make_gluon_call(q, k_cache, v_cache, block_tables, context_lens, scale, k_scale, v_scale):
+def make_gluon_call(
+    q, k_cache, v_cache, block_tables, context_lens, scale, k_scale, v_scale
+):
     if q.dim() == 4:
         batch, query_length, num_heads, _ = q.shape
         q_gluon = q.reshape(batch * query_length, num_heads, HEAD_DIM)
@@ -241,19 +263,20 @@ def make_gluon_call(q, k_cache, v_cache, block_tables, context_lens, scale, k_sc
     return call, out, max_parts
 
 
-def skip_reason(num_q_heads, num_kv_heads, head_dim, query_length, page_size, trans_v, per_token):
+def skip_reason(
+    num_q_heads, num_kv_heads, head_dim, query_length, page_size, trans_v, per_token
+):
     if head_dim != HEAD_DIM:
         return f"OPUS A16W8 is compiled for D={HEAD_DIM}, got {head_dim}"
     if page_size not in (16, 128):
         return f"OPUS A16W8 page sizes are 16 and 128, got {page_size}"
     gqa = num_q_heads // num_kv_heads
-    if query_length * gqa > MAX_GQA_ROWS:
-        if gqa != MAX_GQA_ROWS or query_length > 4:
-            return (
-                f"OPUS MTP packs qlen*gqa into one 16-row tile, or GQA==16 "
-                f"with qlen<=4 via a token loop "
-                f"({query_length}*{gqa}={query_length * gqa} > {MAX_GQA_ROWS})"
-            )
+    if query_length * gqa > MAX_GQA_ROWS and (gqa != MAX_GQA_ROWS or query_length > 4):
+        return (
+            f"OPUS MTP packs qlen*gqa into one 16-row tile, or GQA==16 "
+            f"with qlen<=4 via a token loop "
+            f"({query_length}*{gqa}={query_length * gqa} > {MAX_GQA_ROWS})"
+        )
     return None
 
 
@@ -333,7 +356,15 @@ def run_case(
     rows = list(range(min(verify_rows, batch)))
     if rows:
         ref = reference(
-            q, k_cache, v_cache, block_tables, context_lens, scale, rows, k_scale, v_scale
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            context_lens,
+            scale,
+            rows,
+            k_scale,
+            v_scale,
         )
         opus_err = []
         gluon_err = []
@@ -344,13 +375,19 @@ def run_case(
             gluon_err.append(rms_rel(gluon_view, ref[s]))
         errors["opus_vs_ref"] = max(opus_err)
         errors["gluon_vs_ref"] = max(gluon_err)
-    errors["opus_vs_gluon"] = rms_rel(opus_out.float(), gluon_out.view_as(opus_out).float())
+    errors["opus_vs_gluon"] = rms_rel(
+        opus_out.float(), gluon_out.view_as(opus_out).float()
+    )
 
     t_opus, t_gluon = timeit_pair(
         graph_wrap(opus_call), graph_wrap(gluon_call), iters=iters, rounds=rounds
     )
     kv_bytes = (
-        2 * num_kv_heads * HEAD_DIM * dtypes.fp8.itemsize * int(context_lens.sum().item())
+        2
+        * num_kv_heads
+        * HEAD_DIM
+        * dtypes.fp8.itemsize
+        * int(context_lens.sum().item())
     )
     record = dict(
         batch=batch,
@@ -380,8 +417,6 @@ def run_case(
         f"{errors.get('gluon_vs_ref', float('nan')):.3f}/{errors['opus_vs_gluon']:.3f}",
         flush=True,
     )
-    del q, k_cache, v_cache, block_tables, context_lens, gluon_out, opus_out, k_scale, v_scale
-    torch.cuda.empty_cache()
     return record
 
 
@@ -446,7 +481,9 @@ def main():
         default=[0],
         help="KV scale: 0 per-tensor, 1 per-token [blocks, kvh, PAGE, 1].",
     )
-    parser.add_argument("--modes", nargs="+", choices=["plain", "ps"], default=["plain"])
+    parser.add_argument(
+        "--modes", nargs="+", choices=["plain", "ps"], default=["plain"]
+    )
     parser.add_argument("--verify-rows", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
@@ -480,7 +517,13 @@ def main():
     ):
         num_q_heads, num_kv_heads, head_dim, ctx = shape
         why = skip_reason(
-            num_q_heads, num_kv_heads, head_dim, query_length, page_size, trans_v, per_token
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            query_length,
+            page_size,
+            trans_v,
+            per_token,
         )
         if why is None and mode == "ps" and query_length > 1:
             why = "OPUS persistent A16W8 has no MTP"
@@ -510,10 +553,15 @@ def main():
                 bool(per_token),
             )
         )
+        # run_case's tensors are unreachable once it returns; reclaim the
+        # caching allocator blocks before building the next case.
+        torch.cuda.empty_cache()
     for line in skipped:
         print(line, flush=True)
     if args.output:
-        args.output.write_text(json.dumps({"records": records, "skipped": skipped}, indent=2))
+        args.output.write_text(
+            json.dumps({"records": records, "skipped": skipped}, indent=2)
+        )
 
 
 if __name__ == "__main__":

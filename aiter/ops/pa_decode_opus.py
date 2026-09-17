@@ -166,12 +166,11 @@ def _check_shapes(
     # Packed MTP keeps every (token, head) pair in one 16-row tile. GQA 16 with
     # qlen 2..4 instead loops one token per tile over a shared KV walk.
     gqa = num_heads // num_kv_heads
-    if qlen * gqa > _MAX_GQA:
-        if gqa != _MAX_GQA or qlen > 4:
-            raise RuntimeError(
-                f"qlen * GQA ratio must be <= {_MAX_GQA} (or GQA=={_MAX_GQA} "
-                f"and qlen<=4 for the token loop), got {qlen} * {gqa}"
-            )
+    if qlen * gqa > _MAX_GQA and (gqa != _MAX_GQA or qlen > 4):
+        raise RuntimeError(
+            f"qlen * GQA ratio must be <= {_MAX_GQA} (or GQA=={_MAX_GQA} "
+            f"and qlen<=4 for the token loop), got {qlen} * {gqa}"
+        )
 
 
 def _pa_decode_opus_fake(
@@ -730,7 +729,9 @@ def _check_gptoss(q, k_cache, v_cache, sink, *, allow_shuffled_v=False):
     shuffled_v = v_cache.dim() == 5
     if shuffled_v:
         if not allow_shuffled_v:
-            raise RuntimeError("shuffled V is only supported by ordinary gpt-oss decode")
+            raise RuntimeError(
+                "shuffled V is only supported by ordinary gpt-oss decode"
+            )
         if (
             q.dtype != dtypes.fp8
             or q.dim() not in (3, 4)
