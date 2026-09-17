@@ -75,11 +75,14 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 
    The AOT pass (`aiter/aot/flydsl/conv.py`, run from `setup.py` at build time)
    compiles exactly what the tuned CSV holds, so new rows widen AOT coverage and
-   removed rows narrow it. Its compile keys are derived separately from the
-   runtime's, and a disagreement is silent -- the shape just falls back to JIT.
-   Nothing checks that automatically; `aiter.aot.flydsl.common.run_only_env()`
-   makes FlyDSL raise on a JIT rather than fall back, which is how to verify a
-   row by hand after changing the padding, channel-padding or split-K rules.
+   removed rows narrow it. Both it and the runtime build the compile key through
+   `conv_kernels._implicit_param_from_problem`, so channel padding and field
+   order cannot drift between them. `splitK` is the remaining coupling: the
+   runtime freezes the tuned row's value instead of re-deriving it, so a row
+   written without that column falls back to the CU-count heuristic and can miss
+   the AOT cache. `aiter.aot.flydsl.common.run_only_env()` makes FlyDSL raise on
+   a JIT rather than fall back, which is how to verify a row by hand after
+   changing the padding, channel-padding or split-K rules.
 
    To see which tile a given conv actually picked, run with
    `AITER_LOG_TUNED_CONFIG=1`. A shape that falls back to the heuristic says so

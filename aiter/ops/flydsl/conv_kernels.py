@@ -22,6 +22,7 @@ padding_mode, dilation, bias, groups, and split-K.
 """
 
 import functools
+import math
 import os
 import weakref
 
@@ -78,6 +79,115 @@ TUNED_KEY_COLUMNS = (
 TUNED_RESULT_COLUMNS = ("tile_m", "tile_n", "wave_m", "wave_n", "wgm")
 TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 
+_MATMUL_FAST_PATH_INT_COLS = (
+    "groups",
+    "kT",
+    "kH",
+    "kW",
+    "stride_d",
+    "stride_h",
+    "stride_w",
+    "pad_d",
+    "pad_h",
+    "pad_w",
+)
+
+
+def _parse_tuned_bool(value) -> bool:
+    """Parse a tuned-CSV bias cell.
+
+    Shared by the three readers of that column (this lookup, the tuner and the
+    AOT pass) so they cannot disagree: pandas hands back ``"False"``/``False``/
+    ``0``/NaN depending on the file, and a bare ``bool("False")`` is ``True``.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float) and math.isnan(value):  # an empty cell
+        return False
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    normalized = str(value).strip().lower()
+    if normalized in {"", "0", "false", "no", "nan", "<na>", "none"}:
+        return False
+    if normalized in {"1", "true", "yes"}:
+        return True
+    raise ValueError(f"Expected True/False, got {value!r}")
+
+
+def _is_matmul_fast_path(shape) -> bool:
+    """Rows the op answers with ``torch.matmul``, so there is no kernel to tune or AOT."""
+    vals = {c: int(shape[c]) for c in _MATMUL_FAST_PATH_INT_COLS}
+    return (
+        vals["groups"] == 1
+        and vals["kT"] == vals["kH"] == vals["kW"] == 1
+        and vals["stride_d"] == vals["stride_h"] == vals["stride_w"] == 1
+        and vals["pad_d"] == vals["pad_h"] == vals["pad_w"] == 0
+    )
+
+
+def _implicit_param_from_problem(
+    n,
+    c,
+    d,
+    h,
+    w,
+    k,
+    kt,
+    kh,
+    kw,
+    st,
+    sh,
+    sw,
+    pt,
+    ph,
+    pw,
+    dt,
+    dh,
+    dw,
+    groups,
+    has_bias,
+    splitk,
+    tile,
+    wgm,
+    out_ndhwc,
+    pad_mode="zeros",
+):
+    """Compile param for a caller-facing problem (unpadded ``C``).
+
+    Channel padding is applied here so AOT and ``_conv3d_impl`` cannot disagree
+    on the ``c`` field of the cache key.
+    """
+    return make_conv3d_implicit_param(
+        n,
+        groups * _pad_channels(c // groups),
+        d,
+        h,
+        w,
+        k,
+        kt,
+        kh,
+        kw,
+        st,
+        sh,
+        sw,
+        pt,
+        ph,
+        pw,
+        dt,
+        dh,
+        dw,
+        pad_mode,
+        has_bias,
+        splitk,
+        tile,
+        wgm,
+        groups,
+        out_ndhwc,
+    )
+
+
 # (device, shape) pairs already reported by _log_tuned_lookup, so the report
 # costs one line per shape rather than one per conv call.
 _TUNED_LOOKUP_LOGGED = set()
@@ -85,7 +195,7 @@ _TUNED_LOOKUP_LOGGED = set()
 
 @functools.lru_cache(maxsize=1)
 def _load_tuned_table():
-    """Parse the tuned config CSV into ``{(gfx, cu_num, *shape): (tile, wgm)}``.
+    """Parse the tuned config CSV into ``{(gfx, cu_num, *shape): (tile, wgm, splitk)}``.
 
     The device columns stay in the key instead of filtering the frame, as in
     ``gemm_op_a8w8.get_CKGEMM_config`` and ``tuned_gemm.get_GEMM_A16W16_config``:
@@ -126,9 +236,24 @@ def _load_tuned_table():
         table = {}
         for row in df.itertuples(index=False):
             key = (str(row.gfx).strip(), int(row.cu_num)) + tuple(
-                bool(getattr(row, c)) if c == "bias" else int(getattr(row, c))
+                (
+                    _parse_tuned_bool(getattr(row, c))
+                    if c == "bias"
+                    else int(getattr(row, c))
+                )
                 for c in TUNED_KEY_COLUMNS
             )
+            raw_sk = getattr(row, "splitK", None)
+            if raw_sk is None:
+                raw_sk = getattr(row, "splitk", None)
+            try:
+                splitk = (
+                    int(raw_sk) if raw_sk is not None and str(raw_sk) != "" else None
+                )
+            except (TypeError, ValueError):
+                splitk = None
+            if splitk is not None:
+                splitk = splitk or 1
             table[key] = (
                 (
                     int(row.tile_m),
@@ -137,6 +262,7 @@ def _load_tuned_table():
                     int(row.wave_n),
                 ),
                 int(row.wgm),
+                splitk,
             )
         return table
     except Exception as exc:  # noqa: BLE001  a bad config table must never break a conv
@@ -170,9 +296,11 @@ def _log_tuned_lookup(table, dev, key, hit):
         if not AITER_LOG_TUNED_CONFIG:
             return
         _TUNED_LOOKUP_LOGGED.add((dev, key))
+        splitk = hit[2]
+        sk_s = f", splitK={splitk}" if splitk is not None else ""
         logger.info(
             f"conv3d_implicit: {shape} is tuned on gfx={dev[0]}, "
-            f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}."
+            f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}."
         )
         return
 
@@ -192,15 +320,21 @@ def _log_tuned_lookup(table, dev, key, hit):
 
 
 def _lookup_tuned_tile(key, device):
-    """Offline-tuned launch config for this exact problem, or None."""
+    """Offline-tuned launch config for this exact problem, or None.
+
+    Device identity matches the tuner stamp (``get_gfx`` / ``get_cu_num``), not
+    ``torch.cuda.get_device_properties``: those two disagree under ``GPU_ARCHS`` /
+    ``CU_NUM`` / CU partition, and a miss would silently drop a tuned row.
+    Mixed-arch hosts should set ``HIP_VISIBLE_DEVICES`` the same way GEMM does.
+    ``device`` is unused for the key; kept so call sites stay unchanged.
+    """
+    del device
     if key is None:
         return None
     try:
-        props = torch.cuda.get_device_properties(device)
-        # Not chip_info.get_gfx_runtime(), which the GEMM lookups use: that reads
-        # rocminfo's first GPU, while this has to answer for the device the conv
-        # launches on. The two agree except on a mixed-arch host.
-        dev = (props.gcnArchName.split(":")[0], props.multi_processor_count)
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+        dev = (get_gfx(), get_cu_num())
     except Exception:  # noqa: BLE001  same: degrade to the heuristic
         return None
     table = _load_tuned_table()
@@ -423,9 +557,9 @@ def _as_tuple(v, rank, name):
     t = tuple(v)
     if len(t) == 1:
         return t * rank
-    assert (
-        len(t) == rank
-    ), f"{name} must be an int or a sequence of 1 or {rank} ints, got {tuple(v)}"
+    assert len(t) == rank, (
+        f"{name} must be an int or a sequence of 1 or {rank} ints, got {tuple(v)}"
+    )
     return t
 
 
@@ -439,9 +573,9 @@ def _resolve_padding(padding, kernel, stride, dilation):
         return (0, 0, 0), (0, 0, 0)
     if padding != "same":
         raise ValueError(f"padding string must be 'same' or 'valid', got {padding!r}")
-    assert all(
-        s == 1 for s in stride
-    ), f"padding='same' is not supported for strided convolutions, got stride {tuple(stride)}"
+    assert all(s == 1 for s in stride), (
+        f"padding='same' is not supported for strided convolutions, got stride {tuple(stride)}"
+    )
     total = [dl * (kn - 1) for kn, dl in zip(kernel, dilation)]
     return tuple(t // 2 for t in total), tuple(t - t // 2 for t in total)
 
@@ -470,12 +604,12 @@ def _conv3d_impl(
     k, wc, kt, kh, kw = weight.shape
 
     for name, t in (("x", x), ("weight", weight), ("bias", bias)):
-        assert (
-            t is None or t.is_cuda
-        ), f"flydsl_conv_implicit needs GPU tensors; {name} is on {t.device}"
-    assert (
-        x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-    ), f"flydsl_conv_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
+        assert t is None or t.is_cuda, (
+            f"flydsl_conv_implicit needs GPU tensors; {name} is on {t.device}"
+        )
+    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        f"flydsl_conv_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
+    )
     assert bias is None or (bias.dim() == 1 and bias.numel() == k), (
         f"bias must be a 1-D tensor of {k} elements, one per output channel; "
         f"got shape {tuple(bias.shape)}"
@@ -487,27 +621,27 @@ def _conv3d_impl(
     assert wc == c // groups, f"weight in-channels {wc} != C/groups = {c // groups}"
     st, sh, sw = _as_tuple(stride, 3, "stride")
 
-    assert (
-        min(st, sh, sw) >= 1
-    ), f"non-positive stride is not supported, got (st, sh, sw) = {(st, sh, sw)}"
+    assert min(st, sh, sw) >= 1, (
+        f"non-positive stride is not supported, got (st, sh, sw) = {(st, sh, sw)}"
+    )
     dt, dh, dw = _as_tuple(dilation, 3, "dilation")
     assert min(dt, dh, dw) >= 1, f"dilation must be >= 1, got {(dt, dh, dw)}"
     pad_lo, pad_hi = _resolve_padding(padding, (kt, kh, kw), (st, sh, sw), (dt, dh, dw))
     pt, ph, pw = pad_lo
-    assert (
-        padding_mode in PADDING_MODES
-    ), f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
+    assert padding_mode in PADDING_MODES, (
+        f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}"
+    )
 
     if padding_mode in ("reflect", "circular"):
         for ax, (p, ext) in enumerate(zip(map(max, pad_lo, pad_hi), (d, h, w))):
             if padding_mode == "reflect":
-                assert (
-                    p < ext
-                ), f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
+                assert p < ext, (
+                    f"reflect padding {p} must be < input extent {ext} on spatial axis {ax}"
+                )
             else:
-                assert (
-                    p <= ext
-                ), f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
+                assert p <= ext, (
+                    f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
+                )
 
     # Key into the offline-tuned config table. Captured here, before the padding
     # and channel-padding paths below rewrite n/c/d/h/w, so that it describes the
@@ -595,9 +729,9 @@ def _conv3d_impl(
     do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
     ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
     wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
-    assert (
-        min(do, ho, wo) >= 1
-    ), f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
+    assert min(do, ho, wo) >= 1, (
+        f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
+    )
     npq = n * do * ho * wo
 
     if n == 0:
@@ -606,6 +740,7 @@ def _conv3d_impl(
 
     cg = c // groups
     cgp = _pad_channels(cg)
+    c_in = c
     if cgp != cg:
         if in_ndhwc:
             x = torch.nn.functional.pad(
@@ -631,17 +766,20 @@ def _conv3d_impl(
     x_ndhwc = x.contiguous() if in_ndhwc else _ncdhw_to_ndhwc(x, stream)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
-    def _run(the_tile, the_wgm=1):
-        sk = _resolve_splitk(splitk, npq, crs, k, x.device, the_tile, groups)
+    def _run(the_tile, the_wgm=1, tuned_splitk=None):
+        # Caller ``splitk=`` wins; else freeze the CSV value so AOT and runtime
+        # share one compile key. ``None`` still means "derive from CU count".
+        sk_arg = splitk if splitk is not None else tuned_splitk
+        sk = _resolve_splitk(sk_arg, npq, crs, k, x.device, the_tile, groups)
         if sk > 1:
             y = torch.zeros((npq, k), device=x.device, dtype=torch.float32)
         else:
             out_shape = (n, do, ho, wo, k) if out_ndhwc else (n, k, do, ho, wo)
             y = torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
         exe = compile_conv3d_implicit(
-            make_conv3d_implicit_param(
+            _implicit_param_from_problem(
                 n,
-                c,
+                c_in,
                 d,
                 h,
                 w,
@@ -658,26 +796,27 @@ def _conv3d_impl(
                 dt,
                 dh,
                 dw,
-                pad_mode,
+                groups,
                 has_bias,
                 sk,
                 the_tile,
                 the_wgm,
-                groups,
                 out_ndhwc,
+                pad_mode,
             )
         )
         _dispatch(exe, y, x_ndhwc, w_packed, bias_arg, stream=launch_stream)
         return y, sk
 
     forced_wgm = None if wgm is None else max(1, int(wgm))
+    tuned_splitk = None
     if tile is not None:
         chosen_tile = tuple(tile)
         chosen_wgm = 1 if forced_wgm is None else forced_wgm
     else:
         hit = _lookup_tuned_tile(tuned_key, x.device)
         if hit is not None:
-            chosen_tile, chosen_wgm = hit
+            chosen_tile, chosen_wgm, tuned_splitk = hit
             if forced_wgm is not None:
                 chosen_wgm = forced_wgm
         else:
@@ -688,7 +827,7 @@ def _conv3d_impl(
                 else forced_wgm
             )
 
-    y, sk = _run(chosen_tile, chosen_wgm)
+    y, sk = _run(chosen_tile, chosen_wgm, tuned_splitk=tuned_splitk)
     if sk > 1:
         if has_bias:
             y = y + bias_arg.view(1, k)

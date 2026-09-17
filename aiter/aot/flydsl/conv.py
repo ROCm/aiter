@@ -35,11 +35,15 @@ Coverage is otherwise exactly the CSV, with no generalisation.
 ``compile_conv3d_implicit`` takes the whole problem shape as compile-time
 constants -- the im2col div/mod folding against ``(kT, kH, kW)`` and
 ``C/groups`` is where this kernel's performance comes from -- so a resolution,
-frame count or bias flag outside the table still JITs. These compile keys are
-derived here and again in ``_conv3d_impl``, and a disagreement between the two
-is silent: the shape just falls back to JIT. Nothing checks that automatically
--- ``run_only_env()`` makes FlyDSL raise on a JIT rather than fall back, which
-is how to verify a row by hand.
+frame count or bias flag outside the table still JITs.
+
+The compile key is built by ``conv_kernels._implicit_param_from_problem``, the
+same helper ``_conv3d_impl`` calls, so the channel padding and field order
+cannot drift between the two. What the CSV still has to agree on is ``splitK``:
+the runtime freezes the tuned row's value rather than re-deriving it, so a row
+whose ``splitK`` column is missing falls back to the CU-count heuristic and can
+miss this cache. ``run_only_env()`` makes FlyDSL raise on a JIT rather than
+fall back, which is how to verify a row by hand.
 
 Usage::
 
@@ -76,12 +80,12 @@ from aiter.ops.flydsl.conv_kernels import (
     TUNED_KEY_COLUMNS,
     TUNED_RESULT_COLUMNS,
     _dispatch,
+    _implicit_param_from_problem,
+    _is_matmul_fast_path,
     _pad_channels,
+    _parse_tuned_bool,
 )
-from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import (
-    compile_conv3d_implicit,
-    make_conv3d_implicit_param,
-)
+from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,
@@ -92,30 +96,9 @@ DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE]
 CONV_AOT_ARCH_DEFAULT = "gfx950"
 
 # The lookup's key columns, minus bias -- the one that is not an integer, read
-# through _parse_bool below.
+# through _parse_tuned_bool below.
 _INT_COLS = tuple(c for c in TUNED_KEY_COLUMNS if c != "bias")
 _CONFIG_COLS = TUNED_RESULT_COLUMNS
-
-
-def _parse_bool(value: str | None) -> bool:
-    if value is None:
-        return False
-    normalized = value.strip().lower()
-    if normalized in {"", "0", "false", "no"}:
-        return False
-    if normalized in {"1", "true", "yes"}:
-        return True
-    raise ValueError(f"Expected True/False, got {value!r}")
-
-
-def _is_matmul_fast_path(row: dict) -> bool:
-    """Rows the op answers with torch.matmul, so there is no kernel to compile."""
-    return (
-        row["groups"] == 1
-        and row["kT"] == row["kH"] == row["kW"] == 1
-        and row["stride_d"] == row["stride_h"] == row["stride_w"] == 1
-        and row["pad_d"] == row["pad_h"] == row["pad_w"] == 0
-    )
 
 
 def parse_csv(csv_path: str):
@@ -133,7 +116,7 @@ def parse_csv(csv_path: str):
             try:
                 shape = {c: int(row[c]) for c in _INT_COLS}
                 config = {c: int(row[c]) for c in _CONFIG_COLS}
-                has_bias = _parse_bool(row.get("bias"))
+                has_bias = _parse_tuned_bool(row.get("bias"))
                 # Recorded by the tuner. Re-deriving it here would need the
                 # target's CU count, which a build host may not have.
                 splitk = int(row.get("splitK") or 1) or 1
@@ -162,7 +145,6 @@ def parse_csv(csv_path: str):
                     "kernel_name": "conv3d_implicit_kernel",
                     "cu_num": cu_num,
                     "gfx": gfx,
-                    "c_padded": c_padded,
                     "has_bias": has_bias,
                     "splitk": max(1, splitk),
                     "out_ndhwc": out_ndhwc,
@@ -239,7 +221,7 @@ def _conv_probe_args(splitk: int):
 def _compile_conv3d_to_cache(
     *,
     N: int,
-    c_padded: int,
+    C: int,
     D: int,
     H: int,
     W: int,
@@ -270,9 +252,9 @@ def _compile_conv3d_to_cache(
     del kwargs
 
     exe = compile_conv3d_implicit(
-        make_conv3d_implicit_param(
+        _implicit_param_from_problem(
             N,
-            c_padded,
+            C,
             D,
             H,
             W,
@@ -289,16 +271,16 @@ def _compile_conv3d_to_cache(
             dil_d,
             dil_h,
             dil_w,
-            # The runtime only reaches the table for zero padding (an asymmetric
-            # pad cannot be expressed with one value per axis), so this is the
-            # only mode a tuned row can describe.
-            "zeros",
+            groups,
             has_bias,
             splitk,
             (tile_m, tile_n, wave_m, wave_n),
             wgm,
-            groups,
             out_ndhwc,
+            # The runtime only reaches the table for zero padding (an asymmetric
+            # pad cannot be expressed with one value per axis), so this is the
+            # only mode a tuned row can describe.
+            "zeros",
         )
     )
     with compile_only_env():
