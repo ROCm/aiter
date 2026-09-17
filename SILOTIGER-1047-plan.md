@@ -628,6 +628,14 @@ along ``D``) were measured and **not shipped**. Decode ``M=1`` went to
 ~24.5 µs from the kept ~18.7–19.1 µs; prefill was only a small win
 (~0.51–0.54 ms). Scalar per-``D`` merge stays.
 
+Ping-pong K/V/P plus softmax ``alpha`` LDS (two stages, drop the
+loop-top barrier, keep ``BLOCK_N=16``) was measured and **not
+shipped**. Decode was flat-to-worse (``M=1`` ~19.1–19.5 µs vs kept
+~18.7–19.1 µs; ``M=8`` ~23.2–25.5 µs vs kept ~23.0–25.0 µs). Prefill
+regressed to ~0.65–0.68 ms vs kept ~0.52–0.55 ms. Extra ~17 KB LDS
+did not hide the remaining K/V + C + P barriers and hurt the
+prefill point. Loop-top barrier stays.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

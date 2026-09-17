@@ -456,6 +456,11 @@ prefill ~0.66 ms with sparse ``1e-2`` misses at ``M=512``.
 decode ``M=1`` ~24.5 µs vs kept ~18.7–19.1 µs. Scalar per-``D`` merge
 stays.
 
+Ping-pong K/V/P plus softmax ``alpha`` LDS (drop the loop-top
+barrier, keep ``BLOCK_N=16``) was measured and not shipped: decode
+flat-to-worse (``M=1`` ~19.1–19.5 µs), prefill ~0.65–0.68 ms vs kept
+~0.52–0.55 ms. Loop-top barrier stays.
+
 
 
 
