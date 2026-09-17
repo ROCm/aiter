@@ -84,6 +84,46 @@ value is `2`; the equivalent `hipblaslt-bench` argument value is
 `--scaleA 3 --scaleB 3`. hipBLASLt maps API value `2` to its internal
 `Block_32_UE8M0` value `3` before constructing the Tensile problem.
 
+## Official client block-32 check
+
+The official `hipblaslt-bench` client was built from hipBLASLt commit
+`bc4ca6ea` and run against the rebuilt host library and merged gfx1250 device
+library. Every invocation explicitly used `--scaleA 3 --scaleB 3`; the client
+help identifies value `3` as `B32E8`, and every printed result row contains
+`scaleA=3, scaleB=3`. The selected names also contain
+`MXAE8B32_MXBE8B32`, and the merged logic declares `MXBlockA: 32` and
+`MXBlockB: 32`.
+
+| N | K | Client scale A | Client scale B | YAML index | Selected index | Match | Client time (us) |
+|---:|---:|---:|---:|---:|---:|:---:|---:|
+| 6144 | 7168 | 3 | 3 | 0 | 0 | yes | 16.2579 |
+| 7168 | 3072 | 3 | 3 | 1 | 1 | yes | 9.65846 |
+| 7168 | 16384 | 3 | 3 | 2 | 2 | yes | 30.1784 |
+| 65536 | 1536 | 3 | 3 | 3 | 3 | yes | 23.6426 |
+| 2048 | 7168 | 3 | 3 | 4 | 4 | yes | 12.5696 |
+| 8192 | 1536 | 3 | 3 | 5 | 5 | yes | 6.72687 |
+
+The parsed client output, including full solution names, is in
+[the official block-32 CSV](hipblaslt_tuning/official_client_block32.csv).
+These standalone-client timings use five cold calls and 100 timed calls with
+the GPU timer. They verify mode and solution selection; the same-process
+Python table above remains the direct performance comparison with FlyDSL B.
+
+The client command for each `(N,K)` pair was:
+
+```bash
+env -u TENSILE_DB -u TENSILE_DB2 \
+  LD_PRELOAD=<rebuilt-prefix>/lib/libhipblaslt.so.1 \
+  HIPBLASLT_TENSILE_LIBPATH=<generated-library>/gfx1250 \
+  hipblaslt-bench \
+    -m 512 -n <N> -k <K> --transA T --transB N \
+    --a_type f8_r --b_type f8_r --c_type bf16_r --d_type bf16_r \
+    --compute_type f32_r --scaleA 3 --scaleB 3 \
+    --alpha 1 --beta 0 --algo_method heuristic --requested_solution 1 \
+    --print_kernel_info --use_gpu_timer --initialization hpl \
+    --cold_iters 5 --iters 100
+```
+
 ## Why tuning did not broadly improve performance
 
 Every tuning input contains one candidate and every run reports
