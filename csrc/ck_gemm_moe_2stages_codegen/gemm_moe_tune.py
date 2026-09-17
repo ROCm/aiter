@@ -959,12 +959,6 @@ class FmoeTuner(TunerCommon):
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
-        reference_v = {
-            **v,
-            "isq": torch.zeros_like(v["isq"]),
-            "iss": torch.zeros_like(v["iss"]),
-        }
-        _v2_populate_stage2(d, reference_v, token, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
         a1_scale_sort = moe_mxfp4_sort(
             d["a1_scale"][:token, :].view(token, 1, -1),
@@ -984,7 +978,6 @@ class FmoeTuner(TunerCommon):
             "isq": v["isq"],
             "n": v["n"],
             "ref1": d["ref1"],
-            "ref1_scale": reference_v["iss"],
             "topk_ids": d["topk_ids"],
         }
 
@@ -1010,7 +1003,7 @@ class FmoeTuner(TunerCommon):
     ):
         # Time ONLY the runtime v2 gemm1 kernel: flydsl_moe_stage1(v2_output_layout=True).
         # a1_scale_sort is precomputed in generate_v2_stage1_data (not timed).
-        out, scale = flydsl_moe_stage1(
+        out, _scale = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_shuf,
             out=isq,
@@ -1040,7 +1033,7 @@ class FmoeTuner(TunerCommon):
             k_wave=kparams.get("k_wave", 1),
             v2_output_layout=True,
         )
-        return out.view(torch.uint8).view_as(isq), scale.view(torch.uint8)
+        return out.view(torch.uint8).view_as(isq)
 
     @staticmethod
     def generate_v2_stage2_data(
@@ -1156,22 +1149,17 @@ class FmoeTuner(TunerCommon):
         return ref2
 
     @staticmethod
-    def run_v2_stage1_sorted_ref(
-        ref1, ref1_scale, topk_ids, sti, sei, n, token, inter_dim, bm_s1
-    ):
-        return (
-            _v2_stage1_ref(
-                ref1,
-                topk_ids,
-                sti,
-                sei,
-                n,
-                token=token,
-                inter_dim=inter_dim,
-                bm_s1=bm_s1,
-                max_sorted=sti.numel(),
-            ),
-            ref1_scale,
+    def run_v2_stage1_sorted_ref(ref1, topk_ids, sti, sei, n, token, inter_dim, bm_s1):
+        return _v2_stage1_ref(
+            ref1,
+            topk_ids,
+            sti,
+            sei,
+            n,
+            token=token,
+            inter_dim=inter_dim,
+            bm_s1=bm_s1,
+            max_sorted=sti.numel(),
         )
 
     @staticmethod
@@ -3856,7 +3844,7 @@ class FmoeTuner(TunerCommon):
         s1_kernels = get_flydsl_stage1_kernels(adtype, bdtype, out_dtype_str)
 
         from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
-            v2_stage1_output_error,
+            v2_stage1_dequant_cosine_err,
         )
 
         for blockM in blockMs:
@@ -3871,7 +3859,7 @@ class FmoeTuner(TunerCommon):
             # non-splitk (k_batch==1: _v2_output_layout = _fuse_any_quant and
             # not _is_splitk, moe_kernels.py:1179) and tile_m == blockM.
             s1_compare = functools.partial(
-                v2_stage1_output_error, inter_dim=inter_dim, adtype=adtype
+                v2_stage1_dequant_cosine_err, inter_dim=inter_dim, adtype=adtype
             )
             for kname, kparams in s1_kernels.items():
                 if kparams.get("tile_m") != blockM:
@@ -3929,7 +3917,7 @@ class FmoeTuner(TunerCommon):
                         {},
                         FmoeTuner.run_v2_stage1_sorted_ref,
                         (
-                            ["ref1", "ref1_scale", "topk_ids", "sti", "sei", "n"],
+                            ["ref1", "topk_ids", "sti", "sei", "n"],
                             token,
                             inter_dim,
                             blockM,
