@@ -1,0 +1,4 @@
+.triton_cache/
+__pycache__/
+# the compiled ELF, re-emitted on every run; the textual IRs are what reviews
+*_hsaco.bin
