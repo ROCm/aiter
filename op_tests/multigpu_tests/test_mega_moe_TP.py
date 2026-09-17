@@ -30,9 +30,14 @@ What this file provides
   *separately timeable* modules: ``AllGatherTokens``, GEMM1, GEMM2 (both taken
   from the very kernels ``test_moe_2stage.py`` drives through ``fused_moe``),
   and ``ReduceScatterOutput``.
-* ``MegaMoeTP``            -- interface placeholder for the future fused kernel
-  that will collapse all four into one launch.  Not implemented yet; see
-  ``mega_moe_plan.txt`` at the repo root for the design.
+* ``MegaMoeTP``            -- the fused implementation, a thin adapter over
+  ``aiter.ops.flydsl.mega_moe_tp``.  It keeps the same tuned GEMM1/GEMM2 and replaces
+  everything around them: the activation is MXFP4-quantized *before* the
+  AllGather (3.77x less wire traffic), the AllGather itself is one P2P push
+  kernel straight into every peer's arena, GEMM2 accumulates into that arena,
+  and the ReduceScatter is a publish + pull-reduce pair over the same mapping.
+  ``--impl both`` runs it next to the unfused chain and gates it on both the
+  torch reference and the unfused output.
 
 Only a4w4 (MXFP4 activation x MXFP4 weight, ``QuantType.per_1x32``) is wired up
 for now.
@@ -93,6 +98,8 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP as MegaMoeTPEngine
+from aiter.ops.flydsl.mega_moe_tp import MegaMoeTPConfig, mega_moe_tp_supported
 from aiter.ops.quant import get_hip_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility import fp4_utils
@@ -729,43 +736,19 @@ class MegaMoeTpNotImplemented(NotImplementedError):
 
 
 class MegaMoeTP:
-    """Interface placeholder for the fused AG + GEMM1 + GEMM2 + RS MoE kernel.
+    """Test-side adapter for the fused AG + GEMM1 + GEMM2 + RS MoE runtime.
 
-    Drop-in contract
-    ----------------
-    ``MegaMoeTP`` must be interchangeable with :class:`UnfusedTpMoe`::
+    The engine lives in :mod:`aiter.ops.flydsl.mega_moe_tp`; this class only maps the
+    test's ``TpMoeWeights`` / ``TpMoeInputs`` onto it, so ``MegaMoeTP`` stays
+    interchangeable with :class:`UnfusedTpMoe`::
 
         moe = MegaMoeTP(weights, ctx, max_local_tokens=...)
         y_local = moe(inputs)          # [m, model_dim] bf16
-
-    Intended internal structure (see ``mega_moe_plan.txt`` for the full design):
-
-    K1 = quantize local shard -> P2P AllGather push -> global route planning
-         -> GEMM1 -> activation -> a2 quantization
-       * quantize before the AllGather: the wire row drops from ``H*2`` to
-         ``H/2 + H/32`` bytes (3.77x) and each rank quantizes only its own m
-         rows instead of all M.
-       * destination offsets are *static* (rank p writes at ``p*m``), so the
-         whole histogram / count-exchange / dynamic-base machinery that
-         ``mega_moe/dispatch.py`` needs for EP all-to-all collapses into a
-         fixed-stride push.
-
-    K2 = GEMM2 -> weighted top-k reduction -> ReduceScatter -> cross-TP accumulate
-       * reuse ``mega_moe_stage2.p2p_scatter_epilog`` with the owner mapping
-         changed from "token's source rank" to ``row // m``.
-       * ``comm_fused_moe``'s ``direct`` collective is a good model for the
-         receive side: pull all TP partials rather than pushing, which removes
-         the destination-side atomic counters entirely.
-
-    Both kernels should assign CTA roles by atomic ticket and gate every flag on
-    a monotone epoch counter, so CUDA graph replay stays correct without any
-    buffer clearing.
     """
 
     name = "mega_moe_tp"
 
-    # Flip to True (and implement ``__call__``) once the kernel lands.
-    IMPLEMENTED = False
+    IMPLEMENTED = True
 
     def __init__(
         self,
@@ -773,8 +756,8 @@ class MegaMoeTP:
         ctx: DistCtx,
         max_local_tokens: int,
         *,
-        ag_wire_quant: str = "fp4_1x32",
-        rs_wire_quant: str = "fp8_1x32",
+        ag_wire_quant: str = "auto",
+        rs_wire_quant: str = "auto",
     ):
         self.weights = weights
         self.shape = weights.shape
@@ -784,37 +767,54 @@ class MegaMoeTP:
         self.max_global_tokens = max_local_tokens * weights.tp_size
         self.ag_wire_quant = ag_wire_quant
         self.rs_wire_quant = rs_wire_quant
-        # Symmetric-heap workspace, route metadata and epoch counters will hang
-        # off here.  Everything must be allocated once, in __init__, so that
-        # forward() is allocation-free and CUDA-graph capturable.
-        self.workspace: dict[str, torch.Tensor] = {}
+        situ = self.shape.act_type == aiter.ActivationType.Situv2
+        self.config = MegaMoeTPConfig(
+            rank=ctx.rank,
+            world_size=weights.tp_size,
+            model_dim=self.shape.model_dim,
+            inter_dim=weights.local_inter_dim,
+            experts=self.shape.experts,
+            topk=self.shape.topk,
+            max_local_tokens=max_local_tokens,
+            activation=self.shape.act_type,
+            beta=DEFAULT_SITUV2_BETA if situ else None,
+            linear_beta=DEFAULT_SITUV2_LINEAR_BETA if situ else None,
+            ag_wire=ag_wire_quant,
+            rs_wire=rs_wire_quant,
+        )
+        self.engine = MegaMoeTPEngine(
+            self.config,
+            w1=weights.w1,
+            w1_scale=weights.w1_scale,
+            w2=weights.w2,
+            w2_scale=weights.w2_scale,
+            device=ctx.device,
+        )
 
     @classmethod
     def is_available(cls, shape: ModelShape | None = None, tp_size: int = 8) -> bool:
         """Whether the fused kernel can serve this shape on this machine."""
         if not cls.IMPLEMENTED:
             return False
-        return os.environ.get("AITER_MEGA_MOE_TP", "0") == "1"
+        return mega_moe_tp_supported()
 
     @classmethod
     def unavailable_reason(cls) -> str:
         if not cls.IMPLEMENTED:
             return "MegaMoeTP.IMPLEMENTED is False (fused kernel not written yet)"
-        if os.environ.get("AITER_MEGA_MOE_TP", "0") != "1":
-            return "AITER_MEGA_MOE_TP != 1"
+        if not mega_moe_tp_supported():
+            return f"fused TP MoE needs {SUPPORTED_GFX}, found {get_gfx()}"
         return ""
 
-    def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
-        raise MegaMoeTpNotImplemented(
-            "MegaMoeTP is an interface placeholder: "
-            f"{self.unavailable_reason()}. Implement K1/K2 as described in the "
-            "class docstring and mega_moe_plan.txt, then set IMPLEMENTED = True."
-        )
+    def plan(self, global_tokens: int):
+        return self.engine.plan(global_tokens)
 
-    # -- stubs the implementation is expected to fill in --------------------
-    def preload(self) -> None:
-        """AOT-compile every token-bucket variant without launching anything."""
-        raise MegaMoeTpNotImplemented("MegaMoeTP.preload")
+    def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
+        return self.engine(
+            inputs.x_local,
+            inputs.topk_weights_local,
+            inputs.topk_ids_local,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1015,50 @@ def run_case(
     if int(nan_flag.item()):
         raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: output has NaN")
 
+    # ---------------- fused implementation: accuracy ----------------
+    # Run before the early `--no-perf` return so an accuracy-only sweep still
+    # exercises the fused path. `fused` stays alive for the timing block below.
+    fused = None
+    if args.impl in ("fused", "both"):
+        if not MegaMoeTP.is_available(shape, tp):
+            row["fused_us"] = float("nan")
+            row["fused_note"] = MegaMoeTP.unavailable_reason()
+        else:
+            fused = MegaMoeTP(
+                weights,
+                ctx,
+                max_local_tokens,
+                ag_wire_quant=args.ag_wire,
+                rs_wire_quant=args.rs_wire,
+            )
+            plan = fused.plan(global_tokens)
+            row["fused_ag_wire"] = plan.ag_wire
+            y_fused = fused(inputs)
+            # The unfused path is the oracle here: both run the same tuned
+            # GEMMs, so anything beyond quantization noise is a fusion bug.
+            row["fused_rel_l2"] = rel_l2(y_fused, y_actual)
+            del y_fused
+            if not (row["fused_rel_l2"] == row["fused_rel_l2"]):  # NaN
+                raise AssertionError(
+                    f"{shape.tag(tp)} tokens={global_tokens}: fused rel_l2 NaN"
+                )
+            if row["fused_rel_l2"] >= args.fused_rtol:
+                raise AssertionError(
+                    f"{shape.tag(tp)} tokens={global_tokens}: fused vs unfused "
+                    f"rel_l2={row['fused_rel_l2']:.6f} exceeds {args.fused_rtol}"
+                )
+            if global_tokens <= args.accuracy_max_tokens:
+                reference = TorchReferenceTpMoe(weights, ctx)
+                y_expected = reference(inputs, moe.allgather)
+                row["fused_ref_rel_l2"] = rel_l2(fused(inputs), y_expected)
+                del y_expected
+                torch.cuda.empty_cache()
+                if row["fused_ref_rel_l2"] >= args.rtol:
+                    raise AssertionError(
+                        f"{shape.tag(tp)} tokens={global_tokens}: fused vs torch "
+                        f"rel_l2={row['fused_ref_rel_l2']:.6f} exceeds {args.rtol}"
+                    )
+
     if args.no_perf:
         return row
 
@@ -1076,17 +1120,43 @@ def run_case(
         ) / probe.wire_bytes(inputs.local_tokens)
 
     # ---------------- fused implementation, when it exists ----------------
-    if args.impl in ("fused", "both"):
-        fused = MegaMoeTP(weights, ctx, max_local_tokens)
-        if not MegaMoeTP.is_available(shape, tp):
-            row["fused_us"] = float("nan")
-            row["fused_note"] = MegaMoeTP.unavailable_reason()
-        else:
-            y_fused = fused(inputs)
-            row["fused_rel_l2"] = rel_l2(y_fused, y_actual)
-            fused_mean, _ = timer(lambda: fused(inputs))
-            row["fused_us"] = fused_mean
-            row["fused_speedup"] = e2e_mean / fused_mean if fused_mean else float("nan")
+    if fused is not None:
+        engine = fused.engine
+        plan = engine.plan(global_tokens)
+        # Break the fused path down the same way as the unfused one, so the two
+        # columns are comparable leg by leg rather than only end to end.
+        f_ag_mean, _ = timer(
+            lambda: engine.all_gather(
+                inputs.x_local,
+                inputs.topk_weights_local,
+                inputs.topk_ids_local,
+                plan=plan,
+            )
+        )
+        a1, a1_scale, f_w, f_i = engine.all_gather(
+            inputs.x_local, inputs.topk_weights_local, inputs.topk_ids_local, plan=plan
+        )
+        # Same local MoE, driven by the unfused wrapper on the *fused* inputs.
+        # Isolates "the arena buffers / prequantized operand made the GEMMs
+        # slower" from "the fused driver's own dispatch costs more".
+        f_moe_mean, _ = timer(lambda: engine.local_moe(a1, a1_scale, f_w, f_i, plan))
+        f_rs_mean, _ = timer(
+            lambda: engine.reduce_scatter(inputs.local_tokens, plan)
+        )
+        fused_mean, _ = timer(lambda: fused(inputs))
+        row.update(
+            {
+                "fused_ag_us": f_ag_mean,
+                "fused_moe_us": f_moe_mean,
+                "fused_rs_us": f_rs_mean,
+                "fused_us": fused_mean,
+                "fused_speedup": (
+                    e2e_mean / fused_mean if fused_mean else float("nan")
+                ),
+                "ag_gain": ag_mean / f_ag_mean if f_ag_mean else float("nan"),
+                "rs_gain": rs_mean / f_rs_mean if f_rs_mean else float("nan"),
+            }
+        )
 
     # Everything above is function-local, so it is released on return; the
     # caller calls empty_cache() between cases.  Do not `del` the tensors the
@@ -1118,7 +1188,15 @@ _PERF_COLUMNS = [
     "ag_speedup",
     "ag_bytes_ratio",
     "quant_local_us",
+    "fused_ag_wire",
+    "fused_rel_l2",
+    "fused_ref_rel_l2",
+    "fused_ag_us",
+    "fused_moe_us",
+    "fused_rs_us",
     "fused_us",
+    "ag_gain",
+    "rs_gain",
     "fused_speedup",
 ]
 
@@ -1164,6 +1242,27 @@ def parse_args(argv=None):
         "(it loops over every expert and gets slow fast).",
     )
     p.add_argument("--rtol", type=float, default=0.06, help="rel_l2 accuracy gate.")
+    p.add_argument(
+        "--fused-rtol",
+        type=float,
+        default=0.02,
+        help="rel_l2 gate for fused-vs-unfused. Both run the same tuned GEMMs, "
+        "so the only legitimate difference is where the activation quantization "
+        "happens; anything larger is a fusion bug, hence the tighter bound.",
+    )
+    p.add_argument(
+        "--ag-wire",
+        choices=["auto", "fp4_1x32", "bf16"],
+        default="auto",
+        help="Wire format for the fused AllGather. 'auto' takes the MXFP4 wire "
+        "whenever the selected GEMM1 accepts a pre-quantized operand.",
+    )
+    p.add_argument(
+        "--rs-wire",
+        choices=["auto", "bf16"],
+        default="auto",
+        help="Wire format for the fused ReduceScatter.",
+    )
     p.add_argument(
         "--route",
         choices=["balanced", "random"],
