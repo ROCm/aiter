@@ -78,7 +78,10 @@ from aiter.ops.flydsl.conv_kernels import (
     _dispatch,
     _pad_channels,
 )
-from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
+from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import (
+    compile_conv3d_implicit,
+    make_conv3d_implicit_param,
+)
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,
@@ -267,34 +270,36 @@ def _compile_conv3d_to_cache(
     del kwargs
 
     exe = compile_conv3d_implicit(
-        N,
-        c_padded,
-        D,
-        H,
-        W,
-        K,
-        kT,
-        kH,
-        kW,
-        stride_d,
-        stride_h,
-        stride_w,
-        pad_d,
-        pad_h,
-        pad_w,
-        dil_d,
-        dil_h,
-        dil_w,
-        # The runtime only reaches the table for zero padding (an asymmetric pad
-        # cannot be expressed with one value per axis), so this is the only mode
-        # a tuned row can describe.
-        "zeros",
-        has_bias,
-        splitk,
-        (tile_m, tile_n, wave_m, wave_n),
-        wgm,
-        groups,
-        out_ndhwc,
+        make_conv3d_implicit_param(
+            N,
+            c_padded,
+            D,
+            H,
+            W,
+            K,
+            kT,
+            kH,
+            kW,
+            stride_d,
+            stride_h,
+            stride_w,
+            pad_d,
+            pad_h,
+            pad_w,
+            dil_d,
+            dil_h,
+            dil_w,
+            # The runtime only reaches the table for zero padding (an asymmetric
+            # pad cannot be expressed with one value per axis), so this is the
+            # only mode a tuned row can describe.
+            "zeros",
+            has_bias,
+            splitk,
+            (tile_m, tile_n, wave_m, wave_n),
+            wgm,
+            groups,
+            out_ndhwc,
+        )
     )
     with compile_only_env():
         _dispatch(exe, *_conv_probe_args(splitk), stream=None)

@@ -110,11 +110,46 @@ def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
     return None
 
 
-# One entry per (shape, launch config). A tuning sweep walks ~100 configs per
-# shape and several shapes land in the same worker process, so the upstream 256
-# would evict entries that the same process still needs.
-@functools.lru_cache(maxsize=1024)
-def compile_conv3d_implicit(
+@fx.struct
+class Conv3dImplicitParam:
+    """One compiled conv3d: the problem it solves and the config it runs.
+
+    Every field is a compile-time constant -- the im2col div/mod folding
+    against the filter extents and C/groups is where this kernel's performance
+    comes from -- so one of these is one artifact, and it is the cache key
+    ``compile_conv3d_implicit`` is memoised on. Build it through
+    ``make_conv3d_implicit_param``, which supplies the defaults fx.struct
+    cannot.
+    """
+
+    n: fx.Constexpr[int]
+    c: fx.Constexpr[int]
+    d: fx.Constexpr[int]
+    h: fx.Constexpr[int]
+    w: fx.Constexpr[int]
+    k: fx.Constexpr[int]
+    kt: fx.Constexpr[int]
+    kh: fx.Constexpr[int]
+    kw: fx.Constexpr[int]
+    st: fx.Constexpr[int]
+    sh: fx.Constexpr[int]
+    sw: fx.Constexpr[int]
+    pt: fx.Constexpr[int]
+    ph: fx.Constexpr[int]
+    pw: fx.Constexpr[int]
+    dt: fx.Constexpr[int]
+    dh: fx.Constexpr[int]
+    dw: fx.Constexpr[int]
+    pad_mode: fx.Constexpr[str]
+    has_bias: fx.Constexpr[bool]
+    splitk: fx.Constexpr[int]
+    tile: fx.Constexpr[tuple]
+    wgm: fx.Constexpr[int]
+    groups: fx.Constexpr[int]
+    out_ndhwc: fx.Constexpr[bool]
+
+
+def make_conv3d_implicit_param(
     n,
     c,
     d,
@@ -141,6 +176,53 @@ def compile_conv3d_implicit(
     groups=1,
     out_ndhwc=False,
 ):
+    """Conv3dImplicitParam with the defaults filled in.
+
+    fx.struct has no field defaults, so the ones a caller may leave out live
+    here, as ``make_gemm_a16w16_gfx950_param`` does for the GEMM.
+    """
+    return Conv3dImplicitParam(
+        n=n,
+        c=c,
+        d=d,
+        h=h,
+        w=w,
+        k=k,
+        kt=kt,
+        kh=kh,
+        kw=kw,
+        st=st,
+        sh=sh,
+        sw=sw,
+        pt=pt,
+        ph=ph,
+        pw=pw,
+        dt=dt,
+        dh=dh,
+        dw=dw,
+        pad_mode=pad_mode,
+        has_bias=has_bias,
+        splitk=splitk,
+        tile=tuple(tile),
+        wgm=wgm,
+        groups=groups,
+        out_ndhwc=out_ndhwc,
+    )
+
+
+# One entry per (shape, launch config). A tuning sweep walks ~100 configs per
+# shape and several shapes land in the same worker process, so the upstream 256
+# would evict entries that the same process still needs.
+@functools.lru_cache(maxsize=1024)
+def compile_conv3d_implicit(param: Conv3dImplicitParam):
+    n, c, d, h, w, k = param.n, param.c, param.d, param.h, param.w, param.k
+    kt, kh, kw = param.kt, param.kh, param.kw
+    st, sh, sw = param.st, param.sh, param.sw
+    pt, ph, pw = param.pt, param.ph, param.pw
+    dt, dh, dw = param.dt, param.dh, param.dw
+    pad_mode, has_bias, splitk = param.pad_mode, param.has_bias, param.splitk
+    tile, wgm, groups, out_ndhwc = param.tile, param.wgm, param.groups, param.out_ndhwc
+
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
     # MFMA atoms per wave. tiled_mma replicates the atom over the (WAVE_M, WAVE_N) wave
