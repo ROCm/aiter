@@ -422,9 +422,6 @@ def compile_mixed_moe_gemm1_common(
     pp_b_loads = [p["b_loads"] for p in pipe_phases]
     pp_has_scale = [p["has_scale"] for p in pipe_phases]
 
-    fp4_ratio = 2 if a_dtype == "fp4" else 1
-    gui_ratio = 1 if gate_up_interleave else 2
-
     if True:
 
         def _emit_moe_gemm1(
@@ -680,11 +677,6 @@ def compile_mixed_moe_gemm1_common(
                 body_lds_x_pong = lds_x_pong
                 body_lds_x_ping = lds_x_ping
                 body_b_has_full_operand = is_f8_b or shared_b
-                body_b_load_mult = 2 if body_b_has_full_operand else 1
-                body_vmcnt_before_barrier = (
-                    tile_m // 32 // fp4_ratio
-                    + tile_n // 32 * gui_ratio * body_b_load_mult
-                )
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
                 if const_expr(shared_b):
                     weight_expert_off_idx = arith.index(0)
@@ -1535,7 +1527,8 @@ def compile_mixed_moe_gemm1_common(
                     if const_expr(heterogeneous_b and use_async_copy):
                         barrier(vmcnt=0)
                     else:
-                        rocdl.s_waitcnt(body_vmcnt_before_barrier)
+                        # Partial VMEM waits can leave LDS-DMA loads crossing the barrier.
+                        rocdl.s_waitcnt(0)
                         barrier()
                     rocdl.sched_barrier(0)
 
@@ -1544,6 +1537,8 @@ def compile_mixed_moe_gemm1_common(
                     )
                     if const_expr(use_async_copy and next_k_dma_py < int(k_dim)):
                         prefetch_x_to_lds(abs_k_dma, lds_write)
+                        # Keep scale loads after the LDS-DMA group.
+                        rocdl.sched_barrier(0)
                     if const_expr(not use_async_copy):
                         x_regs = load_x_tile(abs_k_dma)
 
