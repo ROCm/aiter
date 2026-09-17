@@ -692,20 +692,13 @@ def _grouped_a8w4_tdm_moe(
     )
     _compact_scale_buf = None
     _row_to_token = None
-    _fused_out = None
     if _compact:
-        scale_w = model_dim // 32
         _compact_scale_buf = torch.empty(
-            (token_num, scale_w), dtype=torch.uint8, device=device
+            (token_num, model_dim // 32), dtype=torch.uint8, device=device
         )
         # -1 marks tile padding no route points at, which the rebuild zero-fills.
         _row_to_token = torch.full(
             (int(contiguous_m),), -1, dtype=torch.int32, device=device
-        )
-        _fused_out = torch.empty(
-            (1, contiguous_m // wmma_rep, scale_w * wmma_rep),
-            dtype=torch.uint8,
-            device=device,
         )
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
@@ -721,8 +714,16 @@ def _grouped_a8w4_tdm_moe(
         prequantized_scale=src_a1_scale if _prequantized else None,
         out_scale=_compact_scale_buf,
         row_to_token=_row_to_token,
-        fused_preshuffle_out=_fused_out,
     )
+    if _compact:
+        a1_scale = flydsl_moe_scatter_preshuffle_scale(
+            _compact_scale_buf,
+            _row_to_token,
+            1,
+            contiguous_m,
+            wmma_rep=wmma_rep,
+            scale_k_per_tile=tile_k // 32,
+        )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone

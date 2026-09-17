@@ -2175,8 +2175,9 @@ def build_moe_token_multidest_compact_quant_module(
 
     Like ``build_moe_token_multidest_quant_module`` except the scale goes out one
     contiguous row per source token instead of interleaved, so the stores
-    coalesce; ``build_moe_scale_rebuild_module`` converts it and consumes the
-    ``row_to_token`` map written here. Grid-stride over tokens.
+    coalesce. ``build_moe_scatter_copy_preshuffle_scale_module`` converts it to
+    the layout the GEMM reads, consuming the ``row_to_token`` map written here.
+    Grid-stride over tokens.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -2445,133 +2446,6 @@ def build_moe_token_multidest_compact_quant_module(
         },
     }
     return launch_compact_quant
-
-
-def build_moe_scale_rebuild_module(
-    feat_dim: int,
-    wmma_rep: int,
-    quant_mode: str = "fp4",
-):
-    """Rebuild the 16-row-interleaved e8m0 scale from the compact per-token one.
-
-    One workgroup per destination tile, gathering through LDS so both sides move
-    whole cache lines. ``row_to_token`` maps grouped row -> source token, its -1
-    rows being tile padding to zero-fill. Grid-stride over tiles.
-
-    Its own launch rather than a phase of the quant kernel: an interleaved cache
-    line spans 16 grouped rows from 16 unrelated tokens, so it cannot start until
-    every token is quantized.
-    """
-    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
-    if not L.use_pk8:
-        raise NotImplementedError("scale rebuild requires gfx1250 pk8")
-    if L.lanes_per_mx_block != 4:
-        raise NotImplementedError("scale rebuild needs the pk8 4-lane MX block")
-    if _fused_preshuffle_k_chunks(L) != 1:
-        # A k-sliced tile would need its slices on separate blocks, which the
-        # one-block-per-tile loop below cannot express.
-        raise NotImplementedError("scale rebuild needs the whole row in LDS")
-
-    rows_per_tile = L.rows_per_tile
-    src_dwords = L.mx_blocks_per_row // 4
-    units_per_tile = 16 * src_dwords * wmma_rep
-    k_chunk = src_dwords
-    # One dword of padding per row: the store pass reads an LDS column, whose
-    # natural stride would share banks, and an odd pitch is coprime with 32.
-    lds_pitch = k_chunk + 1
-    units_per_chunk = rows_per_tile * k_chunk
-    VEC = 4 if (k_chunk % 4 == 0) else 1
-    pre_iters = ((units_per_chunk // VEC) + BLOCK_THREADS - 1) // BLOCK_THREADS
-
-    @fx.struct
-    class _ScaleTileStorage:
-        buf: fx.Array[fx.Int32, rows_per_tile * lds_pitch, 16]
-
-    module_name = (
-        f"moe_scale_rebuild_fd{feat_dim}_r{wmma_rep}_{quant_mode}_{L.native_tag}"
-    )
-
-    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-    def scale_rebuild_kernel(
-        compact_scale_buf: fx.Pointer,
-        wmma_scale_out: fx.Pointer,
-        row_to_token: fx.Pointer,
-        num_tiles: Int32,
-        grid_blocks: Int32,
-    ):
-        i32 = T.i32
-        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
-
-        tid = fx.Uint32(fx.thread_idx.x)
-        bid = fx.Uint32(fx.block_idx.x)
-        tile_lds = fx.SharedAllocator().allocate(_ScaleTileStorage).peek().buf.ptr
-
-        map_p = ptr_buf_tensor(row_to_token)
-        src_p = ptr_buf_tensor(compact_scale_buf)
-        dst_p = ptr_buf_tensor(wmma_scale_out)
-        for tile in range(bid, fx.Uint32(num_tiles), fx.Uint32(grid_blocks)):
-            row_base = tile * c_rows_per_tile
-            tile_dword_base = tile * arith.constant(units_per_tile, type=i32)
-
-            for it in range_constexpr(pre_iters):
-                unit = (tid + it * BLOCK_THREADS) * VEC
-                if unit < fx.Uint32(units_per_chunk):
-                    row = unit // k_chunk
-                    sd = unit - row * k_chunk
-                    srow = map_p[row_base + row]
-                    ok = fx.Int32(srow) >= fx.Int32(0)
-                    src_off = ok.select(fx.Uint32(srow) * src_dwords + sd, fx.Uint32(0))
-                    for j in range_constexpr(VEC):
-                        v = fx.Int32(src_p[src_off + j])
-                        tile_lds[row * lds_pitch + sd + j] = ok.select(v, fx.Int32(0))
-
-            gpu.barrier()
-
-            for it in range_constexpr(pre_iters):
-                unit = (tid + it * BLOCK_THREADS) * VEC
-                if unit < fx.Uint32(units_per_chunk):
-                    l16 = unit % 16
-                    t2 = unit // 16
-                    w = t2 % wmma_rep
-                    sd = t2 // wmma_rep
-                    dst_off = tile_dword_base + (sd * wmma_rep + w) * 16 + l16
-                    for j in range_constexpr(VEC):
-                        dst_p[dst_off + j] = tile_lds[
-                            (w * 16 + l16 + j) * lds_pitch + sd
-                        ]
-
-            # The next tile reuses this LDS, so publish the reads before it
-            # starts loading.
-            gpu.barrier()
-
-    @flyc.jit
-    def launch_scale_rebuild(
-        compact_scale_buf: fx.Pointer,
-        wmma_scale_out: fx.Pointer,
-        row_to_token: fx.Pointer,
-        num_tiles: fx.Int32,
-        grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        scale_rebuild_kernel(
-            compact_scale_buf,
-            wmma_scale_out,
-            row_to_token,
-            num_tiles,
-            grid_blocks,
-        ).launch(
-            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
-
-    launch_scale_rebuild.compile_hints = {
-        "llvm_options": {
-            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
-            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-        },
-    }
-    return launch_scale_rebuild
 
 
 def build_moe_fused_route_psum_quant_scatter_module(

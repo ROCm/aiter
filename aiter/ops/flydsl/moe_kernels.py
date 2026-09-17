@@ -3018,18 +3018,6 @@ def _get_compiled_token_multidest_compact_quant(
 
 
 @functools.cache
-def _get_compiled_scale_rebuild(feat_dim: int, wmma_rep: int, quant_mode: str):
-    """Compile and cache the scale rebuild kernel (second of the pair)."""
-    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
-        build_moe_scale_rebuild_module,
-    )
-
-    return build_moe_scale_rebuild_module(
-        feat_dim=feat_dim, wmma_rep=wmma_rep, quant_mode=quant_mode
-    )
-
-
-@functools.cache
 def _get_compiled_token_multidest_quant(
     feat_dim: int,
     wmma_rep: int,
@@ -3099,16 +3087,14 @@ def flydsl_moe_fused_quant_preshuffle(
     # ``quant_mode``: the sender already quantized, so the kernel only scatters
     # + preshuffles.
     prequantized_scale: torch.Tensor | None = None,
-    # (contiguous_m,) int32: grouped row -> source token, for the rebuild's gather
+    # (contiguous_m,) int32 out: grouped row -> source token. Supplying it selects
+    # the compact scale, so ``out_scale`` takes one row-major row per token and the
+    # caller rebuilds the GEMM's layout with flydsl_moe_scatter_preshuffle_scale.
     row_to_token: torch.Tensor | None = None,
-    # When given, a second launch rebuilds the interleaved scale into this buffer
-    # and ``out_scale`` becomes the compact per-token staging buffer instead.
-    fused_preshuffle_out: torch.Tensor | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
-    Returns (payload, scale_preshuffle). Pass masked_m to skip padding rows, and
-    ``fused_preshuffle_out`` to take the compact-then-rebuild pair.
+    Returns (payload, scale). Pass masked_m to skip padding rows.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -3207,19 +3193,11 @@ def flydsl_moe_fused_quant_preshuffle(
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
             in ("1", "true", "True")
         )
-        if use_token_multidest and fused_preshuffle_out is not None:
+        if use_token_multidest and row_to_token is not None:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_tdm_chunks,
             )
 
-            rows_per_tile = wmma_rep * 16
-            num_tiles = int(fused_preshuffle_out.shape[-2]) * wmma_rep // rows_per_tile
-            compact_p = ptr_arg(out_scale.view(-1))
-            wmma_p = ptr_arg(fused_preshuffle_out.view(-1))
-            row_map_p = ptr_arg(row_to_token.reshape(-1))
-            stream = torch.cuda.current_stream()
-
-            # Same stream: the rebuild must see every token quantized.
             _get_compiled_token_multidest_compact_quant(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
@@ -3231,22 +3209,14 @@ def flydsl_moe_fused_quant_preshuffle(
             )(
                 ptr_arg(grouped_in.contiguous().view(-1)),
                 ptr_arg(out_payload.view(-1)),
-                compact_p,
+                ptr_arg(out_scale.view(-1)),
                 ptr_arg(topids_to_rows_i32),
-                row_map_p,
+                ptr_arg(row_to_token.reshape(-1)),
                 token_num,
                 (token_num + warps_per_block - 1) // warps_per_block,
-                stream=stream,
+                stream=torch.cuda.current_stream(),
             )
-            _get_compiled_scale_rebuild(feat_dim, wmma_rep, quant_mode)(
-                compact_p,
-                wmma_p,
-                row_map_p,
-                num_tiles,
-                num_tiles,
-                stream=stream,
-            )
-            return out_payload, fused_preshuffle_out
+            return out_payload, out_scale
         if use_token_multidest:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_ksplit,

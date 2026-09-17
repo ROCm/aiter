@@ -56,7 +56,7 @@ Block : (BLOCK_THREADS, 1, 1)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -66,6 +66,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 BLOCK_THREADS = 256
+# LDS a staged row-tile may take. Past this the tile is written straight out,
+# which costs the scattered source reads but needs no scratch.
+_STAGE_LDS = 32768
 
 
 def _emit_preshuffle_dword(gather, map_p, src_p, grow, sd, src_dwords):
@@ -124,6 +127,19 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     rows_per_tile = wmma_rep * 16  # grouped rows per row-tile
     units_per_tile = 16 * src_dwords * wmma_rep
 
+    # Written straight out, adjacent lanes read adjacent grouped ROWS, so the
+    # source side moves one dword per line. Staging through LDS lets the load
+    # walk a row instead, leaving both sides on whole lines. The odd pitch keeps
+    # the store pass's LDS column off one bank.
+    lds_pitch = src_dwords + 1
+    stage_in_lds = rows_per_tile * lds_pitch * 4 <= _STAGE_LDS
+    VEC = 4 if src_dwords % 4 == 0 else 1
+    stage_iters = ((units_per_tile // VEC) + BLOCK_THREADS - 1) // BLOCK_THREADS
+
+    @fx.struct
+    class _ScaleTileStorage:
+        buf: fx.Array[fx.Int32, rows_per_tile * lds_pitch, 16]
+
     _g = "g" if gather else "p"
     module_name = f"moe_scatter_preshuffle_scale_b{row_bytes}_r{wmma_rep}_k{scale_k_per_tile}_{_g}"
 
@@ -157,21 +173,52 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         src_p = ptr_buf_tensor(src)
         dst_p = ptr_buf_tensor(dst)
 
-        for it in range_constexpr(
-            (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS
-        ):
-            unit = tid + it * BLOCK_THREADS
-            if unit < fx.Uint32(units_per_tile):
-                lane = unit % 16
-                t2 = unit // 16
-                w = t2 % wmma_rep
-                sd = t2 // wmma_rep
-                grow = row_base + w * 16 + lane
-                value = _emit_preshuffle_dword(
-                    gather, map_p, src_p, grow, sd, src_dwords
-                )
-                dst_off = tile_dword_base + (sd * wmma_rep + w) * 16 + lane
-                dst_p[dst_off] = value
+        if stage_in_lds:
+            tile_lds = fx.SharedAllocator().allocate(_ScaleTileStorage).peek().buf.ptr
+
+            for it in range_constexpr(stage_iters):
+                unit = (tid + it * BLOCK_THREADS) * VEC
+                if unit < fx.Uint32(units_per_tile):
+                    row = unit // src_dwords
+                    sd = unit - row * src_dwords
+                    grow = row_base + row
+                    for j in range_constexpr(VEC):
+                        tile_lds[row * lds_pitch + sd + j] = fx.Int32(
+                            _emit_preshuffle_dword(
+                                gather, map_p, src_p, grow, sd + j, src_dwords
+                            )
+                        )
+
+            gpu.barrier()
+
+            for it in range_constexpr(stage_iters):
+                unit = (tid + it * BLOCK_THREADS) * VEC
+                if unit < fx.Uint32(units_per_tile):
+                    lane = unit % 16
+                    t2 = unit // 16
+                    w = t2 % wmma_rep
+                    sd = t2 // wmma_rep
+                    dst_off = tile_dword_base + (sd * wmma_rep + w) * 16 + lane
+                    for j in range_constexpr(VEC):
+                        dst_p[dst_off + j] = tile_lds[
+                            (w * 16 + lane + j) * lds_pitch + sd
+                        ]
+        else:
+            for it in range_constexpr(
+                (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS
+            ):
+                unit = tid + it * BLOCK_THREADS
+                if unit < fx.Uint32(units_per_tile):
+                    lane = unit % 16
+                    t2 = unit // 16
+                    w = t2 % wmma_rep
+                    sd = t2 // wmma_rep
+                    grow = row_base + w * 16 + lane
+                    value = _emit_preshuffle_dword(
+                        gather, map_p, src_p, grow, sd, src_dwords
+                    )
+                    dst_off = tile_dword_base + (sd * wmma_rep + w) * 16 + lane
+                    dst_p[dst_off] = value
 
     if gather:
 
