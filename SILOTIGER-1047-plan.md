@@ -557,6 +557,11 @@ elements outside ``1e-2`` at ``M=512``. The four-wave ``exp`` plus
 per-lane shuffles cost more than the barrier they replaced. Loop-top +
 K/V + C + P barriers stay.
 
+128-bit ``partial_out`` loads in the LSE merge (64-thread wave, 8-wide
+along ``D``) were measured and **not shipped**. Decode ``M=1`` went to
+~24.5 µs from the kept ~18.7–19.1 µs; prefill was only a small win
+(~0.51–0.54 ms). Scalar per-``D`` merge stays.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

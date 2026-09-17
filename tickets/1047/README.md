@@ -443,6 +443,10 @@ All-wave softmax plus ``shuffle_idx`` P transpose (drop the P LDS
 barrier) was measured and not shipped: decode ~19.8–20.1 µs at ``M=1``,
 prefill ~0.66 ms with sparse ``1e-2`` misses at ``M=512``.
 
+128-bit LSE-merge loads along ``D`` were measured and not shipped:
+decode ``M=1`` ~24.5 µs vs kept ~18.7–19.1 µs. Scalar per-``D`` merge
+stays.
+
 
 
 
