@@ -301,11 +301,9 @@ def test_top_k_per_row_prefill(
 
     torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
 
-    # The avo kernels select over the full `stride0` extent and emit indices
-    # only, so record up front the two things that decide whether this shape is
-    # inside their contract: whether they accept the geometry at all, and
-    # whether any row is shorter than top_k (which is what needs the per-row
-    # extent honoured and the -1 padding emitted).
+    # The avo kernels honour rowEnds per row and emit indices only, so record
+    # the shortest row: it is what exercises the per-row extent and the -1
+    # padding, and it is the column to look at when a result disagrees.
     min_row_len = int((row_ends - row_starts).min())
     ret["backend"] = backend
     ret["min_row_len"] = min_row_len
@@ -327,7 +325,7 @@ def test_top_k_per_row_prefill(
             logits.stride(1),
             k=top_k,
         )
-        ret["note"] = "" if min_row_len >= top_k else "needs ragged rows"
+        ret["note"] = "" if min_row_len >= top_k else "ragged rows"
     else:
         _, us = run_top_k_per_row_prefill(
             logits,
