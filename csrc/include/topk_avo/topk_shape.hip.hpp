@@ -277,6 +277,11 @@ static inline bool sample_stride_exact(int N, int S)
 // Phase B writes and Phase C selects costs more than phase_a saves.
 static int g_s_rule = 0;
 
+// 1 = search for the smallest exact-stride S at or above the law's S (v5
+// Stage 3); 0 = the v4 behaviour, which offered a single candidate and so took
+// the largest one. Kept as a knob so the +29% cliff stays reproducible.
+static int g_s_repair_search = 1;
+
 // Smallest sample count whose 3-sigma candidate window still fits under the
 // largest cap Phase C can hold.
 //
@@ -462,7 +467,38 @@ static inline ShapeParams derive_shape_params(int M,
         // does not -- N = 131328 repairs to 256 chunks of stride 513, still not a
         // multiple of 4 -- the repair only inflates S for nothing, and the masked
         // stride serves the S the law asked for. That shape used to be refused.
-        if(sample_stride_exact(N, repaired) || !sampling_geometry_ok(N, S))
+        //
+        // But the repair had no cost cap, and buying exactness is not worth any
+        // price. At N = 2^k + 64 -- aiter's own num_prefix + num_rows pattern -- it
+        // moves S from 4096 to 16384, four times the phase_a sampling for 0.2% more
+        // data: M=4096 N=32768 243.0 us against N=32832 313.6 us (+29%), M=1024
+        // +32.5%, M=256 +18.3%, while N=33024 keeps S=4096 and costs 253.3 us.
+        // 1.35% of all N in [32768, 1048576] are inflated >= 2x this way.
+        //
+        // The repair only ever tried ONE candidate -- N/64 chunks, which
+        // align_sample_s then clamps to SAMPLE_S_MAX -- so at N = 2^k + 64 the only
+        // exact choice on offer was the largest one. Searching instead finds a much
+        // closer exact stride: N=32832 takes S=8192 (128 chunks of 256) rather than
+        // 16384, and N=92332 takes 5952 (93 chunks of 992) rather than 16384.
+        //
+        // Searching beats capping the growth. A growth cap keeps the law's S with a
+        // MASKED stride, and that is not free either: at M=4096 N=65600 it produced
+        // under_K=760 on --dist inf where the uncapped S gives 0, while the
+        // neighbouring pow2 N=65536 at the SAME S=4096 also gives 0. The difference
+        // is the masked stride, not the sample count, so the right move is to keep
+        // exactness and pay only the growth that exactness actually costs.
+        int best = 0;
+        for(int cand = S; cand <= SAMPLE_S_MAX; cand += SAMPLE_CHUNK_ELEMS)
+        {
+            if(sample_stride_exact(N, cand))
+            {
+                best = cand;
+                break;
+            }
+        }
+        if(g_s_repair_search != 0 && best > 0)
+            S = best;
+        else if(sample_stride_exact(N, repaired) || !sampling_geometry_ok(N, S))
             S = repaired;
     }
     margin                  = margin_override > 0.f ? margin_override : auto_margin(K, S, N);
