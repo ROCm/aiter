@@ -411,6 +411,11 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
             # Inner quotes must differ from the outer ones: reusing them is PEP 701
             # (Python 3.12+) and leaves this module unparseable on 3.10/3.11.
             aot_name = f"paged_mqa_logits{'_preshuffle' if args.kv_preshuffle else ''}{'_varctx' if EnableVarCtxOpt else ''}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            if (
+                not args.kv_preshuffle
+                and kv_cache_fp8.shape[0] * kv_cache_fp8.stride(0) >= 2**31
+            ):
+                aot_name += "_kv64"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
