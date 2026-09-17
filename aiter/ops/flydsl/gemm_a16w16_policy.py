@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
@@ -65,11 +65,9 @@ class GemmConfigPruner:
             * config["block_n"]
             * self.element_bytes,
         )
-        lds_per_cu = getattr(
-            props,
-            "shared_memory_per_multiprocessor",
-            props.shared_memory_per_block,
-        )
+        # A workgroup may occupy the whole per-CU LDS here, so the capacity the
+        # chip table reports per workgroup is also the per-CU figure.
+        lds_per_cu = get_lds_capacity_bytes()
         resident = (
             min(
                 props.max_threads_per_multi_processor // props.warp_size // waves,

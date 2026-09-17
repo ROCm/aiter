@@ -13,7 +13,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -69,10 +69,7 @@ def _slot_ptr(base_i64, elem_idx, address_space=1):
     The atomicrmw builder needs a raw ``!llvm.ptr<n>``, which the layout/buffer
     ops do not produce, so the byte address is formed by hand here.
     """
-    ptr = buffer_ops.create_llvm_ptr(
-        base_i64 + fx.Int64(elem_idx) * 4, address_space=address_space
-    )
-    return ptr._value if hasattr(ptr, "_value") else ptr
+    return create_llvm_ptr(base_i64 + fx.Int64(elem_idx) * 4, address_space)
 
 
 def build_moe_route_maps_module():
@@ -370,6 +367,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         numel: Int32,
         max_m: Int32,
         n_buckets: Int32,  # local bucket count / sentinel value; <= MAX_ROUTE_BUCKETS
+        ep_rowmap: fx.Pointer,  # (cap,2) i32 or null; sentinel-filled here
+        ep_rowmap_cap: Int32,  # cap_rows_plus1; 0 when ep_rowmap is null
     ):
         i32 = T.i32
         w_fx = fx.BFloat16 if weight_dtype == "bf16" else fx.Float16
@@ -399,6 +398,25 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         # Phase 0: zero the per-block LDS bucket counter ([0, n_buckets)).
         for b in range(tid, n_buckets_i32, BLOCK_THREADS):
             lds_cnt[fx.Uint32(b)] = fx.Int32(0)
+
+        # Fused ep_rowmap sentinel fill: write (-1, 0) as one i64 per row.
+        # Fire-and-forget global stores interleaved with Phase-0 LDS zeroing;
+        # no read of ep_rowmap in this kernel, so no barrier is needed -- the
+        # stores are globally visible to the next kernel on the same stream.
+        # When ep_rowmap is null (non-scatter path) the loop body is skipped.
+        has_ep = fx.Int64(ptrtoint(ep_rowmap)) != 0
+        if has_ep:
+            ep_i64 = ptr_buf_tensor(ep_rowmap, fx.Int64)
+            sentinel = fx.Int64(0xFFFFFFFF)
+            n_fill = fx.Uint32(ep_rowmap_cap)
+            grid_threads = (
+                (fx.Uint32(numel) + fx.Uint32(BLOCK_THREADS - 1))
+                // fx.Uint32(BLOCK_THREADS)
+                * fx.Uint32(BLOCK_THREADS)
+            )
+            for i in range(route, n_fill, grid_threads):
+                ep_i64[i] = sentinel
+
         gpu.barrier()
 
         # Phase 1: classify each route, cast/mask its weight, and take an
@@ -436,7 +454,9 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             my_rank = fx.Uint32(
                 llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.add,
-                    _slot_ptr(cnt_base_i64, eff_e, address_space=3),
+                    _slot_ptr(
+                        cnt_base_i64, eff_e, address_space=fx.AddressSpace.Shared
+                    ),
                     c1,
                     llvm.AtomicOrdering.monotonic,
                     syncscope="workgroup",
@@ -488,6 +508,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         max_m: fx.Int32,
         n_buckets: fx.Int32,
         grid_blocks: fx.Int32,
+        ep_rowmap: fx.Pointer,
+        ep_rowmap_cap: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_kernel(
@@ -501,6 +523,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             numel,
             max_m,
             n_buckets,
+            ep_rowmap,
+            ep_rowmap_cap,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),

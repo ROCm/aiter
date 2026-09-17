@@ -76,6 +76,24 @@ Fn aux_find(const std::unordered_map<std::string, Fn>& table,
 
 }  // namespace
 
+bool mxfp4_moe_sort_internal_is_supported(
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB,
+    bool zero_init)
+{
+    const std::string key = (zero_init ? "aux_sortzi_NE" : "aux_sortonly_NE")
+        + std::to_string(NE) + "_TOPK" + std::to_string(TOPK)
+        + "_MB" + std::to_string(MB) + "_H" + std::to_string(D_HIDDEN);
+    if (zero_init) {
+        const auto& table = sort_only_zi_lookup();
+        return table.find(key) != table.end();
+    }
+    const auto& table = sort_only_lookup();
+    return table.find(key) != table.end();
+}
+
 
 void mxfp4_moe_sort_quant_kernel(
     aiter_tensor_t& a_input,
