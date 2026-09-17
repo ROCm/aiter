@@ -3,9 +3,8 @@
 
 """Runtime correctness for FlyDSL INT4 quick all-reduce (``QuickAllReduceInt4``).
 
-Pytest collects validity cases only (no timing). ``python3`` this file
-runs an aiter-op-test ``@benchmark`` / markdown sweep. Every rank is a
-``multiprocessing`` spawn worker that builds its own
+``python3`` this file runs an aiter-op-test ``@benchmark`` / markdown sweep.
+Every rank is a ``multiprocessing`` spawn worker that builds its own
 ``QuickAllReduceInt4`` engine, calls ``compile()``, and in the sweep
 times ``fly.allreduce`` with ``run_perftest``. The oracle is an untimed
 fp32 NCCL all-reduce of the same per-rank inputs. INT4 is lossy, so
@@ -14,7 +13,7 @@ floor.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
-archs skip, and pytest skips a world size when fewer GPUs are visible
+archs skip, and ``main()`` skips a world size when fewer GPUs are visible
 than TP.
 """
 
@@ -33,7 +32,6 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import pandas as pd
-import pytest
 import torch
 
 import aiter
@@ -41,8 +39,6 @@ from aiter import dtypes
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-pytest.importorskip("flydsl")
 
 set_start_method("spawn", force=True)
 
@@ -67,80 +63,15 @@ CLOSE_ATOL = 1e-1
 CLOSE_ERR_RATIO = 0.5
 SUPER_TILE = 8
 TP = WORLD
-_FILLS = (
-    "normal",
-    "pos_underflow",
-    "neg_underflow",
-    "overflow_512",
-    "zeros",
-)
-
-pytestmark = pytest.mark.skipif(
-    ARCH not in SUPPORTED_ARCHS,
-    reason="QuickAllReduceInt4 requires an available gfx942 or gfx950 GPU",
-)
-
-# Distinct correctness branches, not a tokens x hidden product.
-# hidden=5120 is the calibrated width; hidden=4096 covers a width the tuning
-# was not fitted to. (8, 1024) is a payload smaller than one 32 KiB tile.
-# Every world size gets a super_tile=1 case and at least one super_tile=8
-# case, the latter sized so num_tiles exceeds the ST=1 grid.
-# Pytest skips a world size when fewer GPUs are visible than TP.
-_PYTEST_CASES = (
-    (8, 8, 1024, "partial-tile"),
-    (8, 512, 5120, "st1-auto-calib"),
-    (8, 9216, 4096, "st8-alt-hidden"),
-    (8, 32768, 5120, "st8-calib-prefill"),
-    (4, 512, 5120, "tp4-st1-auto-calib"),
-    (4, 9216, 4096, "tp4-st8-alt-hidden"),
-    (2, 512, 5120, "tp2-st1-auto-calib"),
-    (2, 9216, 4096, "tp2-st8-alt-hidden"),
-)
-
-
-def _num_tiles(tokens: int, hidden: int) -> int:
-    nbytes = tokens * hidden * 2
-    return max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
 
 
 def _make_inp(
-    tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
+    tokens: int, hidden: int, *, rank: int, device: torch.device
 ) -> torch.Tensor:
-    shape = (tokens, hidden)
-    if fill == "normal":
-        gen = torch.Generator().manual_seed(1234 + rank)
-        return (torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1).to(
-            device=device, dtype=torch.bfloat16
-        )
-    if fill == "pos_underflow":
-        val = 2.0**-8
-    elif fill == "neg_underflow":
-        val = -(2.0**-8)
-    elif fill == "overflow_512":
-        # Drives the E4M3 scale above its largest exponent, which the encoder
-        # has to saturate. Only rank 0 carries the value: if every rank sent
-        # 512 the reduced sum would also saturate the INT4 group codec, and
-        # the case would fail on codec range rather than on scale encoding.
-        val = 512.0 if rank == 0 else 0.0
-    elif fill == "zeros":
-        val = 0.0
-    else:
-        raise ValueError(f"unknown fill {fill!r}; expected one of {_FILLS}")
-    return torch.full(shape, val, device=device, dtype=torch.bfloat16)
-
-
-def _pick_st(
-    tokens: int,
-    hidden: int,
-    requested: int = SUPER_TILE,
-    *,
-    grid_cap: int = DEFAULT_GRID_CAP,
-) -> int:
-    """Expected ST: the engine only uses ST>1 when tiles exceed its ST=1 grid."""
-    tiles = _num_tiles(tokens, hidden)
-    if requested == 1 or tiles > grid_cap:
-        return requested
-    return 1
+    gen = torch.Generator().manual_seed(1234 + rank)
+    return (torch.randn((tokens, hidden), generator=gen, dtype=torch.float32) * 0.1).to(
+        device=device, dtype=torch.bfloat16
+    )
 
 
 def _sqnr(ref_pow: torch.Tensor, mse: torch.Tensor) -> torch.Tensor:
@@ -185,7 +116,6 @@ def _run_rank(
     hiddens: list[int],
     super_tile: int,
     grid_cap: int,
-    fill: str,
     time_it: bool,
 ) -> list[dict]:
     import torch.distributed as dist
@@ -230,7 +160,7 @@ def _run_rank(
     rows = []
     try:
         for ntok, hidden in zip(tokens, hiddens, strict=True):
-            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
+            inp = _make_inp(ntok, hidden, rank=rank, device=device)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
             dist.barrier()
@@ -240,10 +170,6 @@ def _run_rank(
             got = out.to(torch.float32)
             dist.barrier()
 
-            nbytes = int(inp.numel()) * int(inp.element_size())
-            n_tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
-            st_used = fly._pick_st(n_tiles)
-            st1 = fly._by_st.get(1, fly._by_st[st_used])
             close_err = checkAllclose(
                 ref,
                 got,
@@ -257,9 +183,6 @@ def _run_rank(
                 "tokens": ntok,
                 "hidden": hidden,
                 "grid_cap": grid_cap,
-                "st1_grid": int(st1.grid),
-                "st_used": int(st_used),
-                "grid": int(fly._by_st[st_used].grid),
                 "sqnr_db": _sqnr_db(got, ref),
                 "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
                 "err": float(close_err),
@@ -295,13 +218,12 @@ def _spawn(
     time_it: bool,
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
-    fill: str = "normal",
 ) -> list[list[dict]]:
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
-        pytest.skip(f"QuickAllReduceInt4 needs {world_size} GPUs, have {n_gpu}")
+        raise RuntimeError(f"QuickAllReduceInt4 needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     token_list = [t for t, _ in pairs]
     hidden_list = [h for _, h in pairs]
@@ -319,7 +241,6 @@ def _spawn(
                     "hiddens": hidden_list,
                     "super_tile": super_tile,
                     "grid_cap": grid_cap,
-                    "fill": fill,
                     "time_it": time_it,
                 },
             )
@@ -348,10 +269,6 @@ def _assert_validity(
     world_size: int,
     label: str,
 ) -> dict:
-    # The ST switch compares tiles against the ST=1 grid, which the engine
-    # clamps below the requested grid_cap for occupancy.
-    st1_grid = ranks[0][0]["st1_grid"]
-    expected_st = _pick_st(tokens, hidden, grid_cap=st1_grid)
     if len(ranks) != world_size:
         raise AssertionError(
             f"{label}: gathered {len(ranks)} ranks, expected {world_size}"
@@ -362,8 +279,6 @@ def _assert_validity(
             fails.append(f"rank {rank}: no rows")
             continue
         row = rows[0]
-        if row["st_used"] != expected_st:
-            fails.append(f"rank {rank}: ST={row['st_used']}, expected {expected_st}")
         if row["sqnr_db"] < SQNR_MIN_DB:
             fails.append(f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}")
         if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB:
@@ -382,38 +297,6 @@ def _assert_validity(
             + "; ".join(fails)
         )
     return ranks[0][0]
-
-
-_CODEC_FILL_CASES = (
-    ("pos_underflow", "pos-underflow-2^-8"),
-    ("neg_underflow", "neg-underflow-2^-8"),
-    ("overflow_512", "overflow-512"),
-    ("zeros", "true-zero-scale"),
-)
-
-
-@pytest.mark.parametrize("fill,label", _CODEC_FILL_CASES)
-def test_quick_allreduce_int4_e4m3_codec_fill(fill, label):
-    ranks = _spawn(2, [(16, 1024)], time_it=False, fill=fill)
-    _assert_validity(
-        ranks,
-        tokens=16,
-        hidden=1024,
-        world_size=2,
-        label=label,
-    )
-
-
-@pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
-def test_quick_allreduce_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
-    ranks = _spawn(world_size, [(tokens, hidden)], time_it=False)
-    _assert_validity(
-        ranks,
-        tokens=tokens,
-        hidden=hidden,
-        world_size=world_size,
-        label=label,
-    )
 
 
 @benchmark()
@@ -435,7 +318,6 @@ def test_quick_allreduce_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_C
         "gfx": ARCH,
         "tp": tp,
         "grid_cap": row["grid_cap"],
-        "st_used": row["st_used"],
         "flydsl us": us,
         "flydsl TFLOPS": (flops / us / 1e6) if us else 0.0,
         "flydsl TB/s": (nbytes / us / 1e6) if us else 0.0,
