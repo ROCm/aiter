@@ -13,6 +13,21 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 triton_version = Version(triton.__version__)
 TRITON_BEYOND_37 = gl.constexpr(triton_version >= Version("3.7"))
 
+
+# Triton 3.7 renamed gl.thread_barrier to gl.barrier.
+if hasattr(gl, "barrier"):
+
+    @gluon.jit
+    def _barrier():
+        gl.barrier()
+
+else:
+
+    @gluon.jit
+    def _barrier():
+        gl.thread_barrier()
+
+
 float8_info = torch.finfo(e4m3_dtype)
 
 
@@ -1452,7 +1467,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
         kv_loader.load_k_to_shared(blk, buffer_id=0)
         kv_loader.load_v_to_shared(blk, buffer_id=0)
         gl.amd.cdna4.async_copy.wait_group(1)
-        gl.barrier()
+        _barrier()
         k = kv_loader.load_k_from_shared(
             wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
         )
@@ -1463,12 +1478,12 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
         gl.amd.cdna4.async_copy.wait_group(0)
-        gl.barrier()
+        _barrier()
         v = kv_loader.load_v_from_shared(
             wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
         )
         acc = pgm.compute_pv(p, v, acc)
-        gl.barrier()
+        _barrier()
 
     if not pgm.cfg.ALL_DECODE:
         for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
@@ -1476,7 +1491,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
             kv_loader.load_k_to_shared(blk, buffer_id=0)
             kv_loader.load_v_to_shared(blk, buffer_id=0)
             gl.amd.cdna4.async_copy.wait_group(1)
-            gl.barrier()
+            _barrier()
             k = kv_loader.load_k_from_shared(
                 wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
             )
@@ -1486,12 +1501,12 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
             p, alpha, M = pgm.softmax_part0(S, M)
             p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
             gl.amd.cdna4.async_copy.wait_group(0)
-            gl.barrier()
+            _barrier()
             v = kv_loader.load_v_from_shared(
                 wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
             )
             acc = pgm.compute_pv(p, v, acc)
-            gl.barrier()
+            _barrier()
 
     # Last tile is always masked
     j = pgm.tile_end - 1
@@ -1499,7 +1514,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     kv_loader.load_k_to_shared(blk, buffer_id=0)
     kv_loader.load_v_to_shared(blk, buffer_id=0)
     gl.amd.cdna4.async_copy.wait_group(1)
-    gl.barrier()
+    _barrier()
     k = kv_loader.load_k_from_shared(
         wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
     )
@@ -1509,7 +1524,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
     gl.amd.cdna4.async_copy.wait_group(0)
-    gl.barrier()
+    _barrier()
     v = kv_loader.load_v_from_shared(
         wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
     )
@@ -1542,7 +1557,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             # Also merged waits to have fewer barriers.
             # this leads to better code-gen
             gl.amd.cdna4.async_copy.wait_group(0)
-            gl.barrier()
+            _barrier()
             # below the drain, or vmcnt(0) waits on this load too
             next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
             k = kv_loader.load_k_from_shared(
@@ -1589,7 +1604,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             else:
                 # same merged wait as the safe-tile loop
                 gl.amd.cdna4.async_copy.wait_group(0)
-                gl.barrier()
+                _barrier()
                 next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
                 k = kv_loader.load_k_from_shared(
                     wait_count=0,
@@ -1626,7 +1641,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     # Last tile is always masked
     if pgm.cfg.NUM_WARPS > 1:
         gl.amd.cdna4.async_copy.wait_group(0)
-        gl.barrier()
+        _barrier()
     k = kv_loader.load_k_from_shared(
         wait_count=1,
         target_dtype=q.dtype,
