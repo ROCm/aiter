@@ -14,6 +14,60 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import moe_gemm_2stage_gfx942_utils as fxh
 
+# RTA can be enabled if accuracy is acceptable. Simplified RTA may reverse NaNs although it should not
+#  occur in practice, so use with caution.
+_SIMPLIFIED_BF16_RTA = os.environ.get(
+    "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED", "0"
+).lower() in ("1", "true")
+_SIMPLIFIED_BF16_RTE = os.environ.get(
+    "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED", "0"
+).lower() in ("1", "true")
+
+
+def _f32_to_bf16_rta(value):
+    # Matches standard RTA for finite values and Inf, but does not preserve all NaNs.
+    # Versus RTE, even-LSB halfway cases produce adjacent BF16 encodings.
+    # e.g.: 0x3f808000: RTE=0x3f80，RTA=0x3f81
+    #       0xbf808000: RTE=0xbf80，RTA=0xbf81
+    return (
+        ((value.bitcast(fx.Uint32) + fx.Uint32(0x8000)) >> 16)
+        .to(fx.Uint16)
+        .bitcast(fx.BFloat16)
+    )
+
+
+def _f32_to_bf16_rte(value):
+    # Both paths match value.to(BFloat16) for finite values and Inf.
+    # The simplified path ignores NaNs; the default asm canonicalizes them to 0x7FFF
+    # and saves one conversion instruction per value on gfx942.
+    if _SIMPLIFIED_BF16_RTE:
+        bits = value.bitcast(fx.Uint32)
+        rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
+        return (rounded >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+    # from ck_tile/float_to_bf16_rtn_asm
+    rounded = llvm.inline_asm(
+        T.i32,
+        [_raw(value), _raw(fx.Uint32(0x7FFF)), _raw(fx.Uint32(0x7FFF0000))],
+        "v_cmp_u_f32 vcc, $1, $1\n\t"
+        "v_bfe_u32 $0, $1, 16, 1\n\t"
+        "v_add3_u32 $0, $1, $0, $2\n\t"
+        "v_cndmask_b32 $0, $0, $3, vcc",
+        "=&v,v,v,v,~{vcc}",
+        has_side_effects=False,
+    )
+    return (fx.Uint32(rounded) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+
+
+def _f32_to_bf16(value):
+    if _SIMPLIFIED_BF16_RTA:
+        return _f32_to_bf16_rta(value)
+    if isinstance(value, Vec):
+        return Vec.from_elements(
+            [_f32_to_bf16_rte(value[i]) for i in range_constexpr(value.numel)],
+            fx.BFloat16,
+        )
+    return _f32_to_bf16_rte(value)
+
 
 def compile_gemm(
     N,
@@ -34,14 +88,8 @@ def compile_gemm(
 ):
 
     TILE_K = 64
-    # Optional TILE_K override for the prefill_1x4 alg. The env fallback lets test_moe.py /
-    # profile scripts pick BK without threading a kwarg through every caller. bf16 prefill_1x4
-    # supports BK in {64, 128} (the per-ki gemm loop); fp8 stays 128.
     if tile_k is None and os.environ.get("MOE_PREFILL_TILE_K"):
         tile_k = int(os.environ["MOE_PREFILL_TILE_K"])
-    # weight_quant_type governs the WEIGHT scale form; act_quant_type governs the ACTIVATION
-    # scale form (native-fp8 prefill only) and defaults to weight_quant_type (legacy behavior
-    # where a single quant_type drove both).
     if act_quant_type is None:
         act_quant_type = weight_quant_type
     assert (
@@ -67,8 +115,6 @@ def compile_gemm(
     ], "activation must be either 'silu' or 'swiglu'"
     if activation == "swiglu":
         swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
-    # Supported native-fp8 prefill (weight, act) combos: weight ptpc requires act ptpc;
-    # weight per_tensor allows act ptpc or per_tensor.
     if weight_dtype == "fp8" and alg == "prefill_1x4":
         assert (weight_quant_type == "ptpc" and act_quant_type == "ptpc") or (
             weight_quant_type == "per_tensor"
@@ -79,9 +125,9 @@ def compile_gemm(
         )
     if stage == "down" and alg == "prefill_1x4":
         assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
-        assert N % 128 == 0, (
-            f"down prefill requires N to be divisible by 128 for paired "
-            f"64-wide tiles, got N={N}"
+        assert N % 256 == 0, (
+            f"down prefill requires N to be divisible by 256 for paired "
+            f"128-wide tiles, got N={N}"
         )
 
     if stage == "gateup" and alg == "splitk":
@@ -91,9 +137,7 @@ def compile_gemm(
         assert (
             K % (TILE_K * 4) == 0
         ), f"gateup split-K requires K to be divisible by {TILE_K * 4}, got K={K}"
-        c_reduce_lds_size = (
-            16 * 64 * 4
-        )  # save LDS size instead of BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
+        c_reduce_lds_size = 16 * 64 * 4
 
         @fx.union
         class SharedStorage:
@@ -110,26 +154,17 @@ def compile_gemm(
             sorted_lds: fx.Array[fx.Int32, 256, 16]
 
     elif stage == "gateup" and alg == "batch1":
-        c_reduce_lds_size = (
-            16 * 64 * 4
-        )  # save LDS size instead of BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
+        c_reduce_lds_size = 16 * 64 * 4
 
         @fx.struct
         class SharedStorage:
             c_reduce_lds: fx.Array[fx.Float32, c_reduce_lds_size, 16]
 
     elif stage == "gateup" and alg == "prefill_1x4":
-        # 1x4: the 4 waves tile the N(channel) direction, and the full TILE_M is shared across
-        # all waves (no M-split). B (weight gate/up)
-        # loads direct global->register (no LDS); only A (activation) is staged through LDS
-        # with a ping-pong double buffer (a_ping / a_pong).
         assert 128 <= BLOCK_TILE_SIZE_N <= 256 and BLOCK_TILE_SIZE_N % 128 == 0, (
             "For prefill_1x4 alg, BLOCK_TILE_SIZE_N must be in [128, 256] and a multiple of 128 "
             "(each wave owns contiguous_n//4 = BN//8 output channels, a multiple of 16)"
         )
-        # fp8 issues 128-bit g2r loads (16 fp8/thread) -> widen K-tile to 128; bf16 keeps 64.
-        # tile_k override (default 64 for bf16 / 128 for fp8) enables the BK sweep; the per-ki
-        # gemm loop in _gemm_1x4 handles bf16 TILE_K in {64, 128} and fp8 TILE_K in {128, 256}.
         TILE_K = (
             tile_k if tile_k is not None else (128 if weight_dtype == "fp8" else 64)
         )
@@ -146,22 +181,10 @@ def compile_gemm(
         assert (
             K % TILE_K == 0
         ), f"prefill_1x4 K={K} must be a multiple of TILE_K={TILE_K}"
-        # The 2-stage software pipeline in _gemm_1x4 consumes K-tiles two at a time (main loop
-        # + a 2-stage tail), so the tile count must be even or the middle tile(s) get skipped.
         assert (K // TILE_K) % 2 == 0, (
             f"prefill_1x4 needs an even K-tile count for the 2-stage pipeline, got "
             f"K//TILE_K={K // TILE_K} (K={K}, TILE_K={TILE_K})"
         )
-        # BLOCK_TILE_SIZE_M lower bound comes from two independent sources:
-        #   (1) A global->register load: 256 threads tile the (BM, TILE_K) A-tile, each issuing
-        #       one 128-bit buffer_load (val_per_thr = 16B/elem = 8 bf16 / 16 fp8). That covers
-        #       _thrs_m = 256 // (TILE_K // val_per_thr) M-rows per pass, so BM must be >= and a
-        #       multiple of _thrs_m. _thrs_m = 32 for (bf16 TK=64 / fp8 TK=128); 16 for
-        #       (bf16 TK=128 / fp8 TK=256).
-        #   (2) CShuffle epilogue read: the (32 token x 64 channel) read tile walks the staged
-        #       LDS with rep_token = BM // 32, so BM must be a multiple of 32 (>= 32).
-        # (2) always dominates (1) (32 >= _thrs_m and 32 % _thrs_m == 0), so the effective
-        # range is a 32-multiple in [32, 256] regardless of TILE_K / dtype.
         _val_per_thr = 16 if weight_dtype == "fp8" else 8
         _thrs_m_aload = 256 // (TILE_K // _val_per_thr)
         assert 32 <= BLOCK_TILE_SIZE_M <= 256 and BLOCK_TILE_SIZE_M % 32 == 0, (
@@ -169,9 +192,7 @@ def compile_gemm(
             f"(A g2r load needs BM >= {_thrs_m_aload}; the CShuffle 32-token read tile forces a "
             f"32-multiple, so 32 is the effective minimum). got BM={BLOCK_TILE_SIZE_M}"
         )
-        a_lds_size = (
-            BLOCK_TILE_SIZE_M * TILE_K
-        )  # full A tile; ping-pong needs two buffers
+        a_lds_size = BLOCK_TILE_SIZE_M * TILE_K
         lds_elem = fx.Float8E4M3FNUZ if weight_dtype == "fp8" else fx.BFloat16
 
         @fx.struct
@@ -184,8 +205,6 @@ def compile_gemm(
             sorted_lds: fx.Array[fx.Int32, 256, 16]
             gemm: GemmBuffers
 
-        # The CShuffle epilogue stages the single (BM x contiguous_n) bf16 output into the
-        # A LDS (reused after the main loop). Confirm it fits.
         _cshuffle_elem_bytes = 1 if weight_dtype == "fp8" else 2
         _gemm_lds_bytes = 2 * a_lds_size * _cshuffle_elem_bytes
         _cshuffle_bytes = BLOCK_TILE_SIZE_M * (BLOCK_TILE_SIZE_N // 2) * 2
@@ -193,10 +212,6 @@ def compile_gemm(
             f"CShuffle needs {_cshuffle_bytes} B of LDS but GemmBuffers only allocates "
             f"{_gemm_lds_bytes} B (BM={BLOCK_TILE_SIZE_M}, BN={BLOCK_TILE_SIZE_N})"
         )
-        # gfx942 (MI300X) has only 64 KB LDS per workgroup. The A ping-pong (a_ping + a_pong
-        # = 2 x BM x TILE_K x sizeof(elem)) is the dominant consumer (sorted_lds is unioned
-        # with it and far smaller), so _gemm_lds_bytes is effectively the whole LDS usage. A
-        # large BM x wide TILE_K (e.g. fp8 BM=256 TK=256 -> 128 KB) overflows it; reject early.
         assert _gemm_lds_bytes <= 64 * 1024, (
             f"prefill_1x4 A ping-pong needs {_gemm_lds_bytes} B of LDS but gfx942 allows "
             f"{64 * 1024} B (BM={BLOCK_TILE_SIZE_M}, TILE_K={TILE_K}, "
@@ -209,13 +224,6 @@ def compile_gemm(
         weight_dtype = fx.Float8E4M3FNUZ
 
     class TensorWithIndex:
-        # view: real tensor
-        # tile_m, tile_k: tile size in M/K dimension for each copy from global to shared
-        # index_frag: pre-read sorted-M-row index fragment (built by _read_sorted_index). The
-        #     caller reads it BEFORE constructing this object because sorted_lds is reused
-        #     (e.g. overwritten by the CShuffle epilogue) before copy() runs.
-        # tiled_copy: thread mapping for copy
-        # tid: thread id for copy
         def __init__(
             self,
             view,
@@ -237,10 +245,8 @@ def compile_gemm(
             self.is_atomic_write = is_atomic_write
             self.index_frag = index_frag
 
-            # split into (1, tile_k) blocks
             rank = fx.get_shape(self.view).rank
             dims = [1] * (rank - 1)
-            # shape: [(1, tile_k), (m, rep_k)]
             self.tensor_blocks_in_k = fx.zipped_divide(
                 view, fx.make_tile(*dims, tile_k)
             )
@@ -255,7 +261,6 @@ def compile_gemm(
                 if is_read_from_mem
                 else tiled_copy.get_slice(tid).partition_D(self.fake_tensor)
             )
-            # since init ptr is zero, it will be the offset of the thread in the tile after partition_S
             offset_thread = fx.Int32(fx.ptrtoint(fx.get_iter(self.fake_tensor_thr)))
             self.offset_thread_k = offset_thread // tile_m
 
@@ -270,10 +275,8 @@ def compile_gemm(
 
             rank = fx.get_shape(self.view).rank
             block_cord = [None] * (rank - 1) + [k_idx]
-            # current iter block (M dimension is not indexed), shape: [(1, tile_k), m]
             tensor_block = self.tensor_blocks_in_k[None, (*block_cord,)]
             for m in range_constexpr(rep_m):
-                # current iter subblock with correct M index, shape: [(1, tile_k)]
                 if const_expr(rank == 2):
                     tensor_sub_block = tensor_block[
                         None, self.index_frag[0, m] & 0xFFFFFF
@@ -286,10 +289,8 @@ def compile_gemm(
                     ]
                 if const_expr(not self.is_atomic_write):
                     for k in range_constexpr(rep_k):
-                        # get block k index
                         offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
                         offset_block_k = offset_block // self.tile_m
-                        # NOTE: assume K is linear in memory
                         offset_k_in_tile = offset_block_k + self.offset_thread_k
                         reg = frag[None, m, k]
                         mem = fx.make_view(
@@ -301,13 +302,11 @@ def compile_gemm(
                         else:
                             fx.copy(copy_atom, reg, mem)
                 else:
-                    # fx.UniversalAtomic(fx.AtomicOp.Add) could not lower to `global_atomic_pk_add_bf16`, hack to emit
+                    # UniversalAtomic cannot lower this packed BF16 operation.
                     if (self.index_frag[0, m] >> 24) < TOPK:
                         for k in range_constexpr(rep_k):
-                            # get block k index
                             offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
                             offset_block_k = offset_block // self.tile_m
-                            # NOTE: assume K is linear in memory
                             offset_k_in_tile = offset_block_k + self.offset_thread_k
                             reg = frag[None, m, k]
                             mem = fx.make_view(
@@ -321,10 +320,7 @@ def compile_gemm(
     def _read_sorted_index(
         tiled_copy_index, tid, lds_index, index_size=None, index_offset=0
     ):
-        # Read the sorted M-row index from LDS into a per-thread register fragment. Kept out
-        # of TensorWithIndex so the read happens at an explicit, caller-controlled point:
-        # sorted_lds is reused (e.g. overwritten by the CShuffle epilogue), so the index must
-        # be captured before that. tiled_copy_index maps threads to the index tile.
+        # Capture indices before sorted_lds is reused.
         if index_size is None:
             index_size = BLOCK_TILE_SIZE_M
         lds = fx.make_view(lds_index.ptr + index_offset, fx.make_layout(index_size, 1))
@@ -345,9 +341,6 @@ def compile_gemm(
         return fx.make_view(fx.get_iter(tensor), new_layout)
 
     def _cvt_fp8_bf16(src_tensor: fx.Tensor, dst_tensor: fx.Tensor):
-        # src_tensor is a packed-uint32 fragment (4 fp8 per dword) loaded straight from
-        # memory, so each dword feeds v_cvt_pk_f32_fp8 directly -- no whole-vector load +
-        # bitcast, which would emit shufflevector / v_lshrrev to repack the bytes.
         n_dwords = fx.size(fx.get_shape(src_tensor)).to_py_value()
 
         items = []
@@ -383,7 +376,6 @@ def compile_gemm(
     def _apply_scale_gateup_bf16(
         c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
     ):
-        # The reduce makes gate/up adjacent (2i, 2i+1).
         v_reps = fx.size(fx.get_shape(c_frag)[0]).to_py_value()
         m_reps = fx.size(fx.get_shape(c_frag)[1]).to_py_value()
         n_reps = fx.size(fx.get_shape(c_frag)[2]).to_py_value()
@@ -428,11 +420,8 @@ def compile_gemm(
                 scale = arg_p_scale[0]
                 c_frag.store(c_frag.load() * scale)
 
-        # c_frag_bf16 stores the gateup activation result (N/2 outputs).
         n_half = n_reps // 2
         if const_expr(v_reps == 1):
-            # v_reps==1 (TILE_N=32): flat value mode with stride 0 to avoid
-            # ((1,1),...):((1,0),...) producing two stride-1 leaves in findContigSegment.
             c_frag_bf16 = fx.make_rmem_tensor(
                 fx.make_layout((1, m_reps, n_half), (0, n_half, 1)), fx.BFloat16
             )
@@ -458,13 +447,7 @@ def compile_gemm(
                     tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
                     acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
             acc = Vec.from_elements(acc, fx.Float32)
-            round_bit = fx.Uint32(0x8000)
-            acc = (
-                ((acc.bitcast(fx.Uint32) + round_bit) >> 16)
-                .to(fx.Uint16)
-                .bitcast(fx.BFloat16)
-            )
-            c_frag_bf16[None, None, i].store(acc)
+            c_frag_bf16[None, None, i].store(_f32_to_bf16(acc))
 
         return c_frag_bf16
 
@@ -505,26 +488,13 @@ def compile_gemm(
 
     def _cvt_f32_to_bf16(c_frag):
         c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
-        round_bit = fx.Uint32(0x8000)
-        c_frag_bf16.store(
-            ((c_frag.load().bitcast(fx.Uint32) + round_bit) >> 16)
-            .to(fx.Uint16)
-            .bitcast(fx.BFloat16)
-        )
+        c_frag_bf16.store(_f32_to_bf16(c_frag.load()))
         return c_frag_bf16
 
     def _gateup_pair_bf16(
         gate_frag, up_frag, gate_scale=None, up_scale=None, a_scale=None
     ):
-        # Apply the selected activation over identically-laid-out gate/up fragments.
-        # Used by the 4-wave compute path where gate (left N-half) and up (right N-half)
-        # land in separate quadrant fragments with matching layout. Iterate (m, n)
-        # explicitly so the result keeps the fragment's [v, m, n] positions. Optional
-        # per-N-channel fp8 weight scales (shape [value, rep_n]) and an optional per-row
-        # fp8 activation scale (a_scale[m], one per C M-row) are folded into the read so
-        # native-fp8 dequant happens before the non-linear activation.
         log2_exp1 = -1.4426950408889634
-        round_bit = fx.Uint32(0x8000)
         out_bf16 = fx.make_fragment_like(gate_frag, dtype=fx.BFloat16)
         m_reps = fx.size(fx.get_shape(gate_frag)[1]).to_py_value()
         n_reps = fx.size(fx.get_shape(gate_frag)[2]).to_py_value()
@@ -553,17 +523,10 @@ def compile_gemm(
                         tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
                         acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
                 acc = Vec.from_elements(acc, fx.Float32)
-                acc = (
-                    ((acc.bitcast(fx.Uint32) + round_bit) >> 16)
-                    .to(fx.Uint16)
-                    .bitcast(fx.BFloat16)
-                )
-                out_bf16[None, m, n].store(acc)
+                out_bf16[None, m, n].store(_f32_to_bf16(acc))
         return out_bf16
 
     def _make_gateup_weight_view(p_weight, expert_id, contiguous_n):
-        # Preshuffle weight [16, (element_num, K//element_num)] composed with the gate/up silu
-        # grouping. Shared by the splitk / batch1 / prefill_1x4 gateup kernels.
         group_layout_silu = fx.make_layout(
             ((contiguous_n, 2, N // (contiguous_n * 2)), K),
             ((1, N // 2, contiguous_n), N),
@@ -581,8 +544,6 @@ def compile_gemm(
         )
 
     def _make_down_weight_view(p_weight, expert_id):
-        # Preshuffle weight [16, (element_num, K//element_num)] without silu grouping. Shared
-        # by the splitk / batch1 down kernels.
         element_num = 16 // (p_weight.dtype.width // 8)
         return fx.make_view(
             p_weight + fx.Int64(expert_id * N * K),
@@ -595,14 +556,8 @@ def compile_gemm(
     def _setup_b_operand(
         arg_p_weight, arg_p_input, tiled_mma, blk_n, TILE_N, tile_k_per_wg, tid
     ):
-        # B (weight) operand setup for _gemm_splitk. bf16: load directly as the MFMA B-operand
-        # (b_frag and b_frag_retile are two views of the same storage). fp8: load as packed
-        # uint32 (4 fp8/dword) for cvt_fp8_bf16 in the main loop -- b_frag is the bf16 decompress
-        # target, b_frag_retile the uint32 load target (DIFFERENT storage). Returns
-        # (b_cp_atom_r, b_tensor_thr, b_frag, b_frag_retile).
         if weight_dtype == fx.BFloat16:
             b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
-            # shape: [n_in_tile, k_in_tile, k_tile]
             b_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N, tile_k_per_wg))[
                 None, None, blk_n, None
             ]
@@ -619,7 +574,6 @@ def compile_gemm(
             ]
             return b_cp_atom_r, b_tensor_thr, b_frag, b_frag_retile
 
-        # b_frag will be decompressed from fp8
         b_fake_tensor = fx.make_view(
             fx.get_iter(arg_p_input),
             fx.make_layout((TILE_N, tile_k_per_wg), (tile_k_per_wg, 1)),
@@ -629,18 +583,7 @@ def compile_gemm(
             tiled_mma.make_fragment_B(b_fake_tensor),
         ]
 
-        # Load the fp8 weights as packed uint32 dwords (4 fp8 / dword) so cvt_fp8_bf16 can
-        # feed each dword straight into v_cvt_pk_f32_fp8 -- avoids the whole-vector load +
-        # bitcast that LLVM lowers to shufflevector / v_lshrrev byte repacking.
-        #
-        # Recast fp8 -> uint32 at the SOURCE (before make_buffer_tensor): arg_p_weight's
-        # iter is a plain pointer whose expert offset is already a byte address, so
-        # recast_iter (reinterpret_cast) keeps the address while recast_layout collapses
-        # the contiguous 16 fp8 into 4 dwords (/4 on every stride). Recasting the buffer
-        # descriptor AFTER partition is wrong: the block/thread offset is baked into the
-        # descriptor in fp8 ELEMENTS, and recast_iter would not divide it by 4 (-> 4x
-        # address error). The fp8 pointer is align=1, so build the uint32 pointer
-        # explicitly with a 16B alignment (the 128b tiles are already 16B-aligned).
+        # Recast before partitioning so descriptor offsets are scaled from FP8 to uint32.
         _w_it = fx.get_iter(arg_p_weight)
         _w_u32_ptr = fx.PointerType.get(fx.Uint32.ir_type, _w_it.memspace, 16)
         arg_w_u32 = fx.make_view(
@@ -652,13 +595,7 @@ def compile_gemm(
             None, None, blk_n, None
         ]
         b_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Uint32)
-        # uint32 thread-value layout mirrors the fp8 tv_layout_B_tiled. Recasting the fp8
-        # weight to uint32 keeps the thread's contiguous-inner stride (1) but divides the
-        # K-group stride by 4 (4 fp8 = 1 dword), so derive the uint32 thread strides from
-        # the fp8 tv (divide any stride >= 4 by 4). value = 4 contiguous uint32 (= the 16
-        # fp8 each thread loads with one 128b buffer_load). Using tile_k_per_wg//4 for the
-        # K-group stride is wrong for splitk_waves=1 (the preshuffle K stride is fixed by
-        # the weight layout, not the tile width).
+        # Preserve the preshuffled FP8 thread layout while grouping four values per dword.
         n_mma = fx.get_scalar(fx.size(fx.select(tiled_mma.tile_size_mnk, [1])))
         _tvB = tiled_mma.tv_layout_B_tiled
         _n0 = fx.get_scalar(_tvB.shape[0][0])
@@ -685,9 +622,9 @@ def compile_gemm(
         TILE_M,
         TILE_N,
         TILE_K,
-        blk_n: int,  # block index for N dimension
-        arg_p_input: fx.Tensor,  # [M, K] or [M, TOPK, K]
-        arg_p_weight: fx.Tensor,  # [(16,N/16), (8, K/8)]
+        blk_n: int,
+        arg_p_input: fx.Tensor,
+        arg_p_weight: fx.Tensor,
         lds,
         splitk_waves=4,
         a_with_index=True,
@@ -703,7 +640,6 @@ def compile_gemm(
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
         a_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), arg_p_input.dtype)
 
-        # tiled copy is created based on the tiled_mma, so the tiled_mma should be same size for tiled copy
         rep_k_per_lane = 4 if const_expr(weight_dtype != fx.BFloat16) else 2
         k_perm = fx.make_tile(
             None,
@@ -712,12 +648,9 @@ def compile_gemm(
                 (4, 4 * splitk_waves, rep_k_per_lane), (1, 4 * rep_k_per_lane, 4)
             ),
         )
-        # splitk always uses a bf16 MFMA(16,16,16): fp8 weights are decompressed to bf16 in
-        # the main loop (cvt_fp8_bf16) before the gemm, so the mma dtype is bf16 in both paths.
-        # (native-fp8 MFMA(16,16,32) is the prefill_1x4 path, not splitk.)
+        # Split-K converts FP8 weights before BF16 MFMA.
         tiled_mma = fx.make_tiled_mma(
             fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-            # splitk for gateup/down
             fx.make_layout((1, 1, splitk_waves), (0, 0, 1)),
             k_perm,
         )
@@ -789,7 +722,6 @@ def compile_gemm(
                     a_frag_retile[buf],
                 )
 
-        # Prefetch iteration 0 into buffer 0
         _prefetch_a(fx.Int32(0), 0)
         fx.copy(
             b_cp_atom_r, b_tensor_thr[None, None, None, fx.Int32(0)], b_frag_retile[0]
@@ -797,26 +729,20 @@ def compile_gemm(
 
         acc_init = c_frag.load()
 
-        # Instruction counts for scheduling
-        # 128-bit buffer_loads per prefetch: A loads + B loads
         a_load_bytes = arg_p_input.dtype.width // 8
         a_vmem_cnt = a_frag_retile[0].load().numel * a_load_bytes // 16
         if const_expr(weight_dtype == fx.BFloat16):
             b_vmem_cnt = b_frag_retile[0].load().numel * weight_dtype.width // 8 // 16
         else:
-            b_vmem_cnt = (
-                b_frag_retile[0].load().numel * 4 // 16
-            )  # uint32 dwords -> 128b loads
+            b_vmem_cnt = b_frag_retile[0].load().numel * 4 // 16
         vmcnt_per_prefetch = a_vmem_cnt + b_vmem_cnt
 
         rocdl.sched_barrier(0)
 
-        # Main loop: 2x unrolled ping-pong (even iter uses buf 0, odd iter uses buf 1)
         results = acc_init
         for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
             c_frag.store(state[0])
             k_base = fx.Int32(k2 * 2)
-            # --- even iteration: compute buf[0], prefetch into buf[1] ---
             _prefetch_a(k_base + 1, 1)
             fx.copy(
                 b_cp_atom_r,
@@ -829,7 +755,6 @@ def compile_gemm(
                 _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
             fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
             rocdl.sched_barrier(0)
-            # --- odd iteration: compute buf[1], prefetch into buf[0] ---
             _prefetch_a(k_base + 2, 0)
             fx.copy(
                 b_cp_atom_r,
@@ -846,13 +771,11 @@ def compile_gemm(
             results = yield [c_frag.load()]
         c_frag.store(results)
 
-        # Tail: if num_k_iters is odd, process the last iteration with buf[0]
         if const_expr(num_k_iters % 2 == 1):
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
             fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
 
-        # [v, n, m] -> [v, m, n]
         c_frag = _select(c_frag, [0, 2, 1])
 
         if const_expr(splitk_waves == 1):
@@ -865,13 +788,11 @@ def compile_gemm(
             cp_atom_lds_w = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
             c_tiled_lds_w = fx.make_tiled_copy(
                 cp_atom_lds_w,
-                # (4wave*16)*4
                 fx.make_layout(((16, 4, 4), (4, 2)), ((1, 256, 16), (64, 1024))),
                 fx.make_tile(16 * 4, 16 * 2),
             )
             c_tensor_thr_lds_w = c_tiled_lds_w.get_slice(tid).partition_D(c_lds)
         else:
-            # Reduce across 4 waves. To save lds size, will reuse (16*4)x64 floats for one loop
             swz = fx.SwizzleType.get(3, 3, 3)
             c_lds = fx.make_view(
                 lds.c_reduce_lds.ptr,
@@ -882,7 +803,6 @@ def compile_gemm(
             cp_atom_lds_w = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
             c_tiled_lds_w = fx.make_tiled_copy(
                 cp_atom_lds_w,
-                # (4wave*16)*4
                 fx.make_layout(((16, 4, 4), (4, 4)), ((1, 256, 16), (64, 1024))),
                 fx.make_tile(16 * 4, 16 * 4),
             )
@@ -892,7 +812,6 @@ def compile_gemm(
             cp_atom_lds_r = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
             c_tiled_lds_r = fx.make_tiled_copy(
                 cp_atom_lds_r,
-                # thread mapping: (4wavex4)x16, repeat 4 times in m dimension for reduce
                 fx.make_layout(((16, 4, 4), (1, 4)), ((32 * 2, 1, 4), (32, 16))),
                 fx.make_tile(16 * 4, 16 * 1),
             )
@@ -901,7 +820,6 @@ def compile_gemm(
             cp_atom_lds_r = fx.make_copy_atom(fx.UniversalCopy64b(), fx.Float32)
             c_tiled_lds_r = fx.make_tiled_copy(
                 cp_atom_lds_r,
-                # thread mapping: (4wavex4)x16, repeat 4 times in m dimension for reduce
                 fx.make_layout(((16, 4, 4), (2, 4)), ((64 * 2, 1, 4), (64, 16))),
                 fx.make_tile(16 * 4, 16 * 2),
             )
@@ -910,20 +828,16 @@ def compile_gemm(
             cp_atom_lds_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
             c_tiled_lds_r = fx.make_tiled_copy(
                 cp_atom_lds_r,
-                # thread mapping: (4wavex4)x16, repeat 4 times in m dimension for reduce
                 fx.make_layout(((16, 4, 4), (4, 4)), ((256, 1, 4), (64, 16))),
                 fx.make_tile(16 * 4, 16 * 4),
             )
             tile_sub_n = 64
         c_tensor_thr_lds_r = c_tiled_lds_r.get_slice(tid).partition_S(c_lds)
 
-        # shape: [(4, 1), rep_m, rep_n]
         c_frag_vec = c_frag.load()
-        # shape: [v, rm, rn]
         shape_v = fx.size(fx.get_shape(c_tensor_thr_lds_r)[0][0]).to_py_value()
         read_rep_n = fx.size(fx.get_shape(c_tensor_thr_lds_r)[2]).to_py_value()
         if const_expr(shape_v == 1):
-            # TILE_N==32: flat layout (0-stride value mode) to avoid two stride-1 leaves
             c_frag_reduce = fx.make_rmem_tensor(
                 fx.make_layout((1, TILE_M // 16, read_rep_n), (0, read_rep_n, 1)),
                 fx.Float32,
@@ -969,9 +883,6 @@ def compile_gemm(
         return c_frag_reduce
 
     def _make_1x4_tiled_mma():
-        # Shared B-first (mma_M=channel, mma_N=token) 1x4 tiled_mma, used by both _gemm_1x4
-        # and the CShuffle epilogue's make_tiled_copy_C. One definition keeps the two sites
-        # from drifting apart. bf16 = MFMA(16,16,16); native fp8 = MFMA(16,16,32).
         if weight_dtype == fx.BFloat16:
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
             k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
@@ -990,32 +901,19 @@ def compile_gemm(
         TILE_M,
         TILE_N,
         TILE_K,
-        blk_n: int,  # block index for N dimension (in units of TILE_N)
-        arg_p_input: fx.Tensor,  # [M, K]; A rows are gathered via lds.sorted_lds
-        arg_p_weight: fx.Tensor,  # preshuffle layout with group_layout_silu composed
-        lds,  # SharedStorage with sorted_lds, a_ping, a_pong
+        blk_n: int,
+        arg_p_input: fx.Tensor,
+        arg_p_weight: fx.Tensor,
+        lds,
     ):
-        """1x4 tiled GEMM: the 4 waves tile N(channel); the full TILE_M is shared across
-        all waves (no M-split). Each wave owns contiguous_n//4 output channels of BOTH the
-        gate and the up projection (two C fragments) so silu stays wave-internal. A
-        (activation) is gathered via sorted_lds and staged through an LDS ping-pong
-        (a_ping/a_pong); B (weight gate/up) loads direct global->register (no LDS). Pipeline
-        mirrors preshuffle_gemm_v2 (A 2-stage LDS ping-pong). B-first MFMA (weight is the
-        MFMA M-side) so each C fragment's value dim runs along channel (4 contiguous
-        channels/lane), letting the epilogue store 64-bit instead of the A-first 16-bit.
-        Convention inside this function: m = channel (mma_M), n = token (mma_N)."""
         tid = gpu.thread_idx.x
         contiguous_n = TILE_N // 2
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
         b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
 
-        # tiled_mma: B-first (mma_M=channel from weight, mma_N=token from activation); the 4
-        # waves tile M(channel) so each wave still owns contiguous_n//4 output channels.
         mma_atom, tiled_mma = _make_1x4_tiled_mma()
 
-        # ---- A (activation): gather + LDS ping-pong ----
-        # Static (TILE_M, K) fake keeps flat_divide static; real rows gathered below.
         a_size_buf = fx.rocdl.make_buffer_tensor(
             fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((TILE_M, K), (K, 1))),
             max_size=False,
@@ -1034,7 +932,6 @@ def compile_gemm(
         a_mem_cp_g2r = fx.make_tiled_copy(
             buf_cp_atom_r, g2r_tv_layout, fx.make_tile(_thrs_m, TILE_K)
         )
-        # index copy for A gather: M-row mapping matches g2r M-tile (_thrs_m).
         _m_per_wave = _thrs_m // 4
         cp_atom_sortid_a = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
         tiled_copy_sortid_a = fx.make_tiled_copy(
@@ -1056,8 +953,7 @@ def compile_gemm(
         a_mem_thr = a_mem_cp_g2r.get_slice(tid).partition_S(a_tile)
         a_cp_frag = fx.make_fragment_like(a_mem_thr[None, None, None, 0])
 
-        # sorted_lds is unioned with a_ping: seed all index_frag reads (caller's c_out index
-        # + a_idx above) before overwriting that LDS region with the A tile below.
+        # All indices must be captured before a_ping reuses sorted_lds.
         gpu.barrier()
 
         if const_expr(weight_dtype == fx.BFloat16):
@@ -1077,7 +973,6 @@ def compile_gemm(
             ),
         )
 
-        # One 128-bit universal copy shared by A r2s (ds_write_b128) and A LDS read (ds_read_b128).
         uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), weight_dtype)
         a_r2s = fx.make_tiled_copy(
             uni_cp_atom, g2r_tv_layout, fx.make_tile(_thrs_m, TILE_K)
@@ -1087,7 +982,6 @@ def compile_gemm(
             a_r2s.get_slice(tid).partition_D(a_pong),
         ]
         a_cp_frag_retile = a_r2s.get_slice(tid).retile(a_cp_frag)
-        # B-first: activation is the MFMA B-operand (make_fragment_B / make_tiled_copy_B).
         a_lds_r = [
             fx.make_tiled_copy_B(uni_cp_atom, tiled_mma)
             .get_slice(tid)
@@ -1101,8 +995,6 @@ def compile_gemm(
             fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).retile(a_frag)
         )
 
-        # ---- B (weight gate/up): direct global->register (no LDS), 2-stage double buffer ----
-        # B-first: weight is the MFMA A-operand (make_fragment_A / make_tiled_copy_A).
         bl_tile = fx.flat_divide(b_tensor, fx.make_tile(contiguous_n, TILE_K))[
             None, None, blk_n * 2 + 0, None
         ]
@@ -1123,9 +1015,6 @@ def compile_gemm(
         bl_ret_st = [b_g2r.retile(bl_frag_st[0]), b_g2r.retile(bl_frag_st[1])]
         br_ret_st = [b_g2r.retile(br_frag_st[0]), b_g2r.retile(br_frag_st[1])]
 
-        # ---- C fragments (gate + up), one make_fragment_C each ----
-        # B-first: make_fragment_C over the (channel, token) tile; the value dim then runs
-        # along channel (4 contiguous channels/lane) for a 64-bit epilogue store.
         c_fake_buf = fx.rocdl.make_buffer_tensor(
             fx.make_view(
                 fx.get_iter(arg_p_input),
@@ -1143,28 +1032,20 @@ def compile_gemm(
 
         num_tiles = K // TILE_K
 
-        # ---- instruction-scheduling hints ----
-        # 128-bit loads / ds ops per stage; MFMA count for the two gemms.
         k_per_mma = 16 if const_expr(weight_dtype == fx.BFloat16) else 32
         _m_reps = fx.size(fx.get_shape(c_gate)[1]).to_py_value()
         _n_reps = fx.size(fx.get_shape(c_gate)[2]).to_py_value()
         mfma_per_gemm = _m_reps * _n_reps * (TILE_K // k_per_mma)
         mem_a_cnt = a_cp_frag.load().numel * weight_dtype.width // 8 // 16
         mem_b_cnt = bl_frag_st[0].load().numel * weight_dtype.width // 8 // 16
-        # per-ki interleave: k_perm groups 2 MFMA-K atoms, so k_iters = TILE_K / (2*k_per_mma).
-        # fragment K dim is (2 atoms, k_iters) -> gemm coord = (None, ki); the retile/LDS-read
-        # views have a flat k_iters dim -> coord = ki. This is what lets TILE_K scale to 128.
         k_iters = TILE_K // (2 * k_per_mma)
-        # full A(tile) LDS read (ds_read), done once per stage (cross-stage rotation)
         lds_a_cnt = a_frag.load().numel * weight_dtype.width // 8 // 16
 
         def hot_loop_scheduler():
-            # Fixed interleave: each buffer_load(vmem)+4 mfma; each ds_read(dsrd)+1 mfma;
-            # each ds_write(dswr)+2 mfma (dsrd before dswr); then the remaining mfma.
             mfma_cnt = 2 * mfma_per_gemm
-            n_vmem = mem_a_cnt + 2 * mem_b_cnt  # A g2r + B gate/up g2r (buffer_load)
-            n_dswr = mem_a_cnt  # A staging -> LDS store (ds_write)
-            n_dsrd = lds_a_cnt  # A LDS -> register full tile (ds_read)
+            n_vmem = mem_a_cnt + 2 * mem_b_cnt
+            n_dswr = mem_a_cnt
+            n_dsrd = lds_a_cnt
             used = 0
             rocdl.sched_dsrd(2)
             for _ in range_constexpr(n_vmem):
@@ -1189,7 +1070,6 @@ def compile_gemm(
 
         def pipeline_stage(read_i, k_next, do_prefetch):
             write_i = read_i ^ 1
-            # prefetch next B (gate/up) + A (global -> register)
             if const_expr(do_prefetch):
                 a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
                 fx.copy(
@@ -1198,7 +1078,6 @@ def compile_gemm(
                 fx.copy(
                     buf_cp_atom_r, br_g2r[None, None, None, k_next], br_ret_st[write_i]
                 )
-            # read this stage's own A tile LDS[read_i] -> a_frag at the head, then compute
             for ki in range_constexpr(k_iters):
                 fx.copy(
                     uni_cp_atom,
@@ -1223,13 +1102,11 @@ def compile_gemm(
                                 c_up[None, m, n],
                             )
             if const_expr(do_prefetch):
-                # A(k_next) staging -> LDS[write] for a later stage's head read
                 fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[write_i])
                 hot_loop_scheduler()
             rocdl.sched_barrier(0)
             gpu.barrier()
 
-        # Prologue: gather A(0) -> LDS[0]; load B(0) -> stage 0.
         a_idx.copy(buf_cp_atom_r, fx.Int32(0), a_cp_frag)
         fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, fx.Int32(0)], bl_ret_st[0])
         fx.copy(buf_cp_atom_r, br_g2r[None, None, None, fx.Int32(0)], br_ret_st[0])
@@ -1265,13 +1142,6 @@ def compile_gemm(
         p_w_scale,
         p_a_scale,
     ):
-        # Native-fp8 dequant folded into c_gate/c_up IN PLACE, before the plain silu. Caller
-        # guards on weight_dtype (bf16 -> not called). B-first layout: value dim = 4 contiguous
-        # channels, m_rep = channel_rep, n_rep = token_rep.
-        #   act ptpc: a_scale is per token (one per token_rep n, shared by the 4 channel values,
-        #     gathered via asc_idx). weight b_scale is per-output-channel (ptpc) or a per_tensor
-        #     scalar.
-        #   act per_tensor: b_scale * a_scale is a single scalar pre-multiply.
         if const_expr(act_quant_type == "ptpc"):
             m_reps = fx.size(fx.get_shape(c_gate_frag)[1]).to_py_value()
             n_reps = fx.size(fx.get_shape(c_gate_frag)[2]).to_py_value()
@@ -1288,8 +1158,6 @@ def compile_gemm(
                     fx.make_layout(contiguous_n, 1),
                 )
                 cp_atom_scale = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
-                # channel = v + 4*(lane//16) + 16*wave (+ 64*channel_rep): gather 4 per
-                # value into [v, channel_rep] to match the C fragment channel layout.
                 scale_copy = fx.make_tiled_copy(
                     cp_atom_scale,
                     fx.make_layout(((16, 4, 4), 4), ((0, 4, 16), 1)),
@@ -1313,9 +1181,6 @@ def compile_gemm(
                 ),
                 max_size=False,
             )
-            # a_scale is per token = per token_rep n (independent of channel_rep m), so
-            # gather all n up front: removes the redundant gather across m and lets the
-            # indexed loads issue together instead of serializing inside the inner loop.
             a_sc_n = [
                 a_scale_tensor[asc_idx[0, n] & 0xFFFFFF]
                 for n in range_constexpr(n_reps)
@@ -1356,10 +1221,9 @@ def compile_gemm(
 
     @flyc.kernel
     def moe_2stage_gateup_splitk(
-        p_input: fx.Pointer,  # bf16 [M, K]
-        p_weight: fx.Pointer,  # quantized/bf16 [N/16, K/8 * 16 * 8]
-        p_output: fx.Pointer,  # bf16 [M, TOPK, N//2]
-        # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
         p_sorted_ids: fx.Pointer,
         p_sorted_weights: fx.Pointer,
         p_sorted_expert_ids: fx.Pointer,
@@ -1392,17 +1256,10 @@ def compile_gemm(
                 fx.Int32, fxh._as_ptr(p_sorted_expert_ids)
             )
             expert_id = arg_p_sorted_expert_ids[e_idx]
-            # there is a reduce in gemm_splitk which will read/write from lds, the BLOCK_TILE_SIZE_N will impact the coalesced access:
-            # BLOCK_TILE_SIZE_N BLOCK_TILE_SIZE_N//2(after silu) LDS_read_per_lane  MEM_write_per_lane
-            # 64                32                               2=(32/16 threads)  2=(32/16 threads)
-            # 128               64                               4=(64/16 threads)  4=(64/16 threads)
-            # 256: will split into 2x128
             contiguous_n = 64 if const_expr(BLOCK_TILE_SIZE_N % 128 == 0) else 32
 
-            # NOTE: assume permuted adjacent 32 rows will fall in the same wave to do silu
             arg_p_weight = _make_gateup_weight_view(p_weight, expert_id, contiguous_n)
 
-            # sorted ids: global -> LDS (scalar load/store, only first BLOCK_TILE_SIZE_M threads participate)
             sorted_ids_buf = fx.rocdl.make_buffer_tensor(
                 arg_p_sorted_ids, max_size=False
             )
@@ -1410,11 +1267,9 @@ def compile_gemm(
                 lds_view = fx.make_view(
                     lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
                 )
-                # fx.memref_store(val, lds_view, tid)
                 lds_view[tid] = sorted_ids_buf[tid]
             gpu.barrier()
 
-            # prepare c_tensor(reuse lds.c_reduce_lds before gemm)
             cp_atom_w = fx.make_copy_atom(
                 (
                     fx.rocdl.BufferCopy64b()
@@ -1425,7 +1280,6 @@ def compile_gemm(
             )
             c_tiled_g = fx.make_tiled_copy(
                 cp_atom_w,
-                # thread mapping: 4 wavex(4x16), (contiguous_n // 16) elements per lane
                 fx.make_layout(
                     ((16, 4, 4), contiguous_n // 16), ((contiguous_n, 1, 4), 16)
                 ),
@@ -1480,10 +1334,9 @@ def compile_gemm(
 
     @flyc.kernel
     def moe_2stage_down_splitk(
-        p_input: fx.Pointer,  # bf16 [M, TOPK, K]
-        p_weight: fx.Pointer,  # quantized/bf16 [N/16, K/8 * 16 * 8]
-        p_output: fx.Pointer,  # bf16 [M, N]
-        # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
         p_sorted_ids: fx.Pointer,
         p_sorted_weights: fx.Pointer,
         p_sorted_expert_ids: fx.Pointer,
@@ -1518,7 +1371,6 @@ def compile_gemm(
             expert_id = arg_p_sorted_expert_ids[e_idx]
             arg_p_weight = _make_down_weight_view(p_weight, expert_id)
 
-            # sorted ids: global -> LDS (scalar load/store, only first BLOCK_TILE_SIZE_M threads participate)
             sorted_ids_buf = fx.rocdl.make_buffer_tensor(
                 arg_p_sorted_ids, max_size=False
             )
@@ -1526,7 +1378,6 @@ def compile_gemm(
                 lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
             )
             for idx in range(tid, BLOCK_TILE_SIZE_M, 64):
-                # fx.memref_store(val, lds_view, tid)
                 lds_view[idx] = sorted_ids_buf[idx]
             gpu.barrier()
 
@@ -1566,7 +1417,6 @@ def compile_gemm(
 
             _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)
 
-            # mul weight
             sorted_weight_frag_vec = sorted_weight_frag.load()
             for m in range_constexpr(BLOCK_TILE_SIZE_M // 16):
                 w = sorted_weight_frag_vec[m]
@@ -1576,8 +1426,7 @@ def compile_gemm(
 
             c_frag_bf16 = _cvt_f32_to_bf16(c_frag)
 
-            # write to mem
-            if const_expr(not USE_ATOMIC_WRITE):  # gateup output shape: [M, TOPK, N]
+            if const_expr(not USE_ATOMIC_WRITE):
                 arg_p_output = fx.make_view(
                     fxh._as_ptr(p_output),
                     fx.make_layout((M, TOPK, N), (TOPK * N, N, 1)),
@@ -1593,15 +1442,12 @@ def compile_gemm(
                 arg_p_output = fx.make_view(
                     fxh._as_ptr(p_output), fx.make_layout((M, N), (N, 1))
                 )
-                # arg_p_output = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False, num_records_bytes=M * TOPK * N * fx.BFloat16.width // 8)
-                # cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferAtomicAdd(fx.BFloat16), fx.BFloat16)
                 cp_atom_w = fx.make_copy_atom(
                     fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16
                 )
                 is_atomic_write = True
             c_tiled_g = fx.make_tiled_copy(
                 cp_atom_w,
-                # 16x4 threads, each writes 4 points in N dimension
                 fx.make_layout(((16, 4), 4), ((1, 64), 16)),
                 fx.make_tile(16, 16),
             )
@@ -1625,10 +1471,10 @@ def compile_gemm(
 
     @flyc.kernel
     def moe_2stage_gateup_batch1(
-        p_input: fx.Pointer,  # bf16 [M, K]
-        p_weight: fx.Pointer,  # quantized/bf16 [N/16, K/8 * 16 * 8]
-        p_output: fx.Pointer,  # bf16 [M, TOPK, N//2]
-        p_topk_ids: fx.Pointer,  # int32 [M, TOPK]
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_topk_ids: fx.Pointer,
         p_w_scale: fx.Pointer,
     ):
         tid = gpu.thread_idx.x
@@ -1641,11 +1487,8 @@ def compile_gemm(
         arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
         expert_id = arg_p_expert_ids[e_idx]
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # gate/up group width. BN==32 keeps the 4-wave split-K but uses a dedicated reduce below;
-        # BN>=64 uses the coalesced reduce in gemm_splitk.
         contiguous_n = min(64, BLOCK_TILE_SIZE_N // 2)
 
-        # NOTE: assume permuted adjacent 32 rows will fall in the same wave to do silu
         arg_p_weight = _make_gateup_weight_view(p_weight, expert_id, contiguous_n)
 
         c_frag = gemm_splitk(
@@ -1687,7 +1530,6 @@ def compile_gemm(
         )
         c_tiled_g = fx.make_tiled_copy(
             cp_atom_w,
-            # thread mapping: 4 wavex(4x16), (contiguous_n // 16) elements per lane
             fx.make_layout(
                 ((16, 4, 4), max(1, contiguous_n // 16)),
                 ((max(1, contiguous_n), 1, 4), 16),
@@ -1705,15 +1547,15 @@ def compile_gemm(
 
     @flyc.kernel
     def moe_2stage_gateup_prefill_1x4(
-        p_input: fx.Pointer,  # bf16 or native-fp8 [M, K]
-        p_weight: fx.Pointer,  # bf16/fp8 [N/16, K/8 * 16 * 8]
-        p_output: fx.Pointer,  # bf16 [M, TOPK, N//2]
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
         p_sorted_ids: fx.Pointer,
         p_sorted_weights: fx.Pointer,
         p_sorted_expert_ids: fx.Pointer,
         p_num_valid_ids: fx.Pointer,
-        p_w_scale: fx.Pointer,  # weight fp8 scale (per-output-channel ptpc / per-tensor)
-        p_a_scale: fx.Pointer,  # input fp8 scale (per-token ptpc / per-tensor)
+        p_w_scale: fx.Pointer,
+        p_a_scale: fx.Pointer,
         M: fx.Int32,
     ):
         tid = gpu.thread_idx.x
@@ -1759,9 +1601,7 @@ def compile_gemm(
                 lds_view[tid] = sorted_ids_buf[tid]
             gpu.barrier()
 
-            # Output [M, TOPK, N//2] + the per-row scatter index, built BEFORE gemm_1x4:
-            # sorted_lds is unioned with a_ping, so c_out must seed its index_frag from
-            # sorted_lds now; gemm_1x4 then overwrites that LDS region with the A tile.
+            # Capture scatter indices before a_ping reuses sorted_lds.
             arg_p_output = fx.make_view(
                 fxh._as_ptr(p_output),
                 fx.make_layout((M, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
@@ -1773,10 +1613,6 @@ def compile_gemm(
                 * (TOPK * N // 2 * fx.BFloat16.width // 8),
             )
             buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-            # CShuffle read/scatter over the single (BM x contiguous_n) region. The read uses a
-            # 4-wave 2x2 thread grid (token = lane//4 + 16*waveM, 8 contiguous channels/lane,
-            # 128b), decoupled from the gemm's 1x4 wave layout (it just walks the staged LDS),
-            # so rep_token = BM//32 and rep_channel = contiguous_n//64.
             c_rw_copy = fx.make_tiled_copy(
                 buf_atom_w128,
                 fx.make_layout(((4, 16, 2, 2), 8), ((256, 1, 16, 1024), 32)),
@@ -1799,10 +1635,6 @@ def compile_gemm(
                 TOPK=TOPK,
             )
 
-            # ptpc a_scale is per-token; B-first packs 4 CONTIGUOUS channels per lane in the
-            # value dim, so token = lane%16 + 16*token_rep (one id per token_rep, shared by
-            # the 4 channel values). Gather the per-token_rep sorted id here, before gemm_1x4
-            # overwrites sorted_lds.
             asc_idx = None
             if const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "ptpc"):
                 asc_index_copy = fx.make_tiled_copy(
@@ -1844,24 +1676,11 @@ def compile_gemm(
 
             c_out_bf16 = _gateup_pair_bf16(c_gate_frag, c_up_frag)
 
-            # 128-bit CShuffle epilogue (single region). Stage c_out_bf16 into the A LDS via
-            # make_tiled_copy_C (framework-consistent with the make_fragment_C layout), reusing
-            # the same 1x4 tiled_mma as _gemm_1x4. B-first makes the value dim 4 contiguous
-            # channels, so the store is 64-bit; read it back channel-contiguous (8 bf16/lane)
-            # so the scatter issues 128-bit writes.
             _, _tiled_mma = _make_1x4_tiled_mma()
             cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
             cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
             cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
-            # B-first: store through the (channel=M, token=N) transpose view so the value dim
-            # (4 contiguous channels) is channel-contiguous -> 64-bit ds_write; read back the
-            # aliased (token, channel) view channel-contiguous (8 bf16/lane) for the 128b
-            # scatter. Both views share the same LDS bytes AND linear-offset formula, so the
-            # same XOR swizzle keeps them consistent. The swizzle is required: the token stride
-            # (contiguous_n elems) is bank-aligned, so an unswizzled 64-bit store is 16-way
-            # bank-conflicted; the swizzle spreads it (needs no extra LDS, unlike padding).
-            # C-staging is bf16 in both the bf16 and fp8 paths (it holds the bf16 output), so
-            # the de-conflict swizzle is bf16's (3,3,3) in both cases -- NOT the fp8 input swz.
+            # Aliased transpose views require the same BF16 swizzle.
             swz_c = fx.SwizzleType.get(3, 3, 3)
             lds_c_store = fx.make_view(
                 cshuf_ptr,
@@ -1896,9 +1715,9 @@ def compile_gemm(
 
     @flyc.kernel
     def moe_2stage_down_batch1(
-        p_input: fx.Pointer,  # bf16 [M, TOPK, K]
-        p_weight: fx.Pointer,  # quantized/bf16 [N/16, K/8 * 16 * 8]
-        p_output: fx.Pointer,  # bf16 [M, N]
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
@@ -1907,9 +1726,6 @@ def compile_gemm(
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
 
-        # batch1: input is gemm1_out[0, e_idx, :] (single token, expert slot e_idx). Point at that
-        # row and broadcast it across the TILE_M MFMA rows (stride 0); every computed row is then
-        # identical, so any single row is the real result.
         arg_p_input = fx.make_view(
             fxh._as_ptr(p_input) + fx.Int64(e_idx * K),
             fx.make_layout((BLOCK_TILE_SIZE_M, K), (0, 1)),
@@ -1936,12 +1752,10 @@ def compile_gemm(
 
         _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)
 
-        # mul weight
         c_frag.store(c_frag.load() * topk_weight)
 
         c_frag_bf16 = _cvt_f32_to_bf16(c_frag)
 
-        # write to mem
         arg_p_output = fx.make_view(
             fxh._as_ptr(p_output), fx.make_layout((1, N), (N, 1))
         )
@@ -1950,7 +1764,6 @@ def compile_gemm(
         )
         c_tiled_g = fx.make_tiled_copy(
             cp_atom_w,
-            # 16x4 threads, each writes 4 points in N dimension
             fx.make_layout(((16, 4), 4), ((1, 64), 16)),
             fx.make_tile(16, 16),
         )
@@ -1972,15 +1785,15 @@ def compile_gemm(
 
     @flyc.kernel
     def moe_2stage_down_prefill_1x4(
-        p_input: fx.Pointer,  # bf16 [M, TOPK, K]           K = HIDDEN_STATES//TP
-        p_weight: fx.Pointer,  # quantized/bf16 [E, N, K]   N = HIDDEN_STATES
-        p_output: fx.Pointer,  # bf16 [M, TOPK, N]
-        p_sorted_ids: fx.Pointer,  # f32 [num_tokens_sorted]
-        p_sorted_weights: fx.Pointer,  # f32 [num_tokens_sorted]
-        p_sorted_expert_ids: fx.Pointer,  # int32 [num_blocks] num_tokens_sorted <= num_blocks * BLOCK_TILE_SIZE_M
-        p_num_valid_ids: fx.Pointer,  # int32 [2]  value: (true_valid_tokens(M*TOPK), M)
-        p_w_scale: fx.Pointer,  # weight fp8 scale (per-output-channel ptpc / per-tensor)
-        p_a_scale: fx.Pointer,  # input fp8 scale (per-token ptpc / per-tensor)
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_expert_ids: fx.Pointer,
+        p_num_valid_ids: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_a_scale: fx.Pointer,
         M: fx.Int32,
     ):
         e_idx = fx.gpu.block_idx.y
@@ -2010,7 +1823,6 @@ def compile_gemm(
                 e_idx
             ]
 
-            # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
                 fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
@@ -2029,11 +1841,10 @@ def compile_gemm(
             BLOCK_N = 64
             BLOCK_K = 64 // (weight_dtype.width // 8)
 
-            # mask,base,shift, swizzle always in unit of 128b,
             swz_base = ((128 // weight_dtype.width) - 1).bit_length()
             swz = fx.SwizzleType.get(3, swz_base, 3)
 
-            act_dtype = weight_dtype  # fp8 / bf16
+            act_dtype = weight_dtype
 
             @fx.union
             class SharedStorage:
@@ -2064,8 +1875,6 @@ def compile_gemm(
             cp_atom = flyobj.get_buffer_copy_atom(arg_p_input.dtype, 128)
 
             def flatten_A(x):
-                # second mode is innermost, so swap before flattening
-                # to get the right order for the tiled copy
                 x = fx.select(x, [1, 0])
                 return fx.group(x, 0, -1)
 
@@ -2086,7 +1895,6 @@ def compile_gemm(
                 fx.copy(cp_atom, atom_A, dst)
             fx.gpu.barrier()
 
-            # (BLOCK_N, BLOCK_K, num_blocks_N, num_blocks_K)
             weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
             ldsA = fx.flat_divide(ldsA0, (BLOCK_M, BLOCK_K))
 
@@ -2119,7 +1927,6 @@ def compile_gemm(
                     fxh._as_ptr(p_w_scale) + expert_id * N,
                     fx.make_layout((N, 1), (1, 0)),
                 )
-                # (BLOCK_N, 1, num_block_N, 1)
                 arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
 
             arg_a_scale = None
@@ -2150,13 +1957,11 @@ def compile_gemm(
                 fx.get_iter(arg_p_sorted_weights),
                 fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
             )
-            # load rows/token weights using C layout
             frag_sorted_weight = flyobj.load_tiled_mma_fragC(
                 mm, sorted_weights, copy_atom_bits=32
             )
 
             if fx.const_expr(arg_a_scale is not None):
-                """load & combine per-token scales with per-token weights, and store into lds.C"""
                 cp_atom = flyobj.get_buffer_copy_atom(p_a_scale.dtype, 32)
                 coord_tensor = fx.make_view(
                     fx.get_iter(arg_p_sorted_ids),
@@ -2179,21 +1984,12 @@ def compile_gemm(
                     )
                     fx.copy(cp_atom, atom_A, dst)
 
-                # combine per-token scales with per-token weights
                 for frag_pt, frag_sw in fxh.all_elements(
                     frag_pt_scales, frag_sorted_weight
                 ):
                     frag_pt.store(frag_pt.load() * frag_sw.load())
 
                 frag_sorted_weight = frag_pt_scales
-
-            def f32_to_bf16(x):
-                round_bit = as_ir_value(fx.Uint32(0x8000)).bitcast(fx.Float32.ir_type)
-                return (
-                    ((x + round_bit).bitcast(fx.Uint32) >> 16)
-                    .to(fx.Uint16)
-                    .bitcast(fx.BFloat16)
-                )
 
             def gemm_compute(fragW, fragPCS, fragC):
                 fragC.fill(0)
@@ -2234,7 +2030,7 @@ def compile_gemm(
                 for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
                     fc.store(fc.load() * fsw.load())
                 vec_f32 = fragC.load()
-                fragC_bf16.store(f32_to_bf16(vec_f32))
+                fragC_bf16.store(_f32_to_bf16(vec_f32))
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
             arg_p_output = fx.flat_divide(arg_p_output, (BLOCK_M, BLOCK_N))
@@ -2246,34 +2042,13 @@ def compile_gemm(
                 fx.copy(cp_ldsc, thrv_ldsC[None, None, None, ldsc_idx], fragOut)
                 fx.copy(cp_atom_out_128b, fragOut, thrv_out[None, None, None, 0, n])
 
-            """
-            apply per-token scale & weights, cvt-bf16, write-fragC to LDS
-            load fragC from LDS, write to global memory
-            """
-
             def hot_loop_scheduler():
-                """
-                // to cross the SCHED_BARRIER during scheduling.
-                //     MASK = 0x0000 0000: No instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0001: ALL, non-memory, non-side-effect producing instructions may be
-                //                         scheduled across SCHED_BARRIER, i.e. allow ALU instructions to pass.
-                //     MASK = 0x0000 0002: VALU instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0004: SALU instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0008: MFMA/WMMA instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0010: ALL VMEM instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0020: VMEM read instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0040: VMEM write instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0080: ALL DS instructions may be scheduled across SCHED_BARRIER.
-                //     MASK = 0x0000 0100: ALL DS read instructions may be scheduled accoss SCHED_BARRIER.
-                //     MASK = 0x0000 0200: ALL DS write instructions may be scheduled across SCHED_BARRIER.
-                """
                 num_mfma_inst = (BLOCK_M // 16) * (
                     K // (16 if weight_dtype.width == 16 else 32)
                 )
                 num_stores = BLOCK_M // (256 // (BLOCK_N // 8))
                 num_loads = K // ((4 * 8) if weight_dtype.width == 16 else (4 * 16))
 
-                # print(num_loads, num_stores, num_mfma_inst)
                 nloads = num_loads
                 nstores = num_stores
                 mfma_step = num_mfma_inst // (nloads + nstores)
@@ -2292,7 +2067,6 @@ def compile_gemm(
 
                 fx.rocdl.sched_barrier(0)
 
-            # prelog
             frag_weights = [None, None]
             frag_pc_scales = [None, None]
             frag_weights[0] = flyobj.load_tiled_mma_fragA(
@@ -2306,7 +2080,6 @@ def compile_gemm(
                     copy_atom_bits=32 if weight_quant_type == "per_tensor" else 128,
                 )
 
-            # prelog
             gemm_compute(frag_weights[0], frag_pc_scales[0], fragC[0])
             frag_weights[1] = flyobj.load_tiled_mma_fragA(
                 mm, weight, [None, None, 1, None]
@@ -2321,15 +2094,6 @@ def compile_gemm(
 
             postprocess_store2lds(fragC[0], 0)
             fx.gpu.barrier()
-            """
-            sched_group_barrier only search independent instructions within current basic-block
-            and syn-threads/barrier is a boundary of basic-block, we need to respect this rules
-            and clearly organize instructions into natural basic-blocks and apply sched_group_barrier
-            to each of them:
-                basic-block1: post-process & LDS write | prefetch part of next weight block
-                    wait barrier
-                basic-block2: gemm compute | prefetch part of next weight block | LDS-read + global-write
-            """
             for n, state in range(0, nBN - 2, 2, init=[]):
                 fxh.asm_mark("aaa")
                 postprocess_store2vmem(n, 0)
@@ -2354,7 +2118,6 @@ def compile_gemm(
                 flyobj.load_tiled_mma_fragA(
                     mm, weight, [None, None, n + 3, None], frag_weights[1]
                 )
-                # fxh.asm_mark("ccc")
 
                 if fx.const_expr(
                     arg_w_scale is not None and weight_quant_type != "per_tensor"
@@ -2368,7 +2131,6 @@ def compile_gemm(
                 hot_loop_scheduler()
                 fx.gpu.barrier()
 
-            # epilogue
             postprocess_store2vmem(nBN - 2, 0)
             gemm_compute(frag_weights[1], frag_pc_scales[1], fragC[1])
             postprocess_store2lds(fragC[1], 1)
@@ -2539,12 +2301,12 @@ def _ptr(t):
 
 @functools.cache
 def sorted_sum(TOPK, N):
-    num_threads = 64
+    assert N % 256 == 0
+    num_threads = 64 if N % 512 == 0 else 32
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def sorted_sum_kernel(loc_ids: fx.Pointer, A: fx.Pointer, B: fx.Pointer):
         batch = fx.block_idx.x
-        # preload all TOPK locations
         loc_ids += batch * TOPK
         token_locs = [loc_ids[topk] for topk in fx.range_constexpr(TOPK)]
 
@@ -2570,7 +2332,6 @@ def sorted_sum(TOPK, N):
             fx.copy(copy_atom, atom, frag)
             return frag
 
-        # all_copy_atoms only partions the first mode, extra modes are considered as batch/broadcast dimension
         for dst, col in fxh.all_copy_atoms(
             B, col_tensor, atom_bits=copy_bits, num_threads=num_threads
         ):
@@ -2582,7 +2343,6 @@ def sorted_sum(TOPK, N):
                 vec = frag[m].load().to(fx.Float32)
                 vec_sum += vec
 
-            # store out
             vec_sum = vec_sum.to(dst.dtype)
 
             frag = fx.make_fragment_like(dst)
@@ -2629,9 +2389,7 @@ def invert_sorted_ids(TOPK):
         batch = fx.block_idx.x
         tid = fx.thread_idx.x
         slot = batch * num_threads + tid
-        # Scan only the down-written region [0, num_valid): the tail of sorted_ids
-        # (>= num_valid) is uninitialized, and its garbage would racily map real
-        # tokens onto unwritten gemm2_out rows. Read the bound on-device (no host sync).
+        # Ignore the uninitialized tail beyond num_valid.
         num_valid = p_num_valid[0].to(fx.Uint32)
         if slot < num_valid:
             sid = sorted_ids[slot].to(fx.Uint32)
@@ -2680,9 +2438,7 @@ def invert_sorted_ids(TOPK):
 def flydsl_absmax():
     num_threads = 64
 
-    @flyc.kernel(
-        known_block_size=[num_threads, 1, 1]
-    )  # known_block_size at compile time
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def absmax(A: fx.Pointer, Amax: fx.Pointer, num_elements: fx.Int64):
 
         worker_id = fx.block_idx.x
@@ -2694,8 +2450,6 @@ def flydsl_absmax():
             num_elements, num_workers, worker_id, align=copy_bits // A.dtype.width
         )
 
-        # buffer-copy returns zero for out-of-bounds address, so we can use it to avoid bounds check
-        # make sure neles * (A.dtype.width//8) < 4GB
         copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), A.dtype)
         A = fx.make_view(A + ele0, fx.make_layout(neles, 1))
         A = fx.rocdl.make_buffer_tensor(
@@ -2771,13 +2525,7 @@ def flydsl_quant_per_tensor(torch_dtype):
 
     fmax = torch.finfo(torch_dtype).max
 
-    # a_scale = gemm1_out.float().abs().amax() / fmax
-    # down_in = (gemm1_out.float() / a_scale).clamp(-fmax, fmax).to(weight_type)
-    # a_scale = a_scale.reshape(1).to(torch.float32)
-
-    @flyc.kernel(
-        known_block_size=[num_threads, 1, 1]
-    )  # known_block_size at compile time
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def quantize_per_tensor(
         A: fx.Pointer, Amax: fx.Pointer, B: fx.Pointer, num_elements: fx.Int64
     ):
@@ -2795,8 +2543,6 @@ def flydsl_quant_per_tensor(torch_dtype):
             num_elements, num_workers, worker_id, align=copy_bits // A.dtype.width
         )
 
-        # buffer-copy returns zero for out-of-bounds address, so we can use it to avoid bounds check
-        # make sure neles * (A.dtype.width//8) < 4GB
         copy_atomA = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), A.dtype)
         copy_atomB = fx.make_copy_atom(
             fx.rocdl.BufferCopy(copy_bits * B.dtype.width // A.dtype.width), B.dtype

@@ -70,10 +70,15 @@ class Config:
                 f"inter_dim={problem.inter_dim} is not divisible by the "
                 "down BLOCK_K=64"
             )
-        if self.use_prefill and problem.model_dim % 128 != 0:
+        if self.use_prefill and problem.hidden_dim % (2 * self.BLOCK_K) != 0:
             return (
-                f"model_dim={problem.model_dim} is not divisible by 128; "
-                "the prefill down kernel processes paired 64-wide tiles"
+                f"hidden_dim={problem.hidden_dim} is not divisible by "
+                f"2*BLOCK_K={2 * self.BLOCK_K} for the gateup pipeline"
+            )
+        if self.use_prefill and problem.model_dim % 256 != 0:
+            return (
+                f"model_dim={problem.model_dim} is not divisible by 256; "
+                "the prefill down pipeline processes paired 128-wide tiles"
             )
         return None
 
@@ -115,9 +120,7 @@ class _Problem:
 
 def get_tune_space():
     return [
-        # decoding ignored BLOCK_N/BLOCK_K
         Config(16, 16, 16, False).to_string(),
-        # Config(64, 256, 64, True).to_string(),
         Config(64, 256, 128, True).to_string(),
         Config(64, 128, 256, True).to_string(),
         Config(64, 128, 128, True).to_string(),
@@ -141,7 +144,6 @@ def _get_compiled_kernel(
     activation_str="silu",
     swiglu_limit=None,
 ):
-    """Cache-compiled flydsl kernel via compile_gemm."""
     from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_gemm
 
     return compile_gemm(
@@ -177,7 +179,6 @@ def _ptr(t):
 
 
 def _launch(kernel_fn, *args):
-    """Launch a FlyDSL JIT kernel on the current stream."""
     stream = torch.cuda.current_stream()
     prepared_args = [
         _ptr(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
@@ -317,7 +318,6 @@ def _run_prefill(
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=128,
-        # Down-prefill uses its own dtype-sized K chunk; Config.BLOCK_K tunes gateup.
         stage="down",
         alg="prefill_1x4",
         E=problem.experts,
@@ -531,6 +531,23 @@ def run_flydsl_moe_gfx942(
     config_string: str,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
+    if num_local_tokens is not None:
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support num_local_tokens"
+        )
+    for name, tensor in (
+        ("hidden_states", hidden_states),
+        ("w1", w1),
+        ("w2", w2),
+        ("topk_weight", topk_weight),
+        ("topk_ids", topk_ids),
+        ("w1_scale", w1_scale),
+        ("w2_scale", w2_scale),
+    ):
+        if tensor is not None and not tensor.is_contiguous():
+            raise NotImplementedError(
+                f"gfx942 FlyDSL whole-graph backend requires contiguous {name}"
+            )
     config = Config.from_string(config_string)
     if (
         hidden_states.dtype != torch.bfloat16

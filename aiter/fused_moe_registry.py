@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Whole-graph fused MoE implementations selected by ``kernelName1``.
-
-Implementations receive a normalized request and an opaque config string. Code
-registers a stable name; tuned CSV rows select it with the convention
-``impl__<name>__<config>``.
-"""
-
 import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -60,7 +53,6 @@ class FusedMoeImplResolutionError(ValueError):
 
 
 def register_fused_moe_impl(name: str, impl: FusedMoeImpl | str) -> None:
-    """Register a whole-graph fused MoE implementation or lazy import path."""
     previous = _IMPLEMENTATIONS.get(name)
     if previous is not None and previous != impl:
         raise ValueError(f"Fused MoE implementation already registered: {name}")
@@ -74,7 +66,6 @@ def make_fused_moe_impl_kernel_name(name: str, config: str) -> str:
 
 
 def resolve_fused_moe_impl(kernel_name: str) -> BoundFusedMoeImpl | None:
-    """Resolve ``impl__<name>__<config>`` and bind its opaque config."""
     if not kernel_name.startswith(_KERNEL_NAME_PREFIX):
         return None
 

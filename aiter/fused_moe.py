@@ -1208,6 +1208,8 @@ def _fused_moe_impl(
             _disable_inline_sort=disable_inline_sort,
             input_dtype=hidden_states.dtype,
             has_stage2_scatter=stage2_scatter is not None,
+            has_activation_scales=a1_scale is not None or a2_scale is not None,
+            has_num_local_tokens=num_local_tokens is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -1756,7 +1758,6 @@ class MOEMetadata:
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
     max_sorted_blocks: int | None = None
-    # Optional backend for replacing the complete sort/quant/GEMM/reduce graph.
     full_impl: BoundFusedMoeImpl | None = None
 
 
@@ -2710,6 +2711,8 @@ def get_2stage_cfgs(
     _disable_inline_sort=False,
     input_dtype=None,
     has_stage2_scatter=False,
+    has_activation_scales=False,
+    has_num_local_tokens=False,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -3055,6 +3058,10 @@ def get_2stage_cfgs(
             unsupported = f"activation dtype {input_dtype}"
         elif has_stage2_scatter:
             unsupported = "stage2_scatter"
+        elif has_activation_scales:
+            unsupported = "prequantized activations"
+        elif has_num_local_tokens:
+            unsupported = "num_local_tokens"
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
         elif gate_mode is not GateMode.SEPARATED:

@@ -129,6 +129,10 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
     return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
 
 
+def _all_finite(tensor: torch.Tensor) -> bool:
+    return bool(torch.isfinite(tensor).all().item())
+
+
 def _parse_tuning_type(value):
     if isinstance(value, (torch.dtype, ActivationType, QuantType)):
         return value
@@ -4836,7 +4840,11 @@ class FmoeTuner(TunerCommon):
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
                 )
-                if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                if not _all_finite(out) or not _all_finite(ref):
+                    diag = tensor_compare_diagnostics(ref, out)
+                    status = f"error:nonfinite output or reference; {diag}"
+                    err_ratio = 1.0
+                elif out.count_nonzero() == 0 and ref.count_nonzero() > 0:
                     diag = tensor_compare_diagnostics(ref, out)
                     status = (
                         "error:output is all zeros (kernel produced no output); "
@@ -5868,6 +5876,7 @@ class FmoeTuner(TunerCommon):
 
         from aiter.ops.flydsl.fused_moe_gfx942 import (
             Config,
+            _Problem,
             get_tune_space,
             run_flydsl_moe_gfx942,
         )
@@ -5951,14 +5960,19 @@ class FmoeTuner(TunerCommon):
                 position
                 for position, (_, row) in enumerate(self.untunedf.iterrows())
                 if not bool(row["doweight_stage1"])
-                and (
-                    not config.use_prefill
-                    or (
-                        int(row["inter_dim"]) * 2 % config.BLOCK_N == 0
-                        and int(row["inter_dim"]) % 64 == 0
-                        and int(row["model_dim"]) % 128 == 0
+                and config.unsupported_reason(
+                    _Problem(
+                        batch=int(row["token"]),
+                        experts=int(row["expert"]),
+                        gateup_dim=int(row["inter_dim"]) * 2,
+                        hidden_dim=int(row["model_dim"]),
+                        model_dim=int(row["model_dim"]),
+                        inter_dim=int(row["inter_dim"]),
+                        topk=int(row["topk"]),
+                        quant_type="",
                     )
                 )
+                is None
             ]
             if not eligible_indices:
                 continue
