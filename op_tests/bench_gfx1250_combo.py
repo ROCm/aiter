@@ -660,7 +660,7 @@ _MLA_V4_DSV4_SHAPES = [
 _MLA_V4_EP_HEADS = 128
 _MLA_V4_EP_BATCH = 512
 _MLA_V4_EP_KV_GROUPS = (
-    ("CSA", (384, 448, 512, 583, 640)),
+    ("CSA", (384, 448, 512, 583, 640, 1024)),
     ("HCA", (136, 138, 140, 142, 144)),
 )
 
@@ -1799,11 +1799,113 @@ def _perf_ratio(num, den):
     return f"{num / den:.2f}x"
 
 
+_MLA_V4_TP_CHILD_CODE = r"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.getcwd(), "op_tests"))
+import bench_gfx1250_combo as combo
+
+args = argparse.Namespace(**json.loads(sys.argv[1]))
+combo._JSON_OUTPUT = True
+combo._run_mla_v4_decode_tp(args)
+raise SystemExit(1 if combo._FAILURES else 0)
+"""
+
+
+def _mla_v4_ep_tables(lines):
+    """Label the sparse-prefill child rows as the MLA decode EP result."""
+    page_groups = {
+        page: group for group, pages in _MLA_V4_EP_KV_GROUPS for page in pages
+    }
+    tables = []
+    for table, profiles in _profiled_json_tables(lines):
+        # Match profiler blocks while the table still has the child test's
+        # original name.  The generic structured-child path cannot associate
+        # them after this extractor relabels the table as MLA decode [EP].
+        _attach_kernel_profiles(table, profiles)
+        table["name"] = "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)"
+        rows = []
+        for row in table["rows"]:
+            mapped = {}
+            for key, value in row.items():
+                if key == "n":
+                    mapped["batch"] = value
+                elif key == "total_pages":
+                    mapped["kv_seq_lens"] = value
+                else:
+                    mapped[key] = value
+            rows.append(
+                {
+                    "scenario": "EP",
+                    "kv_group": page_groups.get(row.get("total_pages")),
+                    **mapped,
+                }
+            )
+        table["rows"] = rows
+        tables.append(json.dumps(table))
+    return tables
+
+
 def run_mla_v4_decode(args):
-    """Run the EP and TP MLA decode paths from the existing combo trigger."""
+    """Run the existing EP and TP tests serially in separate child processes."""
     _unused_scale_init(args, "mla_v4_decode")
-    _run_mla_v4_decode_ep(args)
-    _run_mla_v4_decode_tp(args)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ep_pages = [ctx for _, contexts in _MLA_V4_EP_KV_GROUPS for ctx in contexts]
+    _run_child(
+        "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)",
+        [
+            sys.executable,
+            "op_tests/test_pa_sparse_prefill.py",
+            "-n",
+            str(_MLA_V4_EP_BATCH),
+            "--h_q",
+            str(_MLA_V4_EP_HEADS),
+            "-d",
+            "512",
+            "--total_pages",
+            *map(str, ep_pages),
+            "--total_tokens",
+            str(_MLA_V4_EP_BATCH),
+            "--prec",
+            "fp8",
+            "--mode",
+            "sparse",
+            "--backend",
+            "opus",
+            "asm",
+            "--no-verify",
+            "--seed",
+            str(args.seed),
+            "--data-init",
+            *(args.data_init or ["norm"]),
+        ],
+        cwd=repo_root,
+        extract=_mla_v4_ep_tables,
+        kernels=False,
+        structured=True,
+    )
+
+    tp_args = json.dumps(
+        {
+            "suite": args.suite,
+            "data_init": args.data_init,
+            "seed": args.seed,
+            "mla_v4_kargpreld_shapes": args.mla_v4_kargpreld_shapes,
+            "mla_v4_kargpreld_iters": args.mla_v4_kargpreld_iters,
+            "mla_v4_kargpreld_warmup": args.mla_v4_kargpreld_warmup,
+        }
+    )
+    _run_child(
+        "mla_v4 decode [TP] (bf16, asm vs triton)",
+        [sys.executable, "-c", _MLA_V4_TP_CHILD_CODE, tp_args],
+        cwd=repo_root,
+        extract=_json_tables,
+        kernels=False,
+        structured=True,
+    )
 
 
 def _run_mla_v4_decode_ep(args):
@@ -1912,10 +2014,10 @@ def _run_mla_v4_decode_tp(args):
     # TODO: the model-local TP head count is 32, but the current gfx1250
     # test_mla_v4_kargpreld.py test and dispatcher do not enable qh32-q1.
     # Keep the existing supported head values until that kernel path is wired up.
-    _run_mla_v4_decode_tp_block(args, shapes, group)
+    _run_mla_v4_decode_tp_block(args, shapes, group, mla_v4_kargpreld_mod)
 
 
-def _run_mla_v4_decode_tp_block(args, shapes, group):
+def _run_mla_v4_decode_tp_block(args, shapes, group, mla_v4_kargpreld_mod):
     """Run the TP asm/Triton comparison and emit its table and SMI labels."""
     data_inits = args.data_init or ["norm"]
     rows = []
