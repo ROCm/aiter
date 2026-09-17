@@ -1033,19 +1033,36 @@ def run_case(
             )
             plan = fused.plan(global_tokens)
             row["fused_ag_wire"] = plan.ag_wire
+            # Non-zero only when this M's own tuned row quantizes inline and a
+            # larger bucket's row was borrowed to stay on the FP4 wire, which
+            # means the GEMMs below are not the ones the tuner picked for this M.
+            row["fused_gemm_bucket"] = (
+                plan.gemm_bucket if plan.gemm_bucket != plan.tokens else 0
+            )
             y_fused = fused(inputs)
-            # The unfused path is the oracle here: both run the same tuned
-            # GEMMs, so anything beyond quantization noise is a fusion bug.
+            # Normally the unfused path is the oracle: both run the same tuned
+            # GEMMs, so anything beyond quantization noise is a fusion bug, and
+            # the tight fused_rtol applies.  When a row was borrowed the two
+            # sides run *different* kernels, so their difference is ordinary
+            # kernel-to-kernel rounding and only the wider reference tolerance
+            # is meaningful; torch stays the oracle via fused_ref_rel_l2 below.
+            borrowed_row = bool(row["fused_gemm_bucket"])
+            fused_gate = args.rtol if borrowed_row else args.fused_rtol
             row["fused_rel_l2"] = rel_l2(y_fused, y_actual)
             del y_fused
             if not (row["fused_rel_l2"] == row["fused_rel_l2"]):  # NaN
                 raise AssertionError(
                     f"{shape.tag(tp)} tokens={global_tokens}: fused rel_l2 NaN"
                 )
-            if row["fused_rel_l2"] >= args.fused_rtol:
+            if row["fused_rel_l2"] >= fused_gate:
+                why = (
+                    f" (borrowed the M={row['fused_gemm_bucket']} tuned row)"
+                    if borrowed_row
+                    else ""
+                )
                 raise AssertionError(
                     f"{shape.tag(tp)} tokens={global_tokens}: fused vs unfused "
-                    f"rel_l2={row['fused_rel_l2']:.6f} exceeds {args.fused_rtol}"
+                    f"rel_l2={row['fused_rel_l2']:.6f} exceeds {fused_gate}{why}"
                 )
             if global_tokens <= args.accuracy_max_tokens:
                 reference = TorchReferenceTpMoe(weights, ctx)
@@ -1189,6 +1206,7 @@ _PERF_COLUMNS = [
     "ag_bytes_ratio",
     "quant_local_us",
     "fused_ag_wire",
+    "fused_gemm_bucket",
     "fused_rel_l2",
     "fused_ref_rel_l2",
     "fused_ag_us",
@@ -1246,16 +1264,21 @@ def parse_args(argv=None):
         "--fused-rtol",
         type=float,
         default=0.02,
-        help="rel_l2 gate for fused-vs-unfused. Both run the same tuned GEMMs, "
-        "so the only legitimate difference is where the activation quantization "
-        "happens; anything larger is a fusion bug, hence the tighter bound.",
+        help="rel_l2 gate for fused-vs-unfused. Normally both run the same tuned "
+        "GEMMs, so the only legitimate difference is where the activation "
+        "quantization happens; anything larger is a fusion bug, hence the "
+        "tighter bound. Cases that had to borrow another bucket's tuned row "
+        "(fused_gemm_bucket != 0) run different kernels on the two sides and "
+        "are held to --rtol instead.",
     )
     p.add_argument(
         "--ag-wire",
         choices=["auto", "fp4_1x32", "bf16"],
         default="auto",
-        help="Wire format for the fused AllGather. 'auto' takes the MXFP4 wire "
-        "whenever the selected GEMM1 accepts a pre-quantized operand.",
+        help="Wire format for the fused AllGather. 'auto' prefers the MXFP4 "
+        "wire at every M, borrowing a larger bucket's tuned row when this M's "
+        "own GEMM1 quantizes inline; 'bf16' pins the BF16 wire and always keeps "
+        "the tuned row.",
     )
     p.add_argument(
         "--rs-wire",

@@ -31,9 +31,18 @@ What is fused here
     The hoist needs a GEMM1 that accepts a pre-quantized FP4 operand.  In the
     ``flydsl_mxmoe_g1_a4w4_*`` family that is every non-``f16in`` variant
     (``MXFP4_G1_VARIANTS``); the ``f16in`` ones read raw BF16 and quantize
-    inline.  When the tuned row selects an inline-quant GEMM1 (small ``M``,
-    where the collective is latency-bound and the FP4 wire would buy nothing
-    anyway) this falls back to the BF16 wire automatically.
+    inline.  Small ``M`` tunes onto ``BM=16``, which has *no* pre-quantized
+    variant compiled at all -- ``MXFP4_G1_VARIANTS["fp4"]`` holds only
+    ``(16, True, True)``, because ``native_scale_layout_for(16, "fp4")`` puts
+    BM16 on a different GEMM1/GEMM2 scale-layout contract.
+
+    So to keep small ``M`` on the FP4 wire, ``_resolve_plan`` borrows the tuned
+    row of the first larger token bucket whose GEMM1 *does* take a
+    pre-quantized operand, and substitutes that whole row (stage1 *and* stage2,
+    so the scale-layout contract between them stays intact).  The GEMM is then
+    tile-tuned for more tokens than the call actually has -- a legal kernel for
+    the shape, but not the tuned-optimal one.  ``ag_wire='bf16'`` opts out and
+    keeps the tuned inline-quant row.
 
 ``routing metadata AllGather``
     ``topk_ids`` and ``topk_weights`` are packed into one int32 payload so the
@@ -70,6 +79,12 @@ AQ_DTYPE = dtypes.fp4x2
 WQ_DTYPE = dtypes.fp4x2
 
 #: Wire formats understood by :class:`MegaMoeTP` for the AllGather leg.
+#:
+#: ``auto`` prefers ``fp4_1x32`` at every ``M``, substituting a pre-quantized
+#: GEMM1 from a larger token bucket when the tuned row for this ``M`` quantizes
+#: inline; it only falls back to ``bf16`` when no such row exists anywhere.
+#: ``fp4_1x32`` is the same but raises instead of falling back.  ``bf16`` pins
+#: the BF16 wire and always keeps the tuned row.
 AG_WIRE_MODES = ("auto", "fp4_1x32", "bf16")
 #: Wire formats understood for the ReduceScatter leg.
 RS_WIRE_MODES = ("auto", "bf16")
@@ -260,12 +275,17 @@ class MegaMoeTP:
         self._plan_cache[bucket] = plan
         return plan
 
-    def _resolve_plan(self, bucket: int) -> "_CasePlan":
+    def _tuned_row(self, bucket: int):
+        """Look up the tuned two-stage config for one token bucket.
+
+        Returns ``(metadata, kernel1, kernel2)``.  A failed lookup yields
+        ``(None, "", "")`` rather than raising: the caller either falls back to
+        the BF16 wire or moves on to the next bucket in the probe.
+        """
         from aiter.fused_moe import get_2stage_cfgs
         from aiter.ops.flydsl.moe_common import GateMode
 
         cfg = self.cfg
-        kernel1 = kernel2 = ""
         try:
             metadata = get_2stage_cfgs(
                 bucket,
@@ -285,33 +305,72 @@ class MegaMoeTP:
                 True,  # is_shuffled
                 GateMode.SEPARATED.value,
             )
-            kernel1 = _partial_keyword(metadata.stage1, "kernelName1", "kernelName")
-            kernel2 = _partial_keyword(metadata.stage2, "kernelName2", "kernelName")
         except Exception as exc:  # noqa: BLE001 - probe only, never fatal
             logger.warning(
                 "[mega_moe_tp] could not resolve tuned kernels for M=%d: %s",
                 bucket,
                 exc,
             )
+            return None, "", ""
+        return (
+            metadata,
+            _partial_keyword(metadata.stage1, "kernelName1", "kernelName"),
+            _partial_keyword(metadata.stage2, "kernelName2", "kernelName"),
+        )
 
+    def _probe_prequant_row(self, bucket: int):
+        """First bucket above ``bucket`` whose tuned GEMM1 reads pre-quantized A.
+
+        Buckets are powers of two (:func:`get_padded_M`), and above
+        ``_PADDED_M_TIERS[0]`` the tuner reuses that top row, so the walk stops
+        there instead of asking for rows the CSV does not carry.
+        """
+        from aiter.fused_moe import _PADDED_M_TIERS
+
+        top = int(_PADDED_M_TIERS[0])
+        probe = bucket * 2
+        while probe <= top:
+            metadata, kernel1, kernel2 = self._tuned_row(probe)
+            if _gemm1_takes_prequantized_fp4(kernel1):
+                return probe, metadata, kernel1, kernel2
+            probe *= 2
+        return None
+
+    def _resolve_plan(self, bucket: int) -> "_CasePlan":
+        cfg = self.cfg
+        _, kernel1, kernel2 = self._tuned_row(bucket)
         prequant_ok = _gemm1_takes_prequantized_fp4(kernel1)
-        want = cfg.ag_wire
-        if want == "auto":
-            wire = "fp4_1x32" if prequant_ok else "bf16"
-        elif want == "fp4_1x32" and not prequant_ok:
+
+        if cfg.ag_wire == "bf16":
+            return _CasePlan(bucket, "bf16", kernel1, kernel2, None, bucket)
+        if prequant_ok:
+            return _CasePlan(bucket, "fp4_1x32", kernel1, kernel2, None, bucket)
+
+        # The tuned row for this bucket quantizes inline, so it cannot read the
+        # FP4 wire, and at BM16 no pre-quantized variant exists to retune onto.
+        # Borrow a larger bucket's row instead -- both stages together, so the
+        # GEMM1/GEMM2 scale-layout contract stays self-consistent.
+        borrowed = self._probe_prequant_row(bucket)
+        if borrowed is not None:
+            src, metadata, sub1, sub2 = borrowed
+            logger.debug(
+                "[mega_moe_tp] M=%d tunes onto inline-quant %r; borrowing the "
+                "M=%d row (%r) to stay on the FP4 wire",
+                bucket,
+                kernel1,
+                src,
+                sub1,
+            )
+            return _CasePlan(bucket, "fp4_1x32", sub1, sub2, metadata, src)
+
+        if cfg.ag_wire == "fp4_1x32":
             raise ValueError(
                 f"ag_wire='fp4_1x32' needs a pre-quantized GEMM1, but M={bucket} "
-                f"resolves to {kernel1!r}, which quantizes inline. Use "
-                "ag_wire='auto' or retune this shape onto a non-f16in GEMM1."
+                f"resolves to {kernel1!r}, which quantizes inline, and no larger "
+                "token bucket for this shape resolves to one either. Use "
+                "ag_wire='bf16' or tune a non-f16in GEMM1 for this shape."
             )
-        else:
-            wire = "bf16" if want == "bf16" else want
-        return _CasePlan(
-            tokens=bucket,
-            ag_wire=wire,
-            gemm1_kernel=kernel1,
-            gemm2_kernel=kernel2,
-        )
+        return _CasePlan(bucket, "bf16", kernel1, kernel2, None, bucket)
 
     # -- stages -------------------------------------------------------------
     def _collectives(self, wire: str) -> TpMoeCollectives:
@@ -405,6 +464,13 @@ class MegaMoeTP:
         # The activation arrives packed FP4, so the output dtype cannot be
         # inferred from it the way the BF16 wire allows.
         kwargs["dtype"] = dtypes.bf16
+        if plan.metadata is None:
+            transform = _prequant_transform
+        else:
+            # This bucket's own tuned row quantizes inline; run the borrowed
+            # row instead of whatever the lookup inside _fused_moe_impl finds.
+            borrowed = replace(plan.metadata, prequant=True)
+            transform = lambda _metadata: borrowed  # noqa: E731
         return _fused_moe_impl(
             a1,
             self.w1,
@@ -414,7 +480,7 @@ class MegaMoeTP:
             a1_scale=a1_scale,
             output=output,
             _q_dtype_a=AQ_DTYPE,
-            _metadata_transform=_prequant_transform,
+            _metadata_transform=transform,
             **kwargs,
         )
 
@@ -450,12 +516,21 @@ class MegaMoeTP:
 
 @dataclass(frozen=True)
 class _CasePlan:
-    """The per-token-bucket decisions the runtime caches."""
+    """The per-token-bucket decisions the runtime caches.
+
+    ``metadata`` is the two-stage config to force, set only when this bucket's
+    own tuned row had to be swapped out to stay on the FP4 wire; ``None`` means
+    the ordinary lookup already lands on the right row.  ``gemm_bucket`` records
+    which bucket the kernels came from, so it is visible in tests and logs when
+    it is not ``tokens``.
+    """
 
     tokens: int
     ag_wire: str
     gemm1_kernel: str
     gemm2_kernel: str
+    metadata: object | None = None
+    gemm_bucket: int = 0
 
 
 def _prequant_transform(metadata):
