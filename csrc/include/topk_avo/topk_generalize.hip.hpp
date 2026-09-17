@@ -268,7 +268,9 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
 
     int* out        = out_idx + (size_t)row * K;
     const int k_out = RAGGED ? k_take_dev(K, len) : K;
-    if(c_raw < (unsigned)k_out || c_raw > (unsigned)cap)
+    // See phase_c_select_waveseg: len <= K routes unconditionally so the identity
+    // emit cannot be diverted by a cand_count the +inf threshold let through.
+    if((RAGGED && len <= K) || c_raw < (unsigned)k_out || c_raw > (unsigned)cap)
     {
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;

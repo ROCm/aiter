@@ -82,6 +82,14 @@ static int g_small_n_passes     = RADIX_PASSES; // < 4 is a TIMING ABLATION (wro
 static int g_verify_sample_rows = 32;
 static int g_verify_oracle_gpu  = 1;
 static int g_ragged             = 0;
+// Mirrors aiter's create_row_boundaries(num_rows, num_prefix): row r has extent
+// num_prefix + r + 1. The prefix is what decides WHICH ragged path is exercised
+// and the two are disjoint, so a gate that only runs prefix 0 tests half the
+// code: at prefix 0 every extent is <= M, so with S=8192 every row is routed to
+// the identity/exact path and the SAMPLER never sees a ragged row at all
+// (M=512 N=131072 reported fallback_rows for all 512 rows). aiter's real
+// prefill config uses prefix 131072, where every extent is long and ragged.
+static int g_ragged_prefix = 0;
 
 // ---------------------------------------------------------------------------
 // Block-wide exact radix select over keys already resident in LDS.
@@ -311,7 +319,6 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
                                                           float* __restrict__ threshold_f,
                                                           unsigned int* __restrict__ cand_reserved,
                                                           unsigned int* __restrict__ cand_bad,
-                                                          int* __restrict__ fb_rows,
                                                           int* __restrict__ fb_count,
                                                           int K)
 {
@@ -336,11 +343,16 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
     // threshold is +inf and Phase C takes it through the exact/identity path.
     if(RAGGED && (len <= K || len < S))
     {
+        // +inf is the whole routing signal: Phase B keeps nothing below it, so
+        // cand_count lands under k_out and Phase C takes the row through the
+        // exact/identity path. Deliberately NOT appended to fb_rows here -- Phase C
+        // appends every row it routes, and doing it in both places counted a short
+        // row twice, overflowing the M-entry fb_rows (M=512 triangular reported
+        // fallback_rows=1024 and wrote 512 ints past the end of the buffer).
         if(threadIdx.x == 0)
         {
-            threshold[row]                  = 0u;
-            threshold_f[row]                = __builtin_inff();
-            fb_rows[atomicAdd(fb_count, 1)] = row;
+            threshold[row]   = 0u;
+            threshold_f[row] = __builtin_inff();
         }
         return;
     }
@@ -676,7 +688,12 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
     __shared__ unsigned s_wgt, s_weq;
 
     int* out_row = out_idx + (size_t)row * K;
-    if(c_raw < (unsigned)k_out || c_raw > (unsigned)cap)
+    // `len <= K` is routed unconditionally rather than via cand_count, so the
+    // identity emit does not depend on how many candidates Phase B happened to
+    // keep: under the `inf` distribution a row of +inf values passes the +inf
+    // threshold and can push cand_count above k_out, which would otherwise send
+    // an identity row down the candidate path and order it differently to aiter.
+    if((RAGGED && len <= K) || c_raw < (unsigned)k_out || c_raw > (unsigned)cap)
     {
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;
@@ -982,7 +999,6 @@ static void topk_fused_impl(const float* d_in,
                                                               b.threshold_f,
                                                               coop ? b.cand_reserved : nullptr,
                                                               coop ? b.cand_bad : nullptr,
-                                                              b.fb_rows,
                                                               b.fb_count,
                                                               K);
 
