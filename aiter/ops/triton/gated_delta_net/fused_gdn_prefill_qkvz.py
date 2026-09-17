@@ -138,24 +138,21 @@ def _select_tile_key(tokens: int, batch: int) -> Optional[str]:
 
 
 def _load_tile(key: str):
-    """Lazily import and return the Gluon tile entry for ``key``.
+    """Lazily import and return the host launcher for tile ``key``.
 
-    The ``triton.experimental.gluon`` + ROCm ``libdevice`` imports happen here,
-    on the dispatch path, never at module load.
+    Only the dispatched tile's launcher is imported (and, transitively, its Gluon
+    kernel module), so the ``triton.experimental.gluon`` + ROCm ``libdevice``
+    imports happen here, on the dispatch path, never at module load. Each launcher
+    lives in this package (``_gdn_prefill_launch_<key>``) and holds the torch/
+    triton host orchestration; the kernel modules under ``_gluon_kernels`` stay
+    torch-free.
     """
-    from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz import (
-        _prefill_m1024_3071,
-        _prefill_m3072_16384,
-        _prefill_m12289_16384_b1_5,
-        _prefill_m12289_16384_b6_15,
-    )
+    import importlib
 
-    return {
-        "m1024_3071": _prefill_m1024_3071,
-        "m3072_16384": _prefill_m3072_16384,
-        "m12289_16384_b1_5": _prefill_m12289_16384_b1_5,
-        "m12289_16384_b6_15": _prefill_m12289_16384_b6_15,
-    }[key]
+    launcher = importlib.import_module(
+        f"aiter.ops.triton.gated_delta_net._gdn_prefill_launch_{key}"
+    )
+    return launcher.gdn_prefill_group_fp8_quant
 
 
 def fused_gdn_prefill_qkvz_supported(

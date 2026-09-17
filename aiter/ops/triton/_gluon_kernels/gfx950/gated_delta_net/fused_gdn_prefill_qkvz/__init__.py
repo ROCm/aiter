@@ -22,27 +22,10 @@ kernel-pack profile it was ported from:
     tokens 12289..16384, batch 6..15 -> _prefill_m12289_16384_b6_15
     tokens 12289..16384, batch 16..64-> _prefill_m3072_16384
 
-Each tile module is self-contained (its own ``@gluon.jit`` helpers and
-``FP8_E4M3_FN`` precision config) to keep the ported schedules byte-faithful; the
-duplication is intentional and load-bearing for numerics.
+Each tile module holds only its ``@gluon.jit`` kernels (torch-free). The torch/
+triton host orchestration lives in a per-tile launcher next to the public wrapper
+(``aiter/ops/triton/gated_delta_net/_gdn_prefill_launch_<key>.py``), which imports
+the kernels from here; the wrapper's ``_load_tile`` imports the launcher for the
+dispatched tile. The four tiles are intentionally self-contained (each carries its
+own kernels for its band's byte-faithful schedule).
 """
-
-from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m1024_3071 import (  # noqa: E501
-    gdn_prefill_group_fp8_quant as _prefill_m1024_3071,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m3072_16384 import (  # noqa: E501
-    gdn_prefill_group_fp8_quant as _prefill_m3072_16384,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m12289_16384_b1_5 import (  # noqa: E501
-    gdn_prefill_group_fp8_quant as _prefill_m12289_16384_b1_5,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m12289_16384_b6_15 import (  # noqa: E501
-    gdn_prefill_group_fp8_quant as _prefill_m12289_16384_b6_15,
-)
-
-__all__ = [
-    "_prefill_m1024_3071",
-    "_prefill_m3072_16384",
-    "_prefill_m12289_16384_b1_5",
-    "_prefill_m12289_16384_b6_15",
-]
