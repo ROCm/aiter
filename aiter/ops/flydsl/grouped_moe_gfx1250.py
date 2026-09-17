@@ -973,8 +973,16 @@ def grouped_gemm_gfx1250_a8w4(
 
     if _is_ep:
         if local_expert_hash is None:
-            _grouped_dbg("local_expert_hash missing; skip gfx1250 grouped EP")
-            return None
+            _grouped_dbg(
+                "local_expert_hash missing; deriving it from expert_mask"
+            )
+            mask = expert_mask.reshape(-1).to(
+                device=hidden_states.device, dtype=torch.bool
+            )
+            local_expert_hash = torch.cumsum(
+                mask, dim=0, dtype=torch.int32
+            ) - 1
+            local_expert_hash.masked_fill_(~mask, -1)
         if local_expert_hash.device != hidden_states.device:
             raise ValueError("local_expert_hash must be on the input device")
         if local_expert_hash.dtype != torch.int32:
