@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import math
 import os
 import sys
 
@@ -25,6 +26,15 @@ from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
+
+# atol as a fraction of the reference RMS. A fixed 1e-2 is a no-op once |out|
+# reaches 1e4, leaving near-zero outputs judged on bare rtol -- a bar no
+# bf16-output GEMM can clear.
+ATOL_REL = 1e-2
+# rel-L2 limit, as a multiple of the bf16 output-quantization floor. Unlike the
+# mismatch ratio this is insensitive to how many outputs land near zero, so it
+# is the gate that actually catches lost precision.
+REL_L2_SLACK = 2.0
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -52,8 +62,9 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     w_scale = w_scale[:n, :k]
     weight = weight.to(w_scale.dtype) * w_scale
 
-    out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
-    return out.to(dtype)
+    # fp32, not ``dtype``: the caller needs the un-rounded reference to derive
+    # the bf16 quantization floor.
+    return F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -97,13 +108,30 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
     )
 
 
+def rel_l2(y, ref_f32):
+    """||y - ref|| / ||ref||, evaluated in fp64 so the metric itself is exact."""
+    ref = ref_f32.double()
+    denom = ref.norm().clamp(min=torch.finfo(torch.float64).tiny)
+    return ((y.double() - ref).norm() / denom).item()
+
+
+def check_rel_l2(y, ref_f32, floor, msg):
+    """Gate rel-L2 against the bf16 floor; > REL_L2_SLACK means lost precision."""
+    ratio = rel_l2(y, ref_f32) / max(floor, torch.finfo(torch.float32).tiny)
+    tag = "\033[31mfailed!\033[0m" if ratio > REL_L2_SLACK else "\033[32mpassed~\033[0m"
+    aiter.logger.info(
+        f"{msg}[rel-L2 {ratio:.2f}x bf16 floor, limit {REL_L2_SLACK:.1f}x {tag}]"
+    )
+    return ratio
+
+
 @benchmark()
 def test_gemm(
     dtype,
     m,
     n,
     k,
-    ck_preshuffle=True,
+    bpreshuffle=True,
     use_flydsl=False,
     data_init="uniform",
     scale_init="auto",
@@ -116,30 +144,45 @@ def test_gemm(
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
     generator = bench_init.make_generator(seed)
-    if data_init == "constant":
-        x = torch.full((m, k), 0.5, dtype=dtypes.fp32, device="cuda").to(dtypes.fp8)
-        weight = torch.full((n, k), 0.5, dtype=dtypes.fp32, device="cuda").to(
-            dtypes.fp8
+    if scale_init == "amax":
+        # Realistic MXFP8: each block's scale comes from its own amax, and the
+        # 1/sqrt(k) weight init puts the output at O(1) like a real layer.
+        x, x_scale_raw = bench_init.fill_mx_e8m0(
+            (m, k), data_init, generator, block_n=1, block_k=block_shape_k
+        )
+        weight, w_scale_raw = bench_init.fill_mx_e8m0(
+            (n, k),
+            data_init,
+            generator,
+            block_n=block_shape_n,
+            block_k=block_shape_k,
+            std=1.0 / math.sqrt(k),
         )
     else:
-        x = bench_init.fill_fp8((m, k), data_init, generator, dtype=dtypes.fp8)
-        weight = bench_init.fill_fp8((n, k), data_init, generator, dtype=dtypes.fp8)
+        if data_init == "constant":
+            x = torch.full((m, k), 0.5, dtype=dtypes.fp32, device="cuda").to(dtypes.fp8)
+            weight = torch.full((n, k), 0.5, dtype=dtypes.fp32, device="cuda").to(
+                dtypes.fp8
+            )
+        else:
+            x = bench_init.fill_fp8((m, k), data_init, generator, dtype=dtypes.fp8)
+            weight = bench_init.fill_fp8((n, k), data_init, generator, dtype=dtypes.fp8)
 
-    if scale_init == "constant":
-        x_scale_raw = torch.full(
-            (scale_m, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
-        )
-        w_scale_raw = torch.full(
-            (scale_n, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
-        )
-    else:
-        x_scale_raw = bench_init.fill_scale_e8m0(
-            (scale_m, scale_k), scale_init, generator
-        )
-        w_scale_raw = bench_init.fill_scale_e8m0(
-            (scale_n, scale_k), scale_init, generator
-        )
-    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
+        if scale_init == "constant":
+            x_scale_raw = torch.full(
+                (scale_m, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
+            )
+            w_scale_raw = torch.full(
+                (scale_n, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
+            )
+        else:
+            x_scale_raw = bench_init.fill_scale_e8m0(
+                (scale_m, scale_k), scale_init, generator
+            )
+            w_scale_raw = bench_init.fill_scale_e8m0(
+                (scale_n, scale_k), scale_init, generator
+            )
+    use_flydsl_fp8_scale = use_flydsl and bpreshuffle
     if use_flydsl_fp8_scale:
         x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
         w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
@@ -147,16 +190,22 @@ def test_gemm(
         x_scale = fp4_utils.e8m0_to_f32(x_scale_raw)
         w_scale = fp4_utils.e8m0_to_f32(w_scale_raw)
 
-    a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
+    a_f32, _ = run_torch(x, weight, x_scale, w_scale, dtype)
+    a = a_f32.to(dtype)
+    atol = ATOL_REL * a_f32.pow(2).mean().sqrt().item()
+    l2_floor = rel_l2(a, a_f32)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
-    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
+    gemm_x_scale = x_scale_t if bpreshuffle else x_scale
+    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if bpreshuffle else weight
+    run_func = run_gemm_bpreshuffle if bpreshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
-    err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
-    if ck_preshuffle:
+    err_base = checkAllclose(
+        a, b, msg="bpreshuffle", atol=atol, catastrophic_check=True
+    )
+    l2x_base = check_rel_l2(b, a_f32, l2_floor, "bpreshuffle")
+    if bpreshuffle:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
             x, gemm_weight, x_scale_strided, w_scale, dtype
@@ -164,13 +213,15 @@ def test_gemm(
         checkAllclose(
             a,
             b_strided,
-            msg="ck strided x_scale",
+            msg="bpreshuffle strided x_scale",
+            atol=atol,
             catastrophic_check=True,
         )
-    ret["ck us"] = avg_b
-    ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
-    ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
-    ret["ck err"] = err_ck
+    ret["us"] = avg_b
+    ret["TFLOPS"] = m * n * k * 2 / avg_b / 1e6
+    ret["TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
+    ret["err"] = err_base
+    ret["l2x"] = l2x_base
 
     if apre and use_flydsl_fp8_scale:
         # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
@@ -186,31 +237,36 @@ def test_gemm(
         ret["apre us"] = avg_e
         ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
         ret["apre TB/s"] = (x_apre.nbytes + weight.nbytes) / avg_e / 1e6
-        ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
-        ret["apre/ck"] = avg_e / avg_b
+        ret["apre err"] = checkAllclose(
+            a, e, msg="apre", atol=atol, catastrophic_check=True
+        )
+        ret["apre l2x"] = check_rel_l2(e, a_f32, l2_floor, "apre")
+        ret["apre/bpre"] = avg_e / avg_b
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
         weight_asm = shuffle_weight(weight, layout=(16, 16))
         c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-        err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
+        err_asm = checkAllclose(a, c, msg=f"{tag}", atol=atol, catastrophic_check=True)
         ret[f"{tag} us"] = avg_c
         ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
         ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
         ret[f"{tag} err"] = err_asm
-        ret["asm/ck"] = avg_c / avg_b
+        ret["asm/base"] = avg_c / avg_b
 
         # Triton path requires a preshuffled weight. When not preshuffled we simply omit
         # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
-        if ck_preshuffle:
+        if bpreshuffle:
             d, avg_d = run_triton(x, gemm_weight, x_scale_t, w_scale, dtype)
-            err_triton = checkAllclose(a, d, msg="triton", catastrophic_check=True)
+            err_triton = checkAllclose(
+                a, d, msg="triton", atol=atol, catastrophic_check=True
+            )
             ret["triton us"] = avg_d
             ret["triton TFLOPS"] = m * n * k * 2 / avg_d / 1e6
             ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
             ret["triton err"] = err_triton
-            ret["triton/ck"] = avg_d / avg_b
+            ret["triton/bpre"] = avg_d / avg_b
 
     return ret
 
@@ -297,6 +353,30 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     )
 
 
+# Kept in the JSON record and the results CSV, but dropped from the terminal
+# table: constant across a run, or already gated in the log.
+TABLE_DROP_COLS = ("dtype", "seed", "apre", "l2x", "apre l2x", "apre/bpre")
+# Folded into the summary header when constant, kept as a column when swept.
+TABLE_FOLD_COLS = ("bpreshuffle", "use_flydsl")
+
+
+def display_view(frame):
+    """Trim the results frame down to the terminal summary table.
+
+    Returns ``(view, folded)``: the table, plus the ``{column: value}`` pairs
+    that were constant and belong in the header.  ``data_init`` / ``scale_init``
+    are swept as a pair, so they collapse to one ``init_mode`` column.
+    """
+    view = frame.rename(columns={"data_init": "init_mode"})
+    drop = [c for c in ("scale_init",) + TABLE_DROP_COLS if c in view.columns]
+    folded = {}
+    for col in TABLE_FOLD_COLS:
+        if col in view.columns and view[col].nunique(dropna=False) == 1:
+            folded[col] = view[col].iloc[0]
+            drop.append(col)
+    return view.drop(columns=drop), folded
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -368,7 +448,9 @@ parser.add_argument(
     choices=bench_init.DATA_DISTS,
     default=None,
     help="DATA initialization distribution(s), paired position-wise with "
-    "--scale-init (length-1 broadcasts). Default: constant uniform",
+    "--scale-init (length-1 broadcasts). Default: constant norm. When "
+    "--scale-init is omitted, each value here picks its natural scale dist "
+    "instead (norm -> amax, constant -> constant; see --scale-init).",
 )
 parser.add_argument(
     "--scale-init",
@@ -377,7 +459,9 @@ parser.add_argument(
     choices=bench_init.E8M0_SCALE_DISTS,
     default=None,
     help="E8M0 SCALE initialization distribution(s), paired position-wise "
-    "with --data-init (length-1 broadcasts). Default: constant auto",
+    "with --data-init (length-1 broadcasts). 'amax' derives each block's "
+    "scale from its own payload (realistic MXFP8). Default: derived from "
+    "--data-init (norm -> amax, constant -> constant, others -> amax).",
 )
 parser.add_argument(
     "--seed",
@@ -386,19 +470,19 @@ parser.add_argument(
     help="RNG seed for input, weight, and scales (default: 0)",
 )
 parser.add_argument(
-    "--ck_preshuffle",
+    "--bpreshuffle",
     type=dtypes.str2bool,
     nargs="*",
     default=None,
-    help="""weight ck_preshuffle or not.
-    e.g.: --ck_preshuffle True
-        or --ck_preshuffle False
+    help="""preshuffle the B (weight) operand or not.
+    e.g.: --bpreshuffle True
+        or --bpreshuffle False
     """,
 )
 parser.add_argument(
     "--flydsl",
     action="store_true",
-    help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
+    help="use flydsl fp8 e8m0 scale path (requires --bpreshuffle True)",
 )
 parser.add_argument(
     "--apre",
@@ -406,8 +490,8 @@ parser.add_argument(
     nargs="*",
     default=[False],
     help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
-    --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
-    Sweeps like --ck_preshuffle.
+    --bpreshuffle True). Odd M is padded to M+1 rows for A only.
+    Sweeps like --bpreshuffle.
     e.g.: --apre True
         or --apre True False""",
 )
@@ -419,10 +503,10 @@ parser.add_argument(
     e.g.: --csv shapes.csv""",
 )
 parser.add_argument(
-    "--table",
+    "--json",
     action="store_true",
-    help="""Also print the summary as a human-readable table.
-    The default output is the single-line JSON record.""",
+    help="""Also print the summary as a single-line JSON record, for parent
+    benchmark drivers that consume it. The default output is the table.""",
 )
 parser.add_argument(
     "-o",
@@ -442,23 +526,29 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-data_init_list = args.data_init or ["constant", "uniform"]
-scale_init_list = args.scale_init or ["constant", "auto"]
-if len(data_init_list) == 1:
-    data_init_list *= len(scale_init_list)
-if len(scale_init_list) == 1:
-    scale_init_list *= len(data_init_list)
+DEFAULT_SCALE_FOR_DATA = {"constant": "constant", "norm": "amax"}
+
+data_init_list = args.data_init or ["constant", "norm"]
+if args.scale_init is not None:
+    scale_init_list = args.scale_init
+    if len(data_init_list) == 1:
+        data_init_list *= len(scale_init_list)
+    if len(scale_init_list) == 1:
+        scale_init_list *= len(data_init_list)
+else:
+    scale_init_list = [
+        DEFAULT_SCALE_FOR_DATA.get(d, "amax") for d in data_init_list
+    ]
 if len(data_init_list) != len(scale_init_list):
     parser.error(
-        "--data-init and --scale-init must have equal length "
-        "(or length 1 to broadcast)"
+        "--data-init and --scale-init must have equal length (or length 1 to broadcast)"
     )
 init_pairs = list(zip(data_init_list, scale_init_list))
 
-if args.ck_preshuffle is None:
-    args.ck_preshuffle = [True] if args.flydsl else [True, False]
+if args.bpreshuffle is None:
+    args.bpreshuffle = [True] if args.flydsl else [True, False]
 l_preshuffle = (
-    args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
+    args.bpreshuffle if isinstance(args.bpreshuffle, list) else [args.bpreshuffle]
 )
 l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
 
@@ -478,7 +568,7 @@ if args.csv is not None:
                             int(row["M"]),
                             int(row["N"]),
                             int(row["K"]),
-                            ck_preshuffle=preshuffle,
+                            bpreshuffle=preshuffle,
                             use_flydsl=args.flydsl,
                             data_init=data_init,
                             scale_init=scale_init,
@@ -490,7 +580,7 @@ else:
     for dtype in args.dtype:
         for m in args.m:
             for n, k in args.nk:
-                for ck_p in l_preshuffle:
+                for bpre in l_preshuffle:
                     for apre in l_apre:
                         for data_init, scale_init in init_pairs:
                             ret = test_gemm(
@@ -498,7 +588,7 @@ else:
                                 m,
                                 n,
                                 k,
-                                ck_preshuffle=ck_p,
+                                bpreshuffle=bpre,
                                 use_flydsl=args.flydsl,
                                 data_init=data_init,
                                 scale_init=scale_init,
@@ -508,12 +598,30 @@ else:
                             df.append(ret)
 
 df = pd.DataFrame([row for row in df if row is not None])
-print_json_table("gemm_a8w8_blockscale summary", df)
-if args.table and not df.empty:
+if args.json:
+    print_json_table("gemm_a8w8_blockscale summary", df)
+if not df.empty:
+    table, folded = display_view(df)
+    header = "PERFORMANCE SUMMARY"
+    if folded:
+        header += "   [" + "  ".join(f"{c}={v}" for c, v in folded.items()) + "]"
     print("\n" + "=" * 150)
-    print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+    print(header)
+    print("-" * 150)
+    print("  init_mode                : input distribution (data and block scale)")
+    print("  us / TFLOPS / TB/s / err : B-preshuffle GEMM (weight preshuffled)")
+    print("  apre us / apre TFLOPS /  : A-preshuffle + B-preshuffle GEMM")
+    print("  apre TB/s / apre err       (A and weight both preshuffled)")
+    print(
+        "  err                      : fraction of elements outside "
+        "rtol=1e-2 / atol=1e-2*RMS(ref)"
+    )
+    print(
+        f"  rel-L2 is gated separately at {REL_L2_SLACK:.1f}x the bf16 "
+        f"output-quantization floor; see the per-case lines in the log above."
+    )
     print("=" * 150)
-    print(df.to_string(index=False))
+    print(table.to_string(index=False))
     print("=" * 150)
 
 # Correctness check: verify split-K produces matching results

@@ -30,7 +30,16 @@ E8M0_NEUTRAL = 0x7F  # 2^0 = 1.0
 E4M3_NEUTRAL = 0x38  # e4m3 exp bias -> 1.0
 E4M3_SCALE_MEAN, E4M3_SCALE_STD = 0.34375, 0.08
 POW2_BINOMIAL_N = 10
-E8M0_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto", "pow2_binomial")
+E8M0_SCALE_DISTS = (
+    "zero",
+    "constant",
+    "uniform",
+    "norm",
+    "auto",
+    "pow2_binomial",
+    "amax",
+)
+FP8_E4M3_AMAX = 448.0  # largest finite e4m3 magnitude; the MX quantizer target
 E4M3_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto")
 _STAGE_ELEMS = 1 << 28  # 256M f32 = 1 GiB per chunk
 
@@ -346,3 +355,76 @@ def fill_scale_e4m3(
     )
     v.clamp_(min=0.0)
     return v.to(FP8_E4M3).view(torch.uint8)
+
+
+def quantize_mx_e8m0(
+    t,
+    *,
+    block_n=1,
+    block_k=128,
+    dtype=FP8_E4M3,
+    fp8_amax=FP8_E4M3_AMAX,
+):
+    """Quantize a float 2-D tensor to MX on-wire ``(e4m3 payload, e8m0 scale)``.
+
+    Picks the scale a real quantizer would -- ``2 ** ceil(log2(amax / 448))``
+    per ``block_n x block_k`` tile -- so it is derived from the payload rather
+    than drawn independently, keeping the reconstructed tensor at the magnitude
+    of the float source.  ``block_n=1`` is a per-row activation scale,
+    ``block_n=block_k=128`` the 128x128 weight scale.  Ragged edges are padded
+    for the amax reduction and sliced back off.
+    """
+    rows, cols = t.shape
+    n_blk = (rows + block_n - 1) // block_n
+    k_blk = (cols + block_k - 1) // block_k
+    pad_r, pad_c = n_blk * block_n - rows, k_blk * block_k - cols
+    if pad_r or pad_c:
+        padded = torch.zeros(
+            (rows + pad_r, cols + pad_c), dtype=torch.float32, device=t.device
+        )
+        padded[:rows, :cols] = t
+    else:
+        padded = t.to(torch.float32)
+    blk = padded.view(n_blk, block_n, k_blk, block_k)
+    amax = blk.abs().amax(dim=(1, 3))
+    # An all-zero block has no meaningful exponent; 2^0 keeps its payload at 0.
+    exp = torch.where(
+        amax > 0,
+        torch.ceil(
+            torch.log2(amax.clamp(min=torch.finfo(torch.float32).tiny) / fp8_amax)
+        ),
+        torch.zeros_like(amax),
+    ).clamp(-E8M0_BIAS, 255 - E8M0_BIAS)
+    q = (blk / torch.exp2(exp)[:, None, :, None]).reshape(rows + pad_r, cols + pad_c)
+    return q[:rows, :cols].contiguous().to(dtype), (exp + E8M0_BIAS).to(torch.uint8)
+
+
+def fill_mx_e8m0(
+    shape,
+    dist,
+    gen,
+    *,
+    block_n=1,
+    block_k=128,
+    std=1.0,
+    dtype=FP8_E4M3,
+    device="cuda",
+):
+    """Sample float data and quantize it via :func:`quantize_mx_e8m0`.
+
+    Returns both halves together, unlike ``fill_fp8`` / ``fill_scale_e8m0``.
+    ``std`` scales the source first: pass ``1/sqrt(k)`` for a weight so the
+    GEMM output lands at O(1) the way a real transformer layer does.
+    """
+    dist = _canon_dist(dist, DATA_DISTS)
+    if dist == "zero":
+        src = torch.zeros(shape, dtype=torch.float32, device=device)
+    elif dist == "constant":
+        src = torch.full(shape, float(std), dtype=torch.float32, device=device)
+    else:
+        src = _sample_data_f32(
+            shape, dist, gen, lo=-1.0, hi=1.0, device=device
+        ) * float(std)
+    return quantize_mx_e8m0(
+        src, block_n=block_n, block_k=block_k, dtype=dtype, fp8_amax=FP8_E4M3_AMAX
+    )
