@@ -176,9 +176,21 @@ def get_cu_num_custom_op() -> int:
                         break
         except Exception as e:  # noqa: BLE001  blanket catch is intentional here
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {e!s}")
-        assert len(set(gpu_compute_units)) == 1
-        cu_num = gpu_compute_units[0]
+        cu_num = _uniform_cu_count(gpu_compute_units)
     return cu_num
+
+
+def _uniform_cu_count(gpu_compute_units: list[int]) -> int:
+    """Resolve a host-wide CU count or reject ambiguous heterogeneous hosts."""
+    if not gpu_compute_units:
+        raise RuntimeError("rocminfo reported no GPU compute-unit counts")
+    if len(set(gpu_compute_units)) != 1:
+        raise RuntimeError(
+            "Heterogeneous visible GPUs have different compute-unit counts "
+            f"{gpu_compute_units}; select a homogeneous device set or set "
+            "CU_NUM explicitly for the device being tuned"
+        )
+    return gpu_compute_units[0]
 
 
 @functools.lru_cache(maxsize=1)
