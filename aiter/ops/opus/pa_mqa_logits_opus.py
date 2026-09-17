@@ -116,6 +116,41 @@ def pa_mqa_logits_mxfp4_fwd_decode(
 ) -> None: ...
 
 
+# Underscored and kept out of `aiter.ops.opus`, unlike the `_fwd_*` entries below: those are what
+# ATOM imports from the top-level namespace, this one has no reason to be called directly. It
+# takes the two nullable arrays as EMPTY tensors rather than None, and getting `row_to_batch`
+# wrong that way is silent, so the wrapper owns it.
+@compile_ops(MD_NAME_MXFP4, fc_name="pa_mqa_logits_mxfp4_build_sched", develop=True)
+def _pa_mqa_logits_mxfp4_build_sched_raw(
+    local_starts: torch.Tensor,
+    local_ends: torch.Tensor,
+    row_to_batch: torch.Tensor,
+    cta_info: torch.Tensor,
+    num_rows: int,
+    num_ctas: int,
+    block_k: int,
+    cta_target: int,
+) -> None: ...
+
+
+@compile_ops(MD_NAME_MXFP4, develop=True)
+def pa_mqa_logits_mxfp4_fwd_sched(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    cta_info: torch.Tensor,
+    out: torch.Tensor,
+    num_ctas: int,
+    weight_scale: float,
+    block_k: int,
+    kv_block_size: int,
+    max_seq_len: int,
+) -> None: ...
+
+
 @compile_ops(MD_NAME_MXFP4, develop=True)
 def pa_mqa_logits_mxfp4_prefill_windows(
     cu_seq_q: torch.Tensor,
@@ -159,6 +194,93 @@ def compute_prefill_windows(
         cu, ctx, row_to_batch, local_starts, local_ends, int(total_q)
     )
     return row_to_batch, local_starts, local_ends
+
+
+# ── the schedule ──────────────────────────────────────────────────────────────
+# Mirrors of the C++ definitions. Only SCHED_CTA_TARGET is public, as the builder's default; the
+# rest are geometry that `..._sched_slots` / `..._sched_buffer_ints` exist to own, and a caller
+# who open-codes `(num_ctas + 96) * 8` is one header change away from under-allocating.
+SCHED_CTA_TARGET = 1024
+SCHED_CTA_CAP = SCHED_CTA_TARGET
+SCHED_RECORD_INTS = 8
+SCHED_SCRATCH_RECORDS = 96
+
+
+def pa_mqa_logits_mxfp4_sched_slots(num_rows: int, cta_cap: int = SCHED_CTA_CAP) -> int:
+    """CTA slots to launch, i.e. the ``num_ctas`` GRID for :func:`pa_mqa_logits_mxfp4_sched`.
+
+    The floor is ``num_rows``: below it a row could get no CTA at all, and since every other row
+    would still be right, the miss is silent.
+
+    The cap of 1024 is wrong for an unusually heavy bucket -- many rows AND long windows, e.g.
+    1024 rows of 51 KV tiles want 8192 slots where 1024 rows of 8 want exactly 1024. That is a
+    function of total KV tiles, which the host cannot see, so such a caller should pass
+    ``num_ctas`` to :func:`pa_mqa_logits_mxfp4_build_sched` explicitly.
+
+    To size the BUFFER use :func:`pa_mqa_logits_mxfp4_sched_buffer_ints`, not this.
+    """
+    return max(int(num_rows), int(cta_cap))
+
+
+def pa_mqa_logits_mxfp4_sched_buffer_ints(num_ctas: int) -> int:
+    """int32 elements a ``cta_info`` buffer needs for ``num_ctas`` slots.
+
+    Slots plus the builder's own scratch, which sits past them in the same buffer. Sizing it at
+    ``num_ctas * SCHED_RECORD_INTS`` instead is under-allocation; the launcher raises on it.
+    """
+    return (int(num_ctas) + SCHED_SCRATCH_RECORDS) * SCHED_RECORD_INTS
+
+
+def pa_mqa_logits_mxfp4_build_sched(
+    local_ends: torch.Tensor,
+    num_rows: int,
+    *,
+    local_starts: torch.Tensor | None = None,
+    row_to_batch: torch.Tensor | None = None,
+    block_k: int = BLOCK_K_1WAVE,
+    num_ctas: int | None = None,
+    cta_target: int = SCHED_CTA_TARGET,
+    cta_info: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Build the per-row schedule, for either entry point. Device-side, cudagraph-safe, no sync.
+
+    Call this ONCE PER FORWARD, not once per layer: it depends only on ``local_ends``, which is a
+    per-forward quantity, while the kernel runs per CSA layer. A caller whose scorer sits inside
+    a CUDAGraph capture builds it in its metadata builder and hands the same buffer to the
+    capture.
+
+    ``local_starts`` is the per-row window start. Leave it ``None`` for decode, whose rows always
+    start at 0; prefill's usually do not, and it is the only field that distinguishes the two.
+
+    ``row_to_batch`` is the ``block_tables`` row of each query row. Leave it ``None`` when a query
+    row IS its own batch item and ``block_tables`` is per-token -- the ``next_n=1`` convention.
+    Passing a per-BATCH map while the launch gets per-TOKEN ``block_tables`` reads the wrong
+    pages and produces plausible wrong numbers.
+
+    Returns ``(cta_info, num_ctas)``. Pass both to the launch. Reuse the buffer across forwards:
+    the builder writes every slot, including the surplus ones, so nothing leaks between them.
+    A caller supplying its own ``cta_info`` must size it with :func:`pa_mqa_logits_mxfp4_sched_buffer_ints`.
+    """
+    n = int(num_rows)
+    slots = pa_mqa_logits_mxfp4_sched_slots(n) if num_ctas is None else int(num_ctas)
+    if cta_info is None:
+        cta_info = torch.empty(
+            (slots + SCHED_SCRATCH_RECORDS, SCHED_RECORD_INTS),
+            dtype=torch.int32,
+            device=local_ends.device,
+        )
+    empty = torch.empty(0, dtype=torch.int32, device=local_ends.device)
+    _pa_mqa_logits_mxfp4_build_sched_raw(
+        local_starts if local_starts is not None else empty,
+        local_ends.to(torch.int32).contiguous(),
+        row_to_batch if row_to_batch is not None else empty,
+        cta_info,
+        n,
+        slots,
+        int(block_k),
+        int(cta_target),
+    )
+    return cta_info, slots
 
 
 def _require_gfx950(name):
@@ -340,11 +462,70 @@ def pa_mqa_logits_mxfp4_decode(
     return out
 
 
+def pa_mqa_logits_mxfp4_sched(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    cta_info: torch.Tensor,
+    num_ctas: int,
+    max_seq_len: int,
+    *,
+    weight_scale: float = 1.0,
+    block_k: int = BLOCK_K_1WAVE,
+    kv_block_size: int = 64,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MQA logits over the schedule :func:`pa_mqa_logits_mxfp4_build_sched` produced -- prefill or decode, the
+    table says which. **Prefer this to :func:`pa_mqa_logits_mxfp4_decode` and to
+    :func:`pa_mqa_logits_mxfp4_prefill` on any batch whose rows differ in window length**; the
+    arithmetic is identical, what differs is which CTA covers which KV tiles.
+
+    ``cta_info`` / ``num_ctas`` come from :func:`pa_mqa_logits_mxfp4_build_sched`, once per forward. There is no
+    ``local_ends`` argument and that is deliberate: each record carries its own row's window, so
+    the array the schedule was built from cannot disagree with the table. A reused ``out`` must
+    be pre-filled with -inf, since the kernel only writes in-window cells.
+    """
+    _require_gfx950("pa_mqa_logits_mxfp4_sched")
+    total_q = int(q_fp4.shape[0])
+    if out is None:
+        out = torch.full(
+            (total_q, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp4.device,
+        )
+    pa_mqa_logits_mxfp4_fwd_sched(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        cta_info,
+        out,
+        int(num_ctas),
+        float(weight_scale),
+        int(block_k),
+        int(kv_block_size),
+        int(max_seq_len),
+    )
+    return out
+
+
 __all__ = [
+    "SCHED_CTA_TARGET",
     "compute_prefill_windows",
+    "pa_mqa_logits_mxfp4_build_sched",
     "pa_mqa_logits_mxfp4_decode",
     "pa_mqa_logits_mxfp4_fwd_decode",
     "pa_mqa_logits_mxfp4_fwd_prefill",
+    "pa_mqa_logits_mxfp4_fwd_sched",
     "pa_mqa_logits_mxfp4_prefill",
     "pa_mqa_logits_mxfp4_prefill_windows",
+    "pa_mqa_logits_mxfp4_sched",
+    "pa_mqa_logits_mxfp4_sched_buffer_ints",
+    "pa_mqa_logits_mxfp4_sched_slots",
 ]

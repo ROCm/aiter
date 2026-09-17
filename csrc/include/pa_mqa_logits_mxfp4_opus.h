@@ -89,10 +89,67 @@ void pa_mqa_logits_mxfp4_prefill_windows(aiter_tensor_t& cu_seq_q,
                                       aiter_tensor_t& local_ends,
                                       int total_q);
 
+// PREFILL or DECODE over a per-row schedule table -- the table says which. Two ops, split the
+// way the quantities are: the table depends only on `local_ends`, which is per FORWARD, while
+// the kernel runs once per CSA layer. Building it per layer is pure waste.
+//
+// `cta_info` is caller-allocated int32, refreshed in place so a captured graph can replay from
+// one address. It holds `sched_buffer_records(num_ctas)` records of 8 int32 -- `num_ctas` slots
+// plus the builder's own scratch, so sizing it at `num_ctas * 8` is UNDER-allocation; use
+// `aiter.ops.opus.sched_buffer_ints()`. `num_ctas` itself is the launch grid and must be a
+// cudagraph-stable constant >= num_rows; the schedule absorbs the shape variation instead.
+//
+// `local_starts` may be EMPTY, meaning every row starts at 0, which decode always does.
+// `row_to_batch` may be EMPTY, meaning batch_id == row_id -- the `next_n=1` convention, where a
+// query row is its own batch item and `block_tables` is already per-token. Handing it a
+// per-BATCH map while the launch gets per-TOKEN `block_tables` reads the wrong pages and
+// produces plausible wrong numbers.
+void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& local_starts,
+                                      aiter_tensor_t& local_ends,
+                                      aiter_tensor_t& row_to_batch,
+                                      aiter_tensor_t& cta_info,
+                                      int num_rows,
+                                      int num_ctas,
+                                      int block_k,
+                                      int cta_target);
+
+void pa_mqa_logits_mxfp4_fwd_sched(aiter_tensor_t& q,
+                                      aiter_tensor_t& q_scale,
+                                      aiter_tensor_t& kv_cache,
+                                      aiter_tensor_t& kv_scale,
+                                      aiter_tensor_t& block_tables,
+                                      aiter_tensor_t& weights,
+                                      aiter_tensor_t& cta_info,
+                                      aiter_tensor_t& out,
+                                      int num_ctas,
+                                      float weight_scale,
+                                      int block_k,
+                                      int kv_block_size,
+                                      int max_seq_len);
+
 #ifdef PA_MQA_LOGITS_MXFP4_IMPL
 // ==== Implementation (compiled only in the .cu TU): kargs + traits + kernel. ====
 
 using mqa_logits_bf16_t = __bf16;
+
+// One 32-byte record per CTA slot, consumed by SCHED Table. Six fields are used and the record
+// is padded to 8 dwords so a CTA's whole assignment arrives in one `s_load_dwordx8`; do not
+// shrink it. `chunk_count == 0` marks a surplus slot, whose CTA returns before any load.
+//
+// `chunk_start` is ABSOLUTE -- a tile index into the row's sequence, not an offset from
+// `local_start`. The store's out-of-range proof depends on that and on `local_start` being the
+// row's real start; see the `do_store` bound in the kernel before changing either.
+struct opus_mqa_cta_record {
+    int row_id;       // packed query row -> q / q_scale / weights / out
+    int batch_id;     // block_tables row
+    int chunk_start;  // first KV tile (block_k units) this CTA covers, absolute
+    int chunk_count;  // KV tiles it covers; 0 = surplus slot
+    int local_start;  // the ROW's window start; always 0 on a decode table
+    int local_end;    // the ROW's window end
+    int _pad[2];
+};
+static_assert(sizeof(opus_mqa_cta_record) == 32,
+              "the record must stay one s_load_dwordx8; see the comment above");
 
 // Kernel arguments. Pointers are opaque; the kernel reinterprets per its ABI.
 struct opus_mqa_logits_kargs {
@@ -121,7 +178,454 @@ struct opus_mqa_logits_kargs {
     int   block_k;             // KV tile size (== Traits::KV_TILE_SIZE)
     int   kv_block_size;       // paged block (page) size (== Traits::PAGE_SIZE)
     int   max_blocks_per_seq;  // block_tables row stride
+
+    // SCHED Table only. APPENDED, not grouped with the pointers above: every field before this
+    // must keep the kernarg offset it had, or the four kernels that shipped stop compiling to
+    // the machine code they did.
+    const opus_mqa_cta_record* __restrict__ ptr_cta_info;  // [num_ctas]
+    int   num_ctas;            // grid.x of the Table launch; slots past the work idle
 };
+
+// ── the SCHED Table builder ──────────────────────────────────────────────────────────
+// The same CODE as opus-ops `opus_logits/gfx950/src/logits_sched.h`, maintained by hand like the
+// kargs struct and the kernel below. Not the same comments: that copy carries the design account
+// (and FP4_HANDOFF 21/22 cite it), this one carries what a caller or a translator needs.
+// `opus_logits/gfx950/tools/cmp_sched_sources.py` is what keeps the code halves honest -- run it
+// after editing either.
+namespace opus_logits {
+
+// Workgroup widths the builder is instantiated at; `sched_plan` picks between them.
+constexpr int SCHED_BUILD_BLOCK      = 256;
+constexpr int SCHED_BUILD_BLOCK_WIDE = 1024;
+
+// CTAs the schedule aims to spread the work over: `safe = ceil(total_KV_tiles / SCHED_CTA_TARGET)`
+// tiles per CTA. `total_tiles` is a block reduction the builder already performs, so the split
+// factor needs nothing from the host.
+constexpr int SCHED_CTA_TARGET = 1024;
+
+// Slot count, i.e. the LAUNCH GRID. It must be a host-side constant to stay cudagraph-stable
+// across replays; the schedule absorbs the shape variation instead, and slots past the work
+// carry `chunk_count = 0`.
+//
+// The floor is `num_rows`: below it a row could get no CTA at all and its logits would silently
+// keep whatever the caller pre-filled. A caller whose bucket is unusually heavy (many rows AND
+// long windows) can pass a larger `num_ctas`; surplus slots are cheap, so overshooting is the
+// safer mistake.
+constexpr int SCHED_CTA_CAP = SCHED_CTA_TARGET;
+
+__host__ __device__ inline int sched_slots(int num_rows, int cta_cap = SCHED_CTA_CAP) {
+    return num_rows > cta_cap ? num_rows : cta_cap;
+}
+
+// Workgroups the multi-WG emit may use, and the scratch that shape needs.
+//
+// `_emit` hands each block its (max_tiles, total_tiles, nz_rows) partial to `_finish`. The
+// partials live PAST the slots in the caller's own `cta_info` allocation, so `sched_slots` is the
+// GRID and `sched_buffer_records` is the BUFFER -- confusing the two under-allocates by
+// SCHED_SCRATCH_RECORDS and corrupts the tail. Nothing here needs zeroing: a block writes only
+// its own triple and `_finish` reads exactly as many as `_emit` was launched with.
+constexpr int SCHED_BUILD_MAX_BLOCKS = 256;
+constexpr int SCHED_SCRATCH_INTS     = 3 * SCHED_BUILD_MAX_BLOCKS;
+constexpr int SCHED_SCRATCH_RECORDS =
+    (SCHED_SCRATCH_INTS * (int)sizeof(int) + (int)sizeof(opus_mqa_cta_record) - 1) /
+    (int)sizeof(opus_mqa_cta_record);
+
+// Records the caller must ALLOCATE, as against `sched_slots`, which is the grid to LAUNCH.
+__host__ __device__ inline int sched_buffer_records(int num_ctas) {
+    return num_ctas + SCHED_SCRATCH_RECORDS;
+}
+
+// How to launch, given the shape. Both hosts call this so the two cannot drift on the policy.
+// One workgroup fits the work up to ~4096 rows; past that the pass is spread over a grid and
+// `_finish` settles the split factor. `block` is the single-workgroup width, or `_finish`'s.
+struct sched_build_plan {
+    int block;   // workgroup width
+    int blocks;  // workgroups for the emit; 1 means the single-workgroup kernel
+};
+
+__host__ inline sched_build_plan sched_plan(int num_rows, int num_ctas) {
+    sched_build_plan p{SCHED_BUILD_BLOCK, 1};
+    if (num_rows < 512) return p;                 // narrow, one workgroup
+    p.block = SCHED_BUILD_BLOCK_WIDE;
+    if (num_rows <= 4096) return p;               // wide, one workgroup
+    p.blocks = (num_ctas + SCHED_BUILD_BLOCK - 1) / SCHED_BUILD_BLOCK;
+    if (p.blocks < 1) p.blocks = 1;
+    if (p.blocks > SCHED_BUILD_MAX_BLOCKS) p.blocks = SCHED_BUILD_MAX_BLOCKS;
+    return p;
+}
+
+namespace sched_detail {
+
+// `__syncthreads` comes from the full HIP runtime header, which this tree does not include.
+// Same lowering in builtins: release the workgroup's LDS writes, barrier, acquire.
+__device__ inline void sync_block() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+}
+
+template<int BLOCK, bool IS_MAX>
+__device__ inline int block_reduce(int v, int* s, int tid) {
+    s[tid] = v;
+    sync_block();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            const int o = s[tid + off];
+            s[tid] = IS_MAX ? (o > s[tid] ? o : s[tid]) : (s[tid] + o);
+        }
+        sync_block();
+    }
+    const int r = s[0];
+    sync_block();
+    return r;
+}
+
+// max tiles, total tiles and non-empty row count down ONE ladder. `s` needs 3 * BLOCK ints.
+template<int BLOCK>
+__device__ inline void block_reduce_stats(int vmax, int vsum, int vnz, int* s, int tid,
+                                          int& omax, int& osum, int& onz) {
+    s[tid]             = vmax;
+    s[BLOCK + tid]     = vsum;
+    s[2 * BLOCK + tid] = vnz;
+    sync_block();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            const int om = s[tid + off];
+            if (om > s[tid]) s[tid] = om;
+            s[BLOCK + tid]     += s[BLOCK + tid + off];
+            s[2 * BLOCK + tid] += s[2 * BLOCK + tid + off];
+        }
+        sync_block();
+    }
+    omax = s[0];
+    osum = s[BLOCK];
+    onz  = s[2 * BLOCK];
+    sync_block();
+}
+
+// Hillis-Steele exclusive scan; also returns the block total.
+template<int BLOCK>
+__device__ inline int block_scan_excl(int v, int* s, int tid, int& total) {
+    s[tid] = v;
+    sync_block();
+    for (int off = 1; off < BLOCK; off <<= 1) {
+        const int add = (tid >= off) ? s[tid - off] : 0;
+        sync_block();
+        s[tid] += add;
+        sync_block();
+    }
+    total = s[BLOCK - 1];
+    const int incl = s[tid];
+    sync_block();
+    return incl - v;
+}
+
+// A row's tile range is [first, end) in ABSOLUTE tile indices, so a non-zero window start costs
+// no tiles -- which is what lets one table serve prefill and decode.
+//
+// BRANCHLESS ON PURPOSE. An `if (e <= 0) return 0;` here reads naturally and costs 38% at 16384
+// rows: the callers are latency-bound strided walks, and a branch on the value just loaded
+// serializes what was a pipelined stream.
+__device__ inline int row_tiles(const int* __restrict__ local_starts,
+                                const int* __restrict__ local_ends,
+                                int r, int block_k) {
+    const int e     = local_ends[r];
+    const int first = local_starts ? (local_starts[r] / block_k) : 0;
+    const int end   = e > 0 ? ((e + block_k - 1) / block_k) : 0;
+    return end > first ? end - first : 0;
+}
+
+// One strided walk that reduces AND emits. The fast-path record is the row's own window and
+// nothing else, so it does not depend on the split factor and is written SPECULATIVELY here;
+// when the general path turns out to be needed it overwrites every slot.
+//
+// Read each array ONCE into a local before any arithmetic. Going through `row_tiles` and again
+// for the record reads the same lines twice and the compiler stops merging them.
+__device__ inline void emit_fast(const int* __restrict__ local_starts,
+                                 const int* __restrict__ local_ends,
+                                 const int* __restrict__ row_to_batch,
+                                 opus_mqa_cta_record* __restrict__ cta_info,
+                                 int first_row, int num_rows, int stride, int block_k,
+                                 int& part_max, int& part_sum, int& part_nz) {
+    part_max = 0;
+    part_sum = 0;
+    part_nz  = 0;
+    for (int r = first_row; r < num_rows; r += stride) {
+        const int e     = local_ends[r];
+        const int s     = local_starts ? local_starts[r] : 0;
+        const int b     = row_to_batch ? row_to_batch[r] : r;
+        const int first = s / block_k;
+        const int end   = e > 0 ? ((e + block_k - 1) / block_k) : 0;
+        const int t     = end > first ? end - first : 0;
+        if (t > part_max) part_max = t;
+        part_sum += t;
+        part_nz  += (t > 0);
+        opus_mqa_cta_record rec{};
+        rec.row_id      = r;
+        rec.batch_id    = b;
+        rec.chunk_start = first;
+        rec.chunk_count = t;
+        rec.local_start = s;
+        rec.local_end   = e;
+        cta_info[r]     = rec;
+    }
+}
+
+// Surplus slots. Marked, not left stale: the table is reused in place across cudagraph replays,
+// so a slot that carried work last forward must not carry it again this one.
+__device__ inline void mark_surplus(opus_mqa_cta_record* __restrict__ cta_info,
+                                    int first_slot, int num_ctas, int stride) {
+    for (int slot = first_slot; slot < num_ctas; slot += stride) {
+        opus_mqa_cta_record rec{};
+        rec.chunk_count = 0;
+        cta_info[slot]  = rec;
+    }
+}
+
+// Deepen the split until the schedule fits the slots. `ceil(t/s)` summed over rows is
+// non-increasing in s, so feasibility is monotone and the binary search is valid. Each probe is
+// a full strided pass, so this is the expensive branch.
+//
+// The early-out is exact, not a heuristic: a row with any tiles takes at least one CTA, so
+// `ctas_for(s) >= nz_rows` always, with equality exactly when `s >= max_tiles`. When the slot
+// budget IS the non-empty row count, `max_tiles` is therefore the only feasible split factor and
+// the search below would spend ~log2(max_tiles) passes returning it.
+template<int BLOCK>
+__device__ inline int settle_safe(const int* __restrict__ local_starts,
+                                  const int* __restrict__ local_ends,
+                                  int num_rows, int num_ctas, int block_k,
+                                  int safe, int max_tiles, int nz_rows, int* smem, int tid) {
+    if (nz_rows >= num_ctas) return max_tiles;
+    auto ctas_for = [&](int s) {
+        int part = 0;
+        for (int r = tid; r < num_rows; r += BLOCK) {
+            const int t = row_tiles(local_starts, local_ends, r, block_k);
+            part += (t + s - 1) / s;
+        }
+        return block_reduce<BLOCK, false>(part, smem, tid);
+    };
+    if (ctas_for(safe) > num_ctas) {
+        int lo = safe + 1, hi = max_tiles > safe ? max_tiles : safe + 1;
+        while (lo < hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (ctas_for(mid) <= num_ctas) hi = mid;
+            else lo = mid + 1;
+        }
+        safe = lo;
+    }
+    return safe;
+}
+
+// Some row is split, so slots and rows are not in bijection and the chunk's exclusive prefix sum
+// is needed. The slot cursor carries across chunks of BLOCK rows. Returns the first unused slot.
+// Emitted SLOT-parallel: one thread per CTA of the chunk, finding its row by a search over the
+// LDS prefix, so a deeply split row does not leave BLOCK-1 threads idle.
+template<int BLOCK>
+__device__ inline int general_emit(const int* __restrict__ local_starts,
+                                   const int* __restrict__ local_ends,
+                                   const int* __restrict__ row_to_batch,
+                                   opus_mqa_cta_record* __restrict__ cta_info,
+                                   int num_rows, int num_ctas, int block_k, int safe,
+                                   int* smem, int* s_excl, int* s_tiles, int* s_batch,
+                                   int* s_end, int* s_ls, int tid) {
+    int carry = 0;
+    for (int base = 0; base < num_rows; base += BLOCK) {
+        const int r = base + tid;
+        const int tiles = (r < num_rows) ? row_tiles(local_starts, local_ends, r, block_k) : 0;
+        const int nc = (tiles + safe - 1) / safe;
+        int block_total = 0;
+        const int excl = block_scan_excl<BLOCK>(nc, smem, tid, block_total);
+        s_excl[tid]  = excl;
+        s_tiles[tid] = tiles;
+        s_batch[tid] = (r < num_rows) ? (row_to_batch ? row_to_batch[r] : r) : 0;
+        s_end[tid]   = (r < num_rows) ? local_ends[r] : 0;
+        s_ls[tid]    = (r < num_rows) ? (local_starts ? local_starts[r] : 0) : 0;
+        sync_block();
+
+        for (int j = tid; j < block_total; j += BLOCK) {
+            int lo = 0, hi = BLOCK;
+            while (lo < hi) {           // upper_bound(s_excl, j) - 1
+                const int mid = (lo + hi) >> 1;
+                if (s_excl[mid] <= j) lo = mid + 1; else hi = mid;
+            }
+            const int rl = lo - 1;      // >= 0: s_excl[0] is 0 and j >= 0
+            const int i  = j - s_excl[rl];
+            const int slot = carry + j;
+            if (slot < num_ctas) {      // cannot fire while num_ctas >= the schedule's need
+                const int off  = i * safe;
+                const int left = s_tiles[rl] - off;
+                opus_mqa_cta_record rec{};
+                rec.row_id      = base + rl;
+                rec.batch_id    = s_batch[rl];
+                rec.chunk_start = s_ls[rl] / block_k + off;
+                rec.chunk_count = left < safe ? left : safe;
+                rec.local_start = s_ls[rl];
+                rec.local_end   = s_end[rl];
+                cta_info[slot]  = rec;
+            }
+        }
+        carry += block_total;
+        sync_block();
+    }
+    return carry;
+}
+
+// Aim the CTA COUNT at the target; the tiles per CTA fall out of the work.
+__device__ inline int split_factor(int total_tiles, int cta_target) {
+    const int safe = total_tiles > 0 ? ((total_tiles + cta_target - 1) / cta_target) : 1;
+    return safe < 1 ? 1 : safe;
+}
+
+// The tail both the single-workgroup builder and `_finish` run once the statistics are known:
+// take the fast path as `emit_fast` already wrote it, or overwrite the table from the general
+// one. `surplus_done` says whether the caller already marked the slots past the rows.
+template<int BLOCK>
+__device__ inline void settle_and_emit(const int* __restrict__ local_starts,
+                                       const int* __restrict__ local_ends,
+                                       const int* __restrict__ row_to_batch,
+                                       opus_mqa_cta_record* __restrict__ cta_info,
+                                       int num_rows, int num_ctas, int block_k, int cta_target,
+                                       int max_tiles, int total_tiles, int nz_rows,
+                                       bool surplus_done,
+                                       int* smem, int* s_excl, int* s_tiles, int* s_batch,
+                                       int* s_end, int* s_ls, int tid) {
+    const int safe0 = split_factor(total_tiles, cta_target);
+    if (max_tiles <= safe0) {
+        // No row needs more than one CTA, so the slot IS the row. An empty row spends a slot
+        // rather than a CTA, which is what makes that identity hold without a scan to skip it.
+        if (!surplus_done) mark_surplus(cta_info, num_rows + tid, num_ctas, BLOCK);
+        return;
+    }
+    const int safe = settle_safe<BLOCK>(local_starts, local_ends, num_rows, num_ctas, block_k,
+                                        safe0, max_tiles, nz_rows, smem, tid);
+    const int carry = general_emit<BLOCK>(local_starts, local_ends, row_to_batch, cta_info,
+                                          num_rows, num_ctas, block_k, safe, smem, s_excl,
+                                          s_tiles, s_batch, s_end, s_ls, tid);
+    mark_surplus(cta_info, carry + tid, num_ctas, BLOCK);
+}
+
+}  // namespace sched_detail
+
+// Build the table on ONE workgroup: `<<<1, BLOCK>>>`, BLOCK from `sched_plan`.
+//
+//   local_starts  [num_rows] int32, the per-row window start. MAY BE NULL, which means every
+//                 row starts at 0 -- decode always does, and prefill usually does not.
+//   local_ends    [num_rows] int32, the per-row window end
+//   row_to_batch  [num_rows] int32, the block_tables row for each query row. MAY BE NULL,
+//                 which means batch_id == row_id -- the `next_n=1` convention, where a query
+//                 row IS a batch item and the block table is already per-token. Handing it a
+//                 per-BATCH map while the launch gets per-TOKEN `block_tables` reads the wrong
+//                 pages and produces plausible wrong numbers.
+//   cta_info      [num_ctas] records, written in full: every slot is either work or a marked
+//                 surplus, so the caller never has to clear it between forwards. The ALLOCATION
+//                 is `sched_buffer_records(num_ctas)`; the tail is the multi-WG scratch and this
+//                 kernel does not touch it.
+//
+// The caller must pass `num_ctas >= num_rows`; `sched_slots` guarantees it. With that, the split
+// factor `safe = max_tiles` is always feasible, so the search always terminates on a schedule
+// that covers every row.
+//
+// Row order is a performance decision, not an arbitrary one: slot index decides XCD.
+template<int BLOCK>
+__global__ __launch_bounds__(BLOCK)
+void mqa_logits_build_sched(const int* __restrict__ local_starts,
+                            const int* __restrict__ local_ends,
+                            const int* __restrict__ row_to_batch,
+                            opus_mqa_cta_record* __restrict__ cta_info,
+                            int num_rows, int num_ctas,
+                            int block_k, int cta_target) {
+    __shared__ int smem[3 * BLOCK];
+    // The general emit path's row data, so the slot->row search never leaves LDS.
+    __shared__ int s_excl[BLOCK];
+    __shared__ int s_tiles[BLOCK];
+    __shared__ int s_batch[BLOCK];
+    __shared__ int s_end[BLOCK];
+    __shared__ int s_ls[BLOCK];
+    const int tid = (int)__builtin_amdgcn_workitem_id_x();
+
+    int part_max = 0, part_sum = 0, part_nz = 0;
+    sched_detail::emit_fast(local_starts, local_ends, row_to_batch, cta_info,
+                            tid, num_rows, BLOCK, block_k, part_max, part_sum, part_nz);
+    int max_tiles = 0, total_tiles = 0, nz_rows = 0;
+    sched_detail::block_reduce_stats<BLOCK>(part_max, part_sum, part_nz, smem, tid,
+                                            max_tiles, total_tiles, nz_rows);
+    sched_detail::settle_and_emit<BLOCK>(local_starts, local_ends, row_to_batch, cta_info,
+                                         num_rows, num_ctas, block_k, cta_target,
+                                         max_tiles, total_tiles, nz_rows, /*surplus_done=*/false,
+                                         smem, s_excl, s_tiles, s_batch, s_end, s_ls, tid);
+}
+
+// The multi-workgroup form: `_emit` then `_finish`, same table bit for bit. `emit_fast` is
+// grid-stride here, so it is not stuck on one CU's memory-level parallelism. `_emit` also marks
+// the surplus slots, since those do not depend on the split factor either.
+//
+// `scratch` is `cta_info + num_ctas` reinterpreted as ints, three lanes of
+// SCHED_BUILD_MAX_BLOCKS: each block's max, its sum and its non-empty row count.
+template<int BLOCK>
+__global__ __launch_bounds__(BLOCK)
+void mqa_logits_build_sched_emit(const int* __restrict__ local_starts,
+                                 const int* __restrict__ local_ends,
+                                 const int* __restrict__ row_to_batch,
+                                 opus_mqa_cta_record* __restrict__ cta_info,
+                                 int* __restrict__ scratch,
+                                 int num_rows, int num_ctas, int block_k, int blocks) {
+    __shared__ int smem[3 * BLOCK];
+    const int tid    = (int)__builtin_amdgcn_workitem_id_x();
+    const int bid    = (int)__builtin_amdgcn_workgroup_id_x();
+    const int stride = BLOCK * blocks;
+
+    int part_max = 0, part_sum = 0, part_nz = 0;
+    sched_detail::emit_fast(local_starts, local_ends, row_to_batch, cta_info,
+                            bid * BLOCK + tid, num_rows, stride, block_k,
+                            part_max, part_sum, part_nz);
+    sched_detail::mark_surplus(cta_info, num_rows + bid * BLOCK + tid, num_ctas, stride);
+
+    int bmax = 0, bsum = 0, bnz = 0;
+    sched_detail::block_reduce_stats<BLOCK>(part_max, part_sum, part_nz, smem, tid,
+                                            bmax, bsum, bnz);
+    if (tid == 0) {
+        scratch[bid]                              = bmax;
+        scratch[SCHED_BUILD_MAX_BLOCKS + bid]     = bsum;
+        scratch[2 * SCHED_BUILD_MAX_BLOCKS + bid] = bnz;
+    }
+}
+
+// `<<<1, BLOCK>>>`, and it returns on its first branch whenever the fast path holds -- which at
+// the row counts that reach here it essentially always does, since `safe` grows with the work.
+template<int BLOCK>
+__global__ __launch_bounds__(BLOCK)
+void mqa_logits_build_sched_finish(const int* __restrict__ local_starts,
+                                   const int* __restrict__ local_ends,
+                                   const int* __restrict__ row_to_batch,
+                                   opus_mqa_cta_record* __restrict__ cta_info,
+                                   const int* __restrict__ scratch,
+                                   int num_rows, int num_ctas, int block_k, int cta_target,
+                                   int blocks) {
+    __shared__ int smem[3 * BLOCK];
+    __shared__ int s_excl[BLOCK];
+    __shared__ int s_tiles[BLOCK];
+    __shared__ int s_batch[BLOCK];
+    __shared__ int s_end[BLOCK];
+    __shared__ int s_ls[BLOCK];
+    const int tid = (int)__builtin_amdgcn_workitem_id_x();
+
+    int part_max = 0, part_sum = 0, part_nz = 0;
+    for (int i = tid; i < blocks; i += BLOCK) {
+        const int m = scratch[i];
+        if (m > part_max) part_max = m;
+        part_sum += scratch[SCHED_BUILD_MAX_BLOCKS + i];
+        part_nz  += scratch[2 * SCHED_BUILD_MAX_BLOCKS + i];
+    }
+    int max_tiles = 0, total_tiles = 0, nz_rows = 0;
+    sched_detail::block_reduce_stats<BLOCK>(part_max, part_sum, part_nz, smem, tid,
+                                            max_tiles, total_tiles, nz_rows);
+    sched_detail::settle_and_emit<BLOCK>(local_starts, local_ends, row_to_batch, cta_info,
+                                         num_rows, num_ctas, block_k, cta_target,
+                                         max_tiles, total_tiles, nz_rows, /*surplus_done=*/true,
+                                         smem, s_excl, s_tiles, s_batch, s_end, s_ls, tid);
+}
+
+}  // namespace opus_logits
 
 // Traits for the MXFP4 paged MQA logits kernel on `mfma_scale_f32_32x32x64_f8f6f4`.
 //
@@ -261,6 +765,11 @@ namespace opus_logits {
 enum class mqa_logits_sched {
     Prefill,
     Decode,
+    // Work from a per-row schedule instead of a rectangular (batch, next_n, split_kv) grid,
+    // which gives EVERY row the same split_kv and so spends CTAs on rows that have no work.
+    // Serves BOTH entry points: a record carries `local_start`, the one field prefill needs and
+    // decode never has, so the host decides which by what it puts in the table.
+    Table,
 };
 }
 
@@ -498,6 +1007,7 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     const int* p_cu_seq_q     = kargs.ptr_cu_seq_q;
     int split_kv = kargs.split_kv;
     if constexpr(SCHED == mqa_logits_sched::Decode) { pin_sgpr(split_kv); }
+    const opus_mqa_cta_record* p_cta_info = kargs.ptr_cta_info;
 
     const int tid = opus::thread_id_x();
     const int warp_id     = tid >> 6;
@@ -523,6 +1033,18 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         const int end_kv_tile   = (local_end > 0) ? ((local_end + kv_tile_size - 1) / kv_tile_size) : 0;
         chunk_start = first_kv_tile;
         tile_count  = end_kv_tile - first_kv_tile;
+    } else if constexpr(SCHED == mqa_logits_sched::Table) {
+        // The whole assignment in one `s_load_dwordx8` off a blockIdx-uniform address.
+        const opus_mqa_cta_record rec = p_cta_info[opus::block_id_x()];
+        // Surplus slot; CTA-uniform, so this cannot deadlock.
+        if(rec.chunk_count <= 0) return;
+        row_id      = rec.row_id;
+        batch_id    = rec.batch_id;
+        local_start = rec.local_start;
+        local_end   = rec.local_end;
+        chunk_start = rec.chunk_start;
+        tile_count  = rec.chunk_count;
+        pin_sgpr(batch_id); pin_sgpr(local_start); pin_sgpr(local_end);
     } else {
         const int num_splits = split_kv;
         const int batch      = opus::block_id_x();
