@@ -13,10 +13,6 @@ from op_tests.triton_tests.normalization.test_fused_add_rmsnorm_pad import (
 )
 
 
-def model_benchmarking_shapes(args):
-    raise NotImplementedError("model benchmarking is not supported for this op")
-
-
 def get_x_vals():
     x_vals = [
         # M scaling at fixed rate
@@ -57,7 +53,7 @@ def run_benchmark(args):
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
-    line_names = [ylabel]
+    line_names = [""]  # prevents doubled bandwidth text
     line_vals = [ylabel]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -71,9 +67,7 @@ def run_benchmark(args):
         args={"metric": args.metric},
     )
 
-    # Gluon implementation is gfx1250, we pin Triton on backend here otherwise
-    # gfx1250 would silently benchmark Gluon implementation
-    backend = "triton"
+    backend = args.backend
     add_residual = args.add_residual
     pad_to_multiple = args.pad_to_multiple
     c_dtype = str_to_torch_dtype[args.dtype]
@@ -88,7 +82,9 @@ def run_benchmark(args):
         )
 
         n_out = (
-            triton.cdiv(N, pad_to_multiple) * pad_to_multiple if pad_to_multiple else N
+            triton.cdiv(N, pad_to_multiple) * pad_to_multiple
+            if pad_to_multiple > 0
+            else N
         )
         es = x.element_size()
         mem_read = M * N * es + N * es
@@ -133,6 +129,13 @@ def parse_args(args: list[str] | None = None):
         choices=["time", "bandwidth", "throughput"],
         default="bandwidth",
         help="metric to plot",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend. Default follows the arch: gluon on gfx1250, triton othwerise.",
     )
     parser.add_argument(
         "--add-residual",
