@@ -493,6 +493,12 @@ MHA_FWD_SEARCH_STRATEGIES = ("exhaustive", "smoke")
 # How many configurations the smoke strategy keeps per dict-config backend.
 # Small enough that a full two-arm run finishes in minutes, large enough that
 # the winner is still chosen between genuinely different tile shapes.
+# Multiples of the combined standard error a winner must clear before it
+# displaces the configuration already in use. Two is the conventional ~95%
+# two-sample separation; the point is that the bar is stated once and is
+# visible in the evidence rather than implied by whichever candidate sorted
+# first.
+MHA_FWD_SIGNIFICANCE_SIGMA = 2.0
 MHA_FWD_SMOKE_SEED = 20240917
 MHA_FWD_SMOKE_PER_BACKEND = 8
 

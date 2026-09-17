@@ -513,13 +513,13 @@ class TestIncumbentGate(unittest.TestCase):
         self.assertIn("beat incumbent", winner["detail"])
 
     def test_a_winner_inside_measurement_spread_does_not_displace_the_incumbent(self):
-        """The margin here is 0.1%, far under the spread of the samples, so
+        """The margin here is 0.1%, far under the scatter of the samples, so
         the two configurations have not been told apart and the run should
         change nothing rather than churn the published table."""
         winner = self._tuner()._gate_against_incumbent(
             self.KEY,
             self._frame(
-                challenger_us=999.0, incumbent_us=1000.0, samples=(950.0, 1050.0)
+                challenger_us=999.0, incumbent_us=1000.0, samples=(900.0, 1100.0)
             ),
         )
         self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
@@ -558,6 +558,17 @@ class TestIncumbentGate(unittest.TestCase):
         )
         self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
         self.assertEqual(tuner._promotions[0]["decision"], "incumbent_fastest")
+
+    def test_more_rounds_make_the_gate_more_sensitive_not_less(self):
+        """A range-based threshold widens as samples are added, so gathering
+        more evidence would make a real improvement harder to publish. The
+        standard error has to shrink instead."""
+        tight = [1000.0, 1002.0]
+        many = tight * 8
+        self.assertLess(
+            MhaFwdTuner._standard_error_us({"samples_us": json.dumps(many)}),
+            MhaFwdTuner._standard_error_us({"samples_us": json.dumps(tight)}),
+        )
 
     def test_every_decision_is_recorded_for_the_evidence_file(self):
         tuner = self._tuner()

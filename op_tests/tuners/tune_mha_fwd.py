@@ -45,6 +45,7 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdCandidate,
     MHA_FWD_TILE_CONFIG_BACKENDS,
+    MHA_FWD_SIGNIFICANCE_SIGMA,
     MhaFwdProblem,
     canonical_backend_config,
     enumerate_mha_fwd_candidates,
@@ -1156,13 +1157,16 @@ class MhaFwdTuner(TunerCommon):
         self._atomic_write_csv(frame[list(MHA_FWD_RUNTIME_CSV_FIELDS)], tune_file)
 
     @staticmethod
-    def _sample_spread(row) -> float:
-        """Half-width of a measurement's observed range, as a fraction.
+    def _standard_error_us(row) -> float:
+        """Standard error of a candidate's finalist-round measurements.
 
-        The finalist rounds are the only repeated observation available, so
-        their spread is what the run knows about its own reproducibility. It
-        is a crude dispersion estimate from few samples, which is why it is
-        used as a threshold to clear rather than a p-value to report.
+        The finalist rounds are the only repeated observation the run has, so
+        their scatter is what it knows about its own reproducibility. The
+        standard error rather than the range: the range of a sample grows as
+        samples are added, so a range-based threshold would make the run
+        harder to satisfy the more evidence it gathered. The standard error
+        shrinks as 1/sqrt(n), which makes --finalist-rounds the lever for
+        resolving smaller improvements.
         """
         try:
             samples = json.loads(row.get("samples_us") or "[]")
@@ -1171,7 +1175,7 @@ class MhaFwdTuner(TunerCommon):
         samples = [float(s) for s in samples if math.isfinite(float(s)) and s > 0]
         if len(samples) < 2:
             return 0.0
-        return (max(samples) - min(samples)) / 2.0 / statistics.median(samples)
+        return statistics.stdev(samples) / math.sqrt(len(samples))
 
     def _gate_against_incumbent(self, key, valid):
         """Return the row to publish: the fastest candidate, unless it cannot
@@ -1202,10 +1206,18 @@ class MhaFwdTuner(TunerCommon):
             return fastest
 
         incumbent = measured.iloc[0]
-        margin = (float(incumbent["us"]) - float(fastest["us"])) / float(
-            incumbent["us"]
+        gain_us = float(incumbent["us"]) - float(fastest["us"])
+        margin = gain_us / float(incumbent["us"])
+        # Two-sample separation at roughly 95%: the gain has to clear twice
+        # the combined standard error of the two candidates' round means.
+        combined_se = math.hypot(
+            self._standard_error_us(fastest), self._standard_error_us(incumbent)
         )
-        noise = self._sample_spread(fastest) + self._sample_spread(incumbent)
+        noise = (
+            (MHA_FWD_SIGNIFICANCE_SIGMA * combined_se) / float(incumbent["us"])
+            if float(incumbent["us"]) > 0
+            else 0.0
+        )
         if margin <= noise:
             kept = incumbent.copy()
             kept["detail"] = (
