@@ -1437,3 +1437,7 @@ def test_a4w4_routed_fp8_shared_heterogeneous_path(
     assert torch.isfinite(actual).all()
     error = _rel_l2(actual, routed_high + shared_high)
     assert error <= 5e-2, f"A4W4/FP8 heterogeneous FP32 error: {error:.3e}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
