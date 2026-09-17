@@ -18,6 +18,8 @@
 #          $ python3 op_tests/op_benchmarks/triton/bench_deepgemm_attention.py -kv_length=32768 --batch=2 -mtp=1 -p
 #      Set AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=0 to disable AOT gluon kernel. It will backward
 #      to triton JIT kernel
+#   Non-preshuffled KVBlockSize>1 uses the Triton JIT kernel even in AOT mode,
+#   since cached Gluon binaries may predate the block-addressing fix.
 # ========================================================================
 
 import math
@@ -527,7 +529,12 @@ def deepgemm_fp8_paged_mqa_logits(
     else:
         grid = (batch_size * next_n * SplitKV, 1, 1)
 
-    if enable_gluon_pa_mqa_logits:
+    # AOT cache names do not version the block-addressing fix. Avoid loading
+    # potentially stale non-preshuffle binaries for multi-token blocks.
+    use_gluon = enable_gluon_pa_mqa_logits and (
+        Preshuffle or KVBlockSize == 1 or enable_jit_gluon_pa_mqa_logits_kernel
+    )
+    if use_gluon:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
         kernel = _compile_deepgemm_fp8_paged_mqa_logits(
             ChunkQ=heads,

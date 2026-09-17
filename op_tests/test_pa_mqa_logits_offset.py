@@ -33,9 +33,9 @@ import torch
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention import pa_mqa_logits as pa_mqa_logits_module
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
-    enable_jit_gluon_pa_mqa_logits_kernel,
 )
 
 dev = "cuda"
@@ -134,10 +134,21 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
 
 
 @pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
-    reason="Requires the CDNA Gluon JIT paged MQA kernel",
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="Requires a CDNA GPU",
 )
-@pytest.mark.parametrize("block_size", [1, 16, 64, 128])
+@pytest.mark.parametrize(
+    "block_size,use_aot",
+    [
+        pytest.param(1, False, id="block1-jit"),
+        pytest.param(16, False, id="block16-jit"),
+        pytest.param(64, False, id="block64-jit"),
+        pytest.param(128, False, id="block128-jit"),
+        pytest.param(16, True, id="block16-aot"),
+        pytest.param(64, True, id="block64-aot"),
+        pytest.param(128, True, id="block128-aot"),
+    ],
+)
 @pytest.mark.parametrize("chunk_k", [64, 256])
 @pytest.mark.parametrize("padded_table", [False, True], ids=["compact", "padded"])
 @pytest.mark.parametrize(
@@ -151,12 +162,14 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
 @torch.inference_mode()
 def test_paged_mqa_logits_non_preshuffle(
     block_size: int,
+    use_aot: bool,
     chunk_k: int,
     padded_table: bool,
     context_lengths: tuple[int, ...],
     next_n: int,
     heads: int,
     hidden_dim: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Check block paging, per-token scales, short tails and the prefetch loop.
 
@@ -164,6 +177,25 @@ def test_paged_mqa_logits_non_preshuffle(
     those reads in allocated memory and expose incorrect scores instead.
     Block size 1 also checks the original per-token paging layout.
     """
+    if not use_aot and not pa_mqa_logits_module.enable_jit_gluon_pa_mqa_logits_kernel:
+        pytest.skip("Requires the Gluon JIT paged MQA kernel")
+    if use_aot:
+        monkeypatch.setattr(
+            pa_mqa_logits_module, "enable_aot_gluon_pa_mqa_logits", True
+        )
+        monkeypatch.setattr(
+            pa_mqa_logits_module, "enable_jit_gluon_pa_mqa_logits_kernel", False
+        )
+
+        def reject_aot_load(*args, **kwargs):
+            pytest.fail("Non-preshuffle block paging must not load a cached AOT kernel")
+
+        monkeypatch.setattr(
+            pa_mqa_logits_module,
+            "_compile_deepgemm_fp8_paged_mqa_logits",
+            reject_aot_load,
+        )
+
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(5591)
     fp8_dtype = dtypes.fp8
