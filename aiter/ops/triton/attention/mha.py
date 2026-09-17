@@ -18,6 +18,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _get_config as _get_gluon_config,
 )
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
+from aiter.ops.triton.utils.attention_config_utils import format_mha_shape_key
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
@@ -618,7 +619,21 @@ def _flash_attn_forward(
     else:
         if config is None:
             config = _get_config(
-                enable_dropout, q.dtype, has_pe=pe_head_dim > 0, head_dim_v=v_head_dim
+                enable_dropout,
+                q.dtype,
+                has_pe=pe_head_dim > 0,
+                head_dim_v=v_head_dim,
+                shape_key=format_mha_shape_key(
+                    mode="varlen" if is_varlen else "batch",
+                    hdim_q=qk_head_dim,
+                    hdim_v=v_head_dim,
+                    nhead_q=num_q_heads,
+                    nhead_k=num_k_heads,
+                    dtype=str(q.dtype),
+                    causal=causal,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                ),
             )
 
         grid = lambda META: (

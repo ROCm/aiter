@@ -14,6 +14,7 @@ import functools
 import json
 import os
 import re
+from collections.abc import Mapping
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -23,7 +24,26 @@ logger = AiterTritonLogger()
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_TRITON_OPS_PATH = os.path.abspath(f"{this_dir}/../")
-AITER_TRITON_CONFIGS_PATH = os.path.abspath(f"{this_dir}/../configs")
+
+# The in-tree config root. Overridable so a tuning run can stage a candidate
+# tree somewhere writable before promoting it, and so a deployment that ships
+# aiter read-only can still point at its own configs. The CSV families have had
+# this since jit/core.py grew AITER_CONFIG_<FAMILY>; the JSON tree did not, and
+# a model owner had no way to publish a tuned table without patching the tree.
+AITER_TRITON_CONFIGS_PATH = os.path.abspath(
+    os.getenv("AITER_TRITON_CONFIGS_PATH") or f"{this_dir}/../configs"
+)
+
+# Additional roots consulted *before* AITER_TRITON_CONFIGS_PATH, colon
+# separated and highest priority first. This is the JSON counterpart of the
+# model_configs/ merge that jit/core.py::get_config_file does for CSV families:
+# an overlay adds or replaces entries without editing the shipped file, so a
+# per-model table is a file the owner drops in rather than a diff they carry.
+AITER_TRITON_CONFIGS_OVERLAY_PATH = tuple(
+    os.path.abspath(root)
+    for root in os.getenv("AITER_TRITON_CONFIGS_OVERLAY_PATH", "").split(os.pathsep)
+    if root.strip()
+)
 
 # This flag should be set to True, unless it is being used for debugging.
 # When False, config JSON files are re-read on every call, so live edits to
@@ -57,6 +77,30 @@ def _dtype_dir(config_name: str) -> str:
     """Nested-layout directory for a config family:
     ``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``."""
     return config_name.lower().replace("-", "_")
+
+
+# Tier key used by families that key tuned entries by GPU as well as by
+# architecture, and the name of the SKU-agnostic fallback tier.
+HARDWARE_ANY = "any"
+
+
+def format_hardware_key(cu_num: int, gpu_model: str) -> str:
+    """Canonical in-file key for one measured GPU.
+
+    ``<arch>`` alone under-keys the tree: MI300X and MI325X both report gfx942
+    with 304 CUs, so a tile measured on one is published as if it were
+    measured on the other. The SKU therefore has to be part of the key -- the
+    MHA runtime CSV already keys on gpu_model for exactly this reason.
+
+    It is a key *inside* the file rather than another directory segment for
+    two reasons: the path layout stays exactly as configs/CLAUDE.md documents
+    it, and an unmeasured SKU falls through to the ``HARDWARE_ANY`` tier
+    instead of landing in a directory that does not exist.
+    """
+    model = str(gpu_model).strip().lower().replace(" ", "_")
+    if not model or model == "unknown":
+        raise ValueError(f"gpu_model must identify the GPU SKU, got {gpu_model!r}")
+    return f"cu={int(cu_num)},model={model}"
 
 
 _VALID_BACKENDS = ("triton", "gluon")
@@ -149,4 +193,65 @@ def resolve_config_dir(
     assert isinstance(dev, str) and _ARCH_SAFE_RE.fullmatch(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
-    return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
+    return f"{AITER_TRITON_CONFIGS_PATH}/{resolve_config_relpath(op, config_name, backend, dev)}"
+
+
+def resolve_config_relpath(
+    op: str,
+    config_name: str,
+    backend: str,
+    arch: str,
+) -> str:
+    """Build one family's directory *relative to a config root*.
+
+    ``resolve_config_dir()`` is this joined onto ``AITER_TRITON_CONFIGS_PATH``
+    and is what kernels call. The relative form exists so overlay-aware
+    loading can hold the family fixed and vary the root, keeping the layout
+    encoded in exactly one place. Arguments are validated by the caller.
+    """
+    return f"{arch}/{backend}/{op}/{_dtype_dir(config_name)}"
+
+
+def config_roots() -> tuple[str, ...]:
+    """Config roots in priority order: overlays first, in-tree root last."""
+    return (*AITER_TRITON_CONFIGS_OVERLAY_PATH, AITER_TRITON_CONFIGS_PATH)
+
+
+def _deep_merge(base: dict, overlay: Mapping) -> dict:
+    """Merge ``overlay`` onto ``base``, recursing into nested dicts.
+
+    Scalars and lists are replaced wholesale; only dictionaries merge. An
+    overlay therefore adds new shapes and overrides individual entries without
+    having to restate the rest of the family's table.
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        current = merged.get(key)
+        if isinstance(current, Mapping) and isinstance(value, Mapping):
+            merged[key] = _deep_merge(dict(current), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_config_json_merged(relpath: str, required: bool = True) -> dict | None:
+    """Load one config file from every root and merge, highest priority last.
+
+    ``relpath`` is a path below a config root, e.g.
+    ``"gfx942/triton/attention/mha/DEFAULT.json"``. The in-tree file is the
+    base and each overlay is layered on top of it, so an overlay that names
+    one shape overrides exactly that shape. Returns ``None`` when no root
+    holds the file and ``required`` is False; raises naming the in-tree path
+    otherwise, since that is the path a missing file should be added at.
+    """
+    merged: dict | None = None
+    for root in reversed(config_roots()):
+        document = load_config_json(f"{root}/{relpath}", required=False)
+        if document is None:
+            continue
+        merged = dict(document) if merged is None else _deep_merge(merged, document)
+    if merged is None and required:
+        raise FileNotFoundError(
+            f"Required config file doesn't exist: {AITER_TRITON_CONFIGS_PATH}/{relpath}"
+        )
+    return merged

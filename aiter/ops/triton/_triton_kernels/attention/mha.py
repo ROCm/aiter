@@ -13,6 +13,7 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import (
     remap_workgroup_spatial,
     remap_xcd,
 )
+from aiter.ops.triton.utils.attention_config_utils import get_mha_config
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 
@@ -944,29 +945,44 @@ def _attn_fwd(
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
 
+def _mha_feature_bucket(
+    fwd_cfg,
+    enable_dropout: bool,
+    dtype: torch.dtype,
+    has_pe: bool,
+    head_dim_v: int | None,
+) -> str:
+    """Name the hand-authored tier this call falls back to when untuned."""
+    has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
+    # TODO: pe + dropout is not tuned
+    if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
+        return "pe_dropout_or_fp32"
+    elif has_pe and "pe" in fwd_cfg:
+        return "pe"
+    elif has_dropout_or_fp32:
+        return "dropout_or_fp32"
+    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
+        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
+        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
+        # recovers performance and is numerically verified for these dims, but
+        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
+        return "small_head"
+    else:
+        return "default"
+
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
     has_pe: bool = False,
     head_dim_v: int | None = None,
+    shape_key: str | None = None,
 ):
     cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
-    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    fwd_cfg = config["fwd"]
-    has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
-    # TODO: pe + dropout is not tuned
-    if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
-        return fwd_cfg["pe_dropout_or_fp32"]
-    elif has_pe and "pe" in fwd_cfg:
-        return fwd_cfg["pe"]
-    elif enable_dropout or dtype == torch.float32:
-        return fwd_cfg["dropout_or_fp32"]
-    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
-        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
-        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
-        # recovers performance and is numerically verified for these dims, but
-        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
-        return fwd_cfg["small_head"]
-    else:
-        return fwd_cfg["default"]
+    fwd_cfg = load_config_json(f"{cfg_dir}/DEFAULT.json")["fwd"]
+    bucket = _mha_feature_bucket(fwd_cfg, enable_dropout, dtype, has_pe, head_dim_v)
+    # The tier walk (measured shape entry first, feature bucket last) is shared
+    # with gluon and owned by the family loader; the feature semantics above
+    # are this backend's and stay here.
+    return get_mha_config("triton", bucket, shape_key)

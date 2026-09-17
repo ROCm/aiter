@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import statistics
 from dataclasses import dataclass
 from hashlib import sha256
 from itertools import product
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Sequence
 
 MHA_FWD_HARDWARE_KEY_FIELDS = ("gfx", "gpu_model", "cu_num")
 MHA_FWD_PROBLEM_KEY_FIELDS = (
@@ -349,6 +350,81 @@ class MhaFwdResult:
             if self.samples_us
             else float("inf")
         )
+
+
+MHA_FWD_SELECTION_PROOF_ENV = "AITER_MHA_FWD_SELECTION_PROOF_FILE"
+
+# Backends whose launch is a runtime dict rather than a named, pre-instantiated
+# kernel. For every other backend the symbol name fully determines the launch,
+# so recording the backend proves the winner was applied. For these two it does
+# not: the router can dispatch to Triton and still run untuned tiles, which is
+# why the selection proof has to observe the config as well as the backend.
+MHA_FWD_TILE_CONFIG_BACKENDS = frozenset({"gluon", "triton"})
+
+_RECORDED_SELECTIONS: set[str] = set()
+
+
+def record_mha_fwd_selection(**fields: Any) -> None:
+    """Append one observation of what the running process actually selected.
+
+    A selection is observed in layers: the router in ``mha.py`` knows which
+    backend it dispatched to, and the backend's own config loader knows which
+    launch configuration it resolved. Each reports the fields it is actually
+    in a position to know, and the probe folds the records together. That is
+    the difference between proving a winner was applied and proving only that
+    its backend name was.
+
+    No-ops unless a proof file is requested, so production pays a getenv.
+    """
+    path = os.getenv(MHA_FWD_SELECTION_PROOF_ENV, "").strip()
+    if not path:
+        return
+    payload = json.dumps(
+        {**fields, "pid": os.getpid()}, sort_keys=True, separators=(",", ":")
+    )
+    if payload in _RECORDED_SELECTIONS:
+        return
+    _RECORDED_SELECTIONS.add(payload)
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, f"{payload}\n".encode("utf-8"))
+    finally:
+        os.close(descriptor)
+
+
+def fold_mha_fwd_selection_records(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Collapse layered proof records into one observed selection.
+
+    Later records win per field, so the router's backend and the loader's
+    config combine into a single answer without either layer having to know
+    what the other observed.
+    """
+    observed: dict[str, Any] = {}
+    for record in records:
+        observed.update({key: value for key, value in record.items() if key != "pid"})
+    return observed
+
+
+def mha_fwd_config_matches(
+    expected: Mapping[str, Any] | None,
+    observed: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether every tuned parameter in ``expected`` was actually used.
+
+    Subset rather than equality: a launch config legitimately carries keys the
+    tuner never varied, and demanding equality would fail a proof that in fact
+    succeeded. Every key the tuner *did* choose must match exactly.
+    """
+    if not expected:
+        return True
+    if not observed:
+        return False
+    return all(
+        key in observed and csv_scalar(observed[key]) == csv_scalar(value)
+        for key, value in expected.items()
+    )
 
 
 def validate_mha_fwd_plan_fields(

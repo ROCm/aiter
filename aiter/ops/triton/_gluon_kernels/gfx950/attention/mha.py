@@ -26,16 +26,12 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
-    load_config_json,
-)
+from aiter.ops.triton.utils.attention_config_utils import get_mha_config
 
 
 @gluon.constexpr_function
@@ -1135,14 +1131,12 @@ def _attn_fwd(
     gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
 
 
-def _get_config(is_fp8: bool, has_pe: bool = False):
-    arch = arch_info.get_arch()
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
-    fwd_cfg = load_config_json(fpath)["fwd"]
-    # TODO: configs are not tuned
+def _get_config(is_fp8: bool, has_pe: bool = False, shape_key: str | None = None):
+    # TODO: the feature tiers are not tuned; the shape tiers below them are.
     if is_fp8:
-        return fwd_cfg["fp8"]
+        bucket = "fp8"
     elif has_pe:
-        return fwd_cfg["pe"]
+        bucket = "pe"
     else:
-        return fwd_cfg["default"]
+        bucket = "default"
+    return get_mha_config("gluon", bucket, shape_key)
