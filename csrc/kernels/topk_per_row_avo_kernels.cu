@@ -72,7 +72,7 @@ static int g_inject_fault    = 0;
 static int g_dump_stats      = 0;
 static int g_ablate_store    = 0; // diagnostic only: produces WRONG results
 // Phase C must use all 4 passes to be exact. Fewer is a TIMING ABLATION ONLY.
-static int g_phase_c_passes     = 3; // 4th radix pass is bit-identical at fp32 precision
+static int g_phase_c_passes     = RADIX_PASSES;
 static int g_path_override      = PATH_AUTO;
 static int g_coop_g             = 0;
 static int g_fuse_ab            = 0;
