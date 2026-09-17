@@ -509,38 +509,38 @@ decode 3b ~103 µs at ``M=1`` (64 splits). 3d owns tiles/MFMA.
       next gather from overwriting ``k``/``v``/``p`` LDS while the
       previous tile's PV is still reading them — without it prefill
       ``M=512`` shows ~0.05% of elements outside ``1e-2``. One wave
-      computes split weights in the merge. Decode beats #4882 Triton GQA
-      but **does not** beat live AMD (~1.6–1.8× at ``M=8``, ~1.8× at
-      ``M=1``). Prefill is ~2× AMD/#4882. Not a win claim; gfx950 extra
-      LDS remains 3g.
+      computes split weights in the merge. The next K/V tile is prefetched
+      into registers before current-tile QK and carried across the runtime
+      loop. Decode beats #4882 Triton GQA but **does not** beat live AMD
+      (~1.5–1.8× at ``M=8``, ~1.8–1.9× at ``M=1``). Prefill is ~2×
+      AMD/#4882. Not a win claim; gfx950 extra LDS remains 3g.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0` on decode and
-prefill. Host splits keep decode at 64 and cap prefill at 8. The
-vectorized gather buys ~2–4% at decode over the previous 3d point
-(~20.1–20.5 µs at ``M=1``) and leaves prefill flat; it does not close
-the gap to live AMD.
+prefill. Host splits keep decode at 64 and cap prefill at 8. Register
+prefetch improves the vectorized-gather point by ~3–5% at decode and
+~4–5% at prefill; it does not close the gap to live AMD.
 
 Decode:
 
 | m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
 |--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
-| 1 | 512 | 128 | 2051 | 19.6 | 11.0 | 112.9 | 0 |
-| 8 | 512 | 128 | 2051 | 24.0 | 14.5 | 115.5 | 0 |
-| 1 | 2048 | 512 | 2051 | 19.9 | 11.3 | 116.0 | 0 |
-| 8 | 2048 | 512 | 2051 | 26.4 | 17.1 | 125.7 | 0 |
-| 1 | 8192 | 2048 | 2051 | 20.0 | 11.3 | 117.2 | 0 |
-| 8 | 8192 | 2048 | 2051 | 26.2 | 17.1 | 122.6 | 0 |
-| 1 | 32768 | 8192 | 2051 | 20.0 | 11.3 | 119.1 | 0 |
-| 8 | 32768 | 8192 | 2051 | 26.5 | 16.9 | 122.5 | 0 |
+| 1 | 512 | 128 | 2051 | 18.7 | 10.0 | 112.9 | 0 |
+| 8 | 512 | 128 | 2051 | 23.0 | 13.3 | 115.5 | 0 |
+| 1 | 2048 | 512 | 2051 | 19.1 | 10.3 | 115.9 | 0 |
+| 8 | 2048 | 512 | 2051 | 24.5 | 16.0 | 126.3 | 0 |
+| 1 | 8192 | 2048 | 2051 | 19.1 | 10.3 | 117.4 | 0 |
+| 8 | 8192 | 2048 | 2051 | 24.7 | 15.1 | 121.9 | 0 |
+| 1 | 32768 | 8192 | 2051 | 19.0 | 10.2 | 118.7 | 0 |
+| 8 | 32768 | 8192 | 2051 | 25.0 | 15.4 | 123.1 | 0 |
 
 Prefill:
 
 | m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | 4882_triton_gqa us | flydsl_k2 err |
 |--:|--------:|---------:|------:|-------------:|----------------:|-------------------:|--------------:|
-| 512 | 512 | 128 | 2051 | 538.0 | 204.0 | 222.3 | 0 |
-| 512 | 2048 | 512 | 2051 | 559.9 | 214.9 | 237.6 | 0 |
-| 512 | 8192 | 2048 | 2051 | 570.6 | 248.5 | 260.9 | 0 |
-| 512 | 32768 | 8192 | 2051 | 573.5 | 286.9 | 282.4 | 0 |
+| 512 | 512 | 128 | 2051 | 516.5 | 203.2 | 222.2 | 0 |
+| 512 | 2048 | 512 | 2051 | 530.7 | 214.1 | 236.9 | 0 |
+| 512 | 8192 | 2048 | 2051 | 546.5 | 248.3 | 260.3 | 0 |
+| 512 | 32768 | 8192 | 2051 | 548.7 | 285.7 | 281.5 | 0 |
 
 A second gfx950 ``BLOCK_N=64`` compile was measured and **not shipped**.
 Live AMD's prefill rule (``BLOCK_N=64``, ``splits=1``) is ~1.01–1.17 ms
