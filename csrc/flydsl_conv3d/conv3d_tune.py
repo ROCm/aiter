@@ -44,47 +44,26 @@ import torch
 import torch.nn.functional as F
 
 from aiter import dtypes, logger
-from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.conv3d_policy import (
     get_flydsl_conv3d_configs,
     tile_kernel_name,
 )
+from aiter.ops.flydsl.kernels.conv3d_implicit import (
+    TUNED_DEVICE_COLUMNS,
+    TUNED_KEY_COLUMNS,
+    TUNED_RESULT_COLUMNS,
+)
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
-# Matches conv3d_implicit.TUNED_KEY_COLUMNS, prefixed with the device keys that
-# TunerCommon adds. The untuned CSV header must equal this list minus gfx/cu_num.
-SHAPE_KEYS = [
-    "N",
-    "C",
-    "D",
-    "H",
-    "W",
-    "K",
-    "kT",
-    "kH",
-    "kW",
-    "stride_d",
-    "stride_h",
-    "stride_w",
-    "pad_d",
-    "pad_h",
-    "pad_w",
-    "dil_d",
-    "dil_h",
-    "dil_w",
-    "groups",
-    "bias",
-]
-KEYS = ["gfx", "cu_num", *SHAPE_KEYS]
+# The runtime lookup's key columns are the tuning key, and the untuned CSV
+# header must equal them; TunerCommon prefixes the device columns on top.
+SHAPE_KEYS = list(TUNED_KEY_COLUMNS)
+KEYS = [*TUNED_DEVICE_COLUMNS, *SHAPE_KEYS]
 
 RESULT_LIST = [
-    "tile_m",
-    "tile_n",
-    "wave_m",
-    "wave_n",
-    "wgm",
+    *TUNED_RESULT_COLUMNS,
     "splitK",
     "us",
     "kernelName",
@@ -237,7 +216,7 @@ class Conv3dTuner(TunerCommon):
         m_gemm, n_gemm, _k_gemm, _ = self._gemm_dims(keys)
 
         configs = get_flydsl_conv3d_configs(
-            m_gemm, n_gemm, groups, get_cu_num(), max_configs=max_configs
+            m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
         )
 
         # crs is built from the *padded* per-group channel count, matching what
@@ -435,6 +414,7 @@ class Conv3dTuner(TunerCommon):
         from aiter.ops.flydsl.kernels import conv3d_implicit
 
         conv3d_implicit._load_tuned_table.cache_clear()
+        conv3d_implicit._TUNED_LOOKUP_LOGGED.clear()
 
     @staticmethod
     def _ramp_clocks(seconds=2.0):

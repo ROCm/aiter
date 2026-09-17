@@ -30,7 +30,8 @@ import torch
 
 from aiter.aot.flydsl.common import OpKind, run_only_env
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.kernels.conv3d_implicit import _pad_channels
 

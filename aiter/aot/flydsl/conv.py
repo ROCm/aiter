@@ -74,6 +74,8 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.conv3d_implicit import (
     TR_MAX_BIG_S,
     TR_VEC,
+    TUNED_KEY_COLUMNS,
+    TUNED_RESULT_COLUMNS,
     _dispatch,
     _pad_channels,
     compile_conv3d_implicit,
@@ -83,30 +85,10 @@ from aiter.ops.flydsl.kernels.conv3d_implicit import (
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE]
 CONV_AOT_ARCH_DEFAULT = "gfx950"
 
-# Mirrors conv3d_implicit.TUNED_KEY_COLUMNS; the tuned CSV carries these plus
-# gfx/cu_num and the five launch-config columns.
-_INT_COLS = (
-    "N",
-    "C",
-    "D",
-    "H",
-    "W",
-    "K",
-    "kT",
-    "kH",
-    "kW",
-    "stride_d",
-    "stride_h",
-    "stride_w",
-    "pad_d",
-    "pad_h",
-    "pad_w",
-    "dil_d",
-    "dil_h",
-    "dil_w",
-    "groups",
-)
-_CONFIG_COLS = ("tile_m", "tile_n", "wave_m", "wave_n", "wgm")
+# The lookup's key columns, minus bias -- the one that is not an integer, read
+# through _parse_bool below.
+_INT_COLS = tuple(c for c in TUNED_KEY_COLUMNS if c != "bias")
+_CONFIG_COLS = TUNED_RESULT_COLUMNS
 
 
 def _parse_bool(value: str | None) -> bool:
