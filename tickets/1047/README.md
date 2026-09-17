@@ -267,6 +267,10 @@ closed** on emit / ``visible <= 512`` (``L<=2048``): those rows beat HIP.
 not a 2d gate. 2b single-WG tile merge stays for set equality; do not
 resume long-L scorer work.
 
+A 64-bit MSD binary radix-select on the 1024-candidate tile was measured
+and not shipped. Set equality held. Decode ``M=1`` 8k / 32k ~126 / ~497 µs
+vs kept bitonic ~106 / ~419 µs. Sixty-four digit passes vs 55 sort stages.
+
 | m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
