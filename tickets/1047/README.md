@@ -439,6 +439,10 @@ A gfx950 ``BLOCK_N=64`` second compile was measured and not shipped:
 ``BLOCK_N=16`` / 8-split (~0.54–0.57 ms). ~90 KB LDS; gfx942 cannot hold
 that tile.
 
+All-wave softmax plus ``shuffle_idx`` P transpose (drop the P LDS
+barrier) was measured and not shipped: decode ~19.8–20.1 µs at ``M=1``,
+prefill ~0.66 ms with sparse ``1e-2`` misses at ``M=512``.
+
 
 
 
