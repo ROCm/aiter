@@ -7,12 +7,14 @@ Required BF16 materialization boundaries are retained, and matrix/state
 arithmetic uses FP32. Every consumed scratch element is initialized within
 the invocation, including ragged tails.
 """
+
 from dataclasses import dataclass
 
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.extra import libdevice
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,12 +48,32 @@ def _load_history(qkvz, state, token, begin, slot, cached, channel, packed, vali
     return gl.where(from_input, x, history).to(gl.float32)
 
 
-@gluon.jit
+_prepare_tokens_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_prepare_tokens",
+    ["M", "LOG_BATCH", "BATCH", "ROWS", "LANES", "PACK"],
+)
+
+
+@gluon.jit(repr=_prepare_tokens_repr)
 def _prepare_tokens(
-    qkvz, ba, state, indices, starts, initial, weight, bias,
-    a_log, dt_bias, prepared, gates, M: gl.constexpr,
-    LOG_BATCH: gl.constexpr, BATCH: gl.constexpr,
-    ROWS: gl.constexpr, LANES: gl.constexpr, PACK: gl.constexpr,
+    qkvz,
+    ba,
+    state,
+    indices,
+    starts,
+    initial,
+    weight,
+    bias,
+    a_log,
+    dt_bias,
+    prepared,
+    gates,
+    M: gl.constexpr,
+    LOG_BATCH: gl.constexpr,
+    BATCH: gl.constexpr,
+    ROWS: gl.constexpr,
+    LANES: gl.constexpr,
+    PACK: gl.constexpr,
 ):
     group = gl.program_id(1)
     layout: gl.constexpr = gl.BlockedLayout(
@@ -116,29 +138,41 @@ def _prepare_tokens(
     w3 = gl.load(weight + channel * 4 + 3).to(gl.float32)
     b = gl.load(bias + channel).to(gl.float32)
     conv = (
-        b[None, :] + h0 * w0[None, :] + h1 * w1[None, :]
-        + h2 * w2[None, :] + x * w3[None, :]
+        b[None, :]
+        + h0 * w0[None, :]
+        + h1 * w1[None, :]
+        + h2 * w2[None, :]
+        + x * w3[None, :]
     )
-    activated = gl.div_rn(conv, 1. + libdevice.exp(-conv)).to(gl.bfloat16)
+    activated = gl.div_rn(conv, 1.0 + libdevice.exp(-conv)).to(gl.bfloat16)
     result = activated
     if group < 8:
         z = activated.to(gl.float32)
-        result = (z * gl.rsqrt(gl.sum(z * z, 1) + 1.e-6)[:, None]).to(gl.bfloat16)
+        result = (z * gl.rsqrt(gl.sum(z * z, 1) + 1.0e-6)[:, None]).to(gl.bfloat16)
     else:
         head = group - 8
-        av = gl.load(ba + row * 16 + head // 2 * 4 + 2 + head % 2, row < M, 0).to(gl.float32)
+        av = gl.load(ba + row * 16 + head // 2 * 4 + 2 + head % 2, row < M, 0).to(
+            gl.float32
+        )
         av += gl.load(dt_bias + head).to(gl.float32)
-        bv = gl.load(ba + row * 16 + head // 2 * 4 + head % 2, row < M, 0).to(gl.float32)
+        bv = gl.load(ba + row * 16 + head // 2 * 4 + head % 2, row < M, 0).to(
+            gl.float32
+        )
         decay_weight = gl.exp(gl.load(a_log + head).to(gl.float32))
-        softplus = gl.where(av <= 20., gl.log(1. + gl.exp(av)), av)
+        softplus = gl.where(av <= 20.0, gl.log(1.0 + gl.exp(av)), av)
         decay = gl.exp(-decay_weight * softplus)
-        beta = (1. / (1. + gl.exp(-bv))).to(gl.bfloat16).to(gl.float32)
+        beta = (1.0 / (1.0 + gl.exp(-bv))).to(gl.bfloat16).to(gl.float32)
         gl.store(gates + (head * M + row) * 2, decay, row < M)
         gl.store(gates + (head * M + row) * 2 + 1, beta, row < M)
     gl.store(prepared + (group * M + row[:, None]) * 128 + col[None, :], result, valid)
 
 
-@gluon.jit
+_update_conv_state_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_update_conv_state", []
+)
+
+
+@gluon.jit(repr=_update_conv_state_repr)
 def _update_conv_state(qkvz, state, indices, starts, initial):
     seq = gl.program_id(0)
     group = gl.program_id(1)
@@ -176,8 +210,13 @@ def _multiply(left, right):
 
 @gluon.jit
 def _chunk_coefficients(
-    prepared, gates, starts, chunk_c,
-    M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr,
+    prepared,
+    gates,
+    starts,
+    chunk_c,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
 ):
     chunk = gl.program_id(0)
     head = gl.program_id(1)
@@ -193,24 +232,38 @@ def _chunk_coefficients(
     end = gl.load(starts + lo + 1)
     # floor(begin / BT) + sequence reserves enough space for every ragged tail.
     token_begin = begin + (chunk - (begin // BT + lo)) * BT
-    load_layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 16], [gl.num_warps(), 1], [1, 0])
+    load_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [4, 16], [gl.num_warps(), 1], [1, 0]
+    )
     gram_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True,
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
         warps_per_cta=[1, gl.num_warps()],
     )
-    tri_layout: gl.constexpr = gl.BlockedLayout([1, BT // 16], [4, 16], [1, gl.num_warps()], [1, 0])
+    tri_layout: gl.constexpr = gl.BlockedLayout(
+        [1, BT // 16], [4, 16], [1, gl.num_warps()], [1, 0]
+    )
     t = gl.arange(0, BT, layout=gl.SliceLayout(1, load_layout))
     k = gl.arange(0, 128, layout=gl.SliceLayout(0, load_layout))
     token = token_begin + t
     valid = token < end
-    q = gl.load(prepared + (head // 2 * M + token[:, None]) * 128 + k[None, :], valid[:, None], 0)
+    q = gl.load(
+        prepared + (head // 2 * M + token[:, None]) * 128 + k[None, :],
+        valid[:, None],
+        0,
+    )
     key = gl.load(
         prepared + ((4 + head // 2) * M + token[:, None]) * 128 + k[None, :],
         valid[:, None],
         0,
     )
-    kk = _chunk_dot(key, gl.permute(key, (1, 0)), gl.zeros((BT, BT), gl.float32, gram_layout), 8)
-    qk = _chunk_dot(q, gl.permute(key, (1, 0)), gl.zeros((BT, BT), gl.float32, gram_layout), 8)
+    kk = _chunk_dot(
+        key, gl.permute(key, (1, 0)), gl.zeros((BT, BT), gl.float32, gram_layout), 8
+    )
+    qk = _chunk_dot(
+        q, gl.permute(key, (1, 0)), gl.zeros((BT, BT), gl.float32, gram_layout), 8
+    )
     kk = gl.convert_layout(kk, tri_layout)
     qk = gl.convert_layout(qk, tri_layout)
     row = gl.arange(0, BT, layout=gl.SliceLayout(1, tri_layout))
@@ -225,12 +278,12 @@ def _chunk_coefficients(
         gl.SliceLayout(1, tri_layout),
     )
     between = gl.associative_scan(
-        gl.where(row[:, None] > col[None, :], decay[:, None], 1.), 0, _multiply
+        gl.where(row[:, None] > col[None, :], decay[:, None], 1.0), 0, _multiply
     )
     # Store QK coefficients before the register-heavy triangular solve.
-    c = gl.where(row[:, None] >= col[None, :], qk * between, 0.)
+    c = gl.where(row[:, None] >= col[None, :], qk * between, 0.0)
     gl.store(chunk_c + ((chunk * 8 + head) * BT + row[:, None]) * BT + col[None, :], c)
-    inverse = gl.where(row[:, None] > col[None, :], -beta[:, None] * between * kk, 0.)
+    inverse = gl.where(row[:, None] > col[None, :], -beta[:, None] * between * kk, 0.0)
     # Forward substitution forms the inverse of the unit-lower delta system.
     for i in gl.static_range(BT):
         index_r = gl.full((1, BT), i, gl.int32, tri_layout)
@@ -240,7 +293,7 @@ def _chunk_coefficients(
         inverse += gl.where(
             (row[:, None] > i) & (col[None, :] < i),
             inverse_col[:, None] * inverse_row[None, :],
-            0.,
+            0.0,
         )
     inverse += (row[:, None] == col[None, :]).to(gl.float32)
     final_decay_row = gl.sum(
@@ -250,10 +303,25 @@ def _chunk_coefficients(
     return q, key, inverse, prefix, final_decay_row, beta, token_begin, end
 
 
-@gluon.jit
+_prepare_chunks_full_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_prepare_chunks_full", ["M", "BATCH", "BT"]
+)
+
+
+@gluon.jit(repr=_prepare_chunks_full_repr)
 def _prepare_chunks_full(
-    prepared, gates, starts, chunk_w, chunk_u, chunk_q, chunk_k, chunk_c, chunk_g,
-    M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr,
+    prepared,
+    gates,
+    starts,
+    chunk_w,
+    chunk_u,
+    chunk_q,
+    chunk_k,
+    chunk_c,
+    chunk_g,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
 ):
     chunk = gl.program_id(0)
     head = gl.program_id(1)
@@ -262,7 +330,9 @@ def _prepare_chunks_full(
     )
     layout: gl.constexpr = q.type.layout
     matrix_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=True,
+        version=4,
+        instr_shape=[16, 16, 4],
+        transposed=True,
         warps_per_cta=[1, gl.num_warps()],
     )
     t = gl.arange(0, BT, layout=gl.SliceLayout(1, layout))
@@ -300,10 +370,22 @@ def _prepare_chunks_full(
     gl.store(chunk_g + chunk * 8 + head, final_decay)
 
 
-@gluon.jit
+_prepare_chunks_compact_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_prepare_chunks_compact", ["M", "BATCH", "BT"]
+)
+
+
+@gluon.jit(repr=_prepare_chunks_compact_repr)
 def _prepare_chunks_compact(
-    prepared, gates, starts, chunk_inverse, chunk_c, chunk_decay,
-    M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr,
+    prepared,
+    gates,
+    starts,
+    chunk_inverse,
+    chunk_c,
+    chunk_decay,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
 ):
     chunk = gl.program_id(0)
     head = gl.program_id(1)
@@ -319,11 +401,26 @@ def _prepare_chunks_compact(
     gl.store(chunk_decay + ((chunk * 8 + head) * 2 + 1) * BT + col, suffix)
 
 
-@gluon.jit
+_recurrence_full_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_recurrence_full", ["BT", "BV"]
+)
+
+
+@gluon.jit(repr=_recurrence_full_repr)
 def _recurrence_full(
-    chunk_w, chunk_u, chunk_q, chunk_k, chunk_c, chunk_g,
-    state, indices, starts, out, scale,
-    BT: gl.constexpr, BV: gl.constexpr,
+    chunk_w,
+    chunk_u,
+    chunk_q,
+    chunk_k,
+    chunk_c,
+    chunk_g,
+    state,
+    indices,
+    starts,
+    out,
+    scale,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
 ):
     seq = gl.program_id(0)
     head = gl.program_id(1)
@@ -335,10 +432,14 @@ def _recurrence_full(
     first_chunk = begin // BT + seq
     chunks = gl.cdiv(end - begin, BT)
     layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=True,
+        version=4,
+        instr_shape=[16, 16, 4],
+        transposed=True,
         warps_per_cta=[1, gl.num_warps()],
     )
-    load_layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 16], [gl.num_warps(), 1], [1, 0])
+    load_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [4, 16], [gl.num_warps(), 1], [1, 0]
+    )
     v = value_tile * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, layout))
     k = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
     state_offset = ((slot * 8 + head) * 128 + v[:, None]) * 128 + k[None, :]
@@ -356,10 +457,16 @@ def _recurrence_full(
         key = gl.load(chunk_k + offsets)
         u = gl.load(chunk_u + base + t[None, :] * 128 + v[:, None])
         decay = gl.load(chunk_g + chunk * 8 + head)
-        c = gl.load(chunk_c + ((chunk * 8 + head) * BT + load_t[:, None]) * BT + load_c[None, :])
-        projected = _chunk_dot(h, gl.permute(w, (1, 0)), gl.zeros((BV, BT), gl.float32, layout), 1)
+        c = gl.load(
+            chunk_c + ((chunk * 8 + head) * BT + load_t[:, None]) * BT + load_c[None, :]
+        )
+        projected = _chunk_dot(
+            h, gl.permute(w, (1, 0)), gl.zeros((BV, BT), gl.float32, layout), 1
+        )
         delta = u - projected
-        y = _chunk_dot(h, gl.permute(q, (1, 0)), gl.zeros((BV, BT), gl.float32, layout), 1)
+        y = _chunk_dot(
+            h, gl.permute(q, (1, 0)), gl.zeros((BV, BT), gl.float32, layout), 1
+        )
         y = _chunk_dot(delta, gl.permute(c, (1, 0)), y, 1)
         h = _chunk_dot(delta, key, h * decay, 1)
         token = begin + local_chunk * BT + t
@@ -371,12 +478,29 @@ def _recurrence_full(
     gl.store(state + state_offset, h)
 
 
-@gluon.jit
+_recurrence_compact_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_recurrence_compact",
+    ["M", "BT", "BV", "ROW_WARPS", "TRANSPOSED"],
+)
+
+
+@gluon.jit(repr=_recurrence_compact_repr)
 def _recurrence_compact(
-    prepared, gates, chunk_inverse, chunk_c, chunk_decay,
-    state, indices, starts, out, scale,
-    M: gl.constexpr, BT: gl.constexpr, BV: gl.constexpr,
-    ROW_WARPS: gl.constexpr, TRANSPOSED: gl.constexpr,
+    prepared,
+    gates,
+    chunk_inverse,
+    chunk_c,
+    chunk_decay,
+    state,
+    indices,
+    starts,
+    out,
+    scale,
+    M: gl.constexpr,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    ROW_WARPS: gl.constexpr,
+    TRANSPOSED: gl.constexpr,
 ):
     seq = gl.program_id(0)
     head = gl.program_id(1)
@@ -388,7 +512,9 @@ def _recurrence_compact(
     first_chunk = begin // BT + seq
     chunks = gl.cdiv(end - begin, BT)
     layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=TRANSPOSED,
+        version=4,
+        instr_shape=[16, 16, 4],
+        transposed=TRANSPOSED,
         warps_per_cta=[ROW_WARPS, gl.num_warps() // ROW_WARPS],
     )
     load_layout: gl.constexpr = gl.BlockedLayout(
@@ -407,7 +533,9 @@ def _recurrence_compact(
         token_start = begin + local_chunk * BT
         token_load = token_start + load_t
         key = gl.load(
-            prepared + ((4 + head // 2) * M + token_load[:, None]) * 128 + load_k[None, :],
+            prepared
+            + ((4 + head // 2) * M + token_load[:, None]) * 128
+            + load_k[None, :],
             token_load[:, None] < end,
             0,
         )
@@ -474,10 +602,24 @@ def _group_bounds(starts, group, BATCH: gl.constexpr, GROUP: gl.constexpr):
     return lo, begin, end, local_group
 
 
-@gluon.jit
+_build_group_maps_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_build_group_maps",
+    ["BATCH", "BT", "BV", "GROUP", "ROW_WARPS"],
+)
+
+
+@gluon.jit(repr=_build_group_maps_repr)
 def _build_group_maps(
-    chunk_w, chunk_u, chunk_k, chunk_g, starts, maps,
-    BATCH: gl.constexpr, BT: gl.constexpr, BV: gl.constexpr, GROUP: gl.constexpr,
+    chunk_w,
+    chunk_u,
+    chunk_k,
+    chunk_g,
+    starts,
+    maps,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    GROUP: gl.constexpr,
     ROW_WARPS: gl.constexpr,
 ):
     """Propagate the identity and zero-state response through independent groups."""
@@ -489,7 +631,9 @@ def _build_group_maps(
     first_chunk = begin // BT + seq + local_group * (GROUP // BT)
     chunks = gl.minimum(gl.cdiv(end - group_begin, BT), GROUP // BT)
     layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=True,
+        version=4,
+        instr_shape=[16, 16, 4],
+        transposed=True,
         warps_per_cta=[ROW_WARPS, gl.num_warps() // ROW_WARPS],
     )
     load_layout: gl.constexpr = gl.BlockedLayout(
@@ -518,10 +662,20 @@ def _build_group_maps(
     gl.store(maps + ((group * 8 + head) * 256 + map_row[:, None]) * 128 + k[None, :], h)
 
 
-@gluon.jit
+_propagate_group_maps_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_propagate_group_maps", ["GROUP", "BV"]
+)
+
+
+@gluon.jit(repr=_propagate_group_maps_repr)
 def _propagate_group_maps(
-    maps, boundaries, state, indices, starts,
-    GROUP: gl.constexpr, BV: gl.constexpr,
+    maps,
+    boundaries,
+    state,
+    indices,
+    starts,
+    GROUP: gl.constexpr,
+    BV: gl.constexpr,
 ):
     seq = gl.program_id(0)
     head = gl.program_id(1)
@@ -532,7 +686,9 @@ def _propagate_group_maps(
     first_group = begin // GROUP + seq
     groups = gl.cdiv(end - begin, GROUP)
     layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=True,
+        version=4,
+        instr_shape=[16, 16, 4],
+        transposed=True,
         warps_per_cta=[1, gl.num_warps()],
     )
     load_layout: gl.constexpr = gl.BlockedLayout(
@@ -555,11 +711,28 @@ def _propagate_group_maps(
     gl.store(state + state_offsets, h)
 
 
-@gluon.jit
+_evaluate_groups_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_evaluate_groups",
+    ["BATCH", "BT", "BV", "GROUP", "ROW_WARPS"],
+)
+
+
+@gluon.jit(repr=_evaluate_groups_repr)
 def _evaluate_groups(
-    chunk_w, chunk_u, chunk_q, chunk_k, chunk_c, chunk_g,
-    boundaries, starts, out, scale,
-    BATCH: gl.constexpr, BT: gl.constexpr, BV: gl.constexpr, GROUP: gl.constexpr,
+    chunk_w,
+    chunk_u,
+    chunk_q,
+    chunk_k,
+    chunk_c,
+    chunk_g,
+    boundaries,
+    starts,
+    out,
+    scale,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    GROUP: gl.constexpr,
     ROW_WARPS: gl.constexpr,
 ):
     group = gl.program_id(2)
@@ -570,7 +743,9 @@ def _evaluate_groups(
     first_chunk = begin // BT + seq + local_group * (GROUP // BT)
     chunks = gl.minimum(gl.cdiv(end - group_begin, BT), GROUP // BT)
     layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=True,
+        version=4,
+        instr_shape=[16, 16, 4],
+        transposed=True,
         warps_per_cta=[ROW_WARPS, gl.num_warps() // ROW_WARPS],
     )
     load_layout: gl.constexpr = gl.BlockedLayout(
@@ -593,25 +768,47 @@ def _evaluate_groups(
         key = gl.load(chunk_k + offsets)
         u = gl.load(chunk_u + base + t[None, :] * 128 + v[:, None])
         decay = gl.load(chunk_g + chunk * 8 + head)
-        c = gl.load(chunk_c + ((chunk * 8 + head) * BT + load_t[:, None]) * BT + load_c[None, :])
+        c = gl.load(
+            chunk_c + ((chunk * 8 + head) * BT + load_t[:, None]) * BT + load_c[None, :]
+        )
         projected = _chunk_dot(
             h, gl.permute(w, (1, 0)), gl.zeros((BV, BT), gl.float32, layout), 1
         )
         delta = u - projected
-        y = _chunk_dot(h, gl.permute(q, (1, 0)), gl.zeros((BV, BT), gl.float32, layout), 1)
+        y = _chunk_dot(
+            h, gl.permute(q, (1, 0)), gl.zeros((BV, BT), gl.float32, layout), 1
+        )
         y = _chunk_dot(delta, gl.permute(c, (1, 0)), y, 1)
         h = _chunk_dot(delta, key, h * decay, 1)
         token = group_begin + local_chunk * BT + t
         gl.store(
             out + (token[None, :] * 8 + head) * 128 + v[:, None],
-            y * scale, token[None, :] < end,
+            y * scale,
+            token[None, :] < end,
         )
 
 
-@gluon.jit
-def _gated_rms_quant(core, qkvz, weight, normalized, quantized, scales,
-                    eps, quant_max, inverse_quant_max,
-                    TOTAL: gl.constexpr, ROWS: gl.constexpr, LANES: gl.constexpr, PACK: gl.constexpr):
+_gated_rms_quant_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b6_15_gated_rms_quant", ["TOTAL", "ROWS", "LANES", "PACK"]
+)
+
+
+@gluon.jit(repr=_gated_rms_quant_repr)
+def _gated_rms_quant(
+    core,
+    qkvz,
+    weight,
+    normalized,
+    quantized,
+    scales,
+    eps,
+    quant_max,
+    inverse_quant_max,
+    TOTAL: gl.constexpr,
+    ROWS: gl.constexpr,
+    LANES: gl.constexpr,
+    PACK: gl.constexpr,
+):
     layout: gl.constexpr = gl.BlockedLayout(
         [1, PACK],
         [64 // LANES, LANES],
@@ -626,11 +823,11 @@ def _gated_rms_quant(core, qkvz, weight, normalized, quantized, scales,
     gate = gl.load(qkvz + z_offset[:, None] + col[None, :], valid, 0).to(gl.float32)
     w = gl.load(weight + col).to(gl.float32)
     inverse_rms = gl.rsqrt(gl.sum(x * x, 1) / 128 + eps)
-    sigmoid = 1. / (1. + gl.exp(-gate))
+    sigmoid = 1.0 / (1.0 + gl.exp(-gate))
     result = (x * inverse_rms[:, None] * w[None, :] * gate * sigmoid).to(gl.bfloat16)
     values = result.to(gl.float32)
-    scale = gl.maximum(gl.max(gl.abs(values), 1), 1.e-10) * inverse_quant_max
-    encoded = gl.clamp(values * (1. / scale[:, None]), -quant_max, quant_max)
+    scale = gl.maximum(gl.max(gl.abs(values), 1), 1.0e-10) * inverse_quant_max
+    encoded = gl.clamp(values * (1.0 / scale[:, None]), -quant_max, quant_max)
     gl.store(normalized + row[:, None] * 128 + col[None, :], result, valid)
     gl.store(quantized + row[:, None] * 128 + col[None, :], encoded, valid)
     gl.store(scales + row, scale, row < TOTAL)
@@ -667,7 +864,15 @@ def gdn_prefill_group_fp8_quant(
     assert has_initial_state.dtype is torch.bool and delta_state.dtype is torch.float32
     assert a_log.shape == dt_bias.shape == (8,) and a_log.dtype is torch.float32
     assert norm_weight.shape == (128,) and m > 0
-    bf16 = (projected_qkvz, projected_ba, conv_state, conv_weight, conv_bias, dt_bias, norm_weight)
+    bf16 = (
+        projected_qkvz,
+        projected_ba,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        dt_bias,
+        norm_weight,
+    )
     assert all(t.dtype is torch.bfloat16 and t.is_contiguous() for t in bf16)
 
     device = projected_qkvz.device
@@ -675,15 +880,34 @@ def gdn_prefill_group_fp8_quant(
     gates = torch.empty((8, m, 2), device=device, dtype=torch.float32)
     prep_rows, prep_warps = (16, 4) if m <= 4096 else (4, 1)
     _prepare_tokens[((m + prep_rows - 1) // prep_rows, 16)](
-        projected_qkvz, projected_ba, conv_state, cache_indices, cu_seqlens,
-        has_initial_state, conv_weight, conv_bias, a_log, dt_bias, prepared, gates,
-        M=m, LOG_BATCH=(batch - 1).bit_length(), BATCH=batch,
-        ROWS=prep_rows, LANES=16, PACK=4,
-        num_warps=prep_warps, enable_fp_fusion=False,
+        projected_qkvz,
+        projected_ba,
+        conv_state,
+        cache_indices,
+        cu_seqlens,
+        has_initial_state,
+        conv_weight,
+        conv_bias,
+        a_log,
+        dt_bias,
+        prepared,
+        gates,
+        M=m,
+        LOG_BATCH=(batch - 1).bit_length(),
+        BATCH=batch,
+        ROWS=prep_rows,
+        LANES=16,
+        PACK=4,
+        num_warps=prep_warps,
+        enable_fp_fusion=False,
     )
     # All readers of the old convolution history complete before this launch.
     _update_conv_state[(batch, 16)](
-        projected_qkvz, conv_state, cache_indices, cu_seqlens, has_initial_state,
+        projected_qkvz,
+        conv_state,
+        cache_indices,
+        cu_seqlens,
+        has_initial_state,
         num_warps=1,
     )
     core = torch.empty((m, 8, 128), device=device, dtype=torch.bfloat16)
@@ -706,41 +930,98 @@ def gdn_prefill_group_fp8_quant(
         dtype=torch.float32,
     )
     if batch <= 4:
-        chunk_w = torch.empty((num_chunks, 8, token_block, 128), device=device, dtype=torch.float32)
+        chunk_w = torch.empty(
+            (num_chunks, 8, token_block, 128), device=device, dtype=torch.float32
+        )
         chunk_u = torch.empty_like(chunk_w)
         chunk_q = torch.empty_like(chunk_w)
         chunk_k = torch.empty_like(chunk_w)
         chunk_g = torch.empty((num_chunks, 8), device=device, dtype=torch.float32)
         _prepare_chunks_full[(num_chunks, 8)](
-            prepared, gates, cu_seqlens, chunk_w, chunk_u, chunk_q, chunk_k,
-            chunk_c, chunk_g, M=m, BATCH=batch, BT=token_block, num_warps=prep_warps,
+            prepared,
+            gates,
+            cu_seqlens,
+            chunk_w,
+            chunk_u,
+            chunk_q,
+            chunk_k,
+            chunk_c,
+            chunk_g,
+            M=m,
+            BATCH=batch,
+            BT=token_block,
+            num_warps=prep_warps,
         )
         if use_groups:
-            group_tokens = 128 if m <= 2048 else 512 if m <= 8192 else 1024 if m <= 16384 else 2048
+            group_tokens = (
+                128 if m <= 2048 else 512 if m <= 8192 else 1024 if m <= 16384 else 2048
+            )
             group_row_warps = 1 if value_block == 16 else 2
             num_groups = m // group_tokens + batch
-            maps = torch.empty((num_groups, 8, 256, 128), device=device, dtype=torch.float32)
-            boundaries = torch.empty((num_groups, 8, 128, 128), device=device, dtype=torch.float32)
+            maps = torch.empty(
+                (num_groups, 8, 256, 128), device=device, dtype=torch.float32
+            )
+            boundaries = torch.empty(
+                (num_groups, 8, 128, 128), device=device, dtype=torch.float32
+            )
             _build_group_maps[(256 // value_block, 8, num_groups)](
-                chunk_w, chunk_u, chunk_k, chunk_g, cu_seqlens, maps,
-                BATCH=batch, BT=token_block, BV=value_block, GROUP=group_tokens,
-                ROW_WARPS=group_row_warps, num_warps=recur_warps,
+                chunk_w,
+                chunk_u,
+                chunk_k,
+                chunk_g,
+                cu_seqlens,
+                maps,
+                BATCH=batch,
+                BT=token_block,
+                BV=value_block,
+                GROUP=group_tokens,
+                ROW_WARPS=group_row_warps,
+                num_warps=recur_warps,
             )
             _propagate_group_maps[(batch, 8, 8)](
-                maps, boundaries, delta_state, cache_indices, cu_seqlens,
-                GROUP=group_tokens, BV=16, num_warps=4,
+                maps,
+                boundaries,
+                delta_state,
+                cache_indices,
+                cu_seqlens,
+                GROUP=group_tokens,
+                BV=16,
+                num_warps=4,
             )
             _evaluate_groups[(128 // value_block, 8, num_groups)](
-                chunk_w, chunk_u, chunk_q, chunk_k, chunk_c, chunk_g,
-                boundaries, cu_seqlens, core, scale,
-                BATCH=batch, BT=token_block, BV=value_block, GROUP=group_tokens,
-                ROW_WARPS=group_row_warps, num_warps=recur_warps,
+                chunk_w,
+                chunk_u,
+                chunk_q,
+                chunk_k,
+                chunk_c,
+                chunk_g,
+                boundaries,
+                cu_seqlens,
+                core,
+                scale,
+                BATCH=batch,
+                BT=token_block,
+                BV=value_block,
+                GROUP=group_tokens,
+                ROW_WARPS=group_row_warps,
+                num_warps=recur_warps,
             )
         else:
             _recurrence_full[(batch, 8, 128 // value_block)](
-                chunk_w, chunk_u, chunk_q, chunk_k, chunk_c, chunk_g, delta_state,
-                cache_indices, cu_seqlens, core, scale,
-                BT=token_block, BV=value_block, num_warps=recur_warps,
+                chunk_w,
+                chunk_u,
+                chunk_q,
+                chunk_k,
+                chunk_c,
+                chunk_g,
+                delta_state,
+                cache_indices,
+                cu_seqlens,
+                core,
+                scale,
+                BT=token_block,
+                BV=value_block,
+                num_warps=recur_warps,
             )
     else:
         chunk_inverse = torch.empty_like(chunk_c)
@@ -750,22 +1031,53 @@ def gdn_prefill_group_fp8_quant(
             dtype=torch.float32,
         )
         _prepare_chunks_compact[(num_chunks, 8)](
-            prepared, gates, cu_seqlens, chunk_inverse, chunk_c, chunk_decay,
-            M=m, BATCH=batch, BT=token_block, num_warps=prep_warps,
+            prepared,
+            gates,
+            cu_seqlens,
+            chunk_inverse,
+            chunk_c,
+            chunk_decay,
+            M=m,
+            BATCH=batch,
+            BT=token_block,
+            num_warps=prep_warps,
         )
         _recurrence_compact[(batch, 8, 128 // value_block)](
-            prepared, gates, chunk_inverse, chunk_c, chunk_decay,
-            delta_state, cache_indices, cu_seqlens, core, scale,
-            M=m, BT=token_block, BV=value_block, num_warps=recur_warps,
-            ROW_WARPS=2 if batch > 8 else 1, TRANSPOSED=batch <= 8,
+            prepared,
+            gates,
+            chunk_inverse,
+            chunk_c,
+            chunk_decay,
+            delta_state,
+            cache_indices,
+            cu_seqlens,
+            core,
+            scale,
+            M=m,
+            BT=token_block,
+            BV=value_block,
+            num_warps=recur_warps,
+            ROW_WARPS=2 if batch > 8 else 1,
+            TRANSPOSED=batch <= 8,
         )
     normalized = torch.empty_like(core)
     values = torch.empty((m, 1024), device=device, dtype=precision_config.dtype)
     scales = torch.empty((m, 8), device=device, dtype=torch.float32)
     epi_rows, epi_lanes, epi_pack = (4, 16, 4) if m < 4096 else (8, 8, 8)
     _gated_rms_quant[((m * 8 + epi_rows - 1) // epi_rows,)](
-        core, projected_qkvz, norm_weight, normalized, values, scales, eps,
-        precision_config.group_quant_max, 1.0 / precision_config.group_quant_max,
-        TOTAL=m * 8, ROWS=epi_rows, LANES=epi_lanes, PACK=epi_pack, num_warps=1,
+        core,
+        projected_qkvz,
+        norm_weight,
+        normalized,
+        values,
+        scales,
+        eps,
+        precision_config.group_quant_max,
+        1.0 / precision_config.group_quant_max,
+        TOTAL=m * 8,
+        ROWS=epi_rows,
+        LANES=epi_lanes,
+        PACK=epi_pack,
+        num_warps=1,
     )
     return normalized, conv_state, delta_state, values, scales

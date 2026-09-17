@@ -18,6 +18,7 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.extra import libdevice
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @dataclass(frozen=True)
@@ -43,10 +44,25 @@ def _gate_values(a, b, decay_weight, valid=None):
     return decay, beta
 
 
-@gluon.jit
+_prepare_qkv_window_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_prepare_qkv_window", ["M", "BATCH", "OUT", "NW"]
+)
+
+
+@gluon.jit(repr=_prepare_qkv_window_repr)
 def _prepare_qkv_window(
-    Projected, ConvState, Indices, Starts, Initial, Weight, Bias, QKV,
-    M: gl.constexpr, BATCH: gl.constexpr, OUT: gl.constexpr, NW: gl.constexpr,
+    Projected,
+    ConvState,
+    Indices,
+    Starts,
+    Initial,
+    Weight,
+    Bias,
+    QKV,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    OUT: gl.constexpr,
+    NW: gl.constexpr,
     Bounds=None,
 ):
     work = gl.program_id(0)
@@ -64,26 +80,47 @@ def _prepare_qkv_window(
     first += part * BT
     begin = gl.load(Starts + seq)
     layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 2], [1, 1, 64], [NW, 1, 1], [2, 1, 0])
+        [1, 1, 2], [1, 1, 64], [NW, 1, 1], [2, 1, 0]
+    )
     wave = gl.arange(0, NW, layout=gl.SliceLayout(1, gl.SliceLayout(2, layout)))
     ti = gl.arange(0, WIN, layout=gl.SliceLayout(0, gl.SliceLayout(2, layout)))
     to = gl.arange(0, OUT, layout=gl.SliceLayout(0, gl.SliceLayout(2, layout)))
     c = gl.arange(0, 128, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout)))
     channel = group * 128 + c
-    packed = gl.where(group < 4, group * 768,
-                      gl.where(group < 8, (group - 4) * 768 + 128,
-                               ((group - 8) // 2) * 768 + 256 + (group % 2) * 128)) + c
+    packed = (
+        gl.where(
+            group < 4,
+            group * 768,
+            gl.where(
+                group < 8,
+                (group - 4) * 768 + 128,
+                ((group - 8) // 2) * 768 + 256 + (group % 2) * 128,
+            ),
+        )
+        + c
+    )
     # Each wave loads its convolution window once; gathers are register-local.
     previous = first + wave[:, None] * OUT + ti[None, :] - 3
-    x = gl.load(Projected + previous[:, :, None] * 3072 + packed[None, None, :],
-                (previous[:, :, None] >= begin) & (previous[:, :, None] < end), 0)
+    x = gl.load(
+        Projected + previous[:, :, None] * 3072 + packed[None, None, :],
+        (previous[:, :, None] >= begin) & (previous[:, :, None] < end),
+        0,
+    )
     # Interior windows never need history, including for ragged sequences.
     if first == begin:
         slot = gl.load(Indices + seq)
         cached = gl.load(Initial + seq)
-        history = gl.load(ConvState + (slot * 2048 + channel[None, None, :]) * 3
-                          + previous[:, :, None] - begin + 3,
-                          (previous[:, :, None] < begin) & (previous[:, :, None] >= begin - 3) & cached, 0)
+        history = gl.load(
+            ConvState
+            + (slot * 2048 + channel[None, None, :]) * 3
+            + previous[:, :, None]
+            - begin
+            + 3,
+            (previous[:, :, None] < begin)
+            & (previous[:, :, None] >= begin - 3)
+            & cached,
+            0,
+        )
         x = gl.where(previous[:, :, None] >= begin, x, history)
     x = x.to(gl.float32)
     conv = gl.load(Bias + channel)[None, None, :].to(gl.float32)
@@ -101,8 +138,10 @@ def _prepare_qkv_window(
     token = first + wave[:, None] * OUT + to[None, :]
     # Initialize padding on every invocation so all downstream loads are safe.
     scratch_token = tile * 32 + part * BT + wave[:, None] * OUT + to[None, :]
-    gl.store(QKV + (group * M + scratch_token[:, :, None]) * 128 + c[None, None, :],
-             gl.where(token[:, :, None] < end, activated, 0))
+    gl.store(
+        QKV + (group * M + scratch_token[:, :, None]) * 128 + c[None, None, :],
+        gl.where(token[:, :, None] < end, activated, 0),
+    )
     gl.static_assert(BT >= 3)
     if first == begin:
         slot = gl.load(Indices + seq)
@@ -126,10 +165,23 @@ def _prepare_qkv_window(
         gl.store(cache + 2, gl.where(t2 >= begin, x2, h2))
 
 
-@gluon.jit
-def _prepare_gates(BA, Starts, ALog, DTBias, Gates,
-                   M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr,
-                   Bounds=None):
+_prepare_gates_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_prepare_gates", ["M", "BATCH", "BT"]
+)
+
+
+@gluon.jit(repr=_prepare_gates_repr)
+def _prepare_gates(
+    BA,
+    Starts,
+    ALog,
+    DTBias,
+    Gates,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    Bounds=None,
+):
     chunk = gl.program_id(0)
     if Bounds is None:
         seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
@@ -147,10 +199,14 @@ def _prepare_gates(BA, Starts, ALog, DTBias, Gates,
     decay_weight = gl.exp(gl.load(ALog + head).to(gl.float32))
     decay, beta = _gate_values(av, bv, decay_weight[:, None])
     scratch_token = chunk * BT + i
-    gl.store(Gates + (head[:, None] * 2) * M + scratch_token[None, :],
-             gl.where(token[None, :] < end, decay, 1.0))
-    gl.store(Gates + (head[:, None] * 2 + 1) * M + scratch_token[None, :],
-             gl.where(token[None, :] < end, beta, 0.0))
+    gl.store(
+        Gates + (head[:, None] * 2) * M + scratch_token[None, :],
+        gl.where(token[None, :] < end, decay, 1.0),
+    )
+    gl.store(
+        Gates + (head[:, None] * 2 + 1) * M + scratch_token[None, :],
+        gl.where(token[None, :] < end, beta, 0.0),
+    )
 
 
 @gluon.jit
@@ -159,12 +215,21 @@ def _multiply(a, b):
 
 
 @gluon.jit
-def _dot_f32(a, b, initial=None, WARPS: gl.constexpr = (2, 2),
-             MMA_SIZE: gl.constexpr = 16, TRANSPOSED: gl.constexpr = True):
+def _dot_f32(
+    a,
+    b,
+    initial=None,
+    WARPS: gl.constexpr = (2, 2),
+    MMA_SIZE: gl.constexpr = 16,
+    TRANSPOSED: gl.constexpr = True,
+):
     """FP32 MFMA, optionally accumulating into an existing state tile."""
     mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[MMA_SIZE, MMA_SIZE, 64 // MMA_SIZE],
-        transposed=TRANSPOSED, warps_per_cta=WARPS)
+        version=4,
+        instr_shape=[MMA_SIZE, MMA_SIZE, 64 // MMA_SIZE],
+        transposed=TRANSPOSED,
+        warps_per_cta=WARPS,
+    )
     aa = gl.convert_layout(a, gl.DotOperandLayout(0, mma, 1))
     bb = gl.convert_layout(b, gl.DotOperandLayout(1, mma, 1))
     if initial is None:
@@ -177,7 +242,8 @@ def _dot_f32(a, b, initial=None, WARPS: gl.constexpr = (2, 2),
 @gluon.jit
 def _dot_bf16(a, b):
     mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2])
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
+    )
     aa = gl.convert_layout(a, gl.DotOperandLayout(0, mma, 8))
     bb = gl.convert_layout(b, gl.DotOperandLayout(1, mma, 8))
     acc = gl.zeros((a.shape[0], b.shape[1]), gl.float32, layout=mma)
@@ -209,13 +275,17 @@ def _invert_diagonal_sixteen(lower, NATIVE: gl.constexpr):
     blocks: gl.constexpr = 4
     square: gl.constexpr = gl.BlockedLayout([1, 1], [8, 8], [4, 1], [1, 0])
     four: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 1, 1], [1, 8, 1, 8], [4, 1, 1, 1], [3, 1, 2, 0])
-    three: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 1], [1, 8, 8], [4, 1, 1], [2, 1, 0])
+        [1, 1, 1, 1], [1, 8, 1, 8], [4, 1, 1, 1], [3, 1, 2, 0]
+    )
+    three: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 8, 8], [4, 1, 1], [2, 1, 0])
     matrix = gl.convert_layout(lower, square).reshape((blocks, 8, blocks, 8))
     matrix = gl.convert_layout(matrix, four)
-    br = gl.arange(0, blocks, layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, four))))
-    bc = gl.arange(0, 2, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, four))))
+    br = gl.arange(
+        0, blocks, layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, four)))
+    )
+    bc = gl.arange(
+        0, 2, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, four)))
+    )
     pick = br[:, None, None, None] + gl.full((blocks, 8, 1, 8), 0, gl.int32, four)
     diagonal = gl.gather(matrix, pick, 2).reshape((blocks, 8, 8))
     diagonal = gl.convert_layout(diagonal, three)
@@ -227,34 +297,54 @@ def _invert_diagonal_sixteen(lower, NATIVE: gl.constexpr):
         column = gl.gather(diagonal, index, 2)
         row = gl.gather(inverse, index, 1)
         update = column * row
-        inverse += gl.where((r[None, :, None] > pivot) & (c[None, None, :] < pivot), update, 0.0)
+        inverse += gl.where(
+            (r[None, :, None] > pivot) & (c[None, None, :] < pivot), update, 0.0
+        )
     # Join each neighboring pair while each 8x8 product stays wave-local.
-    link_pick = (br ^ 1)[:, None, None, None] + gl.full((blocks, 8, 1, 8), 0, gl.int32, four)
-    link = gl.convert_layout(gl.gather(matrix, link_pick, 2).reshape((blocks, 8, 8)), three)
+    link_pick = (br ^ 1)[:, None, None, None] + gl.full(
+        (blocks, 8, 1, 8), 0, gl.int32, four
+    )
+    link = gl.convert_layout(
+        gl.gather(matrix, link_pick, 2).reshape((blocks, 8, 8)), three
+    )
     block_id = gl.arange(0, blocks, layout=gl.SliceLayout(1, gl.SliceLayout(2, three)))
-    partner_pick = (block_id ^ 1)[:, None, None] + gl.full((blocks, 8, 8), 0, gl.int32, three)
+    partner_pick = (block_id ^ 1)[:, None, None] + gl.full(
+        (blocks, 8, 8), 0, gl.int32, three
+    )
     partner = gl.gather(inverse, partner_pick, 0)
     mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[4, 1, 1])
+        version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[4, 1, 1]
+    )
     lhs: gl.constexpr = gl.DotOperandLayout(0, mma, 1)
     rhs: gl.constexpr = gl.DotOperandLayout(1, mma, 1)
     zero = gl.zeros((blocks, 8, 8), gl.float32, mma)
-    joined = gl.amd.cdna3.mfma(gl.convert_layout(inverse, lhs), gl.convert_layout(link, rhs), zero)
-    joined = gl.amd.cdna3.mfma(gl.convert_layout(joined, lhs), gl.convert_layout(partner, rhs), zero)
+    joined = gl.amd.cdna3.mfma(
+        gl.convert_layout(inverse, lhs), gl.convert_layout(link, rhs), zero
+    )
+    joined = gl.amd.cdna3.mfma(
+        gl.convert_layout(joined, lhs), gl.convert_layout(partner, rhs), zero
+    )
     joined = gl.convert_layout(joined, gl.SliceLayout(2, four))
     inverse = gl.convert_layout(inverse, gl.SliceLayout(2, four))
-    result = gl.where(br[:, None, None, None] % 2 == bc[None, None, :, None], inverse[:, :, None, :], 0.0)
-    result += gl.where((br[:, None, None, None] % 2 == 1)
-                       & (bc[None, None, :, None] == 0),
-                       joined[:, :, None, :], 0.0)
+    result = gl.where(
+        br[:, None, None, None] % 2 == bc[None, None, :, None],
+        inverse[:, :, None, :],
+        0.0,
+    )
+    result += gl.where(
+        (br[:, None, None, None] % 2 == 1) & (bc[None, None, :, None] == 0),
+        joined[:, :, None, :],
+        0.0,
+    )
     if NATIVE:
         factor_mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[16, 16, 4], transposed=True,
-            warps_per_cta=[1, 1, 4])
+            version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[1, 1, 4]
+        )
         compact: gl.constexpr = gl.DotOperandLayout(0, factor_mma, 1)
     else:
         compact: gl.constexpr = gl.BlockedLayout(
-            [1, 1, 1], [1, 8, 8], [1, 2, 2], [2, 1, 0])
+            [1, 1, 1], [1, 8, 8], [1, 2, 2], [2, 1, 0]
+        )
     return gl.convert_layout(result.reshape((2, 16, 16)), compact)
 
 
@@ -269,13 +359,33 @@ def _solve_two_halves(left, right, link, rhs):
     return top, bottom
 
 
-@gluon.jit
-def _chunk_transform(QKV, Gates, U, W, Scores, Coeff,
-                     M: gl.constexpr, BT: gl.constexpr,
-                     TIME_MAJOR: gl.constexpr = False,
-                     BA=None, Starts=None, ALog=None, DTBias=None,
-                     BATCH: gl.constexpr = 1, FUSED_GATES: gl.constexpr = False,
-                     TailKey=None, Bounds=None, HEAD_MAJOR: gl.constexpr = False):
+_chunk_transform_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_chunk_transform",
+    ["M", "BT", "TIME_MAJOR", "BATCH", "FUSED_GATES", "HEAD_MAJOR"],
+)
+
+
+@gluon.jit(repr=_chunk_transform_repr)
+def _chunk_transform(
+    QKV,
+    Gates,
+    U,
+    W,
+    Scores,
+    Coeff,
+    M: gl.constexpr,
+    BT: gl.constexpr,
+    TIME_MAJOR: gl.constexpr = False,
+    BA=None,
+    Starts=None,
+    ALog=None,
+    DTBias=None,
+    BATCH: gl.constexpr = 1,
+    FUSED_GATES: gl.constexpr = False,
+    TailKey=None,
+    Bounds=None,
+    HEAD_MAJOR: gl.constexpr = False,
+):
     chunk = gl.program_id(1) if HEAD_MAJOR else gl.program_id(0)
     head = gl.program_id(0) if HEAD_MAJOR else gl.program_id(1)
     if Bounds is None:
@@ -307,31 +417,43 @@ def _chunk_transform(QKV, Gates, U, W, Scores, Coeff,
         scan_layout: gl.constexpr = gl.BlockedLayout([1, 1], [32, 2], [1, 4], [0, 1])
         prefix = gl.associative_scan(
             gl.convert_layout(decay, gl.BlockedLayout([1], [64], [4], [0])),
-            0, _multiply)
+            0,
+            _multiply,
+        )
         prefix = gl.convert_layout(prefix, gl.SliceLayout(1, layout))
-        pair_decay = gl.associative_scan(gl.convert_layout(
-            gl.where(i[:, None] > j[None, :], decay[:, None], 1.0), scan_layout),
-            0, _multiply)
+        pair_decay = gl.associative_scan(
+            gl.convert_layout(
+                gl.where(i[:, None] > j[None, :], decay[:, None], 1.0), scan_layout
+            ),
+            0,
+            _multiply,
+        )
         pair_decay = gl.convert_layout(pair_decay, layout)
         tail = gl.sum(gl.where(i[:, None] == BT - 1, pair_decay, 0.0), 0)
         tail = gl.convert_layout(tail, gl.SliceLayout(1, layout))
         gram = gl.convert_layout(_dot_bf16(key, key.trans()), layout)
-        lower = gl.where(i[:, None] > j[None, :],
-                         -beta[:, None] * pair_decay * gram, 0.0)
+        lower = gl.where(
+            i[:, None] > j[None, :], -beta[:, None] * pair_decay * gram, 0.0
+        )
         inverse = _invert_diagonal_sixteen(lower, FUSED_GATES)
         factor_mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[1, 4])
+            version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[1, 4]
+        )
         if FUSED_GATES:
             block_layout: gl.constexpr = gl.DotOperandLayout(0, factor_mma, 1)
         else:
-            block_layout: gl.constexpr = gl.BlockedLayout([1, 1], [8, 8], [2, 2], [1, 0])
+            block_layout: gl.constexpr = gl.BlockedLayout(
+                [1, 1], [8, 8], [2, 2], [1, 0]
+            )
         left = gl.amd.slice(inverse, [1, 16, 16], [0, 0, 0]).reshape((16, 16))
         right = gl.amd.slice(inverse, [1, 16, 16], [1, 0, 0]).reshape((16, 16))
         left = gl.convert_layout(left, block_layout)
         right = gl.convert_layout(right, block_layout)
         link = gl.amd.slice(gl.convert_layout(lower, block_layout), [16, 16], [16, 0])
         base = (chunk * 8 + head) * BT
-        value = gl.load(QKV + ((8 + head) * M + t[:, None]) * 128 + k[None, :]).to(gl.float32)
+        value = gl.load(QKV + ((8 + head) * M + t[:, None]) * 128 + k[None, :]).to(
+            gl.float32
+        )
         fi = gl.arange(0, 16, layout=gl.SliceLayout(1, factor_mma))
         fk = gl.arange(0, 128, layout=gl.SliceLayout(0, factor_mma))
         if TIME_MAJOR:
@@ -343,7 +465,9 @@ def _chunk_transform(QKV, Gates, U, W, Scores, Coeff,
         u0, u1 = _solve_two_halves(left, right, link, beta[:, None] * value)
         gl.store(U + factor_offset, u0)
         gl.store(U + factor_offset + second_offset, u1)
-        w0, w1 = _solve_two_halves(left, right, link, (beta * prefix)[:, None] * key.to(gl.float32))
+        w0, w1 = _solve_two_halves(
+            left, right, link, (beta * prefix)[:, None] * key.to(gl.float32)
+        )
         # Feature-major consumers share a pre-negated factor. Time-major
         # consumers fold the negation into their operand preparation instead.
         gl.store(W + factor_offset, w0 if TIME_MAJOR else -w0)
@@ -355,29 +479,45 @@ def _chunk_transform(QKV, Gates, U, W, Scores, Coeff,
         gl.store(Coeff + (chunk * 8 + head) * 2 * BT + i, prefix)
         gl.store(Coeff + (chunk * 8 + head) * 2 * BT + BT + i, tail)
         if TailKey is not None:
-            gl.store(TailKey + (base + i[:, None]) * 128 + k[None, :],
-                     key.to(gl.float32) * tail[:, None])
+            gl.store(
+                TailKey + (base + i[:, None]) * 128 + k[None, :],
+                key.to(gl.float32) * tail[:, None],
+            )
 
 
 @gluon.jit
-def _load_recurrent_factors(U, W, base, vblock, BT: gl.constexpr,
-                            BV: gl.constexpr, WARPS: gl.constexpr,
-                            TIME_MAJOR: gl.constexpr = False,
-                            TRANSPOSED: gl.constexpr = True):
+def _load_recurrent_factors(
+    U,
+    W,
+    base,
+    vblock,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    WARPS: gl.constexpr,
+    TIME_MAJOR: gl.constexpr = False,
+    TRANSPOSED: gl.constexpr = True,
+):
     """Load U.T and -W.T in the recurrent consumer's operand ownership."""
     if TIME_MAJOR:
         layout: gl.constexpr = gl.BlockedLayout(
-            [1, 2], [4, 16], [WARPS[0] * WARPS[1], 1], [1, 0])
+            [1, 2], [4, 16], [WARPS[0] * WARPS[1], 1], [1, 0]
+        )
         ti = gl.arange(0, BT, layout=gl.SliceLayout(1, layout))
         vr = vblock * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, layout))
         kr = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
         u = gl.amd.cdna3.buffer_load(
-            U, (base + ti[:, None]) * 128 + vr[None, :]).trans()
+            U, (base + ti[:, None]) * 128 + vr[None, :]
+        ).trans()
         w = -gl.amd.cdna3.buffer_load(
-            W, (base + ti[:, None]) * 128 + kr[None, :]).trans()
+            W, (base + ti[:, None]) * 128 + kr[None, :]
+        ).trans()
     else:
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[16, 16, 4], transposed=TRANSPOSED, warps_per_cta=WARPS)
+            version=4,
+            instr_shape=[16, 16, 4],
+            transposed=TRANSPOSED,
+            warps_per_cta=WARPS,
+        )
         rhs: gl.constexpr = gl.DotOperandLayout(1, mma, 1)
         vr = vblock * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, mma))
         ti = gl.arange(0, BT, layout=gl.SliceLayout(0, mma))
@@ -388,11 +528,28 @@ def _load_recurrent_factors(U, W, base, vblock, BT: gl.constexpr,
     return u, w
 
 
-@gluon.jit
-def _chunk_state_rows(QKV, U, W, Coeff, State, Indices, Starts, ChunkState,
-                      M: gl.constexpr, BT: gl.constexpr, BV: gl.constexpr,
-                      NW: gl.constexpr, WM: gl.constexpr,
-                      TailKey=None):
+_chunk_state_rows_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_chunk_state_rows", ["M", "BT", "BV", "NW", "WM"]
+)
+
+
+@gluon.jit(repr=_chunk_state_rows_repr)
+def _chunk_state_rows(
+    QKV,
+    U,
+    W,
+    Coeff,
+    State,
+    Indices,
+    Starts,
+    ChunkState,
+    M: gl.constexpr,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    WM: gl.constexpr,
+    TailKey=None,
+):
     seq = gl.program_id(0)
     head = gl.program_id(1)
     vblock = gl.program_id(2)
@@ -402,7 +559,11 @@ def _chunk_state_rows(QKV, U, W, Coeff, State, Indices, Starts, ChunkState,
     first_chunk = begin // BT + seq
     count = gl.cdiv(end - begin, BT)
     mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[WM, NW // WM])
+        version=4,
+        instr_shape=[16, 16, 4],
+        transposed=True,
+        warps_per_cta=[WM, NW // WM],
+    )
     vr = vblock * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, mma))
     kc = gl.arange(0, 128, layout=gl.SliceLayout(0, mma))
     state_offset = ((slot * 8 + head) * 128 + vr[:, None]) * 128 + kc[None, :]
@@ -411,25 +572,51 @@ def _chunk_state_rows(QKV, U, W, Coeff, State, Indices, Starts, ChunkState,
         chunk = first_chunk + local
         state_base = (chunk * 8 + head) * 128 * 128
         gl.store(ChunkState + state_base + vr[:, None] * 128 + kc[None, :], h)
-        h = _advance_chunk(h, QKV, U, W, Coeff, chunk, head, vblock,
-                           False, M, BT, BV, NW, WM, TailKey, SAVE_DELTA=True)
+        h = _advance_chunk(
+            h,
+            QKV,
+            U,
+            W,
+            Coeff,
+            chunk,
+            head,
+            vblock,
+            False,
+            M,
+            BT,
+            BV,
+            NW,
+            WM,
+            TailKey,
+            SAVE_DELTA=True,
+        )
     gl.store(State + state_offset, h)
 
 
 @gluon.jit
 def _load_key_decay(QKV, Coeff, chunk, head, i, k, M: gl.constexpr, BT: gl.constexpr):
     """Load keys, suffix weights, and the whole-chunk state decay."""
-    key = gl.amd.cdna3.buffer_load(QKV, ((4 + head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]).to(gl.float32)
+    key = gl.amd.cdna3.buffer_load(
+        QKV, ((4 + head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]
+    ).to(gl.float32)
     tail = gl.load(Coeff + (chunk * 8 + head) * 2 * BT + BT + i)
     decay = gl.load(Coeff + (chunk * 8 + head) * 2 * BT + BT - 1)
     return key, tail, decay
 
 
 @gluon.jit
-def _load_tail_key(TailKey, Coeff, chunk, head, BT: gl.constexpr, WARPS: gl.constexpr,
-                  TRANSPOSED: gl.constexpr = True):
+def _load_tail_key(
+    TailKey,
+    Coeff,
+    chunk,
+    head,
+    BT: gl.constexpr,
+    WARPS: gl.constexpr,
+    TRANSPOSED: gl.constexpr = True,
+):
     mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 4], transposed=TRANSPOSED, warps_per_cta=WARPS)
+        version=4, instr_shape=[16, 16, 4], transposed=TRANSPOSED, warps_per_cta=WARPS
+    )
     rhs: gl.constexpr = gl.DotOperandLayout(1, mma, 1)
     ti = gl.arange(0, BT, layout=gl.SliceLayout(1, rhs))
     kc = gl.arange(0, 128, layout=gl.SliceLayout(0, rhs))
@@ -440,11 +627,24 @@ def _load_tail_key(TailKey, Coeff, chunk, head, BT: gl.constexpr, WARPS: gl.cons
 
 
 @gluon.jit
-def _advance_chunk(h, QKV, U, W, Coeff, chunk, head, vblock,
-                   homogeneous, M: gl.constexpr, BT: gl.constexpr,
-                   BV: gl.constexpr, NW: gl.constexpr, WM: gl.constexpr,
-                   TailKey=None,
-                   SAVE_DELTA: gl.constexpr = False):
+def _advance_chunk(
+    h,
+    QKV,
+    U,
+    W,
+    Coeff,
+    chunk,
+    head,
+    vblock,
+    homogeneous,
+    M: gl.constexpr,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    WM: gl.constexpr,
+    TailKey=None,
+    SAVE_DELTA: gl.constexpr = False,
+):
     layout: gl.constexpr = gl.BlockedLayout([1, 2], [4, 16], [NW, 1], [1, 0])
     i = gl.arange(0, BT, layout=gl.SliceLayout(1, layout))
     k = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
@@ -473,11 +673,29 @@ def _recurrence_ids(UNIT_MAJOR: gl.constexpr):
         return gl.program_id(0), gl.program_id(1), gl.program_id(2)
 
 
-@gluon.jit
-def _build_segments(QKV, U, W, Coeff, Starts, Affine,
-                     M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr,
-                     SEG: gl.constexpr, BV: gl.constexpr, NW: gl.constexpr, WM: gl.constexpr,
-                     TailKey=None):
+_build_segments_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_build_segments",
+    ["M", "BATCH", "BT", "SEG", "BV", "NW", "WM"],
+)
+
+
+@gluon.jit(repr=_build_segments_repr)
+def _build_segments(
+    QKV,
+    U,
+    W,
+    Coeff,
+    Starts,
+    Affine,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    SEG: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    WM: gl.constexpr,
+    TailKey=None,
+):
     segment, head, plane_block = _recurrence_ids(True)
     plane = plane_block // (128 // BV)
     vblock = plane_block % (128 // BV)
@@ -486,7 +704,11 @@ def _build_segments(QKV, U, W, Coeff, Starts, Affine,
         begin = gl.load(Starts + seq)
         first_chunk = begin // BT + seq + (first - begin) // BT
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[WM, NW // WM])
+            version=4,
+            instr_shape=[16, 16, 4],
+            transposed=True,
+            warps_per_cta=[WM, NW // WM],
+        )
         vr = vblock * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, mma))
         kc = gl.arange(0, 128, layout=gl.SliceLayout(0, mma))
         ti = gl.arange(0, BT, layout=gl.SliceLayout(0, mma))
@@ -498,26 +720,59 @@ def _build_segments(QKV, U, W, Coeff, Starts, Affine,
         i = gl.arange(0, BT, layout=gl.SliceLayout(1, layout))
         k = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
         if TailKey is None:
-            key, tail, decay = _load_key_decay(QKV, Coeff, first_chunk, head, i, k, M, BT)
+            key, tail, decay = _load_key_decay(
+                QKV, Coeff, first_chunk, head, i, k, M, BT
+            )
             h = gl.where((plane == 0) & (vr[:, None] == kc[None, :]), decay, 0.0)
             h = _dot_f32(delta, key * tail[:, None], h, (WM, NW // WM))
         else:
-            key, decay = _load_tail_key(TailKey, Coeff, first_chunk, head, BT, (WM, NW // WM))
+            key, decay = _load_tail_key(
+                TailKey, Coeff, first_chunk, head, BT, (WM, NW // WM)
+            )
             h = gl.where((plane == 0) & (vr[:, None] == kc[None, :]), decay, 0.0)
             h = _dot_f32(delta, key, h, (WM, NW // WM))
         for local in range(1, SEG // BT):
-            h = _advance_chunk(h, QKV, U, W, Coeff, first_chunk + local,
-                               head, vblock, plane == 0,
-                               M, BT, BV, NW, WM, TailKey)
+            h = _advance_chunk(
+                h,
+                QKV,
+                U,
+                W,
+                Coeff,
+                first_chunk + local,
+                head,
+                vblock,
+                plane == 0,
+                M,
+                BT,
+                BV,
+                NW,
+                WM,
+                TailKey,
+            )
         base = ((segment * 8 + head) * 2 + plane) * 128 * 128
         gl.store(Affine + base + vr[:, None] * 128 + kc[None, :], h)
 
 
-@gluon.jit
+_build_segments_reverse_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_build_segments_reverse",
+    ["M", "BATCH", "BT", "SEG", "BC", "WM", "MMA_SIZE"],
+)
+
+
+@gluon.jit(repr=_build_segments_reverse_repr)
 def _build_segments_reverse(
-    QKV, U, W, Coeff, Starts, Affine,
-    M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr,
-    SEG: gl.constexpr, BC: gl.constexpr, WM: gl.constexpr,
+    QKV,
+    U,
+    W,
+    Coeff,
+    Starts,
+    Affine,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    SEG: gl.constexpr,
+    BC: gl.constexpr,
+    WM: gl.constexpr,
     MMA_SIZE: gl.constexpr = 16,
 ):
     """Compose from the right, sharing K @ T between transform and bias."""
@@ -528,8 +783,11 @@ def _build_segments_reverse(
         first_chunk = begin // BT + seq + (first - begin) // BT
         last_chunk = first_chunk + SEG // BT - 1
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[MMA_SIZE, MMA_SIZE, 64 // MMA_SIZE], transposed=True,
-            warps_per_cta=[WM, 4 // WM])
+            version=4,
+            instr_shape=[MMA_SIZE, MMA_SIZE, 64 // MMA_SIZE],
+            transposed=True,
+            warps_per_cta=[WM, 4 // WM],
+        )
         r = gl.arange(0, 128, layout=gl.SliceLayout(1, mma))
         c = cblock * BC + gl.arange(0, BC, layout=gl.SliceLayout(0, mma))
         factors: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [4, 1], [1, 0])
@@ -544,7 +802,8 @@ def _build_segments_reverse(
         w = gl.amd.cdna3.buffer_load(W, base * 128 + fr[:, None] * BT + ft[None, :])
         decay = gl.load(Coeff + (last_chunk * 8 + head) * 2 * BT + BT - 1)
         stripe_key = gl.amd.cdna3.buffer_load(
-            QKV, ((4 + head // 2) * M + last_chunk * BT + ti[:, None]) * 128 + kc[None, :]
+            QKV,
+            ((4 + head // 2) * M + last_chunk * BT + ti[:, None]) * 128 + kc[None, :],
         ).to(gl.float32)
         tail = gl.load(Coeff + (last_chunk * 8 + head) * 2 * BT + BT + ti)
         stripe_key = stripe_key * tail[:, None]
@@ -560,18 +819,35 @@ def _build_segments_reverse(
             u = gl.amd.cdna3.buffer_load(U, base * 128 + fr[:, None] * BT + ft[None, :])
             w = gl.amd.cdna3.buffer_load(W, base * 128 + fr[:, None] * BT + ft[None, :])
             projected_key = _dot_f32(key, transform, WARPS=(2, 2))
-            transform = _dot_f32(w, projected_key, transform * decay, (WM, 4 // WM), MMA_SIZE)
+            transform = _dot_f32(
+                w, projected_key, transform * decay, (WM, 4 // WM), MMA_SIZE
+            )
             bias = _dot_f32(u, projected_key, bias, (WM, 4 // WM), MMA_SIZE)
         output = (segment * 8 + head) * 2 * 128 * 128 + r[:, None] * 128 + c[None, :]
         gl.store(Affine + output, transform)
         gl.store(Affine + output + 128 * 128, bias)
 
 
-@gluon.jit
+_build_segments_stacked_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_build_segments_stacked",
+    ["M", "BATCH", "BT", "SEG", "BC", "WM", "MMA_SIZE"],
+)
+
+
+@gluon.jit(repr=_build_segments_stacked_repr)
 def _build_segments_stacked(
-    QKV, U, W, Coeff, Starts, Affine,
-    M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr,
-    SEG: gl.constexpr, BC: gl.constexpr, WM: gl.constexpr,
+    QKV,
+    U,
+    W,
+    Coeff,
+    Starts,
+    Affine,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    SEG: gl.constexpr,
+    BC: gl.constexpr,
+    WM: gl.constexpr,
     MMA_SIZE: gl.constexpr = 16,
 ):
     """Stack two 128-row products for the wide, well-populated summary grids."""
@@ -583,8 +859,11 @@ def _build_segments_stacked(
         first_chunk = begin // BT + seq + (first - begin) // BT
         last_chunk = first_chunk + SEG // BT - 1
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[MMA_SIZE, MMA_SIZE, 64 // MMA_SIZE], transposed=True,
-            warps_per_cta=[WM, 4 // WM])
+            version=4,
+            instr_shape=[MMA_SIZE, MMA_SIZE, 64 // MMA_SIZE],
+            transposed=True,
+            warps_per_cta=[WM, 4 // WM],
+        )
         r = gl.arange(0, 256, layout=gl.SliceLayout(1, mma))
         c = cblock * BC + gl.arange(0, BC, layout=gl.SliceLayout(0, mma))
         factors: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [4, 1], [1, 0])
@@ -599,7 +878,8 @@ def _build_segments_stacked(
         w = gl.amd.cdna3.buffer_load(W, base * 128 + fr[:, None] * BT + ft[None, :])
         decay = gl.load(Coeff + (last_chunk * 8 + head) * 2 * BT + BT - 1)
         stripe_key = gl.amd.cdna3.buffer_load(
-            QKV, ((4 + head // 2) * M + last_chunk * BT + ti[:, None]) * 128 + kc[None, :]
+            QKV,
+            ((4 + head // 2) * M + last_chunk * BT + ti[:, None]) * 128 + kc[None, :],
         ).to(gl.float32)
         tail = gl.load(Coeff + (last_chunk * 8 + head) * 2 * BT + BT + ti)
         stripe_key = stripe_key * tail[:, None]
@@ -624,9 +904,15 @@ def _build_segments_stacked(
         gl.store(Affine + output, affine)
 
 
-@gluon.jit
-def _prefix_segments(Affine, State, Indices, Starts,
-                      SEG: gl.constexpr, BV: gl.constexpr):
+_prefix_segments_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_prefix_segments", ["SEG", "BV"]
+)
+
+
+@gluon.jit(repr=_prefix_segments_repr)
+def _prefix_segments(
+    Affine, State, Indices, Starts, SEG: gl.constexpr, BV: gl.constexpr
+):
     """Propagate entry states with complete, unpadded narrow MFMA row tiles."""
     seq, head, vblock = _recurrence_ids(True)
     begin = gl.load(Starts + seq)
@@ -637,13 +923,16 @@ def _prefix_segments(Affine, State, Indices, Starts,
     # Both narrow layouts cover all 128 output columns with two column waves.
     if BV == 4:
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[4, 64, 16], transposed=False, warps_per_cta=[1, 2])
+            version=4, instr_shape=[4, 64, 16], transposed=False, warps_per_cta=[1, 2]
+        )
     elif BV == 8:
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[4, 64, 16], transposed=False, warps_per_cta=[2, 2])
+            version=4, instr_shape=[4, 64, 16], transposed=False, warps_per_cta=[2, 2]
+        )
     else:
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[1, 4])
+            version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[1, 4]
+        )
     vr = vblock * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, mma))
     kc = gl.arange(0, 128, layout=gl.SliceLayout(0, mma))
     rhs: gl.constexpr = gl.DotOperandLayout(1, mma, 1)
@@ -661,7 +950,9 @@ def _prefix_segments(Affine, State, Indices, Starts,
             if BV <= 8:
                 h = gl.amd.cdna3.mfma(
                     gl.convert_layout(h, gl.DotOperandLayout(0, mma, 1)),
-                    transform, bias)
+                    transform,
+                    bias,
+                )
             else:
                 h = _dot_f32(h, transform, bias, (1, 4))
         else:
@@ -673,7 +964,9 @@ def _gated_rms(core, gate, weight, eps):
     """The epilogue's BF16 materialization boundary, shared by both readouts."""
     inverse_rms = gl.rsqrt(gl.sum(core * core, 1) / 128 + eps)
     sigmoid = 1.0 / (1.0 + gl.exp(-gate))
-    return (core * inverse_rms[:, None] * weight[None, :] * gate * sigmoid).to(gl.bfloat16)
+    return (core * inverse_rms[:, None] * weight[None, :] * gate * sigmoid).to(
+        gl.bfloat16
+    )
 
 
 @gluon.jit
@@ -685,11 +978,32 @@ def _quantize_group(normalized, maximum, inverse_maximum):
     return encoded, group_scale
 
 
-@gluon.jit
-def _chunk_output_quant(QKV, Updates, Scores, Coeff, Starts, ChunkState,
-                         Projected, Weight, Normalized, Quantized, Scales, scale, eps,
-                         maximum, inverse_maximum, M: gl.constexpr, BATCH: gl.constexpr,
-                         BT: gl.constexpr):
+_chunk_output_quant_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_chunk_output_quant", ["M", "BATCH", "BT"]
+)
+
+
+@gluon.jit(repr=_chunk_output_quant_repr)
+def _chunk_output_quant(
+    QKV,
+    Updates,
+    Scores,
+    Coeff,
+    Starts,
+    ChunkState,
+    Projected,
+    Weight,
+    Normalized,
+    Quantized,
+    Scales,
+    scale,
+    eps,
+    maximum,
+    inverse_maximum,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+):
     chunk = gl.program_id(0)
     head = gl.program_id(1)
     seq, first, end = _chunk_bounds(Starts, chunk, BATCH, BT)
@@ -707,7 +1021,9 @@ def _chunk_output_quant(QKV, Updates, Scores, Coeff, Starts, ChunkState,
         ft = gl.arange(0, BT, layout=gl.SliceLayout(0, layout))
         factor_offset = base * 128 + fk[:, None] * BT + ft[None, :]
         updates = gl.load(Updates + factor_offset).trans()
-        query = gl.amd.cdna3.buffer_load(QKV, ((head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]).to(gl.float32)
+        query = gl.amd.cdna3.buffer_load(
+            QKV, ((head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]
+        ).to(gl.float32)
         prefix = gl.load(Coeff + (chunk * 8 + head) * 2 * BT + i)
         scores = gl.amd.cdna3.buffer_load(Scores, (base + i[:, None]) * BT + j[None, :])
         weighted_query = query * prefix[:, None]
@@ -716,8 +1032,16 @@ def _chunk_output_quant(QKV, Updates, Scores, Coeff, Starts, ChunkState,
         out = _dot_f32(weighted_query, h, local_output) * scale
         core = gl.convert_layout(out, layout).to(gl.bfloat16).to(gl.float32)
         token = first + i
-        gate = gl.load(Projected + token[:, None] * 3072 + (head // 2) * 768
-                       + 512 + (head % 2) * 128 + k[None, :], token[:, None] < end, 0).to(gl.float32)
+        gate = gl.load(
+            Projected
+            + token[:, None] * 3072
+            + (head // 2) * 768
+            + 512
+            + (head % 2) * 128
+            + k[None, :],
+            token[:, None] < end,
+            0,
+        ).to(gl.float32)
         weight = gl.load(Weight + k).to(gl.float32)
         normalized = _gated_rms(core, gate, weight, eps)
         offset = (token[:, None] * 8 + head) * 128 + k[None, :]
@@ -727,13 +1051,47 @@ def _chunk_output_quant(QKV, Updates, Scores, Coeff, Starts, ChunkState,
         gl.store(Scales + token * 8 + head, group_scale, token < end)
 
 
-@gluon.jit
+_state_and_core_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_state_and_core",
+    [
+        "M",
+        "BATCH",
+        "BT",
+        "SEG",
+        "BV",
+        "NW",
+        "WM",
+        "TIME_MAJOR",
+        "UNIT_MAJOR",
+        "TRANSPOSED",
+    ],
+)
+
+
+@gluon.jit(repr=_state_and_core_repr)
 def _state_and_core(
-    QKV, U, W, Scores, Coeff, State, Indices, Starts, SegmentState, Core, scale,
-    M: gl.constexpr, BATCH: gl.constexpr, BT: gl.constexpr, SEG: gl.constexpr,
-    BV: gl.constexpr, NW: gl.constexpr, WM: gl.constexpr,
-    TIME_MAJOR: gl.constexpr = False, UNIT_MAJOR: gl.constexpr = False,
-    TailKey=None, TRANSPOSED: gl.constexpr = True,
+    QKV,
+    U,
+    W,
+    Scores,
+    Coeff,
+    State,
+    Indices,
+    Starts,
+    SegmentState,
+    Core,
+    scale,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    SEG: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    WM: gl.constexpr,
+    TIME_MAJOR: gl.constexpr = False,
+    UNIT_MAJOR: gl.constexpr = False,
+    TailKey=None,
+    TRANSPOSED: gl.constexpr = True,
 ):
     unit, head, vblock = _recurrence_ids(UNIT_MAJOR)
     if SEG == 0:
@@ -751,16 +1109,24 @@ def _state_and_core(
         first_chunk = begin // BT + seq + (first - begin) // BT
         count = gl.cdiv(end - first, BT)
         mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[16, 16, 4], transposed=TRANSPOSED,
-            warps_per_cta=[WM, NW // WM])
+            version=4,
+            instr_shape=[16, 16, 4],
+            transposed=TRANSPOSED,
+            warps_per_cta=[WM, NW // WM],
+        )
         layout: gl.constexpr = gl.BlockedLayout([1, 2], [4, 16], [NW, 1], [1, 0])
         vr = vblock * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, mma))
         kc = gl.arange(0, 128, layout=gl.SliceLayout(0, mma))
         if SEG == 0:
-            h = gl.load(State + ((slot * 8 + head) * 128 + vr[:, None]) * 128 + kc[None, :])
+            h = gl.load(
+                State + ((slot * 8 + head) * 128 + vr[:, None]) * 128 + kc[None, :]
+            )
         else:
-            h = gl.load(SegmentState + (((unit * 8 + head) * 2 + 1) * 128
-                                       + vr[:, None]) * 128 + kc[None, :])
+            h = gl.load(
+                SegmentState
+                + (((unit * 8 + head) * 2 + 1) * 128 + vr[:, None]) * 128
+                + kc[None, :]
+            )
         i = gl.arange(0, BT, layout=gl.SliceLayout(1, layout))
         j = gl.arange(0, BT, layout=gl.SliceLayout(0, layout))
         k = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
@@ -773,52 +1139,110 @@ def _state_and_core(
                 key, tail, decay = _load_key_decay(QKV, Coeff, chunk, head, i, k, M, BT)
             else:
                 key, decay = _load_tail_key(
-                    TailKey, Coeff, chunk, head, BT, (WM, NW // WM), TRANSPOSED)
+                    TailKey, Coeff, chunk, head, BT, (WM, NW // WM), TRANSPOSED
+                )
             # These narrow, preweighted-key grids benefit from overlapping the
             # independent readout loads with the recurrent factor projection.
             if TailKey is not None:
-                query = gl.amd.cdna3.buffer_load(QKV, ((head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]).to(gl.float32)
+                query = gl.amd.cdna3.buffer_load(
+                    QKV, ((head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]
+                ).to(gl.float32)
                 prefix = gl.load(Coeff + (chunk * 8 + head) * 2 * BT + i)
-                scores = gl.amd.cdna3.buffer_load(Scores, (base + i[:, None]) * BT + j[None, :])
+                scores = gl.amd.cdna3.buffer_load(
+                    Scores, (base + i[:, None]) * BT + j[None, :]
+                )
             u, w = _load_recurrent_factors(
-                U, W, base, vblock, BT, BV, (WM, NW // WM), TIME_MAJOR, TRANSPOSED)
+                U, W, base, vblock, BT, BV, (WM, NW // WM), TIME_MAJOR, TRANSPOSED
+            )
             delta = _dot_f32(h, w, u, (WM, NW // WM), TRANSPOSED=TRANSPOSED)
             if TailKey is None:
-                query = gl.amd.cdna3.buffer_load(QKV, ((head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]).to(gl.float32)
+                query = gl.amd.cdna3.buffer_load(
+                    QKV, ((head // 2) * M + chunk * BT + i[:, None]) * 128 + k[None, :]
+                ).to(gl.float32)
                 prefix = gl.load(Coeff + (chunk * 8 + head) * 2 * BT + i)
-                scores = gl.amd.cdna3.buffer_load(Scores, (base + i[:, None]) * BT + j[None, :])
+                scores = gl.amd.cdna3.buffer_load(
+                    Scores, (base + i[:, None]) * BT + j[None, :]
+                )
             local_output = _dot_f32(
-                delta, scores.trans(), WARPS=(WM, NW // WM), TRANSPOSED=TRANSPOSED)
-            y = _dot_f32(h, (query * prefix[:, None]).trans(), local_output,
-                         (WM, NW // WM), TRANSPOSED=TRANSPOSED) * scale
+                delta, scores.trans(), WARPS=(WM, NW // WM), TRANSPOSED=TRANSPOSED
+            )
+            y = (
+                _dot_f32(
+                    h,
+                    (query * prefix[:, None]).trans(),
+                    local_output,
+                    (WM, NW // WM),
+                    TRANSPOSED=TRANSPOSED,
+                )
+                * scale
+            )
             output_token = first + local * BT + output_t
-            gl.store(Core + (output_token[None, :] * 8 + head) * 128 + vr[:, None],
-                     y.to(gl.bfloat16), output_token[None, :] < end)
+            gl.store(
+                Core + (output_token[None, :] * 8 + head) * 128 + vr[:, None],
+                y.to(gl.bfloat16),
+                output_token[None, :] < end,
+            )
             if TailKey is None:
-                h = _dot_f32(delta, key * tail[:, None], h * decay,
-                             (WM, NW // WM), TRANSPOSED=TRANSPOSED)
+                h = _dot_f32(
+                    delta,
+                    key * tail[:, None],
+                    h * decay,
+                    (WM, NW // WM),
+                    TRANSPOSED=TRANSPOSED,
+                )
             else:
-                h = _dot_f32(delta, key, h * decay,
-                             (WM, NW // WM), TRANSPOSED=TRANSPOSED)
+                h = _dot_f32(
+                    delta, key, h * decay, (WM, NW // WM), TRANSPOSED=TRANSPOSED
+                )
         if end == seq_end:
-            gl.store(State + ((slot * 8 + head) * 128 + vr[:, None]) * 128 + kc[None, :], h)
+            gl.store(
+                State + ((slot * 8 + head) * 128 + vr[:, None]) * 128 + kc[None, :], h
+            )
 
 
-@gluon.jit
-def _normalize_quantize(Core, Projected, Weight, Normalized, Quantized, Scales,
-                        eps, maximum, inverse_maximum, M: gl.constexpr,
-                        ROWS: gl.constexpr, NW: gl.constexpr):
+_normalize_quantize_repr = make_kernel_repr(
+    "gdn_prefill_m12289_16384_b1_5_normalize_quantize", ["M", "ROWS", "NW"]
+)
+
+
+@gluon.jit(repr=_normalize_quantize_repr)
+def _normalize_quantize(
+    Core,
+    Projected,
+    Weight,
+    Normalized,
+    Quantized,
+    Scales,
+    eps,
+    maximum,
+    inverse_maximum,
+    M: gl.constexpr,
+    ROWS: gl.constexpr,
+    NW: gl.constexpr,
+):
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [NW, 1], [1, 0])
     row = gl.program_id(0) * ROWS + gl.arange(0, ROWS, layout=gl.SliceLayout(1, layout))
     c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
     token = row // 8
     head = row % 8
-    x = gl.load(Core + row[:, None] * 128 + c[None, :], row[:, None] < M * 8, 0).to(gl.float32)
-    gate = gl.load(Projected + token[:, None] * 3072 + (head[:, None] // 2) * 768
-                   + 512 + (head[:, None] % 2) * 128 + c[None, :], row[:, None] < M * 8, 0).to(gl.float32)
+    x = gl.load(Core + row[:, None] * 128 + c[None, :], row[:, None] < M * 8, 0).to(
+        gl.float32
+    )
+    gate = gl.load(
+        Projected
+        + token[:, None] * 3072
+        + (head[:, None] // 2) * 768
+        + 512
+        + (head[:, None] % 2) * 128
+        + c[None, :],
+        row[:, None] < M * 8,
+        0,
+    ).to(gl.float32)
     weight = gl.load(Weight + c).to(gl.float32)
     normalized = _gated_rms(x, gate, weight, eps)
-    gl.store(Normalized + row[:, None] * 128 + c[None, :], normalized, row[:, None] < M * 8)
+    gl.store(
+        Normalized + row[:, None] * 128 + c[None, :], normalized, row[:, None] < M * 8
+    )
     encoded, group_scale = _quantize_group(normalized, maximum, inverse_maximum)
     gl.store(Quantized + row[:, None] * 128 + c[None, :], encoded, row[:, None] < M * 8)
     gl.store(Scales + row, group_scale, row < M * 8)
@@ -870,12 +1294,18 @@ def _schedule(m: int, batch: int) -> _Schedule:
         segment = 512
     else:
         segment = 256
-    core_rows = (64 if wide or m >= 32768 else 32) if segment else (32 if batch < 32 else 64)
+    core_rows = (
+        (64 if wide or m >= 32768 else 32) if segment else (32 if batch < 32 else 64)
+    )
     fused_core = segment != 0 or batch >= 8
-    build_rows = 128 if wide or (batch == 1 and m >= 32768) else (64 if m >= 16384 else 32)
+    build_rows = (
+        128 if wide or (batch == 1 and m >= 32768) else (64 if m >= 16384 else 32)
+    )
     reverse_columns = 0
     if segment and m // segment + batch >= 16:
-        reverse_columns = 64 if build_rows == 128 or (3 <= batch <= 4 and m >= 24576) else 32
+        reverse_columns = (
+            64 if build_rows == 128 or (3 <= batch <= 4 and m >= 24576) else 32
+        )
     return _Schedule(
         segment_tokens=segment,
         build_rows=build_rows,
@@ -883,7 +1313,8 @@ def _schedule(m: int, batch: int) -> _Schedule:
         prefix_rows=4 if batch == 1 else (8 if batch == 2 else 16),
         core_rows=core_rows,
         # Keep the established ownership of each recurrent path.
-        core_transposed=(segment != 0 or batch >= 32) and not (batch == 1 and m <= 1024),
+        core_transposed=(segment != 0 or batch >= 32)
+        and not (batch == 1 and m <= 1024),
         prep_warps=4 if m <= 2048 else 1,
         prep_tokens=4 if m <= 12288 else 8,
         norm_rows=16 if m > 8192 else 32,
@@ -893,8 +1324,7 @@ def _schedule(m: int, batch: int) -> _Schedule:
         time_major=batch >= 32,
         unit_major=segment != 0 and (m < 32768 or batch >= 3),
         preweight_key=(
-            not fused_core or (batch == 1 and m <= 1024)
-            or (batch == 8 and m <= 8192)
+            not fused_core or (batch == 1 and m <= 1024) or (batch == 8 and m <= 8192)
         ),
         prepare_bounds=batch >= 8 or (2 < batch < 8 and m <= 4096),
     )
@@ -928,31 +1358,61 @@ def gdn_prefill_group_fp8_quant(
     chunks = (m + bt - 1) // bt if batch == 1 else m // bt + batch
     # Separate direct, preweighted head planes by eight unused rows. Consumers
     # address only initialized chunk rows; the gap changes physical head pitch.
-    qkv_gap = 8 if schedule.fused_core and not schedule.segment_tokens and schedule.preweight_key else 0
+    qkv_gap = (
+        8
+        if schedule.fused_core
+        and not schedule.segment_tokens
+        and schedule.preweight_key
+        else 0
+    )
     qkv_rows = chunks * bt + qkv_gap
     qkv = torch.empty((16, qkv_rows, 128), device=device, dtype=torch.bfloat16)
     bounds = (
         torch.empty((chunks, 2), device=device, dtype=torch.int32)
-        if schedule.prepare_bounds else None
+        if schedule.prepare_bounds
+        else None
     )
     fused_gates = schedule.fused_gates
-    gates = projected_ba if fused_gates else torch.empty(
-        (8, 2, qkv_rows), device=device, dtype=torch.float32)
+    gates = (
+        projected_ba
+        if fused_gates
+        else torch.empty((8, 2, qkv_rows), device=device, dtype=torch.float32)
+    )
     normalized = torch.empty((m, 8, 128), device=device, dtype=torch.bfloat16)
     quantized = torch.empty((m, 1024), device=device, dtype=precision_config.dtype)
     scales = torch.empty((m, 8), device=device, dtype=torch.float32)
     prep_warps = schedule.prep_warps
     prep_tokens = schedule.prep_tokens
     _prepare_qkv_window[(chunks * 32 // (prep_tokens * prep_warps), 16)](
-        projected_qkvz, conv_state, cache_indices, cu_seqlens,
-        has_initial_state, conv_weight, conv_bias, qkv,
-        qkv_rows, batch, prep_tokens, prep_warps,
-        Bounds=bounds, num_warps=prep_warps, enable_fp_fusion=False,
+        projected_qkvz,
+        conv_state,
+        cache_indices,
+        cu_seqlens,
+        has_initial_state,
+        conv_weight,
+        conv_bias,
+        qkv,
+        qkv_rows,
+        batch,
+        prep_tokens,
+        prep_warps,
+        Bounds=bounds,
+        num_warps=prep_warps,
+        enable_fp_fusion=False,
     )
     if not fused_gates:
         _prepare_gates[(chunks,)](
-            projected_ba, cu_seqlens, a_log, dt_bias, gates,
-            qkv_rows, batch, bt, Bounds=bounds, num_warps=4, enable_fp_fusion=False,
+            projected_ba,
+            cu_seqlens,
+            a_log,
+            dt_bias,
+            gates,
+            qkv_rows,
+            batch,
+            bt,
+            Bounds=bounds,
+            num_warps=4,
+            enable_fp_fusion=False,
         )
     seg = schedule.segment_tokens
     fused_core = schedule.fused_core
@@ -963,45 +1423,97 @@ def gdn_prefill_group_fp8_quant(
     coeff = torch.empty((chunks, 8, 2, bt), device=device, dtype=torch.float32)
     tail_key = (
         torch.empty((chunks, 8, bt, 128), device=device, dtype=torch.float32)
-        if schedule.preweight_key else None
+        if schedule.preweight_key
+        else None
     )
     if fused_core:
         core = normalized
     else:
-        chunk_state = torch.empty((chunks, 8, 128, 128), device=device, dtype=torch.float32)
+        chunk_state = torch.empty(
+            (chunks, 8, 128, 128), device=device, dtype=torch.float32
+        )
     # Adjacent heads share the tiny-input factorization traversal.
     head_major = m <= 1024 and batch == 1
     factor_grid = (8, chunks) if head_major else (chunks, 8)
     _chunk_transform[factor_grid](
-        qkv, gates, u, w, scores, coeff,
-        qkv_rows, bt, num_warps=4, enable_fp_fusion=False,
-        TIME_MAJOR=time_major, BA=projected_ba, Starts=cu_seqlens,
-        ALog=a_log, DTBias=dt_bias, BATCH=batch, FUSED_GATES=fused_gates,
-        TailKey=tail_key, Bounds=bounds, HEAD_MAJOR=head_major,
+        qkv,
+        gates,
+        u,
+        w,
+        scores,
+        coeff,
+        qkv_rows,
+        bt,
+        num_warps=4,
+        enable_fp_fusion=False,
+        TIME_MAJOR=time_major,
+        BA=projected_ba,
+        Starts=cu_seqlens,
+        ALog=a_log,
+        DTBias=dt_bias,
+        BATCH=batch,
+        FUSED_GATES=fused_gates,
+        TailKey=tail_key,
+        Bounds=bounds,
+        HEAD_MAJOR=head_major,
     )
     if seg:
         segments = (m + seg - 1) // seg if batch == 1 else m // seg + batch
-        affine = torch.empty((segments, 8, 2, 128, 128), device=device, dtype=torch.float32)
+        affine = torch.empty(
+            (segments, 8, 2, 128, 128), device=device, dtype=torch.float32
+        )
         segment_state = affine
         build_bv = schedule.build_rows
         build_wm = 4 if build_bv == 128 else 2
         if schedule.reverse_columns:
             columns = schedule.reverse_columns
-            build_kernel = _build_segments_stacked if columns == 64 else _build_segments_reverse
+            build_kernel = (
+                _build_segments_stacked if columns == 64 else _build_segments_reverse
+            )
             build_kernel[(8, 128 // columns, segments)](
-                qkv, u, w, coeff, cu_seqlens, affine, qkv_rows, batch, bt, seg,
-                columns, 4, MMA_SIZE=32 if columns == 32 else 16,
-                num_warps=4, enable_fp_fusion=False,
+                qkv,
+                u,
+                w,
+                coeff,
+                cu_seqlens,
+                affine,
+                qkv_rows,
+                batch,
+                bt,
+                seg,
+                columns,
+                4,
+                MMA_SIZE=32 if columns == 32 else 16,
+                num_warps=4,
+                enable_fp_fusion=False,
             )
         else:
             _build_segments[(8, 2 * 128 // build_bv, segments)](
-                qkv, u, w, coeff, cu_seqlens, affine, qkv_rows, batch, bt, seg,
-                build_bv, 4, build_wm, TailKey=tail_key,
-                num_warps=4, enable_fp_fusion=False,
+                qkv,
+                u,
+                w,
+                coeff,
+                cu_seqlens,
+                affine,
+                qkv_rows,
+                batch,
+                bt,
+                seg,
+                build_bv,
+                4,
+                build_wm,
+                TailKey=tail_key,
+                num_warps=4,
+                enable_fp_fusion=False,
             )
         prefix_bv = schedule.prefix_rows
         _prefix_segments[(8, 128 // prefix_bv, batch)](
-            affine, delta_state, cache_indices, cu_seqlens, seg, prefix_bv,
+            affine,
+            delta_state,
+            cache_indices,
+            cu_seqlens,
+            seg,
+            prefix_bv,
             num_warps=2 if prefix_bv == 4 else 4,
             enable_fp_fusion=False,
         )
@@ -1009,21 +1521,52 @@ def gdn_prefill_group_fp8_quant(
         units = segments if seg else batch
         bv = schedule.core_rows
         core_grid = (
-            (8, 128 // bv, units)
-            if schedule.unit_major else (units, 8, 128 // bv)
+            (8, 128 // bv, units) if schedule.unit_major else (units, 8, 128 // bv)
         )
         _state_and_core[core_grid](
-            qkv, u, w, scores, coeff, delta_state, cache_indices, cu_seqlens,
-            segment_state if seg else delta_state, core,
-            scale, qkv_rows, batch, bt, seg, bv, 4, 2, num_warps=4, enable_fp_fusion=False,
-            TIME_MAJOR=time_major, UNIT_MAJOR=schedule.unit_major,
-            TailKey=tail_key, TRANSPOSED=schedule.core_transposed,
+            qkv,
+            u,
+            w,
+            scores,
+            coeff,
+            delta_state,
+            cache_indices,
+            cu_seqlens,
+            segment_state if seg else delta_state,
+            core,
+            scale,
+            qkv_rows,
+            batch,
+            bt,
+            seg,
+            bv,
+            4,
+            2,
+            num_warps=4,
+            enable_fp_fusion=False,
+            TIME_MAJOR=time_major,
+            UNIT_MAJOR=schedule.unit_major,
+            TailKey=tail_key,
+            TRANSPOSED=schedule.core_transposed,
         )
     else:
         bv, wm = 16, 1
         _chunk_state_rows[(batch, 8, 128 // bv)](
-            qkv, u, w, coeff, delta_state, cache_indices, cu_seqlens, chunk_state,
-            qkv_rows, bt, bv, 4, wm, num_warps=4, enable_fp_fusion=False,
+            qkv,
+            u,
+            w,
+            coeff,
+            delta_state,
+            cache_indices,
+            cu_seqlens,
+            chunk_state,
+            qkv_rows,
+            bt,
+            bv,
+            4,
+            wm,
+            num_warps=4,
+            enable_fp_fusion=False,
             TailKey=tail_key,
         )
     maximum = precision_config.group_quant_max
@@ -1031,14 +1574,42 @@ def gdn_prefill_group_fp8_quant(
     if fused_core:
         norm_rows = schedule.norm_rows
         _normalize_quantize[((m * 8 + norm_rows - 1) // norm_rows,)](
-            core, projected_qkvz, norm_weight, normalized, quantized, scales,
-            eps, maximum, inverse_maximum, m, norm_rows, schedule.norm_warps,
-            num_warps=schedule.norm_warps, enable_fp_fusion=False,
+            core,
+            projected_qkvz,
+            norm_weight,
+            normalized,
+            quantized,
+            scales,
+            eps,
+            maximum,
+            inverse_maximum,
+            m,
+            norm_rows,
+            schedule.norm_warps,
+            num_warps=schedule.norm_warps,
+            enable_fp_fusion=False,
         )
     else:
         _chunk_output_quant[(chunks, 8)](
-            qkv, u, scores, coeff, cu_seqlens, chunk_state, projected_qkvz, norm_weight,
-            normalized, quantized, scales, scale, eps, maximum, inverse_maximum,
-            qkv_rows, batch, bt, num_warps=4, enable_fp_fusion=False,
+            qkv,
+            u,
+            scores,
+            coeff,
+            cu_seqlens,
+            chunk_state,
+            projected_qkvz,
+            norm_weight,
+            normalized,
+            quantized,
+            scales,
+            scale,
+            eps,
+            maximum,
+            inverse_maximum,
+            qkv_rows,
+            batch,
+            bt,
+            num_warps=4,
+            enable_fp_fusion=False,
         )
     return normalized, conv_state, delta_state, quantized, scales

@@ -40,8 +40,6 @@ from typing import Optional, Tuple
 
 import torch
 
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-
 # NB: the Gluon tile kernels are imported lazily inside :func:`_load_tile`, not at
 # module load. That keeps this module -- and in particular
 # :func:`fused_gdn_prefill_qkvz_supported`, the gate a caller probes -- importable
@@ -50,8 +48,19 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # The only FP8 output dtype the gfx950 tiles emit (per-head group-128 quant).
 _QUANT_DTYPE = torch.float8_e4m3fn
+
+# Baked-in Qwen3-Next GDN topology. The gfx950 tiles hard-code this exact shape --
+# packed ``[M, 3072]`` qkvz / ``[M, 16]`` ba addressing, 8-value-head launch grids
+# and 2048 conv channels (see ``_gluon_kernels/.../fused_gdn_prefill_qkvz``). The
+# support gate rejects anything else so the caller falls back rather than letting
+# the fixed-stride tiles read out of bounds.
+_K_HEADS = 4  # query/key heads
+_V_HEADS = 8  # value heads (== 2 * _K_HEADS; also the z-gate head count)
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
+_CONV_CHANNELS = (2 * _K_HEADS + _V_HEADS) * _HEAD_DIM  # q + k + v conv = 2048
+_QKVZ_WIDTH = (2 * _K_HEADS + 2 * _V_HEADS) * _HEAD_DIM  # q + k + v + z = 3072
+_BA_WIDTH = 2 * _V_HEADS  # b + a gates = 16
 
 # Covered (tokens, batch) ranges. Full coverage holds for tokens in
 # [_MIN_TOKENS, _MAX_TOKENS] and batch in [1, _MAX_BATCH]; the ranges below only
@@ -59,6 +68,25 @@ _CONV_WIDTH = 4
 _MIN_TOKENS = 1024
 _MAX_TOKENS = 16384
 _MAX_BATCH = 64
+
+
+def _arch_supported() -> Tuple[bool, str]:
+    """gfx950 probe, guarded so architecture detection never raises at import.
+
+    ``arch_info`` detection can touch the driver (and has an unguarded GPU
+    fallback), so it is imported and called *here*, on the gate path, and any
+    detection failure is reported as unsupported -- keeping this module import-safe
+    on CPU-only / non-ROCm workers where the caller just takes the fallback chain.
+    """
+    try:
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        arch = get_arch()
+    except Exception as exc:  # pragma: no cover - detection is environment-specific
+        return False, f"architecture detection failed ({exc})"
+    if arch != "gfx950":
+        return False, f"gfx950 only, got {arch}"
+    return True, ""
 
 
 @functools.lru_cache(maxsize=1)
@@ -141,31 +169,56 @@ def fused_gdn_prefill_qkvz_supported(
     conv_weight: torch.Tensor,
     conv_bias: Optional[torch.Tensor],
     quant_dtype: Optional[torch.dtype] = None,
+    *,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    norm_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[bool, str]:
     """Report whether this call is covered, and if not, why.
 
     Returns ``(True, "")`` or ``(False, reason)``. The reason is meant to be
     logged once by the caller on its fallback path.
+
+    The gate is intentionally strict: the fixed-stride Gluon tiles assume the one
+    baked topology (``_K_HEADS``/``_V_HEADS``/``_HEAD_DIM``) and exact packed
+    widths, so every consumed tensor's shape, dtype, device and contiguity is
+    validated here -- a permissive gate that returned ``True`` for a mismatched
+    shape would let the tiles read out of bounds. ``a_log``/``dt_bias``/
+    ``norm_weight`` are optional so the gate can also be used as a cheap coverage
+    probe before those are materialized; when passed they are fully validated.
     """
-    if get_arch() != "gfx950":
-        return False, f"gfx950 only, got {get_arch()}"
+    arch_ok, arch_reason = _arch_supported()
+    if not arch_ok:
+        return False, arch_reason
 
     gluon_ok, gluon_reason = _gluon_supported()
     if not gluon_ok:
         return False, gluon_reason
 
-    tensors = (
-        projected_qkvz,
-        projected_ba,
-        conv_state,
-        delta_state,
-        cache_indices,
-        cu_seqlens,
-        has_initial_state,
-        conv_weight,
-    )
-    if not all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
-        return False, "all inputs must be CUDA tensors"
+    # --- every consumed tensor must be a CUDA tensor, contiguous, one device ---
+    required = {
+        "projected_qkvz": projected_qkvz,
+        "projected_ba": projected_ba,
+        "conv_state": conv_state,
+        "delta_state": delta_state,
+        "cache_indices": cache_indices,
+        "cu_seqlens": cu_seqlens,
+        "has_initial_state": has_initial_state,
+        "conv_weight": conv_weight,
+        "conv_bias": conv_bias,
+    }
+    optional = {"a_log": a_log, "dt_bias": dt_bias, "norm_weight": norm_weight}
+    named = {**required, **{k: v for k, v in optional.items() if v is not None}}
+    if conv_bias is None:
+        return False, "conv_bias is required (pass zeros if the model has none)"
+    for name, t in named.items():
+        if not isinstance(t, torch.Tensor) or not t.is_cuda:
+            return False, f"{name} must be a CUDA tensor"
+        if not t.is_contiguous():
+            return False, f"{name} must be contiguous"
+    device = projected_qkvz.device
+    if any(t.device != device for t in named.values()):
+        return False, "all inputs must be on the same device"
 
     if delta_state.ndim != 4 or conv_state.ndim != 3:
         return (
@@ -185,32 +238,46 @@ def fused_gdn_prefill_qkvz_supported(
             f"(tokens {_MIN_TOKENS}..{_MAX_TOKENS}, batch 1..{_MAX_BATCH})",
         )
 
-    # --- head topology --------------------------------------------------------
-    _, v_heads, head_v_dim, head_k_dim = delta_state.shape
-    if head_v_dim != _HEAD_DIM or head_k_dim != _HEAD_DIM:
-        return False, f"head dims must be {_HEAD_DIM}, got {head_k_dim}/{head_v_dim}"
-
-    channels = conv_state.shape[1]
-    if (channels - v_heads * head_v_dim) % (2 * head_k_dim):
-        return False, f"conv channel count {channels} is not 2*KH*KD + VH*VD"
-    k_heads = (channels - v_heads * head_v_dim) // (2 * head_k_dim)
-    if v_heads != 2 * k_heads:
+    # --- baked head topology (tiles hard-code _K_HEADS/_V_HEADS/_HEAD_DIM) -----
+    if tuple(delta_state.shape[1:]) != (_V_HEADS, _HEAD_DIM, _HEAD_DIM):
         return (
             False,
-            f"requires num_v_heads == 2 * num_k_heads, got {v_heads}/{k_heads}",
+            f"delta_state must be [N, {_V_HEADS}, {_HEAD_DIM}, {_HEAD_DIM}], got "
+            f"{tuple(delta_state.shape)}",
         )
-
-    # --- convolution layout ---------------------------------------------------
-    if conv_state.shape[2] != _CONV_WIDTH - 1 or conv_weight.shape != (
-        channels,
-        _CONV_WIDTH,
-    ):
+    if conv_state.shape[1] != _CONV_CHANNELS or conv_state.shape[2] != _CONV_WIDTH - 1:
         return (
             False,
-            f"conv width must be {_CONV_WIDTH}, got weight {tuple(conv_weight.shape)}",
+            f"conv_state must be [N, {_CONV_CHANNELS}, {_CONV_WIDTH - 1}], got "
+            f"{tuple(conv_state.shape)}",
         )
-    if conv_bias is None:
-        return False, "conv bias is required (pass zeros if the model has none)"
+
+    # --- packed projection widths (fixed-stride addressing) -------------------
+    if projected_qkvz.shape != (tokens, _QKVZ_WIDTH):
+        return (
+            False,
+            f"projected_qkvz must be [{tokens}, {_QKVZ_WIDTH}], got "
+            f"{tuple(projected_qkvz.shape)}",
+        )
+    if projected_ba.shape != (tokens, _BA_WIDTH):
+        return (
+            False,
+            f"projected_ba must be [{tokens}, {_BA_WIDTH}], got "
+            f"{tuple(projected_ba.shape)}",
+        )
+
+    # --- convolution weight/bias layout ---------------------------------------
+    if conv_weight.shape != (_CONV_CHANNELS, _CONV_WIDTH):
+        return (
+            False,
+            f"conv_weight must be [{_CONV_CHANNELS}, {_CONV_WIDTH}], got "
+            f"{tuple(conv_weight.shape)}",
+        )
+    if conv_bias.shape != (_CONV_CHANNELS,):
+        return (
+            False,
+            f"conv_bias must be [{_CONV_CHANNELS}], got {tuple(conv_bias.shape)}",
+        )
 
     # --- ragged-batch index tensors ------------------------------------------
     if cu_seqlens.dtype is not torch.int32 or cu_seqlens.shape != (batch + 1,):
@@ -235,8 +302,31 @@ def fused_gdn_prefill_qkvz_supported(
     bf16_args = (projected_qkvz, projected_ba, conv_state, conv_weight, conv_bias)
     if not all(t.dtype is torch.bfloat16 for t in bf16_args):
         return False, "packed projections and conv state/weight/bias must be bf16"
-    if not conv_state.is_contiguous() or not delta_state.is_contiguous():
-        return False, "conv and recurrent state pools must be contiguous"
+
+    # --- gating / norm parameters (validated when supplied) -------------------
+    if a_log is not None and (
+        a_log.shape != (_V_HEADS,) or a_log.dtype is not torch.float32
+    ):
+        return (
+            False,
+            f"a_log must be fp32 [{_V_HEADS}], got {a_log.dtype} {tuple(a_log.shape)}",
+        )
+    if dt_bias is not None and (
+        dt_bias.shape != (_V_HEADS,) or dt_bias.dtype is not torch.bfloat16
+    ):
+        return (
+            False,
+            f"dt_bias must be bf16 [{_V_HEADS}], got {dt_bias.dtype} "
+            f"{tuple(dt_bias.shape)}",
+        )
+    if norm_weight is not None and (
+        norm_weight.shape != (_HEAD_DIM,) or norm_weight.dtype is not torch.bfloat16
+    ):
+        return (
+            False,
+            f"norm_weight must be bf16 [{_HEAD_DIM}], got {norm_weight.dtype} "
+            f"{tuple(norm_weight.shape)}",
+        )
 
     if quant_dtype is not None and quant_dtype is not _QUANT_DTYPE:
         return False, f"only {_QUANT_DTYPE} output is supported, got {quant_dtype}"
@@ -262,16 +352,46 @@ def fused_gdn_prefill_qkvz(
     eps: float = 1.0e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused Qwen3-Next GDN prefill (conv + gating + chunked delta + gated
-    RMSNorm + group-128 FP8 quant) in a single Gluon launch.
+    RMSNorm + group-128 FP8 quant) as a tight set of Gluon launches -- the win is
+    the intra-launch fusion and the dropped intermediate HBM traffic, not a single
+    launch.
 
-    ``conv_state`` and ``delta_state`` are updated in place. Returns
-    ``(normalized_bf16, conv_state, delta_state, quantized_fp8, scales)`` where
-    ``normalized_bf16`` is the pre-quant RMSNorm output and ``quantized_fp8`` (a
-    ``torch.float8_e4m3fn`` tensor) + ``scales`` are the per-head group-128 FP8
-    activations for a block-FP8 ``out_proj``.
+    Narrow by design (gfx950 + Triton>=3.8 + the one baked topology); guard with
+    :func:`fused_gdn_prefill_qkvz_supported` and fall back to the four-kernel chain
+    when it returns ``False``.
 
-    Narrow by design; guard with :func:`fused_gdn_prefill_qkvz_supported` and
-    fall back to the four-kernel chain when it returns ``False``.
+    Args:
+        projected_qkvz: bf16 ``[tokens, 3072]`` packed in_proj_qkvz output
+            (``q|k|v|z`` interleaved per k-head).
+        projected_ba: bf16 ``[tokens, 16]`` packed ``b|a`` delta-rule gates.
+        conv_state: bf16 ``[N, 2048, 3]`` depthwise-conv history pool, updated
+            in place.
+        delta_state: fp32 ``[N, 8, 128, 128]`` recurrent state pool, updated in
+            place.
+        cache_indices: int32 ``[batch]`` slot index per sequence.
+        cu_seqlens: int32 ``[batch + 1]`` ragged sequence offsets.
+        has_initial_state: bool ``[batch]`` -- gates the conv history only (the
+            recurrent state is always seeded from ``delta_state``; the caller
+            zeroes fresh slots).
+        conv_weight: bf16 ``[2048, 4]`` depthwise conv weights.
+        conv_bias: bf16 ``[2048]`` conv bias (pass zeros if the model has none).
+        a_log: fp32 ``[8]`` per-v-head decay log-rate.
+        dt_bias: bf16 ``[8]`` per-v-head softplus bias.
+        norm_weight: bf16 ``[128]`` gated-RMSNorm weight.
+        scale: RMSNorm/quant scale (keyword-only).
+        eps: RMSNorm epsilon (keyword-only, default ``1e-6``).
+
+    Returns:
+        ``(normalized_bf16, conv_state, delta_state, quantized_fp8, scales)``:
+        ``normalized_bf16`` ``[tokens, 8, 128]`` is the pre-quant RMSNorm output;
+        ``quantized_fp8`` (``torch.float8_e4m3fn`` ``[tokens, 1024]``) + ``scales``
+        (``[tokens, 8]``) are the per-head group-128 FP8 activations a block-FP8
+        ``out_proj`` consumes directly. ``conv_state`` and ``delta_state`` are the
+        same (mutated) pool tensors passed in.
+
+    Raises:
+        ValueError: if the call is not supported (see
+            :func:`fused_gdn_prefill_qkvz_supported` for the exact contract).
     """
     ok, reason = fused_gdn_prefill_qkvz_supported(
         projected_qkvz,
@@ -284,6 +404,9 @@ def fused_gdn_prefill_qkvz(
         conv_weight,
         conv_bias,
         _QUANT_DTYPE,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        norm_weight=norm_weight,
     )
     if not ok:
         raise ValueError(f"fused_gdn_prefill_qkvz does not support this call: {reason}")

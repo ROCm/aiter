@@ -27,12 +27,16 @@ Each tile module is self-contained (its own ``@gluon.jit`` helpers and
 duplication is intentional and load-bearing for numerics.
 """
 
-from ._tile_m1024_3071 import gdn_prefill_group_fp8_quant as _prefill_m1024_3071
-from ._tile_m3072_16384 import gdn_prefill_group_fp8_quant as _prefill_m3072_16384
-from ._tile_m12289_16384_b1_5 import (
+from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m1024_3071 import (  # noqa: E501
+    gdn_prefill_group_fp8_quant as _prefill_m1024_3071,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m3072_16384 import (  # noqa: E501
+    gdn_prefill_group_fp8_quant as _prefill_m3072_16384,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m12289_16384_b1_5 import (  # noqa: E501
     gdn_prefill_group_fp8_quant as _prefill_m12289_16384_b1_5,
 )
-from ._tile_m12289_16384_b6_15 import (
+from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qkvz._tile_m12289_16384_b6_15 import (  # noqa: E501
     gdn_prefill_group_fp8_quant as _prefill_m12289_16384_b6_15,
 )
 

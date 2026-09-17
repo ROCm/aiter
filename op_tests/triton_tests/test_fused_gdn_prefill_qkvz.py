@@ -3,10 +3,10 @@
 
 """Tests for the fused Qwen3-Next GDN *prefill* kernel.
 
-Fuses, in one launch: packed qkvz/ba split, depthwise causal conv1d (with bias)
-+ SiLU, delta-rule gating, the fp32 chunked delta-rule scan over ragged
-sequences, gated RMSNorm with a SiLU gate, and a per-head group-128 FP8
-quantization epilogue.
+Fuses, in a tight set of Gluon launches (not a single launch): packed qkvz/ba
+split, depthwise causal conv1d (with bias) + SiLU, delta-rule gating, the fp32
+chunked delta-rule scan over ragged sequences, gated RMSNorm with a SiLU gate,
+and a per-head group-128 FP8 quantization epilogue.
 
 This is the *prefill sibling* of ``fused_gdn_decode_qkvz``. The per-token math is
 identical; prefill carries the conv window and the fp32 recurrent state
@@ -22,6 +22,10 @@ normalized value) or the tolerance comparison would be vacuous.
 
 import pytest
 import torch
+
+# Inputs are CUDA-only; skip the whole module on CPU-only workers before any
+# allocation runs (matches the sibling fused_kda decode test).
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 
 device = "cuda"
 
@@ -201,7 +205,9 @@ def make_inputs(seqlens, num_k_heads=4, head_dim=128, width=4, seed=0):
 
     return dict(
         projected_qkvz=(
-            torch.randn(m, num_k_heads * group_width, dtype=torch.bfloat16, device=device)
+            torch.randn(
+                m, num_k_heads * group_width, dtype=torch.bfloat16, device=device
+            )
             * 0.1
         ),
         projected_ba=torch.randn(
@@ -213,7 +219,12 @@ def make_inputs(seqlens, num_k_heads=4, head_dim=128, width=4, seed=0):
         )
         * 0.1,
         delta_state=torch.randn(
-            num_slots, num_v_heads, head_dim, head_dim, dtype=torch.float32, device=device
+            num_slots,
+            num_v_heads,
+            head_dim,
+            head_dim,
+            dtype=torch.float32,
+            device=device,
         )
         * 0.1,
         cache_indices=torch.arange(1, batch + 1, dtype=torch.int32, device=device),
@@ -408,9 +419,3 @@ def test_unsupported_shape_reports_reason():
     # On gfx950+Triton3.8 this is the tile-coverage reason; elsewhere it is the
     # arch/Triton gate. Either way it is a clean (False, reason), never a raise.
     assert ok is False and reason
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v", "-m", "not slow"]))

@@ -15,6 +15,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.extra import libdevice
 from triton.language.core import range as loop_range
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @dataclass(frozen=True)
@@ -27,13 +28,41 @@ class FP8PrecisionConfig:
 FP8_E4M3_FN = FP8PrecisionConfig(torch.float8_e4m3fn, 448.0, 448.0)
 
 
-@gluon.jit
+_convolve_sliding_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_convolve_sliding",
+    [
+        "M",
+        "BATCH",
+        "SEARCH_STEPS",
+        "PAD_BATCH",
+        "BT",
+        "GROUP",
+        "HIERARCHICAL",
+        "TOKENS",
+    ],
+)
+
+
+@gluon.jit(repr=_convolve_sliding_repr)
 def _convolve_sliding(
-    packed, pool, starts, indices, initial, weight, bias, prepared,
-    chunk_offsets, block_offsets,
-    M: gl.constexpr, BATCH: gl.constexpr, SEARCH_STEPS: gl.constexpr,
-    PAD_BATCH: gl.constexpr, BT: gl.constexpr, GROUP: gl.constexpr,
-    HIERARCHICAL: gl.constexpr, TOKENS: gl.constexpr,
+    packed,
+    pool,
+    starts,
+    indices,
+    initial,
+    weight,
+    bias,
+    prepared,
+    chunk_offsets,
+    block_offsets,
+    M: gl.constexpr,
+    BATCH: gl.constexpr,
+    SEARCH_STEPS: gl.constexpr,
+    PAD_BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    GROUP: gl.constexpr,
+    HIERARCHICAL: gl.constexpr,
+    TOKENS: gl.constexpr,
 ):
     # Two waves own either Q/K or the paired value heads.
     layout: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [2, 1], [1, 0])
@@ -54,18 +83,25 @@ def _convolve_sliding(
     slot = gl.load(indices + sequence)
     cached = gl.load(initial + sequence)
     channel_base = gl.where(
-        component == 0, kh * 128,
-        gl.where(component == 1, 512 + kh * 128,
-                 1024 + kh * 256 + (component - 2) * 128),
+        component == 0,
+        kh * 128,
+        gl.where(
+            component == 1, 512 + kh * 128, 1024 + kh * 256 + (component - 2) * 128
+        ),
     )
     channel = channel_base[:, None] + d[None, :]
     packed_channel = kh * 768 + component[:, None] * 128 + d[None, :]
     weight_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 2, 4], [1, 64, 1], [2, 1, 1], [2, 1, 0])
-    wc = gl.convert_layout(channel_base, gl.SliceLayout(1, gl.SliceLayout(2, weight_layout)))
+        [1, 2, 4], [1, 64, 1], [2, 1, 1], [2, 1, 0]
+    )
+    wc = gl.convert_layout(
+        channel_base, gl.SliceLayout(1, gl.SliceLayout(2, weight_layout))
+    )
     wd = gl.arange(0, 128, gl.SliceLayout(0, gl.SliceLayout(2, weight_layout)))
     wt = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(1, weight_layout)))
-    taps = gl.load(weight + (wc[:, None, None] + wd[None, :, None]) * 4 + wt[None, None, :])
+    taps = gl.load(
+        weight + (wc[:, None, None] + wd[None, :, None]) * 4 + wt[None, None, :]
+    )
     even, odd = gl.split(taps.reshape((2, 128, 2, 2)))
     w0, w2 = gl.split(even)
     w1, w3 = gl.split(odd)
@@ -89,7 +125,11 @@ def _convolve_sliding(
             conv = conv + x1 * w1
             conv = conv + x2 * w2
             conv = conv + x3 * w3
-            activated = gl.div_rn(conv, 1.0 + libdevice.exp(-conv)).to(gl.bfloat16).to(gl.float32)
+            activated = (
+                gl.div_rn(conv, 1.0 + libdevice.exp(-conv))
+                .to(gl.bfloat16)
+                .to(gl.float32)
+            )
             result = activated
             if role == 0:
                 inverse_norm = gl.rsqrt(gl.sum(activated * activated, 1) + 1.0e-6)
@@ -97,18 +137,30 @@ def _convolve_sliding(
             gl.store(prepared + current_token * 2048 + channel, result)
             x0, x1, x2 = x1, x2, x3
     else:
-        x0 = gl.load(packed + (token - 3) * 3072 + packed_channel,
-                     token - 3 >= begin, other=0).to(gl.float32)
-        x1 = gl.load(packed + (token - 2) * 3072 + packed_channel,
-                     token - 2 >= begin, other=0).to(gl.float32)
-        x2 = gl.load(packed + (token - 1) * 3072 + packed_channel,
-                     token - 1 >= begin, other=0).to(gl.float32)
-        h0 = gl.load(pool + (slot * 2048 + channel) * 3 + token - begin,
-                     (token - 3 < begin) & cached, other=0).to(gl.float32)
-        h1 = gl.load(pool + (slot * 2048 + channel) * 3 + token - begin + 1,
-                     (token - 2 < begin) & cached, other=0).to(gl.float32)
-        h2 = gl.load(pool + (slot * 2048 + channel) * 3 + token - begin + 2,
-                     (token - 1 < begin) & cached, other=0).to(gl.float32)
+        x0 = gl.load(
+            packed + (token - 3) * 3072 + packed_channel, token - 3 >= begin, other=0
+        ).to(gl.float32)
+        x1 = gl.load(
+            packed + (token - 2) * 3072 + packed_channel, token - 2 >= begin, other=0
+        ).to(gl.float32)
+        x2 = gl.load(
+            packed + (token - 1) * 3072 + packed_channel, token - 1 >= begin, other=0
+        ).to(gl.float32)
+        h0 = gl.load(
+            pool + (slot * 2048 + channel) * 3 + token - begin,
+            (token - 3 < begin) & cached,
+            other=0,
+        ).to(gl.float32)
+        h1 = gl.load(
+            pool + (slot * 2048 + channel) * 3 + token - begin + 1,
+            (token - 2 < begin) & cached,
+            other=0,
+        ).to(gl.float32)
+        h2 = gl.load(
+            pool + (slot * 2048 + channel) * 3 + token - begin + 2,
+            (token - 1 < begin) & cached,
+            other=0,
+        ).to(gl.float32)
         x0 = gl.where(token - 3 >= begin, x0, h0)
         x1 = gl.where(token - 2 >= begin, x1, h1)
         x2 = gl.where(token - 1 >= begin, x2, h2)
@@ -126,48 +178,92 @@ def _convolve_sliding(
                     end = gl.load(starts + sequence + 1)
                     slot = gl.load(indices + sequence)
                     cached = gl.load(initial + sequence)
-                    x0 = gl.load(pool + (slot * 2048 + channel) * 3,
-                                 cached & (current_token < M), other=0).to(gl.float32)
-                    x1 = gl.load(pool + (slot * 2048 + channel) * 3 + 1,
-                                 cached & (current_token < M), other=0).to(gl.float32)
-                    x2 = gl.load(pool + (slot * 2048 + channel) * 3 + 2,
-                                 cached & (current_token < M), other=0).to(gl.float32)
-            x3 = gl.load(packed + current_token * 3072 + packed_channel,
-                         current_token < M, other=0).to(gl.float32)
+                    x0 = gl.load(
+                        pool + (slot * 2048 + channel) * 3,
+                        cached & (current_token < M),
+                        other=0,
+                    ).to(gl.float32)
+                    x1 = gl.load(
+                        pool + (slot * 2048 + channel) * 3 + 1,
+                        cached & (current_token < M),
+                        other=0,
+                    ).to(gl.float32)
+                    x2 = gl.load(
+                        pool + (slot * 2048 + channel) * 3 + 2,
+                        cached & (current_token < M),
+                        other=0,
+                    ).to(gl.float32)
+            x3 = gl.load(
+                packed + current_token * 3072 + packed_channel,
+                current_token < M,
+                other=0,
+            ).to(gl.float32)
             conv = b + x0 * w0
             conv = conv + x1 * w1
             conv = conv + x2 * w2
             conv = conv + x3 * w3
-            activated = gl.div_rn(conv, 1.0 + libdevice.exp(-conv)).to(gl.bfloat16).to(gl.float32)
+            activated = (
+                gl.div_rn(conv, 1.0 + libdevice.exp(-conv))
+                .to(gl.bfloat16)
+                .to(gl.float32)
+            )
             result = activated
             if role == 0:
                 inverse_norm = gl.rsqrt(gl.sum(activated * activated, 1) + 1.0e-6)
                 result = activated * inverse_norm[:, None]
-            gl.store(prepared + current_token * 2048 + channel, result, current_token < M)
+            gl.store(
+                prepared + current_token * 2048 + channel, result, current_token < M
+            )
             x0, x1, x2 = x1, x2, x3
     if (gl.program_id(0) == 0) & (gl.program_id(1) == 0) & (role == 0):
-        _write_offsets(starts, chunk_offsets, block_offsets, BATCH,
-                       PAD_BATCH, BT, GROUP, HIERARCHICAL, 2)
+        _write_offsets(
+            starts,
+            chunk_offsets,
+            block_offsets,
+            BATCH,
+            PAD_BATCH,
+            BT,
+            GROUP,
+            HIERARCHICAL,
+            2,
+        )
 
 
 @gluon.jit
-def _update_conv_pool(packed, pool, starts, indices, initial,
-                      sequence, channel_block, BLOCK: gl.constexpr):
+def _update_conv_pool(
+    packed, pool, starts, indices, initial, sequence, channel_block, BLOCK: gl.constexpr
+):
     c = channel_block * BLOCK + gl.arange(
-        0, BLOCK, layout=gl.BlockedLayout([1], [64], [4], [0]))
+        0, BLOCK, layout=gl.BlockedLayout([1], [64], [4], [0])
+    )
     begin = gl.load(starts + sequence)
     end = gl.load(starts + sequence + 1)
     slot = gl.load(indices + sequence)
     cached = gl.load(initial + sequence)
-    packed_c = gl.where(c < 512, (c // 128) * 768 + c % 128,
-                       gl.where(c < 1024, ((c - 512) // 128) * 768 + 128 + c % 128,
-                                ((c - 1024) // 256) * 768 + 256 + c % 256))
-    h0 = gl.load(pool + (slot * 2048 + c) * 3 + (end - begin),
-                 (end - 3 < begin) & cached, other=0)
-    h1 = gl.load(pool + (slot * 2048 + c) * 3 + (end - begin + 1),
-                 (end - 2 < begin) & cached, other=0)
-    h2 = gl.load(pool + (slot * 2048 + c) * 3 + (end - begin + 2),
-                 (end - 1 < begin) & cached, other=0)
+    packed_c = gl.where(
+        c < 512,
+        (c // 128) * 768 + c % 128,
+        gl.where(
+            c < 1024,
+            ((c - 512) // 128) * 768 + 128 + c % 128,
+            ((c - 1024) // 256) * 768 + 256 + c % 256,
+        ),
+    )
+    h0 = gl.load(
+        pool + (slot * 2048 + c) * 3 + (end - begin),
+        (end - 3 < begin) & cached,
+        other=0,
+    )
+    h1 = gl.load(
+        pool + (slot * 2048 + c) * 3 + (end - begin + 1),
+        (end - 2 < begin) & cached,
+        other=0,
+    )
+    h2 = gl.load(
+        pool + (slot * 2048 + c) * 3 + (end - begin + 2),
+        (end - 1 < begin) & cached,
+        other=0,
+    )
     x0 = gl.load(packed + (end - 3) * 3072 + packed_c, end - 3 >= begin, other=0)
     x1 = gl.load(packed + (end - 2) * 3072 + packed_c, end - 2 >= begin, other=0)
     x2 = gl.load(packed + (end - 1) * 3072 + packed_c, end - 1 >= begin, other=0)
@@ -188,9 +284,15 @@ def _multiply_prefix(a, b):
 
 @gluon.jit
 def _write_offsets(
-    starts, chunk_offsets, block_offsets,
-    BATCH: gl.constexpr, PAD_BATCH: gl.constexpr, BT: gl.constexpr,
-    GROUP: gl.constexpr, HIERARCHICAL: gl.constexpr, NW: gl.constexpr,
+    starts,
+    chunk_offsets,
+    block_offsets,
+    BATCH: gl.constexpr,
+    PAD_BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    GROUP: gl.constexpr,
+    HIERARCHICAL: gl.constexpr,
+    NW: gl.constexpr,
 ):
     # One convolution CTA publishes the offsets. The next launch consumes them.
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
@@ -258,13 +360,20 @@ def _store_chunk_accumulator(pointer, value, M: gl.constexpr, N: gl.constexpr):
 def _load_chunk_u(base, row, col, BT: gl.constexpr, NATIVE: gl.constexpr):
     # Keep the record base scalar for both dense and accumulator-packed U.
     if NATIVE:
-        return gl.amd.cdna4.buffer_load(base + BT * 128, _accumulator_offset(row, col, BT))
+        return gl.amd.cdna4.buffer_load(
+            base + BT * 128, _accumulator_offset(row, col, BT)
+        )
     return gl.amd.cdna4.buffer_load(base + BT * 128, row * BT + col)
 
 
 @gluon.jit
-def _load_matrix_rhs(pointer, K: gl.constexpr, N: gl.constexpr,
-                     mma: gl.constexpr, PACKED: gl.constexpr = True):
+def _load_matrix_rhs(
+    pointer,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    mma: gl.constexpr,
+    PACKED: gl.constexpr = True,
+):
     if not PACKED:
         standard_layout: gl.constexpr = gl.DotOperandLayout(1, mma, 1)
         row = gl.arange(0, K, gl.SliceLayout(1, standard_layout))
@@ -284,7 +393,11 @@ def _load_matrix_rhs(pointer, K: gl.constexpr, N: gl.constexpr,
     n_warps: gl.constexpr = [] if WN == 1 else [[256]]
     layout: gl.constexpr = gl.DistributedLinearLayout(
         [[1], [2]] + n_registers + k_registers,
-        [[4], [8], [16], [32], [64], [128]], n_warps + m_warps, [], [K * N])
+        [[4], [8], [16], [32], [64], [128]],
+        n_warps + m_warps,
+        [],
+        [K * N],
+    )
     index = gl.arange(0, K * N, layout)
     packed = gl.amd.cdna4.buffer_load(pointer, index)
     value = (
@@ -298,8 +411,14 @@ def _load_matrix_rhs(pointer, K: gl.constexpr, N: gl.constexpr,
 
 @gluon.jit
 def _load_scaled_qk(
-    base, raw_qk, qk_factors, record, BT: gl.constexpr,
-    mma: gl.constexpr, PACKED: gl.constexpr, COMPACT_QK: gl.constexpr,
+    base,
+    raw_qk,
+    qk_factors,
+    record,
+    BT: gl.constexpr,
+    mma: gl.constexpr,
+    PACKED: gl.constexpr,
+    COMPACT_QK: gl.constexpr,
     IS_Q: gl.constexpr,
 ):
     if COMPACT_QK:
@@ -333,7 +452,8 @@ def _solve_diagonal_blocks(triangular, BT: gl.constexpr):
     columns = (r // IB)[:, None] * IB + c[None, :]
     diagonal = gl.gather(matrix, columns, 1)
     local_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 1], [1, 8, 8], [4, 1, 1], [2, 1, 0])
+        [1, 1, 1], [1, 8, 8], [4, 1, 1], [2, 1, 0]
+    )
     diagonal = gl.convert_layout(diagonal.reshape((4, IB, IB)), local_layout)
     for pivot in gl.static_range(1, IB - 1):
         row_index = gl.full((4, 1, IB), pivot, gl.int32, local_layout)
@@ -349,13 +469,31 @@ def _solve_diagonal_blocks(triangular, BT: gl.constexpr):
     return gl.convert_layout(expanded, triangular.type.layout)
 
 
-@gluon.jit
+_prepare_chunk_matrices_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_prepare_chunk_matrices",
+    ["BATCH", "SEARCH_STEPS", "BT", "PACKED", "COMPACT_QK", "NATIVE_U"],
+)
+
+
+@gluon.jit(repr=_prepare_chunk_matrices_repr)
 def _prepare_chunk_matrices(
-    prepared, packed_ba, a_log, dt_bias, starts, offsets,
-    matrices, output_weights, chunk_decay, chunk_begin,
-    BATCH: gl.constexpr, SEARCH_STEPS: gl.constexpr, BT: gl.constexpr,
+    prepared,
+    packed_ba,
+    a_log,
+    dt_bias,
+    starts,
+    offsets,
+    matrices,
+    output_weights,
+    chunk_decay,
+    chunk_begin,
+    BATCH: gl.constexpr,
+    SEARCH_STEPS: gl.constexpr,
+    BT: gl.constexpr,
     PACKED: gl.constexpr = True,
-    COMPACT_QK: gl.constexpr = False, raw_qk=None, qk_factors=None,
+    COMPACT_QK: gl.constexpr = False,
+    raw_qk=None,
+    qk_factors=None,
     NATIVE_U: gl.constexpr = False,
 ):
     # Each chunk stores W.T, U.T, scaled K, and scaled Q.T. The recurrence is
@@ -384,12 +522,21 @@ def _prepare_chunk_matrices(
         k = gl.arange(0, 128, gl.SliceLayout(0, load_layout))
         token = begin + row
         valid = token < end
-        q = gl.load(prepared + token[:, None] * 2048 + (head // 2) * 128 + k[None, :],
-                    valid[:, None], other=0)
-        key = gl.load(prepared + token[:, None] * 2048 + 512 + (head // 2) * 128 + k[None, :],
-                      valid[:, None], other=0)
-        value = gl.load(prepared + token[:, None] * 2048 + 1024 + head * 128 + k[None, :],
-                        valid[:, None], other=0).to(gl.float32)
+        q = gl.load(
+            prepared + token[:, None] * 2048 + (head // 2) * 128 + k[None, :],
+            valid[:, None],
+            other=0,
+        )
+        key = gl.load(
+            prepared + token[:, None] * 2048 + 512 + (head // 2) * 128 + k[None, :],
+            valid[:, None],
+            other=0,
+        )
+        value = gl.load(
+            prepared + token[:, None] * 2048 + 1024 + head * 128 + k[None, :],
+            valid[:, None],
+            other=0,
+        ).to(gl.float32)
         ba_offset = token * 16 + (head // 2) * 4 + head % 2
         b = gl.load(packed_ba + ba_offset, valid, other=0).to(gl.float32)
         a = gl.load(packed_ba + ba_offset + 2, valid, other=0).to(gl.float32)
@@ -402,12 +549,16 @@ def _prepare_chunk_matrices(
         scan_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
         scan_input = gl.convert_layout(decay, scan_layout)
         scan_row = gl.arange(0, BT, scan_layout)
-        prefix = gl.convert_layout(gl.associative_scan(scan_input, 0, _multiply_prefix),
-                                   gl.SliceLayout(1, load_layout))
+        prefix = gl.convert_layout(
+            gl.associative_scan(scan_input, 0, _multiply_prefix),
+            gl.SliceLayout(1, load_layout),
+        )
         shifted = gl.gather(scan_input, gl.minimum(scan_row + 1, BT - 1), 0)
         shifted = gl.where(scan_row + 1 < BT, shifted, 1.0)
-        suffix = gl.convert_layout(gl.associative_scan(shifted, 0, _multiply_prefix, reverse=True),
-                                   gl.SliceLayout(1, load_layout))
+        suffix = gl.convert_layout(
+            gl.associative_scan(shifted, 0, _multiply_prefix, reverse=True),
+            gl.SliceLayout(1, load_layout),
+        )
         end_decay = gl.sum(gl.where(row == BT - 1, prefix, 0.0), 0)
         gl.store(chunk_decay + chunk * 8 + head, end_decay)
 
@@ -421,57 +572,81 @@ def _prepare_chunk_matrices(
         kk = gl.convert_layout(gl.amd.cdna4.mfma(key_a, key_b, zero_bf), fp_mma)
         qk = gl.convert_layout(gl.amd.cdna4.mfma(q_a, key_b, zero_bf), fp_mma)
         lower = row[:, None] > col[None, :]
-        causal_decay = gl.associative_scan(gl.where(lower, decay[:, None], 1.0),
-                                           0, _multiply_prefix)
+        causal_decay = gl.associative_scan(
+            gl.where(lower, decay[:, None], 1.0), 0, _multiply_prefix
+        )
         mma_row = gl.arange(0, BT, gl.SliceLayout(1, fp_mma))
         mma_col = gl.arange(0, BT, gl.SliceLayout(0, fp_mma))
         causal_mma = gl.convert_layout(causal_decay, fp_mma)
         beta_mma = gl.convert_layout(beta, gl.SliceLayout(1, fp_mma))
-        triangular = gl.where(mma_row[:, None] > mma_col[None, :],
-                              -beta_mma[:, None] * kk * causal_mma, 0.0)
+        triangular = gl.where(
+            mma_row[:, None] > mma_col[None, :],
+            -beta_mma[:, None] * kk * causal_mma,
+            0.0,
+        )
 
         IB: gl.constexpr = BT // 4
         diagonal_block = mma_row[:, None] // IB == mma_col[None, :] // IB
         diagonal = _solve_diagonal_blocks(triangular, BT)
-        diagonal_inverse = diagonal + (mma_row[:, None] == mma_col[None, :]).to(gl.float32)
+        diagonal_inverse = diagonal + (mma_row[:, None] == mma_col[None, :]).to(
+            gl.float32
+        )
         off_diagonal = gl.where(diagonal_block, 0.0, triangular)
         # Publish both operands together; retain the small diagonal tile
         # for its later use as a right-hand operand.
         diagonal_shared = gl.allocate_shared_memory(
-            gl.float32, (BT, BT), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]), diagonal_inverse)
+            gl.float32,
+            (BT, BT),
+            gl.SwizzledSharedLayout(4, 1, 8, [1, 0]),
+            diagonal_inverse,
+        )
         off_diagonal_shared = gl.allocate_shared_memory(
-            gl.float32, (BT, BT), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]), off_diagonal)
+            gl.float32, (BT, BT), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]), off_diagonal
+        )
         diagonal_a = diagonal_shared.load(gl.DotOperandLayout(0, fp_mma, 1))
         off_diagonal_b = off_diagonal_shared.load(gl.DotOperandLayout(1, fp_mma, 1))
         block_system = gl.amd.cdna4.mfma(
-            diagonal_a, off_diagonal_b, gl.zeros((BT, BT), gl.float32, fp_mma))
+            diagonal_a, off_diagonal_b, gl.zeros((BT, BT), gl.float32, fp_mma)
+        )
         # Contract only the active eight-column pivot block.
         pivot_shared = gl.allocate_shared_memory(
-            gl.float32, (BT, BT), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]))
+            gl.float32, (BT, BT), gl.SwizzledSharedLayout(4, 1, 8, [1, 0])
+        )
         for pivot in gl.static_range(1, 3):
             pivot_shared.store(block_system)
             left = pivot_shared.slice(pivot * IB, IB, dim=1).load(
-                gl.DotOperandLayout(0, fp_mma, 1))
+                gl.DotOperandLayout(0, fp_mma, 1)
+            )
             right = pivot_shared.slice(pivot * IB, IB, dim=0).load(
-                gl.DotOperandLayout(1, fp_mma, 1))
+                gl.DotOperandLayout(1, fp_mma, 1)
+            )
             block_system = gl.amd.cdna4.mfma(left, right, block_system)
         pivot_shared.store(block_system)
         diagonal_b = diagonal_shared.load(gl.DotOperandLayout(1, fp_mma, 1))
         inverse = gl.amd.cdna4.mfma(
-            pivot_shared.load(gl.DotOperandLayout(0, fp_mma, 1)), diagonal_b, diagonal_inverse)
+            pivot_shared.load(gl.DotOperandLayout(0, fp_mma, 1)),
+            diagonal_b,
+            diagonal_inverse,
+        )
         # W and U share the inverse and reuse a weighted-input staging tile.
         inverse_shared = gl.allocate_shared_memory(
-            gl.float32, (BT, BT), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]), inverse)
+            gl.float32, (BT, BT), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]), inverse
+        )
         weighted_shared = gl.allocate_shared_memory(
-            gl.float32, (BT, 128), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]),
-            key.to(gl.float32) * (beta * prefix)[:, None])
+            gl.float32,
+            (BT, 128),
+            gl.SwizzledSharedLayout(4, 1, 8, [1, 0]),
+            key.to(gl.float32) * (beta * prefix)[:, None],
+        )
         inverse_a = inverse_shared.load(gl.DotOperandLayout(0, fp_mma, 1))
         zero_fp = gl.zeros((BT, 128), gl.float32, fp_mma)
         w = gl.amd.cdna4.mfma(
-            inverse_a, weighted_shared.load(gl.DotOperandLayout(1, fp_mma, 1)), zero_fp)
+            inverse_a, weighted_shared.load(gl.DotOperandLayout(1, fp_mma, 1)), zero_fp
+        )
         weighted_shared.store(value * beta[:, None])
         u = gl.amd.cdna4.mfma(
-            inverse_a, weighted_shared.load(gl.DotOperandLayout(1, fp_mma, 1)), zero_fp)
+            inverse_a, weighted_shared.load(gl.DotOperandLayout(1, fp_mma, 1)), zero_fp
+        )
         scaled_key = key.to(gl.float32) * suffix[:, None]
         scaled_q = q.to(gl.float32) * prefix[:, None]
         base = matrices + (chunk * 8 + head) * (2 if COMPACT_QK else 4) * BT * 128
@@ -499,41 +674,87 @@ def _prepare_chunk_matrices(
         if NATIVE_U:
             _store_chunk_accumulator(base + BT * 128, u.T, 128, BT)
         else:
-            gl.store(base + BT * 128 + transposed_offset, gl.convert_layout(u.T, store_layout))
+            gl.store(
+                base + BT * 128 + transposed_offset,
+                gl.convert_layout(u.T, store_layout),
+            )
         if not COMPACT_QK:
             if PACKED:
                 _store_chunk_rhs(base + 3 * BT * 128, scaled_q.T, 128, BT)
             else:
-                gl.store(base + 3 * BT * 128 + transposed_offset,
-                         gl.convert_layout(scaled_q.T, store_layout))
-        output_matrix = gl.where(mma_row[:, None] >= mma_col[None, :], qk * causal_mma, 0.0)
+                gl.store(
+                    base + 3 * BT * 128 + transposed_offset,
+                    gl.convert_layout(scaled_q.T, store_layout),
+                )
+        output_matrix = gl.where(
+            mma_row[:, None] >= mma_col[None, :], qk * causal_mma, 0.0
+        )
         if PACKED:
-            _store_chunk_rhs(output_weights + (chunk * 8 + head) * BT * BT,
-                             output_matrix.T, BT, BT)
+            _store_chunk_rhs(
+                output_weights + (chunk * 8 + head) * BT * BT, output_matrix.T, BT, BT
+            )
         else:
-            gl.store(output_weights + (chunk * 8 + head) * BT * BT
-                     + col[None, :] * BT + row[:, None],
-                     gl.convert_layout(output_matrix, load_layout))
+            gl.store(
+                output_weights
+                + (chunk * 8 + head) * BT * BT
+                + col[None, :] * BT
+                + row[:, None],
+                gl.convert_layout(output_matrix, load_layout),
+            )
 
 
 @gluon.jit
-def _store_core_output(core, output, scale, begin, end, head, value_block,
-                       BT: gl.constexpr, BV: gl.constexpr, NW: gl.constexpr):
+def _store_core_output(
+    core,
+    output,
+    scale,
+    begin,
+    end,
+    head,
+    value_block,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+):
     layout: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [NW, 1], [1, 0])
     token = begin + gl.arange(0, BT, gl.SliceLayout(1, layout))
     value = value_block * BV + gl.arange(0, BV, gl.SliceLayout(0, layout))
     rounded = gl.convert_layout((output * scale).to(gl.bfloat16).T, layout)
-    gl.store(core + (token[:, None] * 8 + head) * 128 + value[None, :],
-             rounded, token[:, None] < end)
+    gl.store(
+        core + (token[:, None] * 8 + head) * 128 + value[None, :],
+        rounded,
+        token[:, None] < end,
+    )
 
 
-@gluon.jit
+_chunk_delta_recurrence_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_chunk_delta_recurrence",
+    ["BT", "BV", "NW", "WM", "PACKED", "TRANSPOSED", "PRELOAD", "COMPACT_QK"],
+)
+
+
+@gluon.jit(repr=_chunk_delta_recurrence_repr)
 def _chunk_delta_recurrence(
-    matrices, output_weights, chunk_decay, chunk_begin, offsets,
-    states, indices, starts, core, scale, BT: gl.constexpr, BV: gl.constexpr,
-    NW: gl.constexpr, WM: gl.constexpr = 1, PACKED: gl.constexpr = True,
-    TRANSPOSED: gl.constexpr = True, PRELOAD: gl.constexpr = 0,
-    COMPACT_QK: gl.constexpr = False, raw_qk=None, qk_factors=None,
+    matrices,
+    output_weights,
+    chunk_decay,
+    chunk_begin,
+    offsets,
+    states,
+    indices,
+    starts,
+    core,
+    scale,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    WM: gl.constexpr = 1,
+    PACKED: gl.constexpr = True,
+    TRANSPOSED: gl.constexpr = True,
+    PRELOAD: gl.constexpr = 0,
+    COMPACT_QK: gl.constexpr = False,
+    raw_qk=None,
+    qk_factors=None,
 ):
     sequence, head = gl.program_id(0), gl.program_id(1)
     mma: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 4], TRANSPOSED, [WM, NW // WM])
@@ -549,21 +770,42 @@ def _chunk_delta_recurrence(
     if BV >= 64:
         # Put each MFMA operand's four K registers next to each other.
         # The high-batch scan reuses this full tile for state and delta.
-        operand_layout: gl.constexpr = gl.SharedLinearLayout([
-            [0, 4], [0, 8],
-            [1, 0], [2, 0], [4, 0], [8, 0],
-            [0, 1], [0, 2],
-            [0, 16], [0, 32], [0, 64], [16, 0], [32, 0],
-        ])
-        operand_shared = gl.allocate_shared_memory(gl.float32, (BV, 128), operand_layout)
+        operand_layout: gl.constexpr = gl.SharedLinearLayout(
+            [
+                [0, 4],
+                [0, 8],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+                [0, 1],
+                [0, 2],
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [16, 0],
+                [32, 0],
+            ]
+        )
+        operand_shared = gl.allocate_shared_memory(
+            gl.float32, (BV, 128), operand_layout
+        )
     for chunk in range(first_chunk, last_chunk):
         base = matrices + (chunk * 8 + head) * (2 if COMPACT_QK else 4) * BT * 128
         w = _load_matrix_rhs(base, 128, BT, mma, PACKED=PACKED)
         u = gl.load(base + BT * 128 + (v[:, None] * BT + out_t[None, :]))
         if PRELOAD == 1:
             scaled_key = _load_scaled_qk(
-                base, raw_qk, qk_factors, chunk * 8 + head,
-                BT, mma, PACKED, COMPACT_QK, False)
+                base,
+                raw_qk,
+                qk_factors,
+                chunk * 8 + head,
+                BT,
+                mma,
+                PACKED,
+                COMPACT_QK,
+                False,
+            )
             decay = gl.load(chunk_decay + chunk * 8 + head)
         zero_delta = gl.zeros((BV, BT), gl.float32, mma)
         if BV >= 64:
@@ -574,15 +816,32 @@ def _chunk_delta_recurrence(
         projected = _float_matrix_product(state_a, w, zero_delta)
         delta = u - projected
         scaled_q = _load_scaled_qk(
-            base, raw_qk, qk_factors, chunk * 8 + head,
-            BT, mma, PACKED, COMPACT_QK, True)
+            base,
+            raw_qk,
+            qk_factors,
+            chunk * 8 + head,
+            BT,
+            mma,
+            PACKED,
+            COMPACT_QK,
+            True,
+        )
         y = _float_matrix_product(state_a, scaled_q, zero_delta)
-        output_matrix = _load_matrix_rhs(output_weights + (chunk * 8 + head) * BT * BT,
-                                         BT, BT, mma, PACKED=PACKED)
+        output_matrix = _load_matrix_rhs(
+            output_weights + (chunk * 8 + head) * BT * BT, BT, BT, mma, PACKED=PACKED
+        )
         if PRELOAD == 3:
             scaled_key = _load_scaled_qk(
-                base, raw_qk, qk_factors, chunk * 8 + head,
-                BT, mma, PACKED, COMPACT_QK, False)
+                base,
+                raw_qk,
+                qk_factors,
+                chunk * 8 + head,
+                BT,
+                mma,
+                PACKED,
+                COMPACT_QK,
+                False,
+            )
             decay = gl.load(chunk_decay + chunk * 8 + head)
         if BV >= 64:
             delta_shared = operand_shared.slice(0, BT, dim=1)
@@ -593,24 +852,57 @@ def _chunk_delta_recurrence(
         y = _float_matrix_product(delta_a, output_matrix, y)
         begin_token = gl.load(chunk_begin + chunk)
         if PACKED:
-            gl.store(core + ((begin_token + out_t[None, :]) * 8 + head) * 128 + v[:, None],
-                     y * scale, begin_token + out_t[None, :] < end_token)
+            gl.store(
+                core + ((begin_token + out_t[None, :]) * 8 + head) * 128 + v[:, None],
+                y * scale,
+                begin_token + out_t[None, :] < end_token,
+            )
         else:
-            _store_core_output(core, y, scale, begin_token, end_token, head,
-                               gl.program_id(2), BT, BV, NW)
+            _store_core_output(
+                core,
+                y,
+                scale,
+                begin_token,
+                end_token,
+                head,
+                gl.program_id(2),
+                BT,
+                BV,
+                NW,
+            )
         if PRELOAD == 0:
             scaled_key = _load_scaled_qk(
-                base, raw_qk, qk_factors, chunk * 8 + head,
-                BT, mma, PACKED, COMPACT_QK, False)
+                base,
+                raw_qk,
+                qk_factors,
+                chunk * 8 + head,
+                BT,
+                mma,
+                PACKED,
+                COMPACT_QK,
+                False,
+            )
             decay = gl.load(chunk_decay + chunk * 8 + head)
         state = _float_matrix_product(delta_a, scaled_key, state * decay)
     gl.store(states + state_address, state)
 
 
-@gluon.jit
+_scan_chunk_states_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_scan_chunk_states", ["BT", "BV", "NW"]
+)
+
+
+@gluon.jit(repr=_scan_chunk_states_repr)
 def _scan_chunk_states(
-    matrices, chunk_decay, offsets, states, indices, snapshots,
-    BT: gl.constexpr, BV: gl.constexpr, NW: gl.constexpr,
+    matrices,
+    chunk_decay,
+    offsets,
+    states,
+    indices,
+    snapshots,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
 ):
     """Scan only the state dependency; independent CTAs later emit outputs."""
     sequence, head = gl.program_id(0), gl.program_id(1)
@@ -624,14 +916,17 @@ def _scan_chunk_states(
     first = gl.load(offsets + sequence)
     last = gl.load(offsets + sequence + 1)
     for chunk in range(first, last):
-        gl.store(snapshots + (chunk * 8 + head) * 16384
-                 + _accumulator_offset(v[:, None], k[None, :], 128), state)
+        gl.store(
+            snapshots
+            + (chunk * 8 + head) * 16384
+            + _accumulator_offset(v[:, None], k[None, :], 128),
+            state,
+        )
         base = matrices + (chunk * 8 + head) * 4 * BT * 128
         w = _load_matrix_rhs(base, 128, BT, mma)
         u_address = base + BT * 128 + _accumulator_offset(v[:, None], t[None, :], BT)
         u = gl.load(u_address)
-        delta = u - _float_matrix_product(
-            state, w, gl.zeros((BV, BT), gl.float32, mma))
+        delta = u - _float_matrix_product(state, w, gl.zeros((BV, BT), gl.float32, mma))
         # U is dead after this scan; reuse its storage for solved updates.
         gl.store(u_address, delta)
         scaled_key = _load_matrix_rhs(base + 2 * BT * 128, BT, 128, mma)
@@ -640,12 +935,34 @@ def _scan_chunk_states(
     gl.store(states + address, state)
 
 
-@gluon.jit
+_emit_chunk_outputs_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_emit_chunk_outputs", ["BATCH", "SEARCH_STEPS", "BT"]
+)
+
+
+@gluon.jit(repr=_emit_chunk_outputs_repr)
 def _emit_chunk_outputs(
-    matrices, output_weights, snapshots, chunk_begin, offsets,
-    packed, weight, normalized, quantized, scales, pool, starts, indices, initial,
-    scale, eps, maximum, inverse_maximum,
-    BATCH: gl.constexpr, SEARCH_STEPS: gl.constexpr, BT: gl.constexpr,
+    matrices,
+    output_weights,
+    snapshots,
+    chunk_begin,
+    offsets,
+    packed,
+    weight,
+    normalized,
+    quantized,
+    scales,
+    pool,
+    starts,
+    indices,
+    initial,
+    scale,
+    eps,
+    maximum,
+    inverse_maximum,
+    BATCH: gl.constexpr,
+    SEARCH_STEPS: gl.constexpr,
+    BT: gl.constexpr,
 ):
     chunk, head = gl.program_id(0), gl.program_id(1)
     if chunk < BATCH:
@@ -666,22 +983,33 @@ def _emit_chunk_outputs(
         k = gl.arange(0, 128, gl.SliceLayout(0, mma))
         t = gl.arange(0, BT, gl.SliceLayout(0, mma))
         base = matrices + (chunk * 8 + head) * 4 * BT * 128
-        state = gl.load(snapshots + (chunk * 8 + head) * 16384
-                        + _accumulator_offset(v[:, None], k[None, :], 128))
+        state = gl.load(
+            snapshots
+            + (chunk * 8 + head) * 16384
+            + _accumulator_offset(v[:, None], k[None, :], 128)
+        )
         scaled_q = _load_matrix_rhs(base + 3 * BT * 128, 128, BT, mma)
         y = _float_matrix_product(state, scaled_q, gl.zeros((128, BT), gl.float32, mma))
         delta = _load_chunk_u(base, v[:, None], t[None, :], BT, True)
         output_matrix = _load_matrix_rhs(
-            output_weights + (chunk * 8 + head) * BT * BT, BT, BT, mma)
+            output_weights + (chunk * 8 + head) * BT * BT, BT, BT, mma
+        )
         y = _float_matrix_product(delta, output_matrix, y)
 
         layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
         token = begin + gl.arange(0, BT, gl.SliceLayout(1, layout))
         d = gl.arange(0, 128, gl.SliceLayout(0, layout))
         x = gl.convert_layout((y * scale).to(gl.bfloat16).T, layout).to(gl.float32)
-        z = gl.load(packed + token[:, None] * 3072 + (head // 2) * 768
-                    + 512 + (head % 2) * 128 + d[None, :],
-                    token[:, None] < end, other=0).to(gl.float32)
+        z = gl.load(
+            packed
+            + token[:, None] * 3072
+            + (head // 2) * 768
+            + 512
+            + (head % 2) * 128
+            + d[None, :],
+            token[:, None] < end,
+            other=0,
+        ).to(gl.float32)
         norm_weight = gl.load(weight + d).to(gl.float32)
         rms = gl.rsqrt(gl.sum(x * x, 1) / 128 + eps)
         sigmoid = 1.0 / (1.0 + gl.exp(-z))
@@ -689,8 +1017,12 @@ def _emit_chunk_outputs(
         address = (token[:, None] * 8 + head) * 128 + d[None, :]
         gl.store(normalized + address, result, token[:, None] < end)
         result_f32 = result.to(gl.float32)
-        quant_scale = gl.maximum(gl.max(gl.abs(result_f32), 1), 1.0e-10) * inverse_maximum
-        codes = gl.clamp(result_f32 * gl.div_rn(1.0, quant_scale[:, None]), -maximum, maximum)
+        quant_scale = (
+            gl.maximum(gl.max(gl.abs(result_f32), 1), 1.0e-10) * inverse_maximum
+        )
+        codes = gl.clamp(
+            result_f32 * gl.div_rn(1.0, quant_scale[:, None]), -maximum, maximum
+        )
         gl.store(quantized + address, codes, token[:, None] < end)
         gl.store(scales + token * 8 + head, quant_scale, token < end)
 
@@ -700,12 +1032,18 @@ def _store_packed_linear(pointer, value, ROWS: gl.constexpr, NW: gl.constexpr):
     # Pack each 16x16 tile as [K_low_2, N_low_4, K_middle_2].
     n_registers: gl.constexpr = [[512], [1024]] if NW == 2 else [[1024]]
     k_registers: gl.constexpr = (
-        [[2048], [4096], [8192]] if ROWS == 128 else
-        [[2048], [4096]] if ROWS == 64 else [[2048]] if ROWS == 32 else [])
+        [[2048], [4096], [8192]]
+        if ROWS == 128
+        else [[2048], [4096]] if ROWS == 64 else [[2048]] if ROWS == 32 else []
+    )
     warp_bases: gl.constexpr = [[256]] if NW == 2 else [[256], [512]]
     layout: gl.constexpr = gl.DistributedLinearLayout(
         [[1], [2]] + n_registers + k_registers,
-        [[4], [8], [16], [32], [64], [128]], warp_bases, [], [ROWS * 128])
+        [[4], [8], [16], [32], [64], [128]],
+        warp_bases,
+        [],
+        [ROWS * 128],
+    )
     packed = (
         value.reshape((ROWS // 16, 4, 4, 8, 16))
         .permute((0, 3, 2, 4, 1))
@@ -723,24 +1061,53 @@ def _load_packed_linear(pointer, mma: gl.constexpr):
     warp_bases: gl.constexpr = [[256], [512]]
     layout: gl.constexpr = gl.DistributedLinearLayout(
         [[1], [2]] + n_registers + [[2048], [4096], [8192]],
-        [[4], [8], [16], [32], [64], [128]], warp_bases, [], [16384])
+        [[4], [8], [16], [32], [64], [128]],
+        warp_bases,
+        [],
+        [16384],
+    )
     index = gl.arange(0, 16384, layout)
     packed = gl.load(pointer + index)
     value = (
-        packed.reshape((8, 8, 4, 16, 4))
-        .permute((0, 4, 2, 1, 3))
-        .reshape((128, 128))
+        packed.reshape((8, 8, 4, 16, 4)).permute((0, 4, 2, 1, 3)).reshape((128, 128))
     )
     return gl.convert_layout(value, gl.DotOperandLayout(1, mma, 1))
 
 
-@gluon.jit
+_block_transforms_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_block_transforms",
+    [
+        "BATCH",
+        "SEARCH_STEPS",
+        "BT",
+        "GROUP",
+        "BV",
+        "NW",
+        "WM",
+        "DIRECT_FIRST",
+        "NATIVE_U",
+    ],
+)
+
+
+@gluon.jit(repr=_block_transforms_repr)
 def _block_transforms(
-    matrices, chunk_decay, chunk_offsets, block_offsets, transforms, block_info,
-    states, indices,
-    BATCH: gl.constexpr, SEARCH_STEPS: gl.constexpr,
-    BT: gl.constexpr, GROUP: gl.constexpr, BV: gl.constexpr, NW: gl.constexpr,
-    WM: gl.constexpr = 1, DIRECT_FIRST: gl.constexpr = True,
+    matrices,
+    chunk_decay,
+    chunk_offsets,
+    block_offsets,
+    transforms,
+    block_info,
+    states,
+    indices,
+    BATCH: gl.constexpr,
+    SEARCH_STEPS: gl.constexpr,
+    BT: gl.constexpr,
+    GROUP: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    WM: gl.constexpr = 1,
+    DIRECT_FIRST: gl.constexpr = True,
     NATIVE_U: gl.constexpr = False,
 ):
     # Zero-state and identity-state passes produce bias and linear maps.
@@ -768,8 +1135,12 @@ def _block_transforms(
 
         # A terminal block has no successor checkpoint. A first block can
         # propagate the supplied state directly, without a linear map.
-        if (last < end) & ((not DIRECT_FIRST) | (first != sequence_first) | (~is_linear)):
-            mma: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 4], True, [WM, NW // WM])
+        if (last < end) & (
+            (not DIRECT_FIRST) | (first != sequence_first) | (~is_linear)
+        ):
+            mma: gl.constexpr = gl.amd.AMDMFMALayout(
+                4, [16, 16, 4], True, [WM, NW // WM]
+            )
             v = value_block * BV + gl.arange(0, BV, gl.SliceLayout(1, mma))
             k = gl.arange(0, 128, gl.SliceLayout(0, mma))
             out_t = gl.arange(0, BT, gl.SliceLayout(0, mma))
@@ -779,18 +1150,27 @@ def _block_transforms(
                 seed = gl.zeros((BV, 128), gl.float32, mma)
                 if first == sequence_first:
                     slot = gl.load(indices + sequence)
-                    seed = gl.load(states + ((slot * 8 + head) * 128 + v[:, None])
-                                   * 128 + k[None, :])
+                    seed = gl.load(
+                        states
+                        + ((slot * 8 + head) * 128 + v[:, None]) * 128
+                        + k[None, :]
+                    )
                     w = _load_matrix_rhs(base, 128, BT, mma)
-                    initial_delta = _load_chunk_u(base, v[:, None], out_t[None, :], BT, NATIVE_U)
+                    initial_delta = _load_chunk_u(
+                        base, v[:, None], out_t[None, :], BT, NATIVE_U
+                    )
                     initial_delta = initial_delta - _float_matrix_product(
-                        seed, w, gl.zeros((BV, BT), gl.float32, mma))
+                        seed, w, gl.zeros((BV, BT), gl.float32, mma)
+                    )
                 elif is_linear:
                     initial_delta = -gl.load(
-                        base + _chunk_rhs_offset(v[:, None], out_t[None, :], BT))
+                        base + _chunk_rhs_offset(v[:, None], out_t[None, :], BT)
+                    )
                     seed = (v[:, None] == k[None, :]).to(gl.float32)
                 else:
-                    initial_delta = _load_chunk_u(base, v[:, None], out_t[None, :], BT, NATIVE_U)
+                    initial_delta = _load_chunk_u(
+                        base, v[:, None], out_t[None, :], BT, NATIVE_U
+                    )
                 scaled_key = _load_matrix_rhs(base + 2 * BT * 128, BT, 128, mma)
                 decay = gl.load(chunk_decay + first * 8 + head)
                 state = _float_matrix_product(initial_delta, scaled_key, seed * decay)
@@ -798,13 +1178,18 @@ def _block_transforms(
                 base = matrices + (first * 8 + head) * 4 * BT * 128
                 if is_linear:
                     initial_delta = -gl.load(
-                        base + _chunk_rhs_offset(v[:, None], out_t[None, :], BT))
+                        base + _chunk_rhs_offset(v[:, None], out_t[None, :], BT)
+                    )
                 else:
-                    initial_delta = _load_chunk_u(base, v[:, None], out_t[None, :], BT, NATIVE_U)
+                    initial_delta = _load_chunk_u(
+                        base, v[:, None], out_t[None, :], BT, NATIVE_U
+                    )
                 scaled_key = _load_matrix_rhs(base + 2 * BT * 128, BT, 128, mma)
                 decay = gl.load(chunk_decay + first * 8 + head)
                 identity = ((v[:, None] == k[None, :]) & is_linear).to(gl.float32)
-                state = _float_matrix_product(initial_delta, scaled_key, identity * decay)
+                state = _float_matrix_product(
+                    initial_delta, scaled_key, identity * decay
+                )
             for chunk in range(first + 1, last):
                 base = matrices + (chunk * 8 + head) * 4 * BT * 128
                 w = _load_matrix_rhs(base, 128, BT, mma)
@@ -813,12 +1198,18 @@ def _block_transforms(
                     decay = gl.load(chunk_decay + chunk * 8 + head)
                     u = gl.zeros((BV, BT), gl.float32, mma)
                     if not is_linear:
-                        u = _load_chunk_u(base, v[:, None], out_t[None, :], BT, NATIVE_U)
-                projected = _float_matrix_product(state, w, gl.zeros((BV, BT), gl.float32, mma))
+                        u = _load_chunk_u(
+                            base, v[:, None], out_t[None, :], BT, NATIVE_U
+                        )
+                projected = _float_matrix_product(
+                    state, w, gl.zeros((BV, BT), gl.float32, mma)
+                )
                 delta = -projected
                 if not is_linear:
                     if BV != 64:
-                        u = _load_chunk_u(base, v[:, None], out_t[None, :], BT, NATIVE_U)
+                        u = _load_chunk_u(
+                            base, v[:, None], out_t[None, :], BT, NATIVE_U
+                        )
                     delta = delta + u
                 if BV != 64:
                     scaled_key = _load_matrix_rhs(base + 2 * BT * 128, BT, 128, mma)
@@ -826,15 +1217,27 @@ def _block_transforms(
                 state = _float_matrix_product(delta, scaled_key, state * decay)
             address = ((block * 8 + head) * 2 + is_linear.to(gl.int32)) * 16384
             if is_linear:
-                _store_packed_linear(transforms + address + value_block * BV * 128, state, BV, NW)
+                _store_packed_linear(
+                    transforms + address + value_block * BV * 128, state, BV, NW
+                )
             else:
                 gl.store(transforms + address + v[:, None] * 128 + k[None, :], state)
 
 
-@gluon.jit
+_propagate_block_states_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_propagate_block_states", ["BV", "NW", "DIRECT_FIRST"]
+)
+
+
+@gluon.jit(repr=_propagate_block_states_repr)
 def _propagate_block_states(
-    transforms, block_offsets, states, indices,
-    BV: gl.constexpr, NW: gl.constexpr, DIRECT_FIRST: gl.constexpr = True,
+    transforms,
+    block_offsets,
+    states,
+    indices,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    DIRECT_FIRST: gl.constexpr = True,
 ):
     # Publish each incoming checkpoint over its now-dead bias tile.
     sequence, head = gl.program_id(0), gl.program_id(1)
@@ -869,12 +1272,33 @@ def _propagate_block_states(
         gl.store(transforms + ((last - 1) * 8 + head) * 2 * 16384 + element, state)
 
 
-@gluon.jit
+_finish_blocks_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_finish_blocks",
+    ["BATCH", "BT", "BV", "NW", "WM", "UNROLL", "NATIVE_U"],
+)
+
+
+@gluon.jit(repr=_finish_blocks_repr)
 def _finish_blocks(
-    matrices, output_weights, chunk_decay, chunk_begin, chunk_offsets,
-    block_offsets, block_info, checkpoints, states, indices, starts, core, scale,
-    BATCH: gl.constexpr, BT: gl.constexpr, BV: gl.constexpr, NW: gl.constexpr,
-    WM: gl.constexpr = 1, UNROLL: gl.constexpr = 4,
+    matrices,
+    output_weights,
+    chunk_decay,
+    chunk_begin,
+    chunk_offsets,
+    block_offsets,
+    block_info,
+    checkpoints,
+    states,
+    indices,
+    starts,
+    core,
+    scale,
+    BATCH: gl.constexpr,
+    BT: gl.constexpr,
+    BV: gl.constexpr,
+    NW: gl.constexpr,
+    WM: gl.constexpr = 1,
+    UNROLL: gl.constexpr = 4,
     NATIVE_U: gl.constexpr = False,
 ):
     block, head = gl.program_id(0), gl.program_id(1)
@@ -887,12 +1311,15 @@ def _finish_blocks(
         mma: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 4], True, [WM, NW // WM])
         v = gl.program_id(2) * BV + gl.arange(0, BV, gl.SliceLayout(1, mma))
         k = gl.arange(0, 128, gl.SliceLayout(0, mma))
-        state = gl.load(checkpoints + (block * 8 + head) * 2 * 16384 + v[:, None] * 128 + k[None, :])
+        state = gl.load(
+            checkpoints + (block * 8 + head) * 2 * 16384 + v[:, None] * 128 + k[None, :]
+        )
         out_t = gl.arange(0, BT, gl.SliceLayout(0, mma))
         if BV >= 64:
             # A full state tile avoids the split conversion's extra barrier.
             operand_shared = gl.allocate_shared_memory(
-                gl.float32, (BV, 128), gl.SwizzledSharedLayout(4, 1, 8, [1, 0]))
+                gl.float32, (BV, 128), gl.SwizzledSharedLayout(4, 1, 8, [1, 0])
+            )
         for chunk in loop_range(first, last, loop_unroll_factor=UNROLL):
             base = matrices + (chunk * 8 + head) * 4 * BT * 128
             w = _load_matrix_rhs(base, 128, BT, mma)
@@ -908,7 +1335,8 @@ def _finish_blocks(
             scaled_q = _load_matrix_rhs(base + 3 * BT * 128, 128, BT, mma)
             y = _float_matrix_product(state_a, scaled_q, zero_delta)
             output_matrix = _load_matrix_rhs(
-                output_weights + (chunk * 8 + head) * BT * BT, BT, BT, mma)
+                output_weights + (chunk * 8 + head) * BT * BT, BT, BT, mma
+            )
             scaled_key = _load_matrix_rhs(base + 2 * BT * 128, BT, 128, mma)
             decay = gl.load(chunk_decay + chunk * 8 + head)
             if BV >= 64:
@@ -924,34 +1352,80 @@ def _finish_blocks(
                 core_base = core + (begin_token * 8 + head) * 128
                 core_offset = out_t[None, :] * 1024 + v[:, None]
                 gl.amd.cdna4.buffer_store(
-                    (y * scale).to(core.dtype.element_ty), core_base, core_offset,
-                    begin_token + out_t[None, :] < end_token)
+                    (y * scale).to(core.dtype.element_ty),
+                    core_base,
+                    core_offset,
+                    begin_token + out_t[None, :] < end_token,
+                )
             else:
-                gl.store(core + ((begin_token + out_t[None, :]) * 8 + head) * 128 + v[:, None],
-                         y * scale, begin_token + out_t[None, :] < end_token)
+                gl.store(
+                    core
+                    + ((begin_token + out_t[None, :]) * 8 + head) * 128
+                    + v[:, None],
+                    y * scale,
+                    begin_token + out_t[None, :] < end_token,
+                )
             state = _float_matrix_product(delta_a, scaled_key, state * decay)
         if last == gl.load(chunk_offsets + sequence + 1):
             slot = gl.load(indices + sequence)
-            gl.store(states + ((slot * 8 + head) * 128 + v[:, None]) * 128 + k[None, :], state)
+            gl.store(
+                states + ((slot * 8 + head) * 128 + v[:, None]) * 128 + k[None, :],
+                state,
+            )
 
 
-@gluon.jit
-def _norm_and_quantize(core, packed, weight, normalized, quantized, scales,
-                       pool, starts, indices, initial,
-                       eps, maximum, inverse_maximum,
-                       M: gl.constexpr, ROWS: gl.constexpr, BATCH: gl.constexpr):
+_norm_and_quantize_repr = make_kernel_repr(
+    "gdn_prefill_m3072_16384_norm_and_quantize", ["M", "ROWS", "BATCH"]
+)
+
+
+@gluon.jit(repr=_norm_and_quantize_repr)
+def _norm_and_quantize(
+    core,
+    packed,
+    weight,
+    normalized,
+    quantized,
+    scales,
+    pool,
+    starts,
+    indices,
+    initial,
+    eps,
+    maximum,
+    inverse_maximum,
+    M: gl.constexpr,
+    ROWS: gl.constexpr,
+    BATCH: gl.constexpr,
+):
     if gl.program_id(0) < BATCH * 8:
-        _update_conv_pool(packed, pool, starts, indices, initial,
-                          gl.program_id(0) // 8, gl.program_id(0) % 8, 256)
+        _update_conv_pool(
+            packed,
+            pool,
+            starts,
+            indices,
+            initial,
+            gl.program_id(0) // 8,
+            gl.program_id(0) % 8,
+            256,
+        )
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
     row = gl.program_id(0) * ROWS + gl.arange(0, ROWS, gl.SliceLayout(1, layout))
     d = gl.arange(0, 128, gl.SliceLayout(0, layout))
     token, head = row // 8, row % 8
-    x = gl.load(core + row[:, None] * 128 + d[None, :], row[:, None] < M * 8,
-                other=0).to(gl.float32)
-    z = gl.load(packed + token[:, None] * 3072 + (head // 2)[:, None] * 768
-                + 512 + (head % 2)[:, None] * 128 + d[None, :],
-                row[:, None] < M * 8, other=0).to(gl.float32)
+    x = gl.load(
+        core + row[:, None] * 128 + d[None, :], row[:, None] < M * 8, other=0
+    ).to(gl.float32)
+    z = gl.load(
+        packed
+        + token[:, None] * 3072
+        + (head // 2)[:, None] * 768
+        + 512
+        + (head % 2)[:, None] * 128
+        + d[None, :],
+        row[:, None] < M * 8,
+        other=0,
+    ).to(gl.float32)
     w = gl.load(weight + d).to(gl.float32)
     rms = gl.rsqrt(gl.sum(x * x, 1) / 128 + eps)
     sigmoid = 1.0 / (1.0 + gl.exp(-z))
@@ -959,7 +1433,9 @@ def _norm_and_quantize(core, packed, weight, normalized, quantized, scales,
     gl.store(normalized + row[:, None] * 128 + d[None, :], result, row[:, None] < M * 8)
     result_f32 = result.to(gl.float32)
     quant_scale = gl.maximum(gl.max(gl.abs(result_f32), 1), 1.0e-10) * inverse_maximum
-    codes = gl.clamp(result_f32 * gl.div_rn(1.0, quant_scale[:, None]), -maximum, maximum)
+    codes = gl.clamp(
+        result_f32 * gl.div_rn(1.0, quant_scale[:, None]), -maximum, maximum
+    )
     gl.store(quantized + row[:, None] * 128 + d[None, :], codes, row[:, None] < M * 8)
     gl.store(scales + row, quant_scale, row < M * 8)
 
@@ -988,8 +1464,9 @@ def gdn_prefill_group_fp8_quant(
     device = projected_qkvz.device
     prepared = torch.empty((m, 2048), dtype=torch.bfloat16, device=device)
     core = (
-        prepared.view(-1)[:m * 1024].view(m, 8, 128) if m >= 8192 else
-        torch.empty((m, 8, 128), dtype=torch.bfloat16, device=device)
+        prepared.view(-1)[: m * 1024].view(m, 8, 128)
+        if m >= 8192
+        else torch.empty((m, 8, 128), dtype=torch.bfloat16, device=device)
     )
     normalized = core
     quantized = torch.empty((m, 1024), dtype=precision_config.dtype, device=device)
@@ -1002,8 +1479,15 @@ def gdn_prefill_group_fp8_quant(
     packed_rhs = hierarchical or snapshot_outputs or compact_qk
     chunks = triton.cdiv(m, bt) + batch
     chunk_offsets = torch.empty((batch + 1,), dtype=torch.int32, device=device)
-    group = (4 if m <= 2048 else 12 if 4096 < m <= 6144 else 8 if m <= 8192
-             else 24 if m <= 12288 else 16 if m <= 16384 else 32)
+    group = (
+        4
+        if m <= 2048
+        else (
+            12
+            if 4096 < m <= 6144
+            else 8 if m <= 8192 else 24 if m <= 12288 else 16 if m <= 16384 else 32
+        )
+    )
     wide_summary = 12288 < m <= 16384 and 3 <= batch <= 5
     if wide_summary:
         group = 20
@@ -1012,70 +1496,160 @@ def gdn_prefill_group_fp8_quant(
     else:
         block_offsets = chunk_offsets
     matrices = torch.empty(
-        (chunks, 8, 2 if compact_qk else 4, bt, 128), dtype=torch.float32, device=device)
-    output_weights = torch.empty((chunks, 8, bt, bt), dtype=torch.float32, device=device)
+        (chunks, 8, 2 if compact_qk else 4, bt, 128), dtype=torch.float32, device=device
+    )
+    output_weights = torch.empty(
+        (chunks, 8, bt, bt), dtype=torch.float32, device=device
+    )
     chunk_decay = torch.empty((chunks, 8), dtype=torch.float32, device=device)
     chunk_begin = torch.empty((chunks,), dtype=torch.int32, device=device)
     raw_qk = (
         torch.empty((chunks, 4, 2, bt, 128), dtype=torch.bfloat16, device=device)
-        if compact_qk else matrices
+        if compact_qk
+        else matrices
     )
     qk_factors = (
         torch.empty((chunks, 8, 2, bt), dtype=torch.float32, device=device)
-        if compact_qk else chunk_decay
+        if compact_qk
+        else chunk_decay
     )
 
     convolution_tile = 8 if m >= 16384 else 4
     _convolve_sliding[(triton.cdiv(m, convolution_tile), 4, 2)](
-        projected_qkvz, conv_state, cu_seqlens, cache_indices, has_initial_state,
-        conv_weight, conv_bias, prepared, chunk_offsets, block_offsets,
-        m, batch, batch.bit_length(), triton.next_power_of_2(batch), bt, group, hierarchical,
+        projected_qkvz,
+        conv_state,
+        cu_seqlens,
+        cache_indices,
+        has_initial_state,
+        conv_weight,
+        conv_bias,
+        prepared,
+        chunk_offsets,
+        block_offsets,
+        m,
+        batch,
+        batch.bit_length(),
+        triton.next_power_of_2(batch),
+        bt,
+        group,
+        hierarchical,
         convolution_tile,
-        num_warps=2, enable_fp_fusion=False,
+        num_warps=2,
+        enable_fp_fusion=False,
     )
     _prepare_chunk_matrices[(8, chunks)](
-        prepared, projected_ba, a_log, dt_bias, cu_seqlens, chunk_offsets,
-        matrices, output_weights, chunk_decay, chunk_begin,
-        batch, batch.bit_length(), bt, packed_rhs, num_warps=4, enable_fp_fusion=False,
-        COMPACT_QK=compact_qk, raw_qk=raw_qk, qk_factors=qk_factors,
+        prepared,
+        projected_ba,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        chunk_offsets,
+        matrices,
+        output_weights,
+        chunk_decay,
+        chunk_begin,
+        batch,
+        batch.bit_length(),
+        bt,
+        packed_rhs,
+        num_warps=4,
+        enable_fp_fusion=False,
+        COMPACT_QK=compact_qk,
+        raw_qk=raw_qk,
+        qk_factors=qk_factors,
         NATIVE_U=native_u,
     )
     if snapshot_outputs:
-        snapshots = torch.empty((chunks, 8, 128, 128), dtype=torch.float32, device=device)
+        snapshots = torch.empty(
+            (chunks, 8, 128, 128), dtype=torch.float32, device=device
+        )
         _scan_chunk_states[(batch, 8, 8)](
-            matrices, chunk_decay, chunk_offsets, delta_state, cache_indices, snapshots,
-            bt, 16, 2, num_warps=2, enable_fp_fusion=False,
+            matrices,
+            chunk_decay,
+            chunk_offsets,
+            delta_state,
+            cache_indices,
+            snapshots,
+            bt,
+            16,
+            2,
+            num_warps=2,
+            enable_fp_fusion=False,
         )
         _emit_chunk_outputs[(chunks, 8)](
-            matrices, output_weights, snapshots, chunk_begin, chunk_offsets,
-            projected_qkvz, norm_weight, normalized, quantized, scales,
-            conv_state, cu_seqlens, cache_indices, has_initial_state,
-            scale, eps, precision_config.group_quant_max,
+            matrices,
+            output_weights,
+            snapshots,
+            chunk_begin,
+            chunk_offsets,
+            projected_qkvz,
+            norm_weight,
+            normalized,
+            quantized,
+            scales,
+            conv_state,
+            cu_seqlens,
+            cache_indices,
+            has_initial_state,
+            scale,
+            eps,
+            precision_config.group_quant_max,
             1.0 / precision_config.group_quant_max,
-            batch, batch.bit_length(), bt, num_warps=4,
+            batch,
+            batch.bit_length(),
+            bt,
+            num_warps=4,
         )
     elif hierarchical:
         direct_first = m < 32768
         value_tile, warps, value_warps = (
-            (16, 2, 1) if m < 4096 else (128, 4, 2) if m >= 32768
-            else (64, 4, 2) if wide_summary else (32, 4, 2)
+            (16, 2, 1)
+            if m < 4096
+            else (
+                (128, 4, 2)
+                if m >= 32768
+                else (64, 4, 2) if wide_summary else (32, 4, 2)
+            )
         )
         finish_warps, finish_value_warps = warps, value_warps
         if 12288 < m <= 16384 and batch == 2:
             value_tile, warps, value_warps = 32, 2, 1
         blocks = triton.cdiv(m, bt * group) + batch
-        transforms = torch.empty((blocks, 8, 2, 128, 128), dtype=torch.float32, device=device)
+        transforms = torch.empty(
+            (blocks, 8, 2, 128, 128), dtype=torch.float32, device=device
+        )
         block_info = torch.empty((blocks, 3), dtype=torch.int32, device=device)
         _block_transforms[(blocks, 8, 2 * 128 // value_tile)](
-            matrices, chunk_decay, chunk_offsets, block_offsets, transforms, block_info,
-            delta_state, cache_indices,
-            batch, batch.bit_length(), bt, group, value_tile, warps, value_warps, direct_first,
-            num_warps=warps, enable_fp_fusion=False,
+            matrices,
+            chunk_decay,
+            chunk_offsets,
+            block_offsets,
+            transforms,
+            block_info,
+            delta_state,
+            cache_indices,
+            batch,
+            batch.bit_length(),
+            bt,
+            group,
+            value_tile,
+            warps,
+            value_warps,
+            direct_first,
+            num_warps=warps,
+            enable_fp_fusion=False,
             NATIVE_U=native_u,
         )
         _propagate_block_states[(batch, 8, 8)](
-            transforms, block_offsets, delta_state, cache_indices,
-            16, 4, direct_first, num_warps=4, enable_fp_fusion=False,
+            transforms,
+            block_offsets,
+            delta_state,
+            cache_indices,
+            16,
+            4,
+            direct_first,
+            num_warps=4,
+            enable_fp_fusion=False,
         )
         finish_tile = 16 if 8192 < m <= 12288 else 64 if m >= 8192 else value_tile
         if 8192 < m <= 12288:
@@ -1083,31 +1657,75 @@ def gdn_prefill_group_fp8_quant(
             finish_warps, finish_value_warps = 2, 1
         finish_unroll = 1 if (m <= 2048 and batch > 1) or 6144 < m <= 8192 else 4
         _finish_blocks[(blocks, 8, 128 // finish_tile)](
-            matrices, output_weights, chunk_decay, chunk_begin, chunk_offsets,
-            block_offsets, block_info, transforms, delta_state, cache_indices,
-            cu_seqlens, core, scale, batch, bt, finish_tile, finish_warps, finish_value_warps,
-            num_warps=finish_warps, enable_fp_fusion=False,
+            matrices,
+            output_weights,
+            chunk_decay,
+            chunk_begin,
+            chunk_offsets,
+            block_offsets,
+            block_info,
+            transforms,
+            delta_state,
+            cache_indices,
+            cu_seqlens,
+            core,
+            scale,
+            batch,
+            bt,
+            finish_tile,
+            finish_warps,
+            finish_value_warps,
+            num_warps=finish_warps,
+            enable_fp_fusion=False,
             UNROLL=finish_unroll,
             NATIVE_U=native_u,
         )
     else:
-        value_tile, warps, value_warps = (
-            (64, 4, 2) if batch >= 32 else (32, 4, 2)
-        )
+        value_tile, warps, value_warps = (64, 4, 2) if batch >= 32 else (32, 4, 2)
         transposed = not (8 <= batch < 16)
         preload = 1 if 8 <= batch < 16 else 3 if batch >= 16 else 0
         _chunk_delta_recurrence[(batch, 8, 128 // value_tile)](
-            matrices, output_weights, chunk_decay, chunk_begin, chunk_offsets,
-            delta_state, cache_indices, cu_seqlens, core, scale, bt,
-            value_tile, warps, value_warps, packed_rhs, transposed, preload,
-            num_warps=warps, enable_fp_fusion=False,
-            COMPACT_QK=compact_qk, raw_qk=raw_qk, qk_factors=qk_factors,
+            matrices,
+            output_weights,
+            chunk_decay,
+            chunk_begin,
+            chunk_offsets,
+            delta_state,
+            cache_indices,
+            cu_seqlens,
+            core,
+            scale,
+            bt,
+            value_tile,
+            warps,
+            value_warps,
+            packed_rhs,
+            transposed,
+            preload,
+            num_warps=warps,
+            enable_fp_fusion=False,
+            COMPACT_QK=compact_qk,
+            raw_qk=raw_qk,
+            qk_factors=qk_factors,
         )
     if not snapshot_outputs:
         _norm_and_quantize[(max(triton.cdiv(m * 8, 16), batch * 8),)](
-            core, projected_qkvz, norm_weight, normalized, quantized, scales,
-            conv_state, cu_seqlens, cache_indices, has_initial_state, eps,
-            precision_config.group_quant_max, 1.0 / precision_config.group_quant_max,
-            m, 16, batch, num_warps=4,
+            core,
+            projected_qkvz,
+            norm_weight,
+            normalized,
+            quantized,
+            scales,
+            conv_state,
+            cu_seqlens,
+            cache_indices,
+            has_initial_state,
+            eps,
+            precision_config.group_quant_max,
+            1.0 / precision_config.group_quant_max,
+            m,
+            16,
+            batch,
+            num_warps=4,
         )
     return normalized, conv_state, delta_state, quantized, scales
