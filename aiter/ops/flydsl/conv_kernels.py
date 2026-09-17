@@ -572,7 +572,3 @@ def flydsl_conv_implicit(
         **kwargs,
     )
     return y.squeeze(0) if unbatched else y
-
-
-# FlyDSL 上游与旧 import 仍用这个名字；语义与 flydsl_conv_implicit 相同。
-conv3d_implicit = flydsl_conv_implicit
