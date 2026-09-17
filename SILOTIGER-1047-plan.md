@@ -439,6 +439,30 @@ B). Split-K as needed.
 - [ ] Family A: 24 Q / 2 KV, group 12, `D=256`, softmax scale, sigmoid gate
       weights if fused into the epilogue. Out: BF16 `o [M, 24, 256]`
       (pre-`o_proj`).
+- [x] **3a.** Family A decode kernel: one WG per ``(row, kv_head)``, paged
+      gather of selected K/V, online softmax, preallocated ``o [M, 24, 256]``.
+      Pytest vs ``qsa_sparse_gqa`` (``checkAllclose``, rtol/atol ``1e-2``).
+      ``bench_qsa_family_a_k2`` vs live AMD ``qsa_sparse_paged_attention``
+      (``num_stages=1``). Times recorded, **no win claim**. Expand, RoPE, and
+      sigmoid stay unfused. Prefill is 3c; split-K is 3b.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0` vs the oracle on
+decode ``M∈{1,8}``. Width is the expanded list (2051), so GQA flops do not
+grow with ``L``. The kernel is a correctness-first GEMV (one thread per
+``D``, 12 sequential block reductions per token) and is ~1000× the live AMD
+column; 3b/3d own occupancy and the win.
+
+| m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | flydsl_k2 err | vllm_amd_gqa err |
+|--:|--------:|---------:|------:|-------------:|----------------:|--------------:|-----------------:|
+| 1 | 512 | 128 | 2051 | 10638.0 | 11.0 | 0 | 0 |
+| 8 | 512 | 128 | 2051 | 10685.7 | 14.4 | 0 | 0 |
+| 1 | 2048 | 512 | 2051 | 10685.4 | 11.2 | 0 | 0 |
+| 8 | 2048 | 512 | 2051 | 10839.6 | 15.7 | 0 | 0 |
+| 1 | 8192 | 2048 | 2051 | 10684.5 | 11.3 | 0 | 0 |
+| 8 | 8192 | 2048 | 2051 | 10968.6 | 16.3 | 0 | 0 |
+| 1 | 32768 | 8192 | 2051 | 10706.1 | 11.2 | 0 | 0 |
+| 8 | 32768 | 8192 | 2051 | 11013.9 | 16.2 | 0 | 0 |
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
