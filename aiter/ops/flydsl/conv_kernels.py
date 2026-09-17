@@ -193,10 +193,10 @@ def _conv3d_impl(
     for name, t in (("x", x), ("weight", weight), ("bias", bias)):
         assert (
             t is None or t.is_cuda
-        ), f"conv3d_implicit needs GPU tensors; {name} is on {t.device}"
+        ), f"flydsl_conv_implicit needs GPU tensors; {name} is on {t.device}"
     assert (
         x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-    ), f"conv3d_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
+    ), f"flydsl_conv_implicit is a bf16-only kernel; got x={x.dtype}, weight={weight.dtype}"
     assert bias is None or (bias.dim() == 1 and bias.numel() == k), (
         f"bias must be a 1-D tensor of {k} elements, one per output channel; "
         f"got shape {tuple(bias.shape)}"
@@ -510,7 +510,9 @@ def _conv1d_impl(
     return y5.reshape(y5.shape[0], y5.shape[1], y5.shape[4])
 
 
-def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs):
+def flydsl_conv_implicit(
+    x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs
+):
     """Main implicit-GEMM conv entry; dispatches 1D/2D/3D by filter rank.
 
     Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S).
@@ -553,7 +555,7 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
     spatial_rank = weight.dim() - 2
     if spatial_rank not in (1, 2, 3):
         raise ValueError(
-            f"conv3d_implicit supports 1D/2D/3D; got filter rank {weight.dim()}"
+            f"flydsl_conv_implicit supports 1D/2D/3D; got filter rank {weight.dim()}"
         )
     unbatched = x.dim() == weight.dim() - 1
     if unbatched:
@@ -570,3 +572,7 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
         **kwargs,
     )
     return y.squeeze(0) if unbatched else y
+
+
+# FlyDSL 上游与旧 import 仍用这个名字；语义与 flydsl_conv_implicit 相同。
+conv3d_implicit = flydsl_conv_implicit
