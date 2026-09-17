@@ -695,6 +695,12 @@ def test_fp8_split_kv_cross_length(causal, seq_len, seqlen_kv, num_kv_splits):
 
 
 @_gfx950_only
+def test_fp8_short_causal_split_kv_rejected():
+    with pytest.raises(ValueError, match="split-K requires seq_len>=384"):
+        _run_fp8_shape(True, seq_len=70, seqlen_kv=16384, num_kv_splits=4)
+
+
+@_gfx950_only
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "seq_len,num_kv_splits", list(zip(FP8_SPLITKV_SEQLENS, FP8_SPLITKV_SPLITS))
