@@ -72,11 +72,12 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.conv3d_tuned_config import (
+from aiter.ops.flydsl.conv_kernels import (
     TUNED_KEY_COLUMNS,
     TUNED_RESULT_COLUMNS,
+    _dispatch,
+    _pad_channels,
 )
-from aiter.ops.flydsl.conv_kernels import _dispatch, _pad_channels
 from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,

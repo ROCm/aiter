@@ -13,10 +13,10 @@
 
 Upstream is FlyDSL ``kernels/conv/conv3d_implicit.py`` and the public entry point
 still matches its keyword surface, but the body has diverged. aiter-only here:
-the tile heuristics, and ``buffer_atomic_add`` -- which upstream imports from
-``kernels/common/``, a directory flydsl's wheel does not ship, as with the
-vendored ``buffer_ops`` and ``vector`` modules. The offline tuned-config lookup
-is also aiter-only but lives in ``../conv3d_tuned_config.py``, mirroring how
+``buffer_atomic_add`` -- which upstream imports from ``kernels/common/``, a
+directory flydsl's wheel does not ship, as with the vendored ``buffer_ops``
+and ``vector`` modules. The tile heuristics and the offline tuned-config
+lookup are aiter-only too but live in ``../conv_kernels.py``, mirroring how
 ``tuned_gemm.py`` sits outside ``kernels/gemm_a16w16_gfx950.py``. The NCDHW
 pre-transpose is a second kernel with its own cache, so it lives in
 ``conv3d_transpose.py``; what the two share is in ``conv3d_gfx950_utils.py``.

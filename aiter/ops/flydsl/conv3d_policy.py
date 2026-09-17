@@ -53,7 +53,7 @@ WGM_VALUES = (1, 4, 8)
 # every sweep so that the tuned pick can never come out worse than the shipped
 # default -- whatever ``_pick_tile`` would have chosen is always measured too.
 #
-# Spelled out rather than spliced from ``conv3d_tuned_config.TILE_LADDER``: this order is
+# Spelled out rather than spliced from ``conv_kernels.TILE_LADDER``: this order is
 # the order the tuner measures them in, and ties are broken by whoever is timed
 # first, so re-ordering it would make a re-tune disagree with the checked-in CSVs
 # for no gain. The cost is that a ladder rung added there and not here becomes an
