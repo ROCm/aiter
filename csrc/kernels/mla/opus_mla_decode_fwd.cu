@@ -52,6 +52,14 @@ constexpr OpusDecodeVariant kA16W16_32mx1{"opus_mla_decode_a16w16_32mx1_16nx4_ke
                                        "mla_opus/opus_mla_decode_a16w16_32mx1_16nx4.co",
                                        32,
                                        256};
+constexpr OpusDecodeVariant kA16W16_32mx4{"opus_mla_decode_a16w16_32mx4_32nx1_kernel",
+                                       "mla_opus/opus_mla_decode_a16w16_32mx4_32nx1.co",
+                                       128,
+                                       256};
+constexpr OpusDecodeVariant kA16W16_32mx3{"opus_mla_decode_a16w16_32mx3_32nx1_kernel",
+                                       "mla_opus/opus_mla_decode_a16w16_32mx3_32nx1.co",
+                                       96,
+                                       256};
 
 constexpr int kHeadDimQk = 576;
 constexpr int kHeadDimVo = 512;
@@ -113,7 +121,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int total_tokens = kv->size(0);
     const int num_workers = work_indptr->size(0) - 1;
 
-    const OpusDecodeVariant& variant = (H <= kA16W16_32mx1.heads_per_block) ? kA16W16_32mx1 : kA16W16_16mx4;
+    const OpusDecodeVariant& variant = (H <= kA16W16_32mx1.heads_per_block) ? kA16W16_32mx1
+                                       : (H % kA16W16_32mx4.heads_per_block == 0) ? kA16W16_32mx4
+                                       : (H % kA16W16_32mx3.heads_per_block == 0) ? kA16W16_32mx3
+                                                                                  : kA16W16_16mx4;
     const int num_h_blocks = (H + variant.heads_per_block - 1) / variant.heads_per_block;
 
     const HipDeviceGuard device_guard(q->device_id);
@@ -141,17 +152,29 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.stride_kv_page = kHeadDimQk;
 
     size_t arg_size = sizeof(kargs);
+    auto launch     = [&](AiterAsmKernel& impl) {
+        impl.launch_kernel({&kargs, &arg_size, num_workers, num_h_blocks, 1,
+                            variant.block_size, 1, 1, stream});
+    };
     if(&variant == &kA16W16_32mx1)
     {
         static AiterAsmKernel impl(kA16W16_32mx1.kernel_name, kA16W16_32mx1.co_path);
-        impl.launch_kernel({&kargs, &arg_size, num_workers, num_h_blocks, 1,
-                            kA16W16_32mx1.block_size, 1, 1, stream});
+        launch(impl);
+    }
+    else if(&variant == &kA16W16_32mx4)
+    {
+        static AiterAsmKernel impl(kA16W16_32mx4.kernel_name, kA16W16_32mx4.co_path);
+        launch(impl);
+    }
+    else if(&variant == &kA16W16_32mx3)
+    {
+        static AiterAsmKernel impl(kA16W16_32mx3.kernel_name, kA16W16_32mx3.co_path);
+        launch(impl);
     }
     else
     {
         static AiterAsmKernel impl(kA16W16_16mx4.kernel_name, kA16W16_16mx4.co_path);
-        impl.launch_kernel({&kargs, &arg_size, num_workers, num_h_blocks, 1,
-                            kA16W16_16mx4.block_size, 1, 1, stream});
+        launch(impl);
     }
 }
 
