@@ -348,6 +348,10 @@ static void pa_decode_opus_launch(aiter_tensor_t& q,
                                   k_scale_map, v_scale_map))
         {
             if(qlen == 1 && num_splits > 128) num_splits = 128;
+            const int sp3_tiles = (kargs.max_blocks_per_batch_row * 16 + 255) / 256;
+            if(num_kv_heads == 1 && qlen > 1 && sp3_tiles >= 4 && sp3_tiles <= 8 &&
+               static_cast<int64_t>(batch) * qlen * sp3_tiles <= num_cu)
+                num_splits = sp3_tiles;
             pa_opus_sp3::run(q, k_cache, v_cache, block_tables, context_lens, out,
                              *k_scale_map, *v_scale_map, softmax_scale, num_splits, num_cu, stream);
             return;

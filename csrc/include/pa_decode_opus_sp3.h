@@ -141,7 +141,9 @@ struct Workspace
 
     Workspace(int device, int batch, int qlen, int heads, int splits)
     {
-        const size_t prefix_bytes = ((static_cast<size_t>(batch) + 1) * sizeof(int) + 15) & ~size_t{15};
+        const size_t prefix_alignment = 256;
+        const size_t prefix_bytes = ((static_cast<size_t>(batch) + 1) * sizeof(int) + prefix_alignment - 1)
+                                    & ~(prefix_alignment - 1);
         const size_t rows = static_cast<size_t>(batch) * qlen * splits * heads;
         const size_t partial_bytes = splits > 1 ? rows * 128 * sizeof(float) : 0;
         const size_t lse_bytes = splits > 1 ? rows * sizeof(float) : 0;
