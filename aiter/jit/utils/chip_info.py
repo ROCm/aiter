@@ -20,9 +20,13 @@ logger = logging.getLogger("aiter")
 
 @functools.lru_cache(maxsize=1)
 def _rocminfo_output() -> str:
-    """rocminfo stdout, run once and shared by every parser below."""
+    """rocminfo stdout, run once and shared by every parser below.
+
+    check=False on purpose: rocminfo can exit non-zero while still printing
+    usable agent blocks. Each parser decides whether what it needs is missing.
+    """
     rocminfo = executable_path("rocminfo")
-    result = subprocess.run([rocminfo], capture_output=True, text=True, check=True)
+    result = subprocess.run([rocminfo], capture_output=True, text=True, check=False)
     return result.stdout
 
 

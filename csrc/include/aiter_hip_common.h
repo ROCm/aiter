@@ -186,24 +186,37 @@ extern "C" void __hipRegisterFunction(void* module,
 // ---- gfx1250 asm B0-only gate ------------------------------------------------
 // Gates the shipped asm code objects only; the OPUS .co path is not gated.
 
-// Soft (non-aborting): false only when the device is confirmed gfx1250 A0
-// (asicRevision 0). Undeterminable arch -> true (the load-site gate is the hard
-// stop). Callers also use it to pick a fallback path (e.g. fmha_v3_bwd -> CK).
+// Soft (non-aborting): false only when a gfx1250 A0 (asicRevision 0) is seen.
+// Undeterminable arch -> true (the load-site gate is the hard stop). Callers
+// also use it to pick a fallback path (e.g. fmha_v3_bwd -> CK).
+//
+// Node-wide and answered once per process, like get_asic_revision() in
+// aiter/jit/utils/chip_info.py: every visible device is scanned and the lowest
+// stepping wins, so the answer does not depend on which device is current when
+// a kernel happens to be loaded (asm kernels are cached process-wide by name).
 static inline bool is_gfx1250_asm_supported()
 {
-    int dev;
-    if(hipGetDevice(&dev) != hipSuccess)
-        return true; // cannot tell -> do not over-block
-    hipDeviceProp_t prop;
-    if(hipGetDeviceProperties(&prop, dev) != hipSuccess)
+    static const bool supported = [] {
+        int count = 0;
+        if(hipGetDeviceCount(&count) != hipSuccess)
+            return true; // cannot tell -> do not over-block
+        for(int dev = 0; dev < count; ++dev)
+        {
+            hipDeviceProp_t prop;
+            if(hipGetDeviceProperties(&prop, dev) != hipSuccess)
+                continue;
+            std::string arch = prop.gcnArchName;
+            size_t colon_pos = arch.find(':');
+            if(colon_pos != std::string::npos)
+                arch = arch.substr(0, colon_pos);
+            if(arch != "gfx1250")
+                continue;
+            if(prop.asicRevision < 1) // gfx1250: shipped asm is B0+ only
+                return false;
+        }
         return true;
-    std::string arch  = prop.gcnArchName;
-    size_t colon_pos  = arch.find(':');
-    if(colon_pos != std::string::npos)
-        arch = arch.substr(0, colon_pos);
-    if(arch != "gfx1250")
-        return true;
-    return prop.asicRevision >= 1; // gfx1250: shipped asm is B0+ only
+    }();
+    return supported;
 }
 
 // Kernels verified to ALSO run on gfx1250 A0, matched by EXACT name. Empty
@@ -225,14 +238,20 @@ static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
 }
 
 // Hard stop for asm load sites: THROWS (never std::abort()) on gfx1250 A0 so
-// pybind/ctypes callers get a Python RuntimeError, not a SIGABRT.
+// pybind/ctypes callers get a Python RuntimeError, not a SIGABRT. Deliberately
+// not AITER_CHECK: that aborts unless g_aiter_can_throw is set, which would
+// downgrade the pybind path from a catchable exception to a crash. Every entry
+// point that can load gfx1250 asm is either pybind or AITER_CTYPES_DEFINE_*,
+// both of which catch; the message is also printed in case a future plain
+// extern "C" entry lets this cross an unwindable frame.
 [[maybe_unused]] static inline void require_gfx1250_asm_or_throw(const char* kernel_name)
 {
     if(is_gfx1250_asm_supported() || is_gfx1250_asm_a0_ok(kernel_name))
         return;
-    throw std::runtime_error(
-        std::string(kernel_name ? kernel_name : "<unknown>") +
-        " asm code object targets gfx1250 B0+; running device is gfx1250 A0.");
+    std::string msg = std::string(kernel_name ? kernel_name : "<unknown>") +
+                      " asm code object targets gfx1250 B0+; running device is gfx1250 A0.";
+    std::cerr << "[AITER] " << msg << std::endl;
+    throw std::runtime_error(std::move(msg));
 }
 
 namespace {
@@ -290,7 +309,13 @@ class AiterAsmKernelFast
         init_ungated(kernel_name, hsaco);
     };
 
-    ~AiterAsmKernelFast() { aiter_detail::__hipUnregisterFatBinary(module); }
+    // module stays null when init() rejects the load (gfx1250 A0): a throw from
+    // a derived ctor body still runs this base dtor.
+    ~AiterAsmKernelFast()
+    {
+        if(module != nullptr)
+            aiter_detail::__hipUnregisterFatBinary(module);
+    }
 
     AiterAsmKernelFast(AiterAsmKernelFast&)             = delete;
     AiterAsmKernelFast(AiterAsmKernelFast&&)            = delete;

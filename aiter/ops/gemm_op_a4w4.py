@@ -505,6 +505,7 @@ def gemm_a4w4o8(
     assert (
         get_gfx() in _GFX1250
     ), f"gemm_a4w4o8 (mxfp8 output) is only supported on gfx1250, got {get_gfx()}"
+    require_gfx1250_asm("gemm_a4w4o8")
     o, s = _f4gemm_asm_dispatch(
         A,
         B,

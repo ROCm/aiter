@@ -549,7 +549,6 @@ def mla_decode_fwd(
     cp_rank=0,
     causal=True,
 ):
-    require_gfx1250_asm("mla_decode_stage1_asm_fwd")
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if kv_buffer.dtype != torch.uint8:
@@ -659,6 +658,7 @@ def mla_decode_fwd(
         )
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
+        require_gfx1250_asm("mla_decode_stage1_asm_fwd")
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -967,6 +967,7 @@ def mla_decode_fwd(
                 o,
             )
         else:
+            require_gfx1250_asm("mla_decode_stage1_asm_fwd")
             aiter.mla_decode_stage1_asm_fwd(
                 q,
                 kv_buffer,

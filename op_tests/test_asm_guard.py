@@ -6,6 +6,9 @@ Everything here reads THIS machine through rocminfo -- nothing is faked -- so
 the A0 branch is only exercised when the test runs on a gfx1250 A0 board.
 """
 
+import re
+from pathlib import Path
+
 import pytest
 
 from aiter.jit.utils import asm_guard
@@ -62,10 +65,20 @@ def test_require_follows_gate(detected):
     assert supported, "require_gfx1250_asm passed on gfx1250 A0"
 
 
-def test_a0_allowlist_is_in_sync():
-    # Python keys the allowlist by op name, C++ by kernel name; both are empty
-    # while all shipped gfx1250 asm is B0-only.
-    assert isinstance(asm_guard._A0_ALLOWLIST, frozenset)
+def test_a0_allowlists_are_both_empty():
+    # Two allowlists on purpose: Python keys by op name, C++ by kernel name, so
+    # entries cannot be compared 1:1. What IS checkable is that both are empty
+    # while all shipped gfx1250 asm is B0-only -- adding to one side alone
+    # fails here and forces the other side to be revisited.
+    assert asm_guard._A0_ALLOWLIST == frozenset()
+
+    header = Path(__file__).resolve().parents[1] / "csrc/include/aiter_hip_common.h"
+    body = re.search(
+        r"kA0AllowList\[\]\s*=\s*\{(.*?)\};", header.read_text(), re.DOTALL
+    )
+    assert body is not None, "kA0AllowList not found in aiter_hip_common.h"
+    entries = re.sub(r"//[^\n]*", "", body.group(1))  # drop comments
+    assert '"' not in entries, "C++ A0 allowlist gained an entry"
 
 
 if __name__ == "__main__":
