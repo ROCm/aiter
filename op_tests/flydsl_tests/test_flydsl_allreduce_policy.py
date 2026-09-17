@@ -17,6 +17,7 @@ import pytest
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     SUPPORTED_ATOMS,
+    SUPPORTED_BLOCKS,
     oneshot_ladder,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_int4 import MESH_ST_LADDER, SUPER_TILES
@@ -135,10 +136,11 @@ def test_ladders_are_well_formed(ws):
         one = oneshot_ladder(ws, link)
         assert one and one[0][0] == 0, link
         assert [r[0] for r in one] == sorted(r[0] for r in one), link
-        for _floor, atoms, cap, fanout in one:
+        for _floor, atoms, cap, fanout, block in one:
             assert atoms in SUPPORTED_ATOMS, (link, atoms)
             assert cap >= 1, (link, cap)
             assert fanout in ("peer", "atom"), (link, fanout)
+            assert block in SUPPORTED_BLOCKS, (link, block)
 
 
 @pytest.mark.parametrize("ws", WORLDS)

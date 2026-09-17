@@ -45,6 +45,8 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
+    DEFAULT_SKIP_SELF,
+    SUPPORTED_BLOCKS,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 from aiter.ops.flydsl.quick_allreduce_int4 import _SUPPORTED_ARCHS
@@ -104,6 +106,8 @@ def _run_rank(args) -> None:
         atoms=args.atoms,
         grid_cap=args.grid_cap,
         fanout=args.fanout,
+        skip_self=args.skip_self,
+        block=args.block,
         # MAX_PAYLOAD_BYTES is a speed policy, not a correctness limit -- the
         # kernel is exact at every size -- so it must not decide what this
         # test covers. Lifted so the shape list stays free to include sizes
@@ -208,6 +212,8 @@ def _spawn(
     atoms: int | None = DEFAULT_ATOMS,
     grid_cap: int | None = DEFAULT_GRID_CAP,
     fanout: str | None = DEFAULT_FANOUT,
+    skip_self: bool = DEFAULT_SKIP_SELF,
+    block: int | None = None,
     mode: str = "shapes",
     iters: int = RUN_AHEAD_ITERS,
 ) -> list:
@@ -258,6 +264,10 @@ def _spawn(
             cmd += ["--grid-cap", str(grid_cap)]
         if fanout is not None:
             cmd += ["--fanout", fanout]
+        if skip_self:
+            cmd += ["--skip-self"]
+        if block is not None:
+            cmd += ["--block", str(block)]
         if rank == 0:
             cmd += ["--out", out_path]
         log = open(  # noqa: SIM115
@@ -393,6 +403,8 @@ def main():
     ap.add_argument("--atoms", type=int, default=None)
     ap.add_argument("--grid-cap", type=int, default=None)
     ap.add_argument("--fanout", default=None, choices=("peer", "atom"))
+    ap.add_argument("--skip-self", action="store_true")
+    ap.add_argument("--block", type=int, default=None, choices=SUPPORTED_BLOCKS)
     args = ap.parse_args()
 
     n = torch.cuda.device_count()
@@ -401,7 +413,13 @@ def main():
 
     pairs = [(m, HIDDEN) for m in SHAPES] + list(NARROW_SHAPES)
     ranks = _spawn(
-        args.tp, pairs, atoms=args.atoms, grid_cap=args.grid_cap, fanout=args.fanout
+        args.tp,
+        pairs,
+        atoms=args.atoms,
+        grid_cap=args.grid_cap,
+        fanout=args.fanout,
+        skip_self=args.skip_self,
+        block=args.block,
     )
     failures = [
         f"rank {r}: {bad}"
@@ -416,6 +434,8 @@ def main():
         atoms=args.atoms,
         grid_cap=args.grid_cap,
         fanout=args.fanout,
+        skip_self=args.skip_self,
+        block=args.block,
         mode="run_ahead",
     )
     failures += [f"rank {r}: {bad}" for r, bad in enumerate(run_ahead_ranks) if bad]
@@ -434,6 +454,8 @@ if __name__ == "__main__":
     parser.add_argument("--atoms", type=int, default=None)
     parser.add_argument("--grid-cap", type=int, default=None)
     parser.add_argument("--fanout", default=None, choices=("peer", "atom"))
+    parser.add_argument("--skip-self", action="store_true")
+    parser.add_argument("--block", type=int, default=None)
     parser.add_argument("--mode", default="shapes", choices=("shapes", "run_ahead"))
     parser.add_argument("--tokens", default="")
     parser.add_argument("--hiddens", default="")

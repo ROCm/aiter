@@ -401,6 +401,13 @@ class Candidate:
     # value means a distinct engine with its own inbox.
     atoms: int | None = None
     fanout: str | None = None
+    # Drop this rank's own trip through its own inbox, family == "fly1s". None
+    # is OneShotAllReduce's default.
+    skip_self: bool | None = None
+    # Threads per block, family == "fly1s". Also the tile width, so it is the
+    # knob that sets how many blocks a decode payload gets. None is the default
+    # (256).
+    block: int | None = None
 
     @property
     def fly_cfg(self) -> tuple:
@@ -416,7 +423,7 @@ class Candidate:
     @property
     def fly1s_cfg(self) -> tuple:
         """Identity of the OneShotAllReduce engine this candidate needs."""
-        return (self.atoms, self.grid_cap, self.fanout)
+        return (self.atoms, self.grid_cap, self.fanout, self.skip_self, self.block)
 
 
 # Floors sit ~5 dB below what each candidate measures on a healthy gfx950 build
@@ -481,6 +488,47 @@ CANDIDATES = (
     Candidate("fly_1stage_a4_fa", "fly1s", 40.0, True, atoms=4, fanout="atom"),
     Candidate("fly_1stage_g128", "fly1s", 40.0, True, grid_cap=128),
     Candidate("fly_1stage_a4_g128", "fly1s", 40.0, True, atoms=4, grid_cap=128),
+    # Tile width. `block` is threads per block and therefore also the tile, so
+    # it is the only knob that raises the block count at a payload too small for
+    # `grid_cap` to bind.
+    Candidate("fly_1stage_b128", "fly1s", 40.0, True, block=128),
+    Candidate("fly_1stage_b128_g128", "fly1s", 40.0, True, block=128, grid_cap=128),
+    Candidate("fly_1stage_b64", "fly1s", 40.0, True, block=64),
+    Candidate("fly_1stage_b64_g128", "fly1s", 40.0, True, block=64, grid_cap=128),
+    Candidate("fly_1stage_b64_g256", "fly1s", 40.0, True, block=64, grid_cap=256),
+    Candidate("fly_1stage_a4_b64", "fly1s", 40.0, True, atoms=4, block=64),
+    # Self-skip: this rank's contribution is read from registers instead of from
+    # its own inbox. 
+    Candidate("fly_1stage_ss", "fly1s", 40.0, True, skip_self=True),
+    Candidate("fly_1stage_ss_g128", "fly1s", 40.0, True, skip_self=True, grid_cap=128),
+    Candidate("fly_1stage_a4_ss", "fly1s", 40.0, True, atoms=4, skip_self=True),
+    Candidate(
+        "fly_1stage_ss_b128_g128",
+        "fly1s",
+        40.0,
+        True,
+        skip_self=True,
+        block=128,
+        grid_cap=128,
+    ),
+    Candidate(
+        "fly_1stage_ss_b64_g128",
+        "fly1s",
+        40.0,
+        True,
+        skip_self=True,
+        block=64,
+        grid_cap=128,
+    ),
+    Candidate(
+        "fly_1stage_ss_b64_g256",
+        "fly1s",
+        40.0,
+        True,
+        skip_self=True,
+        block=64,
+        grid_cap=256,
+    ),
     # Same kernel family, ring schedule. Its floor is lower than fly_int4's
     # because the ring's reduce-scatter lap requantizes N-1 times where the mesh
     # requantizes once; measured 18.7 dB at TP4 (against 19.2), and *better*
@@ -1362,7 +1410,7 @@ def _worker(
             fly[cfg].compile_and_launch(warm, torch.empty_like(warm))
         del warm
 
-    fly1s = {}  # (atoms, grid_cap, fanout) -> OneShotAllReduce engine
+    fly1s = {}  # fly1s_cfg tuple -> OneShotAllReduce engine
     # Same rules as the QuickAllReduceInt4 engines above: one per distinct config, each with
     # its own IPC inbox, constructed in a total order because the handle
     # exchange is a collective.
@@ -1378,7 +1426,7 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         for cfg in wanted_1s:
-            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout"))
+            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout", "skip_self", "block"))
             fly1s[cfg] = OneShotAllReduce(
                 group=tp_group.cpu_group,
                 device=device,

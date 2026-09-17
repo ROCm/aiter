@@ -21,10 +21,13 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .allreduce_policy import FAMILY_POLICY
 from .kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
+    DEFAULT_BLOCK,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
+    DEFAULT_SKIP_SELF,
     DEFAULT_SPIN_SLEEP,
     SUPPORTED_ATOMS,
+    SUPPORTED_BLOCKS,
     make_one_shot_allreduce_kernel,
     oneshot_ladder,
 )
@@ -60,7 +63,9 @@ class OneShotAllReduce:
     Requires a non-NCCL, single-node process group for IPC metadata exchange,
     the same constraint ``QuickAllReduceInt4`` has and for the same reason.
 
-    ``atoms``, ``grid_cap`` and ``fanout`` are the tuning surface.
+    ``atoms``, ``grid_cap``, ``fanout`` and ``block`` are the tuning surface.
+    ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it 
+    from above.
 
     ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
     defaulting to this ``(link, world_size)``'s entry in ``MAX_PAYLOAD_BYTES``.
@@ -73,6 +78,11 @@ class OneShotAllReduce:
     ``inbox_memory`` follows ``QuickAllReduceInt4``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
     MI350X and MI350P both report ``gfx950`` and want opposite answers.
+
+    ``skip_self`` drops the round trip this rank does through its own inbox. 
+    It specialises the kernel to this rank, so the JIT symbol carries an ``_r<n>_`` 
+    field and the binary is not shared across ranks -- one extra compile per process, 
+    not per world.
     """
 
     def __init__(
@@ -86,10 +96,12 @@ class OneShotAllReduce:
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
         fanout: str | None = None,
+        block: int | None = None,
         max_bytes: int | None = None,
         link: str | None = None,
         probe: str = "full",
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
+        skip_self: bool = DEFAULT_SKIP_SELF,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -100,13 +112,22 @@ class OneShotAllReduce:
         if link not in ("pcie", "xgmi"):
             raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
         self.link = link
-        pinned = atoms is not None or grid_cap is not None or fanout is not None
+        pinned = (
+            atoms is not None
+            or grid_cap is not None
+            or fanout is not None
+            or block is not None
+        )
         if atoms is None:
             atoms = DEFAULT_ATOMS
         if fanout is None:
             fanout = DEFAULT_FANOUT
+        if block is None:
+            block = DEFAULT_BLOCK
         if atoms not in SUPPORTED_ATOMS:
             raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
+        if block not in SUPPORTED_BLOCKS:
+            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
         group_world = dist.get_world_size(group=group)
         group_rank = dist.get_rank(group=group)
         if group_world != int(world_size):
@@ -142,14 +163,21 @@ class OneShotAllReduce:
         )
         self.probe = probe
         self.spin_sleep = int(spin_sleep)
+        self.skip_self = bool(skip_self)
 
         if pinned:
-            self._ladder = ((0, int(atoms), cap, fanout),)
+            self._ladder = ((0, int(atoms), cap, fanout, int(block)),)
         else:
             ceiling = cap if grid_cap is not None else None
             self._ladder = tuple(
-                (floor, a, rung_cap if ceiling is None else min(rung_cap, ceiling), f)
-                for floor, a, rung_cap, f in oneshot_ladder(world_size, link)
+                (
+                    floor,
+                    a,
+                    rung_cap if ceiling is None else min(rung_cap, ceiling),
+                    f,
+                    b,
+                )
+                for floor, a, rung_cap, f, b in oneshot_ladder(world_size, link)
             )
 
         # One engine per distinct rung config, built in a fixed sorted order:
@@ -162,8 +190,8 @@ class OneShotAllReduce:
         # ever be a no-op bought with an extra collective per engine.
         self._by_cfg = {}
         try:
-            for _floor, a, c, f in self._ladder:
-                key = (int(a), int(c), f)
+            for _floor, a, c, f, b in self._ladder:
+                key = (int(a), int(c), f, int(b))
                 if key in self._by_cfg:
                     continue
                 spec = make_one_shot_allreduce_kernel(
@@ -172,8 +200,11 @@ class OneShotAllReduce:
                     grid=key[1],
                     inbox_memory=resolved_inbox,
                     fanout=key[2],
+                    block=key[3],
                     probe=probe,
                     spin_sleep=int(spin_sleep),
+                    skip_self=self.skip_self,
+                    rank=self.rank,
                 )
                 self._by_cfg[key] = (
                     _StEngine(
@@ -194,11 +225,12 @@ class OneShotAllReduce:
         # config that is the only rung and these are exact; with a ladder they
         # describe the smallest payloads, which is what a caller inspecting
         # ``tile_bytes`` is almost always asking about.
-        first = (int(self._ladder[0][1]), int(self._ladder[0][2]), self._ladder[0][3])
+        first = self._cfg_of(self._ladder[0])
         eng, spec = self._by_cfg[first]
         self.atoms = first[0]
         self.grid_cap = first[1]
         self.fanout = first[2]
+        self.block = first[3]
         self.tile_bytes = spec["tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.buf_bytes = eng.buf_bytes
@@ -208,13 +240,20 @@ class OneShotAllReduce:
         """IPC inbox bytes this object holds on this rank, across every rung."""
         return sum(eng.buf_bytes for eng, _ in self._by_cfg.values())
 
-    def _pick_cfg(self, live_bytes: int):
-        """``(atoms, grid_cap, fanout)`` the ladder assigns to *live_bytes*."""
+    @staticmethod
+    def _cfg_of(rung) -> tuple:
+        """A ladder rung's engine key: everything but its ``min_bytes``."""
+        _floor, atoms, cap, fanout, block = rung
+        return (int(atoms), int(cap), fanout, int(block))
+
+    def _pick_cfg(self, live_bytes: int) -> tuple:
+        """``(atoms, grid_cap, fanout, block)`` the ladder assigns to
+        *live_bytes*."""
         chosen = self._ladder[0]
         for rung in self._ladder:
             if live_bytes >= rung[0]:
                 chosen = rung
-        return (int(chosen[1]), int(chosen[2]), chosen[3])
+        return self._cfg_of(chosen)
 
     def _num_tiles(self, live_bytes: int, tile_bytes: int | None = None) -> int:
         tb = self.tile_bytes if tile_bytes is None else tile_bytes
