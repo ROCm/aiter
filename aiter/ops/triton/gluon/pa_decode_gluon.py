@@ -5344,7 +5344,8 @@ def pa_decode_gluon(
     ----------
     output : torch.Tensor
         Output tensor for final attention results.
-        - Shape: [num_seqs * query_length, num_query_heads, head_size]
+        - Shape: [num_seqs * query_length, num_query_heads, value_head_size]
+          where value_head_size is the value-cache dimension, independent of Q/K head_size.
         - Dtype: torch.bfloat16, torch.float16
 
     query : torch.Tensor
@@ -5360,8 +5361,8 @@ def pa_decode_gluon(
 
     value_cache : torch.Tensor
         Paged value cache in block layout. Supports two layouts:
-        - Non-transposed shape: [num_blocks, num_kv_heads, head_size, kv_block_size]
-        - Transposed shape: [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+        - Non-transposed shape: [num_blocks, num_kv_heads, value_head_size, kv_block_size]
+        - Transposed shape: [num_blocks, num_kv_heads, kv_block_size // x, value_head_size, x]
           where x = 16 // dtype.itemsize
         - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16
 
@@ -5419,8 +5420,11 @@ def pa_decode_gluon(
 
     temporary_output : torch.Tensor
         Buffer for partial attention outputs from each context partition.
-        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
-        - Dtype: torch.float32
+        - Minimum shape: [num_seqs, num_kv_heads, max_context_partition_num,
+          query_length * query_group_size, value_head_size]
+        - The last dimension must have stride 1; larger reusable buffers are allowed.
+        - Dtype: defaults to query.dtype when allocated internally.
+        - Not used for one-shot execution (a single partition).
 
     alibi_slopes : torch.Tensor, optional
         ALiBi (Attention with Linear Biases) slopes for positional encoding.
@@ -5441,6 +5445,13 @@ def pa_decode_gluon(
       between standard and gluon layouts
     - For FP8 computation, query_scale and key_scale/value_scale are required
     - For BF16/FP16 computation, scales can be None
+    - Asymmetric Q/K and V dimensions require one KV head and persistent dispatch.
+      One-shot execution selects the persistent kernel even when ps=False.
+      Sliding-window attention with page size 1024 bypasses that kernel and is
+      therefore unsupported for asymmetric dimensions, even with ps=True.
+    - The validated asymmetric configuration is Q/K192-V128 on gfx942/gfx950,
+      BF16 or FP8 KV, vectorized 5D page-64 caches, and query length 1 or 4,
+      with full attention or sliding-window attention with sinks.
     """
     if not GLUON_JIT_KERNEL_ENABLED:
         raise RuntimeError(
@@ -5519,9 +5530,14 @@ def pa_decode_gluon(
         "key/value caches must have the same number of KV heads, but got "
         f"key={key_cache.shape}, value={value_cache.shape}"
     )
-    assert key_cache.shape[2] * kv_elements_per_16b == head_size
-    assert key_cache.shape[3] == kv_block_size
-    assert key_cache.shape[4] == kv_elements_per_16b
+    assert key_cache.shape[2] * kv_elements_per_16b == head_size, (
+        f"key_cache must have Q/K head dimension {head_size}, but got "
+        f"shape {key_cache.shape} with vector width {kv_elements_per_16b}"
+    )
+    assert key_cache.shape[4] == kv_elements_per_16b, (
+        f"key_cache must have vector width {kv_elements_per_16b}, "
+        f"but got shape {key_cache.shape}"
+    )
 
     one_shot = max_context_partition_num <= 1
     ps = ps or one_shot
@@ -5555,6 +5571,26 @@ def pa_decode_gluon(
             device=query.device,
             dtype=query.dtype,
         )
+    elif not one_shot:
+        required_shape = (
+            batch_size,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_query_group_size,
+            value_head_size,
+        )
+        if temporary_output.ndim != 5 or any(
+            actual < required
+            for actual, required in zip(temporary_output.shape, required_shape)
+        ):
+            raise ValueError(
+                f"temporary_output must have at least shape {required_shape}, "
+                f"but got {temporary_output.shape}"
+            )
+        if temporary_output.stride(-1) != 1:
+            raise ValueError(
+                "temporary_output must have stride 1 in its last dimension"
+            )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
     stride_query_scale_bs = 0
@@ -5633,12 +5669,21 @@ def pa_decode_gluon(
     if len(value_cache.shape) == 5:
         value_transposed = True
         cache_value_head_size = value_cache.shape[3]
-        assert value_cache.shape[2] == kv_block_size // kv_elements_per_16b
-        assert value_cache.shape[4] == kv_elements_per_16b
+        assert value_cache.shape[2] == kv_block_size // kv_elements_per_16b, (
+            f"value_cache must have {kv_block_size // kv_elements_per_16b} "
+            f"page vectors, but got shape {value_cache.shape}"
+        )
+        assert value_cache.shape[4] == kv_elements_per_16b, (
+            f"value_cache must have vector width {kv_elements_per_16b}, "
+            f"but got shape {value_cache.shape}"
+        )
     elif len(value_cache.shape) == 4:
         value_transposed = False
         cache_value_head_size = value_cache.shape[2]
-        assert value_cache.shape[3] == kv_block_size
+        assert value_cache.shape[3] == kv_block_size, (
+            f"value_cache must have page size {kv_block_size}, "
+            f"but got shape {value_cache.shape}"
+        )
     else:
         raise RuntimeError(f"Unsupported value cache shape: {value_cache.shape}")
     assert cache_value_head_size == value_head_size, (
@@ -5652,7 +5697,9 @@ def pa_decode_gluon(
         )
     if asymmetric_value and not uses_persistent_kernel:
         raise NotImplementedError(
-            "asymmetric Q/K and V head dimensions require the persistent PS kernel"
+            "asymmetric Q/K and V head dimensions require persistent dispatch "
+            "(ps=True or a single partition); sliding_window > 0 with page size "
+            "1024 always bypasses the persistent kernel, even with ps=True"
         )
 
     # ==================== FP8 CONFIGURATION ====================
