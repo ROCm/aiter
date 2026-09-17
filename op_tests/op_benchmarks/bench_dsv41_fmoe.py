@@ -155,6 +155,7 @@ def _graph_call(call):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
+    parser.add_argument("--baseline-csv", type=Path)
     parser.add_argument(
         "--tokens",
         type=int,
@@ -182,7 +183,7 @@ def main():
     torch.cuda.set_stream(torch.cuda.Stream())
     weight1, scale1, weight2, scale2 = _make_weights()
     arms = {
-        "baseline": _config_files(None),
+        "baseline": _config_files(args.baseline_csv),
         "candidate": _config_files(args.csv),
     }
 
@@ -223,8 +224,10 @@ def main():
                     launchers[arm] = launch
                 outputs[arm] = output.clone()
 
-            delta = outputs["candidate"].float() - outputs["baseline"].float()
-            denominator = outputs["baseline"].float().norm().clamp_min(1e-12)
+            baseline_f64 = outputs["baseline"].double()
+            candidate_f64 = outputs["candidate"].double()
+            delta = candidate_f64 - baseline_f64
+            denominator = baseline_f64.norm().clamp_min(1e-12)
             samples = {arm: [] for arm in arms}
             for round_index in range(args.rounds):
                 order = ("baseline", "candidate")
@@ -250,6 +253,10 @@ def main():
                         "speedup": medians["baseline"] / medians["candidate"],
                         "max_abs_delta": float(delta.abs().max()),
                         "relative_l2": float(delta.norm() / denominator),
+                        "finite": {
+                            "baseline": bool(torch.isfinite(baseline_f64).all()),
+                            "candidate": bool(torch.isfinite(candidate_f64).all()),
+                        },
                         "samples_us": samples,
                     }
                 ),
