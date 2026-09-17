@@ -2,34 +2,22 @@ name: Stale branches
 
 # Comments on branches with no commits for 30 days. It never deletes anything.
 #
-# Deleting a stale branch needs somewhere for it to go first. Review asked for
-# the policy the previous cleanup used -- comment and archive at 30 days, 30
-# more days in the archive, then two weeks' notice -- and this action cannot do
-# it: its whole input set is comment, wait, delete, with no archive, rename or
-# tag step, so a longer clock would answer "too aggressive" while leaving "not
-# equivalently recoverable" exactly where it was. The archiving version is a
-# separate proposal; nothing here deletes a ref in the meantime.
+# Review asked for the policy the previous cleanup used -- comment and archive
+# at 30 days, 30 more in the archive, then two weeks' notice -- and this action
+# cannot do it: comment, wait, delete, with no archive, rename or tag step. A
+# longer clock would answer "too aggressive" and leave "not equivalently
+# recoverable" where it was, so days-before-branch-delete below is set past any
+# lifetime this repository will have and the delete stage is unreachable. The
+# job still needs contents: write for commit comments, so that is a
+# configuration guarantee, not a permission one. The archiving version is a
+# separate proposal.
 #
-# days-before-branch-delete below is set past any lifetime this repository will
-# have, which makes the action's delete stage unreachable. The job still needs
-# contents: write because commit comments go through it, so the guarantee is a
-# configuration one, not a permission one -- worth knowing before anyone edits
-# that number.
+# Commenting is off until STALE_BRANCHES_NOTIFY is 'true'; until then every run
+# is a dry run, which posts nothing. Roughly 700 branches are past 30 days, so
+# the first enforcing run comments on up to operations-per-run of them.
+# Deleting the bot's comment stops it coming back until the branch changes.
 #
-# Commenting is off until someone turns it on: every run is a dry run unless
-# the repository variable STALE_BRANCHES_NOTIFY is set to 'true' (Settings >
-# Secrets and variables > Actions), and a dry run posts no comments at all, so
-# nobody is notified while the exemption list is being tuned. Roughly 700
-# branches are past 30 days, so the first enforcing run will comment on up to
-# operations-per-run of them; that is the whole effect it can have.
-#
-# Opting a single branch out needs no admin: delete the bot's comment on it and
-# it will not be commented on again until the branch changes. Branch
-# protection, an open pull request, and the regex below do the same thing
-# permanently.
-#
-# The exemptions below are not preferences, they are things that break if
-# touched. Measured against the repo on 2026-09-15:
+# The exemptions below are not preferences. Measured on 2026-09-15:
 #   release/*, v[0-9]*  16 release branches are already past 30 days
 #   gh-pages            the published documentation site
 #   open PRs            commenting on a branch under review is noise
@@ -63,24 +51,15 @@ jobs:
       - uses: fpicalausa/remove-stale-branches@7c4f2afe88a36c0f9114cd958380979b9d7323fb  # v2.4.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Commenting is opt-in and off until someone turns it on: every run
-          # is a dry run unless the repository variable STALE_BRANCHES_NOTIFY
-          # is set to 'true' (Settings > Secrets and variables > Actions).
-          # Review a dry-run listing, tune the exemptions above, then set it.
-          # The manual input still forces a dry run after that.
+          # Off until STALE_BRANCHES_NOTIFY is 'true' (Settings > Secrets and
+          # variables > Actions). The manual input still forces a dry run.
           dry-run: ${{ inputs.dry_run == true || vars.STALE_BRANCHES_NOTIFY != 'true' }}
           days-before-branch-stale: 30
-          # Effectively never. See the note at the top before changing this:
-          # the action deletes without archiving, which is the thing review
-          # asked us not to do.
+          # Effectively never; read the note at the top before changing it.
           days-before-branch-delete: 36500
-          # Upstream defaults this to 10, which is not a rate limit so much as
-          # a standstill here: roughly 700 branches are past 30 days, so at ten
-          # per weekly run the backlog would take over a year, and a dry run
-          # would only ever list the first ten of it. Only branches it acts on
-          # count, so 300 works the backlog off over about three runs while
-          # still spreading the notifications rather than sending 700 in one
-          # morning. Matches the pull-request workflow.
+          # Upstream's 10 is a standstill here: ~700 branches are past 30
+          # days, so a weekly run would take a year and a dry run would list
+          # only the first ten. Only branches it acts on count toward this.
           operations-per-run: 300
           # Upstream default is false: without this, a branch under review
           # would collect a stale comment while the review is still going.
