@@ -53,6 +53,24 @@ they do not search a wider candidate set. The label `winner` therefore means
 the solution supplied by the artifact, not proof that a full local tuning search
 found the fastest possible Tensile kernel.
 
+### Validated 8192x1536 rerun without `TENSILE_DB2`
+
+The `flydsl_mxf8_tn_34_winner.yaml` config was rerun by itself with
+`TENSILE_DB2` explicitly unset. The client launched the kernel, validation
+passed, and the measured client time was **6.57079 us**. The output is under:
+
+```text
+/tmp/hipblaslt_flydsl_repro.ZX9FzA/rocm-libraries/projects/hipblaslt/
+tensilelite/flydsl_artifacts/run_8192_1536_no_db2
+```
+
+The rerun still reported `Actual Solutions: 1 / 1` and selected the same
+`MT128x128x512` solution as `run1`. A direct same-Python comparison using the
+newly generated directory measured 5.769 us for FlyDSL B and 5.503 us for the
+Tensile winner, with bitwise-equal outputs. An earlier run of the identical
+solution measured 5.663 us and 5.890 us respectively, so the roughly 4-5%
+ordering at this short shape is within observed run-to-run variation.
+
 ## Why the exact winners are slower
 
 The direct results rule out the original database-selection hypothesis for this
