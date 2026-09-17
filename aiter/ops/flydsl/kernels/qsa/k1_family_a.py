@@ -5,9 +5,9 @@
 
 When ``n_columns <= 512``, every visible block is selected and the fused
 short-context kernel emits its id without scoring. Longer rows use independent
-512-column scorer workgroups, an fp32 ``[M, n_columns]`` score buffer, and the
-existing stable FlyDSL per-row radix selector. Decode and prefill share both
-instantiations.
+16/32-column BF16 MFMA scorer workgroups, an fp32 ``[M, n_columns]`` score
+buffer, and the existing stable FlyDSL per-row radix selector. Decode and
+prefill share both instantiations; BLOCK_N=32 is the measured default.
 """
 
 from functools import lru_cache
@@ -244,19 +244,47 @@ def build_qsa_k1_family_a_module(page_size: int):
     return launch_qsa_k1_family_a
 
 
-def build_qsa_k1_family_a_scores_module(page_size: int):
-    """Build the long-context paged scorer with one workgroup per score tile."""
+def build_qsa_k1_family_a_scores_module(
+    page_size: int,
+    use_k32: bool,
+    block_n: int,
+):
+    """Build a long-context paged MFMA scorer."""
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
+    if block_n not in (16, 32):
+        raise ValueError(f"score block_n must be 16 or 32, got {block_n}")
+
+    block_threads = 128
+    head_pad = 16
+    qk_k = 32 if use_k32 else 16
+    qk_vec = qk_k // 4
+    k_steps = 64 // qk_k
+    n_subtiles = block_n // 16
+    vec = 8
+    vec_chunks = _D // vec
+    q_chunks_per_thread = vec_chunks // (block_threads // head_pad)
+    chunks_per_thread = vec_chunks // (block_threads // block_n)
+    num_waves = block_threads // 64
 
     @fx.struct
     class SharedStorage:
-        q: fx.Array[BFloat16, _H * _D, 16]
+        q: fx.Array[BFloat16, head_pad * _D, 16]
+        k: fx.Array[BFloat16, block_n * _D, 16]
+        live: fx.Array[Int32, block_n, 16]
+        c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
 
     @flyc.kernel(
         name="qsa_k1_family_a_scores_"
-        + kernel_signature(ps=page_size, tile=_TILE, h=_H, d=_D, blk=_BLOCK_THREADS),
-        known_block_size=[_BLOCK_THREADS, 1, 1],
+        + kernel_signature(
+            ps=page_size,
+            bn=block_n,
+            h=_H,
+            d=_D,
+            blk=block_threads,
+            qkk=qk_k,
+        ),
+        known_block_size=[block_threads, 1, 1],
     )
     def qsa_k1_family_a_scores_kernel(
         q: fx.Tensor,
@@ -277,19 +305,36 @@ def build_qsa_k1_family_a_scores_module(page_size: int):
         zero = Int32(0)
         one = Int32(1)
         page = Int32(page_size)
-        vec_layout = fx.make_layout(_VEC, 1)
-        k_copy = buf_copy_atom(16, BFloat16)
-        q_load = buf_copy_atom(16, BFloat16)
-        q_store = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+        wave = _idiv(tid, Int32(64))
+        lane = tid - wave * Int32(64)
+        lane_m = lane % Int32(16)
+        lane_kg = _idiv(lane, Int32(16))
+        vec_layout = fx.make_layout(vec, 1)
+        g_copy = buf_copy_atom(16, BFloat16)
         q_buf = fx.rocdl.make_buffer_tensor(q)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
-        q_tile, q_tv = fx.make_layout_tv(
-            fx.make_layout((_H, _D // _VEC), (_D // _VEC, 1)),
-            fx.make_layout((1, _VEC), (_VEC, 1)),
-        )
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        smem_q = storage.q.view(fx.make_layout((_H, _D), (_D, 1)))
+        q_lds = storage.q.view(fx.make_layout((head_pad, _D), (_D, 1)))
+        k_lds = storage.k.view(fx.make_layout((block_n, _D), (_D, 1)))
+        live_lds = storage.live.view(fx.make_layout(block_n, 1))
+        c_lds = storage.c.view(
+            fx.make_layout(
+                (n_subtiles, num_waves, 64, 4),
+                (num_waves * 64 * 4, 64 * 4, 4, 1),
+            )
+        )
+        qk_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, qk_k, BFloat16))
+        qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
+        qk_b = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
+        qk_c = fx.make_rmem_tensor(fx.make_layout(4, 1), Float32)
+
+        def qk_mfma(a_vec, b_vec, c_vec):
+            fx.memref_store_vec(a_vec, qk_a)
+            fx.memref_store_vec(b_vec, qk_b)
+            fx.memref_store_vec(c_vec, qk_c)
+            fx.mma_atom_call(qk_mma, qk_c, qk_a, qk_b, qk_c)
+            return fx.memref_load_vec(qk_c)
 
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
@@ -304,46 +349,75 @@ def build_qsa_k1_family_a_scores_module(page_size: int):
         if (tile == zero) & (tid == zero):
             row_lens[row] = valid_req.select(visible, zero)
 
-        if tid < Int32(_Q_THREADS):
-            q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
-            q_row = fx.slice(q_buf, (row, None, None))
-            q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
-            q_src = q_thr.partition_S(q_block)
-            q_dst = q_thr.partition_D(smem_q)
+        qh = tid % Int32(head_pad)
+        q_chunk = _idiv(tid, Int32(head_pad))
+        q_live = qh < Int32(_H)
+        safe_qh = q_live.select(qh, zero)
+        q_row = fx.logical_divide(fx.slice(q_buf, (row, safe_qh, None)), vec_layout)
+        for part in range_constexpr(q_chunks_per_thread):
+            d_chunk = q_chunk + Int32(part * (block_threads // head_pad))
+            q_src = fx.slice(q_row, (None, d_chunk))
             q_frag = fx.make_fragment_like(q_src)
-            fx.copy(q_load, q_src, q_frag)
-            fx.copy(q_store, q_frag, q_dst)
+            fx.copy(g_copy, q_src, q_frag)
+            q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+            d0 = d_chunk * Int32(vec)
+            for i in range_constexpr(vec):
+                qv = q_live.select(q_vec[i].to(Float32), Float32(0.0))
+                q_lds[qh, d0 + Int32(i)] = qv.to(BFloat16)
+
+        col = tid % Int32(block_n)
+        chunk = _idiv(tid, Int32(block_n))
+        score_col = tile * Int32(block_n) + col
+        col_live = (score_col < n_columns) & (score_col < visible) & valid_req
+        safe_col = col_live.select(score_col, zero)
+        logical_page = _idiv(safe_col, page)
+        off = safe_col - logical_page * page
+        phys = page_table[safe_req, logical_page]
+        k_row = fx.logical_divide(fx.slice(k_buf, (phys, off, zero, None)), vec_layout)
+        for part in range_constexpr(chunks_per_thread):
+            d_chunk = chunk + Int32(part * (block_threads // block_n))
+            k_src = fx.slice(k_row, (None, d_chunk))
+            k_frag = fx.make_fragment_like(k_src)
+            fx.copy(g_copy, k_src, k_frag)
+            k_vec = fx.Vector(fx.memref_load_vec(k_frag))
+            kd0 = d_chunk * Int32(vec)
+            for i in range_constexpr(vec):
+                kv = col_live.select(k_vec[i].to(Float32), Float32(0.0))
+                k_lds[col, kd0 + Int32(i)] = kv.to(BFloat16)
+        if chunk == zero:
+            live_lds[col] = col_live.select(one, zero)
         gpu.barrier()
 
-        col = tile * Int32(_TILE) + tid
-        if col < n_columns:
-            score = _neg_inf()
-            if (col < visible) & valid_req:
-                logical_page = _idiv(col, page)
-                off = col - logical_page * page
-                phys = page_table[safe_req, logical_page]
-                k_row = fx.slice(k_buf, (phys, off, zero, None))
-                k_chunks = fx.logical_divide(k_row, vec_layout)
-                total = Float32(0.0)
+        for ng in range_constexpr(n_subtiles):
+            n_row = Int32(ng * 16) + lane_m
+            acc4 = fx.Vector.filled(4, 0.0, Float32)
+            for ks in range_constexpr(k_steps):
+                md0 = wave * Int32(64) + Int32(ks * qk_k) + lane_kg * Int32(qk_vec)
+                a_vec = fx.Vector.from_elements(
+                    [q_lds[lane_m, md0 + Int32(i)] for i in range_constexpr(qk_vec)],
+                    BFloat16,
+                )
+                b_vec = fx.Vector.from_elements(
+                    [k_lds[n_row, md0 + Int32(i)] for i in range_constexpr(qk_vec)],
+                    BFloat16,
+                )
+                acc4 = fx.Vector(qk_mfma(a_vec, b_vec, acc4))
+            for i in range_constexpr(4):
+                c_lds[ng, wave, lane, i] = acc4[i]
+        gpu.barrier()
+
+        if (wave == zero) & (lane_kg == zero):
+            for ng in range_constexpr(n_subtiles):
+                out_col = tile * Int32(block_n) + Int32(ng * 16) + lane_m
+                score = Float32(0.0)
                 for h in range_constexpr(_H):
-                    q_chunks = fx.logical_divide(
-                        fx.slice(smem_q, (h, None)), vec_layout
-                    )
-                    acc = Float32(0.0)
-                    for chunk in range_constexpr(_D // _VEC):
-                        k_src = fx.slice(k_chunks, (None, chunk))
-                        q_src = fx.slice(q_chunks, (None, chunk))
-                        k_frag = fx.make_fragment_like(k_src)
-                        q_frag = fx.make_fragment_like(q_src)
-                        fx.copy(k_copy, k_src, k_frag)
-                        fx.copy(q_store, q_src, q_frag)
-                        k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                        q_vec = fx.Vector(fx.memref_load_vec(q_frag))
-                        for j in range_constexpr(_VEC):
-                            acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
-                    total = total + fx.max(acc, Float32(0.0))
-                score = total * score_scale
-            scores[row, col] = score
+                    dot = Float32(0.0)
+                    for w in range_constexpr(num_waves):
+                        dot = dot + c_lds[ng, w, lane, h]
+                    score = score + fx.max(dot, Float32(0.0))
+                if out_col < n_columns:
+                    live = live_lds[Int32(ng * 16) + lane_m] != zero
+                    scores[row, out_col] = live.select(score * score_scale, _neg_inf())
 
     @flyc.jit
     def launch_qsa_k1_family_a_scores(
@@ -376,7 +450,7 @@ def build_qsa_k1_family_a_scores_module(page_size: int):
             score_scale,
         ).launch(
             grid=(tiles, rows, 1),
-            block=(_BLOCK_THREADS, 1, 1),
+            block=(block_threads, 1, 1),
             stream=stream,
         )
 
@@ -388,9 +462,9 @@ def _plan(page_size: int):
     return build_qsa_k1_family_a_module(page_size)
 
 
-@lru_cache(maxsize=8)
-def _scores_plan(page_size: int):
-    return build_qsa_k1_family_a_scores_module(page_size)
+@lru_cache(maxsize=16)
+def _scores_plan(page_size: int, use_k32: bool, block_n: int):
+    return build_qsa_k1_family_a_scores_module(page_size, use_k32, block_n)
 
 
 def qsa_k1_family_a_serves(
@@ -431,8 +505,8 @@ def qsa_k1_family_a_block_ids(
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Rows no wider than 512 use the fused emit path. Longer rows materialize
-    scores and invoke FlyDSL's stable per-row radix selector. Expand+tail is
-    still a separate launch.
+    scores with a BLOCK_N=32 MFMA writer and invoke FlyDSL's stable per-row
+    radix selector. Expand+tail is still a separate launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
@@ -480,10 +554,14 @@ def qsa_k1_family_a_block_ids(
             torch.cuda.current_stream(q.device),
         )
     else:
+        score_block_n = 32
         scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
         row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
+        use_k32 = torch.cuda.get_device_properties(q.device).gcnArchName.startswith(
+            "gfx950"
+        )
         _run_compiled(
-            _scores_plan(page_size),
+            _scores_plan(page_size, use_k32, score_block_n),
             q,
             k_cache,
             page_table,
@@ -496,7 +574,7 @@ def qsa_k1_family_a_block_ids(
             int(context_lens.shape[0]),
             float(score_scale),
             m,
-            (n_columns + _TILE - 1) // _TILE,
+            (n_columns + score_block_n - 1) // score_block_n,
             torch.cuda.current_stream(q.device),
         )
         flydsl_top_k_per_row_decode(

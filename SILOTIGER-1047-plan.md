@@ -320,9 +320,9 @@ oracle tie-break on vLLM MQA logits. These AMD microseconds are **not** the
 2d bar.
 
 - [x] **2d.** Family A K1 keeps fused emit for ``n_blocks <= 512``. Long rows
-      materialize fp32 scores with one FlyDSL workgroup per 512-column tile,
-      then call the stable FlyDSL per-row radix selector. Both paths return
-      `block_ids [M, 512]`.
+      materialize fp32 scores with BLOCK_N=32 BF16 MFMA workgroups, then call
+      the stable FlyDSL per-row radix selector. BLOCK_N=16 remains buildable
+      but lost on prefill. Both paths return `block_ids [M, 512]`.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality `err=0`
 on both columns. `aiter/jit/module_top_k_per_row.so` is loaded
@@ -333,8 +333,10 @@ The FlyDSL column keeps the **`n_blocks <= 512` fast path**: every complete
 block is in the top-512, so it writes ids without scoring. For longer rows,
 the old single-workgroup bitonic dispatch is replaced by a global
 `[M, n_blocks]` fp32 score buffer plus `flydsl_top_k_per_row_decode(stable=True)`.
-Scorer tiles are independent workgroups, exposing long-row parallelism.
-Expand remains separate.
+The scorer pads H=4 to an MFMA 16-row tile, splits D=128 across two waves,
+and reduces the partials before summing ReLU across the four real heads.
+BLOCK_N=32 beat BLOCK_N=16 at every material prefill point. Expand remains
+separate.
 
 A 64-bit MSD binary radix-select on the 1024-candidate tile (score order,
 then inverted id, 32 bits each, wave reduce + two barriers per bit) was
@@ -347,22 +349,21 @@ HIP-loaded table. Sixty-four digit passes cost more barriers than the
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
 | 1 | 2048 | 512 | 1.5 | 8.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 16.0 | 17.5 | 0 | 0 |
-| 8 | 8192 | 2048 | 18.2 | 22.1 | 0 | 0 |
-| 1 | 32768 | 8192 | 20.6 | 20.9 | 0 | 0 |
-| 8 | 32768 | 8192 | 23.6 | 25.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 38.7 | 30.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 59.8 | 52.4 | 0 | 0 |
+| 1 | 8192 | 2048 | 10.5 | 18.9 | 0 | 0 |
+| 8 | 8192 | 2048 | 12.7 | 21.7 | 0 | 0 |
+| 1 | 32768 | 8192 | 14.1 | 20.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 19.6 | 25.9 | 0 | 0 |
+| 1 | 131072 | 32768 | 33.7 | 29.8 | 0 | 0 |
+| 8 | 131072 | 32768 | 54.4 | 52.4 | 0 | 0 |
 | 512 | 512 | 128 | 3.1 | 15.9 | 0 | 0 |
 | 512 | 2048 | 512 | 3.0 | 26.9 | 0 | 0 |
-| 512 | 8192 | 2048 | 105.5 | 82.4 | 0 | 0 |
-| 512 | 32768 | 8192 | 363.8 | 249.3 | 0 | 0 |
+| 512 | 8192 | 2048 | 83.8 | 83.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 289.0 | 250.0 | 0 | 0 |
 
-The split path is a large win over the kept bitonic measurements: decode
-8k / 32k / 128k drops from 106.4 / 419.2 / 1718.5 us to
-16.0 / 20.6 / 38.7 us at `M=1`; prefill 8k / 32k drops from
-212.6 / 831.6 us to 105.5 / 363.8 us. It beats the live AMD chain through
-32k in this run, but still loses at decode 128k and at long prefill.
+MFMA improves the scalar split path from 16.0 / 20.6 / 38.7 us to
+10.5 / 14.1 / 33.7 us at `M=1` for 8k / 32k / 128k. Prefill improves from
+105.5 / 363.8 us to 83.8 / 289.0 us at 8k / 32k. It beats live AMD through
+32k decode, ties 8k prefill, and still loses at 128k decode and 32k prefill.
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [x] **2e.** Family B decode kernel, ``H=4`` only, correctness: paged

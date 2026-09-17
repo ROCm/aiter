@@ -260,10 +260,11 @@ set equality `err=0` on both columns (HIP `stable=False` still matched
 this seed).
 
 The FlyDSL column keeps the **`n_blocks <= 512` fast path**: write every
-complete-block id and skip scoring. Longer rows now use independent
-512-column FlyDSL scorer workgroups, a global fp32 `[M, n_blocks]` score
-buffer, and `flydsl_top_k_per_row_decode(stable=True)`. Expand remains
-separate.
+complete-block id and skip scoring. Longer rows use BLOCK_N=32 BF16 MFMA
+scorer workgroups, a global fp32 `[M, n_blocks]` score buffer, and
+`flydsl_top_k_per_row_decode(stable=True)`. H=4 is padded to 16 MFMA rows;
+D=128 is split across two waves. BLOCK_N=16 remains buildable but lost on
+prefill. Expand remains separate.
 
 A 64-bit MSD binary radix-select on the 1024-candidate tile was measured
 and not shipped. Set equality held. Decode ``M=1`` 8k / 32k ~126 / ~497 µs
@@ -273,22 +274,22 @@ vs kept bitonic ~106 / ~419 µs. Sixty-four digit passes vs 55 sort stages.
 |--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
 | 1 | 512 | 128 | 1.4 | 7.6 | 0 | 0 |
 | 1 | 2048 | 512 | 1.5 | 8.1 | 0 | 0 |
-| 1 | 8192 | 2048 | 16.0 | 17.5 | 0 | 0 |
-| 8 | 8192 | 2048 | 18.2 | 22.1 | 0 | 0 |
-| 1 | 32768 | 8192 | 20.6 | 20.9 | 0 | 0 |
-| 8 | 32768 | 8192 | 23.6 | 25.7 | 0 | 0 |
-| 1 | 131072 | 32768 | 38.7 | 30.0 | 0 | 0 |
-| 8 | 131072 | 32768 | 59.8 | 52.4 | 0 | 0 |
+| 1 | 8192 | 2048 | 10.5 | 18.9 | 0 | 0 |
+| 8 | 8192 | 2048 | 12.7 | 21.7 | 0 | 0 |
+| 1 | 32768 | 8192 | 14.1 | 20.3 | 0 | 0 |
+| 8 | 32768 | 8192 | 19.6 | 25.9 | 0 | 0 |
+| 1 | 131072 | 32768 | 33.7 | 29.8 | 0 | 0 |
+| 8 | 131072 | 32768 | 54.4 | 52.4 | 0 | 0 |
 | 512 | 512 | 128 | 3.1 | 15.9 | 0 | 0 |
 | 512 | 2048 | 512 | 3.0 | 26.9 | 0 | 0 |
-| 512 | 8192 | 2048 | 105.5 | 82.4 | 0 | 0 |
-| 512 | 32768 | 8192 | 363.8 | 249.3 | 0 | 0 |
+| 512 | 8192 | 2048 | 83.8 | 83.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 289.0 | 250.0 | 0 | 0 |
 
-Against the previous bitonic dispatch, `M=1` improves from
-106.4 / 419.2 / 1718.5 us to 16.0 / 20.6 / 38.7 us at
-8k / 32k / 128k. `M=512` improves from 212.6 / 831.6 us to
-105.5 / 363.8 us at 8k / 32k. This run beats live AMD through 32k decode,
-but not at 128k decode or long prefill.
+MFMA improves the scalar split path from 16.0 / 20.6 / 38.7 us to
+10.5 / 14.1 / 33.7 us at `M=1` for 8k / 32k / 128k. Prefill improves from
+105.5 / 363.8 us to 83.8 / 289.0 us at 8k / 32k. This run beats live AMD
+through 32k decode, ties 8k prefill, and still loses at 128k decode and
+32k prefill.
 
 ## Phase 2e — family B K1 H=4 emit (not a win)
 
