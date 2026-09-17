@@ -19,9 +19,18 @@ name: PR Title Tags, Labels & Assignees
 # The tag set is documented in CONTRIBUTE.md ("PR Title Format") — keep the
 # two in sync when adding or renaming tags.
 #
-# The PR is also assigned to everyone who has committed to it, so a change
-# several people worked on is not owned by whoever happened to open it. The
-# cap of ten is GitHub's own.
+# The PR can also be assigned to everyone who has committed to it, so a
+# change several people worked on is not owned by whoever happened to open
+# it. That reads the assignee field as "who wrote this" rather than "who is
+# driving it", which is a repo-wide convention call, so it is off unless the
+# repository variable PR_ASSIGN_COMMITTERS is set to 'true' (Settings >
+# Secrets and variables > Actions). Merging this changes nothing until then.
+#
+# Unassigning is final: anyone removed from the PR by hand is never added
+# back, however many times the branch is pushed. GitHub cannot assign anyone
+# without push access, so committers from forks are reported in the job
+# summary rather than silently dropped or given a slot. The cap of ten
+# assignees is GitHub's own.
 #
 # pull_request_target is used so the default token can edit titles on fork
 # PRs as well. This is safe here because the job never checks out or executes
@@ -220,10 +229,12 @@ jobs:
             }
 
       - name: Assign the PR to everyone who committed to it
-        # Add-only. Contributors can appear at any point in a PR's life, so
-        # this runs on pushes too, but it never removes anyone: unassigning
-        # yourself is a human signal and the workflow does not argue with it.
-        if: ${{ contains(fromJSON('["opened", "ready_for_review", "reopened", "synchronize"]'), github.event.action) || (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-title') }}
+        # Add-only, and it honours a removal. Contributors can appear at any
+        # point in a PR's life, so this runs on pushes too; it never removes
+        # anyone, and anyone taken off by hand stays off. Unassigning is a
+        # human signal, and re-adding on the next push would be arguing with
+        # it.
+        if: ${{ vars.PR_ASSIGN_COMMITTERS == 'true' && (contains(fromJSON('["opened", "ready_for_review", "reopened", "synchronize"]'), github.event.action) || (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-title')) }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -257,12 +268,27 @@ jobs:
               weight.set(login, (weight.get(login) || 0) + 1);
             }
 
+            // Anyone whose latest assignment event is a removal is out for
+            // good. Without this the add-only rule only holds until the next
+            // push, which re-adds whoever was just taken off.
+            const lastAction = new Map();
+            const events = await github.paginate(github.rest.issues.listEvents, {
+              owner, repo, issue_number: pr.number, per_page: 100,
+            });
+            for (const e of events) {
+              if (e.event !== 'assigned' && e.event !== 'unassigned') continue;
+              if (e.assignee?.login) lastAction.set(e.assignee.login, e.event);
+            }
+            const removed = new Set(
+              [...lastAction].filter(([, a]) => a === 'unassigned').map(([l]) => l)
+            );
+
             // Most commits first, so that on the rare PR with more than ten
             // contributors the slots go to the people who wrote most of it.
             const ranked = [...weight.entries()]
               .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
               .map(([login]) => login)
-              .filter(login => !already.has(login));
+              .filter(login => !already.has(login) && !removed.has(login));
 
             // The assignees API drops users without push access SILENTLY, so
             // check each one first and keep walking the list rather than
@@ -282,8 +308,16 @@ jobs:
               }
             }
 
+            if (removed.size) {
+              core.info(`Unassigned by hand, left off: ${[...removed].join(', ')}`);
+            }
             if (unassignable.length) {
-              core.info(`Committers without push access: ${unassignable.join(', ')}`);
+              // Nobody reads a job log. GitHub cannot assign a non-collaborator
+              // at all, so this is the only place a fork committer can show up.
+              core.summary.addRaw(
+                `Committers without push access, not assignable: ${unassignable.join(', ')}`
+              );
+              await core.summary.write();
             }
             if (!assignees.length) {
               core.info('No new assignable committers.');
