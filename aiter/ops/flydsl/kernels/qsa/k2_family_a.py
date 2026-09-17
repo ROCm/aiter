@@ -5,11 +5,12 @@
 
 One workgroup per ``(row, kv_head, split)`` gathers ``BLOCK_N`` paged K/V
 with 128-bit D-chunks (one page translate per column owner) and uses MFMA
-for both QK and PV (group padded to 16). Wave 0 runs softmax straight off
-the reduced QK C fragment, so no ``s`` LDS tile is needed. gfx950 uses K32
-QK; gfx942 keeps K16. Split-K uses BF16 partial outputs, and one merge wave
-computes the LSE weights. Decode and prefill share this instantiation.
-Sigmoid and expand+tail stay unfused.
+for both QK and PV (group padded to 16). The next K/V tile is prefetched
+into registers before current-tile QK and carried across the runtime loop.
+Wave 0 runs softmax straight off the reduced QK C fragment, so no ``s`` LDS
+tile is needed. gfx950 uses K32 QK; gfx942 keeps K16. Split-K uses BF16
+partial outputs, and one merge wave computes the LSE weights. Decode and
+prefill share this instantiation. Sigmoid and expand+tail stay unfused.
 """
 
 from functools import lru_cache
@@ -186,6 +187,39 @@ def build_qsa_k2_family_a_module(page_size: int, use_k32: bool):
         col_start = _idiv(split * n_sel, n_splits)
         col_end = _idiv((split + one) * n_sel, n_splits)
 
+        def gather_tile(base):
+            col = tid - _idiv(tid, Int32(_BLOCK_N)) * Int32(_BLOCK_N)
+            chunk = _idiv(tid, Int32(_BLOCK_N))
+            col_i = base + col
+            in_col = col_i < col_end
+            safe_col = in_col.select(col_i, col_start)
+            tok = indices[row, safe_col]
+            live = valid_req & in_col & (tok >= zero)
+            safe_tok = (tok >= zero).select(tok, zero)
+            logical_page = _idiv(safe_tok, page)
+            off = safe_tok - logical_page * page
+            in_table = logical_page < n_pages
+            page_idx = in_table.select(logical_page, zero)
+            phys = page_table[safe_req, page_idx]
+            k_row = fx.logical_divide(
+                fx.slice(k_buf, (phys, off, kv_h, None)), vec_layout
+            )
+            v_row = fx.logical_divide(
+                fx.slice(v_buf, (phys, off, kv_h, None)), vec_layout
+            )
+            regs = []
+            for half in range_constexpr(2):
+                d_chunk = chunk + Int32(half * _CHUNK_STRIDE)
+                k_src = fx.slice(k_row, (None, d_chunk))
+                v_src = fx.slice(v_row, (None, d_chunk))
+                k_frag = fx.make_fragment_like(k_src)
+                v_frag = fx.make_fragment_like(v_src)
+                fx.copy(g_copy, k_src, k_frag)
+                fx.copy(g_copy, v_src, v_frag)
+                regs.append(fx.Vector(fx.memref_load_vec(k_frag)))
+                regs.append(fx.Vector(fx.memref_load_vec(v_frag)))
+            return regs + [live.select(one, zero)]
+
         qh = tid - _idiv(tid, Int32(_HEAD_PAD)) * Int32(_HEAD_PAD)
         q_chunk = _idiv(tid, Int32(_HEAD_PAD))
         q_live = qh < Int32(_GROUP)
@@ -207,7 +241,9 @@ def build_qsa_k2_family_a_module(page_size: int, use_k32: bool):
             l_lds[tid] = Float32(0.0)
         gpu.barrier()
 
-        init_state = [fx.Vector.filled(4, 0.0, Float32) for _c in range(4)]
+        zero_acc = [fx.Vector.filled(4, 0.0, Float32) for _c in range(4)]
+        current_tile = gather_tile(col_start)
+        init_state = zero_acc + current_tile
         span = col_end - col_start
         n_tiles = _idiv(span + Int32(_BLOCK_N - 1), Int32(_BLOCK_N))
         _start = fx.Int64(0)
@@ -220,42 +256,28 @@ def build_qsa_k2_family_a_module(page_size: int, use_k32: bool):
             base = col_start + Int32(t64) * Int32(_BLOCK_N)
             col = tid - _idiv(tid, Int32(_BLOCK_N)) * Int32(_BLOCK_N)
             chunk = _idiv(tid, Int32(_BLOCK_N))
-            col_i = base + col
-            in_col = col_i < col_end
-            safe_col = in_col.select(col_i, col_start)
-            tok = indices[row, safe_col]
-            live = valid_req & in_col & (tok >= zero)
-            safe_tok = (tok >= zero).select(tok, zero)
-            logical_page = _idiv(safe_tok, page)
-            off = safe_tok - logical_page * page
-            in_table = logical_page < n_pages
-            page_idx = in_table.select(logical_page, zero)
-            phys = page_table[safe_req, page_idx]
-            k_row = fx.logical_divide(
-                fx.slice(k_buf, (phys, off, kv_h, None)), vec_layout
-            )
-            v_row = fx.logical_divide(
-                fx.slice(v_buf, (phys, off, kv_h, None)), vec_layout
-            )
+            current_live = Int32(state[8]) != zero
             for half in range_constexpr(2):
                 d_chunk = chunk + Int32(half * _CHUNK_STRIDE)
-                k_src = fx.slice(k_row, (None, d_chunk))
-                v_src = fx.slice(v_row, (None, d_chunk))
-                k_frag = fx.make_fragment_like(k_src)
-                v_frag = fx.make_fragment_like(v_src)
-                fx.copy(g_copy, k_src, k_frag)
-                fx.copy(g_copy, v_src, v_frag)
-                k_vec = fx.Vector(fx.memref_load_vec(k_frag))
-                v_vec = fx.Vector(fx.memref_load_vec(v_frag))
+                k_vec = fx.Vector(state[4 + half * 2])
+                v_vec = fx.Vector(state[5 + half * 2])
                 d0 = d_chunk * Int32(_VEC)
                 for i in range_constexpr(_VEC):
-                    kz = live.select(k_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                    vz = live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
+                    kz = current_live.select(k_vec[i].to(Float32), Float32(0.0)).to(
+                        BFloat16
+                    )
+                    vz = current_live.select(v_vec[i].to(Float32), Float32(0.0)).to(
+                        BFloat16
+                    )
                     k_lds[col, d0 + Int32(i)] = kz
                     v_lds[d0 + Int32(i), col] = vz
             if chunk == zero:
-                live_lds[col] = live.select(one, zero)
+                live_lds[col] = current_live.select(one, zero)
             gpu.barrier()
+
+            # Issue the next paged loads before QK. Their register values are
+            # consumed only after current-tile PV and carried to the next loop.
+            next_tile = gather_tile(base + Int32(_BLOCK_N))
             for ng in range_constexpr(_N_SUBTILES):
                 n_row = Int32(ng * 16) + lane_m
                 acc4 = fx.Vector.filled(4, 0.0, Float32)
@@ -356,7 +378,7 @@ def build_qsa_k2_family_a_module(page_size: int, use_k32: bool):
                     )
                     acc4 = fx.Vector(pv_mfma(p_vec, v_vec, acc4))
                 out_acc.append(acc4)
-            results = yield out_acc
+            results = yield out_acc + next_tile
 
         # Rebuild the views outside the runtime loop so cached slice operations
         # cannot retain a loop/if-local defining operation into the epilogue.
