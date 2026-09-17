@@ -19,9 +19,9 @@ vendored ``buffer_ops`` and ``vector`` modules. The offline tuned-config lookup
 is also aiter-only but lives in ``../conv3d_tuned_config.py``, mirroring how
 ``tuned_gemm.py`` sits outside ``kernels/gemm_a16w16_gfx950.py``. The NCDHW
 pre-transpose is a second kernel with its own cache, so it lives in
-``conv3d_transpose.py``; what the two share is in ``conv3d_common.py``.
+``conv3d_transpose.py``; what the two share is in ``conv3d_gfx950_utils.py``.
 
-Launching goes through ``conv3d_common._dispatch`` rather than aiter's
+Launching goes through ``conv_kernels._dispatch`` rather than aiter's
 ``tensor_shim._run_compiled``: keeping the launcher shape comparable to upstream
 is what makes a re-sync a readable diff, and a conv is launched once per layer
 rather than in a tight loop, so the per-call dispatch ``_run_compiled`` saves
@@ -41,24 +41,25 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T
 
-from .conv3d_common import BF16_BYTES, CONV_COMPILE_HINTS, _as_stream
-
-
-def buffer_atomic_add(vdata, rsrc, offset, soffset, aux):
-    """Buffer-resource atomic fadd (AMD ``raw.ptr.buffer.atomic.fadd``).
-
-    Upstream lives in flydsl's repo-level ``kernels/common/mem_ops.py``, which
-    its wheel does not ship, so aiter keeps this one-line equivalent alongside
-    the vendored ``buffer_ops`` / ``vector`` modules. Operates on a buffer
-    resource plus byte offset, not an ``!llvm.ptr``.
-    """
-    return fx.rocdl.raw_ptr_buffer_atomic_fadd(vdata, rsrc, offset, soffset, aux)
-
+from .conv3d_gfx950_utils import (
+    BF16_BYTES,
+    CONV_COMPILE_HINTS,
+    LDG_VEC,
+    MFMA_C_VALUES,
+    MFMA_M,
+    MFMA_N,
+    WARP_SIZE,
+    _as_stream,
+    barrier,
+    buffer_atomic_add,
+    dil,
+    gather_valid,
+    in_range,
+    sgpr,
+)
 
 TILE_K = 32
-WARP_SIZE = 64
 
 # K tiles consumed between two barriers. Each one is MI_M * MI_N MFMAs, and that product
 # is the only thing that hides global latency here -- see the PIPE_STAGES comment for why
@@ -68,12 +69,6 @@ WARP_SIZE = 64
 # trap: it makes the LDS row stride 128B, exactly one bank rotation, and the resulting
 # ds_read_b128 conflicts cost more than the batching wins (measured ~15% slower).
 TILES_PER_BARRIER = 2
-
-MFMA_M = 16
-MFMA_N = 16
-MFMA_C_VALUES = 4
-
-LDG_VEC = 8
 
 DEFAULT_TILE = (128, 128, 2, 4)
 
@@ -456,21 +451,6 @@ def compile_conv3d_implicit(
             fx.make_view(0, fx.make_layout((TILE_M, TILE_N), (0, 1)))
         )
 
-        def barrier(vmcnt=0, lgkmcnt=None):
-            # Not gpu.barrier(): which counters this waits on is the whole point.
-            # The caller names only the ones it needs, so the DMAs prefetching the
-            # next K tiles stay in flight across the barrier instead of being
-            # drained by it. Naming a counter here is a scheduling decision.
-            fx.rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
-            fx.rocdl.s_barrier()
-
-        def in_range(v, hi):
-            return (v >= 0) & (v < fx.Int64(hi))
-
-        def dil(tap, factor):
-            scaled = tap * factor if const_expr(factor != 1) else tap
-            return scaled
-
         def pad_coord(v, ext, pad):
             """Tap coordinate -> in-bounds input coordinate; returns (coord, mask).
 
@@ -495,12 +475,6 @@ def compile_conv3d_implicit(
                 r = high.select(u - fx.Int64(pad + ext), mid)
                 r = low.select(u + fx.Int64(ext - pad), r)
             return r, None
-
-        def gather_valid(base, *masks):
-            for m in masks:
-                if const_expr(m is not None):
-                    base = base & m
-            return base
 
         _row_dec = []
         for i in range_constexpr(LDG_A_COUNT):
@@ -616,9 +590,6 @@ def compile_conv3d_implicit(
         _lds_dma_ptr_ty = fx.PointerType.get(
             elem_ty.ir_type, fx.AddressSpace.Shared, DMA_BYTES
         )
-
-        def sgpr(x):
-            return fx.Int64(fx.rocdl.readfirstlane(T.i64, fx.Int64(x)))
 
         _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), DMA_BYTES * 8)
 

@@ -27,7 +27,7 @@ import weakref
 import torch
 
 from .conv3d_tuned_config import _lookup_tuned_tile, _num_cu, _pick_tile, _pick_wgm
-from .kernels.conv3d_common import _as_stream
+from .kernels.conv3d_gfx950_utils import _as_stream
 from .kernels.conv3d_implicit import (
     DEFAULT_TILE,
     LDG_VEC,

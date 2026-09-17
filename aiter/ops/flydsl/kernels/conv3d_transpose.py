@@ -24,7 +24,7 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .conv3d_common import BF16_BYTES, CONV_COMPILE_HINTS, _as_stream
+from .conv3d_gfx950_utils import BF16_BYTES, CONV_COMPILE_HINTS, _as_stream
 
 TR_TILE = 64
 TR_VEC = 8
