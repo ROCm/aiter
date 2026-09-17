@@ -24,15 +24,15 @@ preference:
 Write winners into the per-model file, not the header-only canonical
 ``aiter/configs/bf16_tuned_conv3d.csv`` (runtime merges model_configs/).
 
-Usage::
+Model tables are per input resolution, so -i and -o name one::
 
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
-        -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \\
-        -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
+        -i aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_untuned_conv3d.csv \\
+        -o aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_tuned_conv3d.csv
 
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
-        -i aiter/configs/model_configs/wan21_vae_bf16_untuned_conv3d.csv \\
-        -o aiter/configs/model_configs/wan21_vae_bf16_tuned_conv3d.csv
+        -i aiter/configs/model_configs/wan21_vae_480x832_bf16_untuned_conv3d.csv \\
+        -o aiter/configs/model_configs/wan21_vae_480x832_bf16_tuned_conv3d.csv
 """
 
 import os
@@ -44,6 +44,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter import dtypes, logger
+from aiter.jit.core import AITER_CONFIG_CONV3D_BF16
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.conv3d_policy import (
     get_flydsl_conv3d_configs,
@@ -127,8 +128,11 @@ class Conv3dTuner(TunerCommon):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "sort": True,
-        "untune_file": "aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv",
-        "tune_file": "aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv",
+        # The canonical pair, as every other tuner defaults to. Both ship
+        # header-only, so a run without -i finds no shapes rather than tuning
+        # someone else's; a model's own table is passed explicitly.
+        "untune_file": "aiter/configs/bf16_untuned_conv3d.csv",
+        "tune_file": f"{AITER_CONFIG_CONV3D_BF16}",
         "config_env_name": "AITER_CONFIG_CONV3D_BF16",
     }
 

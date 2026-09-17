@@ -34,10 +34,9 @@ python3 setup.py develop
    `qwenimage_vae_1024x1024`, `qwenimage_vae_1328x1328`, `wan21_vae_368x544`,
    `wan21_vae_480x832`.
 
-   Always pass `-i` and `-o` explicitly. The tuner's built-in defaults still
-   name `qwenimage_vae_conv3d_bf16_{un,t}uned.csv`, from before the tables were
-   split by resolution, and no such file exists -- a run without `-i` stops at
-   `AssertionError: Not exist untuned file`.
+   Pass `-i` and `-o` explicitly. The defaults are the canonical pair, which
+   ships header-only, so a run without them finds no shapes and exits rather
+   than tuning a table you did not mean.
 
 3. Tune into the matching per-model tuned table:
 
@@ -102,7 +101,7 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 Benchmark the production operator only, no tuning. Each shape is read
 `RUN_CONFIG_REPS` (3) times and the fastest is kept, because the compare gate
 decides on 3%. Pass `-i` as well: the run still loads the untuned table first,
-and the built-in default for it does not exist (see step 2).
+and the default one is empty (see step 2).
 
 ```bash
 python3 csrc/flydsl_conv3d/conv3d_tune.py \
