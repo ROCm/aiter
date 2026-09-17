@@ -461,6 +461,22 @@ barrier, keep ``BLOCK_N=16``) was measured and not shipped: decode
 flat-to-worse (``M=1`` ~19.1–19.5 µs), prefill ~0.65–0.68 ms vs kept
 ~0.52–0.55 ms. Loop-top barrier stays.
 
+Decode ``M=1`` ``L=512`` rocprofv3 ``--kernel-trace --stats`` (GPU 6,
+12 launches = warmup+iters; PMC ``aqlprofile`` abort). Mean kernel µs:
+
+| kernel | flydsl | vllm_amd |
+|:-------|-------:|---------:|
+| split  | 11.74 | 7.33 |
+| merge  | 7.42 | 4.46 |
+
+ISA (static listing): FlyDSL split has **20× ``ds_write_b16``**, 32×
+``ds_swizzle_b32``, 69× ``s_waitcnt``, 2× K32 + 4× K16 MFMA. Live AMD
+decode split (BN=16) has **0× ``ds_write_b16``**, 4× ``ds_write_b128``
++ 4× ``ds_write_b64``, 0 swizzle, 33× ``s_waitcnt``, 8× K32 + 4× K16
+MFMA. FlyDSL merge is 256 threads with ``global_load_ushort``; AMD
+merge is ``num_warps=2`` with 16× ``buffer_load_dwordx4``. The failed
+64-thread 8-wide-``D`` merge is not this AMD shape.
+
 
 
 

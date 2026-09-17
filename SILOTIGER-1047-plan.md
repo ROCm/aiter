@@ -636,6 +636,15 @@ regressed to ~0.65–0.68 ms vs kept ~0.52–0.55 ms. Extra ~17 KB LDS
 did not hide the remaining K/V + C + P barriers and hurt the
 prefill point. Loop-top barrier stays.
 
+Decode ``M=1`` ``L=512`` rocprofv3 kernel-trace (GPU 6): FlyDSL split
+**11.7 µs** / merge **7.4 µs** vs live AMD **7.3 / 4.5 µs**. PMC
+collection aborted (``aqlprofile``). FlyDSL split ISA still issues
+**20 scalar ``ds_write_b16``** after the 128-bit gather; AMD's BN=16
+split writes LDS with ``ds_write_b128`` / ``ds_write_b64`` only. Merge
+gap is scalar ``global_load_ushort`` plus a 256-thread grid vs AMD's
+2-warp ``buffer_load_dwordx4`` 2D load — not the 64-thread 8-wide-``D``
+merge already measured and dropped.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
