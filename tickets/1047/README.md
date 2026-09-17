@@ -384,6 +384,21 @@ plus an LSE merge. Oracle `err=0`. ~100× vs 3a at ``M=1`` (~103 µs vs
 | 1 | 32768 | 8192 | 2051 | 103.7 | 10.2 | 0 | 0 |
 | 8 | 32768 | 8192 | 2051 | 245.0 | 16.2 | 0 | 0 |
 
+## Phase 3c — family A FlyDSL K2 prefill (same instantiation)
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Prefill ``M=512`` uses
+the 3b split-K kernel (no second compile, no MFMA union). Oracle `err=0`.
+Host uses 1 split (``M * Hk > 512``). ~11.7 ms vs live AMD ~201–285 µs.
+Not a win claim.
+
+| m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | flydsl_k2 err | vllm_amd_gqa err |
+|--:|--------:|---------:|------:|-------------:|----------------:|--------------:|-----------------:|
+| 512 | 512 | 128 | 2051 | 11690.7 | 200.7 | 0 | 0 |
+| 512 | 2048 | 512 | 2051 | 11709.1 | 211.8 | 0 | 0 |
+| 512 | 8192 | 2048 | 2051 | 11831.8 | 246.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 2051 | 11884.8 | 284.6 | 0 | 0 |
+
+
 
 
 

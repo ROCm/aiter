@@ -484,6 +484,23 @@ tiles / MFMA), not more splits.
 | 1 | 32768 | 8192 | 2051 | 103.7 | 10.2 | 0 | 0 |
 | 8 | 32768 | 8192 | 2051 | 245.0 | 16.2 | 0 | 0 |
 
+- [x] **3c.** Prefill ``M=512`` uses the **same** split-K instantiation.
+      Occupancy of the GEMV (1024 WGs at ``splits=1``) did not require a
+      second compile. Do **not** union decode GEMV and prefill MFMA. Separate
+      prefill table; oracle ``checkAllclose``; times recorded, not a win claim.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. Host split
+count matches live AMD (``M * Hk > 512`` → 1 split), so each WG walks the
+full 2051-wide list. Wall is ~11.7 ms vs live AMD ~200–285 µs, and vs
+decode 3b ~103 µs at ``M=1`` (64 splits). 3d owns tiles/MFMA.
+
+| m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | flydsl_k2 err | vllm_amd_gqa err |
+|--:|--------:|---------:|------:|-------------:|----------------:|--------------:|-----------------:|
+| 512 | 512 | 128 | 2051 | 11690.7 | 200.7 | 0 | 0 |
+| 512 | 2048 | 512 | 2051 | 11709.1 | 211.8 | 0 | 0 |
+| 512 | 8192 | 2048 | 2051 | 11831.8 | 246.8 | 0 | 0 |
+| 512 | 32768 | 8192 | 2051 | 11884.8 | 284.6 | 0 | 0 |
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
