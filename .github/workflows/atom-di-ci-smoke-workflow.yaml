@@ -30,6 +30,16 @@ on:
         required: false
         default: true
         type: boolean
+      minimax_m3_mxfp8_model_path:
+        description: "MiniMax-M3-MXFP8 model path visible on Spur nodes"
+        required: false
+        type: string
+        default: "/data/models2/MiniMax-M3-MXFP8"
+      run_minimax_m3_fp8_2p1d_tp8:
+        description: "Run MiniMax-M3-MXFP8 2P+1D TP8 and DPA-TP8 ATOMesh nightly cases"
+        required: false
+        default: false
+        type: boolean
       log_root:
         description: "Root directory for ATOMesh logs"
         required: false
@@ -78,6 +88,11 @@ env:
   GLM_OSL_DEFAULT: "1024"
   GLM_CONC_LIST_DEFAULT: "16"
   GLM_EVAL_CONC_LIST_DEFAULT: "16"
+  ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8_DEFAULT: /data/models2/MiniMax-M3-MXFP8
+  MINIMAX_ISL_LIST_DEFAULT: "8192"
+  MINIMAX_OSL_DEFAULT: "1024"
+  MINIMAX_CONC_LIST_DEFAULT: "16"
+  MINIMAX_EVAL_CONC_LIST_DEFAULT: "128"
   ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
   ATOMESH_SLURM_ACCOUNT: ""
   ATOMESH_SLURM_PARTITION: ""
@@ -121,6 +136,7 @@ jobs:
           # Include GLM in scheduled runs; workflow_dispatch can disable it for
           # targeted DeepSeek-only debugging.
           run_glm = bool_input("run_glm_5_2_fp8", True)
+          run_minimax = bool_input("run_minimax_m3_fp8_2p1d_tp8", False)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
@@ -133,6 +149,14 @@ jobs:
               + value("glm_5_2_fp8_model_path", "ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT")
           )
           print(f"RUN_GLM_5_2_FP8={str(run_glm).lower()}")
+          print(
+              "ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8="
+              + value(
+                  "minimax_m3_mxfp8_model_path",
+                  "ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8_DEFAULT",
+              )
+          )
+          print(f"RUN_MINIMAX_M3_FP8_2P1D_TP8={str(run_minimax).lower()}")
           print(f"ATOMESH_LOG_ROOT={value('log_root', 'ATOMESH_LOG_ROOT_DEFAULT')}")
           print(
               "ATOMESH_SHARED_WORKSPACE_ROOT="
@@ -153,6 +177,10 @@ jobs:
           print(f"GLM_OSL={os.environ['GLM_OSL_DEFAULT']}")
           print(f"GLM_CONC_LIST={os.environ['GLM_CONC_LIST_DEFAULT']}")
           print(f"GLM_EVAL_CONC_LIST={os.environ['GLM_EVAL_CONC_LIST_DEFAULT']}")
+          print(f"MINIMAX_ISL_LIST={os.environ['MINIMAX_ISL_LIST_DEFAULT']}")
+          print(f"MINIMAX_OSL={os.environ['MINIMAX_OSL_DEFAULT']}")
+          print(f"MINIMAX_CONC_LIST={os.environ['MINIMAX_CONC_LIST_DEFAULT']}")
+          print(f"MINIMAX_EVAL_CONC_LIST={os.environ['MINIMAX_EVAL_CONC_LIST_DEFAULT']}")
           PY
 
       - name: Checkout ATOM source
@@ -427,6 +455,23 @@ jobs:
                       "run_eval": True,
                   }
               )
+          if os.environ.get("RUN_MINIMAX_M3_FP8_2P1D_TP8", "false") == "true":
+              for case, topology in (
+                  ("minimax-m3-fp8-2p1d-tp8", "2p1d"),
+                  ("minimax-m3-fp8-2p1d-dpa-tp8", "2p1d_dpa"),
+              ):
+                  requested.append(
+                      {
+                          "model": "MiniMax-M3-MXFP8",
+                          "case": case,
+                          "topology": topology,
+                          "isl": os.environ["MINIMAX_ISL_LIST"],
+                          "osl": os.environ["MINIMAX_OSL"],
+                          "conc": os.environ["MINIMAX_CONC_LIST"],
+                          "eval_conc": os.environ["MINIMAX_EVAL_CONC_LIST"],
+                          "run_eval": True,
+                      }
+                  )
 
           node_pool = [
               node.strip()
@@ -454,7 +499,10 @@ jobs:
 
               cell = matches[0]
               conc = parse_int_list(cfg["conc"])
-              cell["isl"] = isl
+              if "isl" in cfg:
+                  cell["isl"] = parse_int_list(cfg["isl"])
+              else:
+                  cell["isl"] = isl
               cell["osl"] = int(cfg["osl"])
               cell["concurrency"] = conc
               cell["concurrency_x"] = "x".join(str(value) for value in conc)
