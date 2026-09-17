@@ -158,11 +158,31 @@ static inline int occupancy_block_threads(int M, int lds_per_block, int load_cap
 {
     const int lds_blocks = std::max(1, LDS_BYTES_PER_CU / std::max(1, lds_per_block));
     const int g          = grid_blocks_per_cu(M);
-    int waves            = std::max(1, TARGET_WAVES_PER_CU / std::min(lds_blocks, g));
+    const int bound      = std::min(lds_blocks, g);
+    // Ceiling division, then round UP to a power of two. Truncating twice is what
+    // made this formula undershoot: at bound=7 the integer divide turns 4.57 into
+    // 4, which is already a power of two, so a later round-up cannot recover it
+    // (measured +2.2% at M=2048 N=49152).
+    int waves = std::max(1, (TARGET_WAVES_PER_CU + bound - 1) / bound);
     if(load_cap_waves > 0 && g > 1)
         waves = std::min(waves, load_cap_waves);
+    // Round the wave target UP to a power of two, not down.
+    //
+    // Rounding down loses up to 40% of the target whenever the quotient is not
+    // itself a power of two, and phase_a hits exactly those cases as soon as S
+    // leaves {4096, 8192, 16384} -- which only non-pow2 N do. Measured best block
+    // against what rounding down picks, at M=1024..4096:
+    //   lds_blocks=7 (S=4096)          down 256, best 512    -0.0% .. -2.0%
+    //   lds_blocks=6 (S=4608..5504)    down 256, best 512    -0.1% .. -1.1%
+    //   lds_blocks=5 (S=5568..6848)    down 256, best 512    +0.1% .. -3.0%
+    //   lds_blocks=4 (S=6912..8896)    down 512, best 512     agree
+    //   lds_blocks=3 (S=8960..12352)   down 512, best 1024   -0.3% .. -3.0%
+    //   lds_blocks=2 (S=12416+)        down 1024, best 1024   agree
+    // Rounding up reproduces the measured optimum in all six classes, which a
+    // per-class table would also do -- but the formula then keeps working for the
+    // S values nobody measured, and a table would not.
     int pow2 = 1;
-    while(pow2 * 2 <= waves)
+    while(pow2 < waves)
         pow2 *= 2;
     return std::max(4, std::min(16, pow2)) * WAVE_SIZE;
 }
