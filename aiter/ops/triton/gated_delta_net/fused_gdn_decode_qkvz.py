@@ -28,6 +28,7 @@ from typing import Optional, Tuple
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
+    _decode_group,
     _fused_decode,
     _fused_decode_tiled,
 )
@@ -38,6 +39,10 @@ PAD_SLOT_ID = -1
 
 _FP8_QUANT_MAX = {torch.float8_e4m3fn: 448.0, torch.float8_e4m3fnuz: 240.0}
 _HEAD_DIM = 128
+# Batch at which the large-batch decomposition takes over. Measured crossover is
+# between 64 and 128: below it the latency-hiding path wins, above it the
+# register-resident tile does. See notes/gdn-perf-matrix.md.
+_LARGE_BATCH = 128
 _CONV_WIDTH = 4
 
 
@@ -226,7 +231,41 @@ def fused_gdn_decode_qkvz(
         k_heads,
         v_heads,
     )
-    if tokens == 32 or tokens > 64:
+    if tokens >= _LARGE_BATCH:
+        # Large-batch band: a separate decomposition that keeps the whole [V, K]
+        # state tile in registers across both matrix-vector products. Above this
+        # threshold the kernel is bandwidth-bound, where that reaches a better
+        # fraction of peak than the latency-hiding decomposition below; under it
+        # the reverse holds. A range check, so there are no uncovered sizes.
+        _decode_group[(tokens * k_heads,)](
+            projected_qkvz,
+            projected_ba,
+            conv_state,
+            ssm_state,
+            ssm_state_indices,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            norm_weight,
+            out,
+            quantized,
+            scales,
+            scale,
+            norm_eps,
+            quant_max,
+            k_heads,
+            v_heads,
+            head_k_dim,
+            head_v_dim,
+            4 if tokens <= 128 else 8,
+            16,
+            4,
+            PAD_SLOT_ID=pad_slot_id,
+            HAS_FP8=has_fp8,
+            num_warps=4 if tokens <= 128 else 8,
+        )
+    elif tokens == 32 or tokens > 64:
         grid = (tokens * k_heads,) if tokens == 32 else (tokens, k_heads)
         _fused_decode_tiled[grid](
             *launch_args,

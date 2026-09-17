@@ -239,7 +239,7 @@ def _requires_gfx950():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64, 128, 192, 256])
 def test_reference_shapes_and_finiteness(batch):
     inp = make_inputs(batch)
     normalized, quantized, scales = ref_gdn_decode(
@@ -311,7 +311,7 @@ def test_reference_bf16_and_fp8_are_consistent():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64, 128, 192, 256])
 def test_fused_gdn_decode_correctness(batch):
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()

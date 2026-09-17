@@ -21,6 +21,8 @@ guard and the optional FP8 epilogue. Do not hand-edit; see build_aiter_kernel.py
 
   source: gdn_decode_m16.py
   sha256: 16ec8eaf1236ed1f62b495fcc4aaa9294a35e2856affd5d0672d48d5cfae6682
+  source: gdn_decode_m128_m256.py   (large-batch band)
+  sha256: 339400d8b376329c3a727e6c1258d5c43bf54d3147f5707d257ecd1db0e3c9ad
 """
 
 import torch  # noqa: F401  (kept for parity with the aiter op module layout)
@@ -590,3 +592,129 @@ def _fused_decode_tiled(X, BA, History, State, Indices, Weight, Bias, ALog, DTBi
     # Separate convolution storage from the epilogue's conversion scratch to
     # avoid a shared-memory reuse barrier.
     shared._keep_alive()
+
+
+@gluon.jit
+def _conv_channels(
+    Projection, State, Weight, Bias, projection_offset, channel, slot,
+    CHANNELS: gl.constexpr,
+):
+    """Advance width-four convolution; callers assign each channel one owner."""
+    x = gl.load(Projection + projection_offset).to(gl.float32)
+    history_ptr = State + (slot * CHANNELS + channel) * 3
+    h0 = gl.load(history_ptr).to(gl.float32)
+    h1 = gl.load(history_ptr + 1).to(gl.float32)
+    h2 = gl.load(history_ptr + 2).to(gl.float32)
+    w0 = gl.load(Weight + channel * 4).to(gl.float32)
+    w1 = gl.load(Weight + channel * 4 + 1).to(gl.float32)
+    w2 = gl.load(Weight + channel * 4 + 2).to(gl.float32)
+    w3 = gl.load(Weight + channel * 4 + 3).to(gl.float32)
+    acc = gl.load(Bias + channel).to(gl.float32)
+    acc = gl.fma(h0, w0, acc)
+    acc = gl.fma(h1, w1, acc)
+    acc = gl.fma(h2, w2, acc)
+    acc = gl.fma(x, w3, acc)
+    activated = acc / (1.0 + gl.exp(-acc))
+    gl.store(history_ptr, h1)
+    gl.store(history_ptr + 1, h2)
+    gl.store(history_ptr + 2, x)
+    return activated.to(gl.bfloat16).to(gl.float32)
+
+
+@gluon.jit
+def _decode_group(
+    Projection, BA, ConvState, State, Indices, ConvWeight, ConvBias,
+    ALog, DtBias, NormWeight, Output, Quantized, Scales, scale, eps, fp8_max,
+    KH: gl.constexpr, VH: gl.constexpr, K: gl.constexpr, V: gl.constexpr,
+    NW: gl.constexpr, KL: gl.constexpr, KS: gl.constexpr,
+    PAD_SLOT_ID: gl.constexpr, HAS_FP8: gl.constexpr,
+):
+    """One program owns all caches and outputs of a complete Q/K group."""
+    token_group = gl.program_id(0)
+    token = token_group // KH
+    group = token_group % KH
+    ratio: gl.constexpr = VH // KH
+    channels: gl.constexpr = 2 * KH * K + VH * V
+    group_width: gl.constexpr = 2 * K + 2 * ratio * V
+    conv_width: gl.constexpr = 2 * K + ratio * V
+    gl.static_assert(NW * 64 <= conv_width)
+    base = token_group * group_width
+    slot = gl.load(Indices + token).to(gl.int64)
+    if slot == PAD_SLOT_ID:
+        # Padded CUDA-graph row: read no state and write none.
+        return
+    layout: gl.constexpr = gl.BlockedLayout([1, KS], [64 // KL, KL], [NW, 1], [1, 0])
+    k = gl.arange(0, K, layout=gl.SliceLayout(0, layout))
+    v = gl.arange(0, ratio * V, layout=gl.SliceLayout(1, layout))
+    conv_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
+    # This packed tile has no replicated lanes/waves. Every history read and
+    # write has one owner, even though Q/K are subsequently shared by two heads.
+    c = gl.arange(0, conv_width, layout=conv_layout)
+    channel = gl.where(
+        c < K,
+        group * K + c,
+        gl.where(
+            c < 2 * K,
+            KH * K + group * K + c - K,
+            2 * KH * K + group * ratio * V + c - 2 * K,
+        ),
+    )
+    activated = _conv_channels(
+        Projection, ConvState, ConvWeight, ConvBias,
+        base + c, channel, slot, channels,
+    )
+    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    conv_shared = gl.allocate_shared_memory(
+        gl.float32, [conv_width], shared_layout, activated
+    )
+    q = conv_shared.slice(0, K).load(gl.SliceLayout(0, layout))
+    key = conv_shared.slice(K, K).load(gl.SliceLayout(0, layout))
+    value = conv_shared.slice(2 * K, ratio * V).load(gl.SliceLayout(1, layout))
+    q = q * (gl.rsqrt(gl.sum(q * q, 0) + 1.0e-6) * scale)
+    key = key * gl.rsqrt(gl.sum(key * key, 0) + 1.0e-6)
+    head = group * ratio + v // V
+    ba_offset = token * 2 * VH + group * 2 * ratio + v // V
+    a = gl.load(BA + ba_offset + ratio).to(gl.float32)
+    b = gl.load(BA + ba_offset).to(gl.float32)
+    arg = a + gl.load(DtBias + head).to(gl.float32)
+    softplus = gl.where(arg <= 20.0, gl.log(1.0 + gl.exp(arg)), arg)
+    decay = gl.exp(-gl.exp(gl.load(ALog + head)) * softplus)
+    beta = (1.0 / (1.0 + gl.exp(-b))).to(gl.bfloat16).to(gl.float32)
+    state_base = State + (slot * VH + group * ratio) * V * K
+    state_offset = v[:, None] * K + k[None, :]
+    # The full state tile stays in registers through both matrix-vector products.
+    state = gl.amd.cdna3.buffer_load(state_base, state_offset, cache=".cg")
+    decayed = state * decay[:, None]
+    predicted = gl.sum(decayed * key[None, :], 1)
+    residual = (value - predicted) * beta
+    updated = gl.fma(state, decay[:, None], residual[:, None] * key[None, :])
+    out = gl.sum(updated * q[None, :], 1)
+    gl.amd.cdna3.buffer_store(updated, state_base, state_offset, cache=".wt")
+
+    # Preserve the BF16 core boundary before separate per-head RMS reductions.
+    out_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [1, 64], [ratio, NW // ratio], [1, 0]
+    )
+    core = gl.convert_layout(
+        gl.reshape(out.to(gl.bfloat16).to(gl.float32), (ratio, V)), out_layout
+    )
+    h = gl.arange(0, ratio, layout=gl.SliceLayout(1, out_layout))
+    o = gl.arange(0, V, layout=gl.SliceLayout(0, out_layout))
+    gate = gl.load(
+        Projection + base + 2 * K + ratio * V + h[:, None] * V + o[None, :]
+    ).to(gl.float32)
+    weight = gl.load(NormWeight + o).to(gl.float32)
+    rms = gl.rsqrt(gl.sum(core * core, 1) / V + eps)
+    sigmoid = 1.0 / (1.0 + gl.exp(-gate))
+    normalized = (core * rms[:, None] * weight[None, :] * gate * sigmoid).to(gl.bfloat16)
+    out_offset = token_group * ratio * V + h[:, None] * V + o[None, :]
+    gl.store(Output + out_offset, normalized)
+    if HAS_FP8:
+        # FP8 scales must consume the rounded BF16 output, not the FP32 precursor.
+        values = normalized.to(gl.float32)
+        quant_scale = gl.maximum(gl.max(gl.abs(values), 1), 1.0e-10) / fp8_max
+        gl.store(Scales + token_group * ratio + h, quant_scale)
+        gl.store(
+            Quantized + out_offset,
+            gl.clamp(values / quant_scale[:, None], -fp8_max, fp8_max),
+        )
