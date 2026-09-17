@@ -84,12 +84,37 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "MiniMaxM3IndexScoreConfig": (
+        ".kernels.minimax_m3_index_score",
+        "IndexScoreConfig",
+    ),
+    "minimax_m3_index_score_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl",
+    ),
+    "minimax_m3_index_score_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported",
+    ),
+    "minimax_m3_index_score_alloc": (
+        ".kernels.minimax_m3_index_score",
+        "alloc_score",
+    ),
+    "minimax_m3_index_score_work_map": (
+        ".kernels.minimax_m3_index_score",
+        "build_work_map",
+    ),
+    "minimax_m3_index_score_work_map_size": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_size",
+    ),
 }
 
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
+    "MiniMaxM3IndexScoreConfig",
     "compute_varqlen_windows",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_func",
@@ -106,6 +131,11 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
+    "minimax_m3_index_score_alloc",
+    "minimax_m3_index_score_flydsl",
+    "minimax_m3_index_score_flydsl_supported",
+    "minimax_m3_index_score_work_map",
+    "minimax_m3_index_score_work_map_size",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
