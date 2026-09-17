@@ -463,6 +463,27 @@ column; 3b/3d own occupancy and the win.
 | 1 | 32768 | 8192 | 2051 | 10706.1 | 11.2 | 0 | 0 |
 | 8 | 32768 | 8192 | 2051 | 11013.9 | 16.2 | 0 | 0 |
 
+- [x] **3b.** Split-K plus LSE merge on the same 3a ABI (no second math path).
+      Host split count follows live AMD decode occupancy (64 splits when
+      ``M * Hk <= 8``). Pytest vs oracle; decode times vs live AMD recorded,
+      **no win claim**. Prefill is 3c.
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. `err=0`. Decode ``M=1``
+drops from 3a's ~10.6 ms to ~103 µs (~100×) but remains ~10× live AMD
+(``~10 µs``). ``M=8`` is ~246 µs vs ~16 µs. 3d owns the win (vector K/V
+tiles / MFMA), not more splits.
+
+| m | seq_len | n_blocks | width | flydsl_k2 us | vllm_amd_gqa us | flydsl_k2 err | vllm_amd_gqa err |
+|--:|--------:|---------:|------:|-------------:|----------------:|--------------:|-----------------:|
+| 1 | 512 | 128 | 2051 | 101.3 | 10.0 | 0 | 0 |
+| 8 | 512 | 128 | 2051 | 236.8 | 13.3 | 0 | 0 |
+| 1 | 2048 | 512 | 2051 | 103.3 | 10.2 | 0 | 0 |
+| 8 | 2048 | 512 | 2051 | 247.9 | 16.0 | 0 | 0 |
+| 1 | 8192 | 2048 | 2051 | 103.6 | 10.3 | 0 | 0 |
+| 8 | 8192 | 2048 | 2051 | 245.7 | 16.2 | 0 | 0 |
+| 1 | 32768 | 8192 | 2051 | 103.7 | 10.2 | 0 | 0 |
+| 8 | 32768 | 8192 | 2051 | 245.0 | 16.2 | 0 | 0 |
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

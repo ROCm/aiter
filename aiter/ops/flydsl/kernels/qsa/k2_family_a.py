@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K2 (SILOTIGER-1047 3a): sparse GQA decode.
+"""Family A FlyDSL QSA K2 (SILOTIGER-1047 3b): sparse GQA decode with split-K.
 
-One workgroup per ``(row, kv_head)`` attends the expanded token list in the
-paged K/V cache. Group size 12, ``D=256``. Online softmax in registers;
-sigmoid gate and expand+tail stay unfused. Prefill occupancy is 3c.
+One workgroup per ``(row, kv_head, split)`` attends a slice of the expanded
+token list in the paged K/V cache, then a merge kernel combines the partial
+softmax states. Group size 12, ``D=256``. Same ABI as 3a; sigmoid gate and
+expand+tail stay unfused. Prefill occupancy is 3c.
 """
 
 from functools import lru_cache
@@ -26,6 +27,7 @@ _HK = FAMILY_A_GQA.kv_heads
 _GROUP = FAMILY_A_GQA.group_size
 _D = FAMILY_A_GQA.head_dim
 _DEFAULT_SCALE = _D**-0.5
+_LSE_EMPTY = -1.0e20
 
 
 def _idiv(a, b):
@@ -34,6 +36,24 @@ def _idiv(a, b):
 
 def _neg_inf():
     return Float32(float("-inf"))
+
+
+def _choose_splits(rows: int, n_sel: int) -> int:
+    """Match live AMD decode occupancy: many splits when ``M * Hk`` is small."""
+    if n_sel < 1:
+        return 1
+    base = rows * _HK
+    if base <= 8:
+        target = 64
+    elif base < 32:
+        target = 32
+    elif base <= 256:
+        target = 8
+    elif base <= 512:
+        target = 4
+    else:
+        target = 1
+    return max(1, min(target, n_sel))
 
 
 def build_qsa_k2_family_a_module(page_size: int):
@@ -46,15 +66,10 @@ def build_qsa_k2_family_a_module(page_size: int):
 
     @fx.struct
     class SharedStorage:
-        q: fx.Array[BFloat16, _GROUP * _D, 16]
-        k: fx.Array[BFloat16, _D, 16]
-        v: fx.Array[BFloat16, _D, 16]
-        red: fx.Array[Float32, 4, 16]
-        m: fx.Array[Float32, _GROUP, 16]
-        lse: fx.Array[Float32, _GROUP, 16]
+        red: fx.Array[Float32, _GROUP * 4, 16]
 
     @flyc.kernel(
-        name="qsa_k2_family_a_"
+        name="qsa_k2_family_a_split_"
         + kernel_signature(
             ps=page_size,
             hq=_HQ,
@@ -64,64 +79,64 @@ def build_qsa_k2_family_a_module(page_size: int):
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
-    def qsa_k2_family_a_kernel(
+    def qsa_k2_family_a_split_kernel(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         v_cache: fx.Tensor,
         indices: fx.Tensor,
         page_table: fx.Tensor,
         token_to_req: fx.Tensor,
-        out: fx.Tensor,
+        partial_out: fx.Tensor,
+        partial_lse: fx.Tensor,
         n_sel: Int32,
         n_req: Int32,
         n_pages: Int32,
+        n_splits: Int32,
         softmax_scale: Float32,
     ):
         row = Int32(gpu.block_id("x"))
         kv_h = Int32(gpu.block_id("y"))
+        split = Int32(gpu.block_id("z"))
         tid = Int32(gpu.thread_id("x"))
         zero = Int32(0)
         one = Int32(1)
         page = Int32(page_size)
+        wave = _idiv(tid, Int32(64))
         elem_layout = fx.make_layout(1, 1)
         g_copy = buf_copy_atom(2, BFloat16)
-        s_copy = fx.make_copy_atom(fx.UniversalCopy16b(), BFloat16)
         q_buf = fx.rocdl.make_buffer_tensor(q)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        smem_q = storage.q.view(fx.make_layout((_GROUP, _D), (_D, 1)))
-        smem_k = storage.k.view(fx.make_layout(_D, 1))
-        smem_v = storage.v.view(fx.make_layout(_D, 1))
-        red = storage.red.view(fx.make_layout(4, 1))
-        smem_m = storage.m.view(fx.make_layout(_GROUP, 1))
-        smem_l = storage.lse.view(fx.make_layout(_GROUP, 1))
+        red = storage.red.view(fx.make_layout((_GROUP, 4), (4, 1)))
 
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
         safe_req = valid_req.select(req, zero)
+        col_start = _idiv(split * n_sel, n_splits)
+        col_end = _idiv((split + one) * n_sel, n_splits)
 
+        q_regs = []
         for h in range_constexpr(_GROUP):
             head = kv_h * Int32(_GROUP) + Int32(h)
             q_chunks = fx.logical_divide(
                 fx.slice(q_buf, (row, head, None)), elem_layout
             )
-            q_dst = fx.logical_divide(fx.slice(smem_q, (h, None)), elem_layout)
             q_src = fx.slice(q_chunks, (None, tid))
-            q_sm = fx.slice(q_dst, (None, tid))
             q_frag = fx.make_fragment_like(q_src)
             fx.copy(g_copy, q_src, q_frag)
-            fx.copy(s_copy, q_frag, q_sm)
-            smem_m[h] = _neg_inf()
-            smem_l[h] = Float32(0.0)
-        gpu.barrier()
+            q_regs.append(fx.Vector(fx.memref_load_vec(q_frag))[0].to(Float32))
 
-        init_acc = [Float32(0.0) for _h in range(_GROUP)]
-        _start = fx.Int64(0)
-        _stop = fx.Int64(n_sel)
+        init_state = (
+            [_neg_inf() for _h in range(_GROUP)]
+            + [Float32(0.0) for _h in range(_GROUP)]
+            + [Float32(0.0) for _h in range(_GROUP)]
+        )
+        _start = fx.Int64(col_start)
+        _stop = fx.Int64(col_end)
         _step = fx.Int64(1)
-        for col64, state in range(_start, _stop, _step, init=init_acc):
+        for col64, state in range(_start, _stop, _step, init=init_state):
             col = Int32(col64)
             tok = indices[row, col]
             live = valid_req & (tok >= zero)
@@ -137,54 +152,92 @@ def build_qsa_k2_family_a_module(page_size: int):
             v_chunks = fx.logical_divide(
                 fx.slice(v_buf, (phys, off, kv_h, None)), elem_layout
             )
-            k_dst = fx.logical_divide(smem_k, elem_layout)
-            v_dst = fx.logical_divide(smem_v, elem_layout)
             k_src = fx.slice(k_chunks, (None, tid))
             v_src = fx.slice(v_chunks, (None, tid))
-            k_sm = fx.slice(k_dst, (None, tid))
-            v_sm = fx.slice(v_dst, (None, tid))
             k_frag = fx.make_fragment_like(k_src)
             v_frag = fx.make_fragment_like(v_src)
             fx.copy(g_copy, k_src, k_frag)
-            fx.copy(s_copy, k_frag, k_sm)
             fx.copy(g_copy, v_src, v_frag)
-            fx.copy(s_copy, v_frag, v_sm)
-            gpu.barrier()
-            k_f = smem_k[tid].to(Float32)
-            v_f = smem_v[tid].to(Float32)
-            new_acc = []
+            k_f = fx.Vector(fx.memref_load_vec(k_frag))[0].to(Float32)
+            v_f = fx.Vector(fx.memref_load_vec(v_frag))[0].to(Float32)
             for h in range_constexpr(_GROUP):
-                acc = state[h]
-                q_f = smem_q[h, tid].to(Float32)
-                val = q_f * k_f
+                val = q_regs[h] * k_f
                 for sh in (32, 16, 8, 4, 2, 1):
                     val = val + val.shuffle_xor(Int32(sh), Int32(64))
-                red[_idiv(tid, Int32(64))] = val
-                gpu.barrier()
+                red[h, wave] = val
+            gpu.barrier()
+            new_m = []
+            new_l = []
+            new_a = []
+            for h in range_constexpr(_GROUP):
                 score = (
-                    red[zero] + red[one] + red[Int32(2)] + red[Int32(3)]
+                    red[h, zero] + red[h, one] + red[h, Int32(2)] + red[h, Int32(3)]
                 ) * softmax_scale
-                gpu.barrier()
-                m_prev = smem_m[h]
-                l_prev = smem_l[h]
+                m_prev = state[h]
+                l_prev = state[_GROUP + h]
+                acc = state[2 * _GROUP + h]
                 m_new = m_prev.maximumf(score)
                 alpha = fxmath.exp(m_prev - m_new)
                 p = fxmath.exp(score - m_new)
                 l_new = l_prev * alpha + p
                 acc_new = acc * alpha + p * v_f
-                acc_out = live.select(acc_new, acc)
-                smem_m[h] = live.select(m_new, m_prev)
-                smem_l[h] = live.select(l_new, l_prev)
-                gpu.barrier()
-                new_acc.append(acc_out)
-            results = yield new_acc
+                new_m.append(live.select(m_new, m_prev))
+                new_l.append(live.select(l_new, l_prev))
+                new_a.append(live.select(acc_new, acc))
+            gpu.barrier()
+            results = yield new_m + new_l + new_a
 
         for h in range_constexpr(_GROUP):
             head = kv_h * Int32(_GROUP) + Int32(h)
-            l_fin = smem_l[h]
-            acc_h = results[h]
-            out_f = (l_fin > Float32(0.0)).select(acc_h / l_fin, Float32(0.0))
-            out[row, head, tid] = out_f.to(BFloat16)
+            m_fin = results[h]
+            l_fin = results[_GROUP + h]
+            acc_h = results[2 * _GROUP + h]
+            has = l_fin > Float32(0.0)
+            out_f = has.select(acc_h / l_fin, Float32(0.0))
+            lse = has.select(m_fin + fxmath.log(l_fin), Float32(_LSE_EMPTY))
+            partial_out[split, row, head, tid] = out_f
+            partial_lse[split, row, head] = lse
+
+    @flyc.kernel(
+        name="qsa_k2_family_a_merge_"
+        + kernel_signature(hq=_HQ, d=_D, blk=_BLOCK_THREADS),
+        known_block_size=[_BLOCK_THREADS, 1, 1],
+    )
+    def qsa_k2_family_a_merge_kernel(
+        partial_out: fx.Tensor,
+        partial_lse: fx.Tensor,
+        out: fx.Tensor,
+        n_splits: Int32,
+    ):
+        row = Int32(gpu.block_id("x"))
+        head = Int32(gpu.block_id("y"))
+        tid = Int32(gpu.thread_id("x"))
+        m_max = Float32(_LSE_EMPTY)
+        zero_f = Float32(0.0)
+        _start = fx.Int64(0)
+        _stop = fx.Int64(n_splits)
+        _step = fx.Int64(1)
+        for s64, state in range(_start, _stop, _step, init=[m_max, zero_f]):
+            s = Int32(s64)
+            m_in = state[0]
+            lse = partial_lse[s, row, head]
+            results = yield [m_in.maximumf(lse), zero_f]
+        m_max = results[0]
+        acc = Float32(0.0)
+        den = Float32(0.0)
+        for s64, state in range(_start, _stop, _step, init=[acc, den]):
+            s = Int32(s64)
+            acc_in = state[0]
+            den_in = state[1]
+            lse = partial_lse[s, row, head]
+            live = lse > Float32(_LSE_EMPTY)
+            w = live.select(fxmath.exp(lse - m_max), Float32(0.0))
+            part = partial_out[s, row, head, tid]
+            results = yield [acc_in + w * part, den_in + w]
+        acc_f = Float32(results[0])
+        den_f = Float32(results[1])
+        out_f = (den_f > Float32(0.0)).select(acc_f / den_f, Float32(0.0))
+        out[row, head, tid] = out_f.to(BFloat16)
 
     @flyc.jit
     def launch_qsa_k2_family_a(
@@ -194,29 +247,45 @@ def build_qsa_k2_family_a_module(page_size: int):
         indices: fx.Tensor,
         page_table: fx.Tensor,
         token_to_req: fx.Tensor,
+        partial_out: fx.Tensor,
+        partial_lse: fx.Tensor,
         out: fx.Tensor,
         n_sel: Int32,
         n_req: Int32,
         n_pages: Int32,
+        n_splits: Int32,
         softmax_scale: Float32,
         rows: Int32,
         kv_heads: Int32,
+        n_heads: Int32,
         stream: fx.Stream,
     ):
-        qsa_k2_family_a_kernel(
+        qsa_k2_family_a_split_kernel(
             q,
             k_cache,
             v_cache,
             indices,
             page_table,
             token_to_req,
-            out,
+            partial_out,
+            partial_lse,
             n_sel,
             n_req,
             n_pages,
+            n_splits,
             softmax_scale,
         ).launch(
-            grid=(rows, kv_heads, 1),
+            grid=(rows, kv_heads, n_splits),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+        qsa_k2_family_a_merge_kernel(
+            partial_out,
+            partial_lse,
+            out,
+            n_splits,
+        ).launch(
+            grid=(rows, n_heads, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -274,8 +343,9 @@ def qsa_k2_family_a(
 ) -> torch.Tensor:
     """Write family A sparse GQA ``o [M, 24, 256]`` from paged K/V.
 
-    Attends ``indices [M, W]`` (``-1`` padded). Does not apply RoPE or the
-    sigmoid gate. Expand+tail is still a separate launch.
+    Attends ``indices [M, W]`` (``-1`` padded). Split-K plus LSE merge when
+    decode occupancy is low. Does not apply RoPE or the sigmoid gate.
+    Expand+tail is still a separate launch.
     """
     reason = qsa_k2_family_a_serves(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
@@ -305,6 +375,12 @@ def qsa_k2_family_a(
     page_table = page_table.contiguous()
     token_to_req = token_to_req.contiguous()
     page_size = k_cache.shape[1]
+    n_sel = int(indices.shape[1])
+    n_splits = _choose_splits(m, n_sel)
+    partial_out = torch.empty(
+        (n_splits, m, _HQ, _D), dtype=torch.float32, device=q.device
+    )
+    partial_lse = torch.empty((n_splits, m, _HQ), dtype=torch.float32, device=q.device)
     _run_compiled(
         _plan(page_size),
         q,
@@ -313,13 +389,17 @@ def qsa_k2_family_a(
         indices,
         page_table,
         token_to_req,
+        partial_out,
+        partial_lse,
         out,
-        int(indices.shape[1]),
+        n_sel,
         int(page_table.shape[0]),
         int(page_table.shape[1]),
+        n_splits,
         float(softmax_scale),
         int(m),
         int(_HK),
+        int(_HQ),
         torch.cuda.current_stream(q.device),
     )
     return out
