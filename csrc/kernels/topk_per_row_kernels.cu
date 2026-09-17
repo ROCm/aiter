@@ -2086,6 +2086,16 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
                                                    IdxT k)
 {
     constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
+    // Staging area for the compacted candidates. See the comment on the
+    // compact branch below: the candidates are far too sparse to write
+    // straight out, so they are collected here and flushed as one contiguous
+    // run per block.
+    constexpr int kStageCap = 2 * BlockSize;
+    __shared__ T stage_val[kStageCap];
+    __shared__ IdxT stage_idx[kStageCap];
+    __shared__ IdxT stage_cnt;
+    __shared__ IdxT stage_base;
+
     for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
     {
         histogram[i] = 0;
@@ -2094,6 +2104,7 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
     if(threadIdx.x == 0)
     {
         *p_filter_cnt = 0;
+        stage_cnt     = 0;
     }
     __syncthreads();
 
@@ -2144,18 +2155,54 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
         // candidate stalls the whole streaming scan. Pass 1 -- the one pass
         // that still reads the full row -- always has a null in_idx_buf, so
         // specialising it is free and buys the overlap back.
+        //
+        // The staged write goes through LDS rather than straight to `out_buf`,
+        // and the reason is density, not width. At the shapes this gate admits
+        // only about 1.2% of a row survives pass 1 -- 1556 candidates of
+        // 131072 -- which is 0.19 candidate lanes per 64-lane wave per
+        // 16-element step. So a direct `out_buf[atomicAdd(...)] = value` is
+        // one lane writing four bytes per store: 0.051 GB of staged data
+        // measured 658 GB/s against this part's 6642 GB/s write peak, a 10x
+        // transaction amplification, and it cost 77.5us of a 705.1us kernel.
+        // Ablated (both staged stores deleted) the same kernel runs 627.6us
+        // with FETCH_SIZE unchanged at 4.240 GB, so the cost is sub-line write
+        // transactions and not a read-modify-write.
+        //
+        // Collecting into LDS and flushing once per block turns those into one
+        // contiguous run written by all BlockSize threads. Widening the store
+        // would not have helped on its own: with 1.5 candidates per thread
+        // there is nothing to widen, which is why the batching has to be
+        // per block and not per lane.
         auto scan_with = [&](auto index_of) {
             auto process_hist = [histogram, out_buf, out_idx_buf, out, out_idx,
                                  select_min, start_bit,
                                  kth_value_bits, previous_start_bit,
                                  p_filter_cnt, p_out_cnt, index_of](T value, IdxT idx) {
+                // stage_val / stage_idx / stage_cnt are __shared__, so they
+                // have static storage duration and are referenced directly
+                // rather than captured.
                 auto const bits = twiddle_in(value, select_min);
                 auto const pb = (bits >> previous_start_bit) << previous_start_bit;
                 if(pb == kth_value_bits)
                 {
-                    IdxT pos         = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
-                    out_buf[pos]     = value;
-                    out_idx_buf[pos] = index_of(idx);
+                    IdxT slot = atomicAdd(&stage_cnt, static_cast<IdxT>(1));
+                    if(slot < static_cast<IdxT>(kStageCap))
+                    {
+                        stage_val[slot] = value;
+                        stage_idx[slot] = index_of(idx);
+                    }
+                    else
+                    {
+                        // More candidates than LDS holds. The overflow keeps
+                        // the original per-candidate write; it is rare at the
+                        // widths this gate admits and correctness does not
+                        // depend on which of the two routes a candidate takes,
+                        // only on the positions being a permutation of
+                        // [0, current_len).
+                        IdxT pos         = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
+                        out_buf[pos]     = value;
+                        out_idx_buf[pos] = index_of(idx);
+                    }
                     int bucket = __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(start_bit), static_cast<unsigned>(BitsPerPass));
                     atomicAdd(histogram + bucket, static_cast<IdxT>(1));
                 }
@@ -2176,6 +2223,24 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
         else
         {
             scan_with([](IdxT i) { return i; });
+        }
+
+        // One reservation for the whole block, then every thread writes a
+        // contiguous slice of it. Full exec mask, consecutive addresses --
+        // which is the property that was missing, and the only one that
+        // matters to the write path.
+        __syncthreads();
+        IdxT const staged =
+            stage_cnt < static_cast<IdxT>(kStageCap) ? stage_cnt : static_cast<IdxT>(kStageCap);
+        if(threadIdx.x == 0)
+        {
+            stage_base = atomicAdd(p_filter_cnt, staged);
+        }
+        __syncthreads();
+        for(IdxT t = threadIdx.x; t < staged; t += BlockSize)
+        {
+            out_buf[stage_base + t]     = stage_val[t];
+            out_idx_buf[stage_base + t] = stage_idx[t];
         }
     }
 
