@@ -1,38 +1,40 @@
-# Direct `run1` Tensile winners versus FlyDSL B on gfx1250
+# Direct no-DB2 Tensile artifacts versus FlyDSL B on gfx1250
 
 Measured 2026-09-17 on the local gfx1250, 256-CU device.
 
 ## Result
 
-The comparison now loads the exact generated `run1` Tensile library and code
-object for each shape. It does not call the installed hipBLASLt heuristic and
-does not use a separate profiler. Both implementations run in
+The comparison loads the exact freshly generated Tensile library and code
+object for each shape. It does not call the installed hipBLASLt heuristic or
+use a separate profiler. Both implementations run in
 `test_gemm_a8w8_blockscale.py` with its normal Python `perftest` path, the same
 input tensors, the same scales, one hot buffer set, graph replay, two warmups,
 and 100 measured calls.
 
 M is 512. Times are microseconds; lower is better.
 
-| N | K | FlyDSL B | Exact `run1` winner | Winner / B | Result |
+| N | K | FlyDSL B | Exact Tensile solution | Tensile / B | Result |
 |---:|---:|---:|---:|---:|---:|
-| 6144 | 7168 | 14.213 | 15.481 | 1.089x | winner 8.9% slower |
-| 7168 | 3072 | 8.259 | 8.844 | 1.071x | winner 7.1% slower |
-| 7168 | 16384 | 24.500 | 28.940 | 1.181x | winner 18.1% slower |
-| 65536 | 1536 | 22.134 | 22.038 | 0.996x | winner 0.4% faster |
-| 2048 | 7168 | 9.377 | 10.696 | 1.141x | winner 14.1% slower |
-| 8192 | 1536 | 5.663 | 5.890 | 1.040x | winner 4.0% slower |
+| 6144 | 7168 | 14.355 | 15.516 | 1.081x | Tensile 8.1% slower |
+| 7168 | 3072 | 8.455 | 8.799 | 1.041x | Tensile 4.1% slower |
+| 7168 | 16384 | 24.921 | 28.959 | 1.162x | Tensile 16.2% slower |
+| 65536 | 1536 | 21.858 | 22.199 | 1.016x | Tensile 1.6% slower |
+| 2048 | 7168 | 8.910 | 11.012 | 1.236x | Tensile 23.6% slower |
+| 8192 | 1536 | 5.724 | 5.905 | 1.032x | Tensile 3.2% slower |
 
-This is the fresh pybind run after the device recovered. Each shape prints
-`hipBLASLt/Tensile explicit winner` followed by the full solution name, which
-confirms that the generated solution is loaded directly.
+The raw numbers are in
+[the same-script comparison CSV](hipblaslt_tuning/flydsl_comparison.csv). Each
+shape printed `hipBLASLt/Tensile explicit winner` followed by the full solution
+name, confirming that the newly generated solution was loaded directly.
 
 ## Are the tuning results used?
 
-Yes, in this comparison. The bridge searches only under the supplied `run1`
-directory, matches the shape through `ClientParameters.ini`, loads that entry's
-`TensileLibrary.yaml`, loads the adjacent generated code object, and launches
-the library's single solution through `TensileLite::hip::SolutionAdapter`.
-There is no heuristic lookup that could substitute a stock solution.
+Yes, in this comparison. The bridge searches only the index of the newly
+generated no-DB2 artifacts, matches the shape through `ClientParameters.ini`,
+loads that entry's `TensileLibrary.yaml`, loads the adjacent generated code
+object, and launches the library's single solution through
+`TensileLite::hip::SolutionAdapter`. There is no heuristic lookup that could
+substitute a stock solution.
 
 The values in `run1/tuning_results.csv` are not valid performance numbers,
 however. The run used:
@@ -47,7 +49,7 @@ client logged `DEBUG: Skip kernel execution`, produced unrealistically small
 objects can still be launched, which is what the table above measures.
 
 Running the generated clients without `TENSILE_DB2` gave real standalone-client
-times of 6.77-30.15 us across these shapes. Each client reported
+times of 6.57-31.85 us across these shapes. Each client reported
 `Actual Solutions: 1 / 1`: these artifact configs time one prescribed solution;
 they do not search a wider candidate set. The label `winner` therefore means
 the solution supplied by the artifact, not proof that a full local tuning search
@@ -88,30 +90,44 @@ Each rerun reported `Actual Solutions: 1 / 1`. These runs validate the
 prescribed artifact solutions; the inputs do not provide a wider candidate set
 for a full tuning search.
 
-For `(M,N,K)=(512,8192,1536)`, a direct same-Python comparison using the newly
-generated directory measured 5.769 us for FlyDSL B and 5.503 us for the Tensile
-winner, with bitwise-equal outputs. An earlier run of the identical solution
-measured 5.663 us and 5.890 us respectively, so the roughly 4-5% ordering at
-this short shape is within observed run-to-run variation.
+## Why tuning did not improve the result
+
+The no-DB2 generation selected the same full solution name as `run1` for every
+shape. Every input reported `Actual Solutions: 1 / 1`, so `run_tuning.sh` had
+no alternative kernels to compare. Unsetting `TENSILE_DB2` made the generated
+client launch and measure the kernel correctly, but it did not expand the
+candidate set or choose a different implementation.
+
+The direct Tensile times before and after regeneration are also effectively
+the same. A negative change means the new measurement was faster.
+
+| N | K | Previous direct run (us) | New no-DB2 artifact (us) | Change |
+|---:|---:|---:|---:|---:|
+| 6144 | 7168 | 15.481 | 15.516 | +0.2% |
+| 7168 | 3072 | 8.844 | 8.799 | -0.5% |
+| 7168 | 16384 | 28.940 | 28.959 | +0.1% |
+| 65536 | 1536 | 22.038 | 22.199 | +0.7% |
+| 2048 | 7168 | 10.696 | 11.012 | +3.0% |
+| 8192 | 1536 | 5.890 | 5.905 | +0.3% |
 
 ## Why the exact winners are slower
 
 The direct results rule out the original database-selection hypothesis for this
-comparison. The requested `run1` solution is active for every row, and FlyDSL B
-is still faster under the shared Python timing setup.
+comparison. The newly generated solution is active for every row, and FlyDSL B
+is faster under the shared Python timing setup.
 
 Three rows are also not precision-equivalent. FlyDSL B uses BF16 split-K
 partials for `(N,K)=(6144,7168)`, `(2048,7168)`, and `(7168,16384)`, while the
-Tensile winners use FP32 partials or no split-K. The fractions of output elements
-that differ between the two implementations are 0.341667, 0.355141, and
-0.345369 respectively. FlyDSL's 8.9-18.1% advantage on those rows includes
+Tensile solutions use FP32 partials or no split-K. The fractions of output
+elements that differ between the two implementations are 0.341667, 0.355141,
+and 0.345369 respectively. FlyDSL's 8.1-23.6% advantage on those rows includes
 that lower-precision split-K tradeoff.
 
 The other three rows are bitwise equal:
 
-- `(7168,3072)`: winner is 7.1% slower.
-- `(65536,1536)`: winner is 0.4% faster, effectively tied at this noise level.
-- `(8192,1536)`: winner is 4.0% slower.
+- `(7168,3072)`: Tensile is 4.1% slower.
+- `(65536,1536)`: Tensile is 1.6% slower.
+- `(8192,1536)`: Tensile is 3.2% slower.
 
 For those rows, the remaining gap is kernel performance and normal run-to-run
 variation. It is not caused by the tuned solution being skipped or replaced.
@@ -119,14 +135,14 @@ variation. It is not caused by the tuned solution being skipped or replaced.
 ## Reproduce in the same Python script
 
 ```bash
-ENABLE_CK=0 GEMM_BENCH_ROTATE=1 GEMM_BENCH_GRAPH=1 \
+env -u TENSILE_DB2 ENABLE_CK=0 GEMM_BENCH_ROTATE=1 GEMM_BENCH_GRAPH=1 \
 python3 op_tests/test_gemm_a8w8_blockscale.py \
   --flydsl --ck_preshuffle True \
   -m 512 \
   -nk 6144,7168 7168,3072 7168,16384 65536,1536 2048,7168 8192,1536 \
   --data-init uniform --scale-init auto --seed 0 \
   --hipblaslt-winner-dir \
-    /tmp/hipblaslt_flydsl_repro.ZX9FzA/rocm-libraries/projects/hipblaslt/tensilelite/flydsl_artifacts/run1 \
+    /tmp/hipblaslt_flydsl_repro.ZX9FzA/rocm-libraries/projects/hipblaslt/tensilelite/flydsl_artifacts/run_all6_no_db2_index_v2 \
   --hipblaslt-bridge \
     /tmp/hipblaslt_flydsl_repro.ZX9FzA/libwinner_bridge.so
 ```
@@ -140,7 +156,7 @@ Python wrapper passes the existing Torch tensor addresses and current Torch
 stream directly into the Tensile solution adapter. Scale packing and allocation
 remain outside the timed calls.
 
-Build it against the same checkout used to generate `run1`:
+Build it against the same checkout used to generate the Tensile artifacts:
 
 ```bash
 CXX=/usr/local/bin/amdclang++ \
