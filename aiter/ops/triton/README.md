@@ -50,6 +50,33 @@ import from the categorized path** (`aiter.ops.triton.gemm.basic.gemm_a16w16`).
 
 ---
 
+## Framework portability — what may import `torch`
+
+`utils/_triton/` is the torch-free half of the shared machinery. The split
+exists so the Triton kernels and their tuned configs can be imported — or
+snapshotted into another repo — by a framework that is not PyTorch. The live
+case is JAX-Triton (ROCm-supported), where the tensors are created by JAX and
+handed to the same `@triton.jit` kernel.
+
+| Layer | May import `torch`? |
+| ----- | ------------------- |
+| `utils/_triton/` — arch info, `kernel_repr`, pid preprocessing, kernel-side helpers | **No** |
+| Config loading (`utils/config_utils.py`, the `*_config_utils.py` family modules) and `configs/*.json` | **No** |
+| Kernel modules under `_triton_kernels/` and `_gluon_kernels/` | **No** for new modules — a jit body cannot call torch anyway; keep host-side allocation and dtype glue in the wrapper. Modules that already import torch are grandfathered. |
+| `utils/` torch helpers (`shuffle.py`, `types.py`, `common_utils.py`, ...) and every public wrapper | **Yes** — this is where torch belongs |
+
+- A helper both sides need is split, not duplicated: the torch-free part under
+  `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
+  places for exactly this reason.
+- `utils/_triton/tunning/` is exempt — those are standalone tuning harnesses
+  that run in a PyTorch environment, not part of the importable surface.
+- Non-PyTorch users still write their own wrappers. Their framework creates
+  the tensors, so allocation, dtype and layout checks, and the launch belong
+  to them; what crosses the boundary from AITER is the kernel plus its tuned
+  config, not the wrapper.
+
+---
+
 ## Tuned configs
 
 ### One layout, one path builder
@@ -315,6 +342,33 @@ return value, and any special considerations (unsupported options, layout
 expectations such as "weights must be pre-shuffled", etc.).
 
 ---
+
+## Logging
+
+Use the aiter logger, not `print`, and pass the values rather than formatting
+them into the message:
+
+```python
+from aiter import logger
+
+logger.info("resolved config for M=%d N=%d: %s", M, N, config)   # lazy
+# not: logger.info(f"resolved config for M={M} N={N}: {config}") # built every call
+```
+
+An f-string is evaluated before the level check, so it costs a full format on
+every call even when the record is below the configured level — and for a
+kernel wrapper that can mean formatting a tensor repr per launch. Match the
+placeholder to the value: `%d` for counts and dimensions, `%f` for thresholds
+and real scalars, `%s` for tensors, `torch.Size` shapes, tuples and strings.
+`%d` or `%f` on `None` raises when the record is emitted, which logging
+reports as `--- Logging error ---` on stderr instead of raising, so use `%s`
+for anything optional.
+
+Gate verbose output with `logger.debug(...)`, not with an `if` around the
+call; `AITER_LOG_LEVEL=DEBUG` turns it on, and `aiter/__init__.py` applies
+that to the logger and its handler together. Never lower the level by hand
+after import (`logger.setLevel(...)` leaves the handler where it was) and
+never call `logging.basicConfig(...)` from library code.
 
 ## Tests
 

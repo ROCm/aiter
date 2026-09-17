@@ -17,12 +17,9 @@ from flydsl.expr.typing import (
     Float32,
     Int8,
     Int32,
-    T,
 )
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
-
-from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
@@ -662,51 +659,63 @@ def compile_preshuffle_gemm(
         lane_div_16 = lane_id // 16
         lane_mod_16 = lane_id % 16
 
+        def _epi_tiles(arg, tile_elems, *, max_size=True, num_records_bytes=None):
+            # buffer-resource view of a 1D epilogue operand, split into `tile_elems`
+            # tiles so the tile index == element_offset // tile_elems (BufferCopy
+            # soffset is an element count). OOB-clamped by the descriptor.
+            view = fx.rocdl.make_buffer_tensor(
+                arg, max_size=max_size, num_records_bytes=num_records_bytes
+            )
+            return fx.logical_divide(view, fx.make_layout(tile_elems, 1))
+
+        def _epi_read1(tiles, idx, elem_ty, atom):
+            r = fx.make_rmem_tensor(fx.make_layout(1, 1), elem_ty)
+            fx.copy(atom, fx.slice(tiles, (None, fx.Int32(idx))), r)
+            return fx.Vector(fx.memref_load_vec(r))[0]
+
         def load_epi_operands():
             s_a = s_b = bias = None
             if const_expr(is_8bit):
                 # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
-                scale_b_rsrc = buffer_ops.create_buffer_resource(
-                    arg_scale_b, max_size=True
-                )
+                sb_tiles = _epi_tiles(arg_scale_b, 1)
+                sb_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Float32)
                 s_b = [
-                    buffer_ops.buffer_load(
-                        scale_b_rsrc,
-                        fx.Int32(by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16),
-                        vec_width=1,
-                        dtype=T.f32,
+                    _epi_read1(
+                        sb_tiles,
+                        by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16,
+                        fx.Float32,
+                        sb_atom,
                     )
                     for ni in range_constexpr(num_acc_n)
                 ]
-                scale_a_rsrc = buffer_ops.create_buffer_resource(
+                # scale_a: real byte bounds (runtime i32_m) so OOB rows clamp to 0.
+                # dwordx4 (128b) load; the element base is a multiple of 4, so the
+                # tile index (1 tile == 4 f32) is base // 4.
+                sa_tiles = _epi_tiles(
                     arg_scale_a,
+                    4,
                     max_size=False,
                     num_records_bytes=fx.Int64(i32_m) * fx.Int64(4),
                 )
-                s_a = [
-                    Vec(
-                        buffer_ops.buffer_load(
-                            scale_a_rsrc,
-                            fx.Int32(bx_m + mi * 16 + lane_div_16 * 4),
-                            vec_width=4,
-                            dtype=T.f32,
-                        )
-                    ).bitcast(fx.Float32)
-                    for mi in range_constexpr(m_repeat)
-                ]
+                sa_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Float32)
+                s_a = []
+                for mi in range_constexpr(m_repeat):
+                    r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                    idx = fx.Int32(bx_m + mi * 16 + lane_div_16 * 4) // fx.Int32(4)
+                    fx.copy(sa_atom, fx.slice(sa_tiles, (None, idx)), r)
+                    s_a.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Float32))
             if const_expr(_has_bias):
                 # Per-column bias (out_dtype), one scalar per N-block, shared across rows.
-                bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
-                bias_elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
+                bias_elem_ty = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
+                bias_tiles = _epi_tiles(arg_bias, 1)
+                bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(0), bias_elem_ty)
                 bias = [
                     fx.Float32(
-                        buffer_ops.buffer_load(
-                            bias_rsrc,
-                            fx.Int32(
-                                by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16
-                            ),
-                            vec_width=1,
-                            dtype=bias_elem_ty,
+                        _epi_read1(
+                            bias_tiles,
+                            by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16,
+                            bias_elem_ty,
+                            bias_atom,
                         )
                     )
                     for ni in range_constexpr(num_acc_n)
@@ -773,9 +782,7 @@ def compile_preshuffle_gemm(
                 val_s = apply_activation(val_s)
                 out_elems.append(val_s.to(out_elem_cls))
 
-            out_vec = vector.from_elements(
-                T.vec(acc_size, out_elem_cls.ir_type), out_elems
-            )
+            out_vec = fx.Vector.from_elements(out_elems, out_elem_cls)
             frag_C_out.store(out_vec)
 
         fx.copy(buf_copy_out, frag_C_retile, pC_g)

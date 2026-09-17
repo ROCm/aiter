@@ -49,6 +49,7 @@ import os
 import torch
 import triton
 
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
@@ -61,6 +62,13 @@ _LOGGER = AiterTritonLogger()
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
+
+# Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
+_ARCH_ALIAS = {
+    "gfx1101": "gfx1100",
+    "gfx1102": "gfx1100",
+    "gfx1150": "gfx1151",
+}
 
 _SEP = "."
 
@@ -300,9 +308,13 @@ def _axis_values(
     }
 
 
-def _load(op: str, backend, arch) -> tuple:
+def _load(op: str, backend, arch: str | None) -> tuple:
     """Return ``(table, axes, cfg_dir)`` for one op."""
-    cfg_dir = resolve_config_dir("attention", _CONFIG_NAME, backend=backend, arch=arch)
+    if arch is None:
+        arch = arch_info.get_arch()
+    cfg_dir = resolve_config_dir(
+        "attention", _CONFIG_NAME, backend=backend, arch=_ARCH_ALIAS.get(arch, arch)
+    )
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     if config is None:
         raise AssertionError(
