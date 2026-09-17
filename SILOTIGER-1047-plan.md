@@ -542,6 +542,13 @@ Prefill:
 | 512 | 8192 | 2048 | 2051 | 570.6 | 248.5 | 260.9 | 0 |
 | 512 | 32768 | 8192 | 2051 | 573.5 | 286.9 | 282.4 | 0 |
 
+A second gfx950 ``BLOCK_N=64`` compile was measured and **not shipped**.
+Live AMD's prefill rule (``BLOCK_N=64``, ``splits=1``) is ~1.01–1.17 ms
+here; keeping the 8-split cap is ~1.12–1.29 ms. Both lose to the
+``BLOCK_N=16`` / 8-split kernel (~0.54–0.57 ms). The 64-wide tile needs
+~90 KB LDS (over gfx942's 64 KB) and four N-subtiles of QK/PV. Decode
+stays ``BLOCK_N=16``.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

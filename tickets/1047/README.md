@@ -433,6 +433,11 @@ Prefill:
 | 512 | 8192 | 2048 | 2051 | 570.6 | 248.5 | 260.9 | 0 |
 | 512 | 32768 | 8192 | 2051 | 573.5 | 286.9 | 282.4 | 0 |
 
+A gfx950 ``BLOCK_N=64`` second compile was measured and not shipped:
+``splits=1`` ~1.01–1.17 ms, ``splits=8`` ~1.12–1.29 ms, both slower than
+``BLOCK_N=16`` / 8-split (~0.54–0.57 ms). ~90 KB LDS; gfx942 cannot hold
+that tile.
+
 
 
 
