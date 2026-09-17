@@ -109,13 +109,13 @@ def calculate_heap_size(
     total_with_overhead = math.ceil(total_bytes * overhead_factor)
 
     logger.debug(
-        "Heap size calculation: M=%d, N=%d, dtype=%s, world_size=%d, "
+        "Heap size calculation: M=%d, N=%d, dtype=%s, world_size=%s, "
         "quant_mode=%s, all_gather=%s\n"
         "  Input: %d bytes\n"
         "  RS buffer: %d bytes\n"
         "  Quant buffer: %d bytes\n"
         "  Gather buffer: %d bytes\n"
-        "  Total (with %sx overhead): %d bytes (%.2f GB)",
+        "  Total (with %fx overhead): %d bytes (%.2f GB)",
         M,
         N,
         dtype,

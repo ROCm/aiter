@@ -450,7 +450,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         - kv_cache: Updated KV cache (modified in-place)
     """
     _LOGGER.info(
-        "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%s is_neox=%s",
+        "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%d is_neox=%s",
         tuple(q_nope.shape),
         tuple(w_k.shape),
         tuple(w_k_scale.shape),
