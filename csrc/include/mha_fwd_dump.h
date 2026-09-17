@@ -44,6 +44,18 @@
 
 namespace aiter {
 
+namespace detail {
+// File-scope sink handle. Kept in a `detail` sub-namespace so the
+// `std::atexit` handler installed on first open can flush/close it
+// directly, without calling back into `mha_dump_sink()` (which would
+// otherwise re-enter its own `std::call_once` and confuse reviewers).
+inline std::FILE*& sink_fp()
+{
+    static std::FILE* fp = nullptr;
+    return fp;
+}
+} // namespace detail
+
 inline int get_mha_dump_stride()
 {
     static const int stride = [] {
@@ -90,13 +102,15 @@ inline const std::string& mha_dump_output_path()
 
 // One-time initialised sink FILE*. Returns nullptr if the file could not
 // be opened, in which case callers should fall back to std::cerr. The
-// FILE* lives inside a function-local static so the `std::atexit` handler
-// registered on first open can safely close it during normal shutdown.
+// actual handle lives in `detail::sink_fp()` so the `std::atexit`
+// handler installed here can close it by directly referencing that
+// file-scope variable, without recursing back through `mha_dump_sink()`
+// (which would re-enter `std::call_once`).
 inline std::FILE* mha_dump_sink()
 {
-    static std::FILE* fp = nullptr;
     static std::once_flag once;
     std::call_once(once, [] {
+        std::FILE*& fp          = detail::sink_fp();
         const std::string& path = mha_dump_output_path();
         if(!path.empty())
             fp = std::fopen(path.c_str(), "a");
@@ -111,10 +125,16 @@ inline std::FILE* mha_dump_sink()
                          path.c_str());
             // Flush residual buffer on normal shutdown. SIGKILL bypasses
             // this, but per-write fflush() below still keeps the log
-            // durable on disk up to the last completed line.
+            // durable on disk up to the last completed line. The lambda
+            // references the file-scope handle directly, so it does not
+            // re-enter `mha_dump_sink()` / `std::call_once`.
             std::atexit([] {
-                if(std::FILE* g = mha_dump_sink())
+                std::FILE*& g = detail::sink_fp();
+                if(g)
+                {
                     std::fclose(g);
+                    g = nullptr;
+                }
             });
         }
         else
@@ -127,7 +147,7 @@ inline std::FILE* mha_dump_sink()
                          std::strerror(errno));
         }
     });
-    return fp;
+    return detail::sink_fp();
 }
 
 // Write one already-formatted record to the configured sink, holding the
