@@ -53,23 +53,46 @@ they do not search a wider candidate set. The label `winner` therefore means
 the solution supplied by the artifact, not proof that a full local tuning search
 found the fastest possible Tensile kernel.
 
-### Validated 8192x1536 rerun without `TENSILE_DB2`
+### Validated six-shape rerun without `TENSILE_DB2`
 
-The `flydsl_mxf8_tn_34_winner.yaml` config was rerun by itself with
-`TENSILE_DB2` explicitly unset. The client launched the kernel, validation
-passed, and the measured client time was **6.57079 us**. The output is under:
+All six artifact configs were rerun individually with `TENSILE_DB2` explicitly
+unset. Every generated client launched its kernel and passed validation.
+
+| M | N | K | Generated-client time (us) |
+|---:|---:|---:|---:|
+| 512 | 6144 | 7168 | 17.1531 |
+| 512 | 7168 | 3072 | 9.66048 |
+| 512 | 7168 | 16384 | 31.8504 |
+| 512 | 65536 | 1536 | 24.8367 |
+| 512 | 2048 | 7168 | 12.6956 |
+| 512 | 8192 | 1536 | 6.57079 |
+
+The complete solution names and times are in
+[the combined tuning CSV](hipblaslt_tuning/tuning_results.csv). The six
+one-shape outputs were merged into
+[one gfx1250 library-logic config](hipblaslt_tuning/gfx1250_Cijk_Alik_Bljk_F8BS_MXAE8B32_MXBE8B32_BH_UserArgs.yaml).
+It contains six solutions with indices `0..5` and six corresponding
+`ExactLogic` entries. `TensileLogic --check-all` reports `Total 6 solutions`,
+`Keep 6 solutions`, and `Reject 0 solutions`.
+
+The raw generated outputs are under:
 
 ```text
+/tmp/hipblaslt_flydsl_repro.ZX9FzA/rocm-libraries/projects/hipblaslt/
+tensilelite/flydsl_artifacts/run_other5_no_db2
 /tmp/hipblaslt_flydsl_repro.ZX9FzA/rocm-libraries/projects/hipblaslt/
 tensilelite/flydsl_artifacts/run_8192_1536_no_db2
 ```
 
-The rerun still reported `Actual Solutions: 1 / 1` and selected the same
-`MT128x128x512` solution as `run1`. A direct same-Python comparison using the
-newly generated directory measured 5.769 us for FlyDSL B and 5.503 us for the
-Tensile winner, with bitwise-equal outputs. An earlier run of the identical
-solution measured 5.663 us and 5.890 us respectively, so the roughly 4-5%
-ordering at this short shape is within observed run-to-run variation.
+Each rerun reported `Actual Solutions: 1 / 1`. These runs validate the
+prescribed artifact solutions; the inputs do not provide a wider candidate set
+for a full tuning search.
+
+For `(M,N,K)=(512,8192,1536)`, a direct same-Python comparison using the newly
+generated directory measured 5.769 us for FlyDSL B and 5.503 us for the Tensile
+winner, with bitwise-equal outputs. An earlier run of the identical solution
+measured 5.663 us and 5.890 us respectively, so the roughly 4-5% ordering at
+this short shape is within observed run-to-run variation.
 
 ## Why the exact winners are slower
 
