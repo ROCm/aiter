@@ -12,8 +12,8 @@ For example, BS200/MTP4 with FP8 per-token KV scales and explicit split counts::
 Contexts have equal lengths and include the MTP query tokens. Query position
 ``p`` attends to ``max(0, context_length - query_length + 1 + p)`` KV tokens.
 Timing includes the FlyDSL attention kernel and its native FlyDSL reduction.
-Automatic splits use the host-known context length and GPU occupancy, up to
-256 partitions. Use ``--max-partitions 8`` for the legacy clamp, or
+Automatic splits use the host-known context length, MTP length and GPU occupancy,
+up to 256 partitions. Use ``--max-partitions 8`` for the legacy clamp, or
 ``--num-partitions`` to bypass the recommendation with exact counts.
 """
 
@@ -529,6 +529,7 @@ def run_pa_decode_tile_case(
             split_kv_blocks=KV_COMPUTE_BLOCK // block_size,
             max_partitions=max_partitions,
             max_context_length=context_length,
+            query_length=query_length,
         )
 
     torch.manual_seed(0)
@@ -967,6 +968,7 @@ def test_pa_decode(case, monkeypatch):
             split_kv_blocks=KV_COMPUTE_BLOCK // case["block_size"],
             max_partitions=max_partitions,
             max_context_length=case["context_length"],
+            query_length=case["query_length"],
         )
     else:
         expected_partitions = explicit_partitions
@@ -1144,14 +1146,18 @@ def test_sliding_window_plan_covers_absolute_tiles(
 
 
 @pytest.mark.parametrize("sliding_window,query_length", [(0, 1), (1, 4), (257, 3)])
-def test_plan_graph_refresh_overwrites_old_metadata(sliding_window, query_length):
+@pytest.mark.parametrize("max_parts", [7, 256])
+def test_plan_graph_refresh_overwrites_old_metadata(
+    sliding_window, query_length, max_parts
+):
     lengths = [200003] * 8
     context = torch.tensor(lengths, dtype=torch.int32)
     plan_options = {
         "sliding_window": sliding_window,
         "query_length": query_length,
     }
-    plan = plan_pa_decode(context, 1, **plan_options)
+    plan = plan_pa_decode(context, 1, max_partitions=max_parts, **plan_options)
+    counts = plan.num_partitions
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         plan_pa_decode(context, 1, plan=plan, **plan_options)
@@ -1159,6 +1165,7 @@ def test_plan_graph_refresh_overwrites_old_metadata(sliding_window, query_length
         context.copy_(torch.tensor(lengths, dtype=torch.int32))
         graph.replay()
         _assert_plan(plan, lengths)
+        assert counts.count_nonzero().item() == sum(length > 0 for length in lengths)
 
 
 def _planned_call(*args, **kwargs):
@@ -1398,9 +1405,19 @@ def test_planned_decode_register_reducer_chunk_boundary(monkeypatch, long_contex
 @pytest.mark.parametrize(
     "sliding_window,query_length", [(0, 4), (1, 4), (257, 3), (8193, 4)]
 )
+@pytest.mark.parametrize("compact", [False, True])
 def test_planned_decode_graph_replay_with_poisoned_scratch(
-    monkeypatch, sliding_window, query_length
+    monkeypatch, sliding_window, query_length, compact
 ):
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_reduce = module.compile_pa_decode_ps_reduce
+
+    def select_reduce(**kwargs):
+        kwargs["compact_work_plan"] = compact
+        return compile_reduce(**kwargs)
+
+    monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", select_reduce)
+
     def capture_and_replay(*args, **kwargs):
         output, query, key, _value, context = args[:5]
         heads, rows = (
@@ -1468,7 +1485,9 @@ def test_plan_rejects_incompatible_reuse():
     context = torch.tensor([1, 257], dtype=torch.int32)
     plan = plan_pa_decode(context, 1, max_partitions=7)
     with pytest.raises(ValueError, match="max_partitions"):
-        plan_pa_decode(context, 1, plan=plan)
+        plan_pa_decode(context, 1, max_partitions=8, plan=plan)
+    with pytest.raises(TypeError, match="plan must be a PADecodePlan"):
+        plan_pa_decode(context, 1, plan=object())
     with pytest.raises(ValueError, match="KV head"):
         plan_pa_decode(context, 2, max_partitions=7, plan=plan)
     with pytest.raises(ValueError, match="shape"):
@@ -1901,17 +1920,29 @@ def test_sinks_negative_infinity_matches_none(
 
 
 @pytest.mark.parametrize(
-    "planned,head_dim,query_length,window,parts,sink_dtype",
+    "planned,head_dim,query_length,window,parts,sink_dtype,compact",
     [
-        (True, 128, 4, 257, 7, torch.float32),
-        (True, 256, 3, 0, 86, torch.bfloat16),
-        (False, 128, 4, 1, 7, torch.float16),
-        (False, 64, 2, 0, 86, torch.float32),
+        (True, 128, 4, 257, 7, torch.float32, False),
+        (True, 256, 3, 0, 86, torch.bfloat16, False),
+        (False, 128, 4, 1, 7, torch.float16, False),
+        (False, 64, 2, 0, 86, torch.float32, False),
+        (True, 128, 4, 0, 256, torch.float32, True),
+        (True, 128, 4, 257, 256, torch.float32, True),
     ],
 )
 def test_sinks_graph_replay_with_updated_logits_and_poisoned_scratch(
-    planned, head_dim, query_length, window, parts, sink_dtype
+    monkeypatch, planned, head_dim, query_length, window, parts, sink_dtype, compact
 ):
+    if compact:
+        module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+        compile_reduce = module.compile_pa_decode_ps_reduce
+
+        def compact_reduce(**kwargs):
+            kwargs["compact_work_plan"] = True
+            return compile_reduce(**kwargs)
+
+        monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", compact_reduce)
+
     args, reference = _make_sink_case(
         [513, 4, 1, 0],
         query_length=query_length,
@@ -2128,6 +2159,235 @@ def test_mtp4_fused_phase_b_accuracy(
     _run_mtp4_fused_reference_case(
         lengths, num_kv_heads, block_size, trans_v, num_partitions
     )
+
+
+@pytest.mark.parametrize("max_parts", [1, 7, 256])
+def test_planned_partition_argument_inference_and_compatibility(monkeypatch, max_parts):
+    def compare_calls(*args, **kwargs):
+        output = args[0]
+        plan = plan_pa_decode(args[4], args[2].shape[1], max_partitions=max_parts)
+        call_kwargs = dict(
+            context_partition_size=args[9],
+            compute_type=args[10],
+            query_scale=args[11],
+            key_scale=args[12],
+            value_scale=args[13],
+            **kwargs,
+        )
+        # Omit the partition argument entirely: the plan is the source of both
+        # the compilation bound and the GPU-resident per-request work counts.
+        pa_decode(*args[:8], work_plan=plan, **call_kwargs)
+        inferred = output.clone()
+        for bound in (None, max_parts):
+            output.fill_(float("nan"))
+            pa_decode(
+                *args[:8],
+                max_context_partition_num=bound,
+                work_plan=plan,
+                **call_kwargs,
+            )
+            torch.testing.assert_close(output, inferred, rtol=0, atol=0)
+        # Preserve the existing all-positional public calling convention.
+        output.fill_(float("nan"))
+        pa_decode(*args, work_plan=plan, **kwargs)
+        torch.testing.assert_close(output, inferred, rtol=0, atol=0)
+        with pytest.raises(ValueError, match="required without work_plan"):
+            pa_decode(*args[:8], **call_kwargs)
+        with pytest.raises(TypeError, match="work_plan must be a PADecodePlan"):
+            pa_decode(*args[:8], work_plan=object(), **call_kwargs)
+        with pytest.raises(ValueError, match="must match work_plan.max_partitions"):
+            pa_decode(
+                *args[:8],
+                max_context_partition_num=2 if max_parts == 1 else max_parts - 1,
+                work_plan=plan,
+                **call_kwargs,
+            )
+
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", compare_calls)
+    _run_mtp4_fused_reference_case([0, 1, 257, 4099], 1, 128, True, max_parts)
+
+
+@pytest.mark.parametrize("split_kv_blocks", [2, 16])
+@pytest.mark.parametrize(
+    "batch,context,query_length,clamp,expected",
+    [
+        (1, 200000, 4, None, 256),
+        (8, 200000, 4, None, 64),
+        (16, 200000, 4, None, 32),
+        (64, 100000, 4, None, 8),
+        (200, 200000, 2, None, 8),
+        (200, 200000, 3, None, 16),
+        (200, 200000, 4, None, 16),
+        (200, 200000, 4, 8, 8),
+        (200, 200000, 4, 5, 5),
+    ],
+)
+def test_recommended_splits_bounds_mtp_work(
+    monkeypatch, split_kv_blocks, batch, context, query_length, clamp, expected
+):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_args, **_kwargs: type("Props", (), {"multi_processor_count": 256})(),
+    )
+    assert (
+        get_recommended_splits(
+            batch,
+            1,
+            split_kv_blocks,
+            clamp,
+            max_context_length=context,
+            query_length=query_length,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "lengths,query_length,budget,max_parts,capacity",
+    [
+        ([200000] * 200, 4, None, 256, 3200),
+        ([200003] + [257] * 199, 4, None, 256, 512),
+        ([100000] * 64, 4, None, 256, 512),
+        ([200000], 4, None, 256, 256),
+        ([200000] * 200, 1, None, 256, 512),
+        ([200000] * 200, 4, 800, 256, 800),
+        ([200000] * 200, 4, None, 8, 1600),
+    ],
+)
+def test_plan_context_work_hint(
+    monkeypatch, lengths, query_length, budget, max_parts, capacity
+):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_args, **_kwargs: type("Props", (), {"multi_processor_count": 256})(),
+    )
+    context = torch.tensor(lengths, dtype=torch.int32)
+    plan = plan_pa_decode(
+        context,
+        1,
+        max_partitions=max_parts,
+        workgroup_budget=budget,
+        total_context_length=sum(lengths),
+        query_length=query_length,
+    )
+    assert plan.capacity == capacity
+    _assert_plan(plan, lengths)
+    # The hint sizes buffers once. A refreshed plan must cover new lengths
+    # correctly even when the original total-work estimate no longer applies.
+    updated = [0] * len(lengths)
+    updated[-1] = 200003
+    context.copy_(torch.tensor(updated, dtype=torch.int32))
+    plan_pa_decode(context, 1, max_partitions=max_parts, plan=plan)
+    _assert_plan(plan, updated)
+    with pytest.raises(ValueError, match="only used when creating"):
+        plan_pa_decode(
+            context,
+            1,
+            max_partitions=max_parts,
+            total_context_length=sum(updated),
+            plan=plan,
+        )
+
+
+@pytest.mark.parametrize("max_parts", [65, 86, 128, 256])
+@pytest.mark.parametrize("block_size,trans_v", [(16, False), (128, True)])
+@pytest.mark.parametrize("heads", [1, 2])
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_planned_compact_reduce_mixed_contexts(
+    monkeypatch, max_parts, block_size, trans_v, heads, with_sinks
+):
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_reduce = module.compile_pa_decode_ps_reduce
+
+    def compact_reduce(**kwargs):
+        kwargs["compact_work_plan"] = True
+        return compile_reduce(**kwargs)
+
+    def planned_call(*args, **kwargs):
+        plan = plan_pa_decode(
+            args[4],
+            heads,
+            max_partitions=max_parts,
+            workgroup_budget=args[4].numel() * heads * max_parts,
+        )
+        pa_decode(*args, work_plan=plan, **kwargs)
+
+    monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", compact_reduce)
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", planned_call)
+    _run_mtp4_fused_reference_case(
+        [0, 1, 3, 4, 257, 16387, 70003],
+        heads,
+        block_size,
+        trans_v,
+        max_parts,
+        sinks=torch.linspace(-12, 12, heads * 16) if with_sinks else None,
+    )
+
+
+@pytest.mark.parametrize("batch,max_parts", [(1, 256), (64, 64), (64, 256)])
+def test_planned_reduce_uses_row_parallelism(monkeypatch, batch, max_parts):
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_reduce = module.compile_pa_decode_ps_reduce
+    selected = []
+
+    def capture_reduce(**kwargs):
+        selected.append(kwargs["compact_work_plan"])
+        return compile_reduce(**kwargs)
+
+    monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", capture_reduce)
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", _planned_call)
+    _run_mtp4_fused_reference_case([257] * batch, 1, 128, True, max_parts)
+    num_cus = torch.cuda.get_device_properties(0).multi_processor_count
+    assert selected and all(
+        flag == (max_parts > 64 and batch * 64 >= 4 * num_cus) for flag in selected
+    )
+
+
+def test_planned_compact_decode_fp16(monkeypatch):
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_reduce = module.compile_pa_decode_ps_reduce
+
+    def compact_reduce(**kwargs):
+        kwargs["compact_work_plan"] = True
+        return compile_reduce(**kwargs)
+
+    monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", compact_reduce)
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", _planned_call)
+    _run_accuracy_case(
+        [0, 1, 257, 16387, 70003],
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        block_size=128,
+        query_dtype=torch.float16,
+        num_partitions=256,
+        tolerance=0.005,
+        trans_v=True,
+    )
+
+
+@pytest.mark.parametrize("window,capacity", [(1, 512), (257, 512), (65536, 1600)])
+def test_plan_context_work_hint_respects_window(monkeypatch, window, capacity):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_args, **_kwargs: type("Props", (), {"multi_processor_count": 256})(),
+    )
+    lengths = [200000] * 200
+    context = torch.tensor(lengths, dtype=torch.int32)
+    plan = plan_pa_decode(
+        context,
+        1,
+        total_context_length=sum(lengths),
+        query_length=4,
+        sliding_window=window,
+    )
+    assert plan.capacity == capacity
+    _assert_plan(plan, lengths)
+    plan_pa_decode(context, 1, plan=plan, query_length=4, sliding_window=window)
+    _assert_plan(plan, lengths)
 
 
 def _positive_int(value):
