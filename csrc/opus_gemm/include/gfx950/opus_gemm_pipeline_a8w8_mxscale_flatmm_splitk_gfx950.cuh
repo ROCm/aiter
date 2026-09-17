@@ -1043,6 +1043,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // 16B-aligned so the panel fill below can land ds_write_b128; a byte array is
     // only byte-aligned as far as the language is concerned.
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS];
+    constexpr bool SF_PLAIN_OVERLAP_PROLOGUE =
+        PRELOAD_SF_LDS && T::BLOCK_SIZE == 256 && T::B_N == 32
+        && ((!T::B_DIRECT_REG && T::B_M == 32 && T::B_K == 256)
+            || (T::B_DIRECT_REG && T::B_M == 16 && T::B_K == 512));
 
     // SF_SHUF_IN_LDS: the shuffled scale panel. Words, not bytes -- the layout's unit
     // is the dword, and staging anything finer would have to unpack and repack it.
@@ -1221,15 +1225,19 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     }
 
     // PRELOAD_SF_LDS: cooperative one-shot fill of the SFA + SFB panels into LDS.
-    // Executed by all BLOCK_SIZE threads (both producer and consumer waves) before
-    // the producer/consumer role split, with a barrier publishing the panels for
-    // the consumer reads below. Grid-stride over the compact scalar byte counts.
+    // Normally executed by all BLOCK_SIZE threads before the producer/consumer
+    // role split. The small-M overlap arm moves the same work onto the consumer
+    // pair while producers fill A/B; their stage-0 barrier publishes both.
+    // Grid-stride over the compact scalar byte counts.
     // OOB rows (partial-M tail) read 0 via g_sfa's num_records bound and are
-    // never consumed. Bail if this split's K exceeds the compile-time LDS bound
-    // (the dispatch never selects kid324 for such K, so this only guards misuse).
+    // never consumed. Bail if this split's K exceeds the compile-time LDS bound;
+    // launchers reject that before dispatch, so this only guards misuse.
     if constexpr (PRELOAD_SF_LDS) {
         if (loops > SFA_K_TILES_MAX) return;
-        const int tid = opus::thread_id_x();
+        const int tid = SF_PLAIN_OVERLAP_PROLOGUE
+            ? (wave_id / 2) * 64 + lane_id : opus::thread_id_x();
+        constexpr int SF_FILL_THREADS =
+            SF_PLAIN_OVERLAP_PROLOGUE ? T::BLOCK_SIZE / 2 : T::BLOCK_SIZE;
         auto sm_sfa = make_smem(s_sfa_ptr);
         auto sm_sfb = make_smem(s_sfb_ptr);
         const int sfa_total = SFA_ROWS * sf_k_scales;
@@ -1240,27 +1248,42 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         // exposed rather than overlapped. A chunk must not span two panel rows and
         // its source offset must stay naturally aligned, so the width has to divide
         // both sf_k_scales and the row stride; hence the short-K fallbacks.
-        auto fill = [&](auto vec_c, auto sm, auto g, int stride, int total) {
+        auto fill = [&](auto vec_c, auto sm, auto g, D_SF* dst,
+                        int stride, int total) {
             constexpr int VEC = decltype(vec_c)::value;
-            for (int idx = tid * VEC; idx < total; idx += T::BLOCK_SIZE * VEC) {
+            for (int idx = tid * VEC; idx < total; idx += SF_FILL_THREADS * VEC) {
                 const int r  = idx / sf_k_scales;
                 const int kt = idx - r * sf_k_scales;
-                sm.template store<VEC>(load<VEC>(g, r * stride + kt), idx);
+                if constexpr (SF_PLAIN_OVERLAP_PROLOGUE) {
+                    static_assert(T::COM_REP_M == 1,
+                                  "direct plain-panel DMA requires identity M packing");
+                    g.template async_load<VEC>(dst + idx, r * stride + kt);
+                } else {
+                    sm.template store<VEC>(load<VEC>(g, r * stride + kt), idx);
+                }
             }
         };
-        auto fill_panel = [&](auto sm, auto g, int stride, int total) {
+        auto fill_panel = [&](auto sm, auto g, D_SF* dst, int stride, int total) {
             const int widths = sf_k_scales | stride;
-            if      ((widths & 15) == 0) fill(number<16>{}, sm, g, stride, total);
-            else if ((widths & 3) == 0)  fill(number<4>{},  sm, g, stride, total);
-            else                         fill(number<1>{},  sm, g, stride, total);
+            if      ((widths & 15) == 0) fill(number<16>{}, sm, g, dst, stride, total);
+            else if ((widths & 3) == 0)  fill(number<4>{},  sm, g, dst, stride, total);
+            else                         fill(number<1>{},  sm, g, dst, stride, total);
         };
-        fill_panel(sm_sfa, g_sfa, kargs.stride_sfa, sfa_total);
-        fill_panel(sm_sfb, g_sfb, kargs.stride_sfb, sfb_total);
+        if (!SF_PLAIN_OVERLAP_PROLOGUE || role == 1) {
+            fill_panel(sm_sfa, g_sfa, s_sfa_ptr, kargs.stride_sfa, sfa_total);
+            fill_panel(sm_sfb, g_sfb, s_sfb_ptr, kargs.stride_sfb, sfb_total);
+        }
         // vmcnt retires the global reads feeding the panel; lgkmcnt retires the
         // ds_writes that actually publish it. s_barrier does neither on its own.
-        s_waitcnt_vmcnt(0_I);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        if constexpr (SF_PLAIN_OVERLAP_PROLOGUE) {
+            if (role == 1) {
+                s_waitcnt_vmcnt(0_I);
+            }
+        } else {
+            s_waitcnt_vmcnt(0_I);
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
     }
 
     // SF_SHUF_IN_LDS: the shuffled panel's one-shot fill. Same position and contract

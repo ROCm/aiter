@@ -263,6 +263,13 @@ _TUNE_POLICY.update(
         if plain in _TUNE_POLICY
     }
 )
+# Small-M plain-scale panels. COM_REP_M=1 makes their M-packed destination
+# identical to the caller's row-major scale, so the panel is direct global->LDS
+# DMA while producer waves prefetch A/B. The full 133-row retune selects kid398
+# 19 times and kid399 9 times; paired checks improve the previous plain winner
+# by up to 20% and put kid398 within 1% of sfshuf on nearly every selected row.
+_TUNE_POLICY[398] = [1]
+_TUNE_POLICY[399] = [1]
 
 # Deliberately not candidates: kid208 (mpack_sfa) and kid210/213/214/215/216/217
 # (shuffle_scale) need A's scale panel, and for the shuffle_scale kids B's too, relaid out by

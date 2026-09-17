@@ -1132,6 +1132,16 @@ a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list = {
     kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg)
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILES.items()
 }
+# Plain-scale panel counterpart of the BM16 sfshuf winner kid393. COM_REP_M=1,
+# so M-packing is the identity and the flatmm pipeline DMAs the row-major scales
+# directly to LDS while producers prefetch A. Across the nine rows it wins after
+# a full retune, paired measurements improve the old plain kids by 1-6%; the
+# remaining 3% to kid393 is the latter's packed-word scale consumption.
+a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list[399] = (
+    _a8w8_mxscale_bmm_bpreshuffle_bdirect(
+        16, 32, 512, 2, prefetch_scale=False, preload_sf=True
+    )
+)
 
 _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_PRELOAD_TILES = {
     #   (B_M, B_N, B_K, WG_PER_CU)
@@ -1292,6 +1302,18 @@ a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list = {
         for plain_kid, twin_kid in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
     )
 }
+
+# Plain-scale counterpart of the small-M sfshuf-panel winner kid397. kid226 has
+# the same B_M/B_N/B_K geometry but reads scales from global with prefetch. Here
+# COM_REP_M=1 makes M-packing the identity, so the compact 1x128/128x128 panels
+# DMA straight to LDS while producers prefetch A/B. It removes scale VMEM from
+# the K loop without changing the producer layout, wins 19 rows after retuning,
+# and is within 1% of kid397 on all but two paired rows.
+a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list[398] = (
+    _a8w8_mxscale_bmm_bpreshuffle_blds(
+        32, 32, 256, 2, prefetch_scale=False, preload_sf=True
+    )
+)
 
 # kid646 is the DIRECT_ONLY persistent schedule, which carries its own B staging
 # and rejects the flags this family sets. kid0 is the heuristic default and an
