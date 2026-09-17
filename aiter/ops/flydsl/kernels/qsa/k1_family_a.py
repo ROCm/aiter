@@ -6,8 +6,10 @@
 When ``n_columns <= 512``, every visible block is selected and the fused
 short-context kernel emits its id without scoring. Longer rows use independent
 16/32-column BF16 MFMA scorer workgroups, an fp32 ``[M, n_columns]`` score
-buffer, and the existing stable FlyDSL per-row radix selector. Decode and
-prefill share both instantiations; BLOCK_N=32 is the measured default.
+buffer, and a per-row selector. Rows narrower than 32768 columns use the
+stable decode radix; wider rows use streaming radix with ``tie='low'``.
+Decode and prefill share both instantiations; BLOCK_N=32 is the measured
+default.
 """
 
 from functools import lru_cache
@@ -21,6 +23,7 @@ from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_INDEXER, FAMILY_A_SCORE_SCALE
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
+from aiter.ops.topk_select import topk_select
 
 _BLOCK_THREADS = 512
 _TILE = 512
@@ -31,6 +34,7 @@ _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
 _VEC = 8
 _Q_THREADS = _H * (_D // _VEC)
+_STREAM_SELECT_MIN_COLUMNS = 32768
 _BITONIC_STAGES = tuple(
     (span, stride)
     for span in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
@@ -505,8 +509,9 @@ def qsa_k1_family_a_block_ids(
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Rows no wider than 512 use the fused emit path. Longer rows materialize
-    scores with a BLOCK_N=32 MFMA writer and invoke FlyDSL's stable per-row
-    radix selector. Expand+tail is still a separate launch.
+    scores with a BLOCK_N=32 MFMA writer. Selection is the stable decode
+    radix below 32768 columns and streaming radix (``tie='low'``) at or
+    above that width. Expand+tail is still a separate launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
@@ -577,15 +582,24 @@ def qsa_k1_family_a_block_ids(
             (n_columns + score_block_n - 1) // score_block_n,
             torch.cuda.current_stream(q.device),
         )
-        flydsl_top_k_per_row_decode(
-            scores,
-            1,
-            row_lens,
-            out,
-            m,
-            scores.stride(0),
-            scores.stride(1),
-            k=_K,
-            stable=True,
-        )
+        if n_columns >= _STREAM_SELECT_MIN_COLUMNS:
+            topk_select(
+                scores,
+                _K,
+                end=row_lens,
+                output_idx=out,
+                tie="low",
+            )
+        else:
+            flydsl_top_k_per_row_decode(
+                scores,
+                1,
+                row_lens,
+                out,
+                m,
+                scores.stride(0),
+                scores.stride(1),
+                k=_K,
+                stable=True,
+            )
     return out
