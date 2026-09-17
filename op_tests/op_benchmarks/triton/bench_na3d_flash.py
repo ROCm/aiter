@@ -36,11 +36,18 @@ def bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
     C = NH * HD
     K = KT * KH * KW  # neighborhood size
 
-    # Build inputs matching the real decoder call: pre-scaled Q, BF16, channels-last.
+    # Match the LTX-2.5 decoder layout so the timed call includes the wrapper
+    # overhead users actually pay.  In the fused-QKV processor q/k pass through
+    # norm + rope (fresh contiguous tensors), but v is returned directly as
+    # qkv.chunk(3, dim=-1)[2].view(...), i.e. NON-contiguous (W-stride = 3*NH*HD).
+    # na3d_flash_attn's v.contiguous() is therefore a real full-volume staging copy
+    # here, not the no-op it would be for a freshly allocated contiguous v.
     scale = HD**-0.5
     q = torch.randn(B, T, H, W, NH, HD, dtype=dtype, device="cuda") * scale
     k = torch.randn(B, T, H, W, NH, HD, dtype=dtype, device="cuda")
-    v = torch.randn(B, T, H, W, NH, HD, dtype=dtype, device="cuda")
+    qkv = torch.randn(B, T, H, W, 3 * NH * HD, dtype=dtype, device="cuda")
+    v = qkv.chunk(3, dim=-1)[2].view(B, T, H, W, NH, HD)
+    assert not v.is_contiguous()  # consumer layout: v.contiguous() copies in-call
 
     # Reference: grouped-SDPA exact path (same as the eager processor fallback).
     # Also used as a timed candidate so the table shows the real kernel speedup.
