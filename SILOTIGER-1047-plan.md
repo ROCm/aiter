@@ -458,6 +458,44 @@ maps ``pages=512`` to 512 compressed keys packed at ``page_size=8``
       Triton and Gluon on emit / ``visible <= 512`` and on the published
       indexer point (long-L select loss recorded in 2g).
 
+**Phase 2 headline (GPU 6 / gfx950, `FLYDSL_RUNTIME_ENABLE_CACHE=0`).**
+One snapshot; `err=0` on every cell. Expand is still a separate FlyDSL
+launch, so peer columns include expand and FlyDSL does not. Family A is
+vs live AMD select. Family B is vs #4882 Triton and Gluon on emit /
+``visible <= 512`` plus the published indexer point; 2g long-L is not
+in this table.
+
+Family A K1 vs live AMD:
+
+| m | seq_len | n_blocks | flydsl_k1 us | vllm_amd_select us | flydsl_k1 err | vllm_amd_select err |
+|--:|--------:|---------:|-------------:|-------------------:|--------------:|--------------------:|
+| 1 | 512 | 128 | 1.5 | 7.3 | 0 | 0 |
+| 1 | 2048 | 512 | 1.4 | 8.1 | 0 | 0 |
+| 1 | 8192 | 2048 | 10.1 | 18.2 | 0 | 0 |
+| 8 | 8192 | 2048 | 11.6 | 20.1 | 0 | 0 |
+| 1 | 32768 | 8192 | 13.8 | 17.9 | 0 | 0 |
+| 8 | 32768 | 8192 | 18.6 | 23.8 | 0 | 0 |
+| 1 | 131072 | 32768 | 28.4 | 28.8 | 0 | 0 |
+| 8 | 131072 | 32768 | 46.0 | 51.2 | 0 | 0 |
+| 512 | 512 | 128 | 2.9 | 16.1 | 0 | 0 |
+| 512 | 2048 | 512 | 3.0 | 26.9 | 0 | 0 |
+| 512 | 8192 | 2048 | 28.3 | 83.6 | 0 | 0 |
+| 512 | 32768 | 8192 | 67.8 | 250.2 | 0 | 0 |
+
+Family B K1 vs #4882:
+
+| m | seq_len | page_size | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
+|--:|--------:|----------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
+| 1 | 512 | 16 | 4 | 128 | 1.4 | 10.1 | 10.2 | 0 |
+| 8 | 512 | 16 | 4 | 128 | 2.4 | 12.6 | 12.7 | 0 |
+| 1 | 2048 | 16 | 4 | 512 | 1.4 | 8.2 | 8.2 | 0 |
+| 8 | 2048 | 16 | 4 | 512 | 2.4 | 9.0 | 9.1 | 0 |
+| 1 | 512 | 16 | 8 | 128 | 1.5 | 10.8 | 10.1 | 0 |
+| 8 | 512 | 16 | 8 | 128 | 2.3 | 13.5 | 12.8 | 0 |
+| 1 | 2048 | 16 | 8 | 512 | 1.5 | 8.8 | 8.1 | 0 |
+| 8 | 2048 | 16 | 8 | 512 | 2.3 | 9.8 | 9.1 | 0 |
+| 32 | 2048 | 8 | 4 | 512 | 2.3 | 9.8 | 9.6 | 0 |
+
 ### 3. FlyDSL K2 (sparse GQA) — family A then B
 
 K2 attends uncompressed paged K/V at the expanded token indices. Prefetch K/V
