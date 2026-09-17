@@ -7,7 +7,15 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.test_common import benchmark, perftest
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+# The kernel uses 64-lane __shfl_xor reductions. These are the wave64 targets
+# supported in-tree; gfx1250 is wave32 and cannot execute those reductions.
+SUPPORTED_GFX = ("gfx942", "gfx950")
+_MAX_PERF_ROTATIONS = 32
+_PERF_ROTATION_BUDGET = 256 * 1024 * 1024
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -31,6 +39,14 @@ def from_swizzled_layout(state: torch.Tensor) -> torch.Tensor:
     n, hv, k4, v, four = state.shape
     assert four == 4, f"Last dimension must be 4, got {four}"
     return state.permute(0, 1, 2, 4, 3).reshape(n, hv, k4 * 4, v).contiguous()
+
+
+def _perf_rotation_count(state: torch.Tensor, output: torch.Tensor) -> int:
+    bytes_per_call = max(1, state.nbytes + output.nbytes)
+    return max(
+        1,
+        min(_MAX_PERF_ROTATIONS, _PERF_ROTATION_BUDGET // bytes_per_call),
+    )
 
 
 def create_inputs(
@@ -168,7 +184,6 @@ def split_gdr_reference(
     return output.to(mixed_qkv.dtype).to(mixed_qkv.device)
 
 
-@perftest()
 def run_fused_split_gdr_update_decode(
     mixed_qkv: torch.Tensor,
     A_log: torch.Tensor,
@@ -186,17 +201,16 @@ def run_fused_split_gdr_update_decode(
     softplus_threshold: float,
     scale: float,
     use_qk_l2norm_in_kernel: bool,
+    output: torch.Tensor,
 ) -> torch.Tensor:
-    """Run fused_split_gdr_update decode kernel for perf measurement."""
-    # Fresh state per invocation to align with per-iter clone benchmarking.
-    state_fresh = initial_state_source.clone()
+    """Run the kernel with its real swizzled, in-place state and output layout."""
     return aiter.fused_split_gdr_update(
         mixed_qkv=mixed_qkv,
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
         b_gate=b_gate,
-        initial_state_source=state_fresh,
+        initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         key_dim=key_dim,
         value_dim=value_dim,
@@ -207,6 +221,7 @@ def run_fused_split_gdr_update_decode(
         softplus_threshold=softplus_threshold,
         scale=scale,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        output=output,
     )
 
 
@@ -224,18 +239,6 @@ def test_split_gdr_update_decode(
     use_qk_l2norm_in_kernel: bool = True,
 ) -> dict:
     """Check correctness and benchmark HIP split_gdr update decode kernel."""
-    if not torch.cuda.is_available():
-        return {
-            "batch_size": batch_size,
-            "seqlen": seqlen,
-            "num_heads_qk": num_heads_qk,
-            "num_heads_v": num_heads_v,
-            "head_dim": head_dim,
-            "dtype": str(dtype),
-            "all_close": False,
-            "skip_reason": "CUDA/HIP is required",
-        }
-
     seed_everything(42)
     inputs = create_inputs(
         batch_size=batch_size,
@@ -274,170 +277,230 @@ def test_split_gdr_update_decode(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
-    ssm_state_swizzled = to_swizzled_layout(inputs["ssm_state"].clone())
-    output_hip = aiter.fused_split_gdr_update(
-        mixed_qkv=inputs["mixed_qkv"],
-        A_log=inputs["A_log"],
-        a=inputs["a"],
-        dt_bias=inputs["dt_bias"],
-        b_gate=inputs["b"],
-        initial_state_source=ssm_state_swizzled,
-        initial_state_indices=inputs["ssm_state_indices"],
-        key_dim=key_dim,
-        value_dim=value_dim,
-        num_heads_qk=num_heads_qk,
-        num_heads_v=num_heads_v,
-        head_dim=head_dim,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        scale=scale,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-    )
-    ssm_state_hip_final = from_swizzled_layout(ssm_state_swizzled)
-
-    output_diff = (output_ref - output_hip).abs().max().item()
-    state_diff = (ssm_state_ref - ssm_state_hip_final).abs().max().item()
-    all_close_out = torch.allclose(output_ref, output_hip, rtol=rtol, atol=atol)
-    all_close_state = torch.allclose(
-        ssm_state_ref, ssm_state_hip_final, rtol=rtol, atol=atol
-    )
-    all_close = all_close_out and all_close_state
-
-    # Perf path uses fresh state per call via clone in run_fused_split_gdr_update_decode.
-    ssm_state_swizzled_template = to_swizzled_layout(inputs["ssm_state"])
-    _, hip_us = run_fused_split_gdr_update_decode(
-        mixed_qkv=inputs["mixed_qkv"],
-        A_log=inputs["A_log"],
-        a=inputs["a"],
-        dt_bias=inputs["dt_bias"],
-        b_gate=inputs["b"],
-        initial_state_source=ssm_state_swizzled_template,
-        initial_state_indices=inputs["ssm_state_indices"],
-        key_dim=key_dim,
-        value_dim=value_dim,
-        num_heads_qk=num_heads_qk,
-        num_heads_v=num_heads_v,
-        head_dim=head_dim,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        scale=scale,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-    )
-
-    return {
-        "batch_size": batch_size,
-        "seqlen": seqlen,
-        "num_heads_qk": num_heads_qk,
-        "num_heads_v": num_heads_v,
-        "head_dim": head_dim,
-        "output_diff": output_diff,
-        "state_diff": state_diff,
-        "all_close": all_close,
-        "hip_us": hip_us,
-    }
-
-
-_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="Benchmark HIP split_gdr_update decode kernel",
-)
-parser.add_argument(
-    "-b",
-    "--batch-size",
-    "--batch",
-    dest="batch_size",
-    type=int,
-    default=[64],
-    nargs="+",
-)
-parser.add_argument("-s", "--seqlen", type=int, default=[1], nargs="+")
-parser.add_argument(
-    "--num-heads-qk",
-    "--heads-qk",
-    dest="num_heads_qk",
-    type=int,
-    default=[4],
-    nargs="+",
-)
-parser.add_argument(
-    "--num-heads-v", "--heads-v", dest="num_heads_v", type=int, default=[8], nargs="+"
-)
-parser.add_argument("--head-dim", type=int, default=[128], nargs="+")
-parser.add_argument(
-    "--dtype",
-    "--itype",
-    dest="dtype",
-    type=str,
-    default="bf16",
-    choices=["bf16", "fp16", "fp32"],
-    help="Input dtype",
-)
-parser.add_argument(
-    "--extra-state-slots",
-    type=int,
-    default=10,
-    help="Additional state rows beyond batch size",
-)
-parser.add_argument(
-    "--use-qk-l2norm-in-kernel",
-    nargs="*",
-    default=["true"],
-    choices=["true", "false"],
-    help="Enable Q/K L2 norm inside kernel (default: true)",
-)
-args = parser.parse_args()
-
-dtype = _DTYPE_MAP[args.dtype]
-
-
-def _parse_bool_list(lst):
-    return [v.lower() == "true" for v in (lst or ["true", "false"])]
-
-
-l2norm_list = _parse_bool_list(args.use_qk_l2norm_in_kernel)
-
-df = []
-for (
-    batch_size,
-    seqlen,
-    num_heads_qk,
-    num_heads_v,
-    head_dim,
-    l2norm,
-) in itertools.product(
-    args.batch_size,
-    args.seqlen,
-    args.num_heads_qk,
-    args.num_heads_v,
-    args.head_dim,
-    l2norm_list,
-):
-    ret = test_split_gdr_update_decode(
-        batch_size=batch_size,
-        seqlen=seqlen,
-        num_heads_qk=num_heads_qk,
-        num_heads_v=num_heads_v,
-        head_dim=head_dim,
+    # Keep an untouched swizzled state and output template. Perf buffers may be
+    # mutated repeatedly, while correctness always starts from pristine clones.
+    state_pristine = to_swizzled_layout(inputs["ssm_state"].clone())
+    output_pristine = torch.zeros(
+        (batch_size, seqlen, num_heads_v, head_dim),
+        device=inputs["mixed_qkv"].device,
         dtype=dtype,
-        extra_state_slots=args.extra_state_slots,
-        use_qk_l2norm_in_kernel=l2norm,
     )
-    df.append(ret)
 
-df = pd.DataFrame(df)
-dedup_cols = [
-    "batch_size",
-    "seqlen",
-    "num_heads_qk",
-    "num_heads_v",
-    "head_dim",
-    "dtype",
-    "use_qk_l2norm_in_kernel",
-]
-try:
-    df_md = df.to_markdown(index=False)
-except ImportError:
-    df_md = df.to_string(index=False)
-aiter.logger.info("split_gdr_update summary:\n%s", df_md)
+    def hip(state: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        return run_fused_split_gdr_update_decode(
+            mixed_qkv=inputs["mixed_qkv"],
+            A_log=inputs["A_log"],
+            a=inputs["a"],
+            dt_bias=inputs["dt_bias"],
+            b_gate=inputs["b"],
+            initial_state_source=state,
+            initial_state_indices=inputs["ssm_state_indices"],
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+        )
+
+    candidates = {"hip": hip}
+
+    # Dominant tensor arithmetic per token/head: state decay (K*V), state-k
+    # projection (2*K*V), outer-product update (2*K*V), output projection
+    # (2*K*V), q scaling (K), and v correction/gating (2*V). Q/K L2 norm adds
+    # about 6*K FLOPs. Scalar exp/log/sqrt/sigmoid operations are not assigned
+    # an arbitrary FLOP equivalent.
+    flops_per_token_head = 7 * head_dim * head_dim + head_dim + 2 * head_dim
+    if use_qk_l2norm_in_kernel:
+        flops_per_token_head += 6 * head_dim
+    flops = batch_size * seqlen * num_heads_v * flops_per_token_head
+
+    # Logical op traffic: unique activation/gate inputs, output, index/A/dt
+    # vectors, plus one read and one write of each indexed fp32 state element.
+    output_bytes = output_pristine.numel() * output_pristine.element_size()
+    state_bytes = (
+        2
+        * batch_size
+        * num_heads_v
+        * head_dim
+        * head_dim
+        * inputs["ssm_state"].element_size()
+    )
+    nbytes = (
+        inputs["mixed_qkv"].numel() * inputs["mixed_qkv"].element_size()
+        + inputs["a"].numel() * inputs["a"].element_size()
+        + inputs["b"].numel() * inputs["b"].element_size()
+        + inputs["dt_bias"].numel() * inputs["dt_bias"].element_size()
+        + inputs["A_log"].numel() * inputs["A_log"].element_size()
+        + inputs["ssm_state_indices"].numel()
+        * inputs["ssm_state_indices"].element_size()
+        + state_bytes
+        + output_bytes
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        # Timing uses dedicated buffers because the state is intentionally
+        # updated in-place; correctness below never observes these mutations.
+        perf_state = state_pristine.clone()
+        perf_output = output_pristine.clone()
+        _, us = run_perftest(
+            fn,
+            perf_state,
+            perf_output,
+            num_rotate_args=_perf_rotation_count(perf_state, perf_output),
+        )
+
+        check_state = state_pristine.clone()
+        check_output = output_pristine.clone()
+        output = fn(check_state, check_output)
+        state_final = from_swizzled_layout(check_state)
+        output_err = checkAllclose(
+            output_ref.to(dtypes.fp32),
+            output.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"{name}: output",
+        )
+        state_err = checkAllclose(
+            ssm_state_ref.to(dtypes.fp32),
+            state_final.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"{name}: final state",
+        )
+
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = max(output_err, state_err)
+    return ret
+
+
+test_split_gdr_update_decode.__test__ = False
+
+
+def _str2bool(value: str) -> bool:
+    value = value.lower()
+    if value not in ("true", "false"):
+        raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+    return value == "true"
+
+
+def main():
+    if not torch.cuda.is_available():
+        aiter.logger.warning("split_gdr_update requires ROCm; skipping")
+        return
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "split_gdr_update unsupported on %s; supported targets: %s",
+            get_gfx(),
+            ", ".join(SUPPORTED_GFX),
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark HIP split_gdr_update decode kernel",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        "--itype",
+        dest="dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.bf16],
+        nargs="*",
+        default=[dtypes.bf16],
+        help="Input dtype list (the HIP kernel supports bf16).",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch-size",
+        "--batch",
+        dest="batch_size",
+        type=int,
+        default=[64],
+        nargs="+",
+    )
+    parser.add_argument("-s", "--seqlen", type=int, default=[1], nargs="+")
+    parser.add_argument(
+        "--num-heads-qk",
+        "--heads-qk",
+        dest="num_heads_qk",
+        type=int,
+        default=[4],
+        nargs="+",
+    )
+    parser.add_argument(
+        "--num-heads-v",
+        "--heads-v",
+        dest="num_heads_v",
+        type=int,
+        default=[8],
+        nargs="+",
+    )
+    parser.add_argument("--head-dim", type=int, default=[128], nargs="+")
+    parser.add_argument(
+        "--extra-state-slots",
+        type=int,
+        default=[10],
+        nargs="+",
+        help="Additional state rows beyond batch size.",
+    )
+    parser.add_argument(
+        "--use-qk-l2norm-in-kernel",
+        type=_str2bool,
+        nargs="*",
+        default=[True],
+        choices=[True, False],
+        help="Q/K L2-normalization modes to sweep: true false.",
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for (
+        dtype,
+        batch_size,
+        seqlen,
+        num_heads_qk,
+        num_heads_v,
+        head_dim,
+        extra_state_slots,
+        l2norm,
+    ) in itertools.product(
+        args.dtype,
+        args.batch_size,
+        args.seqlen,
+        args.num_heads_qk,
+        args.num_heads_v,
+        args.head_dim,
+        args.extra_state_slots,
+        args.use_qk_l2norm_in_kernel,
+    ):
+        rows.append(
+            test_split_gdr_update_decode(
+                batch_size=batch_size,
+                seqlen=seqlen,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                dtype=dtype,
+                extra_state_slots=extra_state_slots,
+                use_qk_l2norm_in_kernel=l2norm,
+            )
+        )
+
+    df = pd.DataFrame(rows)
+    aiter.logger.info(
+        "split_gdr_update summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()
