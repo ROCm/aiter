@@ -164,11 +164,14 @@ def _build_inputs(args, lengths, block_size, trans_v, device):
     import torch
 
     from aiter import per_tensor_quant, pertoken_quant
-    from op_tests.test_flydsl_pa_decode import _quant_dtype, run_torch
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from op_tests.test_flydsl_pa_decode import run_torch
 
     torch.manual_seed(args.seed)
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-    quant_dtype = _quant_dtype()
+    quant_dtype = (
+        torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
+    )
     q_heads = args.num_query_heads // args.tp_size
     kv_heads = args.num_kv_heads // args.tp_size
     page_counts = [(length + block_size - 1) // block_size for length in lengths]

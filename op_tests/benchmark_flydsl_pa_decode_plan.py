@@ -208,14 +208,17 @@ def benchmark_case(
         )
         output.copy_(saved["plan_each_call"])
 
-    original = torch.ops.aiter.pa_decode_flydsl
-    torch.ops.aiter.pa_decode_flydsl = compare
-    try:
-        reference_tests._run_mtp4_fused_reference_case(
-            lengths_host, 1, block_size, trans_v, 256
-        )
-    finally:
-        torch.ops.aiter.pa_decode_flydsl = original
+    case = reference_tests.DecodeCase(
+        lengths=tuple(lengths_host),
+        block_size=block_size,
+        trans_v=trans_v,
+        num_partitions=1,
+    )
+    args, _options, reference_call = reference_tests._make_inputs(case)
+    reference = reference_call()
+    del reference_call
+    compare(*args)
+    reference_tests._assert_close(args[0], reference)
     return result
 
 
