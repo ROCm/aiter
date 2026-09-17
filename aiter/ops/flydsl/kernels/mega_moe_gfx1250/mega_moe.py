@@ -251,6 +251,10 @@ class MegaMoEConfig:
     # fp8, a4w4 -> fp4). It is not a free choice: the receiver hands the payload
     # to the grouped GEMM as-is, so a mismatch is a width error, not a slow path.
     dispatch_wire: str = "bf16"
+    # None reads $AITER_TDM_COMPACT_PLAN; an explicit value wins over it, for a
+    # caller that drives the recv rows with its own expert GEMM and cannot read
+    # the compact layout.
+    compact_plan_override: bool | None = None
 
     def __post_init__(self):
         if self.dispatch_wire not in _DISPATCH_WIRES:
@@ -317,6 +321,8 @@ class MegaMoEConfig:
         """Send-side compact dest rows; TDM default, disable with env=0."""
         if self.dispatch_backend != "tdm" or not self.is_quant_dispatch_wire:
             return False
+        if self.compact_plan_override is not None:
+            return self.compact_plan_override
         return os.environ.get("AITER_TDM_COMPACT_PLAN", "1") in (
             "1",
             "true",
@@ -447,6 +453,7 @@ class MegaMoEGfx1250:
         situ_linear_beta: torch.Tensor | None = None,
         dispatch_backend: str | None = None,
         dispatch_wire: str | None = None,
+        compact_plan: bool | None = None,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -543,6 +550,7 @@ class MegaMoEGfx1250:
                     if dispatch_wire is not None
                     else read_dispatch_wire_env()
                 ),
+                compact_plan_override=compact_plan,
             ),
             communicator,
         )
