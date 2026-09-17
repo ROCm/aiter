@@ -151,6 +151,57 @@ def test_fp8_mqa_logits(
     assert diff < 1e-3, f"{diff=}"
 
 
+@pytest.mark.parametrize(
+    "s_q, s_k",
+    [
+        (17, 259),
+        (4096, 4096),
+        (4096, 16384),
+        (4096, 65664),
+        (4096, 131072),
+        (4097, 1025),
+    ],
+)
+@torch.inference_mode()
+def test_fp8_mqa_logits_clean_windows(s_q, s_k, monkeypatch):
+    """Check every output for full, empty, and unaligned per-row windows."""
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(0)
+    q = torch.randn(s_q, 32, 128, device="cuda", dtype=torch.bfloat16).to(e4m3_type)
+    kv = torch.randn(s_k, 128, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_ref = kv_fp8.float() * scales[:, None]
+    weights = torch.randn(s_q, 32, device="cuda", dtype=torch.float32)
+    windows = torch.tensor(
+        [
+            [0, s_k],
+            [0, 0],
+            [s_k, s_k],
+            [13, 13],
+            [3, 131],
+            [s_k - 127, s_k - 1],
+            [0, s_k - 3],
+            [17, s_k],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_windows = windows[torch.arange(s_q, device="cuda") % len(windows)]
+    starts, ends = row_windows[:, 0].contiguous(), row_windows[:, 1].contiguous()
+    logits = fp8_mqa_logits(q, kv_fp8, scales, weights, starts, ends, clean_logits=True)
+
+    # Bound the FP32 reference intermediate for long KV sequences.
+    columns = torch.arange(s_k, device="cuda")[None, :]
+    for first in range(0, s_q, 32):
+        rows = slice(first, first + 32)
+        invalid = (columns < starts[rows, None]) | (columns >= ends[rows, None])
+        assert torch.isneginf(logits[rows][invalid]).all(), first
+        expected, _ = ref_fp8_mqa_logits(
+            q[rows], kv_ref, weights[rows], starts[rows], ends[rows]
+        )
+        torch.testing.assert_close(logits[rows], expected, rtol=0.01, atol=0.01)
+
+
 def ref_fp8_mqa_logits_row(q_row, kv, weight_row, start, end):
     """One row of the reference, so s_k can be large.
 

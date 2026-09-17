@@ -885,6 +885,7 @@ _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
         "M_CHUNK",
         "UNROLL",
         "RELAXED_STORE",
+        "FUSE_CLEAN_LOGITS",
     ],
 )
 
@@ -923,6 +924,7 @@ def _gluon_fp8_mqa_logits_kernel(
     M_CHUNK: gl.constexpr = 0,  # heads folded per MFMA group (0 = whole tile)
     UNROLL: gl.constexpr = 1,  # KV tiles per loop body (1 = backend default)
     RELAXED_STORE: gl.constexpr = 0,  # BLOCK_M > 1: drop the per-row store mask
+    FUSE_CLEAN_LOGITS: gl.constexpr = False,
 ):
 
     gl.static_assert(
@@ -991,6 +993,38 @@ def _gluon_fp8_mqa_logits_kernel(
         end_ind1 = gl.minimum(gl.load(cu_end_ptr + row_id + 1), seq_len_kv)
         union_start = gl.minimum(start_ind, start_ind1)
         union_end = gl.maximum(end_ind, end_ind1)
+
+    if FUSE_CLEAN_LOGITS:
+        # Each workgroup owns the invalid windows of its query rows.
+        fill_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1],
+            threads_per_warp=[WARP_SIZE],
+            warps_per_cta=[NUM_WARPS],
+            order=[0],
+        )
+        fill_offsets = gl.arange(0, 256, layout=fill_layout)
+        for r in gl.static_range(BLOCK_M):
+            if r == 0:
+                fill_start = gl.minimum(start_ind, seq_len_kv)
+                fill_end = gl.maximum(end_ind, 0)
+            else:
+                fill_start = gl.minimum(start_ind1, seq_len_kv)
+                fill_end = gl.maximum(end_ind1, 0)
+            fill_ptr = logits_ptr + (row_id + r) * stride_logits_s
+            for base in range(0, fill_start, 256):
+                col = base + fill_offsets
+                gl.store(
+                    fill_ptr + col * stride_logits_k,
+                    float("-inf"),
+                    mask=col < fill_start,
+                )
+            for base in range(fill_end, seq_len_kv, 256):
+                col = base + fill_offsets
+                gl.store(
+                    fill_ptr + col * stride_logits_k,
+                    float("-inf"),
+                    mask=col < seq_len_kv,
+                )
 
     KVLoader: gl.constexpr = MQAAsyncKVLoader
 

@@ -102,7 +102,8 @@ def fp8_mqa_logits(
                   unspecified.
 
     Returns:
-    logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
+    logits:      [seq_len, seq_len_kv], dtype float32. Positions outside each
+                 row's window are -inf when clean_logits=True, otherwise unspecified.
     """
 
     seq_len, num_heads, head_size = Q.shape
@@ -110,10 +111,12 @@ def fp8_mqa_logits(
     # TODO: Currently assuming num_heads and head_size is power of 2.
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
-    # Initialize with -inf because of causal masking
+    use_gluon = TRITON_GE_36 and _gluon_fp8_mqa_logits_kernel is not None
+    fuse_clean_logits = clean_logits and use_gluon and arch == "gfx950"
+    # gfx950 Gluon fills the invalid windows in the compute kernel.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    if clean_logits:
+    if clean_logits and not fuse_clean_logits:
         logits = torch.full(
             (seq_len, seq_len_kv_aligned),
             fill_value=-float("inf"),
@@ -127,7 +130,6 @@ def fp8_mqa_logits(
             device=Q.device,
         )[:, :seq_len_kv]
 
-    use_gluon = TRITON_GE_36 and _gluon_fp8_mqa_logits_kernel is not None
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
@@ -273,6 +275,7 @@ def fp8_mqa_logits(
                 # two KV tiles per loop body for the scheduler to interleave
                 "UNROLL": 2,
                 "RELAXED_STORE": relaxed_store,
+                "FUSE_CLEAN_LOGITS": fuse_clean_logits,
             }
         else:
             loop_variant = 1
