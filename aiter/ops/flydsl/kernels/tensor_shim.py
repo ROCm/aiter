@@ -89,9 +89,18 @@ def ptr_buf_tensor(
     return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
 
 
-def buf_copy_atom(unit_bytes, elem=fx.Int32):
-    """Copy atom for a ``unit_bytes``-wide buffer access."""
-    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](), elem)
+def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
+    """Copy atom for a ``unit_bytes``-wide buffer access.
+
+    ``cache_modifier`` is the CDNA cache-policy field: 0 leaves the default
+    (allocate in L1), 2 marks the access non-temporal. Non-temporal is right for
+    data read once and never revisited -- streaming a KV cache through L1 costs
+    a line fill per access and buys no reuse, and the fills throttle the load
+    path well below what DRAM can deliver. Measured on gfx950 over a
+    32000-page random gather of 128x128 pages: fp8 3.29 -> 5.02 TB/s,
+    bf16 4.12 -> 5.48 TB/s.
+    """
+    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):

@@ -66,12 +66,37 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "MiniMaxM3IndexScoreConfig": (
+        ".kernels.minimax_m3_index_score",
+        "IndexScoreConfig",
+    ),
+    "minimax_m3_index_score_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl",
+    ),
+    "minimax_m3_index_score_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported",
+    ),
+    "minimax_m3_index_score_alloc": (
+        ".kernels.minimax_m3_index_score",
+        "alloc_score",
+    ),
+    "minimax_m3_index_score_work_map": (
+        ".kernels.minimax_m3_index_score",
+        "build_work_map",
+    ),
+    "minimax_m3_index_score_work_map_size": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_size",
+    ),
 }
 
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
+    "MiniMaxM3IndexScoreConfig",
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
@@ -84,6 +109,11 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "minimax_m3_index_score_alloc",
+    "minimax_m3_index_score_flydsl",
+    "minimax_m3_index_score_flydsl_supported",
+    "minimax_m3_index_score_work_map",
+    "minimax_m3_index_score_work_map_size",
 ]
 
 
