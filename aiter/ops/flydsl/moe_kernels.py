@@ -9,18 +9,17 @@ import re
 
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled as _dispatch_compiled,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    ptr_arg,
+)
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
 # HIP limits grid.y/grid.z to 65535.
 _HIP_MAX_GRID_DIM_Y = 65535
-
-
-def _get_dtypes():
-    from aiter.utility import dtypes
-
-    return dtypes
 
 
 @functools.lru_cache(maxsize=256)
@@ -110,6 +109,11 @@ def requires_flydsl_stage2_reduce(
 ) -> bool:
     """Return whether stage2 atomic output exceeds 32-bit byte offsets."""
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
+
+
+def requires_flydsl_stage2_global_a(a: torch.Tensor) -> bool:
+    """Return whether A's stored bytes reach the 4 GiB buffer descriptor limit."""
+    return a.numel() * a.element_size() >= (1 << 32)
 
 
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
@@ -724,6 +728,7 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mode: str = "atomic",
+    use_global_a: bool = True,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -770,6 +775,7 @@ def compile_flydsl_moe_stage2(
             sort_block_m=sort_block_m,
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
+            use_global_a=use_global_a,
             cu_num_mul=cu_num_mul,
             # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
             # from the kernel-name parser. They are accepted as ignored
@@ -993,29 +999,8 @@ def _s2_args_std(
 
 
 def _run_compiled(exe, args):
-    """JIT-compile on first call, then dispatch via cached CompiledFunction."""
-    import flydsl.compiler as flyc
-
-    cf = getattr(exe, "_cf", None)
-    if cf is not None:
-        cf(*args)
-        return
-    try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
-    except Exception:
-        # JitFunction.__call__ leaks ir.Context on compilation failure,
-        # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext -> gpu_module_body error).
-        # Clean up leaked contexts to isolate failures.
-        try:
-            from flydsl._mlir import ir
-
-            while ir.Context.current is not None:
-                ir.Context.current.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001,S110 - best-effort context cleanup
-            pass
-        raise
+    """Tuple-argument adapter for the existing MoE and AOT launch callers."""
+    return _dispatch_compiled(exe, *args)
 
 
 _S2_LEGACY_FP8_SCALE_BLK = 8
@@ -1506,7 +1491,7 @@ def _flydsl_moe_stage1_impl(
     _need_fp8 = out_dtype == "fp8"
     _fuse_any_quant = _need_fp4 or _need_fp8
     _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
-    dtypes = _get_dtypes()
+    from aiter.utility import dtypes
 
     if _need_fp4:
         torch_out_dtype = dtypes.fp4x2
@@ -2284,6 +2269,7 @@ def _flydsl_moe_stage2_impl(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=requires_flydsl_stage2_global_a(inter_states),
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
