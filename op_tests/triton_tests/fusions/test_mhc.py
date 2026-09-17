@@ -1123,3 +1123,181 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
             rtol=common_rtol,
             msg=f"{name} mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
         )
+
+
+# =============================================================================
+# DSV4 kernel tests
+# =============================================================================
+
+
+def _make_pre_dsv4_inputs(M, n, C, dtype, device="cuda"):
+    """Generate inputs for mhc_pre_dsv4 / mhc_post_dsv4."""
+    torch.manual_seed(42)
+    rows = 2 * n + n * n
+    residual = torch.randn(M, n, C, dtype=dtype, device=device) * 0.1
+    fn = torch.randn(rows, n * C, dtype=torch.float32, device=device) * 0.02
+    scale = torch.ones(3, dtype=torch.float32, device=device)
+    base = torch.zeros(rows, dtype=torch.float32, device=device)
+    return residual, fn, scale, base
+
+
+def _make_head_dsv4_inputs(M, n, C, dtype, device="cuda"):
+    """Generate inputs for mhc_head_dsv4."""
+    torch.manual_seed(42)
+    residual = torch.randn(M, n, C, dtype=dtype, device=device) * 0.1
+    fn = torch.randn(n, n * C, dtype=torch.float32, device=device) * 0.02
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+    base = torch.zeros(n, dtype=torch.float32, device=device)
+    return residual, fn, scale, base
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+        (256, 4, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_pre_dsv4_correctness(M, n, C, dtype):
+    """mhc_pre_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        _mhc_pre_dsv4_torch,
+        mhc_pre_dsv4,
+    )
+
+    residual, fn, scale, base = _make_pre_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps, sink_eps = 1e-6, 1e-6, 1e-6
+    post_mult, sink_iters = 2.0, 4
+
+    post_t, comb_t, layer_t = mhc_pre_dsv4(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps=eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sink_eps,
+        hc_post_mult_value=post_mult,
+        sinkhorn_repeat=sink_iters,
+    )
+    post_ref, comb_ref, layer_ref = _mhc_pre_dsv4_torch(
+        residual, fn, scale, base, eps, pre_eps, sink_eps, post_mult, sink_iters
+    )
+
+    atol, rtol = 2e-2, 2e-2
+    for name, t, ref in (
+        ("post_mix", post_t, post_ref),
+        ("comb_mix", comb_t, comb_ref),
+        ("layer_input", layer_t, layer_ref),
+    ):
+        torch.testing.assert_close(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            msg=f"{name} mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+        )
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_post_dsv4_correctness(M, n, C, dtype):
+    """mhc_post_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        mhc_post_dsv4,
+        mhc_pre_dsv4,
+    )
+
+    residual, fn, scale, base = _make_pre_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps, sink_eps = 1e-6, 1e-6, 1e-6
+    post_mult, sink_iters = 2.0, 4
+
+    # Use the Triton pre to get mixes, then check post matches reference e2e
+    post_mix, comb_mix, layer_input = mhc_pre_dsv4(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps=eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sink_eps,
+        hc_post_mult_value=post_mult,
+        sinkhorn_repeat=sink_iters,
+    )
+
+    out_t = mhc_post_dsv4(layer_input, residual, post_mix, comb_mix)
+
+    # Reference: post_2d * layer_input + sum_j(comb_ij * residual_j)
+    post_2d = post_mix.squeeze(-1).float()
+    out_ref = post_2d[:, :, None] * layer_input.float()[:, None, :]
+    out_ref = out_ref + torch.einsum("mhc,mhj->mjc", residual.float(), comb_mix.float())
+    out_ref = out_ref.to(dtype)
+
+    torch.testing.assert_close(
+        out_t.float(),
+        out_ref.float(),
+        atol=2e-2,
+        rtol=2e-2,
+        msg=f"mhc_post_dsv4 mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+    )
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+        (256, 4, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_head_dsv4_correctness(M, n, C, dtype):
+    """mhc_head_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        _mhc_head_dsv4_torch,
+        mhc_head_dsv4,
+    )
+
+    residual, fn, scale, base = _make_head_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps = 1e-6, 1e-6
+
+    out_t = mhc_head_dsv4(residual, fn, scale, base, rms_eps=eps, hc_pre_eps=pre_eps)
+    out_ref = _mhc_head_dsv4_torch(residual, fn, scale, base, eps, pre_eps)
+
+    torch.testing.assert_close(
+        out_t.float(),
+        out_ref.float(),
+        atol=2e-2,
+        rtol=2e-2,
+        msg=f"mhc_head_dsv4 mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+    )
+
+
+def test_mhc_pre_dsv4_empty_batch():
+    """mhc_pre_dsv4 returns zero-sized outputs for M=0 without error."""
+    from aiter.ops.triton.fusions.mhc import mhc_pre_dsv4
+
+    n, C = 4, 64
+    residual, fn, scale, base = _make_pre_dsv4_inputs(0, n, C, torch.bfloat16)
+    post, comb, layer = mhc_pre_dsv4(residual, fn, scale, base)
+    assert post.shape == (0, n, 1)
+    assert comb.shape == (0, n, n)
+    assert layer.shape == (0, C)
+
+
+def test_mhc_head_dsv4_empty_batch():
+    """mhc_head_dsv4 returns zero-sized output for M=0 without error."""
+    from aiter.ops.triton.fusions.mhc import mhc_head_dsv4
+
+    n, C = 4, 64
+    residual, fn, scale, base = _make_head_dsv4_inputs(0, n, C, torch.bfloat16)
+    out = mhc_head_dsv4(residual, fn, scale, base)
+    assert out.shape == (0, C)
