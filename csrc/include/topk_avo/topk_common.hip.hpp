@@ -469,6 +469,61 @@ constexpr int CAND_SLOTS_PER_ROW = 8192;
 // never larger than the number of elements matching the fixed prefix); rows
 // where that does not hold are routed to the fallback and their output is
 // discarded, and the pre-initialised {0,0} keeps them in bounds regardless.
+// Replica-reducing form of the scan below: folds the HIST_REP replicas of each
+// bucket in as it reads them, instead of having the caller run a separate
+// block-wide reduction loop into s_red first.
+//
+// The point is the barrier, not the arithmetic. The separate loop needs its own
+// __syncthreads() before the scan may read s_red, so folding it in here takes a
+// radix pass from 5 block barriers to 4, and leaves s_red unused (1 KB of LDS
+// per block). The select's cost is the serial depth of one row -- passes x
+// barriers over the keys in LDS -- not read throughput, which is why barrier
+// count is the lever here (knowledge/known_bad.md).
+__device__ __forceinline__ void block_find_pivot_bucket_rep(const uint32_t* __restrict__ s_hist,
+                                                            uint32_t* __restrict__ s_scan,
+                                                            int ek)
+{
+    const int t = threadIdx.x;
+    __shared__ uint32_t s_wavetot[256 / WAVE_SIZE];
+    const int lane = t & (WAVE_SIZE - 1);
+    const int wv   = t / WAVE_SIZE;
+    uint32_t x     = 0u;
+    if(t < 256)
+    {
+#pragma unroll
+        for(int r = 0; r < HIST_REP; r++)
+            x += s_hist[t * HIST_REP + r];
+#pragma unroll
+        for(int off = 1; off < WAVE_SIZE; off <<= 1)
+        {
+            uint32_t up = __shfl_down(x, off);
+            if(lane + off < WAVE_SIZE)
+                x += up;
+        }
+        if(lane == 0)
+            s_wavetot[wv] = x;
+    }
+    __syncthreads();
+
+    uint32_t above_waves = 0;
+    if(t < 256)
+        for(int w = wv + 1; w < 256 / WAVE_SIZE; w++)
+            above_waves += s_wavetot[w];
+    const uint32_t s_t = x + above_waves;
+    uint32_t s_next    = __shfl_down(s_t, 1);
+    if(lane == WAVE_SIZE - 1)
+        s_next = above_waves;
+    if(t == 255)
+        s_next = 0u;
+
+    if(t < 256 && ek > 0 && s_t >= (uint32_t)ek && s_next < (uint32_t)ek)
+    {
+        s_scan[0] = (uint32_t)t;
+        s_scan[1] = s_next;
+    }
+    __syncthreads();
+}
+
 __device__ __forceinline__ void
 block_find_pivot_bucket(const uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_scan, int ek)
 {

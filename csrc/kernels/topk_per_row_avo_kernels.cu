@@ -66,7 +66,33 @@ static int g_phase_a_block = 0; // 0 => derive from occupancy
 // 3 passes give bit-identical candidate counts to 4 (the 4th byte never moves the
 // bucket at fp32 precision) and 3 is safer than 2, whose spread ran to max=3919
 // against C_alloc=4096.
-static int g_phase_a_passes  = 3;
+static int g_phase_a_passes = 3;
+// FALSIFIED as a perf change, kept only so the measurement can be reproduced:
+// compacting the active set is correct (same pivot, same candidate counts on all
+// five distributions) but buys nothing -- phase_a 65.7 -> 65.4 us and wall time
+// WORSE on three of four shapes. The discarded reads were never the cost; the
+// barriers are. See knowledge/known_bad.md.
+static int g_phase_a_compact = 0;
+
+// Folds the HIST_REP reduction into the pivot scan, taking a radix pass from 5
+// block barriers to 4. Shipped on; build with `-DSELECT_FUSED_REDUCE=0` to A/B
+// against the separate-reduction form.
+//
+// Build-time and not a runtime knob because it changes the barrier structure of
+// every caller of block_select_lds at once, and a runtime branch around a
+// barrier would not be a fair comparison. Measured wall time, 3 runs each at
+// warmup 20 / iters 100 / repeats 9, 0 -> 1:
+//   M=4096 N=131072  0.6132 -> 0.6090 ms  (-0.68%, the anchor)
+//   M=4096 N=1048576 3.1741 -> 3.1680 ms  (-0.19%)
+//   M=1    N=1048576 0.0316 -> 0.0309 ms  (-2.2%)
+//   M=1024 N=65536   0.0793 -> 0.0781 ms  (-1.5%)
+//   M=4096 N=8192    0.0995 -> 0.0947 ms  (-4.8%, small_n)
+//   M=2048 N=4096    0.0372 -> 0.0355 ms  (-4.6%, small_n)
+// The gain tracks how much of the kernel is the select, which is what the
+// barrier-bound reading of phase_a/phase_c predicts.
+#ifndef SELECT_FUSED_REDUCE
+#define SELECT_FUSED_REDUCE 1
+#endif
 static int g_pipeline_direct = 0;
 static int g_inject_fault    = 0;
 static int g_dump_stats      = 0;
@@ -166,6 +192,9 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
                 atomicAdd(&s_hist[((k >> sh) & 0xFFu) * HIST_REP + rep], 1u);
         }
         __syncthreads();
+#if SELECT_FUSED_REDUCE
+        block_find_pivot_bucket_rep(s_hist, s_scan, ek);
+#else
         if(HIST_REP > 1)
         {
             for(int b = threadIdx.x; b < 256; b += blockDim.x)
@@ -179,8 +208,113 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
             __syncthreads();
         }
         block_find_pivot_bucket(HIST_REP > 1 ? s_red : s_hist, s_scan, ek);
+#endif
         pivot |= (s_scan[0] << sh);
         ek -= (int)s_scan[1];
+    }
+    eq_needed = ek;
+}
+
+// Active-set compaction variant of the select above, for Phase A only.
+//
+// The filter-rescan form reads all `c` keys on every pass and discards the
+// ~255/256 that do not match the pivot prefix. Those later passes were measured
+// at 30-34% of phase_small_n_topk while carrying almost no work (see
+// knowledge/known_bad.md, "Early-exiting the radix select once the pivot is
+// pinned"). This form compacts the survivors after each pass, so pass p+1 reads
+// only what pass p kept: ~2c key reads over three passes instead of 3c.
+//
+// The MECHANISM is the point, not the saving. An earlier attempt removed the
+// same passes with a block-wide active-set min/max early exit and came out
+// 21-39% SLOWER, because that test costs two barriers per pass. Compaction here
+// is WAVE-PRIVATE, so it adds no barrier and no LDS -- the same ownership trick
+// that lets the shipped Phase B filter run with no atomic of any kind.
+//
+// Wave w owns [lo, lo + n_active) of s_keys and compacts its own survivors to
+// the front of its own segment, carrying the count in a wave-uniform register.
+// In place is safe because within an iteration every lane reads before any lane
+// writes, and a survivor lands at or below the index it came from
+// (wcnt <= j and popcount(ballot & lt) <= lane), so nothing is overwritten
+// before it has been read. Waves own disjoint segments, so there is no
+// cross-wave hazard either.
+//
+// No prefix_skip path: a compacted pass needs no prefix filter to begin with,
+// and Phase A never asked for prefix_skip anyway (its samples span the whole
+// row, so no pass is ever skippable -- measured +8.0 us when tried).
+__device__ __forceinline__ void block_select_lds_compact(uint32_t* __restrict__ s_keys,
+                                                         int c,
+                                                         int K,
+                                                         uint32_t* __restrict__ s_hist,
+                                                         uint32_t* __restrict__ s_red,
+                                                         uint32_t* __restrict__ s_scan,
+                                                         uint32_t& pivot,
+                                                         int& eq_needed,
+                                                         int npasses)
+{
+    const int rep     = threadIdx.x & (HIST_REP - 1);
+    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
+    const int wid     = threadIdx.x / WAVE_SIZE;
+    const int nwaves  = blockDim.x / WAVE_SIZE;
+    const uint64_t lt = (1ull << lane) - 1ull;
+
+    if(threadIdx.x == 0)
+    {
+        s_scan[0] = 0;
+        s_scan[1] = 0;
+    }
+
+    const int chunk = (c + nwaves - 1) / nwaves;
+    const int lo    = min(wid * chunk, c);
+    int n_active    = min(lo + chunk, c) - lo;
+
+    pivot  = 0;
+    int ek = K;
+    for(int p = 0; p < npasses; p++)
+    {
+        const int sh = radix_shift(p);
+        for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
+            s_hist[i] = 0;
+        __syncthreads();
+        for(int i = lane; i < n_active; i += WAVE_SIZE)
+        {
+            const uint32_t k = s_keys[lo + i];
+            atomicAdd(&s_hist[((k >> sh) & 0xFFu) * HIST_REP + rep], 1u);
+        }
+        __syncthreads();
+        if(HIST_REP > 1)
+        {
+            for(int b = threadIdx.x; b < 256; b += blockDim.x)
+            {
+                uint32_t sum = 0;
+#pragma unroll
+                for(int r = 0; r < HIST_REP; r++)
+                    sum += s_hist[b * HIST_REP + r];
+                s_red[b] = sum;
+            }
+            __syncthreads();
+        }
+        // Ends in a barrier, so every read of s_hist / s_red for this pass is done
+        // before the next iteration zeroes them.
+        block_find_pivot_bucket(HIST_REP > 1 ? s_red : s_hist, s_scan, ek);
+        pivot |= (s_scan[0] << sh);
+        ek -= (int)s_scan[1];
+
+        if(p + 1 == npasses)
+            break;
+        const uint32_t want = pivot >> sh;
+        int wcnt            = 0;
+        for(int j = 0; j < n_active; j += WAVE_SIZE)
+        {
+            const int i        = j + lane;
+            const bool live    = (i < n_active);
+            const uint32_t k   = live ? s_keys[lo + i] : 0u;
+            const bool keep    = live && ((k >> sh) == want);
+            const uint64_t bal = __ballot(keep);
+            if(keep)
+                s_keys[lo + wcnt + __popcll(bal & lt)] = k;
+            wcnt += __popcll(bal);
+        }
+        n_active = wcnt;
     }
     eq_needed = ek;
 }
@@ -331,7 +465,11 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
 // this is free, where a hipMemsetAsync per counter was a full dispatch each
 // (~2.6 us) -- 5 of the 9 dispatches on the decode path were memsets.
 // cand_reserved / cand_bad may be null on the paths that do not reserve.
-template <bool RAGGED>
+// COMPACT selects the active-set-compacting select instead of the filter-rescan
+// one. It is a template parameter and not a kernarg on purpose: one unused
+// kernarg on phase_small_n_topk alone cost +1.0% of its geomean
+// (knowledge/known_bad.md), so an A/B knob must compile out entirely.
+template <bool RAGGED, bool COMPACT = false>
 __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restrict__ input,
                                                           int pitch,
                                                           RowExtents<RAGGED> extents,
@@ -408,7 +546,16 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
 
     uint32_t pivot;
     int eq_needed;
-    block_select_lds(s_keys, S, rank_row, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses);
+    if constexpr(COMPACT)
+    {
+        block_select_lds_compact(
+            s_keys, S, rank_row, s_hist, s_red, s_scan, pivot, eq_needed, npasses);
+    }
+    else
+    {
+        block_select_lds(
+            s_keys, S, rank_row, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses);
+    }
     if(threadIdx.x == 0)
     {
         threshold[row]   = pivot;
@@ -1074,20 +1221,40 @@ static void topk_fused_impl(const float* d_in,
     }
     else
     {
-        phase_a_threshold<RAGGED>
-            <<<M, a_block, (size_t)S * sizeof(uint32_t), s>>>(d_in,
-                                                              pitch,
-                                                              ext,
-                                                              rank,
-                                                              S,
-                                                              g_phase_a_passes,
-                                                              chunk_stride,
-                                                              b.threshold,
-                                                              b.threshold_f,
-                                                              coop ? b.cand_reserved : nullptr,
-                                                              coop ? b.cand_bad : nullptr,
-                                                              b.fb_count,
-                                                              K);
+        if(g_phase_a_compact)
+        {
+            phase_a_threshold<RAGGED, true>
+                <<<M, a_block, (size_t)S * sizeof(uint32_t), s>>>(d_in,
+                                                                  pitch,
+                                                                  ext,
+                                                                  rank,
+                                                                  S,
+                                                                  g_phase_a_passes,
+                                                                  chunk_stride,
+                                                                  b.threshold,
+                                                                  b.threshold_f,
+                                                                  coop ? b.cand_reserved : nullptr,
+                                                                  coop ? b.cand_bad : nullptr,
+                                                                  b.fb_count,
+                                                                  K);
+        }
+        else
+        {
+            phase_a_threshold<RAGGED, false>
+                <<<M, a_block, (size_t)S * sizeof(uint32_t), s>>>(d_in,
+                                                                  pitch,
+                                                                  ext,
+                                                                  rank,
+                                                                  S,
+                                                                  g_phase_a_passes,
+                                                                  chunk_stride,
+                                                                  b.threshold,
+                                                                  b.threshold_f,
+                                                                  coop ? b.cand_reserved : nullptr,
+                                                                  coop ? b.cand_bad : nullptr,
+                                                                  b.fb_count,
+                                                                  K);
+        }
 
         if(coop)
         {
