@@ -6,7 +6,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -562,18 +562,14 @@ def compile_gemm2_a16w4_port(
 
         def _xcd_np(pid):
             xc = _umod(pid, _NXCD)
-            wgid = (
-                xc * _xq
-                + fx.Int32(arith.minsi(_raw(xc), _raw(_xr)))
-                + _udiv(pid, _NXCD)
-            )
+            wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
             if const_expr(_SW <= 0):
                 return wgid
             _ng = fx.Int32(_SW * _num_n_blocks)
             group_id = wgid // _ng
             first_pid_m = group_id * fx.Int32(_SW)
             remaining_m = total_m_blocks - first_pid_m
-            group_size_m = fx.Int32(arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW))))
+            group_size_m = fx.min(remaining_m, fx.Int32(_SW))
             wig = wgid % _ng
             m_block = first_pid_m + (wig % group_size_m)
             n_block = wig // group_size_m
