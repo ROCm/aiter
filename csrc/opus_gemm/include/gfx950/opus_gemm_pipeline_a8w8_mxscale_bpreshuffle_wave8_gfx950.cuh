@@ -469,6 +469,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // global and gives the array back entirely.
     constexpr bool SF_LDS_A = !SFA_MPACK_GLOBAL && !SHUFFLE_SCALE;
     constexpr bool SF_LDS_B = !SHUFFLE_SCALE;
+    constexpr bool SF_PLAIN_DEFER_BARRIER =
+        (SF_LDS_A || SF_LDS_B) && T::B_M == 128 && T::B_K == 256;
     constexpr int SF_LDS_ELEMS =
         ((SF_LDS_A ? SFA_ROWS : 0) + (SF_LDS_B ? T::N_SCALE_GROUPS : 0)) * SF_SCALES_MAX;
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS > 0 ? SF_LDS_ELEMS : 1];
@@ -607,7 +609,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         if constexpr (SF_LDS_B) dispatch_width(kargs.stride_sfb, fill_sfb);
         s_waitcnt_vmcnt(0_I);
         s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        // The writes are complete. Selected plain-scale tiles publish the panel
+        // at tile 0's existing barrier after issuing the A ring and B(0), rather
+        // than paying a panel-only rendezvous.
+        if constexpr (!SF_PLAIN_DEFER_BARRIER) __builtin_amdgcn_s_barrier();
     }
 
     // Staging: there are no producer waves, every wave issues its own share of
