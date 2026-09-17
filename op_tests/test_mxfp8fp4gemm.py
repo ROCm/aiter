@@ -23,6 +23,7 @@ import argparse
 import csv
 import itertools
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -234,7 +235,7 @@ def _support_reason(outtype, apre, M, N, K):
 
 
 def _ref(intype, A, B, sA, sB, M, N, splitk=1):
-    # Reference only: fp32 math, cast back. Not timed, not in the table.
+    # FP32 reference; optionally benchmarked before the formal ASM measurement.
     A_f32 = A.to(torch.float32)[:M]
     if intype == "a8w4":
         B_f32 = fp4_utils.mxfp4_to_f32(B)[:N]
@@ -265,6 +266,9 @@ def _prep(
     scale_init: str,
     gen,
     reference_splitk=1,
+    pre_benchmark=False,
+    pre_benchmark_warmup=2,
+    pre_benchmark_iters=100,
 ):
     """Build raw + shuffled device tensors and the f32 golden reference.
 
@@ -290,7 +294,25 @@ def _prep(
     sB = fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
     # fp32 golden; the caller casts/quantizes it to the requested outtype.
-    ref_f32 = _ref(intype, A, B, sA, sB, M, N, reference_splitk)
+    pre_results = {}
+    if pre_benchmark:
+        aiter.logger.info("prebenchmark begin: native Torch reference")
+        torch_start_ns = time.monotonic_ns()
+        ref_f32, ref_us = run_perftest(
+            _ref, intype, A, B, sA, sB, M, N, reference_splitk,
+            num_warmup=pre_benchmark_warmup,
+            num_iters=pre_benchmark_iters,
+            testGraph=False,
+            num_rotate_args=0,
+        )
+        torch_end_ns = time.monotonic_ns()
+        pre_results["stage_windows"] = {
+            "torch": {"start_mono_ns": torch_start_ns, "end_mono_ns": torch_end_ns}
+        }
+        pre_results["torch us"] = ref_us
+        pre_results["torch profile_gpu_kernels"] = dict(run_perftest.last_gpu_kernels)
+    else:
+        ref_f32 = _ref(intype, A, B, sA, sB, M, N, reference_splitk)
 
     inp = {
         "A": shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
@@ -298,7 +320,44 @@ def _prep(
         "sA": shuffle_mxfp8fp4_scale(sA),
         "sB": shuffle_mxfp8fp4_scale(sB),
     }
-    return inp, ref_f32
+    if pre_benchmark:
+        from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
+
+        aiter.logger.info("prebenchmark begin: native ASM AP0")
+        pre_output = torch.empty(
+            (reference_splitk, M, N) if reference_splitk > 1 else (M, N),
+            dtype=dtypes.bf16,
+            device=A.device,
+        )
+
+        def run_pre_ap0(a, b, scale_a, scale_b):
+            _mxfp8_mxfp8_gemm_asm(
+                a, b, scale_a, scale_b, pre_output, None, 0, reference_splitk
+            )
+            return pre_output
+
+        ap0_start_ns = time.monotonic_ns()
+        pre_out, pre_us = run_perftest(
+            run_pre_ap0, A, inp["B"], inp["sA"], inp["sB"],
+            num_warmup=pre_benchmark_warmup,
+            num_iters=pre_benchmark_iters,
+            testGraph=False,
+            num_rotate_args=0,
+        )
+        ap0_end_ns = time.monotonic_ns()
+        pre_results["stage_windows"]["ap0"] = {
+            "start_mono_ns": ap0_start_ns, "end_mono_ns": ap0_end_ns
+        }
+        pre_results["ap0 us"] = pre_us
+        pre_results["ap0 profile_gpu_kernels"] = dict(run_perftest.last_gpu_kernels)
+        pre_err = checkAllclose(
+            ref_f32.to(dtypes.bf16).to(dtypes.fp32), pre_out.to(dtypes.fp32),
+            rtol=1e-1, atol=1.0, msg="prebenchmark AP0",
+        )
+        pre_results["ap0 err"] = pre_err
+        pre_results["ap0 result"] = _verdict(pre_err)
+        aiter.logger.info("prebenchmark complete: continuing to formal ASM AP1")
+    return inp, ref_f32, pre_results
 
 
 @benchmark()
@@ -320,6 +379,9 @@ def test_gemm(
     num_iters=None,
     test_graph=False,
     num_rotate=0,
+    pre_benchmark=False,
+    pre_benchmark_warmup=2,
+    pre_benchmark_iters=100,
 ):
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
@@ -355,7 +417,12 @@ def test_gemm(
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     if no_reduce and (intype != "a8w8" or splitk < 1):
         raise ValueError("--no-reduce requires a8w8 and an explicit positive --splitk")
-    inp, ref_f32 = _prep(
+    if pre_benchmark and not (
+        intype == "a8w8" and apre == 1 and no_reduce and splitk > 0
+        and pre_benchmark_warmup >= 0 and pre_benchmark_iters > 1
+    ):
+        raise ValueError("--pre-benchmark requires a8w8/AP1/--no-reduce/positive split-K and valid pre-benchmark counts")
+    inp, ref_f32, pre_results = _prep(
         intype,
         M,
         N,
@@ -365,6 +432,9 @@ def test_gemm(
         scale_init,
         gen,
         reference_splitk=splitk if no_reduce else 1,
+        pre_benchmark=pre_benchmark,
+        pre_benchmark_warmup=pre_benchmark_warmup,
+        pre_benchmark_iters=pre_benchmark_iters,
     )
     ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
@@ -430,6 +500,8 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
+    if pre_benchmark:
+        ret["pre_benchmark_results"] = pre_results
     ret["reference_splitk"] = splitk if no_reduce else 1
     # Report TG occupancy for the tile+cluster the cpp dispatch picks.
     _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
@@ -472,6 +544,8 @@ def test_gemm(
         _NOT_SUPPORTED_MARKERS += ("kernel not in cfg_mxfp8fp4gemm",)
     for name, (cand, cand_args) in candidates.items():
         try:
+            if pre_benchmark:
+                ap1_start_ns = time.monotonic_ns()
             out, us = run_perftest(
                 cand,
                 *cand_args,
@@ -481,6 +555,11 @@ def test_gemm(
                 num_rotate_args=num_rotate,
                 needTrace=needTrace,
             )
+            if pre_benchmark:
+                ap1_end_ns = time.monotonic_ns()
+                pre_results["stage_windows"]["ap1"] = {
+                    "start_mono_ns": ap1_start_ns, "end_mono_ns": ap1_end_ns
+                }
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
                 raise
@@ -662,6 +741,12 @@ def main():
         action="store_true",
         help="Time ASM GEMM only and validate each split-K plane independently",
     )
+    parser.add_argument(
+        "--pre-benchmark", action="store_true",
+        help="Before each AP1 test, benchmark the native Torch reference and native ASM AP0",
+    )
+    parser.add_argument("--pre-benchmark-warmup", type=int, default=2)
+    parser.add_argument("--pre-benchmark-iters", type=int, default=100)
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
@@ -732,6 +817,9 @@ def main():
             num_iters=args.iters,
             test_graph=args.graph,
             num_rotate=args.rotate,
+            pre_benchmark=args.pre_benchmark,
+            pre_benchmark_warmup=args.pre_benchmark_warmup,
+            pre_benchmark_iters=args.pre_benchmark_iters,
         )
         for apre, (di, si), intype, outtype in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype
