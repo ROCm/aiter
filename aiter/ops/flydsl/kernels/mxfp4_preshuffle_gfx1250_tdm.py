@@ -1072,26 +1072,6 @@ def launch_gemm_a8w4_tdm(
             if const_expr(tdm_as_in_prologue):
                 issue_as_prologue()
                 # The first normal pipeline fence covers this oldest TDM load.
-            if const_expr(enable_ep_scatter):
-                # Rowmap (dst_i32, weight_f32) TDM descriptor: a (tile_m, 2) i32
-                # slice at global row blk_m into the persistent rowmap LDS region.
-                # It is issued at the drain tail below rather than here so it does
-                # not perturb the mainloop's exact tensor_wait counts. ext=mn_oob
-                # clamps to this expert's valid rows; padding rows stay unloaded
-                # and are masked in the epilogue.
-                _rm_i32 = fx.get_iter(arg_ep_row_map)
-                _rm_gt = tensor_view(
-                    _rm_i32 + blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
-                )
-                _rm_atom = fx.rocdl.make_tdm_atom(
-                    _rm_gt,
-                    [mn_oob, None],
-                    strides=[fx.Int64(2), None],
-                    num_warps=num_waves,
-                )
-                _rm_dst = tensor_view(
-                    fx.recast_iter(p32_shared, _rowmap_lds_ptr), (tile_m, 2), (2, 1)
-                )
             # Post-compute wins for decode and for shallow pipelines: at
             # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
             if const_expr(tile_m <= 32 or num_buffers <= 2):
