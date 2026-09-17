@@ -20,13 +20,20 @@ def _plan_pa_decode(
     B: tl.constexpr,
     CAPACITY: tl.constexpr,
     MAX_PARTS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    QUERY_LENGTH: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
     seq = tl.program_id(0)
     b = tl.arange(0, BLOCK_B)
-    ctx = tl.load(lengths + b, b < B, other=0)
-    tiles = tl.where(b < B, tl.maximum(ctx, 0).to(tl.int64) + 255, 0) // 256
+    ctx = tl.maximum(tl.load(lengths + b, b < B, other=0), 0).to(tl.int64)
+    first_tile = tl.full((BLOCK_B,), 0, tl.int64)
+    if SLIDING_WINDOW > 0:
+        # Fused MTP queries have different left edges. Schedule their union,
+        # rounding down to an absolute tile so page/scaling offsets stay valid.
+        first_tile = tl.maximum(ctx - (QUERY_LENGTH - 1) - SLIDING_WINDOW, 0) // 256
+    tiles = tl.where(b < B, (ctx + 255) // 256 - first_tile, 0)
     nonempty = (tiles > 0).to(tl.int32)
     total = tl.maximum(tl.sum(tiles, 0), 1)
     remaining = CAPACITY - tl.sum(nonempty, 0)
@@ -40,15 +47,21 @@ def _plan_pa_decode(
     count = tl.sum(tl.where(b == seq, counts, 0), 0).to(tl.int32)
     start = tl.sum(tl.where(b < seq, counts, 0), 0).to(tl.int32)
     seq_ctx = tl.load(lengths + seq)
-    seq_tiles = (tl.maximum(seq_ctx, 0).to(tl.int64) + 255) // 256
+    seq_length = tl.maximum(seq_ctx, 0).to(tl.int64)
+    seq_first_tile = tl.full((), 0, tl.int64)
+    if SLIDING_WINDOW > 0:
+        seq_first_tile = (
+            tl.maximum(seq_length - (QUERY_LENGTH - 1) - SLIDING_WINDOW, 0) // 256
+        )
+    seq_tiles = (seq_length + 255) // 256 - seq_first_tile
     total_tasks = tl.sum(counts, 0).to(tl.int32)
     tl.store(reduce_info + seq * 2, start)
     tl.store(reduce_info + seq * 2 + 1, count)
 
     part = tl.arange(0, BLOCK_P)
     active = part < count
-    begin = part.to(tl.int64) * seq_tiles // tl.maximum(count, 1)
-    end = (part.to(tl.int64) + 1) * seq_tiles // tl.maximum(count, 1)
+    begin = seq_first_tile + part.to(tl.int64) * seq_tiles // tl.maximum(count, 1)
+    end = seq_first_tile + (part.to(tl.int64) + 1) * seq_tiles // tl.maximum(count, 1)
     slot = start + part
     tl.store(work + slot * 4, seq, active)
     tl.store(work + slot * 4 + 1, begin, active)
@@ -69,7 +82,8 @@ def _plan_pa_decode(
 class PADecodePlan:
     """Reusable GPU metadata; refresh it whenever context lengths change.
 
-    ``work_info`` is [capacity, 4]: sequence, first/last 256-token tile, length.
+    ``work_info`` is [capacity, 4]: sequence, first/last absolute 256-token tile,
+    original context length. Sliding windows cover the union of MTP queries.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
     Scratch uses [KV heads, capacity, query rows (, head dim)].
     """
@@ -78,6 +92,8 @@ class PADecodePlan:
     reduce_info: torch.Tensor
     num_kv_heads: int
     max_partitions: int
+    sliding_window: int = 0
+    query_length: int = 1
 
     @property
     def capacity(self) -> int:
@@ -88,6 +104,8 @@ class PADecodePlan:
             raise ValueError("plan KV head count does not match the cache")
         if not 1 <= self.max_partitions <= MAX_CONTEXT_PARTITIONS:
             raise ValueError("invalid plan max_partitions")
+        if self.sliding_window < 0 or self.query_length < 1:
+            raise ValueError("invalid plan sliding_window or query_length")
         if self.reduce_info.shape != (batch_size, 2):
             raise ValueError("reduce_info must have shape [batch_size, 2]")
         if self.work_info.ndim != 2 or self.work_info.shape[1] != 4:
@@ -107,6 +125,8 @@ def plan_pa_decode(
     *,
     max_partitions: int = MAX_CONTEXT_PARTITIONS,
     workgroup_budget: int | None = None,
+    sliding_window: int = 0,
+    query_length: int = 1,
     plan: PADecodePlan | None = None,
 ) -> PADecodePlan:
     """Build/update a plan on the current stream without GPU-to-CPU readback.
@@ -115,7 +135,22 @@ def plan_pa_decode(
     same metadata in place. Include this refresh in end-to-end measurements.
     The budget counts CTAs over all KV heads, with fused query positions.
     This is opt-in: uniform or short-context workloads may favor static splits.
+
+    A positive ``sliding_window`` counts visible tokens including the query's
+    own position; 0 and -1 disable it. Context lengths include the MTP tokens,
+    so the planned range is the union of ``query_length`` causal windows.
+    Pass the same window and (when enabled) query length to ``pa_decode`` and
+    when refreshing the plan. Dense plans remain independent of query length.
     """
+    if not isinstance(sliding_window, int):
+        raise TypeError("sliding_window must be an int")
+    if sliding_window < -1:
+        raise ValueError("sliding_window must be -1, 0, or positive")
+    sliding_window = max(sliding_window, 0)
+    if not isinstance(query_length, int):
+        raise TypeError("query_length must be an int")
+    if query_length < 1:
+        raise ValueError("query_length must be positive")
     if context_lengths.device.type != "cuda" or context_lengths.dtype != torch.int32:
         raise ValueError("context_lengths must be a CUDA int32 tensor")
     if context_lengths.ndim != 1 or not context_lengths.is_contiguous():
@@ -144,12 +179,18 @@ def plan_pa_decode(
             torch.empty((batch, 2), dtype=torch.int32, device=dev),
             num_kv_heads,
             max_partitions,
+            sliding_window,
+            query_length,
         )
     else:
         if workgroup_budget is not None:
             raise ValueError("workgroup_budget is fixed when reusing a plan")
         if max_partitions != plan.max_partitions:
             raise ValueError("max_partitions must match the reused plan")
+        if sliding_window != plan.sliding_window:
+            raise ValueError("sliding_window must match the reused plan")
+        if sliding_window > 0 and query_length != plan.query_length:
+            raise ValueError("query_length must match the reused plan")
     plan.validate(batch, num_kv_heads, dev)
     with torch.cuda.device(dev):
         _plan_pa_decode[(batch,)](
@@ -159,6 +200,10 @@ def plan_pa_decode(
             batch,
             plan.capacity,
             plan.max_partitions,
+            # Larger windows cover every int32 context. Dense planning is
+            # query-length independent, including its compilation cache key.
+            min(sliding_window, 2**31 - 1),
+            query_length if sliding_window > 0 else 1,
             triton.next_power_of_2(batch),
             triton.next_power_of_2(plan.max_partitions),
             num_warps=4,

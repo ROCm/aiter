@@ -221,9 +221,14 @@ def pa_decode(
     Sparse attention uses caller-prepared block tables and selected context
     lengths. Each independently selected MTP query must have its own table row
     and use query_length=1; query_length>1 applies dense causal masking.
-    ALiBi, attention sinks, sliding-window attention, and externally quantized
-    FP8 queries are not supported. The ``ps=False`` partitioning policy is also
-    not supported.
+    A positive ``sliding_window`` limits each query to that many causal tokens,
+    including its own position; 0 and -1 disable the window. Optional ``sinks``
+    is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the query device.
+    Each entry is an unscaled, zero-value attention logit shared across batch
+    and MTP positions. It contributes to the denominator once, independently
+    of the window; -inf disables a head's sink and +inf suppresses its output.
+    ALiBi and externally quantized FP8 queries are not supported. The ``ps=False``
+    partitioning policy is also not supported.
 
     ``context_lengths`` and ``block_tables`` are GPU-resident, so their values
     are not inspected here (which would synchronize the device). Callers must
@@ -235,6 +240,8 @@ def pa_decode(
     ``work_plan`` opts into GPU-planned variable partition counts. Build or
     refresh it with ``plan_pa_decode`` on the current stream after updating
     lengths. Its ``max_partitions`` must equal ``max_context_partition_num``.
+    Its window must match ``sliding_window``, and a windowed plan must be built
+    with the same ``query_length`` so it covers every MTP query's window.
     Planned scratch is packed as [KV heads, plan.capacity, query rows (, D)];
     the static API's dense per-sequence scratch layout remains unchanged.
     """
@@ -249,14 +256,17 @@ def pa_decode(
         )
     if alibi_slopes is not None:
         raise NotImplementedError("pa_decode does not support ALiBi")
-    if sinks is not None:
-        raise NotImplementedError("pa_decode does not support attention sinks")
-    if sliding_window not in (0, -1):
-        raise NotImplementedError("pa_decode does not support sliding-window attention")
+    if not isinstance(sliding_window, int):
+        raise TypeError("sliding_window must be an int")
+    if sliding_window < -1:
+        raise ValueError("sliding_window must be -1, 0, or positive")
+    sliding_window = max(sliding_window, 0)
     if not isinstance(ps, bool):
         raise TypeError(f"ps must be a bool, got {type(ps).__name__}")
     if not ps:
         raise NotImplementedError("pa_decode does not support ps=False")
+    if not isinstance(query_length, int):
+        raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
     if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
@@ -442,6 +452,17 @@ def pa_decode(
         )
 
     dev = query.device
+    if sinks is not None:
+        if not isinstance(sinks, torch.Tensor):
+            raise TypeError("sinks must be a torch.Tensor")
+        if sinks.shape != (num_q_heads,):
+            raise ValueError("sinks must have shape [num_query_heads]")
+        if sinks.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError("sinks must have dtype bfloat16, float16, or float32")
+        if sinks.device != dev:
+            raise ValueError("sinks must be on the same device as query")
+        if not sinks.is_contiguous():
+            raise ValueError("sinks must be contiguous")
     for name, tensor in (
         ("output", output),
         ("key_cache", key_cache),
@@ -541,6 +562,10 @@ def pa_decode(
             raise ValueError(
                 "max_context_partition_num must match work_plan.max_partitions"
             )
+        if work_plan.sliding_window != sliding_window:
+            raise ValueError("sliding_window must match work_plan.sliding_window")
+        if sliding_window > 0 and work_plan.query_length != query_length:
+            raise ValueError("query_length must match work_plan.query_length")
     pmax = max_logits
     psum = exp_sums
     pout = temporary_output
@@ -625,6 +650,9 @@ def pa_decode(
     )
     prefetch_v = scalar_prefetch or per_token_prefetch
 
+    # Partial outputs must exclude the sink: reduction adds it once across all
+    # partitions. Keep direct NP=1 output fused, without extra scratch/launches.
+    use_direct_sinks = sinks is not None and num_partitions == 1 and work_plan is None
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -640,6 +668,9 @@ def pa_decode(
             prefetch_v=prefetch_v,
             query_splits=query_splits,
             use_work_plan=work_plan is not None,
+            sliding_window=sliding_window,
+            use_sinks=use_direct_sinks,
+            sink_dtype_str=get_dtype_str(sinks.dtype) if use_direct_sinks else "f32",
         )
 
     if num_partitions == 1 and work_plan is None:
@@ -722,6 +753,11 @@ def pa_decode(
             ptr_arg(context_lengths, fx.Int32),
             ptr_arg(key_scale_t, fx.Float32),
             ptr_arg(value_scale_t, fx.Float32),
+            (
+                ptr_arg(sinks, _flydsl_pointer_dtype(sinks.dtype))
+                if use_direct_sinks
+                else flyc.from_c_void_p(fx.Float32, 0)
+            ),
             int(max_blocks_per_seq),
             int(num_seqs),
             int(num_kv_heads),
@@ -748,7 +784,7 @@ def pa_decode(
                 psum,
                 pmax,
                 pout,
-                None,
+                sinks,
                 output_5d.stride(0),
                 output_5d.stride(1),
                 output_5d.stride(2),

@@ -99,8 +99,10 @@ def run_torch(
     key_scale: torch.Tensor,
     value_scale: torch.Tensor,
     query_length: int = 1,
+    sliding_window: int = 0,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Dequantized FP32 reference with sequence-major, causal MTP queries."""
+    """Dequantized FP32 reference with sequence-major, windowed causal queries."""
     num_queries, num_query_heads, head_dim = query.shape
     batch_size = context_lengths.numel()
     if query_length < 1 or num_queries != batch_size * query_length:
@@ -142,8 +144,17 @@ def run_torch(
         )
         visible = context_length - query_length + 1 + positions
         masked = token_ids.unsqueeze(0) >= visible.unsqueeze(1)
+        if sliding_window > 0:
+            masked |= token_ids.unsqueeze(0) < (visible - sliding_window).unsqueeze(1)
         scores.masked_fill_(masked[:, None, None, :], float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
+        if sinks is None:
+            probs = torch.softmax(scores, dim=-1)
+        else:
+            sink_logits = sinks.float().reshape(1, num_kv_heads, query_group_size, 1)
+            sink_logits = sink_logits.expand(query_length, -1, -1, -1)
+            # The virtual token's V is zero, and its logit is not QK-scaled.
+            probs = torch.softmax(torch.cat((scores, sink_logits), dim=-1), dim=-1)
+            probs = probs[..., :-1]
         # Contexts shorter than QL have leading queries with no visible tokens.
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         first_row = seq_idx * query_length
@@ -164,6 +175,8 @@ def _run_accuracy_case(
     num_partitions,
     tolerance,
     trans_v=False,
+    sliding_window=0,
+    sinks=None,
 ):
     """Run PA against a dequantized-FP8 torch reference without benchmarking."""
     _require_gpu()
@@ -229,6 +242,8 @@ def _run_accuracy_case(
         context_lengths,
         key_scale,
         value_scale,
+        sliding_window=sliding_window,
+        sinks=sinks,
     )
     output = torch.empty_like(query)
     torch.ops.aiter.pa_decode_flydsl(
@@ -246,6 +261,8 @@ def _run_accuracy_case(
         None,
         key_scale,
         value_scale,
+        sliding_window=sliding_window,
+        sinks=sinks,
     )
 
     torch.testing.assert_close(
@@ -257,11 +274,19 @@ def _run_accuracy_case(
 
 
 def _run_mtp4_fused_reference_case(
-    lengths, num_kv_heads, block_size, trans_v, num_partitions
+    lengths,
+    num_kv_heads,
+    block_size,
+    trans_v,
+    num_partitions,
+    *,
+    query_length=4,
+    sliding_window=0,
+    sinks=None,
 ):
-    """Check MTP4 with sparse pages, varying scales, and a causal FP32 reference."""
+    """Check sparse MTP pages and varying scales against a causal FP32 reference."""
     torch.manual_seed(37)
-    query_length, query_group_size, head_dim = 4, 16, 128
+    query_group_size, head_dim = 16, 128
     batch_size = len(lengths)
     num_query_heads = num_kv_heads * query_group_size
     pages_per_sequence = [(length + block_size - 1) // block_size for length in lengths]
@@ -290,18 +315,25 @@ def _run_mtp4_fused_reference_case(
     token = torch.arange(num_pages * block_size).reshape(num_pages, 1, block_size, 1)
     kv_head = torch.arange(num_kv_heads).reshape(1, num_kv_heads, 1, 1)
     key_scale *= torch.exp2(((2 * token + kv_head) % 4 - 2).float())
-    value_scale *= torch.exp2(((token + 2 * kv_head) % 5 - 3).float())
+    value_scale_factors = torch.exp2(((token + 2 * kv_head) % 5 - 3).float())
+    if sliding_window == 1:
+        # Exact binary ratios make a single visible token's normalized P
+        # representable in FP8 even when MTP queries share the V-scale max.
+        # This isolates mask/scale addressing from P-rounding error; wider
+        # windows retain the random quantization scales below.
+        value_scale = value_scale_factors * 2**-10
+    else:
+        value_scale *= value_scale_factors
 
-    # Make C1--C4 analytically exact while still detecting causal off-by-one:
-    # K=0 gives uniform attention, V progresses as [.25, .5, .75, 1], and
-    # scale=1. A C4 row therefore produces [.25, .375, .5, .625].
+    # Preserve the original exact C1--C4 cases independently of QL: unrestricted
+    # random short contexts hit FP8 probability-rounding error even without SW.
+    # K=0, V=[.25, .5, .75, 1], and scale=1 still detect causal/window off-by-one:
+    # dense QL4/C4 produces [.25, .375, .5, .625], and W=1 returns V directly.
     data_page = 0
     for length, page_count in zip(lengths, pages_per_sequence):
-        if 0 < length <= query_length:
+        if 0 < length <= 4:
             capacity = page_count * block_size
-            token_values = (
-                torch.arange(capacity, dtype=dtypes.fp32) % query_length + 1
-            ) * 0.25
+            token_values = (torch.arange(capacity, dtype=dtypes.fp32) % 4 + 1) * 0.25
             key_quant[data_page : data_page + page_count].zero_()
             value_quant[data_page : data_page + page_count] = (
                 token_values.reshape(page_count, 1, 1, block_size)
@@ -385,13 +417,19 @@ def _run_mtp4_fused_reference_case(
             visible = max(0, length - (query_length - 1) + position)
             if visible == 0:
                 continue
+            first = max(0, visible - sliding_window) if sliding_window > 0 else 0
             row = seq * query_length + position
             scores = (
-                torch.einsum("hd,khd->hk", query[row].float(), keys[:visible])
+                torch.einsum("hd,khd->hk", query[row].float(), keys[first:visible])
                 * head_dim**-0.5
             )
-            probs = torch.softmax(scores, dim=-1)
-            reference[row] = torch.einsum("hk,khd->hd", probs, values[:visible])
+            if sinks is None:
+                probs = torch.softmax(scores, dim=-1)
+            else:
+                probs = torch.softmax(
+                    torch.cat((scores, sinks.float().unsqueeze(-1)), dim=-1), dim=-1
+                )[:, :-1]
+            reference[row] = torch.einsum("hk,khd->hd", probs, values[first:visible])
 
     output = torch.full_like(query, float("nan"))
     torch.ops.aiter.pa_decode_flydsl(
@@ -409,6 +447,8 @@ def _run_mtp4_fused_reference_case(
         None,
         key_scale,
         value_scale,
+        sliding_window=sliding_window,
+        sinks=sinks,
     )
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output.float(), reference, rtol=0.005, atol=0.005)
@@ -962,7 +1002,16 @@ def test_pa_decode(case, monkeypatch):
 def _assert_plan(plan, lengths):
     work = plan.work_info.cpu().tolist()
     reductions = plan.reduce_info.cpu().tolist()
-    tiles_per_sequence = [(max(length, 0) + 255) // 256 for length in lengths]
+    last_tiles = [(max(length, 0) + 255) // 256 for length in lengths]
+    first_tiles = [
+        (
+            max(0, length - (plan.query_length - 1) - plan.sliding_window) // 256
+            if plan.sliding_window > 0
+            else 0
+        )
+        for length in lengths
+    ]
+    tiles_per_sequence = [last - first for first, last in zip(first_tiles, last_tiles)]
     nonempty = [int(tiles > 0) for tiles in tiles_per_sequence]
     total_tiles = max(sum(tiles_per_sequence), 1)
     remaining = plan.capacity - sum(nonempty)
@@ -979,8 +1028,8 @@ def _assert_plan(plan, lengths):
     expected_reductions = []
     expected_work = []
     offset = 0
-    for seq, (length, tiles, count) in enumerate(
-        zip(lengths, tiles_per_sequence, expected_counts)
+    for seq, (length, first, last, tiles, count) in enumerate(
+        zip(lengths, first_tiles, last_tiles, tiles_per_sequence, expected_counts)
     ):
         start = offset
         expected_reductions.append([start, count])
@@ -988,8 +1037,8 @@ def _assert_plan(plan, lengths):
             expected_work.append(
                 [
                     seq,
-                    part * tiles // count,
-                    (part + 1) * tiles // count,
+                    first + part * tiles // count,
+                    first + (part + 1) * tiles // count,
                     length,
                 ]
             )
@@ -998,12 +1047,12 @@ def _assert_plan(plan, lengths):
         assert (actual_start, actual_count) == (start, count)
         assert 0 <= actual_count <= min(tiles, plan.max_partitions)
         assert (actual_count > 0) == (length > 0)
-        previous_end = 0
+        previous_end = first
         for task in work[actual_start : actual_start + actual_count]:
             assert task[0] == seq and task[3] == length
-            assert task[1] == previous_end and task[1] < task[2] <= tiles
+            assert task[1] == previous_end and task[1] < task[2] <= last
             previous_end = task[2]
-        assert previous_end == tiles
+        assert previous_end == last
         offset += actual_count
     expected_work.extend([[0, 0, 0, 0]] * (plan.capacity - offset))
     assert reductions == expected_reductions
@@ -1036,13 +1085,76 @@ def test_plan_covers_each_token_once(lengths, heads, max_parts, budget):
     _assert_plan(plan, lengths)
 
 
-def test_plan_graph_refresh_overwrites_old_metadata():
+@pytest.mark.parametrize(
+    "sliding_window,query_length",
+    [
+        (1, 1),
+        (1, 4),
+        (255, 2),
+        (256, 3),
+        (257, 4),
+        (509, 4),
+        (8192, 4),
+        (2**40, 4),
+        (0, 4),
+        (-1, 2),
+    ],
+)
+@pytest.mark.parametrize(
+    "heads,max_parts,budget", [(1, 1, 32), (1, 7, 17), (2, 256, 512)]
+)
+def test_sliding_window_plan_covers_absolute_tiles(
+    sliding_window, query_length, heads, max_parts, budget
+):
+    # Include MTP unions crossing a 256-token boundary, negative/empty contexts,
+    # and int32's maximum length without allocating a corresponding KV cache.
+    lengths = [
+        -1,
+        0,
+        1,
+        2,
+        3,
+        4,
+        255,
+        256,
+        257,
+        258,
+        259,
+        511,
+        512,
+        513,
+        514,
+        515,
+        8193,
+        200003,
+        2**31 - 1,
+    ]
+    context = torch.tensor(lengths, dtype=torch.int32)
+    plan = plan_pa_decode(
+        context,
+        heads,
+        max_partitions=max_parts,
+        workgroup_budget=budget,
+        query_length=query_length,
+        sliding_window=sliding_window,
+    )
+    assert plan.sliding_window == max(sliding_window, 0)
+    assert plan.query_length == query_length
+    _assert_plan(plan, lengths)
+
+
+@pytest.mark.parametrize("sliding_window,query_length", [(0, 1), (1, 4), (257, 3)])
+def test_plan_graph_refresh_overwrites_old_metadata(sliding_window, query_length):
     lengths = [200003] * 8
     context = torch.tensor(lengths, dtype=torch.int32)
-    plan = plan_pa_decode(context, 1)
+    plan_options = {
+        "sliding_window": sliding_window,
+        "query_length": query_length,
+    }
+    plan = plan_pa_decode(context, 1, **plan_options)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        plan_pa_decode(context, 1, plan=plan)
+        plan_pa_decode(context, 1, plan=plan, **plan_options)
     for lengths in ([0] * 8, [0, 1, 3, 4, 257, 4096, 16385, 200003], [200003] * 8):
         context.copy_(torch.tensor(lengths, dtype=torch.int32))
         graph.replay()
@@ -1050,8 +1162,177 @@ def test_plan_graph_refresh_overwrites_old_metadata():
 
 
 def _planned_call(*args, **kwargs):
-    plan = plan_pa_decode(args[4], args[2].shape[1], max_partitions=args[8])
+    plan = plan_pa_decode(
+        args[4],
+        args[2].shape[1],
+        max_partitions=args[8],
+        query_length=args[7],
+        sliding_window=kwargs.get("sliding_window", 0),
+    )
     pa_decode(*args, work_plan=plan, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "query_length,sliding_window,block_size,trans_v,max_parts,heads",
+    [
+        (1, 1, 16, False, 1, 1),
+        (1, 257, 128, True, 7, 2),
+        (2, 1, 16, True, 7, 1),
+        (2, 255, 64, False, 64, 2),
+        (2, 8192, 128, True, 256, 1),
+        (3, 1, 128, False, 1, 2),
+        (3, 257, 16, True, 7, 1),
+        (3, 513, 64, True, 86, 1),
+        (4, 1, 16, False, 7, 1),
+        (4, 256, 128, True, 7, 2),
+        (4, 257, 128, False, 256, 1),
+        (4, 8192, 16, True, 1, 1),
+        (4, 2**40, 16, False, 7, 1),
+    ],
+)
+def test_planned_sliding_window_sparse_causal_reference(
+    monkeypatch, query_length, sliding_window, block_size, trans_v, max_parts, heads
+):
+    """Each query has its own window even when its tile is shared with MTP peers."""
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", _planned_call)
+    _run_mtp4_fused_reference_case(
+        [0, 1, 2, 3, 4, 255, 256, 257, 258, 259, 513, 514, 515, 4099],
+        heads,
+        block_size,
+        trans_v,
+        max_parts,
+        query_length=query_length,
+        sliding_window=sliding_window,
+    )
+
+
+@pytest.mark.parametrize(
+    "query_length,sliding_window,block_size,trans_v,parts",
+    [
+        (1, 1, 16, False, 1),
+        (2, 257, 128, True, 7),
+        (3, 1, 64, False, 7),
+        (4, 257, 128, True, 7),
+        (4, 8192, 16, False, 1),
+        (4, 2**31 - 1, 16, False, 1),
+        (4, 2**31, 16, False, 1),
+    ],
+)
+def test_static_sliding_window_sparse_causal_reference(
+    query_length, sliding_window, block_size, trans_v, parts
+):
+    """The unplanned path, including query-split kernels, uses the same mask."""
+    _run_mtp4_fused_reference_case(
+        [0, 1, 2, 3, 4, 255, 256, 257, 259, 513, 514, 4099],
+        1,
+        block_size,
+        trans_v,
+        parts,
+        query_length=query_length,
+        sliding_window=sliding_window,
+    )
+
+
+@pytest.mark.parametrize(
+    "sliding_window,head_dim,block_size,trans_v,parts,dtype",
+    [
+        (1, 64, 16, False, 1, torch.bfloat16),
+        (1, 128, 16, True, 7, torch.bfloat16),
+        (257, 128, 128, True, 7, torch.float16),
+        (257, 128, 128, True, 7, torch.bfloat16),
+        (513, 256, 64, True, 86, torch.float16),
+        (8192, 1024, 128, False, 256, torch.bfloat16),
+    ],
+)
+def test_planned_sliding_window_per_tensor_scales(
+    monkeypatch, sliding_window, head_dim, block_size, trans_v, parts, dtype
+):
+    # GQA8 + BF16 + D128 + transposed V also exercises scalar FP8 decode on gfx950.
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", _planned_call)
+    _run_accuracy_case(
+        [0, 1, 255, 256, 257, 513, 4099],
+        num_query_heads=16,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        block_size=block_size,
+        query_dtype=dtype,
+        num_partitions=parts,
+        tolerance=0.005,
+        trans_v=trans_v,
+        sliding_window=sliding_window,
+    )
+
+
+@pytest.mark.parametrize("query_length", [1, 4])
+@pytest.mark.parametrize("planned", [False, True])
+def test_sliding_window_ignores_outside_value_scales(query_length, planned):
+    """Masked prefix scales cannot affect FP8 P normalization in the last tile."""
+    context_length, block_size, head_dim = 511, 128, 128
+    num_pages, num_kv_heads, query_group_size = 4, 1, 16
+    quant_dtype = _quant_dtype()
+    context = torch.tensor([context_length], dtype=torch.int32)
+    block_tables = torch.arange(num_pages, dtype=torch.int32).reshape(1, num_pages)
+    query = torch.ones((query_length, query_group_size, head_dim), dtype=torch.bfloat16)
+    output = torch.full_like(query, float("nan"))
+    key_cache = torch.zeros(
+        (num_pages, num_kv_heads, head_dim // 16, block_size, 16), dtype=quant_dtype
+    )
+    value_tokens = torch.zeros(
+        (num_pages, num_kv_heads, block_size, head_dim), dtype=quant_dtype
+    )
+    scale_shape = (num_pages, num_kv_heads, block_size, 1)
+    key_scale = torch.ones(scale_shape, dtype=torch.float32)
+    value_scale = torch.full(scale_shape, 1e9, dtype=torch.float32)
+    first_visible = context_length - query_length
+    value_scale.reshape(-1)[first_visible:].fill_(1.0)
+    # Every query sees exactly its corresponding tail token. Prefix V=0 keeps
+    # dequantized values finite even though the excluded prefix scales are huge.
+    for position in range(query_length):
+        token = first_visible + position
+        value_tokens[token // block_size, 0, token % block_size].fill_(
+            (position + 1) / query_length
+        )
+    value_cache = (
+        value_tokens.view(num_pages, num_kv_heads, block_size // 16, 16, head_dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    plan = (
+        plan_pa_decode(
+            context,
+            num_kv_heads,
+            sliding_window=1,
+            query_length=query_length,
+            max_partitions=7,
+        )
+        if planned
+        else None
+    )
+    pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        block_tables,
+        head_dim**-0.5,
+        query_length,
+        7,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+        sliding_window=1,
+        work_plan=plan,
+    )
+    expected = (
+        (torch.arange(1, query_length + 1, dtype=query.dtype) / query_length)
+        .reshape(query_length, 1, 1)
+        .expand_as(query)
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, expected, atol=0.005, rtol=0.005)
 
 
 @pytest.mark.parametrize("block_size", [16, 128])
@@ -1114,21 +1395,31 @@ def test_planned_decode_register_reducer_chunk_boundary(monkeypatch, long_contex
     )
 
 
-def test_planned_decode_graph_replay_with_poisoned_scratch(monkeypatch):
+@pytest.mark.parametrize(
+    "sliding_window,query_length", [(0, 4), (1, 4), (257, 3), (8193, 4)]
+)
+def test_planned_decode_graph_replay_with_poisoned_scratch(
+    monkeypatch, sliding_window, query_length
+):
     def capture_and_replay(*args, **kwargs):
         output, query, key, _value, context = args[:5]
         heads, rows = (
             key.shape[1],
             query.shape[0] // context.numel() * query.shape[1] // key.shape[1],
         )
-        plan = plan_pa_decode(context, heads, max_partitions=args[8])
+        plan_options = {
+            "max_partitions": args[8],
+            "sliding_window": sliding_window,
+            "query_length": query_length,
+        }
+        plan = plan_pa_decode(context, heads, **plan_options)
         shape = (heads, plan.capacity, rows)
         psum = torch.full(shape, float("nan"), dtype=torch.float32)
         pmax = torch.full_like(psum, float("nan"))
         pout = torch.full((*shape, query.shape[2]), float("nan"), dtype=query.dtype)
 
         def run():
-            plan_pa_decode(context, heads, max_partitions=args[8], plan=plan)
+            plan_pa_decode(context, heads, plan=plan, **plan_options)
             pa_decode(
                 *args,
                 **kwargs,
@@ -1151,16 +1442,26 @@ def test_planned_decode_graph_replay_with_poisoned_scratch(monkeypatch):
             scratch.fill_(float("nan"))
         context.zero_()
         graph.replay()
+        _assert_plan(plan, [0] * context.numel())
         assert torch.equal(output, torch.zeros_like(output))
         for scratch in (pmax, psum, pout):
             assert torch.isnan(scratch).all()
         context.copy_(original)
         graph.replay()
+        _assert_plan(plan, original.cpu().tolist())
         for scratch in (pmax, psum, pout):
             assert torch.isnan(scratch[:, active_tasks:]).all()
 
     monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", capture_and_replay)
-    _run_mtp4_fused_reference_case([0, 257, 4096, 200003], 1, 128, True, 256)
+    _run_mtp4_fused_reference_case(
+        [0, 257, 4096, 200003],
+        1,
+        128,
+        True,
+        256,
+        query_length=query_length,
+        sliding_window=sliding_window,
+    )
 
 
 def test_plan_rejects_incompatible_reuse():
@@ -1172,6 +1473,537 @@ def test_plan_rejects_incompatible_reuse():
         plan_pa_decode(context, 2, max_partitions=7, plan=plan)
     with pytest.raises(ValueError, match="shape"):
         plan_pa_decode(context[:1], 1, max_partitions=7, plan=plan)
+
+
+def test_sliding_window_plan_rejects_incompatible_reuse():
+    context = torch.tensor([1, 257, 4099], dtype=torch.int32)
+    plan = plan_pa_decode(
+        context, 1, sliding_window=257, query_length=4, max_partitions=7
+    )
+    for window in (0, 256):
+        with pytest.raises(ValueError, match="sliding_window"):
+            plan_pa_decode(
+                context,
+                1,
+                sliding_window=window,
+                query_length=4,
+                max_partitions=7,
+                plan=plan,
+            )
+    with pytest.raises(ValueError, match="query_length"):
+        plan_pa_decode(context, 1, sliding_window=257, max_partitions=7, plan=plan)
+    reused = plan_pa_decode(
+        context, 1, sliding_window=257, query_length=4, max_partitions=7, plan=plan
+    )
+    assert reused is plan
+    _assert_plan(plan, context.cpu().tolist())
+
+
+@pytest.mark.parametrize(
+    "sliding_window,query_length,error,match",
+    [
+        (-2, 1, ValueError, "sliding_window"),
+        (1.5, 1, TypeError, "sliding_window"),
+        (257, 0, ValueError, "query_length"),
+        (257, 1.5, TypeError, "query_length"),
+    ],
+)
+def test_sliding_window_plan_rejects_invalid_arguments(
+    sliding_window, query_length, error, match
+):
+    context = torch.tensor([257], dtype=torch.int32)
+    with pytest.raises(error, match=match):
+        plan_pa_decode(
+            context, 1, sliding_window=sliding_window, query_length=query_length
+        )
+
+
+@pytest.mark.parametrize(
+    "plan_window,plan_query_length,sliding_window,query_length,match",
+    [
+        (0, 4, 257, 4, "sliding_window"),
+        (257, 4, 0, 4, "sliding_window"),
+        (257, 4, 256, 4, "sliding_window"),
+        (257, 3, 257, 4, "query_length"),
+        (257, 4, 257, 1, "query_length"),
+    ],
+)
+def test_planned_decode_rejects_sliding_window_mismatch(
+    monkeypatch, plan_window, plan_query_length, sliding_window, query_length, match
+):
+    def incompatible_plan(*args, **kwargs):
+        plan = plan_pa_decode(
+            args[4],
+            args[2].shape[1],
+            max_partitions=args[8],
+            sliding_window=plan_window,
+            query_length=plan_query_length,
+        )
+        pa_decode(*args, work_plan=plan, **kwargs)
+
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", incompatible_plan)
+    with pytest.raises(ValueError, match=match):
+        _run_mtp4_fused_reference_case(
+            [0, 1, 2, 3, 4, 257],
+            1,
+            16,
+            False,
+            7,
+            query_length=query_length,
+            sliding_window=sliding_window,
+        )
+
+
+@pytest.mark.parametrize(
+    "plan_window,sliding_window,query_length", [(-1, 0, 4), (0, -1, 3)]
+)
+def test_planned_decode_accepts_disabled_sliding_window_aliases(
+    monkeypatch, plan_window, sliding_window, query_length
+):
+    def dense_plan(*args, **kwargs):
+        # A default dense plan is still valid for any number of causal queries.
+        plan = plan_pa_decode(
+            args[4],
+            args[2].shape[1],
+            max_partitions=args[8],
+            sliding_window=plan_window,
+        )
+        assert plan.sliding_window == 0 and plan.query_length == 1
+        assert (
+            plan_pa_decode(
+                args[4],
+                args[2].shape[1],
+                max_partitions=args[8],
+                plan=plan,
+                sliding_window=sliding_window,
+                query_length=query_length,
+            )
+            is plan
+        )
+        pa_decode(*args, work_plan=plan, **kwargs)
+
+    monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", dense_plan)
+    _run_mtp4_fused_reference_case(
+        [0, 1, 2, 3, 4, 257, 513],
+        1,
+        16,
+        False,
+        7,
+        query_length=query_length,
+        sliding_window=sliding_window,
+    )
+
+
+def _make_sink_case(
+    lengths,
+    *,
+    query_length=4,
+    head_dim=128,
+    num_kv_heads=1,
+    query_group_size=16,
+    query_dtype=torch.bfloat16,
+    per_token=True,
+    num_partitions=7,
+    sliding_window=0,
+):
+    """Build exact zero-Q/K data and a length-aware, overflow-safe sink oracle."""
+    block_size = 128
+    num_pages = (max(max(lengths), 1) + block_size - 1) // block_size
+    num_query_heads = num_kv_heads * query_group_size
+    context = torch.tensor(lengths, dtype=torch.int32)
+    query = torch.zeros(
+        (len(lengths) * query_length, num_query_heads, head_dim), dtype=query_dtype
+    )
+    output = torch.full_like(query, float("nan"))
+    quant_dtype = _quant_dtype()
+    key_cache = torch.zeros(
+        (num_pages, num_kv_heads, head_dim // 16, block_size, 16), dtype=quant_dtype
+    )
+    token_values = (
+        torch.arange(num_pages * block_size, dtype=torch.float32) % 4 + 1
+    ) * 0.25
+    kv_factors = torch.arange(1, num_kv_heads + 1, dtype=torch.float32)
+    values = (
+        (
+            token_values.reshape(num_pages, 1, block_size, 1)
+            * kv_factors.reshape(1, num_kv_heads, 1, 1)
+        )
+        .expand(num_pages, num_kv_heads, block_size, head_dim)
+        .to(quant_dtype)
+    )
+    value_cache = (
+        values.reshape(num_pages, num_kv_heads, block_size // 16, 16, head_dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    scale_shape = (num_pages, num_kv_heads, block_size, 1) if per_token else (1,)
+    key_scale = torch.ones(scale_shape, dtype=torch.float32)
+    value_scale = torch.ones_like(key_scale)
+    block_tables = (
+        torch.arange(num_pages, dtype=torch.int32)
+        .expand(len(lengths), num_pages)
+        .contiguous()
+    )
+    args = (
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        block_tables,
+        head_dim**-0.5,
+        query_length,
+        num_partitions,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+    )
+
+    def reference(sinks):
+        # The shared pages encode [.25, .5, .75, 1] * (KV head + 1).
+        # Unlike exp(sinks), logaddexp stays finite for large finite logits.
+        positions = torch.arange(query_length, dtype=torch.int32)
+        visible = (context[:, None] - query_length + 1 + positions).clamp_min(0)
+        first = (visible - sliding_window).clamp_min(0) if sliding_window > 0 else 0
+        count = (visible - first).float()
+
+        def prefix_sum(tokens):
+            remainder = (tokens % 4).float()
+            return (tokens // 4).float() * 2.5 + remainder * (remainder + 1) * 0.125
+
+        value_sum = prefix_sum(visible)
+        if sliding_window > 0:
+            value_sum -= prefix_sum(first)
+        value_sum = value_sum[..., None] * kv_factors.repeat_interleave(
+            query_group_size
+        )
+        logits = (
+            torch.full((num_query_heads,), float("-inf"), dtype=torch.float32)
+            if sinks is None
+            else sinks.float()
+        )
+        log_denominator = torch.logaddexp(count.log()[..., None], logits)
+        expected = value_sum * torch.exp(-log_denominator)
+        expected.masked_fill_(count[..., None] == 0, 0)
+        return expected.reshape(-1, num_query_heads, 1).expand_as(query)
+
+    return args, reference
+
+
+def _analytic_sinks(num_heads, dtype):
+    values = [float("-inf"), float("inf"), -1000, 1000, -2, 0, 0.5, 5]
+    if dtype == torch.float32:
+        values += [-3e38, 3e38]
+    return (
+        torch.tensor(values, dtype=dtype)
+        .repeat((num_heads + len(values) - 1) // len(values))[:num_heads]
+        .contiguous()
+    )
+
+
+@pytest.mark.parametrize(
+    "planned,query_length,parts,window,block_size,trans_v,heads,sink_dtype",
+    [
+        (False, 1, 1, 0, 16, False, 1, torch.float32),
+        (False, 4, 1, 257, 128, True, 1, torch.bfloat16),
+        (True, 4, 1, 1, 16, False, 1, torch.float16),
+        (True, 2, 7, 257, 128, True, 2, torch.float32),
+        (False, 3, 7, 0, 64, False, 2, torch.bfloat16),
+        (True, 4, 7, 0, 128, True, 1, torch.float32),
+        (False, 2, 86, 1, 16, True, 1, torch.float16),
+        (True, 1, 86, 257, 64, False, 2, torch.bfloat16),
+        (False, 4, 256, 257, 128, False, 1, torch.float32),
+        (True, 3, 256, 0, 16, True, 1, torch.float16),
+        (True, 1, 7, 1, 128, True, 1, torch.float32),
+        (False, 4, 1, 0, 16, False, 1, torch.float16),
+    ],
+)
+def test_sinks_sparse_causal_reference(
+    monkeypatch,
+    planned,
+    query_length,
+    parts,
+    window,
+    block_size,
+    trans_v,
+    heads,
+    sink_dtype,
+):
+    if planned:
+        monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", _planned_call)
+    sinks = torch.linspace(-3, 6, heads * 16, dtype=sink_dtype)
+    sinks[0] = float("-inf")
+    _run_mtp4_fused_reference_case(
+        [0, 1, 2, 3, 4, 255, 256, 257, 259, 513, 4099],
+        heads,
+        block_size,
+        trans_v,
+        parts,
+        query_length=query_length,
+        sliding_window=window,
+        sinks=sinks,
+    )
+
+
+@pytest.mark.parametrize(
+    "planned,parts,head_dim,block_size,trans_v,query_dtype,sink_dtype,window",
+    [
+        (False, 1, 64, 16, False, torch.float16, torch.float32, 0),
+        (True, 7, 256, 64, True, torch.float16, torch.bfloat16, 257),
+        (False, 86, 128, 128, True, torch.bfloat16, torch.float16, 1),
+        (True, 256, 256, 128, False, torch.bfloat16, torch.float32, 0),
+        (True, 1, 128, 16, True, torch.bfloat16, torch.float32, 257),
+        (False, 256, 64, 128, True, torch.float16, torch.float16, 257),
+    ],
+)
+def test_sinks_per_tensor_reference(
+    monkeypatch,
+    planned,
+    parts,
+    head_dim,
+    block_size,
+    trans_v,
+    query_dtype,
+    sink_dtype,
+    window,
+):
+    if planned:
+        monkeypatch.setattr(torch.ops.aiter, "pa_decode_flydsl", _planned_call)
+    sinks = torch.linspace(-3, 7, 16, dtype=sink_dtype)
+    _run_accuracy_case(
+        [0, 1, 257, 16385],
+        num_query_heads=16,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        block_size=block_size,
+        query_dtype=query_dtype,
+        num_partitions=parts,
+        tolerance=0.005,
+        trans_v=trans_v,
+        sliding_window=window,
+        sinks=sinks,
+    )
+
+
+@pytest.mark.parametrize("planned", [False, True])
+@pytest.mark.parametrize(
+    "query_length,parts,head_dim,window,query_dtype,sink_dtype,heads,group,per_token",
+    [
+        (1, 1, 128, 0, torch.bfloat16, torch.float32, 2, 8, False),
+        (4, 1, 128, 1, torch.bfloat16, torch.bfloat16, 1, 16, True),
+        (2, 7, 64, 257, torch.float16, torch.float32, 2, 4, False),
+        (3, 7, 128, 0, torch.bfloat16, torch.float16, 2, 8, True),
+        (4, 86, 256, 257, torch.float16, torch.bfloat16, 1, 8, False),
+        (1, 256, 128, 0, torch.bfloat16, torch.float16, 1, 16, True),
+        (4, 256, 64, 1, torch.bfloat16, torch.float32, 2, 4, True),
+        (2, 86, 256, 0, torch.bfloat16, torch.bfloat16, 2, 8, False),
+    ],
+)
+def test_sinks_counted_once_per_query(
+    monkeypatch,
+    planned,
+    query_length,
+    parts,
+    head_dim,
+    window,
+    query_dtype,
+    sink_dtype,
+    heads,
+    group,
+    per_token,
+):
+    """Different head logits, including extremes, add one unscaled zero-V token."""
+    args, reference = _make_sink_case(
+        [0, 1, 3, 4, 257, 513],
+        query_length=query_length,
+        head_dim=head_dim,
+        num_kv_heads=heads,
+        query_group_size=group,
+        query_dtype=query_dtype,
+        per_token=per_token,
+        num_partitions=parts,
+        sliding_window=window,
+    )
+    sinks = _analytic_sinks(heads * group, sink_dtype)
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_tile = module.compile_pa_decode_tile
+    direct_sink_flags = []
+
+    def capture_compile(**kwargs):
+        direct_sink_flags.append(kwargs["use_sinks"])
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(module, "compile_pa_decode_tile", capture_compile)
+    call = _planned_call if planned else pa_decode
+    call(*args, sinks=sinks, sliding_window=window)
+    assert direct_sink_flags and set(direct_sink_flags) == {not planned and parts == 1}
+    assert torch.isfinite(args[0]).all()
+    torch.testing.assert_close(
+        args[0].float(), reference(sinks), atol=0.005, rtol=0.005
+    )
+
+
+@pytest.mark.parametrize("query_splits", [1, 4])
+def test_sinks_np1_fused_and_query_split(monkeypatch, query_splits):
+    """Static NP1 applies sinks in the compute epilogue without a reduction launch."""
+    args, reference = _make_sink_case(
+        [0, 1, 3, 4, 257, 513], num_partitions=1, sliding_window=1
+    )
+    sinks = _analytic_sinks(args[1].shape[1], torch.float32)
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_tile = module.compile_pa_decode_tile
+
+    def compile_query_split(**kwargs):
+        kwargs["query_splits"] = query_splits
+        assert kwargs["use_sinks"] and kwargs["sink_dtype_str"] == "f32"
+        return compile_tile(**kwargs)
+
+    def unexpected_reducer(*_args, **_kwargs):
+        raise AssertionError("static NP1 sinks must not launch a reducer")
+
+    monkeypatch.setattr(module, "compile_pa_decode_tile", compile_query_split)
+    monkeypatch.setattr(module, "launch_pa_decode_ps_reduce", unexpected_reducer)
+    pa_decode(*args, sinks=sinks, sliding_window=1)
+    torch.testing.assert_close(
+        args[0].float(), reference(sinks), atol=0.005, rtol=0.005
+    )
+
+
+@pytest.mark.parametrize(
+    "planned,parts,query_length,head_dim,window",
+    [
+        (False, 1, 4, 128, 257),
+        (False, 7, 1, 64, 0),
+        (True, 1, 4, 128, 1),
+        (True, 256, 3, 256, 257),
+    ],
+)
+def test_sinks_negative_infinity_matches_none(
+    planned, parts, query_length, head_dim, window
+):
+    args, reference = _make_sink_case(
+        [0, 1, 3, 4, 257, 513],
+        query_length=query_length,
+        head_dim=head_dim,
+        num_partitions=parts,
+        sliding_window=window,
+    )
+    call = _planned_call if planned else pa_decode
+    call(*args, sinks=None, sliding_window=window)
+    without_sinks = args[0].clone()
+    args[0].fill_(float("nan"))
+    sinks = torch.full((args[1].shape[1],), float("-inf"), dtype=torch.float32)
+    call(*args, sinks=sinks, sliding_window=window)
+    torch.testing.assert_close(args[0], without_sinks, atol=0.005, rtol=0.005)
+    torch.testing.assert_close(args[0].float(), reference(None), atol=0.005, rtol=0.005)
+
+
+@pytest.mark.parametrize(
+    "planned,head_dim,query_length,window,parts,sink_dtype",
+    [
+        (True, 128, 4, 257, 7, torch.float32),
+        (True, 256, 3, 0, 86, torch.bfloat16),
+        (False, 128, 4, 1, 7, torch.float16),
+        (False, 64, 2, 0, 86, torch.float32),
+    ],
+)
+def test_sinks_graph_replay_with_updated_logits_and_poisoned_scratch(
+    planned, head_dim, query_length, window, parts, sink_dtype
+):
+    args, reference = _make_sink_case(
+        [513, 4, 1, 0],
+        query_length=query_length,
+        head_dim=head_dim,
+        num_partitions=parts,
+        sliding_window=window,
+    )
+    output, query, key_cache, _, context = args[:5]
+    heads = key_cache.shape[1]
+    rows = query_length * query.shape[1] // heads
+    sinks = torch.linspace(-3, 6, query.shape[1], dtype=sink_dtype)
+    plan_options = {
+        "max_partitions": parts,
+        "query_length": query_length,
+        "sliding_window": window,
+    }
+    plan = plan_pa_decode(context, heads, **plan_options) if planned else None
+    shape = (
+        (heads, plan.capacity, rows)
+        if planned
+        else (context.numel(), heads, parts, rows)
+    )
+    psum = torch.full(shape, float("nan"), dtype=torch.float32)
+    pmax = torch.full_like(psum, float("nan"))
+    pout = torch.full((*shape, head_dim), float("nan"), dtype=query.dtype)
+
+    def run():
+        if planned:
+            plan_pa_decode(context, heads, plan=plan, **plan_options)
+        pa_decode(
+            *args,
+            sinks=sinks,
+            sliding_window=window,
+            work_plan=plan,
+            exp_sums=psum,
+            max_logits=pmax,
+            temporary_output=pout,
+        )
+
+    run()  # Compile before capture; all captured pointers remain fixed.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lengths, updated_sinks in (
+        ([0, 1, 4, 513], torch.linspace(7, -4, query.shape[1], dtype=sink_dtype)),
+        ([0, 0, 0, 0], torch.full_like(sinks, 1000)),
+        ([513, 4, 1, 0], _analytic_sinks(query.shape[1], sink_dtype)),
+    ):
+        context.copy_(torch.tensor(lengths, dtype=torch.int32))
+        sinks.copy_(updated_sinks)
+        output.fill_(float("nan"))
+        for scratch in (pmax, psum, pout):
+            scratch.fill_(float("nan"))
+        graph.replay()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(
+            output.float(), reference(sinks), atol=0.005, rtol=0.005
+        )
+        if planned:
+            _assert_plan(plan, lengths)
+            active = int(plan.reduce_info[:, 1].sum().item())
+            assert active < plan.capacity
+            for scratch in (pmax, psum, pout):
+                assert torch.isnan(scratch[:, active:]).all()
+
+
+@pytest.mark.parametrize(
+    "invalid,error",
+    [
+        ("not_tensor", TypeError),
+        ("rank", ValueError),
+        ("head_count", ValueError),
+        ("integer_dtype", TypeError),
+        ("float64_dtype", TypeError),
+        ("cpu", ValueError),
+        ("noncontiguous", ValueError),
+    ],
+)
+def test_sinks_rejects_invalid_tensor(invalid, error):
+    args, _ = _make_sink_case([257], query_length=1)
+    heads = args[1].shape[1]
+    invalid_sinks = {
+        "not_tensor": lambda: [0.0] * heads,
+        "rank": lambda: torch.zeros((1, heads)),
+        "head_count": lambda: torch.zeros(heads - 1),
+        "integer_dtype": lambda: torch.zeros(heads, dtype=torch.int32),
+        "float64_dtype": lambda: torch.zeros(heads, dtype=torch.float64),
+        "cpu": lambda: torch.zeros(heads, device="cpu"),
+        "noncontiguous": lambda: torch.zeros(heads * 2)[::2],
+    }[invalid]()
+    with pytest.raises(error, match="sinks"):
+        pa_decode(*args, sinks=invalid_sinks)
 
 
 @pytest.mark.parametrize("split_kv_blocks", [2, 16])

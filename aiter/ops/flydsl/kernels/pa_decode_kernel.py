@@ -75,6 +75,9 @@ def compile_pa_decode_tile(
     prefetch_v: bool = False,
     query_splits: int = 1,
     use_work_plan: bool = False,
+    sliding_window: int = 0,
+    use_sinks: bool = False,
+    sink_dtype_str: str = "f32",
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
@@ -85,6 +88,12 @@ def compile_pa_decode_tile(
     ``M_TILES = ceil(TOTAL_ROWS / query_splits / 16)`` MFMA tiles. The partial
     output layout remains unsplit so the existing FlyDSL reducer can combine
     context partitions without an intermediate transpose.
+
+    A positive ``sliding_window`` includes the query token itself. Tile ranges
+    cover the union of the MTP windows, and scores are masked per query row.
+    ``use_sinks`` adds a per-query-head zero-value attention logit in the final
+    epilogue for direct NP=1 output. Partitioned/planned execution instead adds
+    it exactly once in the reducer, leaving partial statistics unchanged.
 
     Tokens at/after ``context_len`` still take part in the PV matmul with a zero
     probability, so their V bytes must be finite: the MFMA does not treat a zero
@@ -101,6 +110,9 @@ def compile_pa_decode_tile(
     neutral at ``block_size=16``. The wrapper turns it on from the cache size.
     """
     is_gfx950 = "gfx95" in get_rocm_arch()
+    # Context lengths are int32, so larger windows have identical visibility.
+    # Bound the device constant while retaining the caller's value in the plan.
+    sliding_window = min(sliding_window, 2**31 - 1)
     FP8 = fx.Float8E4M3FN if is_gfx950 else fx.Float8E4M3FNUZ
     FP8_MAX = (
         448.0 if is_gfx950 else 240.0
@@ -238,6 +250,14 @@ def compile_pa_decode_tile(
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_dim**0.5)
     NP = int(num_partitions)  # context partitions (grid.z); compile-time constant
+    DIRECT_SINKS = use_sinks and NP == 1 and not use_work_plan
+    SINK_DTYPE = fx.Float32
+    if DIRECT_SINKS:
+        SINK_DTYPE = {
+            "f32": fx.Float32,
+            "f16": fx.Float16,
+            "bf16": fx.BFloat16,
+        }[sink_dtype_str]
 
     BLOCK_THREADS = NWARP * WAVE  # 256
 
@@ -300,6 +320,7 @@ def compile_pa_decode_tile(
         context_lengths_ptr: fx.Pointer,  # [num_seqs]
         key_scale_ptr: fx.Pointer,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
         value_scale_ptr: fx.Pointer,  # same shape as key_scale_ptr
+        sinks_ptr: fx.Pointer,  # [num_q_heads], used only for direct NP=1 output
         max_blocks_per_seq: fx.Int32,
         stride_ks_block: fx.Int32,
         stride_ks_head: fx.Int32,
@@ -333,6 +354,8 @@ def compile_pa_decode_tile(
         pmax = fx.recast_iter(fx.Float32, pmax_ptr)
         psum = fx.recast_iter(fx.Float32, psum_ptr)
         pout = fx.recast_iter(Q_DTYPE, pout_ptr)
+        if const_expr(DIRECT_SINKS):
+            sink_token = fx.recast_iter(SINK_DTYPE, sinks_ptr)
 
         # K/V use raw UniversalCopy so their optional i64 offsets remain intact.
         def _make_raw_flat_loader(tensor_ptr, elem_ty, reg_width, extent):
@@ -458,8 +481,19 @@ def compile_pa_decode_tile(
             part_end = planned_end
         else:
             num_tiles = (context_len + TILE_TOK - 1) // TILE_TOK
-            tiles_per_part = (num_tiles + NP - 1) // NP
+            active_tiles = num_tiles
+            if const_expr(sliding_window > 0):
+                window_start = (
+                    fx.Int64(context_len) - (query_length - 1) - sliding_window
+                )
+                first_tile = fx.Int32(
+                    (window_start > 0).select(window_start, 0) // TILE_TOK
+                )
+                active_tiles = num_tiles - first_tile
+            tiles_per_part = (active_tiles + NP - 1) // NP
             part_start = part * tiles_per_part
+            if const_expr(sliding_window > 0):
+                part_start = first_tile + part_start
             part_end_raw = part_start + tiles_per_part
             part_end = (part_end_raw < num_tiles).select(part_end_raw, num_tiles)
 
@@ -879,6 +913,13 @@ def compile_pa_decode_tile(
             fx.Vector.from_elements([float(a * c16 + r) for r in range_constexpr(4)])
             for a in range_constexpr(NCHUNK)
         ]
+
+        def _score_mask(a, upper, lower):
+            valid = _ct[a] < upper
+            if const_expr(sliding_window > 0):
+                valid = valid & (_ct[a] >= lower)
+            return valid
+
         # P.V is loop-tiled over head-dim (like production's VHELOOP): each
         # step computes O[:, vh*VHE_SIZE:+VHE_SIZE] instead of materializing
         # the full [16, head_dim] at once.
@@ -1015,10 +1056,30 @@ def compile_pa_decode_tile(
                     ],
                     dtype=fx.Float32,
                 ).broadcast_to(4)
+                window_scale_thr = None
+                if const_expr(sliding_window > 0):
+                    # Scales outside every query's window must not shrink
+                    # visible probabilities to zero during FP8 normalization.
+                    # Keep this bound query-independent for shared MTP scales.
+                    first_visible = (
+                        fx.Int64(context_len)
+                        - (query_length - 1)
+                        - sliding_window
+                        - fx.Int64(tok0)
+                    ).to(fx.Float32)
+                    window_scale_thr = fx.Vector.from_elements(
+                        [
+                            first_visible
+                            - fx.Int32(warp * TOK_PER_WARP + rgroup * 4).to(fx.Float32)
+                        ],
+                        dtype=fx.Float32,
+                    ).broadcast_to(4)
                 zero4_scale = fx.Vector.filled(4, 0.0, fx.Float32)
 
-                def _mask_v_scale(vec, a, thr=ctx_thr, zero=zero4_scale):
-                    return (_ct[a] < thr).select(vec, zero)
+                def _mask_v_scale(
+                    vec, a, thr=ctx_thr, lower=window_scale_thr, zero=zero4_scale
+                ):
+                    return _score_mask(a, thr, lower).select(vec, zero)
 
             # V is independent of QK/softmax. Load it early for the tuned
             # decode path and reuse it across M-tiles in the phase-split path.
@@ -1100,6 +1161,16 @@ def compile_pa_decode_tile(
                     thr = fx.Vector.from_elements(
                         [n_valid_tile - base_tok_f], dtype=fx.Float32
                     ).broadcast_to(4)
+                    window_thr = None
+                    if const_expr(sliding_window > 0):
+                        # Subtract in integer space first so a large window
+                        # cannot round its left edge before the comparison.
+                        first_valid_tile = (
+                            fx.Int64(causal_bound[m]) - sliding_window - fx.Int64(tok0)
+                        ).to(fx.Float32)
+                        window_thr = fx.Vector.from_elements(
+                            [first_valid_tile - base_tok_f], dtype=fx.Float32
+                        ).broadcast_to(4)
                     neg4 = fx.Vector.filled(4, float("-inf"), fx.Float32)
 
                     # Fold the per-row score scale in BEFORE the -inf mask. A
@@ -1121,8 +1192,9 @@ def compile_pa_decode_tile(
                         ]
 
                     if const_expr(MTP4_FUSED):
-                        # All four causal rows fully cover non-tail tiles.
-                        # Keep one uniform branch around the sixteen masks.
+                        # All four causal windows fully cover interior tiles.
+                        # Keep one uniform branch around the sixteen masks,
+                        # including both the left window edge and causal tail.
                         masked_all = fx.Vector.from_elements(
                             [
                                 scaled_frags[a][r]
@@ -1131,10 +1203,17 @@ def compile_pa_decode_tile(
                             ],
                             dtype=fx.Float32,
                         )
-                        if tile_valid < TILE_TOK + query_length - 1:
+                        needs_mask = tile_valid < TILE_TOK + query_length - 1
+                        if const_expr(sliding_window > 0):
+                            needs_mask = needs_mask | (
+                                tok0 < context_len - sliding_window
+                            )
+                        if needs_mask:
                             masked_all = fx.Vector.from_elements(
                                 [
-                                    (_ct[a] < thr).select(scaled_frags[a], neg4)[r]
+                                    _score_mask(a, thr, window_thr).select(
+                                        scaled_frags[a], neg4
+                                    )[r]
                                     for a in range_constexpr(NCHUNK)
                                     for r in range_constexpr(MFMA_ACC_ELEMS)
                                 ],
@@ -1152,7 +1231,9 @@ def compile_pa_decode_tile(
                         ]
                     else:
                         masked_chunks = [
-                            (_ct[a] < thr).select(scaled_frags[a], neg4)
+                            _score_mask(a, thr, window_thr).select(
+                                scaled_frags[a], neg4
+                            )
                             for a in range_constexpr(NCHUNK)
                         ]
 
@@ -1526,6 +1607,14 @@ def compile_pa_decode_tile(
                 thr = fx.Vector.from_elements(
                     [n_valid_tile - base_tok_f], dtype=fx.Float32
                 ).broadcast_to(4)
+                window_thr = None
+                if const_expr(sliding_window > 0):
+                    first_valid_tile = (
+                        fx.Int64(causal_bound[0]) - sliding_window - fx.Int64(tok0)
+                    ).to(fx.Float32)
+                    window_thr = fx.Vector.from_elements(
+                        [first_valid_tile - base_tok_f], dtype=fx.Float32
+                    ).broadcast_to(4)
                 neg4 = fx.Vector.filled(
                     4,
                     float("-inf") if M1_SCALE_BEFORE_MASK else -1e30,
@@ -1554,14 +1643,18 @@ def compile_pa_decode_tile(
                         if const_expr(M1_SCALE_BEFORE_MASK):
                             scaled_frag = scaled_frag * scale_b
                             masked_chunks.append(
-                                (_ct[a] < thr).select(scaled_frag, neg4)
+                                _score_mask(a, thr, window_thr).select(
+                                    scaled_frag, neg4
+                                )
                             )
                         else:
                             scaled_frags.append(scaled_frag)
                 else:
                     if const_expr(M1_SCALE_BEFORE_MASK):
                         masked_chunks = [
-                            (_ct[a] < thr).select(frag_Ss[a] * scale_b, neg4)
+                            _score_mask(a, thr, window_thr).select(
+                                frag_Ss[a] * scale_b, neg4
+                            )
                             for a in range_constexpr(NCHUNK)
                         ]
                     else:
@@ -1569,7 +1662,7 @@ def compile_pa_decode_tile(
                 # Reused in pass 2 below, halving the mask instruction count.
                 if const_expr(not M1_SCALE_BEFORE_MASK):
                     masked_chunks = [
-                        (_ct[a] < thr).select(scaled_frags[a], neg4)
+                        _score_mask(a, thr, window_thr).select(scaled_frags[a], neg4)
                         for a in range_constexpr(NCHUNK)
                     ]
                 # pass 1: per-warp max for this qhead
@@ -1598,8 +1691,8 @@ def compile_pa_decode_tile(
                 # Slots at/after context_len are uninitialised, so an arbitrarily
                 # large one there would shrink every valid probability to 0 in the
                 # fp8 conversion below -- restrict the reduction to real tokens.
-                # (Causally-masked tokens inside the context keep real scales and
-                # stay in, which also keeps pv_max independent of the query row.)
+                # Causally-masked tokens within the MTP window union keep real
+                # scales and stay in, keeping pv_max independent of the query row.
                 if const_expr(per_token_kv):
                     pv_max = fx.Float32(0.0)
                     for a in range_constexpr(NCHUNK):
@@ -1756,9 +1849,36 @@ def compile_pa_decode_tile(
         for m in range_constexpr(M_TILES):
             row = m * MFMA_MNK + lane16  # flat (mtp, gqa) query-row for this lane
             global_row = query_begin * query_group_size + row
+            qi_e = row // query_group_size
+            gs_head_e = row - qi_e * query_group_size
+            qh = kv_h * query_group_size + gs_head_e
             l_row = o_final[_l_slot(m)]
             safe_l = (l_row > ZERO_F).select(l_row, fx.Float32(1.0))
             inv_l = fx.Float32(rcp_f32(safe_l))
+            if const_expr(DIRECT_SINKS):
+                # Keep the sink out of the online Q/P quantization. It only
+                # changes the final denominator, with zero numerator mass.
+                # Compare in natural-logit units before multiplying by LOG2E,
+                # so even a very large finite f32 sink cannot overflow here.
+                sink_value = fx.Float32(sink_token[qh])
+                row_max = o_final[_m_slot(m)] * fx.Float32(1.0 / LOG2E)
+                total_max = fx.maxnumf(row_max, sink_value)
+                safe_max = (total_max > NEG_INF).select(total_max, ZERO_F)
+                kv_mass = (l_row > ZERO_F).select(
+                    fx.exp2((row_max - safe_max) * fx.Float32(LOG2E), fastmath="fast"),
+                    ZERO_F,
+                )
+                # +inf suppresses all KV output; -inf disables this head's
+                # sink. Select before exp2 to avoid the +inf - +inf case.
+                sink_shift = (sink_value == safe_max).select(
+                    ZERO_F, sink_value - safe_max
+                )
+                sink_mass = fx.exp2(sink_shift * fx.Float32(LOG2E), fastmath="fast")
+                denominator = l_row * kv_mass + sink_mass
+                safe_denominator = (denominator > ZERO_F).select(
+                    denominator, fx.Float32(1.0)
+                )
+                inv_l = kv_mass * fx.Float32(rcp_f32(safe_denominator))
             if const_expr(per_token_kv):
                 o_scale = inv_l
             elif const_expr(SCALAR_FP8_DECODE):
@@ -1770,9 +1890,6 @@ def compile_pa_decode_tile(
             o_scale_b = fx.Vector.from_elements(
                 [o_scale], dtype=fx.Float32
             ).broadcast_to(OP_ELEMS)
-            qi_e = row // query_group_size
-            gs_head_e = row - qi_e * query_group_size
-            qh = kv_h * query_group_size + gs_head_e
 
             def _emit(o_norm, sub, query_idx, query_head):
                 if const_expr(NP == 1 and not use_work_plan):
@@ -1824,6 +1941,7 @@ def compile_pa_decode_tile(
         context_lengths_ptr: fx.Pointer,
         key_scale_ptr: fx.Pointer,
         value_scale_ptr: fx.Pointer,
+        sinks_ptr: fx.Pointer,
         max_blocks_per_seq: fx.Int32,
         stride_ks_block: fx.Int32,
         stride_ks_head: fx.Int32,
@@ -1847,6 +1965,7 @@ def compile_pa_decode_tile(
                 context_lengths_ptr,
                 key_scale_ptr,
                 value_scale_ptr,
+                sinks_ptr,
                 max_blocks_per_seq,
                 stride_ks_block,
                 stride_ks_head,
@@ -1894,6 +2013,7 @@ def compile_pa_decode_tile(
         context_lengths: fx.Pointer,
         key_scale: fx.Pointer,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
         value_scale: fx.Pointer,  # same shape as key_scale
+        sinks: fx.Pointer,
         max_blocks_per_seq: fx.Int32,
         num_seqs: fx.Int32,
         num_kv_heads: fx.Int32,
@@ -1923,6 +2043,7 @@ def compile_pa_decode_tile(
                 context_lengths,
                 key_scale,
                 value_scale,
+                sinks,
                 max_blocks_per_seq,
                 stride_ks_block,
                 stride_ks_head,

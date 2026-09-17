@@ -78,6 +78,8 @@ def compile_pa_decode_ps_reduce(
     thread.  For D=128 and larger counts, a 2-D workgroup materializes weights
     once in LDS and splits each output element's partition chain over several
     waves.  Other head sizes retain the register-only lane-striped fallback.
+    A sink is a per-query-head zero-value logit: include it in the shared max
+    for stability and add its mass to the denominator once after summing KV.
     """
     _validate_pa_decode_ps_reduce_config(
         max_context_partition_num=max_context_partition_num,
@@ -210,6 +212,12 @@ def compile_pa_decode_ps_reduce(
                 )
             return reduced
 
+        def _sink_exp(sink_value, safe_max):
+            # +inf sinks have unit mass at the shared max and suppress KV;
+            # -inf contributes zero, including for an entirely empty request.
+            shift = (sink_value == safe_max).select(zero_f, sink_value - safe_max)
+            return fx.exp2(shift * c_log2e, fastmath="fast")
+
         if fx.const_expr(use_parallel_lds):
             # One wave materializes the normalized partition weights once.
             # All output waves then reuse those weights from LDS and split the
@@ -259,6 +267,9 @@ def compile_pa_decode_ps_reduce(
                     lane_max = lane_max.maximumf(part_max)
 
                 global_max = _wave_reduce_max(lane_max)
+                if fx.const_expr(use_sinks):
+                    sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
+                    global_max = global_max.maximumf(sink_value)
                 safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
                 scaled_sums = []
                 lane_exp_sum = zero_f
@@ -289,14 +300,7 @@ def compile_pa_decode_ps_reduce(
 
                 global_exp_sum = _wave_reduce_sum(lane_exp_sum)
                 if fx.const_expr(use_sinks):
-                    sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
-                    sink_scale = (global_max > neg_inf).select(
-                        fx.exp2(
-                            (sink_value - safe_global_max) * c_log2e,
-                            fastmath="fast",
-                        ),
-                        zero_f,
-                    )
+                    sink_scale = _sink_exp(sink_value, safe_global_max)
                     global_exp_sum = global_exp_sum + sink_scale
                 safe_global_exp_sum = (global_exp_sum > zero_f).select(
                     global_exp_sum, one_f
@@ -429,6 +433,9 @@ def compile_pa_decode_ps_reduce(
                     part_max = fx.Float32(max_logits[stats_offset])
 
             global_max = _wave_reduce_max(part_max)
+            if fx.const_expr(use_sinks):
+                sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
+                global_max = global_max.maximumf(sink_value)
             safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
             if fx.const_expr(use_work_plan):
                 part_scale = zero_f
@@ -445,14 +452,7 @@ def compile_pa_decode_ps_reduce(
             scaled_sum = part_sum * part_scale
             global_exp_sum = _wave_reduce_sum(scaled_sum)
             if fx.const_expr(use_sinks):
-                sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
-                sink_scale = (global_max > neg_inf).select(
-                    fx.exp2(
-                        (sink_value - safe_global_max) * c_log2e,
-                        fastmath="fast",
-                    ),
-                    zero_f,
-                )
+                sink_scale = _sink_exp(sink_value, safe_global_max)
                 global_exp_sum = global_exp_sum + sink_scale
             safe_global_exp_sum = (global_exp_sum > zero_f).select(
                 global_exp_sum, one_f
@@ -552,6 +552,9 @@ def compile_pa_decode_ps_reduce(
                 lane_max = lane_max.maximumf(part_max)
 
             global_max = _wave_reduce_max(lane_max)
+            if fx.const_expr(use_sinks):
+                sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
+                global_max = global_max.maximumf(sink_value)
             safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
             scaled_sums = []
             lane_exp_sum = zero_f
@@ -578,14 +581,7 @@ def compile_pa_decode_ps_reduce(
 
             global_exp_sum = _wave_reduce_sum(lane_exp_sum)
             if fx.const_expr(use_sinks):
-                sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
-                sink_scale = (global_max > neg_inf).select(
-                    fx.exp2(
-                        (sink_value - safe_global_max) * c_log2e,
-                        fastmath="fast",
-                    ),
-                    zero_f,
-                )
+                sink_scale = _sink_exp(sink_value, safe_global_max)
                 global_exp_sum = global_exp_sum + sink_scale
             safe_global_exp_sum = (global_exp_sum > zero_f).select(
                 global_exp_sum, one_f
