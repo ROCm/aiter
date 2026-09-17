@@ -443,10 +443,14 @@ def _resolve_raw_recipe(
     # FP6-P rows need V repacked to match the FP6 P operand's K layout, or the kernel reads V rows
     # in the wrong order. Every MXFP6-Q row and f8f6 now ship FP6-P objects in both modes.
     uses_fp6_p_pack = (
-        kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6
-    ) or (
-        kind == _RawRecipeKind.MXFP6
-        and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
+        (kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6)
+        or (
+            kind == _RawRecipeKind.MXFP6
+            and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
+        )
+        # All-MXFP4 sparse is the f4f4 row and wants FP6-P V; dense stays on the canonical-V
+        # mxfp4 row, which is the only all-MXFP4 object that handles ragged sequences.
+        or (kind == _RawRecipeKind.MXFP4 and v_format == AttentionFormat.MXFP4 and sparse)
     )
     v_pack = AttentionPack.V_FOR_FP6_P if uses_fp6_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)
@@ -1157,6 +1161,8 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
+        elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
         if lut_indices is None:
