@@ -42,8 +42,9 @@ def _config_files(candidate: Path | None) -> list[Path]:
     return files
 
 
-def _install_config(fused_moe, files: list[Path]) -> None:
+def _install_config(fused_moe, files: list[Path], *, stage2_fp8: bool) -> None:
     os.environ["AITER_CONFIG_FMOE"] = os.pathsep.join(map(str, files))
+    os.environ["AITER_FLYDSL_STAGE2_FP8"] = "1" if stage2_fp8 else "0"
     AITER_CONFIGS.get_config_file.cache_clear()
     fused_moe.cfg_2stages = None
     fused_moe.cfg_2stages_by_file.clear()
@@ -157,6 +158,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--baseline-csv", type=Path)
+    parser.add_argument("--baseline-stage2-fp8", action="store_true")
+    parser.add_argument("--candidate-stage2-fp8", action="store_true")
     parser.add_argument(
         "--tokens",
         type=int,
@@ -187,6 +190,10 @@ def main():
         "baseline": _config_files(args.baseline_csv),
         "candidate": _config_files(args.csv),
     }
+    stage2_fp8 = {
+        "baseline": args.baseline_stage2_fp8,
+        "candidate": args.candidate_stage2_fp8,
+    }
 
     for tokens in args.tokens:
         hidden = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16) / 4
@@ -198,7 +205,7 @@ def main():
             outputs = {}
             metadata = {}
             for arm, files in arms.items():
-                _install_config(fused_moe, files)
+                _install_config(fused_moe, files, stage2_fp8=stage2_fp8[arm])
                 output = torch.empty_like(hidden)
                 launch = partial(
                     fused_moe.fused_moe,
@@ -229,7 +236,7 @@ def main():
 
             repeats = {}
             for arm, files in arms.items():
-                _install_config(fused_moe, files)
+                _install_config(fused_moe, files, stage2_fp8=stage2_fp8[arm])
                 launchers[arm]()
                 torch.cuda.synchronize()
                 repeats[arm] = live_outputs[arm].clone()
@@ -243,7 +250,11 @@ def main():
                 if round_index % 2:
                     order = tuple(reversed(order))
                 for arm in order:
-                    _install_config(fused_moe, arms[arm])
+                    _install_config(
+                        fused_moe,
+                        arms[arm],
+                        stage2_fp8=stage2_fp8[arm],
+                    )
                     if args.execution == "eager":
                         launchers[arm]()
                         torch.cuda.synchronize()
@@ -260,6 +271,7 @@ def main():
                         "ep_rank": rank,
                         "routing": args.routing,
                         "execution": args.execution,
+                        "stage2_fp8": stage2_fp8,
                         "metadata": metadata,
                         "latency_us": medians,
                         "speedup": medians["baseline"] / medians["candidate"],
