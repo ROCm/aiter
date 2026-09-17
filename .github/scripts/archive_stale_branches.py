@@ -29,12 +29,14 @@ import pathlib
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
 NOTICE_MARKER = "<!-- stale-branch-delete-notice -->"
 ARCHIVE_MARKER = "<!-- stale-branch-archived -->"
 ARCHIVE_PREFIX = "archive/"
+BOT_LOGIN = "github-actions[bot]"
 _ARCHIVED = re.compile(r"^archive/(\d{4}-\d{2}-\d{2})/(.+)$")
 
 
@@ -189,41 +191,95 @@ def pr_branches(api: Api) -> set[str]:
         page += 1
 
 
+def ref_sha(api: Api, name: str) -> str | None:
+    """Current tip of a branch, or None if it is gone."""
+    try:
+        ref = api.get(f"/git/ref/heads/{urllib.parse.quote(name, safe='/')}")
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+    return ref["object"]["sha"]
+
+
+def delete_ref(api: Api, name: str, expect: str) -> bool:
+    """Delete a branch only if its tip is still ``expect``.
+
+    The REST API has no compare-and-delete for refs, so this re-reads first.
+    That does not close the window between the scan and the delete, it narrows
+    it to one round trip; a push landing inside it leaves the branch alone.
+    """
+    if ref_sha(api, name) != expect:
+        return False
+    api.write("DELETE", f"/git/refs/heads/{name}")
+    return True
+
+
 def comments(api: Api, sha: str) -> list[dict]:
     return api.get(f"/commits/{sha}/comments?per_page=100") or []
 
 
-def find_marker(api: Api, sha: str, marker: str) -> dict | None:
+def find_marker(api: Api, sha: str, marker: str, author: str) -> dict | None:
+    """The bot's own comment carrying ``marker``, ignoring look-alikes.
+
+    The notice comment is the deletion clock, so anyone who can comment could
+    otherwise start it early and skip the 30-day hold by pasting the marker.
+    """
     for comment in comments(api, sha):
-        if marker in (comment.get("body") or ""):
+        if marker not in (comment.get("body") or ""):
+            continue
+        if (comment.get("user") or {}).get("login") == author:
             return comment
     return None
 
 
-def archive(api: Api, branch: dict, today: dt.date) -> str:
-    """Copy the branch under archive/<today>/, say so, then remove the original."""
-    target = f"{ARCHIVE_PREFIX}{today.isoformat()}/{branch['name']}"
-    api.write(
-        "POST", "/git/refs", {"ref": f"refs/heads/{target}", "sha": branch["sha"]}
-    )
+def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
+    """Copy the branch under archive/<today>/, say so, then remove the original.
+
+    Three writes, so it has to survive stopping between any two of them: a
+    branch that moved since the scan is left alone, an archive ref an earlier
+    run already created is adopted rather than retried into a 422, and the
+    comment is not repeated.
+    """
+    name, sha = branch["name"], branch["sha"]
+    if ref_sha(api, name) != sha:
+        return f"skipped {name}: moved since the scan"
+    target = f"{ARCHIVE_PREFIX}{today.isoformat()}/{name}"
+    existing = ref_sha(api, target)
+    if existing is None:
+        try:
+            api.write("POST", "/git/refs", {"ref": f"refs/heads/{target}", "sha": sha})
+        except urllib.error.HTTPError as error:
+            if error.code != 422:
+                raise
+            existing = ref_sha(api, target)
+    if existing is not None and existing != sha:
+        return f"skipped {name}: {target} already exists at another commit"
+    if find_marker(api, sha, ARCHIVE_MARKER, author) is not None:
+        return _finish_archive(api, name, sha, target)
     api.write(
         "POST",
-        f"/commits/{branch['sha']}/comments",
+        f"/commits/{sha}/comments",
         {
             "body": (
                 f"{ARCHIVE_MARKER}\n"
-                f"`{branch['name']}` has had no new commits since "
+                f"`{name}` has had no new commits since "
                 f"{branch['date'].date().isoformat()}, so it has been moved to "
                 f"`{target}`. Nothing is lost -- this commit is still here, and "
                 f"one command puts the branch back:\n\n"
-                f"```\ngit push origin {target}:{branch['name']}\n```\n\n"
+                f"```\ngit push origin {target}:{name}\n```\n\n"
                 f"The archive copy is kept for a while and then removed, with a "
                 f"separate comment here giving notice first."
             )
         },
     )
-    api.write("DELETE", f"/git/refs/heads/{branch['name']}")
-    return f"archived {branch['name']} -> {target}"
+    return _finish_archive(api, name, sha, target)
+
+
+def _finish_archive(api: Api, name: str, sha: str, target: str) -> str:
+    if delete_ref(api, name, sha):
+        return f"archived {name} -> {target}"
+    return f"archived {name} -> {target}; original kept, it moved mid-run"
 
 
 def give_notice(api: Api, branch: dict, original: str, delete_on: dt.date) -> str:
@@ -262,6 +318,11 @@ def main() -> int:
         help="Cap per run, so a first run cannot notify hundreds of people at once.",
     )
     parser.add_argument(
+        "--bot-login",
+        default=BOT_LOGIN,
+        help="Only this account's marker comments are believed.",
+    )
+    parser.add_argument(
         "--apply", action="store_true", help="Without this, report only."
     )
     args = parser.parse_args()
@@ -279,10 +340,9 @@ def main() -> int:
 
     skip = protected_branches(api) | pr_branches(api)
     actions: list[str] = []
+    failures: list[str] = []
 
-    for branch in sorted(list_branches(api), key=lambda b: b["date"]):
-        if len(actions) >= args.max_actions:
-            break
+    def act(branch: dict) -> str | None:
         name = branch["name"]
         archived = _ARCHIVED.match(name)
 
@@ -292,40 +352,52 @@ def main() -> int:
                 or exempt(name, exempt_names, exempt_patterns)
                 or name.startswith(ARCHIVE_PREFIX)
             ):
-                continue
-            if (now - branch["date"]).days >= args.stale_days:
-                actions.append(archive(api, branch, today))
-            continue
+                return None
+            if (now - branch["date"]).days < args.stale_days:
+                return None
+            return archive(api, branch, today, args.bot_login)
 
         # An archive ref. Its date is in its name; the original name follows.
         archived_on = dt.date.fromisoformat(archived.group(1))
         original = archived.group(2)
         # Against the name it had, so a line added later still rescues it.
         if original in skip or exempt(original, exempt_names, exempt_patterns):
-            continue
-        notice = find_marker(api, branch["sha"], NOTICE_MARKER)
+            return None
+        notice = find_marker(api, branch["sha"], NOTICE_MARKER, args.bot_login)
 
         if notice is None:
-            if (today - archived_on).days >= args.archive_days:
-                actions.append(
-                    give_notice(
-                        api,
-                        branch,
-                        original,
-                        today + dt.timedelta(days=args.notice_days),
-                    )
-                )
+            if (today - archived_on).days < args.archive_days:
+                return None
+            return give_notice(
+                api, branch, original, today + dt.timedelta(days=args.notice_days)
+            )
+
+        if (now - _parse(notice["created_at"])).days < args.notice_days:
+            return None
+        if not delete_ref(api, name, branch["sha"]):
+            return f"skipped {name}: moved since the scan"
+        return f"deleted {name}"
+
+    for branch in sorted(list_branches(api), key=lambda b: b["date"]):
+        if len(actions) >= args.max_actions:
+            break
+        # One branch failing is not a reason to strand the rest of the backlog,
+        # but it is a reason for the job to go red.
+        try:
+            done = act(branch)
+        except urllib.error.HTTPError as error:
+            failures.append(f"{branch['name']}: HTTP {error.code} {error.reason}")
             continue
+        if done:
+            actions.append(done)
 
-        if (now - _parse(notice["created_at"])).days >= args.notice_days:
-            api.write("DELETE", f"/git/refs/heads/{name}")
-            actions.append(f"deleted {name}")
-
-    verb = "would" if not args.apply else "did"
+    verb = "did" if args.apply else "would"
     print(f"{verb} act on {len(actions)} branch(es); {api.writes} write call(s)")
     for line in actions:
         print(f"  {line}")
-    return 0
+    for line in failures:
+        print(f"  FAILED {line}", file=sys.stderr)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

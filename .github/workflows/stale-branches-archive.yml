@@ -52,11 +52,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # Through the environment, never interpolated into the script: a
+          # dispatch input expanded by ${{ }} is run by the shell before
+          # argparse ever sees it, and this job holds contents: write.
+          MAX_ACTIONS: ${{ inputs.max_actions || 50 }}
         run: |
           python3 .github/scripts/archive_stale_branches.py \
             --stale-days 30 \
             --archive-days 30 \
             --notice-days 14 \
             --exemptions .github/stale-branch-exemptions.txt \
-            --max-actions "${{ inputs.max_actions || 50 }}" \
+            --max-actions "$MAX_ACTIONS" \
             ${{ (inputs.dry_run != true && vars.STALE_BRANCHES_ARCHIVE == 'true') && '--apply' || '' }}
