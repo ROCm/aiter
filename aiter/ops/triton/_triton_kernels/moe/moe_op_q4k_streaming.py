@@ -33,9 +33,7 @@
 
 import triton
 import triton.language as tl
-
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 
 _moe_q4k_streaming_kernel_repr = make_kernel_repr(
     "_moe_q4k_streaming_kernel",
@@ -61,10 +59,10 @@ _moe_q4k_streaming_kernel_repr = make_kernel_repr(
 @triton.jit(repr=_moe_q4k_streaming_kernel_repr)
 def _moe_q4k_streaming_kernel(
     # Pointers
-    a_ptr,                  # *fp32 [n_tokens, n_dim_in]
-    expert_ptrs_ptr,        # *uint64 [n_unique_experts]  (absolute device addresses)
-    remap_ptr,              # *int32 [n_tokens, n_used_per_token]
-    c_ptr,                  # *fp32 [n_tokens, n_used_per_token, n_dim_out]
+    a_ptr,  # *fp32 [n_tokens, n_dim_in]
+    expert_ptrs_ptr,  # *uint64 [n_unique_experts]  (absolute device addresses)
+    remap_ptr,  # *int32 [n_tokens, n_used_per_token]
+    c_ptr,  # *fp32 [n_tokens, n_used_per_token, n_dim_out]
     # Dimensions
     n_dim_in,
     n_dim_out,
@@ -105,7 +103,7 @@ def _moe_q4k_streaming_kernel(
 
     qs_offs = tl.arange(0, 32)
 
-    for bi in range(0, n_blocks):
+    for bi in range(n_blocks):
         block_base = row_byte_base + bi * BLOCK_BYTES  # (BLOCK_SIZE_N,)
 
         # dm: 2 fp16 per row -> dall, dmin (both BLOCK_SIZE_N,)
@@ -144,14 +142,22 @@ def _moe_q4k_streaming_kernel(
         m6 = (b10 >> 4) | ((b6 >> 6) << 4)
         m7 = (b11 >> 4) | ((b7 >> 6) << 4)
 
-        sc_f0 = dall * sc0.to(tl.float32);  m_f0 = dmin * m0.to(tl.float32)
-        sc_f1 = dall * sc1.to(tl.float32);  m_f1 = dmin * m1.to(tl.float32)
-        sc_f2 = dall * sc2.to(tl.float32);  m_f2 = dmin * m2.to(tl.float32)
-        sc_f3 = dall * sc3.to(tl.float32);  m_f3 = dmin * m3.to(tl.float32)
-        sc_f4 = dall * sc4.to(tl.float32);  m_f4 = dmin * m4.to(tl.float32)
-        sc_f5 = dall * sc5.to(tl.float32);  m_f5 = dmin * m5.to(tl.float32)
-        sc_f6 = dall * sc6.to(tl.float32);  m_f6 = dmin * m6.to(tl.float32)
-        sc_f7 = dall * sc7.to(tl.float32);  m_f7 = dmin * m7.to(tl.float32)
+        sc_f0 = dall * sc0.to(tl.float32)
+        m_f0 = dmin * m0.to(tl.float32)
+        sc_f1 = dall * sc1.to(tl.float32)
+        m_f1 = dmin * m1.to(tl.float32)
+        sc_f2 = dall * sc2.to(tl.float32)
+        m_f2 = dmin * m2.to(tl.float32)
+        sc_f3 = dall * sc3.to(tl.float32)
+        m_f3 = dmin * m3.to(tl.float32)
+        sc_f4 = dall * sc4.to(tl.float32)
+        m_f4 = dmin * m4.to(tl.float32)
+        sc_f5 = dall * sc5.to(tl.float32)
+        m_f5 = dmin * m5.to(tl.float32)
+        sc_f6 = dall * sc6.to(tl.float32)
+        m_f6 = dmin * m6.to(tl.float32)
+        sc_f7 = dall * sc7.to(tl.float32)
+        m_f7 = dmin * m7.to(tl.float32)
 
         # 4 contiguous 32-byte qs chunks; each yields two sub-blocks.
         chunk0 = tl.load(block_base[:, None] + 16 + 0 + qs_offs[None, :]).to(tl.int32)
@@ -211,10 +217,5 @@ def _moe_q4k_streaming_kernel(
         )
 
     accumulator = tl.where(row_mask, accumulator, 0.0)
-    dst_base = (
-        c_ptr
-        + pid_token * stride_c_token
-        + pid_slot * stride_c_slot
-        + row_offs
-    )
+    dst_base = c_ptr + pid_token * stride_c_token + pid_slot * stride_c_slot + row_offs
     tl.store(dst_base, accumulator, mask=row_mask)

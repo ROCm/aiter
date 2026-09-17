@@ -5,8 +5,12 @@
 # test_moe_q4k_streaming.py to construct ground-truth inputs and outputs.
 #
 # The packed bytes produced by ``pack_block`` are byte-exact to llama.cpp's
-# Q4_K_M layout (validated against ``dequantize_row_q4_K`` in libggml.so;
-# see test_q4k_vs_ggml.py in the development workspace).
+# Q4_K_M layout, and this module is pinned to that layout by
+# test_q4k_vs_ggml.py, which compares against bytes produced by
+# ``dequantize_row_q4_K`` in libggml-base.so. Changing anything here without
+# updating data/q4k_ggml_golden.npz will fail that test, which is the point:
+# the kernel tests alone cannot catch a drift that moves the reference and
+# the kernel together.
 
 from __future__ import annotations
 
@@ -70,7 +74,7 @@ def pack_block(
     # the low nibble and q[64*il+pos+32] in the high nibble, for il in 0..3
     # and pos in 0..31.
     q_2d = q.reshape(4, 2, 32).astype(np.uint8) & 0x0F
-    low = q_2d[:, 0, :]   # (4, 32)
+    low = q_2d[:, 0, :]  # (4, 32)
     high = q_2d[:, 1, :]  # (4, 32)
     qs = (low | (high << 4)).reshape(-1)
     out[16:144] = qs.tobytes()
@@ -163,6 +167,7 @@ def build_pattern_expert(rng, n_dim_in: int, n_dim_out: int) -> bytes:
     sc = rng.integers(1, 32, size=8, dtype=np.uint8)
     m = rng.integers(0, 16, size=8, dtype=np.uint8)
     q = rng.integers(0, 16, size=QK_K, dtype=np.uint8)
-    blk = pack_block(float(rng.uniform(0.01, 0.5)),
-                     float(rng.uniform(0.0, 0.05)), sc, m, q)
+    blk = pack_block(
+        float(rng.uniform(0.01, 0.5)), float(rng.uniform(0.0, 0.05)), sc, m, q
+    )
     return blk * (n_blocks_per_row * n_dim_out)
