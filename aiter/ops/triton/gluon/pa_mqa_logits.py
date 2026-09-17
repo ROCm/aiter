@@ -265,24 +265,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         kv_offsets += (gl.maximum(logical_kv_idx_next, 0) % KVBlockSize)[
             :, None
         ] * HiddenDim
-    # The wrapper selects 64-bit strides when the KV cache exceeds the buffer
-    # descriptor range. Promote before multiplying and use full global pointers.
-    if stride_k_seq.dtype == gl.int64:
-        k_next = gl.load(KV_buffer + kv_offsets)
-    else:
-        k_next = gl.amd.cdna3.buffer_load(ptr=KV_buffer, offsets=kv_offsets)
+    # The KV strides are 64-bit, so a cache past the 2 GiB buffer descriptor
+    # range still addresses correctly. Global pointers, not buffer loads.
+    k_next = gl.load(KV_buffer + kv_offsets)
     context_kv_scale_idx_next = tl.where(
         mask_kv_scale_next, context_kv_scale_idx_next, 0
     )
     scale_offsets = context_kv_scale_idx_next * stride_scale_seq
     if KVBlockSize > 1:
         scale_offsets += gl.maximum(logical_kv_scale_idx_next, 0) % KVBlockSize
-    if stride_scale_seq.dtype == gl.int64:
-        k_scale_f_next = gl.load(scale_buffer + scale_offsets)
-    else:
-        k_scale_f_next = gl.amd.cdna3.buffer_load(
-            ptr=scale_buffer, offsets=scale_offsets
-        )
+    k_scale_f_next = gl.load(scale_buffer + scale_offsets)
 
     zero = gl.zeros((ChunkQ, ChunkK), dtype=tl.float32, layout=mfma_layout)
     for context_idx in range(
@@ -351,10 +343,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         )
         if KVBlockSize > 1:
             kv_offsets += (logical_kv_idx_next % KVBlockSize)[:, None] * HiddenDim
-        if stride_k_seq.dtype == gl.int64:
-            k_next = gl.load(KV_buffer + kv_offsets)
-        else:
-            k_next = gl.amd.cdna3.buffer_load(ptr=KV_buffer, offsets=kv_offsets)
+        k_next = gl.load(KV_buffer + kv_offsets)
         o = gl.maximum(o, 0.0)
         o = o * scale_weight[:, None]
 
@@ -364,12 +353,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         scale_offsets = context_kv_scale_idx_next * stride_scale_seq
         if KVBlockSize > 1:
             scale_offsets += logical_kv_scale_idx_next % KVBlockSize
-        if stride_scale_seq.dtype == gl.int64:
-            k_scale_f_next = gl.load(scale_buffer + scale_offsets)
-        else:
-            k_scale_f_next = gl.amd.cdna3.buffer_load(
-                ptr=scale_buffer, offsets=scale_offsets
-            )
+        k_scale_f_next = gl.load(scale_buffer + scale_offsets)
 
         mask = (
             context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))

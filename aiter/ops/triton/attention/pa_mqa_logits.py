@@ -266,7 +266,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_padded_mode: bool,
     WavePerEU: int = 2,
     VarCtxOpt: bool = False,
-    Use64BitKV: bool = False,
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
@@ -301,9 +300,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "stride_q_next_n": "i32",
         "stride_q_heads": "i32",
         "KV_buffer": gfx_fp8_pointer,
-        "stride_k_seq": "i64" if Use64BitKV else "i32",
+        # The plain kernel forms per-token KV addresses from the page table, so
+        # a cache past 2 GiB overflows a 32-bit stride product.
+        "stride_k_seq": "i32" if Preshuffle else "i64",
         "scale_buffer": "*fp32",
-        "stride_scale_seq": "i64" if Use64BitKV else "i32",
+        "stride_scale_seq": "i32" if Preshuffle else "i64",
         "context_len_ptr": "*i32",
         "kv_indices": "*i32",
         "weights": "*fp32",
@@ -411,9 +412,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         preshuffle_suffix = "_preshuffle" if Preshuffle else ""
         varctx_suffix = "_varctx" if VarCtxOpt else ""
         kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
-        # Large-cache kernels have 64-bit stride arguments and a different ABI.
-        if Use64BitKV:
-            kernel_str += "_kv64"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
@@ -533,9 +531,6 @@ def deepgemm_fp8_paged_mqa_logits(
 
     if enable_gluon_pa_mqa_logits:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
-        # AMD buffer loads have a 2 GiB descriptor range. Use 64-bit strides
-        # and global loads for large plain caches; retain small-cache codegen.
-        use_64bit_kv = not Preshuffle and num_block * kv_cache_fp8.stride(0) >= 2**31
         kernel = _compile_deepgemm_fp8_paged_mqa_logits(
             ChunkQ=heads,
             ChunkK=ChunkK,
@@ -545,7 +540,6 @@ def deepgemm_fp8_paged_mqa_logits(
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
             VarCtxOpt=VarCtxOpt,
-            Use64BitKV=use_64bit_kv,
         )
         if triton_version >= Version("3.5.0"):
             cdna_version = get_cdna_version()
