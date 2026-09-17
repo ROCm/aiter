@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.mha import (
+    _fwd_offsets_fit_int32 as mha_fwd_offsets_fit_int32,
+)
+from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
@@ -21,6 +24,55 @@ from op_tests.triton_tests.attention.mha_test_utils import (
 )
 
 arch = get_arch()
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("packed", True),
+        ("large_stride", False),
+        ("masked_rows", False),
+        ("pipeline_lookahead", False),
+        ("packed_start", False),
+        ("score_span", False),
+        ("rng_offset", False),
+    ],
+)
+def test_mha_fwd_int32_offset_bounds(case, expected):
+    # Meta tensors exercise large/strided address ranges without allocating them.
+    sq, sk, heads = (16384, 16384, 8) if case == "score_span" else (65, 97, 8)
+    packed = case in ("packed", "packed_start")
+    q_shape = (sq, heads, 96) if packed else (1, sq, heads, 96)
+    k_shape = (sk, 1, 96) if packed else (1, sk, 1, 96)
+    q = torch.empty(q_shape, device="meta", dtype=torch.bfloat16)
+    k = torch.empty(k_shape, device="meta", dtype=torch.bfloat16)
+    v = torch.empty((*k_shape[:-1], 64), device="meta", dtype=torch.bfloat16)
+    if case == "large_stride":
+        q = torch.empty_strided(
+            q.shape, (0, 768, 1 << 29, 1), device="meta", dtype=q.dtype
+        )
+    elif case == "masked_rows":
+        sq = 1
+        q = torch.empty_strided(
+            (1, sq, heads, 96), (0, 1 << 24, 96, 1), device="meta", dtype=q.dtype
+        )
+    elif case == "pipeline_lookahead":
+        sk = 1
+        k = torch.empty_strided(
+            (1, sk, 1, 96), (0, 1 << 24, 96, 1), device="meta", dtype=k.dtype
+        )
+    elif case == "packed_start":
+        q = torch.empty((1 << 22, heads, 96), device="meta", dtype=q.dtype)
+    o = torch.empty((*q.shape[:-1], 64), device="meta", dtype=q.dtype)
+    lse_shape = q.shape[:-1] if packed else (1, heads, sq)
+    lse = torch.empty(lse_shape, device="meta", dtype=torch.float32)
+    offset = (1 << 31) - 1 if case == "rng_offset" else 12345
+    assert (
+        mha_fwd_offsets_fit_int32(
+            q, k, v, o, lse, 1, sq, sk, 128, 32, offset, num_stages=3
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize("BATCH", [1, 3])

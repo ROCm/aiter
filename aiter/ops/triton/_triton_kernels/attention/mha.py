@@ -225,8 +225,9 @@ def _attn_fwd_inner(
             )  # TODO: use tl.randint for better performance
             dropout_mask = rng_output > dropout_p
 
-            # Keep `p_kept` ahead of `sd_mask`. This is a workaround to the backend compiler
-            # instruction reordering miscompile, which leads to elements mismatch.  
+            # Keep both uses of the dropout predicate close together. This works
+            # around an SGPR split/spill bug that corrupts a loop-carried buffer
+            # descriptor on gfx950.
             p_kept = tl.where(dropout_mask, p, 0.0)
 
             if RETURN_SCORES:
