@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K1 (SILOTIGER-1047 2d): paged ReLU-sum + tiled top-512.
+"""Family A FlyDSL QSA K1: short-context emit or unfused score + top-512.
 
-Streams compressed index-K from the paged cache in 512-slot tiles, scores
-complete causal blocks, and merges a running LDS top-512. Writes
-``block_ids [M, 512]``. Scores never land in a global ``[M, n_blocks]`` buffer.
-
-One query row is eight wave64s (512 threads): each lane scores one column of
-the tile. When ``visible <= 512`` the selected set is every complete block, so
-the kernel writes those ids and skips the 1024-wide bitonic. Decode and
-prefill share this instantiation.
+When ``n_columns <= 512``, every visible block is selected and the fused
+short-context kernel emits its id without scoring. Longer rows use independent
+512-column scorer workgroups, an fp32 ``[M, n_columns]`` score buffer, and the
+existing stable FlyDSL per-row radix selector. Decode and prefill share both
+instantiations.
 """
 
 from functools import lru_cache
@@ -23,6 +20,7 @@ from flydsl.expr import BFloat16, Float32, Int32, gpu, range_constexpr
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_INDEXER, FAMILY_A_SCORE_SCALE
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
+from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
 
 _BLOCK_THREADS = 512
 _TILE = 512
@@ -246,9 +244,153 @@ def build_qsa_k1_family_a_module(page_size: int):
     return launch_qsa_k1_family_a
 
 
+def build_qsa_k1_family_a_scores_module(page_size: int):
+    """Build the long-context paged scorer with one workgroup per score tile."""
+    if page_size < 1:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+
+    @fx.struct
+    class SharedStorage:
+        q: fx.Array[BFloat16, _H * _D, 16]
+
+    @flyc.kernel(
+        name="qsa_k1_family_a_scores_"
+        + kernel_signature(ps=page_size, tile=_TILE, h=_H, d=_D, blk=_BLOCK_THREADS),
+        known_block_size=[_BLOCK_THREADS, 1, 1],
+    )
+    def qsa_k1_family_a_scores_kernel(
+        q: fx.Tensor,
+        k_cache: fx.Tensor,
+        page_table: fx.Tensor,
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        scores: fx.Tensor,
+        row_lens: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+        score_scale: Float32,
+    ):
+        tile = Int32(gpu.block_id("x"))
+        row = Int32(gpu.block_id("y"))
+        tid = Int32(gpu.thread_id("x"))
+        zero = Int32(0)
+        one = Int32(1)
+        page = Int32(page_size)
+        vec_layout = fx.make_layout(_VEC, 1)
+        k_copy = buf_copy_atom(16, BFloat16)
+        q_load = buf_copy_atom(16, BFloat16)
+        q_store = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+        q_buf = fx.rocdl.make_buffer_tensor(q)
+        k_buf = fx.rocdl.make_buffer_tensor(k_cache)
+        q_tile, q_tv = fx.make_layout_tv(
+            fx.make_layout((_H, _D // _VEC), (_D // _VEC, 1)),
+            fx.make_layout((1, _VEC), (_VEC, 1)),
+        )
+
+        storage = fx.SharedAllocator().allocate(SharedStorage).peek()
+        smem_q = storage.q.view(fx.make_layout((_H, _D), (_D, 1)))
+
+        req = token_to_req[row]
+        valid_req = (req >= zero) & (req < n_req)
+        safe_req = valid_req.select(req, zero)
+        qpos = query_positions[row]
+        slen = valid_req.select(context_lens[safe_req], zero)
+        vis_q = _idiv(qpos + one, Int32(_R))
+        vis_s = _idiv(slen, Int32(_R))
+        visible = (vis_q < vis_s).select(vis_q, vis_s)
+        visible = (visible < n_columns).select(visible, n_columns)
+
+        if (tile == zero) & (tid == zero):
+            row_lens[row] = valid_req.select(visible, zero)
+
+        if tid < Int32(_Q_THREADS):
+            q_thr = fx.make_tiled_copy(q_load, q_tv, q_tile).get_slice(tid)
+            q_row = fx.slice(q_buf, (row, None, None))
+            q_block = fx.slice(fx.zipped_divide(q_row, q_tile), (None, (0, 0)))
+            q_src = q_thr.partition_S(q_block)
+            q_dst = q_thr.partition_D(smem_q)
+            q_frag = fx.make_fragment_like(q_src)
+            fx.copy(q_load, q_src, q_frag)
+            fx.copy(q_store, q_frag, q_dst)
+        gpu.barrier()
+
+        col = tile * Int32(_TILE) + tid
+        if col < n_columns:
+            score = _neg_inf()
+            if (col < visible) & valid_req:
+                logical_page = _idiv(col, page)
+                off = col - logical_page * page
+                phys = page_table[safe_req, logical_page]
+                k_row = fx.slice(k_buf, (phys, off, zero, None))
+                k_chunks = fx.logical_divide(k_row, vec_layout)
+                total = Float32(0.0)
+                for h in range_constexpr(_H):
+                    q_chunks = fx.logical_divide(
+                        fx.slice(smem_q, (h, None)), vec_layout
+                    )
+                    acc = Float32(0.0)
+                    for chunk in range_constexpr(_D // _VEC):
+                        k_src = fx.slice(k_chunks, (None, chunk))
+                        q_src = fx.slice(q_chunks, (None, chunk))
+                        k_frag = fx.make_fragment_like(k_src)
+                        q_frag = fx.make_fragment_like(q_src)
+                        fx.copy(k_copy, k_src, k_frag)
+                        fx.copy(q_store, q_src, q_frag)
+                        k_vec = fx.Vector(fx.memref_load_vec(k_frag))
+                        q_vec = fx.Vector(fx.memref_load_vec(q_frag))
+                        for j in range_constexpr(_VEC):
+                            acc = acc + q_vec[j].to(Float32) * k_vec[j].to(Float32)
+                    total = total + fx.max(acc, Float32(0.0))
+                score = total * score_scale
+            scores[row, col] = score
+
+    @flyc.jit
+    def launch_qsa_k1_family_a_scores(
+        q: fx.Tensor,
+        k_cache: fx.Tensor,
+        page_table: fx.Tensor,
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        scores: fx.Tensor,
+        row_lens: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+        score_scale: Float32,
+        rows: Int32,
+        tiles: Int32,
+        stream: fx.Stream,
+    ):
+        qsa_k1_family_a_scores_kernel(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            scores,
+            row_lens,
+            n_columns,
+            n_req,
+            score_scale,
+        ).launch(
+            grid=(tiles, rows, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_qsa_k1_family_a_scores
+
+
 @lru_cache(maxsize=8)
 def _plan(page_size: int):
     return build_qsa_k1_family_a_module(page_size)
+
+
+@lru_cache(maxsize=8)
+def _scores_plan(page_size: int):
+    return build_qsa_k1_family_a_scores_module(page_size)
 
 
 def qsa_k1_family_a_serves(
@@ -288,9 +430,9 @@ def qsa_k1_family_a_block_ids(
 ) -> torch.Tensor:
     """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
 
-    Streams 512-slot tiles and merges a running LDS top-512. When every
-    complete block fits in the budget, writes those ids and skips the merge.
-    Does not allocate a score matrix. Expand+tail is still a separate launch.
+    Rows no wider than 512 use the fused emit path. Longer rows materialize
+    scores and invoke FlyDSL's stable per-row radix selector. Expand+tail is
+    still a separate launch.
     """
     reason = qsa_k1_family_a_serves(q, k_cache, page_table)
     if reason is not None:
@@ -321,19 +463,51 @@ def qsa_k1_family_a_block_ids(
     context_lens = context_lens.contiguous()
     page_size = k_cache.shape[1]
     n_columns = page_table.shape[1] * page_size
-    _run_compiled(
-        _plan(page_size),
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        context_lens,
-        out,
-        int(n_columns),
-        int(context_lens.shape[0]),
-        float(score_scale),
-        m,
-        torch.cuda.current_stream(q.device),
-    )
+    if n_columns <= _K:
+        _run_compiled(
+            _plan(page_size),
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            int(n_columns),
+            int(context_lens.shape[0]),
+            float(score_scale),
+            m,
+            torch.cuda.current_stream(q.device),
+        )
+    else:
+        scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
+        row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
+        _run_compiled(
+            _scores_plan(page_size),
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            scores,
+            row_lens,
+            int(n_columns),
+            int(context_lens.shape[0]),
+            float(score_scale),
+            m,
+            (n_columns + _TILE - 1) // _TILE,
+            torch.cuda.current_stream(q.device),
+        )
+        flydsl_top_k_per_row_decode(
+            scores,
+            1,
+            row_lens,
+            out,
+            m,
+            scores.stride(0),
+            scores.stride(1),
+            k=_K,
+            stable=True,
+        )
     return out
