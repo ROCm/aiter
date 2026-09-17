@@ -124,7 +124,7 @@ class JsonShapeStore:
             mha_config_relpath,
         )
         from aiter.ops.triton.utils.config_utils import (
-            AITER_TRITON_CONFIGS_PATH,
+            config_roots,
             format_hardware_key,
         )
         from aiter.ops.triton.utils.config_writer import (
@@ -139,8 +139,12 @@ class JsonShapeStore:
             where=f"{backend} MHA winner for {problem.key()}",
         )
         relpath = mha_config_relpath(backend, arch=problem.gfx)
+        # Publish into the highest-priority root, which is the in-tree tree
+        # unless an overlay is configured. That way tuning in a checkout
+        # produces a reviewable diff, while tuning against a deployment that
+        # sets an overlay writes there and leaves the shipped tree untouched.
         update_config_entry(
-            f"{AITER_TRITON_CONFIGS_PATH}/{relpath}",
+            f"{config_roots()[0]}/{relpath}",
             (
                 "fwd",
                 "shapes",

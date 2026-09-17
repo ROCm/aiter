@@ -356,6 +356,85 @@ class TestConfigStores(unittest.TestCase):
             get_mha_fwd_store("json").publish(self.problem, "triton", None)
 
 
+class TestWinnerRoundTrip(unittest.TestCase):
+    """The question the whole exercise turns on: after a winner is published,
+    does the kernel's own loader hand that winner back on the next call?"""
+
+    def setUp(self):
+        from aiter.ops.triton.utils._triton import arch_info
+
+        self.arch = arch_info.get_arch()
+        self.root = tempfile.mkdtemp()
+        self.config = {"BLOCK_M": 256, "BLOCK_N": 32, "num_warps": 8}
+        # The store keys on the measured GPU, so the round trip only closes if
+        # the row describes the GPU this process is running on.
+        self.gpu_model = "mi325x"
+        self.cu_num = 304
+        self.problem = MhaFwdProblem.from_mapping(
+            _problem_row(gfx=self.arch, gpu_model=self.gpu_model, cu_num=self.cu_num)
+        )
+        self.addCleanup(attn_cfg.current_mha_hardware_key.cache_clear)
+        attn_cfg.current_mha_hardware_key.cache_clear()
+
+    def _staged(self):
+        """Publish to a scratch overlay so the shipped tree is never written.
+
+        This is also the deployment shape of the JSON contract: the overlay is
+        the highest-priority root, so it is both where a winner is published
+        and the first place the loader looks.
+        """
+        return (
+            mock.patch(
+                "aiter.ops.triton.utils.config_utils.AITER_TRITON_CONFIGS_OVERLAY_PATH",
+                (self.root,),
+            ),
+            mock.patch.object(
+                attn_cfg,
+                "current_mha_hardware_key",
+                return_value=format_hardware_key(self.cu_num, self.gpu_model),
+            ),
+        )
+
+    def test_a_published_winner_is_what_the_kernel_loader_returns(self):
+        import torch
+
+        from aiter.ops.triton._triton_kernels.attention import mha as triton_mha
+
+        shape_key = attn_cfg.format_mha_shape_key(**_SHAPE)
+        overlay, hardware = self._staged()
+        with overlay, hardware:
+            untuned = triton_mha._get_config(
+                False, torch.bfloat16, head_dim_v=128, shape_key=shape_key
+            )
+            self.assertNotEqual(untuned, self.config)
+
+            get_mha_fwd_store("json").publish(self.problem, "triton", self.config)
+            triton_mha._get_config.cache_clear()
+
+            tuned = triton_mha._get_config(
+                False, torch.bfloat16, head_dim_v=128, shape_key=shape_key
+            )
+        self.assertEqual(tuned, self.config)
+
+    def test_an_unmeasured_shape_is_unaffected_by_the_publication(self):
+        import torch
+
+        from aiter.ops.triton._triton_kernels.attention import mha as triton_mha
+
+        other_key = attn_cfg.format_mha_shape_key(**{**_SHAPE, "nhead_q": 64})
+        overlay, hardware = self._staged()
+        with overlay, hardware:
+            baseline = triton_mha._get_config(
+                False, torch.bfloat16, head_dim_v=128, shape_key=other_key
+            )
+            get_mha_fwd_store("json").publish(self.problem, "triton", self.config)
+            triton_mha._get_config.cache_clear()
+            after = triton_mha._get_config(
+                False, torch.bfloat16, head_dim_v=128, shape_key=other_key
+            )
+        self.assertEqual(after, baseline)
+
+
 class TestSelectionProof(unittest.TestCase):
     def test_layered_records_fold_into_one_selection(self):
         observed = fold_mha_fwd_selection_records(
