@@ -97,6 +97,7 @@ class DecodeCase:
     wide_kv_addressing: bool | None = None
     expected_prefetch: bool | str | None = None
     expected_query_splits: int | None = None
+    check_schedule: bool = False
 
 
 def _require_gpu():
@@ -474,6 +475,66 @@ def _assert_contracts(args, options):
                 pa_decode(*args, **{**options, "work_plan": wrong_plan})
 
 
+def _assert_schedule_cache(compile_tile, kwargs, selected):
+    """Check deterministic CU boundaries without launching hypothetical grids."""
+    workgroups = kwargs["num_seqs"] * kwargs["num_kv_heads"] * kwargs["num_partitions"]
+    planned, ql = kwargs["use_work_plan"], kwargs["query_length"]
+    cached = {}
+
+    def check(cus, expected, **changes):
+        previous_count = len(selected)
+        compiled = compile_tile(**{**kwargs, "num_compute_units": cus, **changes})
+        assert len(selected) == previous_count + 1
+        actual = (selected[-1]["query_splits"], selected[-1]["prefetch_v"])
+        assert actual == expected
+        previous = cached.setdefault(expected, compiled)
+        assert compiled["kernel"] is previous["kernel"]
+        assert compiled["launch"] is previous["launch"]
+
+    if not kwargs["per_token_kv"]:
+        # Scalar prefetch requires CU < workgroups <= 2 * CU.
+        half = (workgroups + 1) // 2
+        points = [
+            (workgroups, (1, False)),
+            (workgroups - 1, (1, True)),
+            (half, (1, True)),
+            (half - 1, (1, False)),
+        ]
+    elif ql == 1:
+        # Transposed page128 prefetch stops above one workgroup per CU.
+        points = [
+            (workgroups - 1, (1, False)),
+            (workgroups, (1, not planned)),
+            (workgroups + 1, (1, not planned)),
+        ]
+    else:
+        # The selected MTP2 case has an exact QL * workgroups == 2 * CU boundary.
+        boundary = ql * workgroups // 2
+        split = (1, False) if planned else (ql, True)
+        points = [(boundary - 1, (1, False)), (boundary, split), (boundary + 1, split)]
+    for cus, expected in points:
+        check(cus, expected)
+
+    if kwargs["per_token_kv"] and ql == 1:
+        # Hkv1 remains tuned for plans; Hkv2 is static-only; Hkv>2 is untuned.
+        for heads, prefetch in [(1, True), (2, not planned), (3, False)]:
+            cus = kwargs["num_seqs"] * heads * kwargs["num_partitions"]
+            check(cus, (1, prefetch), num_kv_heads=heads)
+    elif kwargs["per_token_kv"] and not planned:
+        # Explicit split overrides must also select matching prefetching.
+        check(boundary - 1, (ql, True), query_splits=ql)
+        check(boundary + 1, (1, False), query_splits=1)
+
+    # Runtime size/CU metadata must not fragment the private specialization cache.
+    cus, expected = points[-1]
+    changes = {"num_seqs": kwargs["num_seqs"] * 2}
+    multiplier = 2
+    if not kwargs["per_token_kv"]:
+        changes["num_kv_heads"] = kwargs["num_kv_heads"] * 2
+        multiplier = 4
+    check(cus * multiplier, expected, **changes)
+
+
 def _case(
     name,
     shape=(4, 1, 16, 128),
@@ -508,7 +569,15 @@ def _case(
 BF16, FP16, FP32 = torch.bfloat16, torch.float16, torch.float32
 CASES = [
     _case("scalar-direct", (1, 2, 8, 128), (16, 1, 0), 1),
-    _case("scalar-window-sinks", (1, 2, 8, 128), (128, 1, 0), 7, 257, FP32),
+    _case(
+        "scalar-window-sinks",
+        (1, 2, 8, 128),
+        (128, 1, 0),
+        7,
+        257,
+        FP32,
+        check_schedule=True,
+    ),
     _case(
         "register-64-65",
         (1, 2, 4, 256),
@@ -533,6 +602,7 @@ CASES = [
         lengths=(257, 259),
         expected_query_splits=2,
         expected_prefetch=True,
+        check_schedule=True,
     ),
     _case(
         "hkv2-prefetch-1wg",
@@ -542,6 +612,7 @@ CASES = [
         sink=FP32,
         lengths=(257,) * 16,
         expected_prefetch="occupancy",
+        check_schedule=True,
     ),
     _case(
         "hkv2-prefetch-2wg",
@@ -663,10 +734,25 @@ def test_pa_decode(case, planned, monkeypatch):
     output, query, _, _, context = args[:5]
     scratch, sinks, plan = args[14:17], args[-1], options["work_plan"]
     module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    kernel_module = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
     compile_tile = module.compile_pa_decode_tile
+    build_tile = kernel_module._compile_pa_decode_tile
+    num_compute_units = torch.cuda.get_device_properties(
+        query.device
+    ).multi_processor_count
     selected = []
+    compile_args = None
+
+    def capture_build(**kwargs):
+        # Observe the final schedule before the real cache lookup, including hits.
+        selected.append(kwargs)
+        return build_tile(**kwargs)
 
     def compile_checked(**kwargs):
+        nonlocal compile_args
+        assert kwargs["num_seqs"] == context.numel()
+        assert kwargs["num_kv_heads"] == case.num_kv_heads
+        assert kwargs["num_compute_units"] == num_compute_units
         if case.query_splits is not None and not planned:
             kwargs["query_splits"] = case.query_splits
         if case.wide_kv_addressing is not None:
@@ -674,12 +760,18 @@ def test_pa_decode(case, planned, monkeypatch):
         assert kwargs["use_sinks"] == (
             sinks is not None and args[8] == 1 and not planned
         )
-        selected.append(kwargs)
-        return compile_tile(**kwargs)
+        compile_args = kwargs
+        previous_count = len(selected)
+        compiled = compile_tile(**kwargs)
+        assert len(selected) == previous_count + 1
+        if case.query_splits is not None and not planned:
+            assert selected[-1]["query_splits"] == case.query_splits
+        return compiled
 
     def unexpected_reducer(*_args, **_kwargs):
         raise AssertionError("static NP=1 must not launch a reducer")
 
+    monkeypatch.setattr(kernel_module, "_compile_pa_decode_tile", capture_build)
     monkeypatch.setattr(module, "compile_pa_decode_tile", compile_checked)
     if not planned and args[8] == 1:
         monkeypatch.setattr(module, "launch_pa_decode_ps_reduce", unexpected_reducer)
@@ -736,6 +828,10 @@ def test_pa_decode(case, planned, monkeypatch):
         assert selected and all(
             config["query_splits"] == expected for config in selected
         )
+
+    if case.check_schedule and get_gfx_runtime() == "gfx950":
+        # Compile-only checks stay outside capture and never launch fake-CU results.
+        _assert_schedule_cache(compile_tile, compile_args, selected)
 
     _assert_contracts(args, options)
     if plan is not None:

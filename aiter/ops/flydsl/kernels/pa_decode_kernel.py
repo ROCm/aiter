@@ -3,12 +3,13 @@
 
 """Readable tile-programming reference for paged-attention fp8 decode.
 
-K/V are fp8 e4m3 (FNUZ on gfx942, OCP on gfx950) fed straight into
-``mfma_f32_16x16x32_fp8_fp8``; Q (bf16/f16) and the softmax probabilities P are
-quantized to fp8 too. Scales fold out of the matmuls (q/key scale into the QK
-score, value scale + 1/FP8_MAX into the epilogue); softmax max/sum stay f32.
-The gfx950 BF16 per-token MTP4 specialization uses K=128 FP8 MFMA atoms,
-with the same normalized Q/P values and operand layouts.
+K/V are fp8 e4m3 (FNUZ on gfx942, OCP on gfx950) fed straight into FP8 MFMA;
+Q (bf16/f16) and the softmax probabilities P are quantized to fp8 too. Scales
+fold out of the matmuls (q/key scale into the QK score, value scale + 1/FP8_MAX
+into the epilogue); softmax max/sum stay f32.
+The default instruction is ``mfma_f32_16x16x32_fp8_fp8``. Tuned gfx950 BF16
+per-token MTP3/MTP4 shapes use K=128 FP8 MFMA atoms, with the same normalized
+Q/P values and operand layouts, including query-split MTP4 CTAs.
 The tuned gfx950 BF16 scalar-scale decode specialization instead casts Q/P
 directly to fp8, without range normalization or the compensating 1/FP8_MAX.
 This is a speed/precision tradeoff: small Q values and long probability tails
@@ -51,16 +52,119 @@ from .utils import rcp_f32
 MFMA_MNK = (
     16  # M = N = 16 for the MMA atom; also query rows handled per CTA (padded to 16)
 )
-MFMA_K = 32  # fp8 MFMA contracts K = 32 per instruction (mfma_f32_16x16x32_fp8_fp8)
+# Logical K coverage across a wave of one i64 FP8 operand pack per lane.
+# Operand layouts retain this unit for both K32 and K128 instructions.
+FP8_PACK_K = 32
 WAVE = 64
-# f32 C-fragment elements each lane holds for one 16x16x32 atom (16*16 / 64).
+# f32 C-fragment elements per lane for a 16x16 atom, independent of its K.
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
 
 
-@functools.cache
 def compile_pa_decode_tile(
+    *,
+    head_dim: int,
+    query_group_size: int,
+    block_size: int,
+    num_seqs: int,
+    num_kv_heads: int,
+    num_compute_units: int,
+    num_partitions: int = 1,
+    softmax_scale: float | None = None,
+    query_dtype: str = "f16",
+    per_token_kv: bool = False,
+    query_length: int = 1,
+    trans_v: bool = True,
+    wide_kv_addressing: bool = False,
+    query_splits: int | None = None,
+    use_work_plan: bool = False,
+    sliding_window: int = 0,
+    use_sinks: bool = False,
+    sink_dtype_str: str = "f32",
+):
+    """Select the schedule and return a cached kernel plus launch wrapper.
+
+    Batch/head/CU counts only select query splitting and V prefetching; the
+    builder caches the resulting specialization, not those runtime sizes.
+    ``query_splits=None`` selects automatically; an explicit count overrides
+    splitting while retaining the matching prefetch policy.
+    """
+    gfx950_d128 = "gfx95" in get_rocm_arch() and head_dim == 128
+    tuned_per_token_shape = (
+        gfx950_d128
+        and per_token_kv
+        and query_dtype == "bf16"
+        and block_size in (16, 128)
+    )
+    # Keep the dense-grid estimate for planned execution too. The plan's
+    # capacity and active token windows do not change the scheduling policy.
+    dense_workgroups = num_seqs * num_kv_heads * num_partitions
+    assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
+    if query_splits is None:
+        # Small static MTP2/MTP4 grids use one query per CTA. MTP3 stays fused.
+        query_splits = (
+            query_length
+            if tuned_per_token_shape
+            and not use_work_plan
+            and num_kv_heads == 1
+            and query_length in (2, 4)
+            and query_group_size == 16
+            and query_length * dense_workgroups <= 2 * num_compute_units
+            else 1
+        )
+    assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
+    assert query_length % query_splits == 0, "query_splits must divide query_length"
+
+    # Split queries always prefetch. Unsplit decode supports Hkv1 and static
+    # Hkv2; transposed page128 keeps its lower-register schedule above one
+    # workgroup per CU. One query with GQA8/16 already implies one M-tile.
+    per_token_m1 = (
+        tuned_per_token_shape
+        and query_length == query_splits
+        and query_group_size in (8, 16)
+        and (
+            query_splits > 1
+            or (
+                (num_kv_heads == 1 or (not use_work_plan and num_kv_heads == 2))
+                and (
+                    block_size == 16
+                    or not trans_v
+                    or dense_workgroups <= num_compute_units
+                )
+            )
+        )
+    )
+    scalar_prefetch = (
+        gfx950_d128
+        and block_size == 128
+        and trans_v
+        and not per_token_kv
+        and query_length * query_group_size <= MFMA_MNK
+        and num_compute_units < dense_workgroups <= 2 * num_compute_units
+    )
+    return _compile_pa_decode_tile(
+        head_dim=head_dim,
+        query_group_size=query_group_size,
+        block_size=block_size,
+        num_partitions=num_partitions,
+        softmax_scale=softmax_scale,
+        query_dtype=query_dtype,
+        per_token_kv=per_token_kv,
+        query_length=query_length,
+        trans_v=trans_v,
+        wide_kv_addressing=wide_kv_addressing,
+        prefetch_v=per_token_m1 or scalar_prefetch,
+        query_splits=query_splits,
+        use_work_plan=use_work_plan,
+        sliding_window=sliding_window,
+        use_sinks=use_sinks,
+        sink_dtype_str=sink_dtype_str,
+    )
+
+
+@functools.cache
+def _compile_pa_decode_tile(
     *,
     head_dim: int,
     query_group_size: int,
@@ -135,9 +239,6 @@ def compile_pa_decode_tile(
     assert (
         head_dim % 64 == 0
     ), f"pa_decode_tile only supports head_dim that's a multiple of 64, got {head_dim}"
-    assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
-    assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
-    assert query_length % query_splits == 0, "query_splits must divide query_length"
     QUERIES_PER_CTA = query_length // query_splits
     # Flattened query-row axis (MTP outer, GQA head inner), tiled into 16-row M-tiles.
     TOTAL_ROWS = query_length * query_group_size
@@ -168,6 +269,8 @@ def compile_pa_decode_tile(
         and query_length in (3, 4)
         and query_group_size == 16
     )
+    MFMA_K = 128 if WIDE_FP8_MFMA else FP8_PACK_K
+    PACKS_PER_MFMA = MFMA_K // FP8_PACK_K
     # Small grids split query positions into separate CTAs; otherwise retain
     # all four queries here and share KV loads, scales, and P publication.
     MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
@@ -175,21 +278,16 @@ def compile_pa_decode_tile(
     # register pressure: load plain V during P packing and transposed V after
     # P publication. Page-16 gathers and narrow addresses retain prefetching.
     MTP4_PREFETCH_V = MTP4_FUSED and (block_size == 16 or not wide_kv_addressing)
-    PER_TOKEN_M1 = (
-        TUNED_BF16
-        and per_token_kv
-        and QUERIES_PER_CTA == 1
-        and query_group_size in (8, 16)
-        and prefetch_v
-    )
-    # The wrapper selects earlier V loads for tuned gfx950 decode shapes.
+    # The selector only enables prefetching for supported single-M-tile shapes.
+    PER_TOKEN_M1 = per_token_kv and prefetch_v
     # Page 16 additionally delays next K until PV and uses IGLP to overlap
     # groups of V loads with QK MFMA instructions.
-    TUNED_V_PATH = PER_TOKEN_M1 or (TUNED_SHAPE and trans_v and not per_token_kv)
-    TUNE_PAGE128 = TUNED_V_PATH and block_size == 128
-    EARLY_V = prefetch_v and TUNED_V_PATH and M_TILES == 1
-    PAGE16_VPIPE = EARLY_V and block_size == 16
-    REUSE_KV_PAGES = PAGE16_VPIPE or PER_TOKEN_M1
+    TUNE_PAGE128 = block_size == 128 and (
+        PER_TOKEN_M1 or (TUNED_SHAPE and trans_v and not per_token_kv)
+    )
+    PAGE16_VPIPE = prefetch_v and block_size == 16
+    # The selected page16 pipeline is always per-token as well.
+    REUSE_KV_PAGES = PER_TOKEN_M1
     SCALES_BEFORE_CURRENT_V = (
         WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
     )
@@ -222,7 +320,10 @@ def compile_pa_decode_tile(
     assert (
         QKHE_LOOP >= 1
     ), f"head_dim {head_dim} must be at least {RGROUP_QUARTERS * QK_CHUNK_ELEMS}"
-    N_SUBCHUNKS = QKHE_LOOP * (QK_CHUNK_ELEMS // 8)
+    # QK operand-pack count, not the number of MFMA instructions.
+    N_SUBCHUNKS = head_dim // FP8_PACK_K
+    assert N_SUBCHUNKS % PACKS_PER_MFMA == 0, "QK packs must fill whole MFMA atoms"
+    assert TILE_TOK % MFMA_K == 0, "PV tokens must fill whole MFMA atoms"
 
     # Q-quant chunk width: NQCHUNK stays fixed at 16 (tied to `lane16`'s role
     # as the absmax butterfly width); QCHUNK scales with head_dim instead.
@@ -244,7 +345,8 @@ def compile_pa_decode_tile(
     # PV processes one VHE_SIZE-wide slice of the output head dimension.
     VHE_SIZE = head_dim // VHE_CHUNKS
     OP_ELEMS = MFMA_ACC_ELEMS  # PV C-fragment elements/lane/chunk
-    NVOPS = TILE_TOK // MFMA_K  # 8 PV k_steps (256 tokens / K=32)
+    # Eight i64 packs/lane: eight K32 or two K128 PV instructions.
+    NVOPS = TILE_TOK // FP8_PACK_K
     STEPS_PER_PAGE = block_size // MFMA_MNK
     STEPS_PER_CHUNK = min(block_size, TOK_PER_WARP) // MFMA_MNK
 
@@ -657,15 +759,23 @@ def compile_pa_decode_tile(
                 sVScale_off, a, buf_off
             )
 
-        def _mfma_fp8(a_ops, b_ops, a_base, b_base, k_steps, acc):
+        def _mfma_fp8(a_ops, b_ops, a_base, b_base, k_packs, acc):
+            # Counts and offsets use i64 operand packs per lane. Each instruction
+            # consumes one pack for K32 or PACKS_PER_MFMA packs for K128.
             if const_expr(WIDE_FP8_MFMA):
-                for ks in range_constexpr(k_steps // 4):
+                for inst in range_constexpr(k_packs // PACKS_PER_MFMA):
                     a_pack = fx.Vector.from_elements(
-                        [a_ops[a_base + ks * 4 + i] for i in range_constexpr(4)],
+                        [
+                            a_ops[a_base + inst * PACKS_PER_MFMA + i]
+                            for i in range_constexpr(PACKS_PER_MFMA)
+                        ],
                         dtype=fx.Int64,
                     ).bitcast(fx.Int32)
                     b_pack = fx.Vector.from_elements(
-                        [b_ops[b_base + ks * 4 + i] for i in range_constexpr(4)],
+                        [
+                            b_ops[b_base + inst * PACKS_PER_MFMA + i]
+                            for i in range_constexpr(PACKS_PER_MFMA)
+                        ],
                         dtype=fx.Int64,
                     ).bitcast(fx.Int32)
                     acc = fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
@@ -683,10 +793,10 @@ def compile_pa_decode_tile(
                         ],
                     )
             else:
-                for ks in range_constexpr(k_steps):
+                for pack in range_constexpr(k_packs):
                     acc = fx.rocdl.mfma_f32_16x16x32_fp8_fp8(
                         T.f32x4,
-                        [a_ops[a_base + ks], b_ops[b_base + ks], acc, 0, 0, 0],
+                        [a_ops[a_base + pack], b_ops[b_base + pack], acc, 0, 0, 0],
                     )
             return acc
 
@@ -704,7 +814,7 @@ def compile_pa_decode_tile(
                     ((kv_h * QCHUNK + he_idx) * block_size + within_page_tok)
                     * QK_CHUNK_ELEMS,
                 )
-                w = _k_load16(base)  # head[he_idx*16 : +16] -> k_step 2*qkhe, 2*qkhe+1
+                w = _k_load16(base)  # head[he_idx*16 : +16] -> two K32 operand packs
                 if const_expr(block_size == 16):
                     # help the scheduler overlap the PAGES_PER_CHUNK gathered loads
                     fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
@@ -1074,7 +1184,7 @@ def compile_pa_decode_tile(
                 ]
             elif const_expr(
                 (M_TILES > 1 and not MTP4_FUSED)
-                or (EARLY_V and not SCALES_BEFORE_CURRENT_V)
+                or (prefetch_v and not SCALES_BEFORE_CURRENT_V)
             ):
                 v_vh_shared = [
                     _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
@@ -1540,7 +1650,7 @@ def compile_pa_decode_tile(
                 o_acc = [ostate[_o_slot(0, vh)] for vh in range_constexpr(VHE_CHUNKS)]
                 m_prev = ostate[_m_slot(0)]  # running max, carried from last tile
                 l_prev = ostate[_l_slot(0)]  # running denom, carried from last tile
-                # QK: each NCHUNK chunk accumulates N_SUBCHUNKS k_steps into an f32x4.
+                # QK: each NCHUNK chunk accumulates N_SUBCHUNKS packs into an f32x4.
                 frag_Ss = []
                 for a in range_constexpr(NCHUNK):
                     acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
@@ -1798,7 +1908,7 @@ def compile_pa_decode_tile(
                 ).broadcast_to(OP_ELEMS)
                 # Use the early V loads where enabled; other shapes retain
                 # the existing batched loads before PV.
-                if const_expr(EARLY_V):
+                if const_expr(prefetch_v):
                     v_vh_batch = v_vh_shared
                 else:
                     v_vh_batch = [
