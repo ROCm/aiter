@@ -8,14 +8,15 @@ Measured 2026-09-17 on the local gfx1250, 256-CU device.
 configurations from
 [ROCm's FlyDSL comparison artifacts](https://github.com/ROCm/rocm-libraries/tree/users/pkamd/flydsl/projects/hipblaslt/tensilelite/flydsl_artifacts).
 The checkout is pinned to `bc4ca6ea60abc3bd4f6980585a14f8bad742fcb2`.
-The comparison calls these **hipBLASLt backend kernels through Tensile's native
-solution adapter**, not the installed hipBLASLt public heuristic API. No separate
-benchmark process is used to measure the winner.
+The script supports both an explicit Tensile solution adapter and the public
+hipBLASLt heuristic API through a pybind module. No separate benchmark process
+is used to measure either path.
 
-Both paths use the test's actual tensors, `benchmark_data_init`, seed 0,
+All paths use the test's actual tensors, `benchmark_data_init`, seed 0,
 FP8 E4M3 uniform data, E8M0 `auto` scales, BF16 output, and the same `perftest`
 implementation: 100 iterations, two warmups, matching buffer rotation and graph
-settings. Both have explicit outputs, so outputs rotate along with inputs.
+settings. Every measured path has an explicit output, so outputs rotate along
+with inputs.
 Default behavior without the new comparison option is preserved.
 
 Tensile expects MX32 scales. Each activation block-128 scale is repeated four
@@ -149,14 +150,42 @@ candidate each. A real tuning pass must enumerate alternatives, merge its
 winning logic into the production logic tree, and rebuild or redistribute the
 hipBLASLt device library.
 
-The public probe uses zero operands and constant scales to isolate selection and
-kernel timing. The earlier same-process table uses matched random operands and
-is the stronger FlyDSL-versus-winner comparison: there, the exact supplied
-Tensile kernels remained slower on four of six shapes. The rebuilt public probe
-therefore explains the much larger stock-library regression without erasing the
-remaining kernel-level gap. The split-K precision qualification under
-**Correctness and precision** still applies to the three larger-K FlyDSL
-results.
+## Rebuilt public hipBLASLt versus FlyDSL in one Python process
+
+The public API is also called from `test_gemm_a8w8_blockscale.py` through
+`hipblaslt_public_bridge`, a small pybind module. For each shape, FlyDSL
+B-preshuffle, FlyDSL AB-preshuffle, and public hipBLASLt consume the same Torch
+tensors and packed scales on the current Torch stream. Validation, two warmups,
+100-call graph capture/replay, output rotation, and synchronization all use the
+same Python helpers.
+
+These values are the median of three independent rocprof run means. Each mean
+contains the 100 graph-replay calls after excluding validation and two warmups.
+The GSU4 public result includes `Cijk_SB_PostGSU4_VW4`. M=512 and times are
+microseconds.
+
+| N | K | Public index | FlyDSL B | FlyDSL AB | Public hipBLASLt | Public / best FlyDSL |
+|---:|---:|---:|---:|---:|---:|---:|
+| 6144 | 7168 | 1 | 14.713 | 14.228 | 15.692 | 1.103x |
+| 7168 | 3072 | 2 | 8.649 | 8.042 | 9.024 | 1.122x |
+| 7168 | 16384 | 3 | 24.937 | 24.778 | 28.799 | 1.162x |
+| 65536 | 1536 | 5 | 22.045 | 22.025 | 22.353 | 1.015x |
+| 2048 | 7168 | 0 | 9.370 | 9.447 | 11.234 | 1.199x |
+| 8192 | 1536 | 4 | 5.775 | 5.746 | 5.851 | 1.018x |
+
+The public API selected all six expected indices, and its times are within
+0.3–3.7% of the earlier direct Tensile-adapter measurements. The tuning mappings
+are therefore active in the rebuilt public library. The remaining gap is in the
+selected kernels rather than a failure to apply the rebuilt database. The
+1.5–1.8% differences on the two short-K shapes are within observed run-to-run
+noise.
+
+For `(N,K)=(7168,3072)`, `(65536,1536)`, and `(8192,1536)`, public hipBLASLt is
+bitwise identical to both FlyDSL outputs. The other three FlyDSL configurations
+use BF16 split-K partials, so their 10–20% speed advantage is not
+precision-equivalent. Public hipBLASLt's reference mismatch fractions are
+0.239%, 0.288%, and 0.224% for `(6144,7168)`, `(7168,16384)`, and `(2048,7168)`;
+the corresponding FlyDSL values are 4.05%, 4.29%, and 5.66%.
 
 The first custom build used `HIPBLASLT_ENABLE_YAML=ON`; in this checkout that
 left `libhipblaslt.so` referring to msgpack loader symbols that the YAML-mode
@@ -276,6 +305,35 @@ python3 op_tests/test_gemm_a8w8_blockscale.py ...
 `GEMM_BENCH_EXTERNAL=1` runs the common warmup/rotation loop without Torch's
 profiler. Its Python timing fields are deliberately NaN; read rocprof's CSV.
 
+To compare the rebuilt public library in that same script, build the pybind
+module and launch Python with the custom hipBLASLt preloaded:
+
+```bash
+CXX=/usr/local/bin/amdclang++ \
+ROCM_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel \
+bash op_tests/build_hipblaslt_public_bridge.sh \
+  /tmp/hipblaslt_six_msgpack/install2 \
+  /tmp/hipblaslt_public_bridge.so
+
+ENABLE_CK=0 GEMM_BENCH_ROTATE=1 GEMM_BENCH_GRAPH=1 \
+GEMM_BENCH_EXTERNAL=1 \
+rocprofv3 --stats --kernel-trace -f csv -d /tmp/hipblaslt_compare \
+  -o compare -- \
+env \
+  LD_PRELOAD=/tmp/hipblaslt_six_msgpack/install2/lib/libhipblaslt.so.1 \
+  LD_LIBRARY_PATH=/tmp/hipblaslt_six_msgpack/install2/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_libraries/lib \
+python3 op_tests/test_gemm_a8w8_blockscale.py \
+  --flydsl --ck_preshuffle True --apre True -m 512 \
+  -nk 6144,7168 7168,3072 7168,16384 65536,1536 2048,7168 8192,1536 \
+  --data-init uniform --scale-init auto --seed 0 \
+  --hipblaslt-public-bridge /tmp/hipblaslt_public_bridge.so
+```
+
+`LD_PRELOAD` is required with this ROCm Python distribution because Torch's SDK
+initializer otherwise opens its packaged hipBLASLt by absolute path before the
+pybind module loads. The benchmark moves only its untimed FP32 Torch reference
+GEMM to hipBLAS/rocBLAS; the measured public call still uses hipBLASLt.
+
 ## Build notes and artifacts
 
 The native bridge source is `op_tests/csrc/hipblaslt_winner_bridge.cc`, with
@@ -348,3 +406,7 @@ The stock and rebuilt public traces and their parsed summary are under
 `/tmp/hipblaslt_public_profiles`. The working custom msgpack build and install
 trees are `/tmp/hipblaslt_six_msgpack/release2` and
 `/tmp/hipblaslt_six_msgpack/install2`.
+
+The matched pybind traces used for the final same-process table are under
+`/tmp/hipblaslt_same_python_by_shape_20260917_1235`, with `_r2` and `_r3`
+suffixes for the repeat sets.

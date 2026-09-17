@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Load a generated hipBLASLt/Tensile winner into the Torch benchmark process.
+"""Load hipBLASLt paths into the Torch benchmark process.
 
-This deliberately selects the supplied winner, not stock hipBLASLt heuristics.
-The native bridge is built against the same Tensile checkout as the code object.
+The explicit-winner path uses a generated Tensile library. The public path asks
+the linked hipBLASLt library for its heuristic selection.
 """
 
 import copy
 import ctypes
+import functools
+import importlib.util
 import pathlib
 
 import torch
@@ -139,3 +141,51 @@ class HipblasltWinner:
         if self._handle:
             self._lib.WinnerDestroy(self._handle)
             self._handle = None
+
+
+@functools.lru_cache(maxsize=None)
+def _load_public_bridge(path: str):
+    """Load the native pybind module once per shared-object path."""
+    spec = importlib.util.spec_from_file_location("hipblaslt_public_bridge", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load hipBLASLt public bridge: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class HipblasltPublic:
+    """Own public hipBLASLt descriptors; tensors and stream remain Torch-owned."""
+
+    def __init__(self, bridge: str, m: int, n: int, k: int):
+        module = _load_public_bridge(str(pathlib.Path(bridge).resolve()))
+        self._gemm = module.PublicGemm(m, n, k)
+        self.index = self._gemm.index
+        self.name = self._gemm.solution_name
+        self.kernel_name = self._gemm.kernel_name
+        self.workspace_size = self._gemm.workspace_size
+
+    def run(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+    ) -> torch.Tensor:
+        """Launch the public heuristic without packing, copies, or synchronization."""
+        self._gemm.launch(
+            a.data_ptr(),
+            b.data_ptr(),
+            scale_a.data_ptr(),
+            scale_b.data_ptr(),
+            out.data_ptr(),
+            workspace.data_ptr(),
+            torch.cuda.current_stream().cuda_stream,
+        )
+        return out
+
+    def close(self) -> None:
+        """Release the hipBLASLt descriptors after launches have completed."""
+        self._gemm = None
