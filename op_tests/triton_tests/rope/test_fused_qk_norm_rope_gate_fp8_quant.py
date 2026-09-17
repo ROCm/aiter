@@ -6,9 +6,15 @@ import torch
 
 import aiter
 from aiter import flash_attn_varlen_func
-from aiter.ops.triton.rope.qwen3_next_fp8_qkv import (
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops import mha as mha_module
+from aiter.ops.triton.rope import (
+    fused_qk_norm_rope_gate_fp8_quant as fp8_quant_module,
+)
+from aiter.ops.triton.rope.fused_qk_norm_rope_gate_fp8_quant import (
+    FP8_DTYPE,
     FP8_MAX,
-    qwen3_next_fp8_qkv_prep,
+    fused_qk_norm_rope_gate_fp8_quant,
 )
 
 NUM_QUERY_HEADS = 8
@@ -16,6 +22,10 @@ NUM_KV_HEADS = 1
 HEAD_DIM = 256
 ROTARY_DIM = 64
 EPS = 1.0e-6
+requires_gfx950 = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
+    reason="requires gfx950",
+)
 
 
 def _make_cos_sin_cache(tokens: int, device: torch.device) -> torch.Tensor:
@@ -160,7 +170,8 @@ def _make_inputs(lengths: list[int]):
 
 @pytest.mark.parametrize("lengths", [[128], [5, 17, 108], [8192]])
 @pytest.mark.parametrize("preallocate_outputs", [False, True])
-def test_qwen3_next_fp8_qkv_prep(lengths, preallocate_outputs):
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant(lengths, preallocate_outputs):
     inputs = _make_inputs(lengths)
     q_gate, key, value, q_weight, k_weight, cache, positions, cu_seqlens = inputs
     output_kwargs = {}
@@ -232,7 +243,7 @@ def test_qwen3_next_fp8_qkv_prep(lengths, preallocate_outputs):
             key_descale_out=expected_outputs[7],
             value_descale_out=expected_outputs[8],
         )
-    output = qwen3_next_fp8_qkv_prep(
+    output = fused_qk_norm_rope_gate_fp8_quant(
         *inputs,
         num_actual_tokens=sum(lengths),
         num_query_heads=NUM_QUERY_HEADS,
@@ -297,11 +308,12 @@ def test_qwen3_next_fp8_qkv_prep(lengths, preallocate_outputs):
             assert torch.isfinite(reconstructed).all()
 
 
-def test_qwen3_next_fp8_qkv_prep_mixed_decode_extend_suffix():
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_mixed_decode_extend_suffix():
     lengths = [1, 1, 1, 16]
     inputs = _make_inputs(lengths)
     q_gate, key, value, q_weight, k_weight, cache, positions, cu_seqlens = inputs
-    output = qwen3_next_fp8_qkv_prep(
+    output = fused_qk_norm_rope_gate_fp8_quant(
         *inputs,
         num_actual_tokens=sum(lengths),
         quant_token_start=3,
@@ -367,11 +379,11 @@ def test_qwen3_next_fp8_qkv_prep_mixed_decode_extend_suffix():
         assert relative_error < 0.04
 
 
-def test_qwen3_next_fp8_qkv_prep_rejects_cpu_inputs():
+def test_fused_qk_norm_rope_gate_fp8_quant_rejects_cpu_inputs():
     q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM)
     key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM)
     with pytest.raises(ValueError, match="requires a CUDA/HIP device"):
-        qwen3_next_fp8_qkv_prep(
+        fused_qk_norm_rope_gate_fp8_quant(
             q_gate,
             key,
             key,
@@ -388,14 +400,143 @@ def test_qwen3_next_fp8_qkv_prep_rejects_cpu_inputs():
         )
 
 
-def test_qwen3_next_fp8_qkv_output_dtype():
-    assert aiter.dtypes.fp8 in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+def test_fused_qk_norm_rope_gate_fp8_quant_rejects_non_gfx950(monkeypatch):
+    monkeypatch.setattr(fp8_quant_module, "get_gfx_runtime", lambda: "gfx942")
+    with pytest.raises(RuntimeError, match="supported only on gfx950"):
+        fp8_quant_module._validate_gfx950_fp8()
 
 
-def test_qwen3_next_fp8_qkv_fmha_abi():
+def test_fused_qk_norm_rope_gate_fp8_quant_rejects_non_fn_fp8(monkeypatch):
+    monkeypatch.setattr(fp8_quant_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(aiter.dtypes, "fp8", torch.float8_e4m3fnuz)
+    with pytest.raises(RuntimeError, match="requires float8_e4m3fn"):
+        fp8_quant_module._validate_gfx950_fp8()
+
+
+def test_fused_qk_norm_rope_gate_fp8_quant_output_dtype():
+    assert FP8_DTYPE == torch.float8_e4m3fn
+
+
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_rejects_fp16_inputs():
+    inputs = tuple(tensor.cuda() for tensor in _make_inputs([8]))
+    inputs = tuple(
+        tensor.to(torch.float16) if tensor.dtype == torch.bfloat16 else tensor
+        for tensor in inputs
+    )
+    with pytest.raises(ValueError, match="q_gate must use bfloat16"):
+        fused_qk_norm_rope_gate_fp8_quant(
+            *inputs,
+            num_actual_tokens=inputs[0].shape[0],
+            num_query_heads=NUM_QUERY_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_dim=HEAD_DIM,
+            rotary_dim=ROTARY_DIM,
+            eps=EPS,
+        )
+
+
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_rejects_noncontiguous_inner_dim():
+    inputs = list(_make_inputs([8]))
+    q_gate = torch.randn(
+        inputs[0].shape[0],
+        inputs[0].shape[1] * 2,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )[:, ::2]
+    assert q_gate.stride(-1) != 1
+    inputs[0] = q_gate
+    with pytest.raises(ValueError, match="contiguous innermost dimension"):
+        fused_qk_norm_rope_gate_fp8_quant(
+            *inputs,
+            num_actual_tokens=q_gate.shape[0],
+            num_query_heads=NUM_QUERY_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_dim=HEAD_DIM,
+            rotary_dim=ROTARY_DIM,
+            eps=EPS,
+        )
+
+
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_masks_misaligned_suffix():
+    lengths = [1, 1, 1, 16]
+    inputs = _make_inputs(lengths)
+    output = fused_qk_norm_rope_gate_fp8_quant(
+        *inputs,
+        num_actual_tokens=sum(lengths),
+        quant_token_start=4,
+        quant_sequence_start=3,
+        num_query_heads=NUM_QUERY_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        rotary_dim=ROTARY_DIM,
+        eps=EPS,
+    )
+    reconstructed = output.value_fp8[4:].float() * output.value_descale[3, 0]
+    assert torch.isfinite(reconstructed).all()
+
+
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_bounds_padded_tokens():
+    inputs = _make_inputs([8, 8])
+    output = fused_qk_norm_rope_gate_fp8_quant(
+        *inputs,
+        num_actual_tokens=12,
+        num_query_heads=NUM_QUERY_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        rotary_dim=ROTARY_DIM,
+        eps=EPS,
+    )
+    assert torch.isfinite(output.query_descale[:2]).all()
+    assert torch.isfinite(output.key_descale[:2]).all()
+    assert torch.isfinite(output.value_descale[:2]).all()
+
+
+def test_flash_attn_varlen_rejects_descales_without_ck(monkeypatch):
+    monkeypatch.setattr(mha_module, "ENABLE_CK", False)
+    q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE)
+    descale = torch.ones((1, 1), dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
+        mha_module.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens,
+            cu_seqlens,
+            1,
+            1,
+            q_descale=descale,
+            k_descale=descale,
+            v_descale=descale,
+        )
+
+
+def test_flash_attn_varlen_rejects_partial_descales():
+    q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE)
+    descale = torch.ones((1, 1), dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(ValueError, match="requires q_descale, k_descale, and v_descale"):
+        mha_module.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens,
+            cu_seqlens,
+            1,
+            1,
+            q_descale=descale,
+        )
+
+
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_fmha_abi():
     lengths = [128]
     inputs = _make_inputs(lengths)
-    output = qwen3_next_fp8_qkv_prep(
+    output = fused_qk_norm_rope_gate_fp8_quant(
         *inputs,
         num_actual_tokens=128,
         num_query_heads=NUM_QUERY_HEADS,

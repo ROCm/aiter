@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Exact-arithmetic Qwen3.8 Q/K RMSNorm, RoPE, gate, and amax kernel."""
+"""Fused Q/K RMSNorm, RoPE, gate extraction, and FP8 quantization kernels."""
 
 import triton
 import triton.language as tl
@@ -300,6 +300,8 @@ def segmented_qkv_partial_amax_kernel(
     cu_seqlens_ptr,
     partial_amax_ptr,
     sequence_start,
+    quant_token_start,
+    num_actual_tokens,
     num_q_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     gqa_ratio: tl.constexpr,
@@ -313,10 +315,16 @@ def segmented_qkv_partial_amax_kernel(
         sequence = tl.program_id(0)
     kv_head = tl.program_id(1)
     block_idx = tl.program_id(2)
-    start = tl.load(cu_seqlens_ptr + sequence)
-    end = tl.load(cu_seqlens_ptr + sequence + 1)
+    start = tl.maximum(
+        tl.load(cu_seqlens_ptr + sequence),
+        quant_token_start,
+    )
+    end = tl.minimum(
+        tl.load(cu_seqlens_ptr + sequence + 1),
+        num_actual_tokens,
+    )
     offsets = start + block_idx * BLOCK_T + tl.arange(0, BLOCK_T)
-    token_mask = offsets < end
+    token_mask = (start < end) & (offsets < end)
     k_values = tl.load(
         k_token_amax_ptr + offsets * num_kv_heads + kv_head,
         mask=token_mask,
@@ -486,8 +494,9 @@ def quantize_qk_grouped_offset_kernel(
     cu_seqlens_ptr,
     quant_token_start,
     num_quant_tokens,
+    num_actual_tokens,
     sequence_start,
-    num_sequences,
+    total_sequences,
     q_stride_t,
     q_stride_h,
     k_stride_t,
@@ -508,22 +517,37 @@ def quantize_qk_grouped_offset_kernel(
     local_token = tl.program_id(0)
     token = quant_token_start + local_token
     head = tl.program_id(1)
-    valid_token = local_token < num_quant_tokens
+    valid_token = (local_token < num_quant_tokens) & (token < num_actual_tokens)
 
     if SINGLE_SEQUENCE:
         sequence = sequence_start
     else:
-        low = sequence_start
-        high = sequence_start + num_sequences - 1
+        low = 0
+        high = total_sequences
         for _ in tl.static_range(0, SEARCH_STEPS):
             middle = (low + high) // 2
             boundary = tl.load(
                 cu_seqlens_ptr + middle + 1,
+                mask=middle < total_sequences,
+                other=num_actual_tokens,
             )
             move_right = token >= boundary
             low = tl.where(move_right, middle + 1, low)
             high = tl.where(move_right, high, middle)
-        sequence = low
+        sequence = tl.minimum(low, total_sequences - 1)
+
+    sequence_token_start = tl.load(cu_seqlens_ptr + sequence)
+    sequence_token_end = tl.minimum(
+        tl.load(cu_seqlens_ptr + sequence + 1),
+        num_actual_tokens,
+    )
+    valid_token = (
+        valid_token
+        & (sequence >= sequence_start)
+        & (token >= quant_token_start)
+        & (token >= sequence_token_start)
+        & (token < sequence_token_end)
+    )
 
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
@@ -562,8 +586,9 @@ def quantize_v_grouped_offset_kernel(
     cu_seqlens_ptr,
     quant_token_start,
     num_quant_tokens,
+    num_actual_tokens,
     sequence_start,
-    num_sequences,
+    total_sequences,
     v_stride_t,
     v_stride_h,
     v_out_stride_t,
@@ -578,20 +603,37 @@ def quantize_v_grouped_offset_kernel(
     local_token = tl.program_id(0)
     token = quant_token_start + local_token
     kv_head = tl.program_id(1)
-    valid_token = local_token < num_quant_tokens
+    valid_token = (local_token < num_quant_tokens) & (token < num_actual_tokens)
 
     if SINGLE_SEQUENCE:
         sequence = sequence_start
     else:
-        low = sequence_start
-        high = sequence_start + num_sequences - 1
+        low = 0
+        high = total_sequences
         for _ in tl.static_range(0, SEARCH_STEPS):
             middle = (low + high) // 2
-            boundary = tl.load(cu_seqlens_ptr + middle + 1)
+            boundary = tl.load(
+                cu_seqlens_ptr + middle + 1,
+                mask=middle < total_sequences,
+                other=num_actual_tokens,
+            )
             move_right = token >= boundary
             low = tl.where(move_right, middle + 1, low)
             high = tl.where(move_right, high, middle)
-        sequence = low
+        sequence = tl.minimum(low, total_sequences - 1)
+
+    sequence_token_start = tl.load(cu_seqlens_ptr + sequence)
+    sequence_token_end = tl.minimum(
+        tl.load(cu_seqlens_ptr + sequence + 1),
+        num_actual_tokens,
+    )
+    valid_token = (
+        valid_token
+        & (sequence >= sequence_start)
+        & (token >= quant_token_start)
+        & (token >= sequence_token_start)
+        & (token < sequence_token_end)
+    )
 
     descale = tl.load(
         v_descale_ptr + sequence * num_kv_heads + kv_head,
