@@ -34,7 +34,6 @@ expected at ~1e-6 (fp32 accumulation order), not at fp4 resolution.
 """
 
 import argparse
-import itertools
 import math
 import random
 from dataclasses import dataclass
@@ -48,9 +47,8 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus.pa_mqa_logits_opus import (
     BLOCK_K_1WAVE,
-    compute_prefill_windows,
-    pa_mqa_logits_mxfp4_decode,
-    pa_mqa_logits_mxfp4_prefill,
+    pa_mqa_logits_mxfp4_build_sched,
+    pa_mqa_logits_mxfp4_sched,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -386,9 +384,9 @@ def flydsl_decode(inp, ctx, batch, next_n, block_k):
 
     Its q / q_scale are [B, next_n, ...] where ours are packed [B*next_n, ...]; fixed
     MTP packs rows in (b, n) order, so a reshape is the whole conversion. `weights`
-    stays packed. It runs a persistent grid from `compute_varctx_schedule` rather than
-    our schedule-free 3D grid, and gets it precomputed here so the timed region is a
-    pure launch on both sides. Fixed-MTP only -- there is no varqlen decode on that side.
+    stays packed. It runs a persistent grid from `compute_varctx_schedule`, precomputed here
+    so the timed region is a pure launch on both sides -- ours gets the same treatment, since
+    its table is per-forward too. Fixed-MTP only -- there is no varqlen decode on that side.
     """
     try:
         from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
@@ -452,9 +450,12 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label, cross_flydsl=True
     ls = torch.tensor(ls, dtype=torch.int32, device=dev)
     le = torch.tensor(le, dtype=torch.int32, device=dev)
 
-    out = pa_mqa_logits_mxfp4_prefill(
+    cta, n_ctas = pa_mqa_logits_mxfp4_build_sched(
+        le, total_q, local_starts=ls, row_to_batch=rb, block_k=block_k
+    )
+    out = pa_mqa_logits_mxfp4_sched(
         inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, rb, ls, le, inp.max_seq_len,
+        inp.weights, cta, n_ctas, inp.max_seq_len,
         weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
     )  # fmt: skip
     torch.cuda.synchronize()
@@ -513,14 +514,16 @@ def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None
     ls = torch.tensor(ls, dtype=torch.int32, device=dev)
     le = torch.tensor(le, dtype=torch.int32, device=dev)
 
-    # `cu_seq_q` left as None on purpose, so this covers the fixed-MTP convenience path
-    # where the wrapper derives it; `test_decode` passes one in and covers the other
-    # branch. Between them both forms of the argument are exercised.
-    out = pa_mqa_logits_mxfp4_decode(
+    # `local_starts` None is what makes this a DECODE table: every row starts at 0.
+    # `row_to_batch` is passed because `block_tables` here is per-BATCH while the rows are
+    # packed (b, n); a per-token map instead reads the wrong pages, silently.
+    cta, n_ctas = pa_mqa_logits_mxfp4_build_sched(
+        le, total_q, row_to_batch=rb, block_k=block_k
+    )
+    out = pa_mqa_logits_mxfp4_sched(
         inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, le, inp.max_seq_len, next_n,
-        split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
-        block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+        inp.weights, cta, n_ctas, inp.max_seq_len,
+        weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
     )  # fmt: skip
     torch.cuda.synchronize()
 
@@ -584,19 +587,18 @@ def check_nan_scale(entry, bs, next_n, ends, seed, block_k, label, kv_row=0):
 
     kvs = poison_kv_rows(inp.kv_scale, inp.block_tables, kv_row)
 
-    if entry == "prefill":
-        out = pa_mqa_logits_mxfp4_prefill(
-            inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
-            inp.weights, rb, ls, le, inp.max_seq_len,
-            weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
-        )  # fmt: skip
-    else:
-        out = pa_mqa_logits_mxfp4_decode(
-            inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
-            inp.weights, le, inp.max_seq_len, next_n,
-            split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
-            block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
-        )  # fmt: skip
+    # `entry` is which TABLE this is: prefill hands the builder the window starts, decode
+    # leaves them None. Both are zero here so the two schedules coincide -- what differs is
+    # the builder's `local_starts` branch, which reads the array instead of assuming 0.
+    cta, n_ctas = pa_mqa_logits_mxfp4_build_sched(
+        le, total_q, local_starts=ls if entry == "prefill" else None,
+        row_to_batch=rb, block_k=block_k,
+    )  # fmt: skip
+    out = pa_mqa_logits_mxfp4_sched(
+        inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
+        inp.weights, cta, n_ctas, inp.max_seq_len,
+        weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+    )  # fmt: skip
     torch.cuda.synchronize()
 
     col = torch.arange(out.shape[1], device=dev).unsqueeze(0)
@@ -715,6 +717,26 @@ def run_corner():
 
 
 # ── perf ──────────────────────────────────────────────────────────────────────
+def tail_causal_windows(qlens, ctxs):
+    """The MTP tail-causal windows, in packed (b, n) row order.
+
+    Batch ``b``'s ``n``-th row sees ``[0, ctx[b] - (qlen[b] - 1 - n))``, plain causal when
+    ``qlen == ctx``. The harness's rule, not the kernel's: the schedule takes whatever windows
+    it is handed, and a compressed cache's ``floor((pos+1)/R)`` is not expressible here.
+    """
+    rb, ls, le = [], [], []
+    for b, (q, c) in enumerate(zip(qlens, ctxs)):
+        for n in range(q):
+            rb.append(b)
+            ls.append(0)
+            le.append(max(c - (q - 1 - n), 0))
+
+    def t(v):
+        return torch.tensor(v, dtype=torch.int32, device=dev)
+
+    return t(rb), t(ls), t(le)
+
+
 def gen_prefill_qlens(bs, total=PREFILL_TOTAL_QLEN, qmin=PREFILL_QMIN, seed=0):
     g = random.Random(seed)
     extra = total - bs * qmin
@@ -767,22 +789,25 @@ def test_prefill(bs):
     qlens = gen_prefill_qlens(bs, seed=bs)
     total_q = sum(qlens)
     inp = build_inputs(bs, max(qlens), total_q, SIZING_BLOCK_K, seed=bs)
-    cu = torch.tensor(
-        [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
-    )
-    ctx = torch.tensor(qlens, dtype=torch.int32, device=dev)
-    rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
+    rb, ls, le = tail_causal_windows(qlens, qlens)
     out = torch.full(
         (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+
+    # Per-FORWARD against a per-layer kernel, so built OUTSIDE the timed region -- FlyDSL's
+    # `cta_info` is precomputed for the same reason. Charging one side a metadata build the
+    # other does not pay is how a 30% deficit got reported once.
+    cta, n_ctas = pa_mqa_logits_mxfp4_build_sched(
+        le, total_q, local_starts=ls, row_to_batch=rb
     )
 
     # Defaults, not closure capture: this is rebuilt per shape over names the sweep later
     # drops, so late binding would read the next shape's buffers. `block_k` is left off
     # so the timed call is the default one.
-    def ours(inp=inp, rb=rb, ls=ls, le=le, out=out):
-        return pa_mqa_logits_mxfp4_prefill(
+    def ours(inp=inp, cta=cta, n_ctas=n_ctas, out=out):
+        return pa_mqa_logits_mxfp4_sched(
             inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, rb, ls, le, inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            inp.weights, cta, n_ctas, inp.max_seq_len, weight_scale=WEIGHT_SCALE,
             kv_block_size=KV_BLOCK_SIZE, out=out,
         )  # fmt: skip
 
@@ -822,26 +847,24 @@ def test_decode(batch, max_ctx, next_n):
     ]  # fmt: skip
     total_q = batch * next_n
     inp = build_inputs(batch, max(ctxs), total_q, SIZING_BLOCK_K, seed=batch + next_n)
-    ctx = torch.tensor(ctxs, dtype=torch.int32, device=dev)
-    # `cu_seq_q` and the window arrays are per-forward quantities while the kernel runs per
-    # layer, so both are built here and PASSED IN. Leaving `cu_seq_q` as None makes the
-    # wrapper rebuild it with a `torch.arange` on every call, and `get_trace_perf` sums
-    # every CUDA event in the region, so that fill kernel lands in the reported time --
-    # measured at 1.2-1.8 us, i.e. 8-21% of these shapes, all of it harness rather than
-    # kernel. FlyDSL gets its `cta_info` precomputed for the same reason.
-    cu = torch.arange(0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev)
-    rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
+    ctx = torch.tensor(
+        ctxs, dtype=torch.int32, device=dev
+    )  # FlyDSL's arm takes it as a tensor
+    # Windows and schedule are per-forward against a per-layer kernel, so both are built here,
+    # OUTSIDE the timed region: `get_trace_perf` sums every CUDA event in it, so a metadata
+    # kernel left inside lands in the reported time. FlyDSL's `cta_info` is precomputed too.
+    rb, ls, le = tail_causal_windows([next_n] * batch, ctxs)
+    cta, n_ctas = pa_mqa_logits_mxfp4_build_sched(le, total_q, row_to_batch=rb)
     out = torch.full(
         (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
 
     # Bound as defaults for the same reason as test_prefill's.
-    def ours(inp=inp, cu=cu, le=le, next_n=next_n, out=out):
-        return pa_mqa_logits_mxfp4_decode(
+    def ours(inp=inp, cta=cta, n_ctas=n_ctas, out=out):
+        return pa_mqa_logits_mxfp4_sched(
             inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, le, inp.max_seq_len, next_n,
-            split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
-            cu_seq_q=cu, kv_block_size=KV_BLOCK_SIZE, out=out,
+            inp.weights, cta, n_ctas, inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            kv_block_size=KV_BLOCK_SIZE, out=out,
         )  # fmt: skip
 
     candidates = {"ours": ours}

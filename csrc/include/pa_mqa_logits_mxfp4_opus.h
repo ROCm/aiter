@@ -6,9 +6,12 @@
 // Per query row r over a window [s, e):
 //   out[r, s:e] = sum_H( relu(Q[r] . K^T) * weight[r] ) * weight_scale
 //
-// A thin launcher: quantization and layout are the CALLER's responsibility. The per-CTA
-// assignment is derived entirely in-kernel from blockIdx plus per-row windows / per-batch
-// metadata, so both entry points are schedule-free and cudagraph-safe.
+// A thin launcher: quantization, layout and the per-row windows are the CALLER's
+// responsibility. Prefill and decode are ONE launch over a per-row schedule table, built on
+// device once per forward; a CTA reads its whole assignment from its record. Cudagraph-safe.
+//
+// The kernel template also carries two schedule-free mappings (`mqa_logits_sched::Prefill` and
+// `::Decode`) and the kargs fields they read. Nothing in aiter launches them.
 //
 //   q         [total_tokens, H, D/2]   uint8   natural (low nibble = even element)
 //   weights   [total_tokens, H]        bf16    natural
@@ -22,7 +25,8 @@
 // a dequantized reference on RANDOM data -- a uniform-data check passes under any
 // permutation of K.
 //
-// Resources: VGPR 223 (Prefill) / 224 (Decode), occupancy 2, zero LDS, no spill.
+// Resources, for the `Table` instantiation aiter compiles: VGPR 223, occupancy 2, zero LDS,
+// no spill. Read them after a clean build; incremental ones report stale numbers.
 
 #pragma once
 #include "aiter_tensor.h"
@@ -32,72 +36,14 @@
 // Public API
 // ---------------------------------------------------------------------------
 
-// PREFILL launch: 1D grid (num_rows), one CTA per query row covering its whole window,
-// read from per-row [num_rows] int32 arrays. No context split.
-//
-// block_k picks the compiled variant: 256 -> 4-wave, 64 -> 1-wave. A performance knob,
-// not a shape -- both produce identical results. See the python wrapper for which to pick.
-void pa_mqa_logits_mxfp4_fwd_prefill(aiter_tensor_t& q,
-                          aiter_tensor_t& q_scale,
-                          aiter_tensor_t& kv_cache,
-                          aiter_tensor_t& kv_scale,
-                          aiter_tensor_t& block_tables,
-                          aiter_tensor_t& weights,
-                          aiter_tensor_t& row_to_batch,
-                          aiter_tensor_t& local_starts,
-                          aiter_tensor_t& local_ends,
-                          aiter_tensor_t& out,
-                          int num_rows,
-                          float weight_scale,
-                          int block_k,
-                          int kv_block_size,
-                          int max_seq_len);
 
-// DECODE launch: 3D grid (batch, next_n_max, split_kv). Q/weights/out PACKED
-// ([total_q, ...]); the packed row is cu_seq_q[batch]+n, scored over [0, local_ends[row]).
-// The window is READ, not derived: a compressed KV cache's floor((pos+1)/ratio) is not
-// expressible as ctx - (qlen-1-n). `pa_mqa_logits_mxfp4_prefill_windows` builds the
-// tail-causal case. cudagraph-safe (grid from static shapes; local_ends read in-kernel).
-void pa_mqa_logits_mxfp4_fwd_decode(aiter_tensor_t& q,
-                          aiter_tensor_t& q_scale,
-                          aiter_tensor_t& kv_cache,
-                          aiter_tensor_t& kv_scale,
-                          aiter_tensor_t& block_tables,
-                          aiter_tensor_t& weights,
-                          aiter_tensor_t& cu_seq_q,
-                          aiter_tensor_t& local_ends,
-                          aiter_tensor_t& out,
-                          int batch,
-                          int next_n_max,
-                          int split_kv,
-                          float weight_scale,
-                          int block_k,
-                          int kv_block_size,
-                          int max_seq_len);
-
-// Build the per-row [local_start, local_end) window arrays the PREFILL launch consumes,
-// from cu_seq_q [B+1] + context_lens [B]. MTP tail-causal: batch b's n-th row sees
-// [0, context_len[b] - (qlen-1-n)); plain causal when qlen == ctx. Outputs are each
-// [total_q] int32. Device-side.
-//
-// This rule cannot express a compressed KV cache, where row n sees floor((pos+1)/ratio);
-// such a caller must build local_ends itself and pass it to the prefill entry directly.
-void pa_mqa_logits_mxfp4_prefill_windows(aiter_tensor_t& cu_seq_q,
-                                      aiter_tensor_t& context_lens,
-                                      aiter_tensor_t& row_to_batch,
-                                      aiter_tensor_t& local_starts,
-                                      aiter_tensor_t& local_ends,
-                                      int total_q);
-
-// PREFILL or DECODE over a per-row schedule table -- the table says which. Two ops, split the
-// way the quantities are: the table depends only on `local_ends`, which is per FORWARD, while
-// the kernel runs once per CSA layer. Building it per layer is pure waste.
+// PREFILL or DECODE over a per-row schedule table -- the table says which. Two ops because the
+// table depends only on `local_ends`, which is per FORWARD, while the kernel runs per CSA layer.
 //
 // `cta_info` is caller-allocated int32, refreshed in place so a captured graph can replay from
-// one address. It holds `sched_buffer_records(num_ctas)` records of 8 int32 -- `num_ctas` slots
-// plus the builder's own scratch, so sizing it at `num_ctas * 8` is UNDER-allocation; use
-// `aiter.ops.opus.sched_buffer_ints()`. `num_ctas` itself is the launch grid and must be a
-// cudagraph-stable constant >= num_rows; the schedule absorbs the shape variation instead.
+// one address. It holds `sched_buffer_records(num_ctas)` records of 8 int32 -- slots plus the
+// builder's own scratch -- so sizing it at `num_ctas * 8` is UNDER-allocation. `num_ctas` is the
+// launch grid: a cudagraph-stable constant >= num_rows.
 //
 // `local_starts` may be EMPTY, meaning every row starts at 0, which decode always does.
 // `row_to_batch` may be EMPTY, meaning batch_id == row_id -- the `next_n=1` convention, where a
@@ -1050,8 +996,9 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         const int batch      = opus::block_id_x();
         const int mtp_pos    = opus::block_id_y();
         const int split_idx  = opus::block_id_z();
-        // grid.x is padded up to a whole number of XCDs (see the launcher). cu_seq_q has
-        // only num_batches+1 entries, so this must precede every load below.
+        // grid.x is padded up to a whole number of XCDs by the host driving this mode, so
+        // batch can exceed num_batches; cu_seq_q has only num_batches+1 entries and this must
+        // precede every load below.
         if(batch >= kargs.num_batches) return;
         int q_start = p_cu_seq_q[batch];
         int q_next  = p_cu_seq_q[batch + 1];

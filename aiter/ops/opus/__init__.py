@@ -48,18 +48,8 @@ if _arch_ok:
 
     # gfx950-only, unlike the gemm entries above: _SUPPORTED is wider than this
     # kernel, so the wrappers re-check at call time rather than at import.
-    # `pa_mqa_logits_mxfp4_fwd_decode` / `_fwd_prefill` are raw pybind entries and are here
-    # because ATOM imports them from the top-level namespace. The schedule's `_fwd_sched` is
-    # NOT: nothing calls it that way yet, and the wrapper is the entry to prefer. Add it when a
-    # caller needs it rather than by symmetry.
     from .pa_mqa_logits_opus import (
-        compute_prefill_windows,
         pa_mqa_logits_mxfp4_build_sched,
-        pa_mqa_logits_mxfp4_decode,
-        pa_mqa_logits_mxfp4_fwd_decode,
-        pa_mqa_logits_mxfp4_fwd_prefill,
-        pa_mqa_logits_mxfp4_prefill,
-        pa_mqa_logits_mxfp4_prefill_windows,
         pa_mqa_logits_mxfp4_sched,
         pa_mqa_logits_mxfp4_sched_buffer_ints,
         pa_mqa_logits_mxfp4_sched_slots,
@@ -88,7 +78,6 @@ else:
     opus_gemm_workspace_release_all = _make_unsupported_arch_stub(
         "opus_gemm_workspace_release_all"
     )
-    compute_prefill_windows = _make_unsupported_arch_stub("compute_prefill_windows")
     pa_mqa_logits_mxfp4_build_sched = _make_unsupported_arch_stub(
         "pa_mqa_logits_mxfp4_build_sched"
     )
@@ -98,27 +87,11 @@ else:
     pa_mqa_logits_mxfp4_sched_slots = _make_unsupported_arch_stub(
         "pa_mqa_logits_mxfp4_sched_slots"
     )
-    pa_mqa_logits_mxfp4_decode = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_decode"
-    )
     pa_mqa_logits_mxfp4_sched = _make_unsupported_arch_stub("pa_mqa_logits_mxfp4_sched")
-    pa_mqa_logits_mxfp4_fwd_decode = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_fwd_decode"
-    )
-    pa_mqa_logits_mxfp4_fwd_prefill = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_fwd_prefill"
-    )
-    pa_mqa_logits_mxfp4_prefill = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_prefill"
-    )
-    pa_mqa_logits_mxfp4_prefill_windows = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_prefill_windows"
-    )
 
 
 __all__ = [
     "bmm_a8w8_mxscale_opus",
-    "compute_prefill_windows",
     "gemm_a16w16_opus",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
     "opus_gemm_a16w16_tune",
@@ -126,11 +99,6 @@ __all__ = [
     "opus_gemm_workspace_release",
     "opus_gemm_workspace_release_all",
     "pa_mqa_logits_mxfp4_build_sched",
-    "pa_mqa_logits_mxfp4_decode",
-    "pa_mqa_logits_mxfp4_fwd_decode",
-    "pa_mqa_logits_mxfp4_fwd_prefill",
-    "pa_mqa_logits_mxfp4_prefill",
-    "pa_mqa_logits_mxfp4_prefill_windows",
     "pa_mqa_logits_mxfp4_sched",
     "pa_mqa_logits_mxfp4_sched_buffer_ints",
     "pa_mqa_logits_mxfp4_sched_slots",
