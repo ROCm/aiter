@@ -283,6 +283,7 @@ def fp8_mqa_logits(
                 "UNROLL": 2,
                 "RELAXED_STORE": relaxed_store,
                 "HAS_KV_SPLIT": 1 if num_kv_splits > 1 else 0,
+                "num_kv_splits": num_kv_splits,
             }
             grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
@@ -293,7 +294,6 @@ def fp8_mqa_logits(
             block_kv = 128
             # This kernel has no BLOCK_M: it walks one query row per program.
             block_m = 1
-            num_kv_splits = 1  # gfx1250 kernel has no split support
             other = {"LOOP_VARIANT": loop_variant}
             grid = ((seq_len + block_m - 1) // block_m,)
 
@@ -307,7 +307,6 @@ def fp8_mqa_logits(
             logits_ptr=logits,
             seq_len=seq_len,
             seq_len_kv=seq_len_kv,
-            num_kv_splits=num_kv_splits,
             NUM_HEADS=num_heads,
             HEAD_SIZE=head_size,
             stride_q_s=stride_q_s,
