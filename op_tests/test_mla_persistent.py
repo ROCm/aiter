@@ -674,6 +674,13 @@ def torch_mla_extend_split_kv(
             and is_fp8_kvc
             and max_seqlen_q <= 6
         )
+        or (
+            get_gfx() == "gfx950"
+            and is_fp8_q
+            and is_fp8_kvc
+            and nheads % 16 != 0
+            and nheads * max_seqlen_q <= 128
+        )
     ):
         # Natively support cases
         pass

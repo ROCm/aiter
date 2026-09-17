@@ -1010,6 +1010,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         config_max_seqlen_q = 4;
         config_gqa_ratio = 16;
         args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
+               && (gqa_ratio % 16 != 0) && (gqa_ratio * max_seqlen_q <= 128)
+               && !(gqa_ratio == 8 && max_seqlen_q == 4)){
+        // Head counts that are not a multiple of 16 have no dedicated kernel. The qh32
+        // kernel handles them: a 32-row wave tile can straddle a token boundary, which its
+        // causal mask resolves per lane. Requiring the whole batch to fit one 128-row tile
+        // keeps the metadata's single qo tile token-aligned.
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 32;
+        args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr && persistent) ? 1 : 0;
 
