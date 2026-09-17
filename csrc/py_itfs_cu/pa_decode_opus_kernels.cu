@@ -881,8 +881,8 @@ static void pa_decode_opus_a16w8_maybe_q_split(bool q_split,
 template<class Base>
 static int pa_decode_opus_a16w8_fused_np(int batch, int nkv, int max_tiles, int num_cu)
 {
-    // Partition count as if query-split is off. FlyDSL decides query_splits
-    // from this NP: qlen * B * nkv * NP <= 2 * CU.
+    // Partition count with query-split disabled, used by the query-split gate:
+    // qlen * B * nkv * NP <= 2 * CU.
     const int min_tiles = PA_DECODE_MIN_TILES_PER_SPLIT;
     const int base      = batch * nkv;
     if(base <= 0) return 1;
@@ -946,7 +946,7 @@ static void pa_decode_opus_a16w8_launch(aiter_tensor_t& q,
     const int max_tiles =
         (static_cast<int>(block_tables.size(1)) * Base::PAGE_SIZE + Base::KV_TILE - 1)
         / Base::KV_TILE;
-    // Same gate as FlyDSL PR4332: split MTP2/4 across CTAs only while
+    // Split MTP2/4 across CTAs only while
     // qlen * B * nkv * NP <= 2 * CU. NP=256 on B=1 Q4 is 1024 > 512, so that
     // launch fuses the four tokens and keeps one WG per CU.
     const int np_gate = pa_decode_opus_a16w8_fused_np<Base>(batch, nkv, max_tiles, num_cu);

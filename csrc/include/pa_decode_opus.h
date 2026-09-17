@@ -334,7 +334,7 @@ using fp8_t = _BitInt(8);
 #endif
 
 // Page-16 dual-tile software pipeline: two KV_TILE=128 bodies share one
-// softmax window, matching FlyDSL's KV_COMPUTE_BLOCK=256 without widening
+// 256-token softmax window without widening
 // MFMA N. Extra live scores stay under the fused-MTP occupancy cliff;
 // K is double-buffered, V stays DEPTH=1 and is refilled after the first PV.
 #ifndef PA_DECODE_OPUS_PAGE16_PAIR
@@ -458,8 +458,8 @@ struct pa_decode_kargs
 //   O [Q_TILE, D_HEAD] += P * V^T                     GEMM1, contracts KV_TILE
 //
 // Page-16 additionally pairs two consecutive tiles into one 256-token softmax
-// window (PAGE16_PAIR): same MFMA N, half as many max-fold/P barriers, matching
-// FlyDSL KV_COMPUTE_BLOCK without widening KV_TILE.
+// window (PAGE16_PAIR): same MFMA N, half as many max-fold/P barriers,
+// without widening KV_TILE.
 //
 // Q is loaded once and O accumulates across tiles, so only K and V stream. Q_TILE
 // is the MFMA's M and also the largest GQA ratio supported, so one tile carries
@@ -507,7 +507,7 @@ struct pa_decode_traits
     static_assert(!MTP_Q_LOOP || HAS_MTP, "token-loop MTP is a HAS_MTP specialization");
     // One CTA per query token. Used when the fused token loop would leave the machine
     // idle: each token keeps the decode body (and its KV pipeline) and the grid grows
-    // by qlen, matching FlyDSL's small-MTP query split.
+    // by qlen for small-MTP query splitting.
     static constexpr bool MTP_Q_SPLIT = false;
     static constexpr bool PER_TOKEN_SCALE = false;
 
@@ -542,7 +542,7 @@ struct pa_decode_traits
     static constexpr int Q_TILE     = 16; // MFMA M, also the max supported GQA ratio
 
     // Upper bound on KV splits: the fused merge indexes LDS by split, so this
-    // statically sizes that buffer. 256 matches FlyDSL's max partition count
+    // statically sizes that buffer. 256 allows up to one partition per CU
     // (one split per CU on a 256-CU gfx950).
     static constexpr int MAX_SPLITS = 256;
 
@@ -830,7 +830,7 @@ struct pa_decode_per_token_traits : Traits
     static constexpr bool PER_TOKEN_SCALE = true;
 };
 
-// FlyDSL small-MTP query split: one token per CTA, decode body, grid.y = batch * qlen.
+// Small-MTP query split: one token per CTA, decode body, grid.y = batch * qlen.
 template<class Traits>
 struct pa_decode_q_split_traits : Traits
 {
@@ -2486,7 +2486,7 @@ pa_decode_opus_work(const pa_decode_kargs& kargs,
     if constexpr(PAGE16_PAIR)
     {
         // Page-16 dual-tile software pipe. Decode/q-split: one softmax over two
-        // KV_TILE=128 halves (FlyDSL's 256-token compute block). Fused MTP keeps
+        // KV_TILE=128 halves (a 256-token compute block). Fused MTP keeps
         // four live scores and walks the two halves sequentially -- combining them
         // needs eight score tiles and drops to one wave.
         auto run_pair = [&](int tile_idx, auto masked0, auto masked1, auto prefetch, auto nh) {
