@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -43,6 +44,24 @@ struct ReduceArgs
 static_assert(sizeof(MainArgs) == 320 && offsetof(MainArgs, lse) == 304);
 static_assert(sizeof(ReduceArgs) == 80 && offsetof(ReduceArgs, num_splits) == 48);
 
+inline std::string code_object_path()
+{
+    if(const char* override_path = std::getenv("PA_DECODE_OPUS_SP3_CO"))
+        return std::string(override_path) == "0" ? std::string{} : std::string(override_path);
+    const char* asm_dir = std::getenv("AITER_ASM_DIR");
+    if(asm_dir == nullptr || asm_dir[0] == '\0')
+        return {};
+    static thread_local std::string cached_dir;
+    static thread_local std::string cached_path;
+    if(cached_dir != asm_dir)
+    {
+        cached_dir = asm_dir;
+        const std::string path = cached_dir + "/gfx950/pa/pa_a16w8_q16_d128_p16_mtp_split.co";
+        cached_path = std::ifstream(path, std::ios::binary).good() ? path : std::string{};
+    }
+    return cached_path;
+}
+
 inline bool requested(const aiter_tensor_t& query,
                       const aiter_tensor_t& key,
                       const aiter_tensor_t& value,
@@ -52,8 +71,7 @@ inline bool requested(const aiter_tensor_t& query,
                       const aiter_tensor_t* key_scale,
                       const aiter_tensor_t* value_scale)
 {
-    const char* path = std::getenv("PA_DECODE_OPUS_SP3_CO");
-    if(path == nullptr || path[0] == '\0' || key_scale == nullptr || value_scale == nullptr)
+    if(key_scale == nullptr || value_scale == nullptr)
         return false;
     if((query.dim() != 3 && query.dim() != 4) || key.dim() != 5 ||
        (value.dim() != 4 && value.dim() != 5) || table.dim() != 2 || lengths.dim() != 1)
@@ -80,7 +98,7 @@ inline bool requested(const aiter_tensor_t& query,
        table.numel() * table.element_size() >= (size_t{1} << 31) ||
        key_scale->numel() * sizeof(float) >= (size_t{1} << 31))
         return false;
-    return true;
+    return get_gpu_arch() == "gfx950" && !code_object_path().empty();
 }
 
 inline hipFunction_t optional_function(hipModule_t module, const char* name)
@@ -196,7 +214,7 @@ inline void run(aiter_tensor_t& query, aiter_tensor_t& key, aiter_tensor_t& valu
     Workspace* workspace = nullptr;
     {
         std::lock_guard<std::mutex> lock(registry->mutex);
-        const auto module_key = std::make_pair(query.device_id, std::string(std::getenv("PA_DECODE_OPUS_SP3_CO")));
+        const auto module_key = std::make_pair(query.device_id, code_object_path());
         const auto workspace_key = std::make_tuple(query.device_id, reinterpret_cast<uintptr_t>(stream),
                                                    batch, qlen, heads, splits);
         auto module_it = registry->modules.find(module_key);
