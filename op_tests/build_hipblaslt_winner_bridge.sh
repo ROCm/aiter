@@ -16,9 +16,17 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 tensile_dir="$source_dir/projects/hipblaslt/tensilelite"
 rocm_dir="${ROCM_PATH:-/opt/rocm}"
 compiler="${CXX:-amdclang++}"
+python="${PYTHON:-python3}"
+python_include=$(
+  "$python" -c 'import sysconfig; print(sysconfig.get_paths()["include"])'
+)
+pybind_include=$(
+  "$python" -c 'import pybind11; print(pybind11.get_include())'
+)
 "$compiler" -x hip --offload-arch="${GPU_ARCH:-gfx1250}" \
   --hip-path="$rocm_dir" -std=c++20 -O2 -shared -fPIC \
   -D__HIP_PLATFORM_AMD__=1 -DTENSILE_YAML \
+  -I"$python_include" -I"$pybind_include" \
   -I"$rocm_dir/include" -I"$tensile_dir/include" \
   -I"$build_dir/tensilelite/include" -I"$tensile_dir/rocisa" \
   -I"$source_dir/shared/origami/include" -I"$build_dir/origami/include" \
