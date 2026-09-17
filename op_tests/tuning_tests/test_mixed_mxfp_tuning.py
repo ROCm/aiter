@@ -422,13 +422,22 @@ class TestMixedMxfpTunerState(unittest.TestCase):
             with self.subTest(family=family):
                 tuner = GemmMixedMxfpTuner(family, f"test_{family}")
                 defaults = tuner.get_arg_defaults()
-                tuner.pre_process(
-                    SimpleNamespace(
-                        run_config=True,
-                        untune_file=defaults["untune_file"],
-                        tune_file=defaults["tune_file"],
+                with (
+                    mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+                    mock.patch.object(tuner, "get_cu_num", return_value=256),
+                    mock.patch.object(
+                        torch.cuda,
+                        "current_device",
+                        side_effect=AssertionError("CPU-only test queried CUDA"),
+                    ),
+                ):
+                    tuner.pre_process(
+                        SimpleNamespace(
+                            run_config=True,
+                            untune_file=defaults["untune_file"],
+                            tune_file=defaults["tune_file"],
+                        )
                     )
-                )
                 self.assertEqual(len(tuner.untunedf), 57)
 
     def test_restore_config_env_clears_runtime_caches(self):
@@ -450,7 +459,16 @@ class TestMixedMxfpTunerState(unittest.TestCase):
                         module, f"_get_GEMM_{family.upper()}_config_cached"
                     )
                     cached_get_config.cache_clear()
-                    get_config(1, 1, 1, temporary_path)
+                    with (
+                        mock.patch.object(module, "get_gfx", return_value="gfx950"),
+                        mock.patch.object(module, "get_cu_num", return_value=256),
+                        mock.patch.object(
+                            torch.cuda,
+                            "current_device",
+                            side_effect=AssertionError("CPU-only test queried CUDA"),
+                        ),
+                    ):
+                        get_config(1, 1, 1, temporary_path)
                     self.assertGreater(cached_get_config.cache_info().currsize, 0)
 
                     tuner._restore_config_env(env_name, old_value, 0)
