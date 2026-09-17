@@ -13,8 +13,8 @@ Phase 3a: family A FlyDSL K2 decode sparse GQA (group 12, ``D=256``).
 Phase 3b: same ABI with split-K plus LSE merge for decode occupancy.
 Phase 3c: prefill ``M=512`` uses that same instantiation (no second compile);
 expand+tail and the sigmoid gate stay unfused.
-Phase 3d: tiled ``BLOCK_N`` MFMA QK on the same ABI (scalar PV; decode
-beats #4882 Triton, not live AMD).
+Phase 3d: tiled ``BLOCK_N`` MFMA QK/PV plus one-wave split merge on the
+same ABI; decode beats #4882 Triton, not live AMD.
 
 Shapes (flattened tokens ``M``; activations BF16 unless noted):
 
