@@ -19,7 +19,7 @@ import os
 
 import torch
 
-# Column order of the conv3d_bf16_untuned family header, and therefore of the
+# Column order of the bf16_untuned_conv3d family header, and therefore of the
 # lookup key. Single source for the three readers of that CSV: this lookup,
 # csrc/flydsl_conv3d/conv3d_tune.py, and aiter/aot/flydsl/conv.py.
 TUNED_KEY_COLUMNS = (

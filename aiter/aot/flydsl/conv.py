@@ -47,7 +47,7 @@ Usage::
     python -m aiter.aot.flydsl.conv
 
     # Custom CSV file(s)
-    python -m aiter.aot.flydsl.conv --csv /path/to/conv3d_bf16_tuned.csv
+    python -m aiter.aot.flydsl.conv --csv /path/to/bf16_tuned_conv3d.csv
 
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)

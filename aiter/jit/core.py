@@ -184,11 +184,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 )
 
 # Per-model tuned rows live under model_configs/
-# (qwenimage_vae_conv3d_bf16_tuned.csv, wan21_vae_conv3d_bf16_tuned.csv) and
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
 # get merged into this canonical file by get_config_file. It ships header-only.
 AITER_CONFIG_CONV3D_BF16 = os.getenv(
     "AITER_CONFIG_CONV3D_BF16",
-    f"{AITER_ROOT_DIR}/aiter/configs/conv3d_bf16_tuned.csv",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
@@ -307,7 +307,7 @@ class AITER_CONFIG:
     @property
     def AITER_CONFIG_CONV3D_BF16_FILE(self):
         return self.get_config_file(
-            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "conv3d_bf16_tuned"
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
         )
 
     @property

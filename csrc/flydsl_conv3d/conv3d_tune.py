@@ -22,17 +22,17 @@ preference:
   ``calculate``; a 20-column conv key breaks both.
 
 Write winners into the per-model file, not the header-only canonical
-``aiter/configs/conv3d_bf16_tuned.csv`` (runtime merges model_configs/).
+``aiter/configs/bf16_tuned_conv3d.csv`` (runtime merges model_configs/).
 
 Usage::
 
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
-        -i aiter/configs/model_configs/qwenimage_vae_conv3d_bf16_untuned.csv \\
-        -o aiter/configs/model_configs/qwenimage_vae_conv3d_bf16_tuned.csv
+        -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \\
+        -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
 
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
-        -i aiter/configs/model_configs/wan21_vae_conv3d_bf16_untuned.csv \\
-        -o aiter/configs/model_configs/wan21_vae_conv3d_bf16_tuned.csv
+        -i aiter/configs/model_configs/wan21_vae_bf16_untuned_conv3d.csv \\
+        -o aiter/configs/model_configs/wan21_vae_bf16_tuned_conv3d.csv
 """
 
 import os
@@ -127,8 +127,8 @@ class Conv3dTuner(TunerCommon):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "sort": True,
-        "untune_file": "aiter/configs/model_configs/qwenimage_vae_conv3d_bf16_untuned.csv",
-        "tune_file": "aiter/configs/model_configs/qwenimage_vae_conv3d_bf16_tuned.csv",
+        "untune_file": "aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv",
+        "tune_file": "aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv",
         "config_env_name": "AITER_CONFIG_CONV3D_BF16",
     }
 
@@ -489,7 +489,7 @@ class Conv3dTuner(TunerCommon):
 
 if __name__ == "__main__":
     tuner = Conv3dTuner(
-        "conv3d_bf16_tuned",
+        "bf16_tuned_conv3d",
         KEYS,
         RESULT_LIST,
         description="FlyDSL implicit-GEMM conv3d bf16 tile tuner",

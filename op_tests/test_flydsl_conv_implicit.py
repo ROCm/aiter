@@ -22,7 +22,7 @@ The rest are the shapes two real VAEs run, traced rather than assumed:
   rows are conv2d -- testing them as conv3d would measure something else.
 
 The coverage the model tables owe is the tuner's own shape set,
-`aiter/configs/model_configs/{wan21,qwenimage}_vae_*_conv3d_bf16_untuned.csv`: at the
+`aiter/configs/model_configs/{wan21,qwenimage}_vae_*_bf16_untuned_conv3d.csv`: at the
 default resolutions every row of all four files is a row of a table here. The Wan
 files hold only the 8 cached conv3d shapes; the Qwen files also hold the encoder
 downsamplers and decoder upsamplers, which is why that table carries stride and
@@ -325,7 +325,7 @@ def wan_vae_decode(height, width, frames):
 #
 # Encode and decode together: 58 calls collapsing to 16 shapes, since the encoder and
 # decoder resnets meet at the same extents. That is row for row the shape set in
-# aiter/configs/model_configs/qwenimage_vae_<res>_conv3d_bf16_untuned.csv, which is
+# aiter/configs/model_configs/qwenimage_vae_<res>_bf16_untuned_conv3d.csv, which is
 # what the tuner enumerates and therefore the coverage this test owes. Two kinds are
 # not causal convs and so do not follow the padding=1 form:
 #

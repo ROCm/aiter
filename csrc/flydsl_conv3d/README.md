@@ -43,18 +43,18 @@ python3 setup.py develop
 
 ```bash
 python3 csrc/flydsl_conv3d/conv3d_tune.py \
-  -i aiter/configs/model_configs/qwenimage_vae_1024x1024_conv3d_bf16_untuned.csv \
-  -o aiter/configs/model_configs/qwenimage_vae_1024x1024_conv3d_bf16_tuned.csv
+  -i aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_untuned_conv3d.csv \
+  -o aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_tuned_conv3d.csv
 ```
 
    Write winners into the per-model file, never into
-   `aiter/configs/conv3d_bf16_tuned.csv`. That one and its untuned sibling ship
+   `aiter/configs/bf16_tuned_conv3d.csv`. That one and its untuned sibling ship
    header-only and back the merge `AITER_CONFIG_CONV3D_BF16` performs:
 
-   - `conv3d_bf16_tuned.csv` -- merge anchor, and the path `get_config_file`
+   - `bf16_tuned_conv3d.csv` -- merge anchor, and the path `get_config_file`
      returns as-is when no per-model table is present, so it has to stay a
      readable csv.
-   - `conv3d_bf16_untuned.csv` -- supplies the duplicate-detection keys, so two
+   - `bf16_untuned_conv3d.csv` -- supplies the duplicate-detection keys, so two
      tables claiming the same shape fail the merge instead of silently
      coexisting. Its columns must stay equal to the tuner's `SHAPE_KEYS`.
 
@@ -106,8 +106,8 @@ and the built-in default for it does not exist (see step 2).
 
 ```bash
 python3 csrc/flydsl_conv3d/conv3d_tune.py \
-  -i aiter/configs/model_configs/wan21_vae_480x832_conv3d_bf16_untuned.csv \
-  --run_config aiter/configs/model_configs/wan21_vae_480x832_conv3d_bf16_tuned.csv
+  -i aiter/configs/model_configs/wan21_vae_480x832_bf16_untuned_conv3d.csv \
+  --run_config aiter/configs/model_configs/wan21_vae_480x832_bf16_tuned_conv3d.csv
 ```
 
 ### `--compare` / `--update_improved`
