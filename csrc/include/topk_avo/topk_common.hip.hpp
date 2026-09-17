@@ -299,6 +299,62 @@ __device__ __forceinline__ vfloat4 load_f4(const vfloat4* p)
     return *p;
 }
 
+// vec4 load at vector index `i` of a row slice that is `len` floats long, which
+// never reads past the slice.
+//
+// n4_cover() rounds the vector count UP, so the last vector of a slice whose
+// length is not a multiple of 4 reaches up to 3 floats beyond it. For an
+// interior row those floats belong to the next row and are harmless -- every
+// consumer predicates on `< len` -- but once nonzero rowStarts make
+// `row_start + len` land within 3 floats of the END OF THE ALLOCATION it is a
+// HIP 700. Measured on the shipped tree: M=256 N=131072 prefix=131072 with
+// --row-starts-stride 65 faults, while the SAME strides at prefix=100000, where
+// the slice ends well before the pitch, pass on every distribution. That pair is
+// what isolates the cause to the over-read.
+//
+// It is NOT a misalignment. gfx950 serves a 4-byte-aligned global_load_dwordx4
+// natively: strides 1, 3, 7 and 65 give base % 4 in {1, 3} and pass at
+// prefix=100000 on both the sampled and the small_n path, with the plain 16-byte
+// vfloat4 typedef. Declaring the typedef `aligned(4)` was tried and changed
+// nothing, which is the other half of the same evidence.
+//
+// RAGGED=false cannot over-read -- the slice is the whole row, len == pitch, and
+// the vector count is an exact division -- so that instantiation keeps the plain
+// load and byte-identical codegen. The aiter entry always instantiates
+// RAGGED=true, so the path that ships gets the clamp.
+// Measured cost on the ragged path, interleaved A/B against the pre-fix binary,
+// 2 rounds each. Three forms of the same clamp were tried and this one, the
+// simplest, is also the cheapest:
+//   this form, `e + FP32_EPT <= len` inline        +0.39% .. +0.88%
+//   `i < n4_full` with n4_full hoisted per row     +0.52% .. +1.00%
+//   clamp armed only on row == gridDim-1          +0.55% .. +2.63%
+// So the cost is the branch existing in the loop at all, not the arithmetic
+// feeding it, and paying it once per vector beats trying to predicate it away.
+template <bool RAGGED>
+__device__ __forceinline__ vfloat4 load_row_f4(const float* __restrict__ row, int i, int len)
+{
+    const vfloat4* v4 = reinterpret_cast<const vfloat4*>(row);
+    if constexpr(!RAGGED)
+    {
+        (void)len;
+        return load_f4(v4 + i);
+    }
+    else
+    {
+        const int e = i * FP32_EPT;
+        if(e + FP32_EPT <= len)
+            return load_f4(v4 + i);
+        // Zero, not garbage: no consumer looks at a lane whose column is >= len, so
+        // the value is unobservable, and zero keeps it that way if one ever does.
+        vfloat4 v = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for(int j = 0; j < FP32_EPT; j++)
+            if(e + j < len)
+                v[j] = row[e + j];
+        return v;
+    }
+}
+
 // Block-wide min and max of keys already in LDS, using an xor butterfly so
 // EVERY lane ends up holding the result (a __shfl_down tree would leave it in
 // lane 0 only -- that exact trap cost 3% recall in the DeepSelect port).

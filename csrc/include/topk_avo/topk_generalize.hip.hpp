@@ -52,7 +52,7 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     const int n4 = RAGGED ? n4_cover(len) : (pitch / FP32_EPT);
     for(int u = threadIdx.x; u < n4; u += blockDim.x)
     {
-        vfloat4 v        = *(reinterpret_cast<const vfloat4*>(ri) + u);
+        vfloat4 v        = load_row_f4<RAGGED>(ri, u, len);
         const int base   = u * FP32_EPT;
         s_keys[base + 0] = fp32_to_sortable(v[0]);
         s_keys[base + 1] = fp32_to_sortable(v[1]);
@@ -122,8 +122,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 {
     const int row     = blockIdx.y;
     const int len     = row_len_of<RAGGED>(row, pitch, extents);
-    const vfloat4* ri = reinterpret_cast<const vfloat4*>(input + (size_t)row * pitch +
-                                                         (RAGGED ? extents.row_start(row) : 0));
+    const float* ri   = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
     const float th    = threshold_f[row];
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
     const int wid     = threadIdx.x / WAVE_SIZE;
@@ -171,7 +170,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         vfloat4 v       = {0.f, 0.f, 0.f, 0.f};
         const bool live = (i < i1);
         if(live)
-            v = load_f4(ri + i);
+            v = load_row_f4<RAGGED>(ri, i, len);
         const int base_idx = i * FP32_EPT;
         const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
         const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));
@@ -417,11 +416,10 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
     block_select_lds(s_keys, S, rank_row, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses);
     const float th = sortable_to_fp32(pivot);
 
-    const vfloat4* ri4 = reinterpret_cast<const vfloat4*>(ri);
-    const int lane     = threadIdx.x & (WAVE_SIZE - 1);
-    const int wid      = threadIdx.x / WAVE_SIZE;
-    const int nwaves   = blockDim.x / WAVE_SIZE;
-    const uint64_t lt  = (1ull << lane) - 1ull;
+    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
+    const int wid     = threadIdx.x / WAVE_SIZE;
+    const int nwaves  = blockDim.x / WAVE_SIZE;
+    const uint64_t lt = (1ull << lane) - 1ull;
     __shared__ uint64_t wbuf[WSTAGE_WAVES * WSTAGE_CAP];
     uint64_t* buf    = wbuf + (size_t)wid * WSTAGE_CAP;
     uint64_t* seg    = cand_pack + (size_t)row * CAND_SLOTS_PER_ROW + (size_t)wid * seg_stride;
@@ -436,7 +434,7 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
         vfloat4 v       = {0.f, 0.f, 0.f, 0.f};
         const bool live = (i < n4);
         if(live)
-            v = load_f4(ri4 + i);
+            v = load_row_f4<RAGGED>(ri, i, len);
         const int base_idx = i * FP32_EPT;
         const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
         const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));

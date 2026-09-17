@@ -399,11 +399,21 @@ def top_k_per_row_prefill(
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
     the workspace for the ob path in that case.
 
-    When stable=False and stride0 >= 32768 and topk_avo_supports() returns true,
-    dispatches to top_k_per_row_prefill_avo. Set AITER_DISABLE_TOPK_AVO=1 to
-    force the original mb/ob path for A/B or fallback."""
+    When stable=False and stride1 == 1 and stride0 >= 32768 and
+    topk_avo_supports() returns true, dispatches to top_k_per_row_prefill_avo.
+    Set AITER_DISABLE_TOPK_AVO=1 to force the original mb/ob path for A/B or
+    fallback.
+
+    stride1 is part of the routing condition and not of topk_avo_supports(),
+    which only takes (numRows, stride0, k) and so cannot see it. The mb/ob path
+    ignores stride1 entirely, while the AVO entry asserts it is 1; routing a
+    stride1 != 1 call here would therefore turn a working (if questionable) call
+    into an abort purely because AVO became available. Keeping the assert for
+    direct callers of top_k_per_row_prefill_avo and routing around it here
+    preserves the pre-AVO behaviour exactly."""
     if (
         not stable
+        and stride1 == 1
         and stride0 >= 32768
         and topk_avo_supports(numRows, stride0, k)
         and os.environ.get("AITER_DISABLE_TOPK_AVO", "0") != "1"
