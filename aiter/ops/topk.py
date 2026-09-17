@@ -397,7 +397,28 @@ def top_k_per_row_prefill(
     When stable=True, the one-block path is forced with deterministic,
     ascending-index ordered, smallest-index tie-breaking emit so every
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
-    the workspace for the ob path in that case."""
+    the workspace for the ob path in that case.
+
+    When stable=False and stride0 >= 32768 and topk_avo_supports() returns true,
+    dispatches to top_k_per_row_prefill_avo. Set AITER_DISABLE_TOPK_AVO=1 to
+    force the original mb/ob path for A/B or fallback."""
+    if (
+        not stable
+        and stride0 >= 32768
+        and topk_avo_supports(numRows, stride0, k)
+        and os.environ.get("AITER_DISABLE_TOPK_AVO", "0") != "1"
+    ):
+        return top_k_per_row_prefill_avo(
+            logits,
+            rowStarts,
+            rowEnds,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+        )
     if not stable and topk_use_mulblocks(numRows, stride0):
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
