@@ -80,13 +80,18 @@ def bytes_moved(batch, num_k_heads, head_dim, fp8):
 def bench_one(batch, num_k_heads, head_dim, slots, quant_dtype, iters, warmup=25):
     inp = make_inputs(batch, num_k_heads, head_dim, slots)
     args = (
-        inp["projected_qkvz"], inp["projected_ba"], inp["conv_state"],
-        inp["ssm_state"], inp["ssm_state_indices"], inp["conv_weight"],
-        inp["conv_bias"], inp["A_log"], inp["dt_bias"], inp["norm_weight"],
+        inp["projected_qkvz"],
+        inp["projected_ba"],
+        inp["conv_state"],
+        inp["ssm_state"],
+        inp["ssm_state_indices"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
     )
-    kwargs = dict(
-        scale=head_dim**-0.5, norm_eps=1e-6, quant_dtype=quant_dtype
-    )
+    kwargs = dict(scale=head_dim**-0.5, norm_eps=1e-6, quant_dtype=quant_dtype)
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -134,15 +139,20 @@ def main():
 
     quant_dtype = None if args.no_fp8 else torch.float8_e4m3fn
     peak = _PEAK_BW.get(arch)
-    print(f"fused_gdn_decode_qkvz on {torch.cuda.get_device_name(0)} ({arch}), "
-          f"num_k_heads={args.num_k_heads} head_dim={args.head_dim} "
-          f"slots={args.slots} fp8={not args.no_fp8}")
-    print(f"{'batch':>7}{'us':>10}{'GB moved':>11}{'TB/s':>9}{'% peak':>9}")
+    print(
+        f"fused_gdn_decode_qkvz on {torch.cuda.get_device_name(0)} ({arch}), "
+        f"num_k_heads={args.num_k_heads} head_dim={args.head_dim} "
+        f"slots={args.slots} fp8={not args.no_fp8}"
+    )
+    # us per call; this op is always a single launch, so also per launch.
+    print(f"{'batch':>7}{'us/call':>10}{'GB moved':>11}{'TB/s':>9}{'% peak':>9}")
     for b in [int(x) for x in args.batch.split(",")]:
         us = bench_one(
             b, args.num_k_heads, args.head_dim, args.slots, quant_dtype, args.iters
         )
-        nbytes = bytes_moved(b, args.num_k_heads, args.head_dim, quant_dtype is not None)
+        nbytes = bytes_moved(
+            b, args.num_k_heads, args.head_dim, quant_dtype is not None
+        )
         tbs = nbytes / (us * 1e-6) / 1e12
         pct = 100.0 * tbs * 1e12 / peak if peak else float("nan")
         print(f"{b:>7}{us:>10.2f}{nbytes / 1e9:>11.4f}{tbs:>9.2f}{pct:>8.1f}%")
