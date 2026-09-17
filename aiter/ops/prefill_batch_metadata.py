@@ -198,6 +198,15 @@ class GatedDeltaRuleChunkSchedule:
     grid: ChunkGrid
     chunk_offsets: torch.Tensor
     kernel_cu_seqlens: torch.Tensor
+    block_chunks: int
+    block_seq_id: torch.Tensor
+    block_chunk_base: torch.Tensor
+    block_nchunks: torch.Tensor
+    block_prefix: torch.Tensor
+
+    @property
+    def total_blocks(self) -> int:
+        return self.block_seq_id.numel()
 
     @property
     def total_chunks(self) -> int:
@@ -404,6 +413,8 @@ def build_gated_delta_rule_prefill_metadata(
     chunk_size: int = 64,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    block_chunks: int = 64,
+    block_chunks_per_seq: Sequence[int] | None = None,
 ) -> GatedDeltaRulePrefillMetadata:
     """Build reusable GDR prefill metadata on the ``cu_seqlens`` device."""
     if cu_seqlens.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -438,18 +449,58 @@ def build_gated_delta_rule_prefill_metadata(
         chunk_offsets_cpu.append(chunk_offsets_cpu[-1] + num_chunks)
         kernel_cu_seqlens_cpu.append(kernel_cu_seqlens_cpu[-1] + length)
 
+    if block_chunks_per_seq is None:
+        block_counts, total_blocks, _ = _chunk_counts(counts, block_chunks)
+    else:
+        if len(block_chunks_per_seq) != len(prefill_lens):
+            raise ValueError(
+                "`block_chunks_per_seq` must have one entry per prefill sequence."
+            )
+        if any(size <= 0 for size in block_chunks_per_seq):
+            raise ValueError("`block_chunks_per_seq` entries must be positive.")
+        block_counts = tuple(
+            (count + size - 1) // size
+            for count, size in zip(counts, block_chunks_per_seq, strict=True)
+        )
+        total_blocks = sum(block_counts)
+    block_seq_id_cpu: list[int] = []
+    block_chunk_base_cpu: list[int] = []
+    block_nchunks_cpu: list[int] = []
+    block_prefix_cpu = [0]
+    for sequence_id, (num_chunks, num_blocks) in enumerate(
+        zip(counts, block_counts, strict=True)
+    ):
+        block_seq_id_cpu.extend([sequence_id] * num_blocks)
+        seq_block_chunks = (
+            block_chunks
+            if block_chunks_per_seq is None
+            else block_chunks_per_seq[sequence_id]
+        )
+        for base in range(0, num_chunks, seq_block_chunks):
+            block_chunk_base_cpu.append(base)
+            block_nchunks_cpu.append(min(seq_block_chunks, num_chunks - base))
+        block_prefix_cpu.append(block_prefix_cpu[-1] + num_blocks)
+
     packed = torch.tensor(
         sequence_ids_cpu
         + chunk_ids_cpu
         + chunk_offsets_cpu
         + _host_cu_seqlens(normalized_seq_lens)
-        + kernel_cu_seqlens_cpu,
+        + kernel_cu_seqlens_cpu
+        + block_seq_id_cpu
+        + block_chunk_base_cpu
+        + block_nchunks_cpu
+        + block_prefix_cpu,
         dtype=torch.int32,
         device=cu_seqlens.device,
     )
     chunk_ids_end = 2 * total_chunks
     offsets_end = chunk_ids_end + len(chunk_offsets_cpu)
     source_cu_end = offsets_end + len(normalized_seq_lens) + 1
+    kernel_cu_end = source_cu_end + len(kernel_cu_seqlens_cpu)
+    block_seq_end = kernel_cu_end + total_blocks
+    block_base_end = block_seq_end + total_blocks
+    block_nchunks_end = block_base_end + total_blocks
     grid = ChunkGrid(
         block_size=chunk_size,
         total_chunks=total_chunks,
@@ -471,6 +522,12 @@ def build_gated_delta_rule_prefill_metadata(
         total_prefill_tokens=sum(prefill_lens),
         grid=grid,
         chunk_offsets=packed[chunk_ids_end:offsets_end],
-        kernel_cu_seqlens=packed[source_cu_end:],
+        kernel_cu_seqlens=packed[source_cu_end:kernel_cu_end],
+        # Zero marks per-sequence sizing: no single scalar describes the blocks.
+        block_chunks=block_chunks if block_chunks_per_seq is None else 0,
+        block_seq_id=packed[kernel_cu_end:block_seq_end],
+        block_chunk_base=packed[block_seq_end:block_base_end],
+        block_nchunks=packed[block_base_end:block_nchunks_end],
+        block_prefix=packed[block_nchunks_end:],
     )
     return GatedDeltaRulePrefillMetadata(layout=layout, schedule=schedule)
