@@ -436,9 +436,7 @@ def _grouped_a8w4_tdm_moe(
             ep_rowmap=_ep_rowmap_for_route,
         )
     else:
-        _masked_m, topids_to_rows, _ = flydsl_moe_topids_to_rows(
-            topk_ids, E, max_m
-        )
+        _masked_m, topids_to_rows, _ = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
     # EP gemm2-fused scatter: the ep_rowmap was allocated and sentinel-filled
     # during routing; build the scatter params dict for contiguous_psum_remap.
     ep_scatter_params = None
@@ -978,15 +976,11 @@ def grouped_gemm_gfx1250_a8w4(
 
     if _is_ep:
         if local_expert_hash is None:
-            _grouped_dbg(
-                "local_expert_hash missing; deriving it from expert_mask"
-            )
+            _grouped_dbg("local_expert_hash missing; deriving it from expert_mask")
             mask = expert_mask.reshape(-1).to(
                 device=hidden_states.device, dtype=torch.bool
             )
-            local_expert_hash = torch.cumsum(
-                mask, dim=0, dtype=torch.int32
-            ) - 1
+            local_expert_hash = torch.cumsum(mask, dim=0, dtype=torch.int32) - 1
             local_expert_hash.masked_fill_(~mask, -1)
         if local_expert_hash.device != hidden_states.device:
             raise ValueError("local_expert_hash must be on the input device")

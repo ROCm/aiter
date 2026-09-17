@@ -2526,9 +2526,7 @@ def flydsl_moe_topids_to_rows(
     # The route kernel computes the dynamic EP route bound so the host does not
     # launch an ATen elementwise multiply. Same-stream consumers can reuse the
     # written scalar without synchronization.
-    compute_num_valid_routes = (
-        num_valid_routes is None and num_local_tokens is not None
-    )
+    compute_num_valid_routes = num_valid_routes is None and num_local_tokens is not None
     if num_valid_routes is not None:
         num_valid_routes = num_valid_routes.reshape(-1)[:1].to(
             device=device, dtype=torch.int32
