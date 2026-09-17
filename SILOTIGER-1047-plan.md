@@ -390,9 +390,9 @@ Times are **not** a win claim (2h). ``H=8`` is 2f; long-`L` is 2g.
 | m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
 | 1 | 512 | 128 | 2.0 | 13.1 | 13.2 | 0 |
-| 8 | 512 | 128 | 3.0 | 15.7 | 15.7 | 0 |
-| 1 | 2048 | 512 | 2.0 | 10.3 | 10.3 | 0 |
-| 8 | 2048 | 512 | 3.0 | 11.4 | 11.4 | 0 |
+| 8 | 512 | 128 | 3.0 | 15.8 | 15.7 | 0 |
+| 1 | 2048 | 512 | 2.0 | 10.2 | 10.4 | 0 |
+| 8 | 2048 | 512 | 3.0 | 11.4 | 11.5 | 0 |
 
 - [x] **2f.** Family B ``H=8`` is a **second compile**, same emit path as 2e
       (``n_blocks <= 512``), oracle set equality; `us` vs #4882 Triton and
@@ -404,10 +404,10 @@ GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Set equality `err=0`.
 
 | m | seq_len | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|---------:|-------------:|----------------------:|---------------------:|--------------:|
-| 1 | 512 | 128 | 1.5 | 11.0 | 10.3 | 0 |
-| 8 | 512 | 128 | 2.4 | 13.7 | 12.9 | 0 |
-| 1 | 2048 | 512 | 1.5 | 8.9 | 8.2 | 0 |
-| 8 | 2048 | 512 | 2.4 | 9.8 | 9.1 | 0 |
+| 1 | 512 | 128 | 2.0 | 13.8 | 13.2 | 0 |
+| 8 | 512 | 128 | 2.8 | 16.2 | 15.5 | 0 |
+| 1 | 2048 | 512 | 2.0 | 11.0 | 10.3 | 0 |
+| 8 | 2048 | 512 | 2.9 | 12.1 | 11.4 | 0 |
 
 - [x] **2g.** Long-`L` merge in the same family B kernel: 512-slot tiles,
       running top-512 in LDS, no `[M, n_blocks]` score buffer. Oracle set
@@ -446,7 +446,7 @@ maps ``pages=512`` to 512 compressed keys packed at ``page_size=8``
 
 | m | seq_len | page_size | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|----------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
-| 32 | 2048 | 8 | 4 | 512 | 2.3 | 9.7 | 9.6 | 0 |
+| 32 | 2048 | 8 | 4 | 512 | 2.9 | 12.1 | 11.9 | 0 |
 - [x] Family A may materialize `[rows, n_blocks]` FP32 scores for long rows;
       short rows retain fused emit. Family B remains fused.
 - [ ] gfx942 and gfx950.
