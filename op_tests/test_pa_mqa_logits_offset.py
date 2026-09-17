@@ -34,6 +34,7 @@ import torch
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     enable_jit_gluon_pa_mqa_logits_kernel,
@@ -265,17 +266,31 @@ def test_paged_mqa_logits_non_preshuffle(
     get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
     reason="Requires the CDNA Gluon JIT paged MQA kernel",
 )
-@pytest.mark.parametrize("block_size", [1, 64])
+@pytest.mark.parametrize(
+    "layout,block_size",
+    [
+        pytest.param("plain", 1, id="plain-B1"),
+        pytest.param("plain", 64, id="plain-B64"),
+        # Preshuffle splits on ChunkKPerStage % KVBlockSize: B64 loads a page
+        # index per lane, B256 keeps one page per stage.
+        pytest.param("preshuffle", 64, id="preshuffle-B64"),
+        pytest.param("preshuffle", 256, id="preshuffle-B256"),
+    ],
+)
 @pytest.mark.parametrize("boundary_bits", [31, 32, 33], ids=["2GiB", "4GiB", "8GiB"])
 @torch.inference_mode()
 def test_paged_mqa_logits_large_kv_offsets(
+    layout: str,
     block_size: int,
     boundary_bits: int,
 ) -> None:
     """Cross buffer bounds and K/FP32-scale offset overflow with a small batch."""
+    preshuffle = layout != "plain"
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(5614)
     heads, hidden_dim = 32, 128
+    # Unaligned lengths with an output width equal to the longest context: the
+    # tail of row 0 must not reach into row 1.
     context_lengths = (3001, 513)
     batch, max_context = len(context_lengths), max(context_lengths)
     block_bytes = block_size * (hidden_dim + 4)
@@ -310,7 +325,8 @@ def test_paged_mqa_logits_large_kv_offsets(
         len(physical_pages), block_bytes, dtype=torch.uint8, device=device
     )
     value_bytes = block_size * hidden_dim
-    compact[:, :value_bytes] = kv.view(len(physical_pages), -1).view(torch.uint8)
+    values = shuffle_weight(kv) if preshuffle else kv
+    compact[:, :value_bytes] = values.reshape(len(physical_pages), -1).view(torch.uint8)
     compact[:, value_bytes:] = scales.view(torch.uint8)
     # Only four pages are referenced. Place them around the address boundary
     # without constructing a multi-GiB FP32 reference or initializing other pages.
@@ -334,7 +350,7 @@ def test_paged_mqa_logits_large_kv_offsets(
         context_lens,
         block_tables,
         max_context,
-        Preshuffle=False,
+        Preshuffle=preshuffle,
         KVBlockSize=block_size,
         # More than ten chunks force both the initial loads and loop prefetch.
         TotalCuCount=1,
