@@ -51,6 +51,12 @@ new directory. `perf.csv` contains individual times and their arithmetic mean;
 `summary.json` also preserves correctness verdicts, and `results.json` preserves
 all accepted native result fields. Native logs and JSON for **all** attempts,
 including incomplete ones, are retained alongside `attempts.json`.
+Native stdout/stderr is also streamed to the terminal while each attempt runs.
+Each repeat prints its elapsed kernel time, TFLOPS, correctness verdict and raw
+GPU event count as soon as it finishes. After all cases finish, the terminal
+prints a Markdown summary table with each accepted repeat's time, the arithmetic
+mean and correctness counts. Incomplete attempts are marked as excluded from
+this final table.
 
 A formal call should produce 100 raw GEMM events. If the profiler returns fewer,
 the reproduction test retries the entire six-call group in a fresh process, up
