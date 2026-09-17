@@ -106,6 +106,8 @@ class HipblasltPublic:
         self.name = self._gemm.solution_name
         self.kernel_name = self._gemm.kernel_name
         self.workspace_size = self._gemm.workspace_size
+        self.scale_a_mode = self._gemm.scale_a_mode
+        self.scale_b_mode = self._gemm.scale_b_mode
 
     def run(
         self,

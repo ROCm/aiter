@@ -54,6 +54,20 @@ class PublicGemm
             operation_, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
         CHECK_LT(hipblasLtMatmulDescSetAttribute(
             operation_, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+        CHECK_LT(hipblasLtMatmulDescGetAttribute(operation_,
+                                                 HIPBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                                                 &scale_a_mode_,
+                                                 sizeof(scale_a_mode_),
+                                                 nullptr));
+        CHECK_LT(hipblasLtMatmulDescGetAttribute(operation_,
+                                                 HIPBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                                                 &scale_b_mode_,
+                                                 sizeof(scale_b_mode_),
+                                                 nullptr));
+        if(scale_a_mode_ != scale_mode || scale_b_mode_ != scale_mode)
+        {
+            throw std::runtime_error("hipBLASLt did not retain block-32 scale modes");
+        }
 
         CHECK_LT(hipblasLtMatmulPreferenceCreate(&preference_));
         constexpr std::uint64_t kMaxWorkspaceSize = 128ULL * 1024 * 1024;
@@ -118,6 +132,8 @@ class PublicGemm
     const std::string& solution_name() const { return solution_name_; }
     const std::string& kernel_name() const { return kernel_name_; }
     std::size_t workspace_size() const { return heuristic_.workspaceSize; }
+    int scale_a_mode() const { return static_cast<int>(scale_a_mode_); }
+    int scale_b_mode() const { return static_cast<int>(scale_b_mode_); }
 
     void Launch(std::uintptr_t a,
                 std::uintptr_t b,
@@ -169,6 +185,8 @@ class PublicGemm
     hipblasLtMatmulDesc_t operation_        = nullptr;
     hipblasLtMatmulPreference_t preference_ = nullptr;
     hipblasLtMatmulHeuristicResult_t heuristic_{};
+    hipblasLtMatmulMatrixScale_t scale_a_mode_ = HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    hipblasLtMatmulMatrixScale_t scale_b_mode_ = HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
 };
 
 } // namespace
@@ -181,5 +199,7 @@ PYBIND11_MODULE(hipblaslt_public_bridge, module)
         .def_property_readonly("solution_name", &PublicGemm::solution_name)
         .def_property_readonly("kernel_name", &PublicGemm::kernel_name)
         .def_property_readonly("workspace_size", &PublicGemm::workspace_size)
+        .def_property_readonly("scale_a_mode", &PublicGemm::scale_a_mode)
+        .def_property_readonly("scale_b_mode", &PublicGemm::scale_b_mode)
         .def("launch", &PublicGemm::Launch);
 }

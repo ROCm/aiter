@@ -61,12 +61,12 @@ entry per shape with 203 calls per entry.
 
 | N | K | YAML `ExactLogic` index | Native profile index | Match | FlyDSL B (us) | Rebuilt hipBLASLt (us) |
 |---:|---:|---:|---:|:---:|---:|---:|
-| 6144 | 7168 | 0 | 0 | yes | 14.057 | 15.531 |
-| 7168 | 3072 | 1 | 1 | yes | 8.276 | 8.808 |
-| 7168 | 16384 | 2 | 2 | yes | 24.662 | 29.071 |
-| 65536 | 1536 | 3 | 3 | yes | 21.707 | 22.136 |
-| 2048 | 7168 | 4 | 4 | yes | 9.416 | 10.982 |
-| 8192 | 1536 | 5 | 5 | yes | 5.471 | 5.801 |
+| 6144 | 7168 | 0 | 0 | yes | 14.652 | 15.419 |
+| 7168 | 3072 | 1 | 1 | yes | 7.896 | 8.797 |
+| 7168 | 16384 | 2 | 2 | yes | 24.591 | 29.136 |
+| 65536 | 1536 | 3 | 3 | yes | 21.768 | 21.938 |
+| 2048 | 7168 | 4 | 4 | yes | 8.923 | 10.991 |
+| 8192 | 1536 | 5 | 5 | yes | 5.634 | 5.871 |
 
 The compact profile check is in
 [the native profile CSV](hipblaslt_tuning/rebuilt_public_profile_check.csv).
@@ -75,6 +75,14 @@ The full solution name reported through the public API also equals
 the rebuilt public API used all six entries from the merged config. The clean
 timings above remain the primary performance result; this logged run is an
 independent selection check.
+
+The profile logger's `scaleA: 0, scaleB: 0` fields are incorrect for this MX
+case. That logger derives the fields from the legacy `useScaleAB` string, which
+is empty for block scaling. The matmul descriptor itself reads back
+`HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0` for both inputs. Its public API enum
+value is `2`; the equivalent `hipblaslt-bench` argument value is
+`--scaleA 3 --scaleB 3`. hipBLASLt maps API value `2` to its internal
+`Block_32_UE8M0` value `3` before constructing the Tensile problem.
 
 ## Why tuning did not broadly improve performance
 

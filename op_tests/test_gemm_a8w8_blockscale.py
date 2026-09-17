@@ -285,6 +285,7 @@ def test_gemm(
         public = HipblasltPublic(hipblaslt_public_bridge, m, n, k)
         print(
             f"hipBLASLt public heuristic: index={public.index} "
+            f"scale_mode_api=({public.scale_a_mode},{public.scale_b_mode}) "
             f"solution={public.name}",
             flush=True,
         )
@@ -306,6 +307,8 @@ def test_gemm(
             expected_public = public_result.clone()
             ret["hipblaslt public index"] = public.index
             ret["hipblaslt public solution"] = public.name
+            ret["hipblaslt public scale A mode"] = public.scale_a_mode
+            ret["hipblaslt public scale B mode"] = public.scale_b_mode
             ret["hipblaslt public err"] = checkAllclose(
                 a,
                 public_result,
