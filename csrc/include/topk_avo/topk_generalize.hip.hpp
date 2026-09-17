@@ -137,9 +137,10 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 
     const int G        = gridDim.x;
     const int bid      = blockIdx.x;
-    const int chunk_n4 = (n4_per_row + G - 1) / G;
+    const int n4       = RAGGED ? n4_cover(len) : n4_per_row;
+    const int chunk_n4 = (n4 + G - 1) / G;
     const int i0       = bid * chunk_n4;
-    const int i1       = min(i0 + chunk_n4, n4_per_row);
+    const int i1       = min(i0 + chunk_n4, n4);
     const int stride   = blockDim.x;
     const int iters    = (i1 > i0) ? ((i1 - i0) + stride - 1) / stride : 0;
 
