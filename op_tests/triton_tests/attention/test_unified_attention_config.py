@@ -69,46 +69,64 @@ def _matched_key(params):
 # Parametrizing over both dtypes keeps the advertised dtype-agnostic
 # prefill behavior covered: a future fp8-only narrowing of the composites
 # would flip the fp8 rows and fail here.
+# (head_size, max_seqlen_q, sliding_window, q_dtype, kv_dtype,
+#  expected_key, expected_block_m)
 _DT_CASES = [
-    # (head_size, max_seqlen_q, q_dtype, kv_dtype, expected_key, expected_block_m)
     # full-attention large prefill (Gemma-4 full attn, head 512)
-    (512, 16384, torch.bfloat16, torch.bfloat16, "D_GEQ_512.Q_GEQ_256", 128),
-    (512, 16384, e4m3_dtype, e4m3_dtype, "D_GEQ_512.Q_GEQ_256", 128),
-    # sliding-window large prefill (Gemma-4 sliding, head 256)
-    (256, 16384, torch.bfloat16, torch.bfloat16, "D_GEQ_256.Q_GEQ_256", 128),
-    (256, 16384, e4m3_dtype, e4m3_dtype, "D_GEQ_256.Q_GEQ_256", 128),
+    (512, 16384, 0, torch.bfloat16, torch.bfloat16, "D_GEQ_512.Q_GEQ_256", 128),
+    (512, 16384, 0, e4m3_dtype, e4m3_dtype, "D_GEQ_512.Q_GEQ_256", 128),
+    # sliding-window large prefill (Gemma-4 sliding, head 256). The gfx942
+    # attn_2d table has no SW axis, so full and sliding prefill resolve through
+    # the same composite entry; SW is passed exactly as the wrapper passes it
+    # so the rows match the real call shape and stay correct if a SW-scoped
+    # entry is ever added.
+    (256, 16384, 1024, torch.bfloat16, torch.bfloat16, "D_GEQ_256.Q_GEQ_256", 128),
+    (256, 16384, 1024, e4m3_dtype, e4m3_dtype, "D_GEQ_256.Q_GEQ_256", 128),
     # decode controls: the Q_LEQ_1 keys must still win at q=1
-    (512, 1, torch.bfloat16, torch.bfloat16, "D_GEQ_512.Q_LEQ_1", 16),
-    (512, 1, e4m3_dtype, e4m3_dtype, "D_GEQ_512.Q_LEQ_1.DT_fp8_fp8", 16),
-    (256, 1, torch.bfloat16, torch.bfloat16, "D_GEQ_256.Q_LEQ_1", 16),
-    (256, 1, e4m3_dtype, e4m3_dtype, "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8", 16),
+    (512, 1, 0, torch.bfloat16, torch.bfloat16, "D_GEQ_512.Q_LEQ_1", 16),
+    (512, 1, 0, e4m3_dtype, e4m3_dtype, "D_GEQ_512.Q_LEQ_1.DT_fp8_fp8", 16),
+    (256, 1, 0, torch.bfloat16, torch.bfloat16, "D_GEQ_256.Q_LEQ_1", 16),
+    (256, 1, 0, e4m3_dtype, e4m3_dtype, "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8", 16),
     # small-head control: standalone Q_GEQ_256 still serves head<=128 prefill
-    (128, 16384, torch.bfloat16, torch.bfloat16, "Q_GEQ_256", 128),
-    (128, 16384, e4m3_dtype, e4m3_dtype, "Q_GEQ_256", 128),
+    (128, 16384, 0, torch.bfloat16, torch.bfloat16, "Q_GEQ_256", 128),
+    (128, 16384, 0, e4m3_dtype, e4m3_dtype, "Q_GEQ_256", 128),
     # Q boundary: the composite keys bind at exactly Q>=256. Just below the
     # threshold the pre-existing D-only (bf16) and D+DT (fp8) entries still
     # serve the call at BLOCK_M=16; asserting both sides of 255/256 pins the
     # threshold so a future re-tune cannot silently move it.
-    (512, 255, torch.bfloat16, torch.bfloat16, "D_GEQ_512", 16),
-    (512, 255, e4m3_dtype, e4m3_dtype, "D_GEQ_512.DT_fp8_fp8", 16),
-    (512, 256, torch.bfloat16, torch.bfloat16, "D_GEQ_512.Q_GEQ_256", 128),
-    (512, 256, e4m3_dtype, e4m3_dtype, "D_GEQ_512.Q_GEQ_256", 128),
-    (256, 255, torch.bfloat16, torch.bfloat16, "D_GEQ_256", 16),
-    (256, 255, e4m3_dtype, e4m3_dtype, "D_GEQ_256", 16),
-    (256, 256, torch.bfloat16, torch.bfloat16, "D_GEQ_256.Q_GEQ_256", 128),
-    (256, 256, e4m3_dtype, e4m3_dtype, "D_GEQ_256.Q_GEQ_256", 128),
+    (512, 255, 0, torch.bfloat16, torch.bfloat16, "D_GEQ_512", 16),
+    (512, 255, 0, e4m3_dtype, e4m3_dtype, "D_GEQ_512.DT_fp8_fp8", 16),
+    (512, 256, 0, torch.bfloat16, torch.bfloat16, "D_GEQ_512.Q_GEQ_256", 128),
+    (512, 256, 0, e4m3_dtype, e4m3_dtype, "D_GEQ_512.Q_GEQ_256", 128),
+    (256, 255, 0, torch.bfloat16, torch.bfloat16, "D_GEQ_256", 16),
+    (256, 255, 0, e4m3_dtype, e4m3_dtype, "D_GEQ_256", 16),
+    (256, 256, 0, torch.bfloat16, torch.bfloat16, "D_GEQ_256.Q_GEQ_256", 128),
+    (256, 256, 0, e4m3_dtype, e4m3_dtype, "D_GEQ_256.Q_GEQ_256", 128),
 ]
 
 
 @pytest.mark.parametrize(
-    "head_size, max_seqlen_q, q_dtype, kv_dtype, expected_key, expected_block_m",
+    "head_size, max_seqlen_q, sliding_window, q_dtype, kv_dtype, expected_key,"
+    " expected_block_m",
     _DT_CASES,
 )
 def test_gfx942_large_head_prefill_lookup(
-    head_size, max_seqlen_q, q_dtype, kv_dtype, expected_key, expected_block_m
+    head_size,
+    max_seqlen_q,
+    sliding_window,
+    q_dtype,
+    kv_dtype,
+    expected_key,
+    expected_block_m,
 ):
     key, config = _matched_key(
-        _Params(head_size, max_seqlen_q, q_dtype=q_dtype, kv_dtype=kv_dtype)
+        _Params(
+            head_size,
+            max_seqlen_q,
+            sliding_window=sliding_window,
+            dtype=q_dtype,
+            kv_dtype=kv_dtype,
+        )
     )
     assert key == expected_key, f"expected {expected_key}, matched {key}"
     assert (
