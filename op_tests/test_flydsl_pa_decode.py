@@ -97,6 +97,8 @@ class DecodeCase:
     wide_kv_addressing: bool | None = None
     expected_prefetch: bool | str | None = None
     expected_query_splits: int | None = None
+    compact_reduce: bool | None = None
+    check_work_hints: bool = False
 
 
 def _require_gpu():
@@ -290,6 +292,7 @@ def _make_inputs(case, planned=False):
             KV_COMPUTE_BLOCK // page,
             case.max_partitions,
             max_context_length=max(case.lengths),
+            query_length=ql,
         )
     plan = (
         plan_pa_decode(
@@ -298,7 +301,8 @@ def _make_inputs(case, planned=False):
             max_partitions=parts,
             workgroup_budget=case.workgroup_budget,
             sliding_window=case.sliding_window,
-            query_length=ql if case.sliding_window > 0 else 1,
+            query_length=ql,
+            total_context_length=sum(max(0, length) for length in case.lengths),
         )
         if planned
         else None
@@ -355,12 +359,25 @@ def _run_flydsl(*args, sliding_window=0, work_plan=None):
         plan_pa_decode(
             args[4],
             args[2].shape[1],
-            max_partitions=args[8],
             query_length=args[7],
             sliding_window=sliding_window,
             plan=work_plan,
         )
-        pa_decode(*args, sliding_window=sliding_window, work_plan=work_plan)
+        pa_decode(
+            *args[:8],
+            context_partition_size=args[9],
+            compute_type=args[10],
+            query_scale=args[11],
+            key_scale=args[12],
+            value_scale=args[13],
+            exp_sums=args[14],
+            max_logits=args[15],
+            temporary_output=args[16],
+            alibi_slopes=args[17],
+            sinks=args[18],
+            sliding_window=sliding_window,
+            work_plan=work_plan,
+        )
     return args[0]
 
 
@@ -435,8 +452,20 @@ def _assert_contracts(args, options):
             pa_decode(*args[:7], value, *args[8:], **options)
         with pytest.raises(error, match="query_length"):
             plan_pa_decode(args[4], args[2].shape[1], query_length=value)
+    with pytest.raises(ValueError, match="required without work_plan"):
+        pa_decode(*args[:8])
+    with pytest.raises(TypeError, match="work_plan must be a PADecodePlan"):
+        pa_decode(*args[:8], work_plan=object())
     plan = options["work_plan"]
     if plan is not None:
+        expected = args[0].clone()
+        for bound in (None, plan.max_partitions):
+            pa_decode(*args[:8], bound, *args[9:], **options)
+            torch.testing.assert_close(args[0], expected, atol=0, rtol=0)
+        with pytest.raises(ValueError, match="must match work_plan.max_partitions"):
+            pa_decode(
+                *args[:8], 1 if plan.max_partitions != 1 else 2, *args[9:], **options
+            )
         context, heads = args[4], args[2].shape[1]
         reuse = {
             "max_partitions": plan.max_partitions,
@@ -452,6 +481,17 @@ def _assert_contracts(args, options):
             ({"sliding_window": plan.sliding_window + 1}, "sliding_window"),
             ({"workgroup_budget": 1}, "workgroup_budget"),
         ]
+        counts = plan.num_partitions
+        plan_pa_decode(
+            context,
+            heads,
+            plan=plan,
+            sliding_window=plan.sliding_window,
+            query_length=plan.query_length,
+        )
+        assert torch.equal(counts, plan.reduce_info[:, 1])
+        with pytest.raises(ValueError, match="only used when creating"):
+            plan_pa_decode(context, heads, total_context_length=1, **reuse)
         if plan.sliding_window > 0:
             changes.append(({"query_length": plan.query_length + 1}, "query_length"))
         for change, message in changes:
@@ -472,6 +512,76 @@ def _assert_contracts(args, options):
             )
             with pytest.raises(ValueError, match="query_length"):
                 pa_decode(*args, **{**options, "work_plan": wrong_plan})
+
+
+def _assert_work_hint_policy(monkeypatch):
+    """Check host sizing and GPU coverage without allocating long KV caches."""
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda *_args, **_kwargs: type(
+                "Props", (), {"multi_processor_count": 256}
+            )(),
+        )
+        recommendations = [
+            (1, 200000, 4, None, 256),
+            (8, 200000, 4, None, 64),
+            (16, 200000, 4, None, 32),
+            (64, 100000, 4, None, 8),
+            (200, 200000, 2, None, 8),
+            (200, 200000, 3, None, 16),
+            (200, 200000, 4, None, 16),
+            (200, 200000, 4, 8, 8),
+            (200, 200000, 4, 5, 5),
+        ]
+        for blocks in (2, 16):
+            for batch, context, ql, clamp, expected in recommendations:
+                assert (
+                    get_recommended_splits(
+                        batch,
+                        1,
+                        blocks,
+                        clamp,
+                        max_context_length=context,
+                        query_length=ql,
+                    )
+                    == expected
+                )
+        configurations = [
+            ([200000] * 200, 4, None, 256, 0, 3200),
+            ([200000] + [1024] * 199, 4, None, 256, 0, 512),
+            ([100000] * 64, 4, None, 256, 0, 512),
+            ([200000], 4, None, 256, 0, 256),
+            ([200000] * 200, 1, None, 256, 0, 512),
+            ([200000] * 200, 4, 800, 256, 0, 800),
+            ([200000] * 200, 4, None, 8, 0, 1600),
+            ([200000] * 200, 4, None, 256, 1, 512),
+            ([200000] * 200, 4, None, 256, 257, 512),
+            ([200000] * 200, 4, None, 256, 65536, 1600),
+        ]
+        for lengths, ql, budget, limit, window, capacity in configurations:
+            context = torch.tensor(lengths, dtype=torch.int32)
+            plan = plan_pa_decode(
+                context,
+                1,
+                max_partitions=limit,
+                workgroup_budget=budget,
+                total_context_length=sum(lengths),
+                query_length=ql,
+                sliding_window=window,
+            )
+            assert plan.capacity == capacity
+            _assert_plan(plan, lengths)
+            counts = plan.num_partitions
+            updated = [0] * len(lengths)
+            updated[-1] = 200003
+            context.copy_(torch.tensor(updated, dtype=torch.int32))
+            plan_pa_decode(
+                context, 1, plan=plan, query_length=ql, sliding_window=window
+            )
+            _assert_plan(plan, updated)
+            assert torch.equal(counts, plan.reduce_info[:, 1])
 
 
 def _case(
@@ -655,6 +765,39 @@ CASES = [
 ]
 
 
+# Compact planned reduction: chunk boundaries, sinks, windows and both dtypes.
+for parts, heads, page, trans, sink, dtype, window in (
+    (65, 1, 16, False, None, BF16, 0),
+    (86, 2, 128, True, FP32, BF16, 0),
+    (128, 1, 128, True, BF16, BF16, 0),
+    (256, 2, 16, False, FP32, FP16, 0),
+    (256, 1, 128, True, FP32, BF16, 257),
+    (256, 1, 16, True, FP32, BF16, 1),
+):
+    CASES.append(
+        _case(
+            f"compact-{parts}-h{heads}-p{page}-w{window}",
+            (4, heads, 16, 128),
+            (page, trans, 1),
+            parts,
+            window,
+            sink,
+            dtype=dtype,
+            lengths=(0, 1, 3, 4, 257, 16387, 70003),
+            workgroup_budget=7 * heads * parts,
+            compact_reduce=True,
+        )
+    )
+CASES.extend(
+    [
+        _case("compact-auto", parts=256, lengths=(257,) * 64),
+        _case(
+            "work-hints", parts=256, lengths=(0, 1, 257, 4099), check_work_hints=True
+        ),
+    ]
+)
+
+
 @pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])
 @pytest.mark.parametrize("case", CASES)
 def test_pa_decode(case, planned, monkeypatch):
@@ -676,6 +819,23 @@ def test_pa_decode(case, planned, monkeypatch):
         )
         selected.append(kwargs)
         return compile_tile(**kwargs)
+
+    compile_reduce = module.compile_pa_decode_ps_reduce
+
+    def compile_reduce_checked(**kwargs):
+        num_cus = torch.cuda.get_device_properties(query.device).multi_processor_count
+        output_rows = len(case.lengths) * case.query_length * query.shape[1]
+        assert kwargs["compact_work_plan"] == (
+            planned
+            and case.head_dim == 128
+            and args[8] > 64
+            and output_rows >= 4 * num_cus
+        )
+        if planned and case.compact_reduce is not None:
+            kwargs["compact_work_plan"] = case.compact_reduce
+        return compile_reduce(**kwargs)
+
+    monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", compile_reduce_checked)
 
     def unexpected_reducer(*_args, **_kwargs):
         raise AssertionError("static NP=1 must not launch a reducer")
@@ -749,6 +909,8 @@ def test_pa_decode(case, planned, monkeypatch):
             query_length=case.query_length,
         )
         _assert_plan(extreme_plan, lengths)
+        if case.check_work_hints:
+            _assert_work_hint_policy(monkeypatch)
 
 
 @benchmark()

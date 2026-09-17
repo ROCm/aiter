@@ -71,6 +71,7 @@ def compile_pa_decode_ps_reduce(
     sink_dtype_str: str,
     use_sinks: bool,
     use_work_plan: bool = False,
+    compact_work_plan: bool = False,
 ):
     """Build the partitioned-softmax reduction used by ``pa_decode``.
 
@@ -111,7 +112,12 @@ def compile_pa_decode_ps_reduce(
     # two or eight independent wave pairs.  A pair covers the two 64-element
     # halves of the output vector, while its y-coordinate selects a disjoint
     # contiguous range of partitions.
-    use_parallel_lds = head_size == 128 and max_context_partition_num > warp_size
+    compact_work_plan = compact_work_plan and use_work_plan
+    use_parallel_lds = (
+        head_size == 128
+        and max_context_partition_num > warp_size
+        and not compact_work_plan
+    )
     parallel_groups = 1
     if use_parallel_lds:
         # Eight groups win from NP=128 onward on gfx950; two avoid excessive
@@ -587,64 +593,97 @@ def compile_pa_decode_ps_reduce(
                 global_exp_sum, one_f
             )
 
-            acc = zero_f
-            for chunk_idx in fx.range_constexpr(partitions_per_lane):
-                chunk_base = chunk_idx * warp_size
-                chunk_size = min(warp_size, max_context_partition_num - chunk_base)
-                if fx.const_expr(use_work_plan):
-                    # Initialize in the enclosing constexpr-loop scope so the
-                    # FlyDSL dynamic-if rewriter never observes a stale value
-                    # from a previous unrolled chunk.
-                    weight_local_i32 = zero_f.bitcast(fx.Int32)
-                    if fx.Int32(chunk_base) < c_part_num:
+            if fx.const_expr(compact_work_plan):
+                # The plan limit can be 256 even when most rows have only a
+                # few partitions. Keep the four lane-local weights in registers
+                # and iterate only the actual count, including zero-part rows.
+                weights = fx.Vector.from_elements(
+                    [
+                        (scaled_sums[i] / safe_global_exp_sum).bitcast(fx.Int32)
+                        for i in fx.range_constexpr(partitions_per_lane)
+                    ],
+                    dtype=fx.Int32,
+                )
+                for part_idx, state in fx.range(0, c_part_num, 1, init=[zero_f]):
+                    part_idx = fx.Int32(part_idx)
+                    weight_local_i32 = weights[part_idx // c_warp_size]
+                    weight_i32 = fx.Int32(
+                        fx.rocdl.ds_bpermute(
+                            T.i32,
+                            (part_idx & c_wave_mask) * c_four,
+                            weight_local_i32,
+                        )
+                    )
+                    weight = weight_i32.bitcast(fx.Float32)
+                    logits_offset = (
+                        logits_seq_offset
+                        + kv_head_idx * stride_logits_head
+                        + part_idx * stride_logits_part
+                        + eqgs_idx * stride_logits_group
+                        + tid
+                    )
+                    part_logits = fx.Float32(logits[logits_offset])
+                    reduced = yield [state[0] + part_logits * weight]
+                acc = fx.Float32(reduced)
+            else:
+                acc = zero_f
+                for chunk_idx in fx.range_constexpr(partitions_per_lane):
+                    chunk_base = chunk_idx * warp_size
+                    chunk_size = min(warp_size, max_context_partition_num - chunk_base)
+                    if fx.const_expr(use_work_plan):
+                        # Initialize in the enclosing constexpr-loop scope so the
+                        # FlyDSL dynamic-if rewriter never observes a stale value
+                        # from a previous unrolled chunk.
+                        weight_local_i32 = zero_f.bitcast(fx.Int32)
+                        if fx.Int32(chunk_base) < c_part_num:
+                            weight_local_i32 = (
+                                scaled_sums[chunk_idx] / safe_global_exp_sum
+                            ).bitcast(fx.Int32)
+                            for part_lane in fx.range_constexpr(chunk_size):
+                                part_idx = chunk_base + part_lane
+                                c_part_idx = fx.Int32(part_idx)
+                                if c_part_idx < c_part_num:
+                                    weight_i32 = fx.Int32(
+                                        fx.rocdl.ds_bpermute(
+                                            T.i32,
+                                            fx.Int32(part_lane) * c_four,
+                                            weight_local_i32,
+                                        )
+                                    )
+                                    weight = weight_i32.bitcast(fx.Float32)
+                                    logits_offset = (
+                                        logits_seq_offset
+                                        + kv_head_idx * stride_logits_head
+                                        + c_part_idx * stride_logits_part
+                                        + eqgs_idx * stride_logits_group
+                                        + tid
+                                    )
+                                    part_logits = fx.Float32(logits[logits_offset])
+                                    acc = acc + part_logits * weight
+                    else:
                         weight_local_i32 = (
                             scaled_sums[chunk_idx] / safe_global_exp_sum
                         ).bitcast(fx.Int32)
                         for part_lane in fx.range_constexpr(chunk_size):
                             part_idx = chunk_base + part_lane
                             c_part_idx = fx.Int32(part_idx)
-                            if c_part_idx < c_part_num:
-                                weight_i32 = fx.Int32(
-                                    fx.rocdl.ds_bpermute(
-                                        T.i32,
-                                        fx.Int32(part_lane) * c_four,
-                                        weight_local_i32,
-                                    )
+                            weight_i32 = fx.Int32(
+                                fx.rocdl.ds_bpermute(
+                                    T.i32,
+                                    fx.Int32(part_lane) * c_four,
+                                    weight_local_i32,
                                 )
-                                weight = weight_i32.bitcast(fx.Float32)
-                                logits_offset = (
-                                    logits_seq_offset
-                                    + kv_head_idx * stride_logits_head
-                                    + c_part_idx * stride_logits_part
-                                    + eqgs_idx * stride_logits_group
-                                    + tid
-                                )
-                                part_logits = fx.Float32(logits[logits_offset])
-                                acc = acc + part_logits * weight
-                else:
-                    weight_local_i32 = (
-                        scaled_sums[chunk_idx] / safe_global_exp_sum
-                    ).bitcast(fx.Int32)
-                    for part_lane in fx.range_constexpr(chunk_size):
-                        part_idx = chunk_base + part_lane
-                        c_part_idx = fx.Int32(part_idx)
-                        weight_i32 = fx.Int32(
-                            fx.rocdl.ds_bpermute(
-                                T.i32,
-                                fx.Int32(part_lane) * c_four,
-                                weight_local_i32,
                             )
-                        )
-                        weight = weight_i32.bitcast(fx.Float32)
-                        logits_offset = (
-                            logits_seq_offset
-                            + kv_head_idx * stride_logits_head
-                            + c_part_idx * stride_logits_part
-                            + eqgs_idx * stride_logits_group
-                            + tid
-                        )
-                        part_logits = fx.Float32(logits[logits_offset])
-                        acc = acc + part_logits * weight
+                            weight = weight_i32.bitcast(fx.Float32)
+                            logits_offset = (
+                                logits_seq_offset
+                                + kv_head_idx * stride_logits_head
+                                + c_part_idx * stride_logits_part
+                                + eqgs_idx * stride_logits_group
+                                + tid
+                            )
+                            part_logits = fx.Float32(logits[logits_offset])
+                            acc = acc + part_logits * weight
 
         query_idx = eqgs_idx // c_qgs
         if fx.const_expr(use_parallel_lds):

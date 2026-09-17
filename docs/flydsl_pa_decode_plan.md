@@ -32,6 +32,22 @@ toward the allocation: from `max(0, C - (Q - 1) - W) // 256` through
 attention kernel applies the exact per-query mask within those tiles; it does
 not load the skipped prefix tiles.
 
+The default budget is two workgroups per compute unit. For long MTP workloads,
+pass the scheduler's host-known `total_context_length` and `query_length` when
+creating a plan. The budget then also accounts for sequential work: it targets
+about 256 query/compute-tile pairs per partition, rounded to a power of two.
+For B200/C200000/MTP4/Hkv1 on a 256-CU GPU, this selects capacity 3200 and 16
+partitions per request. A single long request among short requests does not
+inflate the budget as if every request were long. An explicit `workgroup_budget`
+takes precedence, and `max_partitions` still clamps each request's count.
+
+These optional hints size buffers once; they do not replace GPU lengths or
+perform a GPU-to-CPU copy. Without a total-length hint, or for single-query
+decode, the default budget retains its previous policy.
+
+For a windowed plan, the work hint is capped by the query-window union,
+including a possible partial tile at its left edge.
+
 The planner writes two contiguous int32 CUDA tensors:
 
 - `work_info[capacity, 4]`: request index, absolute first tile, exclusive absolute
@@ -49,6 +65,14 @@ Planned scratch is packed as `[num_kv_heads, capacity, query_rows]` for max/sum 
 `[num_kv_heads, capacity, query_rows, head_dim]` for partial outputs, where
 `query_rows = query_length * num_query_heads // num_kv_heads`.
 The static API continues to use its dense per-request scratch layout.
+
+The plan owns both kinds of partition information: `plan.num_partitions` is a
+GPU tensor view with each request's actual count, while `plan.max_partitions`
+is the host-side upper bound used to compile the attention and reduction
+kernels. Planned calls to `pa_decode` infer that bound from `work_plan`; callers
+do not need to pass `max_context_partition_num`. Existing calls that explicitly
+pass a matching bound remain supported. Static calls still require an explicit
+partition count.
 
 ## Attention sinks
 
@@ -82,10 +106,15 @@ from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 # query/output: [batch * query_length, num_query_heads, head_dim]
 # K/V cache layouts and scales are the same as for static pa_decode.
 num_kv_heads = key_cache.shape[1]
-sliding_window = 4096  # Use 0 (the default) or -1 for full causal attention.
+sliding_window = 4096  # Use 0 or -1 for full causal attention.
 plan = plan_pa_decode(
-    context_lengths, num_kv_heads, max_partitions=256,
-    sliding_window=sliding_window, query_length=query_length,
+    context_lengths,
+    num_kv_heads,
+    # Optional: use a total already known by the CPU request scheduler.
+    # Omit this hint if only the GPU knows the context lengths.
+    total_context_length=host_total_kv_tokens,
+    query_length=query_length,
+    sliding_window=sliding_window,
 )
 rows = query_length * query.shape[1] // num_kv_heads
 shape = (num_kv_heads, plan.capacity, rows)
@@ -98,12 +127,12 @@ sinks = torch.zeros(query.shape[1], dtype=torch.float32, device=query.device)
 def step():
     # Refresh after changing lengths, on the same stream as attention.
     plan_pa_decode(
-        context_lengths, num_kv_heads, max_partitions=256, plan=plan,
+        context_lengths, num_kv_heads, plan=plan,
         sliding_window=sliding_window, query_length=query_length,
     )
     pa_decode(
         output, query, key_cache, value_cache, context_lengths, block_tables,
-        softmax_scale, query_length, plan.max_partitions,
+        softmax_scale, query_length,
         compute_type=key_cache.dtype,
         key_scale=key_scale, value_scale=value_scale,
         exp_sums=exp_sums, max_logits=max_logits, temporary_output=partials,
@@ -115,9 +144,24 @@ graph = torch.cuda.CUDAGraph()
 with torch.cuda.graph(graph):
     step()
 # Update existing input buffers, then graph.replay().
+
+# Optional diagnostics: this is a live GPU view, with no host readback.
+counts = plan.num_partitions
 ```
 
+New plans default to a partition upper bound of 256. To impose a smaller bound,
+pass `max_partitions` when creating the plan. Refreshing with `plan=plan`
+inherits that bound, so it does not need to be repeated. An explicitly supplied
+bound must match the reused plan. Actual counts continue to be computed on the
+GPU from the current context lengths; reading them on the CPU is unnecessary
+for attention or graph replay.
+
 Reuse an already built plan without refreshing only when lengths are unchanged.
+Reuse its buffers and refresh the metadata when lengths change, even if no new
+256-token tile is needed: each task also stores its exact causal context length.
+The total-length hint is only accepted at creation; the capacity remains fixed
+on refresh. If the workload grows substantially, a new capacity can improve
+performance, while the existing capacity remains correct.
 Changing batch size, KV-head count, the partition limit or launch capacity requires
 a compatible new plan and scratch buffers. A plan's window is fixed, as is its
 query length when the window is enabled; changing either requires a new plan.
@@ -132,7 +176,40 @@ satisfy the same validity requirements as static attention.
 
 ```bash
 python -m pytest -q op_tests/test_flydsl_pa_decode.py
+python -m op_tests.benchmark_flydsl_pa_decode_plan --output plan_results.json
+
+# B200/C200000/MTP4, single TP rank: Hq16/Hkv1/D128.
+HIP_VISIBLE_DEVICES=7 python -m op_tests.benchmark_flydsl_pa_decode_plan \
+    --cases b200_uniform --block-size 16 128 --trans-v 0 1 \
+    --num-iters 51 --num-warmup 5 --num-rotate-args 3 \
+    --output b200_results.json
 ```
+
+The benchmark uses the repository timer with allocation rotation on identical
+inputs, checks the planned output against a causal FP32 reference, and reports
+static, plan-per-call, reused-plan and standalone-plan timings separately. Static
+selection uses the host-known maximum length and query length. Plan creation
+uses the host-known sum of lengths and query length. All timed plan refreshes
+reuse the allocated buffers.
+
+`--num-partitions` overrides the static partition count exactly;
+`--workgroup-budget` controls the plan's total CTA budget; `--max-partitions`
+controls the plan's per-request upper bound independently of static splits.
+`--num-iters`, `--num-warmup`, and `--num-rotate-args` expose the repository
+timer's settings. Zero allocation sets selects its automatic rotation policy.
+
+Each attention mode reports microseconds and effective bandwidth in decimal
+GB/s and TB/s. The byte count includes Q/O, valid K/V tokens and their scales,
+referenced page-table entries, and context lengths once per rank. It excludes
+padding, sparse holes, repeated loads, scratch and plan metadata. This measures
+logical bandwidth, not hardware-counter HBM traffic; KV bytes are not multiplied
+by MTP or TP. `plan_each_call` includes planner GPU time in the denominator.
+
+The uniform and one-long sweeps cover batches 1/2/4/8/16/200. Uniform contexts
+have 200000 tokens; the existing one-long cases use 200003 and 257. Other cases
+include B64 with equal 100000-token contexts, B32 one-long, a ramp, and short
+contexts. All use BF16 MTP4, Hq16/Hkv1/D128, per-token FP8 scales, page16/page128
+and both V layouts.
 
 Tests cover exact absolute-tile ownership, sparse pages, empty requests, causal tails,
 non-power-of-two partition caps, multiple KV heads, supported reducer branches,

@@ -40,7 +40,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
-from .kernels.pa_decode_plan import PADecodePlan
+from .kernels.pa_decode_plan import PADecodePlan, _work_granularity_partitions
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     MAX_CONTEXT_PARTITIONS,
@@ -56,6 +56,7 @@ def get_recommended_splits(
     max_partitions: int | None = None,
     *,
     max_context_length: int | None = None,
+    query_length: int = 1,
 ) -> int:
     """Choose a split count before allocating partition scratch buffers.
 
@@ -64,7 +65,9 @@ def get_recommended_splits(
     capped by the number of 256-token compute tiles and the reducer's limit.
     This lets small, long-context batches use more KV partitions without
     multiplying the partition count by the number of physical pages per tile.
-    Short contexts and already large grids retain the legacy recommendation.
+    For MTP, ``query_length`` also supplies a floor based on sequential work
+    per partition: long queries can need more CTAs than the occupancy target.
+    Short contexts and single-query large grids retain the legacy policy.
 
     An explicit ``max_partitions`` remains an upper clamp in either mode.
     The hint is a scheduling bound, not a replacement for the GPU-resident
@@ -73,6 +76,8 @@ def get_recommended_splits(
     count to ``pa_decode``. For heterogeneous lengths this still uses the same
     partition count per sequence; it is not a variable-work scheduler.
     """
+    if query_length < 1:
+        raise ValueError("query_length must be positive")
     if max_context_length is not None and max_context_length < 0:
         raise ValueError("max_context_length must be non-negative")
     if max_partitions is None:
@@ -96,6 +101,13 @@ def get_recommended_splits(
         sequence_heads = max(1, num_sequences * num_kv_heads)
         occupancy_limit = (num_sm + sequence_heads - 1) // sequence_heads
         n = max(legacy, min(work_limit, occupancy_limit))
+        n = max(
+            n,
+            min(
+                context_tiles,
+                _work_granularity_partitions(max_context_length, query_length),
+            ),
+        )
     return max(4, min(n, max_partitions))
 
 
@@ -141,6 +153,15 @@ def launch_pa_decode_ps_reduce(
             f"{MAX_CONTEXT_PARTITIONS} partitions"
         )
     use_sinks = sink_token is not None
+    compact_work_plan = False
+    if reduce_info is not None and head_size == 128 and context_partition_num > 64:
+        output_rows = (
+            output.shape[0] * output.shape[2] * query_seq_len * query_group_size
+        )
+        num_cus = torch.cuda.get_device_properties(output.device).multi_processor_count
+        # With many output rows there is enough grid parallelism to keep one
+        # output element per thread and walk only the row's actual partitions.
+        compact_work_plan = output_rows >= 4 * num_cus
     compiled = compile_pa_decode_ps_reduce(
         max_context_partition_num=context_partition_num,
         head_size=head_size,
@@ -151,6 +172,7 @@ def launch_pa_decode_ps_reduce(
         ),
         use_sinks=use_sinks,
         use_work_plan=reduce_info is not None,
+        compact_work_plan=compact_work_plan,
     )
     sink_ptr = (
         ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
@@ -197,7 +219,7 @@ def pa_decode(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_length: int,
-    max_context_partition_num: int,
+    max_context_partition_num: int | None = None,
     context_partition_size: int = 256,
     compute_type: torch.dtype = torch.bfloat16,
     query_scale: torch.Tensor = None,  # [num_seqs * query_length, num_query_heads, 1] or [1]
@@ -239,7 +261,10 @@ def pa_decode(
 
     ``work_plan`` opts into GPU-planned variable partition counts. Build or
     refresh it with ``plan_pa_decode`` on the current stream after updating
-    lengths. Its ``max_partitions`` must equal ``max_context_partition_num``.
+    lengths. With a plan, omit ``max_context_partition_num``: the plan supplies
+    the compilation bound and its GPU metadata supplies each request's actual
+    partition count. An explicitly supplied bound must match the plan.
+    Without a plan, ``max_context_partition_num`` is required.
     Its window must match ``sliding_window``, and a windowed plan must be built
     with the same ``query_length`` so it covers every MTP query's window.
     Planned scratch is packed as [KV heads, plan.capacity, query rows (, D)];
@@ -269,6 +294,17 @@ def pa_decode(
         raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
+    if work_plan is not None:
+        if not isinstance(work_plan, PADecodePlan):
+            raise TypeError("work_plan must be a PADecodePlan")
+        if max_context_partition_num is None:
+            max_context_partition_num = work_plan.max_partitions
+        elif max_context_partition_num != work_plan.max_partitions:
+            raise ValueError(
+                "max_context_partition_num must match work_plan.max_partitions"
+            )
+    elif max_context_partition_num is None:
+        raise ValueError("max_context_partition_num is required without work_plan")
     if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
         raise ValueError(
             f"max_context_partition_num must be in [1, {MAX_CONTEXT_PARTITIONS}], "
@@ -555,13 +591,7 @@ def pa_decode(
 
     num_partitions = max_context_partition_num
     if work_plan is not None:
-        if not isinstance(work_plan, PADecodePlan):
-            raise TypeError("work_plan must be a PADecodePlan")
         work_plan.validate(num_seqs, num_kv_heads, dev)
-        if work_plan.max_partitions != num_partitions:
-            raise ValueError(
-                "max_context_partition_num must match work_plan.max_partitions"
-            )
         if work_plan.sliding_window != sliding_window:
             raise ValueError("sliding_window must match work_plan.sliding_window")
         if sliding_window > 0 and work_plan.query_length != query_length:
