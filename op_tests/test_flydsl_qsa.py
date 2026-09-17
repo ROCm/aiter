@@ -643,7 +643,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype):
 def bench_qsa_family_a_k2(m, seq_len, page_size, dtype):
     """Family A FlyDSL K2 vs oracle GQA; us vs live AMD and #4882 Triton.
 
-    3d: tiled BLOCK_N MFMA QK/PV, 128-bit paged gather, one-wave merge.
+    3d: tiled MFMA QK/PV, register-prefetched paged gather, one-wave merge.
     Expand and sigmoid stay unfused.
     """
     idx = FAMILY_A_INDEXER
