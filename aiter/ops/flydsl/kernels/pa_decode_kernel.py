@@ -60,8 +60,14 @@ WAVE = 64
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
+# Cache only the selected specialization, not the batch/head/CU counts used
+# to choose it. Entries are published after both JIT wrappers are constructed.
+_PA_DECODE_TILE_CACHE = {}
 
 
+# Repeated calls bypass the builder's closure setup. Keep this metadata cache
+# bounded; the specialization cache below shares kernels across runtime sizes.
+@functools.lru_cache(maxsize=128)
 def compile_pa_decode_tile(
     *,
     head_dim: int,
@@ -83,107 +89,12 @@ def compile_pa_decode_tile(
     use_sinks: bool = False,
     sink_dtype_str: str = "f32",
 ):
-    """Select the schedule and return a cached kernel plus launch wrapper.
+    """Select the schedule and cache the PA-decode kernel + launch wrapper.
 
-    Batch/head/CU counts only select query splitting and V prefetching; the
-    builder caches the resulting specialization, not those runtime sizes.
+    Batch/head/CU counts select query splitting and V prefetching. Calls that
+    select the same specialization share one kernel and launch wrapper.
     ``query_splits=None`` selects automatically; an explicit count overrides
     splitting while retaining the matching prefetch policy.
-    """
-    gfx950_d128 = "gfx95" in get_rocm_arch() and head_dim == 128
-    tuned_per_token_shape = (
-        gfx950_d128
-        and per_token_kv
-        and query_dtype == "bf16"
-        and block_size in (16, 128)
-    )
-    # Keep the dense-grid estimate for planned execution too. The plan's
-    # capacity and active token windows do not change the scheduling policy.
-    dense_workgroups = num_seqs * num_kv_heads * num_partitions
-    assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
-    if query_splits is None:
-        # Small static MTP2/MTP4 grids use one query per CTA. MTP3 stays fused.
-        query_splits = (
-            query_length
-            if tuned_per_token_shape
-            and not use_work_plan
-            and num_kv_heads == 1
-            and query_length in (2, 4)
-            and query_group_size == 16
-            and query_length * dense_workgroups <= 2 * num_compute_units
-            else 1
-        )
-    assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
-    assert query_length % query_splits == 0, "query_splits must divide query_length"
-
-    # Split queries always prefetch. Unsplit decode supports Hkv1 and static
-    # Hkv2; transposed page128 keeps its lower-register schedule above one
-    # workgroup per CU. One query with GQA8/16 already implies one M-tile.
-    per_token_m1 = (
-        tuned_per_token_shape
-        and query_length == query_splits
-        and query_group_size in (8, 16)
-        and (
-            query_splits > 1
-            or (
-                (num_kv_heads == 1 or (not use_work_plan and num_kv_heads == 2))
-                and (
-                    block_size == 16
-                    or not trans_v
-                    or dense_workgroups <= num_compute_units
-                )
-            )
-        )
-    )
-    scalar_prefetch = (
-        gfx950_d128
-        and block_size == 128
-        and trans_v
-        and not per_token_kv
-        and query_length * query_group_size <= MFMA_MNK
-        and num_compute_units < dense_workgroups <= 2 * num_compute_units
-    )
-    return _compile_pa_decode_tile(
-        head_dim=head_dim,
-        query_group_size=query_group_size,
-        block_size=block_size,
-        num_partitions=num_partitions,
-        softmax_scale=softmax_scale,
-        query_dtype=query_dtype,
-        per_token_kv=per_token_kv,
-        query_length=query_length,
-        trans_v=trans_v,
-        wide_kv_addressing=wide_kv_addressing,
-        prefetch_v=per_token_m1 or scalar_prefetch,
-        query_splits=query_splits,
-        use_work_plan=use_work_plan,
-        sliding_window=sliding_window,
-        use_sinks=use_sinks,
-        sink_dtype_str=sink_dtype_str,
-    )
-
-
-@functools.cache
-def _compile_pa_decode_tile(
-    *,
-    head_dim: int,
-    query_group_size: int,
-    block_size: int,
-    num_partitions: int = 1,
-    softmax_scale: float | None = None,
-    query_dtype: str = "f16",
-    per_token_kv: bool = False,
-    query_length: int = 1,
-    trans_v: bool = True,
-    wide_kv_addressing: bool = False,
-    prefetch_v: bool = False,
-    query_splits: int = 1,
-    use_work_plan: bool = False,
-    sliding_window: int = 0,
-    use_sinks: bool = False,
-    sink_dtype_str: str = "f32",
-):
-    """Build the tile-programming PA-decode kernel + launch wrapper.
 
     ``block_size``, ``head_dim``, and ``query_dtype`` are compile-time
     constants. ``query_length`` (MTP) and ``query_group_size`` flatten into
@@ -214,6 +125,83 @@ def _compile_pa_decode_tile(
     neutral at ``block_size=16``. The wrapper turns it on from the cache size.
     """
     is_gfx950 = "gfx95" in get_rocm_arch()
+    IS_BF16 = query_dtype == "bf16"
+    TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
+    TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
+    # Scalar V scheduling also supports f16 and MTP; the numerical fast path
+    # below further restricts this gate to bf16 single-query decode.
+    TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
+
+    # Keep the dense-grid estimate for planned execution too. The plan's
+    # capacity and active token windows do not change the scheduling policy.
+    dense_workgroups = num_seqs * num_kv_heads * num_partitions
+    assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
+    if query_splits is None:
+        # Small static MTP2/MTP4 grids use one query per CTA. MTP3 stays fused.
+        query_splits = (
+            query_length
+            if TUNED_PER_TOKEN
+            and not use_work_plan
+            and num_kv_heads == 1
+            and query_length in (2, 4)
+            and query_group_size == 16
+            and query_length * dense_workgroups <= 2 * num_compute_units
+            else 1
+        )
+    assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
+    assert query_length % query_splits == 0, "query_splits must divide query_length"
+    QUERIES_PER_CTA = query_length // query_splits
+    TOTAL_ROWS = query_length * query_group_size
+
+    # Split queries always prefetch. Unsplit decode supports Hkv1 and static
+    # Hkv2; transposed page128 keeps its lower-register schedule above one
+    # workgroup per CU. One query with GQA8/16 already implies one M-tile.
+    PER_TOKEN_M1 = (
+        TUNED_PER_TOKEN
+        and QUERIES_PER_CTA == 1
+        and query_group_size in (8, 16)
+        and (
+            query_splits > 1
+            or (
+                (num_kv_heads == 1 or (not use_work_plan and num_kv_heads == 2))
+                and (
+                    block_size == 16
+                    or not trans_v
+                    or dense_workgroups <= num_compute_units
+                )
+            )
+        )
+    )
+    prefetch_v = PER_TOKEN_M1 or (
+        TUNED_SCALAR
+        and block_size == 128
+        and TOTAL_ROWS <= MFMA_MNK
+        and num_compute_units < dense_workgroups <= 2 * num_compute_units
+    )
+    # Normalize runtime scheduling metadata to the final specialization before
+    # looking up the cache, including explicit query-split overrides.
+    cache_key = (
+        head_dim,
+        query_group_size,
+        block_size,
+        num_partitions,
+        softmax_scale,
+        query_dtype,
+        per_token_kv,
+        query_length,
+        trans_v,
+        wide_kv_addressing,
+        prefetch_v,
+        query_splits,
+        use_work_plan,
+        sliding_window,
+        use_sinks,
+        sink_dtype_str,
+    )
+    cached = _PA_DECODE_TILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     # Context lengths are int32, so larger windows have identical visibility.
     # Bound the device constant while retaining the caller's value in the plan.
     sliding_window = min(sliding_window, 2**31 - 1)
@@ -234,40 +222,27 @@ def _compile_pa_decode_tile(
         "f16",
         "bf16",
     ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16'), got {query_dtype}"
-    Q_DTYPE = fx.BFloat16 if query_dtype == "bf16" else fx.Float16
+    Q_DTYPE = fx.BFloat16 if IS_BF16 else fx.Float16
 
     assert (
         head_dim % 64 == 0
     ), f"pa_decode_tile only supports head_dim that's a multiple of 64, got {head_dim}"
-    QUERIES_PER_CTA = query_length // query_splits
     # Flattened query-row axis (MTP outer, GQA head inner), tiled into 16-row M-tiles.
-    TOTAL_ROWS = query_length * query_group_size
     CTA_ROWS = QUERIES_PER_CTA * query_group_size
     M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
     ROWS_PADDED = M_TILES * MFMA_MNK
 
-    # Share the device/shape gate; scalar V scheduling also supports f16 and
-    # MTP, while the numerical and MFMA specializations below require bf16.
-    TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
-    TUNED_BF16 = TUNED_SHAPE and query_dtype == "bf16"
     # Fix the tuned scalar-scale shape to the direct-fp8 fast path. This
     # removes the numerical-policy switch, not the fp8 range/precision tradeoff
     # documented above. Per-token and other shapes keep normalized conversion.
     SCALAR_FP8_DECODE = (
-        TUNED_BF16
-        and trans_v
-        and not per_token_kv
-        and query_length == 1
-        and query_group_size in (8, 16)
+        TUNED_SCALAR and IS_BF16 and query_length == 1 and query_group_size in (8, 16)
     )
     # CDNA4 contracts four legacy fp8 K=32 groups in one K=128 instruction.
     # Concatenating the existing packs preserves cache/LDS layouts for fused
     # MTP3/MTP4 and query-split MTP4 CTAs.
     WIDE_FP8_MFMA = (
-        TUNED_BF16
-        and per_token_kv
-        and query_length in (3, 4)
-        and query_group_size == 16
+        TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
     )
     MFMA_K = 128 if WIDE_FP8_MFMA else FP8_PACK_K
     PACKS_PER_MFMA = MFMA_K // FP8_PACK_K
@@ -278,13 +253,9 @@ def _compile_pa_decode_tile(
     # register pressure: load plain V during P packing and transposed V after
     # P publication. Page-16 gathers and narrow addresses retain prefetching.
     MTP4_PREFETCH_V = MTP4_FUSED and (block_size == 16 or not wide_kv_addressing)
-    # The selector only enables prefetching for supported single-M-tile shapes.
-    PER_TOKEN_M1 = per_token_kv and prefetch_v
     # Page 16 additionally delays next K until PV and uses IGLP to overlap
     # groups of V loads with QK MFMA instructions.
-    TUNE_PAGE128 = block_size == 128 and (
-        PER_TOKEN_M1 or (TUNED_SHAPE and trans_v and not per_token_kv)
-    )
+    TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
     PAGE16_VPIPE = prefetch_v and block_size == 16
     # The selected page16 pipeline is always per-token as well.
     REUSE_KV_PAGES = PER_TOKEN_M1
@@ -2150,4 +2121,10 @@ def _compile_pa_decode_tile(
                 stream=stream,
             )
 
-    return {"launch": pa_decode_tile_launch, "kernel": pa_decode_tile_kernel}
+    compiled = {
+        "launch": pa_decode_tile_launch,
+        "kernel": pa_decode_tile_kernel,
+        "query_splits": query_splits,
+        "prefetch_v": prefetch_v,
+    }
+    return _PA_DECODE_TILE_CACHE.setdefault(cache_key, compiled)

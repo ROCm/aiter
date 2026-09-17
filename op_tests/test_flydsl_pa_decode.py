@@ -525,7 +525,7 @@ def _assert_schedule_cache(compile_tile, kwargs, selected):
         check(boundary - 1, (ql, True), query_splits=ql)
         check(boundary + 1, (1, False), query_splits=1)
 
-    # Runtime size/CU metadata must not fragment the private specialization cache.
+    # Runtime size/CU metadata must not fragment the kernel specialization cache.
     cus, expected = points[-1]
     changes = {"num_seqs": kwargs["num_seqs"] * 2}
     multiplier = 2
@@ -734,19 +734,18 @@ def test_pa_decode(case, planned, monkeypatch):
     output, query, _, _, context = args[:5]
     scratch, sinks, plan = args[14:17], args[-1], options["work_plan"]
     module = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    kernel_module = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
-    compile_tile = module.compile_pa_decode_tile
-    build_tile = kernel_module._compile_pa_decode_tile
+    build_tile = module.compile_pa_decode_tile
     num_compute_units = torch.cuda.get_device_properties(
         query.device
     ).multi_processor_count
     selected = []
     compile_args = None
 
-    def capture_build(**kwargs):
-        # Observe the final schedule before the real cache lookup, including hits.
-        selected.append(kwargs)
-        return build_tile(**kwargs)
+    def compile_tile(**kwargs):
+        # Observe the builder's actual schedule, including cached specializations.
+        compiled = build_tile(**kwargs)
+        selected.append(compiled)
+        return compiled
 
     def compile_checked(**kwargs):
         nonlocal compile_args
@@ -771,7 +770,6 @@ def test_pa_decode(case, planned, monkeypatch):
     def unexpected_reducer(*_args, **_kwargs):
         raise AssertionError("static NP=1 must not launch a reducer")
 
-    monkeypatch.setattr(kernel_module, "_compile_pa_decode_tile", capture_build)
     monkeypatch.setattr(module, "compile_pa_decode_tile", compile_checked)
     if not planned and args[8] == 1:
         monkeypatch.setattr(module, "launch_pa_decode_ps_reduce", unexpected_reducer)
