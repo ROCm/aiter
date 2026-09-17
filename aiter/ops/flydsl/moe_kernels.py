@@ -2489,6 +2489,7 @@ def flydsl_moe_topids_to_rows(
     counter: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     num_valid_routes: torch.Tensor | None = None,
+    ep_rowmap: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -2506,6 +2507,12 @@ def flydsl_moe_topids_to_rows(
 
     ``counter`` is the ``(E,)`` per-expert atomic slot counter. A pre-zeroed
     buffer may be passed to avoid allocating and zeroing one here.
+
+    ``ep_rowmap``, when provided, is initialized to the dropped-route sentinel.
+    The LDS g2l path fuses that initialization into its route kernel; fallback
+    paths initialize it with a separate fill.
+
+    Returns ``(counter, topids_to_rows, num_valid_routes)``.
 
     When ``expert_mask`` is given (instead of ``g2l_lut``), the single-block fused
     kernel builds the LUT in LDS and zeros the counter itself -- collapsing the
@@ -2543,6 +2550,8 @@ def flydsl_moe_topids_to_rows(
         # Fused single-block path: build LUT + zero counter + route in one kernel.
         assert gather_w is not None, "expert_mask fused path requires gather_w (out)"
         assert weight_in is not None, "expert_mask fused path requires weight_in (f32)"
+        if ep_rowmap is not None:
+            ep_rowmap.view(torch.int64).fill_(0xFFFFFFFF)
         wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
         counter = torch.empty(E, dtype=torch.int32, device=device)
         mask_i32 = expert_mask.to(torch.int32).reshape(-1)
@@ -2583,28 +2592,59 @@ def flydsl_moe_topids_to_rows(
             os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
+        # The g2l_lds kernel interleaves ep_rowmap sentinel stores with route
+        # work. The plain fallback initializes the same buffer before launch.
+        _ep_rowmap_ptr = (
+            ep_rowmap.reshape(-1)
+            if ep_rowmap is not None
+            else torch.empty(0, dtype=torch.int32, device=device)
+        )
+        _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
         if _use_lds_reduce:
             topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
+            topids_to_rows_kernel(
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(g2l_lut),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+                ptr_arg(gather_w.reshape(-1)),
+                ptr_arg(num_local_tokens),
+                ptr_arg(num_valid_routes),
+                int(compute_num_valid_routes),
+                int(topk),
+                numel,
+                int(max_m),
+                int(E),
+                route_grid,
+                ptr_arg(_ep_rowmap_ptr),
+                int(_ep_rowmap_cap),
+                stream=torch.cuda.current_stream(),
+            )
         else:
+            if ep_rowmap is not None:
+                ep_rowmap.view(torch.int64).fill_(0xFFFFFFFF)
             topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
-        topids_to_rows_kernel(
-            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-            ptr_arg(g2l_lut),
-            ptr_arg(counter),
-            ptr_arg(topids_to_rows),
-            ptr_arg(weight_in.to(torch.float32).reshape(-1)),
-            ptr_arg(gather_w.reshape(-1)),
-            ptr_arg(num_local_tokens),
-            ptr_arg(num_valid_routes),
-            int(compute_num_valid_routes),
-            int(topk),
-            numel,
-            int(max_m),
-            int(E),
-            route_grid,
-            stream=torch.cuda.current_stream(),
-        )
+            topids_to_rows_kernel(
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(g2l_lut),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+                ptr_arg(gather_w.reshape(-1)),
+                ptr_arg(num_local_tokens),
+                ptr_arg(num_valid_routes),
+                int(compute_num_valid_routes),
+                int(topk),
+                numel,
+                int(max_m),
+                int(E),
+                route_grid,
+                stream=torch.cuda.current_stream(),
+            )
     else:
+        if ep_rowmap is not None:
+            ep_rowmap.view(torch.int64).fill_(0xFFFFFFFF)
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
