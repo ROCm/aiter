@@ -25,12 +25,10 @@ from aiter.ops.triton._triton_kernels.rope.fused_qk_norm_rope_gate_fp8_quant imp
     v_token_amax_kernel,
 )
 
-MAX_QUERY_TOKENS = 8192
 MAX_SEQUENCES = 256
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 SCALE_BLOCK_T = 256
-SCALE_NUM_BLOCKS = MAX_QUERY_TOKENS // SCALE_BLOCK_T
 QK_TOKENS_PER_PROGRAM = 4
 
 
@@ -155,10 +153,6 @@ def fused_qk_norm_rope_gate_fp8_quant(
         raise ValueError(
             "fused_qk_norm_rope_gate_fp8_quant requires at least one "
             "prefill/extend token"
-        )
-    if total_tokens > MAX_QUERY_TOKENS:
-        raise ValueError(
-            f"at most {MAX_QUERY_TOKENS} padded query tokens are supported"
         )
     if num_sequences > MAX_SEQUENCES:
         raise ValueError(f"at most {MAX_SEQUENCES} sequences are supported")
@@ -343,8 +337,9 @@ def fused_qk_norm_rope_gate_fp8_quant(
         dtype=torch.float32,
         device=q_gate.device,
     )
+    scale_num_blocks = triton.cdiv(total_tokens, SCALE_BLOCK_T)
     partial_amax = torch.empty(
-        (MAX_SEQUENCES, num_kv_heads, SCALE_NUM_BLOCKS, 3),
+        (num_sequences, num_kv_heads, scale_num_blocks, 3),
         dtype=torch.float32,
         device=q_gate.device,
     )
@@ -410,7 +405,7 @@ def fused_qk_norm_rope_gate_fp8_quant(
 
     has_sequence_offset = quant_sequence_start != 0
     segmented_qkv_partial_amax_kernel[
-        (num_quant_sequences, num_kv_heads, SCALE_NUM_BLOCKS)
+        (num_quant_sequences, num_kv_heads, scale_num_blocks)
     ](
         query_token_amax,
         key_token_amax,
@@ -424,7 +419,7 @@ def fused_qk_norm_rope_gate_fp8_quant(
         num_kv_heads=num_kv_heads,
         gqa_ratio=gqa_ratio,
         BLOCK_T=SCALE_BLOCK_T,
-        NUM_BLOCKS=SCALE_NUM_BLOCKS,
+        NUM_BLOCKS=scale_num_blocks,
         HAS_SEQUENCE_OFFSET=has_sequence_offset,
         num_warps=4,
     )
@@ -436,8 +431,8 @@ def fused_qk_norm_rope_gate_fp8_quant(
         quant_sequence_start,
         num_kv_heads=num_kv_heads,
         FP8_MAX_VALUE=FP8_MAX,
-        NUM_BLOCKS=SCALE_NUM_BLOCKS,
-        BLOCK_B=triton.next_power_of_2(SCALE_NUM_BLOCKS),
+        NUM_BLOCKS=scale_num_blocks,
+        BLOCK_B=triton.next_power_of_2(scale_num_blocks),
         HAS_SEQUENCE_OFFSET=has_sequence_offset,
         num_warps=1,
     )

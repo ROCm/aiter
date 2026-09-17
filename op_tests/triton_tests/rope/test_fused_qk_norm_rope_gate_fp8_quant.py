@@ -168,7 +168,7 @@ def _make_inputs(lengths: list[int]):
     )
 
 
-@pytest.mark.parametrize("lengths", [[128], [5, 17, 108], [8192]])
+@pytest.mark.parametrize("lengths", [[128], [5, 17, 108], [8193]])
 @pytest.mark.parametrize("preallocate_outputs", [False, True])
 @requires_gfx950
 def test_fused_qk_norm_rope_gate_fp8_quant(lengths, preallocate_outputs):
@@ -232,17 +232,17 @@ def test_fused_qk_norm_rope_gate_fp8_quant(lengths, preallocate_outputs):
                 device=q_gate.device,
             ),
         )
-        output_kwargs = dict(
-            query_out=expected_outputs[0],
-            key_out=expected_outputs[1],
-            gate_out=expected_outputs[2],
-            query_fp8_out=expected_outputs[3],
-            key_fp8_out=expected_outputs[4],
-            value_fp8_out=expected_outputs[5],
-            query_descale_out=expected_outputs[6],
-            key_descale_out=expected_outputs[7],
-            value_descale_out=expected_outputs[8],
-        )
+        output_kwargs = {
+            "query_out": expected_outputs[0],
+            "key_out": expected_outputs[1],
+            "gate_out": expected_outputs[2],
+            "query_fp8_out": expected_outputs[3],
+            "key_fp8_out": expected_outputs[4],
+            "value_fp8_out": expected_outputs[5],
+            "query_descale_out": expected_outputs[6],
+            "key_descale_out": expected_outputs[7],
+            "value_descale_out": expected_outputs[8],
+        }
     output = fused_qk_norm_rope_gate_fp8_quant(
         *inputs,
         num_actual_tokens=sum(lengths),
@@ -519,7 +519,9 @@ def test_flash_attn_varlen_rejects_partial_descales():
     q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE)
     descale = torch.ones((1, 1), dtype=torch.float32)
     cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
-    with pytest.raises(ValueError, match="requires q_descale, k_descale, and v_descale"):
+    with pytest.raises(
+        ValueError, match="requires q_descale, k_descale, and v_descale"
+    ):
         mha_module.flash_attn_varlen_func(
             q,
             q,
