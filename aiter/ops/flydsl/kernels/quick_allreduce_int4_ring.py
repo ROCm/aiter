@@ -224,10 +224,6 @@ def make_quick_allreduce_int4_ring_kernel(
     nxt = (rank + 1) % world_size
 
     fused = fusion == "rmsnorm"
-    # A plain build keeps the shipped 256-thread block, so its geometry -- and
-    # every codec offset derived from it -- is bit-identical to what shipped. A
-    # fused build sizes the block to the row: ``atoms_per_row`` atoms cover one
-    # token, and it divides ``rank_atoms`` so a chunk is a whole number of rows.
     if fused:
         block, atoms_per_row = quick_reduce_row_block(hidden, world_size)
     else:
@@ -274,10 +270,7 @@ def make_quick_allreduce_int4_ring_kernel(
     PackStorage = make_pack_storage(pack_i32)
 
     # Per-wave partials for the fused sum of squares, one slot per row of a
-    # chunk. Allocated separately from the pack staging rather than carved out
-    # of it: the epilogue runs after the fanout has read the staged packet, but
-    # aliasing the two would make that ordering load-bearing for no saving --
-    # this is a few hundred bytes against the pack buffer's kilobytes.
+    # chunk. Allocated separately from the pack staging.
     n_partials = rows_per_chunk * n_waves if (fused and n_waves > 1) else 0
     WavePartials = make_wave_partials(n_partials) if n_partials else None
     lds_bytes = pack_i32 * 4 + n_partials * 4
@@ -293,11 +286,6 @@ def make_quick_allreduce_int4_ring_kernel(
         j = k if k <= world_size else k - world_size
         return (rank - j) % world_size
 
-    # One signature for both modes. A plain build never reads the four fused
-    # arguments -- ``const_expr(fused)`` elides every use -- and its launcher
-    # below does not take them, so the host's plain path is unchanged; what a
-    # plain build carries is four unused kernargs, which cost nothing but
-    # kernarg-segment bytes.
     @flyc.kernel(known_block_size=[block, 1, 1])
     def quick_allreduce_int4_ring(
         rank_unused: Int32,
@@ -308,6 +296,7 @@ def make_quick_allreduce_int4_ring_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         n_blocks: Int32,
+        # These args are discarded for non-fused kernel
         res_in_ptr: Int64,
         res_out_ptr: Int64,
         w_ptr: Int64,
@@ -346,7 +335,7 @@ def make_quick_allreduce_int4_ring_kernel(
             )
             for c in ({rs.name: rs, ag.name: ag}).values()
         }
-        # A second allocation from the *same* allocator -- FlyDSL allows only
+        # A second allocation from the same allocator -- FlyDSL allows only
         # one per kernel -- so it cannot alias the staged packet the fanout is
         # still reading. Hoisted here because the allocator is static: one
         # reached from inside the op loop would emit an LDS symbol per visit.

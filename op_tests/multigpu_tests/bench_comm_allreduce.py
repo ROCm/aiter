@@ -238,6 +238,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Pool, freeze_support, set_start_method
@@ -705,15 +706,15 @@ CANDIDATES = (
     # fusion itself buys: same all-reduce as `fused_fly_1stage`, same arch,
     # differing only in whether the norm is fused.
     # Quantized fused rows: the two-shot schedules with the epilogue fused.
-    # Graded at the plain fly_int4 floor -- the epilogue adds no error of its
-    # own, the wire is what costs SQNR -- and `exact=False` for the same reason.
     #
-    # The ring is the one this fusion was built for: it is the schedule that
-    # wins at prefill, which is where the norm's extra HBM pass is worth
-    # removing. The mesh row is the control, and the width at which it starts
-    # paying for the row-sized block in LDS is one thing this sweep is for.
+    # The floor is *not* the plain schedule's own -- fusing through RMSNorm
+    # changes what the metric measures, not just its value. The plain ring's
+    # SQNR is over the raw all-reduce output; the fused SQNR is over
+    # ``x * rsqrt(mean(x^2) + eps) * w``, and dividing by a row's own norm
+    # amplifies whatever quantization variance that row already had. That
+    # variance only averages out over enough rows.
     Candidate(
-        "fused_fly_ring", "fused_flyqr", 15.0, False, fusion=True, algorithm="ring"
+        "fused_fly_ring", "fused_flyqr", 10.0, False, fusion=True, algorithm="ring"
     ),
     Candidate(
         "fused_fly_mesh", "fused_flyqr", 15.0, False, fusion=True, algorithm="mesh"
@@ -738,7 +739,11 @@ CANDIDATES = (
     Candidate(
         "separate_flyring",
         "separate",
-        15.0,
+        14.0,  # matches `fly_int4_ring`'s floor, not the mesh's. Flat
+        # 19.5-19.7 dB across M=8..8192 at TP4/hidden=7168 (measured) -- the
+        # plain kernel's fixed 32 KiB tile does not hit the few-tile regime
+        # `fused_fly_ring` does, so it does not need that candidate's lower
+        # floor.
         False,
         fusion=True,
         sep_ar="flyring",
@@ -2210,6 +2215,39 @@ def run_sweep(tp_size, shapes, dtype, args, keys, prod_regime):
             for r in range(tp_size)
         ]
         pool.close()
+        # Not pool.join(): every rank's _worker shares one process group, so a
+        # `dist.barrier()` a few lines into any candidate needs all tp_size
+        # ranks to reach it. If one rank returns early -- success or exception,
+        # fewer collective calls than its peers either way -- the barrier
+        # sequence desyncs permanently and the remaining ranks spin in that
+        # barrier forever. pool.join() waits for every worker process to
+        # exit, so it would hang right along with them, silently sitting on
+        # top of a result (or exception). Poll instead, and the moment any one 
+        # rank's result is ready, fetch it -- an exception surfaces immediately 
+        # instead of waiting behind peers that will now never finish.
+        pending = set(range(len(rets)))
+        while pending:
+            for i in sorted(pending):
+                if not rets[i].ready():
+                    continue
+                pending.discard(i)
+                try:
+                    rets[i].get()
+                except Exception:
+                    stuck = sorted(pending)
+                    logger.error(
+                        "rank %d failed (see traceback below); rank(s) %s were "
+                        "still running and will now be killed -- a per-rank "
+                        "failure desyncs the barrier sequence, so they were "
+                        "never going to finish on their own",
+                        i,
+                        stuck,
+                    )
+                    pool.terminate()
+                    pool.join()
+                    raise
+            if pending:
+                time.sleep(1.0)
         pool.join()
     per_rank = [r.get() for r in rets]
     return [

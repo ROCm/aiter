@@ -107,16 +107,14 @@ def quick_reduce_row_block(hidden: int, world_size: int) -> tuple[int, int]:
 
     Picks the narrowest row -- the fewest atoms per row, hence the widest
     block -- that both :func:`row_block` accepts and the reduce-scatter split
-    can carry. The second condition is what makes this different from the
-    one-shot's geometry: a rank owns ``rank_atoms = ATOMS // world_size``
+    can carry. A rank owns ``rank_atoms = ATOMS // world_size``
     consecutive atoms of a tile, and the epilogue runs on a whole chunk, so a
     row must fit inside one. ``atoms_per_row`` therefore has to divide
     ``rank_atoms``.
 
-    At ``atoms_per_row == 1`` one atom *is* one row and this succeeds for every
+    At ``atoms_per_row == 1`` one atom is one row and this succeeds for every
     multiple of 1024 up to 8192. Wider rows need ``atoms_per_row > 1``, which
-    TP8 cannot offer (a chunk is a single atom there), so hidden=16384 is
-    TP2/TP4 only.
+    TP8 cannot offer and hidden=16384 is TP2/TP4 only.
     """
     world_size = int(world_size)
     if world_size <= 0 or ATOMS % world_size:
