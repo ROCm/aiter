@@ -85,9 +85,10 @@ them.
 - **Family A K1 may go unfused above 512 blocks.** The ticket requires the
   scores, the top-512, and expand+tail (lines 47-52); it does not require one
   kernel. Long rows score into an `[M, n_blocks]` fp32 buffer with BLOCK_N=32
-  MFMA workgroups. Selection is `flydsl_top_k_per_row_decode(stable=True)`
-  below 32768 columns and `topk_select(..., tie='low')` streaming radix at
-  or above that width. Family B is still fused everywhere.
+  MFMA workgroups; single-request prefill batches 16 query rows per workgroup.
+  Selection is `flydsl_top_k_per_row_decode(stable=True)` below 32768 columns
+  and `topk_select(..., tie='low')` streaming radix at or above that width.
+  Family B is still fused everywhere.
 - **Family B K1 perf is emit / short-L only.** Winning shapes are
   ``visible <= 512`` for ``H`` 4 and 8, plus the #4882 published indexer
   point (``M=32``, ``H=4``, ``D=128``, ``page_size=8``, ``n_blocks=512``).
@@ -336,8 +337,11 @@ the old single-workgroup bitonic dispatch is replaced by a global
 `[M, n_blocks]` fp32 score buffer. The scorer pads H=4 to an MFMA 16-row
 tile, splits D=128 across two waves, and reduces the partials before summing
 ReLU across the four real heads. BLOCK_N=32 beat BLOCK_N=16 at every
-material prefill point. Selection is `flydsl_top_k_per_row_decode(stable=True)`
-until 32768 columns, then streaming radix. Expand remains separate.
+material prefill point. Single-request prefill instead uses the MFMA M
+dimension for 16 query rows, reuses each K tile across those rows, and keeps
+the one-row scorer for decode and multi-request inputs. Selection is
+`flydsl_top_k_per_row_decode(stable=True)` until 32768 columns, then streaming
+radix. Expand remains separate.
 
 A 64-bit MSD binary radix-select on the 1024-candidate tile (score order,
 then inverted id, 32 bits each, wave reduce + two barriers per bit) was
@@ -358,13 +362,13 @@ HIP-loaded table. Sixty-four digit passes cost more barriers than the
 | 8 | 131072 | 32768 | 46.3 | 52.9 | 0 | 0 |
 | 512 | 512 | 128 | 3.5 | 18.1 | 0 | 0 |
 | 512 | 2048 | 512 | 3.6 | 29.1 | 0 | 0 |
-| 512 | 8192 | 2048 | 83.2 | 83.1 | 0 | 0 |
-| 512 | 32768 | 8192 | 288.7 | 245.6 | 0 | 0 |
+| 512 | 8192 | 2048 | 29.3 | 83.1 | 0 | 0 |
+| 512 | 32768 | 8192 | 68.2 | 247.7 | 0 | 0 |
 
 Streaming radix at 32768 columns moves 128k decode from 33.7 / 54.4 us to
-28.3 / 46.3 us (`M=1` / `M=8`) and crosses live AMD. Prefill 32k stays
-scorer-bound (288.7 vs 245.6). Decode still wins through 32k; 8k prefill
-stays tied.
+28.3 / 46.3 us (`M=1` / `M=8`) and crosses live AMD. The 16-row scorer moves
+8k / 32k prefill from 83.2 / 288.7 us to 29.3 / 68.2 us and beats live AMD
+at both points.
 
 - [ ] Family B (`H` 4 or 8, Gluon-validated indexer shapes).
 - [x] **2e.** Family B decode kernel, ``H=4`` only, correctness: paged
