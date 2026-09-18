@@ -722,10 +722,19 @@ def test_triton_unified_attn(
         )
 
 
-@pytest.mark.parametrize("shuffled_kv_cache, block_size", [(False, 64), (True, 64), (True, 128)])
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype",
-    [(torch.bfloat16, torch.bfloat16), (e4m3_dtype, e4m3_dtype)],
+    "q_dtype, kv_dtype, shuffled_kv_cache, block_size",
+    [
+        (torch.bfloat16, torch.bfloat16, False, 64),
+        (e4m3_dtype, e4m3_dtype, False, 64),
+        # get_dtype_str() maps fp16 to the bf16 tag, so the DT_bf16_bf16
+        # entries serve fp16 too; same 2-byte layout, same tile math
+        (torch.float16, torch.float16, False, 64),
+        (torch.bfloat16, torch.bfloat16, True, 64),
+        (e4m3_dtype, e4m3_dtype, True, 64),
+        (torch.bfloat16, torch.bfloat16, True, 128),
+        (e4m3_dtype, e4m3_dtype, True, 128),
+    ],
 )
 @pytest.mark.parametrize("head_size", [256, 512])
 @torch.inference_mode()
@@ -796,7 +805,7 @@ def test_triton_unified_attn_gfx942_large_prefill(
 
     # assert the intended table entry serves this call
     table, axes, _ = _load("attn_2d", "triton", "gfx942")
-    dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"
+    dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"  # fp16 maps to bf16
     if shuffled_kv_cache and block_size <= 64:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_{dt_tag}"
     elif shuffled_kv_cache:
