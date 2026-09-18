@@ -793,10 +793,13 @@ struct MoeSortingKernel
                 {
                     int eid = topk_id[i_t * topk + curr_topk_id];
 
-                    if constexpr(Problem::SubTokenOneShot)
-                        smem_tokens(curr_token_id, eid) = curr_topk_id + 1;
-                    else
-                        smem_tokens(curr_token_id, eid)++;
+                    if(eid >= 0 && eid < num_experts)
+                    {
+                        if constexpr(Problem::SubTokenOneShot)
+                            smem_tokens(curr_token_id, eid) = curr_topk_id + 1;
+                        else
+                            smem_tokens(curr_token_id, eid)++;
+                    }
                 }
 #if defined(__gfx1250__)
                 opus::s_wait_dscnt(opus::number<0>{});
@@ -950,7 +953,9 @@ struct MoeSortingKernel
                 int local_id = eid;
                 if constexpr(Problem::LocalExpertMasking)
                 {
-                    local_id = local_expert_mask[eid] != 0 ? smem_cumdup(eid) : -1;
+                    bool valid_eid = eid >= 0 && eid < num_experts;
+                    local_id = valid_eid && local_expert_mask[eid] != 0 ? smem_cumdup(eid)
+                                                                         : -1;
                 }
                 p_local_topk_ids[i] = local_id;
             }
@@ -1019,7 +1024,8 @@ struct MoeSortingKernel
                     if(i_t < tokens)
                     {
                         int eid                         = topk_id[i_t * topk + curr_topk_id];
-                        smem_tokens(curr_token_id, eid) = curr_topk_id + 1; // at least 1
+                        if(eid >= 0 && eid < num_experts)
+                            smem_tokens(curr_token_id, eid) = curr_topk_id + 1; // at least 1
                     }
                 }
                 __syncthreads();
@@ -2158,16 +2164,18 @@ struct MoeSortingMultiPhaseKernel_P01
                     uint32_t curr_token_id, curr_topk_id;
                     kargs.topk_mdiv.divmod(
                         i * Problem::SubTokenTile + j, curr_token_id, curr_topk_id);
-                    // p_expert_mesh[eid * kargs.mesh_stride + curr_token_id] = curr_topk_id + 1;
-                    if constexpr(Problem::LocalToken)
+                    if(eid >= 0 && eid < kargs.num_experts)
                     {
-                        if(static_cast<opus::index_t>(curr_token_id) < tokens)
+                        if constexpr(Problem::LocalToken)
+                        {
+                            if(static_cast<opus::index_t>(curr_token_id) < tokens)
+                                p_expert_mesh[eid * kargs.mesh_stride + curr_token_id] =
+                                    (curr_topk_id + 1) & 0xffff;
+                        }
+                        else
                             p_expert_mesh[eid * kargs.mesh_stride + curr_token_id] =
                                 (curr_topk_id + 1) & 0xffff;
                     }
-                    else
-                        p_expert_mesh[eid * kargs.mesh_stride + curr_token_id] =
-                            (curr_topk_id + 1) & 0xffff;
                 });
             }
             if(static_cast<opus::index_t>(blockIdx.x) < wg_count)
