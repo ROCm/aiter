@@ -1674,8 +1674,10 @@ bool topk_avo_supports(int64_t numRows, int64_t stride0, int64_t k)
         return false;
     if(k > PHASE_C_CAP_MAX)
         return false;
-    if(stride0 % FP32_EPT != 0)
-        return false;
+    // stride0 need not be a multiple of FP32_EPT. This entry always
+    // instantiates RAGGED=true, where the vector count is n4_cover(len) and
+    // load_row_f4 loads the final partial vector element-wise, so an odd pitch
+    // only makes the row base unaligned -- which gfx950 serves natively.
     return avo::params_for(
                static_cast<int>(numRows), static_cast<int>(stride0), static_cast<int>(k))
         .geom_ok;

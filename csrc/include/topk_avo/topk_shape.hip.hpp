@@ -256,8 +256,12 @@ static inline bool sampling_geometry_ok(int N, int S)
 {
     if(S > SAMPLE_S_MAX || S % SAMPLE_CHUNK_ELEMS != 0)
         return false;
-    if(N % FP32_EPT != 0)
-        return false;
+    // No N % FP32_EPT check. It used to be here because the loads are dwordx4 and
+    // the row base is `input + row * pitch`, which an odd pitch misaligns -- but
+    // gfx950 serves a 4-byte-aligned dwordx4 natively (v5 Stage 2 isolated the
+    // HIP 700 to the tail over-read, not the misalignment, and load_row_f4 clamps
+    // that tail). sample_chunk_stride still masks the spacing to a multiple of 4,
+    // so chunk starts stay 4-aligned RELATIVE to the base whatever the base is.
     const int chunks = S / SAMPLE_CHUNK_ELEMS;
     return sample_chunk_stride(N, chunks) >= SAMPLE_CHUNK_ELEMS;
 }
@@ -277,8 +281,6 @@ static inline bool sampling_geometry_ok(int N, int S)
 static inline bool sample_stride_exact(int N, int S)
 {
     if(S > SAMPLE_S_MAX || S % SAMPLE_CHUNK_ELEMS != 0)
-        return false;
-    if(N % FP32_EPT != 0)
         return false;
     const int chunks = S / SAMPLE_CHUNK_ELEMS;
     const int stride = N / chunks;
@@ -518,7 +520,7 @@ static inline ShapeParams derive_shape_params(int M,
         p.cap         = N;
         p.coop_g      = 1;
         p.keys_only_c = false;
-        p.geom_ok     = (N % FP32_EPT == 0 && K <= N);
+        p.geom_ok     = (K <= N);
         return p;
     }
     if(path_override == PATH_SMALL_N && !small_n_fits)
