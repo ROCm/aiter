@@ -14,6 +14,7 @@ from ..jit.core import (
     compile_ops,
     is_experimental_enabled,
 )
+from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -609,6 +610,7 @@ def fmha_fwd_with_sink_asm(
         allocated even when `return_lse=False`; in that case the contents are
         undefined and callers should ignore the returned `lse`.
     """
+    require_gfx1250_asm("fmha_fwd_with_sink_asm")
     batch, q_seq_len, q_head_num, _qk_head_dim = q.shape
     v_head_dim = v.size(3)
 
@@ -693,6 +695,7 @@ def fmha_fwd_with_sink_varlen_asm(
       * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
         allocated even when `return_lse=False`; in that case ignore the result.
     """
+    require_gfx1250_asm("fmha_fwd_with_sink_varlen_asm")
     q, k, v = (x.contiguous() for x in (q, k, v))
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
@@ -788,6 +791,7 @@ def fmha_fwd_mxfp8_asm(
         (out, lse). The kernel always touches the lse buffer; when
         return_lse=False its contents are undefined and should be ignored.
     """
+    require_gfx1250_asm("fmha_fwd_mxfp8_asm")
     batch, q_seq_len, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(3)
 
@@ -1939,7 +1943,7 @@ def _flash_attn_forward(
         # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
         # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
-        ret = get_gfx() == "gfx1250"
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (hdim_q in (64, 128))
         ret = ret and (hdim_v == hdim_q)
@@ -1975,7 +1979,7 @@ def _flash_attn_forward(
         # (e4m3) q/k/v with microscaling (e8m0) block-scale descale buffers.
         # The e8m0 descale dtype is what distinguishes MXFP8 from the per-tensor
         # fp8 path (is_fmha_v3_fp8, which uses fp32 descales on gfx942/gfx950).
-        ret = get_gfx() == "gfx1250"
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -2997,7 +3001,7 @@ def _flash_attn_varlen_forward(
         # Packed THD (batch folded into the token axis); no dropout / swa /
         # quant / alibi / bias / paged (block_table) / logits-soft-cap.  Sink
         # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
-        ret = get_gfx() == "gfx1250"
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (
             (hdim_q in (64, 128) and hdim_v == hdim_q)
@@ -3732,7 +3736,9 @@ def flash_attn_varlen_func(
         # Keep this public-router gate intentionally narrow so the PR3039
         # prefill ASM path can be measured without changing decode or other
         # FlyDSL/CK coverage.
-        if get_gfx() != "gfx1250" or q.dtype != dtypes.bf16:
+        if get_gfx() != "gfx1250" or not is_gfx1250_asm_supported():
+            return False
+        if q.dtype != dtypes.bf16:
             return False
         hdim_q = q.shape[-1]
         hdim_v = v.shape[-1]
