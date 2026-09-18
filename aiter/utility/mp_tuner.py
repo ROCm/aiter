@@ -81,9 +81,18 @@ def _candidate_failure_status(exc: BaseException, default: str = "crash") -> str
     return default
 
 
-def _format_worker_result(info, us, max_err_ratio, status, return_status):
+def _candidate_failure_detail(exc: BaseException, limit: int = 300) -> str:
+    """Exception class and one-line message for the candidate journal."""
+
+    message = " ".join(str(exc).split())
+    if len(message) > limit:
+        message = message[: limit - 3] + "..."
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def _format_worker_result(info, us, max_err_ratio, status, return_status, detail=""):
     result = (info, us, round(max_err_ratio, 4))
-    return (*result, status) if return_status else result
+    return (*result, status, detail) if return_status else result
 
 
 def worker(
@@ -110,6 +119,7 @@ def worker(
     device = torch.device(f"cuda:{gpu_id}")
     max_err_ratio = 0.0
     status = "ok"
+    detail = ""
     try:
         torch.cuda.set_device(device)
         args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
@@ -138,6 +148,7 @@ def worker(
             us = -1  # not support or error
             max_err_ratio = 1.0
             status = _candidate_failure_status(e)
+            detail = _candidate_failure_detail(e)
         max_retries = 3
         retry_count = 0
 
@@ -150,10 +161,11 @@ def worker(
             us = -1
             max_err_ratio = 1.0
             status = "crash"
+            detail = f"run_perftest returned 0 us on {max_retries} attempts"
         torch.cuda.synchronize()
         if us == -1 or res is None:
             return _format_worker_result(
-                info, us, max_err_ratio, status, return_status
+                info, us, max_err_ratio, status, return_status, detail
             )
         if ref is not None:
             if isinstance(ref, torch.Tensor):
@@ -218,12 +230,14 @@ def worker(
         us = -1  # float("inf")
         max_err_ratio = 1.0
         status = _candidate_failure_status(e)
+        detail = _candidate_failure_detail(e)
     except TimeoutError as e:
         if printLog:
             print(f"Timeout in process:{pid} info:{info}: {e}")
         us = float("inf")
         max_err_ratio = 1.0
         status = "timeout"
+        detail = _candidate_failure_detail(e)
     except Exception as e:  # noqa: BLE001
         if printLog:
             print(f"Unexpected Error in process:{pid} info:{info}: {e}")
@@ -233,8 +247,11 @@ def worker(
         us = -1  # float("inf")
         max_err_ratio = 1.0
         status = _candidate_failure_status(e)
+        detail = _candidate_failure_detail(e)
 
-    return _format_worker_result(info, us, max_err_ratio, status, return_status)
+    return _format_worker_result(
+        info, us, max_err_ratio, status, return_status, detail
+    )
 
 
 def work_group(
@@ -397,21 +414,20 @@ def work_group(
                 progress_queue.put(ret)
         return rets
 
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         import traceback
 
         if _is_accelerator_error(e):
             raise
         print(f"Critical error in work_group: {e!r}")
         traceback.print_exc()
-        # Allocation failed before any candidate launched.
         status = (
             "oom_preflight"
             if isinstance(e, torch.cuda.OutOfMemoryError)
             or "out of memory" in str(e).lower()
             else "crash"
         )
-        # Return dummy failed results for all tasks in the group.
+        detail = f"work_group aborted before launch: {_candidate_failure_detail(e)}"
         if isinstance(tasks, list):
             results = [
                 _format_worker_result(
@@ -420,6 +436,7 @@ def work_group(
                     1.0,
                     status,
                     return_status,
+                    detail,
                 )
                 for task in tasks
             ]
@@ -431,6 +448,7 @@ def work_group(
                     1.0,
                     status,
                     return_status,
+                    detail,
                 )
             ]
         if progress_queue is not None:
@@ -602,8 +620,9 @@ def mp_tuner(
     )
     print(f"Waiting for {len(remaining_tasks)} tasks to complete ({timeout_msg})...")
 
-    def add_dummy_result(k, results_list, status="crash"):
+    def add_dummy_result(k, results_list, status="crash", detail=""):
         """Helper function to add dummy failed result"""
+        detail = detail or f"no result returned by the worker pool ({status})"
         if shape_grouped:
             task_info = (
                 task_group[k] if isinstance(task_group[k], list) else [task_group[k]]
@@ -615,7 +634,7 @@ def mp_tuner(
                     results_list.append(progress_results[info])
                     continue
                 result = _format_worker_result(
-                    info, float("inf"), 1.0, status, return_status
+                    info, float("inf"), 1.0, status, return_status, detail
                 )
                 results_list.append(result)
                 # The first unfinished candidate is the one that faulted or
@@ -631,7 +650,7 @@ def mp_tuner(
                 results_list.append(progress_results[info])
                 return
             result = _format_worker_result(
-                info, float("inf"), 1.0, status, return_status
+                info, float("inf"), 1.0, status, return_status, detail
             )
             results_list.append(result)
             publish_progress(result)
@@ -694,7 +713,13 @@ def mp_tuner(
                         # Add dummy result
                         drain_progress()
                         dummy_results = []
-                        add_dummy_result(k, dummy_results, "timeout")
+                        add_dummy_result(
+                            k,
+                            dummy_results,
+                            "timeout",
+                            f"exceeded {timeout}s after {elapsed:.1f}s; "
+                            "likely GPU hang or infinite loop",
+                        )
                         result_dict[k] = (
                             dummy_results if shape_grouped else [dummy_results[0]]
                         )
@@ -737,7 +762,12 @@ def mp_tuner(
                     failed_tasks.append((k, "accelerator error"))
                     drain_progress()
                     dummy_results = []
-                    add_dummy_result(k, dummy_results, "crash")
+                    add_dummy_result(
+                        k,
+                        dummy_results,
+                        "crash",
+                        f"accelerator fault: {_candidate_failure_detail(e)}",
+                    )
                     result_dict[k] = (
                         dummy_results if shape_grouped else [dummy_results[0]]
                     )
@@ -752,7 +782,9 @@ def mp_tuner(
                     # (previously only timeout path did this; async.get() failures left no result_dict[k]).
                     drain_progress()
                     dummy_results = []
-                    add_dummy_result(k, dummy_results)
+                    add_dummy_result(
+                        k, dummy_results, "crash", _candidate_failure_detail(e)
+                    )
                     result_dict[k] = (
                         dummy_results if shape_grouped else [dummy_results[0]]
                     )

@@ -8,7 +8,7 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 2. half-GPU threshold triggers break at the right time
 3. stale PID mappings trigger an immediate restart and retry
 
-Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
+Run: python3 -m unittest op_tests.tuning_tests.test_mp_tuner_logic -v
 """
 
 import importlib
@@ -431,7 +431,35 @@ class TestTypedCandidateStatus(unittest.TestCase):
         legacy = tuner._format_worker_result("shape", 1.0, 0.0, "ok", False)
         typed = tuner._format_worker_result("shape", 1.0, 0.0, "ok", True)
         self.assertEqual(legacy, ("shape", 1.0, 0.0))
-        self.assertEqual(typed, ("shape", 1.0, 0.0, "ok"))
+        self.assertEqual(typed, ("shape", 1.0, 0.0, "ok", ""))
+
+    def test_failure_detail_names_the_exception(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        detail = tuner._candidate_failure_detail(
+            ValueError("window_size_right is not supported yet")
+        )
+        self.assertEqual(
+            detail, "ValueError: window_size_right is not supported yet"
+        )
+        result = tuner._format_worker_result(
+            "shape", -1, 1.0, "unsupported", True, detail
+        )
+        self.assertEqual(result[3:], ("unsupported", detail))
+
+    def test_failure_detail_is_bounded_and_single_line(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        detail = tuner._candidate_failure_detail(
+            RuntimeError("line one\n  line two   " + "x" * 500), limit=80
+        )
+        self.assertEqual(len(detail), len("RuntimeError: ") + 80)
+        self.assertNotIn("\n", detail)
+        self.assertTrue(detail.endswith("..."))
+
+    def test_failure_detail_survives_an_empty_message(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        self.assertEqual(
+            tuner._candidate_failure_detail(KeyboardInterrupt()), "KeyboardInterrupt"
+        )
 
 
 if __name__ == "__main__":
