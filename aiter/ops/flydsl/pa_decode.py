@@ -141,6 +141,34 @@ def launch_pa_decode_ps_reduce(
             f"{MAX_CONTEXT_PARTITIONS} partitions"
         )
     use_sinks = sink_token is not None
+    # Buffer offsets are byte-sized i32 values. Bound the largest attempted
+    # access, not only the current count: an inactive part must not wrap back
+    # into valid data. Nonstandard standalone reducer strides keep the old path.
+    bounded_plan_logits = (
+        reduce_info is not None
+        and context_partition_num <= 64
+        and query_seq_len > 0
+        and query_group_size > 0
+        and 0 <= stride_logits_head <= 2**31 - 1
+        and stride_logits_group == head_size
+        and stride_logits_part == query_seq_len * query_group_size * head_size
+        and 0
+        < context_partition_num * stride_logits_part * logits.element_size()
+        <= 2**31 - 1
+    )
+    # The pair load is one aligned dword. Packed rows are complete D=128
+    # vectors, and even strides preserve alignment after the 64-bit rebase.
+    # The R9 maximum-span gate also bounds the last byte of every pair load.
+    # Output remains scalar-stored, so its alignment need not match logits.
+    vectorize_plan_logits = (
+        bounded_plan_logits
+        and head_size == 128
+        and logits.dtype in (torch.bfloat16, torch.float16)
+        and logits.data_ptr() % 4 == 0
+        and stride_logits_head % 2 == 0
+        and stride_logits_part % 2 == 0
+        and stride_logits_group % 2 == 0
+    )
     compiled = compile_pa_decode_ps_reduce(
         max_context_partition_num=context_partition_num,
         head_size=head_size,
@@ -151,6 +179,9 @@ def launch_pa_decode_ps_reduce(
         ),
         use_sinks=use_sinks,
         use_work_plan=reduce_info is not None,
+        query_group_size=query_group_size,
+        bounded_plan_logits=bounded_plan_logits,
+        vectorize_plan_logits=vectorize_plan_logits,
     )
     sink_ptr = (
         ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
@@ -220,9 +251,10 @@ def pa_decode(
     Sparse attention uses caller-prepared block tables and selected context
     lengths. Each independently selected MTP query must have its own table row
     and use query_length=1; query_length>1 applies dense causal masking.
-    A positive ``sliding_window`` limits each query to that many causal tokens,
-    including its own position; 0 and -1 disable the window. Optional ``sinks``
-    is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the query device.
+    A positive ``sliding_window`` requires ``work_plan`` and limits each query
+    to that many causal tokens, including its own position; 0 and -1 disable
+    the window. Optional ``sinks`` is a contiguous [num_query_heads]
+    BF16/FP16/FP32 tensor on the query device.
     Each entry is an unscaled, zero-value attention logit shared across batch
     and MTP positions. It contributes to the denominator once, independently
     of the window; -inf disables a head's sink and +inf suppresses its output.
@@ -260,6 +292,8 @@ def pa_decode(
     if sliding_window < -1:
         raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
+    if sliding_window > 0 and work_plan is None:
+        raise ValueError("positive sliding_window requires work_plan")
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
     if query_length < 1:
@@ -592,6 +626,7 @@ def pa_decode(
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             use_work_plan=work_plan is not None,
+            work_capacity=work_plan.capacity if work_plan is not None else None,
             sliding_window=sliding_window,
             use_sinks=use_direct_sinks,
             sink_dtype_str=get_dtype_str(sinks.dtype) if use_direct_sinks else "f32",

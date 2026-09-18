@@ -133,7 +133,8 @@ def plan_pa_decode(
 
     Allocate once outside graph capture, then pass ``plan=...`` to refresh the
     same metadata in place. Include this refresh in end-to-end measurements.
-    The budget counts CTAs over all KV heads, with fused query positions.
+    The budget counts task slots over all KV heads before query splitting;
+    splitting queries can launch multiple CTAs per slot without extra scratch.
     This is opt-in: uniform or short-context workloads may favor static splits.
 
     A positive ``sliding_window`` counts visible tokens including the query's

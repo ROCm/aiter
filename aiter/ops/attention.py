@@ -60,6 +60,7 @@ def pa_decode_flydsl(
     ``sinks`` and is accepted and ignored.
     ``work_plan`` is available through this Python API; the registered
     ``torch.ops.aiter.pa_decode_flydsl`` operator uses static scheduling.
+    Positive ``sliding_window`` requires a work plan through the Python API.
     """
     del ps
     if _pa_decode_flydsl is None:
