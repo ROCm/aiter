@@ -580,7 +580,7 @@ def test_k2_family_a_decode_matches_oracle():
 
 
 def test_k2_family_a_prefill_matches_oracle():
-    """Same K2 instantiation matches qsa_sparse_gqa at prefill M=512."""
+    """The BLOCK_N=64/two-wave K2 specialization matches at prefill M=512."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     gqa = FAMILY_A_GQA
@@ -700,7 +700,8 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=1):
 def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=1):
     """Family A FlyDSL K2 vs oracle GQA; us vs live AMD and #4882 Triton.
 
-    3d: tiled MFMA QK/PV, register-prefetched paged gather, one-wave merge.
+    3d: live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
+    log2 online softmax, direct output at one split, and a two-wave merge.
     Expand and sigmoid stay unfused. Same ``rotate`` on every GQA column.
     """
     idx = FAMILY_A_INDEXER
