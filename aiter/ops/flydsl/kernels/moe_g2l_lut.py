@@ -63,12 +63,11 @@ def build_moe_g2l_lut_module(clear_counter: bool = True):
         if tid == c0:
             ptr_buf_tensor(nvr_out)[0] = ptr_buf_tensor(nvt)[0] * topk
 
-        if const_expr(clear_counter):
-            # Generic grouped-MoE owns this reset. MegaMoE's TDM dispatch can
-            # instead fold it into its existing tail and compile these stores
-            # away while keeping this kernel available to other callers.
-            if tid < E:
-                ptr_buf_tensor(counter)[tid] = c0
+        # Generic grouped-MoE owns this reset. MegaMoE's TDM dispatch can
+        # instead fold it into its existing tail and compile these stores
+        # away while keeping this kernel available to other callers.
+        if const_expr(clear_counter) and tid < E:
+            ptr_buf_tensor(counter)[tid] = c0
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         mr0 = lds.buf0.ptr

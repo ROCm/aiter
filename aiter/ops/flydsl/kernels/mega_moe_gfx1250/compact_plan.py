@@ -27,10 +27,10 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
+from . import tdm_prims as TDM
 from .config import _LANE_MASK as LANE_MASK
 from .config import _LOG2_WAVE_SIZE as LOG2_WAVE
 from .config import _WAVE_SIZE as WAVE
-from . import tdm_prims as TDM
 
 PLAN_BLOCKS = 1
 PLAN_WAVES = 32
@@ -131,7 +131,7 @@ def compile_tdm_compact_plan(
             f"cap={compact_cap} peers={npes}"
         )
     hist_stride = int(hist_stride)
-    row_dwords, sparse_cap, use_sparse = compact_hist_layout(
+    row_dwords, _sparse_cap, use_sparse = compact_hist_layout(
         npes=npes, experts_per_rank=epr, max_routes=max_routes
     )
     if hist_stride != npes * row_dwords:

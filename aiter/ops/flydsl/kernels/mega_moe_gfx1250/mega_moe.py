@@ -835,7 +835,6 @@ class MegaMoEGfx1250:
             PLAN_BLOCKS,
             compact_done_nbytes,
             compact_hist_stride,
-            compile_tdm_compact_plan,
         )
 
         segs = config.world_size * config.experts_per_rank

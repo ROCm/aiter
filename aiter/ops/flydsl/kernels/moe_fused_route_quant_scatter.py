@@ -2997,21 +2997,20 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 topids_to_rows_t[route_i32] = keep.select(
                     fx.Int32(grouped_row), fx.Int32(DROPPED_ROUTE_ROW)
                 )
-                if const_expr(direct_ep):
-                    if keep:
-                        w_f32 = ptr_buf_tensor(weight_in, fx.Float32)[route_i32]
-                        w_f32 = w_f32.to(fx.BFloat16).to(fx.Float32)
-                        token = fx.Uint32(route_i32) // c_topk
-                        k = fx.Uint32(route_i32) - token * c_topk
-                        enc = fx.Uint32(ptr_buf_tensor(tis)[token])
-                        origin_pe = enc // fx.Uint32(max_tok)
-                        origin_lid = enc - origin_pe * fx.Uint32(max_tok)
-                        packed = (
-                            origin_pe * fx.Uint32(slot_stride) + origin_lid * c_topk + k
-                        )
-                        ep_p = ptr_buf_tensor(ep_rowmap)
-                        ep_p[grouped_row * 2] = packed
-                        ep_p[grouped_row * 2 + 1] = w_f32.bitcast(fx.Int32)
+                if const_expr(direct_ep) and keep:
+                    w_f32 = ptr_buf_tensor(weight_in, fx.Float32)[route_i32]
+                    w_f32 = w_f32.to(fx.BFloat16).to(fx.Float32)
+                    token = fx.Uint32(route_i32) // c_topk
+                    k = fx.Uint32(route_i32) - token * c_topk
+                    enc = fx.Uint32(ptr_buf_tensor(tis)[token])
+                    origin_pe = enc // fx.Uint32(max_tok)
+                    origin_lid = enc - origin_pe * fx.Uint32(max_tok)
+                    packed = (
+                        origin_pe * fx.Uint32(slot_stride) + origin_lid * c_topk + k
+                    )
+                    ep_p = ptr_buf_tensor(ep_rowmap)
+                    ep_p[grouped_row * 2] = packed
+                    ep_p[grouped_row * 2 + 1] = w_f32.bitcast(fx.Int32)
 
             if keep:
                 # per-row scale-preshuffle geometry from the global grouped_row.
