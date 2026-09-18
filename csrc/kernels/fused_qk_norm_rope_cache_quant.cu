@@ -5027,16 +5027,9 @@ namespace aiter {
       }
 
       // ORDER MATTERS: the q descriptor and the TDM prologue are issued BEFORE
-      // the cos/sin gather, so their setup covers the gather's latency.
-      //
-      // ATT at T=512 H=128 found the single worst stall in the kernel here: the
-      // two `global_load_b128` of cos/sin were followed immediately by
-      // `s_wait_loadcnt 0x1` and then a `v_lshlrev_b32` consuming the result --
-      // 9898 cycles over 8 hits, 1237 cycles stalled per wave, 99.9% of that
-      // instruction's latency. cos/sin is indexed by positions[token], so it is a
-      // scattered read with poor cache hit rate, and nothing was scheduled between
-      // issue and use. Neither the descriptor build nor the TDM prologue depends on
-      // cos/sin, so moving them up gives the gather something to hide behind.
+      // the cos/sin gather, so their setup covers the gather's latency. cos/sin is
+      // indexed by positions[token], so it is a scattered read with a poor hit
+      // rate, and neither the descriptor build nor the TDM prologue depends on it.
       // Build the q buffer descriptor ONCE per wave (base = this token's q row); load each
       // head via a uniform per-head scalar offset (soffset) instead of rebuilding the SRD
       // (the make_gmem readfirstlane/saveexec pattern) for every head.
@@ -5046,17 +5039,14 @@ namespace aiter {
 
       // ---- Optional TDM prefetch ring over the Q-head loop (gfx1250) ----
       //
-      // The loop below is strictly serial: load head k -> wave_reduce (a full-wave
-      // barrier) -> norm/rope/quant/store -> load head k+1. Nothing overlaps, so
-      // MLP is 1, which is what ATT shows as s_wait_loadcnt = 57.9% of the wave at
-      // T=16384 (78 waves sampled) against FETCH_SIZE = 1.089x ideal -- traffic is
-      // already at the floor, the latency simply is not hidden.
+      // Without the ring the loop is strictly serial: load head k -> wave_reduce (a
+      // full-wave barrier) -> norm/rope/quant/store -> load head k+1. Nothing
+      // overlaps, so the traffic sits at the floor while the latency is not hidden.
       //
-      // The comment this replaces recorded that a vLLM-style 2-deep register
-      // prefetch measured neutral on MI355, because the extra live vec_q_next cost
-      // VGPR/occupancy. That objection does not apply to TDM: tensor_load_to_lds is
-      // a scalar instruction and its in-flight data sits in LDS, not VGPRs, so the
-      // register pressure is nearly unchanged.
+      // A vLLM-style 2-deep REGISTER prefetch measured neutral, because the extra
+      // live vec_q_next costs VGPR/occupancy. That objection does not apply to TDM:
+      // tensor_load_to_lds is a scalar instruction and its in-flight data sits in
+      // LDS, not VGPRs, so the register pressure is nearly unchanged.
       [[maybe_unused]] __UINTPTR_TYPE__ q_lds_addr = 0;
       // Per-wave scratch for the e8m0 scale gather, immediately after the TDM
       // ring. Sized and reserved by the launcher (kQScaleGatherBytes).
@@ -6034,12 +6024,8 @@ namespace aiter {
     // (128 B, kernarg 0x000..0x07f) into user SGPRs; anything past that costs a
     // real s_load. With the 12 pointers first, MlaKernelParams started at 0x064
     // and only its first 7 ints fit -- num_heads (0x0a0), max_position (0x0a4)
-    // and the SWA strides (0x0c4, 0x0d4) all fell outside.
-    //
-    // ATT at T=512 H=128 measured the cost: s_load_b96 @0xd4 = 2045 cycles and
-    // s_load_b128 @0xc4 = 903 cycles, 2948 of the kernel's 3132 scalar-load
-    // cycles in two instructions -- against 25 cycles total when every field the
-    // per-head path needs sits inside the preload window.
+    // and the SWA strides (0x0c4, 0x0d4) all fell outside, so the per-head path
+    // paid a real s_load for them.
     //
     // Putting the struct first moves every int field into the preload window.
     // The pointers move out, but each is dereferenced through an SRD built once,
@@ -6622,13 +6608,10 @@ void fused_qk_norm_rope_group_quant(
       // ceil((num_heads+1)/HPB) * num_tokens workgroups instead of
       // (num_heads+1) * num_tokens. At H=32 that is 9 blocks/token instead of 33.
       //
-      // Why this is the decode lever: ATT at T=256 puts 4046 cyc/wave (~2 us) in
-      // wave execution against an 8.05 us kernel, and all 8448 waves fit resident
-      // at once -- so roughly two thirds of the kernel is dispatch ramp and drain,
-      // not work. inverse_rope_group_quant measured the same 2/3 split at s=512
-      // with this same one-wave-block shape (ramp 33% / steady 33% / drain 35%).
-      // Per-wave savings can only reach the other third; the workgroup count can
-      // reach this one.
+      // Why this is the decode lever: at T=256 every wave of the launch fits
+      // resident at once, so roughly two thirds of the kernel is dispatch ramp and
+      // drain rather than work. Per-wave savings can only reach the other third;
+      // the workgroup count can reach this one.
       //
       // MEASURED on gfx1250 at H=32, paired: HPB=4 is no gain at T=64 or T=256
       // (both CIs cross zero) against a coarse-path control. So packing does NOT
@@ -6670,7 +6653,7 @@ void fused_qk_norm_rope_group_quant(
       // wave count itself halves. Both cut parallelism, and the decode tier is
       // already demand-limited. This is the same failure as raising
       // HEADS_PER_BLOCK: "fewer, bigger waves" is the wrong direction where the
-      // is starved, whatever the ramp/drain share of the ATT trace suggests.
+      // machine is starved, whatever the ramp/drain share suggests.
       //
       // Left at 1. Still worth trying at the XLARGE prefill tier, which also uses
       // the FG kernel but runs far more waves/SIMD, where the occupancy argument
