@@ -587,6 +587,20 @@ def _grouped_a8w4_tdm_moe(
         m_warp2 = m_warp
     if n_warp2 is None:
         n_warp2 = n_warp
+    if _compact:
+        # The plan padded every expert's row count up to this alignment, and its
+        # psum is what the GEMM binary-searches as its m-tile map. A tile wider
+        # than the alignment would cover the tail of one expert and the head of
+        # the next, so the tile follows the plan rather than the CSV alone.
+        _plan_align = int(getattr(_compact_ctx, "compact_align_m", 0) or 0)
+        if _plan_align:
+            tile_m = min(int(tile_m), _plan_align)
+            tile_m2 = min(int(tile_m2), _plan_align)
+            if _plan_align % tile_m or _plan_align % tile_m2:
+                raise ValueError(
+                    f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
+                    f"the compact plan's row alignment {_plan_align}"
+                )
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
@@ -595,7 +609,13 @@ def _grouped_a8w4_tdm_moe(
     )
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
     if _compact:
+        # Rows this step can hold, falling back to the arena's when the caller
+        # gave no bound. The arena is sized for a full prefill, so spending it on
+        # a decode step both oversizes the grid and pads every expert.
+        _compact_rows = int(getattr(_compact_ctx, "compact_rows", 0) or 0)
         contiguous_m = int(hidden_states.shape[0])
+        if _compact_rows:
+            contiguous_m = min(_compact_rows, contiguous_m)
         max_m = contiguous_m
 
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
@@ -867,7 +887,7 @@ def _grouped_a8w4_tdm_moe(
         else 0
     )
     if _compact and _prequantized:
-        a1_payload = hidden_states.reshape(1, contiguous_m, _src_width)
+        a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
     elif _fuse_ep_route_quant:
         route_ws = route_fused_workspace(E, device)
@@ -1379,8 +1399,13 @@ def grouped_gemm_gfx1250_a8w4(
     _csv_tokens = token_num
     if _cctx is not None and getattr(_cctx, "compact_layout", False):
         # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap
-        # as the token count. CSV still keys off the recv-token bucket.
-        _csv_tokens = int(_cctx.max_tokens_per_rank) * int(_cctx.world_size)
+        # as the token count. CSV still keys off the recv-token bucket -- this
+        # step's, when the caller bounded it. Keying off the arena capacity
+        # instead ran every decode step on the tile tuned for a full prefill
+        # arena, which is also the tile the compact plan then pads to.
+        _csv_tokens = int(getattr(_cctx, "compact_recv_bound", 0) or 0) or (
+            int(_cctx.max_tokens_per_rank) * int(_cctx.world_size)
+        )
     if token_num == 0:
         # No tokens to compute (common in EP when a rank receives 0 dispatched
         # tokens). The grouped route/GEMM kernels would launch with a zero-sized
