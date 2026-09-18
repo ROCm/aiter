@@ -81,7 +81,7 @@ def _unsupported_reason(
     if len({t.device for t in tensors}) != 1:
         return "every tensor must be on the same GPU"
     if wave_size_of(gating_output.device.index) != 64:
-        return "the DeepSeek-V4 HERD kernel requires a wave64 GPU"
+        return "the FlyDSL HERD kernels require a wave64 GPU"
     return None
 
 
@@ -135,11 +135,15 @@ def herd_topk_gating(
     assert profile is not None
     device = gating_output.device
     stream = torch.cuda.current_stream(device)
+    # Both native candidate selectors assume packed rows. Some model router
+    # outputs are leading slices of a larger tensor, so inner stride 1 alone is
+    # not sufficient.
+    packed_gating = (
+        gating_output if gating_output.is_contiguous() else gating_output.contiguous()
+    )
     kp1 = topk + 1
     candidate_ids = torch.empty((rows, kp1), dtype=torch.int32, device=device)
-    candidate_values = torch.empty(
-        (rows, kp1), dtype=torch.float32, device=device
-    )
+    candidate_values = torch.empty((rows, kp1), dtype=torch.float32, device=device)
 
     if profile == "dsv4":
         # The dedicated selector reproduces Triton's BF16 score/bias rounding
@@ -149,18 +153,14 @@ def herd_topk_gating(
         topk_gating_herd_candidates_fwd(
             candidate_values,
             candidate_ids,
-            gating_output,
+            packed_gating,
             correction_bias,
         )
     else:
         # Kimi-K3 and MiniMax-M3 expose FP32 sigmoid router logits. Reuse the
-        # native generic selector for Top-(K+1); materialize Kimi's row-strided
-        # gate slice because that kernel currently assumes packed rows.
+        # native generic selector for Top-(K+1).
         from ..topk import topk_gating_fwd
 
-        packed_gating = (
-            gating_output if gating_output.is_contiguous() else gating_output.contiguous()
-        )
         topk_gating_fwd(
             candidate_values,
             candidate_ids,

@@ -7,6 +7,7 @@ import itertools
 import logging
 import os
 from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass
 
 import pandas as pd
 import torch
@@ -63,6 +64,27 @@ AITER_MOE_EXPERT_BALANCE = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class RouteProfile:
+    name: str
+    experts: int
+    topk: int
+    score_func: str
+    score_dtype: torch.dtype
+    shared_expert_id: int | None
+    default_route_scale: float
+
+
+_DSV4_ROUTE_PROFILE = RouteProfile(
+    "dsv4", 384, 6, "sqrtsoftplus", dtypes.bf16, None, 2.5
+)
+_HERD_ROUTE_PROFILES = {
+    (384, 6): _DSV4_ROUTE_PROFILE,
+    (896, 16): RouteProfile("kimi_k3", 896, 16, "sigmoid", dtypes.fp32, None, 1.0),
+    (129, 5): RouteProfile("minimax_m3", 128, 4, "sigmoid", dtypes.fp32, 128, 2.0),
+}
+
+
 # Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
 # Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
 def parse_num_expert_activated():
@@ -106,7 +128,7 @@ def test_fmoe(
     ref_dtype="bf16",
     dsv4_topk=False,
     herd_topk=False,
-    route_scale=2.5,
+    route_scale=None,
     cudagraph=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -120,19 +142,35 @@ def test_fmoe(
     if dsv4_topk:
         if E != 384 or topk != 6:
             raise ValueError("--dsv4-topk requires the routing shape E=384, topk=6")
-        route_profile = ("dsv4", E, topk, "sqrtsoftplus", dtypes.bf16, None)
+        route_profile = _DSV4_ROUTE_PROFILE
     elif herd_topk:
-        if (E, topk) == (384, 6):
-            route_profile = ("dsv4", E, topk, "sqrtsoftplus", dtypes.bf16, None)
-        elif (E, topk) == (896, 16):
-            route_profile = ("kimi_k3", E, topk, "sigmoid", dtypes.fp32, None)
-        elif (E, topk) == (129, 5):
-            route_profile = ("minimax_m3", 128, 4, "sigmoid", dtypes.fp32, 128)
-        else:
+        route_profile = _HERD_ROUTE_PROFILES.get((E, topk))
+        if route_profile is None:
             raise ValueError(
                 "--herd-topk supports DSV4 (E=384,K=6), Kimi-K3 "
                 "(E=896,K=16), and MiniMax-M3 (E=129,K=5)"
             )
+
+    if route_profile is not None:
+        route_scale = (
+            route_profile.default_route_scale
+            if route_scale is None
+            else float(route_scale)
+        )
+
+    # Match fused_moe's runtime activation dtype. MXFP4 dispatch can override
+    # the requested activation dtype based on the activation and token count.
+    effective_aq_dtype = AQDType
+    if actType == aiter.ActivationType.Situv2:
+        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
+        if runtime_aq_dtype is not None:
+            effective_aq_dtype = runtime_aq_dtype
+    elif actType == aiter.ActivationType.Swiglu:
+        runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+            token, actType, gateMode, qType, AQDType, WQDType
+        )
+        if runtime_aq_dtype is not None:
+            effective_aq_dtype = runtime_aq_dtype
 
     # Baseline/HERD are normally launched as separate processes. Pin every
     # generated tensor so their timing comparison changes routing only.
@@ -166,8 +204,9 @@ def test_fmoe(
     if disable_stage2_bias:
         exp_bias2 = None
     if route_profile is not None:
-        _, routed_E, routed_topk, _, score_dtype, _ = route_profile
-        score = torch.randn((token, routed_E), dtype=score_dtype)
+        score = torch.randn(
+            (token, route_profile.experts), dtype=route_profile.score_dtype
+        )
     elif AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
         # Highest priority: activate n randomly-chosen experts (NOT the first n);
         # the other E-n experts are masked to -inf. Load is spread evenly across
@@ -197,17 +236,15 @@ def test_fmoe(
     route_us = None
     active_experts = None
     if route_profile is not None:
-        profile_name, routed_E, routed_topk, score_func, _, shared_expert_id = (
-            route_profile
-        )
         correction_bias = (
-            torch.randn(routed_E, dtype=torch.float32, device=input.device) * 0.1
+            torch.randn(route_profile.experts, dtype=torch.float32, device=input.device)
+            * 0.1
         )
         routed_weights = torch.empty(
-            (token, routed_topk), dtype=torch.float32, device=input.device
+            (token, route_profile.topk), dtype=torch.float32, device=input.device
         )
         routed_ids = torch.empty(
-            (token, routed_topk), dtype=torch.int32, device=input.device
+            (token, route_profile.topk), dtype=torch.int32, device=input.device
         )
 
         def run_herd_router():
@@ -218,12 +255,12 @@ def test_fmoe(
                 correction_bias,
                 need_renorm=True,
                 routed_scaling_factor=route_scale,
-                score_func=score_func,
+                score_func=route_profile.score_func,
             )
 
         _, route_us = run_perftest(run_herd_router, num_iters=20, num_warmup=3)
         active_experts = int(torch.unique(routed_ids).numel())
-        if shared_expert_id is None:
+        if route_profile.shared_expert_id is None:
             topk_weights, topk_ids = routed_weights, routed_ids
         else:
             topk_weights = torch.cat(
@@ -238,7 +275,7 @@ def test_fmoe(
                     routed_ids,
                     torch.full(
                         (token, 1),
-                        shared_expert_id,
+                        route_profile.shared_expert_id,
                         dtype=torch.int32,
                         device=input.device,
                     ),
@@ -247,6 +284,18 @@ def test_fmoe(
             )
     else:
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
+
+    def route_benchmark_metrics(moe_us):
+        """Metrics from separately timed eager routing and MoE execution."""
+        assert route_profile is not None and route_us is not None
+        return {
+            "route_us": route_us,
+            "active_experts": active_experts,
+            "total_us": moe_us + route_us,
+            "route_profile": route_profile.name,
+            "route_scale": route_scale,
+            "effective_aq_dtype": str(effective_aq_dtype),
+        }
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -316,14 +365,6 @@ def test_fmoe(
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
 
-    # Match fused_moe's runtime activation dtype. SiTUv2 can be requested as
-    # a16w4 by the caller but dispatched as a8w4 on gfx950.
-    reference_aq_dtype = AQDType
-    if actType == aiter.ActivationType.Situv2:
-        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
-        if runtime_aq_dtype is not None:
-            reference_aq_dtype = runtime_aq_dtype
-
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
@@ -333,7 +374,7 @@ def test_fmoe(
         a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and reference_aq_dtype == dtypes.fp8
+        and effective_aq_dtype == dtypes.fp8
         and WQDType == dtypes.fp4x2
     ):
         a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(
@@ -342,7 +383,7 @@ def test_fmoe(
     elif (
         (
             qType == aiter.QuantType.per_1x32
-            and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+            and effective_aq_dtype in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
             and WQDType == dtypes.fp4x2
         )
         or is_mxfp8
@@ -352,22 +393,22 @@ def test_fmoe(
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:
-        a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
+        a1_qt, a1_scale = torch_quant(input, quant_dtype=effective_aq_dtype)
 
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
-        and reference_aq_dtype == dtypes.bf16
+        and effective_aq_dtype == dtypes.bf16
         and WQDType == dtypes.fp4x2
         and actType == aiter.ActivationType.Situv2
     ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
-        # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
+        # Key on effective_aq_dtype (runtime dispatch), not the declared AQDType:
         # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
         exp_bias1 = exp_bias2 = None
         exp_bias1_aiter = exp_bias2_aiter = None
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and effective_aq_dtype in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
         and (WQDType == dtypes.fp4x2)
     ):  # a8w4 (fp8 A) mxfp4
         exp_bias1_aiter = None if exp_bias1 is None else exp_bias1.to(dtypes.fp32)
@@ -419,12 +460,12 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and effective_aq_dtype in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
         # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
         # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
-        _w1_gu = AQDType == dtypes.fp8
+        _w1_gu = effective_aq_dtype == dtypes.fp8
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -512,7 +553,7 @@ def test_fmoe(
         a2_scale = a2_scale.view(token, topk, -1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and reference_aq_dtype == dtypes.fp8
+        and effective_aq_dtype == dtypes.fp8
         and WQDType == dtypes.fp4x2
     ):
         a2_qt, a2_scale = per_1x32_f8_scale_f8_quant(
@@ -520,7 +561,7 @@ def test_fmoe(
         )
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and effective_aq_dtype in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
         and (WQDType == dtypes.fp4x2)
     ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
         a2_qt = out1_ref
@@ -531,7 +572,7 @@ def test_fmoe(
         a2_qt = out1_ref
         a2_scale = None
     else:
-        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
+        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=effective_aq_dtype)
     a2_qt = a2_qt.view(token, topk, -1)
 
     out2_ref = torch_moe_stage2(
@@ -612,12 +653,7 @@ def test_fmoe(
             "us_stage2": us2_stage,
         }
         if route_profile is not None:
-            result.update(
-                route_us=route_us,
-                active_experts=active_experts,
-                total_us=result["us"] + route_us,
-                route_profile=profile_name,
-            )
+            result.update(route_benchmark_metrics(result["us"]))
         return result
 
     out2_ck, us2 = run_perftest(
@@ -672,12 +708,7 @@ def test_fmoe(
 
     result = {"us": us2, "logits_diff": float(logits_diff)}
     if route_profile is not None:
-        result.update(
-            route_us=route_us,
-            active_experts=active_experts,
-            total_us=us2 + route_us,
-            route_profile=profile_name,
-        )
+        result.update(route_benchmark_metrics(us2))
     return result
 
 
@@ -890,13 +921,19 @@ parser.add_argument(
 parser.add_argument(
     "--route-scale",
     type=float,
-    default=2.5,
-    help="DeepSeek-V4 routed scaling factor used by --dsv4-topk (default: 2.5).",
+    default=None,
+    help=(
+        "Override the model routed scaling factor used by --herd-topk or "
+        "--dsv4-topk (defaults: DSV4=2.5, Kimi-K3=1.0, MiniMax-M3=2.0)."
+    ),
 )
 parser.add_argument(
     "--cudagraph",
     action="store_true",
-    help="Benchmark fused MoE (and --kernel stages) using HIP graph replay.",
+    help=(
+        "Benchmark fused MoE (and --kernel stages) using HIP graph replay. "
+        "Routing remains separately timed in eager mode; total_us is their sum."
+    ),
 )
 parser.add_argument(
     "--ref-dtype",

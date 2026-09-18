@@ -21,17 +21,13 @@ def _skip_if_unsupported():
     if not torch.cuda.is_available():
         pytest.skip("FlyDSL HERD routing requires a GPU")
     if get_arch() != "gfx950":
-        pytest.skip("DeepSeek-V4 TP8 FlyDSL HERD is specialized for gfx950")
+        pytest.skip("FlyDSL HERD routing is specialized for gfx950")
 
 
 def _inputs(tokens: int):
     torch.manual_seed(2)
-    logits = torch.randn(
-        (tokens, _DSV4_EXPERTS), dtype=torch.bfloat16, device="cuda"
-    )
-    bias = (
-        torch.randn(_DSV4_EXPERTS, dtype=torch.float32, device="cuda") * 0.1
-    )
+    logits = torch.randn((tokens, _DSV4_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(_DSV4_EXPERTS, dtype=torch.float32, device="cuda") * 0.1
     return logits, bias
 
 
@@ -85,18 +81,12 @@ def test_dsv4_herd_matches_triton(tokens, renorm):
         route_scale,
     )
 
-    weights = torch.empty(
-        (tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda"
-    )
+    weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
     ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
-    herd_topk_gating(
-        weights, ids, logits, bias, renorm, route_scale, "sqrtsoftplus"
-    )
+    herd_topk_gating(weights, ids, logits, bias, renorm, route_scale, "sqrtsoftplus")
 
     assert torch.equal(ids, ref_ids.to(torch.int32))
-    torch.testing.assert_close(
-        weights, ref_weights.float(), atol=2e-3, rtol=2e-3
-    )
+    torch.testing.assert_close(weights, ref_weights.float(), atol=2e-3, rtol=2e-3)
     assert torch.all(ids[:, 1:] > ids[:, :-1])
     if renorm:
         torch.testing.assert_close(
@@ -107,18 +97,47 @@ def test_dsv4_herd_matches_triton(tokens, renorm):
         )
 
 
+@pytest.mark.parametrize(
+    "bias_dtype,row_padding",
+    [(torch.float32, 8), (torch.bfloat16, 0)],
+    ids=["row_strided", "bf16_bias"],
+)
+def test_dsv4_herd_input_variants_match_triton(bias_dtype, row_padding):
+    _skip_if_unsupported()
+    tokens = 32
+    torch.manual_seed(5)
+    logits = torch.randn(
+        (tokens, _DSV4_EXPERTS + row_padding),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )[:, :_DSV4_EXPERTS]
+    assert logits.stride(1) == 1
+    assert logits.is_contiguous() == (row_padding == 0)
+    bias = (torch.randn(_DSV4_EXPERTS, dtype=torch.float32, device="cuda") * 0.1).to(
+        bias_dtype
+    )
+    # Triton's public helper only accepts fp32 bias. Widening preserves every
+    # BF16 value exactly while the HERD call below still exercises BF16 input.
+    ref_weights, ref_ids = _triton_herd(
+        logits, bias.float(), _DSV4_TOPK, "sqrtsoftplus", True, 2.5
+    )
+    weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
+    ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
+
+    herd_topk_gating(weights, ids, logits, bias, True, 2.5, "sqrtsoftplus")
+
+    assert torch.equal(ids, ref_ids.to(torch.int32))
+    torch.testing.assert_close(weights, ref_weights.float(), atol=2e-3, rtol=2e-3)
+
+
 @pytest.mark.parametrize("tokens", [16, 32, 64, 128])
 def test_dsv4_herd_reduces_active_experts(monkeypatch, tokens):
     _skip_if_unsupported()
     logits, bias = _inputs(tokens)
 
     def run():
-        weights = torch.empty(
-            (tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda"
-        )
-        ids = torch.empty(
-            (tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda"
-        )
+        weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
+        ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
         topk_mod.topk_gating(
             weights,
             ids,
@@ -153,12 +172,8 @@ def test_dsv4_herd_window_falls_back(monkeypatch):
     logits, bias = _inputs(tokens)
 
     def run():
-        weights = torch.empty(
-            (tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda"
-        )
-        ids = torch.empty(
-            (tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda"
-        )
+        weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
+        ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
         topk_mod.topk_gating(weights, ids, logits, bias, True, 2.5, "sqrtsoftplus")
         return weights, ids
 
@@ -183,20 +198,14 @@ def test_dsv4_herd_negative_ties_match_triton():
         dtype=torch.bfloat16,
         device="cuda",
     )
-    bias = torch.full(
-        (_DSV4_EXPERTS,), -1.0, dtype=torch.float32, device="cuda"
-    )
+    bias = torch.full((_DSV4_EXPERTS,), -1.0, dtype=torch.float32, device="cuda")
     ref_weights, ref_ids = _triton_herd(
         logits, bias, _DSV4_TOPK, "sqrtsoftplus", True, 2.5
     )
 
-    weights = torch.empty(
-        (tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda"
-    )
+    weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
     ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
-    herd_topk_gating(
-        weights, ids, logits, bias, True, 2.5, "sqrtsoftplus"
-    )
+    herd_topk_gating(weights, ids, logits, bias, True, 2.5, "sqrtsoftplus")
 
     assert torch.equal(ids, ref_ids.to(torch.int32))
     assert torch.equal(weights, ref_weights.float())
@@ -205,28 +214,20 @@ def test_dsv4_herd_negative_ties_match_triton():
 def test_dsv4_herd_dispatch_rejects_fp16(monkeypatch):
     _skip_if_unsupported()
     tokens = 16
-    logits = torch.randn(
-        (tokens, _DSV4_EXPERTS), dtype=torch.float16, device="cuda"
-    )
+    logits = torch.randn((tokens, _DSV4_EXPERTS), dtype=torch.float16, device="cuda")
     bias = torch.randn(_DSV4_EXPERTS, dtype=torch.float32, device="cuda")
-    weights = torch.empty(
-        (tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda"
-    )
+    weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
     ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
 
     monkeypatch.setattr(topk_mod, "_FLYDSL_USE_HERD", True)
-    assert not topk_mod._use_flydsl_herd(
-        weights, ids, logits, bias, "sqrtsoftplus"
-    )
+    assert not topk_mod._use_flydsl_herd(weights, ids, logits, bias, "sqrtsoftplus")
 
 
 def test_dsv4_herd_dispatch_requires_bias(monkeypatch):
     _skip_if_unsupported()
     tokens = 16
     logits, _ = _inputs(tokens)
-    weights = torch.empty(
-        (tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda"
-    )
+    weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
     ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
     empty_bias = torch.empty(0, dtype=torch.float32, device="cuda")
 
@@ -245,8 +246,9 @@ def test_dsv4_herd_dispatch_requires_bias(monkeypatch):
     ids=["kimi_k3", "minimax_m3"],
 )
 @pytest.mark.parametrize("tokens", [16, 32, 64, 128])
+@pytest.mark.parametrize("renorm", [False, True])
 def test_sigmoid_herd_matches_triton(
-    experts, topk, route_scale, row_strided, tokens
+    experts, topk, route_scale, row_strided, tokens, renorm
 ):
     _skip_if_unsupported()
     torch.manual_seed(3)
@@ -259,24 +261,23 @@ def test_sigmoid_herd_matches_triton(
     assert logits.is_contiguous() != row_strided
     bias = torch.randn(experts, dtype=torch.float32, device="cuda") * 0.1
     ref_weights, ref_ids = _triton_herd(
-        logits, bias, topk, "sigmoid", True, route_scale
+        logits, bias, topk, "sigmoid", renorm, route_scale
     )
     weights = torch.empty((tokens, topk), dtype=torch.float32, device="cuda")
     ids = torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
 
-    herd_topk_gating(
-        weights, ids, logits, bias, True, route_scale, "sigmoid"
-    )
+    herd_topk_gating(weights, ids, logits, bias, renorm, route_scale, "sigmoid")
 
     assert torch.equal(ids, ref_ids.to(torch.int32))
     torch.testing.assert_close(weights, ref_weights.float(), atol=2e-6, rtol=2e-6)
     assert torch.all(ids[:, 1:] > ids[:, :-1])
-    torch.testing.assert_close(
-        weights.sum(dim=1),
-        torch.full((tokens,), route_scale, device="cuda"),
-        atol=2e-6,
-        rtol=2e-6,
-    )
+    if renorm:
+        torch.testing.assert_close(
+            weights.sum(dim=1),
+            torch.full((tokens,), route_scale, device="cuda"),
+            atol=2e-6,
+            rtol=2e-6,
+        )
 
 
 @pytest.mark.parametrize(

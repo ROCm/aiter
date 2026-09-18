@@ -27,9 +27,7 @@ def topk_gating_fwd(
 ) -> None: ...
 
 
-@compile_ops(
-    "module_moe_topk", fc_name="topk_gating_herd_candidates", develop=True
-)
+@compile_ops("module_moe_topk", fc_name="topk_gating_herd_candidates", develop=True)
 def topk_gating_herd_candidates_fwd(
     candidate_weights: torch.Tensor,
     candidate_indices: torch.Tensor,
@@ -57,11 +55,8 @@ def _use_flydsl_herd(
         return False
     if gating_output.dim() != 2:
         return False
-    tokens, experts = gating_output.shape
-    if (
-        get_gfx() != "gfx950"
-        or not _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
-    ):
+    tokens = gating_output.shape[0]
+    if get_gfx() != "gfx950" or not _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M:
         return False
 
     # Keep unsupported layouts and dtypes on the established HIP path. Import
@@ -248,12 +243,16 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
-    if num_expert_group == 1 and topk_group == 1 and _use_flydsl_herd(
-        topk_weights,
-        topk_ids,
-        gating_output,
-        correction_bias,
-        "sigmoid",
+    if (
+        num_expert_group == 1
+        and topk_group == 1
+        and _use_flydsl_herd(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias,
+            "sigmoid",
+        )
     ):
         from .flydsl.herd_topk import herd_topk_gating
 

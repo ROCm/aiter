@@ -52,9 +52,7 @@ def build_herd_finalize_module(
     ):
         tid = fx.thread_idx.x
         storage = fx.SharedAllocator().allocate(SharedStorage)
-        popularity = storage.popularity.peek().view(
-            fx.make_layout(num_experts, 1)
-        )
+        popularity = storage.popularity.peek().view(fx.make_layout(num_experts, 1))
 
         for expert in range(tid, Int32(num_experts), Int32(_FINALIZE_THREADS)):
             popularity[expert] = Int32(0)
@@ -93,13 +91,9 @@ def build_herd_finalize_module(
 
             kept_sum = Float32(0.0)
             for j in range_constexpr(kp1):
-                kept_sum = kept_sum + (drop != Int32(j)).select(
-                    values[j], Float32(0.0)
-                )
+                kept_sum = kept_sum + (drop != Int32(j)).select(values[j], Float32(0.0))
             if const_expr(renormalize):
-                scale = routed_scaling_factor / fx.max(
-                    kept_sum, Float32(1e-20)
-                )
+                scale = routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
             else:
                 scale = routed_scaling_factor
 

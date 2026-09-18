@@ -131,6 +131,12 @@ void topk_gating_herd_candidates(aiter_tensor_t& candidate_weights,
                                  aiter_tensor_t& gating_output,
                                  aiter_tensor_t& correction_bias)
 {
+    AITER_CHECK(candidate_weights.dim() == 2 && candidate_indices.dim() == 2,
+                "HERD candidate outputs must be 2-D");
+    AITER_CHECK(gating_output.dim() == 2,
+                "HERD gating_output must be 2-D");
+    AITER_CHECK(correction_bias.dim() == 1,
+                "HERD correction_bias must be 1-D");
     AITER_CHECK(candidate_weights.dtype() == AITER_DTYPE_fp32,
                 "HERD candidate_weights must be float32");
     AITER_CHECK(candidate_indices.dtype() == AITER_DTYPE_i32,
@@ -144,10 +150,27 @@ void topk_gating_herd_candidates(aiter_tensor_t& candidate_weights,
     AITER_CHECK(candidate_indices.size(0) == gating_output.size(0) &&
                     candidate_weights.size(0) == gating_output.size(0),
                 "HERD candidate output rows must match gating_output");
+    AITER_CHECK(gating_output.size(0) >= 1 && gating_output.size(0) <= 128,
+                "HERD candidate selection requires 1 to 128 tokens");
     AITER_CHECK(correction_bias.numel() == 384,
                 "HERD candidate selection requires correction_bias[384]");
+    AITER_CHECK(correction_bias.dtype() == AITER_DTYPE_fp32 ||
+                    correction_bias.dtype() == AITER_DTYPE_bf16,
+                "HERD correction_bias must be float32 or bfloat16");
+    AITER_CHECK(gating_output.is_contiguous() && correction_bias.is_contiguous() &&
+                    candidate_weights.is_contiguous() && candidate_indices.is_contiguous(),
+                "HERD candidate tensors must be contiguous");
+    AITER_CHECK(gating_output.is_gpu() && correction_bias.is_gpu() &&
+                    candidate_weights.is_gpu() && candidate_indices.is_gpu(),
+                "HERD candidate tensors must be on the GPU");
+    AITER_CHECK(gating_output.device_id == correction_bias.device_id &&
+                    gating_output.device_id == candidate_weights.device_id &&
+                    gating_output.device_id == candidate_indices.device_id,
+                "HERD candidate tensors must be on the same GPU");
 
     HipDeviceGuard device_guard(gating_output.device_id);
+    AITER_CHECK(get_warp_size_func() == 64,
+                "HERD candidate selection requires a wave64 GPU");
 
     topk_gating_params p{};
     p.gating                = gating_output.data_ptr();
@@ -164,10 +187,8 @@ void topk_gating_herd_candidates(aiter_tensor_t& candidate_weights,
 
     if(correction_bias.dtype() == AITER_DTYPE_fp32)
         topk_gating_herd_candidates_launch<float>(p);
-    else if(correction_bias.dtype() == AITER_DTYPE_bf16)
-        topk_gating_herd_candidates_launch<hip_bfloat16>(p);
     else
-        AITER_CHECK(false, "HERD correction_bias must be float32 or bfloat16");
+        topk_gating_herd_candidates_launch<hip_bfloat16>(p);
 }
 
 } // namespace aiter
