@@ -84,7 +84,7 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
-        op_tests/multigpu_tests/bench_mega_moe.py)
+        op_tests/multigpu_tests/bench_mega_moe_gfx1250.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
             } | tee -a latest_test.log
