@@ -141,19 +141,6 @@ def collect_candidates(gfx: str) -> list[Candidate]:
     ]
     seen = {c.label for c in candidates}
 
-    from aiter.ops.triton.utils.attention_config_utils import format_mha_shape_key
-
-    shape_key = format_mha_shape_key(
-        mode="varlen",
-        hdim_q=SHAPE["hdim_q"],
-        hdim_v=SHAPE["hdim_v"],
-        nhead_q=SHAPE["nhead"],
-        nhead_k=SHAPE["nhead"],
-        dtype="bfloat16",
-        causal=False,
-        max_seqlen_q=SHAPE["max_seqlen_q"],
-        max_seqlen_k=SHAPE["max_seqlen_k"],
-    )
     for backend in ("gluon", "triton"):
         try:
             if backend == "gluon":
@@ -161,7 +148,7 @@ def collect_candidates(gfx: str) -> list[Candidate]:
                     _get_config as resolve,
                 )
 
-                config = resolve(is_fp8=False, has_pe=False, shape_key=shape_key)
+                config = resolve(is_fp8=False, has_pe=False)
             else:
                 from aiter.ops.triton._triton_kernels.attention.mha import (
                     _get_config as resolve,
@@ -172,7 +159,6 @@ def collect_candidates(gfx: str) -> list[Candidate]:
                     torch.bfloat16,
                     has_pe=False,
                     head_dim_v=SHAPE["hdim_v"],
-                    shape_key=shape_key,
                 )
         except Exception as error:  # noqa: BLE001 - a missing default is not fatal
             print(f"  no incumbent for {backend}: {error}")
