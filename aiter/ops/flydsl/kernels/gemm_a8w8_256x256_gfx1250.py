@@ -69,8 +69,6 @@ def launch_gemm_a8w8_256x256(
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
-        (256, 256, 128, 4, 2, 4),
-        (256, 256, 128, 4, 2, 2),
         (256, 256, 128, 2, 2, 2),
         (128, 128, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 4),
@@ -435,6 +433,9 @@ def launch_gemm_a8w8_256x256(
             for sb_sel in range_constexpr(2)
         ]
         c_frags = [None] * n_acc
+        native_vgpr_pinning = const_expr(
+            mx32 and tile_m == 256 and tile_n == 256
+        )
 
         # Native gfx1250 assembly keeps each 4x4 accumulator quadrant in one
         # 256-VGPR bank.  Within a quadrant it uses this permutation so the
@@ -462,6 +463,8 @@ def launch_gemm_a8w8_256x256(
         acc_regs = [None] * n_acc
 
         def _pin_vgpr(value, reg, suffix="v8f32"):
+            if const_expr(not native_vgpr_pinning):
+                return value
             value = as_ir_value(value)
             return Vec(
                 llvm_dialect.call_intrinsic(
@@ -486,10 +489,22 @@ def launch_gemm_a8w8_256x256(
                 c_frags[idx] = fx.make_rmem_tensor(8, fx.Float32)
                 acc_regs[idx] = reg_base + acc_offsets[pos] + reg_bias
 
-        _alloc_acc_quad(0, 0, False, 0, 4)
-        _alloc_acc_quad(0, 1, False, 256)
-        _alloc_acc_quad(1, 1, True, 512)
-        _alloc_acc_quad(1, 0, True, 768)
+        if const_expr(native_vgpr_pinning):
+            _alloc_acc_quad(0, 0, False, 0, 4)
+            _alloc_acc_quad(0, 1, False, 256)
+            _alloc_acc_quad(1, 1, True, 512)
+            _alloc_acc_quad(1, 0, True, 768)
+        else:
+            for qm in range_constexpr(2):
+                for qn in range_constexpr(2):
+                    for im in range_constexpr(half_m):
+                        for jn in range_constexpr(half_n):
+                            idx = (
+                                (qm * half_m + im) * wmma_n_rep
+                                + qn * half_n
+                                + jn
+                            )
+                            c_frags[idx] = fx.make_rmem_tensor(8, fx.Float32)
         for idx, cf in enumerate(c_frags):
             zero = fx.constant_vector(0.0, T.vec(8, T.f32))
             cf.store(_pin_vgpr(zero, acc_regs[idx]))
@@ -510,9 +525,10 @@ def launch_gemm_a8w8_256x256(
                 scale_a=sb_k[wn // 2 if mx32 else 0],
                 scale_b=sa_k[wm // 2],
             )
-            c_frags[idx].store(
-                _pin_vgpr(c_frags[idx].load(), acc_regs[idx])
-            )
+            if const_expr(native_vgpr_pinning):
+                c_frags[idx].store(
+                    _pin_vgpr(c_frags[idx].load(), acc_regs[idx])
+                )
 
         def _mma_block_range(
             wm0,
@@ -752,6 +768,7 @@ def launch_gemm_a8w8_256x256(
                 produce,
                 n_fast,
                 native_ds_waits=False,
+                ds_after_mma=False,
                 pre=None,
                 post=None,
             ):
@@ -778,8 +795,17 @@ def launch_gemm_a8w8_256x256(
                         produce[pos]()
                     if const_expr(pos == last):
                         for _ in range_constexpr(2 * len(produce)):
-                            rocdl.sched_mfma(3 if _ == 0 else 1)
-                            rocdl.sched_dsrd(DS_PER_FRAG)
+                            # Group barriers select instructions bottom-up. Emit
+                            # DS first to schedule WMMA before the producer read.
+                            if const_expr(ds_after_mma):
+                                rocdl.sched_dsrd(DS_PER_FRAG)
+                                rocdl.sched_mfma(3 if _ == 0 else 1)
+                            elif const_expr(native_vgpr_pinning):
+                                rocdl.sched_mfma(3 if _ == 0 else 1)
+                                rocdl.sched_dsrd(DS_PER_FRAG)
+                            else:
+                                rocdl.sched_mfma(1)
+                                rocdl.sched_dsrd(DS_PER_FRAG // 2)
                         rocdl.sched_barrier(0)
                 if const_expr(post is not None):
                     post()
@@ -814,7 +840,7 @@ def launch_gemm_a8w8_256x256(
                             ),
                         )
 
-                per = const_expr(DS_PER_FRAG)
+                per = const_expr(DS_PER_FRAG if mx32 or tile_m != 256 else 1)
                 return [
                     (
                         lambda i=i, base=base: [
@@ -841,13 +867,9 @@ def launch_gemm_a8w8_256x256(
 
             def _wait_refill():
                 if const_expr(boundary and has_next):
-                    # Keep the post-RA scheduler from hoisting the barrier wait
-                    # ahead of the WMMAs that cover its synchronization latency.
-                    rocdl.sched_barrier(0)
                     pipeline_fence_wait(use_cluster=False)
                     if const_expr(refill):
-                        if wave < 4:
-                            tdm_ops.tensor_load_2d(prepared)
+                        tdm_ops.tensor_load_2d(prepared)
                 rocdl.sched_barrier(0)
 
             n_slots = half_m * half_n
@@ -863,7 +885,7 @@ def launch_gemm_a8w8_256x256(
             # independent WMMAs before waiting.  Keep the smaller profiles at
             # their existing insertion point; only the 256x256 profile has the
             # 16 slots needed to move the wait one slot earlier.
-            wait_at = SLACK - (2 if n_slots == 16 else 1)
+            wait_at = SLACK - (2 if native_vgpr_pinning else 1)
             q2 = {wait_at: _wait_refill}
             q2.update({SLACK + i: t for i, t in enumerate(early[:n_q2])})
             q3 = {i: t for i, t in enumerate(early[n_q2:])}
@@ -888,6 +910,12 @@ def launch_gemm_a8w8_256x256(
 
             sched_fence = lambda: rocdl.sched_barrier(0)
             q1_fast = const_expr(parity == 0 if mx32 else parity == 1)
+            align_native_schedule = const_expr(
+                mx32
+                and tile_m == 256
+                and tile_n == 256
+                and num_buffers == 4
+            )
             if const_expr(parity == 0):
                 # (A0,B0) -> (A0,B1) -> (A1,B1) -> (A1,B0); produce b1 then a1.
                 _quad(
@@ -897,7 +925,7 @@ def launch_gemm_a8w8_256x256(
                     b0,
                     _seq(_mk("b", 1, "b1")),
                     False,
-                    native_ds_waits=True,
+                    native_ds_waits=native_vgpr_pinning,
                 )
                 _quad(
                     0,
@@ -906,7 +934,8 @@ def launch_gemm_a8w8_256x256(
                     nxt["b1"],
                     _seq(_mk("a", 1, "a1")),
                     q1_fast,
-                    native_ds_waits=True,
+                    native_ds_waits=native_vgpr_pinning,
+                    ds_after_mma=align_native_schedule,
                     pre=sched_fence,
                 )
                 _quad(
@@ -936,7 +965,7 @@ def launch_gemm_a8w8_256x256(
                     b0,
                     _seq(_mk("a", 1, "a1")),
                     True,
-                    native_ds_waits=True,
+                    native_ds_waits=native_vgpr_pinning,
                 )
                 _quad(
                     half_m,
@@ -945,7 +974,8 @@ def launch_gemm_a8w8_256x256(
                     b0,
                     _seq(_mk("b", 1, "b1")),
                     q1_fast,
-                    native_ds_waits=True,
+                    native_ds_waits=native_vgpr_pinning,
+                    ds_after_mma=align_native_schedule,
                     pre=sched_fence,
                 )
                 _quad(
@@ -972,8 +1002,7 @@ def launch_gemm_a8w8_256x256(
         for i in range_constexpr(num_buffers):
             seed_delta = fx.Int32(i) * tdm_global_step
             seed_delta = (seed_delta < last_delta).select(seed_delta, last_delta)
-            if wave < 4:
-                tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
+            tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
         pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
         for group in _seed_thunks(0):
             for thunk in group:
@@ -1017,12 +1046,25 @@ def launch_gemm_a8w8_256x256(
                 if do_sync:
                     cluster.cluster_barrier()
 
-        # Both traversals compute the same quadrants.  Keeping both behind a
-        # runtime wave-parity branch makes register allocation cover two large
-        # schedule bodies and scatters the accumulator/operand VGPR banks.
-        # The parity-0 traversal uses substantially fewer physical VGPRs while
-        # preserving the same LDS producer/consumer ordering.
-        _run_steady(0)
+        if const_expr(native_vgpr_pinning):
+            # Both traversals compute the same quadrants.  Keeping both behind a
+            # runtime wave-parity branch makes register allocation cover two
+            # large schedule bodies and scatters the pinned VGPR banks.
+            _run_steady(0)
+        else:
+            wave_parity = fx.Int32(
+                llvm_dialect.inline_asm(
+                    T.i32,
+                    [as_ir_value(rocdl.wave_id())],
+                    "s_and_b32 $0, $1, 1",
+                    "=s,s,~{scc}",
+                    has_side_effects=True,
+                )
+            )
+            if wave_parity == 0:
+                _run_steady(0)
+            else:
+                _run_steady(1)
 
         # Retire the last steady producer before the shared drain.
         rocdl.s_wait_dscnt(0)
@@ -1200,9 +1242,6 @@ def launch_gemm_a8w8_256x256(
 
 launch_gemm_a8w8_256x256.compile_hints["llvm_options"] = {
     "amdgpu-expert-scheduling-mode": True,
-    "amdgpu-sched-strategy": "iterative-ilp",
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
-launch_gemm_a8w8_256x256.compile_hints["waves_per_eu"] = 1
-launch_gemm_a8w8_256x256.compile_hints["maxnreg"] = 1024
