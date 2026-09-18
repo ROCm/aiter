@@ -2490,23 +2490,29 @@ def flydsl_moe_topids_to_rows(
     num_local_tokens: torch.Tensor | None = None,
     num_valid_routes: torch.Tensor | None = None,
     ep_rowmap: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
     When ``g2l_lut`` is given, ``topk_ids`` are treated as GLOBAL expert ids and
     remapped to local buckets on-device (EP fusion): ``g2l_lut[global] -> local``
-    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes claim no
-    slot and get ``moe_route_maps.DROPPED_ROUTE_ROW`` as their row, so the returned
-    counts (== ``masked_m``) cover only the routes whose expert is local to this
-    rank -- everything downstream (psum, contiguous row count, the grouped GEMM's
-    M) shrinks with them, and every consumer of the row map must skip the sentinel.
+    in [0, E); negative or out-of-range entries denote dropped routes. Dropped
+    routes claim no slot and get ``moe_route_maps.DROPPED_ROUTE_ROW`` as their
+    row, so the returned counts (== ``masked_m``) cover only routes whose expert
+    is local to this rank. Everything downstream (psum, contiguous row count,
+    and the grouped GEMM's M) shrinks with them, and every row-map consumer must
+    skip the sentinel.
     The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
     (``weight_dtype``, out) in the same pass -- kept -> cast, dropped -> 0 --
     folding the host ``topk_weight.to(bf16)`` copy + dropped-weight masked_fill.
 
-    ``counter`` is the ``(E,)`` per-expert atomic slot counter; when a pre-zeroed
-    buffer is passed (the g2l-LUT kernel zeroes it as a side output) the host
-    ``torch.zeros(E)`` launch is skipped, otherwise it is allocated here.
+    ``counter`` is the ``(E,)`` per-expert atomic slot counter. A pre-zeroed
+    buffer may be passed to avoid allocating and zeroing one here.
+
+    ``ep_rowmap``, when provided, is initialized to the dropped-route sentinel.
+    The LDS g2l path fuses that initialization into its route kernel; fallback
+    paths initialize it with a separate fill.
+
+    Returns ``(counter, topids_to_rows, num_valid_routes)``.
 
     When ``expert_mask`` is given (instead of ``g2l_lut``), the single-block fused
     kernel builds the LUT in LDS and zeros the counter itself -- collapsing the
@@ -2517,33 +2523,33 @@ def flydsl_moe_topids_to_rows(
     numel = token_num * topk
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
 
-    # Dynamic EP token count (capture-safe): the dispatch buffer is padded to a
-    # static token_num but only the first ``num_local_tokens`` (= total_recv) rows
-    # are valid. Build a (1,) int32 DEVICE scalar num_valid_routes = total_recv*topk
-    # (no host sync); the route kernel treats routes >= this as dropped. When
-    # truncation is disabled we pass ``numel`` so every route stays valid.
-    #
-    # The caller can pass a precomputed ``num_valid_routes`` (the grouped path
-    # already builds ``_ep_nvr = total_recv*topk`` for the psum-remap / quant
-    # kernels); reusing it skips a redundant ``* topk`` elementwise launch here.
+    # The route kernel computes the dynamic EP route bound so the host does not
+    # launch an ATen elementwise multiply. Same-stream consumers can reuse the
+    # written scalar without synchronization.
+    compute_num_valid_routes = num_valid_routes is None and num_local_tokens is not None
     if num_valid_routes is not None:
         num_valid_routes = num_valid_routes.reshape(-1)[:1].to(
             device=device, dtype=torch.int32
         )
-    elif num_local_tokens is not None:
-        num_valid_routes = (
-            num_local_tokens.reshape(-1)[:1].to(device=device, dtype=torch.int32)
-            * int(topk)
-        ).contiguous()
+    elif compute_num_valid_routes:
+        num_valid_routes = torch.empty(1, dtype=torch.int32, device=device)
     else:
         # Null pointer (0-element tensor -> data_ptr() == 0); the kernels read
         # null as "no truncation".
         num_valid_routes = torch.empty(0, dtype=torch.int32, device=device)
+    if num_local_tokens is not None:
+        num_local_tokens = num_local_tokens.reshape(-1)[:1].to(
+            device=device, dtype=torch.int32
+        )
+    else:
+        num_local_tokens = torch.empty(0, dtype=torch.int32, device=device)
 
     if expert_mask is not None:
         # Fused single-block path: build LUT + zero counter + route in one kernel.
         assert gather_w is not None, "expert_mask fused path requires gather_w (out)"
         assert weight_in is not None, "expert_mask fused path requires weight_in (f32)"
+        if ep_rowmap is not None:
+            ep_rowmap.view(torch.int64).fill_(0xFFFFFFFF)
         wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
         counter = torch.empty(E, dtype=torch.int32, device=device)
         mask_i32 = expert_mask.to(torch.int32).reshape(-1)
@@ -2554,14 +2560,17 @@ def flydsl_moe_topids_to_rows(
             ptr_arg(counter),
             ptr_arg(topids_to_rows),
             ptr_arg(gather_w.reshape(-1)),
+            ptr_arg(num_local_tokens),
             ptr_arg(num_valid_routes),
+            int(compute_num_valid_routes),
+            int(topk),
             int(mask_i32.numel()),
             numel,
             int(max_m),
             int(E),
             stream=torch.cuda.current_stream(),
         )
-        return counter, topids_to_rows.view(token_num, topk)
+        return counter, topids_to_rows.view(token_num, topk), num_valid_routes
 
     if counter is None or counter.numel() != E:
         counter = torch.zeros(E, dtype=torch.int32, device=device)
@@ -2581,10 +2590,8 @@ def flydsl_moe_topids_to_rows(
             os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
-        # ep_rowmap sentinel fill: the g2l_lds kernel interleaves i64 fill stores
-        # with route work (fire-and-forget, no extra barrier), eliminating the
-        # standalone .fill_() launch between g2l_lds and psum_remap_ep.  When
-        # ep_rowmap is None the kernel receives a null pointer and skips the fill.
+        # The g2l_lds kernel interleaves ep_rowmap sentinel stores with route
+        # work. The plain fallback initializes the same buffer before launch.
         _ep_rowmap_ptr = (
             ep_rowmap.reshape(-1)
             if ep_rowmap is not None
@@ -2593,25 +2600,49 @@ def flydsl_moe_topids_to_rows(
         _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
         if _use_lds_reduce:
             topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
+            topids_to_rows_kernel(
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(g2l_lut),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+                ptr_arg(gather_w.reshape(-1)),
+                ptr_arg(num_local_tokens),
+                ptr_arg(num_valid_routes),
+                int(compute_num_valid_routes),
+                int(topk),
+                numel,
+                int(max_m),
+                int(E),
+                route_grid,
+                ptr_arg(_ep_rowmap_ptr),
+                int(_ep_rowmap_cap),
+                stream=torch.cuda.current_stream(),
+            )
         else:
+            if ep_rowmap is not None:
+                ep_rowmap.view(torch.int64).fill_(0xFFFFFFFF)
             topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
-        topids_to_rows_kernel(
-            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-            ptr_arg(g2l_lut),
-            ptr_arg(counter),
-            ptr_arg(topids_to_rows),
-            ptr_arg(weight_in.to(torch.float32).reshape(-1)),
-            ptr_arg(gather_w.reshape(-1)),
-            ptr_arg(num_valid_routes),
-            numel,
-            int(max_m),
-            int(E),
-            route_grid,
-            ptr_arg(_ep_rowmap_ptr),
-            int(_ep_rowmap_cap),
-            stream=torch.cuda.current_stream(),
-        )
+            topids_to_rows_kernel(
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(g2l_lut),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                ptr_arg(weight_in.to(torch.float32).reshape(-1)),
+                ptr_arg(gather_w.reshape(-1)),
+                ptr_arg(num_local_tokens),
+                ptr_arg(num_valid_routes),
+                int(compute_num_valid_routes),
+                int(topk),
+                numel,
+                int(max_m),
+                int(E),
+                route_grid,
+                stream=torch.cuda.current_stream(),
+            )
     else:
+        if ep_rowmap is not None:
+            ep_rowmap.view(torch.int64).fill_(0xFFFFFFFF)
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
@@ -2622,7 +2653,7 @@ def flydsl_moe_topids_to_rows(
             route_grid,
             stream=torch.cuda.current_stream(),
         )
-    return counter, topids_to_rows.view(token_num, topk)
+    return counter, topids_to_rows.view(token_num, topk), num_valid_routes
 
 
 def flydsl_moe_fused_route_quant_scatter(
