@@ -3,8 +3,9 @@
 
 """Runtime correctness for FlyDSL INT4 quick all-reduce (``QuickAllReduceInt4``).
 
-``python3`` this file runs an aiter-op-test ``@benchmark`` / markdown sweep.
-Every rank is a ``multiprocessing`` spawn worker that builds its own
+``python3`` this file first runs untimed codec/shape validity, then an
+aiter-op-test ``@benchmark`` / markdown sweep. Every rank is a
+``multiprocessing`` spawn worker that builds its own
 ``QuickAllReduceInt4`` engine, calls ``compile()``, and in the sweep
 times ``fly.allreduce`` with ``run_perftest``. The oracle is an untimed
 fp32 NCCL all-reduce of the same per-rank inputs. INT4 is lossy, so
@@ -23,7 +24,6 @@ import argparse
 import itertools
 import json
 import os
-import statistics
 import sys
 from multiprocessing import Pool, freeze_support, set_start_method
 
@@ -63,15 +63,52 @@ CLOSE_ATOL = 1e-1
 CLOSE_ERR_RATIO = 0.5
 SUPER_TILE = 8
 TP = WORLD
+_FILLS = (
+    "normal",
+    "pos_underflow",
+    "neg_underflow",
+    "overflow_512",
+    "zeros",
+)
+_CODEC_FILL_CASES = (
+    ("pos_underflow", "pos-underflow-2^-8"),
+    ("neg_underflow", "neg-underflow-2^-8"),
+    ("overflow_512", "overflow-512"),
+    ("zeros", "true-zero-scale"),
+)
+# One spawn per world size so compile happens once. hidden=4096 is a width
+# the ST pick was not fitted to; (8, 1024) is smaller than one 32 KiB tile.
+_VALIDITY_SHAPES = {
+    8: [(8, 1024), (512, 5120), (9216, 4096), (32768, 5120)],
+    4: [(512, 5120), (9216, 4096)],
+    2: [(512, 5120), (9216, 4096)],
+}
 
 
 def _make_inp(
-    tokens: int, hidden: int, *, rank: int, device: torch.device
+    tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
 ) -> torch.Tensor:
-    gen = torch.Generator().manual_seed(1234 + rank)
-    return (torch.randn((tokens, hidden), generator=gen, dtype=torch.float32) * 0.1).to(
-        device=device, dtype=torch.bfloat16
-    )
+    shape = (tokens, hidden)
+    if fill == "normal":
+        gen = torch.Generator().manual_seed(1234 + rank)
+        return (torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1).to(
+            device=device, dtype=torch.bfloat16
+        )
+    if fill == "pos_underflow":
+        val = 2.0**-8
+    elif fill == "neg_underflow":
+        val = -(2.0**-8)
+    elif fill == "overflow_512":
+        # Drives the E4M3 scale above its largest exponent, which the encoder
+        # has to saturate. Only rank 0 carries the value: if every rank sent
+        # 512 the reduced sum would also saturate the INT4 group codec, and
+        # the case would fail on codec range rather than on scale encoding.
+        val = 512.0 if rank == 0 else 0.0
+    elif fill == "zeros":
+        val = 0.0
+    else:
+        raise ValueError(f"unknown fill {fill!r}; expected one of {_FILLS}")
+    return torch.full(shape, val, device=device, dtype=torch.bfloat16)
 
 
 def _sqnr(ref_pow: torch.Tensor, mse: torch.Tensor) -> torch.Tensor:
@@ -116,6 +153,7 @@ def _run_rank(
     hiddens: list[int],
     super_tile: int,
     grid_cap: int,
+    fill: str,
     time_it: bool,
 ) -> list[dict]:
     import torch.distributed as dist
@@ -160,7 +198,7 @@ def _run_rank(
     rows = []
     try:
         for ntok, hidden in zip(tokens, hiddens, strict=True):
-            inp = _make_inp(ntok, hidden, rank=rank, device=device)
+            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
             dist.barrier()
@@ -218,6 +256,7 @@ def _spawn(
     time_it: bool,
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
+    fill: str = "normal",
 ) -> list[list[dict]]:
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
@@ -241,6 +280,7 @@ def _spawn(
                     "hiddens": hidden_list,
                     "super_tile": super_tile,
                     "grid_cap": grid_cap,
+                    "fill": fill,
                     "time_it": time_it,
                 },
             )
@@ -264,8 +304,7 @@ def _spawn(
 def _assert_validity(
     ranks: list[list[dict]],
     *,
-    tokens: int,
-    hidden: int,
+    pairs: list[tuple[int, int]],
     world_size: int,
     label: str,
 ) -> dict:
@@ -275,27 +314,24 @@ def _assert_validity(
         )
     fails = []
     for rank, rows in enumerate(ranks):
-        if not rows:
-            fails.append(f"rank {rank}: no rows")
+        if len(rows) != len(pairs):
+            fails.append(f"rank {rank}: {len(rows)} rows, expected {len(pairs)}")
             continue
-        row = rows[0]
-        if row["sqnr_db"] < SQNR_MIN_DB:
-            fails.append(f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}")
-        if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB:
-            fails.append(
-                f"rank {rank}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB "
-                f"< {TILE_SQNR_MIN_DB}"
-            )
-        if row["err"] >= CLOSE_ERR_RATIO:
-            fails.append(
-                f"rank {rank}: checkAllclose err {row['err']:.3f} "
-                f">= {CLOSE_ERR_RATIO}"
-            )
+        for (tokens, hidden), row in zip(pairs, rows, strict=True):
+            where = f"rank {rank} tokens={tokens} hidden={hidden}"
+            if row["sqnr_db"] < SQNR_MIN_DB:
+                fails.append(f"{where}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}")
+            if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB:
+                fails.append(
+                    f"{where}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB "
+                    f"< {TILE_SQNR_MIN_DB}"
+                )
+            if row["err"] >= CLOSE_ERR_RATIO:
+                fails.append(
+                    f"{where}: checkAllclose err {row['err']:.3f} >= {CLOSE_ERR_RATIO}"
+                )
     if fails:
-        raise AssertionError(
-            f"{label} tp={world_size} tokens={tokens} hidden={hidden}: "
-            + "; ".join(fails)
-        )
+        raise AssertionError(f"{label} tp={world_size}: " + "; ".join(fails))
     return ranks[0][0]
 
 
@@ -304,8 +340,7 @@ def test_quick_allreduce_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_C
     ranks = _spawn(tp, [(tokens, hidden)], time_it=True, grid_cap=grid_cap)
     row = _assert_validity(
         ranks,
-        tokens=tokens,
-        hidden=hidden,
+        pairs=[(tokens, hidden)],
         world_size=tp,
         label="bench",
     )
@@ -313,7 +348,7 @@ def test_quick_allreduce_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_C
     # (tp - 1) adds per element; codec ALU work is not counted.
     flops = tokens * hidden * (tp - 1)
     rank_us = [r[0]["us"] for r in ranks]
-    us = statistics.median(rank_us)
+    us = max(rank_us)
     return {
         "gfx": ARCH,
         "tp": tp,
@@ -389,6 +424,31 @@ def main():
         "    measured resident workgroups per CU.",
     )
     args = parser.parse_args()
+
+    if n_gpu < 2:
+        aiter.logger.warning(
+            "QuickAllReduceInt4 needs 2 GPUs for codec fills, have %s; skipping",
+            n_gpu,
+        )
+    else:
+        codec_pairs = [(16, 1024)]
+        for fill, label in _CODEC_FILL_CASES:
+            ranks = _spawn(
+                2, codec_pairs, time_it=False, fill=fill, grid_cap=args.grid_cap
+            )
+            _assert_validity(ranks, pairs=codec_pairs, world_size=2, label=label)
+
+    for tp, pairs in _VALIDITY_SHAPES.items():
+        if n_gpu < tp:
+            aiter.logger.warning(
+                "QuickAllReduceInt4 needs %s GPUs, have %s; skipping validity tp=%s",
+                tp,
+                n_gpu,
+                tp,
+            )
+            continue
+        ranks = _spawn(tp, pairs, time_it=False, grid_cap=args.grid_cap)
+        _assert_validity(ranks, pairs=pairs, world_size=tp, label="validity")
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:

@@ -175,9 +175,7 @@ class QuickAllReduceInt4:
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
-        # set_device rejects torch.device("cuda") with no index; resolve first.
         self._device_index = _cuda_index(device)
-        torch.cuda.set_device(self._device_index)
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
@@ -193,27 +191,28 @@ class QuickAllReduceInt4:
             sts.append(self.super_tile)
         self._by_st = {}
         try:
-            for st in sts:
-                grid = clamp_grid_cap(
-                    cap,
-                    arch=arch,
-                    world_size=self.world_size,
-                    super_tile=st,
-                    cu_count=cu_count,
-                )
-                shared_grid = torch.tensor(grid, dtype=torch.int64)
-                dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                spec = make_quick_allreduce_int4_kernel(
-                    world_size=self.world_size,
-                    super_tile=st,
-                    grid=int(shared_grid.item()),
-                )
-                self._by_st[st] = _StEngine(
-                    spec=spec,
-                    group=self.group,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                )
+            with torch.cuda.device(self._device_index):
+                for st in sts:
+                    grid = clamp_grid_cap(
+                        cap,
+                        arch=arch,
+                        world_size=self.world_size,
+                        super_tile=st,
+                        cu_count=cu_count,
+                    )
+                    shared_grid = torch.tensor(grid, dtype=torch.int64)
+                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
+                    spec = make_quick_allreduce_int4_kernel(
+                        world_size=self.world_size,
+                        super_tile=st,
+                        grid=int(shared_grid.item()),
+                    )
+                    self._by_st[st] = _StEngine(
+                        spec=spec,
+                        group=self.group,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                    )
         except Exception:
             self.close()
             raise
@@ -334,12 +333,13 @@ class QuickAllReduceInt4:
         engines = getattr(self, "_by_st", None)
         if not engines:
             return
-        if getattr(self, "_has_launched", False):
-            torch.cuda.synchronize(self._device_index)
-            self._has_launched = False
-        for eng in engines.values():
-            eng.close()
-        engines.clear()
+        with torch.cuda.device(self._device_index):
+            if getattr(self, "_has_launched", False):
+                torch.cuda.synchronize(self._device_index)
+                self._has_launched = False
+            for eng in engines.values():
+                eng.close()
+            engines.clear()
 
     def __del__(self):
         try:
