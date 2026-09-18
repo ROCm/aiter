@@ -73,12 +73,9 @@ gfx950,256,7482,2048,4096,False,torch.bfloat16,torch.bfloat16,False,False,asm,10
 gfx950,256,186,3336,4096,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,19.5011,native,0.0,260.66,1543.15
 gfx950,256,372,3336,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1882,1,25.4235,flydsl_hgemm_abf16_wbf16_bf16_t96x64x64x4_ks1_w2x1x2_bias0_ktail0_gm0_pft_gfx950,0.0049,399.87,1292.42
 gfx950,256,1242,3336,4096,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,49.5681,native,0.0,684.76,923.77
-gfx950,256,6,4096,2048,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,121,1,5.9481,flydsl_hgemm_abf16_wbf16_bf16_t16x16x256x5_ks1_w1x1x2_bias0_ktail0_gm4_pft_gfx950,0.0037,16.92,2833.0
 gfx950,256,7,4096,1536,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,139,1,5.2436,flydsl_hgemm_abf16_wbf16_bf16_t16x16x256x5_ks1_w1x1x2_bias0_ktail0_gm4_pft_gfx950,0.0034,16.8,2414.71
 gfx950,256,7,4096,2048,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,121,1,5.9448,flydsl_hgemm_abf16_wbf16_bf16_t16x16x256x5_ks1_w1x1x2_bias0_ktail0_gm4_pft_gfx950,0.0038,19.76,2836.64
-gfx950,256,8,4096,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,74,1,4.688,flydsl_hgemm_abf16_wbf16_bf16_t16x16x128x5_ks1_w1x1x2_bias0_ktail0_gm4_pft_gfx950,0.0024,14.32,1806.85
 gfx950,256,8,4096,1536,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,134,1,5.2621,flydsl_hgemm_abf16_wbf16_bf16_t16x16x256x4_ks1_w1x1x2_bias0_ktail0_gm0_pft_gfx950,0.0034,19.13,2408.36
-gfx950,256,8,4096,2048,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,115,1,6.081,flydsl_hgemm_abf16_wbf16_bf16_t16x16x256x4_ks1_w1x1x1_bias0_ktail0_gm4_pft_gfx950,0.0,22.07,2775.12
 gfx950,256,66,4096,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1740,1,6.0052,flydsl_hgemm_abf16_wbf16_bf16_t32x64x64x6_ks1_w1x4x1_bias0_ktail0_gm0_pft_gfx950,0.0,92.19,1509.43
 gfx950,256,72,4096,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1510,1,5.965,flydsl_hgemm_abf16_wbf16_bf16_t32x32x64x8_ks1_w2x1x1_bias0_ktail0_gm0_pft_gfx950,0.0,101.25,1529.91
 gfx950,256,80,4096,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1510,1,6.1061,flydsl_hgemm_abf16_wbf16_bf16_t32x32x64x8_ks1_w2x1x1_bias0_ktail0_gm0_pft_gfx950,0.0,109.9,1507.97
