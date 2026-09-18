@@ -91,23 +91,6 @@ constexpr float SOFTPLUS_LOGIT_CLAMP = FLT_MAX;
 // Keep it far below any real routing sum while still preventing division by 0.
 constexpr float RENORM_SUM_FLOOR = 1e-20f;
 
-// Fused DPP warp argmax: 6x v_max_f32+DPP + ballot + ctzll + readlane ~= 9 instr.
-// NaN-safe: if all lanes have NaN (val_o == max_val is always false), ballot is 0
-// and ctzll(0) is UB.  Detect this via the ballot result and fall back to lane 0.
-__device__ __forceinline__ void warpReduceMax_softplus(float& val_o, int& idx)
-{
-    float max_val   = multithread_reduce_max_dpp<WARP_SIZE>(val_o);
-#if defined(__GFX9__)
-    uint64_t mask   = __ballot(val_o == max_val);
-    int win_lane    = (mask != 0) ? __builtin_ctzll(mask) : 0;
-#else
-    unsigned mask   = static_cast<unsigned>(__ballot(val_o == max_val));
-    int win_lane    = (mask != 0) ? __builtin_ctz(mask) : 0;
-#endif
-    idx             = __builtin_amdgcn_readlane(idx, win_lane);
-    val_o           = max_val;
-}
-
 template <int SCORE_FUNC>
 __device__ __forceinline__ float compute_score(float x)
 {
@@ -309,7 +292,7 @@ __global__ void topk_gating_kernel_opt(
         float my_val = (cursor < EPT) ? vals[cursor] : -INFINITY;
         int   my_idx = (cursor < EPT) ? idxs[cursor] : 0;
 
-        warpReduceMax_softplus(my_val, my_idx);
+        wave_argmax_dpp(my_val, my_idx);
 
         bool  i_won   = (cursor < EPT && idxs[cursor] == my_idx);
         float my_orig = i_won ? orig[cursor] : 0.0f;
@@ -422,7 +405,7 @@ __global__ void topk_gating_kernel_opt_multiwave(
         float my_val = (cursor < EPT) ? vals[cursor] : -INFINITY;
         int   my_idx = (cursor < EPT) ? idxs[cursor] : 0;
 
-        warpReduceMax_softplus(my_val, my_idx);
+        wave_argmax_dpp(my_val, my_idx);
 
         bool  i_won   = (cursor < EPT && idxs[cursor] == my_idx);
         float my_orig = i_won ? orig[cursor] : 0.0f;
@@ -483,45 +466,17 @@ __global__ void topk_gating_kernel_opt_multiwave(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sub-warp argmax over THREADS_PER_ROW aligned lanes: DPP max + ballot, the
-// sub-group form of warpReduceMax_softplus above.
-//
-// Returns the group-relative lane holding the max, with val broadcast to the
-// group.  Selecting the winner by ballot rather than co-reducing the payload is
-// what keeps the result uniform: a value-only compare-and-swap reduce leaves
-// every lane holding its own idx on a tie, and the K-merge keys its invalidate
-// / cursor step on that idx, so each tied lane consumes a different winner
-// while only one of them is recorded.  Synthetic routers hit this constantly --
-// fake-eplb logits are two distinct levels, so a row carries topk
-// bit-identical maxima.
-//
-// ctz resolves ties to the lowest lane, as in warpReduceMax_softplus.  The
-// compare stays in float so NaN still loses; that also keeps the all-NaN group
-// reachable, where the ballot is empty and needs a guard.
-// ---------------------------------------------------------------------------
-
-template <int THREADS_PER_ROW>
-__device__ __forceinline__ int subwarpArgmaxLane(float& val)
-{
-    const float max_val = multithread_reduce_max_dpp<THREADS_PER_ROW>(val);
-
-    constexpr uint64_t GROUP_MASK =
-        (THREADS_PER_ROW >= 64) ? ~0ull : ((1ull << THREADS_PER_ROW) - 1);
-    const int      base = __lane_id() & ~(THREADS_PER_ROW - 1);
-    const uint64_t ties =
-        (static_cast<uint64_t>(__ballot(val == max_val)) >> base) & GROUP_MASK;
-
-    val = max_val;
-    // ties == 0 only when every lane in the group is NaN; ctzll(0) is UB.
-    return (ties != 0) ? __builtin_ctzll(ties) : 0;
-}
-
 // val = group max; orig / idx = the winner's, broadcast to the whole group.
+//
+// The uniform winner is load-bearing here: the K-merge keys its invalidate and
+// cursor step on idx, so on a tie each tied lane would otherwise consume a
+// different winner while only one of them is recorded. Synthetic routers hit
+// this constantly -- fake-eplb logits are two distinct levels, so a row carries
+// topk bit-identical maxima. See multithread_argmax_lane_dpp in hip_reduce.h.
 template <int THREADS_PER_ROW>
 __device__ __forceinline__ int subwarpArgmax(float& val, float& orig, int& idx)
 {
-    const int winner = subwarpArgmaxLane<THREADS_PER_ROW>(val);
+    const int winner = multithread_argmax_lane_dpp<THREADS_PER_ROW>(val);
     orig             = __shfl(orig, winner, THREADS_PER_ROW);
     idx              = __shfl(idx, winner, THREADS_PER_ROW);
     return winner;
@@ -983,7 +938,7 @@ __global__ void topk_gating_kernel(
                 if(tmp[i] > max_val) { max_val = tmp[i]; max_idx = e * vec_size + i; }
             }
         }
-        warpReduceMax_softplus(max_val, max_idx);
+        wave_argmax_dpp(max_val, max_idx);
         if(correction_bias != nullptr)
             max_val -= static_cast<float>(correction_bias[max_idx]);
         scores[max_idx] = -INFINITY;
@@ -1169,7 +1124,7 @@ __global__ void topk_gating_kernel_smem_n(
         }
         // The clear below is keyed on max_idx, so the winner has to be uniform
         // across the group or every tied lane blanks a different expert.
-        const int winner = subwarpArgmaxLane<THREADS_PER_ROW>(max_val);
+        const int winner = multithread_argmax_lane_dpp<THREADS_PER_ROW>(max_val);
         max_idx          = __shfl(max_idx, winner, THREADS_PER_ROW);
 
         if(correction_bias != nullptr)

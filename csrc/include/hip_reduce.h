@@ -531,3 +531,46 @@ __device__ __forceinline__ float multithread_reduce_max_dpp(float v)
 #undef _ASM_DPP_MAX_2
 #undef _ASM_DPP_STEP
 #undef _ASM_DPP_WAIT
+
+// ---------------------------------------------------------------------------
+// Argmax over thread_num aligned lanes: DPP max + ballot, ~9 instructions.
+// Returns the group-relative lane holding the max, with val broadcast to the
+// whole group.
+//
+// Selecting the winner by ballot rather than co-reducing the payload is what
+// keeps the result uniform. A value-only compare-and-swap reduce leaves every
+// lane holding its own key on a tie, so callers that key an invalidate or a
+// cursor step on that key would have each tied lane act on a different winner
+// while only one of them is recorded. Folding the key through the reduce
+// instead fixes that, but costs two v_mov_b32_dpp, a compare and two v_cndmask
+// per stage against this form's single v_max_f32.
+//
+// ctz resolves ties to the lowest lane. The compare stays in float so NaN
+// loses, which also keeps the all-NaN group reachable: there the ballot is
+// empty and needs a guard.
+// ---------------------------------------------------------------------------
+template <int thread_num>
+__device__ __forceinline__ int multithread_argmax_lane_dpp(float& val)
+{
+    static_assert(thread_num <= WARP_SIZE,
+                  "thread_num must not exceed the wave width; "
+                  "multithread_reduce_max_dpp<64> is an identity on wave32");
+
+    const float max_val = multithread_reduce_max_dpp<thread_num>(val);
+
+    constexpr uint64_t GROUP_MASK =
+        (thread_num >= 64) ? ~0ull : ((1ull << thread_num) - 1);
+    const int base = __lane_id() & ~(thread_num - 1);
+    const uint64_t ties =
+        (static_cast<uint64_t>(__ballot(val == max_val)) >> base) & GROUP_MASK;
+
+    val = max_val;
+    // ties == 0 only when every lane in the group is NaN; ctzll(0) is UB.
+    return (ties != 0) ? __builtin_ctzll(ties) : 0;
+}
+
+// val = wave max; idx = the winner's, broadcast to the whole wave.
+__device__ __forceinline__ void wave_argmax_dpp(float& val, int& idx)
+{
+    idx = __builtin_amdgcn_readlane(idx, multithread_argmax_lane_dpp<WARP_SIZE>(val));
+}
