@@ -104,9 +104,24 @@ def select_2d_config(
         if head_size >= 512 and not arch.is_rdna:
             num_warps, num_stages_2d = 4, 2
             TILE_SIZE = 16
+            if DEVICE_ARCH == "gfx942":
+                # gfx942: the default BLOCK_M=16 badly under-tiles head_size 512
+                # prefill. BLOCK_M=64 + waves_per_eu=1 gives ~2.1-2.7x on fp8-KV
+                # prefill (e.g. Gemma-4 full-attention, GQA 32/4) with identical
+                # output (max_diff 0.0156). Measured 88->205 TFLOPS at seqlen 8192
+                # on MI325.
+                BLOCK_M = 64
+                waves_per_eu = 1
         elif head_size >= 256 and not arch.is_rdna:
             num_warps, num_stages_2d = 2, 2
             TILE_SIZE = 32
+            if DEVICE_ARCH == "gfx942":
+                # gfx942: same BLOCK_M under-tiling at head_size 256. BLOCK_M=64 +
+                # waves_per_eu=1 gives ~1.4-1.6x on fp8-KV prefill (e.g. Gemma-4
+                # sliding-window layers, GQA 32/16). Measured 186->295 TFLOPS at
+                # seqlen 8192 on MI325.
+                BLOCK_M = 64
+                waves_per_eu = 1
         else:
             # large prefill config
             if max_seqlen_q >= 256:
@@ -290,6 +305,14 @@ def select_3d_config(
     # with bitwise-identical output. Mirrors the waves_per_eu=8 gfx1151 tuning above.
     if DEVICE_ARCH == "gfx1151":
         attn_warps = 8
+
+    # gfx942: head_size 512 decode (e.g. Gemma-4 full-attention, GQA 32/4) is
+    # memory-bound and the default waves_per_eu=2 under-utilises HBM. waves_per_eu=1
+    # gives ~1.4x at batch>=16 (1462->2047 GB/s at batch 16, ctx 8192 on MI325)
+    # with identical output. Left as-is at batch 1, which is segment-count-limited
+    # (2D-vs-3D split), not waves-limited.
+    if DEVICE_ARCH == "gfx942" and head_size >= 512 and not arch.is_rdna:
+        waves_per_eu = 1
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
