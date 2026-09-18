@@ -12,9 +12,9 @@ Two layers, and the split matters because RMSNorm is not the last fusion this
 will carry:
 
 * **Fusion-agnostic** -- ``FUSIONS``, the row-to-workgroup geometry
-  (:func:`row_block`, :func:`quick_reduce_row_block`), the per-wave LDS
-  partials and :func:`block_reduce_add`. Any row-local epilogue needs exactly
-  these.
+  (:func:`row_block`, :func:`row_block_options`, :func:`quick_reduce_row_block`),
+  the per-wave LDS partials and :func:`block_reduce_add`. Any row-local epilogue
+  needs exactly these.
 * **RMSNorm** -- :func:`residual_add`, :func:`rms_rstd`,
   :func:`scale_by_weight`, kept as three steps rather than one call so a caller
   can issue the ``residual_out`` store *before* the reduction's barrier instead
@@ -102,43 +102,108 @@ def row_block_supported(hidden: int, **kwargs) -> bool:
     return True
 
 
-def quick_reduce_row_block(hidden: int, world_size: int) -> tuple[int, int]:
-    """``(block, atoms_per_row)`` for a fused mesh or ring build.
+def row_block_options(
+    hidden: int,
+    *,
+    atoms_choices,
+    align: int = WAVE,
+    max_block: int = MAX_BLOCK,
+) -> tuple[tuple[int, int], ...]:
+    """Every ``(block, atoms_per_row)`` a fused build can use for hidden dim.
 
-    Picks the narrowest row -- the fewest atoms per row, hence the widest
-    block -- that both :func:`row_block` accepts and the reduce-scatter split
-    can carry. A rank owns ``rank_atoms = ATOMS // world_size``
-    consecutive atoms of a tile, and the epilogue runs on a whole chunk, so a
-    row must fit inside one. ``atoms_per_row`` therefore has to divide
-    ``rank_atoms``.
+    Widest block first, which is ascending ``atoms_per_row``: the fewer atoms a
+    thread owns of the row, the more threads the row spreads over. ``[0]`` is
+    therefore the pick every caller made before this enumerated.
 
-    At ``atoms_per_row == 1`` one atom is one row and this succeeds for every
-    multiple of 1024 up to 8192. Wider rows need ``atoms_per_row > 1``, which
-    TP8 cannot offer and hidden=16384 is TP2/TP4 only.
+    Empty when hidden dim admits no build at all.
+    """
+    opts = []
+    for atoms_per_row in sorted({int(a) for a in atoms_choices}):
+        try:
+            block = row_block(
+                hidden,
+                per_thread=ATOM_ELEMS * atoms_per_row,
+                align=align,
+                max_block=max_block,
+            )
+        except ValueError:
+            continue
+        opts.append((block, atoms_per_row))
+    return tuple(opts)
+
+
+def _quick_reduce_atoms_choices(world_size: int) -> tuple[int, ...]:
+    """``atoms_per_row`` values one reduce-scatter chunk can carry.
+
+    A rank owns ``rank_atoms = ATOMS // world_size`` consecutive atoms of a
+    tile and the epilogue runs on a whole chunk, so a row must fit inside one:
+    ``atoms_per_row`` has to divide ``rank_atoms``.
     """
     world_size = int(world_size)
     if world_size <= 0 or ATOMS % world_size:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
     rank_atoms = ATOMS // world_size
-    first_error = None
-    for atoms_per_row in range(1, rank_atoms + 1):
-        if rank_atoms % atoms_per_row:
-            continue
-        try:
-            block = row_block(
-                hidden,
-                per_thread=ATOM_ELEMS * atoms_per_row,
-                align=BLOCK_ALIGN,
-            )
-        except ValueError as exc:
-            first_error = first_error or exc
-            continue
-        return block, atoms_per_row
+    return tuple(a for a in range(1, rank_atoms + 1) if rank_atoms % a == 0)
+
+
+def quick_reduce_row_block_options(
+    hidden: int, world_size: int
+) -> tuple[tuple[int, int], ...]:
+    """Every ``(block, atoms_per_row)`` a fused mesh or ring build can use."""
+    return row_block_options(
+        hidden,
+        atoms_choices=_quick_reduce_atoms_choices(world_size),
+        align=BLOCK_ALIGN,
+    )
+
+
+def quick_reduce_row_block(hidden: int, world_size: int) -> tuple[int, int]:
+    """``(block, atoms_per_row)`` for a fused mesh or ring build.
+
+    The narrowest row -- the fewest atoms per row, hence the widest block --
+    that both :func:`row_block` accepts and the reduce-scatter split can carry.
+
+    At ``atoms_per_row == 1`` one atom is one row and this succeeds for every
+    multiple of 1024 up to 8192. Wider rows need ``atoms_per_row > 1``, which
+    TP8 cannot offer and hidden=16384 is TP2/TP4 only.
+    """
+    opts = quick_reduce_row_block_options(hidden, world_size)
+    if opts:
+        return opts[0]
+    rank_atoms = ATOMS // int(world_size)
+    narrowest = None
+    try:
+        row_block(hidden, per_thread=ATOM_ELEMS, align=BLOCK_ALIGN)
+    except ValueError as exc:
+        narrowest = exc
     raise ValueError(
         f"no fused build for hidden={hidden} at world_size={world_size}: a row "
         f"must be 1..{rank_atoms} atoms wide (it has to fit inside one "
         f"reduce-scatter chunk) and the resulting block a multiple of "
-        f"{BLOCK_ALIGN} at most {MAX_BLOCK} threads -- {first_error}"
+        f"{BLOCK_ALIGN} at most {MAX_BLOCK} threads -- {narrowest}"
+    ) from narrowest
+
+
+def quick_reduce_row_block_at(
+    hidden: int, world_size: int, block: int | None = None
+) -> tuple[int, int]:
+    """``(block, atoms_per_row)`` for a fused mesh or ring build, block optional.
+
+    ``None`` keeps :func:`quick_reduce_row_block`'s widest pick, which is what
+    every caller got before the block was tunable. 
+    """
+    if block is None:
+        return quick_reduce_row_block(hidden, world_size)
+    block = int(block)
+    opts = quick_reduce_row_block_options(hidden, world_size)
+    for b, a in opts:
+        if b == block:
+            return b, a
+    legal = ", ".join(str(b) for b, _ in opts) if opts else "none"
+    raise ValueError(
+        f"no fused build for hidden={hidden} at world_size={world_size} with "
+        f"block={block}: one workgroup covers one token row, so the legal "
+        f"blocks at this width are {legal}"
     )
 
 

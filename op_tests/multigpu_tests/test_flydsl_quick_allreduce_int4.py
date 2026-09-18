@@ -1195,6 +1195,64 @@ def test_quick_allreduce_rmsnorm_supported_hiddens():
             assert atoms_per_row == 1 and block == hidden // 8, (hidden, world_size)
 
 
+def test_quick_reduce_row_block_is_first_option():
+    """Enumerating the row geometries did not move the pick.
+
+    ``quick_reduce_row_block`` is the widest-block entry of
+    ``quick_reduce_row_block_options``, and every existing caller takes it, so
+    this is the guard that the refactor is invisible to the shipped kernels.
+    Host-side and GPU-free.
+    """
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_row_block,
+        quick_reduce_row_block_options,
+    )
+
+    for world_size in SUPPORTED_WORLDS:
+        for hidden in list(range(1024, 16384 + 1, 1024)) + [5120, 7168]:
+            opts = quick_reduce_row_block_options(hidden, world_size)
+            # Widest first, and each entry really is block * 8 * atoms.
+            assert list(opts) == sorted(opts, reverse=True), (hidden, world_size)
+            for block, atoms in opts:
+                assert block * 8 * atoms == hidden, (hidden, world_size, block)
+            if opts:
+                assert quick_reduce_row_block(hidden, world_size) == opts[0]
+            else:
+                with pytest.raises(ValueError, match="no fused build"):
+                    quick_reduce_row_block(hidden, world_size)
+
+
+def test_fused_one_shot_block_options():
+    """The fused one-shot's whole block axis, and its inverse.
+
+    ``block * atoms * 8 == hidden`` with atoms in ``SUPPORTED_ATOMS`` and the
+    block a whole number of waves at most 1024 -- so the axis is short and
+    width-dependent, which is the thing a tuner has to be told rather than
+    allowed to assume. Host-side and GPU-free.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        fused_atoms_for_block,
+        fused_block,
+        fused_block_options,
+    )
+
+    assert fused_block_options(8192) == ((1024, 1), (512, 2), (256, 4))
+    # atoms=4 would want 224 threads at 7168, which is not a whole wave.
+    assert fused_block_options(7168) == ((896, 1), (448, 2))
+    assert fused_block_options(5120) == ((640, 1), (320, 2))
+    # atoms=1 would want 2048 threads, over the 1024 limit.
+    assert fused_block_options(16384) == ((1024, 2), (512, 4))
+    assert fused_block_options(6000) == ()
+
+    for hidden in (2048, 4096, 5120, 7168, 8192, 16384):
+        for block, atoms in fused_block_options(hidden):
+            assert fused_atoms_for_block(hidden, block) == atoms
+            assert fused_block(hidden, atoms) == block
+
+    with pytest.raises(ValueError, match="896, 448"):
+        fused_atoms_for_block(7168, 256)
+
+
 @benchmark()
 def test_quick_allreduce_int4(
     tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP, algorithm="mesh"

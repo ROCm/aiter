@@ -111,6 +111,19 @@ _FUSED_SHAPE_CASES = tuple(
 # atoms=1 no matter how wrong BLOCK is.
 FUSED_ATOMS_CASES = ((2, 4096), (2, 8192), (4, 4096), (4, 8192))
 
+# The same geometries reached from the other side: pin `block` and let the
+# engine solve for atoms at each width. Worth its own cases because the
+# resolution is per-hidden and hidden-dependent -- block 256 is atoms=4 at 8192
+# and does not exist at 7168 -- so a pinned block is the one knob whose validity
+# the constructor cannot decide on its own.
+FUSED_BLOCK_CASES = ((512, 4096), (256, 8192), (448, 7168))
+
+# Self-skip on the fused kernel: this rank's contribution comes out of registers
+# instead of out of its own inbox. `residual_out` is graded bit-exact, which is
+# what makes this a real check -- reading the register copy must produce the
+# same fp32 accumulation, in the same rank order, as the inbox round trip did.
+FUSED_SKIP_SELF_CASES = ((1, 4096), (8, 7168), (32, 8192))
+
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     ref = ref.double()
@@ -312,9 +325,13 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         device=device,
         rank=rank,
         world_size=args.tp,
+        # atoms and block are the same knob here -- the row has to fit one
+        # workgroup -- so the caller pins one and leaves the other None.
         atoms=args.atoms,
         grid_cap=args.grid_cap,
         fanout=args.fanout,
+        block=args.block,
+        skip_self=args.skip_self,
         # As in the plain test: the payload ceiling is a speed policy, not a
         # correctness limit, so it must not decide what this test covers.
         max_bytes=1 << 30,
@@ -402,12 +419,14 @@ def _run_rank_fused(args, rank, device, dist) -> None:
     dist.destroy_process_group()
 
 
-def _log_path(world_size: int, rank: int, mode: str, atoms: int) -> str:
-    """One log per (world size, rank, mode, atoms) so concurrent spawn
-    configurations cannot overwrite each other's failure tails."""
-    return (
-        f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_{mode}_a{atoms}_rank{rank}.log"
-    )
+def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
+    """One log per (world size, rank, mode, knobs) so concurrent spawn
+    configurations cannot overwrite each other's failure tails.
+
+    *tag* has to name every pinned knob, not just ``atoms``: a block-pinned
+    fused spawn leaves atoms unset, so two of them would otherwise share a path.
+    """
+    return f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_{mode}_{tag}_rank{rank}.log"
 
 
 def _spawn(
@@ -439,6 +458,11 @@ def _spawn(
     env.setdefault("FLYDSL_GPU_ARCH", ARCH)
     tokens = ",".join(str(t) for t, _ in pairs)
     hiddens = ",".join(str(h) for _, h in pairs)
+    tag = f"a{atoms}"
+    if block is not None:
+        tag += f"_b{block}"
+    if skip_self is not None:
+        tag += "_ss" if skip_self else "_noss"
     procs = []
     logs = []
     for rank in range(world_size):
@@ -476,7 +500,7 @@ def _spawn(
         if rank == 0:
             cmd += ["--out", out_path]
         log = open(  # noqa: SIM115
-            _log_path(world_size, rank, mode, atoms),
+            _log_path(world_size, rank, mode, tag),
             "w",
         )
         procs.append(
@@ -496,7 +520,7 @@ def _spawn(
     if rc != 0:
         tails = []
         for rank in range(world_size):
-            path = _log_path(world_size, rank, mode, atoms)
+            path = _log_path(world_size, rank, mode, tag)
             try:
                 with open(path) as fh:
                     tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
@@ -533,16 +557,21 @@ def _index_by_shape(
     }
 
 
-def _batch_cache_lookup(key: tuple, pairs: list[tuple[int, int]]) -> dict:
+def _batch_cache_lookup(
+    key: tuple, pairs: list[tuple[int, int]], **spawn_kwargs
+) -> dict:
     """One ``_spawn`` call per `key`, all shapes computed at once.
 
     ``key`` is ``(world_size, mode)`` or ``(world_size, mode, atoms)``; every
-    axis in it is one that forces a separate spawn.
+    axis in it is one that forces a separate spawn. Anything passed in
+    ``spawn_kwargs`` is such an axis too, so it has to be reflected in *key* --
+    two lookups that differ only in a kwarg would otherwise share one cached
+    spawn.
     """
     if key not in _BATCH_CACHE:
         world_size, mode = key[0], key[1]
-        atoms = key[2] if len(key) > 2 else DEFAULT_ATOMS
-        ranks = _spawn(world_size, pairs, mode=mode, atoms=atoms)
+        spawn_kwargs.setdefault("atoms", key[2] if len(key) > 2 else DEFAULT_ATOMS)
+        ranks = _spawn(world_size, pairs, mode=mode, **spawn_kwargs)
         _BATCH_CACHE[key] = _index_by_shape(ranks, pairs)
     return _BATCH_CACHE[key]
 
@@ -592,6 +621,57 @@ def test_one_shot_allreduce_rmsnorm_atoms(atoms, hidden, world_size):
                 f"{m}x{hidden} atoms={atoms}, tp={world_size}, rank {rank}: "
                 + "; ".join(bad)
             )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("block,hidden", FUSED_BLOCK_CASES)
+def test_one_shot_allreduce_rmsnorm_block(block, hidden, world_size):
+    """Pinning ``block`` instead of ``atoms``, which is the tuner's currency.
+
+    The engine has to solve ``block * atoms * 8 == hidden`` for atoms at this
+    width and build the same kernel the equivalent atoms pin would. What this
+    catches that ``..._atoms`` does not is the resolution itself: an off-by-one
+    there produces a *valid* kernel of the wrong width, which still runs.
+    """
+    pairs = [(m, hidden) for m in (1, 8)]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", f"b{block}", hidden),
+        pairs,
+        atoms=None,
+        block=block,
+    )
+    for m, _ in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} block={block}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden", FUSED_SKIP_SELF_CASES)
+def test_one_shot_allreduce_rmsnorm_skip_self(m, hidden, world_size):
+    """Self-skip under the fused epilogue.
+
+    The plain kernel's self-skip cases cover the wire -- one fewer store, one
+    fewer flag, a remapped spin lane. What is specific here is that the fused
+    epilogue consumes the *unrounded* fp32 accumulator, so it is the path where
+    substituting the register copy for the inbox copy could change a rounding.
+    ``residual_out`` is bit-exact against the reference, so it cannot.
+    """
+    pairs = [(m, hidden)]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", "ss", m, hidden),
+        pairs,
+        # Explicit: key[2] is a label here, not an atoms value, so the
+        # positional inference in _batch_cache_lookup must not be relied on.
+        atoms=DEFAULT_ATOMS,
+        skip_self=True,
+    )
+    for rank, bad in enumerate(batch[(m, hidden)]):
+        assert (
+            not bad
+        ), f"{m}x{hidden} skip_self, tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)

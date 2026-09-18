@@ -42,6 +42,7 @@ from .quick_allreduce_fusions import (
     residual_add,
     rms_rstd,
     row_block,
+    row_block_options,
     row_block_supported,
     scale_by_weight,
 )
@@ -223,16 +224,17 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
 # ``atoms`` therefore sets the *block width* instead -- BLOCK = hidden/(8*atoms)
 # -- and the tile, the flag count and the block count are all independent of it.
 FUSED_ONESHOT_LADDER = {
-    2: ((0, 1, 128, "peer"),),
-    4: ((0, 1, 32, "peer"),),
-    8: ((0, 1, 64, "peer"),),
+    2: ((0, 1, 128, "peer", False),),
+    4: ((0, 1, 32, "peer", False),),
+    8: ((0, 1, 64, "peer", False),),
 }
 
 
 def fused_oneshot_ladder(world_size: int):
     """Rungs for *world_size* under ``fusion="rmsnorm"``. See FUSED_ONESHOT_LADDER."""
     return FUSED_ONESHOT_LADDER.get(
-        int(world_size), ((0, 1, DEFAULT_GRID_CAP, "peer"),)
+        int(world_size),
+        ((0, 1, DEFAULT_GRID_CAP, DEFAULT_FANOUT, DEFAULT_SKIP_SELF),),
     )
 
 
@@ -253,6 +255,26 @@ def fused_block(hidden: int, atoms: int) -> int:
 def fused_hidden_supported(hidden: int, atoms: int = 1) -> bool:
     """Whether a fused build exists for this (hidden, atoms). For host-side gates."""
     return row_block_supported(hidden, per_thread=ATOM_ELEMS * int(atoms), align=WAVE)
+
+
+def fused_block_options(hidden: int) -> tuple[tuple[int, int], ...]:
+    """Every ``(block, atoms)`` a fused build can use at hidden dim, widest first."""
+    return row_block_options(hidden, atoms_choices=SUPPORTED_ATOMS, align=WAVE)
+
+
+def fused_atoms_for_block(hidden: int, block: int) -> int:
+    """``atoms`` giving *block* threads at hidden dim, or raise naming the legal set."""
+    block = int(block)
+    opts = fused_block_options(hidden)
+    for b, a in opts:
+        if b == block:
+            return a
+    legal = ", ".join(str(b) for b, _ in opts) if opts else "none"
+    raise ValueError(
+        f"fused hidden={hidden} has no build at block={block}: one workgroup "
+        f"covers one token row, so block is pinned to hidden/(8*atoms) for "
+        f"atoms in {SUPPORTED_ATOMS} -- the legal blocks here are {legal}"
+    )
 
 
 # Inbox slots are indexed by ``colour & 1``. Two buffers is exactly enough to
@@ -322,7 +344,7 @@ def make_one_shot_allreduce_kernel(
     spin_sleep: int = DEFAULT_SPIN_SLEEP,
     skip_self: bool = False,
     rank: int | None = None,
-    block: int = DEFAULT_BLOCK,
+    block: int | None = None,
     fusion: str = "none",
     hidden: int | None = None,
 ):
@@ -332,8 +354,6 @@ def make_one_shot_allreduce_kernel(
         raise ValueError(f"fusion={fusion!r} requires hidden")
     if fusion == "none" and hidden is not None:
         raise ValueError("hidden is only meaningful for a fused build")
-    if block not in SUPPORTED_BLOCKS:
-        raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -364,11 +384,19 @@ def make_one_shot_allreduce_kernel(
     release_writeback = policy["writeback"]
 
     fused = fusion == "rmsnorm"
-    # The plain schedule keeps the provided block, so its emitted code
-    # is untouched by this factory growing a fused mode. A fused build sizes the
-    # block to the row instead; see ``fused_block``.
     if fused:
-        block = fused_block(hidden, atoms)
+        row_width = fused_block(hidden, atoms)
+        if block is not None and int(block) != row_width:
+            raise ValueError(
+                f"fused hidden={hidden} at atoms={atoms} needs block={row_width}, "
+                f"got block={block}; the legal (block, atoms) pairs for this "
+                f"width are {fused_block_options(hidden)}"
+            )
+        block = row_width
+    else:
+        block = DEFAULT_BLOCK if block is None else int(block)
+        if block not in SUPPORTED_BLOCKS:
+            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
     # Per-wave partials for the block-wide sum of squares. The plain build has
     # no LDS at all.
     n_waves = block // WAVE
@@ -644,7 +672,7 @@ def make_one_shot_allreduce_kernel(
                 rocdl.s_waitcnt(vmcnt=0)
             _acquire_inbox()
 
-        def _reduce(parity, my_atoms):
+        def _reduce_f32(parity, my_atoms):
             """Sum this thread's atom across all N contributions, in rank order.
 
             Rank order, not a rotated order: every rank must accumulate in the
@@ -652,30 +680,34 @@ def make_one_shot_allreduce_kernel(
             ``cross_device_reduce`` makes the same promise for the same reason.
             Under ``skip_self`` our own contribution comes out of the registers
             rather than out of the inbox.
+
+            Left unrounded: the plain path rounds once in ``_reduce``, and the
+            fused path needs the fp32 accumulator for the norm.
             """
             outs = []
             for atom in range_constexpr(atoms):
                 acc = None
                 for src in range_constexpr(world_size):
                     if const_expr(src == self_rank):
-                        v = _atom_bf16_to_f32(my_atoms[atom])
+                        v = atom_bf16_to_f32(my_atoms[atom])
                     else:
                         elem = (
                             _slot_i32(parity, fx.Int32(src))
                             + fx.Int32(atom * block * ATOM_I32)
                             + tid * fx.Int32(ATOM_I32)
                         )
-                        v = _atom_bf16_to_f32(
+                        v = atom_bf16_to_f32(
                             _load_v4i32_at(self_rsrc, elem, _RECV_POLICY)
                         )
                     acc = v if acc is None else acc + v
                 outs.append(acc)
             return outs
 
-        def _reduce(parity):
-            return [atom_f32_to_bf16(a) for a in _reduce_f32(parity)]
+        def _reduce(parity, my_atoms):
+            """The plain path's result: one rounding, at the end of the sum."""
+            return [atom_f32_to_bf16(a) for a in _reduce_f32(parity, my_atoms)]
 
-        def _epilogue(tile, x_atoms, w_atoms, parity, sq_lds):
+        def _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms):
             """bf16 round-trip, residual add, RMSNorm.
 
             The arithmetic lives in ``quick_allreduce_fusions``, which the mesh
@@ -684,7 +716,7 @@ def make_one_shot_allreduce_kernel(
             flight across the barrier rather than issued behind it -- it has no
             dependence on the norm.
             """
-            accs = residual_add(_reduce_f32(parity), x_atoms)
+            accs = residual_add(_reduce_f32(parity, my_atoms), x_atoms)
             _store_rows(res_out_buf, tile, pack_bf16(accs))
             # One block covers one row, so there is a single row to reduce.
             rstd = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)[0]
@@ -726,7 +758,7 @@ def make_one_shot_allreduce_kernel(
             _wait(parity, color)
             if const_expr(probe == "full"):
                 if const_expr(fused):
-                    _epilogue(tile, x_atoms, w_atoms, parity, sq_lds)
+                    _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms)
                 else:
                     _store_tile(tile, _reduce(parity, my_atoms))
             color = color + fx.Int32(1)

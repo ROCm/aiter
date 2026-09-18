@@ -29,6 +29,8 @@ from .kernels.one_shot_allreduce import (
     DEFAULT_SPIN_SLEEP,
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
+    fused_atoms_for_block,
+    fused_block_options,
     fused_hidden_supported,
     fused_oneshot_ladder,
     make_one_shot_allreduce_kernel,
@@ -435,6 +437,10 @@ class OneShotAllReduceRMSNorm:
     collective (IPC handle exchange). Engines are built lazily on first use,
     which is safe because TP ranks enter a collective with the same shape in
     lockstep; pass ``hiddens=(...)`` to build them up front instead.
+
+    Same tuning surface as ``OneShotAllReduce`` with one difference. ``block``
+    is not free: the row has to fit one workgroup, so ``block * atoms * 8 ==
+    hidden`` and picking either of ``atoms``/``block`` picks the other.
     """
 
     def __init__(
@@ -448,17 +454,29 @@ class OneShotAllReduceRMSNorm:
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
         fanout: str | None = None,
+        block: int | None = None,
         max_bytes: int | None = None,
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
+        skip_self: bool | None = None,
         hiddens: tuple[int, ...] = (),
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
-        pinned = atoms is not None or grid_cap is not None or fanout is not None
+        pinned = (
+            atoms is not None
+            or grid_cap is not None
+            or fanout is not None
+            or block is not None
+        )
         if atoms is not None and atoms not in SUPPORTED_ATOMS:
             raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
+        if block is not None and atoms is not None:
+            raise ValueError(
+                f"pin atoms or block, not both: block={block} and atoms={atoms} "
+                "are the same knob here (block * atoms * 8 == hidden)"
+            )
         group_world = dist.get_world_size(group=group)
         group_rank = dist.get_rank(group=group)
         if group_world != int(world_size):
@@ -490,9 +508,11 @@ class OneShotAllReduceRMSNorm:
             max_payload_bytes(world_size) if max_bytes is None else int(max_bytes)
         )
         self.spin_sleep = int(spin_sleep)
+        self.block = None if block is None else int(block)
 
         # ``FUSED_ONESHOT_LADDER``: ``atoms`` sets tile
         # width in the plain schedule and block width here.
+        ss = None if skip_self is None else bool(skip_self)
         if pinned:
             self._ladder = (
                 (
@@ -500,16 +520,24 @@ class OneShotAllReduceRMSNorm:
                     DEFAULT_ATOMS if atoms is None else int(atoms),
                     DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap),
                     DEFAULT_FANOUT if fanout is None else fanout,
+                    DEFAULT_SKIP_SELF if ss is None else ss,
                 ),
             )
         else:
             ceiling = None if grid_cap is None else int(grid_cap)
             self._ladder = tuple(
-                (floor, a, rung_cap if ceiling is None else min(rung_cap, ceiling), f)
-                for floor, a, rung_cap, f in fused_oneshot_ladder(world_size)
+                (
+                    floor,
+                    a,
+                    rung_cap if ceiling is None else min(rung_cap, ceiling),
+                    f,
+                    s if ss is None else ss,
+                )
+                for floor, a, rung_cap, f, s in fused_oneshot_ladder(world_size)
             )
+        self.skip_self = self._ladder[0][4]
 
-        # (hidden, atoms, grid_cap, fanout) -> (engine, spec)
+        # (hidden, atoms, grid_cap, fanout, skip_self) -> (engine, spec)
         self._by_cfg: dict[tuple, tuple] = {}
         try:
             for h in sorted({int(x) for x in hiddens}):
@@ -520,11 +548,22 @@ class OneShotAllReduceRMSNorm:
 
     # -- engine construction -------------------------------------------------
 
+    def _atoms_for(self, hidden: int, rung_atoms: int) -> int:
+        """The rung's ``atoms``, or what a pinned ``block`` means at hidden."""
+        if self.block is None:
+            return int(rung_atoms)
+        return fused_atoms_for_block(int(hidden), self.block)
+
+    def _cfg_key(self, hidden: int, rung: tuple) -> tuple:
+        """A ladder rung's engine key at *hidden*."""
+        _floor, a, cap, f, s = rung
+        return (int(hidden), self._atoms_for(hidden, a), int(cap), f, bool(s))
+
     def _build_hidden(self, hidden: int) -> None:
         """Build every rung for hidden dim. Collective: all ranks must call it in
         the same order,."""
-        for _floor, a, cap, f in self._ladder:
-            key = (int(hidden), int(a), int(cap), f)
+        for rung in self._ladder:
+            key = self._cfg_key(hidden, rung)
             if key in self._by_cfg:
                 continue
             spec = make_one_shot_allreduce_kernel(
@@ -534,6 +573,8 @@ class OneShotAllReduceRMSNorm:
                 inbox_memory=self.inbox_memory,
                 fanout=key[3],
                 spin_sleep=self.spin_sleep,
+                skip_self=key[4],
+                rank=self.rank,
                 fusion="rmsnorm",
                 hidden=key[0],
             )
@@ -554,7 +595,7 @@ class OneShotAllReduceRMSNorm:
         for rung in self._ladder:
             if live_bytes >= rung[0]:
                 chosen = rung
-        key = (int(hidden), int(chosen[1]), int(chosen[2]), chosen[3])
+        key = self._cfg_key(hidden, chosen)
         if key not in self._by_cfg:
             self._build_hidden(int(hidden))
         return key
@@ -569,7 +610,9 @@ class OneShotAllReduceRMSNorm:
         return tuple(sorted({k[0] for k in self._by_cfg}))
 
     def supports_hidden(self, hidden: int) -> bool:
-        """Whether a build exists for *hidden* at every rung of this ladder."""
+        """Whether a build exists for hidden at every rung of this ladder."""
+        if self.block is not None:
+            return any(b == self.block for b, _ in fused_block_options(int(hidden)))
         return all(fused_hidden_supported(int(hidden), r[1]) for r in self._ladder)
 
     # -- launch --------------------------------------------------------------
@@ -612,10 +655,16 @@ class OneShotAllReduceRMSNorm:
         ):
             raise ValueError("out/residual_out must have the input's shape")
         if not self.supports_hidden(hidden):
+            pin = (
+                f"block={self.block}"
+                if self.block is not None
+                else f"atoms={[r[1] for r in self._ladder]}"
+            )
             raise ValueError(
-                f"no fused build for hidden={hidden} at atoms={[r[1] for r in self._ladder]}: "
-                "one block covers one row, so hidden/(8*atoms) must be a multiple of 64 "
-                "and at most 1024"
+                f"no fused build for hidden={hidden} at {pin}: one block covers "
+                "one row, so hidden/(8*atoms) must be a multiple of 64 and at "
+                f"most 1024 -- the legal (block, atoms) pairs for this width are "
+                f"{fused_block_options(hidden)}"
             )
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:

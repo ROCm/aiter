@@ -48,8 +48,7 @@ question instead: all-reduce + residual add + RMSNorm.
 | column          | what runs                                   | fuses |
 |-----------------|---------------------------------------------|-------|
 | ``fused_fly_1stage``  | FlyDSL one-shot with the epilogue fused | yes |
-| ``fused_fly_1stage_a2``/``_a4`` | same, narrower blocks (BLOCK = hidden/(8*atoms)) | yes |
-| ``fused_fly_1stage_g8``/``_g32``/``_g128`` | same, grid-cap sweep | yes |
+| ``fused_fly_1stage_b<block>_g<cap>[_ss]`` | same, pinned block x grid cap x self-skip | yes |
 | ``fused_cdr_1stage``  | ``allreduce_fusion_kernel_1stage`` -- the traced kernel | yes |
 | ``fused_cdr_2stage``  | ``allreduce_fusion_kernel_2stage``      | yes |
 | ``fused_qr_fp8``/``_int4`` | ``qr_all_reduce_rmsnorm`` per codec | yes |
@@ -69,6 +68,15 @@ accuracy, and the ring is where the two-shot family wins at size. Its block is
 sized to the token row (``hidden/8`` threads), so it runs at widths that are a
 multiple of 1024 up to 8192 and reports ``n/a`` elsewhere, where
 ``fused_qr_*`` needs the row to tile a 32 KiB tile evenly instead.
+
+The ``fused_fly_1stage_b*`` rows pin the **block**, which in a fused build is
+not the free knob it is in the plain one. The row has to fit one workgroup, so
+``block * atoms * 8 == hidden``: pinning the block pins the atoms, and which
+blocks exist at all is a function of the width. hidden=7168 admits only 896 and
+448; hidden=8192 admits 1024, 512 and 256. A row whose block this width cannot
+produce is **skipped**, not failed -- expect a different subset of the ``b*``
+rows to report at each shape, which is why they are generated from
+``one_shot_allreduce.fused_block_options`` rather than listed by hand.
 
 The prefix describes the **kernel**, not the mode: ``fused_`` only where the
 kernel genuinely fuses, ``separate_`` for the two-launch baselines. Both run
@@ -314,10 +322,16 @@ try:
     from aiter.ops.flydsl import QuickAllReduceInt4
     from aiter.ops.flydsl import allreduce_policy as policy
     from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        fused_block_options as _fused_block_options,
+    )
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
         fused_hidden_supported as _fused_hidden_supported,
     )
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
         quick_reduce_hidden_supported as _flyqr_hidden_supported,
+    )
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_row_block_options as _flyqr_block_options,
     )
     from aiter.ops.flydsl.one_shot_allreduce import (
         OneShotAllReduce,
@@ -338,7 +352,9 @@ except Exception:  # noqa: BLE001
     OneShotAllReduce = None
     OneShotAllReduceRMSNorm = None
     _fused_hidden_supported = None
+    _fused_block_options = None
     _flyqr_hidden_supported = None
+    _flyqr_block_options = None
     MIN_PAYLOAD_BYTES = 0
     ALGORITHMS = {}
     _resolve_codecs = None
@@ -531,19 +547,58 @@ class Candidate:
             self.skip_self,
         )
 
+    @property
+    def flyqr_rms_cfg(self) -> tuple:
+        """Identity of the QuickAllReduceInt4RMSNorm engine this candidate needs.
+
+        Same shape as ``fly_cfg`` plus ``block``, and like ``fly1s_rms_cfg``
+        deliberately not keyed on hidden: one object serves every width,
+        building a per-hidden inbox on demand. The fused geometry *is* a
+        function of hidden -- the block is sized to the row -- so keying here
+        would build one engine per (config, shape) in a sweep and exhaust the
+        IPC heap. ``block`` is safe to key on because it is a *policy* (pin this
+        width, or take the widest), resolved per hidden inside the engine.
+        """
+        return (
+            self.algorithm,
+            self.super_tile,
+            self.grid_cap,
+            self.rs_codec,
+            self.ag_codec,
+            self.block,
+        )
+
+    @property
+    def fly1s_rms_cfg(self) -> tuple:
+        """Identity of the OneShotAllReduceRMSNorm engine this candidate needs.
+
+        Deliberately the same shape as ``fly1s_cfg`` and *not* keyed on hidden:
+        one engine object serves every width, building a per-hidden inbox on
+        demand. Keying on hidden here would build one engine per (config, shape)
+        in the sweep and exhaust the IPC heap.
+
+        ``atoms`` and ``block`` are the same knob in a fused build -- the row
+        has to fit one workgroup, so one picks the other -- and the fused rows
+        pin ``block``, leaving ``atoms`` None for the engine to resolve per
+        width. Both are in the key anyway: they are engine-identifying, and a
+        row that pinned ``atoms`` instead must not collide with one of these.
+        """
+        return (self.atoms, self.grid_cap, self.fanout, self.skip_self, self.block)
+
+
 _FLY1S_GRID = (
     # block, atoms, grid_cap, fanout   tile
-    (64, 1, 64, "peer"),    # 1 KiB
-    (64, 1, 256, "peer"),   # 1 KiB
+    (64, 1, 64, "peer"),  # 1 KiB
+    (64, 1, 256, "peer"),  # 1 KiB
     (128, 1, 128, "peer"),  # 2 KiB
-    (256, 1, 64, "peer"),   # 4 KiB
+    (256, 1, 64, "peer"),  # 4 KiB
     (256, 1, 128, "peer"),  # 4 KiB
-    (128, 2, 64, "peer"),   # 4 KiB
-    (64, 4, 64, "peer"),    # 4 KiB
-    (256, 2, 64, "peer"),   # 8 KiB
-    (256, 2, 64, "atom"),   # 8 KiB
-    (256, 4, 64, "peer"),   # 16 KiB
-    (256, 4, 64, "atom"),   # 16 KiB
+    (128, 2, 64, "peer"),  # 4 KiB
+    (64, 4, 64, "peer"),  # 4 KiB
+    (256, 2, 64, "peer"),  # 8 KiB
+    (256, 2, 64, "atom"),  # 8 KiB
+    (256, 4, 64, "peer"),  # 16 KiB
+    (256, 4, 64, "atom"),  # 16 KiB
     (256, 4, 128, "peer"),  # 16 KiB
 )
 
@@ -562,7 +617,7 @@ def _fly1s_grid_rows():
                 Candidate(
                     key,
                     "fly1s",
-                    40.0, # min acceptable SQNR value 
+                    40.0,  # min acceptable SQNR value
                     True,
                     atoms=atoms,
                     grid_cap=cap,
@@ -573,34 +628,83 @@ def _fly1s_grid_rows():
             )
     return tuple(rows)
 
-    @property
-    def flyqr_rms_cfg(self) -> tuple:
-        """Identity of the QuickAllReduceInt4RMSNorm engine this candidate needs.
 
-        Same shape as ``fly_cfg`` and, like ``fly1s_rms_cfg``, deliberately not
-        keyed on hidden: one object serves every width, building a per-hidden
-        inbox on demand. The fused geometry *is* a function of hidden -- the
-        block is sized to the row -- so keying here would build one engine per
-        (config, shape) in a sweep and exhaust the IPC heap.
-        """
-        return (
-            self.algorithm,
-            self.super_tile,
-            self.grid_cap,
-            self.rs_codec,
-            self.ag_codec,
-        )
+# Widths the fused grid is generated for. Which blocks exist is a function of
+# hidden -- the row has to fit one workgroup -- so there is no width-independent
+# block list to sweep. Take the union over the widths this bench actually sees
+# and let `_fused_hidden_ok` drop the rows that do not apply at the shape being
+# run; a row keyed on a block that width cannot produce is skipped, not failed.
+_FUSED_GRID_HIDDENS = (4096, 5120, 7168, 8192)
+# Grid cap is the only knob that moves the *block count* in fused mode: the tile
+# is one token row, so the tile size, the wire volume and the flag count are all
+# fixed by the shape. Block moves the thread/work split within a row and the LDS
+# partial count.
+_FUSED_FLY1S_CAPS = (8, 32, 64, 128)
 
-    @property
-    def fly1s_rms_cfg(self) -> tuple:
-        """Identity of the OneShotAllReduceRMSNorm engine this candidate needs.
 
-        Deliberately the same shape as ``fly1s_cfg`` and *not* keyed on hidden:
-        one engine object serves every width, building a per-hidden inbox on
-        demand. Keying on hidden here would build one engine per (config, shape)
-        in the sweep and exhaust the IPC heap.
-        """
-        return (self.atoms, self.grid_cap, self.fanout)
+def _fused_fly1s_grid_rows():
+    """Legal fused blocks x grid cap x self-skip as Candidates.
+
+    The block list comes from the kernel module rather than from a literal here,
+    because it *is* the kernel's constraint: BLOCK = hidden/(8*atoms) has to be a
+    whole number of waves and no wider than 1024.
+    """
+    if _fused_block_options is None:
+        return ()
+    blocks = sorted(
+        {b for h in _FUSED_GRID_HIDDENS for b, _ in _fused_block_options(h)},
+        reverse=True,
+    )
+    rows = []
+    for skip_self in (False, True):
+        for block in blocks:
+            for cap in _FUSED_FLY1S_CAPS:
+                key = f"fused_fly_1stage_b{block}_g{cap}"
+                if skip_self:
+                    key += "_ss"
+                rows.append(
+                    Candidate(
+                        key,
+                        "fused_fly1s",
+                        40.0,  # min acceptable SQNR value
+                        True,
+                        fusion=True,
+                        grid_cap=cap,
+                        block=block,
+                        skip_self=skip_self,
+                    )
+                )
+    return tuple(rows)
+
+
+# Blocks worth pinning on the quantized fused rows. The two-shot geometry is
+# stricter than the one-shot's -- a rank-tile also has to land on the 64 B
+# fabric sector grid, so the block is a multiple of 128 rather than of 64 --
+# and that leaves most widths with no choice at all: 5120 is always 640 and
+# 7168 is always 896, at every world size. Only 4096 (512/256/128) and 8192
+# (1024/512/256) have an axis to sweep, and TP8 collapses both to one. The
+# unpinned `fused_fly_ring`/`fused_fly_mesh` rows already cover the forced
+# widths, so these are the four that add anything.
+_FUSED_FLYQR_BLOCKS = (1024, 512, 256, 128)
+
+
+def _fused_flyqr_grid_rows():
+    """Pinned-block rows for the quantized fused schedules."""
+    rows = []
+    for algorithm, floor in (("ring", 10.0), ("mesh", 15.0)):
+        for block in _FUSED_FLYQR_BLOCKS:
+            rows.append(
+                Candidate(
+                    f"fused_fly_{algorithm}_b{block}",
+                    "fused_flyqr",
+                    floor,  # same floors as the unpinned rows of each schedule
+                    False,
+                    fusion=True,
+                    algorithm=algorithm,
+                    block=block,
+                )
+            )
+    return tuple(rows)
 
 
 # Floors sit ~5 dB below what each candidate measures on a healthy gfx950 build
@@ -750,23 +854,9 @@ CANDIDATES = (
     #
     # The new FlyDSL kernel, ladder-driven. The row this whole mode exists for.
     Candidate("fused_fly_1stage", "fused_fly1s", 40.0, True, fusion=True),
-    # Block-width rows. `atoms` sets BLOCK = hidden/(8*atoms) in a fused build,
-    # NOT the tile width -- the tile is pinned to one token row. So unlike the
-    # plain `fly_1stage_a*` rows these do not change the wire, the flag count or
-    # the block count; they only move the thread/work split and the LDS partial
-    # count. Swept because FUSED_ONESHOT_LADDER ships as a stub.
-    Candidate("fused_fly_1stage_a2", "fused_fly1s", 40.0, True, fusion=True, atoms=2),
-    Candidate("fused_fly_1stage_a4", "fused_fly1s", 40.0, True, fusion=True, atoms=4),
-    # Grid cap is the only knob that moves block count in fused mode.
-    Candidate(
-        "fused_fly_1stage_g8", "fused_fly1s", 40.0, True, fusion=True, grid_cap=8
-    ),
-    Candidate(
-        "fused_fly_1stage_g32", "fused_fly1s", 40.0, True, fusion=True, grid_cap=32
-    ),
-    Candidate(
-        "fused_fly_1stage_g128", "fused_fly1s", 40.0, True, fusion=True, grid_cap=128
-    ),
+    # ... plus the pinned block x grid-cap x self-skip grid, see
+    # `_fused_fly1s_grid_rows`.
+    *_fused_fly1s_grid_rows(),
     # The incumbent: the kernel the Qwen3-235B MXFP4 decode trace spends 3.72 s
     # in, 7.1x the next kernel. Beating this is the point.
     Candidate(
@@ -795,6 +885,8 @@ CANDIDATES = (
     Candidate(
         "fused_fly_mesh", "fused_flyqr", 15.0, False, fusion=True, algorithm="mesh"
     ),
+    # ... plus their pinned-block rows, see `_fused_flyqr_grid_rows`.
+    *_fused_flyqr_grid_rows(),
     Candidate("separate_cdr", "separate", 40.0, True, fusion=True, sep_ar="cdr"),
     Candidate("separate_rccl", "separate", 40.0, True, fusion=True, sep_ar="rccl"),
     # The incumbent quick-reduce's own two-launch baseline, so "does fusing
@@ -877,10 +969,41 @@ def _fused_hidden_ok(hidden: int, cand: Candidate) -> bool:
     a wave64 multiple no wider than 1024. Unlike every other gate in this file
     that is a *compile-time* limit, not a policy, which is why it asks the
     kernel module rather than restating the arithmetic.
+
+    A block-pinned row asks the question the other way round -- "does this width
+    admit this block" -- and the answer is no for most (width, block) pairs:
+    hidden=7168 has only 896 and 448, so a b256 row is *skipped* here rather
+    than failing later. That is the same shape of answer as the atoms form, and
+    it is why these rows can be generated across widths and left to gate.
     """
     if _fused_hidden_supported is None:
         return False
+    if cand.block is not None:
+        if _fused_block_options is None:
+            return False
+        return any(b == cand.block for b, _ in _fused_block_options(int(hidden)))
     return _fused_hidden_supported(int(hidden), 1 if cand.atoms is None else cand.atoms)
+
+
+def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
+    """Whether a pinned block exists for the quantized fused schedules here.
+
+    Unpinned rows take whatever ``quick_reduce_row_block`` picks, so they only
+    need the width to fuse at all. A pinned row needs that *specific* width of
+    workgroup, which most (hidden, world_size) pairs do not offer -- the
+    two-shot geometry also has to land a rank-tile on the 64 B sector grid, and
+    at TP8 that leaves exactly one block per width.
+    """
+    if _flyqr_hidden_supported is None or not _flyqr_hidden_supported(
+        int(hidden), int(world_size)
+    ):
+        return False
+    if cand.block is None:
+        return True
+    if _flyqr_block_options is None:
+        return False
+    opts = _flyqr_block_options(int(hidden), int(world_size))
+    return any(b == cand.block for b, _ in opts)
 
 
 def applicable(
@@ -932,16 +1055,16 @@ def applicable(
         return row <= 32768 and 32768 % row == 0
     if cand.family == "fused_flyqr":
         # Gated on the fused geometry rather than on a payload floor: the block
-        # is hidden/8 threads, so only widths that land on the 64 B sector grid
-        # can build at all. The engines here disable the size floor, as the
-        # plain fly rows do.
+        # is hidden/(8*atoms_per_row) threads, so only widths that land on the
+        # 64 B sector grid can build at all. The engines here disable the size
+        # floor, as the plain fly rows do.
         return (
             HAS_FLY_INT4
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
             and hidden is not None
-            and _flyqr_hidden_supported(hidden, world_size)
+            and _flyqr_block_ok(hidden, world_size, cand)
         )
     if cand.family == "fused_fly1s":
         return (
@@ -2082,7 +2205,7 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         for cfg in wanted_rms:
-            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout"))
+            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout", "skip_self", "block"))
             fly1s_rms[cfg] = OneShotAllReduceRMSNorm(
                 group=tp_group.cpu_group,
                 device=device,
@@ -2132,7 +2255,8 @@ def _worker(
                 world_size=tp_size,
                 algorithm=cfg[0],
                 **_fly_kwargs(
-                    cfg[1:], ("super_tile", "grid_cap", "rs_codec", "ag_codec")
+                    cfg[1:],
+                    ("super_tile", "grid_cap", "rs_codec", "ag_codec", "block"),
                 ),
             )
             # Measure every size the sweep asks for, as the plain fly rows do.

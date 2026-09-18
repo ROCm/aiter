@@ -41,7 +41,7 @@ from .quick_allreduce_fusions import (
     FUSIONS,
     make_wave_partials,
     pack_bf16,
-    quick_reduce_row_block,
+    quick_reduce_row_block_at,
     residual_add,
     rms_rstd,
     scale_by_weight,
@@ -174,6 +174,7 @@ def make_quick_allreduce_int4_kernel(
     codec: str = "int4",
     fusion: str = "none",
     hidden: int | None = None,
+    block: int | None = None,
 ):
     if fusion not in FUSIONS:
         raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
@@ -193,12 +194,11 @@ def make_quick_allreduce_int4_kernel(
         raise ValueError(f"codec must be one of {MESH_CODECS}, got {codec!r}")
 
     fused = fusion == "rmsnorm"
-    # A plain build keeps the shipped 256-thread block; a fused one sizes it so
-    # one 16 B atom is one token row, which puts a whole row inside the block
-    # that reduces it. See quick_allreduce_fusions.
     if fused:
-        block, atoms_per_row = quick_reduce_row_block(hidden, world_size)
+        block, atoms_per_row = quick_reduce_row_block_at(hidden, world_size, block)
     else:
+        if block is not None:
+            raise ValueError("block is only meaningful for a fused build")
         block, atoms_per_row = BLOCK, 1
     rows_per_tile = ATOMS // atoms_per_row
     quads_per_block = block // QUAD_LANES
@@ -824,8 +824,7 @@ def make_quick_allreduce_int4_kernel(
     # in cache bits or wire format must not collide in the JIT cache.
     tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_{codec}"
     if fused:
-        # hidden sets the block width and through it every codec offset.
-        tag += f"_rms_h{hidden}"
+        tag += f"_rms_h{hidden}_b{block}"
     launcher = (
         launch_quick_allreduce_int4_fused if fused else launch_quick_allreduce_int4
     )

@@ -48,7 +48,7 @@ from .quick_allreduce_fusions import (
     FUSIONS,
     make_wave_partials,
     pack_bf16,
-    quick_reduce_row_block,
+    quick_reduce_row_block_at,
     residual_add,
     rms_rstd,
     scale_by_weight,
@@ -157,6 +157,7 @@ def make_quick_allreduce_int4_ring_kernel(
     ag_codec: str = "int4",
     fusion: str = "none",
     hidden: int | None = None,
+    block: int | None = None,
 ):
     """Build the ring kernel for one *rank*.
 
@@ -224,9 +225,13 @@ def make_quick_allreduce_int4_ring_kernel(
     nxt = (rank + 1) % world_size
 
     fused = fusion == "rmsnorm"
+    # An explicit block picks among the widths this hidden dim admits; None keeps
+    # the widest.
     if fused:
-        block, atoms_per_row = quick_reduce_row_block(hidden, world_size)
+        block, atoms_per_row = quick_reduce_row_block_at(hidden, world_size, block)
     else:
+        if block is not None:
+            raise ValueError("block is only meaningful for a fused build")
         block, atoms_per_row = BLOCK, 1
     rows_per_chunk = rank_atoms // atoms_per_row
     quads_per_block = block // QUAD_LANES
@@ -936,9 +941,7 @@ def make_quick_allreduce_int4_ring_kernel(
     # in a compile-time constant must not collide in the JIT cache.
     tag = f"ws{world_size}_r{rank}_st{super_tile}_{inbox_memory}_{rs_codec}_{ag_codec}"
     if fused:
-        # hidden sets the block width, and through it every codec offset, so it
-        # belongs in the key as much as the codec names do.
-        tag += f"_rms_h{hidden}"
+        tag += f"_rms_h{hidden}_b{block}"
     launcher = (
         launch_quick_allreduce_int4_ring_fused
         if fused

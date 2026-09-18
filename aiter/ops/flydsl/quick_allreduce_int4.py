@@ -33,7 +33,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from .kernels.quick_allreduce_codec import CODECS
 from .kernels.quick_allreduce_fusions import (
     quick_reduce_hidden_supported,
-    quick_reduce_row_block,
+    quick_reduce_row_block_at,
+    quick_reduce_row_block_options,
 )
 from .kernels.quick_allreduce_int4 import (
     MESH_CODECS,
@@ -190,6 +191,7 @@ def _build_mesh(
     ag_codec,
     fusion="none",
     hidden=None,
+    block=None,
 ):
     del rank  # a runtime kernel argument, not a mesh build knob
     if rs_codec != ag_codec:
@@ -205,6 +207,7 @@ def _build_mesh(
         codec=rs_codec,
         fusion=fusion,
         hidden=hidden,
+        block=block,
     )
 
 
@@ -1019,6 +1022,7 @@ class QuickAllReduceInt4RMSNorm:
         max_bytes: int | None = None,
         rs_codec: str | None = None,
         ag_codec: str | None = None,
+        block: int | None = None,
         hiddens: tuple[int, ...] = (),
     ):
         if world_size not in SUPPORTED_WORLDS:
@@ -1068,6 +1072,9 @@ class QuickAllReduceInt4RMSNorm:
         self.ag_codec = ag_codec
         self.inbox_memory = resolved_inbox
         self.arch = arch
+        # Threads per block, or None for the widest this width admits. It is not
+        # a free knob: one workgroup covers one token row.
+        self.block = None if block is None else int(block)
         self._algo = algo
         self._inbox_flags = inbox_flags
         self._has_launched = False
@@ -1116,7 +1123,10 @@ class QuickAllReduceInt4RMSNorm:
     # -- engine construction -------------------------------------------------
 
     def supports_hidden(self, hidden: int) -> bool:
-        """Whether a fused build exists for *hidden* at this world size."""
+        """Whether a fused build exists for hidden dim at this world size."""
+        if self.block is not None:
+            opts = quick_reduce_row_block_options(int(hidden), self.world_size)
+            return any(b == self.block for b, _ in opts)
         return quick_reduce_hidden_supported(int(hidden), self.world_size)
 
     def _grid_for(self, super_tile: int, rung_cap: int, block: int) -> int:
@@ -1151,8 +1161,10 @@ class QuickAllReduceInt4RMSNorm:
         hidden = int(hidden)
         if not self.supports_hidden(hidden):
             # Resolve again for the message: it names the constraint that failed.
-            quick_reduce_row_block(hidden, self.world_size)
-        block, _atoms_per_row = quick_reduce_row_block(hidden, self.world_size)
+            quick_reduce_row_block_at(hidden, self.world_size, self.block)
+        block, _atoms_per_row = quick_reduce_row_block_at(
+            hidden, self.world_size, self.block
+        )
         for st in self._by_cap:
             key = (hidden, st)
             if key in self._by_cfg:
@@ -1167,6 +1179,7 @@ class QuickAllReduceInt4RMSNorm:
                 ag_codec=self.ag_codec,
                 fusion="rmsnorm",
                 hidden=hidden,
+                block=block,
             )
             if spec["lds_bytes"] > self._lds_capacity:
                 raise ValueError(
@@ -1280,7 +1293,7 @@ class QuickAllReduceInt4RMSNorm:
         ):
             raise ValueError("out/residual_out must have the input's shape")
         if not self.supports_hidden(hidden):
-            quick_reduce_row_block(hidden, self.world_size)  # raises, naming why
+            quick_reduce_row_block_at(hidden, self.world_size, self.block)
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:
             raise ValueError("payload must not exceed the 4 GiB buffer window")
