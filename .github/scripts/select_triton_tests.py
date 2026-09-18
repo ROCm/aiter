@@ -88,6 +88,13 @@ def category_of(path):
 # Roots the graph follows. Tests are in here as well as sources: the suite
 # reuses reference implementations and input generators across test files, so
 # a fused test often reaches the kernel it exercises only through another test.
+#
+# Invariant: a Triton test reaches the kernel it exercises through one of these
+# roots, or is named after it. A test that gets there only through a module
+# outside them (aiter.ops.shuffle, say) is invisible to the graph. If nothing
+# under aiter/ops/triton is in its closure at all it lands in unmapped() and
+# runs on every selection regardless; if something is, that kernel's changes
+# will not select it. A sweep found no such test on 2026-09-18.
 IMPORT_ROOTS = ("aiter.ops.triton", "op_tests.triton_tests")
 
 
@@ -145,6 +152,22 @@ def changed_files(args):
 
 
 # --- selection --------------------------------------------------------------
+
+
+def unmapped(tests, test_reach, sources):
+    """Tests the selector cannot tie to any source: nothing under
+    aiter/ops/triton in their import closure and no source named after them.
+    Four torch_compile tests today, reaching their op through a dynamic helper.
+    They run on every non-empty selection, since no diff can prove it did not
+    touch them, and the list in the summary is how growth of this set gets
+    noticed."""
+    stems = {stem(s) for s in sources}
+    return [
+        t
+        for t in tests
+        if not any(p.startswith(SRC) for p in test_reach[t])
+        and not (subjects(t) & stems)
+    ]
 
 
 def select(diff):
@@ -207,6 +230,20 @@ def select(diff):
         if f.startswith(TESTS):
             relevant = True
             if basename(f).startswith("test_") and f.endswith(".py"):
+                if not (ROOT / f).is_file():
+                    # Deleted, or renamed away. split_tests.sh refuses a
+                    # selection naming a path that is not a test file, and the
+                    # graph cannot find what imported a module that no longer
+                    # exists -- so run the folder, which is where those
+                    # importers live. A whole folder gone raises, to the full
+                    # suite.
+                    cat = category_of(f)
+                    folder = folder_of(cat, f) if cat else []
+                    selected.update(folder)
+                    reasons.append(
+                        f"{f}: deleted test — not run; '{cat}' folder ({len(folder)})"
+                    )
+                    continue
                 importers = reached_by(f)
                 selected.add(f)
                 selected.update(importers)
@@ -271,6 +308,13 @@ def select(diff):
 
     if relevant and not selected:
         raise RuntimeError("relevant files changed but nothing was selected")
+    if selected:
+        extra = [t for t in unmapped(tests, test_reach, sources) if t not in selected]
+        selected.update(extra)
+        reasons.append(
+            f"{len(extra)} test(s) no source maps to, run on every selection: "
+            + ", ".join(basename(t) for t in extra)
+        )
     return sorted(selected), reasons
 
 
