@@ -681,29 +681,41 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         dst             = sig + bias;
     };
 
+    // Vec2 needs the row pointer 2-element aligned. Odd stride_gating misaligns
+    // token>0; load the same (2L, 2L+1) pair as scalars instead.
+    const bool row_vec2 = (stride_gating % 2) == 0;
+
 #pragma unroll
     for(int j = 0; j < NVEC; j++)
     {
         const int e2 = lane + j * WARP_SIZE;
-        vec_i g      = reinterpret_cast<vec_i const*>(input_ptr)[e2];
+        cktype_i g0, g1;
+        if(row_vec2)
+        {
+            vec_i g = reinterpret_cast<vec_i const*>(input_ptr)[e2];
+            g0      = g[0];
+            g1      = g[1];
+        }
+        else
+        {
+            g0 = input_ptr[e2 * 2];
+            g1 = input_ptr[e2 * 2 + 1];
+        }
         if constexpr(isSoftmax)
         {
-#pragma unroll
-            for(int i = 0; i < 2; i++)
-                s[j][i] = static_cast<float>(g[i]);
+            s[j][0] = static_cast<float>(g0);
+            s[j][1] = static_cast<float>(g1);
         }
         else if constexpr(isBiased)
         {
             vec_i b = reinterpret_cast<vec_i const*>(correction_bias)[e2];
-#pragma unroll
-            for(int i = 0; i < 2; i++)
-                load_sigmoid(g[i], e2 * 2 + i, s[j][i], static_cast<float>(b[i]));
+            load_sigmoid(g0, e2 * 2, s[j][0], static_cast<float>(b[0]));
+            load_sigmoid(g1, e2 * 2 + 1, s[j][1], static_cast<float>(b[1]));
         }
         else
         {
-#pragma unroll
-            for(int i = 0; i < 2; i++)
-                load_sigmoid(g[i], e2 * 2 + i, s[j][i], 0.0f);
+            load_sigmoid(g0, e2 * 2, s[j][0], 0.0f);
+            load_sigmoid(g1, e2 * 2 + 1, s[j][1], 0.0f);
         }
     }
     if constexpr(HAS_TAIL)
@@ -1380,7 +1392,6 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
  * - num_experts % 64 == 0 (odd EPL uses a scalar tail after vec2 prefix)
  * - experts-per-lane in [1, 32], avoid VGPR spilling
  * - topk in [AITER_TOPK_REG_MIN_TOPK, 32]
- * - stride_gating even when EPL >= 2 (vec2 prefix)
  */
 #define LAUNCHER_TOPK_REG()                                                    \
     {                                                                          \
@@ -1393,8 +1404,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
            experts_per_lane >= 1 &&                                            \
            experts_per_lane <= kMaxExpertsPerLane &&                           \
            topk <= reg_lanes / 2 &&                                            \
-           topk >= AITER_TOPK_REG_MIN_TOPK &&                                  \
-           (experts_per_lane < 2 || (stride_gating % 2) == 0))                 \
+           topk >= AITER_TOPK_REG_MIN_TOPK)                                    \
         {                                                                      \
             const size_t shared_mem_size = num_experts * sizeof(float) +       \
                                            reg_lanes * sizeof(float) +         \
