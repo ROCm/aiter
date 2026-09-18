@@ -563,6 +563,10 @@ on 32 splits and is flat at 24.0 us, and prefill stays 519.5 us. The
 **Do not retry** 16 splits for ``4 < M * Hk < 32``; ``M=8`` regressed
 to 31.3 us from 24.1 us.
 
+**Do not retry** extra prefill split-K when ``M * Hk > 512``. Four
+splits kept ``err=0`` and 18 tests, but width-2051 ``L=512`` prefill
+went 519.5 → 548.4 us. Keep the one-split direct ``out`` write.
+
 **Do not retry** next-K/PV overlap. Retrying with local
 ``@flyc.jit`` dispatch, localized page-map LDS views, and explicit
 ``index``-to-``Int64`` conversion compiles and gives ``err=0``, but

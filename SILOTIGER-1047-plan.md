@@ -688,6 +688,11 @@ prefill stays 519.5 us. The decode merge drops from 34
 for the ``4 < M * Hk < 32`` regime: ``M=8`` regressed to 31.3 us from
 24.1 us.
 
+**Do not retry** extra prefill split-K when ``M * Hk > 512``. Raising
+that bucket from 1 to 4 splits keeps ``err=0`` and 18 tests, but
+width-2051 ``L=512`` prefill went 519.5 → 548.4 us; decode was
+unchanged. Direct ``out`` writes with one split stay.
+
 **Do not retry** overlapping the next K gather with PV. A local
 ``@flyc.jit`` dispatcher, localized page-map LDS views, and explicit
 ``index``-to-``Int64`` conversion make the runtime ``if is_first`` /
