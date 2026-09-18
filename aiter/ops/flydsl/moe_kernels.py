@@ -2571,30 +2571,33 @@ def flydsl_moe_topids_to_rows(
         assert gather_w is not None, "g2l_lut requires gather_w (out)"
         assert weight_in is not None, "g2l_lut requires weight_in (f32 route weights)"
         wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
-        # Two-level (LDS -> global) atomic reduction when the bucket count fits
-        # the LDS counter: collapses the per-route device atomics (which serialize
-        # on bucket 0 under EP drops) into one device atomic per non-empty bucket
-        # per block. Falls back to the plain device-atomic kernel for large E.
+        # LDS two-level atomic reduction folds the per-route device atomics (which
+        # serialize on bucket 0 under EP drops) into one per non-empty bucket per
+        # block; plain device-atomic fallback for large E or when disabled.
         from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
 
         _use_lds_reduce = (
             os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
-        # ep_rowmap sentinel fill: the g2l_lds kernel interleaves i64 fill stores
-        # with route work (fire-and-forget, no extra barrier), eliminating the
-        # standalone .fill_() launch between g2l_lds and psum_remap_ep.  When
-        # ep_rowmap is None the kernel receives a null pointer and skips the fill.
         _ep_rowmap_ptr = (
             ep_rowmap.reshape(-1)
             if ep_rowmap is not None
             else torch.empty(0, dtype=torch.int32, device=device)
         )
         _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
+        # Only the LDS launcher takes the ep_rowmap (ptr, cap) tail and fuses its
+        # (-1, 0) sentinel fill (fire-and-forget stores, no standalone .fill_()).
+        # The plain fallback keeps the pre-ep_rowmap signature, so pass no tail and
+        # do the fill on the host -- (-1, 0) per (cap, 2) i32 row == 0xFFFFFFFF i64.
         if _use_lds_reduce:
             topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
+            _ep_tail = (ptr_arg(_ep_rowmap_ptr), int(_ep_rowmap_cap))
         else:
             topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
+            if ep_rowmap is not None:
+                ep_rowmap.reshape(-1).view(torch.int64).fill_(0xFFFFFFFF)
+            _ep_tail = ()
         topids_to_rows_kernel(
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
             ptr_arg(g2l_lut),
@@ -2607,8 +2610,7 @@ def flydsl_moe_topids_to_rows(
             int(max_m),
             int(E),
             route_grid,
-            ptr_arg(_ep_rowmap_ptr),
-            int(_ep_rowmap_cap),
+            *_ep_tail,
             stream=torch.cuda.current_stream(),
         )
     else:

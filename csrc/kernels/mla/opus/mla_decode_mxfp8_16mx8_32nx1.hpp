@@ -1,11 +1,12 @@
 #pragma once
 
-#include "defs.h"
+#include "mla_decode_kargs.h"
+#include "mla_decode_traits.h"
 
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs)
+__global__ void opus_mla_decode_mxfp8_16mx8_32nx1_kernel(opus_mla_decode_mxfp8_kargs)
 {
 }
 
@@ -17,7 +18,7 @@ __global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs)
 
 using opus::operator""_I;
 
-namespace dsa_v32_16mx8_32nx1_fp8 {
+namespace opus_mla_decode_mxfp8_16mx8_32nx1 {
 
 // [sched exp] instruction-group masks for __builtin_amdgcn_sched_group_barrier
 namespace sched_masks {
@@ -32,7 +33,7 @@ constexpr int EXP     = 0x400;
 // MFMAs hide the K/rope/scale DS_READs and the softmax/dequant VALU/EXP.
 // sched_group_barrier only reorders within data-dependency constraints -> correctness-safe.
 template <int G>
-__device__ inline void sched_compute_qk_dsa()
+__device__ inline void sched_compute_qk()
 {
     using namespace sched_masks;
     opus::static_for<10>([&](auto) {
@@ -609,7 +610,7 @@ __device__ inline void attn_mask_causal_kv_tile(V& v_s,
 }
 
 template <class Traits, class VQN, class VQR, class VO>
-__device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
+__device__ void mla_decode_le2_tiles(opus_mla_decode_mxfp8_kargs kargs,
                                          int page_idx_begin,
                                          int valid_kv_len,
                                          int tile_begin,
@@ -843,7 +844,7 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
 }
 
 template <class Traits, bool OddTail, class VQN, class VQR, class VO>
-__device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
+__device__ void mla_decode_pipelined(opus_mla_decode_mxfp8_kargs kargs,
                                          int page_idx_begin,
                                          int valid_kv_len,
                                          int tile_begin,
@@ -1137,7 +1138,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-        sched_compute_qk_dsa<0>();
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1201,7 +1202,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-        sched_compute_qk_dsa<0>();
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1273,7 +1274,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-        sched_compute_qk_dsa<0>();
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1328,7 +1329,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-        sched_compute_qk_dsa<0>();
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1411,7 +1412,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-        sched_compute_qk_dsa<0>();
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1469,7 +1470,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-        sched_compute_qk_dsa<0>();
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1526,7 +1527,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-        sched_compute_qk_dsa<0>();
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1584,8 +1585,8 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
 }
 
 template <class Traits>
-__device__ void dsa_v32_decode_one_req(
-    dsa_kargs kargs, int w, char* smem_kv, char* smem_kv_scale, float temperature_scale)
+__device__ void mla_decode_one_work(
+    opus_mla_decode_mxfp8_kargs kargs, int w, char* smem_kv, char* smem_kv_scale, float temperature_scale)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -1598,14 +1599,14 @@ __device__ void dsa_v32_decode_one_req(
     asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    const int* work_item                 = kargs.work_info_set + w * 8;
-    const int batch_idx                  = work_item[0];
-    const int slot                       = work_item[1];
-    const int q_len_ptr_s                = work_item[2];
-    const int q_len_ptr_e                = work_item[3];
-    const int kv_ind_ptr_s               = work_item[4];
-    const int kv_ind_ptr_e               = work_item[5];
-    [[maybe_unused]] const int kv_offset = work_item[6];
+    const opus_mla_decode_work_info work_item = kargs.work_info_set[w];
+    const int batch_idx                  = work_item.batch_idx;
+    const int slot                       = work_item.partial_slot;
+    const int q_len_ptr_s                = work_item.qo_start;
+    const int q_len_ptr_e                = work_item.qo_end;
+    const int kv_ind_ptr_s               = work_item.kv_start;
+    const int kv_ind_ptr_e               = work_item.kv_end;
+    [[maybe_unused]] const int kv_offset = work_item.kv_offset;
 
     const int q_len        = q_len_ptr_e - q_len_ptr_s;
     const int valid_kv_len = kv_ind_ptr_e - kv_ind_ptr_s;
@@ -1650,7 +1651,7 @@ __device__ void dsa_v32_decode_one_req(
 
     if(num_kv_tiles <= 2)
     {
-        dsa_v32_decode_le2_tiles<Traits>(kargs,
+        mla_decode_le2_tiles<Traits>(kargs,
                                          kv_ind_ptr_s,
                                          valid_kv_len,
                                          0,
@@ -1670,7 +1671,7 @@ __device__ void dsa_v32_decode_one_req(
     }
     else if(num_kv_tiles & 1)
     {
-        dsa_v32_decode_pipelined<Traits, true>(kargs,
+        mla_decode_pipelined<Traits, true>(kargs,
                                                kv_ind_ptr_s,
                                                valid_kv_len,
                                                0,
@@ -1690,7 +1691,7 @@ __device__ void dsa_v32_decode_one_req(
     }
     else
     {
-        dsa_v32_decode_pipelined<Traits, false>(kargs,
+        mla_decode_pipelined<Traits, false>(kargs,
                                                 kv_ind_ptr_s,
                                                 valid_kv_len,
                                                 0,
@@ -1747,14 +1748,14 @@ __device__ void dsa_v32_decode_one_req(
     }
 }
 
-} // namespace dsa_v32_16mx8_32nx1_fp8
+} // namespace opus_mla_decode_mxfp8_16mx8_32nx1
 
 template <class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE,
-                             2) void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs kargs)
+                             2) void opus_mla_decode_mxfp8_16mx8_32nx1_kernel(opus_mla_decode_mxfp8_kargs kargs)
 {
     using namespace opus;
-    using namespace dsa_v32_16mx8_32nx1_fp8;
+    using namespace opus_mla_decode_mxfp8_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
 
     const int work_id = block_id_x();
@@ -1773,7 +1774,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
     for(int w = work_idx_start; w < work_idx_end; ++w)
     {
         __builtin_amdgcn_s_barrier();
-        dsa_v32_decode_one_req<Traits>(kargs, w, smem_kv, smem_kv_scale, temperature_scale);
+        mla_decode_one_work<Traits>(kargs, w, smem_kv, smem_kv_scale, temperature_scale);
     }
 }
 
