@@ -635,6 +635,12 @@ are not the split-kernel gap. Keep scalar P gathers.
 Decode oracle ``err≈0.98``. Same class of miss as MMA-native PV B on this
 layout. Keep scalar ``v_lds[n, d]`` gathers.
 
+**Do not retry** decode-only wave-0 full-D QK (8×K32 on wave 0, skip the
+cross-wave C sum). 18 pytest cases, ``err=0``; width-2051 ``L=512`` was
+20.5 / 24.0 / 513.0 us vs 19.8 / 22.7 / 513.5. Prefill is unchanged
+(128 threads still split D). Idle waves plus extra Q fragments do not
+close the split-kernel gap. Keep D-split QK across four waves.
+
 
 
 
