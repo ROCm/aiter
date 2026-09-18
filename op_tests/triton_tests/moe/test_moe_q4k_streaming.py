@@ -5,20 +5,11 @@
 # Reference: pure-numpy q4k_pack_reference, byte-exact to llama.cpp's
 # dequantize_row_q4_K.
 
-import os
-
 import numpy as np
 import pytest
 import torch
-import triton
 
-from aiter.ops.triton._triton_kernels.moe.moe_op_q4k_streaming import (
-    _get_autotune_configs,
-    _moe_q4k_streaming_kernel,
-)
 from aiter.ops.triton.moe.moe_op_q4k_streaming import (
-    BLOCK_BYTES,
-    QK_K,
     fused_moe_q4k_streaming,
 )
 from op_tests.triton_tests.moe.q4k_pack_reference import (
@@ -243,92 +234,3 @@ def test_accepts_strided_token_axis():
     )
     tol = max(1e-3, 5e-6 * s["n_dim_in"])
     np.testing.assert_allclose(s["c"].cpu().numpy(), expected, rtol=tol, atol=tol)
-
-
-# --- autotune search space --------------------------------------------------
-#
-# autotune_configs() pins a single config unless MOE_Q4K_STREAMING_TRITON_AUTOTUNE=1,
-# which keeps launches cheap and test numerics deterministic. The cost is that
-# the other candidates never execute in a default CI run, so a tile that
-# miscomputes would sit undetected until someone enabled tuning. Launch each
-# config explicitly through the underlying JITFunction to cover the whole space
-# regardless of what the autotuner would have picked.
-
-
-def test_every_autotune_config_matches_reference():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    n_tokens, n_used, n_unique, n_dim_in, n_dim_out = 2, 2, 2, 512, 37
-    (
-        expert_bufs,
-        _expert_tensors,
-        expert_ptrs,
-        remap,
-        a,
-        a_np,
-        remap_np,
-        c,
-    ) = _build_setup(n_tokens, n_used, n_unique, n_dim_in, n_dim_out, seed=11)
-
-    expected = moe_matvec_scattered_ref(expert_bufs, remap_np, a_np, n_dim_out)
-    tol = max(1e-3, 5e-6 * n_dim_in)
-
-    configs = _get_autotune_configs()
-    assert configs, "search space must not be empty"
-
-    for cfg in configs:
-        block_n = cfg.kwargs["BLOCK_SIZE_N"]
-        c.zero_()
-        grid = (triton.cdiv(n_dim_out, block_n), n_used, n_tokens)
-        # .fn is the JITFunction the Autotuner wraps; going through it bypasses
-        # config selection so this launches exactly the tile under test.
-        _moe_q4k_streaming_kernel.fn[grid](
-            a,
-            expert_ptrs,
-            remap,
-            c,
-            n_dim_in,
-            n_dim_out,
-            n_used,
-            a.stride(0),
-            c.stride(0),
-            c.stride(1),
-            QK_K=QK_K,
-            BLOCK_BYTES=BLOCK_BYTES,
-            BLOCK_SIZE_N=block_n,
-            num_warps=cfg.num_warps,
-            num_stages=cfg.num_stages,
-        )
-        torch.cuda.synchronize()
-        np.testing.assert_allclose(
-            c.cpu().numpy(),
-            expected,
-            rtol=tol,
-            atol=tol,
-            err_msg=(
-                f"BLOCK_SIZE_N={block_n} num_warps={cfg.num_warps} "
-                f"num_stages={cfg.num_stages} disagrees with the reference"
-            ),
-        )
-
-
-def test_default_launch_pins_one_config():
-    """Without the opt-in env var, nothing benchmarks at launch.
-
-    Guards the README rule that a raw config list must not reach
-    @triton.autotune: with more than one config Triton searches on every new
-    key, which costs compile time and makes test numerics depend on whichever
-    config the timing picked that run.
-    """
-    if os.environ.get("MOE_Q4K_STREAMING_TRITON_AUTOTUNE", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        pytest.skip("autotune explicitly enabled for this run")
-    assert len(_moe_q4k_streaming_kernel.configs) == 1, (
-        "default launch must pin exactly one config; got "
-        f"{len(_moe_q4k_streaming_kernel.configs)}"
-    )

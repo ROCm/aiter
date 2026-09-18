@@ -79,10 +79,9 @@ def fused_moe_q4k_streaming(
     assert remap.shape[0] == n_tokens
     assert C.shape == (n_tokens, n_used_per_token, n_dim_out)
 
-    # See "Stride contract" above. The kernel silently reads the wrong
-    # addresses if any of these are violated, so they are checked rather than
-    # assumed. Nothing here is made contiguous on the caller's behalf: that
-    # would hide a per-dispatch copy in an inference hot path.
+    # Violating any of these makes the kernel read the wrong addresses without
+    # erroring. Nothing is made contiguous here: that would hide a per-dispatch
+    # copy in an inference hot path.
     assert A.stride(1) == 1, (
         f"A must have unit stride along n_dim_in, got stride {A.stride()}; "
         "pass a row-contiguous activation buffer"
@@ -99,10 +98,6 @@ def fused_moe_q4k_streaming(
         expert_ptrs.is_contiguous()
     ), f"expert_ptrs must be contiguous, got stride {expert_ptrs.stride()}"
 
-    # %-style placeholders, not an f-string: AITER_TRITON_LOG_LEVEL defaults to
-    # WARNING, so at INFO this message is discarded, and this wrapper sits in a
-    # per-dispatch inference path. Passing the values as args lets logging skip
-    # the formatting entirely below the configured level.
     _LOGGER.info(
         "MOE_OP_Q4K_STREAMING: A=%s C=%s n_unique_experts=%d n_used_per_token=%d",
         tuple(A.shape),

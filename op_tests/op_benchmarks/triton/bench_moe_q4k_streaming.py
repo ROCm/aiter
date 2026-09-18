@@ -9,14 +9,11 @@
 # not include any host-side cache-miss / SSD-read time, since those are
 # orthogonal to kernel performance.
 #
-# Bandwidth is reported two ways, because the kernel does not deduplicate:
-# it reads a full expert matrix per (token, slot) pair even when two slots
-# resolve to the same expert. The GB/s column divides by the bytes actually
-# issued; the dedup column divides by distinct-expert bytes, which is what a
-# fetch-coalescing cache in front of the kernel would move. Quoting the dedup
-# figure as achieved HBM bandwidth understates the issued traffic, so both
-# are printed. The remap is pinned to a fixed distinct-expert count so the
-# two stay comparable across runs and seeds.
+# Bandwidth is reported two ways because the kernel does not deduplicate: it
+# reads a full expert matrix per (token, slot) pair even when two slots resolve
+# to the same expert. GB/s divides by issued bytes, dedup by distinct-expert
+# bytes. The remap is pinned to a fixed distinct-expert count so both stay
+# comparable across seeds.
 
 import argparse
 import sys
@@ -48,12 +45,9 @@ def _build_inputs(n_tokens, n_used_per_token, n_unique, n_dim_in, n_dim_out, see
     expert_ptrs = torch.tensor(
         [t.data_ptr() for t in expert_tensors], dtype=torch.uint64, device="cuda"
     )
-    # Pin the distinct-expert set. Drawing with replacement would leave the
-    # number of distinct experts actually referenced varying with the seed
-    # (16 draws from 8 experts touch ~6.6 of them on average), which makes the
-    # dedup column below incomparable across runs. Assign round-robin so
-    # exactly min(n_unique, n_tokens * n_used_per_token) experts are touched,
-    # then permute so the access order is not sorted.
+    # Round-robin, then permute: drawing with replacement would leave the
+    # distinct-expert count varying with the seed (16 draws from 8 experts touch
+    # ~6.6 on average), making the dedup column incomparable across runs.
     n_dispatch = n_tokens * n_used_per_token
     remap_flat = np.arange(n_dispatch, dtype=np.int32) % n_unique
     remap_flat = rng.permutation(remap_flat)
