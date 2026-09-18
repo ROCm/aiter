@@ -670,6 +670,13 @@ on copy_B. 18 pytest cases, ``err=0``; width-2051 ``L=512`` was 18.8 /
 21.7 / 513.4 us vs 18.5 / 21.1 / 516.2. Same class of miss as 64-bit
 scalar-pack P loads. Keep scalar ``p_lds[lane_m, n0:n0+4]`` gathers.
 
+**Do not retry** shuffle-pack 128-bit token-major V LDS stores
+(``shuffle_xor`` 8 tokens per D, ``UniversalCopy128b`` from
+``col % 8 == 0``). 18 pytest cases, ``err=0``; width-2051 ``L=512`` was
+24.7 / 29.1 / 516.5 us vs 18.5 / 21.1 / 516.2. Decode lost ~33%; shuffle
+cost dominates scalar ``ds_write_b16``. Keep per-element
+``v_lds[d, col]`` stores.
+
 
 
 
