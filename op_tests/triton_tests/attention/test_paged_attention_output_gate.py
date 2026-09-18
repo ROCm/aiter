@@ -105,7 +105,7 @@ def _reference(q, kc, vc, indptr, indices, gate, scale, k_scale, v_scale, quant_
     # powers of two, plus the non-power-of-two sizes a graph capture asks for
     [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 128],
 )
-@pytest.mark.parametrize("heads", [4, 8])
+@pytest.mark.parametrize("heads", [4, 8, 16])
 @pytest.mark.parametrize("ctx_len", [1, 129, 1024])
 # One hint on each side of the crossover, so both bodies see every shape.
 @pytest.mark.parametrize("max_context", [_SHORT_CONTEXT_MAX, _SHORT_CONTEXT_MAX * 2])
@@ -194,7 +194,7 @@ def test_max_context_hint_never_clamps(rows):
 
 
 @pytest.mark.parametrize("rows", [1, 8, 32])
-@pytest.mark.parametrize("heads", [4, 8])
+@pytest.mark.parametrize("heads", [4, 8, 16])
 def test_bodies_agree(rows, heads):
     """The two bodies are a performance choice, so they must agree numerically.
 
