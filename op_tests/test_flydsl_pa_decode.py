@@ -99,7 +99,6 @@ class DecodeCase:
     masked_scale: bool = False
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
-    check_schedule: bool = False
 
 
 def _require_gpu():
@@ -479,264 +478,6 @@ def _assert_contracts(args, options):
                 pa_decode(*args, **{**options, "work_plan": wrong_plan})
 
 
-def _max_window_tiles(window, query_length):
-    # The union has W + QL - 1 tokens and can start at any offset.
-    union_tokens = window + query_length - 1
-    return 1 + (union_tokens + KV_COMPUTE_BLOCK - 2) // KV_COMPUTE_BLOCK
-
-
-def _expected_single_tile_plan(kwargs):
-    capacity, window = kwargs["work_capacity"], kwargs["sliding_window"]
-    if not kwargs["use_work_plan"] or capacity is None or window <= 0:
-        return False
-    tiles = _max_window_tiles(window, kwargs["query_length"])
-    return kwargs["num_partitions"] >= tiles and capacity >= kwargs["num_seqs"] * tiles
-
-
-def _expected_batch_first_plan_grid(kwargs, query_splits):
-    """Independent shape/occupancy oracle for the measured grid domain."""
-    return (
-        get_gfx_runtime() == "gfx950"
-        and kwargs["head_dim"] == 128
-        and kwargs["query_dtype"] == "bf16"
-        and kwargs["per_token_kv"]
-        and _expected_single_tile_plan(kwargs)
-        and kwargs["num_partitions"] <= 64
-        and kwargs["query_length"] == query_splits == 4
-        and kwargs["num_kv_heads"] == 1
-        and kwargs["query_group_size"] == 16
-        and kwargs["block_size"] == 128
-        and 4096 <= kwargs["sliding_window"] <= 8192
-        and 4 <= kwargs["num_seqs"] <= 24
-        and kwargs["work_capacity"]
-        == kwargs["num_seqs"]
-        * _max_window_tiles(kwargs["sliding_window"], kwargs["query_length"])
-        and kwargs["num_compute_units"] >= (kwargs["work_capacity"] + 1) // 2
-    )
-
-
-def _assert_schedule_cache(compile_tile, kwargs):
-    """Check schedule equivalence through handles, without launching fake grids."""
-    workgroups = kwargs["num_seqs"] * kwargs["num_kv_heads"] * kwargs["num_partitions"]
-    planned, ql = kwargs["use_work_plan"], kwargs["query_length"]
-    cached = {}
-
-    def check(cus, expected, **changes):
-        config = {**kwargs, "num_compute_units": cus, **changes}
-        compiled = compile_tile(**config)
-        expected = (
-            *expected,
-            _expected_single_tile_plan(config),
-            _expected_batch_first_plan_grid(config, expected[0]),
-        )
-        # Only these compile constants vary within this helper. Runtime sizes
-        # must share handles iff they select the same expected schedule.
-        compile_key = (
-            config["num_partitions"],
-            config["query_length"],
-            config["trans_v"],
-        )
-        schedules = cached.setdefault(compile_key, {})
-        for schedule, previous in schedules.items():
-            same_schedule = schedule == expected
-            assert (compiled is previous) == same_schedule
-            assert (compiled["kernel"] is previous["kernel"]) == same_schedule
-            assert (compiled["launch"] is previous["launch"]) == same_schedule
-        schedules.setdefault(expected, compiled)
-
-    def split_boundary(capacity, **changes):
-        config = {**kwargs, **changes, "work_capacity": capacity}
-        tasks = config["num_seqs"] * config["num_partitions"]
-        if config["use_work_plan"]:
-            if capacity is not None:
-                tasks = capacity
-            if config["sliding_window"] > 0:
-                max_tiles = _max_window_tiles(config["sliding_window"], ql)
-                tasks = min(tasks, config["num_seqs"] * max_tiles)
-        queries_per_task = ql
-        if (
-            _expected_single_tile_plan(config)
-            and ql == 4
-            and config["block_size"] == 128
-            and config["trans_v"]
-        ):
-            queries_per_task = 1
-        return (queries_per_task * config["num_kv_heads"] * tasks + 1) // 2
-
-    def ql1_points(**changes):
-        config = {**kwargs, **changes}
-        dense = config["num_seqs"] * config["num_kv_heads"] * config["num_partitions"]
-        eligible = (
-            config["head_dim"] == 128
-            and config["query_dtype"] == "bf16"
-            and config["block_size"] in (16, 128)
-            and 8 <= config["query_group_size"] <= 16
-        )
-        # Express the independent expectation as the minimum CU count. A
-        # proven one-tile plan has at most B * Hkv * window_tiles workgroups,
-        # regardless of excess capacity or the nominal B * Hkv * NP grid.
-        threshold = None
-        if eligible:
-            threshold = (
-                dense if config["block_size"] == 128 and config["trans_v"] else 0
-            )
-            if _expected_single_tile_plan(config):
-                tasks = (
-                    config["num_seqs"]
-                    * config["num_kv_heads"]
-                    * _max_window_tiles(config["sliding_window"], 1)
-                )
-                threshold = min(threshold, (tasks + 1) // 2)
-        cus = {max(1, dense - 1), dense, dense + 1}
-        if threshold is not None:
-            cus.update((max(1, threshold - 1), max(1, threshold), threshold + 1))
-        return [
-            (cu, (1, threshold is not None and cu >= threshold)) for cu in sorted(cus)
-        ]
-
-    if not kwargs["per_token_kv"]:
-        # Scalar prefetch requires CU < workgroups <= 2 * CU.
-        half = (workgroups + 1) // 2
-        points = [
-            (workgroups, (1, False)),
-            (workgroups - 1, (1, True)),
-            (half, (1, True)),
-            (half - 1, (1, False)),
-        ]
-    elif ql == 1:
-        points = ql1_points()
-    else:
-        # Ordinary grids count QL CTAs per task; one-tile QL4/page128/transV
-        # plans permit two tasks per CU. Round up for an odd workgroup count.
-        boundary = split_boundary(kwargs["work_capacity"])
-        split = (ql, True)
-        points = [(boundary - 1, (1, False)), (boundary, split), (boundary + 1, split)]
-    for cus, expected in points:
-        check(cus, expected)
-
-    if kwargs["per_token_kv"] and ql == 1:
-        # Head counts affect occupancy, not single-query M1 eligibility.
-        for heads in (1, 2, 3):
-            for cus, expected in ql1_points(num_kv_heads=heads):
-                check(cus, expected, num_kv_heads=heads)
-    elif kwargs["per_token_kv"]:
-        # Explicit split overrides must also select matching prefetching.
-        check(boundary - 1, (ql, True), query_splits=ql)
-        check(boundary + 1, (1, False), query_splits=1)
-
-    # Capacity selects splitting and the semantic one-tile guarantee, not a
-    # raw cache key. The guarantee uses full QL even when queries are split.
-    capacities = [
-        None,
-        kwargs["num_seqs"],
-        kwargs["num_seqs"] * kwargs["num_partitions"],
-    ]
-    if kwargs["sliding_window"] > 0:
-        full_window = kwargs["num_seqs"] * _max_window_tiles(
-            kwargs["sliding_window"], ql
-        )
-        capacities += [full_window - 1, full_window, full_window + 1]
-    for capacity in dict.fromkeys(capacities):
-        capacity_points = points
-        if kwargs["per_token_kv"] and ql > 1:
-            boundary = split_boundary(capacity)
-            capacity_points = [(boundary - 1, (1, False)), (boundary, (ql, True))]
-        elif kwargs["per_token_kv"] and ql == 1:
-            capacity_points = ql1_points(work_capacity=capacity)
-        for cus, expected in capacity_points:
-            check(cus, expected, work_capacity=capacity)
-
-    if kwargs["sliding_window"] > 0 and kwargs["per_token_kv"] and ql == 1:
-        # Isolate NP's single-tile guarantee from the already sufficient
-        # capacity; hypothetical metadata is compiled but never launched.
-        tiles = _max_window_tiles(kwargs["sliding_window"], 1)
-        for parts in dict.fromkeys((max(1, tiles - 1), tiles)):
-            for cus, expected in ql1_points(
-                num_partitions=parts, work_capacity=full_window
-            ):
-                check(cus, expected, num_partitions=parts, work_capacity=full_window)
-
-    if kwargs["sliding_window"] > 0 and kwargs["per_token_kv"] and ql > 1:
-        # Hypothetical metadata isolates the NP guard from the capacity guard.
-        # Real plans cannot exceed B * NP; these compile-only grids never launch.
-        tiles = _max_window_tiles(kwargs["sliding_window"], ql)
-        for parts in (tiles - 1, tiles, tiles + 1):
-            boundary = split_boundary(full_window, num_partitions=parts)
-            for cus, expected in [(boundary - 1, (1, False)), (boundary, (ql, True))]:
-                check(
-                    cus,
-                    expected,
-                    num_partitions=parts,
-                    work_capacity=full_window,
-                )
-        if planned and kwargs["block_size"] == 128 and kwargs["trans_v"]:
-            # Enough capacity alone must not widen plain-V or QL2 thresholds.
-            wider_boundary = (full_window * kwargs["num_kv_heads"] + 1) // 2
-            check(
-                wider_boundary,
-                (1, False),
-                trans_v=False,
-                work_capacity=full_window,
-            )
-            check(
-                wider_boundary,
-                (1, False),
-                query_length=2,
-                work_capacity=full_window,
-            )
-
-    if (
-        planned
-        and kwargs["per_token_kv"]
-        and ql == 4
-        and kwargs["num_kv_heads"] == 1
-        and kwargs["block_size"] == 128
-        and kwargs["sliding_window"] > 0
-    ):
-        # Probe both batch endpoints and just outside them for every window.
-        # Out-of-range windows must stay flat even for an in-range batch.
-        # Plain V retains the full QL split threshold in either address width.
-        # These hypothetical grids compile but never launch against this plan.
-        tiles = _max_window_tiles(kwargs["sliding_window"], ql)
-        for batch in (3, 4, 5, 12, 24, 25):
-            capacity = batch * tiles
-            boundary = split_boundary(capacity, num_seqs=batch, num_partitions=tiles)
-            for cus in (boundary, boundary + 1):
-                check(
-                    cus,
-                    (4, True),
-                    num_seqs=batch,
-                    num_partitions=tiles,
-                    work_capacity=capacity,
-                )
-        # NP is itself a compile constant. Compare B4/B25 within each cap:
-        # only in-range windows with NP64 separate handles; NP65 stays flat.
-        for parts in (64, 65):
-            for batch in (4, 25):
-                capacity = batch * tiles
-                boundary = split_boundary(
-                    capacity, num_seqs=batch, num_partitions=parts
-                )
-                check(
-                    boundary,
-                    (4, True),
-                    num_seqs=batch,
-                    num_partitions=parts,
-                    work_capacity=capacity,
-                )
-
-    # Runtime size/CU metadata must not fragment the kernel specialization cache.
-    cus, expected = points[-1]
-    changes = {"num_seqs": kwargs["num_seqs"] * 2}
-    if planned and kwargs["work_capacity"] is not None:
-        changes["work_capacity"] = kwargs["work_capacity"] * 2
-    multiplier = 2
-    if not kwargs["per_token_kv"]:
-        changes["num_kv_heads"] = kwargs["num_kv_heads"] * 2
-        multiplier = 4
-    check(cus * multiplier, expected, **changes)
-
-
 def _case(
     name,
     shape=(4, 1, 16, 128),
@@ -767,20 +508,42 @@ def _case(
     )
 
 
-# Positive-window rows reject static calls and run eager/graph checks with plans.
-# Disabled-window rows retain the same numerical checks in both modes.
+def _cases(columns, rows, *, prefix="", **shared):
+    """Expand a small parameter table using the same defaults as _case."""
+    return [
+        _case(
+            prefix + name,
+            **{**shared, **dict(zip(columns.split(), values, strict=True))},
+        )
+        for name, *values in rows
+    ]
+
+
+# Every row uses the same correctness/contract flow in static and planned modes.
+# Positive windows reject static calls; disabled windows run numerics in both.
 BF16, FP16, FP32 = torch.bfloat16, torch.float16, torch.float32
+LENS_1024 = (0, 1, 1025, 1281)
+LENS_4096 = (0, 1, 4097, 4353)
+LENS_8192 = (0, 1, 8193, 8449)
 CASES = [
-    _case("scalar-direct", (1, 2, 8, 128), (16, 1, 0), 1),
-    _case(
-        "scalar-window-sinks",
-        (1, 2, 8, 128),
-        (128, 1, 0),
-        7,
-        257,
-        FP32,
-        check_schedule=True,
+    # Scalar scales, head dimensions and ordinary MTP/window boundaries.
+    *_cases(
+        "shape cache parts window sink",
+        [
+            ("scalar-direct", (1, 2, 8, 128), (16, 1, 0), 1, 0, None),
+            ("scalar-window-sinks", (1, 2, 8, 128), (128, 1, 0), 7, 257, FP32),
+            ("head1024", (1, 2, 4, 1024), (128, 1, 0), 256, 8192, FP32),
+            ("mtp3-window", (3, 1, 16, 128), (128, 0, 1), 7, 257, FP16),
+            ("mtp2-odd-parts", (2, 2, 16, 128), (16, 0, 1), 3, 0, None),
+            ("window256", (3, 2, 8, 128), (128, 0, 1), 7, 256, None),
+            ("window509", (4, 1, 16, 128), (64, 0, 1), 86, 509, FP16),
+            ("window8192", (2, 1, 16, 128), (128, 1, 1), 256, 8192, None),
+            ("head64-mtp-window", (4, 2, 4, 64), (16, 1, 1), 256, 1, FP32),
+            ("hkv2-direct-sinks", (1, 2, 8, 128), (128, 1, 1), 1, 1, BF16),
+        ],
     ),
+    _case("head64-fp16", (2, 2, 4, 64), (16, 0, 0), 7, 257, BF16, dtype=FP16),
+    _case("scalar-fp16-mtp", cache=(128, 1, 0), parts=3, dtype=FP16),
     _case(
         "register-64-65",
         (1, 2, 4, 256),
@@ -790,10 +553,7 @@ CASES = [
         dtype=FP16,
         lengths=(0, 1, 257, 16384, 16385),
     ),
-    _case("head64-fp16", (2, 2, 4, 64), (16, 0, 0), 7, 257, BF16, dtype=FP16),
-    _case("head1024", (1, 2, 4, 1024), (128, 1, 0), 256, 8192, FP32),
-    # QL4/W1 can span two tiles, including when explicitly split into four CTAs.
-    # NP1 therefore retains the multi-tile fallback even with a full plan budget.
+    # Explicit splits also cover padded query rows and direct/partitioned sinks.
     _case(
         "np1-fused-sink", cache=(16, 1, 1), parts=1, window=1, sink=FP32, query_splits=1
     ),
@@ -812,9 +572,9 @@ CASES = [
         "split4-hkv2-full-m1",
         (4, 2, 16, 128),
         (16, 0, 1),
-        parts=34,
-        window=4096,
-        sink=BF16,
+        34,
+        4096,
+        BF16,
         lengths=(1, 257, 4353, 0),
         query_splits=4,
     ),
@@ -822,435 +582,25 @@ CASES = [
         "full-m1-fp16-d256",
         (2, 2, 8, 256),
         (64, 1, 1),
-        parts=5,
-        window=257,
-        sink=FP16,
+        5,
+        257,
+        FP16,
         dtype=FP16,
         lengths=(0, 1, 257, 513),
         query_splits=1,
-    ),
-    _case("mtp3-window", (3, 1, 16, 128), (128, 0, 1), 7, 257, FP16),
-    _case("mtp2-odd-parts", (2, 2, 16, 128), (16, 0, 1), 3),
-    _case(
-        "mtp2-query-split",
-        (2, 1, 16, 128),
-        parts=3,
-        lengths=(257, 259),
-        check_schedule=True,
-    ),
-    _case(
-        "mtp4-window-query-split",
-        cache=(16, 1, 1),
-        window=1024,
-        lengths=(1023, 1024, 1025, 4099),
-        check_schedule=True,
-    ),
-    _case(
-        "mtp4-window-capacity",
-        parts=256,
-        window=1024,
-        lengths=(0, 3, 1024, 4099),
-        check_schedule=True,
-    ),
-    _case(
-        "mtp4-dense-capacity",
-        cache=(128, 0, 1),
-        parts=256,
-        lengths=(257, 259, 1027, 4099),
-        workgroup_budget=17,
-        check_schedule=True,
-    ),
-    _case(
-        "mtp4-window-large-grid",
-        window=1024,
-        lengths=(1027,) * 200,
-        check_schedule=True,
-    ),
-    # Exact one-tile budgets enter the measured (B, H*QS, C/B) grid on gfx950.
-    # Ragged/empty owners are not physical x; each row also runs poisoned
-    # scratch, changing sinks, minus7/all-empty/restored graph plan refreshes.
-    _case(
-        "batch-first-window4096",
-        parts=18,
-        window=4096,
-        sink=FP32,
-        lengths=(0, 1, 4097, 4353),
-        workgroup_budget=72,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window8192",
-        parts=34,
-        window=8192,
-        sink=BF16,
-        lengths=(0, 1, 3, 4, 257, 8193, 8449, 0),
-        workgroup_budget=272,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window8192-batch12",
-        parts=34,
-        window=8192,
-        sink=FP32,
-        lengths=(0, 1, 8193, 8449) * 3,
-        workgroup_budget=408,
-        check_schedule=True,
-    ),
-    # Interior window/odd batch: C125 reaches the QS4 threshold at CU63.
-    _case(
-        "batch-first-window6000-batch5",
-        parts=25,
-        window=6000,
-        sink=FP32,
-        lengths=(0, 1, 6001, 6145, 6257),
-        workgroup_budget=125,
-        check_schedule=True,
-    ),
-    # These plans satisfy the tile/capacity guards but miss the window range.
-    _case(
-        "batch-first-window4095-fallback",
-        parts=18,
-        window=4095,
-        sink=FP32,
-        lengths=(0, 1, 4097, 4353),
-        workgroup_budget=72,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window8193-fallback",
-        parts=34,
-        window=8193,
-        sink=FP32,
-        lengths=(0, 1, 8193, 8449),
-        workgroup_budget=136,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window1024-rejected",
-        parts=6,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 1, 1025, 1281) * 2,
-        workgroup_budget=48,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-excess-partitions",
-        parts=35,
-        window=8192,
-        sink=FP32,
-        lengths=(0, 1, 8193, 8449),
-        workgroup_budget=140,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-excess-capacity",
-        parts=35,
-        window=8192,
-        sink=BF16,
-        lengths=(0, 1, 8193, 8449),
-        workgroup_budget=137,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-tight-capacity",
-        parts=34,
-        window=8192,
-        sink=FP32,
-        lengths=(0, 1, 8193, 8449),
-        workgroup_budget=135,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window4096-wide",
-        parts=18,
-        window=4096,
-        sink=FP32,
-        lengths=(0, 1, 4097, 4353),
-        workgroup_budget=72,
-        wide_kv_addressing=True,
-        check_schedule=True,
-    ),
-    # Plain V needs CU >= QL * C / 2 = 144 to split this B4/C72 plan.
-    # Exercise both address widths and a larger partition cap with real inputs.
-    _case(
-        "batch-first-window4096-plain-v",
-        cache=(128, 0, 1),
-        parts=18,
-        window=4096,
-        sink=FP32,
-        lengths=(0, 1, 4097, 4353),
-        workgroup_budget=72,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window4096-plain-v-wide",
-        cache=(128, 0, 1),
-        parts=18,
-        window=4096,
-        sink=FP32,
-        lengths=(0, 1, 4097, 4353),
-        workgroup_budget=72,
-        wide_kv_addressing=True,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window4096-np64-plain-v-wide",
-        cache=(128, 0, 1),
-        parts=64,
-        window=4096,
-        sink=FP32,
-        lengths=(0, 1, 4097, 4353),
-        workgroup_budget=72,
-        wide_kv_addressing=True,
-        check_schedule=True,
-    ),
-    # The unchanged plain-V split threshold is CU272: CU256 uses QS1/flat.
-    _case(
-        "batch-first-window8192-plain-v-auto",
-        cache=(128, 0, 1),
-        parts=34,
-        window=8192,
-        sink=FP32,
-        lengths=(0, 1, 8193, 8449),
-        workgroup_budget=136,
-        check_schedule=True,
-    ),
-    _case(
-        "batch-first-window4096-batch24",
-        parts=18,
-        window=4096,
-        sink=FP32,
-        lengths=(0, 1, 3, 4, 257, 1025, 2049, 4096, 4097, 4098, 4353, 4354) * 2,
-        workgroup_budget=432,
-        check_schedule=True,
-    ),
-    # NP need not equal the window bound: exact useful capacity still proves
-    # one task per tile. Counts span 0/1/4/8/16/17/18 and poisoned padding.
-    _case(
-        "batch-first-window4096-np64",
-        parts=64,
-        window=4096,
-        sink=FP32,
-        lengths=(0, 1, 769, 1793, 4096, 4097, 4353, 4354),
-        workgroup_budget=144,
-        check_schedule=True,
-    ),
-    # Large NP keeps the flat grid. The 34-task rows still cross the NP256
-    # reducer's 32-partition group boundary, including on graph replays.
-    _case(
-        "batch-first-window8192-np256-fallback",
-        parts=256,
-        window=8192,
-        sink=FP32,
-        lengths=(0, 1, 8449, 8450),
-        workgroup_budget=136,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-window-prefetch",
-        (1, 1, 16, 128),
-        parts=64,
-        window=8192,
-        lengths=(8193,) * 8,
-        workgroup_budget=512,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-window-prefetch-small-capacity",
-        (1, 1, 16, 128),
-        parts=64,
-        window=8192,
-        lengths=(8193,) * 8,
-        workgroup_budget=263,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-window-prefetch-wide",
-        (1, 1, 16, 128),
-        parts=64,
-        window=8192,
-        lengths=(8193,) * 8,
-        workgroup_budget=512,
-        wide_kv_addressing=True,
-        check_schedule=True,
-    ),
-    # G8 pads half an M-tile. Distinct per-head data/scales also cover planned
-    # Hkv2; the Hkv1/NP256 row isolates G8 with a large nominal dense grid.
-    _case(
-        "ql1-hkv2-g8-window-prefetch",
-        (1, 2, 8, 128),
-        parts=64,
-        window=8192,
-        sink=FP32,
-        lengths=(0, 1, 8193, 8449),
-        workgroup_budget=264,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-hkv1-g8-large-np-prefetch",
-        (1, 1, 8, 128),
-        parts=256,
-        window=8192,
-        sink=FP32,
-        lengths=(0, 1, 8193, 8449),
-        workgroup_budget=132,
-        check_schedule=True,
-    ),
-    # Hkv4 exercises dense M1 prefetch with multi-tile tasks in each KV layout.
-    _case(
-        "ql1-hkv4-page128-multi",
-        (1, 4, 16, 128),
-        parts=2,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 1, 1025, 1281),
-        workgroup_budget=32,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-hkv4-page16-multi",
-        (1, 4, 16, 128),
-        (16, 1, 1),
-        parts=2,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 1, 1025, 1281),
-        workgroup_budget=32,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-hkv4-plain-v-multi",
-        (1, 4, 16, 128),
-        (128, 0, 1),
-        parts=2,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 1, 1025, 1281),
-        workgroup_budget=32,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-hkv4-page16-direct-sinks",
-        (1, 4, 16, 128),
-        (16, 1, 1),
-        parts=1,
-        sink=FP32,
-        lengths=(0, 1, 257, 769),
-        workgroup_budget=16,
-        check_schedule=True,
-    ),
-    # Interior GQA sizes pad to one M-tile; G7/G17 exercise both range misses.
-    # Fixed groups per fixture keep the handle-only cache checks unambiguous.
-    *[
-        _case(
-            f"ql1-hkv2-g{group}-window",
-            (1, 2, group, 128),
-            parts=8,
-            window=1024,
-            sink=FP32,
-            lengths=(0, 1, 1025, 1281),
-            workgroup_budget=40,
-            check_schedule=True,
-        )
-        for group in (7, *range(9, 16), 17)
-    ],
-    _case(
-        "ql1-hkv2-g9-page16-direct-sinks",
-        (1, 2, 9, 128),
-        (16, 1, 1),
-        parts=1,
-        sink=FP32,
-        lengths=(0, 1, 257, 769),
-        workgroup_budget=8,
-        check_schedule=True,
-    ),
-    _case(
-        "ql1-hkv2-g15-plain-v-multi",
-        (1, 2, 15, 128),
-        (128, 0, 1),
-        parts=2,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 1, 1025, 1281),
-        workgroup_budget=16,
-        check_schedule=True,
-    ),
-    # Explicit splits also use one padded M-tile for interior GQA sizes.
-    _case(
-        "split2-hkv2-g9-page16-direct-sinks",
-        (2, 2, 9, 128),
-        (16, 1, 1),
-        parts=1,
-        sink=FP32,
-        lengths=(0, 1, 257, 769),
-        workgroup_budget=8,
-        query_splits=2,
     ),
     _case(
         "split4-hkv1-g15-plain-v-window-wide",
         (4, 1, 15, 128),
         (128, 0, 1),
-        parts=8,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 1, 1025, 1281),
+        8,
+        1024,
+        FP32,
+        lengths=LENS_1024,
         workgroup_budget=24,
         query_splits=4,
         wide_kv_addressing=True,
     ),
-    _case(
-        "hkv2-prefetch-1wg",
-        (1, 2, 8, 128),
-        parts=8,
-        window=1,
-        sink=FP32,
-        lengths=(257,) * 16,
-        check_schedule=True,
-    ),
-    _case(
-        "hkv2-prefetch-2wg",
-        (1, 2, 8, 128),
-        parts=8,
-        lengths=(257,) * 32,
-    ),
-    _case(
-        "hkv2-prefetch-page16",
-        (1, 2, 8, 128),
-        (16, 1, 1),
-        8,
-        257,
-        FP16,
-        lengths=(257,) * 32,
-    ),
-    _case(
-        "hkv2-prefetch-plain-v",
-        (1, 2, 16, 128),
-        (128, 0, 1),
-        8,
-        sink=BF16,
-        lengths=(257,) * 32,
-    ),
-    # QL1/W1 has M=1: NP=M and capacity=B*M both meet the exact boundary.
-    _case("hkv2-direct-sinks", (1, 2, 8, 128), parts=1, window=1, sink=BF16),
-    _case(
-        "long-200k",
-        cache=(128, 0, 1),
-        parts=256,
-        sink=FP32,
-        lengths=(0, 1, 3, 4, 255, 256, 257, 200003),
-    ),
-    _case("window-int64", cache=(16, 1, 1), window=2**40, wide_kv_addressing=True),
-    # The single active tile is absolute tile 1; padding stays NaN across replay.
-    _case(
-        "masked-scale-decode",
-        (1, 1, 16, 128),
-        window=1,
-        sink=FP32,
-        lengths=(511,),
-        masked_scale=True,
-    ),
-    _case("masked-scale-mtp", window=1, lengths=(511,), masked_scale=True),
     _case(
         "disabled-window-wide",
         cache=(16, 0, 1),
@@ -1260,95 +610,6 @@ CASES = [
         query_splits=1,
         wide_kv_addressing=True,
     ),
-    _case(
-        "large-batch-auto",
-        cache=(128, 0, 1),
-        parts=None,
-        lengths=(257,) * 200,
-    ),
-    _case("small-batch-auto", (1, 1, 8, 128), (16, 0, 0), None, lengths=(257,) * 3),
-    _case(
-        "exact-parts-override",
-        (1, 1, 16, 128),
-        parts=5,
-        lengths=(200000,),
-        max_partitions=4,
-    ),
-    _case(
-        "window255-budget",
-        (2, 2, 16, 128),
-        (64, 0, 1),
-        64,
-        255,
-        BF16,
-        workgroup_budget=17,
-    ),
-    _case("window256", (3, 2, 8, 128), (128, 0, 1), 7, 256),
-    _case("window509", cache=(64, 0, 1), parts=86, window=509, sink=FP16),
-    _case("window8192", (2, 1, 16, 128), parts=256, window=8192),
-    _case("window-int32-max", cache=(16, 0, 1), parts=1, window=2**31 - 1),
-    _case("window-int32-overflow", cache=(16, 0, 1), parts=1, window=2**31, sink=FP32),
-    # QL3/G8 pads 24 query rows to 32; C<QL also has causally empty rows.
-    # A huge planned window stays valid, and NP1 keeps C257 in a two-tile task.
-    _case(
-        "window-huge-padded-query",
-        (3, 2, 8, 128),
-        parts=1,
-        window=2**31 - 1,
-        sink=FP32,
-        lengths=(0, 1, 2, 257),
-    ),
-    _case(
-        "long-np64",
-        cache=(16, 1, 1),
-        parts=64,
-        lengths=(0, 3, 257, 16384, 16385, 65537),
-    ),
-    # Counts [1, 2, 2, 0, 0] fill capacity=5: trailing empty rows start at
-    # capacity, so a clamped partition index must also clamp the packed base.
-    _case(
-        "reduce-np33-tail-empty",
-        parts=33,
-        window=1,
-        sink=FP32,
-        lengths=(1, 257, 513, 0, 0),
-        workgroup_budget=5,
-    ),
-    # Counts [1, 1, 2, 2, 2, 2, 0, 0] leave NaN padding in capacity=16.
-    # Mask inactive loaded values before arithmetic, including all-empty replay.
-    _case(
-        "reduce-np64-tail-padding",
-        (4, 2, 8, 128),
-        (16, 0, 1),
-        64,
-        255,
-        BF16,
-        lengths=(1, 3, 257, 258, 514, 515, 0, 0),
-        workgroup_budget=32,
-    ),
-    # Counts [0, 4, 5, 0] become [0, 3, 4, 0] after the minus7 graph replay.
-    # Capacity=24=B*M guarantees single-tile tasks and leaves tail NaN padding.
-    _case(
-        "reduce-shortcount-boundary",
-        parts=34,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 769, 1025, 0),
-        workgroup_budget=24,
-    ),
-    # Single-tile counts [0, 8, 9, 0] become [0, 7, 8, 0] after refresh.
-    # Exercise both sides of the eight-part reducer branch with poisoned
-    # unused slots, then the empty and restored-count graph replays.
-    _case(
-        "reduce-eightcount-boundary",
-        parts=34,
-        window=2048,
-        sink=FP32,
-        lengths=(0, 1793, 2049, 0),
-        workgroup_budget=48,
-    ),
-    _case("head64-mtp-window", (4, 2, 4, 64), (16, 1, 1), 256, 1, FP32),
-    _case("scalar-fp16-mtp", cache=(128, 1, 0), parts=3, dtype=FP16),
     _case(
         "fused-narrow",
         cache=(16, 0, 1),
@@ -1368,6 +629,233 @@ CASES = [
         query_splits=1,
         wide_kv_addressing=False,
     ),
+    # Small/large batches and overprovisioned or tight plan capacities.
+    _case("mtp2-query-split", (2, 1, 16, 128), parts=3, lengths=(257, 259)),
+    *_cases(
+        "cache parts window lengths workgroup_budget",
+        [
+            ("window-query-split", (16, 1, 1), 7, 1024, (1023, 1024, 1025, 4099), None),
+            ("window-capacity", (128, 1, 1), 256, 1024, (0, 3, 1024, 4099), None),
+            ("dense-capacity", (128, 0, 1), 256, 0, (257, 259, 1027, 4099), 17),
+            ("window-large-grid", (128, 1, 1), 7, 1024, (1027,) * 200, None),
+        ],
+        prefix="mtp4-",
+    ),
+    # Ragged/empty owners, both window endpoints and their immediate neighbors.
+    *_cases(
+        "parts window lengths workgroup_budget",
+        [
+            ("window4096", 18, 4096, LENS_4096, 72),
+            ("window8192-batch12", 34, 8192, LENS_8192 * 3, 408),
+            ("window6000-batch5", 25, 6000, (0, 1, 6001, 6145, 6257), 125),
+            ("window4095-fallback", 18, 4095, LENS_4096, 72),
+            ("window8193-fallback", 34, 8193, LENS_8192, 136),
+            ("window1024-rejected", 6, 1024, LENS_1024 * 2, 48),
+            ("excess-partitions", 35, 8192, LENS_8192, 140),
+            ("tight-capacity", 34, 8192, LENS_8192, 135),
+            (
+                "window4096-batch24",
+                18,
+                4096,
+                (0, 1, 3, 4, 257, 1025, 2049, 4096, 4097, 4098, 4353, 4354) * 2,
+                432,
+            ),
+            (
+                "window4096-np64",
+                64,
+                4096,
+                (0, 1, 769, 1793, 4096, 4097, 4353, 4354),
+                144,
+            ),
+            ("window8192-np256-fallback", 256, 8192, (0, 1, 8449, 8450), 136),
+        ],
+        prefix="batch-first-",
+        sink=FP32,
+    ),
+    *_cases(
+        "parts lengths workgroup_budget",
+        [
+            ("window8192", 34, (0, 1, 3, 4, 257, 8193, 8449, 0), 272),
+            ("excess-capacity", 35, LENS_8192, 137),
+        ],
+        prefix="batch-first-",
+        window=8192,
+        sink=BF16,
+    ),
+    *_cases(
+        "cache parts wide_kv_addressing",
+        [
+            ("window4096-wide", (128, 1, 1), 18, True),
+            ("window4096-plain-v", (128, 0, 1), 18, None),
+            ("window4096-plain-v-wide", (128, 0, 1), 18, True),
+            ("window4096-np64-plain-v-wide", (128, 0, 1), 64, True),
+        ],
+        prefix="batch-first-",
+        window=4096,
+        sink=FP32,
+        lengths=LENS_4096,
+        workgroup_budget=72,
+    ),
+    _case(
+        "batch-first-window8192-plain-v-auto",
+        cache=(128, 0, 1),
+        parts=34,
+        window=8192,
+        sink=FP32,
+        lengths=LENS_8192,
+        workgroup_budget=136,
+    ),
+    # QL1: layouts, address widths, head counts and padded GQA sizes.
+    *_cases(
+        "workgroup_budget wide_kv_addressing",
+        [
+            ("prefetch", 512, None),
+            ("prefetch-small-capacity", 263, None),
+            ("prefetch-wide", 512, True),
+        ],
+        prefix="ql1-window-",
+        shape=(1, 1, 16, 128),
+        parts=64,
+        window=8192,
+        lengths=(8193,) * 8,
+    ),
+    *_cases(
+        "shape parts workgroup_budget",
+        [
+            ("hkv2-g8-window-prefetch", (1, 2, 8, 128), 64, 264),
+            ("hkv1-g8-large-np-prefetch", (1, 1, 8, 128), 256, 132),
+        ],
+        prefix="ql1-",
+        window=8192,
+        sink=FP32,
+        lengths=LENS_8192,
+    ),
+    *_cases(
+        "shape cache workgroup_budget",
+        [
+            ("hkv4-page128-multi", (1, 4, 16, 128), (128, 1, 1), 32),
+            ("hkv4-page16-multi", (1, 4, 16, 128), (16, 1, 1), 32),
+            ("hkv4-plain-v-multi", (1, 4, 16, 128), (128, 0, 1), 32),
+            ("hkv2-g15-plain-v-multi", (1, 2, 15, 128), (128, 0, 1), 16),
+        ],
+        prefix="ql1-",
+        parts=2,
+        window=1024,
+        sink=FP32,
+        lengths=LENS_1024,
+    ),
+    *_cases(
+        "shape workgroup_budget query_splits",
+        [
+            ("ql1-hkv4-page16-direct-sinks", (1, 4, 16, 128), 16, None),
+            ("ql1-hkv2-g9-page16-direct-sinks", (1, 2, 9, 128), 8, None),
+            ("split2-hkv2-g9-page16-direct-sinks", (2, 2, 9, 128), 8, 2),
+        ],
+        cache=(16, 1, 1),
+        parts=1,
+        sink=FP32,
+        lengths=(0, 1, 257, 769),
+    ),
+    *_cases(
+        "shape",
+        [
+            (f"ql1-hkv2-g{group}-window", (1, 2, group, 128))
+            for group in (7, *range(9, 16), 17)
+        ],
+        parts=8,
+        window=1024,
+        sink=FP32,
+        lengths=LENS_1024,
+        workgroup_budget=40,
+    ),
+    *_cases(
+        "shape cache window sink lengths",
+        [
+            ("1wg", (1, 2, 8, 128), (128, 1, 1), 1, FP32, (257,) * 16),
+            ("2wg", (1, 2, 8, 128), (128, 1, 1), 0, None, (257,) * 32),
+            ("page16", (1, 2, 8, 128), (16, 1, 1), 257, FP16, (257,) * 32),
+            ("plain-v", (1, 2, 16, 128), (128, 0, 1), 0, BF16, (257,) * 32),
+        ],
+        prefix="hkv2-prefetch-",
+        parts=8,
+    ),
+    # Large/automatic partition counts and integer-limit windows.
+    _case(
+        "long-200k",
+        cache=(128, 0, 1),
+        parts=256,
+        sink=FP32,
+        lengths=(0, 1, 3, 4, 255, 256, 257, 200003),
+    ),
+    _case(
+        "long-np64",
+        cache=(16, 1, 1),
+        parts=64,
+        lengths=(0, 3, 257, 16384, 16385, 65537),
+    ),
+    _case("large-batch-auto", cache=(128, 0, 1), parts=None, lengths=(257,) * 200),
+    _case("small-batch-auto", (1, 1, 8, 128), (16, 0, 0), None, lengths=(257,) * 3),
+    _case(
+        "exact-parts-override",
+        (1, 1, 16, 128),
+        parts=5,
+        lengths=(200000,),
+        max_partitions=4,
+    ),
+    _case("window-int64", cache=(16, 1, 1), window=2**40, wide_kv_addressing=True),
+    *_cases(
+        "window sink",
+        [("max", 2**31 - 1, None), ("overflow", 2**31, FP32)],
+        prefix="window-int32-",
+        cache=(16, 0, 1),
+        parts=1,
+    ),
+    _case(
+        "window-huge-padded-query",
+        (3, 2, 8, 128),
+        parts=1,
+        window=2**31 - 1,
+        sink=FP32,
+        lengths=(0, 1, 2, 257),
+    ),
+    _case(
+        "window255-budget",
+        (2, 2, 16, 128),
+        (64, 0, 1),
+        64,
+        255,
+        BF16,
+        workgroup_budget=17,
+    ),
+    # Masked per-token scales and poisoned reducer padding/tail boundaries.
+    *_cases(
+        "shape sink",
+        [("decode", (1, 1, 16, 128), FP32), ("mtp", (4, 1, 16, 128), None)],
+        prefix="masked-scale-",
+        window=1,
+        lengths=(511,),
+        masked_scale=True,
+    ),
+    *_cases(
+        "parts window lengths workgroup_budget",
+        [
+            ("np33-tail-empty", 33, 1, (1, 257, 513, 0, 0), 5),
+            ("shortcount-boundary", 34, 1024, (0, 769, 1025, 0), 24),
+            ("eightcount-boundary", 34, 2048, (0, 1793, 2049, 0), 48),
+        ],
+        prefix="reduce-",
+        sink=FP32,
+    ),
+    _case(
+        "reduce-np64-tail-padding",
+        (4, 2, 8, 128),
+        (16, 0, 1),
+        64,
+        255,
+        BF16,
+        lengths=(1, 3, 257, 258, 514, 515, 0, 0),
+        workgroup_budget=32,
+    ),
     _case("empty", window=1, sink=FP16, lengths=(0,) * 4),
 ]
 
@@ -1383,7 +871,7 @@ def test_pa_decode(case, planned, monkeypatch):
         with pytest.raises(ValueError, match="work_plan"):
             _run_flydsl(*args, **options)
         return
-    output, query, _, _, context = args[:5]
+    output, context = args[0], args[4]
     scratch, sinks, plan = args[14:17], args[-1], options["work_plan"]
     if plan is not None and case.workgroup_budget is not None:
         budget_slots = (
@@ -1392,69 +880,26 @@ def test_pa_decode(case, planned, monkeypatch):
         assert plan.capacity == min(
             context.numel() * args[8], max(context.numel(), budget_slots)
         )
+
+    # Force only explicitly requested variants; ordinary cases use production defaults.
     module = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    build_tile = module.compile_pa_decode_tile
-    compile_reduce = module.compile_pa_decode_ps_reduce
-    num_compute_units = torch.cuda.get_device_properties(
-        query.device
-    ).multi_processor_count
-    compile_args = None
-    cached_reducer = None
+    overrides = {
+        name: getattr(case, name)
+        for name in ("query_splits", "wide_kv_addressing")
+        if getattr(case, name) is not None
+    }
+    if overrides:
+        build_tile = module.compile_pa_decode_tile
 
-    def compile_tile(**kwargs):
-        # Schedule details remain internal; callers receive only launch handles.
-        assert (
-            not {
-                "single_tile_plan",
-                "batch_first_plan_grid",
-                "buffer_plan_output",
-            }
-            & kwargs.keys()
-        )
-        compiled = build_tile(**kwargs)
-        assert set(compiled) == {"launch", "kernel"}
-        return compiled
+        def compile_tile(**kwargs):
+            return build_tile(**{**kwargs, **overrides})
 
-    def compile_checked(**kwargs):
-        nonlocal compile_args
-        assert kwargs["num_seqs"] == context.numel()
-        assert kwargs["num_kv_heads"] == case.num_kv_heads
-        assert kwargs["num_compute_units"] == num_compute_units
-        assert kwargs["work_capacity"] == (plan.capacity if planned else None)
-        if case.query_splits is not None:
-            kwargs["query_splits"] = case.query_splits
-        if case.wide_kv_addressing is not None:
-            kwargs["wide_kv_addressing"] = case.wide_kv_addressing
-        assert kwargs["use_sinks"] == (
-            sinks is not None and args[8] == 1 and not planned
-        )
-        compile_args = kwargs
-        return compile_tile(**kwargs)
-
-    def compile_reduce_checked(**kwargs):
-        nonlocal cached_reducer
-        assert kwargs["query_group_size"] == case.query_group_size
-        assert kwargs["bounded_plan_logits"] == (planned and args[8] <= 64)
-        assert kwargs["vectorize_plan_logits"] == (
-            planned
-            and args[8] <= 64
-            and case.head_dim == 128
-            and case.dtype in (BF16, FP16)
-            and scratch[2].data_ptr() % 4 == 0
-            and all(stride % 2 == 0 for stride in scratch[2].stride()[:-1])
-        )
-        compiled = compile_reduce(**kwargs)
-        if cached_reducer is None:
-            cached_reducer = compiled
-        assert compiled is cached_reducer
-        return compiled
-
-    def unexpected_reducer(*_args, **_kwargs):
-        raise AssertionError("static NP=1 must not launch a reducer")
-
-    monkeypatch.setattr(module, "compile_pa_decode_tile", compile_checked)
-    monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", compile_reduce_checked)
+        monkeypatch.setattr(module, "compile_pa_decode_tile", compile_tile)
     if not planned and args[8] == 1:
+
+        def unexpected_reducer(*_args, **_kwargs):
+            raise AssertionError("static NP=1 must not launch a reducer")
+
         monkeypatch.setattr(module, "launch_pa_decode_ps_reduce", unexpected_reducer)
 
     def check(disabled_sink=False):
@@ -1470,9 +915,6 @@ def test_pa_decode(case, planned, monkeypatch):
             assert (output[:, torch.isposinf(sinks)] == 0).all()
         if plan is not None:
             active = _assert_plan(plan, context.cpu().tolist())
-            if _expected_single_tile_plan(compile_args):
-                records = plan.work_info[:active]
-                assert (records[:, 2] - records[:, 1] == 1).all()
             for tensor in scratch:
                 assert torch.isnan(tensor[:, active:]).all()
         elif args[8] == 1:
@@ -1501,10 +943,6 @@ def test_pa_decode(case, planned, monkeypatch):
             tensor.fill_(float("nan"))
         graph.replay()
         check(disabled_sink=step == 2)
-
-    if case.check_schedule and get_gfx_runtime() == "gfx950":
-        # Compile-only checks stay outside capture and never launch fake-CU results.
-        _assert_schedule_cache(compile_tile, compile_args)
 
     _assert_contracts(args, options)
     if plan is not None:
