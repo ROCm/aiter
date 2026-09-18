@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -143,13 +144,70 @@ __forceinline__ torch::Tensor batched_gemm_bf16_impl(
     int N = WQ.size(1);
     int K = XQ.size(2);
 
-    int StrideA = K;
-    int StrideB = K;
-    int StrideE = N;
+    // Derive every stride from the TENSOR, not from the logical shape.
+    //
+    // The original six expressions (StrideA = K, StrideB = K, StrideE = N,
+    // BatchStrideA = M*K, BatchStrideB = N*K, BatchStrideE = M*N) assume all three
+    // operands are contiguous in their logical shape. CK takes these as ordinary
+    // runtime scalars and supports arbitrary values, so the kernel was never the
+    // limitation -- the wrapper simply never asked the caller what it allocated.
+    //
+    // Two measured consequences of the old form:
+    //   * a non-contiguous Y was written AS IF contiguous -- no error, correct
+    //     arithmetic, wrong placement, and `return Y` handed back a view whose
+    //     strides described a layout the memory did not have;
+    //   * WQ in a (B, K, N) orientation made BatchStrideB = N*K read ~4x past the
+    //     end of the tensor, surfacing as a HIP illegal memory access rather than
+    //     a layout error.
+    //
+    // ALayout=Row  -> A is M x K, leading dim is the stride between M rows
+    // BLayout=Col  -> B is K x N column-major, leading dim is the stride between N columns
+    // ELayout=Row  -> E is M x N, leading dim is the stride between M rows
+    // In every case the INNERMOST dim must be unit-stride; anything else is a
+    // layout these descriptors cannot express and is rejected loudly below.
+    TORCH_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+                "batched_gemm_bf16: XQ, WQ and Y must all be 3-D, got ",
+                XQ.dim(), ", ", WQ.dim(), ", ", Y.dim());
+    TORCH_CHECK(WQ.size(0) == B && Y.size(0) == B,
+                "batched_gemm_bf16: batch mismatch -- XQ ", B, ", WQ ", WQ.size(0),
+                ", Y ", Y.size(0));
+    TORCH_CHECK(WQ.size(2) == K,
+                "batched_gemm_bf16: contraction mismatch -- XQ K=", K, ", WQ K=",
+                WQ.size(2), ". WQ must be (batch, N, K); a (batch, K, N) operand is "
+                "the orientation that used to read past the end of the tensor.");
+    TORCH_CHECK(Y.size(1) == M && Y.size(2) == N,
+                "batched_gemm_bf16: output shape mismatch -- expected (", B, ", ", M,
+                ", ", N, "), got (", Y.size(0), ", ", Y.size(1), ", ", Y.size(2), ")");
+    TORCH_CHECK(XQ.stride(2) == 1,
+                "batched_gemm_bf16: XQ must be unit-stride in its innermost (K) dim, "
+                "got stride ", XQ.stride(2), ". CK's row-major A descriptor cannot "
+                "express this layout.");
+    TORCH_CHECK(WQ.stride(2) == 1,
+                "batched_gemm_bf16: WQ must be unit-stride in its innermost (K) dim, "
+                "got stride ", WQ.stride(2), ". CK's column-major B descriptor cannot "
+                "express this layout.");
+    TORCH_CHECK(Y.stride(2) == 1,
+                "batched_gemm_bf16: Y must be unit-stride in its innermost (N) dim, "
+                "got stride ", Y.stride(2), ". CK's row-major E descriptor cannot "
+                "express this layout -- refusing rather than mis-placing the result.");
 
-    int BatchStrideA = M * K;
-    int BatchStrideB = N * K;
-    int BatchStrideE = M * N;
+    // CK takes these as int; a stride that does not fit is a silent truncation.
+    auto fits_int = [](int64_t v) {
+        return v >= 0 && v <= static_cast<int64_t>(std::numeric_limits<int>::max());
+    };
+    TORCH_CHECK(fits_int(XQ.stride(0)) && fits_int(XQ.stride(1)) &&
+                fits_int(WQ.stride(0)) && fits_int(WQ.stride(1)) &&
+                fits_int(Y.stride(0)) && fits_int(Y.stride(1)),
+                "batched_gemm_bf16: a stride does not fit in int32 and would be "
+                "silently truncated");
+
+    int StrideA = static_cast<int>(XQ.stride(1));
+    int StrideB = static_cast<int>(WQ.stride(1));
+    int StrideE = static_cast<int>(Y.stride(1));
+
+    int BatchStrideA = static_cast<int>(XQ.stride(0));
+    int BatchStrideB = static_cast<int>(WQ.stride(0));
+    int BatchStrideE = static_cast<int>(Y.stride(0));
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(XQ));
     auto device_gemm = DeviceGemmInstance{};

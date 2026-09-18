@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 
 import aiter
-import aiter.ops.flydsl.kernels.topk_per_row_radix_stream as st
+import aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream as st
 from aiter import dtypes
 from aiter.jit.utils.chip_info import _LDS_CAPACITY_BYTES as LDS_CAPACITY
 from aiter.jit.utils.chip_info import get_gfx
