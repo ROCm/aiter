@@ -623,9 +623,17 @@ QK/PV issue to ``fx.gemm``. GPU 6 / gfx950 remains correct (18 pytest
 cases, ``err=0``): width-2051 ``L=512`` is 23.8 / 24.1 / 588.1 us at
 ``M=1/8/512`` versus the first port's 23.3 / 22.2 / 722.2 us. Thus the
 blocked LDS stores improve prefill ~19% but do not improve decode.
-BN64 ISA: 36 ``ds_write_b128``, 16 ``ds_write_b16``, 7 barriers, 48 MFMA,
-169 VGPR, and 43,968 bytes LDS. QK/PV still assemble per-lane fragments
-from scalar LDS reads; an MMA-native thread/value layout and fewer stage
+Occupancy ISA on GPU 6 / gfx950 at width 2051 (the pytest decode case
+is ``ns=1`` and is not this dump):
+
+| kernel | ds_write b128/b32/b16 | ds_read b128/b64/b32 | barrier | MFMA | VGPR | LDS B |
+|---|---:|---:|---:|---:|---:|---:|
+| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 | 7 | 6 | 70 | 13184 |
+| decode merge `ns64_blk128` | 0 / 2 / 0 | 34 / 0 / 1 | 1 | 0 | 64 | 260 |
+| prefill split `bn64_blk128_ns1` | 36 / 15 / 16 | 18 / 0 / 11 | 7 | 48 | 169 | 43968 |
+
+No ``ds_read_b16``. Leftover ``ds_write_b16`` is P/C. Both split
+kernels keep 7 barriers. MMA-native QK/PV copies and fewer stage
 barriers are the next target. Matching ``BLOCK_N``/waves/splits still
 does not mean matching Triton's ISA.
 

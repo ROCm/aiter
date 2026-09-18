@@ -497,10 +497,26 @@ GPU 6 / gfx950 / ``FLYDSL_RUNTIME_ENABLE_CACHE=0``: all 18 QSA pytest
 cases pass. At width 2051 / ``L=512`` the aligned path is 23.8 / 24.1 /
 588.1 us for ``M=1/8/512`` with ``err=0``. The prior port was 23.3 /
 22.2 / 722.2 us, so prefill improves about 19% while decode is flat to
-worse. The BN64 split kernel ISA has 36 ``ds_write_b128``, 16 remaining
-``ds_write_b16``, 7 barriers, 48 MFMA instructions, 169 VGPRs, and
-43,968 bytes LDS. The remaining optimization target is an MMA-native
-thread/value layout for QK/PV fragments and fewer stage barriers.
+worse.
+
+Occupancy ISA (``FLYDSL_DUMP_IR``, width 2051). The pytest decode case
+is ``ns=1`` because width is 8; the bench kernel is ``BN=16`` / 256
+threads / 64 splits. Counts are unrolled static instructions, not
+dynamic per-tile issue.
+
+| kernel | ds_write b128/b32/b16 | ds_read b128/b64/b32/b16 | barrier | MFMA | VGPR | LDS B |
+|---|---:|---:|---:|---:|---:|---:|
+| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 / 0 | 7 | 6 | 70 | 13184 |
+| decode merge `ns64_blk128` | 0 / 2 / 0 | 34 / 0 / 1 / 0 | 1 | 0 | 64 | 260 |
+| prefill split `bn64_blk128_ns1` | 36 / 15 / 16 | 18 / 0 / 11 / 0 | 7 | 48 | 169 | 43968 |
+
+There are **no** ``ds_read_b16``; QK/PV LDS reads already widen to
+``b32``/``b64``/``b128``. Remaining ``ds_write_b16`` are P (and some C)
+stores. Both split kernels keep **7 barriers**. Prefill is
+store/MFMA-heavy; decode split is small (70 VGPR, 13 KiB) and the
+64-split merge does 34 ``ds_read_b128`` plus 41 ``global_load``. Next
+target is MMA-native QK/PV copies and fewer stage barriers, not more
+host splits.
 
 
 
