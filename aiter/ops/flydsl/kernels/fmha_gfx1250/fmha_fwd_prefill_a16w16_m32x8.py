@@ -2234,12 +2234,17 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             q_len = q_end - q_start
             kv_len = kv_end - kv_start
 
-            # LSE is [total_q, nheads_q]: base = q_start*stride_lse_seq; every valid
-            # element offset is < (q_start+q_len)*stride_lse_seq (< the 0x7FFFFFFF drop).
+            # LSE is [nheads_q, total_q]. Bound the buffer resource by the last
+            # element this batch can touch over BOTH axes (seq = q_len-1, head =
+            # nheads_q-1): a seq-only bound is exact only when seq is the major
+            # axis. Exactly numel*4 on the last batch, under the 0x7FFFFFFF drop.
+            num_heads_q = gpu.grid_dim.y * fx.Int32(GQA_RATIO)
             lse_base_elems = q_start * stride_lse_seq
             lse_num_records_bytes = (
-                fx.Int64(q_start + q_len) * fx.Int64(stride_lse_seq) * fx.Int64(4)
-            )
+                fx.Int64(q_start + q_len - fx.Int32(1)) * fx.Int64(stride_lse_seq)
+                + fx.Int64(num_heads_q - fx.Int32(1)) * fx.Int64(stride_lse_head)
+                + fx.Int64(1)
+            ) * fx.Int64(4)
 
             # An empty batch (no queries OR no keys) must NOT enter the core:
             # kv_len==0 gives an empty softmax denom (d=0) and the epilogue would
@@ -2662,7 +2667,7 @@ def flash_attn_varlen_m32x8(
     scaled-score domain — one extra ``exp(sink)`` term in the softmax denominator.
     Presence is baked into the kernel at compile time (``has_sink``).
 
-    ``lse`` (optional): caller-provided ``[total_q, nheads_q]`` fp32 output buffer,
+    ``lse`` (optional): caller-provided ``[nheads_q, total_q]`` fp32 output buffer,
     used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
     assert q.dtype in _TORCH_DTYPE_MAP.values(), f"Expected bf16 or fp16, got {q.dtype}"
@@ -2713,12 +2718,16 @@ def flash_attn_varlen_m32x8(
         )
     if return_lse:
         if lse is None:
+            # [nheads_q, total_q] is the aiter varlen LSE convention: what
+            # flash_attn_varlen_func documents, and what CK and the gfx1250 ASM
+            # varlen kernel both return. The kernel is stride-driven, so the
+            # layout lives entirely in the two strides below.
             lse = torch.empty(
-                (total_q_tokens, nheads_q), dtype=torch.float32, device=q.device
+                (nheads_q, total_q_tokens), dtype=torch.float32, device=q.device
             )
         lse_ptr = lse
-        stride_lse_seq = lse.stride(0)
-        stride_lse_head = lse.stride(1)
+        stride_lse_seq = lse.stride(1)
+        stride_lse_head = lse.stride(0)
     else:
         lse_ptr = q
         stride_lse_seq = 0
