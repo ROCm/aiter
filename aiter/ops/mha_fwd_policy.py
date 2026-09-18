@@ -7,10 +7,11 @@ from __future__ import annotations
 import json
 import math
 import statistics
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from itertools import product
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 MHA_FWD_HARDWARE_KEY_FIELDS = ("gfx", "gpu_model", "cu_num")
 MHA_FWD_PROBLEM_KEY_FIELDS = (
@@ -48,7 +49,6 @@ MHA_FWD_TUNING_KEY_FIELDS = (
     *MHA_FWD_PROBLEM_KEY_FIELDS,
 )
 MHA_FWD_CANDIDATE_FIELDS = ("backend", "num_splits", "backend_config")
-MHA_FWD_RUNTIME_SELECTION_FIELDS = ("backend", "num_splits", "backend_config")
 MHA_FWD_METRIC_FIELDS = (
     "us",
     "errRatio",
@@ -59,7 +59,7 @@ MHA_FWD_METRIC_FIELDS = (
 )
 MHA_FWD_RUNTIME_CSV_FIELDS = (
     *MHA_FWD_TUNING_KEY_FIELDS,
-    *MHA_FWD_RUNTIME_SELECTION_FIELDS,
+    *MHA_FWD_CANDIDATE_FIELDS,
 )
 MHA_FWD_MEASUREMENT_CSV_FIELDS = (
     *MHA_FWD_TUNING_KEY_FIELDS,
@@ -88,7 +88,21 @@ MhaFwdRunState = Literal[
 MHA_FWD_BACKENDS = frozenset(
     {"asm_v3", "ck", "flydsl", "gluon", "opus", "triton"}
 )
-MHA_FWD_RUNTIME_BACKENDS = MHA_FWD_BACKENDS
+MHA_FWD_TILE_CONFIG_BACKENDS = frozenset({"gluon", "triton"})
+MHA_FWD_TILE_CONFIG_KEYS = {
+    "triton": frozenset(
+        {
+            "BLOCK_M",
+            "BLOCK_N",
+            "PRELOAD_V",
+            "num_warps",
+            "waves_per_eu",
+            "num_stages",
+            "num_ctas",
+        }
+    ),
+    "gluon": frozenset({"BLOCK_M", "BLOCK_N", "num_warps", "waves_per_eu"}),
+}
 MHA_FWD_RESULT_STATUSES = frozenset(
     {
         "ok",
@@ -365,8 +379,14 @@ def validate_mha_fwd_plan_fields(
             raise ValueError("asm_v3 requires an explicit split count in [1, 8]")
     elif int(num_splits) != 0:
         raise ValueError(f"{backend} does not accept an external split count")
-    if backend_config and backend not in ("triton", "gluon"):
-        raise ValueError(f"{backend} does not accept backend_config")
+    if backend_config:
+        if backend not in MHA_FWD_TILE_CONFIG_BACKENDS:
+            raise ValueError(f"{backend} does not accept backend_config")
+        unknown = sorted(set(backend_config) - MHA_FWD_TILE_CONFIG_KEYS[backend])
+        if unknown:
+            raise ValueError(
+                f"{backend} backend_config has unknown keys: {unknown}"
+            )
 
 
 def validate_mha_fwd_backend_arch(backend: str, gfx: str) -> None:

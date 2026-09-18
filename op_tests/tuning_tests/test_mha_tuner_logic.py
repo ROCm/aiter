@@ -3,6 +3,7 @@
 """CPU-only policy and enumeration tests for the MHA forward tuner."""
 
 import argparse
+import collections
 import csv
 import importlib.util
 import json
@@ -19,10 +20,13 @@ from aiter.jit.utils.chip_info import normalize_gpu_model
 from aiter.ops import mha
 from aiter.ops.mha_fwd_policy import (
     MHA_FWD_RUNTIME_CSV_FIELDS,
+    MHA_FWD_TILE_CONFIG_BACKENDS,
+    MHA_FWD_TILE_CONFIG_KEYS,
     MhaFwdCandidate,
     MhaFwdPlan,
     MhaFwdProblem,
     MhaFwdResult,
+    enumerate_mha_fwd_candidates,
     mha_fwd_candidate_id,
 )
 
@@ -87,7 +91,7 @@ class TestMhaHardwareIdentity(unittest.TestCase):
         problem = MhaFwdProblem.from_mapping(_problem_row())
         self.assertEqual(problem.key()[:3], ("gfx942", "mi325x", "304"))
 
-    def test_pr5024_bf16_spelling_normalizes_to_runtime_dtype(self):
+    def test_bf16_spelling_normalizes_to_runtime_dtype(self):
         row = _problem_row()
         row["dtype"] = "bf16"
         self.assertEqual(MhaFwdProblem.from_mapping(row).dtype, "bfloat16")
@@ -159,24 +163,57 @@ class TestMhaProblemBuckets(unittest.TestCase):
 
 class TestMhaCandidateEnumeration(unittest.TestCase):
     def test_gfx942_enumerates_every_split_and_triton_grid(self):
-        candidates = _TUNER._candidates("gfx942")
+        candidates = enumerate_mha_fwd_candidates("gfx942")
         splits = [
-            split for backend, split, _ in candidates if backend == "asm_v3"
+            candidate.num_splits
+            for candidate in candidates
+            if candidate.backend == "asm_v3"
         ]
         self.assertEqual(splits, list(range(1, 9)))
-        self.assertIn(("ck", 0, None), candidates)
+        self.assertIn("ck", [candidate.backend for candidate in candidates])
         self.assertGreater(
-            sum(backend == "triton" for backend, _, _ in candidates), 1
+            sum(candidate.backend == "triton" for candidate in candidates), 1
         )
 
     def test_candidate_identities_are_unique(self):
         for gfx in ("gfx942", "gfx950", "gfx1250"):
-            candidates = _TUNER._candidates(gfx)
             identities = [
-                (backend, split, _TUNER._canonical_config(config))
-                for backend, split, config in candidates
+                candidate.identity
+                for candidate in enumerate_mha_fwd_candidates(gfx)
             ]
             self.assertEqual(len(identities), len(set(identities)))
+
+
+class TestTileConfigVocabulary(unittest.TestCase):
+    def test_tile_keys_match_enumeration(self):
+        seen = set()
+        for gfx in ("gfx942", "gfx950", "gfx1250"):
+            emitted = collections.defaultdict(set)
+            for candidate in enumerate_mha_fwd_candidates(gfx):
+                if candidate.backend_config:
+                    emitted[candidate.backend].update(candidate.backend_config)
+            seen.update(emitted)
+            for backend, keys in emitted.items():
+                with self.subTest(gfx=gfx, backend=backend):
+                    self.assertEqual(keys, set(MHA_FWD_TILE_CONFIG_KEYS[backend]))
+        self.assertEqual(seen, set(MHA_FWD_TILE_CONFIG_KEYS))
+        self.assertEqual(seen, set(MHA_FWD_TILE_CONFIG_BACKENDS))
+
+    def test_unknown_tile_key_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown keys"):
+            MhaFwdPlan(backend="triton", backend_config={"BLOCK_MM": 128})
+
+    def test_gluon_rejects_triton_only_key(self):
+        with self.assertRaisesRegex(ValueError, "unknown keys"):
+            MhaFwdPlan(backend="gluon", backend_config={"num_stages": 2})
+
+    def test_legal_tile_config_loads(self):
+        plan = MhaFwdPlan(backend="triton", backend_config={"BLOCK_M": 128})
+        self.assertEqual(plan.backend_config, {"BLOCK_M": 128})
+
+    def test_non_tile_backend_rejects_config(self):
+        with self.assertRaisesRegex(ValueError, "does not accept backend_config"):
+            MhaFwdPlan(backend="opus", backend_config={"BLOCK_M": 128})
 
 
 class TestMhaTunedPolicy(unittest.TestCase):
@@ -225,6 +262,22 @@ class TestMhaTunedPolicy(unittest.TestCase):
         self.assertEqual(table[key]["backend"], "asm_v3")
         self.assertEqual(table[key]["num_splits"], 3)
         self.assertIsNone(table[key]["backend_config"])
+
+    def test_lookup_returns_tiles_only_for_the_winning_backend(self):
+        tiles = {"BLOCK_M": 64, "BLOCK_N": 32}
+        plan = {"backend": "triton", "num_splits": 0, "backend_config": tiles}
+        with mock.patch.object(mha, "_get_mha_fwd_tuned_plan", return_value=plan):
+            self.assertEqual(
+                mha.lookup_mha_fwd_tile_config("triton", **self._key_args()),
+                tiles,
+            )
+            self.assertIsNone(
+                mha.lookup_mha_fwd_tile_config("gluon", **self._key_args())
+            )
+        with mock.patch.object(mha, "_get_mha_fwd_tuned_plan", return_value=None):
+            self.assertIsNone(
+                mha.lookup_mha_fwd_tile_config("triton", **self._key_args())
+            )
 
     def test_measurement_rows_are_rejected_as_runtime_artifacts(self):
         fields = [
@@ -490,6 +543,54 @@ class TestMhaPublicDispatch(unittest.TestCase):
         self.assertEqual(triton_entry.call_args.kwargs["backend"], "triton")
         self.assertEqual(triton_entry.call_args.kwargs["config"], {"BLOCK_M": 64})
 
+    def test_triton_public_varlen_reads_csv_tiles_when_config_is_none(self):
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        tiles = {
+            "BLOCK_M": 64,
+            "BLOCK_N": 32,
+            "PRELOAD_V": False,
+            "num_warps": 4,
+            "waves_per_eu": 2,
+            "num_stages": 1,
+            "num_ctas": 1,
+        }
+        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
+        with (
+            mock.patch.object(
+                mha, "lookup_mha_fwd_tile_config", return_value=tiles
+            ) as lookup,
+            mock.patch.object(
+                triton_mha._FlashAttnVarlenFunc, "apply", return_value="ok"
+            ) as apply,
+        ):
+            result = triton_mha.flash_attn_varlen_func(
+                q, k, v, cu_q, cu_k, 8, 16, config=None, backend="triton"
+            )
+        self.assertEqual(result, "ok")
+        lookup.assert_called_once()
+        self.assertEqual(lookup.call_args.args[0], "triton")
+        self.assertEqual(lookup.call_args.kwargs["mode"], "varlen")
+        self.assertEqual(apply.call_args.args[-1], tiles)
+
+    def test_explicit_triton_config_skips_csv_lookup(self):
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
+        explicit = {"BLOCK_M": 16}
+        with (
+            mock.patch.object(mha, "lookup_mha_fwd_tile_config") as lookup,
+            mock.patch.object(
+                triton_mha._FlashAttnVarlenFunc, "apply", return_value="ok"
+            ) as apply,
+        ):
+            result = triton_mha.flash_attn_varlen_func(
+                q, k, v, cu_q, cu_k, 8, 16, config=explicit, backend="triton"
+            )
+        self.assertEqual(result, "ok")
+        lookup.assert_not_called()
+        self.assertEqual(apply.call_args.args[-1], explicit)
+
     def test_unknown_backend_fails_closed(self):
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
         with (
@@ -514,15 +615,74 @@ class TestMhaCheckpointJournal(unittest.TestCase):
             tuner._args = argparse.Namespace(resume=True)
             tuner._append_journal_result("first", (info, 2.1, 0.0, "ok"))
             tuner._append_journal_result(
-                "finalist:0", (info, float("inf"), 1.0, "timeout")
+                "finalist:0",
+                (info, float("inf"), 1.0, "timeout", "exceeded 60s after 61.2s"),
             )
             with open(tuner._journal_path, "a", encoding="utf-8") as file:
                 file.write('{"incomplete":')
             records = tuner._load_journal()
         key = (mha_fwd_candidate_id(problem, candidate), "first")
-        self.assertEqual(records[key][1:], (2.1, 0.0, "ok"))
+        self.assertEqual(records[key][1:], (2.1, 0.0, "ok", ""))
         failed_key = (mha_fwd_candidate_id(problem, candidate), "finalist:0")
-        self.assertEqual(records[failed_key][1:], (float("inf"), 1.0, "timeout"))
+        self.assertEqual(
+            records[failed_key][1:],
+            (float("inf"), 1.0, "timeout", "exceeded 60s after 61.2s"),
+        )
+
+    def test_journal_reads_records_written_before_details_existed(self):
+        tuner = _TUNER.MhaFwdTuner()
+        problem = MhaFwdProblem.from_mapping(_problem_row())
+        candidate = MhaFwdCandidate("asm_v3", 3)
+        legacy = {
+            "schema_version": 1,
+            "candidate_id": mha_fwd_candidate_id(problem, candidate),
+            "phase": "first",
+            "problem": problem.as_row(),
+            "candidate": {
+                "backend": candidate.backend,
+                "num_splits": candidate.num_splits,
+                "backend_config": "",
+            },
+            "status": "crash",
+            "us": None,
+            "errRatio": 1.0,
+            "recorded_at_unix_s": 0.0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            tuner._journal_path = os.path.join(directory, "run.jsonl")
+            tuner._args = argparse.Namespace(resume=True)
+            with open(tuner._journal_path, "w", encoding="utf-8") as file:
+                file.write(json.dumps(legacy) + "\n")
+            records = tuner._load_journal()
+        key = (mha_fwd_candidate_id(problem, candidate), "first")
+        self.assertEqual(records[key][1:], (float("inf"), 1.0, "crash", ""))
+
+    def test_fresh_probe_invokes_module_from_repo_root(self):
+        tuner = _TUNER.MhaFwdTuner()
+        tuner._args = argparse.Namespace(warmup=1, iters=2, timeout=5)
+        row = _TUNER.pd.Series(
+            {
+                **_problem_row(),
+                "backend": "asm_v3",
+                "num_splits": 3,
+                "backend_config": "",
+            }
+        )
+        completed = mock.Mock(returncode=1, stdout="", stderr="boom")
+        with mock.patch.object(_TUNER.subprocess, "run", return_value=completed) as run:
+            proof = tuner._run_fresh_probe(row, "/tmp/runtime.csv")
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[1:4],
+            ["-m", "op_tests.tuners.tune_mha_fwd", "--_selection_probe"],
+        )
+        repository_root = Path(_TUNER.__file__).resolve().parents[2]
+        self.assertEqual(run.call_args.kwargs["cwd"], str(repository_root))
+        self.assertTrue(
+            run.call_args.kwargs["env"]["PYTHONPATH"].startswith(str(repository_root))
+        )
+        self.assertEqual(proof["status"], "failed")
+        self.assertEqual(proof["expected"]["backend_config"], "")
 
     def test_selection_trace_is_append_only_json(self):
         with tempfile.TemporaryDirectory() as directory:

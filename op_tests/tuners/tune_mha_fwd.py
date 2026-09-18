@@ -37,14 +37,15 @@ from aiter.ops.mha import (
     mha_varlen_fwd,
 )
 from aiter.ops.mha_fwd_policy import (
+    _as_bool,
     MHA_FWD_CANDIDATE_FIELDS,
     MHA_FWD_HARDWARE_KEY_FIELDS,
+    MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdCandidate,
     MhaFwdProblem,
-    canonical_backend_config,
     enumerate_mha_fwd_candidates,
     mha_fwd_candidate_id,
 )
@@ -53,15 +54,7 @@ from aiter.utility.mp_tuner import mp_tuner
 
 
 UNTUNED_FIELDS = MHA_FWD_PROBLEM_KEY_FIELDS
-RESULT_FIELDS = (
-    *MHA_FWD_CANDIDATE_FIELDS,
-    "us",
-    "errRatio",
-    "status",
-    "detail",
-    "samples_us",
-    "tflops",
-)
+RESULT_FIELDS = (*MHA_FWD_CANDIDATE_FIELDS, *MHA_FWD_METRIC_FIELDS)
 BOOL_FIELDS = (
     "causal",
     "return_lse",
@@ -74,23 +67,6 @@ BOOL_FIELDS = (
     "has_physical_padding",
     "is_grad",
 )
-
-
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    value = str(value).strip().lower()
-    if value in ("1", "true", "yes"):
-        return True
-    if value in ("0", "false", "no", ""):
-        return False
-    raise ValueError(f"invalid boolean value {value!r}")
-
-
-def _canonical_config(config: dict[str, Any] | None) -> str:
-    return canonical_backend_config(config)
 
 
 def _balanced_lengths(total: int, batch: int, maximum: int) -> list[int]:
@@ -386,23 +362,12 @@ def _run_candidate(
     raise ValueError(f"unknown backend {backend!r}")
 
 
-def _candidates(gfx: str):
-    """Compatibility view retained for existing tuner tests and callers."""
-
-    return [
-        (candidate.backend, candidate.num_splits, candidate.backend_config)
-        for candidate in enumerate_mha_fwd_candidates(gfx)
-    ]
-
-
 class MhaFwdTuner(TunerCommon):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "tune_file": AITER_CONFIG_MHA_FWD,
         "untune_file": "aiter/configs/untuned_mha_fwd.csv",
         "batch": 8,
-        # Every output element must satisfy the owning allclose tolerance.
-        # Candidate-specific numerical failures must never become winners.
         "errRatio": 0.0,
         "timeout": 7200,
         "config_env_name": "AITER_CONFIG_MHA_FWD",
@@ -601,10 +566,11 @@ class MhaFwdTuner(TunerCommon):
                 os.unlink(temporary)
 
     def _append_journal_result(self, phase: str, result) -> None:
-        info, us, err_ratio, status = result
+        info, us, err_ratio, status = result[:4]
+        detail = result[4] if len(result) > 4 else ""
         problem, candidate = self._problem_and_candidate(info)
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "candidate_id": mha_fwd_candidate_id(problem, candidate),
             "phase": phase,
             "problem": problem.as_row(),
@@ -614,6 +580,7 @@ class MhaFwdTuner(TunerCommon):
                 "backend_config": candidate.config_json,
             },
             "status": status,
+            "detail": str(detail),
             "us": float(us) if math.isfinite(float(us)) else None,
             "errRatio": float(err_ratio),
             "recorded_at_unix_s": time.time(),
@@ -687,6 +654,7 @@ class MhaFwdTuner(TunerCommon):
                         ),
                         float(record["errRatio"]),
                         str(record["status"]),
+                        str(record.get("detail", "")),
                     )
                     records[(candidate_id, str(record["phase"]))] = result
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -837,7 +805,7 @@ class MhaFwdTuner(TunerCommon):
 
         finalists_by_key: dict[tuple, list[tuple]] = {}
         for result in first_pass:
-            info, us, err_ratio, status = result
+            info, us, err_ratio, status = result[:4]
             if (
                 status == "ok"
                 and us > 0
@@ -916,11 +884,21 @@ class MhaFwdTuner(TunerCommon):
             if failed_status is not None or len(samples) != args.finalist_rounds:
                 status = failed_status or "crash"
                 us = float("inf")
+                detail = next(
+                    (
+                        str(result[4])
+                        for result in results
+                        if len(result) > 4 and result[3] != "ok" and result[4]
+                    ),
+                    f"only {len(samples)} of {args.finalist_rounds} "
+                    "finalist rounds produced a measurement",
+                )
             else:
                 status = "ok"
                 us = float(statistics.median(samples))
+                detail = ""
             err_ratio = max((float(result[2]) for result in results), default=1.0)
-            final_by_info[info] = (info, us, err_ratio, status)
+            final_by_info[info] = (info, us, err_ratio, status, detail)
 
         return [final_by_info.get(result[0], result) for result in first_pass]
 
@@ -955,7 +933,15 @@ class MhaFwdTuner(TunerCommon):
                     "us": us,
                     "errRatio": err_ratio,
                     "status": status,
-                    "detail": "" if status == "ok" else f"candidate {status}",
+                    "detail": (
+                        ""
+                        if status == "ok"
+                        else (
+                            str(result[4])
+                            if len(result) > 4 and result[4]
+                            else f"candidate {status} with no diagnostic recorded"
+                        )
+                    ),
                     "samples_us": json.dumps(samples, separators=(",", ":")),
                     "tflops": self.calculate((info, us, err_ratio)),
                 }
@@ -1115,6 +1101,7 @@ class MhaFwdTuner(TunerCommon):
         }
         problem["_proof_warmup"] = int(self._args.warmup)
         problem["_proof_iters"] = int(self._args.iters)
+        repository_root = Path(__file__).parents[2]
         environment = os.environ.copy()
         environment.update(
             {
@@ -1122,6 +1109,9 @@ class MhaFwdTuner(TunerCommon):
                 "AITER_GPU_MODEL": str(row["gpu_model"]),
                 "AITER_MHA_FWD_SELECTION_PROOF_FILE": proof_path,
                 "AITER_MHA_FWD_PROBE_PROBLEM": json.dumps(problem),
+                "PYTHONPATH": os.pathsep.join(
+                    [str(repository_root), os.environ.get("PYTHONPATH", "")]
+                ).rstrip(os.pathsep),
             }
         )
         started = time.time()
@@ -1129,13 +1119,24 @@ class MhaFwdTuner(TunerCommon):
             {
                 "backend": str(row["backend"]),
                 "num_splits": int(row["num_splits"]),
+                "backend_config": (
+                    str(row["backend_config"])
+                    if "backend_config" in row and pd.notna(row["backend_config"])
+                    else ""
+                ),
             }
             if "backend" in row and pd.notna(row["backend"])
             else None
         )
         try:
             completed = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), "--_selection_probe"],
+                [
+                    sys.executable,
+                    "-m",
+                    "op_tests.tuners.tune_mha_fwd",
+                    "--_selection_probe",
+                ],
+                cwd=str(repository_root),
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -1150,6 +1151,7 @@ class MhaFwdTuner(TunerCommon):
             observed = {
                 "backend": selected.get("backend"),
                 "num_splits": selected.get("num_splits"),
+                "backend_config": selected.get("backend_config", ""),
             }
             probe_line = next(
                 (
@@ -1228,7 +1230,7 @@ class MhaFwdTuner(TunerCommon):
                 "atol": 2e-2,
                 "error_metric": "fraction failing elementwise allclose",
                 "maximum_error_ratio": float(self._args.errRatio),
-                "candidate_count": int(len(self._all_results)),
+                "candidate_count": len(self._all_results),
                 "status_counts": dict(sorted(status_counts.items())),
             },
             "artifacts": {

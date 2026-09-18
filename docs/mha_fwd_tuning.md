@@ -1,9 +1,8 @@
 # MHA forward tuning contract
 
-This document defines the native Aiter contract for packed-varlen MHA forward
-tuning. Candidate enumeration, correctness, timing, winner serialization, and
-runtime dispatch remain owned by Aiter. External orchestration may invoke and
-verify this contract, but production does not import an orchestration package.
+This document defines the Aiter contract for packed-varlen MHA forward tuning.
+Candidate enumeration, correctness, timing, winner serialization, and runtime
+dispatch are owned by Aiter.
 
 ## Hardware identity
 
@@ -20,7 +19,6 @@ string returned by the runtime. `AITER_GPU_MODEL` provides an explicit override
 for controlled replay environments.
 
 Rows without `gpu_model` are not silently assigned to the current product.
-That would allow a measurement from one SKU to select a kernel on another.
 
 ## Three distinct artifacts
 
@@ -40,12 +38,8 @@ tile launches, and empty for every other backend. A runtime reader rejects
 measurement columns rather than silently treating evidence as deployable policy.
 
 CK recipe search is not expanded here: the tuner measures the current default
-CK launch, not the PR #5024 tile dump. A faster correctness-gated CK, Triton,
-Gluon, FlyDSL, OPUS, or ASM candidate is the winner and is launched as-is.
-
-This separation follows the updated unified-tuning proposal. Winner identity
-lives in the dispatch CSV, matching the MoE pattern, instead of requiring a
-second backend-native writer before a measured winner can ship.
+CK launch. A faster correctness-gated CK, Triton, Gluon, FlyDSL, OPUS, or ASM
+candidate is the winner and is launched as-is.
 
 ## Split-KV and backend launch
 
@@ -57,7 +51,11 @@ second backend-native writer before a measured winner can ship.
 - `ck` launches `mha_varlen_fwd` / `FlashAttnVarlenFunc` with
   `selected_backend="ck"`.
 - `triton` and `gluon` launch the existing varlen entry with the stored
-  `backend_config`.
+  `backend_config`. A direct call to
+  `aiter.ops.triton.attention.mha.flash_attn_varlen_func` (or `flash_attn_func`)
+  with `config=None` performs the same exact CSV lookup and uses those tiles
+  when the winning backend matches; otherwise it keeps the DEFAULT.json /
+  mha.json feature-bucket fallback.
 - `flydsl` and `opus` launch the same functions the tuner already measures.
 - An explicit public API `num_splits` argument on the dense D64 path remains a
   caller override and is left unchanged.
@@ -81,39 +79,31 @@ Candidate evidence records `ok`, `unsupported`, `mismatch`, `oom_preflight`,
 `failed`, `partial`, `measured`, `verified`, and `review-ready`. Status is never
 stored in the runtime artifact.
 
-Exhaustive search must not apply a heuristic candidate pruner. A future
-explicitly named pruned or guided search mode may use the same candidate
-vocabulary, but its evidence must identify that strategy.
-
 Current enumeration is: ASM splits 1–8, one CK default, the Triton grid, Gluon
 and OPUS on gfx950, and FlyDSL on gfx1250. Tuner-only paths that production
 cannot launch stay invalid.
 
-## Lifecycle and acceptance
+## Lifecycle
 
-A reviewable MHA tuning change completes these stages:
+A complete MHA tuning run:
 
-1. Normalize an explicit problem catalogue. PR #5024's runtime dump and
-   `mha_count_shape.py` are the preferred catalogue producer when available.
-2. Enumerate and validate every legal candidate for the selected strategy.
-3. Correctness-gate and measure candidates through the owning Aiter harness.
-   ASM measurement uses `_fmha_v3_varlen_splitkv_fwd(..., num_splits)` rather
-   than assuming `fmha_v3_varlen_fwd` grew a split argument.
-4. Append each candidate result to a deterministic-ID journal, allowing a
-   killed or faulted shape group to resume only missing phases.
+1. Normalize an explicit problem catalogue.
+2. Enumerate every legal candidate.
+3. Correctness-gate and measure candidates. ASM measurement uses
+   `_fmha_v3_varlen_splitkv_fwd(..., num_splits)`.
+4. Append each candidate result to a deterministic-ID journal so a killed or
+   faulted shape group can resume only missing phases.
 5. Re-measure finalists in fresh worker rounds and select by median latency.
 6. Write the measurement record, cross-backend runtime CSV, and evidence
    manifest atomically. The fastest correctness-gated row is the winner.
 7. Start a fresh process with `AITER_CONFIG_MHA_FWD` pointing to that file.
 8. Run the public MHA operator, repeat correctness, and prove the expected
    backend, split count, and backend config were actually dispatched.
-9. Retain hardware, software, candidate, failure, correctness, timing, and
-   selection evidence for review.
 
 Direct candidate timing and fresh public-path timing are separate evidence
 domains. A candidate is not a deployed winner until public replay succeeds.
 
-## Fallback and compatibility
+## Fallback
 
 An absent exact row preserves Aiter's existing production fallback: FlyDSL
 when it claims the call, otherwise `fmha_v3_varlen_fwd` with C++ `num_splits=0`
@@ -121,8 +111,3 @@ auto-select. Malformed rows, duplicate exact keys, unknown backends, bad
 splits, measurement columns, and incompatible hardware fail closed. Runtime
 lookup does not broaden an exact row to another GPU model, architecture, CU
 count, or problem shape.
-
-The native contract is intentionally specific to MHA forward. It coordinates
-with PR #5024 instead of copying its shape collector or CK writer. It does not
-create a shared MHA/MLA schema, move candidate legality into an external
-sidecar, or require one artifact format for other operator families.
