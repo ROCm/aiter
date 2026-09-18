@@ -36,8 +36,10 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-HEAD_DIM: gl.constexpr = 256
-QUANT_GROUP: gl.constexpr = 128
+# Must be `gl.constexpr(...)`, not a `: gl.constexpr` annotation -- Triton only
+# lets a @jit body read globals instantiated the first way.
+HEAD_DIM = gl.constexpr(256)
+QUANT_GROUP = gl.constexpr(128)
 
 
 @gluon.jit

@@ -12,14 +12,19 @@ could not:
   * **Non-power-of-two batch.** A CUDA graph capture asks for decode batches of
     12, 24, 40, 48, 56 ... and dispatch happens once at capture, so a miss is
     permanent. These sizes are in the parametrization deliberately.
-  * **Context length independent of any compile-time bound.** Short and long
-    contexts run the same binary; the merge width is chosen device-side.
+  * **Context length independent of any compile-time bound.** `max_context` is
+    a capacity hint that picks a body and a launch geometry; it never clamps the
+    live length, which comes from `kv_indptr`. Every case therefore runs with a
+    hint on each side of the crossover, and one case deliberately runs a context
+    far longer than the hint.
 """
 
 import pytest
 import torch
 
 from aiter.ops.triton.attention.paged_attention_output_gate import (
+    _SHORT_CONTEXT_MAX,
+    _short_body_selected,
     paged_attention_output_gate_group_fp8_quant,
     paged_attention_output_gate_supported,
 )
@@ -102,7 +107,9 @@ def _reference(q, kc, vc, indptr, indices, gate, scale, k_scale, v_scale, quant_
 )
 @pytest.mark.parametrize("heads", [4, 8])
 @pytest.mark.parametrize("ctx_len", [1, 129, 1024])
-def test_matches_reference(rows, heads, ctx_len):
+# One hint on each side of the crossover, so both bodies see every shape.
+@pytest.mark.parametrize("max_context", [_SHORT_CONTEXT_MAX, _SHORT_CONTEXT_MAX * 2])
+def test_matches_reference(rows, heads, ctx_len, max_context):
     dtype = torch.float8_e4m3fn
     q, kc, vc, indptr, indices, gate = _make_inputs(
         rows, ctx_len, heads, dtype, seed=rows * 31 + heads
@@ -119,6 +126,7 @@ def test_matches_reference(rows, heads, ctx_len):
         indices,
         gate,
         scale=scale,
+        max_context=max_context,
         k_scale=k_scale,
         v_scale=v_scale,
         quant_dtype=dtype,
@@ -142,12 +150,19 @@ def test_matches_reference(rows, heads, ctx_len):
 
 
 @pytest.mark.parametrize("rows", [1, 16])
-def test_quant_dtype_none_skips_epilogue(rows):
-    """quant_dtype=None must return the bf16 output and nothing else."""
+@pytest.mark.parametrize("max_context", [None, _SHORT_CONTEXT_MAX * 2])
+def test_quant_dtype_none_skips_epilogue(rows, max_context):
+    """quant_dtype=None must return the bf16 output and nothing else.
+
+    Not just a missing return value: the short body stages `sigmoid(gate)` in
+    the `gated` buffer and the launcher has no FP8 buffers to point the epilogue
+    at, so the FP8 stores have to be compiled out rather than aliased onto it.
+    A live-but-aliased store would corrupt `gated` here.
+    """
     dtype = torch.float8_e4m3fn
     q, kc, vc, indptr, indices, gate = _make_inputs(rows, 512, 4, dtype, seed=7)
     gated, quantized, scales = paged_attention_output_gate_group_fp8_quant(
-        q, kc, vc, indptr, indices, gate, scale=HEAD_DIM**-0.5
+        q, kc, vc, indptr, indices, gate, scale=HEAD_DIM**-0.5, max_context=max_context
     )
     assert quantized is None and scales is None
     ref_gated, _, _ = _reference(
@@ -156,11 +171,75 @@ def test_quant_dtype_none_skips_epilogue(rows):
     torch.testing.assert_close(gated.float(), ref_gated.float(), rtol=2e-2, atol=2e-2)
 
 
-def test_gate_row_stride_is_honored():
+@pytest.mark.parametrize("rows", [1, 3, 12])
+def test_max_context_hint_never_clamps(rows):
+    """A context far longer than the hint must still be attended in full.
+
+    The Artemis short-context body this was ported from clamps the live length
+    to a compile-time capacity, which silently truncates exactly this case. The
+    hint here selects a body and a launch geometry and nothing else.
+    """
+    dtype = torch.float8_e4m3fn
+    ctx_len = 5 * _SHORT_CONTEXT_MAX // 4
+    q, kc, vc, indptr, indices, gate = _make_inputs(rows, ctx_len, 4, dtype, seed=17)
+    assert _short_body_selected(4, kc, vc, 1024), "meant to exercise the short body"
+
+    gated, _, _ = paged_attention_output_gate_group_fp8_quant(
+        q, kc, vc, indptr, indices, gate, scale=HEAD_DIM**-0.5, max_context=1024
+    )
+    ref_gated, _, _ = _reference(
+        q, kc, vc, indptr, indices, gate, HEAD_DIM**-0.5, None, None, None
+    )
+    torch.testing.assert_close(gated.float(), ref_gated.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("rows", [1, 8, 32])
+@pytest.mark.parametrize("heads", [4, 8])
+def test_bodies_agree(rows, heads):
+    """The two bodies are a performance choice, so they must agree numerically.
+
+    Not bit-exact: they reassociate the split-K sum differently. The tolerance
+    is the same one each is held to against the fp32 reference.
+    """
+    dtype = torch.float8_e4m3fn
+    q, kc, vc, indptr, indices, gate = _make_inputs(rows, 1024, heads, dtype, seed=23)
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    v_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    args = (q, kc, vc, indptr, indices, gate)
+    kwargs = {
+        "scale": HEAD_DIM**-0.5,
+        "k_scale": k_scale,
+        "v_scale": v_scale,
+        "quant_dtype": dtype,
+    }
+    assert _short_body_selected(heads, kc, vc, _SHORT_CONTEXT_MAX)
+    assert not _short_body_selected(heads, kc, vc, _SHORT_CONTEXT_MAX + 1)
+
+    short_gated, short_q, short_s = paged_attention_output_gate_group_fp8_quant(
+        *args, max_context=_SHORT_CONTEXT_MAX, **kwargs
+    )
+    long_gated, long_q, long_s = paged_attention_output_gate_group_fp8_quant(
+        *args, max_context=_SHORT_CONTEXT_MAX + 1, **kwargs
+    )
+    torch.testing.assert_close(
+        short_gated.float(), long_gated.float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(short_s, long_s, rtol=2e-2, atol=1e-6)
+    torch.testing.assert_close(
+        short_q.float() * short_s.repeat_interleave(QUANT_GROUP, dim=1).float(),
+        long_q.float() * long_s.repeat_interleave(QUANT_GROUP, dim=1).float(),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+
+@pytest.mark.parametrize("max_context", [None, _SHORT_CONTEXT_MAX * 2])
+def test_gate_row_stride_is_honored(max_context):
     """A non-contiguous gate must be read through its stride, not assumed packed.
 
-    The Artemis original folds row and head into one index and silently requires
-    `gate.stride(0) == heads*HEAD_DIM`; this asserts we do not.
+    The Artemis long-context original folds row and head into one index and
+    silently requires `gate.stride(0) == heads*HEAD_DIM`; this asserts neither
+    body does.
     """
     dtype = torch.float8_e4m3fn
     rows, heads = 8, 4
@@ -174,10 +253,17 @@ def test_gate_row_stride_is_honored():
     assert strided.stride(0) != heads * HEAD_DIM
 
     packed, _, _ = paged_attention_output_gate_group_fp8_quant(
-        q, kc, vc, indptr, indices, gate, scale=HEAD_DIM**-0.5
+        q, kc, vc, indptr, indices, gate, scale=HEAD_DIM**-0.5, max_context=max_context
     )
     loose, _, _ = paged_attention_output_gate_group_fp8_quant(
-        q, kc, vc, indptr, indices, strided, scale=HEAD_DIM**-0.5
+        q,
+        kc,
+        vc,
+        indptr,
+        indices,
+        strided,
+        scale=HEAD_DIM**-0.5,
+        max_context=max_context,
     )
     torch.testing.assert_close(loose.float(), packed.float(), rtol=0, atol=0)
 
