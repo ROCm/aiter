@@ -1,149 +1,119 @@
-# gfx1250 F8 GEMM: native ASM versus FlyDSL
+# gfx1250 MX128 FlyDSL tuning and native ASM comparison
 
 ## Scope
 
-This note compares the native kernel from
-`origin/gfx1250/bench_asm_f8gemm` at `996b11ddfc25` with the FlyDSL
-256x256 kernel for:
+This note records the final tuning state on
+`perf/gfx1250-flydsl-waitcnt-align` for the three DSV4 A-preshuffle GEMMs:
 
 ```text
-M=512, N=65536, K=1536, BF16 output, split-K=1
+M=512, N=6144,  K=7168
+M=512, N=7168,  K=16384
+M=512, N=65536, K=1536
 ```
 
-The quoted commands do not initially exercise equivalent scale formats:
+FlyDSL uses MX128 E8M0 scales. The native ASM comparison kernel uses MX32
+scales, so its timings are useful scheduling targets but are not identical
+input semantics.
 
-- Native ASM is MX32 and receives pre-shuffled A, B, A-scale, and B-scale data.
-- `test_gemm_a8w8_blockscale.py --flydsl --ck_preshuffle True --apre True`
-  is MX128 and receives logical-layout scales.
+## Final tuned profiles
 
-That distinction is material to both the instruction stream and the timing.
+| Shape (M x N x K) | FlyDSL profile |
+|---|---|
+| `512x6144x7168` | `t256x256x128_mw2_nw2_nb4_sk4_cm1_cn2_fsk_apre` |
+| `512x7168x16384` | `t256x256x128_mw2_nw2_nb4_sk4_cm2_cn2_fsk_apre` |
+| `512x65536x1536` | `t256x256x128_mw2_nw2_nb4_sk1_cm2_cn2_apre_ps2` |
 
-## Measurements
+The full names in the tuned CSV use the
+`flydsl_mxfp8_128_bpreshuffle_compute_wmma_` prefix.
 
-Measurements were collected on gfx1250 on 2026-09-18. Native values are the
-six-call reproduction driver's accepted GPU-event means. FlyDSL values are
-from `run_perftest`; the MX32 row also includes a `rocprofv3 --stats
---kernel-trace` recheck.
+## FlyDSL result versus the previous config
 
-| Kernel/input | Time (us) | Difference from native constant |
-|---|---:|---:|
-| Native ASM MX32, constant (16.59, 16.62, 16.82) | 16.6767 | baseline |
-| Native ASM MX32, uniform (17.63, 17.51, 17.32) | 17.4867 | n/a |
-| FlyDSL MX128, constant | 19.6980 | +3.0213 (+18.1%) |
-| FlyDSL MX128, uniform | 22.7493 | n/a |
-| FlyDSL MX32/native-format scales, constant | 19.0303 | +2.3536 (+14.1%) |
+These are GPU-only `rocprofv3` kernel durations. Each candidate had 20 warmup
+launches and 100 measured launches; the reported value is the 5%-trimmed mean.
+The previous and tuned candidates were measured in the same profiler run.
 
-The FlyDSL MX32 profiler recheck dispatched the target kernel 121 times and
-reported 19.5184 us average, 18.027 us minimum. Earlier warm runs measured
-18.89-18.92 us by GPU event and 19.2000 us by `rocprofv3` average.
-
-Matching the native scale layout therefore recovers about 0.67-0.81 us, but it
-does not explain the remaining roughly 2.2-2.4 us constant-input gap.
-
-The exact FlyDSL control command remained correct for constant input. Uniform
-input produced the same accepted BF16 warning as the CK references: 0.1% of
-elements differed at the configured tolerance, with maximum absolute delta 20.
-
-## ISA findings
-
-### Scale-format overhead
-
-The MX128 FlyDSL path must broadcast scale bytes before each group of WMMAs. A
-representative sequence is:
-
-```text
-s_wait_dscnt 18
-v_perm_b32
-s_wait_dscnt 1
-v_perm_b32
-s_wait_dscnt 0
-v_perm_b32 ...
-s_wait_dscnt 8
-v_wmma_scale_...
-```
-
-The native MX32 kernel consumes packed scale words through WMMA scale selectors
-and reaches the first WMMA after a single `s_wait_dscnt 8`.
-
-A scheduling barrier after the MX128 scale loads did not hide this work. It
-changed the dependency waits to approximately 34/33/32/8, added another wait,
-and regressed event timing from about 19.65 to 19.73 us. Feeding packed MX32
-words directly to the MX128 path is not valid: constant inputs produced a
-half-scale result and random inputs failed badly. Those experiments are not in
-the final source.
-
-### VGPR-bank and wait-count differences
-
-For each 64-WMMA steady-state block, native has a repeatable schedule:
-
-| Kernel | Block | `s_set_vgpr_msb` | `s_wait_dscnt` | `s_wait_alu` |
+| Shape (M x N x K) | Previous config (us) | Tuned (us) | Improvement | Speedup |
 |---|---:|---:|---:|---:|
-| Native MX32 | 0-3 | 10 | 4 | 0 |
-| FlyDSL MX32 | 0 | 27 | 6 | 2 |
-| FlyDSL MX32 | 1 | 21 | 6 | 5 |
-| FlyDSL MX32 | 2 | 52 | 6 | 3 |
-| FlyDSL MX32 | 3 | 21 | 6 | 2 |
+| `512x6144x7168` | 13.9124 | 12.7167 | 8.59% | 1.094x |
+| `512x7168x16384` | 23.5240 | 19.2532 | 18.16% | 1.222x |
+| `512x65536x1536` | 22.0130 | 18.7708 | 14.73% | 1.173x |
+| **Three-shape sum** | **59.4494** | **50.7407** | **14.65%** | **1.172x** |
 
-Block 2 is the largest remaining outlier. Native keeps a stable operand-bank
-tuple through long WMMA runs. FlyDSL still changes the A operand bank 11, 2,
-12, and 2 times in blocks 0-3 respectively, despite pinning accumulator and
-operand groups to reduce allocator freedom.
+A second run through the public tuned-config dispatch measured 13.0338,
+19.7380, and 19.7946 us respectively. This confirms that both requested large
+gaps are now in the 19-us class when selected from the checked-in CSV.
 
-The first FlyDSL MX32 WMMA is also preceded by a split dependency chain:
+## Native ASM comparison
+
+The exact native kernel is:
 
 ```text
-s_wait_dscnt 8
-s_wait_alu depctr_va_vdst(0)
-ds_load_b128 x4
-s_set_vgpr_msb
-s_wait_dscnt 4
-v_wmma_scale_...
+_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x2_psE
 ```
 
-Native schedules all initial fragment reads before its single
-`s_wait_dscnt 8`, then starts WMMA. Aligning this prologue is the clearest next
-target. Native also issues three initial tensor loads, waits with
-`s_wait_tensorcnt(2)`, then issues the fourth; FlyDSL currently issues four and
-waits with `s_wait_tensorcnt(3)`.
+Split-K raw-kernel numbers must not be compared with a fused or reduced result
+without accounting for the reduction kernel. The relevant measurements are:
 
-## Branch changes
+| Shape | Native ASM | FlyDSL | Interpretation |
+|---|---:|---:|---|
+| `512x6144x7168` | 9.6862 us raw GEMM; 20.5877 us with reduction | 12.7167 us fused | ASM raw is faster; FlyDSL is 38.23% faster than the measured ASM complete path |
+| `512x7168x16384` | 16.3938 us raw GEMM | 17.6802 us raw GEMM | Raw-to-raw FlyDSL gap is 7.85% |
+| `512x7168x16384` | about 25.7000 us with reduction | 19.2532 us fused | FlyDSL complete path is about 25.08% faster |
+| `512x65536x1536` | 16.2844 us, split-K=1 | 18.7708 us, split-K=1 | FlyDSL is 15.27% slower |
 
-The experimental kernel state in this branch:
+For `512x7168x16384`, the native ASM kernel is therefore correctly described
+as a 17-us-class raw kernel. Its separate split-K reduction is not included in
+that 16.3938-us number.
 
-- pins accumulator quadrants and A/B fragments to intended physical VGPR banks;
-- removes the duplicated runtime parity schedule and retains the parity-0
-  traversal;
-- introduces explicit LDS scheduling boundaries and native-like DS wait points;
-- moves the tensor fence wait earlier to leave independent WMMAs in front of it;
-- uses iterative-ILP scheduling with one wave per EU and a 1024-register cap.
+## Correctness checks
 
-The changes are intentionally scoped to the gfx1250 FlyDSL kernel. Failed scale
-reinterpretation and scale-barrier experiments were reverted.
+- Constant data and constant scales passed the reference check for all three
+  tuned-config dispatches.
+- With uniform data and automatic E8M0 scales, A-preshuffle output was bitwise
+  identical to the matching row-major-A FlyDSL profile for all three shapes.
+- Against the FP32-accumulating reference, the split-K=4 profiles have the
+  expected BF16 reduction-order sensitivity: 5.88% and 6.18% of elements fell
+  outside the test's 1% elementwise tolerance. The split-K=1 large-N profile
+  was within the normal warning range at 0.12%. No NaN/Inf or A-preshuffle
+  layout discrepancy was observed.
+
+## Scheduling changes retained
+
+- Native-style explicit VGPR pinning and its wait scheduling remain scoped to
+  the MX32 path.
+- MX128 split-K=4 keeps the hardware wave-ID parity traversal; replacing it
+  with logical parity was slightly slower.
+- MX128 `t256x256`, four-buffer, split-K=1 uses one steady-state traversal. It
+  removes the duplicate runtime branch for the short-K large-N profile and is
+  the source change used by `512x65536x1536`.
+- The final result does not include the rejected no-expert-scheduler, nb3,
+  iterative-ILP, opposite-traversal, or split-K=4 single-path experiments.
 
 ## Reproduction
 
-FlyDSL MX128 control:
+Run the checked-in tuned dispatches:
 
 ```bash
-ENABLE_CK=0 FLYDSL_COMPILE_LLVM_DIR=/app/llvm-pin-tools \
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE="$PWD/aiter/configs/model_configs/dsv4_a8w8_blockscale_abpreshuffle_tuned_gemm.csv" \
+ENABLE_CK=0 \
 python3 op_tests/test_gemm_a8w8_blockscale.py \
   --flydsl --ck_preshuffle True --apre True \
-  -m 512 -nk 65536,1536
+  --data-init constant --scale-init constant \
+  -m 512 -nk 6144,7168 7168,16384 65536,1536 --table
 ```
 
-GPU-only trace:
+GPU-only timing:
 
 ```bash
-ENABLE_CK=0 FLYDSL_COMPILE_LLVM_DIR=/app/llvm-pin-tools \
-rocprofv3 --stats --kernel-trace -f csv -o /tmp/gfx1250_fly_mx128 -- \
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE="$PWD/aiter/configs/model_configs/dsv4_a8w8_blockscale_abpreshuffle_tuned_gemm.csv" \
+ENABLE_CK=0 \
+rocprofv3 --stats --kernel-trace -f csv -o /tmp/gfx1250_dsv4 -- \
 python3 op_tests/test_gemm_a8w8_blockscale.py \
   --flydsl --ck_preshuffle True --apre True \
-  -m 512 -nk 65536,1536
+  --data-init constant --scale-init constant \
+  -m 512 -nk 6144,7168 7168,16384 65536,1536 --table
 ```
 
-Native reproduction from `origin/gfx1250/bench_asm_f8gemm`:
-
-```bash
-python -m op_tests.test_mxfp8fp4gemm_perf \
-  --cases wq_b --data-init constant uniform
-```
+Do not set `FLYDSL_COMPILE_LLVM_DIR=/app/llvm-pin-tools` with the current
+installed FlyDSL package: that older external toolchain rejects the generated
+buffer-resource MLIR syntax. The normal compiler path is the validated setup.

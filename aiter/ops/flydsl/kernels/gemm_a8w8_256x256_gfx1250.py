@@ -1046,10 +1046,21 @@ def launch_gemm_a8w8_256x256(
                 if do_sync:
                     cluster.cluster_barrier()
 
-        if const_expr(native_vgpr_pinning):
+        single_steady_path = const_expr(
+            native_vgpr_pinning
+            or (
+                not mx32
+                and tile_m == 256
+                and tile_n == 256
+                and num_buffers == 4
+                and split_k == 1
+            )
+        )
+        if const_expr(single_steady_path):
             # Both traversals compute the same quadrants.  Keeping both behind a
-            # runtime wave-parity branch makes register allocation cover two
-            # large schedule bodies and scatters the pinned VGPR banks.
+            # runtime wave-parity branch makes register allocation cover two large
+            # schedule bodies.  The parity-0 traversal also compiles better for the
+            # short-K MX128 profile used by the large-N projection.
             _run_steady(0)
         else:
             wave_parity = fx.Int32(
