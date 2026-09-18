@@ -146,7 +146,7 @@ def _fwd_offsets_fit_int32(
 
     heads = q.shape[-2]
     lse_shape = (q_rows, heads) if varlen else (batch, heads, padded_q)
-    if not fits(lse, lse_shape):
+    if lse is not None and not fits(lse, lse_shape):
         return False
 
     # s_dmask uses contiguous [batch, head, max_q, max_k] strides even when it
