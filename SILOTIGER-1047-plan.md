@@ -652,7 +652,14 @@ and was reverted.
 stores plus shuffle-pack 64-bit P stores (`lane_m % 4 == 0` after
 ``shuffle_xor`` 1/2/3). Oracle ``err=0``, but width-2051 ``L=512``
 went to 24.5 / 24.8 / 637.3 us vs 24.0 / 24.1 / 588.6. Scalar P/C
-stores stay. Next: cut the 7 per-tile barriers.
+stores stay.
+
+Dropped the barrier between V gather and wave-0 softmax (softmax
+reads C/live, not V). Split-kernel occupancy ISA is 6 ``s_barrier``
+(was 7). Width-2051 ``L=512`` is 24.3 / 24.1 / 586.7 us (``err=0``)
+— flat. Prefill VGPR 165 vs 169. Do **not** retry all-wave softmax
+to fold the P barrier. Next: K/V-alias or translate barriers, or Q
+register staging.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.

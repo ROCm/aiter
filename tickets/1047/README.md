@@ -535,8 +535,16 @@ reverted.
 
 **Do not retry** 128-bit C stores plus shuffle-pack 64-bit P stores.
 They matched the oracle but width-2051 ``L=512`` went 24.5 / 24.8 /
-637.3 us vs 24.0 / 24.1 / 588.6. Next is cutting the 7 per-tile
-barriers.
+637.3 us vs 24.0 / 24.1 / 588.6.
+
+The V-gather → softmax barrier is gone: softmax only reads C/live,
+already published by the post-QK barrier, and V/P meet before PV.
+Occupancy ISA is **6** split-kernel barriers (was 7). GPU 6 / gfx950:
+18 pytest cases, ``err=0``, width-2051 ``L=512`` is 24.3 / 24.1 /
+586.7 us — flat vs 24.0 / 24.1 / 588.6. Decode VGPR 69; prefill VGPR
+165 vs 169. Do **not** retry all-wave softmax to drop the P barrier.
+Next: remaining required barriers (K/V alias, page translate) or Q
+register staging.
 
 
 
