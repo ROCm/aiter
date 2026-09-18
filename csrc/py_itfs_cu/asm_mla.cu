@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
 #include "asm_mla_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -27,6 +28,11 @@
 #include <sys/stat.h>
 #include <vector>
 #endif
+
+// TLS error bridge for this .so (module_mla_asm). Lets the ctypes entrypoints
+// below turn AITER_CHECK / HIP_CALL failures into a Python RuntimeError instead
+// of std::abort()-ing the worker process.
+AITER_CTYPES_ERROR_DEF
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -645,37 +651,64 @@ static void mla_decode_gfx1250_dispatch(
 #endif
 }
 
-AITER_C_ITFS
-void mla_decode_stage1_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
-    aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
-    aiter_tensor_t* qo_indptr,            //   [batch_size+1]
-    aiter_tensor_t* kv_indptr,            //   [batch_size+1]
-    aiter_tensor_t* kv_page_indices,      //   [num_page_used]
-    aiter_tensor_t* kv_last_page_lens,    //   [batch_size]
-    aiter_tensor_t* num_kv_splits_indptr, //   metadata (nullable)
-    aiter_tensor_t* work_meta_data,       //   metadata addr (nullable)
-    aiter_tensor_t* work_indptr,          //   metadata (nullable)
-    aiter_tensor_t* work_info_set,        //   [batch_size+1] (nullable)
-    int max_seqlen_q,
-    int page_size,
-    int nhead_kv,
-    float softmax_scale,
-    // following are output
-    aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
-    aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
-    aiter_tensor_t* output,               //   [batch_size, num_heads, v_head_dim]
-    aiter_tensor_t* lse,                  //   [batch_size, num_heads] (nullable)
-    aiter_tensor_t* q_scale,              //   [1] (nullable)
-    aiter_tensor_t* kv_scale,             //   [1] (nullable)
-    aiter_tensor_t* g_kv_indptr,          //   [batch_size+1] GLOBAL kv_indptr for round-robin CP (nullable)
-    int cp_world_size,                    //   round-robin CP world size (1 == disabled)
-    int cp_rank,                          //   round-robin CP rank id
-    aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
-    int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
-    int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
-    hipStream_t stream)
-{    
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_decode_stage1_asm_fwd,
+    (aiter_tensor_t * Q,                  //   [num_seqs, num_heads, head_size]
+     aiter_tensor_t* KV,                  //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
+     aiter_tensor_t* qo_indptr,           //   [batch_size+1]
+     aiter_tensor_t* kv_indptr,           //   [batch_size+1]
+     aiter_tensor_t* kv_page_indices,     //   [num_page_used]
+     aiter_tensor_t* kv_last_page_lens,   //   [batch_size]
+     aiter_tensor_t* num_kv_splits_indptr, //   metadata (nullable)
+     aiter_tensor_t* work_meta_data,      //   metadata addr (nullable)
+     aiter_tensor_t* work_indptr,         //   metadata (nullable)
+     aiter_tensor_t* work_info_set,       //   [batch_size+1] (nullable)
+     int max_seqlen_q,
+     int page_size,
+     int nhead_kv,
+     float softmax_scale,
+     // following are output
+     aiter_tensor_t* splitData,           //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+     aiter_tensor_t* splitLse,            //   [batch_size, num_kv_splits, num_heads,  1]
+     aiter_tensor_t* output,              //   [batch_size, num_heads, v_head_dim]
+     aiter_tensor_t* lse,                 //   [batch_size, num_heads] (nullable)
+     aiter_tensor_t* q_scale,             //   [1] (nullable)
+     aiter_tensor_t* kv_scale,            //   [1] (nullable)
+     aiter_tensor_t* g_kv_indptr,         //   [batch_size+1] GLOBAL kv_indptr for round-robin CP (nullable)
+     int cp_world_size,                   //   round-robin CP world size (1 == disabled)
+     int cp_rank,                         //   round-robin CP rank id
+     aiter_tensor_t* valid_split_count,   //   [batch_size] scratch for packed gfx1250 kernels (nullable)
+     int use_valid_split_count_reduce,    //   enable packed-kernel valid split count writeback/reduce
+     int causal,                          //   apply the causal mask across the max_seqlen_q query tokens
+     hipStream_t stream),
+    (Q,
+     KV,
+     qo_indptr,
+     kv_indptr,
+     kv_page_indices,
+     kv_last_page_lens,
+     num_kv_splits_indptr,
+     work_meta_data,
+     work_indptr,
+     work_info_set,
+     max_seqlen_q,
+     page_size,
+     nhead_kv,
+     softmax_scale,
+     splitData,
+     splitLse,
+     output,
+     lse,
+     q_scale,
+     kv_scale,
+     g_kv_indptr,
+     cp_world_size,
+     cp_rank,
+     valid_split_count,
+     use_valid_split_count_reduce,
+     causal,
+     stream))
+{
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);
@@ -1091,26 +1124,44 @@ struct __attribute__((packed)) PsKernelArgs
 };
 
 
-AITER_C_ITFS
-void mla_prefill_ps_asm_fwd(
-    aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
-    aiter_tensor_t* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
-    aiter_tensor_t* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
-    aiter_tensor_t* qo_indptr,            //   [batch_size+1], int
-    aiter_tensor_t* kv_indptr,            //   [batch_size+1], int
-    aiter_tensor_t* kv_page_indices,      //   [num_page_used], int
-    aiter_tensor_t* work_indptr,          //   [available_tgs+1], int (nullable)
-    aiter_tensor_t* work_info_set,        //   [max_works], int (nullable)
-    int max_seqlen_q,
-    float softmax_scale,
-    int is_causal,
-    aiter_tensor_t* splitData,            //   [num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
-    aiter_tensor_t* splitLse,             //   [num_q_heads, num_seqs, max_kv_split,  1], fp32
-    aiter_tensor_t* output,               //   [num_seqs, num_q_heads, v_head_dim], bf16
-    aiter_tensor_t* q_scale,              //   fp32, scalar (nullable)
-    aiter_tensor_t* k_scale,              //   fp32, scalar (nullable)
-    aiter_tensor_t* v_scale,              //   fp32, scalar (nullable)
-    hipStream_t stream)
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_ps_asm_fwd,
+    (aiter_tensor_t * Q,                 //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+     aiter_tensor_t* K,                  //   [num_page, num_kv_heads, qk_head_size], fp8
+     aiter_tensor_t* V,                  //   [num_page, num_kv_heads, v_head_size], fp8
+     aiter_tensor_t* qo_indptr,          //   [batch_size+1], int
+     aiter_tensor_t* kv_indptr,          //   [batch_size+1], int
+     aiter_tensor_t* kv_page_indices,    //   [num_page_used], int
+     aiter_tensor_t* work_indptr,        //   [available_tgs+1], int (nullable)
+     aiter_tensor_t* work_info_set,      //   [max_works], int (nullable)
+     int max_seqlen_q,
+     float softmax_scale,
+     int is_causal,
+     aiter_tensor_t* splitData,          //   [num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
+     aiter_tensor_t* splitLse,           //   [num_q_heads, num_seqs, max_kv_split,  1], fp32
+     aiter_tensor_t* output,             //   [num_seqs, num_q_heads, v_head_dim], bf16
+     aiter_tensor_t* q_scale,            //   fp32, scalar (nullable)
+     aiter_tensor_t* k_scale,            //   fp32, scalar (nullable)
+     aiter_tensor_t* v_scale,            //   fp32, scalar (nullable)
+     hipStream_t stream),
+    (Q,
+     K,
+     V,
+     qo_indptr,
+     kv_indptr,
+     kv_page_indices,
+     work_indptr,
+     work_info_set,
+     max_seqlen_q,
+     softmax_scale,
+     is_causal,
+     splitData,
+     splitLse,
+     output,
+     q_scale,
+     k_scale,
+     v_scale,
+     stream))
 {
     int num_q_tokens  = Q->size(0);
     int num_head_q    = Q->size(1);
@@ -1208,19 +1259,30 @@ void mla_prefill_ps_asm_fwd(
 }
 
 
-AITER_C_ITFS
-void mla_prefill_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
-    aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
-    aiter_tensor_t* qo_indptr,            //   [batch_size+1]
-    aiter_tensor_t* kv_indptr,            //   [batch_size+1]
-    aiter_tensor_t* kv_page_indices,      //   [num_page_used]
-    aiter_tensor_t* kv_last_page_lens,    //   [batch_size]
-    int max_seqlen_q,
-    float softmax_scale,
-    aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
-    aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
-    hipStream_t stream)
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_asm_fwd,
+    (aiter_tensor_t * Q,                 //   [num_seqs, num_heads, head_size]
+     aiter_tensor_t* KV,                 //   [num_page, page_size, num_kv_heads, head_size]
+     aiter_tensor_t* qo_indptr,          //   [batch_size+1]
+     aiter_tensor_t* kv_indptr,          //   [batch_size+1]
+     aiter_tensor_t* kv_page_indices,    //   [num_page_used]
+     aiter_tensor_t* kv_last_page_lens,  //   [batch_size]
+     int max_seqlen_q,
+     float softmax_scale,
+     aiter_tensor_t* splitData,          //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+     aiter_tensor_t* splitLse,           //   [batch_size, num_kv_splits, num_heads,  1]
+     hipStream_t stream),
+    (Q,
+     KV,
+     qo_indptr,
+     kv_indptr,
+     kv_page_indices,
+     kv_last_page_lens,
+     max_seqlen_q,
+     softmax_scale,
+     splitData,
+     splitLse,
+     stream))
 {
     int sub_Q           = 128;
     int batch           = kv_indptr->size(0) - 1;
