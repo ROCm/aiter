@@ -36,13 +36,14 @@ class _Params:
         dtype=torch.bfloat16,
         kv_dtype=None,
         shuffled_kv_cache=False,
+        block_size=64,
     ):
         self.head_size = head_size
         self.max_seqlen_q = max_seqlen_q
         self.max_seqlen_k = 32768
         self.sliding_window = sliding_window
         self.shuffled_kv_cache = shuffled_kv_cache
-        self.block_size = 64
+        self.block_size = block_size
         self.q_dtype = dtype
         self.kv_cache_dtype = kv_dtype if kv_dtype is not None else dtype
 
@@ -71,15 +72,23 @@ def _matched_key(params):
 
 # The pre-shuffled A8W8 KV path pins TILE_SIZE = block_size after the lookup,
 # so the non-shuffled composites (BLOCK_M 64/128 at TILE 16) would be
-# re-launched at TILE 64 and blow the 64KB LDS at head 512. The SHUF axis
-# (added to the schema alongside these entries) keeps pre-shuffled prefill on
-# LDS-safe, separately tuned entries. All cases below run with
-# shuffled_kv_cache=True; the non-shuffled counterparts (which must NOT match
-# the SHUF entries) are the fp8 rows in _CASES above.
+# re-launched at TILE 64 and blow the 64KB LDS at head 512. The SHUF and BS
+# axes (added to the schema alongside these entries) keep pre-shuffled prefill
+# on LDS-safe, separately tuned entries: page <= 64 gets the tuned configs,
+# larger pages fall back to BLOCK_M 16 / 1 stage (the only specialization that
+# fits LDS at TILE 128). All cases below run with shuffled_kv_cache=True; the
+# non-shuffled counterparts (which must NOT match the SHUF entries) are the
+# fp8 rows in _CASES above. Covers prefill and decode.
 _SHUF_CASES = [
-    # shuffled fp8 prefill resolves to the SHUF-scoped entries
-    (512, 16384, e4m3_dtype, "D_GEQ_512.Q_GEQ_1024.SHUF.DT_fp8_fp8", 32),
-    (256, 16384, e4m3_dtype, "D_GEQ_256.Q_GEQ_1024.SHUF.DT_fp8_fp8", 128),
+    # shuffled prefill, page 64: the tuned SHUF+BS_LEQ_64 entries
+    (512, 16384, e4m3_dtype, "D_GEQ_512.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_fp8_fp8", 32),
+    (256, 16384, e4m3_dtype, "D_GEQ_256.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_fp8_fp8", 128),
+    (512, 16384, torch.bfloat16, "D_GEQ_512.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_bf16_bf16", 16),
+    (256, 16384, torch.bfloat16, "D_GEQ_256.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_bf16_bf16", 16),
+    # shuffled prefill, page 128: BS_LEQ_64 must not match; the BS-agnostic
+    # M16/s1 fallbacks serve the call (only LDS-safe config at TILE 128)
+    (512, 16384, e4m3_dtype, "D_GEQ_512.Q_GEQ_1024.SHUF.DT_fp8_fp8", 16),
+    (256, 16384, torch.bfloat16, "D_GEQ_256.Q_GEQ_1024.SHUF.DT_bf16_bf16", 16),
     # shuffled decode still resolves to the Q_LEQ_1 entries
     (512, 1, e4m3_dtype, "D_GEQ_512.Q_LEQ_1.DT_fp8_fp8", 16),
     (256, 1, e4m3_dtype, "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8", 16),
@@ -156,13 +165,12 @@ def test_gfx942_large_head_prefill_lookup(
     "head_size, max_seqlen_q, q_dtype, expected_key, expected_block_m",
     _SHUF_CASES,
 )
-def test_gfx942_shuffled_kv_prefill_lookup(
-    head_size,
-    max_seqlen_q,
-    q_dtype,
-    expected_key,
-    expected_block_m,
-):
+def test_gfx942_shuffled_kv_lookup(head_size, max_seqlen_q, q_dtype, expected_key, expected_block_m):
+    """Shuffled prefill (tuned page-64 entries and page-128 fallback) and decode."""
+    block_size = 64
+    if "BS_LEQ_64" not in expected_key and max_seqlen_q > 1:
+        # the BS-agnostic fallback cases exercise a larger page
+        block_size = 128
     key, config = _matched_key(
         _Params(
             head_size,
@@ -170,6 +178,7 @@ def test_gfx942_shuffled_kv_prefill_lookup(
             dtype=q_dtype,
             kv_dtype=q_dtype,
             shuffled_kv_cache=True,
+            block_size=block_size,
         )
     )
     assert key == expected_key, f"expected {expected_key}, matched {key}"
