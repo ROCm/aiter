@@ -52,19 +52,21 @@ gaps are now in the 19-us class when selected from the checked-in CSV.
 
 ## Final production-default validation
 
-The final post-review `rocprofv3` public-dispatch check exercised both A
-layouts, including the strided-A-scale path. Constant data and scales passed
-exactly on all six shapes. The 5%-trimmed GPU timings were:
+The final post-review correctness sweep exercised both A layouts, including
+the strided-A-scale path. Constant data and scales passed exactly on all six
+shapes. Performance was then remeasured with the exclusive, order-balanced
+procedure described in the native ASM comparison below. The 5%-trimmed GPU
+timings were:
 
 | Shape (M x N x K) | Row-major A (us) | A-preshuffled (us) | A-pre reduction |
 |---|---:|---:|---:|
-| `512x6144x7168` | 14.5584 | 12.7881 | 12.16% |
-| `512x7168x3072` | 8.2247 | 7.9607 | 3.21% |
-| `512x7168x16384` | 23.7999 | 19.5389 | 17.90% |
-| `512x65536x1536` | 21.5881 | 19.2641 | 10.77% |
-| `512x2048x7168` | 8.1173 | 8.1512 | -0.42% |
-| `512x8192x1536` | 6.1318 | 5.9491 | 2.98% |
-| **Six-shape sum** | **82.4202** | **73.6521** | **10.64%** |
+| `512x6144x7168` | 14.3957 | 12.6862 | 11.88% |
+| `512x7168x3072` | 8.0132 | 8.1102 | -1.21% |
+| `512x7168x16384` | 23.7094 | 19.4120 | 18.13% |
+| `512x65536x1536` | 20.6931 | 18.6849 | 9.70% |
+| `512x2048x7168` | 7.8468 | 7.9156 | -0.88% |
+| `512x8192x1536` | 6.1099 | 6.0558 | 0.89% |
+| **Six-shape sum** | **80.7681** | **72.8647** | **9.79%** |
 
 Two row-major defaults changed after two same-command baseline/candidate runs:
 
@@ -106,15 +108,22 @@ warmups followed by 100 measured dispatches, and each run's value is the
 5%-trimmed mean of GPU-only `rocprofv3` durations. A positive gap means FlyDSL
 is slower than native ASM; a negative gap means FlyDSL is faster.
 
+Each run began only after both `rocm-smi` and `/dev/kfd` reported an idle GPU.
+While the benchmark ran, a 10-ms process audit accepted only the profiler
+process and its descendants as `/dev/kfd` holders. All 24 selected runs passed
+that exclusivity check. Three noisy run instances with isolated runtime spikes
+were discarded as whole runs and repeated; individual dispatches were not
+selectively removed beyond the stated symmetric 5% trim.
+
 | Shape | FlyDSL split-K | ASM apre (us) | FlyDSL apre (us) | FlyDSL vs ASM | ASM row (us) | FlyDSL row (us) | FlyDSL vs ASM |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `512x6144x7168` | 4 | 21.4510 | 13.5796 | -36.69% | 24.7291 | 14.6396 | -40.80% |
-| `512x7168x3072` | 1 | 11.3876 | 7.9908 | -29.83% | 13.2382 | 7.9341 | -40.07% |
-| `512x7168x16384` | 4 | 46.4057 | 19.5583 | -57.85% | 51.6492 | 23.7318 | -54.05% |
-| `512x65536x1536` | 1 | 16.1429 | 18.9654 | +17.48% | 18.3593 | 20.9724 | +14.23% |
-| `512x2048x7168` | 4 | 22.1127 | 8.0643 | -63.53% | 25.5539 | 7.9750 | -68.79% |
-| `512x8192x1536` | 1 | 7.7229 | 6.1920 | -19.82% | 8.7594 | 6.1662 | -29.61% |
-| **Six-shape sum** | - | **125.2229** | **74.3504** | **-40.63%** | **142.2892** | **81.4190** | **-42.78%** |
+| `512x6144x7168` | 4 | 21.0658 | 12.6862 | -39.78% | 24.9815 | 14.3957 | -42.37% |
+| `512x7168x3072` | 1 | 11.5293 | 8.1102 | -29.66% | 13.1164 | 8.0132 | -38.91% |
+| `512x7168x16384` | 4 | 46.8413 | 19.4120 | -58.56% | 52.4839 | 23.7094 | -54.83% |
+| `512x65536x1536` | 1 | 16.2122 | 18.6849 | +15.25% | 18.2226 | 20.6931 | +13.56% |
+| `512x2048x7168` | 4 | 21.7530 | 7.9156 | -63.61% | 25.8281 | 7.8468 | -69.62% |
+| `512x8192x1536` | 1 | 7.7878 | 6.0558 | -22.24% | 8.7763 | 6.1099 | -30.38% |
+| **Six-shape sum** | - | **125.1894** | **72.8647** | **-41.80%** | **143.4087** | **80.7681** | **-43.68%** |
 
 A-preshuffling reduces native ASM time on every shape. It helps the FlyDSL
 256x256 profiles, while the three 128x128 profiles are effectively neutral
@@ -122,25 +131,25 @@ within run-to-run noise:
 
 | Shape | ASM A-preshuffle time reduction | FlyDSL A-preshuffle time reduction |
 |---|---:|---:|
-| `512x6144x7168` | 13.26% | 7.24% |
-| `512x7168x3072` | 13.98% | -0.71% |
-| `512x7168x16384` | 10.15% | 17.59% |
-| `512x65536x1536` | 12.07% | 9.57% |
-| `512x2048x7168` | 13.47% | -1.12% |
-| `512x8192x1536` | 11.83% | -0.42% |
-| **Six-shape sum** | **11.99%** | **8.68%** |
+| `512x6144x7168` | 15.67% | 11.88% |
+| `512x7168x3072` | 12.10% | -1.21% |
+| `512x7168x16384` | 10.75% | 18.13% |
+| `512x65536x1536` | 11.03% | 9.70% |
+| `512x2048x7168` | 15.78% | -0.88% |
+| `512x8192x1536` | 11.26% | 0.89% |
+| **Six-shape sum** | **12.70%** | **9.79%** |
 
 These are still scheduling comparisons rather than identical datatype
 comparisons: native ASM uses MX32 scales and FlyDSL uses MX128 scales. Constant
 unit scales make the mathematical correctness check identical, but production
 scale grouping differs. FlyDSL wins five shapes and the aggregate for both A
 layouts. The remaining target is `512x65536x1536`, where native ASM split-K=1
-is 17.48% faster with A preshuffle and 14.23% faster with row-major A.
+is 15.25% faster with A preshuffle and 13.56% faster with row-major A.
 
 The formerly cited 17-us-class native result for `512x7168x16384` was a raw
 split-K=4 partial-output kernel. It is not a complete production result without
-a reducer. Native split-K=1 takes 46.4057 us with A preshuffle; the selected
-one-dispatch FlyDSL result takes 19.5583 us.
+a reducer. Native split-K=1 takes 46.8413 us with A preshuffle; the selected
+one-dispatch FlyDSL result takes 19.4120 us.
 
 ## Correctness checks
 
