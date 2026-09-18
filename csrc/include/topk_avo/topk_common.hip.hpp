@@ -98,15 +98,43 @@ template <>
 struct RowExtents<false>
 {
     const int* ends;
-    __device__ __forceinline__ int row_start(int) const { return 0; }
+    __device__ __forceinline__ int row_start(int, int) const { return 0; }
 };
+// Both accessors clamp the caller's window into [0, pitch].
+//
+// This is the only place that can. rowStarts/rowEnds are device pointers, so a
+// host-side check would cost a D2H sync on every call; and declining the shape
+// in topk_avo_supports() does not help either, because that signature is
+// (numRows, stride0, k) and never sees the extents -- a decline just routes the
+// same arguments to aiter's mb/ob path, which faults on them too.
+//
+// What it prevents, measured by bench/stress_topk.py on the unclamped build:
+// rowStarts = -8 and rowEnds = INT32_MAX each took a GPU memory fault, and
+// rowEnds = pitch + 64 was worse than a fault -- it returned indices past the
+// pitch with no error at all.
+//
+// `pitch` is a parameter rather than a member on purpose. Adding a field would
+// change the kernarg layout, and one unused kernarg has already been measured
+// moving the small_n geomean 1.0% in this kernel (see TopkOut below). The four
+// call sites in topk_generalize.hip.hpp all have pitch in scope already, so
+// passing it is free. The arithmetic is per ROW, not per element.
 template <>
 struct RowExtents<true>
 {
     const int* starts;
     const int* ends;
-    __device__ __forceinline__ int row_start(int row) const { return starts[row]; }
-    __device__ __forceinline__ int row_len(int row) const { return ends[row] - starts[row]; }
+    __device__ __forceinline__ int row_start(int row, int pitch) const
+    {
+        const int s = starts[row];
+        return s < 0 ? 0 : (s > pitch ? pitch : s);
+    }
+    __device__ __forceinline__ int row_len(int row, int pitch) const
+    {
+        const int e  = ends[row];
+        const int ec = e < 0 ? 0 : (e > pitch ? pitch : e);
+        const int s  = row_start(row, pitch);
+        return ec > s ? ec - s : 0;
+    }
 };
 
 __device__ __forceinline__ int row_len_dev(int row, int pitch, const int* row_ends)
@@ -116,7 +144,7 @@ template <bool RAGGED>
 __device__ __forceinline__ int row_len_of(int row, int pitch, RowExtents<RAGGED> ext)
 {
     if constexpr(RAGGED)
-        return ext.row_len(row);
+        return ext.row_len(row, pitch);
     return pitch;
 }
 

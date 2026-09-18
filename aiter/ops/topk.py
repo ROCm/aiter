@@ -473,6 +473,24 @@ def topk_avo_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 def topk_avo_supports(numRows: int, stride0: int, k: int) -> bool: ...
 
 
+@functools.lru_cache(maxsize=1024)
+def _avo_supports_cached(numRows: int, stride0: int, k: int) -> bool:
+    """topk_avo_supports() memoised, because the binding call is not cheap.
+
+    Measured in the correctness image: 4.86 us per call, against a kernel that
+    is 43 us at numRows=64 stride0=65537. Adding one unmemoised call to the
+    validation below cost +12.5% there and +7.5% on average across the twelve
+    shapes in reports/odd_n_ab.tsv -- a constant ~5 us offset that did not grow
+    with the work, which is what host overhead looks like.
+
+    Safe to cache: topk_avo_supports is a pure function of these three ints.
+    It computes avo::params_for -> derive_shape_params, which reads no device
+    state (CU_COUNT is a constexpr in topk_shape.hip.hpp, and there is no
+    hipGetDeviceProperties anywhere in that header).
+    """
+    return bool(topk_avo_supports(numRows, stride0, k))
+
+
 def top_k_per_row_prefill_avo(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -483,6 +501,7 @@ def top_k_per_row_prefill_avo(
     stride0: int,
     stride1: int,
     k: int = 2048,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     """Per-row top-k (prefill) via the topk-prefill-avo kernels.
 
@@ -507,11 +526,74 @@ def top_k_per_row_prefill_avo(
     ranks these scores across ranks cannot have padding outrank a real
     negative logit.
 
-    Call topk_avo_supports() first -- the shapes it declines (k above the
-    Phase C LDS cap, a row width that is not a multiple of 4) raise rather
-    than fall back."""
+    Every argument is validated here and a bad one raises ValueError. That is
+    not belt-and-braces over the C++ checks, it is the only place the check can
+    be survivable: AITER_CHECK calls std::abort() unless g_aiter_can_throw is
+    set (csrc/include/aiter_hip_common.h), and only the aiter_safe_call ctypes
+    bridge sets it, which this entry does not go through. Before this, passing
+    k above the Phase C cap, or stride1 != 1, or a short workspace killed the
+    caller's process with a message instead of raising. Measured with
+    bench/stress_topk.py.
+
+    None of the checks costs a device sync: every term is a scalar argument or
+    a tensor attribute. rowStarts/rowEnds CONTENTS are deliberately not checked
+    here -- they live in device memory, so validating them host-side would cost
+    a D2H sync on every call. The kernel clamps them into [0, stride0] instead
+    (RowExtents in csrc/topk_common.hip.hpp).
+
+    `workspace` is optional: pass a buffer of at least
+    topk_avo_workspace_size(numRows, stride0, k) bytes to own it yourself, or
+    leave it None to get the shared scratch buffer.
+
+    Call topk_avo_supports() first if you want to route around the shapes this
+    declines (k above the Phase C LDS cap) rather than handle the exception."""
+    if numRows <= 0:
+        return  # matches the C++ entry, which returns before touching anything
+    if stride1 != 1:
+        raise ValueError(
+            f"top_k_per_row_prefill_avo: logits inner stride must be 1, got {stride1}"
+        )
+    if not _avo_supports_cached(numRows, stride0, k):
+        raise ValueError(
+            f"top_k_per_row_prefill_avo: unsupported shape (numRows={numRows} "
+            f"stride0={stride0} k={k}); ask topk_avo_supports() first"
+        )
+    if logits.dtype is not torch.float32:
+        raise ValueError(
+            f"top_k_per_row_prefill_avo: logits must be fp32, got {logits.dtype}"
+        )
+    if indices.dtype is not torch.int32:
+        raise ValueError(
+            f"top_k_per_row_prefill_avo: indices must be int32, got {indices.dtype}"
+        )
+    if indices.numel() < numRows * k:
+        raise ValueError(
+            f"top_k_per_row_prefill_avo: indices holds {indices.numel()} entries, "
+            f"needs numRows*k = {numRows * k}"
+        )
+    if values is not None:
+        if values.dtype is not torch.float32:
+            raise ValueError(
+                f"top_k_per_row_prefill_avo: values must be fp32, got {values.dtype}"
+            )
+        if values.numel() < numRows * k:
+            raise ValueError(
+                f"top_k_per_row_prefill_avo: values holds {values.numel()} entries, "
+                f"needs numRows*k = {numRows * k}"
+            )
+    if rowStarts.numel() < numRows or rowEnds.numel() < numRows:
+        raise ValueError(
+            f"top_k_per_row_prefill_avo: rowStarts/rowEnds hold "
+            f"{rowStarts.numel()}/{rowEnds.numel()} entries, need {numRows}"
+        )
     size = topk_avo_workspace_size(numRows, stride0, k)
-    workspace = get_topk_scratch_workspace(logits.device, size)
+    if workspace is None:
+        workspace = get_topk_scratch_workspace(logits.device, size)
+    elif workspace.numel() * workspace.element_size() < size:
+        raise ValueError(
+            f"top_k_per_row_prefill_avo: workspace is "
+            f"{workspace.numel() * workspace.element_size()} B, needs {size} B"
+        )
     return _top_k_per_row_prefill_avo(
         logits,
         rowStarts,

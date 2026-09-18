@@ -29,10 +29,10 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
                                    int npasses)
 {
     const int row       = blockIdx.x;
-    const int row_start = RAGGED ? extents.row_start(row) : 0;
+    const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
     int len;
     if constexpr(RAGGED)
-        len = extents.row_len(row);
+        len = extents.row_len(row, pitch);
     else
         len = pitch;
     const float* ri = input + (size_t)row * pitch + row_start;
@@ -122,7 +122,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 {
     const int row     = blockIdx.y;
     const int len     = row_len_of<RAGGED>(row, pitch, extents);
-    const float* ri   = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
+    const float* ri   = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
     const float th    = threshold_f[row];
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
     const int wid     = threadIdx.x / WAVE_SIZE;
@@ -277,7 +277,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
                                       bool keys_only)
 {
     const int row            = blockIdx.x;
-    const int row_start      = RAGGED ? extents.row_start(row) : 0;
+    const int row_start      = RAGGED ? extents.row_start(row, pitch) : 0;
     const int len            = row_len_of<RAGGED>(row, pitch, extents);
     const unsigned int c_raw = cand_bad[row] ? 0xFFFFFFFFu : cand_reserved[row];
     if(threadIdx.x == 0)
@@ -381,7 +381,7 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
 {
     const int row   = blockIdx.x;
     const int len   = row_len_of<RAGGED>(row, pitch, extents);
-    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
+    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
 
     if(threadIdx.x == 0 && row == 0)
         *fb_count = 0;

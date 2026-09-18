@@ -500,7 +500,7 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
                                                  unsigned* __restrict__ s_wgt,
                                                  unsigned* __restrict__ s_weq)
 {
-    const int row_start = RAGGED ? extents.row_start(row) : 0;
+    const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
     const int len       = row_len_of<RAGGED>(row, pitch, extents);
     const float* rif0   = input + (size_t)row * pitch + row_start;
     if(RAGGED && len <= K)
@@ -586,7 +586,7 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
 {
     const int row   = blockIdx.x;
     const int len   = row_len_of<RAGGED>(row, pitch, extents);
-    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
+    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
 
     if(threadIdx.x == 0)
     {
@@ -683,7 +683,7 @@ __global__ void phase_b_filter_waveseg(const float* __restrict__ input,
 {
     const int row   = blockIdx.x;
     const int len   = row_len_of<RAGGED>(row, pitch, extents);
-    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
+    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
     const float th  = threshold_f[row];
 
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
@@ -804,7 +804,7 @@ __global__
 {
     const int row   = blockIdx.x;
     const int len   = row_len_of<RAGGED>(row, pitch, extents);
-    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row) : 0);
+    const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
     const float th  = threshold_f[row];
 
     const int lane    = threadIdx.x & (WAVE_SIZE - 1);
@@ -941,7 +941,7 @@ __global__ void phase_c_select_waveseg(const float* __restrict__ input,
                                        int npasses)
 {
     const int row            = blockIdx.x;
-    const int row_start      = RAGGED ? extents.row_start(row) : 0;
+    const int row_start      = RAGGED ? extents.row_start(row, pitch) : 0;
     const int len            = row_len_of<RAGGED>(row, pitch, extents);
     const unsigned int c_raw = cand_count[row];
     const int k_out          = RAGGED ? k_take_dev(K, len) : K;
