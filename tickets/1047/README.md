@@ -664,6 +664,13 @@ flat; prefill does not launch merge. Keep the runtime split loop.
 21.1 / 516.2. Decode is slightly worse; prefill does not launch merge.
 Keep two waves and two ``D`` lanes per thread.
 
+**Do not retry** decode-only ``make_tiled_copy_A`` PV-A from
+``p_lds[h, n]`` (64-bit atom, wave slice) with token-major V already
+on copy_B. 18 pytest cases, ``err=0``; width-2051 ``L=512`` was 18.8 /
+21.7 / 513.4 us vs 18.5 / 21.1 / 516.2. Same class of miss as 64-bit
+scalar-pack P loads. Keep scalar ``p_lds[lane_m, n0:n0+4]`` gathers.
+
+
 
 
 
