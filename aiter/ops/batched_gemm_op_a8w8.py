@@ -19,6 +19,7 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .gemm_op_common import get_padded_m
+from .opus.policy import index_tuned_by_cu_num
 from .opus.policy import (
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
@@ -181,16 +182,34 @@ def _get_mxscale_bmm_launchers():
 def _load_mxscale_bmm_tuned(
     libtype: str | None = None, bpreshuffle: bool = False
 ) -> dict:
-    """{(gfx,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
+    """{(gfx,cu_num,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
+    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k"]
+    shape_keys_fallback = ["gfx", "b", "m", "n", "k"]
+
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     try:
         df = pd.read_csv(path).drop_duplicates()
     except FileNotFoundError:
         logger.warning("mxscale BMM tuned CSV not found at %s", path)
         return {}
+
+    required = set(shape_keys_fallback)
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
+
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype]
-    return df.set_index(["gfx", "b", "m", "n", "k"]).to_dict("index")
+
+    if "cu_num" not in df.columns:
+        logger.warning(
+            "MXFP8 BMM tuned CSV %r has no 'cu_num' column; falling back to "
+            "the fallback gfx-only key. Re-run the tuner to distinguish devices "
+            "that share an architecture but have different CU counts.",
+            path,
+        )
+        return df.set_index(shape_keys_fallback).to_dict("index")
+    return index_tuned_by_cu_num(df, path, shape_keys, shape_keys_fallback)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -223,13 +242,16 @@ def lookup_mxscale_bmm_config(
     reported without this layer knowing which column holds it.
     """
     gfx = get_gfx()
+    cu_num = get_cu_num()
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
 
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, b, padded_m, n, k))
+        row = tuned.get((gfx, cu_num, b, padded_m, n, k))
+        if row is None:
+            row = tuned.get((gfx, b, padded_m, n, k))
         if row is not None:
             break
 
@@ -244,13 +266,14 @@ def lookup_mxscale_bmm_config(
         cfg = {c: v for c, v in row.items() if c not in _TUNED_PERF_COLUMNS}
         if padded_m == m:
             logger.info(
-                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, is tuned on gfx = {gfx} "
-                f"in {path}, config is {cfg}!"
+                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, is tuned on gfx = {gfx}, "
+                f"cu_num = {cu_num} in {path}, config is {cfg}!"
             )
         else:
             logger.info(
-                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, exact miss on gfx = {gfx}; "
-                f"using padded_M: {padded_m} config {cfg} from {path}!"
+                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, exact miss on gfx = {gfx}, "
+                f"cu_num = {cu_num}; using padded_M: {padded_m} config {cfg} "
+                f"from {path}!"
             )
     return row
 
