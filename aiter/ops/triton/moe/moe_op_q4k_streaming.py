@@ -99,9 +99,16 @@ def fused_moe_q4k_streaming(
         expert_ptrs.is_contiguous()
     ), f"expert_ptrs must be contiguous, got stride {expert_ptrs.stride()}"
 
+    # %-style placeholders, not an f-string: AITER_TRITON_LOG_LEVEL defaults to
+    # WARNING, so at INFO this message is discarded, and this wrapper sits in a
+    # per-dispatch inference path. Passing the values as args lets logging skip
+    # the formatting entirely below the configured level.
     _LOGGER.info(
-        f"MOE_OP_Q4K_STREAMING: A={tuple(A.shape)} C={tuple(C.shape)} "
-        f"n_unique_experts={expert_ptrs.numel()} n_used_per_token={n_used_per_token}"
+        "MOE_OP_Q4K_STREAMING: A=%s C=%s n_unique_experts=%d n_used_per_token=%d",
+        tuple(A.shape),
+        tuple(C.shape),
+        expert_ptrs.numel(),
+        n_used_per_token,
     )
 
     # BLOCK_SIZE_N is selected by the kernel's autotuner.

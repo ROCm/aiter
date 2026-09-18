@@ -33,30 +33,55 @@
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-_moe_q4k_streaming_kernel_repr = make_kernel_repr(
-    "_moe_q4k_streaming_kernel",
-    [
-        "QK_K",
-        "BLOCK_BYTES",
-        "BLOCK_SIZE_N",
-    ],
+from aiter.ops.triton.utils.tuned_config_utils import (
+    autotune_configs,
+    get_tuned_kernel_config,
 )
 
 
-@triton.autotune(
-    configs=[
+def _get_autotune_configs():
+    return [
         triton.Config({"BLOCK_SIZE_N": 4}, num_warps=2, num_stages=2),
         triton.Config({"BLOCK_SIZE_N": 8}, num_warps=2, num_stages=2),
         triton.Config({"BLOCK_SIZE_N": 8}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_SIZE_N": 16}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_SIZE_N": 16}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_SIZE_N": 32}, num_warps=4, num_stages=2),
-    ],
+    ]
+
+
+# Launchable anywhere rather than fastest somewhere, per the fallback rule in
+# aiter/ops/triton/README.md. BLOCK_SIZE_N=16 sits in the middle of the search
+# space and needs 16 * 4 bytes of accumulator per program, so it fits every
+# arch this tree targets. No measured entry is published yet: once CI can run
+# the benchmark on gfx942 / gfx950, retuning this is a JSON edit under
+# aiter/configs rather than a code change.
+_MOE_Q4K_STREAMING_FALLBACK_CONFIG = triton.Config(
+    {"BLOCK_SIZE_N": 16}, num_warps=4, num_stages=2
+)
+
+
+@triton.autotune(
+    configs=autotune_configs(
+        "MOE_Q4K_STREAMING",
+        _get_autotune_configs(),
+        default_config=get_tuned_kernel_config(
+            "moe",
+            "MOE_Q4K_STREAMING",
+            "_moe_q4k_streaming_kernel",
+            _MOE_Q4K_STREAMING_FALLBACK_CONFIG,
+        ),
+    ),
     key=["n_dim_in", "n_dim_out"],
 )
-@triton.jit(repr=_moe_q4k_streaming_kernel_repr)
+# NOTE: repr= is intentionally omitted, matching moe_wgrad.py. Combining
+# @triton.autotune with @triton.jit(repr=...) is documented there as corrupting
+# kernel execution on the Triton versions this tree supports. Independently of
+# that, make_kernel_repr only sees constexprs, so num_warps and num_stages stay
+# invisible to it: the six configs above collapse onto four repr strings, which
+# would make two pairs of compiled artifacts indistinguishable by name. The
+# autotune key ["n_dim_in", "n_dim_out"] already encodes the variant identity.
+@triton.jit
 def _moe_q4k_streaming_kernel(
     # Pointers
     a_ptr,  # *fp32 [n_tokens, n_dim_in]
