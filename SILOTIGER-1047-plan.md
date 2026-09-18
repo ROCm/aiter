@@ -680,13 +680,13 @@ publishes C; it is no longer an alias-overwrite wait. GPU 6 / gfx950:
 ISA: decode split LDS 21376 (was 13184) VGPR 79 (was 69); prefill LDS
 76736 (was 43968) VGPR 257 (was 165); still 6 ``s_barrier``.
 
-**Do not retry** overlapping the next K gather with PV by wrapping the
-first-tile / has-next gathers in runtime ``if is_first`` / ``if
-has_next`` inside the ``scf.for``. The AST rewriter packs ``ThrCopy``
-into the ``scf.if`` state and raises ``ThrCopy.__init__() missing
-thr_idx``. Next is a compile-safe pipeline (prologue K0 plus
-``range(n_tiles-1)`` with no tiled-copy under a dynamic ``if``), not
-the old 90 KiB ping-pong mapping.
+**Do not retry** overlapping the next K gather with PV. A local
+``@flyc.jit`` dispatcher, localized page-map LDS views, and explicit
+``index``-to-``Int64`` conversion make the runtime ``if is_first`` /
+``if has_next`` tiled-copy path compile and match the oracle. It still
+regresses width-2051 ``L=512`` prefill to 530.0 us from 519.3 us
+(~2.1%); decode is flat at 24.2 / 24.1 us and all 18 tests pass. The
+pipeline was reverted. Do not retry the old 90 KiB ping-pong mapping.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.

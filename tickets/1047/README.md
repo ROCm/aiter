@@ -557,10 +557,11 @@ GPU 6 / gfx950: 18 pytest cases, ``err=0``, width-2051 ``L=512`` is
 24.4 / 24.1 / 519.3 us vs 24.3 / 24.1 / 586.7 (~11% prefill). Decode
 split LDS 21376 VGPR 79; prefill LDS 76736 VGPR 257; 6 barriers.
 
-**Do not retry** next-K/PV overlap via runtime ``if is_first`` /
-``if has_next`` around tiled copies in the tile ``scf.for``
-(``ThrCopy`` cannot be an ``scf.if`` result). Next is a compile-safe
-prologue plus ``range(n_tiles-1)``, not the old 90 KiB ping-pong.
+**Do not retry** next-K/PV overlap. Retrying with local
+``@flyc.jit`` dispatch, localized page-map LDS views, and explicit
+``index``-to-``Int64`` conversion compiles and gives ``err=0``, but
+width-2051 ``L=512`` is 24.2 / 24.1 / 530.0 us versus 24.4 / 24.1 /
+519.3 us. All 18 tests pass; the ~2.1% prefill regression was reverted.
 
 
 
