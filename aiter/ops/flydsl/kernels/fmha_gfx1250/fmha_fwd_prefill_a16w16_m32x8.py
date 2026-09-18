@@ -1808,17 +1808,19 @@ def _core_attention(
                 ]
             return p_list, m_new_list, d_new_list, o_resc_list
 
+        # Only the drain barrier (the one before tensor_load_to_lds) is required; the wall
+        # is pure scheduling. Dropping it halves the in-loop barriers and wins everywhere
+        # except non-window-masked qk_hdim 256 (n_block 64), which regresses ~4%.
+        # Compile-time constant, so both halves still agree on the barrier count.
+        _keep_phase_wall = qk_hdim >= 256 and not (mask_left and mask_right)
+
         def _phase_barrier():
-            # The anti-phase wall: one half leaves the WMMA stream here as the other
-            # enters it. Body count and barrier count are identical on both halves, so
-            # the two never disagree on how many s_barriers this loop executes.
-            #
-            # _bare_barrier, not gpu.barrier: the head issued just above must stay in
-            # flight for the ring's own per-fragment s_wait_dscnt. LDS publication is
-            # already covered by _kv_fence's tensorcnt wait + gpu.barrier.
+            # One half leaves the WMMA stream here as the other enters it; the
+            # sched_barriers pin that split even when the s_barrier itself is gone.
             if ANTI_PHASE:
                 rocdl.sched_barrier(0)
-                _bare_barrier()
+                if _keep_phase_wall:
+                    _bare_barrier()
                 rocdl.sched_barrier(0)
 
         # GEMM2(u-1) then GEMM1(u) on one ring: O += P^T(u-1) @ V(u-1), then
