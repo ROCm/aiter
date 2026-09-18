@@ -316,7 +316,8 @@ class QuickAllReduceInt4:
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
         self._has_launched = True
-        _run_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            _run_compiled(eng.launch, *args)
 
     def compile(self, inp, out, stream=None) -> None:
         """Eager-JIT every ST binary.
