@@ -637,9 +637,16 @@ kernels keep 7 barriers.
 
 QK B now uses wave ``make_tiled_copy_B`` rather than scalar ``k_lds``
 gathers. Width-2051 ``L=512`` stays 24.0 / 24.1 / 588.6 us (``err=0``);
-ISA is flat on decode and +2 ``ds_read_b32`` on prefill. PV A/B tiled
-copies are the next target. Matching ``BLOCK_N``/waves/splits still
-does not mean matching Triton's ISA.
+ISA is flat on decode and +2 ``ds_read_b32`` on prefill. Matching
+``BLOCK_N``/waves/splits still does not mean matching Triton's ISA.
+
+**Do not retry** MMA-native PV A/B (`make_tiled_copy_A/B` or a TV copy
+of P) on this row-major ``[BN, D]`` V layout. copy_B's tile is
+``(MFMA-N, K) = (D, tokens)``, so K along tokens is stride-D and is
+not a contiguous 64-bit B fragment (oracle ``err≈0.98``). A TV 64-bit
+P copy that matched the old four-element fragment compiled and
+matched the oracle but was ISA-neutral / slightly more VGPR on decode
+and was reverted. Next: vectorize leftover P/C ``ds_write_b16``.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
