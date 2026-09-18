@@ -571,7 +571,24 @@ def launch_gemm_a8w4_tdm(
             wv=waves[1],
             cache_modifier=tdm_b_th,
         )
-        if const_expr(tdm_as_in_prologue):
+        if const_expr(row_major_ascale):
+            # Compact dispatch lands e8m0 row-major at the wire pitch. The
+            # as-prologue path below is the interleaved (16-row) layout a local
+            # preshuffle writes; mixing the two dequantizes garbage to NaN.
+            add_tdm_loads(
+                gSA_base,
+                blk_m64 * SA_GROW,
+                SA_GROW,
+                None,
+                SA_KDW,
+                tile_m,
+                on_i32=True,
+                lds_off=SA_OFF // 4,
+                lds_row=SA_KDW,
+                k_adv=SA_KDW * 4,
+                wv=waves[2],
+            )
+        elif const_expr(tdm_as_in_prologue):
             add_tdm_loads(
                 gSA_base,
                 (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
@@ -586,20 +603,6 @@ def launch_gemm_a8w4_tdm(
                 wv=waves[2],
                 split_inner=AS_SUPERS < len(waves[2]),
                 target_jobs=as_prologue_jobs,
-            )
-        elif const_expr(row_major_ascale):
-            add_tdm_loads(
-                gSA_base,
-                blk_m64 * SA_GROW,
-                SA_GROW,
-                None,
-                SA_KDW,
-                tile_m,
-                on_i32=True,
-                lds_off=SA_OFF // 4,
-                lds_row=SA_KDW,
-                k_adv=SA_KDW * 4,
-                wv=waves[2],
             )
         else:
             add_tdm_loads(
@@ -752,12 +755,13 @@ def launch_gemm_a8w4_tdm(
 
         def load_sa(buf, sm, ksl, kt):
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            if const_expr(row_major_ascale):
+                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
+                return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
             if const_expr(tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
                 off = off + wave_m * AS_FULL_INNER * 4 + sa_lane * 4 + kt * AS_INNER * 4
                 return lds_load_b32(as_base, fx.Int32(off))[0]
-            if const_expr(row_major_ascale):
-                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
             return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
         def load_sb(buf, sn, ksl):
