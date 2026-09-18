@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    # labeled: re-run when adding ci:triton-300x to start extra MI300X jobs
+    # labeled: re-run when adding ci:triton-300x (adds the MI300X jobs) or
+    # ci:triton-full (runs the whole suite instead of the diff selection).
+    # MI300X stays opt-in: only ci:triton-300x starts it.
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
     paths:
@@ -39,11 +41,11 @@ concurrency:
 
 jobs:
   ci_config:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) }}
     uses: ./.github/workflows/ci-config.yaml
 
   check-signal:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -57,17 +59,41 @@ jobs:
 
   # Step 1: split triton tests into 8 shards, output triton_shard_0.list ... triton_shard_7.list
   split_triton_tests:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) }}
     runs-on: ubuntu-latest
     needs: [check-signal]
     outputs:
       shard_count: 8
+      # Zero when the diff selects nothing (a benchmark-only PR). The shard
+      # jobs skip on it, so the check reads "skipped" rather than "passed"
+      # over a run that executed no tests.
+      selected_count: ${{ steps.select.outputs.selected_count }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Select Triton tests from PR diff
+        id: select
+        env:
+          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-full') }}
+        run: |
+          set -ex
+          # PRs run the paired test for each edited kernel plus every test
+          # whose imports reach it. main pushes, nightly, manual runs and PRs
+          # labeled ci:triton-full always run the full suite.
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$FULL_LABEL" != "true" ]; then
+            git fetch --no-tags --depth=2 origin \
+              "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
+            python3 .github/scripts/select_triton_tests.py \
+              --merge-ref pr-merge --output selected_triton_tests.list
+          else
+            python3 .github/scripts/select_triton_tests.py \
+              --all --output selected_triton_tests.list
+          fi
+          echo "selected_count=$(grep -c . selected_triton_tests.list || true)" >> "$GITHUB_OUTPUT"
+
       - name: Split Triton Tests (8 shards)
-        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton
+        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton --select-file selected_triton_tests.list
 
       - name: Upload test shard lists as artifact
         uses: actions/upload-artifact@v4
@@ -77,7 +103,7 @@ jobs:
           retention-days: 7
 
   prepare_triton_wheel:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) }}
     needs: [check-signal, ci_config]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
@@ -87,7 +113,7 @@ jobs:
 
   # Step 2: MI35X matrix jobs
   triton:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 60
@@ -233,37 +259,21 @@ jobs:
           echo "Setting up Aiter and Triton..."
           docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
-      # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
-      #       command to enable test selection.
-      # - name: Triton Test Selection Script
-      #   # main branch should always run the full test suite.
-      #   if: ${{ github.ref != 'refs/heads/main' }}
-      #   run: |
-      #     set -ex
-      #     git fetch --no-tags origin --depth=1 \
-      #       "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
-      #     git fetch --no-tags origin --depth=1 \
-      #       "refs/heads/${{ github.event.pull_request.base.ref }}:target"
-      #     ENV_FILE=$(docker exec -w /workspace triton_test \
-      #       mktemp /workspace/github_env.XXXXXXXXXX.tmp)
-      #     docker exec -w /workspace triton_test \
-      #       git config --global --add safe.directory /workspace
-      #     docker exec -w /workspace triton_test \
-      #       python .github/scripts/select_triton_tests.py \
-      #         --source pr-merge --target target \
-      #         --env-var TRITON_TEST --env-file "${ENV_FILE}"
-      #     # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
-      #     docker exec -w /workspace triton_test rm "${ENV_FILE}"
-
       - name: Triton Tests
         run: |
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          # MI35X: skip the MHA-PE tests that fail an accuracy check on gfx950 with the coming Triton release.
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-            --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_varlen_with_pe[triton-True-0.17-96-64-8-1-64-128]" \
-            --junitxml=test-reports/triton.xml
+          if [ -z "${TRITON_TEST// /}" ]; then
+            # Diff-based selection picked no tests for this shard.
+            echo "No tests selected for this shard — writing an empty report."
+            docker exec -w /workspace triton_test bash -c "echo '<testsuites/>' > test-reports/triton.xml"
+          else
+            # MI35X: skip the MHA-PE tests that fail an accuracy check on gfx950 with the coming Triton release.
+            docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
+              --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_varlen_with_pe[triton-True-0.17-96-64-8-1-64-128]" \
+              --junitxml=test-reports/triton.xml
+          fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -280,7 +290,7 @@ jobs:
 
   # Step 2b: MI300X matrix jobs (opt-in via ci:triton-300x on PRs, always on main)
   triton-mi300x:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) && needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-oci-mi300x-1
     timeout-minutes: 60
@@ -379,11 +389,17 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          # MI300X: skip all shapes of the paged-prefill contexted_kv_attention tests that fail an accuracy check (and can hang the GPU) with the coming Triton release.
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-            --deselect "op_tests/triton_tests/attention/test_pa_prefill.py::test_contexted_kv_attention" \
-            --deselect "op_tests/triton_tests/attention/test_chunked_pa_prefill.py::test_contexted_kv_attention" \
-            --junitxml=test-reports/triton.xml
+          if [ -z "${TRITON_TEST// /}" ]; then
+            # Diff-based selection picked no tests for this shard.
+            echo "No tests selected for this shard — writing an empty report."
+            docker exec -w /workspace triton_test bash -c "echo '<testsuites/>' > test-reports/triton.xml"
+          else
+            # MI300X: skip all shapes of the paged-prefill contexted_kv_attention tests that fail an accuracy check (and can hang the GPU) with the coming Triton release.
+            docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
+              --deselect "op_tests/triton_tests/attention/test_pa_prefill.py::test_contexted_kv_attention" \
+              --deselect "op_tests/triton_tests/attention/test_chunked_pa_prefill.py::test_contexted_kv_attention" \
+              --junitxml=test-reports/triton.xml
+          fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -399,7 +415,7 @@ jobs:
           docker rm -f triton_test || true
 
   triton-mi300x-test-finish:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
     name: Triton MI300X Test Results
     runs-on: ubuntu-latest
     needs: [triton-mi300x]
@@ -431,7 +447,7 @@ jobs:
           fi
 
   triton-test-finish:
-    if: ${{ (!github.event.pull_request || !github.event.pull_request.draft) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ (!github.event.pull_request || !github.event.pull_request.draft) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) }}
     name: Triton Test Results
     runs-on: ubuntu-latest
     needs: [triton]
