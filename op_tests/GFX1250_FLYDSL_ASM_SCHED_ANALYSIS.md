@@ -81,6 +81,10 @@ that 16.3938-us number.
 
 - Native-style explicit VGPR pinning and its wait scheduling remain scoped to
   the MX32 path.
+- MX128 `t256x256`, four-buffer kernels now use the native startup cadence:
+  issue tensor loads 0-2, wait with two loads outstanding, seed the first LDS
+  fragments, and then issue tensor load 3 before entering steady state. This
+  ordering matches the startup sequence in the native A-preshuffle 4x2 ISA.
 - MX128 split-K=4 keeps the hardware wave-ID parity traversal; replacing it
   with logical parity was slightly slower.
 - MX128 `t256x256`, four-buffer, split-K=1 uses one steady-state traversal. It
@@ -88,6 +92,21 @@ that 16.3938-us number.
   the source change used by `512x65536x1536`.
 - The final result does not include the rejected no-expert-scheduler, nb3,
   iterative-ILP, opposite-traversal, or split-K=4 single-path experiments.
+
+### Native-startup checkpoint
+
+The startup-cadence change was measured against the immediately preceding
+branch state in paired `rocprofv3` runs. Each result below is the 5%-trimmed
+mean of the target kernel dispatches from its run.
+
+| Shape (M x N x K) | Previous schedule (us) | Native startup (us) | Improvement |
+|---|---:|---:|---:|
+| `512x6144x7168` | 13.2603 | 13.0983 | 1.22% |
+| `512x7168x16384` | 20.1769 | 19.6449 | 2.64% |
+| `512x65536x1536` | 19.7311 | 19.5575 | 0.88% |
+
+All three dispatches passed the constant-data correctness check. A separate
+warm-cache recheck of `512x65536x1536` measured 19.2723 us and also passed.
 
 ## Reproduction
 

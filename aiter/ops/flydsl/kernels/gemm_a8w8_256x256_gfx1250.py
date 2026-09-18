@@ -433,8 +433,11 @@ def launch_gemm_a8w8_256x256(
             for sb_sel in range_constexpr(2)
         ]
         c_frags = [None] * n_acc
+        native_256x256_schedule = const_expr(
+            tile_m == 256 and tile_n == 256 and num_buffers == 4
+        )
         native_vgpr_pinning = const_expr(
-            mx32 and tile_m == 256 and tile_n == 256
+            mx32 and native_256x256_schedule
         )
 
         # Native gfx1250 assembly keeps each 4x4 accumulator quadrant in one
@@ -999,14 +1002,21 @@ def launch_gemm_a8w8_256x256(
 
         SUPERS = K_TILES // KPAIR
         last_delta = (SUPERS - 1) * tdm_global_step
-        for i in range_constexpr(num_buffers):
+        initial_loads = (
+            num_buffers - 1 if native_256x256_schedule else num_buffers
+        )
+        for i in range_constexpr(initial_loads):
             seed_delta = fx.Int32(i) * tdm_global_step
             seed_delta = (seed_delta < last_delta).select(seed_delta, last_delta)
             tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
-        pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
+        pipeline_fence(outstanding=initial_loads - 1, use_cluster=False)
         for group in _seed_thunks(0):
             for thunk in group:
                 thunk()
+        if const_expr(native_256x256_schedule):
+            seed_delta = fx.Int32(num_buffers - 1) * tdm_global_step
+            seed_delta = (seed_delta < last_delta).select(seed_delta, last_delta)
+            tdm_ops.tensor_load_2d(_prepare_tdm(num_buffers - 1, seed_delta))
 
         n_full = (SUPERS + num_buffers - 1) // num_buffers - 1
         drain_s = SUPERS - n_full * num_buffers  # 1..num_buffers
