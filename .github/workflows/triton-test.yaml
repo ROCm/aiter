@@ -64,11 +64,16 @@ jobs:
     needs: [check-signal]
     outputs:
       shard_count: 8
+      # Zero when the diff selects nothing (a benchmark-only PR). The shard
+      # jobs skip on it, so the check reads "skipped" rather than "passed"
+      # over a run that executed no tests.
+      selected_count: ${{ steps.select.outputs.selected_count }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Select Triton tests from PR diff
+        id: select
         env:
           FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-full') }}
         run: |
@@ -85,6 +90,7 @@ jobs:
             python3 .github/scripts/select_triton_tests.py \
               --all --output selected_triton_tests.list
           fi
+          echo "selected_count=$(grep -c . selected_triton_tests.list || true)" >> "$GITHUB_OUTPUT"
 
       - name: Split Triton Tests (8 shards)
         run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton --select-file selected_triton_tests.list
@@ -107,7 +113,7 @@ jobs:
 
   # Step 2: MI35X matrix jobs
   triton:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 60
@@ -284,7 +290,7 @@ jobs:
 
   # Step 2b: MI300X matrix jobs (opt-in via ci:triton-300x on PRs, always on main)
   triton-mi300x:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) && needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-oci-mi300x-1
     timeout-minutes: 60
