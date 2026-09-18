@@ -43,9 +43,13 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
+    MHA_FWD_SEARCH_STRATEGIES,
+    MHA_FWD_SIGNIFICANCE_SIGMA,
+    MHA_FWD_TILE_CONFIG_BACKENDS,
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdCandidate,
     MhaFwdProblem,
+    canonical_backend_config,
     enumerate_mha_fwd_candidates,
     mha_fwd_candidate_id,
 )
@@ -389,6 +393,8 @@ class MhaFwdTuner(TunerCommon):
         self._last_results = pd.DataFrame(columns=self.columns)
         self._all_results = pd.DataFrame(columns=self.columns)
         self._selection_proofs: list[dict[str, Any]] = []
+        self._incumbents_by_key: dict[tuple, set[tuple[str, str]]] = {}
+        self._promotions: list[dict[str, Any]] = []
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -415,9 +421,22 @@ class MhaFwdTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--strategy",
-            choices=("exhaustive",),
+            choices=MHA_FWD_SEARCH_STRATEGIES,
             default="exhaustive",
-            help="candidate search strategy (only exhaustive is currently supported)",
+            help=(
+                "candidate search strategy; smoke samples each tile grid so the "
+                "measure-publish-replay path can be exercised without the full "
+                "catalogue, and records itself in the evidence"
+            ),
+        )
+        self.parser.add_argument(
+            "--backends",
+            default="",
+            help=(
+                "comma-separated backends to measure (default: all). A control "
+                "for comparing contracts, not a tuning mode: the winner is the "
+                "fastest of what was allowed to run, and the evidence says so"
+            ),
         )
 
     def _setup_common_arguments(self):
@@ -674,7 +693,27 @@ class MhaFwdTuner(TunerCommon):
             )
             key = problem.key()
             softmax_scale = int(row.hdim_q) ** -0.5
-            candidates = enumerate_mha_fwd_candidates(str(row.gfx))
+            candidates = list(
+                enumerate_mha_fwd_candidates(
+                    str(row.gfx),
+                    getattr(self._args, "strategy", "exhaustive"),
+                    self._restricted_backends(),
+                )
+            )
+            # Measuring what the kernel resolves today, in the same sweep and
+            # on the same GPU, is what lets the run tell an improvement from a
+            # reordering of noise. Without it the comparison is against a
+            # number from another session.
+            incumbents = self._incumbent_candidates(row)
+            known = {candidate.identity for candidate in candidates}
+            for incumbent in incumbents:
+                if incumbent.identity not in known:
+                    candidates.append(incumbent)
+            self._incumbents_by_key[key] = {
+                (candidate.backend, canonical_backend_config(candidate.backend_config))
+                for candidate in incumbents
+            }
+            candidates = tuple(candidates)
             print(
                 f"tuning MHA row {row_index}: {len(candidates)} candidates for {key}",
                 flush=True,
@@ -989,7 +1028,7 @@ class MhaFwdTuner(TunerCommon):
                 failed["detail"] = "no correctness-gated candidate completed"
                 failures.append(failed)
                 continue
-            winner = valid.iloc[0].copy()
+            winner = self._gate_against_incumbent(key, valid)
             winners.append(winner)
 
         winnerdf = pd.DataFrame(winners, columns=self.columns)
@@ -1091,6 +1130,169 @@ class MhaFwdTuner(TunerCommon):
             frame = frame.sort_values(list(MHA_FWD_TUNING_KEY_FIELDS))
         self._atomic_write_csv(frame[list(MHA_FWD_RUNTIME_CSV_FIELDS)], tune_file)
 
+    @staticmethod
+    def _standard_error_us(row) -> float:
+        """Standard error of a candidate's finalist-round measurements.
+
+        The finalist rounds are the only repeated observation the run has, so
+        their scatter is what it knows about its own reproducibility. The
+        standard error rather than the range: the range of a sample grows as
+        samples are added, so a range-based threshold would make the run
+        harder to satisfy the more evidence it gathered. The standard error
+        shrinks as 1/sqrt(n), which makes --finalist-rounds the lever for
+        resolving smaller improvements.
+        """
+        try:
+            samples = json.loads(row.get("samples_us") or "[]")
+        except (TypeError, ValueError):
+            return 0.0
+        samples = [float(s) for s in samples if math.isfinite(float(s)) and s > 0]
+        if len(samples) < 2:
+            return 0.0
+        return statistics.stdev(samples) / math.sqrt(len(samples))
+
+    def _gate_against_incumbent(self, key, valid):
+        """Return the row to publish: the fastest candidate, unless it cannot
+        be told apart from the configuration already in use.
+
+        Publishing a winner that is inside measurement noise of the incumbent
+        buys nothing and risks shipping a regression that a contended sweep
+        happened to rank first. When the two cannot be separated the incumbent
+        is kept, which is the outcome that changes nothing.
+        """
+        fastest = valid.iloc[0].copy()
+        incumbents = self._incumbents_by_key.get(key, set())
+        if not incumbents:
+            return fastest
+        if (fastest["backend"], fastest["backend_config"]) in incumbents:
+            fastest["detail"] = "incumbent retained: nothing measured beat it"
+            self._record_promotion(key, fastest, fastest, 0.0, 0.0, "incumbent_fastest")
+            return fastest
+
+        measured = valid[
+            valid.apply(
+                lambda r: (r["backend"], r["backend_config"]) in incumbents, axis=1
+            )
+        ]
+        if measured.empty:
+            fastest["detail"] = "incumbent not measured; improvement unverified"
+            self._record_promotion(key, fastest, None, None, None, "incumbent_absent")
+            return fastest
+
+        incumbent = measured.iloc[0]
+        gain_us = float(incumbent["us"]) - float(fastest["us"])
+        margin = gain_us / float(incumbent["us"])
+        # Two-sample separation at roughly 95%: the gain has to clear twice
+        # the combined standard error of the two candidates' round means.
+        combined_se = math.hypot(
+            self._standard_error_us(fastest), self._standard_error_us(incumbent)
+        )
+        noise = (
+            (MHA_FWD_SIGNIFICANCE_SIGMA * combined_se) / float(incumbent["us"])
+            if float(incumbent["us"]) > 0
+            else 0.0
+        )
+        if margin <= noise:
+            kept = incumbent.copy()
+            kept["detail"] = (
+                f"incumbent retained: winner was {margin:+.2%} against "
+                f"{noise:.2%} measurement spread"
+            )
+            self._record_promotion(
+                key, fastest, incumbent, margin, noise, "within_noise"
+            )
+            return kept
+        fastest["detail"] = f"beat incumbent by {margin:.2%} against {noise:.2%} spread"
+        self._record_promotion(key, fastest, incumbent, margin, noise, "promoted")
+        return fastest
+
+    def _record_promotion(self, key, challenger, incumbent, margin, noise, decision):
+        """Keep why each shape was or was not retuned, for the evidence file.
+
+        Without this a reader of the published table cannot tell a measured
+        improvement from a tie that happened to sort first, which is the
+        distinction the incumbent comparison exists to make.
+        """
+        self._promotions.append(
+            {
+                "key": list(key) if isinstance(key, tuple) else key,
+                "decision": decision,
+                "challenger": {
+                    "backend": challenger["backend"],
+                    "backend_config": challenger["backend_config"],
+                    "us": float(challenger["us"]),
+                },
+                "incumbent": (
+                    None
+                    if incumbent is None
+                    else {
+                        "backend": incumbent["backend"],
+                        "backend_config": incumbent["backend_config"],
+                        "us": float(incumbent["us"]),
+                    }
+                ),
+                "margin": None if margin is None else round(float(margin), 6),
+                "measurement_spread": None if noise is None else round(float(noise), 6),
+            }
+        )
+
+    def _incumbent_candidates(self, row) -> list[MhaFwdCandidate]:
+        """The tile dicts the dict-config kernels resolve for this shape today.
+
+        A tuning run that never measures the configuration already in use
+        cannot tell an improvement from a regression. Any gap in the candidate
+        catalogue, and any single contended measurement, then publishes a
+        result that is worse than shipping nothing. Measuring the incumbent in
+        the same sweep, on the same GPU, under the same conditions, turns that
+        guarantee from a policy into a comparison.
+
+        This asks each kernel's own resolver what it would launch, so the
+        incumbent is whatever the shipped default actually is rather than a
+        value restated here.
+        """
+        import torch
+
+        dtype = getattr(torch, str(row.dtype), torch.bfloat16)
+
+        incumbents = []
+        for backend in sorted(MHA_FWD_TILE_CONFIG_BACKENDS):
+            try:
+                if backend == "gluon":
+                    from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+                        _get_config as resolve,
+                    )
+
+                    config = resolve(is_fp8=False, has_pe=False)
+                else:
+                    from aiter.ops.triton._triton_kernels.attention.mha import (
+                        _get_config as resolve,
+                    )
+
+                    config = resolve(
+                        float(row.dropout_p) > 0,
+                        dtype,
+                        has_pe=False,
+                        head_dim_v=int(row.hdim_v),
+                    )
+            except Exception:
+                # A backend with no resolvable default has no incumbent to
+                # beat, which is a weaker claim than one we can measure but
+                # not a reason to abandon the sweep.
+                continue
+            if not isinstance(config, dict):
+                continue
+            incumbents.append(
+                MhaFwdCandidate(
+                    backend=backend, num_splits=0, backend_config=dict(config)
+                )
+            )
+        return incumbents
+
+    def _restricted_backends(self) -> list[str] | None:
+        """Backends this run is allowed to measure, or None for all of them."""
+        value = (getattr(self._args, "backends", "") or "").strip()
+        return [name.strip() for name in value.split(",") if name.strip()] or None
+
     def _run_fresh_probe(self, row, config_file: str) -> dict[str, Any]:
         descriptor, proof_path = tempfile.mkstemp(prefix="mha-selection-", suffix=".jsonl")
         os.close(descriptor)
@@ -1101,6 +1303,12 @@ class MhaFwdTuner(TunerCommon):
         }
         problem["_proof_warmup"] = int(self._args.warmup)
         problem["_proof_iters"] = int(self._args.iters)
+        # Run the child as a module from the repository root, not as a file
+        # path. Executing a path puts op_tests/tuners/ on sys.path instead of
+        # the root, and "import aiter" then resolves to whatever copy is
+        # installed in site-packages -- so the probe either dies on aiter.jit
+        # or, worse, silently proves a claim about a different checkout than
+        # the one being tuned.
         repository_root = Path(__file__).parents[2]
         environment = os.environ.copy()
         environment.update(
@@ -1247,6 +1455,9 @@ class MhaFwdTuner(TunerCommon):
                 ),
             },
             "selection_proofs": self._selection_proofs,
+            "search_strategy": getattr(self._args, "strategy", "exhaustive"),
+            "restricted_backends": self._restricted_backends(),
+            "promotions": self._promotions,
             "coverage_limits": [
                 "CK tile recipes remain the default CK launch; this tuner does not dump PR #5024 JSON",
             ],
