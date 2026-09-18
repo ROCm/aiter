@@ -518,6 +518,15 @@ store/MFMA-heavy; decode split is small (70 VGPR, 13 KiB) and the
 target is MMA-native QK/PV copies and fewer stage barriers, not more
 host splits.
 
+QK B now loads through wave ``make_tiled_copy_B`` (128-bit on gfx950
+K32, 64-bit on K16) into the MFMA B fragment instead of
+``k_lds[n, d]`` scalars. GPU 6 / gfx950: 18 pytest cases, ``err=0``,
+width-2051 ``L=512`` is 24.0 / 24.1 / 588.6 us — flat vs 23.8 / 24.1 /
+588.1. ISA is unchanged on decode (VGPR 69 vs 70); prefill
+``ds_read_b32`` went 11 → 13. The compiler already widened the old
+scalar QK reads, so this copy is authoring-correct but not a wall-time
+win. PV A/B tiled copies remain the next layout step.
+
 
 
 

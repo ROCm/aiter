@@ -633,8 +633,12 @@ is ``ns=1`` and is not this dump):
 | prefill split `bn64_blk128_ns1` | 36 / 15 / 16 | 18 / 0 / 11 | 7 | 48 | 169 | 43968 |
 
 No ``ds_read_b16``. Leftover ``ds_write_b16`` is P/C. Both split
-kernels keep 7 barriers. MMA-native QK/PV copies and fewer stage
-barriers are the next target. Matching ``BLOCK_N``/waves/splits still
+kernels keep 7 barriers.
+
+QK B now uses wave ``make_tiled_copy_B`` rather than scalar ``k_lds``
+gathers. Width-2051 ``L=512`` stays 24.0 / 24.1 / 588.6 us (``err=0``);
+ISA is flat on decode and +2 ``ds_read_b32`` on prefill. PV A/B tiled
+copies are the next target. Matching ``BLOCK_N``/waves/splits still
 does not mean matching Triton's ISA.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
