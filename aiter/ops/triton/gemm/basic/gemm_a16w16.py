@@ -128,6 +128,14 @@ def gemm_a16w16_(
         torch.bfloat16,
     ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
 
+    # Gluon has a single config family: each entry carries `persistent` next to
+    # the params tuned for the kernel it selects, so there is no second lookup.
+    if config is None and backend == "gluon":
+        config, _ = get_gemm_config(
+            "GEMM-A16W16", x.shape[0], w.shape[0], x.shape[1], backend="gluon"
+        )
+        persistent = config.pop("persistent", persistent)
+
     if persistent:
         assert not skip_reduce, (
             "persistent=True does not support skip_reduce; the persistent kernels "
@@ -138,10 +146,13 @@ def gemm_a16w16_(
 
         NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
 
+        # Triton keeps a separate persistent family; gluon resolved above.
         if config is None:
             config, _ = get_gemm_config(
                 "GEMM-A16W16-PERSISTENT", M, N, K, backend=backend
             )
+        # Never reaches the kernel: the launch below splats config.
+        config.pop("persistent", None)
         if backend == "triton":
             config["NUM_KSPLIT"] = 1
             config = compute_splitk_params(config, K)
