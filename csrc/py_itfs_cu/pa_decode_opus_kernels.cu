@@ -32,7 +32,6 @@
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
-#include "pa_decode_opus_sp3.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -339,22 +338,6 @@ static void pa_decode_opus_launch(aiter_tensor_t& q,
             if(target > Traits::MAX_SPLITS) target = Traits::MAX_SPLITS;
             if(target < 1) target = 1;
             num_splits = target;
-        }
-    }
-    if constexpr(Traits::QUANT_Q && !Traits::HAS_SINK && Traits::IS_FP8 &&
-                 Traits::D_HEAD == 128 && Traits::PAGE_SIZE == 16 && Traits::PER_TOKEN_SCALE)
-    {
-        if(pa_opus_sp3::requested(q, k_cache, v_cache, block_tables, context_lens, out,
-                                  k_scale_map, v_scale_map))
-        {
-            if(qlen == 1 && num_splits > 128) num_splits = 128;
-            const int sp3_tiles = (kargs.max_blocks_per_batch_row * 16 + 255) / 256;
-            if(num_kv_heads == 1 && qlen > 1 && sp3_tiles >= 4 && sp3_tiles <= 8 &&
-               static_cast<int64_t>(batch) * qlen * sp3_tiles <= num_cu)
-                num_splits = sp3_tiles;
-            pa_opus_sp3::run(q, k_cache, v_cache, block_tables, context_lens, out,
-                             *k_scale_map, *v_scale_map, softmax_scale, num_splits, num_cu, stream);
-            return;
         }
     }
     kargs.num_splits = num_splits;
@@ -950,9 +933,7 @@ static void pa_decode_opus_a16w8_launch(aiter_tensor_t& q,
     // qlen * B * nkv * NP <= 2 * CU. NP=256 on B=1 Q4 is 1024 > 512, so that
     // launch fuses the four tokens and keeps one WG per CU.
     const int np_gate = pa_decode_opus_a16w8_fused_np<Base>(batch, nkv, max_tiles, num_cu);
-    const bool sp3 = pa_opus_sp3::requested(q, k_cache, v_cache, block_tables, context_lens,
-                                           out, k_scale_map, v_scale_map);
-    const bool q_split = !sp3 && Base::MTP_Q_LOOP && (qlen == 2 || qlen == 4) && num_cu > 0
+    const bool q_split = Base::MTP_Q_LOOP && (qlen == 2 || qlen == 4) && num_cu > 0
                          && static_cast<int64_t>(qlen) * batch * nkv * np_gate
                                 <= static_cast<int64_t>(2) * num_cu;
     if(trans_v && per_token)

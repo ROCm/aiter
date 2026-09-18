@@ -574,11 +574,6 @@ def pa_decode_opus_a16w8(
     ``v_scale`` may be a per-tensor float or a per-token map
     ``[blocks, kv_heads, PAGE, 1]``.
 
-    Contiguous page-16, GQA-16, per-token inputs with query length 1..4 prefer
-    the packaged SP3 ASM code object. Unsupported inputs or a missing packaged
-    object use native HIP. ``PA_DECODE_OPUS_SP3_CO`` overrides the object path;
-    set it to ``0`` or an empty string to force native HIP. When ASM is selected,
-    warm up each device/stream/shape before Graph capture.
     """
     _check_a16w8(q, k_cache, v_cache)
     if out is None:
