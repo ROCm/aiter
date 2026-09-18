@@ -103,6 +103,7 @@ def _compact_gemm_align_m(
     activation: ActivationType,
     quant_type: QuantType,
     inter_dim: int,
+    recv_bound: int | None = None,
 ) -> int:
     """Tile alignment for compact dest rows; must match GEMM ``max(tile_m, tile_m2)``.
 
@@ -110,6 +111,12 @@ def _compact_gemm_align_m(
     use the same grouped-GEMM CSV row fused_moe will pick for this recv-token
     bucket. Flooring at 64 used to pad compact_cap to EPR*64 even when the CSV
     tile is 16/32, which launched a 3–4× GEMM grid at small tpr.
+
+    ``recv_bound`` is this step's recv-token bound; it defaults to the arena's
+    full capacity, which is the bucket to size the arena against but not the one
+    a decode step runs at. Alignment is per-expert padding, so holding it at the
+    capacity tile costs ``experts_per_rank * (tile - used)`` dead rows that the
+    GEMM still computes.
     """
 
     def _env(name: str) -> int | None:
@@ -139,7 +146,9 @@ def _compact_gemm_align_m(
         return 64
 
     row = _find_grouped_config(
-        token_num=_get_padded_m(config.max_recv),
+        token_num=_get_padded_m(
+            config.max_recv if recv_bound is None else int(recv_bound)
+        ),
         model_dim=config.hidden_dim,
         inter_dim=int(inter_dim),
         experts=config.experts_per_rank,
@@ -642,6 +651,11 @@ class MegaMoEGfx1250:
                 f"topk_ids must have shape {expected_shape}, "
                 f"got {tuple(topk_ids.shape)}"
             )
+        if self._compact_plan:
+            # Compact cannot slice recv_x -- the rows are grouped per expert, not
+            # token-major -- so the bound is spent on the geometry instead: it
+            # picks the plan's alignment, the GEMM's tile and the GEMM's grid.
+            self._begin_compact_step(recv_token_bound)
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
             hidden_states, topk_weights, topk_ids
         )
@@ -710,6 +724,87 @@ class MegaMoEGfx1250:
     def __exit__(self, *exc):
         self.close()
 
+    def _compact_plan_for(self, align_m: int):
+        """The compact-plan launch that aligns each expert's rows to ``align_m``.
+
+        Compiled per alignment and cached, because the plan and the expert GEMM
+        must agree on it: the GEMM reads the plan's psum as its m-tile map, so a
+        tile_m that does not divide this alignment would straddle two experts.
+        """
+        from .compact_plan import compile_tdm_compact_plan
+
+        align_m = int(align_m)
+        launch = self._compact_plan_launches.get(align_m)
+        if launch is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"compact plan for align_m={align_m} was not compiled before "
+                    "graph capture; warm this token bucket eagerly first"
+                )
+            launch = compile_tdm_compact_plan(
+                rank=self._config.rank,
+                npes=self._config.world_size,
+                experts_per_rank=self._config.experts_per_rank,
+                topk=self._config.topk,
+                tile_m=align_m,
+                # The arena's row count, not this step's: the plan bounds what it
+                # may write against the region it writes into.
+                compact_cap=self._compact_cap,
+                off_hist=self._arena.offset("compact_hist"),
+                off_done=self._arena.offset("compact_done"),
+                hist_stride=self._compact_hist_stride,
+                max_routes=self._compact_max_routes,
+            )
+            self._compact_plan_launches[align_m] = launch
+        return launch
+
+    def warmup_compact_plan(self, recv_token_bound: int | None = None) -> None:
+        """Compile the compact plan this bound needs, before any graph capture.
+
+        The plan is compiled per tile alignment and the alignment follows the
+        bound's token bucket, so a captured batch whose bucket never ran eagerly
+        would reach the JIT inside the capture -- which _compact_plan_for
+        refuses. A caller that captures a ladder of batch sizes warms every rung
+        through here first. A no-op off the compact path.
+        """
+        if not self._compact_plan:
+            return
+        self._begin_compact_step(recv_token_bound)
+        self._compact_plan_for(self._compact_step_align_m)
+
+    def _begin_compact_step(self, recv_token_bound: int | None) -> None:
+        """Fix this step's compact geometry from the caller's recv bound.
+
+        Everything here is a python int, so a captured graph keeps a static grid
+        and each captured batch size gets the geometry tuned for its own bucket.
+        """
+        from .compact_plan import compact_row_capacity
+
+        config = self._config
+        bound = config.max_recv if recv_token_bound is None else int(recv_token_bound)
+        bound = max(1, min(bound, config.max_recv))
+        align_m = _compact_gemm_align_m(
+            config,
+            activation=self.activation,
+            quant_type=self.quant_type,
+            inter_dim=self.inter_dim,
+            recv_bound=bound,
+        )
+        # The arena holds rows for _compact_tile_m, and the CSV tiles are not
+        # monotonic in the token bucket, so a smaller bound can still name a
+        # wider tile. Clamping keeps every step inside the allocated rows.
+        self._compact_step_align_m = min(int(align_m), self._compact_tile_m)
+        self._compact_step_recv_bound = bound
+        self._compact_step_rows = min(
+            compact_row_capacity(
+                max_recv=bound,
+                topk=config.topk,
+                experts_per_rank=config.experts_per_rank,
+                tile_m=self._compact_step_align_m,
+            ),
+            self._compact_cap,
+        )
+
     def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
         self._config = config
         self._closed = False
@@ -750,6 +845,8 @@ class MegaMoEGfx1250:
             experts_per_rank=config.experts_per_rank,
             max_routes=max_routes,
         )
+        self._compact_hist_stride = hist_stride
+        self._compact_max_routes = max_routes
         arena_regions = [
             ("tok_off", 4),
             ("recv_num", config.world_size * 4),
@@ -800,7 +897,10 @@ class MegaMoEGfx1250:
         )
         self._compact_masked_m = None
         self._compact_psum = None
-        self._compact_plan_launch = None
+        self._compact_plan_launches = {}
+        self._compact_step_align_m = self._compact_tile_m
+        self._compact_step_rows = self._compact_cap
+        self._compact_step_recv_bound = max_recv
         if self._compact_plan:
             self._compact_masked_m = torch.zeros(
                 config.experts_per_rank, dtype=torch.int32, device=device
@@ -819,18 +919,9 @@ class MegaMoEGfx1250:
             self._compact_dummy_wts = torch.zeros(
                 (1, config.topk), dtype=torch.float32, device=device
             )
-            self._compact_plan_launch = compile_tdm_compact_plan(
-                rank=config.rank,
-                npes=config.world_size,
-                experts_per_rank=config.experts_per_rank,
-                topk=config.topk,
-                tile_m=self._compact_tile_m,
-                compact_cap=self._compact_cap,
-                off_hist=self._arena.offset("compact_hist"),
-                off_done=self._arena.offset("compact_done"),
-                hist_stride=hist_stride,
-                max_routes=max_routes,
-            )
+            # Warm the capacity bucket here: it is the one an unbounded (prefill)
+            # step runs, and compiling it inside graph capture is not allowed.
+            self._compact_plan_for(self._compact_tile_m)
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device
         )
@@ -1267,7 +1358,7 @@ class MegaMoEGfx1250:
             # stages them, so there is no repack here.
             self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
         if self._compact_plan:
-            self._compact_plan_launch(
+            self._compact_plan_for(self._compact_step_align_m)(
                 self._arena.handle,
                 topk_ids.data_ptr(),
                 self._token_destination_map.data_ptr(),
@@ -1333,6 +1424,11 @@ class MegaMoEGfx1250:
             compact_wire_row_stride=(
                 self._compact_wire_row if self._compact_plan else 0
             ),
+            compact_recv_bound=(
+                self._compact_step_recv_bound if self._compact_plan else 0
+            ),
+            compact_align_m=(self._compact_step_align_m if self._compact_plan else 0),
+            compact_rows=(self._compact_step_rows if self._compact_plan else 0),
         )
 
     def _combine(self, routing: Routing) -> torch.Tensor:
