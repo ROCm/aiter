@@ -22,6 +22,12 @@ from aiter import (
     mxfp4_moe_sort_fwd,
 )
 from aiter import get_hip_quant as get_quant
+from aiter.fused_moe_registry import (
+    BoundFusedMoeImpl,
+    FusedMoeImplResolutionError,
+    FusedMoeRequest,
+    resolve_fused_moe_impl,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import (
     get_cu_num,
@@ -840,6 +846,9 @@ def fused_moe(
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
+    quant_type_a: QuantType | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
 ):
     if (
         any(
@@ -924,6 +933,9 @@ def fused_moe(
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
         output=output,
+        quant_type_a=None if quant_type_a is None else quant_type_a.value,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
     )
 
 
@@ -962,6 +974,9 @@ def fused_moe_fake(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1019,6 +1034,9 @@ def fused_moe_(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1058,6 +1076,9 @@ def fused_moe_(
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
         output=output,
+        quant_type_a=quant_type_a,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
     )
 
 
@@ -1089,6 +1110,9 @@ def _fused_moe_impl(
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1101,6 +1125,11 @@ def _fused_moe_impl(
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
     gate_mode = GateMode(gate_mode)
+    if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
+        raise NotImplementedError(
+            f"quant_type_a={QuantType(quant_type_a)!s} != quant_type={quant_type!s}: "
+            "mixed activation/weight quant granularity is not supported"
+        )
     if block_size_M == -1:
         block_size_M = None
     """user API"""
@@ -1150,7 +1179,9 @@ def _fused_moe_impl(
         has_a1_scale=a1_scale is not None,
     )
 
-    if _q_dtype_a is not None:
+    if quant_dtype_a is not None:
+        q_dtype_a = quant_dtype_a
+    elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
 
     grouped_a8w4_out = None
@@ -1256,6 +1287,11 @@ def _fused_moe_impl(
             and getattr(w2, "is_shuffled", False),
             config_file=_metadata_config_file,
             _disable_inline_sort=disable_inline_sort,
+            q_dtype_a2=quant_dtype_a2,
+            input_dtype=hidden_states.dtype,
+            has_stage2_scatter=stage2_scatter is not None,
+            has_activation_scales=a1_scale is not None or a2_scale is not None,
+            has_num_local_tokens=num_local_tokens is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -1296,6 +1332,41 @@ def _fused_moe_impl(
             use_inline_sort = False
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    if metadata.full_impl is not None:
+        full_output = metadata.full_impl(
+            FusedMoeRequest(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weight=topk_weight,
+                topk_ids=topk_ids,
+                expert_mask=expert_mask,
+                activation=activation,
+                quant_type=quant_type,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_size_m=(int(block_size_M) if block_size_M is not None else None),
+                ksplit=metadata.ksplit,
+                num_local_tokens=num_local_tokens,
+                moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+                dtype=dtype,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                swiglu_limit=swiglu_limit,
+                beta=beta,
+                linear_beta=linear_beta,
+                gate_mode=gate_mode,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+            )
+        )
+        return _return_output(full_output, output)
+
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
@@ -1769,6 +1840,7 @@ class MOEMetadata:
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
     max_sorted_blocks: int | None = None
+    full_impl: BoundFusedMoeImpl | None = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -2719,6 +2791,11 @@ def get_2stage_cfgs(
     opus_weights_shuffled=None,
     config_file=None,
     _disable_inline_sort=False,
+    q_dtype_a2=None,
+    input_dtype=None,
+    has_stage2_scatter=False,
+    has_activation_scales=False,
+    has_num_local_tokens=False,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2926,6 +3003,7 @@ def get_2stage_cfgs(
         cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
@@ -3039,6 +3117,61 @@ def get_2stage_cfgs(
                 )
 
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
+    kernel_name1 = kn1 if cfg is not None else ""
+    weights_shuffled = (
+        is_shuffled if opus_weights_shuffled is None else opus_weights_shuffled
+    )
+    try:
+        full_impl = (
+            None if bypass_tuned_config else resolve_fused_moe_impl(kernel_name1)
+        )
+    except FusedMoeImplResolutionError as error:
+        logger.warning(f"[fused_moe] {error}; using default heuristics.")
+        cfg = None
+        full_impl = None
+    if full_impl is not None and kernel_name1.startswith("impl__flydsl_"):
+        unsupported = None
+        if not weights_shuffled:
+            unsupported = "both w1 and w2 must be marked is_shuffled=True"
+        elif has_stage1_bias or has_stage2_bias:
+            unsupported = "per-expert bias"
+        elif doweight_stage1:
+            unsupported = "doweight_stage1=True"
+        elif input_dtype is not None and input_dtype != dtypes.bf16:
+            unsupported = f"activation dtype {input_dtype}"
+        elif has_stage2_scatter:
+            unsupported = "stage2_scatter"
+        elif has_activation_scales:
+            unsupported = "prequantized activations"
+        elif has_num_local_tokens:
+            unsupported = "num_local_tokens"
+        elif hidden_pad or intermediate_pad:
+            unsupported = "hidden/intermediate padding"
+        elif gate_mode is not GateMode.SEPARATED:
+            unsupported = f"gate mode {gate_mode.value!r}"
+        elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
+            unsupported = f"activation {activation}"
+        if unsupported is not None:
+            cfg = None
+            full_impl = None
+            logger.warning(
+                f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
+                f"unsupported {unsupported}; using default heuristics"
+            )
+    if is_ep and full_impl is not None:
+        cfg = None
+        full_impl = None
+    if full_impl is not None:
+        block_m = int(cfg.get("block_m", BLOCK_SIZE_M))
+        ksplit = int(cfg.get("ksplit", 0))
+        logger.info(f"[fused_moe] using {kernel_name1!r} for {keys}")
+        return MOEMetadata(
+            None,
+            None,
+            block_m,
+            ksplit,
+            full_impl=full_impl,
+        )
     if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
@@ -3141,6 +3274,21 @@ def get_2stage_cfgs(
     opus_stage2_launch = (
         _opus_a8w4.parse_stage2_config(cfg, block_m) if is_opus_cfg else None
     )
+
+    want_fp8_inter = (
+        q_dtype_a2 == dtypes.fp8
+        if q_dtype_a2 is not None
+        else os.environ.get("AITER_SITUV2_A4W4_FP8_INTER", "0") == "1"
+    )
+    if (
+        want_fp8_inter
+        and q_dtype_a == dtypes.fp4x2
+        and isinstance(kernelName2, str)
+        and kernelName2.startswith("flydsl_moe2_layout_afp4_")
+        and isinstance(kernelName1, str)
+        and kernelName1.startswith("flydsl_moe1_")
+    ):
+        kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
@@ -3733,6 +3881,7 @@ def fused_moe_2stages(
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
+        input_dtype=hidden_states.dtype,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
