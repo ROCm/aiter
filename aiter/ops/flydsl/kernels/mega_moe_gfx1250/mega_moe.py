@@ -944,11 +944,21 @@ class MegaMoEGfx1250:
             config.schedule = _mori_dispatch_schedule(config)
         elif self._compact_plan:
             # Compact dispatch has one warp load a token and fan it out to all
-            # final expert rows. Its optimum is unrelated to token-major
-            # COUNT/RESERVE/FINALIZE, so keep a separate sweepable geometry.
-            compact_blocks = int(os.environ.get("AITER_TDM_COMPACT_BLOCKS", "64"))
-            compact_warps = int(os.environ.get("AITER_TDM_COMPACT_WARPS", "8"))
-            config.schedule = ((None, compact_blocks, compact_warps),)
+            # final expert rows. Prefill needs enough token-owner warps to cover
+            # the input in one pass; the wider grid cuts dispatch roughly in
+            # half at 1K+ tokens, while its launch/synchronization overhead loses
+            # on decode and smaller prompt buckets.
+            blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
+            warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
+            if blocks_env is not None or warps_env is not None:
+                compact_blocks = int(blocks_env or "64")
+                compact_warps = int(warps_env or "8")
+                config.schedule = ((None, compact_blocks, compact_warps),)
+            else:
+                config.schedule = (
+                    (512, 64, 8),
+                    (None, 128, 16),
+                )
 
         if config.schedule:
             dispatch_specs = sorted(

@@ -887,9 +887,6 @@ def _grouped_a8w4_tdm_moe(
     _a1_wire_stride = (
         int(stage2_scatter.compact_wire_row_stride) if _compact and _prequantized else 0
     )
-    # As-prologue A-scale is the interleaved layout. Compact wire scales are
-    # row-major, so gemm1 cannot use that prologue when it reads the wire.
-    _gemm1_as_prologue = 0 if _row_major_ascale else tdm_as_in_prologue
     if _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
@@ -996,7 +993,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
-            tdm_as_in_prologue=_gemm1_as_prologue,
+            tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1031,7 +1028,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
-            tdm_as_in_prologue=_gemm1_as_prologue,
+            tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
