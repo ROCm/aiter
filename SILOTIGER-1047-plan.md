@@ -743,6 +743,11 @@ regressed to 613.0 us from 513.5. Keep row-major ``[BN, D]`` V and
 scalar PV B gathers. This does not cover a later 128-bit LDS transpose
 into a second V buffer.
 
+**Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
+``4 < M * Hk < 32``. ``M=8`` stayed correct (``err=0``) but width-2051
+``L=512`` went 22.7 → 33.5 us; ``M=1`` and prefill were flat. Keep that
+bucket on ``BLOCK_N=16`` / 32 splits / 256 threads.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

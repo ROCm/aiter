@@ -610,6 +610,10 @@ stores and ``make_tiled_copy_B`` PV. ``err=0``, decode 18.6 / 21.2 us,
 prefill 613.0 us vs 513.5. Keep row-major ``[BN, D]`` V. A later
 128-bit LDS transpose into a second buffer is a different experiment.
 
+**Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
+``4 < M * Hk < 32``. ``M=8`` went 22.7 → 33.5 us (``err=0``); ``M=1``
+and prefill were flat. Keep BN16 / 32 splits / 256 threads there.
+
 
 
 
