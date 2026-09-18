@@ -456,6 +456,52 @@ prefill ~0.66 ms with sparse ``1e-2`` misses at ``M=512``.
 decode ``M=1`` ~24.5 µs vs kept ~18.7–19.1 µs. Scalar per-``D`` merge
 stays.
 
+## Phase 3d — live-AMD-shaped FlyDSL replacement
+
+The previous BLOCK_N=16/four-wave-only K2 implementation is removed.
+The replacement builder mirrors live AMD's host policy:
+
+- decode: BLOCK_N=16, 256 threads, target splits 64/32;
+- larger rows: BLOCK_N=64, 128 threads, target splits 8/4/1;
+- splits are capped to the largest useful power of two;
+- split bounds divide complete BLOCK_N tiles, matching live AMD;
+- one owner per column translates logical token to physical page/off;
+- splits=1 writes output directly and does not launch merge;
+- split output is FP32 and merge uses two waves.
+
+The single-stage kernel aliases K and transposed-V LDS, so BLOCK_N=64
+uses about 43 KiB rather than the old experiment's ~90 KiB. Q MFMA
+fragments stay in registers across the tile loop. QK is K32 on gfx950
+and K16 on gfx942; PV is K16. Online softmax and merge weights use
+log2-space ``exp2``.
+
+GPU 6 / gfx950 / ``FLYDSL_RUNTIME_ENABLE_CACHE=0``: the full QSA pytest
+suite passes (18 tests), and width-2051 ``L=512`` correctness has
+``err=0``:
+
+| m | flydsl port µs | live AMD µs | #4882 Triton µs |
+|--:|----------------:|------------:|-----------------:|
+| 1 | 23.3 | 9.9 | 112.8 |
+| 8 | 22.2 | 13.5 | 115.4 |
+| 512 | 722.2 | 202.7 | 222.3 |
+
+The port is structurally complete but does not meet the phase-3 gate.
+The first authoring-alignment pass now stages both K and V through
+``make_tiled_copy`` plus ``UniversalCopy128b`` into a shared row-major
+``[BLOCK_N, D]`` layout, uses ``idx2crd`` for wave/lane coordinates, and
+issues QK/PV through ``fx.gemm``. This removes the scalar V transpose and
+turns the main K/V LDS stores into 128-bit writes; P/C traffic and the
+per-lane MFMA feeds are still scalar.
+
+GPU 6 / gfx950 / ``FLYDSL_RUNTIME_ENABLE_CACHE=0``: all 18 QSA pytest
+cases pass. At width 2051 / ``L=512`` the aligned path is 23.8 / 24.1 /
+588.1 us for ``M=1/8/512`` with ``err=0``. The prior port was 23.3 /
+22.2 / 722.2 us, so prefill improves about 19% while decode is flat to
+worse. The BN64 split kernel ISA has 36 ``ds_write_b128``, 16 remaining
+``ds_write_b16``, 7 barriers, 48 MFMA instructions, 169 VGPRs, and
+43,968 bytes LDS. The remaining optimization target is an MMA-native
+thread/value layout for QK/PV fragments and fewer stage barriers.
+
 
 
 

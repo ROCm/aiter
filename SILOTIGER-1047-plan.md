@@ -590,6 +590,45 @@ along ``D``) were measured and **not shipped**. Decode ``M=1`` went to
 ~24.5 µs from the kept ~18.7–19.1 µs; prefill was only a small win
 (~0.51–0.54 ms). Scalar per-``D`` merge stays.
 
+The original ``BLOCK_N=16`` kernel was then replaced with a
+live-AMD-shaped FlyDSL port. One builder emits two specializations:
+decode follows the live ``BLOCK_N=16`` / 256-thread split policy, while
+prefill uses ``BLOCK_N=64`` / 128 threads / ``splits=1`` and writes
+``out`` directly without launching merge. Splits divide complete
+``BLOCK_N`` tiles, and one column owner translates each logical token
+before sharing page/off/live through LDS. The tile loop gathers paged K
+then V into one aliased single-stage LDS allocation, runs gfx950 K32
+(gfx942 K16) QK and K16 PV MFMA, maintains online softmax in log2 space,
+and emits FP32 split partials to a two-wave merge when splitting. The
+Q MFMA fragments stay in registers across the tile loop. The maximum
+static LDS allocation is about 43 KiB, below gfx942's 64 KiB.
+The old split and merge kernels are no longer callable.
+
+GPU 6 / gfx950 / ``FLYDSL_RUNTIME_ENABLE_CACHE=0``: all 18 QSA pytest
+cases pass, including decode and prefill oracle checks at ``1e-2``.
+The standard ``L=512``, width-2051 bench is correct but slower than both
+the replaced kernel and live AMD:
+
+| m | flydsl port µs | live AMD µs | #4882 Triton µs | err |
+|--:|----------------:|------------:|-----------------:|----:|
+| 1 | 23.3 | 9.9 | 112.8 | 0 |
+| 8 | 22.2 | 13.5 | 115.4 | 0 |
+| 512 | 722.2 | 202.7 | 222.3 | 0 |
+
+This completes the structural port, not the phase-3 performance gate.
+An authoring-alignment pass replaced scalar K/V LDS stores with
+``make_tiled_copy`` + ``UniversalCopy128b``, kept V row-major rather than
+scalar-transposing it, changed wave/lane mapping to ``idx2crd``, and moved
+QK/PV issue to ``fx.gemm``. GPU 6 / gfx950 remains correct (18 pytest
+cases, ``err=0``): width-2051 ``L=512`` is 23.8 / 24.1 / 588.1 us at
+``M=1/8/512`` versus the first port's 23.3 / 22.2 / 722.2 us. Thus the
+blocked LDS stores improve prefill ~19% but do not improve decode.
+BN64 ISA: 36 ``ds_write_b128``, 16 ``ds_write_b16``, 7 barriers, 48 MFMA,
+169 VGPR, and 43,968 bytes LDS. QK/PV still assemble per-lane fragments
+from scalar LDS reads; an MMA-native thread/value layout and fewer stage
+barriers are the next target. Matching ``BLOCK_N``/waves/splits still
+does not mean matching Triton's ISA.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
