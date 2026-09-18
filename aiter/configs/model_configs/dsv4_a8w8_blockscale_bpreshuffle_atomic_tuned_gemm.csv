@@ -1,0 +1,6 @@
+gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx1250,256,512,2048,7168,flydsl,0,4,10.0847,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk4_cm4_cn2_atm,1490.61,1819.60,3.24249e-05
+gfx1250,256,512,6144,7168,flydsl,0,4,19.0379,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk4_cm2_cn4_atm,2368.81,2506.06,2.95639e-05
+gfx1250,256,512,7168,3072,flydsl,0,2,12.3750,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk2_cm4_cn4_atm,1822.11,1906.50,8.17435e-07
+gfx1250,256,512,7168,16384,flydsl,0,4,32.8561,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk4_cm2_cn4_atm,3660.18,3829.70,2.12533e-05
+gfx1250,256,512,8192,1536,flydsl,0,2,8.8476,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk2_cm4_cn4_atm,1456.32,1511.07,7.15256e-07

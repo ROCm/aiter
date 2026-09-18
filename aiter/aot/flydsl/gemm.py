@@ -85,13 +85,14 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     COMPUTE_WMMA_NAME_PREFIX as MXFP8_128_COMPUTE_WMMA_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
-    WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
-)
-from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
-    _fused_splitk_ok,
+    SPLIT_K_FLAG_MAX_LEN,
     check_persistent_n_tiles,
     cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
+    resolve_splitk_mode,
+)
+from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+    WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
@@ -624,7 +625,8 @@ def _compile_mxfp8_128_wmma_to_cache(
     cluster_n: int,
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
-    fused_splitk: bool = True,
+    splitk_mode: str = "atomic",
+    cu_num: int = 0,
     **kwargs,
 ):
     del kwargs
@@ -646,6 +648,8 @@ def _compile_mxfp8_128_wmma_to_cache(
     a_scale = torch.empty((m, k_blocks), device=dev, dtype=torch.uint8)
     b_scale = torch.empty(((n + 127) // 128, k_blocks), device=dev, dtype=torch.uint8)
     out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
+    # split-K flag slots: the kernel only indexes them, compile-only never runs
+    flag = torch.empty(SPLIT_K_FLAG_MAX_LEN, device=dev, dtype=torch.int32)
     stream = fx.Stream(0)
 
     with compile_only_env():
@@ -683,12 +687,24 @@ def _compile_mxfp8_128_wmma_to_cache(
         ):
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
             if compute_bound:
-                fused = fused_splitk and _fused_splitk_ok(
-                    tile_m, variant_cm, cluster_n, split_k, True
+                mode = resolve_splitk_mode(
+                    m,
+                    n,
+                    tile_m,
+                    tile_n,
+                    variant_cm,
+                    cluster_n,
+                    split_k,
+                    True,
+                    splitk_mode,
                 )
                 row_bounded = bool(m % tile_m)
-                cb_args = variant_args[:12] + (_ptr_view_safe(out),) + variant_args[12:]
-                bounds = (False, True) if fused else (row_bounded,)
+                cb_args = (
+                    variant_args[:12]
+                    + (_ptr_view_safe(flag), _ptr_view_safe(out))
+                    + variant_args[12:]
+                )
+                bounds = (False, True) if mode != "none" else (row_bounded,)
                 for bounded_m in bounds:
                     launch(
                         *cb_args,
@@ -696,8 +712,8 @@ def _compile_mxfp8_128_wmma_to_cache(
                         split_k,
                         a_preshuffle,
                         persistent_n_tiles,
-                        fused,
                         bounded_m,
+                        mode,
                     )
             else:
                 launch(
@@ -848,6 +864,7 @@ def compile_one_config(
                     m=m,
                     n=n,
                     k=k,
+                    cu_num=cu_num,
                     **kwargs,
                 )
             elif kind == "ptpc_wmma":

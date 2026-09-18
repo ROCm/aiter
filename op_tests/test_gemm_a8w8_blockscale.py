@@ -4,6 +4,7 @@
 import argparse
 import math
 import os
+import re
 import sys
 
 # Add parent directory to path to ensure we use local aiter module
@@ -24,8 +25,120 @@ from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from atomic_splitk_config import atomic_config_path
+
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
+WARMUP_ITERS = 5
+
+# Set from __main__. Empty / False keep the plain tuned run.
+SPLITK_MODES_TO_TEST = ()
+SPLITK_AB = False
+FLYDSL_KERNEL_OVERRIDE = None
+# Split-K suffix sits between _cn<N> and _apre/_ps<N>.
+_SPLITK_SUFFIX_RE = re.compile(
+    r"(_cm\d+_cn\d+)(?:_nofsk|_fsk|_atm)?((?:_apre)?(?:_ps\d+)?)$"
+)
+_SPLITK_SUFFIX = {"atomic": "_atm", "fsk": "_fsk", "none": "_nofsk"}
+
+
+def kernel_name_with_splitk_mode(name, mode):
+    """Rewrite a tuned kernelName to request ``mode``; None if it does not parse."""
+    if mode == "tuned":
+        return name
+    new, hits = _SPLITK_SUFFIX_RE.subn(
+        lambda m: m.group(1) + _SPLITK_SUFFIX[mode] + m.group(2), name
+    )
+    return new if hits else None
+
+
+def effective_splitk_mode(name, m, n):
+    """What the runner will actually do with ``name`` -- the gate can narrow it."""
+    from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+        is_compute_wmma_kernel_name,
+        parse_wmma_kernel_name,
+        resolve_splitk_mode,
+    )
+
+    cfg = parse_wmma_kernel_name(name)
+    if cfg is None:
+        return None
+    return resolve_splitk_mode(
+        m,
+        n,
+        cfg["tile_m"],
+        cfg["tile_n"],
+        cfg["cluster_m"],
+        cfg["cluster_n"],
+        cfg["split_k"],
+        is_compute_wmma_kernel_name(name),
+        cfg["splitk_mode"],
+    )
+
+
+def _flydsl_row(m, n, k, path):
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
+
+    if get_gfx() != "gfx1250" or not os.path.exists(path):
+        return None
+    try:
+        cfg = get_CKGEMM_config(m, n, k, path)
+    except (FileNotFoundError, KeyError):
+        return None
+    if cfg is None or cfg.get("libtype") != "flydsl":
+        return None
+    return str(cfg.get("kernelName", "")) or None
+
+
+def tuned_kernel_name(m, n, k, apre=False):
+    """The kernelName mainline dispatch picks -- the fused (clustered) row."""
+    from aiter.ops.gemm_op_a8w8 import AITER_CONFIGS
+
+    path = (
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE
+        if apre
+        else AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
+    return _flydsl_row(m, n, k, path)
+
+
+def atomic_kernel_name(m, n, k, apre=False):
+    """The atomic winner from the separate atomic config; None if untuned."""
+    return _flydsl_row(m, n, k, atomic_config_path(apre))
+
+
+def tuned_flydsl_kernel_name(m, n, k):
+    """Base name for --splitk-mode: the override if given, else the tuned row."""
+    if FLYDSL_KERNEL_OVERRIDE is not None:
+        return FLYDSL_KERNEL_OVERRIDE
+    return tuned_kernel_name(m, n, k, apre=False)
+
+
+def flydsl_kernel_call(
+    x, weightshuffle, x_scale, w_scale, kernel_name, m, dtype, a_is_preshuffled=False
+):
+    """Allocates Out internally like the dispatch does, so perftest rotates the
+    same argument set and these numbers stay comparable with the "us" column."""
+    from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250,
+    )
+
+    out = torch.empty((m, weightshuffle.shape[0]), dtype=dtype, device=x.device)
+    return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
+        x,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        kernel_name,
+        a_is_preshuffled=a_is_preshuffled,
+    )
+
+
+run_gemm_flydsl_kernel = perftest(num_iters=TEST_NUM_ITERS)(flydsl_kernel_call)
+
 
 # atol as a fraction of the reference RMS. A fixed 1e-2 is a no-op once |out|
 # reaches 1e4, leaving near-zero outputs judged on bare rtol -- a bar no
@@ -223,6 +336,36 @@ def test_gemm(
     ret["err"] = err_base
     ret["l2x"] = l2x_base
 
+    if use_flydsl_fp8_scale and SPLITK_MODES_TO_TEST:
+        tuned_name = tuned_flydsl_kernel_name(m, n, k)
+        if tuned_name is None:
+            aiter.logger.warning(
+                f"--splitk-mode: no tuned flydsl row for {m}x{n}x{k}, skipped"
+            )
+        else:
+            for mode in SPLITK_MODES_TO_TEST:
+                name = kernel_name_with_splitk_mode(tuned_name, mode)
+                if name is None:
+                    aiter.logger.warning(
+                        f"--splitk-mode {mode}: cannot rewrite {tuned_name!r}"
+                    )
+                    continue
+                eff = effective_splitk_mode(name, m, n)
+                args = (x, gemm_weight, gemm_x_scale, w_scale, name, m, dtype)
+                # Warm-up: without it the first mode measured is taxed 6-16%.
+                for _ in range(WARMUP_ITERS):
+                    flydsl_kernel_call(*args)
+                torch.cuda.synchronize()
+                g, avg_g = run_gemm_flydsl_kernel(*args)
+                ret[f"sk:{mode} us"] = avg_g
+                ret[f"sk:{mode} TFLOPS"] = m * n * k * 2 / avg_g / 1e6
+                ret[f"sk:{mode} eff"] = eff
+                ret[f"sk:{mode} err"] = checkAllclose(
+                    a, g, msg=f"splitk={mode}", atol=atol, catastrophic_check=True
+                )
+                ret[f"sk:{mode}/bpre"] = avg_g / avg_b
+
+    x_shuffled = None
     if apre and use_flydsl_fp8_scale:
         # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
         # A -- padded to M+1 rows; x_scale and the result keep the true M.
@@ -231,8 +374,9 @@ def test_gemm(
             x_apre[:m] = x
         else:
             x_apre = x
+        x_shuffled = shuffle_mxfp8fp4_a(x_apre)
         e, avg_e = run_gemm_abpreshuffle(
-            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype
+            x_shuffled, gemm_weight, gemm_x_scale, w_scale, dtype
         )
         ret["apre us"] = avg_e
         ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
@@ -242,6 +386,55 @@ def test_gemm(
         )
         ret["apre l2x"] = check_rel_l2(e, a_f32, l2_floor, "apre")
         ret["apre/bpre"] = avg_e / avg_b
+
+    if use_flydsl_fp8_scale and SPLITK_AB:
+        variants = [(False, x, "")]
+        if apre and x_shuffled is not None:
+            variants.append((True, x_shuffled, "apre "))
+        for is_apre, xin, pfx in variants:
+            names = {
+                "fsk": tuned_kernel_name(m, n, k, is_apre),
+                "atm": atomic_kernel_name(m, n, k, is_apre),
+            }
+            got = {}
+            for tag, name in names.items():
+                if name is None:
+                    aiter.logger.warning(
+                        f"--splitk-ab: no {tag} row for {m}x{n}x{k} apre={int(is_apre)}"
+                    )
+                    continue
+                args = (
+                    xin,
+                    gemm_weight,
+                    gemm_x_scale,
+                    w_scale,
+                    name,
+                    m,
+                    dtype,
+                    is_apre,
+                )
+                for _ in range(WARMUP_ITERS):
+                    flydsl_kernel_call(*args)
+                torch.cuda.synchronize()
+                y, avg = run_gemm_flydsl_kernel(*args)
+                got[tag] = avg
+                ret[f"{pfx}{tag} us"] = avg
+                ret[f"{pfx}{tag} TFLOPS"] = m * n * k * 2 / avg / 1e6
+                eff = effective_splitk_mode(name, m, n)
+                want = {"fsk": "fsk", "atm": "atomic"}[tag]
+                if eff != want:
+                    aiter.logger.warning(
+                        f"--splitk-ab: {m}x{n}x{k} apre={int(is_apre)} {tag} asked "
+                        f"for {want} but the gate ran {eff} -- not an A/B of the two "
+                        f"epilogues; retune that row or pass a config that fits."
+                    )
+                ret[f"{pfx}{tag} eff"] = eff
+                ret[f"{pfx}{tag} cfg"] = name.split("compute_wmma_")[-1]
+                ret[f"{pfx}{tag} err"] = checkAllclose(
+                    a, y, msg=f"{pfx}{tag}", atol=atol, catastrophic_check=True
+                )
+            if "fsk" in got and "atm" in got:
+                ret[f"{pfx}atm/fsk"] = got["atm"] / got["fsk"]
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
@@ -354,7 +547,7 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
 
 
 # Kept in the JSON record and the results CSV, but dropped from the terminal
-# table: constant across a run, or already gated in the log.
+# table: constant across a run, already gated in the log, or too wide.
 TABLE_DROP_COLS = ("dtype", "seed", "apre", "l2x", "apre l2x", "apre/bpre")
 # Folded into the summary header when constant, kept as a column when swept.
 TABLE_FOLD_COLS = ("bpreshuffle", "use_flydsl")
@@ -369,6 +562,13 @@ def display_view(frame):
     """
     view = frame.rename(columns={"data_init": "init_mode"})
     drop = [c for c in ("scale_init",) + TABLE_DROP_COLS if c in view.columns]
+    # kernelName columns are too wide for the terminal; the CSV/JSON keep them.
+    drop += [c for c in view.columns if c.endswith(" cfg") and c not in drop]
+    if SPLITK_AB:
+        # The baseline columns just repeat what the "fsk" ones already report;
+        # a narrowed split-K mode is warned about in the log instead.
+        drop += [c for c in ("us", "TFLOPS", "TB/s", "err") if c in view.columns]
+        drop += [c for c in view.columns if c.endswith(" eff") and c not in drop]
     folded = {}
     for col in TABLE_FOLD_COLS:
         if col in view.columns and view[col].nunique(dropna=False) == 1:
@@ -493,6 +693,41 @@ parser.add_argument(
         or --apre True False""",
 )
 parser.add_argument(
+    "--splitk-ab",
+    action="store_true",
+    help="""Compare the two tuned split-K epilogues head to head: the fused
+    (clustered) row mainline dispatch uses, vs the atomic winner from the
+    separate atomic config (op_tests/tune_a8w8_splitk_atomic.py writes it;
+    mainline never reads it). Adds "fsk/atm us|TFLOPS|eff|cfg|err" and
+    "atm/fsk"; with --apre 1 the same columns appear again with an "apre "
+    prefix. Requires --flydsl.""",
+)
+parser.add_argument(
+    "--flydsl-kernel",
+    dest="flydsl_kernel",
+    type=str,
+    default=None,
+    help="""Base kernelName for --splitk-mode instead of the tuned row, so a
+    config seen only in an e2e trace can be reproduced verbatim. The split-K
+    suffix is still rewritten per --splitk-mode. Applies to every shape in the
+    run, so pass one -nk at a time.
+    e.g.: --flydsl-kernel flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk4_cm1_cn2""",
+)
+parser.add_argument(
+    "--splitk-mode",
+    dest="splitk_mode",
+    nargs="+",
+    choices=["tuned", "none", "atomic", "fsk"],
+    default=None,
+    help="""Also rerun the FlyDSL candidate with these split-K epilogues, using
+    the SAME tile as the tuned row (only the epilogue changes), so atomic and
+    clustered-fsk can be compared directly. "none" is the separate reduce
+    kernel, "tuned" is the row as written. Repeatable; each mode adds
+    "sk:<mode> us/TFLOPS/eff/err" columns. The "eff" column is what the dispatch
+    gate actually ran -- it can narrow the request. Requires --flydsl.
+    e.g.: --splitk-mode atomic fsk none""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -522,6 +757,20 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+if args.flydsl_kernel:
+    if not args.splitk_mode:
+        parser.error("--flydsl-kernel requires --splitk-mode")
+    FLYDSL_KERNEL_OVERRIDE = args.flydsl_kernel
+if args.splitk_ab:
+    if not args.flydsl:
+        parser.error("--splitk-ab requires --flydsl")
+    SPLITK_AB = True
+if args.splitk_mode:
+    if not args.flydsl:
+        parser.error("--splitk-mode requires --flydsl")
+    seen = dict.fromkeys(args.splitk_mode)  # de-dup, keep order
+    SPLITK_MODES_TO_TEST = tuple(seen)
 
 data_init_list = args.data_init or ["constant", "norm"]
 scale_init_list = args.scale_init or ["constant", "amax"]
@@ -598,18 +847,25 @@ if not df.empty:
     print("\n" + "=" * 150)
     print(header)
     print("-" * 150)
-    print("  init_mode                : input distribution (data and block scale)")
-    print("  us / TFLOPS / TB/s / err : B-preshuffle GEMM (weight preshuffled)")
-    print("  apre us / apre TFLOPS /  : A-preshuffle + B-preshuffle GEMM")
-    print("  apre TB/s / apre err       (A and weight both preshuffled)")
-    print(
-        "  err                      : fraction of elements outside "
-        "rtol=1e-2 / atol=1e-2*RMS(ref)"
-    )
-    print(
-        f"  rel-L2 is gated separately at {REL_L2_SLACK:.1f}x the bf16 "
-        f"output-quantization floor; see the per-case lines in the log above."
-    )
+    if SPLITK_AB:
+        print(
+            "  fsk = mainline tuned row   atm = atomic config   "
+            "atm/fsk = atm us / fsk us"
+        )
+        print("  a narrowed split-K mode is warned about in the log above")
+    else:
+        print("  init_mode                : input distribution (data and block scale)")
+        print("  us / TFLOPS / TB/s / err : B-preshuffle GEMM (weight preshuffled)")
+        print("  apre us / apre TFLOPS /  : A-preshuffle + B-preshuffle GEMM")
+        print("  apre TB/s / apre err       (A and weight both preshuffled)")
+        print(
+            "  err                      : fraction of elements outside "
+            "rtol=1e-2 / atol=1e-2*RMS(ref)"
+        )
+        print(
+            f"  rel-L2 is gated separately at {REL_L2_SLACK:.1f}x the bf16 "
+            f"output-quantization floor; see the per-case lines in the log above."
+        )
     print("=" * 150)
     print(table.to_string(index=False))
     print("=" * 150)
