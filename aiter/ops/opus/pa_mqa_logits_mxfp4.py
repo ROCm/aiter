@@ -89,8 +89,8 @@ _MD_NAME_GFX1250 = "module_pa_mqa_logits_mxfp4_gfx1250_opus"
 # size is computed, and it stays that way on purpose: the builder's own scratch sits past the
 # slots in the same buffer, so open-coding `num_ctas * 8` anywhere is under-allocation, which
 # the launcher raises on. `_SCHED_CTA_RESIDENT` is the part's resident CTA count (256 CUs x
-# occupancy 1) and is only a default -- `cta_target` exists for the A/B that turns the split
-# off, not for a caller to tune.
+# occupancy 1). Not a knob: the split aims at it, and the A/B that turns the split off lives in
+# the opus-ops harness rather than on this op's surface.
 _SCHED_CTA_RESIDENT = 256
 _SCHED_RECORD_INTS = 8
 _SCHED_SCRATCH_RECORDS = 96
@@ -165,7 +165,7 @@ def _gfx1250_max_tiles_for(total_q: int, batch: int) -> int:
     return (int(total_q) + int(batch) * (Q_PER_BLOCK - 1)) // Q_PER_BLOCK
 
 
-def _gfx1250_sched_slots(num_tiles: int, resident: int = _SCHED_CTA_RESIDENT) -> int:
+def _gfx1250_sched_slots(num_tiles: int) -> int:
     """The ``num_ctas`` GRID, NOT the buffer's record count -- that is this plus the builder's
     scratch and lives in the allocation below.
 
@@ -173,8 +173,22 @@ def _gfx1250_sched_slots(num_tiles: int, resident: int = _SCHED_CTA_RESIDENT) ->
     rounding leaves the split room above it, since a split needs MORE slots than tiles. Tight
     rather than generous: a surplus slot's CTA still reads a 32-byte record nobody else touches.
     """
-    n = max(int(num_tiles), int(resident))
-    return -(-n // int(resident)) * int(resident)
+    n = max(int(num_tiles), _SCHED_CTA_RESIDENT)
+    return -(-n // _SCHED_CTA_RESIDENT) * _SCHED_CTA_RESIDENT
+
+
+def _gfx1250_cta_info(device, num_ctas):
+    # Slots PLUS the builder's own scratch, which sits past them in the same buffer.
+    return torch.empty(
+        (int(num_ctas) + _SCHED_SCRATCH_RECORDS, _SCHED_RECORD_INTS),
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def _gfx1250_cu_tiles(device, num_tiles):
+    # Tile `t` covers rows [cu_tiles[t], cu_tiles[t + 1]), so the terminator is not optional.
+    return torch.empty(int(num_tiles) + 1, dtype=torch.int32, device=device)
 
 
 def _gfx1250_compute_tiles(cu_seq_q, total_q, out=None):
@@ -187,11 +201,7 @@ def _gfx1250_compute_tiles(cu_seq_q, total_q, out=None):
     cu = cu_seq_q.to(torch.int32).contiguous()
     batch = int(cu.shape[0]) - 1
     num_tiles = _gfx1250_max_tiles_for(total_q, batch)
-    cu_tiles = (
-        torch.empty(num_tiles + 1, dtype=torch.int32, device=cu.device)
-        if out is None
-        else out
-    )
+    cu_tiles = _gfx1250_cu_tiles(cu.device, num_tiles) if out is None else out
     _gfx1250_build_tiles_raw(cu, cu_tiles, int(total_q), int(num_tiles))
     return cu_tiles, num_tiles
 
@@ -204,22 +214,16 @@ def _gfx1250_compute_schedule(
     local_starts=None,
     row_to_batch=None,
     num_ctas=None,
-    cta_resident=_SCHED_CTA_RESIDENT,
     cta_info=None,
 ):
     """Build the per-tile schedule. Device-side, no sync.
 
-    ``cta_resident`` is what the split aims at; 0 turns the split off. Safe to reuse the buffer
-    across forwards -- every slot is written, surplus ones included.
+    Safe to reuse the buffer across forwards -- every slot is written, surplus ones included.
     """
     n = int(num_tiles)
     slots = _gfx1250_sched_slots(n) if num_ctas is None else int(num_ctas)
     if cta_info is None:
-        cta_info = torch.empty(
-            (slots + _SCHED_SCRATCH_RECORDS, _SCHED_RECORD_INTS),
-            dtype=torch.int32,
-            device=local_ends.device,
-        )
+        cta_info = _gfx1250_cta_info(local_ends.device, slots)
     empty = torch.empty(0, dtype=torch.int32, device=local_ends.device)
     _gfx1250_build_sched_raw(
         cu_tiles,
@@ -229,7 +233,7 @@ def _gfx1250_compute_schedule(
         cta_info,
         n,
         slots,
-        int(cta_resident),
+        _SCHED_CTA_RESIDENT,
     )
     return cta_info, slots
 
@@ -316,6 +320,8 @@ class MqaLogitsPlan:
 
     arch: str
     cta_info: torch.Tensor
+    # The launch GRID. Read it at capture and hand it back to the builder every forward; a
+    # graph replays the grid it captured and nothing re-checks it against a later table.
     num_ctas: int
     # gfx1250 only. The windows travel WITH the plan because the kernel reads them per row for
     # the store mask while the table carries only each tile's union, and because they must be
@@ -367,6 +373,60 @@ def _check_layout(arch: str, q_scale, kv_scale, kv_cache) -> None:
         raise ValueError(f"{arch}: {name} must be {want}-D, got {tuple(t.shape)}{why}")
 
 
+def pa_mqa_logits_mxfp4_plan_buffers(
+    device: torch.device | str | int,
+    total_q: int,
+    batch: int,
+    *,
+    num_ctas: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+    """Allocate a plan's buffers and settle its grid from the STATIC shapes alone.
+
+    Returns ``(cta_info, cu_tiles, num_ctas)`` -- ``cu_tiles`` is ``None`` on gfx950, which has
+    no tile cut -- to be handed straight back to :func:`pa_mqa_logits_mxfp4_plan` every
+    forward. Nothing here needs a formula on the caller's side, which is the point: the
+    ``cta_info`` shape carries the builder's own scratch past the slots and the grid is a
+    two-step rounding, so open-coding either is one header change away from under-allocating.
+
+    For a caller that must allocate BEFORE it has any windows -- a fixed buffer pool set up at
+    startup, which is what a CUDAGraph metadata builder holds. A caller that can allocate
+    lazily does not need this: build one plan and reuse its three outputs.
+
+    Size them at the LARGEST shape they will be pinned to. A later forward with fewer rows
+    writes fewer tiles into the same buffers and keeps the pinned grid, which is consistent;
+    the reverse is what the launcher raises on.
+    """
+    arch = _device_arch(device)
+    if arch == GFX1250:
+        num_tiles = _gfx1250_max_tiles_for(total_q, batch)
+        slots = _gfx1250_sched_slots(num_tiles) if num_ctas is None else int(num_ctas)
+        return (
+            _gfx1250_cta_info(device, slots),
+            _gfx1250_cu_tiles(device, num_tiles),
+            slots,
+        )
+    if arch == GFX950:
+        mod = _gfx950_mod()
+        slots = (
+            mod.pa_mqa_logits_mxfp4_sched_slots(int(total_q))
+            if num_ctas is None
+            else int(num_ctas)
+        )
+        ints = mod.pa_mqa_logits_mxfp4_sched_buffer_ints(slots)
+        return (
+            torch.empty(
+                (ints // mod.SCHED_RECORD_INTS, mod.SCHED_RECORD_INTS),
+                dtype=torch.int32,
+                device=device,
+            ),
+            None,
+            slots,
+        )
+    raise RuntimeError(
+        f"the MXFP4 MQA-logits op supports {GFX950} and {GFX1250}, got {arch}"
+    )
+
+
 def pa_mqa_logits_mxfp4_plan(
     cu_seq_q: torch.Tensor,
     local_ends: torch.Tensor,
@@ -375,7 +435,6 @@ def pa_mqa_logits_mxfp4_plan(
     local_starts: torch.Tensor | None = None,
     row_to_batch: torch.Tensor | None = None,
     num_ctas: int | None = None,
-    cta_target: int | None = None,
     block_k: int | None = None,
     cta_info: torch.Tensor | None = None,
     cu_tiles: torch.Tensor | None = None,
@@ -398,9 +457,17 @@ def pa_mqa_logits_mxfp4_plan(
     ``block_k`` is gfx950-only and raises on gfx1250 rather than being ignored, because a
     silently-dropped tile width is a knob that looks like it took effect.
 
-    ``cta_info`` / ``cu_tiles`` let a caller supply the buffers; pass the previous plan's, which
-    is what a CUDAGraph capture wants. Every slot is written, surplus ones included, so reuse
-    needs no clearing.
+    **UNDER A CUDAGRAPH, `cta_info`, `cu_tiles` AND `num_ctas` ARE ALL REQUIRED**, and both
+    failures are silent. A replay reads the POINTER and the GRID it captured while this builder
+    runs outside it, so: omit the buffers and each forward writes a fresh allocation the graph
+    never reads -- it reads whatever the caching allocator has since put at the captured
+    address, and a garbage record's row index is not bounded anywhere; leave ``num_ctas``
+    derived and a forward whose shape rounds to a different count builds a table the grid does
+    not match. Read ``plan.num_ctas`` at capture and pass it back every forward. That also
+    turns the remaining risk into a host-side raise, since the ``num_ctas >= num_tiles`` check
+    runs eagerly here while the graph's own grid is past checking.
+
+    Every slot is written, surplus ones included, so buffer reuse needs no clearing.
     """
     arch = _arch_of(local_ends)
     n = int(local_ends.numel()) if total_q is None else int(total_q)
@@ -418,9 +485,6 @@ def pa_mqa_logits_mxfp4_plan(
             local_starts=local_starts,
             row_to_batch=row_to_batch,
             num_ctas=num_ctas,
-            cta_resident=(
-                _SCHED_CTA_RESIDENT if cta_target is None else int(cta_target)
-            ),
             cta_info=cta_info,
         )
         return MqaLogitsPlan(
@@ -442,7 +506,7 @@ def pa_mqa_logits_mxfp4_plan(
         row_to_batch=row_to_batch,
         block_k=bk,
         num_ctas=num_ctas,
-        cta_target=(mod.SCHED_CTA_TARGET if cta_target is None else int(cta_target)),
+        cta_target=mod.SCHED_CTA_TARGET,
         cta_info=cta_info,
     )
     return MqaLogitsPlan(arch=arch, cta_info=info, num_ctas=slots, block_k=bk)
@@ -516,4 +580,5 @@ __all__ = [
     "MqaLogitsPlan",
     "pa_mqa_logits_mxfp4",
     "pa_mqa_logits_mxfp4_plan",
+    "pa_mqa_logits_mxfp4_plan_buffers",
 ]
