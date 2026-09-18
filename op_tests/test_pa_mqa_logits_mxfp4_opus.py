@@ -437,6 +437,75 @@ def _csa_chunked(qlen, kvlen):
     return [(0, kvlen - (qlen - 1 - n) // CSA_RATIO) for n in range(qlen)]
 
 
+# A `cu_seq_q` claiming more rows than `q` holds. 14 against 10 puts BOTH of the kernel's
+# row_id clauses on the path: the cut is [0,4) [4,8) [8,12) [12,14), so tile 2 straddles the
+# real row count (the per-wave clause) and tile 3 is past it entirely (the CTA-uniform one).
+ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS, ROWID_WIN = 10, 14, 200
+
+
+def check_row_id_bound(data_init, scale_init, seed):
+    """The one caller inconsistency the kernel has to survive rather than diagnose.
+
+    ``cu_seq_q[batch]`` is device data, so no launcher check can compare it against
+    ``q.shape[0]`` -- reading it host-side is the sync this whole design exists to avoid.
+    Unbounded, the chain ``cu_seq_q -> cu_tiles -> rec.row_id -> row_id`` puts a CTA's reads
+    past ``q`` / ``q_scale`` / ``weights`` and its WRITES past ``out``. The kernel bounds
+    ``row_id`` against ``num_rows`` instead, so the surplus rows are dropped and the real ones
+    stay right.
+
+    THIS CASE IS THE ONLY THING THAT WALKS THAT PATH -- every other case here builds
+    ``cu_seq_q`` and ``q`` from one ``qlens``, so the rows always agree.
+
+    **What gives it teeth is the oversized `out`, not the hope of a fault.** With a
+    right-sized one the unbounded kernel overruns by 4 KB, which the caching allocator usually
+    absorbs: no fault, no wrong answer in the rows that are checked, and the probe passes while
+    establishing nothing. So `out` is allocated for all ``claimed`` rows and the surplus ones
+    are required to stay at their -inf pre-fill. That is the same `row_id` the overrun would
+    have used, so it tests the bound and not a symptom.
+    """
+    real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
+    inp = build_inputs(1, ROWID_WIN, real, seed, data_init, scale_init)
+
+    def t(v):
+        return torch.tensor(v, dtype=torch.int32, device=dev)
+
+    # The window arrays describe `claimed` rows; `q` holds `real`. Every launcher check passes:
+    # num_rows is q.shape[0], local_ends is longer than it, and out is longer still.
+    rb = torch.zeros(claimed, dtype=torch.int32, device=dev)
+    ls = torch.zeros(claimed, dtype=torch.int32, device=dev)
+    le = t([ROWID_WIN] * claimed)
+    plan = pa_mqa_logits_mxfp4_plan(
+        t([0, claimed]), le, total_q=claimed, local_starts=ls, row_to_batch=rb
+    )
+    out = torch.full(
+        (claimed, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+    pa_mqa_logits_mxfp4(
+        inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+        inp.weights, plan, inp.max_seq_len,
+        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+    # Scored over the rows `q` actually holds -- the surplus ones have no Q to be right about.
+    rows = list(range(real))
+    err = check_rows(out, ref_rows(inp, rows, rb, ls, le), "row_id bound")
+    oob = oob_is_neginf(out[:real], ls[:real], le[:real])
+    wr = window_is_written(out[:real], ls[:real], le[:real])
+    # The clause that fails without the kernel's bound: rows past `q` were never scheduled.
+    untouched = bool(torch.isneginf(out[real:]).all().item())
+    ret = {
+        "data_init": data_init, "scale_init": scale_init, "seed": seed,
+        "case": f"cu_seq_q {claimed} > q {real}", "rows": real,
+        "tiles": plan.num_tiles, "ctas": plan.num_ctas, "max_win": ROWID_WIN,
+        "err": err, "oob -inf": oob and untouched, "window written": wr,
+        "pass": err == 0 and oob and untouched and wr,
+    }  # fmt: skip
+    del inp, out
+    torch.cuda.empty_cache()
+    return ret
+
+
 def run_corner(data_init, scale_init, seed):
     """The cases the qshare contract is made of: short groups at every residue mod
     Q_PER_BLOCK, windows that do not start at 0, the KV_TILE = 128 boundary neighbourhood, every
@@ -475,7 +544,7 @@ def run_corner(data_init, scale_init, seed):
     return [
         check_prefill(w, seed + case_seed, label, data_init, scale_init)
         for w, case_seed, label in cases
-    ]
+    ] + [check_row_id_bound(data_init, scale_init, seed + 70)]
 
 
 SPREAD_PROBE_ROWS = 4096

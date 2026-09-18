@@ -75,6 +75,17 @@ static void pa_mqa_logits_mxfp4_gfx1250_check_shapes(aiter_tensor_t& q,
                 (int)Traits::PAGE_SIZE,
                 ", got ",
                 kv_block_size);
+    // block_tables is sized in KV TILES and not in pages: a CTA rounds its window up to a whole
+    // tile and reads the table at EVERY page of the last one, including where the window stops
+    // inside it. `max_blocks_per_seq` is just this size and the kernel uses it as a row stride,
+    // so nothing else bounds the page index. `max_seq_len` bounds every window -- it is the
+    // store's own bound -- which makes this the tightest size the host can know.
+    const int64_t bt_tiles = (max_seq_len + Traits::KV_TILE_SIZE - 1) / Traits::KV_TILE_SIZE;
+    const int64_t bt_cols  = bt_tiles * Traits::PAGES_PER_TILE;
+    AITER_CHECK(block_tables.size(1) >= bt_cols,
+                "block_tables is sized in KV TILES of ", (int)Traits::KV_TILE_SIZE,
+                " tokens, not pages of ", (int)Traits::PAGE_SIZE, ": max_seq_len=", max_seq_len,
+                " needs ", bt_cols, " columns, got ", block_tables.size(1));
 
     AITER_CHECK(q.dtype() == AITER_DTYPE_fp4x2 || q.dtype() == AITER_DTYPE_u8,
                 "q must be fp4x2 (E2M1, 2/byte) or u8 bytes");

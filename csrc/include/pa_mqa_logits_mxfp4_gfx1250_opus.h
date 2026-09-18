@@ -1056,7 +1056,9 @@ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
     int   stride_out   = kargs.stride_out_row;
     float weight_scale = kargs.weight_scale;
     int   max_blk      = kargs.max_blocks_per_seq;
-    pin_sgpr(stride_out); pin_sgpr(weight_scale); pin_sgpr(max_blk);
+    // The kernel's only use of num_rows -- it was validation-only until the row_id bound below.
+    int   num_rows     = kargs.num_rows;
+    pin_sgpr(stride_out); pin_sgpr(weight_scale); pin_sgpr(max_blk); pin_sgpr(num_rows);
     const opus_mqa_cta_record* p_cta_info = kargs.ptr_cta_info;
     const int* p_local_starts = kargs.ptr_local_starts;
     const int* p_local_ends   = kargs.ptr_local_ends;
@@ -1080,8 +1082,22 @@ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
     // The whole assignment in one `s_load_dwordx8` off a blockIdx-uniform address. The
     // surplus-slot return is CTA-uniform, so it cannot deadlock the phase barrier.
     const opus_mqa_cta_record rec = p_cta_info[opus::block_id_x()];
-    if (rec.chunk_count <= 0) return;                // surplus, or an empty window
-    const bool slot_ok    = q_slot < rec.group_rows;
+    // TWO clauses against num_rows, and the split is forced: an out-of-range wave may NOT
+    // return, because a non-uniform early return leaves the four waves with unequal phase
+    // barrier counts and DEADLOCKS. This one is CTA-uniform -- rec comes off a blockIdx-uniform
+    // address -- and it is also what makes the clamp below safe, since a masked-off wave falls
+    // back to rec.row_id and still reads p_local_starts[row_id] unconditionally.
+    //
+    // The row space is the caller's and nothing else bounds it: cu_seq_q -> cu_tiles ->
+    // rec.row_id is a chain the launcher cannot check, because cu_seq_q[batch] is device data
+    // and reading it host-side is the sync this design exists to avoid. This buys a FAILURE
+    // MODE, not correctness -- a caller whose cu_seq_q reaches past q is wrong either way --
+    // but the failure is now dropped rows instead of reads past q and writes past out.
+    if (rec.chunk_count <= 0 || rec.row_id >= num_rows) return;
+    // The per-wave half folds in HERE rather than returning: the wave runs to the end with
+    // own_end = 0, so its out descriptor holds zero records and every store it makes is
+    // dropped -- the same path short groups already take.
+    const bool slot_ok    = q_slot < rec.group_rows && rec.row_id + q_slot < num_rows;
     // Clamped, not branched: q_slot is readfirstlane'd and group_rows comes off the record, so
     // the select is s_cselect and the row's base addresses below stay scalar.
     const int row_id      = rec.row_id + (slot_ok ? q_slot : 0);

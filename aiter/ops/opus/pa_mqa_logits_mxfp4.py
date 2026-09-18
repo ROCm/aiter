@@ -6,9 +6,11 @@
 Per query row ``r`` over a window ``[s, e)``:
 ``out[r, s:e] = sum_H( relu(Q[r] . K^T) * weight[r] ) * weight_scale``
 
-Prefill and decode, through ONE launch over a schedule table built on device, on gfx950 and
-gfx1250 alike. The plan depends only on per-FORWARD data while the kernel runs per CSA LAYER,
-and DeepSeek-V4 has 61 of them, so a caller builds once and launches 61 times::
+Prefill and decode, through ONE launch over a schedule table built on device. **gfx1250 is the
+only target built in this tree** — the entry points below already dispatch on arch, and the
+gfx950 arm raises until ROCm/aiter#5332 lands the module it calls. The plan depends only on
+per-FORWARD data while the kernel runs per CSA LAYER, and DeepSeek-V4 has 61 of them, so a
+caller builds once and launches 61 times::
 
     plan = pa_mqa_logits_mxfp4_plan(cu_seq_q, local_ends)         # once per FORWARD
     out  = pa_mqa_logits_mxfp4(q, q_scale, kv_cache, kv_scale,
@@ -154,6 +156,17 @@ def _gfx1250_build_sched_raw(
 ) -> None: ...
 
 
+def _as_i32(t):
+    """The int32, contiguous form the C++ launchers require, or None.
+
+    Called ONCE, in the plan builder, and the result is what the plan carries -- not per launch.
+    Both are no-ops on a tensor that already conforms, so the common caller pays nothing; a
+    caller holding int64 windows pays one copy per forward instead of one per CSA layer, which
+    is 61 of them on DeepSeek-V4.
+    """
+    return None if t is None else t.to(torch.int32).contiguous()
+
+
 def _gfx1250_max_tiles_for(total_q: int, batch: int) -> int:
     """Tiles the cut can produce, from the static shapes alone -- which is what keeps the launch
     cudagraph-safe.
@@ -218,6 +231,10 @@ def _gfx1250_compute_schedule(
 ):
     """Build the per-tile schedule. Device-side, no sync.
 
+    The three window arrays arrive already `_as_i32`, from the plan builder; this does not
+    convert them, so a caller reaching past the plan gets the C++ dtype check rather than a
+    silent copy.
+
     Safe to reuse the buffer across forwards -- every slot is written, surplus ones included.
     """
     n = int(num_tiles)
@@ -228,7 +245,7 @@ def _gfx1250_compute_schedule(
     _gfx1250_build_sched_raw(
         cu_tiles,
         local_starts if local_starts is not None else empty,
-        local_ends.to(torch.int32).contiguous(),
+        local_ends,
         row_to_batch if row_to_batch is not None else empty,
         cta_info,
         n,
@@ -257,7 +274,8 @@ def _gfx1250_launch(
 ):
     """``local_ends`` is a launch argument even though the schedule was built from it, because
     the kernel reads it PER ROW for the store mask while the table carries only each tile's
-    union. It must be the SAME array; a shorter one is rejected, a differently-valued one is
+    union. It must be the SAME array -- the plan's, already `_as_i32` and not re-converted here,
+    since this runs once per CSA layer. A shorter one is rejected, a differently-valued one is
     not."""
     total_rows = int(q_fp4.shape[0])
     if out is None:
@@ -276,7 +294,7 @@ def _gfx1250_launch(
         block_tables,
         weights,
         local_starts if local_starts is not None else empty,
-        local_ends.to(torch.int32).contiguous(),
+        local_ends,
         cta_info,
         out,
         total_rows,
@@ -323,10 +341,11 @@ class MqaLogitsPlan:
     # The launch GRID. Read it at capture and hand it back to the builder every forward; a
     # graph replays the grid it captured and nothing re-checks it against a later table.
     num_ctas: int
-    # gfx1250 only. The windows travel WITH the plan because the kernel reads them per row for
-    # the store mask while the table carries only each tile's union, and because they must be
-    # the same arrays the schedule was built from. gfx950's records carry each row's window, so
-    # its launch never sees these.
+    # gfx1250 only, and int32 + contiguous: the builder normalizes them once so the per-layer
+    # launch does not. The windows travel WITH the plan because the kernel reads them per row
+    # for the store mask while the table carries only each tile's union, and because they must
+    # be the same arrays the schedule was built from. gfx950's records carry each row's window,
+    # so its launch never sees these.
     #
     # `num_tiles` is the cut's UPPER BOUND, not its exact count, and it is kept because
     # `num_ctas > num_tiles` is how a reader tells that the schedule split a tile across CTAs.
@@ -477,13 +496,16 @@ def pa_mqa_logits_mxfp4_plan(
             raise ValueError(
                 "gfx1250 compiles one KV tile width; block_k is gfx950-only"
             )
+        # All three ONCE, here, and the plan carries the result -- the launch reads the windows
+        # per CSA LAYER, so converting there would be 61 copies for a caller holding int64.
+        ends, starts = _as_i32(local_ends), _as_i32(local_starts)
         tiles, num_tiles = _gfx1250_compute_tiles(cu_seq_q, n, out=cu_tiles)
         info, slots = _gfx1250_compute_schedule(
             tiles,
-            local_ends,
+            ends,
             num_tiles,
-            local_starts=local_starts,
-            row_to_batch=row_to_batch,
+            local_starts=starts,
+            row_to_batch=_as_i32(row_to_batch),
             num_ctas=num_ctas,
             cta_info=cta_info,
         )
@@ -493,8 +515,8 @@ def pa_mqa_logits_mxfp4_plan(
             num_ctas=slots,
             cu_tiles=tiles,
             num_tiles=num_tiles,
-            local_starts=local_starts,
-            local_ends=local_ends,
+            local_starts=starts,
+            local_ends=ends,
         )
 
     mod = _gfx950_mod()
