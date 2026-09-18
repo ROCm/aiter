@@ -75,15 +75,11 @@ def _wave32_inclusive_scan_i32(value, lane):
     value_raw = value.ir_value()
     zero_raw = fx.Int32(0).ir_value()
     for shift, dpp in ((1, 0x111), (2, 0x112), (4, 0x114), (8, 0x118)):
-        remote = fx.rocdl.update_dpp(
-            T.i32, zero_raw, value_raw, dpp, 0xF, 0xF, True
-        )
+        remote = fx.rocdl.update_dpp(T.i32, zero_raw, value_raw, dpp, 0xF, 0xF, True)
         value = (lane >= fx.Int32(shift)).select(value + fx.Int32(remote), value)
         value_raw = value.ir_value()
     source16 = (lane & fx.Int32(0x10)) - fx.Int32(1)
-    remote16 = fx.rocdl.ds_bpermute(
-        T.i32, source16 * fx.Int32(4), value
-    )
+    remote16 = fx.rocdl.ds_bpermute(T.i32, source16 * fx.Int32(4), value)
     return (lane >= fx.Int32(16)).select(value + fx.Int32(remote16), value)
 
 
@@ -96,11 +92,7 @@ def compact_row_capacity(
 ) -> int:
     """Static CUDAGraph-safe bound matching grouped_moe contiguous_m."""
     tile_m = int(tile_m)
-    ub = (
-        int(max_recv) * int(topk)
-        + int(experts_per_rank) * tile_m
-        - int(topk)
-    )
+    ub = int(max_recv) * int(topk) + int(experts_per_rank) * tile_m - int(topk)
     aligned = ((ub + tile_m - 1) // tile_m) * tile_m
     return max(tile_m, aligned)
 
@@ -125,7 +117,9 @@ def compile_tdm_compact_plan(
     epr = int(experts_per_rank)
     segs = int(npes) * epr
     if segs > 1024:
-        raise ValueError(f"compact plan LDS hist supports at most 1024 segments, got {segs}")
+        raise ValueError(
+            f"compact plan LDS hist supports at most 1024 segments, got {segs}"
+        )
     tile_m = int(tile_m)
     compact_cap = int(compact_cap)
     max_routes = max(1, int(max_routes))
@@ -199,7 +193,9 @@ def compile_tdm_compact_plan(
             lds_recv = fx.Int64(fx.ptrtoint(recv_ptr))
 
         for s in range(tid, segs, PLAN_THREADS):
-            comm_ops.store_i32_lds(lds_hist + fx.Int64(s) * fx.Int64(4), arith.constant(0))
+            comm_ops.store_i32_lds(
+                lds_hist + fx.Int64(s) * fx.Int64(4), arith.constant(0)
+            )
         fx.barrier()
 
         n_routes = inp_cur_tok * fx.Int32(topk)
@@ -228,7 +224,9 @@ def compile_tdm_compact_plan(
 
         vec_n = n_routes - (n_routes & fx.Int32(route_vec - 1))
         stride = PLAN_BLOCKS * PLAN_THREADS * route_vec
-        for route in range(bid * PLAN_THREADS * route_vec + tid * route_vec, vec_n, stride):
+        for route in range(
+            bid * PLAN_THREADS * route_vec + tid * route_vec, vec_n, stride
+        ):
             if const_expr(route_vec == 1):
                 expert = buffer_load(rsrc_idx, route, vec_width=1, dtype=T.i32)
                 _tally_one(route, expert)
@@ -238,7 +236,9 @@ def compile_tdm_compact_plan(
                 )
                 for k in range_constexpr(route_vec):
                     _tally_one(route + k, raw[k])
-        for route in range(vec_n + bid * PLAN_THREADS + tid, n_routes, PLAN_BLOCKS * PLAN_THREADS):
+        for route in range(
+            vec_n + bid * PLAN_THREADS + tid, n_routes, PLAN_BLOCKS * PLAN_THREADS
+        ):
             expert = buffer_load(rsrc_idx, route, vec_width=1, dtype=T.i32)
             _tally_one(route, expert)
 
@@ -279,9 +279,9 @@ def compile_tdm_compact_plan(
                 fx.barrier()
 
             if tid == 0:
-                gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32) + arith.constant(
-                    1
-                )
+                gen = buffer_load(
+                    rsrc_bar, 2, vec_width=1, dtype=T.i32
+                ) + arith.constant(1)
                 buffer_store(gen, rsrc_bar, 2)
             fx.barrier()
             gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32)
@@ -319,9 +319,9 @@ def compile_tdm_compact_plan(
                 TDM.tdm_wait(0)
             elif const_expr(PLAN_BLOCKS == 1 and segs % 32 == 0):
                 if warp < npes:
-                    peer_hist = fx.Int64(
-                        window.lsa_ptr(warp, hist_off)
-                    ) + fx.Int64(rank * segs * 4)
+                    peer_hist = fx.Int64(window.lsa_ptr(warp, hist_off)) + fx.Int64(
+                        rank * segs * 4
+                    )
                     TDM.tdm_store(
                         TDM.tdm_group0(
                             arith.trunci(T.i32, arith.unwrap(lds_hist)), peer_hist
@@ -395,8 +395,7 @@ def compile_tdm_compact_plan(
                     )
                     for i in range(tid, nnz, PLAN_THREADS):
                         packed = comm_ops.load_i32_lds(
-                            lds_recv
-                            + fx.Int64(src_base + i + 1) * fx.Int64(4)
+                            lds_recv + fx.Int64(src_base + i + 1) * fx.Int64(4)
                         )
                         seg = packed & arith.constant(0xFFFF)
                         cnt = packed >> arith.constant(16)
@@ -436,14 +435,15 @@ def compile_tdm_compact_plan(
                 for src in range_constexpr(npes):
                     cnt = comm_ops.load_i32_lds(
                         lds_matrix
-                        + fx.Int64(src * segs + dest * fx.Int32(epr) + e)
-                        * fx.Int64(4)
+                        + fx.Int64(src * segs + dest * fx.Int32(epr) + e) * fx.Int64(4)
                     )
                     if src == rank:
                         my_prefix = total
                     total = total + cnt
                 comm_ops.store_i32_lds(lds_total + fx.Int64(idx) * fx.Int64(4), total)
-                comm_ops.store_i32_lds(lds_pref + fx.Int64(idx) * fx.Int64(4), my_prefix)
+                comm_ops.store_i32_lds(
+                    lds_pref + fx.Int64(idx) * fx.Int64(4), my_prefix
+                )
                 if dest == rank:
                     buffer_store(total, rsrc_mm, e)
             fx.barrier()
@@ -512,9 +512,7 @@ def compile_tdm_compact_plan(
             )
             dest_row = send_base + intra
             in_cap = dest_row < compact_cap
-            flat = (dest_row << fx.Int32(peer_bits)) | (
-                dest_pe & fx.Int32(peer_mask)
-            )
+            flat = (dest_row << fx.Int32(peer_bits)) | (dest_pe & fx.Int32(peer_mask))
             buffer_store(
                 arith.select(valid & in_cap, flat, arith.constant(dropped)),
                 rsrc_map,

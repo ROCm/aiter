@@ -911,7 +911,9 @@ class MegaMoEGfx1250:
             self._compact_block_hist = torch.empty(
                 PLAN_BLOCKS * segs, dtype=torch.int32, device=device
             )
-            self._compact_send_base = torch.empty(segs, dtype=torch.int32, device=device)
+            self._compact_send_base = torch.empty(
+                segs, dtype=torch.int32, device=device
+            )
             self._compact_barrier = torch.zeros(4, dtype=torch.int32, device=device)
             self._compact_dummy_ids = torch.zeros(
                 (1, config.topk), dtype=torch.int32, device=device
@@ -1128,22 +1130,19 @@ class MegaMoEGfx1250:
                     off_out_wts=self._arena.offset("out_wts"),
                     off_out_tok=self._arena.offset("disp_out"),
                     off_out_scales=(
-                        (
-                            self._arena.offset("disp_out")
-                            + config.dispatch_token_nbytes
-                        )
+                        (self._arena.offset("disp_out") + config.dispatch_token_nbytes)
                         if self._compact_plan
-                        else self._arena.offset("disp_out_scales")
-                        if config.dispatch_scale_dst_nbytes
-                        else 0
+                        else (
+                            self._arena.offset("disp_out_scales")
+                            if config.dispatch_scale_dst_nbytes
+                            else 0
+                        )
                     ),
                     scale_bytes=config.dispatch_scale_nbytes,
                     scale_stride=config.dispatch_scale_dst_nbytes,
                     block_num=geom[0],
                     warp_num_per_block=geom[1],
-                    clear_route_counter=os.environ.get(
-                        "AITER_TDM_DIRECT_EP_MASK", "1"
-                    )
+                    clear_route_counter=os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
                     and not self._compact_plan,
                     compact_plan=self._compact_plan,
@@ -1301,8 +1300,7 @@ class MegaMoEGfx1250:
         if self._compact_plan:
             span = (rows - 1) * self._compact_wire_row + self._compact_scale_row
             storage = _from_gpu_ptr(
-                self._arena.local_ptr("disp_out")
-                + self._config.dispatch_token_nbytes,
+                self._arena.local_ptr("disp_out") + self._config.dispatch_token_nbytes,
                 (span,),
                 torch.uint8,
             )
