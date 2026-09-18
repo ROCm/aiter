@@ -1,0 +1,103 @@
+# aiter-review-bot —— @aiter-bot review 原生触发的 PR 审查（CI，无轮询无 daemon）。
+#
+# 放到 ROCm/aiter 的 .github/workflows/aiter-review-bot.yml，合进 main 才生效
+# （issue_comment 触发的 workflow 只认 main 上的定义）。在 308 self-hosted runner 上跑。
+#
+# 触发：授权者（aiter team 白名单）在 PR 上评论
+#   @aiter-bot review      首审
+#   @aiter-bot re-review   重扫（作者改完后）
+# 引用行（>）里的命令不触发；非白名单人评论不触发。
+#
+# 执行链（全在 308 runner 上，脚本来自 /mnt/raid0/zufa/skillwork/.review-loop）：
+#   gate(授权+真触发校验) → 👀 认领 → run_one.sh（无头 GLM 审）→ publish.sh（🔴挂/非🔴发，以 aiter-bot 身份）
+name: aiter-review-bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read          # 只读；发评论走 aiter-bot PAT，不用默认 GITHUB_TOKEN
+
+concurrency:
+  # 同一 PR 的多次触发串行、后者取消前者在途，避免并发重复审
+  group: aiter-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    # 便宜的预筛：必须是 PR 评论，且正文里出现命令（真校验放 gate step，含引用行剔除）
+    if: >
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '@aiter-bot review') ||
+       contains(github.event.comment.body, '@aiter-bot re-review'))
+    runs-on: [self-hosted, box308]        # ← 注册 runner 时给它打这些 label
+    env:
+      RL: /mnt/raid0/zufa/skillwork/.review-loop
+      PR: ${{ github.event.issue.number }}          # issue_comment 的 issue 号即 PR 号
+      COMMENTER: ${{ github.event.comment.user.login }}
+      AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+      # runner 上跑 kernel 实测默认关（self-hosted+公开仓的安全默认；要跑再单独开）
+      REVIEW_AUTO_VALIDATE: '0'
+    steps:
+      - name: Gate — aiter team 白名单 + 真触发校验（剔除引用行）
+        id: gate
+        env:
+          BODY: ${{ github.event.comment.body }}
+          AITER_REVIEW_AUTHORIZED: ${{ vars.AITER_REVIEW_AUTHORIZED }}   # 可选 repo 变量；空则用 runner 白名单文件
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re, pathlib
+          body = os.environ.get('BODY', '')
+          who  = os.environ.get('COMMENTER', '').strip().lower()
+          # 1) 真触发：按行判，引用行(>)跳过；re-review 先判（含 review 子串）
+          TRIG = [('re-review', re.compile(r'@aiter-bot\s+re-?review\b', re.I)),
+                  ('review',    re.compile(r'@aiter-bot\s+review\b', re.I))]
+          kind = None
+          for raw in body.splitlines():
+              if raw.lstrip().startswith('>'):
+                  continue
+              for k, rx in TRIG:
+                  if rx.search(raw):
+                      kind = k; break
+              if kind: break
+          # 2) 授权：白名单（repo 变量 AITER_REVIEW_AUTHORIZED 优先，否则 runner 文件）
+          allow = set()
+          v = os.environ.get('AITER_REVIEW_AUTHORIZED', '')
+          if v.strip():
+              allow = {x.strip().lower() for x in v.split(',') if x.strip()}
+          else:
+              f = pathlib.Path('/mnt/raid0/zufa/skillwork/.review-loop/ci/authorized.txt')
+              if f.is_file():
+                  allow = {l.strip().lower() for l in f.read_text().splitlines()
+                           if l.strip() and not l.startswith('#')}
+          ok = bool(kind) and who in allow
+          print(f'ok={"true" if ok else "false"}')
+          print(f'kind={kind or ""}')
+          if not kind:
+              print('reason=只在引用行/无有效命令')
+          elif who not in allow:
+              print('reason=评论者不在 aiter team 白名单')
+          PY
+        # AITER_REVIEW_AUTHORIZED 作为可选 repo 变量透传给上面的 python
+        # （Actions 需在 env 显式引；留空则回落 runner 白名单文件）
+      - name: Gate 结果
+        run: |
+          echo "commenter=$COMMENTER kind=${{ steps.gate.outputs.kind }} ok=${{ steps.gate.outputs.ok }} ${{ steps.gate.outputs.reason }}"
+          [ "${{ steps.gate.outputs.ok }}" = "true" ] || { echo "::notice::忽略：${{ steps.gate.outputs.reason }}"; exit 0; }
+
+      - name: 认领 👀（以 aiter-bot 身份）
+        if: steps.gate.outputs.ok == 'true'
+        run: |
+          curl -s -X POST -H "Authorization: token $AITER_BOT_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"eyes"}' >/dev/null || true
+
+      - name: 审（无头 GLM，run_one.sh）
+        if: steps.gate.outputs.ok == 'true'
+        run: bash "$RL/run_one.sh" "$PR"
+
+      - name: 发布门（publish.sh，🔴挂/非🔴发）
+        if: steps.gate.outputs.ok == 'true'
+        run: bash "$RL/publish.sh" "$PR" --post
