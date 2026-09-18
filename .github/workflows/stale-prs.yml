@@ -22,7 +22,10 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/stale@v10
+      # Pinned to the v10.4.0 commit, not the tag: this step can close pull
+      # requests and rewrite labels, and a tag can be moved. Same convention
+      # as remove-stale-branches in stale-branches.yml.
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629  # v10.4.0
         with:
           days-before-pr-stale: 15
           days-before-pr-close: 15

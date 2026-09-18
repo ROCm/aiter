@@ -63,6 +63,17 @@ jobs:
           operations-per-run: 300
           # Upstream default is false: without this, a branch under review
           # would collect a stale comment while the review is still going.
+          # Upstream stops the whole run when a commit author resolves to no
+          # account, on the grounds that it may mean the token lacks the
+          # privileges to look one up. That reasoning does not apply here --
+          # the token is GITHUB_TOKEN with a fixed scope -- while the cost
+          # does: one commit from an address never linked to an account, or
+          # from a deleted one, would halt a 700-branch pass partway with
+          # nothing failing to say so. Those branches get their comment with
+          # no author named, unless STALE_BRANCHES_DEFAULT_RECIPIENT names
+          # someone to notify instead.
+          ignore-unknown-authors: true
+          default-recipient: ${{ vars.STALE_BRANCHES_DEFAULT_RECIPIENT }}
           ignore-branches-with-open-prs: true
           exempt-protected-branches: true
           exempt-branches-regex: '^(main|master|gh-pages|stable|release/.*|v[0-9].*)$'
