@@ -26,10 +26,19 @@ What this file provides
 -----------------------
 * ``TorchReferenceTpMoe``  -- torch reference built from ``torch_moe_stage1`` /
   ``torch_moe_stage2``, i.e. the same reference ``test_moe_2stage.py`` uses.
-* ``UnfusedTpMoe``         -- the comparison implementation, composed from four
-  *separately timeable* modules: ``AllGatherTokens``, GEMM1, GEMM2 (both taken
-  from the very kernels ``test_moe_2stage.py`` drives through ``fused_moe``),
-  and ``ReduceScatterOutput``.
+* ``SplitTpMoe``           -- the control group.  Runs the steps in the order
+  the fused kernel will, each one timed on its own::
+
+      route AG -> SORT | quant -> AG -> GEMM1 -> GEMM2 -> RS
+                        `--------- one fused launch ---------'
+
+  The sort is hoisted out in front because it will not be fused: it needs only
+  the routing metadata (topk*8 bytes/token, ~1/45 of the activation payload), so
+  it can run while the activations are still on the wire.  ``fused_moe_2stages``
+  already takes the sort results as plain arguments, so hoisting is a call-site
+  change, not a reimplementation -- the GEMMs stay exactly the tuned kernels
+  ``test_moe_2stage.py`` benchmarks.  ``fusable_us`` sums only the legs one
+  fused launch replaces, and that is the number to compare against, not e2e.
 * ``MegaMoeTP``            -- the fused implementation, a thin adapter over
   ``aiter.ops.flydsl.mega_moe_tp``.  It keeps the same tuned GEMM1/GEMM2 and replaces
   everything around them: the activation is MXFP4-quantized *before* the
@@ -44,14 +53,31 @@ for now.
 
 Usage
 -----
+No wrapper and no exported variables: every environment variable the tuned a4w4
+path needs is set at the top of this file, and the repo root is put on
+``sys.path`` there too, so the tuned kernels are reached by running the file::
+
     # all four models, default token sweep
-    PYTHONPATH=$PWD AITER_USE_SYSTEM_TRITON=1 AITER_SITUV2_A4W4=1 \
-    AITER_FLYDSL_STAGE2_FP8=1 \
     torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py
 
     # one model, accuracy only
     torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py \
         --models kimi3 --tokens 8 32 128 --no-perf
+
+The single-GPU equivalent of the GEMM block -- the same tuned kernels, driven
+through ``fused_moe`` -- is::
+
+    python op_tests/test_moe_2stage.py -q 4 -dim 6144,256 -e 257 -k 9 \
+        -a silu -s f -p t -t 8 64 512 4096 --no-flydsl-csv --kernel
+
+with ``-dim <model_dim>,<inter_dim/TP>`` taken from ``MODELS`` below.
+
+The activation wire format is not a free choice: quantizing before the
+AllGather is only legal where GEMM1 accepts a quantized activation, and the
+``_f16in`` variant that the tuner picks at small M reads raw BF16 and ignores
+the A buffers entirely.  ``_TunedPlan.ag_wire`` derives this per bucket, and the
+``ag_wire`` column reports it.  On the current CSVs the crossover is M=128 for
+kimi3, M=256 for glm5, and M=8 for dsv3.
 
 Known environment limitation
 ----------------------------
@@ -75,34 +101,81 @@ import functools
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-import pandas as pd
-import torch
-import torch.distributed as dist
+# ---------------------------------------------------------------------------
+# Environment and search path -- must run before ``import aiter``
+# ---------------------------------------------------------------------------
+# Running this file is meant to be enough: no wrapper script, no exported
+# variables.  Everything the tuned a4w4 path needs is set here with
+# ``setdefault``, so an explicit value from the caller still wins.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if os.path.isdir(os.path.join(_REPO_ROOT, "aiter")) and _REPO_ROOT not in sys.path:
+    # Prefer this checkout over any installed amd-aiter wheel, which on this box
+    # points at a different tree.  Replaces ``PYTHONPATH=$PWD``.
+    sys.path.insert(0, _REPO_ROOT)
 
-import aiter
-from aiter import dtypes
-from aiter.fused_moe import (
-    fused_moe,
+for _key, _value in {
+    # Read at *import* time by aiter/ops/triton/gluon/__init__.py, which raises
+    # when the installed triton is older than 3.6 (this box has 3.4).
+    "AITER_USE_SYSTEM_TRITON": "1",
+    # Resolve SiTUv2 to a4w4 (fp4x2) instead of falling back to a16w4
+    # (fused_moe.py:1077).
+    "AITER_SITUV2_A4W4": "1",
+    # GEMM2 emits fp8 per-route partials plus a separate reduction, which is the
+    # configuration the tuned CSV rows were measured under (fused_moe.py:2468).
+    "AITER_FLYDSL_STAGE2_FP8": "1",
+    # The 256 default would select bf16 activations below M=256
+    # (fused_moe.py:1060), i.e. a16w4 rather than the a4w4 under test.
+    "AITER_BF16_FP8_MOE_BOUND": "0",
+}.items():
+    os.environ.setdefault(_key, _value)
+
+# Deliberately NOT set here:
+#   AITER_CONFIG_FMOE        Pinning one CSV sends the other three models to
+#                            untuned heuristics.  Left unset, aiter globs and
+#                            merges every ``model_configs/*tuned_fmoe*.csv``, so
+#                            all four shapes hit their own tuned rows in one
+#                            process.  Each shape names its file in
+#                            ``ModelShape.tuned_csv`` and ``check_tuned_csvs()``
+#                            asserts they are all present at startup.
+#   AITER_MOE_EXPERT_BALANCE Read only by op_tests/test_moe_2stage.py, never by
+#                            aiter.  The equivalent here is ``--route``, which
+#                            already defaults to ``balanced``.
+
+import pandas as pd  # noqa: E402
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+
+import aiter  # noqa: E402
+from aiter import dtypes  # noqa: E402
+from aiter.fused_moe import (  # noqa: E402
+    fused_moe_2stages,
     fused_topk,
     get_2stage_cfgs,
     get_padded_M,
+    moe_sorting,
+    stage2_uses_route_reduce,
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.moe_common import (
+from aiter.jit.core import AITER_CONFIGS  # noqa: E402
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx  # noqa: E402
+from aiter.ops.flydsl.moe_common import (  # noqa: E402
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
-from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP as MegaMoeTPEngine
-from aiter.ops.flydsl.mega_moe_tp import MegaMoeTPConfig, mega_moe_tp_supported
-from aiter.ops.quant import get_hip_quant
-from aiter.ops.shuffle import shuffle_weight
-from aiter.utility import fp4_utils
+from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP as MegaMoeTPEngine  # noqa: E402
+from aiter.ops.flydsl.mega_moe_tp import (  # noqa: E402
+    MegaMoeTPConfig,
+    _gemm1_takes_prequantized_fp4,
+    mega_moe_tp_supported,
+)
+from aiter.ops.flydsl.mxfp4_kname import parse_g2_kname_any  # noqa: E402
+from aiter.ops.quant import get_hip_quant  # noqa: E402
+from aiter.ops.shuffle import shuffle_weight  # noqa: E402
+from aiter.utility import fp4_utils  # noqa: E402
 
 logger = logging.getLogger("aiter")
 
@@ -592,93 +665,6 @@ def _partial_keyword(fn, *keys: str) -> str:
     return ""
 
 
-class LocalMoeGemms:
-    """The local two-stage MoE: sorting + activation quant + GEMM1 + GEMM2 + reduce.
-
-    This calls ``fused_moe`` with exactly the kwargs ``test_moe_2stage.py`` uses,
-    so the kernels selected here are the same ones that test benchmarks.  The
-    individual GEMM1 / GEMM2 launch closures are captured through
-    ``aiter.fused_moe.kernel_bench_callable`` (the hook behind that test's
-    ``--kernel`` flag) so they can be timed in isolation.
-    """
-
-    def __init__(self, weights: TpMoeWeights):
-        shape = weights.shape
-        self.weights = weights
-        self.shape = shape
-        situ = shape.act_type == aiter.ActivationType.Situv2
-        self.kwargs = {
-            "w1_scale": weights.w1_scale,
-            "w2_scale": weights.w2_scale,
-            "quant_type": QUANT_TYPE,
-            "activation": shape.act_type,
-            "doweight_stage1": False,
-            "intermediate_pad": 0,
-            "hidden_pad": 0,
-            "bias1": None,
-            "bias2": None,
-            # a4w4 leaves swiglu_limit unset (test_moe_2stage.py:970-973).
-            "swiglu_limit": None,
-            "beta": DEFAULT_SITUV2_BETA if situ else None,
-            "linear_beta": DEFAULT_SITUV2_LINEAR_BETA if situ else None,
-            # (fp4x2, fp4x2) resolves to SEPARATED (test_moe_2stage.py:953-968).
-            "gate_mode": GateMode.SEPARATED.value,
-        }
-
-    def __call__(self, x_all, topk_weights, topk_ids):
-        return fused_moe(
-            x_all,
-            self.weights.w1,
-            self.weights.w2,
-            topk_weights,
-            topk_ids,
-            **self.kwargs,
-        )
-
-    def capture_stage_callables(self, x_all, topk_weights, topk_ids):
-        """Run one eager pass and return {"stage1": call, "stage2": call, "out": out}."""
-        captured: list = []
-        aiter.fused_moe.kernel_bench_callable = captured
-        try:
-            out = self(x_all, topk_weights, topk_ids)
-        finally:
-            aiter.fused_moe.kernel_bench_callable = None
-        stages = dict(captured)
-        return stages, out
-
-    def kernel_names(self, global_tokens: int) -> tuple[str, str]:
-        """Report which tuned GEMM1/GEMM2 kernels this shape resolves to."""
-        shape = self.shape
-        try:
-            meta = get_2stage_cfgs(
-                get_padded_M(global_tokens),
-                shape.model_dim,
-                self.weights.local_inter_dim,
-                shape.experts,
-                shape.topk,
-                dtypes.bf16,
-                AQ_DTYPE,
-                WQ_DTYPE,
-                QUANT_TYPE,
-                True,  # use_g1u1
-                shape.act_type,
-                False,  # doweight_stage1
-                0,
-                0,
-                True,  # is_shuffled
-                GateMode.SEPARATED.value,
-            )
-        except Exception as exc:  # noqa: BLE001 - diagnostics only
-            return (f"<{type(exc).__name__}>", "")
-        # MOEMetadata does not carry the names as fields: get_2stage_cfgs bakes
-        # them into the functools.partial keywords of stage1/stage2
-        # (fused_moe.py:2621-2627).
-        return (
-            _partial_keyword(meta.stage1, "kernelName1", "kernelName"),
-            _partial_keyword(meta.stage2, "kernelName2", "kernelName"),
-        )
-
-
 # ---------------------------------------------------------------------------
 # Module 4 / 4: ReduceScatter of the partial output
 # ---------------------------------------------------------------------------
@@ -702,30 +688,386 @@ class ReduceScatterOutput:
 
 
 # ---------------------------------------------------------------------------
-# Composed baseline: AG -> GEMM1 -> GEMM2 -> RS
+# Split baseline, ordered exactly like the fused kernel will be
 # ---------------------------------------------------------------------------
-class UnfusedTpMoe:
-    """The comparison implementation: four separate modules, four+ kernel launches."""
+# The fused kernel collapses quant + AG + GEMM1 + GEMM2 + RS into one launch and
+# leaves the sort outside, so the control group runs those same steps in that
+# same order with each one timed on its own.  Whatever the fused number gains
+# over the sum of these legs is fusion gain; whatever it loses is fusion
+# overhead.
+#
+# The sort is hoisted because it will not be fused.  It needs only the routing
+# metadata -- topk*8 bytes per token, ~1/45 of the activation payload at
+# kimi3 -- so it can be gathered and sorted while the activations are still in
+# flight.  Everything downstream consumes ``sorted_ids`` and friends as plain
+# inputs, exactly as ``fused_moe_2stages`` already does.
+@dataclass(frozen=True)
+class _TunedPlan:
+    """Everything the tuned CSV decides for one global token count.
 
-    name = "unfused"
+    Resolved once per M and reused, so the timed legs never pay a lookup.
+    """
 
-    def __init__(self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int):
+    tokens: int
+    metadata: object
+    block_m: int
+    #: GEMM2 uses the atomic epilogue, so ``moe_sorting`` must zero the output
+    #: buffer it hands back (fused_moe.py:1275-1288).
+    accumulate: bool
+    #: GEMM1 reads a pre-quantized FP4 activation.  False for the ``_f16in``
+    #: (inline-quant) variant, which reads raw BF16 and ignores the A buffers
+    #: entirely -- handing that one a quantized A faults.
+    prequant: bool
+    gemm1_kernel: str
+    gemm2_kernel: str
+
+    @property
+    def ag_wire(self) -> str:
+        """Which wire format the AllGather can use at this M.
+
+        Tied to the GEMM1 variant, not chosen freely: quantizing before the
+        AllGather is only legal when GEMM1 accepts a quantized activation.
+        """
+        return "fp4_1x32" if self.prequant else "bf16"
+
+
+class TunedPlans:
+    """Per-M tuned-config lookup, shared by every step of the split baseline."""
+
+    def __init__(self, weights: TpMoeWeights):
         self.weights = weights
         self.shape = weights.shape
-        self.ctx = ctx
-        self.tp_size = weights.tp_size
-        self.allgather = AllGatherTokens(
-            weights.shape, weights.tp_size, max_local_tokens, ctx.device
+        self._cache: dict[int, _TunedPlan] = {}
+
+    def __call__(self, global_tokens: int) -> _TunedPlan:
+        hit = self._cache.get(global_tokens)
+        if hit is not None:
+            return hit
+        shape = self.shape
+        metadata = get_2stage_cfgs(
+            get_padded_M(global_tokens),
+            shape.model_dim,
+            self.weights.local_inter_dim,
+            shape.experts,
+            shape.topk,
+            dtypes.bf16,
+            AQ_DTYPE,
+            WQ_DTYPE,
+            QUANT_TYPE,
+            True,  # use_g1u1
+            shape.act_type,
+            False,  # doweight_stage1
+            0,
+            0,
+            True,  # is_shuffled
+            GateMode.SEPARATED.value,
         )
-        self.gemms = LocalMoeGemms(weights)
-        self.reduce_scatter = ReduceScatterOutput(
-            weights.shape, weights.tp_size, max_local_tokens, ctx.device
+        kname1 = _partial_keyword(metadata.stage1, "kernelName1", "kernelName")
+        kname2 = _partial_keyword(metadata.stage2, "kernelName2", "kernelName")
+        if metadata.output_aux:
+            # Only the Opus branch needs the name parsed, and only FlyDSL names
+            # parse.  Some shapes (dsv3 at M>=128) resolve to a CK stage2, whose
+            # name is a different grammar entirely -- those never reach here
+            # because CK implies output_aux is False, but guard anyway so a
+            # parser change downgrades to a skip instead of a crash.
+            accumulate = bool(parse_g2_kname_any(kname2)["atomic"])
+        else:
+            accumulate = not stage2_uses_route_reduce(metadata.stage2)
+        plan = _TunedPlan(
+            tokens=global_tokens,
+            metadata=metadata,
+            block_m=int(metadata.block_m),
+            accumulate=accumulate,
+            prequant=_gemm1_takes_prequantized_fp4(kname1),
+            gemm1_kernel=kname1,
+            gemm2_kernel=kname2,
+        )
+        self._cache[global_tokens] = plan
+        return plan
+
+
+class RouteAllGather:
+    """Step 0: gather the routing metadata.  The sort's only input."""
+
+    def __init__(self, shape: ModelShape, tp_size: int, max_local_tokens: int, device):
+        total = max_local_tokens * tp_size
+        self.tp_size = tp_size
+        self.topk = shape.topk
+        self.row_bytes = shape.topk * 8
+        # ids and (bit-cast) weights ride in one int32 payload so this pays a
+        # single collective's latency instead of two.
+        self._meta_local = torch.empty(
+            (max_local_tokens, 2 * shape.topk), dtype=torch.int32, device=device
+        )
+        self._meta = torch.empty(
+            (total, 2 * shape.topk), dtype=torch.int32, device=device
+        )
+        self._w = torch.empty((total, shape.topk), dtype=torch.float32, device=device)
+        self._i = torch.empty((total, shape.topk), dtype=torch.int32, device=device)
+
+    def wire_bytes(self, local_tokens: int) -> int:
+        return local_tokens * self.row_bytes * (self.tp_size - 1)
+
+    def __call__(self, inputs: TpMoeInputs):
+        m, g, k = inputs.local_tokens, inputs.global_tokens, self.topk
+        meta_local = self._meta_local[:m]
+        meta_local[:, :k].copy_(inputs.topk_ids_local)
+        meta_local[:, k:].copy_(inputs.topk_weights_local.view(torch.int32))
+        dist.all_gather_into_tensor(self._meta[:g], meta_local)
+        w, i = self._w[:g], self._i[:g]
+        i.copy_(self._meta[:g, :k])
+        w.view(torch.int32).copy_(self._meta[:g, k:])
+        return w, i
+
+
+class MoeSortingStep:
+    """Step 1: the expert sort, lifted out of ``fused_moe`` and never fused.
+
+    Replicates the sorting block of ``_fused_moe_impl`` (fused_moe.py:1261-1328)
+    rather than wrapping it, because the whole point is to run it as its own
+    step.  Both branches are needed: the two GEMM1 families in the tuned CSVs
+    want different sorts.  ``flydsl_mxmoe_g1_*`` asks for the Opus aux sort and
+    gets back two extra tensors the port consumes; ``flydsl_moe1_*`` takes the
+    ordinary sort and returns five.  The result is normalized to one 7-tuple so
+    everything downstream is family-agnostic.
+    """
+
+    def __init__(self, weights: TpMoeWeights):
+        self.shape = weights.shape
+
+    def __call__(self, w_all, i_all, plan: _TunedPlan):
+        metadata = plan.metadata
+        if metadata.output_aux:
+            return moe_sorting(
+                i_all,
+                w_all,
+                self.shape.experts,
+                self.shape.model_dim,
+                dtypes.bf16,
+                plan.block_m,
+                # The atomic epilogue accumulates into this buffer, so the sort
+                # has to zero it; the reduce epilogue owns its own intermediate.
+                accumulate=plan.accumulate,
+                output_aux=metadata.output_aux,
+                output=None,
+            )
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            moe_sorting(
+                i_all,
+                w_all,
+                self.shape.experts,
+                self.shape.model_dim,
+                dtypes.bf16,
+                plan.block_m,
+                accumulate=plan.accumulate,
+                flat=metadata.flat,
+                output=None,
+            )
+        )
+        return (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            None,  # m_indices        -- Opus-only
+            None,  # reverse_sorted   -- Opus-only
         )
 
+
+class QuantizeLocal:
+    """Step 2: MXFP4-quantize this rank's own shard, before it goes on the wire.
+
+    Per-1x32 MX quantization is row-local, so quantizing m rows here and
+    gathering the result is bit-identical to gathering BF16 and quantizing all M
+    rows -- and it moves 3.77x fewer bytes while doing 1/TP of the work.
+    """
+
+    def __init__(self):
+        self._quant = get_hip_quant(QUANT_TYPE)
+
+    def __call__(self, x_local: torch.Tensor):
+        return self._quant(x_local, quant_dtype=AQ_DTYPE)
+
+
+class PayloadAllGather:
+    """Step 3: gather the quantized activation and its E8M0 scales."""
+
+    def __init__(self, shape: ModelShape, tp_size: int, max_local_tokens: int, device):
+        total = max_local_tokens * tp_size
+        self.tp_size = tp_size
+        self.model_dim = shape.model_dim
+        self.payload_bytes = shape.model_dim // 2
+        self.scale_bytes = shape.model_dim // 32
+        self.row_bytes = self.payload_bytes + self.scale_bytes
+        # One contiguous staging row for payload+scale keeps this at a single
+        # collective, the same accounting the BF16 AllGather gets.
+        self._local = torch.empty(
+            (max_local_tokens, self.row_bytes), dtype=torch.uint8, device=device
+        )
+        self._all = torch.empty(
+            (total, self.row_bytes), dtype=torch.uint8, device=device
+        )
+
+    def wire_bytes(self, local_tokens: int) -> int:
+        return local_tokens * self.row_bytes * (self.tp_size - 1)
+
+    def __call__(self, xq, xq_scale, inputs: TpMoeInputs):
+        m, g = inputs.local_tokens, inputs.global_tokens
+        staging = self._local[:m]
+        staging[:, : self.payload_bytes].copy_(xq.view(torch.uint8).view(m, -1))
+        staging[:, self.payload_bytes :].copy_(xq_scale.view(torch.uint8).view(m, -1))
+        dist.all_gather_into_tensor(self._all[:g], staging)
+        gathered = self._all[:g]
+        a1 = gathered[:, : self.payload_bytes].contiguous().view(AQ_DTYPE)
+        a1_scale = (
+            gathered[:, self.payload_bytes :].contiguous().view(dtypes.fp8_e8m0)
+        )
+        return a1, a1_scale
+
+
+class SplitLocalGemms:
+    """Steps 4 and 5: GEMM1 and GEMM2 on an already-sorted, already-quantized input.
+
+    ``fused_moe_2stages`` takes the sort results as plain arguments, so calling
+    it directly is what "hoist the sort" means in practice -- no reimplementation
+    of the GEMM dispatch, and the tuned rows stay exactly the ones
+    ``test_moe_2stage.py`` benchmarks.  ``_metadata_transform`` pins the row this
+    M resolved to so the internal lookup cannot pick a different one, and sets
+    ``prequant`` so the FP4 activation is passed through with only its scale
+    sorted instead of being quantized a second time (fused_moe.py:3767-3779).
+    """
+
+    def __init__(self, weights: TpMoeWeights):
+        shape = weights.shape
+        self.weights = weights
+        self.shape = shape
+        situ = shape.act_type == aiter.ActivationType.Situv2
+        self.kwargs = {
+            "activation": shape.act_type,
+            "quant_type": QUANT_TYPE,
+            "doweight_stage1": False,
+            "q_dtype_a": AQ_DTYPE,
+            "q_dtype_w": WQ_DTYPE,
+            "w1_scale": weights.w1_scale,
+            "w2_scale": weights.w2_scale,
+            "hidden_pad": 0,
+            "intermediate_pad": 0,
+            "bias1": None,
+            "bias2": None,
+            "swiglu_limit": None,
+            "beta": DEFAULT_SITUV2_BETA if situ else None,
+            "linear_beta": DEFAULT_SITUV2_LINEAR_BETA if situ else None,
+            "gate_mode": GateMode.SEPARATED.value,
+            "routing_num_experts": shape.experts,
+        }
+
+    def __call__(self, a1, a1_scale, w_all, i_all, sorted_ret, plan: _TunedPlan):
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            m_indices,
+            reverse_sorted,
+        ) = sorted_ret
+        forced = plan.metadata
+        if plan.prequant:
+            forced = replace(forced, prequant=True)
+        return fused_moe_2stages(
+            a1,
+            self.weights.w1,
+            self.weights.w2,
+            self.shape.topk,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            True,  # isG1U1
+            plan.block_m,
+            a1_scale=a1_scale,
+            topk_ids=i_all,
+            topk_weights=w_all,
+            m_indices=m_indices,
+            reverse_sorted=reverse_sorted,
+            _metadata_transform=lambda _metadata: forced,
+            **self.kwargs,
+        )
+
+    def capture_stage_callables(self, *args):
+        """Run one eager pass and return ``({"stage1": call, "stage2": call}, out)``."""
+        captured: list = []
+        aiter.fused_moe.kernel_bench_callable = captured
+        try:
+            out = self(*args)
+        finally:
+            aiter.fused_moe.kernel_bench_callable = None
+        return dict(captured), out
+
+
+class SplitTpMoe:
+    """sort -> quant -> AG -> GEMM1 -> GEMM2 -> RS, each step separately timed."""
+
+    name = "split"
+
+    def __init__(self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int):
+        shape = weights.shape
+        self.weights = weights
+        self.shape = shape
+        self.ctx = ctx
+        self.tp_size = weights.tp_size
+        self.plans = TunedPlans(weights)
+        self.route_ag = RouteAllGather(shape, weights.tp_size, max_local_tokens, ctx.device)
+        self.sorting = MoeSortingStep(weights)
+        self.quant = QuantizeLocal()
+        self.payload_ag = PayloadAllGather(
+            shape, weights.tp_size, max_local_tokens, ctx.device
+        )
+        self.gemms = SplitLocalGemms(weights)
+        self.reduce_scatter = ReduceScatterOutput(
+            shape, weights.tp_size, max_local_tokens, ctx.device
+        )
+        # Only the accuracy path needs a BF16 view of the gathered activation.
+        self.allgather = AllGatherTokens(
+            shape, weights.tp_size, max_local_tokens, ctx.device
+        )
+
+    def kernel_names(self, global_tokens: int) -> tuple[str, str]:
+        plan = self.plans(global_tokens)
+        return plan.gemm1_kernel, plan.gemm2_kernel
+
+    def steps(self, inputs: TpMoeInputs):
+        """Run the chain once and hand back every intermediate, for timing."""
+        plan = self.plans(inputs.global_tokens)
+        w_all, i_all = self.route_ag(inputs)
+        sorted_ret = self.sorting(w_all, i_all, plan)
+        if plan.prequant:
+            xq, xq_scale = self.quant(inputs.x_local)
+            a1, a1_scale = self.payload_ag(xq, xq_scale, inputs)
+        else:
+            # The tuned GEMM1 at this M quantizes inline, so the wire stays BF16
+            # and the quantize step is empty -- charging it separately here would
+            # double-count work that happens inside GEMM1.
+            xq = xq_scale = None
+            a1, a1_scale = self.allgather(inputs)[0], None
+        return plan, w_all, i_all, sorted_ret, xq, xq_scale, a1, a1_scale
+
     def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
-        x_all, w_all, i_all = self.allgather(inputs)
-        partial = self.gemms(x_all, w_all, i_all)
+        plan, w_all, i_all, sorted_ret, _xq, _s, a1, a1_scale = self.steps(inputs)
+        partial = self.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan)
         return self.reduce_scatter(partial, inputs.local_tokens)
+
+    def warmup(self, x, wts, ids) -> None:
+        """Build every JIT module this M needs, single rank, no collectives."""
+        plan = self.plans(int(x.shape[0]))
+        sorted_ret = self.sorting(wts, ids, plan)
+        if plan.prequant:
+            a1, a1_scale = self.quant(x)
+        else:
+            a1, a1_scale = x, None
+        self.gemms(a1, a1_scale, wts, ids, sorted_ret, plan)
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +1082,7 @@ class MegaMoeTP:
 
     The engine lives in :mod:`aiter.ops.flydsl.mega_moe_tp`; this class only maps the
     test's ``TpMoeWeights`` / ``TpMoeInputs`` onto it, so ``MegaMoeTP`` stays
-    interchangeable with :class:`UnfusedTpMoe`::
+    interchangeable with :class:`SplitTpMoe`::
 
         moe = MegaMoeTP(weights, ctx, max_local_tokens=...)
         y_local = moe(inputs)          # [m, model_dim] bf16
@@ -912,7 +1254,7 @@ class SkipCase(Exception):
 
 
 def jit_warmup(
-    moe: UnfusedTpMoe, shape: ModelShape, ctx: DistCtx, global_tokens: int
+    moe: SplitTpMoe, shape: ModelShape, ctx: DistCtx, global_tokens: int
 ) -> bool:
     """Build every JIT module on rank 0 alone, then let the others in.
 
@@ -951,7 +1293,7 @@ def jit_warmup(
                 dtype=torch.float32,
                 device=ctx.device,
             )
-            moe.gemms(x, wts, ids)
+            moe.warmup(x, wts, ids)
             del x, ids, wts
         except Exception as exc:  # noqa: BLE001 - warmup must never be fatal
             logger.warning("[jit-warmup] %s M=%d: %s", shape.name, global_tokens, exc)
@@ -1010,8 +1352,8 @@ def run_case(
 ) -> dict:
     tp = args.tp
     inputs = make_inputs(shape, ctx, tp, global_tokens, args.seed, args.route)
-    moe = UnfusedTpMoe(weights, ctx, max_local_tokens)
-    kname1, kname2 = moe.gemms.kernel_names(global_tokens)
+    moe = SplitTpMoe(weights, ctx, max_local_tokens)
+    kname1, kname2 = moe.kernel_names(global_tokens)
     if not args.no_jit_warmup and not jit_warmup(moe, shape, ctx, global_tokens):
         raise SkipCase(
             "kernel build failed on rank 0 (see the [jit-warmup] warning above)"
@@ -1120,10 +1462,6 @@ def run_case(
         return row
 
     # ---------------- per-module perf ----------------
-    x_all, w_all, i_all = moe.allgather(inputs)
-    stages, _ = moe.gemms.capture_stage_callables(x_all, w_all, i_all)
-    partial = moe.gemms(x_all, w_all, i_all)
-
     timer = functools.partial(
         time_us,
         iters=args.iters,
@@ -1131,8 +1469,29 @@ def run_case(
         device=ctx.device,
         rounds=args.rounds,
     )
-    ag_mean, ag_max = timer(lambda: moe.allgather(inputs))
-    moe_mean, _ = timer(lambda: moe.gemms(x_all, w_all, i_all))
+    # Same order the fused kernel will run: the sort is hoisted out in front and
+    # everything after it is what gets collapsed into one launch.
+    quant_mean = 0.0
+    plan, w_all, i_all, sorted_ret, xq, xq_scale, a1, a1_scale = moe.steps(inputs)
+    stages, _ = moe.gemms.capture_stage_callables(
+        a1, a1_scale, w_all, i_all, sorted_ret, plan
+    )
+    partial = moe.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan)
+
+    route_mean, _ = timer(lambda: moe.route_ag(inputs))
+    sort_mean, _ = timer(lambda: moe.sorting(w_all, i_all, plan))
+    if plan.prequant:
+        quant_mean, _ = timer(lambda: moe.quant(inputs.x_local))
+        ag_mean, ag_max = timer(lambda: moe.payload_ag(xq, xq_scale, inputs))
+        ag_bytes = moe.payload_ag.wire_bytes(inputs.local_tokens)
+    else:
+        # GEMM1 quantizes inline at this M, so there is no separate quantize to
+        # charge and the wire stays BF16.
+        ag_mean, ag_max = timer(lambda: moe.allgather(inputs))
+        ag_bytes = moe.allgather.wire_bytes(inputs.local_tokens)
+    moe_mean, _ = timer(lambda: moe.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan))
+    row["ag_wire"] = plan.ag_wire
+
     g1_mean = g2_mean = float("nan")
     if "stage1" in stages:
         g1_mean, _ = timer(stages["stage1"])
@@ -1141,14 +1500,25 @@ def run_case(
     rs_mean, rs_max = timer(lambda: moe.reduce_scatter(partial, inputs.local_tokens))
     e2e_mean, e2e_max = timer(lambda: moe(inputs))
 
+    # What one fused launch is supposed to replace.  The sort and the routing
+    # AllGather stay outside it, so they are excluded -- this is the number the
+    # fused column has to beat, not e2e.
+    fusable_mean = quant_mean + ag_mean + moe_mean + rs_mean
+
     row.update(
         {
+            "route_ag_us": route_mean,
+            "sort_us": sort_mean,
+            "quant_us": quant_mean,
             "ag_us": ag_mean,
             "gemm1_us": g1_mean,
             "gemm2_us": g2_mean,
             "moe_us": moe_mean,
+            # Scale sort + top-k reduction: inside the GEMM block but not in
+            # either GEMM.
             "moe_other_us": moe_mean - (g1_mean + g2_mean),
             "rs_us": rs_mean,
+            "fusable_us": fusable_mean,
             "e2e_us": e2e_mean,
             "e2e_max_us": e2e_max,
             # e2e is eager, so it also carries the host-side dispatch cost of
@@ -1162,14 +1532,20 @@ def run_case(
             # idle node. A large value therefore means either real dispatch cost
             # or that one timed region caught interference the others missed --
             # see host_gap_pct, which flags the rows worth re-measuring.
-            "host_gap_us": e2e_mean - (ag_mean + moe_mean + rs_mean),
+            "host_gap_us": e2e_mean - (route_mean + sort_mean + fusable_mean),
             "host_gap_pct": (
-                100.0 * (e2e_mean - (ag_mean + moe_mean + rs_mean)) / e2e_mean
+                100.0
+                * (e2e_mean - (route_mean + sort_mean + fusable_mean))
+                / e2e_mean
                 if e2e_mean
                 else 0.0
             ),
-            "comm_pct": 100.0 * (ag_mean + rs_mean) / e2e_mean if e2e_mean else 0.0,
-            "ag_GBps": moe.allgather.wire_bytes(inputs.local_tokens) / ag_max / 1e3,
+            "comm_pct": (
+                100.0 * (route_mean + ag_mean + rs_mean) / e2e_mean
+                if e2e_mean
+                else 0.0
+            ),
+            "ag_GBps": ag_bytes / ag_max / 1e3,
             "rs_GBps": moe.reduce_scatter.wire_bytes(inputs.local_tokens)
             / rs_max
             / 1e3,
@@ -1241,6 +1617,7 @@ def run_case(
                 "fused_moe_us": f_moe_mean,
                 "fused_rs_us": f_rs_mean,
                 "fused_rs_mode": "fused" if plan.fuse_rs else "split",
+                "stage12": engine.stage12_mode(plan, inputs.local_tokens),
                 "fused_us": fused_mean,
                 "fused_speedup": (
                     e2e_mean / fused_mean if fused_mean else float("nan")
@@ -1335,11 +1712,18 @@ _PERF_COLUMNS = [
     "local_tokens",
     "inter_dim_local",
     "rel_l2",
+    # Fusion order: the sort and the routing AllGather stay outside the fused
+    # kernel; everything from quant to rs is what one launch replaces.
+    "ag_wire",
+    "route_ag_us",
+    "sort_us",
+    "quant_us",
     "ag_us",
     "gemm1_us",
     "gemm2_us",
     "moe_other_us",
     "rs_us",
+    "fusable_us",
     "host_gap_us",
     "host_gap_pct",
     "e2e_us",
@@ -1359,6 +1743,7 @@ _PERF_COLUMNS = [
     "fused_moe_us",
     "fused_rs_us",
     "fused_rs_mode",
+    "stage12",
     "fused_graph_us",
     "fused_graph_rel_l2",
     "fused_us",
