@@ -596,12 +596,12 @@ decode follows the live ``BLOCK_N=16`` / 256-thread split policy, while
 prefill uses ``BLOCK_N=64`` / 128 threads / ``splits=1`` and writes
 ``out`` directly without launching merge. Splits divide complete
 ``BLOCK_N`` tiles, and one column owner translates each logical token
-before sharing page/off/live through LDS. The tile loop gathers paged K
-then V into one aliased single-stage LDS allocation, runs gfx950 K32
-(gfx942 K16) QK and K16 PV MFMA, maintains online softmax in log2 space,
-and emits FP32 split partials to a two-wave merge when splitting. The
-Q MFMA fragments stay in registers across the tile loop. The maximum
-static LDS allocation is about 43 KiB, below gfx942's 64 KiB.
+before sharing page/off/live through LDS. The tile loop gathers paged K then V; gfx942 aliases those tiles so
+BLOCK_N=64 stays under 64 KiB, while gfx950 keeps separate K and V
+buffers (~75 KiB prefill). QK is gfx950 K32 / gfx942 K16 and PV is
+K16. Online softmax stays in log2 space. Split partials are FP32 and
+merge on two waves. Q MFMA fragments stay in registers. The old split
+and merge kernels are no longer callable.
 The old split and merge kernels are no longer callable.
 
 GPU 6 / gfx950 / ``FLYDSL_RUNTIME_ENABLE_CACHE=0``: all 18 QSA pytest
@@ -628,12 +628,13 @@ is ``ns=1`` and is not this dump):
 
 | kernel | ds_write b128/b32/b16 | ds_read b128/b64/b32 | barrier | MFMA | VGPR | LDS B |
 |---|---:|---:|---:|---:|---:|---:|
-| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 | 7 | 6 | 70 | 13184 |
+| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 | 6 | 6 | 79 | 21376 |
 | decode merge `ns64_blk128` | 0 / 2 / 0 | 34 / 0 / 1 | 1 | 0 | 64 | 260 |
-| prefill split `bn64_blk128_ns1` | 36 / 15 / 16 | 18 / 0 / 11 | 7 | 48 | 169 | 43968 |
+| prefill split `bn64_blk128_ns1` | 36 / 17 / 16 | 18 / 0 / 13 | 6 | 48 | 257 | 76736 |
 
 No ``ds_read_b16``. Leftover ``ds_write_b16`` is P/C. Both split
-kernels keep 7 barriers.
+kernels keep 6 barriers. gfx950 dual-KV LDS is 21 KiB decode / 75 KiB
+prefill.
 
 QK B now uses wave ``make_tiled_copy_B`` rather than scalar ``k_lds``
 gathers. Width-2051 ``L=512`` stays 24.0 / 24.1 / 588.6 us (``err=0``);
@@ -669,10 +670,23 @@ phys/page/live LDS.
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in
 `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`
-plus `q_off`/`from_elements` extract and pad-head zeroing. Next:
-gfx950 extra KV LDS to overlap the next K gather with PV (not the old
-90 KiB ping-pong mapping). Do not drop the K/V alias barrier without
-that extra buffer.
+plus `q_off`/`from_elements` extract and pad-head zeroing.
+
+gfx950 now has separate ``[BN, D]`` K and V LDS tiles (gfx942 still
+aliases). The tile schedule is unchanged, so the post-QK barrier still
+publishes C; it is no longer an alias-overwrite wait. GPU 6 / gfx950:
+18 pytest cases, ``err=0``, width-2051 ``L=512`` is 24.4 / 24.1 /
+519.3 us vs 24.3 / 24.1 / 586.7. Prefill is ~11% faster. Occupancy
+ISA: decode split LDS 21376 (was 13184) VGPR 79 (was 69); prefill LDS
+76736 (was 43968) VGPR 257 (was 165); still 6 ``s_barrier``.
+
+**Do not retry** overlapping the next K gather with PV by wrapping the
+first-tile / has-next gathers in runtime ``if is_first`` / ``if
+has_next`` inside the ``scf.for``. The AST rewriter packs ``ThrCopy``
+into the ``scf.if`` state and raises ``ThrCopy.__init__() missing
+thr_idx``. Next is a compile-safe pipeline (prologue K0 plus
+``range(n_tiles-1)`` with no tiled-copy under a dynamic ``if``), not
+the old 90 KiB ping-pong mapping.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.

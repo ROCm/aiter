@@ -506,17 +506,16 @@ dynamic per-tile issue.
 
 | kernel | ds_write b128/b32/b16 | ds_read b128/b64/b32/b16 | barrier | MFMA | VGPR | LDS B |
 |---|---:|---:|---:|---:|---:|---:|
-| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 / 0 | 7 | 6 | 70 | 13184 |
+| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 / 0 | 6 | 6 | 79 | 21376 |
 | decode merge `ns64_blk128` | 0 / 2 / 0 | 34 / 0 / 1 / 0 | 1 | 0 | 64 | 260 |
-| prefill split `bn64_blk128_ns1` | 36 / 15 / 16 | 18 / 0 / 11 / 0 | 7 | 48 | 169 | 43968 |
+| prefill split `bn64_blk128_ns1` | 36 / 17 / 16 | 18 / 0 / 13 / 0 | 6 | 48 | 257 | 76736 |
 
 There are **no** ``ds_read_b16``; QK/PV LDS reads already widen to
 ``b32``/``b64``/``b128``. Remaining ``ds_write_b16`` are P (and some C)
-stores. Both split kernels keep **7 barriers**. Prefill is
-store/MFMA-heavy; decode split is small (70 VGPR, 13 KiB) and the
-64-split merge does 34 ``ds_read_b128`` plus 41 ``global_load``. Next
-target is MMA-native QK/PV copies and fewer stage barriers, not more
-host splits.
+stores. Split kernels keep **6 barriers**. Prefill is store/MFMA-heavy
+with a larger dual-KV LDS footprint; decode split is still small and
+the 64-split merge does 34 ``ds_read_b128``. Next target is a
+compile-safe next-K/PV pipeline, not more host splits.
 
 QK B now loads through wave ``make_tiled_copy_B`` (128-bit on gfx950
 K32, 64-bit on K16) into the MFMA B fragment instead of
@@ -550,9 +549,18 @@ translate barrier. Oracle ``err=0``, but width-2051 ``L=512`` went
 
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` on global Q).
 Compile aborted in `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep
-the 128-bit Q `g_copy` plus `q_off` extract. Next is gfx950 extra KV
-LDS to overlap next-K with PV, not dropping the alias barrier without
-that buffer.
+the 128-bit Q `g_copy` plus `q_off` extract.
+
+gfx950 keeps separate K and V ``[BN, D]`` LDS tiles (gfx942 still
+aliases). Same tile order; the post-QK barrier still publishes C.
+GPU 6 / gfx950: 18 pytest cases, ``err=0``, width-2051 ``L=512`` is
+24.4 / 24.1 / 519.3 us vs 24.3 / 24.1 / 586.7 (~11% prefill). Decode
+split LDS 21376 VGPR 79; prefill LDS 76736 VGPR 257; 6 barriers.
+
+**Do not retry** next-K/PV overlap via runtime ``if is_first`` /
+``if has_next`` around tiled copies in the tile ``scf.for``
+(``ThrCopy`` cannot be an ``scf.if`` result). Next is a compile-safe
+prologue plus ``range(n_tiles-1)``, not the old 90 KiB ping-pong.
 
 
 
