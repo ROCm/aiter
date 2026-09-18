@@ -977,7 +977,12 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
+        && gqa_ratio == 96){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 96;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
