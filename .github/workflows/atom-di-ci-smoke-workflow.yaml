@@ -36,7 +36,7 @@ on:
         type: string
         default: "/data/models2/MiniMax-M3-MXFP8"
       run_minimax_m3_fp8_2p1d_tp8:
-        description: "Run MiniMax-M3-MXFP8 2P+1D TP8 and DPA-TP8 ATOMesh nightly cases"
+        description: "Run MiniMax-M3-MXFP8 2P+1D TP8, DPA-TP8, and DPA-TP8-EAGLE3 ATOMesh nightly cases"
         required: false
         default: false
         type: boolean
@@ -459,6 +459,7 @@ jobs:
               for case, topology in (
                   ("minimax-m3-fp8-2p1d-tp8", "2p1d"),
                   ("minimax-m3-fp8-2p1d-dpa-tp8", "2p1d_dpa"),
+                  ("minimax-m3-fp8-2p1d-dpa-tp8-eagle3", "2p1d_dpa_eagle3"),
               ):
                   requested.append(
                       {
