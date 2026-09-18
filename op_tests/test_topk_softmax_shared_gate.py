@@ -7,13 +7,14 @@
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.moe_op import topk_softmax
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
 
@@ -35,8 +36,10 @@ def run_torch(gating, hidden, gate_weight, topk, num_shared, base, scale, renorm
     shared_w = torch.sigmoid(shared_logit) * scale
     m = gating.shape[0]
     shared_i = (
-        base + torch.arange(num_shared, device=gating.device, dtype=torch.int32)
-    ).unsqueeze(0).expand(m, num_shared)
+        (base + torch.arange(num_shared, device=gating.device, dtype=torch.int32))
+        .unsqueeze(0)
+        .expand(m, num_shared)
+    )
     return routed_w, routed_i.to(torch.int32), shared_w, shared_i
 
 
@@ -79,22 +82,34 @@ def test_op(tokens, num_experts, hidden, topk, num_shared, scale, renorm, dtype)
 
     # Shared columns are the new Option A logic -- ids exact, weights within tol.
     checkAllclose(
-        got_si.to(dtypes.fp32), ref_si.to(dtypes.fp32), rtol=0, atol=0,
+        got_si.to(dtypes.fp32),
+        ref_si.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
         msg="shared ids",
     )
     err = checkAllclose(
-        got_sw.to(dtypes.fp32), ref_sw.to(dtypes.fp32), rtol=2e-2, atol=2e-2,
+        got_sw.to(dtypes.fp32),
+        ref_sw.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
         msg="shared weights",
     )
     # Routed columns: compare as sets per row (kernel/topk order may differ).
     ref_ids, ref_w = sorted_pairs(ref_ri, ref_rw)
     got_ids, got_w = sorted_pairs(got_ri.to(dtypes.i32), got_rw)
     checkAllclose(
-        got_ids.to(dtypes.fp32), ref_ids.to(dtypes.fp32), rtol=0, atol=0,
+        got_ids.to(dtypes.fp32),
+        ref_ids.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
         msg="routed ids",
     )
     checkAllclose(
-        got_w.to(dtypes.fp32), ref_w.to(dtypes.fp32), rtol=2e-2, atol=2e-2,
+        got_w.to(dtypes.fp32),
+        ref_w.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
         msg="routed weights",
     )
 
@@ -128,7 +143,9 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
     )
-    parser.add_argument("-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default="bf16,")
+    parser.add_argument(
+        "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default="bf16,"
+    )
     parser.add_argument("-t", "--tokens", type=int, nargs="*", default=[1, 4, 17, 64])
     parser.add_argument("-e", "--experts", type=int, nargs="*", default=[512])
     parser.add_argument("--hidden", type=int, nargs="*", default=[4096])
@@ -140,14 +157,33 @@ def main():
 
     for dtype in args.dtype:
         df = []
-        for tokens, experts, hidden, topk, num_shared, scale, renorm in itertools.product(
-            args.tokens, args.experts, args.hidden, args.topk,
-            args.num_shared, args.scale, args.renorm,
+        for (
+            tokens,
+            experts,
+            hidden,
+            topk,
+            num_shared,
+            scale,
+            renorm,
+        ) in itertools.product(
+            args.tokens,
+            args.experts,
+            args.hidden,
+            args.topk,
+            args.num_shared,
+            args.scale,
+            args.renorm,
         ):
             df.append(
                 test_op(
-                    tokens, experts, hidden, topk, num_shared,
-                    scale, bool(renorm), dtype,
+                    tokens,
+                    experts,
+                    hidden,
+                    topk,
+                    num_shared,
+                    scale,
+                    bool(renorm),
+                    dtype,
                 )
             )
         df = pd.DataFrame(df)

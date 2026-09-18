@@ -4,8 +4,6 @@
 import functools
 
 import torch
-from typing import Optional
-
 from torch import Tensor
 
 from ..jit.core import AITER_CSRC_DIR, compile_ops
@@ -25,8 +23,8 @@ def _topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
-    hidden_states: Optional[Tensor] = None,
-    gate_weight: Optional[Tensor] = None,
+    hidden_states: Tensor | None = None,
+    gate_weight: Tensor | None = None,
     shared_expert_scale: float = 1.0,
     shared_expert_base: int = -1,
 ) -> None: ...
@@ -40,8 +38,8 @@ def topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
-    hidden_states: Optional[Tensor] = None,
-    gate_weight: Optional[Tensor] = None,
+    hidden_states: Tensor | None = None,
+    gate_weight: Tensor | None = None,
     shared_expert_scale: float = 1.0,
     shared_expert_base: int = -1,
 ) -> None:
