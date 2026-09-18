@@ -52,6 +52,7 @@ from flydsl.expr import (
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.act import sigmoid_batch, sigmoid_f32
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
     kernel_signature,
@@ -145,6 +146,10 @@ def build_topk_per_row_small_k_module(
     tie_low: bool = False,
     forced_blocks: bool = True,
     prefetch_vecs: int = _PREFETCH_VECS,
+    score_mode: str = "identity",
+    bias_bf16: bool = False,
+    write_values: bool = False,
+    fixed_row_len: int = 0,
 ):
     """Compile the selector for one (k, row-width bound) pair.
 
@@ -160,11 +165,23 @@ def build_topk_per_row_small_k_module(
     is the whole cost at a wide row -- its marginal rate is 3.4 TB/s against the
     5.7-5.8 the other two selectors reach.
 
+    `score_mode="sigmoid_bias"` selects on ``sigmoid(scores) + bias`` while
+    `write_values` emits the unbiased sigmoid values needed by HERD. The bias
+    dtype flag keeps FP32 and BF16 launchers in separate JIT caches.
+
     `block_threads` defaults to the narrowest block that covers the row in one
     round of 128-bit loads, capped at `_BLOCK_THREADS` -- or `_WIDE_BLOCK_THREADS`
     once the survivor buffer is what caps occupancy. A wide block over a short
     row buys nothing and pays the cross-wave barriers.
     """
+    if score_mode not in ("identity", "sigmoid_bias"):
+        raise ValueError(f"unsupported score_mode={score_mode!r}")
+    if score_mode != "identity" and forced_blocks:
+        raise ValueError("scored Top-K does not support forced blocks")
+    if fixed_row_len < 0 or fixed_row_len > n_max:
+        raise ValueError(f"fixed_row_len must be in [0, {n_max}], got {fixed_row_len}")
+    if bias_bf16 and score_mode != "sigmoid_bias":
+        raise ValueError("BF16 bias specialization requires sigmoid_bias scoring")
     if wave_size != 64:
         # The chunk selection is a single i64 ballot over the lanes, so a
         # wave32 target would need a different mask width throughout.
@@ -210,6 +227,10 @@ def build_topk_per_row_small_k_module(
             tlow=tie_low,
             pins=forced_blocks,
             pf=min(prefetch_vecs, vec_per_thread),
+            sm=score_mode,
+            bb=bias_bf16,
+            wv=write_values,
+            fr=fixed_row_len,
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -217,6 +238,8 @@ def build_topk_per_row_small_k_module(
         scores: fx.Tensor,
         row_lens: fx.Tensor,
         indices: fx.Tensor,
+        values_out: fx.Tensor,
+        bias: fx.Tensor,
         init_blocks: fx.Int32,
         local_blocks: fx.Int32,
     ):
@@ -235,7 +258,7 @@ def build_topk_per_row_small_k_module(
         surv_col = storage.surv_col.peek().view(fx.make_layout(survivors, 1))
         state = storage.state.peek().view(fx.make_layout(_ST_SLOTS, 1))
 
-        row_len = row_lens[row]
+        row_len = Int32(fixed_row_len) if fixed_row_len else row_lens[row]
         local_start = fx.max(zero, row_len - local_blocks) if forced_blocks else zero
         # Slice the row first, then build the descriptor over it. Built over the
         # whole tensor and sliced afterwards, `num_records` is a 32-bit BYTE
@@ -248,6 +271,8 @@ def build_topk_per_row_small_k_module(
             fx.make_layout(_VEC, 1),
         )
         row_indices = fx.slice(indices, (row, None))
+        row_values = fx.slice(values_out, (row, None))
+        score_scalar_row = fx.slice(scores, (row, None))
 
         # --- 1. The row into registers, and this thread's partial maximum. ---
         # Thread t takes vectors t, t + block_threads, ...: consecutive lanes
@@ -292,12 +317,18 @@ def build_topk_per_row_small_k_module(
             for u in range_constexpr(width):
                 v = base * group + u
                 loaded = fx.Vector(fx.memref_load_vec(fragments[u]))
+                if const_expr(score_mode == "sigmoid_bias"):
+                    unbiased = sigmoid_batch(
+                        [Float32(loaded[j]) for j in range_constexpr(_VEC)]
+                    )
                 for j in range_constexpr(_VEC):
                     col = col_of(v, j)
                     # `col < row_len` alone: a column past this thread's vectors
                     # is at least `n_max`, which already bounds `row_len`.
                     live = col < row_len
                     value = loaded[j]
+                    if const_expr(score_mode == "sigmoid_bias"):
+                        value = unbiased[j] + Float32(bias[col])
                     if const_expr(forced_blocks):
                         value = (live & (col < init_blocks)).select(
                             Float32(_INIT_PIN), value
@@ -409,11 +440,43 @@ def build_topk_per_row_small_k_module(
                 place = place + ahead.select(one, zero)
             if place < top_k:
                 row_indices[place] = my_col
+                if const_expr(write_values):
+                    raw = Float32(score_scalar_row[my_col])
+                    if const_expr(score_mode == "sigmoid_bias"):
+                        raw = sigmoid_f32(raw)
+                    row_values[place] = raw
 
         # Rows with fewer than k real elements leave the tail unwritten.
         real = fx.min(top_k, row_len)
         if (tid >= real) & (tid < top_k):
             row_indices[tid] = Int32(-1)
+
+    if score_mode != "identity" or write_values:
+
+        @flyc.jit
+        def launch_scored_topk(
+            scores: fx.Tensor,
+            indices: fx.Tensor,
+            values_out: fx.Tensor,
+            bias: fx.Tensor,
+            rows: fx.Int32,
+            stream: fx.Stream,
+        ):
+            topk_per_row_small_k_kernel(
+                scores,
+                indices,
+                indices,
+                values_out,
+                bias,
+                Int32(0),
+                Int32(0),
+            ).launch(
+                grid=(rows, 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
+
+        return launch_scored_topk
 
     @flyc.jit
     def launch_topk_per_row_small_k(
@@ -426,7 +489,13 @@ def build_topk_per_row_small_k_module(
         stream: fx.Stream,
     ):
         topk_per_row_small_k_kernel(
-            scores, row_lens, indices, init_blocks, local_blocks
+            scores,
+            row_lens,
+            indices,
+            scores,
+            scores,
+            init_blocks,
+            local_blocks,
         ).launch(
             grid=(rows, 1, 1),
             block=(block_threads, 1, 1),

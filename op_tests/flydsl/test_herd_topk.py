@@ -332,3 +332,87 @@ def test_sigmoid_herd_grouped_topk_dispatch_reduces_active_experts(
     if total_topk != topk:
         assert torch.all(ids[:, topk] == experts)
         assert torch.all(weights[:, topk] == 1.0)
+
+
+def test_sigmoid_herd_bf16_bias_and_strided_outputs():
+    _skip_if_unsupported()
+    torch.manual_seed(6)
+    for experts, topk, route_scale, token_counts in (
+        (896, 16, 1.0, (16, 64)),
+        (128, 4, 2.0, (96, 16, 128)),
+    ):
+        # K3's FlyDSL selector and M3's native selector must both accept BF16
+        # correction bias. Alternating sizes also exercises K3 scratch reuse.
+        bias = (torch.randn(experts, dtype=torch.float32, device="cuda") * 0.1).to(
+            torch.bfloat16
+        )
+        for tokens in token_counts:
+            logits = torch.randn((tokens, experts), dtype=torch.float32, device="cuda")
+            ref_weights, ref_ids = _triton_herd(
+                logits, bias.float(), topk, "sigmoid", True, route_scale
+            )
+            # The extra output column models MiniMax's shared-expert slot and
+            # checks that row-strided outputs do not overlap.
+            weights = torch.full(
+                (tokens, topk + 1), -1.0, dtype=torch.float32, device="cuda"
+            )
+            ids = torch.full((tokens, topk + 1), -1, dtype=torch.int32, device="cuda")
+
+            herd_topk_gating(
+                weights[:, :topk],
+                ids[:, :topk],
+                logits,
+                bias,
+                True,
+                route_scale,
+                "sigmoid",
+            )
+
+            assert torch.equal(ids[:, :topk], ref_ids.to(torch.int32))
+            torch.testing.assert_close(
+                weights[:, :topk], ref_weights.float(), atol=2e-6, rtol=2e-6
+            )
+            assert torch.all(ids[:, topk] == -1)
+            assert torch.all(weights[:, topk] == -1.0)
+
+
+@pytest.mark.parametrize(
+    "tokens,experts,topk,route_scale",
+    [(64, 896, 16, 1.0), (64, 128, 4, 2.0)],
+    ids=["kimi_k3", "minimax_m3"],
+)
+def test_sigmoid_herd_cudagraph_replay(tokens, experts, topk, route_scale):
+    _skip_if_unsupported()
+    torch.manual_seed(7)
+    logits = torch.randn((tokens, experts), dtype=torch.float32, device="cuda")
+    bias = torch.randn(experts, dtype=torch.float32, device="cuda") * 0.1
+    weights = torch.empty((tokens, topk), dtype=torch.float32, device="cuda")
+    ids = torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
+
+    def run():
+        herd_topk_gating(weights, ids, logits, bias, True, route_scale, "sigmoid")
+
+    # Compile the launchers before capture.
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        run()
+
+    for seed in (8, 9, 10):
+        torch.manual_seed(seed)
+        logits.copy_(torch.randn_like(logits))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref_weights, ref_ids = _triton_herd(
+            logits, bias, topk, "sigmoid", True, route_scale
+        )
+        assert torch.equal(ids, ref_ids.to(torch.int32))
+        torch.testing.assert_close(weights, ref_weights.float(), atol=2e-6, rtol=2e-6)

@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""HERD routing orchestration around native Top-(K+1) selection."""
+"""HERD routing orchestration with optimized candidate selection."""
+
+from functools import cache
 
 import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
 from .kernels.tensor_shim import _run_compiled, wave_size_of
+from .kernels.topk_per_row_small_k import build_topk_per_row_small_k_module
 
 _DSV4_EXPERTS = 384
 _DSV4_TOPK = 6
@@ -15,6 +18,91 @@ _KIMI_K3_TOPK = 16
 _MINIMAX_M3_EXPERTS = 128
 _MINIMAX_M3_TOPK = 4
 _HERD_MAX_TOKENS = 128
+_DEFAULT_FINALIZE_THREADS = 256
+_K3_CANDIDATE_THREADS = 256
+_K3_FINALIZE_THREADS = 1024
+
+
+@cache
+def _get_k3_candidate_workspace(
+    device: torch.device,
+    stream_id: int,
+    kp1: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep graph-stable K3 candidate scratch isolated by device and stream."""
+    del stream_id
+    return (
+        torch.empty((_HERD_MAX_TOKENS, kp1), dtype=torch.int32, device=device),
+        torch.empty((_HERD_MAX_TOKENS, kp1), dtype=torch.float32, device=device),
+    )
+
+
+def _run_sigmoid_candidate(
+    packed_gating: torch.Tensor,
+    correction_bias: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    candidate_values: torch.Tensor,
+    rows: int,
+    experts: int,
+    kp1: int,
+    block_threads: int,
+    stream: torch.cuda.Stream,
+) -> None:
+    candidate_launch = build_topk_per_row_small_k_module(
+        kp1,
+        experts,
+        wave_size_of(packed_gating.device.index),
+        block_threads=block_threads,
+        forced_blocks=False,
+        score_mode="sigmoid_bias",
+        bias_bf16=correction_bias.dtype == torch.bfloat16,
+        write_values=True,
+        fixed_row_len=experts,
+    )
+    _run_compiled(
+        candidate_launch,
+        packed_gating,
+        candidate_ids,
+        candidate_values,
+        correction_bias,
+        rows,
+        stream,
+    )
+
+
+def _run_finalize(
+    candidate_ids: torch.Tensor,
+    candidate_values: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    rows: int,
+    experts: int,
+    topk: int,
+    need_renorm: bool,
+    routed_scaling_factor: float,
+    round_to_bf16: bool,
+    block_threads: int,
+    stream: torch.cuda.Stream,
+) -> None:
+    finalize_launch = build_herd_finalize_module(
+        topk,
+        experts,
+        bool(need_renorm),
+        round_to_bf16,
+        block_threads=block_threads,
+    )
+    _run_compiled(
+        finalize_launch,
+        candidate_ids,
+        candidate_values,
+        topk_weights,
+        topk_ids,
+        int(topk_weights.stride(0)),
+        int(topk_ids.stride(0)),
+        rows,
+        float(routed_scaling_factor),
+        stream,
+    )
 
 
 def _profile(score_func: str, experts: int, topk: int) -> str | None:
@@ -142,12 +230,47 @@ def herd_topk_gating(
         gating_output if gating_output.is_contiguous() else gating_output.contiguous()
     )
     kp1 = topk + 1
+    if profile == "kimi_k3":
+        # K3's wide row benefits from the FlyDSL sigmoid selector, but folding
+        # finalization into the last candidate block serializes too much work.
+        # A separately tuned wide finalize block is faster across M=16..128.
+        candidate_ids, candidate_values = _get_k3_candidate_workspace(
+            device,
+            stream.cuda_stream,
+            kp1,
+        )
+        _run_sigmoid_candidate(
+            packed_gating,
+            correction_bias,
+            candidate_ids,
+            candidate_values,
+            rows,
+            experts,
+            kp1,
+            _K3_CANDIDATE_THREADS,
+            stream,
+        )
+        _run_finalize(
+            candidate_ids,
+            candidate_values,
+            topk_weights,
+            topk_ids,
+            rows,
+            experts,
+            topk,
+            need_renorm,
+            routed_scaling_factor,
+            False,
+            _K3_FINALIZE_THREADS,
+            stream,
+        )
+        return
+
     candidate_ids = torch.empty((rows, kp1), dtype=torch.int32, device=device)
     candidate_values = torch.empty((rows, kp1), dtype=torch.float32, device=device)
-
     if profile == "dsv4":
-        # The dedicated selector reproduces Triton's BF16 score/bias rounding
-        # and tie ordering exactly for DeepSeek-V4.
+        # This dedicated selector reproduces Triton's BF16 score/bias rounding
+        # and tie ordering exactly.
         from ..topk import topk_gating_herd_candidates_fwd
 
         topk_gating_herd_candidates_fwd(
@@ -157,8 +280,7 @@ def herd_topk_gating(
             correction_bias,
         )
     else:
-        # Kimi-K3 and MiniMax-M3 expose FP32 sigmoid router logits. Reuse the
-        # native generic selector for Top-(K+1).
+        # M3's narrow row is fastest through the native HIP candidate selector.
         from ..topk import topk_gating_fwd
 
         topk_gating_fwd(
@@ -171,20 +293,22 @@ def herd_topk_gating(
             score_func,
         )
 
-    finalize_launch = build_herd_finalize_module(
-        topk,
-        experts,
-        bool(need_renorm),
-        profile == "dsv4",
-    )
-
-    _run_compiled(
-        finalize_launch,
+    finalize_threads = _DEFAULT_FINALIZE_THREADS
+    if profile == "minimax_m3" and (rows <= 16 or rows > 64):
+        # HIP Graph sweeps favor a wider finalizer at the ends of M3's token
+        # window; M=32/64 remain faster with the lower synchronization cost.
+        finalize_threads = 512
+    _run_finalize(
         candidate_ids,
         candidate_values,
         topk_weights,
         topk_ids,
         rows,
-        float(routed_scaling_factor),
+        experts,
+        topk,
+        need_renorm,
+        routed_scaling_factor,
+        profile == "dsv4",
+        finalize_threads,
         stream,
     )

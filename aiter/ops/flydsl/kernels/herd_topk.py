@@ -10,6 +10,7 @@ import flydsl.expr as fx
 from flydsl.expr import Float32, Int32, const_expr, gpu, range_constexpr
 
 from aiter.ops.flydsl.kernels.kernels_common import atomic_add_i32, kernel_signature
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 
 _FINALIZE_THREADS = 256
 
@@ -20,12 +21,15 @@ def build_herd_finalize_module(
     num_experts: int,
     renormalize: bool,
     round_to_bf16: bool,
+    block_threads: int = _FINALIZE_THREADS,
 ):
     """Build the fused popularity, min-unique, and Top-K output launcher."""
     if topk < 1 or topk + 1 > num_experts:
         raise ValueError(
             f"invalid HERD geometry: topk={topk}, num_experts={num_experts}"
         )
+    if block_threads not in (64, 128, 256, 512, 1024):
+        raise ValueError(f"unsupported HERD block size {block_threads}")
     kp1 = topk + 1
 
     @fx.struct
@@ -39,27 +43,32 @@ def build_herd_finalize_module(
             e=num_experts,
             rn=renormalize,
             rb=round_to_bf16,
+            blk=block_threads,
         ),
-        known_block_size=[_FINALIZE_THREADS, 1, 1],
+        known_block_size=[block_threads, 1, 1],
     )
     def finalize_kernel(
         candidate_ids: fx.Tensor,
         candidate_values: fx.Tensor,
         topk_weights: fx.Tensor,
         topk_ids: fx.Tensor,
+        topk_weights_stride: Int32,
+        topk_ids_stride: Int32,
         rows: Int32,
         routed_scaling_factor: Float32,
     ):
         tid = fx.thread_idx.x
         storage = fx.SharedAllocator().allocate(SharedStorage)
         popularity = storage.popularity.peek().view(fx.make_layout(num_experts, 1))
+        topk_weights_flat = ptr_buf_tensor(topk_weights, elem=Float32)
+        topk_ids_flat = ptr_buf_tensor(topk_ids, elem=Int32)
 
-        for expert in range(tid, Int32(num_experts), Int32(_FINALIZE_THREADS)):
+        for expert in range(tid, Int32(num_experts), Int32(block_threads)):
             popularity[expert] = Int32(0)
         gpu.barrier()
 
         total = rows * Int32(kp1)
-        for idx in range(tid, total, Int32(_FINALIZE_THREADS)):
+        for idx in range(tid, total, Int32(block_threads)):
             candidate_row = idx // Int32(kp1)
             candidate_col = idx - candidate_row * Int32(kp1)
             expert = candidate_ids[candidate_row, candidate_col]
@@ -107,8 +116,8 @@ def build_herd_finalize_module(
                     weight = values[j] * scale
                     if const_expr(round_to_bf16):
                         weight = weight.to(fx.BFloat16).to(Float32)
-                    topk_ids[row, rank] = ids[j]
-                    topk_weights[row, rank] = weight
+                    topk_ids_flat[row * topk_ids_stride + rank] = ids[j]
+                    topk_weights_flat[row * topk_weights_stride + rank] = weight
 
     @flyc.jit
     def launch_finalize(
@@ -116,6 +125,8 @@ def build_herd_finalize_module(
         candidate_values: fx.Tensor,
         topk_weights: fx.Tensor,
         topk_ids: fx.Tensor,
+        topk_weights_stride: fx.Int32,
+        topk_ids_stride: fx.Int32,
         rows: Int32,
         routed_scaling_factor: Float32,
         stream: fx.Stream,
@@ -125,11 +136,13 @@ def build_herd_finalize_module(
             candidate_values,
             topk_weights,
             topk_ids,
+            topk_weights_stride,
+            topk_ids_stride,
             rows,
             routed_scaling_factor,
         ).launch(
             grid=(1, 1, 1),
-            block=(_FINALIZE_THREADS, 1, 1),
+            block=(block_threads, 1, 1),
             stream=stream,
         )
 
