@@ -9,9 +9,9 @@ compressed K. Rows up to 512 blocks use fused emit; longer rows use tiled
 BLOCK_N=32 BF16 MFMA scoring plus decode radix below 32768 columns and
 streaming radix at or above that width. Single-request prefill scores 16
 query rows per workgroup.
-Phase 2e/2f: family B FlyDSL K1 ``H`` 4 or 8 emit. Phase 2g: same kernel
-streams 512-slot tiles for long ``L``. Phase 2h: emit vs #4882 plus the
-published indexer point.
+Phase 2e/2f: family B FlyDSL K1 ``H`` 4 or 8 emit. Long rows reuse family
+A's MFMA scorer plus radix (``H=8`` is a second compile). Phase 2h: emit
+vs #4882 plus the published indexer point.
 Phase 3a: family A FlyDSL K2 decode sparse GQA (group 12, ``D=256``).
 Phase 3b: same ABI with split-K plus LSE merge for decode occupancy.
 Phase 3d: the live-AMD-shaped replacement uses separate BLOCK_N=16/four-wave
