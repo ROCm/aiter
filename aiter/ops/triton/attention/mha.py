@@ -67,6 +67,20 @@ def _resolve_backend(
     return backend
 
 
+def _maybe_csv_tile_config(
+    backend: Literal["triton", "gluon"], **key_args
+) -> dict | None:
+    """Exact-key CSV tiles for this backend, or None for the JSON feature default."""
+
+    from aiter.ops.mha import lookup_mha_fwd_tile_config
+
+    if "sink" in key_args and "sink_ptr" not in key_args:
+        key_args["sink_ptr"] = key_args.pop("sink")
+    else:
+        key_args.pop("sink", None)
+    return lookup_mha_fwd_tile_config(backend, **key_args)
+
+
 def mha_set_use_fused_bwd_kernel(value: bool):
     """
     Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
@@ -961,6 +975,26 @@ def flash_attn_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     backend = _resolve_backend(backend)
+    if config is None:
+        config = _maybe_csv_tile_config(
+            backend,
+            mode="batch",
+            q=q,
+            k=k,
+            v=v,
+            batch=q.shape[0],
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            causal=causal,
+            window_size=window_size,
+            dropout_p=dropout_p,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            q_descale=q_descale,
+        )
     _LOGGER.info(
         f"FLASH_ATTN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
@@ -1312,6 +1346,27 @@ def flash_attn_varlen_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     backend = _resolve_backend(backend)
+    if config is None:
+        config = _maybe_csv_tile_config(
+            backend,
+            mode="varlen",
+            q=q,
+            k=k,
+            v=v,
+            batch=cu_seqlens_q.numel() - 1,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=causal,
+            window_size=window_size,
+            dropout_p=dropout_p,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            block_table=block_table,
+            q_descale=q_descale,
+        )
     _LOGGER.info(
         f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )

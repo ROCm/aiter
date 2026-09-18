@@ -31,15 +31,12 @@ from .mha_fwd_policy import (
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdPlan,
     MhaFwdProblem,
+    canonical_backend_config,
     csv_scalar,
     parse_backend_config,
 )
 
-_MHA_FWD_RECORDED_SELECTIONS: set[tuple[str, int]] = set()
-
-
-def _mha_csv_scalar(value: Any) -> str:
-    return csv_scalar(value)
+_MHA_FWD_RECORDED_SELECTIONS: set[tuple[str, int, str]] = set()
 
 
 @functools.lru_cache(maxsize=8)
@@ -153,7 +150,7 @@ def _mha_fwd_tuning_key(
         "is_grad": torch.is_grad_enabled()
         and any(t.requires_grad for t in (q, k, v)),
     }
-    return tuple(_mha_csv_scalar(values[field]) for field in MHA_FWD_TUNING_KEY_FIELDS)
+    return tuple(csv_scalar(values[field]) for field in MHA_FWD_TUNING_KEY_FIELDS)
 
 
 @torch._dynamo.assume_constant_result
@@ -163,13 +160,53 @@ def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     return _load_mha_fwd_tuning_table(os.path.abspath(path)).get(key)
 
 
-def _record_mha_fwd_selection(backend: str, num_splits: int = 0) -> None:
+def lookup_mha_fwd_tile_config(backend: str, **key_args) -> dict[str, Any] | None:
+    """Return CSV tiles when the exact row's backend matches, else None."""
+
+    window_size = key_args.get("window_size", (-1, -1))
+    padded = tuple(window_size) if window_size is not None else (-1, -1)
+    if len(padded) < 3:
+        padded = (*padded, 0)
+    plan = _get_mha_fwd_tuned_plan(
+        **{
+            "min_seqlen_q": 0,
+            "logits_soft_cap": 0.0,
+            "how_v3_bf16_cvt": 1,
+            "return_lse": False,
+            "return_attn_probs": False,
+            "bias": None,
+            "alibi_slopes": None,
+            "sink_ptr": None,
+            "block_table": None,
+            "q_descale": None,
+            "cu_seqlens_q_padded": None,
+            "cu_seqlens_k_padded": None,
+            **key_args,
+            "window_size": padded,
+        }
+    )
+    if plan is None or plan.get("backend") != backend:
+        return None
+    config = plan.get("backend_config")
+    return dict(config) if isinstance(config, dict) else None
+
+
+def _record_mha_fwd_selection(
+    backend: str,
+    num_splits: int = 0,
+    backend_config: Any = None,
+) -> None:
     """Append the actual public-path selection when a proof file is requested."""
 
     path = os.getenv("AITER_MHA_FWD_SELECTION_PROOF_FILE", "").strip()
     if not path:
         return
-    identity = (backend, int(num_splits))
+    config_json = (
+        backend_config
+        if isinstance(backend_config, str)
+        else canonical_backend_config(backend_config)
+    )
+    identity = (backend, int(num_splits), config_json)
     if identity in _MHA_FWD_RECORDED_SELECTIONS:
         return
     _MHA_FWD_RECORDED_SELECTIONS.add(identity)
@@ -177,6 +214,7 @@ def _record_mha_fwd_selection(backend: str, num_splits: int = 0) -> None:
         {
             "backend": backend,
             "num_splits": int(num_splits),
+            "backend_config": config_json,
             "pid": os.getpid(),
         },
         sort_keys=True,
@@ -184,7 +222,7 @@ def _record_mha_fwd_selection(backend: str, num_splits: int = 0) -> None:
     )
     descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        os.write(descriptor, f"{payload}\n".encode("utf-8"))
+        os.write(descriptor, f"{payload}\n".encode())
     finally:
         os.close(descriptor)
 
@@ -4153,7 +4191,7 @@ def flash_attn_varlen_func(
             config=parse_backend_config(backend_config),
             backend=triton_backend,
         )
-        _record_mha_fwd_selection(triton_backend)
+        _record_mha_fwd_selection(triton_backend, 0, backend_config)
         return result
     return FlashAttnVarlenFunc.apply(
         q,
