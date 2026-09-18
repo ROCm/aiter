@@ -140,7 +140,8 @@ def indexer_k_fp4_paged_preshuffle(k, slot_mapping, kv_cache, kv_scale, kv_block
     phys = sm // kv_block_size
     boff = sm % kv_block_size
     kv_cache[phys, :, :, boff, :] = packed
-    sflat = (boff % 16) * KVS_NTPW + (boff // 16)
+    scale_group_size = kv_block_size // KVS_NTPW
+    sflat = (boff % scale_group_size) * KVS_NTPW + boff // scale_group_size
     kv_scale[phys, :, :, sflat] = e8m0
     return kv_cache, kv_scale
 
@@ -800,6 +801,13 @@ def main():
     run_case(3, [[30], [200], [100, 150]], seed=2)
     run_case(2, [[16, 200], [64, 128]], heads=128, seed=3)
     run_case(2, [[(10, 50), (64, 200)], [(0, 100), (130, 256)]], seed=4)
+    run_case(
+        2,
+        [[50, 120, 200], [40, 100]],
+        kv_block_size=128,
+        block_k=256,
+        seed=5,
+    )
 
     if args.bench:
         kvb = 64

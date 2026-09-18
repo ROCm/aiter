@@ -453,7 +453,7 @@ def build_pa_mqa_logits_fp4_module(
 
         def _prefetch_chunk(c_i32_arg, phys_list):
             assert N_TILES_PER_WARP == 4, "packed kvs assumes NTPW=4"
-            assert N_PHYS == 1, "packed kvs assumes N_PHYS=1 (NTPW nts share one phys)"
+            assert N_PHYS == 1, "packed kvs assumes one physical page per warp"
 
             kv_list = []
             kvs_packed_list = []
@@ -472,15 +472,24 @@ def build_pa_mqa_logits_fp4_module(
                 width=1,
                 byte_offset=phys_shared * fx.Int64(_stride_kvs_block),
             )
+            # Scales are interleaved in four equal token groups. A 64-row page
+            # puts this warp's four nt scales in one dword; a 128-row page puts
+            # them across two dwords, so extract and repack the bytes.
+            scale_group = kv_block_size // 4
+            warp_token_base = (warp_id * fx.Int32(64)) % kv_block_size
             for k_tile in range_constexpr(k_tiles):
-                kvs_packed_off_bytes = (
-                    fx.Int32(k_tile * _stride_kvs_ktile)
-                    + lane_div_16 * kv_block_size
-                    + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
-                )
-                # 1 dword/thread; byte offset -> i32 element offset (÷4).
-                kvs_packed = kvs_bt[kvs_packed_off_bytes // 4]
-                kvs_packed_list.append(kvs_packed)
+                packed = fx.Int32(0)
+                for nt in range_constexpr(N_TILES_PER_WARP):
+                    token = warp_token_base + fx.Int32(nt * MFMA_N) + lane_mod_16
+                    word_off_bytes = (
+                        fx.Int32(k_tile * _stride_kvs_ktile)
+                        + lane_div_16 * kv_block_size
+                        + (token % scale_group) * fx.Int32(4)
+                    )
+                    word = kvs_bt[word_off_bytes // 4]
+                    scale = (fx.Int32(word) >> ((token // scale_group) * 8)) & 0xFF
+                    packed = packed | (scale << fx.Int32(nt * 8))
+                kvs_packed_list.append(packed)
 
             # ---- KV loads (unchanged): 1 dwordx4 per (nt, k_tile) ----
             for nt in range_constexpr(N_TILES_PER_WARP):
@@ -776,9 +785,10 @@ def flydsl_pa_mqa_logits_fp4(
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]
-    if kv_block_size != 64 or block_k != 256:
+    if kv_block_size not in (64, 128) or block_k != 256:
         raise ValueError(
-            "FP4 packed-scale kernels require kv_block_size=64, block_k=256"
+            "FP4 packed-scale kernels require kv_block_size=64 or 128 and "
+            "block_k=256"
         )
     if q_next_n != next_n:
         raise ValueError(f"q_fp4 next_n dim ({q_next_n}) != next_n arg ({next_n}).")

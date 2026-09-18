@@ -134,23 +134,22 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
         .contiguous()
         .view(batch * t_blocks, k_tiles, 4, kv_block_size, 16)
     )
-    # KVS_NTPW: nt-bytes packed together for the kernel's packed dword load
-    # (4 ubyte → 1 dword). Per (D=lane_div_16, T=lane_mod_16), bytes for nts
-    # 0..KVS_NTPW-1 are adjacent so one thread dword-loads all 4 nts.
+    # Interleave four equally sized token groups so a warp's four scale bytes
+    # can be reconstructed from one dword per half-page.
     assert kv_block_size % KVS_NTPW == 0
-    kv_e8m0_perm = (
-        kv_e8m0.view(batch, t_blocks, kv_block_size, k_tiles, 4)
-        .permute(0, 1, 3, 4, 2)
-        .contiguous()
-        .view(batch * t_blocks, k_tiles, 4, kv_block_size)
-        # Interleave 4 nts per token group: split [kv_block_size] into
-        # (NTPW=4, T_per_nt), transpose to (T, NTPW) so 4 consecutive bytes
-        # per T cover nts 0..3 → 1 dword load.
-        .view(batch * t_blocks, k_tiles, 4, KVS_NTPW, kv_block_size // KVS_NTPW)
-        .transpose(-1, -2)
-        .contiguous()
-        .view(batch * t_blocks, k_tiles, 4, kv_block_size)
+    scale_group_size = kv_block_size // KVS_NTPW
+    kv_e8m0_perm = torch.empty(
+        batch * t_blocks,
+        k_tiles,
+        4,
+        kv_block_size,
+        dtype=torch.uint8,
+        device=dev,
     )
+    token = torch.arange(kv_block_size, device=dev)
+    sflat = (token % scale_group_size) * KVS_NTPW + token // scale_group_size
+    source = kv_e8m0.view(batch * t_blocks, kv_block_size, k_tiles, 4)
+    kv_e8m0_perm[:, :, :, sflat] = source.permute(0, 2, 3, 1)
 
     phys_flat = block_tables.reshape(-1).long()
     kv_cache = torch.zeros(
@@ -765,6 +764,21 @@ def main():
 
             traceback.print_exc()
             raise
+
+    if args.batch == 0 and args.ctx == 0:
+        test_pa_mqa_logits_fp4_qfp4_kvfp4(
+            batch=2,
+            max_ctx=512,
+            heads=64,
+            kv_block_size=128,
+            block_k=256,
+            num_iters=args.num_iters,
+            num_warmup=args.num_warmup,
+            num_warps=args.num_warps,
+            parallel_unit_num=args.parallel_unit_num,
+            head_dim=args.head_dim,
+            bench=False,
+        )
 
     if _PERF_SUMMARY:
         _print_perf_summary()
