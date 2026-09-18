@@ -9,9 +9,10 @@ softmax is maintained in log2 space.  Host dispatch mirrors live AMD:
 small decode uses BLOCK_N=16 / four waves / split-K, while prefill uses
 BLOCK_N=64 / two waves / one split and writes output directly.
 
-The single-stage LDS allocation aliases K and V storage.  This keeps the
-BLOCK_N=64 specialization below the gfx942 64 KiB LDS limit.  Expand,
-partial RoPE, and the sigmoid output gate remain outside K2.
+gfx942 aliases K and V in one LDS tile so BLOCK_N=64 stays under 64 KiB.
+gfx950 stores K and V separately.  The post-QK barrier still publishes C
+for softmax.  Expand, partial RoPE, and the sigmoid output gate remain
+outside K2.
 """
 
 from functools import lru_cache
@@ -97,17 +98,37 @@ def build_qsa_k2_family_a_module(
     gather_rounds = d_chunks // col_owners
     gather_span = col_owners * vec
 
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[BFloat16, block_n * _D, 16]
-        p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
-        live: fx.Array[Int32, block_n, 16]
-        phys: fx.Array[Int32, block_n, 16]
-        page_off: fx.Array[Int32, block_n, 16]
-        m: fx.Array[Float32, _HEAD_PAD, 16]
-        l: fx.Array[Float32, _HEAD_PAD, 16]
-        alpha: fx.Array[Float32, _HEAD_PAD, 16]
-        c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
+    if use_k32:
+
+        @fx.struct
+        class SharedStorage:
+            k: fx.Array[BFloat16, block_n * _D, 16]
+            v: fx.Array[BFloat16, block_n * _D, 16]
+            p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
+            live: fx.Array[Int32, block_n, 16]
+            phys: fx.Array[Int32, block_n, 16]
+            page_off: fx.Array[Int32, block_n, 16]
+            m: fx.Array[Float32, _HEAD_PAD, 16]
+            l: fx.Array[Float32, _HEAD_PAD, 16]
+            alpha: fx.Array[Float32, _HEAD_PAD, 16]
+            c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
+
+        _k_field, _v_field = "k", "v"
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[BFloat16, block_n * _D, 16]
+            p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
+            live: fx.Array[Int32, block_n, 16]
+            phys: fx.Array[Int32, block_n, 16]
+            page_off: fx.Array[Int32, block_n, 16]
+            m: fx.Array[Float32, _HEAD_PAD, 16]
+            l: fx.Array[Float32, _HEAD_PAD, 16]
+            alpha: fx.Array[Float32, _HEAD_PAD, 16]
+            c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
+
+        _k_field, _v_field = "kv", "kv"
 
     @fx.struct
     class MergeStorage:
@@ -167,8 +188,8 @@ def build_qsa_k2_family_a_module(
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        k_lds = storage.kv.view(fx.make_layout((block_n, _D), (_D, 1)))
-        v_lds = storage.kv.view(fx.make_layout((block_n, _D), (_D, 1)))
+        k_lds = getattr(storage, _k_field).view(fx.make_layout((block_n, _D), (_D, 1)))
+        v_lds = getattr(storage, _v_field).view(fx.make_layout((block_n, _D), (_D, 1)))
         p_lds = storage.p.view(fx.make_layout((_HEAD_PAD, block_n), (block_n, 1)))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
         phys_lds = storage.phys.view(fx.make_layout(block_n, 1))
@@ -337,7 +358,8 @@ def build_qsa_k2_family_a_module(
                     c_lds[ng, wave, lane, i] = acc4[i]
             gpu.barrier()
 
-            # K is dead now; reuse the same LDS allocation for transposed V.
+            # K is dead; V uses a separate LDS tile. The post-QK barrier
+            # still publishes C for softmax.
             v_row = fx.logical_divide(
                 fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
             )
