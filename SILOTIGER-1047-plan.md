@@ -628,8 +628,8 @@ is ``ns=1`` and is not this dump):
 
 | kernel | ds_write b128/b32/b16 | ds_read b128/b64/b32 | barrier | MFMA | VGPR | LDS B |
 |---|---:|---:|---:|---:|---:|---:|
-| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 | 6 | 6 | 79 | 21376 |
-| decode merge `ns64_blk128` | 0 / 2 / 0 | 34 / 0 / 1 | 1 | 0 | 64 | 260 |
+| decode split `bn16_blk256_ns32` | 5 / 15 / 4 | 4 / 1 / 12 | 6 | 6 | 79 | 21376 |
+| decode merge `ns32_blk128` | 0 / 2 / 0 | 8 / 0 / 1 | 1 | 0 | 112 | 260 |
 | prefill split `bn64_blk128_ns1` | 36 / 17 / 16 | 18 / 0 / 13 | 6 | 48 | 257 | 76736 |
 
 No ``ds_read_b16``. Leftover ``ds_write_b16`` is P/C. Both split
@@ -679,6 +679,14 @@ publishes C; it is no longer an alias-overwrite wait. GPU 6 / gfx950:
 519.3 us vs 24.3 / 24.1 / 586.7. Prefill is ~11% faster. Occupancy
 ISA: decode split LDS 21376 (was 13184) VGPR 79 (was 69); prefill LDS
 76736 (was 43968) VGPR 257 (was 165); still 6 ``s_barrier``.
+
+Decode split-K is retuned only for ``M * Hk <= 4``: 32 splits replaces
+64. Width-2051 ``L=512`` ``M=1`` improves from 24.4 to 20.7 us (~15%)
+with ``err=0``; ``M=8`` keeps 32 splits and is flat at 24.0 us, while
+prefill stays 519.5 us. The decode merge drops from 34
+``ds_read_b128`` at 64 splits to 8 at 32. **Do not retry** 16 splits
+for the ``4 < M * Hk < 32`` regime: ``M=8`` regressed to 31.3 us from
+24.1 us.
 
 **Do not retry** overlapping the next K gather with PV. A local
 ``@flyc.jit`` dispatcher, localized page-map LDS views, and explicit

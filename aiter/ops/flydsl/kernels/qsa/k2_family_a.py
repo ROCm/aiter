@@ -50,11 +50,9 @@ def _exp2(x):
 
 
 def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
-    """Return ``(BLOCK_N, threads, splits)`` using live AMD's policy."""
+    """Return ``(BLOCK_N, threads, splits)`` using the tuned AMD-shaped policy."""
     base_programs = rows * _HK
-    if base_programs <= 4:
-        block_n, target_splits, threads = 16, 64, 256
-    elif base_programs < 32:
+    if base_programs <= 4 or base_programs < 32:
         block_n, target_splits, threads = 16, 32, 256
     elif base_programs <= 256:
         block_n, target_splits, threads = 64, 8, 128

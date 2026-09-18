@@ -501,21 +501,20 @@ worse.
 
 Occupancy ISA (``FLYDSL_DUMP_IR``, width 2051). The pytest decode case
 is ``ns=1`` because width is 8; the bench kernel is ``BN=16`` / 256
-threads / 64 splits. Counts are unrolled static instructions, not
+threads / 32 splits for ``M=1``. Counts are unrolled static instructions, not
 dynamic per-tile issue.
 
 | kernel | ds_write b128/b32/b16 | ds_read b128/b64/b32/b16 | barrier | MFMA | VGPR | LDS B |
 |---|---:|---:|---:|---:|---:|---:|
-| decode split `bn16_blk256_ns64` | 5 / 15 / 4 | 4 / 1 / 12 / 0 | 6 | 6 | 79 | 21376 |
-| decode merge `ns64_blk128` | 0 / 2 / 0 | 34 / 0 / 1 / 0 | 1 | 0 | 64 | 260 |
+| decode split `bn16_blk256_ns32` | 5 / 15 / 4 | 4 / 1 / 12 / 0 | 6 | 6 | 79 | 21376 |
+| decode merge `ns32_blk128` | 0 / 2 / 0 | 8 / 0 / 1 / 0 | 1 | 0 | 112 | 260 |
 | prefill split `bn64_blk128_ns1` | 36 / 17 / 16 | 18 / 0 / 13 / 0 | 6 | 48 | 257 | 76736 |
 
 There are **no** ``ds_read_b16``; QK/PV LDS reads already widen to
 ``b32``/``b64``/``b128``. Remaining ``ds_write_b16`` are P (and some C)
 stores. Split kernels keep **6 barriers**. Prefill is store/MFMA-heavy
 with a larger dual-KV LDS footprint; decode split is still small and
-the 64-split merge does 34 ``ds_read_b128``. Next target is a
-compile-safe next-K/PV pipeline, not more host splits.
+the 32-split merge does 8 ``ds_read_b128``.
 
 QK B now loads through wave ``make_tiled_copy_B`` (128-bit on gfx950
 K32, 64-bit on K16) into the MFMA B fragment instead of
@@ -556,6 +555,13 @@ aliases). Same tile order; the post-QK barrier still publishes C.
 GPU 6 / gfx950: 18 pytest cases, ``err=0``, width-2051 ``L=512`` is
 24.4 / 24.1 / 519.3 us vs 24.3 / 24.1 / 586.7 (~11% prefill). Decode
 split LDS 21376 VGPR 79; prefill LDS 76736 VGPR 257; 6 barriers.
+
+For ``M * Hk <= 4``, 32 decode splits replaces 64: width-2051
+``L=512`` ``M=1`` improves from 24.4 to 20.7 us (~15%), ``M=8`` stays
+on 32 splits and is flat at 24.0 us, and prefill stays 519.5 us. The
+32-split merge has 8 ``ds_read_b128`` versus 34 at 64 splits.
+**Do not retry** 16 splits for ``4 < M * Hk < 32``; ``M=8`` regressed
+to 31.3 us from 24.1 us.
 
 **Do not retry** next-K/PV overlap. Retrying with local
 ``@flyc.jit`` dispatch, localized page-map LDS views, and explicit
