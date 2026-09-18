@@ -487,12 +487,15 @@ class MhaFwdTuner(TunerCommon):
             ),
         )
         self.parser.add_argument(
-            "--race-candidates",
+            "--candidate-sample",
             type=int,
             default=None,
             help=(
-                "race only: draw a seeded sample of this many catalogue entries "
-                "instead of the whole catalogue, for cheap end-to-end runs"
+                "draw a seeded sample of this many catalogue entries instead of "
+                "the whole catalogue. Applies to every strategy, because the "
+                "point is to give two strategies the identical field when "
+                "comparing them; the sample is fixed by seed so two runs are "
+                "comparable, and the evidence records that it was sampled"
             ),
         )
         self.parser.add_argument(
@@ -788,7 +791,7 @@ class MhaFwdTuner(TunerCommon):
                     self._restricted_backends(),
                 )
             )
-            sample = getattr(args, "race_candidates", None)
+            sample = getattr(args, "candidate_sample", None)
             if sample is not None and sample < len(candidates):
                 candidates = random.Random(MHA_FWD_RACE_SAMPLE_SEED).sample(
                     candidates, sample
@@ -1904,6 +1907,7 @@ class MhaFwdTuner(TunerCommon):
             },
             "selection_proofs": self._selection_proofs,
             "search_strategy": getattr(self._args, "strategy", "exhaustive"),
+            "candidate_sample": getattr(self._args, "candidate_sample", None),
             "restricted_backends": self._restricted_backends(),
             "promotions": self._promotions,
             # What the gate actually compared against, rather than what a
