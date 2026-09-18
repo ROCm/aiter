@@ -113,7 +113,6 @@ def _assert_multiple(name, val, mult):
         assert val % mult == 0, f"{name} must be a multiple of {mult}; got {val}"
 
 
-
 def _as_bases(ptr_lds):
     """Normalize a ``ptr_lds`` argument to a list of LDS sub-buffer bases. The CALLER places
     the sub-buffers (that is the point of splitting), so the split count is just ``len()``,
@@ -629,9 +628,7 @@ class KManager16bV1:
             g_base = (
                 token * stride_k_seq + kv_head * stride_k_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
-            gptr = buffer_ops.create_llvm_ptr(
-                base_i64 + fx.Int64(g_base), address_space=1
-            )
+            gptr = create_llvm_ptr(base_i64 + fx.Int64(g_base), address_space=1)
             for i in fx.range_constexpr(self.num_wr_tile_cols):
                 col_idx = i * _K_WR_TILE_HD  # compile-time
                 tile_col = col_idx // _WMMA_K  # == i
@@ -863,9 +860,7 @@ class VManager16bV1:
             g_base = (
                 token * stride_v_seq + kv_head * stride_v_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
-            gptr = buffer_ops.create_llvm_ptr(
-                v_base_i64 + fx.Int64(g_base), address_space=1
-            )
+            gptr = create_llvm_ptr(v_base_i64 + fx.Int64(g_base), address_space=1)
             for i in fx.range_constexpr(self.num_wr_tile_cols):
                 col_idx = i * _V_WR_TILE_HD  # compile-time
                 imm = col_idx * _BF16_BYTES  # compile-time byte immediate (16B aligned)
@@ -1051,8 +1046,9 @@ def _tdm_load_views(
     return views
 
 
-def _dense_warp_view_args(*, bases, n_block, row_bytes, kv_row0, kv_valid, producer_warp,
-                          num_producer_warps):
+def _dense_warp_view_args(
+    *, bases, n_block, row_bytes, kv_row0, kv_valid, producer_warp, num_producer_warps
+):
     """Per-wave dense sub-tile placement for a 2-way-split K|V TDM load.
 
     Wave ``producer_warp`` (0..num_producer_warps-1, runtime) owns kv rows
@@ -1070,7 +1066,9 @@ def _dense_warp_view_args(*, bases, n_block, row_bytes, kv_row0, kv_valid, produ
     warps_per_split = num_producer_warps // num_splits
     base = bases[-1]
     for s in range(num_splits - 2, -1, -1):
-        base = (producer_warp < fx.Int32((s + 1) * warps_per_split)).select(bases[s], base)
+        base = (producer_warp < fx.Int32((s + 1) * warps_per_split)).select(
+            bases[s], base
+        )
     r0 = producer_warp * fx.Int32(num_rows)
     lds_base = base + (producer_warp % fx.Int32(warps_per_split)) * fx.Int32(
         num_rows * row_bytes
@@ -1197,7 +1195,8 @@ class QManager16bV2:
                 fx.make_view(
                     lds_iter,
                     fx.make_layout(
-                        (num_seq, num_head, w), (num_head * self.row_elems, self.row_elems, 1)
+                        (num_seq, num_head, w),
+                        (num_head * self.row_elems, self.row_elems, 1),
                     ),
                 )
             )
@@ -1304,7 +1303,8 @@ class KManager16bV2:
         of the block's K tile — one per pow2 hdim segment (1 for 128/256, 2 for 192).
         ``ptr_lds`` is the list of CALLER-PLACED sub-buffer bases; see
         ``_dense_warp_view_args`` for the wave -> (split, rows) mapping. Pure (hoistable);
-        issue each with ``fx.copy_atom_call(*view)``, drain with ``tdm_ops.tensor_wait(0)``."""
+        issue each with ``fx.copy_atom_call(*view)``, drain with ``tdm_ops.tensor_wait(0)``.
+        """
         lds_base, row0, valid, num_rows = _dense_warp_view_args(
             bases=_as_bases(ptr_lds),
             n_block=self.n_block,
@@ -1333,9 +1333,10 @@ class KManager16bV2:
         """One per-lane ds_load base pointer per LDS split (a list, matching V1's API) that
         ``load_all_to_reg`` reaches every ``ds_load_b128`` from by a compile-time immediate.
         Lane ``l`` fetches at row ``l%16``, d-byte ``(l//16)*16`` of the split; every
-        fragment ``(kv, dt, half)`` is its split's base + a lane-independent immediate."""
+        fragment ``(kv, dt, half)`` is its split's base + a lane-independent immediate.
+        """
         return [
-            buffer_ops.create_llvm_ptr(
+            create_llvm_ptr(
                 base
                 + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
                 + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES),
@@ -1471,7 +1472,7 @@ class VManager16bV2:
         lane_kv = (lane_idx // _WMMA_M) * fx.Int32(8) + lane_idx % fx.Int32(8)
         lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
         return [
-            buffer_ops.create_llvm_ptr(
+            create_llvm_ptr(
                 base
                 + lane_kv * fx.Int32(self.row_bytes)
                 + lane_d * fx.Int32(_BF16_BYTES),
@@ -1948,7 +1949,7 @@ class OManager16bV3:
     ``[16, v_hdim]`` (row stride v_hdim+_O_PAD_ELEMS). Then the 16 x (v_hdim/8) b128 chunks are stored
     LDS->global over ``num_rounds`` waves of 32 lanes: round r lane l -> chunk c=r*32+l, row=c//cpr,
     d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global). Rows with
-    seq>=q_len are EXEC-masked off (async store has no bounds; ``scf_if_dispatch`` per lane).
+    seq>=q_len are EXEC-masked off (async store has no bounds; a per-lane runtime `if`).
     """
 
     def __init__(

@@ -40,6 +40,11 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl
+
+# Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
+# self-contained: this kernel maintains its own arch constants below and passes the
+# config each manager needs through its constructor.
+from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
@@ -296,9 +301,10 @@ def _bare_barrier():
 
     ``gpu.barrier()`` lowers to ``s_wait_storecnt_dscnt 0x0`` + signal/wait, so it would
     retire a ring head issued just above it. Use this where the barrier is a scheduling
-    or counting rendezvous, or where the caller has already named its own dscnt depth."""
-    rocdl_dialect.s_barrier_signal(-1)
-    rocdl_dialect.s_barrier_wait(-1)
+    or counting rendezvous, or where the caller has already named its own dscnt depth.
+    """
+    rocdl.s_barrier_signal(-1)
+    rocdl.s_barrier_wait(-1)
 
 
 def _kv_fence(num_tensorcnt=-1, num_asynccnt=-1, num_dscnt=None):
@@ -479,7 +485,9 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
 
     steady = num_frag - NP // 2
     held = []  # held[i] = the pair fragment i read; released rel fragments later
-    rel = lag + 1  # refill is hoisted, so hold one fragment PAST the refill of that slot
+    rel = (
+        lag + 1
+    )  # refill is hoisted, so hold one fragment PAST the refill of that slot
 
     def _refill(i):
         for k in range(2):
@@ -490,7 +498,9 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
     for i in range(steady):
         _waitn(NP - 2)
         if lag and i >= rel:
-            _keepalive(held[i - rel])  # regs read by fragment i-rel die HERE, not at wmma
+            _keepalive(
+                held[i - rel]
+            )  # regs read by fragment i-rel die HERE, not at wmma
             held[i - rel] = None
         _refill(i)
         lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
@@ -519,9 +529,7 @@ def _scale_s(s_acc_list, s_scale):
     return [[acc * s_scale for acc in row] for row in s_acc_list]
 
 
-def _qk_gemm(
-    *, k_emit, q_frags_list, n_block, head=None, ring=QK_RING, lag=QK_LAG
-):
+def _qk_gemm(*, k_emit, q_frags_list, n_block, head=None, ring=QK_RING, lag=QK_LAG):
     """GEMM1: S^T = K @ Q^T for one resident KV tile, for all R q-WMMA-tiles this
     wave owns. K is **shared** across the q-tiles (loaded once), so each K fragment
     is shuffled once and fed into R independent WMMA chains.
@@ -556,9 +564,7 @@ def _qk_gemm(
         kv, dt = divmod(i, NDT)
         k_frag = lo.shuffle(hi, list(range(16)))
         for qt in range(R):
-            acc = (
-                s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
-            )
+            acc = s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
             s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
 
     _ring_drive(
@@ -946,9 +952,7 @@ def _pv_qk_gemm(
         kv, dt = divmod(i - num_vfrag, NDT)
         k_frag = lo.shuffle(hi, list(range(16)))
         for qt in range(R):
-            acc = (
-                s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
-            )
+            acc = s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
             s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
 
     # Raise wave priority for the whole WMMA stream: under anti-phase the other half is
@@ -1092,8 +1096,8 @@ def _core_attention(
             f"{_who} split {_b // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
             f"(qk_hdim={qk_hdim}, v_hdim={v_hdim}, n_block={n_block})"
         )
-    assert (
-        2 * N_KV_PP * slot_bytes <= get_lds_capacity_bytes("gfx1250")
+    assert 2 * N_KV_PP * slot_bytes <= get_lds_capacity_bytes(
+        "gfx1250"
     ), "12-chunk K|V layout over LDS capacity"
 
     def _k_lds_buf(
@@ -1111,7 +1115,9 @@ def _core_attention(
     # the first tile (logical slot 1) there lets the prologue issue it before Q is read.
     _PSLOT = [2, 0, 1]
 
-    def _k_bufs_at(slot):  # K[.][0], K[.][1] of the slot whose low-half base is ``slot``
+    def _k_bufs_at(
+        slot,
+    ):  # K[.][0], K[.][1] of the slot whose low-half base is ``slot``
         return [slot, slot + fx.Int32(_SPLIT_STRIDE)]
 
     def _v_bufs_at(slot):
@@ -1123,7 +1129,9 @@ def _core_attention(
     # at the same point of a gemm. Runtime, off warp_idx: _split_bufs runs N_KV_PP times in
     # the prologue and its results are carried as ds pointers, so this is a handful of
     # prologue adds and nothing in the loop.
-    assert not (KV_SPLIT_PARITY_ORDER and KV_LDS_SPLITS != 2), "parity order needs a 2-way split"
+    assert not (
+        KV_SPLIT_PARITY_ORDER and KV_LDS_SPLITS != 2
+    ), "parity order needs a 2-way split"
     if KV_SPLIT_PARITY_ORDER:
         _odd = warp_idx & fx.Int32(1)
         _rd0 = _odd * fx.Int32(_SPLIT_STRIDE)
@@ -1150,7 +1158,9 @@ def _core_attention(
     # (s_wait_dscnt + barrier below). Wave w -> chunk B iff (w&1) ^ ((w>>2)&1), so the two
     # waves sharing a SIMD (w and w+4) always land in different chunks. ----
     for _who, _b in (("Q", q_mgr.warp_lds_size_in_byte()),):
-        assert _b <= LDS_QO_BYTES, f"{_who} per-wave {_b}B over the {LDS_QO_BYTES}B slice"
+        assert (
+            _b <= LDS_QO_BYTES
+        ), f"{_who} per-wave {_b}B over the {LDS_QO_BYTES}B slice"
     _q_chunk_b = (warp_idx & fx.Int32(1)) ^ ((warp_idx >> fx.Int32(2)) & fx.Int32(1))
     q_lds_warp = (
         _k_lds_buf(1)
@@ -1281,9 +1291,7 @@ def _core_attention(
         # body start's dead PV.
         if KV_K_AHEAD and warp_type.is_lo:
             fill_tile = start_tile + fx.Int32(1)
-            kv_fill = _kv_views(
-                _k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), fill_tile
-            )
+            kv_fill = _kv_views(_k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), fill_tile)
         else:
             kv_fill = _kv_views(_k_lds_buf(_PSLOT[0]), start_row0, start_tile)
         num_tdm_copies = len(kv0)
@@ -1299,9 +1307,7 @@ def _core_attention(
         elif not warp_type.is_lo:
             _early += kv_fill
         _issue_views(_early)
-        q_frags = q_mgr.load_q_to_vgpr_part2(
-            scale=_q_scale, skip_tensorcnt=len(_early)
-        )
+        q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale, skip_tensorcnt=len(_early))
         # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
         # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
         # atom is per-wave while a tile's is per-producer (wave A's Q region is written by
@@ -1363,8 +1369,8 @@ def _core_attention(
     # (7) Loop init — MOVED to after the prologue barrier (ordering experiment). Online-
     # softmax seed + O accumulators (iter_args) and loop bounds.
     #
-    # Loop-carried state (scf.for_ iter_args): the online-softmax running max ``m`` and
-    # denom ``d`` (per-lane f32), followed by the ``d_tiles`` fp32 O accumulators. Seed
+    # Loop-carried state (the runtime `for ... init=` carry): the online-softmax running
+    # max ``m`` and denom ``d`` (per-lane f32), then the ``d_tiles`` fp32 O accumulators. Seed
     # m=-inf, d=0, O=0: the first tile's corr=exp2(m_prev-m_new)=0 zeroes the
     # (already-zero) O before its PV adds in — the standard flash seed. (Fully-masked
     # leading tiles under a finite-left window would make exp2(-inf-(-inf))=NaN;
@@ -1518,8 +1524,7 @@ def _core_attention(
             for i in range(N_KV_PP)
         ]
         v_slots = [
-            list(state[_VB0 + i * _NVB : _VB0 + (i + 1) * _NVB])
-            for i in range(N_KV_PP)
+            list(state[_VB0 + i * _NVB : _VB0 + (i + 1) * _NVB]) for i in range(N_KV_PP)
         ]
         slot_of = [fx.Int32(state[_SLOT_BASE + i]) for i in range(N_KV_PP)]
         head_carry = [fx.Vector(state[_HEAD_BASE + i]) for i in range(_NH)]
@@ -1717,16 +1722,21 @@ def _core_attention(
                 mask_any = rescale_masks[0]
                 for _m in rescale_masks[1:]:
                     mask_any = mask_any | _m
+
+                @flyc.jit
+                def _maybe_rescale_all(o_flat_in, corr_flat, do_rescale):
+                    result = o_flat_in
+                    if do_rescale:
+                        result = [ov * cv for ov, cv in zip(o_flat_in, corr_flat)]
+                    return result
+
+                # One flat list for the whole branch: the R rows share the single
+                # folded condition, so they rescale (or pass through) together.
                 o_flat = list(
-                    scf_if_dispatch(
+                    _maybe_rescale_all(
+                        [v for row in o_vecs for v in row],
+                        [corr_vecs[qt] for qt in range(R) for _ in range(d_tiles)],
                         mask_any != fx.Int32(0),
-                        lambda *_a, _o=o_vecs, _c=corr_vecs: [
-                            ov * _c[qt] for qt in range(R) for ov in _o[qt]
-                        ],
-                        result_names=tuple(
-                            f"o{qt}_{dt}" for qt in range(R) for dt in range(d_tiles)
-                        ),
-                        result_values=[v for row in o_vecs for v in row],
                     )
                 )
                 o_resc_list = [
@@ -2276,6 +2286,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                 # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
                 lds_base = _alloc_lds()
                 warp_idx = _warp_id()
+
                 def _run(wt):
                     _core_attention(
                         warp_idx=warp_idx, warp_type=wt, lds_base=lds_base, **_ca_kw
@@ -2386,6 +2397,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
         lds_base = _alloc_lds()
         warp_idx = _warp_id()
+
         def _run(wt):
             _core_attention(
                 warp_idx=warp_idx, warp_type=wt, lds_base=lds_base, **_ca_kw
