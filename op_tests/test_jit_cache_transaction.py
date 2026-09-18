@@ -10,6 +10,7 @@ import json
 import multiprocessing
 import os
 import re
+import runpy
 import shlex
 import shutil
 import socket
@@ -1041,7 +1042,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 get_gfx_runtime=lambda: "gfx942"
             ),
             "opus_gemm_common": types.SimpleNamespace(
-                heuristic_kids_for_arch=lambda _arches: {1}
+                default_compiled_kids_for_arch=lambda _arches: {1}
             ),
         }
         self.tuner_imports = imports
@@ -1059,7 +1060,6 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 "os": os,
                 "sys": sys,
                 "json": json,
-                "HEURISTIC_DEFAULT_KIDS": {1},
                 "_opus_sidecar_path": lambda: self.sidecar,
             },
         )["_ensure_kids_compiled"]
@@ -1144,13 +1144,13 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.tuner_imports["aiter.jit.utils.chip_info"].get_gfx_runtime = mock.Mock(
             side_effect=RuntimeError("no rocminfo")
         )
-        heuristic = mock.Mock(
+        defaults = mock.Mock(
             side_effect=lambda arches: {1} if arches == {"gfx942"} else {1, 200}
         )
-        self.tuner_imports["opus_gemm_common"].heuristic_kids_for_arch = heuristic
+        self.tuner_imports["opus_gemm_common"].default_compiled_kids_for_arch = defaults
         with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx942"}):
             self.assertFalse(tuner({7}))
-        heuristic.assert_called_once_with({"gfx942"})
+        defaults.assert_called_once_with({"gfx942"})
         self.assertEqual(calls, [])
 
     def test_tuner_interruption_restores_environment_and_releases_locks(self):
@@ -1481,6 +1481,10 @@ class TestCppExtensionControl(unittest.TestCase):
 class TestOpusRequestedKids(unittest.TestCase):
     def test_real_generator_accepts_valid_requests_and_rejects_filtered_requests(self):
         generator = JIT_CACHE_PATH.parents[3] / "csrc/opus_gemm/gen_instances.py"
+        registry = runpy.run_path(str(generator.with_name("opus_gemm_common.py")))
+        bmm_kids = sorted(registry["BMM_MXSCALE_KIDS"])
+        co_kids = sorted(registry["GFX1250_4WAVE_CO_KIDS"])
+        workspace_kid = min(registry["gfx1250_clusterlaunch_kernels_list"])
         runner = (
             "import os, runpy, sys, types; "
             "sys.argv = sys.argv[1:]; "
@@ -1490,15 +1494,19 @@ class TestOpusRequestedKids(unittest.TestCase):
             "runpy.run_path(sys.argv[0], run_name='__main__')"
         )
         cases = (
-            (10006, [], True),
-            (999999, [], False),
-            (200, [], False),
-            (200, ["--kernel_tag", "a16w16"], False),
-            (10006, ["--kernel_tag", "a8w8"], False),
+            ("gfx942", [10006], [], True),
+            ("gfx942", [999999], [], False),
+            ("gfx942", [200], [], False),
+            ("gfx942", [200], ["--kernel_tag", "a16w16"], False),
+            ("gfx942", [10006], ["--kernel_tag", "a8w8"], False),
+            ("gfx950", bmm_kids, [], True),
+            ("gfx950", bmm_kids, ["--kernel_tag", "a8w8"], True),
+            ("gfx942", bmm_kids, [], False),
+            ("gfx1250", [workspace_kid, *co_kids], [], True),
         )
-        for kid, extra_args, accepted in cases:
+        for arch, kids, extra_args, accepted in cases:
             with self.subTest(
-                kid=kid, extra_args=extra_args
+                arch=arch, kids=kids, extra_args=extra_args
             ), tempfile.TemporaryDirectory() as tmp:
                 sidecar = os.path.join(tmp, "compiled_kids.json")
                 _write(sidecar, "[]")
@@ -1511,17 +1519,28 @@ class TestOpusRequestedKids(unittest.TestCase):
                         "--working_path",
                         tmp,
                         "--extra_kids",
-                        str(kid),
+                        *map(str, kids),
                         *extra_args,
                     ],
-                    env={**os.environ, "GPU_ARCHS": "gfx942"},
+                    env={**os.environ, "GPU_ARCHS": arch},
                     capture_output=True,
                     text=True,
                     check=False,
                 )
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn(kid, json.loads(_read(sidecar)))
+                    self.assertTrue(set(kids) <= set(json.loads(_read(sidecar))))
+                    manifest = _read(os.path.join(tmp, "opus_gemm_manifest.h"))
+                    for name in {registry["kernels_list"][kid].name for kid in kids}:
+                        self.assertEqual(manifest.count(name + "("), 1, name)
+                    if arch == "gfx950":
+                        dispatch = _read(
+                            os.path.join(tmp, "opus_bmm_mxscale_kid_dispatch.h")
+                        )
+                        emitted = {
+                            int(kid) for kid in re.findall(r"\{\s*(\d+),", dispatch)
+                        }
+                        self.assertEqual(emitted, set(bmm_kids))
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(
