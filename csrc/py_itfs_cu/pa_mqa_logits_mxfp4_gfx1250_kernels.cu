@@ -61,6 +61,9 @@ static void pa_mqa_logits_mxfp4_gfx1250_check_shapes(aiter_tensor_t& q,
     const int H              = static_cast<int>(q.size(1));
     const int D_BYTES        = static_cast<int>(q.size(2));
     AITER_CHECK(H == Traits::N_HEADS, "compiled for H=", (int)Traits::N_HEADS, ", got H=", H);
+    AITER_CHECK(weights.size(1) == Traits::W_ROW_ELEMS,
+                "weights is [T, H] and the kernel strides it by a compile-time H=",
+                (int)Traits::W_ROW_ELEMS, ": got weights.size(1)=", weights.size(1));
     AITER_CHECK(D_BYTES == HEAD_BYTES,
                 "q last dim is D/2 packed bytes; compiled for ",
                 HEAD_BYTES,

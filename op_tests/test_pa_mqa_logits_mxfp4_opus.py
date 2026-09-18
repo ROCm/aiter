@@ -66,7 +66,7 @@ from aiter.ops.opus.pa_mqa_logits_mxfp4 import (  # BLOCK_K / Q_PER_BLOCK are in
     pa_mqa_logits_mxfp4_plan,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.utility.fp4_utils import mxfp4_to_f32
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
 dev = "cuda"
 
@@ -163,14 +163,19 @@ def fp4_dequant(packed, e8m0, block_size=SCALE_BLOCK):
     """``[..., d/2]`` packed e2m1 + ``[..., d/block]`` E8M0 -> ``[..., d]`` fp32.
 
     Defined for ANY pair, which is what lets the two init axes stay independent: nothing here
-    assumes the exponents were derived by quantizing these nibbles. The nibble decode comes
-    from ``aiter.utility.fp4_utils`` rather than a local table, so the reference cannot drift
-    from the encoding ``fill_fp4`` writes.
+    assumes the exponents were derived by quantizing these nibbles.
+
+    BOTH decodes come from ``aiter.utility.fp4_utils`` rather than from arithmetic here, so the
+    reference cannot drift from what ``fill_fp4`` / ``fill_scale_e8m0`` write. That matters at
+    the two E8M0 encodings a plain ``2^(byte - 127)`` gets wrong: ``0xFF`` is the NaN sentinel,
+    which the kernel propagates through the relu, where the power would give +inf. Neither
+    generator emits it today -- ``pow2_binomial`` spans bytes 116..137 -- so this is about the
+    reference staying canonical rather than about a case the suite currently reaches.
     """
     *prefix, d_half = packed.shape
     d = d_half * 2
     vals = mxfp4_to_f32(packed).reshape(*prefix, d // block_size, block_size)
-    scale = torch.pow(2.0, e8m0.float() - 127.0)
+    scale = e8m0_to_f32(e8m0)
     return (vals * scale.unsqueeze(-1)).reshape(*prefix, d)
 
 
