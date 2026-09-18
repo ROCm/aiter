@@ -310,12 +310,20 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     // ~8KB from L2 per row. This runs in the prologue, BEFORE the out-of-range early
     // return, so every thread reaches the (uniform) __syncthreads and the block cannot
     // deadlock. use_lds_gate is uniform across the block (depends only on kernel args).
-    static constexpr int GATE_LDS_CAP   = 4096;  // per shared expert; covers hidden_size <= 4096
-    static constexpr int GATE_LDS_SLOTS =
-        (NUM_SHARED_EXPERTS > 0) ? NUM_SHARED_EXPERTS * GATE_LDS_CAP : 1;
+    static constexpr int GATE_LDS_CAP = 4096;  // per shared expert; covers hidden_size <= 4096
+    // Only stage into LDS when the static buffer fits the 64KB LDS budget:
+    // NUM_SHARED_EXPERTS * GATE_LDS_CAP * sizeof(DTYPE) must be <= 65536. Otherwise
+    // (e.g. fp32 with 8 shared experts = 128KB) sizing the array would fail to compile,
+    // so shrink it to 1 and read the gate from global instead -- the caching
+    // optimization is dropped but the result is identical.
+    static constexpr bool GATE_LDS_FITS =
+        NUM_SHARED_EXPERTS > 0 &&
+        NUM_SHARED_EXPERTS * GATE_LDS_CAP * static_cast<int>(sizeof(DTYPE)) <= 65536;
+    static constexpr int GATE_LDS_SLOTS = GATE_LDS_FITS ? NUM_SHARED_EXPERTS * GATE_LDS_CAP : 1;
     __shared__ alignas(64) DTYPE s_gate[GATE_LDS_SLOTS];
     bool use_lds_gate = false;
-    if constexpr(NUM_SHARED_EXPERTS > 0 && SCORING_FUNC != SharedExpertScoringFunc::NONE)
+    if constexpr(NUM_SHARED_EXPERTS > 0 && SCORING_FUNC != SharedExpertScoringFunc::NONE &&
+                 GATE_LDS_FITS)
     {
         use_lds_gate =
             (shared_gate_weight != nullptr) && (shared_hidden_size <= GATE_LDS_CAP);
