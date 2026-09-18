@@ -720,3 +720,131 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype",
+    [(torch.bfloat16, torch.bfloat16), (e4m3_dtype, e4m3_dtype)],
+)
+@pytest.mark.parametrize("head_size", [256, 512])
+@torch.inference_mode()
+def test_triton_unified_attn_gfx942_large_prefill(
+    head_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+) -> None:
+    """Executable coverage for the gfx942 large-prefill attn_2d entries.
+
+    The general test never exceeds max_seqlen_q 777 (below the Q_GEQ_1024
+    composites) and skips the shuffled 2D Triton path on gfx942, so the
+    Q>=1024, head 256/512 and SHUF specializations are otherwise never
+    compiled or numerically checked. This runs one 2048-token prefill per
+    (head, dtype, shuffled) combination — enough to select, compile and
+    validate each entry — and asserts the resolved config key.
+    """
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip(f"gfx942-tuned entries, skip {DEVICE_ARCH}")
+
+    from aiter.ops.triton.utils.unified_attention_utils import (
+        _axis_values,
+        _load,
+        _lookup,
+    )
+
+    seq_lens = [(2048, 2048)]
+    num_heads = (32, 4)
+    block_size = 64
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
+        use_q_descale=q_dtype == e4m3_dtype,
+        use_kv_descale=kv_dtype == e4m3_dtype,
+        device="cuda",
+    )
+
+    # assert the intended table entry serves this call
+    table, axes, _ = _load("attn_2d", "triton", "gfx942")
+    dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"
+    if shuffled_kv_cache:
+        expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_{dt_tag}"
+    else:
+        expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.DT_{dt_tag}"
+    key, _config = _lookup(
+        table,
+        axes,
+        _axis_values(
+            head_size, max_query_len, max_kv_len, 0,
+            shuffled_kv_cache, block_size, q_dtype, kv_dtype,
+        ),
+    )
+    assert key == expected_key, f"expected {expected_key}, matched {key}"
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        shuffled_kv_cache=shuffled_kv_cache,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    is_fp8 = kv_dtype.itemsize == 1 or q_dtype.itemsize == 1
+    atol, rtol = (1.5e-1, 1.5e-1) if is_fp8 else (1.5e-2, 1e-2)
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
