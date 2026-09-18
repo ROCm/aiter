@@ -3,6 +3,7 @@
 
 #include "gemm_a4w4_blockscale.h"
 
+#include "aiter_stream.h"
 #include "gemm_a4w4_blockscale_common.cuh"
 #include "gemm_a4w4_blockscale_manifest.h"
 #include "gemm_a4w4_blockscale_lookup.h"
@@ -86,4 +87,19 @@ aiter_tensor_t& gemm_a4w4_blockscale_tune(
   return Y;
 }
 
+namespace torch_itfs {
+
+void gemm_a4w4_blockscale_tune(aiter_tensor_t& XQ,
+                               aiter_tensor_t& WQ,
+                               aiter_tensor_t& x_scale,
+                               aiter_tensor_t& w_scale,
+                               aiter_tensor_t& Y,
+                               int kernelId,
+                               int splitK)
+{
+    aiter::gemm_a4w4_blockscale_tune(
+        XQ, WQ, x_scale, w_scale, Y, kernelId, splitK, getCurrentHIPStream());
+}
+
+} // namespace torch_itfs
 } // namespace aiter
