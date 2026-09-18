@@ -69,6 +69,7 @@ aiter_tensor_t& gemm_a4w4_blockscale_tune(
     int splitK,
     hipStream_t stream)
 {
+  check_a4w4_operands(XQ, WQ, x_scale, w_scale, Y);
   AITER_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
   AITER_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
@@ -97,6 +98,9 @@ void gemm_a4w4_blockscale_tune(aiter_tensor_t& XQ,
                                int kernelId,
                                int splitK)
 {
+    // See gemm_a4w4_blockscale.cu: a bad kernel id or dtype must raise in the
+    // tuner, not abort the sweep partway through.
+    aiter_detail::AiterThrowGuard throw_guard;
     aiter::gemm_a4w4_blockscale_tune(
         XQ, WQ, x_scale, w_scale, Y, kernelId, splitK, getCurrentHIPStream());
 }

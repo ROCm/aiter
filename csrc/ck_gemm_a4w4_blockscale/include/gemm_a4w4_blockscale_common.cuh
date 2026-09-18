@@ -7,6 +7,7 @@
 #undef __HIP_NO_HALF_CONVERSIONS__
 
 #include <cstdlib>
+#include <iterator>
 
 #include "aiter_hip_common.h"
 #include "aiter_tensor.h"
@@ -98,6 +99,31 @@ using DeviceGemmHelperF4BlockScale = ck::tensor_operation::device::DeviceGemmMX_
           BlkGemmPipelineVer,
           ADataType, BDataType>;
 // clang-format on
+
+// The kernels below guard on A.device_id, and HipDeviceGuard issues a fatal
+// hipSetDevice() for the -1 that aiter_tensor_t carries for a host tensor. Run
+// this from the entry points, before any guard is constructed, so a CPU or
+// cross-device operand surfaces as a catchable check failure.
+inline void check_a4w4_operands(const aiter_tensor_t& XQ,
+                                const aiter_tensor_t& WQ,
+                                const aiter_tensor_t& x_scale,
+                                const aiter_tensor_t& w_scale,
+                                const aiter_tensor_t& Y)
+{
+    const aiter_tensor_t* operands[] = {&XQ, &WQ, &x_scale, &w_scale, &Y};
+    const char* names[]              = {"XQ", "WQ", "x_scale", "w_scale", "Y"};
+    for(size_t i = 0; i < std::size(operands); ++i)
+    {
+        AITER_CHECK(operands[i]->is_gpu(), names[i], " must be a GPU tensor!");
+        AITER_CHECK(operands[i]->device_id == XQ.device_id,
+                    names[i],
+                    " is on device ",
+                    operands[i]->device_id,
+                    " but XQ is on device ",
+                    XQ.device_id,
+                    "; all operands must be on one device!");
+    }
+}
 
 template <typename CDataType, typename DeviceGemmInstance>
 __forceinline__ aiter_tensor_t& gemm_a4w4_blockscale_impl(

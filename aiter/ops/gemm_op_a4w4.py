@@ -524,12 +524,28 @@ def gemm_a4w4o8(
     return o.view(*lead, o.shape[-1]), s
 
 
+# torch_compile_guard infers each op's schema from the decorated function, then
+# hands the fake the very same arguments, so a fake has to mirror its own op's
+# signature -- the two ops below disagree past `Out` and cannot share one.
 def gen_gemm_a4w4_blockscale_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
+    kernelName: str = "",
+) -> None:
+    return None
+
+
+def gen_gemm_a4w4_blockscale_tune_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
     splitK: int = 0,
 ) -> None:
     return None
@@ -573,7 +589,7 @@ def gemm_a4w4_blockscale(
 @compile_ops(
     "module_gemm_a4w4_blockscale_tune",
     fc_name="gemm_a4w4_blockscale_tune",
-    gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
+    gen_fake=gen_gemm_a4w4_blockscale_tune_fake_tensors,
     develop=True,
 )
 def _gemm_a4w4_blockscale_tune(
