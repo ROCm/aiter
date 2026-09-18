@@ -584,6 +584,11 @@ def main():
             compile_tp_chunk_fused,
             run_tp_chunk_fused,
         )
+        from aiter.ops.flydsl.kernels.mega_moe.tp_mega_moe_stage1 import (
+            compile_tp_mega_moe_stage1,
+            run_tp_ep_broadcast_stage1,
+            run_tp_ep_clone_stage1,
+        )
         from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_push import (
             TpIncrementalWorkspace,
             compile_tp_incremental_push,
@@ -647,6 +652,41 @@ def main():
             chunk_rows=32,
             early_compute=True,
             swiglu_limit=SWIGLU_LIMIT,
+        )
+        s1_cfg = mega._select_config(tokens).stage1
+        print(f"[STEP] rank={rank} tp-ep-broadcast-compile", flush=True)
+        compile_tp_mega_moe_stage1(
+            model_dim=args.model_dim,
+            inter_dim=args.inter_dim,
+            rank=rank,
+            experts_per_rank=local_experts,
+            fuse_npes=world,
+            fuse_topk=args.topk,
+            fuse_cap=mega._s1_cap,
+            fuse_mtpr=args.mtpr,
+            fuse_scale_dim=mega._s1_scale_dim,
+            fixed_slot_dispatch=mega._s1_fixed_slot,
+            sort_block_m=s1_cfg.sort_block_m,
+            tile_n=s1_cfg.tile_n,
+            tile_k=s1_cfg.tile_k,
+            num_waves=s1_cfg.num_waves,
+            grid_mult=s1_cfg.grid_mult,
+            pipe_weights=s1_cfg.pipe_weights,
+            mfma_amajor=s1_cfg.mfma_amajor,
+            swizzle_a=s1_cfg.swizzle_a,
+            async_a_copy=s1_cfg.async_a_copy,
+            use_tile_resource=s1_cfg.use_tile_resource,
+            waves_per_eu_hint=s1_cfg.waves_per_eu_hint,
+            num_cu=mega._s1_num_cu,
+            num_dispatch_cu=s1_cfg.num_dispatch_cu,
+            b_nt=s1_cfg.b_nt,
+            work_shards=s1_cfg.work_shards,
+            external_grouping=s1_cfg.external_grouping,
+            external_counting=s1_cfg.external_counting,
+            payload_chunk_rows=s1_cfg.payload_chunk_rows,
+            payload_tile_ready=s1_cfg.payload_tile_ready,
+            swiglu_limit=SWIGLU_LIMIT,
+            tp_broadcast_payload=True,
         )
         compile_tp_token_gemm1(
             model_dim=args.model_dim,
@@ -971,6 +1011,12 @@ def main():
                 _handshake_sync()
                 _run_fused_stage1()
 
+            def tp_ep_clone_k_body():
+                run_tp_ep_clone_stage1(mega, x_fp8, wts_loc, x_scale, ids_loc)
+
+            def tp_ep_bcast_k_body():
+                run_tp_ep_broadcast_stage1(mega, x_fp8, wts_loc, x_scale, ids_loc)
+
             def tp_chunk_fused_k_body():
                 _run_chunk_fused_stage1()
 
@@ -994,6 +1040,8 @@ def main():
             quant = _time(tp_quant_body, f"tp-quant-{tag}")
             ag_meta = _time(tp_ag_meta_body, f"tp-ag-meta-{tag}")
             _quant_local_x()
+            ep_s1_k = _time(tp_ep_clone_k_body, f"tp-ep-s1-{tag}")
+            ep_bcast_k = _time(tp_ep_bcast_k_body, f"tp-ep-bcast-{tag}")
             fused_k = _time(tp_fused_k_body, f"tp-fused-k-{tag}")
             chunk_fused_k = _time(tp_chunk_fused_k_body, f"tp-chunk-fused-k-{tag}")
             gather_k = _time(tp_gather_k_body, f"tp-gather-k-{tag}")
@@ -1006,6 +1054,8 @@ def main():
                 "lumped_s1": lumped_s1,
                 "quant": quant,
                 "ag_meta": ag_meta,
+                "ep_s1_k": ep_s1_k,
+                "ep_bcast_k": ep_bcast_k,
                 "fused_k": fused_k,
                 "chunk_fused_k": chunk_fused_k,
                 "gather_k": gather_k,
@@ -1017,7 +1067,8 @@ def main():
                     f"[TP-BREAKDOWN] tokens={m_local} "
                     f"nccl_e2e={_fmt_ms(nccl_e2e)} two_e2e={_fmt_ms(two_e2e)} "
                     f"lumped_s1={_fmt_ms(lumped_s1)} quant={_fmt_ms(quant)} "
-                    f"ag_meta={_fmt_ms(ag_meta)} fused_k={_fmt_ms(fused_k)} "
+                    f"ag_meta={_fmt_ms(ag_meta)} ep_s1_k={_fmt_ms(ep_s1_k)} "
+                    f"ep_bcast_k={_fmt_ms(ep_bcast_k)} fused_k={_fmt_ms(fused_k)} "
                     f"chunk_fused_k={_fmt_ms(chunk_fused_k)} "
                     f"gather_k={_fmt_ms(gather_k)} two_launch={_fmt_ms(two_launch)} "
                     f"gemm1_k={_fmt_ms(gemm1_k)}",
@@ -1095,7 +1146,7 @@ def main():
         if tp_rows:
             print(
                 "[TP-TABLE] tokens nccl_e2e two_e2e lumped_s1 quant ag_meta "
-                "fused_k chunk_fused_k gather_k two_launch gemm1_k",
+                "ep_s1_k ep_bcast_k fused_k chunk_fused_k gather_k two_launch gemm1_k",
                 flush=True,
             )
             for row in tp_rows:
@@ -1103,7 +1154,8 @@ def main():
                     f"[TP-TABLE] {row['tokens']} "
                     f"{_fmt_ms(row['nccl_e2e'])} {_fmt_ms(row['two_e2e'])} "
                     f"{_fmt_ms(row['lumped_s1'])} {_fmt_ms(row['quant'])} "
-                    f"{_fmt_ms(row['ag_meta'])} {_fmt_ms(row['fused_k'])} "
+                    f"{_fmt_ms(row['ag_meta'])} {_fmt_ms(row['ep_s1_k'])} "
+                    f"{_fmt_ms(row['ep_bcast_k'])} {_fmt_ms(row['fused_k'])} "
                     f"{_fmt_ms(row['chunk_fused_k'])} "
                     f"{_fmt_ms(row['gather_k'])} {_fmt_ms(row['two_launch'])} "
                     f"{_fmt_ms(row['gemm1_k'])}",
