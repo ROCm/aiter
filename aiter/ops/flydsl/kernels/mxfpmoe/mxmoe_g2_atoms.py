@@ -204,6 +204,88 @@ def issue_a_load_lds_dt(
         )
 
 
+def _a_ds_read_vec(
+    s_aq_base,
+    slot,
+    slot_bytes,
+    KH_TILE_A,
+    k,
+    i,
+    lane_mod_16,
+    lane_div_16,
+    is_f8_a,
+):
+    """One A ds-read as vector SSA (fp8 -> i32x8, fp4 -> i32x4). No rmem store."""
+    lds_row = lane_mod_16 + i * 16
+    row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
+    if const_expr(is_f8_a):
+        mask = lds_swizzle_mask_f8(lane_mod_16, KH_TILE_A)
+        col0 = lane_div_16 * 16 + k * 128
+        col_lo = col0 ^ mask
+        col_hi = (col0 + 64) ^ mask
+        lo = Vec(
+            lds_vec_load(
+                s_aq_base,
+                row_off + col_lo,
+                Vec.make_type(2, fx.Int64),
+                fx.Int64,
+                align=16,
+            )
+        )
+        hi = Vec(
+            lds_vec_load(
+                s_aq_base,
+                row_off + col_hi,
+                Vec.make_type(2, fx.Int64),
+                fx.Int64,
+                align=16,
+            )
+        )
+        a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
+        return a64.bitcast(fx.Int32)
+    mask = lds_swizzle_mask(lane_mod_16, KH_TILE_A)
+    lds_col = (lane_div_16 * 16 + k * 64) ^ mask
+    vec = lds_vec_load(
+        s_aq_base,
+        row_off + lds_col,
+        Vec.make_type(4, fx.Int32),
+        fx.Int32,
+        align=16,
+    )
+    return Vec(vec)
+
+
+def issue_a_ds_read_ssa(
+    s_aq_base,
+    slot,
+    slot_bytes,
+    KH_TILE_A,
+    kHalves,
+    kMChunks,
+    lane_mod_16,
+    lane_div_16,
+    is_f8_a,
+):
+    """A ds-read for one slot as SSA vectors; do not store into a_frags."""
+    a = [
+        [None for _ in range_constexpr(kHalves)] for _ in range_constexpr(kMChunks)
+    ]
+    for k in range_constexpr(kHalves):
+        for i in range_constexpr(kMChunks):
+            a[i][k] = _a_ds_read_vec(
+                s_aq_base,
+                slot,
+                slot_bytes,
+                KH_TILE_A,
+                k,
+                i,
+                lane_mod_16,
+                lane_div_16,
+                is_f8_a,
+            )
+    return a
+
+
 def issue_a_ds_read_slot(
     a_frags,
     s_aq_base,
@@ -219,44 +301,19 @@ def issue_a_ds_read_slot(
     """A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>."""
     for k in range_constexpr(kHalves):
         for i in range_constexpr(kMChunks):
-            lds_row = lane_mod_16 + i * 16
-            row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
-            if const_expr(is_f8_a):
-                mask = lds_swizzle_mask_f8(lane_mod_16, KH_TILE_A)
-                col0 = lane_div_16 * 16 + k * 128
-                col_lo = col0 ^ mask
-                col_hi = (col0 + 64) ^ mask
-                lo = Vec(
-                    lds_vec_load(
-                        s_aq_base,
-                        row_off + col_lo,
-                        Vec.make_type(2, fx.Int64),
-                        fx.Int64,
-                        align=16,
-                    )
-                )
-                hi = Vec(
-                    lds_vec_load(
-                        s_aq_base,
-                        row_off + col_hi,
-                        Vec.make_type(2, fx.Int64),
-                        fx.Int64,
-                        align=16,
-                    )
-                )
-                a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
-                a_frags[i][k].store(a64.bitcast(fx.Int32))
-            else:
-                mask = lds_swizzle_mask(lane_mod_16, KH_TILE_A)
-                lds_col = (lane_div_16 * 16 + k * 64) ^ mask
-                vec = lds_vec_load(
+            a_frags[i][k].store(
+                _a_ds_read_vec(
                     s_aq_base,
-                    row_off + lds_col,
-                    Vec.make_type(4, fx.Int32),
-                    fx.Int32,
-                    align=16,
+                    slot,
+                    slot_bytes,
+                    KH_TILE_A,
+                    k,
+                    i,
+                    lane_mod_16,
+                    lane_div_16,
+                    is_f8_a,
                 )
-                a_frags[i][k].store(Vec(vec))
+            )
 
 
 def scale_chunk_tile(kt, tilesPerScaleChunk):
@@ -287,6 +344,103 @@ def load_a_scale_tile(
             saf,
         )
         out.append(Vec(saf.load())[0])
+    return out
+
+
+def load_b_value_ssa(
+    j,
+    half,
+    kt_rt,
+    b_catom,
+    bq_views,
+    lane_div_16,
+    lane_mod_16,
+    is_f8_b,
+    B_NDW,
+    frag_tmpl=None,
+):
+    """One B-weight cell as vector SSA (copy into a dead temp, then load)."""
+    if const_expr(is_f8_b):
+        lo = fx.make_rmem_tensor(4, Int32)
+        hi = fx.make_rmem_tensor(4, Int32)
+        fx.copy(
+            b_catom,
+            bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 0, None],
+            lo,
+        )
+        fx.copy(
+            b_catom,
+            bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 1, None],
+            hi,
+        )
+        lo_v = Vec(fx.memref_load_vec(lo))
+        hi_v = Vec(fx.memref_load_vec(hi))
+        return lo_v.shuffle(hi_v, list(range(B_NDW)))
+    dst = fx.make_fragment_like(frag_tmpl)
+    fx.copy(
+        b_catom,
+        bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
+        dst,
+    )
+    return Vec(dst.load())
+
+
+def load_b_tile_ssa(
+    kt_rt,
+    b_catom,
+    bq_views,
+    numAccN,
+    kHalves,
+    lane_div_16,
+    lane_mod_16,
+    is_f8_b,
+    B_NDW,
+    frag_tmpl=None,
+):
+    """All N-subblock / K-half B cells for one K-tile as SSA vectors."""
+    out = []
+    for j in range_constexpr(numAccN):
+        row = []
+        for half in range_constexpr(kHalves):
+            row.append(
+                load_b_value_ssa(
+                    j,
+                    half,
+                    kt_rt,
+                    b_catom,
+                    bq_views,
+                    lane_div_16,
+                    lane_mod_16,
+                    is_f8_b,
+                    B_NDW,
+                    frag_tmpl=frag_tmpl,
+                )
+            )
+        out.append(row)
+    return out
+
+
+def load_b_scale_tile_ssa(
+    kt,
+    sc_copy_atom,
+    bscale_views,
+    sc_frag_tmpl,
+    nPairs,
+    lane_div_16,
+    lane_mod_16,
+    tilesPerScaleChunk,
+):
+    """B-scale e8m0 words for one K-tile as SSA i32 scalars."""
+    chunk_kt = scale_chunk_tile(kt, tilesPerScaleChunk)
+    out = []
+    for mw in range_constexpr(nPairs):
+        tmp = fx.make_fragment_like(sc_frag_tmpl)
+        fx.copy(
+            sc_copy_atom,
+            bscale_views[mw][lane_div_16, lane_mod_16, chunk_kt, None],
+            tmp,
+        )
+        out.append(Vec(tmp.load())[0])
     return out
 
 

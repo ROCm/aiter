@@ -19,7 +19,10 @@ from .mxmoe_g2_atoms import (
     bq_view,
     bq_view_fp8,
     issue_a_ds_read_slot,
+    issue_a_ds_read_ssa,
     issue_a_load_lds_dt,
+    load_b_scale_tile_ssa,
+    load_b_tile_ssa,
     make_b_copy_atom,
     make_scale_copy_atom,
     mma_one_j,
@@ -155,10 +158,11 @@ def gemm2_body_v2(
     else:
         aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * K_BYTES)
     A_NDW = 8 if is_f8_a else 4
-    a_frags = [
-        [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)]
-        for _ in range_constexpr(kMChunks)
-    ]
+    if const_expr(not nonatomic):
+        a_frags = [
+            [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)]
+            for _ in range_constexpr(kMChunks)
+        ]
 
     def issue_a_load_lds(slot, kt):
         issue_a_load_lds_dt(
@@ -368,13 +372,14 @@ def gemm2_body_v2(
 
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     zero4 = Vec.filled(4, 0.0, Float32)
-    c_frags = [
-        [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
-        for _ in range_constexpr(kMChunks)
-    ]
-    for i in range_constexpr(kMChunks):
-        for J in range_constexpr(numAccN):
-            c_frags[i][J].store(zero4)
+    if const_expr(not nonatomic):
+        c_frags = [
+            [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
+            for _ in range_constexpr(kMChunks)
+        ]
+        for i in range_constexpr(kMChunks):
+            for J in range_constexpr(numAccN):
+                c_frags[i][J].store(zero4)
 
     def load_c_carry():
         return [c_frags[i][J].load() for i in range(kMChunks) for J in range(numAccN)]
@@ -431,7 +436,176 @@ def gemm2_body_v2(
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
 
-    if const_expr(g2_kstatic):
+    if const_expr(nonatomic):
+        # Scatter short-K. A for every K-tile is already in its own LDS slot
+        # (KT <= aStages, dispatcher preloads a_preload == KT), so the body needs
+        # exactly one fence -- not gemm2's per-tile _kloop_fence. That single
+        # s_barrier is what makes the whole body one scheduling region, which the
+        # SchedGroup pipeline below then lays out. Everything is SSA use-def; the
+        # only scheduling directives are those SCHED_GROUP_BARRIERs.
+        KT = K_TILES
+        assert (
+            KT <= aStages
+        ), f"scatter short-K requires K_TILES<=aStages, got {KT} vs aStages={aStages}"
+        # Mirrors the dispatcher's a_preload; the single fence is only valid while
+        # every K-tile of A lands in LDS before the body starts.
+        assert (min(aStages, KT) if g2_apre else kStages) >= KT, (
+            f"scatter short-K needs all {KT} A tiles preloaded (aStages={aStages}, "
+            f"g2_apre={g2_apre})"
+        )
+
+        def load_b(kt):
+            return load_b_tile_ssa(
+                fx.Int32(kt),
+                b_catom,
+                bq_views,
+                numAccN,
+                kHalves,
+                lane_div_16,
+                lane_mod_16,
+                is_f8_b,
+                B_NDW,
+                frag_tmpl=frag_tmpl,
+            )
+
+        # Prologue (above the fence): every scale word plus tile 0's B, so their
+        # VMEM latency hides behind the wait on A's LDS DMA.
+        a_scale_v = [load_a_scale_tile(fx.Int32(kt)) for kt in range_constexpr(KT)]
+        b_scale_v = [
+            load_b_scale_tile_ssa(
+                fx.Int32(kt),
+                sc_copy_atom,
+                bscale_views,
+                sc_frag_tmpl,
+                nPairs,
+                lane_div_16,
+                lane_mod_16,
+                tilesPerScaleChunk,
+            )
+            for kt in range_constexpr(KT)
+        ]
+        b = [None for _ in range_constexpr(KT)]
+        b[0] = load_b(0)
+        accm = [
+            [None for _ in range_constexpr(numAccN)] for _ in range_constexpr(kMChunks)
+        ]
+        cbsz = 0 if is_f8_a else 4
+        blgp = 0 if is_f8_b else 4
+        mfma_res_ty = T.f32x4
+
+        def mfma_cluster_ssa(b_tile, a, sa, b_scale, kt_rt, init):
+            sa_s = [
+                shift_scale_word(sa[sub], kt_rt)
+                for sub in range_constexpr(kScaleSubBlocks)
+            ]
+            sb_words = [
+                shift_scale_word(b_scale[mni], kt_rt) for mni in range_constexpr(nPairs)
+            ]
+            for J in range_constexpr(numAccN):
+                in_b = J % 2
+                sb = sb_words[J // 2]
+                for sub in range_constexpr(kScaleSubBlocks):
+                    i0 = 2 * sub
+                    i1 = i0 + 1
+                    for k in range_constexpr(kHalves):
+                        osa = 2 * k
+                        osb = 2 * k + in_b
+                        c0 = (
+                            zero4
+                            if const_expr(init) and const_expr(k == 0)
+                            else accm[i0][J]
+                        )
+                        accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            mfma_res_ty,
+                            [
+                                a[i0][k],
+                                b_tile[J][k],
+                                c0,
+                                cbsz,
+                                blgp,
+                                osa,
+                                sa_s[sub],
+                                osb,
+                                sb,
+                            ],
+                        )
+                        c1 = (
+                            zero4
+                            if const_expr(init) and const_expr(k == 0)
+                            else accm[i1][J]
+                        )
+                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            mfma_res_ty,
+                            [
+                                a[i1][k],
+                                b_tile[J][k],
+                                c1,
+                                cbsz,
+                                blgp,
+                                osa + 1,
+                                sa_s[sub],
+                                osb,
+                                sb,
+                            ],
+                        )
+
+        def ds_read_tile(S):
+            return issue_a_ds_read_ssa(
+                s_aq_base,
+                S % aStages,
+                slot_bytes,
+                KH_TILE_A,
+                kHalves,
+                kMChunks,
+                lane_mod_16,
+                lane_div_16,
+                is_f8_a,
+            )
+
+        nDsPerTile = kMChunks * kHalves
+        nBPerTile = numAccN * kHalves
+        nMfmaPerTile = numAccN * kScaleSubBlocks * 2 * kHalves
+
+        gpu.barrier()  # A LDS published; the only fence in the body
+
+        # Declare the pipeline to LLVM's IGroupLP as SchedGroups.
+        #
+        # iglp_opt(0) is not usable here: MFMASmallGemmOpt (AMDGPUIGroupLP.cpp)
+        # only builds DS and MFMA groups, so tile S+1's B buffer_loads stay
+        # unconstrained, float to the top of the region and issue as one burst
+        # (`D2 L8 M...`).  iglp_opt(1) puts VMEM_READ only behind DS_WRITE
+        # groups, and this body has no ds_write, so those never materialise.
+        # SCHED_GROUP_BARRIER is the only mechanism that places VMEM_READ, and
+        # it is mutually exclusive with IGLP_OPT -- hence the (DS 2, MFMA 1)
+        # ladder below is MFMASmallGemmOpt's own ratio, written out by hand so
+        # a DS/VMEM head can be prepended to it.
+        #
+        # Head: one ds_read per B load, so tile S+1's VMEM is spread through
+        # tile S's ds_reads instead of bursting ahead of them.
+        for n in range_constexpr(nDsPerTile):
+            rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 0)
+            if const_expr(n < (KT - 1) * nBPerTile):
+                rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, 0)
+        # Tail: MFMASmallGemmOpt's ladder, which keeps tile S+1's ds_reads
+        # rising into tile S's MFMA stream.
+        for _ in range_constexpr(KT * nMfmaPerTile):
+            rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, 0)
+            rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
+
+        for S in range_constexpr(KT):
+            a = ds_read_tile(S)
+            if const_expr(S + 1 < KT):
+                b[S + 1] = load_b(S + 1)
+            mfma_cluster_ssa(
+                b[S],
+                a,
+                a_scale_v[S],
+                b_scale_v[S],
+                fx.Int32(S),
+                init=(S == 0),
+            )
+
+    elif const_expr(g2_kstatic):
         KT = K_TILES
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(numAccN):
@@ -618,7 +792,7 @@ def gemm2_body_v2(
 
     if const_expr(nonatomic):
         nonatomic_bf16_epilog(
-            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
+            accm,
             arg_out,
             m_row,
             n_block_idx,
