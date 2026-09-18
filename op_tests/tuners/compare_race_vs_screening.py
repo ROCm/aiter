@@ -138,16 +138,16 @@ def remeasure(shape_row, configs, block_calls, blocks, seed):
     during the re-measurement moves all of them together inside a block, and
     cancels in the comparison.
     """
-    from op_tests.tuners.tune_mha_fwd import _run_candidate, generate_data
-
     import zlib
 
-    from aiter.ops.mha_fwd_policy import MHA_FWD_TUNING_KEY_FIELDS, MhaFwdProblem
+    from op_tests.tuners.tune_mha_fwd import _run_candidate, generate_data
 
-    problem = MhaFwdProblem.from_mapping(
-        {field: shape_row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
+    # The problem CSV carries the workload only; the hardware half of the
+    # tuning key is filled in by the tuner. Everything needed to rebuild the
+    # inputs is here, so do not go looking for gfx or cu_num.
+    seed = zlib.crc32(
+        ",".join(str(shape_row[field]) for field in sorted(shape_row.index)).encode()
     )
-    key = problem.key()
     data = generate_data(
         int(shape_row["batch"]),
         int(shape_row["total_q"]),
@@ -158,8 +158,8 @@ def remeasure(shape_row, configs, block_calls, blocks, seed):
         int(shape_row["nhead_k"]),
         int(shape_row["hdim_q"]),
         int(shape_row["hdim_v"]),
-        problem.dtype,
-        zlib.crc32(",".join(map(str, key)).encode("utf-8")),
+        str(shape_row["dtype"]),
+        seed,
     )
     tensors = (data["q"], data["k"], data["v"], data["cu_q"], data["cu_k"])
     tail = (
@@ -307,14 +307,22 @@ def main():
                     chosen.append(run["winner"])
 
             remeasured = {}
+            failure = None
             if chosen:
                 print(
                     f"  re-measuring {len(chosen)} selected configs together",
                     flush=True,
                 )
-                remeasured = remeasure(
-                    shape, chosen, args.block_calls, args.blocks, args.seed
-                )
+                try:
+                    remeasured = remeasure(
+                        shape, chosen, args.block_calls, args.blocks, args.seed
+                    )
+                except Exception as error:  # noqa: BLE001
+                    # Hours of tuning runs are already in hand; losing them
+                    # because the comparison step tripped would be the worse
+                    # outcome by far.
+                    failure = f"{type(error).__name__}: {error}"
+                    print(f"  re-measurement failed: {failure}", flush=True)
 
             results["shapes"].append(
                 {
@@ -322,12 +330,14 @@ def main():
                     "shape": {k: str(v) for k, v in shape.items()},
                     "sessions": sessions,
                     "remeasured_us": remeasured,
+                    "remeasure_error": failure,
                     "summary": summarize(sessions, remeasured),
                 }
             )
+            # Written after every shape, not once at the end.
+            with open(args.out, "w") as handle:
+                json.dump(results, handle, indent=2)
 
-    with open(args.out, "w") as handle:
-        json.dump(results, handle, indent=2)
     print(f"\nwrote {args.out}")
 
     for entry in results["shapes"]:
@@ -336,10 +346,12 @@ def main():
         for strategy in ("race", "exhaustive"):
             item = summary[strategy]
             median = item["realized_median_us"]
+            wall = item["wall_seconds_median"]
             print(
-                f"  {strategy:11s} {item['wall_seconds_median']:>7.0f} s median wall, "
+                f"  {strategy:11s} "
+                f"{'n/a' if wall is None else f'{wall:7.0f}'} s median wall, "
                 f"{item['distinct_winners']} distinct winner(s), "
-                f"realized {median if median is None else f'{median:.1f}'} us, "
+                f"realized {'n/a' if median is None else f'{median:.1f}'} us, "
                 f"spread {item['realized_spread']:.2%}"
             )
         if "speedup" in summary:
