@@ -233,9 +233,16 @@ def select_3d_config(
             attn_warps, attn_stages = 4, 1
         occ = waves_per_eu * 4 // attn_warps
         wide_lds_copy = is_gfx950_small_head(head_size)
+        # gfx942 over-segments head_size>=512 decode at low/mid batch (measured
+        # ~2x the optimum): skip the occ multiplier and cap MAX_SEGMENTS below so
+        # batch 1/16/64 land at ~64/32/16 (the measured optima) instead of
+        # 128/64/16. Output unchanged (segmentation only reorders the reduction).
+        gfx942_big = (
+            DEVICE_ARCH == "gfx942" and head_size >= 512 and not arch.is_rdna
+        )
         # The occupancy multiplier over-segments the KV split for the wide-copy
         # path, so we skip it there; every other case applies it.
-        if not wide_lds_copy:
+        if not wide_lds_copy and not gfx942_big:
             target_num_prgms = target_num_prgms * occ
 
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
@@ -244,6 +251,8 @@ def select_3d_config(
             TILE_SIZE = 64
 
         MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+        if gfx942_big:
+            MAX_SEGMENTS = min(64, MAX_SEGMENTS)
         # the >= 8 floor would clamp the smaller splits (4 and 2) back up to 8
         MIN_SEGMENTS = 1 if wide_lds_copy else min(8, MAX_SEGMENTS)
         if head_size >= 512 and not arch.is_rdna:
