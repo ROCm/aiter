@@ -729,6 +729,13 @@ regresses width-2051 ``L=512`` prefill to 530.0 us from 519.3 us
 (~2.1%); decode is flat at 24.2 / 24.1 us and all 18 tests pass. The
 pipeline was reverted. Do not retry the old 90 KiB ping-pong mapping.
 
+On gfx950, this tile's V gather now runs after the K barrier and before
+QK (separate ``v_lds``). gfx942 still gathers V after QK so it can
+overwrite the aliased KV tile. GPU 6 / gfx950: 18 pytest cases,
+``err=0``, width-2051 ``L=512`` is 19.8 / 22.7 / 513.5 us vs 20.7 /
+24.0 / 519.5. Occupancy ISA is unchanged (6 barriers, decode VGPR 79,
+prefill VGPR 257).
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

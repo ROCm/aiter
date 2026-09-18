@@ -600,6 +600,11 @@ went 519.5 → 548.4 us. Keep the one-split direct ``out`` write.
 width-2051 ``L=512`` is 24.2 / 24.1 / 530.0 us versus 24.4 / 24.1 /
 519.3 us. All 18 tests pass; the ~2.1% prefill regression was reverted.
 
+On gfx950, V gather for the current tile now sits after the K barrier
+and before QK. GPU 6 / gfx950: 18 pytest cases, ``err=0``, width-2051
+``L=512`` is 19.8 / 22.7 / 513.5 us vs 20.7 / 24.0 / 519.5. Occupancy
+ISA is unchanged.
+
 
 
 
