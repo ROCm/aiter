@@ -332,6 +332,96 @@ def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
     )
 
 
+@pytest.mark.parametrize(("sbm", "block_m"), [(160, 64), (160, 32), (128, 64)])
+@pytest.mark.parametrize("epilog", ["atomic", "reduce"])
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_v2_stage2_sub_tiled(sbm, block_m, epilog):
+    """GEMM2 where the sort block (SBM) is not a multiple of the compute tile (BM)."""
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    torch.manual_seed(123)
+    torch.cuda.manual_seed(123)
+    inter_dim, tile_k = 384, 128
+    token, model_dim, E, topk = 2 * sbm, 128, 1, 1
+    a2 = torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
+    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
+    topk_ids = torch.zeros((token, topk), dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones((token, topk), dtype=torch.float32, device="cuda")
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, E, model_dim, torch.bfloat16, sbm
+    )
+
+    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+        a2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    w1_q, _ = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+    a2_dequant = (
+        a2_q.float().view(token, topk, inter_dim // 32, 32)
+        * fp4_utils.e8m0_to_f32(a2_scale).view(token, topk, inter_dim // 32, 1)
+    ).view(token, topk, inter_dim)
+    ref = torch_moe_stage2(
+        a2_dequant,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        dtype=torch.bfloat16,
+        quant_type=Q_TYPE,
+        w2_scale=w2_scale,
+        a2_scale=None,
+        doweight=True,
+    )
+
+    a2_sorted = a2_q.reshape(token * topk, inter_dim)
+    a2_scale_sorted = mxfp4_moe_sort_fwd(
+        a2_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        cols=inter_dim,
+    )
+    w2_shuffled = shuffle_weight_a16w4(w2_q, 16, False)
+    w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, E, False)
+    out = torch.zeros((token, model_dim), dtype=torch.bfloat16, device="cuda")
+
+    mxfp4_moe_gemm2(
+        inter_sorted_quant=a2_sorted,
+        inter_sorted_shuffled_scale=a2_scale_sorted,
+        w2_u8=w2_shuffled,
+        w2_scale_u8=w2_scale_shuffled,
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        sorted_token_ids=sorted_ids,
+        sorted_weights=sorted_weights,
+        out=out,
+        M_logical=token,
+        max_sorted=a2_sorted.shape[0],
+        NE=E,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        BM=block_m,
+        BN=128,
+        BK=tile_k,
+        use_nt=True,
+        a_dtype="fp8",
+        epilog=epilog,
+        SBM=sbm,
+        persist=False,
+    )
+    torch.cuda.synchronize()
+    _check_close(
+        ref.float(),
+        out.float(),
+        f"v2_stage2_subtiled_sbm{sbm}_bm{block_m}_{epilog}",
+    )
+
+
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_stage2_fp8_ep_reduction():
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
