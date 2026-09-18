@@ -3,8 +3,9 @@
 """Shared utilities for group_sizes-based MoE GEMM wrappers."""
 
 import torch
+import triton
 
-__all__ = ["build_block_mapping"]
+__all__ = ["build_block_mapping", "group_sizes_to_expt_tensors"]
 
 
 def build_block_mapping(
@@ -84,3 +85,29 @@ def build_block_mapping(
     block_token_ends = torch.where(valid, ends, zero.expand_as(ends))
 
     return block_expert_ids, block_token_offsets, block_token_ends, max_blocks
+
+
+def group_sizes_to_expt_tensors(
+    group_sizes: torch.Tensor, block_m: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Convert group_sizes to ExptHist/ExptOffs/ExptData for _moe_gemm_a8w8.
+    Tokens must be in contiguous expert order (no gather needed).
+    """
+    E = group_sizes.shape[0]
+    device = group_sizes.device
+    expt_hist = group_sizes.to(torch.int32)
+    expt_offs = torch.zeros(E, dtype=torch.int32, device=device)
+    if E > 1:
+        expt_offs[1:] = group_sizes[:-1].cumsum(0).to(torch.int32)
+    expt_offs_sum = group_sizes.sum().to(torch.int32).unsqueeze(0)
+    entries = []
+    for e in range(E):
+        n_blocks = triton.cdiv(int(group_sizes[e].item()), block_m)
+        for b in range(n_blocks):
+            entries.append((b << 16) | e)
+    expt_data = (
+        torch.tensor(entries, dtype=torch.int32, device=device)
+        if entries
+        else torch.zeros(0, dtype=torch.int32, device=device)
+    )
+    return expt_hist, expt_offs, expt_offs_sum, expt_data, len(entries)
