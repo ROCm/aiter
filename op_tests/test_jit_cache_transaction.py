@@ -699,37 +699,39 @@ class TestStaleLockDetection(unittest.TestCase):
         """A child that has exited but has not been reaped.
 
         Its PID stays allocated, so signal 0 still succeeds against it even
-        though it will never run again.
+        though it will never run again. Popen rather than os.fork, so the
+        test does not fork a multi-threaded interpreter; the child stays a
+        zombie until the returned handle is waited on.
         """
-        pid = os.fork()
-        if pid == 0:  # pragma: no cover - the child exits immediately
-            os._exit(0)
+        child = subprocess.Popen([sys.executable, "-c", ""])
         deadline = time.time() + 10
         while time.time() < deadline:
-            with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            with open(f"/proc/{child.pid}/stat", "rb") as stat_file:
                 if stat_file.read().rpartition(b")")[2].split()[0] == b"Z":
-                    return pid
+                    return child
             time.sleep(0.01)
+        child.kill()
+        child.wait()
         raise AssertionError("child did not become a zombie")
 
     def test_a_zombie_holder_is_treated_as_dead(self):
-        pid = self._spawn_zombie()
+        child = self._spawn_zombie()
         try:
-            os.kill(pid, 0)  # the trap: a zombie answers this
-            self.assertFalse(FileBaton._pid_alive(pid))
+            os.kill(child.pid, 0)  # the trap: a zombie answers this
+            self.assertFalse(FileBaton._pid_alive(child.pid))
         finally:
-            os.waitpid(pid, 0)
+            child.wait()
 
     def test_a_live_holder_is_left_alone(self):
         self.assertTrue(FileBaton._pid_alive(os.getpid()))
 
     def test_a_lock_held_by_a_zombie_is_stale_and_can_be_broken(self):
-        pid = self._spawn_zombie()
+        child = self._spawn_zombie()
         try:
             with tempfile.TemporaryDirectory() as directory:
                 path = os.path.join(directory, "module.lock")
                 with open(path, "w", encoding="utf-8") as lock_file:
-                    lock_file.write(f"{pid}\n{socket.gethostname()}\n")
+                    lock_file.write(f"{child.pid}\n{socket.gethostname()}\n")
                 baton = FileBaton(path)
                 self.assertTrue(baton._is_stale())
                 # wait() returns False to tell the caller nobody ever
@@ -739,7 +741,7 @@ class TestStaleLockDetection(unittest.TestCase):
                 self.assertFalse(baton.wait())
                 self.assertFalse(os.path.exists(path))
         finally:
-            os.waitpid(pid, 0)
+            child.wait()
 
     def test_a_lock_held_by_a_live_process_is_not_stolen(self):
         with tempfile.TemporaryDirectory() as directory:
