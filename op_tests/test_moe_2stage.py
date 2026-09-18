@@ -105,7 +105,9 @@ def test_fmoe(
     disable_stage2_bias=False,
     ref_dtype="bf16",
     dsv4_topk=False,
+    herd_topk=False,
     route_scale=2.5,
+    cudagraph=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -114,9 +116,27 @@ def test_fmoe(
         linear_beta = (
             DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
         )
+    route_profile = None
+    if dsv4_topk:
+        if E != 384 or topk != 6:
+            raise ValueError("--dsv4-topk requires the routing shape E=384, topk=6")
+        route_profile = ("dsv4", E, topk, "sqrtsoftplus", dtypes.bf16, None)
+    elif herd_topk:
+        if (E, topk) == (384, 6):
+            route_profile = ("dsv4", E, topk, "sqrtsoftplus", dtypes.bf16, None)
+        elif (E, topk) == (896, 16):
+            route_profile = ("kimi_k3", E, topk, "sigmoid", dtypes.fp32, None)
+        elif (E, topk) == (129, 5):
+            route_profile = ("minimax_m3", 128, 4, "sigmoid", dtypes.fp32, 128)
+        else:
+            raise ValueError(
+                "--herd-topk supports DSV4 (E=384,K=6), Kimi-K3 "
+                "(E=896,K=16), and MiniMax-M3 (E=129,K=5)"
+            )
+
     # Baseline/HERD are normally launched as separate processes. Pin every
     # generated tensor so their timing comparison changes routing only.
-    if dsv4_topk:
+    if route_profile is not None:
         torch.manual_seed(0)
     torch_quant = aiter.get_torch_quant(qType)
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
@@ -145,7 +165,10 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
-    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+    if route_profile is not None:
+        _, routed_E, routed_topk, _, score_dtype, _ = route_profile
+        score = torch.randn((token, routed_E), dtype=score_dtype)
+    elif AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
         # Highest priority: activate n randomly-chosen experts (NOT the first n);
         # the other E-n experts are masked to -inf. Load is spread evenly across
         # the n active experts by round-robin (balanced), so all n are used.
@@ -173,34 +196,55 @@ def test_fmoe(
 
     route_us = None
     active_experts = None
-    if dsv4_topk:
-        if E != 384 or topk != 6:
-            raise ValueError(
-                "--dsv4-topk requires the TP8 routing shape E=384, topk=6"
-            )
+    if route_profile is not None:
+        profile_name, routed_E, routed_topk, score_func, _, shared_expert_id = (
+            route_profile
+        )
         correction_bias = (
-            torch.randn(E, dtype=torch.float32, device=input.device) * 0.1
+            torch.randn(routed_E, dtype=torch.float32, device=input.device) * 0.1
         )
-        topk_weights = torch.empty(
-            (token, topk), dtype=torch.float32, device=input.device
+        routed_weights = torch.empty(
+            (token, routed_topk), dtype=torch.float32, device=input.device
         )
-        topk_ids = torch.empty(
-            (token, topk), dtype=torch.int32, device=input.device
+        routed_ids = torch.empty(
+            (token, routed_topk), dtype=torch.int32, device=input.device
         )
 
-        def run_dsv4_router():
+        def run_herd_router():
             aiter.topk_gating(
-                topk_weights,
-                topk_ids,
+                routed_weights,
+                routed_ids,
                 score,
                 correction_bias,
                 need_renorm=True,
                 routed_scaling_factor=route_scale,
-                score_func="sqrtsoftplus",
+                score_func=score_func,
             )
 
-        _, route_us = run_perftest(run_dsv4_router, num_iters=20, num_warmup=3)
-        active_experts = int(torch.unique(topk_ids).numel())
+        _, route_us = run_perftest(run_herd_router, num_iters=20, num_warmup=3)
+        active_experts = int(torch.unique(routed_ids).numel())
+        if shared_expert_id is None:
+            topk_weights, topk_ids = routed_weights, routed_ids
+        else:
+            topk_weights = torch.cat(
+                [
+                    routed_weights,
+                    torch.ones((token, 1), dtype=torch.float32, device=input.device),
+                ],
+                dim=1,
+            )
+            topk_ids = torch.cat(
+                [
+                    routed_ids,
+                    torch.full(
+                        (token, 1),
+                        shared_expert_id,
+                        dtype=torch.int32,
+                        device=input.device,
+                    ),
+                ],
+                dim=1,
+            )
     else:
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
@@ -541,7 +585,12 @@ def test_fmoe(
             aiter.fused_moe.kernel_bench_callable = None
         kernel_us = {}
         for _name, _call in kernel_bench_callable:
-            _, _us = run_perftest(_call, num_iters=20, num_warmup=3)
+            _, _us = run_perftest(
+                _call,
+                num_iters=20,
+                num_warmup=3,
+                testGraph=cudagraph,
+            )
             kernel_us[_name] = _us
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
@@ -562,11 +611,12 @@ def test_fmoe(
             "us_stage1": us1,
             "us_stage2": us2_stage,
         }
-        if dsv4_topk:
+        if route_profile is not None:
             result.update(
                 route_us=route_us,
                 active_experts=active_experts,
                 total_us=result["us"] + route_us,
+                route_profile=profile_name,
             )
         return result
 
@@ -577,8 +627,9 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        num_iters=20 if dsv4_topk else 5,
-        num_warmup=5 if dsv4_topk else 2,
+        num_iters=20 if route_profile is not None else 5,
+        num_warmup=5 if route_profile is not None else 2,
+        testGraph=cudagraph,
         **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
@@ -620,11 +671,12 @@ def test_fmoe(
         )
 
     result = {"us": us2, "logits_diff": float(logits_diff)}
-    if dsv4_topk:
+    if route_profile is not None:
         result.update(
             route_us=route_us,
             active_experts=active_experts,
             total_us=us2 + route_us,
+            route_profile=profile_name,
         )
     return result
 
@@ -828,10 +880,23 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--herd-topk",
+    action="store_true",
+    help=(
+        "Use the model routing profile selected by E/topk for DSV4, Kimi-K3, "
+        "or MiniMax-M3. AITER_FLYDSL_USE_HERD selects HERD versus baseline."
+    ),
+)
+parser.add_argument(
     "--route-scale",
     type=float,
     default=2.5,
     help="DeepSeek-V4 routed scaling factor used by --dsv4-topk (default: 2.5).",
+)
+parser.add_argument(
+    "--cudagraph",
+    action="store_true",
+    help="Benchmark fused MoE (and --kernel stages) using HIP graph replay.",
 )
 parser.add_argument(
     "--ref-dtype",
@@ -1540,7 +1605,9 @@ for kwargs, extras in case_iter:
                 kernel_bench=args.kernel,
                 ref_dtype=args.ref_dtype,
                 dsv4_topk=args.dsv4_topk,
+                herd_topk=args.herd_topk,
                 route_scale=args.route_scale,
+                cudagraph=args.cudagraph,
             )
     except torch.cuda.OutOfMemoryError as exc:
         aiter.logger.warning(
