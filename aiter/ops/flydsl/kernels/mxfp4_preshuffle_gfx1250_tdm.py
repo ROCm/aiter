@@ -199,6 +199,7 @@ def launch_gemm_a8w4_tdm(
     AS_KSTEPS = tile_k // 128
     AS_INNER = AS_KSTEPS * wmma_m_rep * 16
     AS_SUPERS = m_warp
+    AS_FULL_KDW = K // 128
     AS_FULL_INNER = (K // 128) * wmma_m_rep * 16
     # A-scale LDS: one outer row is one wave's M tile, and its inner
     # (k128, wm, lane16) layout gives each WMMA scale operand a contiguous
@@ -571,10 +572,27 @@ def launch_gemm_a8w4_tdm(
             wv=waves[1],
             cache_modifier=tdm_b_th,
         )
-        if const_expr(row_major_ascale):
+        if const_expr(row_major_ascale and tdm_as_in_prologue):
+            # The compact wire is row-major with a padded global row pitch.
+            # Keep that layout in the resident LDS region too: each owner wave
+            # brings in a slice of M rows across the complete K-scale range.
+            add_tdm_loads(
+                gSA_base,
+                blk_m64 * SA_GROW,
+                SA_GROW,
+                None,
+                AS_FULL_KDW,
+                tile_m,
+                on_i32=True,
+                lds_off=AS_FULL_OFF // 4,
+                lds_row=AS_FULL_KDW,
+                k_adv=0,
+                wv=waves[2],
+                target_jobs=as_prologue_jobs,
+            )
+        elif const_expr(row_major_ascale):
             # Compact dispatch lands e8m0 row-major at the wire pitch. The
-            # as-prologue path below is the interleaved (16-row) layout a local
-            # preshuffle writes; mixing the two dequantizes garbage to NaN.
+            # rotating path keeps one tile_k slice in each pipeline buffer.
             add_tdm_loads(
                 gSA_base,
                 blk_m64 * SA_GROW,
@@ -755,6 +773,11 @@ def launch_gemm_a8w4_tdm(
 
         def load_sa(buf, sm, ksl, kt):
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            if const_expr(row_major_ascale and tdm_as_in_prologue):
+                as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
+                row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD
+                off = (row * AS_FULL_KDW + kt * SA_KDW + ksl) * 4
+                return lds_load_b32(as_base, fx.Int32(off))[0]
             if const_expr(row_major_ascale):
                 off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
                 return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
