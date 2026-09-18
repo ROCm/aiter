@@ -75,7 +75,8 @@ void pa_mqa_logits_mxfp4_gfx1250_fwd_sched(aiter_tensor_t& q,
 
 #ifdef PA_MQA_LOGITS_MXFP4_GFX1250_IMPL
 
-using bf16_t = __bf16;
+#include <opus/dtypes.hpp>
+using bf16_t = opus::dtypes::bf16;
 
 // The relu must be the IEEE-754-2019 `maximum`, which PROPAGATES NaN, and not a
 // compare-and-select, which returns 0 for it. An E8M0 scale of 0xFF is NaN, the indexer's KV
@@ -1025,10 +1026,11 @@ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
                   "no separate mapping: a decode table is one whose tiles carry a zero start.");
 
     using D_BYTE  = opus::u8_t;
+    using D_ACC   = typename T::D_ACC;
     using D_SCALE = typename T::D_SCALE;
     using D_OUT   = typename T::D_OUT;
     using D_WEIGHT = typename T::D_WEIGHT;
-    using Mma = opus::wmma<opus::fp4_t, opus::fp4_t, float,
+    using Mma = opus::wmma<opus::fp4_t, opus::fp4_t, D_ACC,
                           T::MMA_M, T::MMA_N, T::MMA_K, T::WAVE_SIZE>;
     Mma mma_op;
     static_assert(sizeof(typename Mma::vtype_a) == T::A_BYTES_PER_LANE);
