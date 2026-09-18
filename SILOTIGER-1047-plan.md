@@ -740,8 +740,7 @@ prefill VGPR 257).
 per-element stores plus ``make_tiled_copy_B`` PV. Oracle ``err=0`` and
 18 tests pass, and decode improved to 18.6 / 21.2 us, but prefill
 regressed to 613.0 us from 513.5. Keep row-major ``[BN, D]`` V and
-scalar PV B gathers. This does not cover a later 128-bit LDS transpose
-into a second V buffer.
+scalar PV B gathers.
 
 **Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
 ``4 < M * Hk < 32``. ``M=8`` stayed correct (``err=0``) but width-2051
@@ -757,6 +756,11 @@ threads. This is not the old ~90 KiB aliased 256-thread BN64 mapping.
 ``q_vec[i]`` instead of ``q_vec[q_off + i]``. ``err=0``, but
 width-2051 ``L=512`` stayed 19.8 / 23.3 / 514.9 us vs 19.8 / 22.7 /
 513.5. Prefill VGPR is not this extract.
+
+**Do not retry** a second token-major V LDS (``v_t``) filled by scalar
+scatters from the 128-bit row-major gather, plus ``make_tiled_copy_B``
+PV. ``err=0``, but width-2051 ``L=512`` went 19.9 / 23.3 / 935.7 us
+vs 19.8 / 22.7 / 513.5. Keep one row-major V tile.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.

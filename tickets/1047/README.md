@@ -607,8 +607,7 @@ ISA is unchanged.
 
 **Do not retry** token-major ``(D, BLOCK_N)`` V LDS with per-element
 stores and ``make_tiled_copy_B`` PV. ``err=0``, decode 18.6 / 21.2 us,
-prefill 613.0 us vs 513.5. Keep row-major ``[BN, D]`` V. A later
-128-bit LDS transpose into a second buffer is a different experiment.
+prefill 613.0 us vs 513.5. Keep row-major ``[BN, D]`` V.
 
 **Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
 ``4 < M * Hk < 32``. ``M=8`` went 22.7 → 33.5 us (``err=0``); ``M=1``
@@ -621,6 +620,10 @@ threads. Not the old aliased ~90 KiB 256-thread BN64 mapping.
 **Do not retry** eliding gfx950 K32 ``q_off`` on the Q 128-bit load.
 ``err=0``; width-2051 ``L=512`` was 19.8 / 23.3 / 514.9 us vs 19.8 /
 22.7 / 513.5. Prefill VGPR is not that extract.
+
+**Do not retry** a second token-major ``v_t`` filled from the 128-bit
+row-major V gather plus tiled PV B. Prefill went 513.5 → 935.7 us
+(``err=0``). Keep one row-major V tile.
 
 
 
