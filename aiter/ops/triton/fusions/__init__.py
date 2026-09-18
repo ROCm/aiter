@@ -3,14 +3,25 @@
 
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
-from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.ops.triton.fusions.mhc import (
+    MHC_DSV4_BACKWARD_FALLBACK,
+    mhc,
+    mhc_head_dsv4,
+    mhc_post,
+    mhc_post_dsv4,
+    mhc_pre_dsv4,
+)
 from aiter.ops.triton.fusions.silu_and_mul_backward import silu_and_mul_backward
 
 __all__ = [
+    "MHC_DSV4_BACKWARD_FALLBACK",
     "attn_res_fwd",
     "attn_res_gate",
     "fused_sigmoid_mul",
     "mhc",
+    "mhc_head_dsv4",
     "mhc_post",
+    "mhc_post_dsv4",
+    "mhc_pre_dsv4",
     "silu_and_mul_backward",
 ]
