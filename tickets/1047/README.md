@@ -605,6 +605,11 @@ and before QK. GPU 6 / gfx950: 18 pytest cases, ``err=0``, width-2051
 ``L=512`` is 19.8 / 22.7 / 513.5 us vs 20.7 / 24.0 / 519.5. Occupancy
 ISA is unchanged.
 
+**Do not retry** token-major ``(D, BLOCK_N)`` V LDS with per-element
+stores and ``make_tiled_copy_B`` PV. ``err=0``, decode 18.6 / 21.2 us,
+prefill 613.0 us vs 513.5. Keep row-major ``[BN, D]`` V. A later
+128-bit LDS transpose into a second buffer is a different experiment.
+
 
 
 

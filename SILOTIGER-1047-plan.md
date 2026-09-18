@@ -736,6 +736,13 @@ overwrite the aliased KV tile. GPU 6 / gfx950: 18 pytest cases,
 24.0 / 519.5. Occupancy ISA is unchanged (6 barriers, decode VGPR 79,
 prefill VGPR 257).
 
+**Do not retry** token-major ``(D, BLOCK_N)`` V LDS written with
+per-element stores plus ``make_tiled_copy_B`` PV. Oracle ``err=0`` and
+18 tests pass, and decode improved to 18.6 / 21.2 us, but prefill
+regressed to 613.0 us from 513.5. Keep row-major ``[BN, D]`` V and
+scalar PV B gathers. This does not cover a later 128-bit LDS transpose
+into a second V buffer.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
