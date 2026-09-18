@@ -641,6 +641,13 @@ cross-wave C sum). 18 pytest cases, ``err=0``; width-2051 ``L=512`` was
 (128 threads still split D). Idle waves plus extra Q fragments do not
 close the split-kernel gap. Keep D-split QK across four waves.
 
+**Do not retry** decode all-wave full-D QK (every wave issues 8×K32,
+softmax reads only wave-0 C, no C sum). 18 pytest cases, ``err=0``;
+width-2051 ``L=512`` was 21.0 / 25.7 / 515.4 us vs 19.8 / 22.7 / 513.5.
+Redundant QK matches Triton's K32 count but is 4× the D-split flops and
+loses decode. Keep D-split QK across four waves.
+
+
 
 
 
