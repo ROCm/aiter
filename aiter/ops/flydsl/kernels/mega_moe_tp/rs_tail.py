@@ -64,6 +64,8 @@ from .p2p import (
 )
 from .reduce_scatter import (
     ARRIVE_STRIDE_BYTES,
+    PHASE_CTR_SLOT,
+    PHASE_GATE_SLOT,
     MAX_SERVICE_BLOCKS,
     RS_DESC_EPOCH,
     RS_DESC_FANIN,
@@ -74,7 +76,7 @@ from .reduce_scatter import (
     rs_desc_slot,
 )
 
-__all__ = ["emit_rs_tail", "read_epoch", "rs_tail_slots"]
+__all__ = ["emit_phase_barrier", "emit_rs_tail", "read_epoch", "rs_tail_slots"]
 
 _VEC_WORDS = RS_UNIT_ELEMS // 2
 
@@ -98,6 +100,39 @@ def read_epoch(arg_desc, slots):
     """
     epoch_addr = desc_slot(arg_desc, slots["epoch"])
     return epoch_addr, fx.Int32(comm.load_i32_global_agent(epoch_addr)) + fx.Int32(1)
+
+
+@flyc.jit
+def emit_phase_barrier(arg_desc, epoch, cta, ctas, tid, *, tp_size: int):
+    """Grid-wide barrier with a device-visible handoff, for a multi-GEMM kernel.
+
+    Separates two compute phases inside one kernel when the second reads what
+    the first wrote. A plain ``s_waitcnt`` is *not* enough here, unlike in
+    :func:`emit_rs_tail`: MI355X L2 is per-XCD, so a store that reached the
+    writer's L2 is not visible to a reader on another XCD. Between kernels the
+    dispatch boundary handles that; inside one kernel it has to be an explicit
+    agent-scope release/acquire.
+
+    The generation is the arena epoch, so nothing needs resetting between
+    launches, and the counter is reset by the last CTA in.
+
+    **Requires a resident grid.** Every CTA waits here, so a queued CTA that
+    cannot be scheduled deadlocks the ones that arrived -- size the grid to what
+    the device holds at once.
+    """
+    base = desc_slot(arg_desc, rs_tail_slots(tp_size)["fanin"])
+    ctr = base + fx.Int64(PHASE_CTR_SLOT * ARRIVE_STRIDE_BYTES)
+    gate = base + fx.Int64(PHASE_GATE_SLOT * ARRIVE_STRIDE_BYTES)
+    comm.fence_agent_release()
+    gpu.barrier()
+    if tid == fx.Int32(0):
+        previous = fx.Int32(comm.atomic_add_agent(ctr, fx.Int32(1)))
+        if previous == ctas - fx.Int32(1):
+            comm.store_i32_global_agent_release(ctr, fx.Int32(0))
+            comm.store_i32_global_agent_release(gate, epoch)
+        comm.spin_until_ge_i32_agent(gate, epoch)
+    gpu.barrier()
+    comm.fence_agent_acquire()
 
 
 @flyc.jit

@@ -57,6 +57,8 @@ from .p2p import (
 
 __all__ = [
     "ARRIVE_STRIDE_BYTES",
+    "PHASE_CTR_SLOT",
+    "PHASE_GATE_SLOT",
     "WRITEBACK_BLOCKS",
     "RS_DESC_FANIN",
     "MAX_SERVICE_BLOCKS",
@@ -110,10 +112,15 @@ MAX_SERVICE_BLOCKS = 256
 #: line resident in exactly one XCD's L2.
 ARRIVE_STRIDE_DW = 32
 ARRIVE_STRIDE_BYTES = ARRIVE_STRIDE_DW * 4
-#: One line per fan-in counter, then four more: the whole-grid fan-in root, the
+#: One line per fan-in counter, then six more: the whole-grid fan-in root, the
 #: flag that releases every service CTA once that root fills, the writeback
-#: fan-in root, and the flag that says every peer has published.
-RS_ARRIVE_SLOTS = (MAX_SERVICE_BLOCKS + 4) * ARRIVE_STRIDE_DW
+#: fan-in root, the flag that says every peer has published, and a
+#: counter/gate pair for the inter-phase barrier a kernel hosting more than one
+#: GEMM needs.
+RS_ARRIVE_SLOTS = (MAX_SERVICE_BLOCKS + 6) * ARRIVE_STRIDE_DW
+#: Line indices of the phase-barrier pair, past the four the RS tail owns.
+PHASE_CTR_SLOT = MAX_SERVICE_BLOCKS + 4
+PHASE_GATE_SLOT = MAX_SERVICE_BLOCKS + 5
 #: L2 is per XCD and ``buffer_wbl2`` writes back only the issuing XCD's, so this
 #: many service CTAs -- consecutive block ids, which round-robin the XCDs -- is
 #: exactly enough to cover the device. Letting *every* service CTA do it instead

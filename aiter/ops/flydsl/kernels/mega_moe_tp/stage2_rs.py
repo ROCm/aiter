@@ -156,7 +156,9 @@ def compile_stage2_rs(
 
     tail_slots = rs_tail_slots(tp_size)
 
-    def compose(*, module_name, emit_gemm2_tile, shared_storage):
+    def compose(*, module_name, emit_gemm2_tile, shared_storage, **_extra):
+        # ``**_extra`` absorbs hook fields this composition does not need
+        # (``lds_bytes``, added for compositions that host a second GEMM).
         name = f"{module_name}_tp{tp_size}_rs_h{model_dim}_sv{service_blocks}"
 
         @flyc.kernel(name=name, known_block_size=[_BLOCK, 1, 1])

@@ -1341,8 +1341,18 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    _composition=None,
 ):
-    """Compile GEMM1 with expert-sorted output."""
+    """Compile GEMM1 with expert-sorted output.
+
+    ``_composition`` hands the tile emitter to a caller that wants to author the
+    surrounding kernel itself -- the same hook
+    :func:`~.mxmoe_dispatcher.compile_gemm2_a4w4_port` exposes, so a caller can
+    put GEMM1 and GEMM2 in one kernel. It is called as
+    ``_composition(module_name=..., emit_gemm1_tile=..., lds_bytes=...,
+    block_threads=..., n_blocks=...)`` and whatever it returns is returned from
+    here instead of the standalone launcher.
+    """
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
@@ -1446,6 +1456,76 @@ def compile_gemm1_a4w4_port(
     @fx.struct
     class SharedStorage:
         raw: fx.Array[fx.Uint8, lds_bytes, 16]
+
+    if _composition is not None:
+
+        @flyc.jit
+        def emit_gemm1_tile(
+            arg_aq,
+            arg_ascale,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_mind,
+            arg_aqout,
+            arg_ascaleout,
+            arg_hidden,
+            arg_bias,
+            tile,
+            lane,
+            wave,
+            i32_ntok,
+            total_m_blocks,
+            lds_raw_ptr,
+        ):
+            _gemm1_body(
+                lds_raw_ptr,
+                arg_aq,
+                arg_ascale,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_mind,
+                arg_aqout,
+                arg_ascaleout,
+                arg_hidden,
+                arg_bias,
+                tile,
+                lane,
+                wave,
+                use_nt,
+                i32_ntok,
+                total_m_blocks,
+                BM=BM,
+                BN=BN,
+                BK=BK,
+                inline_quant=inline_quant,
+                prefetch_hidden=prefetch_hidden,
+                a_dtype=a_dtype,
+                out_dtype=out_dtype,
+                act=act,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                swiglu_limit=swiglu_limit,
+                enable_bias=enable_bias,
+                K=D_HIDDEN,
+                N_OUT=N_OUT,
+                NE=NE,
+                interleave=interleave,
+                native_scale_layout=native_scale_layout,
+                num_waves=num_waves,
+                k_wave=k_wave,
+            )
+
+        return _composition(
+            module_name=f"gemm1_a4w4_port_{name_suffix}",
+            emit_gemm1_tile=emit_gemm1_tile,
+            lds_bytes=lds_bytes,
+            block_threads=block_threads,
+            n_blocks=NUM_N_BLOCKS,
+            xcd_swizzle=xcd_swizzle,
+            BM=BM,
+        )
 
     @flyc.kernel(
         name=f"gemm1_a4w4_port_{name_suffix}",

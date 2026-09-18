@@ -92,6 +92,18 @@ _MAX_WAVES_PER_CU = 4
 #: wins. Both are overridable; 0 disables the fused path, -1 always uses it.
 _AG_FUSED_MAX_BYTES = int(os.environ.get("AITER_TP_AG_FUSED_MAX_BYTES", 32 << 20))
 _RS_FUSED_MAX_BYTES = int(os.environ.get("AITER_TP_RS_FUSED_MAX_BYTES", 24 << 20))
+#: Budget for a *different* decision: folding the ReduceScatter into a compute
+#: kernel's tail versus running it as the standalone fused pair. That crossover
+#: sits much later than the fused-vs-NCCL one above, because the tail is being
+#: compared against the fused pull rather than against NCCL. Measured rs_gain on
+#: TP8 (>1 means the tail wins):
+#:
+#:     bytes     6M    12M    21M    42M    49M    84M    98M   196M
+#:     gain    1.45   1.18   0.93   1.00   1.09   0.76   0.86   0.79
+#:
+#: so the tail holds to ~49 MB and is clearly losing by ~84 MB. 64 MB splits
+#: them. Like the budgets above this is a machine-specific tuning point.
+_RS_TAIL_MAX_BYTES = int(os.environ.get("AITER_TP_RS_TAIL_MAX_BYTES", 64 << 20))
 
 COLLECTIVE_BACKENDS = ("auto", "fused", "nccl")
 
@@ -430,6 +442,18 @@ class TpMoeCollectives:
         )
 
     # -- ReduceScatter ------------------------------------------------------
+    def rs_fused_is_profitable(self, local_rows: int) -> bool:
+        """Whether folding the ReduceScatter into a compute kernel still wins.
+
+        A kernel that grows the RS tail needs its own budget: past a point the
+        tail loses to the standalone fused pair, and it has no fallback of its
+        own. Skipping the check entirely cost 0.98x at glm5 / 32768 tokens,
+        where the tail ran 32% slower than the split path; reusing
+        ``_RS_FUSED_MAX_BYTES`` instead over-corrected and gave back 15-24 us at
+        kimi3 / 4096-8192. See :data:`_RS_TAIL_MAX_BYTES`.
+        """
+        return self._use_fused(self.rs_wire_bytes(local_rows), _RS_TAIL_MAX_BYTES)
+
     def rs_descriptor(self) -> int:
         """Device address of the ReduceScatter descriptor.
 

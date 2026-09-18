@@ -1965,6 +1965,7 @@ def _mxfp4_a4w4_stage1(
     k_wave=1,
     prefetch_hidden=False,
     prequantized=False,
+    _gemm1_launch=None,
 ):
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
@@ -2045,7 +2046,11 @@ def _mxfp4_a4w4_stage1(
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
     _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
-    flydsl_mxfp4_gemm1(
+    # A caller that hosts GEMM1 inside a larger kernel takes the call instead of
+    # launching it, so it reuses this function's operand and buffer derivation
+    # rather than duplicating it.
+    _launch = flydsl_mxfp4_gemm1 if _gemm1_launch is None else _gemm1_launch
+    _launch(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
         w1_u8=w1,
@@ -2338,6 +2343,9 @@ def _mxfp4_a4w4_stage1_fw(
         k_wave=p1.get("k_wave", 1),
         prefetch_hidden=p1.get("prefetch_hidden", False),
         prequantized=prequantized,
+        # Forwarded, not consumed: a caller hosting GEMM1 inside a larger kernel
+        # takes the launch and reuses the operand derivation above.
+        _gemm1_launch=_kwargs.get("_gemm1_launch"),
     )
     return inter_sorted_quant, inter_sorted_scale
 

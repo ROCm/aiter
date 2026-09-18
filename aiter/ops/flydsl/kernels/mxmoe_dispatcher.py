@@ -517,6 +517,9 @@ def compile_gemm2_a4w4_port(
             module_name=name,
             emit_gemm2_tile=_gemm2_tile,
             shared_storage=SharedStorage,
+            # A composition that also hosts another GEMM needs the size, not
+            # just the struct, so it can allocate the union of both LDS needs.
+            lds_bytes=lds_bytes,
         )
         if BM == 16:
             launch_gemm2.compile_hints["llvm_options"] = {"enable-post-misched": False}

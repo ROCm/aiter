@@ -91,6 +91,13 @@ logger = logging.getLogger("aiter")
 #: Send the BF16 wire through ``_fused_moe_impl`` so it can reach the fused
 #: ReduceScatter. Off by default: a net loss in eager mode, free under graphs.
 _BF16_VIA_IMPL = os.environ.get("AITER_TP_MEGA_BF16_VIA_IMPL", "0") == "1"
+#: Run GEMM1 + GEMM2 + ReduceScatter as a single kernel where the tuned pair
+#: allows it -- which is the BM16 inline-quant GEMM1 the bf16 wire picks at small
+#: M, so this is the decode path. Measured TP4, `--ag-wire auto`, e2e:
+#: -10.8% / -5.9% / -4.8% on glm5 at 32/64/128 tokens and -5.7% on dsv3 at 32,
+#: and neutral (within +-0.3%) everywhere the gate declines. Set to 0 to pin the
+#: separate GEMM1 / GEMM2 / ReduceScatter launches.
+_STAGE12 = os.environ.get("AITER_TP_MEGA_STAGE12", "1") == "1"
 
 
 __all__ = ["MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
@@ -725,6 +732,91 @@ class MegaMoeTP:
         stage2._is_flydsl_v2_stage2 = True
         return functools.partial(stage2, kernelName2=plan.gemm2_kernel), box
 
+
+    def _fuses_stage12(self, plan) -> bool:
+        """Whether this bucket's tuned pair can share one kernel."""
+        from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import stage12_supported
+        from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+        try:
+            if not _is_mxfp4_kname(plan.gemm1_kernel):
+                return False
+            return stage12_supported(
+                _parse_mxfp4_g1_kname(plan.gemm1_kernel),
+                parse_flydsl_v2_gemm2_kernel(plan.gemm2_kernel),
+                self.cfg.model_dim,
+            )
+        except Exception:  # noqa: BLE001 - probe only, never fatal
+            return False
+
+    def _fused_stage12(self, plan, local_tokens, comm, g2_cfg):
+        """Replace stage1+stage2 with one GEMM1+GEMM2+ReduceScatter kernel.
+
+        ``stage1`` keeps its own identity and keywords -- ``fused_moe_2stages``
+        dispatches on ``metadata.stage1.func``, and the operand derivation there
+        is what this path reuses -- but its ``_gemm1_launch`` hook diverts the
+        launch into a dict. ``stage2`` then runs both GEMMs and the tail in one
+        kernel from that dict. Returns ``(transform, box)``.
+        """
+        from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import run_stage12_rs
+
+        cfg = self.cfg
+        box: list = [None]
+        captured: dict = {}
+
+        def capture_gemm1(**kwargs):
+            captured.update(kwargs)
+
+        def stage2(
+            inter_states,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            *,
+            w2_scale=None,
+            a2_scale=None,
+            block_m=None,
+            sorted_weights=None,
+            kernelName2="",
+            **_kwargs,
+        ):
+            box[0] = run_stage12_rs(
+                g1=captured,
+                w2=w2,
+                w2_scale=w2_scale,
+                sorted_token_ids=sorted_token_ids,
+                sorted_weights=sorted_weights,
+                partial=moe_out,
+                output=comm.output_buffer(local_tokens),
+                desc_ptr=comm.rs_descriptor(),
+                rank=cfg.rank,
+                tp_size=cfg.world_size,
+                local_rows=local_tokens,
+                M_logical=moe_out.shape[0],
+                model_dim=moe_out.shape[1],
+                inter_dim=w1.shape[1] // 2 if w1 is not None else cfg.inter_dim,
+                g2_cfg=g2_cfg,
+                block_m=block_m,
+            )
+            return moe_out
+
+        stage2._is_flydsl_v2_stage2 = True
+        stage2_partial = functools.partial(stage2, kernelName2=plan.gemm2_kernel)
+
+        def transform(metadata):
+            stage1 = functools.partial(
+                metadata.stage1.func,
+                **metadata.stage1.keywords,
+                _gemm1_launch=capture_gemm1,
+            )
+            return replace(metadata, stage1=stage1, stage2=stage2_partial)
+
+        return transform, box
+
     def local_moe(
         self, a1, a1_scale, topk_weights_all, topk_ids_all, plan=None, local_tokens=0
     ):
@@ -756,7 +848,11 @@ class MegaMoeTP:
         # fused tail comes for free. So this is the right default for eager
         # execution and the wrong one under graphs -- revisit if this layer is
         # deployed captured. ``AITER_TP_MEGA_BF16_VIA_IMPL=1`` flips it.
-        if a1_scale is None and not _BF16_VIA_IMPL:
+        # The merged GEMM1+GEMM2+RS kernel only exists for the BM16 inline-quant
+        # pair, which lives on this wire -- so taking it is what makes the wire
+        # worth routing through the hookable entry point despite its host cost.
+        fuse12 = _STAGE12 and a1_scale is None and self._fuses_stage12(plan)
+        if a1_scale is None and not (_BF16_VIA_IMPL or fuse12):
             return (
                 fused_moe(
                     a1,
@@ -787,13 +883,44 @@ class MegaMoeTP:
             # row instead of whatever the lookup inside _fused_moe_impl finds.
             borrowed = replace(plan.metadata, prequant=True)
             transform = lambda _metadata: borrowed  # noqa: E731
+        if fuse12 and local_tokens > 1:
+            from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+            stage12_transform, box = self._fused_stage12(
+                plan,
+                local_tokens,
+                self._collectives(plan.ag_wire),
+                parse_flydsl_v2_gemm2_kernel(plan.gemm2_kernel),
+            )
+            partial = _fused_moe_impl(
+                a1,
+                self.w1,
+                self.w2,
+                topk_weights_all,
+                topk_ids_all,
+                a1_scale=a1_scale,
+                output=output,
+                _q_dtype_a=AQ_DTYPE if a1_scale is not None else None,
+                _metadata_transform=stage12_transform,
+                **kwargs,
+            )
+            return partial, box[0]
+
         box = None
-        # ``local_tokens == 1`` is excluded: the fused tail's pull returns
-        # garbage there (rel_l2 1.0) while leaving the partial itself intact --
-        # bisected to the pull, with 8/16/32 local rows all correct. One row is
-        # a decode-with-TP8 corner and the standalone collective handles it, so
-        # it is gated rather than chased.
-        if plan.fuse_rs and local_tokens > 1:
+        # Two exclusions, both measured:
+        #
+        # * ``local_tokens == 1`` -- the fused tail's pull returns garbage there
+        #   (rel_l2 1.0) while leaving the partial itself intact; bisected to
+        #   the pull, with 8/16/32 local rows all correct. A decode-with-TP8
+        #   corner, gated rather than chased.
+        # * past the ReduceScatter byte budget -- the fused pull is slower than
+        #   NCCL there, and a tail has no fallback of its own.
+        fuse_tail = (
+            plan.fuse_rs
+            and local_tokens > 1
+            and self._collectives(plan.ag_wire).rs_fused_is_profitable(local_tokens)
+        )
+        if fuse_tail:
             stage2, box = self._fused_stage2(plan, local_tokens)
             base = transform
             transform = (
