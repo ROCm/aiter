@@ -104,6 +104,8 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    dsv4_topk=False,
+    route_scale=2.5,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -112,6 +114,10 @@ def test_fmoe(
         linear_beta = (
             DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
         )
+    # Baseline/HERD are normally launched as separate processes. Pin every
+    # generated tensor so their timing comparison changes routing only.
+    if dsv4_topk:
+        torch.manual_seed(0)
     torch_quant = aiter.get_torch_quant(qType)
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
     is_mxfp8 = (
@@ -165,7 +171,38 @@ def test_fmoe(
     else:
         score = torch.randn((token, E), dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    route_us = None
+    active_experts = None
+    if dsv4_topk:
+        if E != 384 or topk != 6:
+            raise ValueError(
+                "--dsv4-topk requires the TP8 routing shape E=384, topk=6"
+            )
+        correction_bias = (
+            torch.randn(E, dtype=torch.float32, device=input.device) * 0.1
+        )
+        topk_weights = torch.empty(
+            (token, topk), dtype=torch.float32, device=input.device
+        )
+        topk_ids = torch.empty(
+            (token, topk), dtype=torch.int32, device=input.device
+        )
+
+        def run_dsv4_router():
+            aiter.topk_gating(
+                topk_weights,
+                topk_ids,
+                score,
+                correction_bias,
+                need_renorm=True,
+                routed_scaling_factor=route_scale,
+                score_func="sqrtsoftplus",
+            )
+
+        _, route_us = run_perftest(run_dsv4_router, num_iters=20, num_warmup=3)
+        active_experts = int(torch.unique(topk_ids).numel())
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -520,11 +557,18 @@ def test_fmoe(
                 "n/a" if us2_stage is None else f"{us2_stage:.2f}",
                 AQDType,
             )
-        return {
+        result = {
             "us": (us1 or 0.0) + (us2_stage or 0.0),
             "us_stage1": us1,
             "us_stage2": us2_stage,
         }
+        if dsv4_topk:
+            result.update(
+                route_us=route_us,
+                active_experts=active_experts,
+                total_us=result["us"] + route_us,
+            )
+        return result
 
     out2_ck, us2 = run_perftest(
         fused_moe,
@@ -533,8 +577,8 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        num_iters=5,
-        num_warmup=2,
+        num_iters=20 if dsv4_topk else 5,
+        num_warmup=5 if dsv4_topk else 2,
         **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
@@ -575,7 +619,14 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    result = {"us": us2, "logits_diff": float(logits_diff)}
+    if dsv4_topk:
+        result.update(
+            route_us=route_us,
+            active_experts=active_experts,
+            total_us=us2 + route_us,
+        )
+    return result
 
 
 l_quant = [
@@ -766,6 +817,21 @@ parser.add_argument(
     alone, excluding input prep) and report them as us_stage1 / us_stage2.
     Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
     n/a.""",
+)
+parser.add_argument(
+    "--dsv4-topk",
+    action="store_true",
+    help=(
+        "Use DeepSeek-V4 sqrtsoftplus+bias routing. Set "
+        "AITER_FLYDSL_USE_HERD=1 to compare the FlyDSL HERD route; without it "
+        "this is the fused Top-K baseline. Reports route_us and active_experts."
+    ),
+)
+parser.add_argument(
+    "--route-scale",
+    type=float,
+    default=2.5,
+    help="DeepSeek-V4 routed scaling factor used by --dsv4-topk (default: 2.5).",
 )
 parser.add_argument(
     "--ref-dtype",
@@ -1470,7 +1536,11 @@ for kwargs, extras in case_iter:
         )
         with aot_guard:
             ret = test_fmoe(
-                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+                **kwargs,
+                kernel_bench=args.kernel,
+                ref_dtype=args.ref_dtype,
+                dsv4_topk=args.dsv4_topk,
+                route_scale=args.route_scale,
             )
     except torch.cuda.OutOfMemoryError as exc:
         aiter.logger.warning(

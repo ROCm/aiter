@@ -6,3 +6,9 @@
 #include "topk_gating_kernels.cuh"
 
 AITER_TOPK_GATING_INSTANTIATE(aiter::SCORE_SQRTSOFTPLUS)
+
+namespace aiter {
+template void topk_gating_herd_candidates_launch<float>(const topk_gating_params&);
+template void
+topk_gating_herd_candidates_launch<hip_bfloat16>(const topk_gating_params&);
+} // namespace aiter

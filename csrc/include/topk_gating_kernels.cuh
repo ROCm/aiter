@@ -28,7 +28,14 @@
 
 namespace aiter {
 
-enum { SCORE_SQRTSOFTPLUS = 0, SCORE_SIGMOID = 1, SCORE_SOFTMAX = 2 };
+enum
+{
+    SCORE_SQRTSOFTPLUS = 0,
+    SCORE_SIGMOID = 1,
+    SCORE_SOFTMAX = 2,
+    // Internal Top-(K+1) candidate mode for the Triton-compatible HERD path.
+    SCORE_SQRTSOFTPLUS_HERD = 3,
+};
 
 // Element types are carried by the topk_gating_launch template parameters, not
 // by these pointers.
@@ -140,6 +147,18 @@ __device__ __forceinline__ float compute_score(float x)
         float sp = x > 20.0f ? x : log2f(1.0f + exp2f(x * 1.4426950408889634f)) * 0.6931471805599453f;  // both HW
         return sqrtf(sp);
     }
+}
+
+__device__ __forceinline__ float pack_herd_tie_key(float value, int expert)
+{
+    // A BF16 value widened to fp32 has 16 zero mantissa bits. Encode the
+    // 9-bit DSV4 expert id there so equal scores favor the larger expert,
+    // matching Triton's packed key without disturbing distinct BF16 values.
+    int bits    = __builtin_bit_cast(int, value);
+    int ordered = bits ^ ((bits >> 31) & 0x7fffffff);
+    ordered     = (ordered & ~0x1ff) | expert;
+    bits        = ordered ^ ((ordered >> 31) & 0x7fffffff);
+    return __builtin_bit_cast(float, bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +293,8 @@ __global__ void topk_gating_kernel_opt(
     {
         int   e     = threadIdx.x + i * static_cast<int>(WARP_SIZE);
         float score = compute_score<SCORE_FUNC>(static_cast<float>(input_ptr[e]));
+        if constexpr(SCORE_FUNC == SCORE_SQRTSOFTPLUS_HERD)
+            score = static_cast<float>(static_cast<DTYPE_I>(score));
         // Weight 0, not the NaN itself: an invalid expert is only ever selected
         // when the row has fewer than topk valid ones, and its NaN would then
         // reach the renorm sum. fmaxf() drops a NaN sum to RENORM_SUM_FLOOR,
@@ -283,7 +304,19 @@ __global__ void topk_gating_kernel_opt(
         vals[i]     = score;
         idxs[i]     = e;
         if(correction_bias != nullptr)
-            vals[i] += static_cast<float>(correction_bias[e]);
+        {
+            if constexpr(SCORE_FUNC == SCORE_SQRTSOFTPLUS_HERD)
+            {
+                const float bias = static_cast<float>(correction_bias[e]);
+                vals[i] = static_cast<float>(static_cast<DTYPE_I>(
+                    vals[i] + static_cast<float>(static_cast<DTYPE_I>(bias))));
+                orig[i] = static_cast<float>(static_cast<DTYPE_I>(vals[i] - bias));
+            }
+            else
+            {
+                vals[i] += static_cast<float>(correction_bias[e]);
+            }
+        }
         // A NaN selection score never wins the argmax and would stall this
         // lane's cursor in the k-way merge (blocking its remaining experts);
         // push NaN to the bottom so it is simply excluded.
@@ -291,6 +324,8 @@ __global__ void topk_gating_kernel_opt(
         // NOTE: folded away under -ffast-math (-ffinite-math-only), which aiter
         // does not use; if that changes, test the exponent/mantissa bits.
         vals[i] = fmaxf(vals[i], -INFINITY);
+        if constexpr(SCORE_FUNC == SCORE_SQRTSOFTPLUS_HERD)
+            vals[i] = pack_herd_tie_key(vals[i], e);
     }
 
     // Step 2: sort thread-local partition descending
@@ -1267,6 +1302,29 @@ __global__ void topk_gating_kernel_smem_n(
         p.weights, p.ids, \
         stride_tk, topk, num_tokens, routed_scaling_factor);
 
+template <typename DTYPE_B>
+void topk_gating_herd_candidates_launch(const topk_gating_params& p)
+{
+    hipLaunchKernelGGL(
+        (aiter::topk_gating_kernel_opt<hip_bfloat16,
+                                       DTYPE_B,
+                                       384,
+                                       false,
+                                       SCORE_SQRTSOFTPLUS_HERD>),
+        dim3(p.num_tokens),
+        dim3(get_warp_size_func()),
+        0,
+        p.stream,
+        reinterpret_cast<const hip_bfloat16*>(p.gating),
+        reinterpret_cast<const DTYPE_B*>(p.bias),
+        p.weights,
+        p.ids,
+        p.stride_tk,
+        p.topk,
+        p.num_tokens,
+        p.routed_scaling_factor);
+}
+
 
 // ---------------------------------------------------------------------------
 // Kernel selection
@@ -1525,6 +1583,11 @@ namespace aiter {
 _AITER_TOPK_GATING_SLICE(extern template, SCORE_SQRTSOFTPLUS)
 _AITER_TOPK_GATING_SLICE(extern template, SCORE_SIGMOID)
 _AITER_TOPK_GATING_SLICE(extern template, SCORE_SOFTMAX)
+
+extern template void
+topk_gating_herd_candidates_launch<float>(const topk_gating_params&);
+extern template void
+topk_gating_herd_candidates_launch<hip_bfloat16>(const topk_gating_params&);
 
 } // namespace aiter
 

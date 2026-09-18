@@ -126,4 +126,48 @@ void topk_gating(aiter_tensor_t& topk_weights,
     }
 }
 
+void topk_gating_herd_candidates(aiter_tensor_t& candidate_weights,
+                                 aiter_tensor_t& candidate_indices,
+                                 aiter_tensor_t& gating_output,
+                                 aiter_tensor_t& correction_bias)
+{
+    AITER_CHECK(candidate_weights.dtype() == AITER_DTYPE_fp32,
+                "HERD candidate_weights must be float32");
+    AITER_CHECK(candidate_indices.dtype() == AITER_DTYPE_i32,
+                "HERD candidate_indices must be int32");
+    AITER_CHECK(gating_output.dtype() == AITER_DTYPE_bf16,
+                "HERD candidate selection requires bfloat16 logits");
+    AITER_CHECK(gating_output.size(1) == 384,
+                "HERD candidate selection requires 384 experts");
+    AITER_CHECK(candidate_indices.size(1) == 7 && candidate_weights.size(1) == 7,
+                "HERD candidate selection emits Top-7");
+    AITER_CHECK(candidate_indices.size(0) == gating_output.size(0) &&
+                    candidate_weights.size(0) == gating_output.size(0),
+                "HERD candidate output rows must match gating_output");
+    AITER_CHECK(correction_bias.numel() == 384,
+                "HERD candidate selection requires correction_bias[384]");
+
+    HipDeviceGuard device_guard(gating_output.device_id);
+
+    topk_gating_params p{};
+    p.gating                = gating_output.data_ptr();
+    p.bias                  = correction_bias.data_ptr();
+    p.weights               = reinterpret_cast<float*>(candidate_weights.data_ptr());
+    p.ids                   = reinterpret_cast<int*>(candidate_indices.data_ptr());
+    p.stride_tk             = candidate_indices.stride(0);
+    p.num_experts           = 384;
+    p.topk                  = 7;
+    p.num_tokens            = gating_output.size(0);
+    p.routed_scaling_factor = 1.0f;
+    p.need_renorm           = false;
+    p.stream                = aiter::getCurrentHIPStream();
+
+    if(correction_bias.dtype() == AITER_DTYPE_fp32)
+        topk_gating_herd_candidates_launch<float>(p);
+    else if(correction_bias.dtype() == AITER_DTYPE_bf16)
+        topk_gating_herd_candidates_launch<hip_bfloat16>(p);
+    else
+        AITER_CHECK(false, "HERD correction_bias must be float32 or bfloat16");
+}
+
 } // namespace aiter

@@ -27,7 +27,54 @@ def topk_gating_fwd(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_topk", fc_name="topk_gating_herd_candidates", develop=True
+)
+def topk_gating_herd_candidates_fwd(
+    candidate_weights: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+) -> None: ...
+
+
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
+
+_FLYDSL_USE_HERD = os.environ.get("AITER_FLYDSL_USE_HERD", "0") == "1"
+_FLYDSL_HERD_MIN_M = int(os.environ.get("AITER_FLYDSL_HERD_MIN_M", "16"))
+_FLYDSL_HERD_MAX_M = int(os.environ.get("AITER_FLYDSL_HERD_MAX_M", "128"))
+
+
+def _use_flydsl_herd(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    score_func: str,
+) -> bool:
+    """Whether this call matches an opt-in HERD model profile."""
+    if not _FLYDSL_USE_HERD:
+        return False
+    if gating_output.dim() != 2:
+        return False
+    tokens, experts = gating_output.shape
+    if (
+        get_gfx() != "gfx950"
+        or not _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
+    ):
+        return False
+
+    # Keep unsupported layouts and dtypes on the established HIP path. Import
+    # FlyDSL only after the opt-in and cheap shape checks have passed.
+    from .flydsl.herd_topk import herd_topk_gating_supported
+
+    return herd_topk_gating_supported(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        score_func,
+    )
 
 
 def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -71,6 +118,21 @@ def topk_gating(
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
+    if _use_flydsl_herd(
+        topk_weights, topk_indices, gating_output, correction_bias, score_func
+    ):
+        from .flydsl.herd_topk import herd_topk_gating
+
+        herd_topk_gating(
+            topk_weights,
+            topk_indices,
+            gating_output,
+            correction_bias,
+            need_renorm,
+            routed_scaling_factor,
+            score_func,
+        )
+        return
     topk_gating_fwd(
         topk_weights,
         topk_indices,
@@ -186,6 +248,25 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
+    if num_expert_group == 1 and topk_group == 1 and _use_flydsl_herd(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        correction_bias,
+        "sigmoid",
+    ):
+        from .flydsl.herd_topk import herd_topk_gating
+
+        herd_topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias,
+            need_renorm,
+            routed_scaling_factor,
+            "sigmoid",
+        )
+        return
     cu_num = get_cu_num()
     if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
         return biased_grouped_topk_hip(
