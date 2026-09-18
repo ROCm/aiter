@@ -35,12 +35,13 @@ class _Params:
         sliding_window=0,
         dtype=torch.bfloat16,
         kv_dtype=None,
+        shuffled_kv_cache=False,
     ):
         self.head_size = head_size
         self.max_seqlen_q = max_seqlen_q
         self.max_seqlen_k = 32768
         self.sliding_window = sliding_window
-        self.shuffled_kv_cache = False
+        self.shuffled_kv_cache = shuffled_kv_cache
         self.block_size = 64
         self.q_dtype = dtype
         self.kv_cache_dtype = kv_dtype if kv_dtype is not None else dtype
@@ -66,6 +67,24 @@ def _matched_key(params):
     )
     key, _config = _lookup(table, axes, values)
     return key, _config
+
+
+# The pre-shuffled A8W8 KV path pins TILE_SIZE = block_size after the lookup,
+# so the non-shuffled composites (BLOCK_M 64/128 at TILE 16) would be
+# re-launched at TILE 64 and blow the 64KB LDS at head 512. The SHUF axis
+# (added to the schema alongside these entries) keeps pre-shuffled prefill on
+# LDS-safe, separately tuned entries.
+_SHUF_CASES = [
+    # shuffled fp8 prefill resolves to the SHUF-scoped entries
+    (512, 16384, e4m3_dtype, "D_GEQ_512.Q_GEQ_1024.SHUF.DT_fp8_fp8", 32),
+    (256, 16384, e4m3_dtype, "D_GEQ_256.Q_GEQ_1024.SHUF.DT_fp8_fp8", 128),
+    # shuffled decode still resolves to the Q_LEQ_1 entries
+    (512, 1, e4m3_dtype, "D_GEQ_512.Q_LEQ_1.DT_fp8_fp8", 16),
+    (256, 1, e4m3_dtype, "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8", 16),
+    # non-shuffled must NOT match the SHUF entries
+    (512, 16384, e4m3_dtype, "D_GEQ_512.Q_GEQ_1024.DT_fp8_fp8", 128),
+    (256, 16384, e4m3_dtype, "D_GEQ_256.Q_GEQ_1024.DT_fp8_fp8", 64),
+]
 
 
 # (head_size, max_seqlen_q, sliding_window, q_dtype, kv_dtype,
@@ -132,3 +151,30 @@ def test_gfx942_large_head_prefill_lookup(
     assert (
         config["BLOCK_M"] == expected_block_m
     ), f"expected BLOCK_M={expected_block_m} via {expected_key}, got {config['BLOCK_M']}"
+
+
+@pytest.mark.parametrize(
+    "head_size, max_seqlen_q, q_dtype, expected_key, expected_block_m",
+    _SHUF_CASES,
+)
+def test_gfx942_shuffled_kv_prefill_lookup(
+    head_size,
+    max_seqlen_q,
+    q_dtype,
+    expected_key,
+    expected_block_m,
+):
+    key, config = _matched_key(
+        _Params(
+            head_size,
+            max_seqlen_q,
+            dtype=q_dtype,
+            kv_dtype=q_dtype,
+            shuffled_kv_cache=True,
+        )
+    )
+    assert key == expected_key, f"expected {expected_key}, matched {key}"
+    assert (
+        config["BLOCK_M"] == expected_block_m
+    ), f"expected BLOCK_M={expected_block_m} via {expected_key}, got {config['BLOCK_M']}"
+

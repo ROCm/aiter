@@ -3,6 +3,7 @@
     "attn_2d": [
       "D",
       "Q",
+      "SHUF",
       "DT"
     ],
     "attn_3d": [
@@ -149,6 +150,22 @@
       "BLOCK_M": 16,
       "num_warps": 2,
       "num_stages": 1,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_GEQ_512.Q_GEQ_1024.SHUF.DT_fp8_fp8": {
+      "BLOCK_M": 32,
+      "num_warps": 4,
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_GEQ_256.Q_GEQ_1024.SHUF.DT_fp8_fp8": {
+      "BLOCK_M": 128,
+      "num_warps": 8,
+      "num_stages": 2,
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
