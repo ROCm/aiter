@@ -24,7 +24,7 @@ all-reduce is fastest at this shape, and what does it cost in accuracy".
 The three ``fly_*`` families are the ones with a dispatch question open: which
 of them wins is a function of payload size, and so is which variant wins inside
 each. Every ``fly_*`` key above is joined by pinned tuning rows
-(``fly_int4_ring_st16``, ``fly_1stage_a4``, ...) whose only purpose is to be
+(``fly_int4_ring_st16``, ``fly_1stage_b256_a4_g64``, ...) whose only purpose is to be
 swept against the auto rows. A key names a *policy*, not a binary -- the auto
 rows walk a size ladder -- so the ``variant`` column and the ``kernel variants``
 table report the JIT symbol that actually ran at each shape, super-tile and
@@ -144,7 +144,7 @@ Examples::
     # only be needed to narrow the window instead. See
     # op_tests/multigpu_tests/shapes/README.md.
     python3 op_tests/multigpu_tests/bench_comm_allreduce.py -tp 4 \
-        -c fly_int4 fly_int4_ring fly_1stage fly_1stage_a4 \
+        -c fly_int4 fly_int4_ring fly_1stage fly_1stage_b256_a4_g64 \
         --shape-csv op_tests/multigpu_tests/shapes/ar_sweep_a_small.csv \
         -o /tmp/ar_a_small_tp4.md --output-csv /tmp/ar_a_small_tp4.csv
 
@@ -402,11 +402,12 @@ class Candidate:
     atoms: int | None = None
     fanout: str | None = None
     # Drop this rank's own trip through its own inbox, family == "fly1s". None
-    # is OneShotAllReduce's default.
+    # leaves it to the rung; False and True both pin it, and pinning it True
+    # specialises the binary per rank.
     skip_self: bool | None = None
     # Threads per block, family == "fly1s". Also the tile width, so it is the
-    # knob that sets how many blocks a decode payload gets. None is the default
-    # (256).
+    # knob that sets how many blocks a decode payload gets. None leaves it to
+    # the rung.
     block: int | None = None
 
     @property
@@ -424,6 +425,72 @@ class Candidate:
     def fly1s_cfg(self) -> tuple:
         """Identity of the OneShotAllReduce engine this candidate needs."""
         return (self.atoms, self.grid_cap, self.fanout, self.skip_self, self.block)
+
+    def fly1s_rung(self, min_bytes: int) -> tuple:
+        """This candidate as an ``ONESHOT_LADDER`` rung, for the fit's paste."""
+        if self.family != "fly1s":
+            raise ValueError(f"{self.key} is not a one-shot candidate")
+        unpinned = [
+            n
+            for n in ("atoms", "grid_cap", "fanout", "block", "skip_self")
+            if getattr(self, n) is None
+        ]
+        if unpinned:
+            raise ValueError(
+                f"{self.key} leaves {', '.join(unpinned)} to the OneShotAllReduce "
+                "default, so it has no ONESHOT_LADDER rung. Pin every knob (see "
+                "_FLY1S_GRID) or keep the row out of the ladder fit."
+            )
+        return (
+            int(min_bytes),
+            self.atoms,
+            self.grid_cap,
+            self.fanout,
+            self.block,
+            self.skip_self,
+        )
+
+_FLY1S_GRID = (
+    # block, atoms, grid_cap, fanout   tile
+    (64, 1, 64, "peer"),    # 1 KiB
+    (64, 1, 256, "peer"),   # 1 KiB
+    (128, 1, 128, "peer"),  # 2 KiB
+    (256, 1, 64, "peer"),   # 4 KiB
+    (256, 1, 128, "peer"),  # 4 KiB
+    (128, 2, 64, "peer"),   # 4 KiB
+    (64, 4, 64, "peer"),    # 4 KiB
+    (256, 2, 64, "peer"),   # 8 KiB
+    (256, 2, 64, "atom"),   # 8 KiB
+    (256, 4, 64, "peer"),   # 16 KiB
+    (256, 4, 64, "atom"),   # 16 KiB
+    (256, 4, 128, "peer"),  # 16 KiB
+)
+
+
+def _fly1s_grid_rows():
+    """``_FLY1S_GRID`` x self-skip as Candidates."""
+    rows = []
+    for skip_self in (False, True):
+        for block, atoms, cap, fanout in _FLY1S_GRID:
+            key = f"fly_1stage_b{block}_a{atoms}_g{cap}"
+            if atoms > 1 and fanout == "atom":
+                key += "_fa"
+            if skip_self:
+                key += "_ss"
+            rows.append(
+                Candidate(
+                    key,
+                    "fly1s",
+                    40.0, # min acceptable SQNR value 
+                    True,
+                    atoms=atoms,
+                    grid_cap=cap,
+                    fanout=fanout,
+                    block=block,
+                    skip_self=skip_self,
+                )
+            )
+    return tuple(rows)
 
 
 # Floors sit ~5 dB below what each candidate measures on a healthy gfx950 build
@@ -459,76 +526,8 @@ CANDIDATES = (
     # by payload size at launch. This is what production gets; the pinned rows
     # below are what it is fitted against.
     Candidate("fly_1stage", "fly1s", 40.0, True),  # 55 / n/a
-    # Block-count sweep. The TP8 data says cdr runs 7-8x more blocks than
-    # cdr_naive at no measurable cost, which is evidence *against* the
-    # small-grid theory -- these rows re-test it on a kernel we control.
-    Candidate("fly_1stage_g8", "fly1s", 40.0, True, grid_cap=8),
-    Candidate("fly_1stage_g32", "fly1s", 40.0, True, grid_cap=32),
-    # Fatter tiles: atoms=2 is an 8 KiB tile and atoms=4 a 16 KiB one, so half
-    # and a quarter the blocks and the flags for a given payload. Measured at
-    # TP4/xGMI and kept as evidence rather than as a candidate to ship: both
-    # LOSE at every decode shape, by ~3 us (a2) and ~7 us (a4), a consistent
-    # sign well outside the 0.15-0.93 us cdr spread. Fatter tiles are just
-    # another way to spend blocks, and a4 at M=1 buys a *single* block -- the
-    # same too-few-blocks cliff grid_cap=8 falls off.
-    Candidate("fly_1stage_a2", "fly1s", 40.0, True, atoms=2),
-    Candidate("fly_1stage_a4", "fly1s", 40.0, True, atoms=4),
-    # Fanout order: "atom" spreads consecutive stores across peers instead of
-    # handing each destination a contiguous run. Expected to matter on xGMI,
-    # where the native packet is 64 B, and to lose on PCIe.
-    Candidate("fly_1stage_fa", "fly1s", 40.0, True, fanout="atom"),
-    # Cross terms. The single-knob rows above were swept one at a time, and the
-    # TP8 data says the winners are not separable: `a4` wins nearly everywhere
-    # at TP8 while `fa` wins at TP2/TP4 small, so the combination is unmeasured
-    # and is exactly what a per-world ladder would want to pick. `g128` lifts
-    # the block ceiling above the 64 default, which only binds once a payload
-    # has more than 64 tiles -- 256 KiB at atoms=1, past where the current
-    # 192 KiB policy ceiling stops the sweep looking.
-    Candidate("fly_1stage_a2_fa", "fly1s", 40.0, True, atoms=2, fanout="atom"),
-    Candidate("fly_1stage_a4_fa", "fly1s", 40.0, True, atoms=4, fanout="atom"),
-    Candidate("fly_1stage_g128", "fly1s", 40.0, True, grid_cap=128),
-    Candidate("fly_1stage_a4_g128", "fly1s", 40.0, True, atoms=4, grid_cap=128),
-    # Tile width. `block` is threads per block and therefore also the tile, so
-    # it is the only knob that raises the block count at a payload too small for
-    # `grid_cap` to bind.
-    Candidate("fly_1stage_b128", "fly1s", 40.0, True, block=128),
-    Candidate("fly_1stage_b128_g128", "fly1s", 40.0, True, block=128, grid_cap=128),
-    Candidate("fly_1stage_b64", "fly1s", 40.0, True, block=64),
-    Candidate("fly_1stage_b64_g128", "fly1s", 40.0, True, block=64, grid_cap=128),
-    Candidate("fly_1stage_b64_g256", "fly1s", 40.0, True, block=64, grid_cap=256),
-    Candidate("fly_1stage_a4_b64", "fly1s", 40.0, True, atoms=4, block=64),
-    # Self-skip: this rank's contribution is read from registers instead of from
-    # its own inbox. 
-    Candidate("fly_1stage_ss", "fly1s", 40.0, True, skip_self=True),
-    Candidate("fly_1stage_ss_g128", "fly1s", 40.0, True, skip_self=True, grid_cap=128),
-    Candidate("fly_1stage_a4_ss", "fly1s", 40.0, True, atoms=4, skip_self=True),
-    Candidate(
-        "fly_1stage_ss_b128_g128",
-        "fly1s",
-        40.0,
-        True,
-        skip_self=True,
-        block=128,
-        grid_cap=128,
-    ),
-    Candidate(
-        "fly_1stage_ss_b64_g128",
-        "fly1s",
-        40.0,
-        True,
-        skip_self=True,
-        block=64,
-        grid_cap=128,
-    ),
-    Candidate(
-        "fly_1stage_ss_b64_g256",
-        "fly1s",
-        40.0,
-        True,
-        skip_self=True,
-        block=64,
-        grid_cap=256,
-    ),
+    # Pinned rows: the knob grid the ladder is fitted over. See _FLY1S_GRID.
+    *_fly1s_grid_rows(),
     # Same kernel family, ring schedule. Its floor is lower than fly_int4's
     # because the ring's reduce-scatter lap requantizes N-1 times where the mesh
     # requantizes once; measured 18.7 dB at TP4 (against 19.2), and *better*

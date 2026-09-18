@@ -86,6 +86,7 @@ def family_of(cand) -> str | None:
 # them as ladder candidates would let the fit "choose" today's ladder and
 # conclude it is optimal.
 BY_FAMILY = {f: [c for c in CANDIDATES if family_of(c) == f] for f in FAMILIES}
+CAND_BY_KEY = {c.key: c for c in CANDIDATES}
 AUTO_KEYS = {
     "oneshot": ("fly_1stage",),
     "mesh": ("fly_int4",),
@@ -1142,6 +1143,29 @@ def main():
             worst,
             ", ".join(f"({lo}, {k!r})" for lo, k in rungs),
         )
+    # The one-shot ladder additionally comes out in the form it is pasted in.
+    # The key form above stays because the alias and non-monotone warnings name
+    # keys, and a rung tuple cannot be traced back to the row that won.
+    oneshot_ladders = [r for r in ladder_rows if r[1] == "oneshot"]
+    if oneshot_ladders:
+        logger.info("\n_ONESHOT_LADDER = {")
+        for tp, _family, rungs, worst in oneshot_ladders:
+            try:
+                tuples = [CAND_BY_KEY[k].fly1s_rung(lo) for lo, k in rungs]
+            except (KeyError, ValueError) as exc:
+                logger.warning("    # (%r, %d): %s", args.link, tp, exc)
+                continue
+            # Trailing comma on every rung, or a one-rung ladder pastes as a
+            # plain tuple rather than a tuple of one rung and every consumer
+            # unpacks an int where it wants a rung.
+            logger.info(
+                "    (%r, %d): (%s),  # worst %.3fx",
+                args.link,
+                tp,
+                "".join(f"{t!r}, " for t in tuples).rstrip(),
+                worst,
+            )
+        logger.info("}")
 
 
 if __name__ == "__main__":

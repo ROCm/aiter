@@ -136,11 +136,12 @@ def test_ladders_are_well_formed(ws):
         one = oneshot_ladder(ws, link)
         assert one and one[0][0] == 0, link
         assert [r[0] for r in one] == sorted(r[0] for r in one), link
-        for _floor, atoms, cap, fanout, block in one:
+        for _floor, atoms, cap, fanout, block, skip_self in one:
             assert atoms in SUPPORTED_ATOMS, (link, atoms)
             assert cap >= 1, (link, cap)
             assert fanout in ("peer", "atom"), (link, fanout)
             assert block in SUPPORTED_BLOCKS, (link, block)
+            assert isinstance(skip_self, bool), (link, skip_self)
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -246,8 +247,9 @@ def test_enable_flag_is_opt_in_only():
 
 def test_byte_overrides():
     # ONESHOT_MAX_VAR applies in both modes -- exact mode's default here is
-    # oneshot_max_exact (256 KiB for TP8/pcie), so leaving mode unset still
-    # exercises the override against a real baseline.
+    # oneshot_max_exact, so leaving mode unset still exercises the override
+    # against a real baseline.
+    table = P.FAMILY_POLICY[("pcie", 8)].oneshot_max_exact
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
         assert P.resolve("pcie", 8).oneshot_max == 65536
     # MESH_MAX_VAR only has an effect in "fast" mode -- see
@@ -256,10 +258,10 @@ def test_byte_overrides():
         assert P.resolve("pcie", 4, mode="fast").mesh_max == 1048576
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="-1"):
-        assert P.resolve("pcie", 8).oneshot_max == (256 << 10)
+        assert P.resolve("pcie", 8).oneshot_max == table
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="lots"):
-        assert P.resolve("pcie", 8).oneshot_max == (256 << 10)
+        assert P.resolve("pcie", 8).oneshot_max == table
 
 
 def test_exact_mode_ignores_mesh_max_override():

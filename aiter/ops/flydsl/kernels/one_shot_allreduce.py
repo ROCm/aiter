@@ -118,8 +118,8 @@ SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 
 # Per-``(link, world_size)`` tuning ladder: ``(min_bytes, atoms, grid_cap,
-# fanout, block)`` rungs. The host builds one engine per rung and selects by
-# payload size at launch. Created from a tuning sweep.
+# fanout, block, skip_self)`` rungs. The host builds one engine per rung and
+# selects by payload size at launch. Created from a tuning sweep.
 #
 # ``atoms`` and ``block`` both scale the tile, and their product is what
 # matters to the block count; they are separate knobs because only ``block``
@@ -127,37 +127,44 @@ DEFAULT_GRID_CAP = 64
 # stores one thread has in flight.
 #
 #   PCIe
-#     TP2  atoms=2, cap 64   -- below 96 KiB the schedule is flag-bound and
-#                               blocks are worth more than tile width.
-#          atoms=4, cap 128  -- above it the trade reverses, and the wider cap
-#                               matters because this window runs to 1.5 MiB: at
-#                               a 16 KiB tile that is 96 tiles, so a cap of 64
-#                               would leave half the blocks running two
-#                               serialized handshake rounds.
-#     TP4  atoms=1, cap 64   -- narrowest tile below 64 KiB, same flag-bound
-#                               reason as TP2's first rung.
-#          atoms=4, cap 64, fanout=atom -- above 64 KiB the fatter tile wins,
-#                               and at atoms>1 the fanout order is a real knob:
-#                               walking the peers of one atom starts more links
-#                               sooner than handing each destination a
-#                               contiguous run. Measured only at TP4.
-#     TP8  atoms=4, cap 64   -- the fattest tile, for the opposite reason: the
-#                               fanout is to 7 peers and cutting the flag count
-#                               matters more than the handful of blocks lost.
 #
+#     TP2  block 128, atoms=2, cap 64 -- a 4 KiB tile reached with a half-size
+#                               workgroup. Below 96 KiB the schedule is
+#                               flag-bound, and 128 threads is the cheapest way
+#                               to hold the tile narrow.
+#          block 256, atoms=4, cap 128 -- above 96 KiB the trade reverses and
+#                               the wider cap matters, because this window runs
+#                               to 1.5 MiB: at a 16 KiB tile that is 96 tiles,
+#                               so a cap of 64 would leave half the blocks
+#                               running two serialized handshake rounds.
+#     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB, 
+#                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
+#     TP8  block 256, atoms=4, cap 64 -- the fattest tile, one rung over the
+#                               whole 80 KiB window: the fanout is to 7 peers
+#                               and cutting the flag count matters more than
+#                               the handful of blocks lost.
+#
+#   TODO: xGMI needs to re-measured to see if self-skip is beneficial also here.
 #   xGMI 
 #     TP2  atoms=2, cap 64   -- one rung over the whole 4 MiB window.
 #     TP4  atoms=1, cap 128  -- the narrow tile wins throughout, and the extra
 #                               blocks matter more than tile width because peer
 #                               bandwidth is not the constraint.
-#     TP8  atoms=1, cap 64   -- one rung over the whole 256 KiB window. 
+#     TP8  atoms=1, cap 64   -- one rung over the whole 256 KiB window.
 ONESHOT_LADDER = {
-    ("pcie", 2): ((0, 2, 64, "peer", 256), (96 << 10, 4, 128, "peer", 256)),
-    ("pcie", 4): ((0, 1, 64, "peer", 256), (64 << 10, 4, 64, "atom", 256)),
-    ("pcie", 8): ((0, 4, 64, "peer", 256),),
-    ("xgmi", 2): ((0, 2, 64, "peer", 256),),
-    ("xgmi", 4): ((0, 1, 128, "peer", 256),),
-    ("xgmi", 8): ((0, 1, 64, "peer", 256),),
+    ("pcie", 2): (
+        (0, 2, 64, "peer", 128, True),
+        (96 << 10, 4, 128, "peer", 256, True),
+    ),
+    ("pcie", 4): (
+        (0, 1, 64, "peer", 256, True),
+        (48 << 10, 2, 64, "atom", 256, True),
+        (96 << 10, 4, 128, "peer", 256, True),
+    ),
+    ("pcie", 8): ((0, 4, 64, "peer", 256, True),),
+    ("xgmi", 2): ((0, 2, 64, "peer", 256, False),),
+    ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
+    ("xgmi", 8): ((0, 1, 64, "peer", 256, False),),
 }
 
 
@@ -170,7 +177,16 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
     """
     return ONESHOT_LADDER.get(
         (str(link), int(world_size)),
-        ((0, DEFAULT_ATOMS, DEFAULT_GRID_CAP, "peer", DEFAULT_BLOCK),),
+        (
+            (
+                0,
+                DEFAULT_ATOMS,
+                DEFAULT_GRID_CAP,
+                DEFAULT_FANOUT,
+                DEFAULT_BLOCK,
+                DEFAULT_SKIP_SELF,
+            ),
+        ),
     )
 
 

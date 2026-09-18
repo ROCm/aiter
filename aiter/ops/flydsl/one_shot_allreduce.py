@@ -79,9 +79,9 @@ class OneShotAllReduce:
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
     MI350X and MI350P both report ``gfx950`` and want opposite answers.
 
-    ``skip_self`` drops the round trip this rank does through its own inbox. 
-    It specialises the kernel to this rank, so the JIT symbol carries an ``_r<n>_`` 
-    field and the binary is not shared across ranks -- one extra compile per process, 
+    ``skip_self`` drops the round trip this rank does through its own inbox.
+    It specialises the kernel to this rank, so the JIT symbol carries an ``_r<n>_``
+    field and the binary is not shared across ranks -- one extra compile per process,
     not per world.
     """
 
@@ -101,7 +101,7 @@ class OneShotAllReduce:
         link: str | None = None,
         probe: str = "full",
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
-        skip_self: bool = DEFAULT_SKIP_SELF,
+        skip_self: bool | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -163,10 +163,20 @@ class OneShotAllReduce:
         )
         self.probe = probe
         self.spin_sleep = int(spin_sleep)
-        self.skip_self = bool(skip_self)
 
+        # ``skip_self``: None means "whatever the rung says".
+        ss = None if skip_self is None else bool(skip_self)
         if pinned:
-            self._ladder = ((0, int(atoms), cap, fanout, int(block)),)
+            self._ladder = (
+                (
+                    0,
+                    int(atoms),
+                    cap,
+                    fanout,
+                    int(block),
+                    DEFAULT_SKIP_SELF if ss is None else ss,
+                ),
+            )
         else:
             ceiling = cap if grid_cap is not None else None
             self._ladder = tuple(
@@ -176,8 +186,9 @@ class OneShotAllReduce:
                     rung_cap if ceiling is None else min(rung_cap, ceiling),
                     f,
                     b,
+                    s if ss is None else ss,
                 )
-                for floor, a, rung_cap, f, b in oneshot_ladder(world_size, link)
+                for floor, a, rung_cap, f, b, s in oneshot_ladder(world_size, link)
             )
 
         # One engine per distinct rung config, built in a fixed sorted order:
@@ -190,8 +201,8 @@ class OneShotAllReduce:
         # ever be a no-op bought with an extra collective per engine.
         self._by_cfg = {}
         try:
-            for _floor, a, c, f, b in self._ladder:
-                key = (int(a), int(c), f, int(b))
+            for rung in self._ladder:
+                key = self._cfg_of(rung)
                 if key in self._by_cfg:
                     continue
                 spec = make_one_shot_allreduce_kernel(
@@ -203,7 +214,7 @@ class OneShotAllReduce:
                     block=key[3],
                     probe=probe,
                     spin_sleep=int(spin_sleep),
-                    skip_self=self.skip_self,
+                    skip_self=key[4],
                     rank=self.rank,
                 )
                 self._by_cfg[key] = (
@@ -231,6 +242,7 @@ class OneShotAllReduce:
         self.grid_cap = first[1]
         self.fanout = first[2]
         self.block = first[3]
+        self.skip_self = first[4]
         self.tile_bytes = spec["tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.buf_bytes = eng.buf_bytes
@@ -243,11 +255,11 @@ class OneShotAllReduce:
     @staticmethod
     def _cfg_of(rung) -> tuple:
         """A ladder rung's engine key: everything but its ``min_bytes``."""
-        _floor, atoms, cap, fanout, block = rung
-        return (int(atoms), int(cap), fanout, int(block))
+        _floor, atoms, cap, fanout, block, skip_self = rung
+        return (int(atoms), int(cap), fanout, int(block), bool(skip_self))
 
     def _pick_cfg(self, live_bytes: int) -> tuple:
-        """``(atoms, grid_cap, fanout, block)`` the ladder assigns to
+        """``(atoms, grid_cap, fanout, block, skip_self)`` the ladder assigns to
         *live_bytes*."""
         chosen = self._ladder[0]
         for rung in self._ladder:

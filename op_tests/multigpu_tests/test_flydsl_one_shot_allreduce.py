@@ -45,7 +45,6 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
-    DEFAULT_SKIP_SELF,
     SUPPORTED_BLOCKS,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import SUPPORTED_WORLDS
@@ -212,7 +211,7 @@ def _spawn(
     atoms: int | None = DEFAULT_ATOMS,
     grid_cap: int | None = DEFAULT_GRID_CAP,
     fanout: str | None = DEFAULT_FANOUT,
-    skip_self: bool = DEFAULT_SKIP_SELF,
+    skip_self: bool | None = None,
     block: int | None = None,
     mode: str = "shapes",
     iters: int = RUN_AHEAD_ITERS,
@@ -264,8 +263,8 @@ def _spawn(
             cmd += ["--grid-cap", str(grid_cap)]
         if fanout is not None:
             cmd += ["--fanout", fanout]
-        if skip_self:
-            cmd += ["--skip-self"]
+        if skip_self is not None:
+            cmd += ["--skip-self" if skip_self else "--no-skip-self"]
         if block is not None:
             cmd += ["--block", str(block)]
         if rank == 0:
@@ -403,7 +402,12 @@ def main():
     ap.add_argument("--atoms", type=int, default=None)
     ap.add_argument("--grid-cap", type=int, default=None)
     ap.add_argument("--fanout", default=None, choices=("peer", "atom"))
-    ap.add_argument("--skip-self", action="store_true")
+    ap.add_argument(
+        "--skip-self",
+        dest="skip_self",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     ap.add_argument("--block", type=int, default=None, choices=SUPPORTED_BLOCKS)
     args = ap.parse_args()
 
@@ -454,7 +458,12 @@ if __name__ == "__main__":
     parser.add_argument("--atoms", type=int, default=None)
     parser.add_argument("--grid-cap", type=int, default=None)
     parser.add_argument("--fanout", default=None, choices=("peer", "atom"))
-    parser.add_argument("--skip-self", action="store_true")
+    parser.add_argument(
+        "--skip-self",
+        dest="skip_self",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--block", type=int, default=None)
     parser.add_argument("--mode", default="shapes", choices=("shapes", "run_ahead"))
     parser.add_argument("--tokens", default="")
