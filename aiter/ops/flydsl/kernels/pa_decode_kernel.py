@@ -283,9 +283,9 @@ def compile_pa_decode_tile(
         448.0 if is_gfx950 else 240.0
     )  # max representable magnitude of the format above
 
-    assert head_dim % MFMA_MNK == 0, (
-        f"head_dim {head_dim} must be a multiple of {MFMA_MNK}"
-    )
+    assert (
+        head_dim % MFMA_MNK == 0
+    ), f"head_dim {head_dim} must be a multiple of {MFMA_MNK}"
     assert block_size in (
         16,
         64,
@@ -360,25 +360,25 @@ def compile_pa_decode_tile(
     TILE_TOK = KV_COMPUTE_BLOCK
     TOK_PER_WARP = TILE_TOK // NWARP
     assert TILE_TOK == NWARP * TOK_PER_WARP, "KV tile must split evenly across warps"
-    assert TOK_PER_WARP == NWARP * MFMA_MNK, (
-        "per-warp token ownership must match the MFMA chunk layout"
-    )
+    assert (
+        TOK_PER_WARP == NWARP * MFMA_MNK
+    ), "per-warp token ownership must match the MFMA chunk layout"
     NCHUNK = TOK_PER_WARP // MFMA_MNK  # 4
     # A warp owns 64 tokens: four page-16s, one page-64, or half a page-128.
     PAGES_PER_CHUNK = (TOK_PER_WARP + block_size - 1) // block_size
     KV_EXTENT = (1 << 42) if wide_kv_addressing else (1 << 30)
-    assert head_dim % (NWARP * MFMA_MNK) == 0, (
-        "head_dim must split across the 4 warps for PV"
-    )
+    assert (
+        head_dim % (NWARP * MFMA_MNK) == 0
+    ), "head_dim must split across the 4 warps for PV"
 
     # head_dim splits into 16-element chunks (QK_CHUNK_ELEMS, one dwordx4 load);
     # RGROUP_QUARTERS of them make a 64-element fetch group, QKHE_LOOP groups total.
     RGROUP_QUARTERS = 4
     QK_CHUNK_ELEMS = 16
     QKHE_LOOP = head_dim // (RGROUP_QUARTERS * QK_CHUNK_ELEMS)
-    assert QKHE_LOOP >= 1, (
-        f"head_dim {head_dim} must be at least {RGROUP_QUARTERS * QK_CHUNK_ELEMS}"
-    )
+    assert (
+        QKHE_LOOP >= 1
+    ), f"head_dim {head_dim} must be at least {RGROUP_QUARTERS * QK_CHUNK_ELEMS}"
     # QK operand-pack count, not the number of MFMA instructions.
     N_SUBCHUNKS = head_dim // FP8_PACK_K
     assert N_SUBCHUNKS % PACKS_PER_MFMA == 0, "QK packs must fill whole MFMA atoms"
@@ -1172,8 +1172,7 @@ def compile_pa_decode_tile(
         # Subtract from tile_valid inside the loop, keeping bounds tile-relative.
         if const_expr(QUERIES_PER_CTA == 1):
             causal_offset = [
-                query_length - 1 - query_begin
-                for _m in range_constexpr(M_TILES)
+                query_length - 1 - query_begin for _m in range_constexpr(M_TILES)
             ]
         else:
             causal_offset = [
@@ -1276,9 +1275,7 @@ def compile_pa_decode_tile(
                     # Scales outside every query's window must not shrink
                     # visible probabilities to zero during FP8 normalization.
                     # Keep this bound query-independent for shared MTP scales.
-                    first_visible = (window_left - (query_length - 1)).to(
-                        fx.Float32
-                    )
+                    first_visible = (window_left - (query_length - 1)).to(fx.Float32)
                     window_scale_thr = fx.Vector.from_elements(
                         [
                             first_visible
