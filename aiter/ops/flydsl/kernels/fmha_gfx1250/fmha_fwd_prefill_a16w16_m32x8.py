@@ -405,7 +405,13 @@ def _wmma(a, b, c):
         else rocdl.wmma_f32_16x16x32_bf16
     )
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
-    return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
+    d = wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
+    # Every wmma is one tick of the ring's WAR clock: the depctr the hazard pass puts
+    # in front of a refill counts the VALU between the last read of those registers
+    # and the ds_load that reclaims them. Let the scheduler slide a wmma across a
+    # ds_load and that count stops matching the geometry the ring was built for.
+    rocdl.sched_barrier(0)
+    return d
 
 
 def _p_to_elem(p_list, elem_dtype):
@@ -441,13 +447,24 @@ def _ring_num_prefetch(num_frag, ring, lag):
     return ring - 2 * lag
 
 
+def _emit_ld(emit, j):
+    """One ring ds_load, fenced. Pairs with the fence in ``_wmma``: together they hold
+    the load/wmma interleave exactly as emitted, which is what makes the refill's WAR
+    distance equal the ring geometry instead of whatever the scheduler settles on."""
+    v = emit(j)
+    rocdl.sched_barrier(0)
+    return v
+
+
 def _ring_head(*, num_frag, emit, ring, lag):
     """Issue a ring's NP-deep prefetch early -- hoisting its LDS latency under unrelated
     work -- for a later ``_ring_drive`` called with the same ``ring``/``lag``."""
-    return [emit(j) for j in range(_ring_num_prefetch(num_frag, ring, lag))]
+    return [
+        _emit_ld(emit, j) for j in range(_ring_num_prefetch(num_frag, ring, lag))
+    ]
 
 
-def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
+def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None, dies=None):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
     ``emit(j)`` emits ds_load ``j`` (2 per WMMA fragment); ``consume(i, lo, hi)`` emits
@@ -462,6 +479,13 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
     above softmax so the LDS latency hides under the softmax VALU). A tile of at most
     ``ring`` loads degenerates to the old burst-everything form (see
     ``_ring_num_prefetch``), as does ``lag=0`` with ``ring >= 2*num_frag``.
+
+    ``dies(i)`` optionally names values *other* than the ring pair whose last read is
+    fragment ``i`` -- the B operands, which the ring does not own. Without it those
+    registers fall free the instant their last wmma issues, and the next refill grabs
+    them at a WAR distance of one VALU (``s_wait_alu depctr_va_vdst(1)``) instead of the
+    ``2*rel`` the ring pairs enjoy. Routing them through the same release queue puts
+    every register the refill can see at the same distance.
     """
     num_ld = 2 * num_frag
     NP = _ring_num_prefetch(num_frag, ring, lag)
@@ -480,7 +504,7 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
             a[i] = v
     else:
         for i in range(NP):
-            a[i] = emit(i)
+            a[i] = _emit_ld(emit, i)
         rocdl.sched_barrier(0)  # pin the NP-deep burst above the stream
 
     steady = num_frag - NP // 2
@@ -493,27 +517,42 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
         for k in range(2):
             j = 2 * i + NP + k
             if j < num_ld:
-                a[j % ring] = emit(j)
+                a[j % ring] = _emit_ld(emit, j)
+
+    def _release(i):
+        j = i - rel
+        if j >= 0 and held[j] is not None:
+            # Fenced: the release point IS the WAR distance the refill below gets
+            # measured against, so the scheduler must not slide a ds_load above it
+            # or the keepalive below one.
+            rocdl.sched_barrier(0)
+            _keepalive(held[j])  # regs read by fragment j die HERE, not at the wmma
+            rocdl.sched_barrier(0)
+            held[j] = None
+
+    def _record(i, pair):
+        vals = list(pair) if pair is not None else []
+        if dies is not None:
+            vals.extend(dies(i))
+        held.append(tuple(vals) if vals else None)
 
     for i in range(steady):
         _waitn(NP - 2)
-        if lag and i >= rel:
-            _keepalive(
-                held[i - rel]
-            )  # regs read by fragment i-rel die HERE, not at wmma
-            held[i - rel] = None
+        _release(i)
         _refill(i)
         lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
         rocdl.sched_barrier(0)
         consume(i, lo, hi)
         rocdl.sched_barrier(0)
-        held.append((lo, hi) if lag else None)
+        _record(i, (lo, hi) if lag else None)
     for i in range(steady, num_frag):
         _waitn(NP - 2 * (i - steady + 1))
+        _release(i)
         lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
         rocdl.sched_barrier(0)
         consume(i, lo, hi)
         rocdl.sched_barrier(0)
+        _record(i, None)
     for p in held:
         if p is not None:
             _keepalive(p)
@@ -865,6 +904,7 @@ def _pv_gemm(
     nkt = n_block // WMMA_K  # kv contraction tiles (K=32 kv each)
 
     out_list = [[None] * d_tiles for _ in range(R)]
+    p_frags = {}  # (qt, kt) -> B operand, handed to _ring_drive on its last fragment
 
     def consume(i, v_lo, v_hi):
         dt, kt = divmod(i, nkt)
@@ -882,7 +922,16 @@ def _pv_gemm(
             # B-operand: P^T frag = two consecutive softmax kv-tiles -> v16 bf16.
             p = p_list[qt]
             p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
+            p_frags[(qt, kt)] = p_frag
             out_list[qt][dt] = _wmma(v_frag, p_frag, acc)
+
+    def dies(i):
+        # kt is reused by every d-tile, so a P^T fragment's last read is its row of
+        # the final d-tile -- exactly where the ring's own refills land.
+        dt, kt = divmod(i, nkt)
+        if dt != d_tiles - 1:
+            return ()
+        return [p_frags.pop((qt, kt)) for qt in range(R)]
 
     _ring_drive(
         num_frag=d_tiles * nkt,
@@ -891,6 +940,7 @@ def _pv_gemm(
         ring=ring,
         lag=lag,
         head=head,
+        dies=dies,
     )
     return out_list
 
@@ -929,6 +979,7 @@ def _pv_qk_gemm(
 
     out_list = [[None] * d_tiles for _ in range(R)]
     s_acc_list = [[None] * NKV for _ in range(R)]
+    p_frags = {}  # (qt, kt) -> B operand, handed to _ring_drive on its last fragment
 
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
@@ -947,6 +998,7 @@ def _pv_qk_gemm(
                     )
                 p = p_list[qt]
                 p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
+                p_frags[(qt, kt)] = p_frag
                 out_list[qt][dt] = _wmma(v_frag, p_frag, acc)
             return
         kv, dt = divmod(i - num_vfrag, NDT)
@@ -954,6 +1006,17 @@ def _pv_qk_gemm(
         for qt in range(R):
             acc = s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
             s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
+
+    def dies(i):
+        # The PV half's B operands die on the final d-tile row -- which is where the
+        # ring is already refilling for the QK half. Release them through the ring so
+        # the refill sees one distance, not two.
+        if i >= num_vfrag:
+            return ()
+        dt, kt = divmod(i, nkt)
+        if dt != d_tiles - 1:
+            return ()
+        return [p_frags.pop((qt, kt)) for qt in range(R)]
 
     # Raise wave priority for the whole WMMA stream: under anti-phase the other half is
     # in its softmax VALU here, and the gemm half must win issue arbitration.
@@ -965,6 +1028,7 @@ def _pv_qk_gemm(
         ring=ring,
         lag=lag,
         head=head,
+        dies=dies,
     )
     rocdl.s_setprio(0)
     return out_list, s_acc_list
