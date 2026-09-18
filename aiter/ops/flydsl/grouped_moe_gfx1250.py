@@ -652,17 +652,20 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = (
-            os.environ.get("MEGA_DISPATCH", "") == "tdm"
-            and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
-            in ("1", "true", "True")
+        _direct_ep_mask = os.environ.get(
+            "MEGA_DISPATCH", ""
+        ) == "tdm" and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1") in (
+            "1",
+            "true",
+            "True",
         )
         _fuse_ep_route_quant = (
             _direct_ep_mask
             and enable_ep_scatter
             and int(E) <= 256
             and a1_scale is not None
-            and hidden_states.dtype in (
+            and hidden_states.dtype
+            in (
                 dtypes.fp8,
                 torch.uint8,
                 dtypes.fp4x2,
@@ -679,9 +682,11 @@ def _grouped_a8w4_tdm_moe(
             # MegaMoE assigns each rank one aligned contiguous E-expert slice.
             # The route kernel can therefore test mask[global_id] and map with
             # global_id % E directly; no LUT/cumsum launch is needed.
-            _g2l_lut = expert_mask.to(
-                device=device, dtype=torch.int32
-            ).reshape(-1).contiguous()
+            _g2l_lut = (
+                expert_mask.to(device=device, dtype=torch.int32)
+                .reshape(-1)
+                .contiguous()
+            )
             _g2l_counter = route_counter_buffer(E, device)
             _ep_nvr = torch.empty(1, dtype=torch.int32, device=device)
         else:
@@ -689,9 +694,7 @@ def _grouped_a8w4_tdm_moe(
                 expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
             )
             _ep_nvr = (
-                _g2l_nvr
-                if _g2l_nvr is not None
-                else (_ep_nvt * int(topk)).contiguous()
+                _g2l_nvr if _g2l_nvr is not None else (_ep_nvt * int(topk)).contiguous()
             )
         # Pre-allocate ep_rowmap so the route kernel can fuse its sentinel fill
         # (fire-and-forget stores interleaved with route work, no extra barrier).
@@ -882,9 +885,7 @@ def _grouped_a8w4_tdm_moe(
             (int(contiguous_m),), -1, dtype=torch.int32, device=device
         )
     _a1_wire_stride = (
-        int(stage2_scatter.compact_wire_row_stride)
-        if _compact and _prequantized
-        else 0
+        int(stage2_scatter.compact_wire_row_stride) if _compact and _prequantized else 0
     )
     if _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)

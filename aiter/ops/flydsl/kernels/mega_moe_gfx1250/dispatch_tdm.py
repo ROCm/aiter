@@ -443,7 +443,9 @@ def _make_dispatch_tdm(
             # ── FINALIZE: hand out the reserved slots and gather the metadata ──
             # destTokId = s_base + block-local j; staging is peer-major destTokId
             # SoA, so a block's reserved run is already a contiguous TDM source.
-            for tok_base in range(global_warp_id * etpi, inp_cur_tok, warps_total * etpi):
+            for tok_base in range(
+                global_warp_id * etpi, inp_cur_tok, warps_total * etpi
+            ):
                 tok, act, expert, slot_off, dest_pe, keep = resolve(tok_base)
                 wt = buffer_load(rsrc_inp_wts, slot_off, vec_width=1, dtype=T.f32)
                 j = arith.constant(0)
@@ -470,7 +472,9 @@ def _make_dispatch_tdm(
                     if lane_act & (pub_e != 0):
                         buffer_store(expert, rsrc_stg_idx, slot_e * topk + e_lane)
                         buffer_store(
-                            arith.bitcast(T.i32, wt), rsrc_stg_wt, slot_e * topk + e_lane
+                            arith.bitcast(T.i32, wt),
+                            rsrc_stg_wt,
+                            slot_e * topk + e_lane,
                         )
                         if e_lane == 0:
                             buffer_store(src_encoded, rsrc_stg_src, slot_e)
@@ -520,7 +524,9 @@ def _make_dispatch_tdm(
                         dst_off + i,
                     )
 
-            def _ship_meta(peer_id, n_tok, src_tok, dst_tok, p_idx, p_wts, p_tis, p_scales):
+            def _ship_meta(
+                peer_id, n_tok, src_tok, dst_tok, p_idx, p_wts, p_tis, p_scales
+            ):
                 """Move one batch of staged metadata for ``n_tok`` tokens to a peer.
 
                 Every field is planned on its own: they start at unrelated phases
@@ -584,7 +590,13 @@ def _make_dispatch_tdm(
                 # The edges are global-to-global and owe the tile nothing, so they
                 # run while the loads above are still in flight.
                 _copy_edge(
-                    rsrc_stg_idx, p_idx, src_tok * topk, dst_tok * topk, h_idx, b_idx, n_kv
+                    rsrc_stg_idx,
+                    p_idx,
+                    src_tok * topk,
+                    dst_tok * topk,
+                    h_idx,
+                    b_idx,
+                    n_kv,
                 )
                 _copy_edge(
                     rsrc_stg_wt, p_wts, src_tok * topk, dst_tok * topk, h_wt, b_wt, n_kv
@@ -676,21 +688,29 @@ def _make_dispatch_tdm(
                         for i in range(lane, topk, WAVE):
                             buffer_store(
                                 buffer_load(
-                                    rsrc_stg_idx, src * topk + i, vec_width=1, dtype=T.i32
+                                    rsrc_stg_idx,
+                                    src * topk + i,
+                                    vec_width=1,
+                                    dtype=T.i32,
                                 ),
                                 peer_idx,
                                 dst * topk + i,
                             )
                             buffer_store(
                                 buffer_load(
-                                    rsrc_stg_wt, src * topk + i, vec_width=1, dtype=T.i32
+                                    rsrc_stg_wt,
+                                    src * topk + i,
+                                    vec_width=1,
+                                    dtype=T.i32,
                                 ),
                                 peer_wts,
                                 dst * topk + i,
                             )
                         if lane == 0:
                             buffer_store(
-                                buffer_load(rsrc_stg_src, src, vec_width=1, dtype=T.i32),
+                                buffer_load(
+                                    rsrc_stg_src, src, vec_width=1, dtype=T.i32
+                                ),
                                 peer_tis,
                                 dst,
                             )
@@ -705,7 +725,7 @@ def _make_dispatch_tdm(
                                     ),
                                     peer_scales,
                                     dst * scale_dst_dw + i,
-                            )
+                                )
 
         # ── PAYLOAD: one TDM load per token, one TDM store per surviving route ──
         # No barrier before this. The tile a warp is about to overwrite is the
@@ -830,8 +850,7 @@ def _make_dispatch_tdm(
                                             fx.Int64(
                                                 window.lsa_ptr(dest_pe, off_out_tok)
                                             )
-                                            + fx.Int64(dest_tok)
-                                            * fx.Int64(row_stride),
+                                            + fx.Int64(dest_tok) * fx.Int64(row_stride),
                                         ),
                                         g_payload_store,
                                     )
@@ -894,13 +913,9 @@ def _make_dispatch_tdm(
                     )
                 comm_ops.waitcnt_stores()
 
-                local_recv_num = fx.Int64(
-                    window.lsa_ptr(my_lsa_rank, off_recv_num)
-                )
+                local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
                 for src_pe in range(lane, npes, WAVE):
-                    recv_num_src_addr = (
-                        local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
-                    )
+                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
                     comm_ops.spin_until_gt_i32(recv_num_src_addr, 0)
                     comm_ops.store_i32_system(
                         recv_num_src_addr, arith.constant(0), arith.constant(0)

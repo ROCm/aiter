@@ -1848,9 +1848,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                         origin_pe = enc // max_tok_v
                         origin_lid = enc - origin_pe * max_tok_v
                         packed = (
-                            origin_pe * fx.Uint32(slot_stride)
-                            + origin_lid * topk_v
-                            + k
+                            origin_pe * fx.Uint32(slot_stride) + origin_lid * topk_v + k
                         )
                         ep_p = ptr_buf_tensor(ep_rowmap)
                         ep_base = row * 2
@@ -2878,9 +2876,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         count_t = ptr_buf_tensor(count)
         valid_routes = fx.Uint32(numel)
         if const_expr(direct_ep):
-            valid_routes = (
-                fx.Uint32(ptr_buf_tensor(num_valid_tokens)[c0_i32]) * c_topk
-            )
+            valid_routes = fx.Uint32(ptr_buf_tensor(num_valid_tokens)[c0_i32]) * c_topk
         route0 = is_route_worker.select(route0, valid_routes)
 
         # ============================ Phase 1: count ============================
@@ -2893,9 +2889,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
             expert = fx.Uint32(global_expert)
             keep = global_expert >= c0_i32
             if const_expr(direct_ep):
-                keep = keep & (
-                    global_expert // fx.Int32(experts) == fx.Int32(rank)
-                )
+                keep = keep & (global_expert // fx.Int32(experts) == fx.Int32(rank))
                 expert = fx.Uint32(global_expert % fx.Int32(experts))
             if (lane == 0) & keep:
                 _atomic_add(count, expert, c1_i32)
@@ -2982,9 +2976,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
             expert = fx.Uint32(global_expert)
             keep = global_expert >= c0_i32
             if const_expr(direct_ep):
-                keep = keep & (
-                    global_expert // fx.Int32(experts) == fx.Int32(rank)
-                )
+                keep = keep & (global_expert // fx.Int32(experts) == fx.Int32(rank))
                 expert = fx.Uint32(global_expert % fx.Int32(experts))
 
             # lane 0 claims the within-expert slot and reads the (published) per-
@@ -3015,9 +3007,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
                         origin_pe = enc // fx.Uint32(max_tok)
                         origin_lid = enc - origin_pe * fx.Uint32(max_tok)
                         packed = (
-                            origin_pe * fx.Uint32(slot_stride)
-                            + origin_lid * c_topk
-                            + k
+                            origin_pe * fx.Uint32(slot_stride) + origin_lid * c_topk + k
                         )
                         ep_p = ptr_buf_tensor(ep_rowmap)
                         ep_p[grouped_row * 2] = packed
@@ -3040,46 +3030,46 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 is_block_lead = lane_in_block == c0_i32
 
                 c = SimpleNamespace(
-                i32=i32,
-                f32=f32,
-                block_iters=block_iters,
-                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                mx_blocks_per_row=mx_blocks_per_row,
-                amax_shuffle_dists=amax_shuffle_dists,
-                is_fp8=is_fp8,
-                use_native=use_native,
-                use_pk8=use_pk8,
-                mx_dtype=mx_dtype,
-                c0_i32=c0_i32,
-                c1_i32=c1_i32,
-                c4_i32=c4_i32,
-                c23_i32=c23_i32,
-                c254_i32=c254_i32,
-                c0_f32=c0_f32,
-                c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                c_wmma_rep=c_wmma_rep,
-                block_in_wave=block_in_wave,
-                lane_in_block=lane_in_block,
-                is_block_lead=is_block_lead,
-                dests=[
-                    SimpleNamespace(
-                        payload_row_i32=grouped_row,
-                        scale_row_dword_base=scale_row_dword_base,
-                    )
-                ],
-                payload_base=payload_base,
-                payload_bytes_per_row=payload_bytes_per_row,
-                hidden_base=hidden_base,
-                feat_bytes_per_row=src_bytes_per_row,
-                feat_row_i32=token,
-                prequantized=prequantized,
-                payload_dwords_per_lane=payload_dwords_per_lane,
-                src_scale_base=fx.Int64(ptrtoint(src_scale)),
-                src_scale_bytes_per_row=src_scale_bytes_per_row,
-                scale_t=scale_t,
+                    i32=i32,
+                    f32=f32,
+                    block_iters=block_iters,
+                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                    mx_blocks_per_row=mx_blocks_per_row,
+                    amax_shuffle_dists=amax_shuffle_dists,
+                    is_fp8=is_fp8,
+                    use_native=use_native,
+                    use_pk8=use_pk8,
+                    mx_dtype=mx_dtype,
+                    c0_i32=c0_i32,
+                    c1_i32=c1_i32,
+                    c4_i32=c4_i32,
+                    c23_i32=c23_i32,
+                    c254_i32=c254_i32,
+                    c0_f32=c0_f32,
+                    c_wave=c_wave,
+                    c_elems_per_lane=c_elems_per_lane,
+                    c_payload_bytes_per_block=c_payload_bytes_per_block,
+                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    c_wmma_rep=c_wmma_rep,
+                    block_in_wave=block_in_wave,
+                    lane_in_block=lane_in_block,
+                    is_block_lead=is_block_lead,
+                    dests=[
+                        SimpleNamespace(
+                            payload_row_i32=grouped_row,
+                            scale_row_dword_base=scale_row_dword_base,
+                        )
+                    ],
+                    payload_base=payload_base,
+                    payload_bytes_per_row=payload_bytes_per_row,
+                    hidden_base=hidden_base,
+                    feat_bytes_per_row=src_bytes_per_row,
+                    feat_row_i32=token,
+                    prequantized=prequantized,
+                    payload_dwords_per_lane=payload_dwords_per_lane,
+                    src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                    src_scale_bytes_per_row=src_scale_bytes_per_row,
+                    scale_t=scale_t,
                 )
                 if const_expr(not direct_ep):
                     _emit_quant_block_loop(c)
