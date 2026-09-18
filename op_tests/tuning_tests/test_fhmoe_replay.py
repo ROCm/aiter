@@ -37,6 +37,8 @@ _SHIPPED_TOKEN1_KN2 = "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic"
 _KERNEL_REGEX = (
     rf"{_TUNE_KN1} {_TUNE_KN2_A}$|{_TUNE_KN1} {_TUNE_KN2_B}$"
 )
+# fused_moe refuses M=16 unless the CSV has every power-of-two through 16.
+_TUNE_TOKENS = (1, 2, 4, 8, 16)
 _REPLAY_TOKENS = (1, 16)
 
 _NATIVE_FIELDS = [
@@ -244,7 +246,7 @@ class TestFhmoeReplay(unittest.TestCase):
             check=False,
         )
 
-    def _run_fhmoe_tuner(self, untuned_path, tuned_path, timeout=1200):
+    def _run_fhmoe_tuner(self, untuned_path, tuned_path, timeout=1800):
         _cleanup_stale_lock_files()
         env = os.environ.copy()
         script_dir = os.path.dirname(_TUNE_SCRIPT)
@@ -294,7 +296,7 @@ class TestFhmoeReplay(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             untuned_path = os.path.join(tmp, "untuned_fhmoe.csv")
             tuned_path = os.path.join(tmp, "tuned_fhmoe.csv")
-            _write_untuned_rows(untuned_path, _REPLAY_TOKENS)
+            _write_untuned_rows(untuned_path, _TUNE_TOKENS)
             tune = self._run_fhmoe_tuner(untuned_path, tuned_path)
             tune_out = tune.stdout + tune.stderr
             self.assertEqual(
@@ -310,8 +312,8 @@ class TestFhmoeReplay(unittest.TestCase):
             by_token = {int(row["token"]): row for row in rows}
             self.assertEqual(
                 set(by_token),
-                set(_REPLAY_TOKENS),
-                f"tuner tokens {sorted(by_token)} != {_REPLAY_TOKENS}",
+                set(_TUNE_TOKENS),
+                f"tuner tokens {sorted(by_token)} != {_TUNE_TOKENS}",
             )
             for token, row in by_token.items():
                 kn1, kn2 = row["kernelName1"], row["kernelName2"]
@@ -324,7 +326,8 @@ class TestFhmoeReplay(unittest.TestCase):
                         _SHIPPED_TOKEN1_KN2,
                         "winner matches shipped token=1; cannot prove AITER_CONFIG_FHMOE",
                     )
-            for token, row in by_token.items():
+            for token in _REPLAY_TOKENS:
+                row = by_token[token]
                 result = self._run_public_op(tuned_path, token=token)
                 output = result.stdout + result.stderr
                 self.assertEqual(
