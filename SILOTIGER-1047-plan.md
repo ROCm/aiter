@@ -774,6 +774,11 @@ are not the split-kernel gap. Keep scalar P gathers.
 Decode oracle ``err≈0.98``. Same class of miss as MMA-native PV B on this
 layout. Keep scalar ``v_lds[n, d]`` gathers.
 
+**Do not retry** unrolling the 32-split LSE merge (``range_constexpr``
+instead of ``scf.for``). ``err=0``; width-2051 ``L=512`` was 18.6 /
+21.2 / 513.0 us vs the kept 18.5 / 21.1 / 516.2. Decode is flat; prefill
+does not launch merge. Keep the runtime split loop.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

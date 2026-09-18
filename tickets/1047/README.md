@@ -655,6 +655,10 @@ must not be retried). GPU 6 / gfx950: 18 pytest cases, ``err=0``,
 width-2051 ``L=512`` is 18.5 / 21.1 / 516.2 us vs 19.8 / 22.7 / 513.5
 (~6–7% decode). Still ~1.8× live AMD on the split kernel.
 
+**Do not retry** unrolling the 32-split LSE merge. ``err=0``; width-2051
+``L=512`` was 18.6 / 21.2 / 513.0 us vs 18.5 / 21.1 / 516.2. Decode is
+flat; prefill does not launch merge. Keep the runtime split loop.
+
 
 
 
