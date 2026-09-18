@@ -436,6 +436,9 @@ def launch_gemm_a8w8_256x256(
         native_256x256_schedule = const_expr(
             tile_m == 256 and tile_n == 256 and num_buffers == 4
         )
+        separate_refill_wait = const_expr(
+            native_256x256_schedule and not mx32 and split_k == 1
+        )
         native_vgpr_pinning = const_expr(
             mx32 and native_256x256_schedule
         )
@@ -870,6 +873,9 @@ def launch_gemm_a8w8_256x256(
 
             def _wait_refill():
                 if const_expr(boundary and has_next):
+                    if const_expr(separate_refill_wait):
+                        # Otherwise LLVM hoists this wait next to the signal.
+                        rocdl.sched_barrier(0)
                     pipeline_fence_wait(use_cluster=False)
                     if const_expr(refill):
                         tdm_ops.tensor_load_2d(prepared)
@@ -884,10 +890,9 @@ def launch_gemm_a8w8_256x256(
             assert len(early) - n_q2 <= n_slots - len(
                 tail
             ), "seed thunks overflow Q2 + Q3"
-            # The native gfx1250 schedule gives a signaled tensor operation three
-            # independent WMMAs before waiting.  Keep the smaller profiles at
-            # their existing insertion point; only the 256x256 profile has the
-            # 16 slots needed to move the wait one slot earlier.
+            # Native gives a signaled tensor operation three independent WMMAs
+            # before waiting. MX32 follows that cadence; MX128 benchmarks faster
+            # with four independent WMMAs before the wait.
             wait_at = SLACK - (2 if native_vgpr_pinning else 1)
             q2 = {wait_at: _wait_refill}
             q2.update({SLACK + i: t for i, t in enumerate(early[:n_q2])})
