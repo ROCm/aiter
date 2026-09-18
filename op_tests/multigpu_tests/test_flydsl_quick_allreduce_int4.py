@@ -473,7 +473,7 @@ def main():
                     tp,
                 )
                 continue
-            if not isinstance(mnk, tuple) or len(mnk) < 2:
+            if not isinstance(mnk, tuple) or len(mnk) != 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
             tokens, hidden = int(mnk[0]), int(mnk[1])
             df.append(

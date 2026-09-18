@@ -29,6 +29,8 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 
 def _cuda_index(device) -> int:
+    if isinstance(device, str):
+        device = torch.device(device)
     if isinstance(device, torch.device):
         if device.type != "cuda":
             raise ValueError(f"QuickAllReduceInt4 requires a CUDA device, got {device}")
