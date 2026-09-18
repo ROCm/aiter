@@ -658,8 +658,14 @@ Dropped the barrier between V gather and wave-0 softmax (softmax
 reads C/live, not V). Split-kernel occupancy ISA is 6 ``s_barrier``
 (was 7). Width-2051 ``L=512`` is 24.3 / 24.1 / 586.7 us (``err=0``)
 — flat. Prefill VGPR 165 vs 169. Do **not** retry all-wave softmax
-to fold the P barrier. Next: K/V-alias or translate barriers, or Q
-register staging.
+to fold the P barrier.
+
+**Do not retry** replacing cooperative page translate with per-thread
+(and softmax) redundant `indices`/`page_table` loads. Oracle ``err=0``,
+but width-2051 ``L=512`` went to 24.1 / 23.8 / 608.9 us vs 24.3 /
+24.1 / 586.7; prefill paid for dropping the translate barrier. Keep
+phys/page/live LDS. Next: Q register staging (do not drop the K/V
+alias barrier without extra KV LDS).
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
