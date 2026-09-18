@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import os
+import random
 import statistics
 import subprocess
 import sys
@@ -40,6 +41,7 @@ from aiter.ops.mha_fwd_policy import (
     _as_bool,
     MHA_FWD_CANDIDATE_FIELDS,
     MHA_FWD_HARDWARE_KEY_FIELDS,
+    MHA_FWD_INDIFFERENCE_DELTA,
     MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
@@ -53,9 +55,20 @@ from aiter.ops.mha_fwd_policy import (
     enumerate_mha_fwd_candidates,
     mha_fwd_candidate_id,
 )
+from aiter.test_common import checkAllclose
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.block_race import (
+    JsonlBlockJournal,
+    RaceEntrant,
+    cuda_event_timer,
+    race,
+)
 from aiter.utility.mp_tuner import mp_tuner
 
+
+# Fixed so that --race-candidates draws the same subset on every run; a
+# sampled field that changed between runs would make two runs incomparable.
+MHA_FWD_RACE_SAMPLE_SEED = 20240917
 
 UNTUNED_FIELDS = MHA_FWD_PROBLEM_KEY_FIELDS
 RESULT_FIELDS = (*MHA_FWD_CANDIDATE_FIELDS, *MHA_FWD_METRIC_FIELDS)
@@ -395,6 +408,8 @@ class MhaFwdTuner(TunerCommon):
         self._selection_proofs: list[dict[str, Any]] = []
         self._incumbents_by_key: dict[tuple, set[tuple[str, str]]] = {}
         self._promotions: list[dict[str, Any]] = []
+        self._race_reports: list[dict[str, Any]] = []
+        self._race_winner_by_key: dict[tuple, tuple] = {}
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -421,12 +436,63 @@ class MhaFwdTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--strategy",
-            choices=MHA_FWD_SEARCH_STRATEGIES,
+            choices=(*MHA_FWD_SEARCH_STRATEGIES, "race"),
             default="exhaustive",
             help=(
                 "candidate search strategy; smoke samples each tile grid so the "
                 "measure-publish-replay path can be exercised without the full "
-                "catalogue, and records itself in the evidence"
+                "catalogue, and records itself in the evidence. race measures "
+                "the exhaustive catalogue as an interleaved elimination race "
+                "instead of screening every candidate once in its own worker"
+            ),
+        )
+        self.parser.add_argument(
+            "--delta",
+            type=float,
+            default=MHA_FWD_INDIFFERENCE_DELTA,
+            help=(
+                "race only: the indifference zone. Candidates within this of "
+                "the leader are treated as settled rather than as a harder "
+                "question, and the same threshold decides whether a challenger "
+                "displaces the incumbent, so one definition of "
+                "indistinguishable holds end to end"
+            ),
+        )
+        self.parser.add_argument(
+            "--race-alpha",
+            type=float,
+            default=0.05,
+            help="race only: error budget, spread over every candidate and look",
+        )
+        self.parser.add_argument(
+            "--race-block-calls",
+            type=int,
+            default=10,
+            help="race only: timed calls per candidate per block",
+        )
+        self.parser.add_argument(
+            "--race-min-blocks",
+            type=int,
+            default=3,
+            help="race only: blocks before any candidate may be eliminated",
+        )
+        self.parser.add_argument(
+            "--race-max-blocks",
+            type=int,
+            default=30,
+            help=(
+                "race only: ceiling on blocks. Reaching it without certifying "
+                "returns a ranking rather than a guarantee, and the evidence "
+                "records that it was not certified"
+            ),
+        )
+        self.parser.add_argument(
+            "--race-candidates",
+            type=int,
+            default=None,
+            help=(
+                "race only: draw a seeded sample of this many catalogue entries "
+                "instead of the whole catalogue, for cheap end-to-end runs"
             ),
         )
         self.parser.add_argument(
@@ -683,10 +749,32 @@ class MhaFwdTuner(TunerCommon):
                     )
         return records
 
+    def _catalogue_strategy(self) -> str:
+        """Which catalogue the candidates come from.
+
+        ``race`` names how the field is measured, not which field it is, so it
+        draws from the full catalogue. Keeping the two apart means the race is
+        never quietly handed a sampled grid and reported as a complete search.
+        """
+        strategy = getattr(self._args, "strategy", "exhaustive")
+        return "exhaustive" if strategy == "race" else strategy
+
     def tune(self, untunedf, tunedf, args):
-        journal = self._load_journal()
+        all_infos, task_by_info, plans = self._plan_candidates(untunedf, args)
+        if getattr(args, "strategy", "exhaustive") == "race":
+            return self._tune_by_race(args, untunedf, plans, all_infos, task_by_info)
+        return self._tune_by_screening(args, untunedf, all_infos, task_by_info)
+
+    def _plan_candidates(self, untunedf, args):
+        """Enumerate every candidate once, for whichever measurement follows.
+
+        Screening and racing need the same three things -- the candidate list,
+        the arguments that build the data, and the arguments that launch a
+        candidate on it -- so they are assembled here rather than twice.
+        """
         all_infos = []
         task_by_info = {}
+        plans = []
         for row_index, row in untunedf.iterrows():
             problem = MhaFwdProblem.from_mapping(
                 {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
@@ -696,10 +784,15 @@ class MhaFwdTuner(TunerCommon):
             candidates = list(
                 enumerate_mha_fwd_candidates(
                     str(row.gfx),
-                    getattr(self._args, "strategy", "exhaustive"),
+                    self._catalogue_strategy(),
                     self._restricted_backends(),
                 )
             )
+            sample = getattr(args, "race_candidates", None)
+            if sample is not None and sample < len(candidates):
+                candidates = random.Random(MHA_FWD_RACE_SAMPLE_SEED).sample(
+                    candidates, sample
+                )
             # Measuring what the kernel resolves today, in the same sweep and
             # on the same GPU, is what lets the run tell an improvement from a
             # reordering of noise. Without it the comparison is against a
@@ -787,6 +880,34 @@ class MhaFwdTuner(TunerCommon):
                 )
                 task_by_info[info] = task
 
+            plans.append(
+                {
+                    "key": key,
+                    "row": row,
+                    "gen_args": gen_args,
+                    "candidates": candidates,
+                    "softmax_scale": softmax_scale,
+                    # Everything _run_candidate needs after the five tensors.
+                    "launch_tail": (
+                        int(row.max_seqlen_q),
+                        int(row.max_seqlen_k),
+                        int(row.min_seqlen_q),
+                        float(row.dropout_p),
+                        softmax_scale,
+                        float(row.logits_soft_cap),
+                        int(row.how_v3_bf16_cvt),
+                        bool(row.causal),
+                        int(row.window_left),
+                        int(row.window_right),
+                        bool(row.return_lse),
+                    ),
+                }
+            )
+
+        return all_infos, task_by_info, plans
+
+    def _tune_by_screening(self, args, untunedf, all_infos, task_by_info):
+        journal = self._load_journal()
         problem_keys = [
             MhaFwdProblem.from_mapping(
                 {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
@@ -940,6 +1061,296 @@ class MhaFwdTuner(TunerCommon):
             final_by_info[info] = (info, us, err_ratio, status, detail)
 
         return [final_by_info.get(result[0], result) for result in first_pass]
+
+    def _tune_by_race(self, args, untunedf, plans, all_infos, task_by_info):
+        """Measure each shape as one interleaved elimination race.
+
+        Screening measures every candidate once, alone, in its own worker, so
+        a single contended measurement drops a candidate permanently and the
+        top eight have to be re-measured to undo that. A race does not have
+        that weakness: every survivor is measured in every block, paired
+        against the others, and leaving the field requires statistical proof
+        rather than one unlucky sample. The finalist rounds it replaces exist
+        only to patch the weakness, so they go with it.
+
+        What the finalist rounds also provided, and a single-process race
+        cannot, is evidence that the winner is not an artefact of one
+        process's allocator layout, cached modules or clocks. That is kept as
+        one confirmation round in a fresh worker over the survivors only.
+        """
+        results = []
+        for plan in plans:
+            results.extend(self._race_one_shape(args, plan, task_by_info))
+        return results
+
+    def _race_block_journal(self, key):
+        """Per-block checkpoint for one shape, beside the candidate journal.
+
+        The candidate journal records finished candidate-phases; a race's unit
+        of durable progress is the finished block. The records cannot share a
+        file, but they share the ``--resume`` flag and the directory, so there
+        is still only one thing for an operator to know about.
+        """
+        if not self._journal_path:
+            return None
+        digest = sha256(",".join(map(str, key)).encode("utf-8")).hexdigest()[:12]
+        return f"{self._journal_path}.race-{digest}.jsonl"
+
+    def _race_one_shape(self, args, plan, task_by_info):
+        key = plan["key"]
+        row = plan["row"]
+        candidates = plan["candidates"]
+        data = generate_data(*plan["gen_args"])
+        tensors = (data["q"], data["k"], data["v"], data["cu_q"], data["cu_k"])
+
+        expected = _chunked_reference(
+            *tensors,
+            plan["softmax_scale"],
+            bool(row.causal),
+            int(row.window_left),
+            int(row.window_right),
+            bool(row.return_lse),
+        )
+
+        def launch(candidate):
+            config = (
+                dict(candidate.backend_config)
+                if candidate.backend_config is not None
+                else None
+            )
+            return _run_candidate(
+                *tensors,
+                candidate.backend,
+                candidate.num_splits,
+                config,
+                *plan["launch_tail"],
+            )
+
+        # Correctness and warm-up in one pass, before any timed call, so a
+        # compile is never charged to a measurement and a wrong candidate never
+        # reaches the race.
+        entrants = []
+        info_by_label = {}
+        rejected = []
+        for candidate in candidates:
+            info = (key, candidate.backend, candidate.num_splits, candidate.config_json)
+            label = f"{candidate.backend}|{candidate.num_splits}|{candidate.config_json}"
+            try:
+                produced = launch(candidate)
+                torch.cuda.synchronize()
+                err_ratio = self._error_ratio(produced, expected, row, args)
+            except Exception as error:  # noqa: BLE001 - unsupported is an outcome
+                rejected.append((info, 1.0, "crash", f"{type(error).__name__}: {error}"))
+                continue
+            if err_ratio > args.errRatio:
+                rejected.append(
+                    (info, err_ratio, "failed", f"error ratio {err_ratio:.4f}")
+                )
+                continue
+            protected = (
+                candidate.backend,
+                canonical_backend_config(candidate.backend_config),
+            ) in self._incumbents_by_key.get(key, set())
+            entrants.append(
+                RaceEntrant(label=label, payload=candidate, protected=protected)
+            )
+            info_by_label[label] = (info, err_ratio)
+
+        if not entrants:
+            print(f"no candidate survived correctness for {key}", flush=True)
+            return [
+                (info, float("inf"), err, status, detail)
+                for info, err, status, detail in rejected
+            ]
+
+        print(
+            f"racing {len(entrants)} candidates for {key} "
+            f"(delta={args.delta:.1%}, at most {args.race_max_blocks} blocks)",
+            flush=True,
+        )
+        journal_path = self._race_block_journal(key)
+        journal = (
+            JsonlBlockJournal(journal_path, resume=args.resume) if journal_path else None
+        )
+        outcome = race(
+            entrants,
+            cuda_event_timer(lambda entrant: launch(entrant.payload)),
+            delta=args.delta,
+            alpha=args.race_alpha,
+            block_calls=args.race_block_calls,
+            min_blocks=args.race_min_blocks,
+            max_blocks=args.race_max_blocks,
+            seed=MHA_FWD_RACE_SAMPLE_SEED,
+            journal=journal,
+            resume=args.resume,
+            verbose=args.verbose,
+        )
+
+        confirmed = self._confirm_survivors(args, outcome, info_by_label, task_by_info)
+        return self._race_results(
+            args, key, outcome, info_by_label, rejected, confirmed
+        )
+
+    @staticmethod
+    def _error_ratio(produced, expected, row, args):
+        """Same correctness bar the worker path applies, applied in process."""
+        actual = _normalize_result(
+            produced, bool(row.return_lse), int(row.total_q), int(row.nhead_q)
+        )
+        pairs = (
+            zip(actual, expected)
+            if isinstance(expected, tuple)
+            else ((actual, expected),)
+        )
+        worst = 0.0
+        for got, want in pairs:
+            worst = max(
+                worst,
+                float(
+                    checkAllclose(
+                        got,
+                        want,
+                        rtol=2e-2,
+                        atol=2e-2,
+                        tol_err_ratio=args.errRatio,
+                        printLog=False,
+                    )
+                ),
+            )
+        return worst
+
+    def _confirm_survivors(self, args, outcome, info_by_label, task_by_info):
+        """Re-measure the survivors once in fresh workers.
+
+        The race is single-process by construction, which is what makes its
+        comparisons paired, and also why it cannot rule out that the whole
+        field was measured inside one unlucky process state. One clean-process
+        round over the handful of survivors answers that cheaply.
+        """
+        survivor_infos = [
+            info_by_label[label][0]
+            for label in outcome.survivors
+            if label in info_by_label
+        ]
+        tasks = [task_by_info[info] for info in survivor_infos if info in task_by_info]
+        if not tasks:
+            return {}
+        print(f"  confirming {len(tasks)} survivors in fresh workers", flush=True)
+        measured = mp_tuner(
+            tasks,
+            [(len(tasks), ())],
+            args.mp,
+            False,
+            True,
+            args.errRatio,
+            timeout=args.timeout,
+            verbose=args.verbose,
+            return_status=True,
+        )
+        return {
+            result[0]: result
+            for result in (measured or ())
+            if result and result[3] == "ok"
+        }
+
+    def _race_results(self, args, key, outcome, info_by_label, rejected, confirmed):
+        """Turn one race into the result rows the rest of the tuner expects.
+
+        Every raced candidate is reported with its race estimate, so the
+        numbers in the profile are all on the same footing. The confirmation
+        measurement is a check on the winner rather than a second unit, and it
+        is recorded in the evidence rather than silently replacing anything.
+        """
+        results = [
+            (info, float("inf"), err, status, detail)
+            for info, err, status, detail in rejected
+        ]
+
+        winner_label = outcome.winner
+        tie_break = outcome.tie_break
+        override = ""
+        if confirmed:
+            # If a clean process disagrees by more than the indifference zone,
+            # the race's pick was an artefact of one process and the fresh
+            # measurement wins. Recorded, never silent.
+            best_info, best = min(confirmed.items(), key=lambda item: item[1][1])
+            picked_info = info_by_label.get(winner_label, (None,))[0]
+            picked = confirmed.get(picked_info)
+            if picked is not None and best[1] > 0:
+                margin = (picked[1] - best[1]) / best[1]
+                if margin > args.delta:
+                    override = (
+                        f"confirmation moved the winner: the race pick was "
+                        f"{margin:+.2%} against a fresh-worker measurement"
+                    )
+                    winner_label = next(
+                        (
+                            label
+                            for label, (info, _) in info_by_label.items()
+                            if info == best_info
+                        ),
+                        winner_label,
+                    )
+                    tie_break = "confirmation_override"
+
+        self._race_reports.append(
+            {
+                "key": list(key),
+                "delta": args.delta,
+                "alpha": args.race_alpha,
+                "block_calls": args.race_block_calls,
+                "candidates": len(info_by_label),
+                "rejected": len(rejected),
+                "blocks_run": outcome.blocks_run,
+                "blocks_replayed": outcome.blocks_replayed,
+                "calls_spent": outcome.calls_spent,
+                "certified": outcome.certified,
+                "eliminated": sum(
+                    1 for v in outcome.verdicts if v.state == "eliminated"
+                ),
+                "survivors": [
+                    {
+                        "label": label,
+                        "estimate_us": outcome.samples[label].estimate,
+                        "relative_spread": outcome.samples[label].relative_spread,
+                    }
+                    for label in outcome.survivors
+                ],
+                "winner": winner_label,
+                "tie_break": tie_break,
+                "confirmation_override": override,
+                "history": [
+                    {
+                        "block": record.block,
+                        "active": record.active,
+                        "eliminated": record.eliminated,
+                        "wall_seconds": record.wall_seconds,
+                    }
+                    for record in outcome.history
+                ],
+            }
+        )
+        self._race_winner_by_key[key] = winner_label and info_by_label.get(
+            winner_label, (None,)
+        )[0]
+
+        for verdict in outcome.verdicts:
+            info, err_ratio = info_by_label[verdict.label]
+            samples = tuple(outcome.samples[verdict.label].block_medians)
+            self._samples_by_info[info] = samples
+            detail = verdict.note
+            if verdict.label == winner_label and override:
+                detail = override
+            results.append(
+                (
+                    info,
+                    float(outcome.samples[verdict.label].estimate),
+                    float(err_ratio),
+                    "ok",
+                    detail,
+                )
+            )
+        return results
 
     def result_to_df(self, results):
         rows = []
@@ -1160,7 +1571,7 @@ class MhaFwdTuner(TunerCommon):
         happened to rank first. When the two cannot be separated the incumbent
         is kept, which is the outcome that changes nothing.
         """
-        fastest = valid.iloc[0].copy()
+        fastest = self._race_pick(key, valid)
         incumbents = self._incumbents_by_key.get(key, set())
         if not incumbents:
             return fastest
@@ -1182,16 +1593,7 @@ class MhaFwdTuner(TunerCommon):
         incumbent = measured.iloc[0]
         gain_us = float(incumbent["us"]) - float(fastest["us"])
         margin = gain_us / float(incumbent["us"])
-        # Two-sample separation at roughly 95%: the gain has to clear twice
-        # the combined standard error of the two candidates' round means.
-        combined_se = math.hypot(
-            self._standard_error_us(fastest), self._standard_error_us(incumbent)
-        )
-        noise = (
-            (MHA_FWD_SIGNIFICANCE_SIGMA * combined_se) / float(incumbent["us"])
-            if float(incumbent["us"]) > 0
-            else 0.0
-        )
+        noise = self._indifference_threshold(fastest, incumbent)
         if margin <= noise:
             kept = incumbent.copy()
             kept["detail"] = (
@@ -1205,6 +1607,52 @@ class MhaFwdTuner(TunerCommon):
         fastest["detail"] = f"beat incumbent by {margin:.2%} against {noise:.2%} spread"
         self._record_promotion(key, fastest, incumbent, margin, noise, "promoted")
         return fastest
+
+    def _indifference_threshold(self, challenger, incumbent) -> float:
+        """How much better a challenger has to be before it displaces the
+        configuration already in use.
+
+        Under the race, delta. The race declares anything inside delta a
+        settled question and stops gathering evidence there, so applying a
+        standard-error test on top would let the gate promote a challenger the
+        measurement itself called a tie -- and because the standard error
+        shrinks as blocks accumulate, it would do so more eagerly the longer
+        the race ran. One definition of indistinguishable, used end to end.
+
+        Otherwise the screening path's two-sample separation at roughly 95%:
+        the gain has to clear twice the combined standard error of the two
+        candidates' round means.
+        """
+        args = getattr(self, "_args", None)
+        if getattr(args, "strategy", "exhaustive") == "race":
+            return float(getattr(args, "delta", MHA_FWD_INDIFFERENCE_DELTA))
+        combined_se = math.hypot(
+            self._standard_error_us(challenger), self._standard_error_us(incumbent)
+        )
+        return (
+            (MHA_FWD_SIGNIFICANCE_SIGMA * combined_se) / float(incumbent["us"])
+            if float(incumbent["us"]) > 0
+            else 0.0
+        )
+
+    def _race_pick(self, key, valid):
+        """The candidate the race selected, rather than whichever sorted first.
+
+        Sorting by latency would throw away the tie-break: inside the
+        indifference zone the fastest point estimate is the noisiest thing to
+        choose on, which is the whole reason the race picks by steadiness and
+        prefers the incumbent.
+        """
+        picked = getattr(self, "_race_winner_by_key", {}).get(key)
+        if picked is not None:
+            match = valid[
+                (valid["backend"] == picked[1])
+                & (valid["num_splits"] == picked[2])
+                & (valid["backend_config"] == picked[3])
+            ]
+            if not match.empty:
+                return match.iloc[0].copy()
+        return valid.iloc[0].copy()
 
     def _record_promotion(self, key, challenger, incumbent, margin, noise, decision):
         """Keep why each shape was or was not retuned, for the evidence file.
@@ -1458,6 +1906,14 @@ class MhaFwdTuner(TunerCommon):
             "search_strategy": getattr(self._args, "strategy", "exhaustive"),
             "restricted_backends": self._restricted_backends(),
             "promotions": self._promotions,
+            # What the gate actually compared against, rather than what a
+            # reader would have to infer from the strategy name.
+            "indifference_threshold": (
+                float(getattr(self._args, "delta", MHA_FWD_INDIFFERENCE_DELTA))
+                if getattr(self._args, "strategy", "") == "race"
+                else f"{MHA_FWD_SIGNIFICANCE_SIGMA} x combined standard error"
+            ),
+            "races": self._race_reports,
             "coverage_limits": [
                 "CK tile recipes remain the default CK launch; this tuner does not dump PR #5024 JSON",
             ],

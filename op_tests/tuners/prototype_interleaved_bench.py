@@ -1,29 +1,19 @@
-"""Prototype: interleaved randomized-block measurement of an MHA candidate set.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""MHA harness for the interleaved randomized-block measurement in
+``aiter.utility.block_race``.
 
-The shipped tuner measures one candidate per task in a fresh worker, which
-costs about 2.2 s of process spawn, allocation and kernel load to buy 0.19 s
-of timing. It also measures each candidate in isolation, so every candidate
-sees a different slice of whatever the machine was doing, and a single
-contended measurement during screening drops a candidate permanently.
+The measurement and the statistics live in the shared core, so other families
+can race their own candidates. What remains here is the part that knows about
+MHA: the problem shape, how to build its inputs, how to launch one candidate,
+and which candidates exist.
 
-This measures the whole catalogue in one process as a randomized complete
-block design. Each block visits every candidate once in a fresh random order,
-running a short run of calls per visit. Blocking is what makes the comparison
-paired: drift that moves one candidate moves them all within a block, so it
-cancels in the differences. Randomizing the order each block is what stops
-position within a block from being confounded with the candidate, which a
-fixed order or a strict alternation cannot do once there are more than two.
-
-Nothing here is settled. Two questions have to be answered by measurement
-before this becomes a design:
-
-  1. Does interleaving bias a candidate's estimate relative to measuring it
-     contiguously? Switching kernels perturbs instruction and data cache, and
-     if that cost lands inside the timed calls then short blocks are biased
-     rather than merely noisy.
-  2. What is the smallest block that does not pay that cost? Shorter blocks
-     buy more paired observations for the same number of calls, so the answer
-     sets how much statistical power a fixed budget can produce.
+Three modes. ``race`` runs the delta-based elimination the tuner uses.
+``sweep`` is the block-size calibration that chose the default block, kept
+because the answer depends on the machine. ``null`` races one configuration
+against copies of itself, which is the experiment that turns delta from a
+judgement call into a measurement: the truth is known to be a tie, so any
+separation reported is measurement error.
 
 Run with PYTHONPATH set to the repository root and HIP_VISIBLE_DEVICES
 pinned, e.g.
@@ -36,14 +26,27 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import statistics
-from dataclasses import dataclass, field
+import time
 
 import torch
 
 from aiter.ops.mha_fwd_policy import enumerate_mha_fwd_candidates
 from aiter.ops.triton.attention.mha import flash_attn_varlen_func
+from aiter.utility.block_race import (
+    JsonlBlockJournal,
+    RaceEntrant,
+    check_t_implementation,
+    cuda_event_timer,
+    indistinguishable_set,
+    measure_blocks,
+    position_effect,
+    race,
+    rank,
+    wilcoxon_floor,
+)
 
 # The Kimi hd192/hdv128 varlen shape the storage comparison has been using.
 SHAPE = {
@@ -57,33 +60,20 @@ SHAPE = {
 }
 
 
-@dataclass(frozen=True)
-class Candidate:
-    backend: str
-    config: dict
-    origin: str = "catalogue"
-    tag: str = ""
+def make_entrant(backend: str, config: dict, origin: str = "catalogue", tag: str = ""):
+    """Wrap one MHA configuration as something the shared race can measure.
 
-    @property
-    def label(self) -> str:
-        base = f"{self.backend}:{json.dumps(self.config, sort_keys=True)}"
-        return f"{base}#{self.tag}" if self.tag else base
-
-
-@dataclass
-class Samples:
-    """Per-call latencies, kept grouped by the block that produced them."""
-
-    blocks: list[list[float]] = field(default_factory=list)
-
-    @property
-    def block_medians(self) -> list[float]:
-        return [statistics.median(block) for block in self.blocks if block]
-
-    @property
-    def estimate(self) -> float:
-        medians = self.block_medians
-        return statistics.median(medians) if medians else float("inf")
+    The incumbent is marked protected: it is measured in every block like
+    everything else, but it is never eliminated, because a run that stops
+    measuring the configuration already in use cannot tell an improvement from
+    a regression.
+    """
+    base = f"{backend}:{json.dumps(config, sort_keys=True)}"
+    return RaceEntrant(
+        label=f"{base}#{tag}" if tag else base,
+        payload={"backend": backend, "config": dict(config), "origin": origin},
+        protected="incumbent" in origin,
+    )
 
 
 def build_inputs(device: str = "cuda"):
@@ -106,7 +96,7 @@ def make_invoker(inputs):
     q, k, v, cu_q, cu_k = inputs
     scale = SHAPE["hdim_q"] ** -0.5
 
-    def invoke(candidate: Candidate):
+    def invoke(entrant: RaceEntrant):
         return flash_attn_varlen_func(
             q,
             k,
@@ -120,26 +110,34 @@ def make_invoker(inputs):
             causal=False,
             window_size=(-1, -1),
             return_lse=False,
-            config=dict(candidate.config),
-            backend=candidate.backend,
+            config=dict(entrant.payload["config"]),
+            backend=entrant.payload["backend"],
         )
 
     return invoke
 
 
-def collect_candidates(gfx: str) -> list[Candidate]:
+def collect_candidates(
+    gfx: str,
+    strategy: str = "smoke",
+    limit: int | None = None,
+    seed: int = 0,
+) -> list[RaceEntrant]:
     """The restricted catalogue plus whatever each kernel resolves today.
 
     The incumbents are part of the field by construction rather than a second
-    phase: a run that never measures the configuration already in use cannot
-    tell an improvement from a regression, and adding them here costs one more
-    visit per block.
+    phase, and adding them here costs one more visit per block.
+
+    ``limit`` takes a seeded sample of the catalogue, which is how the cost of
+    a race is measured as the field grows without running the full catalogue
+    first. The sample is drawn before the incumbents are added, so they are
+    present at every size and the sizes stay comparable.
     """
-    candidates = [
-        Candidate(c.backend, dict(c.backend_config))
-        for c in enumerate_mha_fwd_candidates(gfx, "smoke", ["triton", "gluon"])
-    ]
-    seen = {c.label for c in candidates}
+    catalogue = list(enumerate_mha_fwd_candidates(gfx, strategy, ["triton", "gluon"]))
+    if limit is not None and limit < len(catalogue):
+        catalogue = random.Random(seed).sample(catalogue, limit)
+    entrants = [make_entrant(c.backend, dict(c.backend_config)) for c in catalogue]
+    seen = {entrant.label for entrant in entrants}
 
     for backend in ("gluon", "triton"):
         try:
@@ -163,535 +161,210 @@ def collect_candidates(gfx: str) -> list[Candidate]:
         except Exception as error:  # noqa: BLE001 - a missing default is not fatal
             print(f"  no incumbent for {backend}: {error}")
             continue
-        incumbent = Candidate(backend, dict(config), origin="incumbent")
+        incumbent = make_entrant(backend, dict(config), "incumbent")
         if incumbent.label in seen:
             # Already in the catalogue; relabel so the report can point at it.
-            candidates = [
-                Candidate(c.backend, c.config, "catalogue+incumbent")
-                if c.label == incumbent.label
-                else c
-                for c in candidates
+            entrants = [
+                make_entrant(
+                    e.payload["backend"], e.payload["config"], "catalogue+incumbent"
+                )
+                if e.label == incumbent.label
+                else e
+                for e in entrants
             ]
         else:
-            candidates.append(incumbent)
-    return candidates
+            entrants.append(incumbent)
+    return entrants
 
 
-def screen(candidates: list[Candidate], invoke, warmup: int) -> list[Candidate]:
+def screen(entrants: list[RaceEntrant], invoke, warmup: int) -> list[RaceEntrant]:
     """Drop candidates that cannot run this problem, and warm the rest.
 
     Done once, outside the blocks, so a compile or load cost is never charged
     to a timed call.
     """
     survivors = []
-    for candidate in candidates:
+    for entrant in entrants:
         try:
             for _ in range(warmup):
-                invoke(candidate)
+                invoke(entrant)
             torch.cuda.synchronize()
         except Exception as error:  # noqa: BLE001 - unsupported is an outcome
-            print(f"  dropped {candidate.label}: {type(error).__name__}")
+            print(f"  dropped {entrant.label}: {type(error).__name__}")
             continue
-        survivors.append(candidate)
+        survivors.append(entrant)
     return survivors
 
 
-def measure_blocks(
-    candidates: list[Candidate],
-    invoke,
-    block_calls: int,
-    blocks: int,
-    seed: int,
-    discard_per_block: int = 0,
-) -> dict[str, Samples]:
-    """Run a randomized complete block design over the candidate set."""
-    rng = random.Random(seed)
-    samples = {candidate.label: Samples() for candidate in candidates}
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    for _ in range(blocks):
-        order = list(candidates)
-        rng.shuffle(order)
-        for candidate in order:
-            for _ in range(discard_per_block):
-                invoke(candidate)
-            latencies = []
-            for _ in range(block_calls):
-                start.record()
-                invoke(candidate)
-                end.record()
-                end.synchronize()
-                latencies.append(start.elapsed_time(end) * 1000.0)
-            samples[candidate.label].blocks.append(latencies)
-    return samples
-
-
-def measure_contiguous(
-    candidates: list[Candidate], invoke, calls: int
-) -> dict[str, Samples]:
+def measure_contiguous(entrants, time_calls, calls):
     """The current harness's shape: every call for a candidate back to back.
 
-    This is the reference the interleaved estimates are checked against. If
-    they disagree, interleaving is biased and block size is not merely a
-    power-versus-cost trade.
+    The reference the interleaved estimates are checked against. If they
+    disagree, interleaving is biased and block size is not merely a power
+    versus cost trade.
     """
-    return measure_blocks(candidates, invoke, calls, 1, seed=0)
+    return measure_blocks(entrants, time_calls, calls, 1, seed=0)
 
 
-def position_effect(samples: dict[str, Samples]) -> list[tuple[int, float, int]]:
-    """Latency by position within a block, relative to each candidate's median.
-
-    A switching cost that lands inside the timed calls shows up as the first
-    positions running slow. Normalizing per candidate lets fast and slow
-    candidates be pooled.
-    """
-    by_position: dict[int, list[float]] = {}
-    for sample in samples.values():
-        reference = sample.estimate
-        if not math.isfinite(reference) or reference <= 0:
-            continue
-        for block in sample.blocks:
-            for position, latency in enumerate(block):
-                by_position.setdefault(position, []).append(latency / reference)
-    return [
-        (position, statistics.median(values), len(values))
-        for position, values in sorted(by_position.items())
-    ]
-
-
-def rank(samples: dict[str, Samples]) -> list[tuple[str, float]]:
-    return sorted(
-        ((label, sample.estimate) for label, sample in samples.items()),
-        key=lambda item: item[1],
+def origin_of(entrants, label: str) -> str:
+    return next(
+        (e.payload["origin"] for e in entrants if e.label == label), "catalogue"
     )
 
 
-def _beta_continued_fraction(a: float, b: float, x: float) -> float:
-    """Lentz evaluation of the continued fraction for the incomplete beta."""
-    tiny = 1e-30
-    qab, qap, qam = a + b, a + 1.0, a - 1.0
-    c = 1.0
-    d = 1.0 - qab * x / qap
-    if abs(d) < tiny:
-        d = tiny
-    d = 1.0 / d
-    h = d
-    for m in range(1, 300):
-        m2 = 2 * m
-        step = m * (b - m) * x / ((qam + m2) * (a + m2))
-        d = 1.0 + step * d
-        c = 1.0 + step / c
-        if abs(d) < tiny:
-            d = tiny
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        h *= d * c
-        step = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
-        d = 1.0 + step * d
-        c = 1.0 + step / c
-        if abs(d) < tiny:
-            d = tiny
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        delta = d * c
-        h *= delta
-        if abs(delta - 1.0) < 1e-15:
-            break
-    return h
-
-
-def regularized_incomplete_beta(a: float, b: float, x: float) -> float:
-    """I_x(a, b), the only special function the tests below need."""
-    if x <= 0.0:
-        return 0.0
-    if x >= 1.0:
-        return 1.0
-    front = math.exp(
-        math.lgamma(a + b)
-        - math.lgamma(a)
-        - math.lgamma(b)
-        + a * math.log(x)
-        + b * math.log1p(-x)
-    )
-    # The fraction only converges quickly on one side of this point; past it,
-    # evaluate the mirrored parameters and take the complement.
-    if x < (a + 1.0) / (a + b + 2.0):
-        return front * _beta_continued_fraction(a, b, x) / a
-    return 1.0 - front * _beta_continued_fraction(b, a, 1.0 - x) / b
-
-
-def student_t_sf(t: float, degrees: int) -> float:
-    """P(T > t) for Student's t.
-
-    Implemented here rather than taken from scipy, which aiter does not
-    declare as a dependency. A tuner that only runs where scipy happens to be
-    installed is a tuner that silently changes its statistics with the
-    environment.
-    """
-    tail = 0.5 * regularized_incomplete_beta(
-        0.5 * degrees, 0.5, degrees / (degrees + t * t)
-    )
-    return tail if t > 0 else 1.0 - tail
-
-
-def critical_t(confidence: float, degrees: int) -> float:
-    """Two-sided critical value: t with P(|T| > t) == confidence.
-
-    Bisection rather than a closed form. The Cornish-Fisher expansion from the
-    normal quantile is the usual shortcut, but it is worst exactly where this
-    is used -- few degrees of freedom and a far tail, where the Bonferroni
-    correction puts the per-decision alpha -- so it is not worth the risk.
-    """
-    degrees = max(1, degrees)
-    target = confidence / 2.0
-    # Grow the bracket instead of assuming a ceiling. With one degree of
-    # freedom and a Bonferroni-shrunk alpha the critical value runs into the
-    # hundreds of thousands, and a fixed upper bound would silently saturate
-    # and hand back a value small enough to eliminate candidates that the
-    # evidence does not support.
-    low, high = 0.0, 1.0
-    while student_t_sf(high, degrees) > target and high < 1e300:
-        low, high = high, high * 4.0
-    for _ in range(400):
-        middle = 0.5 * (low + high)
-        if student_t_sf(middle, degrees) > target:
-            low = middle
-        else:
-            high = middle
-        if high - low < 1e-12 * max(1.0, high):
-            break
-    return 0.5 * (low + high)
-
-
-def check_t_implementation() -> None:
-    """Pin the hand-rolled t against printed tables before spending GPU time.
-
-    The continued fraction above is the one piece of this file that can be
-    wrong without looking wrong: a subtly bad critical value does not raise,
-    it just eliminates candidates the evidence does not support. Published
-    two-sided critical values are an external check that costs microseconds.
-    """
-    table = {
-        (1, 0.05): 12.706,
-        (2, 0.05): 4.303,
-        (5, 0.05): 2.571,
-        (10, 0.05): 2.228,
-        (29, 0.05): 2.045,
-        (2, 0.01): 9.925,
-        (10, 0.01): 3.169,
-        (29, 0.001): 3.659,
-    }
-    for (degrees, confidence), expected in table.items():
-        actual = critical_t(confidence, degrees)
-        if abs(actual - expected) > 0.001:
-            raise AssertionError(
-                f"t_{{{degrees}}}({confidence}) computed {actual:.4f}, "
-                f"tables say {expected:.4f}"
-            )
-
-
-@dataclass
-class Verdict:
-    label: str
-    state: str  # "leader", "within_delta", "eliminated", "undecided"
-    estimate: float
-    relative_gap: float
-    blocks_used: int
-    note: str = ""
-
-
-def race(
-    candidates: list[Candidate],
-    invoke,
-    delta: float,
-    alpha: float,
-    block_calls: int,
-    min_blocks: int,
-    max_blocks: int,
-    seed: int,
-    verbose: bool = True,
-):
-    """Eliminate candidates that are worse than the leader by more than delta.
-
-    The objective is selection, not hypothesis testing. Family-wise error
-    control answers "which candidates are provably different", which is both
-    more than we need and unboundedly expensive: separating an arbitrarily
-    small difference takes arbitrarily many blocks, so the closer the field is
-    packed the more it costs. Discarding a candidate genuinely tied with the
-    best costs nothing, because whatever we ship instead is equally fast. An
-    indifference zone says so directly -- two candidates within delta are a
-    finished question, not a harder one -- which makes the block count a
-    function of delta and the measurement noise rather than of the catalogue.
-
-    Delta should be set from reproducibility, not taste. Measuring the same
-    configuration in different sessions on this machine moves it by about
-    1.8%, so a delta below that would be resolving differences that do not
-    survive to the next run.
-
-    Both decisions read the same lower bound on the paired difference against
-    the leader, but they ask opposite questions of it, and the asymmetry is
-    where most of the budget is saved. Eliminating a candidate needs proof it
-    is more than delta *worse* than the leader. Stopping only needs proof that
-    no survivor is more than delta *better* -- that is the only way picking the
-    leader could turn out wrong. Certifying the reverse, that a close candidate
-    is definitely not slightly worse, costs many blocks and buys nothing,
-    because if it were slightly worse we would still be shipping the leader.
-
-    Elimination is permanent and the leader is recomputed every block, so the
-    comparison is always against the best evidence so far. Candidates are
-    compared on the blocks they both took part in, which keeps every
-    comparison paired even though they leave the race at different times.
-    """
-    rng = random.Random(seed)
-    samples = {c.label: Samples() for c in candidates}
-    by_label = {c.label: c for c in candidates}
-    active = [c.label for c in candidates]
-    eliminated: dict[str, tuple[int, float]] = {}
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    # Union bound over every candidate and every look. Peeking after each
-    # block is repeated testing, so an uncorrected alpha would drift. This is
-    # conservative rather than tight -- an anytime-valid bound such as
-    # empirical Bernstein would spend the budget better -- but the eliminations
-    # that dominate the cost are decided by factors of ten, where the
-    # difference between a tight bound and a loose one is a block at most.
-    per_decision = alpha / max(1, len(candidates) * max_blocks)
-
-    calls_spent = 0
-    history = []
-    certified = False
-
-    for block_index in range(max_blocks):
-        order = [by_label[label] for label in active]
-        rng.shuffle(order)
-        for candidate in order:
-            latencies = []
-            for _ in range(block_calls):
-                start.record()
-                invoke(candidate)
-                end.record()
-                end.synchronize()
-                latencies.append(start.elapsed_time(end) * 1000.0)
-            samples[candidate.label].blocks.append(latencies)
-            calls_spent += block_calls
-
-        history.append((block_index + 1, len(active), calls_spent))
-        if block_index + 1 < min_blocks:
-            continue
-
-        leader = min(active, key=lambda label: samples[label].estimate)
-        leader_blocks = samples[leader].block_medians
-        leader_estimate = samples[leader].estimate
-        tolerance = delta * leader_estimate
-
-        undecided, dropped = [], []
-        for label in active:
-            if label == leader:
-                continue
-            blocks = samples[label].block_medians
-            paired = min(len(leader_blocks), len(blocks))
-            differences = [blocks[i] - leader_blocks[i] for i in range(paired)]
-            if len(differences) < 2:
-                undecided.append(label)
-                continue
-            mean = statistics.mean(differences)
-            spread = statistics.stdev(differences) / math.sqrt(len(differences))
-            lower = mean - critical_t(per_decision, len(differences) - 1) * spread
-            if lower > tolerance:
-                dropped.append(label)      # worse than the leader by > delta
-            elif lower <= -tolerance:
-                undecided.append(label)    # could be > delta better than the leader
-
-        for label in dropped:
-            eliminated[label] = (
-                block_index + 1,
-                samples[label].estimate / leader_estimate - 1.0,
-            )
-            active.remove(label)
-
-        if verbose:
-            print(
-                f"  block {block_index + 1:>3}: {len(active):>3} active, "
-                f"{len(dropped):>2} eliminated, {len(undecided):>2} undecided, "
-                f"leader {leader_estimate:8.1f} us"
-            )
-        if not undecided:
-            certified = True
-            break
-
-    leader = min(active, key=lambda label: samples[label].estimate)
-    leader_estimate = samples[leader].estimate
-    verdicts = [
-        Verdict(leader, "leader", leader_estimate, 0.0, len(samples[leader].blocks))
-    ]
-    for label in active:
-        if label == leader:
-            continue
-        verdicts.append(
-            Verdict(
-                label,
-                "within_delta",
-                samples[label].estimate,
-                samples[label].estimate / leader_estimate - 1.0,
-                len(samples[label].blocks),
-            )
-        )
-    for label, (block, gap) in eliminated.items():
-        verdicts.append(
-            Verdict(
-                label,
-                "eliminated",
-                samples[label].estimate,
-                gap,
-                len(samples[label].blocks),
-                f"dropped after block {block}",
-            )
-        )
-    return verdicts, samples, calls_spent, history, certified
-
-
-def wilcoxon_floor(blocks: int) -> float:
-    """Smallest one-sided p a signed-rank test can return with this many pairs.
-
-    Worth printing rather than discovering: at four blocks the floor is 0.0625,
-    so no comparison can clear alpha=0.05 and every candidate survives the
-    filter no matter how slow it is. That is a powerless test, not a tie.
-    """
-    return 0.5**blocks if blocks > 0 else 1.0
-
-
-def indistinguishable_set(samples: dict[str, Samples], alpha: float = 0.05):
-    """Candidates that cannot be separated from the fastest.
-
-    Choosing the single fastest point estimate out of many is biased: the
-    maximum of noisy estimates is optimistic, and second place is often not
-    distinguishable from first. Reporting the set that survives a paired test
-    against the leader says what the measurement actually supports, and leaves
-    the choice within that set to a policy that can prefer the incumbent.
-    """
-    ordered = rank(samples)
-    best_label = ordered[0][0]
-    best_blocks = samples[best_label].block_medians
-
-    raw = []
-    for label, _ in ordered[1:]:
-        blocks = samples[label].block_medians
-        paired = min(len(best_blocks), len(blocks))
-        if paired < 3:
-            raw.append((label, 1.0))
-            continue
-        differences = [blocks[i] - best_blocks[i] for i in range(paired)]
-        if all(d == 0 for d in differences):
-            raw.append((label, 1.0))
-            continue
-        # A paired t on the block differences rather than a signed-rank test.
-        # Rank tests are distribution-free but discard effect size, so their
-        # smallest attainable p depends only on the number of blocks: at eight
-        # blocks the floor is 1/256, which is above the Holm threshold once
-        # there are sixteen comparisons, and a candidate twenty-five times
-        # slower than the leader is declared a tie. The block values being
-        # compared are already medians of many calls, so approximate normality
-        # is a far weaker assumption here than at the level of raw latencies.
-        spread = statistics.stdev(differences) / math.sqrt(len(differences))
-        if spread <= 0.0:
-            raw.append((label, 0.0))
-            continue
-        statistic = statistics.mean(differences) / spread
-        raw.append((label, student_t_sf(statistic, len(differences) - 1)))
-
-    # Holm-Bonferroni: the leader is compared against every other candidate, so
-    # without correction the chance of wrongly excluding one grows with the
-    # size of the catalogue.
-    raw.sort(key=lambda item: item[1])
-    total = len(raw)
-    survivors = [best_label]
-    for index, (label, p_value) in enumerate(raw):
-        if p_value > alpha / (total - index):
-            # Holm stops at the first failure; everything from here on stays.
-            survivors.extend(other for other, _ in raw[index:])
-            break
-    return survivors
-
-
-def run_race(args, candidates, invoke) -> None:
+def run_race(args, entrants, time_calls) -> None:
     print(
-        f"\nracing {len(candidates)} candidates, delta={args.delta:.1%}, "
+        f"\nracing {len(entrants)} candidates, delta={args.delta:.1%}, "
         f"block={args.block_calls} calls, at most {args.max_blocks} blocks"
     )
-    verdicts, samples, calls, history, certified = race(
-        candidates,
-        invoke,
+    journal = (
+        JsonlBlockJournal(args.journal, resume=args.resume) if args.journal else None
+    )
+    started = time.perf_counter()
+    result = race(
+        entrants,
+        time_calls,
         delta=args.delta,
         alpha=args.alpha,
         block_calls=args.block_calls,
         min_blocks=args.min_blocks,
         max_blocks=args.max_blocks,
         seed=args.seed,
+        journal=journal,
+        resume=args.resume,
     )
+    wall = time.perf_counter() - started
 
-    kernel_seconds = (
-        sum(sum(sum(b) for b in s.blocks) for s in samples.values()) / 1e6
+    samples = result.samples
+    kernel_seconds = sum(sum(sum(b) for b in s.blocks) for s in samples.values()) / 1e6
+    exhaustive = (
+        args.max_blocks
+        * args.block_calls
+        * sum(s.estimate for s in samples.values() if math.isfinite(s.estimate))
+        / 1e6
     )
-    exhaustive = args.max_blocks * args.block_calls * sum(
-        s.estimate for s in samples.values() if math.isfinite(s.estimate)
-    ) / 1e6
     print(
-        f"\nspent {calls} calls / {kernel_seconds:.1f} s of kernel time; "
-        f"measuring every candidate for all {args.max_blocks} blocks would "
-        f"have cost {exhaustive:.1f} s ({exhaustive / max(kernel_seconds, 1e-9):.1f}x)"
+        f"\nspent {result.calls_spent} calls / {kernel_seconds:.1f} s of kernel "
+        f"time in {wall:.1f} s wall; measuring every candidate for all "
+        f"{args.max_blocks} blocks would have cost {exhaustive:.1f} s "
+        f"({exhaustive / max(kernel_seconds, 1e-9):.1f}x)"
     )
-
-    blocks_run = history[-1][0]
     print(
-        f"converged after {blocks_run} blocks: the winner is within "
+        f"converged after {result.blocks_run} blocks: the winner is within "
         f"{args.delta:.0%} of the best candidate in the catalogue"
-        if certified
-        else f"budget exhausted at {blocks_run} blocks without certifying the "
-        f"winner; treat the result as a ranking, not a guarantee"
+        if result.certified
+        else f"budget exhausted at {result.blocks_run} blocks without certifying "
+        f"the winner; treat the result as a ranking, not a guarantee"
     )
 
-    survivors = [v for v in verdicts if v.state in ("leader", "within_delta")]
-    print(f"\nwithin delta of the best: {len(survivors)} of {len(candidates)}")
+    survivors = [v for v in result.verdicts if v.state in ("leader", "within_delta")]
+    print(f"\nwithin delta of the best: {len(survivors)} of {len(entrants)}")
     for verdict in sorted(survivors, key=lambda v: v.estimate):
-        origin = next(
-            (c.origin for c in candidates if c.label == verdict.label), "catalogue"
+        mark = (
+            "  <- incumbent" if "incumbent" in origin_of(entrants, verdict.label) else ""
         )
-        mark = "  <- incumbent" if "incumbent" in origin else ""
+        won = "  *winner*" if verdict.label == result.winner else ""
         print(
             f"  {verdict.estimate:9.1f} us  {verdict.relative_gap:+6.2%}  "
-            f"{verdict.label}{mark}"
+            f"spread {verdict.relative_spread:.2%}  {verdict.label}{mark}{won}"
         )
+    print(f"\nselected by {result.tie_break}: {result.winner}")
 
-    incumbent_survives = any(
-        "incumbent"
-        in next(
-            (c.origin for c in candidates if c.label == v.label), "catalogue"
-        )
-        for v in survivors
-    )
-    print(
-        "\nthe incumbent is inside the indifference zone, so keeping it is the "
-        "outcome that changes nothing"
-        if incumbent_survives
-        else "\nno incumbent survived: the winner is a real improvement, not a tie"
-    )
+    # Each backend contributes its own incumbent, so report them one at a time
+    # rather than collapsing them into a single verdict about "the" incumbent.
+    for verdict in result.verdicts:
+        if "incumbent" not in origin_of(entrants, verdict.label):
+            continue
+        backend = verdict.label.split(":")[0]
+        if verdict.state == "protected_behind":
+            print(
+                f"  the {backend} incumbent was kept in the field but measured "
+                f"{verdict.relative_gap:+.2%} behind the leader"
+            )
+        elif verdict.label == result.winner:
+            print(
+                f"  the {backend} incumbent is inside the indifference zone, so "
+                f"keeping it is the outcome that changes nothing"
+            )
+        else:
+            print(
+                f"  the {backend} incumbent is within delta at "
+                f"{verdict.relative_gap:+.2%} but did not win the tie-break"
+            )
 
     dropped = sorted(
-        (v for v in verdicts if v.state == "eliminated"), key=lambda v: v.blocks_used
+        (v for v in result.verdicts if v.state == "eliminated"),
+        key=lambda v: v.blocks_used,
     )
     print(f"\neliminated {len(dropped)}, and how early:")
-    for verdict in dropped:
+    for verdict in dropped[:20]:
         print(
             f"  after {verdict.blocks_used:>3} blocks  {verdict.relative_gap:+8.1%}  "
             f"{verdict.label.split(':')[0]:>7}  {verdict.estimate:9.1f} us"
         )
+    if len(dropped) > 20:
+        print(f"  ... and {len(dropped) - 20} more")
+
+    if args.json_out:
+        emit_json(args, entrants, result, wall, kernel_seconds)
 
 
-def run_null(args, candidates, invoke) -> None:
+def emit_json(args, entrants, result, wall, kernel_seconds) -> None:
+    """Machine-readable record, so a number quoted in a document has a source."""
+    payload = {
+        "shape": SHAPE,
+        "gfx": args.gfx,
+        "strategy": args.strategy,
+        "candidates_requested": args.candidates,
+        "candidates_raced": len(entrants),
+        "delta": args.delta,
+        "alpha": args.alpha,
+        "block_calls": args.block_calls,
+        "min_blocks": args.min_blocks,
+        "max_blocks": args.max_blocks,
+        "seed": args.seed,
+        "screen_seconds": getattr(args, "_screen_seconds", None),
+        "screen_peak_bytes": getattr(args, "_screen_peak_bytes", None),
+        "blocks_run": result.blocks_run,
+        "blocks_replayed": result.blocks_replayed,
+        "calls_spent": result.calls_spent,
+        "kernel_seconds": kernel_seconds,
+        "wall_seconds": wall,
+        "certified": result.certified,
+        "winner": result.winner,
+        "tie_break": result.tie_break,
+        "survivors": result.survivors,
+        "history": [
+            {
+                "block": record.block,
+                "active": record.active,
+                "calls_spent": record.calls_spent,
+                "wall_seconds": record.wall_seconds,
+                "eliminated": record.eliminated,
+            }
+            for record in result.history
+        ],
+        "verdicts": [
+            {
+                "label": v.label,
+                "state": v.state,
+                "estimate_us": v.estimate,
+                "relative_gap": v.relative_gap,
+                "relative_spread": v.relative_spread,
+                "blocks_used": v.blocks_used,
+            }
+            for v in result.verdicts
+        ],
+    }
+    directory = os.path.dirname(args.json_out)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(args.json_out, "w") as handle:
+        json.dump(payload, handle, indent=2)
+    print(f"\nwrote {args.json_out}")
+
+
+def run_null(args, entrants, time_calls) -> None:
     """Race one configuration against copies of itself.
 
     Every other experiment here can only compare procedures against each
@@ -706,21 +379,21 @@ def run_null(args, candidates, invoke) -> None:
     variation is between sessions and not within them.
     """
     seed = next(
-        (c for c in candidates if "incumbent" in c.origin), candidates[0]
+        (e for e in entrants if "incumbent" in e.payload["origin"]), entrants[0]
     )
     replicas = [
-        Candidate(seed.backend, seed.config, "replica", f"r{i}")
+        make_entrant(seed.payload["backend"], seed.payload["config"], "replica", f"r{i}")
         for i in range(args.replicas)
     ]
     print(
         f"\nnull experiment: {args.replicas} copies of one configuration\n"
-        f"  {seed.backend}:{json.dumps(seed.config, sort_keys=True)}\n"
+        f"  {seed.label}\n"
         f"  ground truth: every gap is zero, so every elimination is an error"
     )
 
-    verdicts, samples, calls, history, certified = race(
+    result = race(
         replicas,
-        invoke,
+        time_calls,
         delta=args.delta,
         alpha=args.alpha,
         block_calls=args.block_calls,
@@ -729,11 +402,11 @@ def run_null(args, candidates, invoke) -> None:
         seed=args.seed,
     )
 
-    estimates = sorted(s.estimate for s in samples.values())
+    estimates = sorted(s.estimate for s in result.samples.values())
     spread = estimates[-1] / estimates[0] - 1.0
-    false_positives = [v for v in verdicts if v.state == "eliminated"]
+    false_positives = [v for v in result.verdicts if v.state == "eliminated"]
     print(
-        f"\nspent {calls} calls over {history[-1][0]} blocks\n"
+        f"\nspent {result.calls_spent} calls over {result.blocks_run} blocks\n"
         f"  fastest replica  {estimates[0]:9.1f} us\n"
         f"  slowest replica  {estimates[-1]:9.1f} us\n"
         f"  spread across identical configs: {spread:.2%}\n"
@@ -751,6 +424,113 @@ def run_null(args, candidates, invoke) -> None:
             "smaller than the noise between identical configurations"
         )
     )
+    if args.json_out:
+        with open(args.json_out, "w") as handle:
+            json.dump(
+                {
+                    "mode": "null",
+                    "replicas": args.replicas,
+                    "delta": args.delta,
+                    "estimates_us": estimates,
+                    "spread": spread,
+                    "false_eliminations": len(false_positives),
+                    "blocks_run": result.blocks_run,
+                },
+                handle,
+                indent=2,
+            )
+        print(f"\nwrote {args.json_out}")
+
+
+def run_sweep(args, entrants, time_calls) -> None:
+    print(f"\nreference pass: {args.calls_per_candidate} contiguous calls each")
+    reference = measure_contiguous(entrants, time_calls, args.calls_per_candidate)
+    reference_estimate = {label: s.estimate for label, s in reference.items()}
+
+    block_sizes = [int(b) for b in args.block_sizes.split(",") if b.strip()]
+    print(
+        f"\nsweeping block size at a fixed budget of "
+        f"{args.calls_per_candidate} calls per candidate"
+    )
+    print(
+        f"{'block':>6} {'blocks':>7} {'wall s':>8} {'kernel s':>9} "
+        f"{'median bias':>12} {'max |bias|':>11} {'test floor':>11} {'winner':>8}"
+    )
+
+    results = {}
+    for block_calls in block_sizes:
+        blocks = max(2, args.calls_per_candidate // block_calls)
+        started = time.perf_counter()
+        samples = measure_blocks(
+            entrants, time_calls, block_calls, blocks, seed=args.seed
+        )
+        wall = time.perf_counter() - started
+
+        # Signed and unsigned are different questions. A systematic switching
+        # cost shifts every candidate the same way and shows in the median;
+        # plain noise from short blocks shows only in the maximum.
+        signed = [
+            (sample.estimate - reference_estimate[label]) / reference_estimate[label]
+            for label, sample in samples.items()
+            if math.isfinite(reference_estimate.get(label, float("inf")))
+        ]
+        kernel_seconds = (
+            sum(
+                sum(sum(block) for block in sample.blocks)
+                for sample in samples.values()
+            )
+            / 1e6
+        )
+        winner = rank(samples)[0][0].split(":")[0]
+        print(
+            f"{block_calls:>6} {blocks:>7} {wall:>8.1f} {kernel_seconds:>9.1f} "
+            f"{statistics.median(signed) if signed else float('nan'):>11.2%} "
+            f"{max(abs(b) for b in signed) if signed else float('nan'):>10.2%} "
+            f"{wilcoxon_floor(blocks):>11.4f} {winner:>8}"
+        )
+        results[block_calls] = samples
+
+    print("\nlatency by position within a block (median, normalized per candidate)")
+    print("a switching cost inside the timed calls shows up as slow early positions")
+    for block_calls in block_sizes:
+        if block_calls < 5:
+            continue
+        effect = position_effect(results[block_calls])
+        head = "  ".join(f"p{p}={v:.3f}" for p, v, _ in effect[:6])
+        print(f"  block={block_calls:>3}: {head}")
+
+    # Analyse at the largest block whose block count still leaves the test able
+    # to reject anything. Reporting a survivor set from a powerless test would
+    # read as "everything ties" when it means "we learned nothing".
+    # The bar a comparison has to clear is alpha divided by the number of
+    # comparisons, not alpha, so multiplicity belongs in the capability check.
+    comparisons = max(1, len(entrants) - 1)
+    strictest = 0.05 / comparisons
+    capable = [
+        b
+        for b in block_sizes
+        if wilcoxon_floor(max(2, args.calls_per_candidate // b)) <= strictest
+    ]
+    analysis_block = max(capable) if capable else min(block_sizes)
+    analysis_blocks = max(2, args.calls_per_candidate // analysis_block)
+    print(f"\nranking at block={analysis_block} ({analysis_blocks} blocks)")
+    print(
+        f"  {comparisons} comparisons -> Holm's strictest threshold is "
+        f"{strictest:.5f}; a rank test needs "
+        f"{math.ceil(math.log2(1 / strictest))} blocks to reach it"
+    )
+    for label, estimate in rank(results[analysis_block])[:6]:
+        mark = "  <- incumbent" if "incumbent" in origin_of(entrants, label) else ""
+        print(f"  {estimate:9.1f} us  {label}{mark}")
+
+    survivors = indistinguishable_set(results[analysis_block])
+    print(
+        f"\ncandidates indistinguishable from the fastest: "
+        f"{len(survivors)} of {len(entrants)}"
+    )
+    for label in survivors:
+        mark = "  <- incumbent" if "incumbent" in origin_of(entrants, label) else ""
+        print(f"  {results[analysis_block][label].estimate:9.1f} us  {label}{mark}")
 
 
 def main() -> None:
@@ -805,123 +585,65 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20240917)
+    parser.add_argument(
+        "--strategy",
+        choices=("smoke", "exhaustive"),
+        default="smoke",
+        help="which catalogue to draw from before --candidates samples it",
+    )
+    parser.add_argument(
+        "--candidates",
+        type=int,
+        default=None,
+        help="race a seeded sample of this many catalogue entries, for "
+        "measuring how the cost of a race grows with the size of the field",
+    )
+    parser.add_argument(
+        "--journal",
+        default=None,
+        help="append one record per completed block here, so an interrupted "
+        "race can be resumed without re-measuring what it already did",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="replay the journal before measuring anything new",
+    )
+    parser.add_argument("--json-out", default=None, help="machine-readable summary")
     args = parser.parse_args()
 
     check_t_implementation()
     torch.cuda.init()
     inputs = build_inputs()
     invoke = make_invoker(inputs)
+    time_calls = cuda_event_timer(invoke)
 
     print(f"building catalogue for {args.gfx}")
-    candidates = collect_candidates(args.gfx)
-    print(f"  {len(candidates)} candidates before screening")
-    candidates = screen(candidates, invoke, args.warmup)
-    print(f"  {len(candidates)} survive")
-    for candidate in candidates:
-        if candidate.origin != "catalogue":
-            print(f"  incumbent: {candidate.label}")
+    entrants = collect_candidates(args.gfx, args.strategy, args.candidates, args.seed)
+    print(f"  {len(entrants)} candidates before screening")
+
+    # Warm-up is where a large field first hurts: every candidate is compiled
+    # and resident in one process before any block runs. Timed and reported so
+    # the cost of growing the catalogue is visible rather than inferred.
+    torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
+    entrants = screen(entrants, invoke, args.warmup)
+    args._screen_seconds = time.perf_counter() - started
+    args._screen_peak_bytes = torch.cuda.max_memory_allocated()
+    print(
+        f"  {len(entrants)} survive, warmed in {args._screen_seconds:.1f} s, "
+        f"peak {args._screen_peak_bytes / 2**30:.2f} GiB"
+    )
+    for entrant in entrants:
+        if entrant.payload["origin"] != "catalogue":
+            print(f"  incumbent: {entrant.label}")
 
     if args.mode == "race":
-        run_race(args, candidates, invoke)
-        return
-    if args.mode == "null":
-        run_null(args, candidates, invoke)
-        return
-
-    print(f"\nreference pass: {args.calls_per_candidate} contiguous calls each")
-    reference = measure_contiguous(candidates, invoke, args.calls_per_candidate)
-    reference_estimate = {label: s.estimate for label, s in reference.items()}
-
-    block_sizes = [int(b) for b in args.block_sizes.split(",") if b.strip()]
-    print(
-        f"\nsweeping block size at a fixed budget of "
-        f"{args.calls_per_candidate} calls per candidate"
-    )
-    print(
-        f"{'block':>6} {'blocks':>7} {'wall s':>8} {'kernel s':>9} "
-        f"{'median bias':>12} {'max |bias|':>11} {'test floor':>11} {'winner':>8}"
-    )
-
-    results = {}
-    for block_calls in block_sizes:
-        blocks = max(2, args.calls_per_candidate // block_calls)
-        started = torch.cuda.Event(enable_timing=True)
-        finished = torch.cuda.Event(enable_timing=True)
-        started.record()
-        samples = measure_blocks(
-            candidates, invoke, block_calls, blocks, seed=args.seed
-        )
-        finished.record()
-        finished.synchronize()
-        wall = started.elapsed_time(finished) / 1000.0
-
-        # Signed and unsigned are different questions. A systematic switching
-        # cost shifts every candidate the same way and shows in the median;
-        # plain noise from short blocks shows only in the maximum.
-        signed = [
-            (sample.estimate - reference_estimate[label]) / reference_estimate[label]
-            for label, sample in samples.items()
-            if math.isfinite(reference_estimate.get(label, float("inf")))
-        ]
-        kernel_seconds = sum(
-            sum(sum(block) for block in sample.blocks) for sample in samples.values()
-        ) / 1e6
-        winner = rank(samples)[0][0].split(":")[0]
-        print(
-            f"{block_calls:>6} {blocks:>7} {wall:>8.1f} {kernel_seconds:>9.1f} "
-            f"{statistics.median(signed) if signed else float('nan'):>11.2%} "
-            f"{max(abs(b) for b in signed) if signed else float('nan'):>10.2%} "
-            f"{wilcoxon_floor(blocks):>11.4f} {winner:>8}"
-        )
-        results[block_calls] = samples
-
-    print("\nlatency by position within a block (median, normalized per candidate)")
-    print("a switching cost inside the timed calls shows up as slow early positions")
-    for block_calls in block_sizes:
-        if block_calls < 5:
-            continue
-        effect = position_effect(results[block_calls])
-        head = "  ".join(f"p{p}={v:.3f}" for p, v, _ in effect[:6])
-        print(f"  block={block_calls:>3}: {head}")
-
-    # Analyse at the largest block whose block count still leaves the test able
-    # to reject anything. Reporting a survivor set from a powerless test would
-    # read as "everything ties" when it means "we learned nothing".
-    # The bar a comparison has to clear is alpha divided by the number of
-    # comparisons, not alpha, so multiplicity belongs in the capability check.
-    comparisons = max(1, len(candidates) - 1)
-    strictest = 0.05 / comparisons
-    capable = [
-        b
-        for b in block_sizes
-        if wilcoxon_floor(max(2, args.calls_per_candidate // b)) <= strictest
-    ]
-    analysis_block = max(capable) if capable else min(block_sizes)
-    analysis_blocks = max(2, args.calls_per_candidate // analysis_block)
-    print(f"\nranking at block={analysis_block} ({analysis_blocks} blocks)")
-    print(
-        f"  {comparisons} comparisons -> Holm's strictest threshold is "
-        f"{strictest:.5f}; a rank test needs "
-        f"{math.ceil(math.log2(1 / strictest))} blocks to reach it"
-    )
-    for label, estimate in rank(results[analysis_block])[:6]:
-        origin = next(
-            (c.origin for c in candidates if c.label == label), "catalogue"
-        )
-        mark = "  <- incumbent" if "incumbent" in origin else ""
-        print(f"  {estimate:9.1f} us  {label}{mark}")
-
-    survivors = indistinguishable_set(results[analysis_block])
-    print(
-        f"\ncandidates indistinguishable from the fastest: "
-        f"{len(survivors)} of {len(candidates)}"
-    )
-    for label in survivors:
-        origin = next(
-            (c.origin for c in candidates if c.label == label), "catalogue"
-        )
-        mark = "  <- incumbent" if "incumbent" in origin else ""
-        print(f"  {results[analysis_block][label].estimate:9.1f} us  {label}{mark}")
+        run_race(args, entrants, time_calls)
+    elif args.mode == "null":
+        run_null(args, entrants, time_calls)
+    else:
+        run_sweep(args, entrants, time_calls)
 
 
 if __name__ == "__main__":
