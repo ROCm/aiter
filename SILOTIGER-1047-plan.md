@@ -753,6 +753,11 @@ prefill on the dual-KV mapping. ``err=0``, but width-2051 ``L=512``
 prefill went 513.5 → 719.9 us; decode was flat. Keep two-wave 128
 threads. This is not the old ~90 KiB aliased 256-thread BN64 mapping.
 
+**Do not retry** dropping gfx950 K32 ``q_off`` so Q fragments index
+``q_vec[i]`` instead of ``q_vec[q_off + i]``. ``err=0``, but
+width-2051 ``L=512`` stayed 19.8 / 23.3 / 514.9 us vs 19.8 / 22.7 /
+513.5. Prefill VGPR is not this extract.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

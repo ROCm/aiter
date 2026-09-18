@@ -618,6 +618,10 @@ and prefill were flat. Keep BN16 / 32 splits / 256 threads there.
 dual-KV LDS. Prefill went 513.5 → 719.9 us (``err=0``). Keep 128
 threads. Not the old aliased ~90 KiB 256-thread BN64 mapping.
 
+**Do not retry** eliding gfx950 K32 ``q_off`` on the Q 128-bit load.
+``err=0``; width-2051 ``L=512`` was 19.8 / 23.3 / 514.9 us vs 19.8 /
+22.7 / 513.5. Prefill VGPR is not that extract.
+
 
 
 
