@@ -562,7 +562,7 @@ def _flydsl_moe_sorting(
     # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
-    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    # buffer entirely -- the caller owns the [M, topk, model_dim] intermediate.
     # As in _moe_sorting_impl, a caller buffer can stand in.
     if (expert_mask is not None) or accumulate:
         moe_buf = (
@@ -1919,6 +1919,10 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        w_layout=_kwargs.get(
+            "w_layout",
+            "guinterleave" if activation == ActivationType.Silu else "standard",
+        ),
     )
 
 
@@ -3258,6 +3262,9 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+                w_layout=(
+                    "guinterleave" if gate_mode == GateMode.INTERLEAVE else "standard"
+                ),
             )
         else:
             stage1_func = functools.partial(
@@ -3360,6 +3367,18 @@ def get_2stage_cfgs(
     swiglu_mxfp4_bf16_cktile = (
         q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+    )
+    # Silu a16w4 (bf16/fp16 A x MXFP4 W) has no CK2stages instance: the JIT module
+    # is codegen'd with A=B=fp4x2, so moe_stage1_heuristic_dispatch rejects the
+    # bf16 activation at runtime. Only ksplit>1 shapes escaped to CK-Tile, which
+    # left B where get_ksplit returns 0 crashing. CK-Tile also measured faster
+    # than the untuned FlyDSL a16w-mix port on DeepSeek/MiniMax/Qwen at B=1..32.
+    silu_mxfp4_bf16_cktile = (
+        q_type == QuantType.per_1x32
+        and activation == ActivationType.Silu
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
@@ -3510,14 +3529,16 @@ def get_2stage_cfgs(
         and q_dtype_w in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
-        and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
+        and (ksplit > 1 or swiglu_mxfp4_bf16_cktile or silu_mxfp4_bf16_cktile)
     ):
         # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
         # keeping the generic preshuffled fp4 weights. CK2stages has no
         # heuristic kernel for that A16W4 combination, so use CK-Tile.
         # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4
         # layout. The non-split gate/up epilogue is reserved for legacy A16W4.
-        _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
+        # bf16 activations always take split-k: their stage1 output stays bf16,
+        # and ksplit > 1 is what tells stage2 to skip the MXFP4 re-quant.
+        _min_split_k = 2 if (swiglu_mxfp4_bf16_cktile or silu_mxfp4_bf16_cktile) else 1
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
@@ -4040,7 +4061,10 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            and (
+                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or gate_mode == GateMode.INTERLEAVE
+            )
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
