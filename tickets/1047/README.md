@@ -614,6 +614,10 @@ prefill 613.0 us vs 513.5. Keep row-major ``[BN, D]`` V. A later
 ``4 < M * Hk < 32``. ``M=8`` went 22.7 → 33.5 us (``err=0``); ``M=1``
 and prefill were flat. Keep BN16 / 32 splits / 256 threads there.
 
+**Do not retry** 256-thread ``BLOCK_N=64`` / ``splits=1`` prefill on
+dual-KV LDS. Prefill went 513.5 → 719.9 us (``err=0``). Keep 128
+threads. Not the old aliased ~90 KiB 256-thread BN64 mapping.
+
 
 
 
