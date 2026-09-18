@@ -6419,6 +6419,13 @@ class FhmoeTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FHMOE",
     }
 
+    def _clear_op_caches(self):
+        super()._clear_op_caches()
+        import aiter.fused_moe as fmoe_module
+
+        if hasattr(fmoe_module, "cfg_2stages_by_file"):
+            fmoe_module.cfg_2stages_by_file.clear()
+
     @staticmethod
     def _parse_fhmoe_row(row):
         return {
@@ -6547,6 +6554,12 @@ class FhmoeTuner(FmoeTuner):
         topk_weights = topk_weights.cpu()
         topk_ids = topk_ids.cpu()
 
+        # Unshuffled copies for the torch reference. Shuffle below is kernel ABI.
+        w1_qt, w2_qt = w1, w2
+        w1_scale_qt, w2_scale_qt = w1_scale, w2_scale
+        shared_w1_qt, shared_w2_qt = shared_w1, shared_w2
+        shared_w1_scale_qt, shared_w2_scale_qt = shared_w1_scale, shared_w2_scale
+
         w1 = FhmoeTuner._pad_dummy_expert(w1)
         w2 = FhmoeTuner._pad_dummy_expert(w2)
         w1_scale = FhmoeTuner._pad_dummy_expert(w1_scale, routed_expert)
@@ -6593,10 +6606,18 @@ class FhmoeTuner(FmoeTuner):
             "w2": w2,
             "w1_scale": w1_scale,
             "w2_scale": w2_scale,
+            "w1_qt": w1_qt,
+            "w2_qt": w2_qt,
+            "w1_scale_qt": w1_scale_qt,
+            "w2_scale_qt": w2_scale_qt,
             "shared_w1": shared_w1,
             "shared_w2": shared_w2,
             "shared_w1_scale": shared_w1_scale,
             "shared_w2_scale": shared_w2_scale,
+            "shared_w1_qt": shared_w1_qt,
+            "shared_w2_qt": shared_w2_qt,
+            "shared_w1_scale_qt": shared_w1_scale_qt,
+            "shared_w2_scale_qt": shared_w2_scale_qt,
             "topk_ids": topk_ids,
             "topk_weights": topk_weights,
             "a1_qt": hidden,
@@ -6774,6 +6795,19 @@ class FhmoeTuner(FmoeTuner):
         "shared_w1_scale",
         "shared_w2_scale",
     )
+    _FHMOE_REF_DATA_KEYS = (
+        "hidden",
+        "w1_qt",
+        "w2_qt",
+        "w1_scale_qt",
+        "w2_scale_qt",
+        "shared_w1_qt",
+        "shared_w2_qt",
+        "shared_w1_scale_qt",
+        "shared_w2_scale_qt",
+        "topk_weights",
+        "topk_ids",
+    )
 
     @staticmethod
     def _run_fhmoe_mp(
@@ -6814,9 +6848,119 @@ class FhmoeTuner(FmoeTuner):
             block_m,
         )
 
-    def tune(self, untunedf, tunedf, args):
-        del tunedf
+    @staticmethod
+    def _to_ref_device(tensor):
+        if tensor is None or not torch.is_tensor(tensor):
+            return tensor
+        if tensor.is_cuda:
+            return tensor
+        if torch.cuda.is_available():
+            return tensor.cuda()
+        return tensor
+
+    @staticmethod
+    def run_torch_fhmoe(
+        hidden,
+        w1_qt,
+        w2_qt,
+        w1_scale_qt,
+        w2_scale_qt,
+        shared_w1_qt,
+        shared_w2_qt,
+        shared_w1_scale_qt,
+        shared_w2_scale_qt,
+        topk_weights,
+        topk_ids,
+        shape,
+    ):
+        """Homogeneous torch refs for routed FP4 and shared FP8, then summed.
+
+        Matches the tuner launch: same tensors, no swiglu_limit (the candidate
+        path does not pass one). Activation quant is fused in the kernel;
+        FmoeTuner's a8w4 ref also leaves a1_scale=None.
+        """
+        hidden = FhmoeTuner._to_ref_device(hidden)
+        w1_qt = FhmoeTuner._to_ref_device(w1_qt)
+        w2_qt = FhmoeTuner._to_ref_device(w2_qt)
+        w1_scale_qt = FhmoeTuner._to_ref_device(w1_scale_qt)
+        w2_scale_qt = FhmoeTuner._to_ref_device(w2_scale_qt)
+        shared_w1_qt = FhmoeTuner._to_ref_device(shared_w1_qt)
+        shared_w2_qt = FhmoeTuner._to_ref_device(shared_w2_qt)
+        shared_w1_scale_qt = FhmoeTuner._to_ref_device(shared_w1_scale_qt)
+        shared_w2_scale_qt = FhmoeTuner._to_ref_device(shared_w2_scale_qt)
+        topk_weights = FhmoeTuner._to_ref_device(topk_weights)
+        topk_ids = FhmoeTuner._to_ref_device(topk_ids)
+
+        routed_ids = topk_ids[:, :-1]
+        routed_w = topk_weights[:, :-1]
+        shared_ids = torch.zeros(
+            (topk_ids.shape[0], 1),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        shared_w = topk_weights[:, -1:]
+        dtype = shape["dtype"]
+        activation = shape["act_type"]
+        quant_type = shape["q_type"]
+        doweight_stage1 = bool(shape["doweight_stage1"])
+
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            hidden,
+            w1_qt,
+            w2_qt,
+            routed_w,
+            routed_ids,
+            None,
+            w1_scale_qt,
+            dtype=dtype,
+            activation=activation,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            topk=routed_ids.shape[1],
+        )
+        routed = FmoeTuner.run_torch_moe_stage2(
+            ref1,
+            w1_qt,
+            w2_qt,
+            routed_w,
+            routed_ids,
+            None,
+            w2_scale_qt,
+            dtype=dtype,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+        )
+        shared_ref1 = FmoeTuner.run_torch_moe_stage1(
+            hidden,
+            shared_w1_qt,
+            shared_w2_qt,
+            shared_w,
+            shared_ids,
+            None,
+            shared_w1_scale_qt,
+            dtype=dtype,
+            activation=activation,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            topk=1,
+        )
+        shared = FmoeTuner.run_torch_moe_stage2(
+            shared_ref1,
+            shared_w1_qt,
+            shared_w2_qt,
+            shared_w,
+            shared_ids,
+            None,
+            shared_w2_scale_qt,
+            dtype=dtype,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+        )
+        return routed + shared
+
+    def _fhmoe_tune_tasks(self, untunedf):
         tasks = []
+        in_datas = []
         for _, row in untunedf.iterrows():
             shape = self._parse_fhmoe_row(row)
             info = tuple(shape[k] for k in self.keys)
@@ -6825,6 +6969,8 @@ class FhmoeTuner(FmoeTuner):
                 f"\nStart tuning FHMoE {info} candidates={len(pairs)}",
                 flush=True,
             )
+            if not pairs:
+                continue
             for block_m, kn1, kn2 in pairs:
                 tasks.append(
                     (
@@ -6834,26 +6980,136 @@ class FhmoeTuner(FmoeTuner):
                         FhmoeTuner._run_fhmoe_mp,
                         (list(self._FHMOE_MP_DATA_KEYS), shape, kn1, kn2, block_m),
                         {},
-                        None,
-                        ([],),
+                        FhmoeTuner.run_torch_fhmoe,
+                        (list(self._FHMOE_REF_DATA_KEYS), shape),
                         {},
                         None,
                         0.01,
                         0.01,
+                        cosine_diff_compare,
                     )
                 )
+            in_datas.append((len(pairs), ()))
+        return tasks, in_datas
+
+    def run_config(self, args):
+        """Public fused_moe + shared FP8, not FmoeTuner's homogeneous path."""
+        from aiter.test_common import run_perftest
+
+        results = []
+        for _, row in self.untunedf.iterrows():
+            shape = self._parse_fhmoe_row(row)
+            shape_str = (
+                f"(token={shape['token']}, dim={shape['model_dim']}, "
+                f"inter={shape['inter_dim']}, E={shape['expert']}, "
+                f"topk={shape['topk']}, shared={shape['shared_expert_id']}, "
+                f"{self._csv_cell(shape['act_type'])}, "
+                f"{self._csv_cell(shape['dtype'])}, "
+                f"{self._csv_cell(shape['q_dtype_a'])}, "
+                f"{self._csv_cell(shape['q_dtype_w'])}, "
+                f"{self._csv_cell(shape['q_type'])}, "
+                f"{self._csv_cell(shape['gate_mode'])})"
+            )
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
+            kernel_us = None
+            if "us" in row and pd.notna(row["us"]):
+                try:
+                    kernel_us = float(row["us"])
+                except (TypeError, ValueError):
+                    kernel_us = None
+            try:
+                data = self.generate_fhmoe_data(shape)
+                w1 = self._to_ref_device(data["w1"])
+                w2 = self._to_ref_device(data["w2"])
+                w1.is_shuffled = True
+                w2.is_shuffled = True
+                gate_mode = shape["gate_mode"]
+                if not isinstance(gate_mode, str):
+                    gate_mode = gate_mode.value
+                out, us = run_perftest(
+                    fused_moe,
+                    self._to_ref_device(data["hidden"]),
+                    w1,
+                    w2,
+                    self._to_ref_device(data["topk_weights"]),
+                    self._to_ref_device(data["topk_ids"]),
+                    activation=shape["act_type"],
+                    quant_type=shape["q_type"],
+                    doweight_stage1=bool(shape["doweight_stage1"]),
+                    w1_scale=self._to_ref_device(data["w1_scale"]),
+                    w2_scale=self._to_ref_device(data["w2_scale"]),
+                    dtype=shape["dtype"],
+                    hidden_pad=shape["hidden_pad"],
+                    intermediate_pad=shape["intermediate_pad"],
+                    gate_mode=gate_mode,
+                    shared_w1=self._to_ref_device(data["shared_w1"]),
+                    shared_w2=self._to_ref_device(data["shared_w2"]),
+                    shared_w1_scale=self._to_ref_device(data["shared_w1_scale"]),
+                    shared_w2_scale=self._to_ref_device(data["shared_w2_scale"]),
+                    shared_expert_id=data["shared_expert_id"],
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = self.run_torch_fhmoe(
+                    *[data[k] for k in self._FHMOE_REF_DATA_KEYS],
+                    shape,
+                )
+                if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                    diag = tensor_compare_diagnostics(ref, out)
+                    status = (
+                        "error:output is all zeros (kernel produced no output); "
+                        f"{diag}"
+                    )
+                else:
+                    err_ratio = cosine_diff_compare(
+                        ref, out, msg=f"run_config {shape_str}"
+                    )
+                    if err_ratio <= allowed_err_ratio:
+                        status = "ok"
+                    else:
+                        diag = tensor_compare_diagnostics(ref, out)
+                        status = (
+                            f"mismatch:cosine_diff={err_ratio:.6g}"
+                            f"(>{allowed_err_ratio_desc}); {diag}"
+                        )
+                results.append(
+                    {
+                        "shape": shape_str,
+                        "e2e_us": us,
+                        "kernel_us": kernel_us,
+                        "status": status,
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {
+                        "shape": shape_str,
+                        "e2e_us": -1,
+                        "kernel_us": kernel_us,
+                        "status": f"error:{e}",
+                    }
+                )
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        return results
+
+    def tune(self, untunedf, tunedf, args):
+        del tunedf
+        tasks, in_datas = self._fhmoe_tune_tasks(untunedf)
         if not tasks:
             return []
-        rets = mp_tuner(
+        return mp_tuner(
             tasks,
-            [(len(tasks), ())],
+            in_datas,
             args.mp,
             True,
-            False,
+            True,
             timeout=args.timeout,
             verbose=args.verbose,
         )
-        return rets
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del topk, fast_mode
@@ -6891,10 +7147,15 @@ class FhmoeTuner(FmoeTuner):
             valid = [
                 r
                 for r in rets
-                if r[3] not in (self.INVALID_TIME, self.INF_TIME) and r[3] >= 0
+                if r[3] not in (self.INVALID_TIME, self.INF_TIME)
+                and r[3] >= 0
+                and r[4] <= args.errRatio
             ]
             if not valid:
-                print(f"Tuning result for {key} is none", flush=True)
+                print(
+                    f"Tuning result for {key} is none, please check errRatio={args.errRatio}",
+                    flush=True,
+                )
                 continue
             kn1, kn2, block_m, us, err = min(valid, key=lambda r: r[3])
             row = dict(zip(self.keys, key))
