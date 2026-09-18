@@ -99,20 +99,22 @@ IMPORT_ROOTS = ("aiter.ops.triton", "op_tests.triton_tests")
 
 
 @cache
-def resolve_module(dotted):
-    """aiter.ops.triton.x.y -> the repo file for that module, if it exists.
-    Cached: the same names recur across hundreds of files and each miss costs
-    two filesystem probes."""
+def resolve_module(dotted, gone=frozenset()):
+    """aiter.ops.triton.x.y -> the repo file for that module, if it exists --
+    or if the diff deleted it. An importer of a deleted module still carries the
+    import statement, and will fail at collection; keeping that edge is what
+    lets the graph name it. Cached: the same names recur across hundreds of
+    files and each miss costs two filesystem probes."""
     if not dotted.startswith(IMPORT_ROOTS):
         return None
     rel = dotted.replace(".", "/")
     for cand in (rel + ".py", rel + "/__init__.py"):
-        if (ROOT / cand).is_file():
+        if cand in gone or (ROOT / cand).is_file():
             return cand
     return None
 
 
-def scan_imports(path):
+def scan_imports(path, gone=frozenset()):
     """The aiter.ops.triton modules `path` imports directly."""
     found = set()
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
@@ -125,7 +127,7 @@ def scan_imports(path):
             names = [node.module] + [f"{node.module}.{a.name}" for a in node.names]
         else:
             continue
-        found.update(filter(None, map(resolve_module, names)))
+        found.update(filter(None, (resolve_module(n, gone) for n in names)))
     return found
 
 
@@ -174,9 +176,17 @@ def select(diff):
     """Map changed files to test files. Raises when a subset is not safe."""
     tests = list_files(TESTS, "test_*.py")
     sources = list_files(SRC, "*.py")
+    # Python files the diff names that are no longer in the tree. Edges to
+    # them are kept, so whatever still imports one is found and run -- it is
+    # exactly what breaks once this merges.
+    gone = frozenset(
+        f
+        for f in diff
+        if f.endswith(".py") and f.startswith((SRC, TESTS)) and not (ROOT / f).is_file()
+    )
     # Helpers are parsed as well as test_*.py: a test can reach its kernel
     # through one, and a helper change has to find the tests behind it.
-    imports = {f: scan_imports(f) for f in sources + list_files(TESTS, "*.py")}
+    imports = {f: scan_imports(f, gone) for f in sources + list_files(TESTS, "*.py")}
     # Every module each test can reach, so a change anywhere in that set
     # selects the test -- this is what covers fused kernels without a map.
     test_reach = {t: reachable(t, imports) for t in tests}
@@ -230,18 +240,14 @@ def select(diff):
         if f.startswith(TESTS):
             relevant = True
             if basename(f).startswith("test_") and f.endswith(".py"):
-                if not (ROOT / f).is_file():
-                    # Deleted, or renamed away. split_tests.sh refuses a
-                    # selection naming a path that is not a test file, and the
-                    # graph cannot find what imported a module that no longer
-                    # exists -- so run the folder, which is where those
-                    # importers live. A whole folder gone raises, to the full
-                    # suite.
-                    cat = category_of(f)
-                    folder = folder_of(cat, f) if cat else []
-                    selected.update(folder)
+                if f in gone:
+                    # Deleted, or renamed away: not a path split_tests.sh will
+                    # accept. What still imports it is, and will fail once this
+                    # merges, so that is what runs.
+                    importers = reached_by(f)
+                    selected.update(importers)
                     reasons.append(
-                        f"{f}: deleted test — not run; '{cat}' folder ({len(folder)})"
+                        f"{f}: deleted test — not run; {len(importers)} importing test(s)"
                     )
                     continue
                 importers = reached_by(f)
