@@ -849,7 +849,88 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    iq2r_w1_auxiliary: torch.Tensor | None = None,
+    iq2r_w2_auxiliary: torch.Tensor | None = None,
+    iq2r_w1_metadata=None,
+    iq2r_w2_metadata=None,
+    iq2r_w1_tile_n: int | None = None,
+    iq2r_w2_tile_n: int | None = None,
+    iq2r_workspace=None,
 ):
+    if quant_type == QuantType.iq2r_2bit:
+        unsupported = {
+            "expert_mask": expert_mask,
+            "w1_scale": w1_scale,
+            "w2_scale": w2_scale,
+            "a1_scale": a1_scale,
+            "a2_scale": a2_scale,
+            "num_local_tokens": num_local_tokens,
+            "shared_w1": shared_w1,
+            "shared_w2": shared_w2,
+            "shared_w1_scale": shared_w1_scale,
+            "shared_w2_scale": shared_w2_scale,
+            "stage2_scatter": stage2_scatter,
+        }
+        present = [name for name, value in unsupported.items() if value is not None]
+        if present:
+            raise NotImplementedError(
+                "IQ2R GPT-OSS does not support " + ", ".join(present)
+            )
+        if shared_expert_id != -1:
+            raise NotImplementedError("IQ2R GPT-OSS does not support shared experts")
+        if activation != ActivationType.Swiglu:
+            raise ValueError("IQ2R GPT-OSS requires SwiGLU activation")
+        if doweight_stage1:
+            raise NotImplementedError(
+                "IQ2R GPT-OSS applies route weights after the down projection"
+            )
+        if block_size_M not in (None, -1):
+            raise ValueError("IQ2R uses its workspace task_rows selection")
+        if moe_sorting_dispatch_policy != 0:
+            raise ValueError("IQ2R uses its dedicated stable route sorter")
+        if hidden_pad != 0 or intermediate_pad != 0:
+            raise ValueError("IQ2R GPT-OSS uses logical 2880 dimensions")
+        if dtype not in (None, torch.bfloat16):
+            raise TypeError("IQ2R GPT-OSS output dtype must be bfloat16")
+        if swiglu_limit not in (None, 7.0):
+            raise ValueError("IQ2R GPT-OSS requires swiglu_limit=7.0")
+        if beta not in (None, 1.702):
+            raise ValueError("IQ2R GPT-OSS requires beta=1.702")
+        if linear_beta not in (None, 1.0):
+            raise ValueError("IQ2R GPT-OSS requires linear_beta=1.0")
+        if gate_mode not in (None, GateMode.SEPARATED.value):
+            raise ValueError("IQ2R GPT-OSS requires separated gate/up semantics")
+        required = {
+            "iq2r_w1_auxiliary": iq2r_w1_auxiliary,
+            "iq2r_w2_auxiliary": iq2r_w2_auxiliary,
+            "iq2r_w1_metadata": iq2r_w1_metadata,
+            "iq2r_w2_metadata": iq2r_w2_metadata,
+            "iq2r_w1_tile_n": iq2r_w1_tile_n,
+            "iq2r_w2_tile_n": iq2r_w2_tile_n,
+            "iq2r_workspace": iq2r_workspace,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError("IQ2R dispatch requires " + ", ".join(missing))
+        from aiter.iq2r_moe import iq2r_fused_moe
+
+        return iq2r_fused_moe(
+            hidden_states,
+            w1,
+            iq2r_w1_auxiliary,
+            w2,
+            iq2r_w2_auxiliary,
+            topk_weight,
+            topk_ids,
+            gate_up_metadata=iq2r_w1_metadata,
+            down_metadata=iq2r_w2_metadata,
+            gate_up_tile_n=iq2r_w1_tile_n,
+            down_tile_n=iq2r_w2_tile_n,
+            gate_up_bias=bias1,
+            down_bias=bias2,
+            workspace=iq2r_workspace,
+        )
+
     if (
         any(
             tensor is not None
