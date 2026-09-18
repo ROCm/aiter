@@ -664,8 +664,15 @@ to fold the P barrier.
 (and softmax) redundant `indices`/`page_table` loads. Oracle ``err=0``,
 but width-2051 ``L=512`` went to 24.1 / 23.8 / 608.9 us vs 24.3 /
 24.1 / 586.7; prefill paid for dropping the translate barrier. Keep
-phys/page/live LDS. Next: Q register staging (do not drop the K/V
-alias barrier without extra KV LDS).
+phys/page/live LDS.
+
+**Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
+the QK A fragment). The compiler aborted in
+`CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`
+plus `q_off`/`from_elements` extract and pad-head zeroing. Next:
+gfx950 extra KV LDS to overlap the next K gather with PV (not the old
+90 KiB ping-pong mapping). Do not drop the K/V alias barrier without
+that extra buffer.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
