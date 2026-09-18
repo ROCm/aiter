@@ -181,7 +181,6 @@ def launch_gemm_a8w4_tdm(
     ) // SCATTER_PASSES_PER_VECTOR
     if (4 * num_waves_per_tensor_tdm) % num_waves:
         raise ValueError("A/B/SA/SB ownership must cover every workgroup wave")
-    TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
 
     A_PACK = 2 if a_is_fp4 else 1
     A_ROW_B = tile_k // A_PACK

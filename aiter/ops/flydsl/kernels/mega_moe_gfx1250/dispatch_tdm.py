@@ -260,8 +260,7 @@ def _make_dispatch_tdm(
     meta_fields = 4 if scale_bytes else 3
     meta_per_tok = topk * 4 * 2 + 4 + scale_stride
     meta_cap = (tile_bytes - meta_fields * 128) // meta_per_tok
-    if meta_cap > TDM.TDM_MAX_DIM:
-        meta_cap = TDM.TDM_MAX_DIM
+    meta_cap = min(meta_cap, TDM.TDM_MAX_DIM)
     use_meta_tdm = bool(meta_tdm) and meta_cap > 0
 
     # One warp per peer would leave every warp past the world size idle, so the
@@ -628,12 +627,11 @@ def _make_dispatch_tdm(
                         TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * fx.Int64(4)),
                         TDM.tdm_group1_rows_4b(r_src),
                     )
-                if const_expr(scale_bytes > 0):
-                    if r_sc > 0:
-                        TDM.tdm_store(
-                            TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * fx.Int64(4)),
-                            TDM.tdm_group1_rows_4b(r_sc),
-                        )
+                if const_expr(scale_bytes > 0) and r_sc > 0:
+                    TDM.tdm_store(
+                        TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * fx.Int64(4)),
+                        TDM.tdm_group1_rows_4b(r_sc),
+                    )
                 TDM.tdm_wait(0)
 
             for run_id in range(warp, meta_runs, warp_num_per_block):
@@ -776,22 +774,21 @@ def _make_dispatch_tdm(
                     live_mask = ballot(T.i32, live)
                     wt_bits = arith.constant(0)
                     packed_meta = arith.constant(0)
-                    if const_expr(compact_plan):
-                        if live:
-                            wt_bits = arith.bitcast(
-                                T.i32,
-                                buffer_load(
-                                    rsrc_inp_wts,
-                                    tok * topk + lane,
-                                    vec_width=1,
-                                    dtype=T.f32,
-                                ),
-                            )
-                            packed_meta = (
-                                fx.Int32(rank) * fx.Int32(max_tok_slot_stride)
-                                + tok * fx.Int32(topk)
-                                + lane
-                            )
+                    if const_expr(compact_plan) and live:
+                        wt_bits = arith.bitcast(
+                            T.i32,
+                            buffer_load(
+                                rsrc_inp_wts,
+                                tok * topk + lane,
+                                vec_width=1,
+                                dtype=T.f32,
+                            ),
+                        )
+                        packed_meta = (
+                            fx.Int32(rank) * fx.Int32(max_tok_slot_stride)
+                            + tok * fx.Int32(topk)
+                            + lane
+                        )
                     if live_mask != 0:
                         TDM.tdm_load(
                             TDM.tdm_group0(
