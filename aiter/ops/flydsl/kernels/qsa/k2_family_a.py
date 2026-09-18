@@ -96,6 +96,7 @@ def build_qsa_k2_family_a_module(
     col_owners = block_threads // block_n
     gather_rounds = d_chunks // col_owners
     gather_span = col_owners * vec
+    token_major_v = use_k32 and block_n == 16
 
     if use_k32:
 
@@ -188,7 +189,11 @@ def build_qsa_k2_family_a_module(
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_lds = getattr(storage, _k_field).view(fx.make_layout((block_n, _D), (_D, 1)))
-        v_lds = getattr(storage, _v_field).view(fx.make_layout((block_n, _D), (_D, 1)))
+        v_lds = getattr(storage, _v_field).view(
+            fx.make_layout((_D, block_n), (block_n, 1))
+            if token_major_v
+            else fx.make_layout((block_n, _D), (_D, 1))
+        )
         p_lds = storage.p.view(fx.make_layout((_HEAD_PAD, block_n), (block_n, 1)))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
         phys_lds = storage.phys.view(fx.make_layout(block_n, 1))
@@ -211,6 +216,9 @@ def build_qsa_k2_family_a_module(
             BFloat16,
         )
         qk_b_copy = fx.make_tiled_copy_B(qk_b_atom, qk_wave_mma).get_slice(lane)
+        pv_wave_mma = fx.make_tiled_mma(pv_mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
+        pv_b_atom = fx.make_copy_atom(fx.UniversalCopy64b(), BFloat16)
+        pv_b_copy = fx.make_tiled_copy_B(pv_b_atom, pv_wave_mma).get_slice(lane)
 
         def qk_mfma(a_vec, b_vec, c_vec):
             qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
@@ -353,14 +361,19 @@ def build_qsa_k2_family_a_module(
                         BFloat16,
                     )
                     fx.memref_store_vec(v_vec, v_frag)
-                    v_tile = fx.make_view(
-                        fx.get_iter(v_lds) + Int32(gr * gather_span),
-                        fx.make_layout((block_n, gather_span), (_D, 1)),
-                    )
-                    v_dst = kv_store.partition_D(v_tile)
-                    v_store_frag = fx.make_fragment_like(v_dst)
-                    fx.memref_store_vec(v_vec, v_store_frag)
-                    fx.copy(lds_copy, v_store_frag, v_dst)
+                    if const_expr(token_major_v):
+                        d0 = d_chunk * Int32(vec)
+                        for i in range_constexpr(vec):
+                            v_lds[d0 + Int32(i), col] = v_vec[i]
+                    else:
+                        v_tile = fx.make_view(
+                            fx.get_iter(v_lds) + Int32(gr * gather_span),
+                            fx.make_layout((block_n, gather_span), (_D, 1)),
+                        )
+                        v_dst = kv_store.partition_D(v_tile)
+                        v_store_frag = fx.make_fragment_like(v_dst)
+                        fx.memref_store_vec(v_vec, v_store_frag)
+                        fx.copy(lds_copy, v_store_frag, v_dst)
 
             # QK: waves partition D, then wave 0 reduces their C fragments.
             for ng in range_constexpr(n_subtiles):
@@ -478,15 +491,28 @@ def build_qsa_k2_family_a_module(
                         ],
                         BFloat16,
                     )
-                    v_vec = fx.Vector.from_elements(
-                        [
-                            v_lds[n0, d],
-                            v_lds[n0 + one, d],
-                            v_lds[n0 + Int32(2), d],
-                            v_lds[n0 + Int32(3), d],
-                        ],
-                        BFloat16,
-                    )
+                    if const_expr(token_major_v):
+                        d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
+                        sB = fx.make_view(
+                            fx.get_iter(v_lds)
+                            + d_base * Int32(block_n)
+                            + Int32(ng * 16),
+                            fx.make_layout((16, 16), (block_n, 1)),
+                        )
+                        b_src = pv_b_copy.partition_S(sB)
+                        b_frag = fx.make_fragment_like(b_src)
+                        fx.copy(pv_b_atom, b_src, b_frag)
+                        v_vec = fx.Vector(fx.memref_load_vec(b_frag))
+                    else:
+                        v_vec = fx.Vector.from_elements(
+                            [
+                                v_lds[n0, d],
+                                v_lds[n0 + one, d],
+                                v_lds[n0 + Int32(2), d],
+                                v_lds[n0 + Int32(3), d],
+                            ],
+                            BFloat16,
+                        )
                     acc4 = pv_mfma(p_vec, v_vec, acc4)
                 next_acc.append(acc4)
             results = yield next_acc
