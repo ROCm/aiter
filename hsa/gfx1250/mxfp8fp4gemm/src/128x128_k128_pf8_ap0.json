@@ -1,0 +1,36 @@
+{
+  "tile": "128x128/K128/PF8",
+  "cluster": [
+    4,
+    4
+  ],
+  "grid": [
+    8,
+    2
+  ],
+  "a_preshuffle": 0,
+  "b_preshuffle": 1,
+  "dtype": "FP8xFP8/BF16",
+  "splitk": 1,
+  "input_et": 1,
+  "output_descriptor_bit21": 1,
+  "A_AS": "HT/CU",
+  "B_BS": "RT_NT/CU",
+  "D": "NT/SYS",
+  "lds_bytes": 286720,
+  "vgpr": 896,
+  "kernarg_bytes": 80,
+  "kernarg_preload_dwords": 20,
+  "source": "poc_kl_merg/scripts/mi400/mxfp8fp4gemm/experiments/k128_pf8/artifacts/ap0_20260911",
+  "source_validation": "19/19 CPU golden checks documented in experiments/k128_pf8/AP0_REPORT.md",
+  "master_sha256": "b43b4d9347598f71a352de2a2569cc271abaf88db47e56abe75ca069d750e859",
+  "source_co_sha256": "c7b7d41a33935ea509b23a07e7b1d59ae5249ac686f5c308f6c916ba52c20cd0",
+  "source_asm_sha256": "73533d21d9f89de84cf575b00fbef17c0bfee55c8a4456c11324c8e5089e59f4",
+  "aiter_symbol": "_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_128x128_4x4_psE",
+  "aiter_asm_sha256": "c2f06113777ad77c24086d57e2e884ea633c107adba19313419b9f15cccbc435",
+  "assembly_changes": "Entry symbol renamed; trailing whitespace removed",
+  "aiter_co_sha256": "bf9312c562d9b27297ce3b2aaffdc67281aa63d8a7995190dcf357c14487ffc7",
+  "text_sha256": "ad5680e0718ed54129e16774e6f16cea7ff891a4d9aa66339b05ac86b7d37c39",
+  "poc_text_identical": true,
+  "shape_guard": "M,N positive multiples of 512; K>=1024 and K%128==0; splitk=1"
+}

@@ -5,8 +5,8 @@
 Run from an aiter checkout in its installed environment:
     python -m op_tests.test_mxfp8fp4gemm_perf
 
-Each case/input pair gets a fresh process, with six complete native test calls
-inside it. Input generation, rotation, Torch/AP0 prebenchmarks, GEMM timing and
+Each case/input pair gets a fresh process, with four complete native test calls
+inside it. Input generation, rotation, layout-dependent prebenchmarks, GEMM timing and
 correctness checks all belong to op_tests.test_mxfp8fp4gemm.
 """
 
@@ -33,8 +33,8 @@ INPUTS = {"constant": "constant", "uniform": "auto"}
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def native_command(case, data_init, repeat, json_path):
-    # Inherit AP1, per-shape split-K, formal 2/100 and prebenchmark 2/100
+def native_command(case, data_init, repeat, json_path, apre=1):
+    # Inherit per-shape split-K, formal 2/100 and prebenchmark 2/100
     # from the native entry. No separate timing or input implementation here.
     return [
         sys.executable,
@@ -45,6 +45,8 @@ def native_command(case, data_init, repeat, json_path):
         "perf",
         "--intype",
         "a8w8",
+        "--apre",
+        str(apre),
         "--shape",
         ",".join(map(str, CASES[case])),
         "--pre-benchmark",
@@ -62,10 +64,11 @@ def native_command(case, data_init, repeat, json_path):
 
 def complete_profile(row):
     kernels = row.get("profile_gpu_kernels", {})
+    layout = "ABpreShuffle" if row["apre"] else "BpreShuffle"
     return (
         row.get("timing_scope") == "gemm_only"
         and len(kernels) == 1
-        and all("f8gemm_" in name for name in kernels)
+        and all("f8gemm_" in name and f"_{layout}_" in name for name in kernels)
         and sum(kernels.values()) == row["num_iters"]
     )
 
@@ -75,7 +78,7 @@ def write_json(path, value):
 
 
 def print_summary(summaries):
-    columns = ["case", "M,N,K", "data_init", "scale_init", "splitk"]
+    columns = ["case", "apre", "M,N,K", "data_init", "scale_init", "splitk"]
     columns += [f"us_{i}" for i in range(1, len(summaries[0]["values_us"]) + 1)]
     columns += ["mean_us", "correctness"]
     rows = []
@@ -84,6 +87,7 @@ def print_summary(summaries):
         rows.append(
             [
                 item["case"],
+                str(item["apre"]),
                 ",".join(map(str, CASES[item["case"]])),
                 item["data_init"],
                 INPUTS[item["data_init"]],
@@ -104,11 +108,18 @@ def print_summary(summaries):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--apre",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Formal A layout: 0 = AP0 (row-major A), 1 = AP1 (preshuffled A, default)",
+    )
     parser.add_argument("--cases", nargs="+", choices=list(CASES), default=list(CASES))
     parser.add_argument(
         "--data-init", nargs="+", choices=list(INPUTS), default=list(INPUTS)
     )
-    parser.add_argument("--repeat", type=int, default=6)
+    parser.add_argument("--repeat", type=int, default=4)
     parser.add_argument(
         "--max-attempts",
         type=int,
@@ -142,6 +153,7 @@ def main():
                             data_init,
                             args.repeat,
                             output / f"{case}_{data_init}_attempt1.json",
+                            apre=args.apre,
                         )
                     )
                 )
@@ -154,10 +166,13 @@ def main():
             for attempt in range(1, args.max_attempts + 1):
                 stem = f"{case}_{data_init}_attempt{attempt}"
                 json_path, log_path = output / f"{stem}.json", output / f"{stem}.log"
-                command = native_command(case, data_init, args.repeat, json_path)
+                command = native_command(
+                    case, data_init, args.repeat, json_path, apre=args.apre
+                )
                 print(shlex.join(command), flush=True)
                 entry = {
                     "case": case,
+                    "apre": args.apre,
                     "data_init": data_init,
                     "attempt": attempt,
                     "command": command,
@@ -205,6 +220,7 @@ def main():
                     records.append(dict(row, case=case, attempt=attempt))
                 summary = {
                     "case": case,
+                    "apre": args.apre,
                     "data_init": data_init,
                     "splitk": rows[0]["splitk"],
                     "values_us": values,
@@ -216,7 +232,7 @@ def main():
                 write_json(output / "summary.json", summaries)
                 with (output / "perf.csv").open("w", newline="") as stream:
                     columns = (
-                        ["case", "data_init", "splitk"]
+                        ["case", "apre", "data_init", "splitk"]
                         + [f"us_{i}" for i in range(1, args.repeat + 1)]
                         + ["mean_us"]
                     )
@@ -225,7 +241,7 @@ def main():
                     for item in summaries:
                         row = {
                             key: item[key]
-                            for key in ("case", "data_init", "splitk", "mean_us")
+                            for key in ("case", "apre", "data_init", "splitk", "mean_us")
                         }
                         row.update(
                             {
@@ -235,7 +251,7 @@ def main():
                         )
                         writer.writerow(row)
                 print(
-                    f"{case} {data_init}: {values} us; mean={summary['mean_us']:.4f} us; "
+                    f"{case} AP{args.apre} {data_init}: {values} us; mean={summary['mean_us']:.4f} us; "
                     f"correctness={summary['correctness']}",
                     flush=True,
                 )
