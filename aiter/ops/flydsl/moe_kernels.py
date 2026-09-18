@@ -2489,6 +2489,7 @@ def flydsl_moe_topids_to_rows(
     counter: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     num_valid_routes: torch.Tensor | None = None,
+    ep_rowmap: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -2580,6 +2581,16 @@ def flydsl_moe_topids_to_rows(
             os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
+        # ep_rowmap sentinel fill: the g2l_lds kernel interleaves i64 fill stores
+        # with route work (fire-and-forget, no extra barrier), eliminating the
+        # standalone .fill_() launch between g2l_lds and psum_remap_ep.  When
+        # ep_rowmap is None the kernel receives a null pointer and skips the fill.
+        _ep_rowmap_ptr = (
+            ep_rowmap.reshape(-1)
+            if ep_rowmap is not None
+            else torch.empty(0, dtype=torch.int32, device=device)
+        )
+        _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
         if _use_lds_reduce:
             topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
         else:
@@ -2596,6 +2607,8 @@ def flydsl_moe_topids_to_rows(
             int(max_m),
             int(E),
             route_grid,
+            ptr_arg(_ep_rowmap_ptr),
+            int(_ep_rowmap_cap),
             stream=torch.cuda.current_stream(),
         )
     else:

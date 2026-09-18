@@ -840,6 +840,9 @@ def fused_moe(
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
+    quant_type_a: QuantType | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
 ):
     if (
         any(
@@ -924,6 +927,9 @@ def fused_moe(
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
         output=output,
+        quant_type_a=None if quant_type_a is None else quant_type_a.value,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
     )
 
 
@@ -962,6 +968,9 @@ def fused_moe_fake(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1019,6 +1028,9 @@ def fused_moe_(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1058,6 +1070,9 @@ def fused_moe_(
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
         output=output,
+        quant_type_a=quant_type_a,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
     )
 
 
@@ -1089,6 +1104,9 @@ def _fused_moe_impl(
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1101,6 +1119,11 @@ def _fused_moe_impl(
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
     gate_mode = GateMode(gate_mode)
+    if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
+        raise NotImplementedError(
+            f"quant_type_a={QuantType(quant_type_a)!s} != quant_type={quant_type!s}: "
+            "mixed activation/weight quant granularity is not supported"
+        )
     if block_size_M == -1:
         block_size_M = None
     """user API"""
@@ -1150,7 +1173,9 @@ def _fused_moe_impl(
         has_a1_scale=a1_scale is not None,
     )
 
-    if _q_dtype_a is not None:
+    if quant_dtype_a is not None:
+        q_dtype_a = quant_dtype_a
+    elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
 
     grouped_a8w4_out = None
@@ -1256,6 +1281,7 @@ def _fused_moe_impl(
             and getattr(w2, "is_shuffled", False),
             config_file=_metadata_config_file,
             _disable_inline_sort=disable_inline_sort,
+            q_dtype_a2=quant_dtype_a2,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -2719,6 +2745,7 @@ def get_2stage_cfgs(
     opus_weights_shuffled=None,
     config_file=None,
     _disable_inline_sort=False,
+    q_dtype_a2=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -3141,6 +3168,21 @@ def get_2stage_cfgs(
     opus_stage2_launch = (
         _opus_a8w4.parse_stage2_config(cfg, block_m) if is_opus_cfg else None
     )
+
+    want_fp8_inter = (
+        q_dtype_a2 == dtypes.fp8
+        if q_dtype_a2 is not None
+        else os.environ.get("AITER_SITUV2_A4W4_FP8_INTER", "0") == "1"
+    )
+    if (
+        want_fp8_inter
+        and q_dtype_a == dtypes.fp4x2
+        and isinstance(kernelName2, str)
+        and kernelName2.startswith("flydsl_moe2_layout_afp4_")
+        and isinstance(kernelName1, str)
+        and kernelName1.startswith("flydsl_moe1_")
+    ):
+        kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
