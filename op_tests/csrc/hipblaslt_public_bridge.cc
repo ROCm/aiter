@@ -36,97 +36,81 @@ class PublicGemm
             throw std::invalid_argument("dimensions must be positive");
         }
 
-        CHECK_LT(hipblasLtCreate(&handle_));
-        CHECK_LT(hipblasLtMatrixLayoutCreate(&layout_a_, HIP_R_8F_E4M3, k, m, k));
-        CHECK_LT(hipblasLtMatrixLayoutCreate(&layout_b_, HIP_R_8F_E4M3, k, n, k));
-        CHECK_LT(hipblasLtMatrixLayoutCreate(&layout_d_, HIP_R_16BF, m, n, m));
-        CHECK_LT(hipblasLtMatmulDescCreate(&operation_, HIPBLAS_COMPUTE_32F, HIP_R_32F));
-
-        hipblasOperation_t trans_a = HIPBLAS_OP_T;
-        hipblasOperation_t trans_b = HIPBLAS_OP_N;
-        CHECK_LT(hipblasLtMatmulDescSetAttribute(
-            operation_, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
-        CHECK_LT(hipblasLtMatmulDescSetAttribute(
-            operation_, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
-
-        hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
-        CHECK_LT(hipblasLtMatmulDescSetAttribute(
-            operation_, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
-        CHECK_LT(hipblasLtMatmulDescSetAttribute(
-            operation_, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
-        CHECK_LT(hipblasLtMatmulDescGetAttribute(operation_,
-                                                 HIPBLASLT_MATMUL_DESC_A_SCALE_MODE,
-                                                 &scale_a_mode_,
-                                                 sizeof(scale_a_mode_),
-                                                 nullptr));
-        CHECK_LT(hipblasLtMatmulDescGetAttribute(operation_,
-                                                 HIPBLASLT_MATMUL_DESC_B_SCALE_MODE,
-                                                 &scale_b_mode_,
-                                                 sizeof(scale_b_mode_),
-                                                 nullptr));
-        if(scale_a_mode_ != scale_mode || scale_b_mode_ != scale_mode)
+        try
         {
-            throw std::runtime_error("hipBLASLt did not retain block-32 scale modes");
+            CHECK_LT(hipblasLtCreate(&handle_));
+            CHECK_LT(hipblasLtMatrixLayoutCreate(&layout_a_, HIP_R_8F_E4M3, k, m, k));
+            CHECK_LT(hipblasLtMatrixLayoutCreate(&layout_b_, HIP_R_8F_E4M3, k, n, k));
+            CHECK_LT(hipblasLtMatrixLayoutCreate(&layout_d_, HIP_R_16BF, m, n, m));
+            CHECK_LT(hipblasLtMatmulDescCreate(&operation_, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+
+            hipblasOperation_t trans_a = HIPBLAS_OP_T;
+            hipblasOperation_t trans_b = HIPBLAS_OP_N;
+            CHECK_LT(hipblasLtMatmulDescSetAttribute(
+                operation_, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
+            CHECK_LT(hipblasLtMatmulDescSetAttribute(
+                operation_, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
+
+            hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+            CHECK_LT(hipblasLtMatmulDescSetAttribute(
+                operation_, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+            CHECK_LT(hipblasLtMatmulDescSetAttribute(
+                operation_, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+            CHECK_LT(hipblasLtMatmulDescGetAttribute(operation_,
+                                                     HIPBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                                                     &scale_a_mode_,
+                                                     sizeof(scale_a_mode_),
+                                                     nullptr));
+            CHECK_LT(hipblasLtMatmulDescGetAttribute(operation_,
+                                                     HIPBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                                                     &scale_b_mode_,
+                                                     sizeof(scale_b_mode_),
+                                                     nullptr));
+            if(scale_a_mode_ != scale_mode || scale_b_mode_ != scale_mode)
+            {
+                throw std::runtime_error("hipBLASLt did not retain block-32 scale modes");
+            }
+
+            CHECK_LT(hipblasLtMatmulPreferenceCreate(&preference_));
+            constexpr std::uint64_t kMaxWorkspaceSize = 128ULL * 1024 * 1024;
+            CHECK_LT(
+                hipblasLtMatmulPreferenceSetAttribute(preference_,
+                                                      HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                      &kMaxWorkspaceSize,
+                                                      sizeof(kMaxWorkspaceSize)));
+
+            int returned_count = 0;
+            CHECK_LT(hipblasLtMatmulAlgoGetHeuristic(handle_,
+                                                     operation_,
+                                                     layout_a_,
+                                                     layout_b_,
+                                                     layout_d_,
+                                                     layout_d_,
+                                                     preference_,
+                                                     1,
+                                                     &heuristic_,
+                                                     &returned_count));
+            if(returned_count != 1)
+            {
+                throw std::runtime_error("hipBLASLt returned no heuristic solution");
+            }
+            CHECK_LT(heuristic_.state);
+
+            index_         = hipblaslt_ext::getIndexFromAlgo(heuristic_.algo);
+            solution_name_ = hipblaslt_ext::getSolutionNameFromAlgo(handle_, heuristic_.algo);
+            kernel_name_   = hipblaslt_ext::getKernelNameFromAlgo(handle_, heuristic_.algo);
         }
-
-        CHECK_LT(hipblasLtMatmulPreferenceCreate(&preference_));
-        constexpr std::uint64_t kMaxWorkspaceSize = 128ULL * 1024 * 1024;
-        CHECK_LT(hipblasLtMatmulPreferenceSetAttribute(preference_,
-                                                       HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                       &kMaxWorkspaceSize,
-                                                       sizeof(kMaxWorkspaceSize)));
-
-        int returned_count = 0;
-        CHECK_LT(hipblasLtMatmulAlgoGetHeuristic(handle_,
-                                                 operation_,
-                                                 layout_a_,
-                                                 layout_b_,
-                                                 layout_d_,
-                                                 layout_d_,
-                                                 preference_,
-                                                 1,
-                                                 &heuristic_,
-                                                 &returned_count));
-        if(returned_count != 1)
+        catch(...)
         {
-            throw std::runtime_error("hipBLASLt returned no heuristic solution");
+            Cleanup();
+            throw;
         }
-
-        index_         = hipblaslt_ext::getIndexFromAlgo(heuristic_.algo);
-        solution_name_ = hipblaslt_ext::getSolutionNameFromAlgo(handle_, heuristic_.algo);
-        kernel_name_   = hipblaslt_ext::getKernelNameFromAlgo(handle_, heuristic_.algo);
     }
 
     PublicGemm(const PublicGemm&)            = delete;
     PublicGemm& operator=(const PublicGemm&) = delete;
 
-    ~PublicGemm()
-    {
-        if(preference_ != nullptr)
-        {
-            (void)hipblasLtMatmulPreferenceDestroy(preference_);
-        }
-        if(operation_ != nullptr)
-        {
-            (void)hipblasLtMatmulDescDestroy(operation_);
-        }
-        if(layout_d_ != nullptr)
-        {
-            (void)hipblasLtMatrixLayoutDestroy(layout_d_);
-        }
-        if(layout_b_ != nullptr)
-        {
-            (void)hipblasLtMatrixLayoutDestroy(layout_b_);
-        }
-        if(layout_a_ != nullptr)
-        {
-            (void)hipblasLtMatrixLayoutDestroy(layout_a_);
-        }
-        if(handle_ != nullptr)
-        {
-            (void)hipblasLtDestroy(handle_);
-        }
-    }
+    ~PublicGemm() { Cleanup(); }
 
     int index() const { return index_; }
     const std::string& solution_name() const { return solution_name_; }
@@ -175,6 +159,40 @@ class PublicGemm
     }
 
     private:
+    void Cleanup() noexcept
+    {
+        if(preference_ != nullptr)
+        {
+            (void)hipblasLtMatmulPreferenceDestroy(preference_);
+            preference_ = nullptr;
+        }
+        if(operation_ != nullptr)
+        {
+            (void)hipblasLtMatmulDescDestroy(operation_);
+            operation_ = nullptr;
+        }
+        if(layout_d_ != nullptr)
+        {
+            (void)hipblasLtMatrixLayoutDestroy(layout_d_);
+            layout_d_ = nullptr;
+        }
+        if(layout_b_ != nullptr)
+        {
+            (void)hipblasLtMatrixLayoutDestroy(layout_b_);
+            layout_b_ = nullptr;
+        }
+        if(layout_a_ != nullptr)
+        {
+            (void)hipblasLtMatrixLayoutDestroy(layout_a_);
+            layout_a_ = nullptr;
+        }
+        if(handle_ != nullptr)
+        {
+            (void)hipblasLtDestroy(handle_);
+            handle_ = nullptr;
+        }
+    }
+
     int index_ = -1;
     std::string solution_name_;
     std::string kernel_name_;

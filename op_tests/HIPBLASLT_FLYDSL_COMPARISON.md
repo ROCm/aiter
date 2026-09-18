@@ -2,6 +2,11 @@
 
 Measured 2026-09-17 on the local gfx1250, 256-CU device.
 
+This is the historical hipBLASLt tuning snapshot. It predates the final
+row-major promotions for `512x7168x3072` and `512x2048x7168`; current
+production defaults and the final split-K=1 native ASM comparison are recorded
+in [GFX1250_FLYDSL_ASM_SCHED_ANALYSIS.md](GFX1250_FLYDSL_ASM_SCHED_ANALYSIS.md).
+
 ## Result
 
 The final comparison rebuilt the hipBLASLt host library and regenerated its
