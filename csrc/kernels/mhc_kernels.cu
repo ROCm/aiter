@@ -3558,9 +3558,12 @@ namespace aiter {
             constexpr bool use_bf16 = decltype(bf16_tag)::value;
             constexpr bool use_res_shuffle = decltype(shuffle_tag)::value;
             if constexpr (use_bf16 && use_res_shuffle) {
-                // Packed BF16 decode: direct stores and the single-barrier pipeline
-                // support both row tile sizes throughout the measured decode range.
+                // Use LDS/TDM for the selected mid-M decode interval; direct-store
+                // remains the default outside this range.
+                const bool use_tdm = (hidden_size == 4096 || hidden_size == 7168)
+                                     && m >= 512 && m <= 768;
                 if (WARP_SIZE == 32 && cu_num == 256 && m > 0 && m <= 1024
+                    && !use_tdm
                     && (hidden_size == 4096 || hidden_size == 7168)
                     && tile_n == 32 && tile_k == 32) {
                     if (tile_m == 16) {
