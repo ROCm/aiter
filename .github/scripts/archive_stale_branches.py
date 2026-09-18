@@ -9,8 +9,14 @@ the original ref. +30 days: comment giving notice. +14: delete the archive ref.
 print, ``git push origin archive/<date>/<name>:<name>``.
 
 No state is stored -- the archive date is in the ref name, the notice date is
-the notice comment's own -- so deleting that comment stops the deletion. That is
-the per-branch opt-out, and it needs no admin.
+the notice comment's own. When notice is given, the archiving comment is also
+marked to say so; a notice that is later missing therefore means someone removed
+it, and the archive is left alone. That is the per-branch opt-out, and it needs
+no admin.
+
+Restoring a branch puts it back at the same commit, which is still as old as it
+was, so it is archived again unless it gets a new commit or a line in the
+exemption list. Both comments say so.
 
 Never touched: protected branches, the head or base branch of an open pull
 request, and anything in .github/stale-branch-exemptions.txt, re-checked at
@@ -230,14 +236,22 @@ def pr_branches(api: Api) -> set[str]:
 
     Base too: an integration branch several PRs target has no PR of its own,
     and removing it retargets or closes all of them.
+
+    Heads only from this repository. A fork's PR names a branch in the fork,
+    and taking that name at face value would exempt an unrelated local branch
+    that happens to share it -- for as long as the fork's PR stays open. A
+    deleted fork leaves ``head.repo`` null.
     """
+    mine = f"{api.owner}/{api.name}".lower()
     names, page = set(), 1
     while True:
         batch = api.get(f"/pulls?state=open&per_page=100&page={page}")
         if not batch:
             return names
         for pull in batch:
-            names.add(pull["head"]["ref"])
+            head_repo = (pull["head"].get("repo") or {}).get("full_name") or ""
+            if head_repo.lower() == mine:
+                names.add(pull["head"]["ref"])
             names.add(pull["base"]["ref"])
         page += 1
 
@@ -281,7 +295,20 @@ def still_exempt(api: Api, name: str) -> str | None:
 
 
 def comments(api: Api, sha: str) -> list[dict]:
-    return api.get(f"/commits/{sha}/comments?per_page=100") or []
+    """Every comment on a commit, not the first hundred.
+
+    The markers are the only state this has, and this script adds one comment
+    per archived branch to tip commits that several stale branches can share.
+    Stopping at one page would make a marker past it invisible: notices would
+    be re-posted every week and the delete never reached.
+    """
+    out, page = [], 1
+    while True:
+        batch = api.get(f"/commits/{sha}/comments?per_page=100&page={page}") or []
+        if not batch:
+            return out
+        out.extend(batch)
+        page += 1
 
 
 def find_marker(api: Api, sha: str, marker: str, author: str) -> dict | None:
@@ -348,6 +375,9 @@ def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
                 f"`{target}`. Nothing is lost -- this commit is still here, and "
                 f"one command puts the branch back:\n\n"
                 f"```\ngit push origin {shlex.quote(target + ':' + name)}\n```\n\n"
+                f"That restores it at this same commit, which is as old as it was, "
+                f"so it will be archived again unless it gets a new commit or a "
+                f"line in `.github/stale-branch-exemptions.txt`.\n\n"
                 f"The archive copy is kept for a while and then removed, with a "
                 f"separate comment here giving notice first."
             )
@@ -365,7 +395,22 @@ def _finish_archive(api: Api, name: str, sha: str, target: str) -> str:
     return f"archived {name} -> {target}; original kept, it moved mid-run"
 
 
-def give_notice(api: Api, branch: dict, original: str, delete_on: dt.date) -> str:
+def give_notice(
+    api: Api, branch: dict, original: str, delete_on: dt.date, archived: dict
+) -> str:
+    """Post the notice, then record on the archiving comment that it was given.
+
+    The notice comment is the only thing the delete stage looks for, so its
+    absence has to mean one of two things and the script must be able to tell
+    which: never posted (post it), or posted and since removed by someone who
+    read it (leave the archive alone, for good). Without a record the two are
+    the same and a deleted notice just restarts the clock -- the opposite of
+    the opt-out the notice promises. The record goes on our own archiving
+    comment, which is also the provenance the delete stage already requires.
+
+    Notice first, record second: a failure between the two leaves a notice
+    with no record, and the next run finds the notice and proceeds normally.
+    """
     api.write(
         "POST",
         f"/commits/{branch['sha']}/comments",
@@ -374,10 +419,25 @@ def give_notice(api: Api, branch: dict, original: str, delete_on: dt.date) -> st
                 f"{marker('delete-notice', branch['name'])}\n"
                 f"`{branch['name']}` is due to be deleted on "
                 f"{delete_on.isoformat()}.\n\n"
-                f"To keep it, restore the branch:\n\n"
+                f"To keep the branch, restore it and then give it a commit, or "
+                f"add it to `.github/stale-branch-exemptions.txt`; restoring "
+                f"alone brings it back at this same commit, which is as old as "
+                f"it was, and it would be archived again:\n\n"
                 f"```\ngit push origin {shlex.quote(branch['name'] + ':' + original)}\n```\n\n"
-                f"To stop the clock without restoring anything, delete this "
-                f"comment -- the deletion only happens while it stands."
+                f"To keep only the archive copy, delete this comment -- the "
+                f"deletion happens only while it stands, and it is not re-posted."
+            )
+        },
+    )
+    body = (archived.get("body") or "").rstrip()
+    api.write(
+        "PATCH",
+        f"/comments/{archived['id']}",
+        {
+            "body": (
+                f"{body}\n\n{marker('noticed', branch['name'])}\n"
+                f"Deletion notice given, due {delete_on.isoformat()}; if that "
+                f"notice comment is gone, the deletion is off."
             )
         },
     )
@@ -446,10 +506,10 @@ def main() -> int:
         # naming this ref, is the provenance. Deleting that comment therefore
         # also opts a branch out, permanently.
         original = _ARCHIVED.match(name).group(2)
-        if (
-            find_marker(api, branch["sha"], marker("archived", name), args.bot_login)
-            is None
-        ):
+        archived = find_marker(
+            api, branch["sha"], marker("archived", name), args.bot_login
+        )
+        if archived is None:
             return None
         # Both names: the one it had, so a line added to the list later still
         # rescues it, and the one it has, which can itself end up protected or
@@ -466,10 +526,18 @@ def main() -> int:
         )
 
         if notice is None:
+            if marker("noticed", name) in (archived.get("body") or ""):
+                # Notice was given and is no longer there: someone removed it,
+                # as the notice itself says to. That ends it for this archive.
+                return None
             if (today - archived_on).days < args.archive_days:
                 return None
             return give_notice(
-                api, branch, original, today + dt.timedelta(days=args.notice_days)
+                api,
+                branch,
+                original,
+                today + dt.timedelta(days=args.notice_days),
+                archived,
             )
 
         if (now - _parse(notice["created_at"])).days < args.notice_days:
