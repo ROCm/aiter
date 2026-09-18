@@ -5352,11 +5352,11 @@ namespace aiter {
             // one per group changed nothing, so the cost is the store itself, not
             // its lanes.
             //
-            // Instead the run is handed to the single lane whose b128 slot already
-            // covers it (lane nope_vec, the first PE lane, whose slot is
-            // [nope_dim, nope_dim+vec_size_o)) and rides in the payload store. Only
-            // that lane's slot is added, so the write grows by the 2 pad bytes that
-            // round the 14-byte run up to the slot, and the sector takes one write.
+            // Scale carrier lanes gather the run into the payload store. The
+            // remaining slots carry zeros so one ordinary vector store covers
+            // the allocated output row, including padding. For D=512 and G=64
+            // this writes 512 bytes instead of 464, improving sector coverage.
+            // RoPE output is computed independently from work below.
             //
             // The gather goes through LDS rather than a lane permute: the run needs
             // kNopeGroups values from kNopeGroups different source lanes, which is
@@ -5374,15 +5374,15 @@ namespace aiter {
               for (int i = kNopeGroups; i < kCarrierPairs; i++) q_scale_lds[i] = 0;
             }
             __builtin_amdgcn_wave_barrier();
-            opus_vec_q vec_out;
+            // Zero the unused output slots so the payload store covers the row.
+            opus_vec_q vec_out{};
             if (is_nope_thr) {
               // work already carries rstd*inv_scale, so the fp8 cast is the store.
               vec_out = opus::cast<query_t>(work);
-            } else {
-              // Carrier lane k takes the k-th slot of the run; the PE lanes past
-              // the carriers read it too and are masked off by the store predicate.
-              const int32_t slot = static_cast<int32_t>(tid) - nope_vec;
-              const int32_t k = slot < kScaleCarrierSlots ? slot : 0;
+            } else if (tid < nope_vec + kScaleCarrierSlots) {
+              // The scale carriers gather their slots; the remaining PE lanes
+              // retain zeros for output padding, independently of RoPE work.
+              const int32_t k = static_cast<int32_t>(tid) - nope_vec;
               // memcpy, not a reinterpret_cast load. The publishes above are
               // uint16_t and this pickup is vec_size_o bytes wide, so a typed load
               // lets alias analysis decide the two do not overlap and reorder them
@@ -5399,7 +5399,7 @@ namespace aiter {
                                sizeof(vec_out));
             }
             __builtin_amdgcn_wave_barrier();
-            if (tid < nope_vec + kScaleCarrierSlots)
+            if (tid < head_size / vec_size_i)
               q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
           } else {
             if (is_nope_thr) {
