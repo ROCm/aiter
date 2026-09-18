@@ -11,6 +11,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk import topk_per_row_decode_adaptive as _adaptive
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
@@ -28,6 +29,33 @@ from ..kernels.topk.topk_per_row_decode_persistent import (
 # Measured crossover between the one-workgroup and multi-kernel paths.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
+
+# The gate's answer for this call. The arch, the k and the shape are all the
+# gate's decision; nothing here re-derives them.
+_BACKEND_ADAPTIVE = "adaptive"
+
+
+@lru_cache(maxsize=8)
+def _adaptive_cu_count(device_index: int) -> int:
+    """CU count of the device the row will run on, which one arch name spans
+    several of, so the kernel's grid tables cannot take it as a constant."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@lru_cache(maxsize=16)
+def _get_cached_adaptive_workspace(
+    device: torch.device, stream_id: int, slots: int
+) -> torch.Tensor:
+    return torch.zeros(slots, device=device, dtype=torch.int32)
+
+
+def _get_adaptive_workspace(
+    device: torch.device, stream_id: int, slots: int
+) -> torch.Tensor:
+    # Do not let graph-pool allocations escape through the process cache.
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(slots, device=device, dtype=torch.int32)
+    return _get_cached_adaptive_workspace(device, stream_id, slots)
 
 
 @lru_cache(maxsize=16)
@@ -360,6 +388,66 @@ def is_flydsl_top_k_per_row_decode_supported(
     )
 
 
+def _run_adaptive(
+    logits,
+    next_n,
+    seq_lens,
+    indices,
+    rows,
+    width,
+    stride0,
+    stride1,
+    k,
+    stable,
+    stream,
+):
+    """Launch the adaptive kernel for a shape the gate has already chosen it for.
+
+    The config takes the physical width, not a row's live length: `seq_lens` is
+    device-resident, so the length is not a host quantity. The kernel folds each
+    row onto as many of the launch's workgroups as its own length needs.
+    """
+    cfg = _adaptive.decode_adaptive_config(
+        rows,
+        width,
+        k,
+        ordered=stable,
+        cu_count=_adaptive_cu_count(logits.device.index),
+    )
+    kw = cfg["kw"]
+    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(top_k=k, **kw)
+    workspace = _get_adaptive_workspace(
+        logits.device,
+        stream.cuda_stream,
+        _adaptive.topk_workspace_slots(
+            rows,
+            11,
+            compact=cfg["compact"],
+            compact_cap=kw.get("compact_cap_mult", 16) * k,
+        ),
+    )
+    if _adaptive.needs_workspace_zero(
+        width,
+        k,
+        kw["tiered_short_max"],
+        tier_mode=kw.get("tier_mode", "auto"),
+        bits_per_pass=11,
+    ):
+        workspace.zero_()
+    _run_compiled(
+        launcher,
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        workspace,
+        rows,
+        stride0,
+        stride1,
+        stream,
+    )
+
+
 def flydsl_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -371,8 +459,13 @@ def flydsl_top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    backend: str | None = None,
 ) -> None:
-    """Write per-row TopK indices using each request's effective context length."""
+    """Write per-row TopK indices using each request's effective context length.
+
+    `backend` is the gate's answer; None asks the gate, so a caller arriving
+    here directly cannot be routed to a kernel the gate would not have picked.
+    """
 
     _validate_flydsl_topk_call(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
@@ -382,6 +475,39 @@ def flydsl_top_k_per_row_decode(
     arch = torch.cuda.get_device_properties(logits.device).gcnArchName
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
+
+    if backend is None:
+        from aiter.ops.topk import decode_backend_for_call
+
+        backend = decode_backend_for_call(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            rows,
+            stride0,
+            stride1,
+            k,
+            stable,
+            values,
+        )
+
+    if backend == _BACKEND_ADAPTIVE:
+        _run_adaptive(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            rows,
+            width,
+            stride0,
+            stride1,
+            k,
+            stable,
+            stream,
+        )
+        return
+
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k, wave_size=wave_size, write_values=values is not None

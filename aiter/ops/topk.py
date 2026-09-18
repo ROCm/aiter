@@ -513,26 +513,139 @@ _FLYDSL_TOPK_DECODE_GATES = {
 }
 _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
 
+# What the gate answers. `upstream` is "not ours", not a named kernel: the
+# dispatch below it picks the FlyDSL one-block port where that is enabled and
+# the C++ one-block kernel everywhere else, and which of the two runs differs
+# per arch.
+BACKEND_UPSTREAM = "upstream"
+BACKEND_CHUNKED = "chunked"
+BACKEND_ADAPTIVE = "adaptive"
 
-@functools.lru_cache(maxsize=128)
-def _flydsl_topk_decode_shape_supported(
-    arch: str,
-    stable: bool,
-    width: int,
-    num_rows: int,
-    k: int,
-) -> bool:
-    if k not in _FLYDSL_TOPK_DECODE_KS:
-        return False
+# Which shapes the adaptive kernel is the fastest of the four for, as
+# (minimum width, maximum width, minimum rows, maximum rows) per k and per emit,
+# all bounds inclusive and a maximum width of None meaning no upper bound. A row
+# minimum is not decoration: one row of a narrow buffer goes to the one-block HIP
+# kernel, which has no grid to fill there while this one pays for having a grid.
+#
+# Keyed by CU count as well as arch, because one arch name spans several and the
+# grid the measurements were taken against is built from that count. Anything
+# outside this table -- another CU count, a k with no row, a width past the
+# widest measured -- keeps the chunked gate above, so an unmeasured shape is
+# unchanged rather than guessed at, and measuring another card is an entry here
+# and nothing else. Every edge is read off a sweep of the whole grid against all
+# four decode kernels; the PR description holds the per-cell scores.
+_ADAPTIVE_BANDS_BY_K_GROUP = {
+    ("gfx942", 80): {
+        True: {
+            (256,): (
+                (4_096, 20_000, 128, 512),
+                (65_536, 65_536, 1, 4),
+                (131_072, 131_072, 1, 8),
+                (262_144, 262_144, 1, 16),
+                (524_288, 1_048_576, 1, 32),
+            ),
+            (512, 1024, 2048): (
+                (4_096, 4_096, 128, 512),
+                (8_192, 16_384, 64, 512),
+                (20_000, 20_000, 128, 512),
+                (65_536, 65_536, 1, 4),
+                (131_072, 262_144, 1, 16),
+                (524_288, 1_048_576, 1, 32),
+            ),
+            (4096,): (
+                (8_192, 20_000, 128, 512),
+                (32_768, 32_768, 1, 512),
+                (65_536, 65_536, 1, 32),
+                (131_072, 1_048_576, 1, 512),
+            ),
+        },
+        False: {
+            (256,): (
+                (4_096, 20_000, 128, 512),
+                (32_768, 32_768, 1, 2),
+                (65_536, 262_144, 1, 16),
+                (524_288, 1_048_576, 1, 32),
+            ),
+            (512, 1024, 2048): (
+                (4_096, 4_096, 128, 512),
+                (8_192, 8_192, 64, 512),
+                (16_384, 32_768, 128, 512),
+                (65_536, 131_072, 1, 16),
+                (262_144, 1_048_576, 1, 32),
+            ),
+            (4096,): (
+                (8_192, 20_000, 128, 512),
+                (32_768, 32_768, 1, 8),
+                (65_536, 65_536, 1, 16),
+                (131_072, 1_048_576, 1, 32),
+            ),
+        },
+    },
+}
+
+_ADAPTIVE_BANDS = {
+    device: {
+        stable: {k: bands for ks, bands in per_group.items() for k in ks}
+        for stable, per_group in per_emit.items()
+    }
+    for device, per_emit in _ADAPTIVE_BANDS_BY_K_GROUP.items()
+}
+
+
+def _in_bands(bands, width: int, num_rows: int) -> bool:
     return any(
         min_width <= width
         and (max_width is None or width <= max_width)
         and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
+        for min_width, max_width, max_rows in bands
     )
 
 
-def _should_use_flydsl_topk_decode(
+def _in_row_bands(bands, width: int, num_rows: int) -> bool:
+    return any(
+        min_width <= width
+        and (max_width is None or width <= max_width)
+        and min_rows <= num_rows <= max_rows
+        for min_width, max_width, min_rows, max_rows in bands
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _decode_backend(
+    arch: str,
+    cu_count: int,
+    stable: bool,
+    width: int,
+    num_rows: int,
+    k: int,
+    indices_only: bool,
+) -> str:
+    """Which of the four decode kernels is fastest for this shape.
+
+    Both entry points ask this one function rather than deciding again further
+    down, which is what keeps them from disagreeing.
+    """
+    if indices_only:  # the adaptive kernel does not emit values
+        per_k = _ADAPTIVE_BANDS.get((arch, cu_count), {}).get(stable, {})
+        if _in_row_bands(per_k.get(k, ()), width, num_rows):
+            return BACKEND_ADAPTIVE
+    if (
+        arch in _FLYDSL_TOPK_DECODE_GATES
+        and k in _FLYDSL_TOPK_DECODE_KS
+        and _in_bands(_FLYDSL_TOPK_DECODE_GATES[arch][stable], width, num_rows)
+    ):
+        return BACKEND_CHUNKED
+    return BACKEND_UPSTREAM
+
+
+@functools.lru_cache(maxsize=8)
+def _decode_cu_count(device_index: int) -> int:
+    """CU count of the device the rows will run on, which one arch name spans
+    several of, so the bands cannot be keyed by arch alone."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def decode_backend_for_call(
     logits: torch.Tensor,
     next_n: int,
     seq_lens: torch.Tensor,
@@ -543,30 +656,35 @@ def _should_use_flydsl_topk_decode(
     k: int,
     stable: bool,
     values: torch.Tensor | None = None,
-) -> bool:
+) -> str:
+    """The backend this call should run, shape rule and tensor contract together.
+
+    `topk_per_row.py` calls this for a caller that arrives there directly, so
+    the FlyDSL host never picks a kernel the gate did not pick.
+    """
     if (
         _FLYDSL_TOPK_DECODE_DISABLED
         or not isinstance(logits, torch.Tensor)
         or logits.ndim != 2
     ):
-        return False
+        return BACKEND_UPSTREAM
 
     arch = get_gfx()
-    if arch not in _FLYDSL_TOPK_DECODE_GATES:
-        return False
-
-    if not _flydsl_topk_decode_shape_supported(
+    backend = _decode_backend(
         arch,
+        _decode_cu_count(logits.device.index),
         stable,
         logits.shape[1],
         num_rows,
         k,
-    ):
-        return False
+        values is None,
+    )
+    if backend == BACKEND_UPSTREAM:
+        return BACKEND_UPSTREAM
 
     from .flydsl.topk.topk_per_row import is_flydsl_top_k_per_row_decode_supported
 
-    return is_flydsl_top_k_per_row_decode_supported(
+    supported = is_flydsl_top_k_per_row_decode_supported(
         logits,
         next_n,
         seq_lens,
@@ -577,6 +695,7 @@ def _should_use_flydsl_topk_decode(
         k,
         values,
     )
+    return backend if supported else BACKEND_UPSTREAM
 
 
 def _hip_top_k_per_row_decode(
@@ -632,7 +751,7 @@ def top_k_per_row_decode(
     index's logit is written alongside it. Rows shorter than k pad the index
     with -1 and the score with -inf, so the padding sorts below every real
     candidate and a consumer that ranks these scores needs no extra mask."""
-    if _should_use_flydsl_topk_decode(
+    backend = decode_backend_for_call(
         logits,
         next_n,
         seqLens,
@@ -643,7 +762,8 @@ def top_k_per_row_decode(
         k,
         stable,
         values,
-    ):
+    )
+    if backend != BACKEND_UPSTREAM:
         return flydsl_top_k_per_row_decode(
             logits,
             next_n,
@@ -655,6 +775,7 @@ def top_k_per_row_decode(
             k,
             stable,
             values,
+            backend=backend,
         )
 
     # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
@@ -832,6 +953,7 @@ def flydsl_top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    backend: str | None = None,
 ) -> None:
     """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
 
@@ -853,6 +975,7 @@ def flydsl_top_k_per_row_decode(
         k,
         stable,
         values,
+        backend,
     )
 
 
