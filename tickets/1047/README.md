@@ -531,7 +531,12 @@ win.
 of P) while V stays row-major ``[BN, D]``. copy_B wants ``(D, tokens)``
 with contiguous K; tokens are stride-D here (oracle ``err≈0.98``). A
 matching 64-bit P TV copy was ISA-neutral, added decode VGPR, and was
-reverted. Next is vectorizing P/C ``ds_write_b16``.
+reverted.
+
+**Do not retry** 128-bit C stores plus shuffle-pack 64-bit P stores.
+They matched the oracle but width-2051 ``L=512`` went 24.5 / 24.8 /
+637.3 us vs 24.0 / 24.1 / 588.6. Next is cutting the 7 per-tile
+barriers.
 
 
 

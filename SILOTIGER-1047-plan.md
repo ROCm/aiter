@@ -646,7 +646,13 @@ of P) on this row-major ``[BN, D]`` V layout. copy_B's tile is
 not a contiguous 64-bit B fragment (oracle ``err≈0.98``). A TV 64-bit
 P copy that matched the old four-element fragment compiled and
 matched the oracle but was ISA-neutral / slightly more VGPR on decode
-and was reverted. Next: vectorize leftover P/C ``ds_write_b16``.
+and was reverted.
+
+**Do not retry** widening leftover P/C LDS stores: 128-bit C fragment
+stores plus shuffle-pack 64-bit P stores (`lane_m % 4 == 0` after
+``shuffle_xor`` 1/2/3). Oracle ``err=0``, but width-2051 ``L=512``
+went to 24.5 / 24.8 / 637.3 us vs 24.0 / 24.1 / 588.6. Scalar P/C
+stores stay. Next: cut the 7 per-tile barriers.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
