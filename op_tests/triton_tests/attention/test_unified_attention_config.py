@@ -73,7 +73,9 @@ def _matched_key(params):
 # so the non-shuffled composites (BLOCK_M 64/128 at TILE 16) would be
 # re-launched at TILE 64 and blow the 64KB LDS at head 512. The SHUF axis
 # (added to the schema alongside these entries) keeps pre-shuffled prefill on
-# LDS-safe, separately tuned entries.
+# LDS-safe, separately tuned entries. All cases below run with
+# shuffled_kv_cache=True; the non-shuffled counterparts (which must NOT match
+# the SHUF entries) are the fp8 rows in _CASES above.
 _SHUF_CASES = [
     # shuffled fp8 prefill resolves to the SHUF-scoped entries
     (512, 16384, e4m3_dtype, "D_GEQ_512.Q_GEQ_1024.SHUF.DT_fp8_fp8", 32),
@@ -81,9 +83,6 @@ _SHUF_CASES = [
     # shuffled decode still resolves to the Q_LEQ_1 entries
     (512, 1, e4m3_dtype, "D_GEQ_512.Q_LEQ_1.DT_fp8_fp8", 16),
     (256, 1, e4m3_dtype, "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8", 16),
-    # non-shuffled must NOT match the SHUF entries
-    (512, 16384, e4m3_dtype, "D_GEQ_512.Q_GEQ_1024.DT_fp8_fp8", 128),
-    (256, 16384, e4m3_dtype, "D_GEQ_256.Q_GEQ_1024.DT_fp8_fp8", 64),
 ]
 
 
