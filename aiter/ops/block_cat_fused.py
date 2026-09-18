@@ -45,7 +45,9 @@ def _build_triton_fw_kernel():
         XBLOCK: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        xoffset = pid * XBLOCK
+        # int64 offsets: M * W12 can exceed 2^31, and int32 index math wraps
+        # into an out-of-bounds fault at that scale.
+        xoffset = pid.to(tl.int64) * XBLOCK
         xindex = xoffset + tl.arange(0, XBLOCK)
         xmask = xindex < xnumel
         row = xindex // W12
@@ -116,7 +118,8 @@ def _build_triton_kernel():
         XBLOCK: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        xoffset = pid * XBLOCK
+        # int64 offsets: see the forward kernel; guards against the 2^31 wrap.
+        xoffset = pid.to(tl.int64) * XBLOCK
         xindex = xoffset + tl.arange(0, XBLOCK)
         xmask = xindex < xnumel
         row = xindex // W12
@@ -249,8 +252,12 @@ def block_cat_fused_bw(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward kernel for block_cat_fused. Returns (grad_l12, grad_l4)."""
     if grad_cat.is_cuda and grad_cat.dtype in (torch.bfloat16, torch.float16):
-        grad_l12 = torch.empty_like(l12)
-        grad_l4 = torch.empty_like(l4)
+        # The kernel writes grad_l12/grad_l4 flat-contiguous (row * W + col), so
+        # the output tensors must be contiguous. empty_like keeps the input's
+        # strides, and a permuted (e.g. transposed) l12/l4 would then get the
+        # flat writes scattered under the wrong strides -> silently wrong grads.
+        grad_l12 = torch.empty_like(l12, memory_format=torch.contiguous_format)
+        grad_l4 = torch.empty_like(l4, memory_format=torch.contiguous_format)
         _launch_bw(
             grad_cat.contiguous(),
             l12.contiguous(),

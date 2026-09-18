@@ -85,6 +85,52 @@ class TestBlockCatFusedOp(unittest.TestCase):
         self.assertTrue(torch.allclose(l4.grad, g4_op, rtol=2e-2, atol=2e-2))
 
     @unittest.skipIf(not HAS_GPU, "GPU required")
+    def test_backward_random_grad_gpu_bf16(self):
+        # out.sum().backward() feeds an all-ones upstream grad, which cannot tell
+        # apart a kernel that drops the grad_cat factor. A random upstream grad
+        # does, so this compares the fused backward against eager autograd under
+        # a non-ones grad.
+        l12 = torch.randn(
+            64, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        l4 = torch.randn(
+            64, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        gout = torch.randn(64, 96, device="cuda", dtype=torch.bfloat16)
+        out = torch.ops.aiter.block_cat_fused(l12, l4, 0.01, 32)
+        out.backward(gout)
+        g12_op, g4_op = l12.grad.clone(), l4.grad.clone()
+        l12.grad = None
+        l4.grad = None
+        ref = _eager_block_cat(l12, l4, 0.01, 32)
+        ref.backward(gout)
+        self.assertTrue(torch.allclose(l12.grad, g12_op, rtol=2e-2, atol=2e-2))
+        self.assertTrue(torch.allclose(l4.grad, g4_op, rtol=2e-2, atol=2e-2))
+
+    @unittest.skipIf(not HAS_GPU, "GPU required")
+    def test_backward_noncontiguous_input_gpu_bf16(self):
+        # l4 handed in as a transpose view is dense but non-contiguous. The
+        # backward has to return grads matching eager autograd regardless of the
+        # input strides; allocating grad_l4 with empty_like keeps the transposed
+        # strides and the flat-contiguous kernel writes land under the wrong
+        # layout. Random upstream grad so a dropped factor is also caught.
+        l12 = torch.randn(
+            64, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        w = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        gout = torch.randn(64, 96, device="cuda", dtype=torch.bfloat16)
+        l4 = w.t()
+        out = torch.ops.aiter.block_cat_fused(l12, l4, 0.01, 32)
+        out.backward(gout)
+        g12_op, gw_op = l12.grad.clone(), w.grad.clone()
+        l12.grad = None
+        w.grad = None
+        ref = _eager_block_cat(l12, w.t(), 0.01, 32)
+        ref.backward(gout)
+        self.assertTrue(torch.allclose(l12.grad, g12_op, rtol=2e-2, atol=2e-2))
+        self.assertTrue(torch.allclose(w.grad, gw_op, rtol=2e-2, atol=2e-2))
+
+    @unittest.skipIf(not HAS_GPU, "GPU required")
     def test_forward_fp16_stores_in_input_dtype(self):
         # fp16 in must give fp16 out with no silent bf16 downcast. The kernel
         # computes in fp32 and stores in the input dtype, so the reference is
