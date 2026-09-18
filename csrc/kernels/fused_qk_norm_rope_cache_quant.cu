@@ -99,6 +99,15 @@ using mrope_utils::vec_t;
 // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
 static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
 
+// Per-wave LDS scratch the coarse Q path uses to gather a head's e8m0 scale run
+// into the one lane that carries it, so the inline scale rides in the same store
+// as the fp8 payload instead of a second, partial write to the same 128B sector
+// of the row. 32B per wave covers every supported group size: the run is one
+// duplicated pair per nope group, 14 bytes at Q_GROUP_SIZE=64 and 28 at 32, and
+// the slot is rewritten every head. Reserved by the launcher and addressed in the
+// kernel, so the two must agree -- it sits immediately after the Q-head TDM ring.
+static constexpr size_t kQScaleGatherBytes = 32;
+
 // HW-native fp8 e4m3 element dtype, selected by the compile target (same idiom as
 // quant_kernels.cu): gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn
 // (max_pos=448). Used as the MX dtype tag for the e8m0 block-scale helpers. Keyed on the
@@ -4796,7 +4805,8 @@ namespace aiter {
               bool is_neox,
               // --- compile-time layout/quant options ---
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0>
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0,
+              bool MERGE_Q_SCALE = false>
     __device__ void fuse_qk_norm_rope_group_quant_cache_kernel_impl(
         const scalar_t* __restrict__ q,       // [num_tokens, num_heads, head_dim]
         const scalar_t* __restrict__ kv,      // [num_tokens, (k_num_heads,) head_dim]
@@ -4972,6 +4982,43 @@ namespace aiter {
       static_assert(Q_REDUCE >= 1 && Q_REDUCE <= 64 && (Q_REDUCE & (Q_REDUCE - 1)) == 0,
                     "Q_REDUCE (Q_GROUP_SIZE/vec_size_i) must be a power of 2 in [1,64]");
 
+      // ---- Inline e8m0 run carried by the payload store (see the store below) ----
+      // Distinct group ids among the nope lanes -- NOT head_size/Q_GROUP_SIZE: the
+      // run only covers [0, nope_dim), and nope_dim need not be a multiple of the
+      // group size (448 against 128 is not), so the last group is partial and still
+      // owns one pair.
+      constexpr int32_t kNopeGroups =
+          (static_cast<int32_t>(nope_vec) + Q_REDUCE - 1) / Q_REDUCE;
+      constexpr int32_t kScaleRunBytes = 2 * kNopeGroups;
+      // Slots of the payload store the run spans, hence the carrier lanes:
+      // nope_vec .. nope_vec + kScaleCarrierSlots - 1, the first PE lanes.
+      constexpr int32_t kScaleCarrierSlots =
+          (kScaleRunBytes + vec_size_o - 1) / vec_size_o;
+      // Only where the run starts exactly on a store slot, the carrier lanes exist,
+      // and the LDS scratch the launcher reserved is big enough. That scratch lives
+      // in the coarse kernel's dynamic LDS, which only the TDM build allocates, so
+      // this is off wherever the ring is off.
+      constexpr bool kMergeQScaleStoreOk =
+#if defined(__gfx1250__)
+          Q_TDM_DEPTH > 0 && (nope_dim % vec_size_o) == 0
+          && (static_cast<int32_t>(nope_vec) + kScaleCarrierSlots) <= WARP_SIZE
+          && static_cast<size_t>(kScaleCarrierSlots) * vec_size_o <= kQScaleGatherBytes;
+#else
+          false;
+#endif
+      // ...and only on the tier the trade actually pays on, which is why
+      // MERGE_Q_SCALE is a template parameter and not a runtime flag. Merging
+      // replaces a store with an LDS round trip per head: a win once the store
+      // path sets the time (-3.9% at T=16384 H=128, the xlarge tier) and a loss
+      // while per-head latency does (+6% at T=512, where one generation of waves
+      // covers the whole launch and the saved store was never the limit).
+      //
+      // Selecting between them at RUNTIME costs the small shapes ~6% even with the
+      // branch never taken, because both forms are then present in the one kernel
+      // and T=512 is short enough to pay for the code it does not run. Choosing
+      // host-side gives each tier an instantiation carrying only its own store.
+      constexpr bool merge_q_scale_store = kMergeQScaleStoreOk && MERGE_Q_SCALE;
+
       // q_weight is loaded once per Q head (same across all heads since the weight is shared).
       // We could hoist this out of the head loop, but the cost is negligible (1 load / 16B / thread).
       opus_vec_i vec_q_weight;
@@ -5011,6 +5058,9 @@ namespace aiter {
       // a scalar instruction and its in-flight data sits in LDS, not VGPRs, so the
       // register pressure is nearly unchanged.
       [[maybe_unused]] __UINTPTR_TYPE__ q_lds_addr = 0;
+      // Per-wave scratch for the e8m0 scale gather, immediately after the TDM
+      // ring. Sized and reserved by the launcher (kQScaleGatherBytes).
+      [[maybe_unused]] uint16_t* q_scale_lds = nullptr;
 #if defined(__gfx1250__)
       extern __shared__ char fqk_coarse_lds[];
       if constexpr (Q_TDM_DEPTH > 0) {
@@ -5018,6 +5068,13 @@ namespace aiter {
         q_lds_addr = reinterpret_cast<__UINTPTR_TYPE__>(fqk_coarse_lds)
                    + static_cast<__UINTPTR_TYPE__>(wave_in_blk * Q_TDM_DEPTH * head_size)
                      * sizeof(scalar_t);
+        if constexpr (MERGE_Q_SCALE) {
+          q_scale_lds = reinterpret_cast<uint16_t*>(
+              fqk_coarse_lds
+              + static_cast<size_t>(TOKENS_PER_BLOCK) * Q_TDM_DEPTH * head_size
+                * sizeof(scalar_t)
+              + static_cast<size_t>(wave_in_blk) * kQScaleGatherBytes);
+        }
       }
       using QTdmWin = opus::tdm<scalar_t, opus::seq<head_size, 1>>;
       // ONE window for the whole head loop, walked with move(), instead of a fresh
@@ -5280,18 +5337,81 @@ namespace aiter {
             work[i] = v;
           }
           query_t* q_out_head = q_out + q_out_off;
-          if (is_nope_thr) {
-            {
-              const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
-              auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
-              const uint16_t scale_pair =
-                  static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
-              *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
+          const uint16_t scale_pair =
+              static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
+          auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
+          if constexpr (merge_q_scale_store) {
+            // ONE store per head instead of two.
+            //
+            // The row is nope fp8 in [0, nope_dim) plus the duplicated e8m0 run in
+            // [nope_dim, nope_dim + 2*kNopeGroups). Written as two stores those are
+            // a full b128 per nope lane and a separate b16, and the b16 lands in the
+            // SAME 128B sector as the payload's last lanes -- a second partial write
+            // to a sector already being written, which measured at 7.1% of the
+            // kernel for 14 bytes of data. Cutting the lane count on that store to
+            // one per group changed nothing, so the cost is the store itself, not
+            // its lanes.
+            //
+            // Instead the run is handed to the single lane whose b128 slot already
+            // covers it (lane nope_vec, the first PE lane, whose slot is
+            // [nope_dim, nope_dim+vec_size_o)) and rides in the payload store. Only
+            // that lane's slot is added, so the write grows by the 2 pad bytes that
+            // round the 14-byte run up to the slot, and the sector takes one write.
+            //
+            // The gather goes through LDS rather than a lane permute: the run needs
+            // kNopeGroups values from kNopeGroups different source lanes, which is
+            // one ds_store_b16 plus one ds_load_b128 here against ~7 permutes plus
+            // the packing. LDS ops from one wave are ordered, so the carrier lane
+            // sees this head's run, and the slot is rewritten every head.
+            if (is_nope_thr && (tid % Q_REDUCE) == 0)
+              q_scale_lds[tid / Q_REDUCE] = scale_pair;
+            // The carrier slots are vec_size_o bytes each and the run is only
+            // kScaleRunBytes of that, so define the tail: those bytes are pad in
+            // the row and must not be stored uninitialised.
+            constexpr int32_t kCarrierPairs = kScaleCarrierSlots * vec_size_o / 2;
+            if (tid == 0) {
+              #pragma unroll
+              for (int i = kNopeGroups; i < kCarrierPairs; i++) q_scale_lds[i] = 0;
             }
-            // work already carries rstd*inv_scale, so the fp8 cast is the whole store.
-            opus_vec_q vec_out = opus::cast<query_t>(work);
-            auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
-            q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+            __builtin_amdgcn_wave_barrier();
+            opus_vec_q vec_out;
+            if (is_nope_thr) {
+              // work already carries rstd*inv_scale, so the fp8 cast is the store.
+              vec_out = opus::cast<query_t>(work);
+            } else {
+              // Carrier lane k takes the k-th slot of the run; the PE lanes past
+              // the carriers read it too and are masked off by the store predicate.
+              const int32_t slot = static_cast<int32_t>(tid) - nope_vec;
+              const int32_t k = slot < kScaleCarrierSlots ? slot : 0;
+              // memcpy, not a reinterpret_cast load. The publishes above are
+              // uint16_t and this pickup is vec_size_o bytes wide, so a typed load
+              // lets alias analysis decide the two do not overlap and reorder them
+              // -- including hoisting the NEXT head's publish above this head's
+              // pickup. That reproduced as one wrong e8m0 byte in 29,360,128 at
+              // Q_GROUP_SIZE=32, where the run spans two carrier slots. Going
+              // through char keeps the dependency visible while still lowering to
+              // one ds_read of the slot width. `volatile` also orders it, but it
+              // serialises against the TDM ring's LDS traffic and measured 1.6x
+              // slower than the two-store form it was meant to beat.
+              __builtin_memcpy(&vec_out,
+                               reinterpret_cast<const char*>(
+                                   q_scale_lds + k * (vec_size_o / 2)),
+                               sizeof(vec_out));
+            }
+            __builtin_amdgcn_wave_barrier();
+            if (tid < nope_vec + kScaleCarrierSlots)
+              q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+          } else {
+            if (is_nope_thr) {
+              {
+                const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
+                auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
+                *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
+              }
+              // work already carries rstd*inv_scale, so the fp8 cast is the store.
+              opus_vec_q vec_out = opus::cast<query_t>(work);
+              q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+            }
           }
           if (is_pe_thread) {
             // Rope straight into the bf16 store rather than back into `work`. The
@@ -5905,7 +6025,8 @@ namespace aiter {
     // TOKENS_PER_BLOCK=1: single-wave (decode/small prefill), TOKENS_PER_BLOCK>1: multi-wave
     template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt,
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0>
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0,
+              bool MERGE_Q_SCALE = false>
     __global__ __launch_bounds__(TOKENS_PER_BLOCK * 64, 512 / (TOKENS_PER_BLOCK * 64))
     // PARAMETER ORDER IS PERFORMANCE-CRITICAL, do not regroup for readability.
     //
@@ -5952,7 +6073,8 @@ namespace aiter {
     ) {
       #define DISPATCH_NEOX(NEOX) \
         fuse_qk_norm_rope_group_quant_cache_kernel_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, \
-            Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, TOKENS_PER_BLOCK, Q_TDM_DEPTH>( \
+            Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, TOKENS_PER_BLOCK, Q_TDM_DEPTH, \
+            MERGE_Q_SCALE>( \
             q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, q_rope_out, positions, \
             cos_cache, sin_cache, eps, params, \
             swa_nope, swa_rope, swa_block_tables, swa_dest_row, batch_id_per_token)
@@ -5967,7 +6089,8 @@ namespace aiter {
 // Unified macro for the coarse fused QK norm + RoPE + group quant + cache kernel.
 // Requires in scope at the call site:
 //   template args  head_dim_val, tokens_per_block_val, q_group_size_val,
-//                  q_scale_fp32_val, has_q_weight_val, q_tdm_depth_val
+//                  q_scale_fp32_val, has_q_weight_val, q_tdm_depth_val,
+//                  merge_q_scale_val
 //   launch config  grid, block, coarse_lds_bytes, stream
 //   kernel args    mla_params, eps, is_neox, and the tensors q, kv, k_rope_buff,
 //                  k_weight, k_nope_scale_buff, q_nope_scale_buff, positions,
@@ -5980,7 +6103,7 @@ namespace aiter {
 #define CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
          aiter::fuse_qk_norm_rope_group_quant_cache_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, \
                  q_group_size_val, q_scale_fp32_val, has_q_weight_val, head_dim_val, tokens_per_block_val, \
-                 q_tdm_depth_val> \
+                 q_tdm_depth_val, merge_q_scale_val> \
                <<<grid, block, coarse_lds_bytes, stream>>>(                                                             \
                  mla_params,                                                                             \
                  static_cast<float>(eps),                                                                \
@@ -6448,17 +6571,25 @@ void fused_qk_norm_rope_group_quant(
     constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
     constexpr bool q_scale_fp32_val  = decltype(scale_fp32_tag)::value;
     constexpr bool has_q_weight_val  = decltype(has_qw_tag)::value;
-    auto launch_coarse = [&](auto tokens_per_block_tag, auto q_tdm_depth_tag) {
+    auto launch_coarse = [&](auto tokens_per_block_tag, auto q_tdm_depth_tag,
+                             auto merge_q_scale_tag) {
       constexpr int tokens_per_block_val = decltype(tokens_per_block_tag)::value;
       constexpr int q_tdm_depth_val      = decltype(q_tdm_depth_tag)::value;
+      constexpr bool merge_q_scale_val   = decltype(merge_q_scale_tag)::value;
       // Element size must track scalar_t, not a fixed 2 bytes. The kernel indexes
       // the ring as `wave_in_blk * Q_TDM_DEPTH * head_size * sizeof(scalar_t)`,
       // and the dispatch below instantiates scalar_t = float when kv is fp32, so a
       // hard-coded uint16_t under-allocates by 2x and puts the last wave's slots
       // outside the allocation. scalar_t is KV_T, which comes from kv.dtype().
+      // The per-wave e8m0 gather scratch sits right after the ring, so it is only
+      // reserved for the instantiation that uses it. The kernel derives the same
+      // offset, so the two must stay in step.
       const size_t coarse_lds_bytes =
           static_cast<size_t>(tokens_per_block_val) * q_tdm_depth_val
-          * head_dim_val * kv.element_size();
+              * head_dim_val * kv.element_size()
+          + (merge_q_scale_val
+                 ? static_cast<size_t>(tokens_per_block_val) * kQScaleGatherBytes
+                 : 0);
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val,
                 1 + num_q_waves);
       dim3 block(tokens_per_block_val * warp_size);
@@ -6466,13 +6597,21 @@ void fused_qk_norm_rope_group_quant(
           kv.dtype(), kv_cache_dtype, q_out_type,
           CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE);
     };
-    auto launch_coarse_for_arch = [&](auto tokens_per_block_tag) {
+    // merge_scale: carry the Q e8m0 run in the payload store instead of issuing a
+    // second, partial write to the same sector. Compile-time, not a runtime flag:
+    // the two store forms cannot share one instantiation without the small shapes
+    // paying ~6% for code they never run (see MERGE_Q_SCALE in the kernel). Only
+    // the xlarge tier takes it -- below that, per-head latency rather than the
+    // store path sets the time and the LDS round trip it costs is a loss.
+    auto launch_coarse_for_arch = [&](auto tokens_per_block_tag, auto merge_scale_tag) {
       if (has_tdm) {
         launch_coarse(
             tokens_per_block_tag,
-            std::integral_constant<int, kCoarseQTdmDepth>{});
+            std::integral_constant<int, kCoarseQTdmDepth>{},
+            merge_scale_tag);
       } else {
-        launch_coarse(tokens_per_block_tag, std::integral_constant<int, 0>{});
+        launch_coarse(tokens_per_block_tag, std::integral_constant<int, 0>{},
+                      std::false_type{});
       }
     };
     if (use_finegrained) {
@@ -6550,10 +6689,13 @@ void fused_qk_norm_rope_group_quant(
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_FINEGRAINED);
     } else if (use_decode_path) {
-      launch_coarse_for_arch(std::integral_constant<int, 1>{});
+      launch_coarse_for_arch(std::integral_constant<int, 1>{}, std::false_type{});
+    } else if (use_xlarge_prefill) {
+      launch_coarse_for_arch(
+          std::integral_constant<int, PREFILL_TOKENS_PER_BLOCK>{}, std::true_type{});
     } else {
       launch_coarse_for_arch(
-          std::integral_constant<int, PREFILL_TOKENS_PER_BLOCK>{});
+          std::integral_constant<int, PREFILL_TOKENS_PER_BLOCK>{}, std::false_type{});
     }
   };
 
