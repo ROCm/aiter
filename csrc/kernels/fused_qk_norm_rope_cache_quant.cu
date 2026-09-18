@@ -4768,9 +4768,12 @@ namespace aiter {
           for (int i = 0; i < vec_size_i; i++) {
             float my_val   = k_normed[i];
             float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
-            float rot = is_x_half
-                            ? (my_val * pe_cos[i] - pair_val * pe_sin[i])
-                            : (my_val * pe_cos[i] + pair_val * pe_sin[i]);
+            // Explicit fma for the same reason as the GPT-J branch below: under
+            // SWA this is stored twice, and a rematerialised copy that contracts
+            // the other product differs by one f32 ulp.
+            const float pv = pair_val * pe_sin[i];
+            float rot = is_x_half ? __builtin_fmaf(my_val, pe_cos[i], -pv)
+                                  : __builtin_fmaf(my_val, pe_cos[i], pv);
             const rope_t rot_s = static_cast<rope_t>(rot);
             k_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
             if constexpr (HAS_SWA) {
@@ -4786,8 +4789,22 @@ namespace aiter {
             float fky = k_normed[i + 1];
             float f32_cos = pe_cos[i >> 1];
             float f32_sin = pe_sin[i >> 1];
-            const rope_t r0 = static_cast<rope_t>(fkx * f32_cos - fky * f32_sin);
-            const rope_t r1 = static_cast<rope_t>(fky * f32_cos + fkx * f32_sin);
+            // Under SWA these two values are each stored to two destinations, and
+            // the pool and the main output were observed to disagree by one bf16
+            // code on exactly one element of 131072 at T=1024 H=16 and H=32. The
+            // f32 result there is -0.4736328125, which is the exact tie between
+            // bf16 0xbef2 and 0xbef3, so anything that perturbs it by one f32 ulp
+            // before the convert flips one destination and not the other.
+            //
+            // Spelling the fma explicitly was NOT enough on its own -- the values
+            // did not move -- so the empty asm is what actually pins it: it makes
+            // each result a value the compiler has to materialise once and forbids
+            // recomputing it for the second store. Costs no instruction.
+            float rot0 = __builtin_fmaf(fkx, f32_cos, -(fky * f32_sin));
+            float rot1 = __builtin_fmaf(fky, f32_cos, fkx * f32_sin);
+            asm("" : "+v"(rot0), "+v"(rot1));
+            const rope_t r0 = static_cast<rope_t>(rot0);
+            const rope_t r1 = static_cast<rope_t>(rot1);
             k_out_rope[pe_local_tid * vec_size_i + i]     = r0;
             k_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
             if constexpr (HAS_SWA) {
@@ -5795,8 +5812,11 @@ namespace aiter {
             for (int i = 0; i < vec_size_i; i++) {
               float my_val = k_normed[i];
               float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
-              float rot = is_x_half ? (my_val * kc[i] - pair_val * ks[i])
-                                    : (my_val * kc[i] + pair_val * ks[i]);
+              // Explicit fma: vrot feeds two stores under SWA, and a
+              // rematerialised copy is free to contract the other product.
+              const float pv = pair_val * ks[i];
+              float rot = is_x_half ? __builtin_fmaf(my_val, kc[i], -pv)
+                                    : __builtin_fmaf(my_val, kc[i], pv);
               vrot[i] = static_cast<scalar_t>(rot);
             }
             *reinterpret_cast<opus_vec_i*>(&k_out_rope[pe_local_tid * vec_size_i]) = vrot;
@@ -5820,8 +5840,12 @@ namespace aiter {
               float fky = k_normed[i + 1];
               const float f32_cos = kc[i >> 1];
               const float f32_sin = ks[i >> 1];
-              vrot[i]     = static_cast<scalar_t>(fkx * f32_cos - fky * f32_sin);
-              vrot[i + 1] = static_cast<scalar_t>(fky * f32_cos + fkx * f32_sin);
+              // Explicit fma: vrot feeds two stores under SWA, and a
+              // rematerialised copy is free to contract the other product.
+              vrot[i] =
+                  static_cast<scalar_t>(__builtin_fmaf(fkx, f32_cos, -(fky * f32_sin)));
+              vrot[i + 1] =
+                  static_cast<scalar_t>(__builtin_fmaf(fky, f32_cos, fkx * f32_sin));
             }
             *reinterpret_cast<opus_vec_i*>(&k_out_rope[pe_local_tid * vec_size_i]) = vrot;
             // k_out_rope is safe to vectorise: its row stride is the kernel's own
