@@ -223,7 +223,6 @@ def build_qsa_k2_family_a_module(
         col_end = (col_end_unclamped < n_sel).select(col_end_unclamped, n_sel)
 
         # Load the Q fragments once and carry them in registers for every tile.
-        qh = lane_m
         q_live = lane_m < Int32(_GROUP)
         q_head = kv_h * Int32(_GROUP) + lane_m
         safe_q_head = q_live.select(q_head, kv_h * Int32(_GROUP))
@@ -459,16 +458,15 @@ def build_qsa_k2_family_a_module(
                         out[row, head, d] = value.to(BFloat16)
                     else:
                         partial_out[split, row, head, d] = value
-        if n_splits > 1:
-            if tid < Int32(_GROUP):
-                head = kv_h * Int32(_GROUP) + tid
-                den = l_final[tid]
-                has = den > Float32(0.0)
-                lse = has.select(
-                    m_final[tid] + fxmath.log(den) * Float32(_LOG2E),
-                    Float32(_LSE_EMPTY),
-                )
-                partial_lse[split, row, head] = lse
+        if n_splits > 1 and tid < Int32(_GROUP):
+            head = kv_h * Int32(_GROUP) + tid
+            den = l_final[tid]
+            has = den > Float32(0.0)
+            lse = has.select(
+                m_final[tid] + fxmath.log(den) * Float32(_LOG2E),
+                Float32(_LSE_EMPTY),
+            )
+            partial_lse[split, row, head] = lse
 
     @flyc.kernel(
         name="qsa_k2_family_a_port_merge_"
