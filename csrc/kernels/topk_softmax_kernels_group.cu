@@ -1371,19 +1371,19 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 #define LAUNCH_KERNEL()                                                        \
     LAUNCHER_TOPK_REG()                                                        \
     switch(num_experts % 4)                                                    \
-    {                                                      \
-    case 0:                                                \
-        using vec4_type = opus::vector_t<float, 4>; \
-        LAUNCHER2(vec4_type)                               \
-        break;                                             \
-    case 2:                                                \
-        using vec2_type = opus::vector_t<float, 2>; \
-        LAUNCHER2(vec2_type)                               \
-        break;                                             \
-    default:                                               \
-        using vec1_type = opus::vector_t<float, 1>; \
-        LAUNCHER2(vec1_type)                               \
-        break;                                             \
+    {                                                                          \
+    case 0:                                                                    \
+        using vec4_type = opus::vector_t<float, 4>;                            \
+        LAUNCHER2(vec4_type)                                                   \
+        break;                                                                 \
+    case 2:                                                                    \
+        using vec2_type = opus::vector_t<float, 2>;                            \
+        LAUNCHER2(vec2_type)                                                   \
+        break;                                                                 \
+    default:                                                                   \
+        using vec1_type = opus::vector_t<float, 1>;                            \
+        LAUNCHER2(vec1_type)                                                   \
+        break;                                                                 \
     }
 /* Register-resident path. Gates:
  * - no group filter: topk_grp == num_expert_group
@@ -1392,62 +1392,62 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
  * - experts-per-lane in [1, 32], avoid VGPR spilling
  * - topk in [AITER_TOPK_REG_MIN_TOPK, 32]
  */
-#define LAUNCHER_TOPK_REG()                                                    \
-    {                                                                          \
-        constexpr int kMaxExpertsPerLane = 32;                                 \
-        const int reg_lanes        = static_cast<int>(get_warp_size_func());   \
-        const int experts_per_lane = reg_lanes > 0 ? num_experts / reg_lanes : 0; \
-        if(topk_grp == num_expert_group &&                                     \
-           reg_lanes == 64 &&                                                  \
-           (num_experts % reg_lanes) == 0 &&                                   \
-           experts_per_lane >= 1 &&                                            \
-           experts_per_lane <= kMaxExpertsPerLane &&                           \
-           topk <= reg_lanes / 2 &&                                            \
-           topk >= AITER_TOPK_REG_MIN_TOPK)                                    \
-        {                                                                      \
-            const size_t shared_mem_size = num_experts * sizeof(float) +       \
-                                           reg_lanes * sizeof(float) +         \
-                                           2 * reg_lanes * sizeof(int);        \
-            opus::static_for<kMaxExpertsPerLane>([&](auto i) {                 \
-                constexpr int epl = i.value + 1;                               \
-                if(experts_per_lane != epl)                                    \
-                    return;                                                    \
-                if constexpr(isBiased)                                         \
-                {                                                              \
-                    if(need_renorm)                                            \
-                    {                                                          \
-                        LAUNCHER_topk_reg_kernel(epl, true, true, false)       \
-                    }                                                          \
-                    else                                                       \
-                    {                                                          \
-                        LAUNCHER_topk_reg_kernel(epl, false, true, false)      \
-                    }                                                          \
-                }                                                              \
-                else if(isSoftmax)                                             \
-                {                                                              \
-                    if(need_renorm)                                            \
-                    {                                                          \
-                        LAUNCHER_topk_reg_kernel(epl, true, false, true)       \
-                    }                                                          \
-                    else                                                       \
-                    {                                                          \
-                        LAUNCHER_topk_reg_kernel(epl, false, false, true)      \
-                    }                                                          \
-                }                                                              \
-                else                                                           \
-                {                                                              \
-                    if(need_renorm)                                            \
-                    {                                                          \
-                        LAUNCHER_topk_reg_kernel(epl, true, false, false)      \
-                    }                                                          \
-                    else                                                       \
-                    {                                                          \
-                        LAUNCHER_topk_reg_kernel(epl, false, false, false)     \
-                    }                                                          \
-                }                                                              \
-            });                                                                \
-            return;                                                            \
-        }                                                                      \
+#define LAUNCHER_TOPK_REG()                                                          \
+    {                                                                                \
+        constexpr int kMaxExpertsPerLane = 32;                                       \
+        const int reg_lanes        = static_cast<int>(get_warp_size_func());         \
+        const int experts_per_lane = reg_lanes > 0 ? num_experts / reg_lanes : 0;    \
+        if(topk_grp == num_expert_group &&                                           \
+           reg_lanes == 64 &&                                                        \
+           (num_experts % reg_lanes) == 0 &&                                         \
+           experts_per_lane >= 1 &&                                                  \
+           experts_per_lane <= kMaxExpertsPerLane &&                                 \
+           topk <= reg_lanes / 2 &&                                                  \
+           topk >= AITER_TOPK_REG_MIN_TOPK)                                          \
+        {                                                                            \
+            const size_t shared_mem_size = num_experts * sizeof(float) +             \
+                                           reg_lanes * sizeof(float) +               \
+                                           2 * reg_lanes * sizeof(int);              \
+            opus::static_for<kMaxExpertsPerLane>([&](auto i) {                       \
+                constexpr int epl = i.value + 1;                                     \
+                if(experts_per_lane != epl)                                          \
+                    return;                                                          \
+                if constexpr(isBiased)                                               \
+                {                                                                    \
+                    if(need_renorm)                                                  \
+                    {                                                                \
+                        LAUNCHER_topk_reg_kernel(epl, true, true, false)             \
+                    }                                                                \
+                    else                                                             \
+                    {                                                                \
+                        LAUNCHER_topk_reg_kernel(epl, false, true, false)            \
+                    }                                                                \
+                }                                                                    \
+                else if(isSoftmax)                                                   \
+                {                                                                    \
+                    if(need_renorm)                                                  \
+                    {                                                                \
+                        LAUNCHER_topk_reg_kernel(epl, true, false, true)             \
+                    }                                                                \
+                    else                                                             \
+                    {                                                                \
+                        LAUNCHER_topk_reg_kernel(epl, false, false, true)            \
+                    }                                                                \
+                }                                                                    \
+                else                                                                 \
+                {                                                                    \
+                    if(need_renorm)                                                  \
+                    {                                                                \
+                        LAUNCHER_topk_reg_kernel(epl, true, false, false)            \
+                    }                                                                \
+                    else                                                             \
+                    {                                                                \
+                        LAUNCHER_topk_reg_kernel(epl, false, false, false)           \
+                    }                                                                \
+                }                                                                    \
+            });                                                                      \
+            return;                                                                  \
+        }                                                                            \
     }
 
 #define LAUNCHER2(VEC_F)                                                                    \
@@ -1561,8 +1561,8 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                                routed_scaling_factor);                            \
         });
 
-#define LAUNCHER_topk_reg_kernel(EPL, need_renorm, isBiased, isSoftmax)                             \
-    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "topk_reg_kernel", [&] {            \
+#define LAUNCHER_topk_reg_kernel(EPL, need_renorm, isBiased, isSoftmax)                            \
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "topk_reg_kernel", [&] {           \
         hipLaunchKernelGGL((aiter::topk_reg_kernel<scalar_t,                                       \
                                                    EPL,                                            \
                                                    need_renorm,                                    \
