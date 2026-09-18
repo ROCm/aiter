@@ -412,6 +412,16 @@ MHA_FWD_SEARCH_STRATEGIES = ("exhaustive", "smoke")
 # first.
 MHA_FWD_SIGNIFICANCE_SIGMA = 2.0
 
+# The indifference zone the race uses, as a fraction of the leader's latency.
+# This is a reproducibility threshold rather than a taste parameter: an
+# unchanged configuration moves by roughly this much between sessions on this
+# hardware, so resolving differences below it would be resolving differences
+# that do not survive to the next run. Under the race strategy it is also the
+# bar a challenger must clear to displace the incumbent, because a shrinking
+# standard-error test and a fixed indifference zone disagree about what a tie
+# is, and running both would let one promote what the other called settled.
+MHA_FWD_INDIFFERENCE_DELTA = 0.02
+
 # How many configurations the smoke strategy keeps per dict-config backend.
 # Small enough that a full run finishes in minutes, large enough that the
 # winner is still chosen between genuinely different tile shapes.
