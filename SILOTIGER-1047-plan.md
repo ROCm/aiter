@@ -779,6 +779,12 @@ instead of ``scf.for``). ``err=0``; width-2051 ``L=512`` was 18.6 /
 21.2 / 513.0 us vs the kept 18.5 / 21.1 / 516.2. Decode is flat; prefill
 does not launch merge. Keep the runtime split loop.
 
+**Do not retry** a 256-thread LSE merge (one ``D`` lane per thread,
+drop the ``di`` loop). ``err=0``; width-2051 ``L=512`` was 18.6 /
+21.3 / 513.6 us vs the kept 18.5 / 21.1 / 516.2. Decode is slightly
+worse; prefill does not launch merge. Keep two waves and two ``D``
+lanes per thread.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

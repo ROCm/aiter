@@ -659,6 +659,11 @@ width-2051 ``L=512`` is 18.5 / 21.1 / 516.2 us vs 19.8 / 22.7 / 513.5
 ``L=512`` was 18.6 / 21.2 / 513.0 us vs 18.5 / 21.1 / 516.2. Decode is
 flat; prefill does not launch merge. Keep the runtime split loop.
 
+**Do not retry** a 256-thread LSE merge (one ``D`` lane per thread).
+``err=0``; width-2051 ``L=512`` was 18.6 / 21.3 / 513.6 us vs 18.5 /
+21.1 / 516.2. Decode is slightly worse; prefill does not launch merge.
+Keep two waves and two ``D`` lanes per thread.
+
 
 
 
