@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import dataclasses
 import os
 import statistics
 from dataclasses import MISSING, dataclass, fields
@@ -109,7 +110,7 @@ def _cleanup_distributed():
     dist.destroy_process_group()
 
 
-def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
+def _make_stage2_case(args, rank: int, device, *, accumulate: bool, sorted_inter: bool):
     token = torch.arange(args.token, dtype=torch.int64, device=device)[:, None]
     slot = torch.arange(args.topk, dtype=torch.int64, device=device)[None, :]
     if args.route == "uniform":
@@ -173,6 +174,13 @@ def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
         token_num=args.token,
         cols=args.inter_dim,
     ).contiguous()
+    if sorted_inter:
+        packed = sorted_ids[:row_capacity].to(torch.int64)
+        token_id, slot_id = packed & 0x00FFFFFF, packed >> 24
+        ok = (token_id < args.token) & (slot_id < args.topk)
+        flat = inter_states.reshape(args.token * args.topk, args.inter_dim)
+        inter_states = flat.new_zeros((row_capacity, args.inter_dim))
+        inter_states[ok] = flat[(token_id * args.topk + slot_id)[ok]]
 
     w2_bf16 = torch.randn(
         (args.experts, args.model_dim, args.inter_dim),
@@ -243,7 +251,11 @@ def _resolve_ordinary_stage2(args):
         has_stage2_bias=False,
         opus_weights_shuffled=True,
     )
-    return metadata, not stage2_uses_route_reduce(metadata.stage2)
+    return (
+        metadata,
+        not stage2_uses_route_reduce(metadata.stage2),
+        bool(metadata.skip_inter_quant),
+    )
 
 
 def _run_ordinary_stage2_allreduce(
@@ -640,9 +652,11 @@ def main():
     args = _parse_args()
     rank, device, group = _setup_distributed(args.tp)
     try:
-        metadata, requires_zero = _resolve_ordinary_stage2(args)
+        metadata, requires_zero, sorted_inter = _resolve_ordinary_stage2(args)
         args.tile_m = int(metadata.block_m)
-        case = _make_stage2_case(args, rank, device, accumulate=requires_zero)
+        case = _make_stage2_case(
+            args, rank, device, accumulate=requires_zero, sorted_inter=sorted_inter
+        )
         shared = (
             torch.arange(args.token, device=device, dtype=torch.float32)
             .remainder(7)
@@ -709,6 +723,15 @@ def main():
             shape=shape.kernel_shape(),
             m=args.token,
         )
+        if sorted_inter:
+            candidates = [
+                (
+                    config
+                    if isinstance(config, AtomicConfig)
+                    else dataclasses.replace(config, sorted_input=True)
+                )
+                for config in candidates
+            ]
         if rank == 0:
             print(
                 f"COMM_FUSED_TUNE_START M={args.token} route={args.route} "
