@@ -5077,8 +5077,8 @@ namespace aiter {
       //
       //  - extent[1] = the wave's head count, so the hardware clamps the tail: once
       //    origin[1] passes the last head, dim1_clamped saturates to 0 and the
-      //    refill still ISSUES -- which is all s_wait_tensorcnt<DEPTH-1> counts --
-      //    but fetches nothing. That replaces the old `h = min(head, q_head_end-1)`
+      //    refill still ISSUES -- which is all the tensorcnt wait counts -- but
+      //    fetches nothing. That replaces the old `h = min(head, q_head_end-1)`
       //    clamp and is strictly safer: the old form re-read the last head, this one
       //    touches no memory.
       //  - the row pitch is q_stride_1 rather than head_size. They are equal for a
@@ -5160,48 +5160,49 @@ namespace aiter {
       // modulo: LLVM cannot prove the dividend non-negative, so it emits the
       // sign-correction dance for what is a counter.
       int32_t q_slot = 0;
+      // Slot whose refill is still owed, deferred by one head (see the refill site
+      // below). -1 only on the first iteration, where nothing has been read yet.
+      [[maybe_unused]] int32_t q_refill_slot = -1;
       const bool is_nope_thr = (tid < nope_vec);  // nope-first
       const int32_t pe_store_off = (tid - pe_tid_start) * vec_size_i;
       const bool pe_is_x_half = ((tid - pe_tid_start) < (pe_dim / vec_size_i / 2));
 
       for (int32_t q_head_idx = q_head_start; q_head_idx < q_head_end; q_head_idx++) {
         opus_vec_i vec_q;
+        // Ring slot this head reads. Carried out of the block below so the refill
+        // site, which runs after the reduce, can hand it to the next head.
+        [[maybe_unused]] int32_t q_read_slot = 0;
 #if defined(__gfx1250__)
         if constexpr (Q_TDM_DEPTH > 0) {
           const int32_t slot = q_slot;
-          // Wait only for THIS head's tile; the other Q_TDM_DEPTH-1 stay in flight
-          // across this head's reduce -> rope -> quant -> store chain.
-          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding", so the
-          // ring's N is Q_TDM_DEPTH-1. This MUST cover every depth the dispatch can
-          // pick: a depth that falls through to a smaller N drains the whole ring
-          // and silently turns the prefetch off. It did -- the old switch stopped
-          // at case 3, so any DEPTH > 4 emitted s_wait_tensorcnt<0> (wait for ALL)
-          // and measured 17.9% slower at DEPTH=6, which was misread as an LDS /
-          // occupancy cost rather than a lost pipeline.
-          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding", so the
-          // ring's N is Q_TDM_DEPTH-1, and every depth the dispatch can pick MUST
-          // have a case. The old switch stopped at case 3, so any DEPTH > 4 fell
-          // through to s_wait_tensorcnt<0> -- wait for ALL -- which turns the
-          // prefetch off entirely. That is why DEPTH=6 measured 17.9% slower; it
-          // was misread as an LDS/occupancy cost. ISA confirms it: the DEPTH=6
-          // build emits s_wait_tensorcnt 0x0 where DEPTH=2 emits 0x1.
+          q_read_slot = slot;
+          // Wait only for THIS head's tile; the rest stay in flight across this
+          // head's reduce -> rope -> quant -> store chain.
           //
-          // The hardware ceiling is 3 tensor ops in flight per wave (opus.hpp:2953),
-          // so depth above 3 only parks the prologue. Range is [2,3]: depth 1 races
-          // the refill against the ds_read of the slot it overwrites (508a86ac).
-          static_assert(Q_TDM_DEPTH >= 2 && Q_TDM_DEPTH <= 3,
-                        "Q_TDM_DEPTH must be 2 or 3: 1 is a data race (508a86ac), "
-                        "and the hardware allows only 3 tensor ops in flight/wave.");
-          switch (Q_TDM_DEPTH - 1) {
-            case 2:  opus::s_wait_tensorcnt<2>(); break;
-            default: opus::s_wait_tensorcnt<1>(); break;
-          }
+          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding". The
+          // threshold is DEPTH-2, not DEPTH-1, because the refill is deferred by
+          // one head: at the wait point one slot is still owed its issue, so one
+          // fewer tile is in flight than the ring is deep. Getting this wrong is
+          // silent -- too small a threshold drains the whole ring and turns the
+          // prefetch off rather than failing. That is what a stale switch did
+          // once, emitting s_wait_tensorcnt<0> and measuring 17.9% slower at
+          // DEPTH=6, which was misread as an LDS/occupancy cost.
+          //
+          // DEPTH is 3 exactly. The hardware allows 3 tensor ops in flight per
+          // wave (opus.hpp:2953), so the prologue's 3 issues are the ceiling; and
+          // the deferred refill costs one tile of lead, so DEPTH=2 would leave
+          // DEPTH-2 = 0 -- a full drain every head. DEPTH=3 deferred and DEPTH=2
+          // immediate carry the SAME two heads of lead; the difference is only
+          // that this one needs no explicit s_wait_dscnt (see the refill site).
+          static_assert(Q_TDM_DEPTH == 3,
+                        "the deferred-refill ring needs Q_TDM_DEPTH == 3: 2 leaves "
+                        "no tile in flight at the wait, and the hardware allows "
+                        "only 3 tensor ops in flight per wave.");
+          opus::s_wait_tensorcnt<Q_TDM_DEPTH - 2>();
           vec_q = *reinterpret_cast<const OPUS_LDS_ADDR opus_vec_i*>(
               q_lds_addr
               + static_cast<__UINTPTR_TYPE__>((slot * head_size) + tid * vec_size_i)
                 * sizeof(scalar_t));
-          // Refill this slot with the head Q_TDM_DEPTH ahead.
-          q_tdm_issue(slot);
           q_slot = (slot + 1 == Q_TDM_DEPTH) ? 0 : (slot + 1);
         } else
 #endif
@@ -5243,6 +5244,36 @@ namespace aiter {
         const float sum_sq = acc2.x + acc2.y;
         const float amax_raw = fmaxf(amax2.x, amax2.y);
         (void)amax_raw;
+
+#if defined(__gfx1250__)
+        if constexpr (Q_TDM_DEPTH > 0) {
+          // Refill the slot the PREVIOUS head read, not the one just read.
+          //
+          // tensorcnt orders TDM loads against each other, not against this wave's
+          // DS reads, and tensor_load_to_lds is executed asynchronously by the TDM
+          // engine -- so refilling the slot just read races the ds_read of it, and
+          // instruction order alone does not settle it. Waiting for the read with
+          // an explicit s_wait_dscnt closes the race but drains the whole DS
+          // pipeline every head, which measured +2.1% at T=4096 H=32 (the shapes
+          // that gain nothing elsewhere, so it showed up undiluted).
+          //
+          // Deferring by one head closes it for free instead: the slot being
+          // refilled was read a full head ago, and the sum_sq loop above has since
+          // consumed vec_q -- which the compiler already guards with the
+          // s_wait_dscnt that read needs anyway. So by the time this issues, the
+          // read has provably retired and there is nothing extra to pay. The cost
+          // is one more ring slot of LDS, since holding the same two heads of lead
+          // with a deferred issue needs DEPTH=3 (see the wait above).
+          //
+          // Correctness does NOT depend on where this lands. The scheduler does in
+          // fact hoist the issue back up next to this head's ds_read, but the slot
+          // it refills belongs to the PREVIOUS head, whose read retired before this
+          // iteration could start. Deferring is what closes the race; position
+          // only costs overlap.
+          if (q_refill_slot >= 0) q_tdm_issue(q_refill_slot);
+          q_refill_slot = q_read_slot;
+        }
+#endif
 
         auto sum_func = [](float a, float b) { return a + b; };
         float total_sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(sum_sq, sum_func);
@@ -6398,12 +6429,12 @@ void fused_qk_norm_rope_group_quant(
   constexpr int PREFILL_Q_HEADS_PER_WAVE_LRG   = 8;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_XLRG  = 16;
   // Depth of the Q-head TDM prefetch ring in the coarse kernel (0 = off).
-  // Not a build-time knob: 1 is a data race (the refill overwrites the slot the
-  // consumer is still reading, see 508a86ac) and the hardware allows only 3 tensor
-  // ops in flight per wave, so the range is [2,3] and 3 measured neutral against 2
-  // both before and after the ring stopped re-reading the last head. The kernel's
-  // static_assert enforces the range.
-  constexpr int kCoarseQTdmDepth = 2;
+  // Not a build-time knob: the kernel defers each refill by one head so the slot
+  // it overwrites was read a head ago (which is what removes the explicit
+  // s_wait_dscnt), and holding the same two heads of lead that way costs one extra
+  // slot. 2 would leave nothing in flight at the wait; above 3 the hardware only
+  // allows 3 tensor ops per wave. The kernel's static_assert pins it.
+  constexpr int kCoarseQTdmDepth = 3;
   // ---------------------------------------------------------------------------
   // Heads per wave for the two prefill tiers. 16 at xlarge is the point of the
   // coarse path: one cos/sin gather, one descriptor build and one kernarg read
