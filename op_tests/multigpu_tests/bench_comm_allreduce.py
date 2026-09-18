@@ -318,7 +318,10 @@ _FP8_MIN_NUMEL = 128 * 2048
 # flydsl's SMEM_CAPACITY_MAP). A failed import here is that gate -- there is no
 # separate availability predicate to mirror.
 try:
-    from aiter.dist.device_communicators.flydsl_all_reduce import FlyDSLAllReduce
+    from aiter.dist.device_communicators.flydsl_all_reduce import (
+        FlyDSLAllReduce,
+        FlyDSLAllReduceRMSNorm,
+    )
     from aiter.ops.flydsl import QuickAllReduceInt4
     from aiter.ops.flydsl import allreduce_policy as policy
     from aiter.ops.flydsl.kernels.one_shot_allreduce import (
@@ -360,6 +363,7 @@ except Exception:  # noqa: BLE001
     _resolve_codecs = None
     has_xgmi_peer_links = None
     FlyDSLAllReduce = None
+    FlyDSLAllReduceRMSNorm = None
     policy = None
     HAS_FLY_INT4 = False
 
@@ -634,7 +638,7 @@ def _fly1s_grid_rows():
 # block list to sweep. Take the union over the widths this bench actually sees
 # and let `_fused_hidden_ok` drop the rows that do not apply at the shape being
 # run; a row keyed on a block that width cannot produce is skipped, not failed.
-_FUSED_GRID_HIDDENS = (4096, 5120, 7168, 8192)
+_FUSED_GRID_HIDDENS = (2048, 3072, 4096, 5120, 6144, 7168, 8192)
 # Grid cap is the only knob that moves the *block count* in fused mode: the tile
 # is one token row, so the tile size, the wire volume and the flag count are all
 # fixed by the shape. Block moves the thread/work split within a row and the LDS
@@ -677,22 +681,31 @@ def _fused_fly1s_grid_rows():
     return tuple(rows)
 
 
-# Blocks worth pinning on the quantized fused rows. The two-shot geometry is
-# stricter than the one-shot's -- a rank-tile also has to land on the 64 B
-# fabric sector grid, so the block is a multiple of 128 rather than of 64 --
-# and that leaves most widths with no choice at all: 5120 is always 640 and
-# 7168 is always 896, at every world size. Only 4096 (512/256/128) and 8192
-# (1024/512/256) have an axis to sweep, and TP8 collapses both to one. The
-# unpinned `fused_fly_ring`/`fused_fly_mesh` rows already cover the forced
-# widths, so these are the four that add anything.
-_FUSED_FLYQR_BLOCKS = (1024, 512, 256, 128)
+def _fused_flyqr_blocks():
+    """Blocks worth pinning on the quantized fused rows.
+
+    Stricter geometry than the one-shot's -- a rank-tile also has to land on the
+    64 B sector grid, so the block is a multiple of 128 -- which leaves most
+    widths with no choice: 7168 is always 896, at every world size. Only widths
+    with two or more options contribute; the unpinned rows already cover the
+    forced ones.
+    """
+    if _flyqr_block_options is None:
+        return ()
+    blocks = set()
+    for h in _FUSED_GRID_HIDDENS:
+        for ws in _FLY_WORLDS:
+            opts = _flyqr_block_options(h, ws)
+            if len(opts) > 1:
+                blocks |= {b for b, _ in opts}
+    return tuple(sorted(blocks, reverse=True))
 
 
 def _fused_flyqr_grid_rows():
     """Pinned-block rows for the quantized fused schedules."""
     rows = []
     for algorithm, floor in (("ring", 10.0), ("mesh", 15.0)):
-        for block in _FUSED_FLYQR_BLOCKS:
+        for block in _fused_flyqr_blocks():
             rows.append(
                 Candidate(
                     f"fused_fly_{algorithm}_b{block}",
@@ -857,6 +870,8 @@ CANDIDATES = (
     # ... plus the pinned block x grid-cap x self-skip grid, see
     # `_fused_fly1s_grid_rows`.
     *_fused_fly1s_grid_rows(),
+    # The shipped fused dispatcher, routed through  FlyDSLAllReduceRMSNorm.
+    Candidate("fused_fly_auto", "fused_flyauto", 10.0, False, fusion=True),
     # The incumbent: the kernel the Qwen3-235B MXFP4 decode trace spends 3.72 s
     # in, 7.1x the next kernel. Beating this is the point.
     Candidate(
@@ -1125,7 +1140,7 @@ def applicable(
             and dtype == dtypes.bf16
             and _bench_fly_accuracy_mode() == "fast"
         )
-    if cand.family == "flyauto":
+    if cand.family in ("flyauto", "fused_flyauto"):
         # Gated by the dispatcher's own policy rather than by a constant here:
         # the whole point of the row is that its window is the shipped one.
         return (
@@ -1421,6 +1436,7 @@ def _variant_of(
     *,
     fly1s_rms=None,
     flyqr_rms=None,
+    fused_flyauto=None,
     hidden=None,
 ) -> str | None:
     """The kernel *cand* would actually run at *nbytes*, or None.
@@ -1435,6 +1451,14 @@ def _variant_of(
         # the tile is one token row, so the width is baked into the symbol.
         eng = (fly1s_rms or {}).get(cand.fly1s_rms_cfg)
         return eng.variant(int(hidden), int(nbytes)) if eng is not None else None
+    if cand.family == "fused_flyauto":
+        # `<family>:<symbol>`, so the report says which family the shipped
+        # fused policy picked here as well as which binary it ran.
+        return (
+            fused_flyauto.variant(int(hidden), int(nbytes))
+            if fused_flyauto is not None
+            else None
+        )
     if cand.family == "fused_flyqr":
         # Same reason, for the same reason: a fused two-shot build sizes its
         # block to the row, so hidden reaches the symbol.
@@ -1571,6 +1595,7 @@ def _build_fused_thunks(
     fly1s,
     fly1s_rms,
     flyqr_rms,
+    fused_flyauto,
     group,
     x,
     residual,
@@ -1634,6 +1659,14 @@ def _build_fused_thunks(
             def _f(o=out, ro=res_out, eng=flyqr_rms[cand.flyqr_rms_cfg]):
                 eng.allreduce_rmsnorm(
                     x, residual, weight, FUSION_EPS, out=o, residual_out=ro
+                )
+                return o, ro
+
+            thunks[cand.key] = _f
+        elif cand.family == "fused_flyauto":
+            def _f(o=out, ro=res_out, comm=fused_flyauto):
+                comm.fly_fused_ar_rms(
+                    x, residual, weight, FUSION_EPS, out=o, res_out=ro
                 )
                 return o, ro
 
@@ -1849,12 +1882,16 @@ def _bench_shape(
     fusion="none",
     fly1s_rms=None,
     flyqr_rms=None,
+    fused_flyauto=None,
 ):
     """Time and grade every applicable candidate at one shape. Scalars only."""
     device = torch.device(f"cuda:{rank}")
     x = _make_input(rank, tokens, hidden, dtype).to(device)
     nbytes = x.numel() * x.element_size()
     fused = fusion != "none"
+    residual = weight = res_ref = None
+    if fused:
+        residual, weight = _fusion_inputs(tokens, hidden, dtype, device)
 
     cands = [
         c
@@ -1884,10 +1921,15 @@ def _bench_shape(
             c.family == "flyauto"
             and (flyauto is None or not flyauto.should_fly_all_reduce(x))
         )
+        and not (
+            c.family == "fused_flyauto"
+            and (
+                fused_flyauto is None
+                or not fused_flyauto.should_fly_fused_ar_rms(x, residual, weight)
+            )
+        )
     ]
-    residual = weight = res_ref = None
     if fused:
-        residual, weight = _fusion_inputs(tokens, hidden, dtype, device)
         thunks, buffers = _build_fused_thunks(
             cands,
             ca_comm=ca_comm,
@@ -1896,6 +1938,7 @@ def _bench_shape(
             fly1s=fly1s,
             fly1s_rms=fly1s_rms,
             flyqr_rms=flyqr_rms,
+            fused_flyauto=fused_flyauto,
             group=group,
             x=x,
             residual=residual,
@@ -2013,6 +2056,7 @@ def _bench_shape(
             nbytes,
             fly1s_rms=fly1s_rms,
             flyqr_rms=flyqr_rms,
+            fused_flyauto=fused_flyauto,
             hidden=hidden,
         )
 
@@ -2336,19 +2380,48 @@ def _worker(
                 flyauto.fly_all_reduce(t, out=torch.empty_like(t))
                 del t
 
+    fused_flyauto = None
+    if (
+        any(c.family == "fused_flyauto" and c.key in keys for c in CANDIDATES)
+        and HAS_FLY_INT4
+        and get_gfx() in _FLY_ARCHS
+        and tp_size in _FLY_WORLDS
+        and dtype == dtypes.bf16
+    ):
+        dist.barrier(group=group)
+        comm = FlyDSLAllReduceRMSNorm(group=tp_group.cpu_group, device=device)
+        if comm.disabled:
+            logger.warning(
+                "rank %d: fused_fly_auto requested but FlyDSLAllReduceRMSNorm "
+                "disabled itself; its column will be absent",
+                rank,
+            )
+        else:
+            fused_flyauto = comm
+            for tokens, hidden in shapes:
+                warm = torch.zeros((tokens, hidden), dtype=dtypes.bf16, device=device)
+                w = torch.zeros(hidden, dtype=dtypes.bf16, device=device)
+                dist.barrier(group=group)
+                if fused_flyauto.should_fly_fused_ar_rms(warm, warm, w):
+                    fused_flyauto.fly_fused_ar_rms(warm, warm.clone(), w, FUSION_EPS)
+                del warm, w
+
     # Every fly candidate is a distinct engine with a distinct IPC inbox, and
     # they are all live at once for the whole sweep. A wide tuning sweep is
     # therefore holding a fixed cost on the device before a single payload is
     # allocated -- and the inbox scales with ST * grid, so the ring's high rungs
     # dominate it. Report it here, where it is attributable to the candidate
     # list, rather than letting it surface as an OOM on the largest shape.
-    if fly or fly1s or fly1s_rms or flyqr_rms or flyauto:
+    if fly or fly1s or fly1s_rms or flyqr_rms or flyauto or fused_flyauto:
         per_engine = sorted(
             [(f"fly{cfg}", eng.inbox_bytes) for cfg, eng in fly.items()]
             + [(f"fly1s{cfg}", eng.inbox_bytes) for cfg, eng in fly1s.items()]
             + [(f"fly1s_rms{cfg}", eng.inbox_bytes) for cfg, eng in fly1s_rms.items()]
             + [(f"flyqr_rms{cfg}", eng.inbox_bytes) for cfg, eng in flyqr_rms.items()]
-            + ([("fly_auto", flyauto.inbox_bytes)] if flyauto else []),
+            + ([("fly_auto", flyauto.inbox_bytes)] if flyauto else [])
+            + (
+                [("fused_fly_auto", fused_flyauto.inbox_bytes)] if fused_flyauto else []
+            ),
             key=lambda kv: -kv[1],
         )
         total = sum(b for _, b in per_engine)
@@ -2384,6 +2457,7 @@ def _worker(
                 fusion=fusion,
                 fly1s_rms=fly1s_rms,
                 flyqr_rms=flyqr_rms,
+                fused_flyauto=fused_flyauto,
             )
             for tokens, hidden in shapes
         ]
@@ -2399,6 +2473,8 @@ def _worker(
             eng.close()
         if flyauto is not None:
             flyauto.close()
+        if fused_flyauto is not None:
+            fused_flyauto.close()
         if dist.is_initialized():
             destroy_model_parallel()
             destroy_distributed_environment()

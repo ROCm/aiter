@@ -31,7 +31,6 @@ from .kernels.one_shot_allreduce import (
     SUPPORTED_BLOCKS,
     fused_atoms_for_block,
     fused_block_options,
-    fused_hidden_supported,
     fused_oneshot_ladder,
     make_one_shot_allreduce_kernel,
     oneshot_ladder,
@@ -456,6 +455,7 @@ class OneShotAllReduceRMSNorm:
         fanout: str | None = None,
         block: int | None = None,
         max_bytes: int | None = None,
+        link: str | None = None,
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
         skip_self: bool | None = None,
         hiddens: tuple[int, ...] = (),
@@ -464,6 +464,11 @@ class OneShotAllReduceRMSNorm:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
+        if link is None:
+            link = "xgmi" if has_xgmi_peer_links() else "pcie"
+        if link not in ("pcie", "xgmi"):
+            raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
+        self.link = link
         pinned = (
             atoms is not None
             or grid_cap is not None
@@ -505,7 +510,7 @@ class OneShotAllReduceRMSNorm:
         self.inbox_memory = resolved_inbox
         self._inbox_flags = inbox_flags
         self.max_bytes = (
-            max_payload_bytes(world_size) if max_bytes is None else int(max_bytes)
+            max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
         self.spin_sleep = int(spin_sleep)
         self.block = None if block is None else int(block)
@@ -533,7 +538,7 @@ class OneShotAllReduceRMSNorm:
                     f,
                     s if ss is None else ss,
                 )
-                for floor, a, rung_cap, f, s in fused_oneshot_ladder(world_size)
+                for floor, a, rung_cap, f, s in fused_oneshot_ladder(world_size, link)
             )
         self.skip_self = self._ladder[0][4]
 
@@ -550,9 +555,15 @@ class OneShotAllReduceRMSNorm:
 
     def _atoms_for(self, hidden: int, rung_atoms: int) -> int:
         """The rung's ``atoms``, or what a pinned ``block`` means at hidden."""
-        if self.block is None:
-            return int(rung_atoms)
-        return fused_atoms_for_block(int(hidden), self.block)
+        want = (
+            fused_atoms_for_block(int(hidden), self.block)
+            if self.block
+            else int(rung_atoms)
+        )
+        legal = [a for _b, a in fused_block_options(int(hidden))]
+        if not legal or want in legal:
+            return want
+        return min(legal, key=lambda a: (abs(a - want), a))
 
     def _cfg_key(self, hidden: int, rung: tuple) -> tuple:
         """A ladder rung's engine key at *hidden*."""
@@ -610,10 +621,10 @@ class OneShotAllReduceRMSNorm:
         return tuple(sorted({k[0] for k in self._by_cfg}))
 
     def supports_hidden(self, hidden: int) -> bool:
-        """Whether a build exists for hidden at every rung of this ladder."""
+        """Whether any build exists for hidden dim."""
         if self.block is not None:
             return any(b == self.block for b, _ in fused_block_options(int(hidden)))
-        return all(fused_hidden_supported(int(hidden), r[1]) for r in self._ladder)
+        return bool(fused_block_options(int(hidden)))
 
     # -- launch --------------------------------------------------------------
 

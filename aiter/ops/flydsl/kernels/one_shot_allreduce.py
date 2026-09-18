@@ -224,16 +224,21 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
 # ``atoms`` therefore sets the *block width* instead -- BLOCK = hidden/(8*atoms)
 # -- and the tile, the flag count and the block count are all independent of it.
 FUSED_ONESHOT_LADDER = {
-    2: ((0, 1, 128, "peer", False),),
-    4: ((0, 1, 32, "peer", False),),
-    8: ((0, 1, 64, "peer", False),),
+    # PCIe: from measurements on MI350P
+    ("pcie", 2): ((0, 2, 128, "peer", True),),
+    ("pcie", 4): ((0, 2, 64, "peer", False),),
+    ("pcie", 8): ((0, 4, 64, "peer", False), (8 << 10, 2, 64, "peer", True)),
+    # xGMI: placeholder (not yet measured), same as PCIe
+    ("xgmi", 2): ((0, 2, 128, "peer", True),),
+    ("xgmi", 4): ((0, 2, 64, "peer", False),),
+    ("xgmi", 8): ((0, 4, 64, "peer", False), (8 << 10, 2, 64, "peer", True)),
 }
 
 
-def fused_oneshot_ladder(world_size: int):
-    """Rungs for *world_size* under ``fusion="rmsnorm"``. See FUSED_ONESHOT_LADDER."""
+def fused_oneshot_ladder(world_size: int, link: str = "pcie"):
+    """Rungs for *(link, world_size)* under ``fusion="rmsnorm"``."""
     return FUSED_ONESHOT_LADDER.get(
-        int(world_size),
+        (str(link), int(world_size)),
         ((0, 1, DEFAULT_GRID_CAP, DEFAULT_FANOUT, DEFAULT_SKIP_SELF),),
     )
 

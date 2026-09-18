@@ -34,6 +34,7 @@ from .kernels.quick_allreduce_codec import CODECS
 from .kernels.quick_allreduce_fusions import (
     quick_reduce_hidden_supported,
     quick_reduce_row_block_at,
+    quick_reduce_row_block_for,
     quick_reduce_row_block_options,
 )
 from .kernels.quick_allreduce_int4 import (
@@ -1023,6 +1024,7 @@ class QuickAllReduceInt4RMSNorm:
         rs_codec: str | None = None,
         ag_codec: str | None = None,
         block: int | None = None,
+        atoms_per_row: int | None = None,
         hiddens: tuple[int, ...] = (),
     ):
         if world_size not in SUPPORTED_WORLDS:
@@ -1074,7 +1076,10 @@ class QuickAllReduceInt4RMSNorm:
         self.arch = arch
         # Threads per block, or None for the widest this width admits. It is not
         # a free knob: one workgroup covers one token row.
+        if block is not None and atoms_per_row is not None:
+            raise ValueError("pin block or atoms_per_row, not both")
         self.block = None if block is None else int(block)
+        self.atoms_per_row = None if atoms_per_row is None else int(atoms_per_row)
         self._algo = algo
         self._inbox_flags = inbox_flags
         self._has_launched = False
@@ -1162,8 +1167,11 @@ class QuickAllReduceInt4RMSNorm:
         if not self.supports_hidden(hidden):
             # Resolve again for the message: it names the constraint that failed.
             quick_reduce_row_block_at(hidden, self.world_size, self.block)
-        block, _atoms_per_row = quick_reduce_row_block_at(
-            hidden, self.world_size, self.block
+        block, _atoms_per_row = quick_reduce_row_block_for(
+            hidden,
+            self.world_size,
+            block=self.block,
+            atoms_per_row=self.atoms_per_row,
         )
         for st in self._by_cap:
             key = (hidden, st)

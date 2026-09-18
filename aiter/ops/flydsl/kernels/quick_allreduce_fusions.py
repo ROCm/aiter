@@ -207,6 +207,48 @@ def quick_reduce_row_block_at(
     )
 
 
+#: ``atoms_per_row`` for a fused mesh/ring build, per ``(link, world_size,
+#: algorithm)``. The portable form of the block knob: which blocks exist
+#: depends on the width, which ``atoms_per_row`` values exist does not.
+FUSED_QR_ROW_ATOMS: dict[tuple[str, int, str], int] = {
+    # PCIe: From measurements
+    ("pcie", 2, "ring"): 2,
+    ("pcie", 4, "mesh"): 2,
+    ("pcie", 4, "ring"): 2,
+    # xGMI: placeholder (not yet measured), same as PCIe
+    ("xgmi", 2, "ring"): 2,
+    ("xgmi", 4, "mesh"): 2,
+    ("xgmi", 4, "ring"): 2,
+}
+
+
+def fused_qr_row_atoms(
+    world_size: int, algorithm: str, link: str = "pcie"
+) -> int | None:
+    """Table entry for *(link, world_size, algorithm)*, or None for the default."""
+    return FUSED_QR_ROW_ATOMS.get((str(link), int(world_size), str(algorithm)))
+
+
+def quick_reduce_row_block_for(
+    hidden: int,
+    world_size: int,
+    *,
+    block: int | None = None,
+    atoms_per_row: int | None = None,
+) -> tuple[int, int]:
+    """``(block, atoms_per_row)``, pinned by either knob or the widest default."""
+    if block is not None and atoms_per_row is not None:
+        raise ValueError("pin block or atoms_per_row, not both")
+    if atoms_per_row is None:
+        return quick_reduce_row_block_at(hidden, world_size, block)
+    opts = quick_reduce_row_block_options(hidden, world_size)
+    if not opts:
+        return quick_reduce_row_block(hidden, world_size)  # raises, naming why
+    want = int(atoms_per_row)
+    pick = min(opts, key=lambda ba: (abs(ba[1] - want), ba[1]))
+    return pick
+
+
 def quick_reduce_hidden_supported(hidden: int, world_size: int) -> bool:
     """Whether a fused mesh/ring build exists for this width. For host gates."""
     try:

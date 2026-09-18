@@ -41,6 +41,14 @@ Two knobs matter more than the rest:
     comparison comes back empty. The default here lifts it past the largest
     shape so the curve is visible all the way to where it stops winning.
 
+The FlyDSL rows include the pinned ``_b<block>[_ss]`` grid, not just the
+ladder-driven rows: block and self-skip move the fused kernels by up to 2.6x, so
+a comparison built from the unpinned rows alone understates them badly. Each
+distinct config is an engine with its own IPC inbox -- ~470 MiB per rank at
+TP2/hidden=8192 with everything on -- so trim with ``-c`` when sweeping a single
+family. Which blocks exist is a function of the width, so a different subset of
+the ``b*`` rows reports at each hidden; that is the geometry, not a failure.
+
 Usage::
 
     # the whole sweep, ~30-45 min on 8 GPUs with a warm JIT cache
@@ -73,39 +81,77 @@ if str(_HERE) not in sys.path:
 # Reuse the bench's own prod-path parser rather than re-deriving it: it
 # already handles every `production_fused_path()` string, including
 # `qr_fused:<regime>` for any regime, not just the ones this sweep exercises.
+from bench_comm_allreduce import CANDIDATES as _BENCH_CANDIDATES
 from bench_comm_allreduce import _prod_candidate_key
 
-# Decode through prefill. The gap between 128 and 512 is deliberate: nothing
-# dispatches there, and the crossover this sweep is looking for sits inside it.
-DEFAULT_M = (8, 16, 32, 64, 128, 512, 1024, 2048, 4096, 8192)
+# Decode through prefill, ~4 points per octave at the bottom. The density is
+# what lets `fit_allreduce_policy.py` place a threshold: measured points have to
+# land near the round values it searches over, and both the fused `min_bytes`
+# floor and the one-shot/mesh crossover sit below 512.
+DEFAULT_M = (
+    1, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32, 48, 64, 96,
+    128, 192, 256, 384, 512, 1024, 2048, 4096, 8192,
+)  # fmt: skip
 
-# 4096: every candidate applies, so the field is complete and comparable.
-# 7168: DeepSeek-V3/V4's width. aiter's fused quick-reduce is *not* applicable
-#       there -- a 14336 B row does not tile a 32 KiB QR tile -- so this column
-#       is where the FlyDSL two-shot kernels are the only quantized fused
-#       option at all, which is a result in itself.
-DEFAULT_HIDDEN = (4096, 7168)
+# Widths the dispatch table is fitted on. 4096 and 8192 carry the full
+# three-wide block axis; 7168 is DeepSeek-V3/V4's and the one width where
+# aiter's fused quick-reduce cannot run at all (a 14336 B row does not tile a
+# 32 KiB QR tile), so the FlyDSL two-shot kernels are the only quantized fused
+# option there.
+FIT_HIDDEN = (4096, 8192, 7168)
+# Held out to test whether the fitted boundary is a function of bytes alone.
+HOLDOUT_HIDDEN = (2048, 3072, 6144)
+DEFAULT_HIDDEN = FIT_HIDDEN + HOLDOUT_HIDDEN
 DEFAULT_TP = (2, 4, 8)
 
 # Payload ceiling for the one-shot rows, in KiB. 128 MiB clears the largest
 # shape here (8192 x 8192 bf16 = 128 MiB).
 DEFAULT_FLY1S_MAX_KB = 131072
 
-#: ``family -> (fused kernel, its own two-launch baseline)``.
+
+def _bench_keys(family: str, algorithm: str | None = None) -> tuple[str, ...]:
+    """Fused bench rows of *family*, pinned grid included.
+
+    Taken from the bench rather than listed here: which blocks exist is the
+    kernel's constraint, and the bench already generates the rows from it.
+    """
+    return tuple(
+        c.key
+        for c in _BENCH_CANDIDATES
+        if c.family == family and (algorithm is None or c.algorithm == algorithm)
+    )
+
+
+#: Every FlyDSL fused row, per schedule. The pinned `_b<block>[_ss]` rows are
+#: what makes these comparisons fair: tuning moves the fused kernels by up to
+#: 2.6x, so a table built from the unpinned rows alone understates them.
+FLY_1STAGE = _bench_keys("fused_fly1s")
+FLY_RING = _bench_keys("fused_flyqr", "ring")
+FLY_MESH = _bench_keys("fused_flyqr", "mesh")
+
+#: ``family -> (fused rows, its own two-launch baseline)``. The fused side is a
+#: tuple and reduced with :func:`_best`, so a family is represented by its best
+#: measured config at each shape.
 #:
 #: ``separate_cdr`` serves both cdr rows: it is ``cross_device_reduce`` plus a
 #: standalone norm, which is the unfused form of either fused schedule.
 FUSION_PAIRS = {
-    "cdr_1stage": ("fused_cdr_1stage", "separate_cdr"),
-    "cdr_2stage": ("fused_cdr_2stage", "separate_cdr"),
-    "qr_int4": ("fused_qr_int4", "separate_qr_int4"),
-    "fly_1stage": ("fused_fly_1stage", "separate_fly1s"),
-    "fly_ring": ("fused_fly_ring", "separate_flyring"),
-    "fly_mesh": ("fused_fly_mesh", "separate_flymesh"),
+    "cdr_1stage": (("fused_cdr_1stage",), "separate_cdr"),
+    "cdr_2stage": (("fused_cdr_2stage",), "separate_cdr"),
+    "qr_int4": (("fused_qr_int4",), "separate_qr_int4"),
+    "fly_1stage": (FLY_1STAGE, "separate_fly1s"),
+    "fly_ring": (FLY_RING, "separate_flyring"),
+    "fly_mesh": (FLY_MESH, "separate_flymesh"),
 }
 
-FLYDSL_FUSED = ("fused_fly_1stage", "fused_fly_ring", "fused_fly_mesh")
+FLYDSL_FUSED = FLY_1STAGE + FLY_RING + FLY_MESH
 FLYDSL_SEPARATE = ("separate_fly1s", "separate_flyring", "separate_flymesh")
+#: The shipped fused dispatcher. Measured so `fit_allreduce_policy.py
+#: --fusion ar_rmsnorm --audit-auto` can grade it, but kept out of
+#: `FLYDSL_FUSED`: it is not another kernel to compare, it is the policy that
+#: chooses between them, and counting it as a candidate would double-count.
+#: Needs AITER_FLY_AR=1 in the environment or its column comes back n/a.
+FLYDSL_AUTO = ("fused_fly_auto",)
 AITER_FUSED = ("fused_cdr_1stage", "fused_cdr_2stage", "fused_qr_int4", "fused_qr_fp8")
 AITER_SEPARATE = ("separate_cdr", "separate_rccl", "separate_qr_int4")
 #: aiter candidates with no accuracy loss (``Candidate.exact`` in the bench).
@@ -115,8 +161,10 @@ AITER_EXACT = ("fused_cdr_1stage", "fused_cdr_2stage", "separate_cdr", "separate
 AITER_ALL = tuple(sorted(set(AITER_FUSED) | set(AITER_SEPARATE)))
 
 CANDIDATES = sorted(
-    {c for pair in FUSION_PAIRS.values() for c in pair}
+    {k for fused, _sep in FUSION_PAIRS.values() for k in fused}
+    | {sep for _fused, sep in FUSION_PAIRS.values()}
     | set(FLYDSL_FUSED)
+    | set(FLYDSL_AUTO)
     | set(AITER_FUSED)
     | {"separate_rccl"}  # library reference, free to carry
 )
@@ -156,6 +204,9 @@ def _run(args) -> None:
     env = dict(os.environ)
     # Lift the one-shot's policy ceiling; see the module docstring.
     env["AITER_BENCH_FLY1S_MAX_KB"] = str(args.fly1s_max_kb)
+    # The fused dispatcher is opt-in and self-disabling; without this its row
+    # is n/a everywhere and --audit-auto has nothing to grade.
+    env.setdefault("AITER_FLY_AR", "1")
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
     for key, argv, csv in _commands(args):
         print(f"\n=== TP{key[0]} hidden={key[1]} timing={key[2]} -> {csv}", flush=True)
@@ -200,9 +251,12 @@ def _fusion_table(df: pd.DataFrame, min_gain: float) -> pd.DataFrame:
             "KiB": r["payload size (KiB)"],
         }
         for name, (fused, sep) in FUSION_PAIRS.items():
-            f, s = r.get(f"{fused} us"), r.get(f"{sep} us")
+            _k, f, _db = _best(r, fused, None)
+            s = r.get(f"{sep} us")
             row[name] = (
-                (s / f) if (pd.notna(f) and pd.notna(s) and f > 0) else float("nan")
+                (s / f)
+                if (pd.notna(s) and f > 0 and f != float("inf"))
+                else float("nan")
             )
         rows.append(row)
     out = pd.DataFrame(rows)
