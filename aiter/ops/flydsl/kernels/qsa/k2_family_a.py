@@ -363,8 +363,9 @@ def build_qsa_k2_family_a_module(
                 v_store_frag = fx.make_fragment_like(v_dst)
                 fx.memref_store_vec(v_vec, v_store_frag)
                 fx.copy(lds_copy, v_store_frag, v_dst)
-            gpu.barrier()
 
+            # Softmax reads C and live, not V; the post-QK barrier already
+            # published C. V and P meet at the barrier before PV.
             if wave == zero:
                 for i in range_constexpr(4):
                     h = lane_kg * Int32(4) + Int32(i)
