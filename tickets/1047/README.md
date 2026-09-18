@@ -677,6 +677,12 @@ scalar-pack P loads. Keep scalar ``p_lds[lane_m, n0:n0+4]`` gathers.
 cost dominates scalar ``ds_write_b16``. Keep per-element
 ``v_lds[d, col]`` stores.
 
+**Do not retry** decode-only two-stage K/V LDS ping-pong (prefetch next
+tile after softmax, before PV). Distinct from register next-K/PV
+overlap. 18 pytest cases, ``err=0``; width-2051 ``L=512`` was 19.8 /
+22.5 / 513.5 us vs 18.5 / 21.1 / 516.2. Decode lost ~7%; extra gather
+barriers are not hidden by PV. Keep single-buffered K/V.
+
 
 
 
