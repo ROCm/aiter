@@ -350,11 +350,38 @@ GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. **2h is closed** on emit /
 ``visible <= 512`` (``H`` 4 and 8, 2e/2f tables) plus the published
 indexer point: ``M=32``, ``H=4``, ``D=128``, ``page_size=8``,
 ``n_blocks=512`` (512 compressed keys, 64 pages). Oracle set equality
-`err=0`. Long-L remains a 2g recorded loss.
+`err=0`. Long-L is 2i (family A scorer), not a 2h gate.
 
 | m | seq_len | page_size | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us | flydsl_k1 err |
 |--:|--------:|----------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
 | 32 | 2048 | 8 | 4 | 512 | 2.9 | 12.1 | 11.9 | 0 |
+
+## Phase 2i — family B K1 long-L uses family A scorer
+
+GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Long rows dispatch into
+family A's BLOCK_N=32 MFMA scorer plus decode/streaming radix. ``H=4``
+shares that compile; ``H=8`` is a second compile. Emit kernels no longer
+contain a bitonic path. Oracle set equality. 8k / 32k beat both #4882
+columns; decode ``M=1`` 128k is a small loss vs Gluon.
+
+| m | seq_len | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us |
+|--:|--------:|--:|---------:|-------------:|----------------------:|---------------------:|
+| 1 | 512 | 4 | 128 | 2.0 | 13.5 | 13.3 |
+| 1 | 8192 | 4 | 2048 | 10.5 | 16.3 | 16.2 |
+| 1 | 32768 | 4 | 8192 | 14.2 | 18.4 | 18.5 |
+| 1 | 131072 | 4 | 32768 | 28.6 | 28.0 | 27.2 |
+| 8 | 512 | 4 | 128 | 2.6 | 15.8 | 15.8 |
+| 8 | 8192 | 4 | 2048 | 12.8 | 18.2 | 18.1 |
+| 8 | 32768 | 4 | 8192 | 19.8 | 23.4 | 21.9 |
+| 8 | 131072 | 4 | 32768 | 46.5 | 50.7 | 48.1 |
+| 1 | 512 | 8 | 128 | 2.0 | 14.2 | 13.3 |
+| 1 | 8192 | 8 | 2048 | 10.7 | 17.0 | 16.3 |
+| 1 | 32768 | 8 | 8192 | 14.4 | 19.4 | 18.6 |
+| 1 | 131072 | 8 | 32768 | 28.6 | 30.0 | 27.5 |
+| 8 | 512 | 8 | 128 | 2.7 | 16.3 | 15.6 |
+| 8 | 8192 | 8 | 2048 | 12.8 | 19.4 | 18.1 |
+| 8 | 32768 | 8 | 8192 | 19.9 | 26.2 | 21.9 |
+| 8 | 131072 | 8 | 32768 | 44.9 | 56.4 | 45.1 |
 
 ## Phase 3a — family A FlyDSL K2 decode (correctness)
 

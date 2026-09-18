@@ -88,11 +88,12 @@ them.
   MFMA workgroups; single-request prefill batches 16 query rows per workgroup.
   Selection is `flydsl_top_k_per_row_decode(stable=True)` below 32768 columns
   and `topk_select(..., tie='low')` streaming radix at or above that width.
-  Family B is still fused everywhere.
-- **Family B K1 perf is emit / short-L only.** Winning shapes are
+  Family B long rows reuse the same scorers; ``H=8`` is a second compile.
+- **Family B K1 long-L uses the family A scorer.** Emit remains
   ``visible <= 512`` for ``H`` 4 and 8, plus the #4882 published indexer
-  point (``M=32``, ``H=4``, ``D=128``, ``page_size=8``, ``n_blocks=512``).
-  Long-L select vs #4882 is a recorded 2g loss; do not resume it.
+  point. Longer rows dispatch into family A's BLOCK_N=32 MFMA scorer plus
+  radix (``H=4`` same compile as family A; ``H=8`` a parameterized compile).
+  The 2g bitonic tile merge is removed.
 - **Score math.** `I_ib = sum_h ReLU(dot(q[h], k_bar[b]))` for complete blocks
   only (`p_b + r - 1 <= i`). Optional serving scale `1/sqrt(128)` is allowed
   **only if it cannot change top-k argmax**. `eps` is unused.
@@ -436,8 +437,8 @@ radix. Do not chase a select win. 2h is emit / short-L only.
 - [x] **2h.** Family B K1 beats #4882 Triton and Gluon on emit /
       ``visible <= 512`` (``H`` 4 and 8) and on the published indexer point
       (``M=32``, ``H=4``, ``D=128``, ``page_size=8``, ``n_blocks=512``).
-      Same `block_ids [M, 512]`; no score matrix. Long-L is a 2g recorded
-      loss, not a 2h gate.
+      Same `block_ids [M, 512]`; no score matrix. Long-L is 2i (family A
+      scorer), not a 2h gate.
 
 GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`. Oracle set equality
 `err=0`. Emit already beats both #4882 columns in 2e/2f. Published point
@@ -448,15 +449,42 @@ maps ``pages=512`` to 512 compressed keys packed at ``page_size=8``
 |--:|--------:|----------:|--:|---------:|-------------:|----------------------:|---------------------:|--------------:|
 | 32 | 2048 | 8 | 4 | 512 | 2.9 | 12.1 | 11.9 | 0 |
 - [x] Family A may materialize `[rows, n_blocks]` FP32 scores for long rows;
-      short rows retain fused emit. Family B remains fused.
+      short rows retain fused emit. Family B long rows reuse those scorers
+      (``H=8`` is a second compile).
+- [x] **2i.** Family B long-L drops the 2g bitonic and dispatches into
+      family A's MFMA scorer plus radix. ``H=4`` shares family A's compile;
+      ``H=8`` is a parameterized second compile. Emit kernels no longer
+      contain a bitonic path. GPU 6 / gfx950 / `FLYDSL_RUNTIME_ENABLE_CACHE=0`.
+      Oracle set equality. 8k / 32k beat both #4882 columns. Decode
+      ``M=1`` 128k is a small loss vs Gluon (same regime as family A vs
+      #4882 Triton).
+
+| m | seq_len | H | n_blocks | flydsl_k1 us | 4882_triton_select us | 4882_gluon_select us |
+|--:|--------:|--:|---------:|-------------:|----------------------:|---------------------:|
+| 1 | 512 | 4 | 128 | 2.0 | 13.5 | 13.3 |
+| 1 | 8192 | 4 | 2048 | 10.5 | 16.3 | 16.2 |
+| 1 | 32768 | 4 | 8192 | 14.2 | 18.4 | 18.5 |
+| 1 | 131072 | 4 | 32768 | 28.6 | 28.0 | 27.2 |
+| 8 | 512 | 4 | 128 | 2.6 | 15.8 | 15.8 |
+| 8 | 8192 | 4 | 2048 | 12.8 | 18.2 | 18.1 |
+| 8 | 32768 | 4 | 8192 | 19.8 | 23.4 | 21.9 |
+| 8 | 131072 | 4 | 32768 | 46.5 | 50.7 | 48.1 |
+| 1 | 512 | 8 | 128 | 2.0 | 14.2 | 13.3 |
+| 1 | 8192 | 8 | 2048 | 10.7 | 17.0 | 16.3 |
+| 1 | 32768 | 8 | 8192 | 14.4 | 19.4 | 18.6 |
+| 1 | 131072 | 8 | 32768 | 28.6 | 30.0 | 27.5 |
+| 8 | 512 | 8 | 128 | 2.7 | 16.3 | 15.6 |
+| 8 | 8192 | 8 | 2048 | 12.8 | 19.4 | 18.1 |
+| 8 | 32768 | 8 | 8192 | 19.9 | 26.2 | 21.9 |
+| 8 | 131072 | 8 | 32768 | 44.9 | 56.4 | 45.1 |
 - [ ] gfx942 and gfx950.
 - [ ] Gate vs live vLLM AMD (`MQA Triton + HIP top-k`) and vs #4882 Triton;
       beat Gluon on gfx950 **where Gluon dispatches**.
 - [ ] **Done when:** selected-block **set equality** (or documented tie policy)
       vs the oracle; family A beats live AMD on emit / ``visible <= 512`` and
-      through 32k decode (128k and prefill losses recorded); family B beats #4882
-      Triton and Gluon on emit / ``visible <= 512`` and on the published
-      indexer point (long-L select loss recorded in 2g).
+      through 32k decode; family B beats #4882 Triton and Gluon on emit /
+      ``visible <= 512``, the published indexer point, and 8k / 32k long-L
+      (128k ``M=1`` vs Gluon remains a small recorded loss).
 
 ### 3. FlyDSL K2 (sparse GQA) — family A then B
 
