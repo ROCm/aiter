@@ -671,6 +671,23 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py --working_path {{}}'"
     },
+    "module_iq2r_moe": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/iq2r/iq2r_gemm_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/iq2r/iq2r_moe_aux_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/iq2r_pybind.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [
+            "'-DENABLE_CK=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fmha_fwd_bf16_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_fwd_bf16_opus_kernels.cu'",

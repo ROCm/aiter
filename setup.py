@@ -466,7 +466,7 @@ class ForcePlatlibDistribution(Distribution):
 
 
 if AITER_TRITON_ONLY:
-    install_requires = ["einops", "packaging", "psutil"]
+    install_requires = ["einops", "packaging", "psutil", "safetensors"]
 else:
     install_requires = [
         "pybind11>=3.0.1",
@@ -475,6 +475,7 @@ else:
         "einops",
         "psutil",
         "packaging",
+        "safetensors",
         FLYDSL_VERSION,
     ]
 
