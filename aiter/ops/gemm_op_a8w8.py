@@ -789,6 +789,28 @@ def gemm_a8w8_bpreshuffle(
         ) from e
 
 
+# M at or above which the triton kernel beats the untuned CK fallback, which
+# runs one fixed tile shape at every M. Measured per arch; do not extrapolate.
+_BLOCKSCALE_TRITON_FALLBACK_MIN_M = {"gfx942": 2048, "gfx950": 384}
+
+
+def _blockscale_triton(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Run the triton kernel on CK's inputs: row-major x_scale, (N, K) weight, JIT per arch."""
+    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale as _gemm_a8w8_blockscale_triton,
+    )
+
+    xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
+    wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+    return _gemm_a8w8_blockscale_triton(xq, wq, x_scale, w_scale, dtype=dtype)
+
+
 def gemm_a8w8_blockscale_fake(
     XQ: Tensor,
     WQ: Tensor,
@@ -827,15 +849,7 @@ def gemm_a8w8_blockscale(
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
         if not _hip_blockscale_supported():
-            # No CK code object for this arch -> triton (same row-major x_scale
-            # + (N, K) weight layout; JIT-compiles per-arch).
-            from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-                gemm_a8w8_blockscale as _gemm_a8w8_blockscale_triton,
-            )
-
-            xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
-            wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
-            return _gemm_a8w8_blockscale_triton(xq, wq, x_scale, w_scale, dtype=dtype)
+            return _blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
         config = get_CKGEMM_config(
             m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
         )
@@ -865,6 +879,9 @@ def gemm_a8w8_blockscale(
                 )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+        min_m = _BLOCKSCALE_TRITON_FALLBACK_MIN_M.get(get_gfx())
+        if min_m is not None and m >= min_m:
+            return _blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
         try:
             return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
         except RuntimeError as e:
