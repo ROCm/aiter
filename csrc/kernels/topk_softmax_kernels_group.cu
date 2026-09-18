@@ -689,33 +689,32 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     for(int j = 0; j < NVEC; j++)
     {
         const int e2 = lane + j * WARP_SIZE;
-        cktype_i g0, g1;
+        auto consume = [&](auto g0, auto g1) {
+            if constexpr(isSoftmax)
+            {
+                s[j][0] = static_cast<float>(g0);
+                s[j][1] = static_cast<float>(g1);
+            }
+            else if constexpr(isBiased)
+            {
+                vec_i b = reinterpret_cast<vec_i const*>(correction_bias)[e2];
+                load_sigmoid(g0, e2 * 2, s[j][0], static_cast<float>(b[0]));
+                load_sigmoid(g1, e2 * 2 + 1, s[j][1], static_cast<float>(b[1]));
+            }
+            else
+            {
+                load_sigmoid(g0, e2 * 2, s[j][0], 0.0f);
+                load_sigmoid(g1, e2 * 2 + 1, s[j][1], 0.0f);
+            }
+        };
         if(row_vec2)
         {
             vec_i g = reinterpret_cast<vec_i const*>(input_ptr)[e2];
-            g0      = g[0];
-            g1      = g[1];
+            consume(g[0], g[1]);
         }
         else
         {
-            g0 = input_ptr[e2 * 2];
-            g1 = input_ptr[e2 * 2 + 1];
-        }
-        if constexpr(isSoftmax)
-        {
-            s[j][0] = static_cast<float>(g0);
-            s[j][1] = static_cast<float>(g1);
-        }
-        else if constexpr(isBiased)
-        {
-            vec_i b = reinterpret_cast<vec_i const*>(correction_bias)[e2];
-            load_sigmoid(g0, e2 * 2, s[j][0], static_cast<float>(b[0]));
-            load_sigmoid(g1, e2 * 2 + 1, s[j][1], static_cast<float>(b[1]));
-        }
-        else
-        {
-            load_sigmoid(g0, e2 * 2, s[j][0], 0.0f);
-            load_sigmoid(g1, e2 * 2 + 1, s[j][1], 0.0f);
+            consume(input_ptr[e2 * 2], input_ptr[e2 * 2 + 1]);
         }
     }
     if constexpr(HAS_TAIL)
