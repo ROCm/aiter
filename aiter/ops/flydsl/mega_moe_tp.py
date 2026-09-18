@@ -97,7 +97,253 @@ _BF16_VIA_IMPL = os.environ.get("AITER_TP_MEGA_BF16_VIA_IMPL", "0") == "1"
 #: -10.8% / -5.9% / -4.8% on glm5 at 32/64/128 tokens and -5.7% on dsv3 at 32,
 #: and neutral (within +-0.3%) everywhere the gate declines. Set to 0 to pin the
 #: separate GEMM1 / GEMM2 / ReduceScatter launches.
-_STAGE12 = os.environ.get("AITER_TP_MEGA_STAGE12", "1") == "1"
+#: DEFAULT OFF pending a root cause: the merged kernel returns garbage
+#: (rel_l2 1.0) for fewer than 8 local rows, while 8/16/32/64/128/256 are all
+#: correct. Measured with the wire forced to bf16 so the gate applies:
+#:
+#:     local rows   2      4      8      16
+#:     dsv3         0.003  1.000  0.005  0.006
+#:     glm5         1.000  1.000  0.006  0.005
+#:
+#: The shared RS tail is *not* the culprit -- it is correct at 2 local rows on
+#: the fp4 wire (dsv3 TP8 M=16, rel_l2 0.0040) -- so this is specific to the
+#: merged kernel. Gating at ">= 8" would be guessing the boundary from four
+#: points, which is the mistake already made once with the BM16 gate, so the
+#: feature is off until the mechanism is understood.
+_STAGE12 = os.environ.get("AITER_TP_MEGA_STAGE12", "0") == "1"
+#: Bypass tuned lookup and pin GEMM1/GEMM2 to the two families that expose a
+#: ``_composition`` hook -- the prerequisite for one kernel covering every a4w4
+#: shape. Costs per-shape tuning; buys a single code path.
+_PIN_KERNELS = os.environ.get("AITER_TP_MEGA_PIN_KERNELS", "0") == "1"
+#: Sort/tile block for the pinned rows: an int to fix it, or "auto" to pick per
+#: token bucket. Must be a pre-quantized fp4 GEMM1 variant, i.e. BM in
+#: {32, 64, 128} -- BM16 exists only as inline-quant, which the fp4 wire cannot
+#: use. Note BM128 has no ``nt`` variant, so ``use_nt`` follows the table.
+_PIN_BM = os.environ.get("AITER_TP_MEGA_PIN_BM", "auto")
+#: Largest bucket still served by each block size, in order. Padding is
+#: ``experts * (BM - 1)`` sorted rows, so a big BM is pure overhead until the
+#: routes per expert catch up; past that the wider tile wins. Measured on TP4
+#: across all four models, e2e us, best block size per token count:
+#:
+#:     M       128  512  1024  2048  4096  8192  32768
+#:     winner   32   32    32    64  64/128  128   128
+#:
+#: 4096 splits 2-2 between 64 and 128, so it is resolved by worst-case cost:
+#: picking 128 costs glm5 11.6%, picking 64 costs kimi3 35.7%.
+_PIN_BM_LADDER = ((1024, 32), (2048, 64), (1 << 30, 128))
+
+
+def _pinned_block_m(bucket: int) -> tuple[int, bool]:
+    """(block_m, use_nt) for one token bucket on the pinned GEMM1 family."""
+    if _PIN_BM != "auto":
+        bm = int(_PIN_BM)
+    else:
+        bm = next(b for limit, b in _PIN_BM_LADDER if bucket <= limit)
+    if bm not in (32, 64, 128):
+        raise ValueError(f"pinned block_m must be 32/64/128 (fp4 prequant), got {bm}")
+    # (BM, use_nt, inline_quant=False) must be in MXFP4_G1_VARIANTS["fp4"];
+    # 128 is only compiled without nt.
+    return bm, bm != 128
+
+
+# ---------------------------------------------------------------------------
+# Pinned-path tuning: candidate space, per-shape CSV, tuner override
+# ---------------------------------------------------------------------------
+#: Per-(shape, token) winners for the pinned single-family path, produced by
+#: ``op_tests/multigpu_tests/tune_mega_moe_TP.py``. The heuristic ladder above
+#: is only the fallback for shapes this file does not cover: a fixed ladder
+#: picked the best block_m in just 18 of 28 measured TP8 cells, and the misses
+#: cost up to 2.55x, so the shapes that matter are tuned rather than guessed.
+#:
+#: ``inter_dim`` in this file is the **per-rank shard**, not the full tensor,
+#: because that is what the pinned GEMMs actually see.
+_PIN_TUNED_CSV = "flydsl_fuse_kernel_tuned_fmoe.csv"
+
+#: Key columns; a row matches a call when all of these are equal.
+_PIN_TUNED_KEYS = (
+    "gfx",
+    "cu_num",
+    "tp",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "act_type",
+)
+
+#: Set by the tuner to force one candidate, bypassing CSV and ladder alike.
+_PIN_OVERRIDE: dict | None = None
+
+
+def set_pin_override(choice: dict | None) -> None:
+    """Force one pinned config, or restore CSV/ladder lookup with ``None``.
+
+    Used by the tuner to walk the candidate space in-process; not a runtime
+    knob. Callers must drop any cached plan afterwards (see
+    :meth:`MegaMoeTPEngine.plan`, which bypasses its cache while an override is
+    active).
+    """
+    global _PIN_OVERRIDE
+    _PIN_OVERRIDE = choice
+
+
+def pin_tuned_csv_path() -> str:
+    """Absolute path of the pinned-path tuned config file.
+
+    ``AITER_TP_MEGA_PIN_TUNED_CSV`` redirects it, so a tuning run can write a
+    candidate file without overwriting the shipped one.
+    """
+    override = os.environ.get("AITER_TP_MEGA_PIN_TUNED_CSV")
+    if override:
+        return override
+    import aiter.configs
+
+    return os.path.join(os.path.dirname(aiter.configs.__file__), _PIN_TUNED_CSV)
+
+
+@functools.lru_cache(maxsize=4)
+def _load_pin_tuned(path: str, mtime: float) -> dict:
+    """Read the pinned tuned CSV into ``{key tuple: choice dict}``.
+
+    ``mtime`` is part of the cache key only so a tuner rewriting the file in the
+    same process is picked up rather than served stale.
+    """
+    import csv as _csv
+
+    table: dict = {}
+    try:
+        with open(path, newline="") as fh:
+            for row in _csv.DictReader(fh):
+                try:
+                    key = _pin_tuned_key(
+                        gfx=row["gfx"],
+                        cu_num=int(row["cu_num"]),
+                        tp=int(row["tp"]),
+                        token=int(row["token"]),
+                        model_dim=int(row["model_dim"]),
+                        inter_dim=int(row["inter_dim"]),
+                        expert=int(row["expert"]),
+                        topk=int(row["topk"]),
+                        act_type=row["act_type"],
+                    )
+                except (KeyError, ValueError):
+                    continue  # malformed row: fall back rather than crash
+                table[key] = {
+                    "block_m": int(row["block_m"]),
+                    "kernel1": row["kernelName1"],
+                    "kernel2": row["kernelName2"],
+                }
+    except FileNotFoundError:
+        pass
+    return table
+
+
+def _pin_tuned_key(**kw) -> tuple:
+    return tuple(kw[name] for name in _PIN_TUNED_KEYS)
+
+
+def pinned_candidates(cfg: "MegaMoeTPConfig") -> list[dict]:
+    """Every legal pinned (GEMM1, GEMM2) tile choice for one shape.
+
+    The search space the tuner walks. Constraints come from
+    ``mxfp4_gemm1_kernels._validate`` (GEMM1) and ``stage2_rs_supported``
+    (GEMM2), so every entry here is expected to compile and to keep the fused
+    ReduceScatter available.
+    """
+    n_out = 2 * cfg.inter_dim
+    out = []
+    for bm, use_nt, inline in sorted(MXFP4_G1_VARIANTS["fp4"]):
+        if inline:
+            continue  # the FP4 wire hands GEMM1 an already-quantized operand
+        for g1_bn in (64, 128, 256):
+            # BN64 is compiled only for BM32 A4W4 non-inline.
+            if g1_bn == 64 and bm != 32:
+                continue
+            if n_out % g1_bn:
+                continue
+            for g1_bk in (128, 256):
+                if cfg.model_dim % g1_bk or cfg.model_dim // g1_bk > 32:
+                    continue
+                for g2_tn in (128, 256):
+                    if cfg.model_dim % g2_tn:
+                        continue
+                    for g2_tk in (128, 256):
+                        if cfg.inter_dim % g2_tk:
+                            continue
+                        for epilog in ("atomic", "reduce"):
+                            for g2_nt in (True, False):
+                                out.append(
+                                    {
+                                        "block_m": bm,
+                                        "g1_nt": use_nt,
+                                        "g1_bn": g1_bn,
+                                        "g1_bk": g1_bk,
+                                        "g2_tn": g2_tn,
+                                        "g2_tk": g2_tk,
+                                        "g2_epilog": epilog,
+                                        "g2_nt": g2_nt,
+                                    }
+                                )
+    return out
+
+
+def pinned_default_choice(cfg: "MegaMoeTPConfig", bucket: int) -> dict:
+    """The heuristic pinned config: widest even tile, ladder ``block_m``.
+
+    What the pinned path runs for a shape the tuned CSV does not cover, and the
+    baseline a tuning run measures against. Exposed so the tuner can time it
+    explicitly rather than by clearing its override, which would otherwise read
+    back the half-written CSV it is in the middle of producing.
+    """
+    bm, use_nt = _pinned_block_m(bucket)
+    n_out = 2 * cfg.inter_dim
+    # GEMM1 tiles: N over the gate/up axis, K over model_dim.
+    g1_bn = 256 if n_out % 256 == 0 else 128
+    g1_bk = 256 if cfg.model_dim % 256 == 0 else 128
+    # GEMM2 tiles: N over model_dim, K over the inter shard.
+    g2_tn = 256 if cfg.model_dim % 256 == 0 else 128
+    g2_tk = 256 if cfg.inter_dim % 256 == 0 else 128
+    if n_out % g1_bn or cfg.model_dim % g1_bk or cfg.inter_dim % g2_tk:
+        raise ValueError(
+            f"shape h{cfg.model_dim} i{cfg.inter_dim} does not tile onto the "
+            "pinned GEMM1/GEMM2 families"
+        )
+    return {
+        "block_m": bm,
+        "g1_nt": use_nt,
+        "g1_bn": g1_bn,
+        "g1_bk": g1_bk,
+        "g2_tn": g2_tn,
+        "g2_tk": g2_tk,
+        "g2_epilog": "atomic",
+        "g2_nt": use_nt,
+    }
+
+
+def pinned_kernel_names(cfg: "MegaMoeTPConfig", choice: dict) -> tuple[str, str]:
+    """(kernel1, kernel2) for one entry of :func:`pinned_candidates`."""
+    from aiter.ops.flydsl.moe_kernels import build_flydslv2_gemm2_name
+
+    bm = int(choice["block_m"])
+    act = "_situv2" if cfg.activation == ActivationType.Situv2 else ""
+    nt = "_nt" if choice["g1_nt"] else ""
+    kernel1 = (
+        f"flydsl_mxmoe_g1_a4w4_{bm}x{choice['g1_bn']}x{choice['g1_bk']}{nt}{act}"
+    )
+    kernel2 = build_flydslv2_gemm2_name(
+        "fp4",
+        "fp4",
+        "bf16",
+        tm=bm,
+        epilog=choice["g2_epilog"],
+        persist=False,
+        use_nt=choice["g2_nt"],
+        sbm=bm,
+        tn=choice["g2_tn"],
+        tk=choice["g2_tk"],
+    )
+    return kernel1, kernel2
 
 
 __all__ = ["MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
@@ -318,12 +564,82 @@ class MegaMoeTP:
         from aiter.fused_moe import get_padded_M
 
         bucket = int(get_padded_M(global_tokens))
+        if _PIN_OVERRIDE is not None:
+            # The tuner walks candidates in-process; a cached plan would pin the
+            # first one for the rest of the sweep.
+            return self._resolve_plan(bucket)
         cached = self._plan_cache.get(bucket)
         if cached is not None:
             return cached
         plan = self._resolve_plan(bucket)
         self._plan_cache[bucket] = plan
         return plan
+
+
+    # -- pinned single-family kernel selection --------------------------------
+    def _pinned_row(self, bucket: int):
+        """Build a (metadata, kernel1, kernel2) row on the two chosen families.
+
+        GEMM1 is pinned to ``flydsl_mxmoe_g1_a4w4_*`` and GEMM2 to
+        ``flydsl_moe2_layout_afp4_wfp4_*`` -- the only two families that expose a
+        ``_composition`` hook, and therefore the only pair a single kernel can
+        host. The stock tuned lookup is bypassed entirely: the point is one code
+        path for every a4w4 shape.
+
+        Staying on one family does not mean staying on one tile, though. Tiles
+        come from :data:`_PIN_TUNED_CSV` where the shape is tuned, and from the
+        widest-even-divisor heuristic otherwise.
+        """
+        from aiter.fused_moe import _make_mxfp4_metadata
+
+        cfg = self.cfg
+        # Precedence: tuner override > per-shape tuned CSV > heuristic ladder.
+        if _PIN_OVERRIDE is not None:
+            kernel1, kernel2 = pinned_kernel_names(cfg, _PIN_OVERRIDE)
+            BM = int(_PIN_OVERRIDE["block_m"])
+        else:
+            tuned = self._pinned_tuned_lookup(bucket)
+            if tuned is not None:
+                kernel1, kernel2, BM = tuned
+            else:
+                kernel1, kernel2, BM = self._pinned_default(bucket)
+        metadata = _make_mxfp4_metadata(
+            kernel1, kernel2, GateMode.SEPARATED.value, 0, block_m=BM
+        )
+        return metadata, kernel1, kernel2
+
+    def _pinned_tuned_lookup(self, bucket: int):
+        """``(kernel1, kernel2, block_m)`` from the tuned CSV, or ``None``."""
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+        cfg = self.cfg
+        path = pin_tuned_csv_path()
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        table = _load_pin_tuned(path, mtime)
+        key = _pin_tuned_key(
+            gfx=get_gfx(),
+            cu_num=int(get_cu_num()),
+            tp=int(cfg.world_size),
+            token=int(bucket),
+            model_dim=int(cfg.model_dim),
+            inter_dim=int(cfg.inter_dim),
+            expert=int(cfg.experts),
+            topk=int(cfg.topk),
+            act_type=str(cfg.activation),
+        )
+        row = table.get(key)
+        if row is None:
+            return None
+        return row["kernel1"], row["kernel2"], int(row["block_m"])
+
+    def _pinned_default(self, bucket: int):
+        """Heuristic fallback: widest tile the shape divides, ladder block_m."""
+        choice = pinned_default_choice(self.cfg, bucket)
+        kernel1, kernel2 = pinned_kernel_names(self.cfg, choice)
+        return kernel1, kernel2, int(choice["block_m"])
 
     def _tuned_row(self, bucket: int):
         """Look up the tuned two-stage config for one token bucket.
@@ -400,6 +716,14 @@ class MegaMoeTP:
 
     def _resolve_plan(self, bucket: int) -> "_CasePlan":
         cfg = self.cfg
+        # An active tuner override implies the pinned path even when the env
+        # switch is off, so a tuning run needs no extra environment setup.
+        if _PIN_KERNELS or _PIN_OVERRIDE is not None:
+            metadata, kernel1, kernel2 = self._pinned_row(bucket)
+            return _CasePlan(
+                bucket, "fp4_1x32", kernel1, kernel2, metadata, bucket,
+                self._fuses_rs(kernel2),
+            )
         _, kernel1, kernel2 = self._tuned_row(bucket)
         prequant_ok = _gemm1_takes_prequantized_fp4(kernel1)
 

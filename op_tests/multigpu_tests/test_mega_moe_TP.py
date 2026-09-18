@@ -1155,7 +1155,19 @@ def run_case(
             # chaining the modules (tuned-config lookup, moe_sorting wrapper,
             # per-launch Python). At small M that is a real part of the gap the
             # fused kernel closes, so keep it visible rather than hiding it.
+            #
+            # It is a *residual*, not a measurement, and a biased one: every leg
+            # takes the minimum over its own rounds independently of e2e, so a
+            # sum of independent minima is <= the minimum of the sum even on an
+            # idle node. A large value therefore means either real dispatch cost
+            # or that one timed region caught interference the others missed --
+            # see host_gap_pct, which flags the rows worth re-measuring.
             "host_gap_us": e2e_mean - (ag_mean + moe_mean + rs_mean),
+            "host_gap_pct": (
+                100.0 * (e2e_mean - (ag_mean + moe_mean + rs_mean)) / e2e_mean
+                if e2e_mean
+                else 0.0
+            ),
             "comm_pct": 100.0 * (ag_mean + rs_mean) / e2e_mean if e2e_mean else 0.0,
             "ag_GBps": moe.allgather.wire_bytes(inputs.local_tokens) / ag_max / 1e3,
             "rs_GBps": moe.reduce_scatter.wire_bytes(inputs.local_tokens)
@@ -1247,6 +1259,76 @@ def run_case(
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+#: Above this global token count, host dispatch is a fixed cost that should be
+#: a small share of e2e, so a large ``host_gap_pct`` there means a timed region
+#: caught interference rather than real dispatch work.
+_SUSPECT_MIN_TOKENS = 2048
+#: Clean TP8 rows at those sizes measured 0.5-2.5%; the two contaminated ones
+#: measured 10.0% and 11.4%. 8% separates them with room to spare.
+_SUSPECT_GAP_PCT = 8.0
+
+
+def _suspect_note(row: dict, global_tokens: int) -> str:
+    """Flag a row whose leg accounting does not add up.
+
+    ``host_gap_us`` is a residual, so interference in any one timed region shows
+    up there rather than in the leg that actually suffered. Saying so at print
+    time turns a silently wrong speedup into a visible one -- the alternative is
+    reading a contaminated number as a result, which has already happened once.
+    """
+    gap_pct = row.get("host_gap_pct")
+    if (
+        gap_pct is None
+        or global_tokens < _SUSPECT_MIN_TOKENS
+        or gap_pct < _SUSPECT_GAP_PCT
+    ):
+        return ""
+    return (
+        f"  [SUSPECT host_gap={gap_pct:.0f}% of e2e; re-measure with more "
+        "--rounds before trusting this row]"
+    )
+
+
+#: How much a smaller M may exceed the next larger M before it is called out.
+#: Not pure noise slack: at TP8 the smallest sweep point is one local token,
+#: whose fused path is reproducibly 6-8% slower than two local tokens on all
+#: four models (measured at --rounds 15, so it is real behaviour and not
+#: interference). The threshold sits above that floor; the contaminated rows
+#: this check exists to catch measured 1.20x and 1.42x.
+_MONOTONIC_SLACK = 1.12
+
+
+def _report_non_monotonic(df) -> None:
+    """Warn where a smaller token count timed slower than a larger one.
+
+    The per-row ``host_gap`` check cannot fire at small M, where a large gap is
+    honest dispatch cost. What still holds there is monotonicity: doubling the
+    tokens cannot make the layer faster, so ``e2e(M) > e2e(2M)`` means the
+    smaller cell caught interference. This is how kimi3 M=8 was caught reading
+    1.49x when a clean re-measure gave 1.15x.
+    """
+    hits = []
+    for col in ("e2e_us", "fused_us"):
+        if col not in df.columns:
+            continue
+        for model, grp in df.groupby("model"):
+            grp = grp.sort_values("global_tokens")
+            toks = grp["global_tokens"].tolist()
+            vals = grp[col].tolist()
+            for i in range(len(vals) - 1):
+                a, b = vals[i], vals[i + 1]
+                if a == a and b == b and a > b * _MONOTONIC_SLACK:
+                    hits.append((model, col, toks[i], a, toks[i + 1], b))
+    if not hits:
+        return
+    print("\n[SUSPECT] smaller M timed slower than the next larger M:")
+    for model, col, m0, v0, m1, v1 in hits:
+        print(
+            f"  {model} {col}: M={m0} {v0:.1f}us > M={m1} {v1:.1f}us "
+            f"({v0 / v1:.2f}x) -- re-measure M={m0} with more --rounds"
+        )
+
+
 _PERF_COLUMNS = [
     "model",
     "global_tokens",
@@ -1259,6 +1341,7 @@ _PERF_COLUMNS = [
     "moe_other_us",
     "rs_us",
     "host_gap_us",
+    "host_gap_pct",
     "e2e_us",
     "comm_pct",
     "ag_GBps",
@@ -1502,7 +1585,8 @@ def main(argv=None) -> int:
                                 f"other={row['moe_other_us']:.1f} "
                                 f"rs={row['rs_us']:.1f} "
                                 f"e2e={row['e2e_us']:.1f}us "
-                                f"comm={row['comm_pct']:.0f}%",
+                                f"comm={row['comm_pct']:.0f}%"
+                                + _suspect_note(row, global_tokens),
                                 flush=True,
                             )
                     barrier()
@@ -1521,6 +1605,7 @@ def main(argv=None) -> int:
             if args.csv:
                 df[cols + extra].to_csv(args.csv, index=False)
                 print(f"\nwrote {args.csv}")
+            _report_non_monotonic(df)
             print("\nkernels selected:")
             print(
                 df[["model", "global_tokens", "gemm1_kernel", "gemm2_kernel"]]
