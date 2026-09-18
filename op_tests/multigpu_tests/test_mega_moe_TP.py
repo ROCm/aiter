@@ -960,6 +960,46 @@ def jit_warmup(
     return all_ranks_ok(ok, ctx.device)
 
 
+
+def _time_graph(fused, inputs, args, ctx) -> float:
+    """Capture one fused forward into a CUDA graph and time the replay.
+
+    Returns NaN rather than raising when capture is not possible: this is a
+    diagnostic column, and a shape that cannot be captured should not take the
+    sweep down with it.
+    """
+    try:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                fused(inputs)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = fused(inputs)
+        torch.cuda.synchronize()
+        mean, _ = time_us(
+            graph.replay,
+            iters=args.iters,
+            warmup=args.warmup,
+            device=ctx.device,
+            rounds=args.rounds,
+        )
+        # A replay that is fast but wrong is worthless, and every fused kernel
+        # here takes its epoch from the arena rather than the host precisely so
+        # replay stays correct -- so check it rather than assume it.
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = out.clone()
+        return mean, replayed
+    except Exception as exc:  # noqa: BLE001 - diagnostic column only
+        logging.getLogger(__name__).warning("[TP-MOE] graph capture failed: %s", exc)
+        return float("nan"), None
+
+
 def run_case(
     shape: ModelShape,
     weights: TpMoeWeights,
@@ -1157,15 +1197,38 @@ def run_case(
         # Isolates "the arena buffers / prequantized operand made the GEMMs
         # slower" from "the fused driver's own dispatch costs more".
         f_moe_mean, _ = timer(lambda: engine.local_moe(a1, a1_scale, f_w, f_i, plan))
-        f_rs_mean, _ = timer(
-            lambda: engine.reduce_scatter(inputs.local_tokens, plan)
-        )
+        if plan.fuse_rs:
+            # The ReduceScatter rides in GEMM2's tail, so there is no separate
+            # leg to time: what is comparable to (unfused GEMM + RS) is the one
+            # call that now does both. Report it as the RS leg's cost *over* the
+            # bare MoE so the two columns still add up to the same total.
+            f_moe_rs_mean, _ = timer(
+                lambda: engine.local_moe(
+                    a1, a1_scale, f_w, f_i, plan, inputs.local_tokens
+                )
+            )
+            f_rs_mean = max(0.0, f_moe_rs_mean - f_moe_mean)
+        else:
+            f_rs_mean, _ = timer(
+                lambda: engine.reduce_scatter(inputs.local_tokens, plan)
+            )
         fused_mean, _ = timer(lambda: fused(inputs))
+        if args.graph:
+            # Everything on the fused path is a device-side-epoch kernel, so a
+            # captured graph replays correctly. Replay removes *all* host-side
+            # dispatch, so the gap between this and fused_us is exactly what
+            # collapsing the remaining launches could still win -- and what is
+            # left is real device work.
+            row["fused_graph_us"], replayed = _time_graph(fused, inputs, args, ctx)
+            if replayed is not None:
+                row["fused_graph_rel_l2"] = rel_l2(replayed, fused(inputs))
+                del replayed
         row.update(
             {
                 "fused_ag_us": f_ag_mean,
                 "fused_moe_us": f_moe_mean,
                 "fused_rs_us": f_rs_mean,
+                "fused_rs_mode": "fused" if plan.fuse_rs else "split",
                 "fused_us": fused_mean,
                 "fused_speedup": (
                     e2e_mean / fused_mean if fused_mean else float("nan")
@@ -1212,6 +1275,9 @@ _PERF_COLUMNS = [
     "fused_ag_us",
     "fused_moe_us",
     "fused_rs_us",
+    "fused_rs_mode",
+    "fused_graph_us",
+    "fused_graph_rel_l2",
     "fused_us",
     "ag_gain",
     "rs_gain",
@@ -1309,6 +1375,13 @@ def parse_args(argv=None):
         choices=["unfused", "fused", "both"],
         default="unfused",
         help="Which implementations to run.",
+    )
+    p.add_argument(
+        "--graph",
+        action="store_true",
+        help="Also time the fused path replayed from a CUDA graph. The gap to "
+        "fused_us is the host-side dispatch cost that collapsing the remaining "
+        "launches could still remove.",
     )
     p.add_argument("--csv", default=None, help="Write the perf table here (rank 0).")
     return p.parse_args(argv)

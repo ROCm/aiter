@@ -56,6 +56,11 @@ from .allgather_push import (
     compile_allgather_push,
     push_units,
 )
+from .allgather_quant_push import (
+    compile_allgather_quant_push,
+    quant_push_supported,
+    quant_push_units,
+)
 from .p2p import (
     DESC_ARRIVE,
     DESC_FLAGS,
@@ -64,7 +69,9 @@ from .p2p import (
     desc_region_src,
 )
 from .reduce_scatter import (
+    RS_ARRIVE_SLOTS,
     RS_DESC_EPOCH,
+    RS_DESC_FANIN,
     RS_DESC_OUTPUT,
     RS_DESC_PARTIAL,
     RS_PULL_UNROLL,
@@ -222,15 +229,28 @@ class TpMoeCollectives:
         ]
         self._ag_sources: tuple[int, ...] = ()
         self._ag_launch = compile_allgather_push(self.world_size, self.row_bytes)
+        # Quantize-on-the-wire variant: same arena, same descriptor, but
+        # region 0's source is the BF16 activation and the E8M0 scales are
+        # produced in the kernel instead of read from a staging buffer.
+        self._agq_launch = None
+        if self.fp4_wire and quant_push_supported(self.model_dim, self.topk):
+            self._agq_launch = compile_allgather_quant_push(
+                self.world_size, self.model_dim, self.topk
+            )
 
         # -- ReduceScatter descriptor -----------------------------------------
         self._rs_desc, rs_host = self._new_desc(
             rs_desc_size(self.world_size), rs_arrive, rs_flags
         )
+        # Local-only, deliberately outside the arena: see RS_ARRIVE_SLOTS.
+        self._rs_fanin = torch.zeros(
+            RS_ARRIVE_SLOTS, dtype=torch.int32, device=self.device
+        )
         for which, value in (
             (RS_DESC_PARTIAL, partial.offset),
             (RS_DESC_OUTPUT, self._output.data_ptr()),
             (RS_DESC_EPOCH, rs_epoch.peer_ptrs[self.rank]),
+            (RS_DESC_FANIN, self._rs_fanin.data_ptr()),
         ):
             rs_host[rs_desc_slot(self.world_size, which)] = int(value)
         self._rs_desc.copy_(
@@ -354,7 +374,81 @@ class TpMoeCollectives:
             )
         return self._partial.local[:tokens]
 
+    def quant_push_available(self) -> bool:
+        """Whether this shape can quantize inside the AllGather kernel."""
+        return self._agq_launch is not None
+
+    def all_gather_quant(self, x_local, topk_ids, topk_weights):
+        """AllGather a BF16 activation, quantizing to MXFP4 on the way out.
+
+        Same result as ``all_gather`` on a pre-quantized operand -- the packed
+        payload and E8M0 scales land in the same arena regions -- but the quant
+        kernel, its staging buffers, and the round trip through them are gone.
+        """
+        if self._agq_launch is None:
+            raise RuntimeError("this shape has no fused quantize-and-push kernel")
+        rows = int(topk_ids.shape[0])
+        if rows > self.max_local_tokens:
+            raise ValueError(
+                f"local tokens {rows} exceeds max_local_tokens {self.max_local_tokens}"
+            )
+        if x_local.dtype != dtypes.bf16 or not x_local.is_contiguous():
+            raise ValueError("the fused quant push needs a contiguous bf16 operand")
+        if x_local.shape != (rows, self.model_dim):
+            raise ValueError(
+                f"x_local {tuple(x_local.shape)} != ({rows}, {self.model_dim})"
+            )
+        for tensor in (topk_ids, topk_weights):
+            if not tensor.is_contiguous():
+                raise ValueError("every push source must be contiguous")
+        # Region 1 (scales) has no source -- the kernel produces them -- but the
+        # descriptor slot still has to hold a mapped address.
+        self._publish_ag_sources(
+            (
+                int(x_local.data_ptr()),
+                int(x_local.data_ptr()),
+                int(topk_ids.data_ptr()),
+                int(topk_weights.data_ptr()),
+            )
+        )
+        units = quant_push_units(rows, self.model_dim, self.topk)
+        _run_compiled(
+            self._agq_launch,
+            int(self._ag_desc.data_ptr()),
+            int(self.rank),
+            int(rows),
+            self._grid(units, self._agq_launch.block, 1),
+            torch.cuda.current_stream(),
+        )
+        total = rows * self.world_size
+        return GatheredActivations(
+            payload=self._payload.local[:total],
+            scale=self._scale.local[:total],
+            topk_ids=self._ids.local[:total],
+            topk_weights=self._weights.local[:total],
+            tokens=total,
+        )
+
     # -- ReduceScatter ------------------------------------------------------
+    def rs_descriptor(self) -> int:
+        """Device address of the ReduceScatter descriptor.
+
+        A kernel that folds the ReduceScatter into its own tail needs the same
+        descriptor :meth:`reduce_scatter` hands the standalone publish and pull
+        kernels; handing out the pointer keeps the arena and its slot layout
+        owned here.
+        """
+        return int(self._rs_desc.data_ptr())
+
+    def output_buffer(self, local_tokens: int) -> torch.Tensor:
+        """The ``[local_tokens, H]`` buffer the ReduceScatter writes."""
+        if local_tokens > self.max_local_tokens:
+            raise ValueError(
+                f"local tokens {local_tokens} exceeds max_local_tokens "
+                f"{self.max_local_tokens}"
+            )
+        return self._output[:local_tokens]
+
     def reduce_scatter(self, local_tokens: int) -> torch.Tensor:
         """Sum every peer's partial over this rank's token range."""
         if local_tokens > self.max_local_tokens:

@@ -48,13 +48,29 @@ What is fused here
     ``topk_ids`` and ``topk_weights`` are packed into one int32 payload so the
     routing costs a single collective rather than two.
 
+``GEMM2 -> ReduceScatter``
+    GEMM2's atomic epilogue already accumulates into the symmetric arena slice
+    the ReduceScatter reads, so the only thing between them is "have all peers
+    landed".  :mod:`.kernels.mega_moe_tp.stage2_rs` folds the publish and the
+    pull into GEMM2's own kernel, paying a device-side counter for that instead
+    of two launches and the host gaps around them.  Measured on TP8 kimi3
+    against the same run with ``rs_fuse='off'``: 373 -> 336 us at 8 global
+    tokens, 386 -> 367 at 64, and level at 512.
+
+    This needs a GEMM2 that accumulates in place, i.e. a non-persistent
+    ``atomic`` row; a tuned ``reduce`` row stages per-route output and needs a
+    separate reduction kernel afterwards, so those fall back to the standalone
+    collective automatically.
+
 Only a4w4 (MXFP4 activation x MXFP4 weight, ``QuantType.per_1x32``) is wired up.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
-from dataclasses import dataclass, replace
+import os
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -72,6 +88,11 @@ from .mxfp4_kname import (
 
 logger = logging.getLogger("aiter")
 
+#: Send the BF16 wire through ``_fused_moe_impl`` so it can reach the fused
+#: ReduceScatter. Off by default: a net loss in eager mode, free under graphs.
+_BF16_VIA_IMPL = os.environ.get("AITER_TP_MEGA_BF16_VIA_IMPL", "0") == "1"
+
+
 __all__ = ["MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
 
 QUANT_TYPE = QuantType.per_1x32
@@ -88,6 +109,9 @@ WQ_DTYPE = dtypes.fp4x2
 AG_WIRE_MODES = ("auto", "fp4_1x32", "bf16")
 #: Wire formats understood for the ReduceScatter leg.
 RS_WIRE_MODES = ("auto", "bf16")
+#: Whether the ReduceScatter rides in GEMM2's tail (``auto``) or stays two
+#: standalone launches (``off``).
+RS_FUSE_MODES = ("auto", "off")
 
 
 @dataclass(frozen=True)
@@ -106,6 +130,21 @@ class MegaMoeTPConfig:
     linear_beta: float | None = None
     ag_wire: str = "auto"
     rs_wire: str = "auto"
+    #: ``auto`` folds the ReduceScatter into the GEMM2 kernel's tail whenever
+    #: the tuned GEMM2 is a non-persistent atomic-epilogue row (the only kind
+    #: that accumulates straight into the arena partial); ``off`` keeps the
+    #: standalone publish + pull launches. ``AITER_TP_MEGA_RS_FUSE`` moves the
+    #: default, so an A/B needs no code change.
+    rs_fuse: str = field(
+        default_factory=lambda: os.environ.get("AITER_TP_MEGA_RS_FUSE", "auto")
+    )
+    #: ``auto`` lets the AllGather push kernel do the MXFP4 quantization itself
+    #: (one less launch, no staging buffer) whenever ``model_dim`` splits into
+    #: whole 128-element per-thread units; ``off`` keeps the separate quant
+    #: kernel. ``AITER_TP_MEGA_AGQ_FUSE`` moves the default.
+    ag_quant_fuse: str = field(
+        default_factory=lambda: os.environ.get("AITER_TP_MEGA_AGQ_FUSE", "auto")
+    )
 
     def __post_init__(self):
         if self.world_size <= 0:
@@ -125,6 +164,10 @@ class MegaMoeTPConfig:
             raise ValueError(f"ag_wire must be one of {AG_WIRE_MODES}")
         if self.rs_wire not in RS_WIRE_MODES:
             raise ValueError(f"rs_wire must be one of {RS_WIRE_MODES}")
+        if self.rs_fuse not in RS_FUSE_MODES:
+            raise ValueError(f"rs_fuse must be one of {RS_FUSE_MODES}")
+        if self.ag_quant_fuse not in RS_FUSE_MODES:
+            raise ValueError(f"ag_quant_fuse must be one of {RS_FUSE_MODES}")
 
     @property
     def max_global_tokens(self) -> int:
@@ -336,21 +379,60 @@ class MegaMoeTP:
             probe *= 2
         return None
 
+    def _fuses_rs(self, kernel2: str) -> bool:
+        """Whether this GEMM2 can carry the ReduceScatter in its own tail."""
+        if self.cfg.rs_fuse == "off":
+            return False
+        from aiter.ops.flydsl.kernels.mega_moe_tp.stage2_rs import stage2_rs_supported
+        from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+        try:
+            return stage2_rs_supported(parse_flydsl_v2_gemm2_kernel(kernel2))
+        except Exception:  # noqa: BLE001 - probe only, never fatal
+            return False
+
     def _resolve_plan(self, bucket: int) -> "_CasePlan":
         cfg = self.cfg
         _, kernel1, kernel2 = self._tuned_row(bucket)
         prequant_ok = _gemm1_takes_prequantized_fp4(kernel1)
 
         if cfg.ag_wire == "bf16":
-            return _CasePlan(bucket, "bf16", kernel1, kernel2, None, bucket)
+            return _CasePlan(
+                bucket,
+                "bf16",
+                kernel1,
+                kernel2,
+                None,
+                bucket,
+                self._fuses_rs(kernel2) if _BF16_VIA_IMPL else False,
+            )
         if prequant_ok:
-            return _CasePlan(bucket, "fp4_1x32", kernel1, kernel2, None, bucket)
+            # The FP4 wire always goes through ``_fused_moe_impl`` (it needs the
+            # prequant metadata hook regardless), so the fused tail is free here.
+            return _CasePlan(
+                bucket, "fp4_1x32", kernel1, kernel2, None, bucket,
+                self._fuses_rs(kernel2),
+            )
 
         # The tuned row for this bucket quantizes inline, so it cannot read the
         # FP4 wire, and at BM16 no pre-quantized variant exists to retune onto.
         # Borrow a larger bucket's row instead -- both stages together, so the
         # GEMM1/GEMM2 scale-layout contract stays self-consistent.
-        borrowed = self._probe_prequant_row(bucket)
+        # Borrowing is a measured loss wherever it fires, so `auto` -- which is
+        # supposed to pick the faster path -- declines it. kimi3 TP8, e2e us:
+        #
+        #   tokens    bf16 wire (own tuned row)    fp4 wire (borrowed row)
+        #        8                        246.1                      304.1
+        #       64                        352.9                      355.9
+        #
+        # The borrowed GEMM row costs +76 us at M=8 while the FP4 wire saves
+        # 0.2 us of AllGather, because at that size the collective is
+        # latency-bound and a 3.77x smaller wire row buys nothing. At the sizes
+        # where the AllGather *is* bandwidth-bound (512, 4096) no borrow is
+        # needed and the FP4 wire wins by 6 and 123 us -- which is why this
+        # declines the borrow rather than the wire. `ag_wire='fp4_1x32'` still
+        # forces it for anyone who wants the smaller wire regardless.
+        borrowed = None if cfg.ag_wire == "auto" else self._probe_prequant_row(bucket)
         if borrowed is not None:
             src, metadata, sub1, sub2 = borrowed
             logger.debug(
@@ -361,7 +443,15 @@ class MegaMoeTP:
                 src,
                 sub1,
             )
-            return _CasePlan(bucket, "fp4_1x32", sub1, sub2, metadata, src)
+            return _CasePlan(
+                bucket,
+                "fp4_1x32",
+                sub1,
+                sub2,
+                metadata,
+                src,
+                self._fuses_rs(sub2),
+            )
 
         if cfg.ag_wire == "fp4_1x32":
             raise ValueError(
@@ -370,7 +460,15 @@ class MegaMoeTP:
                 "token bucket for this shape resolves to one either. Use "
                 "ag_wire='bf16' or tune a non-f16in GEMM1 for this shape."
             )
-        return _CasePlan(bucket, "bf16", kernel1, kernel2, None, bucket)
+        return _CasePlan(
+            bucket,
+            "bf16",
+            kernel1,
+            kernel2,
+            None,
+            bucket,
+            self._fuses_rs(kernel2) if _BF16_VIA_IMPL else False,
+        )
 
     # -- stages -------------------------------------------------------------
     def _collectives(self, wire: str) -> TpMoeCollectives:
@@ -414,6 +512,19 @@ class MegaMoeTP:
             # H/2 + H/32 bytes and each rank only quantizes its own m rows.
             # Per-1x32 MX quant is row-local, so this matches quantizing the
             # gathered tensor exactly.
+            #
+            # Better still, it is row-local arithmetic with no cross-thread
+            # dependency, so where the shape allows it the push kernel does the
+            # quantization itself: one less launch and one less round trip
+            # through the staging buffer.
+            if cfg.ag_quant_fuse != "off" and comm.quant_push_available():
+                gathered = comm.all_gather_quant(x_local, topk_ids, topk_weights)
+                return (
+                    gathered.payload.view(AQ_DTYPE),
+                    gathered.scale.view(dtypes.fp8_e8m0),
+                    gathered.topk_weights,
+                    gathered.topk_ids,
+                )
             payload, scale = self._quant(x_local, quant_dtype=AQ_DTYPE)
             payload = payload.view(torch.uint8)
             scale = scale.view(torch.uint8)
@@ -429,14 +540,204 @@ class MegaMoeTP:
             a1_scale = None
         return a1, a1_scale, gathered.topk_weights, gathered.topk_ids
 
-    def local_moe(self, a1, a1_scale, topk_weights_all, topk_ids_all, plan=None):
+    def _fused_stage2(self, plan: "_CasePlan", local_tokens: int):
+        """A ``metadata.stage2`` that also runs this rank's ReduceScatter.
+
+        GEMM2's atomic epilogue already accumulates into the arena partial, so
+        the only thing standing between it and the ReduceScatter is "have all
+        peers landed". Folding that into the same kernel turns two launches
+        into a device-side counter. Returns ``(stage2, result_box)``; after the
+        MoE call ``result_box[0]`` holds this rank's output shard.
+        """
+        from aiter.ops.flydsl.kernels.mega_moe_tp.stage2_rs import run_stage2_rs
+        from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+        cfg = self.cfg
+        comm = self._collectives(plan.ag_wire)
+        kernel_cfg = parse_flydsl_v2_gemm2_kernel(plan.gemm2_kernel)
+        box: list = [None]
+        if kernel_cfg["epilog"] == "reduce":
+            return self._fused_stage2_reduce(plan, local_tokens, comm, kernel_cfg, box)
+
+        def stage2(
+            inter_states,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            *,
+            w2_scale=None,
+            a2_scale=None,
+            block_m=None,
+            sorted_weights=None,
+            kernelName2="",
+            **_kwargs,
+        ):
+            box[0] = run_stage2_rs(
+                inter_states=inter_states,
+                a2_scale=a2_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                sorted_expert_ids=sorted_expert_ids,
+                num_valid_ids=num_valid_ids,
+                sorted_token_ids=sorted_token_ids,
+                sorted_weights=sorted_weights,
+                partial=moe_out,
+                output=comm.output_buffer(local_tokens),
+                desc_ptr=comm.rs_descriptor(),
+                rank=cfg.rank,
+                tp_size=cfg.world_size,
+                local_rows=local_tokens,
+                M_logical=moe_out.shape[0],
+                NE=w2.shape[0],
+                model_dim=moe_out.shape[1],
+                inter_dim=w1.shape[1] // 2 if w1 is not None else cfg.inter_dim,
+                topk=topk,
+                kernel_cfg=kernel_cfg,
+                block_m=block_m,
+            )
+            return moe_out
+
+        return functools.partial(stage2, kernelName2=plan.gemm2_kernel), box
+
+
+    def _fused_stage2_reduce(self, plan, local_tokens, comm, kernel_cfg, box):
+        """The reduce-epilogue twin of :meth:`_fused_stage2`.
+
+        A ``reduce`` GEMM2 stages per-route rows and a reduction kernel turns
+        them into the ``[M, H]`` partial, so the ReduceScatter rides in *that*
+        kernel instead. Everything before it mirrors
+        ``_flydsl_v2_stage2_wrapper``'s reduce branch, so the GEMM and the
+        intermediate format are the tuned ones.
+        """
+        import os as _os
+
+        import torch as _torch
+
+        from aiter.fused_moe import _flydsl_stage2_fp8_enabled, _mxfp4_scale_u8
+        from aiter.ops.flydsl.kernels.mega_moe_tp.reduce_rs import run_reduce_rs
+        from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+            FP8OUT_PITCH_ALIGN,
+            fp8out_row_bytes,
+            fp8out_scale_blk,
+        )
+        from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+        cfg = self.cfg
+
+        def stage2(
+            inter_states,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            *,
+            w2_scale=None,
+            a2_scale=None,
+            block_m=None,
+            sorted_weights=None,
+            topk_weights=None,
+            kernelName2="",
+            **_kwargs,
+        ):
+            token_num = moe_out.shape[0]
+            model_dim = moe_out.shape[1]
+            inter_dim = w1.shape[1] // 2 if w1 is not None else cfg.inter_dim
+            kstatic = _os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
+            fp8_inter = _flydsl_stage2_fp8_enabled()
+            if fp8_inter and kstatic:
+                fp8_inter = sorted_weights is not None and topk_weights is not None
+            defer_weight = fp8_inter and kstatic
+            scale_blk = pitch_align = None
+            if fp8_inter:
+                scale_blk = fp8out_scale_blk(model_dim) if kstatic else 8
+                pitch_align = FP8OUT_PITCH_ALIGN if kstatic else 0
+                target = _torch.empty(
+                    (
+                        token_num * topk,
+                        fp8out_row_bytes(
+                            model_dim, scale_blk=scale_blk, pitch_align=pitch_align
+                        ),
+                    ),
+                    dtype=_torch.uint8,
+                    device=moe_out.device,
+                )
+            else:
+                target = _torch.empty(
+                    (token_num, topk, model_dim),
+                    dtype=moe_out.dtype,
+                    device=moe_out.device,
+                )
+            mxfp4_moe_gemm2(
+                inter_sorted_quant=_mxfp4_scale_u8(inter_states),
+                inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
+                w2_u8=_mxfp4_scale_u8(w2),
+                w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+                sorted_expert_ids=sorted_expert_ids,
+                cumsum_tensor=num_valid_ids,
+                sorted_token_ids=sorted_token_ids,
+                sorted_weights=sorted_weights,
+                out=target,
+                M_logical=token_num,
+                max_sorted=inter_states.shape[0],
+                NE=w2.shape[0],
+                D_HIDDEN=model_dim,
+                D_INTER=inter_dim,
+                topk=topk,
+                BM=kernel_cfg["tile_m"],
+                BN=kernel_cfg["tile_n"],
+                BK=kernel_cfg["tile_k"],
+                use_nt=kernel_cfg["use_nt"],
+                a_dtype=kernel_cfg["a_dtype"],
+                b_dtype=kernel_cfg["b_dtype"],
+                epilog="reduce",
+                SBM=kernel_cfg["sort_block_m"]
+                or (int(block_m) if block_m else kernel_cfg["tile_m"]),
+                persist=kernel_cfg["persist"],
+                g2_bf16_lds=kernel_cfg["bf16_lds"],
+                g2_spart=kernel_cfg["spart"],
+                out_dtype="fp8" if fp8_inter else "bf16",
+            )
+            box[0] = run_reduce_rs(
+                target=target,
+                partial=moe_out,
+                output=comm.output_buffer(local_tokens),
+                token_num=token_num,
+                topk=topk,
+                model_dim=model_dim,
+                tp_size=cfg.world_size,
+                rank=cfg.rank,
+                local_rows=local_tokens,
+                desc_ptr=comm.rs_descriptor(),
+                is_fp8=fp8_inter,
+                topk_weights=topk_weights if defer_weight else None,
+                fp8_scale_blk=scale_blk,
+                fp8_pitch_align=pitch_align,
+            )
+            return moe_out
+
+        stage2._is_flydsl_v2_stage2 = True
+        return functools.partial(stage2, kernelName2=plan.gemm2_kernel), box
+
+    def local_moe(
+        self, a1, a1_scale, topk_weights_all, topk_ids_all, plan=None, local_tokens=0
+    ):
         """Run GEMM1 + activation + GEMM2 + weighted top-k reduce for all tokens.
 
         The result lands directly in the symmetric arena, so the ReduceScatter
-        that follows reads it in place instead of staging a copy.  GEMM2's
-        atomic epilogue needs a zeroed target and ``moe_sorting`` zeroes
-        whatever output buffer it is handed, so the arena slice is safe to reuse
-        every call.
+        reads it in place instead of staging a copy.  GEMM2's atomic epilogue
+        needs a zeroed target and ``moe_sorting`` zeroes whatever output buffer
+        it is handed, so the arena slice is safe to reuse every call.
+
+        With ``plan.fuse_rs`` the ReduceScatter rides in GEMM2's own tail and
+        this returns ``(partial, y_local)``; otherwise it returns
+        ``(partial, None)`` and the caller runs the standalone collective.
 
         The BF16 wire hands the activation to the ordinary public entry point;
         only the MXFP4 wire needs the private one, to force the pre-quantized
@@ -445,15 +746,28 @@ class MegaMoeTP:
         total = int(topk_ids_all.shape[0])
         plan = plan or self.plan(total)
         output = self._collectives(plan.ag_wire).partial_buffer(total)
-        if a1_scale is None:
-            return fused_moe(
-                a1,
-                self.w1,
-                self.w2,
-                topk_weights_all,
-                topk_ids_all,
-                output=output,
-                **self._moe_kwargs,
+        # The BF16 wire takes the *public* entry point. ``_fused_moe_impl`` is
+        # the only one that accepts ``_metadata_transform``, and so the only way
+        # to reach the fused ReduceScatter -- but it is a net loss in eager
+        # mode. Measured both ways (e2e us): kimi3 64 tokens 352.9 -> 357.3, and
+        # glm5 64 tokens 234.6 -> **290.2**. The cost is host-side and shape
+        # dependent, not a property of the tail: under CUDA-graph capture the
+        # two entry points are identical (95.8 vs 96.0 us at 8 tokens) and the
+        # fused tail comes for free. So this is the right default for eager
+        # execution and the wrong one under graphs -- revisit if this layer is
+        # deployed captured. ``AITER_TP_MEGA_BF16_VIA_IMPL=1`` flips it.
+        if a1_scale is None and not _BF16_VIA_IMPL:
+            return (
+                fused_moe(
+                    a1,
+                    self.w1,
+                    self.w2,
+                    topk_weights_all,
+                    topk_ids_all,
+                    output=output,
+                    **self._moe_kwargs,
+                ),
+                None,
             )
 
         from aiter.fused_moe import _fused_moe_impl
@@ -464,14 +778,32 @@ class MegaMoeTP:
         # The activation arrives packed FP4, so the output dtype cannot be
         # inferred from it the way the BF16 wire allows.
         kwargs["dtype"] = dtypes.bf16
-        if plan.metadata is None:
+        if a1_scale is None:
+            transform = None
+        elif plan.metadata is None:
             transform = _prequant_transform
         else:
             # This bucket's own tuned row quantizes inline; run the borrowed
             # row instead of whatever the lookup inside _fused_moe_impl finds.
             borrowed = replace(plan.metadata, prequant=True)
             transform = lambda _metadata: borrowed  # noqa: E731
-        return _fused_moe_impl(
+        box = None
+        # ``local_tokens == 1`` is excluded: the fused tail's pull returns
+        # garbage there (rel_l2 1.0) while leaving the partial itself intact --
+        # bisected to the pull, with 8/16/32 local rows all correct. One row is
+        # a decode-with-TP8 corner and the standalone collective handles it, so
+        # it is gated rather than chased.
+        if plan.fuse_rs and local_tokens > 1:
+            stage2, box = self._fused_stage2(plan, local_tokens)
+            base = transform
+            transform = (
+                (lambda md: replace(md, stage2=stage2))
+                if base is None
+                else (lambda md: replace(base(md), stage2=stage2))
+            )
+        if transform is None:
+            transform = lambda md: md  # noqa: E731
+        partial = _fused_moe_impl(
             a1,
             self.w1,
             self.w2,
@@ -479,10 +811,11 @@ class MegaMoeTP:
             topk_ids_all,
             a1_scale=a1_scale,
             output=output,
-            _q_dtype_a=AQ_DTYPE,
+            _q_dtype_a=AQ_DTYPE if a1_scale is not None else None,
             _metadata_transform=transform,
             **kwargs,
         )
+        return partial, (box[0] if box is not None else None)  # None -> caller RS
 
     def reduce_scatter(self, local_tokens: int, plan: "_CasePlan"):
         """Sum the per-rank partials across TP and keep this rank's token shard."""
@@ -508,7 +841,9 @@ class MegaMoeTP:
         a1, a1_scale, wts, ids = self.all_gather(
             x_local, topk_weights, topk_ids, plan=plan
         )
-        self.local_moe(a1, a1_scale, wts, ids, plan=plan)
+        _, y_local = self.local_moe(a1, a1_scale, wts, ids, plan=plan, local_tokens=m)
+        if y_local is not None:
+            return y_local
         return self.reduce_scatter(m, plan)
 
     __call__ = forward
@@ -522,7 +857,8 @@ class _CasePlan:
     own tuned row had to be swapped out to stay on the FP4 wire; ``None`` means
     the ordinary lookup already lands on the right row.  ``gemm_bucket`` records
     which bucket the kernels came from, so it is visible in tests and logs when
-    it is not ``tokens``.
+    it is not ``tokens``.  ``fuse_rs`` records whether this bucket's GEMM2 runs
+    the ReduceScatter in its own tail instead of as two extra launches.
     """
 
     tokens: int
@@ -531,6 +867,7 @@ class _CasePlan:
     gemm2_kernel: str
     metadata: object | None = None
     gemm_bucket: int = 0
+    fuse_rs: bool = False
 
 
 def _prequant_transform(metadata):

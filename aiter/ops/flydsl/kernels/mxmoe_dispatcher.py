@@ -148,8 +148,8 @@ def compile_gemm2_a4w4_port(
         )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
-    if (_composition is None) != (_input_row_resolver is None):
-        raise ValueError("a composed GEMM2 requires an input row resolver")
+    if _input_row_resolver is not None and _composition is None:
+        raise ValueError("an input row resolver is only meaningful for a composition")
     if _reduce_store_cache_modifier is not None and _composition is None:
         raise ValueError("a custom reduce-store cache policy requires a composition")
     use_reduce = epilog == "reduce"
@@ -479,7 +479,15 @@ def compile_gemm2_a4w4_port(
         lds,
     ):
         m_row = m_block_idx * fx.Int32(BM)
-        resolved_rows = resolve_input_rows(arg_stids, i32_M, m_row, wave, lane)
+        # No resolver means the composition feeds GEMM2 the ordinary sorted-row
+        # A operand (one row per sorted slot), which is what the non-composed
+        # kernel reads; a resolver switches A to the route layout
+        # (token * topk + slot), which is what a dispatch-fused producer wants.
+        resolved_rows = (
+            ()
+            if _input_row_resolver is None
+            else resolve_input_rows(arg_stids, i32_M, m_row, wave, lane)
+        )
         _gemm2_kernel_body(
             arg_aq,
             arg_ascale,

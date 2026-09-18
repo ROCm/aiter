@@ -56,6 +56,11 @@ from .p2p import (
 )
 
 __all__ = [
+    "ARRIVE_STRIDE_BYTES",
+    "WRITEBACK_BLOCKS",
+    "RS_DESC_FANIN",
+    "MAX_SERVICE_BLOCKS",
+    "RS_ARRIVE_SLOTS",
     "RS_DESC_EPOCH",
     "RS_DESC_OUTPUT",
     "RS_DESC_PARTIAL",
@@ -83,7 +88,37 @@ RS_PULL_UNROLL = 1
 RS_DESC_PARTIAL = 0  # arena byte offset of the [M, H] GEMM2 partial
 RS_DESC_OUTPUT = 1  # local address of the [m, H] output
 RS_DESC_EPOCH = 2  # local address of the monotone epoch counter (i32)
-_RS_EXTRA = 3
+RS_DESC_FANIN = 3  # local address of the fused tail's fan-in counters (i32[])
+_RS_EXTRA = 4
+
+#: Fan-in counters the fused GEMM2 tail arrives at, plus one second-level
+#: counter after them.
+#:
+#: These live in ordinary device memory, *not* in the symmetric arena. No peer
+#: ever reads them -- they only say "this rank's GEMM2 tiles are all done" --
+#: and arena pages are IPC-exported, so atomics on them bypass L2 and pay a
+#: fabric round trip each. That is invisible for the standalone publish kernel's
+#: 64 CTAs and ruinous for a fused tail, where every one of a prefill GEMM2
+#: grid's ~25k CTAs arrives: measured at 1.9 ms, versus 0.4 us for the same
+#: kernel with the tail compiled out.
+MAX_SERVICE_BLOCKS = 256
+#: Each counter gets its own 128-byte cache line. Packing them adjacently puts
+#: all of them on two lines, which is no better than a single counter: the line
+#: ping-pongs between XCDs on every arrival and a prefill GEMM2 grid arrives
+#: tens of thousands of times. One line per counter, with a counter index of
+#: ``block % service`` and ``service`` a multiple of the eight XCDs, keeps each
+#: line resident in exactly one XCD's L2.
+ARRIVE_STRIDE_DW = 32
+ARRIVE_STRIDE_BYTES = ARRIVE_STRIDE_DW * 4
+#: One line per fan-in counter, then four more: the whole-grid fan-in root, the
+#: flag that releases every service CTA once that root fills, the writeback
+#: fan-in root, and the flag that says every peer has published.
+RS_ARRIVE_SLOTS = (MAX_SERVICE_BLOCKS + 4) * ARRIVE_STRIDE_DW
+#: L2 is per XCD and ``buffer_wbl2`` writes back only the issuing XCD's, so this
+#: many service CTAs -- consecutive block ids, which round-robin the XCDs -- is
+#: exactly enough to cover the device. Letting *every* service CTA do it instead
+#: is what made a 256-CTA service group 2.3x slower than a 32-CTA one.
+WRITEBACK_BLOCKS = 8
 
 
 def rs_desc_size(tp_size: int) -> int:

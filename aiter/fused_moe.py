@@ -3880,10 +3880,17 @@ def fused_moe_2stages(
     if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
         # FP8 route-output reduction applies the route weights after GEMM2.
         stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
-        uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
-            stage2_func is _mxfp4_a4w4_stage2_fw
-            and str(stage2_keywords.get("kernelName2", "")).startswith(
-                "flydsl_moe2_layout_"
+        uses_flydsl_v2_stage2 = (
+            stage2_func is _flydsl_v2_stage2_wrapper
+            # A caller-supplied stage2 that drives the same v2 GEMM2 opts in
+            # with this attribute; it needs the route weights for exactly the
+            # same reason the in-tree wrapper does.
+            or getattr(stage2_func, "_is_flydsl_v2_stage2", False)
+            or (
+                stage2_func is _mxfp4_a4w4_stage2_fw
+                and str(stage2_keywords.get("kernelName2", "")).startswith(
+                    "flydsl_moe2_layout_"
+                )
             )
         )
         if uses_flydsl_v2_stage2:
