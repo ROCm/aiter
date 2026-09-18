@@ -737,10 +737,12 @@ overwrite the aliased KV tile. GPU 6 / gfx950: 18 pytest cases,
 prefill VGPR 257).
 
 **Do not retry** token-major ``(D, BLOCK_N)`` V LDS written with
-per-element stores plus ``make_tiled_copy_B`` PV. Oracle ``err=0`` and
-18 tests pass, and decode improved to 18.6 / 21.2 us, but prefill
-regressed to 613.0 us from 513.5. Keep row-major ``[BN, D]`` V and
-scalar PV B gathers.
+per-element stores plus ``make_tiled_copy_B`` PV **on prefill / both
+launch paths**. Oracle ``err=0`` and 18 tests pass, and decode improved
+to 18.6 / 21.2 us, but prefill regressed to 613.0 us from 513.5.
+Decode-only gfx950 ``BLOCK_N=16`` token-major V plus tiled PV-B is the
+mapping that landed: width-2051 ``L=512`` is 18.5 / 21.1 / 516.2 us vs
+19.8 / 22.7 / 513.5.
 
 **Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
 ``4 < M * Hk < 32``. ``M=8`` stayed correct (``err=0``) but width-2051

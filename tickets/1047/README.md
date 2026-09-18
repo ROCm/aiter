@@ -606,8 +606,9 @@ and before QK. GPU 6 / gfx950: 18 pytest cases, ``err=0``, width-2051
 ISA is unchanged.
 
 **Do not retry** token-major ``(D, BLOCK_N)`` V LDS with per-element
-stores and ``make_tiled_copy_B`` PV. ``err=0``, decode 18.6 / 21.2 us,
-prefill 613.0 us vs 513.5. Keep row-major ``[BN, D]`` V.
+stores and ``make_tiled_copy_B`` PV **on prefill / both launch paths**.
+``err=0``, decode 18.6 / 21.2 us, prefill 613.0 us vs 513.5. Decode-only
+``BLOCK_N=16`` gfx950 is the mapping that landed later.
 
 **Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
 ``4 < M * Hk < 32``. ``M=8`` went 22.7 → 33.5 us (``err=0``); ``M=1``
@@ -646,6 +647,14 @@ softmax reads only wave-0 C, no C sum). 18 pytest cases, ``err=0``;
 width-2051 ``L=512`` was 21.0 / 25.7 / 515.4 us vs 19.8 / 22.7 / 513.5.
 Redundant QK matches Triton's K32 count but is 4× the D-split flops and
 loses decode. Keep D-split QK across four waves.
+
+Decode-only gfx950 ``BLOCK_N=16`` now stores V as token-major
+``(D, BN)`` and reads PV-B with ``make_tiled_copy_B``. Prefill stays
+row-major ``[BN, D]`` (the both-path token-major mapping above still
+must not be retried). GPU 6 / gfx950: 18 pytest cases, ``err=0``,
+width-2051 ``L=512`` is 18.5 / 21.1 / 516.2 us vs 19.8 / 22.7 / 513.5
+(~6–7% decode). Still ~1.8× live AMD on the split kernel.
+
 
 
 
