@@ -722,7 +722,7 @@ def test_triton_unified_attn(
         )
 
 
-@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@pytest.mark.parametrize("shuffled_kv_cache, block_size", [(False, 64), (True, 64), (True, 128)])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype",
     [(torch.bfloat16, torch.bfloat16), (e4m3_dtype, e4m3_dtype)],
@@ -734,6 +734,7 @@ def test_triton_unified_attn_gfx942_large_prefill(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     shuffled_kv_cache: bool,
+    block_size: int,
 ) -> None:
     """Executable coverage for the gfx942 large-prefill attn_2d entries.
 
@@ -741,8 +742,10 @@ def test_triton_unified_attn_gfx942_large_prefill(
     composites) and skips the shuffled 2D Triton path on gfx942, so the
     Q>=1024, head 256/512 and SHUF specializations are otherwise never
     compiled or numerically checked. This runs one 2048-token prefill per
-    (head, dtype, shuffled) combination — enough to select, compile and
-    validate each entry — and asserts the resolved config key.
+    (head, dtype, shuffled, page) combination — enough to select, compile
+    and validate each entry — and asserts the resolved config key. Page 64
+    hits the tuned SHUF.BS_LEQ_64 entries, page 128 the BS-agnostic
+    M16/stages-1 fallbacks (the only LDS-safe configs at TILE 128).
     """
     if DEVICE_ARCH != "gfx942":
         pytest.skip(f"gfx942-tuned entries, skip {DEVICE_ARCH}")
@@ -755,7 +758,6 @@ def test_triton_unified_attn_gfx942_large_prefill(
 
     seq_lens = [(2048, 2048)]
     num_heads = (32, 4)
-    block_size = 64
     (
         query,
         key_cache_orig,
@@ -779,7 +781,7 @@ def test_triton_unified_attn_gfx942_large_prefill(
         output_scale,
     ) = generate_data(
         seq_lens=seq_lens,
-        num_blocks=2048,
+        num_blocks=(2048 + block_size - 1) // block_size,
         block_size=block_size,
         head_size=head_size,
         num_heads=num_heads,
@@ -795,8 +797,10 @@ def test_triton_unified_attn_gfx942_large_prefill(
     # assert the intended table entry serves this call
     table, axes, _ = _load("attn_2d", "triton", "gfx942")
     dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"
-    if shuffled_kv_cache:
+    if shuffled_kv_cache and block_size <= 64:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_{dt_tag}"
+    elif shuffled_kv_cache:
+        expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.DT_{dt_tag}"
     else:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.DT_{dt_tag}"
     key, _config = _lookup(
