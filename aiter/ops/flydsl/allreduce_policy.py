@@ -81,7 +81,6 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
         oneshot_max=16 << 10, oneshot_max_exact=(80 << 10) - 1, mesh_max=12 << 20
     ),
     # --- xGMI: Policy from measurements (on gfx942) --------------------
-    #
     ("xgmi", 2): FamilyPolicy(
         oneshot_max=512 << 10, oneshot_max_exact=4 << 20, mesh_max=NO_MAX,
     ),
@@ -93,6 +92,29 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     ),
 }
 
+FUSED_FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
+    # --- PCIe: Policy from measurements (on gfx950/MI350P) --------------------
+    ("pcie", 2): FamilyPolicy(
+        oneshot_max=768 << 10, oneshot_max_exact=768 << 10, mesh_max=768 << 10
+    ),
+    ("pcie", 4): FamilyPolicy(
+        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=8 << 20
+    ),
+    ("pcie", 8): FamilyPolicy(
+        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=128 << 20
+    ),
+    # --- xGMI: Placeholder policy (same as PCIe) --------------------
+    ("xgmi", 2): FamilyPolicy(
+        oneshot_max=768 << 10, oneshot_max_exact=768 << 10, mesh_max=768 << 10
+    ),
+    ("xgmi", 4): FamilyPolicy(
+        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=8 << 20
+    ),
+    ("xgmi", 8): FamilyPolicy(
+        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=128 << 20
+    ),
+}
+
 # --- environment variables ---------------------------------------------------------
 #
 # TODO: can we re-use the existing AITER_AR_1STAGE* / AITER_AR_QUANT_* variables?
@@ -101,6 +123,16 @@ ENABLE_VAR = "AITER_FLY_AR"
 ACCURACY_VAR = "AITER_FLY_AR_ACCURACY"
 ONESHOT_MAX_VAR = "AITER_FLY_AR_ONESHOT_MAX_BYTES"
 MESH_MAX_VAR = "AITER_FLY_AR_MESH_MAX_BYTES"
+# Fused overrides. Separate from the plain ones because the boundaries differ;
+# ENABLE_VAR and ACCURACY_VAR are shared -- one FlyDSL all-reduce family.
+FUSED_ONESHOT_MAX_VAR = "AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES"
+FUSED_MESH_MAX_VAR = "AITER_FLY_AR_FUSED_MESH_MAX_BYTES"
+FUSED_MIN_VAR = "AITER_FLY_AR_FUSED_MIN_BYTES"
+# Comma-separated hidden sizes to build the fused engines for at startup.
+# The fused wire layout depends on the width, so a width cannot be built until
+# it is known -- and building inside a HIP graph capture is not possible.
+# Declaring the model's widths here removes the question.
+FUSED_HIDDENS_VAR = "AITER_FLY_AR_FUSED_HIDDENS"
 
 ACCURACY_MODES = ("exact", "fast")
 DEFAULT_ACCURACY = "exact"
@@ -126,6 +158,31 @@ def enabled() -> bool:
     means disabled.
     """
     return os.environ.get(ENABLE_VAR, "").strip() == "1"
+
+
+def fused_hiddens(extra: tuple[int, ...] = ()) -> tuple[int, ...]:
+    """Widths to build the fused engines for up front, sorted and deduped.
+
+    ``AITER_FLY_AR_FUSED_HIDDENS`` plus whatever the caller passed. Sorted so
+    every rank builds in the same order -- each build is a collective.
+    """
+    out = {int(h) for h in extra if int(h) > 0}
+    raw = os.environ.get(FUSED_HIDDENS_VAR, "")
+    for tok in raw.replace(" ", "").split(","):
+        if not tok:
+            continue
+        try:
+            val = int(tok)
+        except ValueError:
+            logger.warning(
+                "FlyDSL QR: ignoring %r in %s, expected an integer",
+                tok,
+                FUSED_HIDDENS_VAR,
+            )
+            continue
+        if val > 0:
+            out.add(val)
+    return tuple(sorted(out))
 
 
 def accuracy_mode() -> str:
@@ -165,26 +222,39 @@ def resolve(link: str, world_size: int, mode: str | None = None) -> FamilyPolicy
     ignored (with a warning) in ``"exact"`` mode: honouring it would reopen the
     mesh/ring window ``"exact"`` exists to close.
     """
+    return _resolve(
+        _base_policy(FAMILY_POLICY, link, world_size),
+        mode,
+        one_var=ONESHOT_MAX_VAR,
+        mesh_var=MESH_MAX_VAR,
+    )
+
+
+def _base_policy(table, link: str, world_size: int) -> FamilyPolicy:
     if link not in LINKS:
         raise ValueError(f"link must be one of {LINKS}, got {link!r}")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
         )
-    base = FAMILY_POLICY[(link, int(world_size))]
+    return table[(link, int(world_size))]
+
+
+def _resolve(base: FamilyPolicy, mode, *, one_var: str, mesh_var: str) -> FamilyPolicy:
+    """*base* with the env overrides and the accuracy mode applied."""
     mode = accuracy_mode() if mode is None else mode
     if mode not in ACCURACY_MODES:
         raise ValueError(f"mode must be one of {ACCURACY_MODES}, got {mode!r}")
 
-    override_one = _env_int(ONESHOT_MAX_VAR)
+    override_one = _env_int(one_var)
 
     if mode == "exact":
         one = base.oneshot_max_exact if override_one is None else override_one
-        if _env_int(MESH_MAX_VAR) is not None:
+        if _env_int(mesh_var) is not None:
             logger.warning(
                 "FlyDSL QR: ignoring %s in accuracy=exact mode -- exact mode "
                 "has no mesh/ring window to widen. Set %s=fast to use it.",
-                MESH_MAX_VAR,
+                mesh_var,
                 ACCURACY_VAR,
             )
         return FamilyPolicy(
@@ -197,7 +267,7 @@ def resolve(link: str, world_size: int, mode: str | None = None) -> FamilyPolicy
 
     one = base.oneshot_max if override_one is None else override_one
     mesh = base.mesh_max
-    override_mesh = _env_int(MESH_MAX_VAR)
+    override_mesh = _env_int(mesh_var)
     if override_mesh is not None:
         mesh = override_mesh
     mesh = max(mesh, one)
@@ -207,6 +277,29 @@ def resolve(link: str, world_size: int, mode: str | None = None) -> FamilyPolicy
         mesh_max=mesh,
         min_bytes=base.min_bytes,
         max_bytes=base.max_bytes,
+    )
+
+
+def resolve_fused(link: str, world_size: int, mode: str | None = None) -> FamilyPolicy:
+    """The fused policy in force for a rank, environment overrides applied.
+
+    Same shape and same accuracy semantics as :func:`resolve`, against
+    ``FUSED_FAMILY_POLICY`` and the ``AITER_FLY_AR_FUSED_*`` overrides. The
+    extra one is ``min_bytes``: below it the fused path declines.
+    """
+    base = _base_policy(FUSED_FAMILY_POLICY, link, world_size)
+    policy = _resolve(
+        base, mode, one_var=FUSED_ONESHOT_MAX_VAR, mesh_var=FUSED_MESH_MAX_VAR
+    )
+    floor = _env_int(FUSED_MIN_VAR)
+    if floor is None:
+        return policy
+    return FamilyPolicy(
+        oneshot_max=policy.oneshot_max,
+        oneshot_max_exact=policy.oneshot_max_exact,
+        mesh_max=policy.mesh_max,
+        min_bytes=floor,
+        max_bytes=policy.max_bytes,
     )
 
 

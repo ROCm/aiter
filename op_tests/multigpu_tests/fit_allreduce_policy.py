@@ -47,6 +47,14 @@ Sizes where a family was not measured at all are skipped for that family rather
 than treated as infinitely slow -- the one-shot is gated above by
 ``AITER_BENCH_FLY1S_MAX_KB`` and its absence past that ceiling is a property of
 the sweep, not of the kernel.
+
+``--fusion ar_rmsnorm`` fits the fused tables from a
+``bench_comm_allreduce.py --fusion ar_rmsnorm`` sweep instead. Two differences:
+a **third** threshold, ``min_bytes``, below which the dispatcher declines and
+the caller runs what it would have anyway (priced from each row's ``prod
+path``); and an **atoms-keyed** ladder, because a fused ``block`` means a
+different ``atoms`` at each width and only ``atoms`` is portable across them.
+See :class:`FusedCand`.
 """
 
 from __future__ import annotations
@@ -62,7 +70,7 @@ from itertools import combinations, pairwise
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bench_comm_allreduce import CANDIDATES
+from bench_comm_allreduce import CANDIDATES, _prod_candidate_key
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 logger = logging.getLogger("fit")
@@ -93,6 +101,148 @@ AUTO_KEYS = {
     "ring": ("fly_int4_ring",),
 }
 
+# --------------------------------------------------------------------------
+# --fusion ar_rmsnorm: a different candidate set, a fourth family, atoms-keyed
+# --------------------------------------------------------------------------
+
+FUSION_MODES = ("none", "ar_rmsnorm")
+#: Set once by :func:`set_fusion_mode`. Everything above is rebound for the
+#: fused sweep rather than parameterised, because every consumer wants the same
+#: answer and this is a single-shot CLI.
+FUSION = "none"
+
+#: Falling back to what aiter would run here anyway. A fourth "family" so the
+#: fit can decide *not* to fuse, which the plain path never has to.
+DECLINE = "decline"
+
+
+def fused_family_of(cand) -> str | None:
+    if cand.family == "fused_fly1s":
+        return "oneshot"
+    if cand.family == "fused_flyqr":
+        return cand.algorithm  # "mesh" | "ring"
+    return None
+
+
+@dataclass(frozen=True)
+class FusedCand:
+    """A fused bench row relabelled by ``atoms``, which is what a rung carries.
+
+    Bench rows pin ``block``, but a block means a different ``atoms`` at each
+    width -- b256 is atoms=4 at hidden 8192 and atoms=2 at 4096 -- and
+    ``segment_pick`` only selects a key present at *every* sample in a segment.
+    Across the fitted widths {4096, 8192, 7168} the common block set is empty,
+    so a block-keyed ladder fit returns nothing at all. Atoms is the portable
+    name and the one ``FUSED_ONESHOT_LADDER`` stores.
+    """
+
+    key: str
+    family: str
+    atoms: int
+    grid_cap: int | None = None
+    fanout: str | None = None
+    skip_self: bool | None = None
+
+    def fused_rung(self, min_bytes: int) -> tuple:
+        """As a ``FUSED_ONESHOT_LADDER`` rung."""
+        unpinned = [
+            n
+            for n in ("atoms", "grid_cap", "fanout", "skip_self")
+            if getattr(self, n) is None
+        ]
+        if unpinned:
+            raise ValueError(
+                f"{self.key} leaves {', '.join(unpinned)} to the engine default, "
+                "so it has no FUSED_ONESHOT_LADDER rung"
+            )
+        return (int(min_bytes), self.atoms, self.grid_cap, self.fanout, self.skip_self)
+
+
+def fused_atoms_at(cand, hidden: int, tp: int) -> int | None:
+    """*cand*'s atoms-per-row at this width, or None if it has no build here."""
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import fused_block_options
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_row_block_options,
+    )
+
+    opts = (
+        fused_block_options(hidden)
+        if cand.family == "fused_fly1s"
+        else quick_reduce_row_block_options(hidden, tp)
+    )
+    for block, atoms in opts:
+        if block == cand.block:
+            return atoms
+    return None
+
+
+def fused_atoms_key(cand, atoms: int) -> str:
+    """The atoms-keyed name *cand* is relabelled to."""
+    if cand.family == "fused_fly1s":
+        key = f"fused_fly_1stage_a{atoms}_g{cand.grid_cap}"
+        return key + "_ss" if cand.skip_self else key
+    return f"fused_fly_{cand.algorithm}_a{atoms}"
+
+
+def fused_pseudo_candidates():
+    """``key -> FusedCand`` for every atoms relabelling the sweep can produce.
+
+    Enumerated over all widths a block-pinned row could be measured at, because
+    the same row becomes a different pseudo-candidate at each.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import SUPPORTED_ATOMS
+
+    out: dict[str, FusedCand] = {}
+    for cand in CANDIDATES:
+        fam = fused_family_of(cand)
+        if fam is None or cand.block is None:
+            continue
+        for atoms in SUPPORTED_ATOMS:
+            key = fused_atoms_key(cand, atoms)
+            out.setdefault(
+                key,
+                FusedCand(
+                    key=key,
+                    family=fam,
+                    atoms=atoms,
+                    grid_cap=cand.grid_cap,
+                    fanout=cand.fanout or "peer",
+                    skip_self=bool(cand.skip_self),
+                ),
+            )
+    return out
+
+
+def set_fusion_mode(mode: str) -> None:
+    """Rebind the family tables for *mode*. Call once, before anything else."""
+    global FUSION, FAMILIES, BY_FAMILY, CAND_BY_KEY, AUTO_KEYS
+    if mode not in FUSION_MODES:
+        raise ValueError(f"fusion must be one of {FUSION_MODES}, got {mode!r}")
+    FUSION = mode
+    if mode == "none":
+        return
+    pseudo = fused_pseudo_candidates()
+    # The unpinned rows are the *auto* rows: what the shipped ladder does today,
+    # and so the thing the fit is graded against rather than an input to it.
+    autos = {
+        "oneshot": ("fused_fly_1stage",),
+        "mesh": ("fused_fly_mesh",),
+        "ring": ("fused_fly_ring",),
+    }
+    auto_cands = {
+        k: FusedCand(key=k, family=f, atoms=0)
+        for f, keys in autos.items()
+        for k in keys
+    }
+    FAMILIES = ("oneshot", "mesh", "ring")
+    BY_FAMILY = {
+        f: [c for c in pseudo.values() if c.family == f]
+        + [c for c in auto_cands.values() if c.family == f]
+        for f in FAMILIES
+    }
+    CAND_BY_KEY = {**pseudo, **auto_cands}
+    AUTO_KEYS = autos
+
 
 def round_thresholds(lo: int, hi: int) -> list[int]:
     """``2^k`` and ``1.5 * 2^k`` spanning [lo, hi], plus 0 and infinity.
@@ -120,6 +270,10 @@ class Sample:
     hidden: int
     us: dict  # candidate key -> microseconds
     variant: dict  # candidate key -> JIT symbol that actually ran
+    db: dict  # candidate key -> SQNR dB, for --min-sqnr
+    # --fusion only: what aiter's own dispatch runs here, i.e. the cost of
+    # declining to fuse. inf when the row named a path the sweep did not measure.
+    decline_us: float = float("inf")
 
 
 def check_timing_provenance(df, *, require: str | None) -> str:
@@ -197,10 +351,13 @@ def load(paths, metric: str, *, require_timing: str | None = None):
     # not duplicates to collapse.
     best: dict[tuple[int, int, int], dict] = {}
     variants: dict[tuple[int, int, int], dict] = {}
+    decline: dict[tuple[int, int, int], float] = {}
+    sqnr: dict[tuple[int, int, int], dict] = {}
     for _, r in df.iterrows():
         ident = (int(r["TP"]), int(r["_nbytes"]), int(r.get("K", 0)))
         cell = best.setdefault(ident, {})
         vcell = variants.setdefault(ident, {})
+        dcell = sqnr.setdefault(ident, {})
         for k in keys:
             v = r.get(f"{k} {metric}")
             if v is not None and pd.notna(v):
@@ -208,10 +365,59 @@ def load(paths, metric: str, *, require_timing: str | None = None):
             sym = r.get(f"{k} variant")
             if sym is not None and pd.notna(sym):
                 vcell[k] = str(sym)
-    return [
-        Sample(nbytes=n, tp=tp, hidden=k, us=cell, variant=variants[(tp, n, k)])
+            q = r.get(f"{k} SQNR dB")
+            if q is not None and pd.notna(q):
+                dcell[k] = min(float(q), dcell.get(k, float("inf")))
+        path = r.get("prod path")
+        if FUSION != "none" and path is not None and pd.notna(path):
+            pk = _prod_candidate_key(str(path))
+            pu = r.get(f"{pk} {metric}") if pk else None
+            if pu is not None and pd.notna(pu):
+                prev = decline.get(ident, float("inf"))
+                decline[ident] = min(float(pu), prev)
+    samples = [
+        Sample(
+            nbytes=n,
+            tp=tp,
+            hidden=k,
+            us=cell,
+            variant=variants[(tp, n, k)],
+            db=sqnr.get((tp, n, k), {}),
+            decline_us=decline.get((tp, n, k), float("inf")),
+        )
         for (tp, n, k), cell in sorted(best.items(), key=lambda kv: kv[0])
-    ], prov
+    ]
+    if FUSION != "none":
+        samples = [relabel_fused_by_atoms(s) for s in samples]
+    return samples, prov
+
+
+def relabel_fused_by_atoms(s: Sample) -> Sample:
+    """Re-key this sample's block-pinned fused rows by atoms. See :class:`FusedCand`."""
+    us, variant, db = dict(s.us), dict(s.variant), dict(s.db)
+    for cand in CANDIDATES:
+        if fused_family_of(cand) is None or cand.block is None:
+            continue
+        if cand.key not in s.us:
+            continue
+        atoms = fused_atoms_at(cand, s.hidden, s.tp)
+        if atoms is None:
+            continue  # measured but no build at this width: nothing to relabel
+        key = fused_atoms_key(cand, atoms)
+        us[key] = s.us[cand.key]
+        if cand.key in s.variant:
+            variant[key] = s.variant[cand.key]
+        if cand.key in s.db:
+            db[key] = s.db[cand.key]
+    return Sample(
+        nbytes=s.nbytes,
+        tp=s.tp,
+        hidden=s.hidden,
+        us=us,
+        variant=variant,
+        db=db,
+        decline_us=s.decline_us,
+    )
 
 
 def collapse_aliases(samples, keys) -> tuple[list[str], dict]:
@@ -231,7 +437,9 @@ def collapse_aliases(samples, keys) -> tuple[list[str], dict]:
     Returns the surviving keys and ``survivor -> [dropped]`` for reporting; a
     collapse is a finding about the sweep, not an implementation detail to hide.
     """
-    order = {c.key: i for i, c in enumerate(CANDIDATES)}
+    # Declaration order of whichever candidate table is active -- the bench rows
+    # in plain mode, the atoms-keyed pseudo-candidates under --fusion.
+    order = {k: i for i, k in enumerate(CAND_BY_KEY)}
     live = sorted([k for k in keys], key=lambda k: order[k])
     survivors: list[str] = []
     merged: dict[str, list[str]] = {}
@@ -246,7 +454,7 @@ def collapse_aliases(samples, keys) -> tuple[list[str], dict]:
     return survivors, merged
 
 
-def score_policy(samples, one_max: int, mesh_max: int):
+def score_policy(samples, one_max: int, mesh_max: int, min_bytes: int = 0):
     """Per-shape regret of a fixed family policy. ``(nbytes, K, family, ratio)``.
 
     The holdout check: a policy fitted on one hidden size is scored on others.
@@ -256,23 +464,39 @@ def score_policy(samples, one_max: int, mesh_max: int):
     """
     out = []
     for s in samples:
-        oracle = min(family_best(s, f)[1] for f in FAMILIES)
+        oracle = min(family_best(s, f)[1] for f in all_families())
         if not math.isfinite(oracle):
             continue
-        fam = pick_family(s.nbytes, one_max, mesh_max)
+        fam = pick_family(s.nbytes, one_max, mesh_max, min_bytes)
         us = family_best(s, fam)[1]
         out.append((s.nbytes, s.hidden, fam, us / oracle))
     return out
 
 
+#: Minimum SQNR a candidate must clear to be selectable, or None for none.
+#: Set by --min-sqnr. Applied in :func:`best_in`, so it constrains the
+#: oracle as well as every family's pick -- a floor that only filtered the
+#: answer would still be graded against an oracle allowed to cheat.
+MIN_SQNR: float | None = None
+
+
 def best_in(sample: Sample, keys) -> tuple[str | None, float]:
-    """Fastest of *keys* that ran at this shape."""
+    """Fastest of *keys* that ran at this shape and clears MIN_SQNR."""
     live = [(k, sample.us[k]) for k in keys if k in sample.us]
+    if MIN_SQNR is not None:
+        live = [kv for kv in live if sample.db.get(kv[0], float("inf")) >= MIN_SQNR]
     return min(live, key=lambda kv: kv[1]) if live else (None, float("inf"))
 
 
 def family_best(sample: Sample, family: str) -> tuple[str | None, float]:
+    if family == DECLINE:
+        return (DECLINE, sample.decline_us)
     return best_in(sample, [c.key for c in BY_FAMILY[family]])
+
+
+def all_families() -> tuple[str, ...]:
+    """Families the oracle ranks over. Fused mode can also choose not to fuse."""
+    return (*FAMILIES, DECLINE) if FUSION != "none" else FAMILIES
 
 
 # --------------------------------------------------------------------------
@@ -280,7 +504,11 @@ def family_best(sample: Sample, family: str) -> tuple[str | None, float]:
 # --------------------------------------------------------------------------
 
 
-def pick_family(nbytes: int, oneshot_max: int, mesh_max: int) -> str:
+def pick_family(
+    nbytes: int, oneshot_max: int, mesh_max: int, min_bytes: int = 0
+) -> str:
+    if nbytes < min_bytes:
+        return DECLINE
     if nbytes <= oneshot_max:
         return "oneshot"
     return "mesh" if nbytes <= mesh_max else "ring"
@@ -298,14 +526,19 @@ def fit_families(samples, *, exact_slack: float | None):
     """
     sizes = [s.nbytes for s in samples]
     grid = round_thresholds(min(sizes), max(sizes))
-    oracle = {s.nbytes: min(family_best(s, f)[1] for f in FAMILIES) for s in samples}
+    fams = all_families()
+    oracle = {s.nbytes: min(family_best(s, f)[1] for f in fams) for s in samples}
     # A shape where nothing at all ran cannot grade a policy.
     graded = [s for s in samples if math.isfinite(oracle[s.nbytes])]
+    # In fused mode the floor is a third threshold: below it the dispatcher
+    # declines and the caller runs what it would have anyway. 0 stays in the
+    # grid, so "never decline" remains expressible.
+    floors = grid if FUSION != "none" else (0,)
 
-    def regrets(one_max, mesh_max):
+    def regrets(min_bytes, one_max, mesh_max):
         out = []
         for s in graded:
-            fam = pick_family(s.nbytes, one_max, mesh_max)
+            fam = pick_family(s.nbytes, one_max, mesh_max, min_bytes)
             us = family_best(s, fam)[1]
             if not math.isfinite(us):
                 # The policy named a family that was not measured here. Only
@@ -316,22 +549,30 @@ def fit_families(samples, *, exact_slack: float | None):
         return out
 
     scored = []
-    for one_max in grid:
-        for mesh_max in grid:
-            if mesh_max < one_max:
+    for floor in floors:
+        for one_max in grid:
+            if one_max < floor:
                 continue
-            r = regrets(one_max, mesh_max)
-            if r is None:
-                continue
-            worst = max(x[2] for x in r)
-            scored.append((worst, sum(x[2] for x in r) / len(r), one_max, mesh_max, r))
+            for mesh_max in grid:
+                if mesh_max < one_max:
+                    continue
+                r = regrets(floor, one_max, mesh_max)
+                if r is None:
+                    continue
+                worst = max(x[2] for x in r)
+                mean = sum(x[2] for x in r) / len(r)
+                scored.append((worst, mean, one_max, mesh_max, r, floor))
     if not scored:
         raise SystemExit(
             "no feasible (oneshot_max, mesh_max) pair; is a family absent?"
         )
 
     if exact_slack is None:
-        worst, mean, one_max, mesh_max, r = min(scored, key=lambda t: (t[0], t[1]))
+        # Fewest declines among equally good policies: a floor that buys nothing
+        # is a shape the dispatcher gives away for free.
+        worst, mean, one_max, mesh_max, r, floor = min(
+            scored, key=lambda t: (t[0], t[1], t[5])
+        )
     else:
         ok = [t for t in scored if t[0] <= exact_slack]
         if not ok:
@@ -344,8 +585,10 @@ def fit_families(samples, *, exact_slack: float | None):
             )
             ok = [best]
         # Largest exact window first, then cheapest among the ties.
-        worst, mean, one_max, mesh_max, r = max(ok, key=lambda t: (t[2], -t[0], -t[1]))
-    return one_max, mesh_max, worst, mean, r
+        worst, mean, one_max, mesh_max, r, floor = max(
+            ok, key=lambda t: (t[2], -t[0], -t[1])
+        )
+    return one_max, mesh_max, worst, mean, r, floor
 
 
 # --------------------------------------------------------------------------
@@ -730,7 +973,14 @@ def audit_declines(samples, slack: float, oracle_keys, oneshot_keys, verbose) ->
     return failures
 
 
-def audit_auto(samples, slack: float, verbose: bool, *, accuracy: str = "fast") -> int:
+def audit_auto(
+    samples,
+    slack: float,
+    verbose: bool,
+    *,
+    accuracy: str = "fast",
+    auto_key: str = "fly_auto",
+) -> int:
     """Grade the shipped dispatcher against the pinned rows. Returns failures.
 
     ``fly_auto`` routes through ``FlyDSLAllReduce``, i.e. the tables as actually
@@ -770,23 +1020,28 @@ def audit_auto(samples, slack: float, verbose: bool, *, accuracy: str = "fast") 
     tps = sorted({s.tp for s in samples})
     failures = 0
     for tp in tps:
-        sub = [s for s in samples if s.tp == tp and "fly_auto" in s.us]
+        sub = [s for s in samples if s.tp == tp and auto_key in s.us]
         if not sub:
-            logger.warning("## TP%d  fly_auto not measured -- nothing to audit", tp)
+            logger.warning("## TP%d  %s not measured -- nothing to audit", tp, auto_key)
             continue
         rows = []
         for s in sub:
             best_key, best_us = best_in(s, pinned)
+            # Declining is an option the fused dispatcher has and the plain
+            # one does not, so fusing where aiter's own kernel is faster is
+            # a miss like any other.
+            if FUSION != "none" and s.decline_us < best_us:
+                best_key, best_us = DECLINE, s.decline_us
             if best_key is None:
                 continue
             # Did the policy pick the same *work* the winning row ran? The auto
             # variant carries a "<family>:" prefix the pinned rows do not.
-            auto_v = s.variant.get("fly_auto", "?").split(":", 1)[-1]
+            auto_v = s.variant.get(auto_key, "?").split(":", 1)[-1]
             rows.append(
                 (
                     s.nbytes,
                     s.hidden,
-                    s.us["fly_auto"] / best_us,
+                    s.us[auto_key] / best_us,
                     best_key,
                     auto_v,
                     same_work(auto_v, s.variant.get(best_key)),
@@ -805,9 +1060,10 @@ def audit_auto(samples, slack: float, verbose: bool, *, accuracy: str = "fast") 
         noisy = [r for r in over if r[5]]
         failures += len(bad)
         logger.info(
-            "## TP%d  fly_auto vs best pinned: worst %.3fx at %s, mean %.3fx, "
+            "## TP%d  %s vs best pinned: worst %.3fx at %s, mean %.3fx, "
             "%d/%d real miss, %d same-kernel noise",
             tp,
+            auto_key,
             worst[2],
             human(worst[0]),
             sum(r[2] for r in rows) / len(rows),
@@ -846,11 +1102,168 @@ def audit_auto(samples, slack: float, verbose: bool, *, accuracy: str = "fast") 
     return failures
 
 
+def fit_fused(samples, holdout, args) -> None:
+    """``--fusion ar_rmsnorm``: the decline floor, the family boundaries, the ladder.
+
+    A separate driver rather than a branch through the plain one: there is no
+    ``exact`` mode here (the fused engines are bf16-only and the quantized ones
+    are the accuracy question, not a second policy), no ``cdr`` 1stage/2stage
+    edge to reconcile against, and one extra threshold.
+    """
+    tps = sorted({s.tp for s in samples})
+    fam_rows, ladder_rows = [], []
+    for tp in tps:
+        sub = [s for s in samples if s.tp == tp]
+        logger.info(
+            "## TP%d  (%d shapes, %s .. %s)",
+            tp,
+            len(sub),
+            human(min(s.nbytes for s in sub)),
+            human(max(s.nbytes for s in sub)),
+        )
+        blind = sum(1 for s in sub if not math.isfinite(s.decline_us))
+        if blind:
+            logger.warning(
+                "  %d/%d shape(s) have no resolved `prod path` time, so declining "
+                "cannot be priced there and min_bytes is fitted without them.",
+                blind,
+                len(sub),
+            )
+
+        one, mesh, worst, mean, detail, floor = fit_families(sub, exact_slack=None)
+        logger.info(
+            "  fused   decline < %-9s oneshot <= %-9s  mesh <= %-9s  "
+            "worst %.3fx  mean %.3fx",
+            human(floor),
+            human(one),
+            human(mesh),
+            worst,
+            mean,
+        )
+        if args.verbose:
+            for nbytes, fam, ratio in detail:
+                if ratio > 1.001:
+                    logger.info("      %-10s %-8s %.3fx", human(nbytes), fam, ratio)
+        fam_rows.append((args.link, tp, floor, one, mesh, worst))
+
+        hold = [h for h in holdout if h.tp == tp]
+        if hold:
+            by_k: dict[int, list] = {}
+            for nbytes, k, _fam, ratio in score_policy(hold, one, mesh, floor):
+                by_k.setdefault(k, []).append((nbytes, ratio))
+            for k in sorted(by_k):
+                rows = by_k[k]
+                bad = max(rows, key=lambda nr: nr[1])
+                logger.info(
+                    "    holdout K=%-5d n=%-2d worst %.3fx at %s",
+                    k,
+                    len(rows),
+                    bad[1],
+                    human(bad[0]),
+                )
+
+        windows = {
+            "oneshot": (floor, one),
+            "mesh": (one, mesh),
+            "ring": (mesh, 1 << 62),
+        }
+        for family in FAMILIES:
+            lo, hi = windows[family]
+            if hi <= lo:
+                logger.info("  ladder %-8s -- empty window", family)
+                continue
+            got = fit_ladder(sub, family, args.max_rungs, args.ladder_slack, (lo, hi))
+            if got is None:
+                logger.info("  ladder %-8s -- not dispatched here", family)
+                continue
+            rungs, lworst, by_count, aliased = got
+            logger.info(
+                "  ladder %-8s (%s .. %s]  %s   worst %.3fx   (by rung count: %s)",
+                family,
+                human(lo),
+                human(hi),
+                " ".join(f"[{human(b)}: {k}]" for b, k in rungs),
+                lworst,
+                ", ".join(f"{n}:{w:.3f}x" for n, (_, w) in sorted(by_count.items())),
+            )
+            ladder_rows.append((tp, family, rungs, lworst))
+        logger.info("")
+
+    logger.info("## paste-ready\n")
+    logger.info("FUSED_FAMILY_POLICY = {")
+    for link, tp, floor, one, mesh, fworst in fam_rows:
+        logger.info(
+            "    (%r, %d): FamilyPolicy(oneshot_max=%d, oneshot_max_exact=%d, "
+            "mesh_max=%d, min_bytes=%d),  # %s / %s / %s, worst %.3fx",
+            link,
+            tp,
+            one,
+            one,
+            mesh,
+            floor,
+            human(one),
+            human(mesh),
+            human(floor),
+            fworst,
+        )
+    logger.info("}\n")
+
+    oneshot = [r for r in ladder_rows if r[1] == "oneshot"]
+    if oneshot:
+        logger.info("FUSED_ONESHOT_LADDER = {")
+        for tp, _family, rungs, lworst in oneshot:
+            try:
+                tuples = [CAND_BY_KEY[k].fused_rung(lo) for lo, k in rungs]
+            except (KeyError, ValueError) as exc:
+                logger.warning("    # %d: %s", tp, exc)
+                continue
+            logger.info(
+                "    (%r, %d): (%s),  # worst %.3fx",
+                args.link,
+                tp,
+                "".join(f"{t!r}, " for t in tuples).rstrip(),
+                lworst,
+            )
+        logger.info("}")
+    # The quantized schedules already ladder super_tile/grid_cap internally, so
+    # the only thing the fused dispatcher has to be told is the row geometry --
+    # one atoms_per_row per (link, world, algorithm), not a payload ladder.
+    # Where the fit wanted more than one rung, say so rather than silently
+    # shipping the first.
+    qr = [r for r in ladder_rows if r[1] in ("mesh", "ring")]
+    if qr:
+        logger.info("\nFUSED_QR_ROW_ATOMS = {")
+        for tp, family, rungs, lworst in qr:
+            atoms = [CAND_BY_KEY[k].atoms for _lo, k in rungs if k in CAND_BY_KEY]
+            if not atoms:
+                continue
+            note = "" if len(set(atoms)) == 1 else f"  # NOTE: fit wanted {atoms}"
+            logger.info(
+                "    (%r, %d, %r): %d,  # worst %.3fx%s",
+                args.link,
+                tp,
+                family,
+                atoms[0],
+                lworst,
+                note,
+            )
+        logger.info("}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
     )
     ap.add_argument("csv", nargs="+", help="--output-csv files from the sweep")
+    ap.add_argument(
+        "--fusion",
+        choices=FUSION_MODES,
+        default="none",
+        help="which sweep this is. 'ar_rmsnorm' fits the fused tables instead:\n"
+        "a decline floor as well as the two family boundaries, and an\n"
+        "atoms-keyed ladder (a fused block means a different atoms at each\n"
+        "hidden, so block is not a portable rung).",
+    )
     ap.add_argument(
         "--link",
         default="pcie",
@@ -920,10 +1333,56 @@ def main():
         "pinning a fit to one of them on purpose, e.g. in a script that must\n"
         "never accidentally consume an eager sweep.",
     )
+    ap.add_argument(
+        "--min-sqnr",
+        type=float,
+        default=None,
+        help="exclude candidates below this SQNR from the fit *and* from\n"
+        "the oracle. The fused epilogue makes this sharper than it looks:\n"
+        "dividing by a row's own norm amplifies whatever quantization\n"
+        "variance it had, and the latency-optimal fused choice at TP8 is a\n"
+        "~20 dB mesh from M=8 upward. Default: rank on time alone.",
+    )
     ap.add_argument("--verbose", action="store_true", help="per-shape regret detail")
     args = ap.parse_args()
+    set_fusion_mode(args.fusion)
+    global MIN_SQNR
+    MIN_SQNR = args.min_sqnr
+    if MIN_SQNR is not None:
+        logger.info("# accuracy floor: %.1f dB\n", MIN_SQNR)
 
     samples, prov = load(args.csv, args.metric, require_timing=args.require_timing)
+    if args.fusion != "none":
+        if args.audit_auto:
+            logger.info(
+                "# auditing fused_fly_auto over %d shape(s), metric %r, "
+                "tolerance %.0f%%\n",
+                len(samples),
+                args.metric,
+                (args.ladder_slack - 1) * 100,
+            )
+            n = audit_auto(
+                samples,
+                args.ladder_slack,
+                args.verbose,
+                auto_key="fused_fly_auto",
+            )
+            logger.info(
+                "\n%s",
+                f"FAILURES: {n}" if n else "PASS: every shape within tolerance",
+            )
+            raise SystemExit(1 if n else 0)
+        holdout = load(args.holdout, args.metric)[0] if args.holdout else []
+        logger.info(
+            "# fused fit from %d file(s), %d shape(s), TP %s, metric %r, link %r\n",
+            len(args.csv),
+            len(samples),
+            sorted({s.tp for s in samples}),
+            args.metric,
+            args.link,
+        )
+        fit_fused(samples, holdout, args)
+        return
     if args.audit_auto:
         logger.info(
             "# auditing fly_auto over %d shape(s), metric %r, accuracy %s, "
@@ -985,7 +1444,9 @@ def main():
         )
 
         for mode, slack in (("fast", None), ("exact", args.exact_slack)):
-            one, mesh, worst, mean, detail = fit_families(sub, exact_slack=slack)
+            one, mesh, worst, mean, detail, _floor = fit_families(
+                sub, exact_slack=slack
+            )
             label = "fast" if mode == "fast" else "exact(legacy, vs mesh/ring)"
             logger.info(
                 "  %-27s oneshot <= %-9s  mesh <= %-9s   worst %.3fx  mean %.3fx",

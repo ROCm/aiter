@@ -28,11 +28,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T
+from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
 
 from . import buffer_ops
 from .quick_allreduce_codec import (
-    CODECS,
     GROUP,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
@@ -41,8 +40,18 @@ from .quick_allreduce_codec import (
     _codec_load,
     _codec_quant,
     _scale_from_word,
+    codecs_for_block,
     scale_slot_of,
     thread_lane,
+)
+from .quick_allreduce_fusions import (
+    FUSIONS,
+    make_wave_partials,
+    pack_bf16,
+    quick_reduce_row_block_at,
+    residual_add,
+    rms_rstd,
+    scale_by_weight,
 )
 from .quick_allreduce_shared import (
     _CM_SC0,
@@ -54,9 +63,7 @@ from .quick_allreduce_shared import (
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
-    TILE_BYTES,
-    TILE_FP16,
-    TILE_I32,
+    WAVE,
     _acquire_inbox,
     _i32_to_bytes,
     _store_v4i32_peer,
@@ -107,9 +114,6 @@ def ring_st_ladder(world_size: int):
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
-# 64 quads of 4 lanes; one quad writes one 64 B fabric sector.
-QUADS_PER_BLOCK = BLOCK // QUAD_LANES
-
 # Cache policy for reading a rank-tile out of our own inbox.
 #
 # The mesh reads its inbox `nt`, which is only a non-temporal hint -- it
@@ -151,6 +155,9 @@ def make_quick_allreduce_int4_ring_kernel(
     inbox_memory: str = "finegrained",
     rs_codec: str = "int4",
     ag_codec: str = "int4",
+    fusion: str = "none",
+    hidden: int | None = None,
+    block: int | None = None,
 ):
     """Build the ring kernel for one *rank*.
 
@@ -164,7 +171,22 @@ def make_quick_allreduce_int4_ring_kernel(
 
     The kernel *signature* keeps its ``rank`` argument, unused, so the host's
     ``_launch_eng`` is identical for both schedules.
+
+    ``fusion="rmsnorm"`` appends a residual-add + RMSNorm epilogue and requires
+    ``hidden``. It changes the geometry rather than just the tail: the block is
+    sized so one 16 B atom is one token row (see
+    ``quick_allreduce_fusions.quick_reduce_row_block``), which is what lets the
+    epilogue run inside the op that receives a chunk. Without it a row would
+    span several ops, and since this schedule carries nothing across a publish,
+    the only way to reassemble one would be to pin ``super_tile`` at 1 -- which
+    is where the ring's throughput goes to die.
     """
+    if fusion not in FUSIONS:
+        raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
+    if fusion != "none" and hidden is None:
+        raise ValueError(f"fusion={fusion!r} requires hidden")
+    if fusion == "none" and hidden is not None:
+        raise ValueError("hidden is only meaningful for a fused build")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -202,8 +224,24 @@ def make_quick_allreduce_int4_ring_kernel(
     n_ops = 2 * world_size - 1  # ops are 1-based; op k reads slot k-2, writes k-1
     nxt = (rank + 1) % world_size
 
-    rs = CODECS[rs_codec]
-    ag = CODECS[ag_codec]
+    fused = fusion == "rmsnorm"
+    # An explicit block picks among the widths this hidden dim admits; None keeps
+    # the widest.
+    if fused:
+        block, atoms_per_row = quick_reduce_row_block_at(hidden, world_size, block)
+    else:
+        if block is not None:
+            raise ValueError("block is only meaningful for a fused build")
+        block, atoms_per_row = BLOCK, 1
+    rows_per_chunk = rank_atoms // atoms_per_row
+    quads_per_block = block // QUAD_LANES
+    n_waves = block // WAVE
+    tile_i32 = block * ATOMS * 4
+    tile_bytes = tile_i32 * 4
+
+    codecs = codecs_for_block(block)
+    rs = codecs[rs_codec]
+    ag = codecs[ag_codec]
     # Which codec each wire slot carries. Ops 1..N-1 fill the reduce-scatter
     # slots and ops N..2N-1 the all-gather ones, so the split is exactly at
     # N-1 and is a compile-time property of the step index.
@@ -226,7 +264,7 @@ def make_quick_allreduce_int4_ring_kernel(
     # atomics-free design sound here (there are no peer atomics over PCIe), and
     # it makes the buffer (N-1)/N of the mesh's rather than larger.
     total_sectors = [rank_atoms * c.n_sectors for c in step_codec]
-    fanout_rounds = [-(-t // QUADS_PER_BLOCK) for t in total_sectors]
+    fanout_rounds = [-(-t // quads_per_block) for t in total_sectors]
 
     # One staging buffer, sized for whichever codec needs more. Only
     # ``rank_atoms`` rows: a ring stages one destination's packet, not every
@@ -234,8 +272,13 @@ def make_quick_allreduce_int4_ring_kernel(
     # INT6 ring costs less LDS than an INT4 mesh.
     pack_row_i32 = max(rs.rank_tile_i32, ag.rank_tile_i32)
     pack_i32 = rank_atoms * pack_row_i32
-    lds_bytes = pack_i32 * 4
     PackStorage = make_pack_storage(pack_i32)
+
+    # Per-wave partials for the fused sum of squares, one slot per row of a
+    # chunk. Allocated separately from the pack staging.
+    n_partials = rows_per_chunk * n_waves if (fused and n_waves > 1) else 0
+    WavePartials = make_wave_partials(n_partials) if n_partials else None
+    lds_bytes = pack_i32 * 4 + n_partials * 4
 
     def _chunk_of(k: int) -> int:
         """Which chunk op *k* carries, following the standard ring schedule.
@@ -248,7 +291,7 @@ def make_quick_allreduce_int4_ring_kernel(
         j = k if k <= world_size else k - world_size
         return (rank - j) % world_size
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(known_block_size=[block, 1, 1])
     def quick_allreduce_int4_ring(
         rank_unused: Int32,
         nbytes: Int64,
@@ -258,32 +301,38 @@ def make_quick_allreduce_int4_ring_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         n_blocks: Int32,
+        # These args are discarded for non-fused kernel
+        res_in_ptr: Int64,
+        res_out_ptr: Int64,
+        w_ptr: Int64,
+        eps: Float32,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        wave, lane = thread_lane(tid)
+        wave, lane = thread_lane(tid, block)
         quad_layout = fx.make_layout((QUADS_PER_WAVE, QUAD_LANES), (QUAD_LANES, 1))
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
         hbm_layout = fx.make_layout(
-            (num_tiles, ATOMS, BLOCK * 4),
-            (TILE_I32, BLOCK * 4, 1),
+            (num_tiles, ATOMS, block * 4),
+            (tile_i32, block * 4, 1),
         )
-        hbm_row_layout = fx.make_layout((1, BLOCK * 4), (BLOCK * 4, 1))
+        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
         hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
         hbm_copy = fx.make_tiled_copy_tv(
             hbm_copy_atom,
-            fx.make_layout((1, BLOCK), (1, 1)),
+            fx.make_layout((1, block), (1, 1)),
             fx.make_layout((1, 4), (1, 1)),
         ).get_slice(tid)
-        scale_slot, pair_in_slot = scale_slot_of(tid)
+        scale_slot, pair_in_slot = scale_slot_of(tid, block)
         color_layout = fx.make_layout((grid,), (1,))
 
         # One allocation, one view per codec.
-        lds = fx.SharedAllocator().allocate(PackStorage).peek()
+        allocator = fx.SharedAllocator()
+        lds = allocator.allocate(PackStorage).peek()
         smem_ptr = lds.pack.ptr
         pack_views = {
             c.name: lds.pack.view(
@@ -291,6 +340,13 @@ def make_quick_allreduce_int4_ring_kernel(
             )
             for c in ({rs.name: rs, ag.name: ag}).values()
         }
+        # A second allocation from the same allocator -- FlyDSL allows only
+        # one per kernel -- so it cannot alias the staged packet the fanout is
+        # still reading. Hoisted here because the allocator is static: one
+        # reached from inside the op loop would emit an LDS symbol per visit.
+        sq_lds = None
+        if const_expr(n_partials > 0):
+            sq_lds = allocator.allocate(WavePartials).peek().wave.ptr
 
         peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
         peers = [
@@ -316,15 +372,27 @@ def make_quick_allreduce_int4_ring_kernel(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
 
-        def _payload_tensor(ptr):
+        def _payload_tensor(ptr, records=None):
             view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
             return rocdl.make_buffer_tensor(
-                view, max_size=False, num_records_bytes=nbytes
+                view,
+                max_size=False,
+                num_records_bytes=nbytes if records is None else records,
             )
 
         in_buf = _payload_tensor(inp_ptr)
         out_buf = _payload_tensor(out_ptr)
         color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+
+        if const_expr(fused):
+            # residual in/out are (M, hidden) bf16 exactly like the payload, so
+            # they ride the payload layout and the same tiled copy.
+            res_in_buf = _payload_tensor(res_in_ptr)
+            res_out_buf = _payload_tensor(res_out_ptr)
+            # The gain is a single (hidden,) row shared by every token. One row
+            # is ``atoms_per_row`` atoms, so it reuses the layout at tile 0 with
+            # its own record bound.
+            w_buf = _payload_tensor(w_ptr, records=fx.Int64(atoms_per_row * block * 16))
 
         def _slot_i32(step, sub):
             """i32 offset of (*step*, this block, *sub*) inside the inbox.
@@ -388,6 +456,20 @@ def make_quick_allreduce_int4_ring_kernel(
             frag.store(_atom_f16_to_bf16(value))
             fx.copy(hbm_copy_atom, frag, dst)
 
+        def _load_raw_atom(buf, tile, atom):
+            """One 16 B atom, unconverted. For the bf16 operands of the fused
+            epilogue, which are not codec values and never become fp16."""
+            src = hbm_copy.partition_S(_hbm_atom_row(buf, tile, atom))
+            frag = fx.make_fragment_like(src)
+            fx.copy(hbm_copy_atom, src, frag)
+            return fx.Vector(frag.load())
+
+        def _store_raw_atom(buf, tile, atom, value):
+            dst = hbm_copy.partition_D(_hbm_atom_row(buf, tile, atom))
+            frag = fx.make_fragment_like(dst)
+            frag.store(value)
+            fx.copy(hbm_copy_atom, frag, dst)
+
         def _lds_write_packet(codec, j, words, scale_word, is_leader):
             """Stage one packet of *codec* into the row this hop will send."""
             pack = pack_views[codec.name]
@@ -436,7 +518,7 @@ def make_quick_allreduce_int4_ring_kernel(
             n_sectors = codec.n_sectors
             n_total = total_sectors[step]
             for rnd in range_constexpr(fanout_rounds[step]):
-                s = quad_id + fx.Int32(rnd * QUADS_PER_BLOCK)
+                s = quad_id + fx.Int32(rnd * quads_per_block)
                 in_range = s < fx.Int32(n_total)
                 safe = in_range.select(s, fx.Int32(0))
                 # Flat sector id -> (rank-atom, sector), then -> i32 offset. Both
@@ -539,7 +621,78 @@ def make_quick_allreduce_int4_ring_kernel(
             rocdl.s_waitcnt(vmcnt=0)
             _acquire_inbox()
 
-        def _op_substep(k, tile, sub):
+        def _atom_f16_to_f32(atom):
+            """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
+            return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32)
+
+        def _complete(tile, chunk, j, value, recv):
+            """Dispose of an atom whose all-reduce is finished.
+
+            Plain: straight to ``out`` in bf16, as before. Fused: held for the
+            epilogue, which needs the whole row -- and has it, because the block
+            is sized so a chunk is ``rows_per_chunk`` complete rows. ``recv[0]``
+            is the prefetched residual, so the atoms follow it.
+            """
+            if const_expr(fused):
+                recv.append(value)
+            else:
+                _store_chunk_atom(tile, chunk, j, value)
+
+        def _load_residual(tile, chunk):
+            """This chunk's residual atoms, issued before the payload arrives.
+
+            Plain HBM with no dependence on any peer, so the load retires while
+            the receive and the dequantize are still running rather than
+            stalling the epilogue on a cold read after them. Same reasoning as
+            the one-shot's residual prefetch.
+            """
+            base = chunk * rank_atoms
+            return [
+                _load_raw_atom(res_in_buf, tile, base + j)
+                for j in range_constexpr(rank_atoms)
+            ]
+
+        def _epilogue(tile, chunk, chunk_atoms, res_atoms, w_atoms):
+            """Residual add + RMSNorm over the rows this chunk just completed.
+
+            Runs *after* the chunk has been forwarded, so no norm arithmetic
+            sits between a receive and the send that unblocks the successor.
+
+            ``chunk`` is a Python int (``_chunk_of`` folds at trace time), so
+            the atom indices below are compile-time and the loads are the same
+            static offsets the plain path uses.
+            """
+            base = chunk * rank_atoms
+            rows = []
+            for r in range_constexpr(rows_per_chunk):
+                idx = [r * atoms_per_row + a for a in range_constexpr(atoms_per_row)]
+                xs = residual_add(
+                    [_atom_f16_to_f32(chunk_atoms[j]) for j in idx],
+                    [res_atoms[j] for j in idx],
+                )
+                rows.append(xs)
+                # residual_out is final already, so it goes out ahead of the
+                # reduction rather than behind its barrier.
+                packed = pack_bf16(xs)
+                for a in range_constexpr(atoms_per_row):
+                    _store_raw_atom(res_out_buf, tile, base + idx[a], packed[a])
+
+            # One reduction for every row of the chunk: one barrier, not
+            # ``rows_per_chunk`` of them.
+            rstds = rms_rstd(rows, eps, hidden, tid=tid, block=block, lds=sq_lds)
+            for r in range_constexpr(rows_per_chunk):
+                outs = scale_by_weight(rows[r], rstds[r], w_atoms)
+                for a in range_constexpr(atoms_per_row):
+                    _store_raw_atom(
+                        out_buf, tile, base + r * atoms_per_row + a, outs[a]
+                    )
+            if const_expr(n_partials > 0):
+                # The next chunk reuses these slots. The last op has no fanout,
+                # hence no barrier of its own between our reads above and those
+                # writes -- this is it.
+                gpu.barrier()
+
+        def _op_substep(k, tile, sub, recv):
             """One op of the ring, for one sub-tile. Stages LDS; does not send.
 
             Written as one ``if/elif/else`` over the compile-time op number, with
@@ -551,6 +704,12 @@ def make_quick_allreduce_int4_ring_kernel(
             selects exactly one branch, so all compile-time branching here uses
             that form.
 
+            For the same reason the completed atoms leave through *recv*, a
+            caller-owned list this appends to, rather than through a return
+            value. A fused build hands them to the epilogue once the fanout has
+            gone out; a plain build passes a list it ignores, and the atoms go
+            straight to ``out`` here as before.
+
             The codecs are compile-time too: an op reads the codec of the step
             it receives from (``k-2``) and writes the codec of the step it sends
             into (``k-1``). Those coincide everywhere except op ``N``, which is
@@ -559,6 +718,9 @@ def make_quick_allreduce_int4_ring_kernel(
             """
             chunk = _chunk_of(k)
             is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            if const_expr(fused and k >= world_size):
+                # Ahead of the receive, so the HBM latency hides behind it.
+                recv.append(_load_residual(tile, chunk))
             c_in = step_codec[k - 2] if k >= 2 else None
             c_out = step_codec[k - 1] if k <= steps else None
 
@@ -592,7 +754,7 @@ def make_quick_allreduce_int4_ring_kernel(
                     acc = _codec_dequant(
                         c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
                     )
-                    _store_chunk_atom(tile, chunk, j, acc)
+                    _complete(tile, chunk, j, acc, recv)
                     words, word, leader = _codec_quant(c_out, acc, lane, tid)
                     _lds_write_packet(c_out, j, words, word, leader)
             elif const_expr(k < n_ops):
@@ -602,25 +764,27 @@ def make_quick_allreduce_int4_ring_kernel(
                 # additional error -- and it is why c_in is c_out here.
                 for j in range_constexpr(rank_atoms):
                     words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
-                    _store_chunk_atom(
+                    _complete(
                         tile,
                         chunk,
                         j,
                         _codec_dequant(c_in, words_in, _scale_of(c_in, word_in), tid),
+                        recv,
                     )
                     _lds_write_packet(c_out, j, words_in, word_in, is_leader)
             else:
                 # Final op: the last chunk arrives and stops here.
                 for j in range_constexpr(rank_atoms):
                     words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
-                    _store_chunk_atom(
+                    _complete(
                         tile,
                         chunk,
                         j,
                         _codec_dequant(c_in, words_in, _scale_of(c_in, word_in), tid),
+                        recv,
                     )
 
-        def _ring_group(i, n_this, color):
+        def _ring_group(i, n_this, color, w_atoms):
             """One super-tile group: ``2N-1`` ops, each a wait / work / publish.
 
             The wait is hoisted above the sub-tile loop and the publish sits
@@ -642,7 +806,11 @@ def make_quick_allreduce_int4_ring_kernel(
                     pass  # op 1 is a pure send: there is nothing to wait for
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
-                    _op_substep(k, tile, s)
+                    # A caller-owned list rather than a return value; see
+                    # ``_op_substep``. Empty for every op that completes nothing,
+                    # and for every op at all in a plain build.
+                    recv = []
+                    _op_substep(k, tile, s, recv)
                     if const_expr(k <= steps):
                         gpu.barrier()
                         _fanout_to_next(k - 1, s)
@@ -654,10 +822,25 @@ def make_quick_allreduce_int4_ring_kernel(
                             gpu.barrier()
                     else:
                         pass  # the last op receives only
+                    if const_expr(fused and k >= world_size):
+                        # After the fanout: the successor is already unblocked,
+                        # so the epilogue runs off the ring's critical path.
+                        _epilogue(tile, _chunk_of(k), recv[1:], recv[0], w_atoms)
+                    else:
+                        pass
                 if const_expr(k <= steps):
                     _publish(k - 1, color)
                 else:
                     pass
+
+        # One row shared by every token, so the gain is read once here rather
+        # than once per chunk.
+        w_atoms = None
+        if const_expr(fused):
+            w_atoms = [
+                _load_raw_atom(w_buf, fx.Int32(0), a)
+                for a in range_constexpr(atoms_per_row)
+            ]
 
         # Stride by the launched grid, not the compile-time cap: the host
         # launches fewer blocks than `grid` when it wants each block to own a
@@ -669,7 +852,7 @@ def make_quick_allreduce_int4_ring_kernel(
         for i in range(fx.Int32(0), n_block_tiles, st_i):
             remain = n_block_tiles - i
             n_this = (remain < st_i).select(remain, st_i)
-            _ring_group(i, n_this, color)
+            _ring_group(i, n_this, color, w_atoms)
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
@@ -677,8 +860,14 @@ def make_quick_allreduce_int4_ring_kernel(
             _store_color(color)
         gpu.barrier()
 
-    flat_wg = f"{BLOCK},{BLOCK}"
+    flat_wg = f"{block},{block}"
 
+    # Two launchers over one kernel. The plain one keeps the eight-argument
+    # signature the host's ``_launch_args`` builds and passes zeros for the
+    # fused operands, which a plain build never reads; the fused one takes them
+    # for real. Splitting here rather than at the kernel keeps the body single-
+    # sourced -- it has to stay lexically inside one ``@flyc.kernel``, because
+    # only that function's AST is rewritten.
     @flyc.jit
     def launch_quick_allreduce_int4_ring(
         rank_arg: Int32,
@@ -700,10 +889,50 @@ def make_quick_allreduce_int4_ring_kernel(
             peer_ptrs,
             colors_ptr,
             grid_x,
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Float32(0.0),
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
-            block=(BLOCK, 1, 1),
+            block=(block, 1, 1),
+            stream=stream,
+        )
+
+    @flyc.jit
+    def launch_quick_allreduce_int4_ring_fused(
+        rank_arg: Int32,
+        nbytes: Int64,
+        num_tiles: Int32,
+        inp_ptr: Int64,
+        out_ptr: Int64,
+        peer_ptrs: Int64,
+        colors_ptr: Int64,
+        grid_x: Int32,
+        res_in_ptr: Int64,
+        res_out_ptr: Int64,
+        w_ptr: Int64,
+        eps: Float32,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        quick_allreduce_int4_ring(
+            rank_arg,
+            nbytes,
+            num_tiles,
+            inp_ptr,
+            out_ptr,
+            peer_ptrs,
+            colors_ptr,
+            grid_x,
+            res_in_ptr,
+            res_out_ptr,
+            w_ptr,
+            eps,
+            value_attrs={"rocdl.flat_work_group_size": flat_wg},
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(block, 1, 1),
             stream=stream,
         )
 
@@ -711,20 +940,25 @@ def make_quick_allreduce_int4_ring_kernel(
     # policy, so both have to reach the symbol name -- variants that differ only
     # in a compile-time constant must not collide in the JIT cache.
     tag = f"ws{world_size}_r{rank}_st{super_tile}_{inbox_memory}_{rs_codec}_{ag_codec}"
-    launch_quick_allreduce_int4_ring.func.__name__ = (
-        f"launch_quick_allreduce_int4_ring_{tag}"
+    if fused:
+        tag += f"_rms_h{hidden}_b{block}"
+    launcher = (
+        launch_quick_allreduce_int4_ring_fused
+        if fused
+        else launch_quick_allreduce_int4_ring
     )
+    launcher.func.__name__ = f"launch_quick_allreduce_int4_ring_{tag}"
     try:
         quick_allreduce_int4_ring.func.__name__ = f"quick_allreduce_int4_ring_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_quick_allreduce_int4_ring,
+        "launch": launcher,
         "flags_bytes": 0,  # the handshake rides in each slot's 64 B tail
         "data_bytes": inbox_bytes,
         "lds_bytes": lds_bytes,
-        "tile_bytes": TILE_BYTES,
-        "tile_fp16": TILE_FP16,
+        "tile_bytes": tile_bytes,
+        "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": rs.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_i32[0] * 4,
         "ag_rank_tile_bytes": ag.rank_tile_bytes,
@@ -741,5 +975,9 @@ def make_quick_allreduce_int4_ring_kernel(
         "rank_atoms": rank_atoms,
         "steps": steps,
         "grid": grid,
-        "block": BLOCK,
+        "block": block,
+        "fusion": fusion,
+        "hidden": hidden,
+        "atoms_per_row": atoms_per_row,
+        "rows_per_chunk": rows_per_chunk,
     }

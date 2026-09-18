@@ -21,11 +21,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T
+from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
 
 from . import buffer_ops
 from .quick_allreduce_codec import (
-    CODECS,
     SUPER_TILES,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
@@ -34,8 +33,18 @@ from .quick_allreduce_codec import (
     _codec_load,
     _codec_quant,
     _scale_from_word,
+    codecs_for_block,
     scale_slot_of,
     thread_lane,
+)
+from .quick_allreduce_fusions import (
+    FUSIONS,
+    make_wave_partials,
+    pack_bf16,
+    quick_reduce_row_block_at,
+    residual_add,
+    rms_rstd,
+    scale_by_weight,
 )
 from .quick_allreduce_shared import (
     _INBOX_POLICY,
@@ -46,8 +55,7 @@ from .quick_allreduce_shared import (
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
     TILE_BYTES,
-    TILE_FP16,
-    TILE_I32,
+    WAVE,
     WORLD,
     _acquire_inbox,
     _i32_to_bytes,
@@ -95,6 +103,7 @@ def clamp_grid_cap(
     world_size: int,
     super_tile: int,
     cu_count: int,
+    block: int = BLOCK,
 ) -> int:
     """Clamp a requested persistent grid to what actually fits on the device.
 
@@ -109,9 +118,19 @@ def clamp_grid_cap(
     the failure mode, so the fallback has to err small. An unknown *arch* or
     *world_size* still raises, because there is nothing to be conservative
     with.
+
+    *block* wider than the measured 256 scales the answer down: the table is
+    VGPR- and wave-slot-limited workgroups per CU at four waves, and a 14-wave
+    workgroup takes 3.5x the slots. That scaling is a **model**, not a
+    measurement, and over-estimating residency here is a hang rather than a
+    slowdown -- so a fused build must not rely on it alone. The host bounds
+    those launches at one workgroup per CU as well; see
+    ``QuickAllReduceInt4RMSNorm``.
     """
     if requested < 1 or cu_count < 1:
         raise ValueError("grid_cap and cu_count must be positive")
+    if block < 1:
+        raise ValueError("block must be positive")
     if arch not in ("gfx942", "gfx950"):
         raise ValueError(
             f"quick_allreduce_int4 has no residency measurement for {arch!r}"
@@ -126,6 +145,7 @@ def clamp_grid_cap(
                 f"world_size={world_size}"
             )
         resident = min(for_world)
+    resident = max(1, (resident * BLOCK) // int(block))
     return min(int(requested), resident * int(cu_count))
 
 
@@ -152,7 +172,16 @@ def make_quick_allreduce_int4_kernel(
     grid: int,
     inbox_memory: str = "uncached",
     codec: str = "int4",
+    fusion: str = "none",
+    hidden: int | None = None,
+    block: int | None = None,
 ):
+    if fusion not in FUSIONS:
+        raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
+    if fusion != "none" and hidden is None:
+        raise ValueError(f"fusion={fusion!r} requires hidden")
+    if fusion == "none" and hidden is not None:
+        raise ValueError("hidden is only meaningful for a fused build")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -163,7 +192,21 @@ def make_quick_allreduce_int4_kernel(
         )
     if codec not in MESH_CODECS:
         raise ValueError(f"codec must be one of {MESH_CODECS}, got {codec!r}")
-    c = CODECS[codec]
+
+    fused = fusion == "rmsnorm"
+    if fused:
+        block, atoms_per_row = quick_reduce_row_block_at(hidden, world_size, block)
+    else:
+        if block is not None:
+            raise ValueError("block is only meaningful for a fused build")
+        block, atoms_per_row = BLOCK, 1
+    rows_per_tile = ATOMS // atoms_per_row
+    quads_per_block = block // QUAD_LANES
+    n_waves = block // WAVE
+    tile_i32 = block * ATOMS * 4
+    tile_bytes = tile_i32 * 4
+
+    c = codecs_for_block(block)[codec]
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
@@ -184,24 +227,45 @@ def make_quick_allreduce_int4_kernel(
     wire_tile_i32 = release_i32_off + 16
     wire_tile_bytes = wire_tile_i32 * 4
 
-    # A rank-tile's sectors, in stripes of up to 8 (a workgroup has 64 quads,
-    # and world_size*8 of them cover one full stripe at TP8). INT4 is 8+8+2;
-    # fp16, with no scale tail, is eight full stripes. One fanout layout per
-    # distinct stripe width.
+    # A rank-tile's sectors, in stripes of up to 8 (a 256-thread workgroup has
+    # 64 quads, and world_size*8 of them cover one full stripe at TP8). INT4 is
+    # 8+8+2; fp16, with no scale tail, is eight full stripes. One fanout layout
+    # per distinct stripe width.
     stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
     _fanout_stride = {
         w: (w, 1) if policy["fanout"] == "peer" else (1, world_size)
         for w in {width for _, width in stripes}
     }
+    # One quad per (peer, sector) of a stripe, in a single pass -- unlike the
+    # ring, which loops rounds. A block narrower than the shipped 256 would run
+    # out of quads and silently drop the sectors past the end, so a fused build
+    # that lands there is rejected rather than built.
+    need_quads = max(world_size * width for _, width in stripes)
+    if quads_per_block < need_quads:
+        raise ValueError(
+            f"fused hidden={hidden} gives BLOCK={block} ({quads_per_block} quads), "
+            f"under the {need_quads} the {codec} fanout needs at world_size="
+            f"{world_size}; use a wider hidden or the ring schedule"
+        )
 
     # dest × rank_atoms == ATOMS for every supported world size.
     pack_i32 = ATOMS * c.rank_tile_i32
-    lds_bytes = ATOMS * c.rank_tile_bytes
     PackStorage = make_pack_storage(pack_i32)
+
+    # Per-wave partials for the fused sum of squares, one slot per row of a
+    # tile. Allocated from the same allocator as the pack staging (FlyDSL
+    # permits one per kernel) but as its own region, so it cannot alias a
+    # packet the fanout is still reading.
+    n_partials = rows_per_tile * n_waves if (fused and n_waves > 1) else 0
+    WavePartials = make_wave_partials(n_partials) if n_partials else None
+    lds_bytes = ATOMS * c.rank_tile_bytes + n_partials * 4
 
     flags_i32 = PHASES * grid * world_size
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    # One signature for both modes; the plain launcher below passes zeros for
+    # the fused operands, which ``const_expr(fused)`` elides every use of. See
+    # the ring kernel for why the split is at the launcher and not here.
+    @flyc.kernel(known_block_size=[block, 1, 1])
     def quick_allreduce_int4(
         rank: Int32,
         nbytes: Int64,
@@ -211,12 +275,16 @@ def make_quick_allreduce_int4_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         n_blocks: Int32,
+        res_in_ptr: Int64,
+        res_out_ptr: Int64,
+        w_ptr: Int64,
+        eps: Float32,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        wave, lane = thread_lane(tid)
+        wave, lane = thread_lane(tid, block)
         quad_layout = fx.make_layout((QUADS_PER_WAVE, QUAD_LANES), (QUAD_LANES, 1))
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
@@ -227,19 +295,19 @@ def make_quick_allreduce_int4_kernel(
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
         # Remote NT fanout stays explicit global_store_dwordx4 nt.
         hbm_layout = fx.make_layout(
-            (num_tiles, ATOMS, BLOCK * 4),
-            (TILE_I32, BLOCK * 4, 1),
+            (num_tiles, ATOMS, block * 4),
+            (tile_i32, block * 4, 1),
         )
-        hbm_row_layout = fx.make_layout((1, BLOCK * 4), (BLOCK * 4, 1))
+        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
         hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
         hbm_copy = fx.make_tiled_copy_tv(
             hbm_copy_atom,
-            fx.make_layout((1, BLOCK), (1, 1)),
+            fx.make_layout((1, block), (1, 1)),
             fx.make_layout((1, 4), (1, 1)),
         ).get_slice(tid)
         # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
-        scale_slot, pair_in_slot = scale_slot_of(tid)
-        # A workgroup has 64 quads. A stripe of up to 8 sectors needs
+        scale_slot, pair_in_slot = scale_slot_of(tid, block)
+        # A 256-thread workgroup has 64 quads. A stripe of up to 8 sectors needs
         # world_size*8 quads (64 at 8 GPUs); leftover quads sit idle (always on
         # a narrower tail stripe, and on every stripe when world_size < 8).
         #
@@ -266,9 +334,16 @@ def make_quick_allreduce_int4_kernel(
             ),
         )
 
-        lds = fx.SharedAllocator().allocate(PackStorage).peek()
+        allocator = fx.SharedAllocator()
+        lds = allocator.allocate(PackStorage).peek()
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
+        # A second region from the same allocator -- FlyDSL permits one per
+        # kernel -- hoisted here because it is static: an allocation reached
+        # from inside the tile loop would emit one LDS symbol per visit.
+        sq_lds = None
+        if const_expr(n_partials > 0):
+            sq_lds = allocator.allocate(WavePartials).peek().wave.ptr
 
         peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
         peers = [
@@ -289,15 +364,25 @@ def make_quick_allreduce_int4_kernel(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
 
-        def _payload_tensor(ptr):
+        def _payload_tensor(ptr, records=None):
             view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
             return rocdl.make_buffer_tensor(
-                view, max_size=False, num_records_bytes=nbytes
+                view,
+                max_size=False,
+                num_records_bytes=nbytes if records is None else records,
             )
 
         in_buf = _payload_tensor(inp_ptr)
         out_buf = _payload_tensor(out_ptr)
         color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+
+        if const_expr(fused):
+            # residual in/out share the payload's (M, hidden) bf16 shape, so
+            # they ride the payload layout and the same tiled copy. The gain is
+            # one (hidden,) row -- ``atoms_per_row`` atoms at tile 0.
+            res_in_buf = _payload_tensor(res_in_ptr)
+            res_out_buf = _payload_tensor(res_out_ptr)
+            w_buf = _payload_tensor(w_ptr, records=fx.Int64(atoms_per_row * block * 16))
 
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
@@ -340,6 +425,64 @@ def make_quick_allreduce_int4_kernel(
                 frag = fx.make_fragment_like(dst)
                 frag.store(packed)
                 fx.copy(hbm_copy_atom, frag, dst)
+
+        def _load_raw_atom(buf, tile, atom):
+            """One 16 B atom, unconverted -- the fused epilogue's bf16 operands
+            are not codec values and never become fp16."""
+            src = hbm_copy.partition_S(_hbm_atom_row(buf, tile, atom))
+            frag = fx.make_fragment_like(src)
+            fx.copy(hbm_copy_atom, src, frag)
+            return fx.Vector(frag.load())
+
+        def _store_raw_atom(buf, tile, atom, value):
+            dst = hbm_copy.partition_D(_hbm_atom_row(buf, tile, atom))
+            frag = fx.make_fragment_like(dst)
+            frag.store(value)
+            fx.copy(hbm_copy_atom, frag, dst)
+
+        def _atom_f16_to_f32(atom):
+            """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
+            return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32)
+
+        def _epilogue(tile, gathered, w_atoms):
+            """Residual add + RMSNorm over the whole tile.
+
+            The mesh ends a tile holding every atom of it, and the fused
+            geometry makes ``atoms_per_row`` of them one token row, so the tile
+            is ``rows_per_tile`` independent rows and each reduces inside this
+            block. All of them go through one ``rms_rstd`` call, which is one
+            barrier rather than one per row.
+            """
+            rows = []
+            for r in range_constexpr(rows_per_tile):
+                idx = [r * atoms_per_row + a for a in range_constexpr(atoms_per_row)]
+                xs = residual_add(
+                    [_atom_f16_to_f32(gathered[j]) for j in idx],
+                    [_load_raw_atom(res_in_buf, tile, j) for j in idx],
+                )
+                rows.append(xs)
+                # residual_out is final here, so it is issued ahead of the
+                # reduction rather than behind its barrier.
+                packed = pack_bf16(xs)
+                for a in range_constexpr(atoms_per_row):
+                    _store_raw_atom(res_out_buf, tile, idx[a], packed[a])
+
+            rstds = rms_rstd(rows, eps, hidden, tid=tid, block=block, lds=sq_lds)
+            for r in range_constexpr(rows_per_tile):
+                outs = scale_by_weight(rows[r], rstds[r], w_atoms)
+                for a in range_constexpr(atoms_per_row):
+                    _store_raw_atom(out_buf, tile, r * atoms_per_row + a, outs[a])
+            if const_expr(n_partials > 0):
+                # The next tile reuses these slots, and the super-tile store
+                # loop runs back-to-back with no barrier of its own between
+                # iterations -- this is what separates its writes from our reads.
+                gpu.barrier()
+
+        def _finish_tile(tile, gathered, w_atoms):
+            if const_expr(fused):
+                _epilogue(tile, gathered, w_atoms)
+            else:
+                _store_tile_atoms(tile, gathered)
 
         def _lds_write_packet(slot, words, scale, is_leader):
             for (off, pred), word in zip(c.plane_slots(tid), words):
@@ -516,6 +659,15 @@ def make_quick_allreduce_int4_kernel(
                     gathered.append(_codec_dequant(c, words, scale, tid))
             return gathered
 
+        # One row shared by every token, so the gain is read once here rather
+        # than once per tile.
+        w_atoms = None
+        if const_expr(fused):
+            w_atoms = [
+                _load_raw_atom(w_buf, fx.Int32(0), a)
+                for a in range_constexpr(atoms_per_row)
+            ]
+
         # Stride by the *launched* grid, not the compile-time cap. The host
         # launches fewer blocks than `grid` whenever it wants each block to own
         # several tiles (see QuickAllReduceInt4._grid_x); striding by the cap instead would
@@ -542,7 +694,7 @@ def make_quick_allreduce_int4_kernel(
 
                 _wait_release(PHASE_ALL_GATHER, color)
                 gathered = _recv_all_gather(fx.Int32(0))
-                _store_tile_atoms(tile, gathered)
+                _finish_tile(tile, gathered, w_atoms)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -586,7 +738,7 @@ def make_quick_allreduce_int4_kernel(
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     gathered = _recv_all_gather(s)
                     tile = bid + (i + s) * n_blocks
-                    _store_tile_atoms(tile, gathered)
+                    _finish_tile(tile, gathered, w_atoms)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -595,8 +747,10 @@ def make_quick_allreduce_int4_kernel(
             _store_color(color)
         gpu.barrier()
 
-    flat_wg = f"{BLOCK},{BLOCK}"
+    flat_wg = f"{block},{block}"
 
+    # Two launchers over one kernel: the plain one keeps the eight-argument
+    # signature the host builds today and passes zeros for the fused operands.
     @flyc.jit
     def launch_quick_allreduce_int4(
         rank: Int32,
@@ -618,10 +772,50 @@ def make_quick_allreduce_int4_kernel(
             peer_ptrs,
             colors_ptr,
             grid_x,
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Float32(0.0),
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
-            block=(BLOCK, 1, 1),
+            block=(block, 1, 1),
+            stream=stream,
+        )
+
+    @flyc.jit
+    def launch_quick_allreduce_int4_fused(
+        rank: Int32,
+        nbytes: Int64,
+        num_tiles: Int32,
+        inp_ptr: Int64,
+        out_ptr: Int64,
+        peer_ptrs: Int64,
+        colors_ptr: Int64,
+        grid_x: Int32,
+        res_in_ptr: Int64,
+        res_out_ptr: Int64,
+        w_ptr: Int64,
+        eps: Float32,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        quick_allreduce_int4(
+            rank,
+            nbytes,
+            num_tiles,
+            inp_ptr,
+            out_ptr,
+            peer_ptrs,
+            colors_ptr,
+            grid_x,
+            res_in_ptr,
+            res_out_ptr,
+            w_ptr,
+            eps,
+            value_attrs={"rocdl.flat_work_group_size": flat_wg},
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(block, 1, 1),
             stream=stream,
         )
 
@@ -629,18 +823,23 @@ def make_quick_allreduce_int4_kernel(
     # both have to be part of the symbol name -- two variants that differ only
     # in cache bits or wire format must not collide in the JIT cache.
     tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_{codec}"
-    launch_quick_allreduce_int4.func.__name__ = f"launch_quick_allreduce_int4_{tag}"
+    if fused:
+        tag += f"_rms_h{hidden}_b{block}"
+    launcher = (
+        launch_quick_allreduce_int4_fused if fused else launch_quick_allreduce_int4
+    )
+    launcher.func.__name__ = f"launch_quick_allreduce_int4_{tag}"
     try:
         quick_allreduce_int4.func.__name__ = f"quick_allreduce_int4_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_quick_allreduce_int4,
+        "launch": launcher,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": lds_bytes,
-        "tile_bytes": TILE_BYTES,
-        "tile_fp16": TILE_FP16,
+        "tile_bytes": tile_bytes,
+        "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": c.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_bytes,
         "super_tile": super_tile,
@@ -652,5 +851,9 @@ def make_quick_allreduce_int4_kernel(
         "release_writeback": release_writeback,
         "rank_atoms": rank_atoms,
         "grid": grid,
-        "block": BLOCK,
+        "block": block,
+        "fusion": fusion,
+        "hidden": hidden,
+        "atoms_per_row": atoms_per_row,
+        "rows_per_tile": rows_per_tile,
     }
