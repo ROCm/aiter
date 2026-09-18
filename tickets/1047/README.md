@@ -625,6 +625,11 @@ threads. Not the old aliased ~90 KiB 256-thread BN64 mapping.
 row-major V gather plus tiled PV B. Prefill went 513.5 → 935.7 us
 (``err=0``). Keep one row-major V tile.
 
+**Do not retry** 64-bit ``UniversalCopy`` PV-A loads from contiguous
+``p_lds[h, n:n+4]``. Oracle ``err=0``; width-2051 ``L=512`` was 19.8 /
+23.1 / 516.0 us vs 19.8 / 22.7 / 513.5. The 16 ``ds_read_u16`` P reads
+are not the split-kernel gap. Keep scalar P gathers.
+
 
 
 
