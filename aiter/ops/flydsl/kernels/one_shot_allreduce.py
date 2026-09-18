@@ -124,49 +124,93 @@ def _store_v4i32_peer_multi(pairs, policy):
     )
 
 
-BLOCK = 256
+DEFAULT_BLOCK = 256
+# Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``. 
+# It sets the parallelism floor at a given payload.
+#
+# The trade is flags and per-block fixed cost: the flag count (``blocks * (N-1)``)
+# rises by the same factor the block count does.
+SUPPORTED_BLOCKS = (64, 128, 256)
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
 ATOM_BYTES = 16
 ATOM_I32 = ATOM_BYTES // 4
 DEFAULT_ATOMS = 1
 # Atoms per thread per tile. More atoms means a bigger tile, hence fewer blocks
 # and fewer flags for a given payload, at the cost of coarser load balance on
-# the last partial tile. 1 is the decode default: at TP8/M=1 (14 KiB) it gives
-# 4 blocks, which is already more parallelism than the payload needs.
-#
-# ``atoms>1`` used to be gated off here as incorrect. The diagnosis blamed the
-# per-atom stride in ``_fanout`` / ``_reduce`` / ``hbm_layout``; that was wrong,
-# those three always agreed. The real fault was a VMEM store hazard the fanout
-# only exposes under the register pressure of several atoms -- see
-# ``_store_v4i32_peer_multi`` below, which now carries the
-# whole fanout in one asm block. Passes at TP2 and TP4 for 1, 2 and 4 including
-# the run-ahead loop.
+# the last partial tile.
 SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 
-# Per-world-size tuning ladder: ``(min_bytes, atoms, grid_cap, fanout)`` rungs.
-# The host builds one engine per rung and selects by payload size at launch.
-# Created from a tuning sweep.
+# Per-``(link, world_size)`` tuning ladder: ``(min_bytes, atoms, grid_cap,
+# fanout, block, skip_self)`` rungs. The host builds one engine per rung and
+# selects by payload size at launch. Created from a tuning sweep.
 #
-#   TP2  atoms=4  -- fattest tile, because at N=2 there is wire volume to spare
-#                    and the payload runs far enough up to want fewer flags.
-#   TP4  atoms=1  -- narrowest tile and a *smaller* grid cap; this window tops
-#                    out at 96 KiB, where the schedule is flag-bound and blocks
-#                    are worth more than tile width.
-#   TP8  atoms=4  -- the fattest tile again, for the opposite reason: the window
-#                    is only 48 KiB wide, the fanout is to 7 peers, and cutting
-#                    the flag count matters more than the handful of blocks lost.
+# ``atoms`` and ``block`` both scale the tile, and their product is what
+# matters to the block count; they are separate knobs because only ``block``
+# also changes the workgroup size, and only ``atoms`` also changes how many
+# stores one thread has in flight.
+#
+#   PCIe
+#
+#     TP2  block 128, atoms=2, cap 64 -- a 4 KiB tile reached with a half-size
+#                               workgroup. Below 96 KiB the schedule is
+#                               flag-bound, and 128 threads is the cheapest way
+#                               to hold the tile narrow.
+#          block 256, atoms=4, cap 128 -- above 96 KiB the trade reverses and
+#                               the wider cap matters, because this window runs
+#                               to 1.5 MiB: at a 16 KiB tile that is 96 tiles,
+#                               so a cap of 64 would leave half the blocks
+#                               running two serialized handshake rounds.
+#     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB, 
+#                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
+#     TP8  block 256, atoms=4, cap 64 -- the fattest tile, one rung over the
+#                               whole 80 KiB window: the fanout is to 7 peers
+#                               and cutting the flag count matters more than
+#                               the handful of blocks lost.
+#
+#   TODO: xGMI needs to re-measured to see if self-skip is beneficial also here.
+#   xGMI 
+#     TP2  atoms=2, cap 64   -- one rung over the whole 4 MiB window.
+#     TP4  atoms=1, cap 128  -- the narrow tile wins throughout, and the extra
+#                               blocks matter more than tile width because peer
+#                               bandwidth is not the constraint.
+#     TP8  atoms=1, cap 64   -- one rung over the whole 256 KiB window.
 ONESHOT_LADDER = {
-    2: ((0, 4, 128, "peer"),),
-    4: ((0, 1, 32, "peer"),),
-    8: ((0, 4, 64, "peer"),),
+    ("pcie", 2): (
+        (0, 2, 64, "peer", 128, True),
+        (96 << 10, 4, 128, "peer", 256, True),
+    ),
+    ("pcie", 4): (
+        (0, 1, 64, "peer", 256, True),
+        (48 << 10, 2, 64, "atom", 256, True),
+        (96 << 10, 4, 128, "peer", 256, True),
+    ),
+    ("pcie", 8): ((0, 4, 64, "peer", 256, True),),
+    ("xgmi", 2): ((0, 2, 64, "peer", 256, False),),
+    ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
+    ("xgmi", 8): ((0, 1, 64, "peer", 256, False),),
 }
 
 
-def oneshot_ladder(world_size: int):
-    """Rungs for *world_size*, or a single default rung for an unlisted one."""
+def oneshot_ladder(world_size: int, link: str = "pcie"):
+    """Rungs for *(link, world_size)*, or a single default rung if unlisted.
+
+    *link* defaults to ``"pcie"`` so a caller that has not resolved the fabric
+    gets the conservative table: its fatter tiles cost throughput on xGMI but
+    are never wrong in the sense of failing.
+    """
     return ONESHOT_LADDER.get(
-        int(world_size), ((0, DEFAULT_ATOMS, DEFAULT_GRID_CAP, "peer"),)
+        (str(link), int(world_size)),
+        (
+            (
+                0,
+                DEFAULT_ATOMS,
+                DEFAULT_GRID_CAP,
+                DEFAULT_FANOUT,
+                DEFAULT_BLOCK,
+                DEFAULT_SKIP_SELF,
+            ),
+        ),
     )
 
 
@@ -226,7 +270,7 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
 #
 # "peer": a thread pushes all its atoms to one destination before moving to the
-# next, so a wave hands each destination a contiguous ``BLOCK * 16`` B run.
+# next, so a wave hands each destination a contiguous ``block * 16`` B run.
 #
 # "atom": consecutive stores walk the peers of one atom. On xGMI the native
 # packet is 64 B and there is no per-destination run-length benefit to collect,
@@ -243,6 +287,11 @@ PROBE_MODES = ("full", "sync")
 
 # ``s_sleep`` interval for the flag spin, 0 to spin flat out.
 DEFAULT_SPIN_SLEEP = 0
+
+# Whether a rank pushes its own contribution through its own inbox. Keeping it
+# costs a store, a load and a flag per tile in memory the rank already holds in
+# registers, which is 1/N of each; dropping it specialises the binary per rank.
+DEFAULT_SKIP_SELF = False
 
 
 def _load_v4i32_at(rsrc, elem_off, policy):
@@ -271,6 +320,9 @@ def make_one_shot_allreduce_kernel(
     fanout: str = DEFAULT_FANOUT,
     probe: str = "full",
     spin_sleep: int = DEFAULT_SPIN_SLEEP,
+    skip_self: bool = False,
+    rank: int | None = None,
+    block: int = DEFAULT_BLOCK,
     fusion: str = "none",
     hidden: int | None = None,
 ):
@@ -280,9 +332,16 @@ def make_one_shot_allreduce_kernel(
         raise ValueError(f"fusion={fusion!r} requires hidden")
     if fusion == "none" and hidden is not None:
         raise ValueError("hidden is only meaningful for a fused build")
+    if block not in SUPPORTED_BLOCKS:
+        raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
+        )
+    if skip_self and not 0 <= (rank if rank is not None else -1) < world_size:
+        raise ValueError(
+            f"skip_self needs the rank at trace time, got rank={rank!r} for "
+            f"world_size={world_size}"
         )
     if atoms not in SUPPORTED_ATOMS:
         raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
@@ -305,10 +364,11 @@ def make_one_shot_allreduce_kernel(
     release_writeback = policy["writeback"]
 
     fused = fusion == "rmsnorm"
-    # The plain schedule keeps the shipped 256-thread block, so its emitted code
+    # The plain schedule keeps the provided block, so its emitted code
     # is untouched by this factory growing a fused mode. A fused build sizes the
     # block to the row instead; see ``fused_block``.
-    block = fused_block(hidden, atoms) if fused else BLOCK
+    if fused:
+        block = fused_block(hidden, atoms)
     # Per-wave partials for the block-wide sum of squares. The plain build has
     # no LDS at all.
     n_waves = block // WAVE
@@ -321,11 +381,22 @@ def make_one_shot_allreduce_kernel(
     wire_tile_bytes = wire_tile_i32 * 4
     data_bytes = PARITIES * grid * world_size * wire_tile_bytes
 
+    # This rank's own index as a trace-time constant, or None when the self
+    # slot is being used. It has to be compile-time: the peer fanout, the flag
+    # publish and the reduce are all unrolled over trace-time peer indices, and
+    # "all peers but me" is only expressible there. The cost is one kernel
+    # binary per rank -- but a process is one rank, so it compiles exactly one.
+    self_rank = int(rank) if skip_self else None
+    # Peers this rank pushes payload and flags to. With ``skip_self`` our own
+    # inbox slot is simply never touched: the wire format is unchanged, the slot
+    # is still allocated, and no peer can observe the difference.
+    push_peers = [p for p in range(world_size) if p != self_rank]
+
     # (peer, atom) iteration order for the fanout, unrolled at trace time.
     if fanout == "peer":
-        fanout_pairs = [(p, a) for p in range(world_size) for a in range(atoms)]
+        fanout_pairs = [(p, a) for p in push_peers for a in range(atoms)]
     else:
-        fanout_pairs = [(p, a) for a in range(atoms) for p in range(world_size)]
+        fanout_pairs = [(p, a) for a in range(atoms) for p in push_peers]
 
     # LDS for the fused sum-of-squares. Carries the per-wave partial sums
     # only: the 1/hidden, the +eps and the rsqrt all happen afterwards in
@@ -462,10 +533,12 @@ def make_one_shot_allreduce_kernel(
             """Push this thread's atoms into every peer's slot for this rank.
 
             Thread ``t``'s data lands at the same offset in every destination,
-            so it goes straight from registers -- no LDS staging. Includes the
-            self-store: it is a local write into our own inbox and keeps the
-            receive loop uniform over ``world_size``. Dropping it is a tuning
-            lever, not a correctness one.
+            so it goes straight from registers -- no LDS staging.
+
+            ``skip_self`` decides whether the fanout includes our own inbox.
+            Keeping it makes the receive loop uniform over ``world_size``;
+            dropping it removes 1/N of the stores, 1/N of the reduce's loads and
+            1/N of the flags, at the cost of one kernel binary per rank.
             """
             # One asm block for the whole fanout: the stores must not have
             # their data VGPRs recycled before ``vmcnt`` retires them, and
@@ -521,7 +594,7 @@ def make_one_shot_allreduce_kernel(
                 _store_v4i32_peer_multi(
                     [
                         (peer_vec[peer] + _i32_to_bytes(elem), v4)
-                        for peer in range(world_size)
+                        for peer in push_peers
                     ],
                     flag_policy,
                 )
@@ -536,8 +609,17 @@ def make_one_shot_allreduce_kernel(
             invalidating or the output lines this block already wrote are
             discarded.
             """
-            if tid < fx.Int32(world_size):
-                elem = _slot_i32(parity, tid) + fx.Int32(tile_i32)
+            # Lane ``t`` watches one source. Without ``skip_self`` that is
+            # source ``t``; with it our own flag is never published, so the
+            # N-1 lanes step over our own index and the last lane sits out.
+            # Computed before the guard rather than nested inside it, so the
+            # remap is a flat ``scf.if`` yielding one value.
+            spin_src = tid
+            if const_expr(skip_self):
+                if tid >= fx.Int32(self_rank):
+                    spin_src = tid + fx.Int32(1)
+            if tid < fx.Int32(len(push_peers)):
+                elem = _slot_i32(parity, spin_src) + fx.Int32(tile_i32)
                 flag_rsrc = buffer_ops.create_buffer_resource_from_addr(
                     peer_vec[rank] + _i32_to_bytes(elem)
                 )
@@ -562,26 +644,30 @@ def make_one_shot_allreduce_kernel(
                 rocdl.s_waitcnt(vmcnt=0)
             _acquire_inbox()
 
-        def _reduce_f32(parity):
-            """Sum this thread's atom across all N inbox copies, in rank order.
+        def _reduce(parity, my_atoms):
+            """Sum this thread's atom across all N contributions, in rank order.
 
             Rank order, not a rotated order: every rank must accumulate in the
             same sequence or the results differ in the last bit across ranks.
             ``cross_device_reduce`` makes the same promise for the same reason.
-
-            Returns fp32 vectors; the plain path rounds them once in
-            ``_reduce``, the fused path needs them unrounded for the norm.
+            Under ``skip_self`` our own contribution comes out of the registers
+            rather than out of the inbox.
             """
             outs = []
             for atom in range_constexpr(atoms):
                 acc = None
                 for src in range_constexpr(world_size):
-                    elem = (
-                        _slot_i32(parity, fx.Int32(src))
-                        + fx.Int32(atom * block * ATOM_I32)
-                        + tid * fx.Int32(ATOM_I32)
-                    )
-                    v = atom_bf16_to_f32(_load_v4i32_at(self_rsrc, elem, _RECV_POLICY))
+                    if const_expr(src == self_rank):
+                        v = _atom_bf16_to_f32(my_atoms[atom])
+                    else:
+                        elem = (
+                            _slot_i32(parity, fx.Int32(src))
+                            + fx.Int32(atom * block * ATOM_I32)
+                            + tid * fx.Int32(ATOM_I32)
+                        )
+                        v = _atom_bf16_to_f32(
+                            _load_v4i32_at(self_rsrc, elem, _RECV_POLICY)
+                        )
                     acc = v if acc is None else acc + v
                 outs.append(acc)
             return outs
@@ -642,7 +728,7 @@ def make_one_shot_allreduce_kernel(
                 if const_expr(fused):
                     _epilogue(tile, x_atoms, w_atoms, parity, sq_lds)
                 else:
-                    _store_tile(tile, _reduce(parity))
+                    _store_tile(tile, _reduce(parity, my_atoms))
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
@@ -685,8 +771,14 @@ def make_one_shot_allreduce_kernel(
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
     # Every compile-time knob that changes the emitted code has to be in the
-    # symbol name, or two variants collide in the JIT cache.
-    tag = f"ws{world_size}_a{atoms}_{inbox_memory}_{fanout}"
+    # symbol name, or two variants collide in the JIT cache. At ``atoms == 1``, 
+    # the (peer, atom) product has one atom per peer, so both fanout orders 
+    # unroll to the same store sequence.
+    tag = f"ws{world_size}_a{atoms}_{inbox_memory}"
+    if block != DEFAULT_BLOCK:
+        tag += f"_b{block}"
+    if atoms > 1:
+        tag += f"_{fanout}"
     if fused:
         # hidden sets BLOCK and the tile, so it belongs in the key just as much
         # as atoms does.
@@ -695,6 +787,11 @@ def make_one_shot_allreduce_kernel(
         tag += f"_{probe}"
     if spin_sleep:
         tag += f"_sl{spin_sleep}"
+    if skip_self:
+        # ``_r<n>_`` is the rank field the bench's variant comparison already
+        # knows to collapse before checking that the ranks agree; a build
+        # specialised per rank legitimately reports a different string on each.
+        tag += f"_r{self_rank}_ss"
     launch_one_shot_allreduce.func.__name__ = f"launch_one_shot_allreduce_{tag}"
     try:
         one_shot_allreduce.func.__name__ = f"one_shot_allreduce_{tag}"
@@ -720,6 +817,7 @@ def make_one_shot_allreduce_kernel(
         "fanout": fanout,
         "probe": probe,
         "spin_sleep": spin_sleep,
+        "skip_self": skip_self,
         "grid": grid,
         "block": block,
         "fusion": fusion,

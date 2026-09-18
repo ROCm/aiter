@@ -16,8 +16,8 @@ with ``cross_device_reduce``); the two-shot schedules quantize to INT4/INT6.
 By default (``AITER_FLY_AR_ACCURACY=exact``) only the one-shot is ever
 reachable -- above its ceiling this path declines the payload rather than
 quantize it, so the caller falls through to whatever it would otherwise
-dispatch to. ``AITER_FLY_AR_ACCURACY=fast`` unlocks the mesh/ring schedules for
-larger payloads, quantized, still preferring the exact one-shot wherever that
+dispatch to. ``AITER_FLY_AR_ACCURACY=fast`` unlocks the quantized mesh/ring
+schedules for larger payloads, still preferring the exact one-shot wherever that
 costs nothing.
 """
 
@@ -179,8 +179,12 @@ class FlyDSLAllReduce:
         if family == "oneshot":
             # max_bytes from the resolved policy rather than the class default,
             # so an AITER_FLY_AR_ONESHOT_MAX_BYTES override reaches the engine's
-            # own guard and the two cannot disagree.
-            return OneShotAllReduce(**common, max_bytes=self.policy.oneshot_max)
+            # own guard and the two cannot disagree. ``link`` is passed rather
+            # than left to re-detection so the engine's tuning ladder is keyed
+            # on the same fabric this object resolved its policy against.
+            return OneShotAllReduce(
+                **common, max_bytes=self.policy.oneshot_max, link=self.link
+            )
         # min_bytes=0: the family boundary above already decided this engine is
         # the right one for the payload, and QuickAllReduceInt4's own floor is
         # a standalone guard rail that would otherwise reject sizes the policy

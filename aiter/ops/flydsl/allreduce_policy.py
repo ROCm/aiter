@@ -41,6 +41,14 @@ class FamilyPolicy:
 
     ``min_bytes`` is where this whole path starts being worth taking; below it
     the caller should fall through to other alternatives.
+
+    The two one-shot ceilings are measured against *different* alternatives and
+    so do not order against each other:
+
+    * ``oneshot_max`` is where the quantized **mesh** overtakes the one-shot.
+    * ``oneshot_max_exact`` is where the **fallback** the caller would otherwise
+      use (``cross_device_reduce``/RCCL) overtakes it, since exact mode declines
+      rather than quantizing.
     """
 
     oneshot_max: int
@@ -50,48 +58,38 @@ class FamilyPolicy:
     max_bytes: int = NO_MAX
 
     def __post_init__(self):
-        if not self.oneshot_max_exact >= self.oneshot_max:
+        if self.oneshot_max <= 0 or self.oneshot_max_exact <= 0:
             raise ValueError(
-                f"oneshot_max_exact ({self.oneshot_max_exact}) must be >= "
-                f"oneshot_max ({self.oneshot_max}): preferring the exact "
-                "schedule can only widen its window"
+                f"oneshot_max ({self.oneshot_max}) and oneshot_max_exact "
+                f"({self.oneshot_max_exact}) must be positive"
             )
-        if self.mesh_max < self.oneshot_max_exact:
+        if self.mesh_max < self.oneshot_max:
             raise ValueError(
-                f"mesh_max ({self.mesh_max}) must be >= oneshot_max_exact "
-                f"({self.oneshot_max_exact}); the families partition by size"
+                f"mesh_max ({self.mesh_max}) must be >= oneshot_max "
+                f"({self.oneshot_max}); the families partition by size"
             )
-
 
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
-    # --- PCIe: Policy from measurements --------------------
+    # --- PCIe: Policy from measurements (on gfx950/MI350P) --------------------
     ("pcie", 2): FamilyPolicy(
-        oneshot_max=512 << 10, oneshot_max_exact=512 << 10, mesh_max=4 << 20
+        oneshot_max=512 << 10, oneshot_max_exact=1536 << 10, mesh_max=3 << 20
     ),
     ("pcie", 4): FamilyPolicy(
-        oneshot_max=96 << 10, oneshot_max_exact=96 << 10, mesh_max=12 << 20
+        oneshot_max=64 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=8 << 20
     ),
     ("pcie", 8): FamilyPolicy(
-        oneshot_max=32 << 10, oneshot_max_exact=48 << 10, mesh_max=12 << 20
+        oneshot_max=16 << 10, oneshot_max_exact=(80 << 10) - 1, mesh_max=12 << 20
     ),
-    # --- xGMI: Not yet measured, conservative placeholder --------------------
+    # --- xGMI: Policy from measurements (on gfx942) --------------------
     #
-    # Set ``mesh_max`` so the ring is never auto-selected. The mesh is the
-    # default algorithm on a meshed fabric and the ring is structurally worse
-    # there -- it trades fanout for per-destination locality, which is what a
-    # PCIe host wants and an xGMI host does not.
-    #
-    # The one-shot boundary above is the part most likely to be wrong. Its
-    # driver, the ``N/2`` wire-volume ratio, is fabric-independent, but the
-    # constant is not: xGMI peer bandwidth is an order of magnitude higher.
     ("xgmi", 2): FamilyPolicy(
-        oneshot_max=192 << 10, oneshot_max_exact=192 << 10, mesh_max=NO_MAX
+        oneshot_max=512 << 10, oneshot_max_exact=4 << 20, mesh_max=NO_MAX,
     ),
     ("xgmi", 4): FamilyPolicy(
-        oneshot_max=192 << 10, oneshot_max_exact=192 << 10, mesh_max=NO_MAX
+        oneshot_max=512 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=NO_MAX,
     ),
     ("xgmi", 8): FamilyPolicy(
-        oneshot_max=192 << 10, oneshot_max_exact=192 << 10, mesh_max=NO_MAX
+        oneshot_max=256 << 10, oneshot_max_exact=256 << 10, mesh_max=NO_MAX,
     ),
 }
 
