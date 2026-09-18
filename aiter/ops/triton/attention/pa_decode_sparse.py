@@ -36,12 +36,6 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_v4_2buff as gluon_pa_decode_sparse_v4_2buff,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse_v4_a8w8 as gluon_pa_decode_sparse_v4_a8w8,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse_v4_mx as gluon_pa_decode_sparse_v4_mx,
-)
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
 )
@@ -96,9 +90,6 @@ def pa_decode_sparse(
     extra_indptr: torch.Tensor | None = None,
     unified_kv_rope: torch.Tensor | None = None,
     q_rope: torch.Tensor | None = None,
-    kv_mx_scales: torch.Tensor | None = None,
-    q_mx_scales: torch.Tensor | None = None,
-    use_mx: bool | None = None,
     num_warps: int | None = None,
     ctas_h: int = 1,
     q_tdm: bool = True,
@@ -134,7 +125,8 @@ def pa_decode_sparse(
             exactly as the MLA-v4 asm decode kernel expects
             (448 fp8 NoPE | 14 duplicated E8M0 group scales | 50 pad), so the
             same pool can be handed to either kernel with no repacking.
-            ``kv_scales`` must be None (the scales are inline).
+            ``kv_scales`` must be None (the scales are inline) and ``q_rope``
+            is required (Q is packed the same way).
         q_tdm: DEFAULT ON. Load Q by TDM descriptor into LDS instead of masked
             buffer_loads. Worth 90.4 -> 71.7us (kv_len 384) and
             58.9 -> 43.5us (kv_len 136), and it takes VGPR spills 146 -> 0 on
@@ -156,18 +148,9 @@ def pa_decode_sparse(
             ``block_h * D / (num_warps * 32)`` = 256 VGPRs at every block_h;
             overriding it is the only way to shrink the accumulator's register
             footprint.
-        use_mx: 2buff path only. ``True`` routes packed fp8 Q to the native-MX
-            kernel (wmma_scaled QK on the raw fp8, bf16 PV over a staged tile).
-            It is now the FASTER of the two -- 53.6us vs 79.8us for the
-            dequant-and-stage kernel at T=512/H=128/kv_len=384, and 27.7us vs
-            38.8us at kv_len=136 -- but it is not the default here yet, so
-            callers opt in. Use it with ``ctas_h=1`` (the default): the
-            clustered variants replicate the dequant per CTA and are ~1.4x
-            slower.
-        q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q. Supplying it (2buff path
-            only) means ``q`` is the packed fp8 ``[N, H, 512]`` Q — i.e. full
-            a8w8 parity with the asm kernel. Omit it to pass ``q`` as plain
-            bf16 ``[N, H, 512]`` (NoPE||RoPE) against the fp8 KV pool.
+        q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q, required on the 2buff
+            path: ``q`` is then the packed fp8 ``[N, H, 512]`` Q — i.e. full
+            a8w8 parity with the asm kernel.
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
     packed fp8_ds_mla / bf16 block cache (``extra_*`` = the two-loop), a 2D one the
@@ -191,25 +174,6 @@ def pa_decode_sparse(
     if not q.is_cuda:
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
 
-    if kv_mx_scales is not None:
-        # EXPERIMENTAL uniform-MX layout (see _pa_decode_sparse_v4_mx).
-        return _pa_decode_sparse_v4_mx(
-            q,
-            q_mx_scales,
-            unified_kv,
-            kv_mx_scales,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            softmax_scale,
-            block_h=block_h,
-            kv_splits=kv_splits,
-            has_invalid=bool(has_invalid),
-            skip_reduce=bool(skip_reduce),
-            ctas_h=ctas_h,
-            q_tdm=q_tdm,
-        )
-
     v4_2buff = unified_kv_rope is not None
     if v4_2buff:
         return _pa_decode_sparse_v4_2buff(
@@ -222,7 +186,6 @@ def pa_decode_sparse(
             softmax_scale,
             q_rope=q_rope,
             kv_scales=kv_scales,
-            use_mx=use_mx,
             num_warps=num_warps,
             ctas_h=ctas_h,
             q_tdm=q_tdm,
@@ -792,7 +755,6 @@ def _pa_decode_sparse_v4_2buff(
     softmax_scale: float,
     q_rope: torch.Tensor | None = None,
     kv_scales: torch.Tensor | None = None,
-    use_mx: bool | None = None,
     num_warps: int | None = None,
     ctas_h: int = 1,
     q_tdm: bool = True,
@@ -810,7 +772,7 @@ def _pa_decode_sparse_v4_2buff(
 
       unified_kv      [P, 512]    fp8 e4m3 (or uint8): 448 NoPE | 14 dup E8M0 | 50 pad
       unified_kv_rope [P, 64]     bf16
-      q               [N, H, 512] fp8 packed (with ``q_rope``) or bf16 NoPE||RoPE
+      q               [N, H, 512] fp8 packed
       q_rope          [N, H, 64]  bf16
 
     Returns ``[N, H, 512]`` bf16 (MLA's V is the whole row: dequantized NoPE
@@ -838,26 +800,23 @@ def _pa_decode_sparse_v4_2buff(
     assert unified_kv_rope.dtype == torch.bfloat16
     assert unified_kv_rope.shape[0] == unified_kv.shape[0]
 
-    q_packed = q_rope is not None
+    if q_rope is None:
+        raise RuntimeError(
+            "the 2buff path needs the packed fp8 Q: pass q_rope alongside q"
+        )
     T, H, D = q.shape
     assert D == _V4_DIM_QK, f"2buff path is fixed to D={_V4_DIM_QK}, got {D}"
-    if q_packed:
-        assert q.dtype in _V4_PACKED_FP8_DTYPES, (
-            f"with q_rope, q must be the packed fp8 [N, H, {_V4_DIM_QK}] tensor, "
-            f"got {q.dtype}"
-        )
-        assert q_rope.shape == (T, H, _V4_DIM_ROPE) and q_rope.dtype == torch.bfloat16
-        assert q_rope.is_contiguous()
-    else:
-        assert (
-            q.dtype == torch.bfloat16
-        ), f"without q_rope, q must be bf16 NoPE||RoPE, got {q.dtype}"
+    assert q.dtype in _V4_PACKED_FP8_DTYPES, (
+        f"q must be the packed fp8 [N, H, {_V4_DIM_QK}] tensor, got {q.dtype}"
+    )
+    assert q_rope.shape == (T, H, _V4_DIM_ROPE) and q_rope.dtype == torch.bfloat16
+    assert q_rope.is_contiguous()
 
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
 
     _LOGGER.info(
-        f"PA_DECODE_SPARSE_V4_2BUFF T={T} H={H} D={D} q_packed={q_packed} "
+        f"PA_DECODE_SPARSE_V4_2BUFF T={T} H={H} D={D} "
         f"total_indices={kv_indices.shape[0]}"
     )
 
@@ -868,7 +827,7 @@ def _pa_decode_sparse_v4_2buff(
     # (byte 0x7F == scale 2^0 is an e4m3 NaN). The NoPE bytes are bitcast back
     # to e4m3 in-kernel.
     kv_u8 = unified_kv.view(torch.uint8)
-    q_u8 = q.view(torch.uint8) if q_packed else q
+    q_u8 = q.view(torch.uint8)
 
     # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
     if block_h is None:
@@ -896,14 +855,12 @@ def _pa_decode_sparse_v4_2buff(
     block_k = 16
     waves_per_eu = 1
     if block_h == 128:
-        # The a8w8 (MX QK) kernel wants a 64-row KV tile: now that its Q
-        # operand is streamed from LDS one K step at a time instead of held in
-        # registers, the wider tile no longer overflows the register file, and
-        # the fatter iteration amortises the accumulator rescale and the
-        # barriers over twice the work -- 64.4us vs 69.9us at kv_len=384,
-        # T=512, H=128. The dequant-and-stage kernel is LDS-bound and doubling
-        # its KV ring regresses it badly (69.3 -> 114.7us), so it keeps 32.
-        block_k = 64 if (q_packed and use_mx) else 32
+        # A 64-row KV tile: now that the Q operand is streamed from LDS one K
+        # step at a time instead of held in registers, the wider tile no longer
+        # overflows the register file, and the fatter iteration amortises the
+        # accumulator rescale and the barriers over twice the work -- 64.4us vs
+        # 69.9us at kv_len=384, T=512, H=128.
+        block_k = 64
         attn_num_warps = 8
         max_num_wg = 256
         # The bf16 path asks for 2 waves/EU here; the dequant pushes this
@@ -969,117 +926,59 @@ def _pa_decode_sparse_v4_2buff(
         ap_strides = acc_partial.stride()
 
     grid_attn = (T, n_head_blocks, kv_splits)
-    # Packed fp8 Q gets the full a8w8 kernel -- MX QK plus a P-folded PV, with
-    # no bf16 staging tile. bf16 Q has no MX operand to offer, so it stays on
-    # the dequant-and-stage kernel.
-    if q_packed and use_mx:
-        gluon_pa_decode_sparse_v4_a8w8[grid_attn](
-            q,
-            q_u8,
-            q_rope,
-            unified_kv,
-            kv_u8,
-            unified_kv_rope,
-            kv_indices,
-            kv_indptr,
-            m_partial,
-            l_partial,
-            acc_partial,
-            attn_sink,
-            out,
-            unified_kv.shape[0],
-            q.stride(0),
-            q.stride(1),
-            q_rope.stride(0) if q_packed else 0,
-            q_rope.stride(1) if q_packed else 0,
-            unified_kv.stride(0),
-            unified_kv_rope.stride(0),
-            mp_strides[0],
-            mp_strides[1],
-            mp_strides[2],
-            lp_strides[0],
-            lp_strides[1],
-            lp_strides[2],
-            ap_strides[0],
-            ap_strides[1],
-            ap_strides[2],
-            ap_strides[3],
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            H,
-            D,
-            kv_splits,
-            float(softmax_scale),
-            BLOCK_H=block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            NOPE_DIM=_V4_DIM_NOPE,
-            ROPE_DIM=_V4_DIM_ROPE,
-            GROUP_SIZE=_FP8_GROUP_SIZE,
-            HAS_INVALID=bool(has_invalid),
-            Q_TDM=bool(q_tdm),
-            USE_EXP2=USE_EXP2,
-            CTAS_H=ctas_h,
-            num_warps=attn_num_warps,
-            num_stages=2,
-            waves_per_eu=waves_per_eu,
-            num_ctas=ctas_h,
-        )
-    else:
-        gluon_pa_decode_sparse_v4_2buff[grid_attn](
-            q,
-            q_u8,
-            q_rope if q_packed else q,
-            kv_u8,
-            unified_kv_rope,
-            kv_indices,
-            kv_indptr,
-            m_partial,
-            l_partial,
-            acc_partial,
-            attn_sink,
-            out,
-            unified_kv.shape[0],
-            q.stride(0),
-            q.stride(1),
-            q_rope.stride(0) if q_packed else 0,
-            q_rope.stride(1) if q_packed else 0,
-            unified_kv.stride(0),
-            unified_kv_rope.stride(0),
-            mp_strides[0],
-            mp_strides[1],
-            mp_strides[2],
-            lp_strides[0],
-            lp_strides[1],
-            lp_strides[2],
-            ap_strides[0],
-            ap_strides[1],
-            ap_strides[2],
-            ap_strides[3],
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            H,
-            D,
-            kv_splits,
-            float(softmax_scale),
-            BLOCK_H=block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            NOPE_DIM=_V4_DIM_NOPE,
-            ROPE_DIM=_V4_DIM_ROPE,
-            GROUP_SIZE=_FP8_GROUP_SIZE,
-            HAS_INVALID=bool(has_invalid),
-            Q_PACKED=q_packed,
-            Q_TDM=bool(q_tdm) and q_packed,
-            USE_EXP2=USE_EXP2,
-            CTAS_H=ctas_h,
-            num_warps=attn_num_warps,
-            num_stages=2,
-            waves_per_eu=waves_per_eu,
-            num_ctas=ctas_h,
-        )
+    gluon_pa_decode_sparse_v4_2buff[grid_attn](
+        q,
+        q_u8,
+        q_rope,
+        unified_kv,
+        kv_u8,
+        unified_kv_rope,
+        kv_indices,
+        kv_indptr,
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        out,
+        unified_kv.shape[0],
+        q.stride(0),
+        q.stride(1),
+        q_rope.stride(0),
+        q_rope.stride(1),
+        unified_kv.stride(0),
+        unified_kv_rope.stride(0),
+        mp_strides[0],
+        mp_strides[1],
+        mp_strides[2],
+        lp_strides[0],
+        lp_strides[1],
+        lp_strides[2],
+        ap_strides[0],
+        ap_strides[1],
+        ap_strides[2],
+        ap_strides[3],
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        kv_splits,
+        float(softmax_scale),
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        NOPE_DIM=_V4_DIM_NOPE,
+        ROPE_DIM=_V4_DIM_ROPE,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        HAS_INVALID=bool(has_invalid),
+        Q_TDM=bool(q_tdm),
+        USE_EXP2=USE_EXP2,
+        CTAS_H=ctas_h,
+        num_warps=attn_num_warps,
+        num_stages=2,
+        waves_per_eu=waves_per_eu,
+        num_ctas=ctas_h,
+    )
 
     if kv_splits == 1:
         return out
@@ -1118,177 +1017,5 @@ def _pa_decode_sparse_v4_2buff(
         USE_EXP2=USE_EXP2,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
-    )
-    return out
-
-
-def _pa_decode_sparse_v4_mx(
-    q: torch.Tensor,
-    q_mx_scales: torch.Tensor,
-    unified_kv: torch.Tensor,
-    kv_mx_scales: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    attn_sink: torch.Tensor,
-    softmax_scale: float,
-    block_h: int | None = None,
-    kv_splits: int | None = None,
-    has_invalid: bool = True,
-    skip_reduce: bool = False,
-    ctas_h: int = 1,
-    q_tdm: bool = False,
-):
-    """EXPERIMENTAL gfx1250 driver for a uniform-MX KV layout.
-
-    Not the asm kernel's format: here the whole head (RoPE included) is e4m3
-    in 64-element quant groups and the E8M0 scales live in their own plane, so
-    the 512 columns are 4 whole MX instructions of pure data.
-
-      q             [N, H, 512] e4m3      q_mx_scales  [N, H, 16] uint8
-      unified_kv    [P, 512]    e4m3      kv_mx_scales [P, 16]    uint8
-
-    Scales are E8M0 with each 64-element group's byte duplicated, so the 16
-    bytes are the MX scale operand as-is (MX blocks are 32 wide).
-    """
-    if DEVICE_ARCH != "gfx1250":
-        raise RuntimeError(f"the uniform-MX path is gfx1250-only, got {DEVICE_ARCH}")
-    T, H, D = q.shape
-    assert D == _V4_DIM_QK, f"uniform-MX path is fixed to D={_V4_DIM_QK}, got {D}"
-    assert (
-        q.dtype in _V4_PACKED_FP8_DTYPES and unified_kv.dtype in _V4_PACKED_FP8_DTYPES
-    )
-    assert unified_kv.dim() == 2 and unified_kv.shape[-1] == D
-    n_blocks = D // 32
-    assert kv_mx_scales.shape == (unified_kv.shape[0], n_blocks)
-    assert q_mx_scales.shape == (T, H, n_blocks)
-    assert kv_mx_scales.dtype == torch.uint8 and q_mx_scales.dtype == torch.uint8
-    assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
-    assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
-
-    _LOGGER.info(f"PA_DECODE_SPARSE_V4_MX T={T} H={H} D={D}")
-    out = torch.empty((T, H, D), dtype=torch.bfloat16, device=q.device)
-
-    if block_h is None:
-        block_h = 128 if H >= 128 else max(16, triton.next_power_of_2(H))
-    else:
-        block_h = max(16, triton.next_power_of_2(block_h))
-    n_head_blocks = triton.cdiv(H, block_h)
-    h_padded = n_head_blocks * block_h
-
-    block_k = 32 if block_h == 128 else 16
-    attn_num_warps = 8 if block_h == 128 else max(1, block_h // 16)
-    if ctas_h > 1:
-        # See the 2buff driver: the per-CTA head tile cannot go below the
-        # 16-row WMMA instruction tile.
-        assert not (block_h % ctas_h), f"block_h {block_h} % ctas_h {ctas_h}"
-        assert block_h // ctas_h >= 16, (
-            f"ctas_h={ctas_h} would give {block_h // ctas_h} heads per CTA for "
-            f"block_h={block_h}; the WMMA tile is 16 rows, so ctas_h must be "
-            f"<= block_h // 16 ({block_h // 16})"
-        )
-        attn_num_warps = max(1, (block_h // ctas_h) // 16)
-    max_num_wg = 256
-    if kv_splits is None:
-        max_kv_splits = max(1, triton.cdiv(kv_indices.shape[0], block_k))
-        kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
-        kv_splits = triton.next_power_of_2(min(max_kv_splits, kv_splits))
-    _lds_cap = max(1, arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH) // (D * 4))
-    kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
-
-    if kv_splits == 1:
-        m_partial = l_partial = acc_partial = out
-        mp_s = lp_s = (0, 0, 0)
-        ap_s = (0, 0, 0, 0)
-    else:
-        m_partial = torch.empty(
-            (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
-        )
-        l_partial = torch.empty_like(m_partial)
-        acc_partial = torch.empty(
-            (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
-        )
-        mp_s, lp_s, ap_s = m_partial.stride(), l_partial.stride(), acc_partial.stride()
-
-    gluon_pa_decode_sparse_v4_mx[(T, n_head_blocks, kv_splits)](
-        q,
-        q_mx_scales,
-        unified_kv,
-        kv_mx_scales,
-        kv_indices,
-        kv_indptr,
-        m_partial,
-        l_partial,
-        acc_partial,
-        attn_sink,
-        out,
-        unified_kv.shape[0],
-        q.stride(0),
-        q.stride(1),
-        q_mx_scales.stride(0),
-        q_mx_scales.stride(1),
-        unified_kv.stride(0),
-        kv_mx_scales.stride(0),
-        mp_s[0],
-        mp_s[1],
-        mp_s[2],
-        lp_s[0],
-        lp_s[1],
-        lp_s[2],
-        ap_s[0],
-        ap_s[1],
-        ap_s[2],
-        ap_s[3],
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        H,
-        D,
-        kv_splits,
-        float(softmax_scale),
-        BLOCK_H=block_h,
-        BLOCK_D=D,
-        BLOCK_K=block_k,
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        HAS_INVALID=bool(has_invalid),
-        Q_TDM=bool(q_tdm),
-        USE_EXP2=True,
-        CTAS_H=ctas_h,
-        num_warps=attn_num_warps,
-        num_stages=2,
-        waves_per_eu=1,
-        num_ctas=ctas_h,
-    )
-    if kv_splits == 1 or skip_reduce:
-        return out if kv_splits == 1 else (acc_partial, m_partial, l_partial)
-
-    gluon_pa_decode_sparse_reduce[(T, H)](
-        m_partial,
-        l_partial,
-        acc_partial,
-        attn_sink,
-        kv_indptr,
-        out,
-        m_partial.stride(0),
-        m_partial.stride(1),
-        m_partial.stride(2),
-        l_partial.stride(0),
-        l_partial.stride(1),
-        l_partial.stride(2),
-        acc_partial.stride(0),
-        acc_partial.stride(1),
-        acc_partial.stride(2),
-        acc_partial.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        H,
-        D,
-        kv_splits,
-        BLOCK_H=1,
-        BLOCK_D=D,
-        BLOCK_K=block_k,
-        USE_EXP2=True,
-        num_warps=1 if kv_splits <= 8 else 4,
-        waves_per_eu=4 if kv_splits <= 8 else 1,
     )
     return out

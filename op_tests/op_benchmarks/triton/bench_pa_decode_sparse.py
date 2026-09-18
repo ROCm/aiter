@@ -10,10 +10,6 @@ Providers
                 E8M0 group scales | 50 pad, plus a bf16 ``[P, 64]`` RoPE plane)
                 with the matching packed fp8 Q + bf16 Q-RoPE plane. Byte-for-byte
                 the layout the MLA-v4 asm decode kernel reads.
-``fp8_stage``   the same a8w8 inputs as ``fp8``, but forced onto the
-                dequantize-to-bf16-and-stage kernel instead of the MX dots --
-                the A/B for "native MX" vs "dequant + bf16 WMMA".
-``fp8_qbf16``   a8w16: the same fp8 pool, but Q handed over as plain bf16.
 ``asm``         the reference point for ``fp8``: ``aiter.mla.mla_decode_fwd_v4_nm``
                 -> ``_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE``. Reads the
                 exact same tensors as ``fp8`` (gfx1250 only, gqa in {16, 64, 128}).
@@ -54,7 +50,7 @@ NUM_TILES = NOPE_DIM // 64  # 7 E8M0 quant groups
 # + the gqa remap in csrc/py_itfs_cu/asm_mla_v4.cu).
 _ASM_SHIPPED_GQA = (16, 64, 128)
 
-ALL_PROVIDERS = ("bf16", "fp8", "fp8_stage", "fp8_qbf16", "mx", "asm")
+ALL_PROVIDERS = ("bf16", "fp8", "asm")
 METRICS = ("time", "bandwidth", "throughput")
 
 # DSv4-Pro: 128 Q heads per rank under dp-attention, kv_len 384 on the CSA
@@ -91,23 +87,6 @@ def v4_pack_2buff(x_bf16):
 # ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
-def v4_pack_mx(x_bf16):
-    """EXPERIMENTAL layout: ``[..., 512]`` bf16 -> (e4m3 [..., 512],
-    E8M0 [..., 16] uint8). The whole head, RoPE included, in 8 quant groups of
-    64; each group's scale byte stored twice so the 16 bytes are the MX scale
-    operand as-is."""
-    lead = x_bf16.shape[:-1]
-    d = x_bf16.shape[-1]
-    tiled = x_bf16.float().reshape(*lead, d // 64, 64)
-    fp8_max = float(torch.finfo(FP8_DTYPE).max)
-    scale = torch.pow(
-        2.0, torch.clamp_min(tiled.abs().amax(dim=-1) / fp8_max, 1e-4).log2().ceil()
-    )
-    vals = (tiled / scale.unsqueeze(-1)).to(FP8_DTYPE).reshape(*lead, d)
-    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
-    return vals, e8m0.repeat_interleave(2, dim=-1)
-
-
 _INPUT_CACHE = {}
 
 
@@ -147,13 +126,7 @@ def build_inputs(T, H, D, kv_len, var_len=False, seed=0, device="cuda"):
 
     kv_packed, kv_rope = v4_pack_2buff(kv)
     q_packed, q_rope = v4_pack_2buff(q)
-    kv_mx, kv_mx_s = v4_pack_mx(kv)
-    q_mx, q_mx_s = v4_pack_mx(q)
     _INPUT_CACHE[key] = {
-        "kv_mx": kv_mx,
-        "kv_mx_s": kv_mx_s,
-        "q_mx": q_mx,
-        "q_mx_s": q_mx_s,
         "q": q,
         "kv": kv,
         "q_packed": q_packed,
@@ -182,13 +155,10 @@ def _make_fn(provider, inp, T, H, D):
         # gathered KV + Q read + output written
         return fn, n_idx * D * 2 + T * H * D * 2 + out_bytes
 
-    if provider in ("fp8", "fp8_stage", "fp8_qbf16"):
+    if provider == "fp8":
         kvp, kvr = inp["kv_packed"], inp["kv_rope"]
-        packed_q = provider in ("fp8", "fp8_stage")
-        q = inp["q_packed"] if packed_q else inp["q"]
-        qr = inp["q_rope"] if packed_q else None
         fn = lambda: pa_decode_sparse(
-            q,
+            inp["q_packed"],
             kvp,
             ind,
             iptr,
@@ -196,27 +166,10 @@ def _make_fn(provider, inp, T, H, D):
             scale,
             has_invalid=False,
             unified_kv_rope=kvr,
-            q_rope=qr,
-            use_mx=None if provider == "fp8" else False,
+            q_rope=inp["q_rope"],
         )
         kv_row = HEAD_DIM * 1 + ROPE_DIM * 2  # 512 B fp8 + 128 B bf16 RoPE
-        q_row = kv_row if packed_q else D * 2
-        return fn, n_idx * kv_row + T * H * q_row + out_bytes
-
-    if provider == "mx":
-        fn = lambda: pa_decode_sparse(
-            inp["q_mx"],
-            inp["kv_mx"],
-            ind,
-            iptr,
-            sink,
-            scale,
-            has_invalid=False,
-            kv_mx_scales=inp["kv_mx_s"],
-            q_mx_scales=inp["q_mx_s"],
-        )
-        row = HEAD_DIM * 1 + (HEAD_DIM // 32)  # 512 e4m3 + 16 E8M0
-        return fn, n_idx * row + T * H * row + out_bytes
+        return fn, n_idx * kv_row + T * H * kv_row + out_bytes
 
     if provider == "asm":
         if arch_info.get_arch() != "gfx1250" or H not in _ASM_SHIPPED_GQA:
