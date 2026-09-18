@@ -83,7 +83,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" -w /workspace \
             -v /models:/models \
             --name ${CONTAINER} \
-            ${{ matrix.base_image }}
+            --entrypoint /bin/bash \
+            ${{ matrix.base_image }} -lc "sleep infinity"
           docker exec ${CONTAINER} git config --global --add safe.directory /workspace || true
 
       - name: Build & install PR AITER (gfx950)

@@ -98,8 +98,9 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e AITER_USE_SYSTEM_TRITON=1 \
+            --entrypoint /bin/bash \
             ${{ env.BASE_IMAGE }} \
-            bash -lc '
+            -lc '
               set -euo pipefail
               git config --global --add safe.directory /workspace
               shopt -s nullglob
@@ -238,7 +239,8 @@ jobs:
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
               -e AITER_USE_SYSTEM_TRITON=1 \
               ${{ matrix.extra_env_args }} \
-              ${{ env.BASE_IMAGE }} bash -lc "
+              --entrypoint /bin/bash \
+              ${{ env.BASE_IMAGE }} -lc "
                 set -euo pipefail
                 shopt -s nullglob
                 wheels=(/workspace/aiter_wheels/*.whl)
