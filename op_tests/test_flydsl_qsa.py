@@ -9,7 +9,7 @@ Two layers:
     ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
     ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table),
-    ``bench_qsa_family_b_k1`` (2e/2f emit; 2g long-``L``; 2h published point),
+    ``bench_qsa_family_b_k1`` (emit; long-``L`` uses family A scorer; published point),
     ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table).
 
 Usage::
@@ -617,13 +617,14 @@ def test_k2_family_a_prefill_matches_oracle():
 
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=1):
-    """Family A FlyDSL K1 vs oracle set equality; us vs live AMD select.
+    """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
     and streaming radix at or above that width. Single-request prefill scores
-    16 query rows per workgroup. Expand is not fused. Same ``rotate`` on both
-    columns.
+    16 query rows per workgroup. Expand is not fused. Same ``rotate`` on every
+    select column. Family A GQA is group 12 / D=256, so #4882 Gluon does not
+    dispatch and is not a column here.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -680,6 +681,21 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=1):
     )
     vllm_err = _set_mismatch_ratio(ref_ids, vllm_ids)
 
+    (_triton_indices, triton_ids), triton_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend="triton",
+    )
+    triton_err = _set_mismatch_ratio(ref_ids, triton_ids)
+
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
     return {
@@ -693,6 +709,10 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=1):
         "vllm_amd_select TFLOPS": flops / vllm_us / 1e6,
         "vllm_amd_select TB/s": nbytes / vllm_us / 1e6,
         "vllm_amd_select err": vllm_err,
+        "4882_triton_select us": triton_us,
+        "4882_triton_select TFLOPS": flops / triton_us / 1e6,
+        "4882_triton_select TB/s": nbytes / triton_us / 1e6,
+        "4882_triton_select err": triton_err,
     }
 
 
@@ -1049,10 +1069,9 @@ def test_k1_family_b_set_equality_published_indexer_point():
 def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=1):
     """Family B FlyDSL K1 vs oracle set equality; us vs #4882 select.
 
-    2e/2f: emit on ``n_blocks <= 512``. 2g: 512-tile LDS merge when
-    ``n_blocks > 512``. ``H`` 4 and 8 are separate compiles. Separate table
-    from family A. Expand is not fused. Oracle is not timed. Same ``rotate``
-    on FlyDSL and #4882 columns.
+    2e/2f: emit on ``n_blocks <= 512``. Longer rows use family A's MFMA
+    scorer plus radix (``H=8`` is a second compile). ``H`` 4 and 8 emit
+    share one kernel. Separate table from family A. Expand is not fused.
     """
     idx = _family_b_indexer(index_heads)
     device = torch.device("cuda")
