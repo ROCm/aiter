@@ -10,9 +10,10 @@ small decode uses BLOCK_N=16 / four waves / split-K, while prefill uses
 BLOCK_N=64 / two waves / one split and writes output directly.
 
 gfx942 aliases K and V in one LDS tile so BLOCK_N=64 stays under 64 KiB.
-gfx950 stores K and V separately.  The post-QK barrier still publishes C
-for softmax.  Expand, partial RoPE, and the sigmoid output gate remain
-outside K2.
+gfx950 stores K and V separately and gathers this tile's V after K is
+visible so QK can run while V is in flight.  The post-QK barrier still
+publishes C for softmax.  Expand, partial RoPE, and the sigmoid output
+gate remain outside K2.
 """
 
 from functools import lru_cache
@@ -20,7 +21,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import BFloat16, Float32, Int32, gpu, range_constexpr
+from flydsl.expr import BFloat16, Float32, Int32, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fxmath
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
@@ -334,6 +335,33 @@ def build_qsa_k2_family_a_module(
                 fx.copy(lds_copy, k_store_frag, k_dst)
             gpu.barrier()
 
+            if const_expr(use_k32):
+                v_row = fx.logical_divide(
+                    fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
+                )
+                for gr in range_constexpr(gather_rounds):
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    v_src = fx.slice(v_row, (None, d_chunk))
+                    v_frag = fx.make_fragment_like(v_src)
+                    fx.copy(g_copy, v_src, v_frag)
+                    v_vec = fx.Vector(fx.memref_load_vec(v_frag))
+                    v_vec = fx.Vector.from_elements(
+                        [
+                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
+                            for i in range_constexpr(vec)
+                        ],
+                        BFloat16,
+                    )
+                    fx.memref_store_vec(v_vec, v_frag)
+                    v_tile = fx.make_view(
+                        fx.get_iter(v_lds) + Int32(gr * gather_span),
+                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                    )
+                    v_dst = kv_store.partition_D(v_tile)
+                    v_store_frag = fx.make_fragment_like(v_dst)
+                    fx.memref_store_vec(v_vec, v_store_frag)
+                    fx.copy(lds_copy, v_store_frag, v_dst)
+
             # QK: waves partition D, then wave 0 reduces their C fragments.
             for ng in range_constexpr(n_subtiles):
                 n0 = Int32(ng * 16)
@@ -356,33 +384,32 @@ def build_qsa_k2_family_a_module(
                     c_lds[ng, wave, lane, i] = acc4[i]
             gpu.barrier()
 
-            # K is dead; V uses a separate LDS tile. The post-QK barrier
-            # still publishes C for softmax.
-            v_row = fx.logical_divide(
-                fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
-            )
-            for gr in range_constexpr(gather_rounds):
-                d_chunk = chunk_owner + Int32(gr * col_owners)
-                v_src = fx.slice(v_row, (None, d_chunk))
-                v_frag = fx.make_fragment_like(v_src)
-                fx.copy(g_copy, v_src, v_frag)
-                v_vec = fx.Vector(fx.memref_load_vec(v_frag))
-                v_vec = fx.Vector.from_elements(
-                    [
-                        live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                        for i in range_constexpr(vec)
-                    ],
-                    BFloat16,
+            if const_expr(not use_k32):
+                v_row = fx.logical_divide(
+                    fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
                 )
-                fx.memref_store_vec(v_vec, v_frag)
-                v_tile = fx.make_view(
-                    fx.get_iter(v_lds) + Int32(gr * gather_span),
-                    fx.make_layout((block_n, gather_span), (_D, 1)),
-                )
-                v_dst = kv_store.partition_D(v_tile)
-                v_store_frag = fx.make_fragment_like(v_dst)
-                fx.memref_store_vec(v_vec, v_store_frag)
-                fx.copy(lds_copy, v_store_frag, v_dst)
+                for gr in range_constexpr(gather_rounds):
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    v_src = fx.slice(v_row, (None, d_chunk))
+                    v_frag = fx.make_fragment_like(v_src)
+                    fx.copy(g_copy, v_src, v_frag)
+                    v_vec = fx.Vector(fx.memref_load_vec(v_frag))
+                    v_vec = fx.Vector.from_elements(
+                        [
+                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
+                            for i in range_constexpr(vec)
+                        ],
+                        BFloat16,
+                    )
+                    fx.memref_store_vec(v_vec, v_frag)
+                    v_tile = fx.make_view(
+                        fx.get_iter(v_lds) + Int32(gr * gather_span),
+                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                    )
+                    v_dst = kv_store.partition_D(v_tile)
+                    v_store_frag = fx.make_fragment_like(v_dst)
+                    fx.memref_store_vec(v_vec, v_store_frag)
+                    fx.copy(lds_copy, v_store_frag, v_dst)
 
             # Softmax reads C and live, not V; the post-QK barrier already
             # published C. V and P meet at the barrier before PV.
