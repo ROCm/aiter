@@ -767,6 +767,11 @@ vs 19.8 / 22.7 / 513.5. Keep one row-major V tile.
 23.1 / 516.0 us vs 19.8 / 22.7 / 513.5. The 16 ``ds_read_u16`` P reads
 are not the split-kernel gap. Keep scalar P gathers.
 
+**Do not retry** ``ds_read_b64_tr_b16`` PV-B from unswizzled row-major
+``[BLOCK_N, D]`` V (lane groups of 4, address ``(n0+lane_m%4)*D + (d-lane_m%4)``).
+Decode oracle ``err≈0.98``. Same class of miss as MMA-native PV B on this
+layout. Keep scalar ``v_lds[n, d]`` gathers.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
