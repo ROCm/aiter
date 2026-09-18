@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""HERD routing with native Top-K and FlyDSL finalization."""
+"""HERD routing orchestration around native Top-(K+1) selection."""
 
 import torch
 

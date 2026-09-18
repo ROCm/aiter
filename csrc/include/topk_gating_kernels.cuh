@@ -1302,30 +1302,6 @@ __global__ void topk_gating_kernel_smem_n(
         p.weights, p.ids, \
         stride_tk, topk, num_tokens, routed_scaling_factor);
 
-template <typename DTYPE_B>
-void topk_gating_herd_candidates_launch(const topk_gating_params& p)
-{
-    hipLaunchKernelGGL(
-        (aiter::topk_gating_kernel_opt<hip_bfloat16,
-                                       DTYPE_B,
-                                       384,
-                                       false,
-                                       SCORE_SQRTSOFTPLUS_HERD>),
-        dim3(p.num_tokens),
-        dim3(get_warp_size_func()),
-        0,
-        p.stream,
-        reinterpret_cast<const hip_bfloat16*>(p.gating),
-        reinterpret_cast<const DTYPE_B*>(p.bias),
-        p.weights,
-        p.ids,
-        p.stride_tk,
-        p.topk,
-        p.num_tokens,
-        p.routed_scaling_factor);
-}
-
-
 // ---------------------------------------------------------------------------
 // Kernel selection
 // ---------------------------------------------------------------------------
@@ -1584,10 +1560,14 @@ _AITER_TOPK_GATING_SLICE(extern template, SCORE_SQRTSOFTPLUS)
 _AITER_TOPK_GATING_SLICE(extern template, SCORE_SIGMOID)
 _AITER_TOPK_GATING_SLICE(extern template, SCORE_SOFTMAX)
 
-extern template void
-topk_gating_herd_candidates_launch<float>(const topk_gating_params&);
-extern template void
-topk_gating_herd_candidates_launch<hip_bfloat16>(const topk_gating_params&);
+extern template void topk_gating_launch<hip_bfloat16,
+                                        float,
+                                        SCORE_SQRTSOFTPLUS_HERD>(
+    const topk_gating_params&);
+extern template void topk_gating_launch<hip_bfloat16,
+                                        hip_bfloat16,
+                                        SCORE_SQRTSOFTPLUS_HERD>(
+    const topk_gating_params&);
 
 } // namespace aiter
 

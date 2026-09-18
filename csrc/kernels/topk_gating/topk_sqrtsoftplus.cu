@@ -8,7 +8,12 @@
 AITER_TOPK_GATING_INSTANTIATE(aiter::SCORE_SQRTSOFTPLUS)
 
 namespace aiter {
-template void topk_gating_herd_candidates_launch<float>(const topk_gating_params&);
-template void
-topk_gating_herd_candidates_launch<hip_bfloat16>(const topk_gating_params&);
+template void topk_gating_launch<hip_bfloat16,
+                                 float,
+                                 SCORE_SQRTSOFTPLUS_HERD>(
+    const topk_gating_params&);
+template void topk_gating_launch<hip_bfloat16,
+                                 hip_bfloat16,
+                                 SCORE_SQRTSOFTPLUS_HERD>(
+    const topk_gating_params&);
 } // namespace aiter

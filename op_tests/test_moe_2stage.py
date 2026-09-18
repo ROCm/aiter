@@ -126,7 +126,6 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
-    dsv4_topk=False,
     herd_topk=False,
     route_scale=None,
     cudagraph=False,
@@ -139,11 +138,7 @@ def test_fmoe(
             DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
         )
     route_profile = None
-    if dsv4_topk:
-        if E != 384 or topk != 6:
-            raise ValueError("--dsv4-topk requires the routing shape E=384, topk=6")
-        route_profile = _DSV4_ROUTE_PROFILE
-    elif herd_topk:
+    if herd_topk:
         route_profile = _HERD_ROUTE_PROFILES.get((E, topk))
         if route_profile is None:
             raise ValueError(
@@ -902,15 +897,6 @@ parser.add_argument(
     n/a.""",
 )
 parser.add_argument(
-    "--dsv4-topk",
-    action="store_true",
-    help=(
-        "Use DeepSeek-V4 sqrtsoftplus+bias routing. Set "
-        "AITER_FLYDSL_USE_HERD=1 to compare the FlyDSL HERD route; without it "
-        "this is the fused Top-K baseline. Reports route_us and active_experts."
-    ),
-)
-parser.add_argument(
     "--herd-topk",
     action="store_true",
     help=(
@@ -923,8 +909,8 @@ parser.add_argument(
     type=float,
     default=None,
     help=(
-        "Override the model routed scaling factor used by --herd-topk or "
-        "--dsv4-topk (defaults: DSV4=2.5, Kimi-K3=1.0, MiniMax-M3=2.0)."
+        "Override the routed scaling factor used by --herd-topk "
+        "(defaults: DSV4=2.5, Kimi-K3=1.0, MiniMax-M3=2.0)."
     ),
 )
 parser.add_argument(
@@ -1641,7 +1627,6 @@ for kwargs, extras in case_iter:
                 **kwargs,
                 kernel_bench=args.kernel,
                 ref_dtype=args.ref_dtype,
-                dsv4_topk=args.dsv4_topk,
                 herd_topk=args.herd_topk,
                 route_scale=args.route_scale,
                 cudagraph=args.cudagraph,

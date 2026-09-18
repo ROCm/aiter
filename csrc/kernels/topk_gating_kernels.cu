@@ -186,9 +186,11 @@ void topk_gating_herd_candidates(aiter_tensor_t& candidate_weights,
     p.stream                = aiter::getCurrentHIPStream();
 
     if(correction_bias.dtype() == AITER_DTYPE_fp32)
-        topk_gating_herd_candidates_launch<float>(p);
+        topk_gating_launch<hip_bfloat16, float, SCORE_SQRTSOFTPLUS_HERD>(p);
     else
-        topk_gating_herd_candidates_launch<hip_bfloat16>(p);
+        topk_gating_launch<hip_bfloat16,
+                           hip_bfloat16,
+                           SCORE_SQRTSOFTPLUS_HERD>(p);
 }
 
 } // namespace aiter
