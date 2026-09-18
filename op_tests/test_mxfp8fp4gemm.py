@@ -78,7 +78,7 @@ def _tiles_for(intype, apre):
     """Tiles registered in the csv for this combo. 16x512 is FP4-only (its master
     asserts B_DTYPE_FP4) and is deployed with a_preshuffle=0 only."""
     tiles = [(256, 256), (64, 512)]
-    if intype == "a8w8" and apre:
+    if intype == "a8w8":
         tiles.append((128, 128))
     if intype == "a8w4" and not apre:
         tiles.append((16, 512))
@@ -89,9 +89,9 @@ def _heuristic_tile(M, N, K, intype, apre):
     """Tile (tile_m, tile_n) the cpp dispatch picks (mirrors get_heuristic_kernel in
     asm_mxfp8fp4gemm.cu): a tiny M wastes a taller tile's rows, so M<=16 prefers the
     16x512 decode tile, M<=64 the 64x512 one, larger M 256x256 -- restricted to the
-    tiles actually registered for this (intype, apre). The FP8/AP1 indexer shape
+    tiles actually registered for this (intype, apre). The FP8 indexer shape
     (512,8192,1536) prefers the 128x128 K128/PF8 variant."""
-    if (M, N, K) == (512, 8192, 1536) and intype == "a8w8" and apre:
+    if (M, N, K) == (512, 8192, 1536) and intype == "a8w8":
         prefs = [(128, 128), (256, 256), (64, 512)]
     elif M <= 16:
         prefs = [(16, 512), (64, 512), (256, 256)]
@@ -158,7 +158,7 @@ PERF_SHAPES = {
     ],
 }
 
-# Defaults for the six a8w8/AP1 cases used by the native GEMM-only benchmark.
+# Defaults for the six a8w8 AP0/AP1 cases used by the native GEMM-only benchmark.
 # An explicit --splitk (including 0 for the operator heuristic) takes precedence.
 F8GEMM_BENCHMARK_SPLITK = {
     (512, 2048, 7168): 8,  # wqkv_a
@@ -171,7 +171,7 @@ F8GEMM_BENCHMARK_SPLITK = {
 
 
 def _benchmark_splitk(intype, apre, M, N, K):
-    if intype == "a8w8" and apre == 1:
+    if intype == "a8w8" and apre in (0, 1):
         return F8GEMM_BENCHMARK_SPLITK.get((M, N, K), 0)
     return 0
 
@@ -347,7 +347,9 @@ def _prep(
         "sA": shuffle_mxfp8fp4_scale(sA),
         "sB": shuffle_mxfp8fp4_scale(sB),
     }
-    if pre_benchmark:
+    # Match the FlyDSL benchmark order: Torch -> AP0, or Torch -> AP0 -> AP1.
+    # Only the AP1 measurement needs a separate AP0 prebenchmark.
+    if pre_benchmark and apre == 1:
         from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
 
         aiter.logger.info("prebenchmark begin: native ASM AP0")
@@ -391,7 +393,8 @@ def _prep(
         )
         pre_results["ap0 err"] = pre_err
         pre_results["ap0 result"] = _verdict(pre_err)
-        aiter.logger.info("prebenchmark complete: continuing to formal ASM AP1")
+    if pre_benchmark:
+        aiter.logger.info("prebenchmark complete: continuing to formal ASM AP%d", apre)
     return inp, ref_f32, pre_results
 
 
@@ -458,14 +461,14 @@ def test_gemm(
         )
     if pre_benchmark and not (
         intype == "a8w8"
-        and apre == 1
+        and apre in (0, 1)
         and no_reduce
         and splitk > 0
         and pre_benchmark_warmup >= 0
         and pre_benchmark_iters > 1
     ):
         raise ValueError(
-            "--pre-benchmark requires a8w8/AP1/--no-reduce/positive split-K and valid pre-benchmark counts"
+            "--pre-benchmark requires a8w8/AP0-or-AP1/--no-reduce/positive split-K and valid pre-benchmark counts"
         )
     inp, ref_f32, pre_results = _prep(
         intype,
@@ -590,7 +593,7 @@ def test_gemm(
     for name, (cand, cand_args) in candidates.items():
         try:
             if pre_benchmark:
-                ap1_start_ns = time.monotonic_ns()
+                formal_start_ns = time.monotonic_ns()
             out, us = run_perftest(
                 cand,
                 *cand_args,
@@ -601,10 +604,11 @@ def test_gemm(
                 needTrace=needTrace,
             )
             if pre_benchmark:
-                ap1_end_ns = time.monotonic_ns()
-                pre_results["stage_windows"]["ap1"] = {
-                    "start_mono_ns": ap1_start_ns,
-                    "end_mono_ns": ap1_end_ns,
+                formal_end_ns = time.monotonic_ns()
+                # Preserve AP1's existing key and AP0's separate prebenchmark window.
+                pre_results["stage_windows"]["ap1" if apre else "formal_ap0"] = {
+                    "start_mono_ns": formal_start_ns,
+                    "end_mono_ns": formal_end_ns,
                 }
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
@@ -777,7 +781,7 @@ def main():
         type=int,
         nargs="*",
         default=None,
-        help="split-K counts to run. Unset: six a8w8/AP1 benchmark shapes use "
+        help="split-K counts to run. Unset: six a8w8 AP0/AP1 benchmark shapes use "
         "8/4/4/4/1/1; other shapes use the operator heuristic. "
         "Explicit 0 always uses the count choose_splitk picks. Several "
         "values sweep them, e.g. --splitk 1 2 4 8. Only the kernel's hard "
@@ -792,7 +796,8 @@ def main():
     parser.add_argument(
         "--pre-benchmark",
         action="store_true",
-        help="Before each AP1 test, benchmark the native Torch reference and native ASM AP0",
+        help="Before each formal test, benchmark the native Torch reference; "
+        "also benchmark native ASM AP0 when the formal test is AP1",
     )
     parser.add_argument("--pre-benchmark-warmup", type=int, default=2)
     parser.add_argument("--pre-benchmark-iters", type=int, default=100)

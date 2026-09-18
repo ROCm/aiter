@@ -74,12 +74,16 @@ struct __attribute__((packed)) KernelArgs
 static_assert(sizeof(KernelArgs) == 80, "mxfp8fp4 preload KernelArgs must be 80B");
 
 // The 128x128 K128/PF8 variant preloads eight K stages and does not implement
-// split-K. Initially expose full output tiles only; shorter K and edge tiles
-// must keep using the existing variants until separately validated.
+// split-K. Restrict AP0 to complete 4x4 clusters after a small-grid validation
+// fault in the POC row-major variant. Keep partial clusters on existing kernels.
 static bool kernel_shape_is_valid(int M, int N, int K, const mxfp8fp4gemmConfig& cfg)
 {
     if(cfg.tile_m == 128 && cfg.tile_n == 128)
-        return M > 0 && M % 128 == 0 && N > 0 && N % 128 == 0 && K >= 1024 && K % 128 == 0;
+    {
+        const int mn_align = cfg.a_preshuffle ? 128 : 512;
+        return M > 0 && M % mn_align == 0 && N > 0 && N % mn_align == 0 &&
+               K >= 1024 && K % 128 == 0;
+    }
     return true;
 }
 
@@ -106,9 +110,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
     static const int tp_m64[][2] = {{64, 512}, {256, 256}};
     static const int tp_big[][2] = {{256, 256}, {64, 512}};
     static const int tp_indexer[][2] = {{128, 128}, {256, 256}, {64, 512}};
-    // Measured K128/PF8 win. Keep the preference local to the validated shape
-    // and input layout; registration alone must not retune other workloads.
-    if(M == 512 && N == 8192 && K == 1536 && b_intype == "mxfp8" && a_preshuffle == 1)
+    // K128/PF8 indexer variants for both A layouts. Keep the preference local
+    // to this shape; registration alone must not retune other workloads.
+    if(M == 512 && N == 8192 && K == 1536 && b_intype == "mxfp8")
     {
         tile_prefs   = tp_indexer;
         n_tile_prefs = 3;
@@ -301,7 +305,9 @@ static const mxfp8fp4gemmConfig& resolve_kernel(int M,
                 ")");
     AITER_CHECK(kernel_shape_is_valid(M, N, K, cfg),
                 __func__,
-                " 128x128 K128/PF8 requires positive M/N multiples of 128 and K>=1024, K%128==0",
+                " 128x128 K128/PF8 requires positive M/N multiples of ",
+                cfg.a_preshuffle ? 128 : 512,
+                " and K>=1024, K%128==0",
                 " (got M=",
                 M,
                 ", N=",
