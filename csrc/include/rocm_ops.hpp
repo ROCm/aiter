@@ -1373,6 +1373,10 @@ namespace py = pybind11;
           py::arg("need_renorm"),                                              \
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \
+          py::arg("hidden_states")              = std::nullopt,                \
+          py::arg("gate_weight")                = std::nullopt,                \
+          py::arg("shared_expert_scale")        = 1.0f,                        \
+          py::arg("shared_expert_base")         = -1,                          \
           "Apply topk softmax to the gating outputs.");                        \
     m.def("grouped_topk",                                                      \
           &grouped_topk,                                                       \

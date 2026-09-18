@@ -4,6 +4,8 @@
 import functools
 
 import torch
+from typing import Optional
+
 from torch import Tensor
 
 from ..jit.core import AITER_CSRC_DIR, compile_ops
@@ -23,6 +25,10 @@ def _topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
+    hidden_states: Optional[Tensor] = None,
+    gate_weight: Optional[Tensor] = None,
+    shared_expert_scale: float = 1.0,
+    shared_expert_base: int = -1,
 ) -> None: ...
 
 
@@ -34,17 +40,26 @@ def topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
+    hidden_states: Optional[Tensor] = None,
+    gate_weight: Optional[Tensor] = None,
+    shared_expert_scale: float = 1.0,
+    shared_expert_base: int = -1,
 ) -> None:
-    # The softmax workspace is only touched on the non-power-of-2 / >256-expert
-    # path, but is always allocated here (torch caching allocator) and passed in so
-    # the C side stays torch-free. Size logic mirrors the original C implementation.
+    # Option A ("fuse-gate") mode: when gate_weight is provided, the kernel computes
+    # the shared-expert logit in-kernel as sigmoid(shared_expert_scale * hidden @ gate_weight.T)
+    # and writes the shared id (shared_expert_base + s) itself. In that mode gating_output
+    # carries ONLY the routed experts, so num_routing_experts must not subtract the shared.
+    fuse_gate = gate_weight is not None
     num_experts_total = gating_output.shape[-1]
     num_tokens = gating_output.numel() // num_experts_total
     num_routing_experts = (
-        num_experts_total - num_shared_experts
-        if num_shared_experts > 0
-        else num_experts_total
+        num_experts_total
+        if (fuse_gate or num_shared_experts == 0)
+        else num_experts_total - num_shared_experts
     )
+    # The softmax workspace is only touched on the non-power-of-2 / >256-expert
+    # path, but is always allocated here (torch caching allocator) and passed in so
+    # the C side stays torch-free. Size logic mirrors the original C implementation.
     is_pow_2 = (
         num_routing_experts != 0
         and (num_routing_experts & (num_routing_experts - 1)) == 0
@@ -63,6 +78,10 @@ def topk_softmax(
         need_renorm,
         num_shared_experts,
         shared_expert_scoring_func,
+        hidden_states,
+        gate_weight,
+        shared_expert_scale,
+        shared_expert_base,
     )
 
 
