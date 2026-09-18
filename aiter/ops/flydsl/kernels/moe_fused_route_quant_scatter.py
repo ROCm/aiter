@@ -86,6 +86,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     buf_scalar_load,
     ptr_buf_tensor,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
 )
@@ -107,6 +108,11 @@ _TOKEN_MULTIDEST_TDM_CHUNKS = 4
 _TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
 _TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
+
+# SLC streaming hints for prequantized copy: sources are read once (no L2 reuse),
+# payload dest is re-read by the grouped GEMM so it stays temporal.
+_PREQUANT_NT_LOAD = 2
+_PREQUANT_NT_STORE = 0
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
 
 # Architectures with native scaled-pack f32->fp4/fp8 conversion
@@ -165,20 +171,12 @@ def _cvt_scalef32_pk8_fp8_bf16(src_v8bf16, scale_f32, *, v2i32_ty):
     )
 
 
-def _raw(value):
-    """Unwrap a DSL Numeric to a raw ir.Value (rocdl ops need raw operands)."""
-    return value.ir_value() if hasattr(value, "ir_value") else value
-
-
 def _emit_pk8_lane_amax(bf16x8, c):
     """max(|x|) over the 8 bf16 this lane owns, as f32."""
-    f32 = c.f32
-    f32x8 = bf16x8.extf(T.vec(8, f32))
-    acc = c.c0_f32
+    f32x8 = bf16x8.to(fx.Float32)
+    acc = fx.Float32(c.c0_f32)
     for j in range_constexpr(8):
-        xj = fx.Vector(f32x8)[j]
-        absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj.ir_value()], [], [])
-        acc = arith.maximumf(acc, absj)
+        acc = fx.max(acc, abs(f32x8[j]))
     return acc
 
 
@@ -438,7 +436,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 peer_amax = block_amax.shuffle_xor(
                     arith.constant(dist, type=i32), c.c_wave
                 )
-                block_amax = arith.maximumf(block_amax, peer_amax)
+                block_amax = fx.max(block_amax, peer_amax)
 
             e8m0_scale = emit_mx_e8m0_scale(
                 block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
@@ -475,14 +473,12 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
 
             # per-block amax: max over this lane's 2 elems, then a butterfly
             # shuffle_xor across the block's 16 lanes.
-            abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0.ir_value()], [], [])
-            abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1.ir_value()], [], [])
-            block_amax = arith.maximumf(c.c0_f32, arith.maximumf(abs0, abs1))
+            block_amax = fx.max(fx.Float32(c.c0_f32), fx.max(abs(x0), abs(x1)))
             for dist in c.amax_shuffle_dists:
                 peer_amax = block_amax.shuffle_xor(
                     arith.constant(dist, type=i32), c.c_wave
                 )
-                block_amax = arith.maximumf(block_amax, peer_amax)
+                block_amax = fx.max(block_amax, peer_amax)
 
             e8m0_scale = emit_mx_e8m0_scale(
                 block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
@@ -718,6 +714,92 @@ def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
     d["block_iters"] = 1
     d["mx_group_base"] = mx_group
     _emit_quant_block_loop(SimpleNamespace(**d))
+
+
+def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
+    """Prequantized full-row path: dwordx4 payload copy + dword-combined e8m0 scatter.
+
+    Replaces ``_emit_quant_block_loop`` for the noKS prequantized case — the row
+    is already an MX payload so the per-block quant structure is pure overhead.
+    Payload goes out as dwordx4 (16 B/lane); e8m0 as whole dwords (4 src bytes
+    already in destination byte order → one i32 copy per 4 MX blocks).
+
+    Loads are clustered before stores to overlap payload and scale latencies.
+    Overshoot lanes are OOB-checked by the buffer resource ``num_records``.
+    """
+    i32 = c.i32
+    c4 = fx.Int32(4)
+    c16 = fx.Int32(16)
+    lane = c.lane
+    dst = c.dests[0]
+
+    payload_bytes_per_row = c.payload_bytes_per_row
+    dst_addr = c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
+    src_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
+    dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        dst_addr, num_records_bytes=payload_bytes_per_row
+    )
+    src_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        src_addr, num_records_bytes=c.feat_bytes_per_row
+    )
+    n_iter = (payload_bytes_per_row // 16 + 31) // 32
+
+    src_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        c.src_scale_base + fx.Uint64(c.feat_row_i32) * c.src_scale_bytes_per_row,
+        num_records_bytes=c.src_scale_bytes_per_row,
+    )
+    n_scale_dwords = c.mx_blocks_per_row // 4
+    c_stride = fx.Int32(c.wmma_rep * 16)
+    c_n_scale_dwords = fx.Int32(n_scale_dwords)
+    scale_row_dword_base = dst.scale_row_dword_base
+    scale_t_i32 = c.scale_t_i32
+    n_sc_iter = (n_scale_dwords + 31) // 32
+
+    # Cluster all loads before stores for memory-level parallelism.
+    payload_chunks = []
+    for it in range_constexpr(n_iter):
+        chunk_idx = fx.Int32(it * 32) + lane
+        v = buffer_ops.buffer_load(
+            src_rsrc,
+            chunk_idx * c4,
+            vec_width=4,
+            dtype=i32,
+            cache_modifier=_PREQUANT_NT_LOAD,
+        )
+        payload_chunks.append((chunk_idx, v))
+    scale_chunks = []
+    for it in range_constexpr(n_sc_iter):
+        g = fx.Int32(it * 32) + lane
+        src_dword = buffer_ops.buffer_load(
+            src_scale_rsrc,
+            g,
+            vec_width=1,
+            dtype=i32,
+            cache_modifier=_PREQUANT_NT_LOAD,
+        )
+        scale_chunks.append((g, src_dword))
+
+    for chunk_idx, v in payload_chunks:
+        buffer_ops.buffer_store(
+            v,
+            dst_rsrc,
+            chunk_idx * c16,
+            offset_is_bytes=True,
+            cache_modifier=_PREQUANT_NT_STORE,
+        )
+    for g, src_dword in scale_chunks:
+        dst_dword_idx = scale_row_dword_base + g * c_stride
+
+        # Tail-lane guard: n_scale_dwords may not be a wave multiple.
+        def _store_scale_dword(dst_dword_idx=dst_dword_idx, src_dword=src_dword):
+            scale_t_i32[dst_dword_idx] = fx.Int32(src_dword)
+
+        @flyc.jit
+        def _dispatch_scale_dword(g=g, _store_scale_dword=_store_scale_dword):
+            if fx.Uint32(g) < fx.Uint32(c_n_scale_dwords):
+                _store_scale_dword()
+
+        _dispatch_scale_dword()
 
 
 def build_moe_fused_route_quant_scatter_module(
@@ -1710,6 +1792,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 feat_row_i32 = row
 
             scale_t = ptr_buf_tensor(grouped_scale, fx.Int8)
+            scale_t_i32 = ptr_buf_tensor(grouped_scale, fx.Int32)
             payload_base = fx.Int64(ptrtoint(grouped_payload))
             hidden_base = fx.Int64(ptrtoint(grouped_in))
 
@@ -1758,10 +1841,15 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                     )
                 ],
                 scale_t=scale_t,
+                scale_t_i32=scale_t_i32,
+                lane=lane,
+                wmma_rep=wmma_rep,
             )
             if const_expr(ksplit):
                 k_group_val = fx.Uint32(fx.block_idx.y)
                 _emit_quant_one_k_group(qc, k_group_val)
+            elif const_expr(prequantized):
+                _emit_prequant_copy_preshuffle(qc)
             else:
                 _emit_quant_block_loop(qc)
 
