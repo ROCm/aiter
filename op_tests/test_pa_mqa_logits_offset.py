@@ -138,7 +138,7 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
     get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
     reason="Requires the CDNA Gluon JIT paged MQA kernel",
 )
-@pytest.mark.parametrize("block_size", [1, 16, 64, 128])
+@pytest.mark.parametrize("block_size", [1, 8, 16, 64, 128])
 @pytest.mark.parametrize("chunk_k", [64, 256])
 @pytest.mark.parametrize("padded_table", [False, True], ids=["compact", "padded"])
 @pytest.mark.parametrize(
