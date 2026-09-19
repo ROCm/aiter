@@ -12,19 +12,35 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from .flash_attn_func_common_gfx1201 import (
+    configure_gpu_module,
+    flatten_scores,
+    kv_load_schedule,
+    mask_scores,
+    pointer_arg,
+    wrap_pointer_args,
+)
 from .kernels_common import LOG2E as _LOG2E
 from .tensor_shim import _run_compiled
 
 KERNEL_NAME = "flash_attn_func_gfx1201_kernel"
+NUM_PREFETCH_K = 1
+NUM_PREFETCH_V = 1
 
 
-def build_flash_attn_func_module_primary(
+def get_flash_attn_lds_bytes(head_dim: int, block_n: int) -> int:
+    """Return the BF16/F16 kernel's exact static LDS allocation."""
+    stride = head_dim + 4
+    elements = NUM_PREFETCH_K * block_n * stride
+    elements += NUM_PREFETCH_V * block_n * stride
+    return elements * 2
+
+
+def build_flash_attn_func_module(
     num_heads,
     head_dim,
     causal=True,
@@ -34,6 +50,9 @@ def build_flash_attn_func_module_primary(
     flat_work_group_size=None,
     block_m=None,
     block_n=None,
+    lds_vec_width=None,
+    tail_mask=False,
+    cross_attn=False,
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
@@ -69,9 +88,6 @@ def build_flash_attn_func_module_primary(
 
     BLOCK_N_OUT = BLOCK_N
 
-    NUM_PREFETCH_K = 1
-    NUM_PREFETCH_V = 1
-
     K_STEP_QK = WMMA_K
     K_STEPS_QK = head_dim // K_STEP_QK
     WMMA_LANE_K = 8
@@ -93,23 +109,29 @@ def build_flash_attn_func_module_primary(
     NUM_HEADS = num_heads
     HEAD_DIM = head_dim
     CAUSAL = causal
+    TAIL_MASK = tail_mask
+    CROSS_ATTN = cross_attn
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
 
     # Padding reduces LDS bank conflicts.
     K_STRIDE = HEAD_DIM + 4
     V_STRIDE = HEAD_DIM + 4
 
-    ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
-    VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
-    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
-    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
-
-    if ROWS_PER_BATCH_LOAD >= BLOCK_N:
-        NUM_BATCHES_KV = 1
-        KV_NEEDS_GUARD = ROWS_PER_BATCH_LOAD > BLOCK_N
-    else:
-        NUM_BATCHES_KV = BLOCK_N // ROWS_PER_BATCH_LOAD
-        KV_NEEDS_GUARD = False
+    if lds_vec_width is None:
+        lds_vec_width = (
+            16
+            if os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
+            else 8
+        )
+    if lds_vec_width not in (8, 16):
+        raise ValueError(f"lds_vec_width must be 8 or 16, got {lds_vec_width}")
+    VEC_WIDTH = lds_vec_width
+    (
+        THREADS_PER_ROW_LOAD,
+        NUM_BATCHES_KV,
+        KV_NEEDS_GUARD,
+    ) = kv_load_schedule(BLOCK_SIZE, HEAD_DIM, BLOCK_N, VEC_WIDTH)
+    NUM_KV_CHUNKS = BLOCK_N * THREADS_PER_ROW_LOAD
 
     # Buffer loads cap at dwordx4, so V rows are fetched in 8-element pieces.
     V_SUBVECS = VEC_WIDTH // 8
@@ -140,6 +162,8 @@ def build_flash_attn_func_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,
         seq_len: fx.Int32,
+        seq_len_kv_real: fx.Int32,
+        seq_len_kv: fx.Int32,
     ):
         elem_dtype = elem_numeric_cls
 
@@ -199,6 +223,11 @@ def build_flash_attn_func_module_primary(
             return Vec(c_frag.load())
 
         seq_len_v = fx.Uint64(seq_len)
+        seq_len_kv_real_v = fx.Uint64(seq_len_kv_real)
+        if const_expr(CROSS_ATTN):
+            seq_len_kv_v = fx.Uint64(seq_len_kv)
+        else:
+            seq_len_kv_v = seq_len_v
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
@@ -237,18 +266,18 @@ def build_flash_attn_func_module_primary(
         batch_idx = batch_q_tile_id // num_q_tiles
         q_start = q_tile_idx * BLOCK_M
 
-        load_row_in_batch = tid // THREADS_PER_ROW_LOAD
-        load_lane_in_row = tid % THREADS_PER_ROW_LOAD
-        load_col_base = load_lane_in_row * VEC_WIDTH
-
         def global_idx(token_idx, col):
             token = batch_idx * seq_len_v + token_idx
+            return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+
+        def kv_global_idx(token_idx, col):
+            token = batch_idx * seq_len_kv_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         # Hardware OOB handling keeps the tail prefetch branch-free. A batch
         # slice must fit the descriptor's 32-bit num_records.
         ELEM_BYTES = (elem_numeric_cls.width + 7) // 8
-        v_batch_elems = seq_len_v * fx.Uint64(STRIDE_TOKEN)
+        v_batch_elems = seq_len_kv_v * fx.Uint64(STRIDE_TOKEN)
         v_buf_ptr = _bounds_checked_buf_ptr(
             fx.add_offset(v_elem_ptr, fx.Int64(batch_idx * v_batch_elems)),
             fx.Int64(v_batch_elems) * fx.Int64(ELEM_BYTES),
@@ -308,40 +337,44 @@ def build_flash_attn_func_module_primary(
             tile_start = fx.Int64(tile_start)
             k_base = k_buf_base(buf_id)
             for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = tile_start + load_row_in_batch + row_offset
+                linear_chunk = tid + fx.Uint64(batch * BLOCK_SIZE)
+                lds_row = linear_chunk // THREADS_PER_ROW_LOAD
+                load_lane = linear_chunk % THREADS_PER_ROW_LOAD
+                load_col_base = load_lane * VEC_WIDTH
+                row_idx = tile_start + lds_row
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Int64(BLOCK_N)
-                    if row_valid:
-                        g_idx = global_idx(row_idx, load_col_base)
-                        lds_row = load_row_in_batch + row_offset
+                    chunk_valid = linear_chunk < fx.Uint64(NUM_KV_CHUNKS)
+                    if chunk_valid:
+                        g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                         vec = load_global_f16xN(k_elem_ptr, g_idx)
                         lds_store(lds_idx, Vec(vec))
                 else:
-                    g_idx = global_idx(row_idx, load_col_base)
-                    lds_row = load_row_in_batch + row_offset
+                    g_idx = kv_global_idx(row_idx, load_col_base)
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     vec = load_global_f16xN(k_elem_ptr, g_idx)
                     lds_store(lds_idx, Vec(vec))
 
-        def _v_store_row_major(v_base, lds_row, col_extra, vec):
+        def _v_store_row_major(v_base, lds_row, load_col_base, col_extra, vec):
             lds_idx = v_base + lds_row * V_STRIDE + load_col_base + col_extra
             fx.ptr_store(Vec(vec), lds_kv + fx.Int32(lds_idx))
 
         def coop_load_v_global(tile_start):
             tile_start = fx.Int64(tile_start)
-            # Clamp surplus loader rows; their LDS stores are discarded.
-            load_row_v = load_row_in_batch
-            if const_expr(KV_NEEDS_GUARD):
-                row_cap = fx.Int64(BLOCK_N - 1)
-                load_row_v = fx.Int64(
-                    (load_row_in_batch < row_cap).select(load_row_in_batch, row_cap)
-                )
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = tile_start + load_row_v + row_offset
+                linear_chunk = tid + fx.Uint64(batch * BLOCK_SIZE)
+                lds_row = linear_chunk // THREADS_PER_ROW_LOAD
+                load_lane = linear_chunk % THREADS_PER_ROW_LOAD
+                load_col_base = load_lane * VEC_WIDTH
+                if const_expr(KV_NEEDS_GUARD):
+                    # Invalid rows in a partial final load batch still execute
+                    # the global load. Redirect them into the valid tile; their
+                    # LDS stores are discarded below.
+                    safe_row = lds_row % fx.Int64(BLOCK_N)
+                    row_idx = tile_start + safe_row
+                else:
+                    row_idx = tile_start + lds_row
                 for sv in range_constexpr(V_SUBVECS):
                     g_idx = v_idx(row_idx, load_col_base + fx.Int64(sv * 8))
                     vecs.append(_load_global_half_vec(v_buf_ptr, g_idx, 8))
@@ -350,20 +383,29 @@ def build_flash_attn_func_module_primary(
         def coop_store_v_lds(vecs, buf_id=0):
             v_base = v_buf_base(buf_id)
             for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
+                linear_chunk = tid + fx.Uint64(batch * BLOCK_SIZE)
+                lds_row = linear_chunk // THREADS_PER_ROW_LOAD
+                load_lane = linear_chunk % THREADS_PER_ROW_LOAD
+                load_col_base = load_lane * VEC_WIDTH
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Int64(BLOCK_N)
-                    if row_valid:
-                        lds_row = load_row_in_batch + row_offset
+                    chunk_valid = linear_chunk < fx.Uint64(NUM_KV_CHUNKS)
+                    if chunk_valid:
                         for sv in range_constexpr(V_SUBVECS):
                             _v_store_row_major(
-                                v_base, lds_row, sv * 8, vecs[batch * V_SUBVECS + sv]
+                                v_base,
+                                lds_row,
+                                load_col_base,
+                                sv * 8,
+                                vecs[batch * V_SUBVECS + sv],
                             )
                 else:
-                    lds_row = load_row_in_batch + row_offset
                     for sv in range_constexpr(V_SUBVECS):
                         _v_store_row_major(
-                            v_base, lds_row, sv * 8, vecs[batch * V_SUBVECS + sv]
+                            v_base,
+                            lds_row,
+                            load_col_base,
+                            sv * 8,
+                            vecs[batch * V_SUBVECS + sv],
                         )
 
         q_row = q_start + wave_q_offset + lane16
@@ -397,7 +439,10 @@ def build_flash_attn_func_module_primary(
         if const_expr(CAUSAL):
             kv_upper = fx.Int64((_q_end < seq_len_v).select(_q_end, seq_len_v))
         else:
-            kv_upper = seq_len_v
+            # The range still executes a final partial tile; K/V live in the
+            # padded allocation and TAIL_MASK excludes its padded columns.
+            # Stopping at the real length avoids processing whole padded tiles.
+            kv_upper = seq_len_kv_real_v
 
         # Non-causal carries prefetched V across iterations; causal avoids the
         # extra VGPR lifetime and loads V in the current iteration.
@@ -466,86 +511,35 @@ def build_flash_attn_func_module_primary(
                             k_pack_b, q_b_packs[ks], s_accs[acc_idx_b]
                         )
 
-            s_raw = []
-            for st in range_constexpr(NUM_S_ACCS):
-                for r in range_constexpr(8):
-                    s_raw.append(Vec(s_accs[st])[r])
+            s_raw = flatten_scores(s_accs, num_s_accs=NUM_S_ACCS)
 
             if const_expr(CAUSAL):
                 kv_start_i32 = fx.Int32(kv_block_start)
-                klane_i32 = fx.Int32(klane)
                 q_start_i32 = fx.Int32(q_start)
                 max_kv_col_i32 = kv_start_i32 + fx.Int32(BLOCK_N - 1)
                 tile_needs_mask = max_kv_col_i32 > q_start_i32
-
-                s_v0 = s_raw[0]
-                s_v1 = s_raw[1]
-                s_v2 = s_raw[2]
-                s_v3 = s_raw[3]
-                s_v4 = s_raw[4]
-                s_v5 = s_raw[5]
-                s_v6 = s_raw[6]
-                s_v7 = s_raw[7]
-                s_v8 = s_raw[8]
-                s_v9 = s_raw[9]
-                s_v10 = s_raw[10]
-                s_v11 = s_raw[11]
-                s_v12 = s_raw[12]
-                s_v13 = s_raw[13]
-                s_v14 = s_raw[14]
-                s_v15 = s_raw[15]
                 if tile_needs_mask:
-                    klane_off_i32 = klane_i32 * fx.Int32(8)
-                    _b0 = kv_start_i32 + fx.Int32(0) + klane_off_i32
-                    s_v0 = (_b0 > q_row_i32).select(c_neg_inf, s_v0)
-                    _b1 = kv_start_i32 + fx.Int32(1) + klane_off_i32
-                    s_v1 = (_b1 > q_row_i32).select(c_neg_inf, s_v1)
-                    _b2 = kv_start_i32 + fx.Int32(2) + klane_off_i32
-                    s_v2 = (_b2 > q_row_i32).select(c_neg_inf, s_v2)
-                    _b3 = kv_start_i32 + fx.Int32(3) + klane_off_i32
-                    s_v3 = (_b3 > q_row_i32).select(c_neg_inf, s_v3)
-                    _b4 = kv_start_i32 + fx.Int32(4) + klane_off_i32
-                    s_v4 = (_b4 > q_row_i32).select(c_neg_inf, s_v4)
-                    _b5 = kv_start_i32 + fx.Int32(5) + klane_off_i32
-                    s_v5 = (_b5 > q_row_i32).select(c_neg_inf, s_v5)
-                    _b6 = kv_start_i32 + fx.Int32(6) + klane_off_i32
-                    s_v6 = (_b6 > q_row_i32).select(c_neg_inf, s_v6)
-                    _b7 = kv_start_i32 + fx.Int32(7) + klane_off_i32
-                    s_v7 = (_b7 > q_row_i32).select(c_neg_inf, s_v7)
-                    _b8 = kv_start_i32 + fx.Int32(16) + klane_off_i32
-                    s_v8 = (_b8 > q_row_i32).select(c_neg_inf, s_v8)
-                    _b9 = kv_start_i32 + fx.Int32(17) + klane_off_i32
-                    s_v9 = (_b9 > q_row_i32).select(c_neg_inf, s_v9)
-                    _b10 = kv_start_i32 + fx.Int32(18) + klane_off_i32
-                    s_v10 = (_b10 > q_row_i32).select(c_neg_inf, s_v10)
-                    _b11 = kv_start_i32 + fx.Int32(19) + klane_off_i32
-                    s_v11 = (_b11 > q_row_i32).select(c_neg_inf, s_v11)
-                    _b12 = kv_start_i32 + fx.Int32(20) + klane_off_i32
-                    s_v12 = (_b12 > q_row_i32).select(c_neg_inf, s_v12)
-                    _b13 = kv_start_i32 + fx.Int32(21) + klane_off_i32
-                    s_v13 = (_b13 > q_row_i32).select(c_neg_inf, s_v13)
-                    _b14 = kv_start_i32 + fx.Int32(22) + klane_off_i32
-                    s_v14 = (_b14 > q_row_i32).select(c_neg_inf, s_v14)
-                    _b15 = kv_start_i32 + fx.Int32(23) + klane_off_i32
-                    s_v15 = (_b15 > q_row_i32).select(c_neg_inf, s_v15)
-                s_raw = [
-                    s_v0,
-                    s_v1,
-                    s_v2,
-                    s_v3,
-                    s_v4,
-                    s_v5,
-                    s_v6,
-                    s_v7,
-                    s_v8,
-                    s_v9,
-                    s_v10,
-                    s_v11,
-                    s_v12,
-                    s_v13,
-                    s_v14,
-                    s_v15,
-                ]
+                    s_raw = mask_scores(
+                        s_raw,
+                        kv_block_start,
+                        klane,
+                        q_row_i32,
+                        seq_len_kv_real_v,
+                        c_neg_inf,
+                        num_s_accs=NUM_S_ACCS,
+                        causal=True,
+                    )
+            elif const_expr(TAIL_MASK):
+                s_raw = mask_scores(
+                    s_raw,
+                    kv_block_start,
+                    klane,
+                    q_row_i32,
+                    seq_len_kv_real_v,
+                    c_neg_inf,
+                    num_s_accs=NUM_S_ACCS,
+                    causal=False,
+                )
 
             local_max = s_raw[0]
             for r in range_constexpr(NUM_S_VALS - 1):
@@ -566,11 +560,7 @@ def build_flash_attn_func_module_primary(
             p_vals = []
             local_sum = c_zero_f
             for r in range_constexpr(NUM_S_VALS):
-                diff = fx.math.fma(
-                    s_raw[r],
-                    c_sm_scale_log2e,
-                    neg_scaled_max,
-                )
+                diff = fx.math.fma(s_raw[r], c_sm_scale_log2e, neg_scaled_max)
                 p = fx.Float32(
                     fx.rocdl.exp2(fx.Float32.ir_type, fx.Float32(diff).ir_value())
                 )
@@ -680,7 +670,7 @@ def build_flash_attn_func_module_primary(
 
         if q_in_bounds:
             for dc in range_constexpr(D_CHUNKS):
-                o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
+                o_norm_vec = o_finals[dc] * inv_l_vec
                 o_trunc = Vec(o_norm_vec).to(elem_dtype)
                 d_col = fx.Int64(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
@@ -694,6 +684,8 @@ def build_flash_attn_func_module_primary(
         O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
+        seq_len_kv_real: fx.Int32,
+        seq_len_kv: fx.Int32,
         stream: fx.Stream = fx.Stream(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
             None
         ),
@@ -705,53 +697,11 @@ def build_flash_attn_func_module_primary(
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
-        launcher = flash_attn_func_kernel(Q, K, V, O, seq_len)
+        launcher = flash_attn_func_kernel(
+            Q, K, V, O, seq_len, seq_len_kv_real, seq_len_kv
+        )
 
-        if const_expr(waves_per_eu is not None):
-            _wpe = int(waves_per_eu)
-            if const_expr(_wpe >= 1):
-                for op in ctx.gpu_module_body.operations:
-                    if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            T.i32, _wpe
-                        )
-        if const_expr(flat_work_group_size is not None):
-            _fwgs = int(flat_work_group_size)
-            if const_expr(_fwgs >= 1):
-                flat_wg_attr = ir.StringAttr.get(f"{_fwgs},{_fwgs}")
-                for op in ctx.gpu_module_body.operations:
-                    if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
-
-        passthrough_entries = []
-        if const_expr(daz):
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("denormal-fp-math-f32"),
-                        ir.StringAttr.get("preserve-sign,preserve-sign"),
-                    ]
-                )
-            )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("no-nans-fp-math"),
-                        ir.StringAttr.get("true"),
-                    ]
-                )
-            )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("unsafe-fp-math"),
-                        ir.StringAttr.get("true"),
-                    ]
-                )
-            )
-        for op in ctx.gpu_module_body.operations:
-            if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
+        configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz)
 
         launcher.launch(grid=(grid_x, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
@@ -761,48 +711,36 @@ def build_flash_attn_func_module_primary(
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    def _ptr_arg(t):
-        if hasattr(t, "data_ptr"):
-            type_name = type(t).__name__
-            module_name = type(t).__module__
-            ptr = (
-                0
-                if type_name == "FakeTensor" or "fake_tensor" in module_name
-                else t.data_ptr()
-            )
-            return flyc.from_c_void_p(fx.Uint8, ptr)
-        return t
-
-    def _wrap_qkvo(args, kwargs):
-        args = list(args)
-        for idx in range(min(4, len(args))):
-            args[idx] = _ptr_arg(args[idx])
-        for name in ("Q", "K", "V", "O"):
-            if name in kwargs:
-                kwargs[name] = _ptr_arg(kwargs[name])
-        return tuple(args), kwargs
-
     launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(*args, **kwargs):
-        args, kwargs = _wrap_qkvo(args, kwargs)
+        args, kwargs = wrap_pointer_args(args, kwargs, range(4), ("Q", "K", "V", "O"))
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
-    def _compile(Q, K, V, O, batch_size, seq_len, stream=None):
+    def _compile(
+        Q,
+        K,
+        V,
+        O,
+        batch_size,
+        seq_len,
+        seq_len_kv_real,
+        seq_len_kv,
+        stream=None,
+    ):
         return flyc.compile(
             launch_flash_attn_func,
-            _ptr_arg(Q),
-            _ptr_arg(K),
-            _ptr_arg(V),
-            _ptr_arg(O),
+            pointer_arg(Q),
+            pointer_arg(K),
+            pointer_arg(V),
+            pointer_arg(O),
             batch_size,
             seq_len,
+            seq_len_kv_real,
+            seq_len_kv,
             fx.Stream(stream),
         )
 
     _launch.compile = _compile
     return _launch
-
-
-build_flash_attn_func_module = build_flash_attn_func_module_primary
