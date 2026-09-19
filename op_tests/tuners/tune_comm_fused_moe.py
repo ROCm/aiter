@@ -4,6 +4,7 @@
 import argparse
 import csv
 import dataclasses
+import json
 import os
 import statistics
 from dataclasses import MISSING, dataclass, fields
@@ -258,8 +259,8 @@ def _resolve_ordinary_stage2(args):
     )
 
 
-def _run_ordinary_stage2_allreduce(
-    case, metadata, *, requires_output_zero, shared_partial
+def _run_ordinary_stage2_local(
+    case, metadata, *, requires_output_zero, shared_partial=None
 ):
     if requires_output_zero:
         case.partial_out.zero_()
@@ -277,11 +278,24 @@ def _run_ordinary_stage2_allreduce(
         block_m=int(metadata.block_m),
         sorted_weights=case.sorted_weights,
     )
-    case.partial_out.add_(shared_partial)
-    return get_tp_group().all_reduce(case.partial_out, ca_fp8_quant=False)
+    if shared_partial is not None:
+        case.partial_out.add_(shared_partial)
+    return case.partial_out
 
 
-_WINNER_KEY_FIELDS = (
+def _run_ordinary_stage2_allreduce(
+    case, metadata, *, requires_output_zero, shared_partial=None
+):
+    partial = _run_ordinary_stage2_local(
+        case,
+        metadata,
+        requires_output_zero=requires_output_zero,
+        shared_partial=shared_partial,
+    )
+    return get_tp_group().all_reduce(partial, ca_fp8_quant=False)
+
+
+_BASE_KEY_FIELDS = (
     "gfx",
     "cu_num",
     "token",
@@ -289,7 +303,6 @@ _WINNER_KEY_FIELDS = (
     "inter_dim",
     "expert",
     "topk",
-    "tp",
     "act_type",
     "dtype",
     "q_dtype_a",
@@ -298,11 +311,18 @@ _WINNER_KEY_FIELDS = (
     "use_g1u1",
     "doweight_stage1",
 )
-CSV_FIELDS = (
+_WINNER_KEY_FIELDS = (
+    *_BASE_KEY_FIELDS,
+    "comm_tp",
+    "comm_add_shared",
+)
+_COMM_MODES = ("ar",)
+_COMM_CONFIGS_FIELD = "comm_fused_configs"
+PROFILE_FIELDS = (
     *_WINNER_KEY_FIELDS,
     "block_m",
-    "us",
-    "kernelName",
+    "comm_stage2_tp_us",
+    "comm_kernel_name",
     "max_abs",
     "rel_l2",
 )
@@ -389,22 +409,22 @@ def benchmark(
     stage2_args: tuple,
     stage2_kwargs: dict,
     ordinary_stage2=None,
-    shared_partial: torch.Tensor,
+    shared_partial: torch.Tensor | None,
     reference: torch.Tensor,
     warmup_replays: int = 100,
     rounds: int = 3,
     iterations: int = 20,
 ) -> TuningResult:
-    """Measure one complete Stage2 + shared + TP communication candidate."""
+    """Measure one fused Stage2 + TP communication candidate."""
 
     runner = create_runner(tp_group, config)
     runner.output.fill_(float("nan"))
-    candidate_shared = shared_partial.clone()
+    candidate_shared = shared_partial.clone() if shared_partial is not None else None
     prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
 
     def run():
         current_shared = candidate_shared
-        if prepare_shared_partial is not None:
+        if current_shared is not None and prepare_shared_partial is not None:
             current_shared = prepare_shared_partial(current_shared)
         return runner(
             stage2_args=stage2_args,
@@ -428,7 +448,7 @@ def benchmark(
         run,
         tp_group=tp_group,
         process_group=process_group,
-        device=shared_partial.device,
+        device=reference.device,
         warmup_replays=warmup_replays,
         rounds=rounds,
         iterations=iterations,
@@ -513,6 +533,25 @@ def candidate_configs(
     return tuple(dict.fromkeys(candidates))
 
 
+def production_config(shape: ShapeKey, token: int, family: str):
+    """Return the existing winner, allowing explicit families to bootstrap."""
+
+    from aiter.ops.flydsl.comm_fused_moe_host import winners_for
+
+    try:
+        current = winners_for(shape).get(token)
+    except KeyError:
+        # A new model shape has no production table yet.  Explicit candidate
+        # families are the bootstrap path used to create that first table.
+        current = None
+    if current is None and family == "current":
+        raise KeyError(
+            f"no production comm_fused config for M={token}; "
+            "select an explicit --family"
+        )
+    return current
+
+
 def select_winner(
     results,
     *,
@@ -549,8 +588,58 @@ def _winner_key(shape: ShapeKey, token: int) -> dict:
         "q_type": shape.q_type,
         "use_g1u1": shape.use_g1u1,
         "doweight_stage1": shape.doweight_stage1,
-        "tp": shape.tp,
+        "comm_add_shared": int(shape.add_shared),
+        "comm_tp": shape.tp,
     }
+
+
+def _row_key(row: dict, field_names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(str(row.get(field, "")) for field in field_names)
+
+
+def _check_matching_block_m(row: dict, winner: dict, base_key) -> None:
+    existing = row.get("block_m")
+    if existing not in (None, "") and int(existing) != int(winner["block_m"]):
+        raise ValueError(
+            f"comm_fused block_m={winner['block_m']} does not match "
+            f"ordinary block_m={existing} for {base_key}"
+        )
+
+
+def _comm_config(mode, tp, add_shared, kernel_name, latency):
+    if mode not in _COMM_MODES:
+        raise ValueError(f"unsupported comm mode {mode!r}")
+    config = {
+        "tp": int(tp),
+        "add_shared": bool(int(add_shared)),
+        "kernel": str(kernel_name),
+    }
+    if latency not in (None, ""):
+        config["us"] = float(latency)
+    return config
+
+
+def _comm_configs(row: dict) -> dict:
+    raw = row.get(_COMM_CONFIGS_FIELD)
+    if not raw:
+        return {}
+    configs = json.loads(raw)
+    if not isinstance(configs, dict):
+        raise TypeError(f"{_COMM_CONFIGS_FIELD} must be a JSON object")
+    unknown = set(configs).difference(_COMM_MODES)
+    if unknown:
+        raise ValueError(f"unsupported comm_fused modes: {sorted(unknown)}")
+    return configs
+
+
+def _find_output_row(rows: list[dict], base_key) -> dict:
+    matches = [row for row in rows if _row_key(row, _BASE_KEY_FIELDS) == base_key]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one ordinary tuned_fmoe row for {base_key}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
 
 
 def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
@@ -566,46 +655,83 @@ def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
     row = {
         **_winner_key(shape, config.m),
         "block_m": block_m,
-        "us": result.latency_us,
-        "kernelName": config_name(config),
+        "comm_stage2_tp_us": result.latency_us,
+        "comm_kernel_name": config_name(config),
         "max_abs": result.max_abs,
         "rel_l2": result.rel_l2,
     }
-    return {field: row.get(field, "") for field in CSV_FIELDS}
-
-
-def fallback_row(shape: ShapeKey, token: int, block_m: int) -> dict:
-    row = {
-        **_winner_key(shape, token),
-        "block_m": block_m,
-        "kernelName": "fallback",
-    }
-    return {field: row.get(field, "") for field in CSV_FIELDS}
+    return {field: row.get(field, "") for field in PROFILE_FIELDS}
 
 
 def write_winner(path, row: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = []
+    fieldnames = None
     if path.exists():
         with path.open(newline="") as file:
-            rows = list(csv.DictReader(file))
-    key = tuple(str(row[field]) for field in _WINNER_KEY_FIELDS)
-    rows = [
-        old
-        for old in rows
-        if tuple(str(old[field]) for field in _WINNER_KEY_FIELDS) != key
-    ]
-    rows.append({field: row.get(field, "") for field in CSV_FIELDS})
+            reader = csv.DictReader(file)
+            rows = list(reader)
+            fieldnames = reader.fieldnames
+    if fieldnames is None or "kernelName1" not in fieldnames:
+        raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
+    if _COMM_CONFIGS_FIELD not in fieldnames:
+        fieldnames.append(_COMM_CONFIGS_FIELD)
+    base_key = _row_key(row, _BASE_KEY_FIELDS)
+    output_row = _find_output_row(rows, base_key)
+    if output_row.get("block_m") not in (None, ""):
+        _check_matching_block_m(output_row, row, base_key)
+    configs = _comm_configs(output_row)
+    configs["ar"] = _comm_config(
+        "ar",
+        row["comm_tp"],
+        row["comm_add_shared"],
+        row["comm_kernel_name"],
+        row["comm_stage2_tp_us"],
+    )
+    output_row[_COMM_CONFIGS_FIELD] = json.dumps(
+        configs, separators=(",", ":"), sort_keys=True
+    )
     with path.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
 
+def remove_winner(path, shape: ShapeKey, token: int) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    with path.open(newline="") as file:
+        reader = csv.DictReader(file)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+    if fieldnames is None or "kernelName1" not in fieldnames:
+        raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
+    if _COMM_CONFIGS_FIELD not in fieldnames:
+        return
+    winner_key = _winner_key(shape, token)
+    base_key = _row_key(winner_key, _BASE_KEY_FIELDS)
+    matching = [row for row in rows if _row_key(row, _BASE_KEY_FIELDS) == base_key]
+    if matching:
+        output_row = _find_output_row(rows, base_key)
+        configs = _comm_configs(output_row)
+        if configs.pop("ar", None) is None:
+            return
+        output_row[_COMM_CONFIGS_FIELD] = (
+            json.dumps(configs, separators=(",", ":"), sort_keys=True)
+            if configs
+            else ""
+        )
+        with path.open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Tune one complete FlyDSL GEMM2 + TP communication shape."
+        description="Tune one FlyDSL GEMM2 + TP communication shape."
     )
     parser.add_argument("--token", type=int, required=True)
     parser.add_argument("--model-dim", type=int, default=7168)
@@ -613,6 +739,13 @@ def _parse_args():
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument(
+        "--add-shared",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Whether the fused Stage2 epilogue adds a shared partial.",
+    )
     parser.add_argument("--route", choices=("uniform", "skew"), default="uniform")
     parser.add_argument("--seed", type=int, default=20260819)
     parser.add_argument(
@@ -641,7 +774,7 @@ def _parse_args():
     parser.add_argument(
         "--ordinary-only",
         action="store_true",
-        help="Measure the ordinary Stage2 + TP AllReduce baseline and exit.",
+        help="Measure the matching ordinary Stage2 + TP collective and exit.",
     )
     parser.add_argument("--profile-output", type=Path)
     parser.add_argument("--winner-output", type=Path)
@@ -657,17 +790,19 @@ def main():
         case = _make_stage2_case(
             args, rank, device, accumulate=requires_zero, sorted_inter=sorted_inter
         )
-        shared = (
-            torch.arange(args.token, device=device, dtype=torch.float32)
-            .remainder(7)
-            .mul_(1.0 / 32.0)
-            .view(-1, 1)
-            + torch.arange(args.model_dim, device=device, dtype=torch.float32)
-            .remainder(17)
-            .mul_(1.0 / 128.0)
-            .view(1, -1)
-            + float(rank + 1) / 16.0
-        ).to(torch.bfloat16)
+        shared = None
+        if args.add_shared:
+            shared = (
+                torch.arange(args.token, device=device, dtype=torch.float32)
+                .remainder(7)
+                .mul_(1.0 / 32.0)
+                .view(-1, 1)
+                + torch.arange(args.model_dim, device=device, dtype=torch.float32)
+                .remainder(17)
+                .mul_(1.0 / 128.0)
+                .view(1, -1)
+                + float(rank + 1) / 16.0
+            ).to(torch.bfloat16)
         reference = _run_ordinary_stage2_allreduce(
             case,
             metadata,
@@ -707,15 +842,9 @@ def main():
             args.topk,
             args.tp,
             get_cu_num(),
+            add_shared=bool(args.add_shared),
         )
-        from aiter.ops.flydsl.comm_fused_moe_host import winners_for
-
-        current = winners_for(shape).get(args.token)
-        if current is None and args.family == "current":
-            raise KeyError(
-                f"no production comm_fused config for M={args.token}; "
-                "select an explicit --family"
-            )
+        current = production_config(shape, args.token, args.family)
         candidates = candidate_configs(
             current,
             args.family,
@@ -789,15 +918,12 @@ def main():
             if args.profile_output is not None:
                 args.profile_output.parent.mkdir(parents=True, exist_ok=True)
                 with args.profile_output.open("w", newline="") as file:
-                    writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+                    writer = csv.DictWriter(file, fieldnames=PROFILE_FIELDS)
                     writer.writeheader()
                     writer.writerows(winner_row(shape, result) for result in results)
             if winner is None:
                 if args.winner_output is not None:
-                    write_winner(
-                        args.winner_output,
-                        fallback_row(shape, args.token, int(metadata.block_m)),
-                    )
+                    remove_winner(args.winner_output, shape, args.token)
                 print(
                     f"COMM_FUSED_TUNE_WINNER ordinary_us={ordinary_us:.4f} "
                     "kernel=ordinary",
@@ -813,7 +939,7 @@ def main():
                     f"speedup={ordinary_us / winner.latency_us:.4f}x "
                     f"max_abs={winner.max_abs:.6f} "
                     f"rel_l2={winner.rel_l2:.6f} "
-                    f"kernel={winner_data['kernelName']}",
+                    f"kernel={winner_data['comm_kernel_name']}",
                     flush=True,
                 )
     finally:

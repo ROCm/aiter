@@ -19,6 +19,7 @@ class Shape:
     experts: int
     topk: int
     tp_size: int = 8
+    add_shared: bool = True
 
     def __post_init__(self):
         for name, value in (
@@ -45,13 +46,16 @@ class Shape:
                 f"{SUPPORTED_TP_SIZES}, "
                 f"got {self.tp_size}"
             )
+        if not isinstance(self.add_shared, bool):
+            raise TypeError(f"add_shared must be bool, got {self.add_shared!r}")
 
     @property
     def tag(self) -> str:
-        return (
+        tag = (
             f"h{self.model_dim}_i{self.inter_dim}_e{self.experts}"
             f"_k{self.topk}_tp{self.tp_size}"
         )
+        return tag if self.add_shared else f"{tag}_no_shared"
 
 
 def _align_up(value: int, alignment: int) -> int:
