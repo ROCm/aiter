@@ -1118,6 +1118,67 @@ def get_mla_decode_fwd_occupancy(
     return 2 if is_hk_m16x4 else 1
 
 
+def _mla_v12_natively_supported(num_head_qo, max_seqlen_qo, q_dtype, kv_dtype):
+    """Mirror of `natively_supported` in v1_2_device.cuh:910-921.
+
+    When this is False and `num_head_qo % 16 == 0`, the planner folds the head
+    count to 16 and scales its batch count by `qk_batch_ratio` BEFORE applying
+    `max_split_per_batch` (v1_2_device.cuh:924-928, then 948-950). Sizing must
+    use the same effective batch count or it reserves less than the planner can
+    emit, and an undersized reduce_partial_map faults the GPU.
+
+    Tests `max_seqlen_qo`, not the sparse-collapsed length, because the C++ does.
+
+    Biased towards False on purpose: a false negative folds when the planner
+    does not, which only over-reserves; a false positive under-reserves and
+    faults. Keep any future divergence on that side.
+    """
+    gfx = get_gfx()
+    q_is_fp8 = q_dtype == dtypes.fp8
+    kv_is_fp8 = kv_dtype == dtypes.fp8
+    both_fp8 = q_is_fp8 and kv_is_fp8
+
+    hk_mtp_experimental = (
+        gfx in ("gfx942", "gfx950")
+        and both_fp8
+        and num_head_qo * max_seqlen_qo == 128
+        and num_head_qo in (16, 32, 64, 128)
+        and is_experimental_enabled()
+    )
+
+    # `== "1"` matches the convention already used for this variable in
+    # get_mla_metadata_info_v1 below. It is deliberately STRICTER than the
+    # C++ `atoi(value) != 0`: a value like "2" reads as enabled there and
+    # disabled here, so we fold where the planner does not, which only
+    # over-reserves. The reverse -- treating "false" as enabled, as a
+    # truthiness test would -- reports native for a shape the planner folds
+    # and under-reserves reduce_partial_map, which faults the GPU.
+    flydsl_ps1 = os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+    gfx1250_flydsl_ps1_heads = (
+        flydsl_ps1
+        and gfx == "gfx1250"
+        and both_fp8
+        and num_head_qo in (32, 64, 128)
+        and max_seqlen_qo == 1
+    )
+
+    return (
+        num_head_qo == 16
+        or gfx1250_flydsl_ps1_heads
+        or (
+            gfx in ("gfx942", "gfx950")
+            and num_head_qo == 64
+            and both_fp8
+            and max_seqlen_qo == 1
+        )
+        or (gfx == "gfx950" and not q_is_fp8 and not kv_is_fp8)
+        or (gfx == "gfx942" and num_head_qo == 128 and both_fp8)
+        or (gfx == "gfx950" and both_fp8 and num_head_qo in (32, 64, 128))
+        or (gfx == "gfx950" and both_fp8 and num_head_qo == 96 and max_seqlen_qo <= 6)
+        or hk_mtp_experimental
+    )
+
+
 def get_mla_decode_fwd_max_splits(
     num_head_qo: int,
     max_seqlen_qo: int,
@@ -1251,6 +1312,10 @@ def get_mla_metadata_info_v1(
         else:
             max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
 
+    # The planner's split budget is computed from the raw KV batch count
+    # (`seqlens_kv_indptr.size(0) - 1`, v1_2_device.cuh:860), NOT from this
+    # sparse-expanded one, so keep the original for per_tile_cap below.
+    kv_batch_size = batch_size
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
@@ -1265,7 +1330,7 @@ def get_mla_metadata_info_v1(
         max_split_tiles = tile_cnt * max_splits
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:948-950). This is a GLOBAL
     # budget shared across all tiles, so the total number of partial reduce
     # entries is bounded by the base tiles (one per tile) plus at most the global
     # split budget of EXTRA splits distributed across them:
@@ -1275,9 +1340,50 @@ def get_mla_metadata_info_v1(
     # forbids. With cudagraph batch_size >> cu_num that product collapsed to
     # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
     # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
-    if max_split_per_batch > 0:
-        per_tile_cap = min(max_splits, max_split_per_batch * batch_size)
-        max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
+    # Only for fast_mode. With fast_mode=False and intra_batch_mode=False,
+    # metadata.cu:149 dispatches to get_mla_metadata_v1_1, whose device entry
+    # point takes no max_split_per_batch at all, so that planner is uncapped and
+    # shrinking its allocation would undersize reduce_partial_map -- which faults
+    # the GPU rather than raising.
+    #
+    # fast_mode=False WITH intra_batch_mode=True is different: metadata.cu:129
+    # routes it to get_mla_metadata_v1_0_device, which does accept the cap. That
+    # path is left out only because its reduce_partial_map sizing above
+    # (`tile_cnt * num_kv_splits`) ignores the cap entirely and is a separate
+    # change; it is not that the planner there is uncapped.
+    if fast_mode and max_split_per_batch > 0:
+        # The planner folds head counts it does not natively serve down to 16
+        # and scales its batch count up by the same ratio BEFORE applying the
+        # cap (v1_2_device.cuh:924-928 then 948-950), so its budget is
+        # `cap * batch_size * qk_batch_ratio`. Use the same gate it does, so
+        # natively-served shapes -- the common case -- keep the tight bound
+        # instead of reserving a fold that never happens.
+        qk_batch_ratio = 1
+        if num_head_qo % 16 == 0 and not _mla_v12_natively_supported(
+            num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
+        ):
+            qk_batch_ratio = num_head_qo // 16
+        per_tile_cap = min(
+            max_splits, max_split_per_batch * kv_batch_size * qk_batch_ratio
+        )
+        # Take the min. `tile_cnt + per_tile_cap` is the cap-aware bound; the
+        # fast_mode estimate above assumes an unbounded per-batch split budget,
+        # so combining them with max() lets the loose estimate always win and a
+        # supplied cap has no effect on the allocation at all.
+        #
+        # The fast_mode estimate saturates at ((max_splits - 1) * 2) * tiles per
+        # batch, so at large batch it can sit below `tile_cnt + per_tile_cap`
+        # and this min() keeps the smaller of the two. That is supported by
+        # measurement rather than assumed: see
+        # op_tests/test_mla_metadata_split_cap_fill.py, where at batch 512 with
+        # jittered KV up to 64k the planner writes at most ~510 partials against
+        # a bound of ~2040 -- roughly 4x headroom either way.
+        #
+        # Only valid because the caller passes the SAME max_split_per_batch to
+        # get_mla_metadata_v1 at build time; the schedule is then built under
+        # the same cap the sizing assumed. The fill test drives both with one
+        # cap for exactly this reason.
+        max_split_tiles = min(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
