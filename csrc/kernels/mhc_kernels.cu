@@ -2573,18 +2573,20 @@ namespace aiter {
         __shared__ DTYPE_I s_x[n_stages * tile_m * tile_k];
         __shared__ DTYPE_I s_residual[n_stages * tile_m * hc_mult * tile_k];
 #if defined(__gfx1250__)
-        // num_warps > 2: the store must be issued by a warp that owns no TDM load
-        // (warps 0/1 issue residual/x), or that warp would carry n_stages loads +
-        // n_stages stores = 4 tensor ops in flight, over the per-wave limit of 3.
-        static constexpr bool nres_tdm = mhc_nres_tdm_store && w_preshuffle_bf16
-                                         && res_preshuffle && (num_warps > 2) && !decode_direct_store;
-#else
-        static constexpr bool nres_tdm = false;
-#endif
-#if defined(__gfx1250__)
         static constexpr bool decode_pipeline = decode_direct_store && w_preshuffle_bf16 && res_preshuffle;
+        // Opus-style register pipeline for the tuned prefill shape.  Keep FN in
+        // VGPRs, but load the next K tile one 16-byte fragment per WMMA gap
+        // instead of issuing the whole tile as one burst after compute.
+        static constexpr bool fn_wmma_pipeline = w_preshuffle_bf16 && res_preshuffle
+                                                  && !decode_pipeline && tile_m == 32
+                                                  && tile_n == 32 && tile_k == 32;
+        static constexpr bool nres_tdm = mhc_nres_tdm_store && w_preshuffle_bf16
+                                         && res_preshuffle && (num_warps > 2)
+                                         && !decode_direct_store;
 #else
         static constexpr bool decode_pipeline = false;
+        static constexpr bool fn_wmma_pipeline = false;
+        static constexpr bool nres_tdm = false;
 #endif
         // Staging tile for the next_residual TDM store; same layout as s_residual.
         __shared__ DTYPE_I s_nres[nres_tdm ? n_stages * tile_m * hc_mult * tile_k : 1];
@@ -2861,15 +2863,21 @@ namespace aiter {
             }
             return v_fn;
         };
+        auto vgpr_load_fn_chunk = [&](int offset_base, auto Chunk) {
+            constexpr int chunk = decltype(Chunk)::value;
+            return load_vector_nbytes<float, fn_load_vec, 16, 0, false>(
+                g_fn, offset_base + chunk * fn_load_vec);
+        };
 
         using float_hc_mult = opus::vector_t<float, hc_mult>;
         float post_mix_v[m_repeat];
         float_hc_mult comb_mix[m_repeat];
 #if defined(__gfx1250__)
-        // Keep coefficient loads in a shared EXEC region instead of waiting
-        // after every scalar read. Full decode tiles can batch all row bands;
-        // the per-band path avoids the prefill regression from that fast path.
-        if (decode_pipeline && m_oob == tile_m) {
+        // Keep full tiles out of the lane-divergent EXEC region.  The scheduler
+        // may hoist the packed-BF16 FN prefetch above this code; changing EXEC
+        // while those vector addresses are outstanding forces an s_wait_xcnt.
+        // The guarded path remains for the single OOB tail tile.
+        if (m_oob == tile_m) {
             for(int b = 0; b < m_repeat; b++) {
                 int row = b * mfma_m + lane_id % mfma_m;
                 post_mix_v[b] = post_layer_mix[(row + idx) * hc_mult + warp_id];
@@ -2918,7 +2926,7 @@ namespace aiter {
                 if (s < k_loop) {
                     lds_load_x_tile(s, s);
                     lds_load_residual_tile(s, s);
-                    v_fn[s] = vgpr_load_fn_tile(s);
+                    if constexpr (!fn_wmma_pipeline) v_fn[s] = vgpr_load_fn_tile(s);
                 }
             }
         });
@@ -2932,7 +2940,9 @@ namespace aiter {
             }
         }
 
-        auto compute_store_tile = [&](int i, int slot, fp32xfntile& v_fn) {
+        auto compute_store_tile = [&](int i, int slot, fp32xfntile& v_fn,
+                                      auto Refill, fp32xfntile& v_fn_next) {
+            constexpr bool refill_fn = decltype(Refill)::value;
             DTYPE_I* s_x_rd_ptr = s_x + slot * tile_mk;
             DTYPE_I* s_residual_rd_ptr = s_residual + slot * (hc_mult * tile_mk);
             static constexpr bool batch_lds = decode_pipeline || (mhc_bf16_mma_avail && warp_size == 32 && w_preshuffle_bf16 && res_shuf && tile_k == 32);
@@ -2943,6 +2953,43 @@ namespace aiter {
             // iterations (2 x ds_read_vec) combined; band_j is even for tile_k in {32,64}.
             using pref_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
             pref_vec pref_x[band_j], pref_res[band_j][hc_mult];
+            opus::array<int, repeat_n> fn_refill_base;
+            if constexpr (fn_wmma_pipeline && refill_fn) {
+                static_assert(m_repeat * repeat_n * 2 == repeat_n * vec_tile / fn_load_vec,
+                              "one FN VMEM fragment must fit in every WMMA gap");
+                const int base = lane_id % mfma_n * fn_stride + warp_id * hidden_size
+                               + lane_id / mfma_n * vec_tile
+                               + (i + 1) * tile_k + k_split_offset;
+                const int n_step = mfma_n * fn_stride;
+                opus::static_for<repeat_n>([&](auto N) {
+                    fn_refill_base[N.value] = base + N.value * n_step;
+                });
+            }
+            auto prefetch_fn_chunk = [&](auto P) __attribute__((always_inline)) {
+                if constexpr (fn_wmma_pipeline && refill_fn) {
+                    constexpr int p = decltype(P)::value;
+                    constexpr int chunks_per_n = vec_tile / fn_load_vec;
+                    static_assert(chunks_per_n == 4 && repeat_n == 2,
+                                  "gfx1250 FN pipeline is scheduled for two 64-byte rows");
+                    // Match next tile's WMMA consumption order: hi(n0), hi(n1),
+                    // lo(n0), lo(n1), two b128 loads per operand.  This makes the
+                    // first consumer depend on the oldest loads and gives the late
+                    // n1/lo fragment the longest distance available to it.
+                    constexpr int consumer = p / 2;
+                    constexpr int dst_n = consumer % repeat_n;
+                    constexpr int half = consumer / repeat_n;
+                    constexpr int chunk = half * 2 + p % 2;
+                    auto value = vgpr_load_fn_chunk(fn_refill_base[dst_n],
+                                                    opus::number<chunk>{});
+                    #pragma unroll
+                    for (int e = 0; e < fn_load_vec; ++e)
+                        v_fn_next[dst_n][chunk * fn_load_vec + e] = value[e];
+                    // Same IGLP shape used by the gfx1250 GEMM pipelines: one
+                    // WMMA and one VMEM read per scheduler group.
+                    __builtin_amdgcn_sched_group_barrier(0x08u, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x20u, 1, 0);
+                }
+            };
             auto prefetch_band = [&](int pb) {
                 if constexpr (batch_lds) {
                     for (int pj = 0; pj < band_j; ++pj) {
@@ -2961,7 +3008,8 @@ namespace aiter {
             // Decode keeps its per-band load order. In the other BF16 path,
             // the next band is fetched while the current WMMA is still pending.
             if constexpr (!decode_pipeline) prefetch_band(0);
-            for(int b = 0; b < m_repeat; b++) {
+            opus::static_for<m_repeat>([&](auto B) {
+                constexpr int b = decltype(B)::value;
                 if constexpr (decode_pipeline) prefetch_band(b);
                 int s_offset = b * band_mk + lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
                 [[maybe_unused]] opus::vector_t<float, 8> res_bf_raw;
@@ -3138,18 +3186,36 @@ namespace aiter {
                             if constexpr (!decode_pipeline) {
                                 if (j + 1 == band_j && b + 1 < m_repeat) prefetch_band(b + 1);
                             }
-                            for (int n = 0; n < repeat_n; n++) {
-                                opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;
-                                // The 64 B this lane already loaded IS [16 hi][16 lo] for
-                                // this k block, so the two fragments are its halves --
-                                // no shift, no mask, no v_perm. 16 floats per block, hi in
-                                // the first 8, lo in the next 8.
-                                {
-                                    // Move in FLOAT units (whole-VGPR v_mov, foldable by the
-                                    // register allocator) and reinterpret once. Slicing a bf16
-                                    // vector element-wise instead makes the compiler emit
-                                    // sub-register extract/insert -- the very shift+mask this
-                                    // layout exists to remove.
+                            if constexpr (fn_wmma_pipeline) {
+                                // Follow the Opus ordering: walk independent N
+                                // accumulators before returning to the same one for
+                                // its low BF16 residual.  Each WMMA gap carries one
+                                // 16-byte fragment of the next FN tile.
+                                auto wmma_half = [&](auto N, auto Half) __attribute__((always_inline)) {
+                                    constexpr int n = decltype(N)::value;
+                                    constexpr int half = decltype(Half)::value;
+                                    using f32x8 = opus::vector_t<float, 8>;
+                                    const int off = mhc_fn_hi_float((j - 1) * ds_read_vec)
+                                                  + half * mhc_fn_lo_off;
+                                    f32x8 raw;
+                                    #pragma unroll
+                                    for (int e = 0; e < 8; ++e) raw[e] = v_fn[n][off + e];
+                                    auto fn_frag = __builtin_bit_cast(
+                                        opus::vector_t<opus::bf16_t, 16>, raw);
+                                    v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(
+                                        fn_frag, res_bf, v_cf[b][n]);
+                                    constexpr int pf = b * repeat_n * 2
+                                                     + half * repeat_n + n;
+                                    prefetch_fn_chunk(opus::number<pf>{});
+                                };
+                                opus::static_for<repeat_n>([&](auto N) { wmma_half(N, 0_I); });
+                                opus::static_for<repeat_n>([&](auto N) { wmma_half(N, 1_I); });
+                                if constexpr (refill_fn) __builtin_amdgcn_sched_barrier(0);
+                            } else {
+                                for (int n = 0; n < repeat_n; n++) {
+                                    opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;
+                                    // The 64 B this lane already loaded IS [16 hi][16 lo]
+                                    // for this k block, so the two fragments are its halves.
                                     using f32x8 = opus::vector_t<float, 8>;
                                     const int off = mhc_fn_hi_float((j - 1) * ds_read_vec);
                                     f32x8 hi_raw, lo_raw;
@@ -3159,9 +3225,9 @@ namespace aiter {
                                     }
                                     fn_hi = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 16>, hi_raw);
                                     fn_lo = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 16>, lo_raw);
+                                    v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, res_bf, v_cf[b][n]);
+                                    v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, res_bf, v_cf[b][n]);
                                 }
-                                v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, res_bf, v_cf[b][n]);
-                                v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, res_bf, v_cf[b][n]);
                             }
                         }
 #endif
@@ -3179,7 +3245,7 @@ namespace aiter {
                         }
                     }
                 }
-            }
+            });
         };
 
         // gfx9 only: x and residual share the async counter, so the "leave in flight"
@@ -3191,17 +3257,19 @@ namespace aiter {
         [[maybe_unused]] static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : (n_stages - 1) * residual_load_waitcnt;
 #if defined(__gfx1250__)
         auto wait_load_cnt = [&]() {
-            // x (warp 1) and residual (warp 0) are both TDM / TENSORcnt-tracked. Each
-            // issuing wave drains its current stage down to the single prefetch left in
-            // flight (KEEP1, per-wave counter; a no-op on the non-issuing warps), then
-            // the workgroup barrier publishes both tiles to all warps. fn stays on
-            // loadcnt; there are no async loads left, so the async count is -1
-            // (sentinel: suppress s_wait_asynccnt emission; 0 would emit a spurious
-            // s_wait_asynccnt 0).
-            MHC_TDM_KEEP(n_stages - 1);
-            s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<-1>{});
-            __builtin_amdgcn_s_barrier();
-            s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<-1>{});
+            // x (warp 1) and residual (warp 0) are TDM / TENSORcnt-tracked.
+            // The Opus-style FN pipeline relies on the destination dependency to
+            // place a fragment-local loadcnt wait immediately before each WMMA;
+            // a loop-top loadcnt would serialize the whole prefetched tile.
+            if constexpr (fn_wmma_pipeline) {
+                MHC_TDM_KEEP(n_stages - 1);
+                __builtin_amdgcn_s_barrier();
+            } else {
+                MHC_TDM_KEEP(n_stages - 1);
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<-1>{});
+                __builtin_amdgcn_s_barrier();
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<-1>{});
+            }
         };
 #else
         auto wait_load_cnt = [&]() {
@@ -3235,11 +3303,10 @@ namespace aiter {
         // actually outstanding -- true throughout the steady state, and the reason
         // the tail below falls back to a full drain once the ring stops refilling.
         // ---- next_residual store via TDM (mirror of lds_load_residual_tile) ----
-        // The same 4D tile kk x row x head x kb, read back out of LDS. Warp 2 owns
-        // no TDM load, so issuing here keeps every wave at n_stages tensor ops. Order
-        // is: deposit (compute_store_tile) -> nres_deposit_fence -> workgroup barrier
-        // -> issue; slot reuse is held behind the store by MHC_TDM_KEEP(n_stages-1)
-        // in wait_load_cnt.
+        // The same 4D tile kk x row x head x kb is read back out of LDS. Warp 2
+        // owns the store stream. Order is deposit -> fence ->
+        // workgroup barrier -> issue, and slot reuse is held behind the store by
+        // MHC_TDM_KEEP(n_stages-1).
         auto nres_deposit_fence = [&](){ if constexpr (nres_tdm) { s_wait_all_dscnt(0_I); } };
 #if defined(__gfx1250__)
         auto tdm_store_nres_tile = [&](int k, int slot){
@@ -3283,7 +3350,7 @@ namespace aiter {
                             v_fn[next_slot] = vgpr_load_fn_tile(k + 1);
                             __builtin_amdgcn_sched_barrier(0);
                         }
-                        compute_store_tile(k, slot, v_fn[slot]);
+                        compute_store_tile(k, slot, v_fn[slot], 0_I, v_fn[slot]);
                     }
                 });
             }
@@ -3292,14 +3359,21 @@ namespace aiter {
             for(; i + 2 * n_stages - 1 < k_loop; i += n_stages) {
                 opus::static_for<n_stages>([&](auto S) {
                     constexpr int s = S.value;
+                    const int k = i + s;
                     wait_load_cnt();
-                    compute_store_tile(i + s, s, v_fn[s]);
+                    if constexpr (fn_wmma_pipeline) {
+                        constexpr int next = (s + 1) % n_stages;
+                        compute_store_tile(k, s, v_fn[s], 1_I, v_fn[next]);
+                    } else {
+                        compute_store_tile(k, s, v_fn[s], 0_I, v_fn[s]);
+                    }
                     nres_deposit_fence();
                     __builtin_amdgcn_s_barrier();
-                    tdm_store_nres_tile(i + s, s);
-                    lds_load_x_tile(i + s + n_stages, s);
-                    lds_load_residual_tile(i + s + n_stages, s);
-                    v_fn[s] = vgpr_load_fn_tile(i + s + n_stages);
+                    tdm_store_nres_tile(k, s);
+                    lds_load_x_tile(k + n_stages, s);
+                    lds_load_residual_tile(k + n_stages, s);
+                    if constexpr (!fn_wmma_pipeline)
+                        v_fn[s] = vgpr_load_fn_tile(k + n_stages);
                     __builtin_amdgcn_sched_barrier(0);
                 });
             }
@@ -3320,18 +3394,32 @@ namespace aiter {
                     constexpr int slot = s % n_stages;
                     if (k + n_stages < k_loop) {
                         wait_load_cnt();
-                        compute_store_tile(k, slot, v_fn[slot]);
+                        if constexpr (fn_wmma_pipeline) {
+                            constexpr int next = (slot + 1) % n_stages;
+                            compute_store_tile(k, slot, v_fn[slot], 1_I, v_fn[next]);
+                        } else {
+                            compute_store_tile(k, slot, v_fn[slot], 0_I, v_fn[slot]);
+                        }
                         nres_deposit_fence();
                         __builtin_amdgcn_s_barrier();
                         tdm_store_nres_tile(k, slot);
                         lds_load_x_tile(k + n_stages, slot);
                         lds_load_residual_tile(k + n_stages, slot);
-                        v_fn[slot] = vgpr_load_fn_tile(k + n_stages);
+                        if constexpr (!fn_wmma_pipeline)
+                            v_fn[slot] = vgpr_load_fn_tile(k + n_stages);
                     } else {
                         s_wait_all_loadcnt(0_I, 0_I);
                         MHC_TDM_DRAIN();
                         __builtin_amdgcn_s_barrier();
-                        compute_store_tile(k, slot, v_fn[slot]);
+                        if constexpr (fn_wmma_pipeline) {
+                            constexpr int next = (slot + 1) % n_stages;
+                            if (k + 1 < k_loop)
+                                compute_store_tile(k, slot, v_fn[slot], 1_I, v_fn[next]);
+                            else
+                                compute_store_tile(k, slot, v_fn[slot], 0_I, v_fn[next]);
+                        } else {
+                            compute_store_tile(k, slot, v_fn[slot], 0_I, v_fn[slot]);
+                        }
                         if constexpr (nres_tdm) {
                             nres_deposit_fence();
                             __builtin_amdgcn_s_barrier();
