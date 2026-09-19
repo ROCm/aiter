@@ -8,7 +8,8 @@
       "DT"
     ],
     "attn_3d": [
-      "D"
+      "D",
+      "Q"
     ],
     "reduce": [
       "D"
@@ -132,6 +133,31 @@
       "TILE_SIZE_MAX": 64,
       "SPLIT_UNMASKED_LOOP": true
     },
+    "D_LEQ_128.Q_GEQ_256.SW": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_128.Q_GEQ_256.SHUF": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_128.Q_GEQ_256": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64,
+      "SPLIT_UNMASKED_LOOP": true
+    },
     "Q_GEQ_256": {
       "BLOCK_M": 128,
       "num_warps": 4,
@@ -163,6 +189,12 @@
       "num_warps": 4,
       "num_stages": 1,
       "waves_per_eu": 2
+    },
+    "Q_GEQ_2": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 1
     },
     "any": {
       "BLOCK_M": 16,
