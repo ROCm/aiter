@@ -136,10 +136,10 @@ def _direct_3x3_guard(R, S, stride, dilation, C):
 
 
 def _wino_guard(R, S, stride, dilation, C):
-    # _is_winograd_eligible signature varies by upstream — keep the flag tight
-    from aiter.ops.triton.conv._utils import _is_winograd_eligible
+    # _is_winograd_2d_eligible signature varies by upstream — keep the flag tight
+    from aiter.ops.triton.conv._utils import _is_winograd_2d_eligible
 
-    return _is_winograd_eligible(R, S, stride, dilation, C)
+    return _is_winograd_2d_eligible(R, S, stride, dilation, C)
 
 
 METHOD_REGISTRY = {

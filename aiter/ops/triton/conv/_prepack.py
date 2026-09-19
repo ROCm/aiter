@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Weight/input repacking for the conv2d kernels.
+"""Weight/input repacking for convolution kernels.
 
 Several conv kernels don't consume the raw OIHW weight (or NCHW input) layout
 directly — they need it reshaped into a kernel-local format for coalesced loads:
@@ -18,8 +18,14 @@ from collections import OrderedDict
 
 import torch
 
-from aiter.ops.triton.conv._launch import _launch_nchw_to_cblocked
-from aiter.ops.triton.conv._utils import BLOCK_K
+from aiter.ops.triton.conv._launch import (
+    _launch_ncdhw_to_cblocked,
+    _launch_nchw_to_cblocked,
+)
+from aiter.ops.triton.conv._utils import (
+    BLOCK_K,
+    _winograd_transform_storage_dtype,
+)
 
 _DEFAULT_PACK_CACHE_MAXSIZE = 256
 
@@ -62,10 +68,26 @@ class _LRUPackCache:
         while len(self._d) > self._max:
             self._d.popitem(last=False)
 
+    def clear(self):
+        self._d.clear()
+
 
 _PACK_CACHE = _LRUPackCache()
 _PACK_CACHE_3x3 = _LRUPackCache()
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
+
+# The 3-D packed layouts use independent cache instances to prevent collisions
+# when source tensor metadata matches a cache entry for another packed format.
+_PACK_CACHE_3D_GENERAL = _LRUPackCache()
+_PACK_CACHE_3D_3X3X3 = _LRUPackCache()
+_PACK_CACHE_3D_WINOGRAD_HW = _LRUPackCache()
+
+
+def clear_conv3d_weight_pack_caches():
+    """Release cached Conv3D weight packs, primarily for synthetic sweeps."""
+    _PACK_CACHE_3D_GENERAL.clear()
+    _PACK_CACHE_3D_3X3X3.clear()
+    _PACK_CACHE_3D_WINOGRAD_HW.clear()
 
 
 def _pack_cache_key(w: torch.Tensor, block: int) -> tuple:
@@ -185,3 +207,134 @@ def get_or_make_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_
     item = prepack_winograd_filter_f4x3(w_oihw, block_c)
     _PACK_CACHE_WINOGRAD_F4X3.put(key, w_oihw, item)
     return item
+
+
+# ---------------------------------------------------------------------------
+# Conv3D packing
+# ---------------------------------------------------------------------------
+
+
+def prepack_oidhw_to_kmajor(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
+    """Pack ``[K_out,C,T,R,S]`` into zero-padded ``[K_out,K_pad]``."""
+    K_out, C, T, R, S = w_oidhw.shape
+    K_red = C * T * R * S
+    K_pad = ((K_red + block_k - 1) // block_k) * block_k
+    packed = w_oidhw.reshape(K_out, K_red)
+    if K_pad != K_red:
+        packed = torch.cat(
+            (
+                packed,
+                torch.zeros(
+                    (K_out, K_pad - K_red),
+                    device=w_oidhw.device,
+                    dtype=w_oidhw.dtype,
+                ),
+            ),
+            dim=1,
+        )
+    return packed.contiguous(), K_pad
+
+
+def get_or_make_weight_pack_3d(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
+    key = _pack_cache_key(w_oidhw, block_k)
+    cached = _PACK_CACHE_3D_GENERAL.get(key)
+    if cached is not None:
+        return cached[1]
+    packed = prepack_oidhw_to_kmajor(w_oidhw, block_k)
+    _PACK_CACHE_3D_GENERAL.put(key, w_oidhw, packed)
+    return packed
+
+
+def prepack_oidhw_to_3x3x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    """Pack OIDHW weights as ``[K_out,27,C_pad]`` in depth-major tap order."""
+    K_out, C, T, R, S = w_oidhw.shape
+    if (T, R, S) != (3, 3, 3):
+        raise ValueError(f"3x3x3 prepack requires a 3x3x3 weight, got {(T, R, S)}")
+    C_pad = ((C + block_c - 1) // block_c) * block_c
+    packed = w_oidhw.reshape(K_out, C, 27).permute(0, 2, 1).contiguous()
+    if C_pad != C:
+        packed = torch.cat(
+            (
+                packed,
+                torch.zeros(
+                    (K_out, 27, C_pad - C),
+                    device=w_oidhw.device,
+                    dtype=w_oidhw.dtype,
+                ),
+            ),
+            dim=2,
+        )
+    return packed.contiguous(), C_pad
+
+
+def get_or_make_weight_pack_3x3x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    key = _pack_cache_key(w_oidhw, block_c)
+    cached = _PACK_CACHE_3D_3X3X3.get(key)
+    if cached is not None:
+        return cached[1]
+    packed = prepack_oidhw_to_3x3x3(w_oidhw, block_c)
+    _PACK_CACHE_3D_3X3X3.put(key, w_oidhw, packed)
+    return packed
+
+
+def prepack_ncdhw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
+    """Materialize NCDHW as contiguous ``[N,C_blocks,D,H,W,Cb]``."""
+    if not x.is_contiguous():
+        x = x.contiguous()
+    N, C, D, H, W = x.shape
+    C_blocks = (C + block_c - 1) // block_c
+    C_pad = C_blocks * block_c
+    packed = torch.empty(
+        (N, C_blocks, D, H, W, block_c), device=x.device, dtype=x.dtype
+    )
+    _launch_ncdhw_to_cblocked(x, packed, N, C, D, H, W, C_pad, block_c)
+    return packed, C_pad
+
+
+def prepack_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    """Apply F(4,3)'s 2-D filter transform to each of three depth taps.
+
+    The result is ``[3,36,K_out,C_pad]``. BF16 weights use FP16 transformed
+    storage, reducing the extra rounding introduced by the Winograd domain.
+    """
+    K_out, C, T, R, S = w_oidhw.shape
+    if (T, R, S) != (3, 3, 3):
+        raise ValueError(f"Winograd prepack requires 3x3x3, got {(T, R, S)}")
+    C_pad = ((C + block_c - 1) // block_c) * block_c
+    G = torch.tensor(
+        [
+            [1.0 / 4, 0.0, 0.0],
+            [-1.0 / 6, -1.0 / 6, -1.0 / 6],
+            [-1.0 / 6, 1.0 / 6, -1.0 / 6],
+            [1.0 / 24, 1.0 / 12, 1.0 / 6],
+            [1.0 / 24, -1.0 / 12, 1.0 / 6],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+        device=w_oidhw.device,
+    )
+    transformed = torch.einsum("ij,kctjl,lm->kctim", G, w_oidhw.float(), G.t())
+    transformed = transformed.reshape(K_out, C, 3, 36).permute(2, 3, 0, 1).contiguous()
+    if C_pad != C:
+        transformed = torch.cat(
+            (
+                transformed,
+                torch.zeros(
+                    (3, 36, K_out, C_pad - C),
+                    device=w_oidhw.device,
+                    dtype=torch.float32,
+                ),
+            ),
+            dim=3,
+        )
+    return transformed.to(_winograd_transform_storage_dtype(w_oidhw.dtype)), C_pad
+
+
+def get_or_make_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    key = _pack_cache_key(w_oidhw, block_c)
+    cached = _PACK_CACHE_3D_WINOGRAD_HW.get(key)
+    if cached is not None:
+        return cached[1]
+    packed = prepack_winograd_hw_filter_f4x3(w_oidhw, block_c)
+    _PACK_CACHE_3D_WINOGRAD_HW.put(key, w_oidhw, packed)
+    return packed

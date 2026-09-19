@@ -20,9 +20,10 @@ Plus test_cross_method (differential correctness) that runs every NCHW
 kernel on shapes routable by all of them and verifies they all match
 F.conv2d. NCHW-only by design; 2 cases (one per dtype).
 
-Plus 7 exact-route and configuration-precedence regression cases.
+Plus 7 exact-route and configuration-precedence regression cases, and 2
+scalar-parameter cases (one per layout).
 
-Total: 12 + 12 + 12 + 36 + 2 + 7 = 81 cases.
+Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 = 83 cases.
 
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
@@ -34,6 +35,7 @@ shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
 from aiter.ops.triton.utils import conv_config_utils
@@ -42,6 +44,7 @@ from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
     ORDERED_METHODS,
     TestSuite,
+    dynamic_conv_tolerances,
     run_activations,
     run_cross_method,
     run_edge_cases,
@@ -129,6 +132,25 @@ def test_cross_method(dtype):
     suite = _make_suite(dtype, "nchw")
     run_cross_method(suite)
     _assert_suite(suite)
+
+
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+def test_scalar_parameters_and_noncontiguous_input(layout):
+    """Conv2D accepts scalar parameters and materializes sliced inputs."""
+    torch.manual_seed(0)
+    x_base = torch.randn(1, 32, 12, 18, device="cuda", dtype=torch.float16)
+    x = x_base[..., ::2]
+    assert not x.is_contiguous()
+    w = torch.randn(48, 32, 1, 1, device="cuda", dtype=torch.float16)
+
+    y = conv2d_module.conv2d(x, w, stride=1, padding=0, dilation=1, layout=layout)
+    ref = F.conv2d(x.float(), w.float())
+    rtol, atol = dynamic_conv_tolerances(torch.float16, 32)
+    torch.testing.assert_close(y.float(), ref, rtol=rtol, atol=atol)
+    if layout == "nhwc":
+        assert y.is_contiguous(memory_format=torch.channels_last)
+    else:
+        assert y.is_contiguous()
 
 
 # -- Configuration lookup and routing (no kernel launches) -------------------
