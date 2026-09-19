@@ -3,8 +3,11 @@ import os
 import sys
 
 from _utils import (
-    config_parms_key,
+    encode_param_json,
+    get_backend,
+    get_schema,
     read_screen_file,
+    schema_name_for,
 )
 
 from aiter.ops.triton.utils._triton import arch_info
@@ -15,6 +18,15 @@ DEVICE_ARCH = arch_info.get_arch()
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("F", type=str, help="Unit test filename")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon"],
+        default=None,
+        help="Backend whose screen logs to read. Must match the --backend the "
+        "sweep ran with, since it picks the schema used to decode each "
+        "screencase row. Default: gluon on gfx1250, triton elsewhere.",
+    )
     parser.add_argument(
         "--n-list", nargs="+", type=int, help="List of N dim", default=[]
     )
@@ -53,6 +65,16 @@ def main():
     last_m_any = args.last_m_any
     max_m = args.max_m
 
+    backend = args.backend if args.backend is not None else get_backend()
+    schema = get_schema(ut_filename, backend)
+    schema_name = schema_name_for(ut_filename, backend)
+    print(f"Backend: {backend} (schema: {schema_name})")
+    print(
+        f"Copy the generated JSON into "
+        f"configs/{DEVICE_ARCH}/{backend}/gemm/<op>/ -- the two backends read "
+        f"separate directories and never fall back to each other."
+    )
+
     assert len(nlist) == len(klist), "Number of N and K must be the same"
     assert len(nlist) > 0, "No N and K dim specified"
 
@@ -83,7 +105,7 @@ def main():
         mlist = []
         m_config_map = {}
         while m <= max_m:
-            screen_filename = f"screen-{ut_filename}-{m}-{n}-{k}.log"
+            screen_filename = f"screen-{ut_filename}-{backend}-{m}-{n}-{k}.log"
             if os.path.isfile(screen_filename):
                 print(f"\tFound {screen_filename}")
                 m_config_map[m] = f"M_LEQ_{m}"
@@ -99,7 +121,7 @@ def main():
         if len(mlist) == 0:
             continue
 
-        print("M\tN\tK\tTriton (us)\tconfig")
+        print(f"M\tN\tK\t{backend.capitalize()} (us)\tconfig")
         last_config_list = None
         get_at_least_one_config = False
         with open(f"{config_json_file_prefix}-N={n}-K={k}.json", "w") as fout:
@@ -107,7 +129,7 @@ def main():
 
             for m in mlist:
                 case_data = []
-                screen_filename = f"screen-{ut_filename}-{m}-{n}-{k}.log"
+                screen_filename = f"screen-{ut_filename}-{backend}-{m}-{n}-{k}.log"
                 read_screen_file(screen_filename, case_data)
                 case_data = sorted(case_data, key=lambda x: x[0])
 
@@ -131,21 +153,21 @@ def main():
 
                 config_name = m_config_map[m]
 
+                assert len(config_list) == len(schema), (
+                    f"{screen_filename} has {len(config_list)} config columns but "
+                    f"the '{schema_name}' schema has {len(schema)}. The log was "
+                    f"probably produced with a different --backend; re-run "
+                    f"view-screen.py with the backend that sweep used."
+                )
+
                 fout.write(f"""  "{config_name}": {{\n""")
-                for i_parms_key, parms_key in enumerate(config_parms_key):
+                for i_parms_key, (parms_key, encoding) in enumerate(schema):
                     parm = config_list[i_parms_key]
+                    fout.write(
+                        f"""    "{parms_key}": {encode_param_json(parm, encoding)}"""
+                    )
 
-                    if parms_key == "cache_modifier":
-                        fout.write(
-                            """    "{}": {}""".format(
-                                parms_key,
-                                """".cg\"""" if parm == "0" else "null",
-                            )
-                        )
-                    else:
-                        fout.write(f"""    "{parms_key}": {parm}""")
-
-                    if i_parms_key != len(config_parms_key) - 1:
+                    if i_parms_key != len(schema) - 1:
                         fout.write(""",\n""")
                     else:
                         fout.write("""\n  }""")

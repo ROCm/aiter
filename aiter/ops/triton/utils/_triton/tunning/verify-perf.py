@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+from _utils import BACKEND_ENV, check_backend_allowed, get_backend
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -10,6 +12,14 @@ def parse_args():
     parser.add_argument("N", type=int, help="N dim")
     parser.add_argument("K", type=int, help="K dim")
     parser.add_argument("F", type=str, help="Unit test filename")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon"],
+        default=None,
+        help="Backend to verify. Default: gluon on gfx1250, triton elsewhere. "
+        "Must match the backend dir you copied the JSON config into.",
+    )
 
     args = parser.parse_args()
     return args
@@ -22,7 +32,11 @@ def main():
     K = args.K
     ut_filename = args.F
 
-    file_tag = f"{ut_filename}-{M}-{N}-{K}"
+    backend = args.backend if args.backend is not None else get_backend()
+    check_backend_allowed(ut_filename, backend)
+    print(f"Backend: {backend}")
+
+    file_tag = f"{ut_filename}-{backend}-{M}-{N}-{K}"
     cmd = f"""rocprofv3 --kernel-trace -f csv -o verf_{file_tag} -- python3 {ut_filename} {M} {N} {K}"""
     cmd = cmd.split(" ")
 
@@ -38,6 +52,7 @@ def main():
         process.communicate()
 
     env = os.environ.copy()
+    env[BACKEND_ENV] = backend
     process = subprocess.Popen(
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )

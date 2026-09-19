@@ -5,7 +5,103 @@ import sys
 from itertools import product
 
 import triton
-from _utils import pre_pruning_rules
+from _utils import (
+    BACKEND_ENV,
+    check_backend_allowed,
+    get_arch,
+    get_backend,
+    get_schema,
+    pre_pruning_rules,
+    schema_name_for,
+)
+
+# The gluon schemas spell the block sizes without SIZE; the legacy
+# --block-size-*-range flags still drive them so existing invocations keep
+# working across both backends.
+_BLOCK_ALIASES = {
+    "BLOCK_M": "BLOCK_SIZE_M",
+    "BLOCK_N": "BLOCK_SIZE_N",
+    "BLOCK_K": "BLOCK_SIZE_K",
+}
+
+
+def default_range(key: str, backend: str, M: int, N: int, K: int, args):
+    """Default search range for a schema key not pinned by a flag."""
+    if key in ("BLOCK_SIZE_M", "BLOCK_M"):
+        if args.block_size_m_range:
+            return list(args.block_size_m_range)
+        rng = [4, 8] if backend == "triton" else [16]
+        return rng + [v for v in (16, 32, 64, 128, 256, 512) if v <= M and v not in rng]
+    if key in ("BLOCK_SIZE_N", "BLOCK_N"):
+        if args.block_size_n_range:
+            return list(args.block_size_n_range)
+        return [16] + [v for v in (32, 64, 128, 256) if v <= N]
+    if key in ("BLOCK_SIZE_K", "BLOCK_K"):
+        if args.block_size_k_range:
+            return list(args.block_size_k_range)
+        return [128] + [v for v in (256, 512, 1024) if v <= K]
+    if key == "NUM_KSPLIT":
+        spk = [1]
+        for v in args.num_ksplit_range:
+            if K % v == 0 and v not in spk:
+                spk.append(v)
+        return spk
+    if key == "GROUP_SIZE_M":
+        return list(args.group_size_m_range)
+    if key == "num_warps":
+        if args.num_warps_range:
+            return list(args.num_warps_range)
+        # gfx1250 gluon kernels are built for 1/2/4 warps; 8 does not lower.
+        return [1, 2, 4] if backend == "gluon" else [1, 4, 8]
+    if key == "num_stages":
+        return list(args.num_stages_range)
+    if key == "waves_per_eu":
+        return list(args.waves_per_eu_range)
+    if key == "matrix_instr_nonkdim":
+        return list(args.matrix_instr_nonkdim_range)
+    if key == "cache_modifier":
+        return list(args.cache_modifier_range)
+    if key == "NUM_BUFFERS":
+        return [2, 3, 4, 5, 6, 8]
+    if key == "kernel_type":
+        return [0, 1]
+    if key in ("CTAS_M", "CTAS_N"):
+        return [1]
+    if key == "B_SCALE_TDM":
+        return [0, 1]
+    if key == "LOOP_UNROLL_FACTOR":
+        return [1, 2]
+    raise ValueError(
+        f"No default range for schema key '{key}'. Pass one with --param {key} ..."
+    )
+
+
+def build_parms(schema, backend: str, M: int, N: int, K: int, args):
+    """Search space for every key in the active schema, in schema order."""
+    overrides = {}
+    for entry in args.param:
+        assert (
+            len(entry) >= 2
+        ), f"--param needs a key and at least one value, got {entry}"
+        overrides[entry[0]] = [int(v) for v in entry[1:]]
+
+    schema_keys = [k for k, _ in schema]
+    for key in overrides:
+        if key not in schema_keys and _BLOCK_ALIASES.get(key) not in schema_keys:
+            raise AssertionError(
+                f"--param {key} is not in this schema. Keys: {schema_keys}"
+            )
+
+    parms = {}
+    for key in schema_keys:
+        if key in overrides:
+            parms[key] = overrides[key]
+        elif _BLOCK_ALIASES.get(key) in overrides:
+            parms[key] = overrides[_BLOCK_ALIASES[key]]
+        else:
+            parms[key] = default_range(key, backend, M, N, K, args)
+        assert len(parms[key]) > 0, f"Empty range for {key}"
+    return parms
 
 
 def echo_to_file(msg: str, filename: str, clear: bool = False):
@@ -27,10 +123,29 @@ def parse_args():
     parser.add_argument("G", type=int, help="GPU card ID")
     parser.add_argument("F", type=str, help="Unit test filename")
     parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend to tune. Default: gluon on gfx1250, triton elsewhere. "
+        "Selects the config schema, so it also changes which params are searched.",
+    )
+    parser.add_argument(
+        "--param",
+        action="append",
+        nargs="+",
+        metavar=("KEY", "VALUE"),
+        default=[],
+        help="Set any schema param range, e.g. --param NUM_BUFFERS 2 4 6. Encoded "
+        "params take ints: kernel_type 0='bandwidth_bound' 1='compute_bound', "
+        "cache_modifier 0='.cg' 1=null, B_SCALE_TDM 0/1. Repeatable; overrides "
+        "the matching legacy flag.",
+    )
+    parser.add_argument(
         "--block-size-m-range",
         nargs="+",
         type=int,
-        help="BLOCK_SIZE_M range",
+        help="BLOCK_SIZE_M (gluon: BLOCK_M) range",
         default=[],
     )
     parser.add_argument(
@@ -65,8 +180,8 @@ def parse_args():
         "--num-warps-range",
         nargs="+",
         type=int,
-        help="GROUP_SIZE_M range",
-        default=[1, 4, 8],
+        help="num_warps range (default: 1 2 4 for gluon, 1 4 8 for triton)",
+        default=[],
     )
     parser.add_argument(
         "--num-stages-range",
@@ -129,13 +244,9 @@ def main():
     block_size_m_range = args.block_size_m_range
     block_size_n_range = args.block_size_n_range
     block_size_k_range = args.block_size_k_range
-    num_ksplit_range = args.num_ksplit_range
-    group_size_m_range = args.group_size_m_range
-    num_warps_range = args.num_warps_range
-    num_stages_range = args.num_stages_range
-    waves_per_eu_range = args.waves_per_eu_range
-    matrix_instr_nonkdim_range = args.matrix_instr_nonkdim_range
-    cache_modifier_range = args.cache_modifier_range
+    block_size_m_range = args.block_size_m_range
+    block_size_n_range = args.block_size_n_range
+    block_size_k_range = args.block_size_k_range
 
     force_overwrite = args.overwrite
     verbose = args.verbose
@@ -153,26 +264,14 @@ def main():
         v == triton.next_power_of_2(v) for v in block_size_k_range
     ), "All possible BLOCK_SIZE_K must be power of 2"
 
-    # default m, n, k, split-k range
-    if len(block_size_m_range) == 0:
-        block_size_m_range = [4, 8]
-        possible_ms = [16, 32, 64, 128, 256, 512]
-        block_size_m_range += [v for v in possible_ms if v <= M]
-
-    if len(block_size_n_range) == 0:
-        block_size_n_range = [16]
-        possible_ns = [32, 64, 128, 256]
-        block_size_n_range += [v for v in possible_ns if v <= N]
-
-    if len(block_size_k_range) == 0:
-        block_size_k_range = [128]
-        possible_ks = [256, 512, 1024]
-        block_size_k_range += [v for v in possible_ks if v <= K]
-
-    spk_range = [1]
-    for spk in num_ksplit_range:
-        if K % spk == 0 and spk not in spk_range:
-            spk_range.append(spk)
+    backend = args.backend if args.backend is not None else get_backend()
+    arch = get_arch()
+    check_backend_allowed(ut_filename, backend, arch)
+    schema = get_schema(ut_filename, backend)
+    schema_name = schema_name_for(ut_filename, backend)
+    print(f"Arch: {arch}", flush=True)
+    print(f"Backend: {backend} (schema: {schema_name})", flush=True)
+    print()
 
     ############################################################
     # # for AFP4WFP4_GEMM_preshuffe
@@ -195,18 +294,11 @@ def main():
     # k_range = [128]
     ############################################################
 
-    parms = {
-        "BLOCK_SIZE_M": block_size_m_range,
-        "BLOCK_SIZE_N": block_size_n_range,
-        "BLOCK_SIZE_K": block_size_k_range,
-        "GROUP_SIZE_M": group_size_m_range,
-        "num_warps": num_warps_range,
-        "num_stages": num_stages_range,
-        "waves_per_eu": waves_per_eu_range,
-        "matrix_instr_nonkdim": matrix_instr_nonkdim_range,
-        "cache_modifier": cache_modifier_range,
-        "NUM_KSPLIT": spk_range,
-    }
+    # First three schema keys are the block sizes; batching and block-level
+    # exclusion below both key off config_list[0:3].
+    block_label = ", ".join(k for k, _ in schema[:3])
+
+    parms = build_parms(schema, backend, M, N, K, args)
     print("Raw tunning space:", flush=True)
     for k, v in parms.items():
         print(f"\t{k} = {v}", flush=True)
@@ -217,7 +309,7 @@ def main():
     print("Pre-pruning cases...", flush=True)
     n_case_remove = 0
     for config_list in parms_comb_list:
-        if pre_pruning_rules(M, N, K, config_list, verbose=verbose):
+        if pre_pruning_rules(M, N, K, config_list, verbose=verbose, schema=schema):
             n_case_remove += 1
             continue
         parms_comb_list_pruned.append(config_list)
@@ -225,7 +317,13 @@ def main():
     print(f"Total number of cases to run: {len(parms_comb_list_pruned)}", flush=True)
     print()
     parms_comb_list = parms_comb_list_pruned
-    file_tag = f"{ut_filename}-{M}-{N}-{K}"
+    assert len(parms_comb_list) > 0, (
+        "Every config was pruned. Widen the ranges, or check that the block "
+        "sizes fit the LDS budget at this NUM_BUFFERS."
+    )
+    # Log names are backend-qualified so a gluon sweep never overwrites a triton
+    # one for the same shape, and view-screen.py can tell them apart.
+    file_tag = f"{ut_filename}-{backend}-{M}-{N}-{K}"
     log_filename = f"screen-{file_tag}.log"
     print(f"Screening results will be output to {log_filename}", flush=True)
     print()
@@ -234,12 +332,19 @@ def main():
     ), f"{log_filename} exists, please save your file somewhere else or use --overwrite to force overwrite log files"
     s = " ".join([str(v) for v in parms])
     echo_to_file(f"Number of combinations = {len(parms_comb_list)}", log_filename, True)
+    # view-screen.py reads these two lines to decode the screencase columns.
+    echo_to_file(f"backend = {backend}", log_filename)
+    echo_to_file(f"schema = {schema_name}", log_filename)
     echo_to_file(f"{s}", log_filename)
     i_comb_start = 0
     comb_max_batch = int(os.environ.get("SCREEN_MAX_BATCH", "100"))
     date_to_file(log_filename)
     env = os.environ.copy()
     env["HIP_VISIBLE_DEVICES"] = f"{G}"
+    # The ut script reads the backend from the environment: argv is a positional
+    # stream of config ints chunked by schema length, so an extra positional
+    # there would desync parsing.
+    env[BACKEND_ENV] = backend
     exclude_mnk = {}
     while i_comb_start < len(parms_comb_list):
         skip_i_comb_start = i_comb_start
@@ -251,7 +356,7 @@ def main():
             skip_i_comb_end = i_comb_start
             i_comb_start += 1
         if skip_i_comb_end > skip_i_comb_start:
-            mnk_str = f"(BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K) = {parms_comb_list[skip_i_comb_start][:3]}"
+            mnk_str = f"({block_label}) = {parms_comb_list[skip_i_comb_start][:3]}"
             print(
                 f"Skipping case {skip_i_comb_start} ~ {skip_i_comb_end}: {mnk_str}",
                 flush=True,
@@ -266,7 +371,7 @@ def main():
         ):
             i_comb_end += 1
 
-        mnk_str = f"(BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K) = {parms_comb_list[i_comb_start][:3]}"
+        mnk_str = f"({block_label}) = {parms_comb_list[i_comb_start][:3]}"
         print(f"Running case {i_comb_start} ~ {i_comb_end - 1}: {mnk_str}", flush=True)
         echo_to_file(
             f"Running case {i_comb_start} ~ {i_comb_end - 1}: {mnk_str}", log_filename

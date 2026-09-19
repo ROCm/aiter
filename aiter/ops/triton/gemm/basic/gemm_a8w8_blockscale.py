@@ -94,6 +94,13 @@ def gemm_a8w8_blockscale(
 
     if config is None:
         config, _ = _get_config(M, N, K, backend=backend)
+    else:
+        # Work on a copy: below we add SPLITK_BLOCK_SIZE and normalise the
+        # pipeline-depth key, and callers (benchmarks, the tuning scripts) reuse
+        # one config dict across many calls. Mutating it in place would make
+        # every call after the first launch a different kernel. _get_config
+        # already hands back a fresh deep-copy.
+        config = dict(config)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -159,7 +166,12 @@ def gemm_a8w8_blockscale(
             for i in range(int(math.log2(config["num_warps"] // 2))):
                 warp_bases.append((1 << i, 0))
             extra_constexpr["warp_bases"] = tuple(warp_bases)
-            config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+            # The gfx1250 kernels take NUM_BUFFERS (pipeline depth), which is
+            # what the configs now carry. Accept the legacy num_stages spelling
+            # so a pre-rename config still runs.
+            if "num_stages" in config:
+                config["NUM_BUFFERS"] = config.pop("num_stages")
+            config.setdefault("NUM_BUFFERS", 1)
         else:
             raise AssertionError(
                 f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
@@ -288,6 +300,11 @@ def gemm_a8w8_blockscale_preshuffle(
 
     if config is None:
         config, _ = _get_config(M, N, K, True, backend=backend)
+    else:
+        # See the note in gemm_a8w8_blockscale: this function adds
+        # SPLITK_BLOCK_SIZE, pops kernel_type and normalises the pipeline-depth
+        # key, so it must not write through to a caller's reused dict.
+        config = dict(config)
 
     # Triton 3.6 fails TritonAMDGPUConvertToBufferOps for gfx950 preshuffle
     # configs with three pipeline stages. Keep the tuned tile and split-K.
@@ -379,7 +396,12 @@ def gemm_a8w8_blockscale_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
-        config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+        # The gfx1250 kernels take NUM_BUFFERS (pipeline depth), which is what
+        # the configs now carry. Accept the legacy num_stages spelling so a
+        # pre-rename config still runs.
+        if "num_stages" in config:
+            config["NUM_BUFFERS"] = config.pop("num_stages")
+        config.setdefault("NUM_BUFFERS", 1)
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 

@@ -12,7 +12,9 @@ This block of code includes APIs you need for generating input and executing GEM
 """
 ############################################################
 
-input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
+input_shape, config_list = get_input_shape_and_config_list(
+    sys.argv, shape_size=3, ut_filename=__file__
+)
 
 ############################################################
 # <import and generate input>
