@@ -164,19 +164,12 @@ jobs:
           RUN pip install --upgrade pip
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
+          # The aiter under test, and flash-attention built against it. One script, shared with
+          # the windows job, because the ORDER is the whole recipe.
           COPY . /aiter
-
-          # Install FA with the PR aiter tree in place of FA's pinned submodule.
-          RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
-              rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
-              cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
-              rm -rf /flash-attention/.git && \
-              cd /flash-attention && \
-              FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-              pip install --no-build-isolation .
-
-          # Ensure the installed aiter points at the PR checkout.
-          RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
+          ENV FA_BRANCH=${{ env.FA_BRANCH }}
+          ENV FA_REPOSITORY_URL=${{ env.FA_REPOSITORY_URL }}
+          RUN bash /aiter/.github/scripts/install_flash_attention.sh /aiter /flash-attention
 
           # Verify aiter is installed from PR branch
           RUN pip show flash-attn && pip show amd-aiter && pip show triton && \
@@ -551,18 +544,12 @@ jobs:
           pip install triton-windows
         shell: bash
 
-      - name: Install aiter
-        run: pip install -e . --no-build-isolation
-        shell: bash
-
-      - name: Install flash-attention (Triton backend)
+      - name: Install aiter and flash-attention (Triton backend)
         run: |
-          git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} "$RUNNER_TEMP/flash-attention"
-          rm -rf "$RUNNER_TEMP/flash-attention/${{ env.AITER_SUBMODULE_PATH }}"
-          cp -a . "$RUNNER_TEMP/flash-attention/${{ env.AITER_SUBMODULE_PATH }}"
-          rm -rf "$RUNNER_TEMP/flash-attention/.git"
-          cd "$RUNNER_TEMP/flash-attention"
-          BUILD_TARGET=rocm FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install --no-build-isolation --no-deps -e .
+          # Invoked through `bash` rather than executed: this job is windows-latest, where the
+          # exec bit does not survive checkout.
+          BUILD_TARGET=rocm bash .github/scripts/install_flash_attention.sh \
+            . "$RUNNER_TEMP/flash-attention" editable
         shell: bash
 
       - name: Verify FA imports aiter Triton backend
