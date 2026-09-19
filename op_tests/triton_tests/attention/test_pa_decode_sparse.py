@@ -561,6 +561,112 @@ def test_pa_decode_sparse_v4_2buff_vs_asm(T, H, kv_len):
     )
 
 
+# ---------------------------------------------------------------------------
+# DSv4 unified paged cache -- the layout vLLM's own allocator produces
+# (``fp8_ds_mla``), per paged block of ``block_size`` tokens:
+#   [0,       bs*576)         token data, 448 B fp8 NoPE | 128 B bf16 RoPE
+#   [bs*576,  bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad per token
+# Same content as the 2buff pool above, different packing: one tensor instead
+# of two, and each group scale stored ONCE rather than duplicated.
+# ---------------------------------------------------------------------------
+_V4_ROW_BYTES = _V4_DIM_NOPE + 2 * _V4_DIM_ROPE  # 576
+_V4_REC_BYTES = _V4_ROW_BYTES + _V4_NUM_TILES + 1  # 584
+
+
+def v4_pack_unified(packed_2buff, rope, block_size):
+    """2buff row + RoPE plane -> ``[nb, block_size, 584]`` uint8.
+
+    Re-lays out the SAME bytes ``v4_pack_2buff`` produced, so a kernel reading
+    either format sees identical quantized values and the two are comparable
+    exactly, not merely within a tolerance.
+    """
+    u8 = packed_2buff.view(torch.uint8)
+    p = u8.shape[0]
+    assert p % block_size == 0, f"{p} rows is not a whole number of blocks"
+    nb = p // block_size
+    device = u8.device
+
+    data = torch.cat(
+        [
+            u8[:, : _V4_DIM_NOPE],
+            rope.reshape(p, _V4_DIM_ROPE).view(torch.uint8).reshape(p, 2 * _V4_DIM_ROPE),
+        ],
+        dim=-1,
+    )  # [P, 576]
+    # 2buff stores each group's byte twice; the unified trailer stores it once.
+    scales = torch.zeros(p, _V4_NUM_TILES + 1, dtype=torch.uint8, device=device)
+    scales[:, :_V4_NUM_TILES] = u8[
+        :, _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES : 2
+    ]
+
+    cache = torch.empty(nb, block_size * _V4_REC_BYTES, dtype=torch.uint8, device=device)
+    cache[:, : block_size * _V4_ROW_BYTES] = data.reshape(
+        nb, block_size * _V4_ROW_BYTES
+    )
+    cache[:, block_size * _V4_ROW_BYTES :] = scales.reshape(
+        nb, block_size * (_V4_NUM_TILES + 1)
+    )
+    return cache.reshape(nb, block_size, _V4_REC_BYTES)
+
+
+@pytest.mark.parametrize("T", [1, 32, 512])
+@pytest.mark.parametrize("H", [16, 128])
+@pytest.mark.parametrize("kv_len", [136, 384])
+@pytest.mark.parametrize("block_size", [256, 64])
+def test_pa_decode_sparse_v4_unified_vs_2buff(T, H, kv_len, block_size):
+    """vLLM's unified paged cache against ATOM's two-buffer pool.
+
+    Both are packed from one set of KV rows, so they hold the same quantized
+    bytes and the two kernels must agree to the bit -- anything else is the
+    unified path's slot -> row addressing or its 8 -> 16 scale expansion. The
+    dense reference then pins both to the actual attention.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx1250":
+        pytest.skip("the DSv4 unified paged-cache path is gfx1250-only")
+
+    D = _V4_DIM_QK
+    # The pool is addressed by GLOBAL slot id, so it must be whole blocks.
+    pages = triton.cdiv(T * kv_len, block_size) * block_size
+    q_bf16, ukv_bf16, indices, indptr, sink, scale = _make_inputs(
+        T, H, D, kv_len, pages
+    )
+
+    kv_packed, kv_rope = v4_pack_2buff(ukv_bf16)
+    q_packed, q_rope = v4_pack_2buff(q_bf16)
+    unified = v4_pack_unified(kv_packed, kv_rope, block_size)
+
+    out_unified = pa_decode_sparse(
+        q_packed, unified, indices, indptr, sink, scale,
+        has_invalid=False, q_rope=q_rope,
+    )
+    out_2buff = pa_decode_sparse(
+        q_packed, kv_packed, indices, indptr, sink, scale,
+        has_invalid=False, unified_kv_rope=kv_rope, q_rope=q_rope,
+    )
+    torch.testing.assert_close(out_unified, out_2buff, atol=0, rtol=0)
+
+    ref = pa_decode_sparse_reference(
+        v4_unpack_2buff(q_packed, q_rope),
+        v4_unpack_2buff(kv_packed, kv_rope),
+        indices,
+        indptr,
+        sink,
+        scale,
+    )
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out_unified.to(torch.bfloat16),
+            ref.to(torch.bfloat16),
+            atol=1e-2,
+            rtol=1e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg="pa_decode_sparse v4 unified paged cache",
+        )
+        <= tol_err_ratio
+    )
 @pytest.mark.parametrize("T", [1, 32])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])

@@ -25,6 +25,9 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse_v4 as gluon_pa_decode_sparse_v4,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_v4_2buff as gluon_pa_decode_sparse_v4_2buff,
 )
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
@@ -80,6 +83,22 @@ _V4_DIM_NOPE = 448
 _V4_DIM_ROPE = 64
 _V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE  # 512, the logical head dim
 _V4_PACKED_FP8_DTYPES = (torch.float8_e4m3fn, torch.uint8)
+
+# ---------------------------------------------------------------------------
+# DSv4 unified paged cache, the layout vLLM's own allocator produces
+# (``fp8_ds_mla``; csrc/.../fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu):
+# per paged block of block_size tokens,
+#   [0,       bs*576)         token data, 448 B fp8 NoPE | 128 B bf16 RoPE
+#   [bs*576,  bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad per token
+# so a record is 584 B and the scales sit in a per-block TRAILER, not beside
+# their row. _V4_DATA_UNIT / _V4_SC_UNIT are gcd(bs*584, 576) and
+# gcd(bs*584, 8): the units that make the gather row indices integral.
+# ---------------------------------------------------------------------------
+_V4_ROW_BYTES = _V4_DIM_NOPE + 2 * _V4_DIM_ROPE  # 576
+_V4_SC_RAW = _V4_DIM_NOPE // _FP8_GROUP_SIZE + 1  # 7 real + 1 pad = 8
+_V4_REC_BYTES = _V4_ROW_BYTES + _V4_SC_RAW  # 584
+_V4_DATA_UNIT = 64
+_V4_SC_UNIT = _V4_SC_RAW
 
 
 def pa_decode_sparse(
@@ -189,6 +208,34 @@ def pa_decode_sparse(
     if not q.is_cuda:
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
 
+    # A 3-D [nb, bs, 584] uint8 cache is vLLM's own fp8_ds_mla: one tensor, no
+    # companion RoPE plane. Upstream's sparse_mla_fwd calls this format
+    # "fp8_dsv4_mla" and classifies it the same way, by record width.
+    if (
+        unified_kv_rope is None
+        and unified_kv.dim() == 3
+        and unified_kv.shape[-1] == _V4_REC_BYTES
+        and unified_kv.dtype in _V4_PACKED_FP8_DTYPES
+    ):
+        return _pa_decode_sparse_v4(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            q_rope=q_rope,
+            kv_scales=kv_scales,
+            num_warps=num_warps,
+            ctas_h=ctas_h,
+            q_tdm=q_tdm,
+            block_h=block_h,
+            kv_splits=kv_splits,
+            has_invalid=has_invalid,
+            skip_reduce=skip_reduce,
+            out=out,
+        )
+
     v4_2buff = unified_kv_rope is not None
     if v4_2buff:
         return _pa_decode_sparse_v4_2buff(
@@ -208,6 +255,7 @@ def pa_decode_sparse(
             kv_splits=kv_splits,
             has_invalid=has_invalid,
             skip_reduce=skip_reduce,
+            out=out,
         )
     if q_rope is not None:
         raise RuntimeError("q_rope requires unified_kv_rope (the DSv4 2buff path)")
@@ -843,6 +891,7 @@ def _pa_decode_sparse_v4_2buff(
     kv_splits: int | None = None,
     has_invalid: bool = True,
     skip_reduce: bool = False,
+    out: torch.Tensor | None = None,
 ):
     """gfx1250 driver for the DSv4 "2buff" packed-fp8 KV pool.
 
@@ -901,7 +950,7 @@ def _pa_decode_sparse_v4_2buff(
         f"total_indices={kv_indices.shape[0]}"
     )
 
-    out = torch.empty((T, H, D), dtype=torch.bfloat16, device=q.device)
+    out = _check_out(out, q, torch.bfloat16)
 
     # The kernel reads the packed pool as raw bytes: the E8M0 scale bytes live
     # inside the rows, and an fp8-typed tile would reinterpret them as e4m3
@@ -971,6 +1020,11 @@ def _pa_decode_sparse_v4_2buff(
         attn_num_warps = max(1, (block_h // ctas_h) // 16)
     if num_warps is not None:
         attn_num_warps = num_warps
+    # Q_IN_VGPR: keep the loop-invariant Q tile resident instead of re-reading
+    # it from LDS every K step. Gated on the warp count because that sets the
+    # VGPR budget -- num_warps 8 caps at 512/SIMD and the BLOCK_H=128 kernel
+    # already measures ~494, while num_warps <= 4 caps at 1024 against 737
+    # (BLOCK_H=16) / 604 (BLOCK_H=32), leaving room for the ~64 VGPR Q tile.
     reduce_num_warps = 1
     reduce_waves_per_eu = 4
     USE_EXP2 = True
@@ -1051,6 +1105,304 @@ def _pa_decode_sparse_v4_2buff(
         NOPE_DIM=_V4_DIM_NOPE,
         ROPE_DIM=_V4_DIM_ROPE,
         GROUP_SIZE=_FP8_GROUP_SIZE,
+        Q_IN_VGPR=(attn_num_warps <= 4),
+        HAS_INVALID=bool(has_invalid),
+        Q_TDM=bool(q_tdm),
+        USE_EXP2=USE_EXP2,
+        CTAS_H=ctas_h,
+        num_warps=attn_num_warps,
+        num_stages=2,
+        waves_per_eu=waves_per_eu,
+        num_ctas=ctas_h,
+    )
+
+    if kv_splits == 1:
+        return out
+
+    if skip_reduce:
+        return acc_partial, m_partial, l_partial
+
+    block_h_reduce = 1
+    grid_reduce = (T, triton.cdiv(H, block_h_reduce))
+    gluon_pa_decode_sparse_reduce[grid_reduce](
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        kv_indptr,
+        out,
+        m_partial.stride(0),
+        m_partial.stride(1),
+        m_partial.stride(2),
+        l_partial.stride(0),
+        l_partial.stride(1),
+        l_partial.stride(2),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_partial.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        kv_splits,
+        BLOCK_H=block_h_reduce,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        USE_EXP2=USE_EXP2,
+        num_warps=reduce_num_warps,
+        waves_per_eu=reduce_waves_per_eu,
+    )
+    return out
+def _pa_decode_sparse_v4(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    q_rope: torch.Tensor | None = None,
+    kv_scales: torch.Tensor | None = None,
+    num_warps: int | None = None,
+    ctas_h: int = 1,
+    q_tdm: bool = True,
+    block_h: int | None = None,
+    kv_splits: int | None = None,
+    has_invalid: bool = True,
+    skip_reduce: bool = False,
+    out: torch.Tensor | None = None,
+):
+    """gfx1250 driver for the DSv4 unified paged cache (vLLM ``fp8_ds_mla``).
+
+    The cache vLLM allocates for DeepSeek-V4, handed over with no repack:
+
+      kv_cache  [nb, block_size, 584] uint8, per block of block_size tokens
+        [0,      bs*576)         448 B fp8 NoPE | 128 B bf16 RoPE, per token
+        [bs*576, bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad, per token
+      q         [N, H, 512] fp8 packed    q_rope [N, H, 64] bf16
+
+    ``kv_indices`` are GLOBAL slot ids (block * block_size + position), which is
+    what the sparse top-k produces; the kernel gathers exactly those rows.
+
+    This is the format for a stock vLLM deployment. ``_pa_decode_sparse_v4_2buff``
+    is the ATOM/asm two-buffer pool; same math, different packing.
+
+    Returns ``[N, H, 512]`` bf16.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        raise RuntimeError(
+            f"the DSv4 unified paged-cache path is gfx1250-only, got {DEVICE_ARCH}"
+        )
+    if kv_scales is not None:
+        raise RuntimeError(
+            "kv_scales must be None: the UE8M0 group scales are inside the cache"
+        )
+    if kv_cache.dim() != 3:
+        raise RuntimeError(
+            f"kv_cache must be [nb, block_size, {_V4_REC_BYTES}] uint8, got "
+            f"{tuple(kv_cache.shape)}"
+        )
+    nb, block_size, rec = kv_cache.shape
+    if rec != _V4_REC_BYTES:
+        raise RuntimeError(
+            f"kv_cache records are {rec} B, expected {_V4_REC_BYTES} "
+            f"(448 fp8 NoPE | 128 B bf16 RoPE | 8 B UE8M0)"
+        )
+    if kv_cache.dtype not in _V4_PACKED_FP8_DTYPES:
+        raise RuntimeError(f"kv_cache must be uint8/e4m3 bytes, got {kv_cache.dtype}")
+    if not kv_cache.is_contiguous():
+        raise RuntimeError("kv_cache must be contiguous")
+    # gcd(bs*584, 576) = 64 and gcd(bs*584, 8) = 8 make the descriptors'
+    # row indices integral; both need block_size divisible by 8.
+    if block_size % 8:
+        raise RuntimeError(
+            f"block_size must be a multiple of 8 for the unit-strided "
+            f"descriptors, got {block_size}"
+        )
+
+    if q_rope is None:
+        raise RuntimeError("this path needs the packed fp8 Q: pass q_rope with q")
+    T, H, D = q.shape
+    assert D == _V4_DIM_QK, f"this path is fixed to D={_V4_DIM_QK}, got {D}"
+    assert q.dtype in _V4_PACKED_FP8_DTYPES, (
+        f"q must be the packed fp8 [N, H, {_V4_DIM_QK}] tensor, got {q.dtype}"
+    )
+    assert q_rope.shape == (T, H, _V4_DIM_ROPE) and q_rope.dtype == torch.bfloat16
+    assert q_rope.is_contiguous()
+
+    assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
+    assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
+
+    _LOGGER.info(
+        f"PA_DECODE_SPARSE_V4 T={T} H={H} D={D} bs={block_size} "
+        f"total_indices={kv_indices.shape[0]}"
+    )
+
+    out = _check_out(out, q, torch.bfloat16)
+
+    # The kernel reads the packed pool as raw bytes: the E8M0 scale bytes live
+    # inside the rows, and an fp8-typed tile would reinterpret them as e4m3
+    # (byte 0x7F == scale 2^0 is an e4m3 NaN). The NoPE bytes are bitcast back
+    # to e4m3 in-kernel.
+    kv_u8 = kv_cache.view(torch.uint8).reshape(-1)
+    # Three views of the same bytes: the descriptors differ only in base offset,
+    # element type and the unit their row index counts in.
+    kv_e4m3 = kv_u8.view(torch.float8_e4m3fn)
+    kv_bf16 = kv_u8.view(torch.bfloat16)
+    total_bytes = nb * block_size * _V4_REC_BYTES
+    kv_rows_data = total_bytes // _V4_DATA_UNIT
+    kv_rows_sc = total_bytes // _V4_SC_UNIT
+    q_u8 = q.view(torch.uint8)
+
+    # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
+    if block_h is None:
+        if H >= 128:
+            block_h = 128
+        elif H >= 64:
+            if T >= 2048:
+                block_h = 64
+            elif T >= 32:
+                block_h = 32
+            else:
+                block_h = 16
+        elif H >= 32:
+            block_h = 32 if T >= 256 else 16
+        else:
+            block_h = triton.next_power_of_2(H)
+    else:
+        block_h = triton.next_power_of_2(block_h)
+    block_h = max(block_h, 16)
+
+    n_head_blocks = triton.cdiv(H, block_h)
+    h_padded = n_head_blocks * block_h
+    block_d = D
+
+    block_k = 16
+    waves_per_eu = 1
+    if block_h == 128:
+        # A 64-row KV tile: now that the Q operand is streamed from LDS one K
+        # step at a time instead of held in registers, the wider tile no longer
+        # overflows the register file, and the fatter iteration amortises the
+        # accumulator rescale and the barriers over twice the work -- 64.4us vs
+        # 69.9us at kv_len=384, T=512, H=128.
+        block_k = 64
+        attn_num_warps = 8
+        max_num_wg = 256
+        # The bf16 path asks for 2 waves/EU here; the dequant pushes this
+        # kernel's register demand past that, so requesting it only costs
+        # spills (measured ~4% on T=512, H=128, kv_len=384).
+        waves_per_eu = 1
+    elif block_h == 64:
+        attn_num_warps = 4
+        max_num_wg = 256
+    elif block_h == 32:
+        attn_num_warps = 2
+        max_num_wg = 512
+    else:
+        attn_num_warps = 1
+        max_num_wg = 1024
+    if ctas_h > 1:
+        # block_h is the CLUSTER tile: each CTA owns block_h // ctas_h heads,
+        # and warps follow the per-CTA tile (16 heads -> 1 warp). The per-CTA
+        # tile may not fall below the 16-row WMMA instruction tile -- without
+        # this the compiler dies with a bare "PassManager::run failed".
+        assert not (block_h % ctas_h), f"block_h {block_h} % ctas_h {ctas_h}"
+        assert block_h // ctas_h >= 16, (
+            f"ctas_h={ctas_h} would give {block_h // ctas_h} heads per CTA for "
+            f"block_h={block_h}; the WMMA tile is 16 rows, so ctas_h must be "
+            f"<= block_h // 16 ({block_h // 16})"
+        )
+        attn_num_warps = max(1, (block_h // ctas_h) // 16)
+    if num_warps is not None:
+        attn_num_warps = num_warps
+    # Q_IN_VGPR: keep the loop-invariant Q tile resident instead of re-reading
+    # it from LDS every K step. Gated on the warp count because that sets the
+    # VGPR budget -- num_warps 8 caps at 512/SIMD and the BLOCK_H=128 kernel
+    # already measures ~494, while num_warps <= 4 caps at 1024 against 737
+    # (BLOCK_H=16) / 604 (BLOCK_H=32), leaving room for the ~64 VGPR Q tile.
+    reduce_num_warps = 1
+    reduce_waves_per_eu = 4
+    USE_EXP2 = True
+
+    if kv_splits is None:
+        max_kv_len = kv_indices.shape[0]
+        max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
+        kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
+        kv_splits = min(max_kv_splits, kv_splits)
+        kv_splits = triton.next_power_of_2(kv_splits)
+
+    _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
+    _lds_cap = max(1, _lds_budget // (block_d * 4))
+    kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
+    if kv_splits > 8:
+        reduce_num_warps = 4
+        reduce_waves_per_eu = 1
+
+    if kv_splits == 1:
+        m_partial = l_partial = acc_partial = out  # unused inside the kernel
+        mp_strides = (0, 0, 0)
+        lp_strides = (0, 0, 0)
+        ap_strides = (0, 0, 0, 0)
+    else:
+        m_partial = torch.empty(
+            (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+        )
+        l_partial = torch.empty_like(m_partial)
+        acc_partial = torch.empty(
+            (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
+        )
+        mp_strides = m_partial.stride()
+        lp_strides = l_partial.stride()
+        ap_strides = acc_partial.stride()
+
+    grid_attn = (T, n_head_blocks, kv_splits)
+    gluon_pa_decode_sparse_v4[grid_attn](
+        q,
+        q_u8,
+        q_rope,
+        kv_u8,
+        kv_e4m3,
+        kv_bf16,
+        kv_indices,
+        kv_indptr,
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        out,
+        nb * block_size,
+        q.stride(0),
+        q.stride(1),
+        q_rope.stride(0),
+        q_rope.stride(1),
+        kv_rows_data,
+        kv_rows_sc,
+        mp_strides[0],
+        mp_strides[1],
+        mp_strides[2],
+        lp_strides[0],
+        lp_strides[1],
+        lp_strides[2],
+        ap_strides[0],
+        ap_strides[1],
+        ap_strides[2],
+        ap_strides[3],
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        kv_splits,
+        float(softmax_scale),
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        NOPE_DIM=_V4_DIM_NOPE,
+        ROPE_DIM=_V4_DIM_ROPE,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        BLOCK_SIZE=block_size,
+        Q_IN_VGPR=(attn_num_warps <= 4),
         HAS_INVALID=bool(has_invalid),
         Q_TDM=bool(q_tdm),
         USE_EXP2=USE_EXP2,

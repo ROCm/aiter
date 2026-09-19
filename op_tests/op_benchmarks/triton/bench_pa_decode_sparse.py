@@ -53,10 +53,23 @@ _ASM_SHIPPED_GQA = (16, 64, 128)
 ALL_PROVIDERS = ("bf16", "fp8", "asm")
 METRICS = ("time", "bandwidth", "throughput")
 
-# DSv4-Pro: 128 Q heads per rank under dp-attention, kv_len 384 on the CSA
-# layers and 136 on the HCA layers.
+# DSv4-Pro head counts: 128 Q heads total. Under DP-attention every rank keeps
+# all 128; under pure TP they shard, so TP4 gives 32 per rank -- which is what
+# a `serve_dsv4.sh pro --tp 4` run actually executes, and what the decode grid
+# in a trace shows (heads_blocks = ceil(32/16) = 2).
+#
+# kv_len is 384 on the CSA layers (compress_ratio 4) and 136 on the HCA layers
+# (compress_ratio 128). T is the decode token count, i.e. the concurrency.
+TP4_HEADS = 128 // 4
 DEFAULT_SHAPES = [
-    (T, 128, HEAD_DIM, kv_len) for kv_len in (136, 384) for T in (1, 32, 128, 512, 1024)
+    (T, TP4_HEADS, HEAD_DIM, kv_len) for kv_len in (136, 384) for T in (16, 64)
+]
+# Wider sweep, for scaling questions rather than the production point.
+SWEEP_SHAPES = [
+    (T, H, HEAD_DIM, kv_len)
+    for kv_len in (136, 384)
+    for H in (32, 128)
+    for T in (1, 16, 64, 128, 512)
 ]
 
 
@@ -210,7 +223,8 @@ def _make_fn(provider, inp, T, H, D):
 # ---------------------------------------------------------------------------
 # Bench
 # ---------------------------------------------------------------------------
-def bench_fn(T, H, D, kv_len, provider, metric, var_len, cudagraph, rep):
+def bench_fn(T, H, D, kv_len, provider, metric, var_len, cudagraph, rep,
+             profile_dir=None):
     inp = build_inputs(T, H, D, kv_len, var_len=var_len)
     made = _make_fn(provider, inp, T, H, D)
     if made is None:
@@ -223,6 +237,33 @@ def bench_fn(T, H, D, kv_len, provider, metric, var_len, cudagraph, rep):
     except Exception as e:  # noqa: BLE001 — one bad shape must not kill the sweep
         print(f"  [{provider}] T={T} H={H} kv_len={kv_len}: {e}", file=sys.stderr)
         return float("nan")
+
+    if profile_dir:
+        # Steady-state capture: the kernel is already compiled and warm above,
+        # so the trace holds only the launches we care about.
+        import os
+
+        os.makedirs(profile_dir, exist_ok=True)
+        for _ in range(10):
+            fn()
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            with_stack=False,
+        ) as prof:
+            for _ in range(50):
+                fn()
+            torch.cuda.synchronize()
+        tag = f"{provider}_T{T}_H{H}_kv{kv_len}"
+        prof.export_chrome_trace(os.path.join(profile_dir, f"{tag}.json"))
+        top = prof.key_averages().table(
+            sort_by="self_device_time_total", row_limit=8
+        )
+        print(f"\n--- {tag} ---\n{top}", file=sys.stderr)
 
     if cudagraph:
         ms = triton.testing.do_bench_cudagraph(fn, rep=rep)
@@ -245,7 +286,9 @@ def run_benchmark(args):
     unit = {"time": "us", "bandwidth": "TB/s", "throughput": "TFLOP/s"}[args.metric]
 
     if args.shape:
-        shapes = [tuple(args.shape)]
+        shapes = [tuple(sh) for sh in args.shape]
+    elif args.sweep:
+        shapes = SWEEP_SHAPES
     else:
         shapes = DEFAULT_SHAPES
 
@@ -288,6 +331,7 @@ def run_benchmark(args):
             args.var_len,
             args.cudagraph,
             args.rep,
+            args.profile,
         )
 
     _bench.run(save_path="." if args.o else None, print_data=True)
@@ -299,12 +343,27 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Sweep T x H x kv_len instead of the TP4 production points.",
+    )
+    p.add_argument(
+        "--profile",
+        metavar="DIR",
+        default=None,
+        help="Capture a torch profiler trace of the timed region into DIR "
+        "(one file per shape/provider). Use with a single --shape and a single "
+        "--providers entry, otherwise the trace mixes launches.",
+    )
+    p.add_argument(
         "--shape",
-        type=int,
+        action="append",
         nargs=4,
+        type=int,
         metavar=("T", "H", "D", "KV_LEN"),
         default=None,
-        help="Single shape to benchmark. Default sweeps the DSv4 decode shapes.",
+        help="Shape to benchmark; repeat the flag for several. Default is the "
+        "TP4 production set (T 16/64, H 32, kv_len 136/384).",
     )
     p.add_argument(
         "--providers",
