@@ -32,6 +32,7 @@ class GemmConfigPruner:
     target_waves_per_cu: int = 8
     max_split_grid_rounds: int = 2
     max_tile_grid_ratio: int = 4
+    prune_slice_k: bool = True
 
     @staticmethod
     def _ceil_div(value, divisor):
@@ -110,6 +111,9 @@ class GemmConfigPruner:
             ):
                 kept.append(config)
 
+        if not self.prune_slice_k:
+            return kept
+
         best = {}
         keep = set()
         for index, config in sorted(
@@ -123,6 +127,27 @@ class GemmConfigPruner:
                 best[key] = occupancy
                 keep.add(index)
         return [config for index, config in enumerate(kept) if index in keep]
+
+
+def gemm_config_space(k, *, block_k=(64, 128, 256), k_waves=(1, 2), max_split_k=9):
+    """Shared HGEMM/MXFP8 axes; split count is a runtime launch parameter."""
+    split_k_candidates = [1]
+    split_k_candidates.extend(
+        split_k for split_k in range(2, max_split_k + 1) if k % split_k == 0
+    )
+    selections = {
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_k": block_k,
+        "stages": list(range(2, 10)),
+        "split_k": split_k_candidates,
+        "m_waves": [1, 2, 4],
+        "n_waves": [1, 2, 4],
+        "k_waves": k_waves,
+        "group_m": [0, 4],
+        "use_half_tile_interleaved": [False, True],
+    }
+    return selections
 
 
 def get_flydsl_a16w16_configs(
@@ -144,20 +169,7 @@ def get_flydsl_a16w16_configs(
     if out_dtype not in (dtype, torch.float32):
         return []
 
-    split_k_candidates = [1]
-    split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
-    selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [16, 32, 64, 80, 96, 128, 256],
-        "block_k": [64, 128, 256],
-        "stages": list(range(2, 10)),
-        "split_k": split_k_candidates,
-        "m_waves": [1, 2, 4],
-        "n_waves": [1, 2, 4],
-        "k_waves": [1, 2],
-        "group_m": [0, 4],
-        "use_half_tile_interleaved": [False, True],
-    }
+    selections = gemm_config_space(k)
     configs = [
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
