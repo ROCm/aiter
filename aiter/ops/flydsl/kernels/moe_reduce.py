@@ -17,6 +17,7 @@ contiguous ``X[tokens, topk, model_dim]`` tensor.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -74,6 +75,11 @@ def _moe_reduction_body(
     TILE = NTHREADS * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
 
+    # Deliberately grid-driven, not parameterised for an in-kernel caller. A
+    # megakernel cannot host this: the reduction sums the topk routes of one
+    # token, those routes belong to different experts and therefore land in
+    # different sort blocks, so it needs a grid-wide sync after GEMM2 -- which
+    # would re-impose the co-residency the merged kernel was just freed from.
     token, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
     tok64 = fx.Int64(token)
 
@@ -192,11 +198,19 @@ def _moe_reduction_body(
 
 
 def _pick_reduce_block(model_dim: int, V: int) -> int:
+    """Threads per CTA: grow until one CTA covers a whole row, then stop.
+
+    ``AITER_MOE_REDUCE_BLOCK_MAX`` caps it. That exists to answer whether the
+    reduction still beats the atomic epilogue when forced down to the 256
+    threads a hosting megakernel is pinned to -- if it does not, there is no
+    point teaching that kernel to host it.
+    """
     need = ceildiv(model_dim, V)
+    cap = int(os.environ.get("AITER_MOE_REDUCE_BLOCK_MAX", "1024"))
     block = BLOCK
-    while block < need and block < 1024:
+    while block < need and block < min(1024, cap):
         block *= 2
-    return block
+    return min(block, cap) if cap >= BLOCK else block
 
 
 @functools.lru_cache(maxsize=1024)

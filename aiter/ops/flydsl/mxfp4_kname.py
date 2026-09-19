@@ -23,6 +23,58 @@ _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
 _MXMOE_G1_PREFIX_RE = re.compile(r"^flydsl_mxmoe_g1_a(?P<a>[48])w4_")
+#: ``(BM, use_nt, inline_quant)`` triples that are compiled for each A dtype.
+#:
+#: ``(BM, use_nt, inline_quant)`` triples that are compiled for each A dtype.
+#:
+#: ``(16, True, False)`` -- BM16 on a *pre-quantized* operand -- is absent
+#: because it computes wrong numbers, with the cause **not** established.
+#:
+#: It compiles and is correct at glm5 M=8/16/64 and kimi3 M=8/16; it is wrong at
+#: glm5 M=128 (NaN) and at kimi3 M=64 paired with a reduce GEMM2 (rel_l2 0.43),
+#: in the ordinary three-kernel path, not only inside the merged kernel. NaN
+#: from garbage bytes decoded as E8M0 exponents fits an out-of-range read.
+#:
+#: The boundary is sharp and reproducible: with BM16 forced, kimi3 passes at
+#: M=8/32/128 and returns NaN from M=192 upward.
+#:
+#: Cause NOT found, after three hypotheses were tested and all three failed.
+#: Recorded so the next attempt does not re-walk them.
+#:
+#: 1. Wrong chunk index. ``issue_a_scale_load`` uses
+#:    ``chunk_base = m_row // 32``, which does put a BM16 block on chunk
+#:    ``b // 2``. Not it.
+#:
+#: 2. Odd blocks read the wrong half of their chunk. The A-scale layout is
+#:    32-row chunked and the MFMA scale selector picks which 16-row half
+#:    applies; ``mfma_cluster`` hardwires BM16 (``kMChunks == 1``) to selectors
+#:    0/2, i.e. the lower half, while BM32 uses all of 0/1/2/3. So an odd BM16
+#:    block looked like it must be reading its predecessor's scales.
+#:    **Disproved by measurement**: dumping ``moe_sorting`` output shows odd
+#:    blocks carry real rows at *every* M for kimi3 (64 of them at M=8, 448 at
+#:    M=128), and those shapes are correct. If this were the mechanism they
+#:    would fail too.
+#:
+#: 3. The over-wide buffer bound. ``_asc_per_mb`` is
+#:    ``max(BM // 32, 1) * kAS_per_chunk_dw * 4``, handing BM16 the BM32 stride
+#:    over twice the blocks -- an 8x view against BM32's designed-in 4x, which
+#:    would disable the hardware clamp on a stray read. Tightening it to the
+#:    real chunk count changed nothing: kimi3 still failed from M=192.
+#:
+#: The one hard fact to design the next experiment around: with BM16 forced,
+#: kimi3 is correct at M=8/32/128 and returns NaN from M=192 up, while the sort
+#: output (valid rows, block count, odd/even occupancy) is *identical* for
+#: M=128 and M=192 -- both 14336 valid rows in 896 blocks. So whatever changes
+#: is not the sorted layout.
+#:
+#: A note on method: an earlier round "ruled out" the odd-block hypothesis using
+#: runs that had ``AITER_TP_MEGA_PIN_BM=16`` set but a tuned CSV row present --
+#: which shadows it entirely (see ``pin_tuned_csv_path``). Those runs never
+#: exercised BM16. Redirect the CSV to a nonexistent path when probing.
+#:
+#: Worth chasing: without BM16 the FP4 wire cannot reach it and borrows a larger
+#: bucket's tuned row, measuring 1.37x on glm5 M=8 against the BF16 wire's
+#: 1.93x. Do it as its own task, with a full shape sweep.
 MXFP4_G1_VARIANTS = {
     "fp4": {
         (32, True, False),

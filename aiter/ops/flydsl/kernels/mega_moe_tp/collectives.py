@@ -48,6 +48,7 @@ from aiter.jit.utils.chip_info import get_cu_num
 
 from ..tensor_shim import _run_compiled
 from .allgather_push import (
+    AG_DESC_DONE,
     AG_DESC_EPOCH,
     PUSH_MIN_BYTES,
     PUSH_UNROLL,
@@ -204,6 +205,10 @@ class TpMoeCollectives:
         # Device-side epoch and phase-release counters keep both kernels free of
         # host state, so a captured graph replays correctly.
         ag_epoch = arena.reserve("ag_epoch", (1,), torch.int32)
+        # Local-only: a kernel that continues past the AllGather spins on this
+        # after the completing CTA publishes it. Distinct from ag_epoch, which
+        # is bumped *before* the cross-rank wait.
+        ag_done = arena.reserve("ag_done", (1,), torch.int32)
         rs_epoch = arena.reserve("rs_epoch", (1,), torch.int32)
         arena.commit()
         self.arena = arena
@@ -236,6 +241,9 @@ class TpMoeCollectives:
         self._ag_desc_host[
             ag_desc_slot(self.world_size, regions, AG_DESC_EPOCH)
         ] = int(ag_epoch.peer_ptrs[self.rank])
+        self._ag_desc_host[
+            ag_desc_slot(self.world_size, regions, AG_DESC_DONE)
+        ] = int(ag_done.peer_ptrs[self.rank])
         self._ag_source_slots = [
             desc_region_src(self.world_size, index) for index in range(regions)
         ]
@@ -245,9 +253,21 @@ class TpMoeCollectives:
         # region 0's source is the BF16 activation and the E8M0 scales are
         # produced in the kernel instead of read from a staging buffer.
         self._agq_launch = None
+        # Route-only and payload-only variants of the same push. The megakernel
+        # hosts the payload half itself, so the route has to go on the wire
+        # first and separately -- the expert sort reads it and must finish
+        # before the fused region starts.
+        self._agq_route_launch = None
+        self._agq_payload_launch = None
         if self.fp4_wire and quant_push_supported(self.model_dim, self.topk):
             self._agq_launch = compile_allgather_quant_push(
                 self.world_size, self.model_dim, self.topk
+            )
+            self._agq_route_launch = compile_allgather_quant_push(
+                self.world_size, self.model_dim, self.topk, regions="route"
+            )
+            self._agq_payload_launch = compile_allgather_quant_push(
+                self.world_size, self.model_dim, self.topk, regions="payload"
             )
 
         # -- ReduceScatter descriptor -----------------------------------------
@@ -386,9 +406,130 @@ class TpMoeCollectives:
             )
         return self._partial.local[:tokens]
 
+    def payload_views(self, total_tokens: int):
+        """The arena payload and scale slices, *without* pushing anything.
+
+        For the megakernel, which does the quantize-and-push itself: the caller
+        still has to hand GEMM1 the addresses those rows will live at, and they
+        are the same arena regions :meth:`all_gather_payload` would have filled.
+        """
+        if total_tokens > self._payload.local.shape[0]:
+            raise ValueError(
+                f"{total_tokens} tokens exceeds the payload arena "
+                f"({self._payload.local.shape[0]})"
+            )
+        return self._payload.local[:total_tokens], self._scale.local[:total_tokens]
+
+    def publish_payload_source(self, x_local, topk_ids, topk_weights) -> None:
+        """Point the descriptor at the operands a hosted push will read.
+
+        A kernel that does the push itself never calls ``all_gather_*``, so
+        nothing else writes these slots for it. Region 1 (scales) has no source
+        -- the push produces them -- but the slot still has to hold a mapped
+        address.
+        """
+        self._check_push_activation(x_local, int(x_local.shape[0]))
+        self._publish_ag_sources(
+            (
+                int(x_local.data_ptr()),
+                int(x_local.data_ptr()),
+                int(topk_ids.data_ptr()),
+                int(topk_weights.data_ptr()),
+            )
+        )
+
+    def ag_descriptor(self) -> int:
+        """Device address of the AllGather descriptor.
+
+        A kernel that hosts the push needs the same descriptor the standalone
+        push kernel reads: peer bases, region offsets, arrival counter, epoch.
+        """
+        return int(self._ag_desc.data_ptr())
+
     def quant_push_available(self) -> bool:
         """Whether this shape can quantize inside the AllGather kernel."""
         return self._agq_launch is not None
+
+    def all_gather_route(self, topk_ids, topk_weights):
+        """AllGather the routing metadata alone, ahead of everything else.
+
+        ``topk*8`` bytes per token, about 1/45 of the activation payload, and it
+        is the expert sort's only input -- so running it first lets the sort
+        finish while the activation is still being quantized and pushed. Returns
+        ``(topk_weights_all, topk_ids_all)``.
+        """
+        if self._agq_route_launch is None:
+            raise RuntimeError("this shape has no fused quantize-and-push kernel")
+        rows = self._check_push_rows(topk_ids, topk_weights)
+        # Regions 0/1 are untouched here, but every descriptor slot still has to
+        # hold a mapped address.
+        self._publish_ag_sources(
+            (
+                int(topk_ids.data_ptr()),
+                int(topk_ids.data_ptr()),
+                int(topk_ids.data_ptr()),
+                int(topk_weights.data_ptr()),
+            )
+        )
+        self._run_push(self._agq_route_launch, rows, "route")
+        total = rows * self.world_size
+        return self._weights.local[:total], self._ids.local[:total]
+
+    def all_gather_payload(self, x_local):
+        """AllGather the activation, quantizing to MXFP4 on the way out.
+
+        The payload half of :meth:`all_gather_quant`, for callers that already
+        pushed the route separately. Returns ``(payload, scale)``.
+        """
+        if self._agq_payload_launch is None:
+            raise RuntimeError("this shape has no fused quantize-and-push kernel")
+        rows = int(x_local.shape[0])
+        self._check_push_activation(x_local, rows)
+        self._publish_ag_sources(
+            (
+                int(x_local.data_ptr()),
+                int(x_local.data_ptr()),
+                int(x_local.data_ptr()),
+                int(x_local.data_ptr()),
+            )
+        )
+        self._run_push(self._agq_payload_launch, rows, "payload")
+        total = rows * self.world_size
+        return self._payload.local[:total], self._scale.local[:total]
+
+    def _check_push_rows(self, topk_ids, topk_weights) -> int:
+        rows = int(topk_ids.shape[0])
+        if rows > self.max_local_tokens:
+            raise ValueError(
+                f"local tokens {rows} exceeds max_local_tokens {self.max_local_tokens}"
+            )
+        for tensor in (topk_ids, topk_weights):
+            if not tensor.is_contiguous():
+                raise ValueError("every push source must be contiguous")
+        return rows
+
+    def _check_push_activation(self, x_local, rows: int) -> None:
+        if rows > self.max_local_tokens:
+            raise ValueError(
+                f"local tokens {rows} exceeds max_local_tokens {self.max_local_tokens}"
+            )
+        if x_local.dtype != dtypes.bf16 or not x_local.is_contiguous():
+            raise ValueError("the fused quant push needs a contiguous bf16 operand")
+        if x_local.shape != (rows, self.model_dim):
+            raise ValueError(
+                f"x_local {tuple(x_local.shape)} != ({rows}, {self.model_dim})"
+            )
+
+    def _run_push(self, launch, rows: int, regions: str) -> None:
+        units = quant_push_units(rows, self.model_dim, self.topk, regions)
+        _run_compiled(
+            launch,
+            int(self._ag_desc.data_ptr()),
+            int(self.rank),
+            int(rows),
+            self._grid(units, launch.block, 1),
+            torch.cuda.current_stream(),
+        )
 
     def all_gather_quant(self, x_local, topk_ids, topk_weights):
         """AllGather a BF16 activation, quantizing to MXFP4 on the way out.

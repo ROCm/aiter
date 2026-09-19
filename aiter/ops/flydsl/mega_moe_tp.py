@@ -97,20 +97,47 @@ _BF16_VIA_IMPL = os.environ.get("AITER_TP_MEGA_BF16_VIA_IMPL", "0") == "1"
 #: -10.8% / -5.9% / -4.8% on glm5 at 32/64/128 tokens and -5.7% on dsv3 at 32,
 #: and neutral (within +-0.3%) everywhere the gate declines. Set to 0 to pin the
 #: separate GEMM1 / GEMM2 / ReduceScatter launches.
-#: DEFAULT OFF pending a root cause: the merged kernel returns garbage
-#: (rel_l2 1.0) for fewer than 8 local rows, while 8/16/32/64/128/256 are all
-#: correct. Measured with the wire forced to bf16 so the gate applies:
+#: Restricted to the **pre-quantized (FP4) wire**, where it is correct at every
+#: local row count measured. The small-M garbage (rel_l2 1.0) that kept this off
+#: is a property of the *inline-quant* GEMM1, not of the merged kernel: forcing
+#: the BF16 wire so the inline-quant row applies gives
 #:
 #:     local rows   2      4      8      16
 #:     dsv3         0.003  1.000  0.005  0.006
 #:     glm5         1.000  1.000  0.006  0.005
 #:
-#: The shared RS tail is *not* the culprit -- it is correct at 2 local rows on
-#: the fp4 wire (dsv3 TP8 M=16, rel_l2 0.0040) -- so this is specific to the
-#: merged kernel. Gating at ">= 8" would be guessing the boundary from four
-#: points, which is the mistake already made once with the BM16 gate, so the
-#: feature is off until the mechanism is understood.
+#: while the same merged kernel on the FP4 wire is clean across all four models
+#: at local rows 1, 2, 4, 8, 16, 32, 64 and 128 (TP8, rel_l2 0.006-0.035 against
+#: the unfused path). The grid barrier and the RS tail are therefore exonerated;
+#: what remains suspect is inline quantization running inside a persistent
+#: grid-stride loop. Since the single-family path a megakernel has to serve is
+#: FP4-only, the fix is to scope the feature rather than to keep it off.
 _STAGE12 = os.environ.get("AITER_TP_MEGA_STAGE12", "0") == "1"
+#: Smallest ``local_tokens`` the merged kernel serves. 1 is measured-correct on
+#: the FP4 wire; the standalone fused ReduceScatter tail needs 2, but the merged
+#: kernel does not inherit that -- its tail runs in the same kernel as the GEMMs
+#: and does not re-read a separately published partial.
+_STAGE12_MIN_M = int(os.environ.get("AITER_TP_MEGA_STAGE12_MIN_M", "1"))
+#: Put the quantize-and-AllGather inside the merged kernel too, so the whole
+#: fusable region -- quant, AG, the A-scale shuffle, both GEMMs and the
+#: ReduceScatter -- is one launch. Requires :data:`_STAGE12`; the routing
+#: AllGather and the expert sort stay outside, because the sort reads the route
+#: and GEMM1 reads the sort.
+#:
+#: The cost is fixed, not tunable: an in-kernel collective makes every CTA wait
+#: at the arrival barrier and then continue, so the grid has to be what the
+#: device holds at once. At BM32 the standalone GEMMs run four CTAs per CU and
+#: this runs one.
+_MEGA_AG_ENV = os.environ.get("AITER_TP_MEGA_FUSE_AG", "0")
+_MEGA_AG = _MEGA_AG_ENV in ("1", "force")
+#: ``force`` runs the merged kernel wherever it is *legal*, ignoring the tuned
+#: rows' per-shape verdict. For answering "is the single kernel itself faster
+#: than the split chain" rather than "what is the fastest configuration".
+_MEGA_FORCE = _MEGA_AG_ENV == "force"
+#: Debug only: also run the standalone payload push before the megakernel, so
+#: the arena is already correct when the kernel's own push runs. Splits "the
+#: in-kernel push is wrong" from "everything after it is wrong".
+_MEGA_AG_ALSO_HOST = os.environ.get("AITER_TP_MEGA_AG_ALSO_HOST", "0") == "1"
 #: Bypass tuned lookup and pin GEMM1/GEMM2 to the two families that expose a
 #: ``_composition`` hook -- the prerequisite for one kernel covering every a4w4
 #: shape. Costs per-shape tuning; buys a single code path.
@@ -139,10 +166,12 @@ def _pinned_block_m(bucket: int) -> tuple[int, bool]:
         bm = int(_PIN_BM)
     else:
         bm = next(b for limit, b in _PIN_BM_LADDER if bucket <= limit)
-    if bm not in (32, 64, 128):
-        raise ValueError(f"pinned block_m must be 32/64/128 (fp4 prequant), got {bm}")
+    if bm not in (16, 32, 64, 128):
+        raise ValueError(
+            f"pinned block_m must be 16/32/64/128 (fp4 prequant), got {bm}"
+        )
     # (BM, use_nt, inline_quant=False) must be in MXFP4_G1_VARIANTS["fp4"];
-    # 128 is only compiled without nt.
+    # 128 is only compiled without nt, 16 only with.
     return bm, bm != 128
 
 
@@ -176,6 +205,23 @@ _PIN_TUNED_KEYS = (
 _PIN_OVERRIDE: dict | None = None
 
 
+#: Set by the tuner to force the merged-kernel decision while it A/Bs the two
+#: paths; ``None`` restores the CSV lookup.
+_MEGA_OVERRIDE: bool | None = None
+
+
+def set_mega_override(value: bool | None) -> None:
+    """Force the merged kernel on or off, or restore the per-shape lookup.
+
+    The tuner needs this because whether fusing wins is a *measured* property of
+    the shape, not a derivable one: fusing trades GPU time for host time, so it
+    pays exactly where the host side dominates, and that boundary moves with
+    both the tile and the baseline.
+    """
+    global _MEGA_OVERRIDE
+    _MEGA_OVERRIDE = value
+
+
 def set_pin_override(choice: dict | None) -> None:
     """Force one pinned config, or restore CSV/ladder lookup with ``None``.
 
@@ -193,6 +239,13 @@ def pin_tuned_csv_path() -> str:
 
     ``AITER_TP_MEGA_PIN_TUNED_CSV`` redirects it, so a tuning run can write a
     candidate file without overwriting the shipped one.
+
+    Point it at a nonexistent path to force ``pinned_default_choice``. That is
+    the only way to make ``AITER_TP_MEGA_PIN_BM`` (and anything else that feeds
+    the heuristic) actually take effect: ``_pinned_row`` resolves
+    override -> CSV -> default, so a shipped row silently wins over the env
+    knobs. Three bisection runs were read as evidence before that was noticed;
+    they had been measuring the CSV's configs the whole time.
     """
     override = os.environ.get("AITER_TP_MEGA_PIN_TUNED_CSV")
     if override:
@@ -233,6 +286,9 @@ def _load_pin_tuned(path: str, mtime: float) -> dict:
                     "block_m": int(row["block_m"]),
                     "kernel1": row["kernelName1"],
                     "kernel2": row["kernelName2"],
+                    # Absent means "allowed": a CSV written before the merged
+                    # kernel existed should not silently disable it.
+                    "mega": str(row.get("mega", "1")).strip() not in ("0", "false"),
                 }
     except FileNotFoundError:
         pass
@@ -262,7 +318,11 @@ def pinned_candidates(cfg: "MegaMoeTPConfig") -> list[dict]:
                 continue
             if n_out % g1_bn:
                 continue
-            for g1_bk in (128, 256):
+            # BK is 256 only. The composition path tolerates 128, but the
+            # ordinary GEMM1 launcher asserts ``BK==256``, and a tuned row has
+            # to be runnable on both -- the merged kernel is a per-shape opt-in,
+            # not the only consumer of these names.
+            for g1_bk in (256,):
                 if cfg.model_dim % g1_bk or cfg.model_dim // g1_bk > 32:
                     continue
                 for g2_tn in (128, 256):
@@ -635,6 +695,39 @@ class MegaMoeTP:
             return None
         return row["kernel1"], row["kernel2"], int(row["block_m"])
 
+    def _mega_allowed_by_csv(self, bucket: int) -> bool:
+        """Whether the tuned row opts this shape into the merged kernel.
+
+        Fusing costs GPU time and saves host time -- measured on kimi3 M=128,
+        the two GEMMs alone are 296 us apart and 391 us merged -- so it is a win
+        exactly where the host side dominates. Which shapes those are is not
+        predictable from the dimensions, so it is recorded per row rather than
+        guessed at runtime. A row without the column, or no row at all, allows
+        it: this must not silently turn the feature off.
+        """
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+        cfg = self.cfg
+        path = pin_tuned_csv_path()
+        try:
+            table = _load_pin_tuned(path, os.path.getmtime(path))
+        except OSError:
+            return True
+        row = table.get(
+            _pin_tuned_key(
+                gfx=get_gfx(),
+                cu_num=int(get_cu_num()),
+                tp=int(cfg.world_size),
+                token=int(bucket),
+                model_dim=int(cfg.model_dim),
+                inter_dim=int(cfg.inter_dim),
+                expert=int(cfg.experts),
+                topk=int(cfg.topk),
+                act_type=str(cfg.activation),
+            )
+        )
+        return True if row is None else bool(row["mega"])
+
     def _pinned_default(self, bucket: int):
         """Heuristic fallback: widest tile the shape divides, ladder block_m."""
         choice = pinned_default_choice(self.cfg, bucket)
@@ -713,6 +806,44 @@ class MegaMoeTP:
             return stage2_rs_supported(parse_flydsl_v2_gemm2_kernel(kernel2))
         except Exception:  # noqa: BLE001 - probe only, never fatal
             return False
+
+    def _mega_ag(self, plan) -> bool:
+        """Whether the merged kernel also hosts the quantize-and-AllGather."""
+        if not _STAGE12:
+            return False
+        if not (_MEGA_AG or _MEGA_OVERRIDE):
+            return False
+        if plan.ag_wire != "fp4_1x32":
+            return False
+        if not self._fuses_stage12(plan):
+            return False
+        if _MEGA_OVERRIDE is not None:
+            if not _MEGA_OVERRIDE:
+                return False
+        elif not (_MEGA_FORCE or self._mega_allowed_by_csv(plan.tokens)):
+            return False
+        from aiter.ops.flydsl.kernels.mega_moe_tp.allgather_quant_push import (
+            quant_push_supported,
+        )
+
+        return quant_push_supported(self.cfg.model_dim, self.cfg.topk)
+
+    def stage12_mode(self, plan, local_tokens: int) -> str:
+        """Why the merged GEMM1+GEMM2+RS kernel does or does not run.
+
+        Reported by the benchmark so a run can tell "fused" from "silently fell
+        back". A correctness gate cannot see the difference -- rel_l2 is fine
+        when nothing is fused -- so the distinction has to be printed.
+        """
+        if not _STAGE12:
+            return "off"
+        if plan.ag_wire != "fp4_1x32":
+            return "bf16-wire"
+        if not self._fuses_stage12(plan):
+            return "unsupported"
+        if local_tokens < _STAGE12_MIN_M:
+            return f"m{local_tokens}-skip"
+        return "mega" if self._mega_ag(plan) else "fused"
 
     def _resolve_plan(self, bucket: int) -> "_CasePlan":
         cfg = self.cfg
@@ -848,6 +979,23 @@ class MegaMoeTP:
             # dependency, so where the shape allows it the push kernel does the
             # quantization itself: one less launch and one less round trip
             # through the staging buffer.
+            if self._mega_ag(plan):
+                # The megakernel pushes the payload itself. Only the route goes
+                # on the wire here, because the sort runs between this call and
+                # the kernel and reads it.
+                weights_all, ids_all = comm.all_gather_route(topk_ids, topk_weights)
+                # The route push left region 0 pointing at the routing tensors;
+                # repoint it at the activation the megakernel will quantize.
+                if _MEGA_AG_ALSO_HOST:
+                    comm.all_gather_payload(x_local)
+                comm.publish_payload_source(x_local, topk_ids, topk_weights)
+                payload, scale = comm.payload_views(total)
+                return (
+                    payload.view(AQ_DTYPE),
+                    scale.view(dtypes.fp8_e8m0),
+                    weights_all,
+                    ids_all,
+                )
             if cfg.ag_quant_fuse != "off" and comm.quant_push_available():
                 gathered = comm.all_gather_quant(x_local, topk_ids, topk_weights)
                 return (
@@ -1073,7 +1221,7 @@ class MegaMoeTP:
         except Exception:  # noqa: BLE001 - probe only, never fatal
             return False
 
-    def _fused_stage12(self, plan, local_tokens, comm, g2_cfg):
+    def _fused_stage12(self, plan, local_tokens, comm, g2_cfg, base_transform=None):
         """Replace stage1+stage2 with one GEMM1+GEMM2+ReduceScatter kernel.
 
         ``stage1`` keeps its own identity and keywords -- ``fused_moe_2stages``
@@ -1081,12 +1229,21 @@ class MegaMoeTP:
         is what this path reuses -- but its ``_gemm1_launch`` hook diverts the
         launch into a dict. ``stage2`` then runs both GEMMs and the tail in one
         kernel from that dict. Returns ``(transform, box)``.
+
+        ``base_transform`` is applied first, so this composes with the MXFP4
+        wire's own metadata rewrite rather than replacing it. Without that the
+        FP4 wire would lose ``prequant=True`` and GEMM1 would try to quantize an
+        already-quantized operand.
         """
         from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import run_stage12_rs
 
         cfg = self.cfg
         box: list = [None]
         captured: dict = {}
+        mega_ag = self._mega_ag(plan)
+        # GEMM1 reads the *shuffled* scale; the kernel also needs the gathered
+        # one it shuffles from, which is the arena region the push fills.
+        raw_scale = comm.payload_views(local_tokens * cfg.world_size)[1] if mega_ag else None
 
         def capture_gemm1(**kwargs):
             captured.update(kwargs)
@@ -1125,6 +1282,10 @@ class MegaMoeTP:
                 inter_dim=w1.shape[1] // 2 if w1 is not None else cfg.inter_dim,
                 g2_cfg=g2_cfg,
                 block_m=block_m,
+                ag_desc_ptr=comm.ag_descriptor() if mega_ag else 0,
+                ascale_raw=raw_scale if mega_ag else None,
+                topk=cfg.topk,
+                fuse_ag=mega_ag,
             )
             return moe_out
 
@@ -1132,12 +1293,13 @@ class MegaMoeTP:
         stage2_partial = functools.partial(stage2, kernelName2=plan.gemm2_kernel)
 
         def transform(metadata):
+            base = metadata if base_transform is None else base_transform(metadata)
             stage1 = functools.partial(
-                metadata.stage1.func,
-                **metadata.stage1.keywords,
+                base.stage1.func,
+                **base.stage1.keywords,
                 _gemm1_launch=capture_gemm1,
             )
-            return replace(metadata, stage1=stage1, stage2=stage2_partial)
+            return replace(base, stage1=stage1, stage2=stage2_partial)
 
         return transform, box
 
@@ -1172,10 +1334,12 @@ class MegaMoeTP:
         # fused tail comes for free. So this is the right default for eager
         # execution and the wrong one under graphs -- revisit if this layer is
         # deployed captured. ``AITER_TP_MEGA_BF16_VIA_IMPL=1`` flips it.
-        # The merged GEMM1+GEMM2+RS kernel only exists for the BM16 inline-quant
-        # pair, which lives on this wire -- so taking it is what makes the wire
-        # worth routing through the hookable entry point despite its host cost.
-        fuse12 = _STAGE12 and a1_scale is None and self._fuses_stage12(plan)
+        # The merged GEMM1+GEMM2+RS kernel takes the *pre-quantized* wire only.
+        # ``run_stage12_rs`` is wire-agnostic and the BF16 wire does reach it,
+        # but that is where the small-M garbage lives (see ``_STAGE12``), so it
+        # is excluded until the inline-quant path is understood. No loss for the
+        # single-family direction: that path is FP4 at every shape.
+        fuse12 = _STAGE12 and a1_scale is not None and self._fuses_stage12(plan)
         if a1_scale is None and not (_BF16_VIA_IMPL or fuse12):
             return (
                 fused_moe(
@@ -1207,7 +1371,7 @@ class MegaMoeTP:
             # row instead of whatever the lookup inside _fused_moe_impl finds.
             borrowed = replace(plan.metadata, prequant=True)
             transform = lambda _metadata: borrowed  # noqa: E731
-        if fuse12 and local_tokens > 1:
+        if fuse12 and local_tokens >= _STAGE12_MIN_M:
             from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
             stage12_transform, box = self._fused_stage12(
@@ -1215,6 +1379,7 @@ class MegaMoeTP:
                 local_tokens,
                 self._collectives(plan.ag_wire),
                 parse_flydsl_v2_gemm2_kernel(plan.gemm2_kernel),
+                base_transform=transform,
             )
             partial = _fused_moe_impl(
                 a1,
@@ -1267,6 +1432,77 @@ class MegaMoeTP:
             **kwargs,
         )
         return partial, (box[0] if box is not None else None)  # None -> caller RS
+
+    # -- hoisted expert sort ------------------------------------------------
+    def sort(self, topk_weights_all, topk_ids_all, plan: "_CasePlan"):
+        """Run the expert sort as its own step, ahead of the fused region.
+
+        The sort reads only the routing metadata -- ``topk*8`` bytes per token,
+        about 1/45 of the activation payload -- so it does not belong behind the
+        payload AllGather, and it is not a fusion candidate either: it is four
+        kernels of counting sort that ``fused_moe_2stages`` already accepts as
+        plain arguments. Hoisting it is therefore a call-site change, and it is
+        what makes the fused region exactly ``quant -> AG -> GEMM1 -> GEMM2 ->
+        RS``.
+
+        Returns the 7-tuple ``(sorted_ids, sorted_weights, sorted_expert_ids,
+        num_valid_ids, moe_buf, m_indices, reverse_sorted)``; the last two are
+        ``None`` unless the GEMM1 family asked for the Opus aux outputs.
+        """
+        from aiter.fused_moe import moe_sorting
+
+        cfg = self.cfg
+        metadata = plan.metadata
+        if metadata is None:
+            raise ValueError("the hoisted sort needs a resolved tuned row")
+        total = int(topk_ids_all.shape[0])
+        # The atomic epilogue accumulates into this buffer so the sort has to
+        # zero it; the reduce epilogue stages its own intermediate instead.
+        accumulate = self._plan_accumulate(plan)
+        if metadata.output_aux:
+            return moe_sorting(
+                topk_ids_all,
+                topk_weights_all,
+                cfg.experts,
+                cfg.model_dim,
+                dtypes.bf16,
+                metadata.block_m,
+                accumulate=accumulate,
+                output_aux=metadata.output_aux,
+                output=self._collectives(plan.ag_wire).partial_buffer(total),
+            )
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid, moe_buf = moe_sorting(
+            topk_ids_all,
+            topk_weights_all,
+            cfg.experts,
+            cfg.model_dim,
+            dtypes.bf16,
+            metadata.block_m,
+            accumulate=accumulate,
+            flat=getattr(metadata, "flat", False),
+            output=self._collectives(plan.ag_wire).partial_buffer(total),
+        )
+        return (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid,
+            moe_buf,
+            None,  # m_indices      -- Opus aux only
+            None,  # reverse_sorted -- Opus aux only
+        )
+
+    @staticmethod
+    def _plan_accumulate(plan: "_CasePlan") -> bool:
+        """Whether GEMM2's epilogue accumulates into the sort's output buffer.
+
+        Same rule ``_fused_moe_impl`` applies internally, reused rather than
+        re-derived so a hoisted sort cannot disagree with an inline one about
+        whether the buffer needs zeroing.
+        """
+        from aiter.fused_moe import stage2_uses_route_reduce
+
+        return not stage2_uses_route_reduce(plan.metadata.stage2)
 
     def reduce_scatter(self, local_tokens: int, plan: "_CasePlan"):
         """Sum the per-rank partials across TP and keep this rank's token shard."""

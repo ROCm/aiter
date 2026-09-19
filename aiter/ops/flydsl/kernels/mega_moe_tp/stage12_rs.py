@@ -13,10 +13,19 @@ to a single one. Neither GEMM is reimplemented: both come from the
 :func:`~..mxmoe_dispatcher.compile_gemm2_a4w4_port`), so the tuned tiles are
 emitted verbatim.
 
-    phase 1   persistent grid-stride over GEMM1 tiles -> sorted FP4 intermediate
-    -- grid-wide barrier, agent-scope release/acquire --
-    phase 2   persistent grid-stride over GEMM2 tiles -> arena partial
+    one CTA per sort block:
+        its ``g1_n_blocks`` GEMM1 tiles   -> that block's FP4 intermediate
+        -- s_waitcnt + workgroup barrier --
+        its ``G2_N_BLOCKS`` GEMM2 tiles   -> arena partial
     tail      the shared ReduceScatter tail from :mod:`.rs_tail`
+
+No grid-wide barrier: GEMM2's row block reads only the GEMM1 output of the same
+row block, because each GEMM1 n-tile pairs its gate slice with the matching up
+slice and writes ``BN//2`` intermediate columns, so one row block's tiles cover
+its intermediate exactly. Dropping the barrier also drops the requirement that
+every CTA be resident, which had capped the launch at one CTA per CU; GEMM1 uses
+32.5 KB of LDS at BM32 against 160 KB per CU on gfx950, so that cost a factor of
+four in occupancy against the standalone kernels.
 
 Why this pair and not any pair
 ------------------------------
@@ -27,14 +36,10 @@ onto. :func:`stage12_supported` checks that rather than assuming it. LDS is the
 union of the two (16640 B and 8192 B for kimi3 BM16), allocated once and handed
 to both, since the phases are disjoint.
 
-The grid is persistent and sized to what the device holds at once: the
-barrier between phases makes that a correctness requirement, not a tuning
-choice.
-
-The handoff needs a real agent-scope release/acquire, not the bare
-``s_waitcnt`` the RS tail uses -- MI355X L2 is per-XCD, so GEMM1's stores are
-not visible to a GEMM2 tile on another XCD without it. See
-:func:`~.rs_tail.emit_phase_barrier`.
+The handoff is a bare ``s_waitcnt`` plus a workgroup barrier. The agent-scope
+release/acquire the two-phase version needed was there because MI355X L2 is
+per-XCD and a GEMM2 tile could land on a different XCD than the GEMM1 tile that
+fed it; with producer and consumer now in the same CTA that cannot happen.
 """
 
 # NOTE: no ``from __future__ import annotations`` here. It would turn the
@@ -48,12 +53,14 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr, gpu, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
 from ..mxfp4_gemm1 import compile_gemm1_a4w4_port
 from ..mxfp4_gemm_common import _udiv, _umod, global_typed_ptr
-from ..mxmoe_dispatcher import _spart_output_tile_index, compile_gemm2_a4w4_port
+from .. import communication_ops_utils as comm
+from .p2p import desc_slot
+from ..mxmoe_dispatcher import compile_gemm2_a4w4_port
 from ..tensor_shim import _run_compiled as run_compiled
 from .reduce_scatter import MAX_SERVICE_BLOCKS, RS_UNIT_ELEMS
 from .rs_tail import emit_phase_barrier, emit_rs_tail, read_epoch, rs_tail_slots
@@ -64,17 +71,87 @@ _BLOCK = 256
 _SERVICE_BLOCKS = min(
     MAX_SERVICE_BLOCKS, int(os.environ.get("AITER_TP_STAGE12_RS_SERVICE", "128"))
 )
-#: CTAs to launch. The inter-phase barrier requires every CTA resident, so this
-#: is the device's CU count rather than the tile count.
+#: Override the CTA count. The default is one CTA per sort block; this exists to
+#: A/B that against the old persistent grid, which was pinned to the CU count
+#: because the inter-phase barrier required every CTA resident.
 _GRID_CU = int(os.environ.get("AITER_TP_STAGE12_GRID", "0"))
+#: Run the in-kernel A-scale shuffle. Whether GEMM1 wants the gathered scale in
+#: token order or in sorted+swizzled order decides this, and the two differ by a
+#: whole kernel, so it is a knob until measured rather than an assumption.
+_ASCALE_SHUFFLE = os.environ.get("AITER_TP_MEGA_ASCALE_SHUFFLE", "1") == "1"
 
 
-def _grid_ctas() -> int:
-    if _GRID_CU > 0:
-        return _GRID_CU
-    from aiter.jit.utils.chip_info import get_cu_num
+def _mx_scale_shuffle_idx(scaleN_pad: int, x, y):
+    """Byte offset of scale column ``y`` of sorted row ``x`` in GEMM1's layout.
 
-    return int(get_cu_num())
+    Port of ``aiter::mx_scale_shuffle_idx`` (csrc/include/mx_quant_utils.h).
+
+    ``y`` may be a Python int or a runtime value; when it is an int the whole
+    column term folds to a constant. Getting that wrong is silent -- the kernel
+    still runs, it just scatters to the wrong bytes -- so the two forms are
+    written out rather than left to duck typing.
+    """
+    row_term = (
+        _udiv(x, fx.Int32(32)) * fx.Int32(scaleN_pad * 32)
+        + _umod(x, fx.Int32(16)) * fx.Int32(4)
+        + _udiv(_umod(x, fx.Int32(32)), fx.Int32(16))
+    )
+    if isinstance(y, int):
+        return row_term + fx.Int32((y // 8) * 256 + (y % 4) * 64 + (y % 8) // 4 * 2)
+    return (
+        row_term
+        + _udiv(y, fx.Int32(8)) * fx.Int32(256)
+        + _umod(y, fx.Int32(4)) * fx.Int32(64)
+        + _udiv(_umod(y, fx.Int32(8)), fx.Int32(4)) * fx.Int32(2)
+    )
+
+
+@flyc.jit
+def emit_ascale_shuffle(
+    arg_scale_in,
+    arg_scale_out,
+    arg_stids,
+    arg_num_valid,
+    i32_ntok,
+    gid,
+    stride,
+    total_sorted,
+    *,
+    scale_per_row: int,
+    scaleN_pad: int,
+):
+    """Reorder the gathered E8M0 scales into the layout GEMM1 reads.
+
+    ``fused_moe_2stages`` runs this as ``mxfp4_moe_sort_fwd`` between the
+    AllGather and the GEMMs, because it needs both: the gathered scales and the
+    sort. That makes it part of the fused region -- the chain is really
+    ``quant -> AG -> scale shuffle -> GEMM1 -> GEMM2 -> RS`` -- so a single
+    kernel has to host it too.
+
+    ``topk`` is 1 on this path (``mxfp4_moe_sort_fwd`` does not forward one), so
+    the source row is just the token id; the per-slot ``token*topk + slot``
+    addressing of the C++ kernel does not apply here.
+    """
+    src = global_typed_ptr(arg_scale_in, T.i8, align=1)
+    dst = global_typed_ptr(arg_scale_out, T.i8, align=1)
+    num_valid = global_typed_ptr(arg_num_valid, T.i32)[0]
+    for raw in range(gid, total_sorted, stride):
+        row = fx.Int32(raw)
+        # Rows past the sort's valid count are padding: the reference leaves
+        # them untouched, so they must stay untouched here as well.
+        if row < num_valid:
+            info = global_typed_ptr(arg_stids, T.i32)[row]
+            token = info & fx.Int32(0xFFFFFF)
+            if token < i32_ntok:
+                base = token * fx.Int32(scale_per_row)
+                # Runtime loop, not ``range_constexpr``. Fully unrolling it
+                # means 112-224 live byte loads depending on model_dim, and this
+                # code shares a register budget with both GEMMs and the RS tail:
+                # the kernel's occupancy is the worst point in it, so an
+                # unrolled copy loop here costs CTAs per CU everywhere else.
+                for col in range(fx.Int32(0), fx.Int32(scale_per_row), fx.Int32(1)):
+                    c = fx.Int32(col)
+                    dst[_mx_scale_shuffle_idx(scaleN_pad, row, c)] = src[base + c]
 
 
 def stage12_supported(g1_cfg, g2_cfg, model_dim: int) -> bool:
@@ -91,7 +168,44 @@ def stage12_supported(g1_cfg, g2_cfg, model_dim: int) -> bool:
         return False
     if int(g1_cfg.get("num_waves", 4)) * int(g1_cfg.get("k_wave", 1)) * 64 != _BLOCK:
         return False
+    # BM16 is excluded from the merged kernel, not from the layer. It is correct
+    # in the three-kernel path at every shape tested, and correct *here* at
+    # glm5 M=8/16/64 and kimi3 M=8/16 -- but glm5 M=128 returns NaN and kimi3
+    # M=64 paired with a reduce GEMM2 returns rel_l2 0.43. The pattern is not
+    # understood, and the BM16 output scale layout
+    # (``native_scale_layout_for(16, "fp4")`` is True) is the obvious suspect:
+    # this kernel reuses one LDS region across phases and drives GEMM2 from the
+    # same CTA, neither of which the standalone pair does. Gating on "the cases
+    # that happened to pass" is how the BM16 bug got shipped once already.
+    if int(g1_cfg.get("BM", 0)) == 16:
+        return False
+    # ``reduce`` is excluded on a dependency argument, not a to-do.
+    #
+    # That epilogue stages per-route rows and needs a reduction afterwards, and
+    # the reduction sums the topk routes of one token. Those routes go to
+    # different experts, so they land in different sort blocks -- meaning no CTA
+    # holds all of any token's routes and the reduction needs a grid-wide sync
+    # after GEMM2. This kernel is free of grid-wide syncs precisely so its grid
+    # can exceed what the device holds at once; adding one back costs more than
+    # the coverage is worth, and the ``reduce`` rows are the large-M ones where
+    # grid parallelism matters most.
+    #
+    # Block size is *not* the obstacle, contrary to an earlier reading here:
+    # capping the reduction at 256 threads measured 1.00-1.06x against its
+    # natural 512/1024 on the six cells that use it.
+    #
+    # Forcing those shapes onto ``atomic`` is not free either -- the tuner picks
+    # ``reduce`` at large M because it wins (kimi3 M=32768: 3690 us vs 5274 us).
     if g2_cfg.get("epilog") != "atomic" or g2_cfg.get("persist"):
+        return False
+    # One CTA owns one sort block through both GEMMs, so the two tile_m must
+    # agree -- a GEMM2 tile narrower than the GEMM1 block would read rows this
+    # CTA did not produce.
+    if int(g2_cfg.get("tile_m", 0)) != int(g1_cfg.get("BM", -1)):
+        return False
+    # ``spart`` re-orders the flattened (m, n) output space; with m owned by the
+    # CTA and n walked inside it there is no flattened space left to re-order.
+    if g2_cfg.get("spart"):
         return False
     return True
 
@@ -130,6 +244,8 @@ def compile_stage12_rs(
     INTER_MAX: int,
     a_dtype: str,
     b_dtype: str,
+    topk: int = 0,
+    fuse_ag: bool = False,
     service_blocks: int = _SERVICE_BLOCKS,
 ):
     """Build the fused GEMM1 + GEMM2 + ReduceScatter launcher for one row pair."""
@@ -141,10 +257,7 @@ def compile_stage12_rs(
     if g2_spart is None:
         g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
     g2_spart = int(g2_spart)
-    g2_group_num = g2_spart // 100 if g2_spart > 0 else 0
-    g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
     tail_slots = rs_tail_slots(tp_size)
-    grid_ctas = _grid_ctas()
 
     # -- collect the GEMM1 tile emitter ----------------------------------
     g1: dict = {}
@@ -182,12 +295,60 @@ def compile_stage12_rs(
     g1_n_blocks = int(g1["n_blocks"])
     g1_lds_bytes = int(g1["lds_bytes"])
 
+    # -- optionally pull the quantize-and-push AllGather in front ----------
+    ag: dict = {}
+    if fuse_ag:
+        from .allgather_quant_push import (
+            compile_allgather_quant_push,
+            quant_push_supported,
+        )
+
+        if not quant_push_supported(model_dim, topk):
+            raise ValueError(
+                f"model_dim={model_dim} topk={topk} has no fused quant push, so "
+                "the AllGather cannot move into this kernel"
+            )
+        compile_allgather_quant_push(
+            tp_size,
+            model_dim,
+            topk,
+            block=_BLOCK,
+            _composition=lambda **hook: ag.update(hook),
+        )
+
     # -- build the merged kernel inside the GEMM2 composition -------------
+    emit_quant_payload_push = ag.get("emit_quant_payload_push")
+    emit_ag_barrier = ag.get("emit_ag_barrier")
+    emit_ag_gate = ag.get("emit_ag_gate")
+    # Every push goes to the lowest ``PUSH_CTAS`` block ids. Workgroups are
+    # dispatched in increasing id order, so those are the ones guaranteed to be
+    # resident -- which means the grid above them can be as large as we like and
+    # a queued CTA never starves the push it is waiting on. Without this the
+    # grid is capped at the CU count, and that cap is expensive: the same GEMM
+    # work measured 391 us at one CTA per sort block against 533 us at 256.
+    push_ctas = 0
+    if fuse_ag:
+        from aiter.jit.utils.chip_info import get_cu_num as _cu
+
+        push_ctas = int(_cu())
+    if fuse_ag:
+        from .allgather_push import AG_DESC_DONE, AG_DESC_EPOCH
+        from .p2p import desc_size as _p2p_desc_size
+
+        ag_done_index = _p2p_desc_size(tp_size, 4) + AG_DESC_DONE
+        assert AG_DESC_EPOCH == AG_DESC_DONE - 1  # the -1 read above
+    else:
+        ag_done_index = 0
+
     def g2_compose(*, module_name, emit_gemm2_tile, shared_storage, lds_bytes, **_):
         merged_lds = max(int(lds_bytes), g1_lds_bytes)
+        # model_dim and g2_BN are both compile-time here, so the GEMM2 n-block
+        # count is too -- which lets the inner loop be unrolled instead of
+        # re-deriving the bound from i32_hidden on every row block.
+        G2_N_BLOCKS = int(model_dim) // int(g2_BN)
         name = (
-            f"mega_moe_tp_stage12_rs_tp{tp_size}_h{model_dim}"
-            f"_g1bm{g1_BM}_g2bm{g2_BM}x{g2_BN}_sv{service_blocks}"
+            f"mega_moe_tp_{'mega' if fuse_ag else 'stage12'}_rs_tp{tp_size}"
+            f"_h{model_dim}_g1bm{g1_BM}_g2bm{g2_BM}x{g2_BN}_sv{service_blocks}"
         )
 
         @fx.struct
@@ -223,6 +384,9 @@ def compile_stage12_rs(
             arg_desc: fx.Int64,
             i32_rank: fx.Int32,
             i32_rows: fx.Int32,
+            arg_ag_desc: fx.Int64,
+            arg_ascale_raw: fx.Int64,
+            i32_max_sorted: fx.Int32,
         ):
             tx_i32 = fx.Int32(gpu.thread_id("x"))
             bx_i32 = fx.Int32(gpu.block_id("x"))
@@ -232,21 +396,92 @@ def compile_stage12_rs(
             lds = fx.SharedAllocator().allocate(MergedStorage).peek()
             lds_raw = lds.buf.ptr
 
+            # Read at kernel entry, before anything can bump it -- and before
+            # the AllGather, because its gate uses this value. The AllGather's
+            # own epoch cannot serve: it is bumped mid-kernel, so a CTA the
+            # hardware dispatched late reads the bumped value and waits for one
+            # more than will ever be published.
             epoch_addr, epoch = read_epoch(arg_desc, tail_slots)
+
+            # -- quantize this rank's rows and AllGather them ----------------
+            #
+            # This is where the kernel stops being a GEMM and becomes the whole
+            # fused region: quant -> AG -> GEMM1 -> GEMM2 -> RS. The routing
+            # AllGather and the expert sort ran before the launch, because the
+            # sort reads the route and GEMM1 reads the sort.
+            #
+            # The barrier below is why this grid has to be persistent. Every CTA
+            # continues into GEMM1 afterwards, so every CTA waits here, and a
+            # waiting CTA holds its slot; if the grid were larger than what the
+            # device holds at once, the CTAs still queued would be the ones
+            # whose push nobody is waiting for, and the wait would never end.
+            # The standalone push does not have this problem only because its
+            # CTAs exit at the barrier instead of going on.
+            if fuse_ag:
+                ag_epoch0 = epoch
+                # Clamp to the actual grid: a shape whose sort blocks number
+                # fewer than the CU count would otherwise have the barrier wait
+                # for arrivals from CTAs that do not exist. glm5 at M=16 is 254
+                # blocks against 256 CUs, so this is not a corner case.
+                n_push = fx.min(fx.Int32(push_ctas), grid_nb)
+                if bx_i32 < n_push:
+                    emit_quant_payload_push(
+                        arg_ag_desc,
+                        i32_rank,
+                        i32_rows,
+                        bx_i32,
+                        bx_i32 * fx.Int32(_BLOCK) + tx_i32,
+                        n_push * fx.Int32(_BLOCK),
+                    )
+                    emit_ag_barrier(
+                        arg_ag_desc,
+                        i32_rank,
+                        n_push,
+                        tx_i32,
+                        entry_epoch=ag_epoch0,
+                    )
+                # Pushers fall through already satisfied; the rest wait here.
+                emit_ag_gate(arg_ag_desc, ag_epoch0, tx_i32)
+
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
 
-            # -- phase 1: GEMM1 ---------------------------------------------
+            # -- GEMM1 then GEMM2 ------------------------------------------
+            #
+            # Two shapes, picked by whether the AllGather lives in this kernel.
+            #
+            # ``fuse_ag=0``: one CTA owns one sort block and runs that block's
+            # GEMM1 tiles then its GEMM2 tiles. GEMM2's row block reads only the
+            # GEMM1 output of the *same* row block -- each GEMM1 n-tile pairs
+            # its gate slice with the matching up slice and writes ``BN//2``
+            # intermediate columns, so one row block's tiles cover its
+            # intermediate exactly -- so no grid-wide barrier is needed, and the
+            # launch is free to be one CTA per sort block at full occupancy.
+            #
+            # ``fuse_ag=1``: the AllGather barrier already forces every CTA to be
+            # resident, so the grid is the CU count no matter what. Owning a
+            # whole sort block then balances badly: at ~430 blocks over 256 CTAs
+            # some CTAs get two and some get one, a 2x tail. Walking the
+            # flattened (m, n) tile space instead gives ~40 tiles per CTA, and
+            # the phase barrier it needs is free here -- co-residency is already
+            # a precondition, not a new cost.
             g1_total_m = _udiv(cumsum0, g1_BM)
-            g1_bound = g1_total_m * fx.Int32(g1_n_blocks)
             _NXCD = 8
-            _xq = _udiv(g1_bound, _NXCD)
-            _xr = _umod(g1_bound, _NXCD)
+            _xq = _udiv(g1_total_m, _NXCD)
+            _xr = _umod(g1_total_m, _NXCD)
 
-            def _g1_tile(pid):
+            def _g1_flat_tile(pid, bound):
+                """XCD-round-robin over the flattened (m, n) GEMM1 tile space.
+
+                The tuned swizzle GEMM1 ships; reproduced here because the
+                flattened branch walks the same space the standalone kernel
+                does.
+                """
                 if const_expr(g1_xcd_swizzle <= 0):
                     return pid
+                xq = _udiv(bound, _NXCD)
+                xr = _umod(bound, _NXCD)
                 xc = _umod(pid, _NXCD)
-                wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
+                wgid = xc * xq + fx.min(xc, xr) + _udiv(pid, _NXCD)
                 ng = fx.Int32(g1_xcd_swizzle * g1_n_blocks)
                 group_id = wgid // ng
                 first_pid_m = group_id * fx.Int32(g1_xcd_swizzle)
@@ -257,70 +492,186 @@ def compile_stage12_rs(
                 n_block = wig // group_size_m
                 return m_block * fx.Int32(g1_n_blocks) + n_block
 
-            for raw in range(bx_i32, g1_bound, grid_nb):
-                # Unconditional: this is a runtime loop, so a Python-level
-                # "skip the first iteration" flag would be evaluated once at
-                # trace time and emit nothing. The extra barrier on iteration
-                # zero is harmless; reusing LDS across iterations is not.
-                gpu.barrier()
-                emit_gemm1_tile(
-                    arg_aq,
-                    arg_ascale,
-                    arg_w1,
-                    arg_w1_scale,
-                    arg_eids,
-                    arg_mind,
-                    arg_aqout,
-                    arg_ascaleout,
-                    arg_hidden,
-                    arg_bias1,
-                    _g1_tile(fx.Int32(raw)),
-                    lane,
-                    wave,
-                    i32_ntok,
-                    g1_total_m,
-                    lds_raw,
-                )
+            def _m_block(pid):
+                """Spread consecutive row blocks across XCDs, as GEMM1 does.
 
-            # -- handoff -----------------------------------------------------
-            emit_phase_barrier(
-                arg_desc, epoch, bx_i32, grid_nb, tx_i32, tp_size=tp_size
-            )
+                The tuned swizzle permutes the flattened (m, n) tile space; with
+                n handled inside the CTA there is only m left to permute, so this
+                is the same round-robin restricted to that axis.
+                """
+                if const_expr(g1_xcd_swizzle <= 0):
+                    return pid
+                xc = _umod(pid, _NXCD)
+                return xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
 
-            # -- phase 2: GEMM2 ----------------------------------------------
-            num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(g2_BN))
-            g2_total_m = _udiv(cumsum0, g2_BM)
-            g2_bound = g2_total_m * num_n_blocks
-            for raw2 in range(bx_i32, g2_bound, grid_nb):
-                gpu.barrier()
-                unit = fx.Int32(raw2)
-                if const_expr(g2_spart > 0):
-                    m_block_idx, n_block_idx = _spart_output_tile_index(
-                        unit, g2_total_m, num_n_blocks, g2_group_num, g2_m01
+            if _GRID_CU > 0:
+                # Flattened tile space, one grid-stride loop per phase. Legal
+                # only when the grid is forced persistent: the phase barriers
+                # below require every CTA resident.
+                if _ASCALE_SHUFFLE:
+                    emit_ascale_shuffle(
+                        arg_ascale_raw,
+                        arg_ascale,
+                        arg_stids,
+                        arg_cumsum,
+                        i32_ntok,
+                        bx_i32 * fx.Int32(_BLOCK) + tx_i32,
+                        grid_nb * fx.Int32(_BLOCK),
+                        i32_max_sorted,
+                        scale_per_row=model_dim // 32,
+                        scaleN_pad=((model_dim // 32 + 7) // 8) * 8,
                     )
-                else:
-                    m_block_idx = _udiv(unit, num_n_blocks)
-                    n_block_idx = unit - m_block_idx * num_n_blocks
-                emit_gemm2_tile(
-                    arg_aqout,
-                    arg_ascaleout,
-                    arg_w2,
-                    arg_w2_scale,
-                    arg_eids,
-                    arg_stids,
-                    arg_sweights,
-                    arg_bias2,
-                    arg_out,
-                    m_block_idx,
-                    n_block_idx,
-                    lane,
-                    wave,
-                    i32_M,
-                    i32_max_m_blocks,
-                    i32_inter,
-                    i32_hidden,
-                    lds,
+                    # Grid-strided, so a CTA reads rows another CTA wrote: this
+                    # needs the same grid-wide release/acquire as the GEMM1
+                    # handoff below, not a workgroup barrier.
+                    # Two barriers in one launch need two gate values: the gate
+                    # is ``spin_until_ge(gate, epoch)``, so reusing one epoch
+                    # makes the second call pass straight through. 2*e+1 and
+                    # 2*e+2 stay monotone across launches and are never 0, which
+                    # a zero-initialised gate would satisfy for free.
+                    emit_phase_barrier(
+                        arg_desc,
+                        fx.Int32(2) * epoch + fx.Int32(1),
+                        bx_i32,
+                        grid_nb,
+                        tx_i32,
+                        tp_size=tp_size,
+                    )
+                g1_bound = g1_total_m * fx.Int32(g1_n_blocks)
+                for raw in range(bx_i32, g1_bound, grid_nb):
+                    gpu.barrier()
+                    TILE = _g1_flat_tile(fx.Int32(raw), g1_bound)
+                    emit_gemm1_tile(
+                        arg_aq,
+                        arg_ascale,
+                        arg_w1,
+                        arg_w1_scale,
+                        arg_eids,
+                        arg_mind,
+                        arg_aqout,
+                        arg_ascaleout,
+                        arg_hidden,
+                        arg_bias1,
+                        TILE,
+                        lane,
+                        wave,
+                        i32_ntok,
+                        g1_total_m,
+                        lds_raw,
+                    )
+                emit_phase_barrier(
+                    arg_desc,
+                    fx.Int32(2) * epoch + fx.Int32(2),
+                    bx_i32,
+                    grid_nb,
+                    tx_i32,
+                    tp_size=tp_size,
                 )
+                g2_bound = g1_total_m * fx.Int32(G2_N_BLOCKS)
+                for raw2 in range(bx_i32, g2_bound, grid_nb):
+                    gpu.barrier()
+                    unit = fx.Int32(raw2)
+                    MBLK = _udiv(unit, fx.Int32(G2_N_BLOCKS))
+                    NBLK = unit - MBLK * fx.Int32(G2_N_BLOCKS)
+                    emit_gemm2_tile(
+                        arg_aqout,
+                        arg_ascaleout,
+                        arg_w2,
+                        arg_w2_scale,
+                        arg_eids,
+                        arg_stids,
+                        arg_sweights,
+                        arg_bias2,
+                        arg_out,
+                        MBLK,
+                        NBLK,
+                        lane,
+                        wave,
+                        i32_M,
+                        i32_max_m_blocks,
+                        i32_inter,
+                        i32_hidden,
+                        lds,
+                    )
+            else:
+                for raw in range(bx_i32, g1_total_m, grid_nb):
+                    mb = _m_block(fx.Int32(raw))
+                    if fuse_ag and _ASCALE_SHUFFLE:
+                        # Only this block's rows. Doing it grid-stride instead would
+                        # make CTA i shuffle rows CTA j consumes, and a workgroup
+                        # barrier cannot order that -- the same reason the GEMM
+                        # handoff is per sort block rather than grid-wide.
+                        emit_ascale_shuffle(
+                            arg_ascale_raw,
+                            arg_ascale,
+                            arg_stids,
+                            arg_cumsum,
+                            i32_ntok,
+                            mb * fx.Int32(g1_BM) + tx_i32,
+                            fx.Int32(_BLOCK),
+                            (mb + fx.Int32(1)) * fx.Int32(g1_BM),
+                            scale_per_row=model_dim // 32,
+                            scaleN_pad=((model_dim // 32 + 7) // 8) * 8,
+                        )
+                        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                        gpu.barrier()
+                    for nb1 in range_constexpr(g1_n_blocks):
+                        # Unconditional: reusing LDS across tiles is not safe
+                        # without it, and a Python-level "skip the first one" flag
+                        # would be evaluated at trace time and emit nothing.
+                        gpu.barrier()
+                        emit_gemm1_tile(
+                            arg_aq,
+                            arg_ascale,
+                            arg_w1,
+                            arg_w1_scale,
+                            arg_eids,
+                            arg_mind,
+                            arg_aqout,
+                            arg_ascaleout,
+                            arg_hidden,
+                            arg_bias1,
+                            mb * fx.Int32(g1_n_blocks) + fx.Int32(nb1),
+                            lane,
+                            wave,
+                            i32_ntok,
+                            g1_total_m,
+                            lds_raw,
+                        )
+
+                    # This block's intermediate is complete. GEMM1 wrote it to HBM
+                    # and the GEMM2 tiles below read it back, so the stores have to
+                    # retire first -- and every wave in the CTA has to see that,
+                    # hence the barrier after the wait rather than instead of it.
+                    # Same CTA, so same XCD and same L2: no agent-scope release is
+                    # needed, which is what made the old inter-phase handoff costly.
+                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
+
+                    for nb2 in range_constexpr(G2_N_BLOCKS):
+                        gpu.barrier()
+                        m_block_idx = mb
+                        n_block_idx = fx.Int32(nb2)
+                        emit_gemm2_tile(
+                            arg_aqout,
+                            arg_ascaleout,
+                            arg_w2,
+                            arg_w2_scale,
+                            arg_eids,
+                            arg_stids,
+                            arg_sweights,
+                            arg_bias2,
+                            arg_out,
+                            m_block_idx,
+                            n_block_idx,
+                            lane,
+                            wave,
+                            i32_M,
+                            i32_max_m_blocks,
+                            i32_inter,
+                            i32_hidden,
+                            lds,
+                        )
 
             # -- ReduceScatter -----------------------------------------------
             emit_rs_tail(
@@ -365,6 +716,10 @@ def compile_stage12_rs(
             arg_desc: fx.Int64,
             i32_rank: fx.Int32,
             i32_rows: fx.Int32,
+            arg_ag_desc: fx.Int64,
+            arg_ascale_raw: fx.Int64,
+            i32_max_sorted: fx.Int32,
+            i32_grid: fx.Int32,
             stream: fx.Stream,
         ):
             stage12_kernel(
@@ -393,14 +748,17 @@ def compile_stage12_rs(
                 arg_desc,
                 i32_rank,
                 i32_rows,
+                arg_ag_desc,
+                arg_ascale_raw,
+                i32_max_sorted,
             ).launch(
-                grid=(fx.Int64(grid_ctas), 1, 1),
+                grid=(fx.Int64(i32_grid), 1, 1),
                 block=(_BLOCK, 1, 1),
                 stream=stream,
             )
 
         launch_stage12_rs.block = _BLOCK
-        launch_stage12_rs.grid_ctas = grid_ctas
+        launch_stage12_rs.g2_n_blocks = G2_N_BLOCKS
         return launch_stage12_rs
 
     return compile_gemm2_a4w4_port(
@@ -465,6 +823,10 @@ def run_stage12_rs(
     inter_dim,
     g2_cfg,
     block_m=None,
+    ag_desc_ptr=0,
+    ascale_raw=None,
+    topk=0,
+    fuse_ag=False,
     stream=None,
 ):
     """Launch GEMM1 + GEMM2 + ReduceScatter as one kernel.
@@ -507,10 +869,26 @@ def run_stage12_rs(
         INTER_MAX=int(inter_dim) if kstatic else 8192,
         a_dtype=g2_cfg["a_dtype"],
         b_dtype=g2_cfg["b_dtype"],
+        topk=int(topk),
+        fuse_ag=bool(fuse_ag),
     )
 
     aqout = g1["inter_sorted_quant"]
     max_sorted = int(sorted_token_ids.shape[0])
+    # One CTA per sort block, with or without the in-kernel AllGather.
+    #
+    # The push is pinned to the lowest block ids, which the dispatcher schedules
+    # first, and everyone else only waits on a flag -- so the whole grid does
+    # not have to be co-resident. An earlier version of this hung part-way
+    # through a sweep because the gate value was read per CTA from the
+    # AllGather's own epoch, which is bumped *mid-kernel*: a late-dispatched CTA
+    # read the bumped value and waited for one more than would ever be
+    # published. The gate now uses the ReduceScatter epoch, which is bumped only
+    # after every CTA has reached the tail and is therefore the same number for
+    # every CTA no matter when it started.
+    grid_blocks = (max_sorted + g2_BM - 1) // g2_BM
+    if _GRID_CU > 0:
+        grid_blocks = _GRID_CU  # override kept for A/B measurement
     run_compiled(
         launch,
         int(g1["hidden_states"].data_ptr()),
@@ -538,6 +916,14 @@ def run_stage12_rs(
         int(desc_ptr),
         int(rank),
         int(local_rows),
+        int(ag_desc_ptr),
+        _ptr(ascale_raw, sorted_token_ids),
+        int(max_sorted),
+        # One CTA per sort block. Not a persistent grid any more: without the
+        # inter-phase barrier nothing requires co-residency, so this is the same
+        # shape the standalone GEMM1 launches and the hardware is free to hold
+        # as many CTAs per CU as LDS allows.
+        int(grid_blocks),
         stream if stream is not None else torch.cuda.current_stream(),
     )
     return output[:local_rows]

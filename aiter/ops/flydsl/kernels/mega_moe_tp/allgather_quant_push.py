@@ -39,7 +39,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
 from .. import communication_ops_utils as comm
-from .allgather_push import AG_DESC_EPOCH, PUSH_VEC_BYTES
+from .allgather_push import AG_DESC_DONE, AG_DESC_EPOCH, PUSH_VEC_BYTES
 from .p2p import (
     DESC_ARRIVE,
     DESC_FLAGS,
@@ -80,8 +80,8 @@ def quant_push_supported(model_dim: int, topk: int) -> bool:
     return model_dim % QUANT_ELEMS_PER_THREAD == 0 and (topk * 4) % 4 == 0
 
 
-def quant_push_units(rows: int, model_dim: int, topk: int) -> int:
-    """Grid-stride work items one fused push covers, across every region.
+def quant_push_units(rows: int, model_dim: int, topk: int, regions: str = "all") -> int:
+    """Grid-stride work items one fused push covers, for the selected regions.
 
     Must mirror the kernel's own split exactly: a route row that is not a whole
     number of :data:`..allgather_push.PUSH_VEC_BYTES` (topk 6 or 9, say) drops
@@ -91,6 +91,10 @@ def quant_push_units(rows: int, model_dim: int, topk: int) -> int:
     route_unit = PUSH_VEC_BYTES if route_row_bytes % PUSH_VEC_BYTES == 0 else 4
     quant = rows * (model_dim // QUANT_ELEMS_PER_THREAD)
     route = 2 * rows * (route_row_bytes // route_unit)
+    if regions == "payload":
+        return quant
+    if regions == "route":
+        return route
     return quant + route
 
 
@@ -101,6 +105,8 @@ def compile_allgather_quant_push(
     topk: int,
     *,
     block: int = _BLOCK,
+    regions: str = "all",
+    _composition=None,
 ):
     """Build the quantize-and-push AllGather launcher for one shape.
 
@@ -108,7 +114,28 @@ def compile_allgather_quant_push(
     region 0's source address is the **BF16** ``x_local`` rather than a
     pre-quantized buffer, and region 1 has no source at all -- the E8M0 scales
     are produced here.
+
+    With ``_composition`` set, the three pieces are handed to the caller instead
+    of being wrapped in a kernel, so a larger kernel can host them. That is how
+    the megakernel gets ``quant -> AG`` without a second copy of this code.
+
+    ``regions`` selects what the standalone kernel pushes:
+
+    ``all``
+        payload, scales and route -- the original one-collective behaviour.
+    ``route``
+        topk ids and weights only. The expert sort reads these and must finish
+        before the fused region runs, so the route cannot ride along with the
+        payload once the payload push lives inside the megakernel.
+    ``payload``
+        activation and scales only, for the same split.
+
+    Each variant still ends in the same arrival barrier, and two of them running
+    back to back on one stream is safe: the first barrier synchronises every
+    rank before the second starts, so the epochs cannot interleave.
     """
+    if regions not in ("all", "route", "payload"):
+        raise ValueError(f"regions must be all/route/payload, got {regions!r}")
     if not 1 <= tp_size <= 8:
         raise ValueError(f"tp_size must be in [1, 8], got {tp_size}")
     if not quant_push_supported(model_dim, topk):
@@ -124,21 +151,19 @@ def compile_allgather_quant_push(
     route_vec_words = 4 if route_row_bytes % PUSH_VEC_BYTES == 0 else 1
     route_units_per_row = route_row_bytes // (route_vec_words * 4)
     epoch_index = desc_size(tp_size, _REGIONS) + AG_DESC_EPOCH
+    done_index = desc_size(tp_size, _REGIONS) + AG_DESC_DONE
+    suffix = "" if regions == "all" else f"_{regions}"
     name = (
-        f"mega_moe_tp_agq_push_tp{tp_size}_h{model_dim}_k{topk}_b{block}"
+        f"mega_moe_tp_agq_push_tp{tp_size}_h{model_dim}_k{topk}_b{block}{suffix}"
     )
 
-    @flyc.kernel(name=name, known_block_size=[block, 1, 1])
-    def ag_quant_push_kernel(
-        arg_desc: fx.Int64,
-        i32_rank: fx.Int32,
-        i32_rows: fx.Int32,
-        i32_grid: fx.Int32,
-    ):
-        tid = fx.Int32(gpu.thread_id("x"))
-        bid = fx.Int32(gpu.block_id("x"))
-        gid = bid * fx.Int32(block) + tid
-        stride = i32_grid * fx.Int32(block)
+    # The kernel body is split into three emitters so the megakernel can host
+    # the same code: it needs the quant+payload push and the AllGather barrier
+    # inline, while the routing push runs as its own earlier step (the expert
+    # sort reads the route and has to finish before the fused region starts).
+    @flyc.jit
+    def emit_quant_payload_push(arg_desc, i32_rank, i32_rows, bid, gid, stride):
+        """Quantize this rank's rows to MXFP4 and push them to every peer."""
 
         src_bytes = fx.Int64(i32_rows) * fx.Int64(model_dim * 2)
         src = flat_buffer(
@@ -259,6 +284,10 @@ def compile_allgather_quant_push(
                     width=1,
                 )
 
+
+    @flyc.jit
+    def emit_route_push(arg_desc, i32_rank, i32_rows, bid, gid, stride):
+        """Push topk ids and weights to every peer (regions 2 and 3)."""
         # -- push the route ------------------------------------------------
         route_bytes = fx.Int64(i32_rows) * fx.Int64(route_row_bytes)
         route_units = i32_rows * fx.Int32(route_units_per_row)
@@ -292,6 +321,47 @@ def compile_allgather_quant_push(
                         width=route_vec_words,
                     )
 
+
+    @flyc.jit
+    def emit_ag_gate(arg_desc, entry_epoch, tid):
+        """Wait until this rank's AllGather has completed, and nothing else.
+
+        For CTAs that did not push. They never touch the arrival counter, so a
+        CTA still queued behind them costs nothing -- which is what lets the
+        hosting kernel use a grid larger than the device holds at once.
+        """
+        if tid == fx.Int32(0):
+            comm.spin_until_ge_i32_agent(
+                desc_slot(arg_desc, done_index), entry_epoch
+            )
+            comm.fence_agent_acquire()
+        gpu.barrier()
+
+    @flyc.jit
+    def emit_ag_barrier(arg_desc, i32_rank, i32_grid, tid, entry_epoch=None):
+        """Publish this rank's arrival and wait until every peer has landed.
+
+        Only tid 0 of the *last* CTA to arrive does the cross-rank spin; every
+        other CTA increments the counter and moves on. For a standalone push
+        that is exactly right -- the kernel ends there, and the next kernel on
+        the stream sees the data.
+
+        It is *not* enough for a kernel whose CTAs continue: they would go read
+        peer rows that are still in flight, having waited for nothing. Passing
+        ``entry_epoch`` turns this into a real gate -- the completing CTA
+        publishes :data:`AG_DESC_DONE` after its cross-rank wait, and every CTA
+        spins on that before returning.
+
+        It must be a value every CTA agrees on *regardless of when it was
+        dispatched*. The AllGather's own epoch is not that: it is bumped here,
+        before the cross-rank wait, so a late CTA reads the bumped value, waits
+        for one more than will ever be published, and hangs. Pass the
+        ReduceScatter epoch instead -- that one is bumped only after every CTA
+        has arrived at the tail, i.e. never during the launch.
+
+        This is also why such a kernel needs every CTA resident: they all wait
+        here, and a waiting CTA holds a slot an unscheduled pusher needs.
+        """
         # -- barrier, identical to the copy-only push -----------------------
         comm.fence_agent_release()
         gpu.barrier()
@@ -321,7 +391,49 @@ def compile_allgather_quant_push(
                         acquire=True,
                     )
                 comm.fence_system_acquire()
+                if entry_epoch is not None:
+                    # Publish only now: the epoch above is bumped *before* the
+                    # cross-rank wait, so it cannot serve as the gate.
+                    comm.store_i32_global_agent_release(
+                        desc_slot(arg_desc, done_index), entry_epoch
+                    )
+        if entry_epoch is not None:
+            if tid == fx.Int32(0):
+                comm.spin_until_ge_i32_agent(
+                    desc_slot(arg_desc, done_index), entry_epoch
+                )
+                comm.fence_agent_acquire()
+            gpu.barrier()
 
+
+    if _composition is not None:
+        return _composition(
+            module_name=name,
+            emit_quant_payload_push=emit_quant_payload_push,
+            emit_route_push=emit_route_push,
+            emit_ag_barrier=emit_ag_barrier,
+            emit_ag_gate=emit_ag_gate,
+            block=block,
+        )
+
+    @flyc.kernel(name=name, known_block_size=[block, 1, 1])
+    def ag_quant_push_kernel(
+        arg_desc: fx.Int64,
+        i32_rank: fx.Int32,
+        i32_rows: fx.Int32,
+        i32_grid: fx.Int32,
+    ):
+        tid = fx.Int32(gpu.thread_id("x"))
+        bid = fx.Int32(gpu.block_id("x"))
+        gid = bid * fx.Int32(block) + tid
+        stride = i32_grid * fx.Int32(block)
+        # Plain Python branches: ``regions`` is a build-time string, so the
+        # tracer only ever sees the selected calls.
+        if regions in ("all", "payload"):
+            emit_quant_payload_push(arg_desc, i32_rank, i32_rows, bid, gid, stride)
+        if regions in ("all", "route"):
+            emit_route_push(arg_desc, i32_rank, i32_rows, bid, gid, stride)
+        emit_ag_barrier(arg_desc, i32_rank, i32_grid, tid)
     @flyc.jit
     def launch(
         arg_desc: fx.Int64,

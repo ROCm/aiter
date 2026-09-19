@@ -49,11 +49,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_mega_moe_TP import (  # noqa: E402
     MODELS,
     MegaMoeTP,
+    SplitTpMoe,
     build_sharded_weights,
     barrier,
     cleanup_dist,
     make_inputs,
     rank_max,
+    rel_l2,
     setup_dist,
     time_us,
 )
@@ -62,6 +64,7 @@ from aiter.fused_moe import get_padded_M  # noqa: E402
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx  # noqa: E402
 from aiter.ops.flydsl.mega_moe_tp import (  # noqa: E402
     mega_moe_tp_supported,
+    set_mega_override,
     pinned_candidates,
     pinned_default_choice,
     pinned_kernel_names,
@@ -99,8 +102,15 @@ CSV_COLUMNS = [
     "us_default",
     "speedup_vs_default",
     "candidates_timed",
+    "mega",
+    "mega_us",
+    "nomega_us",
     "_tag",
 ]
+
+#: A candidate whose output drifts further than this from the reference is
+#: treated as not existing. Same bound the benchmark's --rtol uses.
+_TUNE_RTOL = 0.06
 
 #: Axes swept in each coordinate-descent pass.
 _G1_AXES = ("block_m_nt", "g1_bn", "g1_bk")
@@ -138,19 +148,31 @@ def _describe(choice: dict) -> str:
     )
 
 
-def _time_choice(moe, inputs, choice, args, ctx) -> float:
+def _time_choice(moe, inputs, choice, args, ctx, reference=None) -> float:
     """Microseconds for one candidate, or ``inf`` if it will not run.
 
     A candidate that fails to build or raises at run time is a hole in the
     enumerated space, not a fatal error -- the point of the sweep is to find
     out which ones work.  The verdict is reduced with ``max`` so one rank's
     failure removes the candidate on every rank and the ranks stay in lockstep.
+
+    A candidate that runs but computes the *wrong answer* is also a hole, and
+    timing alone cannot see it. Without this check the sweep will happily crown
+    a config that is merely fast: a BM16 GEMM1 paired with a ``reduce`` GEMM2
+    was picked that way and then failed the benchmark at rel_l2 0.43.
     """
     set_pin_override(choice)
     try:
-        moe(inputs)
+        out = moe(inputs)
         torch.cuda.synchronize()
         failed = 0.0
+        if reference is not None:
+            err = rel_l2(out, reference)
+            if not (err == err) or err > _TUNE_RTOL:
+                logger.debug(
+                    "candidate %s wrong: rel_l2=%s", _describe(choice), err
+                )
+                failed = 1.0
     except Exception as exc:  # noqa: BLE001 - probing an enumerated space
         logger.debug("candidate %s failed: %s", _describe(choice), exc)
         failed = 1.0
@@ -175,7 +197,8 @@ def _time_choice(moe, inputs, choice, args, ctx) -> float:
     return us_max
 
 
-def _tune_cell(moe, inputs, candidates, args, ctx, bucket, log_prefix: str):
+def _tune_cell(moe, inputs, candidates, args, ctx, bucket, log_prefix: str,
+               reference=None):
     """Coordinate descent over the candidate space for one (shape, token).
 
     Returns ``(best_choice, best_us, us_default, n_timed)``.  ``us_default`` is
@@ -187,7 +210,7 @@ def _tune_cell(moe, inputs, candidates, args, ctx, bucket, log_prefix: str):
     def timed_us(choice):
         key = _describe(choice)
         if key not in timed:
-            timed[key] = _time_choice(moe, inputs, choice, args, ctx)
+            timed[key] = _time_choice(moe, inputs, choice, args, ctx, reference)
         return timed[key]
 
     # Baseline: the heuristic ladder, forced explicitly. Clearing the override
@@ -218,6 +241,45 @@ def _tune_cell(moe, inputs, candidates, args, ctx, bucket, log_prefix: str):
         if not improved:
             break
     return current, best_us, us_default, len(timed)
+
+
+def _time_mega_ab(moe, inputs, best, args, ctx):
+    """Time the winning tile with the merged kernel on and off.
+
+    Fusing everything into one launch trades GPU time for host time -- the two
+    GEMMs alone measured 296 us apart and 391 us merged -- so it wins exactly
+    where the host side dominates. That boundary is not derivable from the
+    dimensions and it moves with the tile, so it is measured per shape here
+    rather than decided at runtime.
+
+    Returns ``(mega_wins, us_mega, us_nomega)``.
+    """
+    set_pin_override(best)
+    out = {}
+    for label, flag in (("mega", True), ("nomega", False)):
+        set_mega_override(flag)
+        try:
+            moe(inputs)
+            torch.cuda.synchronize()
+            ok = 0.0
+        except Exception:  # noqa: BLE001
+            ok = 1.0
+        if rank_max(ok, ctx.device) > 0.0:
+            out[label] = float("inf")
+            continue
+        try:
+            _, out[label] = time_us(
+                lambda: moe(inputs),
+                iters=args.iters,
+                warmup=args.warmup,
+                device=ctx.device,
+                rounds=args.rounds,
+            )
+        except Exception:  # noqa: BLE001
+            out[label] = float("inf")
+    set_mega_override(None)
+    set_pin_override(None)
+    return out["mega"] <= out["nomega"], out["mega"], out["nomega"]
 
 
 def _write_csv(path: str, rows: list[dict]) -> None:
@@ -251,6 +313,15 @@ def parse_args(argv=None):
         default=2,
         help="Coordinate-descent passes over (GEMM1 axes, GEMM2 axes). A second "
         "pass lets a GEMM2 win pull block_m somewhere the first pass rejected.",
+    )
+    p.add_argument(
+        "--mega-only",
+        action="store_true",
+        help="Search only configs the merged kernel can host (atomic epilogue, "
+        "tile_m == block_m, no spart) with it forced on. The default search "
+        "optimises the layer and often lands on a 'reduce' row, which the "
+        "merged kernel cannot use at all -- so the two questions need two "
+        "sweeps: what is fastest, and what is fastest *as one kernel*.",
     )
     p.add_argument(
         "--out",
@@ -288,7 +359,30 @@ def main(argv=None) -> int:
         max_local = max(tokens) // tp
         weights = build_sharded_weights(shape, ctx, tp, args.seed)
         moe = MegaMoeTP(weights, ctx, max_local_tokens=max_local, ag_wire_quant="auto")
+        split = SplitTpMoe(weights, ctx, max_local)
         candidates = pinned_candidates(moe.config)
+        if args.mega_only:
+            from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import (
+                stage12_supported,
+            )
+            from aiter.ops.flydsl.mxfp4_kname import (
+                _parse_mxfp4_g1_kname,
+                parse_flydsl_v2_gemm2_kernel,
+            )
+
+            def _hostable(choice):
+                k1, k2 = pinned_kernel_names(moe.config, choice)
+                try:
+                    return stage12_supported(
+                        _parse_mxfp4_g1_kname(k1),
+                        parse_flydsl_v2_gemm2_kernel(k2),
+                        shape.model_dim,
+                    )
+                except Exception:  # noqa: BLE001
+                    return False
+
+            candidates = [c for c in candidates if _hostable(c)]
+            set_mega_override(True)
         if ctx.rank == 0:
             logger.info(
                 "%s: %d candidates, %d token counts",
@@ -302,10 +396,23 @@ def main(argv=None) -> int:
             )
             prefix = f"[{model_name} M={global_tokens}]"
             bucket = int(get_padded_M(global_tokens))
+            # The split chain is the reference every candidate is checked
+            # against. Timing alone cannot tell a fast config from a wrong one.
+            reference = split(inputs).clone()
+            torch.cuda.synchronize()
             best, best_us, us_default, n_timed = _tune_cell(
-                moe, inputs, candidates, args, ctx, bucket, prefix
+                moe, inputs, candidates, args, ctx, bucket, prefix, reference
             )
+            del reference
             kernel1, kernel2 = pinned_kernel_names(moe.config, best)
+            if args.mega_only:
+                # Already forced on and the search space was restricted to what
+                # it can host, so there is nothing to A/B.
+                mega_wins, us_mega, us_nomega = True, best_us, float("nan")
+            else:
+                mega_wins, us_mega, us_nomega = _time_mega_ab(
+                    moe, inputs, best, args, ctx
+                )
             if ctx.rank == 0:
                 rows.append(
                     {
@@ -338,6 +445,9 @@ def main(argv=None) -> int:
                             else ""
                         ),
                         "candidates_timed": n_timed,
+                        "mega": int(mega_wins),
+                        "mega_us": round(us_mega, 4),
+                        "nomega_us": round(us_nomega, 4),
                         "_tag": "mega_moe_tp_pinned",
                     }
                 )

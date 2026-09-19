@@ -43,6 +43,7 @@ from .p2p import (
 )
 
 __all__ = [
+    "AG_DESC_DONE",
     "AG_DESC_EPOCH",
     "PUSH_MIN_BYTES",
     "PUSH_UNROLL",
@@ -55,6 +56,11 @@ __all__ = [
 
 # Descriptor slot beyond the shared prefix and the per-region entries.
 AG_DESC_EPOCH = 0  # local address of the monotone epoch counter (i32)
+#: Bumped *after* the cross-rank wait completes, unlike the epoch which is
+#: bumped before it. A kernel whose CTAs continue past the AllGather waits on
+#: this: the epoch alone would let them through while peer data is still in
+#: flight. See ``emit_ag_barrier(gate_all=True)``.
+AG_DESC_DONE = 1
 
 _BLOCK = int(os.environ.get("AITER_TP_AG_BLOCK", "256"))
 # 16 B/lane is one buffer_load_dwordx4; a wave then moves 1 KiB per instruction.
@@ -220,7 +226,7 @@ def push_units(rows: int, row_bytes) -> int:
 
 
 def ag_desc_size(tp_size: int, regions: int) -> int:
-    return desc_size(tp_size, regions) + 1
+    return desc_size(tp_size, regions) + 2
 
 
 def ag_desc_slot(tp_size: int, regions: int, which: int) -> int:
