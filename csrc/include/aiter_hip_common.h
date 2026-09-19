@@ -582,6 +582,18 @@ static uint32_t get_num_cu_func()
     return num_cu;
 }
 
+static size_t get_lds_per_block_func()
+{
+    static const size_t lds_per_block = []() {
+        hipDevice_t dev;
+        hipDeviceProp_t dev_prop;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+        return static_cast<size_t>(dev_prop.sharedMemPerBlock);
+    }();
+    return lds_per_block;
+}
+
 static uint32_t get_warp_size_func()
 {
     static const uint32_t warp_size = []() {
