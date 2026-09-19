@@ -26,8 +26,13 @@ if [[ "$MULTIGPU" == "TRUE" ]]; then
 else
     if [[ -z "${AITER_TEST:-}" ]]; then
         echo "AITER_TEST is not set"
-        # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-        mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py" | sort)
+# Directories under op_tests/ that are NOT the aiter suite: each has its own
+        # CI job. Everything else under op_tests/ is aiter, including the op-family
+        # folders, so collection recurses instead of stopping at the top level.
+        NOT_AITER=(triton_tests multigpu_tests flydsl_tests tuning_tests tuners opus cpp op_benchmarks configs)
+        aiter_prune=()
+        for d in "${NOT_AITER[@]}"; do aiter_prune+=(-path "op_tests/${d}" -prune -o); done
+        mapfile -t files < <(find op_tests "${aiter_prune[@]}" -type f -name "*.py" -print | sort)
     else
         # If AITER_TEST contains multiple files separated by whitespace, convert to an array
         read -r -a files <<< "$AITER_TEST"

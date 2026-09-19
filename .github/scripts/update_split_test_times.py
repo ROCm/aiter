@@ -134,17 +134,34 @@ def parse_aiter_log(path: Path) -> dict[str, int]:
     return file_time
 
 
+# Directories under op_tests/ that are NOT the aiter suite: each has its own CI
+# job. Keep this in step with NOT_AITER in .github/scripts/split_tests.sh --
+# discovery here must match what the sharder collects, or measured times are
+# written for files that never run and dropped for files that do.
+NOT_AITER = {
+    "triton_tests",
+    "multigpu_tests",
+    "flydsl_tests",
+    "tuning_tests",
+    "tuners",
+    "opus",
+    "cpp",
+    "op_benchmarks",
+    "configs",
+}
+
+
 def list_test_files(repo_root: Path, test_type: str) -> list[str]:
     if test_type == "aiter":
-        glob_pattern = "op_tests/test_*.py"
+        # Recursive, because the aiter suite lives in op-family folders.
+        paths = (
+            p
+            for p in repo_root.glob("op_tests/**/test_*.py")
+            if p.is_file() and p.relative_to(repo_root).parts[1] not in NOT_AITER
+        )
     else:
-        glob_pattern = "op_tests/triton_tests/**/test_*.py"
-    files = sorted(
-        str(p.relative_to(repo_root))
-        for p in repo_root.glob(glob_pattern)
-        if p.is_file()
-    )
-    return files
+        paths = (p for p in repo_root.glob("op_tests/triton_tests/**/test_*.py") if p.is_file())
+    return sorted(str(p.relative_to(repo_root)) for p in paths)
 
 
 def guess_test_file_from_testcase(
