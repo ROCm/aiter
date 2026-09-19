@@ -391,6 +391,25 @@ _PREFILL_GROUPS = [
     *_k5_dense_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
+    # Dedicated review case: varlen with a non-multiple-of-BT tail (T=1000 for BT=64).
+    PrefillGroup(
+        model_name="review-unaligned-varlen",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[1000],
+        max_num_batched_tokens="full_prompt_len",
+    ),
+    # Exercise dense token-major addressing with a non-unit batch stride.
+    PrefillGroup(
+        model_name="review-dense-b2",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[1024],
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens="full_prompt_len",
+        dense_batch=2,
+    ),
 ]
 
 # Full tuner catalog. ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py`` loads this module
@@ -649,13 +668,7 @@ def _build_case(model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dty
     )
 
 
-@benchmark()
-def test_chunk_gdn_prefill_h(
-    model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
-):
-    case = _build_case(
-        model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
-    )
+def _run_prefill_h_case(case: PrefillArgs):
     context_lens = case.resolve_context_lens()
     k, w_orig, u_orig, w_c, u_c, g, h0, cu = _make_inputs(case, context_lens)
     ofs = case.output_final_state
@@ -704,20 +717,6 @@ def test_chunk_gdn_prefill_h(
         # gates decaying to 0.
         "use_exp2": False,
     }
-    candidates = {
-        "flydsl": lambda: chunk_gated_delta_rule_fwd_h_flydsl_opt(
-            k, w_c, u_c, g=g, g_head_major=case.g_head_major, **common
-        ),
-        "triton": lambda: chunk_gated_delta_rule_fwd_h_opt_vk(
-            k, w_c, u_c, g=g_hm, **common
-        ),
-    }
-    # Unsupported shapes leave the HIP cells nan rather than dropping the row.
-    if _hip_k5_supported(case):
-        candidates["hip"] = lambda: chunk_gated_delta_rule_fwd_h_hip_fn(
-            k, w_c, u_c, g=g_hm, g_head_major=True, **common
-        )
-
     # Two bf16 MFMA GEMMs against the [V, K] state per (chunk, head):
     #   v_new = u - w @ h^T   ([BT,K] @ [K,V])  -> 2*BT*K*V
     #   h    += v_gated^T @ k ([V,BT] @ [BT,K]) -> 2*BT*V*K
@@ -740,53 +739,113 @@ def test_chunk_gdn_prefill_h(
     )
 
     ret = {"gfx": get_gfx(), "B": B, "N": N, "H": H, "T_flat": T_flat}
-    for name, fn in candidates.items():
-        (h, vn, fs), us = run_perftest(fn)
+    flydsl_layout_outputs = {}
+    for wu_hm in (True, False):
+        w_in, u_in = (w_c, u_c) if wu_hm else (w_orig, u_orig)
+        candidates = {
+            "flydsl": lambda w_in=w_in, u_in=u_in, wu_hm=wu_hm: chunk_gated_delta_rule_fwd_h_flydsl_opt(
+                k,
+                w_in,
+                u_in,
+                g=g,
+                g_head_major=case.g_head_major,
+                wu_head_major=wu_hm,
+                **common,
+            ),
+        }
+        if wu_hm:
+            candidates["triton"] = lambda: chunk_gated_delta_rule_fwd_h_opt_vk(
+                k, w_c, u_c, g=g_hm, **common
+            )
+            # Unsupported shapes leave the HIP cells nan rather than dropping the row.
+            if _hip_k5_supported(case):
+                candidates["hip"] = lambda: chunk_gated_delta_rule_fwd_h_hip_fn(
+                    k, w_c, u_c, g=g_hm, g_head_major=True, **common
+                )
 
-        # Output contract shared by all three backends.
-        assert h.shape == (B, total_chunks // B, H, V, K), f"{name}: h shape {h.shape}"
-        assert h.dtype == (case.snapshot_dtype or k.dtype), f"{name}: h dtype {h.dtype}"
-        assert vn.shape == (B, H, T_flat, V), f"{name}: v_new shape {vn.shape}"
-        if ofs:
-            assert fs.shape == (N, H, V, K), f"{name}: final_state shape {fs.shape}"
-            assert fs.dtype == case.ssm_state_dtype, f"{name}: fs dtype {fs.dtype}"
-        else:
-            assert fs is None, f"{name}: expected no final_state"
+        for name, fn in candidates.items():
+            (h, vn, fs), us = run_perftest(fn)
 
-        err = checkAllclose(
-            ref_h.to(dtypes.fp32),
-            h.to(dtypes.fp32),
-            rtol=2e-2,
-            atol=2e-2,
-            msg=f"{name}: K5 h snapshots",
-        )
-        err = max(
-            err,
-            checkAllclose(
-                ref_vn.to(dtypes.fp32),
-                _normalize_opt_v_new(vn).to(dtypes.fp32),
+            # Output contract shared by all three backends.
+            assert h.shape == (
+                B,
+                total_chunks // B,
+                H,
+                V,
+                K,
+            ), f"{name}: h shape {h.shape}"
+            assert h.dtype == (
+                case.snapshot_dtype or k.dtype
+            ), f"{name}: h dtype {h.dtype}"
+            expected_vn = (B, H, T_flat, V) if wu_hm else (B, T_flat, H, V)
+            assert (
+                vn.shape == expected_vn
+            ), f"{name} (wu_head_major={wu_hm}): v_new shape {vn.shape}"
+            if ofs:
+                assert fs.shape == (N, H, V, K), f"{name}: final_state shape {fs.shape}"
+                assert fs.dtype == case.ssm_state_dtype, f"{name}: fs dtype {fs.dtype}"
+            else:
+                assert fs is None, f"{name}: expected no final_state"
+
+            err = checkAllclose(
+                ref_h.to(dtypes.fp32),
+                h.to(dtypes.fp32),
                 rtol=2e-2,
                 atol=2e-2,
-                msg=f"{name}: K5 v_new",
-            ),
-        )
-        if ofs:
+                msg=f"{name}: K5 h snapshots",
+            )
+            vn_cmp = _normalize_opt_v_new(vn) if wu_hm else vn
             err = max(
                 err,
                 checkAllclose(
-                    ref_fs.to(dtypes.fp32),
-                    fs.to(dtypes.fp32),
+                    ref_vn.to(dtypes.fp32),
+                    vn_cmp.to(dtypes.fp32),
                     rtol=2e-2,
                     atol=2e-2,
-                    msg=f"{name}: K5 final_state",
+                    msg=f"{name}: K5 v_new",
                 ),
             )
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
+            if ofs:
+                err = max(
+                    err,
+                    checkAllclose(
+                        ref_fs.to(dtypes.fp32),
+                        fs.to(dtypes.fp32),
+                        rtol=2e-2,
+                        atol=2e-2,
+                        msg=f"{name}: K5 final_state",
+                    ),
+                )
+            ret_name = name if wu_hm else f"{name} token-major"
+            ret[f"{ret_name} us"] = us
+            ret[f"{ret_name} TFLOPS"] = flops / us / 1e6
+            ret[f"{ret_name} TB/s"] = nbytes / us / 1e6
+            ret[f"{ret_name} err"] = err
+            if name == "flydsl":
+                flydsl_layout_outputs[wu_hm] = (h, vn, fs)
+
+    h_hm, vn_hm, fs_hm = flydsl_layout_outputs[True]
+    h_tm, vn_tm, fs_tm = flydsl_layout_outputs[False]
+    assert torch.equal(h_tm, h_hm), "FlyDSL token-major h differs from head-major"
+    assert torch.equal(
+        vn_tm, _normalize_opt_v_new(vn_hm)
+    ), "FlyDSL token-major v_new differs from head-major"
+    if ofs:
+        assert torch.equal(
+            fs_tm, fs_hm
+        ), "FlyDSL token-major final_state differs from head-major"
 
     return ret
+
+
+@benchmark()
+def test_chunk_gdn_prefill_h(
+    model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
+):
+    case = _build_case(
+        model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype
+    )
+    return _run_prefill_h_case(case)
 
 
 def _sweep_rows(args, model):
@@ -903,6 +962,14 @@ def main():
             K5_MODELS[model]["label"],
             df.to_markdown(index=False),
         )
+
+    review_names = {"review-unaligned-varlen", "review-dense-b2"}
+    review_cases = expand_groups(
+        [group for group in _PREFILL_GROUPS if group.model_name in review_names]
+    )
+    for case in review_cases:
+        aiter.logger.info("running review case: %s", case)
+        _run_prefill_h_case(case)
 
 
 if __name__ == "__main__":
