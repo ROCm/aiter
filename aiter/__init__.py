@@ -59,11 +59,28 @@ def getLogger():
 logger = getLogger()
 AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
 # Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their
-# JIT build. Always on for Windows (no CK/HIP there); elsewhere opt in via the
-# env var, e.g. Triton-backend users with no C++ toolchain or CK.
-AITER_TRITON_ONLY = (
-    os.getenv("AITER_TRITON_ONLY", "0") == "1" or sys.platform == "win32"
-)
+# JIT build. Opt in via the env var, e.g. Triton-backend users with no C++
+# toolchain or CK.
+AITER_TRITON_ONLY = os.getenv("AITER_TRITON_ONLY", "0") == "1"
+
+
+def _has_rocm_toolchain() -> bool:
+    """Whether a ROCm install the JIT can build against was found."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "jit", "utils"))
+    from cpp_extension import IS_HIP_EXTENSION
+
+    return IS_HIP_EXTENSION
+
+
+# The HIP SDK is a separate, optional install on Windows, and the Triton ops
+# are the supported fallback without it. Linux keeps failing loudly instead,
+# where ROCm is a hard prerequisite and its absence is a broken install.
+if not AITER_TRITON_ONLY and sys.platform == "win32" and not _has_rocm_toolchain():
+    AITER_TRITON_ONLY = True
+    logger.warning(
+        "No ROCm install found; falling back to the Triton ops. "
+        "Install the HIP SDK and set HIP_PATH to build the C++/HIP ops."
+    )
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
 _flydsl_cache = os.path.join(os.path.dirname(__file__), "jit", "flydsl_cache")
@@ -123,7 +140,12 @@ else:
     from .ops.rope import *
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
-    from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+
+    # topk_select imports flydsl at module scope and flydsl publishes
+    # Linux-only wheels, so the op is unavailable on Windows.
+    if sys.platform != "win32":
+        from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
     from .ops.gradlib import *
