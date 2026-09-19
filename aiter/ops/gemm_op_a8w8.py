@@ -446,6 +446,35 @@ _CKGEMM_CONFIG_CACHE: dict = {}
 _CKGEMM_HAS_GFX: dict = {}
 
 
+def _assert_uniquely_keyed(frame, index_cols: list, tuned_file) -> None:
+    """Fail with the diagnosis instead of pandas' "index must be unique".
+
+    A tuned table whose rows are not unique on ``index_cols`` cannot be turned
+    into a lookup, and ``to_dict("index")`` says only that the index is not
+    unique -- not which file, which shapes, or why. The usual cause is a table
+    keyed on a column this lookup does not consider: ``a8w8_tuned_gemm.csv``
+    has carried ``q_dtype_w`` since #1782, so it holds an int8 row and an fp8
+    row for the same (gfx, cu_num, M, N, K), and belongs to
+    ``get_GEMM_config_with_quant_type``.
+    """
+    collisions = frame.duplicated(index_cols, keep=False)
+    if not collisions.any():
+        return
+    shapes = frame[collisions].groupby(index_cols, sort=False).ngroups
+    extra = ""
+    if "q_dtype_w" in frame.columns and "q_dtype_w" not in index_cols:
+        kinds = sorted(str(v) for v in frame.loc[collisions, "q_dtype_w"].unique())
+        extra = (
+            f" Its rows are distinguished by q_dtype_w ({', '.join(kinds)}), which"
+            " this lookup does not key on -- use get_GEMM_config_with_quant_type()"
+            " for this table."
+        )
+    raise ValueError(
+        f"{tuned_file} is not uniquely keyed by {tuple(index_cols)}: "
+        f"{shapes} shape(s) carry more than one row.{extra}"
+    )
+
+
 # Cache config resolution only. The public wrapper records misses on every
 # dispatch until the recorder confirms the row, so transient I/O can recover.
 @functools.lru_cache(maxsize=1024)
@@ -454,20 +483,20 @@ def _get_CKGEMM_config_cached(M: int, N: int, K: int, tuned_file):
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
         # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
         # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
-        if "gfx" in ckgemm_dict.columns:
-            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
-                ["gfx", "cu_num", "M", "N", "K"]
-            ).to_dict("index")
-            _CKGEMM_HAS_GFX[tuned_file] = True
-        else:
+        has_gfx = "gfx" in ckgemm_dict.columns
+        if not has_gfx:
             logger.warning(
                 f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
-            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
-                ["cu_num", "M", "N", "K"]
-            ).to_dict("index")
-            _CKGEMM_HAS_GFX[tuned_file] = False
+        index_cols = (
+            ["gfx", "cu_num", "M", "N", "K"] if has_gfx else ["cu_num", "M", "N", "K"]
+        )
+        _assert_uniquely_keyed(ckgemm_dict, index_cols, tuned_file)
+        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(index_cols).to_dict(
+            "index"
+        )
+        _CKGEMM_HAS_GFX[tuned_file] = has_gfx
 
     gfx = get_gfx()
     cu_num = get_cu_num()

@@ -277,6 +277,69 @@ class TestUntunedShapes(unittest.TestCase):
         self.assertTrue(all(len(line.split(",")) == 3 for line in lines[1:]))
 
 
+class TestTunedTableKeying(unittest.TestCase):
+    """A tuned table that cannot be indexed should say so, and say why."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+
+    def _write(self, name, rows, header):
+        path = os.path.join(self.tempdir.name, name)
+        with open(path, "w") as fh:
+            fh.write(header + "\n")
+            for r in rows:
+                fh.write(r + "\n")
+        return path
+
+    def test_quant_keyed_table_names_the_right_lookup(self):
+        """a8w8_tuned_gemm.csv holds an int8 and an fp8 row per shape.
+
+        It has carried q_dtype_w since #1782 and is keyed on six columns;
+        get_CKGEMM_config keys on five. Loading it there used to raise
+        pandas' "DataFrame index must be unique for orient='index'", which
+        names neither the file nor the reason.
+        """
+        from aiter.ops.gemm_op_a8w8 import _assert_uniquely_keyed
+        import pandas as pd
+
+        path = self._write(
+            "a8w8_tuned_gemm.csv",
+            [
+                "gfx950,256,1,1280,8192,torch.int8,7,0,17.69,k_int8,1.0,1.0,0.0",
+                "gfx950,256,1,1280,8192,torch.float8_e4m3fn,7,0,7.68,k_fp8,1.0,1.0,0.0",
+            ],
+            "gfx,cu_num,M,N,K,q_dtype_w,kernelId,splitK,us,kernelName,tflops,bw,errRatio",
+        )
+        frame = pd.read_csv(path).drop_duplicates()
+
+        with self.assertRaises(ValueError) as caught:
+            _assert_uniquely_keyed(frame, ["gfx", "cu_num", "M", "N", "K"], path)
+
+        message = str(caught.exception)
+        self.assertIn("a8w8_tuned_gemm.csv", message)
+        self.assertIn("1 shape(s)", message)
+        self.assertIn("q_dtype_w", message)
+        self.assertIn("get_GEMM_config_with_quant_type", message)
+
+    def test_uniquely_keyed_table_is_accepted(self):
+        """The control: a table that IS uniquely keyed must not raise."""
+        from aiter.ops.gemm_op_a8w8 import _assert_uniquely_keyed
+        import pandas as pd
+
+        path = self._write(
+            "kv_b_tuned_gemm.csv",
+            [
+                "gfx950,256,1,7168,512,7,0,3.83,k_a,1.0,1.0,0.0",
+                "gfx950,256,2,7168,512,7,0,3.84,k_b,1.0,1.0,0.0",
+            ],
+            "gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio",
+        )
+        frame = pd.read_csv(path).drop_duplicates()
+
+        _assert_uniquely_keyed(frame, ["gfx", "cu_num", "M", "N", "K"], path)
+
+
 class TestCachedLookupMissRecording(unittest.TestCase):
 
     def _assert_retry_outside_cache(self, module, cached_name, log_name, lookup, args):
