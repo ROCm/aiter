@@ -56,12 +56,12 @@ def _auto_num_splits(
 
     logits[m,n] are independent across n, so splitting each row's window across
     grid.y is pure parallelism. Returns 1 once the row grid alone oversubscribes.
-    Constants tuned on MI300X (304 CU): ~4x oversubscription, chunks >= _MIN_TILES_PER_SPLIT.
+    Constants measured on gfx942 (304 CU): ~16x oversubscription, chunks >= _MIN_TILES_PER_SPLIT.
     """
     grid_x = seq_len_padded // rpb
     if grid_x == 0 or seq_len_kv < 4096:
         return 1
-    target_blocks = 4 * _device_cu_count(device_index)
+    target_blocks = 16 * _device_cu_count(device_index)
     if grid_x >= target_blocks:
         return 1
     max_splits = max(1, (seq_len_kv // _BLOCK_KV) // _MIN_TILES_PER_SPLIT)
