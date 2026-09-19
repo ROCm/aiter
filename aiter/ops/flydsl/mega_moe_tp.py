@@ -142,6 +142,10 @@ _MEGA_AG_ALSO_HOST = os.environ.get("AITER_TP_MEGA_AG_ALSO_HOST", "0") == "1"
 #: ``_composition`` hook -- the prerequisite for one kernel covering every a4w4
 #: shape. Costs per-shape tuning; buys a single code path.
 _PIN_KERNELS = os.environ.get("AITER_TP_MEGA_PIN_KERNELS", "0") == "1"
+#: ``waves_per_eu`` for a shape the tuned CSV does not cover. A net win over
+#: the sweep but genuinely per-shape, which is why it is also a tuned axis --
+#: see :func:`pinned_candidates`.
+_WAVES_PER_EU_DEFAULT = int(os.environ.get("AITER_TP_MEGA_WAVES_PER_EU", "2"))
 #: Sort/tile block for the pinned rows: an int to fix it, or "auto" to pick per
 #: token bucket. Must be a pre-quantized fp4 GEMM1 variant, i.e. BM in
 #: {32, 64, 128} -- BM16 exists only as inline-quant, which the fp4 wire cannot
@@ -208,6 +212,12 @@ _PIN_OVERRIDE: dict | None = None
 #: Set by the tuner to force the merged-kernel decision while it A/Bs the two
 #: paths; ``None`` restores the CSV lookup.
 _MEGA_OVERRIDE: bool | None = None
+#: Tuner-only override for ``_STAGE12``; see :func:`set_stage12_override`.
+_STAGE12_OVERRIDE: bool | None = None
+
+
+def _stage12_on() -> bool:
+    return _STAGE12 if _STAGE12_OVERRIDE is None else _STAGE12_OVERRIDE
 
 
 def set_mega_override(value: bool | None) -> None:
@@ -220,6 +230,20 @@ def set_mega_override(value: bool | None) -> None:
     """
     global _MEGA_OVERRIDE
     _MEGA_OVERRIDE = value
+
+
+def set_stage12_override(value: bool | None) -> None:
+    """Force the merged GEMM1+GEMM2+RS kernel on or off, or restore the env.
+
+    The companion to :func:`set_mega_override`, and not optional alongside it:
+    ``_mega_ag`` returns False outright when stage12 is off, so forcing the
+    AllGather into a kernel that is not running is a no-op. A whole tuning
+    sweep can complete, report sensible speedups and write a CSV while never
+    once having run the merged kernel -- which is exactly what happened before
+    this existed, and it silently tunes the three-kernel path instead.
+    """
+    global _STAGE12_OVERRIDE
+    _STAGE12_OVERRIDE = value
 
 
 def set_pin_override(choice: dict | None) -> None:
@@ -289,10 +313,20 @@ def _load_pin_tuned(path: str, mtime: float) -> dict:
                     # Absent means "allowed": a CSV written before the merged
                     # kernel existed should not silently disable it.
                     "mega": str(row.get("mega", "1")).strip() not in ("0", "false"),
+                    # Absent means "let the register allocator decide", which
+                    # is what every row written before this axis existed did.
+                    "waves_per_eu": _int_or(row.get("waves_per_eu"), 0),
                 }
     except FileNotFoundError:
         pass
     return table
+
+
+def _int_or(value, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def _pin_tuned_key(**kw) -> tuple:
@@ -333,18 +367,26 @@ def pinned_candidates(cfg: "MegaMoeTPConfig") -> list[dict]:
                             continue
                         for epilog in ("atomic", "reduce"):
                             for g2_nt in (True, False):
-                                out.append(
-                                    {
-                                        "block_m": bm,
-                                        "g1_nt": use_nt,
-                                        "g1_bn": g1_bn,
-                                        "g1_bk": g1_bk,
-                                        "g2_tn": g2_tn,
-                                        "g2_tk": g2_tk,
-                                        "g2_epilog": epilog,
-                                        "g2_nt": g2_nt,
-                                    }
-                                )
+                                # ``waves_per_eu`` does not appear in either
+                                # kernel name -- it is a compile hint on the
+                                # merged kernel, so it rides in its own CSV
+                                # column. 0 means "allocator decides"; 3 and 4
+                                # measured worse than 2 everywhere (spills), so
+                                # the axis is two-valued.
+                                for wpe in (0, 2):
+                                    out.append(
+                                        {
+                                            "block_m": bm,
+                                            "g1_nt": use_nt,
+                                            "g1_bn": g1_bn,
+                                            "g1_bk": g1_bk,
+                                            "g2_tn": g2_tn,
+                                            "g2_tk": g2_tk,
+                                            "g2_epilog": epilog,
+                                            "g2_nt": g2_nt,
+                                            "waves_per_eu": wpe,
+                                        }
+                                    )
     return out
 
 
@@ -378,6 +420,7 @@ def pinned_default_choice(cfg: "MegaMoeTPConfig", bucket: int) -> dict:
         "g2_tk": g2_tk,
         "g2_epilog": "atomic",
         "g2_nt": use_nt,
+        "waves_per_eu": _WAVES_PER_EU_DEFAULT,
     }
 
 
@@ -638,7 +681,7 @@ class MegaMoeTP:
 
     # -- pinned single-family kernel selection --------------------------------
     def _pinned_row(self, bucket: int):
-        """Build a (metadata, kernel1, kernel2) row on the two chosen families.
+        """Build a (metadata, kernel1, kernel2, waves_per_eu) row.
 
         GEMM1 is pinned to ``flydsl_mxmoe_g1_a4w4_*`` and GEMM2 to
         ``flydsl_moe2_layout_afp4_wfp4_*`` -- the only two families that expose a
@@ -657,19 +700,21 @@ class MegaMoeTP:
         if _PIN_OVERRIDE is not None:
             kernel1, kernel2 = pinned_kernel_names(cfg, _PIN_OVERRIDE)
             BM = int(_PIN_OVERRIDE["block_m"])
+            wpe = int(_PIN_OVERRIDE.get("waves_per_eu", _WAVES_PER_EU_DEFAULT))
         else:
             tuned = self._pinned_tuned_lookup(bucket)
             if tuned is not None:
-                kernel1, kernel2, BM = tuned
+                kernel1, kernel2, BM, wpe = tuned
             else:
                 kernel1, kernel2, BM = self._pinned_default(bucket)
+                wpe = _WAVES_PER_EU_DEFAULT
         metadata = _make_mxfp4_metadata(
             kernel1, kernel2, GateMode.SEPARATED.value, 0, block_m=BM
         )
-        return metadata, kernel1, kernel2
+        return metadata, kernel1, kernel2, wpe
 
     def _pinned_tuned_lookup(self, bucket: int):
-        """``(kernel1, kernel2, block_m)`` from the tuned CSV, or ``None``."""
+        """``(kernel1, kernel2, block_m, waves_per_eu)`` from the CSV, or None."""
         from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
         cfg = self.cfg
@@ -693,7 +738,12 @@ class MegaMoeTP:
         row = table.get(key)
         if row is None:
             return None
-        return row["kernel1"], row["kernel2"], int(row["block_m"])
+        return (
+            row["kernel1"],
+            row["kernel2"],
+            int(row["block_m"]),
+            int(row["waves_per_eu"]),
+        )
 
     def _mega_allowed_by_csv(self, bucket: int) -> bool:
         """Whether the tuned row opts this shape into the merged kernel.
@@ -809,7 +859,7 @@ class MegaMoeTP:
 
     def _mega_ag(self, plan) -> bool:
         """Whether the merged kernel also hosts the quantize-and-AllGather."""
-        if not _STAGE12:
+        if not _stage12_on():
             return False
         if not (_MEGA_AG or _MEGA_OVERRIDE):
             return False
@@ -835,7 +885,7 @@ class MegaMoeTP:
         back". A correctness gate cannot see the difference -- rel_l2 is fine
         when nothing is fused -- so the distinction has to be printed.
         """
-        if not _STAGE12:
+        if not _stage12_on():
             return "off"
         if plan.ag_wire != "fp4_1x32":
             return "bf16-wire"
@@ -850,10 +900,10 @@ class MegaMoeTP:
         # An active tuner override implies the pinned path even when the env
         # switch is off, so a tuning run needs no extra environment setup.
         if _PIN_KERNELS or _PIN_OVERRIDE is not None:
-            metadata, kernel1, kernel2 = self._pinned_row(bucket)
+            metadata, kernel1, kernel2, wpe = self._pinned_row(bucket)
             return _CasePlan(
                 bucket, "fp4_1x32", kernel1, kernel2, metadata, bucket,
-                self._fuses_rs(kernel2),
+                self._fuses_rs(kernel2), wpe,
             )
         _, kernel1, kernel2 = self._tuned_row(bucket)
         prequant_ok = _gemm1_takes_prequantized_fp4(kernel1)
@@ -1235,12 +1285,16 @@ class MegaMoeTP:
         FP4 wire would lose ``prequant=True`` and GEMM1 would try to quantize an
         already-quantized operand.
         """
-        from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import run_stage12_rs
+        from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import (
+            hosts_reduce_as_atomic,
+            run_stage12_rs,
+        )
 
         cfg = self.cfg
         box: list = [None]
         captured: dict = {}
         mega_ag = self._mega_ag(plan)
+        zero_partial = g2_cfg["epilog"] == "reduce" and hosts_reduce_as_atomic()
         # GEMM1 reads the *shuffled* scale; the kernel also needs the gathered
         # one it shuffles from, which is the arena region the push fills.
         raw_scale = comm.payload_views(local_tokens * cfg.world_size)[1] if mega_ag else None
@@ -1265,6 +1319,22 @@ class MegaMoeTP:
             kernelName2="",
             **_kwargs,
         ):
+            if zero_partial:
+                # A ``reduce``-tuned row reaches here with an *unzeroed* buffer
+                # -- the sort only zeroes when its ``accumulate`` says the
+                # epilogue accumulates, and the tuned epilogue does not. The
+                # merged kernel re-emits GEMM2 atomically anyway, so it does.
+                #
+                # Zeroing here rather than fixing the sort's flag because there
+                # are two sorts: this layer's hoisted one and the one inside
+                # ``_fused_moe_impl``, which applies the same rule from the
+                # tuned metadata and cannot see what the merged kernel chose.
+                # Patching only the hoisted one silently does nothing, which is
+                # how this cost a full debugging round: the symptom is a result
+                # that *doubles* on the second call, and an accuracy check that
+                # runs after warmup reads it as uncorrelated rather than as an
+                # obvious overflow.
+                moe_out.zero_()
             box[0] = run_stage12_rs(
                 g1=captured,
                 w2=w2,
@@ -1286,6 +1356,7 @@ class MegaMoeTP:
                 ascale_raw=raw_scale if mega_ag else None,
                 topk=cfg.topk,
                 fuse_ag=mega_ag,
+                waves_per_eu=plan.waves_per_eu,
             )
             return moe_out
 
@@ -1339,7 +1410,7 @@ class MegaMoeTP:
         # but that is where the small-M garbage lives (see ``_STAGE12``), so it
         # is excluded until the inline-quant path is understood. No loss for the
         # single-family direction: that path is FP4 at every shape.
-        fuse12 = _STAGE12 and a1_scale is not None and self._fuses_stage12(plan)
+        fuse12 = _stage12_on() and a1_scale is not None and self._fuses_stage12(plan)
         if a1_scale is None and not (_BF16_VIA_IMPL or fuse12):
             return (
                 fused_moe(
@@ -1499,6 +1570,14 @@ class MegaMoeTP:
         Same rule ``_fused_moe_impl`` applies internally, reused rather than
         re-derived so a hoisted sort cannot disagree with an inline one about
         whether the buffer needs zeroing.
+
+        This reads as if it needed an exception for a ``reduce``-tuned row that
+        the merged kernel hosts with the *atomic* epilogue, which does
+        accumulate and so does need the zeroing. It does not:
+        ``stage2_uses_route_reduce`` only recognises the v1 stage2, and every
+        row here is v2, so this already returns True for them. Verified by
+        printing the buffer stage2 receives -- ``[M, H]``, not the ``(0, 0)``
+        placeholder ``moe_sorting`` hands back when ``accumulate`` is False.
         """
         from aiter.fused_moe import stage2_uses_route_reduce
 
@@ -1555,6 +1634,9 @@ class _CasePlan:
     metadata: object | None = None
     gemm_bucket: int = 0
     fuse_rs: bool = False
+    #: Compile hint for the merged kernel; 0 leaves it to the allocator. Not
+    #: derivable from the kernel names, so it travels on the plan.
+    waves_per_eu: int = 0
 
 
 def _prequant_transform(metadata):

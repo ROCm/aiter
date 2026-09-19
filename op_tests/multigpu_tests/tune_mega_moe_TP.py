@@ -69,6 +69,7 @@ from aiter.ops.flydsl.mega_moe_tp import (  # noqa: E402
     pinned_default_choice,
     pinned_kernel_names,
     set_pin_override,
+    set_stage12_override,
 )
 
 logger = logging.getLogger("tune_mega_moe_tp")
@@ -105,6 +106,9 @@ CSV_COLUMNS = [
     "mega",
     "mega_us",
     "nomega_us",
+    # Not derivable from either kernel name: a compile hint on the merged
+    # kernel. 0 means "let the register allocator decide".
+    "waves_per_eu",
     "_tag",
 ]
 
@@ -115,6 +119,10 @@ _TUNE_RTOL = 0.06
 #: Axes swept in each coordinate-descent pass.
 _G1_AXES = ("block_m_nt", "g1_bn", "g1_bk")
 _G2_AXES = ("g2_tn", "g2_tk", "g2_epilog", "g2_nt")
+#: Walked as its own pass: it is a compile hint on the merged kernel rather
+#: than a tile, so it interacts with every other axis and none of them in
+#: particular, and giving it a pass of its own keeps the descent cheap.
+_KERNEL_AXES = ("waves_per_eu",)
 
 
 def _axis_value(choice: dict, axis: str):
@@ -131,7 +139,7 @@ def _axis_value(choice: dict, axis: str):
 
 def _neighbours(candidates: list[dict], current: dict, axes: tuple[str, ...]):
     """Candidates differing from ``current`` only along ``axes``."""
-    fixed = [a for a in (*_G1_AXES, *_G2_AXES) if a not in axes]
+    fixed = [a for a in (*_G1_AXES, *_G2_AXES, *_KERNEL_AXES) if a not in axes]
     out = []
     for cand in candidates:
         if all(_axis_value(cand, a) == _axis_value(current, a) for a in fixed):
@@ -145,6 +153,7 @@ def _describe(choice: dict) -> str:
         f"_g1n{choice['g1_bn']}k{choice['g1_bk']}"
         f"_g2n{choice['g2_tn']}k{choice['g2_tk']}"
         f"_{choice['g2_epilog']}{'_nt' if choice['g2_nt'] else ''}"
+        f"{'_wpe%d' % choice['waves_per_eu'] if choice.get('waves_per_eu') else ''}"
     )
 
 
@@ -224,7 +233,7 @@ def _tune_cell(moe, inputs, candidates, args, ctx, bucket, log_prefix: str,
     best_us = us_default
     for pass_no in range(args.passes):
         improved = False
-        for axes in (_G1_AXES, _G2_AXES):
+        for axes in (_G1_AXES, _G2_AXES, _KERNEL_AXES):
             for cand in _neighbours(candidates, current, axes):
                 us = timed_us(cand)
                 if us < best_us:
@@ -257,6 +266,7 @@ def _time_mega_ab(moe, inputs, best, args, ctx):
     set_pin_override(best)
     out = {}
     for label, flag in (("mega", True), ("nomega", False)):
+        set_stage12_override(flag)
         set_mega_override(flag)
         try:
             moe(inputs)
@@ -277,6 +287,7 @@ def _time_mega_ab(moe, inputs, best, args, ctx):
             )
         except Exception:  # noqa: BLE001
             out[label] = float("inf")
+    set_stage12_override(None)
     set_mega_override(None)
     set_pin_override(None)
     return out["mega"] <= out["nomega"], out["mega"], out["nomega"]
@@ -313,6 +324,13 @@ def parse_args(argv=None):
         default=2,
         help="Coordinate-descent passes over (GEMM1 axes, GEMM2 axes). A second "
         "pass lets a GEMM2 win pull block_m somewhere the first pass rejected.",
+    )
+    p.add_argument(
+        "--atomic-only",
+        action="store_true",
+        help="Restrict the search to atomic-epilogue configs but leave the "
+        "merged kernel alone. Isolates what the epilogue itself costs from "
+        "what hosting it in one kernel costs -- --mega-only conflates the two.",
     )
     p.add_argument(
         "--mega-only",
@@ -361,6 +379,8 @@ def main(argv=None) -> int:
         moe = MegaMoeTP(weights, ctx, max_local_tokens=max_local, ag_wire_quant="auto")
         split = SplitTpMoe(weights, ctx, max_local)
         candidates = pinned_candidates(moe.config)
+        if args.atomic_only:
+            candidates = [c for c in candidates if c["g2_epilog"] == "atomic"]
         if args.mega_only:
             from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import (
                 stage12_supported,
@@ -382,6 +402,10 @@ def main(argv=None) -> int:
                     return False
 
             candidates = [c for c in candidates if _hostable(c)]
+            # Both, not just the second: ``_mega_ag`` short-circuits on stage12
+            # being off, so forcing only the AllGather tunes the three-kernel
+            # path while reporting mega numbers.
+            set_stage12_override(True)
             set_mega_override(True)
         if ctx.rank == 0:
             logger.info(
@@ -433,6 +457,7 @@ def main(argv=None) -> int:
                         "doweight_stage1": 0,
                         "gate_mode": "SEPARATED",
                         "block_m": best["block_m"],
+                        "waves_per_eu": best.get("waves_per_eu", 0),
                         "ksplit": 0,
                         "kernelName1": kernel1,
                         "kernelName2": kernel2,

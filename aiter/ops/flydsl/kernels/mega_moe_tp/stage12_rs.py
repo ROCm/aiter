@@ -48,11 +48,13 @@ fed it; with producer and consumer now in the same CTA that cannot happen.
 # protocol". The other kernel modules omit it for the same reason.
 
 import functools
+import hashlib
 import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
@@ -61,11 +63,16 @@ from ..mxfp4_gemm_common import _udiv, _umod, global_typed_ptr
 from .. import communication_ops_utils as comm
 from .p2p import desc_slot
 from ..mxmoe_dispatcher import compile_gemm2_a4w4_port
-from ..tensor_shim import _run_compiled as run_compiled
+from ..tensor_shim import _run_compiled as run_compiled, buf_copy_atom, ptr_buf_tensor
 from .reduce_scatter import MAX_SERVICE_BLOCKS, RS_UNIT_ELEMS
 from .rs_tail import emit_phase_barrier, emit_rs_tail, read_epoch, rs_tail_slots
 
-__all__ = ["compile_stage12_rs", "run_stage12_rs", "stage12_supported"]
+__all__ = [
+    "compile_stage12_rs",
+    "hosts_reduce_as_atomic",
+    "run_stage12_rs",
+    "stage12_supported",
+]
 
 _BLOCK = 256
 _SERVICE_BLOCKS = min(
@@ -75,6 +82,64 @@ _SERVICE_BLOCKS = min(
 #: A/B that against the old persistent grid, which was pinned to the CU count
 #: because the inter-phase barrier required every CTA resident.
 _GRID_CU = int(os.environ.get("AITER_TP_STAGE12_GRID", "0"))
+#: Minimum waves per EU to compile for, i.e. a VGPR cap. 0 leaves it to the
+#: register allocator.
+#:
+#: This kernel's register budget is the *peak* over quantize, push, A-scale
+#: shuffle, both GEMMs and the ReduceScatter tail, and its LDS is
+#: ``max(g1, g2)`` -- so GEMM2 runs at GEMM1's footprint rather than its own.
+#: Left to itself the allocator sometimes lands well below what the GEMMs want.
+#:
+#: 2 is a net win over the whole sweep (mean 1.128 -> 1.136, median 1.076 ->
+#: 1.183, 14 losses -> 11) but it is really a *per-shape* choice -- dsv4 gains
+#: 15-17% at M=64..2048 and glm5 2-10%, while kimi3 and dsv3 give back 0.4-4.5%
+#: at small M -- so it is also a tuned axis, carried on the plan and passed as
+#: ``waves_per_eu``. This env value is only the fallback for an untuned shape.
+#: 3 and 4 are worse everywhere (spills), so the axis is two-valued.
+_WAVES_PER_EU = int(os.environ.get("AITER_TP_MEGA_WAVES_PER_EU", "2"))
+#: Skip a phase of the merged kernel. WRONG RESULTS; a timing probe only.
+#: "g1" / "g2" / "both" drop those tiles, so the difference against a full run
+#: is that phase's cost *inside this kernel* -- which is what has to be
+#: compared against the standalone kernel's, not the total. Use "both" to price
+#: GEMM1: "g1" on its own leaves GEMM2 reading uninitialised E8M0 scales and
+#: the run dies, so take (skip g2) - (skip both) instead.
+#:
+#: This is how the large-M deficit was pinned down. At M=8192, GEMM2 costs
+#: **1.6-2.8x inside this kernel** what it costs as its own launch:
+#:
+#:     kimi3  947.5 us in-kernel vs 410.7 standalone  (2.31x)
+#:     dsv4   890.8            vs 552.2              (1.61x)
+#:     glm5   994.2            vs 355.8              (2.79x)
+#:
+#: and that excess (537 / 339 / 638 us) is most of the whole gap against the
+#: split path (817 / 500 / 855 us).
+#:
+#: The cause is **register pressure**, not LDS and not L2 locality. Compiled
+#: ISA (`FLYDSL_DUMP_IR=1`), kimi3 M=8192:
+#:
+#:     GEMM1 standalone   65 KB LDS   230 VGPR   0 B scratch
+#:     GEMM2 standalone   32 KB LDS   128 VGPR   0 B scratch
+#:     merged             65 KB LDS   256 VGPR   172 B scratch
+#:
+#: The merged kernel sits at the 256 arch-VGPR ceiling and spills, with the
+#: scratch traffic spread through the MFMA-heavy regions rather than confined
+#: to a cold path. Dropping the AllGather front (`fuse_ag=False`) leaves it
+#: byte-identical at 256/172, so it is the two GEMMs alone that do it.
+#:
+#: Two plausible explanations were measured and rejected first, both worth
+#: recording because they look right:
+#:   * LDS occupancy. Forcing GEMM1 to a 19 KB tile (8 CTA/CU) instead of 65 KB
+#:     (2 CTA/CU) -- a 4x occupancy swing -- moved GEMM2 in-kernel by **9%**
+#:     (891.6 -> 812.9 us) and left the ratio at ~2x. The total got *worse*
+#:     because GEMM1 degrades at BM32.
+#:   * L2 swizzle. The merged kernel cannot use GEMM2's `spart` partitioning
+#:     (`stage12_supported` rejects it). Disabling `MXFP4_G2_SPART` on the
+#:     standalone kernel costs it **0-4%**, so that is not the gap either.
+#:
+#: One function means one register allocation, and two register-hungry GEMMs
+#: do not fit. Not removable without un-fusing, which is what `mega=0` at
+#: M>=2048 does.
+_SKIP = os.environ.get("AITER_TP_MEGA_SKIP", "")
 #: Run the in-kernel A-scale shuffle. Whether GEMM1 wants the gathered scale in
 #: token order or in sorted+swizzled order decides this, and the two differ by a
 #: whole kernel, so it is a knob until measured rather than an assumption.
@@ -154,6 +219,197 @@ def emit_ascale_shuffle(
                     dst[_mx_scale_shuffle_idx(scaleN_pad, row, c)] = src[base + c]
 
 
+# The staged routes are written by one CTA and read back, inside the same
+# launch, by another that may sit on a different XCD -- and MI355X L2 is
+# per-XCD. Rather than bracket that with a release/acquire fence pair (an L2
+# writeback and a full invalidate, per sort block, which would throw away the
+# GEMM weight locality this kernel depends on), give the two accesses a cache
+# policy: `sc1` on the store puts the line past L2, `sc0` on the load fetches
+# past it. Same pairing the a8w4 comm-fused megakernel uses for its own route
+# buffer.
+_ROUTE_STORE_SC1 = 0x10
+_ROUTE_LOAD_SC0 = 0x1
+#: What a ``reduce``-tuned row does inside the merged kernel.
+#:
+#: ``atomic`` re-emits GEMM2 with the atomic epilogue, keeping the tuned tile
+#: but not the tuned epilogue. ``inline`` keeps the staging buffer and hosts the
+#: reduction here (:func:`emit_route_reduce`).
+#:
+#: ``atomic`` is the default: ``inline`` cannot be made fast, and the reason
+#: is structural rather than a missing optimisation. ``atomic`` needs the
+#: partial zeroed, which the sort does not do for a reduce-tuned row -- see
+#: ``zero_partial`` in :meth:`MegaMoeTP._fused_stage12`.
+#:
+#: ``inline`` cannot be made fast, and the reason is structural rather than a
+#: missing optimisation. Staging moves
+#: ``M * topk * H`` twice where the atomic epilogue moves ``M * H`` once -- at
+#: kimi3 M=8192 that is 939 MB out and 939 MB back in, against 117 MB. The
+#: three-kernel path absorbs that because its reduction is its own launch with
+#: one CTA per token; here it runs inside CTAs whose LDS and register budget
+#: are set by the GEMMs, which leaves about two waves per SIMD. Measured at
+#: kimi3 M=8192: the gather alone costs 1528 us for 1.05 GB (~0.7 TB/s, a tenth
+#: of what the part is worth), and it scales linearly with route count -- one
+#: route instead of eight costs 182 us. Latency-bound at GEMM occupancy, not
+#: fixable by a better loop; four loop shapes were tried.
+_ROUTE_HOST = os.environ.get("AITER_TP_MEGA_REDUCE_HOST", "atomic")
+#: How the staged routes are made visible to the consuming CTA.
+#:   0 - plain stores/loads, release+acquire fences  (default)
+#:   1 - `sc1` stores, `sc0` loads, no fences
+#:   2 - `sc1` stores, plain loads, release+acquire fences
+#:
+#: 1 and 2 both give the wrong answer, and since 2 keeps the fences the fault
+#: is the `sc1` *store*, not the visibility protocol: passing
+#: ``_reduce_store_cache_modifier`` switches GEMM2 to a different 128-bit
+#: epilogue branch (``mxmoe_gemm_v2``), which only the a8w4 comm-fused producer
+#: exercises and which evidently does not reproduce the default branch for this
+#: configuration. Left as a knob because it is the way to drop the release
+#: fence; the fence form is correct and is what ships.
+_ROUTE_VIS = int(os.environ.get("AITER_TP_MEGA_ROUTE_VIS", "0"))
+#:   3 - plain stores, `sc0` loads, release fence only (no L2 invalidate)
+#:   4 - nothing. WRONG RESULTS; exists only to price the fences.
+#:   5 - counter bumps but no reduction. WRONG RESULTS; prices the gather.
+#:   6 - neither. WRONG RESULTS; prices the `reduce` epilogue on its own.
+#:   7 - gather one route instead of `topk`. WRONG RESULTS; prices the width.
+_ROUTE_SC1_STORE = _ROUTE_VIS in (1, 2)
+_ROUTE_RELEASE = _ROUTE_VIS in (0, 2, 3)
+_ROUTE_ACQUIRE = _ROUTE_VIS in (0, 2)
+_ROUTE_LOAD_MOD = 0 if _ROUTE_VIS in (0, 2) else _ROUTE_LOAD_SC0
+_ROUTE_COUNT = _ROUTE_VIS != 6
+_ROUTE_GATHER = _ROUTE_VIS not in (5, 6)
+_ROUTE_WIDTH1 = _ROUTE_VIS == 7
+#: bf16 elements per route access -- 16 bytes, the widest buffer op.
+_ROUTE_VEC = 8
+
+
+def _route_view(arg):
+    """Flat bf16 V# over *arg*, indexed in ``_ROUTE_VEC``-element units.
+
+    Unit-strided, not element-strided. ``unit_stride=1`` would let a caller
+    slice at any element, but it also declares the pointer 2-byte aligned,
+    which is all a 16-byte access could then rely on -- and a 128-bit copy atom
+    under a 2-byte alignment gets scalarised. Every offset here is a multiple
+    of ``_ROUTE_VEC`` anyway, so the strided form costs nothing and keeps the
+    access a single ``buffer_load_dwordx4``.
+    """
+    return ptr_buf_tensor(arg, fx.BFloat16, unit_elems=_ROUTE_VEC)
+
+
+@flyc.jit
+def emit_route_reduce(
+    arg_stids,
+    arg_counter,
+    arg_target,
+    arg_partial,
+    mb,
+    i32_M,
+    i32_num_valid,
+    tid,
+    lds_raw,
+    *,
+    BM: int,
+    topk: int,
+    model_dim: int,
+):
+    """Reduce a token's topk staged routes as soon as the last one is written.
+
+    The ``reduce`` epilogue stages GEMM2 output at ``target[token][slot][:]``
+    and a separate pass sums the ``topk`` slots of each token. Hosting that pass
+    here looks like it needs a grid-wide barrier after GEMM2 -- a token's routes
+    go to different experts, so they land in different sort blocks, and no CTA
+    holds all of them. A barrier would put the grid back under the co-residency
+    cap this kernel was built to escape.
+
+    It does not. The dependency is per *token*, not grid-wide: bump a counter
+    for each row this block produced, and whichever CTA takes a token's count to
+    ``topk`` owns that token's reduction. CTAs never wait on each other, so the
+    grid can stay as large as the sort block count.
+
+    The counter needs no memset beyond its first: the winner subtracts ``topk``
+    on its way out, and since a launch performs exactly ``topk`` increments per
+    token, the counter is back at zero by the time the next launch starts.
+    Generation counting was the obvious alternative and is wrong twice over --
+    the ReduceScatter epoch advances on *atomic* launches too, so a shared
+    counter would drift, and a host-side generation is frozen by CUDA-graph
+    capture, which this path is meant to run under.
+    """
+    # LDS scratch: for each of this block's rows, the token it won, or -1.
+    # Safe to reuse the GEMM region -- this runs between a block's last GEMM2
+    # tile and the next block's first GEMM1 tile, with barriers on both sides.
+    if const_expr(not _ROUTE_COUNT):
+        return
+    scratch = fx.recast_iter(fx.Int32, lds_raw)
+    base = mb * fx.Int32(BM)
+    if tid < fx.Int32(BM):
+        row = base + tid
+        tok = fx.Int32(-1)
+        if row < i32_num_valid:
+            info = global_typed_ptr(arg_stids, T.i32)[row]
+            # Same bound GEMM2's reduce epilogue applies when it stages the
+            # row: a row it skipped must not be counted as an arrival.
+            t = info & fx.Int32(0xFFFFFF)
+            if t < i32_M:
+                addr = fx.Int64(arg_counter) + fx.Int64(t) * fx.Int64(4)
+                prev = fx.Int32(comm.atomic_add_agent(addr, fx.Int32(1)))
+                if prev == fx.Int32(topk - 1):
+                    # Last route in for this token: reduce it, and hand the
+                    # counter back at zero for the next launch.
+                    comm.atomic_add_agent(addr, fx.Int32(-topk))
+                    tok = t
+        scratch[tid] = tok
+    gpu.barrier()
+    if const_expr(not _ROUTE_GATHER):
+        return
+
+    # Rows outside, columns inside. The flattened (row, column) form needs an
+    # integer division per iteration to recover the row, and a non-winning row
+    # still costs its whole share of iterations; this way a non-winning row is
+    # one LDS read and a branch for the entire workgroup.
+    #
+    # No barrier in this loop. The first version had one per row and was 30x
+    # slower than the three-kernel path.
+    NCOL = model_dim // _ROUTE_VEC
+    n_route = 1 if _ROUTE_WIDTH1 else topk
+    src = _route_view(arg_target)
+    dst = _route_view(arg_partial)
+    load = buf_copy_atom(_ROUTE_VEC * 2, fx.BFloat16, cache_modifier=_ROUTE_LOAD_MOD)
+    store = buf_copy_atom(_ROUTE_VEC * 2, fx.BFloat16)
+    # One fragment per route, not one reused across them: sharing it makes each
+    # load wait for the previous one to be consumed, so the routes serialise at
+    # full memory latency with no other wave to hide them.
+    frags = [fx.make_fragment_like(fx.slice(src, (0, None))) for _ in range(n_route)]
+    for r in range_constexpr(BM):
+        t = scratch[fx.Int32(r)]
+        if t >= fx.Int32(0):
+            tbase = t * fx.Int32(topk * NCOL)
+            obase = t * fx.Int32(NCOL)
+            for cg in range(tid, fx.Int32(NCOL), fx.Int32(_BLOCK)):
+                c = fx.Int32(cg)
+                for k in range_constexpr(n_route):
+                    fx.copy(
+                        load,
+                        fx.slice(src, (tbase + c + fx.Int32(k * NCOL), None)),
+                        frags[k],
+                    )
+                acc = [fx.Float32(0.0) for _ in range(_ROUTE_VEC)]
+                for k in range_constexpr(n_route):
+                    v = fx.Vector(fx.memref_load_vec(frags[k]))
+                    for e in range_constexpr(_ROUTE_VEC):
+                        acc[e] = acc[e] + fx.Float32(v[e])
+                fx.memref_store_vec(
+                    fx.Vector.from_elements(acc, fx.Float32).to(fx.BFloat16), frags[0]
+                )
+                fx.copy(store, frags[0], fx.slice(dst, (obase + c, None)))
+
+
+def hosts_reduce_as_atomic() -> bool:
+    """Whether a ``reduce``-tuned row runs its GEMM2 atomically in here.
+
+    The sort has to know: an atomic epilogue accumulates and needs its output
+    buffer zeroed, a reduce epilogue stages elsewhere and does not.
+    """
+    return _ROUTE_HOST != "inline"
+
+
 def stage12_supported(g1_cfg, g2_cfg, model_dim: int) -> bool:
     """Whether this tuned (GEMM1, GEMM2) pair can share one kernel.
 
@@ -179,24 +435,16 @@ def stage12_supported(g1_cfg, g2_cfg, model_dim: int) -> bool:
     # that happened to pass" is how the BM16 bug got shipped once already.
     if int(g1_cfg.get("BM", 0)) == 16:
         return False
-    # ``reduce`` is excluded on a dependency argument, not a to-do.
+    # ``reduce`` is hosted, not excluded. Its reduction sums a token's topk
+    # routes, which live in different sort blocks, so it looks like it needs a
+    # grid-wide barrier after GEMM2 -- the one thing this kernel gave up to let
+    # its grid exceed what the device holds at once. It does not: the dependency
+    # is per token, and ``emit_route_reduce`` expresses it with a counter.
     #
-    # That epilogue stages per-route rows and needs a reduction afterwards, and
-    # the reduction sums the topk routes of one token. Those routes go to
-    # different experts, so they land in different sort blocks -- meaning no CTA
-    # holds all of any token's routes and the reduction needs a grid-wide sync
-    # after GEMM2. This kernel is free of grid-wide syncs precisely so its grid
-    # can exceed what the device holds at once; adding one back costs more than
-    # the coverage is worth, and the ``reduce`` rows are the large-M ones where
-    # grid parallelism matters most.
-    #
-    # Block size is *not* the obstacle, contrary to an earlier reading here:
-    # capping the reduction at 256 threads measured 1.00-1.06x against its
-    # natural 512/1024 on the six cells that use it.
-    #
-    # Forcing those shapes onto ``atomic`` is not free either -- the tuner picks
-    # ``reduce`` at large M because it wins (kimi3 M=32768: 3690 us vs 5274 us).
-    if g2_cfg.get("epilog") != "atomic" or g2_cfg.get("persist"):
+    # Block size was never the obstacle, contrary to an earlier reading here:
+    # capping the standalone reduction at 256 threads measured 1.00-1.06x
+    # against its natural 512/1024.
+    if g2_cfg.get("epilog") not in ("atomic", "reduce") or g2_cfg.get("persist"):
         return False
     # One CTA owns one sort block through both GEMMs, so the two tile_m must
     # agree -- a GEMM2 tile narrower than the GEMM1 block would read rows this
@@ -246,9 +494,24 @@ def compile_stage12_rs(
     b_dtype: str,
     topk: int = 0,
     fuse_ag: bool = False,
+    g2_epilog: str = "atomic",
+    waves_per_eu: int = 0,
     service_blocks: int = _SERVICE_BLOCKS,
 ):
     """Build the fused GEMM1 + GEMM2 + ReduceScatter launcher for one row pair."""
+    # A ``reduce``-tuned row can run either epilogue here; see ``_ROUTE_HOST``.
+    # ``g2_tag`` keeps the *tuned* epilogue in the kernel name even when the
+    # hosted one is rewritten: the name is the module cache key, and a
+    # reduce-tuned row that ends up atomic would otherwise collide with a
+    # genuinely atomic row that happens to share tile sizes -- different GEMM1
+    # configs, one compiled kernel.
+    # Captured before any of it is normalised below, so the signature covers
+    # exactly what the caller asked for.
+    _config = dict(locals())
+    g2_tag = "_red" if g2_epilog == "reduce" else ""
+    if g2_epilog == "reduce" and _ROUTE_HOST != "inline":
+        g2_epilog = "atomic"
+        g2_tag = "_reda"
     if not 1 <= tp_size <= 8:
         raise ValueError(f"tp_size must be in [1, 8], got {tp_size}")
 
@@ -341,14 +604,28 @@ def compile_stage12_rs(
         ag_done_index = 0
 
     def g2_compose(*, module_name, emit_gemm2_tile, shared_storage, lds_bytes, **_):
-        merged_lds = max(int(lds_bytes), g1_lds_bytes)
+        # ``2 * g2_BM`` int32 of that region is also the route-reduce scratch.
+        merged_lds = max(int(lds_bytes), g1_lds_bytes, 2 * g2_BM * 4)
         # model_dim and g2_BN are both compile-time here, so the GEMM2 n-block
         # count is too -- which lets the inner loop be unrolled instead of
         # re-deriving the bound from i32_hidden on every row block.
         G2_N_BLOCKS = int(model_dim) // int(g2_BN)
+        # The name is the module cache key, so everything that changes the
+        # binary has to be in it. The readable part is not enough on its own:
+        # GEMM1's BN/BK, the ``nt`` flags, GEMM2's BK and ``waves_per_eu`` all
+        # change the code and none of them appear there. Cells that differ only
+        # in those shared a name, and whichever compiled first in the process
+        # won -- five dsv4 cells moved together by ~19% between runs because of
+        # it, which reads as irreproducible timing rather than as a bug.
+        sig = hashlib.sha256(
+            repr(
+                (_config, _ROUTE_HOST, _ROUTE_VIS, _ASCALE_SHUFFLE, _SKIP)
+            ).encode()
+        ).hexdigest()[:12]
         name = (
             f"mega_moe_tp_{'mega' if fuse_ag else 'stage12'}_rs_tp{tp_size}"
-            f"_h{model_dim}_g1bm{g1_BM}_g2bm{g2_BM}x{g2_BN}_sv{service_blocks}"
+            f"_h{model_dim}_g1bm{g1_BM}_g2bm{g2_BM}x{g2_BN}"
+            f"{g2_tag}_sv{service_blocks}_{sig}"
         )
 
         @fx.struct
@@ -387,6 +664,8 @@ def compile_stage12_rs(
             arg_ag_desc: fx.Int64,
             arg_ascale_raw: fx.Int64,
             i32_max_sorted: fx.Int32,
+            arg_route_target: fx.Int64,
+            arg_route_counter: fx.Int64,
         ):
             tx_i32 = fx.Int32(gpu.thread_id("x"))
             bx_i32 = fx.Int32(gpu.block_id("x"))
@@ -410,13 +689,13 @@ def compile_stage12_rs(
             # AllGather and the expert sort ran before the launch, because the
             # sort reads the route and GEMM1 reads the sort.
             #
-            # The barrier below is why this grid has to be persistent. Every CTA
-            # continues into GEMM1 afterwards, so every CTA waits here, and a
-            # waiting CTA holds its slot; if the grid were larger than what the
-            # device holds at once, the CTAs still queued would be the ones
-            # whose push nobody is waiting for, and the wait would never end.
-            # The standalone push does not have this problem only because its
-            # CTAs exit at the barrier instead of going on.
+            # An in-kernel collective looks like it forces a persistent grid --
+            # every CTA waits here and then continues, so a queued CTA would
+            # starve the pushers it is waiting on. It does not, because the push
+            # is pinned to the lowest ``push_ctas`` block ids: those are
+            # dispatched first, so they always get to run, and every other CTA
+            # only spins on a flag, which costs nothing while queued. See the
+            # grid sizing in :func:`run_stage12_rs`.
             if fuse_ag:
                 ag_epoch0 = epoch
                 # Clamp to the actual grid: a shape whose sort blocks number
@@ -615,7 +894,7 @@ def compile_stage12_rs(
                         )
                         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                         gpu.barrier()
-                    for nb1 in range_constexpr(g1_n_blocks):
+                    for nb1 in range_constexpr(0 if _SKIP in ("g1", "both") else g1_n_blocks):
                         # Unconditional: reusing LDS across tiles is not safe
                         # without it, and a Python-level "skip the first one" flag
                         # would be evaluated at trace time and emit nothing.
@@ -648,7 +927,7 @@ def compile_stage12_rs(
                     rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                     gpu.barrier()
 
-                    for nb2 in range_constexpr(G2_N_BLOCKS):
+                    for nb2 in range_constexpr(0 if _SKIP in ("g2", "both") else G2_N_BLOCKS):
                         gpu.barrier()
                         m_block_idx = mb
                         n_block_idx = fx.Int32(nb2)
@@ -661,7 +940,7 @@ def compile_stage12_rs(
                             arg_stids,
                             arg_sweights,
                             arg_bias2,
-                            arg_out,
+                            arg_route_target if g2_epilog == "reduce" else arg_out,
                             m_block_idx,
                             n_block_idx,
                             lane,
@@ -671,6 +950,35 @@ def compile_stage12_rs(
                             i32_inter,
                             i32_hidden,
                             lds,
+                        )
+
+                    if g2_epilog == "reduce":
+                        # GEMM2 staged this block's rows at
+                        # target[token][slot][:]; every slot of those tokens is
+                        # only complete once every expert they routed to has run.
+                        # The counter below expresses exactly that, per token,
+                        # instead of a grid-wide barrier -- see
+                        # :func:`emit_route_reduce`.
+                        # `sc1` already put the staged rows past L2, so the
+                        # release is just the wait; without it this needs the
+                        # writeback fence.
+                        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                        if const_expr(_ROUTE_RELEASE and _ROUTE_GATHER):
+                            comm.fence_agent_release()
+                        gpu.barrier()
+                        emit_route_reduce(
+                            arg_stids,
+                            arg_route_counter,
+                            arg_route_target,
+                            arg_out,
+                            mb,
+                            i32_M,
+                            cumsum0,
+                            tx_i32,
+                            lds_raw,
+                            BM=g2_BM,
+                            topk=topk,
+                            model_dim=model_dim,
                         )
 
             # -- ReduceScatter -----------------------------------------------
@@ -719,6 +1027,8 @@ def compile_stage12_rs(
             arg_ag_desc: fx.Int64,
             arg_ascale_raw: fx.Int64,
             i32_max_sorted: fx.Int32,
+            arg_route_target: fx.Int64,
+            arg_route_counter: fx.Int64,
             i32_grid: fx.Int32,
             stream: fx.Stream,
         ):
@@ -751,6 +1061,8 @@ def compile_stage12_rs(
                 arg_ag_desc,
                 arg_ascale_raw,
                 i32_max_sorted,
+                arg_route_target,
+                arg_route_counter,
             ).launch(
                 grid=(fx.Int64(i32_grid), 1, 1),
                 block=(_BLOCK, 1, 1),
@@ -767,11 +1079,11 @@ def compile_stage12_rs(
         BK=g2_BK,
         use_nt=g2_use_nt,
         HIDDEN_MAX=HIDDEN_MAX,
-        epilog="atomic",
+        epilog=g2_epilog,
         INTER_MAX=INTER_MAX,
         a_dtype=a_dtype,
         b_dtype=b_dtype,
-        topk=1,
+        topk=topk if g2_epilog == "reduce" else 1,
         SBM=g2_SBM,
         persist=False,
         g2_spart=g2_spart,
@@ -780,6 +1092,11 @@ def compile_stage12_rs(
         out_dtype="bf16",
         enable_bias=False,
         _composition=g2_compose,
+        # The staged routes are read back inside this same launch, by a CTA that
+        # may sit on another XCD, so they have to land past the per-XCD L2.
+        _reduce_store_cache_modifier=(
+            _ROUTE_STORE_SC1 if (g2_epilog == "reduce" and _ROUTE_SC1_STORE) else None
+        ),
     )
 
 
@@ -792,6 +1109,23 @@ class _G1Handle:
     """
 
     compile_hints: dict = {}
+
+
+_ROUTE_COUNTERS: dict = {}
+
+
+def _route_counter(M, device):
+    """The per-token arrival counter for the hosted ``reduce`` epilogue.
+
+    Zeroed once and cached: :func:`emit_route_reduce`'s winner hands it back at
+    zero, so it is self-maintaining from then on and costs no memset per launch.
+    """
+    key = (int(M), str(device))
+    ctr = _ROUTE_COUNTERS.get(key)
+    if ctr is None:
+        ctr = torch.zeros(int(M), dtype=torch.int32, device=device)
+        _ROUTE_COUNTERS[key] = ctr
+    return ctr
 
 
 def _ptr(t, fallback):
@@ -827,6 +1161,9 @@ def run_stage12_rs(
     ascale_raw=None,
     topk=0,
     fuse_ag=False,
+    waves_per_eu=None,
+    route_target=None,
+    route_counter=None,
     stream=None,
 ):
     """Launch GEMM1 + GEMM2 + ReduceScatter as one kernel.
@@ -838,6 +1175,7 @@ def run_stage12_rs(
     """
     g2_BM = g2_cfg["tile_m"]
     g2_SBM = g2_cfg["sort_block_m"] or (int(block_m) if block_m else g2_BM)
+    wpe = _WAVES_PER_EU if waves_per_eu is None else int(waves_per_eu)
     kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     launch = compile_stage12_rs(
         int(tp_size),
@@ -871,6 +1209,11 @@ def run_stage12_rs(
         b_dtype=g2_cfg["b_dtype"],
         topk=int(topk),
         fuse_ag=bool(fuse_ag),
+        g2_epilog=g2_cfg["epilog"],
+        # Part of the compile key *and* the kernel name: it changes the binary
+        # without changing any tile, so two cells that differ only here would
+        # otherwise share one compiled module.
+        waves_per_eu=wpe,
     )
 
     aqout = g1["inter_sorted_quant"]
@@ -886,44 +1229,63 @@ def run_stage12_rs(
     # published. The gate now uses the ReduceScatter epoch, which is bumped only
     # after every CTA has reached the tail and is therefore the same number for
     # every CTA no matter when it started.
+    if g2_cfg["epilog"] == "reduce":
+        # GEMM2 stages one row per route and the reduction runs later in the
+        # same kernel, so the staging buffer the 3-kernel path allocates is
+        # still needed -- it just never outlives the launch now.
+        if route_target is None:
+            route_target = torch.empty(
+                (int(M_logical), int(topk), int(model_dim)),
+                dtype=partial.dtype,
+                device=partial.device,
+            )
+        if route_counter is None:
+            route_counter = _route_counter(M_logical, partial.device)
+
     grid_blocks = (max_sorted + g2_BM - 1) // g2_BM
     if _GRID_CU > 0:
         grid_blocks = _GRID_CU  # override kept for A/B measurement
-    run_compiled(
-        launch,
-        int(g1["hidden_states"].data_ptr()),
-        _ptr(g1["a_quant"], g1["hidden_states"]),
-        _ptr(g1["a_scale_sorted_shuffled"], g1["hidden_states"]),
-        int(_as_u8(g1["w1_u8"]).data_ptr()),
-        int(_as_u8(g1["w1_scale_u8"]).data_ptr()),
-        int(_as_u8(w2).data_ptr()),
-        int(_as_u8(w2_scale).data_ptr()),
-        int(g1["sorted_expert_ids"].data_ptr()),
-        int(g1["cumsum_tensor"].data_ptr()),
-        int(sorted_token_ids.data_ptr()),
-        int(sorted_weights.data_ptr()),
-        _ptr(g1["m_indices"], sorted_token_ids),
-        _ptr(g1["bias"], partial),
-        int(partial.data_ptr()),  # unused bias2; any mapped address
-        int(aqout.data_ptr()),
-        int(g1["inter_sorted_shuffled_scale"].data_ptr()),
-        int(partial.data_ptr()),
-        int(g1["n_tokens"]),
-        int(M_logical),
-        int((max_sorted + g2_BM - 1) // g2_BM),
-        int(inter_dim),
-        int(model_dim),
-        int(desc_ptr),
-        int(rank),
-        int(local_rows),
-        int(ag_desc_ptr),
-        _ptr(ascale_raw, sorted_token_ids),
-        int(max_sorted),
-        # One CTA per sort block. Not a persistent grid any more: without the
-        # inter-phase barrier nothing requires co-residency, so this is the same
-        # shape the standalone GEMM1 launches and the hardware is free to hold
-        # as many CTAs per CU as LDS allows.
-        int(grid_blocks),
-        stream if stream is not None else torch.cuda.current_stream(),
-    )
+    # The jit compiles on first call, not on build, so the hint has to still be
+    # in scope at the launch.
+    hints = {"waves_per_eu": wpe} if wpe else {}
+    with CompilationContext.compile_hints(hints):
+        run_compiled(
+            launch,
+            int(g1["hidden_states"].data_ptr()),
+            _ptr(g1["a_quant"], g1["hidden_states"]),
+            _ptr(g1["a_scale_sorted_shuffled"], g1["hidden_states"]),
+            int(_as_u8(g1["w1_u8"]).data_ptr()),
+            int(_as_u8(g1["w1_scale_u8"]).data_ptr()),
+            int(_as_u8(w2).data_ptr()),
+            int(_as_u8(w2_scale).data_ptr()),
+            int(g1["sorted_expert_ids"].data_ptr()),
+            int(g1["cumsum_tensor"].data_ptr()),
+            int(sorted_token_ids.data_ptr()),
+            int(sorted_weights.data_ptr()),
+            _ptr(g1["m_indices"], sorted_token_ids),
+            _ptr(g1["bias"], partial),
+            int(partial.data_ptr()),  # unused bias2; any mapped address
+            int(aqout.data_ptr()),
+            int(g1["inter_sorted_shuffled_scale"].data_ptr()),
+            int(partial.data_ptr()),
+            int(g1["n_tokens"]),
+            int(M_logical),
+            int((max_sorted + g2_BM - 1) // g2_BM),
+            int(inter_dim),
+            int(model_dim),
+            int(desc_ptr),
+            int(rank),
+            int(local_rows),
+            int(ag_desc_ptr),
+            _ptr(ascale_raw, sorted_token_ids),
+            int(max_sorted),
+            _ptr(route_target, sorted_token_ids),
+            _ptr(route_counter, sorted_token_ids),
+            # One CTA per sort block. Not a persistent grid any more: without the
+            # inter-phase barrier nothing requires co-residency, so this is the same
+            # shape the standalone GEMM1 launches and the hardware is free to hold
+            # as many CTAs per CU as LDS allows.
+            int(grid_blocks),
+            stream if stream is not None else torch.cuda.current_stream(),
+        )
     return output[:local_rows]
