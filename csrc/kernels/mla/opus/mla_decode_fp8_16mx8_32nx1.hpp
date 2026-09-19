@@ -3,11 +3,11 @@
 // MLA decode forward on gfx950: fp8 Q x fp8 KV, 16mx8 / 32nx1, persistent scheduling.
 //   GEMM0 (Q*K^T): d = 576 = 512 nope + 64 rope      GEMM1 (P*V): d_v = 512
 //
-// Adapted from dsa_v32_splitkv.hpp; three departures from it drive most of the rest:
+// Adapted from mla_decode_mxfp8_16mx8_32nx1.hpp; three departures drive most of the rest:
 //   (A) COMBINED d=576 fp8 BUFFER. q_buffer / kv_buffer are one contiguous fp8 tensor,
 //       row-major with row stride D_HEAD_SIZE = 576. There is no separate rope tensor:
 //       "nope" is d in [0, 512), "rope" is d in [512, 576) reached by a +D_NOPE_SIZE base
-//       offset on the same pointer. rope is fp8 here (bf16 in dsa_v32).
+//       offset on the same pointer. rope is fp8 here (bf16 in the 3-buffer variant).
 //   (B) PER-TENSOR SCALAR DESCALE, no mxfp8 micro-scaling. q_scale_ptr / kv_scale_ptr are
 //       single floats whose product scales the scores, so the 16x16x128 f8f6f4 MFMA takes
 //       block scale `0` -- the literal, not 0_I (a number<0> makes the operand poison and
@@ -41,12 +41,12 @@
 // barrier is not a cost: of its 487-cycle arrival spread, 394 is between the two waves of
 // one SIMD (one computes while the other waits) and only ~46 cycles per SIMD are dead.
 
-#include "mla_fp8fp8_def.h"
+#include "mla_decode_traits.h"
 
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel(mla_kargs)
+__global__ void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_fp8_kargs)
 {
 }
 
@@ -79,7 +79,7 @@ constexpr int EXP     = 0x400;
 constexpr int KEEP_DS_READ_ORDER = 0x67F;
 } // namespace sched_masks
 
-// Interleave the 12 GEMM0 MFMA (dsa_v32's sched_compute_qk_dsa, retuned) so the
+// Interleave the 12 GEMM0 MFMA (the 3-buffer variant's QK schedule, retuned) so the
 // long-latency fp8 128-K MFMAs hide the K/rope DS_READs and the softmax-tail EXP/VALU.
 // EXP precedes VALU in each group because the row sum consumes the exps; Rpt should cover
 // the region's MFMA count, and groups that cannot be filled are dropped.
@@ -151,7 +151,7 @@ __device__ inline auto make_layout_q_nope(int warp_id, int lane_id)
 // +D_NOPE_SIZE, so the layout covers a 64-wide d range. The GEMM0_ROPE_E_K = 2 e_k slices
 // are an explicit y-dim (stride W_K_ROPE = 32 in d); each spreads W_K_ROPE over
 // WARP_SIZE/W_M = 4 lane-groups of VEC_Q_ROPE = 8 contiguous fp8 -> 8 fp8 per lane per
-// slice. Only difference from dsa_v32's version is the row seed: D_HEAD_SIZE (the
+// slice. Only difference from the 3-buffer variant is the row seed: D_HEAD_SIZE (the
 // combined row stride) instead of the split rope tensor's D_Q_SIZE.
 template <class T>
 __device__ inline auto make_layout_q_rope(int warp_id, int lane_id)
@@ -223,7 +223,7 @@ __device__ inline auto make_layout_kv_indices_rope(int warp_id, int lane_id)
 
 // K nope sub-range, d in [0, 512), fp8. The token dimension is folded into the per-thread
 // page offset (make_layout_kv_indices), so this layout only describes the d / warp
-// distribution: row-major d, seed {D_128B_NOPE_SIZE, 1}. dsa_v32's scheme plus the V-read
+// distribution: row-major d, seed {D_128B_NOPE_SIZE, 1}. the 3-buffer variant's scheme plus the V-read
 // bank swizzle.
 //
 // The swizzle has to be applied on the SOURCE side, which is why it appears here and not
@@ -667,7 +667,7 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t ne
 // the same accumulator.
 template <class Traits, bool STAGGER, class VQN, class VQR, class VO>
 __device__ __attribute__((always_inline)) void
-mla_decode_fwd_pipelined(mla_kargs kargs,
+mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
                          int kv_ind_ptr_s,
                          int valid_kv_len,
                          int tile_begin,
@@ -1225,7 +1225,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 // split-KV partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits, bool STAGGER>
 __device__ __attribute__((always_inline)) void
-mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_scale)
+mla_decode_fwd_one_req(opus_mla_decode_fp8_kargs kargs, int w, char* smem_kv, float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1238,14 +1238,14 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
     asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    const int* work_item                 = kargs.work_info_set + w * 8;
-    [[maybe_unused]] const int batch_idx = work_item[0];
-    const int slot                       = work_item[1];
-    const int q_len_ptr_s                = work_item[2];
-    const int q_len_ptr_e                = work_item[3];
-    const int kv_ind_ptr_s               = work_item[4];
-    const int kv_ind_ptr_e               = work_item[5];
-    [[maybe_unused]] const int kv_offset = work_item[6];
+    const opus_mla_decode_work_info work_item = kargs.work_info_set[w];
+    [[maybe_unused]] const int batch_idx = work_item.batch_idx;
+    const int slot                       = work_item.partial_slot;
+    const int q_len_ptr_s                = work_item.qo_start;
+    const int q_len_ptr_e                = work_item.qo_end;
+    const int kv_ind_ptr_s               = work_item.kv_start;
+    const int kv_ind_ptr_e               = work_item.kv_end;
+    [[maybe_unused]] const int kv_offset = work_item.kv_offset;
 
     const int q_len        = q_len_ptr_e - q_len_ptr_s;
     const int valid_kv_len = kv_ind_ptr_e - kv_ind_ptr_s;
@@ -1356,7 +1356,7 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
 // occupancy-2 launch bound is what caps the whole kernel at 256 VGPR.
 template <class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE,
-                             2) void mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel(mla_kargs kargs)
+                             2) void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_fp8_kargs kargs)
 {
     using namespace opus;
     using namespace mla_decode_fwd_16mx8_32nx1_fp8fp8;
