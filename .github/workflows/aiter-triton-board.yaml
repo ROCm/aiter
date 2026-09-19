@@ -8,6 +8,14 @@ name: AITER-triton Kernels board
 #   2. it is a PR whose diff touches Triton/Gluon code
 #   3. it carries the Triton/Gluon label.
 # Draft PRs wait until they are marked ready for review.
+#
+# Enabling it (org / repo admin):
+#   1. Grant the AITER CI GitHub App the organization permissions
+#      "Projects: Read & write" (to add items to the board) and
+#      "Members: read" (rule 1 reads the team roster), then accept the new
+#      permissions on the ROCm installation. Without "Members: read" the team
+#      lookup returns 403 and the assignee rule is skipped.
+#   2. Set the repository variable AITER_TRITON_BOARD_ADD to 'true'.
 
 on:
   pull_request_target:
