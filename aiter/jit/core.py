@@ -130,6 +130,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_TRITON_FMOE = os.getenv(
+    "AITER_CONFIG_TRITON_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_triton_fmoe.csv",
+)
+
 AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
     "AITER_CONFIG_COMM_FUSED_MOE",
     f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
@@ -247,6 +252,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_TRITON_FMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_TRITON_FMOE",
+            AITER_CONFIG_TRITON_FMOE,
+            "tuned_triton_fmoe",
         )
 
     @property
