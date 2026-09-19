@@ -26,15 +26,16 @@ def get_moe_dispatch(config_name: str, arch: str, backend: str) -> dict:
     tuned file is shipped for this arch and backend; callers fall back to
     their safe defaults.
 
-    ``arch`` keys the cache for callers that already resolved it;
-    ``resolve_config_dir()`` reads the same value from ``arch_info``. The
-    returned dict is the shared cached object -- treat it as read-only.
+    ``arch`` selects the table and keys the cache, so callers that already
+    resolved it do not pay a second lookup and tests can resolve a table for
+    an arch other than the running one. The returned dict is the shared
+    cached object -- treat it as read-only.
 
     Args:
         config_name: MOE family name, e.g. ``"A8W4"`` or ``"A4W4"``.
         arch: the running architecture, as the caller resolved it.
         backend: ``"triton"`` or ``"gluon"`` -- the consuming dispatch path.
     """
-    cfg_dir = resolve_config_dir("moe", config_name, backend=backend)
+    cfg_dir = resolve_config_dir("moe", config_name, backend=backend, arch=arch)
     dispatch = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     return dispatch if dispatch is not None else {}

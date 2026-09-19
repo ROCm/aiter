@@ -21,6 +21,7 @@ import triton
 
 from aiter.ops.triton.moe import moe_op_gemm_a16w4
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import get_kernel_config_triton
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _TABLE = (
     Path(moe_op_gemm_a16w4.__file__).resolve().parents[1]
@@ -56,16 +57,28 @@ class _Routing:
 
 def _stock_config(block_m, n, k):
     """What get_kernel_config_triton returns when no table is shipped."""
-    with mock.patch.object(moe_op_gemm_a16w4, "get_arch", lambda: _UNTUNED_ARCH):
-        return get_kernel_config_triton(
-            m=block_m, n=n, k=k, routing_data=_Routing(block_m)
-        )
+    get_moe_dispatch.cache_clear()
+    try:
+        with mock.patch.object(moe_op_gemm_a16w4, "get_arch", lambda: _UNTUNED_ARCH):
+            return get_kernel_config_triton(
+                m=block_m, n=n, k=k, routing_data=_Routing(block_m)
+            )
+    finally:
+        get_moe_dispatch.cache_clear()
 
 
 @pytest.fixture
 def on_gfx942(monkeypatch):
-    """Resolve as gfx942 regardless of the host the suite runs on."""
+    """Resolve as gfx942 regardless of the host the suite runs on.
+
+    ``get_moe_dispatch`` is lru_cached on ``(config_name, arch, backend)``;
+    clear it either side so a table resolved under another arch -- including
+    the untuned probe in ``_stock_config`` -- cannot leak into these tests.
+    """
+    get_moe_dispatch.cache_clear()
     monkeypatch.setattr(moe_op_gemm_a16w4, "get_arch", lambda: "gfx942")
+    yield
+    get_moe_dispatch.cache_clear()
 
 
 def test_table_matches_measured_tiles():
