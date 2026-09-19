@@ -27,6 +27,7 @@ _SCALE_GROUP_SIZE = 32
 _PADK = 2  # K-padding steps (of 128) baked into the packed A/B layout
 _PACKED_TILE_BYTES = 24576
 _SCALE_TILE_BYTES = 1024
+_MAX_BUFFER_BYTES = 1 << 31
 _PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
 _SHORT_K_SWIZZLE_LIMIT = 48 * _K_TILE
 _GROUPED_SWIZZLE_MAX_M = 16 * 32 * _TILE
@@ -42,10 +43,6 @@ if _QUANT_BACKEND not in {"auto", "hip", "triton"}:
         "AITER_MXFP6_QUANT_BACKEND must be one of auto, hip, or triton, "
         f"got {_QUANT_BACKEND!r}"
     )
-try:
-    _IS_GFX950 = torch.cuda.is_available() and get_gfx() == "gfx950"
-except (KeyError, RuntimeError):
-    _IS_GFX950 = False
 _TUNED_CONFIG_KEY_COLUMNS = ("gfx", "cu_num", "M", "N", "K")
 _TUNED_CONFIG_NUMERIC_COLUMNS = ("cu_num", "M", "N", "K", "splitK")
 _TUNED_CONFIG_COLUMNS = frozenset(
@@ -61,10 +58,74 @@ _TUNED_CONFIG_COLUMNS = frozenset(
 )
 
 
+@functools.lru_cache(maxsize=16)
+def _is_gfx950_device_index(device_index: int) -> bool:
+    properties = torch.cuda.get_device_properties(device_index)
+    arch = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+    return arch == "gfx950"
+
+
+@torch.compiler.assume_constant_result
+def _compiled_is_gfx950_device(device_index: int) -> bool:
+    return _is_gfx950_device_index(device_index)
+
+
+def _is_gfx950_device(device: torch.device) -> bool:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    if torch.compiler.is_compiling():
+        return _compiled_is_gfx950_device(device_index)
+    return _is_gfx950_device_index(device_index)
+
+
 @compile_ops("module_quant", fc_name="quant_mxfp6_gemm_hip", develop=True)
 def quant_mxfp6_gemm_hip_out(
     input: Tensor, packed: Tensor, packed_scale: Tensor
 ) -> None: ...
+
+
+_native_quant_mxfp6_gemm_hip_out = quant_mxfp6_gemm_hip_out
+
+
+def quant_mxfp6_gemm_hip_out(
+    input: Tensor, packed: Tensor, packed_scale: Tensor
+) -> None:
+    """Quantize into caller-provided gfx950 GEMM-layout buffers."""
+    if input.ndim != 2:
+        raise ValueError(
+            f"quant_mxfp6_gemm_hip_out expects a 2D input, got {input.ndim}D"
+        )
+    if input.dtype not in {torch.bfloat16, torch.float16}:
+        raise ValueError("quant_mxfp6_gemm_hip_out expects a bfloat16 or float16 input")
+    if not input.is_cuda or not packed.is_cuda or not packed_scale.is_cuda:
+        raise ValueError("quant_mxfp6_gemm_hip_out requires GPU tensors")
+    if input.device != packed.device or input.device != packed_scale.device:
+        raise ValueError("quant_mxfp6_gemm_hip_out requires tensors on one GPU")
+    if not input.is_contiguous():
+        raise ValueError("quant_mxfp6_gemm_hip_out requires a contiguous input")
+    if packed.dtype != torch.uint8 or packed_scale.dtype != torch.uint8:
+        raise ValueError("quant_mxfp6_gemm_hip_out requires uint8 output buffers")
+    if not packed.is_contiguous() or not packed_scale.is_contiguous():
+        raise ValueError("quant_mxfp6_gemm_hip_out requires contiguous outputs")
+    rows, K = input.shape
+    if rows <= 0 or K <= 0:
+        raise ValueError(
+            f"quant_mxfp6_gemm_hip_out requires positive dimensions, got {(rows, K)}"
+        )
+    expected_packed, expected_scale = mxfp6_gemm_pack_size(rows, K)
+    if packed.numel() != expected_packed or packed_scale.numel() != expected_scale:
+        raise ValueError(
+            "quant_mxfp6_gemm_hip_out buffers have wrong size: "
+            f"got ({packed.numel()}, {packed_scale.numel()}), "
+            f"expected ({expected_packed}, {expected_scale})"
+        )
+    if not torch.compiler.is_compiling() and (
+        packed.data_ptr() % 16 or packed_scale.data_ptr() % 16
+    ):
+        raise ValueError("quant_mxfp6_gemm_hip_out requires 16-byte-aligned outputs")
+    with torch.cuda.device(input.device):
+        _native_quant_mxfp6_gemm_hip_out(input, packed, packed_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +168,8 @@ def _hadamard32_np() -> np.ndarray:
 
 _HAD32_NP = _hadamard32_np()
 _HAD32_T: dict[torch.device, Tensor] = {}
+_HADAMARD_SAFETY_THRESHOLD = float.fromhex("0x1p123")
+_HADAMARD_SAFETY_SHIFT = 3.0
 
 
 def _had32_t(device: torch.device) -> Tensor:
@@ -125,6 +188,21 @@ def _rotate_k32_torch(x: Tensor) -> Tensor:
     return (
         x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE) @ h
     ).reshape(R, K)
+
+
+def _rotate_k32_quant_work(x: Tensor) -> tuple[Tensor, Tensor]:
+    """Return overflow-safe H32 work values and per-block exponent shifts."""
+    R, K = x.shape
+    blocks = x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE)
+    input_amax = blocks.abs().amax(dim=2)
+    safety_shift = torch.where(
+        input_amax >= _HADAMARD_SAFETY_THRESHOLD,
+        _HADAMARD_SAFETY_SHIFT,
+        0.0,
+    )
+    work = blocks * torch.exp2(-safety_shift).unsqueeze(-1)
+    h = _had32_t(x.device).to(torch.bfloat16).float()
+    return (work @ h).reshape(R, K), safety_shift
 
 
 def _rotate_k32_np(x: np.ndarray) -> np.ndarray:
@@ -187,6 +265,13 @@ if _HAS_TRITON:
             mask=rm[:, None],
             other=0.0,
         )
+        input_amax = tl.max(tl.abs(xall), 1)
+        safety_shift = tl.where(
+            input_amax >= 1.0633823966279327e37,
+            3.0,
+            0.0,
+        )
+        xall *= tl.exp2(-safety_shift)[:, None]
         # 32x32 Hadamard rotation FUSED in-register (no extra memory pass): mixes the
         # 32 K-elements of this block so mxfp6's per-block scale keeps precision.
         # bf16 MFMA (fp32 accum) -- fast, and plenty since the result feeds a 3-mantissa
@@ -196,11 +281,13 @@ if _HAS_TRITON:
         ).to(tl.bfloat16)
         xall = tl.dot(xall.to(tl.bfloat16), h)
         amax = tl.max(tl.abs(xall), 1)
-        safe = tl.maximum(amax, 1e-30)
-        se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
-        se = tl.where(amax > 0.0, se, 0.0)
+        safe = tl.where(amax > 0.0, amax, 1.0)
+        work_se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
+        work_se = tl.where(amax > 0.0, work_se, 0.0)
+        se = tl.minimum(tl.maximum(work_se + safety_shift, -127.0), 127.0)
+        conversion_se = se - safety_shift
         e8 = (se + 127.0).to(tl.uint8)
-        codes = _e2m3_dev(xall * tl.exp2(-se)[:, None])  # [BM,32]
+        codes = _e2m3_dev(xall * tl.exp2(-conversion_se)[:, None])  # [BM,32]
         cc = tl.reshape(codes, [BLOCK_M, 8, 2, 2])
         lo, hi = tl.split(cc)  # lo=b0-bit {s0,s2}, hi {s1,s3}
         c0, c2 = tl.split(lo)  # phase 0, 2
@@ -276,16 +363,25 @@ if _HAS_TRITON:
             mask=rm[:, None],
             other=0.0,
         )
+        input_amax = tl.max(tl.abs(xall), 1)
+        safety_shift = tl.where(
+            input_amax >= 1.0633823966279327e37,
+            3.0,
+            0.0,
+        )
+        xall *= tl.exp2(-safety_shift)[:, None]
         h = tl.load(
             h_ptr + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
         ).to(tl.bfloat16)
         xall = tl.dot(xall.to(tl.bfloat16), h)
         amax = tl.max(tl.abs(xall), 1)
-        safe = tl.maximum(amax, 1e-30)
-        se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
-        se = tl.where(amax > 0.0, se, 0.0)
+        safe = tl.where(amax > 0.0, amax, 1.0)
+        work_se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
+        work_se = tl.where(amax > 0.0, work_se, 0.0)
+        se = tl.minimum(tl.maximum(work_se + safety_shift, -127.0), 127.0)
+        conversion_se = se - safety_shift
         e8 = (se + 127.0).to(tl.uint8)
-        codes = _e2m3_dev(xall * tl.exp2(-se)[:, None])
+        codes = _e2m3_dev(xall * tl.exp2(-conversion_se)[:, None])
         cc = tl.reshape(codes, [BLOCK_M * 4, 8, 2, 2])
         lo, hi = tl.split(cc)
         c0, c2 = tl.split(lo)
@@ -445,21 +541,22 @@ def quant_mxfp6_torch(x: Tensor) -> tuple[Tensor, Tensor]:
             "quant_mxfp6_torch requires K to be a positive multiple of "
             f"{_SCALE_GROUP_SIZE}, got {x.shape[1]}"
         )
-    x = x.float()
-    x = _rotate_k32_torch(x)
+    x, safety_shift = _rotate_k32_quant_work(x)
     R, K = x.shape
     NB = K // _SCALE_GROUP_SIZE
     blk = x.reshape(R, NB, _SCALE_GROUP_SIZE)
     amax = blk.abs().amax(dim=2)
     safe = torch.where(amax > 0, amax, torch.ones_like(amax))
     exp = torch.floor(torch.log2(safe))
-    scale_exp = torch.clamp(exp - _E2M3_MAX_EXP, -127, 127)
-    scale_exp = torch.where(amax > 0, scale_exp, torch.zeros_like(scale_exp))
+    work_scale_exp = torch.clamp(exp - _E2M3_MAX_EXP, -127, 127)
+    work_scale_exp = torch.where(
+        amax > 0, work_scale_exp, torch.zeros_like(work_scale_exp)
+    )
+    scale_exp = torch.clamp(work_scale_exp + safety_shift, -127, 127)
+    conversion_scale_exp = scale_exp - safety_shift
     scales = (scale_exp + 127).to(torch.uint8)
 
-    scaled = blk / torch.pow(torch.tensor(2.0, device=x.device), scale_exp).unsqueeze(
-        -1
-    )
+    scaled = blk * torch.exp2(-conversion_scale_exp).unsqueeze(-1)
     # arithmetic E2M3 round-to-nearest (identical to the fused Triton _e2m3_dev)
     a = scaled.abs().clamp(max=7.5)
     isn = a >= 1.0
@@ -495,8 +592,21 @@ def _pack32_torch(blocks: Tensor) -> Tensor:
 
 
 def pack_big_torch(codes: Tensor, padK: int = _PADK) -> Tensor:
-    dev = codes.device
+    if codes.ndim != 2:
+        raise ValueError(
+            f"pack_big_torch expects 2D [rows, K] codes, got {codes.ndim}D"
+        )
+    if codes.dtype != torch.uint8:
+        raise ValueError(f"pack_big_torch expects uint8 codes, got {codes.dtype}")
     R, K = codes.shape
+    if R <= 0 or K <= 0 or R % _TILE or K % _K_TILE:
+        raise ValueError(
+            f"pack_big_torch requires positive rows%{_TILE}=0 and "
+            f"K%{_K_TILE}=0, got rows={R}, K={K}"
+        )
+    if not isinstance(padK, int) or isinstance(padK, bool) or padK < 0:
+        raise ValueError(f"pack_big_torch requires padK >= 0, got {padK!r}")
+    dev = codes.device
     nt, nk = R // _TILE, K // _K_TILE
     rb = torch.arange(16, device=dev).repeat_interleave(64)
     L = torch.arange(64, device=dev).repeat(16)
@@ -522,8 +632,26 @@ def pack_big_torch(codes: Tensor, padK: int = _PADK) -> Tensor:
 
 
 def pack_scale_torch(S: Tensor, rows: int, padK: int = _PADK) -> Tensor:
+    if S.ndim != 2:
+        raise ValueError(
+            f"pack_scale_torch expects 2D [rows, K/32] scales, got {S.ndim}D"
+        )
+    if S.dtype != torch.uint8:
+        raise ValueError(f"pack_scale_torch expects uint8 scales, got {S.dtype}")
+    scale_rows, NB = S.shape
+    if rows <= 0 or rows % _TILE or scale_rows != rows:
+        raise ValueError(
+            f"pack_scale_torch requires matching positive rows%{_TILE}=0, "
+            f"got rows={rows}, scale_rows={scale_rows}"
+        )
+    if NB <= 0 or NB % (_K_TILE // _SCALE_GROUP_SIZE):
+        raise ValueError(
+            "pack_scale_torch requires K/32 to be a positive multiple of "
+            f"{_K_TILE // _SCALE_GROUP_SIZE}, got {NB}"
+        )
+    if not isinstance(padK, int) or isinstance(padK, bool) or padK < 0:
+        raise ValueError(f"pack_scale_torch requires padK >= 0, got {padK!r}")
     dev = S.device
-    _R, NB = S.shape
     nt, nk = rows // _TILE, NB // 4
     off = torch.arange(_SCALE_TILE_BYTES, device=dev)
     su = off // 512
@@ -673,13 +801,20 @@ def _select_gemm_a6w6_kernel(M: int, N: int, K: int, kernelName: str | None) -> 
 
 def mxfp6_gemm_pack_size(rows: int, K: int) -> tuple[int, int]:
     """Return packed operand and scale element counts for quant_mxfp6_gemm."""
+    if rows <= 0 or K <= 0:
+        raise ValueError(
+            f"mxfp6_gemm_pack_size requires positive dimensions, got {(rows, K)}"
+        )
     padR, padK = _ceil(rows, _TILE), _ceil(K, _K_TILE)
     nt = padR // _TILE
     nk_pad = padK // _K_TILE + _PADK
-    return (
+    sizes = (
         nt * nk_pad * _PACKED_TILE_BYTES,
         nt * nk_pad * _SCALE_TILE_BYTES,
     )
+    if max(sizes) > _MAX_BUFFER_BYTES:
+        raise ValueError("mxfp6_gemm_pack_size exceeds the kernel's 2 GiB range")
+    return sizes
 
 
 def quant_mxfp6_gemm_out(
@@ -693,6 +828,16 @@ def quant_mxfp6_gemm_out(
     rows, K = w.shape
     padK = _ceil(K, _K_TILE)
     expected_packed, expected_scale = mxfp6_gemm_pack_size(rows, K)
+    if packed.dtype != torch.uint8 or packed_scale.dtype != torch.uint8:
+        raise ValueError("quant_mxfp6_gemm_out requires uint8 output buffers")
+    if not packed.is_contiguous() or not packed_scale.is_contiguous():
+        raise ValueError("quant_mxfp6_gemm_out requires contiguous output buffers")
+    if w.device != packed.device or w.device != packed_scale.device:
+        raise ValueError("quant_mxfp6_gemm_out requires tensors on one device")
+    if not torch.compiler.is_compiling() and (
+        packed.data_ptr() % 16 or packed_scale.data_ptr() % 16
+    ):
+        raise ValueError("quant_mxfp6_gemm_out requires 16-byte-aligned outputs")
     if packed.numel() != expected_packed or packed_scale.numel() != expected_scale:
         raise ValueError(
             "quant_mxfp6_gemm_out buffers have wrong size: "
@@ -700,8 +845,9 @@ def quant_mxfp6_gemm_out(
             f"expected ({expected_packed}, {expected_scale})"
         )
     w = w.detach()
+    is_gfx950 = _is_gfx950_device(w.device)
     hip_supported = (
-        w.is_cuda and w.dtype in {torch.bfloat16, torch.float16} and _IS_GFX950
+        w.is_cuda and w.dtype in {torch.bfloat16, torch.float16} and is_gfx950
     )
     use_hip = hip_supported and _QUANT_BACKEND in {"auto", "hip"}
     if use_hip:
@@ -720,7 +866,7 @@ def quant_mxfp6_gemm_out(
         )  # rotation is fused inside the kernel (no fp32 [M,K] pre-pass)
         NB = padK // _SCALE_GROUP_SIZE
         NK_PAD = padK // _K_TILE + _PADK
-        if _IS_GFX950 and rows * padK >= _BATCHED_PACK_MIN_ELEMENTS:
+        if is_gfx950 and rows * padK >= _BATCHED_PACK_MIN_ELEMENTS:
             BM = _BATCHED_PACK_BLOCK_M
             NSTEP = NB // _BATCHED_PACK_K_BLOCKS
             grid = ((rows + BM - 1) // BM * NSTEP,)
@@ -763,8 +909,9 @@ def quant_mxfp6_gemm(w: Tensor) -> tuple[Tensor, Tensor]:
 
     Rows are represented in a multiple-of-256 layout and K is zero-padded to a
     multiple of 128 so any GEMM shape maps onto the kernel's 256x256 / 128-K
-    tiling. Row-padding slots and the two trailing ABI K-guard tiles are not
-    consumed by the kernel and their contents are intentionally unspecified.
+    tiling. Row-padding slots affect only discarded output rows, and the two
+    trailing ABI K-guard tiles are not accumulated. Their contents are
+    intentionally unspecified to avoid a separate fill kernel.
 
     Returns (packed uint8, packed_scale uint8) torch tensors on w.device.
     Works identically for both A and B operands. Runs entirely on the GPU.
@@ -774,30 +921,30 @@ def quant_mxfp6_gemm(w: Tensor) -> tuple[Tensor, Tensor]:
             f"quant_mxfp6_gemm expects a 2D [rows, K] tensor, got {w.ndim}D"
         )
     rows, K = w.shape
+    packed_size, scale_size = mxfp6_gemm_pack_size(rows, K)
     padR, padK = _ceil(rows, _TILE), _ceil(K, _K_TILE)
     w = w.detach()
+    is_gfx950 = _is_gfx950_device(w.device)
     has_gpu_packer = w.is_cuda and (
         _HAS_TRITON
         or (
-            _IS_GFX950
+            is_gfx950
             and w.dtype in {torch.bfloat16, torch.float16}
             and _QUANT_BACKEND in {"auto", "hip"}
         )
     )
     if has_gpu_packer:
-        NK_PAD = padK // _K_TILE + _PADK
-        nt = padR // _TILE
         # The Triton packer writes every logical K tile.  The ASM bounds
         # accumulation with K; _PADK is addressable pipeline-guard spacing, not
         # data.  Leave guard and row-padding slots unspecified to avoid a fill
         # launch on every activation quantization in inference.
         packed = torch.empty(
-            nt * NK_PAD * _PACKED_TILE_BYTES,
+            packed_size,
             dtype=torch.uint8,
             device=w.device,
         )
         packed_scale = torch.empty(
-            (nt * NK_PAD * _SCALE_TILE_BYTES,),
+            scale_size,
             dtype=torch.uint8,
             device=w.device,
         )
@@ -827,7 +974,7 @@ def _gemm_a6w6_asm(
     A_scale: Tensor,  # packed e8m0 blob
     B_scale: Tensor,  # packed e8m0 blob
     out: Tensor,  # Out:[M, N] bf16
-    K: int,  # logical contraction dim
+    K: int,  # padded contraction dim consumed by the packed layout
     kernelName: str | None = None,
     alpha: float = 1.0,
 ) -> None: ...

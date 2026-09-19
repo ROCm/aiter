@@ -1,0 +1,5 @@
+tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_max_N,swizzle_max_K,knl_name,co_name
+256,256,256,0,0,mxfp4_c0_mxfp6_256_padk2,0,0,0,f4f6gemm_m32_s0_a4_t_kernel_func,gemm_a4w6_m32_s0_a4_t.co
+256,256,256,0,0,mxfp4_c0_mxfp6_256_padk2,0,0,0,f4f6gemm_m32_s0_a5_nt_kernel_func,gemm_a4w6_m32_s0_a5_nt.co
+256,256,256,0,0,mxfp4_c0_mxfp6_256_padk2,131072,16384,6144,f4f6gemm_m32_s3_a5_t_kernel_func,gemm_a4w6_m32_s3_a5_t.co
+256,256,256,0,0,mxfp4_c0_mxfp6_256_padk2,131072,16384,6144,f4f6gemm_m32_s3_a6_t_kernel_func,gemm_a4w6_m32_s3_a6_t.co
