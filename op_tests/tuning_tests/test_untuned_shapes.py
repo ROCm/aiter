@@ -234,6 +234,26 @@ class TestUntunedShapes(unittest.TestCase):
         with open(path) as fh:
             self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
 
+    def test_tuner_skips_an_incomplete_row(self):
+        """The reader discards what the writer could not repair.
+
+        A torn append survives as one short line. It cannot be fixed in place
+        -- another worker may already have appended past it -- so the tuner
+        drops it instead of tuning a shape with NaN dimensions.
+        """
+        from aiter.utility.base_tuner import TunerCommon
+
+        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
+        with open(path, "w") as fh:
+            fh.write("M,N,K\n1,\n1,2,3\n4,5,6\n")
+
+        frame = TunerCommon.get_untuned_gemm_list(None, path)
+
+        self.assertEqual(
+            [tuple(int(v) for v in row) for row in frame[["M", "N", "K"]].values],
+            [(1, 2, 3), (4, 5, 6)],
+        )
+
     def test_processes_append_complete_rows_without_a_lock(self):
         shared = {"M": 1, "N": 2, "K": 3}
         processes = []
@@ -274,26 +294,6 @@ class TestCachedLookupMissRecording(unittest.TestCase):
         self.assertEqual(resolver.call_count, 1)
         self.assertEqual(miss_logger.call_count, 1)
         self.assertEqual(record.call_count, 2)
-
-    def test_tuner_skips_an_incomplete_row(self):
-        """The reader discards what the writer could not repair.
-
-        A torn append survives as one short line. It cannot be fixed in place
-        -- another worker may already have appended past it -- so the tuner
-        drops it instead of tuning a shape with NaN dimensions.
-        """
-        from aiter.utility.base_tuner import TunerCommon
-
-        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
-        with open(path, "w") as fh:
-            fh.write("M,N,K\n1,\n1,2,3\n4,5,6\n")
-
-        frame = TunerCommon.get_untuned_gemm_list(None, path)
-
-        self.assertEqual(
-            [tuple(int(v) for v in row) for row in frame[["M", "N", "K"]].values],
-            [(1, 2, 3), (4, 5, 6)],
-        )
 
     def test_a8w8_misses_record_outside_lookup_caches(self):
         from aiter.ops import gemm_op_a8w8
