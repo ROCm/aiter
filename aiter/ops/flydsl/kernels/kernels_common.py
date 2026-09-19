@@ -17,6 +17,13 @@ from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
+LOG2E = 1.4426950408889634
+
+
+def ceildiv(numer, denom):
+    """Ceiling division preserving Python-int or DSL-scalar operand types."""
+    return (numer + denom - 1) // denom
+
 
 def format_kernel_name(name: str) -> str:
     """Sanitize a kernel symbol name for the amdhsa assembler.
@@ -96,6 +103,11 @@ def _atomic_rmw_i32(binop, memref, val, offset, syncscope):
 def atomic_add_i32(memref, val, offset, syncscope):
     """Atomically add an int32 value and return the previous value."""
     return _atomic_rmw_i32(_llvm.AtomicBinOp.add, memref, val, offset, syncscope)
+
+
+def atomic_or_i32(memref, val, offset, syncscope):
+    """Atomically OR an int32 value in and return the previous value."""
+    return _atomic_rmw_i32(_llvm.AtomicBinOp._or, memref, val, offset, syncscope)
 
 
 def atomic_max_i32(memref, val, offset, syncscope):
@@ -179,11 +191,7 @@ FX_ADDRESS_SPACE = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}
 
 
 def create_llvm_ptr(value, address_space=1):
-    """Raw ``!llvm.ptr<n>`` at *value*, for ops that need one directly.
-
-    The atomicrmw builder and the plain llvm load/store take a raw pointer,
-    which no layout op produces, so the address is formed by hand here.
-    """
+    """Raw LLVM pointer for atomics and intrinsic APIs."""
     # Accept either the LLVM number (1 global / 3 LDS) or an fx.AddressSpace,
     # so a caller cannot silently pass the wrong one.
     space = FX_ADDRESS_SPACE.get(address_space, address_space)
