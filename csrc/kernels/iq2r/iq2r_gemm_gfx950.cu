@@ -1486,7 +1486,14 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
         int launch_grid = base_grid * (estimated_tiles > base_grid ? 2 : 1);
 
         if(!use_narrow && logical_n == 2880)
-            launch_grid = 5 * cu_count;
+        {
+            // Once GPT-OSS reaches 64 decoded tokens (256 routed rows at
+            // top-k=4), four workgroups per CU consistently outperform the
+            // previous five-CU multiplier across uniform and concentrated
+            // expert distributions. Keep the decode-tuned launch below that
+            // boundary.
+            launch_grid = (routed_m >= 256 ? 4 : 5) * cu_count;
+        }
 
         // Profiling-only launch controls used to tune GPT-OSS decode shapes.
         // They are read on the host before launch, so separate CUDA/HIP graphs
