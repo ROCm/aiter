@@ -277,7 +277,10 @@ def _make_dispatch_tdm(
     peer_split = max(1, warp_num_per_block // npes) if npes else 1
     meta_runs = npes * peer_split
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    @flyc.kernel(
+        name=f"ep_dispatch_tdm_{block_num}x{warp_num_per_block}",
+        known_block_size=[block_threads, 1, 1],
+    )
     def ep_dispatch_tdm(
         arena: Int64,
         addr_inp_tok: Int64,
