@@ -873,6 +873,9 @@ def fused_moe(
             "shared_w1_scale": shared_w1_scale,
             "shared_w2_scale": shared_w2_scale,
             "stage2_scatter": stage2_scatter,
+            "quant_type_a": quant_type_a,
+            "quant_dtype_a": quant_dtype_a,
+            "quant_dtype_a2": quant_dtype_a2,
         }
         present = [name for name, value in unsupported.items() if value is not None]
         if present:
@@ -935,6 +938,7 @@ def fused_moe(
             router_logits=iq2r_router_logits,
             router_bias=iq2r_router_bias,
             renormalize=iq2r_router_renormalize,
+            output=output,
         )
 
     if (
@@ -3158,8 +3162,7 @@ def get_2stage_cfgs(
             reject_reason = f"no MXMOE kernel for activation {activation!r}"
         elif configured_act != expected_act:
             reject_reason = (
-                f"activation {configured_act!r} does not match runtime "
-                f"{expected_act!r}"
+                f"activation {configured_act!r} does not match runtime {expected_act!r}"
             )
         elif swiglu_limit and expected_act != "swiglu":
             # MXMOE's _activation_mul_batch consumes the limit for swiglu only;

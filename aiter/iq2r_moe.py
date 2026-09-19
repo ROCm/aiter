@@ -566,18 +566,20 @@ def iq2r_fused_moe(
     router_logits: Tensor | None = None,
     router_bias: Tensor | None = None,
     renormalize: bool = True,
+    output: Tensor | None = None,
 ) -> Tensor:
-    """Allocating wrapper for :func:`iq2r_fused_moe_out`."""
+    """Wrapper for :func:`iq2r_fused_moe_out` with optional caller output."""
 
     # ``hidden_states`` may be the logical 2880-column view of ATOM's
     # 3072-stride TP1 layernorm output.  The result is a dense logical tensor;
     # preserving the input stride would waste storage and violate the out-op
     # contract.
-    output = torch.empty(
-        hidden_states.shape,
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
+    if output is None:
+        output = torch.empty(
+            hidden_states.shape,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
     iq2r_fused_moe_out(
         hidden_states,
         gate_up_data,
