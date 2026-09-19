@@ -33,6 +33,33 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("unroll"), py::arg("threads"), py::arg("blocks"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("alloc_ll128_unroll2_scratch", &aiter::alloc_ll128_unroll2_scratch,
+          py::arg("_fa"));
+    m.def("init_ll128_unroll2_peers", &aiter::init_ll128_unroll2_peers,
+          py::arg("_fa"), py::arg("all_ptrs"));
+    m.def("init_ll128_unroll2_peers_ipc", &aiter::init_ll128_unroll2_peers_ipc,
+          py::arg("_fa"), py::arg("ipc_handle_ptrs"), py::arg("offsets"));
+    m.def("alloc_cas_flags", &aiter::alloc_cas_flags, py::arg("_fa"));
+    m.def("init_cas_peers", &aiter::init_cas_peers,
+          py::arg("_fa"), py::arg("all_ptrs"));
+    m.def("init_cas_peers_ipc", &aiter::init_cas_peers_ipc,
+          py::arg("_fa"), py::arg("ipc_handle_ptrs"), py::arg("offsets"));
+    m.def("alloc_cas_scratch", &aiter::alloc_cas_scratch, py::arg("_fa"));
+    m.def("init_cas_scratch_peers", &aiter::init_cas_scratch_peers,
+          py::arg("_fa"), py::arg("all_ptrs"));
+    m.def("init_cas_scratch_peers_ipc", &aiter::init_cas_scratch_peers_ipc,
+          py::arg("_fa"), py::arg("ipc_handle_ptrs"), py::arg("offsets"));
+    m.def("all_reduce_ll128_unroll2", &aiter::all_reduce_ll128_unroll2,
+          py::arg("_fa"), py::arg("inp"), py::arg("out"),
+          py::arg("block_size") = 1024);
+    m.def("all_reduce_cas_2shot", &aiter::all_reduce_cas_2shot,
+          py::arg("_fa"), py::arg("inp"), py::arg("out"),
+          py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"),
+          py::arg("block_size") = 1024, py::arg("unroll_factor") = 1);
+    m.def("all_reduce_cas_2shot_scratch", &aiter::all_reduce_cas_2shot_scratch,
+          py::arg("_fa"), py::arg("inp"), py::arg("out"),
+          py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"),
+          py::arg("block_size") = 1024, py::arg("unroll_factor") = 1);
     m.def("dispose", &aiter::dispose, py::arg("_fa"));
     m.def("meta_size", &aiter::meta_size);
     m.def("register_input_buffer", &aiter::register_input_buffer,

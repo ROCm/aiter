@@ -101,6 +101,193 @@ int64_t meta_size()
     return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes());
 }
 
+// ---- LL128 / CAS staging: allocation and peer-table exchange ----
+//
+// These buffers are not part of the shared meta buffer, so each rank allocates
+// its own and the bases are exchanged with a second round trip. Both the raw
+// pointer form (VMM transport) and the IPC handle form are provided, mirroring
+// init_custom_ar / init_custom_ar_ipc.
+
+static std::vector<hipIpcMemHandle_t> unpack_ipc_handles(
+    const std::vector<int64_t>& ipc_handle_ptrs, size_t count)
+{
+    std::vector<hipIpcMemHandle_t> handles(count);
+    for(size_t i = 0; i < count; ++i)
+        std::memcpy(&handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
+    return handles;
+}
+
+int64_t alloc_ll128_unroll2_scratch(fptr_t _fa)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    return (int64_t)fa->alloc_ll128_unroll2_scratch_();
+}
+
+void init_ll128_unroll2_peers(fptr_t _fa, const std::vector<int64_t>& all_ptrs)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->init_ll128_unroll2_peers_(all_ptrs);
+}
+
+void init_ll128_unroll2_peers_ipc(fptr_t _fa,
+                                  const std::vector<int64_t>& ipc_handle_ptrs,
+                                  const std::vector<int64_t>& offsets)
+{
+    auto fa      = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    auto handles = unpack_ipc_handles(ipc_handle_ptrs, offsets.size());
+    fa->init_ll128_unroll2_peers_ipc_(handles.data(), offsets.data());
+}
+
+int64_t alloc_cas_flags(fptr_t _fa)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    return (int64_t)fa->alloc_cas_flags_();
+}
+
+void init_cas_peers(fptr_t _fa, const std::vector<int64_t>& all_ptrs)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->init_cas_peers_(all_ptrs);
+}
+
+void init_cas_peers_ipc(fptr_t _fa,
+                        const std::vector<int64_t>& ipc_handle_ptrs,
+                        const std::vector<int64_t>& offsets)
+{
+    auto fa      = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    auto handles = unpack_ipc_handles(ipc_handle_ptrs, offsets.size());
+    fa->init_cas_peers_ipc_(handles.data(), offsets.data());
+}
+
+int64_t alloc_cas_scratch(fptr_t _fa)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    return (int64_t)fa->alloc_cas_scratch_();
+}
+
+void init_cas_scratch_peers(fptr_t _fa, const std::vector<int64_t>& all_ptrs)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->init_cas_scratch_peers_(all_ptrs);
+}
+
+void init_cas_scratch_peers_ipc(fptr_t _fa,
+                                const std::vector<int64_t>& ipc_handle_ptrs,
+                                const std::vector<int64_t>& offsets)
+{
+    auto fa      = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    auto handles = unpack_ipc_handles(ipc_handle_ptrs, offsets.size());
+    fa->init_cas_scratch_peers_ipc_(handles.data(), offsets.data());
+}
+
+// ---- Standalone single-kernel entry points (benchmarking) ----
+
+void all_reduce_ll128_unroll2(fptr_t _fa,
+                              const aiter_tensor_t& inp,
+                              const aiter_tensor_t& out,
+                              int64_t block_size)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa  = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int  bs  = static_cast<int>(block_size);
+    int64_t numel = inp.numel();
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16:
+        fa->allreduce_ll128_unroll2<opus::fp16_t>(
+            stream, reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(out.data_ptr()), numel, bs);
+        break;
+    case AITER_DTYPE_bf16:
+        fa->allreduce_ll128_unroll2<opus::bf16_t>(
+            stream, reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(out.data_ptr()), numel, bs);
+        break;
+    default:
+        throw std::runtime_error(
+            "all_reduce_ll128_unroll2 only supports float16 and bfloat16");
+    }
+}
+
+// Shared body for the two CAS variants. Both pull from every peer's registered
+// input buffer, so a non-registered input is staged into reg_inp_ptr first
+// (pass 0 when the caller already holds a registered buffer).
+static void _all_reduce_cas_2shot(fptr_t _fa,
+                                  const aiter_tensor_t& inp,
+                                  const aiter_tensor_t& out,
+                                  int64_t reg_inp_ptr,
+                                  int64_t reg_inp_bytes,
+                                  int64_t block_size,
+                                  int64_t unroll_factor,
+                                  bool use_scratch)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int  bs = static_cast<int>(block_size);
+    int  uf = static_cast<int>(unroll_factor);
+
+    int64_t numel      = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+    void*   actual_inp = inp.data_ptr();
+    if(reg_inp_ptr != 0)
+    {
+        if(data_bytes > reg_inp_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_inp_ptr;
+    }
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp32:
+        fa->allreduce_cas_2shot<opus::fp32_t>(
+            stream, reinterpret_cast<opus::fp32_t*>(actual_inp),
+            reinterpret_cast<opus::fp32_t*>(out.data_ptr()), numel, bs, uf, use_scratch);
+        break;
+    case AITER_DTYPE_fp16:
+        fa->allreduce_cas_2shot<opus::fp16_t>(
+            stream, reinterpret_cast<opus::fp16_t*>(actual_inp),
+            reinterpret_cast<opus::fp16_t*>(out.data_ptr()), numel, bs, uf, use_scratch);
+        break;
+    case AITER_DTYPE_bf16:
+        fa->allreduce_cas_2shot<opus::bf16_t>(
+            stream, reinterpret_cast<opus::bf16_t*>(actual_inp),
+            reinterpret_cast<opus::bf16_t*>(out.data_ptr()), numel, bs, uf, use_scratch);
+        break;
+    default:
+        throw std::runtime_error(
+            "all_reduce_cas_2shot only supports float32, float16 and bfloat16");
+    }
+}
+
+void all_reduce_cas_2shot(fptr_t _fa,
+                          const aiter_tensor_t& inp,
+                          const aiter_tensor_t& out,
+                          int64_t reg_inp_ptr,
+                          int64_t reg_inp_bytes,
+                          int64_t block_size,
+                          int64_t unroll_factor)
+{
+    _all_reduce_cas_2shot(_fa, inp, out, reg_inp_ptr, reg_inp_bytes, block_size,
+                          unroll_factor, /*use_scratch=*/false);
+}
+
+void all_reduce_cas_2shot_scratch(fptr_t _fa,
+                                  const aiter_tensor_t& inp,
+                                  const aiter_tensor_t& out,
+                                  int64_t reg_inp_ptr,
+                                  int64_t reg_inp_bytes,
+                                  int64_t block_size,
+                                  int64_t unroll_factor)
+{
+    _all_reduce_cas_2shot(_fa, inp, out, reg_inp_ptr, reg_inp_bytes, block_size,
+                          unroll_factor, /*use_scratch=*/true);
+}
+
 // ---- Internal dispatch helper ----
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
