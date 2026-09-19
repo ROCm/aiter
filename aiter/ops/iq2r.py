@@ -120,6 +120,51 @@ def _iq2r_route_direct_gather_quant_out(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_iq2r_moe",
+    fc_name="iq2r_route_topk_direct_gather_quant_out",
+    develop=True,
+)
+def _iq2r_route_topk_direct_gather_quant_out(
+    input: Tensor,
+    router_logits: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    gather_indices: Tensor,
+    scatter_indices: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    scales: Tensor,
+    renormalize: bool,
+    router_bias: Tensor | None,
+) -> None: ...
+
+
+@compile_ops(
+    "module_iq2r_moe",
+    fc_name="iq2r_route_topk_sort_gather_quant_out",
+    develop=True,
+)
+def _iq2r_route_topk_sort_gather_quant_out(
+    input: Tensor,
+    router_logits: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    gather_indices: Tensor,
+    scatter_indices: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    scales: Tensor,
+    task_rows: int,
+    renormalize: bool,
+    router_bias: Tensor | None,
+) -> None: ...
+
+
 @compile_ops("module_iq2r_moe", fc_name="iq2r_swiglu_out", develop=True)
 def _iq2r_swiglu_out(gate_up: Tensor, output: Tensor) -> None: ...
 
@@ -143,6 +188,25 @@ def _iq2r_route_reduce_indexed_out(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_iq2r_moe",
+    fc_name="iq2r_route_reduce_add_rmsnorm_indexed_out",
+    develop=True,
+)
+def _iq2r_route_reduce_add_rmsnorm_indexed_out(
+    route_output: Tensor,
+    route_weights: Tensor,
+    scatter_indices: Tensor,
+    residual: Tensor,
+    norm_weight: Tensor,
+    output: Tensor,
+    residual_out: Tensor,
+    topk: int,
+    epsilon: float,
+    block_size: int,
+) -> None: ...
+
+
 def _validate_gpu_weights(
     data: Tensor, auxiliary: Tensor, metadata: IQ2RMetadata
 ) -> None:
@@ -152,6 +216,19 @@ def _validate_gpu_weights(
     iq2r_validate_expert_weights(data, auxiliary, metadata, verify_reserved_zero=False)
     if data.device.type != "cuda":
         raise ValueError("IQ2R compiled operations require GPU tensors")
+
+
+def _valid_activation_scale_shape(
+    scales: Tensor, rows: int, groups_per_row: int
+) -> bool:
+    row_major = tuple(scales.shape) == (rows, groups_per_row)
+    tile16 = (
+        scales.ndim == 4
+        and scales.shape[0] == (groups_per_row + 3) // 4
+        and scales.shape[1] >= (rows + 15) // 16
+        and scales.shape[2:] == (4, 16)
+    )
+    return scales.dtype == torch.uint8 and (row_major or tile16)
 
 
 @torch.no_grad()
@@ -384,12 +461,14 @@ def iq2r_task_gemm_out(
         raise ValueError("activations must be a two-dimensional float8_e4m3fn tensor")
     if activations.shape[1] != metadata.logical_k:
         raise ValueError(f"activations must have K={metadata.logical_k}")
-    expected_scales = (activations.shape[0], metadata.logical_k // 32)
-    if (
-        activation_scales.dtype != torch.uint8
-        or tuple(activation_scales.shape) != expected_scales
-    ):
-        raise ValueError(f"activation_scales must be uint8 {expected_scales}")
+    scale_rows = activations.shape[0]
+    scale_groups = metadata.logical_k // 32
+    if not _valid_activation_scale_shape(activation_scales, scale_rows, scale_groups):
+        raise ValueError(
+            "activation_scales must be row-major uint8 "
+            f"[{scale_rows},{scale_groups}] or tile16 uint8 "
+            f"[{(scale_groups + 3) // 4},{(scale_rows + 15) // 16},4,16]"
+        )
     if tasks.dtype != torch.int32 or tasks.ndim != 2 or tasks.shape[1] != 3:
         raise ValueError("tasks must be int32 [capacity,3]")
     if task_count.dtype != torch.int32 or tuple(task_count.shape) != (1,):
@@ -481,8 +560,8 @@ def iq2r_task_capacity(routes: int, expert_count: int, task_rows: int) -> int:
             raise ValueError(f"{name} must be a positive int, got {value!r}")
     if expert_count > 128:
         raise ValueError("initial IQ2R routing supports at most 128 experts")
-    if task_rows not in (16, 32, 64):
-        raise ValueError("task_rows must be 16, 32, or 64")
+    if task_rows not in (16, 32, 64, 128, 256):
+        raise ValueError("task_rows must be 16, 32, 64, 128, or 256")
     return (routes + task_rows - 1) // task_rows + min(routes, expert_count + 1)
 
 
@@ -502,8 +581,8 @@ def iq2r_route_sort_tasks_out(
     if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1:
         raise ValueError("expert_ids must be int32 [routes]")
     routes = expert_ids.numel()
-    if not 0 < routes <= 4096:
-        raise ValueError("IQ2R route sorting supports 1..4096 routed rows")
+    if not 0 < routes <= 65536:
+        raise ValueError("IQ2R route sorting supports 1..65536 routed rows")
     expected_vectors = (sorted_expert_ids, gather_indices, scatter_indices)
     if any(
         t.dtype != torch.int32 or tuple(t.shape) != (routes,) for t in expected_vectors
@@ -593,11 +672,16 @@ def iq2r_route_gather_quant_out(
     if input.shape[1] % 32:
         raise ValueError("IQ2R MXFP8 quantization requires hidden divisible by 32")
     expected_output = (gather_indices.numel(), input.shape[1])
-    expected_scales = (gather_indices.numel(), input.shape[1] // 32)
+    scale_rows = gather_indices.numel()
+    scale_groups = input.shape[1] // 32
     if output.dtype != torch.float8_e4m3fn or tuple(output.shape) != expected_output:
         raise ValueError(f"output must be float8_e4m3fn {expected_output}")
-    if scales.dtype != torch.uint8 or tuple(scales.shape) != expected_scales:
-        raise ValueError(f"scales must be uint8 {expected_scales}")
+    if not _valid_activation_scale_shape(scales, scale_rows, scale_groups):
+        raise ValueError(
+            f"scales must be row-major uint8 [{scale_rows},{scale_groups}] "
+            "or tile16 uint8 "
+            f"[{(scale_groups + 3) // 4},{(scale_rows + 15) // 16},4,16]"
+        )
     tensors = (input, gather_indices, output, scales)
     if any(t.device != input.device for t in tensors):
         raise ValueError("IQ2R fused gather/quant tensors must share a device")
@@ -652,11 +736,12 @@ def iq2r_route_direct_gather_quant_out(
         input.shape[1],
     ):
         raise ValueError("output must be FP8 [routes,hidden]")
-    if scales.dtype != torch.uint8 or tuple(scales.shape) != (
-        routes,
-        input.shape[1] // 32,
-    ):
-        raise ValueError("scales must be uint8 [routes,hidden/32]")
+    scale_groups = input.shape[1] // 32
+    if not _valid_activation_scale_shape(scales, routes, scale_groups):
+        raise ValueError(
+            "scales must be row-major uint8 [routes,hidden/32] or "
+            "tile16 uint8 [ceil(hidden/128),ceil(routes/16),4,16]"
+        )
     tensors = (
         expert_ids,
         sorted_expert_ids,
@@ -685,6 +770,211 @@ def iq2r_route_direct_gather_quant_out(
         scales,
         topk,
         expert_count,
+    )
+
+
+def iq2r_route_topk_direct_gather_quant_out(
+    input: Tensor,
+    router_logits: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    gather_indices: Tensor,
+    scatter_indices: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    scales: Tensor,
+    *,
+    renormalize: bool,
+    router_bias: Tensor | None = None,
+) -> None:
+    """Fuse GPT-OSS top-4 routing, direct tasks, and input MXFP8 quantization."""
+
+    if input.dtype != torch.bfloat16 or input.ndim != 2:
+        raise ValueError("input must be BF16 [tokens,hidden]")
+    tokens, hidden = input.shape
+    if not 0 < tokens <= 4:
+        raise ValueError("fused IQ2R routing requires 1..4 tokens")
+    if hidden % 32:
+        raise ValueError("IQ2R MXFP8 quantization requires hidden divisible by 32")
+    if router_logits.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("router_logits must be BF16 or FP32")
+    if tuple(router_logits.shape) != (tokens, 128):
+        raise ValueError("router_logits must be [tokens,128]")
+    if router_bias is not None:
+        if router_bias.dtype != torch.bfloat16 or tuple(router_bias.shape) != (128,):
+            raise ValueError("router_bias must be BF16 [128]")
+        if router_bias.device != input.device or not router_bias.is_contiguous():
+            raise ValueError("router_bias must be contiguous on the input GPU")
+    if topk_weights.dtype != torch.float32 or tuple(topk_weights.shape) != (
+        tokens,
+        4,
+    ):
+        raise ValueError("topk_weights must be FP32 [tokens,4]")
+    if topk_ids.dtype != torch.int32 or tuple(topk_ids.shape) != (tokens, 4):
+        raise ValueError("topk_ids must be int32 [tokens,4]")
+    routes = tokens * 4
+    vectors = (sorted_expert_ids, gather_indices, scatter_indices)
+    if any(t.dtype != torch.int32 or tuple(t.shape) != (routes,) for t in vectors):
+        raise ValueError("sorted/gather/scatter tensors must be int32 [tokens*4]")
+    if (
+        tasks.dtype != torch.int32
+        or tasks.ndim != 2
+        or tasks.shape[1] != 3
+        or tasks.shape[0] < routes
+    ):
+        raise ValueError("tasks must be int32 [capacity>=tokens*4,3]")
+    if task_count.dtype != torch.int32 or tuple(task_count.shape) != (1,):
+        raise ValueError("task_count must be int32 [1]")
+    if output.dtype != torch.float8_e4m3fn or tuple(output.shape) != (
+        routes,
+        hidden,
+    ):
+        raise ValueError("output must be FP8 [tokens*4,hidden]")
+    if not _valid_activation_scale_shape(scales, routes, hidden // 32):
+        raise ValueError(
+            "scales must be row-major uint8 [tokens*4,hidden/32] or "
+            "tile16 uint8 [ceil(hidden/128),ceil(tokens*4/16),4,16]"
+        )
+    tensors = (
+        router_logits,
+        topk_weights,
+        topk_ids,
+        sorted_expert_ids,
+        gather_indices,
+        scatter_indices,
+        tasks,
+        task_count,
+        output,
+        scales,
+    )
+    if input.device.type != "cuda" or any(t.device != input.device for t in tensors):
+        raise ValueError("all fused IQ2R routing tensors must share one GPU")
+    if input.stride(-1) != 1 or input.stride(0) < hidden:
+        raise ValueError("input must have contiguous non-overlapping rows")
+    if router_logits.stride(-1) != 1 or router_logits.stride(0) < 128:
+        raise ValueError("router_logits must have contiguous non-overlapping rows")
+    if any(not t.is_contiguous() for t in tensors[1:]):
+        raise ValueError("all fused IQ2R routing outputs must be contiguous")
+    _iq2r_route_topk_direct_gather_quant_out(
+        input,
+        router_logits,
+        topk_weights,
+        topk_ids,
+        sorted_expert_ids,
+        gather_indices,
+        scatter_indices,
+        tasks,
+        task_count,
+        output,
+        scales,
+        renormalize,
+        router_bias,
+    )
+
+
+def iq2r_route_topk_sort_gather_quant_out(
+    input: Tensor,
+    router_logits: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    gather_indices: Tensor,
+    scatter_indices: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    scales: Tensor,
+    *,
+    task_rows: int,
+    renormalize: bool,
+    router_bias: Tensor | None = None,
+) -> None:
+    """Fuse GPT-OSS top-4, grouped tasks, gather, and MXFP8 quantization."""
+
+    if input.dtype != torch.bfloat16 or input.ndim != 2:
+        raise ValueError("input must be BF16 [tokens,hidden]")
+    tokens, hidden = input.shape
+    if not 0 < tokens <= 16:
+        raise ValueError("fused sorted IQ2R routing requires 1..16 tokens")
+    if hidden % 32:
+        raise ValueError("IQ2R MXFP8 quantization requires hidden divisible by 32")
+    if router_logits.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("router_logits must be BF16 or FP32")
+    if tuple(router_logits.shape) != (tokens, 128):
+        raise ValueError("router_logits must be [tokens,128]")
+    if router_bias is not None:
+        if router_bias.dtype != torch.bfloat16 or tuple(router_bias.shape) != (128,):
+            raise ValueError("router_bias must be BF16 [128]")
+        if router_bias.device != input.device or not router_bias.is_contiguous():
+            raise ValueError("router_bias must be contiguous on the input GPU")
+    if topk_weights.dtype != torch.float32 or tuple(topk_weights.shape) != (
+        tokens,
+        4,
+    ):
+        raise ValueError("topk_weights must be FP32 [tokens,4]")
+    if topk_ids.dtype != torch.int32 or tuple(topk_ids.shape) != (tokens, 4):
+        raise ValueError("topk_ids must be int32 [tokens,4]")
+    routes = tokens * 4
+    vectors = (sorted_expert_ids, gather_indices, scatter_indices)
+    if any(t.dtype != torch.int32 or tuple(t.shape) != (routes,) for t in vectors):
+        raise ValueError("sorted/gather/scatter tensors must be int32 [tokens*4]")
+    required = iq2r_task_capacity(routes, 128, task_rows)
+    if (
+        tasks.dtype != torch.int32
+        or tasks.ndim != 2
+        or tasks.shape[1] != 3
+        or tasks.shape[0] < required
+    ):
+        raise ValueError(f"tasks must be int32 [capacity>={required},3]")
+    if task_count.dtype != torch.int32 or tuple(task_count.shape) != (1,):
+        raise ValueError("task_count must be int32 [1]")
+    if output.dtype != torch.float8_e4m3fn or tuple(output.shape) != (
+        routes,
+        hidden,
+    ):
+        raise ValueError("output must be FP8 [tokens*4,hidden]")
+    if not _valid_activation_scale_shape(scales, routes, hidden // 32):
+        raise ValueError(
+            "scales must be row-major uint8 [tokens*4,hidden/32] or "
+            "tile16 uint8 [ceil(hidden/128),ceil(tokens*4/16),4,16]"
+        )
+    tensors = (
+        router_logits,
+        topk_weights,
+        topk_ids,
+        sorted_expert_ids,
+        gather_indices,
+        scatter_indices,
+        tasks,
+        task_count,
+        output,
+        scales,
+    )
+    if input.device.type != "cuda" or any(t.device != input.device for t in tensors):
+        raise ValueError("all fused sorted IQ2R tensors must share one GPU")
+    if input.stride(-1) != 1 or input.stride(0) < hidden:
+        raise ValueError("input must have contiguous non-overlapping rows")
+    if router_logits.stride(-1) != 1 or router_logits.stride(0) < 128:
+        raise ValueError("router_logits must have contiguous non-overlapping rows")
+    if any(not t.is_contiguous() for t in tensors[1:]):
+        raise ValueError("all fused sorted IQ2R outputs must be contiguous")
+    _iq2r_route_topk_sort_gather_quant_out(
+        input,
+        router_logits,
+        topk_weights,
+        topk_ids,
+        sorted_expert_ids,
+        gather_indices,
+        scatter_indices,
+        tasks,
+        task_count,
+        output,
+        scales,
+        task_rows,
+        renormalize,
+        router_bias,
     )
 
 
@@ -723,11 +1013,16 @@ def iq2r_swiglu_quant_out(
     if gate_up.shape[1] % 64:
         raise ValueError("gate_up width must be divisible by 64")
     expected_output = (gate_up.shape[0], gate_up.shape[1] // 2)
-    expected_scales = (gate_up.shape[0], gate_up.shape[1] // 64)
+    scale_rows = gate_up.shape[0]
+    scale_groups = gate_up.shape[1] // 64
     if output.dtype != torch.float8_e4m3fn or tuple(output.shape) != expected_output:
         raise ValueError(f"output must be float8_e4m3fn {expected_output}")
-    if scales.dtype != torch.uint8 or tuple(scales.shape) != expected_scales:
-        raise ValueError(f"scales must be uint8 {expected_scales}")
+    if not _valid_activation_scale_shape(scales, scale_rows, scale_groups):
+        raise ValueError(
+            f"scales must be row-major uint8 [{scale_rows},{scale_groups}] "
+            "or tile16 uint8 "
+            f"[{(scale_groups + 3) // 4},{(scale_rows + 15) // 16},4,16]"
+        )
     tensors = [gate_up, output, scales]
     if activated is not None:
         if (
@@ -781,6 +1076,80 @@ def iq2r_route_reduce_indexed_out(
     )
 
 
+def iq2r_route_reduce_add_rmsnorm_indexed_out(
+    route_output: Tensor,
+    route_weights: Tensor,
+    scatter_indices: Tensor,
+    residual: Tensor,
+    norm_weight: Tensor,
+    output: Tensor,
+    residual_out: Tensor,
+    *,
+    topk: int,
+    epsilon: float,
+    block_size: int = 256,
+) -> None:
+    """Reduce IQ2R routes, update the residual, and RMS-normalize in one launch.
+
+    The route sum is rounded to BF16 before the residual add, matching the
+    unfused ``route_reduce`` followed by ``rmsnorm2d_fwd_with_add`` sequence.
+    ``block_size`` is exposed while the gfx950 launch geometry is qualified.
+    """
+
+    if route_output.dtype != torch.bfloat16 or route_output.ndim != 2:
+        raise ValueError("route_output must be BF16 [routes,hidden]")
+    if route_weights.dtype != torch.float32 or route_weights.ndim != 2:
+        raise ValueError("route_weights must be FP32 [tokens,topk]")
+    if route_weights.shape[1] != topk:
+        raise ValueError("route_weights top-k dimension does not match topk")
+    tokens = route_weights.shape[0]
+    routes = tokens * topk
+    hidden = route_output.shape[1]
+    if route_output.shape[0] != routes:
+        raise ValueError("route_output row count must equal tokens*topk")
+    if scatter_indices.dtype != torch.int32 or tuple(scatter_indices.shape) != (
+        routes,
+    ):
+        raise ValueError("scatter_indices must be int32 [routes]")
+    expected = (tokens, hidden)
+    for name, tensor in (
+        ("residual", residual),
+        ("output", output),
+        ("residual_out", residual_out),
+    ):
+        if tensor.dtype != torch.bfloat16 or tuple(tensor.shape) != expected:
+            raise ValueError(f"{name} must be BF16 {expected}")
+    if norm_weight.dtype != torch.bfloat16 or tuple(norm_weight.shape) != (hidden,):
+        raise ValueError(f"norm_weight must be BF16 ({hidden},)")
+    tensors = (
+        route_output,
+        route_weights,
+        scatter_indices,
+        residual,
+        norm_weight,
+        output,
+        residual_out,
+    )
+    if any(t.device != route_output.device for t in tensors):
+        raise ValueError("fused route reduction/RMSNorm tensors must share a device")
+    if any(not t.is_contiguous() for t in tensors):
+        raise ValueError("fused route reduction/RMSNorm tensors must be contiguous")
+    if block_size not in (256, 512, 1024):
+        raise ValueError("block_size must be 256, 512, or 1024")
+    _iq2r_route_reduce_add_rmsnorm_indexed_out(
+        route_output,
+        route_weights,
+        scatter_indices,
+        residual,
+        norm_weight,
+        output,
+        residual_out,
+        topk,
+        epsilon,
+        block_size,
+    )
+
+
 __all__ = [
     "iq2r_encode_device",
     "iq2r_gemm",
@@ -790,7 +1159,10 @@ __all__ = [
     "iq2r_route_gather_indexed_out",
     "iq2r_route_gather_quant_out",
     "iq2r_route_direct_gather_quant_out",
+    "iq2r_route_topk_direct_gather_quant_out",
+    "iq2r_route_topk_sort_gather_quant_out",
     "iq2r_route_reduce_indexed_out",
+    "iq2r_route_reduce_add_rmsnorm_indexed_out",
     "iq2r_route_sort_tasks_out",
     "iq2r_swiglu_out",
     "iq2r_swiglu_quant_out",

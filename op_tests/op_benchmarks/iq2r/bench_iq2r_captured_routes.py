@@ -135,13 +135,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
 
             def iq2r_call() -> torch.Tensor:
-                topk_softmax(
-                    iq2r_weights,
-                    iq2r_ids,
-                    token_expert_indices,
-                    logits,
-                    True,
-                )
+                if not args.iq2r_fused_router:
+                    topk_softmax(
+                        iq2r_weights,
+                        iq2r_ids,
+                        token_expert_indices,
+                        logits,
+                        True,
+                    )
                 iq2r_fused_moe_out(
                     hidden,
                     iq2r.gate_up_data,
@@ -158,6 +159,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     gate_up_bias=iq2r.gate_up_bias,
                     down_bias=iq2r.down_bias,
                     workspace=workspace,
+                    router_logits=logits if args.iq2r_fused_router else None,
+                    renormalize=True,
                 )
                 return iq2r_output
 
@@ -248,7 +251,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ),
             }
         )
-    return {"aggregate": aggregate, "records": records}
+    return {
+        "benchmark": (
+            "router-logits-through-output"
+            if args.iq2r_fused_router
+            else "legacy-separate-topk-through-output"
+        ),
+        "aggregate": aggregate,
+        "records": records,
+    }
 
 
 def main() -> None:
@@ -268,11 +279,14 @@ def main() -> None:
     )
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--m", type=int, nargs="+", default=[2, 4])
-    parser.add_argument("--task-rows", type=int, choices=(16, 32, 64), default=16)
+    parser.add_argument(
+        "--task-rows", type=int, choices=(16, 32, 64, 128, 256), default=16
+    )
     parser.add_argument("--max-route-files", type=int, default=36)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--iq2r-fused-router", action="store_true")
     parser.add_argument("--seed", type=int, default=0x1709)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

@@ -35,7 +35,25 @@ from bench_iq2r_gpt_oss import _routes
 EXPERTS = 128
 TOPK = 4
 HIDDEN = 2880
-FAMILIES = ("3x4", "3x8", "6x4", "6x8")
+FAMILIES = (
+    "3x4",
+    "3x4scalar",
+    "3x4t",
+    "3x4s",
+    "3x8",
+    "3x8l0",
+    "3x8t",
+    "6x4",
+    "6x4scalar",
+    "6x4t",
+    "6x4a",
+    "6x4at",
+    "6x4s",
+    "6x4as",
+    "6x8",
+    "6x8t",
+    "6x8a",
+)
 
 
 def _require_device_contract() -> None:
@@ -84,6 +102,24 @@ def _clear_launches() -> None:
         os.environ.pop(f"IQ2R_GEMM_{projection}_GRID_MULTIPLIER", None)
 
 
+def _relative_metrics(
+    actual: torch.Tensor, reference: torch.Tensor
+) -> tuple[float, float]:
+    actual_fp32 = actual.float()
+    reference_fp32 = reference.float()
+    delta = actual_fp32 - reference_fp32
+    relative_rmse = (
+        delta.square().mean().sqrt()
+        / reference_fp32.square().mean().sqrt().clamp_min(1e-12)
+    ).item()
+    cosine = (
+        torch.nn.functional.cosine_similarity(actual_fp32, reference_fp32, dim=-1)
+        .mean()
+        .item()
+    )
+    return relative_rmse, cosine
+
+
 def _select_files(root: Path, tokens: int, limit: int) -> list[Path]:
     files = sorted(root.glob(f"*-m{tokens}-*.pt"))
     if not files:
@@ -124,7 +160,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.iq2r_checkpoint, args.layer, device=device
     )
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    candidates = [(family, grid) for family in FAMILIES for grid in args.grid]
+    candidates = [(family, grid) for family in args.families for grid in args.grid]
     records: list[dict[str, object]] = []
 
     for tokens in args.m:
@@ -203,6 +239,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     gate_call, args.warmup, args.iterations, args.samples
                 )
                 error = float((gate_up.float() - gate_reference.float()).abs().max())
+                relative_rmse, cosine = _relative_metrics(gate_up, gate_reference)
                 records.append(
                     {
                         "M": tokens,
@@ -216,8 +253,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         "latency_ms": latency,
                         "samples_ms": samples,
                         "max_abs_error_vs_default": error,
+                        "relative_rmse_vs_default": relative_rmse,
+                        "mean_cosine_vs_default": cosine,
                         "task_count": int(workspace.task_count.item()),
                         "unique_experts": int(topk_ids.unique().numel()),
+                        "max_expert_load": int(
+                            torch.bincount(
+                                topk_ids.reshape(-1), minlength=EXPERTS
+                            ).max()
+                        ),
                     }
                 )
 
@@ -251,6 +295,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 error = float(
                     (route_output.float() - down_reference.float()).abs().max()
                 )
+                relative_rmse, cosine = _relative_metrics(route_output, down_reference)
                 records.append(
                     {
                         "M": tokens,
@@ -264,8 +309,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         "latency_ms": latency,
                         "samples_ms": samples,
                         "max_abs_error_vs_default": error,
+                        "relative_rmse_vs_default": relative_rmse,
+                        "mean_cosine_vs_default": cosine,
                         "task_count": int(workspace.task_count.item()),
                         "unique_experts": int(topk_ids.unique().numel()),
+                        "max_expert_load": int(
+                            torch.bincount(
+                                topk_ids.reshape(-1), minlength=EXPERTS
+                            ).max()
+                        ),
                     }
                 )
             _clear_launches()
@@ -294,6 +346,24 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         and record["family"] == family
                         and record["grid_multiplier"] == grid
                     ]
+                    relative_rmses = [
+                        float(record["relative_rmse_vs_default"])
+                        for record in records
+                        if record["M"] == tokens
+                        and record["routing"] == routing_pattern
+                        and record["projection"] == projection
+                        and record["family"] == family
+                        and record["grid_multiplier"] == grid
+                    ]
+                    cosines = [
+                        float(record["mean_cosine_vs_default"])
+                        for record in records
+                        if record["M"] == tokens
+                        and record["routing"] == routing_pattern
+                        and record["projection"] == projection
+                        and record["family"] == family
+                        and record["grid_multiplier"] == grid
+                    ]
                     aggregate.append(
                         {
                             "M": tokens,
@@ -305,6 +375,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                             "min_latency_ms": min(selected),
                             "max_latency_ms": max(selected),
                             "max_abs_error_vs_default": max(errors),
+                            "max_relative_rmse_vs_default": max(relative_rmses),
+                            "min_mean_cosine_vs_default": min(cosines),
                             "route_files": len(selected),
                         }
                     )
@@ -332,7 +404,10 @@ def main() -> None:
     )
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--m", type=int, nargs="+", default=[2, 4])
-    parser.add_argument("--task-rows", type=int, choices=(16, 32, 64), default=16)
+    parser.add_argument("--families", nargs="+", choices=FAMILIES, default=FAMILIES)
+    parser.add_argument(
+        "--task-rows", type=int, choices=(16, 32, 64, 128, 256), default=16
+    )
     parser.add_argument("--grid", type=int, nargs="+", default=[1, 2, 3, 4, 5])
     parser.add_argument("--max-route-files", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=5)
