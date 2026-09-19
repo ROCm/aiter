@@ -16,6 +16,7 @@ import os
 import sys
 from collections import namedtuple
 
+import pandas as pd
 import torch
 
 import aiter
@@ -900,6 +901,10 @@ def main():
                     seed=args.seed,
                 )
         print_json_table("inverse_rope_group_quant summary", df)
+        aiter.logger.info(
+            "inverse_rope_group_quant summary (markdown):\n%s",
+            pd.DataFrame(df).to_markdown(index=False),
+        )
         if args.graph:
             aiter.logger.info("all graph capture/replay checks passed")
 

@@ -327,7 +327,8 @@ template <typename scalar_t,
           int K_PER_THREAD,
           ScaleLayout SCALE_LAYOUT,
           TierOrder TIER  = kTierOff,
-          bool ROW_BASED  = false>
+          bool ROW_BASED   = false,
+          bool ROW128_4096 = false>
 __global__ void inverse_rope_group_quant_kernel(
     const scalar_t* __restrict__ o,
     opus::fp8_t* __restrict__ x_fp8,
@@ -338,20 +339,31 @@ __global__ void inverse_rope_group_quant_kernel(
     int S,
     int H,
     int G,
-    int D,
+    int D_arg,
     int scale_n,
-    int k_slots,
+    int k_slots_arg,
     int64_t scale_stride_s,
     int64_t scale_stride_g,
     int64_t scale_stride_k,
     int S_pad,
     int Ks_pad,
     int max_position,
-    bool contig_k,
+    bool contig_k_arg,
     bool swap_sg,
     int n_super,
-    int nope_slots)
+    int nope_slots_arg)
 {
+    // The host selects this specialization only for a full D=4096 row,
+    // two waves/two passes, and packed row-major scales. Constant geometry
+    // removes address multiplies and the per-pass tier branches.
+    static_assert(!ROW128_4096 ||
+                  (SCALE_LAYOUT == kScaleRowMajor && GROUP_SIZE == 128 &&
+                   THREAD_DATA_SIZE == 32 && K_PER_THREAD == 2 &&
+                   TIER == kTierRun8));
+    const int D = ROW128_4096 ? 4096 : D_arg;
+    const int k_slots = ROW128_4096 ? 16 : k_slots_arg;
+    const int nope_slots = ROW128_4096 ? 16 : nope_slots_arg;
+    const bool contig_k = ROW128_4096 ? false : contig_k_arg;
     constexpr int THREADS_PER_GROUP = GROUP_SIZE / THREAD_DATA_SIZE;
     static_assert(HEAD_DIM > 0 && RD > 0 && RD <= HEAD_DIM && (RD % 2) == 0);
     static_assert(GROUP_SIZE == 32 || GROUP_SIZE == 64 || GROUP_SIZE == 128);
@@ -397,7 +409,8 @@ __global__ void inverse_rope_group_quant_kernel(
     // the dispatch index x + gx * (y + gy * z) comes out identical either way
     // (see the host comment where the grid is built).
     const int y_span =
-        static_cast<int>(super_major ? (blockIdx.y >> 5) : blockIdx.y);
+        ROW128_4096 ? 0
+                    : static_cast<int>(super_major ? (blockIdx.y >> 5) : blockIdx.y);
     int s = static_cast<int>(swap ? blockIdx.z : blockIdx.x);
     if(super_major)
     {
@@ -435,8 +448,15 @@ __global__ void inverse_rope_group_quant_kernel(
     // which is the cost the half-cut was there to avoid. At four the run is
     // three against four slots and scatters too, but the extra quarter of
     // passes reaching the native path more than pays for it.
+    // Wide row/128 uses equal half-head runs: regular TDM tiles and a
+    // native-quantization pass for the first half. The host enables this
+    // order only for streaming launches; narrow row/128 retains its 3+1 cut.
+    constexpr bool kWideRow128 = SCALE_LAYOUT == kScaleRowMajor &&
+                                GROUP_SIZE == 128 && THREAD_DATA_SIZE == 32;
     constexpr int kNopePerHead =
-        (GROUPS_PER_HEAD <= 4) ? kRopeFirstGroup : (GROUPS_PER_HEAD / 2);
+        kWideRow128 ? (GROUPS_PER_HEAD / 2)
+                    : ((GROUPS_PER_HEAD <= 4) ? kRopeFirstGroup
+                                             : (GROUPS_PER_HEAD / 2));
     constexpr int kRopePerHead    = GROUPS_PER_HEAD - kNopePerHead;
     // Cutting the head at the half is not where the rope tail actually starts --
     // here it is an eighth in, so half of all passes take the rope path while
@@ -480,6 +500,12 @@ __global__ void inverse_rope_group_quant_kernel(
     // slot, which carries no lane term, so the answer is scalar.
     auto segment_of_pass = [&](int k) -> int
     {
+        if constexpr(ROW128_4096)
+        {
+            // The first pass covers the first half of each head; the second
+            // covers its rotary half. Both waves follow the same order.
+            return k == 1 ? kRopeSegment : 0;
+        }
         if constexpr(TIER == kTierRun4)
         {
             return hi_of_pass(k) * kRun + kRun > kRopeFirstGroup ? kRopeSegment
@@ -802,6 +828,10 @@ __global__ void inverse_rope_group_quant_kernel(
         scale_row_base =
             (static_cast<int64_t>(s >> 5) * G + g) * scale_n * 32 + (s & 31) * 4;
     }
+    else if constexpr(ROW128_4096)
+    {
+        scale_row_base = static_cast<int64_t>(row) * 32;
+    }
     else
     {
         scale_row_base = static_cast<int64_t>(s) * scale_stride_s +
@@ -861,7 +891,8 @@ __global__ void inverse_rope_group_quant_kernel(
         else
         {
             x_scale[scale_row_base +
-                    static_cast<int64_t>(k_group) * scale_stride_k] = byte;
+                    static_cast<int64_t>(k_group) *
+                        (ROW128_4096 ? 1 : scale_stride_k)] = byte;
         }
     };
 
@@ -1281,6 +1312,15 @@ void inverse_rope_group_quant(
     constexpr int HEAD_DIM_T = 512;
     constexpr int RD_T = 64;
 
+    // At least 512 MiB of input amortizes the half-head tier and its second
+    // pass. Each 4096-element span is exactly two waves times two passes at
+    // TDS=32. Small G did not benefit at large S, so keep that case and
+    // smaller workloads on the four-wave, untiered path.
+    const bool row128_stream =
+        scale_layout == kScaleRowMajor && quant_group_size == 128 &&
+        has_tdm_arch() && G >= 4 && D >= 4096 && D % 4096 == 0 &&
+        static_cast<int64_t>(S) * H * HEAD_DIM_T >= (int64_t{1} << 28);
+
     // The whole-row-block tier (md 18.14/18.16.6) is retired: its band was
     // gated on `wide_waves >= simds*32 && wide_waves < simds*32`, which is
     // empty, so it had not been reachable. Kept as a named constant because
@@ -1297,6 +1337,8 @@ void inverse_rope_group_quant(
         constexpr int TDS = decltype(tds_tag)::value;
         constexpr int THREADS_PER_GROUP = GS / TDS;
         constexpr int KPT = decltype(kpt_tag)::value;
+        constexpr bool kWideRow128 =
+            LAYOUT == kScaleRowMajor && GS == 128 && TDS == 32;
         if constexpr(THREADS_PER_GROUP < 1)
         {
             AITER_CHECK(false, "invalid THREAD_DATA_SIZE/GROUP_SIZE combination");
@@ -1360,7 +1402,8 @@ void inverse_rope_group_quant(
             constexpr int kRopeFirstG = (HEAD_DIM_T - RD_T) / GS;
             // Must mirror the kernel's kNopePerHead exactly.
             constexpr int kNopePerHd =
-                (kGph <= 4) ? kRopeFirstG : (kGph / 2);
+                kWideRow128 ? (kGph / 2)
+                            : ((kGph <= 4) ? kRopeFirstG : (kGph / 2));
             const int heads_k = (scale_n % kGph == 0) ? scale_n / kGph : 0;
             // The kernel reads the tier off the wave's first slot, so what must
             // not straddle a tier boundary is a wave's slots, not a block's.
@@ -1370,15 +1413,14 @@ void inverse_rope_group_quant(
             // sort lands on a different set of addresses there and none of the
             // measurements behind it were taken on that placement.
             const int slots_per_wave = std::max(wave_size / THREADS_PER_GROUP, 1);
-            // Row-major admits the same sort once the slice is narrow, and it is
-            // worth 13-18% there (md 23.4). Below that width the sort is not
-            // merely unhelpful but premature -- the groups a wave spans are too
-            // few to amortize it -- so it is gated rather than taken outright.
-            // TDS == 16 is that width on wave32, stated here as TDS because it
-            // is narrow_slice that picks it and narrow_slice is not yet in scope.
+            // Row-major normally tiers narrow slices. Wide row/128 also
+            // admits equal half-head TDM tiles, but only after the workload
+            // crosses the streaming threshold shared with block dispatch.
             constexpr bool kTierLayoutOk =
-                LAYOUT == kScaleN32K4 || (LAYOUT == kScaleRowMajor && TDS == 16);
+                LAYOUT == kScaleN32K4 ||
+                (LAYOUT == kScaleRowMajor && (TDS == 16 || kWideRow128));
             const bool tier_base_ok = !whole_row_block && kTierLayoutOk &&
+                                      (!kWideRow128 || row128_stream) &&
                                       heads_k > 0 &&
                                       k_slots > 0 && wave_size != 64;
             // Run 8 cuts the head in two and needs the nope side to be a whole
@@ -1442,16 +1484,21 @@ void inverse_rope_group_quant(
                 // is what keeps bf16 S = 16384 on the cheaper path.
                 constexpr int64_t kDescReach = int64_t{1} << 31;
                 const int64_t payload_elems = static_cast<int64_t>(S) * G * D;
-                const bool row_based =
+                // Streaming row/128 loads through a row-relative TDM window,
+                // so only its output needs the buffer's 2 GiB reach check.
+                const bool input_needs_row_base =
+                    !(row128_stream && tdm_used) &&
                     payload_elems * static_cast<int64_t>(sizeof(scalar_t)) >
-                        kDescReach ||
-                    payload_elems > kDescReach;
+                        kDescReach;
+                const bool row_based =
+                    input_needs_row_base || payload_elems > kDescReach;
 
-                auto go1 = [&](auto tier_tag, auto row_tag)
+                auto go1 = [&](auto tier_tag, auto row_tag, auto geometry_tag)
                 {
                     inverse_rope_group_quant_kernel<
                         scalar_opus_t, HEAD_DIM_T, RD_T, GS, TDS, KPT, LAYOUT,
-                        decltype(tier_tag)::value, decltype(row_tag)::value>
+                        decltype(tier_tag)::value, decltype(row_tag)::value,
+                        decltype(geometry_tag)::value>
                         <<<grid, block, tdm_lds_bytes, stream>>>(
                             reinterpret_cast<const scalar_opus_t*>(o.data_ptr()),
                             reinterpret_cast<opus::fp8_t*>(x_fp8.data_ptr()),
@@ -1470,15 +1517,32 @@ void inverse_rope_group_quant(
                             super_major ? n_super : 0,
                             nope_slots);
                 };
+                auto go_row = [&](auto tier_tag, auto row_tag)
+                {
+                    if constexpr(kWideRow128 && KPT == 2 &&
+                                 decltype(tier_tag)::value == kTierRun8)
+                    {
+                        // Preserve arbitrary scale strides on the generic path.
+                        // Only four extra kernels (dtype x ROW_BASED) are needed.
+                        if(row128_stream && D == 4096 && k_slots == 16 &&
+                           x_scale.stride(0) == static_cast<int64_t>(G) * 32 &&
+                           x_scale.stride(1) == 32 && x_scale.stride(2) == 1)
+                        {
+                            go1(tier_tag, row_tag, std::true_type{});
+                            return;
+                        }
+                    }
+                    go1(tier_tag, row_tag, std::false_type{});
+                };
                 auto go = [&](auto tier_tag)
                 {
                     if(row_based)
                     {
-                        go1(tier_tag, std::true_type{});
+                        go_row(tier_tag, std::true_type{});
                     }
                     else
                     {
-                        go1(tier_tag, std::false_type{});
+                        go_row(tier_tag, std::false_type{});
                     }
                 };
                 // Only instantiate the tiered kernels where they can ever run.
@@ -1568,7 +1632,15 @@ void inverse_rope_group_quant(
         const int64_t wide_waves =
             static_cast<int64_t>(rows) * D / (wave_size * 32);
 
+        // On gfx1250, row/128 keeps the wide slice even for streaming shapes.
+        // TDS=16 selects the 3+1 tier order, whose irregular runs prevent TDM
+        // staging and increase HBM traffic. TDS=32 admits regular TDM tiles,
+        // including the streaming half-head tier. The adjustment below narrows
+        // rows that cannot fill a wave at this width.
+        const bool keep_wide_row128 =
+            LAYOUT == kScaleRowMajor && GS == 128 && has_tdm_arch();
         const bool narrow_slice =
+            !keep_wide_row128 &&
             wide_waves >= simds * kNarrowCrossoverWavesPerSimd;
 
         // Bytes per thread at bf16/fp16: 16B on wave64, else 32B or 64B.
@@ -1625,8 +1697,12 @@ void inverse_rope_group_quant(
         const int threads_per_group = GS / tds;
         const int k_slots_min =
             std::min(std::max(wave_size / threads_per_group, 1), scale_n);
-        // Row layout on wave32 (gfx1250) was tuned to 1 wave/block -- its scale
-        // writes are already coalesced so the narrowest block spreads best.
+        // On gfx1250, row/128 uses four waves to keep a D=4096 row in one
+        // block; kpt then backs off to one pass. This improves S=256/512/1024
+        // over separate one-wave blocks. Streaming launches use two waves
+        // and two half-head passes instead. The block-count backoff keeps the
+        // GPU occupied on small launches. Other wave32 row layouts retain
+        // one wave per block.
         // wave64 (gfx950) regresses badly with 1-wave blocks (S*G tiny blocks
         // -> poor occupancy/latency hiding, measured +10..26% on the row tier),
         // so keep it as wide as the MFMA tile path.
@@ -1650,7 +1726,9 @@ void inverse_rope_group_quant(
         const int waves_per_block =
             (kMfmaTile || wave64)
                 ? 4
-                : ((LAYOUT == kScaleN32K4 && !run4_fits) ? 2 : 1);
+                : (keep_wide_row128
+                       ? (row128_stream ? 2 : 4)
+                       : ((LAYOUT == kScaleN32K4 && !run4_fits) ? 2 : 1));
         int k_slots = std::min(
             std::max(waves_per_block * wave_size / threads_per_group, 1), scale_n);
         const int64_t target_blocks = static_cast<int64_t>(get_num_cu_func()) * 4;
