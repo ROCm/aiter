@@ -207,6 +207,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         f"got q hidden_dim={hidden_dim} and packed KV dim={packed_dim}."
     )
 
+    ChunkQ = min(ChunkQ, heads)
     TileQCount = batch_size * next_n * (heads // ChunkQ)
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
