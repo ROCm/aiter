@@ -83,6 +83,37 @@ void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
                                         int64_t topk,
                                         int64_t expert_count);
 
+void iq2r_route_topk_direct_gather_quant_out(
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& router_logits,
+    aiter_tensor_t& topk_weights,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& sorted_expert_ids,
+    aiter_tensor_t& gather_indices,
+    aiter_tensor_t& scatter_indices,
+    aiter_tensor_t& tasks,
+    aiter_tensor_t& task_count,
+    aiter_tensor_t& output,
+    aiter_tensor_t& scales,
+    bool renormalize,
+    std::optional<aiter_tensor_t> router_bias);
+
+void iq2r_route_topk_sort_gather_quant_out(
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& router_logits,
+    aiter_tensor_t& topk_weights,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& sorted_expert_ids,
+    aiter_tensor_t& gather_indices,
+    aiter_tensor_t& scatter_indices,
+    aiter_tensor_t& tasks,
+    aiter_tensor_t& task_count,
+    aiter_tensor_t& output,
+    aiter_tensor_t& scales,
+    int64_t task_rows,
+    bool renormalize,
+    std::optional<aiter_tensor_t> router_bias);
+
 void iq2r_swiglu_out(const aiter_tensor_t& gate_up, aiter_tensor_t& output);
 
 void iq2r_swiglu_quant_out(const aiter_tensor_t& gate_up,
@@ -95,5 +126,17 @@ void iq2r_route_reduce_indexed_out(const aiter_tensor_t& route_output,
                                    const aiter_tensor_t& scatter_indices,
                                    aiter_tensor_t& output,
                                    int64_t topk);
+
+void iq2r_route_reduce_add_rmsnorm_indexed_out(
+    const aiter_tensor_t& route_output,
+    const aiter_tensor_t& route_weights,
+    const aiter_tensor_t& scatter_indices,
+    const aiter_tensor_t& residual,
+    const aiter_tensor_t& norm_weight,
+    aiter_tensor_t& output,
+    aiter_tensor_t& residual_out,
+    int64_t topk,
+    double epsilon,
+    int64_t block_size);
 
 } // namespace aiter
