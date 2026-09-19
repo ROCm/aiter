@@ -232,12 +232,12 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
         self.assertEqual(
-            rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"],
+            rows[("gfx950", 256, 2, 1, 1024, 4096)]["kernelId"],
             8311,
             "legacy local OPUS kid 311 must become public global kid 8311",
         )
         self.assertEqual(
-            rows[("gfx950", 8, 128, 1024, 4096)]["kernelId"],
+            rows[("gfx950", 256, 8, 128, 1024, 4096)]["kernelId"],
             8653,
             "legacy local OPUS kid 653 must become public global kid 8653",
         )

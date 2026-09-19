@@ -279,11 +279,146 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
             8640,
             1,
         )
-        assert len(warnings) == 1
-        assert warnings[0][0].startswith("Skipping %d invalid OPUS row")
+        invalid_row_warnings = [
+            warning
+            for warning in warnings
+            if warning[0].startswith("Skipping %d invalid OPUS row")
+        ]
+        assert len(invalid_row_warnings) == 1
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+def test_mxscale_tuned_lookup_distinguishes_cu_count(monkeypatch, tmp_path):
+    from aiter.ops.opus import policy
+
+    config_path = tmp_path / "mxscale.csv"
+    config_path.write_text(
+        "gfx,cu_num,b,m,n,k,libtype,kernelId,splitK\n"
+        "gfx950,128,2,1,1024,4096,opus,8311,1\n"
+        "gfx950,256,2,1,1024,4096,opus,8312,1\n"
+    )
+    monkeypatch.setattr(
+        policy,
+        "AITER_CONFIGS",
+        SimpleNamespace(
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE=str(config_path)
+        ),
+    )
+    current = {"cu_num": -1}
+    monkeypatch.setattr(policy, "get_cu_num", lambda: current["cu_num"])
+    monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        policy,
+        "_get_cached_a8w8_mxscale_bmm_plan",
+        lambda *_args, **_kwargs: object(),
+    )
+    policy._load_mxscale_bmm_tuned.cache_clear()
+    policy.lookup_mxscale_bmm_config.cache_clear()
+
+    try:
+        rows = policy._load_mxscale_bmm_tuned("opus")
+        assert rows[("gfx950", 128, 2, 1, 1024, 4096)]["kernelId"] == 8311
+        assert rows[("gfx950", 256, 2, 1, 1024, 4096)]["kernelId"] == 8312
+
+        current["cu_num"] = 128
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        assert policy.lookup_mxscale_bmm_config(2, 1, 1024, 4096)["kernelId"] == 8311
+
+        current["cu_num"] = 256
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        assert policy.lookup_mxscale_bmm_config(2, 1, 1024, 4096)["kernelId"] == 8312
+    finally:
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+def test_mxscale_tuned_lookup_with_no_cu_count_warns_and_resolves(
+    monkeypatch, tmp_path
+):
+    from aiter.ops.opus import policy
+
+    config_path = tmp_path / "mxscale.csv"
+    config_path.write_text(
+        "gfx,b,m,n,k,libtype,kernelId,splitK\ngfx950,2,1,1024,4096,opus,8311,1\n"
+    )
+    warnings = []
+    monkeypatch.setattr(
+        policy,
+        "AITER_CONFIGS",
+        SimpleNamespace(
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE=str(config_path)
+        ),
+    )
+    monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(policy, "get_cu_num", lambda: 128)
+    monkeypatch.setattr(
+        policy,
+        "_get_cached_a8w8_mxscale_bmm_plan",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        policy.logger,
+        "warning",
+        lambda *args, **_kwargs: warnings.append(args),
+    )
+    policy._load_mxscale_bmm_tuned.cache_clear()
+    policy.lookup_mxscale_bmm_config.cache_clear()
+
+    try:
+        assert policy.lookup_mxscale_bmm_config(2, 1, 1024, 4096)["kernelId"] == 8311
+        assert policy.lookup_mxscale_bmm_config(2, 1, 1024, 4096)["kernelId"] == 8311
+        assert len(warnings) == 1
+    finally:
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+def test_mxscale_tuned_loader_rejects_duplicate_cu_shape(monkeypatch, tmp_path):
+    from aiter.ops.opus import policy
+
+    config_path = tmp_path / "mxscale.csv"
+    config_path.write_text(
+        "gfx,cu_num,b,m,n,k,libtype,kernelId,splitK\n"
+        "gfx950,128,2,1,1024,4096,opus,8311,1\n"
+        "gfx950,128,2,1,1024,4096,opus,8312,1\n"
+    )
+    monkeypatch.setattr(
+        policy,
+        "AITER_CONFIGS",
+        SimpleNamespace(
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE=str(config_path)
+        ),
+    )
+    monkeypatch.setattr(
+        policy,
+        "_get_cached_a8w8_mxscale_bmm_plan",
+        lambda *_args, **_kwargs: object(),
+    )
+    policy._load_mxscale_bmm_tuned.cache_clear()
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="duplicate",
+        ):
+            policy._load_mxscale_bmm_tuned("opus")
+    finally:
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+def test_mxscale_tuner_emits_cu_count_key():
+    from csrc.opus_gemm.opus_bmm_mxscale_tune import OpusBmmMxscaleTuner
+
+    tuner = OpusBmmMxscaleTuner()
+    frame = tuner.result_to_df(
+        [((("gfx950", 128, 2, 1, 1024, 4096), 8311, 1, "kid"), 10.0, 0.0)]
+    )
+
+    assert list(frame.columns[:6]) == ["gfx", "cu_num", "b", "m", "n", "k"]
+    assert frame.loc[0, "cu_num"] == 128
+    assert frame.loc[0, "b"] == 2
 
 
 if __name__ == "__main__":
