@@ -105,7 +105,12 @@ def _reference(q, kc, vc, indptr, indices, gate, scale, k_scale, v_scale, quant_
     # powers of two, plus the non-power-of-two sizes a graph capture asks for
     [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 128],
 )
-@pytest.mark.parametrize("heads", [4, 8, 16])
+# Qwen3-Next has 16 query heads, so a TP degree of 1/2/4/8/16 gives a rank
+# 16/8/4/2/1 of them. All five must work: the support predicate admits
+# 0 < heads <= 16, so anything it admits has to be covered here or the
+# predicate is lying. 3 is included as a non-power-of-two the predicate also
+# admits.
+@pytest.mark.parametrize("heads", [1, 2, 3, 4, 8, 16])
 @pytest.mark.parametrize("ctx_len", [1, 129, 1024])
 # One hint on each side of the crossover, so both bodies see every shape.
 @pytest.mark.parametrize("max_context", [_SHORT_CONTEXT_MAX, _SHORT_CONTEXT_MAX * 2])
@@ -194,7 +199,12 @@ def test_max_context_hint_never_clamps(rows):
 
 
 @pytest.mark.parametrize("rows", [1, 8, 32])
-@pytest.mark.parametrize("heads", [4, 8, 16])
+# Qwen3-Next has 16 query heads, so a TP degree of 1/2/4/8/16 gives a rank
+# 16/8/4/2/1 of them. All five must work: the support predicate admits
+# 0 < heads <= 16, so anything it admits has to be covered here or the
+# predicate is lying. 3 is included as a non-power-of-two the predicate also
+# admits.
+@pytest.mark.parametrize("heads", [1, 2, 3, 4, 8, 16])
 def test_bodies_agree(rows, heads):
     """The two bodies are a performance choice, so they must agree numerically.
 
@@ -212,7 +222,12 @@ def test_bodies_agree(rows, heads):
         "v_scale": v_scale,
         "quant_dtype": dtype,
     }
-    assert _short_body_selected(heads, kc, vc, _SHORT_CONTEXT_MAX)
+    if not _short_body_selected(heads, kc, vc, _SHORT_CONTEXT_MAX):
+        # Head counts outside _SHORT_HEADS never reach the short body, so there
+        # is no second body to compare against. That is a documented property,
+        # asserted in test_body_selection_contract; skipping here keeps this
+        # test about numerical agreement rather than re-testing selection.
+        pytest.skip(f"heads={heads} has no short-body path")
     assert not _short_body_selected(heads, kc, vc, _SHORT_CONTEXT_MAX + 1)
 
     short_gated, short_q, short_s = paged_attention_output_gate_group_fp8_quant(
@@ -291,3 +306,54 @@ def test_supported_predicate_rejects_and_explains():
 
     ok, reason = paged_attention_output_gate_supported(q, kc, vc, gate, torch.float16)
     assert not ok and "quant_dtype" in reason
+
+
+def test_body_selection_contract():
+    """Pin *which* body runs, not just that the answer is right.
+
+    Body choice is a performance contract with three independent conditions,
+    and nothing else in this file would notice if any of them silently changed:
+
+      * `max_context > 32768`     -> long body
+      * `heads not in (4,8,16)`   -> long body REGARDLESS of context, because
+        the short body's QK MFMA tiles 4x64x64 over the head axis
+      * cache not 16-element aligned -> long body, whose gather has no such
+        requirement
+
+    The head-count one is a performance cliff worth stating out loud: a TP8
+    deployment of Qwen3-Next has 2 heads per rank and therefore never gets the
+    short body, even at short context where it is ~24% faster. That is
+    correctness-neutral -- body choice never changes the answer, only the speed
+    (see `test_matches_reference`, which covers heads 1..16) -- but it should
+    not be able to change without someone noticing.
+    """
+    from aiter.ops.triton.attention import paged_attention_output_gate as mod
+
+    dtype = torch.float8_e4m3fn
+    _, kc, vc, _, _, _ = _make_inputs(4, 256, 4, dtype, seed=99)
+    short_ctx = mod._SHORT_CONTEXT_MAX
+    long_ctx = mod._SHORT_CONTEXT_MAX * 2
+
+    for heads in mod._SHORT_HEADS:
+        assert mod._short_body_selected(
+            heads, kc, vc, short_ctx
+        ), f"heads={heads} at max_context={short_ctx} should use the short body"
+        assert not mod._short_body_selected(
+            heads, kc, vc, long_ctx
+        ), f"heads={heads} above the context threshold should use the long body"
+
+    for heads in (1, 2, 3, 5, 6):
+        assert heads not in mod._SHORT_HEADS
+        assert not mod._short_body_selected(heads, kc, vc, short_ctx), (
+            f"heads={heads} is not a short-body head count and must fall to the "
+            "long body even at short context"
+        )
+
+    # A misaligned cache must fall to the long body rather than being rejected.
+    # Slicing rows (kc[1:]) gives an offset of 256 elements, which is still
+    # 16-aligned; the offset has to be built element-wise to be misaligned.
+    pages = kc.shape[0]
+    flat = torch.empty(pages * HEAD_DIM + 1, dtype=kc.dtype, device=kc.device)
+    mis = flat[1:].view(pages, 1, HEAD_DIM)
+    assert mis.storage_offset() % 16 != 0
+    assert not mod._short_body_selected(4, mis, mis, short_ctx)
