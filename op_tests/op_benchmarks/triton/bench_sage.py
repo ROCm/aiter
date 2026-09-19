@@ -1316,17 +1316,12 @@ def make_kernel_runner(
             raise ValueError(f"{args.kernel} does not support --qsmooth")
 
         is_f4f4 = args.kernel == "mha4_f4f4"
-        sparse_mxfp4 = args.kernel == "mha4_mxfp4" and block_lut is not None
-        v_format = fp8_format if sparse_mxfp4 else AttentionFormat.MXFP4
+        v_format = AttentionFormat.MXFP4
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
         )
-        use_dense_p_pack = block_lut is None
-        v_pack = (
-            AttentionPack.V_FOR_FP6_P
-            if is_f4f4 and use_dense_p_pack
-            else AttentionPack.DEFAULT
-        )
+        # Both f4f4 rows ship FP6-P V; mxfp4 uses the canonical order, dense and sparse alike.
+        v_pack = AttentionPack.V_FOR_FP6_P if is_f4f4 else AttentionPack.DEFAULT
 
         def _quantize_mxfp4():
             quant_q, quant_k = q_bshd, k_bshd
@@ -1334,16 +1329,8 @@ def make_kernel_runner(
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
             if is_f4f4:
                 return _production_quantize_f4f4(
-                    quant_q, quant_k, v_bshd, softmax_scale, use_dense_p_pack
+                    quant_q, quant_k, v_bshd, softmax_scale, fp6_p=True
                 )
-            if sparse_mxfp4:
-                q_fp4, q_scale = quantize_mxfp4_q(
-                    quant_q, mha_v4_q_multiplier(softmax_scale)
-                )
-                k_raw, k_scale = quantize_mxfp4_k(quant_k)
-                k_fp4 = mxfp4_k_view(k_raw, k_scale)
-                v_fp8, v_scale = quantize_v_fp8(v_bshd)
-                return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
             return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
 
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
@@ -1628,13 +1615,9 @@ def benchmark_payload_bytes(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    *,
-    sparse: bool = False,
 ) -> tuple[float, float, float]:
     if args.e2e:
         return float(q.element_size()), float(k.element_size()), float(v.element_size())
-    if args.kernel == "mha4_mxfp4" and sparse:
-        return 0.5, 0.5, 1.0
     return KERNEL_SPECS[args.kernel].payload_bytes
 
 
@@ -1696,7 +1679,7 @@ def benchmark_single_case(
 
     mem = compute_memory_bytes(
         shape,
-        *benchmark_payload_bytes(args, q, k, v, sparse=block_lut is not None),
+        *benchmark_payload_bytes(args, q, k, v),
     )
 
     sparse_flops = None

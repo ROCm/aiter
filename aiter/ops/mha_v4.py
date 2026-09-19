@@ -448,9 +448,9 @@ def _resolve_raw_recipe(
             kind == _RawRecipeKind.MXFP6
             and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
         )
-        # All-MXFP4 sparse is the f4f4 row and wants FP6-P V; dense stays on the canonical-V
-        # mxfp4 row, which is the only all-MXFP4 object that handles ragged sequences.
-        or (kind == _RawRecipeKind.MXFP4 and v_format == AttentionFormat.MXFP4 and sparse)
+        # All-MXFP4 takes the canonical-V mxfp4 rows in both modes: it is flat across ragged
+        # sequences where the FP6-P f4f4 object drops (0.98 vs 0.89 at sk=100). f4f4 stays
+        # reachable by passing v_pack=V_FOR_FP6_P explicitly.
     )
     v_pack = AttentionPack.V_FOR_FP6_P if uses_fp6_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)
