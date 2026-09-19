@@ -1,0 +1,110 @@
+name: AITER-triton Kernels board
+
+# Puts work on the AITER-triton Kernels board
+# (https://github.com/orgs/ROCm/projects/232) straight from the repo, so the
+# board does not depend on labels being applied. An issue or PR is added when
+# any of these hold:
+#   1. it is assigned to a member of @ROCm/triton_kernels_team (TEAM below —
+#      update the list when the team changes);
+#   2. it is a PR whose diff touches Triton/Gluon code (same paths as isTriton
+#      in pr-title-tags.yaml — keep the two lists in sync);
+#   3. it carries the Triton/Gluon label.
+# Draft PRs wait until they are marked ready for review. Adding an item that is
+# already on the board is a no-op, so re-evaluating on every event is harmless.
+# The board's own auto-add rules keep working alongside this as a second path.
+#
+# Enabled by the repository variable AITER_TRITON_BOARD_ADD=true. The board
+# token comes from the AITER CI GitHub App, which needs the organization
+# "Projects: read & write" permission for the add step to succeed.
+#
+# pull_request_target is used so fork PRs are covered. This is safe here
+# because the job never checks out or executes PR code — it only reads PR
+# metadata and the changed-file list from the API.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, assigned, labeled]
+  issues:
+    types: [opened, reopened, assigned, labeled]
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: triton-board-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  add-to-board:
+    if: ${{ vars.AITER_TRITON_BOARD_ADD == 'true' && !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether the item belongs on the board
+        id: decide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // https://github.com/orgs/ROCm/teams/triton_kernels_team/members
+            const TEAM = new Set([
+              'ahmed-bsod', 'amd-jrosas', 'amirumoAMD', 'azaidy', 'Boss2002n',
+              'brunomazzottiamd', 'cagrikymk', 'Dewei-Wang-sh', 'farlukas',
+              'k50112113', 'lburzawa', 'lucas-santos-amd', 'micmelesse',
+              'nidal567', 'nsusanto', 'omuhamma', 'rahulbatra85', 'scxiao',
+              'vgokhale', 'xiaohuguo2023',
+            ].map(login => login.toLowerCase()));
+            const TRITON_PATHS = [
+              'aiter/ops/triton/',
+              'aiter/aot/triton/',
+              'aiter/utility/triton/',
+              'op_tests/triton_tests/',
+              'op_tests/op_benchmarks/triton/',
+            ];
+
+            const pr = context.payload.pull_request;
+            const item = pr ?? context.payload.issue;
+            const reasons = [];
+
+            const teamAssignees = (item.assignees ?? [])
+              .map(a => a.login)
+              .filter(login => TEAM.has(login.toLowerCase()));
+            if (teamAssignees.length) {
+              reasons.push(`assigned to ${teamAssignees.join(', ')}`);
+            }
+            if ((item.labels ?? []).some(l => l.name === 'Triton/Gluon')) {
+              reasons.push('labeled Triton/Gluon');
+            }
+            if (pr) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              if (files.some(f => TRITON_PATHS.some(p => f.filename.startsWith(p)))) {
+                reasons.push('touches Triton/Gluon paths');
+              }
+            }
+
+            if (reasons.length) {
+              core.info(`#${item.number} belongs on the board: ${reasons.join('; ')}`);
+            } else {
+              core.info(`#${item.number} does not belong on the board.`);
+            }
+            core.setOutput('add', reasons.length > 0);
+
+      - name: Mint a token for the board
+        if: ${{ steps.decide.outputs.add == 'true' }}
+        id: board_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AITER_CI_APP_ID }}
+          private-key: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: aiter
+
+      - name: Add the item to the board
+        if: ${{ steps.decide.outputs.add == 'true' }}
+        uses: actions/add-to-project@v2
+        with:
+          project-url: https://github.com/orgs/ROCm/projects/232
+          github-token: ${{ steps.board_token.outputs.token }}
