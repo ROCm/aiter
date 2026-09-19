@@ -579,6 +579,8 @@ class MegaMoEGfx1250:
         a1_scale: torch.Tensor | None = None,
         a2_scale: torch.Tensor | None = None,
         recv_token_bound: int | None = None,
+        next_topk_ids: torch.Tensor | None = None,
+        next_recv_token_bound: int | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -589,6 +591,11 @@ class MegaMoEGfx1250:
         so the shape stays static under graph capture, and must not cut below the
         received count -- the kernels skip the tail past the device-side count on
         their own.
+
+        ``next_topk_ids`` (and optional ``next_recv_token_bound``) start the next
+        layer's compact plan on a side stream after this dispatch, so it overlaps
+        the expert GEMM. The two plans use independent hist/done slots and local
+        tok_map/psum buffers. Omit them to keep the plan sequential.
         """
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
@@ -687,6 +694,15 @@ class MegaMoEGfx1250:
         set_tdm_compact_plan(scatter if self._compact_plan else None)
         moe_ids = self._compact_dummy_ids if self._compact_plan else recv_ids
         moe_wts = self._compact_dummy_wts if self._compact_plan else recv_weights
+        if (
+            self._compact_plan
+            and next_topk_ids is not None
+            and int(next_topk_ids.shape[0]) > 0
+        ):
+            # Dispatch of this layer is done, so tok_map[slot] is free. GEMM
+            # still reads psum/masked_m of this slot; the next plan writes the
+            # other slot and overlaps the expert GEMM (and later combine/RMS).
+            self._prefetch_next_compact_plan(next_topk_ids, next_recv_token_bound)
         try:
             fused_moe(
                 recv_x,
@@ -724,23 +740,28 @@ class MegaMoEGfx1250:
     def __exit__(self, *exc):
         self.close()
 
-    def _compact_plan_for(self, align_m: int):
+    def _compact_plan_for(self, align_m: int, slot: int | None = None):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
-        Compiled per alignment and cached, because the plan and the expert GEMM
-        must agree on it: the GEMM reads the plan's psum as its m-tile map, so a
-        tile_m that does not divide this alignment would straddle two experts.
+        Compiled per alignment and hist/done slot, because the plan and the
+        expert GEMM must agree on the tile, and double-buffered plans must not
+        share a done counter.
         """
         from .compact_plan import compile_tdm_compact_plan
 
         align_m = int(align_m)
-        launch = self._compact_plan_launches.get(align_m)
+        slot = int(self._compact_slot if slot is None else slot)
+        key = (align_m, slot)
+        launch = self._compact_plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    f"compact plan for align_m={align_m} was not compiled before "
-                    "graph capture; warm this token bucket eagerly first"
+                    f"compact plan for align_m={align_m} slot={slot} was not "
+                    "compiled before graph capture; warm this token bucket "
+                    "eagerly first"
                 )
+            hist0 = self._arena.offset("compact_hist")
+            done0 = self._arena.offset("compact_done")
             launch = compile_tdm_compact_plan(
                 rank=self._config.rank,
                 npes=self._config.world_size,
@@ -750,12 +771,13 @@ class MegaMoEGfx1250:
                 # The arena's row count, not this step's: the plan bounds what it
                 # may write against the region it writes into.
                 compact_cap=self._compact_cap,
-                off_hist=self._arena.offset("compact_hist"),
-                off_done=self._arena.offset("compact_done"),
+                off_hist=hist0 + slot * self._compact_hist_stride * 4,
+                off_done=done0 + slot * 4,
                 hist_stride=self._compact_hist_stride,
                 max_routes=self._compact_max_routes,
+                hist_pingpong=False,
             )
-            self._compact_plan_launches[align_m] = launch
+            self._compact_plan_launches[key] = launch
         return launch
 
     def warmup_compact_plan(self, recv_token_bound: int | None = None) -> None:
@@ -770,7 +792,87 @@ class MegaMoEGfx1250:
         if not self._compact_plan:
             return
         self._begin_compact_step(recv_token_bound)
-        self._compact_plan_for(self._compact_step_align_m)
+        for slot in range(self._COMPACT_PLAN_SLOTS):
+            self._compact_plan_for(self._compact_step_align_m, slot)
+
+    def prefetch_compact_plan(
+        self,
+        topk_ids: torch.Tensor,
+        recv_token_bound: int | None = None,
+    ) -> None:
+        """Launch ``tdm_compact_plan`` on a side stream into the current slot.
+
+        The plan only needs ``topk_ids``, so the caller can hide the first
+        layer's plan behind RMSNorm. Later layers should pass ``next_topk_ids``
+        to ``forward`` so the plan overlaps the previous expert GEMM instead.
+        """
+        if not self._compact_plan:
+            return
+        self._begin_compact_step(recv_token_bound)
+        self._launch_compact_plan_async(
+            topk_ids, int(topk_ids.shape[0]), self._compact_slot
+        )
+
+    def _prefetch_next_compact_plan(
+        self,
+        topk_ids: torch.Tensor,
+        recv_token_bound: int | None,
+    ) -> None:
+        nxt = 1 - self._compact_slot
+        saved = (
+            self._compact_step_align_m,
+            self._compact_step_rows,
+            self._compact_step_recv_bound,
+        )
+        self._begin_compact_step(recv_token_bound)
+        self._launch_compact_plan_async(topk_ids, int(topk_ids.shape[0]), nxt)
+        (
+            self._compact_step_align_m,
+            self._compact_step_rows,
+            self._compact_step_recv_bound,
+        ) = saved
+        self._compact_slot = nxt
+
+    def _launch_compact_plan_async(
+        self, topk_ids: torch.Tensor, token_count: int, slot: int | None = None
+    ) -> None:
+        slot = int(self._compact_slot if slot is None else slot)
+        bufs = self._compact_slot_bufs(slot)
+        cur = torch.cuda.current_stream()
+        plan_stream = self._compact_plan_stream
+        plan_stream.wait_stream(cur)
+        with torch.cuda.stream(plan_stream):
+            self._compact_plan_for(self._compact_step_align_m, slot)(
+                self._arena.handle,
+                topk_ids.data_ptr(),
+                bufs["tok_map"].data_ptr(),
+                bufs["block_hist"].data_ptr(),
+                bufs["send_base"].data_ptr(),
+                bufs["masked_m"].data_ptr(),
+                bufs["psum"].data_ptr(),
+                bufs["barrier"].data_ptr(),
+                self._config.rank,
+                token_count,
+                fx.Stream(plan_stream),
+            )
+        self._compact_plan_event.record(plan_stream)
+        self._compact_plan_pending = True
+
+    def _wait_compact_plan(self) -> None:
+        if not self._compact_plan_pending:
+            return
+        torch.cuda.current_stream().wait_event(self._compact_plan_event)
+        self._compact_plan_pending = False
+
+    def _compact_slot_bufs(self, slot: int) -> dict:
+        return {
+            "tok_map": self._tok_maps[slot],
+            "block_hist": self._block_hists[slot],
+            "send_base": self._send_bases[slot],
+            "masked_m": self._masked_ms[slot],
+            "psum": self._psums[slot],
+            "barrier": self._barriers[slot],
+        }
 
     def _begin_compact_step(self, recv_token_bound: int | None) -> None:
         """Fix this step's compact geometry from the caller's recv bound.
@@ -888,6 +990,8 @@ class MegaMoEGfx1250:
 
         self._route_counter = route_counter_buffer(config.experts_per_rank, device)
 
+        self._COMPACT_PLAN_SLOTS = 2
+        self._compact_slot = 0
         self._token_destination_map = torch.full(
             (config.max_tokens_per_rank * config.topk,),
             -1,
@@ -901,28 +1005,47 @@ class MegaMoEGfx1250:
         self._compact_step_rows = self._compact_cap
         self._compact_step_recv_bound = max_recv
         if self._compact_plan:
-            self._compact_masked_m = torch.zeros(
-                config.experts_per_rank, dtype=torch.int32, device=device
-            )
-            self._compact_psum = torch.zeros(
-                config.experts_per_rank, dtype=torch.int32, device=device
-            )
-            self._compact_block_hist = torch.empty(
-                PLAN_BLOCKS * segs, dtype=torch.int32, device=device
-            )
-            self._compact_send_base = torch.empty(
-                segs, dtype=torch.int32, device=device
-            )
-            self._compact_barrier = torch.zeros(4, dtype=torch.int32, device=device)
+            n_tok = config.max_tokens_per_rank * config.topk
+            self._tok_maps = [
+                torch.full((n_tok,), -1, dtype=torch.int32, device=device)
+                for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
+            self._token_destination_map = self._tok_maps[0]
+            self._masked_ms = [
+                torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
+                for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
+            self._psums = [
+                torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
+                for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
+            self._block_hists = [
+                torch.empty(PLAN_BLOCKS * segs, dtype=torch.int32, device=device)
+                for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
+            self._send_bases = [
+                torch.empty(segs, dtype=torch.int32, device=device)
+                for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
+            self._barriers = [
+                torch.zeros(4, dtype=torch.int32, device=device)
+                for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
+            self._compact_masked_m = self._masked_ms[0]
+            self._compact_psum = self._psums[0]
             self._compact_dummy_ids = torch.zeros(
                 (1, config.topk), dtype=torch.int32, device=device
             )
             self._compact_dummy_wts = torch.zeros(
                 (1, config.topk), dtype=torch.float32, device=device
             )
-            # Warm the capacity bucket here: it is the one an unbounded (prefill)
-            # step runs, and compiling it inside graph capture is not allowed.
-            self._compact_plan_for(self._compact_tile_m)
+            self._compact_plan_stream = torch.cuda.Stream()
+            self._compact_plan_event = torch.cuda.Event()
+            self._compact_plan_pending = False
+            # Warm both hist/done slots and the capacity bucket: compiling
+            # inside graph capture is not allowed.
+            for slot in range(self._COMPACT_PLAN_SLOTS):
+                self._compact_plan_for(self._compact_tile_m, slot)
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device
         )
@@ -1346,6 +1469,8 @@ class MegaMoEGfx1250:
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
+        if self._compact_plan and not self._compact_plan_pending:
+            self._launch_compact_plan_async(topk_ids, token_count)
         stream = fx.Stream(torch.cuda.current_stream())
         payload = hidden_states
         if self._config.is_quant_dispatch_wire:
@@ -1365,25 +1490,19 @@ class MegaMoEGfx1250:
             # stages them, so there is no repack here.
             self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
         if self._compact_plan:
-            self._compact_plan_for(self._compact_step_align_m)(
-                self._arena.handle,
-                topk_ids.data_ptr(),
-                self._token_destination_map.data_ptr(),
-                self._compact_block_hist.data_ptr(),
-                self._compact_send_base.data_ptr(),
-                self._compact_masked_m.data_ptr(),
-                self._compact_psum.data_ptr(),
-                self._compact_barrier.data_ptr(),
-                self._config.rank,
-                token_count,
-                stream,
-            )
+            self._wait_compact_plan()
+            tok_map = self._tok_maps[self._compact_slot]
+            self._token_destination_map = tok_map
+            self._compact_masked_m = self._masked_ms[self._compact_slot]
+            self._compact_psum = self._psums[self._compact_slot]
+        else:
+            tok_map = self._token_destination_map
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),
             topk_ids.data_ptr(),
             topk_weights.data_ptr(),
-            self._token_destination_map.data_ptr(),
+            tok_map.data_ptr(),
             self._destination_peer_counter.data_ptr(),
             self._dispatch_barrier.data_ptr(),
             self._total_recv.data_ptr(),
