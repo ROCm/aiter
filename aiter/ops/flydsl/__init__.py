@@ -84,6 +84,7 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "pa_decode": (".pa_decode", "pa_decode"),
 }
 
 __all__ = [
@@ -106,6 +107,7 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
+    "pa_decode",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
