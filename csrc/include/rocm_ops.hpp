@@ -161,6 +161,11 @@ namespace py = pybind11;
           "Activation function used in GELU fast.",      \
           py::arg("out"),                                \
           py::arg("input"));                             \
+    m.def("relu2",                                       \
+          &aiter::relu2,                                 \
+          "Plain ReLU^2 activation (no gating multiply).",\
+          py::arg("out"),                                 \
+          py::arg("input"));                              \
     m.def("gelu_tanh_and_mul",                           \
           &aiter::gelu_tanh_and_mul,                     \
           "Activation function used in GELU tanh.",      \
