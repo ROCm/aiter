@@ -47,6 +47,7 @@ IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+_FLYDSL_UNIFIED_ATTN_ARCH = DEVICE_ARCH == "gfx950"
 
 
 def _is_gluon_available():
@@ -153,21 +154,20 @@ def unified_attention(
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
     # backend
-    backend: str | None = None,  # "triton" | "gluon"
+    backend: str | None = None,  # "triton" | "gluon" | "flydsl"
 ):
-    assert causal, "Only causal attention is supported"
-
-    if backend is None:
-        backend = "gluon" if _is_gluon_available() else "triton"
-    backend = backend.lower()
+    if backend is not None:
+        backend = backend.lower()
     assert backend in (
+        None,
         "triton",
         "gluon",
-    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
-    if backend == "gluon":
+        "flydsl",
+    ), f"Unknown backend '{backend}', must be None, 'triton', 'gluon' or 'flydsl'"
+    if backend == "flydsl":
         assert (
-            _is_gluon_available()
-        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+            _FLYDSL_UNIFIED_ATTN_ARCH
+        ), f"FlyDSL backend requires gfx950, got '{DEVICE_ARCH}'"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -185,9 +185,15 @@ def unified_attention(
         assert q_scales is not None and q_scales.dtype == e4m3_dtype
         head_size = head_size * 2
 
-    if shuffled_kv_cache:
-        SCALE_K_WIDTH = 4
-        if kv_cache_dtype == torch.uint8:
+    SCALE_K_WIDTH = 4
+    if k.dim() == 5:
+        # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
+        # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
+        num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
+        shuffled_kv_cache = True
+    elif k.dim() == 4:
+        if shuffled_kv_cache and kv_cache_dtype == torch.uint8:
+            # Packed FP4 uses a distinct 4D shuffled layout.
             num_blocks, num_kv_heads, block_size, _ = k.shape
             K_WIDTH = 16
             SCALE_K = head_size // 16
@@ -195,14 +201,10 @@ def unified_attention(
                 min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
             )
         else:
-            # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
-            # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
-            num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
-    else:
-        # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
-        num_blocks, block_size, num_kv_heads, _ = k.shape
-        K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
-        SCALE_K_WIDTH = 4
+            # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
+            num_blocks, block_size, num_kv_heads, _ = k.shape
+            K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
+            shuffled_kv_cache = False
 
     if shuffled_kv_cache:
         # A shuffled tile is exactly one page (the kernels index the block table
@@ -217,6 +219,66 @@ def unified_attention(
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
+
+    if backend == "flydsl" or (backend is None and _FLYDSL_UNIFIED_ATTN_ARCH):
+        # FlyDSL is optional, but an explicit request must not fall back.
+        try:
+            from aiter.ops.flydsl.unified_attention_kernels import (
+                flydsl_unified_attention,
+            )
+        except ImportError as exc:
+            if backend == "flydsl":
+                raise RuntimeError(
+                    "FlyDSL unified_attention backend is unavailable"
+                ) from exc
+            flydsl_unified_attention = None
+
+        if flydsl_unified_attention is not None:
+            _flydsl_out = flydsl_unified_attention(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                max_seqlen_q,
+                seqused_k,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+                window_size,
+                block_table,
+                softcap,
+                q_descale,
+                k_descale,
+                v_descale,
+                num_kv_heads=num_kv_heads,
+                block_size=block_size,
+                num_queries_per_kv=num_queries_per_kv,
+                num_seqs=num_seqs,
+                q_scales=q_scales,
+                alibi_slopes=alibi_slopes,
+                output_scale=output_scale,
+                qq_bias=qq_bias,
+                sinks=sinks,
+                shuffled_kv_cache=shuffled_kv_cache,
+                skip_reduce=skip_reduce,
+            )
+            if _flydsl_out is not None:
+                return _flydsl_out
+        if backend == "flydsl":
+            raise RuntimeError(
+                "FlyDSL unified_attention backend does not support this configuration"
+            )
+
+    # Only FlyDSL supports non-causal attention.
+    if not causal:
+        raise NotImplementedError("Triton fallback supports only causal attention")
+    if backend is None:
+        backend = "gluon" if _is_gluon_available() else "triton"
+    if backend == "gluon":
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
