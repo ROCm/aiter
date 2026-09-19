@@ -8,7 +8,7 @@ import pytest
 import torch
 from safetensors import safe_open
 
-from aiter import QuantType
+from aiter import QuantType, rmsnorm2d_fwd_with_add, topk_softmax
 from aiter.iq2r_checkpoint import load_iq2r_layer_checkpoint
 from aiter.iq2r_moe import IQ2RMoeWorkspace, iq2r_fused_moe_out
 from aiter.ops.iq2r import (
@@ -17,6 +17,8 @@ from aiter.ops.iq2r import (
     iq2r_route_gather_indexed_out,
     iq2r_route_gather_quant_out,
     iq2r_route_sort_tasks_out,
+    iq2r_route_topk_direct_gather_quant_out,
+    iq2r_route_topk_sort_gather_quant_out,
     iq2r_swiglu_out,
     iq2r_swiglu_quant_out,
     iq2r_task_capacity,
@@ -110,6 +112,14 @@ def _quantize_mxfp8_reference(values: torch.Tensor):
         torch.float8_e4m3fn
     )
     return quantized.reshape(values.shape), scales
+
+
+def _unpack_tile16_scales(
+    scales: torch.Tensor, rows: int, groups_per_row: int
+) -> torch.Tensor:
+    return scales.permute(1, 3, 0, 2).reshape(-1, scales.shape[0] * 4)[
+        :rows, :groups_per_row
+    ]
 
 
 def _relative_metrics(actual: torch.Tensor, expected: torch.Tensor):
@@ -208,6 +218,114 @@ def test_full_o0_pipeline_tracks_source_mxfp4_expert(first_expert, source_first_
     relative_rmse, cosine = _relative_metrics(output, expected)
     assert relative_rmse.item() < 0.25
     assert cosine.item() > 0.97
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 5, 8, 16])
+def test_fused_route_reduce_add_rmsnorm_matches_unfused(first_expert, tokens):
+    hidden, topk_weights, topk_ids = _inputs(tokens, seed=0xA11D)
+    workspace = IQ2RMoeWorkspace.allocate(
+        tokens, 4, device="cuda", max_experts=1, task_rows=16
+    )
+    residual = torch.randn_like(hidden)
+    norm_weight = torch.randn((2880,), dtype=torch.bfloat16, device="cuda")
+
+    moe_output = torch.empty_like(hidden)
+    expected_output = torch.empty_like(hidden)
+    expected_residual = torch.empty_like(hidden)
+    _run(first_expert, hidden, topk_weights, topk_ids, moe_output, workspace)
+    rmsnorm2d_fwd_with_add(
+        expected_output,
+        moe_output,
+        residual,
+        expected_residual,
+        norm_weight,
+        1e-5,
+    )
+
+    fused_output = torch.empty_like(hidden)
+    fused_residual = torch.empty_like(hidden)
+    iq2r_fused_moe_out(
+        hidden,
+        first_expert.gate_up_data,
+        first_expert.gate_up_auxiliary,
+        first_expert.down_data,
+        first_expert.down_auxiliary,
+        topk_weights,
+        topk_ids,
+        fused_output,
+        gate_up_metadata=first_expert.gate_up_metadata,
+        down_metadata=first_expert.down_metadata,
+        gate_up_tile_n=first_expert.gate_up_tile_n,
+        down_tile_n=first_expert.down_tile_n,
+        gate_up_bias=first_expert.gate_up_bias,
+        down_bias=first_expert.down_bias,
+        workspace=workspace,
+        residual=residual,
+        norm_weight=norm_weight,
+        residual_out=fused_residual,
+        norm_epsilon=1e-5,
+        norm_block_size=1024,
+    )
+
+    torch.testing.assert_close(fused_residual, expected_residual, rtol=0, atol=0)
+    torch.testing.assert_close(fused_output, expected_output, rtol=0, atol=0.004)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16])
+def test_tile16_activation_scales_match_row_major_pipeline(first_expert, tokens):
+    hidden, topk_weights, topk_ids = _inputs(tokens, seed=0x1600)
+    row_workspace = IQ2RMoeWorkspace.allocate(
+        tokens, 4, device="cuda", max_experts=1, scale_layout="row_major"
+    )
+    tiled_workspace = IQ2RMoeWorkspace.allocate(
+        tokens, 4, device="cuda", max_experts=1, scale_layout="tile16"
+    )
+    row_output = torch.empty_like(hidden)
+    tiled_output = torch.empty_like(hidden)
+
+    _run(
+        first_expert,
+        hidden,
+        topk_weights,
+        topk_ids,
+        row_output,
+        row_workspace,
+    )
+    _run(
+        first_expert,
+        hidden,
+        topk_weights,
+        topk_ids,
+        tiled_output,
+        tiled_workspace,
+    )
+
+    routes = tokens * 4
+    torch.testing.assert_close(tiled_output, row_output, rtol=0, atol=0)
+    torch.testing.assert_close(
+        tiled_workspace.route_input_fp8[:routes].view(torch.uint8),
+        row_workspace.route_input_fp8[:routes].view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        _unpack_tile16_scales(tiled_workspace.route_input_scales, routes, 90),
+        row_workspace.route_input_scales[:routes],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        tiled_workspace.intermediate_fp8[:routes].view(torch.uint8),
+        row_workspace.intermediate_fp8[:routes].view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        _unpack_tile16_scales(tiled_workspace.intermediate_scales, routes, 90),
+        row_workspace.intermediate_scales[:routes],
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_stable_route_sort_and_task_construction():
@@ -364,6 +482,198 @@ def test_direct_low_m_route_gather_quant_builds_identity_tasks():
     torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("tokens", [1, 2, 4])
+@pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_fused_low_m_topk_route_quant_matches_aiter(tokens, router_dtype, with_bias):
+    hidden, _, _ = _inputs(tokens, seed=0x2A00 + tokens)
+    generator = torch.Generator(device="cuda").manual_seed(0x7060 + tokens)
+    router_logits = torch.randn(
+        (tokens, 128), generator=generator, dtype=torch.float32, device="cuda"
+    ).to(router_dtype)
+    # Exercise AITER's deterministic lower-expert-ID tie break.
+    router_logits[:, 3] = router_logits[:, 7]
+    router_bias = (
+        torch.randn((128,), generator=generator, dtype=torch.bfloat16, device="cuda")
+        if with_bias
+        else None
+    )
+    expected_logits = (
+        router_logits if router_bias is None else router_logits + router_bias
+    )
+
+    expected_weights = torch.empty((tokens, 4), dtype=torch.float32, device="cuda")
+    expected_ids = torch.empty((tokens, 4), dtype=torch.int32, device="cuda")
+    token_expert_indices = torch.empty_like(expected_ids)
+    topk_softmax(
+        expected_weights,
+        expected_ids,
+        token_expert_indices,
+        expected_logits,
+        True,
+    )
+
+    workspace = IQ2RMoeWorkspace.allocate(tokens, 4, device="cuda")
+    actual_weights = workspace.topk_weights[:tokens]
+    actual_ids = workspace.topk_ids[:tokens]
+    routes = tokens * 4
+    iq2r_route_topk_direct_gather_quant_out(
+        hidden,
+        router_logits,
+        actual_weights,
+        actual_ids,
+        workspace.sorted_expert_ids[:routes],
+        workspace.gather_indices[:routes],
+        workspace.scatter_indices[:routes],
+        workspace.tasks,
+        workspace.task_count,
+        workspace.route_input_fp8[:routes],
+        workspace.route_input_scales[:routes],
+        renormalize=True,
+        router_bias=router_bias,
+    )
+
+    identity = torch.arange(routes, dtype=torch.int32, device="cuda")
+    expected_fp8 = torch.empty_like(workspace.route_input_fp8[:routes])
+    expected_scales = torch.empty_like(workspace.route_input_scales[:routes])
+    iq2r_route_gather_quant_out(
+        hidden,
+        identity,
+        expected_fp8,
+        expected_scales,
+        topk=4,
+    )
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(
+        workspace.sorted_expert_ids[:routes], expected_ids.reshape(-1), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        workspace.gather_indices[:routes], identity, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        workspace.scatter_indices[:routes], identity, rtol=0, atol=0
+    )
+    assert int(workspace.task_count.item()) == routes
+    torch.testing.assert_close(
+        workspace.route_input_fp8[:routes].view(torch.uint8),
+        expected_fp8.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        workspace.route_input_scales[:routes], expected_scales, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("tokens", [8, 16])
+@pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_fused_sorted_topk_route_quant_matches_aiter(tokens, router_dtype, with_bias):
+    hidden, _, _ = _inputs(tokens, seed=0x2B00 + tokens)
+    generator = torch.Generator(device="cuda").manual_seed(0x7160 + tokens)
+    router_logits = torch.randn(
+        (tokens, 128), generator=generator, dtype=torch.float32, device="cuda"
+    ).to(router_dtype)
+    router_logits[:, 13] = router_logits[:, 29]
+    router_bias = (
+        torch.randn((128,), generator=generator, dtype=torch.bfloat16, device="cuda")
+        if with_bias
+        else None
+    )
+    expected_logits = (
+        router_logits if router_bias is None else router_logits + router_bias
+    )
+
+    expected_weights = torch.empty((tokens, 4), dtype=torch.float32, device="cuda")
+    expected_ids = torch.empty((tokens, 4), dtype=torch.int32, device="cuda")
+    token_expert_indices = torch.empty_like(expected_ids)
+    topk_softmax(
+        expected_weights,
+        expected_ids,
+        token_expert_indices,
+        expected_logits,
+        True,
+    )
+
+    workspace = IQ2RMoeWorkspace.allocate(tokens, 4, device="cuda")
+    actual_weights = workspace.topk_weights[:tokens]
+    actual_ids = workspace.topk_ids[:tokens]
+    routes = tokens * 4
+    task_capacity = iq2r_task_capacity(routes, 128, workspace.task_rows)
+    iq2r_route_topk_sort_gather_quant_out(
+        hidden,
+        router_logits,
+        actual_weights,
+        actual_ids,
+        workspace.sorted_expert_ids[:routes],
+        workspace.gather_indices[:routes],
+        workspace.scatter_indices[:routes],
+        workspace.tasks[:task_capacity],
+        workspace.task_count,
+        workspace.route_input_fp8[:routes],
+        workspace.route_input_scales[:routes],
+        task_rows=workspace.task_rows,
+        renormalize=True,
+        router_bias=router_bias,
+    )
+
+    flat_ids = expected_ids.reshape(-1)
+    expected_gather = torch.argsort(flat_ids, stable=True).to(torch.int32)
+    expected_sorted_ids = flat_ids[expected_gather.long()]
+    expected_scatter = torch.empty_like(expected_gather)
+    expected_scatter[expected_gather.long()] = torch.arange(
+        routes, dtype=torch.int32, device="cuda"
+    )
+    expected_fp8 = torch.empty_like(workspace.route_input_fp8[:routes])
+    expected_scales = torch.empty_like(workspace.route_input_scales[:routes])
+    iq2r_route_gather_quant_out(
+        hidden,
+        expected_gather,
+        expected_fp8,
+        expected_scales,
+        topk=4,
+    )
+
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(
+        workspace.sorted_expert_ids[:routes], expected_sorted_ids, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        workspace.gather_indices[:routes], expected_gather, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        workspace.scatter_indices[:routes], expected_scatter, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        workspace.route_input_fp8[:routes].view(torch.uint8),
+        expected_fp8.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        workspace.route_input_scales[:routes], expected_scales, rtol=0, atol=0
+    )
+
+    counts = torch.bincount(flat_ids.cpu(), minlength=128).tolist()
+    expected_tasks = []
+    sorted_begin = 0
+    for expert, expert_rows in enumerate(counts):
+        for local in range(0, expert_rows, workspace.task_rows):
+            expected_tasks.append(
+                [
+                    sorted_begin + local,
+                    min(workspace.task_rows, expert_rows - local),
+                    expert,
+                ]
+            )
+        sorted_begin += expert_rows
+    count = int(workspace.task_count.item())
+    assert count == len(expected_tasks)
+    assert workspace.tasks[:count].cpu().tolist() == expected_tasks
+
+
 def test_fused_gather_quant_matches_canonical_split_path():
     hidden, _, _ = _inputs(3, seed=0xA8)
     gather = torch.tensor(
@@ -413,7 +723,9 @@ def test_fused_gather_quant_accepts_padded_row_stride():
     torch.testing.assert_close(actual_scales, expected_scales)
 
 
-def test_fused_swiglu_quant_matches_canonical_split_path():
+@pytest.mark.parametrize("family", ["group32", "parallel8"])
+def test_fused_swiglu_quant_matches_canonical_split_path(monkeypatch, family):
+    monkeypatch.setenv("IQ2R_SWIGLU_QUANT_FAMILY", family)
     generator = torch.Generator(device="cuda").manual_seed(0x51A6)
     gate_up = (torch.randn((7, 5760), generator=generator, device="cuda") * 4.0).to(
         torch.bfloat16

@@ -856,6 +856,9 @@ def fused_moe(
     iq2r_w1_tile_n: int | None = None,
     iq2r_w2_tile_n: int | None = None,
     iq2r_workspace=None,
+    iq2r_router_logits: torch.Tensor | None = None,
+    iq2r_router_bias: torch.Tensor | None = None,
+    iq2r_router_renormalize: bool = True,
 ):
     if quant_type == QuantType.iq2r_2bit:
         unsupported = {
@@ -929,6 +932,9 @@ def fused_moe(
             gate_up_bias=bias1,
             down_bias=bias2,
             workspace=iq2r_workspace,
+            router_logits=iq2r_router_logits,
+            router_bias=iq2r_router_bias,
+            renormalize=iq2r_router_renormalize,
         )
 
     if (
@@ -1464,7 +1470,9 @@ def _fused_moe_impl(
     assert not metadata.flat or get_gfx() in (
         "gfx942",
         "gfx950",
-    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    ), (
+        f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    )
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1702,9 +1710,9 @@ def fused_moe_1stage(
                     num_rows=num_local_tokens,
                 )
             else:
-                assert (
-                    a1_scale is not None or quant_type == QuantType.No
-                ), "a1_scale must be provided for quantized input for fused_moe"
+                assert a1_scale is not None or quant_type == QuantType.No, (
+                    "a1_scale must be provided for quantized input for fused_moe"
+                )
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
                     scale_t = torch.empty_like(a1_scale)
@@ -4076,9 +4084,9 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
     else:
-        assert (
-            a1_scale is not None or quant_type == QuantType.No
-        ), "a1_scale must be provided for quantized input for fused_moe"
+        assert a1_scale is not None or quant_type == QuantType.No, (
+            "a1_scale must be provided for quantized input for fused_moe"
+        )
         a1 = hidden_states
     # a16w4 (bf16 A x mxfp4 W) SiTUv2: stage1 allocates its own sorted
     # [sorted_size, inter_dim] bf16 intermediate and ignores this `out` buffer, so
