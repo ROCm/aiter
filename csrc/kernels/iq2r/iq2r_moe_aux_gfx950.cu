@@ -22,8 +22,7 @@ constexpr int kQuantThreads  = 64;
 constexpr int kTaskColumns   = 3;
 constexpr int kMaxExperts    = 128;
 constexpr int kMaxRoutes     = 4096;
-constexpr int kSmallRoutes   = 256;
-constexpr int kMaxRouteBlocks = (kMaxRoutes + kThreads - 1) / kThreads;
+constexpr int kSmallRoutes   = 16;
 constexpr int kQuantGroup    = 32;
 constexpr float kSwigluAlpha = 1.702f;
 constexpr float kSwigluLimit = 7.0f;
@@ -128,11 +127,13 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_small_kernel(
 }
 
 // GPT-OSS has only 128 experts and at most 4096 routed rows in the initial
-// contract. A single CTA builds a stable counting sort and its homogeneous
-// tasks without global atomics or temporary allocations. The stable scatter
-// is parallelized by 256-route chunks: a route's rank is the sum of earlier
-// chunk histograms and earlier lanes with the same expert. This preserves the
-// exact route order while avoiding the former one-thread O(routes) pass.
+// contract. A single CTA builds an expert-grouped permutation and homogeneous
+// tasks without global atomics or temporary allocations. Row order within an
+// expert is deliberately unspecified: every routed row is computed
+// independently and scatter_indices restores the original top-k order before
+// reduction, so stability has no semantic value here. Using one shared-memory
+// cursor per expert makes this pass O(routes), avoiding the former stable-rank
+// implementation's O(routes * 256) same-expert comparisons.
 __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_kernel(
     const int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ sorted_expert_ids,
@@ -145,61 +146,41 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_kernel(
     int task_capacity,
     int task_rows)
 {
-    __shared__ int counts[kMaxExperts];
-    __shared__ int offsets[kMaxExperts + 1];
-    __shared__ int block_counts[kMaxRouteBlocks][kMaxExperts + 1];
-    __shared__ int route_experts[kMaxRoutes];
+    __shared__ int counts[kMaxExperts + 1];
+    __shared__ int offsets[kMaxExperts + 2];
+    __shared__ int cursors[kMaxExperts + 1];
 
-    for(int expert = threadIdx.x; expert < expert_count; expert += blockDim.x)
-        counts[expert] = 0;
-    for(int index = threadIdx.x;
-        index < kMaxRouteBlocks * (kMaxExperts + 1);
-        index += blockDim.x)
-        reinterpret_cast<int*>(block_counts)[index] = 0;
+    for(int bucket = threadIdx.x; bucket <= expert_count; bucket += blockDim.x)
+        counts[bucket] = 0;
     __syncthreads();
 
     for(int route = threadIdx.x; route < routes; route += blockDim.x)
     {
         const int expert = expert_ids[route];
-        route_experts[route] = expert;
-        const bool valid = expert >= 0 && expert < expert_count;
-        const int bucket = valid ? expert : expert_count;
-        atomicAdd(block_counts[route / kThreads] + bucket, 1);
-        if(valid)
-            atomicAdd(counts + expert, 1);
+        const int bucket = expert >= 0 && expert < expert_count ? expert
+                                                                : expert_count;
+        atomicAdd(counts + bucket, 1);
     }
     __syncthreads();
 
     if(threadIdx.x == 0)
     {
         offsets[0] = 0;
-        for(int expert = 0; expert < expert_count; ++expert)
-        {
-            offsets[expert + 1] = offsets[expert] + counts[expert];
-        }
+        for(int bucket = 0; bucket <= expert_count; ++bucket)
+            offsets[bucket + 1] = offsets[bucket] + counts[bucket];
     }
+    __syncthreads();
+
+    for(int bucket = threadIdx.x; bucket <= expert_count; bucket += blockDim.x)
+        cursors[bucket] = offsets[bucket];
     __syncthreads();
 
     for(int route = threadIdx.x; route < routes; route += blockDim.x)
     {
-        const int expert = route_experts[route];
-        const bool valid = expert >= 0 && expert < expert_count;
-        const int bucket = valid ? expert : expert_count;
-        const int route_block = route / kThreads;
-        const int block_begin = route_block * kThreads;
-        int local_rank = 0;
-        for(int block = 0; block < route_block; ++block)
-            local_rank += block_counts[block][bucket];
-        for(int previous = block_begin; previous < route; ++previous)
-        {
-            const int previous_expert = route_experts[previous];
-            const int previous_bucket =
-                previous_expert >= 0 && previous_expert < expert_count
-                    ? previous_expert
-                    : expert_count;
-            local_rank += previous_bucket == bucket;
-        }
-        const int sorted_route = offsets[bucket] + local_rank;
+        const int expert = expert_ids[route];
+        const int bucket = expert >= 0 && expert < expert_count ? expert
+                                                                : expert_count;
+        const int sorted_route = atomicAdd(cursors + bucket, 1);
         sorted_expert_ids[sorted_route] = expert;
         gather_indices[sorted_route] = route;
         scatter_indices[route] = sorted_route;
@@ -229,7 +210,7 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_kernel(
         // Preserve a deterministic permutation even for malformed route IDs.
         // The corresponding task is marked expert=-1, so the GEMM safely skips
         // it. Production routing is required to supply IDs in [0,E).
-        const int invalid_count = routes - sorted_begin;
+        const int invalid_count = counts[expert_count];
         for(int local = 0; local < invalid_count; local += task_rows)
         {
             if(task < task_capacity)
