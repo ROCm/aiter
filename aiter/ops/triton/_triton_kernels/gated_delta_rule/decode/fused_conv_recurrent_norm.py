@@ -33,23 +33,22 @@ def fused_conv_recurrent_norm_kernel(
     lower_bound,
     norm_eps,
     qk_scale,
-    T: tl.int64,
     # Constexprs
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     W: tl.constexpr,
     # Strides
-    stride_x_tok: tl.int64,
-    stride_cw_group: tl.int64,
-    stride_cw_width: tl.int64,
-    stride_cw_ch: tl.int64,
-    stride_cs_slot: tl.int64,
-    stride_cs_dim: tl.int64,
-    stride_cs_pos: tl.int64,
-    stride_beta_tok: tl.int64,
-    stride_og_tok: tl.int64,
-    stride_ssm_slot: tl.int64,
+    stride_x_tok: tl.constexpr,
+    stride_cw_group: tl.constexpr,
+    stride_cw_width: tl.constexpr,
+    stride_cw_ch: tl.constexpr,
+    stride_cs_slot: tl.constexpr,
+    stride_cs_dim: tl.constexpr,
+    stride_cs_pos: tl.constexpr,
+    stride_beta_tok: tl.constexpr,
+    stride_og_tok: tl.constexpr,
+    stride_ssm_slot: tl.constexpr,
 ):
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
@@ -114,6 +113,8 @@ def fused_conv_recurrent_norm_kernel(
             ).to(tl.float32)
         b_v = b_v * tl.sigmoid(b_v)
 
+        # Layouts with more threads than channels replicate conv vectors.
+        # Finish all history reads before any owner updates the in-place state.
         tl.debug_barrier()
         for j in tl.static_range(W - 2):
             tl.store(

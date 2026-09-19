@@ -97,7 +97,6 @@ def fused_kda_decode(
         lower_bound,
         norm_eps,
         K**-0.5,
-        T,
         H=H,
         K=K,
         V=V,
@@ -112,6 +111,6 @@ def fused_kda_decode(
         stride_beta_tok=stride_beta_tok,
         stride_og_tok=stride_og_tok,
         stride_ssm_slot=ssm_state.stride(0),
-        num_warps=2 if get_arch() == "gfx942" else 4,
+        num_warps=2 if get_arch() in ("gfx942", "gfx950") else 4,
     )
     return out

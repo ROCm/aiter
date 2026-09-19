@@ -200,16 +200,18 @@ def test_fused_kda_decode_determinism():
 
     results = []
     for _ in range(5):
+        conv_state = inp["conv_state"].clone()
+        ssm_state = inp["ssm_state"].clone()
         out = fused_kda_decode(
             inp["mixed_qkv"],
-            inp["conv_state"].clone(),
+            conv_state,
             inp["conv_weight"],
             inp["gate"],
             inp["beta"],
             inp["out_gate"],
             inp["A_log"],
             inp["dt_bias"],
-            inp["ssm_state"].clone(),
+            ssm_state,
             inp["ssm_state_indices"],
             inp["cu_seqlens"],
             inp["norm_weight"],
@@ -218,13 +220,16 @@ def test_fused_kda_decode_determinism():
             Hloc,
             -5.0,
         )
-        results.append(out.clone())
+        results.append((out.clone(), conv_state, ssm_state))
 
     for i in range(1, len(results)):
-        assert torch.equal(results[0], results[i]), (
-            f"Run 0 vs run {i}: max diff = "
-            f"{(results[0].float() - results[i].float()).abs().max().item()}"
-        )
+        for name, expected, actual in zip(
+            ("output", "conv_state", "ssm_state"), results[0], results[i]
+        ):
+            assert torch.equal(expected, actual), (
+                f"{name}, run 0 vs run {i}: max diff = "
+                f"{(expected.float() - actual.float()).abs().max().item()}"
+            )
 
 
 def test_fused_kda_decode_pad_slot():
