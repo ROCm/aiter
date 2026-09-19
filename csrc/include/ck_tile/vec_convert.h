@@ -3,6 +3,16 @@
 #pragma once
 #include "aiter_hip_common.h"
 
+// The definitions below rely on the full Composable Kernel core (thread_buffer,
+// vector_traits, numeric_traits, bit_cast, fp8_interpretation, native fp8/fp4
+// types, CK_TILE_* macros, ...). When building without CK (ENABLE_CK==0) these
+// are unavailable. The sole consumer in this build
+// (fused_qk_norm_rope_cache_quant.cu) includes this header but never calls any
+// ck_tile::vec_convert / amd_assembly_* / fp32x2_t_to_* helper (it uses
+// opus::cast / aiter::scaled_cast instead), so the entire body can be compiled
+// out in the shim build.
+#if ENABLE_CK
+
 namespace ck_tile {
 template <typename T, int N>
 using vec_t = thread_buffer<T, N>;
@@ -252,3 +262,5 @@ CK_TILE_TYPE_CONVERT(fp4x2, bf16, 32)
 #undef CK_TILE_TYPE_CONVERT
 
 } // namespace ck_tile
+
+#endif // ENABLE_CK
