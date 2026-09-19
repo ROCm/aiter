@@ -962,7 +962,11 @@ def flash_attn_func(
     """
     backend = _resolve_backend(backend)
     _LOGGER.info(
-        f"FLASH_ATTN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
+        backend,
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
     )
 
     if backend == "gluon":
@@ -1313,7 +1317,11 @@ def flash_attn_varlen_func(
     """
     backend = _resolve_backend(backend)
     _LOGGER.info(
-        f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        "FLASH_ATTN_VARLEN [%s]:  q=%s  k=%s  v=%s",
+        backend,
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
     )
 
     if backend == "gluon":
