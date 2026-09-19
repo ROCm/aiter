@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Archive stale branches, then delete the archives after notice.
+
+30 days without commits: copy to ``archive/<YYYY-MM-DD>/<name>``, comment, drop
+the original ref. +30 days: comment giving notice. +14: delete the archive ref.
+74 days end to end, 44 of them restorable by name with the command both comments
+print, ``git push origin archive/<date>/<name>:<name>``.
+
+No state is stored -- the archive date is in the ref name, the notice date is
+the notice comment's own. When notice is given, the archiving comment is also
+marked to say so; a notice that is later missing therefore means someone removed
+it, and the archive is left alone. That is the per-branch opt-out, and it needs
+no admin.
+
+Restoring a branch puts it back at the same commit, which is still as old as it
+was, so it is archived again unless it gets a new commit or a line in the
+exemption list. Both comments say so.
+
+Never touched: protected branches, the head or base branch of an open pull
+request, and anything in .github/stale-branch-exemptions.txt, re-checked at
+every stage against the original name so a new line rescues an archived branch.
+
+Nothing is written unless --apply is passed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://api.github.com"
+ARCHIVE_PREFIX = "archive/"
+BOT_LOGIN = "github-actions[bot]"
+_ARCHIVED = re.compile(r"^archive/(\d{4}-\d{2}-\d{2})/(.+)$")
+
+
+def marker(kind: str, ref: str) -> str:
+    """Marker naming the archive ref it belongs to.
+
+    Two branches can point at one commit, and commit comments hang off the
+    commit, so a marker that did not name its ref would let one archive's
+    notice start the clock for the other -- and print the wrong branch in the
+    restore command.
+    """
+    return f"<!-- stale-branch-{kind}: {ref} -->"
+
+
+def archive_date(name: str) -> dt.date | None:
+    """The date in an archive ref's name, or None if it is not one of ours.
+
+    The pattern alone is not enough: archive/2026-02-30/x matches it and is not
+    a date, and raising out of the loop over a branch somebody else named would
+    strand the whole backlog.
+    """
+    found = _ARCHIVED.match(name)
+    if not found:
+        return None
+    try:
+        return dt.date.fromisoformat(found.group(1))
+    except ValueError:
+        return None
+
+
+class Api:
+    """The few REST and GraphQL calls this needs, without a dependency."""
+
+    def __init__(self, token: str, repo: str, apply: bool) -> None:
+        self.token = token
+        self.owner, self.name = repo.split("/", 1)
+        self.apply = apply
+        self.writes = 0
+
+    def _call(self, method: str, url: str, body: dict | None = None) -> object:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req) as response:
+            raw = response.read()
+        return json.loads(raw) if raw else None
+
+    def get(self, path: str) -> object:
+        return self._call("GET", f"{API}/repos/{self.owner}/{self.name}{path}")
+
+    def write(self, method: str, path: str, body: dict | None = None) -> object:
+        """A call that changes the repository. A dry run stops here."""
+        self.writes += 1
+        if not self.apply:
+            return None
+        return self._call(method, f"{API}/repos/{self.owner}/{self.name}{path}", body)
+
+    def delete_branch(self, name: str, expect: str) -> bool:
+        """Delete a branch, server-side, only if its tip is still ``expect``.
+
+        Through git rather than REST: ``--force-with-lease`` sends old-oid ->
+        zero-oid and the receiving end rejects the delete if the ref has moved,
+        so a push landing mid-run cannot be lost. The REST API has no
+        conditional delete, and a read-then-DELETE would still race.
+        """
+        self.writes += 1
+        if not self.apply:
+            return True
+        ref = f"refs/heads/{name}"
+        done = subprocess.run(
+            ["git", "push", f"--force-with-lease={ref}:{expect}", "origin", f":{ref}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode == 0:
+            return True
+        if "stale info" in done.stderr or "[rejected]" in done.stderr:
+            return False
+        raise RuntimeError(f"git push failed for {name}: {done.stderr.strip()}")
+
+    def graphql(self, query: str, variables: dict) -> dict:
+        req = urllib.request.Request(
+            f"{API}/graphql",
+            data=json.dumps({"query": query, "variables": variables}).encode(),
+            method="POST",
+        )
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req) as response:
+            payload = json.loads(response.read())
+        if "errors" in payload:
+            raise RuntimeError(f"GraphQL: {payload['errors']}")
+        return payload["data"]
+
+
+def load_exemptions(path: str) -> tuple[set[str], list[re.Pattern]]:
+    """Exact names and ``re:`` patterns from the checked-in list.
+
+    Missing or empty is fatal: it is indistinguishable from "no exemptions",
+    and only one of those should let this near a branch called main.
+    """
+    try:
+        lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise SystemExit(f"cannot read the exemption list at {path}: {error}")
+    names: set[str] = set()
+    patterns: list[re.Pattern] = []
+    for number, line in enumerate(lines, 1):
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        if entry.startswith("re:"):
+            try:
+                patterns.append(re.compile(entry[3:]))
+            except re.error as error:
+                raise SystemExit(f"{path}:{number}: bad regex: {error}")
+        else:
+            names.add(entry)
+    if not names and not patterns:
+        raise SystemExit(f"{path} lists nothing; refusing to run with no exemptions")
+    return names, patterns
+
+
+def exempt(name: str, names: set[str], patterns: list[re.Pattern]) -> bool:
+    return name in names or any(p.search(name) for p in patterns)
+
+
+_REFS_QUERY = """
+query($owner:String!, $name:String!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    refs(refPrefix:"refs/heads/", first:100, after:$cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        name
+        target { ... on Commit { oid committedDate } }
+      }
+    }
+  }
+}
+"""
+
+
+def list_branches(api: Api) -> list[dict]:
+    """Every branch with its tip SHA and committer date, 100 per request.
+
+    Committer, not author: a rebase keeps the author date, so a branch moved
+    onto main this morning would otherwise read as months old.
+    """
+    out: list[dict] = []
+    cursor = None
+    while True:
+        page = api.graphql(
+            _REFS_QUERY, {"owner": api.owner, "name": api.name, "cursor": cursor}
+        )["repository"]["refs"]
+        for node in page["nodes"]:
+            target = node.get("target") or {}
+            if target.get("oid"):
+                out.append(
+                    {
+                        "name": node["name"],
+                        "sha": target["oid"],
+                        "date": _parse(target["committedDate"]),
+                    }
+                )
+        if not page["pageInfo"]["hasNextPage"]:
+            return out
+        cursor = page["pageInfo"]["endCursor"]
+
+
+def _parse(stamp: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
+
+def protected_branches(api: Api) -> set[str]:
+    names, page = set(), 1
+    while True:
+        batch = api.get(f"/branches?protected=true&per_page=100&page={page}")
+        if not batch:
+            return names
+        names.update(b["name"] for b in batch)
+        page += 1
+
+
+def pr_branches(api: Api) -> set[str]:
+    """Head *and* base refs of every open pull request.
+
+    Base too: an integration branch several PRs target has no PR of its own,
+    and removing it retargets or closes all of them.
+
+    Heads only from this repository. A fork's PR names a branch in the fork,
+    and taking that name at face value would exempt an unrelated local branch
+    that happens to share it -- for as long as the fork's PR stays open. A
+    deleted fork leaves ``head.repo`` null.
+    """
+    mine = f"{api.owner}/{api.name}".lower()
+    names, page = set(), 1
+    while True:
+        batch = api.get(f"/pulls?state=open&per_page=100&page={page}")
+        if not batch:
+            return names
+        for pull in batch:
+            head_repo = (pull["head"].get("repo") or {}).get("full_name") or ""
+            if head_repo.lower() == mine:
+                names.add(pull["head"]["ref"])
+            names.add(pull["base"]["ref"])
+        page += 1
+
+
+def ref_sha(api: Api, name: str) -> str | None:
+    """Current tip of a branch, or None if it is gone."""
+    try:
+        ref = api.get(f"/git/ref/heads/{urllib.parse.quote(name, safe='/')}")
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+    return ref["object"]["sha"]
+
+
+def still_exempt(api: Api, name: str) -> str | None:
+    """Why this branch must not be touched right now, or None.
+
+    The repo-wide skip set is gathered once and a run walks many branches, so a
+    pull request can be opened, or protection added, in between. The lease only
+    compares the SHA, which such a change does not move, so it would not stop
+    the delete on its own. Called immediately before each destructive push.
+    That narrows the window to one call rather than closing it: git leases a
+    ref against a SHA, and there is no equivalent server-side guard for "is
+    this branch some pull request's base".
+    """
+    try:
+        branch = api.get(f"/branches/{urllib.parse.quote(name, safe='/')}")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        return "it no longer exists"
+    if (branch or {}).get("protected"):
+        return "it is protected"
+    quoted = urllib.parse.quote(name, safe="")
+    owner = urllib.parse.quote(api.owner, safe="")
+    for role, query in (("base", f"base={quoted}"), ("head", f"head={owner}:{quoted}")):
+        if api.get(f"/pulls?state=open&per_page=1&{query}"):
+            return f"it is the {role} of an open pull request"
+    return None
+
+
+def comments(api: Api, sha: str) -> list[dict]:
+    """Every comment on a commit, not the first hundred.
+
+    The markers are the only state this has, and this script adds one comment
+    per archived branch to tip commits that several stale branches can share.
+    Stopping at one page would make a marker past it invisible: notices would
+    be re-posted every week and the delete never reached.
+    """
+    out, page = [], 1
+    while True:
+        batch = api.get(f"/commits/{sha}/comments?per_page=100&page={page}") or []
+        if not batch:
+            return out
+        out.extend(batch)
+        page += 1
+
+
+def find_marker(api: Api, sha: str, marker: str, author: str) -> dict | None:
+    """The bot's own comment carrying ``marker``, ignoring look-alikes.
+
+    The notice comment is the deletion clock, so anyone who can comment could
+    otherwise start it early and skip the 30-day hold by pasting the marker.
+    """
+    for comment in comments(api, sha):
+        if marker not in (comment.get("body") or ""):
+            continue
+        if (comment.get("user") or {}).get("login") == author:
+            return comment
+    return None
+
+
+def archive(api: Api, branch: dict, today: dt.date, author: str) -> str:
+    """Copy the branch under archive/<today>/, say so, then remove the original.
+
+    Three writes, so it has to survive stopping between any two of them: a
+    branch that moved since the scan is left alone, an archive ref an earlier
+    run already created is adopted rather than retried into a 422, and the
+    comment is not repeated.
+    """
+    name, sha = branch["name"], branch["sha"]
+    if ref_sha(api, name) != sha:
+        return f"skipped {name}: moved since the scan"
+    reason = still_exempt(api, name)
+    if reason:
+        return f"skipped {name}: {reason}"
+    target = f"{ARCHIVE_PREFIX}{today.isoformat()}/{name}"
+    existing = ref_sha(api, target)
+    if existing is None:
+        try:
+            api.write("POST", "/git/refs", {"ref": f"refs/heads/{target}", "sha": sha})
+        except urllib.error.HTTPError as error:
+            # 422 is how the already-exists race arrives, and also how every
+            # other validation failure arrives; the status alone does not tell
+            # them apart. So read the ref back instead of assuming, on the
+            # quiet path as well: believing the wrong one deletes a branch
+            # whose archive was never written, the one outcome this workflow
+            # exists to prevent.
+            if error.code != 422:
+                raise
+        if api.apply:
+            existing = ref_sha(api, target)
+            if existing is None:
+                raise RuntimeError(
+                    f"{target} does not exist after trying to create it, "
+                    f"so {name} was left alone"
+                )
+    if existing is not None and existing != sha:
+        return f"skipped {name}: {target} already exists at another commit"
+    if find_marker(api, sha, marker("archived", target), author) is not None:
+        return _finish_archive(api, name, sha, target)
+    api.write(
+        "POST",
+        f"/commits/{sha}/comments",
+        {
+            "body": (
+                f"{marker('archived', target)}\n"
+                f"`{name}` has had no new commits since "
+                f"{branch['date'].date().isoformat()}, so it has been moved to "
+                f"`{target}`. Nothing is lost -- this commit is still here, and "
+                f"one command puts the branch back:\n\n"
+                f"```\ngit push origin {shlex.quote(target + ':' + name)}\n```\n\n"
+                f"That restores it at this same commit, which is as old as it was, "
+                f"so it will be archived again unless it gets a new commit or a "
+                f"line in `.github/stale-branch-exemptions.txt`.\n\n"
+                f"The archive copy is kept for a while and then removed, with a "
+                f"separate comment here giving notice first."
+            )
+        },
+    )
+    return _finish_archive(api, name, sha, target)
+
+
+def _finish_archive(api: Api, name: str, sha: str, target: str) -> str:
+    reason = still_exempt(api, name)
+    if reason:
+        return f"archived {name} -> {target}; original kept, {reason}"
+    if api.delete_branch(name, sha):
+        return f"archived {name} -> {target}"
+    return f"archived {name} -> {target}; original kept, it moved mid-run"
+
+
+def give_notice(
+    api: Api, branch: dict, original: str, delete_on: dt.date, archived: dict
+) -> str:
+    """Post the notice, then record on the archiving comment that it was given.
+
+    The notice comment is the only thing the delete stage looks for, so its
+    absence has to mean one of two things and the script must be able to tell
+    which: never posted (post it), or posted and since removed by someone who
+    read it (leave the archive alone, for good). Without a record the two are
+    the same and a deleted notice just restarts the clock -- the opposite of
+    the opt-out the notice promises. The record goes on our own archiving
+    comment, which is also the provenance the delete stage already requires.
+
+    Notice first, record second: a failure between the two leaves a notice
+    with no record, and the next run finds the notice and proceeds normally.
+    """
+    api.write(
+        "POST",
+        f"/commits/{branch['sha']}/comments",
+        {
+            "body": (
+                f"{marker('delete-notice', branch['name'])}\n"
+                f"`{branch['name']}` is due to be deleted on "
+                f"{delete_on.isoformat()}.\n\n"
+                f"To keep the branch, restore it and then give it a commit, or "
+                f"add it to `.github/stale-branch-exemptions.txt`; restoring "
+                f"alone brings it back at this same commit, which is as old as "
+                f"it was, and it would be archived again:\n\n"
+                f"```\ngit push origin {shlex.quote(branch['name'] + ':' + original)}\n```\n\n"
+                f"To keep only the archive copy, delete this comment -- the "
+                f"deletion happens only while it stands, and it is not re-posted."
+            )
+        },
+    )
+    body = (archived.get("body") or "").rstrip()
+    api.write(
+        "PATCH",
+        f"/comments/{archived['id']}",
+        {
+            "body": (
+                f"{body}\n\n{marker('noticed', branch['name'])}\n"
+                f"Deletion notice given, due {delete_on.isoformat()}; if that "
+                f"notice comment is gone, the deletion is off."
+            )
+        },
+    )
+    return f"notice on {branch['name']}, deletes {delete_on.isoformat()}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stale-days", type=int, default=30)
+    parser.add_argument("--archive-days", type=int, default=30)
+    parser.add_argument("--notice-days", type=int, default=14)
+    parser.add_argument(
+        "--exemptions",
+        default=".github/stale-branch-exemptions.txt",
+        help="List of exact branch names and re: patterns never to touch.",
+    )
+    parser.add_argument(
+        "--max-actions",
+        type=int,
+        default=50,
+        help="Cap per run, so a first run cannot notify hundreds of people at once.",
+    )
+    parser.add_argument(
+        "--bot-login",
+        default=BOT_LOGIN,
+        help="Only this account's marker comments are believed.",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="Without this, report only."
+    )
+    args = parser.parse_args()
+
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        print("GITHUB_TOKEN and GITHUB_REPOSITORY must be set", file=sys.stderr)
+        return 2
+
+    api = Api(token, repo, args.apply)
+    exempt_names, exempt_patterns = load_exemptions(args.exemptions)
+    now = dt.datetime.now(dt.timezone.utc)
+    today = now.date()
+
+    skip = protected_branches(api) | pr_branches(api)
+    actions: list[str] = []
+    failures: list[str] = []
+
+    def act(branch: dict) -> str | None:
+        name = branch["name"]
+        archived_on = archive_date(name)
+
+        if archived_on is None:
+            if (
+                name in skip
+                or exempt(name, exempt_names, exempt_patterns)
+                or name.startswith(ARCHIVE_PREFIX)
+            ):
+                return None
+            if (now - branch["date"]).days < args.stale_days:
+                return None
+            return archive(api, branch, today, args.bot_login)
+
+        # An archive ref -- but only if this workflow made it. Anyone may name
+        # a branch archive/<date>/x, and adopting one would put a stranger's
+        # branch on a deletion clock. Our own archiving comment, on this commit,
+        # naming this ref, is the provenance. Deleting that comment therefore
+        # also opts a branch out, permanently.
+        original = _ARCHIVED.match(name).group(2)
+        archived = find_marker(
+            api, branch["sha"], marker("archived", name), args.bot_login
+        )
+        if archived is None:
+            return None
+        # Both names: the one it had, so a line added to the list later still
+        # rescues it, and the one it has, which can itself end up protected or
+        # referenced by a pull request.
+        if (
+            name in skip
+            or original in skip
+            or exempt(name, exempt_names, exempt_patterns)
+            or exempt(original, exempt_names, exempt_patterns)
+        ):
+            return None
+        notice = find_marker(
+            api, branch["sha"], marker("delete-notice", name), args.bot_login
+        )
+
+        if notice is None:
+            if marker("noticed", name) in (archived.get("body") or ""):
+                # Notice was given and is no longer there: someone removed it,
+                # as the notice itself says to. That ends it for this archive.
+                return None
+            if (today - archived_on).days < args.archive_days:
+                return None
+            return give_notice(
+                api,
+                branch,
+                original,
+                today + dt.timedelta(days=args.notice_days),
+                archived,
+            )
+
+        if (now - _parse(notice["created_at"])).days < args.notice_days:
+            return None
+        reason = still_exempt(api, name)
+        if reason:
+            return f"skipped {name}: {reason}"
+        if not api.delete_branch(name, branch["sha"]):
+            return f"skipped {name}: moved since the scan"
+        return f"deleted {name}"
+
+    for branch in sorted(list_branches(api), key=lambda b: b["date"]):
+        if len(actions) >= args.max_actions:
+            break
+        # One branch failing is not a reason to strand the rest of the backlog,
+        # but it is a reason for the job to go red.
+        try:
+            done = act(branch)
+        except (urllib.error.HTTPError, RuntimeError) as error:
+            failures.append(f"{branch['name']}: {error}")
+            continue
+        if done:
+            actions.append(done)
+
+    verb = "did" if args.apply else "would"
+    print(f"{verb} act on {len(actions)} branch(es); {api.writes} write call(s)")
+    for line in actions:
+        print(f"  {line}")
+    for line in failures:
+        print(f"  FAILED {line}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
