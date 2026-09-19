@@ -13,6 +13,7 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
+      - '.github/scripts/install_flash_attention.sh'
       - '.github/workflows/ci-config.yaml'
   pull_request:
     branches: [main]
@@ -26,6 +27,7 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
+      - '.github/scripts/install_flash_attention.sh'
       - '.github/workflows/ci-config.yaml'
   workflow_dispatch:
 
@@ -78,6 +80,7 @@ jobs:
               - 'setup.py'
               - 'aiter/__init__.py'
               - '.github/workflows/flash_attention_integration.yaml'
+              - '.github/scripts/install_flash_attention.sh'
               - '.github/workflows/ci-config.yaml'
             triton:
               - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
