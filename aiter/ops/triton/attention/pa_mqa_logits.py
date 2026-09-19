@@ -300,9 +300,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "stride_q_next_n": "i32",
         "stride_q_heads": "i32",
         "KV_buffer": gfx_fp8_pointer,
-        "stride_k_seq": "i32",
+        # The plain kernel forms per-token KV addresses from the page table, so
+        # a cache past 2 GiB overflows a 32-bit stride product.
+        "stride_k_seq": "i32" if Preshuffle else "i64",
         "scale_buffer": "*fp32",
-        "stride_scale_seq": "i32",
+        "stride_scale_seq": "i32" if Preshuffle else "i64",
         "context_len_ptr": "*i32",
         "kv_indices": "*i32",
         "weights": "*fp32",
