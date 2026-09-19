@@ -96,8 +96,10 @@ class _SplitPolicy:
 _SPLIT_POLICIES = {
     # Tuned on MI300X (304 CU) against the direct-load builder at BKV=128,
     # where min_tiles_per_split=8 is 1024 KV columns.
+    # cu_oversub=16 rather than 4: the indexer prefill shapes leave the device
+    # under-filled at 4x (84% occupancy at seq_len 1024 / seq_len_kv 131072).
     "gfx942": _SplitPolicy(
-        min_seq_len_kv=4096, min_tiles_per_split=8, cu_oversub=4, fallback_cu=304
+        min_seq_len_kv=4096, min_tiles_per_split=8, cu_oversub=16, fallback_cu=304
     ),
     # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
     "gfx950": _SplitPolicy(
