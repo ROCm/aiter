@@ -10,7 +10,7 @@ from safetensors import safe_open
 
 from aiter import QuantType, rmsnorm2d_fwd_with_add, topk_softmax
 from aiter.iq2r_checkpoint import load_iq2r_layer_checkpoint
-from aiter.iq2r_moe import IQ2RMoeWorkspace, iq2r_fused_moe_out
+from aiter.iq2r_moe import IQ2RMoeWorkspace, iq2r_fused_moe, iq2r_fused_moe_out
 from aiter.ops.iq2r import (
     iq2r_materialize_device,
     iq2r_route_direct_gather_quant_out,
@@ -220,6 +220,37 @@ def test_full_o0_pipeline_tracks_source_mxfp4_expert(first_expert, source_first_
     assert cosine.item() > 0.97
 
 
+def test_iq2r_wrapper_honors_caller_output(first_expert):
+    hidden, topk_weights, topk_ids = _inputs(2, seed=0x0A17)
+    workspace = IQ2RMoeWorkspace.allocate(
+        2, 4, device="cuda", max_experts=1, task_rows=16
+    )
+    expected = torch.empty_like(hidden)
+    _run(first_expert, hidden, topk_weights, topk_ids, expected, workspace)
+
+    actual = torch.empty_like(hidden)
+    returned = iq2r_fused_moe(
+        hidden,
+        first_expert.gate_up_data,
+        first_expert.gate_up_auxiliary,
+        first_expert.down_data,
+        first_expert.down_auxiliary,
+        topk_weights,
+        topk_ids,
+        gate_up_metadata=first_expert.gate_up_metadata,
+        down_metadata=first_expert.down_metadata,
+        gate_up_tile_n=first_expert.gate_up_tile_n,
+        down_tile_n=first_expert.down_tile_n,
+        gate_up_bias=first_expert.gate_up_bias,
+        down_bias=first_expert.down_bias,
+        workspace=workspace,
+        output=actual,
+    )
+
+    assert returned is actual
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("tokens", [1, 2, 4, 5, 8, 16])
 def test_fused_route_reduce_add_rmsnorm_matches_unfused(first_expert, tokens):
     hidden, topk_weights, topk_ids = _inputs(tokens, seed=0xA11D)
@@ -268,7 +299,9 @@ def test_fused_route_reduce_add_rmsnorm_matches_unfused(first_expert, tokens):
     )
 
     torch.testing.assert_close(fused_residual, expected_residual, rtol=0, atol=0)
-    torch.testing.assert_close(fused_output, expected_output, rtol=0, atol=0.004)
+    # The fused reduction/RMSNorm changes FP32 reduction order relative to the
+    # two-kernel reference. Allow one BF16 ULP around unit magnitude.
+    torch.testing.assert_close(fused_output, expected_output, rtol=0, atol=0.008)
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16])
