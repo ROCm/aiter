@@ -18,6 +18,7 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
     load_config_json,
+    select_leq_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -54,12 +55,7 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
                 f"fused_clamp_act_mul/DEFAULT.json",
                 required=True,
             )
-        for bound in sorted(
-            int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")
-        ):
-            if block_size_n <= bound:
-                return dict(raw[f"N_LEQ_{bound}"])
-        return dict(raw["any"])
+        return select_leq_config(raw, block_size_n)
 
     config = None
     specialized = load_config_json(

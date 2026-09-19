@@ -11,6 +11,7 @@ from aiter.ops.triton.fusions.mhc import (
     mhc_post_dsv4,
     mhc_pre_dsv4,
 )
+from aiter.ops.triton.fusions.silu_and_mul_backward import silu_and_mul_backward
 
 __all__ = [
     "MHC_DSV4_BACKWARD_FALLBACK",
@@ -22,4 +23,5 @@ __all__ = [
     "mhc_post",
     "mhc_post_dsv4",
     "mhc_pre_dsv4",
+    "silu_and_mul_backward",
 ]

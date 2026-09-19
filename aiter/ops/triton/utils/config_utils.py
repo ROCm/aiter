@@ -53,6 +53,27 @@ def load_config_json(fpath: str, required: bool = True) -> dict | None:
         return None
 
 
+def select_leq_config(
+    configs: dict,
+    value: int,
+    *,
+    prefix: str = "N_LEQ_",
+    fallback_key: str = "any",
+) -> dict:
+    """Copy the smallest prefixed upper-bound config containing ``value``.
+
+    Use ``fallback_key`` when no threshold matches.
+    """
+    threshold_keys = sorted(
+        (key for key in configs if key.startswith(prefix)),
+        key=lambda key: int(key[len(prefix) :]),
+    )
+    for key in threshold_keys:
+        if value <= int(key[len(prefix) :]):
+            return dict(configs[key])
+    return dict(configs[fallback_key])
+
+
 def _dtype_dir(config_name: str) -> str:
     """Nested-layout directory for a config family:
     ``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``."""
