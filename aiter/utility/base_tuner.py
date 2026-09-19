@@ -315,7 +315,20 @@ class TunerCommon:
             untuned_gemm_file
         ), f"Not exist untuned file: {untuned_gemm_file}"
         untunedf = _read_csv(untuned_gemm_file)
-        filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+        # A recorder that loses a write mid-row leaves one incomplete line
+        # behind -- it cannot be repaired in place, because another worker may
+        # already have appended past it. Such a line parses as a row with
+        # missing fields, which would otherwise be tuned as a shape with NaN
+        # dimensions. Drop it here and say so, rather than fail deep inside a
+        # kernel launch.
+        complete = untunedf.dropna()
+        dropped = len(untunedf) - len(complete)
+        if dropped:
+            logger.warning(
+                f"{untuned_gemm_file}: skipping {dropped} incomplete row(s); "
+                "a recorder write was interrupted, most likely by a full disk"
+            )
+        filtered_df = complete.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
     def get_out_file(self, tuned_file):

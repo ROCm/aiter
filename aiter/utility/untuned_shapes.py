@@ -102,7 +102,13 @@ def record(tuned_file: str, row: dict) -> None:
                 logger.info(f"[AITER_TUNE_GEMM] recording untuned shapes to {path}")
 
             prefix = "\n" if state["needs_separator"] else ""
-            _append_line(path, (prefix + ",".join(key) + "\n").encode())
+            try:
+                _append_line(path, (prefix + ",".join(key) + "\n").encode())
+            except ShortAppend as short:
+                # The row did not land. If its fragment could not be closed,
+                # the retry has to open a fresh line rather than extend it.
+                state["needs_separator"] = not short.terminated
+                raise
             state["needs_separator"] = False
             # Only cache a row after its append succeeds. A transient write
             # failure must remain retryable on the next dispatch.
@@ -154,14 +160,47 @@ def _ensure_header(path: str, cols: list[str]) -> bool:
         return fh.read(1) not in (b"\n", b"\r")
 
 
+class ShortAppend(OSError):
+    """A row reached the file only partially.
+
+    ``terminated`` reports whether the surviving fragment ends in a newline.
+    When it does not, the next append has to start with a separator or it
+    would splice itself onto the fragment and produce one malformed row out
+    of two.
+    """
+
+    def __init__(self, message: str, terminated: bool):
+        super().__init__(message)
+        self.terminated = terminated
+
+
 def _append_line(path: str, payload: bytes) -> None:
-    """Append a complete CSV row with one operating-system write."""
+    """Append a complete CSV row with one operating-system write.
+
+    ``os.write`` may return a short count -- an exhausted disk or quota is the
+    usual cause -- and under ``O_APPEND`` the remainder cannot simply be
+    written again: a concurrent worker may have appended in between, so the
+    tail would land after *their* row and corrupt both. The fragment is closed
+    with a single-byte newline instead, which the kernel either writes whole or
+    not at all, so the damage stays confined to its own line and the caller can
+    retry the row intact.
+    """
     fd = os.open(path, os.O_WRONLY | os.O_APPEND)
     try:
         written = os.write(fd, payload)
-        if written != len(payload):
-            raise OSError(
-                f"short append to {path}: wrote {written}/{len(payload)} bytes"
-            )
+        if written == len(payload):
+            return
+        message = f"short append to {path}: wrote {written}/{len(payload)} bytes"
+        fragment = payload[:written]
+        if not fragment:
+            # Nothing reached the file, so there is no fragment to isolate.
+            raise ShortAppend(message, terminated=True)
+        terminated = fragment.endswith(b"\n")
+        if not terminated:
+            try:
+                terminated = os.write(fd, b"\n") == 1
+            except OSError:
+                terminated = False
+        raise ShortAppend(message, terminated)
     finally:
         os.close(fd)

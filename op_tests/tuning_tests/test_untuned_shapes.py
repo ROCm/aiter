@@ -104,6 +104,100 @@ class TestUntunedShapes(unittest.TestCase):
         with open(path) as fh:
             self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
 
+    def _short_write_once(self, path, keep):
+        """Make the first append to ``path`` persist ``keep`` bytes, then stop.
+
+        The kernel is entitled to return a short count -- an exhausted disk or
+        quota is the usual cause -- and the bytes it did accept are already in
+        the file. Every other write, including the newline that closes the
+        fragment, is left alone.
+        """
+        real_write = os.write
+        tripped = False
+        target = os.path.realpath(path)
+
+        def short_first_write(fd, payload):
+            nonlocal tripped
+            if tripped or len(payload) <= keep:
+                return real_write(fd, payload)
+            try:
+                same = os.path.realpath(f"/proc/self/fd/{fd}") == target
+            except OSError:
+                same = False
+            if not same:
+                return real_write(fd, payload)
+            tripped = True
+            return real_write(fd, payload[:keep])
+
+        return mock.patch.object(untuned_shapes.os, "write", short_first_write)
+
+    def test_partial_append_does_not_splice_into_the_retried_row(self):
+        """A torn row must not merge with its own retry.
+
+        Without isolation, a row that reaches the file as ``1,`` and is then
+        retried whole produces ``1,1,2,3`` under a three-column header -- a
+        malformed row the tuner's deduplication cannot repair, because it is
+        not a duplicate of anything.
+        """
+        row = {"M": 1, "N": 2, "K": 3}
+        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
+
+        with self._short_write_once(path, keep=2):
+            untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+
+        untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+
+        self.assertEqual(lines[0], "M,N,K")
+        self.assertIn("1,2,3", lines)
+        # The fragment may survive on a line of its own; what it must never do
+        # is take the retried row with it.
+        for line in lines[1:]:
+            self.assertLessEqual(
+                len(line.split(",")), 3, f"row {line!r} has more fields than the header"
+            )
+
+    def test_partial_append_is_readable_by_the_tuner(self):
+        """Whatever the file looks like afterwards, pandas must still parse it.
+
+        This is the property that actually matters: the untuned CSV is fed
+        straight back to the tuner, so a torn write may cost a row but must
+        not cost the file.
+        """
+        try:
+            import pandas as pd
+        except ImportError:  # pragma: no cover - pandas is a tuner dependency
+            self.skipTest("pandas is not installed")
+        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
+
+        with self._short_write_once(path, keep=2):
+            untuned_shapes.record("a8w8_tuned_gemm.csv", {"M": 1, "N": 2, "K": 3})
+
+        untuned_shapes.record("a8w8_tuned_gemm.csv", {"M": 1, "N": 2, "K": 3})
+        untuned_shapes.record("a8w8_tuned_gemm.csv", {"M": 4, "N": 5, "K": 6})
+
+        frame = pd.read_csv(path, skip_blank_lines=True).dropna()
+        recorded = {tuple(int(v) for v in r) for r in frame[["M", "N", "K"]].values}
+        self.assertIn((1, 2, 3), recorded)
+        self.assertIn((4, 5, 6), recorded)
+
+    def test_partial_append_leaves_the_row_retryable(self):
+        """A torn row is not cached, so the next dispatch of that shape retries."""
+        row = {"M": 7, "N": 8, "K": 9}
+        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
+
+        with self._short_write_once(path, keep=2):
+            untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+
+        state = untuned_shapes._SEEN[path]
+        self.assertNotIn(("7", "8", "9"), state["rows"])
+
+        untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+        with open(path) as fh:
+            self.assertIn("7,8,9", fh.read().splitlines())
+
     def test_failed_initialization_remains_retryable(self):
         row = {"M": 1, "N": 2, "K": 3}
         path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
@@ -180,6 +274,26 @@ class TestCachedLookupMissRecording(unittest.TestCase):
         self.assertEqual(resolver.call_count, 1)
         self.assertEqual(miss_logger.call_count, 1)
         self.assertEqual(record.call_count, 2)
+
+    def test_tuner_skips_an_incomplete_row(self):
+        """The reader discards what the writer could not repair.
+
+        A torn append survives as one short line. It cannot be fixed in place
+        -- another worker may already have appended past it -- so the tuner
+        drops it instead of tuning a shape with NaN dimensions.
+        """
+        from aiter.utility.base_tuner import TunerCommon
+
+        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
+        with open(path, "w") as fh:
+            fh.write("M,N,K\n1,\n1,2,3\n4,5,6\n")
+
+        frame = TunerCommon.get_untuned_gemm_list(None, path)
+
+        self.assertEqual(
+            [tuple(int(v) for v in row) for row in frame[["M", "N", "K"]].values],
+            [(1, 2, 3), (4, 5, 6)],
+        )
 
     def test_a8w8_misses_record_outside_lookup_caches(self):
         from aiter.ops import gemm_op_a8w8
