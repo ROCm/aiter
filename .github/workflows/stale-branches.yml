@@ -1,0 +1,79 @@
+name: Stale branches
+
+# Comments on branches with no commits for 30 days. It never deletes anything.
+#
+# Review asked for the policy the previous cleanup used -- comment and archive
+# at 30 days, 30 more in the archive, then two weeks' notice -- and this action
+# cannot do it: comment, wait, delete, with no archive, rename or tag step. A
+# longer clock would answer "too aggressive" and leave "not equivalently
+# recoverable" where it was, so days-before-branch-delete below is set past any
+# lifetime this repository will have and the delete stage is unreachable. The
+# job still needs contents: write for commit comments, so that is a
+# configuration guarantee, not a permission one. The archiving version is a
+# separate proposal.
+#
+# Commenting is off until STALE_BRANCHES_NOTIFY is 'true'; until then every run
+# is a dry run, which posts nothing. Roughly 700 branches are past 30 days, so
+# the first enforcing run comments on up to operations-per-run of them.
+# Deleting the bot's comment stops it coming back until the branch changes.
+#
+# The exemptions below are not preferences. Measured on 2026-09-15:
+#   release/*, v[0-9]*  16 release branches are already past 30 days
+#   gh-pages            the published documentation site
+#   open PRs            commenting on a branch under review is noise
+#   protected branches  main and anything else protected in settings
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'   # Mondays, 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would be deleted without deleting anything'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write       # comment on and delete branches
+  actions: read         # required by remove-stale-branches
+  pull-requests: read   # detect branches with open PRs
+
+concurrency:
+  group: stale-branches
+  cancel-in-progress: false
+
+jobs:
+  remove-stale-branches:
+    runs-on: ubuntu-latest
+    # Pinned to the v2.4.0 commit, not the tag: this step can delete refs, and
+    # a tag can be moved. Same convention as reviewdog/action-setup in pre-checks.yaml.
+    steps:
+      - uses: fpicalausa/remove-stale-branches@7c4f2afe88a36c0f9114cd958380979b9d7323fb  # v2.4.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Off until STALE_BRANCHES_NOTIFY is 'true' (Settings > Secrets and
+          # variables > Actions). The manual input still forces a dry run.
+          dry-run: ${{ inputs.dry_run == true || vars.STALE_BRANCHES_NOTIFY != 'true' }}
+          days-before-branch-stale: 30
+          # Effectively never; read the note at the top before changing it.
+          days-before-branch-delete: 36500
+          # Upstream's 10 is a standstill here: ~700 branches are past 30
+          # days, so a weekly run would take a year and a dry run would list
+          # only the first ten. Only branches it acts on count toward this.
+          operations-per-run: 300
+          # Upstream default is false: without this, a branch under review
+          # would collect a stale comment while the review is still going.
+          # Upstream stops the whole run when a commit author resolves to no
+          # account, on the grounds that it may mean the token lacks the
+          # privileges to look one up. That reasoning does not apply here --
+          # the token is GITHUB_TOKEN with a fixed scope -- while the cost
+          # does: one commit from an address never linked to an account, or
+          # from a deleted one, would halt a 700-branch pass partway with
+          # nothing failing to say so. Those branches get their comment with
+          # no author named, unless STALE_BRANCHES_DEFAULT_RECIPIENT names
+          # someone to notify instead.
+          ignore-unknown-authors: true
+          default-recipient: ${{ vars.STALE_BRANCHES_DEFAULT_RECIPIENT }}
+          ignore-branches-with-open-prs: true
+          exempt-protected-branches: true
+          exempt-branches-regex: '^(main|master|gh-pages|stable|release/.*|v[0-9].*)$'
