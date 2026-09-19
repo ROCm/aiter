@@ -64,6 +64,10 @@ _HIPEQ_BV_RESIDENT_WGS_CAP = 2
 _HIPEQ_BV_CANDIDATES = (64, 32, 16)
 _HIPEQ_BV_CACHE: dict[tuple[int, int, int, int], int] = {}
 
+# Segmented K5 needs enough chunks to amortise the extra summary pass; 128
+# chunks is ~8k tokens, the shortest prefill that won in measurement.
+_GDN_K5_SEGMENT_MIN_TOTAL_CHUNKS = 128
+
 
 def _hipeq_device_idx(device: torch.device) -> int:
     if device.index is not None:
@@ -765,6 +769,50 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
+
+    # Context-parallel K5. The shape gates keep FlyDSL for the packed batches
+    # that lost in measurement: N<=2 wins from ~8k tokens, N==3 only for a full
+    # 32k pack with a >=16k sequence, and N>=4 always loses.
+    segment_batch_supported = N <= 2 or (
+        N == 3 and _total_chunks >= 512 and _max_seq_chunks >= 256
+    )
+    if (
+        _total_chunks >= _GDN_K5_SEGMENT_MIN_TOTAL_CHUNKS
+        and segment_batch_supported
+        and B == 1
+        and K == V == 128
+        and use_g
+        and not use_gk
+        and g_head_major
+        and g_log2_scaled
+        and save_new_value
+    ):
+        from aiter.ops.triton.gated_delta_net.gdn_segment_scan import (
+            gdn_segment_scan_fwd,
+        )
+
+        if is_varlen:
+            if prefill_metadata is None:
+                raise ValueError(
+                    "Segmented K5 requires prefill_metadata in varlen mode."
+                )
+            seq_lens = prefill_metadata.layout.seq_lens_cpu[num_decodes:]
+        else:
+            seq_lens = (T,)
+        return gdn_segment_scan_fwd(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            seq_lens=seq_lens,
+            state_indices=si_i32,
+            inplace_final_state=bool(inplace),
+            snapshot_dtype=resolved_snapshot_dtype,
+            state_dtype=resolved_state_dtype,
+        )
+
     BV = _tuned_bv(
         H=H,
         Hg=Hg,
