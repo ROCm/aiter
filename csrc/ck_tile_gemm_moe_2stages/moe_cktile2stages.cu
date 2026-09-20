@@ -242,6 +242,29 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                                                       false>::dispatch(M, N, K, block_m);
             }
         }
+        else if(activation == 3 && !has_bias)
+        {
+            if(stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+        }
     }
 }
 
