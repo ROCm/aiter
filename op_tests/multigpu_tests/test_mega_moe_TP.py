@@ -76,15 +76,22 @@ were wrong with it, all of them inflating the split side:
   at all.
 * **It was eager while the fused side was captured.**  ``--graph`` used to
   capture only the fused path, so every launch the baseline dispatched counted
-  as fusion win.  Production decode is captured on both sides; ``--graph`` now
-  captures both and reports ``graph_speedup``, which is the only number here
-  measured the way the layer actually runs.
+  as fusion win.
 
-The eager columns are kept because they are still what an eager caller sees,
-but on this box a single eager launch costs ~14us of host dispatch no matter
-what it does, so at small M the eager legs say more about the harness than
-about the layer.  Read ``graph_speedup`` for the claim and the eager legs for
-where the launches went.
+Eager measurement has since been removed outright rather than reported
+alongside.  On this box a single eager launch costs ~11-35us of host dispatch
+depending on the backend -- more than the work at decode sizes -- and a
+production decode step is captured, so an eager number for this layer
+describes the harness, not the layer.  There is exactly one regime now: both
+paths replayed from a CUDA graph, compared as ``graph_speedup``.  What that
+costs is that a run can no longer print a cheap per-leg breakdown, since each
+leg would need its own capture; ``--leg-device-time`` gives one leg's device
+time per run instead.
+
+What this changed, on the numbers: eager-vs-eager reported mean 1.299 and
+45/50 wins for the fused kernel; graph-vs-graph on the same shapes reports
+mean 0.833 and 8/42, and 0/27 below M=1024.  The small-M win was launch
+overhead, and CUDA graph removes it from both sides.
 
 Usage
 -----
@@ -92,8 +99,10 @@ No wrapper and no exported variables: every environment variable the tuned a4w4
 path needs is set at the top of this file, and the repo root is put on
 ``sys.path`` there too, so the tuned kernels are reached by running the file::
 
-    # all four models, default token sweep
-    torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py
+    # one cell -- this is the unit of a run, because each cell captures two
+    # CUDA graphs and a few of those in one process kills a rank
+    torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py \
+        --models dsv4 --tokens 8 --impl both
 
     # one model, accuracy only
     torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py \
@@ -132,7 +141,7 @@ other three models fall back to untuned heuristics.
 from __future__ import annotations
 
 import argparse
-import functools
+import gc
 import logging
 import os
 import sys
@@ -844,57 +853,6 @@ class AllGatherTokens:
         return x, w, i
 
 
-class QuantWireAllGatherProbe:
-    """Sizes the AllGather *collective* at MXFP4 wire width instead of bf16.
-
-    This is deliberately not part of the functional path: ``fused_moe``
-    quantizes internally, so handing it prequantized input would double-quantize.
-    The probe exists to price the "quantize locally, then AllGather"
-    optimization the fused kernel should use -- the wire row shrinks from
-    ``H*2`` to ``H/2 + H/32`` bytes (3.77x less traffic), and each rank
-    quantizes only its own m rows rather than all M.
-
-    Only the collective is timed.  The quantization is excluded on purpose: in
-    the fused design it is absorbed into K1 alongside the AllGather push, so
-    charging it as a standalone launch here would measure the wrong thing.  Use
-    ``quant_local_us`` for the separate cost of the local quantize.
-    """
-
-    def __init__(self, shape: ModelShape, tp_size: int, max_local_tokens: int, device):
-        self.tp_size = tp_size
-        self.model_dim = shape.model_dim
-        # fp4 payload and its E8M0 scales, packed into one contiguous row so the
-        # probe pays a single collective's latency -- same accounting as the
-        # bf16 AllGatherTokens above.
-        self.row_bytes = shape.model_dim // 2 + shape.model_dim // 32
-        self._local = torch.empty(
-            (max_local_tokens, self.row_bytes), dtype=torch.uint8, device=device
-        )
-        self._all = torch.empty(
-            (max_local_tokens * tp_size, self.row_bytes),
-            dtype=torch.uint8,
-            device=device,
-        )
-
-    def wire_bytes(self, local_tokens: int) -> int:
-        return local_tokens * self.row_bytes * (self.tp_size - 1)
-
-    def __call__(self, inputs: TpMoeInputs):
-        g, m = inputs.global_tokens, inputs.local_tokens
-        dist.all_gather_into_tensor(self._all[:g], self._local[:m])
-        return self._all[:g]
-
-    @staticmethod
-    def quantize_local(inputs: TpMoeInputs):
-        """The local MXFP4 quantize, timed separately from the collective.
-
-        Uses the HIP kernel, not ``get_torch_quant(per_1x32)`` -- the latter is
-        the torch *reference* implementation and is ~350us even for one row,
-        which would make this number meaningless.
-        """
-        return get_hip_quant(QUANT_TYPE)(inputs.x_local, quant_dtype=AQ_DTYPE)
-
-
 # ---------------------------------------------------------------------------
 # Modules 2 / 3: GEMM1 and GEMM2 (the kernels test_moe_2stage.py drives)
 # ---------------------------------------------------------------------------
@@ -1303,16 +1261,6 @@ class SplitLocalGemms:
             **self.kwargs,
         )
 
-    def capture_stage_callables(self, *args):
-        """Run one eager pass and return ``({"stage1": call, "stage2": call}, out)``."""
-        captured: list = []
-        aiter.fused_moe.kernel_bench_callable = captured
-        try:
-            out = self(*args)
-        finally:
-            aiter.fused_moe.kernel_bench_callable = None
-        return dict(captured), out
-
 
 class SplitTpMoe:
     """sort -> quant -> AG -> GEMM1 -> GEMM2 -> RS, each step separately timed."""
@@ -1639,7 +1587,7 @@ def _graph_capture_ctx():
     return graph_capture()
 
 
-def _device_us(fn, *, reps: int, rounds: int, device) -> float:
+def _device_us(fn, *, reps: int, rounds: int, warmup: int, device) -> float:
     """Device time for one call to ``fn``, with host dispatch removed.
 
     Neither of the obvious measurements can see a leg this small.  Timing an
@@ -1662,6 +1610,11 @@ def _device_us(fn, *, reps: int, rounds: int, device) -> float:
     """
     graph = None
     try:
+        # Same warmup requirement as _time_graph: a capture taken on a cold
+        # caching allocator replays into a SIGSEGV.
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
@@ -1683,7 +1636,10 @@ def _device_us(fn, *, reps: int, rounds: int, device) -> float:
         logger.warning("[TP-MOE] leg capture failed: %s", exc)
         return float("nan")
     finally:
-        del graph
+        # Same reason as _time_graph: a live graph makes the next capture fatal.
+        graph = None  # drop the ref into the graph's private pool
+        gc.collect()
+        torch.cuda.synchronize()
 
 
 def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
@@ -1700,6 +1656,25 @@ def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
     sweep down with it.
     """
     try:
+        # Warm up hard on the default stream before capturing.
+        #
+        # Three side-stream iterations are the textbook recipe and are nowhere
+        # near enough here. Both paths allocate on every call -- the one-shot
+        # collectives return their own output buffers -- so the caching
+        # allocator needs many iterations to reach steady state, and a capture
+        # taken before it gets there produces a graph whose *replay* segfaults
+        # the rank. How many is shape-dependent: dsv4 M=8 crashes at 10 and is
+        # fine at 120; kimi3 M=64 still crashes at 120 and is fine at 400.
+        #
+        # This used to work by accident. The eager timing loop that stood here
+        # ran ~500 calls of every leg before any capture happened; deleting it
+        # removed the incidental warmup and the crash appeared. Keeping it
+        # explicit is the point -- a warmup that exists only as a side effect of
+        # a measurement is a warmup that disappears the next time the
+        # measurement is rearranged.
+        for _ in range(args.capture_warmup):
+            impl(inputs)
+        torch.cuda.synchronize()
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
@@ -1729,6 +1704,16 @@ def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
     except Exception as exc:  # noqa: BLE001 - diagnostic column only
         logging.getLogger(__name__).warning("[TP-MOE] graph capture failed: %s", exc)
         return float("nan"), None
+    finally:
+        # Drop the graph and its private memory pool before the caller captures
+        # anything else. A live graph while the next capture warms up is fatal:
+        # capturing the fused path straight after the split one SIGSEGVs unless
+        # the split graph has actually been collected first. This used to work
+        # by accident, because the eager timing loop in between allocated
+        # enough to force a collection.
+        graph = out = None  # drop refs into the graph's private pool
+        gc.collect()
+        torch.cuda.synchronize()
 
 
 def run_case(
@@ -1791,9 +1776,13 @@ def run_case(
     # Run before the early `--no-perf` return so an accuracy-only sweep still
     # exercises the fused path. `fused` stays alive for the timing block below.
     fused = None
-    if args.impl in ("fused", "both"):
+    # Leg mode never builds the fused engine. It has nothing to contribute to a
+    # split-leg measurement, and its residency is what turns the leg capture's
+    # replay into a SIGSEGV -- the same interaction that forces one capture per
+    # process everywhere else in this file.
+    if args.impl in ("fused", "both") and not args.leg_device_time:
         if not MegaMoeTP.is_available(shape, tp):
-            row["fused_us"] = float("nan")
+            row["fused_graph_us"] = float("nan")
             row["fused_note"] = MegaMoeTP.unavailable_reason()
         else:
             fused = MegaMoeTP(
@@ -1851,103 +1840,26 @@ def run_case(
     if args.no_perf:
         return row
 
-    # ---------------- per-module perf ----------------
-    timer = functools.partial(
-        time_us,
-        iters=args.iters,
-        warmup=args.warmup,
-        device=ctx.device,
-        rounds=args.rounds,
-    )
-    # Same order the fused kernel will run: the sort is hoisted out in front and
-    # everything after it is what gets collapsed into one launch.
-    quant_mean = 0.0
+    # ---------------- perf: both paths, captured ----------------
+    # One regime, and it is graph replay. An eager measurement of this layer at
+    # decode sizes is mostly host dispatch -- ~11-35us per launch, more than the
+    # work at small M -- and production captures the decode step, so the eager
+    # numbers described the harness rather than the layer. They are not
+    # collected at all any more; see the module docstring.
+    #
+    # This runs the chain once to produce the live intermediates the capture and
+    # the leg diagnostic need, then captures.
     plan, w_all, i_all, sorted_ret, xq, xq_scale, a1, a1_scale = moe.steps(inputs)
-    stages, _ = moe.gemms.capture_stage_callables(
-        a1, a1_scale, w_all, i_all, sorted_ret, plan
-    )
     partial = moe.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan)
-
-    route_mean, _ = timer(lambda: moe.route_ag(inputs))
-    sort_mean, _ = timer(lambda: moe.sorting(w_all, i_all, plan))
-    if plan.prequant:
-        quant_mean, _ = timer(lambda: moe.quant(inputs.x_local))
-        ag_mean, ag_max = timer(lambda: moe.payload_ag(xq, xq_scale, inputs))
-        ag_bytes = moe.payload_ag.wire_bytes(inputs.local_tokens)
-    else:
-        # GEMM1 quantizes inline at this M, so there is no separate quantize to
-        # charge and the wire stays BF16.
-        ag_mean, ag_max = timer(lambda: moe.allgather(inputs))
-        ag_bytes = moe.allgather.wire_bytes(inputs.local_tokens)
-    moe_mean, _ = timer(lambda: moe.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan))
     row["ag_wire"] = plan.ag_wire
 
-    g1_mean = g2_mean = float("nan")
-    if "stage1" in stages:
-        g1_mean, _ = timer(stages["stage1"])
-    if "stage2" in stages:
-        g2_mean, _ = timer(stages["stage2"])
-    rs_mean, rs_max = timer(lambda: moe.reduce_scatter(partial, inputs.local_tokens))
-    e2e_mean, e2e_max = timer(lambda: moe(inputs))
-
-    # What one fused launch is supposed to replace.  The sort and the routing
-    # AllGather stay outside it, so they are excluded -- this is the number the
-    # fused column has to beat, not e2e.
-    fusable_mean = quant_mean + ag_mean + moe_mean + rs_mean
-
-    row.update(
-        {
-            "route_ag_us": route_mean,
-            "sort_us": sort_mean,
-            "quant_us": quant_mean,
-            "ag_us": ag_mean,
-            "gemm1_us": g1_mean,
-            "gemm2_us": g2_mean,
-            "moe_us": moe_mean,
-            # Scale sort + top-k reduction: inside the GEMM block but not in
-            # either GEMM.
-            "moe_other_us": moe_mean - (g1_mean + g2_mean),
-            "rs_us": rs_mean,
-            "fusable_us": fusable_mean,
-            "e2e_us": e2e_mean,
-            "e2e_max_us": e2e_max,
-            # e2e is eager, so it also carries the host-side dispatch cost of
-            # chaining the modules (tuned-config lookup, moe_sorting wrapper,
-            # per-launch Python). At small M that is a real part of the gap the
-            # fused kernel closes, so keep it visible rather than hiding it.
-            #
-            # It is a *residual*, not a measurement, and a biased one: every leg
-            # takes the minimum over its own rounds independently of e2e, so a
-            # sum of independent minima is <= the minimum of the sum even on an
-            # idle node. A large value therefore means either real dispatch cost
-            # or that one timed region caught interference the others missed --
-            # see host_gap_pct, which flags the rows worth re-measuring.
-            "host_gap_us": e2e_mean - (route_mean + sort_mean + fusable_mean),
-            "host_gap_pct": (
-                100.0
-                * (e2e_mean - (route_mean + sort_mean + fusable_mean))
-                / e2e_mean
-                if e2e_mean
-                else 0.0
-            ),
-            "comm_pct": (
-                100.0 * (route_mean + ag_mean + rs_mean) / e2e_mean
-                if e2e_mean
-                else 0.0
-            ),
-            "ag_GBps": ag_bytes / ag_max / 1e3,
-            "rs_GBps": moe.reduce_scatter.wire_bytes(inputs.local_tokens)
-            / rs_max
-            / 1e3,
-        }
-    )
-
     if args.leg_device_time:
-        # One leg per run, because one capture per process is the only thing
-        # this stack survives reliably -- see --leg-device-time. This is the
-        # answer to "what does the AllGather actually cost": the eager columns
-        # above are dominated by per-launch dispatch at decode sizes and say
-        # more about the harness than about the layer.
+        # A leg run measures the leg and nothing else, and returns. One capture
+        # per process is what this stack reliably survives: adding the two
+        # whole-layer captures on top makes three and SIGSEGVs the rank. So
+        # this is not "also report a leg", it is a separate mode -- run it when
+        # the question is what a leg costs, not when the question is the
+        # speedup.
         legs = {
             "route_ag": lambda: moe.route_ag(inputs),
             "sort": lambda: moe.sorting(w_all, i_all, plan),
@@ -1967,156 +1879,60 @@ def run_case(
             row[f"{args.leg_device_time}_dev_us"] = float("nan")
         else:
             row[f"{args.leg_device_time}_dev_us"] = _device_us(
-                leg_fn, reps=args.leg_reps, rounds=args.rounds, device=ctx.device
+                leg_fn,
+                reps=args.leg_reps,
+                rounds=args.rounds,
+                warmup=args.capture_warmup,
+                device=ctx.device,
             )
+        return row
 
-    if args.graph:
-        # Capture the *baseline* too. Without this the graph column compares a
-        # replayed fused path against an eager control group, so every launch
-        # the baseline dispatches counts as fusion win -- which at M<=32 is a
-        # third of the reported gap and is not a gap production has, because a
-        # decode layer is captured on both sides.
-        row["split_graph_us"], replayed = _time_graph(moe, inputs, args, ctx)
-        # A replay that is fast but wrong would make the baseline look
-        # arbitrarily good, and the baseline is the whole claim here -- so gate
-        # it the same way the fused replay is gated rather than assume the
-        # capture was faithful. The collectives are the risk: under capture
-        # CustomAllreduce takes a different path through its registered pool.
-        if replayed is not None:
-            row["split_graph_rel_l2"] = rel_l2(replayed, y_actual)
-            del replayed
-            if row["split_graph_rel_l2"] >= args.rtol:
-                raise AssertionError(
-                    f"{shape.tag(tp)} tokens={global_tokens}: split graph "
-                    f"replay rel_l2={row['split_graph_rel_l2']:.6f} exceeds "
-                    f"{args.rtol} -- the captured baseline is not computing "
-                    "the same thing as the eager one, so split_graph_us is "
-                    "meaningless"
-                )
-
-    if args.probe_quant_wire:
-        probe = QuantWireAllGatherProbe(shape, tp, max_local_tokens, ctx.device)
-        probe(inputs)
-        agq_mean, _ = timer(lambda: probe(inputs))
-        quant_mean, _ = timer(lambda: probe.quantize_local(inputs))
-        row["ag_fp4_us"] = agq_mean
-        row["ag_speedup"] = ag_mean / agq_mean if agq_mean else float("nan")
-        row["quant_local_us"] = quant_mean
-        row["ag_bytes_ratio"] = moe.allgather.wire_bytes(
-            inputs.local_tokens
-        ) / probe.wire_bytes(inputs.local_tokens)
+    # The control group, captured. A replay that is fast but wrong would make
+    # the baseline look arbitrarily good, and the baseline is the whole claim
+    # here, so gate it rather than assume the capture was faithful. The
+    # collectives are the risk: under capture CustomAllreduce takes a different
+    # path through its registered pool.
+    row["split_graph_us"], replayed = _time_graph(moe, inputs, args, ctx)
+    if replayed is not None:
+        row["split_graph_rel_l2"] = rel_l2(replayed, y_actual)
+        del replayed
+        if row["split_graph_rel_l2"] >= args.rtol:
+            raise AssertionError(
+                f"{shape.tag(tp)} tokens={global_tokens}: split graph "
+                f"replay rel_l2={row['split_graph_rel_l2']:.6f} exceeds "
+                f"{args.rtol} -- the captured baseline is not computing the "
+                "same thing as the eager one, so split_graph_us is meaningless"
+            )
 
     # ---------------- fused implementation, when it exists ----------------
     if fused is not None:
         engine = fused.engine
-        plan = engine.plan(global_tokens)
-        # Break the fused path down the same way as the unfused one, so the two
-        # columns are comparable leg by leg rather than only end to end.
-        f_ag_mean, _ = timer(
-            lambda: engine.all_gather(
-                inputs.x_local,
-                inputs.topk_weights_local,
-                inputs.topk_ids_local,
-                plan=plan,
-            )
-        )
-        a1, a1_scale, f_w, f_i = engine.all_gather(
-            inputs.x_local, inputs.topk_weights_local, inputs.topk_ids_local, plan=plan
-        )
-        # Same local MoE, driven by the unfused wrapper on the *fused* inputs.
-        # Isolates "the arena buffers / prequantized operand made the GEMMs
-        # slower" from "the fused driver's own dispatch costs more".
-        f_moe_mean, _ = timer(lambda: engine.local_moe(a1, a1_scale, f_w, f_i, plan))
-        if plan.fuse_rs:
-            # The ReduceScatter rides in GEMM2's tail, so there is no separate
-            # leg to time: what is comparable to (unfused GEMM + RS) is the one
-            # call that now does both. Report it as the RS leg's cost *over* the
-            # bare MoE so the two columns still add up to the same total.
-            f_moe_rs_mean, _ = timer(
-                lambda: engine.local_moe(
-                    a1, a1_scale, f_w, f_i, plan, inputs.local_tokens
-                )
-            )
-            f_rs_mean = max(0.0, f_moe_rs_mean - f_moe_mean)
-        else:
-            f_rs_mean, _ = timer(
-                lambda: engine.reduce_scatter(inputs.local_tokens, plan)
-            )
-        fused_mean, _ = timer(lambda: fused(inputs))
-        if args.graph:
-            # Everything on the fused path is a device-side-epoch kernel, so a
-            # captured graph replays correctly. Replay removes *all* host-side
-            # dispatch, so the gap between this and fused_us is exactly what
-            # collapsing the remaining launches could still win -- and what is
-            # left is real device work.
-            row["fused_graph_us"], replayed = _time_graph(fused, inputs, args, ctx)
-            if replayed is not None:
-                row["fused_graph_rel_l2"] = rel_l2(replayed, fused(inputs))
-                del replayed
-            # The only apples-to-apples speedup: both sides replayed, neither
-            # charged host dispatch.
-            split_graph = row.get("split_graph_us", float("nan"))
-            fused_graph = row.get("fused_graph_us", float("nan"))
-            # `fused_graph > 0` is also the NaN guard: a failed capture returns
-            # NaN, and NaN fails every comparison.
-            row["graph_speedup"] = (
-                split_graph / fused_graph if fused_graph > 0 else float("nan")
-            )
-        row.update(
-            {
-                "fused_ag_us": f_ag_mean,
-                "fused_moe_us": f_moe_mean,
-                "fused_rs_us": f_rs_mean,
-                "fused_rs_mode": "fused" if plan.fuse_rs else "split",
-                "stage12": engine.stage12_mode(plan, inputs.local_tokens),
-                "fused_us": fused_mean,
-                "fused_speedup": (
-                    e2e_mean / fused_mean if fused_mean else float("nan")
-                ),
-                "ag_gain": ag_mean / f_ag_mean if f_ag_mean else float("nan"),
-                "rs_gain": rs_mean / f_rs_mean if f_rs_mean else float("nan"),
-            }
+        fplan = engine.plan(global_tokens)
+        row["fused_rs_mode"] = "fused" if fplan.fuse_rs else "split"
+        row["stage12"] = engine.stage12_mode(fplan, inputs.local_tokens)
+        # Every kernel on the fused path takes its epoch from the arena rather
+        # than the host, so a captured graph replays correctly.
+        row["fused_graph_us"], replayed = _time_graph(fused, inputs, args, ctx)
+        if replayed is not None:
+            row["fused_graph_rel_l2"] = rel_l2(replayed, fused(inputs))
+            del replayed
+        split_graph = row.get("split_graph_us", float("nan"))
+        fused_graph = row.get("fused_graph_us", float("nan"))
+        # `fused_graph > 0` is also the NaN guard: a failed capture returns NaN,
+        # and NaN fails every comparison.
+        row["graph_speedup"] = (
+            split_graph / fused_graph if fused_graph > 0 else float("nan")
         )
 
     # Everything above is function-local, so it is released on return; the
     # caller calls empty_cache() between cases.  Do not `del` the tensors the
-    # timing lambdas captured.
+    # capture lambdas closed over.
     return row
 
 
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
-#: Above this global token count, host dispatch is a fixed cost that should be
-#: a small share of e2e, so a large ``host_gap_pct`` there means a timed region
-#: caught interference rather than real dispatch work.
-_SUSPECT_MIN_TOKENS = 2048
-#: Clean TP8 rows at those sizes measured 0.5-2.5%; the two contaminated ones
-#: measured 10.0% and 11.4%. 8% separates them with room to spare.
-_SUSPECT_GAP_PCT = 8.0
-
-
-def _suspect_note(row: dict, global_tokens: int) -> str:
-    """Flag a row whose leg accounting does not add up.
-
-    ``host_gap_us`` is a residual, so interference in any one timed region shows
-    up there rather than in the leg that actually suffered. Saying so at print
-    time turns a silently wrong speedup into a visible one -- the alternative is
-    reading a contaminated number as a result, which has already happened once.
-    """
-    gap_pct = row.get("host_gap_pct")
-    if (
-        gap_pct is None
-        or global_tokens < _SUSPECT_MIN_TOKENS
-        or gap_pct < _SUSPECT_GAP_PCT
-    ):
-        return ""
-    return (
-        f"  [SUSPECT host_gap={gap_pct:.0f}% of e2e; re-measure with more "
-        "--rounds before trusting this row]"
-    )
-
-
 #: How much a smaller M may exceed the next larger M before it is called out.
 #: Not pure noise slack: at TP8 the smallest sweep point is one local token,
 #: whose fused path is reproducibly 6-8% slower than two local tokens on all
@@ -2129,14 +1945,18 @@ _MONOTONIC_SLACK = 1.12
 def _report_non_monotonic(df) -> None:
     """Warn where a smaller token count timed slower than a larger one.
 
-    The per-row ``host_gap`` check cannot fire at small M, where a large gap is
-    honest dispatch cost. What still holds there is monotonicity: doubling the
-    tokens cannot make the layer faster, so ``e2e(M) > e2e(2M)`` means the
-    smaller cell caught interference. This is how kimi3 M=8 was caught reading
-    1.49x when a clean re-measure gave 1.15x.
+    This is the only self-check left now that the run is graph-only: there is
+    no leg accounting to cross-foot against, but monotonicity still holds --
+    doubling the tokens cannot make the layer faster, so ``t(M) > t(2M)`` means
+    that cell caught interference from another tenant on the node. It is how
+    kimi3 M=512 was caught reading 916us against 405us at M=1024; a clean
+    re-measure gave 364us.
+
+    It only fires across a sweep, so a one-cell-per-process run has to be
+    cross-checked after the fact -- concatenate the CSVs and look.
     """
     hits = []
-    for col in ("e2e_us", "fused_us"):
+    for col in ("split_graph_us", "fused_graph_us"):
         if col not in df.columns:
             continue
         for model, grp in df.groupby("model"):
@@ -2164,53 +1984,26 @@ _PERF_COLUMNS = [
     "inter_dim_local",
     "comm",
     "rel_l2",
-    # Fusion order: the sort and the routing AllGather stay outside the fused
-    # kernel; everything from quant to rs is what one launch replaces.
     "ag_wire",
-    "route_ag_us",
-    "route_ag_dev_us",
-    "sort_us",
-    "sort_dev_us",
-    "quant_us",
-    "quant_dev_us",
-    "ag_us",
-    "ag_dev_us",
-    "gemm1_us",
-    "gemm2_us",
-    "moe_other_us",
-    "rs_us",
-    "rs_dev_us",
-    "fusable_us",
-    "host_gap_us",
-    "host_gap_pct",
-    "e2e_us",
     "split_graph_us",
+    "fused_graph_us",
+    "graph_speedup",
     "split_graph_rel_l2",
-    "comm_pct",
-    "ag_GBps",
-    "rs_GBps",
-    # only present with --probe-quant-wire / --impl fused|both
-    "ag_fp4_us",
-    "ag_speedup",
-    "ag_bytes_ratio",
-    "quant_local_us",
-    "fused_ag_wire",
-    "fused_gemm_bucket",
+    "fused_graph_rel_l2",
     "fused_rel_l2",
     "fused_ref_rel_l2",
-    "fused_ag_us",
-    "fused_moe_us",
-    "fused_rs_us",
+    "fused_ag_wire",
+    "fused_gemm_bucket",
     "fused_rs_mode",
     "stage12",
-    "fused_graph_us",
-    "fused_graph_rel_l2",
-    "fused_us",
-    "ag_gain",
-    "rs_gain",
-    "fused_speedup",
-    "graph_speedup",
+    # only present with --leg-device-time
+    "route_ag_dev_us",
+    "sort_dev_us",
+    "quant_dev_us",
+    "ag_dev_us",
+    "rs_dev_us",
 ]
+
 
 
 def parse_args(argv=None):
@@ -2238,6 +2031,20 @@ def parse_args(argv=None):
     p.add_argument("--tp", type=int, default=0, help="TP size; 0 = WORLD_SIZE.")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=5)
+    p.add_argument(
+        "--capture-warmup",
+        type=int,
+        default=400,
+        help="Eager iterations to run before each CUDA graph capture. Not a "
+        "tuning knob: a capture taken before the caching allocator reaches "
+        "steady state yields a graph whose REPLAY SIGSEGVs the rank, and how "
+        "many iterations that takes is shape-dependent -- dsv4 M=8 needs more "
+        "than 10 and is happy at 120, kimi3 M=64 still dies at 120 and is "
+        "happy at 400. The default is the largest value found necessary, not "
+        "a measured optimum. Raise it if a cell dies right after its capture; "
+        "lower it only if the warmup dominates a slow shape, and check the run "
+        "still completes.",
+    )
     p.add_argument(
         "--rounds",
         type=int,
@@ -2309,11 +2116,6 @@ def parse_args(argv=None):
         "sweep touches is already built, otherwise the ranks race on the build.",
     )
     p.add_argument(
-        "--probe-quant-wire",
-        action="store_true",
-        help="Also measure an MXFP4 AllGather to size the quantized-wire win.",
-    )
-    p.add_argument(
         "--impl",
         choices=["unfused", "fused", "both"],
         default="unfused",
@@ -2327,8 +2129,10 @@ def parse_args(argv=None):
         "capturing --leg-reps copies of it into a CUDA graph. The eager leg "
         "columns carry ~11-35us of host dispatch per launch, which at decode "
         "sizes exceeds the work being timed; this is what the leg actually "
-        "costs -- at dsv4 M=8 the AllGather measures 9.7us here against 63-102us "
-        "eager depending on backend. One leg per run on purpose: capturing all "
+        "costs -- at dsv4 M=8 the AllGather measures 9.7us here. This is a "
+        "SEPARATE MODE: the run measures that leg and nothing else, no "
+        "speedup, because one capture per process is what this stack "
+        "reliably survives. One leg per run for the same reason: capturing all "
         "five in one process "
         "SIGSEGVs a rank about half the time on this stack (on both "
         "collective backends), and in-graph event records, which would have "
@@ -2342,43 +2146,23 @@ def parse_args(argv=None):
         "Amortizes the ~14us per-replay dispatch to 1/N of it.",
     )
     p.add_argument(
-        "--graph",
-        action=argparse.BooleanOptionalAction,
-        # None means "not asked for either way" -> defaults to on, but a
-        # multi-cell sweep is refused rather than driven into a SIGSEGV.
-        # Passing --graph explicitly is taken as accepting that risk.
-        default=None,
-        help="Time BOTH paths replayed from a CUDA graph and report "
-        "graph_speedup. ON BY DEFAULT: a decode layer is captured in "
-        "production, not dispatched per op, so this is the regime the layer "
-        "actually runs in -- and at small M it is not a small correction, it "
-        "reverses the result (dsv4 M=8 reads 1.63x eager and 0.46x captured). "
-        "The eager columns are still collected alongside. Two captures per "
-        "cell, and repeated capture in one process kills a rank after a few "
-        "cells (kimi3 died on the 4th), so by default a multi-cell run is "
-        "refused with the per-cell loop to run instead; passing --graph "
-        "explicitly overrides that. Use --no-graph for the old eager-only "
-        "sweep, which does every cell in one process.",
+        "--allow-multi-cell",
+        action="store_true",
+        help="Permit more than one (model, tokens) cell in one process. Every "
+        "cell captures two CUDA graphs and repeated capture kills a rank after "
+        "a few of them (kimi3 died on the 4th), so a multi-cell run is refused "
+        "by default with the per-cell loop printed instead.",
     )
     p.add_argument("--csv", default=None, help="Write the perf table here (rank 0).")
-    args = p.parse_args(argv)
-    # --graph defaults on but records whether that was the caller's decision;
-    # see the guard in main().
-    args.graph_explicit = args.graph is not None
-    if args.graph is None:
-        args.graph = True
-    return args
+    return p.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    # 'auto' resolves by measurement regime -- see --comm. Resolving it here,
-    # before the process group comes up, also means an eager sweep never pays
-    # the aiter parallel-state bring-up it would not use.
-    resolved_comm = args.comm
-    if resolved_comm == "auto":
-        resolved_comm = "custom" if args.graph else "rccl"
+    # Everything is measured under graph replay now, and that is the regime the
+    # one-shot collectives win in, so 'auto' is simply 'custom'.
+    resolved_comm = "custom" if args.comm == "auto" else args.comm
     ctx = setup_dist(want_custom_comm=resolved_comm != "rccl")
     args.tp = args.tp or ctx.world
     args.comm_backend = TpCollectives(resolved_comm, ctx, args.tp)
@@ -2405,23 +2189,18 @@ def main(argv=None) -> int:
                 "kernels in one process.",
                 flush=True,
             )
-        captures_per_cell = (2 if args.graph else 0) + (
-            1 if args.leg_device_time else 0
-        )
         cells = len(args.models) * len(set(args.tokens))
-        if args.graph and not args.graph_explicit and cells > 1:
-            # --graph is on by default, and a default must not walk a long
-            # sweep into a SIGSEGV. Capturing repeatedly in one process kills a
-            # rank after a handful of cells (kimi3 on the 4th, dsv4 survived
-            # 4), so the sweep has to be split. Refuse with the loop rather
-            # than silently dropping to eager, which would quietly change the
-            # regime the numbers came from.
+        if cells > 1 and not args.allow_multi_cell:
+            # Every cell captures two graphs, and repeated capture in one
+            # process kills a rank after a handful of them (kimi3 went on the
+            # 4th). There is no eager fallback to quietly drop to any more, so
+            # refuse and hand back the loop rather than walk into a SIGSEGV.
             tok = " ".join(str(t) for t in sorted(set(args.tokens)))
             mods = " ".join(args.models)
             raise SystemExit(
-                f"--graph is on by default and this run asks for {cells} "
-                "cells; repeated CUDA graph capture in one process kills a "
-                "rank after a few of them. Run one cell per process:\n\n"
+                f"this run asks for {cells} cells and each captures two CUDA "
+                "graphs; repeated capture in one process kills a rank after a "
+                "few of them. Run one cell per process:\n\n"
                 f"  for M in {mods}; do\n"
                 f"    for T in {tok}; do\n"
                 "      torchrun --nproc_per_node=8 "
@@ -2430,22 +2209,13 @@ def main(argv=None) -> int:
                 "        --rtol 0.06 --fused-rtol 0.06 --csv /tmp/c_${M}_${T}.csv\n"
                 "    done\n"
                 "  done\n\n"
-                "or pass --no-graph for the eager-only sweep (every cell in "
-                "one process), or --graph explicitly to override this check."
+                "then concatenate the CSVs. --allow-multi-cell overrides this."
             )
-        if captures_per_cell and cells > 1 and ctx.is_main:
-            # Repeated capture in one process eventually kills a rank. The
-            # whole-layer captures --graph does are fairly robust (13 cells x 2
-            # measured fine); the per-leg ones are not (5 in one process
-            # SIGSEGVs about half the time, on both collective backends, so it
-            # is the capture path and not either backend). Say what the run is
-            # about to do so a mid-sweep SIGSEGV is recognisable rather than
-            # mysterious.
+        if cells > 1 and ctx.is_main:
             print(
-                f"[NOTE] capturing {captures_per_cell} CUDA graphs per cell "
-                f"across {cells} cells. If a rank dies mid-sweep, that is the "
-                "capture path giving out -- split the run by model, or one "
-                "cell per process.",
+                f"[NOTE] --allow-multi-cell: capturing 2 graphs per cell across "
+                f"{cells} cells. A rank dying mid-sweep is the capture path "
+                "giving out, not a kernel bug.",
                 flush=True,
             )
         if ctx.is_main:
@@ -2535,31 +2305,32 @@ def main(argv=None) -> int:
                             # Lead with the captured numbers when they exist:
                             # they are the result, and the eager legs behind
                             # them are the breakdown of where launches went.
+                            nan = float("nan")
                             head = (
                                 f"[TP-MOE] {shape.name} M={global_tokens} "
                                 f"m={row['local_tokens']} "
                                 f"rel_l2={row['rel_l2']:.6f} "
+                                f"wire={row['ag_wire']}"
                             )
-                            if "split_graph_us" in row:
-                                head += (
-                                    f"GRAPH split={row['split_graph_us']:.1f} "
-                                    f"fused={row.get('fused_graph_us', float('nan')):.1f} "
-                                    f"speedup={row.get('graph_speedup', float('nan')):.3f} | "
-                                    f"eager split={row['e2e_us']:.1f} "
-                                    f"fused={row.get('fused_us', float('nan')):.1f} "
-                                    f"speedup={row.get('fused_speedup', float('nan')):.3f} | "
+                            legs = " ".join(
+                                f"{k.removesuffix('_dev_us')}={row[k]:.2f}us"
+                                for k in row
+                                if k.endswith("_dev_us")
+                            )
+                            if legs:
+                                # Leg mode: no speedup was measured, so do not
+                                # print columns that are not there.
+                                body = f" | device {legs}"
+                            else:
+                                body = (
+                                    f" | split={row['split_graph_us']:.1f} "
+                                    f"fused={row.get('fused_graph_us', nan):.1f} "
+                                    f"speedup={row.get('graph_speedup', nan):.3f} "
+                                    f"(replay rel_l2 "
+                                    f"{row.get('split_graph_rel_l2', nan):.4f}/"
+                                    f"{row.get('fused_graph_rel_l2', nan):.4f})"
                                 )
-                            print(
-                                head
-                                + f"ag={row['ag_us']:.1f} g1={row['gemm1_us']:.1f} "
-                                f"g2={row['gemm2_us']:.1f} "
-                                f"other={row['moe_other_us']:.1f} "
-                                f"rs={row['rs_us']:.1f} "
-                                f"e2e={row['e2e_us']:.1f}us "
-                                f"comm={row['comm_pct']:.0f}%"
-                                + _suspect_note(row, global_tokens),
-                                flush=True,
-                            )
+                            print(head + body, flush=True)
                     barrier()
             finally:
                 del weights
