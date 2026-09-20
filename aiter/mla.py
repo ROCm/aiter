@@ -900,14 +900,18 @@ def mla_decode_fwd(
         opus_is_fp8 = (
             q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
+            # 16mx1 (nhead 16, one query token) addresses a real block table; every other
+            # opus shape routes to 16mx8, which has not been ported past one token per page.
+            and (page_size in (1, 2, 4) if max_seqlen_q == 1 else page_size == 1)
             and q_scale is not None
             and kv_scale is not None
         )
-        opus_is_bf16 = q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
+        opus_is_bf16 = (
+            q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16 and page_size == 1
+        )
         use_opus = (
             os.environ.get("AITER_MLA_USE_OPUS", "0") == "1"
             and get_gfx() == "gfx950"
-            and page_size == 1
             and (opus_is_fp8 or opus_is_bf16)
         )
 
