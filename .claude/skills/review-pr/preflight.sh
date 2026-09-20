@@ -16,6 +16,9 @@ for s in fetch.sh triage.py render.sh run_one.sh _lib.py _gates.py _collect.py _
   chk "$s present" "[ -f '$S/$s' ]" "missing $S/$s"
 done
 
+echo "[prompt drift]"
+if python3 "$S/check_prompts.py" >/dev/null 2>&1; then echo "  ✅ prompts match SKILL.md verbatim"; ok=$((ok+1)); else echo "  ❌ prompts drifted from SKILL.md — re-copy the quoted sections"; bad=$((bad+1)); fi
+
 echo "[runtime]"
 chk "python3 available" "command -v python3" "install python3"
 chk "git available" "command -v git" "install git"

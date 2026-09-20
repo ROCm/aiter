@@ -37,6 +37,9 @@ WORKER_CMD=(claude-glm -p --dangerously-skip-permissions)
 REFUTER_CMD=(claude-glm -p --dangerously-skip-permissions)
 say() { echo "[run_one #$PR] $*"; }
 
+# Fail fast if the prompts have drifted from SKILL.md (they quote it verbatim).
+python3 "$SKILL/check_prompts.py" >/dev/null || { say "prompts drifted from SKILL.md (run check_prompts.py), aborting"; exit 4; }
+
 # 1) fetch (the skill's own Step-1 fetcher) -> WORK dir
 say "fetch..."
 FL="$(mktemp)"
