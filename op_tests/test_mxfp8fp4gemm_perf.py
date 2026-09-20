@@ -98,10 +98,14 @@ def print_summary(summaries):
             ]
         )
     widths = [max(map(len, cells)) for cells in zip(columns, *rows)]
-    print("\nF8GEMM performance summary (accepted attempts, GEMM-only, us):", flush=True)
+    print(
+        "\nF8GEMM performance summary (accepted attempts, GEMM-only, us):", flush=True
+    )
     for row in [columns, ["-" * width for width in widths], *rows]:
         print(
-            "| " + " | ".join(cell.ljust(width) for cell, width in zip(row, widths)) + " |",
+            "| "
+            + " | ".join(cell.ljust(width) for cell, width in zip(row, widths))
+            + " |",
             flush=True,
         )
 
@@ -194,19 +198,21 @@ def main():
                 }
                 attempts.append(entry)
                 write_json(output / "attempts.json", attempts)
-                with log_path.open("w", buffering=1) as log:
-                    with subprocess.Popen(
+                with (
+                    log_path.open("w", buffering=1) as log,
+                    subprocess.Popen(
                         command,
                         cwd=ROOT,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
                         bufsize=1,
-                    ) as result:
-                        for line in result.stdout:
-                            log.write(line)
-                            print(line, end="", flush=True)
-                        result.wait()
+                    ) as result,
+                ):
+                    for line in result.stdout:
+                        log.write(line)
+                        print(line, end="", flush=True)
+                    result.wait()
                 entry["exit_code"] = result.returncode
                 write_json(output / "attempts.json", attempts)
                 if result.returncode:
@@ -253,7 +259,13 @@ def main():
                     for item in summaries:
                         row = {
                             key: item[key]
-                            for key in ("case", "apre", "data_init", "splitk", "mean_us")
+                            for key in (
+                                "case",
+                                "apre",
+                                "data_init",
+                                "splitk",
+                                "mean_us",
+                            )
                         }
                         row.update(
                             {
