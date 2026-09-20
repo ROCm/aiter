@@ -8,8 +8,8 @@ from functools import lru_cache
 import torch
 from flydsl.expr import BFloat16, Float16, Float32
 
-from .kernels.tensor_shim import _run_compiled
-from .kernels.topk_per_row_argmax import (
+from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk.topk_per_row_argmax import (
     VEC_BY_ELEM,
     build_topk_per_row_argmax_module,
     topk_per_row_argmax_splits,

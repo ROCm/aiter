@@ -7,8 +7,8 @@ from functools import lru_cache
 
 import torch
 
-from .kernels.tensor_shim import _run_compiled, wave_size_of
-from .kernels.topk_per_row_small_k import (
+from ..kernels.tensor_shim import _run_compiled, wave_size_of
+from ..kernels.topk.topk_per_row_small_k import (
     build_topk_per_row_small_k_module,
     lds_limit,
     topk_per_row_small_k_shape,

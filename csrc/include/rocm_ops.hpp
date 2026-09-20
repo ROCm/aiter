@@ -2792,28 +2792,3 @@ namespace py = pybind11;
           py::arg("split_lse"),         \
           py::arg("final_output"),      \
           py::arg("attn_sink") = py::none());
-
-#define MLA_DS32_PYBIND                      \
-    m.def("mla_decode_stage1_opus_fwd_ds32", \
-          &mla_decode_stage1_opus_fwd_ds32,  \
-          "mla_decode_stage1_opus_fwd_ds32", \
-          py::arg("q_nope"),                 \
-          py::arg("q_rope"),                 \
-          py::arg("kv_nope"),                \
-          py::arg("kv_rope"),                \
-          py::arg("qo_indptr"),              \
-          py::arg("kv_indptr"),              \
-          py::arg("kv_indices"),             \
-          py::arg("kv_last_page_lens"),      \
-          py::arg("work_indptr"),            \
-          py::arg("work_info_set"),          \
-          py::arg("max_seqlen_q"),           \
-          py::arg("page_size"),              \
-          py::arg("nhead_kv"),               \
-          py::arg("softmax_scale"),          \
-          py::arg("logits"),                 \
-          py::arg("attn_lse"),               \
-          py::arg("out"),                    \
-          py::arg("final_lse"),              \
-          py::arg("q_scale"),                \
-          py::arg("kv_scale"));
