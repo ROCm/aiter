@@ -29,8 +29,10 @@ import weakref
 import torch
 
 from .kernels.conv3d_gfx950_utils import (
+    BF16_BYTES,
     DEFAULT_TILE,
     LDG_VEC,
+    MAX_DYN_DIVIDEND,
     SPLITK_MAX_STAGING_BYTES,
     TILE_K,
     _as_stream,
@@ -155,6 +157,7 @@ def _implicit_param_from_problem(
     wgm,
     out_ndhwc,
     pad_mode="zeros",
+    dyn_hw=False,
 ):
     """Compile param for a caller-facing problem (unpadded ``C``).
 
@@ -187,7 +190,42 @@ def _implicit_param_from_problem(
         wgm,
         groups,
         out_ndhwc,
+        dyn_hw,
     )
+
+
+# Read the input's spatial extents at runtime so one artifact serves every
+# resolution, instead of compiling per D/H/W. Worth it where the resolution is
+# open-ended -- the tuned table is keyed on the exact shape, so an arbitrary
+# one misses it and pays a JIT anyway -- and not worth it for a fixed set of
+# sizes, which is why it is opt-in rather than the default.
+AITER_CONV3D_DYN_HW = int(os.environ.get("AITER_CONV3D_DYN_HW", "0"))
+
+
+def _dyn_hw_ok(n, c_padded, d, h, w, k, npq, tile):
+    """Whether the variable-resolution path can express this problem.
+
+    Everything it rejects still compiles, just per-resolution as before, so a
+    miss here costs a JIT rather than an error.
+    """
+    if not AITER_CONV3D_DYN_HW:
+        return False
+    # The magic-number reciprocals are derived for dividends under 2**31, and
+    # every division the gather does is of a GEMM row or a remainder of one.
+    if npq >= MAX_DYN_DIVIDEND:
+        return False
+    # BIG_IN / BIG_OUT swap in a different addressing scheme whose reach is
+    # checked against the extents themselves, so leave those static.
+    if n * c_padded * d * h * w > 0x7FFFFFFF:
+        return False
+    if k * npq * BF16_BYTES > 0x7FFFFFFF:
+        return False
+    # M chunking would need the chunk count as one more runtime value; it only
+    # engages past ~16M tiles, which nothing here reaches.
+    tile_m, _, wave_m, wave_n = tile
+    block_threads = wave_m * wave_n * 64
+    grid_m = (npq + tile_m - 1) // tile_m
+    return grid_m <= 0xFFFFFFFF // block_threads
 
 
 # (device, shape) pairs already reported by _log_tuned_lookup, so the report
@@ -434,12 +472,17 @@ def _pick_wgm(npq, k, groups, tile, device):
 
 
 def _dispatch(exe, *args, stream=None):
-    """Run a builder's launcher, pre-compiling on first use."""
+    """Run a builder's launcher, pre-compiling on first use.
+
+    ``extra_args`` are the trailing scalars a variable-resolution conv3d takes
+    on top of its tensors; empty for every other kernel. ``exe.compile``
+    appends them itself, so they are only spelled out on the steady-state call.
+    """
     cf = getattr(exe, "_cf", None)
     if cf is None:
         exe._cf = exe.compile(*args, stream=stream)
         return
-    cf(*args, _as_stream(stream))
+    cf(*args, *getattr(exe, "extra_args", ()), _as_stream(stream))
 
 
 def _ncdhw_to_ndhwc(x, stream):
@@ -784,6 +827,9 @@ def _conv3d_impl(
         else:
             out_shape = (n, do, ho, wo, k) if out_ndhwc else (n, k, do, ho, wo)
             y = torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
+        dyn_hw = _dyn_hw_ok(
+            n, groups * _pad_channels(c_in // groups), d, h, w, k, npq, the_tile
+        )
         exe = compile_conv3d_implicit(
             _implicit_param_from_problem(
                 n,
@@ -811,6 +857,7 @@ def _conv3d_impl(
                 the_wgm,
                 out_ndhwc,
                 pad_mode,
+                dyn_hw,
             )
         )
         _dispatch(exe, y, x_ndhwc, w_packed, bias_arg, stream=launch_stream)

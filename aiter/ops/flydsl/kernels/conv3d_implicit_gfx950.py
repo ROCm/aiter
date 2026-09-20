@@ -40,6 +40,7 @@ from .conv3d_gfx950_utils import (
     DEFAULT_TILE,
     LDG_VEC,
     TILES_PER_BARRIER,
+    DynShapeArgs,
     LdsStager,
     MmaTiling,
     OutputScatter,
@@ -47,11 +48,15 @@ from .conv3d_gfx950_utils import (
     _as_stream,
     barrier,
     block_coords,
+    dyn_extents,
+    dyn_shape_values,
     make_conv_geometry,
     make_launch_grid,
     make_output_scatter_plan,
     make_shared_storage,
     make_tile_config,
+    static_extents,
+    unit_divisors,
     weight_bytes,
 )
 from .conv3d_im2col import Im2colGather, make_im2col_plan
@@ -94,6 +99,17 @@ class Conv3dImplicitParam:
     wgm: fx.Constexpr[int]
     groups: fx.Constexpr[int]
     out_ndhwc: fx.Constexpr[bool]
+    # Read the input's spatial extents at runtime instead of baking them in,
+    # so one artifact serves every resolution of the same layer. Costs the
+    # im2col decomposition a magic-number reciprocal per divisor in place of
+    # a folded immediate; see ``Divisor`` in conv3d_gfx950_utils.
+    #
+    # d/h/w stay in this struct because the host derives the geometry, the
+    # addressing decisions and the grid from them. What changes is that under
+    # this flag none of them reaches the kernel closure, so the compiled
+    # artifact no longer depends on them -- which is exactly what
+    # ``_shape_agnostic_key`` asserts.
+    dyn_hw: fx.Constexpr[bool]
 
 
 def make_conv3d_implicit_param(
@@ -122,6 +138,7 @@ def make_conv3d_implicit_param(
     wgm=1,
     groups=1,
     out_ndhwc=False,
+    dyn_hw=False,
 ):
     """Conv3dImplicitParam with the defaults filled in.
 
@@ -154,6 +171,7 @@ def make_conv3d_implicit_param(
         wgm=wgm,
         groups=groups,
         out_ndhwc=out_ndhwc,
+        dyn_hw=dyn_hw,
     )
 
 
@@ -201,31 +219,55 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     # staging, against the same grid the gather reads A on.
     scatter_plan = make_output_scatter_plan(param, geom, cfg, grid)
 
+    # CRS is the K axis of the implicit GEMM: C/groups times the filter, so it
+    # is fixed for a layer whatever its resolution. Taken out of the geometry
+    # here because it is all the weight loader needs from it.
+    CRS = geom.crs
+
+    if const_expr(param.dyn_hw):
+        # The extents leave the closure, so the grid has to be derivable from
+        # the scalars alone. M chunking folds a second axis into grid.z, which
+        # would need the chunk count as one more runtime value; it only
+        # engages past ~16M tiles, so requiring the flat case costs nothing
+        # real and keeps block_coords on its one dynamic input.
+        assert grid.m_chunks == 1, (
+            f"variable resolution needs a flat M grid, got {grid.m_chunks} chunks "
+            f"for npq={geom.npq} at tile_m={cfg.tile_m}"
+        )
+        extra_args = dyn_shape_values(param, geom, grid)
+        dyn_unit = unit_divisors(param, geom)
+        # What the kernel closes over, with the three fields the resolution
+        # moves blanked: grid_m arrives as a scalar and the launch sizes x and
+        # z from it, so a kernel that kept the real numbers here would be
+        # keyed on them and get one artifact per resolution after all.
+        kernel_grid = grid._replace(grid_x=0, grid_z=0, grid_m=0)
+    else:
+        extra_args = ()
+        dyn_unit = None
+        kernel_grid = grid
+
     elem_ty = fx.BFloat16
     SharedStorage = make_shared_storage(elem_ty, cfg)
 
-    @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def conv3d_implicit_kernel(
-        y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
-    ):
+    def _body(y, x, weight, bias, ext, grid_m):
         # A's whole convolution: which input element each A vector taps, and
         # through which descriptor. Everything downstream of the gather treats
         # A as an ordinary GEMM operand.
-        im2col = Im2colGather(im2col_plan, x)
+        im2col = Im2colGather(im2col_plan, x, ext)
 
         # B needs no gather at all: the weight is already a (K, CRS) matrix.
-        weights = WeightLoader(cfg, grid, geom, weight, W_BYTES)
+        weights = WeightLoader(cfg, kernel_grid, CRS, weight, W_BYTES)
 
         # And how C goes back: the epilogue's descriptors and copy atoms, built
         # here with the others; the store itself happens at the end.
-        scatter = OutputScatter(scatter_plan, y, bias, elem_ty)
+        scatter = OutputScatter(scatter_plan, y, bias, elem_ty, ext)
 
         lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek()
 
         tid = fx.Int32(gpu.thread_id("x"))
         # Which (M, N, K) tile this block owns: WGM swizzle or M chunking,
         # then grouped N, then split-K.
-        blk = block_coords(grid)
+        blk = block_coords(kernel_grid, grid_m)
 
         mma = MmaTiling(cfg, elem_ty, tid, lds, scratch=y)
         acc = mma.acc
@@ -249,13 +291,15 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         # while issuing the next DMA.
         PREFETCH = TILES_PER_BARRIER
         for s in range_constexpr(PREFETCH):
-            if const_expr(s < grid.tiles_per_split):
+            if const_expr(s < kernel_grid.tiles_per_split):
                 async_load_a_to_lds(s, s)
                 async_load_b_to_lds(s, s)
 
-        for kt_idx in range_constexpr(0, grid.tiles_per_split, TILES_PER_BARRIER):
+        for kt_idx in range_constexpr(
+            0, kernel_grid.tiles_per_split, TILES_PER_BARRIER
+        ):
             batch = range_constexpr(
-                kt_idx, min(kt_idx + TILES_PER_BARRIER, grid.tiles_per_split)
+                kt_idx, min(kt_idx + TILES_PER_BARRIER, kernel_grid.tiles_per_split)
             )
 
             barrier(vmcnt=0, lgkmcnt=0)
@@ -264,7 +308,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             issued = 0
             for k_tile in batch:
                 nxt = k_tile + PREFETCH
-                if const_expr(nxt < grid.tiles_per_split):
+                if const_expr(nxt < kernel_grid.tiles_per_split):
                     async_load_a_to_lds(nxt, nxt % cfg.pipe_stages)
                     async_load_b_to_lds(nxt, nxt % cfg.pipe_stages)
                     issued += cfg.ldg_a_count + cfg.ldg_b_count
@@ -282,27 +326,135 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             c_col=mma.c_col,
         )
 
-    @flyc.jit
-    def launch(
-        y: fx.Tensor,
-        x: fx.Tensor,
-        weight: fx.Tensor,
-        bias: fx.Tensor,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        conv3d_implicit_kernel(y, x, weight, bias).launch(
-            grid=(grid.grid_x, grid.grid_y, grid.grid_z),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
+    if const_expr(param.dyn_hw):
+        # The extents arrive as scalars. FlyDSL binds kernel parameters by
+        # name, so the fourteen are spelled out rather than packed behind a
+        # *args -- DynShapeArgs.FIELDS is the order, and reassembling one on
+        # both sides is what keeps the two in step.
+        @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
+        def conv3d_implicit_kernel(
+            y: fx.Tensor,
+            x: fx.Tensor,
+            weight: fx.Tensor,
+            bias: fx.Tensor,
+            d: fx.Int64,
+            h: fx.Int64,
+            w: fx.Int64,
+            wo: fx.Int64,
+            hw_o: fx.Int64,
+            dhw: fx.Int64,
+            npq: fx.Int64,
+            rcp_d: fx.Int64,
+            rcp_wo: fx.Int64,
+            rcp_hw_o: fx.Int64,
+            rcp_dhw: fx.Int64,
+            grid_m: fx.Int64,
+            x_elems: fx.Int64,
+            x_sample_elems: fx.Int64,
+        ):
+            s = DynShapeArgs(
+                d,
+                h,
+                w,
+                wo,
+                hw_o,
+                dhw,
+                npq,
+                rcp_d,
+                rcp_wo,
+                rcp_hw_o,
+                rcp_dhw,
+                grid_m,
+                x_elems,
+                x_sample_elems,
+            )
+            _body(y, x, weight, bias, dyn_extents(s, dyn_unit), s.grid_m)
+
+        @flyc.jit
+        def launch(
+            y: fx.Tensor,
+            x: fx.Tensor,
+            weight: fx.Tensor,
+            bias: fx.Tensor,
+            d: fx.Int64,
+            h: fx.Int64,
+            w: fx.Int64,
+            wo: fx.Int64,
+            hw_o: fx.Int64,
+            dhw: fx.Int64,
+            npq: fx.Int64,
+            rcp_d: fx.Int64,
+            rcp_wo: fx.Int64,
+            rcp_hw_o: fx.Int64,
+            rcp_dhw: fx.Int64,
+            grid_m: fx.Int64,
+            x_elems: fx.Int64,
+            x_sample_elems: fx.Int64,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            conv3d_implicit_kernel(
+                y,
+                x,
+                weight,
+                bias,
+                d,
+                h,
+                w,
+                wo,
+                hw_o,
+                dhw,
+                npq,
+                rcp_d,
+                rcp_wo,
+                rcp_hw_o,
+                rcp_dhw,
+                grid_m,
+                x_elems,
+                x_sample_elems,
+            ).launch(
+                # M is the only axis the resolution moves; chunking it is
+                # ruled out on this path (see the assert in compile), so
+                # grid.x is the tile count and z is the split alone.
+                grid=(grid_m, kernel_grid.grid_y, kernel_grid.splitk),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
+    else:
+
+        @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
+        def conv3d_implicit_kernel(
+            y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
+        ):
+            _body(y, x, weight, bias, static_extents(param, geom), None)
+
+        @flyc.jit
+        def launch(
+            y: fx.Tensor,
+            x: fx.Tensor,
+            weight: fx.Tensor,
+            bias: fx.Tensor,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            conv3d_implicit_kernel(y, x, weight, bias).launch(
+                grid=(grid.grid_x, grid.grid_y, grid.grid_z),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
 
     def _launch(y, x, weight, bias, stream=None):
         with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
-            return launch(y, x, weight, bias, stream=_as_stream(stream))
+            return launch(y, x, weight, bias, *extra_args, stream=_as_stream(stream))
 
     def _compile(y, x, weight, bias, stream=None):
         with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
-            return flyc.compile(launch, y, x, weight, bias, _as_stream(stream))
+            return flyc.compile(
+                launch, y, x, weight, bias, *extra_args, _as_stream(stream)
+            )
 
     _launch.compile = _compile
+    # The compiled function is called directly on the steady-state path (see
+    # ``conv_kernels._dispatch``), which bypasses this closure, so the extents
+    # have to be reachable from the object rather than captured here alone.
+    _launch.extra_args = extra_args
     return _launch

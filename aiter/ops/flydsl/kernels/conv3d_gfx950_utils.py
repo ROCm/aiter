@@ -120,6 +120,124 @@ def in_range(v, hi):
     return (v >= 0) & (v < fx.Int64(hi))
 
 
+# ---------------------------------------------------------------------------
+# Variable resolution: the extents that stop being compile-time constants
+#
+# Folding im2col's div/mod against the output extents is where much of this
+# kernel's performance comes from, and folding needs a literal divisor -- so
+# one artifact belongs to one D/H/W. Where the resolution is arbitrary that
+# is a JIT per new size, which is the cost this exists to remove.
+#
+# Magic-number division is the way out: the divisor arrives as a runtime
+# value carrying its own reciprocal, and the decomposition stays a multiply
+# and a shift -- the two constants move from immediates into kernargs, which
+# is the whole of the difference. ``Divisor`` presents the folded and the
+# magic form behind one interface so the gather and the epilogue keep one
+# body between them.
+#
+# Only the *integers* need this. ``big_in``, ``vec_store`` and the rest of
+# the addressing decisions are booleans, and a boolean left in the cache key
+# costs a constant number of variants rather than one per resolution.
+# ---------------------------------------------------------------------------
+
+
+def magic_u32(d: int):
+    """``(m, s)`` such that ``v // d == (v * m) >> (32 + s)``.
+
+    Holds for ``0 <= v < 2**31``, which is what the caller has to guarantee
+    (see ``MAX_DYN_DIVIDEND``). Round-up form: ``m = ceil(2**(32+s) / d)``
+    at the smallest ``s`` that keeps ``m`` inside 32 bits.
+    """
+    if d < 1:
+        raise ValueError(f"magic_u32 needs a positive divisor, got {d}")
+    for s in range(32):
+        if (1 << (32 + s)) >= d * (1 << 31):
+            break
+    m = ((1 << (32 + s)) + d - 1) // d
+    if m >= (1 << 32):
+        raise ValueError(f"magic for d={d} does not fit 32 bits")
+    return m, s
+
+
+# The bound magic_u32's derivation assumes of a dividend. Everything a Divisor
+# divides here is a GEMM row or a remainder of one, so all of them are under
+# npq and this is the same statement as "fewer than 2**31 output elements".
+MAX_DYN_DIVIDEND = 1 << 31
+
+
+class Divisor:
+    """A divisor that is either a compile-time constant or a runtime value.
+
+    The static form holds a Python int and lets the compiler fold ``//`` and
+    ``%`` exactly as it did before this layer existed. The dynamic form
+    carries a magic reciprocal and a shift, which turns the same
+    decomposition into a multiply and a shift. Both answer ``divmod``, so no
+    call site has to branch on which one it got.
+
+    Not a NamedTuple, and it must never reach a cache key: the dynamic form
+    holds fx runtime values whose repr differs per trace, so a key containing
+    one would never hit. What the compiler needs to know about the choice is
+    carried by the ``dyn_hw`` boolean instead.
+    """
+
+    __slots__ = ("_magic", "_shift", "is_static", "value")
+
+    def __init__(self, value, magic=None, shift=None):
+        self.value = value
+        self._magic = magic
+        self._shift = shift
+        self.is_static = magic is None
+
+    def divmod(self, v):
+        """``(v // self, v % self)``, both Int64."""
+        vi = fx.Int64(v)
+        if const_expr(self.is_static):
+            return vi // fx.Int64(self.value), vi % fx.Int64(self.value)
+        q = (vi * fx.Int64(self._magic)).shrui(fx.Int64(32) + fx.Int64(self._shift))
+        return q, vi - q * fx.Int64(self.value)
+
+    def div(self, v):
+        return self.divmod(v)[0]
+
+    def mod(self, v):
+        return self.divmod(v)[1]
+
+
+def static_divisor(value):
+    """The folded form, for a kernel compiled against one resolution."""
+    return Divisor(int(value))
+
+
+# A divisor's reciprocal travels as one scalar rather than two: the shift is
+# under 32 and the magic under 2**32, so ``magic << RCP_SHIFT_BITS | shift``
+# fits an i64 and halves the number of kernargs the extents need.
+RCP_SHIFT_BITS = 6
+RCP_SHIFT_MASK = (1 << RCP_SHIFT_BITS) - 1
+
+
+def pack_reciprocal(d: int) -> int:
+    """``magic_u32(d)`` as the single scalar the kernel unpacks.
+
+    A divisor of 1 has no 32-bit magic form -- it would need ``m == 2**32`` --
+    and needs none: dividing by it is the identity. Those are reported through
+    ``unit_divisors`` and keep the folded form, so the value here is never read.
+    """
+    if d == 1:
+        return 0
+    m, s = magic_u32(d)
+    return (m << RCP_SHIFT_BITS) | s
+
+
+def dyn_divisor(value, rcp):
+    """The magic form, from the divisor and its packed reciprocal."""
+    rcp_i = fx.Int64(rcp)
+    return Divisor(
+        value,
+        magic=rcp_i.shrui(fx.Int64(RCP_SHIFT_BITS)),
+        shift=rcp_i & fx.Int64(RCP_SHIFT_MASK),
+    )
+
+
 def dil(tap, factor):
     """Scale a filter tap by its dilation, folding the factor away when it is 1."""
     return tap * factor if const_expr(factor != 1) else tap
@@ -271,8 +389,12 @@ class WeightLoader:
     kernel's, the columns are the block's.
     """
 
-    def __init__(self, cfg, grid, geom, weight, w_bytes):
-        self._cfg, self._grid, self._crs = cfg, grid, geom.crs
+    def __init__(self, cfg, grid, crs, weight, w_bytes):
+        # ``crs`` rather than the whole geometry: it is the only field this
+        # needs, and it follows from C/groups and the filter, so taking it
+        # alone keeps the output extents out of the kernel's closure -- which
+        # is what lets one artifact serve several resolutions.
+        self._cfg, self._grid, self._crs = cfg, grid, crs
         self._src = flat_buffer_view(
             fx.get_iter(weight), w_bytes // BF16_BYTES, w_bytes
         )
@@ -501,6 +623,213 @@ def make_conv_geometry(param):
     )
 
 
+class ConvExtents:
+    """The extents the gather and the epilogue actually address against.
+
+    What separates this from ``ConvGeometry`` is when the values are known:
+    a ``ConvGeometry`` is compile-time and reaches the cache key, while this
+    is what the kernel body reads and may hold either Python ints or fx
+    runtime scalars. The field names and the division interface are the same
+    either way, which is what keeps one body across both.
+
+    ``static_extents`` copies a ``ConvGeometry`` straight across with folded
+    divisors, so a kernel that does not opt into variable resolution compiles
+    to what it did before this layer existed.
+
+    Never reaches a cache key, for the reason ``Divisor`` gives.
+    """
+
+    __slots__ = (
+        "d",
+        "dhw",
+        "div_d",
+        "div_dhw",
+        "div_hw_o",
+        "div_wo",
+        "do",
+        "h",
+        "ho",
+        "hw_o",
+        "is_static",
+        "npq",
+        "w",
+        "wo",
+        "x_elems",
+        "x_sample_elems",
+    )
+
+    def __init__(
+        self,
+        *,
+        d,
+        h,
+        w,
+        do,
+        ho,
+        wo,
+        dhw,
+        hw_o,
+        npq,
+        x_elems,
+        x_sample_elems,
+        div_d,
+        div_dhw,
+        div_hw_o,
+        div_wo,
+        is_static,
+    ):
+        self.d, self.h, self.w = d, h, w
+        self.do, self.ho, self.wo = do, ho, wo
+        self.dhw, self.hw_o, self.npq = dhw, hw_o, npq
+        self.x_elems = x_elems
+        self.x_sample_elems = x_sample_elems
+        self.div_d = div_d
+        self.div_dhw = div_dhw
+        self.div_hw_o = div_hw_o
+        self.div_wo = div_wo
+        self.is_static = is_static
+
+
+def static_extents(param, geom):
+    """The compile-time form: every extent and every divisor is a literal."""
+    return ConvExtents(
+        d=param.d,
+        h=param.h,
+        w=param.w,
+        do=geom.do,
+        ho=geom.ho,
+        wo=geom.wo,
+        dhw=geom.dhw,
+        hw_o=geom.hw_o,
+        npq=geom.npq,
+        x_elems=param.n * param.c * param.d * param.h * param.w,
+        x_sample_elems=param.c * param.d * param.h * param.w,
+        # Only the temporal_only_fast path divides by d, but a folded divisor
+        # costs nothing to build for the paths that do not.
+        div_d=static_divisor(param.d),
+        div_dhw=static_divisor(geom.dhw),
+        div_hw_o=static_divisor(geom.hw_o),
+        div_wo=static_divisor(geom.wo),
+        is_static=True,
+    )
+
+
+class DynShapeArgs:
+    """The runtime scalars a variable-resolution kernel takes on top of its
+    four tensors.
+
+    Field order is the kernel's parameter order and also the order
+    ``dyn_shape_values`` produces on the host; both read it off ``FIELDS`` so
+    adding an extent cannot update one side only.
+    """
+
+    FIELDS = (
+        "d",
+        "h",
+        "w",
+        "wo",
+        "hw_o",
+        "dhw",
+        "npq",
+        "rcp_d",
+        "rcp_wo",
+        "rcp_hw_o",
+        "rcp_dhw",
+        "grid_m",
+        "x_elems",
+        "x_sample_elems",
+    )
+
+    __slots__ = FIELDS
+
+    def __init__(self, *values):
+        if len(values) != len(self.FIELDS):
+            raise ValueError(
+                f"DynShapeArgs takes {len(self.FIELDS)} values, got {len(values)}"
+            )
+        for name, v in zip(self.FIELDS, values):
+            setattr(self, name, v)
+
+
+def dyn_shape_values(param, geom, grid):
+    """The values behind ``DynShapeArgs``, in ``FIELDS`` order.
+
+    ``param`` has to be the one carrying the *real* d/h/w: what the kernel
+    closure holds under variable resolution is the zeroed stand-in, which
+    would derive the wrong geometry here.
+    """
+    if geom.npq >= MAX_DYN_DIVIDEND:
+        raise ValueError(
+            f"npq={geom.npq} reaches the {MAX_DYN_DIVIDEND} bound the magic-number "
+            "division assumes; this shape has to stay on the static path"
+        )
+    x_sample_elems = param.c * param.d * param.h * param.w
+    return (
+        param.d,
+        param.h,
+        param.w,
+        geom.wo,
+        geom.hw_o,
+        geom.dhw,
+        geom.npq,
+        pack_reciprocal(param.d),
+        pack_reciprocal(geom.wo),
+        pack_reciprocal(geom.hw_o),
+        pack_reciprocal(geom.dhw),
+        grid.grid_m,
+        param.n * x_sample_elems,
+        x_sample_elems,
+    )
+
+
+def unit_divisors(param, geom):
+    """Which of the four dynamic divisors are 1, as a compile-time tuple.
+
+    A unit divisor keeps the folded form (see ``pack_reciprocal``), and which
+    ones are unit follows from the layer rather than the resolution -- a 2D
+    conv has ``d == 1`` at every size -- so putting these four booleans in the
+    cache key costs a constant number of artifacts.
+
+    Order matches ``dyn_extents``: (d, wo, hw_o, dhw).
+    """
+    return (param.d == 1, geom.wo == 1, geom.hw_o == 1, geom.dhw == 1)
+
+
+def dyn_extents(s, unit=(False, False, False, False)):
+    """The runtime form, assembled from the scalars the kernel was handed.
+
+    ``s`` is a ``DynShapeArgs``: the host already derived every extent and
+    its magic reciprocal, so all this does is pair them into ``Divisor``s.
+    ``unit`` is ``unit_divisors``' answer, which decides per divisor between
+    the magic form and the identity the folded form collapses to.
+    """
+    unit_d, unit_wo, unit_hw_o, unit_dhw = unit
+
+    def _div(is_unit, value, rcp):
+        return static_divisor(1) if is_unit else dyn_divisor(value, rcp)
+
+    return ConvExtents(
+        d=s.d,
+        h=s.h,
+        w=s.w,
+        # do and ho only shape the grid, which the host already sized, so the
+        # kernel never reads them back.
+        do=None,
+        ho=None,
+        wo=s.wo,
+        dhw=s.dhw,
+        hw_o=s.hw_o,
+        npq=s.npq,
+        x_elems=s.x_elems,
+        x_sample_elems=s.x_sample_elems,
+        div_d=_div(unit_d, s.d, s.rcp_d),
+        div_dhw=_div(unit_dhw, s.dhw, s.rcp_dhw),
+        div_hw_o=_div(unit_hw_o, s.hw_o, s.rcp_hw_o),
+        div_wo=_div(unit_wo, s.wo, s.rcp_wo),
+        is_static=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # How the work is spread over blocks, and what each block owns
 #
@@ -636,14 +965,21 @@ class BlockCoords(NamedTuple):
     k_off: object
 
 
-def block_coords(grid):
+def block_coords(grid, grid_m=None):
     """Decode this block's ids into the tile it owns.
 
     ``n_local`` is the column within the group and ``n_offset`` the global
     one; they differ only for a grouped conv, where the N grid is per group.
     ``ch_base`` is the group's first input channel, which only the gather
     needs, and is None when there is one group.
+
+    ``grid_m`` overrides the tile count along M, which the WGM swizzle needs
+    as a number. It is the one part of the grid that follows from the
+    resolution, so a variable-resolution kernel passes the runtime value and
+    everything else keeps reading the compile-time grid.
     """
+    if const_expr(grid_m is None):
+        grid_m = grid.grid_m
     if const_expr(grid.m_chunks > 1):
         m_chunk = fx.Int64(gpu.block_id("z")) % fx.Int64(grid.m_chunks)
         m_offset = (
@@ -652,13 +988,13 @@ def block_coords(grid):
         n_tile = fx.Int32(gpu.block_id("y"))
     elif const_expr(grid.wgm > 1):
         pid = fx.Int64(gpu.block_id("x")) + fx.Int64(gpu.block_id("y")) * fx.Int64(
-            grid.grid_m
+            grid_m
         )
         blocks_per_swizzle = fx.Int64(grid.wgm * grid.grid_y)
         swizzle_id = pid // blocks_per_swizzle
         first_m = swizzle_id * fx.Int64(grid.wgm)
         # The last swizzle group is short when grid_m is not a multiple of WGM.
-        swizzle_rows = fx.min(fx.Int64(grid.grid_m) - first_m, fx.Int64(grid.wgm))
+        swizzle_rows = fx.min(fx.Int64(grid_m) - first_m, fx.Int64(grid.wgm))
         local = pid % blocks_per_swizzle
         m_offset = (first_m + (local % swizzle_rows)) * grid.tile_m
         n_tile = local // swizzle_rows
@@ -723,24 +1059,36 @@ class OutputScatterPlan(NamedTuple):
     that is not a scalar or a tuple silently drops out of that key.
     """
 
-    n: int
+    # The batch reaches the epilogue only through this: whether a row has to
+    # be split back into (sample, position) before it can be addressed. The
+    # predicate rather than the count, so a batch size cannot split the
+    # artifact the way an extent would -- and false for NDHWC output, where
+    # the row already *is* the offset and the batch never enters the
+    # arithmetic at all.
+    #
+    # Collapsing this into the split-always form was measured and dropped: it
+    # is correct on its own, but ``vec_store`` below keeps N in the key
+    # regardless, so the divmod it adds to the single-sample case buys
+    # nothing.
+    needs_sample_split: bool
     k: int
     kg: int
     groups: int
     out_ndhwc: bool
     has_bias: bool
 
-    # The grid C is produced on, shared with the gather and the launch config.
-    geom: ConvGeometry
+    # The output extents C is scattered against are absent for the same reason
+    # they are absent from ``Im2colPlan``: they are what a variable-resolution
+    # kernel reads at runtime, and they arrive as ``ConvExtents``.
 
     # MFMA atoms per wave along M and N: the epilogue walks them.
     mi_m: int
     mi_n: int
 
-    # How the store is done, decided once below.
+    # How the store is done, decided once below. Booleans, so they cost a
+    # constant number of artifacts rather than one per resolution.
     use_splitk: bool
     big_out: bool
-    y_bytes: int
     row_chk: bool
     n_tail: bool
     need_chk: bool
@@ -762,7 +1110,6 @@ def make_output_scatter_plan(param, geom, cfg, grid):
     npq, dhw = geom.npq, geom.dhw
 
     big_out = (n * k * geom.do * geom.ho * geom.wo * BF16_BYTES) > 0x7FFFFFFF
-    y_bytes = npq * k * (4 if use_splitk else BF16_BYTES)
 
     assert (
         not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
@@ -770,18 +1117,16 @@ def make_output_scatter_plan(param, geom, cfg, grid):
 
     need_chk = row_chk or n_tail
     return OutputScatterPlan(
-        n=n,
+        needs_sample_split=(not out_ndhwc) and n > 1,
         k=k,
         kg=kg,
         groups=param.groups,
         out_ndhwc=out_ndhwc,
         has_bias=param.has_bias,
-        geom=geom,
         mi_m=mi_m,
         mi_n=mi_n,
         use_splitk=use_splitk,
         big_out=big_out,
-        y_bytes=y_bytes,
         row_chk=row_chk,
         n_tail=n_tail,
         need_chk=need_chk,
@@ -792,6 +1137,9 @@ def make_output_scatter_plan(param, geom, cfg, grid):
         # The four values of an MFMA atom are consecutive rows, so they are
         # only contiguous in memory where a row's neighbour is the next
         # spatial position: NCDHW, one sample, one store, no staging.
+        # ``n == 1`` is not conservatism: extending the vectorised store to a
+        # batch was tried and produced wrong results, so the four rows of an
+        # atom cannot be assumed contiguous once samples are stacked.
         vec_store=(
             (n == 1)
             and (not use_splitk)
@@ -810,12 +1158,16 @@ class OutputScatter:
     separate bind.
     """
 
-    def __init__(self, plan, y, bias, elem_ty):
+    def __init__(self, plan, y, bias, elem_ty, ext):
         self._plan = plan
+        self._ext = ext
         self._y = y
         self._elem_ty = elem_ty
 
-        y_buf = fx.rocdl.make_buffer_tensor(y, num_records_bytes=plan.y_bytes)
+        # fp32 while split-K stages through it, bf16 once it is the output.
+        y_elems = ext.npq * plan.k
+        y_bytes = y_elems * (4 if plan.use_splitk else BF16_BYTES)
+        y_buf = fx.rocdl.make_buffer_tensor(y, num_records_bytes=y_bytes)
         if const_expr(plan.use_splitk):
             # buffer_atomic_add needs the raw !llvm.ptr<8> descriptor, not a tensor.
             self._y_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(y_buf))
@@ -824,7 +1176,7 @@ class OutputScatter:
                 fx.Tensor(
                     fx.make_view(
                         fx.get_iter(y_buf),
-                        fx.make_layout(plan.geom.npq * plan.k, 1),
+                        fx.make_layout(y_elems, 1),
                     )
                 ),
                 fx.make_layout(1, 1),
@@ -871,7 +1223,7 @@ class OutputScatter:
 
                 if const_expr(plan.vec_store):
                     row0 = fx.Int64(row_base)
-                    off_nk0 = col * plan.geom.dhw + row0
+                    off_nk0 = col * fx.Int64(self._ext.dhw) + row0
 
                     def _emit_vec():
                         vals = []
@@ -959,22 +1311,22 @@ class OutputScatter:
 
     def _off_nk(self, row, col, off_sk):
         """The GEMM's (row, col) as an element offset into y."""
-        plan = self._plan
-        dhw = plan.geom.dhw
+        plan, ext = self._plan, self._ext
         # NDHWC is already (npq, k) row-major, so the scatter is off_sk.
         if const_expr(plan.out_ndhwc):
             return off_sk
-        if const_expr(plan.n == 1):
+        dhw = fx.Int64(ext.dhw)
+        if const_expr(not plan.needs_sample_split):
             return col * dhw + row
-        n_idx = row // dhw
-        return n_idx * (plan.k * dhw) + col * dhw + (row % dhw)
+        n_idx, row_in_sample = ext.div_dhw.divmod(row)
+        return n_idx * (fx.Int64(plan.k) * dhw) + col * dhw + row_in_sample
 
     def _valid(self, row, col_loc):
         plan = self._plan
         if const_expr(plan.row_chk and plan.n_tail):
-            return (row < fx.Int64(plan.geom.npq)) & (col_loc < fx.Int64(plan.kg))
+            return (row < fx.Int64(self._ext.npq)) & (col_loc < fx.Int64(plan.kg))
         if const_expr(plan.row_chk):
-            return row < fx.Int64(plan.geom.npq)
+            return row < fx.Int64(self._ext.npq)
         return col_loc < fx.Int64(plan.kg)
 
     def _route(self, off, row, col_loc):

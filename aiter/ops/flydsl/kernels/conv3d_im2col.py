@@ -31,7 +31,6 @@ from .conv3d_gfx950_utils import (
     LDG_VEC,
     OOB_SENTINEL_BYTES,
     OOB_SENTINEL_ELEM,
-    ConvGeometry,
     TileConfig,
     dil,
     flat_buffer_view,
@@ -43,6 +42,17 @@ PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 
 # num_records of a rebased BIG_IN resource: the most a 32-bit voffset reaches.
 BIG_IN_NR = 0x80000000
+
+
+def _bytes_of(elems):
+    """Element count -> byte count, as a literal where the count is one.
+
+    num_records is a plain integer to the descriptor, so a literal stays an
+    immediate and a runtime extent becomes the scalar it is.
+    """
+    return (
+        elems * BF16_BYTES if isinstance(elems, int) else fx.Int32(elems) * BF16_BYTES
+    )
 
 
 class Im2colPlan(NamedTuple):
@@ -64,10 +74,13 @@ class Im2colPlan(NamedTuple):
 
     # Input and filter. Flat rather than the param struct they come from,
     # because only tuples and scalars reach the cache key (see above).
+    #
+    # The input's spatial extents are deliberately absent: they are the one
+    # part of the problem that a variable-resolution kernel reads at runtime,
+    # so they travel in ``ConvExtents`` instead. Holding them here would put
+    # them back in the cache key and give every resolution its own artifact,
+    # which is what that mode exists to avoid.
     c: int
-    d: int
-    h: int
-    w: int
     kh: int
     kw: int
     st: int
@@ -82,23 +95,27 @@ class Im2colPlan(NamedTuple):
     pad_mode: str
     groups: int
 
-    # The output grid the rows decompose against. Nested, which a NamedTuple
-    # may be: it is a tuple, so its own fields still reach the cache key.
-    geom: ConvGeometry
+    # The two parts of ``ConvGeometry`` the gather needs, flattened out. Both
+    # follow from C/groups and the filter, never from the resolution, so they
+    # stay compile-time while the output extents next to them in the geometry
+    # do not; holding the whole struct would drag those along.
+    cgp: int
+    crs: int
 
     # The A tile this gather fills. Nested, which a NamedTuple may be: it is
     # a tuple, so its own fields still reach the cache key.
     cfg: TileConfig
 
-    # Addressing decisions derived from the above.
+    # Addressing decisions derived from the above. All booleans, and that is
+    # what keeps them here: a boolean in the key costs a constant number of
+    # artifacts, while the extent it was derived from would cost one per
+    # resolution. The host derives them from the real shape either way.
     temporal_only_fast: bool
     scalar_k: bool
     big_in: bool
     big_in_n1: bool
     big_in_nm: bool
     t_aligned: bool
-    x_bytes: int
-    x_sample_elems: int
 
 
 def make_im2col_plan(param, geom, cfg):
@@ -171,9 +188,6 @@ def make_im2col_plan(param, geom, cfg):
 
     return Im2colPlan(
         c=c,
-        d=d,
-        h=h,
-        w=w,
         kh=kh,
         kw=kw,
         st=st,
@@ -187,7 +201,8 @@ def make_im2col_plan(param, geom, cfg):
         dw=dw,
         pad_mode=pad_mode,
         groups=groups,
-        geom=geom,
+        cgp=geom.cgp,
+        crs=geom.crs,
         cfg=cfg,
         # A 1x1 filter at unit stride and no spatial padding leaves the H and W
         # taps fixed, so the row's own offset already addresses them and only
@@ -212,8 +227,6 @@ def make_im2col_plan(param, geom, cfg):
         big_in_n1=big_in_n1,
         big_in_nm=big_in_nm,
         t_aligned=t_aligned,
-        x_bytes=x_bytes,
-        x_sample_elems=x_sample_elems,
     )
 
 
@@ -228,8 +241,9 @@ class Im2colGather:
     A vector for the caller to DMA.
     """
 
-    def __init__(self, plan, x):
+    def __init__(self, plan, x, ext):
         self._plan = plan
+        self._ext = ext
         self._x = x
         self._tid = self._ch_base = None
         self._nbase = self._base_t = self._base_h = None
@@ -239,9 +253,7 @@ class Im2colGather:
         self._x_src = (
             None
             if const_expr(plan.big_in)
-            else flat_buffer_view(
-                fx.get_iter(x), plan.x_bytes // BF16_BYTES, plan.x_bytes
-            )
+            else flat_buffer_view(fx.get_iter(x), ext.x_elems, _bytes_of(ext.x_elems))
         )
 
     def bind_block(self, tid, m_offset, ch_base=None):
@@ -257,14 +269,14 @@ class Im2colGather:
     def taps(self, k_base):
         """Yield ``(i, src, voff)`` per A vector of the K tile at ``k_base``."""
         assert self._rows is not None, "bind_block() before taps()"
-        plan, geom, cfg = self._plan, self._plan.geom, self._plan.cfg
+        plan, cfg = self._plan, self._plan.cfg
         kbase_i = fx.Int64(k_base)
         cc_base = ckk_base = None
         if const_expr(plan.scalar_k):
-            cc_base = kbase_i % geom.cgp
+            cc_base = kbase_i % plan.cgp
             if const_expr(plan.groups > 1):
                 cc_base = self._ch_base + cc_base
-            ckk_base = kbase_i // geom.cgp
+            ckk_base = kbase_i // plan.cgp
         for i in range_constexpr(cfg.ldg_a_count):
             g_off, valid, sample = self._tap_addr(i, kbase_i, cc_base, ckk_base)
             yield (
@@ -279,30 +291,29 @@ class Im2colGather:
         return flat_buffer_view(ptr, BIG_IN_NR // BF16_BYTES, BIG_IN_NR)
 
     def _rebase_on_tile(self, m_offset):
-        plan, geom = self._plan, self._plan.geom
-        self._nbase = m_offset // geom.dhw
-        rem0 = m_offset % geom.dhw
-        ot_base0 = rem0 // geom.hw_o
+        plan, ext = self._plan, self._ext
+        self._nbase, rem0 = ext.div_dhw.divmod(m_offset)
+        ot_base0, rem1 = ext.div_hw_o.divmod(rem0)
 
         self._base_t = fx.max(
             ot_base0 * fx.Int64(plan.st) - fx.Int64(plan.pt), fx.Int64(0)
         )
         if const_expr(plan.t_aligned):
-            oh_base0 = (rem0 % geom.hw_o) // geom.wo
+            oh_base0 = ext.div_wo.div(rem1)
             self._base_h = fx.max(
                 oh_base0 * fx.Int64(plan.sh) - fx.Int64(plan.ph), fx.Int64(0)
             )
         else:
             self._base_h = fx.Int64(0)
-        base_row = (self._nbase * fx.Int64(plan.d) + self._base_t) * fx.Int64(
-            plan.h
+        base_row = (self._nbase * fx.Int64(ext.d) + self._base_t) * fx.Int64(
+            ext.h
         ) + self._base_h
-        x_base_elem = base_row * fx.Int64(plan.w) * fx.Int64(plan.c)
+        x_base_elem = base_row * fx.Int64(ext.w) * fx.Int64(plan.c)
         self._x_src = self._rebased(fx.Int64(x_base_elem))
 
     def _tap_src(self, sample):
         if const_expr(self._plan.big_in_nm):
-            return self._rebased(fx.Int64(sample) * fx.Int64(self._plan.x_sample_elems))
+            return self._rebased(fx.Int64(sample) * fx.Int64(self._ext.x_sample_elems))
         return self._x_src
 
     def _decode_rows(self, m_offset):
@@ -311,24 +322,21 @@ class Im2colGather:
         Held as the input coordinate each of those taps starts from, since the
         filter tap is all that is added per K tile.
         """
-        plan, geom, cfg = self._plan, self._plan.geom, self._plan.cfg
+        plan, ext, cfg = self._plan, self._ext, self._plan.cfg
         rows = []
         for i in range_constexpr(cfg.ldg_a_count):
             linear = (self._tid + i * cfg.block_threads) * LDG_VEC
             local_m = linear // cfg.tile_k
             local_k = linear % cfg.tile_k
             row = m_offset + local_m
-            row_valid = row < fx.Int64(geom.npq)
+            row_valid = row < fx.Int64(ext.npq)
             if const_expr(plan.temporal_only_fast):
-                out_t = (row // geom.hw_o) % plan.d
+                out_t = ext.div_d.mod(ext.div_hw_o.div(row))
                 rows.append((local_k, row, row_valid, out_t))
             else:
-                n_idx = row // geom.dhw
-                rem = row % geom.dhw
-                ot = rem // geom.hw_o
-                rem2 = rem % geom.hw_o
-                oh = rem2 // geom.wo
-                ow = rem2 % geom.wo
+                n_idx, rem = ext.div_dhw.divmod(row)
+                ot, rem2 = ext.div_hw_o.divmod(rem)
+                oh, ow = ext.div_wo.divmod(rem2)
                 in_t0 = ot * plan.st - plan.pt
                 in_h0 = oh * plan.sh - plan.ph
                 in_w0 = ow * plan.sw - plan.pw
@@ -338,30 +346,39 @@ class Im2colGather:
                 rows.append((local_k, row_valid, n_or_di, in_t0, in_h0, in_w0))
         return rows
 
-    def _pad_coord(self, v, ext, pad):
+    def _pad_coord(self, v, extent, pad):
         """Tap coordinate -> in-bounds input coordinate; returns (coord, mask).
 
         "zeros" leaves the coordinate alone and returns a range mask, which the
         caller folds into the OOB-sentinel routing so the load reads as zero. Every
-        other mode resolves the coordinate into [0, ext) instead and returns no mask
+        other mode resolves the coordinate into [0, extent) instead and returns no
+        mask.
+
+        ``extent`` is one of the input's spatial sizes, so it is a literal on the
+        static path and a runtime scalar under variable resolution. Every term it
+        appears in is built through fx, which folds back to the same immediates
+        when it is a literal.
         """
         pad_mode = self._plan.pad_mode
+        ext_i = fx.Int64(extent)
         if const_expr(pad_mode == "zeros"):
-            return v, in_range(v, ext)
+            return v, in_range(v, ext_i)
         u = v + fx.Int64(pad)
         low = u < fx.Int64(pad)  # v < 0
-        high = u >= fx.Int64(pad + ext)  # v >= ext
+        high = u >= fx.Int64(pad) + ext_i  # v >= extent
         mid = u - fx.Int64(pad)  # v, where in range
         if const_expr(pad_mode == "replicate"):
-            r = high.select(fx.Int64(ext - 1), mid)
+            r = high.select(ext_i - fx.Int64(1), mid)
             r = low.select(fx.Int64(0), r)
         elif const_expr(pad_mode == "reflect"):
-            # [a b c d e] pad 2 -> [c b a b c d e d c]: -v near, 2*(ext-1) - v far.
-            r = high.select(fx.Int64(2 * (ext - 1) + pad) - u, mid)
+            # [a b c d e] pad 2 -> [c b a b c d e d c]: -v near, 2*(extent-1) - v far.
+            r = high.select(
+                (ext_i - fx.Int64(1)) * fx.Int64(2) + fx.Int64(pad) - u, mid
+            )
             r = low.select(fx.Int64(pad) - u, r)
-        else:  # circular: v + ext near, v - ext far
-            r = high.select(u - fx.Int64(pad + ext), mid)
-            r = low.select(u + fx.Int64(ext - pad), r)
+        else:  # circular: v + extent near, v - extent far
+            r = high.select(u - fx.Int64(pad) - ext_i, mid)
+            r = low.select(u + ext_i - fx.Int64(pad), r)
         return r, None
 
     def _tap_addr(self, i, kbase_i, cc_base, ckk_base):
@@ -373,23 +390,23 @@ class Im2colGather:
         offset within the group. ``sample`` is which sample to rebase on, and
         only the per-sample descriptor path has one.
         """
-        plan, geom = self._plan, self._plan.geom
+        plan, ext = self._plan, self._ext
         dec = self._rows[i]
         local_k = dec[0]
         k_abs = kbase_i + fx.Int64(local_k)
         if const_expr(plan.scalar_k):
             cc = cc_base + fx.Int64(local_k)  # cc_base already carries ch_base
         else:
-            cc = k_abs % geom.cgp
+            cc = k_abs % plan.cgp
             if const_expr(plan.groups > 1):
                 cc = self._ch_base + cc
-        k_valid = k_abs < fx.Int64(geom.crs)
+        k_valid = k_abs < fx.Int64(plan.crs)
 
         if const_expr(plan.temporal_only_fast):
             _, row, row_valid, out_t = dec
-            kt_i = ckk_base if const_expr(plan.scalar_k) else k_abs // geom.cgp
+            kt_i = ckk_base if const_expr(plan.scalar_k) else k_abs // plan.cgp
             temporal_delta = dil(kt_i, plan.dt) - plan.pt
-            in_t, m_t = self._pad_coord(out_t + temporal_delta, plan.d, plan.pt)
+            in_t, m_t = self._pad_coord(out_t + temporal_delta, ext.d, plan.pt)
             valid = gather_valid(row_valid & k_valid, m_t)
 
             delta = (
@@ -399,33 +416,36 @@ class Im2colGather:
             )
             if const_expr(plan.big_in_n1):
                 g_off = (
-                    (row + delta * geom.hw_o)
-                    - (fx.Int64(self._nbase) * geom.dhw + self._base_t * geom.hw_o)
+                    (row + delta * ext.hw_o)
+                    - (fx.Int64(self._nbase) * ext.dhw + self._base_t * ext.hw_o)
                 ) * plan.c + cc
             else:
-                g_off = (row + delta * geom.hw_o) * plan.c + cc
+                g_off = (row + delta * ext.hw_o) * plan.c + cc
             return fx.Int32(g_off), valid, None
 
-        ckk = ckk_base if const_expr(plan.scalar_k) else k_abs // geom.cgp
+        ckk = ckk_base if const_expr(plan.scalar_k) else k_abs // plan.cgp
         kw_i = ckk % plan.kw
         ckk2 = ckk // plan.kw
         kh_i = ckk2 % plan.kh
         kt_i = ckk2 // plan.kh
         _, row_valid, n_or_di, in_t0, in_h0, in_w0 = dec
-        in_t, m_t = self._pad_coord(in_t0 + dil(kt_i, plan.dt), plan.d, plan.pt)
-        in_h, m_h = self._pad_coord(in_h0 + dil(kh_i, plan.dh), plan.h, plan.ph)
-        in_w, m_w = self._pad_coord(in_w0 + dil(kw_i, plan.dw), plan.w, plan.pw)
+        in_t, m_t = self._pad_coord(in_t0 + dil(kt_i, plan.dt), ext.d, plan.pt)
+        in_h, m_h = self._pad_coord(in_h0 + dil(kh_i, plan.dh), ext.h, plan.ph)
+        in_w, m_w = self._pad_coord(in_w0 + dil(kw_i, plan.dw), ext.w, plan.pw)
         valid = gather_valid(row_valid & k_valid, m_t, m_h, m_w)
         if const_expr(plan.big_in_n1):
             row_off = (
-                (n_or_di * plan.d + (in_t - self._base_t)) * plan.h
+                (n_or_di * fx.Int64(ext.d) + (in_t - self._base_t)) * fx.Int64(ext.h)
                 + (in_h - self._base_h)
-            ) * plan.w + in_w
+            ) * fx.Int64(ext.w) + in_w
             return fx.Int32(row_off * plan.c + cc), valid, None
         if const_expr(plan.big_in_nm):
-            g_off = ((in_t * plan.h + in_h) * plan.w + in_w) * plan.c + cc
+            g_off = (
+                (in_t * fx.Int64(ext.h) + in_h) * fx.Int64(ext.w) + in_w
+            ) * plan.c + cc
             return fx.Int32(g_off), valid, n_or_di
         g_off = (
-            ((n_or_di * plan.d + in_t) * plan.h + in_h) * plan.w + in_w
-        ) * plan.c + cc
+            (n_or_di * fx.Int64(ext.d) + in_t) * fx.Int64(ext.h) + in_h
+        ) * fx.Int64(ext.w) + in_w
+        g_off = g_off * plan.c + cc
         return fx.Int32(g_off), valid, None

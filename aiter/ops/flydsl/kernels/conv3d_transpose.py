@@ -39,8 +39,19 @@ TR_MAX_BIG_S = (0x7FFFFFFF - (TR_TILE - TR_VEC)) // (TR_TILE - 1)
 
 @functools.lru_cache(maxsize=64)
 def compile_transpose_ncdhw_ndhwc(n, c, s):
-    """Transpose flat (N, C, S) -> (N, S, C) (S == T*H*W). Requires c%8==0."""
-    grid_s = (s + TR_TILE - 1) // TR_TILE
+    """Transpose flat (N, C, S) -> (N, S, C) (S == T*H*W). Requires c%8==0.
+
+    S is a kernel operand rather than a compile-time constant, so one
+    artifact serves every resolution of a layer -- the counterpart to the
+    convolution's ``dyn_hw``, and unconditional here because it is nearly
+    free: nothing divides by S (the only division is by ``_TR_VPL``, a tile
+    constant), so it stays an operand of multiplies that were never going to
+    fold into anything cheaper. ``n`` and ``c`` remain compile-time; neither
+    moves with the resolution.
+
+    ``s`` is still an argument and must be the real one: ``BIG`` is derived
+    from it, and it seeds the launch. It simply does not reach the kernel.
+    """
     grid_c = (c + TR_TILE - 1) // TR_TILE
     elem_ty = fx.BFloat16
     BIG = (n * c * s) > 0x7FFFFFFF
@@ -48,7 +59,6 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
     # 1-D element view so the flat gather/scatter offsets index elements. Both
     # descriptors stay max_size: an exact num_records would zero the whole
     # straddling tail read.
-    _TR_FLAT = n * c * s
     _TR_REBASED_FLAT = 0xFFFFFFFF // BF16_BYTES
 
     def _flat_div(buf_ptr, elems):
@@ -62,7 +72,7 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
         tile: fx.Array[elem_ty, TR_TILE * _TR_LDS_S, 16]
 
     @flyc.kernel(known_block_size=[TR_THREADS, 1, 1])
-    def transpose_kernel(out: fx.Tensor, inp: fx.Tensor):
+    def transpose_kernel(out: fx.Tensor, inp: fx.Tensor, s: fx.Int32):
         lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek().tile
 
         class BF16Ty:
@@ -102,8 +112,9 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
         else:
             in_base = nb * c * s
             out_base = nb * s * c
-            in_div = _flat_div(fx.get_iter(fx.rocdl.make_buffer_tensor(inp)), _TR_FLAT)
-            out_div = _flat_div(fx.get_iter(fx.rocdl.make_buffer_tensor(out)), _TR_FLAT)
+            flat = n * c * s
+            in_div = _flat_div(fx.get_iter(fx.rocdl.make_buffer_tensor(inp)), flat)
+            out_div = _flat_div(fx.get_iter(fx.rocdl.make_buffer_tensor(out)), flat)
         tr_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
         tr_reg = fx.make_rmem_tensor(TR_VEC, elem_ty)
 
@@ -167,23 +178,29 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
     def launch_transpose(
         out: fx.Tensor,
         inp: fx.Tensor,
+        s_rt: fx.Int32,
         # flydsl's launcher signature convention; the default is the DSL's
         # null-stream sentinel, not a live handle captured at import.
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        transpose_kernel(out, inp).launch(
-            grid=(grid_s, grid_c, n),
+        transpose_kernel(out, inp, s_rt).launch(
+            # S is the only grid axis the resolution moves, so it is sized
+            # here rather than baked in.
+            grid=((s_rt + (TR_TILE - 1)) // TR_TILE, grid_c, n),
             block=(TR_THREADS, 1, 1),
             stream=stream,
         )
 
     def _launch(out, inp, stream=None):
         with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
-            return launch_transpose(out, inp, stream=_as_stream(stream))
+            return launch_transpose(out, inp, s, stream=_as_stream(stream))
 
     def _compile(out, inp, stream=None):
         with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
-            return flyc.compile(launch_transpose, out, inp, _as_stream(stream))
+            return flyc.compile(launch_transpose, out, inp, s, _as_stream(stream))
 
     _launch.compile = _compile
+    # Reachable from the object because the steady-state path calls the
+    # compiled function directly; see ``conv_kernels._dispatch``.
+    _launch.extra_args = (s,)
     return _launch

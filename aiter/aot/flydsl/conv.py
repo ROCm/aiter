@@ -31,11 +31,24 @@ not a compile-time parameter: it only decides whether the host runs the
 pre-transpose, so ``NDHWC -> NCDHW`` is served by the same artifact as
 ``NCDHW -> NCDHW``. That makes this 2 variants per row rather than 4.
 
-Coverage is otherwise exactly the CSV, with no generalisation.
-``compile_conv3d_implicit`` takes the whole problem shape as compile-time
-constants -- the im2col div/mod folding against ``(kT, kH, kW)`` and
-``C/groups`` is where this kernel's performance comes from -- so a resolution,
-frame count or bias flag outside the table still JITs.
+How far coverage reaches past the CSV depends on ``AITER_CONV3D_DYN_HW``.
+
+Off (the default), it reaches nowhere: ``compile_conv3d_implicit`` bakes the
+whole problem shape in -- the im2col div/mod folding against ``(kT, kH, kW)``
+and ``C/groups`` is where this kernel's performance comes from -- so a
+resolution, frame count or bias flag outside the table still JITs.
+
+On, the input's spatial extents are read at runtime and one artifact serves
+every resolution of the same layer, so a row covers sizes the table never
+listed. The flag is part of the compile key, which is why ``_resolve_dyn_hw``
+derives it here through the same ``_dyn_hw_ok`` the dispatch uses, and why
+the summary prints it: a build and a run that disagree miss each other
+silently rather than failing. Shapes the dynamic path cannot express (past
+the 2**31 dividend the magic-number division assumes, BIG_IN/BIG_OUT
+addressing, M chunking) fall back to a per-shape artifact on their own.
+
+The pre-transpose is unaffected either way -- it keys on ``(N, padded C,
+D*H*W)`` and stays per-shape.
 
 The compile key is built by ``conv_kernels._implicit_param_from_problem``, the
 same helper ``_conv3d_impl`` calls, so the channel padding and field order
@@ -77,15 +90,17 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.conv_kernels import (
+    AITER_CONV3D_DYN_HW,
     TUNED_KEY_COLUMNS,
     TUNED_RESULT_COLUMNS,
     _dispatch,
+    _dyn_hw_ok,
     _implicit_param_from_problem,
     _is_matmul_fast_path,
     _pad_channels,
     _parse_tuned_bool,
 )
-from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import TILE_K
+from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import TILE_K, make_conv_geometry
 from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
@@ -157,6 +172,12 @@ def parse_csv(csv_path: str):
             # store on the n==1 fast path once channels are innermost. The
             # *input* layout is not -- it only decides whether the host runs the
             # pre-transpose -- so this is 2 variants per row rather than 4.
+            tile = (
+                config["tile_m"],
+                config["tile_n"],
+                config["wave_m"],
+                config["wave_n"],
+            )
             for out_ndhwc in (False, True):
                 conv_job = {
                     "kind": "conv3d",
@@ -166,6 +187,16 @@ def parse_csv(csv_path: str):
                     "has_bias": has_bias,
                     "splitk": splitk,
                     "out_ndhwc": out_ndhwc,
+                    # Part of the compile key, and derived the same way the
+                    # dispatch derives it, so a row lands on the artifact the
+                    # runtime will ask for.
+                    "dyn_hw": _resolve_dyn_hw(
+                        shape=shape,
+                        splitk=splitk,
+                        tile=tile,
+                        out_ndhwc=out_ndhwc,
+                        has_bias=has_bias,
+                    ),
                     **shape,
                     **config,
                 }
@@ -195,6 +226,48 @@ def parse_csv(csv_path: str):
                     jobs.append(tr_job)
 
     return jobs
+
+
+def _resolve_dyn_hw(*, shape, splitk, tile, out_ndhwc, has_bias):
+    """Would the runtime take the variable-resolution path for this row?
+
+    Built from the same ``_implicit_param_from_problem`` and ``_dyn_hw_ok``
+    the dispatch uses, because the answer is part of the compile key: an AOT
+    artifact compiled for one and requested as the other is a silent miss,
+    not an error.
+    """
+    probe = _implicit_param_from_problem(
+        shape["N"],
+        shape["C"],
+        shape["D"],
+        shape["H"],
+        shape["W"],
+        shape["K"],
+        shape["kT"],
+        shape["kH"],
+        shape["kW"],
+        shape["stride_d"],
+        shape["stride_h"],
+        shape["stride_w"],
+        shape["pad_d"],
+        shape["pad_h"],
+        shape["pad_w"],
+        shape["dil_d"],
+        shape["dil_h"],
+        shape["dil_w"],
+        shape["groups"],
+        has_bias,
+        splitk,
+        tile,
+        1,
+        out_ndhwc,
+        "zeros",
+        False,
+    )
+    geom = make_conv_geometry(probe)
+    return _dyn_hw_ok(
+        probe.n, probe.c, probe.d, probe.h, probe.w, probe.k, geom.npq, tile
+    )
 
 
 def job_arch(cu_num: int = 0, gfx: str = "") -> str:
@@ -265,6 +338,7 @@ def _compile_conv3d_to_cache(
     wave_n: int,
     wgm: int,
     out_ndhwc: bool = False,
+    dyn_hw: bool = False,
     **kwargs,
 ):
     del kwargs
@@ -299,6 +373,7 @@ def _compile_conv3d_to_cache(
             # pad cannot be expressed with one value per axis), so this is the
             # only mode a tuned row can describe.
             "zeros",
+            dyn_hw,
         )
     )
     with compile_only_env():
@@ -401,11 +476,15 @@ def main():
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:              {csv_path}")
-    print(f"  conv3d jobs:      {len(conv_jobs)}")
-    print(f"  transpose jobs:   {len(tr_jobs)}")
+    n_dyn = sum(1 for j in conv_jobs if j.get("dyn_hw"))
+    print(f"  conv3d jobs:      {len(conv_jobs)}  ({n_dyn} variable-resolution)")
+    print(f"  transpose jobs:   {len(tr_jobs)}  (all variable-resolution)")
     print(f"  Total jobs:       {len(all_jobs)}")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch or '(all archs found in CSVs)'}")
+    # The flag is part of the compile key, so a build and a run that disagree
+    # about it miss each other silently. Printed rather than inferred.
+    print(f"  AITER_CONV3D_DYN_HW={AITER_CONV3D_DYN_HW}  (must match at runtime)")
     print("=" * 72)
 
     total_t0 = time.time()
