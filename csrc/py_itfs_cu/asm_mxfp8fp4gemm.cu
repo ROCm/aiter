@@ -416,7 +416,6 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     args.N          = Ndim;
     args.K          = Kdim;
     args.batch_size = 1;
-    args.splitk     = splitk;
     size_t arg_size = sizeof(KernelArgs);
 
     const HipDeviceGuard device_guard(A->device_id);
@@ -449,6 +448,8 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
                 ", got numel=",
                 out->numel(),
                 ")");
+
+    args.splitk = splitk;
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(

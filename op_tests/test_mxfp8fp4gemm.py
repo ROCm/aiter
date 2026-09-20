@@ -688,9 +688,9 @@ def main():
         type=int,
         nargs="*",
         choices=[1, 0],
-        default=[1],
+        default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%2), 0 sends it "
-        "row-major (M%%1). Default: [1]. Pass --apre 1 0 to sweep both.",
+        "row-major (M%%1). Default: [1, 0] for func, [1] for perf/profile.",
     )
     parser.add_argument(
         "--outtype",
@@ -848,7 +848,9 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
-    apre_list = args.apre
+    apre_list = (
+        args.apre if args.apre is not None else ([1, 0] if args.mode == "func" else [1])
+    )
 
     def shapes_for(intype):
         if args.shape is not None:

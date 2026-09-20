@@ -94,6 +94,13 @@ to `--max-attempts 15`. Selection is based on event completeness, never latency.
 Failure to obtain a complete group exits with an error. This check applies to
 formal timing; prebenchmark profiler counts are retained in native JSON but are
 not used to select results. Correctness warnings are retained and printed.
+An explicit `asm result=failed` stops the benchmark with a nonzero exit status,
+even if its profiler records are incomplete. Its native JSON/log and verdict in
+`attempts.json` are retained; correctness failures are never retried away.
+
+The native `--mode func` entry defaults to both AP1 and AP0; perf/profile default
+to AP1. An explicit `--apre` overrides those defaults. The six-case performance
+wrapper always passes its chosen layout and `--no-reduce` explicitly.
 
 The native timing helper excludes its first profiled iteration and applies IQR
 outlier filtering, so 100 raw events do not imply 100 samples in the final mean.

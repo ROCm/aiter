@@ -223,9 +223,17 @@ def main():
                 counts = [
                     sum(row.get("profile_gpu_kernels", {}).values()) for row in rows
                 ]
-                accepted = all(complete_profile(row) for row in rows)
-                entry.update(accepted=accepted, raw_formal_event_counts=counts)
+                correctness = [row["asm result"] for row in rows]
+                failed = "failed" in correctness
+                accepted = not failed and all(complete_profile(row) for row in rows)
+                entry.update(
+                    accepted=accepted,
+                    raw_formal_event_counts=counts,
+                    correctness=correctness,
+                )
                 write_json(output / "attempts.json", attempts)
+                if failed:
+                    raise RuntimeError(f"Native correctness failed; see {json_path}")
                 if not accepted:
                     print(
                         f"Incomplete formal profiler records: {stem}, counts={counts}; "

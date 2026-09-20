@@ -18,6 +18,22 @@ from torch import Tensor
 from ..jit.core import compile_ops
 
 
+def gemm_mxfp8_fake(
+    A: Tensor,
+    B: Tensor,
+    ScaleA: Tensor,
+    ScaleB: Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    a_preshuffle: bool = True,
+    kernelName: str = "",
+    splitk: int = 0,
+) -> Tensor:
+    # The public result has no split-K dimension. Keep the host-only kernel
+    # selection and partial-buffer allocation inside the real implementation;
+    # tracing must not guess the count returned by the C++ heuristic.
+    return torch.empty((A.shape[0], B.shape[0]), dtype=dtype, device=A.device)
+
+
 @compile_ops(
     "module_mxfp8fp4gemm_asm",
     fc_name="mxfp8fp4_gemm_splitk",

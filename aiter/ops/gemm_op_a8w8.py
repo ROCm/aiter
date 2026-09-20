@@ -21,7 +21,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
-from ..ops.mxfp8fp4gemm_common import gemm_with_splitk
+from ..ops.mxfp8fp4gemm_common import gemm_mxfp8_fake, gemm_with_splitk
 from ..utility import dtypes
 
 aiter_lib = Library("aiter", "FRAGMENT")
@@ -1435,6 +1435,7 @@ def _mxfp8_mxfp8_gemm_asm(
 ) -> None: ...
 
 
+@torch_compile_guard(mutates_args=[], gen_fake=gemm_mxfp8_fake)
 def gemm_a8w8_mxfp8(
     A: Tensor,  # A:[M, K]   mxfp8 e4m3
     B: Tensor,  # B:[N, K]   mxfp8 e4m3
