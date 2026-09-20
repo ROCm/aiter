@@ -25,6 +25,35 @@ from ...jit.core import compile_ops
 
 _DEFAULT_SORT_BLOCK_M = 32
 _OPUS_MOE_STAGE2_ROUTE_REDUCE_AUTO_BLOCK_N = -1
+_ROUTE_WORKSPACE_BUCKET_BYTES = 1 << 30
+
+
+def _route_workspace_token_capacity(
+    token_num: int,
+    topk: int,
+    row_bytes: int,
+) -> int:
+    """Bucket multi-GiB route workspaces so dynamic-M calls reuse segments.
+
+    DPA prefill changes the gathered token count by small amounts from one
+    scheduler step to the next.  Exact-size allocations make each slightly
+    larger step miss the previous cached block and can leave a staircase of
+    fully inactive allocator segments.  Round only large workspaces to a
+    fixed byte quantum, bounding both the number of sizes and padding to one
+    quantum plus token-alignment slack.  The exact-size leading view preserves
+    the kernel ABI.
+    """
+
+    bytes_per_token = topk * row_bytes
+    requested_bytes = token_num * bytes_per_token
+    if requested_bytes < _ROUTE_WORKSPACE_BUCKET_BYTES:
+        return token_num
+    bucket_bytes = (
+        (requested_bytes + _ROUTE_WORKSPACE_BUCKET_BYTES - 1)
+        // _ROUTE_WORKSPACE_BUCKET_BYTES
+        * _ROUTE_WORKSPACE_BUCKET_BYTES
+    )
+    return (bucket_bytes + bytes_per_token - 1) // bytes_per_token
 
 
 @dataclass(frozen=True)
@@ -252,7 +281,13 @@ def opus_moe_stage2_a8w4_decode_fwd(
         if route_out_fp8:
             # MXFP8 route_out: uint8 [rows, md fp8 | md/8 e8m0 scale].
             rows = token_num * topk
-            out = torch.empty((rows, md + md // 8), dtype=torch.uint8, device=w2.device)
+            cols = md + md // 8
+            capacity_tokens = _route_workspace_token_capacity(token_num, topk, cols)
+            out = torch.empty(
+                (capacity_tokens * topk, cols),
+                dtype=torch.uint8,
+                device=w2.device,
+            )[:rows]
         else:
             shape = (
                 (token_num, topk, w2.shape[1])

@@ -34,6 +34,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -1216,6 +1217,30 @@ def _iter_legacy_cases():
                     ), extras
 
 
+def test_route_workspace_token_capacity():
+    topk = 6
+    row_bytes = 8064
+    bucket_bytes = 1 << 30
+
+    assert _route_workspace_token_capacity(2048, topk, row_bytes) == 2048
+
+    token_counts = (117626, 128960, 129216, 131072)
+    capacities = {
+        _route_workspace_token_capacity(token_num, topk, row_bytes)
+        for token_num in token_counts
+    }
+    assert capacities == {133153}
+
+    for token_num in (*token_counts, 131073):
+        capacity = _route_workspace_token_capacity(token_num, topk, row_bytes)
+        requested_bytes = token_num * topk * row_bytes
+        capacity_bytes = capacity * topk * row_bytes
+        assert capacity_bytes >= requested_bytes
+        assert capacity_bytes - requested_bytes < bucket_bytes + topk * row_bytes
+
+    aiter.logger.info("moe_2stage: route workspace capacity passed")
+
+
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1410,6 +1435,7 @@ def _iter_with_env(case_iter, **env_overrides):
 
 
 _case_iters = []
+test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
