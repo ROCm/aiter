@@ -1467,8 +1467,19 @@ void inverse_rope_group_quant(
                 tdm_run >= 1 && slots_per_wave_tdm % tdm_run == 0 &&
                 tdm_seg_uniform && tdm_run * GS <= 65535 &&
                 (slots_per_wave_tdm / tdm_run) <= 65535;
+            // Sized per wave, not per thread: the kernel stages one whole
+            // kSlotsPerWave tile per pass per wave, and k_slots only has to
+            // divide Ks. The halving loop that fits it to Ks has no wave floor,
+            // so a block can be a part wave (Ks=36 -> k_slots=4 against 8 slots
+            // a wave) or a ragged count of them (Ks=12 -> k_slots=12, 1.5
+            // waves). Charging block_size for it then buys the tail wave a tile
+            // it does not own. The two agree exactly once k_slots is whole
+            // waves, so this only raises the part-wave launches.
+            const int waves_in_block =
+                (block_size + wave_size - 1) / wave_size;
             const size_t tdm_lds_bytes =
-                tdm_used ? static_cast<size_t>(block_size) * TDS * KPT *
+                tdm_used ? static_cast<size_t>(waves_in_block) *
+                               slots_per_wave_tdm * GS * KPT *
                                static_cast<size_t>(o.element_size())
                          : 0;
 

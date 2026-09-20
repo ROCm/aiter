@@ -834,6 +834,55 @@ def main():
     if args.opus_tree:
         check_opus_layout_identity(args.opus_tree)
 
+    def run_case(h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df):
+        # n32k4 only exists at group 32: its four packed k groups are one
+        # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
+        # anything else, so sweeping it here would only collect failures.
+        if scale_layout == "n32k4" and group_size != 32:
+            return
+        # mfma_tile (CDNA V_MFMA_SCALE) and n32k4 (RDNA WMMA scaleB) have
+        # disjoint consumers, so the module builds each only for the family
+        # that can launch it -- see AITER_INVERSE_ROPE_MFMA_TILE / _N32K4.
+        # Skipping the wrong-family layout here would leave the rejection
+        # itself untested, and the kernel's own AITER_CHECK aborts the
+        # process rather than raising, so assert the python-level guard
+        # instead: that is the only thing standing between a caller passing
+        # a legal-looking string and a core dump.
+        is_cdna = get_gfx().startswith("gfx9")
+        if (scale_layout == "mfma_tile" and not is_cdna) or (
+            scale_layout == "n32k4" and is_cdna
+        ):
+            check_layout_rejected(
+                s, h, g, head_dim, rd, group_size, dtype, scale_layout
+            )
+            return
+        ret = test_inverse_rope_group_quant(
+            s,
+            h,
+            g,
+            head_dim,
+            rd,
+            group_size,
+            dtype,
+            scale_layout,
+            data_init=data_init,
+            seed=args.seed,
+        )
+        df.append(ret)
+        if args.graph:
+            check_graph(
+                s,
+                h,
+                g,
+                head_dim,
+                rd,
+                group_size,
+                dtype,
+                scale_layout,
+                data_init=data_init,
+                seed=args.seed,
+            )
+
     for dtype in args.dtype:
         df = []
         for (
@@ -853,53 +902,34 @@ def main():
             args.scale_layout,
             args.data_init,
         ):
-            # n32k4 only exists at group 32: its four packed k groups are one
-            # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
-            # anything else, so sweeping it here would only collect failures.
-            if scale_layout == "n32k4" and group_size != 32:
-                continue
-            # mfma_tile (CDNA V_MFMA_SCALE) and n32k4 (RDNA WMMA scaleB) have
-            # disjoint consumers, so the module builds each only for the family
-            # that can launch it -- see AITER_INVERSE_ROPE_MFMA_TILE / _N32K4.
-            # Skipping the wrong-family layout here would leave the rejection
-            # itself untested, and the kernel's own AITER_CHECK aborts the
-            # process rather than raising, so assert the python-level guard
-            # instead: that is the only thing standing between a caller passing
-            # a legal-looking string and a core dump.
-            is_cdna = get_gfx().startswith("gfx9")
-            if (scale_layout == "mfma_tile" and not is_cdna) or (
-                scale_layout == "n32k4" and is_cdna
-            ):
-                check_layout_rejected(
-                    s, h, g, head_dim, rd, group_size, dtype, scale_layout
-                )
-                continue
-            ret = test_inverse_rope_group_quant(
-                s,
-                h,
-                g,
-                head_dim,
-                rd,
-                group_size,
-                dtype,
-                scale_layout,
-                data_init=data_init,
-                seed=args.seed,
+            run_case(
+                h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df
             )
-            df.append(ret)
-            if args.graph:
-                check_graph(
-                    s,
-                    h,
-                    g,
-                    head_dim,
-                    rd,
-                    group_size,
-                    dtype,
-                    scale_layout,
-                    data_init=data_init,
-                    seed=args.seed,
-                )
+        # Rows whose Ks leaves the block a part wave, which is what sizes the
+        # TDM staging buffer: 9 heads (Ks=36 at GS=128) drives k_slots down to
+        # 4 against a wave's 8 slots, and 3 heads (Ks=12) lands on 12, one and
+        # a half waves. Every default shape above is a whole number of waves
+        # and so cannot reach either. Correctness gate, not a bandwidth case.
+        for (
+            (h, g),
+            s,
+            head_dim,
+            rd,
+            group_size,
+            scale_layout,
+            data_init,
+        ) in itertools.product(
+            [(18, 2), (36, 4), (48, 16)],
+            [1, 32, 512, 4096],
+            args.head_dim,
+            args.rope_dim,
+            args.group_size,
+            args.scale_layout,
+            args.data_init,
+        ):
+            run_case(
+                h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df
+            )
         print_json_table("inverse_rope_group_quant summary", df)
         aiter.logger.info(
             "inverse_rope_group_quant summary (markdown):\n%s",
