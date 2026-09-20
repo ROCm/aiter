@@ -21,7 +21,6 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
-from ..ops.mxfp8fp4gemm_common import gemm_mxfp8_fake, gemm_with_splitk
 from ..utility import dtypes
 
 aiter_lib = Library("aiter", "FRAGMENT")
@@ -1428,14 +1427,27 @@ def _mxfp8_mxfp8_gemm_asm(
     B: Tensor,  # B:[N, K]   mxfp8 e4m3 (always preshuffled)
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
-    out: Tensor,  # Out:[M, N] bf16, or [splitk, M, N] when splitk > 1
+    out: Tensor,  # BF16 [M, N], or [splitk, M, N] for partial outputs
     kernelName: str | None = None,
     a_preshuffle: int = 1,
-    splitk: int = 0,  # 0 = let the dispatch choose
+    splitk: int = 1,
 ) -> None: ...
 
 
-@torch_compile_guard(mutates_args=[], gen_fake=gemm_mxfp8_fake)
+def _gemm_a8w8_mxfp8_fake(
+    A: Tensor,
+    B: Tensor,
+    ScaleA: Tensor,
+    ScaleB: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    a_preshuffle: bool = True,
+    kernelName: str = "",
+    splitk: int = 1,
+) -> Tensor:
+    return torch.empty((A.shape[0], B.shape[0]), dtype=dtype, device=A.device)
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_gemm_a8w8_mxfp8_fake)
 def gemm_a8w8_mxfp8(
     A: Tensor,  # A:[M, K]   mxfp8 e4m3
     B: Tensor,  # B:[N, K]   mxfp8 e4m3
@@ -1444,10 +1456,12 @@ def gemm_a8w8_mxfp8(
     dtype: torch.dtype = dtypes.bf16,
     a_preshuffle: bool = True,
     kernelName: str = "",
-    splitk: int = 0,  # 0 = let the dispatch choose
+    splitk: int = 1,
 ) -> Tensor:
     """gfx1250 MXFP8 x MXFP8 GEMM (a8w8). D[M,N] bf16 = A @ B^T with e8m0 block
-    scales. Kernel auto-selected from M/N/K unless ``kernelName`` is given."""
+    scales. Kernel auto-selected from M/N/K unless ``kernelName`` is given.
+    ``splitk`` defaults to 1; supported 256x256 kernels can emit BF16 partials,
+    which are summed here to preserve the public [M,N] output."""
     require_gfx1250_asm("gemm_a8w8_mxfp8")
     M = A.shape[0]
     N = B.shape[0]
@@ -1468,15 +1482,19 @@ def gemm_a8w8_mxfp8(
         raise NotImplementedError(
             f"gfx1250 a8w8 MXFP8 GEMM a_preshuffle requires M%2==0, got M={M}"
         )
-    return gemm_with_splitk(
-        _mxfp8_mxfp8_gemm_asm,
+    if splitk < 1:
+        raise ValueError("splitk must be a positive integer")
+    out = torch.empty(
+        (splitk, M, N) if splitk > 1 else (M, N), dtype=dtype, device=A.device
+    )
+    _mxfp8_mxfp8_gemm_asm(
         A,
         B,
         ScaleA,
         ScaleB,
-        0,  # b_is_fp4
+        out,
+        kernelName if kernelName else None,
         int(bool(a_preshuffle)),
-        kernelName,
-        dtype,
         splitk,
     )
+    return out.sum(dim=0, dtype=dtype) if splitk > 1 else out

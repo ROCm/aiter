@@ -13,9 +13,7 @@ from torch import Tensor
 
 from ..jit.core import compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
-from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-from .mxfp8fp4gemm_common import gemm_mxfp8_fake, gemm_with_splitk
 
 
 @compile_ops(
@@ -28,14 +26,12 @@ def _mxfp8_mxfp4_gemm_asm(
     B: Tensor,  # B:[N, K/2] mxfp4 e2m1 (always preshuffled)
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
-    out: Tensor,  # Out:[M, N] bf16, or [splitk, M, N] when splitk > 1
+    out: Tensor,  # Out:[M, N] bf16
     kernelName: str | None = None,
     a_preshuffle: int = 1,
-    splitk: int = 0,  # 0 = let the dispatch choose
 ) -> None: ...
 
 
-@torch_compile_guard(mutates_args=[], gen_fake=gemm_mxfp8_fake)
 def gemm_a8w4_mxfp8(
     A: Tensor,  # A:[M, K]   mxfp8 e4m3
     B: Tensor,  # B:[N, K/2] mxfp4 e2m1
@@ -44,7 +40,6 @@ def gemm_a8w4_mxfp8(
     dtype: torch.dtype = dtypes.bf16,
     a_preshuffle: bool = True,
     kernelName: str = "",
-    splitk: int = 0,  # 0 = let the dispatch choose
 ) -> Tensor:
     """gfx1250 MXFP8 (activation) x MXFP4 (weight) GEMM (a8w4). D[M,N] bf16 =
     A @ B^T with e8m0 block scales. Kernel auto-selected from M/N/K unless
@@ -72,15 +67,14 @@ def gemm_a8w4_mxfp8(
         raise NotImplementedError(
             f"gfx1250 a8w4 MXFP8xMXFP4 GEMM a_preshuffle requires M%2==0, got M={M}"
         )
-    return gemm_with_splitk(
-        _mxfp8_mxfp4_gemm_asm,
+    out = torch.empty((M, N), dtype=dtype, device=A.device)
+    _mxfp8_mxfp4_gemm_asm(
         A,
         B,
         ScaleA,
         ScaleB,
-        1,  # b_is_fp4
+        out,
+        kernelName if kernelName else None,
         int(bool(a_preshuffle)),
-        kernelName,
-        dtype,
-        splitk,
     )
+    return out

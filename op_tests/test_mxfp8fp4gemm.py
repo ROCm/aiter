@@ -20,11 +20,8 @@
 # ===============================================================================
 
 import argparse
-import csv
 import itertools
 import sys
-import time
-from pathlib import Path
 
 import pandas as pd
 import torch
@@ -38,7 +35,6 @@ from aiter.benchmark_data_init import (
     make_generator,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.mxfp8fp4gemm_common import mxfp8fp4_gemm_splitk
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
@@ -65,63 +61,26 @@ _OUT_DTYPE = {"bf16": dtypes.bf16}
 PERSISTENT_TG = 256
 
 
-# Per-tile cluster sets (cluster_x, cluster_y) deployed in mxfp8fp4gemm.csv, kept in
-# sync with the cover in poc_kl/mi400/mxfp8fp4gemm/run.sh COVER_CONFIGS so the reported
-# label names the .co the cpp heuristic (get_heuristic_kernel) actually dispatches to.
-_CLUSTERS = {
-    (128, 128): [(4, 4)],
-    (256, 256): [(4, 4), (2, 4), (4, 2), (2, 2), (1, 1)],
-    (64, 512): [(4, 1), (2, 1), (1, 1)],
-    (16, 512): [(4, 1), (2, 1), (1, 1)],
+F8GEMM_BENCHMARK_SPLITK = {
+    (512, 2048, 7168): 8,
+    (512, 7168, 16384): 4,
+    (512, 6144, 7168): 4,
+    (512, 7168, 3072): 4,
+    (512, 65536, 1536): 1,
+    (512, 8192, 1536): 1,
 }
 
 
-def _tiles_for(intype, apre):
-    """Tiles registered in the csv for this combo. 16x512 is FP4-only (its master
-    asserts B_DTYPE_FP4) and is deployed with a_preshuffle=0 only."""
-    tiles = [(256, 256), (64, 512)]
-    if intype == "a8w8":
-        tiles.append((128, 128))
-    if intype == "a8w4" and not apre:
-        tiles.append((16, 512))
-    return tiles
+def _heuristic_tile(M, N, K, intype):
+    if intype == "a8w8" and (M, N, K) == (512, 8192, 1536):
+        return 128, 128
+    return (64, 512) if M <= 64 else (256, 256)
 
 
-def _heuristic_tile(M, N, K, intype, apre):
-    """Tile (tile_m, tile_n) the cpp dispatch picks (mirrors get_heuristic_kernel in
-    asm_mxfp8fp4gemm.cu): a tiny M wastes a taller tile's rows, so M<=16 prefers the
-    16x512 decode tile, M<=64 the 64x512 one, larger M 256x256 -- restricted to the
-    tiles actually registered for this (intype, apre). The FP8 indexer shape
-    (512,8192,1536) prefers the 128x128 K128/PF8 variant."""
-    if (M, N, K) == (512, 8192, 1536) and intype == "a8w8":
-        prefs = [(128, 128), (256, 256), (64, 512)]
-    elif M <= 16:
-        prefs = [(16, 512), (64, 512), (256, 256)]
-    elif M <= 64:
-        prefs = [(64, 512), (256, 256)]
-    else:
-        prefs = [(256, 256), (64, 512)]
-    avail = _tiles_for(intype, apre)
-    return next(t for t in prefs if t in avail)
-
-
-def _heuristic_cluster(tile_m, tile_n, M, N):
-    """(cluster_x, cluster_y) the cpp dispatch picks within the tile: the largest
-    cluster that DIVIDES the tile grid evenly, tie-break by aspect closeness then
-    larger cx. 1x1 always fits (n % 1 == 0), so a pick always exists.
-
-    Divisibility, not just cx<=ntiles: a ragged last block leaves its trailing lanes
-    with an out-of-range tile id, which the kernel clamps onto the last valid tile
-    (redundant work). Must stay in sync with `fits` in asm_mxfp8fp4gemm.cu."""
-    mtiles = (M + tile_m - 1) // tile_m
-    ntiles = (N + tile_n - 1) // tile_n
-    best, best_key = (1, 1), None
-    for cx, cy in _CLUSTERS.get((tile_m, tile_n), [(1, 1)]):
-        score = cx * cy if (ntiles % cx == 0 and mtiles % cy == 0) else 0
-        key = (score, -abs(cx * mtiles - cy * ntiles), cx)
-        if best_key is None or key > best_key:
-            best, best_key = (cx, cy), key
-    return best
+def _heuristic_cluster(M, N, K, intype):
+    if intype == "a8w8" and (M, N, K) in F8GEMM_BENCHMARK_SPLITK:
+        return (4, 4) if N == 8192 else (4, 2)
+    return (4, 1) if M <= 64 else (4, 4)
 
 
 def _report_active_tg(M, N, tile_m, tile_n, label):
@@ -159,25 +118,6 @@ PERF_SHAPES = {
         (2, 1048576, 16384),  # memory-bound
     ],
 }
-
-# Defaults for the six a8w8 AP0/AP1 cases used by the native GEMM-only benchmark.
-# An explicit --splitk (including 0 for the operator heuristic) takes precedence.
-F8GEMM_BENCHMARK_SPLITK = {
-    (512, 2048, 7168): 8,  # wqkv_a
-    (512, 7168, 16384): 4,  # wo_b
-    (512, 6144, 7168): 4,  # gate_up_proj
-    (512, 7168, 3072): 4,  # w2
-    (512, 65536, 1536): 1,  # wq_b
-    (512, 8192, 1536): 1,  # indexer_wq_b
-}
-
-
-def _benchmark_splitk(intype, apre, M, N, K):
-    if intype == "a8w8" and apre in (0, 1):
-        return F8GEMM_BENCHMARK_SPLITK.get((M, N, K), 0)
-    return 0
-
-
 FUNC_SHAPES = [
     # qkv_proj
     (1, 1280, 8192),
@@ -202,7 +142,7 @@ FUNC_SHAPES = [
     (256, 8192, 1024),
     (320, 8192, 1024),
     (512, 8192, 1024),
-    (512, 8192, 1536),  # K128/PF8 128x128 automatic dispatch
+    (512, 8192, 1536),  # 128x128 AP0/AP1
     (1024, 8192, 1024),
     (2048, 8192, 1024),
     (4096, 8192, 1024),
@@ -256,7 +196,7 @@ def _support_reason(outtype, apre, M, N, K):
 
 
 def _ref(intype, A, B, sA, sB, M, N, splitk=1):
-    # FP32 reference; optionally benchmarked before the formal ASM measurement.
+    # Reference only: fp32 math, cast back. Not timed, not in the table.
     A_f32 = A.to(torch.float32)[:M]
     if intype == "a8w4":
         B_f32 = fp4_utils.mxfp4_to_f32(B)[:N]
@@ -266,7 +206,6 @@ def _ref(intype, A, B, sA, sB, M, N, splitk=1):
     sB_f = fp4_utils.e8m0_to_f32(sB).repeat_interleave(MX_SCALE_BLOCK, dim=1)
     lhs, rhs = A_f32 * sA_f, B_f32 * sB_f
     if splitk > 1:
-        assert lhs.shape[1] % splitk == 0
         step = lhs.shape[1] // splitk
         return torch.stack(
             [
@@ -287,9 +226,6 @@ def _prep(
     scale_init: str,
     gen,
     reference_splitk=1,
-    pre_benchmark=False,
-    pre_benchmark_warmup=2,
-    pre_benchmark_iters=100,
 ):
     """Build raw + shuffled device tensors and the f32 golden reference.
 
@@ -315,33 +251,7 @@ def _prep(
     sB = fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
     # fp32 golden; the caller casts/quantizes it to the requested outtype.
-    pre_results = {}
-    if pre_benchmark:
-        aiter.logger.info("prebenchmark begin: native Torch reference")
-        torch_start_ns = time.monotonic_ns()
-        ref_f32, ref_us = run_perftest(
-            _ref,
-            intype,
-            A,
-            B,
-            sA,
-            sB,
-            M,
-            N,
-            reference_splitk,
-            num_warmup=pre_benchmark_warmup,
-            num_iters=pre_benchmark_iters,
-            testGraph=False,
-            num_rotate_args=0,
-        )
-        torch_end_ns = time.monotonic_ns()
-        pre_results["stage_windows"] = {
-            "torch": {"start_mono_ns": torch_start_ns, "end_mono_ns": torch_end_ns}
-        }
-        pre_results["torch us"] = ref_us
-        pre_results["torch profile_gpu_kernels"] = dict(run_perftest.last_gpu_kernels)
-    else:
-        ref_f32 = _ref(intype, A, B, sA, sB, M, N, reference_splitk)
+    ref_f32 = _ref(intype, A, B, sA, sB, M, N, reference_splitk)
 
     inp = {
         "A": shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
@@ -349,55 +259,7 @@ def _prep(
         "sA": shuffle_mxfp8fp4_scale(sA),
         "sB": shuffle_mxfp8fp4_scale(sB),
     }
-    # Match the FlyDSL benchmark order: Torch -> AP0, or Torch -> AP0 -> AP1.
-    # Only the AP1 measurement needs a separate AP0 prebenchmark.
-    if pre_benchmark and apre == 1:
-        from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
-
-        aiter.logger.info("prebenchmark begin: native ASM AP0")
-        pre_output = torch.empty(
-            (reference_splitk, M, N) if reference_splitk > 1 else (M, N),
-            dtype=dtypes.bf16,
-            device=A.device,
-        )
-
-        def run_pre_ap0(a, b, scale_a, scale_b):
-            _mxfp8_mxfp8_gemm_asm(
-                a, b, scale_a, scale_b, pre_output, None, 0, reference_splitk
-            )
-            return pre_output
-
-        ap0_start_ns = time.monotonic_ns()
-        pre_out, pre_us = run_perftest(
-            run_pre_ap0,
-            A,
-            inp["B"],
-            inp["sA"],
-            inp["sB"],
-            num_warmup=pre_benchmark_warmup,
-            num_iters=pre_benchmark_iters,
-            testGraph=False,
-            num_rotate_args=0,
-        )
-        ap0_end_ns = time.monotonic_ns()
-        pre_results["stage_windows"]["ap0"] = {
-            "start_mono_ns": ap0_start_ns,
-            "end_mono_ns": ap0_end_ns,
-        }
-        pre_results["ap0 us"] = pre_us
-        pre_results["ap0 profile_gpu_kernels"] = dict(run_perftest.last_gpu_kernels)
-        pre_err = checkAllclose(
-            ref_f32.to(dtypes.bf16).to(dtypes.fp32),
-            pre_out.to(dtypes.fp32),
-            rtol=1e-1,
-            atol=1.0,
-            msg="prebenchmark AP0",
-        )
-        pre_results["ap0 err"] = pre_err
-        pre_results["ap0 result"] = _verdict(pre_err)
-    if pre_benchmark:
-        aiter.logger.info("prebenchmark complete: continuing to formal ASM AP%d", apre)
-    return inp, ref_f32, pre_results
+    return inp, ref_f32
 
 
 @benchmark()
@@ -406,7 +268,7 @@ def test_gemm(
     M,
     N,
     K,
-    apre=1,
+    apre,
     outtype="bf16",
     data_init="uniform",
     scale_init="auto",
@@ -419,12 +281,13 @@ def test_gemm(
     num_iters=None,
     test_graph=False,
     num_rotate=0,
-    pre_benchmark=False,
-    pre_benchmark_warmup=2,
-    pre_benchmark_iters=100,
 ):
     if splitk is None:
-        splitk = _benchmark_splitk(intype, apre, M, N, K)
+        splitk = F8GEMM_BENCHMARK_SPLITK.get((M, N, K), 1) if intype == "a8w8" else 1
+    if splitk < 1 or K % splitk != 0:
+        raise ValueError("splitk must be positive and divide K")
+    if intype != "a8w8" and (no_reduce or splitk != 1):
+        raise ValueError("Split-K and --no-reduce are only supported for a8w8")
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
     reason = _support_reason(outtype, apre, M, N, K)
@@ -439,14 +302,12 @@ def test_gemm(
             N,
             K,
         )
-        _tm, _tn = _heuristic_tile(M, N, K, intype, apre)
-        _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
+        _tm, _tn = _heuristic_tile(M, N, K, intype)
         return {
             "gfx": get_gfx(),
             "knl_name": knl_name or "(heuristic)",
             "tile": f"{_tm}x{_tn}",
-            "cluster": f"{_cx}x{_cy}",
-            "splitk": splitk or 1,
+            "cluster": "4x4",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -457,22 +318,7 @@ def test_gemm(
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
     out_dtype = _OUT_DTYPE[outtype]
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
-    if no_reduce and (intype != "a8w8" or splitk < 1):
-        raise ValueError(
-            "--no-reduce requires a8w8 and a positive split-K; pass --splitk for shapes without a benchmark default"
-        )
-    if pre_benchmark and not (
-        intype == "a8w8"
-        and apre in (0, 1)
-        and no_reduce
-        and splitk > 0
-        and pre_benchmark_warmup >= 0
-        and pre_benchmark_iters > 1
-    ):
-        raise ValueError(
-            "--pre-benchmark requires a8w8/AP0-or-AP1/--no-reduce/positive split-K and valid pre-benchmark counts"
-        )
-    inp, ref_f32, pre_results = _prep(
+    inp, ref_f32 = _prep(
         intype,
         M,
         N,
@@ -482,14 +328,11 @@ def test_gemm(
         scale_init,
         gen,
         reference_splitk=splitk if no_reduce else 1,
-        pre_benchmark=pre_benchmark,
-        pre_benchmark_warmup=pre_benchmark_warmup,
-        pre_benchmark_iters=pre_benchmark_iters,
     )
     ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
-    # --iters overrides; unset keeps the mode default (func=5, perf/profile=100).
-    num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 100)
+    # --iters overrides; unset keeps the mode default (func=5, perf/profile=101).
+    num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 101)
 
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
     # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
@@ -504,9 +347,9 @@ def test_gemm(
     elif knl_name == "auto":
         middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
         pre = "ABpreShuffle" if apre else "BpreShuffle"
-        _tm, _tn = _heuristic_tile(M, N, K, intype, apre)
-        _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
-        base = f"f8gemm_{outtype}_{middle}_{pre}_{_tm}x{_tn}_{_cx}x{_cy}_ps"
+        tm, tn = _heuristic_tile(M, N, K, intype)
+        cx, cy = _heuristic_cluster(M, N, K, intype)
+        base = f"f8gemm_{outtype}_{middle}_{pre}_{tm}x{tn}_{cx}x{cy}_ps"
         knl = f"_ZN5aiter{len(base)}{base}E"
     else:
         knl = knl_name
@@ -514,7 +357,6 @@ def test_gemm(
     if no_reduce:
         from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
 
-        # One output buffer, as in the POC host. Allocation and reference are untimed.
         partials = torch.empty(
             (splitk, M, N) if splitk > 1 else (M, N),
             dtype=out_dtype,
@@ -527,15 +369,19 @@ def test_gemm(
                 A, B, sA, sB, partials, knl or None, int(apre), splitk
             )
             return partials
+        if intype == "a8w8":
+            return kern(
+                A,
+                B,
+                sA,
+                sB,
+                dtype=out_dtype,
+                a_preshuffle=bool(apre),
+                kernelName=knl,
+                splitk=splitk,
+            )
         return kern(
-            A,
-            B,
-            sA,
-            sB,
-            dtype=out_dtype,
-            a_preshuffle=bool(apre),
-            kernelName=knl,
-            splitk=splitk,
+            A, B, sA, sB, dtype=out_dtype, a_preshuffle=bool(apre), kernelName=knl
         )
 
     asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
@@ -550,52 +396,31 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
-    if pre_benchmark:
-        ret["pre_benchmark_results"] = pre_results
-    ret["reference_splitk"] = splitk if no_reduce else 1
-    # Report TG occupancy for the tile+cluster the cpp dispatch picks.
+    # Report TG occupancy for the tile the cpp dispatch picks (M<=64 -> 64x512).
     _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
     _pre = "ABpreShuffle" if apre else "BpreShuffle"
-    _tile_m, _tile_n = _heuristic_tile(M, N, K, intype, apre)
-    _cx, _cy = _heuristic_cluster(_tile_m, _tile_n, M, N)
-    if knl:
-        catalog = (
-            Path(__file__).resolve().parents[1]
-            / "hsa/gfx1250/mxfp8fp4gemm/mxfp8fp4gemm.csv"
-        )
-        with catalog.open() as source:
-            cfg = next(
-                (row for row in csv.DictReader(source) if row["knl_name"] == knl), None
-            )
-        if cfg is not None:
-            _tile_m, _tile_n = int(cfg["tile_m"]), int(cfg["tile_n"])
-            _cx, _cy = int(cfg["cluster_x"]), int(cfg["cluster_y"])
-    _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
+    _tile_m, _tile_n = _heuristic_tile(M, N, K, intype)
+    _cx, _cy = _heuristic_cluster(M, N, K, intype)
+    _label = (
+        knl or f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
+    )
     _report_active_tg(M, N, _tile_m, _tile_n, _label)
-    # Structured algo details (mxfp8fp4gemm.csv columns): the cpp-dispatch tile,
-    # the aspect-selected cluster and the split-K count the cpp picks (asked for
-    # rather than mirrored -- choose_splitk owns the constraints).
+    # Report the tile and cluster selected for this shape.
     ret["tile"] = f"{_tile_m}x{_tile_n}"
     ret["cluster"] = f"{_cx}x{_cy}"
-    ret["splitk"] = splitk or mxfp8fp4_gemm_splitk(
-        M, N, K, int(intype == "a8w4"), apre, knl or None
-    )
-    ret["reduced"] = not no_reduce and ret["splitk"] > 1
+    ret["splitk"] = splitk
+    ret["reference_splitk"] = splitk if no_reduce else 1
+    ret["reduced"] = not no_reduce and splitk > 1
     ret["timing_scope"] = "gemm_with_reduce" if ret["reduced"] else "gemm_only"
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
     # build), so "kernel not in cfg" is benign ONLY on the heuristic path (knl == "").
-    # An explicit --splitk the kernel cannot honour for this shape (odd count, K not
-    # divisible, more than WG_MAX TGs, non-256x256 tile) is a skip, not an error --
-    # a sweep runs the same count against every shape.
-    _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel", "is not valid for")
+    _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel",)
     if not knl:
         _NOT_SUPPORTED_MARKERS += ("kernel not in cfg_mxfp8fp4gemm",)
     for name, (cand, cand_args) in candidates.items():
         try:
-            if pre_benchmark:
-                formal_start_ns = time.monotonic_ns()
             out, us = run_perftest(
                 cand,
                 *cand_args,
@@ -605,13 +430,6 @@ def test_gemm(
                 num_rotate_args=num_rotate,
                 needTrace=needTrace,
             )
-            if pre_benchmark:
-                formal_end_ns = time.monotonic_ns()
-                # Preserve AP1's existing key and AP0's separate prebenchmark window.
-                pre_results["stage_windows"]["ap1" if apre else "formal_ap0"] = {
-                    "start_mono_ns": formal_start_ns,
-                    "end_mono_ns": formal_end_ns,
-                }
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
                 raise
@@ -632,7 +450,6 @@ def test_gemm(
             ret[f"{name} err"] = float("nan")
             ret[f"{name} result"] = "not support"
             continue
-        ret["profile_gpu_kernels"] = run_perftest.last_gpu_kernels
         # a8w8 (mxfp8xmxfp8) can show a "warning" on ~1 element in 5e5: an
         # ill-conditioned output where sum|terms| (~2.7e5) cancels to a ~0.2
         # residual (ratio ~9e-7). The fp32 accumulation noise floor there is
@@ -690,7 +507,7 @@ def main():
         choices=[1, 0],
         default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%2), 0 sends it "
-        "row-major (M%%1). Default: [1, 0] for func, [1] for perf/profile.",
+        "row-major (M%%1). Default (unset): perf/profile = [1], func = [1, 0].",
     )
     parser.add_argument(
         "--outtype",
@@ -704,7 +521,7 @@ def main():
         "--data-init",
         dest="data_init",
         nargs="+",
-        choices=["zero", "constant", "uniform", "norm", "poc"],
+        choices=["zero", "constant", "uniform", "norm"],
         default=None,
         help="DATA init distribution(s) (sampled independently of scale).\n"
         "Paired position-wise with --scale-init (length-1 broadcasts).\n"
@@ -712,14 +529,13 @@ def main():
         "  zero     = all-zero on-wire codes\n"
         "  constant = A/B = 0.5 (deterministic)\n"
         "  uniform  = FP8 U(-6,6) / FP4 U(-3,3)  [default]\n"
-        "  norm     = N(0,1)                     [norm-dist / LLM-like]\n"
-        "  poc      = {+-0.5,1,1.5,2,3} random    [matches poc perf harness]",
+        "  norm     = N(0,1)                     [norm-dist / LLM-like]",
     )
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
         nargs="+",
-        choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm", "poc"],
+        choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm"],
         default=None,
         help="SCALE init distribution(s) (e8m0 for both operands)\n"
         "Default (unset): perf/profile = 'constant auto', func = 'auto'\n"
@@ -728,8 +544,7 @@ def main():
         "  zero          = all-zero e8m0 bytes\n"
         "  constant      = neutral scale 0x7F (2^0 = 1.0)\n"
         "  uniform       = U(0.5,2) -> nearest e8m0 byte\n"
-        "  norm          = N(1,0.25) -> nearest e8m0 byte\n"
-        "  poc           = 2^[-2,2] (exp+127)              [matches poc perf harness]",
+        "  norm          = N(1,0.25) -> nearest e8m0 byte",
     )
     parser.add_argument(
         "--seed",
@@ -748,7 +563,7 @@ def main():
         type=int,
         default=None,
         help="timed iterations (run_perftest num_iters); unset -> mode default "
-        "(func=5, perf/profile=100)",
+        "(func=5, perf/profile=101)",
     )
     parser.add_argument(
         "--graph",
@@ -778,37 +593,6 @@ def main():
         ".co from mxfp8fp4gemm.csv by (b_intype, a_preshuffle) and shape. Any other "
         "value = force that exact mangled knl_name for all runs (developer debug).",
     )
-    parser.add_argument(
-        "--splitk",
-        type=int,
-        nargs="*",
-        default=None,
-        help="split-K counts to run. Unset: six a8w8 AP0/AP1 benchmark shapes use "
-        "8/4/4/4/1/1; other shapes use the operator heuristic. "
-        "Explicit 0 always uses the count choose_splitk picks. Several "
-        "values sweep them, e.g. --splitk 1 2 4 8. Only the kernel's hard "
-        "constraints are checked, so a count deeper than the dispatch would pick "
-        "is allowed; 256x256 only.",
-    )
-    parser.add_argument(
-        "--no-reduce",
-        action="store_true",
-        help="Time ASM GEMM only and validate each split-K plane independently",
-    )
-    parser.add_argument(
-        "--pre-benchmark",
-        action="store_true",
-        help="Before each formal test, benchmark the native Torch reference; "
-        "also benchmark native ASM AP0 when the formal test is AP1",
-    )
-    parser.add_argument("--pre-benchmark-warmup", type=int, default=2)
-    parser.add_argument("--pre-benchmark-iters", type=int, default=100)
-    parser.add_argument(
-        "--repeat",
-        type=int,
-        default=1,
-        help="Repeat the complete preparation/prebenchmark/formal test per configuration",
-    )
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
@@ -820,11 +604,19 @@ def main():
         help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384; "
         "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
     )
+    parser.add_argument(
+        "--splitk",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Positive a8w8 split counts. Unset: six target cases use 8/4/4/4/1/1; other cases use 1.",
+    )
+    parser.add_argument(
+        "--no-reduce",
+        action="store_true",
+        help="Measure ASM GEMM only and compare each BF16 split-K plane independently (a8w8)",
+    )
     args = parser.parse_args()
-    if args.repeat < 1:
-        parser.error("--repeat must be positive")
-    if args.iters is None:
-        args.iters = 5 if args.mode == "func" else 100
 
     # DATA and SCALE init are paired position-wise (NOT crossed). Mode-aware
     # defaults when unset: perf/profile run constant+constant and uniform+auto;
@@ -848,9 +640,14 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
-    apre_list = (
-        args.apre if args.apre is not None else ([1, 0] if args.mode == "func" else [1])
-    )
+    # A-preshuffle sweep. Mode-aware default when unset: perf/profile exercise only
+    # the preshuffled path ([1]); func sweeps both ([1, 0]).
+    if args.apre is not None:
+        apre_list = args.apre
+    elif args.mode in ("perf", "profile"):
+        apre_list = [1]
+    else:
+        apre_list = [1, 0]
 
     def shapes_for(intype):
         if args.shape is not None:
@@ -859,39 +656,8 @@ def main():
             return FUNC_SHAPES
         return PERF_SHAPES[intype]
 
-    def splitks_for(intype, apre, M, N, K):
-        if args.splitk is not None:
-            return args.splitk
-        return [_benchmark_splitk(intype, apre, M, N, K)]
-
-    def run_once(repeat, *test_args, **test_kwargs):
-        aiter.logger.info("repeat %d/%d begin", repeat, args.repeat)
-        row = dict(test_gemm(*test_args, **test_kwargs), repeat=repeat)
-        aiter.logger.info(
-            "repeat %d/%d result: %s M,N,K=%s,%s,%s %s/%s AP%s splitk=%s "
-            "asm=%s us, %s TFLOPS, correctness=%s, err=%s, GPU events=%s/%s",
-            repeat,
-            args.repeat,
-            row["intype"],
-            row["M"],
-            row["N"],
-            row["K"],
-            row["data_init"],
-            row["scale_init"],
-            row["apre"],
-            row.get("splitk"),
-            row.get("asm us"),
-            row.get("asm TFLOPS"),
-            row.get("asm result"),
-            row.get("asm err"),
-            sum(row.get("profile_gpu_kernels", {}).values()),
-            row["num_iters"],
-        )
-        return row
-
     rows = [
-        run_once(
-            repeat,
+        test_gemm(
             intype,
             M,
             N,
@@ -909,16 +675,12 @@ def main():
             num_iters=args.iters,
             test_graph=args.graph,
             num_rotate=args.rotate,
-            pre_benchmark=args.pre_benchmark,
-            pre_benchmark_warmup=args.pre_benchmark_warmup,
-            pre_benchmark_iters=args.pre_benchmark_iters,
         )
         for apre, (di, si), intype, outtype in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype
         )
         for (M, N, K) in shapes_for(intype)
-        for splitk in splitks_for(intype, apre, M, N, K)
-        for repeat in range(1, args.repeat + 1)
+        for splitk in (args.splitk if args.splitk is not None else [None])
     ]
     df_full = pd.DataFrame(rows)
     # JSON keeps every column (config + algo details + results) so each record is
@@ -929,9 +691,7 @@ def main():
         aiter.logger.info(
             "wrote JSON summary (%d rows) to %s", len(df_full), args.json_out
         )
-    # Keep knl_name (the actual .co) + tile + cluster; drop columns constant within a
-    # table (cluster now varies with shape via the aspect heuristic, so it is kept).
-    # Nested profiling details stay in JSON; omit them from the terminal table.
+    # Keep kernel, tile, cluster, and split-K details in the displayed table.
     df = df_full.drop(
         columns=[
             "seed",
@@ -941,8 +701,6 @@ def main():
             "num_iters",
             "test_graph",
             "num_rotate",
-            "pre_benchmark_results",
-            "profile_gpu_kernels",
         ],
         errors="ignore",
     )
@@ -952,6 +710,8 @@ def main():
     )
     if args.mode == "profile":
         aiter.logger.info("profiler traces written under ./aiter_logs/")
+    if any(row.get("asm result") == "failed" for row in rows):
+        raise RuntimeError("F8GEMM correctness failed; see the summary above")
 
 
 if __name__ == "__main__":
