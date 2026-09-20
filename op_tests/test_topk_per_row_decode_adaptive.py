@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Host-rule tests for the adaptive decode Top-K kernel.
+"""Tests for the adaptive decode Top-K kernel.
 
-These pin the config the kernel is built from, so a shape cannot start taking a
-different kernel without a test saying so. They need no device.
+Most of these pin the config the kernel is built from, so a shape cannot start
+taking a different kernel without a test saying so; those need no device. The
+last section needs one: it checks on the card that the kernel the table names is
+the kernel that launches, which no host-side reading of the table can show.
 """
 
 import pytest
+import torch
 
 from aiter.ops import topk
 from aiter.ops.flydsl.kernels.topk import topk_per_row_decode_adaptive as km
@@ -168,3 +171,141 @@ def test_the_flydsl_host_takes_the_gates_answer_rather_than_its_own():
     from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
 
     assert "backend" in inspect.signature(flydsl_top_k_per_row_decode).parameters
+
+
+# --- on the card ------------------------------------------------------------
+#
+# Everything above reads the table. None of it can show that the kernel the
+# table names is the kernel that runs, because that is decided at the launch
+# site, so this section observes the launch by patching it and checks what it
+# wrote. Skipped without a device, and a no-op on a card the table does not
+# carry -- there is no band there, so there is no claim to check.
+
+# Rows the bands are expressed in. Band edges are checked from both sides, so
+# the neighbours of min_rows and max_rows have to be on this axis too.
+_ROWS_AXIS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+
+# A cell is allocated in full. The widest band times the tallest row count is
+# half a billion float32, which is not what an op test should ask a shared card
+# for, so the corner is left to the measurement harness and everything under
+# the cap is checked here.
+_MAX_ELEMENTS = 64 << 20
+
+
+def _band_edge_cells(arch, cu_count):
+    """Both sides of every band edge in the shipped table, read off the table.
+
+    A hand-written cell list goes stale the moment the table is re-fitted, and
+    a stale list passes by testing nothing.
+    """
+    out, seen = [], []
+
+    def add(width, rows, k, stable):
+        key = (width, rows, k, stable)
+        if rows in _ROWS_AXIS and key not in seen and rows * width <= _MAX_ELEMENTS:
+            seen.append(key)
+            out.append(key)
+
+    for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[(arch, cu_count)].items():
+        for ks, bands in per_group.items():
+            k = ks[0]
+            for min_w, max_w, min_r, max_r in bands:
+                for w in (min_w, max_w):
+                    add(w, min_r, k, stable)  # inside, at the bottom edge
+                    add(w, max_r, k, stable)  # inside, at the top edge
+                    i = _ROWS_AXIS.index(min_r)
+                    if i:
+                        add(w, _ROWS_AXIS[i - 1], k, stable)  # just below
+                    j = _ROWS_AXIS.index(max_r)
+                    if j + 1 < len(_ROWS_AXIS):
+                        add(w, _ROWS_AXIS[j + 1], k, stable)  # just above
+    return out
+
+
+def _this_card():
+    if not torch.cuda.is_available():
+        pytest.skip("needs a device: this section observes a launch")
+    props = torch.cuda.get_device_properties(0)
+    return props.gcnArchName.split(":")[0], props.multi_processor_count
+
+
+def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
+    """Per band-edge cell: the gate agrees with the table, the launch agrees
+    with the gate, and the indices select the right values."""
+    import aiter
+    from aiter.ops.flydsl.topk import topk_per_row as host
+
+    arch, cu_count = _this_card()
+    if (arch, cu_count) not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
+        pytest.skip(f"{arch} at {cu_count} CU is not in the table, so it claims nothing")
+
+    launched = []
+
+    def spy(name, attr):
+        real = getattr(host, attr)
+
+        def wrapper(*args, **kwargs):
+            launched.append(name)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(host, attr, wrapper)
+
+    spy(topk.BACKEND_ADAPTIVE, "_run_adaptive")
+    spy(topk.BACKEND_CHUNKED, "_run_compiled")
+    spy("port", "flydsl_radix_topk_one_block")
+
+    # The gate answers "not ours" and never names the fallback kernel, so what
+    # a declined cell launches is an arch question. On the one-block arches
+    # upstream runs the FlyDSL port, which is spied above and reports by name;
+    # elsewhere it runs the HIP kernel, which is not on this module and so is
+    # observed by nothing having been spied.
+    declined_runs = (
+        "port"
+        if arch in host._FLYDSL_TOPK_ONE_BLOCK_ARCHES
+        else topk.BACKEND_UPSTREAM
+    )
+
+    cells = _band_edge_cells(arch, cu_count)
+    assert cells, "the table carries this card, so it has band edges to check"
+
+    torch.manual_seed(0)
+    bad = []
+    for width, rows, k, stable in cells:
+        want = topk._decode_backend(arch, cu_count, stable, width, rows, k, True)
+        # float32: the FlyDSL decode path takes no other dtype.
+        logits = torch.randn(rows, width, dtype=torch.float32, device="cuda")
+        seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        out = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+
+        launched.clear()
+        got = topk.decode_backend_for_call(
+            logits, 1, seq_lens, out, rows,
+            logits.stride(0), logits.stride(1), k, stable, None,
+        )
+        aiter.top_k_per_row_decode(
+            logits, 1, seq_lens, out, rows,
+            logits.stride(0), logits.stride(1), k=k, stable=stable,
+        )
+        # `_run_adaptive` and the port both go on to call `_run_compiled`, so
+        # the first name recorded is the one that was dispatched to.
+        ran = launched[0] if launched else topk.BACKEND_UPSTREAM
+
+        # Compare selected values, not indices: a row of this many float32
+        # samples carries ties, and either index of a tied pair is a correct
+        # answer, so an index comparison reports a right kernel as wrong.
+        want_values = torch.sort(torch.topk(logits, k, dim=1).values, dim=1).values
+        got_values = torch.sort(logits.gather(1, out.long()), dim=1).values
+
+        expect_ran = declined_runs if got == topk.BACKEND_UPSTREAM else got
+        if got != want or ran != expect_ran or not torch.equal(got_values, want_values):
+            bad.append(
+                f"width={width} rows={rows} k={k} stable={stable}: "
+                f"gate said {got!r} (table says {want!r}), "
+                f"{ran!r} launched (expected {expect_ran!r}), "
+                f"values {'match' if torch.equal(got_values, want_values) else 'WRONG'}"
+            )
+
+        del logits, seq_lens, out, want_values, got_values
+        torch.cuda.empty_cache()
+
+    assert not bad, f"{len(bad)}/{len(cells)} cells:\n" + "\n".join(bad)
