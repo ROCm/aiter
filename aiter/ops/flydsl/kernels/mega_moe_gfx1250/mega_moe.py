@@ -242,9 +242,7 @@ class MegaMoEConfig:
     max_tokens_per_rank: int
     experts_per_rank: int
     topk: int
-    # Dispatch (stage1) knobs. They live here because this package has no
-    # stage1 config yet -- dispatch and gemm1 are not fused. When that fusion
-    # lands they move together into whatever config it brings.
+    # Dispatch (stage1) knobs.
     dispatch_block_num: int | None = None
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
@@ -1115,20 +1113,15 @@ class MegaMoEGfx1250:
         )
 
     def _build_tdm_dispatch(self, config: MegaMoEConfig, device) -> dict:
-        """The TDM dispatch, wearing `_make_dispatch`'s calling convention.
+        """Build FlyDSL TDM dispatch launchers keyed by (block, warp) spec.
 
-        It leaves the same arena state the vector dispatch does (disp_out rows
-        at slot*hidden, out_idx/out_wts at slot*topk+k, recv_to_src_token as
-        src_pe*max_tok+src_tok), so gemm1, the gemm2 P2P scatter and the fused
-        combine are untouched. Only the recv SLOT a token lands in changes:
-        slots are reserved one atomic per (block, peer) and handed out
-        block-local, so a test comparing arena contents slot-by-slot against
-        the vector dispatch will differ.
+        Arena layout is disp_out rows at slot*hidden, out_idx/out_wts at
+        slot*topk+k, recv_to_src_token as src_pe*max_tok+src_tok. Recv slots are
+        reserved one atomic per (block, peer) and handed out block-local.
 
-        The three staging arrays are this package's stand-in for the ``__device__``
-        BSS the HIP kernel keeps: FINALIZE gathers idx / weights / srcmap into a
-        peer-major destTokId SoA there so META can ship each block's reserved run
-        as a couple of contiguous TDM copies.
+        The staging arrays stand in for the HIP kernel's ``__device__`` BSS:
+        FINALIZE gathers idx / weights / srcmap into a peer-major destTokId SoA
+        so META can ship each block's reserved run as contiguous TDM copies.
         """
         payload_dim = config.dispatch_wire_elem_count
         elem_size = config.dispatch_wire_spec.recv_dtype.itemsize
@@ -1158,10 +1151,9 @@ class MegaMoEGfx1250:
         # On a quantized wire the metadata batch grew by a scale row while the
         # payload shrank, so the shared LDS tile is floored at the bf16 width.
         slab_bytes = config.hidden_dim * 2 if config.is_quant_dispatch_wire else 0
-        # A vector-tuned spec can name more warps than the payload tiles fit;
-        # clamp the width but keep the tuned block count, which is what paces
-        # the grid barrier, and keep the caller's spec as the variant key so the
-        # runtime pick still resolves.
+        # Clamp warp count to the LDS tile budget but keep the tuned block
+        # count, which is what paces the grid barrier, and keep the caller's
+        # spec as the variant key so the runtime pick still resolves.
         max_warps = tdm_max_warps(
             hidden_dim=payload_dim,
             hidden_elem_size=elem_size,
@@ -1261,18 +1253,12 @@ class MegaMoEGfx1250:
         return variants
 
     def _build_mori_dispatch(self, config: MegaMoEConfig) -> dict:
-        """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
+        """Build mori HIP/JIT dispatch launchers keyed by (block, warp) spec.
 
-        Only the kernel changes: mori leaves the same arena state this package's
-        own dispatch does (disp_out rows at slot*hidden, out_idx/out_wts at
-        slot*topk+k, recv_to_src_token as src_pe*max_tok+src_tok) and never
-        touches cross_device_barrier, so gemm1, the gemm2 P2P scatter and the
-        fused combine are untouched.
-
-        The recv SLOT a token lands in does change -- mori reserves a block's
-        slots with one atomic and hands them out block-local. Nothing indexes by
-        slot order, but a test comparing arena contents slot-by-slot against the
-        FlyDSL dispatch will differ.
+        Arena layout matches the FlyDSL TDM path (disp_out rows at slot*hidden,
+        out_idx/out_wts at slot*topk+k, recv_to_src_token as
+        src_pe*max_tok+src_tok). mori never touches cross_device_barrier.
+        Recv slots are reserved one atomic per block and handed out block-local.
         """
         try:
             from mori.ops.dispatch_combine_v2.ep_plans import EpDispatchPlan
