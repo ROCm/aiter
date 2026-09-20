@@ -24,11 +24,24 @@ _LOGGER = AiterTritonLogger()
 
 
 def num_programs(x):
+    # Previously used for both forward and backward operators, now backward only
     return min(x.shape[0], get_num_sms())
 
 
 def block_size(x):
-    return min(65536 // x.element_size(), triton.next_power_of_2(x.shape[1]))
+    n_pow2 = triton.next_power_of_2(x.shape[1])
+    cap = 65536 // x.element_size()
+    if get_arch() == "gfx950":
+        # Cap blocked path at 8192 (fastest) to avoid severe VGPR spilling
+        blocked_max_block_size = 8192
+        if n_pow2 > cap:
+            # blocked; still < the row, so use_blocked() holds
+            return blocked_max_block_size
+        return n_pow2
+    else:
+        # Previous block size selection
+        # TODO: retune to account for updated compiler
+        return min(cap, n_pow2)
 
 
 def use_blocked(x):
@@ -37,6 +50,22 @@ def use_blocked(x):
 
 def dg_tmp_rows(x):
     return x.shape[0] if use_blocked(x) else num_programs(x)
+
+
+def num_programs_fwd(x):
+    # Replaces num_programs() for the forward operators on gfx950, and falls back
+    # to num_programs() for other architectures
+    if get_arch() == "gfx950":
+        # num_programs() caps the grid at one workgroup per CU, so oversubscribe
+        fwd_program_oversub = 4
+        fwd_oversub_max_block_size = 8192
+        # except large blocks
+        if block_size(x) > fwd_oversub_max_block_size:
+            return num_programs(x)
+        return min(x.shape[0], get_num_sms() * fwd_program_oversub)
+    else:
+        # TODO: retune to account for updated compiler
+        return num_programs(x)
 
 
 def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
@@ -48,7 +77,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs(x)
+    NUM_PRGMS = num_programs_fwd(x)
 
     grid = lambda meta: (NUM_PRGMS,)
     _rms_norm_kernel[grid](
@@ -83,7 +112,7 @@ def _rmsnorm_forward_with_add(
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs(x)
+    NUM_PRGMS = num_programs_fwd(x)
 
     grid = lambda meta: (NUM_PRGMS,)
     _fused_add_rmsnorm_kernel[grid](
@@ -190,6 +219,8 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     if need_reduction:
         grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
+        # Widening the workgroup helps on gfx950. Left at default otherwise
+        dg_reduce_kwargs = {"num_warps": 8} if get_arch() == "gfx950" else {}
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
             dg_tmp,
             dgamma,
@@ -198,6 +229,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             dg_tmp.shape[1],
             BLOCK_SIZE_M=128,
             BLOCK_SIZE_N=64,
+            **dg_reduce_kwargs,
         )
 
     return dx, dgamma
@@ -373,7 +405,7 @@ def rmsnorm2d_fwd_with_smoothquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -443,7 +475,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False
@@ -520,7 +552,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -583,7 +615,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False

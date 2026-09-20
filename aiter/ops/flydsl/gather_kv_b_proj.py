@@ -5,7 +5,7 @@
 
 Supported: fp8 KV cache (OCP e4m3), fp8 weight in either row-major or
 ``shuffle_weight((16,16))`` layout, per-output-row *or* 128x128 block weight
-scale, per-tensor activation scale, page_size 1, bf16 outputs, gfx950.
+scale, per-tensor activation scale, page_size 1, bf16 or scaled fp8 outputs, gfx950.
 
 The cache has no size limit: up to 4 GiB it is reached through one buffer
 descriptor, beyond that through 64-bit per-lane addresses. Output width is
@@ -190,8 +190,14 @@ def _unsupported_reason(
             f"outputs must be 3-D, got {tuple(k_prefix.shape)}, "
             f"{tuple(v_prefix.shape)}"
         )
-    if k_prefix.dtype != torch.bfloat16 or v_prefix.dtype != torch.bfloat16:
-        return "outputs must be bf16"
+    if (
+        k_prefix.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        or v_prefix.dtype != k_prefix.dtype
+    ):
+        return "outputs must both be bf16 or float8_e4m3fn"
+    for name, t in (("k_prefix", k_prefix), ("v_prefix", v_prefix)):
+        if not t.is_contiguous() or t.device != k_buffer.device:
+            return f"{name} must be contiguous and on the cache device"
 
     total_kv, n_heads, kp_dim = k_prefix.shape
     total_kv_v, n_heads_v, v_dim = v_prefix.shape
@@ -268,6 +274,7 @@ def compile_gather_kv_b_proj(
     weight_preshuffle: bool,
     per_row_scale: bool,
     wide_index: bool,
+    output_fp8: bool = False,
 ):
     """Compile (and memoize) a gather+proj launcher."""
     _validate(
@@ -290,6 +297,7 @@ def compile_gather_kv_b_proj(
         weight_preshuffle=bool(weight_preshuffle),
         per_row_scale=bool(per_row_scale),
         wide_index=bool(wide_index),
+        output_fp8=bool(output_fp8),
     )
 
 
@@ -333,8 +341,8 @@ def gather_kv_b_proj_flydsl(
     kv_prefix_sum_context_lens: Tensor,  # unused, see kv_indptr
     kv_proj_weight: Tensor,  # [n_heads*(nope+v_dim), 512] fp8, shuffle_weight(w, (16,16))
     kv_proj_scale: Tensor,  # [weight_n] or [weight_n, 1] fp32, per-row
-    k_prefix: Tensor,  # [total_kv, n_heads, nope+64] bf16, written in place
-    v_prefix: Tensor,  # [total_kv, n_heads, v_dim] bf16, written in place
+    k_prefix: Tensor,  # [total_kv, n_heads, nope+64] bf16 or fp8, written in place
+    v_prefix: Tensor,  # [total_kv, n_heads, v_dim] bf16 or fp8, written in place
     *,
     num_tokens: int | None = None,
     weight_preshuffle: bool = True,
@@ -342,8 +350,21 @@ def gather_kv_b_proj_flydsl(
     block_m: int | None = None,
     waves_per_eu: int = 2,
     xcd_swizzle: int | None = None,
+    k_out_scale: Tensor | None = None,
+    v_out_scale: Tensor | None = None,
 ) -> None:
     """Fused gather + kv_b_proj + rope copy. Writes k_prefix / v_prefix in place.
+
+    FP8 requires caller-supplied ``k_out_scale`` / ``v_out_scale``: single-element
+    fp32 tensors on the cache device. BF16 must omit both. Descales and their
+    fp32 reciprocals must be positive and finite.
+    Conversion uses ``inv = fp32(1 / scale)`` then
+    ``out = saturate_e4m3(fp32(projection * inv))``; division can round differently.
+    RoPE uses ``saturate_e4m3(fp32(cache_rope * fp32(k_scale * inv)))`` with K's inv.
+    Dequantize as ``out.float() * scale``. No BF16 intermediate or amax is computed.
+    Scale values remain unchecked on device for graph capture. Invalid scales can
+    silently produce NaN K/V (e.g. zero scale gives ``0 * inf``); saturation does
+    not sanitize NaNs.
 
     ``kv_indptr`` and ``kv_prefix_sum_context_lens`` are accepted but unused --
     with page_size 1 the output row index *is* the token index, which is why the
@@ -376,6 +397,21 @@ def gather_kv_b_proj_flydsl(
     )
     if reason is not None:
         _raise(reason)
+
+    output_fp8 = k_prefix.dtype == torch.float8_e4m3fn
+    for name, t in (("k_out_scale", k_out_scale), ("v_out_scale", v_out_scale)):
+        if output_fp8:
+            if (
+                t is None
+                or t.dtype != torch.float32
+                or t.numel() != 1
+                or t.device != k_buffer.device
+            ):
+                raise ValueError(
+                    f"[FlyDSL gather_kv_b_proj] {name} must be a single fp32 descale on the cache device for fp8 outputs"
+                )
+        elif t is not None:
+            raise ValueError(f"[FlyDSL gather_kv_b_proj] {name} requires fp8 outputs")
 
     num_blocks = k_buffer.shape[0]
     total_kv, n_heads, kp_dim = k_prefix.shape
@@ -435,6 +471,7 @@ def gather_kv_b_proj_flydsl(
         # measure the same, so the split is not for speed: the descriptor form
         # keeps the hardware bounds check, which the wide form gives up.
         wide_index=(num_blocks * KV_ROW_ELEMS >= _BUFFER_SPAN_MAX),
+        output_fp8=bool(output_fp8),
     )
 
     # Local: `ptr_arg` keeps only the address, so a `.contiguous()` temporary
@@ -448,8 +485,11 @@ def gather_kv_b_proj_flydsl(
         _as_i8(kv_proj_weight.contiguous()).view(-1),
         scale.contiguous(),
         k_scale.reshape(-1).to(torch.float32).contiguous(),
-        k_prefix.view(-1),
-        v_prefix.view(-1),
+        _as_i8(k_prefix).view(-1),
+        _as_i8(v_prefix).view(-1),
+        # BF16 unity placeholders are compile-time constants, absent from the ABI.
+        k_out_scale.reshape(-1) if output_fp8 else 1.0,
+        v_out_scale.reshape(-1) if output_fp8 else 1.0,
         m_rows,
         fx.Stream(torch.cuda.current_stream(device=k_buffer.device)),
     )

@@ -92,6 +92,26 @@ def _route(k1: bool | None = None, k2: bool | None = None):
         ) = saved
 
 
+@contextlib.contextmanager
+def _k2_tuner_search_space():
+    """Hand K2's autotuner the candidates a tuning build gives it.
+
+    The launch path pins one config, and Triton consults its autotune cache
+    only when there is more than one to choose between, so a test about the
+    key has to supply the space the key indexes.
+    """
+    if len(_flash_kda._K2_CONFIGS) < 2:
+        pytest.skip("no published K2 candidates on this device to key between")
+    kern = _flash_kda._flash_kda_segment_kernel
+    saved = kern.configs
+    kern.configs = list(_flash_kda._K2_CONFIGS)
+    try:
+        yield kern
+    finally:
+        kern.configs = saved
+        kern.cache.clear()
+
+
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
     """Default five-kernel pipeline."""
     with _force_default_pipeline():
@@ -363,9 +383,9 @@ def test_tuner_keeps_the_two_schedules_apart():
     K2's grid is ``cdiv(W, BW) * num_segs * H``, so the wide BW that suits a
     segmented sweep leaves the unsegmented scan a quarter of the blocks: at
     H=12 that pick costs 2.3x. The two collide unless the segment count reaches
-    the autotune key, and `cache_results` then persists whichever won.
+    the autotune key, and `cache_results` then persists whichever won. Only a
+    tuning build chooses, so the tuner is given its config space here.
     """
-    kern = _flash_kda._flash_kda_segment_kernel
     args = make_inputs(1, 1024, 4)
     # An incoming state is what makes the two output passes otherwise identical:
     # without it the unsegmented one passes h_in=None and the key picks up the
@@ -373,12 +393,12 @@ def test_tuner_keeps_the_two_schedules_apart():
     kw = {"initial_state": torch.zeros(1, 4, K_DIM, K_DIM, device=device)}
     # This is about the Triton kernel's autotuner, which never runs -- and whose
     # cache therefore stays empty -- when K2 is routed to Gluon.
-    with _route(k2=False):
+    with _k2_tuner_search_space() as kern, _route(k2=False):
         kern.cache.clear()
         run_flash(*args, chunks_per_seg=4, **kw)
         segmented_keys = set(kern.cache)
         run_flash(*args, chunks_per_seg=0, **kw)
-    assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
+        assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
 
 
 def test_published_k2_schedules_can_split_their_tile():
@@ -387,7 +407,19 @@ def test_published_k2_schedules_can_split_their_tile():
     Above BW // 16 the extra warps recompute columns their neighbours already
     hold -- still correct, which is why nothing downstream catches it, and the
     pairs are now editable from a config file rather than derived.
+
+    An arch that publishes neither schedule has nothing here to check. Both
+    lookups then return _K2_GLUON_FALLBACK, whose MIN_BLOCKS_PER_CU of 0 makes
+    the occupancy test vacuous, so the wide branch is taken for every shape and
+    exactly one pair is reachable by construction rather than by choice.
     """
+    if (
+        _flash_kda.chunk_delta_attn_tuned_config(
+            "k2_ab_fused_gluon_wide", _flash_kda._K2_GLUON_FALLBACK, backend="gluon"
+        )
+        is _flash_kda._K2_GLUON_FALLBACK
+    ):
+        pytest.skip("this arch publishes no Gluon K2 schedules")
     reached = set()
     for W in (64, 128, 256):
         for num_segs in (1, 2, 8, 64, 512):

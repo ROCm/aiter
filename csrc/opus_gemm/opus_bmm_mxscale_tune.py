@@ -15,10 +15,15 @@ unaligned shape while the runtime dispatched it there anyway.
 
 Runtime schema (what the tuner emits, and what the runtime reads back):
     gfx,b,m,n,k,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-``aiter/ops/batched_gemm_op_a8w8.py:lookup_mxscale_bmm_config`` indexes on
+``aiter/ops/opus/policy.py:lookup_mxscale_bmm_config`` indexes on
 ``["gfx","b","m","n","k"]``, dispatches to a backend on the winning row's
-``libtype``, and ``bmm_op.py`` reads ``kernelId`` / ``splitK`` off that row, so
+``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
+the batch-first ``opus_bmm`` entry, so
 those columns must match exactly.
+
+The shipped schema has no output-dtype key. This tuner deliberately measures
+the production BF16 route; FP32 production calls can execute the selected kid,
+but do not have an independently tuned winner in this CSV format.
 
 Verification (the part that catches column-transpose / scale defects):
   * inputs are *signed* and have *per-128-K-block varied magnitude*
@@ -27,6 +32,10 @@ Verification (the part that catches column-transpose / scale defects):
     column permutation (kid312/313 measured ~0.007 there but ~0.7-1.0 on real
     signed data) -- see the opus_bmm.md root-cause note.
   * reference is a dequantized fp32 einsum.
+  * output is allocated as contiguous ``[M,G,N]`` exactly like production and
+    passed to the batch-first public API through a transpose view. The existing
+    batch-first activation/scale storage is retained, matching the canonical
+    production transpose-view inputs.
   * gate: ``mp_tuner`` runs ``checkAllclose(rtol=1e-2, atol=1e-2)`` and
     ``post_process`` keeps the fastest candidate whose mismatch fraction is
     ``<= --errRatio`` (default 0.02). A still-broken tileN COM_REP_N>1 kernel
@@ -37,10 +46,11 @@ tree wins over any installed aiter):
     cd <repo> && PYTHONPATH=$PWD \\
         python3 csrc/opus_gemm/opus_bmm_mxscale_tune.py -g 16 -m 1,16,64 -n 1024 -k 4096
 
-    # re-tune every shape already in the shipped CSV, write a diffable copy:
+    # tune shipped shapes not already present in the diffable output copy;
+    # add --all to force every shipped shape to be measured again:
     ... opus_bmm_mxscale_tune.py
 
-    # overwrite the shipped tuned CSV in place:
+    # overwrite the shipped tuned CSV in place (--apply implies --all):
     ... opus_bmm_mxscale_tune.py --apply
 
     # from an untuned CSV (columns: b,m,n,k -- or g,m,n,k), 8-way parallel:
@@ -56,6 +66,7 @@ tree wins over any installed aiter):
     ... opus_bmm_mxscale_tune.py -i shapes.csv -o /tmp/preb.csv --pool preb --mp 8
 """
 
+import math
 import os
 import sys
 from typing import Any, ClassVar
@@ -64,7 +75,7 @@ import pandas as pd
 import torch
 
 from aiter import dtypes, logger
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
+from aiter.ops.opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 from aiter.ops.shuffle import shuffle_scale_a, shuffle_scale_b, shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
@@ -85,6 +96,7 @@ from opus_gemm_common import (
     _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF,
     _opus_sf_shuf_sub,
     a8w8_mxscale_bmm_kernel_lists,
+    bmm_mxscale_global_kid,
 )
 from test_opus_a8w8_bmm import (
     GROUP,
@@ -114,41 +126,46 @@ _SK = [1, 2, 4, 8]
 # Tuning policy: kid -> splitK list. The ONLY hand-maintained per-kid metadata --
 # it decides which kids to sweep and with which split-K factors, not their
 # geometry and not their M alignment. Tile shape, kernelName and m_align all come
-# from the codegen instance, so this cannot drift from what compiles. kid 0 (the
+# from the codegen instance, so this cannot drift from what compiles. kid 8000 (the
 # heuristic default) is intentionally not tuned.
 _TUNE_POLICY = {
     # flatmm_splitk family: the M=16/32 last-mile tiles, the mid-M SFA/SFB-preload
     # tiles and the 64x* tiles. All are split-K capable via the fused reduce tail,
     # except kid646 whose persistent DIRECT_ONLY schedule requires splitK == 1.
-    32: _SK,
-    64: _SK,
-    138: _SK,
-    139: _SK,
-    256: _SK,
-    311: _SK,
-    312: _SK,
-    313: _SK,
-    314: _SK,
-    316: _SK,
-    317: _SK,
-    318: _SK,
-    319: _SK,
-    320: _SK,
-    321: _SK,
-    322: _SK,
-    323: _SK,
-    324: _SK,
-    326: _SK,
-    327: _SK,
-    640: _SK,
-    642: _SK,
-    646: [1],
-    650: _SK,
-    653: _SK,
+    8032: _SK,
+    8064: _SK,
+    8138: _SK,
+    8139: _SK,
+    8256: _SK,
+    8311: _SK,
+    8312: _SK,
+    8313: _SK,
+    8314: _SK,
+    8316: _SK,
+    8317: _SK,
+    8318: _SK,
+    8319: _SK,
+    8320: _SK,
+    8321: _SK,
+    8322: _SK,
+    8323: _SK,
+    8324: _SK,
+    8326: _SK,
+    8327: _SK,
+    8640: _SK,
+    8642: _SK,
+    8646: [1],
+    8650: _SK,
+    8653: _SK,
     # fused single-tile launcher.
-    100: [1],
+    8100: [1],
     # pipeline family; kid158 preloads both the per-token SFA and the block SFB
     # panel into LDS.
+    8149: [1],
+    8150: [1],
+    8151: [1],
+    8152: [1],
+    8158: [1],
     149: [1],
     150: [1],
     151: [1],
@@ -220,17 +237,17 @@ _TUNE_POLICY = {
     # for what preshuffling B is worth at the tile the shipped table leans on.
     196: [1],
     # monolithic mouter / wave pipelines.
-    131: [1],
-    132: [1],
-    134: [1],
-    142: [1],
-    144: [1],
-    148: [1],
-    160: [1],
-    161: [1],
+    8131: [1],
+    8132: [1],
+    8134: [1],
+    8142: [1],
+    8144: [1],
+    8148: [1],
+    8160: [1],
+    8161: [1],
     # minterleave only exists in split-K form.
-    162: [2, 4, 8],
-    163: [2, 4, 8],
+    8162: [1],
+    8163: [1],
     # 128x128x128 tiles, splitK=1 only and deliberately so. They are the largest
     # BMM tile (COM_REP_M=4 x COM_REP_N=8 -> 32 C fragments, 128 fp32 C values per
     # lane) at 512 VGPRs / occupancy 1. At splitK=1 they run the Cbf16
@@ -239,9 +256,9 @@ _TUNE_POLICY = {
     # never won (g2/m256: best kid325 split-K is 23.6us against the 14.5us winner),
     # and which is also where the clang-22 gfx950 greedy-VGPR miscompile lives (one
     # C-fragment dword left unmaterialized under --amdgpu-mfma-vgpr-form).
-    128: [1],
-    137: [1],
-    325: [1],
+    8128: [1],
+    8137: [1],
+    8325: [1],
 }
 
 # The blds twins, derived rather than listed: a twin is its plain kid's tile with
@@ -465,16 +482,15 @@ _dead = sorted(set(_TUNE_POLICY) - set(_CODEGEN_BMM))
 assert not _dead, f"_TUNE_POLICY lists kids the codegen does not emit: {_dead}"
 
 # Only the flatmm_splitk (non-direct) and minterleave launchers honor splitK>1.
+# Only non-direct flatmm split-K launchers are swept with splitK>1.
 # Any other family sweeping it is a policy bug, so fail loudly at import.
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
         _tag = _CODEGEN_BMM[_kid].kernel_tag
         assert (
             _tag == "a8w8_mxscale_bmm_flatmm_splitk"
-            and not getattr(_CODEGEN_BMM[_kid], "direct_only", False)
-        ) or _tag == "a8w8_mxscale_bmm_minterleave", (
-            f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
-        )
+            and not _CODEGEN_BMM[_kid].direct_only
+        ), f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
 
 
 # Families whose kernel implements the SHUFFLE_SCALE template bool at all. The
@@ -691,6 +707,59 @@ BPRESHUFFLE_CSV = os.path.join(
 )
 
 
+def _read_shape_csv(path):
+    """Read ``b/g,m,n,k`` shape rows with a clear schema error."""
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"MXFP8 BMM shape CSV does not exist: {path}") from exc
+
+    df.columns = [str(column).strip().lower() for column in df.columns]
+    bcol = "b" if "b" in df.columns else "g" if "g" in df.columns else None
+    required = {"m", "n", "k"}
+    missing = sorted(required.difference(df.columns))
+    if bcol is None or missing:
+        expected = "b,m,n,k (or g,m,n,k)"
+        raise ValueError(
+            f"MXFP8 BMM shape CSV {path!r} must contain {expected}; "
+            f"got columns {list(df.columns)}"
+        )
+    return [
+        (int(row[bcol]), int(row["m"]), int(row["n"]), int(row["k"]))
+        for _, row in df.iterrows()
+    ]
+
+
+def _validate_tune_shapes(shapes):
+    """Normalize, deduplicate and enforce the global MXFP8 BMM contract."""
+    valid = []
+    seen = set()
+    for raw_shape in shapes:
+        try:
+            g, m, n, k = map(int, raw_shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MXFP8 BMM shape must be (G,M,N,K), got {raw_shape!r}"
+            ) from exc
+        shape = (g, m, n, k)
+        if min(shape) <= 0:
+            raise ValueError(
+                "MXFP8 BMM requires positive G, M, N and K; "
+                f"got G={g}, M={m}, N={n}, K={k}"
+            )
+        if n % GROUP or k % GROUP:
+            raise ValueError(
+                f"MXFP8 BMM requires N and K to be multiples of {GROUP}; "
+                f"got G={g}, M={m}, N={n}, K={k}"
+            )
+        if shape not in seen:
+            seen.add(shape)
+            valid.append(shape)
+    if not valid:
+        raise ValueError("no MXFP8 BMM shapes were provided for tuning")
+    return valid
+
+
 # ---------------------------------------------------------------------------
 # mp_tuner hooks (module-level so the spawn workers can import them by name).
 # ---------------------------------------------------------------------------
@@ -701,22 +770,42 @@ def _gen_varied(shape, k, device):
     return (x * amp.repeat_interleave(GROUP)).to(dtypes.bf16)
 
 
-def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
-    """Return the 9-tuple mp_tuner indexes into:
+def _workspace_numel(kernel_id, split_k, batch, m, n):
+    instance = _CODEGEN_BMM[int(kernel_id)]
+    if split_k <= 1 or instance.kernel_tag not in {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_fused",
+    }:
+        return 0
+    tiles_m = (m + instance.B_M - 1) // instance.B_M
+    tiles_n = (n + instance.B_N - 1) // instance.B_N
+    partial_numel = split_k * batch * tiles_m * instance.B_M * tiles_n * instance.B_N
+    if instance.kernel_tag != "a8w8_mxscale_bmm_fused":
+        return partial_numel
+    counter_offset = (partial_numel * 4 + 255) & ~255
+    counter_bytes = batch * tiles_m * tiles_n * 4
+    return (counter_offset + counter_bytes + 3) // 4
+def gen_bmm_mxscale_data(
+    batch, m, n, k, seed, out_dtype, kernel_id, split_k, device="cuda"
+):
+    """Return the 10-tuple mp_tuner indexes into:
 
-    0 O_in   [m,g,k]     fp8 (mmajor transposed view, K contiguous)
+    0 O_mx   [g,m,k]     fp8 batch-first contiguous input
     1 W_mx   [g,n,k]     fp8 (batch-major)
-    2 Y       [m,g,n]     out_dtype output buffer
-    3 xs_in  [m,g,k/128] uint8 e8m0 per-token scale (mmajor view)
+    2 Y       [m,g,n]     contiguous production-layout output buffer
+    3 xs_mx  [g,m,k/128] uint8 e8m0 batch-first contiguous scale
     4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
-    5 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
-    6 W_sh   [g,n,k]     the same B in the (16,16) preshuffled layout
-    7 xs_sh  [m,g,W]     the same A scale in the shuffle_scale_a layout
-    8 ws_sh  [g,n/128,*] the same B scale in the shuffle_scale_b layout
+    5 workspace optional caller-owned FP32 split-K buffer, None when unused
+    6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
+    7 W_sh    [g,n,k]     the same B in the (16,16) preshuffled layout
+    8 xs_sh   [m,g,W]     the same A scale in the shuffle_scale_a layout
+    9 ws_sh   [g,n/128,*] the same B scale in the shuffle_scale_b layout
 
-    Slots 7/8 are built here for the same reason 6 is: they are a permutation of
-    what is already in 3/4, so the slot-5 reference covers them, and building
-    them in the generator keeps the relayout out of what is timed.
+    Slot 5 is upstream's: #4961 moved split-K workspace ownership out of the
+    kernel and onto the caller. Slots 7/8/9 are ours, built here for the same
+    reason 7 is: they are a permutation of what is already in 3/4, so the
+    slot-6 reference covers them, and building them in the generator keeps the
+    relayout out of what is timed.
 
     They are also built here rather than closed over, which is the whole point.
     run_perftest deep-copies the *arguments* it is handed into rotate_args sets
@@ -732,9 +821,14 @@ def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
     W_bf16 = _gen_varied((batch, n, k), k, device)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
-    O_in = O_mx.transpose(0, 1)  # [m,g,k]
-    xs_in = xs_mx.transpose(0, 1)  # [m,g,k/128]
     Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
+
+    workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
+    workspace = (
+        torch.empty(workspace_numel, dtype=torch.float32, device=device)
+        if workspace_numel
+        else None
+    )
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
     # The preshuffled-B kids read B through the (16,16) MFMA-fragment layout that
     # a serving stack bakes into the weight offline. It is a permutation, so the
@@ -751,11 +845,11 @@ def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
     # Kept 3-D with the N-block axis in the middle so stride(0) is the per-batch
     # slab, the only term the shuffled path reads.
     ws_sh = shuffle_scale_b(ws_mx, n, k).view(batch, n // 128, -1)
-    return (O_in, W_mx, Y, xs_in, ws_mx, ref, W_sh, xs_sh, ws_sh)
+    return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref, W_sh, xs_sh, ws_sh)
 
 
 def run_bmm_mxscale_bench(
-    O_in, W_mx, Y, xs_in, ws_mx, W_sh, xs_sh, ws_sh, kernelId, splitK
+    O_mx, W_mx, Y, xs_mx, ws_mx, workspace, W_sh, xs_sh, ws_sh, kernelId, splitK
 ):
     """Tuner bench func: run the kid in-place, return Y for checkAllclose.
 
@@ -768,19 +862,28 @@ def run_bmm_mxscale_bench(
     wrong: a shuffled kid handed the plain panels reads the wrong elements and
     returns a plausible wrong number rather than faulting. Both forms are already
     materialised in the data tuple, so this only picks.
+
+    `workspace` is whatever slot 5 holds -- None for split_k <= 1, and for the
+    families that never take the fp32 partials path at all. The launch entry
+    sizes and allocates it when it is None, so passing it through unexamined is
+    correct here; the tuner only has to keep it out of the timed region, which
+    generating it in the data tuple already does.
     """
     inst = _CODEGEN_BMM[kernelId]
     Wb = W_sh if inst.needs_preshuffled_b else W_mx
     if inst.needs_shuffle_scale:
         sfa, sfb = xs_sh, ws_sh
     else:
-        sfa, sfb = xs_in, ws_mx
-    _opus_bmm_a8w8_mxscale_raw(O_in, Wb, Y, sfa, sfb, splitK, kernelId)
+        sfa, sfb = xs_mx, ws_mx
+    _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+        O_mx, Wb, Y, sfa, sfb,
+        workspace=workspace, kid=kernelId, split_k=splitK,
+    )
     return Y
 
 
 def _bmm_ref_passthrough(ref):
-    """ref_func: the fp32 reference is precomputed in gen_data (slot 5)."""
+    """ref_func: the fp32 reference is precomputed in gen_data (slot 6)."""
     return ref
 
 
@@ -796,6 +899,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         # sit at the ~1e-4 fp8 e8m0 quant floor; a column-transposed kid is ~0.5.
         "errRatio": 0.02,
         "batch": 100,
+        "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
     KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k"]
@@ -910,7 +1014,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             "--apply",
             action="store_true",
             default=False,
-            help="overwrite the shipped tuned CSV in place",
+            help="overwrite the shipped tuned CSV in place (implies --all)",
         )
         self.parser.add_argument(
             "--bpreshuffle",
@@ -943,13 +1047,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
     # --- shape sourcing -----------------------------------------------------
     def _shapes_from_shipped(self):
-        try:
-            df = pd.read_csv(SHIPPED_CSV)
-        except FileNotFoundError:
-            return []
-        return sorted(
-            {(int(r.b), int(r.m), int(r.n), int(r.k)) for _, r in df.iterrows()}
-        )
+        return sorted(set(_read_shape_csv(SHIPPED_CSV)))
 
     def pre_process(self, args):
         if args.apply and args.bpreshuffle:
@@ -960,9 +1058,20 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             args.tune_file = BPRESHUFFLE_CSV
             if args.pool == "all":
                 args.pool = "preb"
+            # Reading and writing the shipped CSV otherwise makes every source
+            # shape look already tuned and silently produces zero tasks.
+            args.all = True
 
         gfx = self.get_gfx()
-        if args.batch_g and args.M:
+        if gfx != "gfx950":
+            raise RuntimeError(f"MXFP8 BMM tuning is gfx950-only; detected {gfx!r}")
+
+        manual_g = args.batch_g is not None
+        manual_m = args.M is not None
+        if manual_g != manual_m:
+            raise ValueError("-g/--batch_g and -m/--M must be provided together")
+
+        if manual_g:
             shapes = [
                 (g, m, n, k)
                 for g in args.batch_g
@@ -970,19 +1079,14 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                 for n in args.N
                 for k in args.K
             ]
-        elif args.untune_file and os.path.exists(args.untune_file):
-            df = pd.read_csv(args.untune_file)
-            df.columns = [c.strip().lower() for c in df.columns]
-            bcol = "b" if "b" in df.columns else "g"
-            shapes = [
-                (int(r[bcol]), int(r["m"]), int(r["n"]), int(r["k"]))
-                for _, r in df.iterrows()
-            ]
+        elif args.untune_file:
+            shapes = _read_shape_csv(args.untune_file)
         else:
             logger.info(
                 "no -g/-m and no untune_file; re-tuning shapes from %s", SHIPPED_CSV
             )
             shapes = self._shapes_from_shipped()
+        shapes = _validate_tune_shapes(shapes)
 
         self.untunedf = pd.DataFrame(
             [{"gfx": gfx, "b": g, "m": m, "n": n, "k": k} for (g, m, n, k) in shapes],
@@ -1000,6 +1104,153 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             if args.verbose and mask.any():
                 logger.info("skipping %d already-tuned shapes", int(mask.sum()))
             self.untunedf = self.untunedf[~mask].reset_index(drop=True)
+
+    # --- saved exact-kid benchmark ------------------------------------------
+    def _clear_op_caches(self):
+        from aiter.ops import batched_gemm_op_a8w8
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        batched_gemm_op_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
+
+    def run_config(self, args):
+        from aiter.test_common import checkAllclose, run_perftest
+
+        required = {"libtype", "kernelId", "splitK"}
+        missing = required.difference(self.untunedf.columns)
+        if missing:
+            if missing == required:
+                return self._run_default_config(args)
+            raise ValueError(
+                f"--run_config requires a tuned CSV with {sorted(missing)}"
+            )
+
+        results = []
+        for seed, (_, row) in enumerate(self.untunedf.iterrows(), start=1):
+            b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+            if str(row["libtype"]).strip().lower() != "opus":
+                raise ValueError(
+                    "MXFP8 BMM --run_config only supports libtype=opus; "
+                    f"got {row['libtype']!r} for B={b}, M={m}, N={n}, K={k}"
+                )
+
+            saved_kid = int(row["kernelId"])
+            kernel_id = saved_kid
+            if kernel_id not in _CODEGEN_BMM:
+                legacy_global_kid = bmm_mxscale_global_kid(saved_kid)
+                if legacy_global_kid in _CODEGEN_BMM:
+                    kernel_id = legacy_global_kid
+            if kernel_id not in _CODEGEN_BMM:
+                raise ValueError(
+                    f"saved MXFP8 BMM kid {saved_kid} is not registered on gfx950"
+                )
+
+            split_k = int(row["splitK"])
+            if split_k not in _applicable(kernel_id, b, m, n, k):
+                raise ValueError(
+                    f"saved MXFP8 BMM kid {saved_kid} (global {kernel_id}) with "
+                    f"splitK={split_k} is incompatible with "
+                    f"B={b}, M={m}, N={n}, K={k}"
+                )
+
+            shape_str = f"B={b},M={m},N={n},K={k},kid={kernel_id},splitK={split_k}"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            data = gen_bmm_mxscale_data(
+                b,
+                m,
+                n,
+                k,
+                seed,
+                dtypes.bf16,
+                kernel_id,
+                split_k,
+            )
+            data[2].fill_(float("nan"))
+            out, us = run_perftest(
+                run_bmm_mxscale_bench,
+                *data[:6],
+                kernel_id,
+                split_k,
+                num_warmup=args.warmup,
+                num_iters=args.iters,
+            )
+            err_ratio = checkAllclose(
+                out,
+                data[6],
+                rtol=1e-2,
+                atol=1e-2,
+                tol_err_ratio=allowed,
+                msg=f"run_config {shape_str}",
+                printLog=args.verbose,
+            )
+            if (
+                not math.isfinite(us)
+                or us <= 0
+                or not math.isfinite(err_ratio)
+                or err_ratio > allowed
+            ):
+                raise RuntimeError(
+                    f"saved MXFP8 BMM kid {kernel_id} failed: "
+                    f"us={us}, errRatio={err_ratio} (>{allowed_desc})"
+                )
+            results.append({"shape": shape_str, "e2e_us": us, "status": "ok"})
+        return results
+
+    def _run_default_config(self, args):
+        """Keep shape-only ``--run_config``/``--compare`` on production policy."""
+        from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+        from aiter.test_common import checkAllclose, run_perftest
+
+        results = []
+        for seed, (_, row) in enumerate(self.untunedf.iterrows(), start=1):
+            b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+            shape_str = f"({b}, {m}, {n}, {k})"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            try:
+                # 10-tuple now: upstream's workspace at 5, our shuffled B/scale
+                # forms at 7/8/9. This site only needs the plain operands and the
+                # reference, so the tail is dropped rather than named.
+                (
+                    O_mx, W_mx, _Y, xs_mx, ws_mx, _workspace, ref, *_shuf
+                ) = gen_bmm_mxscale_data(
+                    b,
+                    m,
+                    n,
+                    k,
+                    seed,
+                    dtypes.bf16,
+                    8000,
+                    1,
+                )
+                out, us = run_perftest(
+                    batched_gemm_a8w8_mxscale,
+                    O_mx.transpose(0, 1),
+                    W_mx,
+                    xs_mx.transpose(0, 1),
+                    ws_mx,
+                    dtype=dtypes.bf16,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                err_ratio = checkAllclose(
+                    out,
+                    ref,
+                    rtol=1e-2,
+                    atol=1e-2,
+                    msg=f"run_config {shape_str}",
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= allowed
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{exc}"}
+                )
+        return results
 
     # --- tuning -------------------------------------------------------------
     def tune(self, untunedf, tunedf, args):
@@ -1035,15 +1286,16 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                         (
                             info,
                             gen_bmm_mxscale_data,
-                            (b, m, n, k, seed, out_dtype),
+                            (b, m, n, k, seed, out_dtype, kid, sk),
                             run_bmm_mxscale_bench,
                             # Every buffer a kid might read is passed as an
                             # argument, never closed over, so run_perftest
                             # rotates all of them; the bench picks per kid.
-                            ([0, 1, 2, 3, 4, 6, 7, 8], kid, sk),
+                            # 6 (ref) is the checker's, not the kernel's.
+                            ([0, 1, 2, 3, 4, 5, 7, 8, 9], kid, sk),
                             perf_kwargs,
                             _bmm_ref_passthrough,
-                            ([5],),
+                            ([6],),
                             {},
                             None,
                             1e-2,  # rtol

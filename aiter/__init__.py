@@ -145,7 +145,19 @@ else:
     from .ops.gdr_decode_packed_bf16 import *
     from . import mla  # noqa: F401
 
-    # isort: on
+if AITER_TRITON_ONLY:
+
+    def is_gfx1250_asm_supported() -> bool:
+        return True
+
+    def require_gfx1250_asm(op_name: str) -> None:
+        return None
+
+else:
+    from .jit.utils.asm_guard import (  # noqa: F401
+        is_gfx1250_asm_supported,
+        require_gfx1250_asm,
+    )
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:

@@ -5,7 +5,7 @@
 
 Covers the one configuration the FlyDSL backend implements: page_size 1, fp8 KV
 cache, fp8 ``shuffle_weight((16,16))`` weight, per-output-row weight scale,
-per-tensor activation scale, bf16 outputs, gfx950 -- at both the DeepSeek
+per-tensor activation scale, bf16 or scaled fp8 outputs, gfx950 -- at both the DeepSeek
 128+128 head and the GLM-5.2 192+256 one.
 
 Checked against two independent references:
@@ -15,6 +15,7 @@ Checked against two independent references:
 Usage:
     pytest op_tests/test_flydsl_gather_kv_b_proj.py -q
     python op_tests/test_flydsl_gather_kv_b_proj.py      # + perf
+    python op_tests/test_flydsl_gather_kv_b_proj.py --fp8-output
 """
 
 import argparse
@@ -64,6 +65,7 @@ def _make_case(
     seed=0,
     device="cuda",
     dims=DIMS_DEEPSEEK,
+    output_dtype=torch.bfloat16,
 ):
     """Build one page_size-1 gather case.
 
@@ -119,9 +121,9 @@ def _make_case(
     k_prefix = torch.zeros(
         (alloc, n_heads, nope + KV_PE_DIM),
         device=device,
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
     )
-    v_prefix = torch.zeros((alloc, n_heads, v_dim), device=device, dtype=torch.bfloat16)
+    v_prefix = torch.zeros((alloc, n_heads, v_dim), device=device, dtype=output_dtype)
     return {
         "k_buffer": k_buffer,
         "k_scale": k_scale,
@@ -137,6 +139,14 @@ def _make_case(
         "scale_mode": scale_mode,
         "nope": nope,
         "v_dim": v_dim,
+        "out_scales": (
+            {
+                "k_out_scale": torch.tensor([0.73], device=device),
+                "v_out_scale": torch.tensor([0.53], device=device),
+            }
+            if output_dtype == torch.float8_e4m3fn
+            else {}
+        ),
     }
 
 
@@ -182,8 +192,31 @@ def _run_flydsl(case, weight_preshuffle=True, **kw):
         case["v_prefix"],
         num_tokens=case["num_tokens"],
         weight_preshuffle=weight_preshuffle,
-        **kw,
+        **{**case["out_scales"], **kw},
     )
+
+
+_OUTPUT_DTYPES = pytest.mark.parametrize(
+    "output_dtype", [torch.bfloat16, torch.float8_e4m3fn]
+)
+
+
+def _check_output(case):
+    for key, ref, scale_name in zip(
+        ("k_prefix", "v_prefix"), _torch_ref(case), ("k_out_scale", "v_out_scale")
+    ):
+        actual = case[key][: case["num_tokens"]].float()
+        if case["out_scales"]:
+            # BF16 absolute tolerance plus E4M3's 1/16 normal-value rounding error.
+            actual *= case["out_scales"][scale_name]
+            assert (
+                checkAllclose(
+                    actual, ref, rtol=0.065, atol=1e-2, tol_err_ratio=0, msg=key
+                )
+                == 0
+            )
+        else:
+            checkAllclose(ref, actual, atol=1e-2, rtol=1e-2, msg=key)
 
 
 @_SKIP
@@ -202,29 +235,23 @@ def _run_flydsl(case, weight_preshuffle=True, **kw):
         (1, 12, 256, False, 1.0),
     ],
 )
+@_OUTPUT_DTYPES
 def test_gather_kv_b_proj_flydsl(
-    num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims
+    num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims, output_dtype
 ):
     case = _make_case(
-        num_tokens, n_heads, alloc, duplicate_indices, k_scale_value, dims=dims
+        num_tokens,
+        n_heads,
+        alloc,
+        duplicate_indices,
+        k_scale_value,
+        output_dtype=output_dtype,
+        dims=dims,
     )
     _run_flydsl(case)
     m = num_tokens
-    k_ref, v_ref = _torch_ref(case)
-    checkAllclose(
-        k_ref,
-        case["k_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="k_prefix vs torch f32",
-    )
-    checkAllclose(
-        v_ref,
-        case["v_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="v_prefix vs torch f32",
-    )
+    _check_output(case)
+    _, v_ref = _torch_ref(case)
 
     cos = torch.nn.functional.cosine_similarity(
         case["v_prefix"][:m].float().flatten(), v_ref.flatten(), dim=0
@@ -243,72 +270,45 @@ def test_gather_kv_b_proj_flydsl(
         (512, 16, None, 1.0),
     ],
 )
-def test_gather_kv_b_proj_flydsl_block_scale(num_tokens, n_heads, alloc, k_scale_value):
-    """128x128 block scale -- the DeepSeek default quantization.
-
-    The scale varies along K, so it cannot be applied once at the end; the kernel
-    renormalises the accumulator between K tiles instead of keeping a second
-    accumulator. This is the test that the renormalisation is exact.
-    """
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_block_scale(
+    num_tokens, n_heads, alloc, k_scale_value, output_dtype
+):
+    """Check accumulator rescaling between K tiles with 128x128 weight scales."""
     case = _make_case(
-        num_tokens, n_heads, alloc, k_scale_value=k_scale_value, scale_mode="block"
+        num_tokens,
+        n_heads,
+        alloc,
+        k_scale_value=k_scale_value,
+        scale_mode="block",
+        output_dtype=output_dtype,
     )
     _run_flydsl(case)
-    m = num_tokens
-    k_ref, v_ref = _torch_ref(case)
-    checkAllclose(
-        k_ref,
-        case["k_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="k_prefix, block scale",
-    )
-    checkAllclose(
-        v_ref,
-        case["v_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="v_prefix, block scale",
-    )
+    _check_output(case)
 
 
 @_SKIP
 @pytest.mark.parametrize("num_tokens", [512, 1000])
-@pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens, dims):
-    """Row-major (un-preshuffled) weight must match the preshuffled path exactly.
-
-    Same GEMM, only the B-side global->LDS address map and the K-tile stride
-    differ, so any difference here is an addressing bug, not arithmetic. The v
-    half starts at weight row ``nope``, which the two layouts reach differently.
-    """
-    case = _make_case(num_tokens, 12, dims=dims)
+@_OUTPUT_DTYPES
+@pytest.mark.parametrize(
+    "dims,scale_mode",
+    [(DIMS_DEEPSEEK, "row"), (DIMS_DEEPSEEK, "block"), (DIMS_GLM, "row")],
+)
+def test_gather_kv_b_proj_flydsl_row_major_weight(
+    num_tokens, dims, output_dtype, scale_mode
+):
+    """Row-major and preshuffled weight layouts must produce identical outputs."""
+    case = _make_case(
+        num_tokens, 12, output_dtype=output_dtype, scale_mode=scale_mode, dims=dims
+    )
     _run_flydsl(case, weight_preshuffle=False)
-    k_ref, v_ref = _torch_ref(case)
-    m = num_tokens
-    checkAllclose(
-        k_ref,
-        case["k_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="k_prefix, row-major weight",
-    )
-    checkAllclose(
-        v_ref,
-        case["v_prefix"][:m].float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="v_prefix, row-major weight",
-    )
-
-    shuffled = _make_case(num_tokens, 12, dims=dims)
-    _run_flydsl(shuffled, weight_preshuffle=True)
-    assert torch.equal(
-        case["k_prefix"], shuffled["k_prefix"]
-    ), "row-major != preshuffled"
-    assert torch.equal(
-        case["v_prefix"], shuffled["v_prefix"]
-    ), "row-major != preshuffled"
+    _check_output(case)
+    first = [case[key].clone() for key in ("k_prefix", "v_prefix")]
+    _run_flydsl(case, weight_preshuffle=True)
+    for key, expected in zip(("k_prefix", "v_prefix"), first):
+        assert torch.equal(
+            case[key].view(torch.uint8), expected.view(torch.uint8)
+        ), "row-major != preshuffled"
 
 
 @_SKIP
@@ -339,14 +339,10 @@ def _supported(case, **kw):
 
 @_SKIP
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op(dims):
-    """The predicate and the op must never disagree about a configuration.
-
-    Both read one ``_unsupported_reason``; this pins that they keep doing so,
-    because the failure mode of a second copy is a caller routing a shape here
-    that the kernel then refuses mid-forward.
-    """
-    ok = _make_case(256, 12, dims=dims)
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op(dims, output_dtype):
+    """The support predicate must agree with launch validation."""
+    ok = _make_case(256, 12, output_dtype=output_dtype, dims=dims)
     assert _supported(ok)
     _run_flydsl(ok)  # and it really runs
 
@@ -501,52 +497,58 @@ def test_gather_kv_b_proj_flydsl_determinism_large_m(num_tokens, block_m):
 @_SKIP
 @pytest.mark.parametrize("block_m", [128, 256, 384])
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m):
-    """Every rope row must be written, and be a bitwise copy, for any BLOCK_M.
-
-    The fused rope copy maps 512 threads onto 256 rows per pass, so BLOCK_M > 256
-    needs more than one pass. A single pass leaves rows 256.. of every tile
-    unwritten while the GEMM half stays perfectly correct -- silent missing data
-    that an accuracy check on k_nope / v cannot see. On GLM-5.2 dims the rope
-    columns sit right behind the k half's dropped ones, and every tile of a
-    split head writes them, so a mis-dropped store lands here.
-    """
-    # 1536 is divisible by all three block_m under test, so no tail masking
-    # confounds the completeness check.
-    case = _make_case(1536, 12, dims=dims)
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_rope_is_complete(dims, block_m, output_dtype):
+    """Check every RoPE row, including the extra copy pass for BLOCK_M > 256."""
+    # Divisible by all tested tile heights to exclude tail masking.
+    case = _make_case(
+        1536,
+        12,
+        output_dtype=output_dtype,
+        dims=dims,
+        k_scale_value=0.43 if output_dtype == torch.float8_e4m3fn else 1.0,
+    )
     case["k_prefix"].fill_(float("nan"))
     _run_flydsl(case, block_m=block_m)
 
     rope = case["k_prefix"][:, :, case["nope"] :]
-    assert not torch.isnan(rope).any(), f"block_m={block_m}: rope rows left unwritten"
+    assert not torch.isnan(
+        rope.float()
+    ).any(), f"block_m={block_m}: rope rows left unwritten"
 
     idx = case["kv_indices"][: case["num_tokens"]].long()
     want = case["k_buffer"][idx].reshape(-1, KV_C_DIM + KV_PE_DIM)[:, KV_C_DIM:]
-    want = want.to(torch.bfloat16).unsqueeze(1).expand(-1, case["n_heads"], -1)
-    # k_scale is 1.0 here, so the rope is a pure copy and must match bitwise.
-    assert torch.equal(rope, want), f"block_m={block_m}: rope is not a bitwise copy"
+    if case["out_scales"]:
+        scale = case["k_scale"] * case["out_scales"]["k_out_scale"].reciprocal()
+        want = (want.float() * scale).clamp(-448, 448)
+    want = want.to(output_dtype).unsqueeze(1).expand(-1, case["n_heads"], -1)
+    assert torch.equal(
+        rope.view(torch.uint8), want.view(torch.uint8)
+    ), f"block_m={block_m}: incorrect rope"
 
 
 @_SKIP
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
-def test_gather_kv_b_proj_flydsl_tail_is_untouched(dims):
-    """Rows past ``num_tokens`` must not be written.
-
-    This is the check that catches a wrong ``num_records_bytes``: the caller
-    preallocates the workspace at its maximum, so a bound derived from the
-    tensor extent instead of the live row count would let tail workgroups
-    scribble on data the caller still owns. The dropped k columns are steered
-    to exactly that bound, so an off-by-one there shows up here too.
-    """
+@_OUTPUT_DTYPES
+def test_gather_kv_b_proj_flydsl_tail_is_untouched(dims, output_dtype):
+    """Store bounds must use the live row count, preserving the allocated tail."""
     m, alloc = 1000, 1024
-    case = _make_case(m, 12, alloc, dims=dims)
+    case = _make_case(m, 12, alloc, output_dtype=output_dtype, dims=dims)
     case["k_prefix"].fill_(float("nan"))
     case["v_prefix"].fill_(float("nan"))
     _run_flydsl(case)
-    assert torch.isnan(case["k_prefix"][m:]).all(), "k_prefix tail was clobbered"
-    assert torch.isnan(case["v_prefix"][m:]).all(), "v_prefix tail was clobbered"
-    assert not torch.isnan(case["k_prefix"][:m]).any(), "k_prefix live rows unwritten"
-    assert not torch.isnan(case["v_prefix"][:m]).any(), "v_prefix live rows unwritten"
+    assert torch.isnan(
+        case["k_prefix"][m:].float()
+    ).all(), "k_prefix tail was clobbered"
+    assert torch.isnan(
+        case["v_prefix"][m:].float()
+    ).all(), "v_prefix tail was clobbered"
+    assert not torch.isnan(
+        case["k_prefix"][:m].float()
+    ).any(), "k_prefix live rows unwritten"
+    assert not torch.isnan(
+        case["v_prefix"][:m].float()
+    ).any(), "v_prefix live rows unwritten"
 
 
 @_SKIP
@@ -612,6 +614,160 @@ def _bench(num_tokens, n_heads, dims):
     return us_tri, us_fly, tflops, out_gb
 
 
+@_SKIP
+@pytest.mark.parametrize(
+    "descale,projection",
+    [(0.37, 7.029999732971191), (0.73, 78.83999633789062)],
+)
+def test_fp8_reciprocal_rounding(descale, projection):
+    # Exact dot products that hit E4M3 ties with reciprocal multiplication,
+    # but fall below the ties with division.
+    case = _make_case(
+        257, 12, k_scale_value=projection, output_dtype=torch.float8_e4m3fn
+    )
+    case["k_buffer"].zero_()
+    case["k_buffer"][:, 0, 0] = 1
+    case["k_buffer"][:, 0, 512:] = 1
+    case["weight"].zero_()
+    case["weight"][:, 0] = 1
+    case["weight_scale"].fill_(1)
+    scale = torch.tensor([descale], device="cuda", dtype=torch.float32)
+    # CPU reference prevents device compiler rewrites of division.
+    value = torch.tensor([projection], dtype=torch.float32)
+    scale_cpu = torch.tensor([descale], dtype=torch.float32)
+    expected = (value * scale_cpu.reciprocal()).to(torch.float8_e4m3fn)
+    divided = (value / scale_cpu).to(torch.float8_e4m3fn)
+    assert not torch.equal(expected.view(torch.int8), divided.view(torch.int8))
+    expected = expected.to(device="cuda")
+    _run_flydsl(case, k_out_scale=scale, v_out_scale=scale)
+    for key in ("k_prefix", "v_prefix"):
+        assert torch.equal(
+            case[key].view(torch.int8),
+            expected.view(torch.int8).expand_as(case[key]),
+        )
+
+
+@_SKIP
+@pytest.mark.parametrize("zero", [False, True])
+def test_fp8_saturation_and_zero(zero):
+    case = _make_case(259, 12, k_scale_value=2.0, output_dtype=torch.float8_e4m3fn)
+    case["k_buffer"].fill_(0 if zero else 1)
+    case["weight"].fill_(1)
+    case["weight"][128:256].fill_(-1)
+    case["weight_scale"].fill_(1)
+    scale = torch.tensor([0.001], device="cuda")
+    _run_flydsl(case, k_out_scale=scale, v_out_scale=scale)
+    for key, ref in zip(("k_prefix", "v_prefix"), _torch_ref(case)):
+        actual = case[key].float()
+        expected = (
+            (ref * scale.reciprocal()).clamp(-448, 448).to(torch.float8_e4m3fn).float()
+        )
+        assert (
+            checkAllclose(actual, expected, rtol=0, atol=0, tol_err_ratio=0, msg=key)
+            == 0
+        )
+        assert actual.isfinite().all()
+        if not zero:
+            assert (actual.abs() == 448).any()
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    "invalid",
+    ["missing", "shape", "dtype", "device", "mixed_outputs", "bf16_scales", "strided"],
+)
+def test_fp8_output_validation(invalid):
+    case = _make_case(256, 2)
+    if invalid != "bf16_scales":
+        for key in ("k_prefix", "v_prefix"):
+            case[key] = case[key].to(torch.float8_e4m3fn)
+    ks = vs = torch.ones(1, device="cuda")
+    if invalid == "missing":
+        ks = None
+    elif invalid == "shape":
+        ks = torch.ones(2, device="cuda")
+    elif invalid == "dtype":
+        ks = ks.to(torch.bfloat16)
+    elif invalid == "device":
+        ks = ks.cpu()
+    elif invalid == "mixed_outputs":
+        case["v_prefix"] = case["v_prefix"].to(torch.bfloat16)
+    elif invalid == "strided":
+        case["k_prefix"] = case["k_prefix"].transpose(0, 1).contiguous().transpose(0, 1)
+    with pytest.raises(ValueError):
+        _run_flydsl(case, k_out_scale=ks, v_out_scale=vs)
+
+
+@_SKIP
+def test_fp8_graph_replay_uses_current_scales():
+    case = _make_case(257, 12, output_dtype=torch.float8_e4m3fn)
+    _run_flydsl(case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_flydsl(case)
+    case["out_scales"]["k_out_scale"].mul_(1.5)
+    case["out_scales"]["v_out_scale"].mul_(2.0)
+    graph.replay()
+    _check_output(case)
+
+
+def _bench_fp8(num_tokens, n_heads, dims):
+    from aiter.ops.quant import per_tensor_quant_hip
+
+    case = _make_case(num_tokens, n_heads, dims=dims)
+    args = (
+        case["k_buffer"],
+        case["k_scale"],
+        case["kv_indptr"],
+        case["kv_indices"],
+        case["cu_seqlens_k"],
+        shuffle_weight(case["weight"], layout=(16, 16)),
+        case["weight_scale"],
+    )
+    k, v = case["k_prefix"], case["v_prefix"]
+
+    def dynamic_quant():
+        gather_kv_b_proj_flydsl(*args, k, v)
+        # A 256-row view reduces HIP amax overhead while preserving vector alignment.
+        return tuple(
+            per_tensor_quant_hip(x.view(256, -1), quant_dtype=torch.float8_e4m3fn)
+            for x in (k, v)
+        )
+
+    (_, ks), (_, vs) = dynamic_quant()
+    k8, v8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn) for x in (k, v))
+
+    def supplied_scale_quant():
+        gather_kv_b_proj_flydsl(*args, k, v)
+        return tuple(
+            per_tensor_quant_hip(
+                x.view(256, -1), scale=scale, quant_dtype=torch.float8_e4m3fn
+            )
+            for x, scale in ((k, ks), (v, vs))
+        )
+
+    def fused():
+        gather_kv_b_proj_flydsl(*args, k8, v8, k_out_scale=ks, v_out_scale=vs)
+
+    fused()
+    for actual, ref, scale in zip((k8, v8), _torch_ref(case), (ks, vs)):
+        assert (
+            checkAllclose(
+                actual.float() * scale,
+                ref,
+                rtol=0.065,
+                atol=0.01,
+                tol_err_ratio=0,
+                msg="fp8 gather benchmark",
+            )
+            == 0
+        )
+    _, dynamic_us = run_perftest(dynamic_quant)
+    _, supplied_scale_us = run_perftest(supplied_scale_quant)
+    _, fused_us = run_perftest(fused)
+    return dynamic_us, supplied_scale_us, fused_us
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -624,8 +780,32 @@ def main():
     parser.add_argument(
         "-dims", type=int, nargs=2, default=DIMS_GLM, help="qk_nope_head_dim v_head_dim"
     )
+    parser.add_argument(
+        "--fp8-output",
+        action="store_true",
+        help="compare BF16 gather + HIP K/V quantization against direct FP8 output",
+    )
     args = parser.parse_args()
     dims = tuple(args.dims)
+
+    if args.fp8_output:
+        print(
+            f"\n## FP8 gather output {dims[0]}+{dims[1]}, {args.heads} heads, K=512\n"
+        )
+        print("The supplied-scale and fused paths reuse scales prepared before timing.")
+        print("The HIP per-tensor baseline uses a 256-row view of each output.")
+        print(
+            "| M | BF16 gather + dynamic quant us | BF16 gather + supplied-scale quant us "
+            "| FP8 gather us | speedup vs dynamic | speedup vs supplied-scale |"
+        )
+        print("|---|---|---|---|---|---|")
+        for m in (2048, 8192, 16384):
+            dynamic_us, supplied_scale_us, fused_us = _bench_fp8(m, args.heads, dims)
+            print(
+                f"| {m} | {dynamic_us:.2f} | {supplied_scale_us:.2f} | {fused_us:.2f} | "
+                f"{dynamic_us / fused_us:.2f}x | {supplied_scale_us / fused_us:.2f}x |"
+            )
+        return
 
     rows = []
     for m in (2048, 8192, 16384):

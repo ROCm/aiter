@@ -270,6 +270,54 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+# The rebuild is an extra launch with a fixed cost, while coalescing the scale
+# write only pays off in proportion to the token count, so small batches are
+# better served by the inline interleaved write -- and wmma_rep=1, whose
+# interleave stride is narrower, stays better served for longer. Empirical rather
+# than derived; retune per arch and shape through the env override below.
+_COMPACT_MIN_TOKENS = 1024
+_COMPACT_MIN_TOKENS_NARROW_STRIDE = 2048
+
+
+def _compact_scale_min_tokens(wmma_rep: int) -> int:
+    """Smallest batch that takes the compact + rebuild path."""
+    default = (
+        _COMPACT_MIN_TOKENS_NARROW_STRIDE if wmma_rep == 1 else _COMPACT_MIN_TOKENS
+    )
+    raw = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS=%r is not an integer; using %d",
+            raw,
+            default,
+        )
+        return default
+
+
+def _use_fused_quant_preshuffle(
+    model_dim: int, wmma_rep: int, quant_mode: str, token_num: int, topk: int
+) -> bool:
+    """Can this call take the compact quant + scale-rebuild path?
+
+    The caller sizes token-indexed buffers on the answer, so it needs it up front
+    rather than letting the launch decide.
+    """
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        fused_quant_preshuffle_supported,
+    )
+    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+    return (
+        token_num >= _compact_scale_min_tokens(wmma_rep)
+        and token_multidest_eligible(token_num, topk)
+        and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
+    )
+
+
 @functools.cache
 def _get_compiled_g2l_lut():
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
@@ -521,6 +569,14 @@ def _grouped_a8w4_tdm_moe(
         # Route kernel writes every entry (kept -> weight_dtype cast, dropped -> 0),
         # so the buffer is left uninitialised (fully kernel-written).
         _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
+        # Pre-allocate ep_rowmap so the route kernel can fuse its sentinel fill
+        # (fire-and-forget stores interleaved with route work, no extra barrier).
+        _ep_rowmap_for_route = None
+        if enable_ep_scatter:
+            ep_rowmap = torch.empty(
+                (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
+            )
+            _ep_rowmap_for_route = ep_rowmap
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
             topk_ids,
             E,
@@ -531,18 +587,15 @@ def _grouped_a8w4_tdm_moe(
             counter=_g2l_counter,
             num_local_tokens=num_local_tokens,
             num_valid_routes=_ep_nvr,
+            ep_rowmap=_ep_rowmap_for_route,
         )
     else:
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-    # EP gemm2-fused scatter: build the ep_rowmap inside the remap pass, which
-    # already knows each route's final contiguous row, so the gemm2 TDM epilogue
-    # can P2P each weighted row into peers' comb_inp.
+        ep_rowmap = None
+    # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
+    # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
     ep_scatter_params = None
-    ep_rowmap = None
     if enable_ep_scatter:
-        ep_rowmap = torch.empty(
-            (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
-        )
         ep_scatter_params = {
             "gather_w": _gather_w_buf,
             "tis": stage2_scatter.source_token_map,
@@ -551,18 +604,6 @@ def _grouped_a8w4_tdm_moe(
             "max_tok": int(stage2_scatter.max_tokens_per_rank),
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
         }
-    # A compact stage-1 A holds one row per token, so both consumers below have
-    # to gather their rows through this map. Tile padding rows are never written
-    # by the remap; -1 suits both of them: the scale preshuffle treats it as a
-    # padding row and writes zero, and the payload gather packs it into a 16-bit
-    # index of 65535, past the token bound, so the TDM drops it.
-    _compact_a = os.environ.get("AITER_COMPACT_A", "0") == "1"
-    _compact_scale = _compact_a and os.environ.get("AITER_COMPACT_SCALE", "1") == "1"
-    _row_to_token = None
-    if _compact_a:
-        _row_to_token = torch.full(
-            (int(contiguous_m),), -1, dtype=torch.int32, device=device
-        )
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
@@ -571,8 +612,6 @@ def _grouped_a8w4_tdm_moe(
         tile_m,
         num_valid_routes=_ep_nvr,
         ep_scatter_params=ep_scatter_params,
-        row_to_token=_row_to_token,
-        topk=topk,
     )
     psum = psum.to(torch.int32).contiguous()
     # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
@@ -649,33 +688,23 @@ def _grouped_a8w4_tdm_moe(
             f"row at model_dim {model_dim}, got {_src_width}"
         )
 
-    # Compact scale: the quant pass writes one row-major row per token, and a
-    # second pass gathers those rows into the WMMA layout the GEMM reads. That
-    # split costs one extra launch but removes the scattered form's 16x write
-    # amplification -- there each store lands 4 useful bytes in a 64 B line,
-    # while the preshuffle pass writes whole lines.
+    _compact = (
+        not _prequantized
+        and _ep_nvr is None
+        and _use_fused_quant_preshuffle(
+            model_dim, wmma_rep, _quant_mode, token_num, topk
+        )
+    )
     _compact_scale_buf = None
-    if _compact_scale and not _prequantized:
+    _row_to_token = None
+    if _compact:
         _compact_scale_buf = torch.empty(
             (token_num, model_dim // 32), dtype=torch.uint8, device=device
         )
-
-    # The 16-row-interleaved a1 scale makes the quant pass write 4 B per cache
-    # line; the row-major form moves that interleave into gemm1's LDS read,
-    # which is free (~12 us off quant at 16k tokens, gemm1 unchanged). Only the
-    # topk=6 multidest quant path implements it.
-    #
-    # Mutually exclusive with the compact scale above: that one also has the
-    # quant pass write row-major, but per token rather than per grouped row, and
-    # rebuilds the WMMA layout in its own pass instead of teaching gemm1 to read
-    # a different one.
-    _row_major_ascale = (
-        not _prequantized
-        and _compact_scale_buf is None
-        and int(topk) == 6
-        and not tdm_as_in_prologue
-        and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "1") in ("1", "true", "True")
-    )
+        # -1 marks tile padding no route points at, which the rebuild zero-fills.
+        _row_to_token = torch.full(
+            (int(contiguous_m),), -1, dtype=torch.int32, device=device
+        )
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
         hidden_states.reshape(1, token_num, _src_width),
@@ -688,12 +717,10 @@ def _grouped_a8w4_tdm_moe(
         source_topk=topk,
         num_valid_routes=_ep_nvr,
         prequantized_scale=src_a1_scale if _prequantized else None,
-        # Compact scale is row-major as well; gemm1 keeps reading the WMMA
-        # layout, which the preshuffle pass below rebuilds for it.
-        row_major_scale=_row_major_ascale or _compact_scale_buf is not None,
         out_scale=_compact_scale_buf,
+        row_to_token=_row_to_token,
     )
-    if _compact_scale_buf is not None:
+    if _compact:
         a1_scale = flydsl_moe_scatter_preshuffle_scale(
             _compact_scale_buf,
             _row_to_token,
@@ -752,20 +779,10 @@ def _grouped_a8w4_tdm_moe(
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             cluster_n=cluster_n,
-            # Gathering A splits a wave's rows over ceil(rows_per_wave/16)
-            # descriptors, and the kernel needs (3 + descs) * wpt to divide the
-            # workgroup's waves; at the tile_m this path runs, only wpt=4 does.
-            waves_per_tensor_tdm=(
-                4
-                if (_row_to_token is not None and waves_per_tensor_tdm in (-1, None))
-                else waves_per_tensor_tdm
-            ),
+            waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            row_major_ascale=int(_row_major_ascale),
-            row_to_token=_row_to_token,
-            a_gather_rows=token_num,
             **_situ_kw,
         )
     else:
@@ -798,7 +815,6 @@ def _grouped_a8w4_tdm_moe(
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            row_major_ascale=int(_row_major_ascale),
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -844,6 +860,44 @@ def _grouped_a8w4_tdm_moe(
     )
 
     if kernel_bench_callable is not None:
+        kernel_bench_callable.append(
+            (
+                "quant_a1",
+                functools.partial(
+                    flydsl_moe_fused_quant_preshuffle,
+                    hidden_states.reshape(1, token_num, _src_width),
+                    1,
+                    contiguous_m,
+                    wmma_rep=wmma_rep,
+                    quant_mode=_quant_mode,
+                    masked_m=None,
+                    topids_to_rows=topids_to_rows,
+                    source_topk=topk,
+                    num_valid_routes=_ep_nvr,
+                    prequantized_scale=src_a1_scale if _prequantized else None,
+                    out_payload=a1_payload,
+                    out_scale=a1_scale,
+                ),
+            )
+        )
+        if not _fuse_quant:
+            kernel_bench_callable.append(
+                (
+                    "quant_a2",
+                    functools.partial(
+                        flydsl_moe_fused_quant_preshuffle,
+                        y,
+                        1,
+                        contiguous_m,
+                        wmma_rep=wmma_rep2,
+                        quant_mode=_quant_mode,
+                        masked_m=None,
+                        topids_to_rows=None,
+                        out_payload=a2_payload,
+                        out_scale=a2_scale,
+                    ),
+                )
+            )
         if _fuse_quant:
             kernel_bench_callable.append(
                 (
@@ -1353,16 +1407,6 @@ def _get_compiled_contiguous_psum_remap():
 
 
 @functools.cache
-def _get_compiled_row_to_token():
-    """Compile and cache the route->row map inversion kernel."""
-    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
-        build_moe_row_to_token_module,
-    )
-
-    return build_moe_row_to_token_module()
-
-
-@functools.cache
 def _get_compiled_route_psum_fused():
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
@@ -1465,17 +1509,12 @@ def contiguous_psum_remap(
     tile_m: int,
     num_valid_routes: torch.Tensor | None = None,
     ep_scatter_params: dict | None = None,
-    row_to_token: torch.Tensor | None = None,
-    topk: int = 1,
 ):
     """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
 
     With ``ep_scatter_params`` (gather_w/tis/ep_rowmap/topk/max_tok/slot_stride)
     the same pass also scatters the gemm2-fused EP row map, reusing the final row
     it just computed.
-
-    With ``row_to_token`` the pass also writes the inverse map, which a GEMM
-    reading a compact (one row per token) A needs to gather its rows.
     """
     device = masked_m.device
     experts = int(experts)
@@ -1498,9 +1537,8 @@ def contiguous_psum_remap(
         )
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
-        # Init ep_rowmap to (-1, 0) with one int64 fill (low i32 = -1, high = 0);
-        # stream-ordered before the launch, whose scatter overwrites the kept rows.
-        ep_scatter_params["ep_rowmap"].view(torch.int64).fill_(0xFFFFFFFF)
+        # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
+        # interleaved with route work for free.  No host .fill_() needed.
         launch(
             ptr_arg(masked_m_i32),
             ptr_arg(topids_flat),
@@ -1540,18 +1578,6 @@ def contiguous_psum_remap(
         ptr_arg(num_valid_routes_i32),
         stream=torch.cuda.current_stream(),
     )
-    if row_to_token is not None:
-        # Its own launch: the remap above is a single-block prefix scan, so
-        # these scattered stores are far cheaper spread over their own grid.
-        numel = int(topids_flat.numel())
-        _get_compiled_row_to_token()(
-            ptr_arg(topids_flat),
-            ptr_arg(row_to_token.reshape(-1)),
-            numel,
-            int(topk),
-            (numel + 255) // 256,
-            stream=torch.cuda.current_stream(),
-        )
     return starts, psum, contiguous_m_t
 
 
@@ -1721,22 +1747,13 @@ def flydsl_moe_scatter_copy_token(
 def _get_compiled_scatter_preshuffle_scale(
     row_bytes: int, wmma_rep: int, scale_k_per_tile: int, gather: bool = True
 ):
-    """Compile and cache the WMMA-preshuffle scale kernel (with/without gather).
-
-    The gathering form stages through LDS so both its read and its write
-    coalesce; see the two builders for why the direct form cannot.
-    """
+    """Compile and cache the WMMA-preshuffle scale kernel (with/without gather)."""
     from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
-        build_moe_gather_preshuffle_scale_lds_module,
         build_moe_scatter_copy_preshuffle_scale_module,
     )
 
-    if gather:
-        return build_moe_gather_preshuffle_scale_lds_module(
-            row_bytes, wmma_rep, scale_k_per_tile
-        )
     return build_moe_scatter_copy_preshuffle_scale_module(
-        row_bytes, wmma_rep, scale_k_per_tile, gather=False
+        row_bytes, wmma_rep, scale_k_per_tile, gather=gather
     )
 
 
@@ -1773,9 +1790,9 @@ def flydsl_moe_scatter_preshuffle_scale(
         scale_w, wmma_rep, scale_k_per_tile, True
     )
     launch(
-        ptr_arg(a1_scale_token_u8.contiguous().view(-1, scale_w)),
-        ptr_arg(grouped_a1_scale.view(E * (max_m // wmma_rep), scale_w * wmma_rep)),
-        ptr_arg(rows_to_tokens),
+        a1_scale_token_u8.contiguous().view(-1, scale_w),
+        grouped_a1_scale.view(E * (max_m // wmma_rep), scale_w * wmma_rep),
+        rows_to_tokens,
         max_m,
         E,
         tiles_per_expert,

@@ -16,7 +16,7 @@
 #include "opus_gemm_arch.cuh"
 #include "opus_build_archs.h"
 #include "opus_gemm_manifest.h"
-#include "opus_bmm_mxscale_tune_lookup.h"  // GENERATE_BMM_MXSCALE_FLATMM_SPLITK_LOOKUP_FP32
+#include "opus_bmm_mxscale_kid_dispatch.h"
 #include "opus_gemm_utils.cuh"  // bf16_t / fp32_t
 #include "aiter_stream.h"
 #include "gfx950/opus_bmm_launchers_a8w8_mxscale_gfx950.cuh"
@@ -28,68 +28,67 @@ namespace opus_bmm_detail {
 
 // Uniform kid->launcher fn-pointer type. Every kid is codegen'd (no hand-written
 // adapters), so this namespace only holds the shared type.
-using OpusBmmMxscaleFlatmmSplitkKernel = void (*)(
+using OpusBmmMxscaleKernel = void (*)(
     aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
-    aiter_tensor_t &, aiter_tensor_t &, int /*splitK*/);
+    aiter_tensor_t &, aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, int /*split_k*/);
 }  // namespace opus_bmm_detail
 
-// Table-driven kid -> launcher dispatch. Launchers come from the generated
-// GENERATE_BMM_MXSCALE_FLATMM_SPLITK_LOOKUP_FP32 macro, which covers every kid in
-// the catalog including kid 0 (the heuristic default, the 32x128x128 wg2 tile).
+// Table-driven global exact-kid dispatch. Every registry BMM kid is generated;
+// an unknown id is an error rather than a fallback to another kernel.
 //
-// A kid outside the map therefore means it was not emitted, which is a build
-// problem and not a shape the caller can recover from, so it throws. It used to
-// return the kid-0 launcher instead, and that silently substituted a different
-// kernel: adding a codegen tag means three hand-maintained lists in
-// gen_instances.py on top of the five gfx950 maps, and if any is missed the new
-// kids run kid 0's tile, pass the correctness gate, and time identically to each
-// other -- which is exactly how five different blds tiles once measured within
-// 0.1% of one another (see the kid224/225 note in opus_gemm_common.py).
-static opus_bmm_detail::OpusBmmMxscaleFlatmmSplitkKernel
-opus_bmm_a8w8_mxscale_tune_dispatch(int id)
+// Throwing beats falling back, and that is worth stating because the fallback
+// looks harmless: adding a codegen tag means three hand-maintained lists in
+// gen_instances.py on top of the five gfx950 maps, and a kid missed by any of
+// them would quietly run another kid's tile, pass the correctness gate, and
+// time identically to its siblings. That is exactly how five different blds
+// tiles once measured within 0.1% of one another (see the kid224/225 note in
+// opus_gemm_common.py).
+static opus_bmm_detail::OpusBmmMxscaleKernel
+opus_bmm_a8w8_mxscale_exact_dispatch(int kid)
 {
   using namespace opus_bmm_detail;
-  static const std::unordered_map<int, OpusBmmMxscaleFlatmmSplitkKernel> kTune = {
-      GENERATE_BMM_MXSCALE_FLATMM_SPLITK_LOOKUP_FP32(fp32_t)
+  static const std::unordered_map<int, OpusBmmMxscaleKernel> kDispatch = {
+      GENERATE_BMM_MXSCALE_KID_DISPATCH(fp32_t)
   };
-  auto it = kTune.find(id);
-  AITER_CHECK(it != kTune.end(),
-              "opus_bmm_a8w8_mxscale: kid ", id, " has no emitted instance. It is "
+  auto it = kDispatch.find(kid);
+  AITER_CHECK(it != kDispatch.end(),
+              "opus_bmm_a8w8_mxscale: kid ", kid, " has no emitted instance. It is "
               "either not in the catalog or its kernel_tag is missing from one of "
               "the codegen maps; rebuild with AITER_REBUILD=1 after a codegen edit");
   return it->second;
 }
 #endif  // OPUS_BUILD_HAS_GFX950
 
-void opus_bmm_a8w8_mxscale(
+void opus_gemm_a8w8_mxscale_bmm_launch(
     aiter_tensor_t &O,
     aiter_tensor_t &wo_a,
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    int splitK,
-    int kernelId)
+    std::optional<aiter_tensor_t> workspace,
+    int kid,
+    int split_k)
 {
   // Common dtype/shape validation + arch gate, done once here so the codegen'd
   // launchers (which omit these to stay lean) and the fused kid 100 wrapper share
   // one check. The _impl still re-checks internally (idempotent).
-  opus_bmm_a8w8_common_checks(O, wo_a, Y,
-                              "opus_bmm_a8w8_mxscale");
+  opus_bmm_a8w8_common_checks(O, wo_a, Y, x_scale, w_scale,
+                              "opus_gemm_a8w8_mxscale_bmm_launch");
 #ifndef OPUS_BUILD_HAS_GFX950
   AITER_CHECK(false,
-              "opus_bmm_a8w8_mxscale requires "
+              "opus_gemm_a8w8_mxscale_bmm_launch requires "
               "OPUS_BUILD_HAS_GFX950");
 #else
   {
     const auto &arch_info = opus_get_arch_info();
     AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
-                "opus_bmm_a8w8_mxscale is gfx950-only; "
+                "opus_gemm_a8w8_mxscale_bmm_launch is gfx950-only; "
                 "current device ", arch_info.dev, " has gcnArchName='",
                 arch_info.name, "'");
   }
-  // Single table lookup instead of a ~40-case switch (see opus_gemm.cu).
-  opus_bmm_a8w8_mxscale_tune_dispatch(kernelId)(
-      O, wo_a, Y, x_scale, w_scale, splitK);
+  opus_bmm_a8w8_mxscale_exact_dispatch(kid)(
+      O, wo_a, Y, x_scale, w_scale, workspace, split_k);
 #endif  // OPUS_BUILD_HAS_GFX950
 }
 

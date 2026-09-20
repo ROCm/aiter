@@ -1,19 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sparse paged-decode attention over a unified KV pool with per-token paged
-indices. See ``_triton_kernels/attention/pa_decode_sparse.py`` for the
-kernels' caller contract.
+"""Sparse paged-decode attention over a unified or split KV pool with per-token paged
+indices.
 
-This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
-+ pipelined-K-loop variant suitable for sparse decode (e.g. V4 top-k gather)
-where each token's K range is an unordered subset of a unified KV pool.
-
-On gfx950 (CDNA4) DeepSeek-V4 sparse-MLA decode has a dedicated gluon
-implementation (bottom of this module): ``pa_decode_sparse`` routes all formats
-to the merged ``_pa_decode_sparse_gfx950_gluon`` driver -- packed fp8_ds_mla /
-bf16 block cache (3D; optional SWA+top-k two-loop via ``extra_*``) and the
-uniform fp8 / bf16 pool (2D).
+TODO: add details once API has settled
 """
 
 import math
@@ -21,11 +12,11 @@ import math
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-    _pa_decode_sparse as _pa_decode_sparse_gfx950,
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    _sparse_mla as _sparse_mla_gfx950,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-    _pa_decode_sparse_reduce as _pa_decode_sparse_reduce_gfx950,
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse as gluon_pa_decode_sparse,
@@ -43,14 +34,34 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
+
+# Fused fp8 x E8M0 -> bf16 upcast check (gluon cdna4.scaled_upcast)
+try:
+    from triton.experimental.gluon.language.amd import cdna4 as _cdna4
+
+    _HAS_SCALED_UPCAST = hasattr(_cdna4, "scaled_upcast")
+except ImportError:
+    _HAS_SCALED_UPCAST = False
 
 _LOGGER = AiterTritonLogger()
 
 
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = torch.float8_e4m3fnuz
+_FP8_DTYPE = get_fp8_e4m3_dtype()
+
+
+def _check_out(out, q, dtype):
+    """Caller-supplied output buffer, or a fresh one. Writing the caller's buffer
+    directly saves a full [T, H, D] device copy per call."""
+    if out is None:
+        return torch.empty_like(q, dtype=dtype)
+    assert out.shape == q.shape, f"out shape {tuple(out.shape)} != q {tuple(q.shape)}"
+    assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
+    assert out.device == q.device
+    return out
 
 
 def pa_decode_sparse(
@@ -70,6 +81,7 @@ def pa_decode_sparse(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -88,6 +100,8 @@ def pa_decode_sparse(
             auto-infers to fill ~512 total CTAs while capping below the number
             of K-blocks, then rounds up to a power of 2.
         num_stages: software-pipeline depth of the K loop (default 2).
+        out: optional ``[N, H, D]`` destination. Supplied -> written in place and
+            returned, which saves the caller a full-size device copy.
         skip_reduce: when the split-K path is active (``kv_splits > 1``), return
             the pre-reduce ``(acc_partial, m_partial, l_partial)`` partials
             instead of launching the reduce kernel. Has no effect when
@@ -98,7 +112,8 @@ def pa_decode_sparse(
             two-loop's second (top-k) cache + index set; must be None otherwise.
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
-    packed fp8_ds_mla / bf16 block cache (``extra_*`` = the two-loop), a 2D one the
+    packed fp8_dsv4_mla (584 B rows) / bf16 block cache (``extra_*`` = the
+    two-loop), a 2D one the
     uniform pool (``kv_scales`` present = fp8). ``kv_splits``/``skip_reduce`` are
     honored; ``block_h`` and fp16 ``q`` fall through to the triton path.
 
@@ -120,28 +135,26 @@ def pa_decode_sparse(
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
+    _LOGGER.info(
+        f"PA_DECODE_SPARSE: q={tuple(q.shape)} unified_kv={tuple(unified_kv.shape)} "
+        f"{unified_kv.dtype} kv_indices={tuple(kv_indices.shape)}"
+    )
 
     # gfx950: route to the merged DSv4 sparse-MLA gluon driver. Format is inferred
-    # from the cache: 3D -> packed fp8_ds_mla / bf16 block cache (optional SWA+top-k
+    # from the cache: 3D -> packed fp8_dsv4_mla / bf16 block cache (optional SWA+top-k
     # two-loop via extra_*); 2D -> uniform pool (OCP fp8 + fp32 kv_scales, or bf16).
     # kv_splits and skip_reduce are honored here; block_h and fp16 q fall through to
     # the triton path below (the gluon kernel is bf16-only: bf16 LDS + bf16 MFMA).
     if DEVICE_ARCH == "gfx950" and block_h is None and q.dtype == torch.bfloat16:
+        # gfx950 (CDNA4) reads OCP e4m3 natively. fnuz is the gfx942 encoding,
+        # so it never appears here and falls through to the triton path below.
         if unified_kv.ndim == 3:
-            _ok = kv_scales is None and (
-                unified_kv.dtype == torch.uint8 or unified_kv.dtype == q.dtype
-            )
+            # packed / bf16 block cache: it carries its own scales, if any
+            _ok = kv_scales is None and unified_kv.dtype in (torch.uint8, q.dtype)
+        elif kv_scales is not None:
+            _ok = unified_kv.dtype in (torch.float8_e4m3fn, torch.uint8)
         else:
-            _fp8 = unified_kv.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-                torch.uint8,
-            )
-            _ok = (kv_scales is not None and _fp8) or (
-                kv_scales is None and unified_kv.dtype == q.dtype
-            )
-        # fnuz vs OCP e4m3 (2D fp8 only) selects the in-kernel dequant bias.
-        fp8_fnuz = unified_kv.ndim == 2 and unified_kv.dtype == torch.float8_e4m3fnuz
+            _ok = unified_kv.dtype == q.dtype
         if _ok:
             cache = (
                 unified_kv.view(torch.uint8)
@@ -162,7 +175,7 @@ def pa_decode_sparse(
                 kv_splits=kv_splits,
                 skip_reduce=skip_reduce,
                 has_invalid=bool(has_invalid),
-                fp8_fnuz=fp8_fnuz,
+                out=out,
             )
 
     assert (
@@ -195,11 +208,8 @@ def pa_decode_sparse(
             )
 
     T, H, D = q.shape
-    _LOGGER.info(
-        f"PA_DECODE_SPARSE T={T} H={H} D={D} " f"total_indices={kv_indices.shape[0]}"
-    )
 
-    out = torch.empty_like(q)
+    out = _check_out(out, q, q.dtype)
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
 
@@ -427,32 +437,20 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.int32).contiguous()
 
 
-def _decode_num_splits(
-    num_queries, heads_blocks, avg_main=0.0, avg_extra=0.0, block_k=64
-):
-    """Pick the split-K count by minimizing a cost model of the decode work:
-
-        cost(s) = waves(s) * iters(s)  +  GAMMA * s  +  DELTA * fill(s)
-        s = # splits
-    Tuned on gfx950 for DSv4 decode (H=16, D=512, BLOCK_K=64); split count is
-    capped at 16.
+def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block_k):
+    """Split-K count for the gfx950 gluon kernel: fill the machine, but never
+    split a segment finer than one BLOCK_K tile.
     """
-    cu = max(1, get_num_sms())
-    base = max(1, num_queries * heads_blocks)
-    GAMMA, DELTA, FILL_CU = 0.32, 2.0, 0.75
-    thr = FILL_CU * cu
-    best_splits, best_cost = 1, None
-    for splits in range(1, 17):
-        m_it = math.ceil(math.ceil(avg_main / splits) / block_k) if avg_main > 0 else 0
-        e_it = (
-            math.ceil(math.ceil(avg_extra / splits) / block_k) if avg_extra > 0 else 0
-        )
-        waves = (base * splits + cu - 1) // cu
-        fill = max(0.0, 1.0 - base * splits / thr) / splits
-        cost = waves * (m_it + e_it) + GAMMA * splits + DELTA * fill
-        if best_cost is None or cost < best_cost - 1e-9:
-            best_splits, best_cost = splits, cost
-    return best_splits
+    num_sms = get_num_sms()
+    base_wg = max(1, num_queries * heads_blocks)
+    cta_cap = max(1, (2 * num_sms) // base_wg)
+    main_tiles = max(1, math.ceil(avg_main / block_k)) if avg_main > 0 else 0
+    extra_tiles = max(1, math.ceil(avg_extra / block_k)) if avg_extra > 0 else 0
+    tiles = max(1, main_tiles, extra_tiles)
+    if base_wg >= num_sms:
+        # Already at least one workgroup per CU without splitting
+        return max(1, min(cta_cap, tiles // 4))
+    return max(1, min(cta_cap, tiles))
 
 
 def _pa_decode_sparse_gfx950_gluon(
@@ -468,24 +466,25 @@ def _pa_decode_sparse_gfx950_gluon(
     extra_indptr=None,
     kv_splits=None,
     skip_reduce=False,
+    out=None,
     has_invalid=False,
-    fp8_fnuz=False,
 ):
-    """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from ``cache.ndim``:
-    3D [nb, block, ...] -> packed fp8_ds_mla (uint8: 448 NoPE fp8 e4m3 OCP +
+    """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
+    3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
                            embedded UE8M0 per-64 scale + 64 RoPE bf16) or a bf16
-                           block cache; pass ``extra_*`` for the SWA+top-k two-loop,
+                           block cache; pass extra_* for the SWA+top-k two-loop,
                            else a single segment.
-    2D [pages, D]       -> uniform pool: fp8 (uint8) + ``cache_scales``
-                           [pages, D//64] fp32, or bf16 (``cache_scales`` None).
+    2D [pages, D]       -> uniform pool: fp8 (uint8) + cache_scales
+                           [pages, D//64] fp32, or bf16 (cache_scales None).
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
 
-    # Tuned launch config (gfx950 / MI355), inlined. BLOCK_M = heads per MFMA M-tile;
-    # BLOCK_K = KV tile; num_warps = BLOCK_K // 16 (warps tile the dot-N, MFMA N=16).
-    BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 0
-    num_warps = BLOCK_K // 16
+    # Tuned launch config (gfx950 / MI355). BLOCK_M = heads per MFMA M-tile, and 16
+    # is both the MFMA M and the DSv4 head count; BLOCK_K = KV tile; num_warps =
+    # BLOCK_K // 16, because warps tile the dot-N and MFMA N = 16.
+    BLOCK_M, BLOCK_K = 16, 64
+    num_warps = max(1, BLOCK_K // 16)
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
 
@@ -502,7 +501,7 @@ def _pa_decode_sparse_gfx950_gluon(
     if cache.ndim == 2:
         # uniform pool: one fp8 gather over the whole head + separate fp32 scales,
         # or bf16. page_size=1 -> block_idx=slot, pos=0; scales ride the bf16 ptr.
-        UNIFORM = True
+        FLAT_POOL = True
         main_is_fp8 = cache.dtype == torch.uint8
         if main_is_fp8:
             assert cache_scales is not None and cache_scales.dtype == torch.float32
@@ -521,12 +520,13 @@ def _pa_decode_sparse_gfx950_gluon(
         main_block, extra_block = 1, 1
         nope_dim = head_dim
         main_num_rows = extra_num_rows = cache.shape[0]
-        cache_bytes = max_addressable_bytes(cache)
         avg_main = indices.numel() / max(1, num_queries)  # one segment; no extra
         avg_extra = 0.0
     else:
-        # packed fp8_ds_mla [nb, block, 584] (embedded scale) or bf16 block cache.
-        UNIFORM = False
+        # packed fp8_dsv4_mla [nb, block, 584] (UE8M0 block trailer) or bf16 block
+        # cache. NB: vLLM's fp8_ds_mla also names the 656 B V3.2 layout, which is
+        # fp8_dsv32_mla and reaches the kernel through sparse_mla.py instead.
+        FLAT_POOL = False
         main_is_fp8 = cache.dtype == torch.uint8
         main_bf16 = cache.view(torch.bfloat16) if main_is_fp8 else cache
         has_extra = (
@@ -545,32 +545,60 @@ def _pa_decode_sparse_gfx950_gluon(
         nope_dim = NOPE_DIM
         main_num_rows = cache.shape[0] * cache.shape[1]
         extra_num_rows = extra_cache.shape[0] * extra_cache.shape[1]
-        cache_bytes = max(
-            max_addressable_bytes(cache), max_addressable_bytes(extra_cache)
-        )
         avg_main = indices.numel() / max(1, num_queries)
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
-    use_buffer_load = cache_bytes < MAX_BYTES
+    # Kernel-side cache-format tags (kernel shared with sparse_mla.py).
+    if FLAT_POOL:
+        main_fmt = "fp8_g64" if main_is_fp8 else "bf16"
+        extra_fmt = main_fmt
+    else:
+        main_fmt = "fp8_dsv4_mla" if main_is_fp8 else "bf16"
+        extra_fmt = "fp8_dsv4_mla" if extra_is_fp8 else "bf16"
+
+    # Alignment hint for the page strides so row gathers can vectorize: the largest
+    # power of 2 (<= 16) dividing both.
+    s0, s1 = int(cache.stride(0)), int(extra_cache.stride(0))
+    cs0_align = 1
+    for a in (16, 8, 4, 2):
+        if s0 % a == 0 and s1 % a == 0:
+            cs0_align = a
+            break
+
+    # Gate each cache on its own span: buffer_load carries a 32-bit offset, and one
+    # oversized cache must not drop the fast path for the other. The index lists are
+    # one int32 per gathered token, far under the limit even for a full batch.
+    main_use_buffer_load = max_addressable_bytes(cache) < MAX_BYTES
+    extra_use_buffer_load = max_addressable_bytes(extra_cache) < MAX_BYTES
+    idx_use_buffer_load = (
+        max_addressable_bytes(indices) < MAX_BYTES
+        and max_addressable_bytes(extra_indices) < MAX_BYTES
+    )
+    use_buffer_load = main_use_buffer_load and extra_use_buffer_load
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    out = _check_out(out, q, torch.bfloat16)
 
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
-        num_splits = _decode_num_splits(
+        num_splits = _decode_num_splits_occ(
             num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
         )
+
+    # Q is read once per query without split-K, and re-read by every split
+    q_cache = ".cg" if num_splits == 1 else ""
 
     if num_splits > 1:
         part_m = torch.empty(
             (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
         )
         part_l = torch.empty_like(part_m)
+        # bf16 partials halve both the split-K HBM traffic (~31% of the kernel's
+        # bytes)
         part_acc = torch.empty(
             (num_queries, num_splits, num_heads, head_dim),
-            dtype=torch.float32,
+            dtype=torch.float32 if skip_reduce else torch.bfloat16,
             device=q.device,
         )
         pm_stride0, pm_stride_s = part_m.stride(0), part_m.stride(1)
@@ -583,8 +611,42 @@ def _pa_decode_sparse_gfx950_gluon(
         part_m = part_l = part_acc = out  # unused placeholders (never dereferenced)
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
+    # Dequant chunking. The gather layout puts 32 of a wave's 64 lanes along a row
+    # (16 B each, 512 B) and the other 32 on a second row; col_reps is how many
+    # such spans each lane holds, which is what makes a column split a free
+    # register rename.
+    col_reps = head_dim // 512
+    chunk_axis = 1 if col_reps >= 4 else 0
+    nope_chunk = max(1, BLOCK_K // 4) if chunk_axis == 0 else min(128, head_dim)
+
+    waves_per_eu = 2
+    one_wg_per_cu = (
+        use_buffer_load and num_queries * heads_blocks * num_splits <= get_num_sms()
+    )
+    if one_wg_per_cu:
+        waves_per_eu = 1
+
+    main_splits = num_splits
+    if has_extra and avg_main > 0:
+        main_splits = max(1, min(num_splits, math.ceil(avg_main / BLOCK_K)))
+
+    # Per-query split count decided in-kernel; only meaningful when there is more
+    # than one split to give back.
+    adaptive_splits = num_splits > 1
+
+    # Fuse the dsv4 dequant into v_cvt_scalef32_pk_bf16_fp8. The asm fallback
+    # gathers an extra int16 tile, so it only pays off at one workgroup per CU.
+    if _HAS_SCALED_UPCAST:
+        deq = "upcast"
+    elif one_wg_per_cu:
+        deq = "asm"
+    else:
+        deq = "none"
+
+    # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
+    # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, num_splits, heads_blocks)
-    _pa_decode_sparse_gfx950[grid](
+    _sparse_mla_gfx950[grid](
         q,
         cache,
         main_bf16,
@@ -599,6 +661,10 @@ def _pa_decode_sparse_gfx950_gluon(
         part_m,
         part_l,
         part_acc,
+        # f32 scale pointers (separated-rope formats only); None is elided,
+        # keeping the DSv4 kernarg layout unchanged.
+        None,
+        None,
         scale,
         q.stride(0),
         q.stride(1),
@@ -616,22 +682,35 @@ def _pa_decode_sparse_gfx950_gluon(
         num_heads,
         HAS_EXTRA=has_extra,
         HAS_SINK=has_sink,
-        MAIN_IS_FP8=main_is_fp8,
-        EXTRA_IS_FP8=extra_is_fp8,
+        MAIN_FMT=main_fmt,
+        EXTRA_FMT=extra_fmt,
         MAIN_BLOCK_SIZE=main_block,
         EXTRA_BLOCK_SIZE=extra_block,
+        CS0_ALIGN=cs0_align,
         NOPE_DIM=nope_dim,
         ROPE_DIM=ROPE_DIM,
         HEAD_SIZE=head_dim,
+        ROPE_SEPARATE=False,
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=HEAD_ALIGNED,
-        MFMA_K=MFMA_K,
-        UNIFORM=UNIFORM,
-        USE_BUFFER_LOAD=use_buffer_load,
+        NOPE_CHUNK=nope_chunk,
+        CHUNK_AXIS=chunk_axis,
+        PART_STORE_CACHE="",
+        Q_CACHE=q_cache,
+        GRID_ORDER="qsh",
+        # The partial last tile rides the full-tile body. Gluon inlines, so a peeled
+        # masked copy would be a second gather+dequant+MFMA body, and its register
+        # demand spills the tile loop.
+        UNI_TILE=True,
+        MAIN_SPLITS=main_splits,
+        ADAPTIVE_SPLITS=adaptive_splits,
+        DEQ=deq,
+        MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
+        EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
+        IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
-        FP8_FNUZ=fp8_fnuz,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
@@ -641,8 +720,9 @@ def _pa_decode_sparse_gfx950_gluon(
     if skip_reduce:
         return part_acc, part_m, part_l
 
-    rgrid = (num_queries, heads_blocks)
-    _pa_decode_sparse_reduce_gfx950[rgrid](
+    # One head per reduce workgroup
+    rgrid = (num_queries, num_heads)
+    _sparse_mla_reduce_gfx950[rgrid](
         part_m,
         part_l,
         part_acc,
@@ -658,9 +738,10 @@ def _pa_decode_sparse_gfx950_gluon(
         num_heads,
         HAS_SINK=has_sink,
         HEAD_SIZE=head_dim,
-        BLOCK_M=BLOCK_M,
+        BLOCK_M=1,
         NUM_SPLITS=num_splits,
-        HEAD_ALIGNED=HEAD_ALIGNED,
-        num_warps=4,
+        HEAD_ALIGNED=True,
+        ADAPTIVE_SPLITS=adaptive_splits,
+        num_warps=1,
     )
     return out

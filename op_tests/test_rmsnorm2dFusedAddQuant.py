@@ -333,7 +333,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "-n",
         type=int,
-        default=[1024, 2048, 3584, 4096, 8192],
+        # 5120 covers the 4096 < n <= 6144 shape bucket, which no other default
+        # width reaches -- that is how a bucket with no grouped-quant kernel
+        # went unnoticed.
+        default=[1024, 2048, 3584, 4096, 5120, 8192],
         nargs="*",
         help="""N of mnk.
     e.g.: -n 1024""",

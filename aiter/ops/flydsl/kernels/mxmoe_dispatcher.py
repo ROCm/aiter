@@ -148,8 +148,8 @@ def compile_gemm2_a4w4_port(
         )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
-    if (_composition is None) != (_input_row_resolver is None):
-        raise ValueError("a composed GEMM2 requires an input row resolver")
+    if _composition is None and _input_row_resolver is not None:
+        raise ValueError("an input row resolver requires a composition")
     if _reduce_store_cache_modifier is not None and _composition is None:
         raise ValueError("a custom reduce-store cache policy requires a composition")
     use_reduce = epilog == "reduce"
@@ -479,7 +479,11 @@ def compile_gemm2_a4w4_port(
         lds,
     ):
         m_row = m_block_idx * fx.Int32(BM)
-        resolved_rows = resolve_input_rows(arg_stids, i32_M, m_row, wave, lane)
+        resolved_rows = (
+            ()
+            if _input_row_resolver is None
+            else resolve_input_rows(arg_stids, i32_M, m_row, wave, lane)
+        )
         _gemm2_kernel_body(
             arg_aq,
             arg_ascale,

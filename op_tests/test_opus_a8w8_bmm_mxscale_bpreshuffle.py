@@ -37,7 +37,8 @@ from test_opus_a8w8_bmm import (
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
+from aiter.ops.opus import policy
+from aiter.ops.opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import run_perftest
 
@@ -78,7 +79,9 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
     def _call(kid, W):
         Y = torch.zeros((m, g, n), dtype=ydt)
         xs_kid, ws_kid = scale_for(kid)
-        _opus_bmm_a8w8_mxscale_raw(O_in, W, Y, xs_kid, ws_kid, split_k, kid)
+        _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+            O_in, W, Y, xs_kid, ws_kid, workspace=None, kid=kid, split_k=split_k
+        )
         torch.cuda.synchronize()
         return Y
 
@@ -122,14 +125,18 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
         def _time(kid, W):
             xs_kid, ws_kid = scale_for(kid)
             _, t = run_perftest(
-                _opus_bmm_a8w8_mxscale_raw,
+                _opus_gemm_a8w8_mxscale_bmm_launch_raw,
                 O_in,
                 W,
                 torch.zeros((m, g, n), dtype=ydt),
                 xs_kid,
                 ws_kid,
-                split_k,
-                kid,
+                # Keyword from here on: the unified entry's tail is
+                # (workspace, kid, split_k), the reverse of the old
+                # (split_k, kid), and positionally both orders type-check.
+                workspace=None,
+                kid=kid,
+                split_k=split_k,
                 num_warmup=5,
             )
             return t
@@ -167,7 +174,7 @@ def _check_tables():
     log.
     """
     import aiter.ops.batched_gemm_op_a8w8 as bg
-    import aiter.ops.opus.bmm_op as bmm
+    import aiter.ops.opus.gemm_op_a8w8 as bmm
 
     gfx = get_gfx()
     ok = True
@@ -210,7 +217,7 @@ def _check_dispatch():
     from unittest.mock import patch
 
     import aiter.ops.batched_gemm_op_a8w8 as bg
-    import aiter.ops.opus.bmm_op as bmm
+    import aiter.ops.opus.gemm_op_a8w8 as bmm
 
     g, m, n, k = 2, 128, 1024, 4096
     pre = bmm._mxscale_kid_pre_b()
@@ -232,16 +239,22 @@ def _check_dispatch():
         """The kid this tuned row dispatches to, or the ValueError it raises."""
         seen = {}
 
-        def _spy(x, wo_a, Y, sfa, sfb, splitK, kernelId):
-            seen["kid"] = int(kernelId)
+        # Mirrors the unified entry exactly, keywords included: the production
+        # call passes kid/split_k by name, so a spy still shaped like the old
+        # (splitK, kernelId) positional tail would raise TypeError here rather
+        # than record anything.
+        def _spy(x, wo_a, Y, sfa, sfb, workspace=None, kid=0, split_k=1):
+            seen["kid"] = int(kid)
 
         impl = (
             bg._batched_gemm_a8w8_mxscale_bpreshuffle_impl
             if b_preshuffled
             else bg._batched_gemm_a8w8_mxscale_impl
         )
-        with patch.object(bmm, "_opus_bmm_a8w8_mxscale_raw", _spy), patch.object(
-            bg, "lookup_mxscale_bmm_config", lambda *a, **kw: row
+        with patch.object(
+            bmm, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", _spy
+        ), patch.object(
+            policy, "lookup_mxscale_bmm_config", lambda *a, **kw: row
         ):
             try:
                 impl(*args)
