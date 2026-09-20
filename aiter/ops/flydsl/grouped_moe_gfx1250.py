@@ -63,9 +63,12 @@ def _as_bool(value, default: bool) -> bool:
 
 
 def _as_int(value, default: int | None) -> int | None:
-    if value is None or str(value).strip() == "":
+    # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
+    # cell can come back as the literal "nan"; read those as unset like _cell.
+    text = "" if value is None else str(value).strip()
+    if text == "" or text.lower() in ("nan", "none"):
         return default
-    return int(value)
+    return int(text)
 
 
 def _dtype_name(dtype) -> str:
@@ -572,6 +575,7 @@ def _grouped_a8w4_tdm_moe(
     n_warp2=None,
     num_buffers2=None,
     cluster_n=-1,
+    cluster_n2=None,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
@@ -616,6 +620,12 @@ def _grouped_a8w4_tdm_moe(
         m_warp2 = m_warp
     if n_warp2 is None:
         n_warp2 = n_warp
+    if cluster_n2 is None:
+        # The two stages want different cluster widths: gemm1 gains from the
+        # multicast of its shared A operand, while gemm2 loses more than it
+        # gains once its scatter epilogue runs on a narrower tile_m2. Blank
+        # keeps gemm2 on gemm1's width, i.e. the historical behaviour.
+        cluster_n2 = cluster_n
     if _compact:
         # The plan padded every expert's row count up to this alignment, and its
         # psum is what the GEMM binary-searches as its m-tile map. A tile wider
@@ -1110,7 +1120,7 @@ def _grouped_a8w4_tdm_moe(
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
-        cluster_n=cluster_n,
+        cluster_n=cluster_n2,
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
@@ -1257,7 +1267,7 @@ def _grouped_a8w4_tdm_moe(
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
-                    cluster_n=cluster_n,
+                    cluster_n=cluster_n2,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
@@ -1519,6 +1529,9 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
             )
             _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
+            _tdm_kw["cluster_n2"] = _as_int(
+                cfg_row.get("cluster_n2"), _tdm_kw["cluster_n"]
+            )
             _tdm_kw["waves_per_tensor_tdm"] = _as_int(
                 cfg_row.get("waves_per_tensor_tdm"), -1
             )
