@@ -127,22 +127,14 @@ class MoriAll2AllManager(All2AllManagerBase):
     def get_handle(self, kwargs, index: int = 0):
         """Cached op for one config and ``index``. Always a single handle.
 
-        ``index=0`` (default) is the shared singleton used by layers with the
-        same kwargs. Distinct indexes are distinct ops: an op holds routing
-        state from dispatch to combine, so callers with several in flight at
-        once -- ATOM's TBO ubatches -- pass ``index=ubatch_id``. Indexes are
-        part of the cache key so every MoE layer reuses the same arenas.
+        ``index=0`` (default) is the shared singleton. Other indexes are extra
+        instances for callers with several in flight (ATOM TBO:
+        ``index=ubatch_id + 1``). All indexes use ``handle_cache``.
         """
-        if index < 0:
-            raise ValueError(f"index must be >= 0, got {index}")
-
         mori_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("MoRI all2all index=%d args %s", index, mori_kwargs)
-        # Cache hashes the dict it is given, then calls factory(**that dict).
-        # Keep index in the key only; the MoRI config must not see it.
         return self.handle_cache.get_or_create(
-            {**mori_kwargs, "_handle_index": index},
-            lambda **_: self._make_handle(**mori_kwargs),
+            mori_kwargs, self._make_handle, index=index
         )
 
 
@@ -154,8 +146,8 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
     must be installed alongside flydsl. The dispatch/combine *kernels* however
     are entirely FlyDSL-generated, replacing mori's comm primitives.
 
-    TBO multi-instance ops are created via ``create_handle`` (non-cached) so
-    the two ubatch ops are guaranteed to be distinct, independent objects.
+    TBO multi-instance ops use ``get_handle(..., index=)`` so ubatches get
+    distinct cached ops. ``create_handle`` remains for a one-off uncached op.
     """
 
     @staticmethod
@@ -242,18 +234,18 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         cfg = self._flydsl_dispatch_config_cls(**kwargs)
         return self._flydsl_dispatch_op_cls(cfg)
 
-    def get_handle(self, kwargs):
+    def get_handle(self, kwargs, index: int = 0):
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
-        logger.debug("FlyDSL all2all args %s", flydsl_kwargs)
-        return self.handle_cache.get_or_create(flydsl_kwargs, self._make_handle)
+        logger.debug("FlyDSL all2all index=%d args %s", index, flydsl_kwargs)
+        return self.handle_cache.get_or_create(
+            flydsl_kwargs, self._make_handle, index=index
+        )
 
     def create_handle(self, kwargs):
         """Create a fresh, uncached FlyDSL op instance.
 
-        Unlike ``get_handle`` (which caches one op per config), every call
-        returns a new independent op. Callers that need multiple distinct ops
-        for the same config (e.g. ATOM for TBO ubatches) should call this
-        and manage the instances themselves.
+        Prefer ``get_handle(kwargs, index=)`` when the op should be reused.
+        Use this only if you need a throwaway instance that is not cached.
         """
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("FlyDSL all2all (uncached) args %s", flydsl_kwargs)
