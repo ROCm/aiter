@@ -733,10 +733,19 @@ def mhc_post(
 def get_mhc_pre_splitk_large_m(
     m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
 ) -> tuple[int, int]:
-    """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
+    """Select split-K for the gfx950 large-M post+pre path."""
+    generic = get_mhc_pre_splitk(m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16)
     if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
+        # For unpacked V4.1 H=5120, (8, 64) wins only in this measured grid
+        # depth; the generic policy is faster on both sides.
+        if (
+            not w_preshuffle_bf16
+            and hc_hidden_size == 4 * 5120
+            and not 13312 <= m <= 14592
+        ):
+            return generic
         return 8, 64
-    return get_mhc_pre_splitk(m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16)
+    return generic
 
 
 @compile_ops("module_mhc", develop=True)

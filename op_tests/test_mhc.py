@@ -1100,6 +1100,30 @@ def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
     }
 
 
+def validate_mhc_large_m_policy():
+    if get_gfx_runtime() != "gfx950":
+        return
+    from aiter.ops.mhc import get_mhc_pre_splitk, get_mhc_pre_splitk_large_m
+
+    hc_hidden_size = 4 * 5120
+    assert get_mhc_pre_splitk_large_m(8192, hc_hidden_size) == get_mhc_pre_splitk(
+        8192, hc_hidden_size
+    )
+    assert get_mhc_pre_splitk_large_m(13312, hc_hidden_size) == (8, 64)
+    assert get_mhc_pre_splitk_large_m(14592, hc_hidden_size) == (8, 64)
+    assert get_mhc_pre_splitk_large_m(14848, hc_hidden_size) == get_mhc_pre_splitk(
+        14848, hc_hidden_size
+    )
+    assert get_mhc_pre_splitk_large_m(16384, hc_hidden_size) == get_mhc_pre_splitk(
+        16384, hc_hidden_size
+    )
+    assert get_mhc_pre_splitk_large_m(8192, hc_hidden_size, w_preshuffle_bf16=True) == (
+        8,
+        64,
+    )
+    assert get_mhc_pre_splitk_large_m(8192, 4 * 7168) == (8, 64)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1168,6 +1192,7 @@ parser.add_argument(
 add_data_init_args(parser, default_dist="norm")
 
 args = parser.parse_args()
+validate_mhc_large_m_policy()
 if args.res_preshuffle and get_gfx_runtime() != "gfx1250":
     parser.error("residual shuffle is only supported on gfx1250; use --no-res_shuffle")
 
