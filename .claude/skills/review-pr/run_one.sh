@@ -66,11 +66,24 @@ if [ -d "$W/merge-target" ]; then
 fi
 say "WORK=$W"
 
-# 2) worker (headless GLM)
+# The GLM backend can be slow or time out on a shared box; a single request timeout must not
+# kill the whole review. Retry the agent up to AITER_REVIEW_RETRIES (default 3) with backoff,
+# requiring its output file to exist and be non-empty before counting the attempt as success.
+run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
+  local label="$1" pf="$2" out="$3"; shift 3
+  local n=0 max="${AITER_REVIEW_RETRIES:-3}"
+  while :; do
+    n=$((n + 1)); rm -f "$out"
+    if (cd "$PROJ" && "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
+    if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error/timeout?)"; return 1; fi
+    say "$label attempt $n failed (GLM slow/timeout?); retrying in $((n * 10))s"; sleep $((n * 10))
+  done
+}
+
+# 2) worker (headless GLM), with retry on GLM timeout
 say "worker (GLM)..."
 bash "$SKILL/render.sh" worker "$W" > "$W/_pw.txt"
-(cd "$PROJ" && "${WORKER_CMD[@]}" "$(cat "$W/_pw.txt")") || { say "worker failed"; exit 2; }
-[ -s "$W/card.md" ] || { say "worker produced no card.md, aborting"; exit 2; }
+run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || exit 2
 
 # 3) refuter (headless GLM) -- Step 7.7; or the NONE line for a 0-finding card
 say "refuter..."
@@ -78,8 +91,7 @@ if grep -qiE '(NO FINDINGS|✅)' "$W/card.md" && ! grep -qE '^(🔴|⚠️|📝)
   printf 'NONE AVAILABLE -- 0 findings on the card (NO FINDINGS); nothing for an independent reader to refute\n' > "$W/independent.txt"
 else
   bash "$SKILL/render.sh" refuter "$W" "$W/card.md" > "$W/_prf.txt"
-  (cd "$PROJ" && "${REFUTER_CMD[@]}" "$(cat "$W/_prf.txt")") || { say "refuter failed"; exit 3; }
-  [ -s "$W/independent.txt" ] || { say "refuter wrote no independent.txt, aborting"; exit 3; }
+  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || exit 3
 fi
 
 # 4) gates + collect (call the python directly; no thin shell wrappers)
