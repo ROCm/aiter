@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import logging
-
 import pytest
 import torch
 
+from aiter import logger
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
@@ -27,11 +26,6 @@ arch = get_arch()
 pytestmark = pytest.mark.skipif(
     arch not in FP8_ARCHS, reason=f"FP8 not supported on {arch}"
 )
-
-
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-DEBUG_MODE = False
 
 
 def assert_cosine_similarity(actual, expected, threshold=0.96, norm_floor=1e-3):
@@ -93,17 +87,17 @@ def test_mha(
         causal=CAUSAL,
     )
 
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     torch_out = attention_ref(q, k, v, causal=CAUSAL)
     torch_out, attention_scores, _ = torch_out
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
 
@@ -155,24 +149,26 @@ def test_mha_varlen(
         _,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
-    if DEBUG_MODE:
-        print(
-            f"query_padding_mask.shape={query_padding_mask.shape} query_padding_mask={query_padding_mask}"
-        )
-        print(
-            f"key_padding_mask.shape={key_padding_mask.shape} key_padding_mask={key_padding_mask}"
-        )
-
-        print(f"q.shape={q.shape} q={q}")
-        print(f"k.shape={k.shape} k={k}")
-        print(f"v.shape={v.shape} v={v}")
-        print(f"q_unpad.shape={q_unpad.shape} q_unpad={q_unpad}")
-        print(f"k_unpad.shape={k_unpad.shape} k_unpad={k_unpad}")
-        print(f"v_unpad.shape={v_unpad.shape} v_unpad={v_unpad}")
-        print(f"max_seqlens_q={max_seqlen_q }")
-        print(f"max_seqlens_k={max_seqlen_k }")
-        print(f"cu_seqlens_q={cu_seqlens_q }")
-        print(f"cu_seqlens_k={cu_seqlens_k }")
+    logger.debug(
+        "query_padding_mask.shape=%s query_padding_mask=%s",
+        query_padding_mask.shape,
+        query_padding_mask,
+    )
+    logger.debug(
+        "key_padding_mask.shape=%s key_padding_mask=%s",
+        key_padding_mask.shape,
+        key_padding_mask,
+    )
+    logger.debug("q.shape=%s q=%s", q.shape, q)
+    logger.debug("k.shape=%s k=%s", k.shape, k)
+    logger.debug("v.shape=%s v=%s", v.shape, v)
+    logger.debug("q_unpad.shape=%s q_unpad=%s", q_unpad.shape, q_unpad)
+    logger.debug("k_unpad.shape=%s k_unpad=%s", k_unpad.shape, k_unpad)
+    logger.debug("v_unpad.shape=%s v_unpad=%s", v_unpad.shape, v_unpad)
+    logger.debug("max_seqlens_q=%d", max_seqlen_q)
+    logger.debug("max_seqlens_k=%d", max_seqlen_k)
+    logger.debug("cu_seqlens_q=%s", cu_seqlens_q)
+    logger.debug("cu_seqlens_k=%s", cu_seqlens_k)
 
     triton_out = flash_attn_varlen_fp8_func(
         q_unpad,
@@ -187,8 +183,7 @@ def test_mha_varlen(
 
     triton_out = output_pad_fn(triton_out)
 
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     torch_out = attention_ref(
         q,
@@ -200,11 +195,12 @@ def test_mha_varlen(
     )
     torch_out, attention_scores, _ = torch_out
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
 

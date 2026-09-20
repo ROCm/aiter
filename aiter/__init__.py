@@ -123,6 +123,7 @@ else:
     from .ops.rope import *
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
+    from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
     from .ops.gradlib import *
@@ -144,7 +145,19 @@ else:
     from .ops.gdr_decode_packed_bf16 import *
     from . import mla  # noqa: F401
 
-    # isort: on
+if AITER_TRITON_ONLY:
+
+    def is_gfx1250_asm_supported() -> bool:
+        return True
+
+    def require_gfx1250_asm(op_name: str) -> None:
+        return None
+
+else:
+    from .jit.utils.asm_guard import (  # noqa: F401
+        is_gfx1250_asm_supported,
+        require_gfx1250_asm,
+    )
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:
