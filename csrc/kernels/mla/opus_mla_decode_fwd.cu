@@ -71,9 +71,16 @@ using MxFp8Traits = opus_mla_decode_mxfp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, b
 // single query token needs no diagonal either way -- it then sits at the end of
 // the KV run and masks nothing -- so max_seqlen_q == 1 keeps the build that only
 // masks out-of-bounds columns even when causal is asked for.
-template <bool CAUSAL, bool LARGE_KV = false>
-using OpusTraitsC =
-    opus_mla_decode_fp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV>;
+template <bool CAUSAL, bool LARGE_KV = false, bool WAVE_SPANS_TOKENS = false>
+using OpusTraitsC = opus_mla_decode_fp8_16mx8_32nx1_traits<16,
+                                                           32,
+                                                           8,
+                                                           fp8_t,
+                                                           fp8_t,
+                                                           bf16_t,
+                                                           CAUSAL,
+                                                           LARGE_KV,
+                                                           WAVE_SPANS_TOKENS>;
 using OpusTraits = OpusTraitsC<false>;
 
 } // namespace
@@ -396,12 +403,22 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         opus_mla_decode_fp8_16mx8_32nx1_kernel<decltype(traits)>
             <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
     };
+    // A work item is 8 waves x W_M = 128 packed Q rows, and a wave's 16 rows all belong to
+    // one query token only while H divides them evenly. When it does not (H = 10, 12, 24,
+    // ...), the causal bound differs inside a wave and the kernel needs its per-lane form --
+    // a third specialization axis, but only under causal, since that is the only thing the
+    // bound feeds. Non-causal and every H that is a multiple of W_M keep the original build.
+    const bool wave_spans_tokens = (H % OpusTraits::W_M) != 0;
     if(causal && max_seqlen_q > 1)
     {
-        if(large_kv)
-            launch(OpusTraitsC<true, true>{});
+        if(large_kv && wave_spans_tokens)
+            launch(OpusTraitsC<true, true, true>{});
+        else if(large_kv)
+            launch(OpusTraitsC<true, true, false>{});
+        else if(wave_spans_tokens)
+            launch(OpusTraitsC<true, false, true>{});
         else
-            launch(OpusTraitsC<true, false>{});
+            launch(OpusTraitsC<true, false, false>{});
     }
     else
     {
