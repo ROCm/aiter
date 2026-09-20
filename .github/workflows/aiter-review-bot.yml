@@ -9,8 +9,9 @@
 # is provisioned on the runner box.
 #
 # Trigger (an authorized aiter-team member comments on a PR):
-#   @aiter-bot review      first pass
-#   @aiter-bot re-review   after the author pushes fixes
+#   @aiter-bot review      reviews the PR. Comment it again after you push fixes for a fresh
+#                          pass — a new head SHA is reviewed, repeats on the same SHA are
+#                          deduped, so this one command covers both the first pass and repeat passes.
 # Commands inside quote (`>`) lines do not trigger; non-allowlisted commenters are ignored.
 #
 # Chain (all on the runner, scripts from .claude/skills/review-pr/):
@@ -36,8 +37,7 @@ jobs:
     # check runs in the gate step below).
     if: >
       github.event.issue.pull_request &&
-      (contains(github.event.comment.body, '@aiter-bot review') ||
-       contains(github.event.comment.body, '@aiter-bot re-review'))
+      contains(github.event.comment.body, '@aiter-bot review')
     runs-on: [self-hosted, box308]        # label the runner with these at registration
     env:
       PR: ${{ github.event.issue.number }}          # issue number == PR number here
@@ -66,18 +66,16 @@ jobs:
           import os, re, pathlib
           body = os.environ.get('BODY', '')
           who  = os.environ.get('COMMENTER', '').strip().lower()
-          # 1) Real trigger: line-based; skip quote (>) lines; re-review before review
-          #    (re-review contains the substring 'review').
-          TRIG = [('re-review', re.compile(r'@aiter-bot\s+re-?review\b', re.I)),
-                  ('review',    re.compile(r'@aiter-bot\s+review\b', re.I))]
-          kind = None
+          # 1) Real trigger: line-based; skip quote (>) lines. One command only,
+          #    @aiter-bot review: pushing fixes changes the head SHA and _publish.py dedups by
+          #    head SHA, so the same command auto-covers the first pass and a repeat pass after a push.
+          TRIG = re.compile(r'@aiter-bot\s+review\b', re.I)
+          triggered = False
           for raw in body.splitlines():
               if raw.lstrip().startswith('>'):
                   continue
-              for k, rx in TRIG:
-                  if rx.search(raw):
-                      kind = k; break
-              if kind: break
+              if TRIG.search(raw):
+                  triggered = True; break
           # 2) Authorization: repo var AITER_REVIEW_AUTHORIZED wins, else allowlist file
           allow = set()
           v = os.environ.get('AITER_REVIEW_AUTHORIZED', '')
@@ -88,10 +86,9 @@ jobs:
               if f.is_file():
                   allow = {l.strip().lower() for l in f.read_text().splitlines()
                            if l.strip() and not l.startswith('#')}
-          ok = bool(kind) and who in allow
+          ok = triggered and who in allow
           print(f'ok={"true" if ok else "false"}')
-          print(f'kind={kind or ""}')
-          if not kind:
+          if not triggered:
               print('reason=command only in a quote line or absent')
           elif who not in allow:
               print('reason=commenter not on the aiter-team allowlist')
@@ -99,7 +96,7 @@ jobs:
 
       - name: Gate result
         run: |
-          echo "commenter=$COMMENTER kind=${{ steps.gate.outputs.kind }} ok=${{ steps.gate.outputs.ok }} ${{ steps.gate.outputs.reason }}"
+          echo "commenter=$COMMENTER ok=${{ steps.gate.outputs.ok }} ${{ steps.gate.outputs.reason }}"
           [ "${{ steps.gate.outputs.ok }}" = "true" ] || { echo "::notice::ignored — ${{ steps.gate.outputs.reason }}"; exit 0; }
 
       - name: Claim 👀 (as aiter-bot)
