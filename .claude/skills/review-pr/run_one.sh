@@ -32,9 +32,13 @@ if ! gh api repos/"$REPO" --jq .full_name >/dev/null 2>&1; then
   [ -n "$TOK" ] && export GH_TOKEN="$TOK" GITHUB_TOKEN="$TOK"
 fi
 
-WORKER_CMD=(claude-glm -p --dangerously-skip-permissions)
-# Cross-family (restores the refuter's value): REFUTER_CMD=(claude -p --dangerously-skip-permissions)
-REFUTER_CMD=(claude-glm -p --dangerously-skip-permissions)
+# The box's Claude entrypoint. Default is claude-glm (resolves a remote GLM over a tunnel);
+# on a box that hosts GLM itself, set AITER_REVIEW_AGENT to a local `claude` pointed at the
+# on-box endpoint (ANTHROPIC_BASE_URL=http://localhost:<port>), so no tunnel/wrapper is needed.
+AGENT="${AITER_REVIEW_AGENT:-claude-glm}"
+WORKER_CMD=("$AGENT" -p --dangerously-skip-permissions)
+# Cross-family (restores the refuter's value): set AITER_REVIEW_REFUTER_AGENT to an Opus entrypoint.
+REFUTER_CMD=("${AITER_REVIEW_REFUTER_AGENT:-$AGENT}" -p --dangerously-skip-permissions)
 say() { echo "[run_one #$PR] $*"; }
 
 # Fail fast if the prompts have drifted from SKILL.md (they quote it verbatim).
