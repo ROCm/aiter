@@ -51,6 +51,41 @@ What this file provides
 Only a4w4 (MXFP4 activation x MXFP4 weight, ``QuantType.per_1x32``) is wired up
 for now.
 
+Making the control group the thing it claims to be
+--------------------------------------------------
+A speedup is only worth the baseline it is measured against, and this one
+started out measuring a baseline no serving stack would ship.  Three things
+were wrong with it, all of them inflating the split side:
+
+* **It called RCCL.**  At TP8 decode sizes these collectives are pure latency
+  -- kilobytes of payload -- and RCCL's floor on gfx950 is ~18us of *device*
+  time per call against ~8us for aiter's one-shot P2P kernels, the ones
+  ``tensor_model_parallel_all_gather(use_custom=True)`` exists to reach.  That
+  is a ~2.3x handicap per collective before any fusion happens.  ``--comm``
+  now selects the backend.  It does not simply default to the one-shot path:
+  those kernels also carry 2-3x the *host* dispatch, so they lose in eager and
+  win under graph replay, and ``auto`` picks whichever is ahead in the regime
+  being measured so the control group is never the slower of the two.
+* **It timed staging, not communication.**  The routing AllGather packed
+  ids/weights into a staging row and unpacked them again, and the payload
+  AllGather did the same for the MXFP4 activation and its scales: four extra
+  launches each.  At dsv4 M=8 the routing leg reported ~59us and the payload
+  leg ~65us; measured on device against the one-shot backend the same work is
+  7.5us and 9.7us.  The packs were never the layer's work (a router emits its
+  top-k straight into wire format) and the payload halves never needed packing
+  at all.
+* **It was eager while the fused side was captured.**  ``--graph`` used to
+  capture only the fused path, so every launch the baseline dispatched counted
+  as fusion win.  Production decode is captured on both sides; ``--graph`` now
+  captures both and reports ``graph_speedup``, which is the only number here
+  measured the way the layer actually runs.
+
+The eager columns are kept because they are still what an eager caller sees,
+but on this box a single eager launch costs ~14us of host dispatch no matter
+what it does, so at small M the eager legs say more about the harness than
+about the layer.  Read ``graph_speedup`` for the claim and the eager legs for
+where the launches went.
+
 Usage
 -----
 No wrapper and no exported variables: every environment variable the tuned a4w4
@@ -102,6 +137,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, replace
+from typing import ClassVar
 
 # ---------------------------------------------------------------------------
 # Environment and search path -- must run before ``import aiter``
@@ -149,6 +185,10 @@ import torch.distributed as dist  # noqa: E402
 
 import aiter  # noqa: E402
 from aiter import dtypes  # noqa: E402
+from aiter.dist.communication_op import (  # noqa: E402
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_reduce_scatter,
+)
 from aiter.fused_moe import (  # noqa: E402
     fused_moe_2stages,
     fused_topk,
@@ -275,25 +315,70 @@ class DistCtx:
     rank: int
     world: int
     device: torch.device
+    #: Whether aiter's parallel state came up, i.e. whether the one-shot P2P
+    #: collectives are reachable at all.  Empty string when they are; otherwise
+    #: the reason, which the backend selection prints once.
+    custom_comm_error: str = ""
 
     @property
     def is_main(self) -> bool:
         return self.rank == 0
 
 
-def setup_dist() -> DistCtx:
+def setup_dist(want_custom_comm: bool = True) -> DistCtx:
+    """Bring up the process group, preferring aiter's parallel state.
+
+    ``init_dist_env`` is the entry point a serving stack uses: it initializes
+    the same NCCL process group *and* the CustomAllreduce IPC arena that backs
+    the one-shot P2P AllGather / ReduceScatter.  Without it those kernels are
+    simply unreachable and the only collective available is RCCL -- which at
+    decode sizes is ~2.3x slower per call on device (see ``TpCollectives``).
+
+    Falls back to a bare NCCL group when the arena cannot be created, so a box
+    without working IPC still runs the sweep instead of aborting it.
+    """
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    err = ""
+    if want_custom_comm and not dist.is_initialized():
+        try:
+            from aiter.ops.communication import init_dist_env
+
+            if rank == 0:
+                # Announced because this step can *hang* rather than fail on
+                # boxes where the IPC rendezvous inside ``init_custom_ar`` does
+                # not complete (seen on torch 2.8 + ROCm 7.1 here, fine on
+                # torch 2.13). A hang with no output is indistinguishable from
+                # a slow JIT build; a hang after this line is diagnosable, and
+                # ``--comm rccl`` skips the step entirely.
+                print(
+                    "[TP-MOE] bringing up aiter parallel state for the "
+                    "one-shot collectives (--comm rccl skips this)",
+                    flush=True,
+                )
+            init_dist_env(world, rank, local_rank=local_rank)
+        except Exception as exc:  # noqa: BLE001 - degrade to RCCL, never abort
+            err = f"{type(exc).__name__}: {exc}"
+    elif not want_custom_comm:
+        err = "disabled by --comm rccl"
     if not dist.is_initialized():
         dist.init_process_group("nccl", device_id=device)
+        if want_custom_comm and not err:
+            err = "aiter parallel state did not initialize"
     torch.set_default_device(device)
-    return DistCtx(rank=rank, world=world, device=device)
+    return DistCtx(rank=rank, world=world, device=device, custom_comm_error=err)
 
 
 def cleanup_dist() -> None:
+    try:
+        from aiter.ops.communication import destroy_dist_env
+
+        destroy_dist_env()
+    except Exception as exc:  # noqa: BLE001 - teardown must not mask a failure
+        logger.debug("[TP-MOE] destroy_dist_env: %s", exc)
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -491,6 +576,16 @@ class TpMoeInputs:
     x_local: torch.Tensor  # [m, H] bf16, this rank's token shard
     topk_weights_local: torch.Tensor  # [m, topk] f32
     topk_ids_local: torch.Tensor  # [m, topk] i32
+    #: ids and (bit-cast) weights side by side in one [m, 2*topk] int32 row, so
+    #: the routing metadata rides a single collective instead of two.
+    #:
+    #: This buffer is built here, with the routing, and not inside the layer.
+    #: Packing it per call used to cost two extra launches on every timed
+    #: routing AllGather, charged to the collective even though it is the
+    #: router's output format and not the layer's work. A
+    #: real router writes its top-k straight into whatever the layer is about
+    #: to send; the layer's job starts at the collective.
+    route_meta_local: torch.Tensor  # [m, 2*topk] i32
     global_tokens: int
     local_tokens: int
 
@@ -532,13 +627,163 @@ def make_inputs(
             (m, shape.experts), dtype=dtypes.bf16, device=ctx.device, generator=gen
         )
     topk_weights, topk_ids = fused_topk(x, score, shape.topk, True)
+    topk_weights = topk_weights.contiguous()
+    topk_ids = topk_ids.contiguous()
+    # The router's wire format, built once with the routing itself -- see
+    # TpMoeInputs.route_meta_local for why this does not belong in the layer.
+    meta = torch.empty(
+        (m, 2 * shape.topk), dtype=torch.int32, device=ctx.device
+    ).contiguous()
+    meta[:, : shape.topk].copy_(topk_ids)
+    meta[:, shape.topk :].copy_(topk_weights.view(torch.int32))
     return TpMoeInputs(
         x_local=x.contiguous(),
-        topk_weights_local=topk_weights.contiguous(),
-        topk_ids_local=topk_ids.contiguous(),
+        topk_weights_local=topk_weights,
+        topk_ids_local=topk_ids,
+        route_meta_local=meta,
         global_tokens=global_tokens,
         local_tokens=m,
     )
+
+
+# ---------------------------------------------------------------------------
+# Collective backend
+# ---------------------------------------------------------------------------
+class TpCollectives:
+    """The AllGather / ReduceScatter the split baseline runs on.
+
+    Which backend this is is not an implementation detail, it decides whether
+    the baseline is the thing the fused kernel actually has to beat.  At TP8
+    decode sizes these calls are pure latency -- the payload is kilobytes --
+    and on gfx950 the two available backends are nowhere near each other.
+    Measured on this box at M=8, dsv4 (H=7168), device time per call (``reps``
+    copies captured inside one CUDA graph, so no host dispatch is included)::
+
+        AllGather   bf16          RCCL 18.4us    aiter one-shot  7.8us
+        ReduceScatter bf16        RCCL 18.3us    aiter one-shot  8.2us
+        AllGather   mxfp4 wire    RCCL 25.2us    aiter one-shot  7.3us
+
+    A serving stack runs the one-shot kernels -- that is exactly what
+    ``tensor_model_parallel_all_gather(use_custom=True)`` and
+    ``tensor_model_parallel_reduce_scatter(use_custom=True)`` exist for -- so a
+    baseline wired straight to ``torch.distributed`` concedes ~2.3x on every
+    collective before fusion enters the picture, and any speedup quoted against
+    it inherits that.
+
+    The one-shot path is not free, though: its Python wrapper, torch.library
+    dispatch and per-call output allocation cost ~26-35us of *host* time per
+    call against RCCL's ~11us, so it is behind in eager and ahead under graph
+    replay.  ``--comm auto`` resolves that before this object is built (see
+    ``main``); by the time a backend arrives here it is already the one that
+    wins in the regime being measured.  Within a backend, individual calls
+    still fall back to RCCL when the shape is one the kernel declines, which is
+    what a serving stack does too -- ``describe()`` reports when that happened
+    rather than letting a mixed baseline pass as a pure one.
+
+    Eligibility is the kernel's, not ours: ``should_custom_ag`` wants a
+    contiguous input whose byte size is a multiple of 16, and the kernel itself
+    only accepts fp32/fp16/bf16.  Byte-identical dtypes are therefore bit-cast
+    on the way in and back on the way out -- an MXFP4 payload is just bytes on
+    the wire, and a collective that only copies does not care how they are
+    interpreted.
+    """
+
+    #: Byte-identical float view for dtypes the one-shot kernel rejects.
+    #: int32/int16/int64 are already handled inside ``custom_all_gather``;
+    #: these are the ones that reach it unconverted.
+    _BYTE_VIEW: ClassVar[dict] = {
+        torch.uint8: torch.bfloat16,
+        torch.int8: torch.bfloat16,
+    }
+
+    def __init__(self, backend: str, ctx: DistCtx, tp_size: int):
+        self.tp_size = tp_size
+        self.device = ctx.device
+        self.enabled = backend in ("auto", "custom") and not ctx.custom_comm_error
+        self.error = "" if self.enabled else (ctx.custom_comm_error or "")
+        #: Set once the first fallback happens, so the report can say the
+        #: baseline was not purely one-shot rather than silently mixing.
+        self.fell_back = False
+
+    # -- eligibility ------------------------------------------------------
+    def _as_float(self, x: torch.Tensor):
+        """Return a byte-identical float view, or None if there is not one."""
+        want = self._BYTE_VIEW.get(x.dtype)
+        if want is None:
+            return x
+        step = torch.finfo(want).bits // 8 // x.element_size()
+        if x.dim() != 2 or x.shape[-1] % step:
+            return None
+        return x.view(want)
+
+    def _ag_custom_ok(self, x: torch.Tensor) -> bool:
+        if not self.enabled or not x.is_contiguous():
+            return False
+        # should_custom_ag: 16-byte multiple, and the gathered result has to fit
+        # the registered IPC arena (it is 1 GiB, so only the largest sweep
+        # points come near it).
+        return (x.numel() * x.element_size()) % 16 == 0
+
+    def _rs_custom_ok(self, x: torch.Tensor) -> bool:
+        if not self.enabled or not x.is_contiguous():
+            return False
+        if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return False
+        if x.shape[0] % self.tp_size:
+            return False
+        pack = 16 // x.element_size()
+        return x.numel() % (self.tp_size * pack) == 0
+
+    # -- collectives ------------------------------------------------------
+    def all_gather(self, x: torch.Tensor, out: torch.Tensor | None = None):
+        """Gather ``x[m, ...]`` along dim 0 into ``[m * TP, ...]``.
+
+        ``out`` is only a hint: the one-shot path returns its own buffer (the
+        kernel writes into the IPC arena), while the RCCL path writes into the
+        preallocated buffer so it is not charged an allocation the one-shot
+        path does not pay either.
+        """
+        if self._ag_custom_ok(x):
+            view = self._as_float(x)
+            if view is not None:
+                try:
+                    got = tensor_model_parallel_all_gather(
+                        view, use_custom=True, dim=0
+                    )
+                    return got.view(x.dtype) if view.dtype != x.dtype else got
+                except Exception:  # noqa: BLE001 - shape the kernel declines
+                    self.fell_back = True
+        if out is None:
+            out = torch.empty(
+                (x.shape[0] * self.tp_size,) + tuple(x.shape[1:]),
+                dtype=x.dtype,
+                device=x.device,
+            )
+        dist.all_gather_into_tensor(out, x)
+        return out
+
+    def reduce_scatter(self, x: torch.Tensor, out: torch.Tensor | None = None):
+        """Sum ``x[M, ...]`` across ranks and keep this rank's ``[M/TP, ...]``."""
+        if self._rs_custom_ok(x):
+            try:
+                return tensor_model_parallel_reduce_scatter(
+                    x, use_custom=True, dim=0
+                )
+            except Exception:  # noqa: BLE001 - shape the kernel declines
+                self.fell_back = True
+        if out is None:
+            out = torch.empty(
+                (x.shape[0] // self.tp_size,) + tuple(x.shape[1:]),
+                dtype=x.dtype,
+                device=x.device,
+            )
+        dist.reduce_scatter_tensor(out, x)
+        return out
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return f"rccl ({self.error})" if self.error else "rccl"
+        return "custom+rccl-fallback" if self.fell_back else "custom"
 
 
 # ---------------------------------------------------------------------------
@@ -551,10 +796,18 @@ class AllGatherTokens:
     the same instance can be captured by a CUDA graph later.
     """
 
-    def __init__(self, shape: ModelShape, tp_size: int, max_local_tokens: int, device):
+    def __init__(
+        self,
+        shape: ModelShape,
+        tp_size: int,
+        max_local_tokens: int,
+        device,
+        comm: TpCollectives | None = None,
+    ):
         self.tp_size = tp_size
         self.model_dim = shape.model_dim
         self.topk = shape.topk
+        self.comm = comm
         total = max_local_tokens * tp_size
         self._x = torch.empty(
             (total, shape.model_dim), dtype=dtypes.bf16, device=device
@@ -563,12 +816,8 @@ class AllGatherTokens:
         self._i = torch.empty((total, shape.topk), dtype=torch.int32, device=device)
         # Routing metadata is tiny (topk*8 bytes/token) but must be gathered too:
         # every rank evaluates every global token against its own expert shard.
-        # At M=8 a bare collective already costs ~40us, so issuing one per tensor
-        # would make the baseline pay 3x the latency floor for no reason. Pack
-        # ids and (bit-cast) weights into a single int32 payload instead.
-        self._meta_local = torch.empty(
-            (max_local_tokens, 2 * shape.topk), dtype=torch.int32, device=device
-        )
+        # It arrives already packed as ``inputs.route_meta_local``, so this pays
+        # one collective for it rather than a second latency floor.
         self._meta = torch.empty(
             (total, 2 * shape.topk), dtype=torch.int32, device=device
         )
@@ -579,17 +828,19 @@ class AllGatherTokens:
         return local_tokens * row * (self.tp_size - 1)
 
     def __call__(self, inputs: TpMoeInputs):
-        m, g, k = inputs.local_tokens, inputs.global_tokens, self.topk
-        meta_local = self._meta_local[:m]
-        meta_local[:, :k].copy_(inputs.topk_ids_local)
-        meta_local[:, k:].copy_(inputs.topk_weights_local.view(torch.int32))
-
-        dist.all_gather_into_tensor(self._x[:g], inputs.x_local)
-        dist.all_gather_into_tensor(self._meta[:g], meta_local)
-
-        x, w, i = self._x[:g], self._w[:g], self._i[:g]
-        i.copy_(self._meta[:g, :k])
-        w.view(torch.int32).copy_(self._meta[:g, k:])
+        g, k = inputs.global_tokens, self.topk
+        if self.comm is None:
+            dist.all_gather_into_tensor(self._x[:g], inputs.x_local)
+            dist.all_gather_into_tensor(self._meta[:g], inputs.route_meta_local)
+            x, meta = self._x[:g], self._meta[:g]
+        else:
+            x = self.comm.all_gather(inputs.x_local, out=self._x[:g])
+            meta = self.comm.all_gather(
+                inputs.route_meta_local, out=self._meta[:g]
+            )
+        w, i = self._w[:g], self._i[:g]
+        i.copy_(meta[:, :k])
+        w.view(torch.int32).copy_(meta[:, k:])
         return x, w, i
 
 
@@ -671,9 +922,17 @@ def _partial_keyword(fn, *keys: str) -> str:
 class ReduceScatterOutput:
     """Sum the per-rank partial outputs across TP and scatter back to the token shard."""
 
-    def __init__(self, shape: ModelShape, tp_size: int, max_local_tokens: int, device):
+    def __init__(
+        self,
+        shape: ModelShape,
+        tp_size: int,
+        max_local_tokens: int,
+        device,
+        comm: TpCollectives | None = None,
+    ):
         self.tp_size = tp_size
         self.model_dim = shape.model_dim
+        self.comm = comm
         self._y = torch.empty(
             (max_local_tokens, shape.model_dim), dtype=dtypes.bf16, device=device
         )
@@ -682,9 +941,14 @@ class ReduceScatterOutput:
         return local_tokens * self.model_dim * 2 * (self.tp_size - 1)
 
     def __call__(self, partial: torch.Tensor, local_tokens: int) -> torch.Tensor:
+        # A GEMM2 output is already contiguous, so this is a host-side no-op
+        # rather than a copy; it is kept because both backends require it.
+        partial = partial.contiguous()
         out = self._y[:local_tokens]
-        dist.reduce_scatter_tensor(out, partial.contiguous())
-        return out
+        if self.comm is None:
+            dist.reduce_scatter_tensor(out, partial)
+            return out
+        return self.comm.reduce_scatter(partial, out=out)
 
 
 # ---------------------------------------------------------------------------
@@ -787,18 +1051,34 @@ class TunedPlans:
 
 
 class RouteAllGather:
-    """Step 0: gather the routing metadata.  The sort's only input."""
+    """Step 0: gather the routing metadata.  The sort's only input.
 
-    def __init__(self, shape: ModelShape, tp_size: int, max_local_tokens: int, device):
+    One collective plus the two unpack copies ``moe_sorting`` forces, and
+    nothing else.  What used to sit here was a four-copy sandwich -- pack
+    ids/weights into a staging row, gather, unpack both halves back out -- and
+    it dominated its own measurement: at dsv4 M=8 the leg reported ~59us for
+    what is 7.5us of device work on the one-shot backend, the rest being two
+    packs, two unpacks and the eager dispatch of five launches instead of
+    three.  The packs are gone
+    because the router already emits ``route_meta_local`` in wire format (see
+    ``TpMoeInputs``); the unpacks stay because ``moe_sorting`` needs two
+    separately contiguous tensors, and a strided view of one gathered buffer is
+    not that.
+    """
+
+    def __init__(
+        self,
+        shape: ModelShape,
+        tp_size: int,
+        max_local_tokens: int,
+        device,
+        comm: TpCollectives | None = None,
+    ):
         total = max_local_tokens * tp_size
         self.tp_size = tp_size
         self.topk = shape.topk
         self.row_bytes = shape.topk * 8
-        # ids and (bit-cast) weights ride in one int32 payload so this pays a
-        # single collective's latency instead of two.
-        self._meta_local = torch.empty(
-            (max_local_tokens, 2 * shape.topk), dtype=torch.int32, device=device
-        )
+        self.comm = comm
         self._meta = torch.empty(
             (total, 2 * shape.topk), dtype=torch.int32, device=device
         )
@@ -809,14 +1089,17 @@ class RouteAllGather:
         return local_tokens * self.row_bytes * (self.tp_size - 1)
 
     def __call__(self, inputs: TpMoeInputs):
-        m, g, k = inputs.local_tokens, inputs.global_tokens, self.topk
-        meta_local = self._meta_local[:m]
-        meta_local[:, :k].copy_(inputs.topk_ids_local)
-        meta_local[:, k:].copy_(inputs.topk_weights_local.view(torch.int32))
-        dist.all_gather_into_tensor(self._meta[:g], meta_local)
+        g, k = inputs.global_tokens, self.topk
+        if self.comm is None:
+            dist.all_gather_into_tensor(self._meta[:g], inputs.route_meta_local)
+            meta = self._meta[:g]
+        else:
+            meta = self.comm.all_gather(
+                inputs.route_meta_local, out=self._meta[:g]
+            )
         w, i = self._w[:g], self._i[:g]
-        i.copy_(self._meta[:g, :k])
-        w.view(torch.int32).copy_(self._meta[:g, k:])
+        i.copy_(meta[:, :k])
+        w.view(torch.int32).copy_(meta[:, k:])
         return w, i
 
 
@@ -891,22 +1174,46 @@ class QuantizeLocal:
 
 
 class PayloadAllGather:
-    """Step 3: gather the quantized activation and its E8M0 scales."""
+    """Step 3: gather the quantized activation and its E8M0 scales.
 
-    def __init__(self, shape: ModelShape, tp_size: int, max_local_tokens: int, device):
+    Two collectives on the buffers the quantizer already produced, and no
+    staging at all.  The previous shape of this packed payload and scale into
+    one uint8 row, gathered once, then called ``.contiguous()`` on both halves
+    to get them back -- four extra kernels and two allocations to save one
+    collective launch.  That trade is a loss once the collective is the
+    one-shot kernel, which costs ~7.3us: the four staging copies cost more than
+    the launch they save.  It also made the leg report ~65us at dsv4 M=8 for
+    what measures 9.7us of device work here, which is most of why the split
+    baseline looked far worse than a real unfused layer.
+
+    On RCCL the two forms are close (both ~60-65us eager), so nothing is given
+    up by choosing the one that has no staging in it.
+
+    Both halves are plain bytes on the wire, so each rides whichever backend
+    ``TpCollectives`` picks; MXFP4 and E8M0 are bit-cast for the one-shot
+    kernel and cast straight back.
+    """
+
+    def __init__(
+        self,
+        shape: ModelShape,
+        tp_size: int,
+        max_local_tokens: int,
+        device,
+        comm: TpCollectives | None = None,
+    ):
         total = max_local_tokens * tp_size
         self.tp_size = tp_size
         self.model_dim = shape.model_dim
         self.payload_bytes = shape.model_dim // 2
         self.scale_bytes = shape.model_dim // 32
         self.row_bytes = self.payload_bytes + self.scale_bytes
-        # One contiguous staging row for payload+scale keeps this at a single
-        # collective, the same accounting the BF16 AllGather gets.
-        self._local = torch.empty(
-            (max_local_tokens, self.row_bytes), dtype=torch.uint8, device=device
+        self.comm = comm
+        self._payload = torch.empty(
+            (total, self.payload_bytes), dtype=torch.uint8, device=device
         )
-        self._all = torch.empty(
-            (total, self.row_bytes), dtype=torch.uint8, device=device
+        self._scale = torch.empty(
+            (total, self.scale_bytes), dtype=torch.uint8, device=device
         )
 
     def wire_bytes(self, local_tokens: int) -> int:
@@ -914,16 +1221,16 @@ class PayloadAllGather:
 
     def __call__(self, xq, xq_scale, inputs: TpMoeInputs):
         m, g = inputs.local_tokens, inputs.global_tokens
-        staging = self._local[:m]
-        staging[:, : self.payload_bytes].copy_(xq.view(torch.uint8).view(m, -1))
-        staging[:, self.payload_bytes :].copy_(xq_scale.view(torch.uint8).view(m, -1))
-        dist.all_gather_into_tensor(self._all[:g], staging)
-        gathered = self._all[:g]
-        a1 = gathered[:, : self.payload_bytes].contiguous().view(AQ_DTYPE)
-        a1_scale = (
-            gathered[:, self.payload_bytes :].contiguous().view(dtypes.fp8_e8m0)
-        )
-        return a1, a1_scale
+        payload = xq.view(torch.uint8).view(m, self.payload_bytes)
+        scale = xq_scale.view(torch.uint8).view(m, self.scale_bytes)
+        if self.comm is None:
+            dist.all_gather_into_tensor(self._payload[:g], payload)
+            dist.all_gather_into_tensor(self._scale[:g], scale)
+            a1, a1_scale = self._payload[:g], self._scale[:g]
+        else:
+            a1 = self.comm.all_gather(payload, out=self._payload[:g])
+            a1_scale = self.comm.all_gather(scale, out=self._scale[:g])
+        return a1.view(AQ_DTYPE), a1_scale.view(dtypes.fp8_e8m0)
 
 
 class SplitLocalGemms:
@@ -1012,26 +1319,34 @@ class SplitTpMoe:
 
     name = "split"
 
-    def __init__(self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int):
+    def __init__(
+        self,
+        weights: TpMoeWeights,
+        ctx: DistCtx,
+        max_local_tokens: int,
+        comm: TpCollectives | None = None,
+    ):
         shape = weights.shape
+        tp = weights.tp_size
         self.weights = weights
         self.shape = shape
         self.ctx = ctx
-        self.tp_size = weights.tp_size
+        self.tp_size = tp
+        self.comm = comm
         self.plans = TunedPlans(weights)
-        self.route_ag = RouteAllGather(shape, weights.tp_size, max_local_tokens, ctx.device)
+        self.route_ag = RouteAllGather(shape, tp, max_local_tokens, ctx.device, comm)
         self.sorting = MoeSortingStep(weights)
         self.quant = QuantizeLocal()
         self.payload_ag = PayloadAllGather(
-            shape, weights.tp_size, max_local_tokens, ctx.device
+            shape, tp, max_local_tokens, ctx.device, comm
         )
         self.gemms = SplitLocalGemms(weights)
         self.reduce_scatter = ReduceScatterOutput(
-            shape, weights.tp_size, max_local_tokens, ctx.device
+            shape, tp, max_local_tokens, ctx.device, comm
         )
         # Only the accuracy path needs a BF16 view of the gathered activation.
         self.allgather = AllGatherTokens(
-            shape, weights.tp_size, max_local_tokens, ctx.device
+            shape, tp, max_local_tokens, ctx.device, comm
         )
 
     def kernel_names(self, global_tokens: int) -> tuple[str, str]:
@@ -1303,8 +1618,82 @@ def jit_warmup(
 
 
 
-def _time_graph(fused, inputs, args, ctx) -> float:
-    """Capture one fused forward into a CUDA graph and time the replay.
+def _graph_capture_ctx():
+    """aiter's capture context, or a no-op when its parallel state is absent.
+
+    ``CustomAllreduce`` needs to know it is being captured: under capture it
+    routes through the pre-registered IPC pool instead of the normal path, and
+    capturing it without this yields a graph that replays stale peer pointers.
+    The fused engine does not need it, but the split baseline does as soon as
+    its collectives are the one-shot kernels, and both go through this helper
+    so the two sides are captured identically.
+    """
+    try:
+        from aiter.dist.parallel_state import get_tp_group, graph_capture
+
+        get_tp_group()
+    except Exception:  # noqa: BLE001 - no aiter parallel state -> plain capture
+        import contextlib
+
+        return contextlib.nullcontext()
+    return graph_capture()
+
+
+def _device_us(fn, *, reps: int, rounds: int, device) -> float:
+    """Device time for one call to ``fn``, with host dispatch removed.
+
+    Neither of the obvious measurements can see a leg this small.  Timing an
+    eager loop charges ~11-35us of host dispatch per call depending on the
+    backend, which at decode sizes is larger than the work.  Replaying a graph
+    that holds a *single* call is no better: the replay call itself costs ~14us
+    on this box, so a one-call graph reports ~14us for a no-op.  Capturing
+    ``reps`` copies into one graph and replaying that amortizes the replay to
+    ``1/reps`` and leaves device work.
+
+    This is how the legs were shown to be mostly dispatch. dsv4 M=8, TP8, the
+    one-shot backend, eager vs device::
+
+        route AG  58.2 -> 7.5     AllGather 101.6 -> 9.7
+        sort      41.2 -> 9.7     ReduceSc.  47.7 -> 6.0
+        quant     20.6 -> 1.9
+
+    Returns NaN when capture is not possible -- a diagnostic column must not
+    take the sweep down with it.
+    """
+    graph = None
+    try:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                fn()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        barrier()
+        graph = torch.cuda.CUDAGraph()
+        with _graph_capture_ctx(), torch.cuda.graph(graph):
+            for _ in range(reps):
+                fn()
+        torch.cuda.synchronize()
+        mean, _ = time_us(
+            graph.replay, iters=4, warmup=2, device=device, rounds=rounds
+        )
+        return mean / reps
+    except Exception as exc:  # noqa: BLE001 - diagnostic column only
+        logger.warning("[TP-MOE] leg capture failed: %s", exc)
+        return float("nan")
+    finally:
+        del graph
+
+
+def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
+    """Capture one forward into a CUDA graph and time the replay.
+
+    Works for either implementation. Replay removes *all* host-side dispatch,
+    which is the only way the two sides can be compared the way a serving stack
+    actually runs them -- a decode layer is captured, not dispatched per op, so
+    an eager-vs-eager speedup credits the fused kernel for launch overhead that
+    production never pays. See ``--graph``.
 
     Returns NaN rather than raising when capture is not possible: this is a
     diagnostic column, and a shape that cannot be captured should not take the
@@ -1315,13 +1704,13 @@ def _time_graph(fused, inputs, args, ctx) -> float:
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(3):
-                fused(inputs)
+                impl(inputs)
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         barrier()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = fused(inputs)
+        with _graph_capture_ctx(), torch.cuda.graph(graph):
+            out = impl(inputs)
         torch.cuda.synchronize()
         mean, _ = time_us(
             graph.replay,
@@ -1352,7 +1741,7 @@ def run_case(
 ) -> dict:
     tp = args.tp
     inputs = make_inputs(shape, ctx, tp, global_tokens, args.seed, args.route)
-    moe = SplitTpMoe(weights, ctx, max_local_tokens)
+    moe = SplitTpMoe(weights, ctx, max_local_tokens, comm=args.comm_backend)
     kname1, kname2 = moe.kernel_names(global_tokens)
     if not args.no_jit_warmup and not jit_warmup(moe, shape, ctx, global_tokens):
         raise SkipCase(
@@ -1369,6 +1758,7 @@ def run_case(
         "experts": shape.experts,
         "topk": shape.topk,
         "act": str(shape.act_type).split(".")[-1],
+        "comm": args.comm_backend.describe(),
         "gemm1_kernel": kname1,
         "gemm2_kernel": kname2,
         "rel_l2": float("nan"),
@@ -1552,6 +1942,58 @@ def run_case(
         }
     )
 
+    if args.leg_device_time:
+        # One leg per run, because one capture per process is the only thing
+        # this stack survives reliably -- see --leg-device-time. This is the
+        # answer to "what does the AllGather actually cost": the eager columns
+        # above are dominated by per-launch dispatch at decode sizes and say
+        # more about the harness than about the layer.
+        legs = {
+            "route_ag": lambda: moe.route_ag(inputs),
+            "sort": lambda: moe.sorting(w_all, i_all, plan),
+            "rs": lambda: moe.reduce_scatter(partial, inputs.local_tokens),
+            "ag": (
+                (lambda: moe.payload_ag(xq, xq_scale, inputs))
+                if plan.prequant
+                else (lambda: moe.allgather(inputs))
+            ),
+        }
+        if plan.prequant:
+            legs["quant"] = lambda: moe.quant(inputs.x_local)
+        leg_fn = legs.get(args.leg_device_time)
+        if leg_fn is None:
+            # 'quant' on a bf16-wire bucket: GEMM1 quantizes inline, so there
+            # is no standalone quantize to time. Report it as absent, not zero.
+            row[f"{args.leg_device_time}_dev_us"] = float("nan")
+        else:
+            row[f"{args.leg_device_time}_dev_us"] = _device_us(
+                leg_fn, reps=args.leg_reps, rounds=args.rounds, device=ctx.device
+            )
+
+    if args.graph:
+        # Capture the *baseline* too. Without this the graph column compares a
+        # replayed fused path against an eager control group, so every launch
+        # the baseline dispatches counts as fusion win -- which at M<=32 is a
+        # third of the reported gap and is not a gap production has, because a
+        # decode layer is captured on both sides.
+        row["split_graph_us"], replayed = _time_graph(moe, inputs, args, ctx)
+        # A replay that is fast but wrong would make the baseline look
+        # arbitrarily good, and the baseline is the whole claim here -- so gate
+        # it the same way the fused replay is gated rather than assume the
+        # capture was faithful. The collectives are the risk: under capture
+        # CustomAllreduce takes a different path through its registered pool.
+        if replayed is not None:
+            row["split_graph_rel_l2"] = rel_l2(replayed, y_actual)
+            del replayed
+            if row["split_graph_rel_l2"] >= args.rtol:
+                raise AssertionError(
+                    f"{shape.tag(tp)} tokens={global_tokens}: split graph "
+                    f"replay rel_l2={row['split_graph_rel_l2']:.6f} exceeds "
+                    f"{args.rtol} -- the captured baseline is not computing "
+                    "the same thing as the eager one, so split_graph_us is "
+                    "meaningless"
+                )
+
     if args.probe_quant_wire:
         probe = QuantWireAllGatherProbe(shape, tp, max_local_tokens, ctx.device)
         probe(inputs)
@@ -1611,6 +2053,15 @@ def run_case(
             if replayed is not None:
                 row["fused_graph_rel_l2"] = rel_l2(replayed, fused(inputs))
                 del replayed
+            # The only apples-to-apples speedup: both sides replayed, neither
+            # charged host dispatch.
+            split_graph = row.get("split_graph_us", float("nan"))
+            fused_graph = row.get("fused_graph_us", float("nan"))
+            # `fused_graph > 0` is also the NaN guard: a failed capture returns
+            # NaN, and NaN fails every comparison.
+            row["graph_speedup"] = (
+                split_graph / fused_graph if fused_graph > 0 else float("nan")
+            )
         row.update(
             {
                 "fused_ag_us": f_ag_mean,
@@ -1711,22 +2162,30 @@ _PERF_COLUMNS = [
     "global_tokens",
     "local_tokens",
     "inter_dim_local",
+    "comm",
     "rel_l2",
     # Fusion order: the sort and the routing AllGather stay outside the fused
     # kernel; everything from quant to rs is what one launch replaces.
     "ag_wire",
     "route_ag_us",
+    "route_ag_dev_us",
     "sort_us",
+    "sort_dev_us",
     "quant_us",
+    "quant_dev_us",
     "ag_us",
+    "ag_dev_us",
     "gemm1_us",
     "gemm2_us",
     "moe_other_us",
     "rs_us",
+    "rs_dev_us",
     "fusable_us",
     "host_gap_us",
     "host_gap_pct",
     "e2e_us",
+    "split_graph_us",
+    "split_graph_rel_l2",
     "comm_pct",
     "ag_GBps",
     "rs_GBps",
@@ -1750,6 +2209,7 @@ _PERF_COLUMNS = [
     "ag_gain",
     "rs_gain",
     "fused_speedup",
+    "graph_speedup",
 ]
 
 
@@ -1821,6 +2281,21 @@ def parse_args(argv=None):
         help="Wire format for the fused ReduceScatter.",
     )
     p.add_argument(
+        "--comm",
+        choices=["auto", "custom", "rccl"],
+        default="auto",
+        help="Collective backend for the SPLIT baseline. 'custom' uses aiter's "
+        "one-shot P2P AllGather/ReduceScatter wherever the shape is eligible "
+        "and falls back to RCCL where it is not; 'rccl' pins "
+        "torch.distributed. Neither wins outright: the one-shot kernels are "
+        "~2.3x faster on device at decode sizes (8us vs 18us at M=8) but carry "
+        "2-3x the host dispatch, so RCCL is ahead in eager and the one-shot "
+        "path is ahead under graph replay. 'auto' therefore picks by regime -- "
+        "custom with --graph, RCCL without -- so the control group is the best "
+        "available implementation of whatever is being measured rather than a "
+        "fixed choice that happens to lose.",
+    )
+    p.add_argument(
         "--route",
         choices=["balanced", "random"],
         default="balanced",
@@ -1845,21 +2320,73 @@ def parse_args(argv=None):
         help="Which implementations to run.",
     )
     p.add_argument(
+        "--leg-device-time",
+        choices=["route_ag", "sort", "quant", "ag", "rs"],
+        default=None,
+        help="Report ONE non-GEMM leg's DEVICE time (<leg>_dev_us) by "
+        "capturing --leg-reps copies of it into a CUDA graph. The eager leg "
+        "columns carry ~11-35us of host dispatch per launch, which at decode "
+        "sizes exceeds the work being timed; this is what the leg actually "
+        "costs -- at dsv4 M=8 the AllGather measures 9.7us here against 63-102us "
+        "eager depending on backend. One leg per run on purpose: capturing all "
+        "five in one process "
+        "SIGSEGVs a rank about half the time on this stack (on both "
+        "collective backends), and in-graph event records, which would have "
+        "allowed a single capture, are unsupported here.",
+    )
+    p.add_argument(
+        "--leg-reps",
+        type=int,
+        default=32,
+        help="Copies of each leg captured into one graph for --leg-device-time. "
+        "Amortizes the ~14us per-replay dispatch to 1/N of it.",
+    )
+    p.add_argument(
         "--graph",
-        action="store_true",
-        help="Also time the fused path replayed from a CUDA graph. The gap to "
-        "fused_us is the host-side dispatch cost that collapsing the remaining "
-        "launches could still remove.",
+        action=argparse.BooleanOptionalAction,
+        # None means "not asked for either way" -> defaults to on, but a
+        # multi-cell sweep is refused rather than driven into a SIGSEGV.
+        # Passing --graph explicitly is taken as accepting that risk.
+        default=None,
+        help="Time BOTH paths replayed from a CUDA graph and report "
+        "graph_speedup. ON BY DEFAULT: a decode layer is captured in "
+        "production, not dispatched per op, so this is the regime the layer "
+        "actually runs in -- and at small M it is not a small correction, it "
+        "reverses the result (dsv4 M=8 reads 1.63x eager and 0.46x captured). "
+        "The eager columns are still collected alongside. Two captures per "
+        "cell, and repeated capture in one process kills a rank after a few "
+        "cells (kimi3 died on the 4th), so by default a multi-cell run is "
+        "refused with the per-cell loop to run instead; passing --graph "
+        "explicitly overrides that. Use --no-graph for the old eager-only "
+        "sweep, which does every cell in one process.",
     )
     p.add_argument("--csv", default=None, help="Write the perf table here (rank 0).")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # --graph defaults on but records whether that was the caller's decision;
+    # see the guard in main().
+    args.graph_explicit = args.graph is not None
+    if args.graph is None:
+        args.graph = True
+    return args
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    ctx = setup_dist()
+    # 'auto' resolves by measurement regime -- see --comm. Resolving it here,
+    # before the process group comes up, also means an eager sweep never pays
+    # the aiter parallel-state bring-up it would not use.
+    resolved_comm = args.comm
+    if resolved_comm == "auto":
+        resolved_comm = "custom" if args.graph else "rccl"
+    ctx = setup_dist(want_custom_comm=resolved_comm != "rccl")
     args.tp = args.tp or ctx.world
+    args.comm_backend = TpCollectives(resolved_comm, ctx, args.tp)
+    if args.comm == "custom" and not args.comm_backend.enabled:
+        raise RuntimeError(
+            "--comm custom requested but aiter's one-shot collectives are "
+            f"unavailable: {args.comm_backend.error}"
+        )
     try:
         if args.tp != ctx.world:
             raise ValueError(
@@ -1878,10 +2405,54 @@ def main(argv=None) -> int:
                 "kernels in one process.",
                 flush=True,
             )
+        captures_per_cell = (2 if args.graph else 0) + (
+            1 if args.leg_device_time else 0
+        )
+        cells = len(args.models) * len(set(args.tokens))
+        if args.graph and not args.graph_explicit and cells > 1:
+            # --graph is on by default, and a default must not walk a long
+            # sweep into a SIGSEGV. Capturing repeatedly in one process kills a
+            # rank after a handful of cells (kimi3 on the 4th, dsv4 survived
+            # 4), so the sweep has to be split. Refuse with the loop rather
+            # than silently dropping to eager, which would quietly change the
+            # regime the numbers came from.
+            tok = " ".join(str(t) for t in sorted(set(args.tokens)))
+            mods = " ".join(args.models)
+            raise SystemExit(
+                f"--graph is on by default and this run asks for {cells} "
+                "cells; repeated CUDA graph capture in one process kills a "
+                "rank after a few of them. Run one cell per process:\n\n"
+                f"  for M in {mods}; do\n"
+                f"    for T in {tok}; do\n"
+                "      torchrun --nproc_per_node=8 "
+                f"{os.path.relpath(__file__, _REPO_ROOT)} \\\n"
+                "        --models $M --tokens $T --impl both --rounds 5 \\\n"
+                "        --rtol 0.06 --fused-rtol 0.06 --csv /tmp/c_${M}_${T}.csv\n"
+                "    done\n"
+                "  done\n\n"
+                "or pass --no-graph for the eager-only sweep (every cell in "
+                "one process), or --graph explicitly to override this check."
+            )
+        if captures_per_cell and cells > 1 and ctx.is_main:
+            # Repeated capture in one process eventually kills a rank. The
+            # whole-layer captures --graph does are fairly robust (13 cells x 2
+            # measured fine); the per-leg ones are not (5 in one process
+            # SIGSEGVs about half the time, on both collective backends, so it
+            # is the capture path and not either backend). Say what the run is
+            # about to do so a mid-sweep SIGSEGV is recognisable rather than
+            # mysterious.
+            print(
+                f"[NOTE] capturing {captures_per_cell} CUDA graphs per cell "
+                f"across {cells} cells. If a rank dies mid-sweep, that is the "
+                "capture path giving out -- split the run by model, or one "
+                "cell per process.",
+                flush=True,
+            )
         if ctx.is_main:
             print(
                 f"[ENV] gfx={gfx} cu={get_cu_num()} tp={args.tp} "
                 f"route={args.route} quant=a4w4 "
+                f"baseline_comm={args.comm_backend.describe()} "
                 f"fmoe_csv={AITER_CONFIGS.AITER_CONFIG_FMOE_FILE}",
                 flush=True,
             )
@@ -1961,11 +2532,26 @@ def main(argv=None) -> int:
                                 flush=True,
                             )
                         else:
-                            print(
+                            # Lead with the captured numbers when they exist:
+                            # they are the result, and the eager legs behind
+                            # them are the breakdown of where launches went.
+                            head = (
                                 f"[TP-MOE] {shape.name} M={global_tokens} "
                                 f"m={row['local_tokens']} "
                                 f"rel_l2={row['rel_l2']:.6f} "
-                                f"ag={row['ag_us']:.1f} g1={row['gemm1_us']:.1f} "
+                            )
+                            if "split_graph_us" in row:
+                                head += (
+                                    f"GRAPH split={row['split_graph_us']:.1f} "
+                                    f"fused={row.get('fused_graph_us', float('nan')):.1f} "
+                                    f"speedup={row.get('graph_speedup', float('nan')):.3f} | "
+                                    f"eager split={row['e2e_us']:.1f} "
+                                    f"fused={row.get('fused_us', float('nan')):.1f} "
+                                    f"speedup={row.get('fused_speedup', float('nan')):.3f} | "
+                                )
+                            print(
+                                head
+                                + f"ag={row['ag_us']:.1f} g1={row['gemm1_us']:.1f} "
                                 f"g2={row['gemm2_us']:.1f} "
                                 f"other={row['moe_other_us']:.1f} "
                                 f"rs={row['rs_us']:.1f} "
