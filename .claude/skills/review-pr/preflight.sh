@@ -23,6 +23,8 @@ echo "[runtime]"
 chk "python3 available" "command -v python3" "install python3"
 chk "git available" "command -v git" "install git"
 chk "curl available" "command -v curl" "install curl"
+chk "gh available" "command -v gh" "install GitHub CLI (gh) — fetch.sh Step 1 calls it"
+chk "gh knows baseRefOid (recent enough)" "gh pr view --help 2>&1 | grep -q baseRefOid" "gh too old: 'gh pr view --json ...,baseRefOid' fails and fetch.sh aborts at Step 1 (seen on gh 2.23.0). Install a current gh (>= 2.24)."
 
 echo "[headless GLM]"
 chk "claude-glm on PATH" "command -v claude-glm" "install/symlink claude-glm"
