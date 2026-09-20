@@ -25,7 +25,7 @@ Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 
 Launch (4x gfx1250; every env knob below is already the script's default):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
-    torchrun --standalone --nproc_per_node=4 bench_mega_moe_gfx1250.py \
+    torchrun --standalone --nproc_per_node=4 bench_mega_moe.py \
       -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine both
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
