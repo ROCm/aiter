@@ -56,6 +56,19 @@ from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 TOL = {"rtol": 2e-2, "atol": 2e-2}
+
+# checkAllclose returns the fraction of elements outside TOL and raises only on a
+# catastrophic (non-finite) one, so a sweep that merely tabulates that number exits
+# 0 however wrong the kernel is -- and CI runs this file as a script, where nothing
+# but a non-zero exit counts as a failure. Every row that misses is collected and
+# asserted once at the end of main(), rather than per case: one run should name
+# every failing shape instead of stopping at the first. Only the flydsl column is
+# checked; torch's own error against the fp32 reference is MIOpen's, not this
+# kernel's. The bar is zero mismatched elements, which is what a fp32 accumulator
+# rounded once to bf16 gives against a fp32 reference at 2e-2 -- a nonzero count
+# here has always meant a real defect, not accumulated rounding.
+ERR_TOL = 0.0
+_FAILED = []
 # TILE_K=32 uses mfma_f32_16x16x32_bf16, which is CDNA4/gfx950 only. gfx942
 # (MI300X) has no K=32 BF16 MFMA; a positive allow-list keeps unknown cards
 # from silently compiling an illegal instruction.
@@ -698,6 +711,10 @@ def test_qwen_vae_conv2d(case, res, xshape, wshape, stride, padding, dtype, call
 def summarize(title, rows):
     if not rows:  # every case in this sweep was filtered out by --cases
         return
+    for row in rows:
+        err = row.get("flydsl err")
+        if err is not None and err > ERR_TOL:
+            _FAILED.append(f"{title}: {row['case']} -- {err:.2%} of elements mismatch")
     aiter.logger.info("%s:\n%s", title, pd.DataFrame(rows).to_markdown(index=False))
 
 
@@ -753,6 +770,7 @@ def main():
         "...) runs the same 16 shapes at different extents.",
     )
     args = p.parse_args()
+    _FAILED.clear()
 
     # The kernel asserts bf16 on entry, so drop the rest here instead of letting a
     # sweep die halfway through.
@@ -819,6 +837,13 @@ def main():
             if case in args.cases
         ]
         summarize(f"Qwen-Image VAE encode+decode, T=1 rewritten conv2d ({name})", rows)
+
+    # After the tables, so a failure is read next to the numbers that produced it.
+    if _FAILED:
+        raise AssertionError(
+            f"{len(_FAILED)} case(s) outside rtol={TOL['rtol']} atol={TOL['atol']}:\n  "
+            + "\n  ".join(_FAILED)
+        )
 
 
 if __name__ == "__main__":
