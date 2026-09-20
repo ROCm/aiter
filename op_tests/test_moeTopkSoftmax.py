@@ -699,6 +699,37 @@ aiter.logger.info(
 
 df = []
 for token in args.token:
+    # Kimi-K3 fused MoE-front router: logits are a row-strided slice of the
+    # fused [gate_up | experts | routed] buffer, not a standalone tensor
+    gate_up_width, num_experts, routed_width = 1536, 896, 3584
+    fused_front_width = gate_up_width + num_experts + routed_width
+    backing = torch.randn((token, fused_front_width), dtype=dtypes.bf16)
+    gating_output = backing[:, gate_up_width : gate_up_width + num_experts]
+    # stride(0) is the thing under test. Do not also assert non-contiguity:
+    # at token=1 the row stride is unreachable, so the slice is contiguous.
+    assert gating_output.stride(0) == fused_front_width
+    ret = test_biased_grouped_topk(
+        token,
+        num_experts,
+        1,  # group
+        16,  # topk
+        1,  # topk_group
+        True,  # need_renorm
+        dtypes.bf16,
+        gating_output=gating_output,
+        num_iters=args.iters,
+        num_warmup=args.warmup,
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_biased_grouped_topk_kimi_k3_strided summary (markdown):\n%s",
+    df_md,
+)
+
+df = []
+for token in args.token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
         topk = 8
