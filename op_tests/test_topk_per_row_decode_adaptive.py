@@ -324,3 +324,138 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
         torch.cuda.empty_cache()
 
     assert not bad, f"{len(bad)}/{len(cells)} cells:\n" + "\n".join(bad)
+
+
+# --------------------------------------------------------------------------
+# max_row_len: a decode buffer is sized to the model's maximum context and a
+# call fills whatever part of it the requests need. Without a bound the host
+# has to configure for the whole buffer, which measured 1.21x median and 1.91x
+# p90 against the same live lengths in a tight buffer.
+
+
+@pytest.mark.parametrize(
+    "width,bound,expected",
+    [
+        (1 << 20, None, 1 << 20),  # said nothing: the buffer stands
+        (1 << 20, 8_192, 8_192),  # said less than it holds
+        (8_192, 1 << 20, 8_192),  # said more: the buffer still bounds it
+        (8_192, 8_192, 8_192),
+    ],
+)
+def test_the_bound_is_the_shorter_of_what_is_held_and_what_is_promised(
+    width, bound, expected
+):
+    assert topk.decode_adaptive_width(width, bound) == expected
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_a_bound_no_row_could_have_is_refused(bad):
+    """Zero is the plausible mistake -- an empty batch, a length not yet
+    filled in -- and it would otherwise configure for a row of nothing."""
+    with pytest.raises(ValueError, match="max_row_len"):
+        topk.decode_adaptive_width(1 << 20, bad)
+
+
+def test_the_gate_reads_the_bound_not_the_buffer(one_band):
+    """The band is 8192..20000 wide. A 1M buffer is outside it and a 1M buffer
+    carrying 8192 is inside it, and those are the same tensor."""
+    args = ("gfx942", 80, True, 1 << 20, 8, 1024, True)
+    assert topk._decode_backend(*args) != topk.BACKEND_ADAPTIVE
+
+    bounded = args[:3] + (topk.decode_adaptive_width(1 << 20, 8_192),) + args[4:]
+    assert topk._decode_backend(*bounded) == topk.BACKEND_ADAPTIVE
+
+
+def test_the_bound_is_what_moves_the_config_off_the_padded_launch():
+    """The mechanism behind the measurement, checked where it is decided.
+
+    A buffer wide enough can never take the single-workgroup tier, so a short
+    row inside one is launched as if it were long. That is a compile-time
+    choice, which is also why the bound has to be a guarantee: the tier is
+    picked before any row is read.
+    """
+    from aiter.ops.flydsl.kernels.topk import topk_per_row_decode_adaptive as km
+
+    padded = km.decode_adaptive_config(rows=8, seq=1 << 20, k=1024, cu_count=80)
+    bounded = km.decode_adaptive_config(rows=8, seq=8_192, k=1024, cu_count=80)
+
+    assert padded["kw"]["tier_mode"] == "auto"
+    assert bounded["kw"]["tier_mode"] == "short"
+    assert km.needs_workspace_zero(
+        1 << 20, 1024, padded["kw"]["tiered_short_max"], tier_mode="auto"
+    )
+    assert not km.needs_workspace_zero(
+        8_192, 1024, bounded["kw"]["tiered_short_max"], tier_mode="short"
+    )
+
+
+def test_a_bound_call_selects_what_an_unbound_one_does(monkeypatch):
+    """The contract, on the card: over every band-edge cell that fits in a
+    buffer four times its width, with ragged `seq_lens` whose longest row sits
+    exactly on the bound, `max_row_len` changes which kernel runs and does not
+    change what it selects.
+
+    Ragged and exactly-on-the-bound together, because those are the two ways a
+    caller's bound meets the kernel's assumption: a row shorter than the bound
+    must not read past its own length, and a row at the bound must still be
+    read to its end.
+    """
+    import aiter
+
+    arch, cu_count = _this_card()
+    if (arch, cu_count) not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
+        pytest.skip(f"{arch} at {cu_count} CU is not in the table")
+
+    cells = [
+        (w, rows, k, stable)
+        for w, rows, k, stable in _band_edge_cells(arch, cu_count)
+        if topk._decode_backend(arch, cu_count, stable, w, rows, k, True)
+        == topk.BACKEND_ADAPTIVE
+        and rows * w * 4 <= _MAX_ELEMENTS
+        and w >= 4 * k  # leave room for a ragged length that still holds k
+    ]
+    if not cells:
+        pytest.skip("no admitted band edge fits a padded buffer under the cap")
+
+    torch.manual_seed(0)
+    bad = []
+    for live, rows, k, stable in cells:
+        buf = live * 4
+        logits = torch.randn(rows, buf, dtype=torch.float32, device="cuda")
+        # Ragged, and the first row sits exactly on the bound: a kernel built
+        # for a shorter row would truncate it, and one that ignores `seq_lens`
+        # would over-read the others into the padding.
+        lens = torch.randint(k, live + 1, (rows,), dtype=torch.int32, device="cuda")
+        lens[0] = live
+        out = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+
+        aiter.top_k_per_row_decode(
+            logits,
+            1,
+            lens,
+            out,
+            rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=k,
+            stable=stable,
+            max_row_len=live,
+        )
+
+        # Per row against its own live slice, by value: the row carries ties
+        # and either index of a tied pair is a correct answer.
+        host_lens = lens.tolist()
+        for r in range(rows):
+            want = torch.sort(torch.topk(logits[r, : host_lens[r]], k).values).values
+            got = torch.sort(logits[r].gather(0, out[r].long())).values
+            if not torch.equal(want, got):
+                bad.append(
+                    f"live={live} rows={rows} k={k} stable={stable} row={r} "
+                    f"len={host_lens[r]}: selected values differ"
+                )
+                break
+
+        del logits, lens, out
+        torch.cuda.empty_cache()
+
+    assert not bad, f"{len(bad)}/{len(cells)} cells:\n" + "\n".join(bad)

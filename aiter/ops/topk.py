@@ -696,6 +696,28 @@ def _decode_cu_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def decode_adaptive_width(width: int, max_row_len: int | None) -> int:
+    """The row length the adaptive path should be gated and configured on.
+
+    A decode buffer is allocated once at the model's maximum context, so its
+    physical width says what a row *could* hold and `seq_lens` says what it
+    does. `seq_lens` is device-resident and this runs on the host, so the only
+    way the host learns the live length is for the caller to state a bound.
+
+    Both the band lookup and `decode_adaptive_config` take this, and they must
+    take the same value: gating on one length and configuring for another is
+    how a band admits a shape that then runs the wrong kernel for it.
+
+    `max_row_len` is a **guarantee, not a hint** -- see `top_k_per_row_decode`.
+    `None` means the caller does not know, and the physical width stands.
+    """
+    if max_row_len is None:
+        return width
+    if max_row_len < 1:
+        raise ValueError(f"max_row_len must be positive, got {max_row_len}")
+    return min(width, max_row_len)
+
+
 def decode_backend_for_call(
     logits: torch.Tensor,
     next_n: int,
@@ -707,6 +729,7 @@ def decode_backend_for_call(
     k: int,
     stable: bool,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
 ) -> str:
     """The backend this call should run, shape rule and tensor contract together.
 
@@ -725,7 +748,7 @@ def decode_backend_for_call(
         arch,
         _decode_cu_count(logits.device.index),
         stable,
-        logits.shape[1],
+        decode_adaptive_width(logits.shape[1], max_row_len),
         num_rows,
         k,
         values is None,
@@ -789,6 +812,7 @@ def top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel; the scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
@@ -801,7 +825,20 @@ def top_k_per_row_decode(
     When `values` is given (float32, same shape as `indices`), each selected
     index's logit is written alongside it. Rows shorter than k pad the index
     with -1 and the score with -inf, so the padding sorts below every real
-    candidate and a consumer that ranks these scores needs no extra mask."""
+    candidate and a consumer that ranks these scores needs no extra mask.
+
+    `max_row_len` is an upper bound on every entry of `seqLens`, for callers
+    whose `logits` is a context-sized buffer that decode only partly fills.
+    Without it the host has to assume every row is as long as the buffer is
+    wide, which costs up to 1.21x median and 1.91x p90 on a 1M buffer -- the
+    wide buffer itself is free, but the config built for it is not.
+
+    **It is a guarantee, not a hint.** Some of what it selects is compiled in,
+    so a bound below the longest live row does not merely give up performance,
+    it launches a kernel that cannot read those rows to the end and returns
+    wrong indices. It cannot be checked here: `seqLens` is device-resident and
+    reading it would sync, which this path may be inside a graph capture for.
+    Pass `None`, which is always correct, rather than an estimate."""
     backend = decode_backend_for_call(
         logits,
         next_n,
@@ -813,6 +850,7 @@ def top_k_per_row_decode(
         k,
         stable,
         values,
+        max_row_len=max_row_len,
     )
     if backend != BACKEND_UPSTREAM:
         return flydsl_top_k_per_row_decode(
@@ -827,6 +865,7 @@ def top_k_per_row_decode(
             stable,
             values,
             backend=backend,
+            max_row_len=max_row_len,
         )
 
     # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
@@ -1005,11 +1044,15 @@ def flydsl_top_k_per_row_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
     backend: str | None = None,
+    max_row_len: int | None = None,
 ) -> None:
     """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
 
     This path is optimized for long-context decode, where its multi-CTA radix
     selection typically outperforms the HIP one-block implementation.
+
+    `max_row_len` bounds `seqLens` from the host; `top_k_per_row_decode`
+    documents it, including why it is a guarantee and not a hint.
     """
     from .flydsl.topk.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
@@ -1027,6 +1070,7 @@ def flydsl_top_k_per_row_decode(
         stable,
         values,
         backend,
+        max_row_len,
     )
 
 

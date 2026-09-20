@@ -400,16 +400,26 @@ def _run_adaptive(
     k,
     stable,
     stream,
+    cfg_width=None,
 ):
     """Launch the adaptive kernel for a shape the gate has already chosen it for.
 
-    The config takes the physical width, not a row's live length: `seq_lens` is
-    device-resident, so the length is not a host quantity. The kernel folds each
-    row onto as many of the launch's workgroups as its own length needs.
+    `cfg_width` is the longest row this launch can contain and `width` is how
+    wide the buffer holding it is; they differ when a caller passed a
+    `max_row_len`. The config takes the former, because every quantity it picks
+    -- the tier, the blocks per row, the parts, the compact path, and whether
+    the workspace needs zeroing -- is sized for the work, and the padding is not
+    work. The kernel still folds each row onto as many of the launch's
+    workgroups as that row's own `seq_lens` entry needs.
+
+    Defaulting `cfg_width` to `width` is the conservative reading of a caller
+    who said nothing, and was the only behaviour before `max_row_len` existed.
     """
+    if cfg_width is None:
+        cfg_width = width
     cfg = _adaptive.decode_adaptive_config(
         rows,
-        width,
+        cfg_width,
         k,
         ordered=stable,
         cu_count=_adaptive_cu_count(logits.device.index),
@@ -426,8 +436,11 @@ def _run_adaptive(
             compact_cap=kw.get("compact_cap_mult", 16) * k,
         ),
     )
+    # `cfg_width` again, not `width`: this asks whether the config above left
+    # counters a pass could read before writing, so it has to be asked about the
+    # same config. On the width it answers for a kernel that was never built.
     if _adaptive.needs_workspace_zero(
-        width,
+        cfg_width,
         k,
         kw["tiered_short_max"],
         tier_mode=kw.get("tier_mode", "auto"),
@@ -460,11 +473,16 @@ def flydsl_top_k_per_row_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
     backend: str | None = None,
+    max_row_len: int | None = None,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
     `backend` is the gate's answer; None asks the gate, so a caller arriving
     here directly cannot be routed to a kernel the gate would not have picked.
+
+    `max_row_len` bounds `seq_lens` from the host, and is a guarantee rather
+    than a hint -- `aiter.ops.topk.top_k_per_row_decode` documents what it
+    costs to get wrong.
     """
 
     _validate_flydsl_topk_call(
@@ -475,6 +493,10 @@ def flydsl_top_k_per_row_decode(
     arch = torch.cuda.get_device_properties(logits.device).gcnArchName
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
+
+    from aiter.ops.topk import decode_adaptive_width
+
+    cfg_width = decode_adaptive_width(width, max_row_len)
 
     if backend is None:
         from aiter.ops.topk import decode_backend_for_call
@@ -490,6 +512,7 @@ def flydsl_top_k_per_row_decode(
             k,
             stable,
             values,
+            max_row_len=max_row_len,
         )
 
     if backend == _BACKEND_ADAPTIVE:
@@ -505,6 +528,7 @@ def flydsl_top_k_per_row_decode(
             k,
             stable,
             stream,
+            cfg_width=cfg_width,
         )
         return
 
