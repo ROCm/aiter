@@ -226,10 +226,23 @@ inline constexpr bool kNativeQuant =
 // is an unsigned integer max -- and at 16 bits that is v_pk_max3_u16, three
 // elements per instruction, with only the winner widened at the end.
 //
-// This propagates NaN where the f32 fmaxf tree suppressed it (v_max_num_f32
-// returns the non-NaN operand). Propagating is the documented intent for E8M0 --
-// mx_quant_utils.h keeps exponent 0xFF so consumers read it as an E8M0 NaN --
-// so the narrow path is the more faithful of the two.
+// Non-finite slices come out as +Inf, which is what carries an invalid group
+// through the reduction. Leaving a NaN here would not survive it: the fmaxf
+// tree below drops a NaN operand (v_max_num_f32 returns the other one), so the
+// lane would fall back to kAbsmaxFloor and the group would then be scaled
+// against its remaining magnitudes -- a scale too small for them, not an
+// invalid marker. Inf does survive, and fp_f32_to_e8m0_block_scale maps it to
+// the 0xFF E8M0 NaN that marks the block invalid. Same policy as MXFP8 in
+// dynamic_per_group_scaled_quant (csrc/kernels/quant_kernels.cu).
+//
+// The general f32 path below only matches on Inf, which reaches its scale on
+// its own. A NaN there is still dropped by the fmaxf tree, so that group is
+// scaled against its finite lanes and only the NaN element itself converts to
+// one. Folding it the same way costs an and plus a min per element, which
+// displaces the free fabs source modifier and breaks the v_max3_f32 fusion the
+// tree is built around: measured +17% on average over the row sweep, +33% worst
+// case. Not paid for an input the op is not expected to see. Closing it wants
+// an unsigned max tree rather than a per-element fold.
 template <typename scalar_t, int N>
 __device__ __forceinline__ float slice_amax_native(
     const opus::vector_t<scalar_t, N>& v)
@@ -255,7 +268,12 @@ __device__ __forceinline__ float slice_amax_native(
             m[i] = __builtin_elementwise_max(m[i], m[i + w]);
         }
     }
-    const unsigned short hi = m[0][0] > m[0][1] ? m[0][0] : m[0][1];
+    const unsigned short raw = m[0][0] > m[0][1] ? m[0][0] : m[0][1];
+    // Unsigned ordering puts NaN above Inf, so one min folds every NaN onto Inf
+    // and leaves all finite patterns -- including the largest -- unchanged.
+    constexpr unsigned short kInfBits =
+        std::is_same_v<scalar_t, opus::bf16_t> ? 0x7F80 : 0x7C00;
+    const unsigned short hi = raw < kInfBits ? raw : kInfBits;
     if constexpr(std::is_same_v<scalar_t, opus::bf16_t>)
     {
         // bf16 is the top half of the f32 it stands for, so widening is a shift.
@@ -973,24 +991,8 @@ __global__ void inverse_rope_group_quant_kernel(
         {
             if(!pass_is_rope(k))
             {
-                float native_amax =
+                const float native_amax =
                     slice_amax_native<scalar_t, THREAD_DATA_SIZE>(in_vec[k]);
-                if constexpr(kWideRow128)
-                {
-                    // Below the original streaming crossover, preserve the
-                    // untiered f32 reduction's handling of a slice containing
-                    // both NaN and finite/Inf values. Packed integer max picks
-                    // NaN first; fmaxf would retain the other magnitudes.
-                    if(static_cast<int64_t>(S) * H * HEAD_DIM < (int64_t{1} << 28) &&
-                       __builtin_isnan(native_amax))
-                    {
-                        native_amax = 0.0f;
-#pragma unroll
-                        for(int i = 0; i < THREAD_DATA_SIZE; ++i)
-                            native_amax = fmaxf(native_amax,
-                                fabsf(static_cast<float>(in_vec[k][i])));
-                    }
-                }
                 const float amax = reduce_amax_across_group(
                     fmaxf(native_amax, kAbsmaxFloor));
                 const E8m0BlockScale s8 =

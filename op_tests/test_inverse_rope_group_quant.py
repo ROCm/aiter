@@ -702,6 +702,85 @@ def check_graph(
     )
 
 
+def check_invalid_group(s, h, g, head_dim, rd, group_size, dtype, seed=0):
+    """A non-finite input invalidates its own quant group and no other.
+
+    The kernel folds every non-finite magnitude onto +Inf before the group
+    reduction, so the block scale lands on the 0xFF E8M0 NaN and the converter
+    turns that whole group into FP8 NaNs. slice_amax_native in
+    csrc/kernels/inverse_rope_group_quant.cu has the reasoning.
+
+    Inf reaches that on both quantize paths, so it is asserted outright. NaN
+    only does on the native one: the general f32 path reduces with fmaxf, which
+    drops a NaN operand, and folding it there costs far more than the case is
+    worth (the kernel comment carries the measurement). Rather than restate the
+    host's path choice here, NaN is held to whichever of the two documented
+    outcomes applies -- which still fails on any third one.
+    """
+    # e4m3fnuz (gfx942) spells NaN 0x80; OCP e4m3fn uses 0xFF.
+    nan_byte = 0x80 if torch.finfo(dtypes.fp8).max == 240 else 0xFF
+    d = h * head_dim // g
+    ks = d // group_size
+
+    for name, poison in (("inf", float("inf")), ("nan", float("nan"))):
+        o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype, seed=seed)
+        # Group 0 of row 0, beside a finite value big enough that a scale
+        # computed from the survivors is clearly distinguishable from 0xFF.
+        o[0, 0, 0] = poison
+        o[0, 0, 1] = 3.0
+
+        fp8, scale = inverse_rope_group_quant_cpp(
+            o,
+            positions,
+            cos,
+            sin,
+            num_groups=g,
+            quant_group_size=group_size,
+            scale_layout="row",
+        )
+        bytes_ = _scale_bytes(scale).reshape(s, g, ks)
+        q = fp8.view(dtypes.u8).reshape(s, g, d)
+        hit_scale = int(bytes_[0, 0, 0])
+        hit_nans = int((q[0, 0, :group_size] == nan_byte).sum())
+        # The group next door shares the row and must be untouched either way.
+        nbr_scale = int(bytes_[0, 0, 1])
+        nbr_nans = int((q[0, 0, group_size : 2 * group_size] == nan_byte).sum())
+
+        invalidated = hit_scale == 0xFF and hit_nans == group_size
+        assert nbr_scale != 0xFF and nbr_nans == 0, (
+            f"{name} at s={s} h={h} g={g} gs={group_size} leaked into the next "
+            f"group: scale=0x{nbr_scale:02X} nan_elems={nbr_nans}"
+        )
+        if name == "inf":
+            assert invalidated, (
+                f"inf at s={s} h={h} g={g} gs={group_size} did not invalidate "
+                f"its group: scale=0x{hit_scale:02X} nan_elems={hit_nans}/"
+                f"{group_size}"
+            )
+        else:
+            # The general f32 path scales against the surviving lanes, leaving
+            # only the poisoned element itself as a NaN.
+            survived = hit_scale != 0xFF and hit_nans == 1
+            assert invalidated or survived, (
+                f"nan at s={s} h={h} g={g} gs={group_size} matched neither "
+                f"documented outcome: scale=0x{hit_scale:02X} nan_elems="
+                f"{hit_nans}/{group_size}"
+            )
+        aiter.logger.info(
+            "invalid-group %-3s s=%-5d h=%-4d g=%-3d gs=%-3d  scale=0x%02X "
+            "nan_elems=%d/%d  (%s)",
+            name,
+            s,
+            h,
+            g,
+            group_size,
+            hit_scale,
+            hit_nans,
+            group_size,
+            "group invalidated" if invalidated else "scaled from survivors",
+        )
+
+
 def main():
     # Whole-op arch gate lives here: @benchmark always returns the call-args
     # dict, so returning from inside the test fn would still emit a NaN row.
@@ -933,6 +1012,16 @@ def main():
             run_case(
                 h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df
             )
+        # Cheap enough to run unconditionally, and worth it: the invalid-group
+        # policy has changed twice under optimisation with nothing watching it,
+        # because none of the DATA_DISTS can produce a non-finite input. (64, 8)
+        # is a D=4096 row, which takes the native quantize path; (16, 2) is the
+        # untiered f32 one.
+        for h, g in ((64, 8), (16, 2)):
+            for group_size in args.group_size:
+                check_invalid_group(
+                    512, h, g, args.head_dim[0], args.rope_dim[0], group_size, dtype
+                )
         print_json_table("inverse_rope_group_quant summary", df)
         aiter.logger.info(
             "inverse_rope_group_quant summary (markdown):\n%s",
