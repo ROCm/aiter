@@ -162,6 +162,8 @@ def flydsl_flash_attn_paged_fp8_func(
         raise ValueError("paged FP8 Q/K/V must be on the same CUDA/HIP device")
     if q.ndim != 3:
         raise ValueError("paged FP8 Q must be packed [total_q,Hq,Dqk]")
+    if any(tensor.requires_grad for tensor in (q, k, v)):
+        raise NotImplementedError("paged FP8 prefill is inference-only")
     if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
         raise ValueError("paged FP8 Q/K/V must use OCP float8_e4m3fn")
     if not causal:
@@ -259,6 +261,8 @@ def flydsl_flash_attn_paged_fp8_func(
             or tensor.numel() != 1
         ):
             raise ValueError(f"{name} must be one FP32 value on Q's device")
+        if tensor.requires_grad:
+            raise NotImplementedError("paged FP8 descales must not require gradients")
     output_shape = (q.shape[0], q.shape[1], value_dim)
     if max(q.numel(), q.shape[0] * q.shape[1] * value_dim) >= _MAX_FLAT_ELEMS:
         raise NotImplementedError(
@@ -273,6 +277,9 @@ def flydsl_flash_attn_paged_fp8_func(
         raise ValueError(
             "paged FP8 out must be contiguous BF16 with the expected shape on Q's device"
         )
+
+    if out is not None and out.requires_grad:
+        raise NotImplementedError("paged FP8 output buffers must not require gradients")
 
     with torch.cuda.device(q.device):
         launch_stream = (

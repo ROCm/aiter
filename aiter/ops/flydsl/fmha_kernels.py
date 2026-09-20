@@ -8,6 +8,9 @@ arch and dtype: gfx950 fp8 to ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the
 m32x8 prefill kernel, anything else ``None`` so the caller falls through to
 CK/Triton.
 
+``flydsl_flash_attn_paged_prefill_func`` is an explicit gfx950 FP8 paged
+prefill API; unsupported requests raise without fallback.
+
 ``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
 `flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
@@ -29,7 +32,6 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 from __future__ import annotations
 
 from functools import lru_cache
-from numbers import Real
 
 import torch
 import torch.nn.functional as F
@@ -43,8 +45,8 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 
 __all__ = [
     "flydsl_flash_attn_batch_func",
-    "flydsl_flash_attn_batch_prefill_func",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_paged_prefill_func",
     "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_func",
 ]
@@ -222,99 +224,56 @@ def flydsl_flash_attn_func(
     return o_p
 
 
-def flydsl_flash_attn_batch_prefill_func(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    kv_indptr,
-    kv_page_indices,
-    max_seqlen_q,
-    max_seqlen_k,
+def flydsl_flash_attn_paged_prefill_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
     *,
-    dropout_p=0.0,
-    softmax_scale=None,
-    logits_soft_cap=0.0,
-    causal=False,
-    window_size=(-1, -1),
-    alibi_slopes=None,
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
-    out=None,
-    kv_last_page_lens=None,
-    block_table=None,
-    seqlen_k=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
-    kv_block_descale=None,
-    sink_ptr=None,
-    sink_size=0,
+    block_table: torch.Tensor | None = None,
+    seqlen_k: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    kv_page_indices: torch.Tensor | None = None,
+    kv_last_page_lens: torch.Tensor | None = None,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = True,
+    out: torch.Tensor | None = None,
+    stream: torch.cuda.Stream | None = None,
 ):
-    """Native gfx950 FP8 paged prefill, or None for another AITER backend."""
-    if not all(torch.is_tensor(tensor) for tensor in (q, k, v)):
-        return None
-    if not (
-        q.ndim == 3
-        and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
-        and q.is_cuda
-        and q.device == k.device == v.device
-        and causal
-        and dropout_p == 0.0
-        and logits_soft_cap == 0.0
-        and len(window_size) >= 2
-        and all(w < 0 for w in window_size[:2])
-        and (len(window_size) < 3 or window_size[2] == 0)
-        and alibi_slopes is None
-        and sink_ptr is None
-        and sink_size == 0
-        and kv_block_descale is None
-        and not return_lse
-        and not return_attn_probs
-        and not any(tensor.requires_grad for tensor in (q, k, v))
-    ):
-        return None
+    """Compute causal paged prefill with the gfx950 FlyDSL FP8 kernel.
+
+    Q is packed ``[total_q, Hq, Dqk]``; Q/K/V must be OCP E4M3FN with
+    single-element FP32 descales on the same GPU. Supported ``(Dqk, Dv)``
+    pairs are ``(128, 128)``, ``(192, 128)`` and ``(192, 192)``. Page-1 KV
+    caches use rank-3/4 linear layouts; pages 16/64/1024 use vectorized
+    rank-5 layouts. Hq must be divisible by Hkv.
+
+    Supply either a rectangular ``block_table`` and KV token ``seqlen_k``,
+    or CSR ``kv_indptr``/``kv_page_indices`` with ``kv_last_page_lens`` for
+    pages larger than one. A supplied block table takes precedence. All
+    metadata is int32 on Q's device; maxima are host integer launch bounds.
+    The causal mask is bottom-right aligned, including when Q is longer
+    than KV. ``softmax_scale`` defaults to ``Dqk**-0.5`` and must be a
+    positive finite Python scalar, independent of the quantization descales.
+
+    Returns BF16 ``out[total_q, Hq, Dv]``; fully masked rows have zero
+    output. The output buffer may be preallocated and must be contiguous
+    on Q's device. Launches use the current stream unless supplied.
+
+    This is an explicit inference-only API: unsupported hardware, dtypes,
+    layouts or noncausal requests raise rather than falling back. Local
+    windows, sinks, ALiBi, soft capping, dropout and per-page scales are not
+    supported. Backend scheduling controls stay in the kernel launcher.
+    """
     from .kernels.flash_attn_paged_fp8_func_gfx950 import (
-        _cache_geometry,
-        _gpu_arch,
-        _is_valid_softmax_scale,
         flydsl_flash_attn_paged_fp8_func,
     )
 
-    if _gpu_arch(q.device) != "gfx950":
-        return None
-    if softmax_scale is not None and not isinstance(softmax_scale, Real):
-        return None
-    if not _is_valid_softmax_scale(softmax_scale):
-        return None
-    if any(
-        not torch.is_tensor(scale)
-        or scale.dtype != torch.float32
-        or scale.numel() != 1
-        or scale.device != q.device
-        or scale.requires_grad
-        for scale in (q_descale, k_descale, v_descale)
-    ):
-        return None
-    if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
-        return None
-    # These positional metadata arguments remain part of the AITER contract
-    # even when the rectangular block table takes precedence over CSR lookup.
-    if not all(
-        torch.is_tensor(tensor)
-        and tensor.dtype == torch.int32
-        and tensor.device == q.device
-        and tensor.ndim == 1
-        for tensor in (cu_seqlens_q, kv_indptr, kv_page_indices)
-    ):
-        return None
-    if kv_indptr.shape != cu_seqlens_q.shape:
-        return None
-    try:
-        _cache_geometry(q, k, v)
-    except NotImplementedError:
-        return None
     return flydsl_flash_attn_paged_fp8_func(
         q,
         k,
@@ -322,17 +281,18 @@ def flydsl_flash_attn_batch_prefill_func(
         cu_seqlens_q,
         max_seqlen_q,
         max_seqlen_k,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
         kv_indptr=kv_indptr,
         kv_page_indices=kv_page_indices,
         kv_last_page_lens=kv_last_page_lens,
-        block_table=block_table,
-        seqlen_k=seqlen_k,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
         softmax_scale=softmax_scale,
         causal=causal,
         out=out,
+        stream=stream,
     )
 
 

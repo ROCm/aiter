@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.ops.flydsl import flydsl_flash_attn_paged_fp8_func
+from aiter.ops.flydsl import flydsl_flash_attn_paged_prefill_func
 from aiter.ops.flydsl.kernels import flash_attn_paged_fp8_func_gfx950 as paged
 from aiter.test_common import checkAllclose
 
@@ -160,9 +160,13 @@ def run_case(case, **kwargs):
         "out": case.out,
     }
     options.update(kwargs)
-    return flydsl_flash_attn_paged_fp8_func(
-        case.q, case.k, case.v, case.cuq, case.maxq, case.maxkv, **options
+    # Scheduling variants are kernel-only controls, not public API options.
+    fn = (
+        paged.flydsl_flash_attn_paged_fp8_func
+        if "dualwave_swp_lazy_rescale" in options
+        else flydsl_flash_attn_paged_prefill_func
     )
+    return fn(case.q, case.k, case.v, case.cuq, case.maxq, case.maxkv, **options)
 
 
 def csr_metadata(case, prefix=0):
@@ -495,53 +499,17 @@ def test_side_stream_keeps_copy_source_alive():
     ],
 )
 @pytest.mark.parametrize("rectangular", [False, True])
-def test_public_batch_prefill_routes_to_flydsl(
-    monkeypatch, page, layout, d, dv, rectangular
-):
-    from aiter.ops import mha
-
-    # Cover every layout and width on both routes; native tests cover their product.
+def test_direct_prefill_metadata_precedence(page, layout, d, dv, rectangular):
     case = make_case(page, layout, d, dv)
     metadata = csr_metadata(case, prefix=5)
-    indptr, indices = metadata.pop("kv_indptr"), metadata.pop("kv_page_indices")
     if rectangular:
         metadata["block_table"] = case.table
-        indices.fill_(-1)  # The rectangular table must take precedence.
-    seen = []
-    direct = paged.flydsl_flash_attn_paged_fp8_func
-
-    def observed(*args, **kwargs):
-        seen.append(kwargs)
-        return direct(*args, **kwargs)
-
-    def unexpected_ck(*args, **kwargs):
-        raise AssertionError("supported paged FP8 request reached CK")
-
-    monkeypatch.setattr(paged, "flydsl_flash_attn_paged_fp8_func", observed)
-    monkeypatch.setattr(mha, "_mha_batch_prefill", unexpected_ck)
-    actual = mha.mha_batch_prefill_func(
-        case.q,
-        case.k,
-        case.v,
-        case.cuq,
-        indptr,
-        indices,
-        case.maxq,
-        case.maxkv,
-        causal=True,
-        softmax_scale=0.137,
-        out=case.out,
-        seqlen_k=case.lengths,
-        q_descale=case.qs,
-        k_descale=case.ks,
-        v_descale=case.vs,
-        **metadata,
-    )
+        metadata["seqlen_k"] = case.lengths
+        metadata["kv_page_indices"].fill_(-1)
+    actual = run_case(case, **metadata, softmax_scale=0.137)
     torch.cuda.synchronize()
-    assert actual is case.out and len(seen) == 1
-    torch.testing.assert_close(
-        actual.float(), reference(case, scale=0.137), rtol=FP8_RTOL, atol=FP8_ATOL
-    )
+    assert actual is case.out
+    check_accuracy(case, actual, reference(case, scale=0.137))
 
 
 @gfx950

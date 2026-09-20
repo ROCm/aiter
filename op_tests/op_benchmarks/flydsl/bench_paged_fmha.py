@@ -6,31 +6,12 @@ r"""Compare native paged FP8 entry points on gfx950 (16 Q heads / 1 KV head).
 
 Backends share FP8 Q/K/V, shuffled physical pages, scalar descales and
 preallocated BF16 outputs:
-  flydsl-direct: AITER's migrated FlyDSL kernel, called directly with CSR metadata.
-  flydsl-via-aiter: mha_batch_prefill_func, dispatching these inputs to the same kernel.
-  ck: CK MHA batch prefill, bypassing the new public FlyDSL dispatch.
-This is not a comparison with the original FlyDSL repository or dense attention.
+  flydsl: flydsl_flash_attn_paged_prefill_func with native CSR metadata.
+  ck: the existing CK MHA batch-prefill path.
 
-The FP32 oracle checks every output element in bounded query chunks, including
-long contexts. It is outside timing. Accuracy is measured normalized mean absolute
-error: mean(abs(output - reference)) / max(mean(abs(reference)), 1e-12), as in
-bench_mha_bwd. PASS requires elementwise rtol=0.02, atol=0.02. Skipped backends
-and --no-check rows have no accuracy value (NaN in CSV) and status=SKIP.
-
-Every eligible backend, including CK MHA, is called once before measurement to
-finish imports, JIT compilation and first-use setup. AITER's run_perftest handles timing
-and synchronization, with the same --warmup count for each prepared backend.
-Timing follows --backends order; accuracy checks run after all measurements.
-avg_us is the helper's profiler-derived average GPU time, including its standard
-warm-sample/outlier filtering. It is not a median, host/API latency or graph-replay
-time. Device state can still matter, so compare both backend orders.
-
-Requires the repository's FlyDSL runtime (0.3.2 for this port); CK also requires
-the initialized composable_kernel submodule and working ROCm build tools.
-Run from the repository root:
-    python3 -m op_tests.op_benchmarks.flydsl.bench_paged_fmha
-    python3 -m op_tests.op_benchmarks.flydsl.bench_paged_fmha \
-        -b 1 -s 65536,131072 --page-sizes 64 --backends flydsl-direct flydsl-via-aiter \
+python3 -m op_tests.op_benchmarks.flydsl.bench_paged_fmha
+python3 -m op_tests.op_benchmarks.flydsl.bench_paged_fmha \
+        -b 1 -s 65536,131072 --page-sizes 64 --backends flydsl \
         --iters 100 --warmup 10 -o paged.csv
 """
 
@@ -45,7 +26,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-BACKENDS = ("flydsl-direct", "flydsl-via-aiter", "ck")
+BACKENDS = ("flydsl", "ck")
 FP8_RTOL = 0.02
 FP8_ATOL = 0.02
 # Bound each FP32 score tensor, independently of the full Q length. Softmax
@@ -160,8 +141,8 @@ def benchmark_paged(
 ):
     import aiter
     from aiter.jit.utils.chip_info import get_gfx
-    from aiter.ops.flydsl import flydsl_flash_attn_paged_fp8_func
-    from aiter.ops.mha import _mha_batch_prefill, mha_batch_prefill_func
+    from aiter.ops.flydsl import flydsl_flash_attn_paged_prefill_func
+    from aiter.ops.mha import _mha_batch_prefill
     from aiter.test_common import checkAllclose, run_perftest
     from op_tests.test_flydsl_paged_fmha import csr_metadata, make_case
 
@@ -193,10 +174,10 @@ def benchmark_paged(
     scale = head_dim**-0.5
     descales = {"q_descale": case.qs, "k_descale": case.ks, "v_descale": case.vs}
     candidates = {}
-    if "flydsl-direct" in selected:
+    if "flydsl" in selected:
         output = torch.empty_like(case.out)
-        candidates["flydsl-direct"] = partial(
-            flydsl_flash_attn_paged_fp8_func,
+        candidates["flydsl"] = partial(
+            flydsl_flash_attn_paged_prefill_func,
             case.q,
             case.k,
             case.v,
@@ -211,31 +192,12 @@ def benchmark_paged(
             out=output,
             **descales,
         )
-    if "flydsl-via-aiter" in selected:
-        output = torch.empty_like(case.out)
-        candidates["flydsl-via-aiter"] = partial(
-            mha_batch_prefill_func,
-            case.q,
-            case.k,
-            case.v,
-            case.cuq,
-            indptr,
-            indices,
-            query_length,
-            kv_length,
-            causal=True,
-            softmax_scale=scale,
-            kv_last_page_lens=last,
-            out=output,
-            **descales,
-        )
     if "ck" in selected:
         ck_output = torch.empty_like(case.out)
         ck_key = case.k.unsqueeze(1) if page_size == 1 else case.k
         ck_value = case.v.unsqueeze(1) if page_size == 1 else case.v
 
         def ck():
-            # Bypass the new high-level dispatch to measure CK MHA batch prefill.
             return _mha_batch_prefill(
                 case.q,
                 ck_key,
@@ -256,7 +218,7 @@ def benchmark_paged(
         candidates["ck"] = ck
     # Respect the requested order, including when checking the reverse order.
     candidates = {name: candidates[name] for name in selected}
-    # Public dispatch and CK may import/compile on their first invocation too.
+    # Both entry points may import/compile on their first invocation.
     # Complete every backend's first-use work before warming or timing any one.
     for fn in candidates.values():
         fn()
