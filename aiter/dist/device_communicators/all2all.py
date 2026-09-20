@@ -127,9 +127,9 @@ class MoriAll2AllManager(All2AllManagerBase):
     def get_handle(self, kwargs, index: int = 0):
         """Cached op for one config and ``index``. Always a single handle.
 
-        ``index=0`` (default) is the shared singleton. Other indexes are extra
-        instances for callers with several in flight (ATOM TBO:
-        ``index=ubatch_id + 1``). All indexes use ``handle_cache``.
+        ``index=0`` (default) is the shared singleton. Callers with several
+        operations in flight use a distinct index for each concurrent slot.
+        All indexes use ``handle_cache``.
         """
         mori_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("MoRI all2all index=%d args %s", index, mori_kwargs)
