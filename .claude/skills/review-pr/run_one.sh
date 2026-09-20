@@ -84,4 +84,9 @@ python3 "$SKILL/_gates.py" "$W" "$PROJ"
 say "collect..."
 python3 "$SKILL/_collect.py" "$W"
 
+# Clean up the scratch WORK dir + its worktrees on success (set -e keeps it on failure for debug).
+for wt in "$W/merge-target" "$W/head"; do [ -d "$wt" ] && git -C "$PROJ" worktree remove --force "$wt" 2>/dev/null || true; done
+rm -rf "$W"
+git -C "$PROJ" worktree prune 2>/dev/null || true
+
 say "done. report in $SKILL/reports/PR-$PR/ (uncommitted, unpublished)"

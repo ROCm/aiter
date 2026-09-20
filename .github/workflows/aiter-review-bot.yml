@@ -42,7 +42,6 @@ jobs:
     env:
       PR: ${{ github.event.issue.number }}          # issue number == PR number here
       COMMENTER: ${{ github.event.comment.user.login }}
-      AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
       # Kernel validation off by default (self-hosted + public repo). Enable per-need.
       REVIEW_AUTO_VALIDATE: '0'
     steps:
@@ -105,6 +104,8 @@ jobs:
 
       - name: Claim 👀 (as aiter-bot)
         if: steps.gate.outputs.ok == 'true'
+        env:
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
         run: |
           curl -s -X POST -H "Authorization: token $AITER_BOT_TOKEN" \
             -H 'Accept: application/vnd.github+json' \
@@ -116,5 +117,7 @@ jobs:
         run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR"
 
       - name: Publish gate (hold 🔴, post non-🔴)
-        if: steps.gate.outputs.ok == 'true'
+        if: steps.gate.outputs.ok == 'true' && success()
+        env:
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
         run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
