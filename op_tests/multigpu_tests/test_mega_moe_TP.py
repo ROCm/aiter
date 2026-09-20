@@ -726,22 +726,31 @@ class TpCollectives:
         return x.view(want)
 
     def _ag_custom_ok(self, x: torch.Tensor) -> bool:
-        if not self.enabled or not x.is_contiguous():
+        if not self.enabled:
             return False
-        # should_custom_ag: 16-byte multiple, and the gathered result has to fit
-        # the registered IPC arena (it is 1 GiB, so only the largest sweep
-        # points come near it).
-        return (x.numel() * x.element_size()) % 16 == 0
+        # should_custom_ag wants a contiguous input whose byte size is a
+        # multiple of 16. That is not a formality: glm5 has topk=9, so its
+        # packed routing row is 9*2*4 = 72 bytes and at one local token the
+        # whole payload is 72 bytes, which fails the check and quietly takes
+        # the RCCL path -- visible as a ~20us routing leg against ~7.5us on the
+        # models whose topk happens to land on a multiple of 4.
+        ok = x.is_contiguous() and (x.numel() * x.element_size()) % 16 == 0
+        if not ok:
+            self.fell_back = True
+        return ok
 
     def _rs_custom_ok(self, x: torch.Tensor) -> bool:
-        if not self.enabled or not x.is_contiguous():
+        if not self.enabled:
             return False
-        if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-            return False
-        if x.shape[0] % self.tp_size:
-            return False
-        pack = 16 // x.element_size()
-        return x.numel() % (self.tp_size * pack) == 0
+        ok = (
+            x.is_contiguous()
+            and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and x.shape[0] % self.tp_size == 0
+            and x.numel() % (self.tp_size * (16 // x.element_size())) == 0
+        )
+        if not ok:
+            self.fell_back = True
+        return ok
 
     # -- collectives ------------------------------------------------------
     def all_gather(self, x: torch.Tensor, out: torch.Tensor | None = None):
@@ -754,7 +763,9 @@ class TpCollectives:
         """
         if self._ag_custom_ok(x):
             view = self._as_float(x)
-            if view is not None:
+            if view is None:
+                self.fell_back = True
+            else:
                 try:
                     got = tensor_model_parallel_all_gather(
                         view, use_custom=True, dim=0
@@ -1663,8 +1674,10 @@ def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
         # collectives return their own output buffers -- so the caching
         # allocator needs many iterations to reach steady state, and a capture
         # taken before it gets there produces a graph whose *replay* segfaults
-        # the rank. How many is shape-dependent: dsv4 M=8 crashes at 10 and is
-        # fine at 120; kimi3 M=64 still crashes at 120 and is fine at 400.
+        # the rank. How many is shape-dependent and NOT monotonic: dsv4 M=8
+        # crashes at 10, passes at 120 and 400, and crashes again at 800, while
+        # M=32768 needs 800 on every model. So this is a value to retry at, not
+        # one to raise until it works.
         #
         # This used to work by accident. The eager timing loop that stood here
         # ran ~500 calls of every leg before any capture happened; deleting it
@@ -1743,7 +1756,6 @@ def run_case(
         "experts": shape.experts,
         "topk": shape.topk,
         "act": str(shape.act_type).split(".")[-1],
-        "comm": args.comm_backend.describe(),
         "gemm1_kernel": kname1,
         "gemm2_kernel": kname2,
         "rel_l2": float("nan"),
@@ -1885,6 +1897,7 @@ def run_case(
                 warmup=args.capture_warmup,
                 device=ctx.device,
             )
+        row["comm"] = args.comm_backend.describe()
         return row
 
     # The control group, captured. A replay that is fast but wrong would make
@@ -1923,6 +1936,10 @@ def run_case(
         row["graph_speedup"] = (
             split_graph / fused_graph if fused_graph > 0 else float("nan")
         )
+
+    # Recorded last, not at row-construction time: whether a shape had to fall
+    # back to RCCL is only known once its collectives have actually run.
+    row["comm"] = args.comm_backend.describe()
 
     # Everything above is function-local, so it is released on return; the
     # caller calls empty_cache() between cases.  Do not `del` the tensors the
@@ -2035,15 +2052,16 @@ def parse_args(argv=None):
         "--capture-warmup",
         type=int,
         default=400,
-        help="Eager iterations to run before each CUDA graph capture. Not a "
-        "tuning knob: a capture taken before the caching allocator reaches "
-        "steady state yields a graph whose REPLAY SIGSEGVs the rank, and how "
-        "many iterations that takes is shape-dependent -- dsv4 M=8 needs more "
-        "than 10 and is happy at 120, kimi3 M=64 still dies at 120 and is "
-        "happy at 400. The default is the largest value found necessary, not "
-        "a measured optimum. Raise it if a cell dies right after its capture; "
-        "lower it only if the warmup dominates a slow shape, and check the run "
-        "still completes.",
+        help="Eager iterations to run before each CUDA graph capture. A "
+        "capture taken before the caching allocator settles yields a graph "
+        "whose REPLAY SIGSEGVs the rank, so this cannot be 0 -- but it is NOT "
+        "monotonic and there is no value that works everywhere. Measured, 2 "
+        "attempts each: dsv4 M=8 dies at 10, passes at 120 and 400, and dies "
+        "again at 800; kimi3 M=64 dies at 120 and passes at 400; kimi3 M=32, "
+        "dsv3 M=2048 and every model at M=32768 die at 400 and pass at 800. "
+        "400 is what the published sweep used. If a cell dies immediately "
+        "after its capture, retry it at a different value rather than assuming "
+        "higher is safer.",
     )
     p.add_argument(
         "--rounds",
