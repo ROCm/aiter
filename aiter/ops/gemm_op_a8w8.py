@@ -891,6 +891,37 @@ def flatmm_a8w8_blockscale_ASM(
     return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
 
+def _flydsl_mxfp8_128_fallback_kernel(m: int, n: int, k: int, a_preshuffle: bool = False):
+    """Best-effort gfx1250 mxfp8_128 kernel for a shape with no tuned row."""
+    from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        is_compute_kernel,
+        kernel_fits_shape,
+        kernels_list,
+    )
+
+    # A-preshuffle packs adjacent row pairs, so an odd M has no valid pairing.
+    if a_preshuffle and m % 2:
+        return None
+    fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
+    if not fits:
+        return None
+    want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
+    compute = [ki for ki in fits if is_compute_kernel(ki)]
+    if compute:
+        return min(
+            compute,
+            key=lambda x: (
+                abs(x.tile_m - want_tm),
+                -(x.cluster_m * x.cluster_n),
+                x.split_k,
+                x.persistent_n_tiles,
+                -x.tile_n,
+                -x.num_buffers,
+            ),
+        )
+    return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
+
+
 def gemm_a8w8_blockscale_bpreshuffle_fake(
     XQ: Tensor,
     WQ: Tensor,
@@ -992,17 +1023,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
 
-        from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
-            kernel_fits_shape,
-            kernels_list,
-        )
-
-        fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
-        if fits:
-            want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
-            ki = min(
-                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
-            )
+        ki = _flydsl_mxfp8_128_fallback_kernel(m, n, k)
+        if ki is not None:
             logger.warning(
                 f"[gfx1250] gemm_a8w8_blockscale_bpreshuffle untuned "
                 f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
@@ -1132,16 +1154,40 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int) -> dict:
     The two kernel families differ only by an ``_apre`` marker, which sits before
     any ``_ps<n>`` persistent-tile suffix.
     """
+    from .flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+        is_compute_wmma_kernel_name,
+    )
+
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
-    if config is None or config.get("libtype") != "flydsl":
-        raise RuntimeError(
-            f"gemm_a8w8_blockscale_abpreshuffle: no FlyDSL config for M={m}, N={n}, K={k}"
+    borrowed = None
+    if config is not None and config.get("libtype") == "flydsl":
+        name = str(config["kernelName"])
+        head, sep, tail = name.partition("_ps")
+        borrowed = dict(config, kernelName=head + "_apre" + sep + tail)
+        if is_compute_wmma_kernel_name(borrowed["kernelName"]):
+            return borrowed
+    ki = _flydsl_mxfp8_128_fallback_kernel(m, n, k, a_preshuffle=True)
+    if ki is not None and (
+        borrowed is None or is_compute_wmma_kernel_name(ki.name_for(True))
+    ):
+        logger.warning(
+            f"[gfx1250] gemm_a8w8_blockscale_abpreshuffle untuned "
+            f"M={m}, N={n}, K={k}; falling back to flydsl kernel "
+            f"'{ki.name_for(True)}'."
         )
-    name = str(config["kernelName"])
-    head, sep, tail = name.partition("_ps")
-    return dict(config, kernelName=head + "_apre" + sep + tail)
+        return {"kernelName": ki.name_for(True), "libtype": "flydsl"}
+    if borrowed is not None:
+        logger.info(
+            f"[gfx1250] gemm_a8w8_blockscale_abpreshuffle untuned "
+            f"M={m}, N={n}, K={k}; no compute-bound kernel fits, borrowing the "
+            f"generic bpreshuffle winner '{borrowed['kernelName']}'."
+        )
+        return borrowed
+    raise RuntimeError(
+        f"gemm_a8w8_blockscale_abpreshuffle: no FlyDSL config for M={m}, N={n}, K={k}"
+    )
 
 
 def gemm_a8w8_blockscale_abpreshuffle_fake(
