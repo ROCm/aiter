@@ -1384,8 +1384,6 @@ def assert_no_k_tail(k: int, kwargs: dict):
 
 @functools.lru_cache(maxsize=128)
 def get_split_k_buffers(stream, device):
-    # Allocated from a private MemPool because this key can first miss inside a
-    # CUDA graph capture -- see persistent_alloc.
     with persistent_alloc(torch.device(device)):
         semaphore = torch.zeros(
             (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device

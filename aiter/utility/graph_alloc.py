@@ -10,18 +10,16 @@ from packaging.version import Version
 
 logger = logging.getLogger("aiter")
 
-# torch < 2.10 scans captures_underway in registration order, so the graph pool
-# registered at capture begin always wins and use_mem_pool is ignored inside a
-# capture; 2.10 scans it in LIFO order (c10/cuda/CUDACachingAllocator.cpp).
-# Compare parsed versions: "2.9.1" > "2.10" as plain strings.
+# Before 2.10 the allocator scans captures_underway in registration order, so
+# the graph pool wins and use_mem_pool is ignored inside a capture. Parsed, not
+# string-compared: "2.9.1" sorts above "2.10".
 ROUTES_INSIDE_CAPTURE = Version(torch.__version__.split("+")[0]) >= Version("2.10")
 
 
 @functools.cache
 def _persistent_pool(index: int) -> "torch.cuda.MemPool":
-    # Concurrent first callers can each build a pool and only one is kept; the
-    # cost is a duplicate set of segments, not a dangling pointer -- blocks stay
-    # valid after the pool object they came from is dropped.
+    # Concurrent first callers can each build one and only one is kept: the cost
+    # is a duplicate set of segments, not a dangling pointer.
     with torch.cuda.device(index):
         return torch.cuda.MemPool()
 

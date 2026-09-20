@@ -235,8 +235,7 @@ def _get_preshuffle_split_buffers(
     stream: torch.cuda.Stream,
 ) -> tuple[Tensor, Tensor]:
     # Safe to reuse: launches on a stream are ordered and the reduction hands
-    # the semaphore back zeroed. Allocated from a private MemPool because this
-    # key can first miss inside a CUDA graph capture -- see persistent_alloc.
+    # the semaphore back zeroed.
     with persistent_alloc(device):
         workspace = torch.empty(
             PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device

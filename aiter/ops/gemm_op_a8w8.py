@@ -397,8 +397,6 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
 def get_zero_bias_buf_keyed(
     device: torch.device, stream_id: int, out_shape: int
 ) -> Tensor:
-    # Allocated from a private MemPool because this key can first miss inside a
-    # CUDA graph capture -- see persistent_alloc.
     with persistent_alloc(device):
         return torch.zeros(1, out_shape, dtype=torch.float32, device=device)
 

@@ -85,8 +85,6 @@ _SPLIT_K_MAX_TILES = 4096
 
 @functools.cache
 def _split_k_counters(device, stream):
-    # Allocated from a private MemPool because this key can first miss inside a
-    # CUDA graph capture -- see persistent_alloc.
     with persistent_alloc(torch.device(device)):
         return torch.zeros(_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device)
 

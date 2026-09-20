@@ -336,8 +336,6 @@ def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
-    # Allocated from a private MemPool because this key can first miss inside a
-    # CUDA graph capture -- see persistent_alloc.
     with persistent_alloc(device):
         return torch.zeros(size, dtype=torch.uint8, device=device)
 
