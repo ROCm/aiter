@@ -162,8 +162,10 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
     agents: list[tuple[str, int]] = []
     for block in re.split(r"^device#", _gpu_info_output(), flags=re.MULTILINE)[1:]:
         # gcnArchName can carry target-id features ("gfx942:sramecc+").
-        name = re.search(r"^gcnArchName:\s*(gfx\w+)", block, re.M | re.I)
-        rev = re.search(r"^asicRevision:\s*(\d+)", block, re.M)
+        name = re.search(
+            r"^gcnArchName:\s*(gfx\w+)", block, re.MULTILINE | re.IGNORECASE
+        )
+        rev = re.search(r"^asicRevision:\s*(\d+)", block, re.MULTILINE)
         if name and rev:
             agents.append((name.group(1).lower(), int(rev.group(1))))
     return agents
