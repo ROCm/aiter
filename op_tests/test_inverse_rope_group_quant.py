@@ -41,12 +41,15 @@ from aiter.test_common import (
 
 torch.set_default_device("cuda")
 
-# The HIP kernel widens its cross-lane amax reduction past a 16-lane DPP row with
-# __builtin_amdgcn_permlane16_swap / permlane32_swap, which are gfx950+. Those
-# instantiate whenever THREADS_PER_GROUP >= 32, i.e. the s <= 4 tier
-# (THREAD_DATA_SIZE=2 -> 64 lanes per group), so the module does not build on
-# gfx942 today.
-SUPPORTED_GFX = ["gfx950", "gfx1250", "gfx1201"]
+# The op needs no arch-specific instruction of its own. The amax reduction
+# reaches past a 16-lane DPP row through __shfl_xor, which the compiler lowers
+# per arch (row_bcast on gfx9, permlane on gfx10+), and the hardware scaled-FP8
+# converters are an opt-in fast path that falls back to the general chain
+# (kHwScaledFp8 / kNativeQuant). So this list is the set of verified targets
+# rather than a build constraint. gfx942 quantizes to E4M3_FNUZ rather than
+# E4M3 (kHwFp8E4m3 in the kernel); the reference tracks that through
+# dtypes.fp8, which is what _e8m0_round_up below takes its max_pos from.
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250", "gfx1201"]
 
 # Positions stay unique for every swept s, so cos/sin rows are not reused across
 # tokens -- reuse would inflate the L2 hit rate versus a real decode batch spread
