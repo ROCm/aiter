@@ -81,13 +81,17 @@ def fused_kda_decode(
     else:
         stride_indices_seq = ssm_state_indices.stride(0)
         stride_indices_tok = 1
+    num_accepted_tokens_arg = (
+        num_accepted_tokens if num_accepted_tokens is not None else ssm_state_indices
+    )
+    conv_state_indices_arg = (
+        conv_state_indices if conv_state_indices is not None else ssm_state_indices
+    )
 
     if out is None:
         out = torch.empty(T, lp, dtype=torch.bfloat16, device=mixed_qkv.device)
     elif out.shape != (T, lp):
         raise ValueError(f"Expected out shape {(T, lp)}, got {tuple(out.shape)}")
-
-    dummy_i32 = torch.empty(1, dtype=torch.int32, device=mixed_qkv.device)
 
     # Conv weight strides: support [3*lp, W] and [3, W, lp]
     if conv_weight.dim() == 3:
@@ -194,8 +198,8 @@ def fused_kda_decode(
         dt_bias,
         ssm_state,
         ssm_state_indices,
-        num_accepted_tokens if num_accepted_tokens is not None else dummy_i32,
-        conv_state_indices if conv_state_indices is not None else dummy_i32,
+        num_accepted_tokens_arg,
+        conv_state_indices_arg,
         cu_seqlens,
         norm_weight,
         out_gate,

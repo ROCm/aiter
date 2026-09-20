@@ -108,14 +108,15 @@ def fused_conv_recurrent_norm_kernel(
     o_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, K), K), K)
     o_v = tl.max_contiguous(tl.multiple_of(tl.arange(0, V), V), V)
 
-    p_h = (
-        ssm_state_ptr
-        + state_idx * stride_ssm_slot
-        + i_h * V * K
-        + o_v[:, None] * K
-        + o_k[None, :]
-    )
-    b_h = tl.load(p_h).to(tl.float32)
+    if IS_SPEC_DECODING:
+        p_h = (
+            ssm_state_ptr
+            + state_idx * stride_ssm_slot
+            + i_h * V * K
+            + o_v[:, None] * K
+            + o_k[None, :]
+        )
+        b_h = tl.load(p_h).to(tl.float32)
 
     p_cs = conv_state_ptr + conv_state_idx * stride_cs_slot
     p_csq = p_cs + (q_off + o_k) * stride_cs_dim
@@ -279,6 +280,15 @@ def fused_conv_recurrent_norm_kernel(
         )
 
         # ========== Delta Rule ==========
+        if not IS_SPEC_DECODING:
+            p_h = (
+                ssm_state_ptr
+                + state_idx * stride_ssm_slot
+                + i_h * V * K
+                + o_v[:, None] * K
+                + o_k[None, :]
+            )
+            b_h = tl.load(p_h).to(tl.float32)
         b_h = b_h * tl.exp(b_g[None, :])
         b_dot = tl.sum(b_h * b_k[None, :], 1)
         b_v = b_v - b_dot
@@ -301,6 +311,8 @@ def fused_conv_recurrent_norm_kernel(
                     + o_k[None, :]
                 )
                 tl.store(p_h_out, b_h.to(p_h_out.dtype.element_ty))
+        else:
+            tl.store(p_h, b_h.to(p_h.dtype.element_ty))
 
         # ========== Gated RMSNorm ==========
         b_o_rounded = b_o.to(tl.bfloat16).to(tl.float32)
@@ -315,9 +327,6 @@ def fused_conv_recurrent_norm_kernel(
             out_ptr + tok * (H * V) + i_h * V + o_v,
             b_y.to(out_ptr.dtype.element_ty),
         )
-
-    if not IS_SPEC_DECODING:
-        tl.store(p_h, b_h.to(p_h.dtype.element_ty))
 
 
 @triton.jit

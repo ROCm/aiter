@@ -200,9 +200,10 @@ def _make_inputs(
     cap=64,
     write_pos_val=0,
     full_spec_sequence=False,
+    normal_seq_len=1,
 ):
     lp = Hloc * D
-    seq_len = 1 + num_spec if num_spec > 0 and full_spec_sequence else 1
+    seq_len = 1 + num_spec if num_spec > 0 and full_spec_sequence else normal_seq_len
     total_tokens = batch * seq_len
     state_len = (W - 1 + num_spec) if num_spec > 0 else (W - 1)
     num_slots = batch + num_spec * batch + 4
@@ -309,6 +310,53 @@ def test_normal_decode(batch, Hloc):
         state_indices=inp["state_indices"],
     )
     torch.testing.assert_close(out, ref, atol=0.15, rtol=0.1)
+
+
+def test_fused_normal_decode_multi_token():
+    from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+
+    batch, Hloc, seq_len = 2, 2, 4
+    inp = _make_inputs(batch, Hloc, normal_seq_len=seq_len)
+    ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
+    ref = _ref_decode(
+        inp["mixed_qkv"],
+        ref_cs,
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        ref_ss,
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        Hloc,
+        -5.0,
+        state_indices=inp["state_indices"],
+    )
+    fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
+    out = fused_kda_decode(
+        inp["mixed_qkv"],
+        fused_cs,
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        fused_ss,
+        inp["state_indices"],
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        D,
+        Hloc,
+        -5.0,
+    )
+    torch.testing.assert_close(out, ref, atol=0.15, rtol=0.1)
+    torch.testing.assert_close(fused_cs, ref_cs, atol=0, rtol=0)
+    torch.testing.assert_close(fused_ss, ref_ss, atol=0.05, rtol=0.02)
 
 
 @pytest.mark.parametrize("batch,Hloc,num_spec", [(1, 12, 3), (2, 4, 3)])
