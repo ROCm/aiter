@@ -158,6 +158,17 @@ def main(argv):
             print(f"  #{pr}: {action} — {reason}")
             if action == "HOLD":
                 held.append(pr)
+                # Surface a held HIGH RISK review: a GitHub Actions warning annotation shows on
+                # the PR's checks, and the full card goes to the job log for the maintainer.
+                if a.post:
+                    card = (REPORTS / f"PR-{pr}" / "card.md").read_text(
+                        encoding="utf-8"
+                    )
+                    print(
+                        f"::warning title=aiter-bot HIGH RISK::PR #{pr} review found HIGH RISK "
+                        f"— held for a maintainer; full card in this job log"
+                    )
+                    print(card)
     if held:
         print(f"  ⚠ held for a human: {held}")
     return 0
