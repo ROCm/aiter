@@ -48,7 +48,7 @@ python3 "$SKILL/check_prompts.py" >/dev/null || { say "prompts drifted from SKIL
 say "fetch..."
 FL="$(mktemp)"
 (cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
-W="$(grep -oE 'WORK=/tmp/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
+W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
 rm -f "$FL"
 [ -n "$W" ] && [ -d "$W" ] || { say "fetch produced no WORK dir, aborting"; exit 1; }
 
