@@ -360,12 +360,12 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     batch,
     max_ctx,
     kv_block_size=64,
-    block_k=256,
+    block_k=None,
     next_n=1,
     heads=DEFAULT_HEADS,
     num_iters=20,
     num_warmup=3,
-    num_warps=4,
+    num_warps=None,
     parallel_unit_num=None,
     head_dim=DEFAULT_HEAD_DIM,
     bench=True,
@@ -379,6 +379,23 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     batch_size = batch
     assert heads % 16 == 0 and heads <= 128, f"heads={heads}: multiple of 16, <= 128"
     assert head_dim % 128 == 0, f"head_dim={head_dim}: multiple of 128"
+    if block_k is None and num_warps is None:
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+            _default_decode_config,
+        )
+
+        block_k, num_warps = _default_decode_config(
+            batch_size,
+            next_n,
+            heads,
+            head_dim,
+            max_ctx,
+            kv_block_size,
+        )
+    elif block_k is None:
+        block_k = 64 * num_warps
+    elif num_warps is None:
+        num_warps = block_k // 64
     m_tiles = heads // 16
     k_tiles = head_dim // 128
     head_dim_packed = head_dim // 2
@@ -658,7 +675,7 @@ def main():
     parser.add_argument(
         "--block_k",
         type=int,
-        default=256,
+        default=None,
         help="Tokens per chunk (multiple of MFMA_N=16, divisible by num_warps)",
     )
     parser.add_argument("--num_iters", type=int, default=30)
@@ -666,7 +683,7 @@ def main():
     parser.add_argument(
         "--num_warps",
         type=int,
-        default=4,
+        default=None,
         help="warps per CTA (pipelined kernel only); BLOCK=num_warps*64",
     )
     parser.add_argument(
@@ -710,13 +727,14 @@ def main():
         configs = [(args.batch, args.ctx, args.next_n, args.heads)]
     else:
         # Default sweep: correctness + light perf on small/moderate ragged shapes,
-        # exercising next_n=1/2 and heads=64/128. Use --batch/--ctx for a big run.
+        # exercising next_n=1/2/4 and heads=64/128. Use --batch/--ctx for a big run.
         configs = [
             (2, 512, 1, 64),
             (3, 1024, 1, 64),
             (2, 512, 2, 64),
             (2, 768, 1, 128),
             (4, 2048, 1, 64),
+            (4, 2048, 4, 64),
         ]
 
     for b, c, nn, h in configs:
