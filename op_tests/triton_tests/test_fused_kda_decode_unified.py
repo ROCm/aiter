@@ -72,6 +72,7 @@ def _ref_decode(
     buf_g=None,
     write_pos=None,
     slot_idx=None,
+    full_spec_sequence=False,
 ):
     T = mixed_qkv.shape[0]
     K = V = D
@@ -113,6 +114,17 @@ def _ref_decode(
             s_idx = state_indices[n, i_start].item()
             conv_slot_idx = conv_state_indices[n].item()
             b_h = state[s_idx].clone().float()
+            if full_spec_sequence:
+                spec_conv_history = conv_state[
+                    conv_slot_idx, :, i_start : i_start + W - 1
+                ].clone()
+                spec_next_conv_state = torch.cat(
+                    (
+                        spec_conv_history[:, 1:],
+                        mixed_qkv[bos:eos].transpose(0, 1),
+                    ),
+                    dim=1,
+                )
         else:
             s_idx = state_indices[n].item()
             conv_slot_idx = s_idx
@@ -121,7 +133,14 @@ def _ref_decode(
         for t in range(eos - bos):
             tok = bos + t
             qkv_out = _ref_conv1d_step(
-                mixed_qkv[tok], conv_state[conv_slot_idx], conv_weight, state_len
+                mixed_qkv[tok],
+                (
+                    spec_conv_history
+                    if is_spec and full_spec_sequence
+                    else conv_state[conv_slot_idx]
+                ),
+                conv_weight,
+                W - 1 if is_spec and full_spec_sequence else state_len,
             )
             q = qkv_out[:lp].reshape(H, K)
             k = qkv_out[lp : 2 * lp].reshape(H, K)
@@ -167,30 +186,50 @@ def _ref_decode(
                     o_bf16 * rstd * w * torch.sigmoid(og)
                 ).bfloat16()
 
+        if is_spec and full_spec_sequence:
+            conv_state[conv_slot_idx] = spec_next_conv_state
+
     return out
 
 
-def _make_inputs(batch, Hloc, num_spec=0, replay=False, cap=64, write_pos_val=0):
+def _make_inputs(
+    batch,
+    Hloc,
+    num_spec=0,
+    replay=False,
+    cap=64,
+    write_pos_val=0,
+    full_spec_sequence=False,
+):
     lp = Hloc * D
+    seq_len = 1 + num_spec if num_spec > 0 and full_spec_sequence else 1
+    total_tokens = batch * seq_len
     state_len = (W - 1 + num_spec) if num_spec > 0 else (W - 1)
     num_slots = batch + num_spec * batch + 4
     torch.manual_seed(42)
     inp = {
-        "mixed_qkv": torch.randn(batch, 3 * lp, dtype=DTYPE, device=DEVICE) * 0.1,
+        "mixed_qkv": torch.randn(total_tokens, 3 * lp, dtype=DTYPE, device=DEVICE)
+        * 0.1,
         "conv_weight": torch.randn(3 * lp, W, dtype=DTYPE, device=DEVICE) * 0.1,
         "conv_state": torch.randn(
             num_slots, 3 * lp, state_len, dtype=DTYPE, device=DEVICE
         )
         * 0.1,
-        "gate": torch.randn(1, batch, Hloc, D, dtype=DTYPE, device=DEVICE) * 0.5,
-        "beta": torch.randn(1, batch, Hloc, dtype=DTYPE, device=DEVICE),
-        "out_gate": torch.randn(batch, lp, dtype=DTYPE, device=DEVICE),
+        "gate": torch.randn(1, total_tokens, Hloc, D, dtype=DTYPE, device=DEVICE) * 0.5,
+        "beta": torch.randn(1, total_tokens, Hloc, dtype=DTYPE, device=DEVICE),
+        "out_gate": torch.randn(total_tokens, lp, dtype=DTYPE, device=DEVICE),
         "A_log": torch.randn(Hloc, dtype=DTYPE, device=DEVICE) * 0.1,
         "dt_bias": torch.randn(lp, dtype=DTYPE, device=DEVICE) * 0.1,
         "state": torch.randn(num_slots, Hloc, D, D, dtype=torch.float32, device=DEVICE)
         * 0.01,
         "norm_weight": torch.ones(D, dtype=DTYPE, device=DEVICE),
-        "cu_seqlens": torch.arange(batch + 1, dtype=torch.int64, device=DEVICE),
+        "cu_seqlens": torch.arange(
+            0,
+            total_tokens + 1,
+            seq_len,
+            dtype=torch.int64,
+            device=DEVICE,
+        ),
     }
     if num_spec > 0:
         inp["state_indices"] = torch.arange(
@@ -321,6 +360,70 @@ def test_spec_decode(batch, Hloc, num_spec):
         conv_state_indices=inp["conv_state_indices"],
     )
     torch.testing.assert_close(out, ref, atol=0.15, rtol=0.1)
+
+
+@pytest.mark.parametrize("weight_layout", ["channels_width", "group_width_channels"])
+def test_optimized_fused_spec_decode_num_spec_7(weight_layout):
+    from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("parallel spec-7 kernel is only dispatched on gfx950")
+
+    batch, Hloc, num_spec = 4, 2, 7
+    inp = _make_inputs(batch, Hloc, num_spec=num_spec, full_spec_sequence=True)
+    inp["num_accepted_tokens"] = torch.tensor(
+        [1, 2, 4, 7], dtype=torch.int32, device=DEVICE
+    )
+    fused_weight = inp["conv_weight"]
+    if weight_layout == "group_width_channels":
+        fused_weight = fused_weight.reshape(3, Hloc * D, W).transpose(1, 2).contiguous()
+
+    ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
+    ref = _ref_decode(
+        inp["mixed_qkv"],
+        ref_cs,
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        ref_ss,
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        Hloc,
+        -5.0,
+        state_indices=inp["state_indices"],
+        num_accepted_tokens=inp["num_accepted_tokens"],
+        conv_state_indices=inp["conv_state_indices"],
+        full_spec_sequence=True,
+    )
+    fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
+    out = fused_kda_decode(
+        inp["mixed_qkv"],
+        fused_cs,
+        fused_weight,
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        fused_ss,
+        inp["state_indices"],
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        D,
+        Hloc,
+        -5.0,
+        num_accepted_tokens=inp["num_accepted_tokens"],
+        conv_state_indices=inp["conv_state_indices"],
+    )
+    torch.testing.assert_close(out, ref, atol=0.15, rtol=0.1)
+    torch.testing.assert_close(fused_cs, ref_cs, atol=0, rtol=0)
+    torch.testing.assert_close(fused_ss, ref_ss, atol=0.05, rtol=0.02)
 
 
 @pytest.mark.parametrize("batch,Hloc", [(1, 12), (2, 4)])
