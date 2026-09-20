@@ -5047,39 +5047,3 @@ def fused_topk(
     #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
-
-
-def herd_fused_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    topk_ids: torch.Tensor | None = None,
-    topk_weights: torch.Tensor | None = None,
-    *,
-    sm_first: bool = True,
-    score_mode: str | None = None,
-    bias: torch.Tensor | None = None,
-):
-    """HERD min-unique drop-in for :func:`fused_topk`.
-
-    Same ``(topk_weights[M, k] fp32, topk_ids[M, k] i32)`` contract so
-    ``fused_moe`` / ``test_moe_2stage`` can swap the selector without touching
-    ``moe_sorting``. Implementation lives in
-    ``aiter.ops.triton.moe.moe_routing.minunique``.
-    """
-    from aiter.ops.triton.moe.moe_routing.minunique import (
-        herd_fused_topk as _herd_fused_topk,
-    )
-
-    return _herd_fused_topk(
-        hidden_states,
-        gating_output,
-        topk,
-        renormalize,
-        topk_ids,
-        topk_weights,
-        sm_first=sm_first,
-        score_mode=score_mode,
-        bias=bias,
-    )
