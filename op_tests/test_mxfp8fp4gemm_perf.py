@@ -158,6 +158,18 @@ def main():
                     )
                 )
         return
+
+    # Keep --dry-run usable without an installed aiter/PyTorch GPU environment.
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    if gfx != "gfx1250":
+        print(
+            f"Skipping F8GEMM performance benchmark: requires gfx1250, got {gfx}",
+            flush=True,
+        )
+        return
+
     output.mkdir(parents=True, exist_ok=False)
     print(f"Results: {output}", flush=True)
     attempts, records, summaries = [], [], []
