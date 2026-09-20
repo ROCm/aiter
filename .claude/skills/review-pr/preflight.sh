@@ -2,20 +2,19 @@
 # Runner preflight self-check: run once after the runner is installed to confirm the
 # environment a PR review needs is present. All green = @aiter-bot review runs end to end
 # on trigger. Fix any red per its hint. Read-only, changes nothing.
-#   bash .review-loop/ci/preflight.sh
+#   bash .claude/skills/review-pr/preflight.sh
 # Run it as the same user the runner runs as (claude-glm config is per-user).
 set -uo pipefail
-RL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+S="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # the review-pr skill dir
 ok=0; bad=0
 chk() { if eval "$2" >/dev/null 2>&1; then echo "  ✅ $1"; ok=$((ok+1)); else echo "  ❌ $1 — $3"; bad=$((bad+1)); fi; }
 
 echo "=== aiter-review-bot runner preflight (user=$(whoami)) ==="
 
-echo "[scripts present]"
-for s in fetch.sh render.sh gates.sh collect.sh run_one.sh publish.sh; do
-  chk "$s present and executable" "[ -x '$RL/$s' ]" "missing $RL/$s or not +x"
+echo "[skill scripts present]"
+for s in fetch.sh triage.py render.sh run_one.sh _lib.py _gates.py _collect.py _publish.py; do
+  chk "$s present" "[ -f '$S/$s' ]" "missing $S/$s"
 done
-chk "triage.py in the skill" "[ -f '$RL/../.claude/skills/review-pr/triage.py' ]" "review-pr skill missing"
 
 echo "[runtime]"
 chk "python3 available" "command -v python3" "install python3"

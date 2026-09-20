@@ -4,7 +4,7 @@
 #
 # Install at ROCm/aiter as .github/workflows/aiter-review-bot.yml and merge to the
 # default branch (issue_comment workflows only run from the definition on the default
-# branch). The review tooling (.review-loop/ + the review-pr skill) lives in this repo,
+# branch). The review tooling lives in the review-pr skill dir (.claude/skills/review-pr/) and
 # so the runner gets everything by checkout; only claude-glm (the internal AI backend)
 # is provisioned on the runner box.
 #
@@ -13,7 +13,7 @@
 #   @aiter-bot re-review   after the author pushes fixes
 # Commands inside quote (`>`) lines do not trigger; non-allowlisted commenters are ignored.
 #
-# Chain (all on the runner, scripts from the checkout's .review-loop/):
+# Chain (all on the runner, scripts from .claude/skills/review-pr/):
 #   gate (allowlist + real-trigger check) -> claim 👀 -> run_one.sh (headless GLM review)
 #   -> publish.sh (hold 🔴 for a human, post non-🔴, as aiter-bot)
 name: aiter-review-bot
@@ -54,7 +54,7 @@ jobs:
 
       - name: Resolve tooling dir
         id: rl
-        run: echo "dir=${GITHUB_WORKSPACE}/.review-loop" >> "$GITHUB_OUTPUT"
+        run: echo "dir=${GITHUB_WORKSPACE}/.claude/skills/review-pr" >> "$GITHUB_OUTPUT"
 
       - name: Gate — aiter-team allowlist + real trigger (skip quote lines)
         id: gate
@@ -85,7 +85,7 @@ jobs:
           if v.strip():
               allow = {x.strip().lower() for x in v.split(',') if x.strip()}
           else:
-              f = pathlib.Path(os.environ['RL']) / 'ci' / 'authorized.txt'
+              f = pathlib.Path(os.environ['RL']) / 'authorized.txt'
               if f.is_file():
                   allow = {l.strip().lower() for l in f.read_text().splitlines()
                            if l.strip() and not l.startswith('#')}
@@ -117,4 +117,4 @@ jobs:
 
       - name: Publish gate (hold 🔴, post non-🔴)
         if: steps.gate.outputs.ok == 'true'
-        run: bash "${{ steps.rl.outputs.dir }}/publish.sh" "$PR" --post
+        run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post

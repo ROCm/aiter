@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -7,11 +8,21 @@ import _lib
 if len(sys.argv) < 2:
     sys.exit("usage: gates.sh <WORK_DIR> [PROJECT_ROOT]")
 W = sys.argv[1]
-PROJ = (
-    sys.argv[2]
-    if len(sys.argv) > 2
-    else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
+if len(sys.argv) > 2:
+    PROJ = sys.argv[2]
+else:
+    PROJ = subprocess.run(
+        [
+            "git",
+            "-C",
+            os.path.dirname(os.path.abspath(__file__)),
+            "rev-parse",
+            "--show-toplevel",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
 
 print(f"======== SEVEN GATES ({W}) ========")
 res = _lib.run_gates(W, PROJ)

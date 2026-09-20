@@ -1,6 +1,7 @@
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -57,7 +58,13 @@ for f in _lib.REQUIRED + _lib.OPTIONAL:
 
 
 # GATES.txt is this report's credibility receipt; keep it with the artifacts — write failures in too
-res = _lib.run_gates(W, os.path.dirname(HERE))
+_proj = subprocess.run(
+    ["git", "-C", str(HERE), "rev-parse", "--show-toplevel"],
+    capture_output=True,
+    text=True,
+    check=False,
+).stdout.strip() or os.path.dirname(os.path.dirname(os.path.dirname(str(HERE))))
+res = _lib.run_gates(W, _proj)
 npass = sum(1 for _, rc, _, _ in res if rc == 0)
 lines = [f"======== SEVEN GATES ({W}) ========"]
 for name, rc, first, full in res:
@@ -77,8 +84,6 @@ print(f"  collected into {D}  ({copied} items, {npass}/7 green)")
 # Refresh the aggregate report right after collect (a manual step gets forgotten, and a
 # forgotten one leaves the report inconsistent with reality). _report.py is a dev-only tool
 # and may not ship; skip it silently when absent.
-import subprocess
-
 _rep = HERE / "_report.py"
 if _rep.is_file():
     subprocess.run([sys.executable, str(_rep)], check=False)

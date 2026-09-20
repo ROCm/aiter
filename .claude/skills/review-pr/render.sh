@@ -8,7 +8,7 @@ T="${1:?usage: render.sh <template> <WORK_DIR> [findings-file]}"
 WORK="${2:?work dir}"
 FIND="${3:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJ="$(cd "$HERE/.." && pwd)"
+PROJ="$(git -C "$HERE" rev-parse --show-toplevel)"
 TPL="$HERE/prompts/$T.md"
 [ -f "$TPL" ] || { echo "no such template: $TPL" >&2; ls "$HERE/prompts"/*.md >&2; exit 1; }
 [ -s "$WORK/pr_meta.json" ] || { echo "missing $WORK/pr_meta.json -- run fetch.sh first" >&2; exit 1; }
