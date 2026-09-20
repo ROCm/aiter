@@ -1385,11 +1385,6 @@ def _fused_moe_impl(
         "gfx950",
     ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
 
-    def _maybe_record_sort(sort_fn):
-        if kernel_bench_callable is not None:
-            kernel_bench_callable.append(("sort", sort_fn))
-        return sort_fn()
-
     sort_m_indices = None
     sort_reverse_sorted = None
     if metadata.output_aux:
@@ -1407,18 +1402,16 @@ def _fused_moe_impl(
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
         # BM16's adaptive sort already emits routes and zeroes the output without
         # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = _maybe_record_sort(
-            lambda: moe_sorting(
-                topk_ids,
-                topk_weight,
-                global_E,
-                model_dim,
-                dtype,
-                block_size_M,
-                accumulate=_atomic,
-                output_aux=metadata.output_aux,
-                output=output,
-            )
+        sorting_ret = moe_sorting(
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            accumulate=_atomic,
+            output_aux=metadata.output_aux,
+            output=output,
         )
         (
             sorted_ids,
@@ -1431,22 +1424,20 @@ def _fused_moe_impl(
         ) = sorting_ret
         local_topk_ids = None
     else:
-        sorting_ret = _maybe_record_sort(
-            lambda: moe_sorting(
-                topk_ids,
-                topk_weight,
-                global_E,
-                model_dim,
-                dtype,
-                block_size_M,
-                expert_mask,
-                num_local_tokens,
-                moe_sorting_dispatch_policy,
-                return_local_topk_ids=need_local_topk_ids,
-                accumulate=not stage2_uses_route_reduce(metadata.stage2),
-                flat=metadata.flat,
-                output=None if metadata.flat else output,
-            )
+        sorting_ret = moe_sorting(
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+            return_local_topk_ids=need_local_topk_ids,
+            accumulate=not stage2_uses_route_reduce(metadata.stage2),
+            flat=metadata.flat,
+            output=None if metadata.flat else output,
         )
         if need_local_topk_ids:
             (
