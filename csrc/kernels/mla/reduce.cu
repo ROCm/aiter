@@ -482,7 +482,8 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
 
     auto make_final_lse = [&](const int32_t seq) {
         const int64_t elem = int64_t(seq) * Traits::kNumHeadQ + head_idx;
-        return opus::make_gmem<lse_t>(reinterpret_cast<lse_t*>(params.p_final_lse) + elem);
+        lse_t* const base  = reinterpret_cast<lse_t*>(params.p_final_lse);
+        return opus::make_gmem<lse_t>(base ? base + elem : nullptr, base ? 0xffffffffu : 0u);
     };
 
     auto make_final_output = [&](const int32_t seq) {
@@ -599,7 +600,8 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
 
     auto make_final_lse = [&](const int32_t seq) {
         const int64_t elem = int64_t(seq) * Traits::kNumHeadQ + head_idx;
-        return opus::make_gmem<lse_t>(reinterpret_cast<lse_t*>(params.p_final_lse) + elem);
+        lse_t* const base  = reinterpret_cast<lse_t*>(params.p_final_lse);
+        return opus::make_gmem<lse_t>(base ? base + elem : nullptr, base ? 0xffffffffu : 0u);
     };
 
     // The partial-slot output offset (slot * kNumHeadQ * kSizeDV * 4) can exceed 2^31, but the
