@@ -28,9 +28,8 @@ __all__ = ["moe_gemm_mxfp8"]
 
 _LOGGER = AiterTritonLogger()
 
-_MXFP8_FALLBACK = triton.Config(
-    {"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1
-)
+# Tile values must come from configs/<arch>/triton/moe/mxfp8_fnuz/DEFAULT.json.
+_MXFP8_FALLBACK = triton.Config({}, num_warps=4, num_stages=1)
 
 
 def moe_gemm_mxfp8(
@@ -71,8 +70,12 @@ def moe_gemm_mxfp8(
     E, N, K = rhs.shape
 
     assert lhs.shape[1] == K, "K dimension mismatch"
+    assert quant_block_size == 32, (
+        f"quant_block_size must be 32 (got {quant_block_size}): "
+        "_moe_gemm_a8w8 hardcodes MX_PACK_DIVISOR=32"
+    )
     assert (
-        quant_block_size > 0 and K % quant_block_size == 0
+        K % quant_block_size == 0
     ), f"K ({K}) must be divisible by quant_block_size ({quant_block_size})"
 
     out = torch.empty(total_tokens, N, dtype=out_dtype, device=lhs.device)
@@ -84,6 +87,13 @@ def moe_gemm_mxfp8(
     cfg = get_tuned_kernel_config(
         "moe", "MXFP8_FNUZ", "moe_gemm_mxfp8", _MXFP8_FALLBACK
     )
+    if "BLOCK_M" not in cfg.kwargs or "BLOCK_N" not in cfg.kwargs:
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        raise FileNotFoundError(
+            f"No MXFP8 MoE GEMM tile config for arch '{get_arch()}'. "
+            "Add configs/<arch>/triton/moe/mxfp8_fnuz/DEFAULT.json."
+        )
     BLOCK_M = cfg.kwargs["BLOCK_M"]
     BLOCK_N = cfg.kwargs["BLOCK_N"]
 

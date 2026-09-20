@@ -120,6 +120,7 @@ _moe_gemm_a8w8_repr = make_kernel_repr(
         "N_EXPTS_ACT",
         "APPLY_SWIGLU",
         "SWIGLU_ADD_RESIDUAL",
+        "USE_FNUZ",
     ],
 )
 

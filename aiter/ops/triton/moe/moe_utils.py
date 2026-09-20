@@ -3,7 +3,6 @@
 """Shared utilities for group_sizes-based MoE GEMM wrappers."""
 
 import torch
-import triton
 
 __all__ = ["build_block_mapping", "group_sizes_to_expt_tensors"]
 
@@ -95,19 +94,35 @@ def group_sizes_to_expt_tensors(
     """
     E = group_sizes.shape[0]
     device = group_sizes.device
-    expt_hist = group_sizes.to(torch.int32)
+    gs = group_sizes.to(torch.int32)
+
+    expt_hist = gs
     expt_offs = torch.zeros(E, dtype=torch.int32, device=device)
     if E > 1:
-        expt_offs[1:] = group_sizes[:-1].cumsum(0).to(torch.int32)
-    expt_offs_sum = group_sizes.sum().to(torch.int32).unsqueeze(0)
-    entries = []
-    for e in range(E):
-        n_blocks = triton.cdiv(int(group_sizes[e].item()), block_m)
-        for b in range(n_blocks):
-            entries.append((b << 16) | e)
-    expt_data = (
-        torch.tensor(entries, dtype=torch.int32, device=device)
-        if entries
-        else torch.zeros(0, dtype=torch.int32, device=device)
+        expt_offs[1:] = gs[:-1].cumsum(0)
+    expt_offs_sum = gs.sum().unsqueeze(0)
+
+    # Build ExptData = (block_id << 16) | expert_id using tensor ops (no per-expert CPU sync).
+    n_blocks_per_expert = (gs + block_m - 1) // block_m  # cdiv without .item()
+    total_blocks = int(n_blocks_per_expert.sum().item())  # single sync at end
+
+    if total_blocks == 0:
+        return (
+            expt_hist,
+            expt_offs,
+            expt_offs_sum,
+            torch.zeros(0, dtype=torch.int32, device=device),
+            0,
+        )
+
+    # expert_id for each block slot
+    block_cumsum = torch.zeros(E + 1, dtype=torch.int64, device=device)
+    block_cumsum[1:] = n_blocks_per_expert.cumsum(0)
+    block_ids = torch.arange(total_blocks, device=device, dtype=torch.int64)
+    expert_for_block = torch.bucketize(block_ids, block_cumsum[1:], right=True).clamp(
+        max=E - 1
     )
-    return expt_hist, expt_offs, expt_offs_sum, expt_data, len(entries)
+    local_block_id = block_ids - block_cumsum[expert_for_block]
+
+    expt_data = ((local_block_id << 16) | expert_for_block).to(torch.int32)
+    return expt_hist, expt_offs, expt_offs_sum, expt_data, total_blocks
