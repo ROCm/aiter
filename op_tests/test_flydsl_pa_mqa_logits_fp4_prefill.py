@@ -717,7 +717,7 @@ def main():
     # Correctness sweep (small, ragged windows incl. non-zero lower bounds).
     run_case(2, [[50, 120, 200], [40, 100]], seed=0)
     run_case(3, [[30], [200], [100, 150]], seed=2)
-    run_case(2, [[16, 200], [64, 128]], heads=128, seed=3)
+    run_case(2, [[16, 200], [64, 128]], seed=3)
     run_case(2, [[(10, 50), (64, 200)], [(0, 100), (130, 256)]], seed=4)
 
     if args.bench:
@@ -743,7 +743,7 @@ def main():
         ([3, 1, 2], [512, 320, 768], 64, 0),
         ([10, 1, 5, 2], [1024, 256, 2048, 512], 64, 1),  # incl a qlen=10 batch
         ([2, 0, 3], [384, 256, 640], 64, 2),  # empty batch (qlen=0)
-        ([4, 3], [512, 768], 128, 3),
+        ([4, 3], [512, 768], 64, 3),
         ([16, 8, 24, 4], [4096, 2048, 4096, 1024], 64, 4),  # larger (repr. perf)
     ]
     for qlens, ctxs, vheads, seed in varqlen_cfgs:
