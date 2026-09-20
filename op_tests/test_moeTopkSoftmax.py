@@ -833,9 +833,7 @@ for token in reg_tokens:
     df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
-aiter.logger.info(
-    "moeTopkSoftmax_reg_grouped_topk summary (markdown):\n%s", df_md
-)
+aiter.logger.info("moeTopkSoftmax_reg_grouped_topk summary (markdown):\n%s", df_md)
 
 # Test shared expert sigmoid scoring
 aiter.logger.info("\n" + "=" * 70)
