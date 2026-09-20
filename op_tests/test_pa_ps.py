@@ -138,6 +138,7 @@ def torch_mha_extend(
     qo_indptr,
     k_scale=None,  # [num_heads, num_blocks * block_size] for per-token, [num_blocks, num_heads] for per-block
     v_scale=None,  # [num_heads, num_blocks * block_size] for per-token, [num_blocks, num_heads] for per-block
+    is_causal=True,
 ):
     num_blocks, num_heads, head_size, block_size = v_cache.shape
     sm_scale = 1.0 / (head_size**0.5)
@@ -188,7 +189,7 @@ def torch_mha_extend(
             else:
                 # per-token: v_scale is [num_heads, total_tokens]
                 v *= v_scale[:, idx].t().unsqueeze(-1)
-        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
+        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
         os.append(o)
     o = torch.concat(os)
     return o
@@ -437,12 +438,16 @@ def test_pa_ps(
     dump_metadata: bool = False,
     profile_ps: bool = False,
     quant_type: QuantType = QuantType.per_Token,
+    test_case=None,
 ) -> dict:
     ret = {}
     seed = 0
     device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
+    kv_dtype, mask = (aiter.dtypes.fp8, 1) if test_case is None else test_case
+    if test_case is not None:
+        quant_type = QuantType.No if kv_dtype == dtype else QuantType.per_Token
 
     assert num_query_heads % num_kv_heads == 0
 
@@ -511,18 +516,22 @@ def test_pa_ps(
         block_tables,
         seq_lens_kv,
         qo_indptr,
+        is_causal=bool(mask),
     )
 
     scale = float(1.0 / (head_size**0.5))
 
     # ################## quant start ######################
-    if quant_type in [
+    if quant_type == QuantType.No:
+        k_quant_, v_quant_ = k_cache, v_cache
+        k_scale_ = v_scale_ = k_scale_asm = v_scale_asm = None
+    elif quant_type in [
         QuantType.per_1x128,
         QuantType.per_256x128,
         QuantType.per_1024x128,
     ]:
         k_quant_, k_scale_asm, v_quant_, v_scale_asm = perblock_quant_kvcache_symm(
-            k_cache, v_cache, quant_dtype=aiter.dtypes.fp8
+            k_cache, v_cache, quant_dtype=kv_dtype
         )
         # For per-block, k_scale_asm is [num_blocks, num_heads]
         k_scale_ = k_scale_asm
@@ -535,7 +544,7 @@ def test_pa_ps(
             v_scale_,
             k_scale_asm,
             v_scale_asm,
-        ) = pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
+        ) = pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=kv_dtype)
 
     # torch ref
     out_ref = torch_mha_extend(
@@ -547,6 +556,7 @@ def test_pa_ps(
         qo_indptr,
         k_scale_,
         v_scale_,
+        is_causal=bool(mask),
     )
 
     (
@@ -594,7 +604,7 @@ def test_pa_ps(
             torch.tensor([0], dtype=torch.int32),
             1,
             1,
-            True,
+            bool(mask),
             work_metadata_ptrs,
             work_indptr,
             work_info,
@@ -618,7 +628,7 @@ def test_pa_ps(
             seq_lens_kv,
             num_query_heads // num_kv_heads,
             num_kv_heads,
-            True,
+            bool(mask),
             work_metadata_ptrs,
             work_indptr,
             work_info,
@@ -668,7 +678,8 @@ def test_pa_ps(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             softmax_scale=scale,
-            mask=1,
+            mask=mask,
+            quant_type=quant_type,
         )
 
         _, us_pa_nops = run_aiter_asm(
@@ -710,7 +721,8 @@ def test_pa_ps(
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
                 softmax_scale=scale,
-                mask=1,
+                mask=mask,
+                quant_type=quant_type,
             )
         )
 
@@ -770,7 +782,7 @@ def test_pa_ps(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             softmax_scale=scale,
-            mask=1,
+            mask=mask,
             quant_type=quant_type,
         )
 
@@ -810,6 +822,13 @@ def test_pa_ps(
         ret["us_asm_fp8"] = us_aiter_asm
         ret["err fp8"] = err
 
+    if test_case is not None:
+        assert torch.isfinite(out_ref).all(), "Non-finite reference output"
+        assert torch.isfinite(output).all(), f"Non-finite output: {kv_dtype}, mask={mask}"
+        assert err == 0, f"Accuracy check failed: {kv_dtype}, mask={mask} ({err})"
+        ret["err"] = ret.pop("err fp8")
+        if "us_asm_fp8" in ret:
+            ret["us_asm"] = ret.pop("us_asm_fp8")
     return ret
 
 
@@ -924,30 +943,61 @@ quant_type_map = {
 }
 l_quant_type = quant_type_map.get(args.quant_type, QuantType.per_Token)
 
+if 16 in args.block_size:
+    if not device_properties.gcnArchName.startswith("gfx950"):
+        raise ValueError("The page16 PS code objects require gfx950")
+    if args.head_dim != 128 or args.quant_type != "per_Token":
+        raise ValueError("The page16 PS matrix requires -hd 128 --quant_type per_Token")
+
+all_results = []
 for dtype in args.dtype:
     df = []
     for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
         args.num_heads, args.qlen, args.ctx_len, args.batch_size, args.block_size
     ):
-        ret = test_pa_ps(
-            ctx_len,
-            batch_size,
-            num_heads,
-            args.head_dim,
-            block_size,
-            dtype,
-            qlen,
-            args.varlen,
-            args.load_metadata,
-            args.dump_metadata,
-            args.profile,
-            getattr(QuantType, args.quant_type),
-        )
-        df.append(ret)
+        test_cases = [None]
+        if block_size == 16:
+            if (
+                dtype not in (torch.bfloat16, torch.float16)
+                or num_heads[1] <= 0
+                or num_heads[0] % num_heads[1]
+                or num_heads[0] // num_heads[1] not in (8, 16)
+                or not 1 <= qlen <= 4
+            ):
+                raise ValueError("The page16 PS matrix requires BF16/FP16, GQA8/16 and query length 1..4")
+            kv_dtypes = [dtype, aiter.dtypes.fp8, torch.int8]
+            if qlen > 2 and num_heads[0] // num_heads[1] == 16:
+                kv_dtypes = [aiter.dtypes.fp8, torch.int8]
+            test_cases = [
+                (kv_dtype, mask)
+                for kv_dtype in kv_dtypes
+                for mask in ([0, 1] if qlen > 2 else [1])
+            ]
+        for test_case in test_cases:
+            ret = test_pa_ps(
+                ctx_len,
+                batch_size,
+                num_heads,
+                args.head_dim,
+                block_size,
+                dtype,
+                qlen,
+                args.varlen,
+                args.load_metadata,
+                args.dump_metadata,
+                args.profile,
+                getattr(QuantType, args.quant_type),
+                test_case=test_case,
+            )
+            df.append(ret)
     df = pd.DataFrame(df)
     df = df.drop(
-        columns=["load_metadata", "dump_metadata", "profile_ps"], errors="ignore"
+        columns=["load_metadata", "dump_metadata", "profile_ps", "test_case"], errors="ignore"
     )
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
     df.to_csv("pa_ps.csv")
+    all_results.append(df)
+
+if 16 in args.block_size:
+    pd.concat(all_results, ignore_index=True).to_csv("pa_ps.csv", index=False)
