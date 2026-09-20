@@ -16,6 +16,7 @@ from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
     fused_moe,
+    fused_topk,
     get_2stage_cfgs,
     get_padded_M,
     torch_moe_stage1,
@@ -75,100 +76,6 @@ def parse_num_expert_activated():
 
 
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
-
-_HERD_FALSEY = ("", "0", "false", "False")
-
-
-def _herd_selector_requested():
-    """HERD overlay: AITER_FLYDSL_USE_HERD or AITER_TRITON_USE_HERD."""
-    return (
-        os.environ.get("AITER_FLYDSL_USE_HERD", "") not in _HERD_FALSEY
-        or os.environ.get("AITER_TRITON_USE_HERD", "") not in _HERD_FALSEY
-    )
-
-
-def _atom_biased_grouped_topk(gating_output, topk, renormalize=True, bias=None):
-    """ATOM Kimi-K3 selector: FusedMoE.select_experts → biased_grouped_topk.
-
-    Matches ``atom/model_ops/moe.py`` with ``use_grouped_topk=True``,
-    ``scoring_func=sigmoid``, ``e_score_correction_bias`` set,
-    ``num_expert_group=1``, ``topk_group=1``. ATOM never calls
-    ``aiter.fused_moe.fused_topk`` / ``topk_softmax`` on this path.
-    E/group=896>32 so ``biased_grouped_topk`` always launches
-    ``biased_grouped_topk_hip``.
-    """
-    M, E = gating_output.shape
-    if bias is None:
-        bias = torch.zeros((E,), dtype=gating_output.dtype, device=gating_output.device)
-    topk_ids = torch.empty((M, topk), dtype=torch.int32, device=gating_output.device)
-    topk_weights = torch.empty(
-        (M, topk), dtype=torch.float32, device=gating_output.device
-    )
-    aiter.biased_grouped_topk(
-        gating_output,
-        bias,
-        topk_weights,
-        topk_ids,
-        1,
-        1,
-        renormalize,
-        1.0,
-    )
-    return topk_weights, topk_ids
-
-
-def _select_topk(hidden_states, gating_output, topk, renormalize=True, bias=None):
-    """ATOM biased_grouped_topk, or FlyDSL HERD min-unique overlay when env is set.
-
-    HERD is a decode-sized min-unique selector (top-(k+1) then drop) on the
-    same sigmoid+bias scores ATOM uses. It cannot run when the expert set is
-    already pinned (BALANCE / NUM_EXPERT_ACTIVATED), when k+1 > E, or outside
-    [MIN_M, MAX_M] — those fall through to biased_grouped_topk.
-    """
-    n_tokens, n_expts = gating_output.shape
-    if not _herd_selector_requested():
-        return _atom_biased_grouped_topk(gating_output, topk, renormalize, bias)
-
-    min_m = int(
-        os.environ.get(
-            "AITER_FLYDSL_HERD_MIN_M", os.environ.get("AITER_TRITON_HERD_MIN_M", "16")
-        )
-    )
-    max_m = int(
-        os.environ.get(
-            "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "128")
-        )
-    )
-    skip = None
-    gfx = get_gfx()
-    if gfx not in ("gfx950", "gfx1250"):
-        skip = f"arch {gfx} (need gfx950/gfx1250)"
-    elif AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
-        skip = "AITER_MOE_NUM_EXPERT_ACTIVATED pins the expert set"
-    elif AITER_MOE_EXPERT_BALANCE:
-        skip = "AITER_MOE_EXPERT_BALANCE pins the expert set"
-    elif topk >= n_expts:
-        skip = f"topk={topk} >= E={n_expts} (HERD needs k+1 <= E)"
-
-    if skip is not None:
-        aiter.logger.warning(
-            "HERD selector skipped (%s); using biased_grouped_topk", skip
-        )
-        return _atom_biased_grouped_topk(gating_output, topk, renormalize, bias)
-    if not (min_m <= n_tokens <= max_m):
-        return _atom_biased_grouped_topk(gating_output, topk, renormalize, bias)
-
-    from aiter.ops.flydsl.herd_topk import herd_topk_gating, herd_topk_gating_supported
-
-    M, E = gating_output.shape
-    if bias is None:
-        bias = torch.zeros((E,), dtype=gating_output.dtype, device=gating_output.device)
-    weights = torch.empty((M, topk), dtype=torch.float32, device=gating_output.device)
-    ids = torch.empty((M, topk), dtype=torch.int32, device=gating_output.device)
-    if not herd_topk_gating_supported(weights, ids, gating_output, bias, "sigmoid"):
-        return _atom_biased_grouped_topk(gating_output, topk, renormalize, bias)
-    herd_topk_gating(weights, ids, gating_output, bias, renormalize, 1.0, "sigmoid")
-    return weights, ids
 
 
 @benchmark()
@@ -247,7 +154,6 @@ def test_fmoe(
         slot = torch.arange(token * topk) % n_act  # round-robin over active set
         rows = torch.arange(token).repeat_interleave(topk)
         score[rows, sel[slot]] = 1.0
-        router_bias = torch.zeros((E,), dtype=dtype)
     elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
@@ -256,24 +162,10 @@ def test_fmoe(
             score[token_id, start_col:end_col] = 1.0
             start_col = end_col % E
             end_col = start_col + topk
-        router_bias = torch.zeros((E,), dtype=dtype)
     else:
         score = torch.randn((token, E), dtype=dtype)
-        # ATOM Kimi-K3: gate.e_score_correction_bias is bf16 [E]
-        router_bias = torch.randn((E,), dtype=dtype)
 
-    topk_weights, topk_ids = _select_topk(input, score, topk, True, bias=router_bias)
-    unique_expts = int(torch.unique(topk_ids[:token].long()).numel())
-    _, us_selector = run_perftest(
-        _select_topk,
-        input,
-        score,
-        topk,
-        True,
-        num_iters=20,
-        num_warmup=3,
-        bias=router_bias,
-    )
+    topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -616,9 +508,6 @@ def test_fmoe(
             kernel_us[_name] = _us
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
-        us_sort = kernel_us.get("sort")
-        us_moe = (us1 or 0.0) + (us2_stage or 0.0)
-        us_total = (us_selector or 0.0) + (us_sort or 0.0) + us_moe
         if not kernel_us:
             logger.warning(
                 "kernel_bench: no kernels captured (non-2stage/1stage path?) (quant:%s)",
@@ -626,26 +515,15 @@ def test_fmoe(
             )
         else:
             logger.info(
-                "e2e breakdown: selector=%.2f us, sort=%s us, "
-                "stage1=%s us, stage2=%s us, moe=%.2f us, total=%.2f us "
-                "(unique=%s, quant:%s)",
-                us_selector,
-                "n/a" if us_sort is None else f"{us_sort:.2f}",
+                "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
                 "n/a" if us1 is None else f"{us1:.2f}",
                 "n/a" if us2_stage is None else f"{us2_stage:.2f}",
-                us_moe,
-                us_total,
-                unique_expts,
                 AQDType,
             )
         return {
-            "us": us_total,
-            "us_selector": us_selector,
-            "us_sort": us_sort,
-            "us_moe": us_moe,
+            "us": (us1 or 0.0) + (us2_stage or 0.0),
             "us_stage1": us1,
             "us_stage2": us2_stage,
-            "unique_expts": unique_expts,
         }
 
     out2_ck, us2 = run_perftest(
@@ -697,13 +575,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {
-        "us": (us_selector or 0.0) + us2,
-        "us_selector": us_selector,
-        "us_moe_e2e": us2,
-        "logits_diff": float(logits_diff),
-        "unique_expts": unique_expts,
-    }
+    return {"us": us2, "logits_diff": float(logits_diff)}
 
 
 l_quant = [
@@ -1425,7 +1297,7 @@ def test_output_buffer_contract():
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
     gating = torch.randn((token, E), dtype=dtype)
-    topk_weights, topk_ids = _select_topk(hidden, gating, topk, True)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
     args = (hidden, w1, w2, topk_weights, topk_ids)
 
     ref = fused_moe(*args)
