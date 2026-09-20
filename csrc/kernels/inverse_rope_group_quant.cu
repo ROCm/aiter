@@ -973,9 +973,26 @@ __global__ void inverse_rope_group_quant_kernel(
         {
             if(!pass_is_rope(k))
             {
-                const float amax = reduce_amax_across_group(fmaxf(
-                    slice_amax_native<scalar_t, THREAD_DATA_SIZE>(in_vec[k]),
-                    kAbsmaxFloor));
+                float native_amax =
+                    slice_amax_native<scalar_t, THREAD_DATA_SIZE>(in_vec[k]);
+                if constexpr(kWideRow128)
+                {
+                    // Below the original streaming crossover, preserve the
+                    // untiered f32 reduction's handling of a slice containing
+                    // both NaN and finite/Inf values. Packed integer max picks
+                    // NaN first; fmaxf would retain the other magnitudes.
+                    if(static_cast<int64_t>(S) * H * HEAD_DIM < (int64_t{1} << 28) &&
+                       __builtin_isnan(native_amax))
+                    {
+                        native_amax = 0.0f;
+#pragma unroll
+                        for(int i = 0; i < THREAD_DATA_SIZE; ++i)
+                            native_amax = fmaxf(native_amax,
+                                fabsf(static_cast<float>(in_vec[k][i])));
+                    }
+                }
+                const float amax = reduce_amax_across_group(
+                    fmaxf(native_amax, kAbsmaxFloor));
                 const E8m0BlockScale s8 =
                     fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp,
                                                kHwFp8E4m3>(amax);
@@ -1312,14 +1329,16 @@ void inverse_rope_group_quant(
     constexpr int HEAD_DIM_T = 512;
     constexpr int RD_T = 64;
 
-    // At least 512 MiB of input amortizes the half-head tier and its second
-    // pass. Each 4096-element span is exactly two waves times two passes at
-    // TDS=32. Small G did not benefit at large S, so keep that case and
-    // smaller workloads on the four-wave, untiered path.
+    // Each 4096-element span is two waves times two half-head passes at
+    // TDS=32. With G >= 8, fixed D=4096 geometry amortizes this path from
+    // 32 MiB of input. Wider rows and G=4 retain the 512 MiB crossover;
+    // smaller G stays untiered because it did not benefit from this schedule.
+    const int64_t input_elems = static_cast<int64_t>(S) * H * HEAD_DIM_T;
     const bool row128_stream =
         scale_layout == kScaleRowMajor && quant_group_size == 128 &&
         has_tdm_arch() && G >= 4 && D >= 4096 && D % 4096 == 0 &&
-        static_cast<int64_t>(S) * H * HEAD_DIM_T >= (int64_t{1} << 28);
+        (input_elems >= (int64_t{1} << 28) ||
+         (D == 4096 && G >= 8 && input_elems >= (int64_t{1} << 24)));
 
     // The whole-row-block tier (md 18.14/18.16.6) is retired: its band was
     // gated on `wide_waves >= simds*32 && wide_waves < simds*32`, which is
