@@ -203,6 +203,14 @@ def test_relu2(m, n, dtype, output_dtype=None):
     ret = {}
     input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
     out_dtype = output_dtype if output_dtype is not None else dtype
+    if out_dtype != dtype:
+        raise ValueError(
+            "test_relu2 does not support output_dtype != dtype: relu2_wrapper "
+            "always allocates `out` with the same dtype as `input` "
+            "(torch.empty_like(input)), so a differing output_dtype would "
+            "silently compare a mis-cast reference against a same-dtype "
+            "kernel output."
+        )
 
     out, us_aiter = run_perftest(relu2_wrapper, input)
     ref, us_torch = run_perftest(torch_relu2_ref, input)
