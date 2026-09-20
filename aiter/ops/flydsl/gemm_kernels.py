@@ -247,7 +247,7 @@ def _get_preshuffle_split_buffers(
 def _check_preshuffle_split_capacity(
     m: int, n: int, tile_m: int, tile_n: int, split_k: int
 ) -> None:
-    tiles = ((m + tile_m - 1) // tile_m) * (n // tile_n)
+    tiles = ((m + tile_m - 1) // tile_m) * ((n + tile_n - 1) // tile_n)
     if tiles > PRESHUFFLE_SPLIT_K_MAX_TILES:
         raise RuntimeError(
             f"[FlyDSL] split_k needs {tiles} tile semaphores, "
@@ -289,10 +289,13 @@ def flydsl_preshuffle_gemm_a8(
             f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
             f"views A and C through a layout bounded by that many rows."
         )
-    if n % tile_n != 0:
+    if n % 16 != 0:
         raise RuntimeError(
-            f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "
-            f"Arguments not supported! Skipping gemm!"
+            f"[FlyDSL] N ({n}) must be a multiple of 16 for preshuffled B."
+        )
+    if n % tile_n != 0 and split_k > 1:
+        raise RuntimeError(
+            f"[FlyDSL] ragged N ({n}) does not support split_k ({split_k})."
         )
     if split_k < 1 or k % split_k != 0:
         raise RuntimeError(

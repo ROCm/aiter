@@ -195,22 +195,26 @@ def _padded_m(M: int) -> int:
 def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     """Whether a preshuffle candidate is worth tuning for this shape.
 
-    Every predicate is verbatim from the tuner's inline filter, in the original
-    order, so the enumerated candidate set is unchanged. **Do not tune these
-    here**: they decide the search space, so relaxing or tightening any of them
-    invalidates the committed tuned CSVs and requires a re-tune. It lives beside
-    ``kernels_list`` only so both a8w8 bpreshuffle pipelines expose the same
-    ``(kernels_list, kernel_fits_shape)`` pair.
+    Ragged M is legal: the device kernel bounds A, scale-A, and C buffer
+    descriptors to the runtime M extent and masks overhanging rows. Ragged N is
+    legal for non-split kernels when N remains a multiple of the 16-column
+    preshuffle group. K remains a tile-divisibility requirement. Changes here
+    alter the tuner search space and therefore require affected model shapes to
+    be re-tuned.
     """
     if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
         return False
-    if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+    if N % 16 != 0 or K % ki.tile_k != 0:
+        return False
+    if N % ki.tile_n != 0 and ki.k_split > 1:
         return False
     if ki.k_split > 1 and (K // ki.tile_k) % ki.k_split != 0:
         return False
-    if _padded_m(M) % ki.tile_m != 0:
+    # Preserve the bounded decode search space. Ragged-M candidates target the
+    # large-M wave-quantization cliffs where tile-row waste is small.
+    if M < 2048 and _padded_m(M) % ki.tile_m != 0:
         return False
-    num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+    num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * ((N + ki.tile_n - 1) // ki.tile_n)
     if num_ctas < max(4, min(16, N // 64)):
         return False
     if ki.tile_m == 16 and ki.tile_n == 512:
@@ -271,6 +275,13 @@ _base_tiles_950_extra = [
     (256, 256, 128),
 ]
 
+_base_tiles_950_2wave = [
+    (16, 32, 512),
+    (32, 32, 512),
+    (16, 32, 1024),
+    (32, 32, 1024),
+]
+
 # ---------------------------------------------------------------------------
 # Combo sweep: lds_stage x waves_per_eu x async_copy x xcd_swizzle
 # ---------------------------------------------------------------------------
@@ -295,7 +306,9 @@ _MFMA_N = 16
 _THREADS_PER_TG = _WAVES_PER_WG * 64
 
 
-def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
+def _estimate_max_wpe(
+    tile_m: int, tile_n: int, tile_k: int, total_vgpr: int = 512
+) -> int:
     """Estimate max achievable waves_per_eu from C-accumulator VGPR pressure.
 
     Preshuffle GEMM always uses 16x16 MFMA (4 VGPRs per thread per block).
@@ -306,6 +319,16 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
     padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
     padded_n = math.ceil(tile_n / _MFMA_N) * _MFMA_N
     c_per_thread = padded_m * padded_n // _THREADS_PER_TG
+    if tile_n == 32 and tile_k >= 1024:
+        # The 2-wave K=1024 path keeps two A-side and two B-side fragments
+        # live. Model those operands explicitly so wpe=3/4 candidates that
+        # must spill are pruned before compilation.
+        threads = 2 * 64
+        operand_vgpr = (
+            2 * (tile_m + tile_n) * tile_k // threads // 4
+        )
+        est_per_wave = operand_vgpr + c_per_thread * 1.5 + 32
+        return int(total_vgpr / max(est_per_wave, 1))
     est_per_wave = c_per_thread * 1.5
     return int(total_vgpr / max(est_per_wave, 1))
 
@@ -314,6 +337,9 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
 # are enumerated rather than hardcoded.
 K_SPLIT_MIN_TILES_PER_SLICE = 2  # keep the ping-pong loop fed
 K_SPLIT_MAX_CTA_OVERSUBSCRIBE = 4  # no point going far past one CU each
+# Mirrors gemm_kernels.PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS without importing
+# the runtime launcher (which would create a tune-space import cycle).
+K_SPLIT_WORKSPACE_ELEMS = 4 * 256 * 32 * 128
 
 
 def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[int]:
@@ -325,27 +351,36 @@ def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[in
     """
     if ki.k_split != 1 or K % ki.tile_k:
         return []
-    base_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+    if N % ki.tile_n:
+        return []
+    base_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (
+        (N + ki.tile_n - 1) // ki.tile_n
+    )
     if base_ctas >= cu_num:
         return []
     n_tiles = K // ki.tile_k
     max_split = min(
         n_tiles // K_SPLIT_MIN_TILES_PER_SLICE,
         max(2, cu_num * K_SPLIT_MAX_CTA_OVERSUBSCRIBE // base_ctas),
+        K_SPLIT_WORKSPACE_ELEMS // (M * N),
     )
+    if max_split < 2:
+        return []
     return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
 
 
-def _build_kernels_list(tiles, total_vgpr=512):
+def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):
     kl = {}
-    idx = 0
+    idx = start_idx
 
     for lds in _LDS_STAGES:
         for wpe in _WAVES_PER_EU:
             for acp in _ASYNC_COPY_VALS:
                 for xcd in _XCD_SWIZZLE_VALS:
                     for tm, tn, tk in tiles:
-                        if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
+                        if wpe > 0 and wpe > _estimate_max_wpe(
+                            tm, tn, tk, total_vgpr
+                        ):
                             continue
                         kl[idx] = _ki(tm, tn, tk, acp, wpe, xcd, lds_stage=lds)
                         idx += 1
@@ -358,6 +393,13 @@ kernels_list_942 = _build_kernels_list(
 kernels_list_950 = _build_kernels_list(
     _base_tiles_common + _base_tiles_950_extra,
     total_vgpr=_vgpr_per_simd("gfx950"))
+kernels_list_950.update(
+    _build_kernels_list(
+        _base_tiles_950_2wave,
+        total_vgpr=_vgpr_per_simd("gfx950"),
+        start_idx=max(kernels_list_950) + 1,
+    )
+)
 # fmt: on
 
 default_kernels_dict_942 = {

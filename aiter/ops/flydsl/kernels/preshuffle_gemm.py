@@ -26,6 +26,11 @@ from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
 
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k).
 _TILE_PRELOAD_TABLE = {
+    # ── 2-wave tile_n = 32 ──
+    (16, 32, 512): (4, 4),
+    (16, 32, 1024): (4, 4),
+    (32, 32, 512): (4, 4),
+    (32, 32, 1024): (4, 4),
     # ── tile_m = 16 ──
     (16, 64, 256): (2, 2),
     (16, 64, 512): (4, 4),
@@ -159,6 +164,15 @@ def compile_preshuffle_gemm(
         )
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
+    if N % 16 != 0:
+        raise ValueError(f"N must be a multiple of 16 for preshuffled B, got N={N}")
+    if tile_n != 32 and tile_n % 64 != 0:
+        raise ValueError(f"tile_n must be 32 or a multiple of 64, got tile_n={tile_n}")
+    n_padded = ((N + tile_n - 1) // tile_n) * tile_n
+    n_ragged = n_padded != N
+    is_two_wave = tile_n == 32
+    if n_ragged and split_k > 1:
+        raise ValueError("ragged N does not support split_k > 1")
     _has_epilogue = epilogue != "none"
     _has_bias = epilogue in ("bias", "bias_relu", "bias_silu", "bias_gelu")
     _has_relu = epilogue == "bias_relu"
@@ -200,12 +214,14 @@ def compile_preshuffle_gemm(
     k_iters = tile_k // tile_K_perm
     num_tiles = split_k_extent // tile_k
     m_repeat = tile_m // 16
-    num_waves = 4
+    # The standard path maps four waves along N. A 32-column tile needs two
+    # waves so each wave still owns one full 16-column MFMA atom.
+    num_waves = 2 if is_two_wave else 4
     n_per_wave = tile_n // num_waves
     num_acc_n = n_per_wave // 16
     acc_size = m_repeat * num_acc_n * 4
 
-    total_threads = 256
+    total_threads = num_waves * 64
     a_load_bytes = 16
     bytes_per_thread_a = (tile_m * tile_k * elem_bytes) // total_threads
     num_a_loads = bytes_per_thread_a // a_load_bytes
@@ -263,9 +279,13 @@ def compile_preshuffle_gemm(
             _scale_atom = fx.make_mma_atom(
                 fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, layout_elem)
             )
+            if const_expr(is_two_wave):
+                wave_layout = fx.make_layout((1, 2, 1), (0, 1, 0))
+            else:
+                wave_layout = fx.make_layout((1, 4, 1), (0, 1, 0))
             tiled_mma = fx.make_tiled_mma(
                 _scale_atom,
-                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                wave_layout,
                 fx.make_tile(None, None, fx.make_layout((32, 4), (1, 32))),
             )
         else:
@@ -281,7 +301,14 @@ def compile_preshuffle_gemm(
             max_size=False,
             num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes),
         )
-        gB = fx.rocdl.make_buffer_tensor(arg_b)
+        if const_expr(n_ragged):
+            gB = fx.rocdl.make_buffer_tensor(
+                arg_b,
+                max_size=False,
+                num_records_bytes=fx.Int64(N) * fx.Int64(K * elem_bytes),
+            )
+        else:
+            gB = fx.rocdl.make_buffer_tensor(arg_b)
         c_tensor = arg_c
         if const_expr(split_k > 1):
             c_split_offset = fx.Int64(bid_z) * fx.Int64(i32_m) * fx.Int64(N)
@@ -677,7 +704,15 @@ def compile_preshuffle_gemm(
             s_a = s_b = bias = None
             if const_expr(is_8bit):
                 # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
-                sb_tiles = _epi_tiles(arg_scale_b, 1)
+                if const_expr(n_ragged):
+                    sb_tiles = _epi_tiles(
+                        arg_scale_b,
+                        1,
+                        max_size=False,
+                        num_records_bytes=N * 4,
+                    )
+                else:
+                    sb_tiles = _epi_tiles(arg_scale_b, 1)
                 sb_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Float32)
                 s_b = [
                     _epi_read1(
@@ -707,7 +742,15 @@ def compile_preshuffle_gemm(
             if const_expr(_has_bias):
                 # Per-column bias (out_dtype), one scalar per N-block, shared across rows.
                 bias_elem_ty = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
-                bias_tiles = _epi_tiles(arg_bias, 1)
+                if const_expr(n_ragged):
+                    bias_tiles = _epi_tiles(
+                        arg_bias,
+                        1,
+                        max_size=False,
+                        num_records_bytes=N * 2,
+                    )
+                else:
+                    bias_tiles = _epi_tiles(arg_bias, 1)
                 bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(0), bias_elem_ty)
                 bias = [
                     fx.Float32(
@@ -785,7 +828,48 @@ def compile_preshuffle_gemm(
             out_vec = fx.Vector.from_elements(out_elems, out_elem_cls)
             frag_C_out.store(out_vec)
 
-        fx.copy(buf_copy_out, frag_C_retile, pC_g)
+        if const_expr(n_ragged):
+            # pC_g uses a padded-N tile layout to form the accumulator fragment,
+            # but the real output is row-major with runtime stride i32_n. Store
+            # each lane explicitly and redirect tail columns to the descriptor's
+            # one-past-end element so the hardware drops them.
+            c_tiles = _epi_tiles(
+                arg_out,
+                1,
+                max_size=False,
+                num_records_bytes=(
+                    fx.Int64(i32_m) * fx.Int64(i32_n) * fx.Int64(out_elem_bytes)
+                ),
+            )
+            scalar_out = fx.make_rmem_tensor(fx.make_layout(1, 1), out_elem_cls)
+            scalar_atom = fx.make_copy_atom(
+                (
+                    fx.rocdl.BufferCopy32b(out_cpol)
+                    if split_k > 1
+                    else fx.rocdl.BufferCopy16b(out_cpol)
+                ),
+                out_elem_cls,
+            )
+            final_values = Vec(frag_C_out.load())
+            oob = fx.Int32(i32_m * i32_n)
+            for p in range_constexpr(acc_size):
+                ni = p // (m_repeat * 4)
+                mi = (p // 4) % m_repeat
+                ii = p % 4
+                row = bx_m + mi * 16 + lane_div_16 * 4 + ii
+                col = by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16
+                c_index = fx.Int32(row * i32_n + col)
+                safe_index = (col < i32_n).select(c_index, oob)
+                fx.memref_store_vec(
+                    Vec.filled(1, final_values[p], out_elem_cls), scalar_out
+                )
+                fx.copy(
+                    scalar_atom,
+                    scalar_out,
+                    fx.slice(c_tiles, (None, safe_index)),
+                )
+        else:
+            fx.copy(buf_copy_out, frag_C_retile, pC_g)
         if const_expr(split_k > 1):
             # The store carries sc0|sc1, so waiting on it is the whole release.
             rocdl.s_waitcnt(0)
@@ -844,10 +928,12 @@ def compile_preshuffle_gemm(
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, layout_elem))
             k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
 
+        if const_expr(is_two_wave):
+            wave_layout = fx.make_layout((1, 2, 1), (0, 1, 0))
+        else:
+            wave_layout = fx.make_layout((1, 4, 1), (0, 1, 0))
         tiled_mma = fx.make_tiled_mma(
-            mma_atom,
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
-            fx.make_tile(None, None, k_perm),
+            mma_atom, wave_layout, fx.make_tile(None, None, k_perm)
         )
 
         # G2S tiled copy
@@ -867,7 +953,7 @@ def compile_preshuffle_gemm(
         kp_bytes = 16
         kp_elems = kp_bytes if elem_bytes == 1 else kp_bytes // elem_bytes
         k_bytes_b = K * elem_bytes
-        n0 = N // 16
+        n0 = n_padded // 16
         k0 = k_bytes_b // 64
         s_nlane = kp_elems
         s_klane = 16 * s_nlane
@@ -888,11 +974,18 @@ def compile_preshuffle_gemm(
             fx.make_view(fx.get_iter(arg_a), fx.make_layout((M_max, K), (K, 1)))
         )
         arg_c_2d = fx.Tensor(
-            fx.make_view(fx.get_iter(arg_c), fx.make_layout((M_max, N), (N, 1)))
+            fx.make_view(
+                fx.get_iter(arg_c),
+                fx.make_layout((M_max, n_padded), (n_padded, 1)),
+            )
         )
 
         gx = (i32_m + (tile_m - 1)) // tile_m
-        gy = i32_n // tile_n
+        gy = (
+            (i32_n + (tile_n - 1)) // tile_n
+            if const_expr(n_ragged)
+            else i32_n // tile_n
+        )
 
         kernel_gemm(
             arg_c_2d,
@@ -910,7 +1003,7 @@ def compile_preshuffle_gemm(
             value_attrs={"rocdl.waves_per_eu": waves_per_eu},
         ).launch(
             grid=(gx, gy, split_k),
-            block=(256, 1, 1),
+            block=(total_threads, 1, 1),
             stream=stream,
         )
 
