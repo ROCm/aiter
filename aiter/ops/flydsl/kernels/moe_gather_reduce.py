@@ -116,7 +116,6 @@ def build_moe_gather_reduce_module(
     out_dwords = model_dim // 2  # dwords per output row (also the source row width)
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
-    sk_i32 = fx.Int32(split_k)
 
     module_name = format_kernel_name(
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
@@ -153,7 +152,6 @@ def build_moe_gather_reduce_module(
         vec_i32 = fx.Uint32(VEC)
         num_tokens_i32 = fx.Uint32(num_tokens)
         bid_i32 = fx.Uint32(bid)
-        slice_stride_dw_i32 = fx.Uint32(slice_stride_dw)
 
         num_valid_tokens_is_set = fx.Int64(ptrtoint(num_valid_tokens)) != 0
         valid_token_count = num_tokens_i32
@@ -172,46 +170,50 @@ def build_moe_gather_reduce_module(
             rows_lds = route_lds.rows.ptr
             wbits_lds = route_lds.w_bits.ptr
             tid_u32 = fx.Uint32(tid)
-            # First row past the end of the flat tensor. A dropped EP route
-            # (DROPPED_ROUTE_ROW) owns no grouped row, and steering it to row 0
-            # would read bytes stage2 need never have written -- a stale NaN
-            # there survives the multiply by the route's (zero) weight. Sending
-            # it out of range instead makes the resource's num_records return 0,
-            # which is what the per-row zero-sized descriptor used to do.
-            oob_row_i32 = fx.Int32(slice_stride_dw) * sk_i32 // fx.Int32(out_dwords)
-
             if tid_u32 < topk_i32:
                 map_off = map_base + tid_u32
-                raw_row = fx.Int32(rows_t[map_off])
-                is_mapped = raw_row >= fx.Int32(0)
-                row_i32 = is_mapped.select(raw_row, oob_row_i32)
+                # DROPPED_ROUTE_ROW (-1) is kept as-is: it owns no grouped row,
+                # and the zero-length descriptor below is what switches its
+                # loads off. Clamping it to a real row instead would read bytes
+                # stage2 need never have written, and a stale NaN there survives
+                # the multiply by the route's (zero) weight.
+                row_i32 = fx.Int32(rows_t[map_off])
                 _lds_si32(rows_lds, row_i32, tid)
                 # .to(Float32) is a no-op when the route weights are already f32.
                 w_f32 = w_dt_fx(w_t[map_off]).to(fx.Float32)
                 _lds_si32(wbits_lds, w_f32.bitcast(fx.Int32), tid)
             gpu.barrier()
 
-            flat_bytes = fx.Int32(slice_stride_dw) * sk_i32 * fx.Int32(4)
-            in_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                in_base_i64, num_records_bytes=flat_bytes
-            )
-
             thread_id = fx.Uint32(tid)
             iter_idx_i32 = fx.Uint32(fx.block_idx.y)
 
-            def _row_weight(k):
-                row_u32 = fx.Uint32(_lds_li32(rows_lds, k))
-                w_f32 = _lds_li32(wbits_lds, k).bitcast(fx.Float32)
-                return row_u32, w_f32
+            row_bytes_i32 = fx.Int32(out_dwords * 4)
 
-            # One flat descriptor for the whole grouped tensor, indexed in
-            # dwords, instead of a per-row descriptor rebuilt on every access.
-            def load_flat(row_u32, sk, dw_off, vec_width):
-                off_dw = row_u32 * out_dwords_i32 + dw_off
+            def _row_weight(k):
+                row_i32 = _lds_li32(rows_lds, k)
+                w_f32 = _lds_li32(wbits_lds, k).bitcast(fx.Float32)
+                return row_i32, w_f32
+
+            # A descriptor per route rather than one for the whole tensor: the
+            # buffer offset is 32-bit, so a flat descriptor stops addressing
+            # once grouped_out passes 4 GiB, which at topk=6 is around 48k
+            # tokens. Folding the row into the 64-bit base keeps the offset
+            # inside one row. The base is loop-invariant, so this costs the
+            # address math once per route, not once per access.
+            def _row_rsrc(row_i32, sk):
+                mapped = row_i32 >= fx.Int32(0)
+                row_u64 = fx.Uint64(mapped.select(row_i32, fx.Int32(0)))
+                off_dw = row_u64 * fx.Uint64(out_dwords)
                 if sk != 0:
-                    off_dw = off_dw + sk * slice_stride_dw_i32
+                    off_dw = off_dw + fx.Uint64(sk) * fx.Uint64(slice_stride_dw)
+                return buffer_ops.create_buffer_resource_from_addr(
+                    in_base_i64 + off_dw * fx.Uint64(4),
+                    num_records_bytes=mapped.select(row_bytes_i32, fx.Int32(0)),
+                )
+
+            def load_flat(row_i32, sk, dw_off, vec_width):
                 return buffer_ops.buffer_load(
-                    in_rsrc, off_dw, vec_width=vec_width, dtype=i32
+                    _row_rsrc(row_i32, sk), dw_off, vec_width=vec_width, dtype=i32
                 )
 
             dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
@@ -225,10 +227,10 @@ def build_moe_gather_reduce_module(
                     frag = fx.make_fragment_like(fx.slice(out_vec_t, (0, None)))
 
                     for k in range_constexpr(topk):
-                        row_u32, w_f32 = _row_weight(k)
+                        row_i32, w_f32 = _row_weight(k)
                         red = [fx.Float32(0.0) for _ in range(2 * VEC)]
                         for sk in range_constexpr(split_k):
-                            raw_vec = fx.Vector(load_flat(row_u32, sk, dw_base, VEC))
+                            raw_vec = fx.Vector(load_flat(row_i32, sk, dw_base, VEC))
                             for lane in range_constexpr(VEC):
                                 raw_dw = fx.Uint32(raw_vec[lane])
                                 lo_f32, hi_f32 = _unpack_pair_to_f32(raw_dw, out_dtype)
@@ -260,12 +262,12 @@ def build_moe_gather_reduce_module(
                             acc_lo = fx.Float32(0.0)
                             acc_hi = fx.Float32(0.0)
                             for k in range_constexpr(topk):
-                                row_u32, w_f32 = _row_weight(k)
+                                row_i32, w_f32 = _row_weight(k)
                                 red_lo = fx.Float32(0.0)
                                 red_hi = fx.Float32(0.0)
                                 for sk in range_constexpr(split_k):
                                     raw_dw = fx.Uint32(
-                                        load_flat(row_u32, sk, dw_idx, 1)
+                                        load_flat(row_i32, sk, dw_idx, 1)
                                     )
                                     lo_f32, hi_f32 = _unpack_pair_to_f32(
                                         raw_dw, out_dtype

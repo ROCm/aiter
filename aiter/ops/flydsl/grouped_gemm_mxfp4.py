@@ -39,9 +39,10 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
     try:
-        requested_cluster_n = (
-            int(env_cluster_n) if env_cluster_n is not None else int(csv_cluster_n)
-        )
+        if env_cluster_n is not None:
+            requested_cluster_n = int(env_cluster_n)
+        else:
+            requested_cluster_n = int(csv_cluster_n)
     except (TypeError, ValueError) as exc:
         raise ValueError("AITER_FLYDSL_MXFP4_CLUSTER_N must be an integer") from exc
     if requested_cluster_n <= 1:
@@ -108,6 +109,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     row_major_ascale=0,
+    a_row_stride_bytes=0,
+    a_scale_row_stride_bytes=0,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -179,5 +182,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
         row_major_ascale=int(row_major_ascale),
+        a_row_stride_bytes=int(a_row_stride_bytes),
+        a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
     )
     return out
