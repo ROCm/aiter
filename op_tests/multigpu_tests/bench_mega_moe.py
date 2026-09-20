@@ -678,6 +678,11 @@ class DeviceMoEPipeline:
         ids, wts = self.routings[layer_idx]
         xn = _rmsnorm(x)  # keep the quantized activations in range across 61 layers
         if self.mega is not None:
+            next_ids = (
+                self.routings[layer_idx + 1][0]
+                if layer_idx + 1 < self.n_layers
+                else None
+            )
             y = self.mega(
                 xn,
                 wts,
@@ -686,6 +691,7 @@ class DeviceMoEPipeline:
                 w2=self.w2_a,
                 w1_scale=self.w1_s,
                 w2_scale=self.w2_s,
+                next_topk_ids=next_ids,
             )
             if self.sw1 is not None:
                 y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
@@ -717,6 +723,10 @@ class DeviceMoEPipeline:
 
     def _pipeline(self, x0):
         x = x0
+        if self.mega is not None:
+            prefetch = getattr(self.mega, "prefetch_compact_plan", None)
+            if prefetch is not None:
+                prefetch(self.routings[0][0])
         for layer_idx in range(self.n_layers):
             x = self._layer_step(x, layer_idx)
         return x
