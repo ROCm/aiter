@@ -403,11 +403,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         opus_mla_decode_fp8_16mx8_32nx1_kernel<decltype(traits)>
             <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
     };
-    // A work item is 8 waves x W_M = 128 packed Q rows, and a wave's 16 rows all belong to
-    // one query token only while H divides them evenly. When it does not (H = 10, 12, 24,
-    // ...), the causal bound differs inside a wave and the kernel needs its per-lane form --
-    // a third specialization axis, but only under causal, since that is the only thing the
-    // bound feeds. Non-causal and every H that is a multiple of W_M keep the original build.
+
     const bool wave_spans_tokens = (H % OpusTraits::W_M) != 0;
     if(causal && max_seqlen_q > 1)
     {

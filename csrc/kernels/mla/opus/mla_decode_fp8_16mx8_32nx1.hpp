@@ -603,18 +603,7 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
                  : "vcc");
 }
 
-// Last KV position the diagonal lets this lane's query row attend to. Loop-invariant and
-// costs an integer division, so it is evaluated once on entry; the cheap valid_kv_len
-// bound stays at the point of use instead, where it need not be kept live across the
-// pipeline.
-//
-// A wave owns Q_TILE_SIZE packed rows starting at warp_id * W_M, and the row a lane holds
-// is lane_id % W_M -- the MFMA's M index, the same one make_layout_o and the LSE store
-// use. Packed row p belongs to query token p / nhead.
-//
-// While nhead is a multiple of W_M every row of a wave lands on the same token, so the row
-// term drops out and the bound stays wave-uniform, i.e. in an SGPR. T::WAVE_SPANS_TOKENS
-// marks the head counts where it does not, and only those pay the extra live VGPR.
+
 template <typename T>
 __device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_id, int lane_id)
 {
@@ -626,9 +615,7 @@ __device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_i
     return row / nhead + causal_diagonal;
 }
 
-// Masks every score column past `last_valid_kv_pos` to -inf. The bound may be per lane
-// (each lane holds one query row, so under CAUSAL each has its own diagonal); it only ever
-// enters through `rel`, which is a VGPR regardless because k_pos depends on the lane.
+
 template <typename T, typename V>
 __device__ inline void
 attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t neg_inf_v)
@@ -960,26 +947,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
-    // Only the tiles that can actually contain invalid columns pay for a mask: the last
-    // partial tile of the request always, and for CAUSAL also every tile the diagonal
-    // reaches into. `bound` is the tighter of the two limits. Everything deciding *whether*
-    // to mask is workgroup-uniform so the branch stays scalar; `bound` itself is per lane
-    // once the diagonal is (see causal_kv_bound).
-    //
-    // The diagonal is not confined to the last tile. Query row 0 of the work item is bounded
-    // at causal_diagonal and the last row at valid_kv_len - 1, so the bounds span the work
-    // item's q_len columns; those sit inside the last tile only when
-    // valid_kv_len % KV_TILE_SIZE >= q_len. Otherwise they reach back into the previous tile,
-    // which a `tile_idx == tile_end - 1` test leaves unmasked and the rows bounded there then
-    // attend past their diagonal -- measured at max |delta| 1.41 over 58% of elements for
-    // nhead 12 / qlen 8 / ctx 33.
-    //
-    // The last two tiles are therefore always masked rather than the exact set being derived
-    // from causal_diagonal: two is always enough, since a work item holds at most 128 packed
-    // rows over at least 4 heads and so q_len <= 32 == KV_TILE_SIZE. Deriving the exact set
-    // needs causal_diagonal live for every tile's test, and at 256 VGPR that extra liveness
-    // cost 0.7% across the existing shapes -- far more than masking one tile that usually has
-    // nothing to mask, which is ~32 VALU once per work item.
     auto mask_oob_scores = [&](auto& s, int tile_idx) {
         bool masked = (tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len;
         if constexpr(T::CAUSAL)

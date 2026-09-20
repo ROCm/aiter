@@ -170,10 +170,6 @@ struct opus_mla_decode_fp8_16mx8_32nx1_traits
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool CAUSAL      = CAUSAL_;
-    // Set when nhead is not a multiple of W_M, so one wave's W_M packed Q rows can span two
-    // query tokens and the causal bound has to be computed per lane instead of per wave.
-    // Off keeps the bound wave-uniform (an SGPR); on costs one more live VGPR in a kernel
-    // that is already at 256, so it is a specialization rather than a runtime test.
     static constexpr bool WAVE_SPANS_TOKENS = WAVE_SPANS_TOKENS_;
     // KV cache past the 4 GiB a buffer descriptor can address; see the KV load in
     // mla_decode_fp8_16mx8_32nx1.hpp. Costs ~1-2% and 3 spilled VGPR, so
