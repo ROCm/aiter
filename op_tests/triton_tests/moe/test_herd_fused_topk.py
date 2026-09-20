@@ -9,7 +9,9 @@ import torch
 import torch.nn.functional as F
 
 from aiter.fused_moe import fused_topk, herd_fused_topk
-from aiter.ops.triton.moe.moe_routing.minunique import herd_fused_topk as herd_fused_topk_impl
+from aiter.ops.triton.moe.moe_routing.minunique import (
+    herd_fused_topk as herd_fused_topk_impl,
+)
 from op_tests.triton_tests.moe.test_moe_routing_herd import (
     HERD_N_TOKENS,
     HERD_SHAPES,
@@ -24,9 +26,7 @@ from op_tests.triton_tests.moe.test_moe_routing_herd import (
 
 def _hidden(gating):
     # fused_topk only reads M / device from hidden_states.
-    return torch.empty(
-        (gating.shape[0], 1), dtype=gating.dtype, device=gating.device
-    )
+    return torch.empty((gating.shape[0], 1), dtype=gating.dtype, device=gating.device)
 
 
 def _maps_close(ref, got, atol=2e-3, rtol=2e-2):
@@ -81,7 +81,9 @@ def test_herd_fused_topk_matches_minunique_torch(
     assert w.shape == (n_tokens, n_expts_act) and w.dtype == torch.float32
     assert ids.shape == (n_tokens, n_expts_act) and ids.dtype == torch.int32
     assert int((ids >= 0).all() and (ids < n_expts_tot).all())
-    _maps_close(_ref_per_token(ref_ids.cpu(), ref_w.cpu()), _ref_per_token(ids.cpu(), w.cpu()))
+    _maps_close(
+        _ref_per_token(ref_ids.cpu(), ref_w.cpu()), _ref_per_token(ids.cpu(), w.cpu())
+    )
 
 
 # ==========================================================================
@@ -90,7 +92,9 @@ def test_herd_fused_topk_matches_minunique_torch(
 @pytest.mark.parametrize("n_tokens", HERD_N_TOKENS)
 @pytest.mark.parametrize("n_expts_tot, n_expts_act", HERD_SHAPES)
 @pytest.mark.parametrize("renormalize", [False, True])
-def test_fused_topk_matches_softmax_topk(n_tokens, n_expts_tot, n_expts_act, renormalize):
+def test_fused_topk_matches_softmax_topk(
+    n_tokens, n_expts_tot, n_expts_act, renormalize
+):
     _skip_if_unsupported()
     logits = _init_logits(n_tokens, n_expts_tot)
     ref_w, ref_ids = _fused_topk_torch(logits, n_expts_act, renormalize)
@@ -111,9 +115,7 @@ def test_fused_topk_matches_softmax_topk(n_tokens, n_expts_tot, n_expts_act, ren
 @pytest.mark.parametrize("n_tokens", [32, 64, 128])
 @pytest.mark.parametrize("n_expts_tot, n_expts_act", [(128, 4), (256, 8)])
 @pytest.mark.parametrize("renormalize", [False, True])
-def test_herd_fused_topk_vs_fused_topk(
-    n_tokens, n_expts_tot, n_expts_act, renormalize
-):
+def test_herd_fused_topk_vs_fused_topk(n_tokens, n_expts_tot, n_expts_act, renormalize):
     _skip_if_unsupported()
     logits = _init_logits(n_tokens, n_expts_tot)
     hidden = _hidden(logits)
@@ -135,9 +137,13 @@ def test_herd_fused_topk_vs_fused_topk(
 
     uniq_stock = _unique_experts(stock_ids[:n_tokens])
     uniq_herd = _unique_experts(herd_ids)
-    assert uniq_herd <= uniq_stock, f"HERD did not shrink the union: {uniq_herd} > {uniq_stock}"
+    assert (
+        uniq_herd <= uniq_stock
+    ), f"HERD did not shrink the union: {uniq_herd} > {uniq_stock}"
     # decode-sized 128/256 experts: sharing is guaranteed -> selection must change
-    stock_hist = torch.bincount(stock_ids[:n_tokens].reshape(-1).long(), minlength=n_expts_tot)
+    stock_hist = torch.bincount(
+        stock_ids[:n_tokens].reshape(-1).long(), minlength=n_expts_tot
+    )
     herd_hist = torch.bincount(herd_ids.reshape(-1).long(), minlength=n_expts_tot)
     assert not torch.equal(stock_hist, herd_hist), "HERD did not engage vs fused_topk"
 
@@ -172,4 +178,6 @@ def test_herd_fused_topk_fused_moe_reexport_is_impl():
     hidden = _hidden(logits)
     a = herd_fused_topk(hidden, logits, 4, False, sm_first=True)
     b = herd_fused_topk_impl(hidden, logits, 4, False, sm_first=True)
-    _maps_close(_ref_per_token(a[1].cpu(), a[0].cpu()), _ref_per_token(b[1].cpu(), b[0].cpu()))
+    _maps_close(
+        _ref_per_token(a[1].cpu(), a[0].cpu()), _ref_per_token(b[1].cpu(), b[0].cpu())
+    )

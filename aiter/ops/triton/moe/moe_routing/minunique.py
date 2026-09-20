@@ -89,11 +89,11 @@ def _prepare_herd_candidates(
     pop = z[:n_expts_tot]
     hist = z[n_expts_tot : 2 * n_expts_tot]
     partials = z[2 * n_expts_tot :].view(num_blocks, n_expts_tot)
-    topk_kwargs = dict(
-        apply_softmax=False,
-        HIST_BLOCK_M=HIST_BLOCK_M,
-        pop_out=pop,
-    )
+    topk_kwargs = {
+        "apply_softmax": False,
+        "HIST_BLOCK_M": HIST_BLOCK_M,
+        "pop_out": pop,
+    }
     if score_mode is not None:
         topk_kwargs.update(
             score_mode=score_mode,
@@ -128,9 +128,7 @@ def herd_fused_topk(
     ``renormalize`` is the fused_topk flag and only applies on the sm_first
     path (softmax of the kept k already normalizes when ``sm_first=False``).
     """
-    assert (
-        hidden_states.shape[0] == gating_output.shape[0]
-    ), "Number of tokens mismatch"
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, n_expts_tot = gating_output.shape
     logits = gating_output.float()
     expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M = _prepare_herd_candidates(
