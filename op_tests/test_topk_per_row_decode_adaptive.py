@@ -237,7 +237,9 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
 
     arch, cu_count = _this_card()
     if (arch, cu_count) not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
-        pytest.skip(f"{arch} at {cu_count} CU is not in the table, so it claims nothing")
+        pytest.skip(
+            f"{arch} at {cu_count} CU is not in the table, so it claims nothing"
+        )
 
     launched = []
 
@@ -260,9 +262,7 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
     # elsewhere it runs the HIP kernel, which is not on this module and so is
     # observed by nothing having been spied.
     declined_runs = (
-        "port"
-        if arch in host._FLYDSL_TOPK_ONE_BLOCK_ARCHES
-        else topk.BACKEND_UPSTREAM
+        "port" if arch in host._FLYDSL_TOPK_ONE_BLOCK_ARCHES else topk.BACKEND_UPSTREAM
     )
 
     cells = _band_edge_cells(arch, cu_count)
@@ -279,12 +279,27 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
 
         launched.clear()
         got = topk.decode_backend_for_call(
-            logits, 1, seq_lens, out, rows,
-            logits.stride(0), logits.stride(1), k, stable, None,
+            logits,
+            1,
+            seq_lens,
+            out,
+            rows,
+            logits.stride(0),
+            logits.stride(1),
+            k,
+            stable,
+            None,
         )
         aiter.top_k_per_row_decode(
-            logits, 1, seq_lens, out, rows,
-            logits.stride(0), logits.stride(1), k=k, stable=stable,
+            logits,
+            1,
+            seq_lens,
+            out,
+            rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=k,
+            stable=stable,
         )
         # `_run_adaptive` and the port both go on to call `_run_compiled`, so
         # the first name recorded is the one that was dispatched to.
