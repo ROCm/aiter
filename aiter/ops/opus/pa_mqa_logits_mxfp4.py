@@ -35,7 +35,7 @@ tensor         gfx950                                   gfx1250
 On gfx1250 every scale is the plain E8M0 byte for 32-element K block ``b`` of its row and
 every packed row is 64 contiguous bytes, low nibble first. ``block_tables`` differs too: both
 targets round a window up to a whole KV tile before indexing it, and that width is 64 or 256 on
-gfx950 against a fixed 128 here. The C++ header states the resulting bound.
+gfx950 against a fixed 64 here. The C++ header states the resulting bound.
 
 **WHY THIS MODULE VALIDATES THE LAYOUT.** Every fp4 scale layout has the same BYTE COUNT --
 ``q_scale`` is ``total_q * 256`` either way -- so both C++ launchers check ``numel`` and accept
@@ -75,8 +75,9 @@ DEFAULT_KV_BLOCK_SIZE = 64
 Q_PER_BLOCK = 4
 
 # The gfx1250 KV tile in tokens, and internal: gfx950 takes it as `block_k` instead, so a
-# caller reading this constant would be wrong there.
-BLOCK_K = 128
+# caller reading this constant would be wrong there. One page wide here, so a CTA's KV
+# granularity and `kv_block_size` coincide and `block_tables` needs no tile rounding.
+BLOCK_K = 64
 
 # 4-D is the gfx950 MFMA permutation of the scales and its 4-chunk kv_cache; 3-D is gfx1250's
 # all-natural form. The two differ in no other observable way -- see the module docstring.
@@ -90,10 +91,12 @@ _MD_NAME_GFX1250 = "module_pa_mqa_logits_mxfp4_gfx1250_opus"
 # Mirrors of the C++ constants. `_gfx1250_compute_schedule` is the ONLY place the `cta_info`
 # size is computed, and it stays that way on purpose: the builder's own scratch sits past the
 # slots in the same buffer, so open-coding `num_ctas * 8` anywhere is under-allocation, which
-# the launcher raises on. `_SCHED_CTA_RESIDENT` is the part's resident CTA count (256 CUs x
-# occupancy 1). Not a knob: the split aims at it, and the A/B that turns the split off lives in
-# the opus-ops harness rather than on this op's surface.
-_SCHED_CTA_RESIDENT = 256
+# the launcher raises on. `_SCHED_CTA_RESIDENT` is the part's resident CTA count (256 CUs x 3
+# CTAs per CU, i.e. occupancy 3 at 4 waves per CTA). Not a knob: the split aims at it, and the
+# A/B that turns the split off lives in the opus-ops harness rather than on this op's surface.
+# It follows the C++ traits' KV tile, which is what sets the occupancy -- the two are stated
+# twice and nothing ties them, so a KV_TILE change that misses this one under-sizes the grid.
+_SCHED_CTA_RESIDENT = 768
 _SCHED_RECORD_INTS = 8
 _SCHED_SCRATCH_RECORDS = 96
 

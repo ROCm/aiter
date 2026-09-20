@@ -12,7 +12,7 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 
-// The single compiled config: 4 query rows per CTA (4 waves of 32), KV tile 128 = 2 pages,
+// The single compiled config: 4 query rows per CTA (4 waves of 32), KV tile 64 = 1 page,
 // D = 128, H = 64, page 64.
 using mqa_logits_fp4_gfx1250_traits = logits_fp4_qshare_traits_4q;
 

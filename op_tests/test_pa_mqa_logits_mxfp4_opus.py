@@ -90,7 +90,7 @@ DECODE_SEQS = 32
 DECODE_WIN_LONG = 25000
 DECODE_WIN_SHORT = 100
 
-# Window ends around the KV_TILE = 128 boundary, plus the 1-tile and 2-tile pipeline corners --
+# Window ends around the KV_TILE = 64 boundary, plus the 1-tile and 2-tile pipeline corners --
 # which is where the accumulator ping-pong's peeled first phase and its epilogue run ALONE,
 # rather than as the steady loop's two halves.
 TILE_EDGE_ENDS = (1, 63, 64, 65, 127, 128, 129, 191, 255, 256, 257, 383, 384, 385)
@@ -513,7 +513,7 @@ def check_row_id_bound(data_init, scale_init, seed):
 
 def run_corner(data_init, scale_init, seed):
     """The cases the qshare contract is made of: short groups at every residue mod
-    Q_PER_BLOCK, windows that do not start at 0, the KV_TILE = 128 boundary neighbourhood, every
+    Q_PER_BLOCK, windows that do not start at 0, the KV_TILE = 64 boundary neighbourhood, every
     window start mod 128, and both ATOM CSA regimes where a group's rows differ by a column.
 
     The per-case seeds below are OFFSETS from ``--seed``: the cases stay distinct from one

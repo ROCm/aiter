@@ -14,11 +14,13 @@
 // count, so the launcher catches a wrong array and never a wrong permutation. Only a
 // random-data comparison against a dequantized reference does.
 //
-// `block_tables` is sized for the 128-token TILE, not the page -- a CTA rounds its window up
-// to a whole tile, so it needs `ceil(max_window / 128) * 2` entries, one more than
-// `ceil(max_window / PAGE)` whenever that is odd. NOTHING CHECKS IT, and the consequence is
-// not a wrong answer: the extra entry feeds a KV fetch whose columns the store masks off, so
-// what it risks is reading a page id the caller never populated.
+// `block_tables` is sized in KV TILES, which at this width is exactly one page -- so
+// `ceil(max_seq_len / PAGE)` entries, and the tile rounding a CTA does costs nothing over the
+// page rounding a caller would compute anyway. That coincidence is a property of
+// KV_TILE_SIZE == PAGE_SIZE and not of the ABI: at a wider tile a CTA reads the table at every
+// page of the last tile, including where the window stops inside it, and the sizing is
+// `ceil(max_seq_len / KV_TILE) * PAGES_PER_TILE`. The launcher checks that form, derived from
+// the traits, so it follows the tile width without being restated here.
 #pragma once
 #include "aiter_tensor.h"
 #include <cstdint>
@@ -185,8 +187,11 @@ namespace opus_logits {
 constexpr int SCHED_BUILD_BLOCK      = 256;
 constexpr int SCHED_BUILD_BLOCK_WIDE = 1024;
 
-// CTAs resident on the part: 256 CUs x occupancy 1 x 4 waves per CTA -- a hardware number.
-constexpr int SCHED_CTA_RESIDENT = 256;
+// CTAs resident on the part: 256 CUs x 3 CTAs per CU -- occupancy 3 at 4 waves per CTA, which
+// is what the traits' KV tile buys. A hardware number, but NOT an independent one: it follows
+// the accumulator width, so changing KV_TILE_SIZE without changing this leaves the split aiming
+// at a fraction of the part. The Python wrapper holds the same value and nothing ties them.
+constexpr int SCHED_CTA_RESIDENT = 768;
 
 // The CTA count the split aims at: a WHOLE NUMBER OF ROUNDS. One CTA per tile leaves the last
 // round `resident - (nz mod resident)` CTAs empty, and that tail is not small -- 1025 tiles is
@@ -655,9 +660,15 @@ enum class mqa_logits_sched {
 
 // ONE kv_cache layout, the natural one: with no FlyDSL kernel on this target there is nothing
 // to be byte-compatible with, so the LDS address formulas below are that layout's, once.
+//
+// KV_TILE_SIZE = 64 is ONE PAGE, and it is the width the accumulator is sized by: N_TILES is
+// KV_TILE_SIZE / MMA_N, so the tile decides ACC_VGPR and ACC_VGPR decides how many waves the
+// allocator fits per SIMD. At 64 that is three, at 128 it is one. **SCHED_CTA_RESIDENT is
+// derived from that occupancy and has to move with this number** -- a stale value there
+// under-sizes the grid, the split cannot fill the part, and nothing reports it.
 template<int Q_PER_BLOCK_  = 4,
          int LDS_STAGES_   = 2,
-         int KV_TILE_SIZE_ = 128,
+         int KV_TILE_SIZE_ = 64,
          int PAGE_SIZE_    = 64,
          int HEAD_DIM_     = 128,
          int N_HEADS_      = 64>
@@ -691,9 +702,9 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static constexpr int K_CHUNKS = MMA_K / SCALE_BLOCK;  // 4  (32-K scale blocks per instruction)
     static constexpr int SCALE_BLOCKS_ROW = HEAD_DIM / SCALE_BLOCK;  // 4 == K_TILES * K_CHUNKS
 
-    static constexpr int N_TILES         = KV_TILE_SIZE / MMA_N;   // 8
+    static constexpr int N_TILES         = KV_TILE_SIZE / MMA_N;   // 4
     static constexpr int TILES_PER_PAGE  = PAGE_SIZE / MMA_N;      // 4
-    static constexpr int PAGES_PER_TILE  = KV_TILE_SIZE / PAGE_SIZE;  // 2
+    static constexpr int PAGES_PER_TILE  = KV_TILE_SIZE / PAGE_SIZE;  // 1
 
     static constexpr int C_FRAG = MMA_M * MMA_N / WAVE_SIZE;   // 16 floats per lane per m-tile
     static constexpr int GRPN_C = MMA_N;                       // 16: n == lane % 16
@@ -811,8 +822,8 @@ struct opus_mqa_logits_fp4_qshare_traits {
         return lds_expand(kv_byte(token_in_page, block));
     }
     static constexpr int LDS_PAGE_BYTES = lds_expand(KV_PAGE_BYTES);  // 4608 == 4096 + one 16 B pad per 128 B
-    static constexpr int LDS_TILE_BYTES  = PAGES_PER_TILE * LDS_PAGE_BYTES;   // 9216
-    static constexpr int LDS_SCALE_BYTES = KV_TILE_SIZE * SCALE_BYTES_PER_DWORD;   // 512
+    static constexpr int LDS_TILE_BYTES  = PAGES_PER_TILE * LDS_PAGE_BYTES;   // 4608
+    static constexpr int LDS_SCALE_BYTES = KV_TILE_SIZE * SCALE_BYTES_PER_DWORD;   // 256
     static constexpr int LDS_STAGE_BYTES = LDS_TILE_BYTES + LDS_SCALE_BYTES;
     static constexpr int LDS_STAGES      = LDS_STAGES_;
     static constexpr int LDS_BYTES       = LDS_STAGES * LDS_STAGE_BYTES;
@@ -891,16 +902,16 @@ struct opus_mqa_logits_fp4_qshare_traits {
     // CONTIGUOUS BYTES -- not by token or by K block -- and wave w takes piece (w % SPLIT) of
     // page (w / SPLIT). ──
     static constexpr int TDM_ISSUE_WAVES = NUM_WAVES;
-    static constexpr int TDM_PAGE_SPLIT  = TDM_ISSUE_WAVES / PAGES_PER_TILE;   // 2
+    static constexpr int TDM_PAGE_SPLIT  = TDM_ISSUE_WAVES / PAGES_PER_TILE;   // 4
     static constexpr int TDM_OPS_PER_TILE = 2 * TDM_ISSUE_WAVES;               // 8
     static constexpr int TDM_INFLIGHT_PER_WAVE = 3;                   // hardware, per opus.hpp
     static constexpr int TDM_OPS_PER_ISSUING_WAVE = TDM_OPS_PER_TILE / TDM_ISSUE_WAVES;   // 2
     static constexpr int TDM_INFLIGHT_CAP = TDM_INFLIGHT_PER_WAVE / TDM_OPS_PER_ISSUING_WAVE;
 
-    static constexpr int TDM_ROWS        = PAGE_SIZE / TDM_PAGE_SPLIT;         // 32
-    static constexpr int TDM_PIECE_BYTES = KV_PAGE_BYTES / TDM_PAGE_SPLIT;     // 2048, global side
-    static constexpr int LDS_PIECE_BYTES = lds_expand(TDM_PIECE_BYTES);        // 2304
-    static constexpr int TDM_SCALE_PIECE_BYTES = TDM_ROWS * SCALE_BYTES_PER_DWORD;   // 128
+    static constexpr int TDM_ROWS        = PAGE_SIZE / TDM_PAGE_SPLIT;         // 16
+    static constexpr int TDM_PIECE_BYTES = KV_PAGE_BYTES / TDM_PAGE_SPLIT;     // 1024, global side
+    static constexpr int LDS_PIECE_BYTES = lds_expand(TDM_PIECE_BYTES);        // 1152
+    static constexpr int TDM_SCALE_PIECE_BYTES = TDM_ROWS * SCALE_BYTES_PER_DWORD;   // 64
 
     static_assert(TDM_ISSUE_WAVES <= NUM_WAVES,
                   "there are not enough waves to spread a tile's TDM issues over");
@@ -929,12 +940,13 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static constexpr int TENSORCNT_KEEP = (TILES_IN_FLIGHT - 1) * TDM_OPS_PER_ISSUING_WAVE;
 
     // ── the accumulator: TWO copies, ping-ponged, so tile t+1's WMMAs issue while tile t is
-    // reduced. Worth 20-52% wherever the grid fills the machine, which is why occupancy 1 is the
-    // deliberate operating point. ──
+    // reduced -- the two sets have no data dependency, so the scheduler may interleave a tile's
+    // WMMAs with the previous tile's relu, weight and permlane work. Its width is what sets
+    // occupancy: ACC_VGPR is M_TILES x N_TILES x C_FRAG per set, so the KV tile decides both. ──
     static constexpr int ACC_SETS = 2;
-    static constexpr int ACC_VGPR_PER_SET = M_TILES * N_TILES * C_FRAG;   // 256
-    static constexpr int ACC_VGPR = ACC_SETS * ACC_VGPR_PER_SET;          // 512
-    static constexpr int WMMA_PER_TILE = M_TILES * N_TILES;               // 16
+    static constexpr int ACC_VGPR_PER_SET = M_TILES * N_TILES * C_FRAG;   // 128
+    static constexpr int ACC_VGPR = ACC_SETS * ACC_VGPR_PER_SET;          // 256
+    static constexpr int WMMA_PER_TILE = M_TILES * N_TILES;               // 8
     static constexpr int WAVES_PER_EU = 1;
     static constexpr int VGPR_ADDRESSABLE = 1024;                    // wave32, per lane
     static_assert(ACC_VGPR < VGPR_ADDRESSABLE,
