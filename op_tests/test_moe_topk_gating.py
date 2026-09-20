@@ -68,6 +68,12 @@ def _renorm_err(topk_weights):
 # so rank r owns [r * num_experts / _EPLB_EP_SIZE, (r + 1) * ...).
 _EPLB_EP_SIZE = 4
 
+# prefill_n expert counts that CI must hit for softmax. Not in the global
+# default: putting them there also ran sigmoid and nan, where E=640 bf16
+# already mismatches indices and the large-T smem fallback fails the
+# starved-row check (T=4096/16384 sit above the E=512/640 prefill_n gates).
+_SOFTMAX_PREFILL_N_EXPERTS = [512, 640]
+
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
@@ -776,7 +782,8 @@ def main():
         "--num-experts",
         type=str2tuple,
         default=[64, 128, 256, 384],
-        help="Comma-separated list of number of experts (default: 64,128,256,384)",
+        help="Comma-separated list of number of experts (default: 64,128,256,384). "
+        "The softmax section also sweeps 512,640 so CI hits those prefill_n paths.",
     )
     parser.add_argument(
         "--num-tokens",
@@ -861,9 +868,12 @@ def main():
 
     # -- topk_softmax: topk_gating (fused) vs topk_softmax (vLLM) --------
     if "softmax" in sections:
+        softmax_experts = list(
+            dict.fromkeys([*num_experts_list, *_SOFTMAX_PREFILL_N_EXPERTS])
+        )
         softmax_configs = list(
             itertools.product(
-                num_experts_list, num_tokens_list, topk_list, dtype_list, [False, True]
+                softmax_experts, num_tokens_list, topk_list, dtype_list, [False, True]
             )
         )
         df = [

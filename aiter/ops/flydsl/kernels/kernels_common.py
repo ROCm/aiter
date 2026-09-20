@@ -17,6 +17,13 @@ from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
+LOG2E = 1.4426950408889634
+
+
+def ceildiv(numer, denom):
+    """Ceiling division preserving Python-int or DSL-scalar operand types."""
+    return (numer + denom - 1) // denom
+
 
 def format_kernel_name(name: str) -> str:
     """Sanitize a kernel symbol name for the amdhsa assembler.
@@ -29,17 +36,61 @@ def format_kernel_name(name: str) -> str:
     return name.replace("-", "_")
 
 
+def kernel_signature(**params: object) -> str:
+    """Render build parameters into a kernel-name suffix.
+
+    Every build parameter that changes a kernel's body belongs here. Two builds
+    of one module that differ only in an omitted parameter otherwise emit the
+    same symbol, and are then indistinguishable in a profile, in a disassembly
+    dump, and to anything keyed on the name.
+
+    Booleans render as 0/1 so the suffix stays short, and the whole string goes
+    through ``format_kernel_name`` because a negative config value is legal here
+    and a hyphen is not legal in a symbol.
+    """
+    parts = [
+        f"{name}{int(value) if isinstance(value, bool) else value}"
+        for name, value in params.items()
+    ]
+    return format_kernel_name("_".join(parts))
+
+
+# Exponent-all-ones with a zero mantissa; anything above it is a NaN.
+F32_INF_BITS = 0x7F800000
+F32_NAN_KEY = 2147483647
+_F32_INT32_MIN = -2147483648
+
+
+def ord_signed_f32(value):
+    """Map fp32 to an int32 that compares the same way under `<`, NaN highest.
+
+    fp32 is sign-magnitude, so flipping the magnitude bits of negatives yields a
+    signed-integer total order. -0.0 and 0.0 are one score with two bit patterns
+    and must not become two keys.
+
+    NaN sorts above +inf, matching `torch.topk`. The per-row selectors are
+    dispatched by shape, so a row holding a NaN must not answer differently
+    depending on a choice the caller did not make -- which is why this lives
+    here rather than once per selector. Testing the bits rather than `x != x`
+    keeps it in the integer domain and leaves the infinities where they belong.
+    """
+    bits = value.bitcast(fx.Int32)
+    bits = (bits == fx.Int32(_F32_INT32_MIN)).select(fx.Int32(0), bits)
+    ordered = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
+    is_nan = (bits & fx.Int32(0x7FFFFFFF)) > fx.Int32(F32_INF_BITS)
+    return is_nan.select(fx.Int32(F32_NAN_KEY), ordered)
+
+
 def uint32_to_int32(x: int) -> int:
     """Return the signed int32 value with the same low 32-bit pattern."""
     return x - (1 << 32) if x >= (1 << 31) else x
 
 
-def atomic_add_i32(memref, val, offset, syncscope):
-    """Atomically add an int32 value and return the previous value."""
+def _atomic_rmw_i32(binop, memref, val, offset, syncscope):
     ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
     val = fx.Int32(val) if isinstance(val, int) else val
     old = _llvm.AtomicRMWOp(
-        _llvm.AtomicBinOp.add,
+        binop,
         ptr,
         as_ir_value(val),
         _llvm.AtomicOrdering.monotonic,
@@ -47,6 +98,25 @@ def atomic_add_i32(memref, val, offset, syncscope):
         alignment=4,
     ).result
     return fx.Int32(old)
+
+
+def atomic_add_i32(memref, val, offset, syncscope):
+    """Atomically add an int32 value and return the previous value."""
+    return _atomic_rmw_i32(_llvm.AtomicBinOp.add, memref, val, offset, syncscope)
+
+
+def atomic_or_i32(memref, val, offset, syncscope):
+    """Atomically OR an int32 value in and return the previous value."""
+    return _atomic_rmw_i32(_llvm.AtomicBinOp._or, memref, val, offset, syncscope)
+
+
+def atomic_max_i32(memref, val, offset, syncscope):
+    """Atomically take the signed max and return the previous value.
+
+    Unlike a fetch-and-add, the result does not depend on the order the lanes
+    are served, so a reduction built on this is reproducible.
+    """
+    return _atomic_rmw_i32(_llvm.AtomicBinOp.max, memref, val, offset, syncscope)
 
 
 def get_warp_size(arch=None):
@@ -121,11 +191,7 @@ FX_ADDRESS_SPACE = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}
 
 
 def create_llvm_ptr(value, address_space=1):
-    """Raw ``!llvm.ptr<n>`` at *value*, for ops that need one directly.
-
-    The atomicrmw builder and the plain llvm load/store take a raw pointer,
-    which no layout op produces, so the address is formed by hand here.
-    """
+    """Raw LLVM pointer for atomics and intrinsic APIs."""
     # Accept either the LLVM number (1 global / 3 LDS) or an fx.AddressSpace,
     # so a caller cannot silently pass the wrong one.
     space = FX_ADDRESS_SPACE.get(address_space, address_space)
