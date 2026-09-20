@@ -60,6 +60,107 @@ def keepk_sort0(
     return Vout, Iout
 
 
+def _prepare_herd_candidates(
+    logits,
+    k,
+    *,
+    sm_first=False,
+    score_mode=None,
+    bias=None,
+):
+    """Fusion-1: top-(k+1) + popularity histogram.
+
+    Allocates pre-zeroed ``hist`` / ``partials`` for Fusion-2 (``keepk_sort0``).
+    The bitmatrix from ``topk`` is unused here — ``moe_sorting`` / a later
+    ``_combined_routing`` path rebuilds grouping from the kept ``[M, k]``.
+    """
+    if sm_first:
+        assert score_mode is None, "sm_first is the flat-softmax path"
+        logits = torch.softmax(logits.float(), dim=-1)
+    num_tokens, n_expts_tot = logits.shape
+    assert k < n_expts_tot, f"HERD needs k+1 <= E, got k={k} E={n_expts_tot}"
+    HIST_BLOCK_M = 32
+    num_blocks = triton.cdiv(num_tokens, HIST_BLOCK_M)
+    z = torch.zeros(
+        2 * n_expts_tot + num_blocks * n_expts_tot,
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    pop = z[:n_expts_tot]
+    hist = z[n_expts_tot : 2 * n_expts_tot]
+    partials = z[2 * n_expts_tot :].view(num_blocks, n_expts_tot)
+    topk_kwargs = dict(
+        apply_softmax=False,
+        HIST_BLOCK_M=HIST_BLOCK_M,
+        pop_out=pop,
+    )
+    if score_mode is not None:
+        topk_kwargs.update(
+            score_mode=score_mode,
+            bias=bias,
+            renorm=False,
+            routed_scaling_factor=1.0,
+        )
+    expt_scal, expt_indx, _bitmatrix = topk(logits, k + 1, **topk_kwargs)
+    return expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M
+
+
+def herd_fused_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    *,
+    sm_first: bool = True,
+):
+    """HERD min-unique selection with ``fused_topk``'s ``[M, k]`` contract.
+
+    Drop-in for ``fused_topk`` at the *selection* layer: returns
+    ``(topk_weights[M, k] fp32, topk_ids[M, k] i32)``. Does not run
+    ``_combined_routing`` / ``moe_sorting`` — hist/partials written by
+    ``keepk_sort0`` are discarded so the fused_moe sort can rebuild them.
+
+    ``sm_first=True`` (default) matches ``fused_topk`` scoring: softmax over
+    all E, then top-(k+1) and drop. ``sm_first=False`` matches ``routing()``
+    default: top-(k+1) on raw logits, softmax the kept k.
+    ``renormalize`` is the fused_topk flag and only applies on the sm_first
+    path (softmax of the kept k already normalizes when ``sm_first=False``).
+    """
+    assert (
+        hidden_states.shape[0] == gating_output.shape[0]
+    ), "Number of tokens mismatch"
+    M, n_expts_tot = gating_output.shape
+    logits = gating_output.float()
+    expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M = _prepare_herd_candidates(
+        logits, topk, sm_first=sm_first
+    )
+    apply_softmax = not sm_first
+    apply_renorm = bool(renormalize) and sm_first
+    weights, ids = keepk_sort0(
+        expt_scal,
+        expt_indx,
+        pop,
+        hist,
+        partials,
+        n_expts_tot,
+        topk,
+        apply_softmax=apply_softmax,
+        HIST_BLOCK_M=HIST_BLOCK_M,
+        apply_renorm=apply_renorm,
+    )
+    weights = weights.float()
+    ids = ids.to(torch.int32)
+    if topk_weights is not None:
+        topk_weights[:M].copy_(weights)
+        weights = topk_weights[:M]
+    if topk_ids is not None:
+        topk_ids[:M].copy_(ids)
+        ids = topk_ids[:M]
+    return weights, ids
+
+
 def _minunique_common(
     num_tokens,
     n_expts_tot,
@@ -146,24 +247,9 @@ def routing_minunique(logits, n_expts_act, *, sm_first=False):
     m = num_tokens * k
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    if sm_first:
-        logits = torch.softmax(logits, dim=-1)
-    HIST_BLOCK_M = 32
-    num_blocks = triton.cdiv(num_tokens, HIST_BLOCK_M)
-
-    z = torch.zeros(
-        2 * n_expts_tot + num_blocks * n_expts_tot,
-        dtype=torch.int32,
-        device=logits.device,
+    expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M = _prepare_herd_candidates(
+        logits, k, sm_first=sm_first
     )
-    pop = z[:n_expts_tot]
-    hist = z[n_expts_tot : 2 * n_expts_tot]
-    partials = z[2 * n_expts_tot :].view(num_blocks, n_expts_tot)
-
-    expt_scal, expt_indx, _bitmatrix = topk(
-        logits, k + 1, apply_softmax=False, HIST_BLOCK_M=HIST_BLOCK_M, pop_out=pop
-    )
-
     return _minunique_common(
         num_tokens,
         n_expts_tot,
@@ -198,30 +284,9 @@ def routing_minunique_fused(
     m = num_tokens * k
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    HIST_BLOCK_M = 32
-    num_blocks = triton.cdiv(num_tokens, HIST_BLOCK_M)
-
-    z = torch.zeros(
-        2 * n_expts_tot + num_blocks * n_expts_tot,
-        dtype=torch.int32,
-        device=logits.device,
+    expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M = _prepare_herd_candidates(
+        logits, k, score_mode=score_mode, bias=bias
     )
-    pop = z[:n_expts_tot]
-    hist = z[n_expts_tot : 2 * n_expts_tot]
-    partials = z[2 * n_expts_tot :].view(num_blocks, n_expts_tot)
-
-    expt_scal, expt_indx, _bitmatrix = topk(
-        logits,
-        k + 1,
-        apply_softmax=False,
-        score_mode=score_mode,
-        bias=bias,
-        renorm=False,
-        routed_scaling_factor=1.0,
-        HIST_BLOCK_M=HIST_BLOCK_M,
-        pop_out=pop,
-    )
-
     return _minunique_common(
         num_tokens,
         n_expts_tot,

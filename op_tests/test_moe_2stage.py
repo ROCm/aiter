@@ -77,6 +77,52 @@ def parse_num_expert_activated():
 
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
+_HERD_FALSEY = ("", "0", "false", "False")
+
+
+def _herd_selector_requested():
+    """Same env as Triton routing(): AITER_TRITON_USE_HERD / HERD_MIN_M / HERD_MAX_M."""
+    return os.environ.get("AITER_TRITON_USE_HERD", "") not in _HERD_FALSEY
+
+
+def _select_topk(hidden_states, gating_output, topk, renormalize=True):
+    """fused_topk, or herd_fused_topk when AITER_TRITON_USE_HERD is set and in window.
+
+    HERD is a decode-sized min-unique selector (top-(k+1) then drop). It cannot
+    run when the expert set is already pinned (BALANCE / NUM_EXPERT_ACTIVATED),
+    when k+1 > E, or outside [MIN_M, MAX_M] — those fall through to fused_topk
+    the same way routing() does.
+    """
+    n_tokens, n_expts = gating_output.shape
+    if not _herd_selector_requested():
+        return fused_topk(hidden_states, gating_output, topk, renormalize)
+
+    min_m = int(os.environ.get("AITER_TRITON_HERD_MIN_M", "16"))
+    max_m = int(os.environ.get("AITER_TRITON_HERD_MAX_M", "128"))
+    skip = None
+    gfx = get_gfx()
+    if gfx not in ("gfx950", "gfx1250"):
+        skip = f"arch {gfx} (need gfx950/gfx1250)"
+    elif AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        skip = "AITER_MOE_NUM_EXPERT_ACTIVATED pins the expert set"
+    elif AITER_MOE_EXPERT_BALANCE:
+        skip = "AITER_MOE_EXPERT_BALANCE pins the expert set"
+    elif topk >= n_expts:
+        skip = f"topk={topk} >= E={n_expts} (HERD needs k+1 <= E)"
+
+    if skip is not None:
+        aiter.logger.warning("HERD selector skipped (%s); using fused_topk", skip)
+        return fused_topk(hidden_states, gating_output, topk, renormalize)
+    if not (min_m <= n_tokens <= max_m):
+        return fused_topk(hidden_states, gating_output, topk, renormalize)
+
+    from aiter.fused_moe import herd_fused_topk
+
+    weights, ids = herd_fused_topk(
+        hidden_states, gating_output, topk, renormalize, sm_first=True
+    )
+    return weights, ids
+
 
 @benchmark()
 def test_fmoe(
@@ -165,7 +211,11 @@ def test_fmoe(
     else:
         score = torch.randn((token, E), dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    topk_weights, topk_ids = _select_topk(input, score, topk, True)
+    unique_expts = int(torch.unique(topk_ids[:token].long()).numel())
+    _, us_selector = run_perftest(
+        _select_topk, input, score, topk, True, num_iters=20, num_warmup=3
+    )
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -508,6 +558,9 @@ def test_fmoe(
             kernel_us[_name] = _us
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
+        us_sort = kernel_us.get("sort")
+        us_moe = (us1 or 0.0) + (us2_stage or 0.0)
+        us_total = (us_selector or 0.0) + (us_sort or 0.0) + us_moe
         if not kernel_us:
             logger.warning(
                 "kernel_bench: no kernels captured (non-2stage/1stage path?) (quant:%s)",
@@ -515,15 +568,26 @@ def test_fmoe(
             )
         else:
             logger.info(
-                "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
+                "e2e breakdown: selector=%.2f us, sort=%s us, "
+                "stage1=%s us, stage2=%s us, moe=%.2f us, total=%.2f us "
+                "(unique=%s, quant:%s)",
+                us_selector,
+                "n/a" if us_sort is None else f"{us_sort:.2f}",
                 "n/a" if us1 is None else f"{us1:.2f}",
                 "n/a" if us2_stage is None else f"{us2_stage:.2f}",
+                us_moe,
+                us_total,
+                unique_expts,
                 AQDType,
             )
         return {
-            "us": (us1 or 0.0) + (us2_stage or 0.0),
+            "us": us_total,
+            "us_selector": us_selector,
+            "us_sort": us_sort,
+            "us_moe": us_moe,
             "us_stage1": us1,
             "us_stage2": us2_stage,
+            "unique_expts": unique_expts,
         }
 
     out2_ck, us2 = run_perftest(
@@ -575,7 +639,13 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    return {
+        "us": (us_selector or 0.0) + us2,
+        "us_selector": us_selector,
+        "us_moe_e2e": us2,
+        "logits_diff": float(logits_diff),
+        "unique_expts": unique_expts,
+    }
 
 
 l_quant = [
@@ -1297,7 +1367,7 @@ def test_output_buffer_contract():
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
     gating = torch.randn((token, E), dtype=dtype)
-    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    topk_weights, topk_ids = _select_topk(hidden, gating, topk, True)
     args = (hidden, w1, w2, topk_weights, topk_ids)
 
     ref = fused_moe(*args)
