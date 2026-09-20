@@ -532,8 +532,19 @@ BACKEND_ADAPTIVE = "adaptive"
 # outside this table -- another CU count, a k with no row, a width past the
 # widest measured -- keeps the chunked gate above, so an unmeasured shape is
 # unchanged rather than guessed at, and measuring another card is an entry here
-# and nothing else. Every edge is read off a sweep of the whole grid against all
-# four decode kernels; the PR description holds the per-cell scores.
+# and nothing else.
+#
+# Every edge is read off a sweep of the whole grid against all four decode
+# kernels, and a cell is only taken when both of these hold, which are different
+# questions asked of different baselines:
+#
+#   this kernel is no slower than the best of the four        (nothing regresses)
+#   and at least 1.05x faster than the kernel that runs today (the win is real)
+#
+# The second condition is why a cell that is merely 1.00x to 1.05x is declined:
+# that margin is not separable from run-to-run noise, so claiming it would be
+# claiming more than the measurement supports. The PR description holds the
+# per-cell scores.
 _ADAPTIVE_BANDS_BY_K_GROUP = {
     ("gfx942", 80): {
         True: {
@@ -545,8 +556,8 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
                 (524_288, 1_048_576, 1, 32),
             ),
             (512, 1024, 2048): (
-                (4_096, 4_096, 128, 512),
-                (8_192, 16_384, 64, 512),
+                (4_096, 8_192, 128, 512),
+                (16_384, 16_384, 64, 512),
                 (20_000, 20_000, 128, 512),
                 (65_536, 65_536, 1, 4),
                 (131_072, 262_144, 1, 16),
@@ -584,44 +595,40 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
     ("gfx950", 256): {
         True: {
             (256,): (
-                (8_192, 8_192, 128, 512),
                 (131_072, 131_072, 1, 16),
                 (262_144, 1_048_576, 1, 64),
             ),
             (512, 1024, 2048): (
-                (8_192, 8_192, 64, 512),
-                (16_384, 16_384, 256, 256),
-                (131_072, 131_072, 1, 32),
-                (262_144, 1_048_576, 1, 64),
+                (131_072, 131_072, 1, 16),
+                (262_144, 262_144, 1, 8),
+                (524_288, 1_048_576, 1, 64),
             ),
             (4096,): (
-                (4_096, 4_096, 2, 2),
                 (32_768, 32_768, 1, 16),
                 (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 256),
-                (262_144, 1_048_576, 1, 512),
+                (131_072, 131_072, 1, 16),
+                (262_144, 262_144, 32, 512),
+                (524_288, 1_048_576, 1, 512),
             ),
         },
         False: {
             (256,): (
-                (4_096, 4_096, 32, 512),
-                (8_192, 8_192, 512, 512),
-                (65_536, 65_536, 1, 16),
+                (4_096, 4_096, 512, 512),
+                (65_536, 65_536, 1, 2),
                 (131_072, 131_072, 1, 32),
                 (262_144, 1_048_576, 1, 64),
             ),
             (512, 1024, 2048): (
                 (4_096, 4_096, 512, 512),
-                (8_192, 8_192, 64, 512),
                 (65_536, 65_536, 1, 8),
-                (131_072, 131_072, 1, 32),
-                (262_144, 1_048_576, 1, 64),
+                (131_072, 262_144, 1, 16),
+                (524_288, 1_048_576, 1, 64),
             ),
             (4096,): (
-                (4_096, 4_096, 2, 2),
                 (32_768, 32_768, 1, 1),
                 (65_536, 65_536, 1, 32),
-                (131_072, 1_048_576, 1, 64),
+                (131_072, 262_144, 1, 16),
+                (524_288, 1_048_576, 1, 64),
             ),
         },
     },
