@@ -824,7 +824,9 @@ def test_pa_ps(
 
     if test_case is not None:
         assert torch.isfinite(out_ref).all(), "Non-finite reference output"
-        assert torch.isfinite(output).all(), f"Non-finite output: {kv_dtype}, mask={mask}"
+        assert torch.isfinite(
+            output
+        ).all(), f"Non-finite output: {kv_dtype}, mask={mask}"
         assert err == 0, f"Accuracy check failed: {kv_dtype}, mask={mask} ({err})"
         ret["err"] = ret.pop("err fp8")
         if "us_asm_fp8" in ret:
@@ -964,7 +966,9 @@ for dtype in args.dtype:
                 or num_heads[0] // num_heads[1] not in (8, 16)
                 or not 1 <= qlen <= 4
             ):
-                raise ValueError("The page16 PS matrix requires BF16/FP16, GQA8/16 and query length 1..4")
+                raise ValueError(
+                    "The page16 PS matrix requires BF16/FP16, GQA8/16 and query length 1..4"
+                )
             kv_dtypes = [dtype, aiter.dtypes.fp8, torch.int8]
             if qlen > 2 and num_heads[0] // num_heads[1] == 16:
                 kv_dtypes = [aiter.dtypes.fp8, torch.int8]
@@ -992,7 +996,8 @@ for dtype in args.dtype:
             df.append(ret)
     df = pd.DataFrame(df)
     df = df.drop(
-        columns=["load_metadata", "dump_metadata", "profile_ps", "test_case"], errors="ignore"
+        columns=["load_metadata", "dump_metadata", "profile_ps", "test_case"],
+        errors="ignore",
     )
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
