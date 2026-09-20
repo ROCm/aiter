@@ -9,7 +9,19 @@ from flydsl._mlir.dialects import fly
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
+
+from ..kernels_common import LOG2E
+
+LN2 = 1.0 / LOG2E
+_P_HEADROOM_LOG2 = 8.807354922057604  # log2(448), the largest finite E4M3 value.
+
+
+def _p_headroom_log2(traits):
+    """Exponent bias shared by FP8 probability packing and LSE recovery."""
+    headroom = _P_HEADROOM_LOG2
+    if traits.DUALWAVE_SWP_LAZY_RESCALE:
+        headroom -= traits.DUALWAVE_SWP_RESCALE_THRESHOLD
+    return max(0.0, headroom)
 
 
 def load(ptr, *, dtype, count):
@@ -51,9 +63,8 @@ def _cu_load(div, idx, cu_atom, cu_v1i32):
     v = fly.copy_atom_call_ssa(
         [cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx)))
     )
-    return fx.Index(
-        rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(Vec(v, (1,), fx.Int32)[0])))
-    )
+    value = Vec(v, (1,), fx.Int32)[0]
+    return fx.Index(rocdl.readfirstlane(T.i32, value.ir_value()))
 
 
 def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):

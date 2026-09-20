@@ -10,7 +10,6 @@ from flydsl._mlir.dialects import fly, llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from ..kernels_common import LOG2E as _LOG2E
 from .common import (
@@ -18,9 +17,11 @@ from .common import (
     _buffer_load_lds_128,
     _buffer_store_128,
     _cu_load,
+    _p_headroom_log2,
 )
 from .common import load as _load
 
+PAGED_FP8_HEAD_DIMS = ((128, 128), (192, 128), (192, 192))
 PAGED_FP8_BLOCK_M = 256
 PAGED_FP8_BUFFER_LIMIT_BYTES = (1 << 31) - 16
 
@@ -35,21 +36,13 @@ def _tree_reduce(vals, binop):
     return items[0]
 
 
-def _bitcast_i32(value):
-    return fx.Float32(value).bitcast(fx.Int32).ir_value()
-
-
-def _bitcast_f32(value):
-    return fx.Int32(value).bitcast(fx.Float32).ir_value()
-
-
 def _reduction_pair(v_f32):
-    v_i32 = _bitcast_i32(v_f32)
+    v_i32 = fx.Float32(v_f32).bitcast(fx.Int32).ir_value()
     pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
     swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
     lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
     rhs_i32 = llvm.extractvalue(T.i32, swapped, [1])
-    return _bitcast_f32(lhs_i32), _bitcast_f32(rhs_i32)
+    return fx.Int32(lhs_i32).bitcast(fx.Float32), fx.Int32(rhs_i32).bitcast(fx.Float32)
 
 
 def _score_pair_to_lists(v_s):
@@ -63,8 +56,8 @@ def _score_pair_to_lists(v_s):
 def _score_lists_to_vecs(v_s_lists):
     s_lo, s_hi = v_s_lists
     return (
-        Vec.from_elements([as_mlir_value(v) for v in s_lo], fx.Float32).ir_value(),
-        Vec.from_elements([as_mlir_value(v) for v in s_hi], fx.Float32).ir_value(),
+        Vec.from_elements(s_lo, fx.Float32).ir_value(),
+        Vec.from_elements(s_hi, fx.Float32).ir_value(),
     )
 
 
@@ -117,7 +110,7 @@ def _scale_sub_score_pair(v_s, row_max_raw, scale, zero_f, bias=None):
         return Vec.from_elements(centered, fx.Float32)
 
     lo, hi = _center(s_lo), _center(s_hi)
-    return as_mlir_value(lo), as_mlir_value(hi)
+    return fx.as_ir_value(lo), fx.as_ir_value(hi)
 
 
 def _exp2_score_slice(v_s, start):
@@ -125,18 +118,18 @@ def _exp2_score_slice(v_s, start):
         s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
         lo_partial = []
         for r in range_constexpr(16):
-            lo_partial.append(rocdl.exp2(T.f32, as_mlir_value(s_lo[r])))
+            lo_partial.append(fx.exp2(s_lo[r], fastmath="afn").ir_value())
         return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
 
     lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
     hi_full = []
     for r in range_constexpr(16):
-        hi_full.append(rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])))
+        hi_full.append(fx.exp2(Vec(v_s[1])[r], fastmath="afn").ir_value())
     return lo_partial, hi_full
 
 
 def _safe_l_inv(l_row, zero_f):
-    l_inv = rocdl.rcp(T.f32, as_mlir_value(l_row))
+    l_inv = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
     return (fx.Float32(l_row) > zero_f).select(l_inv, zero_f)
 
 
@@ -259,6 +252,7 @@ class PagedDualwaveSwpFp8Traits:
     CSR_PAGE_TABLE: bool = False
     HAS_LAST_PAGE_LENS: bool = False
     GUARD_OUTPUT_ROWS: bool = True
+    RETURN_LSE: bool = False
     DMA_BYTES: int = 16
     ELEM_BYTES: int = 1
     OUT_ELEM_BYTES: int = 2
@@ -289,7 +283,17 @@ class PagedDualwaveSwpFp8Traits:
             self.CSR_PAGE_TABLE,
             self.HAS_LAST_PAGE_LENS,
             self.GUARD_OUTPUT_ROWS,
+            self.RETURN_LSE,
         )
+
+    @property
+    def LSE_BEFORE_O(self):
+        # This ordering and late row reconstruction keep page-1 V192 spill-free.
+        return self.RETURN_LSE and self.PAGE_SIZE == 1 and self.HEAD_DIM_V == 192
+
+    @property
+    def P_HEADROOM_LOG2(self):
+        return _p_headroom_log2(self)
 
     @property
     def K_LDS_PAGE_GROUPED(self):
@@ -338,6 +342,7 @@ def _make_paged_dualwave_swp_fp8_traits(
     metadata_mode="block_table",
     has_last_page_lens=False,
     guard_output_rows=True,
+    return_lse=False,
 ):
     """Build layouts after the dedicated builder validates the paged contract."""
     block_n = 64
@@ -376,6 +381,7 @@ def _make_paged_dualwave_swp_fp8_traits(
         CSR_PAGE_TABLE=metadata_mode == "csr",
         HAS_LAST_PAGE_LENS=bool(has_last_page_lens),
         GUARD_OUTPUT_ROWS=bool(guard_output_rows),
+        RETURN_LSE=bool(return_lse),
         DEFAULT_STRIDE_Q_N=num_heads * head_dim,
         SMEM_D_RPT=smem_d_rpt,
         NUM_PREFETCH_K=num_prefetch_k,
@@ -413,6 +419,8 @@ class DualwaveFp8KernelContext:
         stride_o_n=None,
         BlockTable=None,
         block_table_stride=None,
+        LSE=None,
+        lse_stride_h=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -435,6 +443,8 @@ class DualwaveFp8KernelContext:
         self.softmax_scale = softmax_scale
         self.BlockTable = BlockTable
         self.block_table_stride = block_table_stride
+        self.LSE = LSE
+        self.lse_stride_h = lse_stride_h
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -453,7 +463,6 @@ class DualwaveFp8KernelContext:
 
     def init_lds(self, shared_storage):
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
-        self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_vt_base_idx = fx.Index(fx.ptrtoint(lds.vt.ptr))
         # The 16-byte tile stride preserves wide LDS loads; i64-element
@@ -539,8 +548,8 @@ class DualwaveFp8KernelContext:
     def init_descriptors(self):
         traits = self.traits
         eb = traits.ELEM_BYTES
-        q_nrec_bytes = as_mlir_value(self.q_tok_end * self.stride_q_n_v * eb)
-        o_nrec_bytes = as_mlir_value(
+        q_nrec_bytes = fx.as_ir_value(self.q_tok_end * self.stride_q_n_v * eb)
+        o_nrec_bytes = fx.as_ir_value(
             self.q_tok_end * self.stride_o_n_v * traits.OUT_ELEM_BYTES
         )
 
@@ -629,22 +638,21 @@ class DualwaveFp8KernelContext:
         causal_end_i32 = fx.Int32(
             fx.min(fx.max(causal_end_raw, fx.Int64(0)), fx.Int64((1 << 31) - 1))
         )
-        causal_num_tiles = (fx.Index(causal_end_i32) + kv_tile_size - 1) // kv_tile_size
-        max_num_tiles = fx.Index(
+        causal_num_tiles = (fx.Int64(causal_end_i32) + kv_tile_size - 1) // kv_tile_size
+        max_num_tiles = fx.Int64(
             (causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles)
         )
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
-        max_num_tiles = ((max_num_tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
-        max_num_tiles = fx.Index(
-            (max_num_tiles < fx.Index(4)).select(fx.Index(4), max_num_tiles)
+        max_num_tiles = ((max_num_tiles + fx.Int64(1)) // fx.Int64(2)) * fx.Int64(2)
+        max_num_tiles = fx.Int64(
+            (max_num_tiles < fx.Int64(4)).select(fx.Int64(4), max_num_tiles)
         )
-        self.max_num_tiles = max_num_tiles
         split_t0 = 0
         split_t_end = max_num_tiles
         active = self.q_start < self.seqlen_q_v
         in_mask = causal_end_raw > fx.Int64(0)
         active = active & in_mask
-        split_t_end = fx.Index(active.select(split_t_end, split_t0))
+        split_t_end = fx.Int64(active.select(split_t_end, split_t0))
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end

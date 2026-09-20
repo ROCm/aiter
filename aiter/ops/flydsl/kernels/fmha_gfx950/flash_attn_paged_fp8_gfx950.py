@@ -21,6 +21,7 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_softmax import (
 )
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     PAGED_FP8_BUFFER_LIMIT_BYTES,
+    PAGED_FP8_HEAD_DIMS,
     DualwaveFp8KernelContext,
     _make_paged_dualwave_swp_fp8_traits,
 )
@@ -42,20 +43,12 @@ def build_flash_attn_paged_fp8_module(
     num_heads,
     head_dim,
     value_head_dim=None,
-    causal=True,
-    dtype_str="bf16",
     num_kv_heads=None,
     waves_per_eu=2,
     daz=True,
     dualwave_swp_lazy_rescale=True,
     rescale_threshold=8.0,
-    dualwave_swp_setprio=True,
-    dualwave_swp_enable_stagger=True,
-    num_kv_splits=1,
-    varlen=False,
-    cross_seqlen=False,
-    paged=False,
-    kv_cache_layout="linear",
+    kv_cache_layout="vectorized",
     paged_bn128=False,
     batch_interleave_group=1,
     page_size=64,
@@ -63,11 +56,10 @@ def build_flash_attn_paged_fp8_module(
     metadata_mode="block_table",
     has_last_page_lens=False,
     guard_output_rows=True,
+    return_lse=False,
 ):
     """Build the gfx950 packed-varlen paged FP8 attention launcher.
 
-    Priority/stagger options are accepted for caller compatibility; this
-    paired-page pipeline uses neither wave-priority nor staggered phases.
     All page-ID paths consume packed cu-seqlens, including B=1. Direct
     callers supply native cache tensors, flat contiguous Q/O, int32 metadata
     and one-element fp32 descales for both launch and explicit compilation;
@@ -84,21 +76,10 @@ def build_flash_attn_paged_fp8_module(
     native_cache_layout = (
         page_size == 1 and kv_cache_layout in ("linear", "linear3d")
     ) or (page_size in (16, 64, 1024) and kv_cache_layout == "vectorized")
-    if (
-        not paged
-        or dtype_str != "fp8"
-        or not causal
-        or not varlen
-        or not cross_seqlen
-        or (head_dim, value_head_dim) not in ((128, 128), (192, 128), (192, 192))
-        or not native_cache_layout
-        or int(num_kv_splits) != 1
-    ):
-        raise RuntimeError(
-            "paged FP8 flash_attn requires gfx950, causal packed-varlen cross-attention, "
-            "page-16/64/1024 vectorized or page-1 linear/linear3d KV, (head_dim,value_head_dim) in "
-            "{(128,128),(192,128),(192,192)}, "
-            "and num_kv_splits=1"
+    if (head_dim, value_head_dim) not in PAGED_FP8_HEAD_DIMS or not native_cache_layout:
+        raise ValueError(
+            "paged FP8 requires page-1 linear/linear3d or page-16/64/1024 vectorized KV "
+            "and (head_dim, value_head_dim) in {(128,128),(192,128),(192,192)}"
         )
 
     if num_kv_heads is None:
@@ -139,6 +120,7 @@ def build_flash_attn_paged_fp8_module(
         metadata_mode=metadata_mode,
         has_last_page_lens=has_last_page_lens,
         guard_output_rows=guard_output_rows,
+        return_lse=return_lse,
     )
     BLOCK_M = traits.BLOCK_M
     BLOCK_SIZE = traits.BLOCK_SIZE
@@ -170,11 +152,11 @@ def build_flash_attn_paged_fp8_module(
         QDescale: fx.Tensor,
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_o_n: fx.Int32,
         softmax_scale: fx.Float32,
+        LSE: fx.Tensor,
+        lse_stride_h: fx.Int32,
     ):
         ctx = DualwaveFp8KernelContext(
             traits,
@@ -193,6 +175,8 @@ def build_flash_attn_paged_fp8_module(
             stride_o_n=DEFAULT_STRIDE_O_N if PAIRED_PAGE_IDS else stride_o_n,
             BlockTable=BlockTable,
             block_table_stride=block_table_stride,
+            LSE=LSE,
+            lse_stride_h=lse_stride_h,
         )
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
@@ -492,12 +476,18 @@ def build_flash_attn_paged_fp8_module(
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
 
+        if const_expr(traits.LSE_BEFORE_O and not traits.GUARD_OUTPUT_ROWS):
+            # Reconstruct from the wave-uniform row start instead of keeping
+            # the original 64-bit per-lane row live across the KV loop. The
+            # unguarded-output contract proves these row positions fit i32.
+            q_row = fx.Int64(ctx.q_start_pos_i32) + ctx.lane_mod_32
+
         inv_l = softmax_helper.safe_l_inv(l_row)
         value_descale = _load(fx.get_iter(ctx.VDescale), dtype=fx.Float32, count=1)
         inv_l = inv_l * value_descale
         softmax_helper.scale_o(v_o, inv_l)
         rocdl.s_barrier()
-        output_store.store_final_o(v_o, q_row)
+        output_store.store_final_o(v_o, q_row, m_row, l_row)
 
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
@@ -515,10 +505,11 @@ def build_flash_attn_paged_fp8_module(
         VDescale: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_o_n: fx.Int32,
         softmax_scale: fx.Float32,
+        LSE: fx.Tensor,
+        lse_stride_h: fx.Int32,
         stream: fx.Stream,
     ):
         # Make shape/mode traits visible to the JIT cache key.
@@ -555,11 +546,11 @@ def build_flash_attn_paged_fp8_module(
             QDescale,
             KDescale,
             VDescale,
-            seq_len,
-            seq_len_kv,
             stride_q_n,
             stride_o_n,
             softmax_scale,
+            LSE,
+            lse_stride_h,
             value_attrs=kernel_attrs,
         ).launch(
             grid=(
@@ -612,7 +603,6 @@ def build_flash_attn_paged_fp8_module(
         O,
         batch_size,
         seq_len,
-        stride_kv_n=None,
         stride_q_n=None,
         stride_o_n=None,
         softmax_scale=None,
@@ -626,6 +616,8 @@ def build_flash_attn_paged_fp8_module(
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        lse=None,
+        lse_stride_h=0,
         stream=None,
         _compile_only=False,
     ):
@@ -652,6 +644,10 @@ def build_flash_attn_paged_fp8_module(
             )
         if has_last_page_lens and kv_last_page_lens is None:
             raise ValueError("paged FP8 CSR launch requires kv_last_page_lens")
+        if return_lse and (lse is None or lse_stride_h <= 0):
+            raise ValueError(
+                "return_lse=True requires an LSE buffer and positive lse_stride_h"
+            )
         for metadata in (cu_seqlens_q, kv_metadata, block_table, kv_last_page_lens):
             if (
                 metadata is not None
@@ -661,7 +657,6 @@ def build_flash_attn_paged_fp8_module(
                 raise ValueError(
                     "paged FP8 metadata exceeds the signed-int32 byte limit"
                 )
-        # stride_kv_n is accepted for compatibility; native cache layouts fix it.
         if stride_q_n is None:
             stride_q_n = DEFAULT_STRIDE_Q_N
         if stride_o_n is None:
@@ -689,10 +684,11 @@ def build_flash_attn_paged_fp8_module(
             v_descale,
             batch_size,
             seq_len,
-            seq_len_kv,
             stride_q_n,
             stride_o_n,
             softmax_scale,
+            O if lse is None else lse,
+            lse_stride_h,
             fx.Stream(stream),
         )
 

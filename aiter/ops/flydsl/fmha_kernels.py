@@ -9,7 +9,7 @@ m32x8 prefill kernel, anything else ``None`` so the caller falls through to
 CK/Triton.
 
 ``flydsl_flash_attn_paged_prefill_func`` is an explicit gfx950 FP8 paged
-prefill API; unsupported requests raise without fallback.
+prefill API with optional LSE; unsupported requests raise without fallback.
 
 ``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
 `flash_attn_func_gfx1201` kernel with:
@@ -243,6 +243,8 @@ def flydsl_flash_attn_paged_prefill_func(
     softmax_scale: float | None = None,
     causal: bool = True,
     out: torch.Tensor | None = None,
+    return_lse: bool = False,
+    lse: torch.Tensor | None = None,
     stream: torch.cuda.Stream | None = None,
 ):
     """Compute causal paged prefill with the gfx950 FlyDSL FP8 kernel.
@@ -261,9 +263,11 @@ def flydsl_flash_attn_paged_prefill_func(
     than KV. ``softmax_scale`` defaults to ``Dqk**-0.5`` and must be a
     positive finite Python scalar, independent of the quantization descales.
 
-    Returns BF16 ``out[total_q, Hq, Dv]``; fully masked rows have zero
-    output. The output buffer may be preallocated and must be contiguous
-    on Q's device. Launches use the current stream unless supplied.
+    Returns BF16 ``out[total_q, Hq, Dv]``, or ``(out, lse)`` when
+    ``return_lse=True``. LSE is FP32 ``[Hq, total_q]`` in natural-log units;
+    fully masked rows have zero output and LSE ``-inf``. Both buffers may
+    be preallocated and must be contiguous on Q's device. ``lse`` requires
+    ``return_lse=True``. Launches use the current stream unless supplied.
 
     This is an explicit inference-only API: unsupported hardware, dtypes,
     layouts or noncausal requests raise rather than falling back. Local
@@ -292,6 +296,8 @@ def flydsl_flash_attn_paged_prefill_func(
         softmax_scale=softmax_scale,
         causal=causal,
         out=out,
+        return_lse=return_lse,
+        lse=lse,
         stream=stream,
     )
 

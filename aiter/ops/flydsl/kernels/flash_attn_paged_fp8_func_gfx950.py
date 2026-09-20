@@ -17,9 +17,9 @@ from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     PAGED_FP8_BLOCK_M,
     PAGED_FP8_BUFFER_LIMIT_BYTES,
+    PAGED_FP8_HEAD_DIMS,
 )
 
-_HEAD_DIMS = ((128, 128), (192, 128), (192, 192))
 _MAX_FLAT_ELEMS = 1 << 31
 
 
@@ -54,7 +54,7 @@ def _cache_geometry(q, k, v):
         raise ValueError("paged FP8 K/V must be rank 3, 4 or 5")
     if dim != q.shape[-1]:
         raise ValueError("paged FP8 K width must match Q")
-    if (dim, value_dim) not in _HEAD_DIMS:
+    if (dim, value_dim) not in PAGED_FP8_HEAD_DIMS:
         raise NotImplementedError(
             "paged FP8 supports D128/V128, D192/V128 and D192/V192"
         )
@@ -91,6 +91,7 @@ def _build(
     metadata_mode,
     has_last_page_lens,
     guard_output_rows,
+    return_lse=False,
 ):
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_paged_fp8_gfx950 import (
         build_flash_attn_paged_fp8_module,
@@ -101,11 +102,6 @@ def _build(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         value_head_dim=value_dim,
-        causal=True,
-        dtype_str="fp8",
-        varlen=True,
-        cross_seqlen=True,
-        paged=True,
         kv_cache_layout=layout,
         page_size=page_size,
         paged_bn128=paired,
@@ -115,6 +111,7 @@ def _build(
         metadata_mode=metadata_mode,
         has_last_page_lens=has_last_page_lens,
         guard_output_rows=guard_output_rows,
+        return_lse=return_lse,
     )
 
 
@@ -137,6 +134,8 @@ def flydsl_flash_attn_paged_fp8_func(
     softmax_scale=None,
     causal=True,
     out=None,
+    return_lse=False,
+    lse=None,
     dualwave_swp_lazy_rescale=True,
     stream=None,
 ):
@@ -155,6 +154,9 @@ def flydsl_flash_attn_paged_fp8_func(
     Q/K/V descales are single FP32 values on the same device. The independent
     softmax scale defaults to ``Dqk**-0.5`` and must be positive and finite.
     The output is contiguous BF16 and may be preallocated by the caller.
+    With ``return_lse=True``, return ``(out, lse)`` where LSE is contiguous
+    FP32 ``[Hq,total_q]`` in natural-log units; ``lse`` may be preallocated.
+    Fully masked rows have zero output and LSE ``-inf``.
     """
     if not all(torch.is_tensor(tensor) for tensor in (q, k, v)):
         raise ValueError("paged FP8 Q/K/V must be tensors")
@@ -277,8 +279,18 @@ def flydsl_flash_attn_paged_fp8_func(
         raise ValueError(
             "paged FP8 out must be contiguous BF16 with the expected shape on Q's device"
         )
-
-    if out is not None and out.requires_grad:
+    if lse is not None and not return_lse:
+        raise ValueError("lse requires return_lse=True")
+    lse_shape = (q.shape[1], q.shape[0])
+    if lse is not None and (
+        not torch.is_tensor(lse)
+        or lse.shape != lse_shape
+        or lse.dtype != torch.float32
+        or lse.device != q.device
+        or not lse.is_contiguous()
+    ):
+        raise ValueError("lse must be contiguous FP32 [Hq,total_q] on Q's device")
+    if any(tensor is not None and tensor.requires_grad for tensor in (out, lse)):
         raise NotImplementedError("paged FP8 output buffers must not require gradients")
 
     with torch.cuda.device(q.device):
@@ -290,6 +302,11 @@ def flydsl_flash_attn_paged_fp8_func(
         with torch.cuda.stream(launch_stream) if stream is not None else nullcontext():
             if out is None:
                 out = torch.empty(output_shape, dtype=torch.bfloat16, device=q.device)
+            if return_lse:
+                if lse is None:
+                    lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
+                if stream is not None:
+                    lse.record_stream(launch_stream)
             if (
                 q.numel() == 0
                 or pages == 0
@@ -297,9 +314,11 @@ def flydsl_flash_attn_paged_fp8_func(
                 or page_indices.numel() == 0
             ):
                 out.zero_()
+                if return_lse:
+                    lse.fill_(float("-inf"))
                 if stream is not None:
                     out.record_stream(launch_stream)
-                return out
+                return (out, lse) if return_lse else out
             paired = page_size == 64 and max_pages % 2 == 0
             group = (
                 _batch_interleave_group(batch, (dim, value_dim), paired)
@@ -334,6 +353,7 @@ def flydsl_flash_attn_paged_fp8_func(
                 metadata_mode="csr" if csr else "block_table",
                 has_last_page_lens=has_last,
                 guard_output_rows=guard_output_rows,
+                return_lse=return_lse,
             )
             if stream is not None:
                 # Copies must keep their caller-owned sources alive too, even
@@ -368,6 +388,8 @@ def flydsl_flash_attn_paged_fp8_func(
                 k_descale=scales[1],
                 v_descale=scales[2],
                 softmax_scale=softmax_scale,
+                lse=lse.view(-1) if return_lse else None,
+                lse_stride_h=q.shape[0] if return_lse else 0,
                 stream=launch_stream,
             )
             if stream is not None:
@@ -383,4 +405,4 @@ def flydsl_flash_attn_paged_fp8_func(
                     out,
                 ):
                     tensor.record_stream(launch_stream)
-    return out
+    return (out, lse) if return_lse else out

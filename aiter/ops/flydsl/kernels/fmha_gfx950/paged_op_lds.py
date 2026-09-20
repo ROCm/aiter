@@ -224,11 +224,6 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
 
                 _copy_tail_waves(dma_id)
 
-    def load_v(self, tile_start, buf_id, page_id=None, *, mask_padding=True):
-        self._stage_v_fp8_vectorized_bankpad(
-            tile_start, buf_id, page_id=page_id, mask_padding=mask_padding
-        )
-
     def _permute_v_fp8_vectorized(self, src_i32x4):
         src_words = Vec(src_i32x4, (4,), fx.Int32)
         # permlane16_swap returns an LLVM pair; unpack it at this intrinsic boundary.
@@ -257,10 +252,8 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
             fx.Int32,
         )
 
-    def _stage_v_fp8_vectorized_bankpad(
-        self, tile_start, buf_id, page_id=None, *, mask_padding=True
-    ):
-        """Stage vectorized paged V in the bank-padded direct-FP8 layout."""
+    def load_v(self, tile_start, buf_id, page_id=None, *, mask_padding=True):
+        """Stage native V pages in the matching FP8 LDS layout."""
         if const_expr(self.traits.K_LDS_PAGE_GROUPED and self.traits.CACHE_BUFFERED):
             self._stage_v_fp8_page16_segments(
                 tile_start, buf_id, page_id=page_id, mask_padding=mask_padding

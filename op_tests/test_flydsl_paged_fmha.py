@@ -17,6 +17,8 @@ from aiter.test_common import checkAllclose
 # Match the paged-FMHA benchmark for active rows; masked rows stay exact.
 FP8_RTOL = 0.02
 FP8_ATOL = 0.02
+LSE_RTOL = 1e-4
+LSE_ATOL = 1e-4
 
 LAYOUTS = [
     (1, "linear3d"),
@@ -115,15 +117,17 @@ def make_case(
     )
 
 
-def reference(case, *, scale=None, lengths=None):
+def reference(case, *, scale=None, lengths=None, return_lse=False):
     """Logical token reconstruction and FP32 attention, without kernel helpers."""
     scale = case.d**-0.5 if scale is None else scale
     lengths = case.klens if lengths is None else lengths
-    output = []
+    output, lse = [], []
     offset = 0
     for b, (qlen, klen) in enumerate(zip(case.qlens, lengths)):
         if klen == 0:
             output.append(torch.zeros(qlen, case.hq, case.dv, device="cuda"))
+            if return_lse:
+                lse.append(torch.full((case.hq, qlen), -float("inf"), device="cuda"))
             offset += qlen
             continue
         physical = case.table[b, : (klen + case.page - 1) // case.page].long()
@@ -141,13 +145,21 @@ def reference(case, *, scale=None, lengths=None):
             torch.arange(klen, device="cuda")[None, :]
             <= torch.arange(qlen, device="cuda")[:, None] + klen - qlen
         )
-        probability = torch.softmax(
-            scores.masked_fill(~allowed, float("-inf")), dim=-1
-        ).nan_to_num(0)
+        scores = scores.masked_fill(~allowed, float("-inf"))
+        if return_lse:
+            lse.append(torch.logsumexp(scores, dim=-1))
+        probability = torch.softmax(scores, dim=-1).nan_to_num(0)
         output.append((probability @ v.transpose(0, 1)).transpose(0, 1))
-    return (
+    output = (
         torch.cat(output) if output else torch.empty_like(case.out, dtype=torch.float32)
     )
+    if return_lse:
+        return output, (
+            torch.cat(lse, dim=1)
+            if lse
+            else torch.empty((case.hq, 0), dtype=torch.float32, device=case.q.device)
+        )
+    return output
 
 
 def run_case(case, **kwargs):
@@ -186,22 +198,6 @@ def csr_metadata(case, prefix=0):
             last, dtype=torch.int32, device=case.q.device
         ),
     }
-
-
-@gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
-@pytest.mark.parametrize("d,dv", DIMS)
-def test_csr_ragged_and_odd_page_bases(page, layout, d, dv):
-    case = make_case(
-        page,
-        layout,
-        d,
-        dv,
-        qlens=(0, 65, 300, 17),
-        klens=(33, 0, max(129, page + 1), 65),
-    )
-    options = csr_metadata(case, prefix=5)
-    check_case(case, **options)
 
 
 @gfx950
@@ -259,23 +255,97 @@ def check_case(case, **kwargs):
     return actual
 
 
+def check_lse(actual, expected):
+    assert actual.dtype == torch.float32 and actual.shape == expected.shape
+    assert torch.equal(actual.isneginf(), expected.isneginf())
+    finite = expected.isfinite()
+    assert bool(actual[finite].isfinite().all())
+    if bool(finite.any()):
+        err = checkAllclose(
+            actual[finite],
+            expected[finite],
+            rtol=LSE_RTOL,
+            atol=LSE_ATOL,
+            tol_err_ratio=0,
+            msg="paged FP8 LSE",
+        )
+        assert err == 0
+        return float((actual[finite] - expected[finite]).abs().max())
+    return 0.0
+
+
+@gfx950
+@pytest.mark.parametrize("page,layout", LAYOUTS)
+@pytest.mark.parametrize("d,dv", DIMS)
+@pytest.mark.parametrize("csr", [False, True])
+def test_lse_ragged_and_output_buffers(page, layout, d, dv, csr):
+    case = make_case(
+        page,
+        layout,
+        d,
+        dv,
+        qlens=(0, 65, max(300, page + 17), 17),
+        klens=(33, 0, max(129, page + 1), 65),
+    )
+    options = csr_metadata(case, prefix=5) if csr else {}
+    expected, expected_lse = reference(case, scale=0.137, return_lse=True)
+    plain = run_case(case, **options, softmax_scale=0.137).clone()
+    storage = torch.full((case.hq * case.q.shape[0] + 32,), 123.0, device="cuda")
+    buffer = storage[16:-16].view(case.hq, -1)
+    actual, lse = run_case(
+        case, **options, softmax_scale=0.137, return_lse=True, lse=buffer
+    )
+    assert actual is case.out and lse is buffer
+    torch.testing.assert_close(actual, plain, rtol=0, atol=0)
+    check_accuracy(case, actual, expected)
+    check_lse(lse, expected_lse)
+    assert bool((storage[:16] == 123).all() & (storage[-16:] == 123).all())
+
+
+@gfx950
+@pytest.mark.parametrize("qlens,klens", [((0, 0), (1, 2)), ((1, 65), (0, 0))])
+def test_lse_empty_launch(qlens, klens):
+    case = make_case(64, "vectorized", 128, 128, qlens=qlens, klens=klens)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    output = torch.empty_like(case.out)
+    buffer = torch.empty((case.hq, case.q.shape[0]), device="cuda")
+    for out_arg, lse_arg in ((None, None), (output, buffer)):
+        actual, lse = run_case(
+            case, out=out_arg, lse=lse_arg, return_lse=True, stream=stream
+        )
+        stream.synchronize()
+        if out_arg is not None:
+            assert actual is output and lse is buffer
+        expected, expected_lse = reference(case, return_lse=True)
+        torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
+        check_lse(lse, expected_lse)
+
+
+@gfx950
+def test_lse_buffer_validation():
+    case = make_case(64, "vectorized", 128, 128, qlens=(17,), klens=(65,))
+    shape = (case.hq, case.q.shape[0])
+    for buffer in (
+        torch.empty((shape[0], shape[1] - 1), device="cuda"),
+        torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
+        torch.empty(shape, device="cpu"),
+        torch.empty((shape[0], shape[1] * 2), device="cuda")[:, ::2],
+    ):
+        with pytest.raises(ValueError, match="lse must be contiguous FP32"):
+            run_case(case, return_lse=True, lse=buffer)
+    with pytest.raises(ValueError, match="lse requires return_lse=True"):
+        run_case(case, lse=torch.empty(shape, device="cuda"))
+    # The same caller-owned buffer succeeds when it satisfies the contract.
+    _, lse = run_case(case, return_lse=True, lse=torch.empty(shape, device="cuda"))
+    check_lse(lse, reference(case, return_lse=True)[1])
+
+
 @gfx950
 @pytest.mark.parametrize("page,layout", LAYOUTS)
 @pytest.mark.parametrize("d,dv", DIMS)
 def test_native_layouts_ragged_multiblock(page, layout, d, dv):
     check_case(make_case(page, layout, d, dv))
-
-
-@gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
-@pytest.mark.parametrize("d,dv", DIMS)
-def test_empty_requests_and_fully_masked_rows(page, layout, d, dv):
-    case = make_case(
-        page, layout, d, dv, qlens=(0, 65, 300, 17), klens=(33, 0, 129, 65)
-    )
-    actual = check_case(case)
-    assert torch.count_nonzero(actual[:65]) == 0
-    assert torch.count_nonzero(actual[65 : 65 + 171]) == 0
 
 
 @gfx950
@@ -406,18 +476,21 @@ def test_strided_metadata_and_scalar_descales(page, layout):
 
 @gfx950
 @pytest.mark.parametrize(
-    "page,layout,d,dv",
+    "page,layout,d,dv,return_lse",
     [
-        (1, "linear", 128, 128),
-        (1, "linear3d", 192, 128),
-        (16, "vectorized", 192, 192),
-        (64, "vectorized", 192, 128),
-        (1024, "vectorized", 192, 192),
+        (1, "linear", 128, 128, False),
+        (1, "linear3d", 192, 128, False),
+        (16, "vectorized", 192, 192, False),
+        (64, "vectorized", 192, 128, False),
+        (1024, "vectorized", 192, 192, False),
+        (1, "linear3d", 192, 192, True),
     ],
 )
-def test_copies_follow_nondefault_stream(page, layout, d, dv):
+def test_copies_follow_nondefault_stream(page, layout, d, dv, return_lse):
     case = make_case(page, layout, d, dv)
     expected = check_case(case).clone()
+    expected_lse = reference(case, return_lse=True)[1]
+    lse = torch.empty_like(expected_lse) if return_lse else None
 
     def strided(tensor):
         storage = torch.empty(
@@ -432,16 +505,19 @@ def test_copies_follow_nondefault_stream(page, layout, d, dv):
     case.q, case.k, case.v = map(strided, (case.q, case.k, case.v))
     stream = torch.cuda.Stream(priority=-1)
     torch.cuda.synchronize()
-    run_case(case, stream=stream)
+    run_case(case, stream=stream, return_lse=return_lse, lse=lse)
     stream.synchronize()
     torch.cuda._sleep(3_000_000_000)
     blocked = torch.cuda.Event()
     blocked.record()
-    run_case(case, stream=stream)
+    run_case(case, stream=stream, return_lse=return_lse, lse=lse)
     stream.synchronize()
     assert not blocked.query(), "copies waited on the blocked default stream"
     torch.cuda.synchronize()
     torch.testing.assert_close(case.out, expected, rtol=0, atol=0)
+
+    if return_lse:
+        check_lse(lse, expected_lse)
 
 
 @gfx950
@@ -527,6 +603,8 @@ def test_csr_graph_updates_ranges_and_lengths(page, layout, d, dv):
         page, layout, d, dv, qlens=(17, 65), klens=(max(513, page + 1), 81)
     )
     metadata = csr_metadata(case, prefix=5)
+    lse = torch.empty((case.hq, case.q.shape[0]), device="cuda")
+    metadata.update(return_lse=True, lse=lse)
     run_case(case, **metadata, softmax_scale=0.137)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -552,15 +630,21 @@ def test_csr_graph_updates_ranges_and_lengths(page, layout, d, dv):
                 case.table[batch, :count]
             )
         case.out.fill_(float("nan"))
+        lse.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         assert bool(case.out.isfinite().all())
+        expected, expected_lse = reference(
+            case, scale=0.137, lengths=lengths, return_lse=True
+        )
         torch.testing.assert_close(
             case.out.float(),
-            reference(case, scale=0.137, lengths=lengths),
+            expected,
             rtol=FP8_RTOL,
             atol=FP8_ATOL,
         )
+
+        check_lse(lse, expected_lse)
 
 
 @gfx950
@@ -587,16 +671,36 @@ def test_csr_strided_metadata_on_side_stream(page, layout):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", [LAYOUTS[i] for i in (0, 2, 3, 4)])
-@pytest.mark.parametrize("d,dv", DIMS)
-def test_lazy_and_eager_match_reference(page, layout, d, dv):
-    # Layout/metadata coverage uses lazy mode above. Check both softmax modes
-    # for each page size/width without duplicating the rank/metadata product.
+@pytest.mark.parametrize(
+    "page,layout,d,dv,return_lse",
+    [
+        (page, layout, d, dv, False)
+        for page, layout in (LAYOUTS[i] for i in (0, 2, 3, 4))
+        for d, dv in DIMS
+    ]
+    + [
+        (64, "vectorized", 128, 128, True),
+        (16, "vectorized", 192, 128, True),
+        (1, "linear3d", 192, 192, True),
+    ],
+)
+def test_lazy_and_eager_match_reference(page, layout, d, dv, return_lse):
+    # Cover both softmax modes across pages/widths, with LSE on each head pair.
+    # The ragged LSE matrix covers the full layout/metadata product.
     case = make_case(page, layout, d, dv)
     options = csr_metadata(case, prefix=5)
-    lazy = check_case(case, **options).clone()
-    eager = check_case(case, **options, dualwave_swp_lazy_rescale=False)
-    torch.testing.assert_close(eager, lazy, rtol=FP8_RTOL, atol=FP8_ATOL)
+    if not return_lse:
+        lazy = check_case(case, **options).clone()
+        eager = check_case(case, **options, dualwave_swp_lazy_rescale=False)
+        torch.testing.assert_close(eager, lazy, rtol=FP8_RTOL, atol=FP8_ATOL)
+        return
+    expected, expected_lse = reference(case, return_lse=True)
+    for lazy in (True, False):
+        actual, lse = run_case(
+            case, **options, return_lse=True, dualwave_swp_lazy_rescale=lazy
+        )
+        check_accuracy(case, actual, expected)
+        check_lse(lse, expected_lse)
 
 
 def _large_case(page, layout, d, dv, high_page):
@@ -822,30 +926,39 @@ def test_d128_query_bound_preserves_rescaling(mode, csr):
     scale = 0.137
     peak = {"bounded": 3.0, "escape": 16.0, "mixed-waves": 3.0, "negative": 2.5}[mode]
     case.ks.fill_(peak / (448 * scale * math.log2(math.e)))
-    expected = reference(case, scale=scale)
+    expected, expected_lse = reference(case, scale=scale, return_lse=True)
     options = csr_metadata(case, prefix=5) if csr else {}
     for lazy in (True, False):
-        actual = run_case(
-            case, **options, softmax_scale=scale, dualwave_swp_lazy_rescale=lazy
+        actual, lse = run_case(
+            case,
+            **options,
+            softmax_scale=scale,
+            dualwave_swp_lazy_rescale=lazy,
+            return_lse=True,
         )
         assert bool(actual.isfinite().all())
         torch.testing.assert_close(
             actual.float(), expected, rtol=FP8_RTOL, atol=FP8_ATOL
         )
 
+        check_lse(lse, expected_lse)
+
 
 @gfx950
 @pytest.mark.parametrize(
-    "page,layout,d,dv,csr",
+    "page,layout,d,dv,csr,return_lse",
     [
-        (1, "linear3d", 128, 128, False),
-        (1, "linear", 192, 128, True),
-        (16, "vectorized", 192, 192, True),
-        (64, "vectorized", 192, 128, False),
-        (1024, "vectorized", 128, 128, True),
+        (1, "linear3d", 128, 128, False, False),
+        (1, "linear", 192, 128, True, False),
+        (16, "vectorized", 192, 192, True, False),
+        (64, "vectorized", 192, 128, False, False),
+        (1024, "vectorized", 128, 128, True, False),
+        (1, "linear3d", 192, 192, False, True),
     ],
 )
-def test_explicit_compile_then_launch(monkeypatch, page, layout, d, dv, csr):
+def test_explicit_compile_then_launch(
+    monkeypatch, page, layout, d, dv, csr, return_lse
+):
     case = make_case(page, layout, d, dv, qlens=(65, 17), klens=(128, 97))
     original = paged._build
     original.cache_clear()
@@ -856,11 +969,14 @@ def test_explicit_compile_then_launch(monkeypatch, page, layout, d, dv, csr):
 
         def run(*args, **options):
             before = case.out.view(torch.uint8).clone()
+            before_lse = options["lse"].clone() if return_lse else None
             compile_results.append(launcher.compile(*args, **options))
             torch.cuda.synchronize()
             torch.testing.assert_close(
                 case.out.view(torch.uint8), before, rtol=0, atol=0
             )
+            if return_lse:
+                torch.testing.assert_close(options["lse"], before_lse, rtol=0, atol=0)
             return launcher(*args, **options)
 
         return run
@@ -868,13 +984,24 @@ def test_explicit_compile_then_launch(monkeypatch, page, layout, d, dv, csr):
     monkeypatch.setattr(paged, "_build", build)
     for _ in range(2):  # Cold preload, then preload after a real launch.
         case.out.fill_(123)
-        check_case(case, **(csr_metadata(case, prefix=1) if csr else {}))
+        options = csr_metadata(case, prefix=1) if csr else {}
+        if return_lse:
+            buffer = torch.full((case.hq, case.q.shape[0]), 123.0, device="cuda")
+            actual, lse = run_case(case, **options, return_lse=True, lse=buffer)
+            expected, expected_lse = reference(case, return_lse=True)
+            check_accuracy(case, actual, expected)
+            check_lse(lse, expected_lse)
+        else:
+            check_case(case, **options)
     assert len(compile_results) == 2  # Older no-dispatch runtimes return None.
 
 
 @gfx950
-def test_loose_query_bound_cannot_wrap_output():
-    case = make_case(64, "vectorized", 128, 128, qlens=(2,), klens=(1,), heads=(16, 1))
+@pytest.mark.parametrize(
+    "page,layout,d,dv", [(64, "vectorized", 128, 128), (1, "linear3d", 192, 192)]
+)
+def test_loose_query_bound_cannot_wrap_output(page, layout, d, dv):
+    case = make_case(page, layout, d, dv, qlens=(2,), klens=(1,), heads=(16, 1))
     expected = check_case(case).clone()
     # Padded row 2**20 starts at 2**32 BF16 bytes and aliases row zero if
     # the output store truncates the offset before rejecting inactive rows.
@@ -883,6 +1010,10 @@ def test_loose_query_bound_cannot_wrap_output():
     run_case(case)
     torch.cuda.synchronize()
     torch.testing.assert_close(case.out, expected, rtol=0, atol=0)
+
+    actual, lse = run_case(case, return_lse=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    check_lse(lse, reference(case, return_lse=True)[1])
 
 
 @gfx950

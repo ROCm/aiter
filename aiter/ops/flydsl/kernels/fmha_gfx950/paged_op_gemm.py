@@ -9,7 +9,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     DualwaveFp8KernelContext,
@@ -57,15 +56,15 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             base = g * 4
             w = rocdl.cvt_pk_fp8_f32(
                 T.i32,
-                as_mlir_value(f32_vals[base]),
-                as_mlir_value(f32_vals[base + 1]),
+                fx.as_ir_value(f32_vals[base]),
+                fx.as_ir_value(f32_vals[base + 1]),
                 c0,
                 0,
             )
             w = rocdl.cvt_pk_fp8_f32(
                 T.i32,
-                as_mlir_value(f32_vals[base + 2]),
-                as_mlir_value(f32_vals[base + 3]),
+                fx.as_ir_value(f32_vals[base + 2]),
+                fx.as_ir_value(f32_vals[base + 3]),
                 w,
                 1,
             )
@@ -76,8 +75,8 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         words = []
         for ks in range_constexpr(4):
             v2 = Vec.from_elements([fx.Int64(v_v[ks][dc])], fx.Int64).bitcast(fx.Int32)
-            words.append(fx.Int32(v2[0]))
-            words.append(fx.Int32(v2[1]))
+            words.append(v2[0])
+            words.append(v2[1])
         return Vec.from_elements(words, fx.Int32).ir_value()
 
     def load_q_wide(self):
@@ -86,9 +85,9 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         d_base = self.lane_div_32 * 32
         packs = []
         for ws in range_constexpr(traits.HEAD_DIM // 64):
-            elem = self.global_idx_q(self.ctx_ref.q_row, fx.Index(ws * 64) + d_base)
+            elem = self.global_idx_q(self.ctx_ref.q_row, ws * 64 + d_base)
             lo = self.buffer_load_128(elem)
-            hi = self.buffer_load_128(elem + fx.Index(16))
+            hi = self.buffer_load_128(elem + 16)
             packs.append(Vec(lo).shuffle(Vec(hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value())
         return packs
 
@@ -120,12 +119,9 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             f32 += [hi_full[p_base + s] for s in range_constexpr(8)]
         return self._pack_p_fp8(f32)
 
-    def _pv_fp8_direct(self, p_fp8, v_v, v_o):
+    def pv(self, p_fp8, v_v, v_o):
         v_o = self.preserve_accumulators(v_o)
         for dc in range_constexpr(self.traits.D_CHUNKS):
             v_op = self._v_concat_i32x8(v_v, dc)
             v_o[dc] = self._mfma_acc_fp8_wide(v_op, p_fp8, v_o[dc])
         return v_o
-
-    def pv(self, v_p, v_v, v_o):
-        return self._pv_fp8_direct(v_p, v_v, v_o)

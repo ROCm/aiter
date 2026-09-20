@@ -19,20 +19,20 @@ from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import LOG2E as _LOG2E
 from .common import (
+    LN2 as _LN2,
+)
+from .common import (
     _buffer_load_128,
     _buffer_load_lds_128,
     _buffer_store_128,
     _cu_load,
 )
 from .common import (
+    _p_headroom_log2 as _p_headroom_log2,  # noqa: PLC0414 - shared FP8 contract
+)
+from .common import (
     _read_exec_i64 as _read_exec_i64,  # noqa: PLC0414 - compatibility re-export
 )
-
-_LN2 = 1.0 / _LOG2E
-
-# log2 of e4m3's largest finite value, 448.
-_P_HEADROOM_LOG2 = 8.807354922057604
-
 
 LDS_BYTES_GFX950 = 160 * 1024
 
@@ -264,14 +264,6 @@ def _make_ws_rsrc(ws_base_i64, byte_offset, nrec_bytes):
     return buffer_ops.create_buffer_resource_from_addr(
         addr_i64, num_records_bytes=as_mlir_value(fx.Int64(nrec_bytes))
     )
-
-
-def _p_headroom_log2(traits):
-    """Exponent bias `sub_m` folds into P, so l_row carries a 2**this factor."""
-    h = _P_HEADROOM_LOG2
-    if traits.DUALWAVE_SWP_LAZY_RESCALE:
-        h -= traits.DUALWAVE_SWP_RESCALE_THRESHOLD
-    return max(0.0, h)
 
 
 def _store_lse(ctx, row, m_scaled, l_row, in_range, is_writer):

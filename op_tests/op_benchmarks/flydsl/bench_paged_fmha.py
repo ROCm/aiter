@@ -11,7 +11,7 @@ preallocated BF16 outputs:
 
 python3 -m op_tests.op_benchmarks.flydsl.bench_paged_fmha
 python3 -m op_tests.op_benchmarks.flydsl.bench_paged_fmha \
-        -b 1 -s 65536,131072 --page-sizes 64 --backends flydsl \
+        -b 1 -s 65536,131072 --page-sizes 64 --backends flydsl --return-lse 0 1 \
         --iters 100 --warmup 10 -o paged.csv
 """
 
@@ -34,9 +34,14 @@ FP8_ATOL = 0.02
 REFERENCE_SCORE_BYTES = 256 * 1024**2
 
 
-def reference_chunked(case, score_bytes=REFERENCE_SCORE_BYTES):
+def reference_chunked(case, score_bytes=REFERENCE_SCORE_BYTES, return_lse=False):
     """Full-output FP32 oracle, gathering each request's logical K/V only once."""
     output = torch.empty_like(case.out, dtype=torch.float32)
+    lse = (
+        torch.full((case.hq, case.q.shape[0]), -float("inf"), device=case.q.device)
+        if return_lse
+        else None
+    )
     offset = 0
     for b, (qlen, klen) in enumerate(zip(case.qlens, case.klens)):
         if klen == 0:
@@ -64,11 +69,13 @@ def reference_chunked(case, score_bytes=REFERENCE_SCORE_BYTES):
             query_positions = torch.arange(start, end, device=case.q.device)
             allowed = key_positions[None, :] <= query_positions[:, None] + klen - qlen
             scores.masked_fill_(~allowed, float("-inf"))
+            if return_lse:
+                lse[:, offset + start : offset + end] = torch.logsumexp(scores, dim=-1)
             probability = torch.softmax(scores, dim=-1).nan_to_num_(0)
             output[offset + start : offset + end] = (probability @ v).transpose(0, 1)
             del scores, probability
         offset += qlen
-    return output
+    return (output, lse) if return_lse else output
 
 
 def mean_relative_error(reference, actual):
@@ -135,6 +142,7 @@ def benchmark_paged(
     page_size,
     dtype,
     backends,
+    return_lse=False,
     iters=100,
     warmup=10,
     check=True,
@@ -144,7 +152,7 @@ def benchmark_paged(
     from aiter.ops.flydsl import flydsl_flash_attn_paged_prefill_func
     from aiter.ops.mha import _mha_batch_prefill
     from aiter.test_common import checkAllclose, run_perftest
-    from op_tests.test_flydsl_paged_fmha import csr_metadata, make_case
+    from op_tests.test_flydsl_paged_fmha import check_lse, csr_metadata, make_case
 
     layout = "linear3d" if page_size == 1 else "vectorized"
     ret = {"gfx": get_gfx(), "layout": layout}
@@ -190,6 +198,12 @@ def benchmark_paged(
             softmax_scale=scale,
             causal=True,
             out=output,
+            return_lse=return_lse,
+            lse=(
+                torch.empty((case.hq, case.q.shape[0]), device=case.q.device)
+                if return_lse
+                else None
+            ),
             **descales,
         )
     if "ck" in selected:
@@ -198,7 +212,7 @@ def benchmark_paged(
         ck_value = case.v.unsqueeze(1) if page_size == 1 else case.v
 
         def ck():
-            return _mha_batch_prefill(
+            result = _mha_batch_prefill(
                 case.q,
                 ck_key,
                 ck_value,
@@ -212,8 +226,10 @@ def benchmark_paged(
                 True,
                 kv_last_page_lens=last,
                 out=ck_output,
+                return_lse=return_lse,
                 **descales,
-            )[0]
+            )
+            return result[:2] if return_lse else result[0]
 
         candidates["ck"] = ck
     # Respect the requested order, including when checking the reverse order.
@@ -222,9 +238,17 @@ def benchmark_paged(
     # Complete every backend's first-use work before warming or timing any one.
     for fn in candidates.values():
         fn()
-    expected = reference_chunked(case) if check else None
+    reference = reference_chunked(case, return_lse=return_lse) if check else None
+    expected = reference[0] if check and return_lse else reference
     flops = (
         2 * batch * 16 * _causal_pairs(query_length, kv_length) * (head_dim + value_dim)
+    )
+    # Logical Q/K/V reads and O/LSE writes; excludes repeated hardware traffic.
+    nbytes = (
+        case.q.numel() * case.q.element_size()
+        + batch * kv_length * case.hkv * (head_dim + value_dim) * case.k.element_size()
+        + case.out.numel() * case.out.element_size()
+        + (case.hq * case.q.shape[0] * 4 if return_lse else 0)
     )
     measurements = {
         name: run_perftest(fn, num_iters=iters, num_warmup=warmup, num_rotate_args=1)
@@ -233,6 +257,13 @@ def benchmark_paged(
     # Each backend owns a distinct output buffer. Check them only after all
     # timings, so reductions/copies from accuracy checks cannot perturb a peer.
     for name, (actual, avg_us) in measurements.items():
+        lse_actual = actual[1] if return_lse else None
+        actual = actual[0] if return_lse else actual
+        lse_error = (
+            check_lse(lse_actual, reference[1])
+            if check and return_lse
+            else float("nan")
+        )
         assert bool(actual.isfinite().all()), f"{name} output is not finite"
         err = float("nan")
         if check:
@@ -248,6 +279,8 @@ def benchmark_paged(
         us = float(avg_us)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} lse_max_abs_error"] = lse_error
         ret[f"{name} err"] = err
         ret[f"{name} status"] = "PASS" if check else "SKIP"
         ret[f"{name} accuracy"] = (
@@ -319,6 +352,9 @@ def main():
         help="entry points to compare, in measurement order",
     )
     parser.add_argument(
+        "--return-lse", type=int, nargs="+", choices=[0, 1], default=[0]
+    )
+    parser.add_argument(
         "--iters", type=int, default=100, help="profiled calls per backend (minimum 2)"
     )
     parser.add_argument(
@@ -367,8 +403,13 @@ def main():
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
     rows = []
-    for dtype, batch, (q, kv), (d, dv), page in itertools.product(
-        args.dtype, args.batch, args.seqlens, args.head_dims, args.page_sizes
+    for dtype, batch, (q, kv), (d, dv), page, return_lse in itertools.product(
+        args.dtype,
+        args.batch,
+        args.seqlens,
+        args.head_dims,
+        args.page_sizes,
+        args.return_lse,
     ):
         result = run_benchmark(
             batch,
@@ -379,6 +420,7 @@ def main():
             page,
             dtype,
             backends,
+            return_lse=bool(return_lse),
             iters=args.iters,
             warmup=args.warmup,
             check=args.check,
@@ -398,6 +440,7 @@ def main():
                 "kv_heads": 1,
                 "dtype": dtype,
                 "backend": name,
+                "return_lse": bool(return_lse),
                 "iters": args.iters,
                 "warmup": args.warmup,
                 "avg_us": result.get(f"{name} us", float("nan")),
@@ -405,7 +448,7 @@ def main():
                 "accuracy": result.get(f"{name} accuracy", float("nan")),
                 "skip_reason": result.get(f"{name} reason", ""),
             }
-            for metric in ("TFLOPS", "err"):
+            for metric in ("TFLOPS", "TB/s", "err", "lse_max_abs_error"):
                 row[metric] = result.get(f"{name} {metric}", float("nan"))
             rows.append(row)
         # Preserve completed shapes if a subsequent backend fails or is interrupted.
@@ -419,8 +462,11 @@ def main():
         "value_dim",
         "page_size",
         "backend",
+        "return_lse",
         "avg_us",
         "TFLOPS",
+        "TB/s",
+        "lse_max_abs_error",
         "accuracy",
         "status",
     ]
@@ -429,7 +475,8 @@ def main():
         pd.DataFrame(rows)[columns].to_markdown(
             index=False,
             floatfmt=tuple(
-                ".3e" if column == "accuracy" else ".4f" for column in columns
+                ".3e" if column in ("accuracy", "lse_max_abs_error") else ".4f"
+                for column in columns
             ),
         ),
     )
