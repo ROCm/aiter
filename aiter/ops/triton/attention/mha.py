@@ -94,6 +94,72 @@ def mha_set_use_int64_strides(value: bool):
     _USE_INT64_STRIDES = value
 
 
+def _fwd_offsets_fit_int32(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    batch: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    block_m: int,
+    block_n: int,
+    philox_offset: int,
+    num_stages: int = 1,
+) -> bool:
+    """Conservatively bound forward offsets, including masked lanes, on the host.
+
+    Byte offsets as well as element offsets must fit signed i32. Tensor storage
+    offsets are already part of the 64-bit base pointers. All strides must be
+    nonnegative so bounding the final sum also bounds its products/partial sums.
+    No cumulative-length tensors are read: total packed tokens bound their starts.
+    """
+    limit = (1 << 31) - 1
+    if min(batch, max_seqlen_q, max_seqlen_k, block_m, block_n) <= 0:
+        return False
+    if not 0 <= philox_offset <= limit:
+        return False
+
+    padded_q = triton.cdiv(max_seqlen_q, block_m) * block_m
+    # Include the final pointer/counter increment and pipeline lookahead.
+    padded_k = (triton.cdiv(max_seqlen_k, block_n) + max(num_stages, 1) + 1) * block_n
+    varlen = q.ndim == 3
+    q_rows = padded_q + (q.shape[0] if varlen else 0)
+    k_rows = padded_k + (k.shape[0] if varlen else 0)
+
+    def fits(tensor, shape):
+        strides = tensor.stride()
+        if any(stride < 0 or stride > limit for stride in strides):
+            return False
+        offset = sum((size - 1) * stride for size, stride in zip(shape, strides))
+        return offset <= limit // tensor.element_size()
+
+    for tensor, rows in ((q, q_rows), (k, k_rows), (v, k_rows), (o, q_rows)):
+        # Rounding the whole Q/K feature extent up also bounds the separate PE tile.
+        features = max(triton.next_power_of_2(tensor.shape[-1]), 16)
+        shape = (rows, tensor.shape[-2], features)
+        if not varlen:
+            shape = (batch, *shape)
+        if not fits(tensor, shape):
+            return False
+
+    heads = q.shape[-2]
+    lse_shape = (q_rows, heads) if varlen else (batch, heads, padded_q)
+    if lse is not None and not fits(lse, lse_shape):
+        return False
+
+    # s_dmask uses contiguous [batch, head, max_q, max_k] strides even when it
+    # is not returned. Keep the same decision for both RETURN_SCORES variants.
+    score_offset = (
+        (batch * heads - 1) * max_seqlen_q * max_seqlen_k
+        + (padded_q - 1) * max_seqlen_k
+        + padded_k
+        - 1
+    )
+    return score_offset <= limit // 4 and philox_offset + score_offset <= limit
+
+
 _MHA_SWIZZLE_VALUES = ("default", "spatial")
 
 _env_swizzle = os.environ.get("AITER_TRITON_MHA_SWIZZLE", "default")
@@ -542,20 +608,20 @@ def _flash_attn_forward(
     else:
         philox_seed = 0
         philox_offset = 0
-    if return_softmax or enable_dropout:
+    sd_strides = (
+        num_q_heads * max_seqlen_q * max_seqlen_k,
+        max_seqlen_q * max_seqlen_k,
+        max_seqlen_k,
+        1,
+    )
+    if return_softmax:
         s_dmask = torch.zeros(
-            (batch, num_q_heads, max_seqlen_q, max_seqlen_k),
-            device=q.device,
-            dtype=torch.float32,
-        )
-        dropout_mask = torch.zeros(
             (batch, num_q_heads, max_seqlen_q, max_seqlen_k),
             device=q.device,
             dtype=torch.float32,
         )
     else:
         s_dmask = None
-        dropout_mask = None
 
     if _MHA_IMPL == "dao_ai":
         assert sink is None, "dao_ai impl does not support attention sink."
@@ -621,6 +687,31 @@ def _flash_attn_forward(
                 enable_dropout, q.dtype, has_pe=pe_head_dim > 0, head_dim_v=v_head_dim
             )
 
+        use_int64_strides = _USE_INT64_STRIDES
+        if (
+            use_int64_strides
+            and get_arch() == "gfx950"
+            and q.dtype == torch.bfloat16
+            and pe_head_dim > 0
+            and enable_dropout
+            and alibi_slopes is None
+            and sink is None
+        ):
+            use_int64_strides = not _fwd_offsets_fit_int32(
+                q,
+                k,
+                v,
+                o,
+                softmax_lse,
+                batch,
+                max_seqlen_q,
+                max_seqlen_k,
+                config["BLOCK_M"],
+                config["BLOCK_N"],
+                philox_offset,
+                config.get("num_stages", 1),
+            )
+
         grid = lambda META: (
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
@@ -635,7 +726,6 @@ def _flash_attn_forward(
             o,
             alibi_slopes,
             s_dmask,
-            dropout_mask,
             softmax_lse,
             sink,
             *q_strides,
@@ -647,10 +737,10 @@ def _flash_attn_forward(
             *o_strides,
             alibi_slopes.stride(0) if alibi_slopes is not None else 0,
             alibi_slopes.stride(1) if alibi_slopes is not None else 0,
-            s_dmask.stride(0) if s_dmask is not None else 0,
-            s_dmask.stride(1) if s_dmask is not None else 0,
-            s_dmask.stride(2) if s_dmask is not None else 0,
-            s_dmask.stride(3) if s_dmask is not None else 0,
+            sd_strides[0],
+            sd_strides[1],
+            sd_strides[2],
+            sd_strides[3],
             stride_lse_z if softmax_lse is not None else 0,
             stride_lse_h if softmax_lse is not None else 0,
             stride_lse_m if softmax_lse is not None else 0,
@@ -676,7 +766,7 @@ def _flash_attn_forward(
             BATCH=batch,
             NUM_XCD=get_num_xcds(),
             SWIZZLE=_MHA_SWIZZLE,
-            USE_INT64_STRIDES=_USE_INT64_STRIDES,
+            USE_INT64_STRIDES=use_int64_strides,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
             # Soundness precondition: only set when every Q/K/V head-axis
