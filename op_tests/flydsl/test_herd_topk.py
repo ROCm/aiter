@@ -7,6 +7,7 @@ import pytest
 import torch
 import triton
 
+import aiter.ops.flydsl.herd_topk as herd_topk_mod
 import aiter.ops.topk as topk_mod
 from aiter.ops.flydsl.herd_topk import herd_topk_gating
 from aiter.ops.triton.moe.moe_routing.minunique import keepk_sort0
@@ -211,6 +212,32 @@ def test_dsv4_herd_negative_ties_match_triton():
     assert torch.equal(weights, ref_weights.float())
 
 
+def test_dsv4_herd_excludes_nan_scores():
+    _skip_if_unsupported()
+    tokens = 16
+    logits = torch.randn(
+        (tokens, _DSV4_EXPERTS), dtype=torch.bfloat16, device="cuda"
+    )
+    logits[:, 0] = float("nan")
+    logits[0, :] = float("nan")
+    bias = torch.randn(_DSV4_EXPERTS, dtype=torch.float32, device="cuda") * 0.1
+    bias[1] = float("nan")
+    bias[2] = float("inf")
+    bias[3] = float("-inf")
+    weights = torch.empty((tokens, _DSV4_TOPK), dtype=torch.float32, device="cuda")
+    ids = torch.empty((tokens, _DSV4_TOPK), dtype=torch.int32, device="cuda")
+
+    herd_topk_gating(weights, ids, logits, bias, True, 2.5, "sqrtsoftplus")
+
+    assert torch.isfinite(weights).all()
+    assert torch.all(weights[0] == 0.0)
+    assert torch.all((ids >= 0) & (ids < _DSV4_EXPERTS))
+    assert not torch.any(ids[1:] == 0)
+    assert not torch.any(ids[1:] == 1)
+    assert torch.all(torch.any(ids[1:] == 2, dim=1))
+    assert not torch.any(ids[1:] == 3)
+
+
 def test_dsv4_herd_dispatch_rejects_fp16(monkeypatch):
     _skip_if_unsupported()
     tokens = 16
@@ -235,6 +262,88 @@ def test_dsv4_herd_dispatch_requires_bias(monkeypatch):
     assert not topk_mod._use_flydsl_herd(
         weights, ids, logits, empty_bias, "sqrtsoftplus"
     )
+
+
+@pytest.mark.parametrize("tokens", [16, 128])
+def test_kimi_k3_herd_ties_match_triton(tokens):
+    _skip_if_unsupported()
+    experts = 896
+    topk = 16
+    logits = torch.zeros((tokens, experts), dtype=torch.float32, device="cuda")
+    bias = torch.zeros(experts, dtype=torch.float32, device="cuda")
+    ref_weights, ref_ids = _triton_herd(
+        logits, bias, topk, "sigmoid", True, 1.0
+    )
+    weights = torch.empty((tokens, topk), dtype=torch.float32, device="cuda")
+    ids = torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
+
+    herd_topk_gating(weights, ids, logits, bias, True, 1.0, "sigmoid")
+
+    assert torch.equal(ids, ref_ids.to(torch.int32))
+    assert torch.equal(weights, ref_weights.float())
+
+
+def test_kimi_k3_herd_excludes_nan_scores():
+    _skip_if_unsupported()
+    tokens = 16
+    experts = 896
+    topk = 16
+    torch.manual_seed(8)
+    logits = torch.randn((tokens, experts), dtype=torch.float32, device="cuda")
+    logits[:, 0] = float("nan")
+    logits[0, :] = float("nan")
+    bias = torch.randn(experts, dtype=torch.float32, device="cuda") * 0.1
+    bias[1] = float("nan")
+    bias[2] = float("inf")
+    bias[3] = float("-inf")
+    weights = torch.empty((tokens, topk), dtype=torch.float32, device="cuda")
+    ids = torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
+
+    herd_topk_gating(weights, ids, logits, bias, True, 1.0, "sigmoid")
+
+    assert torch.isfinite(weights).all()
+    assert torch.all(weights[0] == 0.0)
+    assert torch.all((ids >= 0) & (ids < experts))
+    assert not torch.any(ids[1:] == 0)
+    assert not torch.any(ids[1:] == 1)
+    assert torch.all(torch.any(ids[1:] == 2, dim=1))
+    assert not torch.any(ids[1:] == 3)
+
+
+def test_kimi_k3_herd_workspace_is_per_invocation(monkeypatch):
+    """Captured graphs must not retain the same intermediate candidate buffers."""
+    _skip_if_unsupported()
+    tokens = 16
+    experts = 896
+    topk = 16
+    logits = torch.randn((tokens, experts), dtype=torch.float32, device="cuda")
+    bias = torch.randn(experts, dtype=torch.float32, device="cuda")
+    weights = torch.empty((tokens, topk), dtype=torch.float32, device="cuda")
+    ids = torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
+    workspaces = []
+
+    def capture_workspace(
+        packed_gating,
+        correction_bias,
+        candidate_ids,
+        candidate_values,
+        rows,
+        stream,
+    ):
+        del packed_gating, correction_bias, rows, stream
+        workspaces.append((candidate_ids, candidate_values))
+
+    def skip_finalize(*args, **kwargs):
+        del args, kwargs
+
+    monkeypatch.setattr(herd_topk_mod, "_run_kimi_k3_candidate", capture_workspace)
+    monkeypatch.setattr(herd_topk_mod, "_run_finalize", skip_finalize)
+
+    for _ in range(2):
+        herd_topk_gating(weights, ids, logits, bias, True, 1.0, "sigmoid")
+
+    assert workspaces[0][0].data_ptr() != workspaces[1][0].data_ptr()
+    assert workspaces[0][1].data_ptr() != workspaces[1][1].data_ptr()
 
 
 @pytest.mark.parametrize(

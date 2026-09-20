@@ -1435,8 +1435,8 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'."); \
-    m.def("topk_gating_herd_candidates",                     \
-          &aiter::topk_gating_herd_candidates,                \
+    m.def("dsv4_herd_topk_candidates",                       \
+          &aiter::dsv4_herd_topk_candidates,                  \
           py::arg("candidate_weights"),                       \
           py::arg("candidate_indices"),                       \
           py::arg("gating_output"),                           \

@@ -14,9 +14,9 @@ void topk_gating(aiter_tensor_t& topk_weights,
                  float routed_scaling_factor = 1.0,
                  const std::string& score_func = "sqrtsoftplus");
 
-void topk_gating_herd_candidates(aiter_tensor_t& candidate_weights,
-                                 aiter_tensor_t& candidate_indices,
-                                 aiter_tensor_t& gating_output,
-                                 aiter_tensor_t& correction_bias);
+void dsv4_herd_topk_candidates(aiter_tensor_t& candidate_weights,
+                               aiter_tensor_t& candidate_indices,
+                               aiter_tensor_t& gating_output,
+                               aiter_tensor_t& correction_bias);
 
 } // namespace aiter

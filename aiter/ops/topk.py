@@ -27,15 +27,6 @@ def topk_gating_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_moe_topk", fc_name="topk_gating_herd_candidates", develop=True)
-def topk_gating_herd_candidates_fwd(
-    candidate_weights: torch.Tensor,
-    candidate_indices: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-) -> None: ...
-
-
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 
 _FLYDSL_USE_HERD = os.environ.get("AITER_FLYDSL_USE_HERD", "0") == "1"
