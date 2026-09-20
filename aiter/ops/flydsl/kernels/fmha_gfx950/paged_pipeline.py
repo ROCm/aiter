@@ -19,7 +19,6 @@ from .common import (
     _cu_load,
     _p_headroom_log2,
 )
-from .common import load as _load
 
 PAGED_FP8_HEAD_DIMS = ((128, 128), (192, 128), (192, 192))
 PAGED_FP8_BLOCK_M = 256
@@ -689,7 +688,9 @@ class DualwaveFp8KernelContext:
             )
         # Do not issue an out-of-allocation load before selecting zero padding.
         safe_offset = valid.select(fx.Int64(byte_offset), fx.Int64(0))
-        loaded = _load(fx.add_offset(base_iter, safe_offset), dtype=fx.Int32, count=4)
+        loaded = fx.generic_load(
+            fx.add_offset(base_iter, safe_offset), dtype=fx.Int32, count=4
+        )
         return valid.select(loaded, fx.Vector.filled(4, 0, fx.Int32)).ir_value()
 
     def buffer_load_lds_128(self, src_div, lds_byte_addr, src_elem, soffset_elems):
@@ -840,7 +841,7 @@ class DualwaveFp8KernelContext:
 
     def read_i32x4_lds(self, byte_row):
         tile = fx.slice(self.k_lds_i32_tiles, (None, fx.Uint32(byte_row) // 16))
-        return _load(fx.get_iter(tile), dtype=fx.Int32, count=4).ir_value()
+        return fx.generic_load(fx.get_iter(tile), dtype=fx.Int32, count=4).ir_value()
 
     def preserve_accumulators(self, v_o):
         # Preserve FP expression boundaries without inline-assembly pins.

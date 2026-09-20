@@ -1022,7 +1022,6 @@ def test_causal_tile_bounds_int32_limit():
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.fmha_gfx950.common import store
     from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
         DualwaveFp8KernelContext,
         _make_paged_dualwave_swp_fp8_traits,
@@ -1054,7 +1053,7 @@ def test_causal_tile_bounds_int32_limit():
             ctx.delta_i32 = klen - qlen
             ctx.q_start = fx.Index(start)
             ctx.init_tile_bounds()
-            store(output, fx.Int64(ctx.split_t_end))
+            fx.generic_store(output, fx.Int64(ctx.split_t_end))
 
     @flyc.jit
     def launch(
@@ -1087,7 +1086,6 @@ def test_causal_pair_mask_int32_limit():
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.fmha_gfx950.common import store
     from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_softmax import (
         DualwaveFp8SoftmaxHelper,
     )
@@ -1115,7 +1113,7 @@ def test_causal_pair_mask_int32_limit():
         _, second = helper.causal_mask_pair_if_needed(
             (scores, scores), (scores, scores), tile_a
         )
-        store(fx.add_offset(output, lane), fx.Vector(second[1])[15])
+        fx.generic_store(fx.add_offset(output, lane), fx.Vector(second[1])[15])
 
     @flyc.jit
     def launch(output: fx.Pointer, klen: fx.Int32, stream: fx.Stream):

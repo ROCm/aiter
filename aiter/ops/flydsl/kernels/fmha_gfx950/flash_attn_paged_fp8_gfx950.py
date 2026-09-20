@@ -9,7 +9,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.common import load as _load
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_epilog import DualwaveFp8StoreHelper
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_gemm import DualwaveFp8GemmHelper
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_lds import (
@@ -483,7 +482,9 @@ def build_flash_attn_paged_fp8_module(
             q_row = fx.Int64(ctx.q_start_pos_i32) + ctx.lane_mod_32
 
         inv_l = softmax_helper.safe_l_inv(l_row)
-        value_descale = _load(fx.get_iter(ctx.VDescale), dtype=fx.Float32, count=1)
+        value_descale = fx.generic_load(
+            fx.get_iter(ctx.VDescale), dtype=fx.Float32, count=1
+        )
         inv_l = inv_l * value_descale
         softmax_helper.scale_o(v_o, inv_l)
         rocdl.s_barrier()

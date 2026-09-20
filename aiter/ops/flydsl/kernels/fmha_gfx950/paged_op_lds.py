@@ -10,8 +10,6 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.common import load as _load
-from aiter.ops.flydsl.kernels.fmha_gfx950.common import store as _store
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     PAGED_FP8_BUFFER_LIMIT_BYTES,
     DualwaveFp8KernelContext,
@@ -134,7 +132,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
                         dst = fx.slice(
                             self.k_lds_i32_tiles, (None, fx.Uint32(dst_byte) // 16)
                         )
-                        _store(fx.get_iter(dst), fx.Vector(source))
+                        fx.generic_store(fx.get_iter(dst), fx.Vector(source))
                 else:
                     oct_idx = _vec_k_dma_oct_idx(
                         traits, d, self.wave_id_uni, self.lane_in_warp
@@ -321,7 +319,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
 
     def _store_v_fp8_lds(self, data, byte_offset):
         dst = fx.slice(self.v_lds_i32_tiles, (None, fx.Uint32(byte_offset) // 16))
-        _store(fx.get_iter(dst), data)
+        fx.generic_store(fx.get_iter(dst), data)
 
     def load_v_source(self, tile_start, page_id=None):
         """Prefetch a native V packet; store_v_source consumes its selected layout."""
@@ -477,7 +475,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
                 ptr = fx.add_offset(
                     fx.get_iter(self.v_lds_i32_tiles), fx.Uint32(dst) // 4
                 )
-                _store(ptr, fx.Int32(words[first_word + word]))
+                fx.generic_store(ptr, fx.Int32(words[first_word + word]))
 
         _store_segment(0, 0)
         if const_expr(traits.FP8_PV_SEGMENTED):
@@ -520,7 +518,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
                     fx.get_iter(self.v_lds_i32_tiles),
                     fx.Uint32(row_base + token_offset) // 4,
                 )
-                _store(ptr, fx.Int32(words[first_word + word]))
+                fx.generic_store(ptr, fx.Int32(words[first_word + word]))
 
         _store_segment(0, segment_offset)
         if const_expr(traits.FP8_PV_SEGMENTED and include_tail):
@@ -635,5 +633,5 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 self.v_lds_i32_tiles,
                 (None, fx.Uint32(row_base + token_offset - self.lds_vt_base_idx) // 16),
             )
-            halves.append(_load(fx.get_iter(view), dtype=fx.Int32, count=4))
+            halves.append(fx.generic_load(fx.get_iter(view), dtype=fx.Int32, count=4))
         return halves[0].shuffle(halves[1], [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()

@@ -24,34 +24,6 @@ def _p_headroom_log2(traits):
     return max(0.0, headroom)
 
 
-def load(ptr, *, dtype, count):
-    """Plain copy on FlyDSL 0.3.2, preserving byte-only pointer alignment."""
-    # Dynamic FP8 offsets need not be word-aligned. Copy bytes, then bitcast
-    # registers; do not strengthen the pointer alignment to use a wider type.
-    byte_count = count * dtype.width // 8
-    view = fx.make_view(fx.recast_iter(fx.Uint8, ptr), fx.make_layout(byte_count, 1))
-    fragment = fx.make_rmem_tensor(byte_count, fx.Uint8)
-    atom = fx.make_copy_atom(fx.UniversalCopy(byte_count * 8), fx.Uint8)
-    fx.copy(atom, view, fragment)
-    result = fx.Vector(fragment.load()).bitcast(dtype)
-    return result[0] if count == 1 else result
-
-
-def store(ptr, value):
-    """Plain scalar/vector store without assuming more than byte alignment."""
-    vector = (
-        value
-        if isinstance(value, fx.Vector)
-        else fx.Vector.from_elements([value], type(value))
-    )
-    packed = vector.bitcast(fx.Uint8)
-    view = fx.make_view(fx.recast_iter(fx.Uint8, ptr), fx.make_layout(packed.numel, 1))
-    fragment = fx.make_rmem_tensor(packed.numel, fx.Uint8)
-    fragment.store(packed)
-    atom = fx.make_copy_atom(fx.UniversalCopy(packed.numel * 8), fx.Uint8)
-    fx.copy(atom, fragment, view)
-
-
 def _read_exec_i64():
     """Read the current wave exec mask, matching Clang's builtin lowering."""
     true_i1 = fx.Boolean(True).ir_value()
