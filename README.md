@@ -74,7 +74,7 @@ AITER is the **default kernel backend for LLM inference on AMD GPUs**, integrate
 | AMD AI Max and Max Pro 400/300 Series | gfx1151 (RDNA3.5) | Experimental<sup>1</sup> |
 | AMD Radeon AI PRO R9700 | gfx1201 (RDNA4) | Experimental<sup>1</sup> |
 
-<sup>1</sup> On RDNA, Triton and most FlyDSL kernels run, as do most HIP kernels (norm, RoPE, quant, activation, plus some GEMM/attention). Most CK and ASM kernels are CDNA-only.
+<sup>1</sup> On RDNA, Triton and most FlyDSL kernels run, as do most HIP kernels (norm, RoPE, quant, activation, plus some GEMM/attention). Most CK and ASM kernels are CDNA-only. Experimental does not mean suboptimal: AITER often ships faster kernels than the defaults in upstream frameworks such as vLLM, so installing it is **strongly recommended** on these parts. Ongoing RDNA optimization work — attention, MoE, GEMM and beyond — lands here first.
 
 ## Operators
 
