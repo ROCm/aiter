@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from itertools import pairwise
 
 import pytest
 import torch
@@ -662,10 +663,25 @@ def test_fp8_split_kv_batched(causal, batch):
 
 
 @_gfx950_only
-@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
-    "seq_len,seqlen_kv,num_kv_splits",
-    [(512, 16384, 8), (2614, 16384, 8), (1024, 32768, 16)],
+    "causal,seq_len,seqlen_kv,num_kv_splits",
+    [
+        (causal, sq, skv, splits)
+        for causal in (False, True)
+        for sq, skv, splits in [(512, 16384, 8), (2614, 16384, 8), (1024, 32768, 16)]
+    ]
+    + [
+        # Short cached-prefix queries are eligible only without causal masking.
+        (False, 1, 257, 4),
+        (False, 70, 16384, 2),
+        (False, 70, 16384, 4),
+        (False, 70, 16384, 16),
+        (False, 70, 16384, None),
+        (False, 127, 11008, 4),
+        (False, 129, 257, 4),
+        (False, 255, 513, 4),
+        (False, 383, 11008, 4),
+    ],
 )
 def test_fp8_split_kv_cross_length(causal, seq_len, seqlen_kv, num_kv_splits):
     """Split-KV with short Q against long KV -- the shape split-KV exists for."""
@@ -676,6 +692,12 @@ def test_fp8_split_kv_cross_length(causal, seq_len, seqlen_kv, num_kv_splits):
         seqlen_kv=seqlen_kv,
         num_kv_splits=num_kv_splits,
     )
+
+
+@_gfx950_only
+def test_fp8_short_causal_split_kv_rejected():
+    with pytest.raises(ValueError, match="split-K requires seq_len>=384"):
+        _run_fp8_shape(True, seq_len=70, seqlen_kv=16384, num_kv_splits=4)
 
 
 @_gfx950_only
@@ -1043,19 +1065,20 @@ def test_fp8_split_result_survives_a_non_current_stream(monkeypatch):
     torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
 
 
-def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False):
+def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False, Skv=None):
     """Quantized inputs for the dispatch tests."""
     torch.manual_seed(0)
-    shape = (B * S, H, D) if varlen else (B, S, H, D)
+    Skv = S if Skv is None else Skv
 
-    def _t():
+    def _t(seq_len):
+        shape = (B * seq_len, H, D) if varlen else (B, seq_len, H, D)
         return torch.empty(shape, device="cuda", dtype=torch.bfloat16).uniform_(
             *FP8_UNIFORM_RANGE
         )
 
-    q, qs = _fp8_quant(_t())
-    k, ks = _fp8_quant(_t())
-    v, vs = _fp8_quant(_t())
+    q, qs = _fp8_quant(_t(S))
+    k, ks = _fp8_quant(_t(Skv))
+    v, vs = _fp8_quant(_t(Skv))
     return q, k, v, {"q_descale": qs, "k_descale": ks, "v_descale": vs}
 
 
@@ -1260,6 +1283,8 @@ def test_fp8_dispatch_rejects_descale_on_another_device():
         (True, 1, 1024, 4096, 8, 1, 128, 128, 4),
         (False, 2, 512, 512, 8, 8, 128, 128, 2),
         (True, 1, 512, 2048, 12, 12, 192, 128, 4),
+        (False, 1, 70, 16384, 12, 12, 192, 128, 4),
+        (False, 1, 70, 16384, 12, 12, 192, 128, None),
         # Skv < Sq: bottom-right causal leaves the leading Sq-Skv rows with no
         # visible key, so their LSE must be -inf rather than NaN.
         (True, 1, 1024, 128, 8, 8, 128, 128, None),
@@ -1610,9 +1635,13 @@ def test_fp8_softmax_scale_dense(causal, S, Skv, H_KV, D, splits):
 
 
 @_gfx950_only
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("splits", [1, 4])
-def test_fp8_softmax_scale_varlen(causal, splits):
+@pytest.mark.parametrize(
+    "causal,cuq,cukv",
+    [(causal, [0, 512, 582, 838], [0, 2048, 2048, 2176]) for causal in (False, True)]
+    + [(False, [0, 70, 71, 198, 198], [0, 16384, 16384, 16641, 16769])],
+)
+@pytest.mark.parametrize("splits", [1, 4, None])
+def test_fp8_softmax_scale_varlen(causal, cuq, cukv, splits):
     """Custom scale survives packed varlen, split-K and a zero-length KV entry."""
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
@@ -1620,7 +1649,6 @@ def test_fp8_softmax_scale_varlen(causal, splits):
 
     torch.manual_seed(FP8_SEED)
     H, D, Dv = 12, 192, 128
-    cuq, cukv = [0, 512, 582, 838], [0, 2048, 2048, 2176]
 
     def _t(*shape):
         return torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
@@ -1639,8 +1667,8 @@ def test_fp8_softmax_scale_varlen(causal, splits):
         "cross_seqlen": True,
         "cu_seqlens_q": torch.tensor(cuq, dtype=torch.int32, device="cuda"),
         "cu_seqlens_kv": torch.tensor(cukv, dtype=torch.int32, device="cuda"),
-        "max_seqlen_q": 512,
-        "max_seqlen_kv": 2048,
+        "max_seqlen_q": max(b - a for a, b in pairwise(cuq)),
+        "max_seqlen_kv": max(b - a for a, b in pairwise(cukv)),
     }
     for scale in (0.5 * D**-0.5, 1.8738542070926265 * D**-0.5, 0.37):
         out, lse = flydsl_flash_attn_fp8_func(q, k, v, softmax_scale=scale, **kw)
@@ -1658,14 +1686,23 @@ def test_fp8_softmax_scale_varlen(causal, splits):
 
 
 @_gfx950_only
-def test_fp8_softmax_scale_graph_replay():
+@pytest.mark.parametrize(
+    "S,Skv,causal,splits", [(512, 512, True, None), (70, 16384, False, 4)]
+)
+def test_fp8_softmax_scale_graph_replay(S, Skv, causal, splits):
     """A custom runtime scalar needs no scale-preparation kernel during capture."""
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
     )
 
-    q, k, v, descales = _fp8_dispatch_inputs(B=1, S=512, H=12, D=192)
-    kw = dict(softmax_scale=0.137, causal=True, return_lse=True, **descales)
+    q, k, v, descales = _fp8_dispatch_inputs(B=1, S=S, Skv=Skv, H=12, D=192)
+    kw = dict(
+        softmax_scale=0.137,
+        causal=causal,
+        num_kv_splits=splits,
+        return_lse=True,
+        **descales,
+    )
     flydsl_flash_attn_fp8_func(q, k, v, **kw)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
