@@ -1,0 +1,5 @@
+# aiter-review-bot trigger allowlist — only the GitHub users listed here may use @aiter-bot review.
+# One login per line (case-insensitive). Lines starting with # are comments. Edit this to change
+# who is allowed (version-controlled, auditable).
+# Step 1: aiter team only. Start with the lead, add more over time.
+zufayu
