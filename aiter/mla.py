@@ -827,13 +827,10 @@ def mla_decode_fwd(
                 and max_seqlen_q <= 6
             )
             or (
-                # Head counts that are not a multiple of 16 cannot be folded to 16; the
-                # qh32 asm kernel takes them directly as long as the packed Q rows of a
-                # batch fit one 128-row workgroup tile.
                 get_gfx() == "gfx950"
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
-                and nhead % 16 != 0
+                and nhead == 12
                 and nhead * max_seqlen_q <= 128
             )
         ):

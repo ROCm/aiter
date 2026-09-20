@@ -1011,8 +1011,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         config_gqa_ratio = 16;
         args.s_MQA = gqa_ratio;
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
-               && (gqa_ratio % 16 != 0) && (gqa_ratio * max_seqlen_q <= 128)
-               && !(gqa_ratio == 8 && max_seqlen_q == 4)){
+               && (gqa_ratio == 12) && (gqa_ratio * max_seqlen_q <= 128)){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;

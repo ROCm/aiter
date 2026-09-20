@@ -1234,23 +1234,28 @@ def get_mla_metadata_info_v1(
     ):
         max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
-        get_gfx() == "gfx950"
-        and (packed_qo_len >= 128 or num_head_qo > 64)
-        and kv_dtype == dtypes.bf16
-        and q_dtype == dtypes.bf16
-        and num_head_qo != 48
-    ) or (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo == 96
-        and effective_seqlen_qo <= 6
-    ) or (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo % 16 != 0
-        and packed_qo_len <= 128
+        (
+            get_gfx() == "gfx950"
+            and (packed_qo_len >= 128 or num_head_qo > 64)
+            and kv_dtype == dtypes.bf16
+            and q_dtype == dtypes.bf16
+            and num_head_qo != 48
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
+            and effective_seqlen_qo <= 6
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 12
+            and packed_qo_len <= 128
+            and fast_mode
+        )
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1680,7 +1685,7 @@ def decode_update_mla_metadata_v1(
             arch_id == "gfx950"
             and q_is_fp8
             and kv_is_fp8
-            and num_heads_per_head_k % 16 != 0
+            and num_heads_per_head_k == 12
             and num_heads_per_head_k * max_seqlen_qo <= 128
         )
     )

@@ -1254,17 +1254,14 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     // pseudo-batches (qk_batch_ratio), which the FlyDSL kernel does not read.
     // Keep it behind AITER_MLA_DECODE_PS1_FLYDSL so gfx1250 persistent ASM
     // (16-head fold + host Q fold) is unchanged when FlyDSL is off.
-    const bool flydsl_ps1 =
-        std::getenv("AITER_MLA_DECODE_PS1_FLYDSL") != nullptr &&
-        std::atoi(std::getenv("AITER_MLA_DECODE_PS1_FLYDSL")) != 0;
+    const bool flydsl_ps1 = std::getenv("AITER_MLA_DECODE_PS1_FLYDSL") != nullptr &&
+                            std::atoi(std::getenv("AITER_MLA_DECODE_PS1_FLYDSL")) != 0;
     const bool gfx1250_flydsl_ps1_heads =
         flydsl_ps1 && (arch_id == "gfx1250") && q_is_fp8 && kv_is_fp8 &&
-        ((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
-        (max_seqlen_qo == 1);
+        ((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) && (max_seqlen_qo == 1);
 
     const bool natively_supported =
-        (num_heads == 16) ||
-        gfx1250_flydsl_ps1_heads ||
+        (num_heads == 16) || gfx1250_flydsl_ps1_heads ||
         ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 &&
          kv_is_fp8 && (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
@@ -1273,7 +1270,7 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
          (max_seqlen_qo <= 6)) ||
-        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && ((num_heads % 16) != 0) &&
+        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 12) &&
          ((num_heads * max_seqlen_qo) <= 128)) ||
         hk_mtp_experimental;
 
@@ -1351,9 +1348,8 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
         kPackedQoLenPerWg = 64;
     }
 
-    const int32_t xcd_rows_per_lane =
-        (params.num_xcd > 0) ? (num_clusters / params.num_xcd) : 0;
-    const bool xcd_multi_tile = (num_heads * 2 > kPackedQoLenPerWg) && (max_seqlen_qo > 1) &&
+    const int32_t xcd_rows_per_lane = (params.num_xcd > 0) ? (num_clusters / params.num_xcd) : 0;
+    const bool xcd_multi_tile       = (num_heads * 2 > kPackedQoLenPerWg) && (max_seqlen_qo > 1) &&
                                 (xcd_rows_per_lane > 0) &&
                                 ((xcd_rows_per_lane % max_seqlen_qo) == 0);
     params.xcd_lane_works =
