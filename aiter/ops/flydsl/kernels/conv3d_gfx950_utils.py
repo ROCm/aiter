@@ -574,6 +574,17 @@ def make_launch_grid(param, geom, cfg):
 
     k_tiles = (geom.crs + tile_k - 1) // tile_k
     splitk = max(1, min(param.splitk, k_tiles))
+    # Every split has to take a whole number of K tiles. Where it does not,
+    # splitk * tiles_per_split < k_tiles and the tail tiles belong to no block at
+    # all: the K they carry is neither an error nor an out-of-bounds access, just
+    # missing from the sum. ``_resolve_splitk`` walks sk down until it divides, but
+    # the paths that bypass it -- AOT reads the CSV's splitK column straight -- have
+    # no such step, which is what makes this the last line of defence.
+    assert k_tiles % splitk == 0, (
+        f"splitk={splitk} does not divide k_tiles={k_tiles}: splits would cover only "
+        f"{splitk * (k_tiles // splitk)} of them and the rest of the K axis would be "
+        f"dropped. Pick it through _resolve_splitk."
+    )
     tiles_per_split = k_tiles // splitk
 
     grid_m = (npq + tile_m - 1) // tile_m

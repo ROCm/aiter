@@ -289,15 +289,22 @@ def _log_tuned_lookup(table, dev, key, hit):
     """
     if not table or (dev, key) in _TUNED_LOOKUP_LOGGED:
         return
-    from aiter import logger
-
-    shape = ",".join(f"{c}={v}" for c, v in zip(TUNED_KEY_COLUMNS, key))
+    # Recorded before anything is formatted, and whether or not the line is
+    # going to be emitted: the memo exists so that a tuned hit costs nothing
+    # per conv call, and joining the 20 key columns only to find the log
+    # switched off is not nothing. AITER_LOG_TUNED_CONFIG is read once at
+    # import, so suppressing this shape cannot hide a line someone turns on later.
+    _TUNED_LOOKUP_LOGGED.add((dev, key))
     if hit is not None:
         from aiter.jit.core import AITER_LOG_TUNED_CONFIG
 
         if not AITER_LOG_TUNED_CONFIG:
             return
-        _TUNED_LOOKUP_LOGGED.add((dev, key))
+
+    from aiter import logger
+
+    shape = ",".join(f"{c}={v}" for c, v in zip(TUNED_KEY_COLUMNS, key))
+    if hit is not None:
         splitk = hit[2]
         sk_s = f", splitK={splitk}" if splitk is not None else ""
         logger.info(
@@ -306,7 +313,6 @@ def _log_tuned_lookup(table, dev, key, hit):
         )
         return
 
-    _TUNED_LOOKUP_LOGGED.add((dev, key))
     elsewhere = sorted({k[:2] for k in table if k[2:] == key})
     if elsewhere:
         logger.warning(

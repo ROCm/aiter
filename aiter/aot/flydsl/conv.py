@@ -85,6 +85,7 @@ from aiter.ops.flydsl.conv_kernels import (
     _pad_channels,
     _parse_tuned_bool,
 )
+from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import TILE_K
 from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
@@ -118,7 +119,8 @@ def parse_csv(csv_path: str):
                 config = {c: int(row[c]) for c in _CONFIG_COLS}
                 has_bias = _parse_tuned_bool(row.get("bias"))
                 # Recorded by the tuner. Re-deriving it here would need the
-                # target's CU count, which a build host may not have.
+                # target's CU count, which a build host may not have; what IS
+                # re-derived below is the divisibility the kernel asserts.
                 splitk = int(row.get("splitK") or 1) or 1
             except ValueError as exc:
                 print(f"  [WARN] {csv_path}: unparsable row ({exc}), skipping")
@@ -134,6 +136,22 @@ def parse_csv(csv_path: str):
             cgp = _pad_channels(shape["C"] // groups)
             c_padded = groups * cgp
 
+            # make_launch_grid asserts that splitK divides the K-tile count: a split
+            # that does not would leave the tail of the K axis unowned by any block
+            # and quietly drop it. The tuner only ever writes a value _resolve_splitk
+            # returned, so this converges a hand-edited row, or one tuned on a device
+            # whose CU count picked a different split. It is the same step _resolve_splitk
+            # ends with, and it needs no CU count -- unlike the heuristic above it,
+            # which is why deriving THAT here is what a build host cannot do. Landing
+            # on the same value keeps the AOT artifact a hit rather than compiling one
+            # the kernel would refuse.
+            k_tiles = (
+                cgp * shape["kT"] * shape["kH"] * shape["kW"] + TILE_K - 1
+            ) // TILE_K
+            splitk = min(max(1, splitk), k_tiles)
+            while splitk > 1 and k_tiles % splitk:
+                splitk -= 1
+
             # Both output layouts, because `out_ndhwc` is a compile-time
             # parameter: it flips the epilogue, which gives up the vectorised
             # store on the n==1 fast path once channels are innermost. The
@@ -146,7 +164,7 @@ def parse_csv(csv_path: str):
                     "cu_num": cu_num,
                     "gfx": gfx,
                     "has_bias": has_bias,
-                    "splitk": max(1, splitk),
+                    "splitk": splitk,
                     "out_ndhwc": out_ndhwc,
                     **shape,
                     **config,
