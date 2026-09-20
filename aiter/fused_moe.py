@@ -5058,6 +5058,8 @@ def herd_fused_topk(
     topk_weights: torch.Tensor | None = None,
     *,
     sm_first: bool = True,
+    score_mode: str | None = None,
+    bias: torch.Tensor | None = None,
 ):
     """HERD min-unique drop-in for :func:`fused_topk`.
 
@@ -5078,4 +5080,6 @@ def herd_fused_topk(
         topk_ids,
         topk_weights,
         sm_first=sm_first,
+        score_mode=score_mode,
+        bias=bias,
     )

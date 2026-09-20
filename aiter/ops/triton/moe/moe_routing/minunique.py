@@ -114,6 +114,8 @@ def herd_fused_topk(
     topk_weights: torch.Tensor | None = None,
     *,
     sm_first: bool = True,
+    score_mode: str | None = None,
+    bias: torch.Tensor | None = None,
 ):
     """HERD min-unique selection with ``fused_topk``'s ``[M, k]`` contract.
 
@@ -125,17 +127,25 @@ def herd_fused_topk(
     ``sm_first=True`` (default) matches ``fused_topk`` scoring: softmax over
     all E, then top-(k+1) and drop. ``sm_first=False`` matches ``routing()``
     default: top-(k+1) on raw logits, softmax the kept k.
-    ``renormalize`` is the fused_topk flag and only applies on the sm_first
-    path (softmax of the kept k already normalizes when ``sm_first=False``).
+    ``score_mode`` (e.g. ``"sigmoid"``) plus ``bias`` matches ATOM's
+    Kimi-K3 ``biased_grouped_topk`` scoring (sigmoid + noaux_tc bias);
+    ``sm_first`` is ignored in that case.
+    ``renormalize`` applies on the sm_first path and on ``score_mode``
+    (softmax of the kept k already normalizes when ``sm_first=False``
+    and ``score_mode`` is None).
     """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, n_expts_tot = gating_output.shape
+    if score_mode is not None:
+        sm_first = False
+        if bias is not None and bias.dtype != torch.float32:
+            bias = bias.float()
     logits = gating_output.float()
     expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M = _prepare_herd_candidates(
-        logits, topk, sm_first=sm_first
+        logits, topk, sm_first=sm_first, score_mode=score_mode, bias=bias
     )
-    apply_softmax = not sm_first
-    apply_renorm = bool(renormalize) and sm_first
+    apply_softmax = (not sm_first) and score_mode is None
+    apply_renorm = bool(renormalize) and (sm_first or score_mode is not None)
     weights, ids = keepk_sort0(
         expt_scal,
         expt_indx,
