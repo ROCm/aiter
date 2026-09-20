@@ -6,30 +6,34 @@ import logging
 from contextlib import contextmanager
 
 import torch
+from packaging.version import Version
 
 logger = logging.getLogger("aiter")
 
 # torch < 2.10 scans captures_underway in registration order, so the graph pool
 # registered at capture begin always wins and use_mem_pool is ignored inside a
 # capture; 2.10 scans it in LIFO order (c10/cuda/CUDACachingAllocator.cpp).
-ROUTES_INSIDE_CAPTURE = torch.__version__ >= "2.10"
+# Compare parsed versions: "2.9.1" > "2.10" as plain strings.
+ROUTES_INSIDE_CAPTURE = Version(torch.__version__.split("+")[0]) >= Version("2.10")
 
 
 @functools.cache
 def _persistent_pool(index: int) -> "torch.cuda.MemPool":
-    # The cache also owns the pool: destroying the MemPool frees its memory and
-    # leaves every pointer handed out from it dangling.
+    # Concurrent first callers can each build a pool and only one is kept; the
+    # cost is a duplicate set of segments, not a dangling pointer -- blocks stay
+    # valid after the pool object they came from is dropped.
     with torch.cuda.device(index):
         return torch.cuda.MemPool()
 
 
 @functools.cache
-def _warn_capture_routing_unavailable() -> None:
+def _warn_capture_routing_unavailable(index: int) -> None:
     logger.warning(
-        "torch %s cannot route an allocation out of a CUDA graph capture; "
-        "scratch buffers first allocated during capture may be overwritten on "
-        "replay. Upgrade to torch 2.10 or later.",
+        "torch %s cannot route an allocation out of a CUDA graph capture, so a "
+        "scratch buffer first allocated during capture on device %d may be "
+        "overwritten on replay. Upgrade to torch 2.10 or later.",
         torch.__version__,
+        index,
     )
 
 
@@ -45,6 +49,6 @@ def persistent_alloc(device: torch.device):
     """
     index = torch.cuda.current_device() if device.index is None else device.index
     if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
-        _warn_capture_routing_unavailable()
+        _warn_capture_routing_unavailable(index)
     with torch.cuda.use_mem_pool(_persistent_pool(index), device=index):
         yield
