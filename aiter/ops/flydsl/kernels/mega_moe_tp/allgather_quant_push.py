@@ -32,9 +32,10 @@ from __future__ import annotations
 import functools
 import os
 
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
@@ -79,6 +80,13 @@ def quant_push_supported(model_dim: int, topk: int) -> bool:
     """Whether this shape's rows split into whole per-thread quant units."""
     return model_dim % QUANT_ELEMS_PER_THREAD == 0 and (topk * 4) % 4 == 0
 
+
+#: Probe: drop the per-CTA acquire in the AllGather gate. WRONG RESULTS; it
+#: exists to price that fence. The acquire is an L2 invalidate executed once
+#: per CTA, and the hosting kernel's grid is sized by *padded* sort blocks --
+#: hundreds to thousands even at 16 tokens -- so it is a fixed cost that does
+#: not shrink with the token count.
+_GATE_ACQUIRE = os.environ.get("AITER_TP_MEGA_GATE_ACQUIRE", "1") == "1"
 
 def quant_push_units(rows: int, model_dim: int, topk: int, regions: str = "all") -> int:
     """Grid-stride work items one fused push covers, for the selected regions.
@@ -334,7 +342,8 @@ def compile_allgather_quant_push(
             comm.spin_until_ge_i32_agent(
                 desc_slot(arg_desc, done_index), entry_epoch
             )
-            comm.fence_agent_acquire()
+            if const_expr(_GATE_ACQUIRE):
+                comm.fence_agent_acquire()
         gpu.barrier()
 
     @flyc.jit

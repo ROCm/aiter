@@ -316,6 +316,14 @@ def _load_pin_tuned(path: str, mtime: float) -> dict:
                     # Absent means "let the register allocator decide", which
                     # is what every row written before this axis existed did.
                     "waves_per_eu": _int_or(row.get("waves_per_eu"), 0),
+                    # Three regimes, not two. ``mega`` alone only gates whether
+                    # the AllGather joins the merged kernel; with it off the
+                    # GEMM1+GEMM2+RS kernel still runs, and at large M *that*
+                    # loses to the split path too (glm5 M=32768: 0.55x). So a
+                    # row needs to be able to say "no merged kernel at all".
+                    # Absent means yes, which is what every earlier row meant.
+                    "stage12": str(row.get("stage12", "1")).strip()
+                    not in ("0", "false"),
                 }
     except FileNotFoundError:
         pass
@@ -701,17 +709,19 @@ class MegaMoeTP:
             kernel1, kernel2 = pinned_kernel_names(cfg, _PIN_OVERRIDE)
             BM = int(_PIN_OVERRIDE["block_m"])
             wpe = int(_PIN_OVERRIDE.get("waves_per_eu", _WAVES_PER_EU_DEFAULT))
+            s12 = True  # a tuner override is measuring the merged kernel
         else:
             tuned = self._pinned_tuned_lookup(bucket)
             if tuned is not None:
-                kernel1, kernel2, BM, wpe = tuned
+                kernel1, kernel2, BM, wpe, s12 = tuned
             else:
                 kernel1, kernel2, BM = self._pinned_default(bucket)
                 wpe = _WAVES_PER_EU_DEFAULT
+                s12 = True
         metadata = _make_mxfp4_metadata(
             kernel1, kernel2, GateMode.SEPARATED.value, 0, block_m=BM
         )
-        return metadata, kernel1, kernel2, wpe
+        return metadata, kernel1, kernel2, wpe, s12
 
     def _pinned_tuned_lookup(self, bucket: int):
         """``(kernel1, kernel2, block_m, waves_per_eu)`` from the CSV, or None."""
@@ -743,6 +753,7 @@ class MegaMoeTP:
             row["kernel2"],
             int(row["block_m"]),
             int(row["waves_per_eu"]),
+            bool(row["stage12"]),
         )
 
     def _mega_allowed_by_csv(self, bucket: int) -> bool:
@@ -900,10 +911,10 @@ class MegaMoeTP:
         # An active tuner override implies the pinned path even when the env
         # switch is off, so a tuning run needs no extra environment setup.
         if _PIN_KERNELS or _PIN_OVERRIDE is not None:
-            metadata, kernel1, kernel2, wpe = self._pinned_row(bucket)
+            metadata, kernel1, kernel2, wpe, s12 = self._pinned_row(bucket)
             return _CasePlan(
                 bucket, "fp4_1x32", kernel1, kernel2, metadata, bucket,
-                self._fuses_rs(kernel2), wpe,
+                self._fuses_rs(kernel2), wpe, s12,
             )
         _, kernel1, kernel2 = self._tuned_row(bucket)
         prequant_ok = _gemm1_takes_prequantized_fp4(kernel1)
@@ -1256,7 +1267,15 @@ class MegaMoeTP:
 
 
     def _fuses_stage12(self, plan) -> bool:
-        """Whether this bucket's tuned pair can share one kernel."""
+        """Whether this bucket's tuned pair can *and should* share one kernel.
+
+        ``plan.stage12`` is the per-row opt-out. It is separate from ``mega``
+        because there are three regimes, not two: merged with the AllGather in
+        it, merged without, and not merged at all. At large M the second still
+        loses to the split path, so ``mega=0`` alone is not a fallback.
+        """
+        if not plan.stage12:
+            return False
         from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import stage12_supported
         from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
@@ -1637,6 +1656,9 @@ class _CasePlan:
     #: Compile hint for the merged kernel; 0 leaves it to the allocator. Not
     #: derivable from the kernel names, so it travels on the plan.
     waves_per_eu: int = 0
+    #: Whether this bucket may use the merged GEMM1+GEMM2+RS kernel at all.
+    #: ``mega`` gates only the AllGather on top of it.
+    stage12: bool = True
 
 
 def _prequant_transform(metadata):

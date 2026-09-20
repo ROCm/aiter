@@ -114,32 +114,57 @@ _WAVES_PER_EU = int(os.environ.get("AITER_TP_MEGA_WAVES_PER_EU", "2"))
 #: and that excess (537 / 339 / 638 us) is most of the whole gap against the
 #: split path (817 / 500 / 855 us).
 #:
-#: The cause is **register pressure**, not LDS and not L2 locality. Compiled
-#: ISA (`FLYDSL_DUMP_IR=1`), kimi3 M=8192:
+#: **Both** GEMMs are inflated, not just GEMM2 -- G1 1.38-1.79x, G2 1.62-2.78x
+#: -- so whatever it is, it is a whole-kernel effect. Four candidates were
+#: measured; all four are too small, and each is recorded because each looks
+#: like the answer until it is measured:
 #:
-#:     GEMM1 standalone   65 KB LDS   230 VGPR   0 B scratch
-#:     GEMM2 standalone   32 KB LDS   128 VGPR   0 B scratch
-#:     merged             65 KB LDS   256 VGPR   172 B scratch
-#:
-#: The merged kernel sits at the 256 arch-VGPR ceiling and spills, with the
-#: scratch traffic spread through the MFMA-heavy regions rather than confined
-#: to a cold path. Dropping the AllGather front (`fuse_ag=False`) leaves it
-#: byte-identical at 256/172, so it is the two GEMMs alone that do it.
-#:
-#: Two plausible explanations were measured and rejected first, both worth
-#: recording because they look right:
-#:   * LDS occupancy. Forcing GEMM1 to a 19 KB tile (8 CTA/CU) instead of 65 KB
-#:     (2 CTA/CU) -- a 4x occupancy swing -- moved GEMM2 in-kernel by **9%**
-#:     (891.6 -> 812.9 us) and left the ratio at ~2x. The total got *worse*
-#:     because GEMM1 degrades at BM32.
-#:   * L2 swizzle. The merged kernel cannot use GEMM2's `spart` partitioning
+#:   * *LDS occupancy.* Forcing GEMM1 to a 19 KB tile (8 CTA/CU) instead of
+#:     65 KB (2 CTA/CU) -- a 4x swing -- moved GEMM2 in-kernel by **9%**
+#:     (891.6 -> 812.9 us), ratio still ~2x, and the total got worse because
+#:     GEMM1 degrades at BM32.
+#:   * *L2 swizzle.* The merged kernel cannot use GEMM2's `spart` partitioning
 #:     (`stage12_supported` rejects it). Disabling `MXFP4_G2_SPART` on the
-#:     standalone kernel costs it **0-4%**, so that is not the gap either.
+#:     standalone kernel costs it **0-4%**.
+#:   * *Register spill.* The merged kernel does spill (256 VGPR, 172 B scratch,
+#:     against 230/0 for GEMM1 and 128/0 for GEMM2 standalone). But the
+#:     BM32/BN128 variant compiles to 229 VGPR and **0 scratch** and still
+#:     shows 2.03x.
+#:   * *n-tile serialisation.* GEMM2's tiles run back to back in one CTA with a
+#:     `gpu.barrier()` between them, so nothing overlaps. Halving the tile count
+#:     (BN 256 -> 512, 14 -> 7 blocks) is worth **13%** (893.0 -> 775.6, ratio
+#:     2.22 -> 1.93). Real, but not the bulk.
 #:
-#: One function means one register allocation, and two register-hungry GEMMs
-#: do not fit. Not removable without un-fusing, which is what `mega=0` at
-#: M>=2048 does.
+#: What is left, and what fits all four negatives: the producer-consumer
+#: round trip. A CTA writes its m-block's FP4 intermediate to global, drains it
+#: with `s_waitcnt vmcnt(0)`, then reads it straight back for GEMM2. In the
+#: split path that handoff is a kernel boundary and GEMM2 streams an
+#: already-settled buffer. Here it is a full memory round trip per m-block with
+#: nothing to overlap it, because a CTA holds one m-block at a time.
+#: Untested fix for that: give each CTA two m-blocks and software-pipeline
+#: them -- GEMM1(A), GEMM1(B), one drain, GEMM2(A), GEMM2(B) -- so B's compute
+#: covers A's drain. Local to this file. Until then `mega=0` at M>=2048.
 _SKIP = os.environ.get("AITER_TP_MEGA_SKIP", "")
+#: Emit the n-block loops as runtime loops instead of ``range_constexpr``
+#: unrolls.
+#:
+#: The unrolled form emits one full copy of the tile body per n block --
+#: ``g1_n_blocks`` of GEMM1 and ``G2_N_BLOCKS`` of GEMM2. At kimi3 M=8192 that
+#: is 3 and 14 copies, 2016 MFMA instructions against 448 + 48 for the two
+#: standalone kernels, and 18k lines of ISA (~144 KB) against a 32 KB L1
+#: instruction cache. Every tile is *different* code, so there is no
+#: instruction reuse across them.
+#:
+#: The tile emitters already take a runtime block index -- the flattened
+#: ``_GRID_CU`` branch passes one -- so rolling the loops costs nothing but the
+#: loop overhead.
+#:
+#: The bound has to come from a *kernel argument*, not from the Python
+#: constant. A ``range(fx.Int32(0), fx.Int32(14), fx.Int32(1))`` is folded and
+#: fully unrolled again: with that form the emitted ISA was byte-identical to
+#: the constexpr one (18100 lines, 2016 MFMA), which reads as "rolling does not
+#: help" when in fact nothing rolled.
+_ROLL = os.environ.get("AITER_TP_MEGA_ROLL", "0") == "1"
 #: Run the in-kernel A-scale shuffle. Whether GEMM1 wants the gathered scale in
 #: token order or in sorted+swizzled order decides this, and the two differ by a
 #: whole kernel, so it is a knob until measured rather than an assumption.
@@ -619,7 +644,10 @@ def compile_stage12_rs(
         # it, which reads as irreproducible timing rather than as a bug.
         sig = hashlib.sha256(
             repr(
-                (_config, _ROUTE_HOST, _ROUTE_VIS, _ASCALE_SHUFFLE, _SKIP)
+                (
+                    _config, _ROUTE_HOST, _ROUTE_VIS, _ASCALE_SHUFFLE,
+                    _SKIP, _ROLL,
+                )
             ).encode()
         ).hexdigest()[:12]
         name = (
@@ -873,13 +901,16 @@ def compile_stage12_rs(
                         lds,
                     )
             else:
-                for raw in range(bx_i32, g1_total_m, grid_nb):
-                    mb = _m_block(fx.Int32(raw))
+                # One CTA owns one sort block: its GEMM1 tiles, then its
+                # GEMM2 tiles, with the handoff below.
+
+                def _do_shuffle(mb):
                     if fuse_ag and _ASCALE_SHUFFLE:
-                        # Only this block's rows. Doing it grid-stride instead would
-                        # make CTA i shuffle rows CTA j consumes, and a workgroup
-                        # barrier cannot order that -- the same reason the GEMM
-                        # handoff is per sort block rather than grid-wide.
+                        # Only this block's rows. Doing it grid-stride instead
+                        # would make CTA i shuffle rows CTA j consumes, and a
+                        # workgroup barrier cannot order that -- the same reason
+                        # the GEMM handoff is per sort block rather than
+                        # grid-wide.
                         emit_ascale_shuffle(
                             arg_ascale_raw,
                             arg_ascale,
@@ -894,10 +925,13 @@ def compile_stage12_rs(
                         )
                         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                         gpu.barrier()
-                    for nb1 in range_constexpr(0 if _SKIP in ("g1", "both") else g1_n_blocks):
+
+                def _do_gemm1(mb):
+                    n1 = 0 if _SKIP in ("g1", "both") else g1_n_blocks
+                    for nb1 in range_constexpr(n1):
                         # Unconditional: reusing LDS across tiles is not safe
-                        # without it, and a Python-level "skip the first one" flag
-                        # would be evaluated at trace time and emit nothing.
+                        # without it, and a Python-level "skip the first one"
+                        # flag would be evaluated at trace time and emit nothing.
                         gpu.barrier()
                         emit_gemm1_tile(
                             arg_aq,
@@ -910,7 +944,8 @@ def compile_stage12_rs(
                             arg_ascaleout,
                             arg_hidden,
                             arg_bias1,
-                            mb * fx.Int32(g1_n_blocks) + fx.Int32(nb1),
+                            mb * fx.Int32(g1_n_blocks)
+                            + (nb1 if _ROLL else fx.Int32(nb1)),
                             lane,
                             wave,
                             i32_ntok,
@@ -918,50 +953,42 @@ def compile_stage12_rs(
                             lds_raw,
                         )
 
-                    # This block's intermediate is complete. GEMM1 wrote it to HBM
-                    # and the GEMM2 tiles below read it back, so the stores have to
-                    # retire first -- and every wave in the CTA has to see that,
-                    # hence the barrier after the wait rather than instead of it.
-                    # Same CTA, so same XCD and same L2: no agent-scope release is
-                    # needed, which is what made the old inter-phase handoff costly.
-                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                def _g2_tile(mb, nb2):
                     gpu.barrier()
+                    emit_gemm2_tile(
+                        arg_aqout, arg_ascaleout, arg_w2, arg_w2_scale,
+                        arg_eids, arg_stids, arg_sweights, arg_bias2,
+                        arg_route_target if g2_epilog == "reduce" else arg_out,
+                        mb, nb2, lane, wave, i32_M, i32_max_m_blocks,
+                        i32_inter, i32_hidden, lds,
+                    )
 
-                    for nb2 in range_constexpr(0 if _SKIP in ("g2", "both") else G2_N_BLOCKS):
-                        gpu.barrier()
-                        m_block_idx = mb
-                        n_block_idx = fx.Int32(nb2)
-                        emit_gemm2_tile(
-                            arg_aqout,
-                            arg_ascaleout,
-                            arg_w2,
-                            arg_w2_scale,
-                            arg_eids,
-                            arg_stids,
-                            arg_sweights,
-                            arg_bias2,
-                            arg_route_target if g2_epilog == "reduce" else arg_out,
-                            m_block_idx,
-                            n_block_idx,
-                            lane,
-                            wave,
-                            i32_M,
-                            i32_max_m_blocks,
-                            i32_inter,
-                            i32_hidden,
-                            lds,
-                        )
+                def _do_gemm2(mb):
+                    n2 = 0 if _SKIP in ("g2", "both") else G2_N_BLOCKS
+                    # Two syntactic loops, not one over a precomputed iterator:
+                    # the tracer recognises ``for x in range(...)`` by *shape*
+                    # and otherwise falls back to iterating it in Python, which
+                    # fails with "dynamic 'ArithValue' has no Python integer
+                    # representation". The bound also has to come from a kernel
+                    # argument -- a constant one is folded and re-unrolled.
+                    if _ROLL and n2:
+                        for nb2 in range(
+                            fx.Int32(0), _udiv(i32_hidden, fx.Int32(g2_BN)),
+                            fx.Int32(1),
+                        ):
+                            _g2_tile(mb, nb2)
+                    else:
+                        for nb2 in range_constexpr(n2):
+                            _g2_tile(mb, fx.Int32(nb2))
 
+                def _do_reduce(mb):
                     if g2_epilog == "reduce":
                         # GEMM2 staged this block's rows at
                         # target[token][slot][:]; every slot of those tokens is
-                        # only complete once every expert they routed to has run.
-                        # The counter below expresses exactly that, per token,
+                        # only complete once every expert they routed to has
+                        # run. The counter expresses exactly that, per token,
                         # instead of a grid-wide barrier -- see
                         # :func:`emit_route_reduce`.
-                        # `sc1` already put the staged rows past L2, so the
-                        # release is just the wait; without it this needs the
-                        # writeback fence.
                         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                         if const_expr(_ROUTE_RELEASE and _ROUTE_GATHER):
                             comm.fence_agent_release()
@@ -980,6 +1007,34 @@ def compile_stage12_rs(
                             topk=topk,
                             model_dim=model_dim,
                         )
+
+                for raw in range(bx_i32, g1_total_m, grid_nb):
+                    mb = _m_block(fx.Int32(raw))
+                    _do_shuffle(mb)
+                    _do_gemm1(mb)
+                    # This block's intermediate is complete. GEMM1 wrote it to
+                    # HBM and the GEMM2 tiles below read it back, so the stores
+                    # have to retire first -- and every wave in the CTA has to
+                    # see that, hence the barrier after the wait rather than
+                    # instead of it. Same CTA, so same XCD and same L2: no
+                    # agent-scope release is needed, which is what made the old
+                    # inter-phase handoff costly.
+                    #
+                    # Running *two* blocks' GEMM1 before a single drain, so the
+                    # second covers the first's store latency, was tried and is
+                    # **worse** -- 3 to 40% across every cell. The drain is not
+                    # idle time for the machine: while one CTA waits on its own
+                    # stores the other CTAs resident on the CU keep issuing, so
+                    # there is nothing for a within-CTA pipeline to recover.
+                    # It also needs the out-of-range second block clamped onto
+                    # the last valid one, which re-runs that block's GEMM1 while
+                    # another CTA is reading its output -- same values, but a
+                    # race, and pure waste. Removed rather than left behind a
+                    # knob.
+                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
+                    _do_gemm2(mb)
+                    _do_reduce(mb)
 
             # -- ReduceScatter -----------------------------------------------
             emit_rs_tail(
