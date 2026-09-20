@@ -699,37 +699,6 @@ aiter.logger.info(
 
 df = []
 for token in args.token:
-    # Kimi-K3 fused MoE-front router: logits are a row-strided slice of the
-    # fused [gate_up | experts | routed] buffer, not a standalone tensor
-    gate_up_width, num_experts, routed_width = 1536, 896, 3584
-    fused_front_width = gate_up_width + num_experts + routed_width
-    backing = torch.randn((token, fused_front_width), dtype=dtypes.bf16)
-    gating_output = backing[:, gate_up_width : gate_up_width + num_experts]
-    # stride(0) is the thing under test. Do not also assert non-contiguity:
-    # at token=1 the row stride is unreachable, so the slice is contiguous.
-    assert gating_output.stride(0) == fused_front_width
-    ret = test_biased_grouped_topk(
-        token,
-        num_experts,
-        1,  # group
-        16,  # topk
-        1,  # topk_group
-        True,  # need_renorm
-        dtypes.bf16,
-        gating_output=gating_output,
-        num_iters=args.iters,
-        num_warmup=args.warmup,
-    )
-    df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info(
-    "moeTopkSoftmax_biased_grouped_topk_kimi_k3_strided summary (markdown):\n%s",
-    df_md,
-)
-
-df = []
-for token in args.token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
         topk = 8
@@ -753,6 +722,89 @@ for token in args.token:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)
+
+# Register-resident path: G=1 and E on the EPL whitelist. Token list is kept
+# small so CI time stays bounded. Odd stride (rowVec2=false) is one extra case.
+reg_tokens = [1, 128]
+df = []
+for token in reg_tokens:
+    for expert, topk, dtype in (
+        (128, 4, dtypes.bf16),
+        (128, 32, dtypes.fp32),
+        (2048, 32, dtypes.bf16),
+    ):
+        ret = test_biased_grouped_topk(
+            token,
+            expert,
+            1,
+            topk,
+            1,
+            True,
+            dtype,
+            num_iters=args.iters,
+            num_warmup=args.warmup,
+        )
+        df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_biased_grouped_topk summary (markdown):\n%s", df_md
+)
+
+# Odd row stride: host launches rowVec2=false. token>1 is required — row 0 is
+# still 2-element aligned even when stride_gating is odd.
+odd_token, odd_expert, odd_topk = 128, 128, 8
+backing = torch.randn((odd_token, odd_expert + 1), dtype=dtypes.bf16)
+gating_odd = backing[:, :odd_expert]
+assert gating_odd.stride(0) % 2 == 1
+ret = test_biased_grouped_topk(
+    odd_token,
+    odd_expert,
+    1,
+    odd_topk,
+    1,
+    True,
+    dtypes.bf16,
+    gating_output=gating_odd,
+    num_iters=args.iters,
+    num_warmup=args.warmup,
+)
+df = pd.DataFrame([ret])
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_biased_grouped_topk_odd_stride summary (markdown):\n%s",
+    df_md,
+)
+
+df = []
+for token in reg_tokens:
+    ret = test_grouped_topk(
+        token,
+        128,
+        1,
+        8,
+        1,
+        True,
+        dtypes.bf16,
+        scoring_func="softmax",
+    )
+    df.append(ret)
+    ret = test_grouped_topk(
+        token,
+        256,
+        1,
+        8,
+        1,
+        True,
+        dtypes.bf16,
+        scoring_func="sigmoid",
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_grouped_topk summary (markdown):\n%s", df_md
+)
 
 # Test shared expert sigmoid scoring
 aiter.logger.info("\n" + "=" * 70)
