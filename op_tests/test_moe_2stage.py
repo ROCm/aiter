@@ -80,8 +80,11 @@ _HERD_FALSEY = ("", "0", "false", "False")
 
 
 def _herd_selector_requested():
-    """Same env as Triton routing(): AITER_TRITON_USE_HERD / HERD_MIN_M / HERD_MAX_M."""
-    return os.environ.get("AITER_TRITON_USE_HERD", "") not in _HERD_FALSEY
+    """HERD overlay: AITER_FLYDSL_USE_HERD or AITER_TRITON_USE_HERD."""
+    return (
+        os.environ.get("AITER_FLYDSL_USE_HERD", "") not in _HERD_FALSEY
+        or os.environ.get("AITER_TRITON_USE_HERD", "") not in _HERD_FALSEY
+    )
 
 
 def _atom_biased_grouped_topk(gating_output, topk, renormalize=True, bias=None):
@@ -115,7 +118,7 @@ def _atom_biased_grouped_topk(gating_output, topk, renormalize=True, bias=None):
 
 
 def _select_topk(hidden_states, gating_output, topk, renormalize=True, bias=None):
-    """ATOM biased_grouped_topk, or HERD min-unique overlay when env is set.
+    """ATOM biased_grouped_topk, or FlyDSL HERD min-unique overlay when env is set.
 
     HERD is a decode-sized min-unique selector (top-(k+1) then drop) on the
     same sigmoid+bias scores ATOM uses. It cannot run when the expert set is
@@ -126,8 +129,16 @@ def _select_topk(hidden_states, gating_output, topk, renormalize=True, bias=None
     if not _herd_selector_requested():
         return _atom_biased_grouped_topk(gating_output, topk, renormalize, bias)
 
-    min_m = int(os.environ.get("AITER_TRITON_HERD_MIN_M", "16"))
-    max_m = int(os.environ.get("AITER_TRITON_HERD_MAX_M", "128"))
+    min_m = int(
+        os.environ.get(
+            "AITER_FLYDSL_HERD_MIN_M", os.environ.get("AITER_TRITON_HERD_MIN_M", "16")
+        )
+    )
+    max_m = int(
+        os.environ.get(
+            "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "128")
+        )
+    )
     skip = None
     gfx = get_gfx()
     if gfx not in ("gfx950", "gfx1250"):
@@ -147,17 +158,16 @@ def _select_topk(hidden_states, gating_output, topk, renormalize=True, bias=None
     if not (min_m <= n_tokens <= max_m):
         return _atom_biased_grouped_topk(gating_output, topk, renormalize, bias)
 
-    from aiter.fused_moe import herd_fused_topk
+    from aiter.ops.flydsl.herd_topk import herd_topk_gating, herd_topk_gating_supported
 
-    weights, ids = herd_fused_topk(
-        hidden_states,
-        gating_output,
-        topk,
-        renormalize,
-        sm_first=False,
-        score_mode="sigmoid",
-        bias=bias,
-    )
+    M, E = gating_output.shape
+    if bias is None:
+        bias = torch.zeros((E,), dtype=gating_output.dtype, device=gating_output.device)
+    weights = torch.empty((M, topk), dtype=torch.float32, device=gating_output.device)
+    ids = torch.empty((M, topk), dtype=torch.int32, device=gating_output.device)
+    if not herd_topk_gating_supported(weights, ids, gating_output, bias, "sigmoid"):
+        return _atom_biased_grouped_topk(gating_output, topk, renormalize, bias)
+    herd_topk_gating(weights, ids, gating_output, bias, renormalize, 1.0, "sigmoid")
     return weights, ids
 
 
