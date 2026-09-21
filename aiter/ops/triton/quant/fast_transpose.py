@@ -20,7 +20,7 @@ def fast_transpose_2d(x: torch.Tensor) -> torch.Tensor:
     Replaces the ``tensor.t().contiguous()`` pattern which dispatches a
     full ``aten::copy_`` kernel.
     """
-    _LOGGER.info(f"FAST_TRANSPOSE_2D: x={tuple(x.shape)}")
+    _LOGGER.info("FAST_TRANSPOSE_2D: x=%s", tuple(x.shape))
     assert x.dim() == 2, f"Expected 2D tensor, got {x.dim()}D"
     M, N = x.shape
 
