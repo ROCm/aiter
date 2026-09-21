@@ -33,6 +33,7 @@ from .kernels.conv3d_gfx950_utils import (
     DEFAULT_TILE,
     LDG_VEC,
     MAX_DYN_DIVIDEND,
+    SPLITK_AUTO_MAX_STAGING_BYTES,
     SPLITK_MAX_STAGING_BYTES,
     TILE_K,
     _as_stream,
@@ -47,6 +48,44 @@ from .kernels.conv3d_transpose import (
     TR_VEC,
     compile_transpose_ncdhw_ndhwc,
 )
+
+# ---------------------------------------------------------------------------
+# Which cards this op runs on
+# ---------------------------------------------------------------------------
+
+# TILE_K = 32 makes the MMA ``mfma_f32_16x16x32_bf16``, which is CDNA4 and
+# nothing else: gfx942 has no K=32 bf16 MFMA to fall back to, so a call there
+# does not run slowly, it dies inside the compile or assembles an instruction
+# the card does not have -- neither of which names the arch as the reason.
+#
+# A positive allow-list rather than a deny-list of the archs known to lack it:
+# an unsupported card that nobody thought of should be told so, not find out by
+# executing an illegal instruction.
+#
+# Checked at the public entry point, which means the 1x1 ``torch.matmul`` fast
+# path below is refused on an unsupported card too, even though it would have
+# run. That is deliberate: one op answers for one set of cards, and a surface
+# where some shapes work and others fail inside the compiler is worse to use
+# than one that says no.
+SUPPORTED_GFX = ("gfx950",)
+
+
+def _check_supported_arch():
+    """Refuse an arch whose MFMA this kernel is written against, before compiling."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    # ``get_gfx()`` rather than ``get_gfx_runtime()``: it is what the tuned
+    # table, the tuner's stamp and the rest of this module already answer to,
+    # and it is memoised, so this costs nothing per call. Feature suffixes
+    # (``gfx950:sramecc+``) are dropped first.
+    gfx = get_gfx().split(":", 1)[0]
+    if gfx not in SUPPORTED_GFX:
+        raise RuntimeError(
+            f"flydsl_conv_implicit requires one of {list(SUPPORTED_GFX)}, got {gfx}. "
+            f"Its MMA is mfma_f32_16x16x32_bf16 (TILE_K={TILE_K}), which is CDNA4 "
+            f"only; use torch.nn.functional.conv{{1,2,3}}d on this device."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Offline tuned launch configs: the runtime counterpart to
@@ -120,14 +159,42 @@ def _parse_tuned_bool(value) -> bool:
     raise ValueError(f"Expected True/False, got {value!r}")
 
 
-def _is_matmul_fast_path(shape) -> bool:
-    """Rows the op answers with ``torch.matmul``, so there is no kernel to tune or AOT."""
-    vals = {c: int(shape[c]) for c in _MATMUL_FAST_PATH_INT_COLS}
+def _is_matmul_shape(*, groups, kt, kh, kw, st, sh, sw, pt, ph, pw) -> bool:
+    """Is this convolution just a matmul over the channel axis?
+
+    A 1x1x1 filter at unit stride and no padding makes every output element a
+    dot product of one input element's channels with a filter row, so the op
+    answers it with ``torch.matmul`` and no kernel is compiled at all.
+
+    The one copy of that question. ``_conv3d_impl`` asks it to decide whether to
+    run a kernel and the tuner and the AOT pass ask it (through
+    ``_is_matmul_fast_path``) to decide whether a CSV row is worth compiling; the
+    two drifting apart would leave the runtime launching a kernel for shapes
+    nobody tuned, and no error to say so. Dilation is absent because a 1-tap
+    filter has nothing to space out.
+    """
     return (
-        vals["groups"] == 1
-        and vals["kT"] == vals["kH"] == vals["kW"] == 1
-        and vals["stride_d"] == vals["stride_h"] == vals["stride_w"] == 1
-        and vals["pad_d"] == vals["pad_h"] == vals["pad_w"] == 0
+        groups == 1
+        and kt == kh == kw == 1
+        and st == sh == sw == 1
+        and pt == ph == pw == 0
+    )
+
+
+def _is_matmul_fast_path(shape) -> bool:
+    """``_is_matmul_shape`` for a tuned/untuned CSV row, keyed by column name."""
+    vals = {c: int(shape[c]) for c in _MATMUL_FAST_PATH_INT_COLS}
+    return _is_matmul_shape(
+        groups=vals["groups"],
+        kt=vals["kT"],
+        kh=vals["kH"],
+        kw=vals["kW"],
+        st=vals["stride_d"],
+        sh=vals["stride_h"],
+        sw=vals["stride_w"],
+        pt=vals["pad_d"],
+        ph=vals["pad_h"],
+        pw=vals["pad_w"],
     )
 
 
@@ -424,6 +491,27 @@ WGM_MIN_BLOCKS_PER_CU = 4
 
 
 def _num_cu(device):
+    """CU count the tile and split-K heuristics size themselves against.
+
+    ``chip_info.get_cu_num()`` first, not ``torch.cuda.get_device_properties``:
+    the tuned table is keyed on the former (see ``_lookup_tuned_tile``), the
+    tuner enumerates its candidates against it, and the AOT jobs are stamped
+    with it. Under ``CU_NUM`` or a CU partition the two disagree, and since the
+    split this picks is part of the compile key, a disagreement is not a
+    differently shaped heuristic answer but an AOT artifact the runtime never
+    asks for.
+
+    torch remains the fallback, and 256 (gfx950's count) the fallback's
+    fallback: this only sizes a heuristic, so a probe failure must not raise.
+    """
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        cu = int(get_cu_num())
+    except Exception:  # noqa: BLE001 -- no rocminfo (CPU-only host); try torch
+        cu = 0
+    if cu > 0:
+        return cu
     try:
         return torch.cuda.get_device_properties(device).multi_processor_count
     except Exception:  # noqa: BLE001 -- probe failure falls back to gfx950's count
@@ -586,7 +674,10 @@ def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
             or kg % tile_n != 0
             or npq % tile_m != 0
             or crs % TILE_K != 0
-            or npq * k * 4 > 0x7FFFFFFF
+            # Not SPLITK_MAX_STAGING_BYTES: the top half of that window is only
+            # addressable through the unsigned reinterpretation the constant
+            # documents, and a split nobody asked for does not go there.
+            or npq * k * 4 > SPLITK_AUTO_MAX_STAGING_BYTES
         ):
             sk = 1
         else:
@@ -751,17 +842,12 @@ def _conv3d_impl(
         inline_pad = False
     pad_mode = padding_mode if inline_pad else "zeros"
 
-    if (
-        groups == 1
-        and kt == 1
-        and kh == 1
-        and kw == 1
-        and st == 1
-        and sh == 1
-        and sw == 1
-        and pt == 0
-        and ph == 0
-        and pw == 0
+    # Asked through the shared predicate, not inline: the tuner and the AOT pass
+    # skip exactly these rows, and a second spelling here is how the runtime ends
+    # up launching a kernel for a shape nobody tuned. The padding values are the
+    # post-normalisation ones, so a "same" pad that resolved to zero lands here too.
+    if _is_matmul_shape(
+        groups=groups, kt=kt, kh=kh, kw=kw, st=st, sh=sh, sw=sw, pt=pt, ph=ph, pw=pw
     ):
         wm = weight.reshape(k, c)
         if in_ndhwc:
@@ -1026,7 +1112,11 @@ def flydsl_conv_implicit(
     the K axis, while K/groups=1 leaves all but one column of the N tile masked.
     Narrower tiles recover little there -- depthwise wants its own kernel, not this
     single-GEMM mapping.
+
+    Raises ``RuntimeError`` on an arch outside ``SUPPORTED_GFX``; see that
+    constant for why the refusal covers every shape, fast path included.
     """
+    _check_supported_arch()
     spatial_rank = weight.dim() - 2
     if spatial_rank not in (1, 2, 3):
         raise ValueError(

@@ -53,6 +53,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_conv_implicit
+from aiter.ops.flydsl.conv_kernels import SUPPORTED_GFX
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 TOL = {"rtol": 2e-2, "atol": 2e-2}
@@ -69,10 +70,10 @@ TOL = {"rtol": 2e-2, "atol": 2e-2}
 # here has always meant a real defect, not accumulated rounding.
 ERR_TOL = 0.0
 _FAILED = []
-# TILE_K=32 uses mfma_f32_16x16x32_bf16, which is CDNA4/gfx950 only. gfx942
-# (MI300X) has no K=32 BF16 MFMA; a positive allow-list keeps unknown cards
-# from silently compiling an illegal instruction.
-SUPPORTED_GFX = ["gfx950"]
+# SUPPORTED_GFX is the op's own allow-list (TILE_K=32 means mfma_f32_16x16x32_bf16,
+# which is CDNA4 only), imported rather than restated: the op now refuses an
+# unsupported arch itself, and a sweep that skipped on a different list than the
+# one the op enforces would either test nothing or fail on the refusal.
 
 
 def _levels(v, n=3):

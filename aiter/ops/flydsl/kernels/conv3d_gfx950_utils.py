@@ -1048,7 +1048,25 @@ def block_coords(grid, grid_m=None):
 
 # Split-K accumulates through a buffer descriptor, whose num_records is a
 # 32-bit byte count, so the fp32 staging buffer has to fit one.
+#
+# The whole 2**32 is reachable, but only because every part of that address is
+# unsigned: ``OutputScatter.store`` computes the element offset in i64 and hands
+# the atomic an ``fx.Int32(off_sk * 4)``, which is a negative i32 past 2**31 --
+# the access still lands on the right byte, since the hardware reads voffset and
+# num_records as unsigned. This is the hard limit, and what
+# ``make_output_scatter_plan`` asserts against.
 SPLITK_MAX_STAGING_BYTES = 0xFFFFFFFF
+
+# What ``_resolve_splitk`` will put a split on *by itself*. Half the window
+# above, and deliberately so: everything past 2**31 depends on the unsigned
+# reinterpretation described above, so a split nobody asked for does not go
+# there. Only an explicit ``splitk=`` from the caller, or a tuned CSV row, can
+# reach the rest of the window -- and either way it is a value someone measured.
+#
+# Written as its own constant rather than a bare literal next to the one above
+# because the two are not a copy that drifted: they are the hardware's limit and
+# the heuristic's, and a reader who assumes otherwise will "fix" one of them.
+SPLITK_AUTO_MAX_STAGING_BYTES = 0x7FFFFFFF
 
 
 class OutputScatterPlan(NamedTuple):
