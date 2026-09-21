@@ -693,6 +693,9 @@ class DeviceMoEPipeline:
                 w1_scale=self.w1_s,
                 w2_scale=self.w2_s,
                 next_topk_ids=next_ids,
+                # Named per step, not inherited from construction: building the
+                # reduce and running it are separate decisions now.
+                combine_quant=self.combine_quant,
             )
             if self.sw1 is not None:
                 y = y + _device_shared_ffn(xn, self.sw1, self.sw2)

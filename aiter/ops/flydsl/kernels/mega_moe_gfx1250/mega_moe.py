@@ -41,6 +41,7 @@ _MAX_EXPERTS_PER_RANK = 512
 # "mxfp8" is what the mega_moe v2 path calls "fp8_blockwise_1x32" (kernels/
 # flydsl_dispatch_combine_intranode_op.py); that path has no fp4.
 _COMBINE_QUANT_MODES = ("none", "mxfp8", "mxfp4")
+_COMBINE_QUANT_BITS = {"none": 0, "mxfp8": 8, "mxfp4": 4}
 # Preferred lane tile for the TDM combine: T tokens x C chunks per block
 # iteration, which the reduce turns into T*C*256/16 lanes -- so the quantized
 # path runs a wider block than the bf16 one. A ceiling, not the answer:
@@ -453,16 +454,31 @@ class MegaMoEConfig:
 
     @property
     def combine_quant_bits(self) -> int:
-        """Payload width on the combine wire; 0 keeps it bf16."""
-        return {"none": 0, "mxfp8": 8, "mxfp4": 4}[self.combine_quant]
+        """Payload width of the quantized wire this instance OFFERS; 0 is none.
+
+        What a step actually runs on is forward()'s own ``combine_quant``; this
+        only says which format it may name.
+        """
+        return _COMBINE_QUANT_BITS[self.combine_quant]
 
     @property
-    def combine_wire_nbytes(self) -> int:
-        """What combine moves per token: an MX payload, or bf16 when off."""
-        if self.combine_quant_bits:
+    def combine_quant_bit_modes(self) -> tuple[int, ...]:
+        """Payload widths a step may pick, i.e. what to build a reduce for.
+
+        bf16 is always in, and is what a step gets unless it asks otherwise: a
+        quantized wire only pays off once there are enough tokens on it to
+        outweigh the per-token quant/dequant pair. Asking for none here keeps
+        bf16 the only one, so a model that never quantizes builds one reduce.
+        """
+        bits = self.combine_quant_bits
+        return (0,) if not bits else (0, bits)
+
+    def combine_wire_nbytes(self, quant_bits: int) -> int:
+        """What combine moves per token at ``quant_bits``: MX, or bf16 at 0."""
+        if quant_bits:
             # A payload plane of MX bytes, then its e8m0 scale plane.
             return (
-                self.hidden_dim * self.combine_quant_bits // 8
+                self.hidden_dim * quant_bits // 8
                 + self.hidden_dim // _COMBINE_SCALE_BLOCK
             )
         return self.hidden_dim * 2
@@ -503,12 +519,31 @@ class MegaMoEConfig:
 
         return scale_stride_bytes(self.dispatch_scale_nbytes)
 
-    @property
-    def combine_slot_stride_bytes(self) -> int:
+    def combine_slot_stride_for(self, quant_bits: int) -> int:
+        """Slot pitch on the ``quant_bits`` wire: the payload rounded up to a
+        power of two, so one row index addresses both peer and slot.
+
+        Tight per wire, not shared across them. The scatter writes and the
+        reduce reads one payload per slot at this pitch, so padding a quantized
+        slot out to the bf16 one would leave three quarters of every cache line
+        and TDM row untouched -- handing back most of what the narrower payload
+        just won. The arena is what absorbs the difference instead: it is cut to
+        the widest pitch (below) and a quantized wire packs into its front.
+        """
         stride = 1
-        while stride < self.combine_wire_nbytes:
+        while stride < self.combine_wire_nbytes(quant_bits):
             stride <<= 1
         return stride
+
+    @property
+    def combine_slot_stride_bytes(self) -> int:
+        """The bf16 wire's pitch, and so the one the arena is SIZED for.
+
+        bf16 is the widest wire, so a staging region cut to this pitch holds a
+        step on any of them and the arena stops depending on which format a
+        step picks -- which is what lets one instance serve them all.
+        """
+        return self.combine_slot_stride_for(0)
 
 
 @dataclass
@@ -673,6 +708,7 @@ class MegaMoEGfx1250:
         recv_token_bound: int | None = None,
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
+        combine_quant: str | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -688,7 +724,14 @@ class MegaMoEGfx1250:
         layer's compact plan on a side stream after this dispatch, so it overlaps
         the expert GEMM. The two plans use independent hist/done slots and local
         tok_map/psum buffers. Omit them to keep the plan sequential.
+
+        ``combine_quant`` picks this step's combine wire out of the formats the
+        constructor built a reduce for, so a caller can quantize the steps with
+        enough tokens on the wire to pay for it and leave the rest on bf16.
+        Omitting it means bf16 -- naming a format at construction only builds
+        it, each step still has to ask for it.
         """
+        combine_quant_bits = self._resolve_combine_quant(combine_quant)
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
@@ -780,7 +823,7 @@ class MegaMoEGfx1250:
         if self.activation == ActivationType.Situv2:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
-        scatter = self._scatter_context(routing)
+        scatter = self._scatter_context(routing, combine_quant_bits)
         from aiter.ops.flydsl.grouped_moe_gfx1250 import set_tdm_compact_plan
 
         set_tdm_compact_plan(scatter if self._compact_plan else None)
@@ -822,7 +865,33 @@ class MegaMoEGfx1250:
             )
         finally:
             set_tdm_compact_plan(None)
-        return self._combine(routing)
+        return self._combine(routing, combine_quant_bits)
+
+    def _resolve_combine_quant(self, combine_quant: str | None) -> int:
+        """This step's combine payload width, checked against what was built.
+
+        Unnamed means bf16. The constructor's ``combine_quant`` says which
+        formats exist, not which one runs: a quantized wire only pays off once
+        there are enough tokens on it to outweigh the per-token quant/dequant
+        pair, and that is a property of the step, so a step has to ask.
+        """
+        if combine_quant is None:
+            return 0
+        if combine_quant not in _COMBINE_QUANT_MODES:
+            raise ValueError(
+                f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
+                f"got {combine_quant!r}"
+            )
+        bits = _COMBINE_QUANT_BITS[combine_quant]
+        if bits not in self._combine_variants:
+            raise ValueError(
+                f"combine_quant={combine_quant!r} was not built: this MegaMoE "
+                f"was constructed with combine_quant="
+                f"{self._config.combine_quant!r}, which builds a reduce for "
+                f"{sorted(self._combine_variants)} bit widths only. Name the "
+                "format at construction to make it available per step."
+            )
+        return bits
 
     __call__ = forward
 
@@ -1061,6 +1130,9 @@ class MegaMoEGfx1250:
                     ("compact_done", compact_done_nbytes()),
                 ]
             )
+        # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
+        # holds a step on any of them and a quantized one just packs into the
+        # front of it at its own pitch.
         arena_regions.append(
             (
                 "comb_inp",
@@ -1215,28 +1287,26 @@ class MegaMoEGfx1250:
 
         # Keep the cross-device barrier in its own 1-block kernel so the reduce
         # grid is unconstrained. Both wires stage through LDS, so the block is
-        # sized to the lane tile (T*C*256/16 lanes).
-        _comb_toks, _comb_chunks = _combine_tile(
-            topk=config.topk,
-            hidden_dim=config.hidden_dim,
-            quant_bits=config.combine_quant_bits,
-        )
-        _lanes = _comb_toks * _comb_chunks * _COMBINE_CHUNK_ELEMS // 16
-        combine_specs = [(512, _lanes // _WAVE_SIZE)]
-        self._combine_specs = combine_specs
-        self._combine_variants = {
-            spec: _make_combine_fused_reduce(
+        # sized to the lane tile (T*C*256/16 lanes) -- which differs per wire,
+        # hence one build per width rather than one shared spec.
+        self._combine_variants = {}
+        for _bits in config.combine_quant_bit_modes:
+            _toks, _chunks = _combine_tile(
+                topk=config.topk,
+                hidden_dim=config.hidden_dim,
+                quant_bits=_bits,
+            )
+            _lanes = _toks * _chunks * _COMBINE_CHUNK_ELEMS // 16
+            self._combine_variants[_bits] = _make_combine_fused_reduce(
                 experts_per_token=config.topk,
                 hidden_dim=config.hidden_dim,
-                block_num=spec[0],
-                warp_num_per_block=spec[1],
-                slot_stride_nbytes=config.combine_slot_stride_bytes,
-                quant_bits=config.combine_quant_bits,
-                tokens_per_block=_comb_toks,
-                chunks_per_iter=_comb_chunks,
+                block_num=512,
+                warp_num_per_block=_lanes // _WAVE_SIZE,
+                slot_stride_nbytes=config.combine_slot_stride_for(_bits),
+                quant_bits=_bits,
+                tokens_per_block=_toks,
+                chunks_per_iter=_chunks,
             )
-            for spec in combine_specs
-        }
         self._combine_sync = _make_combine_fused_sync(
             rank=config.rank,
             npes=config.world_size,
@@ -1629,11 +1699,13 @@ class MegaMoEGfx1250:
             routing,
         )
 
-    def _scatter_context(self, routing: Routing) -> Stage2ScatterContext:
+    def _scatter_context(
+        self, routing: Routing, combine_quant_bits: int
+    ) -> Stage2ScatterContext:
         return Stage2ScatterContext(
             arena_handle=self._arena.handle,
             combine_input_offset=self._arena.offset("comb_inp"),
-            slot_stride_bytes=self._config.combine_slot_stride_bytes,
+            slot_stride_bytes=self._config.combine_slot_stride_for(combine_quant_bits),
             max_tokens_per_rank=self._config.max_tokens_per_rank,
             world_size=self._config.world_size,
             source_token_map=routing.source_token_map,
@@ -1657,11 +1729,16 @@ class MegaMoEGfx1250:
             ),
             compact_align_m=(self._compact_step_align_m if self._compact_plan else 0),
             compact_rows=(self._compact_step_rows if self._compact_plan else 0),
-            combine_quant_bits=self._config.combine_quant_bits,
+            combine_quant_bits=combine_quant_bits,
         )
 
-    def _combine(self, routing: Routing) -> torch.Tensor:
-        spec = self._combine_specs[0]
+    def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:
+        """Reduce the staged slots into this rank's tokens.
+
+        ``combine_quant_bits`` must match what the gemm2 epilogue packed the
+        slots as; it defaults to bf16, the wire a caller gets unless it asked
+        forward() for another.
+        """
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the same
         # stream; the kernel boundary gives the reduce its visibility.
@@ -1671,7 +1748,7 @@ class MegaMoEGfx1250:
             self._config.rank,
             stream,
         )
-        self._combine_variants[spec](
+        self._combine_variants[combine_quant_bits](
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),
             routing.token_count,
