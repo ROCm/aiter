@@ -853,6 +853,12 @@ That count was already replaced by 32 because merge traffic dominated
 exact (``err=0``) and width-2051 ``L=512`` went 18.65 → 23.26 us at
 ``M=1`` and 21.15 → 27.06 us at ``M=8``. Keep 32 decode splits.
 
+**Do not retry** nontemporal (``cache_modifier=2``) 32-bit stores of
+FP32 ``partial_out``. GPU 6 / gfx950 stayed exact (``err=0``);
+width-2051 ``L=512`` went 18.65 → 18.82 us at ``M=1`` and
+21.15 → 21.07 us at ``M=8`` (under the 3% keep gate);
+``M=512`` was flat (no partials). Keep default cached epilogue stores.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
