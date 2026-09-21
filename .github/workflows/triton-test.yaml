@@ -393,10 +393,7 @@ jobs:
             echo "No tests selected for this shard — writing an empty report."
             docker exec -w /workspace triton_test bash -c "echo '<testsuites/>' > test-reports/triton.xml"
           else
-            # MI300X: skip all shapes of the paged-prefill contexted_kv_attention tests that fail an accuracy check (and can hang the GPU) with the coming Triton release.
             docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-              --deselect "op_tests/triton_tests/attention/test_pa_prefill.py::test_contexted_kv_attention" \
-              --deselect "op_tests/triton_tests/attention/test_chunked_pa_prefill.py::test_contexted_kv_attention" \
               --junitxml=test-reports/triton.xml
           fi
 
