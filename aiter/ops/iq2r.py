@@ -11,6 +11,11 @@ from torch import Tensor
 from ..jit.core import compile_ops
 from .iq2r_format import IQ2RMetadata, iq2r_validate_expert_weights
 
+# GLM-5.3 top-k=8 with ATOM's production 16K-token prefill budget. The route
+# sorter is grid-stride and its caller owns the buffers, so this is a workspace
+# memory contract rather than a launch-shape limit.
+IQ2R_MAX_ROUTES = 131072
+
 
 @compile_ops("module_iq2r_moe", fc_name="iq2r_encode_out", develop=True)
 def _iq2r_encode_out(
@@ -166,7 +171,13 @@ def _iq2r_route_topk_sort_gather_quant_out(
 
 
 @compile_ops("module_iq2r_moe", fc_name="iq2r_swiglu_out", develop=True)
-def _iq2r_swiglu_out(gate_up: Tensor, output: Tensor) -> None: ...
+def _iq2r_swiglu_out(
+    gate_up: Tensor,
+    output: Tensor,
+    limit: float,
+    alpha: float,
+    up_offset: float,
+) -> None: ...
 
 
 @compile_ops("module_iq2r_moe", fc_name="iq2r_swiglu_quant_out", develop=True)
@@ -175,6 +186,9 @@ def _iq2r_swiglu_quant_out(
     output: Tensor,
     scales: Tensor,
     activated: Tensor | None,
+    limit: float,
+    alpha: float,
+    up_offset: float,
 ) -> None: ...
 
 
@@ -558,8 +572,8 @@ def iq2r_task_capacity(routes: int, expert_count: int, task_rows: int) -> int:
     for name, value in (("routes", routes), ("expert_count", expert_count)):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive int, got {value!r}")
-    if expert_count > 128:
-        raise ValueError("initial IQ2R routing supports at most 128 experts")
+    if expert_count > 512:
+        raise ValueError("IQ2R routing supports at most 512 experts")
     if task_rows not in (16, 32, 64, 128, 256):
         raise ValueError("task_rows must be 16, 32, 64, 128, or 256")
     return (routes + task_rows - 1) // task_rows + min(routes, expert_count + 1)
@@ -581,8 +595,10 @@ def iq2r_route_sort_tasks_out(
     if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1:
         raise ValueError("expert_ids must be int32 [routes]")
     routes = expert_ids.numel()
-    if not 0 < routes <= 65536:
-        raise ValueError("IQ2R route sorting supports 1..65536 routed rows")
+    if not 0 < routes <= IQ2R_MAX_ROUTES:
+        raise ValueError(
+            f"IQ2R route sorting supports 1..{IQ2R_MAX_ROUTES} routed rows"
+        )
     expected_vectors = (sorted_expert_ids, gather_indices, scatter_indices)
     if any(
         t.dtype != torch.int32 or tuple(t.shape) != (routes,) for t in expected_vectors
@@ -978,8 +994,26 @@ def iq2r_route_topk_sort_gather_quant_out(
     )
 
 
-def iq2r_swiglu_out(gate_up: Tensor, output: Tensor) -> None:
-    """Apply GPT-OSS clipped SwiGLU to interleaved gate/up columns."""
+def _validate_swiglu_parameters(limit: float, alpha: float, up_offset: float) -> None:
+    import math
+
+    if not math.isfinite(limit) or limit <= 0:
+        raise ValueError("SwiGLU limit must be finite and positive")
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("SwiGLU alpha must be finite and positive")
+    if not math.isfinite(up_offset):
+        raise ValueError("SwiGLU up_offset must be finite")
+
+
+def iq2r_swiglu_out(
+    gate_up: Tensor,
+    output: Tensor,
+    *,
+    limit: float = 7.0,
+    alpha: float = 1.702,
+    up_offset: float = 1.0,
+) -> None:
+    """Apply clipped SwiGLU to interleaved gate/up columns."""
 
     if gate_up.dtype != torch.bfloat16 or gate_up.ndim != 2:
         raise ValueError("gate_up must be BF16 [rows,2*intermediate]")
@@ -996,7 +1030,8 @@ def iq2r_swiglu_out(gate_up: Tensor, output: Tensor) -> None:
         or not output.is_contiguous()
     ):
         raise ValueError("IQ2R SwiGLU tensors must be contiguous on one device")
-    _iq2r_swiglu_out(gate_up, output)
+    _validate_swiglu_parameters(limit, alpha, up_offset)
+    _iq2r_swiglu_out(gate_up, output, limit, alpha, up_offset)
 
 
 def iq2r_swiglu_quant_out(
@@ -1005,8 +1040,11 @@ def iq2r_swiglu_quant_out(
     scales: Tensor,
     *,
     activated: Tensor | None = None,
+    limit: float = 7.0,
+    alpha: float = 1.702,
+    up_offset: float = 1.0,
 ) -> None:
-    """Apply GPT-OSS clipped SwiGLU and emit MXFP8/E8M0 in one pass."""
+    """Apply clipped SwiGLU and emit MXFP8/E8M0 in one pass."""
 
     if gate_up.dtype != torch.bfloat16 or gate_up.ndim != 2:
         raise ValueError("gate_up must be BF16 [rows,2*intermediate]")
@@ -1037,7 +1075,8 @@ def iq2r_swiglu_quant_out(
         raise ValueError(
             "IQ2R fused SwiGLU/quant tensors must be contiguous on one GPU"
         )
-    _iq2r_swiglu_quant_out(gate_up, output, scales, activated)
+    _validate_swiglu_parameters(limit, alpha, up_offset)
+    _iq2r_swiglu_quant_out(gate_up, output, scales, activated, limit, alpha, up_offset)
 
 
 def iq2r_route_reduce_indexed_out(
@@ -1151,19 +1190,20 @@ def iq2r_route_reduce_add_rmsnorm_indexed_out(
 
 
 __all__ = [
+    "IQ2R_MAX_ROUTES",
     "iq2r_encode_device",
     "iq2r_gemm",
     "iq2r_gemm_out",
     "iq2r_materialize_device",
     "iq2r_materialize_out",
+    "iq2r_route_direct_gather_quant_out",
     "iq2r_route_gather_indexed_out",
     "iq2r_route_gather_quant_out",
-    "iq2r_route_direct_gather_quant_out",
+    "iq2r_route_reduce_add_rmsnorm_indexed_out",
+    "iq2r_route_reduce_indexed_out",
+    "iq2r_route_sort_tasks_out",
     "iq2r_route_topk_direct_gather_quant_out",
     "iq2r_route_topk_sort_gather_quant_out",
-    "iq2r_route_reduce_indexed_out",
-    "iq2r_route_reduce_add_rmsnorm_indexed_out",
-    "iq2r_route_sort_tasks_out",
     "iq2r_swiglu_out",
     "iq2r_swiglu_quant_out",
     "iq2r_task_capacity",
