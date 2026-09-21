@@ -744,6 +744,15 @@ Decode-only gfx950 ``BLOCK_N=16`` token-major V plus tiled PV-B is the
 mapping that landed: width-2051 ``L=512`` is 18.5 / 21.1 / 516.2 us vs
 19.8 / 22.7 / 513.5.
 
+**Do not retry** replacing that decode-only token-major mapping with
+prefill's row-major ``[BLOCK_N, D]`` V LDS, 128-bit tiled V stores, and
+scalar stride-``D`` PV gathers. GPU 6 / gfx950 stayed exact and removed
+the decode V scalar-store cluster (``ds_write_b16`` 20 → 4,
+``ds_write_b128`` 3 → 5, no ``ds_bpermute``), but width-2051 ``L=512``
+regressed 18.65 → 19.60 us at ``M=1`` and 21.15 → 22.82 us at ``M=8``;
+``M=512`` was flat at 513.29 → 513.31 us. Keep decode token-major V:
+eliminating its shuffle-free scalar stores is not worth the PV-read cost.
+
 **Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
 ``4 < M * Hk < 32``. ``M=8`` stayed correct (``err=0``) but width-2051
 ``L=512`` went 22.7 → 33.5 us; ``M=1`` and prefill were flat. Keep that
