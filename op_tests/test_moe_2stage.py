@@ -34,6 +34,10 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.flydsl.mxfp4_kname import (
+    _is_mxfp4_kname,
+    _parse_mxfp4_g1_kname,
+)
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -48,6 +52,7 @@ except ModuleNotFoundError as e:
 
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
+    shuffle_scale,
     shuffle_scale_a16w4,
     shuffle_scale_for_int4,
     shuffle_weight,
@@ -104,6 +109,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    config_kernel_name1="",
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -118,6 +124,11 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and AQDType == dtypes.fp8
         and WQDType == dtypes.fp8
+    )
+    mxmoe_params = (
+        _parse_mxfp4_g1_kname(config_kernel_name1)
+        if config_kernel_name1 and _is_mxfp4_kname(config_kernel_name1)
+        else None
     )
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
@@ -139,6 +150,11 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
+    if mxmoe_params is not None and not mxmoe_params["enable_bias"]:
+        # MXMOE stage1 bias capability is part of the cache-safe kernel name.
+        # Do not force a non-bias model-config row onto an unrelated fallback;
+        # stage2 bias remains enabled and is validated independently.
+        exp_bias1 = None
     if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
         # Highest priority: activate n randomly-chosen experts (NOT the first n);
         # the other E-n experts are masked to -inf. Load is spread evenly across
@@ -258,6 +274,10 @@ def test_fmoe(
         a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(
             input, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
         )
+    elif mxmoe_params is not None and mxmoe_params["inline_quant"]:
+        # `_f16in` is a BF16 API contract, but GEMM1 quantizes those values to
+        # MXFP4 internally. Mirror that arithmetic in the torch reference.
+        a1_qt, a1_scale = torch_quant(input, quant_dtype=dtypes.fp4x2)
     elif (
         (
             qType == aiter.QuantType.per_1x32
@@ -341,13 +361,19 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
-        # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
-        # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
-        _w1_gu = AQDType == dtypes.fp8
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
-        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+        if mxmoe_params is not None:
+            w1_qt_aiter = shuffle_weight(w1_qt_aiter, (16, 16))
+            w1_scale_aiter = shuffle_scale(w1_scale)
+            w2_qt_aiter = shuffle_weight(w2_qt_aiter, (16, 16))
+            w2_scale_aiter = shuffle_scale(w2_scale)
+        else:
+            # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False);
+            # a8w4 (fp8 act) keeps gate/up-interleaved GUGU (gate_up=True).
+            _w1_gu = AQDType == dtypes.fp8
+            w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
+            w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+            w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
@@ -364,6 +390,10 @@ def test_fmoe(
 
     # # ######################## stage 1 start ###########
     stage1_ref_dtype = dtype
+    if mxmoe_params is not None:
+        # MXMOE applies activation and output quantization to its f32
+        # accumulator without a BF16 round trip.
+        stage1_ref_dtype = dtypes.fp32
     if (
         actType == aiter.ActivationType.Swiglu
         and qType == aiter.QuantType.per_1x32
@@ -437,6 +467,8 @@ def test_fmoe(
         a2_qt, a2_scale = per_1x32_f8_scale_f8_quant(
             out1_ref, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
         )
+    elif mxmoe_params is not None and mxmoe_params["out_dtype"] == "fp4":
+        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=dtypes.fp4x2)
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
@@ -842,6 +874,7 @@ def _row_to_kwargs(row):
         "swiglu_limit": _effective_swiglu_limit(
             q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
+        "config_kernel_name1": str(row.get("kernelName1", "") or ""),
     }
 
 
