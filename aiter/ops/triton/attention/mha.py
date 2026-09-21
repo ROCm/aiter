@@ -446,9 +446,9 @@ def _gluon_flash_attn_forward(
 
     # Largest power of two, in elements, dividing every K/V stride that reaches the
     # base pointer of a global->LDS copy -- batch, head and sequence alike, since all
-    # three are summed into it.  This is the alignment the DMA's 128-bit-per-lane
+    # three are summed into it.  This is the alignment the copy's 128-bit-per-lane
     # chunks depend on.  The last axis must also be contiguous, or the copy's whole
-    # addressing model is wrong; 0 disables the DMA outright in that case.
+    # addressing model is wrong; 0 disables the async copy outright in that case.
     if k_strides[3] == 1 and v_strides[3] == 1:
         kv_stride_align = math.gcd(16, *k_strides[:3], *v_strides[:3])
     else:
@@ -456,17 +456,16 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
-    # The kernel now carries two loops -- the rotated pipeline and the generic one --
-    # in a single function, and its live set is close to the 256 architected VGPRs a
-    # wave gets at waves_per_eu=2.  Left to the default scheduler that tips into
-    # scratch spills; `iterative-minreg` schedules for register pressure instead of
-    # ILP and pulls it back under.  `amdgpu-agpr-alloc=0,0` keeps the accumulators in
-    # arch VGPRs: on CDNA4 the register file is unified, so parking them in AGPRs buys
-    # nothing and puts v_accvgpr moves on the critical path of the unrolled loop.
-    _LLVM_FN_ATTRS = (
-        ("amdgpu-agpr-alloc", "0,0"),
-        ("amdgpu-sched-strategy", "iterative-minreg"),
-    )
+    # `amdgpu-agpr-alloc=0,0` keeps the accumulators in architected VGPRs: on CDNA4
+    # the register file is unified, so an AGPR-resident accumulator buys no extra
+    # capacity and every VALU that reads it pays a v_accvgpr move.  The softmax reads
+    # the accumulator on every tile, so those moves would land on the critical path.
+    #
+    # No `amdgpu-sched-strategy` is set: the default (max-occupancy) balances ILP
+    # against register pressure.  `iterative-minreg` removes this kernel's spills but
+    # shortens live ranges to do it, which is the opposite of what the rotated
+    # pipeline needs -- vector work spread across the MFMA shadows.
+    _LLVM_FN_ATTRS = (("amdgpu-agpr-alloc", "0,0"),)
 
     _gluon_attn_fwd[grid](
         q,
