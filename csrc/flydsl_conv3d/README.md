@@ -86,11 +86,12 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 
    The AOT pass (`aiter/aot/flydsl/conv.py`, run from `setup.py` at build time)
    compiles exactly what the tuned CSV holds, so new rows widen AOT coverage and
-   removed rows narrow it. `AITER_CONV3D_DYN_HW=1` widens what each of those
-   artifacts then serves -- one covers a layer at any resolution instead of the
-   one it was compiled for -- but it is part of the compile key, so a build and
-   the runtime reading its cache have to agree on it. Tile lookup is unaffected:
-   that still needs an exact 20-column match. Both it and the runtime build the compile key through
+   removed rows narrow it. `AITER_CONV3D_DYN_HW` (on by default) widens what
+   each of those artifacts then serves -- one covers a layer at any resolution
+   instead of the one it was compiled for -- but it is part of the compile key,
+   so a build and the runtime reading its cache have to agree on it. Tile lookup
+   is unaffected: that still needs an exact 20-column match, so a resolution
+   with no row still runs on the heuristic tile, just without the JIT. Both it and the runtime build the compile key through
    `conv_kernels._implicit_param_from_problem`, so channel padding and field
    order cannot drift between them. `splitK` is the remaining coupling: the
    runtime freezes the tuned row's value instead of re-deriving it, so a row

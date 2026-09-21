@@ -69,7 +69,7 @@ Usage::
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
     GPU_ARCHS / ARCH          Restrict compilation to these architectures.
-    AITER_CONV3D_DYN_HW       Variable-resolution artifacts (default 0). Part of
+    AITER_CONV3D_DYN_HW       Variable-resolution artifacts (default 1). Part of
                               the compile key, so a build and the runtime that
                               uses its cache have to agree on it.
 """

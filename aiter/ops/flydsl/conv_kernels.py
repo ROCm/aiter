@@ -275,11 +275,18 @@ def _implicit_param_from_problem(
 
 
 # Read the input's spatial extents at runtime so one artifact serves every
-# resolution, instead of compiling per D/H/W. Worth it where the resolution is
-# open-ended -- the tuned table is keyed on the exact shape, so an arbitrary
-# one misses it and pays a JIT anyway -- and not worth it for a fixed set of
-# sizes, which is why it is opt-in rather than the default.
-AITER_CONV3D_DYN_HW = int(os.environ.get("AITER_CONV3D_DYN_HW", "0"))
+# resolution, instead of compiling per D/H/W. On by default: the extents only
+# have to reach the gather as magic-number reciprocals rather than folded
+# immediates, and the decomposition they feed runs once per block rather than
+# per tap, so the cost does not show up. Measured over the 64 Wan and
+# Qwen-Image cases of op_tests/test_flydsl_conv_implicit.py on gfx950, two runs
+# each: median -0.70%, total -1.4%, no case slower than the run-to-run spread
+# and one (down_6_7) reliably 32% faster.
+#
+# Set it to 0 to compile per resolution again. The shapes this cannot express
+# -- BIG_IN, BIG_OUT, an M grid that needs chunking -- fall back to that path
+# on their own, see _dyn_hw_ok.
+AITER_CONV3D_DYN_HW = int(os.environ.get("AITER_CONV3D_DYN_HW", "1"))
 
 
 def _dyn_hw_ok(n, c_padded, d, h, w, k, npq, tile):
