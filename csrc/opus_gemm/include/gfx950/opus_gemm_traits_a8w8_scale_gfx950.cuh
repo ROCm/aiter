@@ -312,6 +312,35 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static_assert(SFB_GROUPS_PER_WAVE * SF_LANE_SCALES_PER_BK <= 64,
                   "the B scale vector would cost more than 16 VGPRs a lane");
 
+    // ---- SF_RING: the scale ring the producer stages -------------------------
+    // One slot per prefetch_k_iter K tile, each holding that tile's SFA rows and
+    // SFB groups. The point is that LDS stops scaling with K, which the
+    // whole-split panel could not do: its rows cost SFA_K_MAX/GROUP_K bytes
+    // each, four times as much at GROUP_K=32, and the large tiles asked for
+    // 168,960 to 185,344 of a CU's 163,840. A slot is SF_RING_SLOT bytes -- 528
+    // for the widest tile at 32/32 -- so the whole ring is a couple of KiB.
+    //
+    // Staged by the producer beside the A/B tiles rather than filled up front,
+    // which is what keeps it prefetched: the barrier that publishes a tile's
+    // A/B publishes its scales, so the prefetch distance and the synchronisation
+    // are the ones already there. No new barrier, which is the part that would
+    // have risked a hang rather than a wrong answer.
+    static constexpr int SF_RING_ROWS = B_M / GROUP_M + N_SCALE_GROUPS;
+    static constexpr int SF_RING_SLOT = SF_RING_ROWS * SCALES_PER_BK;
+    static constexpr int SF_RING_LDS = prefetch_k_iter * SF_RING_SLOT;
+    // The two producer waves share the fill, the same split a_buffer_load_insts
+    // makes with its slots / 2.
+    static constexpr int SF_RING_PROD_LANES = 2 * opus::get_warp_size();
+    // Widest per-lane chunk that stays inside one row and keeps its source
+    // offset naturally aligned, so it has to divide the row width.
+    static constexpr int SF_RING_VEC =
+        SCALES_PER_BK % 4 == 0 ? 4 : (SCALES_PER_BK % 2 == 0 ? 2 : 1);
+    // Counted, because mb feeds every s_waitcnt_vmcnt(number<mb * p>) in the
+    // producer and an off-by-one there is a race, not a wrong number.
+    static constexpr int sf_ring_load_insts =
+        (SF_RING_SLOT + SF_RING_PROD_LANES * SF_RING_VEC - 1)
+        / (SF_RING_PROD_LANES * SF_RING_VEC);
+
     static_assert(VEC_A == 16 / sizeof(D_A));
     static_assert(VEC_B == 16 / sizeof(D_B));
     static constexpr int smem_linear_wave_per_async_load = opus::get_warp_size() * 16 / sizeof(D_A);
