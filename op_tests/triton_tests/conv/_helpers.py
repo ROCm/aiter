@@ -43,6 +43,7 @@ import torch.nn.functional as F
 from aiter.ops.triton.conv._utils import (
     _is_1x1_conv,
     _is_3x3_conv,
+    _is_winograd_2d_eligible,
     _out_hw,
 )
 from aiter.ops.triton.conv.conv2d import (
@@ -135,13 +136,6 @@ def _direct_3x3_guard(R, S, stride, dilation, C):
     return _is_3x3_conv(R, S) and has_conv_config("CONV-3X3-NCHW")
 
 
-def _wino_guard(R, S, stride, dilation, C):
-    # _is_winograd_2d_eligible signature varies by upstream — keep the flag tight
-    from aiter.ops.triton.conv._utils import _is_winograd_2d_eligible
-
-    return _is_winograd_2d_eligible(R, S, stride, dilation, C)
-
-
 METHOD_REGISTRY = {
     "default": MethodEntry(conv2d_nchw, None, False, "", "default"),
     "direct": MethodEntry(
@@ -151,11 +145,15 @@ METHOD_REGISTRY = {
         conv2d_nchw_cblocked, _3x3_guard, False, "[cblocked]", "cblocked"
     ),
     "winograd_f4x3": MethodEntry(
-        conv2d_winograd_f4x3, _wino_guard, True, "[winograd_f4x3]", "WF(4,3)"
+        conv2d_winograd_f4x3,
+        _is_winograd_2d_eligible,
+        True,
+        "[winograd_f4x3]",
+        "WF(4,3)",
     ),
     "winograd_f4x3_cblocked": MethodEntry(
         conv2d_winograd_f4x3_cblocked,
-        _wino_guard,
+        _is_winograd_2d_eligible,
         True,
         "[winograd_f4x3_cblocked]",
         "WF4cb",
