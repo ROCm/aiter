@@ -338,7 +338,7 @@ def wan_vae_decode(height, width, frames):
 #
 # Encode and decode together: 58 calls collapsing to 16 shapes, since the encoder and
 # decoder resnets meet at the same extents. That is row for row the shape set in
-# aiter/configs/model_configs/qwenimage_vae_<res>_bf16_untuned_conv3d.csv, which is
+# aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv, which is
 # what the tuner enumerates and therefore the coverage this test owes. Two kinds are
 # not causal convs and so do not follow the padding=1 form:
 #
@@ -749,9 +749,10 @@ def main():
         "--wan-res",
         nargs="*",
         default=["480x832", "368x544"],
-        help="Wan clip HxW, multiples of 8. The two defaults are the ones with a tuned "
-        "config in aiter/configs/model_configs: 480x832 is what the integration report "
-        "benchmarks, 368x544 what its 8-GPU training run actually feeds the VAE.",
+        help="Wan clip HxW, multiples of 8. 480x832 is what the integration report "
+        "benchmarks, 368x544 what its 8-GPU training run actually feeds the VAE and "
+        "the resolution wan21_vae_bf16_tuned_conv3d.csv holds; any other size runs the "
+        "same shapes on the heuristic tile.",
     )
     p.add_argument(
         "--wan-frames",
@@ -765,9 +766,10 @@ def main():
         "--qwen-res",
         nargs="*",
         default=["1024x1024", "1328x1328"],
-        help="Qwen-Image HxW, multiples of 8. The two defaults are the ones with a "
-        "tuned config in aiter/configs/model_configs; any other legal size (1664x928, "
-        "...) runs the same 16 shapes at different extents.",
+        help="Qwen-Image HxW, multiples of 8. 1024x1024 is the resolution "
+        "qwenimage_vae_bf16_tuned_conv3d.csv holds; any other legal size (1328x1328, "
+        "1664x928, ...) runs the same 16 shapes at different extents on the heuristic "
+        "tile.",
     )
     args = p.parse_args()
     _FAILED.clear()

@@ -24,15 +24,15 @@ preference:
 Write winners into the per-model file, not the header-only canonical
 ``aiter/configs/bf16_tuned_conv3d.csv`` (runtime merges model_configs/).
 
-Model tables are per input resolution, so -i and -o name one::
+Model tables are per model, so -i and -o name one::
 
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
-        -i aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_untuned_conv3d.csv \\
-        -o aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_tuned_conv3d.csv
+        -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \\
+        -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
 
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
-        -i aiter/configs/model_configs/wan21_vae_480x832_bf16_untuned_conv3d.csv \\
-        -o aiter/configs/model_configs/wan21_vae_480x832_bf16_tuned_conv3d.csv
+        -i aiter/configs/model_configs/wan21_vae_bf16_untuned_conv3d.csv \\
+        -o aiter/configs/model_configs/wan21_vae_bf16_tuned_conv3d.csv
 """
 
 import os

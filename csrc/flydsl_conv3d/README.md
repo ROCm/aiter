@@ -30,9 +30,10 @@ python3 setup.py develop
     |-----|-----|-----|-----|-----|-----|------|------|------|------------|------------|------------|---------|---------|---------|---------|---------|---------|----------|--------|
     |1    |3    |1    |1024 |1024 |96   |1     |3     |3     |1           |1           |1           |0        |1        |1        |1        |1        |1        |1         |True    |
 
-   Tables are per input resolution, because a VAE's shapes are derived from it:
-   `qwenimage_vae_1024x1024`, `qwenimage_vae_1328x1328`, `wan21_vae_368x544`,
-   `wan21_vae_480x832`.
+   Tables are per model: `qwenimage_vae`, `wan21_vae`. A VAE's shapes are
+   derived from its input resolution, so each table holds the shapes of the
+   resolution it was tuned at -- another resolution needs its own rows appended,
+   or it falls back to the heuristic tile.
 
    Pass `-i` and `-o` explicitly. The defaults are the canonical pair, which
    ships header-only, so a run without them finds no shapes and exits rather
@@ -42,8 +43,8 @@ python3 setup.py develop
 
 ```bash
 python3 csrc/flydsl_conv3d/conv3d_tune.py \
-  -i aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_untuned_conv3d.csv \
-  -o aiter/configs/model_configs/qwenimage_vae_1024x1024_bf16_tuned_conv3d.csv
+  -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \
+  -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
 ```
 
    Write winners into the per-model file, never into
@@ -108,8 +109,8 @@ and the default one is empty (see step 2).
 
 ```bash
 python3 csrc/flydsl_conv3d/conv3d_tune.py \
-  -i aiter/configs/model_configs/wan21_vae_480x832_bf16_untuned_conv3d.csv \
-  --run_config aiter/configs/model_configs/wan21_vae_480x832_bf16_tuned_conv3d.csv
+  -i aiter/configs/model_configs/wan21_vae_bf16_untuned_conv3d.csv \
+  --run_config aiter/configs/model_configs/wan21_vae_bf16_tuned_conv3d.csv
 ```
 
 ### `--compare` / `--update_improved`
