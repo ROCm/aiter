@@ -1790,6 +1790,18 @@ namespace py = pybind11;
           py::arg("shuffle_scale") = true,                                                   \
           py::arg("do_rotate_act") = false);
 
+#define DSV4_DEQUANT_GATHER_K_PYBIND                                                       \
+    m.def("dsv4_dequantize_and_gather_k",                                                  \
+          &aiter::dsv4_dequantize_and_gather_k,                                            \
+          py::arg("out"),                                                                  \
+          py::arg("k_cache"),                                                              \
+          py::arg("seq_lens"),                                                             \
+          py::arg("gather_lens"),                                                          \
+          py::arg("block_table"),                                                          \
+          py::arg("block_size"),                                                           \
+          py::arg("offset")   = 0,                                                         \
+          py::arg("use_fnuz") = false);
+
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
     AITER_SET_STREAM_PYBIND;                                                               \
     m.def("init_custom_qr",                                                                \
