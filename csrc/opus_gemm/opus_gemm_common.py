@@ -526,12 +526,19 @@ _bmm_flatmm_local.update({
     )
     for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
 })
-_bmm_flatmm_local.update({
-    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
-        bm, bn, bk, wg, preload_sf=True, quant_block=32
-    )
-    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
-})
+# The PRELOAD_SF_LDS tiles get no MX twin yet. That path stages the whole
+# split's scale panel in LDS, sized (B_M/GROUP_M + N_SCALE_GROUPS) rows by
+# SFA_K_MAX/GROUP_K bytes, and the second factor is 64 bytes at GROUP_K=128 but
+# 256 at 32 -- the "combined panel <=~4.2 KiB" the pipeline comment promises is
+# 128-only arithmetic. Built anyway, the three large-tile twins ask for 168,960
+# to 185,344 bytes of LDS against the 163,840 a CU has, and clang additionally
+# hits the register-class bug the kid326 workspace note already describes.
+#
+# Shrinking SFA_K_MAX by the same factor would fit, at the price of capping the
+# preload path at K=2048 -- below the K=4096 it exists to serve, and the miss is
+# a silent early return rather than an error. Refilling the panel in K chunks is
+# the real answer and is its own change.
+
 
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
 # exact high-pressure PRELOAD_SF_LDS + D_OUT=void specialization after the

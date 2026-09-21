@@ -329,7 +329,7 @@ def check_tilen_column_map():
 # and the only compile coverage those arms get -- without it they are dead code
 # the compiler never instantiates.
 #
-# Every flatmm_splitk tile has an MX twin, and all of them are checked: they are
+# Every flatmm_splitk tile that has an MX twin is checked here: they are
 # generated from the 128 table, so listing a subset would leave the rest to be
 # discovered broken by whoever tuned them. A twin's id is its mirror's plus
 # 1000, hence 8321 / 9321 for one geometry at two granularities.
@@ -344,8 +344,8 @@ def check_tilen_column_map():
 _MX32_KIDS = (
     9000, 9032, 9064, 9128, 9137, 9138, 9139, 9256,
     9311, 9312, 9313, 9314, 9316, 9317, 9318, 9319,
-    9320, 9321, 9322, 9323, 9324, 9325, 9326, 9327,
-    9640, 9642, 9646, 9650, 9653,
+    9320, 9321, 9322, 9323, 9640, 9642, 9646, 9650,
+    9653,
 )
 _MX32_SHAPE = (2, 128, 256, 4096)  # G, M, N, K
 _MX32_GROUP = 32
