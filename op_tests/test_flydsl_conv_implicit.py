@@ -710,6 +710,52 @@ def test_qwen_vae_conv2d(case, res, xshape, wshape, stride, padding, dtype, call
     return _bench_vs_torch(case, xshape, wshape, dtype, calls, stride, padding)
 
 
+# Pairs that share every compile-time constant except the input's own extents.
+#
+# stride 2 floor-divides, so two adjacent input sizes land on one output size:
+# d=7 and d=8 both give do=4, and likewise for h and w. Everything the cache key
+# carries -- the output geometry, the grid, the three plans -- is then identical,
+# and the only difference is what the gather bounds-checks its taps against.
+# Those extents used to reach the kernel only through the fx.struct param, which
+# FlyDSL does not collect, so the two shapes shared one artifact and whichever
+# compiled second ran the other's bounds (see StaticInputExtents).
+#
+# The larger of each pair runs first, which is the order that showed it: its
+# kernel permits the wider tap range, so the smaller one reading past the end of
+# its input is what went wrong. Both halves must come out clean, and they only do
+# if the two got separate artifacts.
+_KEY_ISOLATION_PAIRS = (
+    ("depth", (1, 32, 8, 16, 16), (1, 32, 7, 16, 16)),
+    ("height", (1, 32, 4, 32, 16), (1, 32, 4, 31, 16)),
+    ("width", (1, 32, 4, 16, 34), (1, 32, 4, 16, 33)),
+)
+
+
+def test_artifact_key_isolation(dtype):
+    """One row per shape; a shape that borrowed another's artifact shows up here."""
+    rows = []
+    for axis, big, small in _KEY_ISOLATION_PAIRS:
+        for which, xshape in (("larger", big), ("smaller", small)):
+            torch.manual_seed(0)
+            x = torch.randn(xshape, device="cuda", dtype=dtype)
+            w = torch.randn((32, xshape[1], 3, 3, 3), device="cuda", dtype=dtype)
+            kw = {"stride": 2, "padding": 1}
+            out = flydsl_conv_implicit(x, w, **kw)
+            ref = F.conv3d(x.to(dtypes.fp32), w.to(dtypes.fp32), **kw)
+            case = f"{axis}_{which}_{'x'.join(str(v) for v in xshape[2:])}"
+            rows.append(
+                {
+                    "case": case,
+                    "gfx": get_gfx(),
+                    "x": "x".join(str(v) for v in xshape),
+                    "flydsl err": checkAllclose(
+                        ref, out.to(dtypes.fp32), msg=f"{case}: ", **TOL
+                    ),
+                }
+            )
+    return rows
+
+
 def summarize(title, rows):
     if not rows:  # every case in this sweep was filtered out by --cases
         return
@@ -841,6 +887,14 @@ def main():
             if case in args.cases
         ]
         summarize(f"Qwen-Image VAE encode+decode, T=1 rewritten conv2d ({name})", rows)
+
+        # Not shape coverage: this one checks that two shapes which differ only
+        # in what the key used to drop still get their own artifact. Unfiltered
+        # by --cases, since it is cheap and a regression here is silent.
+        summarize(
+            f"compile-key isolation, same output extents ({name})",
+            test_artifact_key_isolation(dtype),
+        )
 
     # After the tables, so a failure is read next to the numbers that produced it.
     if _FAILED:

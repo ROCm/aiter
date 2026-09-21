@@ -56,6 +56,7 @@ from .conv3d_gfx950_utils import (
     make_shared_storage,
     make_tile_config,
     static_extents,
+    static_input_extents,
     unit_divisors,
     weight_bytes,
 )
@@ -351,6 +352,10 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         extra_args = ()
         dyn_unit = None
         kernel_grid = grid
+        # Bound here, so the kernel closes over the tuple rather than reading
+        # the extents off ``param`` at trace time -- ``param`` is an fx.struct
+        # and never reaches the cache key. See ``StaticInputExtents``.
+        static_in_ext = static_input_extents(param)
 
     elem_ty = fx.BFloat16
     SharedStorage = make_shared_storage(elem_ty, cfg)
@@ -532,7 +537,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         def conv3d_implicit_kernel(
             y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
         ):
-            _body(y, x, weight, bias, static_extents(param, geom), None)
+            _body(y, x, weight, bias, static_extents(static_in_ext, geom), None)
 
         @flyc.jit
         def launch(

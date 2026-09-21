@@ -701,23 +701,71 @@ class ConvExtents:
         self.is_static = is_static
 
 
-def static_extents(param, geom):
-    """The compile-time form: every extent and every divisor is a literal."""
-    return ConvExtents(
+class StaticInputExtents(NamedTuple):
+    """The input's own extents, as a static kernel folds them in.
+
+    A NamedTuple, and that is load-bearing for correctness rather than for
+    tidiness. These values reach the kernel only through ``Conv3dImplicitParam``,
+    which is an ``fx.struct`` -- not a tuple, so FlyDSL's closure-scalar
+    collection skips it silently and nothing in it reaches the cache key. Every
+    other constant the kernel folds in travels in a NamedTuple (``ConvGeometry``,
+    ``Im2colPlan``, ``LaunchGrid``, ``OutputScatterPlan``) and is keyed on; the
+    input extents were the one exception.
+
+    What that cost: the gather bounds-checks its taps against ``d``/``h``/``w``,
+    while the key only carried the *output* extents (through ``ConvGeometry``)
+    and the grid. Two convolutions with the same output extents and different
+    input extents therefore shared one artifact -- and a strided one makes that
+    easy to hit, since floor division maps several input sizes onto one output
+    size. At stride 2 with a 3-tap filter and pad 1, d=7 and d=8 both give
+    do=4: whichever compiled first, the other ran its bounds, leaving the last
+    output plane reading past the end of the input (measured: 24.5% of elements
+    wrong, and correct again when either shape was compiled on its own).
+
+    So: keep this a NamedTuple, and do not fold a new input-side extent into the
+    kernel by reading it off ``param`` at trace time.
+    """
+
+    d: int
+    h: int
+    w: int
+    x_elems: int
+    x_sample_elems: int
+
+
+def static_input_extents(param):
+    """The ``StaticInputExtents`` of one problem."""
+    x_sample_elems = param.c * param.d * param.h * param.w
+    return StaticInputExtents(
         d=param.d,
         h=param.h,
         w=param.w,
+        x_elems=param.n * x_sample_elems,
+        x_sample_elems=x_sample_elems,
+    )
+
+
+def static_extents(in_ext, geom):
+    """The compile-time form: every extent and every divisor is a literal.
+
+    Takes ``StaticInputExtents`` rather than the param it comes from, so that
+    what the kernel closes over is a tuple FlyDSL keys on. See that class.
+    """
+    return ConvExtents(
+        d=in_ext.d,
+        h=in_ext.h,
+        w=in_ext.w,
         do=geom.do,
         ho=geom.ho,
         wo=geom.wo,
         dhw=geom.dhw,
         hw_o=geom.hw_o,
         npq=geom.npq,
-        x_elems=param.n * param.c * param.d * param.h * param.w,
-        x_sample_elems=param.c * param.d * param.h * param.w,
+        x_elems=in_ext.x_elems,
+        x_sample_elems=in_ext.x_sample_elems,
         # Only the temporal_only_fast path divides by d, but a folded divisor
         # costs nothing to build for the paths that do not.
-        div_d=static_divisor(param.d),
+        div_d=static_divisor(in_ext.d),
         div_dhw=static_divisor(geom.dhw),
         div_hw_o=static_divisor(geom.hw_o),
         div_wo=static_divisor(geom.wo),
