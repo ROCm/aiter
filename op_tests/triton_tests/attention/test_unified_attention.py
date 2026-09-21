@@ -722,6 +722,7 @@ def test_triton_unified_attn(
         )
 
 
+@pytest.mark.parametrize("sliding_window", [None, 1024])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, shuffled_kv_cache, block_size",
     [
@@ -744,6 +745,7 @@ def test_triton_unified_attn_gfx942_large_prefill(
     kv_dtype: torch.dtype,
     shuffled_kv_cache: bool,
     block_size: int,
+    sliding_window: int | None,
 ) -> None:
     """Executable coverage for the gfx942 large-prefill attn_2d entries.
 
@@ -755,6 +757,11 @@ def test_triton_unified_attn_gfx942_large_prefill(
     and validate each entry — and asserts the resolved config key. Page 64
     hits the tuned SHUF.BS_LEQ_64 entries, page 128 the BS-agnostic
     M16/stages-1 fallbacks (the only LDS-safe configs at TILE 128).
+    The sliding_window=1024 arm mirrors the Gemma-4 production call shape:
+    these entries were tuned for sliding-window prefill, and the general
+    test's windowed cases all stay below Q_GEQ_1024, so this is the only
+    place the composite configs are exercised together with a window.
+    The same window is passed to the kernel and the independent reference.
     """
     if DEVICE_ARCH != "gfx942":
         pytest.skip(f"gfx942-tuned entries, skip {DEVICE_ARCH}")
@@ -800,6 +807,7 @@ def test_triton_unified_attn_gfx942_large_prefill(
         shuffled_kv_cache=shuffled_kv_cache,
         use_q_descale=q_dtype == e4m3_dtype,
         use_kv_descale=kv_dtype == e4m3_dtype,
+        sliding_window=sliding_window,
         device="cuda",
     )
 
@@ -816,8 +824,14 @@ def test_triton_unified_attn_gfx942_large_prefill(
         table,
         axes,
         _axis_values(
-            head_size, max_query_len, max_kv_len, 0,
-            shuffled_kv_cache, block_size, q_dtype, kv_dtype,
+            head_size,
+            max_query_len,
+            max_kv_len,
+            sliding_window if sliding_window is not None else 0,
+            shuffled_kv_cache,
+            block_size,
+            q_dtype,
+            kv_dtype,
         ),
     )
     assert key == expected_key, f"expected {expected_key}, matched {key}"
@@ -852,6 +866,7 @@ def test_triton_unified_attn_gfx942_large_prefill(
         block_tables=block_tables,
         scale=scale,
         out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
