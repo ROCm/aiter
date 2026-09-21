@@ -48,7 +48,7 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     SUPPORTED_BLOCKS,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import SUPPORTED_WORLDS
-from aiter.ops.flydsl.quick_allreduce_int4 import _SUPPORTED_ARCHS
+from aiter.ops.flydsl.quick_allreduce import _SUPPORTED_ARCHS
 
 ARCH = get_gfx_runtime()
 

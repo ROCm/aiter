@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness for FlyDSL INT4 quick all-reduce (``QuickAllReduceInt4``).
+"""Runtime correctness for FlyDSL quick all-reduce (``FlyQuickAllReduce``).
 
 Pytest collects validity cases only (no timing). ``python3`` this file
 runs an aiter-op-test ``@benchmark`` / markdown sweep. Every rank is a
 ``multiprocessing`` spawn worker that builds its own
-``QuickAllReduceInt4`` engine, calls ``compile_and_launch()``, and in the
+``FlyQuickAllReduce`` engine, calls ``compile_and_launch()``, and in the
 sweep times ``fly.allreduce`` with ``run_perftest``. The oracle is an
 untimed fp32 NCCL all-reduce of the same per-rank inputs.
 
-Both schedules are covered. INT4/INT6 are lossy, so those cases gate on
-SQNR, a calibrated mismatch ratio and a per-tile SQNR floor. The ``fp16``
-wire format is a lossless passthrough, so the transport tests that use it
-gate on bit-identity instead -- which is what isolates a chunk-addressing
-or flag-protocol bug from a codec one.
+Both schedules are covered, and the mesh is covered on the quantized wire
+formats: one host serves INT4, INT5 and INT6, so the codec is a parameter
+here rather than a second file. INT4/INT5/INT6 are lossy, so those cases
+gate on SQNR, a calibrated mismatch ratio and a per-tile SQNR floor. The
+``fp16`` wire format is a lossless passthrough, so the transport tests that
+use it gate on bit-identity instead -- which is what isolates a
+chunk-addressing or flag-protocol bug from a codec one.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
-requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
+requires. FlyQuickAllReduce runs on gfx942/gfx950 at TP∈{2,4,8}; other
 archs skip, and pytest skips a world size when fewer GPUs are visible
 than TP.
 """
@@ -51,14 +53,15 @@ pytest.importorskip("flydsl")
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import ring_st_ladder
+from aiter.ops.flydsl.kernels.quick_allreduce_mesh import mesh_st_ladder
+from aiter.ops.flydsl.kernels.quick_allreduce_ring import ring_st_ladder
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
     has_release_fence,
 )
-from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
+from aiter.ops.flydsl.quick_allreduce import DEFAULT_GRID_CAP
 
 try:
     ARCH = get_gfx_runtime()
@@ -66,7 +69,22 @@ except (KeyError, RuntimeError):
     ARCH = None
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
-# One SQNR floor for both schedules, in their shipping configuration.
+# Mesh floor per wire format, in the shipping configuration.
+#
+# The mesh requantizes exactly once, so its SQNR is a property of the codec
+# rather than of the world size: INT4 delivers ~19 dB, INT5 ~25 dB (sim),
+# INT6 ~30. Holding a fatter codec to the INT4 floor would let it silently
+# fall back to INT4 bits -- pass a codec the host ignores, resolve the wrong
+# default -- and still pass, which is the failure mode one codec-generic host
+# makes possible. INT5's 24 dB floor is below the 25.00 dB two-shot sim so
+# GPU noise has a dB, and above INT4 so an ignored ``rs_codec="int5"`` fails.
+#
+# fp16 is lossless on the transport cases' exact-grid input, but those gate on
+# bit-identity; this floor only applies where fp16 meets random input.
+_MESH_SQNR_MIN_DB = {"int4": 18.0, "int5": 24.0, "int6": 25.0, "fp16": 25.0}
+
+# Ring floor, keyed on the schedule rather than the codec because its two laps
+# need not agree -- TP8 already ships INT6 reduce-scatter with INT4 all-gather.
 #
 # It used to take two. The ring's reduce-scatter lap requantizes N-1 times where
 # the mesh requantizes once, and the partial sum it requantizes grows with the
@@ -77,7 +95,26 @@ SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # Defaulting the ring's reduce-scatter lap to INT6 at TP8 lifts it to ~21 dB and
 # removes the reason for the split. Anything that falls below 18.0 now is a
 # regression, not a known cost of the schedule.
-SQNR_MIN_DB = {"mesh": 18.0, "ring": 18.0}
+_RING_SQNR_MIN_DB = 18.0
+
+# Floor for the deliberately pathological E4M3 fills below. The per-codec
+# floors above do not apply to them, and not just because they are slacker:
+# on these inputs the codec is not what bounds the error.
+#
+# The saturating-exponent fill is the clearest case. Both codecs reconstruct a
+# uniform 512.0 as exactly 480.0 -- 6.25% low, 20*log10(512/32) = 24.08 dB --
+# because what saturates is the group-16 E4M3 scale they share, not the code
+# width, so INT6's wider [-32,+31] buys nothing. A second lap maps 480 to 480,
+# so it does not compound either. 24 dB is the ceiling here for any codec on
+# this table, which makes a per-codec floor meaningless on it.
+#
+# Nothing is lost by being slack: a codec silently ignored is caught by
+# ``_assert_sqnr``'s check that both laps resolved to what was asked for,
+# which is stronger than any threshold. This gate is for NaN and collapse.
+_EDGE_FILL_SQNR_MIN_DB = 18.0
+
+# Wire formats the mesh cases sweep. fp16 is covered by the transport tests.
+MESH_TEST_CODECS = ("int4", "int5", "int6")
 
 # INT4 at TP8 is still a supported configuration -- AITER_ALL_REDUCE_CODEC=INT4
 # reaches it -- and is covered by its own case rather than skipped. It is held
@@ -89,7 +126,8 @@ SQNR_MIN_DB_TP8_INT4_RING = 15.0
 # away by the rest of a large message.
 TILE_SQNR_MIN_DB = 8.0
 
-# Calibrated to the INT4 group-16 codec vs fp32 all-reduce, not bit identity.
+# Calibrated to the group-16 INT4 codec vs fp32 all-reduce, not bit identity.
+# INT6 clears it with room to spare, so one pair of tolerances covers both.
 CLOSE_RTOL = 1e-1
 CLOSE_ATOL = 1e-1
 CLOSE_ERR_RATIO = 0.5
@@ -109,23 +147,27 @@ _FILLS = (
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
-    reason="QuickAllReduceInt4 requires an available gfx942 or gfx950 GPU",
+    reason="FlyQuickAllReduce requires an available gfx942 or gfx950 GPU",
 )
 
 # Distinct correctness branches, not a tokens x hidden product.
 # hidden=5120 is the calibrated width; hidden=4096 covers a width the tuning
 # was not fitted to. (8, 1024) is a payload smaller than one 32 KiB tile.
-# TP2/4 get an ST=1 calibration case plus one ST=8 case (num_tiles > grid_cap).
+#
+# Labelled by shape rather than by super-tile: these run unpinned, the way a
+# deployment does, so which ST a shape lands on is a function of the codec's
+# ladder. The same 9216x4096 is ST=8 on INT4 at TP8 and on INT6 (72 MiB is over
+# both ladders' top rung), while 512x5120 is ST=8 on INT4 and ST=1 on INT6.
 # Pytest skips a world size when fewer GPUs are visible than TP.
 _PYTEST_CASES = (
     (8, 8, 1024, "partial-tile"),
-    (8, 512, 5120, "st1-auto-calib"),
-    (8, 9216, 4096, "st8-alt-hidden"),
-    (8, 32768, 5120, "st8-calib-prefill"),
-    (4, 512, 5120, "tp4-st1-auto-calib"),
-    (4, 9216, 4096, "tp4-st8-alt-hidden"),
-    (2, 512, 5120, "tp2-st1-auto-calib"),
-    (2, 9216, 4096, "tp2-st8-alt-hidden"),
+    (8, 512, 5120, "decode-calib"),
+    (8, 9216, 4096, "mid-alt-hidden"),
+    (8, 32768, 5120, "prefill-calib"),
+    (4, 512, 5120, "tp4-decode-calib"),
+    (4, 9216, 4096, "tp4-mid-alt-hidden"),
+    (2, 512, 5120, "tp2-decode-calib"),
+    (2, 9216, 4096, "tp2-mid-alt-hidden"),
 )
 
 
@@ -177,45 +219,50 @@ def _make_inp(
 def _pick_st(
     tokens: int,
     hidden: int,
-    requested: int = SUPER_TILE,
     *,
     world_size: int,
-    grid_cap: int = DEFAULT_GRID_CAP,
+    codec: str,
+    st_grids: dict[int, int],
     inbox_memory: str = "uncached",
     algorithm: str = "mesh",
 ) -> int:
-    """Mirror of ``QuickAllReduceInt4._pick_st``, so the test asserts the rule.
+    """Mirror of ``FlyQuickAllReduce._pick_st``, so the test asserts the rule.
 
-    Two rules compose. The interconnect one: an inbox that needs a release
-    fence makes each publish expensive enough to take a super-tile as soon as
-    there is one, while without a fence ST=1 is preferred for its parallelism.
-    Which applies is a property of the host, so it comes from the rank's
-    reported ``inbox_memory`` rather than being assumed.
+    Three rules compose. The payload one: publishes per rank are
+    ``num_tiles / ST * 2(N-1)``, so a bigger payload wants a bigger super-tile,
+    and the sited rungs live in the ladders. Both schedules are constructed
+    here without pinning ``super_tile``, the way a deployment does, so both
+    walk one -- the mesh's keyed on the codec (INT6 moves 1664 B per rank-tile
+    against INT4's 1152 and switches far later), the ring's on world size,
+    where the ``2(N-1)`` factor brings the crossover in as N grows.
 
-    The payload one, ring only: publishes per rank are
-    ``num_tiles / ST * 2(N-1)``, so a bigger payload wants a bigger super-tile.
-    ``RING_ST_LADDER`` holds the sited rungs, keyed by world size -- the
-    batching crossover moves with N because publishes per rank carry a
-    ``2(N-1)`` factor. The tests construct the engine without pinning
-    ``super_tile``, so the ring walks that ladder and ``requested`` does not
-    apply to it.
+    The interconnect one: an inbox that needs a release fence makes each
+    publish expensive enough to take the rung's super-tile as soon as there is
+    a whole one, while without a fence ST=1 is preferred for its parallelism
+    until there are more tiles than blocks. Which applies is a property of the
+    host, so it comes from the rank's reported ``inbox_memory``.
 
-    *grid_cap* must be the engine's *clamped* ST=1 grid, not the requested cap:
-    the host reduces it to the measured resident workgroups per CU, and it is
-    the clamped value the selection compares against.
+    *st_grids* must be the engines' *clamped* grids, per super-tile: the host
+    reduces each rung's cap to the measured resident workgroups per CU, and it
+    is the clamped value of the rung being confirmed that the rule compares
+    against.
     """
     tiles = _num_tiles(tokens, hidden)
-    if algorithm == "ring":
-        nbytes = tokens * hidden * 2
-        requested = 1
-        for floor, rung_st, _cap in ring_st_ladder(world_size):
-            if nbytes >= floor:
-                requested = rung_st
-    if requested == 1:
+    nbytes = tokens * hidden * 2
+    rungs = (
+        ring_st_ladder(world_size)
+        if algorithm == "ring"
+        else mesh_st_ladder(codec, world_size)
+    )
+    want = 1
+    for floor, rung_st, _cap in rungs:
+        if nbytes >= floor:
+            want = rung_st
+    if want == 1:
         return 1
     if has_release_fence(inbox_memory):
-        return requested if tiles >= requested else 1
-    return requested if tiles > grid_cap else 1
+        return want if tiles >= want else 1
+    return want if tiles > st_grids[want] else 1
 
 
 def _sqnr(ref_pow: torch.Tensor, mse: torch.Tensor) -> torch.Tensor:
@@ -275,7 +322,7 @@ def _run_rank(
 ) -> list[dict]:
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -286,25 +333,22 @@ def _run_rank(
         rank=rank,
         device_id=device,
     )
-    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group;
+    # FlyQuickAllReduce exchanges IPC metadata over a non-NCCL group;
     # NCCL stays for the fp32 reference all-reduce.
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
 
-    fly = QuickAllReduceInt4(
+    fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
         rank=rank,
         world_size=tp,
         algorithm=algorithm,
-        # Left unpinned for the ring so the host walks RING_ST_LADDER -- that
-        # is the configuration production runs, and the one worth testing. The
-        # transport tests (fp16 codec) pin it explicitly instead.
-        **(
-            {"super_tile": super_tile}
-            if (algorithm != "ring" or pin_super_tile)
-            else {}
-        ),
+        # Left unpinned so the host walks its ladder -- the mesh's keyed on the
+        # codec, the ring's on world size. That is the configuration production
+        # runs, and the one worth testing. The transport tests (fp16 codec) pin
+        # it explicitly instead.
+        **({"super_tile": super_tile} if pin_super_tile else {}),
         grid_cap=grid_cap,
         # The case list deliberately includes sub-threshold shapes (8x1024 is
         # 16 KiB, well under MIN_PAYLOAD_BYTES) to cover the partial-tile path.
@@ -349,7 +393,11 @@ def _run_rank(
             # Pass nbytes as well: with a ladder the super-tile is chosen by
             # payload size, and omitting it silently reports the fallback.
             st_used = fly._pick_st(n_tiles, nbytes)
-            st1 = fly._by_st.get(1, fly._by_st[st_used])
+            # Every rung's clamped grid, not just ST=1's: with a ladder the
+            # rungs carry different caps (INT6 sites its ST=8 rung at 1216
+            # against INT4's 128), and the rule compares against the grid of
+            # the rung it is confirming.
+            st_grids = {int(st): int(eng.grid) for st, eng in fly._by_st.items()}
             mismatch = got != ref
             n_mismatch = int(mismatch.sum().item())
             first_bad = -1
@@ -365,7 +413,7 @@ def _run_rank(
                 atol=CLOSE_ATOL,
                 tol_err_ratio=CLOSE_ERR_RATIO,
                 printLog=False,
-                msg=f"quick_allreduce_int4 rank {rank}",
+                msg=f"quick_allreduce rank {rank}",
             )
             row = {
                 "tokens": ntok,
@@ -378,7 +426,7 @@ def _run_rank(
                 # regression should name the codec that produced it.
                 "rs_codec": fly.rs_codec,
                 "ag_codec": fly.ag_codec,
-                "st1_grid": int(st1.grid),
+                "st_grids": st_grids,
                 "st_used": int(st_used),
                 "grid": int(fly._by_st[st_used].grid),
                 "sqnr_db": _sqnr_db(got, ref),
@@ -432,7 +480,7 @@ def _spawn(
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
-        pytest.skip(f"QuickAllReduceInt4 needs {world_size} GPUs, have {n_gpu}")
+        pytest.skip(f"FlyQuickAllReduce needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     token_list = [t for t, _ in pairs]
     hidden_list = [h for _, h in pairs]
@@ -489,7 +537,7 @@ def _spawn(
         pool.join()
     if len(ranks) != world_size:
         raise RuntimeError(
-            f"QuickAllReduceInt4 gathered {len(ranks)} ranks, expected {world_size}"
+            f"FlyQuickAllReduce gathered {len(ranks)} ranks, expected {world_size}"
         )
     return ranks
 
@@ -532,29 +580,50 @@ def _assert_sqnr(
     world_size: int,
     label: str,
     algorithm: str = "mesh",
+    codec: str | None = None,
     floor: float | None = None,
 ) -> dict:
-    # The ST switch compares tiles against the ST=1 grid, which the engine
-    # clamps below the requested grid_cap for occupancy.
+    """Gate a run on SQNR, the mismatch ratio and the predicted super-tile.
+
+    *codec* is the mesh wire format the caller asked for. Passing it does two
+    things: it selects that codec's ladder for the super-tile prediction, and
+    it asserts both laps actually resolved to it -- a request the host drops on
+    the floor would otherwise show up only as a milder SQNR than expected.
+    """
+    resolved = ranks[0][0]
+    # The ST switch walks the ladder, then confirms the rung against that
+    # rung's own grid, which the engine clamps below the requested grid_cap for
+    # occupancy.
     expected_st = _pick_st(
         tokens,
         hidden,
         world_size=world_size,
-        grid_cap=ranks[0][0]["st1_grid"],
-        inbox_memory=ranks[0][0]["inbox_memory"],
+        codec=codec or resolved["rs_codec"],
+        st_grids=resolved["st_grids"],
+        inbox_memory=resolved["inbox_memory"],
         algorithm=algorithm,
     )
     if len(ranks) != world_size:
         raise AssertionError(
             f"{label}: gathered {len(ranks)} ranks, expected {world_size}"
         )
-    want = SQNR_MIN_DB[algorithm] if floor is None else floor
+    if floor is not None:
+        want = floor
+    elif algorithm == "mesh":
+        want = _MESH_SQNR_MIN_DB[codec or resolved["rs_codec"]]
+    else:
+        want = _RING_SQNR_MIN_DB
     fails = []
     for rank, rows in enumerate(ranks):
         if not rows:
             fails.append(f"rank {rank}: no rows")
             continue
         row = rows[0]
+        if codec is not None and (row["rs_codec"] != codec or row["ag_codec"] != codec):
+            fails.append(
+                f"rank {rank}: codecs resolved to {row['rs_codec']}/"
+                f"{row['ag_codec']}, requested {codec}"
+            )
         if row["st_used"] != expected_st:
             fails.append(f"rank {rank}: ST={row['st_used']}, expected {expected_st}")
         if row["sqnr_db"] < want:
@@ -581,19 +650,48 @@ def _assert_sqnr(
     return ranks[0][0]
 
 
-@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
-@pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
-def test_quick_allreduce_int4_sqnr_vs_fp32_allreduce(
-    world_size, tokens, hidden, label, algorithm
-):
-    """Shipping configuration: no codec pinned, so the per-N default applies.
+def _mesh_codec_kwargs(codec: str | None) -> dict:
+    """How a caller asks for *codec*.
 
-    Every case here that shares (world_size, algorithm) rides one spawn --
-    see ``_batch_cache_lookup``.
+    INT4 is the default at every world size and on both schedules, so leaving
+    both laps unset is the deployment path and is worth exercising as such.
+    INT6 has to be named; naming one lap would be enough, since the mesh
+    mirrors it, but both are passed so the ring could use this too.
+    """
+    if codec in (None, "int4"):
+        return {}
+    return {"rs_codec": codec, "ag_codec": codec}
+
+
+# (schedule, wire format). ``None`` means "whatever the per-N default resolves
+# to", which is the only sensible request for the ring: its two laps need not
+# agree, and at TP8 they deliberately do not.
+_SCHEDULE_CODECS = (
+    *(("mesh", codec) for codec in MESH_TEST_CODECS),
+    ("ring", None),
+)
+
+
+@pytest.mark.parametrize("algorithm,codec", _SCHEDULE_CODECS)
+@pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
+def test_quick_allreduce_sqnr_vs_fp32_allreduce(
+    world_size, tokens, hidden, label, algorithm, codec
+):
+    """Shipping configuration, on every schedule and mesh wire format.
+
+    Super-tile is left unpinned, so each run also asserts that the codec's own
+    ladder put it on the rung ``_pick_st`` predicts.
+
+    Every case here that shares (world_size, algorithm, codec) rides one spawn
+    -- see ``_batch_cache_lookup``.
     """
     group_pairs = [(t, h) for ws, t, h, _ in _PYTEST_CASES if ws == world_size]
     batch = _batch_cache_lookup(
-        (world_size, "sqnr", algorithm), group_pairs, time_it=False, algorithm=algorithm
+        (world_size, "sqnr", algorithm, codec),
+        group_pairs,
+        time_it=False,
+        algorithm=algorithm,
+        **_mesh_codec_kwargs(codec),
     )
     ranks = batch[(tokens, hidden)]
     _assert_sqnr(
@@ -601,8 +699,9 @@ def test_quick_allreduce_int4_sqnr_vs_fp32_allreduce(
         tokens=tokens,
         hidden=hidden,
         world_size=world_size,
-        label=f"{label}/{algorithm}",
+        label=f"{label}/{algorithm}/{codec or 'default'}",
         algorithm=algorithm,
+        codec=codec,
     )
 
 
@@ -610,7 +709,7 @@ def test_quick_allreduce_int4_sqnr_vs_fp32_allreduce(
     "tokens,hidden,label",
     [(t, h, lbl) for ws, t, h, lbl in _PYTEST_CASES if ws == 8],
 )
-def test_quick_allreduce_int4_ring_tp8_int4_codec(tokens, hidden, label):
+def test_quick_allreduce_ring_tp8_int4_codec(tokens, hidden, label):
     """TP8 ring forced back to an all-INT4 wire by the environment override.
 
     Two things at once: that ``AITER_ALL_REDUCE_CODEC`` actually reaches the
@@ -644,28 +743,54 @@ _CODEC_FILL_CASES = (
 )
 
 
+@pytest.mark.parametrize("codec", MESH_TEST_CODECS)
 @pytest.mark.parametrize("fill,label", _CODEC_FILL_CASES)
-def test_quick_allreduce_int4_e4m3_codec_fill(fill, label):
+def test_quick_allreduce_e4m3_codec_fill(fill, label, codec):
     """Uniform payloads that land on the E4M3 scale's edge cases.
 
     Each drives the group extremum somewhere the encoder has to special-case:
-    below the magnitude floor, past the largest exponent, or exactly zero.
+    below the magnitude floor, past the largest exponent, or exactly zero. Both
+    codecs share the scale encoding but not the reciprocal they apply it with,
+    so both are swept.
     """
-    ranks = _spawn(2, [(16, 1024)], time_it=False, fill=fill)
-    _assert_sqnr(ranks, tokens=16, hidden=1024, world_size=2, label=label)
+    ranks = _spawn(
+        2, [(16, 1024)], time_it=False, fill=fill, **_mesh_codec_kwargs(codec)
+    )
+    _assert_sqnr(
+        ranks,
+        tokens=16,
+        hidden=1024,
+        world_size=2,
+        label=f"{label}/{codec}",
+        codec=codec,
+        floor=_EDGE_FILL_SQNR_MIN_DB,
+    )
 
 
-@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
-def test_quick_allreduce_int4_degenerate_inputs(algorithm):
+@pytest.mark.parametrize(
+    "algorithm,codec",
+    (
+        *(("mesh", codec) for codec in MESH_TEST_CODECS),
+        ("ring", "int4"),
+        ("ring", "int6"),
+    ),
+)
+def test_quick_allreduce_degenerate_inputs(algorithm, codec):
     """All-zero and all-tiny groups must not produce NaN.
 
     A group whose extremum is zero decodes to a zero scale, so the encode
     reciprocal saturates; before it was clamped, that reached the codec as Inf
     and ``0 * Inf`` poisoned the tile. INT6 quadruples the reciprocal for a
-    given extremum, so it has four times less headroom here than INT4.
+    given extremum, so it has four times less headroom here than INT4, which
+    is why both are swept rather than trusting the INT4 result.
     """
     ranks = _spawn(
-        2, [(512, 5120)], time_it=False, algorithm=algorithm, fill="degenerate"
+        2,
+        [(512, 5120)],
+        time_it=False,
+        algorithm=algorithm,
+        fill="degenerate",
+        **_mesh_codec_kwargs(codec),
     )
     for rank, rows in enumerate(ranks):
         assert rows, f"rank {rank}: no rows"
@@ -843,11 +968,22 @@ def test_quick_allreduce_ring_lap_isolation(rs_codec, ag_codec):
 
 
 @benchmark()
-def test_quick_allreduce_int4(
-    tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP, algorithm="mesh"
+def test_quick_allreduce(
+    tokens,
+    hidden,
+    dtype,
+    tp,
+    grid_cap=DEFAULT_GRID_CAP,
+    algorithm="mesh",
+    codec=None,
 ):
     ranks = _spawn(
-        tp, [(tokens, hidden)], time_it=True, grid_cap=grid_cap, algorithm=algorithm
+        tp,
+        [(tokens, hidden)],
+        time_it=True,
+        grid_cap=grid_cap,
+        algorithm=algorithm,
+        **_mesh_codec_kwargs(codec),
     )
     row = _assert_sqnr(
         ranks,
@@ -856,6 +992,7 @@ def test_quick_allreduce_int4(
         world_size=tp,
         label="bench",
         algorithm=algorithm,
+        codec=codec if algorithm == "mesh" else None,
     )
     nbytes = tokens * hidden * 2
     # (tp - 1) adds per element; codec ALU work is not counted.
@@ -865,6 +1002,11 @@ def test_quick_allreduce_int4(
         "gfx": ARCH,
         "tp": tp,
         "algorithm": algorithm,
+        # Resolved, not requested: the sweep's default leaves the codec to the
+        # host, and a row that does not name what it actually sent cannot be
+        # compared against another run.
+        "rs_codec": row["rs_codec"],
+        "ag_codec": row["ag_codec"],
         "grid_cap": row["grid_cap"],
         "st_used": row["st_used"],
         "flydsl us": us,
@@ -875,12 +1017,12 @@ def test_quick_allreduce_int4(
     }
 
 
-test_quick_allreduce_int4.__test__ = False
+test_quick_allreduce.__test__ = False
 
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("FlyQuickAllReduce unsupported on %s; skipping", ARCH)
         return
     n_gpu = torch.cuda.device_count()
 
@@ -902,7 +1044,7 @@ def main():
         type=int,
         nargs="*",
         default=[1],
-        help="Not a QuickAllReduceInt4 dimension; only 1 runs, "
+        help="Not a FlyQuickAllReduce dimension; only 1 runs, "
         "other values are skipped.",
     )
     parser.add_argument(
@@ -917,6 +1059,14 @@ def main():
         default="mesh",
         choices=("mesh", "ring"),
         help="Schedule to sweep. Default mesh.",
+    )
+    parser.add_argument(
+        "--codec",
+        default=None,
+        choices=("int4", "int5", "int6"),
+        help="Wire format to sweep, both laps. Default: leave it to the\n"
+        "    host, which resolves INT4 on the mesh and INT6/INT4 on the\n"
+        "    TP8 ring. INT5 is mesh-only.\n    e.g.: --codec int5",
     )
     parser.add_argument(
         "-s",
@@ -949,7 +1099,7 @@ def main():
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
             aiter.logger.warning(
-                "QuickAllReduceInt4 payload is bf16; skipping %s", dtype
+                "FlyQuickAllReduce payload is bf16; skipping %s", dtype
             )
             continue
         df = []
@@ -958,12 +1108,12 @@ def main():
                 continue
             if tp not in SUPPORTED_WORLDS:
                 aiter.logger.warning(
-                    "QuickAllReduceInt4 unsupported world_size=%s; skipping", tp
+                    "FlyQuickAllReduce unsupported world_size=%s; skipping", tp
                 )
                 continue
             if n_gpu < tp:
                 aiter.logger.warning(
-                    "QuickAllReduceInt4 needs %s GPUs, have %s; skipping tp=%s",
+                    "FlyQuickAllReduce needs %s GPUs, have %s; skipping tp=%s",
                     tp,
                     n_gpu,
                     tp,
@@ -973,19 +1123,20 @@ def main():
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
             tokens, hidden = int(mnk[0]), int(mnk[1])
             df.append(
-                test_quick_allreduce_int4(
+                test_quick_allreduce(
                     tokens,
                     hidden,
                     dtype,
                     tp,
                     grid_cap=args.grid_cap,
                     algorithm=args.algorithm,
+                    codec=args.codec,
                 )
             )
         if df:
             table = pd.DataFrame(df)
             aiter.logger.info(
-                "flydsl quick allreduce INT4 summary (markdown):\n%s",
+                "flydsl quick allreduce summary (markdown):\n%s",
                 table.to_markdown(index=False),
             )
             if args.out:
@@ -999,6 +1150,7 @@ def main():
                                 "gfx": ARCH,
                                 "grid_cap": args.grid_cap,
                                 "algorithm": args.algorithm,
+                                "codec": args.codec or "host default",
                                 "timer": "run_perftest cuda_event",
                             },
                             "rows": df,

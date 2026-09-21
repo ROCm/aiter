@@ -8,9 +8,9 @@ are being reduced:
 
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
-* **mesh** (``QuickAllReduceInt4(algorithm="mesh")``) -- two-shot, fanout to all
+* **mesh** (``FlyQuickAllReduce(algorithm="mesh")``) -- two-shot, fanout to all
   ``N-1`` peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire.
-* **ring** (``QuickAllReduceInt4(algorithm="ring")``) -- two-shot, ``2(N-1)``
+* **ring** (``FlyQuickAllReduce(algorithm="ring")``) -- two-shot, ``2(N-1)``
   hops, same wire volume as the mesh, traded for per-destination locality.
 """
 
