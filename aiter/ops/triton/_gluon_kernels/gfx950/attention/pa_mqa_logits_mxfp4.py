@@ -252,6 +252,8 @@ class Config:
     dot_a: gl.constexpr
     dot_b: gl.constexpr
     q_scale_layout: gl.constexpr
+    PAGE_MASK: gl.constexpr
+    PAGE_SHIFT: gl.constexpr
     kv_scale_layout: gl.constexpr
     blocked_kv: gl.constexpr
     shared_kv: gl.constexpr
@@ -267,6 +269,13 @@ class Config:
         self.HEAD_BYTES = gl.constexpr(HEAD_SIZE // 2)
         self.NUM_SCALES = gl.constexpr(HEAD_SIZE // SCALE_GROUP.value)
         self.PAGE_SIZE = gl.constexpr(PAGE_SIZE)
+        # Split the position with a mask and a shift. `%` and `//` are signed,
+        # and a signed divide by a power of two carries a sign correction the
+        # value can never need -- free where the tile is the page and the whole
+        # expression folds, 5-10 SALU a loop where it is not.
+        assert PAGE_SIZE & (PAGE_SIZE - 1) == 0, "page_size must be a power of two"
+        self.PAGE_MASK = gl.constexpr(PAGE_SIZE - 1)
+        self.PAGE_SHIFT = gl.constexpr((PAGE_SIZE - 1).bit_length())
         self.BLOCK_KV = gl.constexpr(BLOCK_KV)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.KV_PAGE_STRIDE = gl.constexpr(KV_PAGE_STRIDE)
@@ -436,8 +445,9 @@ class KVState:
         # DEPTH does not hide it. Clamped to a page the sequence owns, which is
         # what lets every KV load run unmasked -- a tile past the context reads
         # real bytes and produces real, wrong logits that the store drops.
-        return gl.load(self.blk_ptr + gl.minimum(tile_pos // self.cfg.PAGE_SIZE,
-                                                 self.last_page_row))
+        return gl.load(self.blk_ptr
+                       + gl.minimum(tile_pos >> self.cfg.PAGE_SHIFT,
+                                    self.last_page_row))
 
     @gluon.jit
     def tile_ptr(self, base, tile_pos, page, PAGE_STRIDE: gl.constexpr,
@@ -445,14 +455,14 @@ class KVState:
         # 64-bit on purpose: one scalar multiply per tile keeps a cache far
         # above 2 GiB addressable while every per-element offset stays i32.
         return base + (page.to(gl.int64) * PAGE_STRIDE
-                       + (tile_pos % self.cfg.PAGE_SIZE).to(gl.int64) * PER_TOKEN)
+                       + (tile_pos & self.cfg.PAGE_MASK).to(gl.int64) * PER_TOKEN)
 
     @gluon.jit
     def page_off(self, tile_pos, page, PAGE_STRIDE: gl.constexpr,
                  PER_TOKEN: gl.constexpr):
         # The same address as a scalar to add into an offsets tensor, which is
         # what the LDS path needs; see LDSLoader.issue.
-        in_page = tile_pos % self.cfg.PAGE_SIZE
+        in_page = tile_pos & self.cfg.PAGE_MASK
         if self.cfg.USE_BUFFER_LOAD:
             return page * PAGE_STRIDE + in_page * PER_TOKEN
         else:
