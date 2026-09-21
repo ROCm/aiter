@@ -750,23 +750,7 @@ jobs:
 
       - name: Ensure zstd for Triton wheel cache
         if: ${{ runner.os == 'Linux' }}
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          if command -v zstd >/dev/null 2>&1 && command -v unzstd >/dev/null 2>&1; then
-            zstd --version
-            exit 0
-          fi
-          if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y zstd
-          elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update
-            apt-get install -y zstd
-          else
-            echo "::warning::apt-get is unavailable; Triton wheel cache restore may miss if this runner lacks zstd"
-          fi
-          command -v zstd >/dev/null 2>&1 && zstd --version || true
+        run: ./.github/scripts/ensure_zstd.sh
 
       - name: Restore Triton wheel cache
         id: restore_triton_wheel
@@ -788,7 +772,7 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
-      - name: Speedtest after Aiter test artifact download failure
+      - name: Speedtest after Aiter test cache or artifact download failure
         if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
@@ -1086,23 +1070,7 @@ jobs:
 
       - name: Ensure zstd for Triton wheel cache
         if: ${{ runner.os == 'Linux' }}
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          if command -v zstd >/dev/null 2>&1 && command -v unzstd >/dev/null 2>&1; then
-            zstd --version
-            exit 0
-          fi
-          if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y zstd
-          elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update
-            apt-get install -y zstd
-          else
-            echo "::warning::apt-get is unavailable; Triton wheel cache restore may miss if this runner lacks zstd"
-          fi
-          command -v zstd >/dev/null 2>&1 && zstd --version || true
+        run: ./.github/scripts/ensure_zstd.sh
 
       - name: Restore Triton wheel cache
         id: restore_triton_wheel
