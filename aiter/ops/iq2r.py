@@ -84,6 +84,7 @@ def _iq2r_route_sort_tasks_out(
     tasks: Tensor,
     task_count: Tensor,
     expert_count: int,
+    expert_start: int,
     task_rows: int,
 ) -> None: ...
 
@@ -122,6 +123,7 @@ def _iq2r_route_direct_gather_quant_out(
     scales: Tensor,
     topk: int,
     expert_count: int,
+    expert_start: int,
 ) -> None: ...
 
 
@@ -588,9 +590,10 @@ def iq2r_route_sort_tasks_out(
     task_count: Tensor,
     *,
     expert_count: int,
+    expert_start: int = 0,
     task_rows: int,
 ) -> None:
-    """Stable-sort routes by expert and build bounded GEMM tasks."""
+    """Map global expert IDs, group local routes, and build bounded GEMM tasks."""
 
     if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1:
         raise ValueError("expert_ids must be int32 [routes]")
@@ -627,6 +630,15 @@ def iq2r_route_sort_tasks_out(
         raise ValueError("IQ2R route sorting requires GPU tensors")
     if any(not t.is_contiguous() for t in tensors):
         raise ValueError("all IQ2R routing tensors must be contiguous")
+    if (
+        isinstance(expert_start, bool)
+        or not isinstance(expert_start, int)
+        or expert_start < 0
+        or expert_start + expert_count > 512
+    ):
+        raise ValueError(
+            "expert_start must define a non-negative local expert range within 512"
+        )
     _iq2r_route_sort_tasks_out(
         expert_ids,
         sorted_expert_ids,
@@ -635,6 +647,7 @@ def iq2r_route_sort_tasks_out(
         tasks,
         task_count,
         expert_count,
+        expert_start,
         task_rows,
     )
 
@@ -728,6 +741,7 @@ def iq2r_route_direct_gather_quant_out(
     *,
     topk: int,
     expert_count: int,
+    expert_start: int = 0,
 ) -> None:
     """Fuse unsorted one-row task construction with low-M gather/quantization."""
 
@@ -774,6 +788,15 @@ def iq2r_route_direct_gather_quant_out(
         raise ValueError("direct IQ2R input must have contiguous non-overlapping rows")
     if any(not t.is_contiguous() for t in tensors):
         raise ValueError("direct IQ2R routing outputs must be contiguous")
+    if (
+        isinstance(expert_start, bool)
+        or not isinstance(expert_start, int)
+        or expert_start < 0
+        or expert_start + expert_count > 512
+    ):
+        raise ValueError(
+            "expert_start must define a non-negative local expert range within 512"
+        )
     _iq2r_route_direct_gather_quant_out(
         input,
         expert_ids,
@@ -786,6 +809,7 @@ def iq2r_route_direct_gather_quant_out(
         scales,
         topk,
         expert_count,
+        expert_start,
     )
 
 
@@ -997,8 +1021,8 @@ def iq2r_route_topk_sort_gather_quant_out(
 def _validate_swiglu_parameters(limit: float, alpha: float, up_offset: float) -> None:
     import math
 
-    if not math.isfinite(limit) or limit <= 0:
-        raise ValueError("SwiGLU limit must be finite and positive")
+    if not math.isfinite(limit) or limit < 0:
+        raise ValueError("SwiGLU limit must be finite and non-negative")
     if not math.isfinite(alpha) or alpha <= 0:
         raise ValueError("SwiGLU alpha must be finite and positive")
     if not math.isfinite(up_offset):
@@ -1013,7 +1037,7 @@ def iq2r_swiglu_out(
     alpha: float = 1.702,
     up_offset: float = 1.0,
 ) -> None:
-    """Apply clipped SwiGLU to interleaved gate/up columns."""
+    """Apply SwiGLU to interleaved gate/up columns; limit 0 disables clamping."""
 
     if gate_up.dtype != torch.bfloat16 or gate_up.ndim != 2:
         raise ValueError("gate_up must be BF16 [rows,2*intermediate]")
@@ -1044,7 +1068,7 @@ def iq2r_swiglu_quant_out(
     alpha: float = 1.702,
     up_offset: float = 1.0,
 ) -> None:
-    """Apply clipped SwiGLU and emit MXFP8/E8M0 in one pass."""
+    """Apply SwiGLU and emit MXFP8/E8M0; limit 0 disables clamping."""
 
     if gate_up.dtype != torch.bfloat16 or gate_up.ndim != 2:
         raise ValueError("gate_up must be BF16 [rows,2*intermediate]")

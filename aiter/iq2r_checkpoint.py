@@ -111,7 +111,7 @@ def _checkpoint_layout(config: dict[str, Any]) -> _CheckpointLayout:
         "GptOss" in architecture or "GPTOSS" in architecture
         for architecture in architectures
     )
-    is_glm = model_type in ("glm5", "glm5_next") or any(
+    is_glm = model_type in ("glm5", "glm5_next", "glm_moe_dsa") or any(
         architecture.startswith(("Glm5", "GlmMoe")) for architecture in architectures
     )
 

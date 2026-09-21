@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from aiter.iq2r_checkpoint import iq2r_compiled_tensor_keys
+from aiter.iq2r_checkpoint import iq2r_compiled_tensor_keys, iq2r_glm5_source_keys
 from aiter.iq2r_glm5_compile import (
+    GLM5Importance,
     GLM5Layout,
+    _compiled_config,
     _validate_projection_shard,
     dequantize_block_fp8,
+    glm5_source_layout,
     interleave_gate_up,
     load_glm5_importance,
 )
@@ -32,6 +38,121 @@ def _layout() -> GLM5Layout:
         block_n=2,
         block_k=2,
     )
+
+
+def test_source_layout_supports_flash_and_plain_glm53():
+    quantization_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    dimensions = {
+        "num_hidden_layers": 78,
+        "first_k_dense_replace": 3,
+        "n_routed_experts": 256,
+        "hidden_size": 6144,
+        "moe_intermediate_size": 2048,
+    }
+    flash = glm5_source_layout(
+        {
+            "architectures": ["Glm5NextForConditionalGeneration"],
+            "model_type": "glm5_next",
+            "text_config": dimensions,
+            "quantization_config": quantization_config,
+        }
+    )
+    plain = glm5_source_layout(
+        {
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "model_type": "glm_moe_dsa",
+            **dimensions,
+            "quantization_config": quantization_config,
+        }
+    )
+
+    assert flash.model_family == "glm5_next"
+    assert flash.source_root == "model.language_model"
+    assert plain.model_family == "glm_moe_dsa"
+    assert plain.source_root == "model"
+    assert plain.layer_count == 78
+    assert plain.expert_count == 256
+    assert plain.hidden_size == 6144
+    assert plain.intermediate_size == 2048
+
+
+def test_plain_glm53_source_keys_use_top_level_model_root():
+    names = iq2r_glm5_source_keys(3, 255, root="model")
+    assert names["gate_proj_weight"] == (
+        "model.layers.3.mlp.experts.255.gate_proj.weight"
+    )
+    assert names["down_proj_weight_scale_inv"] == (
+        "model.layers.3.mlp.experts.255.down_proj.weight_scale_inv"
+    )
+
+
+def test_plain_glm53_compiled_config_keeps_dimensions_top_level():
+    layout = GLM5Layout(
+        layer_count=78,
+        first_moe_layer=3,
+        expert_count=256,
+        hidden_size=6144,
+        intermediate_size=2048,
+        block_n=128,
+        block_k=128,
+        model_family="glm_moe_dsa",
+        source_root="model",
+    )
+    importance = GLM5Importance(
+        gate_up=torch.empty(0),
+        down=torch.empty(0),
+        metadata={"calibration_scheme": "diagnostic-uniform"},
+        quality="diagnostic-uniform-not-o0-quality",
+    )
+    config = _compiled_config(
+        {
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "model_type": "glm_moe_dsa",
+        },
+        layout,
+        importance,
+        [3],
+        ["iq2r-layer-0003-gate-up.safetensors"],
+        "/models/zai-org/GLM-5.3",
+        "abc123",
+    )
+
+    assert "text_config" not in config
+    assert config["model_type"] == "glm_moe_dsa"
+    assert config["num_hidden_layers"] == 78
+    assert config["n_routed_experts"] == 256
+    assert config["hidden_size"] == 6144
+    assert config["moe_intermediate_size"] == 2048
+    assert config["iq2r"]["model_family"] == "glm_moe_dsa"
+    assert config["iq2r"]["source_root"] == "model"
+
+
+@pytest.mark.skipif(
+    not Path("/models/zai-org/GLM-5.3/config.json").is_file(),
+    reason="plain GLM-5.3 checkpoint is not mounted",
+)
+def test_real_plain_glm53_index_matches_compiler_contract():
+    model_dir = Path("/models/zai-org/GLM-5.3")
+    config = json.loads((model_dir / "config.json").read_text())
+    layout = glm5_source_layout(config)
+    index = json.loads((model_dir / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+
+    assert layout.model_family == "glm_moe_dsa"
+    assert layout.source_root == "model"
+    assert layout.layer_count == 78
+    assert layout.first_moe_layer == 3
+    assert layout.expert_count == 256
+    for layer, expert in ((3, 0), (77, 255), (78, 0)):
+        assert all(
+            name in weight_map
+            for name in iq2r_glm5_source_keys(
+                layer, expert, root=layout.source_root
+            ).values()
+        )
 
 
 def test_interleave_gate_up_uses_aiter_swiglu_row_order():

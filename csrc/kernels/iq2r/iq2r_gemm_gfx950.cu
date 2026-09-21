@@ -570,9 +570,26 @@ __global__ __launch_bounds__(256) void iq2r_task_gemm_kernel(
     const int row_begin = tasks[task_index * 3];
     const int row_count = tasks[task_index * 3 + 1];
     const int expert_index = tasks[task_index * 3 + 2];
-    if(row_begin < 0 || row_count <= 0 || row_begin + row_count > M ||
-       expert_index < 0 || expert_index >= expert_count)
+    if(row_begin < 0 || row_count <= 0 || row_begin + row_count > M)
         return;
+    if(expert_index < 0 || expert_index >= expert_count)
+    {
+        // Expert-parallel callers remap non-local global routes to -1. The
+        // reduction still visits every original route, so materialize exact
+        // zeros for skipped tasks rather than leaving stale workspace values.
+        const int output_column_begin = static_cast<int>(blockIdx.x) * TileN;
+        const int task_elements = row_count * TileN;
+        for(int element = threadIdx.x; element < task_elements;
+            element += blockDim.x)
+        {
+            const int row = row_begin + element / TileN;
+            const int column = output_column_begin + element % TileN;
+            if(column < N)
+                output[static_cast<int64_t>(row) * N + column] =
+                    __float2bfloat16(0.0f);
+        }
+        return;
+    }
 
     __shared__ alignas(16) uint8_t codebook[kCodebookBytes];
     const uint8_t* data = all_data + static_cast<int64_t>(expert_index) * data_bytes;
@@ -1556,9 +1573,28 @@ void iq2r_task_gemm_cooperative_kernel(
         const int row_begin = tasks[task_index * 3];
         const int row_count = tasks[task_index * 3 + 1];
         const int expert_index = tasks[task_index * 3 + 2];
-        if(row_begin < 0 || row_count <= 0 || row_begin + row_count > M ||
-           expert_index < 0 || expert_index >= expert_count)
+        if(row_begin < 0 || row_count <= 0 || row_begin + row_count > M)
             continue;
+        if(expert_index < 0 || expert_index >= expert_count)
+        {
+            // Expert-parallel callers retain non-local routes in the sorted
+            // permutation so the final indexed reduction can preserve the
+            // original top-k order. Materialize their contribution exactly as
+            // zero, matching the generic task kernel instead of leaving stale
+            // workspace values behind.
+            const int output_column_begin = n_tile_index * kOutputColumns;
+            const int output_columns = min(kOutputColumns, N - output_column_begin);
+            const int task_elements = row_count * output_columns;
+            for(int element = linear_thread; element < task_elements;
+                element += linear_threads)
+            {
+                const int row = row_begin + element / output_columns;
+                const int column = output_column_begin + element % output_columns;
+                output[static_cast<int64_t>(row) * N + column] =
+                    __float2bfloat16(0.0f);
+            }
+            continue;
+        }
 
         const uint8_t* data =
             all_data + static_cast<int64_t>(expert_index) * data_bytes;
@@ -2066,6 +2102,7 @@ void iq2r_encode_out(const aiter_tensor_t& weight,
                     data.device_id == device && auxiliary.device_id == device &&
                     scale_delta_overflow.device_id == device,
                 "IQ2R encoder tensors must be on the same device");
+    const HipDeviceGuard device_guard(device);
     AITER_CHECK(weight.dtype() == AITER_DTYPE_fp32 &&
                     importance.dtype() == AITER_DTYPE_fp32 &&
                     codebook.dtype() == AITER_DTYPE_fp32,
@@ -2343,7 +2380,11 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
 
     const bool gpt_oss_shape = logical_k == 2880 &&
                                (logical_n == 2880 || logical_n == 5760);
-    if(gpt_oss_shape)
+    const bool glm53_gate_shape = logical_k == 6144 && logical_n == 4096;
+    const bool glm53_down_shape = logical_k == 2048 && logical_n == 6144;
+    const bool cooperative_shape =
+        gpt_oss_shape || glm53_gate_shape || glm53_down_shape;
+    if(cooperative_shape)
     {
         const int routed_m = static_cast<int>(activations.size(0));
         const int expert_count = static_cast<int>(data.size(0));
@@ -2351,13 +2392,13 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
         const int cu_count = static_cast<int>(get_num_cu_func());
         const int base_grid = 2 * cu_count;
         const bool use_wide_eight_wave_down =
-            logical_n == 2880 && routed_m > 4 && routed_m <= 8;
+            gpt_oss_shape && logical_n == 2880 && routed_m > 4 && routed_m <= 8;
         // GPT-OSS top-k=4 maps token counts 4..8 and 16 to 16..32 and 64
         // routed rows. Captured M=5/M=8 routes plus synthetic M=6/M=7 route
         // distributions consistently favor the narrower 3x4 down-projection
         // family in this decode band while retaining the existing 5xCU grid.
         const bool use_narrow_four_wave_down =
-            logical_n == 2880 &&
+            gpt_oss_shape && logical_n == 2880 &&
             (routed_m == 16 || (routed_m >= 20 && routed_m <= 32) ||
              routed_m == 64);
         const bool use_narrow = routed_m < 16 && !use_wide_eight_wave_down;
@@ -2367,7 +2408,7 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
             ((static_cast<int>(logical_n) + output_columns - 1) / output_columns);
         int launch_grid = base_grid * (estimated_tiles > base_grid ? 2 : 1);
 
-        if(!use_narrow && logical_n == 2880)
+        if(gpt_oss_shape && !use_narrow && logical_n == 2880)
         {
             // Once GPT-OSS reaches 64 decoded tokens (256 routed rows at
             // top-k=4), four workgroups per CU consistently outperform the
@@ -2381,12 +2422,14 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
         // They are read on the host before launch, so separate CUDA/HIP graphs
         // can capture different candidates without rebuilding this module. An
         // unset variable preserves the production heuristic above.
+        const bool gate_up_projection =
+            (gpt_oss_shape && logical_n == 5760) || glm53_gate_shape;
         const char* family_override = std::getenv(
-            logical_n == 5760 ? "IQ2R_GEMM_GATE_UP_FAMILY"
-                              : "IQ2R_GEMM_DOWN_FAMILY");
+            gate_up_projection ? "IQ2R_GEMM_GATE_UP_FAMILY"
+                               : "IQ2R_GEMM_DOWN_FAMILY");
         const char* grid_override = std::getenv(
-            logical_n == 5760 ? "IQ2R_GEMM_GATE_UP_GRID_MULTIPLIER"
-                              : "IQ2R_GEMM_DOWN_GRID_MULTIPLIER");
+            gate_up_projection ? "IQ2R_GEMM_GATE_UP_GRID_MULTIPLIER"
+                               : "IQ2R_GEMM_DOWN_GRID_MULTIPLIER");
         if(grid_override != nullptr && grid_override[0] != '\0')
         {
             const int multiplier = std::atoi(grid_override);
@@ -2447,6 +2490,15 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
             HIP_CALL_LAUNCH(hipGetLastError());
             return;
         }
+        if(!gpt_oss_shape && family_override != nullptr &&
+           (std::strcmp(family_override, "3x4s") == 0 ||
+            std::strcmp(family_override, "6x4s") == 0 ||
+            std::strcmp(family_override, "6x4as") == 0 ||
+            std::strncmp(family_override, "large", 5) == 0 ||
+            std::strncmp(family_override, "prefetch", 8) == 0))
+            AITER_CHECK(false,
+                        "this IQ2R launch family is currently restricted to "
+                        "the GPT-OSS K=2880 shapes");
         if(use_prefetch32a_auto ||
            (family_override != nullptr &&
             (std::strcmp(family_override, "large32") == 0 ||
@@ -2630,6 +2682,27 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
                             "prefetch32, prefetch32a, prefetch32t, "
                             "prefetch64, prefetch64a, or "
                             "large192");
+        }
+        else if(glm53_gate_shape)
+        {
+            // Real EP4 route sweeps from M=1 through M=32 favor the narrow
+            // 48-column family. Four physical waves divide the 48 K tiles
+            // evenly and leave enough workgroups to fill all CUs when only a
+            // handful of this rank's experts are active.
+            if(tiled_activation_scales)
+                IQ2R_LAUNCH_COOPERATIVE(3, 4, false, false, true, true, 2);
+            else
+                IQ2R_LAUNCH_COOPERATIVE(3, 4, false, false, false, true, 2);
+        }
+        else if(glm53_down_shape)
+        {
+            // The down projection has only 16 K tiles. Four waves divide them
+            // evenly, while the narrow output tile provides enough parallel
+            // work across the 6144-column result for sparse EP4 decode routes.
+            if(tiled_activation_scales)
+                IQ2R_LAUNCH_COOPERATIVE(3, 4, false, false, true, true, 2);
+            else
+                IQ2R_LAUNCH_COOPERATIVE(3, 4, false, false, false, true, 2);
         }
         else if(use_narrow)
         {

@@ -78,6 +78,8 @@ class GLM5Layout:
     intermediate_size: int
     block_n: int
     block_k: int
+    model_family: str = "glm5_next"
+    source_root: str = "model.language_model"
 
     @property
     def moe_layers(self) -> int:
@@ -98,15 +100,30 @@ class GLM5Importance:
         return (importance / importance.mean().clamp_min(1e-12)).clamp_min(1e-6)
 
 
-def _source_layout(config: dict[str, Any]) -> GLM5Layout:
+def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
+    """Return the checkpoint layout for Flash or plain GLM-5.3."""
+
     architectures = config.get("architectures") or []
-    if config.get("model_type") != "glm5_next" and not any(
+    is_flash = config.get("model_type") == "glm5_next" or any(
         isinstance(name, str) and name.startswith("Glm5Next") for name in architectures
-    ):
-        raise ValueError("IQ2R GLM compiler requires a GLM-5 Next checkpoint")
-    text = config.get("text_config")
-    if not isinstance(text, dict):
-        raise TypeError("GLM-5 config does not contain a text_config object")
+    )
+    is_plain = config.get("model_type") == "glm_moe_dsa" or any(
+        isinstance(name, str) and name.startswith("GlmMoeDsa") for name in architectures
+    )
+    if not (is_flash or is_plain):
+        raise ValueError(
+            "IQ2R GLM compiler requires a GLM-5 Next or GLM MoE DSA checkpoint"
+        )
+    if is_flash:
+        text = config.get("text_config")
+        if not isinstance(text, dict):
+            raise TypeError("GLM-5 Next config does not contain a text_config object")
+        model_family = "glm5_next"
+        source_root = "model.language_model"
+    else:
+        text = config
+        model_family = "glm_moe_dsa"
+        source_root = "model"
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict) or quantization.get("quant_method") != "fp8":
         raise ValueError("GLM-5 IQ2R source must use block-FP8 weights")
@@ -125,6 +142,8 @@ def _source_layout(config: dict[str, Any]) -> GLM5Layout:
         intermediate_size=int(text.get("moe_intermediate_size", -1)),
         block_n=block_size[0],
         block_k=block_size[1],
+        model_family=model_family,
+        source_root=source_root,
     )
     if not (0 <= layout.first_moe_layer < layout.layer_count):
         raise ValueError("GLM-5 config has an invalid routed-MoE layer range")
@@ -458,7 +477,7 @@ def _source_projection(
     projection: str,
     device: torch.device | str,
 ) -> Tensor:
-    names = iq2r_glm5_source_keys(layer, expert)
+    names = iq2r_glm5_source_keys(layer, expert, root=layout.source_root)
     if projection == "gate_up":
         gate = dequantize_block_fp8(
             reader.get(names["gate_proj_weight"]),
@@ -663,6 +682,59 @@ def _validate_device(device: torch.device) -> None:
         )
 
 
+def _compiled_config(
+    source_config: dict[str, Any],
+    layout: GLM5Layout,
+    importance: GLM5Importance,
+    selected_layers: list[int],
+    file_manifest: list[str],
+    source_model: str,
+    source_config_sha256: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "architectures": list(source_config.get("architectures") or []),
+        "model_type": layout.model_family,
+        "compiled_tensor_parallel_size": 1,
+        "compiled_expert_parallel_size": 1,
+        "storage_format": "safetensors",
+        "profile": "o0" if importance.quality == "calibrated-o0" else "diagnostic",
+        "file_manifest": file_manifest,
+        "iq2r": {
+            "format": IQ2R_FORMAT_NAME,
+            "version": IQ2R_FORMAT_VERSION,
+            "activation_basis": IQ2R_ACTIVATION_BASIS,
+            "expert_projection_modules": {
+                "gate_up": "up_gate_proj",
+                "down": "down_proj",
+            },
+            "expert_bias": False,
+            "gate_up_row_order": "gate-up-interleaved",
+            "model_family": layout.model_family,
+            "source_root": layout.source_root,
+            "quality": importance.quality,
+            "compiled_layers": selected_layers,
+            "source_model": source_model,
+            "source_config_sha256": source_config_sha256,
+            "calibration": importance.metadata,
+        },
+    }
+    dimensions = {
+        "num_hidden_layers": layout.layer_count,
+        "first_k_dense_replace": layout.first_moe_layer,
+        "n_routed_experts": layout.expert_count,
+        "hidden_size": layout.hidden_size,
+        "moe_intermediate_size": layout.intermediate_size,
+    }
+    if layout.model_family == "glm5_next":
+        result["text_config"] = {
+            **dict(source_config["text_config"]),
+            **dimensions,
+        }
+    else:
+        result.update(dimensions)
+    return result
+
+
 def compile_glm5_iq2r(
     model_dir: str | os.PathLike[str],
     output_dir: str | os.PathLike[str],
@@ -684,7 +756,7 @@ def compile_glm5_iq2r(
     config_path = model_dir / "config.json"
     index_path = model_dir / "model.safetensors.index.json"
     config = _read_json(config_path)
-    layout = _source_layout(config)
+    layout = glm5_source_layout(config)
     source_index = _read_json(index_path)
     weight_map = source_index.get("weight_map")
     if not isinstance(weight_map, dict) or not all(
@@ -758,32 +830,15 @@ def compile_glm5_iq2r(
             )
 
     source_config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    compiled_config = {
-        "architectures": list(config.get("architectures") or []),
-        "model_type": config.get("model_type", "glm5_next"),
-        "text_config": dict(config["text_config"]),
-        "compiled_tensor_parallel_size": 1,
-        "compiled_expert_parallel_size": 1,
-        "storage_format": "safetensors",
-        "profile": "o0" if importance.quality == "calibrated-o0" else "diagnostic",
-        "file_manifest": file_manifest,
-        "iq2r": {
-            "format": IQ2R_FORMAT_NAME,
-            "version": IQ2R_FORMAT_VERSION,
-            "activation_basis": IQ2R_ACTIVATION_BASIS,
-            "expert_projection_modules": {
-                "gate_up": "up_gate_proj",
-                "down": "down_proj",
-            },
-            "expert_bias": False,
-            "gate_up_row_order": "gate-up-interleaved",
-            "quality": importance.quality,
-            "compiled_layers": selected_layers,
-            "source_model": str(model_dir),
-            "source_config_sha256": source_config_sha256,
-            "calibration": importance.metadata,
-        },
-    }
+    compiled_config = _compiled_config(
+        config,
+        layout,
+        importance,
+        selected_layers,
+        file_manifest,
+        str(model_dir),
+        source_config_sha256,
+    )
     output_config = output_dir / "config.json"
     if output_config.exists() and not (force or resume):
         raise FileExistsError(
@@ -844,6 +899,7 @@ __all__ = [
     "GLM5Layout",
     "compile_glm5_iq2r",
     "dequantize_block_fp8",
+    "glm5_source_layout",
     "interleave_gate_up",
     "load_glm5_importance",
 ]

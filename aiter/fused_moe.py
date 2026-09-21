@@ -859,6 +859,7 @@ def fused_moe(
     iq2r_router_logits: torch.Tensor | None = None,
     iq2r_router_bias: torch.Tensor | None = None,
     iq2r_router_renormalize: bool = True,
+    iq2r_expert_start: int = 0,
 ):
     if quant_type == QuantType.iq2r_2bit:
         unsupported = {
@@ -927,6 +928,7 @@ def fused_moe(
             gate_up_bias=bias1,
             down_bias=bias2,
             workspace=iq2r_workspace,
+            expert_start=iq2r_expert_start,
             router_logits=iq2r_router_logits,
             router_bias=iq2r_router_bias,
             renormalize=iq2r_router_renormalize,

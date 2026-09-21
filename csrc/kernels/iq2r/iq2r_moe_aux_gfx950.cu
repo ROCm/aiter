@@ -90,6 +90,7 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_small_kernel(
     int32_t* __restrict__ task_count,
     int routes,
     int expert_count,
+    int expert_start,
     int task_capacity,
     int task_rows)
 {
@@ -103,9 +104,11 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_small_kernel(
 
     if(threadIdx.x < routes)
     {
-        const int expert = expert_ids[threadIdx.x];
-        const int bucket = expert >= 0 && expert < expert_count ? expert
-                                                                : expert_count;
+        const int local_expert = expert_ids[threadIdx.x] - expert_start;
+        const int expert = local_expert >= 0 && local_expert < expert_count
+                               ? local_expert
+                               : -1;
+        const int bucket = expert >= 0 ? expert : expert_count;
         route_experts[threadIdx.x] = expert;
         atomicAdd(counts + bucket, 1);
     }
@@ -192,6 +195,7 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_kernel(
     int32_t* __restrict__ task_count,
     int routes,
     int expert_count,
+    int expert_start,
     int task_capacity,
     int task_rows)
 {
@@ -205,9 +209,10 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_kernel(
 
     for(int route = threadIdx.x; route < routes; route += blockDim.x)
     {
-        const int expert = expert_ids[route];
-        const int bucket = expert >= 0 && expert < expert_count ? expert
-                                                                : expert_count;
+        const int local_expert = expert_ids[route] - expert_start;
+        const int bucket = local_expert >= 0 && local_expert < expert_count
+                               ? local_expert
+                               : expert_count;
         atomicAdd(counts + bucket, 1);
     }
     __syncthreads();
@@ -226,9 +231,11 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_kernel(
 
     for(int route = threadIdx.x; route < routes; route += blockDim.x)
     {
-        const int expert = expert_ids[route];
-        const int bucket = expert >= 0 && expert < expert_count ? expert
-                                                                : expert_count;
+        const int local_expert = expert_ids[route] - expert_start;
+        const int expert = local_expert >= 0 && local_expert < expert_count
+                               ? local_expert
+                               : -1;
+        const int bucket = expert >= 0 ? expert : expert_count;
         const int sorted_route = atomicAdd(cursors + bucket, 1);
         sorted_expert_ids[sorted_route] = expert;
         gather_indices[sorted_route] = route;
@@ -360,9 +367,11 @@ __global__ __launch_bounds__(kQuantThreads) void iq2r_route_gather_quant_kernel(
 // source token once before broadcasting the packed row to all of its top-k
 // routes. The previous route-major implementation repeated the BF16 loads,
 // absolute-max reduction, scale conversion, and FP8 conversion top-k times.
-constexpr int kDirectQuantThreads = 128;
+constexpr int kDefaultQuantThreads = 128;
+constexpr int kMaxQuantThreads     = 256;
+constexpr int kDirectTopKThreads   = kGptOssExperts;
 
-__global__ __launch_bounds__(kDirectQuantThreads)
+__global__ __launch_bounds__(kMaxQuantThreads)
 void iq2r_route_direct_gather_quant_kernel(
     const opus::bf16_t* __restrict__ input,
     const int32_t* __restrict__ expert_ids,
@@ -379,6 +388,7 @@ void iq2r_route_direct_gather_quant_kernel(
     int groups_per_row,
     int topk,
     int expert_count,
+    int expert_start,
     int scale_m_blocks,
     bool tiled_scales)
 {
@@ -390,9 +400,10 @@ void iq2r_route_direct_gather_quant_kernel(
     if(group < topk)
     {
         const int route = token * topk + group;
-        const int expert = expert_ids[route];
-        const int valid_expert = expert >= 0 && expert < expert_count ? expert : -1;
-        sorted_expert_ids[route] = expert;
+        const int local_expert = expert_ids[route] - expert_start;
+        const int valid_expert =
+            local_expert >= 0 && local_expert < expert_count ? local_expert : -1;
+        sorted_expert_ids[route] = valid_expert;
         gather_indices[route] = route;
         scatter_indices[route] = route;
         tasks[route * kTaskColumns] = route;
@@ -443,7 +454,7 @@ void iq2r_route_direct_gather_quant_kernel(
 // and quantizes the hidden row once before broadcasting it to the four routes.
 // This removes the standalone top-k launch from the launch-bound decode path.
 template <typename RouterType>
-__global__ __launch_bounds__(kDirectQuantThreads)
+__global__ __launch_bounds__(kDirectTopKThreads)
 void iq2r_route_topk_direct_gather_quant_kernel(
     const opus::bf16_t* __restrict__ input,
     const RouterType* __restrict__ router_logits,
@@ -489,7 +500,7 @@ void iq2r_route_topk_direct_gather_quant_kernel(
     for(int rank = 0; rank < kTopK; ++rank)
     {
         const kvp selected =
-            block_reduce<kvp, ArgMax, kDirectQuantThreads, true>(local, ArgMax());
+            block_reduce<kvp, ArgMax, kDirectTopKThreads, true>(local, ArgMax());
         if(lane == 0)
         {
             if(rank == 0)
@@ -507,7 +518,7 @@ void iq2r_route_topk_direct_gather_quant_kernel(
     if(!renormalize)
     {
         const float remainder = expf(local.value - first_max);
-        full_row_sum = block_reduce<float, Sum, kDirectQuantThreads, true>(
+        full_row_sum = block_reduce<float, Sum, kDirectTopKThreads, true>(
             remainder, Sum());
         __syncthreads();
     }
@@ -770,7 +781,7 @@ void iq2r_route_topk_sort_tasks_kernel(
 // expert-grouped destinations. A CTA per token restores enough parallelism for
 // the 2880-column GPT-OSS hidden state while retaining the 4x reduction in BF16
 // reads, max reductions, and FP8 conversions.
-__global__ __launch_bounds__(kDirectQuantThreads)
+__global__ __launch_bounds__(kMaxQuantThreads)
 void iq2r_route_gather_quant_broadcast_kernel(
     const opus::bf16_t* __restrict__ input,
     const int32_t* __restrict__ scatter_indices,
@@ -848,14 +859,11 @@ __global__ void iq2r_swiglu_kernel(const __hip_bfloat16* __restrict__ gate_up,
             __bfloat162float(gate_up[gate_up_offset + 2 * column]);
         const float unclamped_up =
             __bfloat162float(gate_up[gate_up_offset + 2 * column + 1]);
-        const float gate = unclamped_gate > limit
-                               ? limit
-                               : unclamped_gate;
-        const float up = unclamped_up < -limit
+        const bool clamp = limit > 0.0f;
+        const float gate = clamp && unclamped_gate > limit ? limit : unclamped_gate;
+        const float up = clamp && unclamped_up < -limit
                              ? -limit
-                             : (unclamped_up > limit
-                                    ? limit
-                                    : unclamped_up);
+                             : (clamp && unclamped_up > limit ? limit : unclamped_up);
         const float swish = gate / (1.0f + __expf(-alpha * gate));
         output[index] = __float2bfloat16(swish * (up + up_offset));
     }
@@ -902,12 +910,12 @@ __global__ __launch_bounds__(kQuantThreads) void iq2r_swiglu_quant_kernel(
             __bfloat162float(gate_up[gate_up_offset + 2 * column]);
         const float unclamped_up =
             __bfloat162float(gate_up[gate_up_offset + 2 * column + 1]);
+        const bool clamp = limit > 0.0f;
         const float gate =
-            unclamped_gate > limit ? limit : unclamped_gate;
-        const float up = unclamped_up < -limit
+            clamp && unclamped_gate > limit ? limit : unclamped_gate;
+        const float up = clamp && unclamped_up < -limit
                              ? -limit
-                             : (unclamped_up > limit ? limit
-                                                            : unclamped_up);
+                             : (clamp && unclamped_up > limit ? limit : unclamped_up);
         const float swish = gate / (1.0f + __expf(-alpha * gate));
         const __hip_bfloat16 rounded =
             __float2bfloat16(swish * (up + up_offset));
@@ -986,12 +994,13 @@ void iq2r_swiglu_quant_parallel8_kernel(
                 __bfloat162float(gate_up[gate_up_offset + 2 * column]);
             const float unclamped_up =
                 __bfloat162float(gate_up[gate_up_offset + 2 * column + 1]);
+            const bool clamp = limit > 0.0f;
             const float gate =
-                unclamped_gate > limit ? limit : unclamped_gate;
-            const float up = unclamped_up < -limit
+                clamp && unclamped_gate > limit ? limit : unclamped_gate;
+            const float up = clamp && unclamped_up < -limit
                                  ? -limit
-                                 : (unclamped_up > limit ? limit
-                                                                : unclamped_up);
+                                 : (clamp && unclamped_up > limit ? limit
+                                                                  : unclamped_up);
             const float swish = gate / (1.0f + __expf(-alpha * gate));
             const __hip_bfloat16 rounded =
                 __float2bfloat16(swish * (up + up_offset));
@@ -1145,6 +1154,7 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                                aiter_tensor_t& tasks,
                                aiter_tensor_t& task_count,
                                int64_t expert_count,
+                               int64_t expert_start,
                                int64_t task_rows)
 {
     AITER_CHECK(expert_ids.is_gpu() && sorted_expert_ids.is_gpu() &&
@@ -1178,6 +1188,8 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                 "IQ2R route sorting tensors must be contiguous");
     AITER_CHECK(expert_count > 0 && expert_count <= kMaxExperts,
                 "IQ2R supports at most 512 experts");
+    AITER_CHECK(expert_start >= 0 && expert_start + expert_count <= kMaxExperts,
+                "IQ2R local expert range must fit within 512 global experts");
     AITER_CHECK(task_rows == 16 || task_rows == 32 || task_rows == 64 ||
                     task_rows == 128 ||
                     task_rows == 256,
@@ -1203,6 +1215,7 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                            static_cast<int32_t*>(task_count.data_ptr()),
                            static_cast<int>(routes),
                            static_cast<int>(expert_count),
+                           static_cast<int>(expert_start),
                            static_cast<int>(tasks.size(0)),
                            static_cast<int>(task_rows));
     else
@@ -1219,6 +1232,7 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                            static_cast<int32_t*>(task_count.data_ptr()),
                            static_cast<int>(routes),
                            static_cast<int>(expert_count),
+                           static_cast<int>(expert_start),
                            static_cast<int>(tasks.size(0)),
                            static_cast<int>(task_rows));
     HIP_CALL_LAUNCH(hipGetLastError());
@@ -1282,6 +1296,8 @@ void iq2r_route_gather_quant_out(const aiter_tensor_t& input,
                     scales.dtype() == AITER_DTYPE_u8,
                 "IQ2R fused gather/quant dtype mismatch");
     const int64_t groups_per_row = input.size(1) / kQuantGroup;
+    AITER_CHECK(groups_per_row <= kMaxQuantThreads,
+                "IQ2R broadcast gather hidden size exceeds one-CTA quantization capacity");
     AITER_CHECK(input.dim() == 2 && gather_indices.dim() == 1 &&
                     output.dim() == 2 && topk > 0 &&
                     output.size(0) == input.size(0) * topk &&
@@ -1329,7 +1345,8 @@ void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
                                         aiter_tensor_t& output,
                                         aiter_tensor_t& scales,
                                         int64_t topk,
-                                        int64_t expert_count)
+                                        int64_t expert_count,
+                                        int64_t expert_start)
 {
     AITER_CHECK(input.is_gpu() && expert_ids.is_gpu() &&
                     sorted_expert_ids.is_gpu() && gather_indices.is_gpu() &&
@@ -1358,6 +1375,8 @@ void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
     AITER_CHECK(routes > 0 && routes <= 16 && topk > 0 && routes % topk == 0,
                 "IQ2R direct routing requires 1..16 complete top-k route rows");
     const int64_t groups_per_row = input.size(1) / kQuantGroup;
+    AITER_CHECK(groups_per_row <= kMaxQuantThreads,
+                "IQ2R direct routing hidden size exceeds one-CTA quantization capacity");
     AITER_CHECK(input.dim() == 2 && input.size(0) * topk == routes &&
                     input.size(1) % kQuantGroup == 0 &&
                     output.dim() == 2 && output.size(0) == routes &&
@@ -1377,12 +1396,17 @@ void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
                 "IQ2R direct routing tensors must be contiguous");
     AITER_CHECK(expert_count > 0 && expert_count <= kMaxExperts,
                 "IQ2R direct routing supports at most 512 experts");
+    AITER_CHECK(expert_start >= 0 && expert_start + expert_count <= kMaxExperts,
+                "IQ2R local expert range must fit within 512 global experts");
 
     const bool tiled_scales = scales.dim() == 4;
     const int scale_m_blocks = static_cast<int>((routes + 15) / 16);
+    const int quant_threads = groups_per_row > kDefaultQuantThreads
+                                  ? kMaxQuantThreads
+                                  : kDefaultQuantThreads;
     hipLaunchKernelGGL(iq2r_route_direct_gather_quant_kernel,
                        dim3(static_cast<uint32_t>(input.size(0))),
-                       dim3(kDirectQuantThreads),
+                       dim3(quant_threads),
                        0,
                        getCurrentHIPStream(),
                        static_cast<const opus::bf16_t*>(input.data_ptr()),
@@ -1400,6 +1424,7 @@ void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
                        static_cast<int>(groups_per_row),
                        static_cast<int>(topk),
                        static_cast<int>(expert_count),
+                       static_cast<int>(expert_start),
                        scale_m_blocks,
                        tiled_scales);
     HIP_CALL_LAUNCH(hipGetLastError());
@@ -1490,7 +1515,7 @@ void iq2r_route_topk_direct_gather_quant_out(
 
     HipDeviceGuard device_guard(device);
     const dim3 grid(static_cast<unsigned int>(input.size(0)));
-    const dim3 block(kDirectQuantThreads);
+    const dim3 block(kDirectTopKThreads);
     const bool tiled_scales = scales.dim() == 4;
     const int scale_m_blocks = (routes + 15) / 16;
     if(router_logits.dtype() == AITER_DTYPE_bf16)
@@ -1692,9 +1717,12 @@ void iq2r_route_topk_sort_gather_quant_out(
             renormalize);
     HIP_CALL_LAUNCH(hipGetLastError());
 
+    const int quant_threads = groups_per_row > kDefaultQuantThreads
+                                  ? kMaxQuantThreads
+                                  : kDefaultQuantThreads;
     hipLaunchKernelGGL(iq2r_route_gather_quant_broadcast_kernel,
                        dim3(static_cast<unsigned int>(input.size(0))),
-                       dim3(kDirectQuantThreads),
+                       dim3(quant_threads),
                        0,
                        getCurrentHIPStream(),
                        static_cast<const opus::bf16_t*>(input.data_ptr()),

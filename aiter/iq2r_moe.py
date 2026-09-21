@@ -275,6 +275,7 @@ def iq2r_fused_moe_out(
     gate_up_bias: Tensor | None,
     down_bias: Tensor | None,
     workspace: IQ2RMoeWorkspace,
+    expert_start: int = 0,
     router_logits: Tensor | None = None,
     router_bias: Tensor | None = None,
     renormalize: bool = True,
@@ -316,6 +317,15 @@ def iq2r_fused_moe_out(
     if gate_up_data.shape[0] != down_data.shape[0]:
         raise ValueError("gate/up and down IQ2R expert counts differ")
     experts = gate_up_data.shape[0]
+    if (
+        isinstance(expert_start, bool)
+        or not isinstance(expert_start, int)
+        or expert_start < 0
+        or expert_start + experts > 512
+    ):
+        raise ValueError(
+            "expert_start must define a non-negative local expert range within 512"
+        )
     if experts > workspace.max_experts:
         raise ValueError(
             f"workspace supports at most {workspace.max_experts} experts, got {experts}"
@@ -410,6 +420,10 @@ def iq2r_fused_moe_out(
         )
 
     if router_logits is not None:
+        if expert_start != 0:
+            raise ValueError(
+                "the fused IQ2R router does not support expert parallelism"
+            )
         if experts != IQ2R_GPT_OSS_EXPERTS or topk != IQ2R_GPT_OSS_TOP_K:
             raise ValueError(
                 "the fused IQ2R router is restricted to GPT-OSS geometry "
@@ -519,6 +533,7 @@ def iq2r_fused_moe_out(
             route_input_scales,
             topk=topk,
             expert_count=experts,
+            expert_start=expert_start,
         )
     else:
         iq2r_route_sort_tasks_out(
@@ -529,6 +544,7 @@ def iq2r_fused_moe_out(
             tasks,
             workspace.task_count,
             expert_count=experts,
+            expert_start=expert_start,
             task_rows=task_rows,
         )
         iq2r_route_gather_quant_out(
@@ -611,6 +627,7 @@ def iq2r_fused_moe(
     gate_up_bias: Tensor | None,
     down_bias: Tensor | None,
     workspace: IQ2RMoeWorkspace,
+    expert_start: int = 0,
     router_logits: Tensor | None = None,
     router_bias: Tensor | None = None,
     renormalize: bool = True,
@@ -647,6 +664,7 @@ def iq2r_fused_moe(
         gate_up_bias=gate_up_bias,
         down_bias=down_bias,
         workspace=workspace,
+        expert_start=expert_start,
         router_logits=router_logits,
         router_bias=router_bias,
         renormalize=renormalize,
@@ -675,6 +693,7 @@ def iq2r_fused_moe_add_rmsnorm(
     gate_up_bias: Tensor | None,
     down_bias: Tensor | None,
     workspace: IQ2RMoeWorkspace,
+    expert_start: int = 0,
     router_logits: Tensor | None = None,
     router_bias: Tensor | None = None,
     renormalize: bool = True,
@@ -708,6 +727,7 @@ def iq2r_fused_moe_add_rmsnorm(
         gate_up_bias=gate_up_bias,
         down_bias=down_bias,
         workspace=workspace,
+        expert_start=expert_start,
         router_logits=router_logits,
         router_bias=router_bias,
         renormalize=renormalize,

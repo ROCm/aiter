@@ -53,6 +53,27 @@ def test_device_encoder_matches_reference(k):
     torch.testing.assert_close(actual_auxiliary, expected_auxiliary, rtol=0, atol=0)
 
 
+def test_device_encoder_honors_noncurrent_gpu():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires at least two visible GPUs")
+
+    torch.cuda.set_device(0)
+    target = torch.device("cuda:1")
+    generator = torch.Generator(device=target).manual_seed(0xD3A1CE)
+    weight = (torch.randn((64, 128), generator=generator, device=target) * 0.08).float()
+    importance = torch.linspace(0.2, 2.0, 128, device=target)
+    codebook = iq2r_initial_codebook(target)
+    expected_data, expected_auxiliary = iq2r_encode_reference(
+        weight, importance, codebook
+    )
+
+    actual_data, actual_auxiliary = iq2r_encode_device(weight, importance, codebook)
+
+    assert torch.cuda.current_device() == 0
+    torch.testing.assert_close(actual_data, expected_data, rtol=0, atol=0)
+    torch.testing.assert_close(actual_auxiliary, expected_auxiliary, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("n", [64, 128])
 def test_device_materializer_matches_independent_host_decoder(first_expert, n):
     metadata = IQ2RMetadata(n, 2880)

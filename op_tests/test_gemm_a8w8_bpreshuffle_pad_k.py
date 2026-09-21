@@ -14,6 +14,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class DSLCompileError(Exception):
+    pass
+
+
+DSLCompileError.__module__ = "flydsl.compiler.diagnostics"
+
+
 def test_shuffle_weight_pad_k_to_pads_last_dim():
     weight = torch.zeros((16, 96), device="cuda", dtype=dtypes.fp8)
 
@@ -168,6 +175,83 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch):
     assert seen["config_shape"] == (2, 16, 96)
     assert seen["x_shape"] == (2, 128)
     assert seen["tail_is_zero"]
+
+
+def test_gemm_a8w8_bpreshuffle_flydsl_compile_failure_falls_back_once(
+    monkeypatch,
+):
+    xq = torch.zeros((2, 128), device="cuda", dtype=dtypes.fp8)
+    wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
+    x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
+    w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
+    calls = {"flydsl": 0, "ck": 0}
+
+    monkeypatch.setattr(
+        gemm_mod,
+        "get_GEMM_config_with_quant_type",
+        lambda *_args: {
+            "libtype": "flydsl",
+            "splitK": 0,
+            "kernelName": "broken-a8w8-kernel",
+        },
+    )
+
+    def fail_compile(*_args, **_kwargs):
+        calls["flydsl"] += 1
+        raise DSLCompileError("lld invocation failed")
+
+    def fake_ck(XQ, WQ, x_scale, w_scale, Y, splitK):
+        calls["ck"] += 1
+        return Y
+
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_flydsl", fail_compile)
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
+    gemm_mod._flydsl_compile_failures.clear()
+
+    for _ in range(2):
+        out = gemm_mod.gemm_a8w8_bpreshuffle(
+            xq,
+            wq,
+            x_scale,
+            w_scale,
+            dtype=torch.bfloat16,
+        )
+        assert out.shape == (2, 16)
+    assert calls == {"flydsl": 1, "ck": 2}
+
+
+def test_gemm_a8w8_bpreshuffle_flydsl_runtime_failure_is_not_hidden(
+    monkeypatch,
+):
+    xq = torch.zeros((2, 128), device="cuda", dtype=dtypes.fp8)
+    wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
+    x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
+    w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
+
+    monkeypatch.setattr(
+        gemm_mod,
+        "get_GEMM_config_with_quant_type",
+        lambda *_args: {
+            "libtype": "flydsl",
+            "splitK": 0,
+            "kernelName": "runtime-failure",
+        },
+    )
+    monkeypatch.setattr(
+        gemm_mod,
+        "gemm_a8w8_bpreshuffle_flydsl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("launch failed")),
+    )
+    gemm_mod._flydsl_compile_failures.clear()
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        gemm_mod.gemm_a8w8_bpreshuffle(
+            xq,
+            wq,
+            x_scale,
+            w_scale,
+            dtype=torch.bfloat16,
+        )
 
 
 def test_gemm_a8w8_bpreshuffle_rejects_short_weight_k():

@@ -406,6 +406,55 @@ def test_stable_route_sort_and_task_construction():
     ]
 
 
+def test_route_sort_fuses_global_to_local_expert_mapping():
+    expert_ids = torch.tensor(
+        [0, 4, 5, 7, 5, 4, 2, 6, 5, 7, 4, 1],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    routes = expert_ids.numel()
+    sorted_ids = torch.empty_like(expert_ids)
+    gather = torch.empty_like(expert_ids)
+    scatter = torch.empty_like(expert_ids)
+    capacity = iq2r_task_capacity(routes, 2, 16)
+    tasks = torch.empty((capacity, 3), dtype=torch.int32, device="cuda")
+    task_count = torch.empty((1,), dtype=torch.int32, device="cuda")
+
+    iq2r_route_sort_tasks_out(
+        expert_ids,
+        sorted_ids,
+        gather,
+        scatter,
+        tasks,
+        task_count,
+        expert_count=2,
+        expert_start=4,
+        task_rows=16,
+    )
+
+    local_ids = expert_ids - 4
+    local_ids = torch.where((local_ids >= 0) & (local_ids < 2), local_ids, -1).to(
+        torch.int32
+    )
+    expected_gather = torch.argsort(
+        torch.where(local_ids >= 0, local_ids, 2), stable=True
+    )
+    torch.testing.assert_close(gather, expected_gather.to(torch.int32), rtol=0, atol=0)
+    torch.testing.assert_close(sorted_ids, local_ids[gather.long()], rtol=0, atol=0)
+    torch.testing.assert_close(
+        gather[scatter.long()],
+        torch.arange(routes, dtype=torch.int32, device="cuda"),
+        rtol=0,
+        atol=0,
+    )
+    count = int(task_count.item())
+    assert tasks[:count].cpu().tolist() == [
+        [0, 3, 0],
+        [3, 3, 1],
+        [6, 6, -1],
+    ]
+
+
 @pytest.mark.parametrize("routes", [17, 32, 64, 128, 256, 257])
 def test_route_sort_boundaries(routes):
     expert_count = 128
@@ -566,6 +615,45 @@ def test_direct_low_m_route_gather_quant_builds_identity_tasks():
         output.view(torch.uint8), expected_output.view(torch.uint8), rtol=0, atol=0
     )
     torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+
+def test_direct_low_m_route_fuses_global_to_local_expert_mapping():
+    hidden, _, _ = _inputs(2, seed=0xE4)
+    expert_ids = torch.tensor(
+        [0, 4, 5, 7, 4, 5, 6, 3], dtype=torch.int32, device="cuda"
+    )
+    routes = expert_ids.numel()
+    sorted_ids = torch.empty_like(expert_ids)
+    gather = torch.empty_like(expert_ids)
+    scatter = torch.empty_like(expert_ids)
+    tasks = torch.empty((routes, 3), dtype=torch.int32, device="cuda")
+    task_count = torch.empty((1,), dtype=torch.int32, device="cuda")
+    output = torch.empty((routes, 2880), dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.empty((routes, 90), dtype=torch.uint8, device="cuda")
+
+    iq2r_route_direct_gather_quant_out(
+        hidden,
+        expert_ids,
+        sorted_ids,
+        gather,
+        scatter,
+        tasks,
+        task_count,
+        output,
+        scales,
+        topk=4,
+        expert_count=2,
+        expert_start=4,
+    )
+
+    expected_ids = torch.tensor(
+        [-1, 0, 1, -1, 0, 1, -1, -1], dtype=torch.int32, device="cuda"
+    )
+    identity = torch.arange(routes, dtype=torch.int32, device="cuda")
+    torch.testing.assert_close(sorted_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(gather, identity, rtol=0, atol=0)
+    torch.testing.assert_close(scatter, identity, rtol=0, atol=0)
+    torch.testing.assert_close(tasks[:, 2], expected_ids, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 4])

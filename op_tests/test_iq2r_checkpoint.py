@@ -48,7 +48,16 @@ def test_loader_rejects_wrong_basis(tmp_path):
         load_iq2r_layer_checkpoint(tmp_path, 0, expert_count=1)
 
 
-def test_loads_bias_free_glm_checkpoint_and_slices_experts(tmp_path):
+@pytest.mark.parametrize(
+    ("architecture", "model_type", "nested_config"),
+    [
+        ("Glm5NextForCausalLM", "glm5_next", True),
+        ("GlmMoeDsaForCausalLM", "glm_moe_dsa", False),
+    ],
+)
+def test_loads_bias_free_glm_checkpoint_and_slices_experts(
+    tmp_path, architecture, model_type, nested_config
+):
     experts = 2
     hidden_size = 128
     intermediate_size = 64
@@ -73,25 +82,29 @@ def test_loads_bias_free_glm_checkpoint_and_slices_experts(tmp_path):
         down_keys["tile_n"]: torch.tensor([128], dtype=torch.int32),
     }
     save_file(tensors, tmp_path / "flywheel_model.0.safetensors")
+    dimensions = {
+        "num_hidden_layers": 5,
+        "first_k_dense_replace": 3,
+        "n_routed_experts": experts,
+        "hidden_size": hidden_size,
+        "moe_intermediate_size": intermediate_size,
+    }
     config = {
-        "architectures": ["Glm5NextForCausalLM"],
-        "model_type": "glm5_next",
+        "architectures": [architecture],
+        "model_type": model_type,
         "compiled_tensor_parallel_size": 1,
         "compiled_expert_parallel_size": 1,
         "file_manifest": ["flywheel_model.0.safetensors"],
-        "text_config": {
-            "num_hidden_layers": 5,
-            "first_k_dense_replace": 3,
-            "n_routed_experts": experts,
-            "hidden_size": hidden_size,
-            "moe_intermediate_size": intermediate_size,
-        },
         "iq2r": {
             "format": IQ2R_FORMAT_NAME,
             "version": IQ2R_FORMAT_VERSION,
             "activation_basis": "native",
         },
     }
+    if nested_config:
+        config["text_config"] = dimensions
+    else:
+        config.update(dimensions)
     (tmp_path / "config.json").write_text(json.dumps(config))
 
     loaded = load_iq2r_layer_checkpoint(tmp_path, 3, expert_start=1, expert_count=1)
