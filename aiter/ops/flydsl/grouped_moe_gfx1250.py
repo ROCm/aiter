@@ -828,6 +828,14 @@ def _grouped_a8w4_tdm_moe(
     _is_fp4 = data_format == "fp4"
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
+    _gemm1_a_preshuffle = _is_fp4 and _as_bool(
+        os.environ.get("AITER_FLYDSL_GEMM1_A_PRESHUFFLE"), False
+    )
+    # GEMM2 consumes expert-local grouped rows, so its producer switches layout
+    # independently from the token-once GEMM1 producer.
+    _gemm2_a_preshuffle = _is_fp4 and _as_bool(
+        os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE"), False
+    )
 
     # Bound once, because the quant pass below rebinds a1_scale to the
     # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
@@ -842,6 +850,10 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
+    if _prequantized and _gemm1_a_preshuffle:
+        raise NotImplementedError(
+            "GEMM1 A-preshuffle does not accept a prequantized wire payload"
+        )
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
@@ -869,6 +881,7 @@ def _grouped_a8w4_tdm_moe(
     _compact_ascale = (
         not _compact
         and not _prequantized
+        and not _gemm1_a_preshuffle
         and _ep_nvr is None
         and _use_fused_quant_preshuffle(
             model_dim, wmma_rep, _quant_mode, token_num, topk
@@ -931,6 +944,7 @@ def _grouped_a8w4_tdm_moe(
             out_scale=_compact_ascale_buf,
             row_to_token=_row_to_token,
             ep_psum_params=ep_psum_params,
+            a_preshuffle=_gemm1_a_preshuffle,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -945,7 +959,7 @@ def _grouped_a8w4_tdm_moe(
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = _b1 is None
+    _fuse_quant = (not _is_fp4) and (_b1 is None)
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -998,6 +1012,7 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_preshuffle=_gemm1_a_preshuffle,
             **_situ_kw,
         )
     else:
@@ -1033,8 +1048,26 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_preshuffle=_gemm1_a_preshuffle,
             **_situ_kw,
         )
+        if os.environ.get("AITER_FLYDSL_GEMM1_DEBUG_OUTPUT", "0") == "1":
+            torch.cuda.synchronize()
+            _y = y.float()
+            _bad = ~torch.isfinite(_y)
+            _bad_2d = _bad.reshape(-1, _bad.shape[-1])
+            _bad_rows = torch.nonzero(_bad_2d.any(dim=1), as_tuple=False).flatten()
+            _bad_cols = torch.nonzero(_bad_2d.any(dim=0), as_tuple=False).flatten()
+            print(
+                "[grouped-moe gemm1 debug] "
+                f"shape={tuple(y.shape)} nan={int(torch.isnan(_y).sum())} "
+                f"inf={int(torch.isinf(_y).sum())} finite={int(torch.isfinite(_y).sum())} "
+                f"bad_rows={_bad_rows[:16].cpu().tolist()} "
+                f"bad_cols={_bad_cols[:16].cpu().tolist()}",
+                flush=True,
+            )
+        # Quantize only routed rows. Per-expert padding and the sentinel tail
+        # remain unwritten and are excluded by GEMM2's mn_oob bound.
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
             y,
             1,
@@ -1042,7 +1075,13 @@ def _grouped_a8w4_tdm_moe(
             wmma_rep=wmma_rep2,
             quant_mode=_quant_mode,
             masked_m=None,
-            topids_to_rows=None,
+            topids_to_rows=topids_to_rows,
+            source_topk=0,
+            num_valid_routes=_ep_nvr,
+            a_preshuffle=_gemm2_a_preshuffle,
+            m_tile_map=psum,
+            n_experts=E,
+            expert_tile_m=_align_m,
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
@@ -1074,6 +1113,7 @@ def _grouped_a8w4_tdm_moe(
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=tdm_b_th,
+        a_preshuffle=_gemm2_a_preshuffle,
         **_ep_gemm2_kwargs,
     )
 
@@ -1095,6 +1135,7 @@ def _grouped_a8w4_tdm_moe(
                     prequantized_scale=src_a1_scale if _prequantized else None,
                     out_payload=a1_payload,
                     out_scale=a1_scale,
+                    a_preshuffle=_gemm1_a_preshuffle,
                 ),
             )
         )
@@ -1110,7 +1151,13 @@ def _grouped_a8w4_tdm_moe(
                         wmma_rep=wmma_rep2,
                         quant_mode=_quant_mode,
                         masked_m=None,
-                        topids_to_rows=None,
+                        topids_to_rows=topids_to_rows,
+                        source_topk=0,
+                        num_valid_routes=_ep_nvr,
+                        a_preshuffle=_gemm2_a_preshuffle,
+                        m_tile_map=psum,
+                        n_experts=E,
+                        expert_tile_m=_align_m,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
                     ),
@@ -1151,6 +1198,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        a_preshuffle=_gemm1_a_preshuffle,
                         **_situ_kw,
                     ),
                 )
@@ -1187,6 +1235,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        a_preshuffle=_gemm1_a_preshuffle,
                         **_situ_kw,
                     ),
                 )
@@ -1221,6 +1270,7 @@ def _grouped_a8w4_tdm_moe(
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
+                    a_preshuffle=_gemm2_a_preshuffle,
                 ),
             )
         )
@@ -1536,6 +1586,7 @@ def grouped_gemm_gfx1250_a8w4(
         _ov_nw = _tdm_env("AITER_TDM_N_WARP")
         _ov_mw2 = _tdm_env("AITER_TDM_M_WARP2")
         _ov_nw2 = _tdm_env("AITER_TDM_N_WARP2")
+        _ov_wpt = _tdm_env("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM")
         if any(v is not None for v in (_ov_mw, _ov_nw, _ov_mw2, _ov_nw2)):
             _base_mw = _ov_mw if _ov_mw is not None else _tdm_kw.get("m_warp", 1)
             _base_nw = _ov_nw if _ov_nw is not None else _tdm_kw.get("n_warp", n_warp)
@@ -1543,6 +1594,8 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        if _ov_wpt is not None:
+            _tdm_kw["waves_per_tensor_tdm"] = _ov_wpt
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,
