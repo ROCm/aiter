@@ -256,12 +256,20 @@ def test_mha_v4_bf16fp8_scale_recipe():
             _RawRecipeKind.FP8,
             AttentionPack.V_FOR_FP6_P,
         ),
+        # All-MXFP4 consumes FP6 probabilities against MXFP4 V, so both modes need the repacked V.
         (
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,
             False,
             _RawRecipeKind.MXFP4,
-            AttentionPack.DEFAULT,
+            AttentionPack.V_FOR_FP6_P,
+        ),
+        (
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            True,
+            _RawRecipeKind.MXFP4,
+            AttentionPack.V_FOR_FP6_P,
         ),
         (
             AttentionFormat.MXFP6,
@@ -2696,7 +2704,12 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
     seqlens_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
 
     out = mha_v4(
-        q, k, v, AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16,
+        q,
+        k,
+        v,
+        AttentionFormat.BF16,
+        AttentionFormat.BF16,
+        AttentionFormat.BF16,
         seqlens_k=seqlens_k,
     )
     torch.cuda.synchronize()
@@ -2719,7 +2732,10 @@ def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
 
     dense = mha_v4(q, k, v, *formats)
     full = mha_v4(
-        q, k, v, *formats,
+        q,
+        k,
+        v,
+        *formats,
         seqlens_k=torch.full((2,), 512, device="cuda", dtype=torch.int32),
     )
     torch.cuda.synchronize()
@@ -2731,17 +2747,26 @@ def test_mha_v4_rejects_unusable_seqlens_k():
     formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
     with pytest.raises(ValueError, match="int32"):
-        mha_v4(q, q, q, *formats,
-               seqlens_k=torch.ones(2, device="cuda", dtype=torch.int64))
+        mha_v4(
+            q, q, q, *formats, seqlens_k=torch.ones(2, device="cuda", dtype=torch.int64)
+        )
     with pytest.raises(ValueError, match="one entry per batch"):
-        mha_v4(q, q, q, *formats,
-               seqlens_k=torch.ones(1, device="cuda", dtype=torch.int32))
+        mha_v4(
+            q, q, q, *formats, seqlens_k=torch.ones(1, device="cuda", dtype=torch.int32)
+        )
     with pytest.raises(NotImplementedError, match="per-batch key lengths"):
-        mha_v4(q, q, q, AttentionFormat.INT8, AttentionFormat.INT8,
-               native_fp8_format(),
-               block_mask=torch.ones((2, 4, 1, 256 // mha_v4_kv_tile()),
-                                     device="cuda", dtype=torch.bool),
-               seqlens_k=torch.ones(2, device="cuda", dtype=torch.int32))
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.INT8,
+            AttentionFormat.INT8,
+            native_fp8_format(),
+            block_mask=torch.ones(
+                (2, 4, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+            ),
+            seqlens_k=torch.ones(2, device="cuda", dtype=torch.int32),
+        )
 
 
 if __name__ == "__main__":

@@ -448,7 +448,7 @@ def _resolve_raw_recipe(
             kind == _RawRecipeKind.MXFP6
             and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
         )
-        or kind == _RawRecipeKind.MXFP4
+        or (kind == _RawRecipeKind.MXFP4 and v_format == AttentionFormat.MXFP4)
     )
     v_pack = AttentionPack.V_FOR_FP6_P if uses_fp6_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)
@@ -842,7 +842,9 @@ def mha_v4_packed(
                 "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
             )
         if seqlens_k.dtype != torch.int32 or seqlens_k.device != q.device:
-            raise ValueError("seqlens_k must be an int32 tensor on the same device as Q")
+            raise ValueError(
+                "seqlens_k must be an int32 tensor on the same device as Q"
+            )
         if seqlens_k.numel() < batch:
             raise ValueError("seqlens_k needs one entry per batch")
         if not seqlens_k.is_contiguous():

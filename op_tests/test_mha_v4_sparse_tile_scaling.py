@@ -11,6 +11,7 @@ Lives in its own module so it can be extended without touching test_mha_v4.py.
 import pytest
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
@@ -18,7 +19,6 @@ from aiter.ops.mha_v4 import (
     mha_v4_kv_tile,
     native_fp8_format,
 )
-from aiter.jit.utils.chip_info import get_gfx
 from op_tests.test_mha_v4 import _mha_v4_sparse_co_available
 
 FP8 = native_fp8_format()
@@ -92,14 +92,18 @@ def test_mha_v4_sparse_accuracy_holds_as_tile_count_grows(recipe_name):
     """A row's own small-tile-count accuracy is its baseline; growing the count must not erode it."""
     baseline_out, baseline_ref, _ = _run(recipe_name, BASELINE_TILES)
     baseline = _cosine(baseline_out, baseline_ref)
-    assert torch.isfinite(baseline_out).all(), f"{recipe_name}: non-finite at {BASELINE_TILES} tiles"
+    assert torch.isfinite(
+        baseline_out
+    ).all(), f"{recipe_name}: non-finite at {BASELINE_TILES} tiles"
     assert baseline > ABSOLUTE_FLOOR, f"{recipe_name}: baseline cosine {baseline:.5f}"
 
     for tiles in GROWN_TILES:
         out, ref, _ = _run(recipe_name, tiles)
         assert torch.isfinite(out).all(), f"{recipe_name}: non-finite at {tiles} tiles"
         cosine = _cosine(out, ref)
-        assert cosine > ABSOLUTE_FLOOR, f"{recipe_name}: cosine {cosine:.5f} at {tiles} tiles"
+        assert (
+            cosine > ABSOLUTE_FLOOR
+        ), f"{recipe_name}: cosine {cosine:.5f} at {tiles} tiles"
         assert cosine > baseline - MAX_DEGRADATION, (
             f"{recipe_name}: accuracy degrades with tile count -- "
             f"{baseline:.5f} at {BASELINE_TILES} tiles, {cosine:.5f} at {tiles}"
@@ -114,7 +118,9 @@ def test_mha_v4_sparse_skipping_lut_holds_as_tile_count_grows(recipe_name):
         out, _, mask = _run(recipe_name, tiles, all_true=False)
         assert torch.isfinite(out).all(), f"{recipe_name}: non-finite at {tiles} tiles"
         assert mask.sum() > 0
-        assert not bool((out == 0).all()), f"{recipe_name}: all-zero output at {tiles} tiles"
+        assert not bool(
+            (out == 0).all()
+        ), f"{recipe_name}: all-zero output at {tiles} tiles"
 
 
 @requires_sparse
@@ -133,7 +139,9 @@ def test_mha_v4_sparse_all_true_lut_matches_dense_bitwise(recipe_name):
         k = torch.randn((1, sequence_k, 5, 128), device="cuda", dtype=torch.bfloat16)
         v = torch.randn_like(k)
         mask = torch.ones((1, 5, 1, tiles), device="cuda", dtype=torch.bool)
-        sparse = mha_v4(q, k, v, q_format, q_format, v_format, block_mask=mask, **kwargs)
+        sparse = mha_v4(
+            q, k, v, q_format, q_format, v_format, block_mask=mask, **kwargs
+        )
         dense = mha_v4(q, k, v, q_format, q_format, v_format, **kwargs)
         torch.cuda.synchronize()
         assert torch.equal(sparse, dense), (
