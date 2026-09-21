@@ -847,6 +847,12 @@ gfx950 stayed exact (``err=0``); width-2051 ``L=512`` went
 ``M=512`` was flat (no merge). Distinct from the 8-wide / 64-thread
 and 2-wide / 128-thread merge misses. Keep two-wave scalar merge.
 
+**Do not retry** restoring 64 decode splits for ``M * Hk < 32``.
+That count was already replaced by 32 because merge traffic dominated
+(``M=1`` 24.4 → 20.7 us). Re-measuring it on GPU 6 / gfx950 stayed
+exact (``err=0``) and width-2051 ``L=512`` went 18.65 → 23.26 us at
+``M=1`` and 21.15 → 27.06 us at ``M=8``. Keep 32 decode splits.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
