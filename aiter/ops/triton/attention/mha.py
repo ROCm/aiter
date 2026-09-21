@@ -315,7 +315,12 @@ def _gluon_flash_attn_forward(
         )
 
     if config is None:
-        config = _get_gluon_config(is_fp8=IS_FP8, has_pe=pe_head_dim > 0, causal=causal)
+        config = _get_gluon_config(
+            is_fp8=IS_FP8,
+            has_pe=pe_head_dim > 0,
+            causal=causal,
+            v_head_dim=v_head_dim,
+        )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
     BLOCK_N = config.pop("BLOCK_N")

@@ -23,6 +23,12 @@
       "BLOCK_N": 64,
       "waves_per_eu": 2,
       "num_warps": 8
+    },
+    "pe_narrow_v": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 8
     }
   }
 }

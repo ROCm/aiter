@@ -332,8 +332,8 @@ def _load_v(
 
 
 @gluon.jit
-def _dma_2d(smem, base, offsets, mask, HAS_MASK: gl.constexpr):
-    """One global->LDS DMA tile plus its commit group.
+def _dma_issue(smem, base, offsets, mask, HAS_MASK: gl.constexpr):
+    """Issue one global->LDS DMA tile, WITHOUT closing a commit group.
 
     The copy never passes through VGPRs, so it needs no ``s_waitcnt vmcnt(0)`` and
     no ``ds_write``; the wave issues it and walks away.
@@ -342,6 +342,37 @@ def _dma_2d(smem, base, offsets, mask, HAS_MASK: gl.constexpr):
         cdna4_async.buffer_load_to_shared(smem, base, offsets, mask=mask, other=0.0)
     else:
         cdna4_async.buffer_load_to_shared(smem, base, offsets)
+
+
+@gluon.jit
+def _dma_2d(smem, base, offsets, mask, HAS_MASK: gl.constexpr):
+    """One global->LDS DMA tile plus its commit group."""
+    _dma_issue(smem, base, offsets, mask, HAS_MASK)
+    cdna4_async.commit_group()
+
+
+@gluon.jit
+def _dma_k_group(
+    smemK,
+    smemKpe,
+    k_base,
+    kt_off,
+    kpe_off,
+    k_mask,
+    kpe_mask,
+    HAS_MASK: gl.constexpr,
+    HAS_PE: gl.constexpr,
+):
+    """Stage K and, when present, its PE slice as a SINGLE commit group.
+
+    Grouping them matters: every ``wait_group`` count in the pipeline is expressed
+    in commit groups, so letting the PE slice open its own group would shift all of
+    them.  K and its PE slice are consumed by the same MFMA chain in the same
+    cluster, so there is never a reason to wait for one without the other.
+    """
+    _dma_issue(smemK, k_base, kt_off, k_mask, HAS_MASK)
+    if HAS_PE:
+        _dma_issue(smemKpe, k_base, kpe_off, kpe_mask, kpe_mask is not None)
     cdna4_async.commit_group()
 
 
@@ -393,13 +424,23 @@ def _dma_kv_tile(
         k_mask = None
         v_mask = None
 
-    _dma_2d(smemK.index(slot), k_base, kt_dma_off, k_mask, HAS_MASK)
-    if HAS_PE:
-        if MASK_STEPS:
-            kpe_mask = (start_n + kpe_dma_n)[None, :] < seqlen_k
-            _dma_2d(smemKpe.index(slot), k_base, kpe_dma_off, kpe_mask, True)
-        else:
-            _dma_2d(smemKpe.index(slot), k_base, kpe_dma_off, None, False)
+    # The PE slice has no head-dim padding of its own (the host requires unpadded
+    # powers of two there), so it only ever carries the KV-token mask.
+    if HAS_PE and MASK_STEPS:
+        kpe_mask = (start_n + kpe_dma_n)[None, :] < seqlen_k
+    else:
+        kpe_mask = None
+    _dma_k_group(
+        smemK.index(slot),
+        smemKpe.index(slot) if HAS_PE else smemK.index(slot),
+        k_base,
+        kt_dma_off,
+        kpe_dma_off,
+        k_mask,
+        kpe_mask,
+        HAS_MASK,
+        HAS_PE,
+    )
     _dma_2d(smemV.index(slot), v_base, v_dma_off, v_mask, HAS_MASK)
 
 
@@ -618,12 +659,16 @@ def _pipe_tile(
     p_c,
     alpha_c,
     kt_dot,
+    kpe_dot,
     q_dot,
+    q_pe,
     smemK,
+    smemKpe,
     smemV,
     k_base,
     v_base,
     kt_dma_off,
+    kpe_dma_off,
     v_dma_off,
     k_mask,
     v_mask,
@@ -640,12 +685,21 @@ def _pipe_tile(
     SCALE_ON_Q: gl.constexpr,
     DTYPE: gl.constexpr,
     HAS_MASK: gl.constexpr,
+    HAS_PE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    """One tile of the rotated loop.  Tile ``blk`` owns LDS slot ``CUR``."""
+    """One tile of the rotated loop.  Tile ``blk`` owns LDS slot ``CUR``.
+
+    With a decoupled PE slice the QK chain is two MFMAs into the same accumulator
+    rather than one, and the PE tile rides with K everywhere: staged in the same
+    commit group in ``mem1``, read out of LDS beside it in ``mem2``, consumed beside
+    it in ``dot1``.  It never needs a cluster of its own.
+    """
     with warp_pipeline_stage("dot1"):
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
+        if HAS_PE:
+            qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
         qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)
         acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)
 
@@ -656,8 +710,16 @@ def _pipe_tile(
     cdna4_async.wait_group(1)
     with warp_pipeline_stage("mem1"):
         v_dot = cdna4_async.load_shared_relaxed(smemV.index(CUR), dotV)
-        _dma_2d(
-            smemK.index(NXT), k_base + (blk + 3) * kt_step, kt_dma_off, k_mask, HAS_MASK
+        _dma_k_group(
+            smemK.index(NXT),
+            smemKpe.index(NXT) if HAS_PE else smemK.index(NXT),
+            k_base + (blk + 3) * kt_step,
+            kt_dma_off,
+            kpe_dma_off,
+            k_mask,
+            None,
+            HAS_MASK,
+            HAS_PE,
         )
 
     with warp_pipeline_stage("dot2"):
@@ -667,11 +729,19 @@ def _pipe_tile(
     cdna4_async.wait_group(1)
     with warp_pipeline_stage("mem2"):
         kt_dot = cdna4_async.load_shared_relaxed(smemK.index(CUR), dotK)
+        if HAS_PE:
+            kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(CUR), dotK)
+        else:
+            # A loop-carried value has to be a real tensor in every instantiation,
+            # so without a PE slice this aliases K rather than carrying None.  It
+            # has no consumer, and aliasing rather than duplicating keeps the
+            # allocator from pinning a second live range for it.
+            kpe_dot = kt_dot
         _dma_2d(
             smemV.index(CUR), v_base + (blk + 2) * v_step, v_dma_off, v_mask, HAS_MASK
         )
 
-    return acc, l_i, m_run, p_c, alpha_c, kt_dot
+    return acc, l_i, m_run, p_c, alpha_c, kt_dot, kpe_dot
 
 
 @gluon.jit
@@ -680,11 +750,14 @@ def _attn_fwd_pipelined(
     l_i,
     m_i,
     q_dot,
+    q_pe,
     smemK,
+    smemKpe,
     smemV,
     k_base,
     v_base,
     kt_dma_off,
+    kpe_dma_off,
     v_dma_off,
     k_mask,
     v_mask,
@@ -699,6 +772,7 @@ def _attn_fwd_pipelined(
     SCALE_ON_Q: gl.constexpr,
     DTYPE: gl.constexpr,
     HAS_MASK: gl.constexpr,
+    HAS_PE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BUF_DEPTH: gl.constexpr,
@@ -708,26 +782,64 @@ def _attn_fwd_pipelined(
     ``k_base`` / ``v_base`` point at tile 0 and every tile index is an offset from
     them, so the address VALU stays out of the loop entirely.
     """
+
     # -- Prologue: prime the rotation for tile 0 ---------------------------------
     # Compute all of tile 0's ahead-work (qk[0], m[0], p[0], alpha[0]) and the K
     # registers for tile 1, and stage K[0..2] / V[0..1].  K runs three tiles ahead,
     # so slot 0 is reused for K[2] once tile 0's read is done -- hence the barrier.
     # Commit order K0, V0, K1, K2, V1 leaves {K2, V1} pending, which is the loop's
     # steady-state entry condition.
-    _dma_2d(smemK.index(0), k_base, kt_dma_off, k_mask, HAS_MASK)
+    _dma_k_group(
+        smemK.index(0),
+        smemKpe.index(0) if HAS_PE else smemK.index(0),
+        k_base,
+        kt_dma_off,
+        kpe_dma_off,
+        k_mask,
+        None,
+        HAS_MASK,
+        HAS_PE,
+    )
     _dma_2d(smemV.index(0), v_base, v_dma_off, v_mask, HAS_MASK)
-    _dma_2d(smemK.index(1), k_base + kt_step, kt_dma_off, k_mask, HAS_MASK)
+    _dma_k_group(
+        smemK.index(1),
+        smemKpe.index(1) if HAS_PE else smemK.index(1),
+        k_base + kt_step,
+        kt_dma_off,
+        kpe_dma_off,
+        k_mask,
+        None,
+        HAS_MASK,
+        HAS_PE,
+    )
 
     cdna4_async.wait_group(2)  # K[0] has landed
     kt0 = cdna4_async.load_shared_relaxed(smemK.index(0), dotK)
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
+    if HAS_PE:
+        kpe0 = cdna4_async.load_shared_relaxed(smemKpe.index(0), dotK)
+        qk = gl.amd.cdna4.mfma(q_pe, kpe0, qk)
     qk = gl.amd.cdna4.mfma(q_dot, kt0, qk)
     m_run, p_c, alpha_c = _sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q)
 
     gl.barrier()  # WAR: tile 0's ds_read against K[2]'s write into the same slot
-    _dma_2d(smemK.index(0), k_base + 2 * kt_step, kt_dma_off, k_mask, HAS_MASK)
+    _dma_k_group(
+        smemK.index(0),
+        smemKpe.index(0) if HAS_PE else smemK.index(0),
+        k_base + 2 * kt_step,
+        kt_dma_off,
+        kpe_dma_off,
+        k_mask,
+        None,
+        HAS_MASK,
+        HAS_PE,
+    )
     cdna4_async.wait_group(1)  # K[1] has landed
     kt_dot = cdna4_async.load_shared_relaxed(smemK.index(1), dotK)
+    if HAS_PE:
+        kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(1), dotK)
+    else:
+        kpe_dot = kt_dot
     _dma_2d(smemV.index(1), v_base + v_step, v_dma_off, v_mask, HAS_MASK)
 
     # -- Main loop, unrolled 2x ---------------------------------------------------
@@ -737,19 +849,23 @@ def _attn_fwd_pipelined(
     pairs = (n_full_blocks - 3) // 2
     for pair in range(pairs):
         blk = pair * 2
-        acc, l_i, m_run, p_c, alpha_c, kt_dot = _pipe_tile(
+        acc, l_i, m_run, p_c, alpha_c, kt_dot, kpe_dot = _pipe_tile(
             acc,
             l_i,
             m_run,
             p_c,
             alpha_c,
             kt_dot,
+            kpe_dot,
             q_dot,
+            q_pe,
             smemK,
+            smemKpe,
             smemV,
             k_base,
             v_base,
             kt_dma_off,
+            kpe_dma_off,
             v_dma_off,
             k_mask,
             v_mask,
@@ -766,22 +882,27 @@ def _attn_fwd_pipelined(
             SCALE_ON_Q,
             DTYPE,
             HAS_MASK,
+            HAS_PE,
             BLOCK_M,
             BLOCK_N,
         )
-        acc, l_i, m_run, p_c, alpha_c, kt_dot = _pipe_tile(
+        acc, l_i, m_run, p_c, alpha_c, kt_dot, kpe_dot = _pipe_tile(
             acc,
             l_i,
             m_run,
             p_c,
             alpha_c,
             kt_dot,
+            kpe_dot,
             q_dot,
+            q_pe,
             smemK,
+            smemKpe,
             smemV,
             k_base,
             v_base,
             kt_dma_off,
+            kpe_dma_off,
             v_dma_off,
             k_mask,
             v_mask,
@@ -798,6 +919,7 @@ def _attn_fwd_pipelined(
             SCALE_ON_Q,
             DTYPE,
             HAS_MASK,
+            HAS_PE,
             BLOCK_M,
             BLOCK_N,
         )
@@ -805,19 +927,23 @@ def _attn_fwd_pipelined(
     # An odd count leaves one tile over.  It is always an "even" tile (slots 0/1),
     # because each pair returns the buffers to where they started.
     if (n_full_blocks - 3) % 2 == 1:
-        acc, l_i, m_run, p_c, alpha_c, kt_dot = _pipe_tile(
+        acc, l_i, m_run, p_c, alpha_c, kt_dot, kpe_dot = _pipe_tile(
             acc,
             l_i,
             m_run,
             p_c,
             alpha_c,
             kt_dot,
+            kpe_dot,
             q_dot,
+            q_pe,
             smemK,
+            smemKpe,
             smemV,
             k_base,
             v_base,
             kt_dma_off,
+            kpe_dma_off,
             v_dma_off,
             k_mask,
             v_mask,
@@ -834,6 +960,7 @@ def _attn_fwd_pipelined(
             SCALE_ON_Q,
             DTYPE,
             HAS_MASK,
+            HAS_PE,
             BLOCK_M,
             BLOCK_N,
         )
@@ -847,6 +974,8 @@ def _attn_fwd_pipelined(
     s_nm1 = (nm1 % BUF_DEPTH).to(gl.int32)
 
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
+    if HAS_PE:
+        qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
     qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)
     cdna4_async.wait_group(2)
     v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm3), dotV)
@@ -857,8 +986,12 @@ def _attn_fwd_pipelined(
     _dma_2d(smemV.index(s_nm1), v_base + nm1 * v_step, v_dma_off, v_mask, HAS_MASK)
     cdna4_async.wait_group(2)
     kt_dot = cdna4_async.load_shared_relaxed(smemK.index(s_nm1), dotK)
+    if HAS_PE:
+        kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(s_nm1), dotK)
 
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
+    if HAS_PE:
+        qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
     qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)
     cdna4_async.wait_group(1)
     v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm2), dotV)
@@ -947,8 +1080,9 @@ def _attn_fwd_inner(
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    # Commit groups the DMA path issues per tile: K, V, and the PE slice when on.
-    DMA_GROUPS: gl.constexpr = 3 if HAS_PE else 2
+    # Commit groups the DMA path issues per tile: one for K (carrying the PE slice
+    # with it when present), one for V.
+    DMA_GROUPS: gl.constexpr = 2
 
     if USE_DMA:
         # Prime slot 0, then run one tile ahead: the copy for tile i+1 is in flight
@@ -1786,15 +1920,32 @@ def _attn_fwd(
         v_base += skipped_blocks * BLOCK_N * stride_vn
 
     # The rotated pipeline is a dense-path specialisation: it carries no per-element
-    # masking, no PE slice and no fp8 rescale, so it only takes the configurations
-    # whose full blocks are plain Q@K^T / P@V.  Everything it declines -- and every
-    # masked block in every configuration -- goes to the generic loop below.
+    # masking and no fp8 rescale, so it only takes the configurations whose full
+    # blocks are plain Q@K^T / P@V.  Everything it declines -- and every masked block
+    # in every configuration -- goes to the generic loop below.
+    #
+    # PE is implemented (the slice rides with K: same commit group in mem1, read
+    # beside it in mem2, consumed beside it in dot1) but OFF, because it measures a
+    # net regression.  Interleaved A/B at B=2 S=4096 H=16, both tiles tuned:
+    #
+    #     PE(192/128) full   862 -> 846   -1.9%
+    #     PE(192/128) causal 759 -> 756   -0.3%
+    #     PE(128/64)  full   851 -> 791   -7.1%
+    #     PE(128/64)  causal 710 -> 765   +7.6%
+    #
+    # Not register pressure -- 210 VGPRs, no spills.  The four clusters are balanced
+    # on the assumption that each matrix cluster faces one memory cluster; the PE
+    # slice puts a SECOND MFMA chain in dot1 without giving mem1 any more work to
+    # overlap it with, so dot1 grows and nothing covers the growth.  Making it pay
+    # needs the clusters re-cut around three chains, not a flag flip -- but the flip
+    # is here when that happens.
+    PE_IN_PIPELINE: gl.constexpr = False
     FAST_PATH: gl.constexpr = (
         USE_DMA
         and (not IS_FP8)
-        and (not HAS_PE)
         and (not RETURN_SCORES)
         and SLIDING_WINDOW == 0
+        and (PE_IN_PIPELINE or not HAS_PE)
     )
 
     pipelined = False
@@ -1809,11 +1960,14 @@ def _attn_fwd(
                 l_i,
                 m_i,
                 q,
+                q_pe,
                 smemK,
+                smemKpe,
                 smemV,
                 k_base,
                 v_base,
                 kt_dma_off,
+                kpe_dma_off,
                 v_dma_off,
                 k_head_mask,
                 v_head_mask,
@@ -1828,6 +1982,7 @@ def _attn_fwd(
                 SCALE_ON_Q=SCALE_ON_Q,
                 DTYPE=v_ptr.dtype.element_ty,
                 HAS_MASK=PADDED_HEAD,
+                HAS_PE=HAS_PE,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 BUF_DEPTH=BUF_DEPTH,
@@ -2035,7 +2190,9 @@ def _attn_fwd(
     gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
 
 
-def _get_config(is_fp8: bool, has_pe: bool = False, causal: bool = False):
+def _get_config(
+    is_fp8: bool, has_pe: bool = False, causal: bool = False, v_head_dim: int = 0
+):
     """Tile / wave configuration for one masking + dtype mode.
 
     The MFMA tiling fixes ``BLOCK_M = 32 * num_warps``, so the two knobs move
@@ -2051,6 +2208,14 @@ def _get_config(is_fp8: bool, has_pe: bool = False, causal: bool = False):
     if is_fp8:
         return fwd_cfg["fp8"]
     elif has_pe:
+        # The PE tile is bounded by the accumulator, which is [BLOCK_M, v_head_dim]
+        # fp32 -- v_head_dim/2 VGPRs per lane once BLOCK_M cancels against the wave
+        # count.  A 64-wide V head leaves room for the wide tile and the two waves
+        # per SIMD that go with it; a 128-wide one does not, and forcing it there
+        # spills.  Measured at B=2 S=4096 H=16: PE(128/64) 675 -> 915 TFLOPS on the
+        # wide tile, while PE(192/128) drops 851 -> 723.
+        if v_head_dim and v_head_dim <= 64 and "pe_narrow_v" in fwd_cfg:
+            return fwd_cfg["pe_narrow_v"]
         return fwd_cfg["pe"]
     elif causal and "causal" in fwd_cfg:
         return fwd_cfg["causal"]
