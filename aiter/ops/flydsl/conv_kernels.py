@@ -122,6 +122,18 @@ TUNED_KEY_COLUMNS = (
 TUNED_RESULT_COLUMNS = ("tile_m", "tile_n", "wave_m", "wave_n", "wgm")
 TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 
+# Which implementation a row's config belongs to, as `libtype` does for the GEMM
+# tables. It is a *result*, not part of the key: a tuner picks the fastest
+# candidate across whatever backends it knows and records whose config it wrote,
+# so one shape still owns one row.
+#
+# Optional on read. FlyDSL is the only conv3d backend today, so a table without
+# the column -- or with the cell left empty -- is read as all-FlyDSL, and rows
+# naming anything else are skipped rather than handed to a dispatch that cannot
+# run them.
+TUNED_LIBTYPE_COLUMN = "libtype"
+LIBTYPE_FLYDSL = "flydsl"
+
 _MATMUL_FAST_PATH_INT_COLS = (
     "groups",
     "kT",
@@ -340,8 +352,21 @@ def _load_tuned_table():
             )
             return {}
 
+        # Absent on a pre-libtype table, which was FlyDSL-only by construction.
+        has_libtype = TUNED_LIBTYPE_COLUMN in df.columns
+        skipped_libtypes = {}
+
         table = {}
         for row in df.itertuples(index=False):
+            if has_libtype:
+                # An empty cell reads back as NaN, and str(NaN) is the truthy
+                # "nan" -- which would look like a backend named nan and drop a
+                # row the caller meant as FlyDSL.
+                raw_libtype = getattr(row, TUNED_LIBTYPE_COLUMN, None)
+                libtype = "" if pd.isna(raw_libtype) else str(raw_libtype).strip()
+                if libtype and libtype != LIBTYPE_FLYDSL:
+                    skipped_libtypes[libtype] = skipped_libtypes.get(libtype, 0) + 1
+                    continue
             key = (str(row.gfx).strip(), int(row.cu_num)) + tuple(
                 (
                     _parse_tuned_bool(getattr(row, c))
@@ -370,6 +395,17 @@ def _load_tuned_table():
                 ),
                 int(row.wgm),
                 splitk,
+            )
+        if skipped_libtypes:
+            from aiter import logger
+
+            logger.info(
+                f"conv3d_implicit: tuned config {path} holds rows for backends this "
+                "dispatch does not serve, skipped: "
+                + ", ".join(
+                    f"{n} x {TUNED_LIBTYPE_COLUMN}={lt}"
+                    for lt, n in sorted(skipped_libtypes.items())
+                )
             )
         return table
     except Exception as exc:  # noqa: BLE001  a bad config table must never break a conv

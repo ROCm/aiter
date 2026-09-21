@@ -91,7 +91,9 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.conv_kernels import (
     AITER_CONV3D_DYN_HW,
+    LIBTYPE_FLYDSL,
     TUNED_KEY_COLUMNS,
+    TUNED_LIBTYPE_COLUMN,
     TUNED_RESULT_COLUMNS,
     _dispatch,
     _dyn_hw_ok,
@@ -125,6 +127,12 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         for raw in csv.DictReader(f):
             row = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
+            # Only FlyDSL rows describe something this module can compile. The
+            # column is optional and an empty cell means FlyDSL, so a
+            # pre-libtype table still yields every row.
+            libtype = row.get(TUNED_LIBTYPE_COLUMN, "")
+            if libtype and libtype != LIBTYPE_FLYDSL:
+                continue
             missing = [c for c in (*_INT_COLS, *_CONFIG_COLS) if c not in row]
             if missing:
                 print(f"  [WARN] {csv_path}: missing columns {missing}, skipping row")

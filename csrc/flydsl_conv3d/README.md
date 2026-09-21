@@ -60,9 +60,17 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
 
    Results carry the tuning device plus the chosen config:
 
-    |**gfx**|**cu_num**|*(the 20 key columns)*|**tile_m**|**tile_n**|**wave_m**|**wave_n**|**wgm**|**splitK**|**us**|**kernelName**|**err_ratio**|**tflops**|**bw**|
-    |-------|----------|----------------------|----------|----------|----------|----------|-------|----------|------|--------------|-------------|----------|------|
-    |gfx950 |256       |...                   |96        |96        |2         |3         |1      |1         |137.3024|conv3d_implicit_t96x96_w2x3_g1|0.0|39.59|1512.16|
+    |**gfx**|**cu_num**|*(the 20 key columns)*|**libtype**|**tile_m**|**tile_n**|**wave_m**|**wave_n**|**wgm**|**splitK**|**us**|**kernelName**|**err_ratio**|**tflops**|**bw**|
+    |-------|----------|----------------------|-----------|----------|----------|----------|----------|-------|----------|------|--------------|-------------|----------|------|
+    |gfx950 |256       |...                   |flydsl     |96        |96        |2         |3         |1      |1         |137.3024|conv3d_implicit_t96x96_w2x3_g1|0.0|39.59|1512.16|
+
+   `libtype` names the implementation the rest of the row configures, as it does
+   in the GEMM tables. It is a result rather than part of the key: a tuner picks
+   the fastest candidate across the backends it knows and records whose config it
+   wrote, so one shape still owns one row. FlyDSL is the only conv3d backend
+   today, so this tuner always writes `flydsl`; the runtime and the AOT pass skip
+   rows naming anything else, and read a table without the column -- or with the
+   cell empty -- as all-FlyDSL.
 
 4. Check the result and its coverage:
 

@@ -51,8 +51,10 @@ from aiter.ops.flydsl.conv3d_policy import (
     tile_kernel_name,
 )
 from aiter.ops.flydsl.conv_kernels import (
+    LIBTYPE_FLYDSL,
     TUNED_DEVICE_COLUMNS,
     TUNED_KEY_COLUMNS,
+    TUNED_LIBTYPE_COLUMN,
     TUNED_RESULT_COLUMNS,
     _is_matmul_fast_path,
     _pad_channels,
@@ -67,6 +69,9 @@ SHAPE_KEYS = list(TUNED_KEY_COLUMNS)
 KEYS = [*TUNED_DEVICE_COLUMNS, *SHAPE_KEYS]
 
 RESULT_LIST = [
+    # Ahead of the config columns it qualifies, where the GEMM tables put it.
+    # This tuner only enumerates FlyDSL candidates, so it always writes that.
+    TUNED_LIBTYPE_COLUMN,
     *TUNED_RESULT_COLUMNS,
     "splitK",
     "us",
@@ -394,6 +399,7 @@ class Conv3dTuner(TunerCommon):
             row = dict(zip(self.keys, keys))
             row.update(
                 {
+                    TUNED_LIBTYPE_COLUMN: LIBTYPE_FLYDSL,
                     "tile_m": tile_m,
                     "tile_n": tile_n,
                     "wave_m": wave_m,
