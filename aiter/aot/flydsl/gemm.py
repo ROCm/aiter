@@ -625,6 +625,7 @@ def _compile_mxfp8_128_wmma_to_cache(
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
+    c_store_nt: bool = False,
     **kwargs,
 ):
     del kwargs
@@ -674,7 +675,6 @@ def _compile_mxfp8_128_wmma_to_cache(
             True,
         )
         compute_bound = is_compute_wmma_kernel_name(kernel_name)
-        launch = launch_gemm_a8w8_256x256 if compute_bound else launch_gemm_a8w8
         check_persistent_n_tiles(
             persistent_n_tiles, n, tile_n, cluster_n, split_k, compute_bound
         )
@@ -690,7 +690,7 @@ def _compile_mxfp8_128_wmma_to_cache(
                 cb_args = variant_args[:12] + (_ptr_view_safe(out),) + variant_args[12:]
                 bounds = (False, True) if fused else (row_bounded,)
                 for bounded_m in bounds:
-                    launch(
+                    launch_gemm_a8w8_256x256(
                         *cb_args,
                         SCALE_BLOCK_SIZE,
                         split_k,
@@ -698,9 +698,10 @@ def _compile_mxfp8_128_wmma_to_cache(
                         persistent_n_tiles,
                         fused,
                         bounded_m,
+                        c_store_nt,
                     )
             else:
-                launch(
+                launch_gemm_a8w8(
                     *variant_args,
                     SCALE_BLOCK_SIZE,
                     split_k,

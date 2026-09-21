@@ -359,7 +359,24 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
             specialization_key=specialization,
         )
     else:
-        _launch_gemm_a8w8(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
+        generic_spec = launch_args[12:22] + (
+            BLOCK_K,
+            split_k,
+            False,  # batched
+            0,  # preload_ks
+            a_preshuffle,
+        )
+        _run_compiled(
+            _launch_gemm_a8w8,
+            *launch_args,
+            BLOCK_K,
+            split_k,
+            False,
+            0,
+            1,  # batch (runtime)
+            a_preshuffle,
+            specialization_key=generic_spec,
+        )
     if partials is not None and not fused:
         dense = ldc == N
         _run_compiled(
