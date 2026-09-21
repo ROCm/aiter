@@ -119,7 +119,6 @@ class _UpProjection(torch.autograd.Function):
         I = I_full // 2 if is_glu_activation else I_full
         TK = total_expert_freq
 
-        # Compute each expert's up projection in grouped layout.
         h = torch.empty(TK, I_full, dtype=x.dtype, device=x.device)
         grouped_gemm(
             x,
@@ -203,7 +202,6 @@ class _UpProjection(torch.autograd.Function):
             grouped_weight_layout=ctx.grouped_weight_layout,
         )
 
-        # Compute dW1 as grouped x.T @ dh.
         grouped_gemm(
             x,
             dh,
@@ -270,7 +268,6 @@ class _DownProjection(torch.autograd.Function):
                 )
             gemm_w2 = w2.permute(2, 1, 0)
 
-        # Compute each expert's down projection.
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
         grouped_gemm(a, gemm_w2, expert_frequency_offset, out=y, bias=b2)
 
@@ -352,7 +349,6 @@ class _DownProjection(torch.autograd.Function):
             concat_layout=ctx.concat_layout,
         )
 
-        # Compute dW2 as grouped activation.T @ routed output gradient.
         s = topk_scores[s_scatter_idx]
         dout_gathered = dout[x_gather_idx]
         dy = dout_gathered * s.unsqueeze(-1)
@@ -379,14 +375,13 @@ def moe_TC_softmax_topk_layer(
     w2: torch.Tensor,
     b2: torch.Tensor | None,
     K: int,
-    stream_id: int,
+    _stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del stream_id
     assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None))
     E = router_w.size(0)
     router_logits = F.linear(x, router_w)
@@ -468,13 +463,12 @@ def moe_general_routing_inputs(
     w2: torch.Tensor,
     b2: torch.Tensor | None,
     E: int,
-    stream_id: int,
+    _stream_id: int,
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
     grouped_weight_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del stream_id
     assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None))
 
     T = x.size(0)
@@ -555,15 +549,13 @@ def moe_pre_routed_inputs(
     b1: torch.Tensor | None,
     w2: torch.Tensor,
     b2: torch.Tensor | None,
-    stream_id: int,
+    _stream_id: int,
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
     grouped_weight_layout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run SonicMoE on expert-major tokens from an all-to-all dispatcher."""
-    del stream_id
-
     T = x.size(0)
     if router_scores.numel() != T:
         raise ValueError(
