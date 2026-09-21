@@ -3301,7 +3301,7 @@ def _flash_attn_varlen_backward(
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 256 and hdim_q % 8 == 0
+        ret &= (hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0) or hdim_q == 256
         ret &= not swa
         if hdim_q == 256:
             ret &= not causal
