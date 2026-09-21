@@ -206,7 +206,7 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
 // that function's own note), so it could go there too, but that is a separate
 // claim about a path this work is meant to leave alone.
 template<typename T, typename S>
-OPUS_D int sf_scale_word(S scale) {
+__attribute__((always_inline)) OPUS_D int sf_scale_word(S scale) {
     if constexpr (T::SF_PER_MFMA_K == 1) {
         return pack_e8m0x4(scale);
     } else {
@@ -225,8 +225,15 @@ OPUS_D int sf_scale_word(S scale) {
 // many instructions say them. Splitting on SF_PER_MFMA_K keeps that case the
 // single b32 over the tile's contiguous K-scale run it has always been, rather
 // than letting a general per-MFMA form turn it into COM_REP_K byte loads.
+// always_inline, not merely OPUS_D's `inline`: leaving the decision to the
+// compiler let it keep this as a call in the highest-pressure kids and shift
+// their register allocation enough to trip clang 22's "operand has incorrect
+// register class" on kid326, a 128 kernel this work is supposed to leave
+// untouched. The code these emit inline is what the call sites used to hold
+// verbatim, so forcing that back is restoring the old shape, not tuning.
 template<typename T, int NG, typename Mem, typename VSFB>
-OPUS_D void load_sfb_lane(Mem& mem, int row_base, int lane_k, VSFB& v_sfb) {
+__attribute__((always_inline)) OPUS_D void
+load_sfb_lane(Mem& mem, int row_base, int lane_k, VSFB& v_sfb) {
     constexpr int slot = NG * T::SF_LANE_SCALES_PER_BK;
     if constexpr (T::SF_PER_MFMA_K == 1) {
         auto sfb = opus::load<T::SF_LANE_SCALES_PER_BK>(mem, row_base);
