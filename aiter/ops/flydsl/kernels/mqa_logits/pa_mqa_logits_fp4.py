@@ -28,6 +28,7 @@ MFMA_M = 16
 MFMA_N = 16
 WARP_SIZE = 64
 DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
+DIRECT_BLOCK32_CTA_LIMIT = 1024
 
 
 def _default_decode_config(
@@ -710,14 +711,26 @@ def flydsl_pa_mqa_logits_fp4(
     if next_n < 1 or batch_size < 1 or max_seq_len < 1:
         raise ValueError("batch_size, next_n, and max_seq_len must be positive.")
     if block_k is None and num_warps is None:
-        block_k, num_warps = _default_decode_config(
-            batch_size,
-            next_n,
-            heads,
-            head_dim,
-            max_seq_len,
-            kv_block_size,
+        block32_ctas = batch_size * next_n * triton.cdiv(max_seq_len, 32)
+        use_direct_block32 = (
+            cta_info is None
+            and (parallel_unit_num is None or parallel_unit_num >= block32_ctas)
+            and heads in (64, 128)
+            and head_dim == 128
+            and kv_block_size in (64, 128)
+            and block32_ctas <= DIRECT_BLOCK32_CTA_LIMIT
         )
+        if use_direct_block32:
+            block_k, num_warps = 32, 2
+        else:
+            block_k, num_warps = _default_decode_config(
+                batch_size,
+                next_n,
+                heads,
+                head_dim,
+                max_seq_len,
+                kv_block_size,
+            )
     elif block_k is None:
         block_k = 64 * num_warps
     elif num_warps is None:
@@ -755,6 +768,21 @@ def flydsl_pa_mqa_logits_fp4(
     head_waves = min(num_warps, 4, triton.next_power_of_2(triton.cdiv(heads, 32)))
     while head_waves > 1 and (head_waves not in (1, 2, 4) or num_warps % head_waves):
         head_waves //= 2
+    direct_kv = (
+        schedule_internal
+        and block_k in (32, 64)
+        and head_dim == 128
+        and heads in (64, 128)
+        and num_warps == head_waves
+        and direct_chunks * block_k >= max_seq_len
+    )
+    if direct_kv and block_k == 32:
+        scalar_weights = heads == 64 and total_ctas >= 128
+    elif direct_kv:
+        scalar_weights = heads == 128 or total_ctas >= 128
+    else:
+        scalar_weights = total_ctas >= 768
+    direct_keep_local = direct_kv and block_k == 64 and heads == 64 and scalar_weights
     launcher, _ = compile_pa_mqa_logits_fp4_decode(
         block_k=block_k,
         kv_block_size=kv_block_size,
@@ -763,7 +791,12 @@ def flydsl_pa_mqa_logits_fp4(
         block_table_stride=block_tables.stride(0),
         num_warps=num_warps,
         head_waves=head_waves,
-        scalar_weights=total_ctas >= 768,
+        scalar_weights=scalar_weights,
+        direct_kv=direct_kv,
+        direct_token_split=direct_kv and block_k == 32,
+        direct_grid_2d=direct_kv,
+        direct_page_fast=direct_kv,
+        direct_keep_local=direct_keep_local,
         next_n=next_n,
         heads=heads,
         head_dim=head_dim,

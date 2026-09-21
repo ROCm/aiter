@@ -33,6 +33,11 @@ def compile_pa_mqa_logits_fp4_decode(
     stages=2,
     mfma_m=32,
     scalar_weights=False,
+    direct_kv=False,
+    direct_token_split=False,
+    direct_grid_2d=False,
+    direct_page_fast=False,
+    direct_keep_local=False,
     direct_chunks=0,
     max_seq_len=0,
 ):
@@ -43,29 +48,73 @@ def compile_pa_mqa_logits_fp4_decode(
     if head_waves not in (1, 2, 4) or num_warps % head_waves:
         raise ValueError("head_waves must divide num_warps.")
     token_waves = num_warps // head_waves
-    if block_k % (token_waves * 64):
-        raise ValueError("Each token wave must own complete 64-token fragments.")
+    fragment_tokens = 32 if direct_token_split else 64
+    if block_k % (token_waves * fragment_tokens):
+        raise ValueError(
+            f"Each token wave must own complete {fragment_tokens}-token fragments."
+        )
     if stages not in (1, 2):
         raise ValueError("Supported LDS stage counts are one and two.")
 
-    fragments = block_k // (token_waves * 64)
+    fragments = block_k // (token_waves * fragment_tokens)
     if mfma_m not in (16, 32):
         raise ValueError("MFMA M must be 16 or 32.")
     mfma_k = 128 if mfma_m == 16 else 64
     acc_elements = mfma_m * mfma_m // 64
-    n_tiles = 64 // mfma_m
+    n_tiles = fragment_tokens // mfma_m
     head_tiles = (heads + mfma_m * head_waves - 1) // (mfma_m * head_waves)
     k_tiles = head_dim // 128
     k_steps = head_dim // mfma_k
     qs_words = (heads // 16 + 3) // 4
     single_chunk = direct_chunks > 0 and direct_chunks * block_k >= max_seq_len
+    if direct_token_split and not (
+        direct_kv
+        and mfma_m == 32
+        and block_k == token_waves * 32
+        and fragments == 1
+    ):
+        raise ValueError(
+            "The 32-token split requires one direct MFMA32 tile per token wave."
+        )
+    if direct_grid_2d and direct_chunks <= 0:
+        raise ValueError("The 2D grid requires a direct chunk schedule.")
+    if direct_page_fast and not (
+        direct_kv
+        and block_k in (32, 64)
+        and kv_block_size % block_k == 0
+    ):
+        raise ValueError(
+            "Fast page addressing requires direct block32/block64 decode "
+            "with an integral number of chunks per KV page."
+        )
+    if direct_kv and not (
+        single_chunk
+        and block_k in (32, 64)
+        and head_dim == 128
+        and mfma_m == 32
+        and (head_waves >= 2 or direct_token_split)
+    ):
+        raise ValueError(
+            "Specialized D128 path requires direct single-chunk MFMA32 decode "
+            "with at least two head waves."
+        )
     storage_stages = 1 if single_chunk else stages
     kv_stage_bytes = block_k * head_dim // 2
     scales_per_fragment = k_tiles * 4 * kv_block_size
     scale_stage_bytes = token_waves * fragments * scales_per_fragment
-    scales_base = storage_stages * kv_stage_bytes
-    partial_base = scales_base + storage_stages * scale_stage_bytes
-    lds_bytes = partial_base + (head_waves * block_k * 4 if head_waves > 1 else 0)
+    if direct_kv:
+        scales_base = 0
+        partial_base = 0
+    else:
+        scales_base = storage_stages * kv_stage_bytes
+        partial_base = scales_base + storage_stages * scale_stage_bytes
+    partial_waves = (
+        head_waves - 1 if direct_kv and direct_keep_local else head_waves
+    )
+    lds_bytes = max(
+        16,
+        partial_base + (partial_waves * block_k * 4 if head_waves > 1 else 0),
+    )
 
     @flyc.kernel
     def pa_mqa_logits_fp4_decode_kernel(
@@ -83,14 +132,18 @@ def compile_pa_mqa_logits_fp4_decode(
             fx.Int64(fx.ptrtoint(fx.get_iter(info)))
         )
         if const_expr(direct_chunks > 0):
-            row = fx.Int32(gpu.block_idx.x) // fx.Int32(direct_chunks)
+            if const_expr(direct_grid_2d):
+                row = fx.Int32(gpu.block_idx.y)
+                split = fx.Int32(gpu.block_idx.x)
+            else:
+                row = fx.Int32(gpu.block_idx.x) // fx.Int32(direct_chunks)
+                split = fx.Int32(gpu.block_idx.x) % fx.Int32(direct_chunks)
             batch = row // fx.Int32(next_n)
             row_in_batch = row % fx.Int32(next_n)
             context = fx.Int32(buffer_ops.buffer_load(
                 info_rsrc, batch,
                 vec_width=1, dtype=fx.Int32, is_scalar=True,
             ))
-            split = fx.Int32(gpu.block_idx.x) % fx.Int32(direct_chunks)
             if const_expr(single_chunk):
                 start = split
                 count = fx.Int32(1)
@@ -440,32 +493,264 @@ def compile_pa_mqa_logits_fp4_decode(
                             buffer_ops.buffer_store(total * weight_scale, out_rsrc,
                                                     (start + chunk) * fx.Int32(block_k) + token_local)
 
-            issue_stage(fx.Int32(0), fx.Int32(0))
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
-            initial = load_stage(fx.Int32(0), fx.Int32(0))
-            for chunk_idx, values in range(
-                0, fx.Int64(count - fx.Int32(1)), 1, init=initial,
-            ):
-                chunk = fx.Int32(chunk_idx)
-                stage = chunk & fx.Int32(stages - 1)
-                # LLVM conservatively waits for all buffer-to-LDS traffic
-                # before LDS reads. Finish current reads before starting the
-                # next DMA, leaving MFMA and reduction to hide its latency.
-                rocdl.s_waitcnt(lgkmcnt=0)
-                rocdl.sched_barrier(0)
-                issue_stage(
-                    chunk + fx.Int32(1),
-                    (stage + fx.Int32(1)) & fx.Int32(stages - 1),
-                )
-                compute_stage(chunk, values)
-                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+            if const_expr(direct_kv):
+                direct_totals = []
+                for frag in range_constexpr(fragments):
+                    fragment = token_wave * fx.Int32(fragments) + fx.Int32(frag)
+                    token_local = fragment * fx.Int32(fragment_tokens)
+                    token_global = start * fx.Int32(block_k) + token_local
+                    if const_expr(direct_page_fast):
+                        chunks_per_page = kv_block_size // block_k
+                        page_index = start >> fx.Int32(
+                            chunks_per_page.bit_length() - 1
+                        )
+                        page_base = (
+                            start & fx.Int32(chunks_per_page - 1)
+                        ) * fx.Int32(block_k)
+                    else:
+                        page_index = fx.Int32(
+                            fx.Uint32(token_global)
+                            >> fx.Uint32(kv_block_size.bit_length() - 1)
+                        )
+                        page_base = token_global & fx.Int32(kv_block_size - 1)
+                    phys = fx.Int32(buffer_ops.buffer_load(
+                        bt_rsrc,
+                        page_index,
+                        vec_width=1,
+                        dtype=fx.Int32,
+                        is_scalar=True,
+                    ))
+                    kv_direct_rsrc = resource(
+                        kv,
+                        fx.Int64(phys) * fx.Int64(kv_page_stride),
+                        (
+                            fx.Int32(kv_block_size * head_dim // 2)
+                            if const_expr(direct_page_fast)
+                            else (token_global < context).select(
+                                fx.Int32(kv_block_size * head_dim // 2),
+                                fx.Int32(0),
+                            )
+                        ),
+                    )
+                    scale_direct_rsrc = resource(
+                        kvs,
+                        fx.Int64(phys) * fx.Int64(kv_scale_page_stride),
+                        (
+                            fx.Int32(scales_per_fragment)
+                            if const_expr(direct_page_fast)
+                            else (token_global < context).select(
+                                fx.Int32(scales_per_fragment), fx.Int32(0)
+                            )
+                        ),
+                    )
+                    accs = [
+                        [zero for _ in range(head_tiles)]
+                        for _ in range(n_tiles)
+                    ]
+                    for ks in range_constexpr(k_steps):
+                        for nt in range_constexpr(n_tiles):
+                            page_token = (
+                                page_base
+                                + (
+                                    token_local
+                                    if const_expr(direct_page_fast)
+                                    else fx.Int32(0)
+                                )
+                                + fx.Int32(nt * mfma_m)
+                                + lane_m
+                            )
+                            plane = fx.Int32(ks * 2) + lane_k
+                            b_offset = (
+                                plane * fx.Int32(kv_block_size * 4)
+                                + page_token * fx.Int32(4)
+                            )
+                            b_vec = fx.Vector(buffer_ops.buffer_load(
+                                kv_direct_rsrc,
+                                b_offset,
+                                vec_width=4,
+                                dtype=fx.Int32,
+                            ))
+                            scale_offset = (
+                                plane * fx.Int32(kv_block_size // 4)
+                                + (
+                                    page_token
+                                    & fx.Int32(kv_block_size // 4 - 1)
+                                )
+                            )
+                            scale_word = fx.Int32(buffer_ops.buffer_load(
+                                scale_direct_rsrc,
+                                scale_offset,
+                                vec_width=1,
+                                dtype=fx.Int32,
+                            ))
+                            scale_shift = (
+                                page_token
+                                >> fx.Int32(kv_block_size.bit_length() - 3)
+                            ) * fx.Int32(8)
+                            scale_b = fx.Int32(
+                                fx.Uint32(scale_word) >> fx.Uint32(scale_shift)
+                            )
+                            b_reg = fx.make_rmem_tensor(4, fx.Int32)
+                            b_reg.store(b_vec)
+                            for mi in range_constexpr(head_tiles):
+                                c_reg = fx.make_rmem_tensor(
+                                    acc_elements, fx.Float32
+                                )
+                                c_reg.store(accs[nt][mi])
+                                fx.gemm(
+                                    mfma,
+                                    c_reg,
+                                    q_fragments[mi][ks],
+                                    b_reg,
+                                    c_reg,
+                                    scale_a=q_scales[mi][ks],
+                                    scale_b=scale_b,
+                                )
+                                accs[nt][mi] = c_reg.load()
+
+                    sums = []
+                    for nt in range_constexpr(n_tiles):
+                        total = fx.Float32(0.0)
+                        for mi in range_constexpr(head_tiles):
+                            relu = fx.maxnumf(
+                                accs[nt][mi],
+                                zero,
+                                fastmath=fx.arith.FastMathFlags.nnan,
+                            )
+                            for elem in range_constexpr(acc_elements):
+                                w = weight_fragments[mi][elem // 4][elem % 4]
+                                total = fx.fma(relu[elem], w, total)
+                        sums.append(total)
+
+                    if const_expr(n_tiles == 2):
+                        total = finish_pair(sums[0], sums[1])
+                        token_offset = lane
+                        writer = fx.Boolean(True)
+                    else:
+                        total = finish_pair(sums[0], sums[0])
+                        token_offset = lane_m
+                        writer = lane < fx.Int32(mfma_m)
+                    if const_expr(head_waves > 1 and direct_keep_local):
+                        direct_totals.append(total)
+                    if writer:
+                        if const_expr(head_waves > 1):
+                            if const_expr(direct_keep_local):
+                                if head_wave > fx.Int32(0):
+                                    offset = (
+                                        fx.Int32(partial_base // 4)
+                                        + (head_wave - fx.Int32(1))
+                                        * fx.Int32(block_k)
+                                        + token_local
+                                        + token_offset
+                                    )
+                                    view = fx.make_view(
+                                        fx.add_offset(lds_f32, offset),
+                                        scalar_layout,
+                                    )
+                                    reg = fx.make_rmem_tensor(1, fx.Float32)
+                                    reg.store(
+                                        fx.Vector.from_elements(
+                                            [total], dtype=fx.Float32
+                                        )
+                                    )
+                                    fx.copy(copy_float, reg, view)
+                            else:
+                                offset = (
+                                    fx.Int32(partial_base // 4)
+                                    + head_wave * fx.Int32(block_k)
+                                    + token_local
+                                    + token_offset
+                                )
+                                view = fx.make_view(
+                                    fx.add_offset(lds_f32, offset), scalar_layout
+                                )
+                                reg = fx.make_rmem_tensor(1, fx.Float32)
+                                reg.store(
+                                    fx.Vector.from_elements(
+                                        [total], dtype=fx.Float32
+                                    )
+                                )
+                                fx.copy(copy_float, reg, view)
+                        else:
+                            buffer_ops.buffer_store(
+                                total * weight_scale,
+                                out_rsrc,
+                                start * fx.Int32(block_k)
+                                + token_local
+                                + token_offset,
+                            )
+
+                if const_expr(head_waves > 1):
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                    gpu.barrier()
+                    if head_wave == fx.Int32(0):
+                        for frag in range_constexpr(fragments):
+                            fragment = (
+                                token_wave * fx.Int32(fragments)
+                                + fx.Int32(frag)
+                            )
+                            if const_expr(n_tiles == 2):
+                                token_local = (
+                                    fragment * fx.Int32(fragment_tokens) + lane
+                                )
+                                writer = fx.Boolean(True)
+                            else:
+                                token_local = (
+                                    fragment * fx.Int32(fragment_tokens) + lane_m
+                                )
+                                writer = lane < fx.Int32(mfma_m)
+                            if writer:
+                                total = (
+                                    direct_totals[frag]
+                                    if const_expr(direct_keep_local)
+                                    else fx.Float32(0.0)
+                                )
+                                first_lds_wave = 1 if direct_keep_local else 0
+                                for hw in range_constexpr(
+                                    first_lds_wave, head_waves
+                                ):
+                                    offset = (
+                                        fx.Int32(partial_base // 4)
+                                        + fx.Int32(
+                                            (hw - first_lds_wave) * block_k
+                                        )
+                                        + token_local
+                                    )
+                                    total = total + lds_load1(offset).bitcast(
+                                        fx.Float32
+                                    )
+                                buffer_ops.buffer_store(
+                                    total * weight_scale,
+                                    out_rsrc,
+                                    start * fx.Int32(block_k) + token_local,
+                                )
+            else:
+                issue_stage(fx.Int32(0), fx.Int32(0))
+                rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
-                results = yield load_stage(
-                    chunk + fx.Int32(1), (stage + fx.Int32(1)) & fx.Int32(stages - 1),
-                )
-            last = count - fx.Int32(1)
-            compute_stage(last, results)
+                initial = load_stage(fx.Int32(0), fx.Int32(0))
+                for chunk_idx, values in range(
+                    0, fx.Int64(count - fx.Int32(1)), 1, init=initial,
+                ):
+                    chunk = fx.Int32(chunk_idx)
+                    stage = chunk & fx.Int32(stages - 1)
+                    # Finish LDS reads before the next DMA so its latency can
+                    # overlap the current MFMA and reduction.
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                    rocdl.sched_barrier(0)
+                    issue_stage(
+                        chunk + fx.Int32(1),
+                        (stage + fx.Int32(1)) & fx.Int32(stages - 1),
+                    )
+                    compute_stage(chunk, values)
+                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                    gpu.barrier()
+                    results = yield load_stage(
+                        chunk + fx.Int32(1),
+                        (stage + fx.Int32(1)) & fx.Int32(stages - 1),
+                    )
+                last = count - fx.Int32(1)
+                compute_stage(last, results)
 
         if (count > fx.Int32(0)) & (start * fx.Int32(block_k) < context):
             run_active()
@@ -474,8 +759,24 @@ def compile_pa_mqa_logits_fp4_decode(
     def launch(out, q, qs, kv, kvs, bt, weights, info,
                out_stride: fx.Int32, weight_scale: fx.Float32,
                grid: fx.Int32, stream: fx.Stream):
-        pa_mqa_logits_fp4_decode_kernel(
+        kernel = pa_mqa_logits_fp4_decode_kernel(
             out, q, qs, kv, kvs, bt, weights, info, out_stride, weight_scale,
-        ).launch(grid=(fx.Int64(grid),), block=(num_warps * 64, 1, 1), stream=stream)
+        )
+        if const_expr(direct_grid_2d):
+            kernel.launch(
+                grid=(
+                    fx.Int64(direct_chunks),
+                    fx.Int64(grid) // fx.Int64(direct_chunks),
+                    1,
+                ),
+                block=(num_warps * 64, 1, 1),
+                stream=stream,
+            )
+        else:
+            kernel.launch(
+                grid=(fx.Int64(grid),),
+                block=(num_warps * 64, 1, 1),
+                stream=stream,
+            )
 
     return launch, num_warps * 64

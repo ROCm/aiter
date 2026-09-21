@@ -86,6 +86,8 @@ def run_case(case, args):
     configurations = {
         "old256": (256, 4, 0, 0, 16, False),
         "old64": (64, 1, 0, 0, 16, False),
+        "lds32w2h2": (32, 2, 2, 2, 32, False),
+        "lds32w2h2sw": (32, 2, 2, 2, 32, True),
         "lds64w1h1": (64, 1, 1, 2, 32, False),
         "lds128w2h1": (128, 2, 1, 2, 32, False),
         "lds128w4h2": (128, 4, 2, 2, 32, False),
@@ -104,8 +106,18 @@ def run_case(case, args):
     functions, outputs, schedules, resources = {}, {}, {}, {}
     for name in args.variants.split(","):
         direct = name.endswith("d")
+        config_name = name[:-1] if direct else name
+        direct_kv = config_name.endswith("gmem")
+        if direct_kv:
+            config_name = config_name[:-4]
+        direct_token_split = "tok32" in config_name
+        direct_grid_2d = "grid2d" in config_name
+        direct_page_fast = "pagefast" in config_name
+        direct_keep_local = "keeplocal" in config_name
+        for marker in ("tok32", "grid2d", "pagefast", "keeplocal"):
+            config_name = config_name.replace(marker, "")
         block, waves, hw, stages, mfma_m, scalar_weights = configurations[
-            name[:-1] if direct else name
+            config_name
         ]
         if block < args.page and not hw:
             continue
@@ -130,6 +142,11 @@ def run_case(case, args):
                 block_table_stride=bt.stride(0), block_k=block, num_warps=waves,
                 head_waves=hw, stages=stages, mfma_m=mfma_m,
                 scalar_weights=scalar_weights,
+                direct_kv=direct_kv,
+                direct_token_split=direct_token_split,
+                direct_grid_2d=direct_grid_2d,
+                direct_page_fast=direct_page_fast,
+                direct_keep_local=direct_keep_local,
                 direct_chunks=direct_chunks, max_seq_len=padded,
             )
         else:
@@ -154,6 +171,11 @@ def run_case(case, args):
             "num_warps": waves,
             "head_waves": hw,
             "scalar_weights": scalar_weights,
+            "direct_kv": direct_kv,
+            "direct_token_split": direct_token_split,
+            "direct_grid_2d": direct_grid_2d,
+            "direct_page_fast": direct_page_fast,
+            "direct_keep_local": direct_keep_local,
             "grid": total,
         }
         functions[name] = launch
