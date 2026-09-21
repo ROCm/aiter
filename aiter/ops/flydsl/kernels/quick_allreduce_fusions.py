@@ -132,6 +132,78 @@ def row_block_options(
     return tuple(opts)
 
 
+# -- fusion-agnostic: geometry with padding -----------------------------------
+#: Largest payload a padded build may address, in bytes.
+#:
+#: ``buffer_ops.buffer_load``/``buffer_store`` implement ``mask=`` by replacing a
+#: masked lane's byte offset with ``0x7FFFFFFF``, which is only out of bounds
+#: while the descriptor's ``num_records`` is no larger. Past that a pad lane
+#: would read and write real memory.
+PAD_MASK_MAX_BYTES = 0x7FFFFFFF
+
+
+def padded_row_block_options(
+    hidden: int,
+    *,
+    atoms_choices,
+    align: int = WAVE,
+    max_block: int = MAX_BLOCK,
+) -> tuple[tuple[int, int, int], ...]:
+    """Every ``(block, atoms_per_row, h_pad)`` a padded fused build can use.
+
+    Ordered by **ascending h_pad** -- least padding, hence least wire volume,
+    first. Ties break on the widest block, which keeps ``[0]``.
+
+    *hidden* must be a whole number of 16 B atoms (``ATOM_ELEMS`` bf16). That is
+    what puts the pad boundary on an atom granule, which in turn makes the
+    kernel's lane mask a compare against a trace-time constant rather than a
+    byte-level predicate. Returns empty otherwise.
+    """
+    hidden = int(hidden)
+    if hidden <= 0 or hidden % ATOM_ELEMS:
+        return ()
+    opts = []
+    for atoms_per_row in sorted({int(a) for a in atoms_choices}):
+        per_thread = ATOM_ELEMS * atoms_per_row
+        granule = align * per_thread
+        for h_pad in range(
+            -(-hidden // granule) * granule, max_block * per_thread + 1, granule
+        ):
+            opts.append((h_pad // per_thread, atoms_per_row, h_pad))
+    return tuple(sorted(opts, key=lambda bah: (bah[2], -bah[0])))
+
+
+def padded_row_block(
+    hidden: int,
+    *,
+    atoms_choices,
+    align: int = WAVE,
+    max_block: int = MAX_BLOCK,
+) -> tuple[int, int, int]:
+    """``(block, atoms_per_row, h_pad)`` for a padded build, least padding first.
+
+    Raises ``ValueError`` naming the constraint that failed; these messages
+    reach a user through a host-side hidden gate.
+    """
+    opts = padded_row_block_options(
+        hidden, atoms_choices=atoms_choices, align=align, max_block=max_block
+    )
+    if opts:
+        return opts[0]
+    hidden = int(hidden)
+    if hidden <= 0 or hidden % ATOM_ELEMS:
+        raise ValueError(
+            f"fused hidden must be a positive multiple of {ATOM_ELEMS} (one 16 B "
+            f"atom) even with padding, got {hidden}"
+        )
+    widest = max(int(a) for a in atoms_choices)
+    raise ValueError(
+        f"no padded fused build for hidden={hidden}: the widest per-thread "
+        f"coverage available here is {widest} atoms, which tops out at "
+        f"{max_block * ATOM_ELEMS * widest} elements per row"
+    )
+
+
 def _quick_reduce_atoms_choices(world_size: int) -> tuple[int, ...]:
     """``atoms_per_row`` values one reduce-scatter chunk can carry.
 
@@ -151,6 +223,17 @@ def quick_reduce_row_block_options(
 ) -> tuple[tuple[int, int], ...]:
     """Every ``(block, atoms_per_row)`` a fused mesh or ring build can use."""
     return row_block_options(
+        hidden,
+        atoms_choices=_quick_reduce_atoms_choices(world_size),
+        align=BLOCK_ALIGN,
+    )
+
+
+def quick_reduce_padded_row_block_options(
+    hidden: int, world_size: int
+) -> tuple[tuple[int, int, int], ...]:
+    """Every ``(block, atoms_per_row, h_pad)`` a padded mesh or ring build can use."""
+    return padded_row_block_options(
         hidden,
         atoms_choices=_quick_reduce_atoms_choices(world_size),
         align=BLOCK_ALIGN,

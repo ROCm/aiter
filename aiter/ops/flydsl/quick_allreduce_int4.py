@@ -32,7 +32,10 @@ from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
 from .kernels.quick_allreduce_codec import CODECS
 from .kernels.quick_allreduce_fusions import (
-    quick_reduce_hidden_supported,
+    PAD_MASK_MAX_BYTES as _PAD_MASK_MAX_BYTES,
+)
+from .kernels.quick_allreduce_fusions import (
+    quick_reduce_padded_row_block_options,
     quick_reduce_row_block_at,
     quick_reduce_row_block_for,
     quick_reduce_row_block_options,
@@ -43,6 +46,7 @@ from .kernels.quick_allreduce_int4 import (
     SUPER_TILES,
     clamp_grid_cap,
     make_quick_allreduce_int4_kernel,
+    mesh_fanout_fits,
 )
 from .kernels.quick_allreduce_int4_ring import (
     AG_CODECS,
@@ -158,6 +162,7 @@ class _Algorithm:
     # the mesh stops winning, which very much does. See
     # ``_RING_MIN_PAYLOAD_BYTES_BY_WORLD``.
     min_bytes_by_world: tuple[tuple[int, int], ...] = ()
+    fused_block_ok: Callable[[int, int, str], bool] | None = None
 
     def floor_bytes(self, world_size: int) -> int:
         return dict(self.min_bytes_by_world).get(int(world_size), self.min_bytes)
@@ -193,6 +198,7 @@ def _build_mesh(
     fusion="none",
     hidden=None,
     block=None,
+    h_pad=None,
 ):
     del rank  # a runtime kernel argument, not a mesh build knob
     if rs_codec != ag_codec:
@@ -209,6 +215,7 @@ def _build_mesh(
         fusion=fusion,
         hidden=hidden,
         block=block,
+        h_pad=h_pad,
     )
 
 
@@ -223,6 +230,7 @@ ALGORITHMS = {
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=MESH_ST_LADDER,
+        fused_block_ok=mesh_fanout_fits,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -1026,6 +1034,7 @@ class QuickAllReduceInt4RMSNorm:
         block: int | None = None,
         atoms_per_row: int | None = None,
         hiddens: tuple[int, ...] = (),
+        pad: bool = True,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -1097,6 +1106,7 @@ class QuickAllReduceInt4RMSNorm:
         # pushes the whole payload to every peer.
         self.min_bytes = algo.floor_bytes(self.world_size)
         self.max_bytes = max_bytes
+        self.pad = bool(pad)
 
         # Rungs to build, as ``(super_tile, grid_cap)``. Same ladder the plain
         # class walks; pinning ``super_tile`` collapses it to one rung.
@@ -1128,11 +1138,72 @@ class QuickAllReduceInt4RMSNorm:
     # -- engine construction -------------------------------------------------
 
     def supports_hidden(self, hidden: int) -> bool:
-        """Whether a fused build exists for hidden dim at this world size."""
+        """Whether a fused build exists for hidden dim, padded ones included."""
+        return bool(self._native_opts(hidden) or self._padded_opts(hidden))
+
+    def _block_ok(self, block: int) -> bool:
+        """Whether this schedule can actually build at *block*."""
+        ok = self._algo.fused_block_ok
+        return ok is None or ok(int(block), self.world_size, self.rs_codec)
+
+    def _native_opts(self, hidden: int) -> tuple[tuple[int, int], ...]:
+        """``(block, atoms_per_row)`` this width admits with no padding."""
+        opts = quick_reduce_row_block_options(int(hidden), self.world_size)
+        opts = tuple(o for o in opts if self._block_ok(o[0]))
         if self.block is not None:
-            opts = quick_reduce_row_block_options(int(hidden), self.world_size)
-            return any(b == self.block for b, _ in opts)
-        return quick_reduce_hidden_supported(int(hidden), self.world_size)
+            opts = tuple(o for o in opts if o[0] == self.block)
+        return opts
+
+    def _padded_opts(self, hidden: int) -> tuple[tuple[int, int, int], ...]:
+        """``(block, atoms_per_row, h_pad)`` this width admits with padding.
+
+        Ascending ``h_pad``, so ``[0]`` is the least wire volume that every
+        constraint accepts.
+        """
+        if not self.pad:
+            return ()
+        opts = quick_reduce_padded_row_block_options(int(hidden), self.world_size)
+        opts = tuple(o for o in opts if self._block_ok(o[0]))
+        if self.block is not None:
+            opts = tuple(o for o in opts if o[0] == self.block)
+        return opts
+
+    def _geom_for(self, hidden: int) -> tuple[int, int, int]:
+        """``(block, atoms_per_row, h_pad)`` for hidden dim.
+
+        A width with a native geometry resolves exactly. A width without one 
+        falls to the padded set, least wire volume first, with a pinned ``atoms_per_row`` 
+        breaking ties among equally-padded candidates.
+        """
+        hidden = int(hidden)
+        if self._native_opts(hidden):
+            block, apr = quick_reduce_row_block_for(
+                hidden,
+                self.world_size,
+                block=self.block,
+                atoms_per_row=self.atoms_per_row,
+            )
+            return block, apr, hidden
+        opts = self._padded_opts(hidden)
+        if not opts:
+            # No geometry at all: re-resolve so the build raises with the
+            # message that names the constraint that failed.
+            block, apr = quick_reduce_row_block_for(
+                hidden,
+                self.world_size,
+                block=self.block,
+                atoms_per_row=self.atoms_per_row,
+            )
+            return block, apr, hidden
+        tied = [o for o in opts if o[2] == opts[0][2]]
+        if self.atoms_per_row is not None:
+            want = int(self.atoms_per_row)
+            return min(tied, key=lambda o: (abs(o[1] - want), o[1]))
+        return tied[0]
+
+    def pads_hidden(self, hidden: int) -> int:
+        """``h_pad`` this width runs at, or hidden dim when it needs no padding."""
+        return self._geom_for(int(hidden))[2]
 
     def _grid_for(self, super_tile: int, rung_cap: int, block: int) -> int:
         """Persistent grid for one rung: the minimum of every bound we have.
@@ -1167,12 +1238,7 @@ class QuickAllReduceInt4RMSNorm:
         if not self.supports_hidden(hidden):
             # Resolve again for the message: it names the constraint that failed.
             quick_reduce_row_block_at(hidden, self.world_size, self.block)
-        block, _atoms_per_row = quick_reduce_row_block_for(
-            hidden,
-            self.world_size,
-            block=self.block,
-            atoms_per_row=self.atoms_per_row,
-        )
+        block, _atoms_per_row, h_pad = self._geom_for(hidden)
         for st in self._by_cap:
             key = (hidden, st)
             if key in self._by_cfg:
@@ -1188,6 +1254,7 @@ class QuickAllReduceInt4RMSNorm:
                 fusion="rmsnorm",
                 hidden=hidden,
                 block=block,
+                h_pad=h_pad,
             )
             if spec["lds_bytes"] > self._lds_capacity:
                 raise ValueError(
@@ -1220,16 +1287,19 @@ class QuickAllReduceInt4RMSNorm:
     # -- selection -----------------------------------------------------------
 
     def _tile_bytes(self, hidden: int) -> int:
-        """Tile size for *hidden*, building its engines if they do not exist.
+        """HBM bytes one tile spans at hidden dim, building its engines if needed.
 
-        Build-derived rather than a constant: a fused tile is ``ATOMS`` token
-        rows of this width, not the plain schedule's 32 KiB, so the tile count
-        a launch derives has to come from the engine.
+        A fused tile is ``rows_per_tile`` token rows of this width.
+
+        ``hbm_tile_bytes``, not ``tile_bytes``: on a padded build the wire tile
+        is rows of ``h_pad`` while the footprint is rows of ``hidden``, and it
+        is the footprint a tile *count* has to divide. They are equal whenever
+        the build is not padded.
         """
         key = (int(hidden), 1)  # ST=1 is always built; see the constructor
         if key not in self._by_cfg:
             self._build_hidden(int(hidden))
-        return self._by_cfg[key][1]["tile_bytes"]
+        return self._by_cfg[key][1]["hbm_tile_bytes"]
 
     def _ladder_st(self, live_bytes: int) -> int:
         st = min(self._by_cap)
@@ -1305,6 +1375,13 @@ class QuickAllReduceInt4RMSNorm:
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:
             raise ValueError("payload must not exceed the 4 GiB buffer window")
+        if live_bytes > _PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
+            raise ValueError(
+                f"a padded fused build (hidden={hidden} runs at "
+                f"h_pad={self.pads_hidden(hidden)}) masks its pad lanes with an "
+                f"offset of {_PAD_MASK_MAX_BYTES} B, so the payload must not "
+                f"exceed that; got {live_bytes} B"
+            )
 
         # Aliasing. ``residual_out is residual_in`` is allowed: a thread writes
         # only the bytes it read, and vLLM's fused_add_rmsnorm is in-place on
@@ -1422,7 +1499,7 @@ class QuickAllReduceInt4RMSNorm:
         for (h, _st), (eng, spec) in self._by_cfg.items():
             if h != hidden:
                 continue
-            tile_bytes = spec["tile_bytes"]
+            tile_bytes = spec["hbm_tile_bytes"]
             num_tiles = max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
             st = (
                 Stream(torch.cuda.current_stream(self._device_index))

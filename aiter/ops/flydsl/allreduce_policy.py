@@ -143,6 +143,9 @@ FUSED_MIN_VAR = "AITER_FLY_AR_FUSED_MIN_BYTES"
 # it is known -- and building inside a HIP graph capture is not possible.
 # Declaring the model's widths here removes the question.
 FUSED_HIDDENS_VAR = "AITER_FLY_AR_FUSED_HIDDENS"
+# Whether a hidden dim with no native row geometry may run on a wider workgroup
+# with the lanes past the real row masked off. 
+FUSED_PAD_VAR = "AITER_FLY_AR_FUSED_PAD"
 
 ACCURACY_MODES = ("exact", "fast")
 DEFAULT_ACCURACY = "exact"
@@ -193,6 +196,11 @@ def fused_hiddens(extra: tuple[int, ...] = ()) -> tuple[int, ...]:
         if val > 0:
             out.add(val)
     return tuple(sorted(out))
+
+
+def fused_pad_enabled() -> bool:
+    """Whether padded fused builds are allowed. On unless ``…_PAD`` is ``"0"``."""
+    return os.environ.get(FUSED_PAD_VAR, "").strip() != "0"
 
 
 def accuracy_mode() -> str:

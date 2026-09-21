@@ -32,8 +32,12 @@ from .kernels.one_shot_allreduce import (
     fused_atoms_for_block,
     fused_block_options,
     fused_oneshot_ladder,
+    fused_padded_block_options,
     make_one_shot_allreduce_kernel,
     oneshot_ladder,
+)
+from .kernels.quick_allreduce_fusions import (
+    PAD_MASK_MAX_BYTES as _PAD_MASK_MAX_BYTES,
 )
 from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _run_compiled
@@ -459,6 +463,7 @@ class OneShotAllReduceRMSNorm:
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
         skip_self: bool | None = None,
         hiddens: tuple[int, ...] = (),
+        pad: bool = True,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -514,6 +519,9 @@ class OneShotAllReduceRMSNorm:
         )
         self.spin_sleep = int(spin_sleep)
         self.block = None if block is None else int(block)
+        # Whether a width with no native geometry may run on a wider workgroup
+        # with the lanes past the real row masked off.
+        self.pad = bool(pad)
 
         # ``FUSED_ONESHOT_LADDER``: ``atoms`` sets tile
         # width in the plain schedule and block width here.
@@ -553,22 +561,46 @@ class OneShotAllReduceRMSNorm:
 
     # -- engine construction -------------------------------------------------
 
-    def _atoms_for(self, hidden: int, rung_atoms: int) -> int:
-        """The rung's ``atoms``, or what a pinned ``block`` means at hidden."""
-        want = (
-            fused_atoms_for_block(int(hidden), self.block)
-            if self.block
-            else int(rung_atoms)
-        )
-        legal = [a for _b, a in fused_block_options(int(hidden))]
-        if not legal or want in legal:
-            return want
-        return min(legal, key=lambda a: (abs(a - want), a))
+    def _geom_for(self, hidden: int, rung_atoms: int) -> tuple[int, int]:
+        """``(atoms, h_pad)`` for a rung at hidden dim.
+
+        A width with a native geometry resolves exactly. A width without one 
+        falls to the padded set, and there the *pad* leads.
+        ``fused_padded_block_options`` is ordered by ascending ``h_pad``, so
+        this takes the least wire volume available and only then uses the rung's
+        ``atoms`` (or a pinned ``block``) to break the tie.
+        """
+        hidden = int(hidden)
+        native = fused_block_options(hidden)
+        if native:
+            want = (
+                fused_atoms_for_block(hidden, self.block)
+                if self.block
+                else int(rung_atoms)
+            )
+            legal = [a for _b, a in native]
+            atoms = want if want in legal else min(legal, key=lambda a: (abs(a - want), a))
+            return atoms, hidden
+
+        opts = fused_padded_block_options(hidden) if self.pad else ()
+        if not opts:
+            # No geometry at all. Returning the rung's own atoms lets the build
+            # raise with the message that names the constraint that failed.
+            return int(rung_atoms), hidden
+        if self.block:
+            pinned = [o for o in opts if o[0] == self.block]
+            if pinned:
+                return pinned[0][1], pinned[0][2]
+        least_pad = opts[0][2]
+        tied = [o for o in opts if o[2] == least_pad]
+        _b, atoms, h_pad = min(tied, key=lambda o: (abs(o[1] - int(rung_atoms)), o[1]))
+        return atoms, h_pad
 
     def _cfg_key(self, hidden: int, rung: tuple) -> tuple:
         """A ladder rung's engine key at *hidden*."""
         _floor, a, cap, f, s = rung
-        return (int(hidden), self._atoms_for(hidden, a), int(cap), f, bool(s))
+        atoms, h_pad = self._geom_for(hidden, a)
+        return (int(hidden), atoms, int(cap), f, bool(s), h_pad)
 
     def _build_hidden(self, hidden: int) -> None:
         """Build every rung for hidden dim. Collective: all ranks must call it in
@@ -588,6 +620,7 @@ class OneShotAllReduceRMSNorm:
                 rank=self.rank,
                 fusion="rmsnorm",
                 hidden=key[0],
+                h_pad=key[5],
             )
             self._by_cfg[key] = (
                 _StEngine(
@@ -621,10 +654,21 @@ class OneShotAllReduceRMSNorm:
         return tuple(sorted({k[0] for k in self._by_cfg}))
 
     def supports_hidden(self, hidden: int) -> bool:
-        """Whether any build exists for hidden dim."""
+        """Whether any build exists for hidden dim, padded ones included."""
+        hidden = int(hidden)
         if self.block is not None:
-            return any(b == self.block for b, _ in fused_block_options(int(hidden)))
-        return bool(fused_block_options(int(hidden)))
+            if any(b == self.block for b, _ in fused_block_options(hidden)):
+                return True
+            return self.pad and any(
+                b == self.block for b, _a, _h in fused_padded_block_options(hidden)
+            )
+        if fused_block_options(hidden):
+            return True
+        return self.pad and bool(fused_padded_block_options(hidden))
+
+    def pads_hidden(self, hidden: int) -> int:
+        """``h_pad`` this width would run at, or hidden dim when it needs no padding."""
+        return self._geom_for(int(hidden), self._ladder[0][1])[1]
 
     # -- launch --------------------------------------------------------------
 
@@ -671,15 +715,23 @@ class OneShotAllReduceRMSNorm:
                 if self.block is not None
                 else f"atoms={[r[1] for r in self._ladder]}"
             )
+            padding = "" if self.pad else " (padding is off for this engine)"
             raise ValueError(
-                f"no fused build for hidden={hidden} at {pin}: one block covers "
-                "one row, so hidden/(8*atoms) must be a multiple of 64 and at "
-                f"most 1024 -- the legal (block, atoms) pairs for this width are "
-                f"{fused_block_options(hidden)}"
+                f"no fused build for hidden={hidden} at {pin}{padding}: one block "
+                "covers one row, so hidden/(8*atoms) must be a multiple of 64 and "
+                f"at most 1024 -- the legal (block, atoms) pairs for this width "
+                f"are {fused_block_options(hidden)}"
             )
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:
             raise ValueError("payload must not exceed the 4 GiB buffer window")
+        if live_bytes > _PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
+            raise ValueError(
+                f"a padded fused build (hidden={hidden} runs at "
+                f"h_pad={self.pads_hidden(hidden)}) masks its pad lanes with an "
+                f"offset of {_PAD_MASK_MAX_BYTES} B, so the payload must not "
+                f"exceed that; got {live_bytes} B"
+            )
         # Distinct destinations: the kernel writes out and residual_out from the
         # same thread and reads residual_in after, so aliasing any pair is a race.
         spans = [

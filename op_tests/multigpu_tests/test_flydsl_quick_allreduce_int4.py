@@ -1118,6 +1118,51 @@ def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
     assert not fails, f"{label}/{algorithm}: " + "; ".join(fails)
 
 
+#: Widths with no native row geometry, which run on a *padded* workgroup.
+#:
+#: Graded with a **lossless** wire on purpose. Padding must be invisible to the
+#: answer, so under fp16 a padded build has to produce the same bits a native
+#: one would -- an equality, not a tolerance. INT4 would hide a one-atom
+#: addressing slip inside the codec's own 19 dB of noise.
+#:
+#: 1536 pads to 2048 (block 256, the narrowest the mesh fanout accepts) and is
+#: the only width here that fits fp16's LDS at TP2. ``tokens`` is well past one
+#: tile: at ``rows_per_tile = 8`` a single-tile payload puts every pad lane past
+#: the end of the tensor, where the descriptor bound masks it for free, so it
+#: would pass with the per-lane mask removed entirely.
+_FUSED_PAD_CASES = ((2, 512, 1536, "tp2-1536pad2048"),)
+
+
+@pytest.mark.parametrize("algorithm", ("ring", "mesh"))
+@pytest.mark.parametrize("tp,tokens,hidden,label", _FUSED_PAD_CASES)
+def test_quick_allreduce_rmsnorm_padded_is_bit_exact(
+    tp, tokens, hidden, label, algorithm
+):
+    """A padded width on a lossless wire is bit-exact, same as a native one.
+
+    This is the test that isolates the padded addressing. The kernel runs a
+    block covering ``h_pad`` and masks the lanes past the real row; a mask one
+    atom too wide folds the next row's first 16 B into this row's norm, and a
+    store that is not dropped overwrites the next row's first 16 B. Both move
+    bits that an equality sees and that an SQNR floor would not.
+    """
+    batch = _fused_batch(
+        (tp, "pad", algorithm),
+        [(tokens, hidden)],
+        algorithm=algorithm,
+        codecs=("fp16", "fp16"),
+        solo=True,
+    )
+    rows = batch[(tokens, hidden)]
+    bad = [r["rank"] for r in rows if not r["res_exact"]]
+    assert not bad, (
+        f"{label}/{algorithm}: residual_out is not bit-exact on ranks {bad} "
+        "with a lossless wire -- a pad lane is reaching the real row"
+    )
+    for row in rows:
+        assert row["out_sqnr_db"] > 60.0, row
+
+
 @pytest.mark.parametrize("algorithm", ("ring", "mesh"))
 def test_quick_allreduce_rmsnorm_residual_is_bit_exact(algorithm):
     """With a lossless wire and one live rank, ``residual_out`` is exact.
@@ -1193,6 +1238,80 @@ def test_quick_allreduce_rmsnorm_supported_hiddens():
         for hidden in range(1024, 8192 + 1, 1024):
             block, atoms_per_row = quick_reduce_row_block(hidden, world_size)
             assert atoms_per_row == 1 and block == hidden // 8, (hidden, world_size)
+
+
+def test_quick_reduce_padded_row_block_is_least_wire():
+    """The padded pick is the narrowest legal width at or above hidden dim.
+
+    Host-side and GPU-free. Guards the selection rule rather than the kernel:
+    padding costs ``(h_pad-hidden)/hidden`` extra wire on a bandwidth-bound
+    schedule, so taking anything but the least is a silent throughput loss.
+
+    Also pins the half that matters more -- a width with a native geometry must
+    resolve to ``h_pad == hidden`` and the same ``(block, atoms_per_row)`` it
+    always did, or every shipped shape starts paying for this.
+    """
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_padded_row_block_options,
+        quick_reduce_row_block_options,
+    )
+
+    for world_size in SUPPORTED_WORLDS:
+        for hidden in range(8, 32768 + 1, 8):
+            opts = quick_reduce_padded_row_block_options(hidden, world_size)
+            if not opts:
+                continue
+            block, atoms_per_row, h_pad = opts[0]
+            assert h_pad >= hidden and block * atoms_per_row * 8 == h_pad
+            assert h_pad == min(o[2] for o in opts), (hidden, world_size, h_pad)
+            native = quick_reduce_row_block_options(hidden, world_size)
+            if native:
+                assert (block, atoms_per_row, h_pad) == (*native[0], hidden), (
+                    f"hidden={hidden} tp={world_size} has a native geometry "
+                    f"{native[0]} but the padded list leads with "
+                    f"{(block, atoms_per_row, h_pad)}"
+                )
+
+
+def test_mesh_fanout_quad_budget_gates_narrow_blocks():
+    """The mesh needs a quad per (peer, sector) of a stripe, and the gate knows.
+
+    The row geometry is necessary but not sufficient: ``hidden=1024`` at TP8
+    gives a 128-thread block, which passes every row constraint and then has
+    too few quads for the fanout to issue in one pass. Before this predicate
+    existed the host advertised that width and the factory raised on it.
+
+    Host-side and GPU-free.
+    """
+    from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+        make_quick_allreduce_int4_kernel,
+        mesh_fanout_fits,
+    )
+
+    assert not mesh_fanout_fits(128, 8, "int4")
+    assert mesh_fanout_fits(256, 8, "int4")
+    # The predicate and the factory must agree, or the gate lies again.
+    with pytest.raises(ValueError, match="quads"):
+        make_quick_allreduce_int4_kernel(
+            world_size=8, grid=64, fusion="rmsnorm", hidden=1024
+        )
+    for world_size in SUPPORTED_WORLDS:
+        for block in range(128, 1024 + 1, 128):
+            hidden = block * 8
+            fits = mesh_fanout_fits(block, world_size, "int4")
+            try:
+                make_quick_allreduce_int4_kernel(
+                    world_size=world_size,
+                    grid=64,
+                    fusion="rmsnorm",
+                    hidden=hidden,
+                )
+                built = True
+            except ValueError as exc:
+                if "quads" not in str(exc):
+                    continue  # LDS or another limit; not what this test is about
+                built = False
+            assert built == fits, (world_size, block, fits, built)
 
 
 def test_quick_reduce_row_block_is_first_option():

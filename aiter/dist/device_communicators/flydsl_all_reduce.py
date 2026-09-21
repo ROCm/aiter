@@ -418,6 +418,7 @@ class FlyDSLAllReduceRMSNorm:
             "device": self.device,
             "rank": self.rank,
             "world_size": self.world_size,
+            "pad": policy.fused_pad_enabled(),
         }
         if family == "oneshot":
             return OneShotAllReduceRMSNorm(
@@ -455,7 +456,9 @@ class FlyDSLAllReduceRMSNorm:
         eng = self._engines.get(family)
         if eng is None:
             return family
-        return f"{family}:{eng.variant(int(hidden), int(nbytes))}"
+        got = f"{family}:{eng.variant(int(hidden), int(nbytes))}"
+        h_pad = eng.pads_hidden(int(hidden))
+        return got if h_pad == int(hidden) else f"{got}/pad{h_pad}"
 
     #: Rows in the probe :meth:`prime` launches. Small, but >1 so a partial
     #: last tile is exercised the way a real decode step would be.

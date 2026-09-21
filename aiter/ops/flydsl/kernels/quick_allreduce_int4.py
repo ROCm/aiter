@@ -38,6 +38,7 @@ from .quick_allreduce_codec import (
     thread_lane,
 )
 from .quick_allreduce_fusions import (
+    ATOM_ELEMS,
     FUSIONS,
     make_wave_partials,
     pack_bf16,
@@ -165,6 +166,24 @@ MESH_ST_LADDER = {
 MESH_CODECS = ("int4", "fp16")
 
 
+def mesh_fanout_quads(block: int, world_size: int, codec: str) -> tuple[int, int]:
+    """``(quads the block has, quads the mesh fanout needs)`` at this geometry.
+
+    A rank-tile's sectors go out in stripes of up to 8, one quad per
+    ``(peer, sector)`` of a stripe, in a single pass. A block with fewer quads
+    than that would silently drop the sectors past the end.
+    """
+    c = codecs_for_block(int(block))[codec]
+    stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
+    return int(block) // QUAD_LANES, max(int(world_size) * w for _, w in stripes)
+
+
+def mesh_fanout_fits(block: int, world_size: int, codec: str) -> bool:
+    """Whether the mesh fanout fits in *block*'s quads. For host-side gates."""
+    have, need = mesh_fanout_quads(block, world_size, codec)
+    return have >= need
+
+
 def make_quick_allreduce_int4_kernel(
     *,
     world_size: int = WORLD,
@@ -175,6 +194,7 @@ def make_quick_allreduce_int4_kernel(
     fusion: str = "none",
     hidden: int | None = None,
     block: int | None = None,
+    h_pad: int | None = None,
 ):
     if fusion not in FUSIONS:
         raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
@@ -182,6 +202,8 @@ def make_quick_allreduce_int4_kernel(
         raise ValueError(f"fusion={fusion!r} requires hidden")
     if fusion == "none" and hidden is not None:
         raise ValueError("hidden is only meaningful for a fused build")
+    if fusion == "none" and h_pad is not None:
+        raise ValueError("h_pad is only meaningful for a fused build")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -195,16 +217,43 @@ def make_quick_allreduce_int4_kernel(
 
     fused = fusion == "rmsnorm"
     if fused:
-        block, atoms_per_row = quick_reduce_row_block_at(hidden, world_size, block)
+        # ``h_pad`` is the width the *workgroup* covers, ``hidden`` the width the
+        # *tensor* has. The block, the tile, the codec and the wire all follow
+        # h_pad; the HBM row stride and the RMS denominator follow hidden.
+        h_pad = hidden if h_pad is None else int(h_pad)
+        if h_pad < hidden:
+            raise ValueError(f"h_pad={h_pad} is narrower than hidden={hidden}")
+        if h_pad != hidden and hidden % ATOM_ELEMS:
+            raise ValueError(
+                f"a padded fused build needs hidden to be a whole number of "
+                f"{ATOM_ELEMS}-element atoms so the pad boundary lands on an "
+                f"atom granule, got hidden={hidden}"
+            )
+        block, atoms_per_row = quick_reduce_row_block_at(h_pad, world_size, block)
     else:
         if block is not None:
             raise ValueError("block is only meaningful for a fused build")
         block, atoms_per_row = BLOCK, 1
+    padded = fused and h_pad != hidden
     rows_per_tile = ATOMS // atoms_per_row
-    quads_per_block = block // QUAD_LANES
     n_waves = block // WAVE
     tile_i32 = block * ATOMS * 4
     tile_bytes = tile_i32 * 4
+    # i32 between one token row and the next *in HBM*, and the HBM bytes a whole
+    # tile spans. These part company from ``tile_i32``/``tile_bytes`` exactly
+    # when a build is padded: the wire tile is rows_per_tile rows of h_pad, the
+    # HBM footprint is rows_per_tile rows of hidden. The host derives num_tiles
+    # from ``hbm_tile_bytes``, never from ``tile_bytes``.
+    row_stride_i32 = (hidden // 2) if fused else tile_i32
+    hbm_tile_i32 = rows_per_tile * row_stride_i32 if fused else tile_i32
+    hbm_tile_bytes = hbm_tile_i32 * 4
+    # Lanes of each atom *of a row* that land inside the real row, at trace
+    # time. Indexed by atom-in-row, not by atom-in-tile: every row of a tile has
+    # the same shape, so the pad boundary is the same for all of them.
+    live_lanes = tuple(
+        min(max(row_stride_i32 - a * block * 4, 0), block * 4) // 4
+        for a in range(atoms_per_row)
+    )
 
     c = codecs_for_block(block)[codec]
     policy = _INBOX_POLICY[inbox_memory]
@@ -240,7 +289,7 @@ def make_quick_allreduce_int4_kernel(
     # ring, which loops rounds. A block narrower than the shipped 256 would run
     # out of quads and silently drop the sectors past the end, so a fused build
     # that lands there is rejected rather than built.
-    need_quads = max(world_size * width for _, width in stripes)
+    quads_per_block, need_quads = mesh_fanout_quads(block, world_size, codec)
     if quads_per_block < need_quads:
         raise ValueError(
             f"fused hidden={hidden} gives BLOCK={block} ({quads_per_block} quads), "
@@ -294,17 +343,18 @@ def make_quick_allreduce_int4_kernel(
         # start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
         # Remote NT fanout stays explicit global_store_dwordx4 nt.
-        hbm_layout = fx.make_layout(
-            (num_tiles, ATOMS, block * 4),
-            (tile_i32, block * 4, 1),
-        )
-        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
-        hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-        hbm_copy = fx.make_tiled_copy_tv(
-            hbm_copy_atom,
-            fx.make_layout((1, block), (1, 1)),
-            fx.make_layout((1, 4), (1, 1)),
-        ).get_slice(tid)
+        if const_expr(not padded):
+            hbm_layout = fx.make_layout(
+                (num_tiles, ATOMS, block * 4),
+                (hbm_tile_i32, block * 4, 1),
+            )
+            hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
+            hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
+            hbm_copy = fx.make_tiled_copy_tv(
+                hbm_copy_atom,
+                fx.make_layout((1, block), (1, 1)),
+                fx.make_layout((1, 4), (1, 1)),
+            ).get_slice(tid)
         # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
         # A 256-thread workgroup has 64 quads. A stripe of up to 8 sectors needs
@@ -365,12 +415,20 @@ def make_quick_allreduce_int4_kernel(
         )
 
         def _payload_tensor(ptr, records=None):
+            """The handle the atom helpers address an operand through.
+
+            A padded build hands back a raw buffer descriptor instead of a
+            tiled-copy tensor: its pad lanes need a *per-lane* poke out of
+            bounds, which the copy's layout-derived addresses cannot express,
+            and only the raw path takes a mask. Unpadded builds are untouched.
+            """
+            n = nbytes if records is None else records
+            if const_expr(padded):
+                return buffer_ops.create_buffer_resource_from_addr(
+                    ptr, num_records_bytes=n
+                )
             view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
-            return rocdl.make_buffer_tensor(
-                view,
-                max_size=False,
-                num_records_bytes=nbytes if records is None else records,
-            )
+            return rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=n)
 
         in_buf = _payload_tensor(inp_ptr)
         out_buf = _payload_tensor(out_ptr)
@@ -379,10 +437,13 @@ def make_quick_allreduce_int4_kernel(
         if const_expr(fused):
             # residual in/out share the payload's (M, hidden) bf16 shape, so
             # they ride the payload layout and the same tiled copy. The gain is
-            # one (hidden,) row -- ``atoms_per_row`` atoms at tile 0.
+            # one (hidden,) row -- ``atoms_per_row`` atoms at tile 0. Bounding
+            # it at the *true* width is what makes a padded build's pad lanes
+            # read weight 0: there is only one row, so nothing lies past it and
+            # the descriptor is the whole mask for this one operand.
             res_in_buf = _payload_tensor(res_in_ptr)
             res_out_buf = _payload_tensor(res_out_ptr)
-            w_buf = _payload_tensor(w_ptr, records=fx.Int64(atoms_per_row * block * 16))
+            w_buf = _payload_tensor(w_ptr, records=fx.Int64(hidden * 2))
 
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
@@ -409,36 +470,75 @@ def make_quick_allreduce_int4_kernel(
             off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
             buffer_ops.buffer_store(color, color_rsrc, off)
 
+        def _row_elem(tile, atom):
+            """i32 element offset of this thread's 16 B of *atom* of *tile*.
+
+            A fused tile is ``rows_per_tile`` token rows laid end to end, so the
+            atom index splits into a row and an atom within it. The row base
+            strides by the *true* width and the column inside it by the *padded*
+            one -- which is the whole of the padding: the tensor's rows stay
+            where they are and only the workgroup gets wider.
+            """
+            r, a = divmod(atom, atoms_per_row)
+            return (
+                (tile * fx.Int32(rows_per_tile) + fx.Int32(r))
+                * fx.Int32(row_stride_i32)
+                + fx.Int32(a * block * 4)
+                + tid * fx.Int32(4)
+            )
+
+        def _lane_mask(atom):
+            """Lanes of *atom* inside the real row, or None when every lane is.
+
+            ``live_lanes`` is a trace-time count, so this is a compare against a
+            constant. An atom entirely past the row would give ``tid < 0``,
+            false on every lane, which loads 0 and drops the store -- the same
+            answer, with no special case. Least-padding selection never produces
+            one, since an atom is at least as wide as the pad.
+            """
+            a = atom % atoms_per_row
+            if const_expr(live_lanes[a] == block):
+                return None
+            return tid < fx.Int32(live_lanes[a])
+
         def _load_tile_atoms(tile):
             atoms = []
             for atom in range_constexpr(ATOMS):
-                src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
-                frag = fx.make_fragment_like(src)
-                fx.copy(hbm_copy_atom, src, frag)
-                atoms.append(_atom_bf16_to_f16(fx.Vector(frag.load())))
+                atoms.append(_atom_bf16_to_f16(_load_raw_atom(in_buf, tile, atom)))
             return atoms
 
         def _store_tile_atoms(tile, atoms):
             for atom in range_constexpr(ATOMS):
-                packed = _atom_f16_to_bf16(atoms[atom])
-                dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
-                frag = fx.make_fragment_like(dst)
-                frag.store(packed)
-                fx.copy(hbm_copy_atom, frag, dst)
+                _store_raw_atom(out_buf, tile, atom, _atom_f16_to_bf16(atoms[atom]))
 
         def _load_raw_atom(buf, tile, atom):
             """One 16 B atom, unconverted -- the fused epilogue's bf16 operands
             are not codec values and never become fp16."""
+            if const_expr(padded):
+                return fx.Vector(
+                    buffer_ops.buffer_load(
+                        buf,
+                        _row_elem(tile, atom),
+                        vec_width=4,
+                        dtype=T.i32,
+                        mask=_lane_mask(atom),
+                    )
+                )
             src = hbm_copy.partition_S(_hbm_atom_row(buf, tile, atom))
             frag = fx.make_fragment_like(src)
             fx.copy(hbm_copy_atom, src, frag)
             return fx.Vector(frag.load())
 
         def _store_raw_atom(buf, tile, atom, value):
-            dst = hbm_copy.partition_D(_hbm_atom_row(buf, tile, atom))
-            frag = fx.make_fragment_like(dst)
-            frag.store(value)
-            fx.copy(hbm_copy_atom, frag, dst)
+            if const_expr(padded):
+                buffer_ops.buffer_store(
+                    value, buf, _row_elem(tile, atom), mask=_lane_mask(atom)
+                )
+            else:
+                dst = hbm_copy.partition_D(_hbm_atom_row(buf, tile, atom))
+                frag = fx.make_fragment_like(dst)
+                frag.store(value)
+                fx.copy(hbm_copy_atom, frag, dst)
 
         def _atom_f16_to_f32(atom):
             """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
@@ -824,7 +924,11 @@ def make_quick_allreduce_int4_kernel(
     # in cache bits or wire format must not collide in the JIT cache.
     tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_{codec}"
     if fused:
+        # h_pad changes both the geometry and which loads carry a mask, so a
+        # padded build must not share a JIT key with the plain one.
         tag += f"_rms_h{hidden}_b{block}"
+        if padded:
+            tag += f"_p{h_pad}"
     launcher = (
         launch_quick_allreduce_int4_fused if fused else launch_quick_allreduce_int4
     )
@@ -839,6 +943,11 @@ def make_quick_allreduce_int4_kernel(
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": lds_bytes,
         "tile_bytes": tile_bytes,
+        # HBM bytes one tile spans, which is what a tile *count* has to come
+        # from. Equal to tile_bytes unless the build is padded, where the wire
+        # tile is rows_per_tile rows of h_pad but the footprint is
+        # rows_per_tile rows of hidden.
+        "hbm_tile_bytes": hbm_tile_bytes,
         "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": c.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_bytes,
@@ -854,6 +963,8 @@ def make_quick_allreduce_int4_kernel(
         "block": block,
         "fusion": fusion,
         "hidden": hidden,
+        "h_pad": h_pad,
+        "padded": padded,
         "atoms_per_row": atoms_per_row,
         "rows_per_tile": rows_per_tile,
     }

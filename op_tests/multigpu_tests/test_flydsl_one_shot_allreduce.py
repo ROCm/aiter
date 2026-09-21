@@ -98,6 +98,25 @@ _FUSED_SHAPE_CASES = tuple(
     (m, hidden, f"{m}x{hidden}") for hidden in FUSED_HIDDENS for m in FUSED_M
 )
 
+# Widths with no native row geometry, which run on a *padded* workgroup: BLOCK
+# covers h_pad and the lanes past the real row are masked off. See
+# ``op_tests/dump_data/docs/flydsl_fused_allreduce_hidden_coverage.md``.
+#
+# 896 -> 1024 and 2304 -> 2560 pad within one atom of the row; 2880 -> 3072 is
+# the gpt-oss width and the one that motivated this.
+#
+# ``m`` has to reach past one row. With a single token every pad lane addresses
+# past the end of the tensor, where the descriptor bound masks it for free --
+# so m=1 passes even with the per-lane mask removed entirely. m=32 is what puts
+# a *real* row under the pad, which is the only arrangement where a leaked load
+# reads live data and a leaked store corrupts a neighbour.
+FUSED_PAD_HIDDENS = (896, 2304, 2880)
+_FUSED_PAD_SHAPE_CASES = tuple(
+    (m, hidden, f"{m}x{hidden}pad")
+    for hidden in FUSED_PAD_HIDDENS
+    for m in (1, 5, 32)
+)
+
 # `atoms` sets the *block width* in a fused build (BLOCK = hidden/(8*atoms)),
 # not the tile width, so these cases exercise the reduction ladder rather than
 # the wire -- the plain kernel's atoms cases already cover the wire.
@@ -600,6 +619,76 @@ def test_one_shot_allreduce_rmsnorm(m, hidden, label, world_size):
     batch = _batch_cache_lookup((world_size, "fused"), group_pairs)
     for rank, bad in enumerate(batch[(m, hidden)]):
         assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden,label", _FUSED_PAD_SHAPE_CASES)
+def test_one_shot_allreduce_rmsnorm_padded(m, hidden, label, world_size):
+    """Widths that only exist because the workgroup is padded past the row.
+
+    Graded exactly like the native widths -- and that is the point. Padding is
+    supposed to be invisible to the answer: the pad lanes load 0, push 0 on the
+    wire and add 0 to the sum of squares, and their stores are dropped, so
+    ``residual_out`` must still be **bit-exact** against the fp32 reference.
+
+    Anything that leaks shows up here rather than as a tolerance wobble. A
+    mask that is one atom too wide reads the next row's first 16 B into the
+    norm; a store that is not dropped overwrites the next row's first 16 B.
+    Both change bits that the equality check sees.
+    """
+    group_pairs = [(mm, hh) for mm, hh, _ in _FUSED_PAD_SHAPE_CASES]
+    # key[2] is read as ``atoms`` by ``_batch_cache_lookup``; the trailing
+    # "pad" is only there to keep this group's spawn out of the plain fused
+    # cache entry, which shares both the mode and the atoms value.
+    batch = _batch_cache_lookup(
+        (world_size, "fused", DEFAULT_ATOMS, "pad"), group_pairs
+    )
+    for rank, bad in enumerate(batch[(m, hidden)]):
+        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+def test_one_shot_allreduce_rmsnorm_padding_is_least_wire():
+    """The padded pick is the narrowest legal width at or above hidden dim.
+
+    Host-side and GPU-free. Guards the selection rule rather than the kernel:
+    padding costs ``(h_pad-hidden)/hidden`` extra wire on a bandwidth-bound
+    schedule, so taking anything but the least is a silent throughput loss.
+
+    Also pins the half of the contract that matters more -- a width with a
+    native geometry must not pad at all, or every shipped shape pays for this.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        fused_block_options,
+        fused_padded_block,
+        fused_padded_block_options,
+    )
+
+    # Every width the padded GPU cases use must have *no* native geometry, or
+    # those cases would be passing on the unpadded path and proving nothing.
+    for hidden in FUSED_PAD_HIDDENS:
+        assert not fused_block_options(hidden), (
+            f"hidden={hidden} is in FUSED_PAD_HIDDENS but builds natively, so "
+            "test_one_shot_allreduce_rmsnorm_padded is not testing padding"
+        )
+        assert fused_padded_block(hidden)[2] > hidden
+
+    for hidden in range(8, 40961, 8):
+        opts = fused_padded_block_options(hidden)
+        if not opts:
+            continue
+        block, atoms, h_pad = fused_padded_block(hidden)
+        assert h_pad >= hidden
+        assert h_pad == min(o[2] for o in opts), (
+            f"hidden={hidden} padded to {h_pad}, but {min(o[2] for o in opts)} "
+            "is legal and moves fewer bytes"
+        )
+        assert block * atoms * 8 == h_pad
+        native = fused_block_options(hidden)
+        if native:
+            assert (h_pad, block, atoms) == (hidden, *native[0]), (
+                f"hidden={hidden} has a native geometry {native[0]} but "
+                f"resolved to a padded {(block, atoms, h_pad)}"
+            )
 
 
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
