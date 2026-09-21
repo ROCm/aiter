@@ -37,6 +37,15 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
+def _require_cuda_inputs(x, w_oidhw) -> None:
+    """Reject tensors that cannot be consumed by the Triton Conv3D kernels."""
+    if not x.is_cuda or not w_oidhw.is_cuda:
+        raise ValueError(
+            "Conv3D requires CUDA input and weight tensors, got "
+            f"input on {x.device} and weight on {w_oidhw.device}"
+        )
+
+
 class Route3D(Enum):
     # Values are the kernel display names used in benchmark output.
     ONE_X_ONE_X_ONE = "_conv3d_1x1x1_kernel"
@@ -235,6 +244,7 @@ def conv3d_general(
     if layout not in ("ncdhw", "ndhwc"):
         raise ValueError(f"layout must be 'ncdhw' or 'ndhwc', got '{layout}'")
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
     x = _ensure_layout(x, layout)
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
@@ -289,6 +299,7 @@ def conv3d_1x1x1(
     if layout not in ("ncdhw", "ndhwc"):
         raise ValueError(f"layout must be 'ncdhw' or 'ndhwc', got '{layout}'")
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
     x = _ensure_layout(x, layout)
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
@@ -336,6 +347,7 @@ def conv3d_ndhwc_3x3x3(
     """NDHWC-native 3x3x3 conv3d (channels-last-3d). Raises ValueError for
     non-3x3x3. ``x`` is trusted to carry channels_last_3d strides."""
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
     x = _ensure_layout(x, "ndhwc")
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
@@ -386,6 +398,7 @@ def conv3d_ncdhw_cblocked(
     x_blocked: optional pre-packed NCDHWc input (used by the benchmark to time
     the kernel without host-side packing); when None the input is packed here."""
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
     x = _ensure_layout(x, "ncdhw")
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
@@ -448,6 +461,7 @@ def conv3d_winograd_hw_f4x3(
     Raises ValueError for non-eligible convs (needs 3x3x3, stride=1, dilation=1,
     C>=4)."""
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
     x = _ensure_layout(x, "ncdhw")
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
@@ -500,6 +514,7 @@ def conv3d_winograd_hw_f4x3_cblocked(
     x_blocked: optional pre-packed NCDHWc input (used by the benchmark to time
     the kernel without host-side packing); when None the input is packed here."""
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
     x = _ensure_layout(x, "ncdhw")
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
@@ -622,7 +637,7 @@ def conv3d_ncdhw(
     block_k=BLOCK_K,
 ):
     """NCDHW Conv3D with shape-driven specialized-kernel routing."""
-    assert x.is_cuda and w_oidhw.is_cuda
+    _require_cuda_inputs(x, w_oidhw)
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
     x = _ensure_layout(x, "ncdhw")
     return _route_and_run(
@@ -655,7 +670,7 @@ def conv3d_ndhwc(
     allocated channels_last_3d and returned in logical NCDHW shape with
     channels_last_3d strides.
     """
-    assert x.is_cuda and w_oidhw.is_cuda
+    _require_cuda_inputs(x, w_oidhw)
     stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
     x = _ensure_layout(x, "ndhwc")
     return _route_and_run(
