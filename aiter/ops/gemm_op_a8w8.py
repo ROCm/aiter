@@ -1438,27 +1438,30 @@ _MXFP8_GEMM_CONFIG_CACHE: dict = {}
 
 
 @functools.lru_cache(maxsize=1024)
-def get_mxfp8_gemm_config(M, N, K, a_preshuffle, dtype=dtypes.bf16, tuned_file=None):
+def get_mxfp8_gemm_config(
+    M, N, K, a_preshuffle, dtype=dtypes.bf16, tuned_file=None, *, b_intype="mxfp8"
+):
+    """Look up MXFP8 activation GEMM configs using HSA B types (mxfp8/mxfp4)."""
     if tuned_file is None:
-        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_FILE
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_MXFP8FP4_FILE
     if tuned_file not in _MXFP8_GEMM_CONFIG_CACHE:
         _MXFP8_GEMM_CONFIG_CACHE[tuned_file] = (
             pd.read_csv(tuned_file)
             .drop_duplicates()
-            .set_index(["gfx", "M", "N", "K", "a_preshuffle", "outdtype"])
+            .set_index(["gfx", "M", "N", "K", "b_intype", "a_preshuffle", "outdtype"])
             .to_dict("index")
         )
     config = _MXFP8_GEMM_CONFIG_CACHE[tuned_file].get(
-        (get_gfx(), M, N, K, int(bool(a_preshuffle)), str(dtype))
+        (get_gfx(), M, N, K, b_intype, int(bool(a_preshuffle)), str(dtype))
     )
     if config is None:
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, a_preshuffle:{a_preshuffle}, "
+            f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, a_preshuffle:{a_preshuffle}, "
             f"not found tuned config in {tuned_file}, will use default config!"
         )
     elif AITER_LOG_TUNED_CONFIG:
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, a_preshuffle:{a_preshuffle}, "
+            f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, a_preshuffle:{a_preshuffle}, "
             f"found tuned config in {tuned_file}, kernel name is {config['kernelName']}, "
             f"splitK is {config['splitK']}!"
         )
@@ -1466,11 +1469,19 @@ def get_mxfp8_gemm_config(M, N, K, a_preshuffle, dtype=dtypes.bf16, tuned_file=N
 
 
 def _resolve_mxfp8_gemm_config(
-    M, N, K, a_preshuffle, dtype=dtypes.bf16, kernelName="", splitk=None
+    M,
+    N,
+    K,
+    a_preshuffle,
+    dtype=dtypes.bf16,
+    kernelName="",
+    splitk=None,
+    *,
+    b_intype="mxfp8",
 ):
     # Explicit kernels bypass tuning; an explicit split count overrides the CSV.
     if not kernelName:
-        config = get_mxfp8_gemm_config(M, N, K, a_preshuffle, dtype)
+        config = get_mxfp8_gemm_config(M, N, K, a_preshuffle, dtype, b_intype=b_intype)
         if config is not None:
             kernelName = config["kernelName"]
             if splitk is None:
