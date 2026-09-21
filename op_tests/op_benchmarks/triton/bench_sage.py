@@ -86,7 +86,7 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
     q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4(value)
+    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
@@ -1320,8 +1320,8 @@ def make_kernel_runner(
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
         )
-        # Both f4f4 rows ship FP6-P V; mxfp4 uses the canonical order, dense and sparse alike.
-        v_pack = AttentionPack.V_FOR_FP6_P if is_f4f4 else AttentionPack.DEFAULT
+        # Both all-MXFP4 kernels consume an FP6 P operand, so both need the FP6-P V order.
+        v_pack = AttentionPack.V_FOR_FP6_P
 
         def _quantize_mxfp4():
             quant_q, quant_k = q_bshd, k_bshd
