@@ -64,9 +64,11 @@ def test_resolved_policy_partitions_by_size(cell):
     for mode in P.ACCURACY_MODES:
         p = P.resolve(cell[0], cell[1], mode=mode)
         assert 0 < p.oneshot_max == p.oneshot_max_exact
-        if p.mesh_max is not None:
+        # mesh_max=0 / ring_max=0 are "algorithm disabled" sentinels (exact mode);
+        # ordering only applies to active (positive or None) ceilings.
+        if p.mesh_max is not None and p.mesh_max > 0:
             assert p.oneshot_max <= p.mesh_max
-        if p.mesh_max is not None and p.ring_max is not None:
+        if p.mesh_max is not None and p.mesh_max > 0 and p.ring_max is not None and p.ring_max > 0:
             assert p.mesh_max <= p.ring_max
         assert p.min_bytes <= p.oneshot_max
 
@@ -226,7 +228,7 @@ def test_accuracy_mode_env():
 def test_exact_mode_is_oneshot_only():
     """``"exact"`` is not just a wider one-shot boundary -- it is a different
     policy shape. Above ``oneshot_max_exact`` there is no mesh/ring window at
-    all: ``mesh_max`` collapses onto ``oneshot_max`` and ``ring_max=None``, so
+    all: ``mesh_max=0`` and ``ring_max=0`` (disabled sentinels), so
     ``should_fly_all_reduce`` declines any larger payload instead of routing
     it to a quantized schedule. A caller who never touches
     ``AITER_FLY_AR_ACCURACY`` gets bit-exact FlyDSL or no FlyDSL, never
@@ -235,8 +237,8 @@ def test_exact_mode_is_oneshot_only():
     for link in P.LINKS:
         for ws in WORLDS:
             exact = P.resolve(link, ws, mode="exact")
-            assert exact.mesh_max == exact.oneshot_max
-            assert exact.ring_max is None
+            assert exact.mesh_max == 0
+            assert exact.ring_max == 0
             assert P.families_reachable(exact) == ("oneshot",)
             assert exact.oneshot_max == P.FAMILY_POLICY[(link, ws)].oneshot_max_exact
 
@@ -292,7 +294,7 @@ def test_exact_mode_ignores_mesh_max_override():
     a warning) rather than applied."""
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
         p = P.resolve("pcie", 4, mode="exact")
-        assert p.mesh_max == p.oneshot_max
+        assert p.mesh_max == 0
         assert p.mesh_max != 1048576
 
 

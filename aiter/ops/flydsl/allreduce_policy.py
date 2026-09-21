@@ -54,11 +54,13 @@ class FamilyPolicy:
     def max_bytes(self) -> int | None:
         """Upper bound of the dispatch range, or ``None`` if unbounded.
 
-        ``None`` means the last reachable family (mesh when ``ring_max`` is
-        not set, ring when it is) has no size ceiling. Callers that need an
-        integer for range comparisons should treat ``None`` as infinity.
+        ``None`` means at least one active family has no size ceiling.
+        Callers that need an integer for range comparisons should treat
+        ``None`` as infinity.
         """
-        return self.ring_max if self.mesh_max is not None else None
+        if self.mesh_max is None or self.ring_max is None:
+            return None
+        return max(self.oneshot_max, self.oneshot_max_exact, self.mesh_max, self.ring_max)
 
     def __post_init__(self):
         if self.oneshot_max <= 0 or self.oneshot_max_exact <= 0:
@@ -66,60 +68,50 @@ class FamilyPolicy:
                 f"oneshot_max ({self.oneshot_max}) and oneshot_max_exact "
                 f"({self.oneshot_max_exact}) must be positive"
             )
-        if self.mesh_max is not None and self.mesh_max < self.oneshot_max:
+        if self.mesh_max is not None and self.mesh_max > 0 and self.mesh_max < self.oneshot_max:
             raise ValueError(
                 f"mesh_max ({self.mesh_max}) must be >= oneshot_max "
                 f"({self.oneshot_max}); the families partition by size"
-            )
-        if (
-            self.mesh_max is not None
-            and self.ring_max is not None
-            and self.ring_max < self.mesh_max
-        ):
-            raise ValueError(
-                f"ring_max ({self.ring_max}) must be >= mesh_max "
-                f"({self.mesh_max}); the families partition by size"
             )
 
 
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     # --- PCIe: Policy from measurements (on gfx950/MI350P) --------------------
     ("pcie", 2): FamilyPolicy(
-        oneshot_max=512 << 10, oneshot_max_exact=1536 << 10, mesh_max=3 << 20
+        oneshot_max=512 << 10, oneshot_max_exact=1536 << 10, mesh_max=3 << 20, ring_max=None
     ),
     ("pcie", 4): FamilyPolicy(
-        oneshot_max=64 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=8 << 20
+        oneshot_max=64 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=8 << 20, ring_max=None
     ),
     ("pcie", 8): FamilyPolicy(
-        oneshot_max=16 << 10, oneshot_max_exact=(80 << 10) - 1, mesh_max=12 << 20
+        oneshot_max=16 << 10, oneshot_max_exact=(80 << 10) - 1, mesh_max=12 << 20, ring_max=None
     ),
     # --- xGMI: Policy from measurements (on gfx942) --------------------
-    # ring_max omitted (defaults to None): ring is never the best choice on
-    # xGMI (all-pairs equidistant fabric), so the mesh window is unbounded.
+    # No ring algorithm, mesh is always better.
     ("xgmi", 2): FamilyPolicy(
-        oneshot_max=512 << 10, oneshot_max_exact=4 << 20, mesh_max=None,
+        oneshot_max=512 << 10, oneshot_max_exact=4 << 20, mesh_max=None
     ),
     ("xgmi", 4): FamilyPolicy(
-        oneshot_max=512 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=None,
+        oneshot_max=512 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=None
     ),
     ("xgmi", 8): FamilyPolicy(
-        oneshot_max=256 << 10, oneshot_max_exact=256 << 10, mesh_max=None,
+        oneshot_max=256 << 10, oneshot_max_exact=256 << 10, mesh_max=None
     ),
 }
 
 FUSED_FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     # --- PCIe: Policy from measurements (on gfx950/MI350P) --------------------
     ("pcie", 2): FamilyPolicy(
-        oneshot_max=768 << 10, oneshot_max_exact=768 << 10, mesh_max=768 << 10
+        oneshot_max=768 << 10, oneshot_max_exact=768 << 10, mesh_max=768 << 10, ring_max = None
     ),
     ("pcie", 4): FamilyPolicy(
-        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=8 << 20
+        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=8 << 20, ring_max=None
     ),
     ("pcie", 8): FamilyPolicy(
-        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=128 << 20
+        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=128 << 20, ring_max=None
     ),
     # --- xGMI: Policy from measurements (on gfx942/MI300X) --------------------
-    # ring_max omitted (defaults to None): ring is never dispatched on xGMI.
+    # No ring algorithm, mesh is always better.
     ("xgmi", 2): FamilyPolicy(
         oneshot_max=1 << 20, oneshot_max_exact=1 << 20, mesh_max=None,
     ),
@@ -280,8 +272,8 @@ def _resolve(base: FamilyPolicy, mode, *, one_var: str, mesh_var: str) -> Family
         return FamilyPolicy(
             oneshot_max=one,
             oneshot_max_exact=one,
-            mesh_max=one,
-            ring_max=None,
+            mesh_max=0,
+            ring_max=0,
             min_bytes=base.min_bytes,
         )
 
@@ -344,11 +336,11 @@ def families_reachable(policy: FamilyPolicy) -> tuple[str, ...]:
     mesh_reachable = policy.mesh_max is None or policy.mesh_max > policy.oneshot_max
     if mesh_reachable:
         out.append("mesh")
-    # Ring is reachable only when mesh_max is finite (otherwise the mesh is
-    # unbounded and the ring is never dispatched) AND the mesh window is
-    # non-empty (if mesh_max == oneshot_max there is no mesh window and no
-    # payload can land in the ring window either, since pick_family returns
-    # "mesh" for anything above oneshot_max when mesh_max is None).
-    if mesh_reachable and policy.mesh_max is not None:
+    # Ring is reachable when the mesh window is finite and non-empty (ring
+    # starts above mesh_max) AND the ring window itself is non-empty: either
+    # ring_max is None (unbounded) or ring_max > mesh_max.
+    if mesh_reachable and policy.mesh_max is not None and (
+        policy.ring_max is None or policy.ring_max > policy.mesh_max
+    ):
         out.append("ring")
     return tuple(out)

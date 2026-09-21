@@ -244,6 +244,9 @@ class FlyDSLAllReduce:
             return False
         if nbytes < self.policy.min_bytes:
             return False
+        max_b = self.policy.max_bytes
+        if max_b is not None and nbytes > max_b:
+            return False
         # A family the table can name but this rank did not build (an env
         # override can widen a window past what ``families_reachable`` saw at
         # construction). Decline rather than KeyError on the critical path.
@@ -529,6 +532,9 @@ class FlyDSLAllReduceRMSNorm:
         if nbytes % 16 != 0:
             return False
         if nbytes < self.policy.min_bytes:
+            return False
+        max_b = self.policy.max_bytes
+        if max_b is not None and nbytes > max_b:
             return False
         family = self.family_for(nbytes)
         eng = self._engines.get(family)
