@@ -822,6 +822,14 @@ drop the ``di`` loop). ``err=0``; width-2051 ``L=512`` was 18.6 /
 worse; prefill does not launch merge. Keep two waves and two ``D``
 lanes per thread.
 
+**Do not retry** 64-bit ``BufferCopy64b`` ``partial_out`` loads in the
+128-thread LSE merge with consecutive ``D`` pairs (``d=2*tid``). GPU 6 /
+gfx950 stayed exact (``err=0``); merge VGPR 112 → 63 and ISA emitted
+``buffer_load_dwordx2``. Split-kernel occupancy ISA was unchanged. Width-2051
+``L=512`` went 18.65 → 18.76 us at ``M=1`` and 21.15 → 21.62 us at ``M=8``;
+``M=512`` was flat (no merge). This is not the earlier 8-wide / 64-thread
+128-bit merge miss. Keep scalar per-``D`` merge loads.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
