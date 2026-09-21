@@ -5,6 +5,7 @@ import csv
 import glob
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -548,6 +549,66 @@ def generate_test_tensors(
         v = 0.5 * torch.randn(
             (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
         )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution in ("clustered", "kcommon"):
+        # Coherent-attention regime. The shipped distributions are all far more diffuse and far
+        # more self-cancelling than measured model traces (n_eff 125-3050 and cancel 11-55 here,
+        # against 21-173 and 1.3-3.3 on real fixtures), so the quantized rows are never exercised
+        # where real workloads actually live. Tokens are drawn from clusters: a query scores its
+        # own cluster highly, which sets n_eff, and V carries a shared per-cluster component, which
+        # keeps the output coherent and cancellation low.
+        #
+        # "kcommon" additionally gives K a large shared direction. Softmax is shift-invariant, so a
+        # component common to every key changes no output, but per-tensor Q/K quantization noise
+        # scales with the magnitude of q.k rather than with its spread across keys. It is therefore
+        # invisible to n_eff, cancellation and logit spread while multiplying the quantized-row
+        # error, and it is the one axis no other distribution here covers.
+        # Tokens are drawn from clusters: a query scores its own cluster highly, which sets
+        # n_eff, and V carries a shared per-cluster component, which keeps the output coherent
+        # and cancellation low.
+        clusters = max(8, sk // 16)
+        rho = 0.8  # share of a Q/K row explained by its centroid
+        struct = 0.55  # shared share of a V row; lower cancels more
+        target_logit_std = 1.2
+        k_common = 16.0 if distribution == "kcommon" else 0.0
+
+        group = max(1, hq // hk)
+        a, b = math.sqrt(rho), math.sqrt(1.0 - rho)
+        centroids = torch.randn(
+            (hk, clusters, d_head), device=device, dtype=torch.float32
+        )
+        v_centroids = torch.randn(
+            (hk, clusters, d_head_v), device=device, dtype=torch.float32
+        )
+        assign_q = torch.randint(0, clusters, (sq,), device=device)
+        assign_k = torch.randint(0, clusters, (sk,), device=device)
+
+        q = torch.empty((batch, hq, sq, d_head), device=device, dtype=torch.float32)
+        k = torch.empty((batch, hk, sk, d_head), device=device, dtype=torch.float32)
+        v = torch.empty((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
+        for h in range(hk):
+            k[:, h] = a * centroids[h][assign_k] + b * torch.randn(
+                (batch, sk, d_head), device=device, dtype=torch.float32
+            )
+            v[:, h] = struct * v_centroids[h][assign_k] + math.sqrt(
+                1.0 - struct * struct
+            ) * torch.randn((batch, sk, d_head_v), device=device, dtype=torch.float32)
+        for h in range(hq):
+            q[:, h] = a * centroids[h // group][assign_q] + b * torch.randn(
+                (batch, sq, d_head), device=device, dtype=torch.float32
+            )
+
+        # Hold the logit spread fixed so the cluster knobs move diffuseness alone.
+        probe = torch.arange(0, sq, max(1, sq // 64), device=device)[:64]
+        measured = ((q[0, 0, probe] @ k[0, 0].T) * (d_head**-0.5)).std(-1).median()
+        q *= target_logit_std / measured.clamp_min(1e-9)
+
+        if k_common:
+            direction = torch.randn((hk, d_head), device=device, dtype=torch.float32)
+            direction /= direction.norm(dim=-1, keepdim=True)
+            k += k_common * k.norm(dim=-1).mean() * direction[None, :, None, :]
+
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution != "transformer":
@@ -2240,6 +2301,8 @@ def parse_args() -> argparse.Namespace:
             "underflow",
             "latepeak",
             "maxstair",
+            "clustered",
+            "kcommon",
         ],
         help=(
             "Distribution used for generated Q/K/V tensors. 'zero' sets all Q/K/V values "
@@ -2247,7 +2310,9 @@ def parse_args() -> argparse.Namespace:
             "StreamingLLM attention sink pattern; 'underflow'/'latepeak' are "
             "adversarial fp8 tile-skip / frozen-max rollback regression tripwires; "
             "'maxstair' raises the max every KV tile and triggers rollback for alternating "
-            "query-row groups."
+            "query-row groups; 'clustered' is the coherent low-cancellation regime real "
+            "traces occupy, which the others miss; 'kcommon' adds the shared K direction "
+            "that inflates quantization noise without changing any softmax statistic."
         ),
     )
     parser.add_argument(
