@@ -224,7 +224,26 @@ def fp8_mqa_logits(
             # ceiling. It must also be gated on use_buffer_store: BLOCK_M=2
             # on the non-buffer-store path trips an LLVM assertion ("Begin must
             # be less or equal to End") that aborts the process rather than
-            # failing the launch.
+            # failing the launch. For the 32x128 indexer shape below the
+            # measured crossover is ~1024 rows rather than 2048, because sglang
+            # splits the call to keep the fp32 logits under aiter's 2 GiB limit
+            # and the chunks the kernel sees are only ~1-2k rows wide.
+
+            if num_heads == 32 and head_size == 128:
+                # Retuned for the DSA indexer, which is what this shape is:
+                # 32 index heads of 128, one call per prefill over the whole
+                # cached context. Autotuned per shape over the (seq_len x
+                # seq_len_kv) cells a GLM-5.2 agentic replay actually produces,
+                # weighted by GEMM work, then reduced to the simplest rule that
+                # keeps the gain: 128-wide KV tiles at 2 waves/EU. Scoped to
+                # this shape, which is the measured domain; all other shapes
+                # keep the default config.
+                block_kv = 128
+                waves_per_eu = 2
+                # num_warps is part of the measured config. Upstream it is
+                # inherited from a `2 if num_heads <= 32 else 1` default that
+                # this tree does not have, so state it explicitly.
+                num_warps = 2
             other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
         else:
             loop_variant = 1
