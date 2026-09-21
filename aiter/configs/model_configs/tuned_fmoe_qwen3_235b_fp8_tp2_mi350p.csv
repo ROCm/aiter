@@ -1,0 +1,4 @@
+gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us1,kernelName1,err1,us2,kernelName2,err2,us,run_1stage,xbf16,flat,tflops,bw
+gfx950,128,1,4096,768,128,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,1,0,39.2827,_ZN5aiter48fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_1x128E,0.0%,0.0,,0.0%,39.2827,1,1,1,3.84,30750.73
+gfx950,128,2,4096,768,128,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,1,0,58.427,_ZN5aiter48fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_1x128E,0.0%,0.0,,0.0%,58.427,1,1,1,5.17,20675.1
+gfx950,128,4,4096,768,128,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,1,0,104.7781,_ZN5aiter48fmoe_bf16_blockscaleBf16_g1u1_flat_vs_silu_1x256E,0.0%,0.0,,0.0%,104.7781,1,1,1,5.76,11529.21
