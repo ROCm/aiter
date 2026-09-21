@@ -27,7 +27,6 @@ from .flash_attn_func_common_gfx1201 import (
 from .kernels_common import LOG2E as _LOG2E
 from .tensor_shim import _run_compiled
 
-KERNEL_NAME = "flash_attn_func_gfx1201_kernel"
 NUM_PREFETCH_K = 1
 NUM_PREFETCH_V = 1
 
@@ -56,7 +55,6 @@ def build_flash_attn_func_module(
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
-    path_tag="auto",
 ):
     """Build the gfx1201 Flash Attention kernel."""
 
@@ -144,6 +142,8 @@ def build_flash_attn_func_module(
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
     LDS_KV_TOTAL_SIZE = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_SIZE
 
+    # A single aligned, typed arena preserves the explicit K/V element offsets while
+    # allowing vector-width views. SharedAllocator owns the static LDS sizing.
     _NUMERIC_MAP = {
         "f32": fx.Float32,
         "f16": fx.Float16,
@@ -166,15 +166,6 @@ def build_flash_attn_func_module(
         seq_len_kv: fx.Int32,
     ):
         elem_dtype = elem_numeric_cls
-
-        def _fadd(a, b):
-            return a + b
-
-        def _fsub(a, b):
-            return a - b
-
-        def _fmul(a, b):
-            return a * b
 
         def _fmax(a, b):
             return fx.Float32(a).maximumf(fx.Float32(b))
@@ -348,16 +339,16 @@ def build_flash_attn_func_module(
                         g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                         vec = load_global_f16xN(k_elem_ptr, g_idx)
-                        lds_store(lds_idx, Vec(vec))
+                        lds_store(lds_idx, vec)
                 else:
                     g_idx = kv_global_idx(row_idx, load_col_base)
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     vec = load_global_f16xN(k_elem_ptr, g_idx)
-                    lds_store(lds_idx, Vec(vec))
+                    lds_store(lds_idx, vec)
 
         def _v_store_row_major(v_base, lds_row, load_col_base, col_extra, vec):
             lds_idx = v_base + lds_row * V_STRIDE + load_col_base + col_extra
-            fx.ptr_store(Vec(vec), lds_kv + fx.Int32(lds_idx))
+            fx.ptr_store(vec, lds_kv + fx.Int32(lds_idx))
 
         def coop_load_v_global(tile_start):
             tile_start = fx.Int64(tile_start)
@@ -458,7 +449,6 @@ def build_flash_attn_func_module(
             for vi in range_constexpr(NUM_V_VECS):
                 init_args.append(_v_vecs_init[vi])
 
-        loop_results = init_args
         for kv_block_start, inner_iter_args in range(
             fx.Int64(0), kv_upper, fx.Int64(BLOCK_N_OUT), init=init_args
         ):
@@ -548,14 +538,14 @@ def build_flash_attn_func_module(
             row_max = _fmax(local_max, peer_max)
             m_new_raw = _fmax(m_running, row_max)
 
-            diff_m_raw = _fsub(m_running, m_new_raw)
-            diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
+            diff_m_raw = m_running - m_new_raw
+            diff_m_scaled = diff_m_raw * c_sm_scale_log2e
             corr = fx.Float32(
                 fx.rocdl.exp2(fx.Float32.ir_type, fx.Float32(diff_m_scaled).ir_value())
             )
 
-            scaled_max = _fmul(c_sm_scale_log2e, m_new_raw)
-            neg_scaled_max = _fsub(c_zero_f, scaled_max)
+            scaled_max = c_sm_scale_log2e * m_new_raw
+            neg_scaled_max = c_zero_f - scaled_max
 
             p_vals = []
             local_sum = c_zero_f
@@ -565,16 +555,16 @@ def build_flash_attn_func_module(
                     fx.rocdl.exp2(fx.Float32.ir_type, fx.Float32(diff).ir_value())
                 )
                 p_vals.append(p)
-                local_sum = _fadd(local_sum, p)
+                local_sum = local_sum + p
 
             peer_sum = reduction_peer(local_sum)
-            tile_sum = _fadd(local_sum, peer_sum)
-            l_corr = _fmul(corr, l_running)
-            l_new = _fadd(l_corr, tile_sum)
+            tile_sum = local_sum + peer_sum
+            l_corr = corr * l_running
+            l_new = l_corr + tile_sum
 
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(8)
             for dc in range_constexpr(D_CHUNKS):
-                o_accs[dc] = _fmul(o_accs[dc], corr_vec)
+                o_accs[dc] = o_accs[dc] * corr_vec
 
             coop_store_v_lds(_v_vecs_tile, 0)
             gpu.barrier()

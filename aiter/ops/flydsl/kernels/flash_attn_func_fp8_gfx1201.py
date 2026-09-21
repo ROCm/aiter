@@ -31,17 +31,15 @@ WMMA 16x16x16 register layout (wave32):
 
 Layout: Q/K/V/O are 1D flattened from BSHD (batch, seq_len, num_heads, head_dim).
 Grid:   (batch * num_q_tiles * num_heads,)
-Block:  (256,) -- 8 waves x 32 threads/wave.
+Block:  (BLOCK_M / 16) wave32 waves by default; flat_work_group_size may override.
 
 Requires: head_dim % 32 == 0, head_dim >= 64.
 
-Low-level operations are limited to three performance-sensitive boundaries:
-the packed FP8 WMMA/conversion intrinsics, the byte-transposed LDS path, and
-explicit fast-math/signed-comparison operations. On gfx1201, FlyDSL 0.3.2
-rejects the high-level FP8 WMMA atom during construction. Replacing the LDS path
-with SharedAllocator measured 3.7-5.1x slower, while replacing four scalar K
-stores with Vector.store regressed representative shapes by 1.8-6.5%. Keep
-these boundaries local and compare generated ISA before migrating.
+Low-level operations remain only where the public API does not expose the same
+packed ABI: FP8 WMMA/conversion intrinsics, packed global pointer accesses, and
+explicit fast-math/signed comparisons. LDS uses one typed SharedAllocator arena
+with an i8 alias for transposed stores. Keep the four K stores scalar to preserve
+their tuned LDS schedule, and compare generated ISA before changing a boundary.
 """
 
 import math as host_math
@@ -52,9 +50,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
-from flydsl._mlir.dialects import (
-    memref as _memref,
-)
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
@@ -64,8 +59,6 @@ from flydsl.expr import (
 )
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 try:
     from flydsl.expr import buffer_ops
@@ -192,8 +185,6 @@ def build_flash_attn_func_module(
     daz=True,
 ):
     """Build shape-tiled gfx1201 FP8 attention with pipelined GEMM2/V loads."""
-    gpu_arch = get_hip_arch()
-
     # ---- WMMA / wave32 constants ----
     WARP_SIZE = 32
     WMMA_M = 16
@@ -221,7 +212,6 @@ def build_flash_attn_func_module(
         flat_work_group_size = NUM_WAVES * WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
 
-    PATH_TAG = f"M{BLOCK_M}N{BLOCK_N}_combined"
     BLOCK_N_OUT = BLOCK_N
 
     K_STEP_QK = WMMA_K
@@ -274,28 +264,22 @@ def build_flash_attn_func_module(
     ) = kv_load_schedule(BLOCK_SIZE, HEAD_DIM, BLOCK_N, VEC_WIDTH)
     NUM_KV_CHUNKS = BLOCK_N * THREADS_PER_ROW_LOAD
 
+    # One aligned i32 arena keeps K and packed-V reads vector typed. An i8 alias is
+    # used only for transposed V scatter stores; both typed views share one storage
+    # layout, preserving 16-byte alignment and packed LDS operations.
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
     LDS_K_TOTAL_SIZE = NUM_PREFETCH_K * LDS_K_TILE_SIZE
     # FP8 V is transposed in LDS (V_T[d][kv_row]) so GEMM2 reads contiguous
     # v2i32. All V sizing and addressing is expressed directly in bytes.
     KV_STRIDE_FP8 = BLOCK_N + 4  # fp8 bytes per d-row (kv_row inner + pad)
     KV_STRIDE_I32_FP8 = KV_STRIDE_FP8 // 4  # i32 words per d-row (contiguous kv load)
-    V_BYTE_BASE = LDS_K_TOTAL_SIZE  # fp8 V region starts after fp8 K region (bytes)
+    V_BYTE_BASE = LDS_K_TOTAL_SIZE
     LDS_V_TOTAL_BYTES = NUM_PREFETCH_V * HEAD_DIM * KV_STRIDE_FP8
     LDS_TOTAL_BYTES = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_BYTES
 
-    # PERF(gfx1201): Keep typed SmemPtr views and their required fx.Index
-    # boundaries. FlyDSL 0.2.4 and 0.3.1 SharedAllocator byte-pointer lowering
-    # makes representative FP8 attention shapes 3.7-5.1x slower. Revisit only
-    # when the generated ISA and latency are equivalent.
-    allocator = SmemAllocator(
-        None,
-        arch=gpu_arch,
-        global_sym_name=f"flash_attn_func_fp8_gfx1201c_exp_a_smem_{PATH_TAG}",
-    )
-    lds_kv_offset = allocator._align(allocator.ptr, 16)
-    # FP8 K (1 byte/elem) followed by the transposed FP8 V region.
-    allocator.ptr = lds_kv_offset + LDS_TOTAL_BYTES
+    @fx.struct
+    class SharedStorage:
+        kv: fx.Array[fx.Int32, LDS_TOTAL_BYTES // 4, 16]
 
     # Map dtype string to a FlyDSL Numeric class (for Vec.make_type and `.to(...)`).
     # aiter's `dtype_to_elem_type` returns a raw MLIR `ir.Type`; the FlyDSL Vector
@@ -341,9 +325,8 @@ def build_flash_attn_func_module(
         _i8_input_ty = fx.Int8.ir_type
 
         def wmma_acc_fp8(k_v2i32_raw, q_pk_pair, c_v8):
-            # FlyDSL 0.3.2's high-level FP8 WMMA atom rejects gfx1201 during
-            # construction. Keep this target-supported intrinsic local until
-            # the universal WMMA builder exposes the same packed contract.
+            # The high-level WMMA atom does not expose this packed FP8 operand
+            # contract. Keep the target-supported intrinsic local.
             q_vec = Vec.from_elements(q_pk_pair, fx.Int32).ir_value()
             return fx.rocdl.wmma_f32_16x16x16_fp8_fp8(
                 res=v8f32_type, a=k_v2i32_raw, b=q_vec, c=c_v8
@@ -359,31 +342,18 @@ def build_flash_attn_func_module(
             # self-attn path pays nothing for the cross-attn arg.
             seq_len_kv_v = seq_len_v
 
-        base_ptr = allocator.get_base()
-        # FP8 K region indexed in i32 units (4 fp8/i32, ds_read_b64 for v2i32 loads).
-        # Byte offset same as lds_kv_offset; elem_type=i32; shape=LDS_K_TOTAL_SIZE//4 i32 words.
-        _i32_mlir_type = fx.Int32.ir_type
-        lds_k_i32 = SmemPtr(
-            base_ptr,
-            lds_kv_offset,
-            _i32_mlir_type,
-            shape=(LDS_K_TOTAL_SIZE // 4,),
-        ).get()
-        # fp8 V region views (same base_ptr/offset as lds_kv):
-        # i8 view → byte-addressable GEMM2 read; i32 view → vectorized convert-store.
-        _i8_mlir_type = fx.Int8.ir_type
-        lds_v_i8 = SmemPtr(
-            base_ptr,
-            lds_kv_offset,
-            _i8_mlir_type,
-            shape=(LDS_TOTAL_BYTES,),
-        ).get()
-        lds_v_i32 = SmemPtr(
-            base_ptr,
-            lds_kv_offset,
-            _i32_mlir_type,
-            shape=(LDS_TOTAL_BYTES // 4,),
-        ).get()
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_i32_ptr = lds.kv.ptr
+        lds_i8_ptr = fx.recast_iter(
+            fx.PointerType.get(fx.Int8.ir_type, lds_i32_ptr.address_space),
+            lds_i32_ptr,
+        )
+
+        def lds_i32_view(offset, width):
+            return fx.make_view(
+                lds_i32_ptr + fx.Int32(offset),
+                fx.make_layout(width, 1),
+            )
 
         block_id = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
@@ -424,11 +394,9 @@ def build_flash_attn_func_module(
             return _pointer_load(vec_type, gep)
 
         def coop_load_k(tile_start):
-            # Load K global (already fp8), store as i32 words in lds_k_i32.
-            # LDS index in i32 units: k_base_i32 = buf_id * LDS_K_TILE_SIZE // 4
-            # Per-row: lds_row * K_STRIDE_I32 + load_col_base // 4
-            # VEC_WIDTH=16 fp8 per thread = 4 i32 → stored at consecutive i32 slots.
-            k_base_i32 = fx.Index(0)
+            # Load K global (already fp8), store as i32 words in typed LDS.
+            # LDS indices are i32 words: row*K_STRIDE_I32 + fp8_column/4.
+            # Each thread stores its 16-byte global load as four consecutive words.
             for batch in range_constexpr(NUM_BATCHES_KV):
                 linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
                 lds_row = linear_chunk // fx.Index(THREADS_PER_ROW_LOAD)
@@ -440,32 +408,24 @@ def build_flash_attn_func_module(
                     chunk_valid = linear_chunk < fx.Index(NUM_KV_CHUNKS)
                     if chunk_valid:
                         g_idx = kv_global_idx(row_idx, load_col_base)
-                        lds_i32_idx = (
-                            k_base_i32 + lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
-                        )
+                        lds_i32_idx = lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
                         v4 = _load_global_fp8(k_ptr, g_idx, v4i32_type)
                         # Four scalar stores preserve the tuned LDS instruction
-                        # sequence; Vector.store was 6.15% slower at S=1536.
-                        fp8_i32s = [Vec(v4)[wi] for wi in range(4)]
+                        # sequence; keep both branches structurally identical.
                         for wi in range_constexpr(4):
-                            _memref.store(
-                                _raw(fp8_i32s[wi]),
-                                lds_k_i32,
-                                [_raw(lds_i32_idx + fx.Index(wi))],
+                            fx.ptr_store(
+                                Vec(v4)[wi],
+                                lds_i32_ptr + fx.Int32(lds_i32_idx + fx.Index(wi)),
                             )
                 else:
                     g_idx = kv_global_idx(row_idx, load_col_base)
-                    lds_i32_idx = (
-                        k_base_i32 + lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
-                    )
+                    lds_i32_idx = lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
                     v4 = _load_global_fp8(k_ptr, g_idx, v4i32_type)
                     # Keep this identical to the guarded path above.
-                    fp8_i32s = [Vec(v4)[wi] for wi in range(4)]
                     for wi in range_constexpr(4):
-                        _memref.store(
-                            _raw(fp8_i32s[wi]),
-                            lds_k_i32,
-                            [_raw(lds_i32_idx + fx.Index(wi))],
+                        fx.ptr_store(
+                            Vec(v4)[wi],
+                            lds_i32_ptr + fx.Int32(lds_i32_idx + fx.Index(wi)),
                         )
 
         def _v_store_row_major_fp8(lds_row, load_col_base, v_bytes):
@@ -478,7 +438,7 @@ def build_flash_attn_func_module(
                 byte_idx = (
                     fx.Index(V_BYTE_BASE) + d_col * fx.Index(KV_STRIDE_FP8) + lds_row
                 )
-                _memref.store(_raw(v_bytes[j]), lds_v_i8, [_raw(byte_idx)])
+                fx.ptr_store(v_bytes[j], lds_i8_ptr + fx.Int32(byte_idx))
 
         def coop_load_v_global(tile_start):
             vecs = []
@@ -574,10 +534,8 @@ def build_flash_attn_func_module(
             gpu.barrier()
 
             # ==== GEMM1: S = K @ Q^T (fp8 WMMA) ====
-            # K loaded as v2i32 (ds_read_b64) from lds_k_i32; Q as v2i32 from registers.
-            # Single-buffered LDS, so k_base_i32 = 0.
+            # K loaded as v2i32 (ds_read_b64) from typed LDS; Q as v2i32 from registers.
             s_accs = [_raw(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
-            k_base_i32 = fx.Index(0)
 
             for ks in range_constexpr(K_STEPS_QK):
                 # k_col_i32 in i32 units: ks*K_STEP_QK fp8 elements / 4 fp8 per i32
@@ -590,16 +548,12 @@ def build_flash_attn_func_module(
                     st_base_row = st_idx * K_SUB_N
 
                     k_row_a = lane16 + fx.Index(st_base_row)
-                    k_lds_a_i32 = (
-                        k_base_i32 + k_row_a * fx.Index(K_STRIDE_I32) + k_col_i32
-                    )
-                    k_pack_a_v2i32 = Vec.load(v2i32_type, lds_k_i32, [k_lds_a_i32])
+                    k_lds_a_i32 = k_row_a * fx.Index(K_STRIDE_I32) + k_col_i32
+                    k_pack_a_v2i32 = lds_i32_view(k_lds_a_i32, 2).load()
 
                     k_row_b = lane16 + fx.Index(st_base_row + 16)
-                    k_lds_b_i32 = (
-                        k_base_i32 + k_row_b * fx.Index(K_STRIDE_I32) + k_col_i32
-                    )
-                    k_pack_b_v2i32 = Vec.load(v2i32_type, lds_k_i32, [k_lds_b_i32])
+                    k_lds_b_i32 = k_row_b * fx.Index(K_STRIDE_I32) + k_col_i32
+                    k_pack_b_v2i32 = lds_i32_view(k_lds_b_i32, 2).load()
 
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
@@ -674,8 +628,7 @@ def build_flash_attn_func_module(
                     + fx.Index((st_kv_base_val + pks_val * PV_K_STEP) // 4)
                     + klane * fx.Index(WMMA_LANE_K // 4)
                 )
-                v_pack = Vec.load(v2i32_type, lds_v_i32, [v_i32_idx])
-                return Vec(v_pack).ir_value()
+                return lds_i32_view(v_i32_idx, 2).load().ir_value()
 
             # Software pipeline: preload first V pack
             cur_v_packs = []
@@ -754,10 +707,7 @@ def build_flash_attn_func_module(
         v_scale_ptr: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        allocator.finalized = False
         ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
 
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)

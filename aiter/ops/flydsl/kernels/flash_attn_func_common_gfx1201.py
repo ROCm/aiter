@@ -3,11 +3,12 @@
 
 """Shared representation-independent helpers for gfx1201 flash attention."""
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
+
+from .tensor_shim import ptr_arg as _ptr_arg
 
 
 def kv_load_schedule(block_size, head_dim, block_n, vec_width):
@@ -46,6 +47,7 @@ def mask_scores(
     for acc in range_constexpr(num_s_accs):
         for row in range_constexpr(8):
             idx = acc * 8 + row
+            # Each accumulator covers eight columns in a 16-column WMMA half.
             col_i32 = kv_start_i32 + acc * 16 + row + klane_off_i32
             pred = (
                 col_i32 > q_row_i32 if const_expr(causal) else col_i32 >= seq_len_real
@@ -55,7 +57,7 @@ def mask_scores(
 
 
 def configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz):
-    """Apply launch attributes shared by both attention kernels."""
+    """Apply raw GPU/LLVM attributes without public FlyDSL launch wrappers."""
     if const_expr(waves_per_eu is not None):
         value = int(waves_per_eu)
         if const_expr(value >= 1):
@@ -91,14 +93,7 @@ def pointer_arg(value):
     """Convert tensor-like launch arguments to raw FlyDSL pointers."""
     if not hasattr(value, "data_ptr"):
         return value
-    type_name = type(value).__name__
-    module_name = type(value).__module__
-    ptr = (
-        0
-        if type_name == "FakeTensor" or "fake_tensor" in module_name
-        else value.data_ptr()
-    )
-    return flyc.from_c_void_p(fx.Uint8, ptr)
+    return _ptr_arg(value)
 
 
 def wrap_pointer_args(args, kwargs, positional_indices, keyword_names):
