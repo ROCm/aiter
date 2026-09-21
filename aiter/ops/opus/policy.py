@@ -613,7 +613,7 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         logger.warning("MXFP8 BMM tuned CSV was not found at %s", path)
         return {}
 
-    required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
+    required = {"gfx", "b", "m", "n", "k", "groupSize", "kernelId", "splitK"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
@@ -672,7 +672,13 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         )
         df = df.loc[~invalid_opus_rows].copy()
 
-    shape_keys = ["gfx", "b", "m", "n", "k"]
+    # groupSize is part of the key, not a note on the row: the same shape has
+    # a best 128-block kid and a best 32-block kid, and they are different
+    # kernels. Without it the two collide as duplicate shapes, and a lookup
+    # could hand a 128 kid a scale buffer with four times the entries -- not a
+    # shape error downstream, just the wrong stride, so a plausible wrong
+    # answer at full speed.
+    shape_keys = ["gfx", "b", "m", "n", "k", "groupSize"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
         rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
@@ -687,15 +693,21 @@ def lookup_mxscale_bmm_config(
     n: int,
     k: int,
     *,
+    group_size: int = 128,
     libtype: str | None = None,
 ):
-    """Return the exact or existing padded-M tuned row for one shape."""
+    """Return the exact or existing padded-M tuned row for one shape.
+
+    ``group_size`` is the quantisation block the caller's scales are in, 128 or
+    32, and it selects among kids rather than describing them: a row tuned for
+    one block is meaningless for the other.
+    """
     gfx = get_gfx()
     tuned = _load_mxscale_bmm_tuned(libtype)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, b, padded_m, n, k))
+        row = tuned.get((gfx, b, padded_m, n, k, group_size))
         if row is not None:
             break
 
