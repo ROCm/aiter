@@ -80,6 +80,40 @@ def _arch_num_warps(arch: str) -> int:
     return _ARCH_NUM_WARPS.get(arch, _arch_block_k(arch) // 16)
 
 
+# An arch listed here has its geometry checked against that LDS budget. gfx942
+# is the only one that needs it: it already takes the smaller of the two tiles
+# this wrapper selects, so a latent too wide to fit has nowhere left to go.
+# gfx950 has 160 KB and is left to the launcher, as before.
+_ARCH_LDS_BUDGET = {"gfx942": 64 * 1024}
+# Row pitch padding, and the scratch the kernel takes beyond the tiles. Both
+# hold only for bf16 tiles with the async path off, which is every gfx942
+# launch: fp8 dots are rejected there and lds_limited forces ASYNC_LDS off.
+_LDS_PAD = 8
+_LDS_SCRATCH_PER_BLOCK_K = 32
+
+
+def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim):
+    """Reject a geometry whose tiles cannot fit, naming what would.
+
+    Left to the launcher this surfaces as an opaque OutOfResources.
+    """
+    budget = _ARCH_LDS_BUDGET.get(arch)
+    if budget is None:
+        return
+    rope = block_k * (qk_rope_head_dim + _LDS_PAD) * 2 if qk_rope_head_dim else 0
+    need = (
+        block_k * (kv_lora_rank + _LDS_PAD) * 2
+        + rope
+        + _LDS_SCRATCH_PER_BLOCK_K * block_k
+    )
+    if need > budget:
+        raise ValueError(
+            f"kv_lora_rank={kv_lora_rank} with qk_rope_head_dim="
+            f"{qk_rope_head_dim} needs {need} B of LDS at BLOCK_K={block_k}, "
+            f"over {arch}'s {budget} B. This geometry needs gfx950's 160 KB."
+        )
+
+
 def _mla_num_splits(
     num_queries: int, heads_blocks: int, avg_topk: float, block_k: int = 64
 ) -> int:
@@ -638,6 +672,7 @@ def sparse_mla_fwd(
         block_k=block_k,
         lds_limited=lds_limited,
     )
+    _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim)
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
