@@ -502,8 +502,17 @@ def deepgemm_fp8_paged_mqa_logits(
             # half and the kernel waits for them. Sizing the grid instead of
             # SplitKV keeps that from happening at any batch.
             SplitKV = max(1, -(-2 * TotalCuCount // TileQCount))
+            chunks = max(1, -(-max_model_len // ChunkK))
+            # Two per CU stops being enough once a workgroup's share of the
+            # context passes ~32 chunks: at batch 128/256 it leaves each one
+            # chewing 128-256 chunks with no queue behind it to rebalance
+            # against. Split further there, by at most 2x -- `max_model_len` is
+            # only an upper bound on the context, since the real lengths live in
+            # a device tensor, and a loose bound must not over-split without
+            # limit.
+            SplitKV = min(max(SplitKV, -(-chunks // 32)), SplitKV * 2)
             # Splits past the last chunk return immediately; don't launch them.
-            SplitKV = min(SplitKV, max(1, -(-max_model_len // ChunkK)))
+            SplitKV = min(SplitKV, chunks)
 
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
