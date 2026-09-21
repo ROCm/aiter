@@ -25,35 +25,15 @@ from ...jit.core import compile_ops
 
 _DEFAULT_SORT_BLOCK_M = 32
 _OPUS_MOE_STAGE2_ROUTE_REDUCE_AUTO_BLOCK_N = -1
-_ROUTE_WORKSPACE_BUCKET_BYTES = 1 << 30
 
 
-def _route_workspace_token_capacity(
-    token_num: int,
-    topk: int,
-    row_bytes: int,
-) -> int:
-    """Bucket multi-GiB route workspaces so dynamic-M calls reuse segments.
+def _route_workspace_token_capacity(token_num: int) -> int:
+    """Round a route workspace token count up to a reusable capacity class."""
 
-    DPA prefill changes the gathered token count by small amounts from one
-    scheduler step to the next.  Exact-size allocations make each slightly
-    larger step miss the previous cached block and can leave a staircase of
-    fully inactive allocator segments.  Round only large workspaces to a
-    fixed byte quantum, bounding both the number of sizes and padding to one
-    quantum plus token-alignment slack.  The exact-size leading view preserves
-    the kernel ABI.
-    """
-
-    bytes_per_token = topk * row_bytes
-    requested_bytes = token_num * bytes_per_token
-    if requested_bytes < _ROUTE_WORKSPACE_BUCKET_BYTES:
-        return token_num
-    bucket_bytes = (
-        (requested_bytes + _ROUTE_WORKSPACE_BUCKET_BYTES - 1)
-        // _ROUTE_WORKSPACE_BUCKET_BYTES
-        * _ROUTE_WORKSPACE_BUCKET_BYTES
-    )
-    return (bucket_bytes + bytes_per_token - 1) // bytes_per_token
+    token_num = int(token_num)
+    if token_num <= 0:
+        raise ValueError(f"token_num must be positive, got {token_num}")
+    return 1 << (token_num - 1).bit_length()
 
 
 @dataclass(frozen=True)
@@ -282,7 +262,7 @@ def opus_moe_stage2_a8w4_decode_fwd(
             # MXFP8 route_out: uint8 [rows, md fp8 | md/8 e8m0 scale].
             rows = token_num * topk
             cols = md + md // 8
-            capacity_tokens = _route_workspace_token_capacity(token_num, topk, cols)
+            capacity_tokens = _route_workspace_token_capacity(token_num)
             out = torch.empty(
                 (capacity_tokens * topk, cols),
                 dtype=torch.uint8,

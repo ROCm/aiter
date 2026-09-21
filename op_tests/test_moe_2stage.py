@@ -1218,25 +1218,30 @@ def _iter_legacy_cases():
 
 
 def test_route_workspace_token_capacity():
-    topk = 6
-    row_bytes = 8064
-    bucket_bytes = 1 << 30
+    cases = (
+        (1, 1),
+        (247, 256),
+        (256, 256),
+        (257, 512),
+        (32768, 32768),
+        (32769, 65536),
+        (65536, 65536),
+        (65537, 131072),
+        (117626, 131072),
+        (128332, 131072),
+        (131072, 131072),
+        (131073, 262144),
+    )
+    for token_num, expected_capacity in cases:
+        assert _route_workspace_token_capacity(token_num) == expected_capacity
 
-    assert _route_workspace_token_capacity(2048, topk, row_bytes) == 2048
-
-    token_counts = (117626, 128960, 129216, 131072)
-    capacities = {
-        _route_workspace_token_capacity(token_num, topk, row_bytes)
-        for token_num in token_counts
-    }
-    assert capacities == {133153}
-
-    for token_num in (*token_counts, 131073):
-        capacity = _route_workspace_token_capacity(token_num, topk, row_bytes)
-        requested_bytes = token_num * topk * row_bytes
-        capacity_bytes = capacity * topk * row_bytes
-        assert capacity_bytes >= requested_bytes
-        assert capacity_bytes - requested_bytes < bucket_bytes + topk * row_bytes
+    for token_num in (0, -1):
+        try:
+            _route_workspace_token_capacity(token_num)
+        except ValueError as error:
+            assert "must be positive" in str(error)
+        else:
+            raise AssertionError(f"expected ValueError for token_num={token_num}")
 
     aiter.logger.info("moe_2stage: route workspace capacity passed")
 
