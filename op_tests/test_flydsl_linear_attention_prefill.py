@@ -391,9 +391,9 @@ _PREFILL_GROUPS = [
     *_k5_dense_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
-    # Dedicated review case: varlen with a non-multiple-of-BT tail (T=1000 for BT=64).
+    # Varlen with a non-multiple-of-BT tail (T=1000 for BT=64).
     PrefillGroup(
-        model_name="review-unaligned-varlen",
+        model_name="unaligned-varlen",
         Hv=32,
         tps=[1],
         full_prompt_lens=[1000],
@@ -401,7 +401,7 @@ _PREFILL_GROUPS = [
     ),
     # Exercise dense token-major addressing with a non-unit batch stride.
     PrefillGroup(
-        model_name="review-dense-b2",
+        model_name="dense-b2",
         Hv=32,
         tps=[1],
         full_prompt_lens=[1024],
