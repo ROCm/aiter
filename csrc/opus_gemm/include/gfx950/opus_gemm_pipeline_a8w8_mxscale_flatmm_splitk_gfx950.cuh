@@ -193,10 +193,26 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
 }
 
 // pack_e8m0x4 (broadcast e8m0 -> x4 word) is shared via opus_gemm_utils.cuh.
-// It stays in use at GROUP_K=32 even though each lane now holds the one byte it
-// needs: the broadcast still leaves that byte in position 0, which is what
-// op_sel 0 reads, so it costs a v_mul and nothing else. Dropping it is an
-// optimisation, not a correctness step.
+
+// The scale word an op_sel-0 MFMA reads.
+//
+// At GROUP_K=128 one byte covers the MFMA's whole K extent and pack_e8m0x4
+// fills the word with it. At 32 the lane already holds exactly the byte this
+// MFMA wants and byte 0 is where op_sel 0 looks, so the broadcast is a v_mul
+// whose result nothing reads -- one per scale per MFMA, which is why it is
+// worth removing rather than leaving as harmless.
+//
+// The 128 arm keeps pack_e8m0x4. Its upper three bytes are equally unread (see
+// that function's own note), so it could go there too, but that is a separate
+// claim about a path this work is meant to leave alone.
+template<typename T, typename S>
+OPUS_D int sf_scale_word(S scale) {
+    if constexpr (T::SF_PER_MFMA_K == 1) {
+        return pack_e8m0x4(scale);
+    } else {
+        return static_cast<int>(scale) & 0xFF;
+    }
+}
 
 // Fill one N scale group's slice of v_sfb for this lane.
 //
@@ -307,8 +323,8 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
     // Whole register tile in a single scale group -> one (scale_a, scale_b) pair
     // -> a single tiled-mma call covers the tile.
     if constexpr (T::COM_REP_M == 1 && T::COM_REP_N <= rep_n_per_scale && T::COM_REP_K == 1) {
-        const int scale_a = pack_e8m0x4(v_sfa[0]);
-        const int scale_b = pack_e8m0x4(v_sfb[0]);
+        const int scale_a = sf_scale_word<T>(v_sfa[0]);
+        const int scale_b = sf_scale_word<T>(v_sfb[0]);
         v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
     } else if constexpr (MODE == mxscale_pack::opsel) {
         // One word per M-subtile / N-scale-group holding the COM_REP_K K-group
@@ -352,7 +368,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 packed_sfa[im * T::COM_REP_K + ik] =
-                    pack_e8m0x4(v_sfa[im * T::SF_LANE_SCALES_PER_BK + ik]);
+                    sf_scale_word<T>(v_sfa[im * T::SF_LANE_SCALES_PER_BK + ik]);
             });
         });
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
@@ -360,7 +376,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 packed_sfb[ng * T::COM_REP_K + ik] =
-                    pack_e8m0x4(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]);
+                    sf_scale_word<T>(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]);
             });
         });
         mma_mxscale_subtile_loop<T, Mma>(v_a, v_b, v_c,
@@ -374,11 +390,11 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
     } else {
         mma_mxscale_subtile_loop<T, Mma>(v_a, v_b, v_c,
             [&](auto im_c, auto ik_c) {
-                return pack_e8m0x4(
+                return sf_scale_word<T>(
                     v_sfa[decltype(im_c)::value * T::SF_LANE_SCALES_PER_BK + decltype(ik_c)::value]);
             },
             [&](auto in_c, auto ik_c) {
-                return pack_e8m0x4(
+                return sf_scale_word<T>(
                     v_sfb[(decltype(in_c)::value / rep_n_per_scale) * T::SF_LANE_SCALES_PER_BK
                           + decltype(ik_c)::value]);
             });

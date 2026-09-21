@@ -507,27 +507,30 @@ _bmm_flatmm_local.update({
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
 
-# GROUP_N == GROUP_K == 32, i.e. A and B both on the 32-element MX block.
+# Every flatmm_splitk tile again at GROUP_N == GROUP_K == 32, the MX block.
 #
-# Each mirrors the geometry of a 128 kid so a pair differs in nothing but the
-# quantisation granularity, and between them they cover the axes the finer block
-# actually moves: how many B scale groups a tile spans, and both wave grids.
-# The kernel name carries the GROUP triple, so these read ..._1x32x32_... and
-# cannot be confused with the kid they mirror -- nor can their tuned rows.
+# Derived from the 128 tables rather than restated, so a tile added above cannot
+# silently lack its MX twin and the two can never drift apart in geometry: a
+# pair differs in nothing but the quantisation granularity, which is what makes
+# them comparable. The kernel name carries the GROUP triple, so a twin reads
+# ..._1x32x32_... and neither it nor its tuned rows can be mistaken for the
+# 128 kid it mirrors.
 #
-# 706 is here because it is the shape the old B_N <= 2 * GROUP_N assertion would
-# have rejected outright: four N groups in one tile.
-_BMM_MXSCALE_SPLITK_MX32_TILES = {
-    #    B_M  B_N  B_K  wg    mirrors  N scale groups per tile
-    700: (32,  32, 256, 2),  # 321      1
-    701: (16,  32, 256, 2),  # 316      1, on the tileN grid (T_M=1, T_N=2)
-    702: (16,  32, 512, 2),  # 314      1, four MFMAs of K per tile
-    704: (32,  64, 256, 2),  # 640      2
-    706: (128,128, 128, 1),  # 128      4
-}
+# The kid is the mirror's plus MX32_KID_STRIDE, keeping the low digits the way
+# the 8000 globalisation does: local 321 and 1321 become global 8321 and 9321,
+# so a pair is recognisable on sight in a log or a tuned CSV.
+MX32_KID_STRIDE = 1000
 _bmm_flatmm_local.update({
-    kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, quant_block=32)
-    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_MX32_TILES.items()
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, direct, prefetch, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+})
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, preload_sf=True, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
 
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this

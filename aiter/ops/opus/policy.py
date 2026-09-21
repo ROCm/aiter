@@ -577,10 +577,11 @@ def resolve_a16w16_caller_candidate(
 
 _MXSCALE_BMM_KID_OFFSET = 8000
 # Upper end of the pre-globalisation id space a tuned CSV may still be written
-# in. Raised past 653 for the GROUP_N=GROUP_K=32 kids, which sit in their own
-# 700 band; anything below the offset is unambiguously a local id, so widening
-# the window only admits ids that would otherwise have been rejected.
-_MXSCALE_BMM_LOCAL_KID_MAX = 799
+# in. Raised past 653 for the GROUP_N=GROUP_K=32 twins, which sit at their
+# mirror's id plus 1000. Still unambiguous: every local id stays below the 8000
+# offset, so widening the window only admits ids that would otherwise have been
+# rejected outright.
+_MXSCALE_BMM_LOCAL_KID_MAX = 1653
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 _C_INT_MAX = (1 << 31) - 1
 

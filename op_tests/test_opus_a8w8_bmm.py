@@ -324,19 +324,30 @@ def check_tilen_column_map():
 # These are the only kids quantised on the 32-element block, and they are the
 # only thing that instantiates the per-lane scale addressing at all: every 128
 # kid has SF_PER_MFMA_K == 1, so `if constexpr` discards the lane arms of
-# load_sfb_lane and collapses the scale layout's lane p dim to extent 1. This
-# check is therefore both the numerical guard on MX quantisation and the only
-# compile coverage those arms get -- without it they are dead code the compiler
-# never instantiates.
+# load_sfb_lane and sf_scale_word and collapses the scale layout's lane p dim to
+# extent 1. This check is therefore both the numerical guard on MX quantisation
+# and the only compile coverage those arms get -- without it they are dead code
+# the compiler never instantiates.
 #
-# One shape serves all five. K=4096 is a whole number of each kid's B_K
-# (128 / 256 / 512) and N=128 of each B_N (32 / 64 / 128). K has to be this
-# large for a reason beyond divisibility: these pipelines prime several K tiles
-# before the steady state and reject a launch that cannot fill the prefetch, so
-# K=1024 left kid 8701 with four tiles against the six it wants. At 4096 the
-# shallowest tiling still has eight. It is also the production K.
-_MX32_KIDS = (8700, 8701, 8702, 8704, 8706)
-_MX32_SHAPE = (2, 128, 128, 4096)  # G, M, N, K
+# Every flatmm_splitk tile has an MX twin, and all of them are checked: they are
+# generated from the 128 table, so listing a subset would leave the rest to be
+# discovered broken by whoever tuned them. A twin's id is its mirror's plus
+# 1000, hence 8321 / 9321 for one geometry at two granularities.
+#
+# One shape serves all of them. N=256 is a whole number of every B_N
+# (32 / 64 / 128 / 256) and K=4096 of every B_K (128 / 256 / 512). K has to be
+# this large for a reason beyond divisibility: these pipelines prime several K
+# tiles before the steady state and reject a launch that cannot fill the
+# prefetch, so K=1024 left the B_K=256 tiles with four tiles against the six
+# they want. At 4096 the deepest tiling still has eight. It is also the
+# production K.
+_MX32_KIDS = (
+    9000, 9032, 9064, 9128, 9137, 9138, 9139, 9256,
+    9311, 9312, 9313, 9314, 9316, 9317, 9318, 9319,
+    9320, 9321, 9322, 9323, 9324, 9325, 9326, 9327,
+    9640, 9642, 9646, 9650, 9653,
+)
+_MX32_SHAPE = (2, 128, 256, 4096)  # G, M, N, K
 _MX32_GROUP = 32
 _MX32_ERR_TOL = 0.003
 
