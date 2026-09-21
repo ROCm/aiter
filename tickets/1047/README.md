@@ -688,6 +688,12 @@ four K32/wave). 18 pytest cases, ``err=0``; width-2051 ``L=512`` was
 19.8 / 22.6 / 516.4 us vs 18.5 / 21.1 / 516.2. Decode lost ~7%; prefill
 unchanged. Keep four-wave 256-thread decode.
 
+**Do not retry** isolated 128-bit C fragment stores
+(``UniversalCopy128b`` of the four f32 QK accumulators, no packed P).
+18 pytest cases, ``err=0``; width-2051 ``L=512`` was 18.5 / 21.2 /
+515.5 us vs 18.5 / 21.1 / 516.2. Flat; not the split-kernel gap. Keep
+scalar ``c_lds[ng, wave, lane, i]`` stores.
+
 
 
 
