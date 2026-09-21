@@ -110,10 +110,10 @@ def _assert_conv3d_result(
     y, ref, dtype, K_red, *, is_winograd=False, normalization_reference=None
 ):
     """Check the public result contract and guard against permissive tolerances."""
-    assert y.dtype == dtype
-    assert y.shape == ref.shape
-    assert torch.isfinite(y).all()
-    assert torch.isfinite(ref).all()
+    assert y.dtype == dtype, f"expected output dtype {dtype}, got {y.dtype}"
+    assert y.shape == ref.shape, f"output shape {y.shape} != reference {ref.shape}"
+    assert torch.isfinite(y).all(), "Conv3D output contains non-finite values"
+    assert torch.isfinite(ref).all(), "reference output contains non-finite values"
 
     if is_winograd:
         rtol, atol = _winograd_tolerances(dtype, K_red)
@@ -138,8 +138,14 @@ def _assert_conv3d_result(
         )
         normalized_max_error = error.max() / reference_scale
         relative_l2_error = torch.linalg.vector_norm(error) / reference_norm
-        assert normalized_max_error < _WINOGRAD_NORMALIZED_MAX_ERROR
-        assert relative_l2_error < _WINOGRAD_RELATIVE_L2_ERROR
+        assert normalized_max_error < _WINOGRAD_NORMALIZED_MAX_ERROR, (
+            f"Winograd normalized max error {normalized_max_error} exceeds "
+            f"{_WINOGRAD_NORMALIZED_MAX_ERROR}"
+        )
+        assert relative_l2_error < _WINOGRAD_RELATIVE_L2_ERROR, (
+            f"Winograd relative L2 error {relative_l2_error} exceeds "
+            f"{_WINOGRAD_RELATIVE_L2_ERROR}"
+        )
 
 
 def _run_case(
@@ -169,7 +175,7 @@ def _run_case(
     b = torch.randn(K, device="cuda", dtype=dtype) if bias else None
 
     if force_winograd:
-        assert layout == "ncdhw"
+        assert layout == "ncdhw", f"forced Winograd requires NCDHW, got {layout}"
         y = conv3d_winograd_hw_f4x3(
             x, w, b, stride=stride, padding=pad, dilation=dil, activation=act
         )
@@ -227,9 +233,13 @@ def _run_case(
         normalization_reference=normalization_reference,
     )
     if layout == "ndhwc":
-        assert y.is_contiguous(memory_format=torch.channels_last_3d)
+        assert y.is_contiguous(memory_format=torch.channels_last_3d), (
+            f"expected channels-last-3d output, got strides={y.stride()}"
+        )
     else:
-        assert y.is_contiguous()
+        assert y.is_contiguous(), (
+            f"expected contiguous NCDHW output, got strides={y.stride()}"
+        )
 
 
 LAYOUTS = ["ncdhw", "ndhwc"]
@@ -293,18 +303,22 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
     torch.manual_seed(0)
     x_base = torch.randn(1, 32, 4, 12, 18, device="cuda", dtype=torch.float16)
     x = x_base[..., ::2]
-    assert not x.is_contiguous()
+    assert not x.is_contiguous(), f"expected sliced input, got strides={x.stride()}"
     w = torch.randn(48, 32, 1, 1, 1, device="cuda", dtype=torch.float16)
 
     y = conv3d(x, w, stride=1, padding=0, dilation=1, layout=layout)
     ref = F.conv3d(x.float(), w.float())
     rtol, atol = dynamic_conv_tolerances(torch.float16, 32)
     torch.testing.assert_close(y.float(), ref, rtol=rtol, atol=atol)
-    assert y.dtype == torch.float16
+    assert y.dtype == torch.float16, f"expected float16 output, got {y.dtype}"
     if layout == "ndhwc":
-        assert y.is_contiguous(memory_format=torch.channels_last_3d)
+        assert y.is_contiguous(memory_format=torch.channels_last_3d), (
+            f"expected channels-last-3d output, got strides={y.stride()}"
+        )
     else:
-        assert y.is_contiguous()
+        assert y.is_contiguous(), (
+            f"expected contiguous NCDHW output, got strides={y.stride()}"
+        )
 
 
 def test_ncdhw_to_cblocked_mapping_and_zero_padding():
@@ -322,11 +336,19 @@ def test_ncdhw_to_cblocked_mapping_and_zero_padding():
     for c in range(C):
         expected[:, c // block_c, ..., c % block_c] = x[:, c]
 
-    assert C_pad == C_blocks * block_c
-    assert packed.shape == expected.shape
-    assert packed.is_contiguous()
+    assert C_pad == C_blocks * block_c, (
+        f"expected padded channels {C_blocks * block_c}, got {C_pad}"
+    )
+    assert packed.shape == expected.shape, (
+        f"packed shape {packed.shape} != expected {expected.shape}"
+    )
+    assert packed.is_contiguous(), (
+        f"packed strides are not contiguous: {packed.stride()}"
+    )
     torch.testing.assert_close(packed, expected, rtol=0, atol=0)
-    assert torch.count_nonzero(packed[:, -1, ..., C % block_c :]) == 0
+    assert torch.count_nonzero(packed[:, -1, ..., C % block_c :]) == 0, (
+        "channel-padding region contains nonzero values"
+    )
 
 
 def test_oidhw_to_kmajor_prepack_mapping_and_zero_padding():
@@ -338,11 +360,17 @@ def test_oidhw_to_kmajor_prepack_mapping_and_zero_padding():
     packed, K_pad = prepack_oidhw_to_kmajor(w, block_k)
 
     K_red = C * T * R * S
-    assert K_pad == block_k
-    assert packed.shape == (K_out, K_pad)
-    assert packed.is_contiguous()
+    assert K_pad == block_k, f"expected K padding {block_k}, got {K_pad}"
+    assert packed.shape == (K_out, K_pad), (
+        f"packed shape {packed.shape} != expected {(K_out, K_pad)}"
+    )
+    assert packed.is_contiguous(), (
+        f"packed strides are not contiguous: {packed.stride()}"
+    )
     torch.testing.assert_close(packed[:, :K_red], w.reshape(K_out, K_red))
-    assert torch.count_nonzero(packed[:, K_red:]) == 0
+    assert torch.count_nonzero(packed[:, K_red:]) == 0, (
+        "K-padding region contains nonzero values"
+    )
 
 
 def test_oidhw_to_3x3x3_prepack_mapping_and_zero_padding():
@@ -354,11 +382,17 @@ def test_oidhw_to_3x3x3_prepack_mapping_and_zero_padding():
     packed, C_pad = prepack_oidhw_to_3x3x3(w, block_c)
 
     expected = w.reshape(K_out, C, 27).permute(0, 2, 1)
-    assert C_pad == block_c
-    assert packed.shape == (K_out, 27, C_pad)
-    assert packed.is_contiguous()
+    assert C_pad == block_c, f"expected channel padding {block_c}, got {C_pad}"
+    assert packed.shape == (K_out, 27, C_pad), (
+        f"packed shape {packed.shape} != expected {(K_out, 27, C_pad)}"
+    )
+    assert packed.is_contiguous(), (
+        f"packed strides are not contiguous: {packed.stride()}"
+    )
     torch.testing.assert_close(packed[:, :, :C], expected)
-    assert torch.count_nonzero(packed[:, :, C:]) == 0
+    assert torch.count_nonzero(packed[:, :, C:]) == 0, (
+        "channel-padding region contains nonzero values"
+    )
 
 
 def test_weight_prepack_cache_reuses_and_invalidates(monkeypatch):
@@ -369,16 +403,22 @@ def test_weight_prepack_cache_reuses_and_invalidates(monkeypatch):
     first, first_pad = conv_prepack.get_or_make_weight_pack_3d(w, block_k=4)
     cached, cached_pad = conv_prepack.get_or_make_weight_pack_3d(w, block_k=4)
 
-    assert cached is first
-    assert cached_pad == first_pad
+    assert cached is first, "identical weight did not reuse its cached pack"
+    assert cached_pad == first_pad, (
+        f"cached padding {cached_pad} != original {first_pad}"
+    )
 
     w.add_(10)
     refreshed, refreshed_pad = conv_prepack.get_or_make_weight_pack_3d(w, block_k=4)
 
-    assert refreshed is not first
-    assert refreshed_pad == first_pad
+    assert refreshed is not first, "in-place weight update reused a stale pack"
+    assert refreshed_pad == first_pad, (
+        f"refreshed padding {refreshed_pad} != original {first_pad}"
+    )
     torch.testing.assert_close(refreshed[:, :3], w.reshape(1, 3))
-    assert torch.count_nonzero(refreshed[:, 3:]) == 0
+    assert torch.count_nonzero(refreshed[:, 3:]) == 0, (
+        "refreshed K-padding region contains nonzero values"
+    )
 
 
 def test_weight_prepack_cache_uses_lru_eviction(monkeypatch):
@@ -394,12 +434,14 @@ def test_weight_prepack_cache_uses_lru_eviction(monkeypatch):
     first_hit, _ = conv_prepack.get_or_make_weight_pack_3d(weights[0], block_k=4)
     conv_prepack.get_or_make_weight_pack_3d(weights[2], block_k=4)
 
-    assert first_hit is first
-    assert len(cache._d) == 2
-    assert conv_prepack.get_or_make_weight_pack_3d(weights[0], block_k=4)[0] is first
+    assert first_hit is first, "cache hit did not return the original packed weight"
+    assert len(cache._d) == 2, f"expected two cached entries, got {len(cache._d)}"
+    assert (
+        conv_prepack.get_or_make_weight_pack_3d(weights[0], block_k=4)[0] is first
+    ), "recently used entry was unexpectedly evicted"
     assert (
         conv_prepack.get_or_make_weight_pack_3d(weights[1], block_k=4)[0] is not second
-    )
+    ), "least-recently-used entry was not evicted"
 
 
 @pytest.mark.parametrize(
@@ -438,8 +480,12 @@ def test_weight_pack_cache_clear_is_dimension_specific(
 
     clear_caches()
 
-    assert all(not caches[name]._d for name in cleared_names)
-    assert all(caches[name]._d for name in preserved_names)
+    assert all(not caches[name]._d for name in cleared_names), (
+        f"expected caches to be cleared: {cleared_names}"
+    )
+    assert all(caches[name]._d for name in preserved_names), (
+        f"expected caches to be preserved: {preserved_names}"
+    )
 
 
 def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeypatch):
@@ -463,7 +509,7 @@ def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeyp
     reference = F.conv3d(x.float(), w.float(), bias.float(), padding=(0, 1, 1))
     rtol, atol = dynamic_conv_tolerances(torch.float16, 54)
     torch.testing.assert_close(y.float(), reference, rtol=rtol, atol=atol)
-    assert y.dtype == torch.float16
+    assert y.dtype == torch.float16, f"expected float16 output, got {y.dtype}"
 
 
 @pytest.mark.parametrize(
@@ -504,7 +550,8 @@ def test_conv3d_dims_supports_cpu_tensors():
         dilation=(1, 1, 1),
     )
 
-    assert dimensions == (2, 4, 5, 6, 7, 8, 3, 3, 3, 5, 6, 7)
+    expected = (2, 4, 5, 6, 7, 8, 3, 3, 3, 5, 6, 7)
+    assert dimensions == expected, f"dimensions {dimensions} != expected {expected}"
 
 
 def test_conv3d_execution_rejects_cpu_tensors():
@@ -754,9 +801,13 @@ def test_direct_methods_support_bias_and_activations(
             normalization_reference=normalization_reference,
         )
         if layout == "ndhwc":
-            assert y.is_contiguous(memory_format=torch.channels_last_3d)
+            assert y.is_contiguous(memory_format=torch.channels_last_3d), (
+                f"expected channels-last-3d output, got strides={y.stride()}"
+            )
         else:
-            assert y.is_contiguous()
+            assert y.is_contiguous(), (
+                f"expected contiguous NCDHW output, got strides={y.stride()}"
+            )
     finally:
         clear_conv3d_weight_pack_caches()
 
@@ -789,8 +840,12 @@ def test_bf16_winograd_uses_fp16_transform_storage():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    assert _winograd_transform_storage_dtype(torch.bfloat16) == torch.float16
-    assert _winograd_transform_storage_dtype(torch.float16) == torch.float16
+    assert _winograd_transform_storage_dtype(torch.bfloat16) == torch.float16, (
+        "BF16 Winograd weights should use FP16 transform storage"
+    )
+    assert _winograd_transform_storage_dtype(torch.float16) == torch.float16, (
+        "FP16 Winograd weights should retain FP16 transform storage"
+    )
 
     torch.manual_seed(0)
     N, C, D, H, W, K = 1, 96, 4, 32, 40, 96
@@ -799,8 +854,12 @@ def test_bf16_winograd_uses_fp16_transform_storage():
     b = torch.randn(K, device="cuda", dtype=torch.bfloat16)
 
     transformed_w, _ = prepack_winograd_hw_filter_f4x3(w)
-    assert transformed_w.dtype == torch.float16
-    assert torch.isfinite(transformed_w).all()
+    assert transformed_w.dtype == torch.float16, (
+        f"expected FP16 transformed weights, got {transformed_w.dtype}"
+    )
+    assert torch.isfinite(
+        transformed_w
+    ).all(), "transformed Winograd weights contain non-finite values"
 
     y = conv3d_winograd_hw_f4x3(x, w, b, padding=(1, 1, 1))
     ref = F.conv3d(x.float(), w.float(), b.float(), padding=1)
@@ -808,10 +867,14 @@ def test_bf16_winograd_uses_fp16_transform_storage():
     normalized_max_error = error.max() / ref.abs().max()
     relative_l2_error = torch.linalg.vector_norm(error) / torch.linalg.vector_norm(ref)
 
-    assert y.dtype == torch.bfloat16
-    assert torch.isfinite(y).all()
-    assert normalized_max_error < 0.015
-    assert relative_l2_error < 0.006
+    assert y.dtype == torch.bfloat16, f"expected BF16 output, got {y.dtype}"
+    assert torch.isfinite(y).all(), "BF16 Winograd output contains non-finite values"
+    assert normalized_max_error < 0.015, (
+        f"normalized max error {normalized_max_error} exceeds 0.015"
+    )
+    assert relative_l2_error < 0.006, (
+        f"relative L2 error {relative_l2_error} exceeds 0.006"
+    )
 
 
 def test_routing(monkeypatch):
@@ -848,44 +911,74 @@ def test_routing(monkeypatch):
         )
 
     # 1x1x1 -> specialized channel-GEMM (layout-independent).
-    assert route(1, 1, 1, C=128) is Route3D.ONE_X_ONE_X_ONE
-    assert route(1, 1, 1, C=128, layout="ndhwc") is Route3D.ONE_X_ONE_X_ONE
+    assert route(1, 1, 1, C=128) is Route3D.ONE_X_ONE_X_ONE, (
+        "NCDHW 1x1x1 convolution should use the specialized route"
+    )
+    assert route(1, 1, 1, C=128, layout="ndhwc") is Route3D.ONE_X_ONE_X_ONE, (
+        "NDHWC 1x1x1 convolution should use the specialized route"
+    )
     # The measured wave32 policy accounts for depth utilization, channel
     # expansion/compression, tile count, and activation-pack cost.
     monkeypatch.setattr("aiter.ops.triton.conv.conv3d._is_amd_wave32", lambda: True)
-    assert route(3, 3, 3, C=384, D=3, H=46, W=51, K=384) is Route3D.WINOGRAD_HW
-    assert route(3, 3, 3, C=192, D=6, H=178, W=198, K=192) is Route3D.WINOGRAD_HW
-    assert route(3, 3, 3, C=384, D=4, H=90, W=100, K=384) is Route3D.WINOGRAD_HW
-    assert route(3, 3, 3, C=96, D=6, H=354, W=394, K=96) is Route3D.CBLOCKED_NCDHW
-    assert route(3, 3, 3, C=64) is Route3D.CBLOCKED_NCDHW
-    assert route(3, 3, 3, C=32) is Route3D.CBLOCKED_NCDHW
+    assert route(3, 3, 3, C=384, D=3, H=46, W=51, K=384) is Route3D.WINOGRAD_HW, (
+        "expected Wan decoder shape to use Winograd"
+    )
+    assert route(3, 3, 3, C=192, D=6, H=178, W=198, K=192) is Route3D.WINOGRAD_HW, (
+        "expected large low-depth shape to use Winograd"
+    )
+    assert route(3, 3, 3, C=384, D=4, H=90, W=100, K=384) is Route3D.WINOGRAD_HW, (
+        "expected medium-depth shape to use Winograd"
+    )
+    assert route(
+        3, 3, 3, C=96, D=6, H=354, W=394, K=96
+    ) is Route3D.CBLOCKED_NCDHW, "expected low-channel shape to use NCDHWc"
+    assert route(3, 3, 3, C=64) is Route3D.CBLOCKED_NCDHW, (
+        "expected C=64 shape to use NCDHWc"
+    )
+    assert route(3, 3, 3, C=32) is Route3D.CBLOCKED_NCDHW, (
+        "expected C=32 shape to use NCDHWc"
+    )
     assert (
         route(3, 3, 3, C=12, D=3, H=354, W=642, K=160, padding=(0, 0, 0))
         is Route3D.GENERAL
-    )
+    ), "expected low-channel unpadded shape to use the general route"
     assert (
         route(3, 3, 3, C=384, D=3, H=46, W=51, K=384, padding=(0, 0, 0))
         is Route3D.CBLOCKED_NCDHW
-    )
+    ), "expected unpadded C=384 shape to use NCDHWc"
     assert (
         route(3, 3, 3, C=640, D=3, H=46, W=82, K=640, padding=(0, 0, 0))
         is Route3D.WINOGRAD_HW_CBLOCKED
-    )
+    ), "expected wide C=640 shape to use cblocked Winograd"
     assert (
         route(3, 3, 3, C=512, D=33, H=34, W=60, K=4096, padding=(0, 1, 1))
         is Route3D.CBLOCKED_NCDHW
-    )
-    assert route(3, 3, 3, stride=(2, 2, 2), C=384) is Route3D.CBLOCKED_NCDHW
+    ), "expected high-depth expansion shape to use NCDHWc"
+    assert route(
+        3, 3, 3, stride=(2, 2, 2), C=384
+    ) is Route3D.CBLOCKED_NCDHW, "expected strided 3x3x3 shape to use NCDHWc"
     # Wave64 uses the conservative 512-channel crossover.
     monkeypatch.setattr("aiter.ops.triton.conv.conv3d._is_amd_wave32", lambda: False)
-    assert route(3, 3, 3, C=384, D=4, H=64, W=64, K=384) is Route3D.CBLOCKED_NCDHW
-    assert route(3, 3, 3, C=512, D=4, H=64, W=64, K=512) is Route3D.WINOGRAD_HW
+    assert route(
+        3, 3, 3, C=384, D=4, H=64, W=64, K=384
+    ) is Route3D.CBLOCKED_NCDHW, "expected wave64 C=384 shape to use NCDHWc"
+    assert route(
+        3, 3, 3, C=512, D=4, H=64, W=64, K=512
+    ) is Route3D.WINOGRAD_HW, "expected wave64 C=512 shape to use Winograd"
     # 3x3x3 NDHWC -> channels-last kernel.
-    assert route(3, 3, 3, C=384, layout="ndhwc") is Route3D.NDHWC_3X3X3
+    assert route(3, 3, 3, C=384, layout="ndhwc") is Route3D.NDHWC_3X3X3, (
+        "expected NDHWC 3x3x3 shape to use the channels-last kernel"
+    )
     # No specialized kernel -> general.
-    assert route(5, 5, 5, C=384) is Route3D.GENERAL
-    assert route(3, 3, 3, dilation=(2, 2, 2), C=384) is Route3D.GENERAL
-    assert route(1, 1, 1, dilation=(2, 2, 2), C=384) is Route3D.GENERAL
+    assert route(5, 5, 5, C=384) is Route3D.GENERAL, (
+        "expected 5x5x5 shape to use the general route"
+    )
+    assert route(3, 3, 3, dilation=(2, 2, 2), C=384) is Route3D.GENERAL, (
+        "expected dilated 3x3x3 shape to use the general route"
+    )
+    assert route(1, 1, 1, dilation=(2, 2, 2), C=384) is Route3D.GENERAL, (
+        "expected dilated 1x1x1 shape to use the general route"
+    )
 
 
 @pytest.mark.parametrize(
@@ -945,10 +1038,15 @@ def test_route_and_run_dispatches_to_selected_wrapper(
         layout,
     )
 
-    assert result is sentinel
-    assert [name for name, _args, _kwargs in calls] == [expected_wrapper]
+    assert result is sentinel, "dispatcher did not return the selected wrapper result"
+    called_wrappers = [name for name, _args, _kwargs in calls]
+    assert called_wrappers == [expected_wrapper], (
+        f"called wrappers {called_wrappers}, expected only {expected_wrapper}"
+    )
     if expected_wrapper in ("conv3d_1x1x1", "conv3d_general"):
-        assert calls[0][2]["layout"] == layout
+        assert calls[0][2]["layout"] == layout, (
+            f"forwarded layout {calls[0][2]['layout']} != expected {layout}"
+        )
 
 
 # -- Configuration lookup and launcher-key regression tests -----------------
@@ -983,10 +1081,14 @@ def test_conv3d_config_layout_variant_precedence(
             "TEST-CONV3D-VARIANTS", shape_key=key, M=M, variants=variants
         )["source"]
 
-    assert selected("ndhwc") == "layout"
-    assert selected() == "generic"
-    assert selected("ndhwc", key="missing") == "bucket"
-    assert selected("ndhwc", key="missing", M=65) == "any"
+    assert selected("ndhwc") == "layout", "layout-specific config was not preferred"
+    assert selected() == "generic", "generic shape config was not selected"
+    assert selected("ndhwc", key="missing") == "bucket", (
+        "M bucket was not used after a layout-specific shape miss"
+    )
+    assert selected("ndhwc", key="missing", M=65) == "any", (
+        "generic fallback was not used after shape and bucket misses"
+    )
 
 
 class _KernelSpy:
@@ -1016,13 +1118,16 @@ def test_prepack_launcher_uses_complete_3d_key(monkeypatch):
         torch.empty(1), torch.empty(1), 2, 65, 3, 5, 7, 128, 64
     )
 
-    assert seen == [
+    expected = [
         {
             "shape_key": format_prepack_shape_key_3d(2, 65, 3, 5, 7, 64),
             "M": 3 * 5 * 7,
         }
     ]
-    assert len(kernel.calls) == 1
+    assert seen == expected, f"prepack config lookup {seen} != expected {expected}"
+    assert len(kernel.calls) == 1, (
+        f"expected one prepack kernel launch, got {len(kernel.calls)}"
+    )
 
 
 def test_general_launcher_uses_complete_3d_key_and_layout(monkeypatch):
@@ -1064,10 +1169,13 @@ def test_general_launcher_uses_complete_3d_key_and_layout(monkeypatch):
     expected_key = format_shape_key_3d(
         2, 5, 5, 9, 13, 7, 2, 3, 1, 1, 2, 3, 0, 1, 2, 2, 1, 3
     )
-    assert seen == [
+    expected = [
         {"shape_key": expected_key, "M": 2 * 3 * 5 * 6, "variants": ("ndhwc",)}
     ]
-    assert len(kernel.calls) == 1
+    assert seen == expected, f"general config lookup {seen} != expected {expected}"
+    assert len(kernel.calls) == 1, (
+        f"expected one general kernel launch, got {len(kernel.calls)}"
+    )
 
 
 def test_1x1x1_launcher_uses_complete_3d_key_and_layout(monkeypatch):
@@ -1103,10 +1211,13 @@ def test_1x1x1_launcher_uses_complete_3d_key_and_layout(monkeypatch):
     expected_key = format_shape_key_3d(
         2, 5, 3, 5, 7, 7, 1, 1, 1, 1, 2, 1, 0, 0, 0, 1, 1, 1
     )
-    assert seen == [
+    expected = [
         {"shape_key": expected_key, "M": 2 * 3 * 3 * 7, "variants": ("ncdhw",)}
     ]
-    assert len(kernel.calls) == 1
+    assert seen == expected, f"1x1x1 config lookup {seen} != expected {expected}"
+    assert len(kernel.calls) == 1, (
+        f"expected one 1x1x1 kernel launch, got {len(kernel.calls)}"
+    )
 
 
 @pytest.mark.parametrize("layout", ["ndhwc", "cblocked"])
@@ -1150,8 +1261,11 @@ def test_3x3x3_launchers_use_complete_3d_key(monkeypatch, layout):
     expected_key = format_shape_key_3d(
         2, 65, 4, 9, 11, 67, 3, 3, 3, 1, 2, 3, 0, 1, 2, 2, 1, 3
     )
-    assert seen == [{"shape_key": expected_key, "M": 2 * 4 * 5 * 6}]
-    assert len(kernel.calls) == 1
+    expected = [{"shape_key": expected_key, "M": 2 * 4 * 5 * 6}]
+    assert seen == expected, f"3x3x3 config lookup {seen} != expected {expected}"
+    assert len(kernel.calls) == 1, (
+        f"expected one {layout} 3x3x3 kernel launch, got {len(kernel.calls)}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1218,16 +1332,27 @@ def test_winograd_launchers_use_complete_3d_key_and_axes(
         2, 65, 4, 9, 11, 67, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1
     )
     tile_count = 3 * 3
-    assert input_seen == [
+    expected_input = [
         {
             "shape_key": expected_key,
             "M": 2 * 4 * tile_count,
             "variants": (input_variant,),
         }
     ]
-    assert gemm_seen == [{"shape_key": expected_key, "M": 2 * 4 * tile_count}]
-    assert output_seen == [{"shape_key": expected_key, "M": 2 * 4 * tile_count}]
-    assert all(len(kernel.calls) == 1 for kernel in kernels)
+    expected_stage = [{"shape_key": expected_key, "M": 2 * 4 * tile_count}]
+    assert input_seen == expected_input, (
+        f"Winograd input config lookup {input_seen} != expected {expected_input}"
+    )
+    assert gemm_seen == expected_stage, (
+        f"Winograd GEMM config lookup {gemm_seen} != expected {expected_stage}"
+    )
+    assert output_seen == expected_stage, (
+        f"Winograd output config lookup {output_seen} != expected {expected_stage}"
+    )
+    launch_counts = [len(kernel.calls) for kernel in kernels]
+    assert all(count == 1 for count in launch_counts), (
+        f"expected one launch per Winograd stage, got {launch_counts}"
+    )
 
 
 # -- Benchmark database, reporting, and CLI regression tests ----------------
@@ -1245,11 +1370,21 @@ def test_winograd_launchers_use_complete_3d_key_and_axes(
 def test_load_conv3d_model_shapes(model, expected_shapes, encoder_calls, decoder_calls):
     selected, shapes = _load_model_shapes(model)
 
-    assert selected == model
-    assert len(shapes) == expected_shapes
-    assert all(isinstance(shape, tuple) and len(shape) == 16 for shape in shapes)
-    assert sum(shape[13] for shape in shapes) == encoder_calls
-    assert sum(shape[14] for shape in shapes) == decoder_calls
+    assert selected == model, f"selected model {selected!r} != requested {model!r}"
+    assert len(shapes) == expected_shapes, (
+        f"loaded {len(shapes)} shapes for {model}, expected {expected_shapes}"
+    )
+    assert all(isinstance(shape, tuple) and len(shape) == 16 for shape in shapes), (
+        f"model {model} contains a shape that does not use the 16-field schema"
+    )
+    actual_encoder_calls = sum(shape[13] for shape in shapes)
+    assert actual_encoder_calls == encoder_calls, (
+        f"encoder calls {actual_encoder_calls} != expected {encoder_calls} for {model}"
+    )
+    actual_decoder_calls = sum(shape[14] for shape in shapes)
+    assert actual_decoder_calls == decoder_calls, (
+        f"decoder calls {actual_decoder_calls} != expected {decoder_calls} for {model}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1263,7 +1398,9 @@ def test_load_conv3d_model_shapes(model, expected_shapes, encoder_calls, decoder
 )
 def test_model_pattern_is_case_insensitive(pattern, expected):
     selected, _shapes = _load_model_shapes(pattern)
-    assert selected == expected
+    assert selected == expected, (
+        f"pattern {pattern!r} selected {selected!r}, not {expected!r}"
+    )
 
 
 def test_ambiguous_model_pattern_is_rejected():
@@ -1276,39 +1413,49 @@ def test_missing_model_lists_available_conv3d_models():
         _load_model_shapes("not-a-model")
 
     message = str(error.value)
-    assert "ltx25-conv-vae" in message
-    assert "vision-patch-embed" in message
-    assert "wan22-a14b-vae" in message
-    assert "wan22-ti2v-5b-vae" in message
+    assert "ltx25-conv-vae" in message, "error omitted the LTX model"
+    assert "vision-patch-embed" in message, "error omitted the vision model"
+    assert "wan22-a14b-vae" in message, "error omitted the Wan A14B model"
+    assert "wan22-ti2v-5b-vae" in message, "error omitted the Wan TI2V model"
 
 
 def test_model_shape_tuples_preserve_runtime_parameters():
     _, vision_shapes = _load_model_shapes("vision-patch")
     qwen25 = next(shape for shape in vision_shapes if shape[15] == "Qwen2.5 224px")
-    assert qwen25[9] == (2, 14, 14)
-    assert qwen25[12] is False
+    assert qwen25[9] == (2, 14, 14), f"unexpected Qwen stride: {qwen25[9]}"
+    assert qwen25[12] is False, f"unexpected Qwen bias flag: {qwen25[12]}"
 
     _, ltx_shapes = _load_model_shapes("ltx25")
     encoder_input = next(shape for shape in ltx_shapes if shape[15] == "encoder input")
-    assert encoder_input[2:5] == (123, 136, 240)
-    assert encoder_input[10] == (0, 1, 1)
+    assert encoder_input[2:5] == (123, 136, 240), (
+        f"unexpected LTX encoder input dimensions: {encoder_input[2:5]}"
+    )
+    assert encoder_input[10] == (0, 1, 1), (
+        f"unexpected LTX encoder padding: {encoder_input[10]}"
+    )
 
     _, ti2v_shapes = _load_model_shapes("ti2v")
     temporal_downsample = next(
         shape for shape in ti2v_shapes if shape[15] == "encoder time down 320"
     )
-    assert temporal_downsample[9] == (2, 1, 1)
-    assert temporal_downsample[10] == (0, 0, 0)
+    assert temporal_downsample[9] == (2, 1, 1), (
+        f"unexpected TI2V temporal stride: {temporal_downsample[9]}"
+    )
+    assert temporal_downsample[10] == (0, 0, 0), (
+        f"unexpected TI2V temporal padding: {temporal_downsample[10]}"
+    )
 
 
 def test_default_cli_selects_model_sweep_mode():
     args = parse_args([])
 
-    assert _DEFAULT_MODEL == "wan22-a14b-vae"
-    assert args.single_shape is False
-    assert args.model is None
-    assert args.smoke is False
-    assert not hasattr(args, "suite")
+    assert _DEFAULT_MODEL == "wan22-a14b-vae", (
+        f"unexpected default model: {_DEFAULT_MODEL}"
+    )
+    assert args.single_shape is False, "default CLI unexpectedly selected one shape"
+    assert args.model is None, f"default CLI model should be None, got {args.model!r}"
+    assert args.smoke is False, "default CLI unexpectedly enabled smoke mode"
+    assert not hasattr(args, "suite"), "removed --suite option remains on parsed args"
 
 
 def test_torch_reference_preserves_requested_dtype(monkeypatch):
@@ -1335,12 +1482,17 @@ def test_torch_reference_preserves_requested_dtype(monkeypatch):
         activation="relu",
     )
 
-    assert seen["dtypes"] == (torch.bfloat16,) * 3
-    assert seen["kwargs"] == {
+    assert seen["dtypes"] == (torch.bfloat16,) * 3, (
+        f"reference inputs were unexpectedly promoted: {seen['dtypes']}"
+    )
+    expected_kwargs = {
         "stride": (1, 1, 1),
         "padding": (0, 1, 1),
         "dilation": (1, 1, 1),
     }
+    assert seen["kwargs"] == expected_kwargs, (
+        f"reference kwargs {seen['kwargs']} != expected {expected_kwargs}"
+    )
     torch.testing.assert_close(result, torch.tensor([0.0, 2.0], dtype=torch.bfloat16))
 
 
@@ -1360,13 +1512,15 @@ def test_sweep_cli_supports_conv2d_style_options():
         ]
     )
 
-    assert args.single_shape is False
-    assert args.model == "ltx25"
-    assert args.batch_size == 3
-    assert args.miopen_solvers is True
-    assert args.metric == "time"
-    assert args.show_kernel_name is True
-    assert args.activation == "relu"
+    assert args.single_shape is False, "sweep options unexpectedly selected one shape"
+    assert args.model == "ltx25", f"parsed model {args.model!r} != 'ltx25'"
+    assert args.batch_size == 3, f"parsed batch size {args.batch_size} != 3"
+    assert args.miopen_solvers is True, "--miopen-solvers was not enabled"
+    assert args.metric == "time", f"parsed metric {args.metric!r} != 'time'"
+    assert args.show_kernel_name is True, "--show-kernel-name was not enabled"
+    assert args.activation == "relu", (
+        f"parsed activation {args.activation!r} != 'relu'"
+    )
 
 
 def test_default_sweep_applies_batch_override(monkeypatch):
@@ -1425,9 +1579,11 @@ def test_default_sweep_applies_batch_override(monkeypatch):
 
     bench_conv3d.run_sweep(parse_args(["--batch-size", "4"]))
 
-    assert loaded_patterns == [_DEFAULT_MODEL]
-    assert calls[0][0][0] == 4
-    assert calls[0][1]["bias"] is True
+    assert loaded_patterns == [_DEFAULT_MODEL], (
+        f"loaded patterns {loaded_patterns} != expected [{_DEFAULT_MODEL!r}]"
+    )
+    assert calls[0][0][0] == 4, f"batch override was not forwarded: {calls[0][0][0]}"
+    assert calls[0][1]["bias"] is True, "shape bias flag was not forwarded"
 
 
 def _fake_benchmark_result(*, correct=True):
@@ -1494,11 +1650,19 @@ def test_partial_sweep_reports_requested_denominator_and_fails(monkeypatch, caps
         bench_conv3d.run_sweep(parse_args([]))
 
     captured = capsys.readouterr()
-    assert error.value.code == 1
-    assert "1/2 passed (1 errored)" in captured.out
-    assert "INCOMPLETE — ERRORED LAYERS EXCLUDED" in captured.out
-    assert "broken layer             ERROR: RuntimeError: boom" in captured.err
-    assert "requested=2 completed=1 correct=1 incorrect=0 errored=1" in captured.err
+    assert error.value.code == 1, f"expected exit code 1, got {error.value.code}"
+    assert "1/2 passed (1 errored)" in captured.out, (
+        f"stdout omitted partial-sweep counts:\n{captured.out}"
+    )
+    assert "INCOMPLETE — ERRORED LAYERS EXCLUDED" in captured.out, (
+        f"stdout omitted incomplete-result warning:\n{captured.out}"
+    )
+    assert "broken layer             ERROR: RuntimeError: boom" in captured.err, (
+        f"stderr omitted layer failure details:\n{captured.err}"
+    )
+    assert (
+        "requested=2 completed=1 correct=1 incorrect=0 errored=1" in captured.err
+    ), f"stderr omitted partial-sweep summary:\n{captured.err}"
 
 
 def test_incorrect_sweep_result_is_visible_and_fails(monkeypatch, capsys):
@@ -1518,17 +1682,23 @@ def test_incorrect_sweep_result_is_visible_and_fails(monkeypatch, capsys):
         bench_conv3d.run_sweep(parse_args([]))
 
     captured = capsys.readouterr()
-    assert error.value.code == 1
-    assert "0/1 passed (1 incorrect)" in captured.out
-    assert "NO" in captured.out
-    assert "requested=1 completed=1 correct=0 incorrect=1 errored=0" in captured.err
+    assert error.value.code == 1, f"expected exit code 1, got {error.value.code}"
+    assert "0/1 passed (1 incorrect)" in captured.out, (
+        f"stdout omitted incorrect-result counts:\n{captured.out}"
+    )
+    assert "NO" in captured.out, (
+        f"stdout did not mark the layer incorrect:\n{captured.out}"
+    )
+    assert (
+        "requested=1 completed=1 correct=0 incorrect=1 errored=0" in captured.err
+    ), f"stderr omitted incorrect-sweep summary:\n{captured.err}"
 
 
 def test_smoke_shapes_use_the_same_tuple_schema_as_models():
-    assert EDGE_CASE_SHAPES
+    assert EDGE_CASE_SHAPES, "smoke shape collection is empty"
     assert all(
         isinstance(shape, tuple) and len(shape) == 16 for shape in EDGE_CASE_SHAPES
-    )
+    ), "a smoke shape does not use the 16-field model-shape schema"
 
 
 @pytest.mark.parametrize(
@@ -1602,10 +1772,15 @@ def test_single_shape_cli_uses_independent_depth_height_width_flags():
         ]
     )
 
-    assert args.single_shape is True
-    assert (args.stride_d, args.stride_h, args.stride_w) == (2, 3, 4)
-    assert (args.pad_d, args.pad_h, args.pad_w) == (1, 2, 3)
-    assert (args.dilation_d, args.dilation_h, args.dilation_w) == (1, 2, 3)
+    assert args.single_shape is True, "complete dimensions did not select single mode"
+    stride = (args.stride_d, args.stride_h, args.stride_w)
+    padding = (args.pad_d, args.pad_h, args.pad_w)
+    dilation = (args.dilation_d, args.dilation_h, args.dilation_w)
+    assert stride == (2, 3, 4), f"parsed stride {stride} != expected (2, 3, 4)"
+    assert padding == (1, 2, 3), f"parsed padding {padding} != expected (1, 2, 3)"
+    assert dilation == (1, 2, 3), (
+        f"parsed dilation {dilation} != expected (1, 2, 3)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1657,10 +1832,12 @@ def test_single_shape_output_includes_depth_kernel_depth_and_primary_metric():
 
     line = _format_single_shape_line(args, result)
 
-    assert "D=5" in line
-    assert "T=3" in line
-    assert "kernel=_conv3d_general_kernel" in line
-    assert line.endswith("1.2500")
+    assert "D=5" in line, f"single-shape output omitted depth: {line}"
+    assert "T=3" in line, f"single-shape output omitted kernel depth: {line}"
+    assert "kernel=_conv3d_general_kernel" in line, (
+        f"single-shape output omitted kernel name: {line}"
+    )
+    assert line.endswith("1.2500"), f"single-shape output has wrong metric: {line}"
 
 
 @pytest.mark.parametrize("layout", ["ncdhw", "ndhwc"])
@@ -1687,16 +1864,24 @@ def test_miopen_solver_detection_uses_all_three_spatial_axes_and_layout(
     precompute_miopen_solvers([shape], torch.float16, layout)
 
     N, C, D, H, W, K, T, R, S, stride, padding, dilation = shape[:12]
-    assert (
-        _get_miopen_solver(N, C, D, H, W, K, T, R, S, stride, padding, dilation, layout)
-        == "ConvDirectNaiveConvFwd"
+    solver = _get_miopen_solver(
+        N, C, D, H, W, K, T, R, S, stride, padding, dilation, layout
+    )
+    assert solver == "ConvDirectNaiveConvFwd", (
+        f"detected solver {solver!r} != 'ConvDirectNaiveConvFwd'"
     )
     script = captured["command"][2]
-    assert "F.conv3d" in script
-    assert f"torch.randn({N},{C},{D},{H},{W}" in script
-    assert "stride=(1,1,1)" in script
-    assert ("channels_last_3d" in script) is (layout == "ndhwc")
-    assert captured["kwargs"]["env"]["MIOPEN_LOG_LEVEL"] == "6"
+    assert "F.conv3d" in script, "solver probe does not execute F.conv3d"
+    assert f"torch.randn({N},{C},{D},{H},{W}" in script, (
+        "solver probe omitted a spatial input dimension"
+    )
+    assert "stride=(1,1,1)" in script, "solver probe omitted the 3-D stride"
+    has_channels_last = "channels_last_3d" in script
+    assert has_channels_last is (layout == "ndhwc"), (
+        f"solver probe layout handling does not match {layout}"
+    )
+    log_level = captured["kwargs"]["env"]["MIOPEN_LOG_LEVEL"]
+    assert log_level == "6", f"MIOPEN_LOG_LEVEL {log_level!r} != '6'"
 
 
 if __name__ == "__main__":
