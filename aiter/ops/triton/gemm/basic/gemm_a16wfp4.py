@@ -69,7 +69,10 @@ def gemm_a16wfp4_(
     """
 
     _LOGGER.info(
-        f"GEMM_A16WFP4: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scales.shape)} "
+        "GEMM_A16WFP4: x=%s w=%s w_scale=%s ",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(w_scales.shape),
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
@@ -252,7 +255,10 @@ def gemm_a16wfp4_preshuffle_(
     """
 
     _LOGGER.info(
-        f"GEMM_A16WFP4_PRESHUFFLE: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scales.shape)} "
+        "GEMM_A16WFP4_PRESHUFFLE: x=%s w=%s w_scale=%s ",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(w_scales.shape),
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
