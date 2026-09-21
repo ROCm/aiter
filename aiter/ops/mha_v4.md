@@ -9,22 +9,26 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - BF16 BSHD output.
 - Dense and sorted block-sparse inference.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- No backward, dropout, RNG state, LSE, causal, or varlen support yet.
+- Per-batch key lengths on dense via `seqlens_k`; sorted sparse rejects it.
+- No backward, dropout, RNG state, LSE, causal, or Q-side varlen support yet.
 
-Supported dense recipes:
+Supported recipes. Every quantized recipe is available in both dense and sorted-sparse mode with
+the same V packing and scale modes; only the BF16 rows are dense-only (for now).
 
-| Q/K | V |
-|---|---|
-| BF16 | BF16 |
-| BF16 | FP8 |
-| INT8 | FP8 |
-| MXFP8 | FP8 |
-| FP8 | FP8 |
-| FP8 | MXFP6 |
-| MXFP6 | FP8 |
-| MXFP6 | MXFP6 (dense only) |
-| MXFP6 | MXFP4 |
-| MXFP4 | MXFP4 |
+| Q/K | V | Modes |
+|---|---|---|
+| BF16 | BF16 | dense |
+| BF16 | FP8 | dense |
+| INT8 | FP8 | dense, sparse |
+| MXFP8 | FP8 | dense, sparse |
+| FP8 | FP8 | dense, sparse |
+| FP8 | MXFP6 | dense, sparse |
+| MXFP6 | FP8 | dense, sparse |
+| MXFP6 | MXFP6 | dense, sparse |
+| MXFP6 | MXFP4 | dense, sparse |
+| MXFP4 | MXFP4 | dense, sparse |
+
+MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
 ## Ownership
 
@@ -115,10 +119,10 @@ calling `mha_v4_packed`.
 MXFP4 V uses E2M1 values with one E8M0 scale per `(channel, 32-token)` block. Each 128-token tile
 contributes 8,192 data bytes and 512 scale bytes. The data buffer includes 64 bytes of launch slack.
 
-`AttentionPack.DEFAULT` is the canonical V token order used by sparse kernels and FP8-P rows.
-`AttentionPack.V_FOR_FP6_P` selects the shared dense V token order for FP6-P and FP4-P consumers.
-Numeric format and consumer pairing are separate dispatch contracts even when the physical V
-layout is identical.
+`AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
+token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the
+mode: dense and sparse rows for the same recipe select the same pack. Numeric format and consumer
+pairing remain separate dispatch contracts even when the physical V layout is identical.
 
 Changing a custom op's output shape or packed layout requires a versioned custom-op name.
 
