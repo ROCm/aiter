@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       cache-key:
-        description: Cache key used to share the Triton wheelhouse with downstream jobs.
+        description: Optional cache key override used to share the Triton wheelhouse with downstream jobs.
         required: false
         type: string
         default: ""
@@ -21,6 +21,10 @@ on:
         required: false
         type: number
         default: 3
+    outputs:
+      cache_key:
+        description: Cache key used to share the Triton wheelhouse with downstream jobs.
+        value: ${{ jobs.prepare.outputs.cache_key }}
 
 permissions:
   contents: read
@@ -28,11 +32,55 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    outputs:
+      cache_key: ${{ steps.triton_cache_key.outputs.cache_key }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Compute Triton wheel cache key
+        id: triton_cache_key
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          CACHE_KEY_INPUT: ${{ inputs.cache-key }}
+          DOCKER_IMAGE: ${{ inputs.docker-image }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${CACHE_KEY_INPUT}" ]; then
+            cache_key="${CACHE_KEY_INPUT}"
+          else
+            inputs_hash="$(
+              printf '%s\n%s\n' "${DOCKER_IMAGE}" "${ARTIFACT_NAME}" |
+                sha256sum |
+                cut -c1-16
+            )"
+            files_hash="$(
+              sha256sum \
+                .github/scripts/download_triton_wheel.sh \
+                .github/scripts/install_triton.sh \
+                .github/workflows/prepare-triton-wheel.yaml |
+                sha256sum |
+                cut -c1-16
+            )"
+            cache_key="${RUNNER_OS:-Linux}-triton-wheel-v1-${inputs_hash}-${files_hash}"
+          fi
+
+          echo "cache_key=${cache_key}" >> "${GITHUB_OUTPUT}"
+          echo "Triton wheel cache key: ${cache_key}"
+
+      - name: Restore Triton wheel cache
+        id: restore_triton_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: triton_wheels
+          key: ${{ steps.triton_cache_key.outputs.cache_key }}
+
       - name: Download Triton wheel
+        if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         id: download_triton_wheel
         env:
           TRITON_DEFAULT_ROCM_VERSION: "7.2.0"
@@ -60,12 +108,12 @@ jobs:
           echo "source=fallback-rocm-${TRITON_DEFAULT_ROCM_VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Save Triton wheel cache
-        if: ${{ inputs.cache-key != '' }}
+        if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: triton_wheels
-          key: ${{ inputs.cache-key }}
+          key: ${{ steps.triton_cache_key.outputs.cache_key }}
 
       - name: Upload Triton wheel artifact
         uses: actions/upload-artifact@v4

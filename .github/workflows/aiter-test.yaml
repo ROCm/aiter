@@ -512,7 +512,6 @@ jobs:
     with:
       docker-image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
       artifact-name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
-      cache-key: Linux-triton-wheel-${{ github.run_id }}-${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       retention-days: 3
 
   detect_multigpu_test_scope:
@@ -757,7 +756,7 @@ jobs:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
           path: triton_wheels
-          key: Linux-triton-wheel-${{ github.run_id }}-${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          key: ${{ needs.prepare_triton_wheel.outputs.cache_key }}
 
       - name: Download Triton wheel artifact
         if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
@@ -1073,7 +1072,7 @@ jobs:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
           path: triton_wheels
-          key: Linux-triton-wheel-${{ github.run_id }}-${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          key: ${{ needs.prepare_triton_wheel.outputs.cache_key }}
 
       - name: Download Triton wheel artifact
         if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
