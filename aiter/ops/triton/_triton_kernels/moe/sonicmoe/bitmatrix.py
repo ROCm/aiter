@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import triton
 import triton.language as tl
 
@@ -12,7 +15,6 @@ _bitmatrix_stage2_repr = make_kernel_repr(
 )
 
 
-# Adapted from https://github.com/triton-lang/triton/blob/434aecbe933af6a8d49595d4197bfc3df7618748/python/triton_kernels/triton_kernels/tensor_details/bitmatrix.py#L44
 @triton.jit(repr=_bitmatrix_stage1_repr)
 def _bitmatrix_metadata_compute_stage1(
     expert_freq_ptr,
@@ -50,7 +52,6 @@ def _bitmatrix_metadata_compute_stage1(
         tl.store(expert_freq_offs_ptr + E, TK)
 
 
-# Adapted from https://github.com/triton-lang/triton/blob/434aecbe933af6a8d49595d4197bfc3df7618748/python/triton_kernels/triton_kernels/tensor_details/bitmatrix.py#L44
 @triton.jit(repr=_bitmatrix_stage2_repr)
 def _bitmatrix_metadata_compute_stage2(
     s_scatter_idx_ptr,
