@@ -249,9 +249,7 @@ def worker(
         status = _candidate_failure_status(e)
         detail = _candidate_failure_detail(e)
 
-    return _format_worker_result(
-        info, us, max_err_ratio, status, return_status, detail
-    )
+    return _format_worker_result(info, us, max_err_ratio, status, return_status, detail)
 
 
 def work_group(
@@ -743,7 +741,6 @@ def mp_tuner(
                 error_type = type(e).__name__
                 is_mapping_error = _is_mapping_error(e)
                 is_accelerator_error = _is_accelerator_error(e)
-                # not restart as this is not root use
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
