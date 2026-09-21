@@ -195,6 +195,11 @@ def fp8_mqa_logits(
     else:
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
+        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
+        # Fall back to plain global load/store when a tensor exceeds that.
+        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
+        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
@@ -202,6 +207,19 @@ def fp8_mqa_logits(
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
             num_warps = 1
             block_kv = 32
+            # TODO(port): the BLOCK_M gate this commit fixes upstream has no
+            # counterpart here -- the gfx950 gluon kernel in this tree is
+            # hardwired to one query row per program and takes no BLOCK_M
+            # constexpr, so there is nothing to gate yet. Upstream the gate was
+            # `seq_len > 4096`, but seq_len is a prefill's new-token count:
+            # GLM-5.2 agentic runs p25=664, p50=1650, p90=6475, so it
+            # essentially never fired and every prefill ran BLOCK_M=1,
+            # re-streaming the cached context per row. Measured crossover on
+            # gfx950 (num_heads=32, head_size=128, seq_len_kv 32k-256k) is
+            # ~1536 rows. It must also be gated on use_buffer_store: BLOCK_M=2
+            # on the non-buffer-store path trips an LLVM assertion ("Begin must
+            # be less or equal to End") that aborts the process rather than
+            # failing the launch.
             other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
         else:
             loop_variant = 1
@@ -211,11 +229,6 @@ def fp8_mqa_logits(
             block_kv = 128
             other = {"LOOP_VARIANT": loop_variant}
 
-        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
-        # Fall back to plain global load/store when a tensor exceeds that.
-        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
-        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
         _gluon_fp8_mqa_logits_kernel[(seq_len,)](
             Q_ptr=Q,
             KV_ptr=KV,
