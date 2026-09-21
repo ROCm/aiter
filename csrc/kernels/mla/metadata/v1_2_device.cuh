@@ -34,6 +34,18 @@ static constexpr int32_t MLA_V12_FILL_WARPS = 8;
 #define MLA_V12_PARALLEL_BATCH_CHUNK 4096
 #endif
 
+// Below this the three barriers bracketing each pass cost more than the pass
+// saves, so the dispatch prefers the serial planner. See the measurement in the
+// commit message: 4096 -> 1024 costs 3.7%, and it degrades from there.
+#ifndef MLA_V12_PARALLEL_BATCH_CHUNK_MIN
+#define MLA_V12_PARALLEL_BATCH_CHUNK_MIN 256
+#endif
+
+// Scratch layout: three scalars and the five-slot scan carry, then the five
+// per-batch prefix arrays.
+static constexpr int32_t kMlaV12ScratchScalarBytes   = sizeof(int32_t) * (3 + 5);
+static constexpr int32_t kMlaV12ScratchBytesPerBatch = sizeof(int32_t) * 5;
+
 // Scales the sqrt(workload) split-K law; absorbs the arch reduction/compute
 // cost ratio. 1.2 tuned on gfx950; retune per arch if needed.
 static constexpr float MLA_V12_SPLIT_COEF = 1.2f;
@@ -135,7 +147,12 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
 // Parallel planner: Phase 1 (warp 0) runs an O(num_batches) scan
 // recording each batch's start CU / remainder / prefix counts;
 // phase 2 fills every batch's fragments in parallel (one warp per batch).
-template <typename Traits>
+// kStaticChunk pins the chunk at compile time; 0 takes it from params instead.
+// Both are correct, but folding it is worth ~19% -- the offsets and the loop
+// bounds stop being values the compiler has to carry. The card that fits the
+// full chunk therefore gets the pinned instantiation, and anything else falls
+// back to the runtime one rather than to the serial planner.
+template <typename Traits, int32_t kStaticChunk = 0>
 __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     void kn_get_mla_metadata_v1_2_parallel(MlaMetadataV1KernelParameter params)
 {
@@ -151,7 +168,9 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
 
     // Scalars [payload, num_works, last_reduce_indptr] followed by five per-batch
     // prefix arrays produced by the phase-1 scan.
-    constexpr int32_t kBatchChunk = MLA_V12_PARALLEL_BATCH_CHUNK;
+    // Set by the dispatch to the most batches whose scratch fits this card's
+    // LDS, which is what lets one build serve gfx942's 64 KiB and gfx950's 160.
+    const int32_t kBatchChunk = (kStaticChunk > 0) ? kStaticChunk : params.batch_chunk;
 
     int32_t* p_lds_scalars        = p_lds_after;
     // Five slots for the scan state carried between chunks. They must sit
@@ -1159,17 +1178,37 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     const bool parallel_wanted = (parallel_env == nullptr) || (std::atoi(parallel_env) != 0);
     const bool use_parallel = parallel_wanted && (max_seqlen_qo == 1) && !kQoSplits && !kIsSparse &&
                               (params.page_size == 1) && (params.qk_batch_ratio == 1);
-    // opus::min is OPUS_D, and this is the host-side dispatch; a ternary keeps
-    // the cap here without pulling in <algorithm> for one comparison.
-    const int32_t chunk_cap = (params.num_batches < MLA_V12_PARALLEL_BATCH_CHUNK)
-                                  ? params.num_batches
-                                  : static_cast<int32_t>(MLA_V12_PARALLEL_BATCH_CHUNK);
-    const int32_t scratch_bytes =
-        static_cast<int32_t>(sizeof(int32_t)) * (3 + 5 + 5 * chunk_cap);
     const int32_t qo_bytes =
         is_unique ? 0 : static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
     const int32_t kv_bytes   = static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
     const int32_t fill_block = warp_size * MLA_V12_FILL_WARPS;
+
+    // Largest chunk whose scratch fits once `reserved` is spoken for: 32 B of
+    // scalars plus 20 B per batch in the chunk. Asking this rather than fixing
+    // the chunk and testing whether it fits is what keeps one build usable on
+    // both cards -- 4096 batches need 81,952 B, which gfx950 has and gfx942,
+    // with 64 KiB, does not. A fixed chunk would leave MI300 on the serial
+    // fallback at exactly the batch counts the chunking was written for.
+    // opus::min is OPUS_D and this is host code, hence the ternaries.
+    // Deliberately not capped by num_batches: a short batch list still wants the
+    // pinned instantiation, which is what ran before the chunk became a
+    // parameter at all. Capping here would push every decode-sized call onto the
+    // runtime path and cost it the folding.
+    auto chunk_that_fits = [&](const int32_t reserved) -> int32_t {
+        const int32_t room = lds_size - reserved - kMlaV12ScratchScalarBytes;
+        if(room < kMlaV12ScratchBytesPerBatch)
+        {
+            return 0;
+        }
+        const int32_t chunk = room / kMlaV12ScratchBytesPerBatch;
+        return (chunk > MLA_V12_PARALLEL_BATCH_CHUNK)
+                   ? static_cast<int32_t>(MLA_V12_PARALLEL_BATCH_CHUNK)
+                   : chunk;
+    };
+    // A chunk below the floor spends more on the three barriers bracketing each
+    // pass than the pass saves, so the serial planner is the better answer.
+    const int32_t chunk_with_kv = chunk_that_fits(qo_bytes + kv_bytes);
+    const int32_t chunk_no_kv   = chunk_that_fits(qo_bytes);
 
     // The XCD planner keeps its whole plan in LDS on top of the per-batch info: three per-batch
     // arrays, the group -> batch map, and the per-lane / per-(lane, row) / per-workgroup tables.
@@ -1194,17 +1233,41 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
         }
     }
 
-    if(use_parallel && (scratch_bytes + qo_bytes + kv_bytes <= lds_size))
+    // params arrives by const reference and the kernel takes it by value, so the
+    // chunk rides in on a copy rather than widening the caller's contract.
+    if(use_parallel && (chunk_with_kv >= MLA_V12_PARALLEL_BATCH_CHUNK_MIN))
     {
+        MlaMetadataV1KernelParameter chunked = params;
+        chunked.batch_chunk                  = chunk_with_kv;
         using Traits =
             MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, true, kIsSparse>;
-        kn_get_mla_metadata_v1_2_parallel<Traits><<<grid, fill_block, lds_size, stream>>>(params);
+        if(chunk_with_kv == MLA_V12_PARALLEL_BATCH_CHUNK)
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits, MLA_V12_PARALLEL_BATCH_CHUNK>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
+        else
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
     }
-    else if(use_parallel && (scratch_bytes + qo_bytes <= lds_size))
+    else if(use_parallel && (chunk_no_kv >= MLA_V12_PARALLEL_BATCH_CHUNK_MIN))
     {
+        MlaMetadataV1KernelParameter chunked = params;
+        chunked.batch_chunk                  = chunk_no_kv;
         using Traits =
             MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, false, kIsSparse>;
-        kn_get_mla_metadata_v1_2_parallel<Traits><<<grid, fill_block, lds_size, stream>>>(params);
+        if(chunk_no_kv == MLA_V12_PARALLEL_BATCH_CHUNK)
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits, MLA_V12_PARALLEL_BATCH_CHUNK>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
+        else
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
     }
     else if(params.num_batches <= max_lds_batch_size)
     {
