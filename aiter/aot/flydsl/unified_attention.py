@@ -60,7 +60,7 @@ _NUM_KV_HEADS = 4  # GQA-16, the only decode-valid production config
 # only ever pairs with split=1.
 _PREFILL_SPLITS = (1, 2, 4, 8, 16)
 # Decode split-K counts (decode has no use_sinks axis -- always sinks-off).
-_DECODE_SPLITS = (1, 2, 4, 8)
+_DECODE_SPLITS = (1, 2, 4, 8, 16)
 
 _OUT_DTYPES = ("bf16", "f16")
 

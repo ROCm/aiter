@@ -52,10 +52,12 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
 @cache
 def _flydsl_unified_attn_capability(device_index: int) -> tuple[bool, str]:
-    from aiter.ops.flydsl.unified_attention_kernels import GFX950_CUS
-
     props = torch.cuda.get_device_properties(device_index)
     arch = props.gcnArchName.split(":", 1)[0]
+    try:
+        from aiter.ops.flydsl.unified_attention_kernels import GFX950_CUS
+    except ImportError:
+        return False, arch
     return arch == "gfx950" and props.multi_processor_count >= GFX950_CUS, arch
 
 

@@ -146,6 +146,7 @@ def build_flash_attn_fp8_decode_module(
     # (m, l, O) for its contiguous KV sub-range to a global workspace; a
     # separate combine kernel LSE-merges the S partials.
     SPLK = int(num_kv_splits)
+    assert SPLK >= 1
     SPLITK = SPLK > 1
     # per (b,h,s) workspace row: O[D*BLOCK_M] + m[BLOCK_M] + l[BLOCK_M].
     WS_PER = D * BLOCK_M + 2 * BLOCK_M

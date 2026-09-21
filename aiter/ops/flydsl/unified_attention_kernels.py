@@ -408,7 +408,9 @@ def _route_decode_kernel(
     num_query_heads = q.shape[1]
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
     npages = (int(max_seqlen_k) + _PAGE_SIZE - 1) // _PAGE_SIZE
-    num_kv_splits = plan_num_kv_splits(num_seqs, num_kv_heads, npages)
+    num_kv_splits = plan_num_kv_splits(
+        num_seqs, num_kv_heads, npages, s_max=_MAX_SEGMENTS
+    )
     with torch.cuda.device(q.device.index):
         mod = _get_decode_kernel(
             num_query_heads,
