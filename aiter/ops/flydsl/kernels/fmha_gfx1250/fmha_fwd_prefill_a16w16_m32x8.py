@@ -65,11 +65,11 @@ from .fmha_b16_buffer_managers import (
     OManager16bV1,
     OManager16bV2,
     OManager16bV3,
+    ProducerCtx,
     QManager16bV1,
     QManager16bV2,
     VManager16bV1,
     VManager16bV2,
-    _async_load_to_lds,
     _ir,
 )
 
@@ -191,17 +191,19 @@ RESCALE_THRESHOLD = 8.0
 # -inf did. Masked scores stay -inf (p = exp2(-inf) = 0); only the max seed changes.
 BIG_NEG = -1.0e30
 
-# Compile-time Q/K/V loader select. False = V1 (Q ring async + swizzled LDS; K/V cluster_load_async +
-# swizzled LDS); True = V2 (Q per-warp TDM; K/V TDM global->LDS; all row-major padded LDS, HW OOB,
-# fewer address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by O_VARIANT.
+# Compile-time Q/K/V loader select. False = V1 (Q ring async + swizzled LDS; K/V
+# cluster_load_async), True = V2 (Q per-warp TDM; K/V TDM global->LDS, HW OOB, far fewer
+# address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by
+# O_VARIANT. For K and V the two differ ONLY in that transport -- same padded row-major
+# LDS, same fragment reads, V2 a subclass of V1 -- so this flag picks a class pair and
+# nothing at the call sites below branches on it.
 USE_TDM_LOADER = True
-assert not KV_K_AHEAD or USE_TDM_LOADER, "K-ahead is wired for the V2 TDM loaders only"
 
-# K/V producer specialization (always on; V1's cooperative loaders do not support it).
-# The LO half issues every K copy, the HI half every V copy, and each of a half's
-# KV_PRODUCER_WARPS waves copies one dense n_block/KV_PRODUCER_WARPS row band by itself
-# (num_warps=1), so a wave issues one tensor_load per pow2 hdim segment and each half's
-# tensorcnt tracks one operand. The drain barrier still publishes both halves.
+# K/V producer specialization. The LO half issues every K copy, the HI half every V copy,
+# and each of a half's KV_PRODUCER_WARPS waves copies one dense n_block/KV_PRODUCER_WARPS
+# row band by itself, so each half's counter tracks one operand. The drain barrier still
+# publishes both halves. Transport-independent: the partition reaches the managers as a
+# ProducerCtx, and both build that band the same way.
 KV_PRODUCER_WARPS = NUM_WAVES // 2
 # Read a tile's two n_block halves in opposite order on odd SIMDs, so the two SIMD
 # parities never sit in the same 64 KB LDS segment set at the same point of a gemm. Swaps
@@ -225,7 +227,8 @@ KV_SPLIT_PARITY_ORDER = True
 # fully-masked path (m_new = m_prev, corr = 1, P = 0, d unchanged).
 ANTI_PHASE = True
 # Lagging half only: put the KV drain barrier AFTER the gemm instead of at the top of the
-# body, so the loop's back-edge bookkeeping and _addr_phase VALU/SALU land BEHIND it.
+# body, so the loop's back-edge bookkeeping and the prefetch descriptor's VALU/SALU land
+# BEHIND it.
 LAG_DRAIN_AFTER_GEMM = True and ANTI_PHASE
 # O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
 # far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
@@ -1316,134 +1319,105 @@ def _core_attention(
     # n_block/KV_PRODUCER_WARPS row band and copies it alone (one tensor_load per pow2
     # hdim segment).
     _producer_warp = warp_idx % fx.Int32(KV_PRODUCER_WARPS)
-    if USE_TDM_LOADER:
-        # V2: build the TDM copy views (pure), run Q part2, fence Q's LDS dead, then
-        # issue the copies and drain before the loop.
-        def _kv_views(slot, row0, tile):
-            # This half's operand only: LO issues every K copy, HI every V copy.
-            if warp_type.is_lo:
-                return k_mgr.load_views(
-                    ptr_lds=_k_bufs_at(slot),
-                    ptr_K=ptr_K,
-                    stride_k_seq=stride_k_seq,
-                    stride_k_head=stride_k_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + row0,
-                    kv_valid=_kv_valid(tile),
-                    num_warps=KV_PRODUCER_WARPS,
-                    producer_warp=_producer_warp,
-                )
-            return v_mgr.load_views(
-                ptr_lds=_v_bufs_at(slot),
-                ptr_V=ptr_V,
-                stride_v_seq=stride_v_seq,
-                stride_v_head=stride_v_head,
-                kv_head=kv_head,
-                kv_row0=kv_start + row0,
-                kv_valid=_kv_valid(tile),
-                num_warps=KV_PRODUCER_WARPS,
-                producer_warp=_producer_warp,
+    _kv_ctx = ProducerCtx(
+        producer_warp=_producer_warp,
+        num_producer_warps=KV_PRODUCER_WARPS,
+        lane_idx=lane_idx,
+    )
+
+    def _get_kv_desc(slot, row0, valid):
+        """This half's BufferOpDescriptor for one tile: LO issues every K copy, HI every
+        V copy. Pure -- no memory op until ``.async_load()`` -- so the address VALU it
+        costs can sit in an unrelated load's shadow. Which transport the descriptor carries
+        (async vs TDM) is the manager's business, not this call site's."""
+        if warp_type.is_lo:
+            return k_mgr.load_descriptor(
+                ptr_lds=_k_bufs_at(slot),
+                ptr_src=ptr_K,
+                stride_seq=stride_k_seq,
+                stride_head=stride_k_head,
+                head=kv_head,
+                row0=kv_start + row0,
+                valid=valid,
+                ctx=_kv_ctx,
             )
+        return v_mgr.load_descriptor(
+            ptr_lds=_v_bufs_at(slot),
+            ptr_src=ptr_V,
+            stride_seq=stride_v_seq,
+            stride_head=stride_v_head,
+            head=kv_head,
+            row0=kv_start + row0,
+            valid=valid,
+            ctx=_kv_ctx,
+        )
 
-        def _issue_views(views):
-            for _v in views:
-                fx.copy_atom_call(*_v)
-
-        kv0 = _kv_views(_k_lds_buf(_PSLOT[1]), start_row0, start_tile)
-        # Built here, issued below: the views are pure, so the address VALU stays in the
-        # Q global-load shadow. LO's second copy is K(start+1) into slot 2, the tile the
-        # body no longer issues once K runs ahead; HI's is V(start) into slot 0, read by
-        # body start's dead PV.
-        if KV_K_AHEAD and warp_type.is_lo:
-            fill_tile = start_tile + fx.Int32(1)
-            kv_fill = _kv_views(_k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), fill_tile)
-        else:
-            kv_fill = _kv_views(_k_lds_buf(_PSLOT[0]), start_row0, start_tile)
-        num_tdm_copies = len(kv0)
-        num_async_copies = -1  # nothing increments asynccnt under TDM
-        _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
-        # Copies whose destination misses Q go out BEFORE Q is read, so their global
-        # latency overlaps Q's; part2 then waits tensorcnt down to them instead of to 0.
-        # Only LO's K-ahead fill (logical slot 2) lands on Q, so it waits for the barrier.
-        _early = list(kv0)
-        _late = []
-        if KV_K_AHEAD and warp_type.is_lo:
-            _late = list(kv_fill)
-        elif not warp_type.is_lo:
-            _early += kv_fill
-        _issue_views(_early)
-        q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale, skip_tensorcnt=len(_early))
-        # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
-        # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
-        # atom is per-wave while a tile's is per-producer (wave A's Q region is written by
-        # wave B's share of the tile).
-        rocdl.s_wait_dscnt(0)
-        gpu.barrier()
-        # HI enters its resting priority here, at the first point both halves have
-        # reached. Before this the two are still in the symmetric Q/KV prologue; from
-        # here on the lagging half is the one that must not lose arbitration to its
-        # SIMD-mate, and _pv_qk_gemm's exit restores this same level after every gemm.
-        # Compile-time: warp_type is a Python constant, so LO traces no instruction.
-        if not warp_type.is_lo:
-            rocdl.s_setprio(1)
-        _issue_views(_late)
-        _kv_fence(*_kv_drain)
+    kv0 = _get_kv_desc(_k_lds_buf(_PSLOT[1]), start_row0, _kv_valid(start_tile))
+    # Built here, issued below: the descriptor is pure, so the address VALU stays in the
+    # Q global-load shadow. LO's second copy is K(start+1) into slot 2, the tile the
+    # body no longer issues once K runs ahead; HI's is V(start) into slot 0, read by
+    # body start's dead PV.
+    if KV_K_AHEAD and warp_type.is_lo:
+        fill_tile = start_tile + fx.Int32(1)
+        kv_fill = _get_kv_desc(
+            _k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), _kv_valid(fill_tile)
+        )
     else:
-
-        def _kv_ptrs(slot, row0, tile):
-            return (
-                k_mgr.global_load_ptrs(
-                    ptr_lds=slot,
-                    ptr_K=ptr_K,
-                    stride_k_seq=stride_k_seq,
-                    stride_k_head=stride_k_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + row0,
-                    kv_valid=_kv_valid(tile),
-                    warp_idx=warp_idx,
-                    lane_idx=lane_idx,
-                ),
-                v_mgr.global_load_ptrs(
-                    ptr_lds=slot + fx.Int32(k_blk_bytes),
-                    ptr_V=ptr_V,
-                    stride_v_seq=stride_v_seq,
-                    stride_v_head=stride_v_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + row0,
-                    kv_valid=_kv_valid(tile),
-                    warp_idx=warp_idx,
-                    lane_idx=lane_idx,
-                ),
-            )
-
-        def _issue_ptrs(kv):
-            (k_g, k_l, k_i), (v_g, v_l, v_i) = kv
-            _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
-            _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
-
-        kv0 = _kv_ptrs(_k_lds_buf(_PSLOT[1]), start_row0, start_tile)
-        kv_fill = _kv_ptrs(_k_lds_buf(_PSLOT[0]), start_row0, start_tile)
-        num_tdm_copies = -1  # nothing increments tensorcnt under V1
-        num_async_copies = 0  # V1 has no per-tile count: its counter fully drains
-        _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
-        # (3) QMgr part2 — Q ds_load LDS->VGPR (drains the part1 Q async), issued AHEAD of
-        # the cluster_loads so its Q-scaling reg reuse leaves the load shadow.
+        kv_fill = _get_kv_desc(_k_lds_buf(_PSLOT[0]), start_row0, _kv_valid(start_tile))
+    # Fence depths, straight off the descriptor's declared counter usage. A counter this
+    # half's copies never touch gets -1 ("do not wait on it at all"), which is NOT the
+    # same as waiting for 0. The one it does touch gets this half's per-tile copy count,
+    # the depth a KV_PARTIAL_FENCE names to leave the newest tile in flight: both
+    # counters take a depth (``tensor_wait(N)`` / ``s_wait_asynccnt(N)``) and both retire
+    # in issue order, so it means the same thing on either transport. It is a per-HALF
+    # count -- LO's K band and HI's V band differ whenever qk_hdim != v_hdim.
+    num_tdm_copies = kv0.tensorcnt if kv0.tensorcnt else -1
+    num_async_copies = kv0.asynccnt if kv0.asynccnt else -1
+    _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
+    # What this half copies in the prologue, transport-independent: its tile, plus the
+    # fill -- except on LO without K-ahead, where the fill is the same tile again and
+    # ``kv_fill`` is built only to be dropped.
+    _tiles = [kv0]
+    if KV_K_AHEAD or not warp_type.is_lo:
+        _tiles.append(kv_fill)
+    # When each goes out is NOT transport-independent. Under V2, copies whose destination
+    # misses Q go out BEFORE Q is read, so their global latency overlaps Q's and part2
+    # waits tensorcnt down to them instead of to 0; only LO's K-ahead fill (logical slot
+    # 2) lands on Q, so that one waits for the barrier. Under V1 there is no such overlap
+    # to have: Q's own stage is on asynccnt too, and its part2 waits that counter to a
+    # depth counted over Q's loads ALONE, so a tile copy issued first would corrupt the
+    # count. Everything goes after the barrier -- and after part2, which ends at depth 0,
+    # leaving asynccnt carrying this half's K/V copies alone from here on.
+    if not USE_TDM_LOADER:
+        _early, _late = [], _tiles
+    elif KV_K_AHEAD and warp_type.is_lo:
+        _early, _late = _tiles[:1], _tiles[1:]
+    else:
+        _early, _late = _tiles, []
+    for _d in _early:
+        _d.async_load()
+    if USE_TDM_LOADER:
+        q_frags = q_mgr.load_q_to_vgpr_part2(
+            scale=_q_scale, skip_tensorcnt=sum(_d.tensorcnt for _d in _early)
+        )
+    else:
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
-        rocdl.s_wait_dscnt(0)  # Q's ds_loads retired: its LDS is now dead
-        gpu.barrier()
-        # HI enters its resting priority here, at the first point both halves have
-        # reached. Before this the two are still in the symmetric Q/KV prologue; from
-        # here on the lagging half is the one that must not lose arbitration to its
-        # SIMD-mate, and _pv_qk_gemm's exit restores this same level after every gemm.
-        # Compile-time: warp_type is a Python constant, so LO traces no instruction.
-        if not warp_type.is_lo:
-            rocdl.s_setprio(1)
-        # (4)+(5) Issue the cluster_loads as ONE packed burst between two barriers, before
-        # the compiler reuses their source address VGPRs (mode-2 async-source-WAR fix).
-        _issue_ptrs(kv0)
-        _v_g, _v_l, _v_i = kv_fill[1]
-        _async_load_to_lds(_v_g, _v_l, cluster=True, imm_offs=_v_i)
-        _kv_fence(*_kv_drain)
+    # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
+    # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
+    # atom is per-wave while a tile's is per-producer (wave A's Q region is written by
+    # wave B's share of the tile).
+    rocdl.s_wait_dscnt(0)
+    gpu.barrier()
+    # HI enters its resting priority here, at the first point both halves have
+    # reached. Before this the two are still in the symmetric Q/KV prologue; from
+    # here on the lagging half is the one that must not lose arbitration to its
+    # SIMD-mate, and _pv_qk_gemm's exit restores this same level after every gemm.
+    # Compile-time: warp_type is a Python constant, so LO traces no instruction.
+    if not warp_type.is_lo:
+        rocdl.s_setprio(1)
+    for _d in _late:
+        _d.async_load()
+    _kv_fence(*_kv_drain)
 
     # (7) Loop init — MOVED to after the prologue barrier (ordering experiment). Online-
     # softmax seed + O accumulators (iter_args) and loop bounds.
@@ -1513,8 +1487,7 @@ def _core_attention(
     # iter_args and LEFT-ROTATED in the yield: iteration i reads set 0 (= tile i) and
     # writes tile i+2 at byte base 2 (= slot i+2 == slot i-1). Rotation is pure register
     # renaming, so no runtime "% N_KV_PP" is ever evaluated. Base count per mgr is
-    # manager-defined (V1: 2, V2: 1) — carried generically; the global->LDS ISSUE is the
-    # only piece that branches on the loader. ----
+    # manager-defined (== KV_LDS_SPLITS today) — carried generically. ----
     k_lds_ld = [
         k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(_PSLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
@@ -1523,7 +1496,7 @@ def _core_attention(
         v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(_PSLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
     ]
-    _NKB = len(k_lds_ld[0])  # ds bases per K buffer (V1: 2, V2: 1)
+    _NKB = len(k_lds_ld[0])  # ds bases per K buffer (one per LDS split)
     _NVB = len(v_lds_ld[0])
     _PTR_BASE = len(_init)
     for i in range(N_KV_PP):
@@ -1630,59 +1603,8 @@ def _core_attention(
         pf_row0 = _tile_row0(pf_tile)
         pf_valid = _kv_valid(pf_tile)
 
-        def _addr_phase():
-            # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
-            # global/LDS pointer lists, for tile ``pf``'s K/V into the oldest slot.
-            if USE_TDM_LOADER:
-                if warp_type.is_lo:
-                    return k_mgr.load_views(
-                        ptr_lds=_k_bufs_at(wr_slot),
-                        ptr_K=ptr_K,
-                        stride_k_seq=stride_k_seq,
-                        stride_k_head=stride_k_head,
-                        kv_head=kv_head,
-                        kv_row0=kv_start + pf_row0,
-                        kv_valid=pf_valid,
-                        num_warps=KV_PRODUCER_WARPS,
-                        producer_warp=_producer_warp,
-                    )
-                return v_mgr.load_views(
-                    ptr_lds=_v_bufs_at(wr_slot),
-                    ptr_V=ptr_V,
-                    stride_v_seq=stride_v_seq,
-                    stride_v_head=stride_v_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + pf_row0,
-                    kv_valid=pf_valid,
-                    num_warps=KV_PRODUCER_WARPS,
-                    producer_warp=_producer_warp,
-                )
-            k_g, k_l, k_i = k_mgr.global_load_ptrs(
-                ptr_lds=wr_slot,
-                ptr_K=ptr_K,
-                stride_k_seq=stride_k_seq,
-                stride_k_head=stride_k_head,
-                kv_head=kv_head,
-                kv_row0=kv_start + pf_row0,
-                kv_valid=pf_valid,
-                warp_idx=warp_idx,
-                lane_idx=lane_idx,
-            )
-            v_g, v_l, v_i = v_mgr.global_load_ptrs(
-                ptr_lds=wr_slot + fx.Int32(k_blk_bytes),
-                ptr_V=ptr_V,
-                stride_v_seq=stride_v_seq,
-                stride_v_head=stride_v_head,
-                kv_head=kv_head,
-                kv_row0=kv_start + pf_row0,
-                kv_valid=pf_valid,
-                warp_idx=warp_idx,
-                lane_idx=lane_idx,
-            )
-            return (k_g, k_l, k_i, v_g, v_l, v_i)
-
         def _drain_barrier():
-            # The producing half's own tensorcnt. K runs two bodies ahead, so LO reaches
+            # The producing half's own copy counter. K runs two bodies ahead, so LO reaches
             # this fence with the tile it is about to read second-oldest and can leave the
             # newest in flight. V only has one body of slack on the ring head this half
             # issues, so HI still drains to 0.
@@ -1697,18 +1619,11 @@ def _core_attention(
             else:
                 _kv_fence(*_kv_drain, num_dscnt=_NH)
 
-        def _prefetch(addr):
-            if USE_TDM_LOADER:
-                for _v in addr:
-                    fx.copy_atom_call(*_v)
-            else:
-                k_g, k_l, k_i, v_g, v_l, v_i = addr
-                _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
-                _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
-
-        # Address VALU up front (no barrier dependency) so it overlaps the drain; only
-        # the async issue in _prefetch must stay after the barrier.
-        addr = _addr_phase()
+        # This half's descriptor for tile ``pf``'s K (LO) or V (HI) into the oldest slot.
+        # Built up front: it is pure, so its address VALU has no barrier dependency and
+        # overlaps the drain; only the copy itself (pf_desc.async_load()) must stay after
+        # the barrier.
+        pf_desc = _get_kv_desc(wr_slot, pf_row0, pf_valid)
         num_kfrag = k_mgr.num_ds_loads() // 2
         num_vfrag = v_mgr.num_ds_loads() // 2
 
@@ -1844,7 +1759,7 @@ def _core_attention(
         if _lag_sm:
             if not LAG_DRAIN_AFTER_GEMM:
                 _drain_barrier()
-            _prefetch(addr)
+            pf_desc.async_load()
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Ring head for the gemm below goes out BEFORE P is narrowed: the head is
             # ds_loads with no dependence on P, so issuing it first puts the conversion in
@@ -1877,7 +1792,7 @@ def _core_attention(
         else:
             _drain_barrier()
             pvqk_head = _pvqk_head()
-            _prefetch(addr)
+            pf_desc.async_load()
             rocdl.sched_barrier(0)
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
