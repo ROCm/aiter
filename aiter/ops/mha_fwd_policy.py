@@ -86,9 +86,7 @@ MhaFwdRunState = Literal[
     "review-ready",
 ]
 
-MHA_FWD_BACKENDS = frozenset(
-    {"asm_v3", "ck", "flydsl", "gluon", "opus", "triton"}
-)
+MHA_FWD_BACKENDS = frozenset({"asm_v3", "ck", "flydsl", "gluon", "opus", "triton"})
 MHA_FWD_TILE_CONFIG_BACKENDS = frozenset({"gluon", "triton"})
 MHA_FWD_TILE_CONFIG_KEYS = {
     "triton": frozenset(
@@ -274,7 +272,9 @@ class MhaFwdProblem:
         )
 
     def key(self) -> tuple[str, ...]:
-        return tuple(csv_scalar(getattr(self, field)) for field in MHA_FWD_TUNING_KEY_FIELDS)
+        return tuple(
+            csv_scalar(getattr(self, field)) for field in MHA_FWD_TUNING_KEY_FIELDS
+        )
 
     def as_row(self) -> dict[str, Any]:
         return {field: getattr(self, field) for field in MHA_FWD_TUNING_KEY_FIELDS}
@@ -287,9 +287,7 @@ class MhaFwdCandidate:
     backend_config: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        validate_mha_fwd_plan_fields(
-            self.backend, self.num_splits, self.backend_config
-        )
+        validate_mha_fwd_plan_fields(self.backend, self.num_splits, self.backend_config)
 
     @property
     def config_json(self) -> str:
@@ -307,9 +305,7 @@ class MhaFwdPlan:
     backend_config: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        validate_mha_fwd_plan_fields(
-            self.backend, self.num_splits, self.backend_config
-        )
+        validate_mha_fwd_plan_fields(self.backend, self.num_splits, self.backend_config)
 
     def validate_for(self, problem: MhaFwdProblem) -> None:
         validate_mha_fwd_backend_arch(self.backend, problem.gfx)
@@ -385,9 +381,7 @@ def validate_mha_fwd_plan_fields(
             raise ValueError(f"{backend} does not accept backend_config")
         unknown = sorted(set(backend_config) - MHA_FWD_TILE_CONFIG_KEYS[backend])
         if unknown:
-            raise ValueError(
-                f"{backend} backend_config has unknown keys: {unknown}"
-            )
+            raise ValueError(f"{backend} backend_config has unknown keys: {unknown}")
 
 
 def validate_mha_fwd_backend_arch(backend: str, gfx: str) -> None:
@@ -551,9 +545,7 @@ def enumerate_mha_fwd_candidates(
     return tuple(candidates)
 
 
-def mha_fwd_candidate_id(
-    problem: MhaFwdProblem, candidate: MhaFwdCandidate
-) -> str:
+def mha_fwd_candidate_id(problem: MhaFwdProblem, candidate: MhaFwdCandidate) -> str:
     """Return a stable identifier used by checkpoint journals and resume."""
 
     payload = json.dumps(

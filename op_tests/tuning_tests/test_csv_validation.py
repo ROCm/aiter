@@ -185,9 +185,7 @@ class TestCSVValidation(unittest.TestCase):
         self.assertEqual(required - set(df.columns), set())
         self.assertFalse(df["gpu_model"].isna().any())
         self.assertFalse(df["gpu_model"].astype(str).str.strip().eq("").any())
-        self.assertFalse(
-            df.duplicated(subset=list(MHA_FWD_TUNING_KEY_FIELDS)).any()
-        )
+        self.assertFalse(df.duplicated(subset=list(MHA_FWD_TUNING_KEY_FIELDS)).any())
 
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
