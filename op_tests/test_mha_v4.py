@@ -26,7 +26,6 @@ from aiter.ops.mha_v4 import (
     _resolve_raw_recipe,
     mha_v4,
     mha_v4_kv_tile,
-    mha_v4_mxfp8,
     mha_v4_packed,
     mha_v4_sparse_work_table,
     native_fp8_format,
@@ -54,7 +53,6 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
-    quantize_v_mxfp4,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
@@ -96,69 +94,6 @@ def _rotate_hd128_reference(value):
         rotated = torch.cat((left + right, left - right), dim=-1).reshape(value.shape)
         group_size *= 2
     return (rotated / 128**0.5).to(value.dtype)
-
-
-def _reference_mxfp4_v(value):
-    batch, sequence, heads, _ = value.shape
-    padded_sequence = fp4_v_padded_sequence(sequence)
-    tiles = padded_sequence // 128
-    padded = torch.nn.functional.pad(
-        value.float(), (0, 0, 0, 0, 0, padded_sequence - sequence)
-    )
-    padded = padded.permute(0, 2, 1, 3)
-
-    column = torch.arange(64, device=value.device)
-    lane = column % 32
-    permutation = 4 * (lane // 8) + 16 * ((lane // 4) % 2) + lane % 4
-    tau64 = 32 * (column // 32) + permutation
-    kperm = torch.empty(64, dtype=torch.long, device=value.device)
-    kperm[tau64] = column
-
-    raw = torch.zeros(
-        fp4_v_raw_buffer_size(batch, sequence, heads),
-        dtype=torch.uint8,
-        device=value.device,
-    )
-    payload = raw[:-64].view(batch, heads, tiles * 8192)
-    scale = torch.empty(
-        (batch, heads, tiles * 512), dtype=torch.uint8, device=value.device
-    )
-    for tile in range(tiles):
-        for channel_block in range(4):
-            for token_half in range(2):
-                unit = 2 * channel_block + token_half
-                tokens = tile * 128 + token_half * 64 + kperm
-                channels = slice(channel_block * 32, (channel_block + 1) * 32)
-                block = padded[:, :, tokens, channels]
-                exponents = []
-                normalized = torch.empty_like(block)
-                for token_block in range(2):
-                    columns = slice(token_block * 32, (token_block + 1) * 32)
-                    amax = block[:, :, columns].abs().amax(dim=2)
-                    exponent = torch.ceil(
-                        torch.log2(torch.clamp_min(amax, 1e-12) / 6.0)
-                    )
-                    exponents.append(exponent)
-                    normalized[:, :, columns] = block[:, :, columns] / torch.exp2(
-                        exponent[:, :, None]
-                    )
-
-                code = _e2m1_code_ties_low(normalized)
-                packed = code[..., 0::2] | (code[..., 1::2] << 4)
-                payload[
-                    :, :, tile * 8192 + unit * 1024 : tile * 8192 + (unit + 1) * 1024
-                ] = packed.flatten(2)
-
-                scale_base = tile * 512 + token_half * 256
-                for token_block, exponent in enumerate(exponents):
-                    encoded = (exponent + 127).clamp(0, 255).to(torch.uint8)
-                    for pair in range(16):
-                        offset = (
-                            scale_base + token_block * 128 + 8 * pair + channel_block
-                        )
-                        scale[:, :, offset] = encoded[:, :, 2 * pair]
-                        scale[:, :, offset + 4] = encoded[:, :, 2 * pair + 1]
-    return raw, scale
 
 
 @pytest.fixture(autouse=True)
@@ -754,37 +689,6 @@ def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, hea
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
 @pytest.mark.parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
-def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
-    torch.manual_seed(sequence)
-    value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
-    raw, scale = quantize_v_mxfp4(value)
-    raw_again, scale_again = quantize_v_mxfp4(value)
-    expected_raw, expected_scale = _reference_mxfp4_v(value)
-
-    assert raw.shape == (fp4_v_raw_buffer_size(2, sequence, 3),)
-    assert scale.shape == (2, 3, ((sequence + 127) // 128) * 512)
-    assert raw.dtype == scale.dtype == torch.uint8
-    assert torch.equal(raw, expected_raw)
-    assert torch.equal(scale, expected_scale)
-    assert torch.equal(raw, raw_again)
-    assert torch.equal(scale, scale_again)
-    # The HIP producer replaced a Triton packer; keep the retired one as a second oracle.
-    triton_raw, triton_scale = pack_v_mxfp4_colmajor_raw(value)
-    assert torch.equal(raw, triton_raw)
-    assert torch.equal(scale, triton_scale)
-    assert torch.count_nonzero(raw[-64:]) == 0
-    logical = mxfp4_v_view(raw, scale, sequence)
-    assert logical.shape == value.shape
-    assert logical.stride() == (
-        3 * fp4_v_padded_sequence(sequence) * 64,
-        64,
-        fp4_v_padded_sequence(sequence) * 64,
-        1,
-    )
-
-
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
-@pytest.mark.parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
 def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -929,8 +833,8 @@ def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
 @pytest.mark.parametrize("sequence", [1, 128, 129, 257, 512])
 @pytest.mark.parametrize(
     "quantize",
-    [quantize_v_mxfp4, quantize_v_mxfp4_fp6_p],
-    ids=["canonical", "fp6_p"],
+    [quantize_v_mxfp4_fp6_p],
+    ids=["fp6_p"],
 )
 def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
     quantize, sequence
@@ -1171,7 +1075,7 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
 
     mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
     mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)
-    mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4(value)
+    mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4_fp6_p(value)
     with pytest.raises(RuntimeError, match="speculative tile gather"):
         mha_v4_packed(
             mxfp4_q,
@@ -1442,32 +1346,6 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
     assert torch.equal(eager, compiled)
     assert torch.isfinite(consumed).all()
     assert churn.numel() == 16 * 1024 * 1024
-
-
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
-def test_mha_v4_mxfp8_deprecated_alias_matches_mha_v4():
-    torch.manual_seed(41)
-    q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    fp8_format = native_fp8_format()
-
-    expected = mha_v4(
-        q,
-        k,
-        v,
-        fp8_format,
-        fp8_format,
-        fp8_format,
-        q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
-        k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
-        v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
-    )
-    with pytest.deprecated_call():
-        actual = mha_v4_mxfp8(q, k, v)
-    torch.cuda.synchronize()
-
-    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")

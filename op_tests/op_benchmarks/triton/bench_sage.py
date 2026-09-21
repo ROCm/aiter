@@ -45,7 +45,6 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
-    quantize_v_mxfp4,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
@@ -98,12 +97,11 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 
-def _production_quantize_f4f4(query, key, value, softmax_scale, fp6_p=True):
+def _production_quantize_f4f4(query, key, value, softmax_scale):
     q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    quantize_v = quantize_v_mxfp4_fp6_p if fp6_p else quantize_v_mxfp4
-    v_raw, v_scale = quantize_v(value)
+    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
@@ -124,8 +122,7 @@ def _production_quantize_mxfp6(
         return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
     if v_format != AttentionFormat.MXFP4:
         raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
-    quantize_v = quantize_v_mxfp4_fp6_p if fp6_p else quantize_v_mxfp4
-    v_raw, v_scale = quantize_v(value)
+    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
     v_quantized = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 

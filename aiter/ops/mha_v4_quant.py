@@ -545,21 +545,6 @@ def _mxfp4_v_buffers(
     return raw, scale
 
 
-@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_raw_v2", mutates_args=())
-def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers."""
-    batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP4 V quantization")
-    raw, scale = _mxfp4_v_buffers(input, batch, sequence, heads)
-    _quantize_v_mxfp4_hip(raw, scale, input)
-    return raw, scale
-
-
-@quantize_v_mxfp4.register_fake
-def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, _ = input.shape
-    return _mxfp4_v_buffers(input, batch, sequence, heads)
-
-
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_raw", mutates_args=())
 def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
     """Pack MXFP4 V in the token order consumed by the FP6-P F4F4 kernel."""

@@ -64,10 +64,12 @@ Backend choice is private to `mha_v4_quant`; recipe selection does not branch on
 | Per-tensor INT8/FP8 | Triton |
 | Rotated FP8 and FP8 V | Triton |
 | Canonical MXFP6 V | Triton |
-| Canonical MXFP4 V | Triton |
 | MXFP8/MXFP6/MXFP4 Q and K | HIP `module_mha_v4_quant` |
 | FP6-P MXFP6 V | HIP `module_mha_v4_quant` |
 | FP6-P MXFP4 V | HIP `module_mha_v4_quant` |
+
+No manifest row consumes canonical MX V: every MXFP6-V and MXFP4-V row selects the FP6-P pack.
+`quantize_v_mxfp6` is retained only as the reference the FP6-P layout test permutes against.
 
 ## APIs
 
