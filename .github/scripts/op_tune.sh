@@ -24,7 +24,7 @@ declare -a tune_jobs=(
   "ck_gemm_a8w8_blockscale_bpreshuffle:csrc/ck_gemm_a8w8_blockscale_bpreshuffle:op_tests/test_gemm_a8w8_blockscale.py:python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py --preshuffle -i aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv"
   "ck_gemm_a8w8_bpreshuffle:csrc/ck_gemm_a8w8_bpreshuffle:op_tests/test_gemm_a8w8.py:python3 csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py -i aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv"
   "ck_gemm_moe_2stages_codegen:csrc/ck_gemm_moe_2stages_codegen:op_tests/test_moe.py:python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv"
-  "fhmoe:csrc/ck_gemm_moe_2stages_codegen:op_tests/test_fhmoe.py:python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --fhmoe --all -i aiter/configs/untuned_fhmoe.csv -o aiter/configs/tuned_fhmoe.csv"
+  "fhmoe:csrc/ck_gemm_moe_2stages_codegen:op_tests/test_fhmoe.py:python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --fhmoe -i aiter/configs/untuned_fhmoe.csv -o aiter/configs/tuned_fhmoe.csv"
   #"ck_gemm_a4w4_blockscale:csrc/ck_gemm_a4w4_blockscale:op_tests/test_gemm_a4w4_blockscale.py:python3 csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py -i aiter/configs/a4w4_blockscale_untuned_gemm.csv -o aiter/configs/a4w4_blockscale_tuned_gemm.csv"
 )
 
@@ -44,6 +44,16 @@ for job in "${tune_jobs[@]}"; do
             fi
         done
         if [ "$found_match" = false ]; then
+            continue
+        fi
+    fi
+    if [ "$shape" = "fhmoe" ]; then
+        gfx=$(python3 -c "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())") || gfx=""
+        if [ "$gfx" != "gfx950" ]; then
+            echo "============================================================"
+            echo "Skipping fhmoe: requires gfx950, got ${gfx:-unknown}"
+            echo "==============================================="
+            echo
             continue
         fi
     fi
