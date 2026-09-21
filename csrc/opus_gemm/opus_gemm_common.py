@@ -520,11 +520,19 @@ _bmm_flatmm_local.update({
 # the 8000 globalisation does: local 321 and 1321 become global 8321 and 9321,
 # so a pair is recognisable on sight in a log or a tuned CSV.
 MX32_KID_STRIDE = 1000
+# Three tiles get no twin: clang 22 fails them with "operand has incorrect
+# register class", the same ROCm 7.2.4 defect the kid326 workspace note below
+# already works around. All three are WG_PER_CU=1 kernels on the largest tiles,
+# where the register budget is tightest, and GROUP_K=32 adds just enough --
+# a wider v_sfb and the lane's block index -- to cross the line. Their 128
+# twins compile; nothing here is wrong with the tile itself.
+_MX32_CLANG_REGCLASS_SKIP = frozenset({128, 139, 256})
 _bmm_flatmm_local.update({
     kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
         bm, bn, bk, wg, direct, prefetch, quant_block=32
     )
     for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+    if kid not in _MX32_CLANG_REGCLASS_SKIP
 })
 # The PRELOAD_SF_LDS tiles get no MX twin yet. That path stages the whole
 # split's scale panel in LDS, sized (B_M/GROUP_M + N_SCALE_GROUPS) rows by
