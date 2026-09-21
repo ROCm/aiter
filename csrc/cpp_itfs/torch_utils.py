@@ -3,7 +3,9 @@
 
 
 import ctypes
+import inspect
 from collections.abc import Callable
+from types import FunctionType
 
 import torch
 from torch.library import Library
@@ -90,6 +92,8 @@ def direct_register_custom_op(
     target_lib: Library | None = None,
     dispatch_key: str = "CUDA",
     tags: tuple[torch.Tag, ...] = (),
+    *,
+    python_only_args: tuple[str, ...] = (),
 ):
     """
     `torch.library.custom_op` can have significant overhead because it
@@ -102,6 +106,10 @@ def direct_register_custom_op(
     want to register it to a different library, you can pass the library
     object to the `target_lib` argument.
 
+    `python_only_args` names optional trailing parameters to omit from the
+    Torch schema, in signature order. Calls through torch.ops use their
+    defaults; direct Python calls can supply them.
+
     IMPORTANT: the lifetime of the operator is tied to the lifetime of the
     library object. If you want to bind the operator to a different library,
     make sure the library object is alive when the operator is used.
@@ -113,13 +121,38 @@ def direct_register_custom_op(
             log_args(op_func, *args, **kwargs)
         return op_func(*args, **kwargs)
 
+    schema_func = op_func
+    if python_only_args:
+        signature = inspect.signature(op_func)
+        parameters = list(signature.parameters.values())
+        excluded = parameters[-len(python_only_args) :]
+        if tuple(param.name for param in excluded) != python_only_args or any(
+            param.default is inspect.Parameter.empty for param in excluded
+        ):
+            raise ValueError(
+                "python_only_args must name optional trailing parameters "
+                "in signature order"
+            )
+        # Preserve the original globals for forward-referenced annotations
+        # while keeping the public Python signature unchanged.
+        schema_func = FunctionType(
+            op_func.__code__,
+            op_func.__globals__,
+            op_func.__name__,
+            op_func.__defaults__,
+            op_func.__closure__,
+        )
+        schema_func.__signature__ = signature.replace(
+            parameters=parameters[: -len(python_only_args)]
+        )
+
     if hasattr(torch.library, "infer_schema"):
-        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+        schema_str = torch.library.infer_schema(schema_func, mutates_args=mutates_args)
     else:
         # for pytorch 2.4
         import torch._custom_op.impl
 
-        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+        schema_str = torch._custom_op.impl.infer_schema(schema_func, mutates_args)
     my_lib = target_lib or aiter_lib
     my_lib.define(op_name + schema_str, tags=tags)
     my_lib.impl(op_name, _op_func, dispatch_key=dispatch_key)

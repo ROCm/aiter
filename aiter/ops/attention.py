@@ -59,6 +59,7 @@ def pa_decode_flydsl(
     """FlyDSL decode; ``ps`` is ignored for API compatibility.
 
     Pass ``work_plan`` by keyword to enable planning and positive sliding windows.
+    The registered ``torch.ops.aiter.pa_decode_flydsl`` operator is static-only.
     """
     del ps
     if _pa_decode_flydsl is None:
@@ -92,6 +93,13 @@ direct_register_custom_op(
     "pa_decode_gluon",
     pa_decode_gluon,
     ["output", "exp_sums", "max_logits", "temporary_output"],
+)
+
+direct_register_custom_op(
+    "pa_decode_flydsl",
+    pa_decode_flydsl,
+    ["output", "exp_sums", "max_logits", "temporary_output"],
+    python_only_args=("work_plan",),
 )
 
 
