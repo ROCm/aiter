@@ -827,6 +827,11 @@ gfx950 stayed exact (``err=0``); width-2051 ``L=512`` was 18.91 / 21.23 /
 515.40 us vs 18.65 / 21.15 / 513.29. Decode is flat-to-worse; prefill
 does not use split partials. Keep FP32 ``partial_out``.
 
+**Do not retry** nontemporal (``cache_modifier=2``) 128-bit K/V gathers.
+GPU 6 / gfx950 stayed exact (``err=0``); width-2051 ``L=512`` went
+18.65 → 19.12 us at ``M=1``, 21.15 → 22.87 us at ``M=8``, and
+513.29 → 528.44 us at ``M=512``. Keep cached ``BufferCopy128b`` K/V loads.
+
 **Do not retry** 64-bit ``BufferCopy64b`` ``partial_out`` loads in the
 128-thread LSE merge with consecutive ``D`` pairs (``d=2*tid``). GPU 6 /
 gfx950 stayed exact (``err=0``); merge VGPR 112 → 63 and ISA emitted
