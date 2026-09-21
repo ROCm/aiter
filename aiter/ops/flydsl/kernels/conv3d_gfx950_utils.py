@@ -1077,18 +1077,11 @@ class OutputScatterPlan(NamedTuple):
     that is not a scalar or a tuple silently drops out of that key.
     """
 
-    # The batch reaches the epilogue only through this: whether a row has to
-    # be split back into (sample, position) before it can be addressed. The
-    # predicate rather than the count, so a batch size cannot split the
-    # artifact the way an extent would -- and false for NDHWC output, where
-    # the row already *is* the offset and the batch never enters the
-    # arithmetic at all.
-    #
-    # Collapsing this into the split-always form was measured and dropped: it
-    # is correct on its own, but ``vec_store`` below keeps N in the key
-    # regardless, so the divmod it adds to the single-sample case buys
-    # nothing.
-    needs_sample_split: bool
+    # No field here carries the batch size. A row is split back into
+    # (sample, position) whenever the output is NCDHW, single sample or not:
+    # the divmod costs nothing measurable (a Wan 480x832 encode moved 0.0%),
+    # and making it unconditional is what keeps N out of the cache key
+    # entirely rather than costing two variants.
     k: int
     kg: int
     groups: int
@@ -1135,7 +1128,6 @@ def make_output_scatter_plan(param, geom, cfg, grid):
 
     need_chk = row_chk or n_tail
     return OutputScatterPlan(
-        needs_sample_split=(not out_ndhwc) and n > 1,
         k=k,
         kg=kg,
         groups=param.groups,
@@ -1154,13 +1146,14 @@ def make_output_scatter_plan(param, geom, cfg, grid):
         route_store=need_chk and not use_splitk and not big_out,
         # The four values of an MFMA atom are consecutive rows, so they are
         # only contiguous in memory where a row's neighbour is the next
-        # spatial position: NCDHW, one sample, one store, no staging.
-        # ``n == 1`` is not conservatism: extending the vectorised store to a
-        # batch was tried and produced wrong results, so the four rows of an
-        # atom cannot be assumed contiguous once samples are stacked.
+        # spatial position: NCDHW, one store, no staging.
+        #
+        # A batch is fine, which is worth saying because it looks like it
+        # should not be. The four rows start at a multiple of 4 and dhw is
+        # required to be one just below, so they cannot straddle a sample,
+        # and their offsets stay contiguous whatever n is.
         vec_store=(
-            (n == 1)
-            and (not use_splitk)
+            (not use_splitk)
             and (dhw % MFMA_C_VALUES == 0)
             and (not big_out)
             and (not out_ndhwc)
@@ -1241,7 +1234,7 @@ class OutputScatter:
 
                 if const_expr(plan.vec_store):
                     row0 = fx.Int64(row_base)
-                    off_nk0 = col * fx.Int64(self._ext.dhw) + row0
+                    off_nk0 = self._off_nk(row0, col, None)
 
                     def _emit_vec():
                         vals = []
@@ -1334,8 +1327,6 @@ class OutputScatter:
         if const_expr(plan.out_ndhwc):
             return off_sk
         dhw = fx.Int64(ext.dhw)
-        if const_expr(not plan.needs_sample_split):
-            return col * dhw + row
         n_idx, row_in_sample = ext.div_dhw.divmod(row)
         return n_idx * (fx.Int64(plan.k) * dhw) + col * dhw + row_in_sample
 
