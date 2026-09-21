@@ -173,7 +173,7 @@ def _async_launch_config(
     return enabled, (128 if enabled else block_k), waves_per_eu
 
 
-def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str = "gfx950") -> bool:
+def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
     if dot_precision not in ("bf16", "fp8"):
         raise ValueError(
             f"dot_precision must be 'bf16' or 'fp8', got {dot_precision!r}"

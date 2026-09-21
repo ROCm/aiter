@@ -153,6 +153,21 @@ def test_sparse_mla(fmt, dots, tol, H, C, topk, ragged, pool):
     )
 
 
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_dot_precision_arch_gate(arch):
+    """The fp8-dot gate, for every arch, from any machine.
+
+    The matrix above skips its fp8 cases off gfx950, so the gate has no
+    coverage on any arch without this.
+    """
+    assert smd._resolve_dot_precision("bf16", "fp8_scalar", arch) is False
+    if arch in FP8_DOT_ARCHS:
+        assert smd._resolve_dot_precision("fp8", "fp8_scalar", arch) is True
+    else:
+        with pytest.raises(ValueError, match="fnuz"):
+            smd._resolve_dot_precision("fp8", "fp8_scalar", arch)
+
+
 def test_ds_mla_format():
     _skip_unless_supported()
     _run_and_check("dsmla", C=8, H=16, topk=2048, ragged=True)
