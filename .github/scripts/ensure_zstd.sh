@@ -1,18 +1,29 @@
 #!/bin/bash
 
-set -u
+set -euo pipefail
 
 if command -v zstd >/dev/null 2>&1 && command -v unzstd >/dev/null 2>&1; then
     zstd --version
     exit 0
 fi
 
-if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
-    sudo apt-get update && sudo apt-get install -y zstd
-elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update && apt-get install -y zstd
-else
-    echo "::warning::apt-get is unavailable; Triton wheel cache restore may miss if this runner lacks zstd"
+install_zstd() {
+    if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+        sudo apt-get update || return $?
+        sudo apt-get install -y zstd || return $?
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update || return $?
+        apt-get install -y zstd || return $?
+    else
+        return 127
+    fi
+}
+
+install_status=0
+install_zstd || install_status=$?
+
+if [ "${install_status}" -ne 0 ]; then
+    echo "::warning::Installing zstd failed with exit code ${install_status}; Triton wheel cache restore may miss"
 fi
 
 if command -v zstd >/dev/null 2>&1 && command -v unzstd >/dev/null 2>&1; then
