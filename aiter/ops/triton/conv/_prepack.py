@@ -83,7 +83,14 @@ _PACK_CACHE_3D_3X3X3 = _LRUPackCache()
 _PACK_CACHE_3D_WINOGRAD_HW = _LRUPackCache()
 
 
-def clear_conv3d_weight_pack_caches():
+def clear_conv2d_weight_pack_caches() -> None:
+    """Release cached Conv2D weight packs, primarily for synthetic sweeps."""
+    _PACK_CACHE.clear()
+    _PACK_CACHE_3x3.clear()
+    _PACK_CACHE_WINOGRAD_F4X3.clear()
+
+
+def clear_conv3d_weight_pack_caches() -> None:
     """Release cached Conv3D weight packs, primarily for synthetic sweeps."""
     _PACK_CACHE_3D_GENERAL.clear()
     _PACK_CACHE_3D_3X3X3.clear()
