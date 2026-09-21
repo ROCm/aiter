@@ -66,6 +66,12 @@ SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # fp8 dots need OCP e4m3 MFMA; CDNA3's is fnuz-only and reads OCP as garbage.
 FP8_DOT_ARCHS = ("gfx950",)
 
+# The packed caches (fp8_dsv4_mla, fp8_g64) and the SWA+top-k two-loop do not
+# reach the kernel below: they route to pa_decode_sparse, whose packed driver is
+# gfx950-only. Everywhere else they land in its fallback path, which reads a
+# plain grouped fp8 pool rather than these records, so it rejects them on dtype.
+PACKED_ARCHS = ("gfx950",)
+
 # gfx942 has 64 KB of LDS, not gfx950's 160, so BLOCK_K=64 (~67 KB) will not
 # launch. num_warps stays 4 instead of block_k // 16, which the cap would halve.
 _ARCH_BLOCK_K = {"gfx942": 32, "gfx950": 64}
@@ -78,6 +84,20 @@ def _arch_block_k(arch: str) -> int:
 
 def _arch_num_warps(arch: str) -> int:
     return _ARCH_NUM_WARPS.get(arch, _arch_block_k(arch) // 16)
+
+
+def _check_packed_arch(arch: str) -> None:
+    """Packed caches and the two-loop are gfx950-only, whatever SUPPORTED_ARCHS says.
+
+    Left alone these reach pa_decode_sparse and fail inside it on a cache dtype,
+    which says nothing about the arch being the reason.
+    """
+    if arch not in PACKED_ARCHS:
+        raise ValueError(
+            f"the fp8_dsv4_mla and fp8_g64 caches and the SWA+top-k two-loop are "
+            f"{'/'.join(PACKED_ARCHS)}-only and have no implementation on {arch}. "
+            f"The flat bf16, fp8_scalar and fp8_dsv32_mla caches do run on {arch}."
+        )
 
 
 # An arch listed here has its geometry checked against that LDS budget. gfx942
@@ -356,6 +376,7 @@ def _forward_paged(
     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
+    _check_packed_arch(arch_info.get_arch())
     unsupported = [
         name
         for name, asked in (
