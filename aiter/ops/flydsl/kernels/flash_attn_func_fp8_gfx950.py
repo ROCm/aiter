@@ -247,7 +247,9 @@ def flydsl_flash_attn_fp8_func(
         max_seqlen_kv: Maximum per-batch KV seqlen. Required for varlen cross-attn.
         cross_seqlen: Whether seqlen_q and seqlen_kv differ. Required in varlen
             mode; dense mode infers it from ``q.shape[1] != k.shape[1]``.
-        num_kv_splits: Split-K factor (seq_len >= 384). ``None`` autotunes it.
+        num_kv_splits: Split-K factor. Requires seq_len >= 384, or noncausal
+            cross-sequence attention (including short cached-prefix queries).
+            ``None`` autotunes it.
         fp8_block_m: Pin the tile height to 128 or 256. ``None`` autotunes it.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales, required.
         out: Optional pre-allocated bf16 output of shape ``q.shape[:-1] + (Dv,)``.
@@ -443,7 +445,8 @@ def flydsl_flash_attn_fp8_func(
         if fp8_block_m is None
         else int(fp8_block_m)
     )
-    if _auto_splits and Sq >= 384:
+    splitk_supported = Sq >= 384 or (cross and not causal)
+    if _auto_splits and splitk_supported:
         _auto = _fp8_auto_kv_splits(
             B, H, Sq, _skv_eff, causal, _num_cu(q.device), block_m=_block_m
         )
@@ -454,9 +457,11 @@ def flydsl_flash_attn_fp8_func(
 
     splitk = num_kv_splits > 1
     if splitk:
-        if Sq < 384:
+        if not splitk_supported:
             raise ValueError(
-                f"flydsl_flash_attn_fp8_func: split-K requires seq_len>=384, got {Sq}"
+                "flydsl_flash_attn_fp8_func: split-K requires seq_len>=384 "
+                f"or noncausal cross-sequence attention, got seq_len={Sq}, "
+                f"cross_seqlen={cross}, causal={causal}"
             )
         ws_elems = dualwave_splitk_workspace_elems(
             B, H, Sq, int(num_kv_splits), head_dim=Dv
