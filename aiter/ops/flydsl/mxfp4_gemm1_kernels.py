@@ -63,10 +63,8 @@ def _get_compiled_mxfp4_gemm1_port(
 
 def _assert_supported(
     *,
-    NE,
     D_HIDDEN,
     D_INTER,
-    topk,
     BM,
     use_nt,
     inline_quant,
@@ -79,7 +77,6 @@ def _assert_supported(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     swiglu_limit=7.0,
-    interleave=False,
     num_waves=4,
     native_scale_layout=False,
     k_wave=1,
@@ -226,10 +223,8 @@ def flydsl_mxfp4_gemm1(
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
     _assert_supported(
-        NE=NE,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
-        topk=topk,
         BM=BM,
         use_nt=use_nt,
         inline_quant=inline_quant,
@@ -242,7 +237,6 @@ def flydsl_mxfp4_gemm1(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         swiglu_limit=swiglu_limit,
-        interleave=interleave,
         num_waves=num_waves,
         native_scale_layout=native_scale_layout,
         k_wave=k_wave,

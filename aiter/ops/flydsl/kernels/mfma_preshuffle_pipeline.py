@@ -14,17 +14,12 @@ from dataclasses import dataclass
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects.arith import CmpIPredicate
-from flydsl.expr import arith as _arith
 from flydsl.expr.typing import T
 
 
 def crd2idx(crd, layout):
     """crd2idx returning an index-typed ir.Value (unwraps fly.int_tuple)."""
-    scalar = fx.get_scalar(fx.crd2idx(crd, layout)).ir_value()
-    if isinstance(scalar.type, ir.IndexType):
-        return scalar
-    return _arith.IndexCastOp(T.index, scalar).result
+    return fx.Index(fx.get_scalar(fx.crd2idx(crd, layout))).ir_value()
 
 
 def swizzle_xor16(row, col, k_blocks16):
@@ -35,11 +30,9 @@ def swizzle_xor16(row, col, k_blocks16):
     k_blocks16 is always a power of 2 (tile_k_bytes / 16), so use
     bitwise AND instead of remui to save ~10 VALU cycles on CDNA.
     """
-    from flydsl.expr import arith as _swz_arith
-
-    mask = k_blocks16 - _swz_arith.index(1)
-    rem = _swz_arith.andi(row, mask)
-    return col ^ (rem * 16)
+    mask = fx.Index(k_blocks16) - 1
+    rem = fx.Index(row) & mask
+    return fx.Index(col) ^ (rem * 16)
 
 
 def split_row_major_2d(index, minor_extent):
@@ -59,16 +52,14 @@ def _buffer_load_vec(
     cache_modifier=0,
 ):
     """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
-    from flydsl.expr import arith as _ld_arith
-
     elem_size = int(elem_bytes)
     load_bytes = int(vec_elems) * elem_size
     vec_width = load_bytes // 4
 
     if offset_in_bytes:
-        idx_i32 = _ld_arith.shrui(idx, _ld_arith.index(2))
+        idx_i32 = fx.Index(idx) >> 2
     elif elem_bytes == 2:
-        idx_i32 = _ld_arith.shrui(idx, _ld_arith.index(1))
+        idx_i32 = fx.Index(idx) >> 1
     else:
         idx_i32 = idx
 
@@ -103,7 +94,6 @@ class PreshuffleScaleLayout:
 
 
 def make_preshuffle_scale_layout(
-    arith,
     *,
     c_mn: ir.Value,
     c_k: ir.Value,
@@ -132,11 +122,11 @@ def make_preshuffle_scale_layout(
     stride_k0 = c4 * stride_klane
     stride_n0 = c_k1 * stride_k0
 
-    c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
-    c_k1_i32 = arith.index_cast(T.i32, c_k1)
-    stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
-    stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
-    stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
+    c_mn1_i32 = fx.Int32(c_mn1)
+    c_k1_i32 = fx.Int32(c_k1)
+    stride_n0_i32 = fx.Int32(stride_n0)
+    stride_k0_i32 = fx.Int32(stride_k0)
+    stride_klane_i32 = fx.Int32(stride_klane)
 
     layout_scale = fx.make_layout(
         (c_mn1_i32, c_k1_i32, 4, 16),
@@ -160,7 +150,6 @@ class PreshuffleBLayout:
 
 
 def make_preshuffle_b_layout(
-    arith,
     *,
     c_n: ir.Value,
     c_k: ir.Value,
@@ -182,14 +171,10 @@ def make_preshuffle_b_layout(
 
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
-    c_k_bytes = c_k * arith.constant(int(elem_bytes), index=True)
+    c_k_bytes = c_k * fx.Index(elem_bytes)
     n0 = c_n // c16
 
-    c_kpack_elems = (
-        c_kpack
-        if elem_bytes == 1
-        else (c_kpack // arith.constant(int(elem_bytes), index=True))
-    )
+    c_kpack_elems = c_kpack if elem_bytes == 1 else (c_kpack // fx.Index(elem_bytes))
 
     stride_nlane = c_kpack_elems
 
@@ -211,12 +196,12 @@ def make_preshuffle_b_layout(
         stride_n0 = c_k0 * stride_k0
 
     kpack_elems_static = kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
-    n0_i32 = arith.index_cast(T.i32, n0)
-    c_k0_i32 = arith.index_cast(T.i32, c_k0)
-    stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
-    stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
-    stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
-    stride_nlane_i32 = arith.index_cast(T.i32, stride_nlane)
+    n0_i32 = fx.Int32(n0)
+    c_k0_i32 = fx.Int32(c_k0)
+    stride_n0_i32 = fx.Int32(stride_n0)
+    stride_k0_i32 = fx.Int32(stride_k0)
+    stride_klane_i32 = fx.Int32(stride_klane)
+    stride_nlane_i32 = fx.Int32(stride_nlane)
 
     stride_b = (stride_n0_i32, stride_k0_i32, stride_klane_i32, stride_nlane_i32, 1)
     layout_b = fx.make_layout(
@@ -226,7 +211,6 @@ def make_preshuffle_b_layout(
 
 
 def tile_chunk_coord_i32(
-    arith,
     *,
     tx_i32_base: ir.Value,
     i: int,
@@ -237,7 +221,7 @@ def tile_chunk_coord_i32(
     """Map (thread, chunk_id) -> (row_local, col_local_i32) for X/A loads."""
     if chunk_i32 not in (1, 2, 4):
         raise ValueError(f"chunk_i32 must be one of (1,2,4), got {chunk_i32!r}")
-    chunk_off_i32 = arith.constant(i * total_threads * chunk_i32, index=True)
+    chunk_off_i32 = fx.Index(i * total_threads * chunk_i32)
     tile_idx_i32 = tx_i32_base + chunk_off_i32
     coord_local = fx.idx2crd(fx.Int32(tile_idx_i32), layout_tile_div4)
     row_local = fx.get(coord_local, 0)
@@ -401,30 +385,28 @@ def xcd_remap_bx_by(
     if xcd_swizzle <= 0:
         return bx, by
 
-    _c1 = fx.arith.constant(1, index=True)
-    _c_tm = fx.arith.constant(tile_m, index=True)
-    _gx = fx.arith.constant(N // tile_n, index=True)
+    _c1 = fx.Index(1)
+    _c_tm = fx.Index(tile_m)
+    _gx = fx.Index(N // tile_n)
     _gy = (c_m + _c_tm - _c1) // _c_tm
 
     _linear_id = bx * _gx + by
     _num_wgs = _gx * _gy
 
-    _c_xcds = fx.arith.constant(num_xcds, index=True)
+    _c_xcds = fx.Index(num_xcds)
     _q = _num_wgs // _c_xcds
     _r = _num_wgs % _c_xcds
     _xcd = _linear_id % _c_xcds
     _in_xcd = _linear_id // _c_xcds
-    _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
-    _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
+    _clip = (_xcd < _r).select(_xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
-    _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
+    _c_wgm = fx.Index(xcd_swizzle)
     _num_wgid_in_group = _c_wgm * _gx
     _group_id = _wgid // _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
     _remaining_m = _gy - _first_pid_m
-    _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
-    _group_size_m = fx.arith.select(_cmp_m, _remaining_m, _c_wgm)
+    _group_size_m = (_remaining_m < _c_wgm).select(_remaining_m, _c_wgm)
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
