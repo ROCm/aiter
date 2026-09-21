@@ -33,6 +33,7 @@ class OpKind(enum.Enum):
     MXFP4_MOE = "mxfp4_moe"
     GEMM = "gemm"
     CONV = "conv"
+    MXSCALE_PRESHUFFLE = "mxscale_preshuffle"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
     MEGA_MOE = "mega_moe"
@@ -151,6 +152,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CONV:
         from .conv import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.MXSCALE_PRESHUFFLE:
+        from .mxscale_preshuffle import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GROUPED_MOE:
         from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
@@ -175,6 +178,8 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .gemm import compile_one_config
     elif kind is OpKind.CONV:
         from .conv import compile_one_config
+    elif kind is OpKind.MXSCALE_PRESHUFFLE:
+        from .mxscale_preshuffle import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
         from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:

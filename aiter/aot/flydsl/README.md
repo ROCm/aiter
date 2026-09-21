@@ -10,6 +10,7 @@ the JIT path hits the cache instead of compiling again.
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
+| `mxscale_preshuffle.py` | `MXSCALE_PRESHUFFLE` | gfx950 MX-scale preshuffle GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
@@ -47,6 +48,9 @@ python -m aiter.aot.flydsl.gemm
 
 # conv3d
 python -m aiter.aot.flydsl.conv
+
+# MX-scale preshuffle GEMM (gfx950)
+python -m aiter.aot.flydsl.mxscale_preshuffle
 
 # grouped MoE (gfx1250)
 python -m aiter.aot.flydsl.grouped_moe
