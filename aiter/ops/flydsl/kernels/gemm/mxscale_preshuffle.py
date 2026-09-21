@@ -755,8 +755,7 @@ def _launch_gemm_impl(
             fx.make_layout(1, 1),
         )
         if const_expr(
-            (k_batch > 1 and not splitk_fused)
-            or (small_m_bf16 and not multi_row_tile)
+            (k_batch > 1 and not splitk_fused) or (small_m_bf16 and not multi_row_tile)
         ):
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), store_elem)
         else:
@@ -779,7 +778,9 @@ def _launch_gemm_impl(
                     if lane_mod_16 % fx.Int32(2) == fx.Int32(0):
                         cf = fx.make_rmem_tensor(2, store_elem)
                         cf.store(
-                            Vec.from_elements([acc_f32[0], peer], Float32).to(store_elem)
+                            Vec.from_elements([acc_f32[0], peer], Float32).to(
+                                store_elem
+                            )
                         )
                         fx.copy(c_copy, cf, c_flat[None, col])
         else:
@@ -828,9 +829,7 @@ def _launch_gemm_impl(
                 # M=1 has only BN/2 packed outputs, which fit in wave 0. Avoid
                 # the LDS round trip and extra block barrier on that fast path.
                 arrival = fx.Int32(rocdl.readfirstlane(T.i32, arrival))
-                owns_reduce = (wave == fx.Int32(0)) & (
-                    arrival == fx.Int32(k_batch - 1)
-                )
+                owns_reduce = (wave == fx.Int32(0)) & (arrival == fx.Int32(k_batch - 1))
             if owns_reduce:
                 bf16_ptr_ty = fx.PointerType.get(
                     BFloat16.ir_type,
@@ -864,9 +863,7 @@ def _launch_gemm_impl(
                 if const_expr(multi_row_tile):
                     pairs_per_row = BN // reduce_vec
                     reduce_pairs = i32_m * fx.Int32(pairs_per_row)
-                    for pair_idx in range(
-                        tid, reduce_pairs, fx.Int32(num_threads)
-                    ):
+                    for pair_idx in range(tid, reduce_pairs, fx.Int32(num_threads)):
                         row = pair_idx // fx.Int32(pairs_per_row)
                         pair_in_row = pair_idx % fx.Int32(pairs_per_row)
                         out_off = (
@@ -879,9 +876,7 @@ def _launch_gemm_impl(
                             partial_dw = fx.Int32(
                                 load_i32_nt(
                                     arg_c,
-                                    (
-                                        out_off + fx.Int32(sk) * slab_stride
-                                    )
+                                    (out_off + fx.Int32(sk) * slab_stride)
                                     // fx.Int32(2),
                                 )
                             )
@@ -899,10 +894,7 @@ def _launch_gemm_impl(
                         partial_dw = fx.Int32(
                             load_i32_nt(
                                 arg_c,
-                                (
-                                    out_off + fx.Int32(sk) * slab_stride
-                                )
-                                // fx.Int32(2),
+                                (out_off + fx.Int32(sk) * slab_stride) // fx.Int32(2),
                             )
                         )
                         partial = Vec.from_elements([partial_dw], Int32).bitcast(
