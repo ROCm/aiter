@@ -49,8 +49,15 @@ TEST_DIR="${TEST_DIR%/}"
 # ------------------------------
 # scan test files in TEST_DIR
 # ------------------------------
+# Directories under op_tests/ that are NOT the aiter suite: each has its own
+# CI job. Everything else under op_tests/ is aiter, including the op-family
+# folders, so collection recurses instead of stopping at the top level.
+NOT_AITER=(triton_tests multigpu_tests flydsl_tests tuning_tests tuners opus cpp op_benchmarks configs)
+aiter_prune=()
+for d in "${NOT_AITER[@]}"; do aiter_prune+=(-path "op_tests/${d}" -prune -o); done
+
 if [[ "$TEST_TYPE" == "aiter" ]]; then
-    mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    mapfile -t ALL_FILES < <(find "$TEST_DIR" "${aiter_prune[@]}" -name 'test_*.py' -type f -print | LC_ALL=C sort)
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
