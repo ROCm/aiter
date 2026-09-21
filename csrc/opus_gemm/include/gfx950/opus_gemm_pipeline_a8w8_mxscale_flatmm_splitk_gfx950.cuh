@@ -193,6 +193,39 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
 }
 
 // pack_e8m0x4 (broadcast e8m0 -> x4 word) is shared via opus_gemm_utils.cuh.
+// It stays in use at GROUP_K=32 even though each lane now holds the one byte it
+// needs: the broadcast still leaves that byte in position 0, which is what
+// op_sel 0 reads, so it costs a v_mul and nothing else. Dropping it is an
+// optimisation, not a correctness step.
+
+// Fill one N scale group's slice of v_sfb for this lane.
+//
+// B has no layout object -- it is addressed as a flat [group][K scale] row --
+// so the lane's MX block goes in the offset here rather than in a p coord. The
+// byte index within the row mirrors make_layout_sfa_mxsk: ik * SF_PER_MFMA_K
+// plus the lane's block, which is the row's natural K order.
+//
+// The two arms are the same addresses at GROUP_K=128 and differ only in how
+// many instructions say them. Splitting on SF_PER_MFMA_K keeps that case the
+// single b32 over the tile's contiguous K-scale run it has always been, rather
+// than letting a general per-MFMA form turn it into COM_REP_K byte loads.
+template<typename T, int NG, typename Mem, typename VSFB>
+OPUS_D void load_sfb_lane(Mem& mem, int row_base, int lane_k, VSFB& v_sfb) {
+    constexpr int slot = NG * T::SF_LANE_SCALES_PER_BK;
+    if constexpr (T::SF_PER_MFMA_K == 1) {
+        auto sfb = opus::load<T::SF_LANE_SCALES_PER_BK>(mem, row_base);
+        opus::static_for<T::SF_LANE_SCALES_PER_BK>([&](auto ik_c) {
+            constexpr int ik = decltype(ik_c)::value;
+            v_sfb[slot + ik] = sfb[ik];
+        });
+    } else {
+        opus::static_for<T::SF_LANE_SCALES_PER_BK>([&](auto ik_c) {
+            constexpr int ik = decltype(ik_c)::value;
+            v_sfb[slot + ik] =
+                opus::load<1>(mem, row_base + ik * T::SF_PER_MFMA_K + lane_k)[0];
+        });
+    }
+}
 
 // Per-subtile scaled-MFMA loop -- the shared "else" body used whenever the
 // register tile spans more than one MX scale group. The MMA issue pattern is
@@ -291,7 +324,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             int w = 0;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
-                w |= (static_cast<int>(v_sfa[im * T::SCALES_PER_BK + ik]) & 0xFF) << (8 * ik);
+                w |= (static_cast<int>(v_sfa[im * T::SF_LANE_SCALES_PER_BK + ik]) & 0xFF) << (8 * ik);
             });
             packed_sfa[im] = w;
         });
@@ -300,7 +333,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             int w = 0;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
-                w |= (static_cast<int>(v_sfb[ng * T::SCALES_PER_BK + ik]) & 0xFF) << (8 * ik);
+                w |= (static_cast<int>(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]) & 0xFF) << (8 * ik);
             });
             packed_sfb[ng] = w;
         });
@@ -319,7 +352,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 packed_sfa[im * T::COM_REP_K + ik] =
-                    pack_e8m0x4(v_sfa[im * T::SCALES_PER_BK + ik]);
+                    pack_e8m0x4(v_sfa[im * T::SF_LANE_SCALES_PER_BK + ik]);
             });
         });
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
@@ -327,7 +360,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 packed_sfb[ng * T::COM_REP_K + ik] =
-                    pack_e8m0x4(v_sfb[ng * T::SCALES_PER_BK + ik]);
+                    pack_e8m0x4(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]);
             });
         });
         mma_mxscale_subtile_loop<T, Mma>(v_a, v_b, v_c,
@@ -342,11 +375,11 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
         mma_mxscale_subtile_loop<T, Mma>(v_a, v_b, v_c,
             [&](auto im_c, auto ik_c) {
                 return pack_e8m0x4(
-                    v_sfa[decltype(im_c)::value * T::SCALES_PER_BK + decltype(ik_c)::value]);
+                    v_sfa[decltype(im_c)::value * T::SF_LANE_SCALES_PER_BK + decltype(ik_c)::value]);
             },
             [&](auto in_c, auto ik_c) {
                 return pack_e8m0x4(
-                    v_sfb[(decltype(in_c)::value / rep_n_per_scale) * T::SCALES_PER_BK
+                    v_sfb[(decltype(in_c)::value / rep_n_per_scale) * T::SF_LANE_SCALES_PER_BK
                           + decltype(ik_c)::value]);
             });
     }
@@ -560,8 +593,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         typename decltype(mma)::vtype_c v_c;
         clear(v_c);
 
-        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SCALES_PER_BK>;
+        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
 
         auto issue_a_tile = [&](int loop_k) {
             const int slot = wave_id_m * T::prefetch_k_iter + (loop_k % T::prefetch_k_iter);
@@ -587,14 +620,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
 
         auto load_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
             const int scale_base = loop_k * T::SCALES_PER_BK;
-            v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
+            v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
             opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
-                opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                    constexpr int kg = decltype(kg_c)::value;
-                    v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
-                });
+                load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                                    (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
             });
             s_waitcnt_vmcnt(0_I);
         };
@@ -801,8 +831,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         typename decltype(mma)::vtype_c v_c;
         clear(v_c);
 
-        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SCALES_PER_BK>;
+        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
         constexpr int ds_read_insts = T::a_ds_read_insts + T::b_ds_read_insts;
 
         auto load_scale_regs = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
@@ -813,28 +843,22 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 // Vec = SCALES_PER_BK so the contiguous per-M-row K bytes come in
                 // as one dword (ds_read_b32) instead of SCALES_PER_BK byte reads.
                 auto sm_a = make_smem(s_sfa_ptr + scale_base);
-                v_sfa = load<T::SCALES_PER_BK>(sm_a, u_sfa_lds);
+                v_sfa = load<T::SF_LANE_LOAD_VEC>(sm_a, u_sfa_lds);
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr + ng * sf_k_scales + scale_base);
-                    auto sfb = load<T::SCALES_PER_BK>(sm_b, 0);
-                    opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                        constexpr int kg = decltype(kg_c)::value;
-                        v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
-                    });
+                    load_sfb_lane<T, ng>(sm_b, 0,
+                                        (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
                 });
             } else {
                 // Vec = SCALES_PER_BK: the contiguous per-M-row K-scale bytes are
                 // read as one dword (buffer_load_b32) rather than SCALES_PER_BK
                 // separate buffer_load_ubyte. SFB already loads b32 the same way.
-                v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
+                v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
-                    opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                        constexpr int kg = decltype(kg_c)::value;
-                        v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
-                    });
+                    load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                                        (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
                 });
             }
         };
@@ -1278,8 +1302,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
         typename decltype(mma)::vtype_b v_b0, v_b1;
         typename decltype(mma)::vtype_c v_c;
 
-        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SCALES_PER_BK>;
+        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
         constexpr int ds_read_insts = T::a_ds_read_insts + T::b_ds_read_insts;
 
         auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
@@ -1297,15 +1321,12 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
             auto u_sfa = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, kargs.stride_sfa);
             auto scaled_mma = [&](const auto& va, const auto& vb, int loop_k) {
                 const int scale_base = loop_k * T::SCALES_PER_BK;
-                vtype_sfa v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
+                vtype_sfa v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
                 vtype_sfb v_sfb;
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
-                    opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                        constexpr int kg = decltype(kg_c)::value;
-                        v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
-                    });
+                    load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                                        (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
                 });
                 if constexpr (!SKIP_SCALE_WAIT) {
                     s_waitcnt_vmcnt(0_I);
@@ -1572,8 +1593,8 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
         typename decltype(mma)::vtype_b v_b;
         typename decltype(mma)::vtype_c v_c[MI];
 
-        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SCALES_PER_BK>;
+        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
 
         auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
                                           wave_id_n_cons, lane_id / mma.grpn_c);
@@ -1606,16 +1627,13 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
             vtype_sfb v_sfb;
             opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
-                opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                    constexpr int kg = decltype(kg_c)::value;
-                    v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
-                });
+                load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                                    (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
             });
             opus::static_for<MI>([&](auto mi_c) {
                 constexpr int mi = decltype(mi_c)::value;
                 auto gsfa = g_sfa(mi);
-                vtype_sfa v_sfa = load<T::SCALES_PER_BK>(gsfa, u_sfa, scale_base);
+                vtype_sfa v_sfa = load<T::SF_LANE_LOAD_VEC>(gsfa, u_sfa, scale_base);
                 if constexpr (!SKIP_SCALE_WAIT) s_waitcnt_vmcnt(0_I);
                 __builtin_amdgcn_s_setprio(1);
                 mma_mxscale_flatmm_accum<T>(mma, v_a[mi], v_b, v_sfa, v_sfb, v_c[mi]);
@@ -1771,8 +1789,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
     typename decltype(mma)::vtype_b v_b;
     typename decltype(mma)::vtype_c v_c;
     clear(v_c);
-    using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
-    using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SCALES_PER_BK>;
+    using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
+    using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
 
     __builtin_amdgcn_s_barrier();
     {
@@ -1785,15 +1803,12 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
 
     for (int k = 0; k < loops; ++k) {
         const int scale_base = k * T::SCALES_PER_BK;
-        vtype_sfa v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
+        vtype_sfa v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
         vtype_sfb v_sfb;
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
-            auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
-            opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                constexpr int kg = decltype(kg_c)::value;
-                v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
-            });
+            load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                                (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
         });
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
@@ -1920,8 +1935,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
     typename decltype(mma)::vtype_b v_b;
     typename decltype(mma)::vtype_c v_c;
     clear(v_c);
-    using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
-    using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SCALES_PER_BK>;
+    using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
+    using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
 
     auto issue_tile = [&](int loop_k) {
         const int slot = loop_k & 1;
@@ -1942,14 +1957,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
 
     auto load_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
         const int scale_base = loop_k * T::SCALES_PER_BK;
-        v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
+        v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
-            auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
-            opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                constexpr int kg = decltype(kg_c)::value;
-                v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
-            });
+            load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                                (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
         });
         if constexpr (!SKIP_SCALE_WAIT) {
             s_waitcnt_vmcnt(0_I);
