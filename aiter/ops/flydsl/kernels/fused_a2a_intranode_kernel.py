@@ -25,7 +25,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v27-v4-fp8-qk"
+_JIT_SCHEMA_VERSION = "v28-v4-hadamard-control"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -335,6 +335,7 @@ def make_fused_a2a_kernel(
     quant=False,
     codec="e4m3",
     hadamard=False,
+    v4_hadamard=True,
     v4_output="",
     q_multiplier=1.0,
     v4_amax=False,
@@ -549,7 +550,7 @@ def make_fused_a2a_kernel(
                                 value.to(fx.BFloat16).to(fx.Float32)
                                 for value in rotated
                             ]
-                        if const_expr(hadamard or mode):
+                        if const_expr(hadamard or (mode and v4_hadamard)):
                             rotated = _hadamard_head(rotated, lane, head_dim)
                         if const_expr(mode and codec == "mxfp8"):
                             rotated = rotated.to(fx.BFloat16).to(fx.Float32)
@@ -776,7 +777,7 @@ def make_fused_a2a_kernel(
                     )
                     if const_expr(quant):
                         decoded = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
-                        if const_expr(rotate or mode):
+                        if const_expr(rotate or (mode and v4_hadamard)):
                             decoded = _hadamard_head(decoded, lane, head_dim)
                         if const_expr(mode and codec == "mxfp8"):
                             decoded = decoded.to(fx.BFloat16).to(fx.Float32)
@@ -994,7 +995,9 @@ def make_fused_a2a_kernel(
                             .to(fx.BFloat16)
                             .to(fx.Float32)
                         )
-                    if const_expr(codecs[0] == "e4m3"):
+                    if const_expr(
+                        codecs[0] == "e4m3" and (hadamard or v4_hadamard)
+                    ):
                         # quantize_fp8_rotated materializes BF16 after normalized WHT;
                         # neither per-tensor recipe folds the MX Q multiplier.
                         values = (
@@ -1438,6 +1441,7 @@ def make_fused_a2a_jit(
     quant=False,
     codec="e4m3",
     hadamard=False,
+    v4_hadamard=True,
     v4_output="",
     q_multiplier=1.0,
     v4_amax=False,
@@ -1457,6 +1461,7 @@ def make_fused_a2a_jit(
         quant=quant,
         codec=codec,
         hadamard=hadamard,
+        v4_hadamard=v4_hadamard,
         v4_output=v4_output,
         q_multiplier=q_multiplier,
         v4_amax=v4_amax,
@@ -1475,6 +1480,7 @@ def make_fused_a2a_jit(
         quant,
         codec,
         hadamard,
+        v4_hadamard,
         v4_output,
         q_multiplier,
         v4_amax,

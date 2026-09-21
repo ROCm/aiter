@@ -52,6 +52,8 @@ class FusedA2AIntraNodeOp:
     FUSED_A2A_HADAMARD=1 applies normalized Walsh-Hadamard to Q/K before
     quantization (after norm/RoPE when fused). V is unchanged. Default is off;
     ignored without quantization. Consumers use rotated Q/K without an inverse.
+    V4 packed Q/K preserve their historical implicit Hadamard by default; set
+    FUSED_A2A_V4_HADAMARD=0 to disable that transform for performance studies.
     Raw mxfp4 payloads contain two E2M1 values per byte, low nibble first.
     Raw mxfp6 payloads contain contiguous E2M3 six-bit codes, least-significant
     bits first (four values per three bytes), with no padding.
@@ -92,6 +94,10 @@ class FusedA2AIntraNodeOp:
     ):
         self.quant = quant or os.environ.get("FUSED_A2A_QUANT", "0") == "1"
         self.hadamard = self.quant and os.environ.get("FUSED_A2A_HADAMARD", "0") == "1"
+        self.v4_hadamard = (
+            self.quant
+            and os.environ.get("FUSED_A2A_V4_HADAMARD", "1") == "1"
+        )
         self.codec = os.environ.get("FUSED_A2A_CODEC", "e4m3")
         self.codecs = tuple(
             os.environ.get(f"FUSED_A2A_CODEC_{role}", self.codec) for role in "QKV"
@@ -345,6 +351,7 @@ class FusedA2AIntraNodeOp:
                 quant=self.quant,
                 codec=self.codecs[i] if self.split else self.codecs,
                 hadamard=self.hadamard and (not self.split or i < 2),
+                v4_hadamard=self.v4_hadamard,
                 v4_output=self.v4_output[i] if self.split else self.v4_output,
                 q_multiplier=q_multiplier,
                 element_size=element_size,
@@ -366,6 +373,7 @@ class FusedA2AIntraNodeOp:
                     split=True,
                     quant=True,
                     codec=self.codecs[i],
+                    v4_hadamard=self.v4_hadamard,
                     v4_output=self.v4_output[i],
                     v4_amax=True,
                     element_size=element_size,
