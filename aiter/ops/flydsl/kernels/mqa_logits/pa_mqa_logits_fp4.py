@@ -700,11 +700,12 @@ def flydsl_pa_mqa_logits_fp4(
 ) -> torch.Tensor:
     """Decode/varctx FP4 paged MQA logits (gfx950).
 
-    Head waves share double-buffered LDS KV tiles and reduce within the CTA.
-    This is the same decode algorithm for every ``next_n``. Without an external
-    schedule, work intervals are derived from ``context_lens`` on the device.
-    ``parallel_unit_num`` optionally limits the direct grid; external schedules
-    retain their original ``[row, chunk_start, chunk_count, context_len]`` ABI.
+    Head waves cooperate on the head reduction within each CTA. The default
+    D128 path reads KV directly into registers; other layouts retain the staged
+    LDS pipeline. Without an external schedule, work intervals are derived from
+    ``context_lens`` on the device. ``parallel_unit_num`` optionally limits the
+    direct grid; external schedules retain their original
+    ``[row, chunk_start, chunk_count, context_len]`` ABI.
     """
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
@@ -748,8 +749,12 @@ def flydsl_pa_mqa_logits_fp4(
         direct_chunks = (max_seq_len + block_k - 1) // block_k
         if parallel_unit_num is not None:
             if parallel_unit_num < batch_size * next_n or parallel_unit_num % next_n:
-                raise ValueError("parallel_unit_num must cover all rows and be divisible by next_n.")
-            direct_chunks = min(direct_chunks, parallel_unit_num // (batch_size * next_n))
+                raise ValueError(
+                    "parallel_unit_num must cover all rows and be divisible by next_n."
+                )
+            direct_chunks = min(
+                direct_chunks, parallel_unit_num // (batch_size * next_n)
+            )
         cta_info = context_lens.to(dtype=torch.int32)
         total_ctas = batch_size * next_n * direct_chunks
 
@@ -768,7 +773,7 @@ def flydsl_pa_mqa_logits_fp4(
     head_waves = min(num_warps, 4, triton.next_power_of_2(triton.cdiv(heads, 32)))
     while head_waves > 1 and (head_waves not in (1, 2, 4) or num_warps % head_waves):
         head_waves //= 2
-    direct_kv = (
+    direct_global = (
         schedule_internal
         and block_k in (32, 64)
         and head_dim == 128
@@ -776,13 +781,12 @@ def flydsl_pa_mqa_logits_fp4(
         and num_warps == head_waves
         and direct_chunks * block_k >= max_seq_len
     )
-    if direct_kv and block_k == 32:
+    if direct_global and block_k == 32:
         scalar_weights = heads == 64 and total_ctas >= 128
-    elif direct_kv:
+    elif direct_global:
         scalar_weights = heads == 128 or total_ctas >= 128
     else:
         scalar_weights = total_ctas >= 768
-    direct_keep_local = direct_kv and block_k == 64 and heads == 64 and scalar_weights
     launcher, _ = compile_pa_mqa_logits_fp4_decode(
         block_k=block_k,
         kv_block_size=kv_block_size,
@@ -792,11 +796,7 @@ def flydsl_pa_mqa_logits_fp4(
         num_warps=num_warps,
         head_waves=head_waves,
         scalar_weights=scalar_weights,
-        direct_kv=direct_kv,
-        direct_token_split=direct_kv and block_k == 32,
-        direct_grid_2d=direct_kv,
-        direct_page_fast=direct_kv,
-        direct_keep_local=direct_keep_local,
+        direct_global=direct_global,
         next_n=next_n,
         heads=heads,
         head_dim=head_dim,
