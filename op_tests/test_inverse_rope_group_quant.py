@@ -706,16 +706,24 @@ def check_invalid_group(s, h, g, head_dim, rd, group_size, dtype, seed=0):
     """A non-finite input invalidates its own quant group and no other.
 
     The kernel folds every non-finite magnitude onto +Inf before the group
-    reduction, so the block scale lands on the 0xFF E8M0 NaN and the converter
-    turns that whole group into FP8 NaNs. slice_amax_native in
-    csrc/kernels/inverse_rope_group_quant.cu has the reasoning.
+    reduction, so the block scale lands on the 0xFF E8M0 NaN. On the hardware
+    scaled convert that also turns the whole group into FP8 NaNs.
+    slice_amax_native in csrc/kernels/inverse_rope_group_quant.cu has the
+    reasoning.
 
-    Inf reaches that on both quantize paths, so it is asserted outright. NaN
-    only does on the native one: the general f32 path reduces with fmaxf, which
-    drops a NaN operand, and folding it there costs far more than the case is
-    worth (the kernel comment carries the measurement). Rather than restate the
-    host's path choice here, NaN is held to whichever of the two documented
-    outcomes applies -- which still fails on any third one.
+    Inf reaches the 0xFF scale on both quantize paths, so that byte is
+    asserted outright. The payload NaNs only come from the hardware scaled
+    convert (kHwScaledFp8 / kNativeQuant: gfx950, gfx1250). gfx942 has
+    neither instruction, so it does ``inv_scale = 1/Inf = +0`` and
+    ``v_med3_f32`` drops NaN -- the group stores zeros, and the invalid
+    marker is the scale alone.
+
+    NaN only folds onto Inf on the native amax; the general f32 path reduces
+    with fmaxf, which drops a NaN operand, and folding it there costs far
+    more than the case is worth (the kernel comment carries the measurement).
+    Rather than restate the host's path choice here, NaN is held to whichever
+    of the two documented outcomes applies -- which still fails on any third
+    one.
     """
     # e4m3fnuz (gfx942) spells NaN 0x80; OCP e4m3fn uses 0xFF.
     nan_byte = 0x80 if torch.finfo(dtypes.fp8).max == 240 else 0xFF
@@ -746,7 +754,12 @@ def check_invalid_group(s, h, g, head_dim, rd, group_size, dtype, seed=0):
         nbr_scale = int(bytes_[0, 0, 1])
         nbr_nans = int((q[0, 0, group_size : 2 * group_size] == nan_byte).sum())
 
-        invalidated = hit_scale == 0xFF and hit_nans == group_size
+        # Mirrors kHwScaledFp8 / kNativeQuant in the kernel: only those
+        # instructions turn an Inf dq_scale into a group of FP8 NaNs.
+        hw_scaled_fp8 = get_gfx() in ("gfx950", "gfx1250")
+        invalidated = hit_scale == 0xFF and (
+            hit_nans == group_size if hw_scaled_fp8 else True
+        )
         assert nbr_scale != 0xFF and nbr_nans == 0, (
             f"{name} at s={s} h={h} g={g} gs={group_size} leaked into the next "
             f"group: scale=0x{nbr_scale:02X} nan_elems={nbr_nans}"
@@ -758,9 +771,11 @@ def check_invalid_group(s, h, g, head_dim, rd, group_size, dtype, seed=0):
                 f"{group_size}"
             )
         else:
-            # The general f32 path scales against the surviving lanes, leaving
-            # only the poisoned element itself as a NaN.
-            survived = hit_scale != 0xFF and hit_nans == 1
+            # The general f32 path scales against the surviving lanes. The
+            # poisoned element itself is a NaN only if the convert preserves
+            # it; gfx942's v_med3_f32 clamp drops that NaN, so the count can
+            # be zero.
+            survived = hit_scale != 0xFF and hit_nans <= 1
             assert invalidated or survived, (
                 f"nan at s={s} h={h} g={g} gs={group_size} matched neither "
                 f"documented outcome: scale=0x{hit_scale:02X} nan_elems="
