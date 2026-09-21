@@ -4,9 +4,18 @@
 import pytest
 import torch
 
-from aiter.ops.triton.fusions import silu_and_mul_backward
+from aiter.ops.triton.activation import silu_and_mul_backward
+from aiter.ops.triton.utils import config_utils
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(
+        torch.cuda.is_available() and get_arch() not in _SUPPORTED_ARCHS,
+        reason="silu_and_mul_backward supports gfx942 and gfx950",
+    ),
+]
 
 
 def _torch_reference(grad_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -20,6 +29,7 @@ def _torch_reference(grad_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor
 @pytest.mark.parametrize(
     "shape",
     [
+        pytest.param((3, 2), id="width_1"),
         (4, 64),
         (31, 500),
         (2, 16, 128),
@@ -65,6 +75,30 @@ def test_silu_and_mul_backward_empty_rows():
     out = silu_and_mul_backward(grad_output, x)
     assert out.shape == x.shape
     assert out.numel() == 0
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_silu_and_mul_backward_non_current_device():
+    current_device = torch.cuda.current_device()
+    input_device = (current_device + 1) % torch.cuda.device_count()
+    x = torch.randn((3, 128), dtype=torch.bfloat16, device=input_device)
+    grad_output = torch.randn((3, 64), dtype=x.dtype, device=x.device)
+
+    out = silu_and_mul_backward(grad_output, x)
+    torch.testing.assert_close(
+        out, _torch_reference(grad_output, x), rtol=1e-2, atol=1e-2
+    )
+    assert out.device == x.device
+    assert torch.cuda.current_device() == current_device
+
+
+def test_silu_and_mul_backward_unsupported_arch(monkeypatch):
+    x = torch.randn((2, 64), dtype=torch.bfloat16, device="cuda")
+    grad_output = torch.randn((2, 32), dtype=x.dtype, device=x.device)
+    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: "gfx1201")
+
+    with pytest.raises(FileNotFoundError, match="gfx1201.*silu_and_mul_backward"):
+        silu_and_mul_backward(grad_output, x)
 
 
 def test_silu_and_mul_backward_validation():

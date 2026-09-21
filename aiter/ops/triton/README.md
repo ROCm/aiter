@@ -127,8 +127,8 @@ escaped or wrong directory. `backend` is declared by the caller (gluon kernels
 and gluon dispatch paths pass `"gluon"`; everything else takes the `"triton"`
 default), because the two backends take disjoint config params and borrowing
 across them would be a bug. `arch=` overrides the running architecture only
-where a loader deliberately retries elsewhere — today just MHC's documented
-gfx942 fallback.
+for documented compatibility fallbacks: MHC retries gfx942, and the Triton
+`fused_clamp_act_mul` path retries its legacy gfx950 table.
 
 `config_utils.py` is the shared core; each family keeps its own small loader
 module on top of it, and every function has exactly one home:

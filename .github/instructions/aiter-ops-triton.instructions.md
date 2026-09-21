@@ -213,9 +213,10 @@ values for either backend live in JSON, never in Python. Flag:
   `load_config_json` on a `moe/` file, and any reintroduced per-wrapper MOE
   loader.
 - A new arch- or backend-fallback chain inside a loader (try this arch, then
-  that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
-  fallback is the one documented exception and it goes through the `arch=`
-  override, not through a probe.
+  that one; try triton, then gluon). Resolution is deterministic. The
+  documented compatibility exceptions are MHC's gfx942 fallback and Triton
+  `fused_clamp_act_mul`'s legacy gfx950 fallback; both use the `arch=` override
+  instead of a probe.
 - A raw config list handed to `@triton.autotune`. Route it through
   `autotune_configs` from `aiter.ops.triton.utils.tuned_config_utils`:
 
