@@ -748,6 +748,26 @@ jobs:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
 
+      - name: Ensure zstd for Triton wheel cache
+        if: ${{ runner.os == 'Linux' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if command -v zstd >/dev/null 2>&1 && command -v unzstd >/dev/null 2>&1; then
+            zstd --version
+            exit 0
+          fi
+          if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y zstd
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y zstd
+          else
+            echo "::warning::apt-get is unavailable; Triton wheel cache restore may miss if this runner lacks zstd"
+          fi
+          command -v zstd >/dev/null 2>&1 && zstd --version || true
+
       - name: Restore Triton wheel cache
         id: restore_triton_wheel
         continue-on-error: true
@@ -1063,6 +1083,26 @@ jobs:
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
+
+      - name: Ensure zstd for Triton wheel cache
+        if: ${{ runner.os == 'Linux' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if command -v zstd >/dev/null 2>&1 && command -v unzstd >/dev/null 2>&1; then
+            zstd --version
+            exit 0
+          fi
+          if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y zstd
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y zstd
+          else
+            echo "::warning::apt-get is unavailable; Triton wheel cache restore may miss if this runner lacks zstd"
+          fi
+          command -v zstd >/dev/null 2>&1 && zstd --version || true
 
       - name: Restore Triton wheel cache
         id: restore_triton_wheel
