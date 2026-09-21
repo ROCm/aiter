@@ -683,6 +683,11 @@ overlap. 18 pytest cases, ``err=0``; width-2051 ``L=512`` was 19.8 /
 22.5 / 513.5 us vs 18.5 / 21.1 / 516.2. Decode lost ~7%; extra gather
 barriers are not hidden by PV. Keep single-buffered K/V.
 
+**Do not retry** 128-thread ``BLOCK_N=16`` / 32-split decode (two waves,
+four K32/wave). 18 pytest cases, ``err=0``; width-2051 ``L=512`` was
+19.8 / 22.6 / 516.4 us vs 18.5 / 21.1 / 516.2. Decode lost ~7%; prefill
+unchanged. Keep four-wave 256-thread decode.
+
 
 
 
