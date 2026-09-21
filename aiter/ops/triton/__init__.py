@@ -177,7 +177,7 @@ def __getattr__(name):
 
             if not is_cdna4():
                 raise NotImplementedError(
-                    f"aiter.ops.triton.{name} requires gfx950 (CDNA4) or newer"
+                    f"aiter.ops.triton.{name} requires gfx950 (CDNA4)"
                 )
         new_path = f"aiter.ops.triton.{_BACKWARD_COMPAT_MAP[name]}"
         _warn_if_deprecated(name, new_path)
