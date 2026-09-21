@@ -178,6 +178,12 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
     compute_chunk = next_n >= COMPUTE_CHUNK
     spec_rows = num_heads <= 32 and 2 <= next_n <= SPEC_ROWS
     wide_decode = num_heads > 32 and next_n == 1
+    block_kv = kv_tile(page_size)
+    # A page wider than the tile leaves a live in-page offset between the
+    # block-table read and the KV address; a page equal to it folds that away.
+    # Two rules below carry a term for it, and both are gated so the common
+    # page_size == BLOCK_KV path is untouched.
+    split_page = page_size > block_kv
 
     if preshuffle:
         # Register path. One warp: with no KV tile in LDS a second warp has no
@@ -187,7 +193,11 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
             num_warps=1,
             num_buffers=1,
             waves_per_eu=3 if (compute_chunk or wide_decode) else 2,
-            depth=2 if wide_decode else 1,
+            # A second KV tile in flight. Worth its registers where there
+            # are registers to spare, and on a split page it also covers the
+            # longer address chain -- 1.11x on decode there, a spill and 1.3x
+            # the other way on a wide chunk, so decode only.
+            depth=2 if (wide_decode or (next_n == 1 and split_page)) else 1,
             unroll=2 if ((compute_chunk or spec_rows) and block_m <= 6) else 1,
             fold_asm=1 if (compute_chunk or spec_rows or num_heads > 32) else 0)
     else:
@@ -212,13 +222,16 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
     cfg.update(
         block_m=block_m,
         row_blocks=(next_n + block_m - 1) // block_m,
-        block_kv=kv_tile(page_size),
+        block_kv=block_kv,
         n_per_tile=n_per_tile,
         # Workgroups to fill the machine: 4 SIMDs per CU
         target_wgs=4 * get_num_sms() * cfg["waves_per_eu"],
-        # Hoists the block-table read an iteration ahead. Off at 64 heads,
-        # where the extra live value costs more than it buys.
-        page_pipe=1 if num_heads <= 32 else 0,
+        # Hoists the block-table read a tile past the KV prefetch. Off at 64
+        # heads, where the extra live value costs more than it buys -- unless
+        # the page is split, where it pays on decode and prefill but not on
+        # speculative decode, which has rows of fold to hide the read behind.
+        page_pipe=1 if (num_heads <= 32
+                        or (split_page and not 2 <= next_n <= SPEC_ROWS)) else 0,
         m_chunk=n_per_tile if (num_heads > n_per_tile and n_per_tile == 32) else 0,
         num_chains=1,
         relaxed_store=0 if clean_logits else 1,
