@@ -107,7 +107,7 @@ run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
   local n=0 max="${AITER_REVIEW_RETRIES:-3}"
   while :; do
     n=$((n + 1)); rm -f "$out"
-    if (cd "$PROJ" && "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
+    if (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-1200}" "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
     if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error/timeout?)"; return 1; fi
     say "$label attempt $n failed (GLM slow/timeout?); retrying in $((n * 10))s"; sleep $((n * 10))
   done
@@ -126,6 +126,11 @@ else
   bash "$SKILL/render.sh" refuter "$W" "$W/card.md" > "$W/_prf.txt"
   run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || fail glm 3 "the GLM refuter failed after retries -- the backend is timing out or down"
 fi
+
+# 3b) apply the refuter's verdicts: drop KILLED findings from the card before the gates, or the
+# independent gate red-fails every review whose refuter did its job (kills a finding). No-op on a
+# 0-finding card (NONE AVAILABLE) or a count mismatch.
+python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
 
 # 4) gates + collect (call the python directly; no thin shell wrappers)
 say "gates..."

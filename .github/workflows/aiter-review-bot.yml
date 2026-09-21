@@ -37,8 +37,11 @@ jobs:
     # check runs in the gate step below).
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@aiter-bot review')
+      contains(github.event.comment.body, '@aiter-bot review') &&
+      (vars.AITER_REVIEW_AUTHORIZED == '' ||
+       contains(vars.AITER_REVIEW_AUTHORIZED, github.event.comment.user.login))
     runs-on: [self-hosted, box308]        # label the runner with these at registration
+    timeout-minutes: 90     # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
     env:
       PR: ${{ github.event.issue.number }}          # issue number == PR number here
       COMMENTER: ${{ github.event.comment.user.login }}

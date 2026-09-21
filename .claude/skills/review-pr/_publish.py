@@ -1,7 +1,8 @@
 """Publish gate (phase-2): post a collected report to the PR, as aiter-bot, under the rules.
 
 Rules (after run_one, given 7 green gates):
-  - Review line is 🔴 HIGH RISK  → HOLD: do not auto-post, print it for a human (escalate the dangerous ones)
+  - Review line is 🔴 HIGH RISK  → POST too: the reviewer who triggered it must see the high-risk
+    findings (still advisory, not a merge gate); a warning annotation also flags it in the checks UI
   - otherwise (✅ / ⚠️ / notes only) → POST: post card.md as a PR comment
   - already posted (same head SHA, by marker) → SKIP: do not repost
   - PR already merged/closed         → SKIP: a post-merge follow-up should not go as a PR review
@@ -119,9 +120,10 @@ def decide(pr):
     sha = head_sha(pr)
     if sha and already_posted(pr, sha):
         return "SKIP", f"same head {sha[:9]} already posted (marker hit)"
-    if severity(card.read_text(encoding="utf-8")) == "high":
-        return "HOLD", "🔴 HIGH RISK — not auto-posted, held for a human"
-    return "POST", "non-🔴, postable"
+    # Post the card for EVERY verdict, including 🔴: the reviewer who asked for the review must
+    # see it, and 🔴 is exactly what they most need to see. It stays advisory (the Review line
+    # says so) and never gates merge; main() adds a warning annotation for the 🔴 ones.
+    return "POST", "postable"
 
 
 def do_post(pr):
@@ -147,30 +149,20 @@ def main(argv):
     print(
         f'=== publish gate  [{"POST" if a.post else "DRY-RUN"}]  identity={BOT}  repo={REPO} ==='
     )
-    held, posted = [], []
+    posted, failed = [], []
     for pr in a.prs:
         action, reason = decide(pr)
         if action == "POST" and a.post:
             ok, info = do_post(pr)
             print(f'  #{pr}: POST -> {"✅ "+info if ok else "❌ "+info}')
-            (posted if ok else held).append(pr)
+            (posted if ok else failed).append(pr)
+            if ok and severity((REPORTS / f"PR-{pr}" / "card.md").read_text(encoding="utf-8")) == "high":
+                # extra signal in the checks UI; the card itself is already posted as a comment
+                print(f"::warning title=aiter-bot HIGH RISK::PR #{pr} — review flags HIGH RISK (advisory, not a merge gate)")
         else:
             print(f"  #{pr}: {action} — {reason}")
-            if action == "HOLD":
-                held.append(pr)
-                # Surface a held HIGH RISK review: a GitHub Actions warning annotation shows on
-                # the PR's checks, and the full card goes to the job log for the maintainer.
-                if a.post:
-                    card = (REPORTS / f"PR-{pr}" / "card.md").read_text(
-                        encoding="utf-8"
-                    )
-                    print(
-                        f"::warning title=aiter-bot HIGH RISK::PR #{pr} review found HIGH RISK "
-                        f"— held for a maintainer; full card in this job log"
-                    )
-                    print(card)
-    if held:
-        print(f"  ⚠ held for a human: {held}")
+    if failed:
+        print(f"  ❌ failed to post: {failed}")
     return 0
 
 
