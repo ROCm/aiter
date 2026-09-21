@@ -2,13 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import logging
 from contextlib import contextmanager
 
 import torch
 from packaging.version import Version
-
-logger = logging.getLogger("aiter")
 
 # Before 2.10 the allocator scans captures_underway in registration order, so
 # the graph pool wins and use_mem_pool is ignored inside a capture. Parsed, not
@@ -24,17 +21,6 @@ def _persistent_pool(index: int) -> "torch.cuda.MemPool":
         return torch.cuda.MemPool()
 
 
-@functools.cache
-def _warn_capture_routing_unavailable(index: int) -> None:
-    logger.warning(
-        "torch %s cannot route an allocation out of a CUDA graph capture, so a "
-        "scratch buffer first allocated during capture on device %d may be "
-        "overwritten on replay. Upgrade to torch 2.10 or later.",
-        torch.__version__,
-        index,
-    )
-
-
 @contextmanager
 def persistent_alloc(device: torch.device):
     """Allocate buffers that outlive a CUDA graph capture.
@@ -47,6 +33,14 @@ def persistent_alloc(device: torch.device):
     """
     index = torch.cuda.current_device() if device.index is None else device.index
     if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
-        _warn_capture_routing_unavailable(index)
+        raise RuntimeError(
+            f"aiter: a cached scratch buffer was first allocated on device {index} "
+            f"while a CUDA graph was capturing, and torch {torch.__version__} "
+            "ignores use_mem_pool inside a capture, so the buffer would come from "
+            "the graph's private pool and could inherit the address of an "
+            "intermediate that every replay overwrites. Upgrade to torch 2.10 or "
+            "later, or run this op once on the stream you capture on so the "
+            "buffer is already cached."
+        )
     with torch.cuda.use_mem_pool(_persistent_pool(index), device=index):
         yield
