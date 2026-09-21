@@ -12,9 +12,20 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 
-// The single compiled config: 4 query rows per CTA (4 waves of 32), KV tile 64 = 1 page,
-// D = 128, H = 64, page 64.
-using mqa_logits_fp4_gfx1250_traits = logits_fp4_qshare_traits_4q;
+// THE COMPILED CONFIGS. Both take the same five input layouts and the same `block_tables`
+// width, since both carry KV tile 64 = 1 page.
+//
+//   qlen4    4 query rows per CTA (4 waves of 32), each wave one row sharing the CTA's KV tile.
+//   qlen1    ONE row per CTA, which at Q_PER_BLOCK == NUM_WAVES is a single wave32.
+//
+// `fwd_sched`'s dispatch below is the only statement of which pairs exist; a caller names one by
+// `(q_per_block, block_k)`. There is no table here -- the builders take those two as runtime
+// values, and `cta_resident` is the caller's (see `build_sched`).
+using mqa_logits_traits_qlen4_kv64 = opus_mqa_logits_fp4_qshare_traits<4, 2, 64>;
+using mqa_logits_traits_qlen1_kv64 = opus_mqa_logits_fp4_qshare_traits<1, 2, 64>;
+// The default, and the name the rest of this file uses: the shape checks and kargs fields below
+// are identical across the two.
+using mqa_logits_fp4_gfx1250_traits = mqa_logits_traits_qlen4_kv64;
 
 // Every input is strided by a COMPILE-TIME constant in the kernel and no runtime stride is ever
 // read, so a padded or permuted input is silently wrong rather than rejected -- hence the
@@ -230,14 +241,34 @@ void pa_mqa_logits_mxfp4_gfx1250_fwd_sched(aiter_tensor_t& q,
                                            int num_ctas,
                                            float weight_scale,
                                            int kv_block_size,
-                                           int max_seq_len)
+                                           int max_seq_len,
+                                           int q_per_block,
+                                           int block_k)
 {
     // pybind path: make the shape checks throw a Python RuntimeError instead of abort()ing the
     // interpreter. Same convention as opus_gemm.cu / gradlib.
     aiter_detail::g_aiter_can_throw = true;
-    pa_mqa_logits_mxfp4_gfx1250_launch_sched<mqa_logits_fp4_gfx1250_traits>(
-        q, q_scale, kv_cache, kv_scale, block_tables, weights, local_starts, local_ends,
-        cta_info, out, num_rows, num_ctas, weight_scale, kv_block_size, max_seq_len);
+    // THE ONLY PLACE AN INSTANTIATION IS CHOSEN: the two numbers name a TYPE, which a runtime
+    // value cannot be. Each arm is a full kernel in the module.
+    //
+    // **The last arm RAISES and must not be an `else`.** An unmatched pair falling to a default
+    // is cut at one `q_per_block` and computed at another, so the surplus waves mask themselves
+    // off at the store and the answer comes back CORRECT and slow.
+    if(q_per_block == 4 && block_k == 64)
+        pa_mqa_logits_mxfp4_gfx1250_launch_sched<mqa_logits_traits_qlen4_kv64>(
+            q, q_scale, kv_cache, kv_scale, block_tables, weights, local_starts, local_ends,
+            cta_info, out, num_rows, num_ctas, weight_scale, kv_block_size, max_seq_len);
+    else if(q_per_block == 1 && block_k == 64)
+        pa_mqa_logits_mxfp4_gfx1250_launch_sched<mqa_logits_traits_qlen1_kv64>(
+            q, q_scale, kv_cache, kv_scale, block_tables, weights, local_starts, local_ends,
+            cta_info, out, num_rows, num_ctas, weight_scale, kv_block_size, max_seq_len);
+    else
+        AITER_CHECK(false,
+                    "no kernel instance compiled for q_per_block=",
+                    q_per_block,
+                    " block_k=",
+                    block_k,
+                    "; this module has (4, 64) and (1, 64)");
 }
 
 // Both builders take and return caller-allocated device buffers: no hipMalloc, no host<->device
@@ -246,10 +277,14 @@ void pa_mqa_logits_mxfp4_gfx1250_fwd_sched(aiter_tensor_t& q,
 void pa_mqa_logits_mxfp4_gfx1250_build_tiles(aiter_tensor_t& cu_seq_q,
                                              aiter_tensor_t& cu_tiles,
                                              int total_q,
-                                             int max_tiles)
+                                             int max_tiles,
+                                             int q_per_block)
 {
     aiter_detail::g_aiter_can_throw = true;
-    constexpr int QPB               = mqa_logits_fp4_gfx1250_traits::Q_PER_BLOCK;
+    // The cut's granularity, a runtime value all the way into the kernel. It must be the SAME
+    // number the launch is given, or the rows are cut at one width and computed at another.
+    const int QPB                   = q_per_block;
+    AITER_CHECK(QPB >= 1, "q_per_block must be >= 1, got ", QPB);
     const int B                     = static_cast<int>(cu_seq_q.size(0)) - 1;
     AITER_CHECK(cu_seq_q.dtype() == AITER_DTYPE_i32 && cu_tiles.dtype() == AITER_DTYPE_i32,
                 "cu_seq_q / cu_tiles must be int32");
@@ -308,9 +343,17 @@ void pa_mqa_logits_mxfp4_gfx1250_build_sched(aiter_tensor_t& cu_tiles,
                                              aiter_tensor_t& cta_info,
                                              int num_tiles,
                                              int num_ctas,
-                                             int cta_resident)
+                                             int cta_resident,
+                                             int block_k)
 {
     aiter_detail::g_aiter_can_throw = true;
+    // `cta_resident` is the CTAs the part holds at once. It follows the kernel's OCCUPANCY,
+    // which nothing here can read back, so it is the caller's number; a wrong one leaves most of
+    // the part idle and nothing reports it. `<= 0` turns the split's aim off entirely.
+    //
+    // `block_k` is the KV tile in tokens and must be the launch's: it decides the chunk unit the
+    // records carry.
+    AITER_CHECK(block_k >= 1, "block_k must be >= 1, got ", block_k);
     namespace ol                    = opus_logits;
     AITER_CHECK(cu_tiles.dtype() == AITER_DTYPE_i32 && cu_tiles.is_contiguous(),
                 "cu_tiles must be contiguous int32");
@@ -370,7 +413,6 @@ void pa_mqa_logits_mxfp4_gfx1250_build_sched(aiter_tensor_t& cu_tiles,
     const int* p_cut         = reinterpret_cast<const int*>(cu_tiles.data_ptr());
     const int* p_le          = reinterpret_cast<const int*>(local_ends.data_ptr());
     auto* p_cta              = reinterpret_cast<opus_mqa_cta_record*>(cta_info.data_ptr());
-    const int block_k        = mqa_logits_fp4_gfx1250_traits::KV_TILE_SIZE;
 
     const auto plan = ol::sched_plan(num_tiles, num_ctas);
     if(plan.blocks == 1)

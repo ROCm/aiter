@@ -45,10 +45,22 @@
 // `local_starts` and `row_to_batch` may each be EMPTY: starts then read as 0, and `batch_id` is
 // the tile's FIRST ROW rather than a sequence. Handing a per-SEQUENCE map to a launch with a
 // per-token block table, or the reverse, reads the wrong pages and looks plausible.
+//
+// WHICH KERNEL INSTANCE a call runs is named by `(q_per_block, block_k)`, which all three ops
+// take: the builders use them as runtime values, and `fwd_sched`'s dispatch -- the only place a
+// TYPE is chosen -- is the module's only statement of which pairs exist. An unmatched pair
+// RAISES there and must not fall to a default, or the rows are cut at one width and computed at
+// another, which comes back correct and slow rather than wrong.
+//
+// `cta_resident` is NOT one of these. It follows the kernel's occupancy, nothing here can check
+// it, and the only things that consume it -- the grid and the split's aim -- are the caller's.
+// It arrives as an argument to `build_sched`; a wrong one leaves most of the part idle.
+
 void pa_mqa_logits_mxfp4_gfx1250_build_tiles(aiter_tensor_t& cu_seq_q,
                                              aiter_tensor_t& cu_tiles,
                                              int total_q,
-                                             int max_tiles);
+                                             int max_tiles,
+                                             int q_per_block);
 
 void pa_mqa_logits_mxfp4_gfx1250_build_sched(aiter_tensor_t& cu_tiles,
                                              aiter_tensor_t& local_starts,
@@ -57,7 +69,8 @@ void pa_mqa_logits_mxfp4_gfx1250_build_sched(aiter_tensor_t& cu_tiles,
                                              aiter_tensor_t& cta_info,
                                              int num_tiles,
                                              int num_ctas,
-                                             int cta_resident);
+                                             int cta_resident,
+                                             int block_k);
 
 void pa_mqa_logits_mxfp4_gfx1250_fwd_sched(aiter_tensor_t& q,
                                            aiter_tensor_t& q_scale,
@@ -73,7 +86,9 @@ void pa_mqa_logits_mxfp4_gfx1250_fwd_sched(aiter_tensor_t& q,
                                            int num_ctas,
                                            float weight_scale,
                                            int kv_block_size,
-                                           int max_seq_len);
+                                           int max_seq_len,
+                                           int q_per_block,
+                                           int block_k);
 
 #ifdef PA_MQA_LOGITS_MXFP4_GFX1250_IMPL
 
@@ -187,16 +202,15 @@ namespace opus_logits {
 constexpr int SCHED_BUILD_BLOCK      = 256;
 constexpr int SCHED_BUILD_BLOCK_WIDE = 1024;
 
-// CTAs resident on the part: 256 CUs x 3 CTAs per CU -- occupancy 3 at 4 waves per CTA, which
-// is what the traits' KV tile buys. A hardware number, but NOT an independent one: it follows
-// the accumulator width, so changing KV_TILE_SIZE without changing this leaves the split aiming
-// at a fraction of the part. The Python wrapper holds the same value and nothing ties them.
-constexpr int SCHED_CTA_RESIDENT = 768;
+// `resident` is the CTAs the part holds at once and is REQUIRED on both of these, with no
+// default: it is PER INSTANCE -- it follows the accumulator width, hence the KV tile, hence the
+// occupancy -- so a file-scope constant could only ever be right for one of them, and a default
+// is how one gets launched with another's grid. It reaches both as an argument.
 
 // The CTA count the split aims at: a WHOLE NUMBER OF ROUNDS. One CTA per tile leaves the last
 // round `resident - (nz mod resident)` CTAs empty, and that tail is not small -- 1025 tiles is
 // four full rounds and one straggler. 0 means do not split.
-__host__ __device__ inline int sched_target(int nz_tiles, int resident = SCHED_CTA_RESIDENT) {
+__host__ __device__ inline int sched_target(int nz_tiles, int resident) {
     if (resident <= 0) return 0;
     if (nz_tiles <= resident) return resident;
     return ((nz_tiles + resident - 1) / resident) * resident;
@@ -205,7 +219,7 @@ __host__ __device__ inline int sched_target(int nz_tiles, int resident = SCHED_C
 // The GRID: the tile count rounded to a whole number of rounds, one round as the floor, and a
 // host constant so a captured graph replays at one shape. Deliberately tight -- a surplus
 // slot's CTA still reads a 32-byte record nobody else touches.
-__host__ __device__ inline int sched_slots(int num_tiles, int resident = SCHED_CTA_RESIDENT) {
+__host__ __device__ inline int sched_slots(int num_tiles, int resident) {
     const int n = num_tiles > resident ? num_tiles : resident;
     return (n + resident - 1) / resident * resident;
 }
@@ -663,9 +677,9 @@ enum class mqa_logits_sched {
 //
 // KV_TILE_SIZE = 64 is ONE PAGE, and it is the width the accumulator is sized by: N_TILES is
 // KV_TILE_SIZE / MMA_N, so the tile decides ACC_VGPR and ACC_VGPR decides how many waves the
-// allocator fits per SIMD. At 64 that is three, at 128 it is one. **SCHED_CTA_RESIDENT is
-// derived from that occupancy and has to move with this number** -- a stale value there
-// under-sizes the grid, the split cannot fill the part, and nothing reports it.
+// allocator fits per SIMD. At 64 that is three, at 128 it is one. **The caller's
+// `cta_resident` follows that occupancy and has to be re-tuned when this number moves** -- a
+// stale value under-sizes the grid, the split cannot fill the part, and nothing reports it.
 template<int Q_PER_BLOCK_  = 4,
          int LDS_STAGES_   = 2,
          int KV_TILE_SIZE_ = 64,

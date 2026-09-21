@@ -41,6 +41,7 @@ reference cannot give live in the opus-ops standalone harness.
 """
 
 import argparse
+import functools
 import itertools
 import random
 from dataclasses import dataclass
@@ -59,11 +60,12 @@ from aiter.benchmark_data_init import (
 )
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus.pa_mqa_logits_mxfp4 import (  # BLOCK_K / Q_PER_BLOCK are internal, and
-    BLOCK_K,  # reached for on purpose: only a test sizes block_tables or checks a tile's rows
-    Q_PER_BLOCK,
+from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
     pa_mqa_logits_mxfp4,
+    pa_mqa_logits_mxfp4_block_table_width,
     pa_mqa_logits_mxfp4_plan,
+    pa_mqa_logits_mxfp4_plan_buffers,
+    pa_mqa_logits_mxfp4_variants,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
@@ -200,8 +202,12 @@ def pages_for(max_end):
     reads ``block_tables`` at every page of the last one, even where the window stops inside
     it.
     """
-    tiles = max(1, (max_end + BLOCK_K - 1) // BLOCK_K)
-    return tiles * (BLOCK_K // KV_BLOCK_SIZE)
+    # Sized for EVERY compiled variant, not just the one this shape will pick: a test holds one
+    # block_tables per case and the plan chooses from the shape. That is what the op's own
+    # sizing helper is for, and open-coding the rounding is how it drifts.
+    return pa_mqa_logits_mxfp4_block_table_width(
+        max(max_end, 1), kv_block_size=KV_BLOCK_SIZE
+    )
 
 
 def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
@@ -334,7 +340,25 @@ def sample_rows(total, le, n=N_COS_SAMPLE, seed=0):
 
 
 # ── correctness ───────────────────────────────────────────────────────────────
-def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends):
+@functools.cache
+def _variants():
+    """The kernel instances this build compiled, looked up LAZILY.
+
+    Never at module scope: the probe reads the device's properties, so it initializes the HIP
+    context at IMPORT and raises outright on an arch ``main()`` is meant to skip -- and CI
+    discovers every ``op_tests/test_*.py`` on the other shards. The gate has to run first.
+    """
+    return pa_mqa_logits_mxfp4_variants()
+
+
+def _qpb_max():
+    """The widest ``Q_PER_BLOCK`` compiled. ``_g4`` replicates rows by it so a group's rows
+    share a window exactly on the widest instance; a narrower one cuts the same data finer,
+    which is a regime the cases want covered rather than avoided."""
+    return max((v.q_per_block for v in _variants()), default=4)
+
+
+def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends, q_per_block):
     """Check the one condition the schedule takes on faith: within a tile the window rule is
     NON-DECREASING, so the union is the first row's start and the LAST row's end -- two loads
     instead of a reduction. A violation makes the builder compute a union that is not one, so
@@ -342,6 +366,10 @@ def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends):
 
     Host-side and synchronising, which is why it lives here and not in the op: it is worth three
     device-to-host copies in a correctness sweep and nothing in a hot path.
+
+    ``q_per_block`` must be THIS plan's instance and never the widest one the build compiled:
+    the one-row instance cuts every tile to a single row, so a bound taken from the widest
+    would be satisfied by anything and the span check would stop checking.
 
     "A tile is contiguous rows of one batch" is not checked, because the tile cut inside
     ``pa_mqa_logits_mxfp4_plan`` is what produces the array and guarantees it.
@@ -353,9 +381,9 @@ def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends):
         lo, hi = ct[t], ct[t + 1]
         if hi == lo:
             continue  # an empty tile; its CTA gets a zero-count record
-        if not (0 < hi - lo <= Q_PER_BLOCK):
+        if not (0 < hi - lo <= q_per_block):
             raise AssertionError(
-                f"qshare: tile {t} spans rows [{lo},{hi}), which is not 1..{Q_PER_BLOCK} rows"
+                f"qshare: tile {t} spans rows [{lo},{hi}), which is not 1..{q_per_block} rows"
             )
         for r in range(lo + 1, hi):
             if ls[r] < ls[r - 1] or le[r] < le[r - 1]:
@@ -365,23 +393,31 @@ def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends):
                 )
 
 
-def run_one(inp, qlens, rb, ls, le, label, seed, check_windows=True):
-    """Launch one case over explicit per-row windows and score it."""
+def run_one(inp, qlens, rb, ls, le, label, seed, variant, check_windows=True):
+    """Launch one case over explicit per-row windows, on a PINNED instance, and score it."""
     total_q = int(rb.numel())
     cu = torch.tensor(
         [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
+    )
+    # The buffers carry the instance, so allocating them is the only way to run a case on
+    # something other than what the plan's own `total_q // batch` rule would choose. It is also
+    # the only path in this file that touches `plan_buffers` at all.
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(
+        dev, total_q, len(qlens), variant=variant
     )
     # `local_starts` is passed because these cases carry non-zero window starts; ATOM's paths do
     # not and leave it None. `row_to_batch` is passed because `block_tables` here is per
     # SEQUENCE -- leaving it None would make the kernel read the table by query row.
     plan = pa_mqa_logits_mxfp4_plan(
-        cu, le, total_q=total_q, local_starts=ls, row_to_batch=rb
+        cu, le, buffers=buffers, total_q=total_q, local_starts=ls, row_to_batch=rb
     )
     if check_windows:
         # The condition the kernel cannot check. Host-side and synchronising, so it runs in the
         # correctness path only -- and it is worth running, because breaking it DEADLOCKS the
         # CTA rather than returning a wrong answer.
-        assert_qshare_windows(plan.cu_tiles, plan.num_tiles, ls, le)
+        assert_qshare_windows(
+            plan.cu_tiles, plan.num_tiles, ls, le, plan.variant.q_per_block
+        )
 
     out = pa_mqa_logits_mxfp4(
         inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
@@ -395,13 +431,14 @@ def run_one(inp, qlens, rb, ls, le, label, seed, check_windows=True):
     oob = oob_is_neginf(out, ls, le)
     wr = window_is_written(out, ls, le)
     return {
-        "case": label, "rows": total_q, "tiles": plan.num_tiles, "ctas": plan.num_ctas,
+        "case": label, "variant": plan.variant.name,
+        "rows": total_q, "tiles": plan.num_tiles, "ctas": plan.num_ctas,
         "max_win": int(le.max()), "err": err, "oob -inf": oob,
         "window written": wr, "pass": err == 0 and oob and wr,
     }  # fmt: skip
 
 
-def check_prefill(windows_per_batch, seed, label, data_init, scale_init):
+def check_prefill(windows_per_batch, seed, label, data_init, scale_init, variant):
     """One ragged-prefill case from explicit per-row ``(start, end)`` windows."""
     qlens = [len(w) for w in windows_per_batch]
     total_q = sum(qlens)
@@ -418,17 +455,17 @@ def check_prefill(windows_per_batch, seed, label, data_init, scale_init):
     ls = torch.tensor(ls, dtype=torch.int32, device=dev)
     le = torch.tensor(le, dtype=torch.int32, device=dev)
 
-    ret = run_one(inp, qlens, rb, ls, le, label, seed)
+    ret = run_one(inp, qlens, rb, ls, le, label, seed, variant)
     del inp
     torch.cuda.empty_cache()
     return {"data_init": data_init, "scale_init": scale_init, "seed": seed, **ret}
 
 
 def _g4(windows_per_batch):
-    """Replicate each row Q_PER_BLOCK times so a group's rows share a window exactly -- the
+    """Replicate each row ``_qpb_max()`` times so a group's rows share a window exactly -- the
     EASY regime. The CSA rules below are the hard one, where adjacent rows of a group differ by
     a column and the loop bound has to be their union."""
-    return [[r for r in b for _ in range(Q_PER_BLOCK)] for b in windows_per_batch]
+    return [[r for r in b for _ in range(_qpb_max())] for b in windows_per_batch]
 
 
 def _csa_fresh(qlen):
@@ -448,7 +485,7 @@ def _csa_chunked(qlen, kvlen):
 ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS, ROWID_WIN = 10, 14, 200
 
 
-def check_row_id_bound(data_init, scale_init, seed):
+def check_row_id_bound(data_init, scale_init, seed, variant):
     """The one caller inconsistency the kernel has to survive rather than diagnose.
 
     ``cu_seq_q[batch]`` is device data, so no launcher check can compare it against
@@ -467,6 +504,11 @@ def check_row_id_bound(data_init, scale_init, seed):
     establishing nothing. So `out` is allocated for all ``claimed`` rows and the surplus ones
     are required to stay at their -inf pre-fill. That is the same `row_id` the overrun would
     have used, so it tests the bound and not a symptom.
+
+    Both clauses need a tile WIDER than one row, so only the qshare instances put the per-wave
+    half on the path; at one row per CTA the cut is `[0,1) .. [13,14)`, no tile straddles
+    ``real`` and the CTA-uniform clause is the only one that can fire. Run on both anyway --
+    the CTA-uniform half is the one that bounds the store, and it is the whole probe there.
     """
     real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
     inp = build_inputs(1, ROWID_WIN, real, seed, data_init, scale_init)
@@ -479,8 +521,14 @@ def check_row_id_bound(data_init, scale_init, seed):
     rb = torch.zeros(claimed, dtype=torch.int32, device=dev)
     ls = torch.zeros(claimed, dtype=torch.int32, device=dev)
     le = t([ROWID_WIN] * claimed)
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, 1, variant=variant)
     plan = pa_mqa_logits_mxfp4_plan(
-        t([0, claimed]), le, total_q=claimed, local_starts=ls, row_to_batch=rb
+        t([0, claimed]),
+        le,
+        buffers=buffers,
+        total_q=claimed,
+        local_starts=ls,
+        row_to_batch=rb,
     )
     out = torch.full(
         (claimed, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
@@ -501,7 +549,8 @@ def check_row_id_bound(data_init, scale_init, seed):
     untouched = bool(torch.isneginf(out[real:]).all().item())
     ret = {
         "data_init": data_init, "scale_init": scale_init, "seed": seed,
-        "case": f"cu_seq_q {claimed} > q {real}", "rows": real,
+        "case": f"cu_seq_q {claimed} > q {real}", "variant": plan.variant.name,
+        "rows": real,
         "tiles": plan.num_tiles, "ctas": plan.num_ctas, "max_win": ROWID_WIN,
         "err": err, "oob -inf": oob and untouched, "window written": wr,
         "pass": err == 0 and oob and untouched and wr,
@@ -513,8 +562,11 @@ def check_row_id_bound(data_init, scale_init, seed):
 
 def run_corner(data_init, scale_init, seed):
     """The cases the qshare contract is made of: short groups at every residue mod
-    Q_PER_BLOCK, windows that do not start at 0, the KV_TILE = 64 boundary neighbourhood, every
+    the widest Q_PER_BLOCK, windows not starting at 0, the KV_TILE = 64 neighbourhood, every
     window start mod 128, and both ATOM CSA regimes where a group's rows differ by a column.
+
+    Every case runs on every compiled instance, so the count below is the case list times
+    ``len(_variants())``.
 
     The per-case seeds below are OFFSETS from ``--seed``: the cases stay distinct from one
     another while the whole sweep moves with the flag.
@@ -546,10 +598,23 @@ def run_corner(data_init, scale_init, seed):
             "csa mixed",
         ),
     ]
+    # EVERY compiled instance, and not the one the plan would pick on its own. The default rule
+    # is `total_q // batch` and no case above has fewer than two rows per sequence -- the
+    # shortest is `csa short groups` at 8 rows over 4 batches -- so left to itself this suite
+    # builds the qshare instance 14 times and the one-row instance never. The probes' coverage
+    # is stated in TILE units, so it has to be re-established per instance rather than
+    # inherited: a tile is four rows for one of them and one row for the other.
+    variants = _variants()
+    if not variants:
+        raise RuntimeError(
+            "no compiled kernel instances to run the corner suite on; an empty sweep reports "
+            "`pass` having tested nothing"
+        )
     return [
-        check_prefill(w, seed + case_seed, label, data_init, scale_init)
+        check_prefill(w, seed + case_seed, label, data_init, scale_init, v)
+        for v in variants
         for w, case_seed, label in cases
-    ] + [check_row_id_bound(data_init, scale_init, seed + 70)]
+    ] + [check_row_id_bound(data_init, scale_init, seed + 70, v) for v in variants]
 
 
 SPREAD_PROBE_ROWS = 4096
@@ -682,6 +747,9 @@ def test_prefill_causal(bs, data_init, scale_init, seed):
     n_logits = int((le - ls).clamp(min=0).sum().item())
     ret = {
         "gfx": get_gfx(),
+        # Whatever the op settled on its own: these rows pass no `variant`, which is the other
+        # half of the decode table's coverage and the only place the DEFAULT is exercised.
+        "variant": plan.variant.name,
         "total_q": total_q,
         "tiles": plan.num_tiles,
         "ctas": plan.num_ctas,
@@ -734,6 +802,8 @@ def run_windowed_case(per_batch, data_init, scale_init, seed):
     n_logits = int((le - ls).clamp(min=0).sum().item())
     ret = {
         "gfx": get_gfx(),
+        # As in `test_prefill_causal`: the op's own default, passed no `variant`.
+        "variant": plan.variant.name,
         "total_q": total_q,
         "tiles": plan.num_tiles,
         "ctas": plan.num_ctas,
@@ -783,35 +853,41 @@ def test_prefill_chunked(bs, kvlen, data_init, scale_init, seed):
 
 
 @benchmark()
-def test_decode(mtp, n_long, data_init, scale_init, seed):
-    """MTP decode over ``DECODE_SEQS`` sequences, ``n_long`` of them long.
+def test_decode(mtp, seqs, n_long, variant, data_init, scale_init, seed):
+    """MTP decode over ``seqs`` sequences, ``n_long`` of them long, on ``variant``.
 
     ``mtp`` is the query rows per sequence -- ``next_n`` in the schedule's own tables -- so the
-    row count is ``DECODE_SEQS * mtp`` and the tile count is ``DECODE_SEQS * ceil(mtp/QPB)``.
-    The tile count is therefore CONSTANT across the ragged shapes, which is what makes them a
-    clean read on load balance: same rows, same tiles, only the work per tile moves.
+    row count is ``seqs * mtp`` and the tile count is ``seqs * ceil(mtp/QPB)``. Within one
+    ``(mtp, seqs)`` the tile count is therefore CONSTANT across the ragged shapes, which is what
+    makes them a clean read on load balance: same rows, same tiles, only the work per tile moves.
 
     Every row of a sequence takes that sequence's whole window. The tail-causal alternative --
     row ``j`` ending at ``ctx - (mtp - 1 - j)`` -- would read the same here, because the loop
     bound is the TILE's union and that is the last row's end either way; the per-row ends only
     move the store mask, by three columns out of 25000.
+
+    ``variant`` is the kernel instance, or ``None`` for the op's own default. It is a per-shape
+    CHOICE made by the driver and never inferred here -- see ``decode_shapes``.
     """
-    n_short = DECODE_SEQS - n_long
+    n_short = seqs - n_long
     ctxs = [DECODE_WIN_LONG] * n_long + [DECODE_WIN_SHORT] * n_short
-    qlens = [mtp] * DECODE_SEQS
-    total_q = DECODE_SEQS * mtp
-    inp = build_inputs(DECODE_SEQS, max(ctxs), total_q, seed, data_init, scale_init)
+    qlens = [mtp] * seqs
+    total_q = seqs * mtp
+    inp = build_inputs(seqs, max(ctxs), total_q, seed, data_init, scale_init)
 
     def t(v):
         return torch.tensor(v, dtype=torch.int32, device=dev)
 
-    rb = t([b for b in range(DECODE_SEQS) for _ in range(mtp)])
+    rb = t([b for b in range(seqs) for _ in range(mtp)])
     ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
-    le = t([ctxs[b] for b in range(DECODE_SEQS) for _ in range(mtp)])
+    le = t([ctxs[b] for b in range(seqs) for _ in range(mtp)])
     cu = t([0] + list(itertools.accumulate(qlens)))
     # `local_starts` stays None rather than an array of zeros, because that is the call ATOM
     # makes on this path and a per-row start load is not part of it.
-    plan = pa_mqa_logits_mxfp4_plan(cu, le, total_q=total_q, row_to_batch=rb)
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, seqs, variant=variant)
+    plan = pa_mqa_logits_mxfp4_plan(
+        cu, le, buffers=buffers, total_q=total_q, row_to_batch=rb
+    )
     out = torch.full(
         (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
@@ -828,6 +904,7 @@ def test_decode(mtp, n_long, data_init, scale_init, seed):
         "gfx": get_gfx(),
         "regime": "uniform" if n_short == 0 else "ragged",
         "n_short": n_short,
+        "variant": plan.variant.name,
         "rows": total_q,
         "tiles": plan.num_tiles,
         "ctas": plan.num_ctas,
@@ -980,24 +1057,43 @@ def main():
         ],
     )
 
-    # (mtp, n_long) over a fixed DECODE_SEQS. The first three are uniform and sweep the row
-    # count; the last three hold mtp = 4 and 128 rows and move only the long fraction, so the
-    # uniform mtp = 4 line above is their same-row-count anchor.
+    # (mtp, seqs, n_long, variant).
+    #
+    # **MTP = 1 carries the batch sweep, because it is the regime the framework runs.** At one
+    # row per sequence `rows == seqs == TILES`, so `seqs` IS the tile count and the schedule has
+    # to spread 1..128 tiles over 3072 CTAs -- the axis it lives or dies on, and the one MTP > 1
+    # cannot be read on, because packing four rows into a tile hides it. Its two ragged rows hold
+    # the tile count and move only the long fraction, for the same reason the mtp = 4 ones do.
+    #
+    # The MTP > 1 rows stay at `DECODE_SEQS`: two uniform ones extend the row count from the
+    # mtp = 1 anchor, and the last three hold mtp = 4 and 128 rows so the uniform mtp = 4 line is
+    # their same-row-count anchor.
+    #
+    # **The variant is a per-shape CHOICE, not a rule.** The op defaults every shape to the
+    # four-row instance and infers nothing, so `mtp = 1` -- where that instance masks three of
+    # its four waves off -- names the one-row instance here, which is what a caller that knows
+    # its own regime does. Left to the default those rows read about twice the time, and the
+    # `variant` column is what makes the choice visible in the table rather than implied.
     decode_shapes = [
-        (1, DECODE_SEQS),
-        (4, DECODE_SEQS),
-        (8, DECODE_SEQS),
-        (4, 16),
-        (4, 4),
-        (4, 28),
+        (1, 1, 1, "qlen1_kv64"),
+        (1, 8, 8, "qlen1_kv64"),
+        (1, DECODE_SEQS, DECODE_SEQS, "qlen1_kv64"),
+        (1, 128, 128, "qlen1_kv64"),
+        (1, DECODE_SEQS, 4, "qlen1_kv64"),
+        (1, 128, 16, "qlen1_kv64"),
+        (4, DECODE_SEQS, DECODE_SEQS, None),
+        (8, DECODE_SEQS, DECODE_SEQS, None),
+        (4, DECODE_SEQS, 16, None),
+        (4, DECODE_SEQS, 4, None),
+        (4, DECODE_SEQS, 28, None),
     ]
     summarize(
-        f"pa_mqa_logits_mxfp4 decode ({DECODE_SEQS} seqs, "
-        f"win {DECODE_WIN_LONG}/{DECODE_WIN_SHORT} compressed cols)",
+        f"pa_mqa_logits_mxfp4 decode "
+        f"(win {DECODE_WIN_LONG}/{DECODE_WIN_SHORT} compressed cols)",
         [
-            test_decode(mtp, n_long, data_init, scale_init, args.seed)
+            test_decode(mtp, seqs, n_long, variant, data_init, scale_init, args.seed)
             for data_init, scale_init in pairs
-            for mtp, n_long in decode_shapes
+            for mtp, seqs, n_long, variant in decode_shapes
         ],
     )
 
