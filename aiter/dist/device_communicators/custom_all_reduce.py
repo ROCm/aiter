@@ -806,6 +806,8 @@ class _SymmMemBufferProxy:
 
 
 class CustomAllreduce:
+    defers_capture_registration = True
+
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _meta_size(self) -> int:
@@ -888,6 +890,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self.enable_register_for_capturing = False
+        self._register_for_capturing_requested = False
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
@@ -1017,6 +1021,9 @@ class CustomAllreduce:
         # it would fail. Force the copy-in path, which stages into the plain
         # hipMalloc input pool (IPC-exportable). The VMM transport does its own
         # pointer exchange and is unaffected, so only guard the IPC path.
+        self._register_for_capturing_requested = (
+            enable_register_for_capturing and not self._is_gfx1250
+        )
         if (
             not self._use_vmm
             and not self._use_symm_mem
@@ -1024,10 +1031,10 @@ class CustomAllreduce:
         ):
             if enable_register_for_capturing:
                 logger.warning(
-                    "PyTorch expandable_segments is enabled; forcing custom "
-                    "allreduce copy-in during CUDA graph capture because "
+                    "PyTorch expandable_segments is enabled; defaulting custom "
+                    "allreduce to copy-in during CUDA graph capture because "
                     "expandable-segment pointers cannot be IPC-exported "
-                    "(issue #4174)."
+                    "(issue #4174). Re-checked when capture() is entered."
                 )
             enable_register_for_capturing = False
         self.enable_register_for_capturing = enable_register_for_capturing
@@ -1398,13 +1405,28 @@ class CustomAllreduce:
         flush_graph_buffers call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
+        prev_register = self.enable_register_for_capturing
+        if (
+            self._register_for_capturing_requested
+            and not self._use_vmm
+            and not self.enable_register_for_capturing
+            and not _expandable_segments_enabled()
+        ):
+            logger.info(
+                "expandable_segments is off at capture time; using the "
+                "registered custom-allreduce capture path (no staging copy)."
+            )
+            self.enable_register_for_capturing = True
         try:
             self._IS_CAPTURING = True
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
-                self._pool.flush_graph_buffers(self._ptr)
+            try:
+                if not self.disabled:
+                    self._pool.flush_graph_buffers(self._ptr)
+            finally:
+                self.enable_register_for_capturing = prev_register
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
