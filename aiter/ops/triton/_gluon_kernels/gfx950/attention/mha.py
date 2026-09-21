@@ -100,11 +100,10 @@ def _staggered_layout_ok(head_dim_pow2, block_n, elem_bytes, interval=_PAD_INTER
         return False
     if head_dim_pow2 < 16 or block_n < 16:
         return False
-    # K^T is [head_dim, block_n] with dim 0 contiguous; V is the transpose.
-    for c, r in ((head_dim_pow2, block_n), (head_dim_pow2, block_n)):
-        if r % max(interval // c, 1) != 0:
-            return False
-    return True
+    # K^T is [head_dim, block_n] with dim 0 contiguous and V is its transpose, so
+    # both tiles have the head dim on the contiguous axis and BLOCK_N on the strided
+    # one.  The strided axis has to split evenly across the padding intervals.
+    return block_n % max(interval // head_dim_pow2, 1) == 0
 
 
 @gluon.constexpr_function
@@ -196,15 +195,26 @@ def _dma_source_layout(rows, cols, contig_dim, num_warps, vec, warp_size=64):
 
 
 @gluon.constexpr_function
-def _dma_ok(head_dim_pow2, block_n, num_warps, elem_bits):
+def _dma_ok(head_dim_pow2, block_n, num_warps, elem_bits, stride_align):
     """Can BOTH the K^T and the V tile be moved by ``buffer_load_to_shared``?
 
     All-or-nothing on purpose: a loop that DMAs one tile and register-stages the
     other still pays the blocking ``s_waitcnt vmcnt(0)`` for the second.
+
+    ``stride_align`` is the largest power of two, in elements, that the host has
+    verified divides both KV sequence strides -- and 0 when it could not verify
+    anything, which is what the host reports for a tensor whose last axis is not
+    contiguous.  It has to reach the copy's vector width, because that is what makes
+    every lane's 16-byte chunk 16-byte aligned; see the note at the
+    ``gl.multiple_of`` call.  Below it the DMA is not merely unprofitable, it is
+    wrong, so 0 disqualifies.
     """
     if not _staggered_layout_ok(head_dim_pow2, block_n, elem_bits // 8):
         return False
-    if _dma_vec(head_dim_pow2, block_n, 0, num_warps, elem_bits) == 0:
+    vec = _dma_vec(head_dim_pow2, block_n, 0, num_warps, elem_bits)
+    if vec == 0:
+        return False
+    if stride_align < vec:
         return False
     # K^T is [head_dim, block_n] with dim 0 contiguous; V is its transpose.
     return _dma_vec(block_n, head_dim_pow2, 1, num_warps, elem_bits) != 0
@@ -366,9 +376,8 @@ def _dma_kv_tile(
     padded. ``buffer_load_to_shared`` broadcasts a mask against the offsets, so each
     half is handed over carrying only the axis it constrains.
 
-    The ``HAS_PE`` arm is currently unreachable -- ``USE_DMA`` is forced off for the
-    decoupled-PE path by the lowering bug noted at its definition -- and is kept so
-    that lifting that gate is a one-line change rather than a rewrite.
+    The PE slice is a third tile with its own LDS buffer and its own commit group;
+    ``DMA_GROUPS`` in the caller counts it.
     """
     HAS_MASK: gl.constexpr = MASK_STEPS or PADDED_HEAD
     if MASK_STEPS:
@@ -1194,6 +1203,7 @@ def _attn_fwd(
     SLIDING_WINDOW: gl.constexpr,
     RETURN_SCORES: gl.constexpr,
     HEAD_STRIDE_ALIGN: gl.constexpr,
+    KV_STRIDE_ALIGN: gl.constexpr = 1,
     SCALE_ON_Q: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
@@ -1264,6 +1274,26 @@ def _attn_fwd(
         stride_sd_h = stride_sd_h_in
         stride_sd_m = stride_sd_m_in
         stride_sd_n = stride_sd_n_in
+
+    # The global->LDS copy hands every lane 16 contiguous bytes, and its lowering
+    # only fires when it can PROVE that chunk is 16-byte aligned.  A lane's chunk
+    # sits at `K + z*stride_kz + h*stride_kh + n*stride_kn + d0`, with `d0` a
+    # multiple of the vector -- so EVERY stride that reaches the base pointer has to
+    # carry the alignment, not just the sequence one.
+    #
+    # Triton infers `tt.divisibility = 16` for a stride argument only when the value
+    # is a multiple of 16 *elements*.  A head dim padded to 40 gives 40, which is
+    # 80 bytes and perfectly 16-byte aligned, but misses that test -- so the
+    # conversion pattern silently declines to match and the op survives all the way
+    # to LLVM translation as an unlowered `builtin.unrealized_conversion_cast`.
+    # State the alignment the host actually measured instead.
+    if KV_STRIDE_ALIGN > 1:
+        stride_kz = gl.multiple_of(stride_kz, KV_STRIDE_ALIGN)
+        stride_kh = gl.multiple_of(stride_kh, KV_STRIDE_ALIGN)
+        stride_kn = gl.multiple_of(stride_kn, KV_STRIDE_ALIGN)
+        stride_vz = gl.multiple_of(stride_vz, KV_STRIDE_ALIGN)
+        stride_vh = gl.multiple_of(stride_vh, KV_STRIDE_ALIGN)
+        stride_vn = gl.multiple_of(stride_vn, KV_STRIDE_ALIGN)
 
     # program -> (batch, q_head, query block). SEQLEN_Q is the max query length,
     # so NUM_BLOCKS_M matches the launch grid in both fixed and varlen mode.
@@ -1365,17 +1395,19 @@ def _attn_fwd(
     # Can the K/V tiles go global->LDS with the DMA engine, skipping VGPRs entirely?
     # All-or-nothing, including the PE slice: one register-staged tile reinstates the
     # blocking `s_waitcnt vmcnt(0)` the DMA exists to remove.
-    # KNOWN GAP: a masked global->LDS copy fails to lower under a padded head dim or
-    # a decoupled PE slice ("LLVM Translation failed for operation:
-    # builtin.unrealized_conversion_cast").  Those two configurations keep the
-    # buffer_load + ds_write staging; they still get the conflict-free LDS layouts and
-    # the epilogue fixes, and only lose the DMA and the rotated pipeline.  Head dims
-    # that are already a power of two >= 16 (64, 128, 256 ...) with no PE slice are
-    # unaffected, which is every shape in the performance table.
-    USE_DMA: gl.constexpr = (
-        (not PADDED_HEAD)
-        and (not HAS_PE)
-        and _dma_ok(BLOCK_DMODEL_POW2, BLOCK_N, num_warps, ELEM_BITS)
+    # Can the K/V tiles go global->LDS with the DMA engine, skipping VGPRs entirely?
+    # All-or-nothing, including the PE slice: one register-staged tile reinstates the
+    # blocking `s_waitcnt vmcnt(0)` the DMA exists to remove.  The gate covers the
+    # three things the copy's lowering actually requires -- a tile shape it can split
+    # 128 bits per lane, a destination it can write coalesced (the staggered padded
+    # layout, which also needs 16-bit elements), and a KV sequence stride whose
+    # alignment reaches the vector width.  Falling any of them keeps the
+    # buffer_load + ds_write staging, which is correct, just slower.
+    USE_DMA: gl.constexpr = _dma_ok(
+        BLOCK_DMODEL_POW2, BLOCK_N, num_warps, ELEM_BITS, KV_STRIDE_ALIGN
+    ) and (
+        (not HAS_PE)
+        or _dma_ok(BLOCK_DMODEL_PE, BLOCK_N, num_warps, ELEM_BITS, KV_STRIDE_ALIGN)
     )
     # Double buffering only earns its LDS when the copy is asynchronous.
     BUF_DEPTH: gl.constexpr = 2 if USE_DMA else 1
@@ -1389,8 +1421,12 @@ def _attn_fwd(
         kPeLoadLayout: gl.constexpr = _make_load_layout(
             BLOCK_DMODEL_PE, LOAD_VEC, num_warps, transposed=True
         )
+        # block_n matters: without it this falls back to the analytic swizzle, and a
+        # swizzled destination is not a legal target for buffer_load_to_shared unless
+        # the swizzle stays inside a warp boundary.  The PE tile needs the same
+        # staggered padded layout the K/V tiles get.
         _KPE_SHARED: gl.constexpr = _make_kv_shared_layouts(
-            BLOCK_DMODEL_PE, ELEM_BYTES, k_width=K_WIDTH
+            BLOCK_DMODEL_PE, ELEM_BYTES, k_width=K_WIDTH, block_n=BLOCK_N
         )
         kPeSharedLayout: gl.constexpr = _KPE_SHARED[0]
     else:
