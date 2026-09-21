@@ -33,6 +33,9 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus import opus_bmm
 from aiter.ops.opus.policy import lookup_mxscale_bmm_config
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from csrc.opus_gemm.opus_gemm_common import (
+    a8w8_mxscale_bmm_kernels_list,
+)
 
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
 # Default quantisation block. GROUP_M is always 1 (per token); GROUP_N and
@@ -341,14 +344,21 @@ def check_tilen_column_map():
 # prefetch, so K=1024 left the B_K=256 tiles with four tiles against the six
 # they want. At 4096 the deepest tiling still has eight. It is also the
 # production K.
-_MX32_KIDS = (
-    9000, 9032, 9064, 9137, 9138, 9311, 9312, 9313,
-    9314, 9316, 9317, 9318, 9319, 9320, 9321, 9322,
-    9323, 9640, 9642, 9646, 9650, 9653,
-)
-_MX32_SHAPE = (2, 128, 256, 4096)  # G, M, N, K
+# Derived, not listed. The twins are generated from the 128 tables, so a listed
+# subset goes stale the moment one is added or dropped -- a new twin would go
+# unchecked until whoever tuned it found out, and the three clang cannot
+# register-allocate would have to be remembered here as well as there. Reading
+# the catalog makes both automatic.
 _MX32_GROUP = 32
+_MX32_SHAPE = (2, 128, 256, 4096)  # G, M, N, K
 _MX32_ERR_TOL = 0.003
+_MX32_KIDS = tuple(
+    sorted(
+        kid
+        for kid, inst in a8w8_mxscale_bmm_kernels_list.items()
+        if inst.GROUP_K == _MX32_GROUP
+    )
+)
 
 
 def check_mx32_kids():
@@ -367,8 +377,15 @@ def check_mx32_kids():
 
     for kid in _MX32_KIDS:
         out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
-        _run_opus(O_in, W_mx, out, xs_in, ws_mx, kid)
-        torch.cuda.synchronize()
+        try:
+            _run_opus(O_in, W_mx, out, xs_in, ws_mx, kid)
+            torch.cuda.synchronize()
+        except RuntimeError as exc:
+            # A launcher refusing the shape -- too few K tiles to prime the
+            # pipeline, say -- is a result about that kid, not a reason to stop
+            # reporting the others.
+            failures.append(f"kid {kid}: launch refused: {str(exc).strip()[-120:]}")
+            continue
         delta = (out.to(dtypes.fp32) - ref).abs()
         rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
         err = rows.max().item()
