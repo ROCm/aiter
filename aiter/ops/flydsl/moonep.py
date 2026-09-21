@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoonEP-style planning contracts for the gfx950 FlyDSL prototype.
+"""MoonEP planning contracts for the gfx950 FlyDSL prototype.
 
-The first prototype intentionally keeps planning host-driven.  It provides a
-small, deterministic reference that the later FlyDSL planner and direct-P2P
-dispatch kernels can be checked against field by field.
+The current path exposes separate prefill and decode policies.  Prefill builds
+an all-rank histogram and maps logical expert ids to EPLB-style global physical
+ids for a normal MoRI dispatch.  Decode keeps owner ids unchanged and avoids
+global planning.  The older grouped-row prototype remains as a correctness and
+performance comparison while the policy path is integrated.
 
 ``hipblaslt_grouped_gemm_reference`` is likewise a correctness baseline.  It
 launches one hipBLASLt GEMM per non-empty VM group and is not intended to be the
@@ -45,22 +47,20 @@ class MoonEPPlanConfig:
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
         if not 0 <= self.rank < self.world_size:
-            raise ValueError(
-                f"rank must be in [0, {self.world_size}), got {self.rank}"
-            )
+            raise ValueError(f"rank must be in [0, {self.world_size}), got {self.rank}")
         if self.num_tokens <= 0:
             raise ValueError("num_tokens must be positive")
         if self.top_k <= 0:
             raise ValueError("top_k must be positive")
         if self.num_experts <= 0 or self.num_experts % self.world_size != 0:
-            raise ValueError(
-                "num_experts must be positive and divisible by world_size"
-            )
+            raise ValueError("num_experts must be positive and divisible by world_size")
         if self.token_padding <= 0:
             raise ValueError("token_padding must be positive")
 
-        slots = self.experts_per_rank if self.prefetch_slots is None else int(
-            self.prefetch_slots
+        slots = (
+            self.experts_per_rank
+            if self.prefetch_slots is None
+            else int(self.prefetch_slots)
         )
         if slots <= 0:
             raise ValueError("prefetch_slots must be positive")
@@ -73,6 +73,16 @@ class MoonEPPlanConfig:
     @property
     def capacity(self) -> int:
         return self.num_tokens * self.top_k
+
+    @property
+    def virtual_experts_per_rank(self) -> int:
+        """Physical-id width consumed by MoRI for the prefill policy."""
+
+        return self.experts_per_rank + int(self.prefetch_slots)
+
+    @property
+    def num_virtual_experts(self) -> int:
+        return self.world_size * self.virtual_experts_per_rank
 
     @property
     def num_dispatch_rows(self) -> int:
@@ -88,9 +98,7 @@ class MoonEPPlanConfig:
         # At most one remote home group and one local home group contribute
         # non-empty expert segments to a destination rank.  Each segment may
         # need token_padding - 1 rows of padding.
-        padding_rows = (
-            2 * self.experts_per_rank * (self.token_padding - 1)
-        )
+        padding_rows = 2 * self.experts_per_rank * (self.token_padding - 1)
         return self.capacity + padding_rows
 
 
@@ -137,7 +145,7 @@ class MoonEPReferencePlan:
     def K(self) -> int:
         return self.config.top_k
 
-    def clone(self) -> "MoonEPReferencePlan":
+    def clone(self) -> MoonEPReferencePlan:
         """Clone plan-owned tensors for safe reuse, matching MoonEPCommPlan."""
 
         return type(self)(
@@ -158,6 +166,61 @@ class MoonEPReferencePlan:
         is_primary = dst >= 0
         raw_dst = torch.where(is_primary, dst, -dst - 1)
         return raw_dst, is_primary
+
+
+@dataclass(frozen=True)
+class MoonEPPrefillRoutePlan:
+    """Prefill planning result consumed by an ordinary MoRI dispatch.
+
+    ``planned_topk_ids`` uses the same global-physical-id convention as EPLB::
+
+        physical_id = destination_rank * (experts_per_rank + B) + local_slot
+
+    Slots ``[0, experts_per_rank)`` are the destination's resident home
+    experts; slots ``[experts_per_rank, experts_per_rank + B)`` are the
+    destination's dynamic prefetch slots.  The planner rolls allocations for
+    every non-selected remote expert back to its owner, so every emitted id has
+    a weight row on its destination.
+    """
+
+    config: MoonEPPlanConfig
+    planned_topk_ids: torch.Tensor
+    experts_to_copy: torch.Tensor
+    alloc: torch.Tensor
+    expert_to_slot: torch.Tensor
+    rank_route_counts: torch.Tensor
+    residual_imbalance: torch.Tensor
+
+    @property
+    def num_experts_per_rank(self) -> int:
+        """Value to pass as ``num_experts_per_rank`` to MoRI dispatch."""
+
+        return self.config.virtual_experts_per_rank
+
+    def clone(self) -> MoonEPPrefillRoutePlan:
+        return type(self)(
+            config=self.config,
+            planned_topk_ids=self.planned_topk_ids.clone(),
+            experts_to_copy=self.experts_to_copy.clone(),
+            alloc=self.alloc.clone(),
+            expert_to_slot=self.expert_to_slot.clone(),
+            rank_route_counts=self.rank_route_counts.clone(),
+            residual_imbalance=self.residual_imbalance.clone(),
+        )
+
+
+@dataclass(frozen=True)
+class MoonEPDecodeRoutePlan:
+    """Owner-only decode routing; no histogram, synchronization, or migration."""
+
+    planned_topk_ids: torch.Tensor
+    num_experts_per_rank: int
+
+    def clone(self) -> MoonEPDecodeRoutePlan:
+        return type(self)(
+            planned_topk_ids=self.planned_topk_ids.clone(),
+            num_experts_per_rank=self.num_experts_per_rank,
+        )
 
 
 def _validate_planning_inputs(
@@ -189,9 +252,7 @@ def _validate_planning_inputs(
     row_totals = tokens_per_expert.to(torch.int64).sum(dim=1)
     expected_total = torch.full_like(row_totals, config.capacity)
     if not torch.equal(row_totals.cpu(), expected_total.cpu()):
-        raise ValueError(
-            "every tokens_per_expert row must sum to num_tokens * top_k"
-        )
+        raise ValueError("every tokens_per_expert row must sum to num_tokens * top_k")
 
     local_hist = torch.bincount(
         topk_experts.reshape(-1).to(torch.int64).cpu(),
@@ -206,46 +267,30 @@ def _validate_planning_inputs(
         )
 
 
-def build_reference_plan(
-    config: MoonEPPlanConfig,
-    topk_experts: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-) -> MoonEPReferencePlan:
-    """Build the deterministic MoonEP plan for one source rank.
+def _build_balanced_alloc_cpu(
+    config: MoonEPPlanConfig, tokens_per_expert: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(alloc[E,R], expert_count[E], source_prefix[E])`` on CPU."""
 
-    The implementation deliberately runs on CPU.  Inputs may reside on a GPU;
-    returned tensors are copied back to ``topk_experts.device`` so they can feed
-    the first FlyDSL dispatch prototype directly.
-    """
-
-    _validate_planning_inputs(config, topk_experts, tokens_per_expert)
-
-    output_device = topk_experts.device
-    topk = topk_experts.to(device="cpu", dtype=torch.int64).contiguous()
     tpe = tokens_per_expert.to(device="cpu", dtype=torch.int64).contiguous()
-
-    rank = config.rank
     world_size = config.world_size
-    num_experts = config.num_experts
     experts_per_rank = config.experts_per_rank
-    capacity = config.capacity
-    num_rows = config.num_dispatch_rows
-    num_slots = int(config.prefetch_slots)
 
-    # cumsum for tokens of each expert, last element is total tokens of each expert
     tpe_cumsum = tpe.cumsum(dim=0)
     expert_count = tpe_cumsum[-1]
-    
-    group_tokens = expert_count.view(world_size, experts_per_rank).sum(dim=1)
-    balance = group_tokens - capacity
+    source_prefix = (
+        torch.zeros_like(expert_count)
+        if config.rank == 0
+        else tpe_cumsum[config.rank - 1]
+    )
 
-    # alloc[e, d] is the number of expert-e routed entries executed by d.
-    alloc = torch.zeros(num_experts, world_size, dtype=torch.int64)
-    for expert in range(num_experts):
+    group_tokens = expert_count.view(world_size, experts_per_rank).sum(dim=1)
+    balance = group_tokens - config.capacity
+
+    alloc = torch.zeros(config.num_experts, world_size, dtype=torch.int64)
+    for expert in range(config.num_experts):
         alloc[expert, expert // experts_per_rank] = expert_count[expert]
 
-    # First choose how many entries each overloaded home group moves to each
-    # underloaded destination rank.
     quotas_by_home = torch.zeros(world_size, world_size, dtype=torch.int64)
     while not config.no_migration:
         home = int(balance.argmax().item())
@@ -259,7 +304,6 @@ def build_reference_plan(
         balance[home] -= move
         balance[dest] = 0
 
-    # Resolve each home-group quota into exact expert allocations.
     for home in range(world_size):
         expert_begin = home * experts_per_rank
         expert_end = expert_begin + experts_per_rank
@@ -283,26 +327,161 @@ def build_reference_plan(
 
     if not torch.equal(alloc.sum(dim=1), expert_count):
         raise AssertionError("per-expert token conservation failed")
-    if not config.no_migration:
-        expected_capacity = torch.full(
-            (world_size,), capacity, dtype=torch.int64
+    return alloc, expert_count, source_prefix
+
+
+def build_prefill_reference_plan(
+    config: MoonEPPlanConfig,
+    topk_experts: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+) -> MoonEPPrefillRoutePlan:
+    """Build the owner-plus-B virtual-id prefill plan on the CPU.
+
+    The unconstrained MoonEP greedy is run first.  Each destination then keeps
+    only its top-B remote experts.  Work assigned to any other remote expert is
+    returned to that expert's owner before route ids are materialized.  This is
+    the key difference from the legacy grouped-row plan: every destination id
+    is directly executable from either a home slot or a prefetched slot.
+    """
+
+    if config.no_migration:
+        raise ValueError("prefill planning requires no_migration=False")
+    _validate_planning_inputs(config, topk_experts, tokens_per_expert)
+
+    output_device = topk_experts.device
+    topk = topk_experts.to(device="cpu", dtype=torch.int64).contiguous()
+    tpe = tokens_per_expert.to(device="cpu", dtype=torch.int64).contiguous()
+    alloc, expert_count, source_prefix = _build_balanced_alloc_cpu(config, tpe)
+
+    R = config.world_size
+    E = config.num_experts
+    B = int(config.prefetch_slots)
+    EPR = config.experts_per_rank
+    physical_per_rank = config.virtual_experts_per_rank
+
+    experts_to_copy = torch.full((R, B), -1, dtype=torch.int64)
+    expert_to_slot = torch.full((R, E), -1, dtype=torch.int64)
+
+    for dest in range(R):
+        local_begin = dest * EPR
+        local_end = local_begin + EPR
+        expert_to_slot[dest, local_begin:local_end] = torch.arange(
+            EPR, dtype=torch.int64
         )
+
+        remote = [
+            expert
+            for expert in range(E)
+            if int(alloc[expert, dest].item()) > 0
+            and not local_begin <= expert < local_end
+        ]
+        remote.sort(
+            key=lambda expert: (int(alloc[expert, dest].item()), expert),
+            reverse=True,
+        )
+        selected = remote[:B]
+        for slot, expert in enumerate(selected):
+            experts_to_copy[dest, slot] = expert
+            expert_to_slot[dest, expert] = EPR + slot
+
+        # A virtual destination has only B remote weight slots.  Returning the
+        # overflow to its owner trades perfect balance for an executable plan.
+        for expert in remote[B:]:
+            count = int(alloc[expert, dest].item())
+            if count == 0:
+                continue
+            owner = expert // EPR
+            alloc[expert, dest] = 0
+            alloc[expert, owner] += count
+
+    if not torch.equal(alloc.sum(dim=1), expert_count):
+        raise AssertionError("top-B fallback broke per-expert conservation")
+    if bool(((alloc.t() > 0) & (expert_to_slot < 0)).any()):
+        raise AssertionError("non-zero allocation has no destination weight slot")
+
+    rank_route_counts = alloc.sum(dim=0)
+    residual_imbalance = rank_route_counts - config.capacity
+    alloc_cumsum = alloc.cumsum(dim=1)
+
+    local_seen = torch.zeros(E, dtype=torch.int64)
+    planned = torch.empty(config.capacity, dtype=torch.int64)
+    for flat_idx, expert_tensor in enumerate(topk.reshape(-1)):
+        expert = int(expert_tensor.item())
+        global_expert_index = int(source_prefix[expert].item()) + int(
+            local_seen[expert].item()
+        )
+        local_seen[expert] += 1
+
+        dest = int(
+            torch.searchsorted(
+                alloc_cumsum[expert], global_expert_index, right=True
+            ).item()
+        )
+        if dest >= R:
+            raise AssertionError("no destination rank covers routed entry")
+        slot = int(expert_to_slot[dest, expert].item())
+        if slot < 0:
+            raise AssertionError(
+                f"destination {dest} has no physical slot for expert {expert}"
+            )
+        physical_id = dest * physical_per_rank + slot
+        if physical_id > torch.iinfo(torch.int32).max:
+            raise OverflowError("planned physical id exceeds int32")
+        planned[flat_idx] = physical_id
+
+    def out(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.to(device=output_device, dtype=torch.int32)
+
+    return MoonEPPrefillRoutePlan(
+        config=config,
+        planned_topk_ids=out(planned.view(config.num_tokens, config.top_k)),
+        experts_to_copy=out(experts_to_copy),
+        alloc=out(alloc.t().contiguous()),
+        expert_to_slot=out(expert_to_slot),
+        rank_route_counts=out(rank_route_counts),
+        residual_imbalance=out(residual_imbalance),
+    )
+
+
+def build_reference_plan(
+    config: MoonEPPlanConfig,
+    topk_experts: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+) -> MoonEPReferencePlan:
+    """Build the deterministic MoonEP plan for one source rank.
+
+    The implementation deliberately runs on CPU.  Inputs may reside on a GPU;
+    returned tensors are copied back to ``topk_experts.device`` so they can feed
+    the first FlyDSL dispatch prototype directly.
+    """
+
+    _validate_planning_inputs(config, topk_experts, tokens_per_expert)
+
+    output_device = topk_experts.device
+    topk = topk_experts.to(device="cpu", dtype=torch.int64).contiguous()
+    tpe = tokens_per_expert.to(device="cpu", dtype=torch.int64).contiguous()
+    alloc, _expert_count, source_prefix = _build_balanced_alloc_cpu(config, tpe)
+
+    rank = config.rank
+    world_size = config.world_size
+    num_experts = config.num_experts
+    experts_per_rank = config.experts_per_rank
+    capacity = config.capacity
+    num_rows = config.num_dispatch_rows
+    num_slots = int(config.prefetch_slots)
+
+    if not config.no_migration:
+        expected_capacity = torch.full((world_size,), capacity, dtype=torch.int64)
         if not torch.equal(alloc.sum(dim=0), expected_capacity):
             raise AssertionError("destination ranks are not perfectly balanced")
 
     alloc_cumsum = alloc.cumsum(dim=1)
-    expert_offsets = torch.zeros(
-        world_size, num_experts, dtype=torch.int64
-    )
-    all_cu_seqlens = torch.zeros(
-        world_size, num_experts + num_slots, dtype=torch.int64
-    )
+    expert_offsets = torch.zeros(world_size, num_experts, dtype=torch.int64)
+    all_cu_seqlens = torch.zeros(world_size, num_experts + num_slots, dtype=torch.int64)
     all_zero_fill = torch.zeros(
         world_size, num_experts + num_slots, 2, dtype=torch.int64
     )
-    experts_to_copy = torch.full(
-        (world_size, num_slots), -1, dtype=torch.int64
-    )
+    experts_to_copy = torch.full((world_size, num_slots), -1, dtype=torch.int64)
     remote_stats = torch.zeros(world_size, 2, dtype=torch.int64)
     group_expert_ids = torch.full(
         (world_size, num_experts + num_slots), -1, dtype=torch.int64
@@ -311,7 +490,7 @@ def build_reference_plan(
     for dest in range(world_size):
         local_begin = dest * experts_per_rank
         local_end = local_begin + experts_per_rank
-        # alloc[expert,dest] => expert i has n routed to dest 
+        # alloc[expert,dest] => expert i has n routed to dest
         # find remote expert which routes to dest
         remote_experts = [
             expert
@@ -372,10 +551,9 @@ def build_reference_plan(
     dst = torch.empty(config.capacity, dtype=torch.int64)
     for flat_idx, expert_tensor in enumerate(topk.reshape(-1)):
         expert = int(expert_tensor.item())
-        previous_sources = (
-            0 if rank == 0 else int(tpe_cumsum[rank - 1, expert].item())
+        global_expert_index = int(source_prefix[expert].item()) + int(
+            local_seen[expert].item()
         )
-        global_expert_index = previous_sources + int(local_seen[expert].item())
         local_seen[expert] += 1
 
         dest = int(
@@ -537,9 +715,7 @@ def hipblaslt_moonep_grouped_gemm_reference(
             if group < num_experts:
                 owner = expert // experts_per_rank
                 if owner != rank:
-                    raise ValueError(
-                        "remote expert group has no dynamic prefetch slot"
-                    )
+                    raise ValueError("remote expert group has no dynamic prefetch slot")
                 weight = home_weights[expert % experts_per_rank]
             else:
                 weight = prefetched_weights[group - num_experts]
@@ -618,7 +794,11 @@ def hipblaslt_moonep_mlp_reference(
             if expert < 0:
                 raise ValueError("non-empty group is missing its expert id")
             if group < num_experts:
-                if full_gate is not None and full_up is not None and full_down is not None:
+                if (
+                    full_gate is not None
+                    and full_up is not None
+                    and full_down is not None
+                ):
                     gate_w = full_gate[expert]
                     up_w = full_up[expert]
                     down_w = full_down[expert]
@@ -646,8 +826,7 @@ def hipblaslt_moonep_mlp_reference(
                 x, up_w, solution_index=solution_index, out_dtype=torch.bfloat16
             )
             activated = (
-                torch.nn.functional.silu(gate.to(torch.float32))
-                * up.to(torch.float32)
+                torch.nn.functional.silu(gate.to(torch.float32)) * up.to(torch.float32)
             ).to(torch.bfloat16)
             group_out = hipb_mm(
                 activated,
@@ -680,6 +859,7 @@ class MoonEPGpuPlanner:
         config: MoonEPPlanConfig,
         device: torch.device | str,
         *,
+        _virtual_ids: bool = False,
         num_vblocks: int = 128,
         hist_waves_per_block: int = 4,
         dst_block_threads: int = 256,
@@ -691,6 +871,7 @@ class MoonEPGpuPlanner:
         )
 
         self.config = config
+        self.virtual_ids = bool(_virtual_ids)
         # Normalise "cuda" to "cuda:N" so the input check can compare devices
         # against tensors, which always carry an explicit index.
         self.device = torch.empty(0, device=device).device
@@ -704,6 +885,7 @@ class MoonEPGpuPlanner:
             token_padding=config.token_padding,
             num_dispatch_rows=config.num_dispatch_rows,
             no_migration=config.no_migration,
+            virtual_ids=self.virtual_ids,
             num_vblocks=num_vblocks,
             hist_waves_per_block=hist_waves_per_block,
             dst_block_threads=dst_block_threads,
@@ -726,6 +908,7 @@ class MoonEPGpuPlanner:
         self._tpe_prefix = _i32(sizes["tpe_prefix"])
         self._alloc_cumsum = _i32(sizes["alloc_cumsum"])
         self._expert_off = _i32(sizes["expert_off"])
+        self.expert_to_slot = _i32(R, E)
 
         self.dst = _i32(config.num_tokens, config.top_k)
         self.cu_seqlens = _i32(G)
@@ -733,6 +916,8 @@ class MoonEPGpuPlanner:
         self.zero_fill_ranges = _i32(G, 2)
         self.remote_stats = _i32(2)
         self.alloc = _i32(R, E)
+        self.rank_route_counts = _i32(R)
+        self.residual_imbalance = _i32(R)
         self.group_expert_ids = _i32(G)
 
     def _check_inputs(
@@ -767,9 +952,9 @@ class MoonEPGpuPlanner:
         if self._compiled[slot] is None:
             self._compiled[slot] = flyc.compile(self._jits[slot], *args)
         else:
-            raw = tuple(
-                a.value if hasattr(a, "value") else a for a in args[:-1]
-            ) + (args[-1],)
+            raw = tuple(a.value if hasattr(a, "value") else a for a in args[:-1]) + (
+                args[-1],
+            )
             self._compiled[slot](*raw)
 
     STAGES = ("order_hist", "meta", "dst")
@@ -802,7 +987,10 @@ class MoonEPGpuPlanner:
                 p(self._tpe_prefix.data_ptr()),
                 p(self._alloc_cumsum.data_ptr()),
                 p(self._expert_off.data_ptr()),
+                p(self.expert_to_slot.data_ptr()),
                 p(self.alloc.data_ptr()),
+                p(self.rank_route_counts.data_ptr()),
+                p(self.residual_imbalance.data_ptr()),
                 p(self.experts_to_copy.data_ptr()),
                 p(self.cu_seqlens.data_ptr()),
                 p(self.zero_fill_ranges.data_ptr()),
@@ -817,6 +1005,7 @@ class MoonEPGpuPlanner:
             p(self._tpe_prefix.data_ptr()),
             p(self._alloc_cumsum.data_ptr()),
             p(self._expert_off.data_ptr()),
+            p(self.expert_to_slot.data_ptr()),
             p(self.dst.data_ptr()),
             self.config.num_tokens,
             stream,
@@ -854,6 +1043,40 @@ class MoonEPGpuPlanner:
             remote_stats=self.remote_stats,
             alloc=self.alloc,
             group_expert_ids=self.group_expert_ids,
+        )
+
+
+class MoonEPPrefillPlanner(MoonEPGpuPlanner):
+    """Three-launch GPU planner that emits MoRI/EPLB-style physical ids."""
+
+    def __init__(
+        self,
+        config: MoonEPPlanConfig,
+        device: torch.device | str,
+        **planner_kwargs,
+    ) -> None:
+        if config.no_migration:
+            raise ValueError("prefill planner requires no_migration=False")
+        super().__init__(config, device, _virtual_ids=True, **planner_kwargs)
+
+    def build(
+        self, topk_experts: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> MoonEPPrefillRoutePlan:
+        self._check_inputs(topk_experts, tokens_per_expert)
+        stream = torch.cuda.current_stream(self.device)
+        for slot in range(3):
+            self._run(
+                slot, self.stage_args(slot, topk_experts, tokens_per_expert, stream)
+            )
+
+        return MoonEPPrefillRoutePlan(
+            config=self.config,
+            planned_topk_ids=self.dst,
+            experts_to_copy=self.experts_to_copy,
+            alloc=self.alloc,
+            expert_to_slot=self.expert_to_slot,
+            rank_route_counts=self.rank_route_counts,
+            residual_imbalance=self.residual_imbalance,
         )
 
 
@@ -989,9 +1212,9 @@ class MoonEPFusedPlanner:
         if self._compiled is None:
             self._compiled = flyc.compile(self._jit, *args)
         else:
-            raw = tuple(
-                a.value if hasattr(a, "value") else a for a in args[:-1]
-            ) + (args[-1],)
+            raw = tuple(a.value if hasattr(a, "value") else a for a in args[:-1]) + (
+                args[-1],
+            )
             self._compiled(*raw)
 
     def build(
@@ -1035,12 +1258,181 @@ def build_plan_gpu(
     return planner.build(topk_experts, tokens_per_expert)
 
 
+class MoonEPSymmetricHistogramExchange:
+    """Exchange one ``[E]`` histogram through MoRI's symmetric heap.
+
+    This is the first lightweight synchronization backend for PrefillPolicy. It
+    replaces the per-layer RCCL ``all_gather`` with direct peer writes followed
+    by a device-stream barrier.  The policy depends only on ``publish`` and can
+    later switch to the single-kernel epoch-doorbell implementation without
+    changing its planning or dispatch contract.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        num_experts: int,
+        device: torch.device | str,
+    ) -> None:
+        import mori.shmem as ms
+        from mori.shmem import mori_shmem_create_tensor, mori_shmem_free_tensor
+        from mori.shmem.tensor_utils import symm_mori_shmem_tensor
+
+        self.rank = rank
+        self.world_size = world_size
+        self.num_experts = num_experts
+        self.device = torch.empty(0, device=device).device
+        self._ms = ms
+        self._free = mori_shmem_free_tensor
+        # Ping-pong planes prevent the next layer from overwriting a histogram
+        # while a slower peer is still consuming the current plan input.
+        self._buffer = mori_shmem_create_tensor(
+            (2, world_size, num_experts), torch.int32
+        )
+        self._peers = [
+            symm_mori_shmem_tensor(self._buffer, peer) for peer in range(world_size)
+        ]
+        self._epoch = 0
+        self._closed = False
+
+    @property
+    def buffer(self) -> torch.Tensor:
+        return self._buffer
+
+    def publish(self, local_histogram: torch.Tensor) -> torch.Tensor:
+        if self._closed:
+            raise RuntimeError("histogram exchange is closed")
+        if tuple(local_histogram.shape) != (self.num_experts,):
+            raise ValueError(
+                f"local histogram must have shape {(self.num_experts,)}, got "
+                f"{tuple(local_histogram.shape)}"
+            )
+        if local_histogram.dtype != torch.int32:
+            raise TypeError("local histogram must be int32")
+        if local_histogram.device != self.device:
+            raise ValueError(f"local histogram must live on {self.device}")
+
+        plane = self._epoch & 1
+        for peer_view in self._peers:
+            peer_view[plane, self.rank].copy_(local_histogram)
+        self._ms.shmem_barrier_on_stream(torch.cuda.current_stream(self.device))
+        self._epoch += 1
+        return self._buffer[plane]
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        torch.cuda.synchronize(self.device)
+        self._ms.shmem_barrier_all()
+        self._peers = []
+        self._free(self._buffer)
+        self._closed = True
+
+
+class MoonEPPrefillPolicy:
+    """Histogram, synchronization, and virtual-id planning for prefill."""
+
+    def __init__(
+        self,
+        config: MoonEPPlanConfig,
+        device: torch.device | str,
+        *,
+        histogram_exchange=None,
+        planner: MoonEPPrefillPlanner | None = None,
+        **planner_kwargs,
+    ) -> None:
+        if config.no_migration:
+            raise ValueError("PrefillPolicy requires no_migration=False")
+        self.config = config
+        self.device = torch.empty(0, device=device).device
+        self.planner = planner or MoonEPPrefillPlanner(
+            config, self.device, **planner_kwargs
+        )
+        self._owns_exchange = histogram_exchange is None
+        self.histogram_exchange = (
+            histogram_exchange
+            or MoonEPSymmetricHistogramExchange(
+                rank=config.rank,
+                world_size=config.world_size,
+                num_experts=config.num_experts,
+                device=self.device,
+            )
+        )
+        self.local_histogram = torch.zeros(
+            config.num_experts, dtype=torch.int32, device=self.device
+        )
+        self._histogram_ones = torch.ones(
+            config.capacity, dtype=torch.int32, device=self.device
+        )
+
+    @property
+    def num_experts_per_rank(self) -> int:
+        """MoRI dispatch configuration for this prefill policy."""
+
+        return self.config.virtual_experts_per_rank
+
+    def plan(self, topk_experts: torch.Tensor) -> MoonEPPrefillRoutePlan:
+        expected = (self.config.num_tokens, self.config.top_k)
+        if tuple(topk_experts.shape) != expected:
+            raise ValueError(
+                f"topk_experts must have shape {expected}, got "
+                f"{tuple(topk_experts.shape)}"
+            )
+        if topk_experts.device != self.device:
+            raise ValueError(f"topk_experts must live on {self.device}")
+
+        topk_i32 = topk_experts.to(torch.int32).contiguous()
+        flat = topk_i32.reshape(-1).to(torch.int64)
+        self.local_histogram.zero_()
+        self.local_histogram.scatter_add_(0, flat, self._histogram_ones)
+        tokens_per_expert = self.histogram_exchange.publish(self.local_histogram)
+        return self.planner.build(topk_i32, tokens_per_expert)
+
+    def close(self) -> None:
+        if self._owns_exchange:
+            self.histogram_exchange.close()
+
+
+class MoonEPDecodePolicy:
+    """Owner-only decode policy with no global histogram or synchronization."""
+
+    def __init__(self, *, world_size: int, num_experts: int) -> None:
+        if world_size <= 0 or num_experts <= 0 or num_experts % world_size != 0:
+            raise ValueError("num_experts must be positive and divisible by world_size")
+        self.world_size = world_size
+        self.num_experts = num_experts
+        self.num_experts_per_rank = num_experts // world_size
+
+    def plan(self, topk_experts: torch.Tensor) -> MoonEPDecodeRoutePlan:
+        if topk_experts.dtype not in (torch.int32, torch.int64):
+            raise TypeError("topk_experts must be int32 or int64")
+        return MoonEPDecodeRoutePlan(
+            planned_topk_ids=topk_experts.to(torch.int32).contiguous(),
+            num_experts_per_rank=self.num_experts_per_rank,
+        )
+
+
+PrefillPolicy = MoonEPPrefillPolicy
+DecodePolicy = MoonEPDecodePolicy
+
+
 __all__ = [
+    "DecodePolicy",
+    "MoonEPDecodePolicy",
+    "MoonEPDecodeRoutePlan",
     "MoonEPFusedPlanner",
     "MoonEPGpuPlanner",
     "MoonEPPlanConfig",
+    "MoonEPPrefillPlanner",
+    "MoonEPPrefillPolicy",
+    "MoonEPPrefillRoutePlan",
     "MoonEPReferencePlan",
+    "MoonEPSymmetricHistogramExchange",
+    "PrefillPolicy",
     "build_plan_gpu",
+    "build_prefill_reference_plan",
     "build_reference_plan",
     "hipblaslt_grouped_gemm_reference",
     "hipblaslt_moonep_grouped_gemm_reference",

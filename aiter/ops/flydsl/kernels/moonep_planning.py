@@ -214,6 +214,7 @@ class MoonEPPlanGeometry:
         token_padding: int,
         num_dispatch_rows: int,
         no_migration: bool = False,
+        virtual_ids: bool = False,
         num_vblocks: int = 128,
         hist_waves_per_block: int = 4,
         dst_block_threads: int = 256,
@@ -248,6 +249,10 @@ class MoonEPPlanGeometry:
         # serve a handful. Skipping it also empties the migration groups, which
         # removes the second experts call and the prefetch entirely.
         self.NO_MIG = bool(no_migration)
+        self.VIRTUAL_IDS = bool(virtual_ids)
+        if self.VIRTUAL_IDS and self.NO_MIG:
+            raise ValueError("virtual-id prefill planning requires migration")
+        self.VS = self.epn + prefetch_slots
         self.NvS = num_dispatch_rows
         self.token_padding = token_padding
         self.G = num_experts + prefetch_slots
@@ -286,6 +291,7 @@ class MoonEPPlanGeometry:
             self.K,
             self.NvS,
             self.token_padding,
+            self.VIRTUAL_IDS,
             self.NV,
             self.EPV,
             self.hist_waves_per_block,
@@ -426,6 +432,7 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
     epn = geo.epn
     CAP = geo.CAP
     NO_MIG = geo.NO_MIG
+    VIRTUAL_IDS = geo.VIRTUAL_IDS
     NV = geo.NV
     G = geo.G
     RANK = geo.rank
@@ -465,7 +472,10 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
         tpe_prefix: fx.Int64,  # int32 [E] out scratch
         alloc_cumsum: fx.Int64,  # int32 [E, R] out scratch
         expert_off: fx.Int64,  # int32 [R, E] out scratch
+        expert_to_slot: fx.Int64,  # int32 [R, E] physical local slot
         alloc_out: fx.Int64,  # int32 [R, E] out
+        rank_route_counts: fx.Int64,  # int32 [R] out
+        residual_imbalance: fx.Int64,  # int32 [R] out
         experts_to_copy: fx.Int64,  # int32 [R, B] out
         cu_seqlens: fx.Int64,  # int32 [G] out (this rank)
         zero_fill: fx.Int64,  # int32 [G, 2] out (this rank)
@@ -487,13 +497,17 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
         p_rstat1 = lds.rstat1.ptr
         p_etc = lds.etc.ptr
         rstat1_base = fx.Int64(ptrtoint(p_rstat1))
+        alloc_base = fx.Int64(ptrtoint(p_alloc))
 
         tpe_rsrc = _addr_rsrc(tokens_per_expert)
         hist_rsrc = _addr_rsrc(local_hist)
         tpe_prefix_rsrc = _addr_rsrc(tpe_prefix)
         cumsum_rsrc = _addr_rsrc(alloc_cumsum)
         expert_off_rsrc = _addr_rsrc(expert_off)
+        expert_to_slot_rsrc = _addr_rsrc(expert_to_slot)
         alloc_out_rsrc = _addr_rsrc(alloc_out)
+        rank_route_counts_rsrc = _addr_rsrc(rank_route_counts)
+        residual_imbalance_rsrc = _addr_rsrc(residual_imbalance)
         etc_rsrc = _addr_rsrc(experts_to_copy)
         cu_rsrc = _addr_rsrc(cu_seqlens)
         zf_rsrc = _addr_rsrc(zero_fill)
@@ -552,7 +566,9 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
             e = i // fx.Int32(R)
             d = i - e * fx.Int32(R)
             home = e // fx.Int32(epn)
-            _lds_store(p_alloc, (d == home).select(_lds_load(p_ecount, e), fx.Int32(0)), i)
+            _lds_store(
+                p_alloc, (d == home).select(_lds_load(p_ecount, e), fx.Int32(0)), i
+            )
 
         gpu.barrier()
 
@@ -611,7 +627,9 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
             # Largest remaining receiver quota (first maximum on ties).
             q_in_range = lane < fx.Int32(R)
             q_val = q_in_range.select(
-                _lds_load(p_quota, home * fx.Int32(R) + q_in_range.select(lane, fx.Int32(0))),
+                _lds_load(
+                    p_quota, home * fx.Int32(R) + q_in_range.select(lane, fx.Int32(0))
+                ),
                 fx.Int32(_INT_MIN),
             )
             q_idx = q_in_range.select(lane, fx.Int32(1 << 30))
@@ -650,19 +668,6 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
 
         gpu.barrier()
 
-        # -- publish alloc and its per-expert cumulative sum over destinations -
-        for e in range(tid, fx.Int32(E), BLOCK):
-            acc = fx.Int32(0)
-            for d in range_constexpr(R):
-                acc = acc + _lds_load(p_alloc, e * fx.Int32(R) + fx.Int32(d))
-                buffer_ops.buffer_store(acc, cumsum_rsrc, e * fx.Int32(R) + fx.Int32(d))
-        for i in range(tid, fx.Int32(E * R), BLOCK):
-            e = i // fx.Int32(R)
-            d = i - e * fx.Int32(R)
-            buffer_ops.buffer_store(
-                _lds_load(p_alloc, i), alloc_out_rsrc, d * fx.Int32(E) + e
-            )
-
         # -- prefetch candidates: remote experts with a non-zero allocation ----
         for i in range(tid, fx.Int32(R * E), BLOCK):
             d = i // fx.Int32(E)
@@ -680,7 +685,9 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
         # Trash slot: absorbs the predicated "selected" write when no candidate
         # is left, so the selection loop needs no branch.
         for d in range(tid, fx.Int32(R), BLOCK):
-            _lds_store(p_key, fx.Int32(_KEY_NOT_CANDIDATE), d * fx.Int32(E + 1) + fx.Int32(E))
+            _lds_store(
+                p_key, fx.Int32(_KEY_NOT_CANDIDATE), d * fx.Int32(E + 1) + fx.Int32(E)
+            )
         # Slots with no candidate are never written by the selection below.
         for i in range(tid, fx.Int32(R * B), BLOCK):
             _lds_store(p_etc, fx.Int32(-1), i)
@@ -731,84 +738,162 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
                 _lds_store(p_key, fx.Int32(_KEY_SELECTED), key_base + cand_ids[c])
                 # remote_stats[:, 1] counts, per home rank, how many of its
                 # experts some destination prefetches.
-                _lds_atomic_add(
-                    rstat1_base, cand_ids[c] // fx.Int32(epn), fx.Int32(1)
+                _lds_atomic_add(rstat1_base, cand_ids[c] // fx.Int32(epn), fx.Int32(1))
+
+        gpu.barrier()
+
+        # A MoRI virtual destination has exactly E/R resident slots plus B
+        # dynamic slots.  The unconstrained balancing greedy may assign more
+        # than B distinct remote experts to one destination; those allocations
+        # cannot be represented by a physical id, so return them to the
+        # expert's owner.  This intentionally allows residual rank imbalance.
+        if VIRTUAL_IDS:
+            for i in range(tid, fx.Int32(R * E), BLOCK):
+                dest = i // fx.Int32(E)
+                expert = i - dest * fx.Int32(E)
+                owner = expert // fx.Int32(epn)
+                remote = owner != dest
+                selected = _lds_load(
+                    p_key, dest * fx.Int32(E + 1) + expert
+                ) == fx.Int32(_KEY_SELECTED)
+                alloc_slot = expert * fx.Int32(R) + dest
+                count = _lds_load(p_alloc, alloc_slot)
+                rollback = remote & (~selected) & (count > fx.Int32(0))
+                if rollback:
+                    _lds_store(p_alloc, fx.Int32(0), alloc_slot)
+                    _lds_atomic_add(
+                        alloc_base,
+                        expert * fx.Int32(R) + owner,
+                        count,
+                    )
+
+        gpu.barrier()
+
+        # Publish the final allocation only after the top-B rollback.  Build a
+        # destination-local slot map alongside it so the dst kernel can emit
+        # EPLB-style global physical ids directly.
+        for e in range(tid, fx.Int32(E), BLOCK):
+            acc = fx.Int32(0)
+            for d in range_constexpr(R):
+                acc = acc + _lds_load(p_alloc, e * fx.Int32(R) + fx.Int32(d))
+                buffer_ops.buffer_store(acc, cumsum_rsrc, e * fx.Int32(R) + fx.Int32(d))
+        for i in range(tid, fx.Int32(E * R), BLOCK):
+            expert = i // fx.Int32(R)
+            dest = i - expert * fx.Int32(R)
+            buffer_ops.buffer_store(
+                _lds_load(p_alloc, i), alloc_out_rsrc, dest * fx.Int32(E) + expert
+            )
+
+        if VIRTUAL_IDS:
+            for i in range(tid, fx.Int32(E * R), BLOCK):
+                expert = i // fx.Int32(R)
+                dest = i - expert * fx.Int32(R)
+                owner = expert // fx.Int32(epn)
+                slot = (owner == dest).select(
+                    expert - dest * fx.Int32(epn), fx.Int32(-1)
+                )
+                for prefetch_slot in range_constexpr(B):
+                    selected_expert = _lds_load(
+                        p_etc, dest * fx.Int32(B) + fx.Int32(prefetch_slot)
+                    )
+                    slot = (selected_expert == expert).select(
+                        fx.Int32(epn + prefetch_slot), slot
+                    )
+                buffer_ops.buffer_store(
+                    slot, expert_to_slot_rsrc, dest * fx.Int32(E) + expert
                 )
 
-        gpu.barrier()
-
-        # -- physical layout for destination ``dest_rank`` ---------------------
-        # Groups [0, E) are the global expert groups (minus the ones promoted to
-        # a prefetch slot); groups [E, E + B) are the prefetch slots.
-        counts = []
-        paddeds = []
-        experts = []
-        lane_total = fx.Int32(0)
-        for t in range_constexpr(GPL):
-            g = lane * fx.Int32(GPL) + fx.Int32(t)
-            in_range = g < fx.Int32(G)
-            safe_g = in_range.select(g, fx.Int32(0))
-            is_slot = safe_g >= fx.Int32(E)
-            slot = is_slot.select(safe_g - fx.Int32(E), fx.Int32(0))
-            slot_expert = _lds_load(p_etc, dest_rank * fx.Int32(B) + slot)
-            selected = _lds_load(p_key, key_base + is_slot.select(fx.Int32(E), safe_g)) == fx.Int32(
-                _KEY_SELECTED
-            )
-
-            expert = is_slot.select(slot_expert, selected.select(fx.Int32(-1), safe_g))
-            expert = in_range.select(expert, fx.Int32(-1))
-            has_expert = expert >= fx.Int32(0)
-            safe_expert = has_expert.select(expert, fx.Int32(0))
-            cnt = has_expert.select(
-                _lds_load(p_alloc, safe_expert * fx.Int32(R) + dest_rank), fx.Int32(0)
-            )
-            padded = (cnt > fx.Int32(0)).select(
-                ((cnt + fx.Int32(TP - 1)) // fx.Int32(TP)) * fx.Int32(TP), fx.Int32(0)
-            )
-            counts.append(cnt)
-            paddeds.append(padded)
-            experts.append(expert)
-            lane_total = lane_total + padded
-
-        lane_base = _wave_inclusive_prefix_sum(lane_total, lane) - lane_total
-
-        running = lane_base
-        for t in range_constexpr(GPL):
-            g = lane * fx.Int32(GPL) + fx.Int32(t)
-            in_range = g < fx.Int32(G)
-            cnt = counts[t]
-            padded = paddeds[t]
-            expert = experts[t]
-            has_expert = expert >= fx.Int32(0)
-            nonempty = cnt > fx.Int32(0)
-
-            start = running
-            end = start + cnt
-            padded_end = start + padded
-
-            if in_range:
-                if nonempty:
-                    buffer_ops.buffer_store(
-                        start,
-                        expert_off_rsrc,
-                        dest_rank * fx.Int32(E) + has_expert.select(expert, fx.Int32(0)),
+            if tid < fx.Int32(R):
+                route_count = fx.Int32(0)
+                for expert in range(fx.Int32(0), fx.Int32(E), 1):
+                    route_count = route_count + _lds_load(
+                        p_alloc, expert * fx.Int32(R) + tid
                     )
-                if dest_rank == fx.Int32(RANK):
-                    buffer_ops.buffer_store(padded_end, cu_rsrc, g)
-                    buffer_ops.buffer_store(
-                        nonempty.select(expert, fx.Int32(-1)), gei_rsrc, g
-                    )
-                    buffer_ops.buffer_store(
-                        nonempty.select(end, fx.Int32(0)), zf_rsrc, g * fx.Int32(2)
-                    )
-                    buffer_ops.buffer_store(
-                        nonempty.select(padded - cnt, fx.Int32(0)),
-                        zf_rsrc,
-                        g * fx.Int32(2) + fx.Int32(1),
-                    )
-            running = padded_end
+                buffer_ops.buffer_store(route_count, rank_route_counts_rsrc, tid)
+                buffer_ops.buffer_store(
+                    route_count - fx.Int32(CAP), residual_imbalance_rsrc, tid
+                )
 
-        gpu.barrier()
+        if not VIRTUAL_IDS:
+            # Legacy grouped-row layout.  PrefillPolicy deliberately skips all
+            # of this work: MoRI needs only physical ids and does its own token
+            # packing before the ordinary fused_moe path.
+            counts = []
+            paddeds = []
+            experts = []
+            lane_total = fx.Int32(0)
+            for t in range_constexpr(GPL):
+                g = lane * fx.Int32(GPL) + fx.Int32(t)
+                in_range = g < fx.Int32(G)
+                safe_g = in_range.select(g, fx.Int32(0))
+                is_slot = safe_g >= fx.Int32(E)
+                slot = is_slot.select(safe_g - fx.Int32(E), fx.Int32(0))
+                slot_expert = _lds_load(p_etc, dest_rank * fx.Int32(B) + slot)
+                selected = _lds_load(
+                    p_key, key_base + is_slot.select(fx.Int32(E), safe_g)
+                ) == fx.Int32(_KEY_SELECTED)
+
+                expert = is_slot.select(
+                    slot_expert, selected.select(fx.Int32(-1), safe_g)
+                )
+                expert = in_range.select(expert, fx.Int32(-1))
+                has_expert = expert >= fx.Int32(0)
+                safe_expert = has_expert.select(expert, fx.Int32(0))
+                cnt = has_expert.select(
+                    _lds_load(p_alloc, safe_expert * fx.Int32(R) + dest_rank),
+                    fx.Int32(0),
+                )
+                padded = (cnt > fx.Int32(0)).select(
+                    ((cnt + fx.Int32(TP - 1)) // fx.Int32(TP)) * fx.Int32(TP),
+                    fx.Int32(0),
+                )
+                counts.append(cnt)
+                paddeds.append(padded)
+                experts.append(expert)
+                lane_total = lane_total + padded
+
+            lane_base = _wave_inclusive_prefix_sum(lane_total, lane) - lane_total
+
+            running = lane_base
+            for t in range_constexpr(GPL):
+                g = lane * fx.Int32(GPL) + fx.Int32(t)
+                in_range = g < fx.Int32(G)
+                cnt = counts[t]
+                padded = paddeds[t]
+                expert = experts[t]
+                has_expert = expert >= fx.Int32(0)
+                nonempty = cnt > fx.Int32(0)
+
+                start = running
+                end = start + cnt
+                padded_end = start + padded
+
+                if in_range:
+                    if nonempty:
+                        buffer_ops.buffer_store(
+                            start,
+                            expert_off_rsrc,
+                            dest_rank * fx.Int32(E)
+                            + has_expert.select(expert, fx.Int32(0)),
+                        )
+                    if dest_rank == fx.Int32(RANK):
+                        buffer_ops.buffer_store(padded_end, cu_rsrc, g)
+                        buffer_ops.buffer_store(
+                            nonempty.select(expert, fx.Int32(-1)), gei_rsrc, g
+                        )
+                        buffer_ops.buffer_store(
+                            nonempty.select(end, fx.Int32(0)),
+                            zf_rsrc,
+                            g * fx.Int32(2),
+                        )
+                        buffer_ops.buffer_store(
+                            nonempty.select(padded - cnt, fx.Int32(0)),
+                            zf_rsrc,
+                            g * fx.Int32(2) + fx.Int32(1),
+                        )
+                running = padded_end
+
+            gpu.barrier()
 
         # -- publish experts_to_copy and this rank's remote_stats --------------
         for i in range(tid, fx.Int32(R * B), BLOCK):
@@ -836,14 +921,16 @@ def make_moonep_plan_dst_kernel(geo: MoonEPPlanGeometry):
     R = geo.R
     E = geo.E
     K = geo.K
-    S = geo.S
     EPV = geo.EPV
     NvS = geo.NvS
+    VS = geo.VS
+    VIRTUAL_IDS = geo.VIRTUAL_IDS
     BLOCK = geo.dst_block_threads
     GRID = geo.dst_blocks
 
     @flyc.kernel(
-        name=f"moonep_plan_dst_r{R}_e{E}_k{K}_nvs{NvS}_epv{EPV}",
+        name=f"moonep_plan_dst_r{R}_e{E}_k{K}_nvs{NvS}_epv{EPV}"
+        + ("_virtual" if VIRTUAL_IDS else ""),
         known_block_size=[BLOCK, 1, 1],
     )
     def dst_kernel(
@@ -853,6 +940,7 @@ def make_moonep_plan_dst_kernel(geo: MoonEPPlanGeometry):
         tpe_prefix: fx.Int64,  # int32 [E]
         alloc_cumsum: fx.Int64,  # int32 [E, R]
         expert_off: fx.Int64,  # int32 [R, E]
+        expert_to_slot: fx.Int64,  # int32 [R, E]
         dst: fx.Int64,  # int32 [S, K] out
         num_tokens: fx.Int32,
     ):
@@ -862,6 +950,7 @@ def make_moonep_plan_dst_kernel(geo: MoonEPPlanGeometry):
         prefix_rsrc = _addr_rsrc(tpe_prefix)
         cumsum_rsrc = _addr_rsrc(alloc_cumsum)
         expert_off_rsrc = _addr_rsrc(expert_off)
+        expert_to_slot_rsrc = _addr_rsrc(expert_to_slot)
         dst_rsrc = _addr_rsrc(dst)
 
         gid = fx.Int32(fx.block_idx.x) * fx.Int32(BLOCK) + fx.Int32(fx.thread_idx.x)
@@ -896,25 +985,38 @@ def make_moonep_plan_dst_kernel(geo: MoonEPPlanGeometry):
                     found = found | hit
                     acc_prev = cum
 
-                local_offset = (
-                    buffer_load_i32(expert_off_rsrc, dest * fx.Int32(E) + expert)
-                    + global_index
-                    - prev
-                )
-                raws.append(dest * fx.Int32(NvS) + local_offset)
+                if VIRTUAL_IDS:
+                    local_slot = buffer_load_i32(
+                        expert_to_slot_rsrc, dest * fx.Int32(E) + expert
+                    )
+                    raws.append(dest * fx.Int32(VS) + local_slot)
+                else:
+                    local_offset = (
+                        buffer_load_i32(expert_off_rsrc, dest * fx.Int32(E) + expert)
+                        + global_index
+                        - prev
+                    )
+                    raws.append(dest * fx.Int32(NvS) + local_offset)
                 dests.append(dest)
 
             for k in range_constexpr(K):
-                # The first entry per destination rank keeps the payload; later
-                # ones encode -raw - 1 and carry weights only.
-                is_dup = _false()
-                for j in range_constexpr(k):
-                    is_dup = is_dup | (dests[j] == dests[k])
-                buffer_ops.buffer_store(
-                    is_dup.select(fx.Int32(0) - raws[k] - fx.Int32(1), raws[k]),
-                    dst_rsrc,
-                    token * fx.Int32(K) + fx.Int32(k),
-                )
+                if VIRTUAL_IDS:
+                    # MoRI performs destination-rank payload dedup itself and
+                    # still needs every positive physical id for expert routing.
+                    buffer_ops.buffer_store(
+                        raws[k], dst_rsrc, token * fx.Int32(K) + fx.Int32(k)
+                    )
+                else:
+                    # The first entry per destination rank keeps the payload;
+                    # later ones encode -raw - 1 and carry weights only.
+                    is_dup = _false()
+                    for j in range_constexpr(k):
+                        is_dup = is_dup | (dests[j] == dests[k])
+                    buffer_ops.buffer_store(
+                        is_dup.select(fx.Int32(0) - raws[k] - fx.Int32(1), raws[k]),
+                        dst_rsrc,
+                        token * fx.Int32(K) + fx.Int32(k),
+                    )
 
     return dst_kernel
 
@@ -960,7 +1062,10 @@ def make_moonep_plan_jit(geo: MoonEPPlanGeometry):
         tpe_prefix: fx.Int64,
         alloc_cumsum: fx.Int64,
         expert_off: fx.Int64,
+        expert_to_slot: fx.Int64,
         alloc_out: fx.Int64,
+        rank_route_counts: fx.Int64,
+        residual_imbalance: fx.Int64,
         experts_to_copy: fx.Int64,
         cu_seqlens: fx.Int64,
         zero_fill: fx.Int64,
@@ -975,7 +1080,10 @@ def make_moonep_plan_jit(geo: MoonEPPlanGeometry):
             tpe_prefix,
             alloc_cumsum,
             expert_off,
+            expert_to_slot,
             alloc_out,
+            rank_route_counts,
+            residual_imbalance,
             experts_to_copy,
             cu_seqlens,
             zero_fill,
@@ -995,6 +1103,7 @@ def make_moonep_plan_jit(geo: MoonEPPlanGeometry):
         tpe_prefix: fx.Int64,
         alloc_cumsum: fx.Int64,
         expert_off: fx.Int64,
+        expert_to_slot: fx.Int64,
         dst: fx.Int64,
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -1007,6 +1116,7 @@ def make_moonep_plan_jit(geo: MoonEPPlanGeometry):
             tpe_prefix,
             alloc_cumsum,
             expert_off,
+            expert_to_slot,
             dst,
             num_tokens,
         ).launch(
