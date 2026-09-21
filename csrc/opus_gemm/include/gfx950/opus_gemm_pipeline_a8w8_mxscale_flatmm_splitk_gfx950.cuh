@@ -226,6 +226,28 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
 // The 128 arm keeps pack_e8m0x4. Its upper three bytes are equally unread (see
 // that function's own note), so it could go there too, but that is a separate
 // claim about a path this work is meant to leave alone.
+// First B scale group this consumer N-wave's columns fall in.
+//
+// v_sfb holds only the wave's own groups, so this is where the wave's N offset
+// lives and the subtile loop can keep indexing locally. Consumer wave w owns
+// subtiles w*COM_REP_N .. +COM_REP_N, which is the same map the C store uses
+// (see the nbc note), and the scale index is the only place it was missing:
+// every wave read groups 0.. and wave 1 got wave 0's scales. Invisible at
+// GROUP_N=128, where a tile spanned one group and every candidate index
+// floored to 0.
+//
+// A literal 0 when one wave owns the tile's whole N extent, which is every
+// T_N == 1 kid.
+template<typename T>
+__attribute__((always_inline)) OPUS_D int sfb_group_base(int wave_id_n) {
+    if constexpr (T::T_N == 1) {
+        (void)wave_id_n;
+        return 0;
+    } else {
+        return wave_id_n * T::COM_REP_N / T::SFB_REP_N;
+    }
+}
+
 template<typename T, typename S>
 __attribute__((always_inline)) OPUS_D int sf_scale_word(S scale) {
     if constexpr (T::SF_PER_MFMA_K == 1) {
@@ -346,8 +368,9 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
     static_assert((T::COM_REP_M == 1 || T::COM_REP_M == 2 || T::COM_REP_M == 4)
                   && (T::COM_REP_K == 1 || T::COM_REP_K == 2 || T::COM_REP_K == 4));
     static_assert(T::B_K % T::GROUP_K == 0);
-    constexpr int rep_n_per_scale = T::GROUP_N / (T::W_N * T::T_N);
-    static_assert(rep_n_per_scale > 0 && T::GROUP_N % (T::W_N * T::T_N) == 0);
+    // Subtiles per B scale group. v_sfb holds only this wave's groups, so the
+    // index below stays local and the wave's offset lives in the load.
+    constexpr int rep_n_per_scale = T::SFB_REP_N;
     // Whole register tile in a single scale group -> one (scale_a, scale_b) pair
     // -> a single tiled-mma call covers the tile.
     if constexpr (T::COM_REP_M == 1 && T::COM_REP_N <= rep_n_per_scale && T::COM_REP_K == 1) {
@@ -362,7 +385,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
         // with or slightly slower than preload's broadcast pack across the tuned
         // shapes, so preload stays the default. Kept for experimentation.
         opus::vector_t<int, T::COM_REP_M> packed_sfa;
-        opus::vector_t<int, T::N_SCALE_GROUPS> packed_sfb;
+        opus::vector_t<int, T::SFB_GROUPS_PER_WAVE> packed_sfb;
         opus::static_for<T::COM_REP_M>([&](auto im_c) {
             constexpr int im = decltype(im_c)::value;
             int w = 0;
@@ -372,7 +395,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             });
             packed_sfa[im] = w;
         });
-        opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+        opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
             int w = 0;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
@@ -390,7 +413,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
             });
     } else if constexpr (MODE == mxscale_pack::preload) {
         opus::vector_t<int, T::COM_REP_M * T::COM_REP_K> packed_sfa;
-        opus::vector_t<int, T::N_SCALE_GROUPS * T::COM_REP_K> packed_sfb;
+        opus::vector_t<int, T::SFB_GROUPS_PER_WAVE * T::COM_REP_K> packed_sfb;
         opus::static_for<T::COM_REP_M>([&](auto im_c) {
             constexpr int im = decltype(im_c)::value;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
@@ -399,7 +422,7 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
                     sf_scale_word<T>(v_sfa[im * T::SF_LANE_SCALES_PER_BK + ik]);
             });
         });
-        opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+        opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
@@ -638,7 +661,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         clear(v_c);
 
         using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_WAVE * T::SF_LANE_SCALES_PER_BK>;
 
         auto issue_a_tile = [&](int loop_k) {
             const int slot = wave_id_m * T::prefetch_k_iter + (loop_k % T::prefetch_k_iter);
@@ -665,9 +688,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         auto load_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
             const int scale_base = loop_k * T::SCALES_PER_BK;
             v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
-            opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+            opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             s_waitcnt_vmcnt(0_I);
@@ -876,7 +899,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         clear(v_c);
 
         using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_WAVE * T::SF_LANE_SCALES_PER_BK>;
         constexpr int ds_read_insts = T::a_ds_read_insts + T::b_ds_read_insts;
 
         auto load_scale_regs = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
@@ -888,9 +911,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 // as one dword (ds_read_b32) instead of SCALES_PER_BK byte reads.
                 auto sm_a = make_smem(s_sfa_ptr + scale_base);
                 v_sfa = load<T::SF_LANE_LOAD_VEC>(sm_a, u_sfa_lds);
-                opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+                opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    auto sm_b = make_smem(s_sfb_ptr + ng * sf_k_scales + scale_base);
+                    auto sm_b = make_smem(s_sfb_ptr
+                                          + (sfb_group_base<T>(wave_id_n_cons) + ng)
+                                                * sf_k_scales + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -899,9 +924,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 // read as one dword (buffer_load_b32) rather than SCALES_PER_BK
                 // separate buffer_load_ubyte. SFB already loads b32 the same way.
                 v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
-                opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+                opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
             }
@@ -1347,7 +1372,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
         typename decltype(mma)::vtype_c v_c;
 
         using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_WAVE * T::SF_LANE_SCALES_PER_BK>;
         constexpr int ds_read_insts = T::a_ds_read_insts + T::b_ds_read_insts;
 
         auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
@@ -1367,9 +1392,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
                 const int scale_base = loop_k * T::SCALES_PER_BK;
                 vtype_sfa v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
                 vtype_sfb v_sfb;
-                opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+                opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
                 if constexpr (!SKIP_SCALE_WAIT) {
@@ -1638,7 +1663,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
         typename decltype(mma)::vtype_c v_c[MI];
 
         using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
-        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_WAVE * T::SF_LANE_SCALES_PER_BK>;
 
         auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
                                           wave_id_n_cons, lane_id / mma.grpn_c);
@@ -1669,9 +1694,9 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
 
             const int scale_base = k * T::SCALES_PER_BK;
             vtype_sfb v_sfb;
-            opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+            opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             opus::static_for<MI>([&](auto mi_c) {
@@ -1834,7 +1859,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
     typename decltype(mma)::vtype_c v_c;
     clear(v_c);
     using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
-    using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
+    using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_WAVE * T::SF_LANE_SCALES_PER_BK>;
 
     __builtin_amdgcn_s_barrier();
     {
@@ -1849,9 +1874,13 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
         const int scale_base = k * T::SCALES_PER_BK;
         vtype_sfa v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
         vtype_sfb v_sfb;
-        opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+        opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
-            load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+            // This kernel splits its waves over M and phase, never N, so there is no
+            // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
+            // instantiation would read wave 0's scale groups from every wave.
+            static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
+            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         s_waitcnt_vmcnt(0_I);
@@ -1980,7 +2009,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
     typename decltype(mma)::vtype_c v_c;
     clear(v_c);
     using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
-    using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SF_LANE_SCALES_PER_BK>;
+    using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_WAVE * T::SF_LANE_SCALES_PER_BK>;
 
     auto issue_tile = [&](int loop_k) {
         const int slot = loop_k & 1;
@@ -2002,9 +2031,13 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
     auto load_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
         const int scale_base = loop_k * T::SCALES_PER_BK;
         v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
-        opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+        opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
-            load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
+            // This kernel splits its waves over M and phase, never N, so there is no
+            // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
+            // instantiation would read wave 0's scale groups from every wave.
+            static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
+            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         if constexpr (!SKIP_SCALE_WAIT) {

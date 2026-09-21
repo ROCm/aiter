@@ -290,12 +290,26 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // quarter would make them adjacent again.
     static constexpr int SF_LANE_LOAD_VEC = SF_PER_MFMA_K == 1 ? SF_LANE_SCALES_PER_BK : 1;
     static constexpr int N_SCALE_GROUPS = (B_N + GROUP_N - 1) / GROUP_N;
+    // N subtiles sharing one B scale group: GROUP_N columns per group over W_N
+    // per subtile. T_N is deliberately absent. It used to be in this denominator
+    // and does not belong -- T_N partitions subtiles across consumer waves, it
+    // does not widen a subtile -- and the error was invisible while a tile held
+    // one group, because both forms then floor to 0.
+    static_assert(GROUP_N % W_N == 0, "a B scale group must be whole subtiles");
+    static constexpr int SFB_REP_N = GROUP_N / W_N;
+    // A consumer N-wave owns COM_REP_N contiguous subtiles, so it needs this
+    // many groups, starting at wave_id_n * COM_REP_N / SFB_REP_N. Holding only
+    // its own share is what lets the subtile loop keep indexing v_sfb locally.
+    static_assert(COM_REP_N % SFB_REP_N == 0 || SFB_REP_N % COM_REP_N == 0,
+                  "an N-wave must not straddle a partial B scale group");
+    static constexpr int SFB_GROUPS_PER_WAVE =
+        COM_REP_N >= SFB_REP_N ? COM_REP_N / SFB_REP_N : 1;
     // The bound the old B_N <= 2 * GROUP_N was standing in for. What a finer
     // GROUP_N really costs is v_sfb, one byte per (group, MFMA) in the lane:
     // 2 bytes for today's widest 128-column kid, 8 for a B_N=128 tile at
     // GROUP_N=GROUP_K=32. Sized against the lane's share, not SCALES_PER_BK,
     // which is why separating the two mattered.
-    static_assert(N_SCALE_GROUPS * SF_LANE_SCALES_PER_BK <= 64,
+    static_assert(SFB_GROUPS_PER_WAVE * SF_LANE_SCALES_PER_BK <= 64,
                   "the B scale vector would cost more than 16 VGPRs a lane");
 
     static_assert(VEC_A == 16 / sizeof(D_A));
