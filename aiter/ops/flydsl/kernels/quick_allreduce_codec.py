@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""INT4, INT6 and FP16 wire codecs for quick-allreduce.
+"""INT4, INT5, INT6 and FP16 wire codecs for quick-allreduce.
 
 A rank-tile is 256 threads x one 16 B atom, quantized in packed fp16 with a
-group-16 signed E4M3 scale. INT4 is one nibble plane; INT6 adds a dense 2-bit
-plane, which keeps the nibble plane byte-identical to INT4's and every region
-on the 64 B fabric sector grid. FP16 is a passthrough wire format -- the
+group-16 signed E4M3 scale. INT4 is one nibble plane; INT5/INT6 add a dense
+1-bit or 2-bit plane on the same 64 B sector grid, which keeps the nibble
+plane byte-identical to INT4's. FP16 is a passthrough wire format -- the
 thread's eight fp16 values verbatim, no quantization -- used to test the
 reduce-scatter/all-gather transport in isolation from the codec.
 
@@ -37,11 +37,11 @@ N_SECTORS = RANK_TILE_BYTES // 64
 # Dequant bit-trick: code | 0x6400 then + (-(1024+bias)) as f16x2 reconstructs
 # (q - bias). fp16 with exponent field 1024.0 holds the integer in its low
 # mantissa bits, so this works for any field that fits below bit 10 -- 4 bits
-# with bias 8, 6 bits with bias 32.
+# with bias 8, 5 bits with bias 16, 6 bits with bias 32.
 _K_MASK_000F = 0x000F000F
-_K_MASK_0003 = 0x00030003
 _K_HALF2_1024 = 0x64006400
 _K_HALF2_1032 = 0xE408E408  # -1032.0 fp16x2 = -(1024 + 8)
+_K_HALF2_1040 = 0xE410E410  # -1040.0 fp16x2 = -(1024 + 16)
 _K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
 
 # Largest finite fp16. The encode scale is materialised as fp16, so anything
@@ -58,12 +58,12 @@ class Codec:
     onto ``-bias`` -- that is what uses the asymmetric range fully. The
     decoding factor is therefore ``-1/bias``.
 
-    INT6 is INT4's nibble plane plus a dense 2-bit plane, rather than a 48-bit
-    field per thread. A 48-bit field straddles i32 boundaries and leaves the
-    regions off the 64 B fabric sector grid; two planes keep every region
-    sector-aligned (16 + 8 + 2 = 26) and leave the nibble plane byte-identical
-    to INT4's, so ``_fanout_to_next`` needs nothing but a different sector
-    count.
+    INT5/INT6 are INT4's nibble plane plus a dense extra-bit plane, rather
+    than a 5- or 6-bit field per thread. A packed odd-width field straddles
+    i32 boundaries and leaves the regions off the 64 B fabric sector grid;
+    two planes keep every region sector-aligned (INT5: 16 + 4 + 2 = 22;
+    INT6: 16 + 8 + 2 = 26) and leave the nibble plane byte-identical to
+    INT4's, so fanout needs nothing but a different sector count.
     """
 
     name: str
@@ -71,8 +71,8 @@ class Codec:
     bias: int | None
     #: fp16x2 constant added after the ``| 0x6400`` trick: -(1024 + bias).
     dequant_bias: int | None
-    #: i32 offset of the dense 2-bit plane in the rank-tile; None when the
-    #: codec has only a nibble plane.
+    #: i32 offset of the dense extra-bit plane (INT5 1-bit, INT6 2-bit);
+    #: None when the codec has only a nibble plane.
     hi2_i32_off: int | None
     scale_i32_off: int | None
     rank_tile_i32: int
@@ -103,6 +103,21 @@ class Codec:
     def n_sectors(self) -> int:
         return self.rank_tile_bytes // 64
 
+    @property
+    def hi_bits(self) -> int | None:
+        """Width of the extra plane, or ``None`` when there is none."""
+        if self.hi2_i32_off is None:
+            return None
+        return self.bits - 4
+
+    @property
+    def hi_share(self) -> int:
+        """Threads that share one extra-plane i32 (8 values × ``hi_bits`` each).
+
+        INT6 is 16 bits/thread → 2 threads; INT5 is 8 bits/thread → 4.
+        """
+        return 32 // (8 * self.hi_bits)
+
     def plane_slots(self, tid):
         """``[(i32 offset within the rank-tile, store predicate)]``, one per
         payload word, in the order :func:`_codec_quant` returns them.
@@ -110,15 +125,15 @@ class Codec:
         The offset is where this thread's word lives; the predicate says
         whether this thread is the one that stores it -- a Python ``True``
         when every thread owns its word (INT4's nibble plane, fp16's four
-        dense planes), or ``hi2_leader`` when a lane pair shares one slot
-        (INT6's 2-bit plane). A load ignores the predicate: every thread reads
-        a plane's word regardless of who wrote it.
+        dense planes), or the extra-plane leader when a lane pair (INT6) or
+        quartet (INT5) shares one slot. A load ignores the predicate: every
+        thread reads a plane's word regardless of who wrote it.
         """
         if self.n_words_per_thread == 1:
             return [(tid, True)]
         if self.hi2_i32_off is not None:
-            hi2_leader, hi2_slot = hi2_slot_of(tid)
-            return [(tid, True), (fx.Int32(self.hi2_i32_off) + hi2_slot, hi2_leader)]
+            hi_leader, hi_slot = hi_slot_of(tid, self.hi_share)
+            return [(tid, True), (fx.Int32(self.hi2_i32_off) + hi_slot, hi_leader)]
         # Dense multi-word codec (fp16): every thread owns every word, at a
         # fixed stride of one rank-tile row (BLOCK i32) per word.
         return [
@@ -137,6 +152,17 @@ INT4 = Codec(
     scale_i32_off=SCALE_I32_OFF,
     rank_tile_i32=RANK_TILE_I32,
     n_words_per_thread=1,
+)
+# 1024 B nibbles, 256 B 1-bit plane, 128 B scale; 1408 B rank-tile, 22 sectors.
+INT5 = Codec(
+    name="int5",
+    bits=5,
+    bias=16,
+    dequant_bias=_K_HALF2_1040,
+    hi2_i32_off=256,
+    scale_i32_off=320,
+    rank_tile_i32=352,
+    n_words_per_thread=2,
 )
 # 1024 B nibbles, 512 B 2-bit plane, 128 B scale; 1664 B rank-tile, 26 sectors.
 INT6 = Codec(
@@ -161,7 +187,7 @@ FP16 = Codec(
     rank_tile_i32=BLOCK * 4,
     n_words_per_thread=4,
 )
-CODECS = {c.name: c for c in (INT4, INT6, FP16)}
+CODECS = {c.name: c for c in (INT4, INT5, INT6, FP16)}
 
 
 def thread_lane(tid):
@@ -192,18 +218,18 @@ def scale_slot_of(tid):
     return scale_slot, pair_in_slot
 
 
-def hi2_slot_of(tid):
-    """(hi2_leader, hi2_slot) for INT6's dense 2-bit plane.
+def hi_slot_of(tid, share):
+    """(hi_leader, hi_slot) for the extra-bit plane.
 
-    Threads ``2t`` and ``2t+1`` share one i32 of that plane (see
-    :func:`_compact_hi2`); ``hi2_leader`` is whether this thread is the even
-    one that stores it, ``hi2_slot`` is which i32. Meaningless for INT4
-    (``codec.n_words_per_thread == 1``), so callers that only ever run INT4 need not
-    call this at all.
+    ``share`` threads compact into one i32 (2 for INT6, 4 for INT5; see
+    :func:`_compact_hi`). ``hi_leader`` is the lowest-tid thread of that
+    group, the one that stores the word; ``hi_slot`` is which i32.
+    Meaningless for INT4, so callers that only ever run INT4 need not call
+    this at all.
     """
-    hi2_leader = (tid & fx.Int32(1)) == fx.Int32(0)
-    hi2_slot = tid.shrui(fx.Int32(1))
-    return hi2_leader, hi2_slot
+    hi_leader = (tid & fx.Int32(share - 1)) == fx.Int32(0)
+    hi_slot = tid.shrui(fx.Int32(share.bit_length() - 1))
+    return hi_leader, hi_slot
 
 
 def _scale_from_word(codec, word, pair_in_slot):
@@ -358,12 +384,14 @@ def _quant_atom_fp16(codec, atom, enc_pk):
             | (q[3] << fx.Int32(12)),
         )
     # Every code is masked here. In INT4 each field already fills its whole
-    # nibble, so the shift-or cannot collide; a 6-bit code would overrun its
-    # neighbour's slot if left whole.
+    # nibble, so the shift-or cannot collide; a 5- or 6-bit code would overrun
+    # its neighbour's slot if left whole.
+    hi_bits = codec.hi_bits
+    hi_mask = (1 << hi_bits) - 1
     m4 = fx.Int32(_K_MASK_000F)
-    m2 = fx.Int32(_K_MASK_0003)
+    m_hi = fx.Int32(hi_mask | (hi_mask << 16))
     lo4 = [qi & m4 for qi in q]
-    hi2 = [qi.shrui(fx.Int32(4)) & m2 for qi in q]
+    hi = [qi.shrui(fx.Int32(4)) & m_hi for qi in q]
     packed_lo = (
         lo4[0]
         | (lo4[1] << fx.Int32(4))
@@ -371,37 +399,61 @@ def _quant_atom_fp16(codec, atom, enc_pk):
         | (lo4[3] << fx.Int32(12))
     )
     packed_hi = (
-        hi2[0]
-        | (hi2[1] << fx.Int32(2))
-        | (hi2[2] << fx.Int32(4))
-        | (hi2[3] << fx.Int32(6))
+        hi[0]
+        | (hi[1] << fx.Int32(hi_bits))
+        | (hi[2] << fx.Int32(2 * hi_bits))
+        | (hi[3] << fx.Int32(3 * hi_bits))
     )
     return (packed_lo, packed_hi)
 
 
-def _compact_hi2(packed_hi, lane):
-    """Two threads' 2-bit planes into the single i32 they share on the wire.
+def _compact_hi(packed_hi, lane, hi_bits):
+    """``share`` threads' extra-bit planes into the single i32 they share.
 
-    ``packed_hi`` carries its 8 live bits at [0..7] and [16..23] -- the f16x2
-    pairing puts a thread's even elements in the low half of every i32 and its
-    odd ones in the high half. Squeeze those to 16 dense bits, then merge with
-    the xor-1 neighbour. Both lanes of the pair compute the same word; only the
-    even one stores it, at ``hi2_i32_off + (tid >> 1)``.
+    ``packed_hi`` carries its live bits in each f16 half -- the f16x2 pairing
+    puts a thread's even elements in the low half of every i32 and its odd
+    ones in the high half. Squeeze those to ``8 * hi_bits`` dense bits, then
+    butterfly-merge with xor-1 (and xor-2 when four threads share, INT5).
+    Every lane of the group computes the same word; only the leader stores
+    it, at ``hi2_i32_off + (tid >> log2(share))``.
 
-    ``lane & 1 == tid & 1``, so this is the same pairing
-    :func:`_pair_signed_ext_f16` already uses for the group-16 extremum -- no
-    second convention is introduced.
+    The xor-1 step is the same pairing :func:`_pair_signed_ext_f16` already
+    uses for the group-16 extremum -- no second convention is introduced.
     """
-    c = (packed_hi & fx.Int32(0xFF)) | (packed_hi.shrui(fx.Int32(8)) & fx.Int32(0xFF00))
-    other = fx.Int32(gpu.shuffle_xor(c, 1, WAVE))
-    is_even = (lane & fx.Int32(1)) == fx.Int32(0)
-    return is_even.select(c | (other << fx.Int32(16)), other | (c << fx.Int32(16)))
+    n_lo = 4 * hi_bits
+    mask_lo = (1 << n_lo) - 1
+    c = (packed_hi & fx.Int32(mask_lo)) | (
+        packed_hi.shrui(fx.Int32(16 - n_lo)) & fx.Int32(mask_lo << n_lo)
+    )
+    word = c
+    thread_bits = 8 * hi_bits
+    share = 4 // hi_bits
+    shift = thread_bits
+    xor_off = 1
+    while xor_off < share:
+        other = fx.Int32(gpu.shuffle_xor(word, xor_off, WAVE))
+        is_lo = (lane & fx.Int32(xor_off)) == fx.Int32(0)
+        word = is_lo.select(
+            word | (other << fx.Int32(shift)),
+            other | (word << fx.Int32(shift)),
+        )
+        shift *= 2
+        xor_off *= 2
+    return word
 
 
-def _expand_hi2(word, tid):
-    """Inverse of :func:`_compact_hi2`, for the calling thread's half."""
-    c = word.shrui((tid & fx.Int32(1)) * fx.Int32(16)) & fx.Int32(0xFFFF)
-    return (c & fx.Int32(0xFF)) | ((c & fx.Int32(0xFF00)) << fx.Int32(8))
+def _expand_hi(word, tid, hi_bits):
+    """Inverse of :func:`_compact_hi`, for the calling thread's slice."""
+    thread_bits = 8 * hi_bits
+    share = 4 // hi_bits
+    n_lo = 4 * hi_bits
+    mask_lo = (1 << n_lo) - 1
+    c = word.shrui((tid & fx.Int32(share - 1)) * fx.Int32(thread_bits)) & fx.Int32(
+        (1 << thread_bits) - 1
+    )
+    return (c & fx.Int32(mask_lo)) | (
+        (c & fx.Int32(mask_lo << n_lo)) << fx.Int32(16 - n_lo)
+    )
 
 
 def _codec_quant(codec, atom, lane, tid):
@@ -426,8 +478,8 @@ def _codec_quant(codec, atom, lane, tid):
     # given extremum, so 1/|d| peaks near 4096 rather than 1024.
     enc = _clamp_f32(fx.Float32(1.0) / (d + fx.Float32(1e-7)), -_FP16_MAX, _FP16_MAX)
     words = _quant_atom_fp16(codec, atom, _splat_f16x2(enc))
-    if codec.n_words_per_thread == 2:
-        words = (words[0], _compact_hi2(words[1], lane))
+    if codec.hi2_i32_off is not None:
+        words = (words[0], _compact_hi(words[1], lane, codec.hi_bits))
     is_leader = (tid % GROUP) == 0
     return words, _pack_e4m3_word(e, lane), is_leader
 
@@ -438,8 +490,8 @@ def _codec_dequant(codec, words, scale, tid, acc=None):
     ``a * b + c`` does not contract to ``v_pk_fma_f16``; ``fx.fma`` does.
     Two fp16 lanes are independent channels, not a dot into f32.
 
-    *words* are as they sit on the wire, so the 2-bit plane is still compacted
-    and is expanded here -- once, outside the loop.
+    *words* are as they sit on the wire, so the extra-bit plane is still
+    compacted and is expanded here -- once, outside the loop.
 
     A codec with no scale plane (fp16 passthrough) has nothing to unpack:
     *words* are already the atom's four dwords, so this reduces to a packed
@@ -455,13 +507,17 @@ def _codec_dequant(codec, words, scale, tid, acc=None):
     bias_hi = fx.Int32(_K_HALF2_1024)
     bias_lo = _f16x2(fx.Int32(codec.dequant_bias))
     packed = words[0]
-    if codec.n_words_per_thread == 2:
-        hi = _expand_hi2(words[1], tid)
-        m2 = fx.Int32(_K_MASK_0003)
+    if codec.hi2_i32_off is not None:
+        hi_bits = codec.hi_bits
+        hi = _expand_hi(words[1], tid, hi_bits)
+        hi_mask = (1 << hi_bits) - 1
+        m_hi = fx.Int32(hi_mask | (hi_mask << 16))
     for i in range_constexpr(4):
         code = packed.shrui(fx.Int32(i * 4)) & mask
-        if codec.n_words_per_thread == 2:
-            code = code | ((hi.shrui(fx.Int32(i * 2)) & m2) << fx.Int32(4))
+        if codec.hi2_i32_off is not None:
+            code = code | (
+                (hi.shrui(fx.Int32(i * hi_bits)) & m_hi) << fx.Int32(4)
+            )
         dq = _f16x2(code | bias_hi) + bias_lo
         if acc is None:
             out.append(_i32(dq * scale))
@@ -473,10 +529,10 @@ def _codec_dequant(codec, words, scale, tid, acc=None):
 def _codec_load(codec, get, tid, scale_slot):
     """Read one packet through ``get(i32_off_in_tile) -> i32``.
 
-    Returns ``(words, e4m3_word)`` exactly as they sit on the wire -- the 2-bit
-    plane stays compacted -- so a forwarding path can restage them byte for
-    byte without decoding. ``e4m3_word`` is ``None`` for a codec with no scale
-    plane (fp16 passthrough).
+    Returns ``(words, e4m3_word)`` exactly as they sit on the wire -- the
+    extra-bit plane stays compacted -- so a forwarding path can restage them
+    byte for byte without decoding. ``e4m3_word`` is ``None`` for a codec with
+    no scale plane (fp16 passthrough).
     """
     words = tuple(get(off) for off, _pred in codec.plane_slots(tid))
     scale_word = (

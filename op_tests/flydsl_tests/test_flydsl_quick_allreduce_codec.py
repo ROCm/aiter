@@ -235,7 +235,7 @@ GROUP_ELEMS = 16
 # the true one.
 E4M3_REL_SLACK = 1.0 / 16.0
 
-CODEC_NAMES = ("int4", "int6")
+CODEC_NAMES = ("int4", "int5", "int6")
 
 
 def _payload(*, n_tiles: int, seed: int, scale: float = 1.0) -> torch.Tensor:
@@ -268,8 +268,9 @@ def test_memory_path_matches_register_path(codec_name):
     """Staging through the wire layout must not change a single bit.
 
     This is the store/load consistency check. It would catch the two sides
-    disagreeing about where the INT6 2-bit plane lives, or a half-swap between
-    the threads that share one of its i32 slots.
+    disagreeing about where the extra-bit plane lives, or a half-swap between
+    the threads that share one of its i32 slots (pair for INT6, quartet for
+    INT5).
     """
     x = _payload(n_tiles=2, seed=17)
     through_lds = codec_roundtrip(x, codec_name, via_memory=True)
@@ -326,10 +327,25 @@ def test_int6_codec_is_more_accurate_than_int4():
     xf = x.float()
     rms = {
         c: float((codec_roundtrip(x, c).float() - xf).pow(2).mean().sqrt())
-        for c in CODEC_NAMES
+        for c in ("int4", "int6")
     }
     ratio = rms["int6"] / rms["int4"]
     assert 0.15 <= ratio <= 0.30, f"int6/int4 RMS ratio {ratio:.3f}, expected ~0.25"
+
+
+def test_int5_sits_between_int4_and_int6():
+    """One extra bit vs INT4, one fewer than INT6, on the same input."""
+    x = _payload(n_tiles=4, seed=41)
+    xf = x.float()
+    rms = {
+        c: float((codec_roundtrip(x, c).float() - xf).pow(2).mean().sqrt())
+        for c in ("int4", "int5", "int6")
+    }
+    assert rms["int6"] < rms["int5"] < rms["int4"], rms
+    r54 = rms["int5"] / rms["int4"]
+    r65 = rms["int6"] / rms["int5"]
+    assert 0.35 <= r54 <= 0.70, f"int5/int4 RMS ratio {r54:.3f}, expected ~0.5"
+    assert 0.35 <= r65 <= 0.70, f"int6/int5 RMS ratio {r65:.3f}, expected ~0.5"
 
 
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
@@ -338,7 +354,7 @@ def test_degenerate_groups_stay_finite(codec_name):
 
     ``1/d`` is materialised as fp16, so without the clamp in ``_codec_quant`` a
     zero-extremum group reaches the codec as Inf and ``0 * Inf`` poisons the
-    tile. INT6 has a quarter of INT4's headroom here, hence both codecs.
+    tile. INT6 has a quarter of INT4's headroom here; INT5 is in between.
     """
     x = _payload(n_tiles=2, seed=43).reshape(-1, GROUP_ELEMS)
     x[0::4] = 0.0
@@ -460,13 +476,20 @@ def test_ring_codec_defaults_widen_only_at_tp8(monkeypatch, world_size, expected
 def test_mesh_is_int4_at_every_world_size(monkeypatch, world_size):
     """The mesh has no separable lap, so the per-N default must not leak into it.
 
-    The mesh can build INT6 -- it is the same kernel -- which is exactly why
-    this has to be asserted rather than left to ``MESH_CODECS`` to enforce.
+    The mesh can build INT5 and INT6 -- it is the same kernel -- which is
+    exactly why this has to be asserted rather than left to ``MESH_CODECS``
+    to enforce.
     Widening only the reduce-scatter lap is meaningless on a schedule that
     carries one format across both, so ``single_codec`` opts it out of the
     ring's per-N widening.
     """
     assert _resolve(monkeypatch, "mesh", world_size) == ("int4", "int4")
+
+
+@pytest.mark.parametrize("env,expected", (("int4", "int4"), ("int5", "int5"), ("int6", "int6")))
+def test_env_override_sets_both_laps_on_mesh(monkeypatch, env, expected):
+    """Mesh is single-codec, so the env names both laps, including INT5."""
+    assert _resolve(monkeypatch, "mesh", 8, env=env) == (expected, expected)
 
 
 @pytest.mark.parametrize("env,expected", (("int4", "int4"), ("int6", "int6")))
@@ -483,34 +506,28 @@ def test_explicit_argument_outranks_the_environment(monkeypatch):
 def test_env_that_the_schedule_cannot_build_falls_back(monkeypatch):
     """A process-wide variable must not break an unrelated call site.
 
-    Every codec now builds on both schedules, so reaching this branch takes a
-    name no schedule knows -- one ``_parse_codec_env`` would itself have
-    dropped, which is why the value is patched in past it. The branch stays
-    for the next codec that only one schedule can carry.
+    INT5 is mesh-only, so naming it on the ring is the real fall-back case
+    (unlike a typo ``_parse_codec_env`` would already have dropped).
     """
-    assert _resolve(monkeypatch, "ring", 8, env="nosuch") == ("int6", "int4")
+    assert _resolve(monkeypatch, "ring", 8, env="int5") == ("int6", "int4")
 
 
 def test_explicit_codec_no_schedule_can_build_raises(monkeypatch):
-    """Unlike the environment: naming it in code is a programming error.
-
-    A name no schedule knows, for the same reason as the fall-back test above:
-    every real codec builds on both schedules now, so there is no longer a
-    supported format one of them has to refuse.
-    """
+    """Unlike the environment: naming it in code is a programming error."""
     with pytest.raises(ValueError, match="rs_codec"):
-        _resolve(monkeypatch, "mesh", 8, rs="nosuch")
+        _resolve(monkeypatch, "ring", 8, rs="int5")
 
 
 @pytest.mark.parametrize("lap", ("rs", "ag"))
-def test_mesh_mirrors_a_single_named_lap(monkeypatch, lap):
+@pytest.mark.parametrize("codec", ("int5", "int6"))
+def test_mesh_mirrors_a_single_named_lap(monkeypatch, lap, codec):
     """One format spans both mesh laps, so naming either names both.
 
     Pairing the named lap with the *other* lap's default would hand the build
-    a mismatch it can only reject, which is how INT6 on the mesh would be
+    a mismatch it can only reject, which is how INT5/INT6 on the mesh would be
     unreachable without this.
     """
-    assert _resolve(monkeypatch, "mesh", 8, **{lap: "int6"}) == ("int6", "int6")
+    assert _resolve(monkeypatch, "mesh", 8, **{lap: codec}) == (codec, codec)
 
 
 def test_mesh_rejects_two_different_laps(monkeypatch):

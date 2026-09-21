@@ -11,10 +11,11 @@ they are named for the topology of each lap instead:
 * ``"ring"`` 2(N-1) single-destination hops.
 
 The wire format is a per-lap argument rather than a property of the type:
-``rs_codec`` and ``ag_codec`` take INT4 nibble, INT6 bit-plane pair (both with
-group-16 E4M3 scales) or fp16 passthrough, and each carries its own super-tile
-ladder. Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. Payload
-HBM is bf16.
+``rs_codec`` and ``ag_codec`` take INT4 nibble, INT5 nibble+1-bit plane,
+INT6 nibble+2-bit plane (all with group-16 E4M3 scales) or fp16
+passthrough, and each carries its own super-tile ladder. Mesh builds all
+four; ring has not grown INT5. Super-tile ST∈{1,8} on the mesh,
+ST∈{1,8,16,32} on the ring. Payload HBM is bf16.
 """
 
 from __future__ import annotations
@@ -149,10 +150,9 @@ class _Algorithm:
     default_super_tile: int
     # Whether one wire format has to serve both laps. True of the mesh, which
     # carries the same format across reduce-scatter and all-gather; the ring
-    # decodes and re-encodes between them and so can differ per lap.
-    #
-    # This has to be stated rather than inferred from ``rs_codecs`` overlapping
-    # ``ag_codecs``: both schedules accept the same three formats.
+    # decodes and re-encodes between them and so can differ per lap. A flag,
+    # not inferred from the two allow-lists overlapping: those names can match
+    # and the laps can still be paired independently.
     single_codec: bool = False
     # Per-world-size override of ``min_bytes``. Empty means the world does not
     # move this schedule's floor, which is true of the mesh -- it is gated from
@@ -171,10 +171,11 @@ class _Algorithm:
     #
     # An accessor rather than a table, because the two schedules key theirs on
     # different things. The mesh's rungs move with the codec: INT6 carries
-    # 1664 B per rank-tile against INT4's 1152 and switches super-tile far
-    # later. The ring's move with world size alone -- publishes per rank are
-    # ``num_tiles / ST * 2(N-1)``, so its crossover arrives sooner the wider
-    # the world, and measurement says the codec is not what shifts it.
+    # 1664 B per rank-tile against INT4's 1152 (INT5 sits between them at
+    # 1408 B) and switches super-tile far later. The ring's move with world
+    # size alone -- publishes per rank are ``num_tiles / ST * 2(N-1)``, so
+    # its crossover arrives sooner the wider the world, and measurement says
+    # the codec is not what shifts it.
     #
     # ``None`` means "one super-tile for every size"; no schedule uses that any
     # more, but the code path stays because pinning ``super_tile`` collapses to
@@ -556,19 +557,23 @@ class FlyQuickAllReduce:
 
     ``rs_codec`` and ``ag_codec`` are the wire formats of the two laps, and are
     what makes this type codec-generic rather than INT4-only: either takes
-    ``"int4"``, ``"int6"`` or ``"fp16"``. The mesh carries one format across
-    both laps and so requires them equal; the ring may differ per lap.
+    ``"int4"``, ``"int5"``, ``"int6"`` or ``"fp16"``. The mesh carries one
+    format across both laps and so requires them equal; it is the schedule
+    that builds INT5. The ring may differ per lap and does not list INT5.
 
     The ring's reduce-scatter lap is the only place it loses accuracy the mesh
     does not -- it requantizes ``N-1`` times where the mesh requantizes once --
     so it defaults to ``"int6"`` at TP8, where INT4 would cost too much
     accuracy. The all-gather lap forwards bytes verbatim and contributes a
     single quantization, so it defaults to ``"int4"`` everywhere and widens
-    only by request. The mesh defaults to ``"int4"`` at every world size.
+    only by request. The mesh defaults to ``"int4"`` at every world size and
+    widens to INT5/INT6 only by request (``single_codec`` keeps TP8 from
+    inheriting the ring's ``rs_default=int6``).
 
-    Leave both ``None`` to get those defaults. ``AITER_ALL_REDUCE_CODEC=INT4``
-    or ``INT6`` overrides them process-wide, for both laps at once; an explicit
-    argument here outranks the environment.
+    Leave both ``None`` to get those defaults. ``AITER_ALL_REDUCE_CODEC=INT4``,
+    ``INT5`` or ``INT6`` overrides them process-wide, for both laps at once; an
+    explicit argument here outranks the environment. ``INT5`` on the ring
+    falls back: that schedule cannot build it.
 
     ``inbox_memory`` selects how the IPC inbox is allocated:
 

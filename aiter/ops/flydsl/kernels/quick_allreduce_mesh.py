@@ -8,8 +8,8 @@ Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 Wire format is a parameter, not a property of this file: ``MESH_CODECS``
 names the ones it can build, and the tile geometry that follows from each
 lives in ``quick_allreduce_codec`` (INT4 nibble [-8,+7], 1152 B rank-tile;
-INT6 bit-plane pair [-32,+31], 1664 B; both with group-16 signed E4M3
-scales in the 128 B tail).
+INT5 nibble+1-bit plane [-16,+15], 1408 B; INT6 nibble+2-bit plane
+[-32,+31], 1664 B; all with group-16 signed E4M3 scales in the 128 B tail).
 
 Super-tile ST∈{1,8}, from the per-codec ``MESH_ST_LADDER``. Payload HBM is
 bf16; in-kernel math is packed fp16. Each rank owns ``ATOMS / world_size``
@@ -141,8 +141,8 @@ def clamp_grid_cap(
 # Tuning ladder: ``(min_bytes, super_tile, grid_cap)`` rungs, per codec and
 # per world size.
 #
-# Keyed on the codec because the two do not want the same schedule, and a
-# ladder fitted to one picks the wrong super-tile for the other. INT4:
+# Keyed on the codec because a ladder fitted to one picks the wrong
+# super-tile for another. INT4:
 #
 #   TP2  ST=1 everywhere.
 #   TP4  ST=8 everywhere.
@@ -154,6 +154,9 @@ def clamp_grid_cap(
 #
 #   All TP  ST=1 up to 38 MiB then ST=8.
 #
+# INT5 uses the same all-TP rungs as INT6, at the full grid, rather than
+# INT4's per-world table.
+#
 # 38 MiB is 1216 tiles, which is also the grid cap. That is deliberate: the
 # no-fence branch of ``FlyQuickAllReduce._pick_st`` confirms a rung by
 # comparing tiles against the grid, so siting the rung there makes the ladder
@@ -164,6 +167,11 @@ MESH_ST_LADDER = {
         4: ((0, 8, 128),),
         8: ((0, 1, 128), (768 << 10, 8, 128)),
     },
+    "int5": {
+        2: ((0, 1, 1216), (38 << 20, 8, 1216)),
+        4: ((0, 1, 1216), (38 << 20, 8, 1216)),
+        8: ((0, 1, 1216), (38 << 20, 8, 1216)),
+    },
     "int6": {
         2: ((0, 1, 1216), (38 << 20, 8, 1216)),
         4: ((0, 1, 1216), (38 << 20, 8, 1216)),
@@ -171,7 +179,7 @@ MESH_ST_LADDER = {
     },
 }
 # Wire formats the mesh can build. The mesh carries one across both laps.
-MESH_CODECS = ("int4", "int6", "fp16")
+MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
 
 def mesh_st_ladder(codec: str, world_size: int):
@@ -225,8 +233,8 @@ def make_quick_allreduce_mesh_kernel(
 
     # A rank-tile's sectors, in stripes of up to 8 (a workgroup has 64 quads,
     # and world_size*8 of them cover one full stripe at TP8). INT4 is 8+8+2,
-    # INT6 is 8+8+8+2; fp16, with no scale tail, is eight full stripes. One
-    # fanout layout per distinct stripe width.
+    # INT5 is 8+8+4+2, INT6 is 8+8+8+2; fp16, with no scale tail, is eight
+    # full stripes. One fanout layout per distinct stripe width.
     stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
     _fanout_stride = {
         w: (w, 1) if policy["fanout"] == "peer" else (1, world_size)

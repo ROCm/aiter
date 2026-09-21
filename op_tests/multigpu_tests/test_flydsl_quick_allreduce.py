@@ -10,13 +10,13 @@ runs an aiter-op-test ``@benchmark`` / markdown sweep. Every rank is a
 sweep times ``fly.allreduce`` with ``run_perftest``. The oracle is an
 untimed fp32 NCCL all-reduce of the same per-rank inputs.
 
-Both schedules are covered, and the mesh is covered on both quantized wire
-formats: one host serves INT4 and INT6, so the codec is a parameter here
-rather than a second file. INT4/INT6 are lossy, so those cases gate on
-SQNR, a calibrated mismatch ratio and a per-tile SQNR floor. The ``fp16``
-wire format is a lossless passthrough, so the transport tests that use it
-gate on bit-identity instead -- which is what isolates a chunk-addressing
-or flag-protocol bug from a codec one.
+Both schedules are covered, and the mesh is covered on the quantized wire
+formats: one host serves INT4, INT5 and INT6, so the codec is a parameter
+here rather than a second file. INT4/INT5/INT6 are lossy, so those cases
+gate on SQNR, a calibrated mismatch ratio and a per-tile SQNR floor. The
+``fp16`` wire format is a lossless passthrough, so the transport tests that
+use it gate on bit-identity instead -- which is what isolates a
+chunk-addressing or flag-protocol bug from a codec one.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. FlyQuickAllReduce runs on gfx942/gfx950 at TP∈{2,4,8}; other
@@ -72,14 +72,16 @@ SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # Mesh floor per wire format, in the shipping configuration.
 #
 # The mesh requantizes exactly once, so its SQNR is a property of the codec
-# rather than of the world size: INT4 delivers ~19 dB and INT6 ~30. Holding
-# INT6 to the INT4 floor would let it silently fall back to INT4 bits -- pass a
-# codec the host ignores, resolve the wrong default -- and still pass, which is
-# the failure mode one codec-generic host makes possible.
+# rather than of the world size: INT4 delivers ~19 dB, INT5 ~25 dB (sim),
+# INT6 ~30. Holding a fatter codec to the INT4 floor would let it silently
+# fall back to INT4 bits -- pass a codec the host ignores, resolve the wrong
+# default -- and still pass, which is the failure mode one codec-generic host
+# makes possible. INT5's 24 dB floor is below the 25.00 dB two-shot sim so
+# GPU noise has a dB, and above INT4 so an ignored ``rs_codec="int5"`` fails.
 #
 # fp16 is lossless on the transport cases' exact-grid input, but those gate on
 # bit-identity; this floor only applies where fp16 meets random input.
-_MESH_SQNR_MIN_DB = {"int4": 18.0, "int6": 25.0, "fp16": 25.0}
+_MESH_SQNR_MIN_DB = {"int4": 18.0, "int5": 24.0, "int6": 25.0, "fp16": 25.0}
 
 # Ring floor, keyed on the schedule rather than the codec because its two laps
 # need not agree -- TP8 already ships INT6 reduce-scatter with INT4 all-gather.
@@ -112,7 +114,7 @@ _RING_SQNR_MIN_DB = 18.0
 _EDGE_FILL_SQNR_MIN_DB = 18.0
 
 # Wire formats the mesh cases sweep. fp16 is covered by the transport tests.
-MESH_TEST_CODECS = ("int4", "int6")
+MESH_TEST_CODECS = ("int4", "int5", "int6")
 
 # INT4 at TP8 is still a supported configuration -- AITER_ALL_REDUCE_CODEC=INT4
 # reaches it -- and is covered by its own case rather than skipped. It is held
@@ -1055,10 +1057,10 @@ def main():
     parser.add_argument(
         "--codec",
         default=None,
-        choices=("int4", "int6"),
+        choices=("int4", "int5", "int6"),
         help="Wire format to sweep, both laps. Default: leave it to the\n"
         "    host, which resolves INT4 on the mesh and INT6/INT4 on the\n"
-        "    TP8 ring.\n    e.g.: --codec int6",
+        "    TP8 ring. INT5 is mesh-only.\n    e.g.: --codec int5",
     )
     parser.add_argument(
         "-s",
