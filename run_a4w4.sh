@@ -15,8 +15,8 @@
   AITER_FLYDSL_EXPLICIT_VGPR_PARTITION=${AITER_FLYDSL_EXPLICIT_VGPR_PARTITION:-1} \
   AITER_FLYDSL_PLANAR_LDS=${AITER_FLYDSL_PLANAR_LDS:-1} \
   AITER_FLYDSL_WAVE_LDS_ORDER=${AITER_FLYDSL_WAVE_LDS_ORDER:-1} \
-  python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
-    --scenario kernel \
+  python3 -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
+    --scenario profile \
     --data-format a4w4 \
     --experts 96 \
     --tokens 16384 \
@@ -25,6 +25,7 @@
     --inter-dim 3072 \
     --act silu \
     --no-bias \
+    --data-init zero \
+    --scale-init zero \
     --iters 32 \
-    --no-check-aot-cache \
-    --const-init 0
+    --no-check-aot-cache
