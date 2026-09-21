@@ -35,7 +35,11 @@ from aiter.ops.opus.policy import lookup_mxscale_bmm_config
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
-GROUP = 128  # GROUP_N == GROUP_K == 128; GROUP_M == 1 (per-token)
+# Default quantisation block. GROUP_M is always 1 (per token); GROUP_N and
+# GROUP_K move together, since A and B quantise on the same block -- DSv4's 128
+# or MX's 32. The helpers below take it as an argument so one shape can be
+# generated at either granularity and handed to the kid tuned for it.
+GROUP = 128
 _DT = {"fp32": dtypes.fp32, "bf16": dtypes.bf16}
 
 
@@ -71,38 +75,38 @@ def _to_e8m0_scale(scale):
     return e, scale_pow2
 
 
-def _quant_per_token_e8m0(x_bf16):
-    """[G,M,K] bf16 -> fp8 + e8m0 x_scale [G,M,K/128] + fp32 scale."""
+def _quant_per_token_e8m0(x_bf16, group=GROUP):
+    """[G,M,K] bf16 -> fp8 + e8m0 x_scale [G,M,K/group] + fp32 scale."""
     G, M, K = x_bf16.shape
-    xb = x_bf16.to(dtypes.fp32).view(G, M, K // GROUP, GROUP)
+    xb = x_bf16.to(dtypes.fp32).view(G, M, K // group, group)
     raw = xb.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 448.0
     e8m0, scale = _to_e8m0_scale(raw)
     q = (xb / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
     return q.view(G, M, K), e8m0.squeeze(-1), scale.squeeze(-1)
 
 
-def _quant_block_e8m0(w_bf16):
-    """[G,N,K] bf16 -> fp8 + e8m0 w_scale [G,N/128,K/128] + fp32 scale."""
+def _quant_block_e8m0(w_bf16, group=GROUP):
+    """[G,N,K] bf16 -> fp8 + e8m0 w_scale [G,N/group,K/group] + fp32 scale."""
     G, N, K = w_bf16.shape
-    wb = w_bf16.to(dtypes.fp32).view(G, N // GROUP, GROUP, K // GROUP, GROUP)
+    wb = w_bf16.to(dtypes.fp32).view(G, N // group, group, K // group, group)
     raw = wb.abs().amax(dim=(2, 4), keepdim=True).clamp(min=1e-8) / 448.0
     e8m0, scale = _to_e8m0_scale(raw)
     q = (wb / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
     return (
         q.view(G, N, K),
-        e8m0.view(G, N // GROUP, K // GROUP),
-        scale.view(G, N // GROUP, K // GROUP),
+        e8m0.view(G, N // group, K // group),
+        scale.view(G, N // group, K // group),
     )
 
 
-def run_torch(O_fp8, W_fp8, x_scale, w_scale):
+def run_torch(O_fp8, W_fp8, x_scale, w_scale, group=GROUP):
     """Reference: dequant fp8 -> fp32 einsum -> [G,M,N]. Not timed."""
     G, M, K = O_fp8.shape
     N = W_fp8.shape[1]
-    act = O_fp8.to(dtypes.fp32).view(G, M, K // GROUP, GROUP)
+    act = O_fp8.to(dtypes.fp32).view(G, M, K // group, group)
     act = (act * x_scale.unsqueeze(-1)).view(G, M, K)
-    W = W_fp8.to(dtypes.fp32).view(G, N // GROUP, GROUP, K // GROUP, GROUP)
-    W = (W * w_scale.view(G, N // GROUP, 1, K // GROUP, 1)).view(G, N, K)
+    W = W_fp8.to(dtypes.fp32).view(G, N // group, group, K // group, group)
+    W = (W * w_scale.view(G, N // group, 1, K // group, 1)).view(G, N, K)
     return torch.einsum("gmk,gnk->gmn", act, W).to(dtypes.fp32)
 
 
@@ -314,6 +318,52 @@ def check_tilen_column_map():
 
     assert not failures, "tileN column-map regression:\n  " + "\n  ".join(failures)
     return len(_TILEN_REGRESSION_KIDS) * 2
+
+
+# --- GROUP_N == GROUP_K == 32 (the MX block) ------------------------------
+# These are the only kids quantised on the 32-element block, and they are the
+# only thing that instantiates the per-lane scale addressing at all: every 128
+# kid has SF_PER_MFMA_K == 1, so `if constexpr` discards the lane arms of
+# load_sfb_lane and collapses the scale layout's lane p dim to extent 1. This
+# check is therefore both the numerical guard on MX quantisation and the only
+# compile coverage those arms get -- without it they are dead code the compiler
+# never instantiates.
+#
+# One shape serves all five: K=1024 is a whole number of each kid's B_K
+# (128 / 256 / 512) and N=128 of each B_N (32 / 64 / 128). Between them the
+# kids span one, two and four B scale groups per tile and both wave grids.
+_MX32_KIDS = (8700, 8701, 8702, 8704, 8706)
+_MX32_SHAPE = (2, 128, 128, 1024)  # G, M, N, K
+_MX32_GROUP = 32
+_MX32_ERR_TOL = 0.003
+
+
+def check_mx32_kids():
+    """Check the GROUP_N=GROUP_K=32 kids against a 32-block reference."""
+    g, m, n, k = _MX32_SHAPE
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(
+        _block_varied((g, m, k), k), group=_MX32_GROUP
+    )
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(
+        _block_varied((g, n, k), k), group=_MX32_GROUP
+    )
+    O_in = O_mx.transpose(0, 1)
+    xs_in = xs_mx.transpose(0, 1)
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=_MX32_GROUP).transpose(0, 1)
+    failures = []
+
+    for kid in _MX32_KIDS:
+        out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
+        _run_opus(O_in, W_mx, out, xs_in, ws_mx, kid)
+        torch.cuda.synchronize()
+        delta = (out.to(dtypes.fp32) - ref).abs()
+        rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+        err = rows.max().item()
+        if not (err <= _MX32_ERR_TOL):
+            failures.append(f"kid {kid}: worst row rel err {err:.4f} > {_MX32_ERR_TOL}")
+
+    assert not failures, "GROUP_K=32 kids:\n  " + "\n  ".join(failures)
+    return len(_MX32_KIDS)
 
 
 def check_splitk_workspace():
@@ -549,6 +599,8 @@ def main():
     aiter.logger.info(
         "MXFP8 BMM split-K workspace checks passed (%d paths)", n_workspace_checks
     )
+    n_mx32_kids = check_mx32_kids()
+    aiter.logger.info("GROUP_K=32 MX quantisation passed for %d kids", n_mx32_kids)
 
     if args.check_m_align:
         try:

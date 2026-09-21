@@ -576,7 +576,11 @@ def resolve_a16w16_caller_candidate(
 # ---- gfx950 MXFP8 BMM tuned-row and heuristic policy ---------------------
 
 _MXSCALE_BMM_KID_OFFSET = 8000
-_MXSCALE_BMM_LOCAL_KID_MAX = 653
+# Upper end of the pre-globalisation id space a tuned CSV may still be written
+# in. Raised past 653 for the GROUP_N=GROUP_K=32 kids, which sit in their own
+# 700 band; anything below the offset is unambiguously a local id, so widening
+# the window only admits ids that would otherwise have been rejected.
+_MXSCALE_BMM_LOCAL_KID_MAX = 799
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 _C_INT_MAX = (1 << 31) - 1
 
