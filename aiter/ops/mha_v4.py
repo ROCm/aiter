@@ -436,7 +436,7 @@ def _resolve_raw_recipe(
         )
 
     # FP6-P rows need V repacked to match the FP6 P operand's K layout, or the kernel reads V rows
-    # in the wrong order. Every MXFP6-Q row and f8f6 now ship FP6-P objects in both modes.
+    # in the wrong order. Dense and sparse agree on this per recipe; the mode never changes it.
     uses_fp6_p_pack = (
         (kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6)
         or (
@@ -1154,12 +1154,7 @@ def mha_v4(
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
         k_quantized, k_descale = quantize_mxfp4_k(k)
-        if _is_fp8_format(v_format):
-            v_quantized, v_descale = quantize_v_fp8(v)
-        elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
-            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
-        else:
-            v_quantized, v_descale = quantize_v_mxfp4(v)
+        v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
             _launch_mxfp4_coalesced(
                 q_quantized,
@@ -1175,11 +1170,7 @@ def mha_v4(
             )
             return out
         k_view = mxfp4_k_view(k_quantized, k_descale)
-        v_view = (
-            v_quantized
-            if _is_fp8_format(v_format)
-            else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
-        )
+        v_view = mxfp4_v_view(v_quantized, v_descale, k.shape[1])
         k_quantized = k_view
         v_quantized = v_view
     elif recipe.kind == _RawRecipeKind.MXFP6:
@@ -1191,10 +1182,8 @@ def mha_v4(
             v_quantized, v_descale = quantize_v_fp8(v)
         elif v_format == AttentionFormat.MXFP6:
             v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
-        elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
-            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp4(v)
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
             _launch_mxfp6(
                 q_quantized,
