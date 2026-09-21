@@ -52,7 +52,7 @@ _ROTATE = 4
 # Timing loop size. This file is a correctness harness: 101 timed iterations per
 # row used to dominate a sweep's wall clock for a `us` column nobody reads here.
 # Default is now a token loop; `--bench` restores a converged one. Either way,
-# measure perf with op_tests/perf_mha_flydsl.py, not with this script.
+# measure perf with op_tests/op_benchmarks/flydsl/bench_mha_fwd.py, not with this script.
 _ITERS = 3
 _WARMUP = 1
 
