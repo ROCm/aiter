@@ -534,18 +534,18 @@ _bmm_flatmm_local.update({
     for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
     if kid not in _MX32_CLANG_REGCLASS_SKIP
 })
-# The PRELOAD_SF_LDS tiles get no MX twin yet. That path stages the whole
-# split's scale panel in LDS, sized (B_M/GROUP_M + N_SCALE_GROUPS) rows by
-# SFA_K_MAX/GROUP_K bytes, and the second factor is 64 bytes at GROUP_K=128 but
-# 256 at 32 -- the "combined panel <=~4.2 KiB" the pipeline comment promises is
-# 128-only arithmetic. Built anyway, the three large-tile twins ask for 168,960
-# to 185,344 bytes of LDS against the 163,840 a CU has, and clang additionally
-# hits the register-class bug the kid326 workspace note already describes.
-#
-# Shrinking SFA_K_MAX by the same factor would fit, at the price of capping the
-# preload path at K=2048 -- below the K=4096 it exists to serve, and the miss is
-# a silent early return rather than an error. Refilling the panel in K chunks is
-# the real answer and is its own change.
+# The PRELOAD_SF_LDS tiles get MX twins too, and they take the scale ring rather
+# than the whole-split panel -- the traits pick that from GROUP_K (SF_USE_RING),
+# so nothing here says which. The panel could not serve them: its rows cost
+# SFA_K_MAX/GROUP_K bytes each, 64 at 128 and 256 at 32, and the large tiles
+# asked for 168,960 to 185,344 bytes of a CU's 163,840. The ring is at most
+# 11,264 and is a function of prefetch_k_iter rather than of K.
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, preload_sf=True, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+})
 
 
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this

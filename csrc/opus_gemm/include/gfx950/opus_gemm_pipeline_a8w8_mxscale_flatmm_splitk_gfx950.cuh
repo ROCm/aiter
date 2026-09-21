@@ -775,7 +775,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // OOB rows (partial-M tail) read 0 via g_sfa's num_records bound and are
     // never consumed. Bail if this split's K exceeds the compile-time LDS bound
     // (the dispatch never selects kid324 for such K, so this only guards misuse).
-    if constexpr (PRELOAD_SF_LDS) {
+    if constexpr (SF_PANEL) {
         if (loops > SFA_K_TILES_MAX) return;
         const int tid = opus::thread_id_x();
         auto sm_sfa = make_smem(s_sfa_ptr);
@@ -818,6 +818,44 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         auto u_gb = make_layout_gmem_group_load_mxsk<T, 2>(lane_id, wave_id_prod, kargs.stride_b);
         auto u_sb = make_layout_smem_group_load_mxsk<T, 2>(lane_id, wave_id_prod);
 
+        // Stage one K tile's scales into its ring slot, issued in the same
+        // per-tile group as that tile's A and B. That placement is the whole
+        // design: the barrier which publishes the A/B tile publishes these, and
+        // mb already counts them, so none of the s_waitcnt_vmcnt(number<mb * p>)
+        // below had to be re-derived.
+        //
+        // A slot is flat (row, K byte) order. Lane l of the two producer waves
+        // takes bytes [l*VEC, l*VEC+VEC) of a chunk, which is what the raw
+        // async_load form writes, and the consumer reads that same flat index.
+        // SFA rows and SFB groups are separate copies because they come from
+        // different global buffers, each padded to whole chunks so every lane
+        // always issues -- see SF_RING_A_BYTES for why that matters.
+        auto issue_sf_tile = [&](int issue_k) {
+            if constexpr (SF_RING) {
+                constexpr int VEC   = T::SF_RING_VEC;
+                constexpr int CHUNK = T::SF_RING_CHUNK;
+                constexpr int SPBK  = T::SCALES_PER_BK;
+                D_SF* slot = smem_sf
+                           + (issue_k % T::prefetch_k_iter) * T::SF_RING_SLOT;
+                const int plane =
+                    (wave_id_prod * (int)opus::get_warp_size() + lane_id) * VEC;
+                const int k_off = issue_k * SPBK;
+                opus::static_for<T::SF_RING_A_BYTES / CHUNK>([&](auto c_c) {
+                    const int idx = decltype(c_c)::value * CHUNK + plane;
+                    async_load<VEC>(g_sfa, slot + idx,
+                                    (idx / SPBK) * kargs.stride_sfa
+                                        + k_off + idx % SPBK);
+                });
+                D_SF* slot_b = slot + T::SF_RING_A_BYTES;
+                opus::static_for<T::SF_RING_B_BYTES / CHUNK>([&](auto c_c) {
+                    const int idx = decltype(c_c)::value * CHUNK + plane;
+                    async_load<VEC>(g_sfb, slot_b + idx,
+                                    (idx / SPBK) * kargs.stride_sfb
+                                        + k_off + idx % SPBK);
+                });
+            }
+        };
+
         opus::static_for<T::prefetch_k_iter>([&](auto p_c) {
             constexpr int p = decltype(p_c)::value;
             opus::static_for<T::NUM_LOAD_GROUPS_PER_BK>([&](auto kg_c) {
@@ -831,6 +869,12 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     async_load<T::VEC_B>(g_b, smem_b_at(p, n, kg), u_gb, u_sb, b_offset(p, n, kg));
                 });
             });
+            // Interleaved per tile, not appended as a second pass. vmcnt retires
+            // in order, so issuing every tile's A/B and only then every tile's
+            // scales would leave tile 0's scale still in flight at the drain
+            // that waits for mb * (prefetch_k_iter - 1) -- the barrier would
+            // publish a tile whose scales had not landed.
+            issue_sf_tile(p);
         });
 
         opus::static_for<T::prefetch_k_iter - 2>([&](auto i_c) {
@@ -856,6 +900,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                         async_load<T::VEC_B>(g_b, smem_b_at(slot, n, kg), u_gb, u_sb, b_offset(issue_k, n, kg));
                     });
                 });
+                issue_sf_tile(issue_k);
                 s_waitcnt_vmcnt(number<mb>{});
                 __builtin_amdgcn_s_barrier();
             }
@@ -876,6 +921,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                         async_load<T::VEC_B>(g_b, smem_b_at(slot, n, kg), u_gb, u_sb, b_offset(issue_k, n, kg));
                     });
                 });
+                issue_sf_tile(issue_k);
                 s_waitcnt_vmcnt(number<2 * mb>{});
                 __builtin_amdgcn_s_barrier();
             }
@@ -903,6 +949,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         // LDS read layout for the preloaded SFA panel: same lane/wave mapping as
         // u_sfa but with the compact per-row K-scale count as the row stride.
         auto u_sfa_lds = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, sf_k_scales);
+        // The ring's rows are one K tile wide, so its stride is compile-time and
+        // the slot base carries the K position instead of a scale_base offset.
+        auto u_sfa_ring =
+            make_layout_sfa_mxsk<T>(lane_id, wave_id_m, T::SCALES_PER_BK);
 
         auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
             seq<T::COM_REP_M, T::COM_REP_N, T::COM_REP_K>{},
@@ -921,7 +971,23 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
 
         auto load_scale_regs = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
             const int scale_base = loop_k * T::SCALES_PER_BK;
-            if constexpr (PRELOAD_SF_LDS) {
+            if constexpr (SF_RING) {
+                // This tile's slot, staged by the producer and published by the
+                // same barrier as its A/B. Flat (row, K byte) order, the layout
+                // the fill wrote.
+                D_SF* slot = smem_sf
+                           + (loop_k % T::prefetch_k_iter) * T::SF_RING_SLOT;
+                auto sm_a = make_smem(slot);
+                v_sfa = load<T::SF_LANE_LOAD_VEC>(sm_a, u_sfa_ring);
+                opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
+                    constexpr int ng = decltype(ng_c)::value;
+                    auto sm_b = make_smem(
+                        slot + T::SF_RING_A_BYTES
+                        + (sfb_group_base<T>(wave_id_n_cons) + ng) * T::SCALES_PER_BK);
+                    load_sfb_lane<T, ng>(sm_b, 0,
+                                        sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
+                });
+            } else if constexpr (SF_PANEL) {
                 // Read this K-tile's scales from the preloaded LDS panels
                 // (ds_read / lgkmcnt) instead of a per-tile global buffer_load.
                 // Vec = SCALES_PER_BK so the contiguous per-M-row K bytes come in
