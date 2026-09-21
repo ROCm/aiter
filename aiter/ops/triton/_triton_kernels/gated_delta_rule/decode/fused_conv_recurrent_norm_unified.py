@@ -305,7 +305,6 @@ def _fused_kda_decode_unified_kernel(
                     p_csv + j * stride_cs_pos, tl.load(p_csv + (j + 1) * stride_cs_pos)
                 )
             tl.store(p_csv + (W - 2) * stride_cs_pos, b_x_v.to(p_csv.dtype.element_ty))
-        tl.debug_barrier()
 
         # -------- QK L2 Norm + Decay + Beta --------
         b_q = b_q * tl.math.rsqrt(tl.sum(b_q * b_q) + 1e-6) * qk_scale
