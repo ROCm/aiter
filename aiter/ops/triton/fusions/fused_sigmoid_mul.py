@@ -48,7 +48,7 @@ def fused_sigmoid_mul(
     Constraints:
         x and gate must be contiguous, same shape, same dtype
     """
-    _LOGGER.info(f"FUSED_SIGMOID_MUL: x={tuple(x.shape)} dtype={x.dtype}")
+    _LOGGER.info("FUSED_SIGMOID_MUL: x=%s dtype=%s", tuple(x.shape), x.dtype)
 
     assert x.is_cuda, "x must be a CUDA tensor"
     assert gate.device == x.device, "x and gate must be on the same device"

@@ -1015,6 +1015,18 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_dsv4_dequant_gather_k": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/dsv4_dequant_gather_k_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/dsv4_dequant_gather_k.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_dsv4_rotate_quant": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/dsv4_rotate_quant_pybind.cu'",
@@ -1472,6 +1484,22 @@
             "f'{CK_DIR}/example/ck_tile/50_sparse_attn/generate.py -d fwd_vsa --receipt 600 --output_dir {{}}'"
         ]
     },
+    "module_pa_mqa_logits_mxfp4_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_mqa_logits_mxfp4_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/pa_mqa_logits_mxfp4_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-fno-finite-math-only'",
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_mha_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
@@ -1824,40 +1852,6 @@
         ],
         "is_experimental": "True"
     },
-    "module_ds32_mla": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/dsa_v32_splitkv.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/defs.h'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-ffast-math'"
-        ],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "torch_exclude": "True",
-        "blob_gen_cmd": "''"
-    },
-    "module_opus_mla": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/mla/mla_decode_fwd_opus.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_fp8fp8_def.h'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-ffast-math'"
-        ],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "torch_exclude": "True",
-        "blob_gen_cmd": "''"
-    },
     "module_topk_plain": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_plain_pybind.cu'",
@@ -2001,6 +1995,24 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/causal_conv1d_fwd_split_qkv_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/causal_conv1d_fwd_split_qkv.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mla_decode_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_mxfp8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fp8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_traits.h'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
