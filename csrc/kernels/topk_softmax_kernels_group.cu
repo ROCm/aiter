@@ -333,59 +333,65 @@ topk_candidate_better(float a_score, int a_id, float b_score, int b_id)
     return legacy_topk_tie_rank(a_id) < legacy_topk_tie_rank(b_id);
 }
 
-__device__ __forceinline__ void emit_legacy_ordered_topk(const float* cand_val,
-                                                         const int* cand_idx,
-                                                         const float* sig_scores,
-                                                         float* topk_weights,
-                                                         int* topk_ids,
-                                                         int n_cand,
-                                                         int topk,
-                                                         float routed_scaling_factor,
-                                                         bool need_renorm)
+__device__ __forceinline__ void emit_legacy_selected_topk(const float* cand_val,
+                                                          int* cand_idx,
+                                                          const float* sig_scores,
+                                                          float* topk_weights,
+                                                          int* topk_ids,
+                                                          int n_cand,
+                                                          int topk,
+                                                          float routed_scaling_factor,
+                                                          bool need_renorm)
 {
     const int lane        = threadIdx.x;
     const float cv        = lane < n_cand ? cand_val[lane] : -INFINITY;
     const int ci          = lane < n_cand ? cand_idx[lane] : -1;
     const float sorted_cv = warp_bitonic_merge_sort_to_reg(cv, opus::number<WARP_SIZE>{});
+    const float cutoff    = __shfl(sorted_cv, topk - 1, WARP_SIZE);
 
-    // Sort values with DPP; use legacy rank only for exact ties.
+    const bool is_gt      = lane < n_cand && cv > cutoff;
+    const bool is_eq      = lane < n_cand && cv == cutoff;
+    const uint64_t gt_set = __ballot(is_gt);
+    const uint64_t eq_set = __ballot(is_eq);
+    const int n_gt        = __builtin_popcountll(gt_set);
+    const int n_eq        = __builtin_popcountll(eq_set);
+    const int need_eq     = topk - n_gt;
+    int* final_idx        = cand_idx + WARP_SIZE;
+
+    const int local_cnt = cumsum_topk_with_pivot(cv, cutoff, opus::number<WARP_SIZE>{});
+    if(is_gt || (is_eq && n_eq <= need_eq))
+        final_idx[local_cnt - 1] = ci;
+
+    if(n_eq > need_eq)
+    {
+        bool selected = false;
+        for(int i = 0; i < need_eq; ++i)
+        {
+            const bool active = is_eq && !selected;
+            int rank          = active ? legacy_topk_tie_rank(ci) : 0x7fffffff;
+            auto min_op       = [](int a, int b) { return a < b ? a : b; };
+            rank              = wave_reduce<int, decltype(min_op), WARP_SIZE, true>(rank, min_op);
+            const uint64_t winner = __ballot(active && legacy_topk_tie_rank(ci) == rank);
+            const int winner_lane = winner != 0 ? __builtin_ctzll(winner) : 0;
+            if(lane == winner_lane)
+                selected = true;
+            if(lane == i)
+                final_idx[n_gt + i] = __builtin_amdgcn_readlane(ci, winner_lane);
+        }
+    }
+    __builtin_amdgcn_wave_barrier();
+
     int out_idx   = 0;
     float w       = 0.0f;
-    float total   = 0.0f;
-    bool selected = false;
-    for(int i = 0; i < topk; ++i)
+    if(lane < topk)
     {
-        const float target     = __shfl(sorted_cv, i, WARP_SIZE);
-        const bool match       = lane < n_cand && !selected && cv == target;
-        const uint64_t matches = __ballot(match);
-        int winner_lane;
-        if((matches & (matches - 1)) == 0)
-        {
-            winner_lane = matches != 0 ? __builtin_ctzll(matches) : 0;
-        }
-        else
-        {
-            int rank    = match ? legacy_topk_tie_rank(ci) : 0x7fffffff;
-            auto min_op = [](int a, int b) { return a < b ? a : b; };
-            rank        = wave_reduce<int, decltype(min_op), WARP_SIZE, true>(rank, min_op);
-            const uint64_t winner = __ballot(match && legacy_topk_tie_rank(ci) == rank);
-            winner_lane           = winner != 0 ? __builtin_ctzll(winner) : 0;
-        }
-        if(lane == winner_lane)
-            selected = true;
-        const int winner_id       = __builtin_amdgcn_readlane(ci, winner_lane);
-        const float winner_weight = sig_scores[winner_id];
-        if(need_renorm)
-            total += winner_weight;
-        if(lane == i)
-        {
-            out_idx = winner_id;
-            w       = winner_weight;
-        }
+        out_idx = final_idx[lane];
+        w       = sig_scores[out_idx];
     }
     if(need_renorm)
     {
-        // Preserve the legacy serial renormalization order.
+        auto add_op       = [](float a, float b) { return a + b; };
+        const float total = wave_reduce<float, decltype(add_op), WARP_SIZE, true>(w, add_op);
         w *= routed_scaling_factor / total;
     }
     else
@@ -926,15 +932,15 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         });
         __builtin_amdgcn_wave_barrier();
 
-        emit_legacy_ordered_topk(cand_val,
-                                 cand_idx,
-                                 sig_scores,
-                                 topk_weights + token_idx * stride_tk,
-                                 topk_ids + token_idx * stride_tk,
-                                 n_cand,
-                                 topk,
-                                 routed_scaling_factor,
-                                 need_renorm);
+        emit_legacy_selected_topk(cand_val,
+                                  cand_idx,
+                                  sig_scores,
+                                  topk_weights + token_idx * stride_tk,
+                                  topk_ids + token_idx * stride_tk,
+                                  n_cand,
+                                  topk,
+                                  routed_scaling_factor,
+                                  need_renorm);
         return;
     }
 
