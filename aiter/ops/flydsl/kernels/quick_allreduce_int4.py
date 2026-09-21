@@ -310,6 +310,17 @@ def make_quick_allreduce_int4_kernel(
     wire_tile_i32 = release_i32_off + 16
     wire_tile_bytes = wire_tile_i32 * 4
 
+    # flags_i32 is also the i32 offset of the wire area, so the flag prefix has
+    # to be a whole number of 64 B sectors (16 i32s). At a smaller multiple every
+    # rank-tile and release sector straddles two hardware sectors, so the 64 B
+    # fanout stores and the last-sector release stop being one sector wide.
+    grid_multiple = 16 // (PHASES * world_size)
+    if grid % grid_multiple != 0:
+        raise ValueError(
+            f"grid must be a multiple of {grid_multiple} at "
+            f"world_size={world_size} to keep the wire area 64 B aligned, got "
+            f"{grid}"
+        )
     flags_i32 = PHASES * grid * world_size
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
