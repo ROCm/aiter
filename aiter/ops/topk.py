@@ -13,6 +13,35 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
 
 
+# Shape-aware AVO dispatch floor. See top_k_per_row_prefill's docstring for the
+# measured crossover this comes from: many rows fill the machine at a narrower
+# row and win from 32K, few rows do not and lose until 48K.
+# stride0 at which `sampled` overtakes the FlyDSL one-block prefill path, which
+# is what this function reaches below it. Measured per shape, k=2048, fp32, both
+# ops under one @perftest on the same data (flydsl_us / sampled_us, above 1.00
+# meaning `sampled` is faster):
+#
+#     M \ N     49152   65536  131072  262144
+#     1          0.92    1.06    1.68    2.71
+#     8          0.78    0.90    1.38    2.15
+#     64         0.72    0.83    1.17    1.57
+#     256        0.67    0.79    0.99    1.14
+#     512        0.72    0.77    1.08    1.27
+#     1024       0.89    0.96    1.07    1.30
+#     2048       0.85    0.89    1.02    1.37
+#     4096       0.83    0.92    1.04    1.32
+#
+# The crossover is a clean function of stride0 and not of the row count, so
+# unlike the floor this replaces there is no wide/narrow split. M=256 at 131072
+# is 0.99, a wash, and is left on the simple rule rather than carved out.
+#
+# This supersedes a 32768/49152 floor that was fitted against the mb/ob path.
+# That measurement was not wrong when it was taken; upstream put FlyDSL in front
+# of mb/ob afterwards, which made it a comparison against an op this function no
+# longer reaches at those widths.
+SAMPLED_MIN_STRIDE0 = 131072
+
+
 # Raw binding: no argument validation, correction_bias must be a real tensor.
 # Callers should use topk_gating() below.
 @compile_ops("module_moe_topk", fc_name="topk_gating", develop=True)
@@ -331,6 +360,58 @@ def topk_ob_workspace_size(
 def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
 
 
+@functools.lru_cache(maxsize=1024)
+def _mb_workspace_size_cached(
+    numRows: int, stride0: int, k: int, is_decode: bool
+) -> int:
+    """topk_mb_workspace_size() memoised: 5.06 us per call through the binding.
+
+    query_mb_workspace() is a pure function of (numRows, stride0, kTopK)
+    (topk_per_row_kernels.cu:2705 -- no getenv, no device query), so the size is
+    fixed for a shape and the second call onward is a dict hit.
+    """
+    return topk_mb_workspace_size(numRows, stride0, k, is_decode)
+
+
+@functools.lru_cache(maxsize=1024)
+def _ob_workspace_size_cached(
+    numRows: int, stride0: int, k: int, is_decode: bool
+) -> int:
+    """topk_ob_workspace_size() memoised: 6.74 us per call, pure in
+    (numRows, stride0, kTopK) (topk_per_row_kernels.cu:2721).
+
+    This is the one every small shape pays, because low stride0 stays on the
+    one-block path: at numRows=64 stride0=512 the binding query cost 6.74 us to
+    size a workspace for a kernel that runs in 2.36 us.
+    """
+    return topk_ob_workspace_size(numRows, stride0, k, is_decode)
+
+
+@functools.lru_cache(maxsize=1024)
+def _use_mulblocks_cached(
+    numRows: int, stride0: int, _force_path: str | None, _dispatch_factor: str | None
+) -> bool:
+    """topk_use_mulblocks() memoised: 6.34 us per call.
+
+    should_use_mulblocks() (topk_per_row_kernels.cu:2648) compares the shape
+    against thresholds chosen by CU count, and it already caches that CU count in
+    a function-local static -- so the decision is device-pinned in C++ before we
+    cache it here. It does re-read TOPK_FORCE_PATH and TOPK_DISPATCH_FACTOR every
+    call, so both are in the key rather than assumed constant: two dict lookups
+    against a 6.34 us binding call keeps those override knobs live for free.
+    """
+    return topk_use_mulblocks(numRows, stride0)
+
+
+def _use_mulblocks(numRows: int, stride0: int) -> bool:
+    return _use_mulblocks_cached(
+        numRows,
+        stride0,
+        os.environ.get("TOPK_FORCE_PATH"),
+        os.environ.get("TOPK_DISPATCH_FACTOR"),
+    )
+
+
 @functools.lru_cache(maxsize=16)
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
@@ -403,8 +484,68 @@ def top_k_per_row_prefill(
     ascending-index ordered, smallest-index tie-breaking emit so every
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
     the workspace for the ob path in that case.
-    """
-    use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
+
+    When stable=False and stride1 == 1 and topk_sampled_supports() returns true and
+    stride0 is at least SAMPLED_MIN_STRIDE0, dispatches to
+    top_k_per_row_prefill_sampled. Set AITER_DISABLE_TOPK_SAMPLED=1 to force the original
+    mb/ob path for A/B or fallback.
+
+    The threshold is shape-aware because a flat one was wrong in both directions.
+    It used to be a flat 32768, which sent every numRows <= 512 shape at
+    stride0 = 32768 to a path that is SLOWER than the mb/ob one it replaced --
+    0.81x to 0.94x, measured through this dispatch with both backends under one
+    @perftest. No gate in the repo could see it: score_grid compares `sampled` against
+    its own earlier baseline, so a cell that is correct, not regressing, and
+    simply worse than the op it replaces is invisible.
+
+    Measured crossover, aiter_us / sampled_us, below 1.00 meaning `sampled` is slower
+    (log/crossover/, k=2048, fp32):
+
+        M \\ N     32K   40K   48K   56K   64K
+        1         0.87  1.05  1.15  1.31  1.22
+        8         0.88  1.05  1.22  1.09  1.27
+        64        0.94  0.95  1.15  1.11  1.28
+        256       0.81  0.84  1.04  1.04  1.23
+        512       0.91  0.92  1.03  1.02  1.19
+        1024      1.25  1.26  1.40  1.45  1.52
+        2048      1.14  1.17  1.28  1.30  1.38
+        4096      1.02  1.04  1.19  1.24  1.34
+
+    numRows >= 1024 wins from 32768 already, so its floor stays there; everything
+    below only turns positive at 49152. Raising the threshold to 65536 for all
+    shapes was the other tempting answer and it gives up the 1.15-1.22x that
+    numRows <= 64 earns at 48K.
+
+    stride1 is part of the routing condition and not of topk_sampled_supports(),
+    which only takes (numRows, stride0, k) and so cannot see it. The mb/ob path
+    ignores stride1 entirely, while the `sampled` entry asserts it is 1; routing a
+    stride1 != 1 call here would therefore turn a working (if questionable) call
+    into an abort purely because `sampled` became available. Keeping the assert for
+    direct callers of top_k_per_row_prefill_sampled and routing around it here
+    preserves the pre-`sampled` behaviour exactly."""
+    # Ahead of the FlyDSL check, and gated at a floor measured against FlyDSL
+    # rather than against mb/ob -- see SAMPLED_MIN_STRIDE0. Behind it this was
+    # unreachable: FlyDSL served every shape tested, M=4096 N=65536 included.
+    if (
+        not stable
+        and stride1 == 1
+        and stride0 >= SAMPLED_MIN_STRIDE0
+        and _sampled_supports_cached(numRows, stride0, k)
+        and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1"
+    ):
+        return top_k_per_row_prefill_sampled(
+            logits,
+            rowStarts,
+            rowEnds,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+        )
+
+    use_mulblocks = not stable and _use_mulblocks(numRows, stride0)
     # FlyDSL one-block outperforms HIP one-block on the remaining prefill cases.
     if not use_mulblocks and not _FLYDSL_TOPK_PREFILL_DISABLED:
         from .flydsl.topk.topk_per_row import (
@@ -436,10 +577,10 @@ def top_k_per_row_prefill(
             )
 
     if use_mulblocks:
-        size = topk_mb_workspace_size(numRows, stride0, k, False)
+        size = _mb_workspace_size_cached(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
     else:
-        size = topk_ob_workspace_size(numRows, stride0, k, False)
+        size = _ob_workspace_size_cached(numRows, stride0, k, False)
         workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_prefill(
         logits,
@@ -453,6 +594,184 @@ def top_k_per_row_prefill(
         k,
         workspace,
         stable,
+    )
+
+
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill_sampled", develop=True)
+def _top_k_per_row_prefill_sampled(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    workspace: torch.Tensor | None = None,
+) -> None: ...
+
+
+@compile_ops("module_top_k_per_row")
+def topk_sampled_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
+
+
+@compile_ops("module_top_k_per_row")
+def topk_sampled_supports(numRows: int, stride0: int, k: int) -> bool: ...
+
+
+@functools.lru_cache(maxsize=1024)
+def _sampled_supports_cached(numRows: int, stride0: int, k: int) -> bool:
+    """topk_sampled_supports() memoised, because the binding call is not cheap.
+
+    Measured in the correctness image: 4.86 us per call, against a kernel that
+    is 43 us at numRows=64 stride0=65537. Adding one unmemoised call to the
+    validation below cost +12.5% there and +7.5% on average across the twelve
+    shapes in reports/odd_n_ab.tsv -- a constant ~5 us offset that did not grow
+    with the work, which is what host overhead looks like.
+
+    Safe to cache: topk_sampled_supports is a pure function of these three ints.
+    It computes sampled::params_for -> derive_shape_params, which reads no device
+    state (CU_COUNT is a constexpr in topk_shape.hip.hpp, and there is no
+    hipGetDeviceProperties anywhere in that header).
+    """
+    return bool(topk_sampled_supports(numRows, stride0, k))
+
+
+@functools.lru_cache(maxsize=1024)
+def _sampled_workspace_size_cached(numRows: int, stride0: int, k: int) -> int:
+    """topk_sampled_workspace_size() memoised, for the same reason and the same
+    measured cost: 4.80 us per call through the binding.
+
+    Together with the supports() lookup above, these two were 9.66 us of every
+    call that routes to AVO, and at small M that was the whole call. Measured on
+    the enqueue side, where a profiler kernel trace cannot see it:
+    M=16 N=32768 spent 25.29 us on the host against 25.43 us end to end, so 99.4%
+    of the call was the caller's CPU and the GPU work was entirely hidden behind
+    it. Optimising the kernel there would have changed nothing.
+
+    Safe to cache for the same reason: it is a pure function of these three ints.
+    topk_sampled_workspace_size computes params_for -> derive_shape_params and then
+    ws_layout, none of which reads device state (CU_COUNT is a constexpr in
+    topk_shape.hip.hpp).
+    """
+    return int(topk_sampled_workspace_size(numRows, stride0, k))
+
+
+def top_k_per_row_prefill_sampled(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    workspace: torch.Tensor | None = None,
+) -> None:
+    """Per-row top-k (prefill) via the topk-prefill-avo kernels.
+
+    Same call shape as top_k_per_row_prefill, and the same workspace rule: this
+    allocates on the Python side so the C++ never allocates device scratch. The
+    buffer is plain scratch rather than the zeroed, self-resetting kind the mb
+    path needs -- Phase A clears the counters it shares before anything reads
+    them, and the small_n path uses no workspace at all.
+
+    Ragged rows are served: rowEnds[row] is the exclusive end column and a row
+    shorter than k emits min(k, row_len) indices followed by -1, the same
+    padding top_k_per_row_prefill writes.
+
+    rowStarts and rowEnds bound each row's window [rowStart, rowEnd); emitted
+    indices are absolute column numbers, matching top_k_per_row_prefill
+    (topk_per_row_kernels.cu:377 and :404).
+
+    `values` is optional: pass an fp32 numRows*k tensor to also receive the
+    selected scores, or None to skip the stores entirely (it is a template
+    parameter on the four output kernels, not a runtime branch). Padded slots
+    get -inf rather than 0, matching top_k_per_row_prefill, so a consumer that
+    ranks these scores across ranks cannot have padding outrank a real
+    negative logit.
+
+    Every argument is validated here and a bad one raises ValueError. That is
+    not belt-and-braces over the C++ checks, it is the only place the check can
+    be survivable: AITER_CHECK calls std::abort() unless g_aiter_can_throw is
+    set (csrc/include/aiter_hip_common.h), and only the aiter_safe_call ctypes
+    bridge sets it, which this entry does not go through. Before this, passing
+    k above the Phase C cap, or stride1 != 1, or a short workspace killed the
+    caller's process with a message instead of raising. Measured with
+    bench/stress_topk.py.
+
+    None of the checks costs a device sync: every term is a scalar argument or
+    a tensor attribute. rowStarts/rowEnds CONTENTS are deliberately not checked
+    here -- they live in device memory, so validating them host-side would cost
+    a D2H sync on every call. The kernel clamps them into [0, stride0] instead
+    (RowExtents in csrc/topk_common.hip.hpp).
+
+    `workspace` is optional: pass a buffer of at least
+    topk_sampled_workspace_size(numRows, stride0, k) bytes to own it yourself, or
+    leave it None to get the shared scratch buffer.
+
+    Call topk_sampled_supports() first if you want to route around the shapes this
+    declines (k above the Phase C LDS cap) rather than handle the exception."""
+    if numRows <= 0:
+        return  # matches the C++ entry, which returns before touching anything
+    if stride1 != 1:
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: logits inner stride must be 1, got {stride1}"
+        )
+    if not _sampled_supports_cached(numRows, stride0, k):
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: unsupported shape (numRows={numRows} "
+            f"stride0={stride0} k={k}); ask topk_sampled_supports() first"
+        )
+    if logits.dtype is not torch.float32:
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: logits must be fp32, got {logits.dtype}"
+        )
+    if indices.dtype is not torch.int32:
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: indices must be int32, got {indices.dtype}"
+        )
+    if indices.numel() < numRows * k:
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: indices holds {indices.numel()} entries, "
+            f"needs numRows*k = {numRows * k}"
+        )
+    if values is not None:
+        if values.dtype is not torch.float32:
+            raise ValueError(
+                f"top_k_per_row_prefill_sampled: values must be fp32, got {values.dtype}"
+            )
+        if values.numel() < numRows * k:
+            raise ValueError(
+                f"top_k_per_row_prefill_sampled: values holds {values.numel()} entries, "
+                f"needs numRows*k = {numRows * k}"
+            )
+    if rowStarts.numel() < numRows or rowEnds.numel() < numRows:
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: rowStarts/rowEnds hold "
+            f"{rowStarts.numel()}/{rowEnds.numel()} entries, need {numRows}"
+        )
+    size = _sampled_workspace_size_cached(numRows, stride0, k)
+    if workspace is None:
+        workspace = get_topk_scratch_workspace(logits.device, size)
+    elif workspace.numel() * workspace.element_size() < size:
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: workspace is "
+            f"{workspace.numel() * workspace.element_size()} B, needs {size} B"
+        )
+    return _top_k_per_row_prefill_sampled(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        workspace,
     )
 
 
@@ -591,7 +910,7 @@ def _hip_top_k_per_row_decode(
     stable: bool,
     values: torch.Tensor | None,
 ) -> None:
-    size = topk_ob_workspace_size(num_rows, stride0, k, True)
+    size = _ob_workspace_size_cached(num_rows, stride0, k, True)
     workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_decode(
         logits,
