@@ -409,18 +409,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-            # Open the wave-group phase shift. Waves 4-7 take one extra barrier
-            # that waves 0-3 skip, so from here every rendezvous pairs group B
-            # at cluster N+1 against group A at cluster N. s_barrier is an
-            # arrival count, not a program point, which is what makes that
-            # legal. The result is that one group is always inside a compute
-            # cluster while the other is in a memory cluster.
-            #
-            # Only sound with the 8-cluster decomposition above: at one barrier
-            # per iteration this same offset is a FULL-iteration skew and every
-            # LDS producer/consumer handoff desynchronises. The complementary
-            # barrier for group A is in the epilogue, keeping arrival counts
-            # equal over the kernel's lifetime.
+            # Waves 4-7 take one extra barrier so group B at cluster N+1 pairs
+            # against group A at cluster N. Sound only with the 8-cluster
+            # decomposition: a one-barrier loop would make this a full-iteration
+            # skew that desyncs every LDS handoff. A complementary barrier in the
+            # epilogue keeps arrival counts equal.
             if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
                 stagger_extra_barrier_if_one(ctx.stagger_i32)
 

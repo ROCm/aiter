@@ -16,7 +16,7 @@ const_expr branches of the prefill kernel. It is deliberately decode-local and
 does NOT call the welded dualwave loaders (which are hardwired to
 num_waves=8 / rows_per_wave=32); it carries its own small decode traits.
 
-Proven cores, measured empirically:
+Compute cores:
 
 - QK = mma(A=K, B=Q) -> S^T[n_kv, m_q]. C-output packing: value v in {0..3} of
   lane = C[m=(lane//16)*4+v, n=lane%16]; here M=n_kv, n=m_q. Softmax reduces
@@ -66,21 +66,17 @@ HEAD_DIM = 128
 BLOCK_M = 16  # one GQA group = MMA M-dim
 VEC = 16  # 5D-shuffled vectorization width
 _LOG2E = _math.log2(_math.e)
-GFX950_CUS = 256  # MI355X compute units
+GFX950_CUS = 256  # full-chip gfx950 CU count; split-K fill target
 
 
 def plan_num_kv_splits(batch, num_kv_heads, npages, target_wg=GFX950_CUS, s_max=8):
     """Fill-aware host plan for the inter-workgroup KV split S.
 
-    The base grid is ``batch * num_kv_heads`` workgroups; at low batch this
-    under-fills the 256 CUs. Split so the total grid reaches ``target_wg``
-    resident workgroups. ``target_wg=256`` (1 WG/CU) is the measured optimum:
-    although freeing V's LDS opened 2 WG/CU, over-splitting past one-WG/CU fill
-    regresses (the per-split combine overhead and smaller tiles outweigh the
-    extra occupancy). This gives S = ceil(256/(b*H_kv)), i.e. b=8->8, b=16->4,
-    b=32->2, b=64->1 -- matching the per-cell S sweep and never regressing b=64
-    (base=256 -> S=1). S is capped at ``s_max`` and at ``npages`` (>= 1 page per
-    split; the -1e30 mask makes an over-split correct anyway, just wasteful).
+    Base grid is batch*num_kv_heads workgroups; at low batch this underfills the
+    CUs. Split so the total grid reaches target_wg resident workgroups:
+    S = ceil(target_wg / (batch*num_kv_heads)), capped at s_max and at npages
+    (>= 1 page per split). target_wg = 1 WG/CU is the fill optimum; over-split is
+    still correct (the -1e30 mask makes an empty split a no-op), just wasteful.
     """
     base = max(1, batch * num_kv_heads)
     s = (target_wg + base - 1) // base  # ceil(target_wg / base)
@@ -98,7 +94,7 @@ def build_flash_attn_fp8_decode_module(
     varlen=False,
     paged=True,
     kv_cache_layout="linear",
-    num_waves=8,  # tuned for full-machine b=64 (8 waves/CU, matches the asm ref)
+    num_waves=8,  # 8 waves/CU at full-machine b=64
     num_kv_splits=1,  # inter-workgroup KV split S; host-computed per shape
 ):
     """Build the gfx950 decode-specialized fp8 flash-attention launcher.
@@ -130,14 +126,11 @@ def build_flash_attn_fp8_decode_module(
     OUT = fx.BFloat16 if out_dtype_str == "bf16" else fx.Float16
     SHUF = kv_cache_layout == "vectorized"
     VARLEN = bool(varlen)
-    # Multi-wave cooperative workgroup (occupancy fix): NW waves per
-    # (batch, kv-head) share the 16 query-heads and split the KV page loop
-    # (wave w streams pages w, w+NW, ...). Each produces a partial flash-decoding
-    # softmax (m_w, l_w, O_w); the NW partials are LSE-merged on-chip via LDS.
-    # This lifts waves/CU from 1 (single-wave) toward the CU's capacity -- the
-    # single-wave grid (b*HKV workgroups) was the throughput ceiling. One KV
-    # buffer PER WAVE (no per-wave double-buffer: inter-wave parallelism hides
-    # the DMA latency instead).
+    # Multi-wave cooperative workgroup: NW waves per (batch, kv-head) share the
+    # 16 query-heads and split the KV page loop (wave w streams pages w, w+NW,
+    # ...). Each produces a partial flash-decoding softmax (m_w, l_w, O_w); the
+    # NW partials are LSE-merged on-chip via LDS. One KV buffer per wave (no
+    # per-wave double-buffer: inter-wave parallelism hides the DMA latency).
     NW = int(num_waves)
     BUFSZ = PAGE * HEAD_DIM  # one K (or V) tile in bytes/elements, per wave
     OPART = D * BLOCK_M  # one wave's O^T partial (128*16 f32)
@@ -520,10 +513,10 @@ def build_flash_attn_fp8_decode_module(
 
         # Wave-strided KV split within this split's range: wave w streams pages
         # sp0+w, sp0+w+NW, ...  Each wave keeps its own register-resident partial
-        # (m_c, l_c, fo_c); the NW partials are LSE-merged in the epilogue.
-        # NO s_barrier inside this loop: waves have unequal trip counts, so a
-        # workgroup-wide barrier here would deadlock. Ordering within a wave (DMA
-        # -> LDS read, and read -> next-page overwrite) is a wave-local s_waitcnt.
+        # (m_c, l_c, fo_c); the NW partials are LSE-merged in the epilogue. NO
+        # s_barrier inside this loop: waves have unequal trip counts, so a
+        # workgroup-wide barrier here would deadlock. Intra-wave ordering (DMA ->
+        # LDS read, read -> next-page overwrite) is a wave-local s_waitcnt.
         p_start = fx.Int64(sp0 + wave)
         p_stop = fx.Int64(sp1)
         p_step = fx.Int64(NW)
@@ -910,12 +903,10 @@ def build_flash_attn_fp8_decode_module(
         )
 
     # Keyed on device.index, not a single "cuda" cache slot: this closure is
-    # memoized (per kernel config) across the process by _get_decode_kernel's
-    # lru_cache in unified_attention_kernels.py, so a "cuda" allocation binds
-    # to whatever device was current on first use and gets reused -- wrongly
-    # -- by a later launch on another device, whose stream belongs to that
-    # other device. Mirrors the Aug-12 _target_num_prgms fix (@cache keyed on
-    # device.index).
+    # memoized per kernel config across the process, so a "cuda" allocation
+    # binds to whatever device was current on first use and is then reused --
+    # wrongly -- by a later launch on another device, whose stream belongs to
+    # that other device.
     _dummy_holder = {}
 
     def _dummy_f32(device):

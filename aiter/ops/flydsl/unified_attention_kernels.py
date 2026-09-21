@@ -11,9 +11,9 @@ routes here instead of Triton.
 Dispatch is a pure predicate returning ``None`` when it can't serve the
 config, falling through to Triton unchanged (matches
 ``flydsl_flash_attn_varlen_func`` / the flydsl branch in
-``ops/gemm_op_a8w8.py``) -- deliberately no dispatch env var, since a code gate
-states an arch/shape-scoped choice more honestly than another undocumented
-backend flag. Automatic routing is enabled only when the call's ``q.device`` is
+``ops/gemm_op_a8w8.py``) -- deliberately no dispatch env var (the routing is a
+code gate on arch/shape). Automatic routing is enabled only when the call's
+``q.device`` is
 a full-chip gfx950. Two env knobs govern dispatch: the split-count cap,
 ``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``), and
 ``AITER_DECODE_KERNEL``, the decode-kernel on/off master switch (see
@@ -42,7 +42,6 @@ import torch
 
 from .kernels.flash_attn_dualwave_common import dualwave_splitk_workspace_elems
 from .kernels.flash_attn_fp8_decode_gfx950 import (
-    GFX950_CUS,
     build_flash_attn_fp8_decode_module,
     plan_num_kv_splits,
 )
@@ -63,7 +62,7 @@ def is_flydsl_available(device_index: int) -> bool:
     with torch.cuda.device(device_index):
         props = torch.cuda.get_device_properties(device_index)
     arch = props.gcnArchName.split(":", 1)[0]
-    return arch == "gfx950" and props.multi_processor_count >= GFX950_CUS
+    return arch == "gfx950"
 
 
 # Page size is structural, not a builder parameter: the paged path addresses KV
@@ -84,19 +83,12 @@ def _target_num_prgms(device_index: int) -> int:
     """Split-K fill target: a launch with num_2d_prgms base workgroups is "full"
     at num_2d_prgms >= this value.
 
-    Both full-chip gfx950 parts (MI350X, MI355X) are 256 CUs, so this is a
-    device CU-count query, not a hardcoded arch constant -- it also handles
-    CU-partitioned modes (CPX/NPS) where fewer CUs are exposed. Falls back to
-    256 (the full-chip count) if the query fails.
-
-    Keyed on ``q.device`` (via ``device_index``) and resolved at call time, not
-    once at import: in a multi-GPU process the active device at import can
-    differ from the device a call actually runs on, and a heterogeneous host
-    can expose different CU counts per device -- either would lock in a wrong
-    fill target and mis-select split-K. ``@cache`` keeps it a one-time
-    host-side query per device. The value comes from ``get_num_sms()`` under
-    that device so the CU_NUM override and the tuning-dispatch CU count stay
-    consistent.
+    A device CU-count query (not a hardcoded constant), so it also handles
+    CU-partitioned modes (CPX/NPS) where fewer CUs are exposed; falls back to
+    256 (full-chip gfx950) if the query fails. Keyed on device.index and
+    resolved at call time: in a multi-GPU process the import-time device can
+    differ from the run device, and a heterogeneous host exposes different CU
+    counts per device -- either would lock in a wrong fill target.
     """
     try:
         from aiter.ops.triton.utils.device_info import get_num_sms
@@ -110,8 +102,8 @@ def _target_num_prgms(device_index: int) -> int:
 def _env_max_kv_splits(default: int = 16) -> int:
     """Auto-dispatch split-count cap, overridable by environment.
 
-    Split-K selection cannot be tuned perfectly from shape alone (a lesson from
-    CK), so the cap is an override knob rather than a derived guess.
+    Split-K selection cannot be tuned perfectly from shape alone, so the cap is
+    an override knob rather than a derived guess.
     ``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` raises or lowers it; a non-integer or
     non-positive value is ignored and the default is used.
     """
@@ -125,11 +117,10 @@ def _env_max_kv_splits(default: int = 16) -> int:
     return n if n >= 1 else default
 
 
-# Cap on the auto-dispatched split count. Default 16: no regression across
-# tested decode shapes while capturing most of the long-context win. >16
-# helps only very long contexts and regresses short ones, since _split_count
-# keys on machine fill, not KV depth (counts are verified correct to 128).
-# Raise via AITER_UNIFIED_ATTN_MAX_KV_SPLITS for long-context workloads.
+# Cap on the auto-dispatched split count. Default 16 captures most of the
+# long-context win without regressing short contexts (_split_count keys on
+# machine fill, not KV depth). Raise via AITER_UNIFIED_ATTN_MAX_KV_SPLITS
+# for long-context workloads.
 _MAX_SEGMENTS = _env_max_kv_splits(16)
 
 # block_m, and with it the largest GQA group that can pack into the M dimension.
@@ -144,50 +135,29 @@ _MAX_KV_TILES = 2048
 
 _FP8_DTYPE = torch.float8_e4m3fn
 
-# Minimum decode-half context depth (KV length) at which the mixed-batch dispatch
-# split (below) is taken. Below this the decode half's split-K does not amortize
-# the split's two-launch + partition-sync overhead, so the split regresses vs the
-# single call (chunk=256 was 0.87x at ctx=4096); at/above this every sampled
-# chunk size wins (1.01-1.93x). Set from a gfx950 ctx sweep at chunks 256/512/4023:
-# the crossover is chunk-independent and lands in (5632, 6144];
-# 6144 (96 pages) is the lowest depth where all sampled chunks win noise-robustly.
+# Minimum decode-half context depth (KV length) at which the mixed-batch
+# dispatch split is taken. Below this the decode half's split-K does not
+# amortize the split's two-launch + partition-sync overhead, so the split
+# regresses vs the single call; 6144 (96 pages) is the crossover.
 _SPLIT_MIN_DECODE_KV = 6144
 
-# num_seqs * max_seqlen_k above which pure-decode FlyDSL loses to Triton and is
-# ceded (return None). The FlyDSL kernel is prefill-tuned: for GQA decode
-# (query_len=1, 16:1) a BLOCK_M=256 tile has only 16 live M-rows, and that wasted
-# per-tile compute is exposed at 1 WG/CU (the 97 KB BLOCK_N-based LDS ring pins
-# occupancy). Above this KV-read-volume quantum the exposure dominates and Triton
-# wins ~2x; split-K does not recover it (monotonic-worse at full fill). Boundary
-# from a gfx950 A/B grid: every winning cell has b*ctx <= 65536,
-# every losing cell >= 98304.
-#
-# NOTE: this gates the LEGACY prefill-body decode path only (non-16:1 GQA the
-# decode kernel declines). The decode-specialized kernel's own cede lives in the
-# centralized _decode_dispatch_action block below.
+# num_seqs * max_seqlen_k above which pure-decode FlyDSL loses to Triton and
+# is ceded (return None). The FlyDSL kernel is prefill-tuned: for GQA decode
+# (query_len=1, 16:1) a BLOCK_M=256 tile has only 16 live M-rows, and that
+# wasted per-tile compute is exposed at 1 WG/CU. Above this KV-read-volume
+# quantum the exposure dominates and Triton wins; split-K does not recover
+# it. NOTE: gates only the LEGACY prefill-body decode path; the decode
+# kernel cedes in _decode_dispatch_action.
 _DECODE_CEDE_WORK = 65536
 
 
-# Bounded memo of mixed-batch signatures whose dispatch-split probe DECLINED.
-# Keyed on host-only quantities (the two device-tensor data_ptrs plus the shape
-# scalars), so a lookup costs no device sync -- the point is to avoid re-paying
-# _partition_mixed's ~29us host sync.
-#
-# The residual it removes: a large-chunk + shallow-decode mixed batch passes the
-# host-scalar pre-check (max_seqlen_k reflects the deep PREFILL KV) but declines
-# on the true, shallow decode depth. That batch recurs identically on every
-# decoder layer of a forward pass, so without a memo each layer probes only to
-# decline again. With it, the first layer probes and records the signature; the
-# rest skip straight to the single call.
-#
-# ONLY declines are memoized, and that asymmetry is a correctness invariant, not
-# an optimization: a decline falls through to the single unified call, which is
-# correct for ANY batch composition, so a stale hit (a reused data_ptr whose
-# contents now differ) costs at most a missed split -- never wrong output. A
-# TAKE slices q/out at the probed split_point, so a stale partition would route
-# the wrong rows to each half; takes therefore always re-probe (see the dispatch
-# site). Bounded LRU because data_ptr keys churn across steps; eviction only ever
-# forces a re-probe, never affects correctness.
+# Memoizes only DECLINES of the mixed-batch split probe, to avoid re-paying
+# _partition_mixed's host sync for a batch shape that recurs each decoder
+# layer. The asymmetry is a correctness invariant: a declined split falls
+# through to the always-correct single call, so a stale decline costs at
+# most a missed split, never a wrong result -- whereas a TAKE re-slices on
+# the probed split_point and must always re-probe. Bounded LRU; eviction
+# only forces a re-probe.
 _SPLIT_DECLINE_MEMO: OrderedDict[tuple, bool] = OrderedDict()
 _SPLIT_DECLINE_MEMO_MAX = 128
 
@@ -286,10 +256,9 @@ def _env_use_decode_kernel(default: bool = True) -> bool:
 _DECODE_GQA = 16
 # Master on/off; AITER_DECODE_KERNEL=0 forces the legacy prefill-body/cede path.
 _USE_DECODE_KERNEL = _env_use_decode_kernel()
-# Conservative cede band: mid-batch x deep-context is the measured
-# near-parity/loss region vs Triton on gfx950 (crossover sweep; noisy and not
-# cleanly separable), so cede the whole band to guarantee no regression. Retune
-# against production traces.
+# Conservative cede band: mid-batch x deep-context is the near-parity/loss
+# region vs Triton on gfx950, so cede the whole band to guarantee no
+# regression. Retune against production traces.
 _DECODE_CEDE_MIN_SEQS = 9  # below: machine underfills, split-K decode wins
 _DECODE_CEDE_MAX_SEQS = 48  # above (incl. b=64): batch fills the machine, wins
 _DECODE_CEDE_MIN_KV = 8192  # shallower context always wins on the decode kernel
@@ -409,7 +378,11 @@ def _route_decode_kernel(
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
     npages = (int(max_seqlen_k) + _PAGE_SIZE - 1) // _PAGE_SIZE
     num_kv_splits = plan_num_kv_splits(
-        num_seqs, num_kv_heads, npages, s_max=_MAX_SEGMENTS
+        num_seqs,
+        num_kv_heads,
+        npages,
+        target_wg=_target_num_prgms(q.device.index),
+        s_max=_MAX_SEGMENTS,
     )
     with torch.cuda.device(q.device.index):
         mod = _get_decode_kernel(
@@ -444,14 +417,9 @@ def _route_decode_kernel(
 def _split_count(num_2d_prgms: int, target_num_prgms: int) -> int:
     """Split count from the machine-fill deficit; 1 means single-pass.
 
-    The measured no-oversubscribe rule (NOT Triton's ceil/round-up/MIN=8): the
-    largest power of two such that the launch does not oversubscribe the CU
-    count, capped at _MAX_SEGMENTS. No MIN floor -- b=9 needs 4, below Triton's
-    floor of 8. Below 2 there is no split to take, so the caller falls back to
-    single-pass.
-
-    Verified against the measured best split count: num_2d = 4*b for a
-    b-sequence GQA-16 decode gives b=7 -> 8, b=8 -> 8, b=9 -> 4.
+    The largest power of two whose launch does not oversubscribe the CU count,
+    capped at _MAX_SEGMENTS. No MIN floor (unlike Triton's floor of 8): b=9
+    needs only 4. Below 2 there is no split to take.
     """
     n = 1
     while n * 2 <= _MAX_SEGMENTS and num_2d_prgms * (n * 2) <= target_num_prgms:

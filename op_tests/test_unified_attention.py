@@ -21,9 +21,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import aiter
-import aiter.ops.triton.attention.unified_attention as ua
+import aiter.ops.unified_attention as ua
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.triton.attention.unified_attention import _is_gluon_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 PAGE, H, HKV, D = 64, 64, 4, 128
@@ -409,7 +410,7 @@ def test_routing_backend_gate(config):
         ret = measure(candidates, case, want, query_lens, kv_lens)
         if config != "supported":
             compare(auto, case["out"], 0, "declined config vs Triton bitwise")
-        if ua._is_gluon_available():
+        if _is_gluon_available():
             ret.update(
                 measure(
                     {"gluon": partial(ua.unified_attention, **case, backend="gluon")},
