@@ -10,8 +10,9 @@ they are named for the topology of each lap instead:
 * ``"mesh"`` the default: fanout to all N-1 peers, twice.
 * ``"ring"`` 2(N-1) single-destination hops.
 
-Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
-INT6 bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
+Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble,
+INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E4M3
+scales. INT5 is mesh-only. Payload HBM is bf16.
 
 Two more tuning knobs ride every ladder rung: ``block`` (threads per workgroup,
 which sets the tile) and, on the mesh only, ``skip_self`` (no round trip through

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 **mesh** all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4/INT5/INT6 **mesh** all-reduce.
 
 Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
-INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
+INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. INT5 adds a 1-bit
+plane (1408 B) and INT6 a 2-bit plane (1664 B) at block=256. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
@@ -179,7 +180,7 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
 
 
 # Wire formats the mesh can build.
-MESH_CODECS = ("int4", "int6", "fp16")
+MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
 
 def make_quick_allreduce_mesh_kernel(

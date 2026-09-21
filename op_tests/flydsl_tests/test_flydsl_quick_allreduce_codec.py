@@ -245,7 +245,7 @@ GROUP_ELEMS = 16
 # the true one.
 E4M3_REL_SLACK = 1.0 / 16.0
 
-CODEC_NAMES = ("int4", "int6")
+CODEC_NAMES = ("int4", "int5", "int6")
 
 
 def _payload(
@@ -342,10 +342,25 @@ def test_int6_codec_is_more_accurate_than_int4():
     xf = x.float()
     rms = {
         c: float((codec_roundtrip(x, c).float() - xf).pow(2).mean().sqrt())
-        for c in CODEC_NAMES
+        for c in ("int4", "int6")
     }
     ratio = rms["int6"] / rms["int4"]
     assert 0.15 <= ratio <= 0.30, f"int6/int4 RMS ratio {ratio:.3f}, expected ~0.25"
+
+
+def test_int5_sits_between_int4_and_int6():
+    """One extra bit vs INT4, one fewer than INT6, on the same input."""
+    x = _payload(n_tiles=4, seed=41)
+    xf = x.float()
+    rms = {
+        c: float((codec_roundtrip(x, c).float() - xf).pow(2).mean().sqrt())
+        for c in ("int4", "int5", "int6")
+    }
+    assert rms["int6"] < rms["int5"] < rms["int4"], rms
+    r54 = rms["int5"] / rms["int4"]
+    r65 = rms["int6"] / rms["int5"]
+    assert 0.35 <= r54 <= 0.70, f"int5/int4 RMS ratio {r54:.3f}, expected ~0.5"
+    assert 0.35 <= r65 <= 0.70, f"int6/int5 RMS ratio {r65:.3f}, expected ~0.5"
 
 
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
@@ -354,7 +369,7 @@ def test_degenerate_groups_stay_finite(codec_name):
 
     ``1/d`` is materialised as fp16, so without the clamp in ``_codec_quant`` a
     zero-extremum group reaches the codec as Inf and ``0 * Inf`` poisons the
-    tile. INT6 has a quarter of INT4's headroom here, hence both codecs.
+    tile. INT6 has a quarter of INT4's headroom here; INT5 is in between.
     """
     x = _payload(n_tiles=2, seed=43).reshape(-1, GROUP_ELEMS)
     x[0::4] = 0.0
@@ -530,11 +545,14 @@ def test_one_lap_can_be_pinned_without_disturbing_the_other():
 def test_explicit_codec_the_schedule_cannot_build_raises():
     with pytest.raises(ValueError, match="rs_codec"):
         _resolve("mesh", 8, rs="nosuch")
+    with pytest.raises(ValueError, match="rs_codec"):
+        _resolve("ring", 8, rs="int5")
 
 
 @pytest.mark.parametrize("lap", ("rs", "ag"))
-def test_mesh_mirrors_a_single_named_lap(lap):
-    assert _resolve("mesh", 8, **{lap: "int6"}) == ("int6", "int6")
+@pytest.mark.parametrize("codec", ("int5", "int6"))
+def test_mesh_mirrors_a_single_named_lap(lap, codec):
+    assert _resolve("mesh", 8, **{lap: codec}) == (codec, codec)
 
 
 def test_mesh_rejects_two_different_laps():
