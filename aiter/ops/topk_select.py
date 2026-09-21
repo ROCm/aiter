@@ -775,8 +775,15 @@ def _dispatch(
             )
         )
         top_k_per_row_prefill_sampled(
-            input, starts, ends, idx, None,
-            rows, input.stride(0), input.stride(1), k=topk,
+            input,
+            starts,
+            ends,
+            idx,
+            None,
+            rows,
+            input.stride(0),
+            input.stride(1),
+            k=topk,
         )
     elif backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)

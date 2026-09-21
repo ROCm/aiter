@@ -12,10 +12,6 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
 
-
-# Shape-aware AVO dispatch floor. See top_k_per_row_prefill's docstring for the
-# measured crossover this comes from: many rows fill the machine at a narrower
-# row and win from 32K, few rows do not and lose until 48K.
 # stride0 at which `sampled` overtakes the FlyDSL one-block prefill path, which
 # is what this function reaches below it. Measured per shape, k=2048, fp32, both
 # ops under one @perftest on the same data (flydsl_us / sampled_us, above 1.00
@@ -597,7 +593,9 @@ def top_k_per_row_prefill(
     )
 
 
-@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill_sampled", develop=True)
+@compile_ops(
+    "module_top_k_per_row", fc_name="top_k_per_row_prefill_sampled", develop=True
+)
 def _top_k_per_row_prefill_sampled(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,

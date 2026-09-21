@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
 """Routing tests for top_k_per_row_prefill -> `sampled` at stride0 >= the floor."""
+
 import os
 from unittest import mock
 
@@ -54,15 +54,15 @@ def test_prefill_sampled_dispatch_routing():
         sampled_fn.side_effect = lambda *a, **k: None
 
         run_prefill(below)
-        assert not sampled_fn.called, (
-            "stride0=%d is below the floor and must not use `sampled`" % below
-        )
+        assert (
+            not sampled_fn.called
+        ), f"stride0={below} is below the floor and must not use `sampled`"
 
         sampled_fn.reset_mock()
         run_prefill(at_or_above)
-        assert sampled_fn.called, (
-            "stride0=%d is at the floor and must use `sampled`" % at_or_above
-        )
+        assert (
+            sampled_fn.called
+        ), f"stride0={at_or_above} is at the floor and must use `sampled`"
 
         sampled_fn.reset_mock()
         run_prefill(at_or_above, stable=True)
