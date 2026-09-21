@@ -21,6 +21,7 @@
 
 import argparse
 import itertools
+import re
 import sys
 
 import pandas as pd
@@ -35,6 +36,7 @@ from aiter.benchmark_data_init import (
     make_generator,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.gemm_op_a8w8 import _resolve_mxfp8_gemm_config
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
@@ -61,26 +63,14 @@ _OUT_DTYPE = {"bf16": dtypes.bf16}
 PERSISTENT_TG = 256
 
 
-F8GEMM_BENCHMARK_SPLITK = {
-    (512, 2048, 7168): 8,
-    (512, 7168, 16384): 4,
-    (512, 6144, 7168): 4,
-    (512, 7168, 3072): 4,
-    (512, 65536, 1536): 1,
-    (512, 8192, 1536): 1,
-}
-
-
-def _heuristic_tile(M, N, K, intype):
-    if intype == "a8w8" and (M, N, K) == (512, 8192, 1536):
-        return 128, 128
-    return (64, 512) if M <= 64 else (256, 256)
-
-
-def _heuristic_cluster(M, N, K, intype):
-    if intype == "a8w8" and (M, N, K) in F8GEMM_BENCHMARK_SPLITK:
-        return (4, 4) if N == 8192 else (4, 2)
-    return (4, 1) if M <= 64 else (4, 4)
+def _kernel_geometry(M, kernel_name=""):
+    if kernel_name:
+        match = re.search(r"_(\d+)x(\d+)_(\d+)x(\d+)_ps", kernel_name)
+        if match is None:
+            raise ValueError(f"Unrecognized F8GEMM kernel name: {kernel_name}")
+        return tuple(int(value) for value in match.groups())
+    # Native heuristic used when no tuned config or explicit kernel is selected.
+    return (64, 512, 4, 1) if M <= 64 else (256, 256, 4, 4)
 
 
 def _report_active_tg(M, N, tile_m, tile_n, label):
@@ -282,11 +272,7 @@ def test_gemm(
     test_graph=False,
     num_rotate=0,
 ):
-    if splitk is None:
-        splitk = F8GEMM_BENCHMARK_SPLITK.get((M, N, K), 1) if intype == "a8w8" else 1
-    if splitk < 1 or K % splitk != 0:
-        raise ValueError("splitk must be positive and divide K")
-    if intype != "a8w8" and (no_reduce or splitk != 1):
+    if intype != "a8w8" and (no_reduce or splitk not in (None, 1)):
         raise ValueError("Split-K and --no-reduce are only supported for a8w8")
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
@@ -302,12 +288,12 @@ def test_gemm(
             N,
             K,
         )
-        _tm, _tn = _heuristic_tile(M, N, K, intype)
+        _tm, _tn, _cx, _cy = _kernel_geometry(M)
         return {
             "gfx": get_gfx(),
             "knl_name": knl_name or "(heuristic)",
             "tile": f"{_tm}x{_tn}",
-            "cluster": "4x4",
+            "cluster": f"{_cx}x{_cy}",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -317,6 +303,22 @@ def test_gemm(
 
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
     out_dtype = _OUT_DTYPE[outtype]
+    # Share the public op's CSV lookup and override rules. Resolve before building
+    # the partial reference so --no-reduce validates the actual split count.
+    knl = "" if knl_name in (None, "", "auto") else knl_name
+    if intype == "a8w8":
+        knl, splitk = _resolve_mxfp8_gemm_config(M, N, K, apre, out_dtype, knl, splitk)
+    elif splitk is None:
+        splitk = 1
+    if splitk < 1 or K % splitk != 0:
+        raise ValueError("splitk must be positive and divide K")
+    _tile_m, _tile_n, _cx, _cy = _kernel_geometry(M, knl)
+    if knl_name == "auto" and not knl:
+        middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
+        pre = "ABpreShuffle" if apre else "BpreShuffle"
+        base = f"f8gemm_{outtype}_{middle}_{pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
+        knl = f"_ZN5aiter{len(base)}{base}E"
+
     gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     inp, ref_f32 = _prep(
         intype,
@@ -336,23 +338,8 @@ def test_gemm(
 
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
     # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
-    # heuristic by default (kernelName=""); an explicit --knl-name forces that .co.
+    # CSV-configured when available, otherwise native heuristic (kernelName="").
     kern = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
-    # Dispatch mode. Default (knl_name=None) is heuristic: knl="" lets the op pick
-    # the .co by (b_intype, a_preshuffle). Explicit is opt-in via --knl-name:
-    # "auto" derives this config's mangled name from the CSV convention (see
-    # hsa/gfx1250/mxfp8fp4gemm/mxfp8fp4gemm.csv); any other value is used verbatim.
-    if not knl_name:
-        knl = ""
-    elif knl_name == "auto":
-        middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
-        pre = "ABpreShuffle" if apre else "BpreShuffle"
-        tm, tn = _heuristic_tile(M, N, K, intype)
-        cx, cy = _heuristic_cluster(M, N, K, intype)
-        base = f"f8gemm_{outtype}_{middle}_{pre}_{tm}x{tn}_{cx}x{cy}_ps"
-        knl = f"_ZN5aiter{len(base)}{base}E"
-    else:
-        knl = knl_name
 
     if no_reduce:
         from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
@@ -395,12 +382,10 @@ def test_gemm(
     scale_bytes = (M + N) * (K // MX_SCALE_BLOCK)  # e8m0: 1 byte per 32-K block
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
-    ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
-    # Report TG occupancy for the tile the cpp dispatch picks (M<=64 -> 64x512).
+    ret = {"gfx": get_gfx(), "knl_name": knl or "(heuristic)"}
+    # Report the selected kernel's geometry, including explicit overrides.
     _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
     _pre = "ABpreShuffle" if apre else "BpreShuffle"
-    _tile_m, _tile_n = _heuristic_tile(M, N, K, intype)
-    _cx, _cy = _heuristic_cluster(M, N, K, intype)
     _label = (
         knl or f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
     )
@@ -589,9 +574,9 @@ def main():
         "--knl-name",
         dest="knl_name",
         default=None,
-        help="dispatch mode. Default (unset) = heuristic: the aiter op picks the "
-        ".co from mxfp8fp4gemm.csv by (b_intype, a_preshuffle) and shape. Any other "
-        "value = force that exact mangled knl_name for all runs (developer debug).",
+        help="Default: use the a8w8 tuned CSV, falling back to the native heuristic. "
+        "'auto' makes the selected kernel name explicit; any other value forces "
+        "that exact mangled knl_name for all runs (developer debug).",
     )
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
@@ -609,7 +594,8 @@ def main():
         type=int,
         nargs="+",
         default=None,
-        help="Positive a8w8 split counts. Unset: six target cases use 8/4/4/4/1/1; other cases use 1.",
+        help="Positive a8w8 split counts (not log2). Unset: use the tuned CSV; "
+        "a config miss or explicit kernel defaults to 1.",
     )
     parser.add_argument(
         "--no-reduce",

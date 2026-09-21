@@ -115,6 +115,11 @@ AITER_CONFIG_GEMM_A8W8 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A8W8_MXFP8 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_MXFP8",
+    f"{AITER_ROOT_DIR}/aiter/configs/asm_a8w8_mxfp8_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
@@ -225,6 +230,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_A8W8_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_MXFP8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_MXFP8",
+            AITER_CONFIG_GEMM_A8W8_MXFP8,
+            "asm_a8w8_mxfp8_gemm",
         )
 
     @property

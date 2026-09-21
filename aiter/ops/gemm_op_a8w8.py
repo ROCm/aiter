@@ -1414,8 +1414,8 @@ def gemm_a8w8_bpreshuffle_cktile_tune(
 # ---------------------------------------------------------------------------
 # gfx1250 MXFP8 x MXFP8 GEMM (a8w8) -- ASM, kernarg preload mode.
 # A (activation) and B (weight) are both mxfp8 (e4m3) with OCP MX e8m0 block
-# scales (block=32). Kernel variant is auto-selected by the .cu heuristic
-# unless an explicit kernelName is given. See asm_mxfp8fp4gemm.cu.
+# scales (block=32). Tuned CSV configs select the kernel and split count;
+# config misses use the .cu heuristic. See asm_mxfp8fp4gemm.cu.
 # ---------------------------------------------------------------------------
 @compile_ops(
     "module_mxfp8fp4gemm_asm",
@@ -1434,6 +1434,50 @@ def _mxfp8_mxfp8_gemm_asm(
 ) -> None: ...
 
 
+_MXFP8_GEMM_CONFIG_CACHE: dict = {}
+
+
+@functools.lru_cache(maxsize=1024)
+def get_mxfp8_gemm_config(M, N, K, a_preshuffle, dtype=dtypes.bf16, tuned_file=None):
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_FILE
+    if tuned_file not in _MXFP8_GEMM_CONFIG_CACHE:
+        _MXFP8_GEMM_CONFIG_CACHE[tuned_file] = (
+            pd.read_csv(tuned_file)
+            .drop_duplicates()
+            .set_index(["gfx", "M", "N", "K", "a_preshuffle", "outdtype"])
+            .to_dict("index")
+        )
+    config = _MXFP8_GEMM_CONFIG_CACHE[tuned_file].get(
+        (get_gfx(), M, N, K, int(bool(a_preshuffle)), str(dtype))
+    )
+    if config is None:
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, a_preshuffle:{a_preshuffle}, "
+            f"not found tuned config in {tuned_file}, will use default config!"
+        )
+    elif AITER_LOG_TUNED_CONFIG:
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, a_preshuffle:{a_preshuffle}, "
+            f"found tuned config in {tuned_file}, kernel name is {config['kernelName']}, "
+            f"splitK is {config['splitK']}!"
+        )
+    return config
+
+
+def _resolve_mxfp8_gemm_config(
+    M, N, K, a_preshuffle, dtype=dtypes.bf16, kernelName="", splitk=None
+):
+    # Explicit kernels bypass tuning; an explicit split count overrides the CSV.
+    if not kernelName:
+        config = get_mxfp8_gemm_config(M, N, K, a_preshuffle, dtype)
+        if config is not None:
+            kernelName = config["kernelName"]
+            if splitk is None:
+                splitk = config["splitK"]
+    return kernelName, 1 if splitk is None else splitk
+
+
 def _gemm_a8w8_mxfp8_fake(
     A: Tensor,
     B: Tensor,
@@ -1442,7 +1486,7 @@ def _gemm_a8w8_mxfp8_fake(
     dtype: torch.dtype = dtypes.bf16,
     a_preshuffle: bool = True,
     kernelName: str = "",
-    splitk: int = 1,
+    splitk: int | None = None,
 ) -> Tensor:
     return torch.empty((A.shape[0], B.shape[0]), dtype=dtype, device=A.device)
 
@@ -1456,12 +1500,14 @@ def gemm_a8w8_mxfp8(
     dtype: torch.dtype = dtypes.bf16,
     a_preshuffle: bool = True,
     kernelName: str = "",
-    splitk: int = 1,
+    splitk: int | None = None,
 ) -> Tensor:
     """gfx1250 MXFP8 x MXFP8 GEMM (a8w8). D[M,N] bf16 = A @ B^T with e8m0 block
-    scales. Kernel auto-selected from M/N/K unless ``kernelName`` is given.
-    ``splitk`` defaults to 1; supported 256x256 kernels can emit BF16 partials,
-    which are summed here to preserve the public [M,N] output."""
+    scales. Select kernel and split count from the tuned CSV unless overridden.
+    A config miss uses the native heuristic with ``splitk=1``. Explicit kernels
+    also default to one split. Split counts are literal counts, not log2 values.
+    Supported 256x256 kernels emit BF16 partials, which are summed here to
+    preserve the public [M,N] output."""
     require_gfx1250_asm("gemm_a8w8_mxfp8")
     M = A.shape[0]
     N = B.shape[0]
@@ -1482,6 +1528,9 @@ def gemm_a8w8_mxfp8(
         raise NotImplementedError(
             f"gfx1250 a8w8 MXFP8 GEMM a_preshuffle requires M%2==0, got M={M}"
         )
+    kernelName, splitk = _resolve_mxfp8_gemm_config(
+        M, N, K, a_preshuffle, dtype, kernelName, splitk
+    )
     if splitk < 1:
         raise ValueError("splitk must be a positive integer")
     out = torch.empty(

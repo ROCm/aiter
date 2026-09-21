@@ -71,13 +71,6 @@ struct __attribute__((packed)) KernelArgs
 static_assert(sizeof(KernelArgs) == 80, "Split-K preload KernelArgs must be 80B");
 static_assert(offsetof(KernelArgs, splitk) == 76, "Legacy kernel arguments must remain 76B");
 
-static bool is_f8gemm_target(int M, int N, int K)
-{
-    return M == 512 && ((N == 2048 && K == 7168) || (N == 7168 && K == 16384) ||
-                       (N == 6144 && K == 7168) || (N == 7168 && K == 3072) ||
-                       (N == 65536 && K == 1536) || (N == 8192 && K == 1536));
-}
-
 static bool supports_splitk(const mxfp8fp4gemmConfig& cfg)
 {
     return cfg.b_intype == "mxfp8" && cfg.tile_m == 256 && cfg.tile_n == 256 &&
@@ -116,11 +109,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
     // Tile choice is a plain size rule, not a round/efficiency search: a tiny M
     // wastes most of a 256-tall tile's rows, so M<=64 takes the 64x512 variant;
     // any larger M takes 256x256 (which also fills a full persistent 256-TG wave).
-    const bool target         = b_intype == "mxfp8" && is_f8gemm_target(M, N, K);
-    const bool indexer        = target && N == 8192 && K == 1536;
-    const int  want_tile_m    = indexer ? 128 : ((M <= 64) ? 64 : 256);
-    const int  want_tile_n    = indexer ? 128 : ((M <= 64) ? 512 : 256);
-    const int  want_cluster_y = indexer ? 4 : (target ? 2 : ((M <= 64) ? 1 : 4));
+    const int want_tile_m    = (M <= 64) ? 64 : 256;
+    const int want_tile_n    = (M <= 64) ? 512 : 256;
+    const int want_cluster_y = (M <= 64) ? 1 : 4;
 
     std::string selectedKernelName = "";
     std::string fallbackKernelName = ""; // any valid variant if the wanted tile is absent
@@ -135,8 +126,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
 
         if(cfg.outtype != outtype)
             continue;
-        // The four additions must not retune the existing general path.
-        if(!target && uses_extended_args(cfg))
+        // Tuned kernels are selected by kernelName from the Python CSV lookup.
+        // A config miss keeps the original general dispatch.
+        if(uses_extended_args(cfg))
             continue;
 
         const int m_align = a_preshuffle ? F8GEMM_M_ALIGN_APRE : 1;
