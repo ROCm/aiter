@@ -196,6 +196,38 @@ def run_top_k_per_row_prefill(
 
 
 @perftest()
+def run_top_k_per_row_prefill_sampled(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    num_rows: int,
+    stride_row: int,
+    stride_col: int,
+    k: int = 2048,
+) -> None:
+    """Run the topk-prefill-avo kernels through the same timing harness.
+
+    Same arguments as run_top_k_per_row_prefill so the two are measured under
+    one decorator rather than two, which is the only way the numbers are
+    comparable: @perftest() sizes its argument rotation from the input, so a
+    separately written loop would not defeat L2 the same way.
+    """
+    return aiter.top_k_per_row_prefill_sampled(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values,
+        num_rows,
+        stride_row,
+        stride_col,
+        k=k,
+    )
+
+
+@perftest()
 def run_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -266,10 +298,20 @@ def test_top_k_per_row_prefill(
     data_generation: str = "random",
     flydsl: bool = False,
     stable: bool = False,
+    backend: str = "aiter",
     write_values: bool = False,
 ) -> dict:
     """
     Test topk_per_row_prefill.
+
+    `backend` picks which selector runs: "aiter" for top_k_per_row_prefill,
+    "sampled" for the topk-prefill-avo kernels. Both go through the same data,
+    the same torch.topk reference and the same @perftest timing, so the `us`
+    column is comparable across the two rows of the summary table.
+
+    `write_values` also requests the selected scores. They are checked by
+    gathering the logits at the indices the SAME call returned, so a score that
+    is self-consistently wrong cannot pass.
     """
     ret = {}
     torch.set_default_device("cuda:0")
@@ -293,20 +335,47 @@ def test_top_k_per_row_prefill(
         else None
     )
 
-    # Run the kernel
-    _, us = run_top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        indices,
-        values,
-        num_rows,
-        logits.stride(0),
-        logits.stride(1),
-        k=top_k,
-        flydsl=flydsl,
-        stable=stable,
-    )
+    # The sampled kernels honour rowEnds per row and emit indices only, so record
+    # the shortest row: it is what exercises the per-row extent and the -1
+    # padding, and it is the column to look at when a result disagrees.
+    min_row_len = int((row_ends - row_starts).min())
+    ret["backend"] = backend
+    ret["min_row_len"] = min_row_len
+    ret["write_values"] = write_values
+    if backend == "sampled":
+        if not aiter.topk_sampled_supports(num_rows, logits.stride(0), top_k):
+            ret["context_len"] = logits.shape[1]
+            ret["all_close"] = None
+            ret["us"] = float("nan")
+            ret["note"] = "unsupported geometry"
+            return ret
+        _, us = run_top_k_per_row_prefill_sampled(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            values,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=top_k,
+        )
+        ret["note"] = "" if min_row_len >= top_k else "ragged rows"
+    else:
+        _, us = run_top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            values,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=top_k,
+            flydsl=flydsl,
+            stable=stable,
+        )
+        ret["note"] = ""
 
     # Run reference implementation
     torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)[1]
@@ -501,6 +570,18 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--prefill_backend",
+    type=str,
+    default=["aiter"],
+    choices=["aiter", "sampled"],
+    nargs="+",
+    help="""which prefill selector to measure: `aiter` for
+    top_k_per_row_prefill, `sampled` for the topk-prefill-avo kernels. Pass both to
+    get one summary table with a row per backend per shape.
+    e.g.: --prefill_backend aiter sampled""",
+)
+
+parser.add_argument(
     "-b",
     "--decode_batch_size",
     type=int,
@@ -550,6 +631,20 @@ for data_generation in args.data_generation:
             for num_prefix in args.num_prefix:
                 ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
                 df.append(ret)
+                for backend in args.prefill_backend:
+                    # Both ways round, matching the decode loop: the value
+                    # stores are a separate instantiation of the output
+                    # kernels, so skipping one leaves half of them untested.
+                    for write_values in (False, True):
+                        ret = test_top_k_per_row_prefill(
+                            m,
+                            num_prefix,
+                            k,
+                            data_generation,
+                            backend=backend,
+                            write_values=write_values,
+                        )
+                        df.append(ret)
                 # Cover the one-block radix kernel directly, so a dispatch
                 # change cannot hide a kernel regression.
                 if not one_block_available:
