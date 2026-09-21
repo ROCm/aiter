@@ -900,9 +900,10 @@ def mla_decode_fwd(
         opus_is_fp8 = (
             q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            # 16mx1 (nhead 16, one query token) addresses a real block table; every other
-            # opus shape routes to 16mx8, which has not been ported past one token per page.
-            and (page_size in (1, 2, 4) if max_seqlen_q == 1 else page_size == 1)
+            # No opus fp8 build addresses a real block table any more: 16mx1 (nhead 16, one
+            # query token) routes to 32nx4 and everything else to 16mx8, and neither has
+            # been ported past one token per page.
+            and page_size == 1
             and q_scale is not None
             and kv_scale is not None
         )

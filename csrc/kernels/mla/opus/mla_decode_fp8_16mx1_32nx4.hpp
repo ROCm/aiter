@@ -20,12 +20,43 @@
 // group g by itself (16 nope + 2 rope buffer_load_lds) and scores it, and GEMM1 then walks all
 // four groups as its four k-steps, reading each group's P block and V out of that group's K.
 //
-// THIS IS THE SIMPLE VERSION: one LDS slot, one tile at a time, every stage drained and
-// barriered, nothing in flight across a tile boundary. It exists to get the geometry right
-// and to measure a floor for the pipelined version, so it deliberately spends the whole gmem
-// latency of every tile in the open. The LDS budget is what the pipeline will have to live
-// within: 79360 B, i.e. two blocks per CU (8 waves), which is only reachable because Q aliases
-// the KV region -- see smem_q_offset in the traits.
+// The default build is the two-slot ring: tile t+1's DMA is issued from inside tile t's GEMM0,
+// chunk by chunk in its MFMA shadows, and lands in the other slot while tile t is scored. The
+// loop at the bottom carries the barrier and vmcnt rules, and the three restructurings that
+// were tried against it and lost. AITER_MLA_OPUS_32NX4_SLOTS_1=1 builds the one-slot floor
+// instead -- one tile at a time, every stage drained and barriered, so the whole gmem latency
+// of every tile sits in the open. That is 12.8 to 14.9% slower on the memory-bound shapes and
+// exists to bound what the ring is worth.
+//
+// WHAT IT COSTS (gfx950, from the compiled metadata; the spread is the causal x large_kv
+// fan-out):
+//
+//                  total VGPR (arch + acc)    SGPR    spill / scratch     LDS     blocks/CU
+//   two slots          208 (176 + 32)        99-106       0 / 0        155136 B       1
+//   one slot           152 (152 +  0)        97-106       0 / 0         79360 B       2
+//
+// Neither is register bound. Two slots put a block at 155 KB of gfx950's 160, so it is one
+// block per CU: four waves on four SIMDs, one apiece, and a lone wave owns all 512 registers.
+// The one-slot build fits two blocks and so two waves per SIMD, where the budget is 256 --
+// still twice what it uses. Q aliasing the last KV slot (smem_q_offset in the traits) is what
+// keeps that build under 80 KB and therefore at two blocks.
+//
+// WHERE THE CEILING IS: at b=256 c=8192 page_size=1 the kernel runs at 226.4 us and moves
+// 1.352 GB of DRAM read traffic doing it -- 6.0 TB/s against gfx950's ~6.3 TB/s coalesced
+// roof, i.e. ~95% of the machine. (rocprofv3: TCC_EA0_RDREQ doubled, since the counters come
+// back from half the instances, times 64 B, TCC_EA0_RDREQ_32B being zero so every EA read is
+// a full sector. TCC_HIT / TCC_REQ is 6.3%.) The hand-written asm decode kernel
+// (AITER_MLA_USE_OPUS=0) lands at 227.95 us on the identical shape, which is the cheapest
+// confirmation available that this is a wall and not an implementation.
+//
+// That traffic is 10.07 sectors per 576 B token row against the 9 the data is, and the extra
+// one belongs to the page table rather than to the kernel: 576 is not a multiple of 128, so a
+// row's tail shares a line with the next token row, which at page_size 1 sits somewhere
+// unrelated and is read by an unrelated request at an unrelated time. The 16nx8 header works
+// this through and shows it disappearing at page_size 2 -- but this geometry cannot use
+// page_size > 1 at all, its rope DMA dealing a whole 16-token line so the within-page token
+// offset would have to be per-lane. Here the 11% is structural, and the kernel is already
+// within 5% of what is left after it.
 
 #include "mla_decode_traits.h"
 
@@ -708,19 +739,20 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_base_pos, opus::u32_t ne
 // and passed by reference, so a split-KV request can run several tile ranges into the same
 // accumulator.
 template <class Traits, class VO>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_decode_fp8_kargs kargs,
-                                                                     int kv_ind_ptr_s,
-                                                                     int valid_kv_len,
-                                                                     int tile_begin,
-                                                                     int tile_end,
-                                                                     char* smem_buffer,
-                                                                     int q_len_ptr_s,
-                                                                     int q_len,
-                                                                     VO& v_o,
-                                                                     typename Traits::D_ACC& m_row,
-                                                                     typename Traits::D_ACC& l_row,
-                                                                     float temperature_scale,
-                                                                     int causal_diagonal)
+__device__ __attribute__((always_inline)) void
+mla_decode_fwd_simple(opus_mla_decode_fp8_kargs kargs,
+                      int kv_ind_ptr_s,
+                      int valid_kv_len,
+                      int tile_begin,
+                      int tile_end,
+                      char* smem_buffer,
+                      int q_len_ptr_s,
+                      int q_len,
+                      VO& v_o,
+                      typename Traits::D_ACC& m_row,
+                      typename Traits::D_ACC& l_row,
+                      float temperature_scale,
+                      int causal_diagonal)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -924,8 +956,12 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_de
         tile[1] = load<T::VEC_KV_ROPE>(s_kv, u_r + base + T::smem_rope_line);
     };
 
-    // 4 e_k steps of 2 MFMA, each prefetching the K tile two steps ahead.
-    auto compute_qk_nope = [&](auto& s, auto& q) {
+    // 4 e_k steps of 2 MFMA, each prefetching the K tile two steps ahead. `co` is emitted
+    // after every MFMA, in its shadow: 8 chunks, which is what the KV prefetch is chopped
+    // into (see prefetch_chunk). Hard fences around it because what it carries is
+    // buffer_load_lds -- inline asm the scheduler must not be allowed to regroup back into
+    // one block, which is the whole point of chopping it up.
+    auto compute_qk_nope = [&](auto& s, auto& q, auto&& co) {
         clear(s);
         static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
             constexpr int idx  = ek.value;
@@ -935,7 +971,13 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_de
             // The trailing 0,0 are the f8f6f4 block scales: per-tensor descale rides the
             // softmax temperature instead, and only a literal 0 selects the bare 8-byte form.
             s_tile[0] = mfma0_nope(k_tile[0], q[idx], s_tile[0], 0, 0);
+            __builtin_amdgcn_sched_barrier(0);
+            co(number<2 * idx>{});
+            __builtin_amdgcn_sched_barrier(0);
             s_tile[1] = mfma0_nope(k_tile[1], q[idx], s_tile[1], 0, 0);
+            __builtin_amdgcn_sched_barrier(0);
+            co(number<2 * idx + 1>{});
+            __builtin_amdgcn_sched_barrier(0);
             if constexpr(idx + 2 < T::GEMM0_NOPE_E_K)
             {
                 load_k_nope(v_k_nope[slot], sk_nope_slice(number<idx + 2>{}));
@@ -947,6 +989,7 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_de
             }
         });
     };
+    auto no_co           = [](auto) {};
     auto compute_qk_rope = [&](auto& s, auto& q) {
         load_k_rope(v_k_rope[0], 0_I);
         __builtin_amdgcn_sched_barrier(sched_masks::KEEP_DS_READ_ORDER);
@@ -1072,14 +1115,42 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_de
     auto v_q_rope_slices =
         reinterpret_cast<vector_t<D_Q, T::W_M * T::W_K_ROPE / T::WARP_SIZE>*>(&v_q_rope);
 
-    // The whole body of one tile, out of whichever slot kv_slot_off points at.
-    auto compute_tile = [&](int t) {
-        // --- GEMM0 on this wave's own token group.
+    // The whole body of one tile, out of whichever slot kv_slot_off points at. `prefetch_off`
+    // is the slot tile t+1 goes into, or -1 for the last tile of the range, which must not
+    // prefetch at all -- it would pull a whole tile of KV nobody reads.
+    auto compute_tile = [&](int t, int prefetch_off) {
+        // The tile t+1 prefetch, chopped into one chunk per QK MFMA. As a straight-line block
+        // it is 18 buffer_load_lds plus 3 index loads with no MFMA anywhere near them, and
+        // every LDS-DMA needs m0 rewritten with an s_nop behind it, so it is almost pure
+        // issue latency that nothing covers -- the ISA showed all 18 back to back. Riding the
+        // QK MFMA puts each piece in the shadow of the MFMA that just issued, and delays the
+        // prefetch only by the QK region it now sits inside, not by the half tile that moving
+        // it behind the softmax costs (measured: +5 to +8% on the memory-bound shapes).
+        auto prefetch_chunk = [&](auto chunk) {
+            constexpr int k    = decltype(chunk)::value;
+            constexpr int nope = T::nope_lines_per_wave;
+            constexpr int rope = T::rope_lines_per_wave;
+            if constexpr(k < nope)
+                async_load_kv_nope(prefetch_off, pages[k], number<k>{});
+            else if constexpr(k < nope + rope)
+                async_load_kv_rope(prefetch_off, pages_rope[k - nope], number<k - nope>{});
+            // The indices for t+2 go last: the chunks above still need this tile's.
+            else if constexpr(k == nope + rope)
+                pages = load_pages_nope(t + 2);
+            else if constexpr(k == nope + rope + 1)
+                pages_rope = load_pages_rope(t + 2);
+        };
+
+        // --- GEMM0 on this wave's own token group, with the prefetch in its MFMA shadows.
         load_k_nope(v_k_nope[0], sk_nope_slice(0_I));
         load_k_nope(v_k_nope[1], sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s, v_q_nope_slices);
+        // One scalar branch for the whole region rather than one per chunk.
+        if(prefetch_off >= 0)
+            compute_qk_nope(v_s, v_q_nope_slices, prefetch_chunk);
+        else
+            compute_qk_nope(v_s, v_q_nope_slices, no_co);
         compute_qk_rope(v_s, v_q_rope_slices);
         __builtin_amdgcn_s_setprio(0);
         mask_oob_scores(v_s, t);
@@ -1116,44 +1187,23 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_de
             pages_rope = load_pages_rope(t + 1);
             s_waitcnt_vmcnt(number<T::kv_idx_load_insts>{});
             stage_end_barrier();
-            compute_tile(t);
+            // One slot: the tile being computed is the only one there is, so the prefetch
+            // above already did the work and the QK region carries nothing.
+            compute_tile(t, -1);
             stage_end_barrier();
         }
     }
     else
     {
-        // Ping-pong: tile t computes out of slot (t - tile_begin) & 1 while tile t+1 lands in
-        // the other one. The single barrier at the top of an iteration does both halves of
-        // the handover -- it publishes tile t's DMA, and it proves every wave has finished
-        // reading the OTHER slot (tile t-1's V reads are the last thing before it), which is
-        // what makes it safe to overwrite that slot immediately after.
-        //
-        // One tile of compute is all the slack a 2-slot ring can give the prefetch: the slot
-        // stays live through PV, so tile t+1 cannot be issued any earlier than this barrier.
-        // Buying more would mean pulling V into registers at the top of the phase the way the
-        // 16nx8 kernel does, which here is 64 VGPR per slot -- V is 128 d x 128 tokens per
-        // wave, four times that kernel's share.
-        //
-        // The vmcnt budget below is why the indices are fetched a tile ahead: at the top of
-        // an iteration the queue holds tile t's DMA followed by the indices for t+1, so
-        // waiting for the DMA means leaving kv_idx_load_insts outstanding. Fetch the indices
-        // in the same iteration that uses them and the wait in front of the DMA's address
-        // arithmetic drains the previous prefetch with them.
         for(int t = tile_begin; t < tile_end; ++t)
         {
             s_waitcnt_vmcnt(number<T::kv_idx_load_insts>{});
             stage_end_barrier();
 
             const int nxt_slot_off = kv_slot_off ^ static_cast<int>(T::smem_kv_slot_bytes);
-            if(t + 1 < tile_end)
-            {
-                async_load_kv(nxt_slot_off, pages, pages_rope);
-                pages      = load_pages_nope(t + 2);
-                pages_rope = load_pages_rope(t + 2);
-            }
-            __builtin_amdgcn_sched_barrier(0);
-
-            compute_tile(t);
+            // The prefetch itself is issued from inside the QK region, chunk by chunk; this
+            // only picks the slot, or opts out on the range's last tile.
+            compute_tile(t, t + 1 < tile_end ? nxt_slot_off : -1);
             kv_slot_off = nxt_slot_off;
         }
     }
@@ -1168,8 +1218,8 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_de
 // this item owns the whole request and writes the real output; otherwise it is one split-KV
 // partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits>
-__device__ __attribute__((always_inline)) void
-mla_decode_fwd_one_req(opus_mla_decode_fp8_kargs kargs, int w, char* smem_buffer, float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
+    opus_mla_decode_fp8_kargs kargs, int w, char* smem_buffer, float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1181,12 +1231,12 @@ mla_decode_fwd_one_req(opus_mla_decode_fp8_kargs kargs, int w, char* smem_buffer
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const opus_mla_decode_work_info work_item = kargs.work_info_set[w];
-    [[maybe_unused]] const int batch_idx = work_item.batch_idx;
-    const int slot                       = work_item.partial_slot;
-    const int q_len_ptr_s                = work_item.qo_start;
-    const int q_len_ptr_e                = work_item.qo_end;
-    const int kv_ind_ptr_s               = work_item.kv_start;
-    const int kv_ind_ptr_e               = work_item.kv_end;
+    [[maybe_unused]] const int batch_idx      = work_item.batch_idx;
+    const int slot                            = work_item.partial_slot;
+    const int q_len_ptr_s                     = work_item.qo_start;
+    const int q_len_ptr_e                     = work_item.qo_end;
+    const int kv_ind_ptr_s                    = work_item.kv_start;
+    const int kv_ind_ptr_e                    = work_item.kv_end;
 
     const int q_len        = q_len_ptr_e - q_len_ptr_s;
     const int valid_kv_len = kv_ind_ptr_e - kv_ind_ptr_s;
@@ -1284,8 +1334,9 @@ mla_decode_fwd_one_req(opus_mla_decode_fp8_kargs kargs, int w, char* smem_buffer
 // Persistent entry point: the grid is sized to the machine, not to the problem, and each block
 // drains the work items the metadata kernel assigned it through work_indptr.
 template <class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE,
-                             2) void opus_mla_decode_fp8_16mx1_32nx4_kernel(opus_mla_decode_fp8_kargs kargs)
+__global__
+__launch_bounds__(Traits::BLOCK_SIZE,
+                  2) void opus_mla_decode_fp8_16mx1_32nx4_kernel(opus_mla_decode_fp8_kargs kargs)
 {
     using namespace opus;
     using namespace opus_mla_decode_fp8_16mx1_32nx4;

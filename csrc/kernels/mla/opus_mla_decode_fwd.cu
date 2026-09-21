@@ -24,7 +24,6 @@
 #include "aiter_ctypes_error.h"
 
 #include "aiter_hip_common.h"
-#include "opus/mla_decode_fp8_16mx1_16nx8.hpp"
 #include "opus/mla_decode_fp8_16mx1_32nx4.hpp"
 #include "opus/mla_decode_fp8_16mx8_32nx1.hpp"
 #include "opus/mla_decode_kargs.h"
@@ -79,26 +78,17 @@ using OpusTraitsC =
     opus_mla_decode_fp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV>;
 using OpusTraits = OpusTraitsC<false>;
 
-// --- fp8 (16, 1): 8 waves of 16 KV tokens, Q shared through LDS ---------------------
+// --- fp8 (16, 1): 4 waves of 32 KV tokens, Q shared through LDS ---------------------
 // The 16mx8 kernel above gives every wave its own 16 query rows, so it needs nhead *
 // max_seqlen_q >= 128 to fill a workgroup. At nhead 16 with one query token there are only
-// 16 rows to go round, so this build tiles the KV tokens across the waves instead. It is
-// also the only fp8 build that addresses a real block table (PAGE_SIZE > 1).
-template <bool CAUSAL, bool LARGE_KV = false, int PAGE_SIZE = 1>
-using OpusTraits16mx1C = opus_mla_decode_fp8_16mx1_16nx8_traits<16,
-                                                                16,
-                                                                8,
-                                                                fp8_t,
-                                                                fp8_t,
-                                                                bf16_t,
-                                                                CAUSAL,
-                                                                LARGE_KV,
-                                                                PAGE_SIZE>;
-// A/B alternative for the same shape: 4 waves of 32 KV tokens, ping-pong over two LDS slots.
-// Opt in with AITER_MLA_OPUS_32NX4=1; AITER_MLA_OPUS_32NX4_SLOTS_1=1 then selects the
-// single-slot floor build, which has no DMA overlap but fits two blocks per CU. page_size 1
-// only -- its rope DMA deals a 16-token line, so the within-page token offset would be
-// per-lane above 1.
+// 16 rows to go round, so this build tiles the KV tokens across the waves instead: four
+// waves of 32 tokens, ping-pong over two LDS slots. AITER_MLA_OPUS_32NX4_SLOTS_1=1 selects
+// the single-slot floor build, which has no DMA overlap but fits two blocks per CU.
+//
+// page_size 1 only -- the rope DMA deals a 16-token line, so the within-page token offset
+// would be per-lane above 1. The 16nx8 geometry this replaced is the only fp8 build that
+// ever addressed a real block table; it still sits in opus/ but nothing routes to it, and
+// the python gate now keeps page_size > 1 on the asm path.
 template <bool CAUSAL, bool LARGE_KV = false>
 using OpusTraits16mx1x32nx4C =
     opus_mla_decode_fp8_16mx1_32nx4_traits<16, 32, 4, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, 2>;
@@ -117,17 +107,6 @@ inline bool opus_use_16mx1_kernel(int nhead, int max_seqlen_q)
     return nhead == 16 && max_seqlen_q == 1;
 }
 
-struct OpusLaunch16mx1
-{
-    template <class Traits>
-    static void
-    launch(int num_workers, hipStream_t stream, const opus_mla_decode_fp8_kargs& kargs)
-    {
-        opus_mla_decode_fp8_16mx1_16nx8_kernel<Traits>
-            <<<dim3(num_workers, 1, 1), dim3(Traits::BLOCK_SIZE), 0, stream>>>(kargs);
-    }
-};
-
 struct OpusLaunch16mx1x32nx4
 {
     template <class Traits>
@@ -139,8 +118,7 @@ struct OpusLaunch16mx1x32nx4
     }
 };
 
-// causal x large_kv fan-out, shared by every 16mx1 build. PAGE_SIZE is pinned by the caller
-// because each value costs a whole extra kernel in the binary.
+// causal x large_kv fan-out, shared by every 16mx1 build.
 template <template <bool, bool> class TraitsC, class Launcher>
 void launch_opus_16mx1(bool causal,
                        int max_seqlen_q,
@@ -161,28 +139,6 @@ void launch_opus_16mx1(bool causal,
         launch(TraitsC<false, true>{});
     else
         launch(TraitsC<false, false>{});
-}
-
-template <int PAGE_SIZE>
-void launch_opus_16mx1_paged(bool causal,
-                             int max_seqlen_q,
-                             bool large_kv,
-                             int num_workers,
-                             hipStream_t stream,
-                             const opus_mla_decode_fp8_kargs& kargs)
-{
-    const bool use_causal = causal && max_seqlen_q > 1;
-    auto launch           = [&](auto traits) {
-        OpusLaunch16mx1::template launch<decltype(traits)>(num_workers, stream, kargs);
-    };
-    if(use_causal && large_kv)
-        launch(OpusTraits16mx1C<true, true, PAGE_SIZE>{});
-    else if(use_causal)
-        launch(OpusTraits16mx1C<true, false, PAGE_SIZE>{});
-    else if(large_kv)
-        launch(OpusTraits16mx1C<false, true, PAGE_SIZE>{});
-    else
-        launch(OpusTraits16mx1C<false, false, PAGE_SIZE>{});
 }
 
 } // namespace
@@ -437,13 +393,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const std::string gfx = get_gpu_arch();
     AITER_CHECK(
         gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
-    // Only the 16mx1 build addresses a block table. 4 is allowed but buys ~0.5% over 2 --
-    // see the PAGE_SIZE note in its traits.
+    // No build here addresses a block table any more: the 16mx1 shape routes to 32nx4,
+    // whose rope DMA deals a 16-token line and so cannot carry a per-lane within-page
+    // offset. page_size > 1 belongs to the asm path, and the python gate keeps it there.
     const bool use_16mx1 = opus_use_16mx1_kernel(q->size(1), max_seqlen_q);
-    AITER_CHECK(page_size == 1 || (use_16mx1 && (page_size == 2 || page_size == 4)),
-                __func__,
-                ": page_size must be 1 (or 1/2/4 for nhead 16 with one query token), got ",
-                page_size);
+    AITER_CHECK(page_size == 1, __func__, ": only page_size == 1 is supported, got ", page_size);
     AITER_CHECK(q->size(-1) == T::D_HEAD_SIZE,
                 __func__,
                 ": q last dim must be ",
@@ -477,12 +431,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.q_scale_ptr   = q_scale->data_ptr();
     kargs.kv_buffer_ptr = kv->data_ptr();
     kargs.kv_scale_ptr  = kv_scale->data_ptr();
-    // Only the paged builds read it, and only for the work item at a batch tail; left null
-    // at page_size 1 so nothing can quietly start depending on it there.
-    kargs.kv_last_page_lens =
-        (page_size > 1 && kv_last_page_lens && kv_last_page_lens->numel() > 0)
-            ? static_cast<const int*>(kv_last_page_lens->data_ptr())
-            : nullptr;
+    // Only a paged build would read it, and there is none left; null so nothing can quietly
+    // start depending on it.
+    kargs.kv_last_page_lens = nullptr;
     kargs.out_ptr   = out->data_ptr();
     kargs.lse_ptr   = (final_lse && final_lse->numel() > 0) ? final_lse->data_ptr() : nullptr;
     kargs.o_accum   = logits->data_ptr();
@@ -517,28 +468,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     if(use_16mx1)
     {
-        // Opt-in A/B of the 32nx4 geometry on the same shape: 4 waves of 32 KV tokens with
-        // a ping-pong ring, against 8 waves of 16 with a 2-slot pipeline.
-        static const bool want_32nx4 = opus_env_flag("AITER_MLA_OPUS_32NX4");
+        // The floor build, for A/B only: one slot, so a tile's whole gmem latency sits in
+        // the open. Measured 13 to 15% slower than the ring on the memory-bound shapes.
         static const bool want_1slot = opus_env_flag("AITER_MLA_OPUS_32NX4_SLOTS_1");
 
-        if(want_32nx4 && page_size == 1)
-        {
-            if(want_1slot)
-                launch_opus_16mx1<OpusTraits16mx1x32nx4S1C, OpusLaunch16mx1x32nx4>(
-                    causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
-            else
-                launch_opus_16mx1<OpusTraits16mx1x32nx4C, OpusLaunch16mx1x32nx4>(
-                    causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
-        }
-        else if(page_size == 2)
-            launch_opus_16mx1_paged<2>(
-                causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
-        else if(page_size == 4)
-            launch_opus_16mx1_paged<4>(
+        if(want_1slot)
+            launch_opus_16mx1<OpusTraits16mx1x32nx4S1C, OpusLaunch16mx1x32nx4>(
                 causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
         else
-            launch_opus_16mx1_paged<1>(
+            launch_opus_16mx1<OpusTraits16mx1x32nx4C, OpusLaunch16mx1x32nx4>(
                 causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
         return;
     }
