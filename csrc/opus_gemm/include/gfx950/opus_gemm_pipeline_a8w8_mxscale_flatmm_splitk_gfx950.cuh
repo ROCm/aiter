@@ -162,22 +162,34 @@ inline __device__ auto make_layout_rb_mxsk(int lane_id) {
 
 template<typename T>
 inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stride_sfa) {
+    // The K side is two dims so the lane's own MX block can be addressed: the
+    // y dim steps one per MFMA and the p dim picks the block inside it. Their
+    // order puts the p dim innermost, so the byte index is
+    // ik * SF_PER_MFMA_K + lane block -- the natural K order of the scale row.
+    //
+    // The A *fragment* layout has carried lane_id / W_M since it was written
+    // (make_layout_ra_mxsk's last p coord); the scale layout did not, which is
+    // the whole of what made every scale block 128 wide. At GROUP_K=128 the p
+    // dim has extent 1 and SF_LANE_K_DIV sends its coord to 0, so this is the
+    // same address it always produced.
     constexpr auto sfa_block_shape = opus::make_tuple(
         opus::number<T::COM_REP_M>{},
         opus::number<T::T_M>{},
         opus::number<T::W_M>{},
-        opus::number<T::B_K / T::GROUP_K>{});
+        opus::number<T::SF_LANE_SCALES_PER_BK>{},
+        opus::number<T::SF_PER_MFMA_K>{});
 
     constexpr auto sfa_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}));
 
     return opus::make_layout(
         sfa_block_shape,
         opus::unfold_x_stride(sfa_block_dim, sfa_block_shape,
             opus::tuple{stride_sfa, 1_I}),
         opus::unfold_p_coord(sfa_block_dim,
-            opus::tuple{wave_id_m, lane_id % T::W_M}));
+            opus::tuple{wave_id_m, lane_id % T::W_M,
+                        (lane_id / T::W_M) / T::SF_LANE_K_DIV}));
 }
 
 // pack_e8m0x4 (broadcast e8m0 -> x4 word) is shared via opus_gemm_utils.cuh.
