@@ -33,13 +33,9 @@ DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 def _default_decode_config(
     batch_size, next_n, heads, head_dim, max_seq_len, kv_block_size
 ):
-    if next_n % 4 == 0 and heads == 64 and head_dim == 128 and kv_block_size == 64:
-        return 256, 4
-
-    four_wave_ctas = batch_size * next_n * ((max_seq_len + 255) // 256)
-    if kv_block_size <= 64 and heads >= 32 and four_wave_ctas > 4:
-        return 64, 1
-    return 256, 4
+    head_waves = min(4, triton.next_power_of_2(triton.cdiv(heads, 32)))
+    num_warps = max(2, head_waves)
+    return 64 * (num_warps // head_waves), num_warps
 
 
 @triton.jit
@@ -703,17 +699,16 @@ def flydsl_pa_mqa_logits_fp4(
 ) -> torch.Tensor:
     """Decode/varctx FP4 paged MQA logits (gfx950).
 
-    When ``block_k`` and ``num_warps`` are omitted, the launch configuration is
-    selected from the available CTA parallelism. Explicit values are preserved.
-    ``parallel_unit_num`` is the persistent-grid CTA count; when ``None`` it is
-    auto-derived (cudagraph-safe, no device→host sync) as
-    ``batch * next_n * ceil(max_seq_len / block_k)``, which is a multiple of
-    ``next_n`` and ``>= batch*next_n`` by construction. Pass a smaller explicit
-    value to trade parallelism for fewer no-op CTAs.
+    Head waves share double-buffered LDS KV tiles and reduce within the CTA.
+    This is the same decode algorithm for every ``next_n``. Without an external
+    schedule, work intervals are derived from ``context_lens`` on the device.
+    ``parallel_unit_num`` optionally limits the direct grid; external schedules
+    retain their original ``[row, chunk_start, chunk_count, context_len]`` ABI.
     """
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
-    max_blocks_per_seq = block_tables.shape[1]
+    if next_n < 1 or batch_size < 1 or max_seq_len < 1:
+        raise ValueError("batch_size, next_n, and max_seq_len must be positive.")
     if block_k is None and num_warps is None:
         block_k, num_warps = _default_decode_config(
             batch_size,
@@ -727,30 +722,23 @@ def flydsl_pa_mqa_logits_fp4(
         block_k = 64 * num_warps
     elif num_warps is None:
         num_warps = block_k // 64
+    if block_k < 1 or num_warps < 1:
+        raise ValueError("block_k and num_warps must be positive.")
     if q_next_n != next_n:
         raise ValueError(f"q_fp4 next_n dim ({q_next_n}) != next_n arg ({next_n}).")
 
-    use_grouped = (
-        next_n % 4 == 0
-        and block_k == 256
-        and kv_block_size == 64
-        and num_warps == 4
-        and heads == 64
-        and head_dim == 128
-    )
     if (cta_info is None) != (total_ctas is None):
         raise ValueError("Pass both cta_info and total_ctas, or neither.")
     schedule_internal = cta_info is None
+    direct_chunks = 0
     if schedule_internal:
-        if use_grouped and parallel_unit_num is None:
-            chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
-            parallel_unit_num = max(
-                batch_size * next_n,
-                min(batch_size * next_n * chunks_per_seq, 2048),
-            )
-        _, cta_info, total_ctas = compute_varctx_schedule(
-            context_lens, block_k, parallel_unit_num, max_seq_len, next_n=next_n
-        )
+        direct_chunks = (max_seq_len + block_k - 1) // block_k
+        if parallel_unit_num is not None:
+            if parallel_unit_num < batch_size * next_n or parallel_unit_num % next_n:
+                raise ValueError("parallel_unit_num must cover all rows and be divisible by next_n.")
+            direct_chunks = min(direct_chunks, parallel_unit_num // (batch_size * next_n))
+        cta_info = context_lens.to(dtype=torch.int32)
+        total_ctas = batch_size * next_n * direct_chunks
 
     if out is None:
         out = torch.full(
@@ -762,41 +750,25 @@ def flydsl_pa_mqa_logits_fp4(
     elif schedule_internal:
         out.fill_(float("-inf"))
 
-    if use_grouped and total_ctas % 4 == 0:
-        from .pa_mqa_logits_fp4_prefill import compile_pa_mqa_logits_fp4_prefill
+    from .pa_mqa_logits_fp4_decode import compile_pa_mqa_logits_fp4_decode
 
-        launcher, _ = compile_pa_mqa_logits_fp4_prefill(
-            kv_page_stride=kv_cache.stride(0),
-            kv_scale_page_stride=kv_scale.stride(0),
-            block_table_stride=block_tables.stride(0),
-            weight_scale=float(weight_scale),
-            decode_next_n=next_n,
-        )
-        if stream is None:
-            stream = torch.cuda.current_stream()
-        launcher(
-            out,
-            q_fp4,
-            q_scale,
-            kv_cache,
-            kv_scale,
-            block_tables,
-            weights,
-            cta_info,
-            out.stride(0),
-            total_ctas // 4,
-            stream,
-        )
-        return out
-
-    launcher, _ = compile_pa_mqa_logits_fp4(
+    head_waves = min(num_warps, 4, triton.next_power_of_2(triton.cdiv(heads, 32)))
+    while head_waves > 1 and (head_waves not in (1, 2, 4) or num_warps % head_waves):
+        head_waves //= 2
+    launcher, _ = compile_pa_mqa_logits_fp4_decode(
         block_k=block_k,
         kv_block_size=kv_block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
+        kv_page_stride=kv_cache.stride(0),
+        kv_scale_page_stride=kv_scale.stride(0),
+        block_table_stride=block_tables.stride(0),
         num_warps=num_warps,
+        head_waves=head_waves,
+        scalar_weights=total_ctas >= 768,
         next_n=next_n,
         heads=heads,
         head_dim=head_dim,
+        direct_chunks=direct_chunks,
+        max_seq_len=max_seq_len,
     )
 
     if stream is None:

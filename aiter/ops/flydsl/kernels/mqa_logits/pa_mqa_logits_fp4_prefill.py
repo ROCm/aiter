@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, rocdl
+from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
@@ -322,7 +322,6 @@ def compile_pa_mqa_logits_fp4_prefill(
     kv_scale_page_stride: int,
     block_table_stride: int,
     weight_scale: float = 1.0,
-    decode_next_n: int = 0,
 ):
     """Build the FP4 MQA prefill kernel.
 
@@ -357,65 +356,36 @@ def compile_pa_mqa_logits_fp4_prefill(
             fx.Int64(fx.ptrtoint(fx.get_iter(cta_info_ptr)))
         )
         cta_record = fx.Int32(pid) * fx.Int32(ROWS_PER_CTA) + warp_id_uniform
-        if const_expr(decode_next_n > 0):
-            cta_base = cta_record * fx.Int32(4)
-            cta_info_lo = fx.Vector(
-                buffer_ops.buffer_load(
-                    cta_rsrc,
-                    cta_base,
-                    vec_width=4,
-                    dtype=fx.Int32,
-                    is_scalar=True,
-                )
+        cta_rsrc_v4i32 = llvm.bitcast(
+            ir.VectorType.get([4], T.i32),
+            llvm.ptrtoint(ir.IntegerType.get_signless(128), as_mlir_value(cta_rsrc)),
+        )
+        cta_base = cta_record * fx.Int32(CTA_INFO_WIDTH)
+        cta_info_lo = fx.Vector(
+            buffer_ops.buffer_load(
+                cta_rsrc, cta_base, vec_width=4, dtype=fx.Int32, is_scalar=True
             )
-            batch_packed = cta_info_lo[0]
-            batch_id = batch_packed // fx.Int32(decode_next_n)
-            chunk_start = cta_info_lo[1]
-            chunk_count = cta_info_lo[2]
-            context_len = cta_info_lo[3]
-            row_in_batch = batch_packed % fx.Int32(decode_next_n)
-            local_start = fx.Int32(0)
-            local_end_raw = context_len - fx.Int32(decode_next_n - 1) + row_in_batch
-            local_end = (local_end_raw > fx.Int32(0)).select(local_end_raw, fx.Int32(0))
-            row_active = local_end > fx.Int32(0)
-            row_id = batch_packed
-        else:
-            cta_rsrc_v4i32 = llvm.bitcast(
-                ir.VectorType.get([4], T.i32),
-                llvm.ptrtoint(
-                    ir.IntegerType.get_signless(128), as_mlir_value(cta_rsrc)
-                ),
+        )
+        cta_info_hi = fx.Vector(
+            llvm.inline_asm(
+                ir.VectorType.get([2], T.i32),
+                [
+                    cta_rsrc_v4i32,
+                    as_mlir_value((cta_base + fx.Int32(4)) * fx.Int32(4)),
+                ],
+                "s_buffer_load_dwordx2 $0, $1, $2 offset:0",
+                "=s,s,s",
+                has_side_effects=False,
             )
-            cta_base = cta_record * fx.Int32(CTA_INFO_WIDTH)
-            cta_info_lo = fx.Vector(
-                buffer_ops.buffer_load(
-                    cta_rsrc,
-                    cta_base,
-                    vec_width=4,
-                    dtype=fx.Int32,
-                    is_scalar=True,
-                )
-            )
-            cta_info_hi = fx.Vector(
-                llvm.inline_asm(
-                    ir.VectorType.get([2], T.i32),
-                    [
-                        cta_rsrc_v4i32,
-                        as_mlir_value((cta_base + fx.Int32(4)) * fx.Int32(4)),
-                    ],
-                    "s_buffer_load_dwordx2 $0, $1, $2 offset:0",
-                    "=s,s,s",
-                    has_side_effects=False,
-                )
-            )
-            encoded_row_id = cta_info_lo[0]
-            batch_id = cta_info_lo[1]
-            chunk_start = cta_info_lo[2]
-            chunk_count = cta_info_lo[3]
-            local_start = cta_info_hi[0]
-            local_end = cta_info_hi[1]
-            row_active = encoded_row_id >= fx.Int32(0)
-            row_id = row_active.select(encoded_row_id, -encoded_row_id - fx.Int32(1))
+        )
+        encoded_row_id = cta_info_lo[0]
+        batch_id = cta_info_lo[1]
+        chunk_start = cta_info_lo[2]
+        chunk_count = cta_info_lo[3]
+        local_start = cta_info_hi[0]
+        local_end = cta_info_hi[1]
+        row_active = encoded_row_id >= fx.Int32(0)
+        row_id = row_active.select(encoded_row_id, -encoded_row_id - fx.Int32(1))
         inactive_row_off = row_active.select(
             fx.Int32(0), fx.Int32(NON_WRITER_ELEMENT_OFFSET)
         )
