@@ -265,7 +265,8 @@ def _get_kernel(
 # combine.
 # ===========================================================================
 def _env_use_decode_kernel(default: bool = True) -> bool:
-    """Defensive parse of AITER_DECODE_KERNEL, the decode-kernel master switch.
+    """Defensive parse of AITER_DECODE_KERNEL, the enabled-by-default master
+    switch for the BLOCK_M=16 multi-wave + register-V + split-K decode path.
 
     Mirrors ``_env_max_kv_splits``: a bad value (non-integer, e.g. ``true``/
     ``on``/empty) must not abort import. The importer in unified_attention.py
