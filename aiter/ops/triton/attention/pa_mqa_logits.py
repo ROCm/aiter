@@ -476,6 +476,7 @@ def deepgemm_fp8_paged_mqa_logits(
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
     VarCtxSchedule: torch.Tensor = None,
+    SplitKV: int | None = None,
 ):
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
@@ -490,13 +491,19 @@ def deepgemm_fp8_paged_mqa_logits(
             WavePerEU = 1
 
     TileQCount = batch_size * next_n
-    SplitKV = (
-        (max(1, TotalCuCount // TileQCount) + 4)
-        // 5
-        * 5
-        * WavePerEU
-        * (2 if get_gfx() == "gfx1250" else 1)
-    )
+    if SplitKV is None:
+        if get_gfx() == "gfx1250":
+            SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU * 2
+        else:
+            # Two workgroups per CU, with the context split evenly between
+            # them. Rounding SplitKV itself to a multiple of 5 leaves the grid
+            # at a fraction of the CU count -- 2.5 workgroups per CU at batch
+            # 16/32/64 -- so half the CUs run one more workgroup than the other
+            # half and the kernel waits for them. Sizing the grid instead of
+            # SplitKV keeps that from happening at any batch.
+            SplitKV = max(1, -(-2 * TotalCuCount // TileQCount))
+            # Splits past the last chunk return immediately; don't launch them.
+            SplitKV = min(SplitKV, max(1, -(-max_model_len // ChunkK)))
 
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
