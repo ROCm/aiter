@@ -3597,3 +3597,12 @@ def launch_gemm_a8w4_tdm_optimized(
         )
     else:
         kernel(*kargs).launch(grid=grid, block=(block, 1, 1), stream=stream)
+
+
+launch_gemm_a8w4_tdm_optimized.compile_hints["llvm_options"] = {
+    "amdgpu-expert-scheduling-mode": AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
+    "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+    "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    "enable-post-misched": AITER_FLYDSL_GEMM1_POST_MISCHED,
+    "lsr-drop-solution": AITER_FLYDSL_GEMM1_LSR_DROP_SOLUTION,
+}
