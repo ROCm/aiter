@@ -44,7 +44,7 @@ def dpp_xor_f32(src, offset: int, **kw):
     from flydsl._mlir.dialects import arith as _arith_dialect
     from flydsl.expr.typing import T
 
-    src_i32 = _to_ir(src).bitcast(T.i32)
+    src_i32 = fx.Float32(src).bitcast(fx.Int32)
     if offset == 8:
         out_i32 = update_dpp_i32(src_i32, src_i32, 280, 0xF, 0xC, False, **kw)
         out_i32 = update_dpp_i32(out_i32, src_i32, 264, 0xF, 0x3, False, **kw)
