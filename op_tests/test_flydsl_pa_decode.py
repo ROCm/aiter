@@ -1,20 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""One parametrized correctness/contract test and a CLI performance sweep.
+"""Parametrized correctness/contract test and CLI benchmark.
 
     python -m pytest -q op_tests/test_flydsl_pa_decode.py
     python op_tests/test_flydsl_pa_decode.py -d bf16 -b 200 -q 4 \
         -s 16,1,128,200000 --block-size 16 128 --trans-v 0 1 \
         --per-token 1 --num-partitions 3 5
 
-Both entry points share input generation, the FP32 reference and kernel launch.
-Context lengths include the MTP query tokens. Explicit partition counts override
-automatic recommendations; the CLI times attention plus the native reducer.
-Plans default to a per-sequence partition cap equal to the device's CU count.
-Positive sliding windows require a work plan: planned cases check numerics and
-graph replays, while static cases check rejection by the core and wrapper APIs.
-Disabled windows retain both static and planned numerical coverage.
+Contexts include MTP tokens. Positive windows require a plan; 0/-1 allow both
+static and planned decoding. Plan caps default to device CU count; explicit
+partitions override static recommendations. CLI timing includes the reducer.
 """
 
 import argparse
@@ -113,7 +109,7 @@ def _require_gpu():
 
 @pytest.fixture(autouse=True)
 def _default_cuda_device():
-    # Do not leak the default device into other files in the shared CI shard.
+    # Restore the default device for other tests.
     _require_gpu()
     previous = torch.get_default_device()
     torch.set_default_device("cuda")
@@ -169,8 +165,7 @@ def run_torch(
             log_denominator = torch.logaddexp(
                 log_denominator, sinks.float().reshape(1, kv_heads, group, 1)
             )
-        # A +inf sink suppresses all finite KV logits. Fully masked rows need
-        # an explicit zero because -inf - -inf is undefined without a sink.
+        # +inf sinks suppress finite logits; zero empty rows after -inf - -inf.
         probs = torch.exp(scores - log_denominator)
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
@@ -178,7 +173,6 @@ def run_torch(
 
 
 def _make_inputs(case, planned=False):
-    """Build one sparse/dense paged cache, launch arguments and reference call."""
     torch.manual_seed(37 if case.sparse else 0)
     batch, page, dim = len(case.lengths), case.block_size, case.head_dim
     kv_heads, ql = case.num_kv_heads, case.query_length
@@ -190,7 +184,7 @@ def _make_inputs(case, planned=False):
     )
     query = torch.empty((batch * ql, heads, dim), dtype=case.dtype).uniform_(-0.5, 0.5)
     if case.masked_scale:
-        query.zero_()  # Also exercise online Q quantization with zero Q scale.
+        query.zero_()  # Exercise zero-scale Q quantization.
     key = torch.empty((num_pages, kv_heads, page, dim), dtype=case.dtype).uniform_(
         -0.5, 0.5
     )
@@ -205,7 +199,7 @@ def _make_inputs(case, planned=False):
         head = torch.arange(kv_heads).reshape(1, kv_heads, 1, 1)
         key_scale *= torch.exp2(((2 * token + head) % 4 - 2).float())
         factors = torch.exp2(((token + 2 * head) % 5 - 3).float())
-        # Exact binary ratios isolate W=1 masking from existing FP8 P rounding.
+        # Power-of-two scales isolate W=1 masking from FP8 P rounding.
         value_scale = (
             factors * 2**-10 if case.sliding_window == 1 else value_scale * factors
         )
@@ -214,9 +208,8 @@ def _make_inputs(case, planned=False):
     for length, count in zip(case.lengths, counts):
         end = start + count
         if 0 < length <= 4 or (case.sink_dtype is not None and length in (257, 513)):
-            # Positive, periodic V covers short rows and makes repeated sink
-            # mass across multiple partitions observable without cancellation.
-            # Per-tensor cases keep their shared scale and use larger FP8 values.
+            # Positive periodic V exposes repeated sink mass without cancellation;
+            # per-tensor cases retain a shared scale and use larger FP8 values.
             token_values = (torch.arange(count * page) % 4 + 1).float()
             token_values *= 0.25 if case.per_token else 32
             key_quant[start:end].zero_()
@@ -354,7 +347,7 @@ def _make_inputs(case, planned=False):
 
 
 def _run_flydsl(*args, sliding_window=0, work_plan=None):
-    # Fixtures use the core signature; the wrapper inserts ps before sinks.
+    # The wrapper needs ps=True before sinks.
     args = (*args[:-1], True, args[-1])
     if work_plan is None:
         torch.ops.aiter.pa_decode_flydsl(*args, sliding_window=sliding_window)
@@ -418,7 +411,7 @@ def _assert_plan(plan, lengths):
 
 
 def _assert_contracts(args, options):
-    """Reuse the valid inputs for API validation instead of separate fixtures."""
+    """Reuse numerical inputs for API validation."""
     heads = args[1].shape[1]
     for invalid, error in [
         ([0.0] * heads, TypeError),
@@ -528,7 +521,7 @@ def _case(
 
 
 def _cases(columns, rows, *, prefix="", **shared):
-    """Expand a small parameter table using the same defaults as _case."""
+    """Expand parameter rows over shared defaults."""
     return [
         _case(
             prefix + name,
@@ -538,14 +531,11 @@ def _cases(columns, rows, *, prefix="", **shared):
     ]
 
 
-# Every row uses the same correctness/contract flow in static and planned modes.
-# Positive windows reject static calls; disabled windows run numerics in both.
 BF16, FP16, FP32 = torch.bfloat16, torch.float16, torch.float32
 LENS_1024 = (0, 1, 1025, 1281)
 LENS_4096 = (0, 1, 4097, 4353)
 LENS_8192 = (0, 1, 8193, 8449)
 CASES = [
-    # Scalar scales, head dimensions and ordinary MTP/window boundaries.
     *_cases(
         "shape cache parts window sink",
         [
@@ -572,7 +562,6 @@ CASES = [
         dtype=FP16,
         lengths=(0, 1, 257, 16384, 16385),
     ),
-    # Explicit splits also cover padded query rows and direct/partitioned sinks.
     _case(
         "np1-fused-sink", cache=(16, 1, 1), parts=1, window=1, sink=FP32, query_splits=1
     ),
@@ -648,7 +637,6 @@ CASES = [
         query_splits=1,
         wide_kv_addressing=False,
     ),
-    # Small/large batches and overprovisioned or tight plan capacities.
     _case("mtp2-query-split", (2, 1, 16, 128), parts=3, lengths=(257, 259)),
     *_cases(
         "cache parts window lengths workgroup_budget",
@@ -660,7 +648,6 @@ CASES = [
         ],
         prefix="mtp4-",
     ),
-    # Ragged/empty owners, both window endpoints and their immediate neighbors.
     *_cases(
         "parts window lengths workgroup_budget",
         [
@@ -724,7 +711,6 @@ CASES = [
         lengths=LENS_8192,
         workgroup_budget=136,
     ),
-    # QL1: layouts, address widths, head counts and padded GQA sizes.
     *_cases(
         "workgroup_budget wide_kv_addressing",
         [
@@ -798,7 +784,6 @@ CASES = [
         prefix="hkv2-prefetch-",
         parts=8,
     ),
-    # Large/automatic partition counts and integer-limit windows.
     _case(
         "long-200k",
         cache=(128, 0, 1),
@@ -815,7 +800,7 @@ CASES = [
     _case("large-batch-auto", cache=(128, 0, 1), parts=None, lengths=(257,) * 200),
     _case("small-batch-auto", (1, 1, 8, 128), (16, 0, 0), None, lengths=(257,) * 3),
     _case("default-cu-window", parts=None, window=1024, sink=FP32, lengths=LENS_1024),
-    # With CU > 256, the long row uses 257 tasks and exercises the larger reducer.
+    # CU > 256 gives the long row 257 reducer tasks.
     _case(
         "default-cu-head256",
         (2, 1, 8, 256),
@@ -857,7 +842,7 @@ CASES = [
         BF16,
         workgroup_budget=17,
     ),
-    # Masked per-token scales and poisoned reducer padding/tail boundaries.
+    # Inactive scales and NaN scratch must not contaminate live rows.
     *_cases(
         "shape sink",
         [("decode", (1, 1, 16, 128), FP32), ("mtp", (4, 1, 16, 128), None)],
@@ -893,7 +878,7 @@ CASES = [
 @pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])
 @pytest.mark.parametrize("case", CASES)
 def test_pa_decode(case, planned, monkeypatch):
-    """Reject static windows; otherwise check real kernels, plans and replays."""
+    """Check numerics, contracts and graph replays."""
     if planned and case.num_partitions is not None:
         context = torch.tensor(case.lengths, dtype=torch.int32)
         num_compute_units = torch.cuda.get_device_properties(
@@ -932,7 +917,6 @@ def test_pa_decode(case, planned, monkeypatch):
             context.numel() * args[8], max(context.numel(), budget_slots)
         )
 
-    # Force only explicitly requested variants; ordinary cases use production defaults.
     module = importlib.import_module("aiter.ops.flydsl.pa_decode")
     overrides = {
         name: getattr(case, name)
@@ -997,7 +981,7 @@ def test_pa_decode(case, planned, monkeypatch):
 
     _assert_contracts(args, options)
     if plan is not None:
-        # Exercise planner integer limits without allocating an INT32_MAX KV cache.
+        # Check int32 limits without allocating a matching KV cache.
         lengths = (-1, 0, 1, 257, 2**31 - 1)
         extreme_plan = plan_pa_decode(
             torch.tensor(lengths, dtype=torch.int32),
@@ -1024,7 +1008,6 @@ def run_pa_decode_tile_case(
     query_length=1,
     num_partitions=None,
 ):
-    """CLI-only timing wrapper around the same input/reference/launch helpers."""
     if min(batch_size, context_length, query_length, num_query_heads, num_kv_heads) < 1:
         raise ValueError(
             "batch, context, query length and head counts must be positive"
@@ -1172,7 +1155,7 @@ def _parse_args(argv=None):
 
 
 def main():
-    # Parse before GPU checks so --help and invalid options remain usable.
+    # Keep --help and argument errors usable without a GPU.
     args = _parse_args()
     if not torch.cuda.is_available():
         aiter.logger.warning("ROCm is not available; skipping pa_decode")

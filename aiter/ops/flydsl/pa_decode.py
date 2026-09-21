@@ -1,36 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Readable tile-programming reference for paged-attention fp8 decode.
+"""FP8 paged-attention decode with BF16/FP16 queries on gfx942/gfx950.
 
-K/V are fp8 e4m3 (FNUZ on gfx942, OCP on gfx950) fed straight into
-``mfma_f32_16x16x32_fp8_fp8``; Q (bf16/f16) and the softmax probabilities P are
-quantized to fp8 too. Scales fold out of the matmuls (q/key scale into the QK
-score, value scale + 1/FP8_MAX into the epilogue); softmax max/sum stay f32.
-The gfx950 BF16 per-token MTP4 specialization uses K=128 FP8 MFMA atoms
-without changing this normalization policy.
-The tuned gfx950 BF16 scalar-scale decode path uses direct fp8 Q/P conversion
-instead. It trades dynamic range for speed and can truncate small probabilities;
-see ``kernels.pa_decode_kernel`` for its scope. Per-token scales keep normalization.
-``key_scale``/``value_scale`` are either a ``[1]`` per-tensor scalar or a
-``[num_blocks, num_kv_heads, block_size, 1]`` per-token tensor.
-
-``block_size`` (16/64/128) and ``head_dim`` (64, or a multiple of 128 up to
-1024) are compile-time constants. Layouts are logical, not production's
-preshuffle.
-
-* ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
-* ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16]  fp8
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (trans_v)
-                   or [num_blocks, num_kv_heads, head_dim, block_size] (plain), by rank
-* ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
-* ``context_lengths`` [num_seqs]  int32
-* ``output``       [num_seqs, num_q_heads, head_dim]  same dtype as query
-
-Each CTA (4 waves) processes a KV head and context partition over 256-token
-blocks. Small MTP4 grids split query positions among CTAs; larger grids keep
-queries fused. The waves split tokens for Q.KT and head-dim for P.V, with an
-LDS round-trip on P transposing ownership between the two MMAs.
+Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
+OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
+MFMA specialization details.
 """
 
 import flydsl.compiler as flyc
@@ -57,21 +32,13 @@ def get_recommended_splits(
     *,
     max_context_length: int | None = None,
 ) -> int:
-    """Choose a split count before allocating partition scratch buffers.
+    """Recommend a uniform split count for scratch allocation and ``pa_decode``.
 
-    Without a host-side ``max_context_length`` hint, retain the legacy policy
-    and default upper clamp of eight. With a hint, target two CTAs per CU,
-    capped by the number of 256-token compute tiles and the reducer's limit.
-    This lets small, long-context batches use more KV partitions without
-    multiplying the partition count by the number of physical pages per tile.
-    Short contexts and already large grids retain the legacy recommendation.
-
-    An explicit ``max_partitions`` remains an upper clamp in either mode.
-    The hint is a scheduling bound, not a replacement for the GPU-resident
-    per-sequence lengths; no tensor readback or planning kernel is needed.
-    Callers must allocate scratch for the returned count and pass that exact
-    count to ``pa_decode``. For heterogeneous lengths this still uses the same
-    partition count per sequence; it is not a variable-work scheduler.
+    Without ``max_context_length``, the default cap is eight. A host length
+    hint targets two CTAs per CU, bounded by 256-token tiles and the reducer
+    limit; short contexts and large grids retain the legacy recommendation.
+    ``max_partitions`` caps either mode. Allocate scratch and call ``pa_decode``
+    with the returned count for every sequence; no GPU lengths are read back.
     """
     if max_context_length is not None and max_context_length < 0:
         raise ValueError("max_context_length must be non-negative")
@@ -88,9 +55,7 @@ def get_recommended_splits(
     n = ((num_sm + denom - 1) // denom) * split_kv_blocks
     if max_context_length is not None:
         legacy = max(4, min(n, 8))
-        # KV partitions consist of compute tiles, regardless of physical page
-        # size. Keep a short-context floor of eight to preserve the existing
-        # query-split launch and avoid perturbing already tuned small grids.
+        # Count compute tiles, not pages; the floor preserves short-grid tuning.
         context_tiles = (max_context_length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
         work_limit = max(8, context_tiles)
         sequence_heads = max(1, num_sequences * num_kv_heads)
@@ -146,9 +111,8 @@ def launch_pa_decode_ps_reduce(
             f"FlyDSL pa_decode reduce supports at most {partition_limit} partitions"
         )
     use_sinks = sink_token is not None
-    # Buffer offsets are byte-sized i32 values. Bound the largest attempted
-    # access, not only the current count: an inactive part must not wrap back
-    # into valid data. Nonstandard standalone reducer strides keep the old path.
+    # Bound all attempted i32 byte offsets, including inactive partitions,
+    # so out-of-bounds reads cannot wrap back into valid data.
     bounded_plan_logits = (
         use_work_plan
         and context_partition_num <= 64
@@ -161,10 +125,7 @@ def launch_pa_decode_ps_reduce(
         < context_partition_num * stride_logits_part * logits.element_size()
         <= 2**31 - 1
     )
-    # The pair load is one aligned dword. Packed rows are complete D=128
-    # vectors, and even strides preserve alignment after the 64-bit rebase.
-    # The R9 maximum-span gate also bounds the last byte of every pair load.
-    # Output remains scalar-stored, so its alignment need not match logits.
+    # Paired loads need dword alignment; scalar output stores do not.
     vectorize_plan_logits = (
         bounded_plan_logits
         and head_size == 128
@@ -236,7 +197,7 @@ def pa_decode(
     max_context_partition_num: int,
     context_partition_size: int = 256,
     compute_type: torch.dtype = torch.bfloat16,
-    query_scale: torch.Tensor = None,  # [num_seqs * query_length, num_query_heads, 1] or [1]
+    query_scale: torch.Tensor = None,
     key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
@@ -247,41 +208,31 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan | None = None,
 ) -> None:
-    """FlyDSL paged-attention fp8 decode.
+    """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
 
-    The call signature and intermediate-buffer layouts follow the shared
-    aiter paged-attention decode API. This kernel currently supports FP8 K/V caches,
-    BF16/FP16 queries, a 256-token compute tile, block sizes 16/64/128, and
-    ``head_dim=64`` or a multiple of 128 up to 1024.
-    Sparse attention uses caller-prepared block tables and selected context
-    lengths. Each independently selected MTP query must have its own table row
-    and use query_length=1; query_length>1 applies dense causal masking.
-    A positive ``sliding_window`` requires ``work_plan`` and limits each query
-    to that many causal tokens, including its own position; 0 and -1 disable
-    the window. Optional ``sinks`` is a contiguous [num_query_heads]
-    BF16/FP16/FP32 tensor on the query device.
-    Each entry is an unscaled, zero-value attention logit shared across batch
-    and MTP positions. It contributes to the denominator once, independently
-    of the window; -inf disables a head's sink and +inf suppresses its output.
-    ALiBi and externally quantized FP8 queries are not supported. Partitioning
-    is controlled by ``max_context_partition_num`` and ``work_plan``.
+    Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
+    K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
+    ALiBi and externally quantized queries are unsupported.
 
-    ``context_lengths`` and ``block_tables`` are GPU-resident, so their values
-    are not inspected here (which would synchronize the device). Callers must
-    ensure ``0 <= context_lengths[i] <= block_tables.shape[1] * block_size`` and
-    that every block-table entry used by a sequence is a physical block index in
-    ``[0, min(key_cache.shape[0], value_cache.shape[0]))`` -- a packed cache
-    reaches V through a shifted view that spans fewer blocks than K.
+    MTP lengths include the query tokens and use dense causal masking.
+    Independently selected sparse queries need separate table rows and
+    query_length=1. Positive ``sliding_window`` requires ``work_plan`` and
+    includes each query's own position; 0 and -1 disable it.
 
-    ``work_plan`` opts into GPU-planned variable partition counts. Build or
-    refresh it with ``plan_pa_decode`` on the current stream after updating
-    lengths. Its ``max_partitions`` must equal ``max_context_partition_num``.
-    The plan's partition limit is bounded by the query device's CU count;
-    static scheduling retains the fixed limit of 256.
-    Its window must match ``sliding_window``, and a windowed plan must be built
-    with the same ``query_length`` so it covers every MTP query's window.
-    Planned scratch is packed as [KV heads, plan.capacity, query rows (, D)];
-    the static API's dense per-sequence scratch layout remains unchanged.
+    ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
+    query device: unscaled zero-value logits shared across batch/MTP positions.
+    Each contributes once, independently of the window; -inf disables it and
+    +inf suppresses the head's output.
+
+    Refresh ``work_plan`` on the current stream after changing lengths. Its
+    max_partitions must equal max_context_partition_num, bounded by device CUs
+    (static limit: 256). Match sliding_window and, for windowed plans,
+    query_length. Planned scratch is [KV heads, capacity, query rows (, D)];
+    static scratch uses the per-sequence layouts shown in the signature.
+
+    GPU lengths and table entries are not checked. Callers must ensure
+    0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
+    block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
@@ -371,9 +322,8 @@ def pa_decode(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
         )
 
-    # Keep NP==1 and NP>1 on the same domain. The tile requires a multiple of
-    # 64 and complete <=8-element Q-load pieces; the NP>1 reducer additionally
-    # caps its thread block (head_dim) at 1024.
+    # Enforce tile Q-load constraints and the reducer's 1024-thread limit,
+    # including for direct output.
     q_chunk = head_dim // 16
     if not (
         64 <= head_dim <= 1024
@@ -415,10 +365,7 @@ def pa_decode(
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
                 f"head_dim={head_dim}"
             )
-    # A packed cache interleaves K and V in one allocation, so the V view starts
-    # part-way into it and legitimately spans fewer blocks than K. Block ids live
-    # on the device, so V's usable extent is a caller contract either way; only
-    # the inverted-argument direction is worth rejecting here.
+    # Packed V is a shifted view and may span fewer blocks than K.
     if v_num_blocks > num_blocks:
         raise ValueError(
             f"value_cache must not span more blocks than key_cache, "
@@ -609,14 +556,10 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
-    # An i32 element offset wraps once a single cache tensor passes 2^31
-    # elements (2 GiB at fp8). The wider math costs ~18% at block_size=64, so
-    # pay it only where it is needed. Both caches share the code path, so widen
-    # if either does.
+    # Widen before either cache's i32 element offsets can wrap.
     wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
 
-    # Partial outputs must exclude the sink: reduction adds it once across all
-    # partitions. Keep direct NP=1 output fused, without extra scratch/launches.
+    # Add sinks once: here for static NP=1, otherwise in reduction.
     use_direct_sinks = sinks is not None and num_partitions == 1 and work_plan is None
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
@@ -643,7 +586,7 @@ def pa_decode(
         )
 
     if num_partitions == 1 and work_plan is None:
-        # NP==1 writes output directly; partials unused (caller buffers ignored).
+        # Direct output ignores caller scratch; supply unused kernel arguments.
         dummy = torch.empty(1, dtype=torch.float32, device=dev)
         pmax = psum = pout = dummy
     else:

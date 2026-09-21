@@ -56,13 +56,10 @@ def pa_decode_flydsl(
     sliding_window: int = 0,
     work_plan: "PADecodePlan | None" = None,
 ) -> None:
-    """FlyDSL decode with an optional work plan.
+    """FlyDSL decode; ``ps`` is ignored for API compatibility.
 
-    Pass ``work_plan`` by keyword. The ``ps`` compatibility argument precedes
-    ``sinks`` and is accepted and ignored.
-    ``work_plan`` is available through this Python API; the registered
-    ``torch.ops.aiter.pa_decode_flydsl`` operator uses static scheduling.
-    Positive ``sliding_window`` requires a work plan through the Python API.
+    Pass ``work_plan`` by keyword to enable planning and positive sliding windows.
+    The registered ``torch.ops.aiter.pa_decode_flydsl`` operator is static-only.
     """
     del ps
     if _pa_decode_flydsl is None:

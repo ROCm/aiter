@@ -28,17 +28,15 @@ def _plan_pa_decode(
     ctx = tl.maximum(tl.load(lengths + b, b < B, other=0), 0).to(tl.int64)
     first_tile = tl.full((BLOCK_B,), 0, tl.int64)
     if SLIDING_WINDOW > 0:
-        # Fused MTP queries have different left edges. Schedule their union,
-        # rounding down to an absolute tile so page/scaling offsets stay valid.
+        # Absolute tiles cover the MTP window union without rebasing cache offsets.
         first_tile = tl.maximum(ctx - (QUERY_LENGTH - 1) - SLIDING_WINDOW, 0) // 256
     tiles = tl.where(b < B, (ctx + 255) // 256 - first_tile, 0)
     nonempty = (tiles > 0).to(tl.int32)
     total = tl.maximum(tl.sum(tiles, 0), 1)
     remaining = CAPACITY - tl.sum(nonempty, 0)
     cumulative = tl.cumsum(tiles, 0)
-    # Integer prefix apportionment telescopes to the budget, even when the
-    # lengths differ by orders of magnitude. Each nonempty request gets one
-    # task first; clamp extras to useful tiles and the reducer's per-row limit.
+    # Reserve one task per nonempty row, then apportion the rest using integer
+    # prefixes so rounding cannot overfill the budget.
     upper = cumulative * remaining // total
     lower = (cumulative - tiles) * remaining // total
     counts = tl.minimum(tl.minimum(nonempty + upper - lower, tiles), MAX_PARTS)
@@ -66,10 +64,8 @@ def _plan_pa_decode(
     tl.store(work + slot * 4 + 2, end, active)
     tl.store(work + slot * 4 + 3, seq_ctx, active)
 
-    # The launch capacity is static for graph capture. Clear every padded work
-    # record so the attention kernel can skip it without touching stale scratch.
-    # These stores and the active stores are disjoint, including when every
-    # context is empty.
+    # Zero unused slots for fixed-capacity graph launches. Padding stores must
+    # stay disjoint from active records, including for all-empty batches.
     pad = seq * BLOCK_P + part
     padding = (pad >= total_tasks) & (pad < CAPACITY)
     for field in tl.static_range(4):
@@ -80,10 +76,9 @@ def _plan_pa_decode(
 class PADecodePlan:
     """Reusable GPU metadata; refresh it whenever context lengths change.
 
-    ``work_info`` is [capacity, 4]: sequence, first/last absolute 256-token tile,
-    original context length. Sliding windows cover the union of MTP queries.
+    ``work_info`` is [capacity, 4]: sequence, begin/end absolute 256-token tile,
+    original context length. Tile ranges are half-open and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
-    Scratch uses [KV heads, capacity, query rows (, head dim)].
     """
 
     work_info: torch.Tensor
@@ -130,23 +125,17 @@ def plan_pa_decode(
     query_length: int = 1,
     plan: PADecodePlan | None = None,
 ) -> PADecodePlan:
-    """Build/update a plan on the current stream without GPU-to-CPU readback.
+    """Build/refresh GPU work metadata on the current stream without readback.
 
-    Allocate once outside graph capture, then pass ``plan=...`` to refresh the
-    same metadata in place. Include this refresh in end-to-end measurements.
-    The budget counts task slots over all KV heads before query splitting;
-    splitting queries can launch multiple CTAs per slot without extra scratch.
-    This is opt-in: uniform or short-context workloads may favor static splits.
+    Allocate outside graph capture; pass ``plan`` to refresh buffers in place.
+    The budget counts task slots across KV heads before query splitting.
 
-    The per-sequence partition limit defaults to the context device's CU count;
-    an explicit limit must be in [1, CU count]. When refreshing an existing
-    plan, omitting ``max_partitions`` preserves its original limit.
+    ``max_partitions`` is in [1, device CU count], defaulting to CU count;
+    omitting it on refresh preserves the existing limit.
 
-    A positive ``sliding_window`` counts visible tokens including the query's
-    own position; 0 and -1 disable it. Context lengths include the MTP tokens,
-    so the planned range is the union of ``query_length`` causal windows.
-    Pass the same window and (when enabled) query length to ``pa_decode`` and
-    when refreshing the plan. Dense plans remain independent of query length.
+    Lengths include MTP tokens. Positive windows include each query's position;
+    0 and -1 disable them. Plans cover the MTP window union: match the window
+    and query length when decoding or refreshing. Dense plans ignore query length.
     """
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
@@ -207,8 +196,7 @@ def plan_pa_decode(
             batch,
             plan.capacity,
             plan.max_partitions,
-            # Larger windows cover every int32 context. Dense planning is
-            # query-length independent, including its compilation cache key.
+            # Clamp windows to int32 lengths; dense plans share one specialization.
             min(sliding_window, 2**31 - 1),
             query_length if sliding_window > 0 else 1,
             triton.next_power_of_2(batch),

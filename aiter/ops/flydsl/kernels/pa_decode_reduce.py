@@ -86,23 +86,18 @@ def compile_pa_decode_ps_reduce(
     bounded_plan_logits: bool = False,
     vectorize_plan_logits: bool = False,
 ):
-    """Build the partitioned-softmax reduction used by ``pa_decode``.
+    """Build PA decode's partitioned-softmax reducer.
 
-    Counts up to one wave use one partition per lane and one output element per
-    thread.  For D=128 and larger counts, a 2-D workgroup materializes weights
-    once in LDS and splits each output element's partition chain over several
-    waves.  Other head sizes retain the register-only lane-striped fallback.
-    A sink is a per-query-head zero-value logit: include it in the shared max
-    for stability and add its mass to the denominator once after summing KV.
-    ``query_group_size=None`` retains runtime GQA addressing; a positive
-    specialization constant must match the GQA passed to the launch wrapper.
-    ``bounded_plan_logits`` requires packed, contiguous logits rows and a
-    positive NP-part byte span no larger than INT32_MAX. A per-sequence buffer
-    bound then zero-fills inactive parts without reading adjacent sequences.
-    ``vectorize_plan_logits`` additionally requires D=128, bf16/f16 logits,
-    a four-byte-aligned logits base and even head/part/group strides. One wave
-    then assigns two consecutive output elements to each lane, sharing the
-    unchanged partition weights. Output stores retain scalar alignment.
+    D128/NP>64 shares weights in LDS; other shapes stay register-only.
+    Sinks are per-head zero-value logits: include them in the shared maximum
+    for stability and add their denominator mass once after summing KV.
+    ``query_group_size`` is None for runtime GQA, or a matching positive value.
+    ``bounded_plan_logits`` requires planned NP<=64, packed contiguous rows
+    and a positive NP-part byte span <= INT32_MAX. Per-sequence bounds
+    zero-fill inactive loads without reading adjacent sequences.
+    ``vectorize_plan_logits`` also requires D128 bf16/f16 logits, a four-byte
+    aligned base and even head/part/group strides. Output stores retain
+    scalar alignment.
     """
     _validate_pa_decode_ps_reduce_config(
         max_context_partition_num=max_context_partition_num,
@@ -142,18 +137,10 @@ def compile_pa_decode_ps_reduce(
         offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
     ]
 
-    # The original mapping gives each output element to one thread, so every
-    # thread walks every partition.  That is a good fit for <=1 wave of
-    # partitions, but it leaves NP=160..256 as a long dependent load/FMA
-    # chain.  For the decode shape used by PA (D=128), split that chain over
-    # two or eight independent wave pairs.  A pair covers the two 64-element
-    # halves of the output vector, while its y-coordinate selects a disjoint
-    # contiguous range of partitions.
+    # D128 splits partition ranges across wave pairs, one wave per 64 outputs.
     use_parallel_lds = head_size == 128 and max_context_partition_num > warp_size
     parallel_groups = 1
     if use_parallel_lds:
-        # Eight groups win from NP=128 onward on gfx950; two avoid excessive
-        # synchronization/thread overhead for the small >64 tail.
         parallel_groups = 2 if max_context_partition_num <= 96 else 8
     head_waves = head_size // warp_size
     worker_waves = head_waves * parallel_groups
@@ -166,8 +153,7 @@ def compile_pa_decode_ps_reduce(
         max_context_partition_num + parallel_groups - 1
     ) // parallel_groups
 
-    # Keep the legacy specializations effectively LDS-free.  The fields are
-    # only allocated from the compile-time parallel branch below.
+    # SharedStorage is allocated only by the parallel branch.
     shared_weight_elems = max_context_partition_num if use_parallel_lds else 1
     shared_partial_elems = (parallel_groups - 1) * head_size if use_parallel_lds else 1
 
@@ -222,9 +208,8 @@ def compile_pa_decode_ps_reduce(
             reduce_info = fx.recast_iter(fx.Int32, reduce_info_ptr)
             first_part = fx.Int32(reduce_info[batch_idx * 2])
             c_part_num = fx.Int32(reduce_info[batch_idx * 2 + 1])
-            # Empty sequences may point one past the packed allocation. The
-            # <=64 path uses clamped loads, so give them a valid base slot;
-            # every loaded value is masked before it contributes to a result.
+            # Empty rows may point past packed storage; clamped loads need slot 0.
+            # Mask every inactive value before arithmetic.
             first_part = (c_part_num > zero_i).select(first_part, zero_i)
             stats_seq_offset = first_part * stride_exp_sums_part
             logits_seq_offset = first_part * stride_logits_part
@@ -232,8 +217,7 @@ def compile_pa_decode_ps_reduce(
             stats_seq_offset = batch_idx * stride_exp_sums_seq
             logits_seq_offset = batch_idx * stride_logits_seq
         if fx.const_expr(bounded_plan_logits):
-            # Rebase before narrowing offsets: the whole packed workspace may
-            # exceed 2 GiB even when this sequence's NP-part span is small.
+            # Rebase in i64 before narrowing: packed storage can exceed 2 GiB.
             logits_item_bytes = logits_dtype.width // 8
             planned_logits_base = (
                 buf_base_i64(logits_ptr)
@@ -289,9 +273,8 @@ def compile_pa_decode_ps_reduce(
             return fx.exp2(shift * c_log2e, fastmath="fast")
 
         def _reduce_planned_wave(part_count, shuffle_offsets):
-            # Both widths use the same packed-scratch and softmax rules.
-            # Invalid lanes read this sequence's first partition; count=0
-            # has a safe global slot 0 base. Select out NaNs before math.
+            # Clamp invalid lanes to a valid slot, then mask loaded NaNs
+            # before arithmetic; empty rows use global slot 0.
             planned_lane_in_range = lane < c_part_num
             planned_stats_part_idx = planned_lane_in_range.select(lane, zero_i)
             planned_stats_offset = (
@@ -305,23 +288,19 @@ def compile_pa_decode_ps_reduce(
             planned_part_sum = planned_lane_in_range.select(planned_loaded_sum, zero_f)
             planned_part_max = planned_lane_in_range.select(planned_loaded_max, neg_inf)
 
-            # Preload before softmax so independent loads can overlap. The
-            # caller's uniform branch encloses these loads, not just the FMAs.
             planned_logits = []
             for planned_part in fx.range_constexpr(part_count):
                 planned_part_idx = fx.Int32(planned_part)
                 if fx.const_expr(bounded_plan_logits):
-                    # The descriptor ends at count*part_stride, before the
-                    # next sequence or NaN padding. Even count=0 is a valid
-                    # zero-sized resource; raw buffer loads return zero.
+                    # Bound loads before adjacent sequences/NaN padding;
+                    # count=0 gives a zero-sized descriptor that returns zero.
                     planned_logits_offset = (
                         planned_part_idx * stride_logits_part
                         + eqgs_idx * stride_logits_group
                         + tid * fx.Int32(planned_elements_per_thread)
                     )
-                    # With unit_stride=1 this remains an element offset, not
-                    # a vector-unit index. A D=128 pair ends within its row;
-                    # even count=0 suppresses the complete 32-bit buffer load.
+                    # unit_stride=1 uses element offsets; D128 pairs stay in-row.
+                    # A zero-sized descriptor suppresses the entire dword load.
                     planned_loaded_logits = buf_copy_load(
                         planned_logits_buffer,
                         planned_logits_offset,
@@ -329,8 +308,6 @@ def compile_pa_decode_ps_reduce(
                         unit_elems=planned_elements_per_thread,
                     )
                     if fx.const_expr(vectorize_plan_logits):
-                        # Keep the prefetched pair packed in 32 bits across
-                        # softmax; widen only the part being accumulated below.
                         planned_logits.append(planned_loaded_logits)
                     else:
                         planned_logits.append(fx.Float32(planned_loaded_logits))
@@ -401,16 +378,13 @@ def compile_pa_decode_ps_reduce(
                     )
                 else:
                     planned_part_logits = planned_logits[planned_acc_part]
-                # Elementwise mul then add, with the same increasing-part
-                # order as the scalar path: no FMA or reassociation hint.
+                # Preserve increasing-part order and separate multiply/add rounding.
                 planned_acc = planned_acc + planned_part_logits * planned_weight
             return planned_acc
 
         if fx.const_expr(use_parallel_lds):
-            # One wave materializes the normalized partition weights once.
-            # All output waves then reuse those weights from LDS and split the
-            # long partition loop.  This avoids both duplicated exp2 work and
-            # a ds_bpermute for every output FMA.
+            # Worker 0 publishes weights to LDS. All threads, including inactive
+            # groups, must reach both barriers; group 0 reads only active partials.
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             lds_weights = lds.weights
             lds_partials = lds.partials
@@ -464,10 +438,7 @@ def compile_pa_decode_ps_reduce(
                 for chunk_idx in fx.range_constexpr(partitions_per_lane):
                     part_max = part_maxes[chunk_idx]
                     if fx.const_expr(use_work_plan):
-                        # ``select`` evaluates its exp2 operand even for an
-                        # inactive planned partition. Keep the static path
-                        # branch-free, but predicate that expensive operation
-                        # when the per-request count is dynamic.
+                        # select evaluates exp2 eagerly; branch around inactive parts.
                         part_scale = zero_f
                         if part_max > neg_inf:
                             part_scale = fx.exp2(
@@ -585,25 +556,16 @@ def compile_pa_decode_ps_reduce(
 
         elif fx.const_expr(max_context_partition_num <= warp_size):
             if fx.const_expr(use_work_plan):
-                # Both arms of the dynamic short-count branch, and its
-                # initial carried value, must have the same scalar/vector type.
+                # Count branches must carry the same scalar/vector type.
                 if fx.const_expr(vectorize_plan_logits):
                     acc = fx.Vector.filled(2, 0.0, fx.Float32)
                 else:
                     acc = zero_f
                 if fx.const_expr(max_context_partition_num > 8):
-                    # The count is uniform across this CTA. Keep the complete
-                    # short reduction under the branch so large NP does not
-                    # force short requests to preload and accumulate padding.
-                    # Small NP stays straight-line: the branch costs more than
-                    # the few clamped loads it removes on those specializations.
+                    # Count is CTA-uniform; keep short-path loads and math inside it.
                     if c_part_num <= c_four:
                         acc = _reduce_planned_wave(4, (2, 1))
                     elif c_part_num <= fx.Int32(8):
-                        # Medium-count requests need only the first eight
-                        # lanes/partials, even when NP reserves up to 64.
-                        # Keep the preload, softmax and accumulation inside
-                        # this uniform branch, including empty-row handling.
                         acc = _reduce_planned_wave(8, (4, 2, 1))
                     else:
                         acc = _reduce_planned_wave(
@@ -615,9 +577,7 @@ def compile_pa_decode_ps_reduce(
                     )
             else:
                 if fx.const_expr(max_context_partition_num == reduce_width):
-                    # Preserve the static mapping: exact powers of two have no
-                    # inactive lanes inside their reduction subgroup, while
-                    # partial subgroups use EXEC-masked loads.
+                    # Full subgroups have no inactive lanes; tails use EXEC masks.
                     lane_in_range = lane < c_part_num
                     lane_in_reduce = lane < c_reduce_width
                     part_sum = zero_f
@@ -690,11 +650,7 @@ def compile_pa_decode_ps_reduce(
                     part_logits = fx.Float32(logits[logits_offset])
                     acc = acc + part_logits * weight
         else:
-            # A wave covers several 64-partition chunks. Lane ``l`` owns
-            # partitions l, l+64, l+128, and l+192 (as present). Reduce the
-            # lane-local maxima/sums before the usual wave reduction; later,
-            # select the corresponding local weight and broadcast from
-            # ``part_idx % 64``. This stays register-only through NP=256.
+            # Lane l owns l + 64*k; reduce locally, then broadcast each weight.
             partitions_per_lane = (
                 max_context_partition_num + warp_size - 1
             ) // warp_size
@@ -775,9 +731,8 @@ def compile_pa_decode_ps_reduce(
                 chunk_base = chunk_idx * warp_size
                 chunk_size = min(warp_size, max_context_partition_num - chunk_base)
                 if fx.const_expr(use_work_plan):
-                    # Initialize in the enclosing constexpr-loop scope so the
-                    # FlyDSL dynamic-if rewriter never observes a stale value
-                    # from a previous unrolled chunk.
+                    # Initialize per unrolled chunk so the dynamic-if rewriter
+                    # cannot reuse a stale value.
                     weight_local_i32 = zero_f.bitcast(fx.Int32)
                     if fx.Int32(chunk_base) < c_part_num:
                         weight_local_i32 = (
