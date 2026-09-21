@@ -21,10 +21,10 @@ from .gemm_op_mixed_mxfp import (
     _load_mixed_mxfp_configs,
 )
 
-_MFMA32_SMALL_KERNEL = "f4f6gemm_m32_s0_a5_nt_kernel_func"
-_MFMA32_SWZ0_KERNEL = "f4f6gemm_m32_s0_a4_t_kernel_func"
-_MFMA32_GROUPED_KERNEL = "f4f6gemm_m32_s3_a5_t_kernel_func"
-_MFMA32_LONG_K_KERNEL = "f4f6gemm_m32_s3_a6_t_kernel_func"
+_MFMA32_SMALL_KERNEL = "_ZN5aiter40f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a5_ntE"
+_MFMA32_SWZ0_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a4_tE"
+_MFMA32_GROUPED_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a5_tE"
+_MFMA32_LONG_K_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a6_tE"
 _MAX_BUFFER_BYTES = 1 << 31
 _MAX_KERNEL_K = (1 << 31) - 1
 _GROUPED_SWIZZLE_MAX_M = 131072

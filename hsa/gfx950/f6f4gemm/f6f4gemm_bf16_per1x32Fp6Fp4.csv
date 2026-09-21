@@ -1,5 +1,5 @@
 tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_max_N,swizzle_max_K,knl_name,co_name
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,f6f4gemm_m32_s0_a4_nt_kernel_func,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_nt.co
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,f6f4gemm_m32_s3_a4_t_kernel_func,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a4_t.co
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,f6f4gemm_m32_s3_a5_t_kernel_func,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a5_t.co
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,f6f4gemm_m32_s0_a4_t_kernel_func,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_t.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,_ZN5aiter40f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_ntE,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_nt.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a4_tE,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a4_t.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a5_tE,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a5_t.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_tE,f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_t.co

@@ -20,7 +20,7 @@ constexpr size_t kScaleTileBytes    = 1024;
 constexpr size_t kMaxBufferBytes    = size_t{1} << 31;
 constexpr size_t kTensorAlignment   = 16;
 constexpr char kPackLayout[]        = "mxfp6_mxfp4_c0_256_padk2";
-constexpr char kDefaultKernelName[] = "f6f4gemm_m32_s0_a4_t_kernel_func";
+constexpr char kDefaultKernelName[] = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_tE";
 
 // KernelArgs layout is identical to the a4w4 asm gemm ABI; the mixed A6W4
 // kernel was assembled against the same kernarg struct (0x180 bytes). Fields

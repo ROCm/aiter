@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import csv
+import re
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,12 @@ def test_mixed_mxfp_manifest_objects(module, manifest_name, pack_layout, tuned_n
     kernel_names = {row["knl_name"] for row in rows}
     assert len(rows) >= 4
     assert len(kernel_names) == len(rows)
+    for kernel_name in kernel_names:
+        match = re.fullmatch(r"_ZN5aiter(\d+)(.+)E", kernel_name)
+        assert match is not None
+        declared_length, entrypoint = match.groups()
+        assert int(declared_length) == len(entrypoint)
+        assert entrypoint.startswith(f"{module}_")
     assert len({row["co_name"] for row in rows}) == len(rows)
     assert {row["co_name"] for row in rows} == {
         path.name for path in manifest_dir.glob("*.co")
@@ -59,7 +66,6 @@ def test_mixed_mxfp_manifest_objects(module, manifest_name, pack_layout, tuned_n
     tuned_path = _REPO_ROOT / "aiter" / "configs" / tuned_name
     with tuned_path.open(newline="") as tuned_file:
         tuned_rows = list(csv.DictReader(tuned_file))
-    assert all(row["kernelName"].startswith(f"{module}_") for row in tuned_rows)
     assert {row["kernelName"] for row in tuned_rows} <= kernel_names
     assert all(row["splitK"] == "0" for row in tuned_rows)
 

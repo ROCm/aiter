@@ -25,10 +25,10 @@ from aiter.ops.quant import per_1x32_f4_quant
 from aiter.utility import dtypes, fp4_utils
 from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE
 
-MFMA32_SMALL_KERNEL = "f6f4gemm_m32_s0_a4_nt_kernel_func"
-MFMA32_SWZ0_KERNEL = "f6f4gemm_m32_s0_a4_t_kernel_func"
-MFMA32_GROUPED_KERNEL = "f6f4gemm_m32_s3_a4_t_kernel_func"
-MFMA32_LONG_K_KERNEL = "f6f4gemm_m32_s3_a5_t_kernel_func"
+MFMA32_SMALL_KERNEL = "_ZN5aiter40f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_ntE"
+MFMA32_SWZ0_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_tE"
+MFMA32_GROUPED_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a4_tE"
+MFMA32_LONG_K_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a5_tE"
 
 
 def _is_gfx950() -> bool:

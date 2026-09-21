@@ -45,12 +45,12 @@ FAMILIES = (
 )
 KERNEL_NAMES = {
     "a6w4": (
-        "f6f4gemm_m32_s0_a4_nt_kernel_func",
-        "f6f4gemm_m32_s0_a4_t_kernel_func",
+        "_ZN5aiter40f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_ntE",
+        "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_tE",
     ),
     "a4w6": (
-        "f4f6gemm_m32_s0_a5_nt_kernel_func",
-        "f4f6gemm_m32_s0_a4_t_kernel_func",
+        "_ZN5aiter40f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a5_ntE",
+        "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a4_tE",
     ),
 }
 

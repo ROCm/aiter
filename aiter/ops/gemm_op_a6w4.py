@@ -36,10 +36,10 @@ from .gemm_op_mixed_mxfp import (
 )
 from .quant import quant_mxfp4_hip
 
-_MFMA32_SMALL_KERNEL = "f6f4gemm_m32_s0_a4_nt_kernel_func"
-_MFMA32_SWZ0_KERNEL = "f6f4gemm_m32_s0_a4_t_kernel_func"
-_MFMA32_GROUPED_KERNEL = "f6f4gemm_m32_s3_a4_t_kernel_func"
-_MFMA32_LONG_K_KERNEL = "f6f4gemm_m32_s3_a5_t_kernel_func"
+_MFMA32_SMALL_KERNEL = "_ZN5aiter40f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_ntE"
+_MFMA32_SWZ0_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_tE"
+_MFMA32_GROUPED_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a4_tE"
+_MFMA32_LONG_K_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a5_tE"
 _PACKED_W_TILE_BYTES = 16384
 _SCALE_TILE_BYTES = 1024
 _MAX_BUFFER_BYTES = 1 << 31
