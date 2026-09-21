@@ -91,7 +91,7 @@ def mxfp8_attention_forward(
         Tuple of (output, softmax_lse, exp_scores).
     """
     _LOGGER.info(f"MXFP8_ATTENTION_FWD: q={tuple(q.shape)}, k={tuple(k.shape)}")
-    assert is_cdna4(), "mxfp8 attention requires gfx950 or newer"
+    assert is_cdna4(), "mxfp8 attention requires gfx950"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert q_scale.is_contiguous() and k_scale.is_contiguous()
     if layout == "thd":
@@ -343,7 +343,7 @@ def mxfp8_attention_backward(
     implementation; pass bias=None and dropout_p=0 to avoid silent errors.
     """
     _LOGGER.info(f"MXFP8_ATTENTION_BWD: q={tuple(q.shape)}, k={tuple(k.shape)}")
-    assert is_cdna4(), "mxfp8 attention requires gfx950 or newer"
+    assert is_cdna4(), "mxfp8 attention requires gfx950"
     if layout == "thd":
         raise NotImplementedError(
             "layout='thd' (varlen) is not yet supported in mxfp8_attention_backward"
@@ -356,6 +356,11 @@ def mxfp8_attention_backward(
     use_exp2 = True
     quant_size = 32
     do = do.contiguous()
+    assert quant_block_size % quant_size == 0
+    assert block_m_dq_bwd % quant_block_size == 0
+    assert block_n_dq_bwd % quant_block_size == 0
+    assert block_m_dkv_bwd % quant_block_size == 0
+    assert block_n_dkv_bwd % quant_block_size == 0
 
     if cu_seqlens_q is None:
         cu_seqlens_q = 0
@@ -371,6 +376,12 @@ def mxfp8_attention_backward(
             q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
         )
     )
+    if nheads_q % nheads_k != 0:
+        raise ValueError(
+            f"num_q_heads ({nheads_q}) must be divisible by num_kv_heads ({nheads_k}) for GQA"
+        )
+    if v.shape[0] != q.shape[0]:
+        raise ValueError("Q and V must have the same batch size")
 
     q_strides = get_strides_from_layout(q, layout)
     k_strides = get_strides_from_layout(k, layout)
@@ -388,6 +399,8 @@ def mxfp8_attention_backward(
 
     padded_d_model_qk = get_padded_head_dim(head_size_qk)
     padded_d_model_v = get_padded_head_dim(head_size_v)
+    assert padded_d_model_qk % quant_block_size == 0
+    assert padded_d_model_v % quant_block_size == 0
 
     copy_back = {"dq": False, "dk": False, "dv": False}
     bwd_dtype = torch.bfloat16
@@ -401,18 +414,18 @@ def mxfp8_attention_backward(
             copy_back["dq"] = True
         dq.zero_()
 
-    if dk is None or dv is None:
+    if dk is None:
         dk = torch.zeros_like(k, dtype=bwd_dtype)
+    elif not dk.is_contiguous():
+        dk_og = dk
+        dk = dk.contiguous()
+        copy_back["dk"] = True
+    if dv is None:
         dv = torch.zeros_like(v, dtype=bwd_dtype)
-    else:
-        if not dk.is_contiguous():
-            dk_og = dk
-            dk = dk.contiguous()
-            copy_back["dk"] = True
-        if not dv.is_contiguous():
-            dv_og = dv
-            dv = dv.contiguous()
-            copy_back["dv"] = True
+    elif not dv.is_contiguous():
+        dv_og = dv
+        dv = dv.contiguous()
+        copy_back["dv"] = True
 
     delta = torch.empty_like(softmax_lse)
     if is_varlen:
