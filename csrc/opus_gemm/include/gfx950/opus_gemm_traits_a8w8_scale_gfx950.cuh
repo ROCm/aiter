@@ -328,10 +328,6 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int per_block_iter_lds_size =
         (NUM_LOAD_GROUPS_PER_BM + NUM_LOAD_GROUPS_PER_BN)
         * NUM_LOAD_GROUPS_PER_BK * smem_per_group_load_size;
-    static constexpr int prefetch_k_iter = max_lds_size_per_wg / per_block_iter_lds_size;
-    static_assert(prefetch_k_iter >= 3,
-                  "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
-
     // ---- SF_RING: the scale ring the producer stages -------------------------
     // One slot per prefetch_k_iter K tile, each holding that tile's SFA rows and
     // SFB groups. The point is that LDS stops scaling with K, which the
@@ -345,21 +341,77 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // A/B publishes its scales, so the prefetch distance and the synchronisation
     // are the ones already there. No new barrier, which is the part that would
     // have risked a hang rather than a wrong answer.
-    static constexpr int SF_RING_ROWS = B_M / GROUP_M + N_SCALE_GROUPS;
-    static constexpr int SF_RING_SLOT = SF_RING_ROWS * SCALES_PER_BK;
-    static constexpr int SF_RING_LDS = prefetch_k_iter * SF_RING_SLOT;
+    // Which staging a PRELOAD_SF_LDS kid gets. The whole-split panel cannot hold
+    // a GROUP_K=32 split, so those take the ring; GROUP_K=128 keeps the panel,
+    // untouched. Decided here rather than by a template flag on purpose: the
+    // codegen and every existing instantiation stay exactly as they are, and the
+    // gate is precisely "the kids the panel cannot serve".
+    static constexpr bool SF_USE_RING = SF_PER_MFMA_K > 1;
     // The two producer waves share the fill, the same split a_buffer_load_insts
     // makes with its slots / 2.
     static constexpr int SF_RING_PROD_LANES = 2 * opus::get_warp_size();
-    // Widest per-lane chunk that stays inside one row and keeps its source
-    // offset naturally aligned, so it has to divide the row width.
+    // Widest per-lane chunk the prefetch depth can afford.
+    //
+    // Wider wastes fewer instructions on the small B side but pads more, and
+    // the padding is charged to every prefetch slot -- so the choice is not
+    // free, it trades vm instructions against depth. Tried widest-first, so a
+    // tile only pays the narrow form when its budget is genuinely tight:
+    // kid 9319 has 40,960 bytes for a 12,672-byte stage, where a 1,024-byte
+    // slot drops the depth to 2 and the pipeline needs 3.
+    //
+    // A chunk must also stay inside one row and keep its source offset
+    // naturally aligned, hence dividing the row width.
+    static constexpr int sf_ring_slot_for(int vec) {
+        const int chunk = SF_RING_PROD_LANES * vec;
+        return ((B_M / GROUP_M * SCALES_PER_BK + chunk - 1) / chunk
+                + (N_SCALE_GROUPS * SCALES_PER_BK + chunk - 1) / chunk) * chunk;
+    }
+    static constexpr int sf_ring_depth_for(int vec) {
+        return max_lds_size_per_wg / (per_block_iter_lds_size + sf_ring_slot_for(vec));
+    }
     static constexpr int SF_RING_VEC =
-        SCALES_PER_BK % 4 == 0 ? 4 : (SCALES_PER_BK % 2 == 0 ? 2 : 1);
-    // Counted, because mb feeds every s_waitcnt_vmcnt(number<mb * p>) in the
-    // producer and an off-by-one there is a race, not a wrong number.
+        (SCALES_PER_BK % 4 == 0 && sf_ring_depth_for(4) >= 3) ? 4
+        : (SCALES_PER_BK % 2 == 0 && sf_ring_depth_for(2) >= 3) ? 2
+        : 1;
+    static constexpr int SF_RING_CHUNK = SF_RING_PROD_LANES * SF_RING_VEC;
+    // Each side is padded to a whole number of chunks, and the two are separate
+    // because they come from different global buffers -- a lane's chunk must not
+    // span the boundary.
+    //
+    // The padding is what makes the instruction count exact. Predicating the
+    // tail instead would let a producer wave whose lanes are all out of range
+    // skip the instruction entirely, so the two producer waves would issue
+    // different numbers of vm loads while executing the same
+    // s_waitcnt_vmcnt(number<mb * p>) -- the wave that issued fewer would be
+    // allowing more in flight than it has accounted for, and barrier before its
+    // LDS writes landed. With padding every lane always issues; the out-of-range
+    // global reads return zero through the buffer's num_records bound and land
+    // in slot padding nobody reads.
+    static constexpr int SF_RING_A_BYTES =
+        (B_M / GROUP_M * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK
+        * SF_RING_CHUNK;
+    static constexpr int SF_RING_B_BYTES =
+        (N_SCALE_GROUPS * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK
+        * SF_RING_CHUNK;
+    static constexpr int SF_RING_SLOT = SF_RING_A_BYTES + SF_RING_B_BYTES;
+    // Counted rather than estimated because mb feeds every
+    // s_waitcnt_vmcnt(number<mb * p>) in the producer, and being off by one
+    // there is a race, not a wrong number.
     static constexpr int sf_ring_load_insts =
-        (SF_RING_SLOT + SF_RING_PROD_LANES * SF_RING_VEC - 1)
-        / (SF_RING_PROD_LANES * SF_RING_VEC);
+        SF_RING_A_BYTES / SF_RING_CHUNK + SF_RING_B_BYTES / SF_RING_CHUNK;
+
+    // A scale ring slot is charged to every prefetch slot, so the depth is
+    // solved against their sum rather than the ring being added afterwards.
+    // Added afterwards is exactly how the whole-split panel overran a CU:
+    // this division is integer, so the A/B staging already claims the whole
+    // budget and the slack it leaves can be nothing. SF_RING_SLOT does not
+    // depend on the depth, so there is no circularity.
+    static constexpr int prefetch_k_iter =
+        max_lds_size_per_wg / (per_block_iter_lds_size + (SF_USE_RING ? SF_RING_SLOT : 0));
+    static_assert(prefetch_k_iter >= 3,
+                  "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
+    static constexpr int SF_RING_LDS = prefetch_k_iter * SF_RING_SLOT;
+
 
     static constexpr int a_buffer_load_insts = NUM_LOAD_GROUPS_PER_BM * NUM_LOAD_GROUPS_PER_BK * slots / 2;
     static constexpr int b_buffer_load_insts = NUM_LOAD_GROUPS_PER_BN * NUM_LOAD_GROUPS_PER_BK * slots / 2;

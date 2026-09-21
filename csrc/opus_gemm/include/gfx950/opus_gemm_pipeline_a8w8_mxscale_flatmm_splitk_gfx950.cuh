@@ -589,12 +589,20 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // for a compile-time K upper bound (SFA_K_MAX); the actual packed count is a
     // runtime value so any K<=SFA_K_MAX (K%B_K==0) works. SFA_K_MAX=8192 keeps the
     // combined panel <=~4.2 KiB, well inside the WG_PER_CU=2 LDS headroom.
+    //
+    // Two shapes, picked by the traits rather than by a template flag so the
+    // codegen and every existing instantiation stay as they are: GROUP_K=128
+    // keeps this whole-split panel, GROUP_K=32 takes the ring, because the panel
+    // cannot hold a 32 split (T::SF_USE_RING).
+    constexpr bool SF_PANEL = PRELOAD_SF_LDS && !T::SF_USE_RING;
+    constexpr bool SF_RING  = PRELOAD_SF_LDS && T::SF_USE_RING;
     constexpr int SFA_K_MAX        = 8192;
-    constexpr int SFA_K_TILES_MAX  = PRELOAD_SF_LDS ? (SFA_K_MAX / T::B_K) : 1;
+    constexpr int SFA_K_TILES_MAX  = SF_PANEL ? (SFA_K_MAX / T::B_K) : 1;
     constexpr int SF_SCALES_MAX    = SFA_K_TILES_MAX * T::SCALES_PER_BK;
     constexpr int SFA_ROWS         = T::B_M / T::GROUP_M;
     constexpr int SF_LDS_ELEMS     =
-        PRELOAD_SF_LDS ? ((SFA_ROWS + T::N_SCALE_GROUPS) * SF_SCALES_MAX) : 1;
+        SF_PANEL ? ((SFA_ROWS + T::N_SCALE_GROUPS) * SF_SCALES_MAX)
+                 : (SF_RING ? T::SF_RING_LDS : 1);
     // 16B-aligned so the panel fill below can land ds_write_b128; a byte array is
     // only byte-aligned as far as the language is concerned.
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS];
@@ -628,7 +636,16 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     D_SF* s_sfb_ptr = smem_sf + SFA_ROWS * sf_k_scales;
     constexpr int mb_a = T::a_buffer_load_insts;
     constexpr int mb_b = T::b_buffer_load_insts;
-    constexpr int mb = mb_a + mb_b;
+    // The scale ring is staged per K tile beside A and B, so it belongs in mb.
+    //
+    // mb is "vm loads this producer issues for one K tile", and every
+    // s_waitcnt_vmcnt in the producer is mb times the number of tiles it allows
+    // in flight -- mb * p draining the prologue, mb or 2 * mb in the steady
+    // loop. That is why the ring only has to be issued in the same per-tile
+    // group as A/B: including it here keeps all of those correct without any of
+    // them being re-derived.
+    constexpr int mb_sf = SF_RING ? T::sf_ring_load_insts : 0;
+    constexpr int mb = mb_a + mb_b + mb_sf;
 
     if constexpr (DIRECT_ONLY) {
         __shared__ int b_ready[T::prefetch_k_iter];
