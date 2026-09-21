@@ -972,7 +972,11 @@ def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
-    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+    if (quant_type, aq_dtype, wq_dtype) in (
+        _PER1X32_BF16_FP4,
+        _PER1X32_FP8_FP4,
+        _PER1X32_FP4_FP4,
+    ):
         return swiglu_limit
     return None
 
