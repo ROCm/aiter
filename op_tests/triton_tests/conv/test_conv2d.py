@@ -140,7 +140,7 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
     torch.manual_seed(0)
     x_base = torch.randn(1, 32, 12, 18, device="cuda", dtype=torch.float16)
     x = x_base[..., ::2]
-    assert not x.is_contiguous()
+    assert not x.is_contiguous(), f"expected sliced input, got strides={x.stride()}"
     w = torch.randn(48, 32, 1, 1, device="cuda", dtype=torch.float16)
 
     y = conv2d_module.conv2d(x, w, stride=1, padding=0, dilation=1, layout=layout)
@@ -148,9 +148,13 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
     rtol, atol = dynamic_conv_tolerances(torch.float16, 32)
     torch.testing.assert_close(y.float(), ref, rtol=rtol, atol=atol)
     if layout == "nhwc":
-        assert y.is_contiguous(memory_format=torch.channels_last)
+        assert y.is_contiguous(
+            memory_format=torch.channels_last
+        ), f"expected channels-last output, got strides={y.stride()}"
     else:
-        assert y.is_contiguous()
+        assert y.is_contiguous(), (
+            f"expected contiguous output, got strides={y.stride()}"
+        )
 
 
 # -- Configuration lookup and routing (no kernel launches) -------------------
@@ -225,7 +229,10 @@ def test_exact_nchw_pin_selects_direct(
 ):
     _use_arch(monkeypatch, arch)
 
-    assert _resolve_nchw_3x3(shape) is conv2d_module.Route.DIRECT_NCHW_3X3
+    route = _resolve_nchw_3x3(shape)
+    assert route is conv2d_module.Route.DIRECT_NCHW_3X3, (
+        f"expected direct NCHW route for pinned {arch} shape, got {route}"
+    )
 
 
 @pytest.mark.parametrize("arch", ["gfx1100", "gfx1151"])
@@ -234,7 +241,10 @@ def test_unpinned_nchw_shape_falls_back_to_cblocked(
 ):
     _use_arch(monkeypatch, arch)
 
-    assert _resolve_nchw_3x3(_UNPINNED) is conv2d_module.Route.CBLOCKED_NCHW
+    route = _resolve_nchw_3x3(_UNPINNED)
+    assert route is conv2d_module.Route.CBLOCKED_NCHW, (
+        f"expected NCHWc fallback for unpinned {arch} shape, got {route}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -247,9 +257,9 @@ def test_exact_nchw_pin_uses_complete_shape_key(
 ):
     _use_arch(monkeypatch, "gfx1100")
 
-    assert (
-        _resolve_nchw_3x3(_GFX1100_PINNED, **route_override)
-        is conv2d_module.Route.CBLOCKED_NCHW
+    route = _resolve_nchw_3x3(_GFX1100_PINNED, **route_override)
+    assert route is conv2d_module.Route.CBLOCKED_NCHW, (
+        f"expected NCHWc after shape-key change {route_override}, got {route}"
     )
 
 
@@ -270,7 +280,11 @@ def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config
             "TEST-CONV-VARIANTS", shape_key=key, M=M, variants=variants
         )["source"]
 
-    assert selected("nhwc") == "layout"
-    assert selected() == "generic"
-    assert selected("nhwc", key="missing") == "bucket"
-    assert selected("nhwc", key="missing", M=65) == "any"
+    assert selected("nhwc") == "layout", "layout-specific config was not preferred"
+    assert selected() == "generic", "generic shape config was not selected"
+    assert selected("nhwc", key="missing") == "bucket", (
+        "M bucket was not used after a layout-specific shape miss"
+    )
+    assert selected("nhwc", key="missing", M=65) == "any", (
+        "generic fallback was not used after shape and bucket misses"
+    )
