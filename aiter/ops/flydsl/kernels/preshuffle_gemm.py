@@ -859,7 +859,8 @@ def compile_preshuffle_gemm(
                 row = bx_m + mi * 16 + lane_div_16 * 4 + ii
                 col = by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16
                 c_index = fx.Int32(row * i32_n + col)
-                safe_index = (col < i32_n).select(c_index, oob)
+                in_bounds = (row < i32_m) & (col < i32_n)
+                safe_index = in_bounds.select(c_index, oob)
                 fx.memref_store_vec(
                     Vec.filled(1, final_values[p], out_elem_cls), scalar_out
                 )

@@ -220,6 +220,7 @@ def _get_compile_fn():
 # Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated to avoid importing the
 # compiler module before the preshuffle path is selected.
 PRESHUFFLE_M_MAX = 65536
+PRESHUFFLE_FLAT_BUFFER_LIMIT_BYTES = 1 << 32
 
 PRESHUFFLE_SPLIT_K_MAX_TILES = 256
 PRESHUFFLE_SPLIT_K_MAX_TILE_ELEMS = 32 * 128
@@ -242,6 +243,28 @@ def _get_preshuffle_split_buffers(
         PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
     )
     return workspace, semaphore
+
+
+def _check_preshuffle_flat_buffer_capacity(
+    m: int,
+    n: int,
+    k: int,
+    a_elem_bytes: int,
+    b_elem_bytes: int,
+    out_elem_bytes: int,
+) -> None:
+    """Keep flat AMD buffer descriptors and their i32 offsets below 4 GiB."""
+    buffer_bytes = {
+        "A": m * k * a_elem_bytes,
+        "B": n * k * b_elem_bytes,
+        "output": m * n * out_elem_bytes,
+    }
+    for name, size in buffer_bytes.items():
+        if size >= PRESHUFFLE_FLAT_BUFFER_LIMIT_BYTES:
+            raise RuntimeError(
+                f"[FlyDSL] preshuffle {name} buffer needs {size} bytes; "
+                "flat buffer descriptors require fewer than 4 GiB"
+            )
 
 
 def _check_preshuffle_split_capacity(
@@ -326,6 +349,14 @@ def flydsl_preshuffle_gemm_a8(
             f"[FlyDSL] unsupported output dtype {Out.dtype}; "
             "expected torch.bfloat16 or torch.float16"
         )
+    _check_preshuffle_flat_buffer_capacity(
+        m,
+        n,
+        k,
+        XQ.element_size(),
+        WQ.element_size(),
+        Out.element_size(),
+    )
 
     exe = compile_fn(
         N=n,

@@ -303,7 +303,6 @@ def _vgpr_per_simd(gfx: str) -> int:
 
 _MFMA_M = 16
 _MFMA_N = 16
-_THREADS_PER_TG = _WAVES_PER_WG * 64
 
 
 def _estimate_max_wpe(
@@ -312,20 +311,21 @@ def _estimate_max_wpe(
     """Estimate max achievable waves_per_eu from C-accumulator VGPR pressure.
 
     Preshuffle GEMM always uses 16x16 MFMA (4 VGPRs per thread per block).
-    Per-thread accum VGPRs = round_up(tile_m, 16) * round_up(tile_n, 16) / 256.
+    Per-thread accum VGPRs divide by the actual workgroup size: tile_n=32 uses
+    two waves (128 threads), while the standard path uses four (256 threads).
     Estimated total ~= accum * 1.5 (pipeline overhead for A/B buffers).
     Returns the max waves_per_eu that the register file can support.
     """
     padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
     padded_n = math.ceil(tile_n / _MFMA_N) * _MFMA_N
-    c_per_thread = padded_m * padded_n // _THREADS_PER_TG
+    threads_per_tg = (2 if tile_n == 32 else _WAVES_PER_WG) * 64
+    c_per_thread = padded_m * padded_n // threads_per_tg
     if tile_n == 32 and tile_k >= 1024:
         # The 2-wave K=1024 path keeps two A-side and two B-side fragments
         # live. Model those operands explicitly so wpe=3/4 candidates that
         # must spill are pruned before compilation.
-        threads = 2 * 64
         operand_vgpr = (
-            2 * (tile_m + tile_n) * tile_k // threads // 4
+            2 * (tile_m + tile_n) * tile_k // threads_per_tg // 4
         )
         est_per_wave = operand_vgpr + c_per_thread * 1.5 + 32
         return int(total_vgpr / max(est_per_wave, 1))
