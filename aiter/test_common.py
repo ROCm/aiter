@@ -53,6 +53,7 @@ def perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    return_trace_df=False,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -91,6 +92,8 @@ def perftest(
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
                 if use_cuda_event:
+                    if return_trace_df:
+                        return data, avg, None
                     return data, avg
 
             with tpf.profile(
@@ -108,7 +111,11 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            avg = get_trace_perf(prof, num_iters)
+            if return_trace_df:
+                avg, trace_df = get_trace_perf(prof, num_iters, return_df=True)
+            else:
+                avg = get_trace_perf(prof, num_iters)
+                trace_df = None
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -121,7 +128,10 @@ def perftest(
                     with_modules=True,
                 ) as prof:
                     run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
+                if return_trace_df:
+                    avg, trace_df = get_trace_perf(prof, num_iters, return_df=True)
+                else:
+                    avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
             if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
@@ -154,6 +164,8 @@ def perftest(
                     estimated_us=replay_us,
                 )
 
+            if return_trace_df:
+                return data, avg, trace_df
             return data, avg
 
         return wrapper
@@ -248,6 +260,7 @@ def run_perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    return_trace_df=False,
     **kwargs,
 ):
     @perftest(
@@ -257,6 +270,7 @@ def run_perftest(
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
+        return_trace_df=return_trace_df,
     )
     @wraps(func)
     def worker(*args, **kwargs):
@@ -361,7 +375,7 @@ def post_process_data(df, num_iters, warm_iter=1):
     return list(indices), out_range_num + warm_iter + num_iters - act_iters
 
 
-def get_trace_perf(prof, num_iters):
+def get_trace_perf(prof, num_iters, return_df=False):
     assert num_iters > 1
     warm_iter = 1
     num_iters -= warm_iter
@@ -443,7 +457,10 @@ def get_trace_perf(prof, num_iters):
         # table. Keep its full kernel symbol for downstream log parsers without
         # changing pandas' process-wide column-width setting.
         logger.info(df.to_string(max_colwidth=None))
-    return df.at[avg_name, "device_time_sum"]
+    avg = df.at[avg_name, "device_time_sum"]
+    if return_df:
+        return avg, df
+    return avg
 
 
 _CATASTROPHIC_REL_THRESHOLD = 0.5
