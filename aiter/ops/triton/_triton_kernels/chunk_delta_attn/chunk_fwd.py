@@ -19,7 +19,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
     RCP_LN2,
 )
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
-    CHUNK_DELTA_ATTN_USE_FLASH_KDA,
+    AITER_FDA_ENABLE,
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
     flash_kda_supported,
@@ -126,7 +126,7 @@ def chunk_delta_attn_fwd(
     # the two apart risks landing on the default pipeline at 32, the slowest
     # combination of the three.
     use_flash_kda = (
-        CHUNK_DELTA_ATTN_USE_FLASH_KDA
+        AITER_FDA_ENABLE
         and not disable_recompute
         and flash_kda_supported(
             q=q,

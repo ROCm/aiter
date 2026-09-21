@@ -14,6 +14,7 @@ defaultDtypes = {
     "gfx1100": {"fp8": torch.float8_e4m3fn},
     "gfx1101": {"fp8": torch.float8_e4m3fn},
     "gfx1102": {"fp8": torch.float8_e4m3fn},
+    "gfx1150": {"fp8": torch.float8_e4m3fn},
     "gfx1151": {"fp8": torch.float8_e4m3fn},
     "gfx1200": {"fp8": torch.float8_e4m3fn},
     "gfx1201": {"fp8": torch.float8_e4m3fn},
@@ -181,5 +182,15 @@ def str2Dtype(v):
 
 
 def str2ActivationType(s):
-    """Convert string to ActivationType."""
-    return getattr(ActivationType, s.capitalize())
+    s = str(s)
+    members = getattr(ActivationType, "__members__", None)
+    if members is not None:
+        s_lower = s.lower()
+        for name, member in members.items():
+            if name.lower() == s_lower:
+                return member
+        raise argparse.ArgumentTypeError(f"invalid activation type: {s}")
+    try:
+        return getattr(ActivationType, s.capitalize())
+    except AttributeError as e:
+        raise argparse.ArgumentTypeError(f"invalid activation type: {s}") from e

@@ -14,6 +14,12 @@ _DTYPE_INFO = {
     torch.int32: ("<i4", 4, None),
     torch.float32: ("<f4", 4, None),
     torch.bfloat16: ("<u1", 2, torch.bfloat16),
+    # The quantizing wires: an fp8 payload views as fp8, an fp4 one as raw bytes
+    # (its row width is in BYTES, not features), and both e8m0 scale rows are
+    # bytes. Same byte-view-then-reinterpret shape as bf16, one byte per element.
+    torch.uint8: ("|u1", 1, None),
+    torch.float8_e4m3fn: ("<u1", 1, torch.float8_e4m3fn),
+    torch.float8_e4m3fnuz: ("<u1", 1, torch.float8_e4m3fnuz),
 }
 
 
@@ -57,6 +63,23 @@ class Stage2ScatterContext:
     max_tokens_per_rank: int
     world_size: int
     source_token_map: torch.Tensor
+    compact_layout: bool = False
+    compact_masked_m: torch.Tensor | None = None
+    compact_psum: torch.Tensor | None = None
+    compact_ep_rowmap: torch.Tensor | None = None
+    compact_wire_row_stride: int = 0
+    # This step's shape, not the arena's. The compact rows a forward actually
+    # holds depend on what dispatch delivered, while the arena is sized once for
+    # the worst case; a GEMM keyed off the arena runs the largest tuned tile and
+    # a grid to match on every decode step. All three are python ints so a
+    # captured graph keeps a static grid.
+    #   recv_bound: recv-token upper bound, i.e. the CSV token bucket.
+    #   align_m:    per-expert row alignment the plan wrote; a GEMM tile_m must
+    #               divide it or a tile would straddle two experts.
+    #   rows:       row upper bound for this step, bounding the GEMM grid.
+    compact_recv_bound: int = 0
+    compact_align_m: int = 0
+    compact_rows: int = 0
 
     def __post_init__(self):
         if self.arena_handle < 0:

@@ -35,9 +35,7 @@ from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
 CHUNK_SIZE = 64
 
 _K5_TEST_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "flydsl_tests"
-    / "test_flydsl_linear_attention_prefill.py"
+    Path(__file__).resolve().parents[2] / "test_flydsl_linear_attention_prefill.py"
 )
 
 MODELS = {

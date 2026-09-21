@@ -30,8 +30,6 @@ import functools
 
 import torch
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
@@ -113,11 +111,6 @@ def flydsl_mxscale_preshuffle_gemm(
     A-scale is a plain reshape+permute, so build it on device (a host round-trip
     costs more than this GEMM).
     """
-    if not is_flydsl_available():
-        raise RuntimeError(
-            "flydsl is not available; cannot run mxscale_preshuffle GEMM"
-        )
-
     from .kernels.tensor_shim import _run_compiled, ptr_arg
 
     # Logical K: fp4 A packs 2 codes/byte (A last dim = K//2); fp6/fp8 A = 1 byte/code.

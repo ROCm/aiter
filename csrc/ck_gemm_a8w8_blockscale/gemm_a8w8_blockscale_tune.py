@@ -55,7 +55,6 @@ try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
         kernels_list as kernels_list_flydsl,
     )
-    from aiter.ops.flydsl.utils import is_flydsl_available
 except ImportError as _flydsl_import_err:
     print(
         f"[FlyDSL] mxscale preshuffle catalog unavailable "
@@ -63,9 +62,6 @@ except ImportError as _flydsl_import_err:
     )
     kernels_list_flydsl = {}
     fits_shape_flydsl = None
-
-    def is_flydsl_available():
-        return False
 
 
 block_shape = (128, 128)
@@ -653,8 +649,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             return []
         if not kernels_list_flydsl or fits_shape_flydsl is None:
             return []
-        if not is_flydsl_available():
-            return []
 
         gemm_keys = ["x", "weight_shuffle", "x_scale_shuf", "w_scale_shuf", "out"]
         ref_args = (["x_deq", "w_deq"], dtypes.bf16)
@@ -957,6 +951,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         """
 
         resultdf = pd.DataFrame(columns=self.columns)
+        rows = []
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName, libtype, preshuffleB = info
@@ -990,11 +985,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     "bw": [bw],
                 }
             )
-            temp = pd.DataFrame(key_dict)
-            if resultdf.empty:
-                resultdf = temp
-            else:
-                resultdf = pd.concat([resultdf, temp], ignore_index=True)
+            rows.append(key_dict)
+        # Build the frame once. Concatenating per row is O(n^2) in both time and
+        # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
+        # candidate run spends hours here AFTER all GPU work is done.
+        if rows:
+            resultdf = pd.concat([pd.DataFrame(r) for r in rows], ignore_index=True)
         return resultdf
 
 

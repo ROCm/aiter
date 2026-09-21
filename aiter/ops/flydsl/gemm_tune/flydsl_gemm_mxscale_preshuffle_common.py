@@ -170,9 +170,9 @@ def estimated_lds_bytes(ki: kernelInstance) -> int:
 
 def _max_lds_bytes() -> int:
     try:
-        from aiter.ops.flydsl.utils import get_shared_memory_per_block
+        from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-        return int(get_shared_memory_per_block(fallback_gfx="gfx950"))
+        return int(get_lds_capacity_bytes("gfx950"))
     except Exception:  # noqa: BLE001
         return 160 * 1024  # gfx950 LDS
 

@@ -19,16 +19,21 @@ logger = logging.getLogger("aiter")
 
 
 @functools.lru_cache(maxsize=1)
+def _rocminfo_output() -> str:
+    """rocminfo stdout, run once and shared by every parser below.
+
+    check=False on purpose: rocminfo can exit non-zero while still printing
+    usable agent blocks. Each parser decides whether what it needs is missing.
+    """
+    rocminfo = executable_path("rocminfo")
+    result = subprocess.run([rocminfo], capture_output=True, text=True, check=False)
+    return result.stdout
+
+
+@functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
     try:
-        rocminfo = executable_path("rocminfo")
-        result = subprocess.run(
-            [rocminfo],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        for line in result.stdout.splitlines():
+        for line in _rocminfo_output().splitlines():
             match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
@@ -68,6 +73,30 @@ def get_gfx():
     return GFX_MAP.get(gfx_num, "unknown")
 
 
+_LDS_CAPACITY_BYTES = {
+    "gfx90a": 64 * 1024,
+    "gfx942": 64 * 1024,
+    "gfx950": 160 * 1024,
+    "gfx1100": 64 * 1024,
+    "gfx1101": 64 * 1024,
+    "gfx1102": 64 * 1024,
+    "gfx1150": 64 * 1024,
+    "gfx1151": 64 * 1024,
+    "gfx1200": 64 * 1024,
+    "gfx1201": 64 * 1024,
+    "gfx1250": 320 * 1024,
+}
+
+
+def get_lds_capacity_bytes(gfx: str | None = None) -> int:
+    """Return the architectural LDS capacity for one workgroup."""
+    arch = (gfx or get_gfx()).split(":", 1)[0].lower()
+    try:
+        return _LDS_CAPACITY_BYTES[arch]
+    except KeyError as exc:
+        raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
+
+
 @functools.lru_cache(maxsize=1)
 def get_gfx_runtime() -> str:
     """Return the arch of the live GPU, always via rocminfo.
@@ -85,6 +114,63 @@ def get_gfx_runtime() -> str:
             f"Supported architectures: {sorted(supported)}"
         )
     return gfx_arch
+
+
+@functools.lru_cache(maxsize=1)
+def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
+    """(arch, asicRevision) of every GPU agent rocminfo reports.
+
+    rocminfo's `ASIC Revision:` is HSA_AMD_AGENT_INFO_ASIC_REVISION, the same
+    value hipDeviceGetAttribute(hipDeviceAttributeAsicRevision) returns.
+    """
+    agents: list[tuple[str, int]] = []
+    name = kind = None
+    rev = None
+    for line in _rocminfo_output().splitlines():
+        if re.match(r"^\s*Agent\s+\d+\s*$", line):
+            name = kind = rev = None
+            continue
+        # 2-space indent = agent header; ISA/pool sub-blocks nest deeper.
+        m = re.match(r"^  (Name|Device Type|ASIC Revision):\s+(.*?)\s*$", line)
+        if m is None:
+            continue
+        key, value = m.group(1), m.group(2)
+        if key == "Name" and name is None:
+            # Agent names can carry target-id features ("gfx942:sramecc+").
+            m2 = re.search(r"\b(gfx\w+)\b", value, re.IGNORECASE)
+            name = m2.group(1) if m2 else value
+        elif key == "Device Type":
+            kind = value
+        elif key == "ASIC Revision":
+            rev = int(value.split("(")[0])
+        if kind == "GPU" and name is not None and rev is not None:
+            agents.append((name.lower(), rev))
+            name = kind = rev = None
+    return agents
+
+
+@functools.lru_cache(maxsize=1)
+def get_asic_revision() -> int:
+    """Silicon stepping of this node's GPUs: 0=A0, 1=B0, 2=C0, ...
+
+    Node-wide, not per-device: rocminfo enumerates HSA agents, which
+    HIP_VISIBLE_DEVICES does not filter, so agent index and HIP device index
+    can disagree. The lowest stepping is reported, so the asm gate on a
+    mixed-stepping node fails closed. Raises when nothing can be read.
+    """
+    agents = _rocminfo_gpu_agents()
+    arch = get_gfx_runtime()
+    revs = [rev for name, rev in agents if name == arch]
+    if not revs:
+        raise RuntimeError(
+            f"rocminfo reported no ASIC Revision for a {arch} agent "
+            f"(GPU agents seen: {agents})"
+        )
+    rev = min(revs)
+    # A bogus parse must not read as A0 and disable asm on good silicon.
+    if not 0 <= rev <= 15:
+        raise RuntimeError(f"implausible ASIC Revision {rev} parsed from rocminfo")
+    return rev
 
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
@@ -140,12 +226,7 @@ def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
         try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], capture_output=True, text=True, check=False
-            )
-            output = result.stdout
-            devices = re.split(r"Agent\s*\d+", output)
+            devices = re.split(r"Agent\s*\d+", _rocminfo_output())
             gpu_compute_units = []
             for device in devices:
                 for line in device.split("\n"):
@@ -374,7 +455,13 @@ def write_name_keyed_lookup_header(
 
 
 def write_lookup_header(
-    output_path, kernels_dict, lookup_head, lookup_template, lookup_end, istune=False
+    output_path,
+    kernels_dict,
+    lookup_head,
+    lookup_template,
+    lookup_end,
+    istune=False,
+    extra_format_args=None,
 ):
     """Write a C++ GEMM dispatch lookup header from a kernels_dict.
 
@@ -396,7 +483,16 @@ def write_lookup_header(
         lookup_template: String with {MNK} and {kernel_name} placeholders.
         lookup_end:      String written after the loop (closes the macro / #endif).
         istune:          True when generating the tune-mode lookup (int kernelId keys).
+        extra_format_args: Optional callable returning additional format arguments
+                           for a kernel instance.
     """
+
+    def format_entry(key_value, kernel):
+        format_args = {"MNK": key_value, "kernel_name": kernel.name}
+        if extra_format_args is not None:
+            format_args.update(extra_format_args(kernel))
+        return lookup_template.format(**format_args)
+
     with open(output_path, "w") as f:
         f.write(lookup_head)
         for key, k in kernels_dict.items():
@@ -407,14 +503,9 @@ def write_lookup_header(
                 cpp_key = (
                     '{"' + key[0] + '", ' + ", ".join(str(x) for x in key[1:]) + "}"
                 )
-                f.write(
-                    lookup_template.format(
-                        MNK=cpp_key,
-                        kernel_name=k.name,
-                    )
-                )
+                f.write(format_entry(cpp_key, k))
             elif istune and isinstance(key, int) and key >= 0:
-                f.write(lookup_template.format(MNK=key, kernel_name=k.name))
+                f.write(format_entry(key, k))
         f.write(lookup_end)
 
 

@@ -2,12 +2,15 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
 #include "asm_mla_configs.hpp"
+#include "aiter_ctypes_error.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
+
+AITER_CTYPES_ERROR_DEF
 
 // Debug instrumentation (host prints + post-launch sync/error checks + raw
 // buffer dumps) for the gfx1250 gfx1250 MLA dispatch is compiled ONLY when
@@ -316,10 +319,11 @@ static void mla_decode_gfx1250_dispatch(
     const int num_heads    = Q->size(1);
     const int gqa_ratio    = num_heads / nhead_kv;
     const int kv_split     = splitData->size(1);
-    // TODO: Keep the ABI decision in this host dispatch layer: it owns kernel
-    // selection and the exact kernarg layout. qh128 remains on the legacy ABI
-    // for e2e stability; the other gfx1250 gfx1250 kernels use packed preload.
-    const bool use_packed_gfx1250_args = !(gqa_ratio == 128 && max_seqlen_q == 1);
+    // Keep the ABI decision in this host dispatch layer: it owns kernel selection
+    // and the exact kernarg layout. Every gfx1250 MLA kernel -- qh128 included --
+    // is now built from the poc_kl sp3 with DIRECT_PARAM=1, i.e. the 120B packed
+    // preload ABI, so there is no longer a legacy exception.
+    const bool use_packed_gfx1250_args = true;
     constexpr int bdx      = 128;
     constexpr int bdy      = 1;
     constexpr int bdz      = 1;
@@ -407,9 +411,9 @@ static void mla_decode_gfx1250_dispatch(
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
     }
 
-    // gfx1250 gfx1250 dispatch. qh128 is temporarily left on the legacy 288B ABI
-    // because it is used by e2e. Other gfx1250 private kernels use the new
-    // 120B packed-preload ABI from poc_kl/gfx1250/mla/mla_execute_v3_hip.inl.
+    // gfx1250 dispatch. All gfx1250 private kernels use the 120B packed-preload
+    // ABI from poc_kl/gfx1250/mla/mla_execute_v3_hip.inl; the legacy 288B branch
+    // below is kept only for kernels that have not been rebuilt from sp3 yet.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
     const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;
@@ -473,9 +477,13 @@ static void mla_decode_gfx1250_dispatch(
         arg_size = sizeof(packed_args);
     }
 
-    const int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    // The kernel body covers 64 Q rows per workgroup, so gqa=128 is split across
+    // two workgroups along X: the kernel copies the X id into _s_tg_idx (guarded by
+    // _s_MQA > 64) and shifts Q by Q_GROUP_PAD_SIZE * tg_idx. Z is the plain KV
+    // split id in every case -- it must not carry the head half as well.
+    const int gdx = (gqa_ratio == 128) ? 2 : (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
     const int gdy = batch;
-    const int gdz = (gqa_ratio == 128) ? kv_split * 2 : kv_split;
+    const int gdz = kv_split;
 
 #ifdef ASM_DEBUG
     std::printf("[aiter][gfx1250][debug] kernelName=%s\n", kernelName.c_str());
@@ -640,9 +648,10 @@ static void mla_decode_gfx1250_dispatch(
 #endif
 }
 
-AITER_C_ITFS
-void mla_decode_stage1_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_decode_stage1_asm_fwd,
+    (aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
     aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
     aiter_tensor_t* qo_indptr,            //   [batch_size+1]
     aiter_tensor_t* kv_indptr,            //   [batch_size+1]
@@ -669,7 +678,8 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
     int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, work_meta_data, work_indptr, work_info_set, max_seqlen_q, page_size, nhead_kv, softmax_scale, splitData, splitLse, output, lse, q_scale, kv_scale, g_kv_indptr, cp_world_size, cp_rank, valid_split_count, use_valid_split_count_reduce, causal, stream))
 {    
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
@@ -972,7 +982,12 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
+        && gqa_ratio == 96){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 96;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
@@ -983,7 +998,8 @@ void mla_decode_stage1_asm_fwd(
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
                && ((gqa_ratio == 32 && max_seqlen_q >= 4)
                    || (gqa_ratio == 64 && max_seqlen_q >= 2)
-                   || (gqa_ratio == 128))){
+                   || (gqa_ratio == 128)
+                   || (gqa_ratio == 96 && max_seqlen_q <= 6))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
@@ -1085,9 +1101,10 @@ struct __attribute__((packed)) PsKernelArgs
 };
 
 
-AITER_C_ITFS
-void mla_prefill_ps_asm_fwd(
-    aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_ps_asm_fwd,
+    (aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
     aiter_tensor_t* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
     aiter_tensor_t* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
     aiter_tensor_t* qo_indptr,            //   [batch_size+1], int
@@ -1104,7 +1121,8 @@ void mla_prefill_ps_asm_fwd(
     aiter_tensor_t* q_scale,              //   fp32, scalar (nullable)
     aiter_tensor_t* k_scale,              //   fp32, scalar (nullable)
     aiter_tensor_t* v_scale,              //   fp32, scalar (nullable)
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, K, V, qo_indptr, kv_indptr, kv_page_indices, work_indptr, work_info_set, max_seqlen_q, softmax_scale, is_causal, splitData, splitLse, output, q_scale, k_scale, v_scale, stream))
 {
     int num_q_tokens  = Q->size(0);
     int num_head_q    = Q->size(1);
@@ -1202,9 +1220,10 @@ void mla_prefill_ps_asm_fwd(
 }
 
 
-AITER_C_ITFS
-void mla_prefill_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_asm_fwd,
+    (aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
     aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
     aiter_tensor_t* qo_indptr,            //   [batch_size+1]
     aiter_tensor_t* kv_indptr,            //   [batch_size+1]
@@ -1214,7 +1233,8 @@ void mla_prefill_asm_fwd(
     float softmax_scale,
     aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
     aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, max_seqlen_q, softmax_scale, splitData, splitLse, stream))
 {
     int sub_Q           = 128;
     int batch           = kv_indptr->size(0) - 1;
