@@ -41,7 +41,6 @@ def update_dpp_i32(
 
 def dpp_xor_f32(src, offset: int, **kw):
     """Return ``src`` from the lane selected by a 16-lane XOR DPP pattern."""
-    from flydsl._mlir.dialects import arith as _arith_dialect
     from flydsl.expr.typing import T
 
     src_i32 = fx.Float32(src).bitcast(fx.Int32)
@@ -59,4 +58,4 @@ def dpp_xor_f32(src, offset: int, **kw):
         raise ValueError(
             f"dpp_xor_f32 only supports 16-lane offsets 1, 2, 4, 8; got {offset}"
         )
-    return _arith_dialect.BitcastOp(T.f32, out_i32).result
+    return out_i32.bitcast(T.f32)
