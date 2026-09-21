@@ -339,8 +339,10 @@ def silu_and_mul_backward(
     Returns:
         The gradient with respect to ``x``. Computation uses FP32 intermediates.
 
-    Width thresholds select the launch configuration from the current
-    architecture's ``DEFAULT.json``. Only gfx942 and gfx950 are supported.
+    On gfx950, ``N_LEQ_*`` thresholds select the row/column tiles
+    (``BLOCK_M``, ``BLOCK_N``) and launch scheduling (``num_warps``,
+    ``num_stages``); ``BLOCK_M`` is capped by the row count. Other
+    architectures are unsupported.
     """
     assert x.is_contiguous(), "x must be contiguous"
     assert x.dtype in (

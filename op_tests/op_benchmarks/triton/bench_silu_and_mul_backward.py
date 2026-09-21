@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark the fused SiLU-and-multiply backward kernel."""
+"""Benchmark the fused SiLU-and-multiply backward kernel.
+
+Reports the public API, its preallocated-output path, and an FP32 eager reference.
+"""
 
 import argparse
 import sys
@@ -20,7 +23,7 @@ _DTYPES = {
     "bf16": torch.bfloat16,
     "fp32": torch.float32,
 }
-_PROVIDERS = ("aiter", "torch")
+_PROVIDERS = ("aiter", "aiter-preallocated", "torch")
 _ROWS = (1, 128, 2048, 8192)
 _WIDTHS = (64, 128, 256, 512, 4096, 12288)
 
@@ -39,11 +42,16 @@ def _benchmark(rows: int, width: int, provider: str, metric: str, args):
     dtype = _DTYPES[args.dtype]
     x = torch.randn((rows, 2 * width), dtype=dtype, device="cuda")
     grad_output = torch.randn((rows, width), dtype=dtype, device=x.device)
-    if provider == "aiter":
+    if provider == "aiter-preallocated":
         out = torch.empty_like(x)
 
         def fn():
             return silu_and_mul_backward(grad_output, x, out=out)
+
+    elif provider == "aiter":
+
+        def fn():
+            return silu_and_mul_backward(grad_output, x)
 
     else:
 
@@ -54,6 +62,7 @@ def _benchmark(rows: int, width: int, provider: str, metric: str, args):
     if metric == "time":
         return ms * 1000
     if metric == "bandwidth":
+        # Three logical input reads and two gradient writes per gate/up pair.
         logical_bytes = 5 * rows * width * x.element_size()
         return logical_bytes / (ms * 1e-3) * 1e-9
     raise ValueError(f"unknown metric: {metric}")
@@ -63,8 +72,7 @@ def run_benchmark(args):
     rows = (args.rows,) if args.rows is not None else _ROWS
     widths = (args.width,) if args.width is not None else _WIDTHS
     providers = _PROVIDERS if args.provider == "all" else (args.provider,)
-    metrics = ("time", "bandwidth") if args.metric == "all" else (args.metric,)
-    lines = [f"{provider}_{metric}" for metric in metrics for provider in providers]
+    lines = [f"{provider}_{args.metric}" for provider in providers]
 
     benchmark = triton.testing.Benchmark(
         x_names=["rows", "width"],
@@ -72,11 +80,13 @@ def run_benchmark(args):
         line_arg="provider_metric",
         line_vals=lines,
         line_names=lines,
-        styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("orange", "-")][
-            : len(lines)
-        ],
-        ylabel="",
-        plot_name=f"{get_caller_name_no_ext()}_{args.dtype}",
+        styles=[
+            ("red", "-"),
+            ("blue", "-"),
+            ("green", "-"),
+        ][: len(lines)],
+        ylabel="us" if args.metric == "time" else "GB/s",
+        plot_name=f"{get_caller_name_no_ext()}_{args.dtype}_{args.metric}",
         args={},
     )
 
@@ -97,7 +107,7 @@ def parse_args():
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="bf16")
     parser.add_argument("--provider", choices=(*_PROVIDERS, "all"), default="all")
-    parser.add_argument("--metric", choices=("time", "bandwidth", "all"), default="all")
+    parser.add_argument("--metric", choices=("time", "bandwidth"), default="time")
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--print-vgpr", action="store_true")

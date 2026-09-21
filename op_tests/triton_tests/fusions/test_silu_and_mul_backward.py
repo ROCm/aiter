@@ -8,12 +8,12 @@ from aiter.ops.triton.activation import silu_and_mul_backward
 from aiter.ops.triton.utils import config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+_SUPPORTED_ARCHS = ("gfx950",)
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.skipif(
         torch.cuda.is_available() and get_arch() not in _SUPPORTED_ARCHS,
-        reason="silu_and_mul_backward supports gfx942 and gfx950",
+        reason="silu_and_mul_backward supports gfx950",
     ),
 ]
 
@@ -95,9 +95,9 @@ def test_silu_and_mul_backward_non_current_device():
 def test_silu_and_mul_backward_unsupported_arch(monkeypatch):
     x = torch.randn((2, 64), dtype=torch.bfloat16, device="cuda")
     grad_output = torch.randn((2, 32), dtype=x.dtype, device=x.device)
-    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: "gfx1201")
+    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: "gfx942")
 
-    with pytest.raises(FileNotFoundError, match="gfx1201.*silu_and_mul_backward"):
+    with pytest.raises(FileNotFoundError, match="gfx942.*silu_and_mul_backward"):
         silu_and_mul_backward(grad_output, x)
 
 
