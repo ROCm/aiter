@@ -1189,11 +1189,10 @@ def attn_fwd_mxfp8(
 
 
 def get_padded_head_dim(head_size: int):
-    # Get closest power of 2 over or equal to 32.
+    # Closest power of 2 at least QUANT_BLOCK_SIZE (32). Smaller head dims
+    # are padded in the tile only; there is no padding in memory.
     padded_d_model = 1 << (head_size - 1).bit_length()
-    # Smallest head_dim supported is 16. If smaller, the tile in the
-    # kernel is padded - there is no padding in memory for any dims.
-    padded_d_model = max(padded_d_model, 16)
+    padded_d_model = max(padded_d_model, 32)
     return padded_d_model
 
 
@@ -1356,7 +1355,8 @@ def get_autotune_bwd_configs():
         "attention", "MXFP8_ATTN", "_bwd_kernels", _BWD_FALLBACK
     )
     return autotune_configs("MXFP8_ATTN_BWD", [pinned], pinned), [
-        "BLOCK_DMODEL",
+        "BLOCK_DMODEL_QK",
+        "BLOCK_DMODEL_V",
         "CAUSAL",
         "use_mxfp8",
     ]
@@ -1620,17 +1620,19 @@ def _attn_bwd_dkdv(
                     out_dtype=tl.float32,
                 )
             else:
-                if (SCALE_NUM_PER_D_V) % 2 == 0:
-                    do_descaled = _unpack_fp8(
-                        do,
-                        blk_do_scale_2d,
-                        tl.float32,
-                        BLOCK_M,
-                        BLOCK_DMODEL_V,
-                        QUANT_BLOCK_SIZE,
-                        True,
-                        DO_USE_ASM,
-                    )
+                # SCALE_NUM_PER_M odd: always unpack. When SCALE_NUM_PER_D_V is
+                # also odd, dp already unpacked do_descaled, but Triton SSA does
+                # not carry that assignment into this branch.
+                do_descaled = _unpack_fp8(
+                    do,
+                    blk_do_scale_2d,
+                    tl.float32,
+                    BLOCK_M,
+                    BLOCK_DMODEL_V,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    DO_USE_ASM,
+                )
                 dv += tl.dot(
                     tl.trans(p), do_descaled, out_dtype=tl.float32, allow_tf32=False
                 )
@@ -1673,17 +1675,16 @@ def _attn_bwd_dkdv(
                     out_dtype=tl.float32,
                 )
             else:
-                if (SCALE_NUM_PER_D_QK) % 2 == 0:
-                    q_descaled = _unpack_fp8(
-                        q,
-                        blk_q_scale_2d,
-                        tl.float32,
-                        BLOCK_M,
-                        BLOCK_DMODEL_QK,
-                        QUANT_BLOCK_SIZE,
-                        True,
-                        USE_ASM,
-                    )
+                q_descaled = _unpack_fp8(
+                    q,
+                    blk_q_scale_2d,
+                    tl.float32,
+                    BLOCK_M,
+                    BLOCK_DMODEL_QK,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
+                )
                 _dk = tl.dot(
                     tl.trans(ds), q_descaled, out_dtype=tl.float32, allow_tf32=False
                 )
@@ -2209,8 +2210,6 @@ def _attn_bwd_dq(
     SCALE_NUM_PER_D_V: tl.constexpr = scales_num_block_d_v * SCALE_NUM_PER_QUANT_BLK
     # scale number per N in this warp tile for mxfp
     SCALE_NUM_PER_N: tl.constexpr = scales_num_block_n * SCALE_NUM_PER_QUANT_BLK
-    # scale number per N in this warp tile for mxfp
-    scales_num_block_m * SCALE_NUM_PER_QUANT_BLK
 
     # if block size can be divided by quant block size, the scale wont be tranposed.
     if scales_num_block_n == 1 and scales_num_block_d_v == 1:
@@ -2372,19 +2371,17 @@ def _attn_bwd_dq(
                 )
 
             else:
-                if (SCALE_NUM_PER_D_QK) % 2 == 0:
-                    blk_k_scale = tl.load(k_scale_ptr_2d_base)
-                    k_descaled = _unpack_fp8(
-                        k,
-                        blk_k_scale,
-                        tl.float32,
-                        BLOCK_N,
-                        BLOCK_DMODEL_QK,
-                        QUANT_BLOCK_SIZE,
-                        True,
-                        USE_ASM,
-                    )
-
+                blk_k_scale = tl.load(k_scale_ptr_2d_base)
+                k_descaled = _unpack_fp8(
+                    k,
+                    blk_k_scale,
+                    tl.float32,
+                    BLOCK_N,
+                    BLOCK_DMODEL_QK,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
+                )
                 _dq = tl.dot(ds, k_descaled, out_dtype=tl.float32, allow_tf32=False)
                 dq += _dq
 
