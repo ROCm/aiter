@@ -114,12 +114,19 @@ void iq2r_route_topk_sort_gather_quant_out(
     bool renormalize,
     std::optional<aiter_tensor_t> router_bias);
 
-void iq2r_swiglu_out(const aiter_tensor_t& gate_up, aiter_tensor_t& output);
+void iq2r_swiglu_out(const aiter_tensor_t& gate_up,
+                     aiter_tensor_t& output,
+                     double limit,
+                     double alpha,
+                     double up_offset);
 
 void iq2r_swiglu_quant_out(const aiter_tensor_t& gate_up,
                            aiter_tensor_t& output,
                            aiter_tensor_t& scales,
-                           std::optional<aiter_tensor_t> activated);
+                           std::optional<aiter_tensor_t> activated,
+                           double limit,
+                           double alpha,
+                           double up_offset);
 
 void iq2r_route_reduce_indexed_out(const aiter_tensor_t& route_output,
                                    const aiter_tensor_t& route_weights,

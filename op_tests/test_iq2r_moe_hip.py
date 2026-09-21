@@ -257,8 +257,13 @@ def test_fused_route_reduce_add_rmsnorm_matches_unfused(first_expert, tokens):
     workspace = IQ2RMoeWorkspace.allocate(
         tokens, 4, device="cuda", max_experts=1, task_rows=16
     )
-    residual = torch.randn_like(hidden)
-    norm_weight = torch.randn((2880,), dtype=torch.bfloat16, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(0xA11D + tokens)
+    residual = torch.randn(
+        hidden.shape, generator=generator, dtype=torch.bfloat16, device="cuda"
+    )
+    norm_weight = torch.randn(
+        (2880,), generator=generator, dtype=torch.bfloat16, device="cuda"
+    )
 
     moe_output = torch.empty_like(hidden)
     expected_output = torch.empty_like(hidden)
@@ -460,6 +465,54 @@ def test_route_sort_boundaries(routes):
     count = int(task_count.item())
     assert count == len(expected_tasks)
     assert tasks[:count].cpu().tolist() == expected_tasks
+
+
+def test_route_sort_supports_glm53_default_atom_capacity():
+    routes = 131072
+    expert_count = 288
+    task_rows = 16
+    generator = torch.Generator(device="cuda").manual_seed(0x53131072)
+    expert_ids = torch.randint(
+        expert_count,
+        (routes,),
+        generator=generator,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    sorted_ids = torch.empty_like(expert_ids)
+    gather = torch.empty_like(expert_ids)
+    scatter = torch.empty_like(expert_ids)
+    capacity = iq2r_task_capacity(routes, expert_count, task_rows)
+    tasks = torch.empty((capacity, 3), dtype=torch.int32, device="cuda")
+    task_count = torch.empty((1,), dtype=torch.int32, device="cuda")
+
+    iq2r_route_sort_tasks_out(
+        expert_ids,
+        sorted_ids,
+        gather,
+        scatter,
+        tasks,
+        task_count,
+        expert_count=expert_count,
+        task_rows=task_rows,
+    )
+
+    torch.testing.assert_close(sorted_ids, expert_ids[gather.long()], rtol=0, atol=0)
+    torch.testing.assert_close(
+        sorted_ids,
+        torch.sort(expert_ids).values,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        gather[scatter.long()],
+        torch.arange(routes, dtype=torch.int32, device="cuda"),
+        rtol=0,
+        atol=0,
+    )
+    counts = torch.bincount(expert_ids, minlength=expert_count)
+    expected_task_count = int(((counts + task_rows - 1) // task_rows).sum().item())
+    assert int(task_count.item()) == expected_task_count
 
 
 def test_direct_low_m_route_gather_quant_builds_identity_tasks():
