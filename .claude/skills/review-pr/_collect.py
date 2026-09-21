@@ -24,7 +24,7 @@ if missing:
     # gets picked up by the report index.
     sys.exit(
         f"refusing to collect: {W} is missing required artifacts {', '.join(missing)}.\n"
-        f"run state.sh {W} to see what is missing."
+        f"{W} is an incomplete WORK dir (fetch likely failed) -- re-run the review."
     )
 
 D = HERE / "reports" / f"PR-{pr}"
@@ -96,5 +96,5 @@ if npass != 7:
 # step gets forgotten" is exactly why #4860 sat unstaged in the worktree. Remind explicitly
 # and point at the breakpoint detector.
 print(
-    f"  ↳ not landed yet: git commit reports/PR-{pr}/ to finish. run ./pending.sh anytime to find unstaged reports."
+    f"  ↳ not landed yet: git add reports/PR-{pr}/ && git commit to finish."
 )

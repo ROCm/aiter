@@ -111,7 +111,7 @@ fi
 say "WORK=$W"
 
 # The GLM backend can be slow or time out on a shared box; a single request timeout must not
-# kill the whole review. Retry the agent up to AITER_REVIEW_RETRIES (default 3) with backoff,
+# kill the whole review. Retry the agent up to AITER_REVIEW_RETRIES (default 2) with backoff,
 # requiring its output file to exist and be non-empty before counting the attempt as success.
 run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
   local label="$1" pf="$2" out="$3"; shift 3
