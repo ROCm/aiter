@@ -3353,7 +3353,11 @@ def get_2stage_cfgs(
         if nt_override != -1:
             use_non_temporal_load = bool(nt_override)
         elif "nt" in cfg:
-            use_non_temporal_load = bool(int(cfg["nt"]))
+            try:
+                use_non_temporal_load = bool(int(float(cfg["nt"])))
+            except (TypeError, ValueError):
+                # blank or malformed column: keep the pre-column behaviour
+                use_non_temporal_load = False
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
             ksplit = cfg["ksplit"]
         else:

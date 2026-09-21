@@ -6070,6 +6070,7 @@ class FmoeTuner(TunerCommon):
                         0,  # flat
                         tflops,
                         bw,
+                        0,  # nt: flydsl rows do not read the hint
                     )
 
         tune_results = []
