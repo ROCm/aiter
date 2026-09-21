@@ -1119,9 +1119,10 @@ def mha_v4(
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
 
-    # FP8 fuses the subtraction into its rotation pass; the others need a materialised K.
+    # Every quantized K path fuses the subtraction into its rotation kernel, except INT8, whose
+    # quantizer is still Triton and so needs a materialised K.
     k_mean = _k_mean(k, recipe.kind)
-    if k_mean is not None and recipe.kind is not _RawRecipeKind.FP8:
+    if k_mean is not None and recipe.kind is _RawRecipeKind.INT8_FP8:
         k = (k.float() - k_mean.unsqueeze(1)).to(k.dtype)
         k_mean = None
 
@@ -1147,7 +1148,7 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp8_k(k)
+        k_quantized, k_descale = quantize_mxfp8_k(k, k_mean)
         v_quantized, v_descale = quantize_fp8(v)
     elif recipe.kind == _RawRecipeKind.INT8_FP8:
         q_quantized, q_descale = quantize_int8(q)
@@ -1166,7 +1167,7 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp4_k(k)
+        k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
         v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
             _launch_mxfp4_coalesced(
@@ -1190,7 +1191,7 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp6_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp6_k(k)
+        k_quantized, k_descale = quantize_mxfp6_k(k, k_mean)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
         elif v_format == AttentionFormat.MXFP6:

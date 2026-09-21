@@ -26,7 +26,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("out"),
           py::arg("scale"),
           py::arg("input"),
-          py::arg("multiplier"));
+          py::arg("multiplier"),
+          py::arg("mean"));
     m.def("rotate_activation_mxfp6_quant",
           &aiter::torch_itfs::rotate_activation_mxfp6_quant,
           py::arg("out"),
@@ -37,7 +38,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           &aiter::torch_itfs::rotate_activation_mxfp6_quant_k,
           py::arg("out"),
           py::arg("scale"),
-          py::arg("input"));
+          py::arg("input"),
+          py::arg("mean"));
     m.def("_quantize_v_mxfp6_fp6_p_hip",
           &aiter::torch_itfs::quantize_v_mxfp6_fp6_p,
           py::arg("out"),
@@ -53,7 +55,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           &aiter::torch_itfs::rotate_activation_mxfp4_quant_k,
           py::arg("out"),
           py::arg("scale"),
-          py::arg("input"));
+          py::arg("input"),
+          py::arg("mean"));
     m.def("_quantize_v_mxfp4_fp6_p_hip",
           &aiter::torch_itfs::quantize_v_mxfp4_fp6_p,
           py::arg("out"),

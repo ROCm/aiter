@@ -14,11 +14,13 @@ void rotate_activation_hd128(aiter_tensor_t& out,
                              const aiter_tensor_t& input,
                              const aiter_tensor_t& mean);
 
-// Rotate hd128 rows and emit token-major MX data plus one E8M0 scale per 32 values.
+// Rotate hd128 rows and emit token-major MX data plus one E8M0 scale per 32 values. `mean` is
+// the optional K mean documented above; pass an empty tensor for Q.
 void rotate_activation_mxfp8_quant(aiter_tensor_t& out,
                                    aiter_tensor_t& scale,
                                    const aiter_tensor_t& input,
-                                   double multiplier);
+                                   double multiplier,
+                                   const aiter_tensor_t& mean);
 
 void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
                                    aiter_tensor_t& scale,
@@ -28,7 +30,8 @@ void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
 // The K variants write the coalesced tile layouts consumed directly by MHA v4 code objects.
 void rotate_activation_mxfp6_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
-                                     const aiter_tensor_t& input);
+                                     const aiter_tensor_t& input,
+                                     const aiter_tensor_t& mean);
 
 void quantize_v_mxfp6_fp6_p(aiter_tensor_t& out,
                             aiter_tensor_t& scale,
@@ -41,7 +44,8 @@ void rotate_activation_mxfp4_quant(aiter_tensor_t& out,
 
 void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
-                                     const aiter_tensor_t& input);
+                                     const aiter_tensor_t& input,
+                                     const aiter_tensor_t& mean);
 
 void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
                             aiter_tensor_t& scale,
