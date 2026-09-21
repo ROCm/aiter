@@ -2312,20 +2312,28 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         out += batch_id * k;
     }
 
-    // Pass 0: find the high 12-bit crossing prefix.
-    filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, BlockSize>(
-        in,
-        static_cast<IdxT const*>(nullptr),
-        static_cast<T*>(nullptr),
-        static_cast<IdxT*>(nullptr),
-        out,
-        out_idx,
-        row_len,
-        &counter,
-        histogram,
-        select_min,
-        0,
-        k);
+    // Pass 0: find the high 12-bit crossing prefix.  Keep this scan local to
+    // the LDS-tail specialization instead of calling
+    // filter_and_histogram_for_one_block(): that helper also declares the
+    // compaction staging arrays, even though pass 0 cannot use them.
+    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+    {
+        histogram[i] = 0;
+    }
+    if(threadIdx.x == 0)
+    {
+        counter.filter_cnt = 0;
+    }
+    __syncthreads();
+
+    IdxT* const pass0_histogram = histogram;
+    auto build_pass0_histogram = [pass0_histogram, select_min](T value, IdxT) {
+        auto const bits = twiddle_in(value, select_min);
+        int const bucket = __builtin_amdgcn_ubfe(
+            bits, static_cast<unsigned>(pass0_start_bit), static_cast<unsigned>(BitsPerPass));
+        atomicAdd(pass0_histogram + bucket, static_cast<IdxT>(1));
+    };
+    vectorized_process(threadIdx.x, blockDim.x, in, row_len, build_pass0_histogram);
     __syncthreads();
     scan<IdxT, BitsPerPass, BlockSize>(histogram);
     __syncthreads();
@@ -2412,19 +2420,29 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         __syncthreads();
 
         IdxT const pass2_k = counter.k;
-        filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, BlockSize>(
-            in,
-            static_cast<IdxT const*>(nullptr),
-            static_cast<T*>(nullptr),
-            static_cast<IdxT*>(nullptr),
-            out,
-            out_idx,
-            row_len,
-            &counter,
-            histogram,
-            select_min,
-            pass2,
-            k);
+        for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+        {
+            histogram[i] = 0;
+        }
+        if(threadIdx.x == 0)
+        {
+            counter.filter_cnt = 0;
+        }
+        __syncthreads();
+
+        auto const pass1_prefix = counter.kth_value_bits;
+        IdxT* const pass2_histogram = histogram;
+        auto build_pass2_histogram = [pass2_histogram, pass1_prefix, select_min](T value, IdxT) {
+            auto const bits = twiddle_in(value, select_min);
+            auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
+            if(prefix == pass1_prefix)
+            {
+                int const bucket = __builtin_amdgcn_ubfe(
+                    bits, 0u, static_cast<unsigned>(BitsPerPass));
+                atomicAdd(pass2_histogram + bucket, static_cast<IdxT>(1));
+            }
+        };
+        vectorized_process(threadIdx.x, blockDim.x, in, row_len, build_pass2_histogram);
         __syncthreads();
         scan<IdxT, BitsPerPass, BlockSize>(histogram);
         __syncthreads();
@@ -3047,11 +3065,11 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
     // the extra LDS allocation in a separate kernel specialization.  This
     // avoids imposing its occupancy cost on any non-target shape.
     if constexpr(std::is_same_v<T, float> && std::is_same_v<IdxT, int> && BlockSize == 1024 &&
-                 !STABLE && phase == Phase::Prefill)
+                 !WRITE_TOPK_VALUES && !STABLE && phase == Phase::Prefill)
     {
         bool const use_lds_tail = buf != nullptr && topk_oneblock_use_large_bpp() &&
                                   in_idx == nullptr && rowStarts == nullptr && rowEnds == nullptr &&
-                                  !select_min && k == 2048 && len >= 8192 && len <= 32770;
+                                  !select_min && k == 2048 && len >= 16384 && len <= 32770;
         if(use_lds_tail)
         {
             radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES>
