@@ -236,8 +236,15 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif gfx in ("gfx90a", "gfx942", "gfx950") and is_skinny_default_shape(
-            M, N, K, dtype, cu_num
+        # `otype == dtype` because the skinny kernels allocate their output at
+        # the input dtype and write it there; picking one when the caller asked
+        # for a wider output means the widening happens after the values have
+        # already been rounded, which is not what asking for it meant. Those
+        # shapes go to torch instead, which writes the accumulator.
+        elif (
+            gfx in ("gfx90a", "gfx942", "gfx950")
+            and otype == dtype
+            and is_skinny_default_shape(M, N, K, dtype, cu_num)
         ):
             # soltype, solution_idx = 3, 2
             default_config["libtype"] = "skinny"
@@ -417,6 +424,8 @@ def skinny_gemm(
         ops.wv_splitk_small_fp16_bf16(weights, inp, out, inp.shape[0], get_cu_num())
     if bias is not None:
         out += bias
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
     return out
 
 
@@ -478,7 +487,18 @@ def torch_gemm(
             )
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
+    if otype == dtypes.fp32 and inp.dtype in (dtypes.bf16, dtypes.fp16):
+        # `F.linear` returns the *input* dtype, so widening its result
+        # afterwards preserves nothing: the values are already on the BF16
+        # grid and a caller that asked for FP32 silently gets BF16 precision.
+        # `out_dtype` writes the accumulator instead, which is what the tuned
+        # ASM (`bf16gemm_fp32bf16_*`) and OPUS kernels do -- an untuned shape
+        # must not disagree with them about what `otype` means.
+        out = torch.mm(inp, weights.t(), out_dtype=otype)
+        return out if bias is None else out + bias
     out = F.linear(inp, weights, bias)
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
     return out
 
 
