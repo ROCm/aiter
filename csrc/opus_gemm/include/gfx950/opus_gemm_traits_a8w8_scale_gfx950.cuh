@@ -312,6 +312,26 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static_assert(SFB_GROUPS_PER_WAVE * SF_LANE_SCALES_PER_BK <= 64,
                   "the B scale vector would cost more than 16 VGPRs a lane");
 
+
+    static_assert(VEC_A == 16 / sizeof(D_A));
+    static_assert(VEC_B == 16 / sizeof(D_B));
+    static constexpr int smem_linear_wave_per_async_load = opus::get_warp_size() * 16 / sizeof(D_A);
+    static constexpr int smem_sub = smem_linear_wave_per_async_load / LOAD_GROUP_K;
+    static constexpr int slots = LOAD_GROUP_M / smem_sub;
+    static constexpr int smem_padding = 2 * 16 / sizeof(D_A);
+    static constexpr int smem_per_group_load_size =
+        slots * (smem_linear_wave_per_async_load + smem_padding) * sizeof(D_A);
+
+    static constexpr int WG_PER_CU = WG_PER_CU_;
+    static constexpr int LDS_SIZE_TOTAL = 163840;
+    static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
+    static constexpr int per_block_iter_lds_size =
+        (NUM_LOAD_GROUPS_PER_BM + NUM_LOAD_GROUPS_PER_BN)
+        * NUM_LOAD_GROUPS_PER_BK * smem_per_group_load_size;
+    static constexpr int prefetch_k_iter = max_lds_size_per_wg / per_block_iter_lds_size;
+    static_assert(prefetch_k_iter >= 3,
+                  "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
+
     // ---- SF_RING: the scale ring the producer stages -------------------------
     // One slot per prefetch_k_iter K tile, each holding that tile's SFA rows and
     // SFB groups. The point is that LDS stops scaling with K, which the
@@ -340,25 +360,6 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int sf_ring_load_insts =
         (SF_RING_SLOT + SF_RING_PROD_LANES * SF_RING_VEC - 1)
         / (SF_RING_PROD_LANES * SF_RING_VEC);
-
-    static_assert(VEC_A == 16 / sizeof(D_A));
-    static_assert(VEC_B == 16 / sizeof(D_B));
-    static constexpr int smem_linear_wave_per_async_load = opus::get_warp_size() * 16 / sizeof(D_A);
-    static constexpr int smem_sub = smem_linear_wave_per_async_load / LOAD_GROUP_K;
-    static constexpr int slots = LOAD_GROUP_M / smem_sub;
-    static constexpr int smem_padding = 2 * 16 / sizeof(D_A);
-    static constexpr int smem_per_group_load_size =
-        slots * (smem_linear_wave_per_async_load + smem_padding) * sizeof(D_A);
-
-    static constexpr int WG_PER_CU = WG_PER_CU_;
-    static constexpr int LDS_SIZE_TOTAL = 163840;
-    static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
-    static constexpr int per_block_iter_lds_size =
-        (NUM_LOAD_GROUPS_PER_BM + NUM_LOAD_GROUPS_PER_BN)
-        * NUM_LOAD_GROUPS_PER_BK * smem_per_group_load_size;
-    static constexpr int prefetch_k_iter = max_lds_size_per_wg / per_block_iter_lds_size;
-    static_assert(prefetch_k_iter >= 3,
-                  "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
 
     static constexpr int a_buffer_load_insts = NUM_LOAD_GROUPS_PER_BM * NUM_LOAD_GROUPS_PER_BK * slots / 2;
     static constexpr int b_buffer_load_insts = NUM_LOAD_GROUPS_PER_BN * NUM_LOAD_GROUPS_PER_BK * slots / 2;
