@@ -10,9 +10,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from ..gdr_common import _gview, _load_vec, _store_vec
 
 
-def compile_chunk_gdn_carry(
-    *, blocks: int, H: int, requests: int, use_initial_state: bool
-):
+def compile_chunk_gdn_carry(*, H: int, use_initial_state: bool):
     K = V = 128
     BV = 16
     THREADS = 256
@@ -27,6 +25,8 @@ def compile_chunk_gdn_carry(
         h0_tensor: fx.Tensor,
         entry_tensor: fx.Tensor,
         block_prefix_tensor: fx.Tensor,
+        blocks: fx.Int32,
+        requests: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         tile_v = fx.Int32(gpu.block_id("x"))
@@ -132,10 +132,12 @@ def compile_chunk_gdn_carry(
         h0_tensor: fx.Tensor,
         entry_tensor: fx.Tensor,
         block_prefix_tensor: fx.Tensor,
+        blocks: fx.Int32,
+        requests: fx.Int32,
         stream: fx.Stream,
     ):
-        carry_kernel(maps_tensor, h0_tensor, entry_tensor, block_prefix_tensor).launch(
-            grid=(V // BV, requests * H, 1), block=(THREADS, 1, 1), stream=stream
-        )
+        carry_kernel(
+            maps_tensor, h0_tensor, entry_tensor, block_prefix_tensor, blocks, requests
+        ).launch(grid=(V // BV, requests * H, 1), block=(THREADS, 1, 1), stream=stream)
 
     return launch

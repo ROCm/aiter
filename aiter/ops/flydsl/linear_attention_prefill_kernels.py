@@ -938,8 +938,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         if g_log2_scaled:
             gk = gk * _RCP_LN2
 
-    # Run-only deployments have no compiled artifact for blocked launches;
-    # route to the prebuilt serial path.
     if (
         B == 1
         and use_g
@@ -962,7 +960,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         and torch.cuda.get_device_properties(k.device).gcnArchName.split(":")[0]
         == "gfx950"
         and not torch.cuda.is_current_stream_capturing()
-        and not _flydsl_run_only()
     ):
         lengths = _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata)
         chunk_counts = tuple(triton.cdiv(length, BT) for length in lengths)
@@ -1114,14 +1111,10 @@ def _build_chunk_gdn_block_maps(
 
 
 @functools.lru_cache(maxsize=32)
-def _get_or_compile_chunk_gdn_carry(
-    blocks: int, heads: int, requests: int, use_initial_state: bool
-):
+def _get_or_compile_chunk_gdn_carry(heads: int, use_initial_state: bool):
     from .kernels.gdr_prefill.chunk_gdn_carry_gfx950 import compile_chunk_gdn_carry
 
-    return compile_chunk_gdn_carry(
-        blocks=blocks, H=heads, requests=requests, use_initial_state=use_initial_state
-    )
+    return compile_chunk_gdn_carry(H=heads, use_initial_state=use_initial_state)
 
 
 def _carry_chunk_gdn_block_maps(
@@ -1164,15 +1157,15 @@ def _carry_chunk_gdn_block_maps(
     entry = torch.empty((blocks, heads, K, V), device=maps.device, dtype=maps.dtype)
     if blocks != schedule.total_blocks or schedule.block_prefix.device != maps.device:
         raise ValueError("Carry maps must match the block schedule.")
-    launch = _get_or_compile_chunk_gdn_carry(
-        blocks, heads, requests, initial_state is not None
-    )
+    launch = _get_or_compile_chunk_gdn_carry(heads, initial_state is not None)
     _run_compiled(
         launch,
         maps,
         initial_state if initial_state is not None else maps,
         entry,
         schedule.block_prefix,
+        blocks,
+        requests,
         torch.cuda.current_stream(maps.device),
     )
     return entry
