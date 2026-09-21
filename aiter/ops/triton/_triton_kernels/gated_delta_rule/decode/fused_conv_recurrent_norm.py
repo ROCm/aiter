@@ -11,6 +11,10 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
+_fused_conv_recurrent_norm_repr = make_kernel_repr(
+    "fused_conv_recurrent_norm_kernel",
+    ["H", "K", "V", "W", "STATE_LEN", "IS_SPEC_DECODING"],
+)
 _fused_kda_spec_parallel_v_repr = make_kernel_repr(
     "fused_kda_spec_parallel_v_kernel",
     ["H", "K", "V", "W", "BV", "SPEC_LEN"],
@@ -21,7 +25,7 @@ _fused_kda_spec_finalize_repr = make_kernel_repr(
 )
 
 
-@triton.jit
+@triton.jit(repr=_fused_conv_recurrent_norm_repr)
 def fused_conv_recurrent_norm_kernel(
     # Conv1d inputs
     x_ptr,  # [B, 3*lp] bf16 (may be strided slice)
