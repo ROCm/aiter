@@ -275,17 +275,25 @@ def _implicit_param_from_problem(
 
 
 # Read the input's spatial extents at runtime so one artifact serves every
-# resolution, instead of compiling per D/H/W. On by default: the extents only
-# have to reach the gather as magic-number reciprocals rather than folded
-# immediates, and the decomposition they feed runs once per block rather than
-# per tap, so the cost does not show up. Measured over the 64 Wan and
-# Qwen-Image cases of op_tests/test_flydsl_conv_implicit.py on gfx950, two runs
-# each: median -0.70%, total -1.4%, no case slower than the run-to-run spread
-# and one (down_6_7) reliably 32% faster.
+# resolution, instead of compiling per D/H/W. The extents reach the gather as
+# magic-number reciprocals rather than folded immediates, which costs a fixed
+# amount per block -- the decomposition they feed runs once per block, not once
+# per tap.
 #
-# Set it to 0 to compile per resolution again. The shapes this cannot express
-# -- BIG_IN, BIG_OUT, an M grid that needs chunking -- fall back to that path
-# on their own, see _dyn_hw_ok.
+# On by default, because that fixed cost is only visible where there is little
+# else in the kernel. Measured on gfx950 with flydsl 0.3.4.1 over
+# op_tests/test_flydsl_conv_implicit.py, two runs per setting:
+#
+#   real VAE layers (the 31 cases at or above 50us): median +0.87%, worst
+#       +2.4%, nothing past the run-to-run spread, and down_6_7 reliably 31%
+#       faster
+#   the microsecond keyword-surface cases: up to +48% (1d_nwc, 2.6us -> 3.8us),
+#       where per-block work is most of the kernel
+#
+# Set it to 0 to compile per resolution again -- worth doing for a workload
+# made of tiny convolutions at a fixed set of sizes. The shapes this cannot
+# express -- BIG_IN, BIG_OUT, an M grid that needs chunking -- fall back to
+# that path on their own, see _dyn_hw_ok.
 AITER_CONV3D_DYN_HW = int(os.environ.get("AITER_CONV3D_DYN_HW", "1"))
 
 

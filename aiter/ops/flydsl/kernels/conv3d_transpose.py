@@ -77,9 +77,6 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
     def transpose_kernel(out: fx.Tensor, inp: fx.Tensor, s: fx.Int32):
         lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek().tile
 
-        class BF16Ty:
-            ir_type = elem_ty.ir_type
-
         tid = fx.Int32(gpu.thread_id("x"))
         s0 = fx.Int32(gpu.block_id("x")) * TR_TILE
         c0 = fx.Int32(gpu.block_id("y")) * TR_TILE
@@ -134,7 +131,7 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
 
         def lds_load_scalar(elem_offset):
             u8 = fx.recast_iter(fx.Uint8, lds.ptr)
-            return fx.ptr_load(u8 + fx.Int32(elem_offset * 2), result_type=BF16Ty)
+            return fx.ptr_load(u8 + fx.Int32(elem_offset * 2), result_type=elem_ty)
 
         # Read: coalesced vec8 along contiguous S -> LDS[c_local][s_local].
         for i in range_constexpr(_TR_ITERS):
