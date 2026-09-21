@@ -164,14 +164,15 @@ class FlyDSLAllReduce:
             self.close()
             return
 
+        mesh_kib = "unbounded" if resolved.mesh_max is None else f"{resolved.mesh_max >> 10}"
         logger.info(
             "FlyDSL all-reduce enabled: TP%d on %s, accuracy=%s, "
-            "one-shot <= %d KiB, mesh <= %d KiB, %s, %.1f MiB of IPC inbox.",
+            "one-shot <= %d KiB, mesh <= %s KiB, %s, %.1f MiB of IPC inbox.",
             world_size,
             link,
             self.accuracy,
             resolved.oneshot_max >> 10,
-            resolved.mesh_max >> 10,
+            mesh_kib,
             "+".join(self._engines),
             self.inbox_bytes / 2**20,
         )
@@ -208,6 +209,17 @@ class FlyDSLAllReduce:
     def inbox_bytes(self) -> int:
         return sum(e.inbox_bytes for e in self._engines.values())
 
+    @property
+    def max_bytes(self) -> int | None:
+        """Upper bound on the message size the dispatcher accepts, or ``None`` if unbounded.
+
+        Returns 0 when the instance is disabled so callers can gate on
+        ``max_bytes > 0`` without a separate ``disabled`` check.
+        """
+        if self.disabled:
+            return 0
+        return self.policy.max_bytes
+
     def family_for(self, nbytes: int) -> str:
         """Which schedule *nbytes* dispatches to. Public for tests and reports."""
         return policy.pick_family(int(nbytes), self.policy)
@@ -230,7 +242,7 @@ class FlyDSLAllReduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        if not self.policy.min_bytes <= nbytes <= self.policy.max_bytes:
+        if nbytes < self.policy.min_bytes:
             return False
         # A family the table can name but this rank did not build (an env
         # override can widen a window past what ``families_reachable`` saw at
@@ -363,15 +375,16 @@ class FlyDSLAllReduceRMSNorm:
             self.close()
             return
 
+        mesh_kib = "unbounded" if resolved.mesh_max is None else f"{resolved.mesh_max >> 10}"
         logger.info(
             "FlyDSL fused AR+RMSNorm enabled: TP%d on %s, accuracy=%s, "
-            ">= %d B, one-shot <= %d KiB, mesh <= %d KiB, %s.",
+            ">= %d B, one-shot <= %d KiB, mesh <= %s KiB, %s.",
             world_size,
             link,
             self.accuracy,
             resolved.min_bytes,
             resolved.oneshot_max >> 10,
-            resolved.mesh_max >> 10,
+            mesh_kib,
             "+".join(self._engines),
         )
         self.disabled = False
@@ -419,6 +432,17 @@ class FlyDSLAllReduceRMSNorm:
     @property
     def inbox_bytes(self) -> int:
         return sum(e.inbox_bytes for e in self._engines.values())
+
+    @property
+    def max_bytes(self) -> int | None:
+        """Upper bound on the message size the dispatcher accepts, or ``None`` if unbounded.
+
+        Returns 0 when the instance is disabled so callers can gate on
+        ``max_bytes > 0`` without a separate ``disabled`` check.
+        """
+        if self.disabled:
+            return 0
+        return self.policy.max_bytes
 
     def family_for(self, nbytes: int) -> str:
         return policy.pick_family(int(nbytes), self.policy)
@@ -504,7 +528,7 @@ class FlyDSLAllReduceRMSNorm:
         # Every FlyDSL schedule reads and writes 16 B atoms.
         if nbytes % 16 != 0:
             return False
-        if not self.policy.min_bytes <= nbytes <= self.policy.max_bytes:
+        if nbytes < self.policy.min_bytes:
             return False
         family = self.family_for(nbytes)
         eng = self._engines.get(family)

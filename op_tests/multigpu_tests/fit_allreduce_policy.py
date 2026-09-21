@@ -454,7 +454,7 @@ def collapse_aliases(samples, keys) -> tuple[list[str], dict]:
     return survivors, merged
 
 
-def score_policy(samples, one_max: int, mesh_max: int, min_bytes: int = 0):
+def score_policy(samples, one_max: int, mesh_max: int | None, min_bytes: int = 0):
     """Per-shape regret of a fixed family policy. ``(nbytes, K, family, ratio)``.
 
     The holdout check: a policy fitted on one hidden size is scored on others.
@@ -505,13 +505,15 @@ def all_families() -> tuple[str, ...]:
 
 
 def pick_family(
-    nbytes: int, oneshot_max: int, mesh_max: int, min_bytes: int = 0
+    nbytes: int, oneshot_max: int, mesh_max: int | None, min_bytes: int = 0
 ) -> str:
     if nbytes < min_bytes:
         return DECLINE
     if nbytes <= oneshot_max:
         return "oneshot"
-    return "mesh" if nbytes <= mesh_max else "ring"
+    if mesh_max is None or nbytes <= mesh_max:
+        return "mesh"
+    return "ring"
 
 
 def fit_families(samples, *, exact_slack: float | None):
@@ -732,7 +734,8 @@ def fit_ladder(
         # production can never reach. Narrowing the window usually *shortens*
         # the ladder, which is the point -- a rung is a compiled engine.
         lo, hi = window
-        live = [s for s in live if lo < s.nbytes <= hi]
+        # hi=None means the window is unbounded (ring window on PCIe).
+        live = [s for s in live if lo < s.nbytes and (hi is None or s.nbytes <= hi)]
     if not live:
         return None
     pinned, aliased = collapse_aliases(live, pinned)
@@ -1165,11 +1168,12 @@ def fit_fused(samples, holdout, args) -> None:
         windows = {
             "oneshot": (floor, one),
             "mesh": (one, mesh),
-            "ring": (mesh, 1 << 62),
+            "ring": (mesh, None),  # ring window is unbounded (no ceiling)
         }
         for family in FAMILIES:
             lo, hi = windows[family]
-            if hi <= lo:
+            # hi=None means unbounded (ring); None > lo is always True.
+            if hi is not None and hi <= lo:
                 logger.info("  ladder %-8s -- empty window", family)
                 continue
             got = fit_ladder(sub, family, args.max_rungs, args.ladder_slack, (lo, hi))
@@ -1181,7 +1185,7 @@ def fit_fused(samples, holdout, args) -> None:
                 "  ladder %-8s (%s .. %s]  %s   worst %.3fx   (by rung count: %s)",
                 family,
                 human(lo),
-                human(hi),
+                "inf" if hi is None else human(hi),
                 " ".join(f"[{human(b)}: {k}]" for b, k in rungs),
                 lworst,
                 ", ".join(f"{n}:{w:.3f}x" for n, (_, w) in sorted(by_count.items())),
@@ -1526,10 +1530,11 @@ def main():
         one_fast, mesh_max = next(
             (r[3], r[4]) for r in fam_rows if r[:3] == (args.link, tp, "fast")
         )
+        # Ring window upper bound: None means unbounded (no ring ceiling).
         windows = {
             "oneshot": (0, max(one_exact, one_fast)),
             "mesh": (min(one_exact, one_fast), mesh_max),
-            "ring": (mesh_max, 1 << 62),
+            "ring": (mesh_max, None),
         }
         for family in FAMILIES:
             lo, hi = windows[family]
@@ -1544,7 +1549,7 @@ def main():
                 "  ladder %-8s (%s .. %s]  %s   worst %.3fx   (by rung count: %s)",
                 family,
                 human(lo),
-                human(hi),
+                "inf" if hi is None else human(hi),
                 " ".join(f"[{human(b)}: {k}]" for b, k in rungs),
                 worst,
                 ", ".join(f"{n}:{w:.3f}x" for n, (_, w) in sorted(by_count.items())),

@@ -215,10 +215,10 @@ FUSED_QR_ROW_ATOMS: dict[tuple[str, int, str], int] = {
     ("pcie", 2, "ring"): 2,
     ("pcie", 4, "mesh"): 2,
     ("pcie", 4, "ring"): 2,
-    # xGMI: placeholder (not yet measured), same as PCIe
-    ("xgmi", 2, "ring"): 2,
+    # xGMI: From measurements
+    ("xgmi", 2, "ring"): 4,
     ("xgmi", 4, "mesh"): 2,
-    ("xgmi", 4, "ring"): 2,
+    ("xgmi", 8, "mesh"): 1,
 }
 
 

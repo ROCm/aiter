@@ -27,17 +27,10 @@ LINKS = ("pcie", "xgmi")
 
 SUPPORTED_WORLDS = (2, 4, 8)
 
-# No ceiling. The ring's inbox is a fixed ring of wire slots sized by ``ST * grid``.
-NO_MAX = 1 << 62
-
 
 @dataclass(frozen=True)
 class FamilyPolicy:
     """Family boundaries for one ``(link, world_size)``, in payload bytes.
-
-    ``nbytes <= oneshot_max``  -> one-shot
-    ``nbytes <= mesh_max``     -> mesh
-    otherwise                  -> ring
 
     ``min_bytes`` is where this whole path starts being worth taking; below it
     the caller should fall through to other alternatives.
@@ -45,7 +38,7 @@ class FamilyPolicy:
     The two one-shot ceilings are measured against *different* alternatives and
     so do not order against each other:
 
-    * ``oneshot_max`` is where the quantized **mesh** overtakes the one-shot.
+    * ``oneshot_max`` is where the quantized **mesh/ring** overtakes the one-shot.
     * ``oneshot_max_exact`` is where the **fallback** the caller would otherwise
       use (``cross_device_reduce``/RCCL) overtakes it, since exact mode declines
       rather than quantizing.
@@ -53,9 +46,19 @@ class FamilyPolicy:
 
     oneshot_max: int
     oneshot_max_exact: int
-    mesh_max: int
+    mesh_max: int | None
+    ring_max: int | None = None
     min_bytes: int = 0
-    max_bytes: int = NO_MAX
+
+    @property
+    def max_bytes(self) -> int | None:
+        """Upper bound of the dispatch range, or ``None`` if unbounded.
+
+        ``None`` means the last reachable family (mesh when ``ring_max`` is
+        not set, ring when it is) has no size ceiling. Callers that need an
+        integer for range comparisons should treat ``None`` as infinity.
+        """
+        return self.ring_max if self.mesh_max is not None else None
 
     def __post_init__(self):
         if self.oneshot_max <= 0 or self.oneshot_max_exact <= 0:
@@ -63,11 +66,21 @@ class FamilyPolicy:
                 f"oneshot_max ({self.oneshot_max}) and oneshot_max_exact "
                 f"({self.oneshot_max_exact}) must be positive"
             )
-        if self.mesh_max < self.oneshot_max:
+        if self.mesh_max is not None and self.mesh_max < self.oneshot_max:
             raise ValueError(
                 f"mesh_max ({self.mesh_max}) must be >= oneshot_max "
                 f"({self.oneshot_max}); the families partition by size"
             )
+        if (
+            self.mesh_max is not None
+            and self.ring_max is not None
+            and self.ring_max < self.mesh_max
+        ):
+            raise ValueError(
+                f"ring_max ({self.ring_max}) must be >= mesh_max "
+                f"({self.mesh_max}); the families partition by size"
+            )
+
 
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     # --- PCIe: Policy from measurements (on gfx950/MI350P) --------------------
@@ -81,14 +94,16 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
         oneshot_max=16 << 10, oneshot_max_exact=(80 << 10) - 1, mesh_max=12 << 20
     ),
     # --- xGMI: Policy from measurements (on gfx942) --------------------
+    # ring_max omitted (defaults to None): ring is never the best choice on
+    # xGMI (all-pairs equidistant fabric), so the mesh window is unbounded.
     ("xgmi", 2): FamilyPolicy(
-        oneshot_max=512 << 10, oneshot_max_exact=4 << 20, mesh_max=NO_MAX,
+        oneshot_max=512 << 10, oneshot_max_exact=4 << 20, mesh_max=None,
     ),
     ("xgmi", 4): FamilyPolicy(
-        oneshot_max=512 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=NO_MAX,
+        oneshot_max=512 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=None,
     ),
     ("xgmi", 8): FamilyPolicy(
-        oneshot_max=256 << 10, oneshot_max_exact=256 << 10, mesh_max=NO_MAX,
+        oneshot_max=256 << 10, oneshot_max_exact=256 << 10, mesh_max=None,
     ),
 }
 
@@ -103,15 +118,18 @@ FUSED_FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     ("pcie", 8): FamilyPolicy(
         oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=128 << 20
     ),
-    # --- xGMI: Placeholder policy (same as PCIe) --------------------
+    # --- xGMI: Policy from measurements (on gfx942/MI300X) --------------------
+    # ring_max omitted (defaults to None): ring is never dispatched on xGMI.
     ("xgmi", 2): FamilyPolicy(
-        oneshot_max=768 << 10, oneshot_max_exact=768 << 10, mesh_max=768 << 10
+        oneshot_max=1 << 20, oneshot_max_exact=1 << 20, mesh_max=None,
     ),
     ("xgmi", 4): FamilyPolicy(
-        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=8 << 20
+        oneshot_max=3 << 20, oneshot_max_exact=3 << 20, mesh_max=None,
+        min_bytes=3 << 20,
     ),
     ("xgmi", 8): FamilyPolicy(
-        oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=128 << 20
+        oneshot_max=7 << 20, oneshot_max_exact=7 << 20, mesh_max=None,
+        min_bytes=7 << 20,
     ),
 }
 
@@ -212,9 +230,9 @@ def resolve(link: str, world_size: int, mode: str | None = None) -> FamilyPolicy
       ``oneshot_max``, mesh/ring (quantized) beyond it.
     * ``"exact"`` (default) -- **only** the one-shot is ever reachable, at its
       widened ``oneshot_max_exact`` ceiling. Above that, this returns a policy
-      with no mesh/ring window at all (``mesh_max == max_bytes ==
-      oneshot_max``), so ``should_fly_all_reduce`` declines the payload and the
-      caller falls through to whatever it would otherwise dispatch to
+      with no mesh/ring window at all (``mesh_max == oneshot_max``,
+      ``ring_max=None``), so ``should_fly_all_reduce`` declines the payload and
+      the caller falls through to whatever it would otherwise dispatch to
       (``cross_device_reduce``/RCCL) rather than silently quantizing.
 
     ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` applies in both modes -- it only moves
@@ -257,12 +275,14 @@ def _resolve(base: FamilyPolicy, mode, *, one_var: str, mesh_var: str) -> Family
                 mesh_var,
                 ACCURACY_VAR,
             )
+        # mesh_max=oneshot_max collapses the mesh window to zero; ring_max=None
+        # (the default) means no ring either. Only one-shot is reachable.
         return FamilyPolicy(
             oneshot_max=one,
             oneshot_max_exact=one,
             mesh_max=one,
+            ring_max=None,
             min_bytes=base.min_bytes,
-            max_bytes=one,
         )
 
     one = base.oneshot_max if override_one is None else override_one
@@ -270,13 +290,14 @@ def _resolve(base: FamilyPolicy, mode, *, one_var: str, mesh_var: str) -> Family
     override_mesh = _env_int(mesh_var)
     if override_mesh is not None:
         mesh = override_mesh
-    mesh = max(mesh, one)
+    if mesh is not None:
+        mesh = max(mesh, one)
     return FamilyPolicy(
         oneshot_max=one,
         oneshot_max_exact=one,
         mesh_max=mesh,
+        ring_max=base.ring_max,
         min_bytes=base.min_bytes,
-        max_bytes=base.max_bytes,
     )
 
 
@@ -298,8 +319,8 @@ def resolve_fused(link: str, world_size: int, mode: str | None = None) -> Family
         oneshot_max=policy.oneshot_max,
         oneshot_max_exact=policy.oneshot_max_exact,
         mesh_max=policy.mesh_max,
+        ring_max=policy.ring_max,
         min_bytes=floor,
-        max_bytes=policy.max_bytes,
     )
 
 
@@ -307,7 +328,9 @@ def pick_family(nbytes: int, policy: FamilyPolicy) -> str:
     """``"oneshot"`` | ``"mesh"`` | ``"ring"`` for a payload of *nbytes*."""
     if nbytes <= policy.oneshot_max:
         return "oneshot"
-    return "mesh" if nbytes <= policy.mesh_max else "ring"
+    if policy.mesh_max is None or nbytes <= policy.mesh_max:
+        return "mesh"
+    return "ring"
 
 
 def families_reachable(policy: FamilyPolicy) -> tuple[str, ...]:
@@ -315,8 +338,17 @@ def families_reachable(policy: FamilyPolicy) -> tuple[str, ...]:
     out = []
     if policy.oneshot_max >= policy.min_bytes:
         out.append("oneshot")
-    if policy.mesh_max > policy.oneshot_max:
+    # Mesh is reachable when its window is non-empty: either mesh_max is None
+    # (unbounded) or mesh_max > oneshot_max. Also needs to be reachable above
+    # min_bytes -- but if oneshot_max >= min_bytes that is already guaranteed.
+    mesh_reachable = policy.mesh_max is None or policy.mesh_max > policy.oneshot_max
+    if mesh_reachable:
         out.append("mesh")
-    if policy.max_bytes > policy.mesh_max:
+    # Ring is reachable only when mesh_max is finite (otherwise the mesh is
+    # unbounded and the ring is never dispatched) AND the mesh window is
+    # non-empty (if mesh_max == oneshot_max there is no mesh window and no
+    # payload can land in the ring window either, since pick_family returns
+    # "mesh" for anything above oneshot_max when mesh_max is None).
+    if mesh_reachable and policy.mesh_max is not None:
         out.append("ring")
     return tuple(out)

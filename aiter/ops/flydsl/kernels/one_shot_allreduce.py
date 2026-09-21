@@ -228,10 +228,10 @@ FUSED_ONESHOT_LADDER = {
     ("pcie", 2): ((0, 2, 128, "peer", True),),
     ("pcie", 4): ((0, 2, 64, "peer", False),),
     ("pcie", 8): ((0, 4, 64, "peer", False), (8 << 10, 2, 64, "peer", True)),
-    # xGMI: placeholder (not yet measured), same as PCIe
+    # xGMI: from measurements on MI300X
     ("xgmi", 2): ((0, 2, 128, "peer", True),),
-    ("xgmi", 4): ((0, 2, 64, "peer", False),),
-    ("xgmi", 8): ((0, 4, 64, "peer", False), (8 << 10, 2, 64, "peer", True)),
+    ("xgmi", 4): ((0, 2, 64, "peer", False),),   # window empty; placeholder kept for schema
+    ("xgmi", 8): ((0, 4, 64, "peer", False),),   # window empty; placeholder kept for schema
 }
 
 

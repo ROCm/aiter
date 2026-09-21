@@ -2347,25 +2347,22 @@ def _worker(
             # one-shot ceiling, one token above it, and one token above the
             # mesh ceiling.
             tok = DSV4_HIDDEN * 2
+            reachable = policy.families_reachable(flyauto.policy)
+            # Probe sites: just inside each window boundary. Ring probe is only
+            # computed when mesh_max is finite (otherwise ring is not reachable
+            # and mesh_max=None would make the arithmetic nonsensical).
             probes = {
                 "oneshot": max(1, flyauto.policy.oneshot_max // tok),
                 "mesh": max(1, flyauto.policy.oneshot_max // tok + 1),
-                "ring": max(1, flyauto.policy.mesh_max // tok + 1),
             }
-            # Only the families this policy can actually select, which is the
-            # same list FlyDSLAllReduce built engines from. A family it
-            # disables is disabled by a *sentinel* ceiling mesh_max = NO_MAX (1 << 62) 
-            # so the ring is never auto-selected. A probe sized from that ceiling asks
-            # for an exabyte and dies in torch.zeros below, before any of the
-            # guards downstream get to reject it.
-            reachable = policy.families_reachable(flyauto.policy)
+            if flyauto.policy.mesh_max is not None:
+                probes["ring"] = max(1, flyauto.policy.mesh_max // tok + 1)
             for family, m in probes.items():
                 # Everything decidable from the byte count is decided before
                 # the allocation.
                 nbytes = m * tok
                 if (
                     family not in reachable
-                    or nbytes > flyauto.policy.max_bytes
                     or flyauto.family_for(nbytes) != family
                 ):
                     continue  # window too narrow, or this policy never reaches `family`
