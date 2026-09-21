@@ -19,6 +19,12 @@ PR="${1:?usage: run_one.sh <pr> [owner/repo]}"
 REPO="${2:-ROCm/aiter}"
 SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .claude/skills/review-pr
 PROJ="$(git -C "$SKILL" rev-parse --show-toplevel)"     # repo root
+STATUS="${GITHUB_WORKSPACE:-$PROJ}/.aiter-review-status"
+rm -f "$STATUS"   # fresh run: never inherit a previous run's verdict
+# GUARANTEE a responsible person is always identified: any non-zero exit that did NOT classify
+# itself (an unexpected crash in fetch/gates/collect, a set -e trip) still leaves a status so
+# _notify.py routes it -- to the bot owner (flow) for triage -- instead of dying silently.
+trap 'ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"' EXIT
 
 # GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.
 # The container runs as root; declare the docker sandbox so headless tools work.
@@ -47,7 +53,7 @@ fail() {  # <class> <exit-code> <message...>
   local cls="$1" code="$2"; shift 2
   say "$*"
   echo "::error title=aiter-bot::[$cls] $*"
-  printf '%s\t%s\n' "$cls" "$*" > "${GITHUB_WORKSPACE:-$PROJ}/.aiter-review-status"
+  printf '%s\t%s\n' "$cls" "$*" > "$STATUS"
   exit "$code"
 }
 
