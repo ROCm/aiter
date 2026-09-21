@@ -28,7 +28,7 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.utils import get_shared_memory_per_block
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.utility import dtypes as aiter_dtypes
 
 from .kernels_common import get_warp_size
@@ -986,7 +986,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             "multiple of 16 (dwordx4 K-cache run size)"
         )
     lds_bytes = _align_up(2 * head_size * block_size * k_cache.element_size() + 4, 16)
-    lds_limit = get_shared_memory_per_block(qkv.device)
+    lds_limit = get_lds_capacity_bytes(get_gfx_runtime())
     if lds_bytes > lds_limit:
         raise ValueError(
             f"head_size={head_size} x block_size={block_size} needs "
