@@ -155,7 +155,6 @@ def _out_dhw(D, H, W, T, R, S, stride, padding, dilation):
 
 def _conv3d_dims(x, w_oidhw, stride, padding, dilation):
     """Validate NCDHW/OIDHW tensors and return all convolution dimensions."""
-    assert x.is_cuda and w_oidhw.is_cuda
     if x.ndim != 5:
         raise ValueError(f"conv3d input must be 5-D NCDHW, got {x.ndim}-D")
     if w_oidhw.ndim != 5:

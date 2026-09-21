@@ -33,7 +33,10 @@ from aiter.ops.triton.conv._prepack import (
     prepack_oidhw_to_kmajor,
     prepack_winograd_hw_filter_f4x3,
 )
-from aiter.ops.triton.conv._utils import _winograd_transform_storage_dtype
+from aiter.ops.triton.conv._utils import (
+    _conv3d_dims,
+    _winograd_transform_storage_dtype,
+)
 from aiter.ops.triton.conv.conv3d import (
     Route3D,
     _resolve_route,
@@ -487,6 +490,29 @@ def test_invalid_layout():
 
     with pytest.raises(ValueError, match="layout must be 'ncdhw' or 'ndhwc'"):
         conv3d(x, w, layout="nchw")
+
+
+def test_conv3d_dims_supports_cpu_tensors():
+    x = torch.empty((2, 4, 5, 6, 7), dtype=torch.float16)
+    w = torch.empty((8, 4, 3, 3, 3), dtype=torch.float16)
+
+    dimensions = _conv3d_dims(
+        x,
+        w,
+        stride=(1, 1, 1),
+        padding=(1, 1, 1),
+        dilation=(1, 1, 1),
+    )
+
+    assert dimensions == (2, 4, 5, 6, 7, 8, 3, 3, 3, 5, 6, 7)
+
+
+def test_conv3d_execution_rejects_cpu_tensors():
+    x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16)
+    w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="requires CUDA input and weight tensors"):
+        conv3d_general(x, w)
 
 
 def test_input_weight_channel_mismatch():
