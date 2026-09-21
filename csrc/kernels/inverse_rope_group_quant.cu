@@ -1342,11 +1342,10 @@ void inverse_rope_group_quant(
         (input_elems >= (int64_t{1} << 28) ||
          (D == 4096 && G >= 8 && input_elems >= (int64_t{1} << 24)));
 
-    // The whole-row-block tier (md 18.14/18.16.6) is retired: its band was
-    // gated on `wide_waves >= simds*32 && wide_waves < simds*32`, which is
-    // empty, so it had not been reachable. Kept as a named constant because
-    // the tier gate and the slice width below both still read it.
-    constexpr bool whole_row_block = false;
+    // The whole-row-block tier (md 18.14/18.16.6): one block spans the row,
+    // untiered and four waves wide. Set per dispatch, read by the slice width,
+    // the tier gate and the block width below.
+    bool whole_row_block = false;
 
     // k_slots (groups a block covers per pass) is a runtime launch choice: it
     // only sizes the block, so it costs no extra kernel instantiations.
@@ -1669,10 +1668,23 @@ void inverse_rope_group_quant(
         // staging and increase HBM traffic. TDS=32 admits regular TDM tiles,
         // including the streaming half-head tier. The adjustment below narrows
         // rows that cannot fill a wave at this width.
+        // One doubling of launch size wide, and it has to stay that way: below
+        // the floor the tiered path is not yet wave-starved, above the ceiling
+        // a whole row in one block stops paying. n32k4/GS=32 only, and it
+        // outranks both the slice heuristic and the tier sort, so it is
+        // computed before either. Narrowing the ceiling to the floor empties
+        // the band and silently costs 13-19% on the two launches that land in
+        // it -- (128,16) s=512 and (16,2) s=4096 on a 256-CU part.
+        constexpr int kWholeRowFloorWavesPerSimd = 32;
+        constexpr int kWholeRowCeilWavesPerSimd  = 64;
+        whole_row_block = !wave64 && LAYOUT == kScaleN32K4 && GS == 32 &&
+                          wide_waves >= simds * kWholeRowFloorWavesPerSimd &&
+                          wide_waves < simds * kWholeRowCeilWavesPerSimd;
+
         const bool keep_wide_row128 =
             LAYOUT == kScaleRowMajor && GS == 128 && has_tdm_arch();
         const bool narrow_slice =
-            !keep_wide_row128 &&
+            !whole_row_block && !keep_wide_row128 &&
             wide_waves >= simds * kNarrowCrossoverWavesPerSimd;
 
         // Bytes per thread at bf16/fp16: 16B on wave64, else 32B or 64B.
@@ -1756,7 +1768,7 @@ void inverse_rope_group_quant(
                                kRopeFirstGD >= kGphD - 4 &&
                                heads_k_d * 4 == k_slots_min;
         const int waves_per_block =
-            (kMfmaTile || wave64)
+            (kMfmaTile || wave64 || whole_row_block)
                 ? 4
                 : (keep_wide_row128
                        ? (row128_stream ? 2 : 4)
