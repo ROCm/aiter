@@ -963,12 +963,12 @@ def main():
             df.to_markdown(index=False),
         )
 
-    review_names = {"review-unaligned-varlen", "review-dense-b2"}
-    review_cases = expand_groups(
-        [group for group in _PREFILL_GROUPS if group.model_name in review_names]
+    edge_case_names = {"unaligned-varlen", "dense-b2"}
+    edge_cases = expand_groups(
+        [group for group in _PREFILL_GROUPS if group.model_name in edge_case_names]
     )
-    for case in review_cases:
-        aiter.logger.info("running review case: %s", case)
+    for case in edge_cases:
+        aiter.logger.info("running case: %s", case)
         _run_prefill_h_case(case)
 
 
