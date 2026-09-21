@@ -10,6 +10,7 @@ fp32-scale blockscale GEMM).
 
 from __future__ import annotations
 
+import functools
 import re
 
 import torch
@@ -136,6 +137,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
+    c_store_nt: bool = False,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
 
@@ -329,20 +331,35 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         cluster_n,
         True,
     )
-    launch = _launch_gemm_a8w8_compute_bound if compute_bound else _launch_gemm_a8w8
     if compute_bound:
-        cb_args = launch_args[:12] + (_ptr_arg(Out),) + launch_args[12:]
-        launch(
-            *cb_args,
+        specialization = (
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            out_is_f16,
+            nb,
+            cluster_m,
+            cluster_n,
+            True,
             BLOCK_K,
             split_k,
             a_preshuffle,
             persistent_n_tiles,
             fused,
             bounded_m,
+            c_store_nt,
+        )
+        cb_args = launch_args[:12] + (_ptr_arg(Out),)
+        _run_compiled(
+            _launch_gemm_a8w8_compute_bound,
+            *cb_args,
+            *specialization,
+            specialization_key=specialization,
         )
     else:
-        launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
+        _launch_gemm_a8w8(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
     if partials is not None and not fused:
         dense = ldc == N
         _run_compiled(
@@ -367,11 +384,11 @@ BASE_NAME_SUFFIX_RE = (
 NAME_SUFFIX_RE = (
     BASE_NAME_SUFFIX_RE + r"(?P<fused_splitk>_fsk)?"
     r"(?P<a_preshuffle>_apre)?"
-    r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
+    r"(?:_ps(?P<persistent_n_tiles>\d+))?"
 )
-_KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
+_KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}$")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
+    rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}(?P<c_store_nt>_cnt)?$"
 )
 
 
@@ -384,10 +401,12 @@ def parse_wmma_kernel_name(name: str):
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
+    c_store_nt = groups.pop("c_store_nt", None) is not None
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["c_store_nt"] = c_store_nt
     return cfg
 
 
@@ -436,6 +455,29 @@ def is_compute_wmma_kernel_name(name: str) -> bool:
     return _COMPUTE_KERNEL_NAME_RE.fullmatch(name) is not None
 
 
+@functools.lru_cache(maxsize=1024)
+def _resolved_wmma_config(
+    kernel_name: str, true_m: int, allow_cluster_m_fallback: bool
+) -> tuple[tuple[str, int | bool], ...]:
+    cfg = parse_wmma_kernel_name(kernel_name)
+    if cfg is None:
+        raise ValueError(
+            f"[FlyDSL gfx1250 mxfp8_128] unrecognised kernelName: {kernel_name!r}"
+        )
+    if allow_cluster_m_fallback:
+        cfg["cluster_m"] = (
+            resolve_cluster_m(
+                true_m,
+                cfg["tile_m"],
+                cfg["cluster_m"],
+                cfg["cluster_n"],
+                is_compute_wmma_kernel_name(kernel_name),
+            )
+            or cfg["cluster_m"]
+        )
+    return tuple(cfg.items())
+
+
 def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
     XQ: Tensor,
     WQ: Tensor,
@@ -447,23 +489,14 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
     allow_cluster_m_fallback: bool = True,
 ) -> Tensor:
     """Decode a tuned kernelName and dispatch its internal implementation."""
-    cfg = parse_wmma_kernel_name(kernel_name)
-    if cfg is None:
-        raise ValueError(
-            f"[FlyDSL gfx1250 mxfp8_128] unrecognised kernelName: {kernel_name!r}"
+    cfg = dict(
+        _resolved_wmma_config(
+            kernel_name,
+            # Out always carries true M; preshuffled XQ may include one pad row.
+            Out.shape[0],
+            allow_cluster_m_fallback,
         )
-    if allow_cluster_m_fallback:
-        cfg["cluster_m"] = (
-            resolve_cluster_m(
-                # true M: with a_preshuffle XQ is padded to an even row count
-                Out.shape[0] if cfg["a_preshuffle"] else XQ.shape[0],
-                cfg["tile_m"],
-                cfg["cluster_m"],
-                cfg["cluster_n"],
-                is_compute_wmma_kernel_name(kernel_name),
-            )
-            or cfg["cluster_m"]
-        )
+    )
     if cfg["a_preshuffle"] and not a_is_preshuffled:
         raise ValueError(
             f"[FlyDSL gfx1250 mxfp8_128] kernelName {kernel_name!r} selects "
@@ -493,4 +526,5 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         a_preshuffle=cfg["a_preshuffle"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        c_store_nt=cfg["c_store_nt"],
     )

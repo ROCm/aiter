@@ -62,6 +62,7 @@ def launch_gemm_a8w8_256x256(
     persistent_n_tiles: Constexpr[int] = 1,
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
+    c_store_nt: Constexpr[bool] = False,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -85,6 +86,9 @@ def launch_gemm_a8w8_256x256(
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
     cluster_splitk = fused_splitk and split_k > 1
+    assert not (
+        c_store_nt and cluster_splitk
+    ), "NT store is not implemented in the fused split-K epilogue"
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
     ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
@@ -156,6 +160,7 @@ def launch_gemm_a8w8_256x256(
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
         + ("_fsk" if cluster_splitk else "")
+        + ("_cnt" if c_store_nt else "")
     )
 
     def _run_tile(
@@ -1018,6 +1023,8 @@ def launch_gemm_a8w8_256x256(
                 [mn_oob, tile_n],
                 strides=[ldc64, None],
                 num_warps=num_waves,
+                # Non-temporal cache hint for streaming outputs.
+                cache_modifier=1 if c_store_nt else 0,
             )
             fx.copy(
                 atomC,
