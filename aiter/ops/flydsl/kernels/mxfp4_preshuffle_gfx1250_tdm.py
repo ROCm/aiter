@@ -25,7 +25,7 @@ from .gemm_common_gfx1250 import (
     situv2_consts,
     workgroup_barrier,
 )
-from .kernels_common import ceildiv
+from .kernels_common import ceildiv, read_realtime, read_shader_cycles
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -42,6 +42,16 @@ from .tensor_shim import (
 )
 
 TDM_DESCRIPTOR_VERSION = 1
+CYCLE_WAVE_START = 0
+CYCLE_PROLOGUE_END = 1
+CYCLE_MAINLOOP_END = 2
+CYCLE_WAVE_END = 3
+CYCLE_HAS_WORK = 4
+CYCLE_WAVE_REALTIME_START = 5
+CYCLE_WAVE_REALTIME_END = 6
+CYCLE_RESERVED_BEGIN = 7
+CYCLE_RECORD_FIELDS = 8
+CYCLE_RECORD_BYTES = CYCLE_RECORD_FIELDS * 8
 
 
 @flyc.jit
@@ -89,6 +99,8 @@ def launch_gemm_a8w4_tdm(
     row_major_ascale: Constexpr[int] = 0,
     a_row_stride_bytes: Constexpr[int] = 0,
     a_scale_row_stride_bytes: Constexpr[int] = 0,
+    need_cycle_analysis: Constexpr[int] = 0,
+    cycle_counters: fx.Pointer = None,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -157,6 +169,7 @@ def launch_gemm_a8w4_tdm(
         row_major_ascale,
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
+        need_cycle_analysis,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -264,12 +277,13 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _profile = "_profile" if need_cycle_analysis else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_as_prologue}"
-        f"{_b_tdm_th}{_waves_per_tensor}{_ep}"
+        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_profile}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -288,6 +302,7 @@ def launch_gemm_a8w4_tdm(
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
+        cycle_counters: fx.Pointer,
     ):
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
@@ -302,6 +317,13 @@ def launch_gemm_a8w4_tdm(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
+        wave_start = fx.Int64(0)
+        wave_realtime_start = fx.Int64(0)
+        prologue_end = fx.Int64(0)
+        mainloop_end = fx.Int64(0)
+        if const_expr(need_cycle_analysis):
+            wave_realtime_start = read_realtime()
+            wave_start = read_shader_cycles()
 
         # DeepGEMM contiguous-M swizzle, run at cluster granularity so peers land
         # on one m_tile. Ternaries, not `if`: the rewriter would trace a branch.
@@ -1121,6 +1143,9 @@ def launch_gemm_a8w4_tdm(
                     workgroup_barrier()
                     load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0, 0)
 
+                if const_expr(need_cycle_analysis):
+                    prologue_end = read_shader_cycles()
+
                 def steady_post(my_jobs):
                     for kt in range(n_steady):
                         s = kt % num_buffers
@@ -1172,6 +1197,9 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(next_stage_on):
                     pipeline_fence(outstanding=TDM_PER * (PRE - 1))
                     load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0, 0)
+
+                if const_expr(need_cycle_analysis):
+                    prologue_end = read_shader_cycles()
 
                 # With the carry, a tile's only fence is at its last k128 (see
                 # k_step); buffer 0 and the first drain tile use the prologue's.
@@ -1236,6 +1264,9 @@ def launch_gemm_a8w4_tdm(
                             else None
                         ),
                     )
+
+            if const_expr(need_cycle_analysis):
+                mainloop_end = read_shader_cycles()
 
             accs = []
             output_fragments_per_acc = WMMA_N // 16
@@ -1626,12 +1657,39 @@ def launch_gemm_a8w4_tdm(
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)
 
+        if const_expr(need_cycle_analysis):
+            wave_end = read_shader_cycles()
+            wave_realtime_end = read_realtime()
+            if lane == 0:
+                cycle_ptr = fx.recast_iter(fx.Int64, cycle_counters)
+                record_base = (bid_x * num_waves + wave) * CYCLE_RECORD_FIELDS
+                fx.ptr_store(wave_start, cycle_ptr + record_base + CYCLE_WAVE_START)
+                fx.ptr_store(prologue_end, cycle_ptr + record_base + CYCLE_PROLOGUE_END)
+                fx.ptr_store(mainloop_end, cycle_ptr + record_base + CYCLE_MAINLOOP_END)
+                fx.ptr_store(wave_end, cycle_ptr + record_base + CYCLE_WAVE_END)
+                fx.ptr_store(
+                    has_work.select(fx.Int64(1), fx.Int64(0)),
+                    cycle_ptr + record_base + CYCLE_HAS_WORK,
+                )
+                fx.ptr_store(
+                    wave_realtime_start,
+                    cycle_ptr + record_base + CYCLE_WAVE_REALTIME_START,
+                )
+                fx.ptr_store(
+                    wave_realtime_end,
+                    cycle_ptr + record_base + CYCLE_WAVE_REALTIME_END,
+                )
+                for field in range_constexpr(CYCLE_RESERVED_BEGIN, CYCLE_RECORD_FIELDS):
+                    fx.ptr_store(fx.Int64(0), cycle_ptr + record_base + field)
+
     m_tiles = ceildiv(i32_m, tile_m)
     n_tiles = ceildiv(N, tile_n)
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+    if cycle_counters is None:
+        cycle_counters = fx.get_iter(arg_c)
     kargs = (
         fx.get_iter(arg_c),
         arg_a,
@@ -1647,6 +1705,7 @@ def launch_gemm_a8w4_tdm(
         f32_swiglu_limit,
         f32_situ_beta,
         f32_situ_linear_beta,
+        cycle_counters,
     )
     grid = (m_tiles * n_tiles, 1, 1)
     if cluster_n > 1:

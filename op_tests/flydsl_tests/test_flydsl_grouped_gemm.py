@@ -15,11 +15,13 @@ grouped GEMM launcher directly. The grouped path is opted-in via the
 Pytest covers a small correctness case for each format. Direct execution
 (``python op_tests/flydsl_tests/test_flydsl_grouped_gemm.py``) runs a
 DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
-per-kernel bench that times gemm1 and gemm2 in isolation
+cycle-profiled bench (``--scenario profile``), a per-kernel bench that times
+gemm1 and gemm2 in isolation
 (``--scenario kernel``), a tiny correctness check
 (``--scenario verify``), or a full sweep of every setting in a tuned-config
 CSV (``--scenario csv``; defaults to ``aiter/configs/tuned_grouped_fmoe.csv``,
-one benched case per row, override the file with ``--csv-path``).
+one benched case per row, override the file with ``--csv-path``). Profile mode
+prints per-wave phase cycles for every grouped-GEMM threadgroup.
 """
 
 from __future__ import annotations
@@ -58,6 +60,191 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+
+_CYCLE_PROFILE_RECORDS = {}
+
+
+def _enable_cycle_profile() -> None:
+    """Wrap grouped GEMM launches with reusable per-wave cycle buffers."""
+    import aiter.ops.flydsl.grouped_gemm_mxfp4 as grouped_gemm
+
+    original = grouped_gemm.flydsl_grouped_gemm_a8w4_masked
+    if getattr(original, "_cycle_profile_wrapper", False):
+        return
+
+    def profiled(*args, **kwargs):
+        out = args[0]
+        tile_m = kwargs.get("tile_m", 64)
+        tile_n = kwargs.get("tile_n", 256)
+        m_warp = kwargs.get("m_warp", 1)
+        n_warp = kwargs.get("n_warp", 4)
+        stage = "gemm1" if kwargs.get("stage1_act", 0) else "gemm2"
+        key = (
+            stage,
+            kwargs["contiguous_m"],
+            kwargs["N"],
+            kwargs["K"],
+            tile_m,
+            tile_n,
+            kwargs.get("tile_k", 256),
+            m_warp,
+            n_warp,
+            kwargs.get("num_buffers", 3),
+            kwargs.get("a_is_fp4", 0),
+            kwargs.get("stage1_quant_out", 0),
+            str(out.device),
+        )
+        entry = _CYCLE_PROFILE_RECORDS.get(key)
+        if entry is None:
+            entry = {
+                "stage": stage,
+                "shape": (kwargs["N"], kwargs["K"]),
+                "tile": (
+                    tile_m,
+                    tile_n,
+                    kwargs.get("tile_k", 256),
+                ),
+                "cycles": grouped_gemm.allocate_cycle_counters(
+                    out,
+                    contiguous_m=kwargs["contiguous_m"],
+                    n=kwargs["N"],
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    m_warp=m_warp,
+                    n_warp=n_warp,
+                ),
+            }
+            _CYCLE_PROFILE_RECORDS[key] = entry
+        kwargs["need_cycle_analysis"] = 1
+        kwargs["cycle_analysis"] = entry["cycles"]
+        return original(*args, **kwargs)
+
+    profiled._cycle_profile_wrapper = True
+    grouped_gemm.flydsl_grouped_gemm_a8w4_masked = profiled
+
+
+def _reset_cycle_profile() -> None:
+    _CYCLE_PROFILE_RECORDS.clear()
+
+
+def _format_cycle_table(headers: tuple[str, ...], rows: list[tuple]) -> str:
+    """Format cycle-profile rows without requiring an optional dependency."""
+    text_rows = [[str(value) for value in row] for row in rows]
+    widths = [
+        max(len(header), *(len(row[index]) for row in text_rows))
+        for index, header in enumerate(headers)
+    ]
+    header_line = " | ".join(
+        header.ljust(widths[index]) for index, header in enumerate(headers)
+    )
+    separator = "-+-".join("-" * width for width in widths)
+    body = [
+        " | ".join(value.rjust(widths[index]) for index, value in enumerate(row))
+        for row in text_rows
+    ]
+    return "\n".join([header_line, separator, *body])
+
+
+def _print_cycle_profile(realtime_mhz: float) -> None:
+    """Print per-GEMM averages for working and empty waves."""
+    torch.cuda.synchronize()
+    work_cycles = {}
+    no_work_cycles = {}
+    all_wave_counts = {}
+    for entry in _CYCLE_PROFILE_RECORDS.values():
+        records = entry["cycles"].view(torch.int64).cpu()
+        stage = entry["stage"]
+        all_waves = records.shape[0] * records.shape[1]
+        all_wave_counts[stage] = all_wave_counts.get(stage, 0) + all_waves
+        print(
+            f"\n[cycle profile {stage}] N={entry['shape'][0]} "
+            f"K={entry['shape'][1]} tile={entry['tile']} "
+            f"threadgroups={records.shape[0]} waves={records.shape[1]}",
+            flush=True,
+        )
+        for tg_id in range(records.shape[0]):
+            for wave_id in range(records.shape[1]):
+                record = records[tg_id, wave_id]
+                total = int(record[3] - record[0])
+                realtime_ticks = int(record[6] - record[5])
+                if int(record[4]):
+                    work_cycles.setdefault(stage, []).append(
+                        (
+                            int(record[1] - record[0]),
+                            int(record[2] - record[1]),
+                            int(record[3] - record[2]),
+                            realtime_ticks,
+                        )
+                    )
+                else:
+                    no_work_cycles.setdefault(stage, []).append((total, realtime_ticks))
+
+    print(f"\n[cycle profile] realtime_mhz={realtime_mhz:.3f}", flush=True)
+    if work_cycles:
+        work_rows = []
+        for stage, cycles in work_cycles.items():
+            count = len(cycles)
+            all_waves = all_wave_counts[stage]
+            total_cycles = sum(sum(row[:3]) for row in cycles)
+            total_realtime_ticks = sum(row[3] for row in cycles)
+            avg_realtime_ticks = total_realtime_ticks / count
+            work_rows.append(
+                (
+                    stage,
+                    f"{count}/{all_waves} ({100 * count / all_waves:.2f}%)",
+                    f"{sum(row[0] for row in cycles) / count:.1f}",
+                    f"{sum(row[1] for row in cycles) / count:.1f}",
+                    f"{sum(row[2] for row in cycles) / count:.1f}",
+                    f"{avg_realtime_ticks:.1f}",
+                    f"{avg_realtime_ticks / realtime_mhz:.3f}",
+                    f"{total_cycles * realtime_mhz / total_realtime_ticks:.1f}",
+                )
+            )
+        print(
+            "\n[cycle profile: has work]\n"
+            + _format_cycle_table(
+                (
+                    "gemm",
+                    "wave_ratio",
+                    "avg_prologue",
+                    "avg_mainloop",
+                    "avg_epilogue",
+                    "avg_rt_ticks",
+                    "avg_rt_us",
+                    "est_shader_mhz",
+                ),
+                work_rows,
+            ),
+            flush=True,
+        )
+    if no_work_cycles:
+        no_work_rows = [
+            (
+                stage,
+                f"{len(cycles)}/{all_wave_counts[stage]} "
+                f"({100 * len(cycles) / all_wave_counts[stage]:.2f}%)",
+                f"{sum(row[0] for row in cycles) / len(cycles):.1f}",
+                f"{sum(row[1] for row in cycles) / len(cycles):.1f}",
+                f"{sum(row[1] for row in cycles) / len(cycles) / realtime_mhz:.3f}",
+                f"{sum(row[0] for row in cycles) * realtime_mhz / sum(row[1] for row in cycles):.1f}",
+            )
+            for stage, cycles in no_work_cycles.items()
+        ]
+        print(
+            "\n[cycle profile: no work]\n"
+            + _format_cycle_table(
+                (
+                    "gemm",
+                    "wave_ratio",
+                    "avg_tg_cycles",
+                    "avg_rt_ticks",
+                    "avg_rt_us",
+                    "est_shader_mhz",
+                ),
+                no_work_rows,
+            ),
+            flush=True,
+        )
 
 
 # Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
@@ -1208,10 +1395,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        choices=("bench", "verify", "kernel", "csv"),
+        choices=("bench", "profile", "verify", "kernel", "csv"),
         default="bench",
-        help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
-        "correctness only. kernel: time the gemm1 and gemm2 kernels in "
+        help="bench: time fused_moe end-to-end (CUDA graph). profile: run the "
+        "same benchmark and print per-wave grouped-GEMM phase cycles. verify: "
+        "eager correctness only. kernel: time the gemm1 and gemm2 kernels in "
         "isolation (loop each launch alone). csv: sweep every setting in "
         "--csv-path (one run_moe case per row).",
     )
@@ -1237,6 +1425,13 @@ def main() -> None:
     parser.add_argument("--inter-dim", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
+    parser.add_argument(
+        "--realtime-mhz",
+        type=float,
+        default=100.0,
+        help="calibrated REALTIME frequency used by --scenario profile to "
+        "convert ticks to microseconds and estimate shader MHz (default: 100)",
+    )
     parser.add_argument(
         "--data-init",
         dest="data_init",
@@ -1306,6 +1501,11 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
+    profile = args.scenario == "profile"
+    if profile and args.realtime_mhz <= 0:
+        parser.error("--realtime-mhz must be greater than zero")
+    if profile:
+        _enable_cycle_profile()
     data_init_list = args.data_init or ["constant", "uniform"]
     scale_init_list = args.scale_init or ["constant", "auto"]
     if len(data_init_list) == 1:
@@ -1350,6 +1550,8 @@ def main() -> None:
             print(f"\n===== tokens={_tok} =====", flush=True)
 
         for data_init, scale_init in args.init_pairs:
+            if profile:
+                _reset_cycle_profile()
             tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
             # raise_on_fail=False so one out-of-gate token does not abort the
             # sweep; the failure is recorded and reported after the table.
@@ -1366,9 +1568,9 @@ def main() -> None:
                 situ_beta=args.situ_beta,
                 situ_linear_beta=args.situ_linear_beta,
                 use_bias=not args.no_bias,
-                check_aot_cache=not args.no_check_aot_cache,
+                check_aot_cache=not (args.no_check_aot_cache or profile),
                 raise_on_fail=False,
-                bench=args.scenario == "bench",
+                bench=args.scenario in ("bench", "profile"),
                 kernel_bench=args.scenario == "kernel",
                 warmup=args.warmup,
                 iters=args.iters,
@@ -1376,6 +1578,8 @@ def main() -> None:
                 data_init=data_init,
                 scale_init=scale_init,
             )
+            if profile:
+                _print_cycle_profile(args.realtime_mhz)
             rows.append(
                 {
                     "data_format": args.data_format,

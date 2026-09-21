@@ -20,6 +20,34 @@ from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 LOG2E = 1.4426950408889634
 
 
+def read_shader_cycles():
+    """Read the AMD shader-cycle counter into a 64-bit scalar value."""
+    op = _llvm.InlineAsmOp(
+        res=ir.IntegerType.get_signless(64),
+        operands_=[],
+        asm_string="s_get_shader_cycles_u64 $0",
+        constraints="=&s",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+    return fx.Int64(op.res)
+
+
+def read_realtime():
+    """Read the fixed-frequency AMD REALTIME counter into a 64-bit scalar."""
+    op = _llvm.InlineAsmOp(
+        res=ir.IntegerType.get_signless(64),
+        operands_=[],
+        asm_string=(
+            "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n\t" "s_wait_kmcnt 0"
+        ),
+        constraints="=&s",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+    return fx.Int64(op.res)
+
+
 def ceildiv(numer, denom):
     """Ceiling division preserving Python-int or DSL-scalar operand types."""
     return (numer + denom - 1) // denom
