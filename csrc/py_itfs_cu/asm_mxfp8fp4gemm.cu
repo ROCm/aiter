@@ -16,6 +16,9 @@
 //  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
 //  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %2==0.
 //  - K is always a multiple of 128.
+//  - The 128x128 K128/PF8 kernels additionally require complete clusters:
+//    positive M%(tile_m*cluster_y)==0 and N%(tile_n*cluster_x)==0 for both A
+//    layouts (512 for the shipped 4x4 variants), K>=1024, and splitk=1.
 // ============================================================================
 //
 // gfx1250 MXFP8 x {MXFP8, MXFP4} GEMM ASM dispatch (preload SGPR mode).
@@ -27,8 +30,8 @@
 //   - mxfp8_mxfp8_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K] mxfp8   (a8w8)
 //   - mxfp8_mxfp4_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K/2] mxfp4 (a8w4)
 //
-// Legacy kernels use 76-byte preload arguments; the four additions use 80 bytes:
-// 5 pointers (MEM-first), then 9 tight 4B scalars and an optional splitk scalar.
+// All shipped kernels use 80-byte preload arguments:
+// 5 pointers (MEM-first), then 10 tight 4B scalars, including splitk.
 // The persistent + cluster
 // shaders do their own tile scheduling, so unlike f4gemm there are no
 // log2_grid kernargs -- the host only supplies M/N/K/batch and launches on a
@@ -44,9 +47,11 @@
 
 constexpr int MX_SCALE_BLOCK = 32;
 
-constexpr int F8GEMM_N_ALIGN      = 16;
-constexpr int F8GEMM_K_ALIGN      = 128;
-constexpr int F8GEMM_M_ALIGN_APRE = 2;
+constexpr int F8GEMM_N_ALIGN       = 16;
+constexpr int F8GEMM_K_ALIGN       = 128;
+constexpr int F8GEMM_M_ALIGN_APRE  = 2;
+constexpr int F8GEMM_PERSISTENT_TG = 256; // must match the .co's WG_MAX
+constexpr int F8GEMM_128_MIN_K     = 8 * F8GEMM_K_ALIGN; // K128/PF8 prologue
 
 // Preload-mode KernelArgs (4B-tight, MEM-first). Offsets in comments are the
 // kernarg byte offsets the preload-aware shader s_load's from.
@@ -66,33 +71,49 @@ struct __attribute__((packed)) KernelArgs
     unsigned int N;          // s18      off 0x40
     unsigned int K;          // s19      off 0x44
     unsigned int batch_size; // s20      off 0x48
-    unsigned int splitk;     // s21      off 0x4c, new kernels only
+    unsigned int splitk;     // s21      off 0x4c
 };
 static_assert(sizeof(KernelArgs) == 80, "Split-K preload KernelArgs must be 80B");
-static_assert(offsetof(KernelArgs, splitk) == 76, "Legacy kernel arguments must remain 76B");
+static_assert(offsetof(KernelArgs, splitk) == 76, "splitk must be at byte offset 76");
 
 static bool supports_splitk(const mxfp8fp4gemmConfig& cfg)
 {
-    return cfg.b_intype == "mxfp8" && cfg.tile_m == 256 && cfg.tile_n == 256 &&
-           cfg.cluster_x == 4 && cfg.cluster_y == 2;
+    if(cfg.outtype != "bf16" || cfg.cluster_x != 4 ||
+       (cfg.b_intype != "mxfp8" && cfg.b_intype != "mxfp4"))
+        return false;
+    // The refreshed 256x256_4x4 and 64x512_4x1 binaries use the same
+    // Split-K contract as 256x256_4x2. The 128x128 family remains splitk=1.
+    return (cfg.tile_m == 256 && cfg.tile_n == 256 &&
+            (cfg.cluster_y == 4 || (cfg.cluster_y == 2 && cfg.b_intype == "mxfp8"))) ||
+           (cfg.tile_m == 64 && cfg.tile_n == 512 && cfg.cluster_y == 1);
 }
 
-static bool uses_extended_args(const mxfp8fp4gemmConfig& cfg)
+static bool is_tuned_kernel(const mxfp8fp4gemmConfig& cfg)
 {
-    return supports_splitk(cfg) || (cfg.tile_m == 128 && cfg.tile_n == 128);
+    // CSV-only selection is independent of Split-K capability: the refreshed
+    // general kernels must remain reachable on a config miss.
+    return (cfg.tile_m == 256 && cfg.tile_n == 256 && cfg.cluster_x == 4 &&
+            cfg.cluster_y == 2) ||
+           (cfg.tile_m == 128 && cfg.tile_n == 128);
 }
 
 static bool splitk_is_valid(int M, int N, int K, const mxfp8fp4gemmConfig& cfg, int splitk)
 {
     if(splitk == 1)
         return true;
-    if(!supports_splitk(cfg) || splitk < 1 || (splitk & (splitk - 1)) != 0)
+    if(!supports_splitk(cfg) || splitk < 1 || (splitk & (splitk - 1)) != 0 ||
+       M <= 0 || N <= 0 || K <= 0)
         return false;
-    // Each split needs whole K128 stages and at least four prefetched stages.
-    if(K % splitk != 0 || (K / splitk) % 128 != 0 || K / splitk < 512)
+    // Match the shaders' PF_TILES: six stages for 64x512 MXFP4, four for
+    // the other Split-K kernels. K is measured in elements, including MXFP4.
+    const int prefetch_stages = (cfg.tile_m == 64 && cfg.b_intype == "mxfp4") ? 6 : 4;
+    if(K % splitk != 0 || (K / splitk) % F8GEMM_K_ALIGN != 0 ||
+       K / splitk < prefetch_stages * F8GEMM_K_ALIGN)
         return false;
-    const int tiles = ((M + 255) / 256) * ((N + 255) / 256);
-    return static_cast<long long>(splitk) * tiles <= 256;
+    const long long tiles_m = (static_cast<long long>(M) + cfg.tile_m - 1) / cfg.tile_m;
+    const long long tiles_n = (static_cast<long long>(N) + cfg.tile_n - 1) / cfg.tile_n;
+    // Divide the capacity first to avoid overflow even for oversized arguments.
+    return tiles_m * tiles_n <= F8GEMM_PERSISTENT_TG / splitk;
 }
 
 // Pick the best registered kernel variant for (M,N,K) given the B dtype and
@@ -128,7 +149,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
             continue;
         // Tuned kernels are selected by kernelName from the Python CSV lookup.
         // A config miss keeps the original general dispatch.
-        if(uses_extended_args(cfg))
+        if(is_tuned_kernel(cfg))
             continue;
 
         const int m_align = a_preshuffle ? F8GEMM_M_ALIGN_APRE : 1;
@@ -278,17 +299,29 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
 
     if(cfg.tile_m == 128 && cfg.tile_n == 128)
     {
-        const int mn_align = a_preshuffle ? 128 : 512;
-        AITER_CHECK(Mdim > 0 && Ndim > 0 && Mdim % mn_align == 0 && Ndim % mn_align == 0 &&
-                        Kdim >= 1024,
-                    __func__, " 128x128 requires aligned positive M/N and K>=1024");
+        // Both binaries traverse full clusters. A tail cluster still executes
+        // prefetches for empty tensor tiles; an empty M tile can underflow the
+        // output prefetch length. TDM output clipping alone does not make that
+        // path safe. Require full clusters independently of the A layout.
+        const int m_align = cfg.tile_m * cfg.cluster_y;
+        const int n_align = cfg.tile_n * cfg.cluster_x;
+        AITER_CHECK(Mdim > 0 && Ndim > 0 && Mdim % m_align == 0 && Ndim % n_align == 0 &&
+                        Kdim >= F8GEMM_128_MIN_K,
+                    __func__, " 128x128 requires complete clusters: positive M%", m_align,
+                    "==0, N%", n_align, "==0 and K>=", F8GEMM_128_MIN_K);
     }
     AITER_CHECK(splitk_is_valid(Mdim, Ndim, Kdim, cfg, splitk),
                 __func__, " invalid splitk=", splitk, " for ", cfg.knl_name);
-    AITER_CHECK(out->numel() == static_cast<long long>(splitk) * Mdim * Ndim,
-                __func__, " out must hold splitk*M*N elements");
+    // The launcher passes a compact N-element row stride. A larger contiguous
+    // workspace is allowed, but only its first splitk*M*N elements are written,
+    // starting at out->ptr (which may already include a storage offset).
+    AITER_CHECK(out->is_contiguous(),
+                __func__, " out must be contiguous; strided/padded output is unsupported");
+    const size_t required_elements = static_cast<size_t>(splitk) * Mdim * Ndim;
+    AITER_CHECK(out->numel() >= required_elements,
+                __func__, " out must hold at least splitk*M*N elements (need ",
+                required_elements, ", got ", out->numel(), ")");
     args.splitk = splitk;
-    arg_size = uses_extended_args(cfg) ? sizeof(KernelArgs) : offsetof(KernelArgs, splitk);
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
@@ -304,7 +337,7 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1; // compile-time per .co
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    constexpr int WG_MAX = 256; // must match the .co's WG_MAX
+    constexpr int WG_MAX = F8GEMM_PERSISTENT_TG;
 
     const int cluster_size = cluster_x * cluster_y;
     AITER_CHECK((WG_MAX % cluster_size) == 0,
@@ -333,7 +366,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* B,      // B:[N, K]   mxfp8 e4m3 (always preshuffled)
      aiter_tensor_t* ScaleA, // ScaleA:[M, K/32] e8m0 (shuffled)
      aiter_tensor_t* ScaleB, // ScaleB:[N, K/32] e8m0 (shuffled)
-     aiter_tensor_t* out,    // Out:[M, N] bf16
+     aiter_tensor_t* out,    // contiguous BF16 capacity >= splitk*M*N; compact prefix
      const char* kernelName,
      int a_preshuffle,
      int splitk,
@@ -349,11 +382,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* B,      // B:[N, K/2] mxfp4 e2m1 (always preshuffled)
      aiter_tensor_t* ScaleA, // ScaleA:[M, K/32] e8m0 (shuffled)
      aiter_tensor_t* ScaleB, // ScaleB:[N, K/32] e8m0 (shuffled)
-     aiter_tensor_t* out,    // Out:[M, N] bf16
+     aiter_tensor_t* out,    // contiguous BF16 capacity >= splitk*M*N; compact prefix
      const char* kernelName,
      int a_preshuffle,
+     int splitk,
      hipStream_t stream),
-    (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, stream))
+    (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, splitk, stream))
 {
-    mxfp8fp4_launch(A, B, ScaleA, ScaleB, out, kernelName, "mxfp4", a_preshuffle, 1, stream);
+    mxfp8fp4_launch(A, B, ScaleA, ScaleB, out, kernelName, "mxfp4", a_preshuffle, splitk, stream);
 }

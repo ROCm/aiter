@@ -414,14 +414,23 @@ class AITER_CONFIG:
         # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
         untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        if os.path.exists(untuned_path):
-            untunedf = pd.read_csv(untuned_path)
-            keys = untunedf.columns.to_list()
-            if "cu_num" not in keys:
-                keys.append("cu_num")
+        if merge_name == "asm_mfxp8fp4gemm" or os.path.exists(untuned_path):
+            if merge_name == "asm_mfxp8fp4gemm":
+                # This family has no untuned sibling. Match its exact lookup
+                # key; kernelName and splitK are tuned values, not shape axes.
+                keys = ["gfx", "M", "N", "K", "b_intype", "a_preshuffle", "outdtype"]
+            else:
+                untunedf = pd.read_csv(untuned_path)
+                keys = untunedf.columns.to_list()
+                if "cu_num" not in keys:
+                    keys.append("cu_num")
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
-            dedup_keys = keys + ["_tag"] if has_tag else keys
+            dedup_keys = (
+                keys + ["_tag"]
+                if has_tag and merge_name != "asm_mfxp8fp4gemm"
+                else keys
+            )
             # Only key on columns actually present in the merged frame. Most
             # families carry cu_num, but some (e.g. the mxscale batched-GEMM
             # table) key on gfx and never carry cu_num; keeping a missing column

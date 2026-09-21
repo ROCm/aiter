@@ -21,7 +21,6 @@
 
 import argparse
 import itertools
-import re
 import sys
 
 import pandas as pd
@@ -35,14 +34,20 @@ from aiter.benchmark_data_init import (
     fill_scale_e8m0,
     make_generator,
 )
+from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a8w8 import _resolve_mxfp8_gemm_config
+from aiter.ops.gemm_op_a8w8 import (
+    _mxfp8_kernel_configs,
+    _resolve_mxfp8_gemm_config,
+    _validate_mxfp8_splitk,
+)
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
     shuffle_mxfp8fp4_scale,
 )
 from aiter.test_common import (
+    assertAllclose,
     benchmark,
     checkAllclose,
     run_perftest,
@@ -64,38 +69,51 @@ PERSISTENT_TG = 256
 
 
 def _kernel_geometry(M, kernel_name=""):
-    if kernel_name:
-        match = re.search(r"_(\d+)x(\d+)_(\d+)x(\d+)_ps", kernel_name)
-        if match is None:
-            raise ValueError(f"Unrecognized F8GEMM kernel name: {kernel_name}")
-        return tuple(int(value) for value in match.groups())
-    # Native heuristic used when no tuned config or explicit kernel is selected.
-    return (64, 512, 4, 1) if M <= 64 else (256, 256, 4, 4)
+    if not kernel_name:
+        # Native heuristic used when no tuned or explicit kernel is selected.
+        return (64, 512, 4, 1) if M <= 64 else (256, 256, 4, 4)
+    try:
+        config = _mxfp8_kernel_configs(get_asm_dir())[kernel_name]
+        geometry = tuple(
+            int(config[key]) for key in ("tile_m", "tile_n", "cluster_x", "cluster_y")
+        )
+        if any(value <= 0 for value in geometry):
+            raise ValueError("nonpositive tile/cluster dimension")
+        return geometry
+    except (OSError, KeyError, TypeError, ValueError, OverflowError) as exc:
+        # Reporting must not veto an explicit name; native dispatch validates it.
+        aiter.logger.warning(
+            "Unknown geometry for %s in HSA manifest: %s", kernel_name, exc
+        )
+        return None
 
 
-def _report_active_tg(M, N, tile_m, tile_n, label):
+def _report_active_tg(M, N, tile_m, tile_n, label, splitk=1):
     """Warn when the persistent shader's TG slots aren't fully packed.
 
     The .co always launches PERSISTENT_TG (256) threadgroups. The real work is
-    ceil(M/tile_m) * ceil(N/tile_n) tiles; when that isn't a multiple of 256 the
-    final wave leaves the leftover TG slots idle (wasted CUs) -> "poor perf".
+    splitk * ceil(M/tile_m) * ceil(N/tile_n) logical work units. When that is
+    not a multiple of 256, the final wave has unused slots. This counts logical
+    work, not measured hardware occupancy or the cost of padded cluster tiles.
     (Moved here from the cpp dispatch so the report lives with the test.)
     """
     tg_m = (M + tile_m - 1) // tile_m
     tg_n = (N + tile_n - 1) // tile_n
-    active_tg = tg_m * tg_n
+    active_tg = splitk * tg_m * tg_n
     wave_active = (
         PERSISTENT_TG if active_tg % PERSISTENT_TG == 0 else active_tg % PERSISTENT_TG
     )
     info = (
         f"{label}: active {wave_active}/{PERSISTENT_TG} TG "
-        f"({tg_m} M-tiles x {tg_n} N-tiles, tile_m={tile_m}, tile_n={tile_n})"
+        f"in the final wave ({tg_m} M-tiles x {tg_n} N-tiles x {splitk} splits, "
+        f"{active_tg} work units, tile_m={tile_m}, tile_n={tile_n})"
     )
     if active_tg % PERSISTENT_TG == 0:
         aiter.logger.info("dispatch to %s", info)
     else:
         tag = "\033[31mpoor perf\033[0m" if sys.stderr.isatty() else "poor perf"
         aiter.logger.warning("dispatch to %s - %s!", info, tag)
+    return active_tg, wave_active
 
 
 PERF_SHAPES = {
@@ -154,6 +172,12 @@ FUNC_SHAPES = [
     (128, 384, 8192),
     (66, 384, 8192),
     (65, 384, 8192),
+    # Remaining tuned MXFP8 shapes: exercise the CSV defaults, including reduction.
+    (512, 2048, 7168),
+    (512, 7168, 16384),
+    (512, 6144, 7168),
+    (512, 7168, 3072),
+    (512, 65536, 1536),
 ]
 
 MX_SCALE_BLOCK = 32
@@ -161,6 +185,50 @@ MX_SCALE_BLOCK = 32
 # checkAllclose returns 0 when all-close, else the mismatch fraction. Its own
 # verdict thresholds: pass (0) / warning (<= tol_err_ratio) / failed (above).
 _TOL_ERR_RATIO = 0.05  # matches checkAllclose default tol_err_ratio
+_RTOL = 1e-1
+_ATOL = 1.0
+# BF16 partials introduce additional rounding before the cross-split sum.
+# Keep the existing elementwise criterion, but also bound the total error:
+# ||actual - reference||_2 / ||reference||_2 <= 1%. This is independent of
+# split count; increasing split-K must not automatically relax admission.
+_SPLITK_MAX_RELATIVE_L2 = 1e-2
+
+
+def _check_splitk_accuracy(actual, reference, msg=""):
+    """Enforce final-output accuracy; warnings within the declared limits are OK.
+
+    The reference is the full-K FP32 matmul rounded once to the output dtype,
+    or a splitk=1 output for a paired comparison. Neither comparison uses a
+    reference that has already rounded each K partition to BF16.
+    """
+    assert actual.shape == reference.shape, f"{msg}: output shape mismatch"
+    actual, reference = actual.float(), reference.float()
+    assert (
+        torch.isfinite(actual).all() and torch.isfinite(reference).all()
+    ), f"{msg}: nonfinite output/reference (possibly an unwritten split plane)"
+    # Preserve the native benchmark's isclose argument order and 5% policy.
+    err = assertAllclose(
+        reference,
+        actual,
+        rtol=_RTOL,
+        atol=_ATOL,
+        tol_err_ratio=_TOL_ERR_RATIO,
+        catastrophic_check=True,
+        msg=msg,
+    )
+    delta_norm = torch.linalg.vector_norm(
+        actual - reference, dtype=torch.float64
+    ).item()
+    ref_norm = torch.linalg.vector_norm(reference, dtype=torch.float64).item()
+    # A zero reference requires a zero result; do not hide it behind an epsilon.
+    relative_l2 = (
+        delta_norm / ref_norm if ref_norm else (float("inf") if delta_norm else 0.0)
+    )
+    assert relative_l2 <= _SPLITK_MAX_RELATIVE_L2, (
+        f"{msg}: relative L2 error {relative_l2:.6%} exceeds "
+        f"{_SPLITK_MAX_RELATIVE_L2:.2%}"
+    )
+    return err, relative_l2
 
 
 def _verdict(err):
@@ -272,8 +340,10 @@ def test_gemm(
     test_graph=False,
     num_rotate=0,
 ):
-    if intype != "a8w8" and (no_reduce or splitk not in (None, 1)):
-        raise ValueError("Split-K and --no-reduce are only supported for a8w8")
+    explicit_splitk = splitk is not None
+    if explicit_splitk:
+        # Reject malformed counts even when the shape would otherwise be skipped.
+        _validate_mxfp8_splitk(M, N, K, splitk)
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
     reason = _support_reason(outtype, apre, M, N, K)
@@ -288,12 +358,14 @@ def test_gemm(
             N,
             K,
         )
-        _tm, _tn, _cx, _cy = _kernel_geometry(M)
+        geometry = _kernel_geometry(
+            M, "" if knl_name in (None, "", "auto") else knl_name
+        )
         return {
             "gfx": get_gfx(),
             "knl_name": knl_name or "(heuristic)",
-            "tile": f"{_tm}x{_tn}",
-            "cluster": f"{_cx}x{_cy}",
+            "tile": f"{geometry[0]}x{geometry[1]}" if geometry else "unknown",
+            "cluster": f"{geometry[2]}x{geometry[3]}" if geometry else "unknown",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -306,14 +378,30 @@ def test_gemm(
     # Share the public op's CSV lookup and override rules. Resolve before building
     # the partial reference so --no-reduce validates the actual split count.
     knl = "" if knl_name in (None, "", "auto") else knl_name
-    if intype == "a8w8":
-        knl, splitk = _resolve_mxfp8_gemm_config(M, N, K, apre, out_dtype, knl, splitk)
-    elif splitk is None:
-        splitk = 1
-    if splitk < 1 or K % splitk != 0:
-        raise ValueError("splitk must be positive and divide K")
-    _tile_m, _tile_n, _cx, _cy = _kernel_geometry(M, knl)
+    knl, splitk = _resolve_mxfp8_gemm_config(
+        M,
+        N,
+        K,
+        apre,
+        out_dtype,
+        knl,
+        splitk,
+        b_intype="mxfp4" if intype == "a8w4" else "mxfp8",
+    )
+    geometry = _kernel_geometry(M, knl)
+    if explicit_splitk:
+        kernel = None
+        if geometry is not None:
+            kernel = dict(
+                zip(("tile_m", "tile_n", "cluster_x", "cluster_y"), geometry),
+                b_intype="mxfp4" if intype == "a8w4" else "mxfp8",
+                outtype=outtype,
+            )
+        # Use the resolved kernel's tile geometry, including a CSV-selected or
+        # explicit override. Unknown metadata stays native dispatch's concern.
+        _validate_mxfp8_splitk(M, N, K, splitk, kernel)
     if knl_name == "auto" and not knl:
+        _tile_m, _tile_n, _cx, _cy = geometry
         middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
         pre = "ABpreShuffle" if apre else "BpreShuffle"
         base = f"f8gemm_{outtype}_{middle}_{pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
@@ -342,8 +430,10 @@ def test_gemm(
     kern = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
 
     if no_reduce:
+        from aiter.ops.gemm_op_a8w4 import _mxfp8_mxfp4_gemm_asm
         from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
 
+        raw_kern = _mxfp8_mxfp4_gemm_asm if intype == "a8w4" else _mxfp8_mxfp8_gemm_asm
         partials = torch.empty(
             (splitk, M, N) if splitk > 1 else (M, N),
             dtype=out_dtype,
@@ -352,23 +442,17 @@ def test_gemm(
 
     def run_asm(A, B, sA, sB):
         if no_reduce:
-            _mxfp8_mxfp8_gemm_asm(
-                A, B, sA, sB, partials, knl or None, int(apre), splitk
-            )
+            raw_kern(A, B, sA, sB, partials, knl or None, int(apre), splitk)
             return partials
-        if intype == "a8w8":
-            return kern(
-                A,
-                B,
-                sA,
-                sB,
-                dtype=out_dtype,
-                a_preshuffle=bool(apre),
-                kernelName=knl,
-                splitk=splitk,
-            )
         return kern(
-            A, B, sA, sB, dtype=out_dtype, a_preshuffle=bool(apre), kernelName=knl
+            A,
+            B,
+            sA,
+            sB,
+            dtype=out_dtype,
+            a_preshuffle=bool(apre),
+            kernelName=knl,
+            splitk=splitk,
         )
 
     asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
@@ -383,16 +467,18 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl or "(heuristic)"}
-    # Report the selected kernel's geometry, including explicit overrides.
-    _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
-    _pre = "ABpreShuffle" if apre else "BpreShuffle"
-    _label = (
-        knl or f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
-    )
-    _report_active_tg(M, N, _tile_m, _tile_n, _label)
-    # Report the tile and cluster selected for this shape.
-    ret["tile"] = f"{_tile_m}x{_tile_n}"
-    ret["cluster"] = f"{_cx}x{_cy}"
+    # Never substitute heuristic geometry for an unrecognized explicit kernel.
+    if geometry is None:
+        ret.update(
+            tile="unknown", cluster="unknown", work_units=None, last_wave_tg=None
+        )
+    else:
+        _tile_m, _tile_n, _cx, _cy = geometry
+        ret["work_units"], ret["last_wave_tg"] = _report_active_tg(
+            M, N, _tile_m, _tile_n, knl or f"{intype} heuristic", splitk
+        )
+        ret["tile"] = f"{_tile_m}x{_tile_n}"
+        ret["cluster"] = f"{_cx}x{_cy}"
     ret["splitk"] = splitk
     ret["reference_splitk"] = splitk if no_reduce else 1
     ret["reduced"] = not no_reduce and splitk > 1
@@ -435,20 +521,30 @@ def test_gemm(
             ret[f"{name} err"] = float("nan")
             ret[f"{name} result"] = "not support"
             continue
-        # a8w8 (mxfp8xmxfp8) can show a "warning" on ~1 element in 5e5: an
-        # ill-conditioned output where sum|terms| (~2.7e5) cancels to a ~0.2
-        # residual (ratio ~9e-7). The fp32 accumulation noise floor there is
-        # O(1), so any accumulator (kernel or this ref) lands in [-1,+1] noise
-        # purely by summation order -- benign, not a kernel defect. a8w4's
-        # coarser fp4 B rarely hits it. atol=1.0 keeps such elements a warning.
-        err = checkAllclose(
-            ref.to(dtypes.fp32),
-            out.to(dtypes.fp32),
-            rtol=1e-1,
-            atol=1.0,
-            msg=f"{intype} {name}",
+        # Split-K rounds each partial to BF16. Cancellation can therefore
+        # increase elementwise mismatches even when the total error is small.
+        # Enforce both criteria on the public reduced output, including perf
+        # runs. --no-reduce remains a separate per-plane diagnostic.
+        if splitk > 1 and not no_reduce:
+            err, relative_l2 = _check_splitk_accuracy(out, ref, f"{intype} {name}")
+            ret[f"{name} relative_l2"] = relative_l2
+        else:
+            err = checkAllclose(
+                ref.to(dtypes.fp32),
+                out.to(dtypes.fp32),
+                rtol=_RTOL,
+                atol=_ATOL,
+                msg=f"{intype} {name}",
+            )
+        # Logical traffic for the timed scope, not measured HBM traffic:
+        # raw mode writes S BF16 planes; reduction also reads those S planes
+        # and writes the final [M,N] output. Input partitions cover K once.
+        output_io_bytes = (
+            out.nbytes * (2 * splitk + 1) if ret["reduced"] else out.nbytes
         )
-        io_bytes = in_bytes + out.nbytes
+        io_bytes = in_bytes + output_io_bytes
+        ret[f"{name} io_bytes"] = io_bytes
+        ret[f"{name} output_io_bytes"] = output_io_bytes
         ret[f"{name} us"] = round(us, 2)
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(io_bytes / us / 1e6, 2)
@@ -574,7 +670,7 @@ def main():
         "--knl-name",
         dest="knl_name",
         default=None,
-        help="Default: use the a8w8 tuned CSV, falling back to the native heuristic. "
+        help="Default: use the shared a8w8/a8w4 tuned CSV, falling back to the native heuristic. "
         "'auto' makes the selected kernel name explicit; any other value forces "
         "that exact mangled knl_name for all runs (developer debug).",
     )
@@ -594,13 +690,15 @@ def main():
         type=int,
         nargs="+",
         default=None,
-        help="Positive a8w8 split counts (not log2). Unset: use the tuned CSV; "
-        "a config miss or explicit kernel defaults to 1.",
+        help="Power-of-two split counts for a8w8/a8w4 (not log2). Unset: use the tuned CSV; "
+        "a config miss or explicit kernel defaults to 1. Each K partition must be "
+        "a multiple of 128 and at least 512 (768 for a8w4 64x512); "
+        "split count times tile count must not exceed 256. 128x128 requires splitk=1.",
     )
     parser.add_argument(
         "--no-reduce",
         action="store_true",
-        help="Measure ASM GEMM only and compare each BF16 split-K plane independently (a8w8)",
+        help="Measure ASM GEMM only and compare each BF16 split-K plane independently (a8w8/a8w4)",
     )
     args = parser.parse_args()
 
@@ -687,6 +785,8 @@ def main():
             "num_iters",
             "test_graph",
             "num_rotate",
+            "asm io_bytes",
+            "asm output_io_bytes",
         ],
         errors="ignore",
     )

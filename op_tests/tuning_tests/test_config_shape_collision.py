@@ -6,8 +6,8 @@ Cross-file shape-collision guard for tuned config CSVs.
 At runtime ``aiter.jit.core.AITER_CONFIGS.get_config_file`` merges, per family,
 the canonical ``aiter/configs/<name>.csv`` with every
 ``aiter/configs/model_configs/*<name>*.csv``, then ``update_config_files``
-de-duplicates on a key derived from the matching *untuned* CSV's columns and
-**raises** if two rows collide.
+de-duplicates on the family's lookup key (usually derived from the matching
+*untuned* CSV's columns) and **raises** if two rows collide.
 
 A single PR's CI only ever merges *its own* changed file with current ``main``,
 so two PRs that each add the same shape to different model files both pass, then
@@ -73,6 +73,7 @@ FAMILIES = [
         "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
     ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_MXFP8FP4", "asm_mfxp8fp4gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
@@ -251,6 +252,67 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
+
+    def test_mxfp8fp4(self):
+        self._check_family("AITER_CONFIG_GEMM_MXFP8FP4", "asm_mfxp8fp4gemm")
+
+    def test_mxfp8fp4_merge_uses_lookup_key(self):
+        # This family has no "tuned" token in its filename and no untuned
+        # sibling. A changed kernel/split count must still collide on the same
+        # lookup key, while distinct B types, A layouts and shapes coexist.
+        name = "asm_mfxp8fp4gemm"
+        env_name = "AITER_CONFIG_GEMM_MXFP8FP4"
+        row = {
+            "gfx": "gfx1250",
+            "M": 512,
+            "N": 2048,
+            "K": 7168,
+            "b_intype": "mxfp8",
+            "a_preshuffle": 0,
+            "outdtype": "torch.bfloat16",
+            "splitK": 8,
+            "kernelName": "kernel_a",
+            "cu_num": 256,
+            "_tag": "",
+        }
+        variants = (
+            ({}, True),
+            ({"splitK": 4}, True),
+            ({"kernelName": "kernel_b"}, True),
+            ({"cu_num": 304}, True),
+            ({"_tag": "alternate"}, True),
+            ({"b_intype": "mxfp4"}, False),
+            ({"a_preshuffle": 1}, False),
+            ({"M": 513}, False),
+            ({"N": 4096}, False),
+            ({"K": 8192}, False),
+            ({"gfx": "gfx950"}, False),
+            ({"outdtype": "torch.float16"}, False),
+        )
+        for changes, collision in variants:
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp:
+                cfg = os.path.join(tmp, "aiter", "configs")
+                model = os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv")
+                os.makedirs(os.path.dirname(model))
+                for path, saved in (
+                    (os.path.join(cfg, f"{name}.csv"), row),
+                    (model, dict(row, **changes)),
+                ):
+                    with open(path, "w") as f:
+                        writer = csv.DictWriter(f, fieldnames=list(row))
+                        writer.writeheader()
+                        writer.writerow(saved)
+                try:
+                    if collision:
+                        with self.assertRaisesRegex(RuntimeError, "duplicate shape"):
+                            self._resolve(tmp, env_name, name)
+                    else:
+                        merged = self._resolve(tmp, env_name, name)
+                        with open(merged) as f:
+                            self.assertEqual(len(list(csv.DictReader(f))), 2)
+                finally:
+                    core.AITER_ROOT_DIR = self._tmp
+                    _cache_clear()
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")

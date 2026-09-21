@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -15,6 +17,7 @@ from ..jit.core import (
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
     compile_ops,
+    get_asm_dir,
 )
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num
@@ -1431,41 +1434,262 @@ def _mxfp8_mxfp8_gemm_asm(
     kernelName: str | None = None,
     a_preshuffle: int = 1,
     splitk: int = 1,
-) -> None: ...
+) -> None:
+    """Write compact BF16 [splitk, M, N] partials (or [M, N] for splitk=1).
+
+    ``out`` must be contiguous with at least splitk*M*N elements. A workspace
+    slice may have a nonzero storage offset. Only the first splitk*M*N elements
+    from out.data_ptr() are written; extra capacity is untouched. The output
+    shape does not set row/plane strides, and padded/strided views are unsupported.
+    """
 
 
 _MXFP8_GEMM_CONFIG_CACHE: dict = {}
+_MXFP8_GEMM_CONFIG_KEYS = ("gfx", "M", "N", "K", "b_intype", "a_preshuffle", "outdtype")
+_MXFP8_128_MIN_K = 8 * 128  # K128/PF8 prologue
+
+
+def _mxfp8_config_int(value, name, minimum=1):
+    """Parse a saved integer without truncation or overflow at the C++ ABI."""
+    number = float(value)
+    if (
+        isinstance(value, bool)
+        or not math.isfinite(number)
+        or not number.is_integer()
+        or not minimum <= number <= (1 << 31) - 1
+    ):
+        raise ValueError(f"{name} must be an integer in [{minimum}, 2147483647]")
+    return int(number)
+
+
+def _load_mxfp8_gemm_configs(tuned_file):
+    try:
+        table = pd.read_csv(tuned_file).drop_duplicates()
+        missing = {*_MXFP8_GEMM_CONFIG_KEYS, "kernelName", "splitK"} - set(
+            table.columns
+        )
+        if missing:
+            raise ValueError(f"missing columns {sorted(missing)}")
+    except (OSError, UnicodeError, ValueError, pd.errors.ParserError) as exc:
+        logger.warning(
+            "Ignoring MXFP8 GEMM tuned CSV %r; using default dispatch: %s",
+            tuned_file,
+            exc,
+        )
+        return {}
+
+    configs, duplicates = {}, set()
+    for row in table.to_dict("records"):
+        try:
+            for name in ("M", "N", "K"):
+                row[name] = _mxfp8_config_int(row[name], name)
+            row["a_preshuffle"] = _mxfp8_config_int(
+                row["a_preshuffle"], "a_preshuffle", minimum=0
+            )
+            if row["a_preshuffle"] not in (0, 1):
+                raise ValueError("a_preshuffle must be 0 or 1")
+            key = tuple(row[name] for name in _MXFP8_GEMM_CONFIG_KEYS)
+            if key in configs:
+                duplicates.add(key)
+            configs[key] = row
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning("Skipping invalid MXFP8 GEMM row in %r: %s", tuned_file, exc)
+    for key in duplicates:
+        del configs[key]
+        logger.warning(
+            "Ignoring conflicting MXFP8 GEMM rows for %s in %r; using default dispatch",
+            key,
+            tuned_file,
+        )
+    return configs
+
+
+@functools.lru_cache(maxsize=8)
+def _mxfp8_kernel_configs(asm_dir):
+    manifest = Path(asm_dir) / "mxfp8fp4gemm" / "mxfp8fp4gemm.csv"
+    return pd.read_csv(manifest).set_index("knl_name").to_dict("index")
+
+
+def _validate_mxfp8_splitk(M, N, K, splitk, kernel=None):
+    """Shared config/CLI checks matching native splitk_is_valid.
+
+    Without kernel metadata, check only the kernel-independent constraints;
+    native dispatch remains responsible for checking the selected binary.
+    """
+    context = f"splitk={splitk} for M={M}, N={N}, K={K}"
+    if (
+        isinstance(splitk, bool)
+        or not isinstance(splitk, int)
+        or not 1 <= splitk <= (1 << 31) - 1
+    ):
+        raise ValueError(f"{context}: splitk must be a positive C++ int")
+    if splitk == 1:
+        return
+    if splitk & (splitk - 1):
+        raise ValueError(f"{context}: splitk must be a power of two")
+    if M <= 0 or N <= 0 or K <= 0:
+        raise ValueError(f"{context}: M, N and K must be positive")
+    if K % splitk:
+        raise ValueError(f"{context}: splitk must divide K")
+    part_k = K // splitk
+    if part_k % 128:
+        raise ValueError(f"{context}: K/splitk={part_k} must be a multiple of 128")
+    if kernel is None:
+        return
+    tile_m, tile_n = int(kernel["tile_m"]), int(kernel["tile_n"])
+    cluster_x, cluster_y = int(kernel["cluster_x"]), int(kernel["cluster_y"])
+    b_intype = kernel["b_intype"]
+    supports_splitk = (
+        kernel["outtype"] == "bf16"
+        and cluster_x == 4
+        and b_intype in ("mxfp8", "mxfp4")
+        and (
+            (tile_m, tile_n) == (256, 256)
+            and (cluster_y == 4 or (cluster_y == 2 and b_intype == "mxfp8"))
+            or (tile_m, tile_n, cluster_y) == (64, 512, 1)
+        )
+    )
+    label = f"{b_intype} {tile_m}x{tile_n}_{cluster_x}x{cluster_y}"
+    if not supports_splitk:
+        raise ValueError(f"{context}: {label} requires splitk=1")
+    min_k = 768 if tile_m == 64 and b_intype == "mxfp4" else 512
+    if part_k < min_k:
+        raise ValueError(f"{context}: K/splitk={part_k} must be >= {min_k} for {label}")
+    tiles = ((M + tile_m - 1) // tile_m) * ((N + tile_n - 1) // tile_n)
+    if tiles * splitk > 256:
+        raise ValueError(
+            f"{context}: {label} needs splitk * tiles = {splitk} * {tiles} = "
+            f"{tiles * splitk} work units, exceeding 256"
+        )
+
+
+def _validate_mxfp8_tuned_config(config, M, N, K, a_preshuffle, dtype, b_intype):
+    """Check the saved launch before allocating partials; match the native guards."""
+    splitk = _mxfp8_config_int(config["splitK"], "splitK")
+    asm_dir = get_asm_dir()
+    kernel = _mxfp8_kernel_configs(asm_dir)[config["kernelName"]]
+    if (
+        dtype != dtypes.bf16
+        or kernel["outtype"] != "bf16"
+        or kernel["b_intype"] != b_intype
+        or kernel["a_preshuffle"] != int(bool(a_preshuffle))
+    ):
+        raise ValueError("kernel does not match b_intype/a_preshuffle/outdtype")
+    if not (Path(asm_dir) / "mxfp8fp4gemm" / kernel["co_name"]).is_file():
+        raise ValueError(f"kernel code object is missing: {kernel['co_name']}")
+    if M <= 0 or N <= 0 or K <= 0 or N % 16 or K % 128 or (a_preshuffle and M % 2):
+        raise ValueError("shape does not satisfy the kernel alignment requirements")
+    tile_m, tile_n = int(kernel["tile_m"]), int(kernel["tile_n"])
+    cluster_x, cluster_y = int(kernel["cluster_x"]), int(kernel["cluster_y"])
+    if (tile_m, tile_n) == (128, 128):
+        # Empty tiles in a tail cluster still execute page-table prefetches in
+        # both binaries. Match the native full-cluster guard for both A layouts.
+        m_align, n_align = tile_m * cluster_y, tile_n * cluster_x
+        if M % m_align or N % n_align or K < _MXFP8_128_MIN_K:
+            raise ValueError(
+                f"128x128 requires complete clusters: M%{m_align}==0, "
+                f"N%{n_align}==0 and K>={_MXFP8_128_MIN_K}"
+            )
+    _validate_mxfp8_splitk(M, N, K, splitk, kernel)
+    return dict(config, splitK=splitk)
 
 
 @functools.lru_cache(maxsize=1024)
 def get_mxfp8_gemm_config(
     M, N, K, a_preshuffle, dtype=dtypes.bf16, tuned_file=None, *, b_intype="mxfp8"
 ):
-    """Look up MXFP8 activation GEMM configs using HSA B types (mxfp8/mxfp4)."""
+    """Try exact M, then fine/coarse padded-M keys, without padding tensors.
+
+    A candidate must be valid for both its saved shape and the actual shape.
+    Unusable candidates are skipped; no usable candidate means default dispatch.
+    """
     if tuned_file is None:
-        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_MXFP8FP4_FILE
+        try:
+            tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_MXFP8FP4_FILE
+        except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+            # The registry may reject conflicting model CSVs before the loader
+            # can inspect any rows. Preserve automatic-config fallback here too.
+            logger.warning(
+                "Ignoring MXFP8 GEMM tuned config resolution; using default dispatch: %s",
+                exc,
+            )
+            return None
     if tuned_file not in _MXFP8_GEMM_CONFIG_CACHE:
-        _MXFP8_GEMM_CONFIG_CACHE[tuned_file] = (
-            pd.read_csv(tuned_file)
-            .drop_duplicates()
-            .set_index(["gfx", "M", "N", "K", "b_intype", "a_preshuffle", "outdtype"])
-            .to_dict("index")
+        _MXFP8_GEMM_CONFIG_CACHE[tuned_file] = _load_mxfp8_gemm_configs(tuned_file)
+    configs = _MXFP8_GEMM_CONFIG_CACHE[tuned_file]
+    gfx = get_gfx()
+    tried_m = set()
+    for gl in (None, 0, 1):
+        if not configs:
+            break
+        try:
+            lookup_m = M if gl is None else get_padded_m(M, N, K, gl)
+        except (OSError, RuntimeError, OverflowError) as exc:
+            logger.warning(
+                "Cannot resolve MXFP8 GEMM padded M for M:%s N:%s K:%s; "
+                "using default dispatch: %s",
+                M,
+                N,
+                K,
+                exc,
+            )
+            break
+        if lookup_m in tried_m:
+            continue
+        tried_m.add(lookup_m)
+        config = configs.get(
+            (gfx, lookup_m, N, K, b_intype, int(bool(a_preshuffle)), str(dtype))
         )
-    config = _MXFP8_GEMM_CONFIG_CACHE[tuned_file].get(
-        (get_gfx(), M, N, K, b_intype, int(bool(a_preshuffle)), str(dtype))
+        if config is None:
+            continue
+        try:
+            # Do not revive an invalid saved row merely because a smaller
+            # runtime M would happen to satisfy its Split-K work-unit limit.
+            config = _validate_mxfp8_tuned_config(
+                config, lookup_m, N, K, a_preshuffle, dtype, b_intype
+            )
+            if lookup_m != M:
+                config = _validate_mxfp8_tuned_config(
+                    config, M, N, K, a_preshuffle, dtype, b_intype
+                )
+        except (
+            OSError,
+            UnicodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as exc:
+            logger.warning(
+                "Ignoring unusable MXFP8 GEMM tuned row in %r with lookup M:%s "
+                "for actual M:%s N:%s K:%s b_intype:%s a_preshuffle:%s "
+                "(kernelName=%r, splitK=%r); trying remaining candidates "
+                "before default dispatch: %s",
+                tuned_file,
+                lookup_m,
+                M,
+                N,
+                K,
+                b_intype,
+                a_preshuffle,
+                config.get("kernelName"),
+                config.get("splitK"),
+                exc,
+            )
+            continue
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, "
+                f"a_preshuffle:{a_preshuffle}, found lookup M:{lookup_m} in "
+                f"{tuned_file}, kernel name is {config['kernelName']}, "
+                f"splitK is {config['splitK']}!"
+            )
+        return config
+    logger.info(
+        f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, a_preshuffle:{a_preshuffle}, "
+        f"not found usable exact/padded-M config in {tuned_file}, will use default config!"
     )
-    if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, a_preshuffle:{a_preshuffle}, "
-            f"not found tuned config in {tuned_file}, will use default config!"
-        )
-    elif AITER_LOG_TUNED_CONFIG:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, a_preshuffle:{a_preshuffle}, "
-            f"found tuned config in {tuned_file}, kernel name is {config['kernelName']}, "
-            f"splitK is {config['splitK']}!"
-        )
-    return config
+    return None
 
 
 def _resolve_mxfp8_gemm_config(
@@ -1480,6 +1704,12 @@ def _resolve_mxfp8_gemm_config(
     b_intype="mxfp8",
 ):
     # Explicit kernels bypass tuning; an explicit split count overrides the CSV.
+    if splitk is not None and (
+        isinstance(splitk, bool)
+        or not isinstance(splitk, int)
+        or not 1 <= splitk <= (1 << 31) - 1
+    ):
+        raise ValueError("splitk must be a positive C++ int")
     if not kernelName:
         config = get_mxfp8_gemm_config(M, N, K, a_preshuffle, dtype, b_intype=b_intype)
         if config is not None:
@@ -1515,10 +1745,22 @@ def gemm_a8w8_mxfp8(
 ) -> Tensor:
     """gfx1250 MXFP8 x MXFP8 GEMM (a8w8). D[M,N] bf16 = A @ B^T with e8m0 block
     scales. Select kernel and split count from the tuned CSV unless overridden.
-    A config miss uses the native heuristic with ``splitk=1``. Explicit kernels
-    also default to one split. Split counts are literal counts, not log2 values.
-    Supported 256x256 kernels emit BF16 partials, which are summed here to
-    preserve the public [M,N] output."""
+    Try exact M first, then get_padded_m at granularity levels 0 and 1; all other
+    key fields must match exactly. Reuse a row only if its saved and actual shapes
+    satisfy the kernel guards. Lookup does not pad inputs or change output shape.
+    Missing CSVs and invalid tuned rows are logged and discarded as config misses.
+    A config miss uses the native heuristic; an explicit split count is kept,
+    otherwise it defaults to one split. Explicit kernels also default to one
+    split. Invalid explicit split counts raise rather than falling back.
+    Split counts are literal counts, not log2 values. The 256x256 and
+    64x512 kernels support power-of-two splits with K/splitk a multiple of 128
+    and at least 512, subject to splitk * ceil(M/tile_m) * ceil(N/tile_n) <= 256.
+    The 128x128 kernels require splitk=1, K>=1024, and positive M/N multiples
+    of 512 (complete 4x4 clusters) for both A layouts.
+    Supported kernels emit BF16 partials, which are summed here to
+    preserve the public [M,N] output. Each partial is rounded to BF16 before
+    reduction, so results can differ from ``splitk=1``, which rounds only after
+    accumulating the full K dimension."""
     require_gfx1250_asm("gemm_a8w8_mxfp8")
     M = A.shape[0]
     N = B.shape[0]
