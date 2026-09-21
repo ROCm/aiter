@@ -276,12 +276,11 @@ def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
 
     The launch-config half of ``compile_conv3d_implicit``'s asserts, in a
     function that costs nothing to call, so a candidate sweep can filter on it
-    instead of paying a compile per rejected config. ``conv3d_policy`` used to
-    carry its own closed form of the same arithmetic -- the two agreed over all
-    8281 combinations of its enumeration, but nothing made them, and a policy
-    that drifts stricter prunes configs that would have compiled, which shows
-    up as neither an error nor a wrong answer, only as a tuned pick that could
-    have been faster.
+    instead of paying a compile per rejected config. ``conv3d_policy`` asks this
+    rather than carrying its own copy of the arithmetic: a copy that drifted
+    stricter would prune configs that would have compiled, which shows up as
+    neither an error nor a wrong answer, only as a tuned pick that could have
+    been faster.
 
     Only the tile-shape constraints live here. c/groups and the channel padding
     are properties of the problem, not of the launch config, so they stay as
@@ -1051,10 +1050,12 @@ def block_coords(grid, grid_m=None):
 # an over-provisioned grid must not write, plus split-K accumulating into fp32
 # staging with atomics, is what ``store`` does.
 #
-# Only ``n == 1``, contiguous NCDHW, no split-K and a small enough output let
-# the four accumulator values of an MFMA atom land contiguously; that case
-# takes a single 64-bit store and every other one stores element by element.
-# Which case applies is decided once, in the plan.
+# An NCDHW output, no split-K, an output a buffer descriptor still reaches and
+# a ``dhw`` that is a multiple of four let the four accumulator values of an
+# MFMA atom land contiguously; that case takes a single 64-bit store and every
+# other one stores element by element. The batch size does not enter into it --
+# the alignment is what keeps the four rows inside one sample. Which case
+# applies is decided once, in the plan.
 # ---------------------------------------------------------------------------
 
 

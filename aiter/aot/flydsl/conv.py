@@ -25,8 +25,8 @@ the row.
 
 Both output layouts are covered, two conv jobs per CSV row. ``out_ndhwc`` is a
 compile-time parameter because it flips the epilogue -- channels-last output
-gives up the vectorised store on the ``n == 1`` fast path, since a lane's four
-accumulator values become four M rows that are K apart. The *input* layout is
+gives up the vectorised store, since a lane's four accumulator values become
+four M rows that are K apart. The *input* layout is
 not a compile-time parameter: it only decides whether the host runs the
 pre-transpose, so ``NDHWC -> NCDHW`` is served by the same artifact as
 ``NCDHW -> NCDHW``. That makes this 2 variants per row rather than 4.
@@ -69,6 +69,9 @@ Usage::
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
     GPU_ARCHS / ARCH          Restrict compilation to these architectures.
+    AITER_CONV3D_DYN_HW       Variable-resolution artifacts (default 0). Part of
+                              the compile key, so a build and the runtime that
+                              uses its cache have to agree on it.
 """
 
 from __future__ import annotations
@@ -178,9 +181,9 @@ def parse_csv(csv_path: str):
 
             # Both output layouts, because `out_ndhwc` is a compile-time
             # parameter: it flips the epilogue, which gives up the vectorised
-            # store on the n==1 fast path once channels are innermost. The
-            # *input* layout is not -- it only decides whether the host runs the
-            # pre-transpose -- so this is 2 variants per row rather than 4.
+            # store once channels are innermost. The *input* layout is not --
+            # it only decides whether the host runs the pre-transpose -- so
+            # this is 2 variants per row rather than 4.
             tile = (
                 config["tile_m"],
                 config["tile_n"],

@@ -50,7 +50,9 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
     moves with the resolution.
 
     ``s`` is still an argument and must be the real one: ``BIG`` is derived
-    from it, and it seeds the launch. It simply does not reach the kernel.
+    from it, and it seeds the launch. It reaches the kernel as a runtime
+    operand rather than a folded constant, so it stays out of the key the
+    artifact is cached on.
     """
     grid_c = (c + TR_TILE - 1) // TR_TILE
     elem_ty = fx.BFloat16

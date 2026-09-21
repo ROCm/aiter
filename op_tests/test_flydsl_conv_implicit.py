@@ -21,13 +21,12 @@ The rest are the shapes two real VAEs run, traced rather than assumed:
   collapses to an exact conv2d and the model never calls a 3-D kernel, so those
   rows are conv2d -- testing them as conv3d would measure something else.
 
-The coverage the model tables owe is the tuner's own shape set,
-`aiter/configs/model_configs/{wan21,qwenimage}_vae_*_bf16_untuned_conv3d.csv`: at the
-default resolutions every row of all four files is a row of a table here. The Wan
-files hold only the 8 cached conv3d shapes; the Qwen files also hold the encoder
-downsamplers and decoder upsamplers, which is why that table carries stride and
-padding columns. See `docs_flydsl_conv_0826/wan21_vae_conv3d_shapes.md` for the
-derivation.
+The coverage the model tables owe is the tuner's own shape set, in
+`aiter/configs/model_configs/wan21_vae_bf16_untuned_conv3d.csv` (22 rows) and
+`qwenimage_vae_bf16_untuned_conv3d.csv` (16 rows): at the resolution each was
+traced at, every one of those rows is a row of a table here. Both carry the
+resamplers next to the convolutions proper, hence the stride and padding columns;
+only Wan has kT=3 rows, since Qwen runs the same architecture at T=1.
 
 Both VAEs downsample space by 8 and their shapes are generated from the input
 resolution, so the sweeps take one. Time is not a free variable on the Wan side:
@@ -102,7 +101,7 @@ def parse_res(text):
 # feature frames, so the leading time slices hold real features instead of the
 # zeros a causal pad would supply and conv3d(pad(x), w) == conv2d(x, w[:,:,-1])
 # stops holding. Those calls are 67.7% of one encode's convolutions and are what
-# vae_conv_video routes to this kernel.
+# the integration layer routes to this kernel.
 #
 # WanCausalConv3d leaves nn.Conv3d's own padding at (0,0,0) and applies its causal
 # padding itself before calling down, so the model hands the kernel an already
@@ -116,9 +115,9 @@ def parse_res(text):
 # 4 -> 2 -> 1 is the two stride-2 time_conv. So 81 and 17 frames give the same
 # shapes and differ only in how many times each runs.
 #
-# Derived from Wan-AI/Wan2.1-T2V-1.3B-Diffusers vae/config.json (base_dim 96,
-# dim_mult [1,2,4,4], temperal_downsample [F,T,T]); see
-# docs_flydsl_conv_0826/wan21_vae_conv3d_shapes.md.
+# Derived by forward-hook tracing an encode against
+# Wan-AI/Wan2.1-T2V-1.3B-Diffusers vae/config.json (base_dim 96,
+# dim_mult [1,2,4,4], temperal_downsample [F,T,T]).
 def wan_vae_conv3d(height, width, frames):
     """(case, x, weight, calls) for the T>1/cached conv3d of one encode."""
     h, w = _levels(height), _levels(width)
@@ -154,15 +153,17 @@ def wan_vae_conv3d(height, width, frames):
 # `plain2d` are WanResample's spatial downsamplers. WanResample folds time into
 # batch, so these are ordinary nn.Conv2d over N*T images, and the ZeroPad2d((0,1,0,1))
 # ahead of them is a separate Sequential entry -- hence the odd H+1 input and
-# padding=0. vae_conv_video does replace these (0.54-0.86x of torch here). They have no
-# row in the Wan tuned config, so they run on _pick_tile's heuristic.
+# padding=0. The integration layer does replace these (0.54-0.86x of torch here).
+# The Wan tuned config carries them, so they hit a tuned tile at the resolution it
+# was traced at and fall back to _pick_tile's heuristic at any other.
 #
 # `time1x1` is pointwise in space only: kT=3 makes K = C*3, which is why it behaves
-# nothing like the true 1x1 layers it used to be bucketed with. min_spatial_kernel=2
-# leaves it on torch, but it measures 0.41-0.66x through the kernel, i.e. ~0.8 ms per
-# encode at 480x832 and ~1.3 ms at 368x544 left on the table. Both sides here are
-# 12-85 us launch-bound kernels timed L2-warm, and torch's 368x544 number is slower
-# than its larger 480x832 one, so re-measure cleanly before moving the gate.
+# nothing like the true 1x1 layers it used to be bucketed with. The integration
+# layer's spatial-kernel gate leaves it on torch, but it measures 0.41-0.66x through
+# the kernel, i.e. ~0.8 ms per encode at 480x832 and ~1.3 ms at 368x544 left on the
+# table. Both sides here are 12-85 us launch-bound kernels timed L2-warm, and
+# torch's 368x544 number is slower than its larger 480x832 one, so re-measure
+# cleanly before moving the gate.
 #
 # The `_t1` rows are the first chunk (1 frame, no cache) and so run once per encode
 # whatever the clip length -- a different batch/time extent, hence a separate shape.
@@ -328,8 +329,8 @@ def wan_vae_decode(height, width, frames):
 # Qwen-Image VAE -- the same architecture as Wan's (identical vae/config.json:
 # base_dim 96, dim_mult [1,2,4,4], temperal_downsample [F,T,T]), fine-tuned and run
 # at T=1. That degeneracy is the whole story: with one frame and no cache, every
-# time slice of the filter but the last multiplies zeros, so lumen_vae_conv rebinds
-# forward to an exact 2-D convolution
+# time slice of the filter but the last multiplies zeros, so the integration layer
+# rebinds forward to an exact 2-D convolution
 #
 #     conv3d(causal_pad(x), w) == conv2d(x[:,:,0], w[:,:,-1])
 #
@@ -435,7 +436,7 @@ KW_CASES = [
     # Channels-last is the kernel's own layout, and the two sides are independent
     # keywords, so each direction takes its own row: a channels-last input skips
     # the pre-transpose, a channels-last output skips the split-K epilogue's
-    # transpose and, at n == 1 as here, gives up the vectorized store. torch has
+    # transpose and gives up the vectorized store, whatever the batch. torch has
     # no such argument, hence the ref_kw.
     (
         "3d_in_ndhwc",

@@ -78,7 +78,7 @@ BASELINE_TILES = (
 MAX_N_ACC = 32
 
 # Two-wave workgroups exist in the legal space but have too little to overlap
-# global latency with; they are only reachable through ``allow_narrow``.
+# global latency with; only the later ``_RELAXATIONS`` steps let them in.
 MIN_WAVES = 4
 MAX_WAVES = 16
 
@@ -227,10 +227,8 @@ def get_flydsl_conv3d_configs(
     scored.sort(key=lambda item: item[0])
     configs = [config for _, config in scored[:max_configs]]
 
-    # Union in whatever the shipped heuristic could pick, so the sweep always
-    # measures the incumbent and "tuned is never worse than default" holds.
-    #
-    # Every WGM value, not just 1: `_pick_tile` and `_pick_wgm` decide
+    # Union in the incumbent (see BASELINE_TILES), at every WGM value rather
+    # than just 1: `_pick_tile` and `_pick_wgm` decide
     # independently, so pinning the baseline tiles at wgm=1 left the real
     # incumbent out of the sweep wherever the heuristic wanted the L2 swizzle.
     # 384->384 @48x70 is one: the heuristic runs (32,32,1,2) at wgm=8, only

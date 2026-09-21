@@ -12,7 +12,9 @@ Differences from the GEMM tuners, all forced by the operator rather than by
 preference:
 
 * **One backend.** There is no asm/CK/triton alternative for this kernel, so
-  there is no ``libtype`` column and no per-backend task builder.
+  there is no per-backend task builder and no ``--libtype`` flag. The tuned CSV
+  still carries a ``libtype`` column, as the GEMM tables do; this tuner always
+  writes ``flydsl`` into it.
 * **Explicit config columns instead of ``solidx``.** The whole launch config is
   five integers. GEMM stores an index because its asm/CK kernel instances are
   opaque; here an index would only add a way for a reordered candidate list to
@@ -86,7 +88,7 @@ RESULT_LIST = [
 # Readings per shape in the compare benchmark; the gate keeps the fastest.
 RUN_CONFIG_REPS = 3
 
-# Same tolerance as tests/kernels/test_conv3d_implicit.py. The reference is bf16
+# Same tolerance as op_tests/test_flydsl_conv_implicit.py. The reference is bf16
 # rather than fp32 on purpose: the tuner needs to catch a config that computes
 # the wrong thing, not to measure bf16 rounding, and a matching rounding regime
 # keeps err_ratio at ~0 for every correct candidate.

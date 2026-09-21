@@ -8,9 +8,11 @@ at runtime. A shape with no tuned row falls back to the heuristic tile ladder,
 so tuning is an optimization rather than a prerequisite.
 
 Single backend, unlike the GEMM tuners: there is no asm/CK/triton alternative
-for this kernel, so there is no `--libtype` and no `gemm_tuner.py`-style
+for this kernel, so there is no `--libtype` flag and no `gemm_tuner.py`-style
 subprocess wrapper -- that one exists to retry hipBLASLt's GPU faults, which are
 not fixable locally. Here a crash is this repo's own bug and should surface.
+(The tuned CSV does carry a `libtype` column, as the GEMM tables do; this tuner
+always writes `flydsl` into it.)
 The launch config is stored as five explicit integer columns rather than a
 `solidx`, so reordering the candidate list cannot silently invalidate a
 checked-in CSV.
@@ -65,9 +67,9 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
     |gfx950 |256       |...                   |flydsl     |96        |96        |2         |3         |1      |1         |137.3024|conv3d_implicit_t96x96_w2x3_g1|0.0|39.59|1512.16|
 
    `libtype` names the implementation the rest of the row configures, as it does
-   in the GEMM tables. It is a result rather than part of the key: a tuner picks
-   the fastest candidate across the backends it knows and records whose config it
-   wrote, so one shape still owns one row. FlyDSL is the only conv3d backend
+   in the GEMM tables. It is a result rather than part of the key: where a tuner
+   has several backends to choose between, it records whose config won, so one
+   shape still owns one row. FlyDSL is the only conv3d backend
    today, so this tuner always writes `flydsl`; the runtime and the AOT pass skip
    rows naming anything else, and read a table without the column -- or with the
    cell empty -- as all-FlyDSL.
@@ -84,7 +86,11 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 
    The AOT pass (`aiter/aot/flydsl/conv.py`, run from `setup.py` at build time)
    compiles exactly what the tuned CSV holds, so new rows widen AOT coverage and
-   removed rows narrow it. Both it and the runtime build the compile key through
+   removed rows narrow it. `AITER_CONV3D_DYN_HW=1` widens what each of those
+   artifacts then serves -- one covers a layer at any resolution instead of the
+   one it was compiled for -- but it is part of the compile key, so a build and
+   the runtime reading its cache have to agree on it. Tile lookup is unaffected:
+   that still needs an exact 20-column match. Both it and the runtime build the compile key through
    `conv_kernels._implicit_param_from_problem`, so channel padding and field
    order cannot drift between them. `splitK` is the remaining coupling: the
    runtime freezes the tuned row's value instead of re-deriving it, so a row
@@ -133,9 +139,12 @@ Number of GPUs for parallel tuning. Default: all available.
 
 ### `--errRatio`
 Tolerable error ratio against the `torch.nn.functional.conv3d` reference
-(default 0.05). The reference is bf16 rather than fp32 on purpose: the tuner
-needs to catch a config that computes the wrong thing, not to measure bf16
-rounding.
+(default 0.0, not the usual 0.05). The reference is bf16 rather than fp32 on
+purpose: the tuner needs to catch a config that computes the wrong thing, not to
+measure bf16 rounding, and a matching rounding regime puts every correct
+candidate at exactly 0. Raise it only to investigate a specific failure --
+`op_tests/test_flydsl_conv_implicit.py` fails on any mismatched element, so a
+row tuned under a looser bar is a row that test will reject.
 
 ### `--timeout`
 Per-task watchdog in seconds (default 1800). A worker killed by a GPU

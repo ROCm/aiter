@@ -8,7 +8,7 @@ Upstream is FlyDSL ``kernels/conv/conv3d_implicit.py`` and the public entry poin
 still matches its keyword surface, but the body has diverged. aiter-only here:
 ``buffer_atomic_add`` -- which upstream imports from ``kernels/common/``, a
 directory flydsl's wheel does not ship, as with the vendored ``buffer_ops``
-and ``vector`` modules. The tile heuristics and the offline tuned-config
+module. The tile heuristics and the offline tuned-config
 lookup are aiter-only too but live in ``../conv_kernels.py``, mirroring how
 ``tuned_gemm.py`` sits outside ``kernels/gemm_a16w16_gfx950.py``. The NCDHW
 pre-transpose is a second kernel with its own cache, so it lives in
@@ -69,7 +69,8 @@ class Conv3dImplicitParam:
     Every field is a compile-time constant -- the im2col div/mod folding
     against the filter extents and C/groups is where this kernel's performance
     comes from -- so one of these is one artifact, and it is the cache key
-    ``compile_conv3d_implicit`` is memoised on. Build it through
+    ``compile_conv3d_implicit`` is memoised on. ``dyn_hw`` is the one exception
+    and describes itself below. Build it through
     ``make_conv3d_implicit_param``, which supplies the defaults fx.struct
     cannot.
     """
@@ -105,10 +106,12 @@ class Conv3dImplicitParam:
     # a folded immediate; see ``Divisor`` in conv3d_gfx950_utils.
     #
     # d/h/w stay in this struct because the host derives the geometry, the
-    # addressing decisions and the grid from them. What changes is that under
-    # this flag none of them reaches the kernel closure, so the compiled
-    # artifact no longer depends on them -- which is exactly what
-    # ``_shape_agnostic_key`` asserts.
+    # addressing decisions and the grid from them. What changes is that none of
+    # them reaches the kernel closure: the plans carry only the booleans they
+    # imply (``big_in``, ``vec_store`` and the rest) while the extents
+    # themselves arrive as ``ConvExtents``. The artifact is then keyed on a
+    # handful of booleans rather than on one resolution, which is what
+    # ``_assert_shape_agnostic`` checks.
     dyn_hw: fx.Constexpr[bool]
 
 

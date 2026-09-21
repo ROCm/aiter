@@ -353,7 +353,6 @@ def _load_tuned_table():
             )
             return {}
 
-        # Absent on a pre-libtype table, which was FlyDSL-only by construction.
         has_libtype = TUNED_LIBTYPE_COLUMN in df.columns
         skipped_libtypes = {}
 
@@ -1129,9 +1128,9 @@ def flydsl_conv_implicit(
     leads in both, so an unbatched input works either way. Channels-last is the kernel's
     own layout on both sides: an NDHWC input skips the pre-transpose, and an NDHWC output
     is the (npq, K) index space the GEMM already writes, so it also skips the split-K
-    epilogue's transpose. Channels-last output does give up the vectorized store on the
-    ``n == 1`` fast path, since a lane's four accumulator values are four M rows and those
-    are K apart once channels are innermost.
+    epilogue's transpose. Channels-last output does give up the vectorized store, since a
+    lane's four accumulator values are four M rows and those are K apart once channels are
+    innermost.
 
     ``padding`` takes an int, a per-axis tuple, or one of torch's two strings. "valid" is
     no padding. "same" pads so the output keeps the input's spatial extent, which needs

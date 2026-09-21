@@ -121,9 +121,9 @@ class Im2colPlan(NamedTuple):
 def make_im2col_plan(param, geom, cfg):
     """An Im2colPlan for one problem and launch config, or an assertion.
 
-    Takes the problem as the ``Conv3dImplicitParam`` the caller already has,
-    and the grid as the ``ConvGeometry`` it already derived, so the two cannot
-    disagree with what the rest of the kernel was built against.
+    Takes the problem as the ``Conv3dImplicitParam`` the caller already has, and
+    the output geometry as the ``ConvGeometry`` it already derived, so the two
+    cannot disagree with what the rest of the kernel was built against.
 
     The asserts here are the ones about reach: whether the input fits what a
     buffer descriptor addresses, on its own and as rebased per sample or per
