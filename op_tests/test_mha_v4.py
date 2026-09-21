@@ -552,8 +552,9 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
     v = torch.randn_like(q)
     fp8_format = native_fp8_format()
 
+    # mha_v4 smooths K before quantizing; packed callers pass the mean themselves.
     q_quantized, q_descale = quantize_fp8_rotated(q)
-    k_quantized, k_descale = quantize_fp8_rotated(k)
+    k_quantized, k_descale = quantize_fp8_rotated(k, k.float().mean(dim=1).contiguous())
     v_quantized, v_descale = quantize_fp8(v)
     expected = mha_v4_packed(
         q_quantized,

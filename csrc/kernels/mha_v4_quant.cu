@@ -55,6 +55,9 @@ __device__ float swap_thread_data(float data)
 template <typename DTYPE_I, int vec_size = 16>
 __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ out,
                                                          DTYPE_I const* __restrict__ input,
+                                                         float const* __restrict__ mean,
+                                                         const int32_t heads,
+                                                         const int32_t seq_heads,
                                                          const int32_t m,
                                                          const int32_t in_stride,
                                                          const int32_t out_stride)
@@ -79,6 +82,18 @@ __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ ou
 #pragma unroll
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
+
+    // K-smoothing: remove the per-(batch, head, channel) token mean before rotating. Softmax is
+    // shift-invariant in a component shared by every key, but quantization noise is not.
+    if(mean != nullptr)
+    {
+        const int32_t mean_row = (row / seq_heads) * heads + (row % heads);
+        float const* __restrict__ mrow =
+            mean + static_cast<int64_t>(mean_row) * dim + lane * vec_size;
+#pragma unroll
+        for(int i = 0; i < vec_size; i++)
+            af[i] -= mrow[i];
+    }
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -773,7 +788,9 @@ void launch_quant(aiter_tensor_t& out,
 
 } // namespace
 
-void rotate_activation_hd128(aiter_tensor_t& out, const aiter_tensor_t& input)
+void rotate_activation_hd128(aiter_tensor_t& out,
+                             const aiter_tensor_t& input,
+                             const aiter_tensor_t& mean)
 {
     constexpr int32_t dim        = kHeadDim;
     constexpr int32_t block_size = WARP_SIZE;
@@ -802,12 +819,29 @@ void rotate_activation_hd128(aiter_tensor_t& out, const aiter_tensor_t& input)
     const int32_t out_stride = dim;
     const dim3 grid((m + m_block - 1) / m_block);
     HipDeviceGuard device_guard(input.device_id);
+    const float* mean_ptr = nullptr;
+    int32_t heads         = 1;
+    int32_t seq_heads     = m;
+    if(mean.numel() > 0)
+    {
+        AITER_CHECK(mean.dtype() == AITER_DTYPE_fp32, "K mean must be fp32");
+        AITER_CHECK(mean.is_contiguous(), "K mean must be contiguous");
+        AITER_CHECK(mean.dim() == 3 && mean.size(2) == dim, "K mean must be (batch, heads, 128)");
+        AITER_CHECK(input.dim() == 4, "K mean requires BSHD input");
+        mean_ptr  = reinterpret_cast<const float*>(mean.data_ptr());
+        heads     = static_cast<int32_t>(mean.size(1));
+        seq_heads = static_cast<int32_t>(input.size(1)) * heads;
+        AITER_CHECK(static_cast<int32_t>(input.size(2)) == heads, "K mean heads must match input");
+    }
     const hipStream_t stream = aiter::getCurrentHIPStream();
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "rotate_activation_hd128", [&] {
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
         hadamard_rotate_activation_hd128_kernel<DTYPE_I><<<grid, dim3(block_size), 0, stream>>>(
             reinterpret_cast<DTYPE_I*>(out.data_ptr()),
             reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
+            mean_ptr,
+            heads,
+            seq_heads,
             m,
             in_stride,
             out_stride);

@@ -19,7 +19,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
     m.def("rotate_activation_hd128",
           &aiter::torch_itfs::rotate_activation_hd128,
           py::arg("out"),
-          py::arg("input"));
+          py::arg("input"),
+          py::arg("mean"));
     m.def("rotate_activation_mxfp8_quant",
           &aiter::torch_itfs::rotate_activation_mxfp8_quant,
           py::arg("out"),

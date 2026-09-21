@@ -7,8 +7,12 @@
 namespace aiter {
 namespace torch_itfs {
 
-// Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows.
-void rotate_activation_hd128(aiter_tensor_t& out, const aiter_tensor_t& input);
+// Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows. When `mean` is a valid
+// (batch, heads, 128) fp32 tensor its per-(batch, head, channel) values are subtracted first,
+// fusing K-smoothing into the rotation pass; pass an empty tensor to skip it.
+void rotate_activation_hd128(aiter_tensor_t& out,
+                             const aiter_tensor_t& input,
+                             const aiter_tensor_t& mean);
 
 // Rotate hd128 rows and emit token-major MX data plus one E8M0 scale per 32 values.
 void rotate_activation_mxfp8_quant(aiter_tensor_t& out,

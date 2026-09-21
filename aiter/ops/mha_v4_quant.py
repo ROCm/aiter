@@ -60,9 +60,18 @@ def mha_v4_q_multiplier(softmax_scale: float) -> float:
     return softmax_scale * MHA_V4_LOG2E
 
 
-@compile_ops("module_mha_v4_quant", develop=True)
-def rotate_activation_hd128(out: Tensor, input: Tensor) -> None:
+@compile_ops("module_mha_v4_quant", fc_name="rotate_activation_hd128", develop=True)
+def _rotate_activation_hd128(out: Tensor, input: Tensor, mean: Tensor) -> None:
     """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
+
+
+def rotate_activation_hd128(
+    out: Tensor, input: Tensor, mean: Tensor | None = None
+) -> None:
+    """Rotate hd128 rows, first subtracting a (batch, heads, 128) fp32 `mean` when given."""
+    if mean is None:
+        mean = input.new_empty((0,), dtype=torch.float32)
+    _rotate_activation_hd128(out, input, mean)
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -211,12 +220,14 @@ def _quantize_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
-def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Apply normalized hd128 Walsh-Hadamard rotation, then per-tensor FP8 quantize."""
+def quantize_fp8_rotated(
+    input: Tensor, mean: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
+    """Rotate hd128 rows, optionally removing `mean` first, then per-tensor FP8 quantize."""
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
     rotated = torch.empty_like(input)
-    rotate_activation_hd128(rotated, input)
+    rotate_activation_hd128(rotated, input, mean)
     return quantize_fp8(rotated)
 
 

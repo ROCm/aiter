@@ -1022,6 +1022,17 @@ def _launch_mxfp6_fake(
     del out
 
 
+def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
+    """Per-(batch, head, channel) token mean of K, or None for recipes that keep K in BF16.
+
+    Softmax is shift-invariant in a component shared by every key, but quantization noise is not,
+    so removing it is free accuracy. Recipes that never quantize K have nothing to gain.
+    """
+    if kind in (_RawRecipeKind.BF16, _RawRecipeKind.BF16_FP8):
+        return None
+    return k.float().mean(dim=1).contiguous()
+
+
 def _validate_mha_v4_raw_inputs(
     q: Tensor,
     k: Tensor,
@@ -1108,6 +1119,12 @@ def mha_v4(
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
 
+    # FP8 fuses the subtraction into its rotation pass; the others need a materialised K.
+    k_mean = _k_mean(k, recipe.kind)
+    if k_mean is not None and recipe.kind is not _RawRecipeKind.FP8:
+        k = (k.float() - k_mean.unsqueeze(1)).to(k.dtype)
+        k_mean = None
+
     lut_indices: Optional[Tensor] = None  # noqa: UP045
     lut_start: Optional[Tensor] = None  # noqa: UP045
     lut_count: Optional[Tensor] = None  # noqa: UP045
@@ -1138,7 +1155,7 @@ def mha_v4(
         v_quantized, v_descale = quantize_fp8(v)
     elif recipe.kind == _RawRecipeKind.FP8:
         q_quantized, q_descale = quantize_fp8_rotated(q)
-        k_quantized, k_descale = quantize_fp8_rotated(k)
+        k_quantized, k_descale = quantize_fp8_rotated(k, k_mean)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
         elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
