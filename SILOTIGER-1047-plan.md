@@ -753,6 +753,16 @@ regressed 18.65 → 19.60 us at ``M=1`` and 21.15 → 22.82 us at ``M=8``;
 ``M=512`` was flat at 513.29 → 513.31 us. Keep decode token-major V:
 eliminating its shuffle-free scalar stores is not worth the PV-read cost.
 
+**Do not retry** decode-only ``[BLOCK_N, D]`` V LDS plus
+``LDSReadTrans16_64b`` ``make_tiled_copy_B`` PV on
+``(16, 16):(1, D)``. GPU 6 / gfx950 stayed exact and did emit
+``ds_read_b64_tr_b16`` (4) with packed V stores (``ds_write_b16`` 20 → 4,
+``ds_write_b128`` 3 → 5, VGPR 71 → 69), but width-2051 ``L=512``
+regressed 18.65 → 19.16 us at ``M=1`` and 21.15 → 22.35 us at ``M=8``;
+``M=512`` was flat at 513.29 → 512.71 us. This is not the earlier
+hand-rolled ``(n0+lane_m%4)*D + (d-lane_m%4)`` miss. Keep token-major
+decode V: a correct transpose PV-B does not buy back the layout change.
+
 **Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
 ``4 < M * Hk < 32``. ``M=8`` stayed correct (``err=0``) but width-2051
 ``L=512`` went 22.7 → 33.5 us; ``M=1`` and prefill were flat. Keep that
