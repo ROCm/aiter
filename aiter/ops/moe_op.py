@@ -23,10 +23,6 @@ def _topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
-    hidden_states: Tensor | None = None,
-    gate_weight: Tensor | None = None,
-    shared_expert_scale: float = 1.0,
-    shared_expert_base: int = -1,
 ) -> None: ...
 
 
@@ -38,26 +34,17 @@ def topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
-    hidden_states: Tensor | None = None,
-    gate_weight: Tensor | None = None,
-    shared_expert_scale: float = 1.0,
-    shared_expert_base: int = -1,
 ) -> None:
-    # Option A ("fuse-gate") mode: when gate_weight is provided, the kernel computes
-    # the shared-expert logit in-kernel as sigmoid(shared_expert_scale * hidden @ gate_weight.T)
-    # and writes the shared id (shared_expert_base + s) itself. In that mode gating_output
-    # carries ONLY the routed experts, so num_routing_experts must not subtract the shared.
-    fuse_gate = gate_weight is not None
-    num_experts_total = gating_output.shape[-1]
-    num_tokens = gating_output.numel() // num_experts_total
-    num_routing_experts = (
-        num_experts_total
-        if (fuse_gate or num_shared_experts == 0)
-        else num_experts_total - num_shared_experts
-    )
     # The softmax workspace is only touched on the non-power-of-2 / >256-expert
     # path, but is always allocated here (torch caching allocator) and passed in so
     # the C side stays torch-free. Size logic mirrors the original C implementation.
+    num_experts_total = gating_output.shape[-1]
+    num_tokens = gating_output.numel() // num_experts_total
+    num_routing_experts = (
+        num_experts_total - num_shared_experts
+        if num_shared_experts > 0
+        else num_experts_total
+    )
     is_pow_2 = (
         num_routing_experts != 0
         and (num_routing_experts & (num_routing_experts - 1)) == 0
@@ -68,6 +55,64 @@ def topk_softmax(
         workspace_size, dtype=dtypes.fp32, device=gating_output.device
     )
     _topk_softmax(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        softmax_workspace,
+        need_renorm,
+        num_shared_experts,
+        shared_expert_scoring_func,
+    )
+
+
+@compile_ops("module_moe_asm", fc_name="topk_softmax_fused_shared_gate", develop=True)
+def _topk_softmax_fused_shared_gate(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    softmax_workspace: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int,
+    shared_expert_scoring_func: str,
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    shared_expert_scale: float,
+    shared_expert_base: int,
+) -> None: ...
+
+
+def topk_softmax_fused_shared_gate(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int,
+    shared_expert_scoring_func: str,
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    shared_expert_scale: float = 1.0,
+    shared_expert_base: int = -1,
+) -> None:
+    # Option A ("fuse-gate"): gating_output holds ONLY routed experts; the shared
+    # logit is computed in-kernel as
+    #   sigmoid(hidden_states @ gate_weight.T) * shared_expert_scale
+    # (scale applied AFTER sigmoid) and the shared id (shared_expert_base + s) is
+    # written by the kernel. Output buffers are width topk + num_shared_experts.
+    num_routing_experts = gating_output.shape[-1]
+    num_tokens = gating_output.numel() // num_routing_experts
+    is_pow_2 = (
+        num_routing_experts != 0
+        and (num_routing_experts & (num_routing_experts - 1)) == 0
+    )
+    needs_workspace = (not is_pow_2) or num_routing_experts > 256
+    workspace_size = num_tokens * num_routing_experts if needs_workspace else 0
+    softmax_workspace = torch.empty(
+        workspace_size, dtype=dtypes.fp32, device=gating_output.device
+    )
+    _topk_softmax_fused_shared_gate(
         topk_weights,
         topk_indices,
         token_expert_indices,
