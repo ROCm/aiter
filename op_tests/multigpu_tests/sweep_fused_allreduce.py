@@ -142,6 +142,13 @@ FUSION_PAIRS = {
     "fly_1stage": (FLY_1STAGE, "separate_fly1s"),
     "fly_ring": (FLY_RING, "separate_flyring"),
     "fly_mesh": (FLY_MESH, "separate_flymesh"),
+    # The shipped policy against itself: same size->family rule on both sides,
+    # so this row is the fusion gain production actually gets rather than the
+    # gain one hand-pinned schedule would get. Every other entry above pins a
+    # schedule, so their fused and separate sides are guaranteed to match; here
+    # they are only guaranteed to match *if the two policies agree*, which is
+    # itself worth seeing.
+    "fly_auto": (("fused_fly_auto",), "separate_fly_auto"),
 }
 
 FLYDSL_FUSED = FLY_1STAGE + FLY_RING + FLY_MESH
@@ -152,6 +159,12 @@ FLYDSL_SEPARATE = ("separate_fly1s", "separate_flyring", "separate_flymesh")
 #: chooses between them, and counting it as a candidate would double-count.
 #: Needs AITER_FLY_AR=1 in the environment or its column comes back n/a.
 FLYDSL_AUTO = ("fused_fly_auto",)
+#: Its two-launch baseline -- `FlyDSLAllReduce` plus a standalone norm. Kept out
+#: of `FLYDSL_SEPARATE` for the same reason `FLYDSL_AUTO` is kept out of
+#: `FLYDSL_FUSED`: it is the policy, not another schedule to compare, and
+#: counting it alongside separate_fly1s/flyring/flymesh would double-count
+#: whichever of them the policy chose. Same AITER_FLY_AR=1 requirement.
+FLYDSL_AUTO_SEPARATE = ("separate_fly_auto",)
 AITER_FUSED = ("fused_cdr_1stage", "fused_cdr_2stage", "fused_qr_int4", "fused_qr_fp8")
 AITER_SEPARATE = ("separate_cdr", "separate_rccl", "separate_qr_int4")
 #: aiter candidates with no accuracy loss (``Candidate.exact`` in the bench).
@@ -165,6 +178,7 @@ CANDIDATES = sorted(
     | {sep for _fused, sep in FUSION_PAIRS.values()}
     | set(FLYDSL_FUSED)
     | set(FLYDSL_AUTO)
+    | set(FLYDSL_AUTO_SEPARATE)
     | set(AITER_FUSED)
     | {"separate_rccl"}  # library reference, free to carry
 )

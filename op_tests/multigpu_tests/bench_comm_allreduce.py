@@ -54,11 +54,13 @@ question instead: all-reduce + residual add + RMSNorm.
 | ``fused_qr_fp8``/``_int4`` | ``qr_all_reduce_rmsnorm`` per codec | yes |
 | ``fused_fly_ring``    | FlyDSL quantized **ring** with the epilogue fused | yes |
 | ``fused_fly_mesh``    | same, mesh schedule                     | yes |
+| ``fused_fly_auto``    | ``FlyDSLAllReduceRMSNorm`` -- the shipped fused policy | yes |
 | ``separate_cdr``      | ``cross_device_reduce`` + ``rmsnorm2d_fwd_with_add`` | no |
 | ``separate_rccl``     | ``dist.all_reduce`` + ditto             | no |
 | ``separate_fly1s``    | plain FlyDSL one-shot + ditto           | no |
 | ``separate_flyring``  | plain FlyDSL ring + ditto               | no |
 | ``separate_flymesh``  | plain FlyDSL mesh + ditto               | no |
+| ``separate_fly_auto`` | ``FlyDSLAllReduce`` -- the shipped plain policy -- + ditto | no |
 | ``separate_qr_int4``  | ``quick_all_reduce`` + ditto            | no |
 
 ``fused_fly_ring`` against ``separate_flyring`` is the pair this fusion exists
@@ -943,12 +945,47 @@ CANDIDATES = (
         sep_ar="flyring",
         algorithm="mesh",
     ),
+    # `fused_fly_auto`'s own two-launch baseline: FlyDSLAllReduce followed by a standalone norm.
+    Candidate(
+        "separate_fly_auto",
+        "separate",
+        14.0,
+        False,
+        fusion=True,
+        sep_ar="flyauto",
+    ),
 )
-CANDIDATE_KEYS = [c.key for c in CANDIDATES]
 PRIMARY = "cdr"  # the kernel we ship, and the default baseline
 # The fused-mode counterpart: the traced kernel, i.e. what production runs today.
 FUSION_PRIMARY = "fused_cdr_1stage"
 FUSION_MODES = ("none", "ar_rmsnorm")
+
+
+def mode_keys(fusion: str) -> list[str]:
+    """Candidate keys belonging to *fusion*, in declaration order.
+
+    The two modes compute different functions and are graded against different
+    references, so a sweep is always wholly one or wholly the other. This is the
+    one definition of "which half"; both the ``-c``/``-b`` choices and the
+    default key set derive from it.
+    """
+    return [c.key for c in CANDIDATES if c.fusion == (fusion != "none")]
+
+
+def _wants_flyauto(keys) -> bool:
+    """Whether *keys* needs the plain ``FlyDSLAllReduce`` dispatcher built.
+
+    Two rows reach it and they are in different families: ``fly_auto`` is the
+    policy measured directly, and ``separate_fly_auto`` is that same policy
+    carrying a two-launch baseline under ``--fusion``.
+    """
+    ks = set(keys)
+    return any(
+        c.key in ks and (c.family == "flyauto" or c.sep_ar == "flyauto")
+        for c in CANDIDATES
+    )
+
+
 # RMSNorm epsilon, matching the value in the Qwen3-235B trace's call signature.
 FUSION_EPS = 1e-6
 
@@ -1099,6 +1136,13 @@ def applicable(
         if cand.sep_ar == "qr":
             return world_size in _QR_WORLDS and dtype in _QR_DTYPES
         if cand.sep_ar == "flyring":
+            return (
+                HAS_FLY_INT4
+                and get_gfx() in _FLY_ARCHS
+                and world_size in _FLY_WORLDS
+                and dtype == dtypes.bf16
+            )
+        if cand.sep_ar == "flyauto":
             return (
                 HAS_FLY_INT4
                 and get_gfx() in _FLY_ARCHS
@@ -1469,6 +1513,8 @@ def _variant_of(
             eng = fly1s.get(cand.fly1s_cfg)
         elif cand.sep_ar == "flyring":
             eng = fly.get(cand.fly_cfg)
+        elif cand.sep_ar == "flyauto":
+            eng = flyauto
         else:
             eng = None
         return eng.variant(int(nbytes)) if eng is not None else None
@@ -1491,13 +1537,17 @@ def _ran_exact(cand: Candidate, flyauto, nbytes: int) -> bool:
     the candidate names one kernel. ``fly_auto`` names a *policy*: it dispatches
     to the bit-exact one-shot below its ceiling and to a quantized mesh/ring
     above it, so a single ``Candidate.exact`` flag cannot describe it.
+    ``separate_fly_auto`` drives the same policy object and needs the same
+    treatment -- it is the one ``separate`` row whose kernel is not fixed.
 
     ``Candidate.exact`` stays the static answer and still drives the accuracy
     *floor*: ``fly_auto``'s floor has to stay the quantized one, since one
     column spans both accuracy classes and the floor has to admit the worst of
     them.
     """
-    if cand.family != "flyauto":
+    if cand.family != "flyauto" and not (
+        cand.family == "separate" and cand.sep_ar == "flyauto"
+    ):
         return cand.exact
     # The policy object is the only thing that knows which family this payload
     # reaches; "oneshot" is the exact one (bf16 widened to fp32, accumulated in
@@ -1595,6 +1645,7 @@ def _build_fused_thunks(
     fly1s,
     fly1s_rms,
     flyqr_rms,
+    flyauto,
     fused_flyauto,
     group,
     x,
@@ -1697,6 +1748,12 @@ def _build_fused_thunks(
 
                 def _ar(b=ar_buf, eng=fly[cand.fly_cfg]):
                     eng.allreduce(x, b)
+                    return b
+
+            elif cand.sep_ar == "flyauto":
+
+                def _ar(b=ar_buf, comm=flyauto):
+                    comm.fly_all_reduce(x, out=b)
                     return b
 
             else:
@@ -1911,14 +1968,18 @@ def _bench_shape(
             c.family == "separate" and c.sep_ar == "flyring" and c.fly_cfg not in fly
         )
         # flyauto's window is dynamic (depends on AITER_FLY_AR_ACCURACY, only
-        # known once the object exists), unlike every other family's static
+        # known once the object exists) -- for both rows that drive it,
+        # `fly_auto` and `separate_fly_auto` -- unlike every other family's static
         # applicable() check -- and under the default accuracy=exact policy it
         # is a real "n/a" above oneshot_max, since that policy builds no
         # mesh/ring engine at all. should_fly_all_reduce is the one predicate
         # that already knows this; calling fly_all_reduce without checking it
         # first is a KeyError on any shape past the ceiling.
         and not (
-            c.family == "flyauto"
+            (
+                c.family == "flyauto"
+                or (c.family == "separate" and c.sep_ar == "flyauto")
+            )
             and (flyauto is None or not flyauto.should_fly_all_reduce(x))
         )
         and not (
@@ -1938,6 +1999,7 @@ def _bench_shape(
             fly1s=fly1s,
             fly1s_rms=fly1s_rms,
             flyqr_rms=flyqr_rms,
+            flyauto=flyauto,
             fused_flyauto=fused_flyauto,
             group=group,
             x=x,
@@ -1972,43 +2034,82 @@ def _bench_shape(
             else production_path(ca_comm, qr_comm, x, tp_size, prod_regime)
         ),
     }
-    for cand in cands:
-        # Barrier before each timed region so the measurement reflects the
-        # kernel rather than accumulated rank skew. Production time is higher:
-        # in the DSv4 trace the 1-stage kernel spends most of its duration
-        # spinning in start_sync waiting for peers
-        # (docs/communication_kernels.md §8.6 item 3).
+
+    def _time(thunk, label):
+        """Time *thunk*, returning ``(what it produced, us)``.
+
+        One helper for every timed region in this function so the candidates and
+        the norm-only reference below are measured identically -- ``comms us``
+        subtracts one from the other, which is only meaningful if the harness is
+        held constant.
+
+        Barrier first, so the measurement reflects the kernel rather than
+        accumulated rank skew. Production time is higher: in the DSv4 trace the
+        1-stage kernel spends most of its duration spinning in start_sync
+        waiting for peers (docs/communication_kernels.md §8.6 item 3).
+
+        hipEvent timing rather than run_perftest's default torch-profiler path.
+        Ranks are spawned children, and once the parent has initialized HIP --
+        which `import aiter` does at module scope -- some ROCm builds hand the
+        children a profiler that records CPU ops but no GPU activity. That is
+        silent for RCCL (an aten op with 0 device time) and fatal for the
+        custom-AR candidates, which register no aten op at all: the event table
+        comes back empty and get_trace_perf() raises on the missing
+        host_time_sum column. Events are also the honest metric here -- they
+        bracket the whole collective, including the start_sync spin the
+        profiler's per-kernel device time hides.
+
+        Under `graph`, `_bench_graph` warms, captures, times the replay and
+        hands back the output a **replay** produced, so the caller's SQNR and
+        allclose gates cover the captured path rather than an eager re-run.
+        """
         dist.barrier(group=group)
         torch.cuda.synchronize()
-        # hipEvent timing rather than run_perftest's default torch-profiler
-        # path. Ranks are spawned children, and once the parent has initialized
-        # HIP -- which `import aiter` does at module scope -- some ROCm builds
-        # hand the children a profiler that records CPU ops but no GPU activity.
-        # That is silent for RCCL (an aten op with 0 device time) and fatal for
-        # the custom-AR candidates, which register no aten op at all: the event
-        # table comes back empty and get_trace_perf() raises on the missing
-        # host_time_sum column. Events are also the honest metric here -- they
-        # bracket the whole collective, including the start_sync spin the
-        # profiler's per-kernel device time hides.
         if timing == "graph":
-            # `_bench_graph` warms, captures, times the replay and hands back
-            # the output a replay produced -- so the SQNR/allclose gates below
-            # cover the captured path rather than an eager re-run.
-            got, us = _bench_graph(
-                thunks[cand.key],
+            return _bench_graph(
+                thunk,
                 num_iters=num_iters,
                 num_warmup=num_warmup,
                 inner=graph_inner,
                 group=group,
-                label=f"{cand.key} tp{tp_size} {tokens}x{hidden}",
+                label=label,
             )
-        else:
-            got, us = run_perftest(
-                thunks[cand.key],
-                num_iters=num_iters,
-                num_warmup=num_warmup,
-                use_cuda_event=True,
-            )
+        return run_perftest(
+            thunk, num_iters=num_iters, num_warmup=num_warmup, use_cuda_event=True
+        )
+
+    if fused:
+        # The epilogue on its own, so a fused row's comms cost can be read
+        # separately from the norm its `us` also covers. Timed through the same
+        # path as every candidate -- subtracting a number measured another way
+        # would be subtracting a different harness, not a different kernel.
+        #
+        # Per shape rather than per candidate: it is the same kernel on the same
+        # shape whoever ran the all-reduce, so one measurement serves every row
+        # and the sweep pays for it once.
+        from aiter import rmsnorm2d_fwd_with_add
+
+        # Its own buffers, so nothing aliases a candidate's output. `src` is
+        # never read for its values -- only its shape and dtype reach the
+        # kernel's cost.
+        norm_out = torch.empty_like(x)
+        norm_src = torch.empty_like(x)
+        norm_res_out = torch.empty_like(x)
+
+        # Bound as defaults rather than captured, matching every thunk in
+        # `_build_fused_thunks`.
+        def _norm_only(
+            o=norm_out, src=norm_src, ro=norm_res_out, res=residual, w=weight
+        ):
+            rmsnorm2d_fwd_with_add(o, src, res, ro, w, FUSION_EPS)
+            return o
+
+        _, ret["norm_us"] = _time(
+            _norm_only, f"norm-only tp{tp_size} {tokens}x{hidden}"
+        )
+
+    for cand in cands:
+        got, us = _time(thunks[cand.key], f"{cand.key} tp{tp_size} {tokens}x{hidden}")
         # In fused mode a thunk returns (out, residual_out); `out` carries the
         # headline columns and residual_out is checked separately below.
         res_got = None
@@ -2321,11 +2422,12 @@ def _worker(
     # Production dispatch, built last so its three internal engines exchange
     # handles after every pinned one -- the exchange is a collective and the
     # order has to match across ranks. It self-disables unless AITER_FLY_AR is
-    # set, which main() does when this row is in the sweep, alongside
+    # set, which main() does when either row that drives it is in the sweep --
+    # `fly_auto` or, under --fusion, `separate_fly_auto` -- alongside
     # AITER_FLY_AR_ACCURACY from --fly-accuracy.
     flyauto = None
     if (
-        any(c.family == "flyauto" and c.key in keys for c in CANDIDATES)
+        _wants_flyauto(keys)
         and HAS_FLY_INT4
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
@@ -2501,6 +2603,11 @@ def _row(tp_size, tokens, hidden, dtype, rank_rets):
         "naive": predicted_kernel(tp_size, nbytes, use_new=False),
         "prod path": rank_rets[0]["prod"],
     }
+    if "norm_us" in rank_rets[0]:
+        # `max`, matching how every candidate's `us` is reduced below. Any other
+        # reduction would subtract a number drawn from a different rank
+        # population than the one it is subtracted from.
+        row["norm us"] = max(r["norm_us"] for r in rank_rets)
     for cand in CANDIDATES:
         key = f"{cand.key}_us"
         if key not in rank_rets[0]:
@@ -2798,6 +2905,9 @@ def case_tables(df, keys, baseline: str):
             row = {"candidate": k, "us": us}
             if base_us is not None:
                 row[f"vs {baseline}"] = base_us / us
+            comms = _comms_us(r, k)
+            if comms is not None:
+                row["comms us"] = comms
             row["SQNR dB"] = r.get(f"{k} SQNR dB", float("nan"))
             row["busbw GB/s"] = r.get(f"{k} busbw GB/s", float("nan"))
             spread = r.get(f"{k} spread us")
@@ -2849,11 +2959,15 @@ def _roof(row, key, measured):
     the same algorithm it had chosen -- so picking a better one than the model
     put ``eff`` above 1.0. The roof is now the best algorithm for that many
     bytes, which is a bound a candidate cannot legitimately beat.
+
+    The row's ``variant`` goes to ``wire_bytes`` so the ``*fly_auto`` policy
+    rows are sized by the family they actually picked here. Must stay identical
+    to what ``measure_roofline`` requested, or the lookup misses and the cell
+    reads ``nan``.
     """
     nbytes = int(row["_nbytes"])
-    return measured.get(
-        (int(row["TP"]), tbr.wire_bytes(nbytes, key) if key else nbytes)
-    )
+    wire = tbr.wire_bytes(nbytes, key, row.get(f"{key} variant")) if key else nbytes
+    return measured.get((int(row["TP"]), wire))
 
 
 def _roof_us(row, key, measured):
@@ -2868,6 +2982,19 @@ def _eff(row, key, us, measured):
         return float("nan")
     roof = _roof_us(row, key, measured)
     return roof / us if roof is not None else float("nan")
+
+
+def _comms_us(row, key):
+    """*key*'s time with the RMSNorm epilogue subtracted, or None.
+
+    ``None`` outside ``--fusion``, where there is no epilogue and ``us`` is
+    already the collective alone.
+    """
+    norm = row.get("norm us")
+    us = row.get(f"{key} us")
+    if norm is None or not pd.notna(norm) or us is None or not pd.notna(us):
+        return None
+    return us - norm if us > norm else float("nan")
 
 
 def _prod_candidate_key(prod_path: str) -> str | None:
@@ -3071,6 +3198,27 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
     return pd.DataFrame(rows)
 
 
+def _warn_unpriced(df, live) -> None:
+    """Name any candidate whose wire size nobody has declared."""
+    unpriced = sorted(
+        {
+            k
+            for k in live
+            for _, r in df.iterrows()
+            if pd.notna(r[f"{k} us"])
+            and tbr.wire_ratio(k, r.get(f"{k} variant")) is None
+        }
+    )
+    if unpriced:
+        logger.warning(
+            "roofline: no WIRE_RATIO entry for %s -- graded as if each sends "
+            "its payload verbatim. Correct for an exact candidate, and ~1/ratio "
+            "too generous for a quantizing one. Add them to "
+            "transferbench_roofline.WIRE_RATIO.",
+            ", ".join(unpriced),
+        )
+
+
 def measure_roofline(df, keys, *, binary, cus, iters, warmup):
     """Run TransferBench once per TP and return the ``(tp, wire_bytes,
     pattern) -> us`` lookup that ``roofline_table`` and ``summary_table`` both
@@ -3082,6 +3230,7 @@ def measure_roofline(df, keys, *, binary, cus, iters, warmup):
     every TP failed, so callers can skip the roofline entirely.
     """
     live = [k for k in keys if f"{k} us" in df.columns]
+    _warn_unpriced(df, live)
 
     # (tp, wire_bytes, pattern) -> us. Collect every distinct request first so
     # each TP costs exactly one process launch no matter how many shapes and
@@ -3094,7 +3243,7 @@ def measure_roofline(df, keys, *, binary, cus, iters, warmup):
             requests.add(nbytes)
             for k in live:
                 if pd.notna(r[f"{k} us"]):
-                    requests.add(tbr.wire_bytes(nbytes, k))
+                    requests.add(tbr.wire_bytes(nbytes, k, r.get(f"{k} variant")))
         logger.info(
             "TransferBench: TP%d, %d distinct byte count(s) x %d algorithm(s)",
             tp_size,
@@ -3145,6 +3294,22 @@ def roofline_table(df, keys, measured):
     ``roof algo`` is worth reading next to the ``kernel`` column: where they
     disagree, the dispatch picked an algorithm this fabric does not favour.
 
+    Under ``--fusion`` each candidate gets a second column, ``<cand> comms
+    eff``, and the pair is a **band** rather than two competing estimates. The
+    roof models the collective only, while ``us`` also covers the residual add
+    and the RMSNorm, so:
+
+    * ``eff`` = ``roof / us`` is a **lower** bound: the denominator includes
+      epilogue work the numerator does not price.
+    * ``comms eff`` = ``roof / (us - norm us)`` is an **upper** bound for a
+      genuinely fused kernel, which overlaps the norm with the collective --
+      subtracting a standalone norm removes more than fusion spends.
+
+    The true comms efficiency of a fused row sits between them, and how wide
+    the band is *is itself the reading*: a narrow band means the epilogue is
+    cheap relative to the collective, a wide one means the row is being judged
+    mostly on work this roof does not model.
+
     *measured* is the lookup from ``measure_roofline``.
     """
     out = df[[c for c in ID_COLUMNS if c in df]].copy()
@@ -3157,6 +3322,9 @@ def roofline_table(df, keys, measured):
         for u, n in zip(out["roof us"], df["_nbytes"])
     ]
     out["roof algo"] = [x.algo if x is not None else "-" for x in roofs]
+    fused = "norm us" in df.columns
+    if fused:
+        out["norm us"] = df["norm us"]
     for k in live:
         # None (-> "n/a") when the candidate does not apply to this row;
         # float nan (-> "nan") when it does but the roofline point for it
@@ -3167,6 +3335,16 @@ def roofline_table(df, keys, measured):
             for _, r in df.iterrows()
         ]
         out[f"{k} eff"] = pd.Series(effs, dtype=object, index=out.index)
+        if fused:
+            comms = [
+                (
+                    _eff(r, k, _comms_us(r, k), measured)
+                    if pd.notna(r[f"{k} us"])
+                    else None
+                )
+                for _, r in df.iterrows()
+            ]
+            out[f"{k} comms eff"] = pd.Series(comms, dtype=object, index=out.index)
     return out
 
 
@@ -3339,6 +3517,10 @@ def main():
         return
 
     visible = torch.cuda.device_count()
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--fusion", choices=FUSION_MODES, default="none")
+    mode = pre.parse_known_args()[0].fusion
+    mode_candidates = mode_keys(mode)
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description=__doc__,
@@ -3389,9 +3571,18 @@ def main():
         "-c",
         "--candidates",
         nargs="*",
-        choices=CANDIDATE_KEYS,
+        choices=mode_candidates,
+        metavar="CANDIDATE",
         default=None,
-        help="restrict the candidate set (default: everything applicable)",
+        help="restrict the candidate set (default: everything applicable).\n"
+        f"Scoped to --fusion {mode}; pass --list-candidates to print the\n"
+        "names this mode accepts, grouped by family.",
+    )
+    parser.add_argument(
+        "--list-candidates",
+        action="store_true",
+        help="print the candidate keys this --fusion mode accepts, grouped by\n"
+        "family, and exit without touching a GPU.",
     )
     parser.add_argument(
         "--fly-accuracy",
@@ -3501,6 +3692,9 @@ def main():
         "kernel in the Qwen3-235B MXFP4 decode trace. The fused_* rows are the\n"
         "kernels that genuinely fuse; the separate_* rows are the two-launch\n"
         "baselines (all-reduce, then rmsnorm2d_fwd_with_add) they must beat.\n"
+        "Also times the norm alone once per shape ('norm us'), so each row\n"
+        "gets a 'comms us' with the epilogue subtracted -- one extra timed\n"
+        "region per shape, and what makes --roofline meaningful here.\n"
         "Default 'none' leaves every existing invocation untouched.",
     )
     parser.add_argument(
@@ -3536,7 +3730,8 @@ def main():
     parser.add_argument(
         "-b",
         "--baseline",
-        choices=CANDIDATE_KEYS,
+        choices=mode_candidates,
+        metavar="CANDIDATE",
         default=None,
         help="candidate to measure the others against. Adds a\n"
         "'<cand> vs <baseline>' column per candidate, where > 1.0 means the\n"
@@ -3565,23 +3760,29 @@ def main():
         "sweep covers more than one.",
     )
     args = parser.parse_args()
+    # From args.fusion rather than the pre-pass's `mode`, so this is authoritative
+    # even if the two ever drift.
+    mode_set = set(mode_keys(args.fusion))
+    if args.list_candidates:
+        print(f"--fusion {args.fusion} accepts:")
+        for fam in dict.fromkeys(c.family for c in CANDIDATES if c.key in mode_set):
+            names = [c.key for c in CANDIDATES if c.family == fam and c.key in mode_set]
+            print(f"  {fam:<14} {', '.join(names)}")
+        return
     # Mode-dependent default, resolved here so --help can describe both modes.
     if args.baseline is None:
         args.baseline = FUSION_PRIMARY if args.fusion != "none" else PRIMARY
     if args.graph_inner < 1:
         parser.error("--graph-inner must be positive")
-    fused_keys = {c.key for c in CANDIDATES if c.fusion}
     if args.candidates:
-        wrong = [
-            k for k in args.candidates if (k in fused_keys) != (args.fusion != "none")
-        ]
+        wrong = [k for k in args.candidates if k not in mode_set]
         if wrong:
             parser.error(
                 f"--fusion {args.fusion} cannot run {', '.join(wrong)}: fused and "
                 "plain candidates compute different things and are graded against "
                 "different references, so they never share a sweep."
             )
-    if (args.baseline in fused_keys) != (args.fusion != "none"):
+    if args.baseline not in mode_set:
         parser.error(
             f"--baseline {args.baseline} does not belong to --fusion {args.fusion}"
         )
@@ -3611,9 +3812,7 @@ def main():
         )
 
     # Default to the half of the candidate list that matches the mode.
-    keys = args.candidates or sorted(
-        k for k in CANDIDATE_KEYS if (k in fused_keys) == (args.fusion != "none")
-    )
+    keys = args.candidates or sorted(mode_set)
 
     # Resolve the binary before spawning anything: a missing TransferBench
     # should cost a warning at startup, not a full sweep followed by one.
@@ -3630,7 +3829,7 @@ def main():
             logger.info("TransferBench: using %s", roofline_bin)
     # Remember what the deployment would do before overriding the environment
     # for our own QR candidates; `prod path` is reported against this value.
-    if any(c.family == "flyauto" for c in CANDIDATES if c.key in keys):
+    if _wants_flyauto(keys):
         # FlyDSLAllReduce is opt-in; set it before the ranks are spawned so the
         # children inherit it. Unlike _QR_ENV this does not change `prod path`,
         # which reports the custom-AR/quick-reduce dispatch only.
