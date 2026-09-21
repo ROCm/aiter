@@ -11,7 +11,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -36,6 +36,9 @@ DEFAULT_BATCHES = [4, 8, 16, 32, 64, 128]
 DEFAULT_CTX_LENS = [2048, 4096, 8192]
 
 _PARALLEL_ENV = "AITER_MLA_META_USE_PARALLEL"
+
+# Every card the MLA metadata planner is built and validated for.
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 
 def kimi_nhead(tp: int) -> int:
@@ -175,18 +178,27 @@ def compare_metadata(golden, test):
     """
     details = {}
 
+    def exact(name, g, t, mask=None):
+        # Planner output is indices, not arithmetic: any difference at all is a
+        # divergence, so compare to the bit (rtol=atol=tol_err_ratio=0).
+        details[name] = checkAllclose(
+            g, t, rtol=0, atol=0, tol_err_ratio=0, mask=mask, printLog=False
+        )
+
     wi_g = golden["work_indptr"]
     wi_t = test["work_indptr"]
-    details["work_indptr"] = int((wi_g != wi_t).sum().item())
+    exact("work_indptr", wi_g, wi_t)
 
     num_works = int(wi_g[-1].item())
-    wis_g = golden["work_info_set"][:num_works]
-    wis_t = test["work_info_set"][:num_works]
-    details["work_info_set"] = int((wis_g != wis_t).sum().item())
+    exact(
+        "work_info_set",
+        golden["work_info_set"][:num_works],
+        test["work_info_set"][:num_works],
+    )
 
     ri_g = golden["reduce_indptr"]
     ri_t = test["reduce_indptr"]
-    details["reduce_indptr"] = int((ri_g != ri_t).sum().item())
+    exact("reduce_indptr", ri_g, ri_t)
 
     # Valid regions for the reduce maps, derived from the golden reduce_indptr.
     steps = ri_g[1:] - ri_g[:-1]
@@ -202,17 +214,16 @@ def compare_metadata(golden, test):
     # happened to hold and reported a mismatch that no kernel produced. A split
     # tile is exactly one whose reduce_indptr step is positive, so compare those
     # rows and leave the untouched ones alone.
-    written = steps > 0
     rfm_g = golden["reduce_final_map"].reshape(-1, 2)
     rfm_t = test["reduce_final_map"].reshape(-1, 2)
-    written = written[: rfm_g.shape[0]]
-    details["reduce_final_map"] = int(
-        (rfm_g[written] != rfm_t[written]).sum().item()
-    )
+    written = (steps > 0)[: rfm_g.shape[0]].unsqueeze(1)
+    exact("reduce_final_map", rfm_g, rfm_t, mask=written)
 
-    rpm_g = golden["reduce_partial_map"][:num_partial]
-    rpm_t = test["reduce_partial_map"][:num_partial]
-    details["reduce_partial_map"] = int((rpm_g != rpm_t).sum().item())
+    exact(
+        "reduce_partial_map",
+        golden["reduce_partial_map"][:num_partial],
+        test["reduce_partial_map"][:num_partial],
+    )
 
     ok = all(v == 0 for v in details.values())
     return ok, details, num_works, num_groups
@@ -232,33 +243,55 @@ def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_i
     if not ok:
         print(f"  [MISMATCH] bs={batch_size} ctx={ctx_len} nhead={nhead}: {mism}")
 
-    # Microbench both planners.
-    serial_outs = alloc_outputs(out_meta)
-    parallel_outs = alloc_outputs(out_meta)
+    # The planner does no floating-point at all, so TFLOPS would be a column of
+    # zeros. Bytes are the metric that means something here: it reads three
+    # per-batch indptrs and writes the work/reduce descriptors, and the GB/s
+    # column against a card that does TB/s is the whole diagnosis -- this kernel
+    # is bound by a single-lane scan, not by traffic.
+    wis = golden["work_info_set"]
+    work_bytes = wis.element_size() * (wis[0].numel() if wis.dim() > 1 else 1)
+    nbytes = (
+        3 * (batch_size + 1) * 4  # qo_indptr, kv_indptr, kv_last_page_lens
+        + num_works * work_bytes  # work_info_set
+        + (batch_size + 1) * 4  # reduce_indptr
+        + num_groups * 2 * 4  # reduce_final_map, split tiles only
+    )
 
-    os.environ[_PARALLEL_ENV] = "0"
-    _, us_serial = run_perftest(
-        call_metadata, inputs, serial_outs, dtype, kvtype, num_iters=num_iters
-    )
-    os.environ[_PARALLEL_ENV] = "1"
-    _, us_parallel = run_perftest(
-        call_metadata, inputs, parallel_outs, dtype, kvtype, num_iters=num_iters
-    )
+    # The serial planner is both the reference and a kernel under test: it is
+    # what runs today whenever the parallel path bails out, so it is timed.
+    candidates = {"serial": "0", "parallel": "1"}
+
+    ret = {"gfx": get_gfx(), "num_works": num_works, "num_split_groups": num_groups}
+    us = {}
+    for name, env in candidates.items():
+        os.environ[_PARALLEL_ENV] = env
+        _, us[name] = run_perftest(
+            call_metadata,
+            inputs,
+            alloc_outputs(out_meta),
+            dtype,
+            kvtype,
+            num_iters=num_iters,
+        )
+        ret[f"{name} us"] = round(us[name], 3)
+        ret[f"{name} GB/s"] = round(nbytes / us[name] / 1e3, 2)
     os.environ.pop(_PARALLEL_ENV, None)
 
-    speedup = us_serial / us_parallel if us_parallel > 0 else float("nan")
-
-    return {
-        "match": ok,
-        "num_works": num_works,
-        "num_split_groups": num_groups,
-        "serial_us": round(us_serial, 3),
-        "parallel_us": round(us_parallel, 3),
-        "speedup": round(speedup, 3),
-    }
+    # Only the parallel path can diverge; serial is the reference it is checked
+    # against, so its err is 0 by construction and would be a noise column.
+    ret["parallel err"] = max(mism.values()) if mism else 0
+    ret["match"] = ok
+    ret["speedup"] = round(us["serial"] / us["parallel"], 3) if us["parallel"] else float("nan")
+    return ret
 
 
 def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "mla metadata planner unsupported on %s; skipping", get_gfx()
+        )
+        return
+
     parser = argparse.ArgumentParser(
         description=(
             "MLA metadata planner microbench/correctness test, with shapes "
@@ -334,22 +367,11 @@ def main():
             all_match = all_match and row["match"]
 
     df = pd.DataFrame(rows)
-    cols = [
-        "batch_size",
-        "ctx_len",
-        "nhead",
-        "num_works",
-        "num_split_groups",
-        "match",
-        "serial_us",
-        "parallel_us",
-        "speedup",
-    ]
-    cols = [c for c in cols if c in df.columns]
-    print(df[cols].to_string(index=False))
+    aiter.logger.info(
+        "mla metadata planner summary (markdown):\n%s", df.to_markdown(index=False)
+    )
 
     assert all_match, "parallel MLA metadata planner diverged from serial reference"
-    print("\nAll shapes: parallel planner matches serial reference. ✓")
 
 
 if __name__ == "__main__":
