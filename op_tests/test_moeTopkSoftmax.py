@@ -375,6 +375,87 @@ def test_biased_grouped_topk(
 
 
 @benchmark()
+def test_biased_grouped_topk_legacy_set(
+    token,
+    expert,
+    topk,
+    dtype,
+    pattern,
+    num_iters=2,
+    num_warmup=1,
+):
+    torch.manual_seed(20260921 + expert + topk)
+    gating = torch.randn((token, expert), dtype=dtype)
+    bias = (torch.randn(expert) * 0.05).to(dtype)
+    if pattern == "all_equal":
+        gating.zero_()
+        bias.zero_()
+    elif pattern == "sixteen_way_tie":
+        gating.fill_(-4)
+        gating[:, -16:] = 0
+        bias.zero_()
+    elif pattern == "all_nan":
+        gating.fill_(torch.nan)
+        bias.zero_()
+    elif pattern == "all_neg_inf_selection":
+        gating.zero_()
+        bias.fill_(-torch.inf)
+
+    stride = topk + 1
+    reg_w_storage = torch.full((token, stride), -123.0, dtype=dtypes.fp32)
+    reg_i_storage = torch.full((token, stride), -123, dtype=dtypes.i32)
+    reg_w = reg_w_storage[:, :topk]
+    reg_i = reg_i_storage[:, :topk]
+
+    legacy_gating = torch.full((token, expert + 4), -torch.inf, dtype=dtype)
+    legacy_gating[:, :expert] = gating
+    legacy_bias = torch.full((expert + 4,), -torch.inf, dtype=dtype)
+    legacy_bias[:expert] = bias
+    legacy_w = torch.empty((token, topk), dtype=dtypes.fp32)
+    legacy_i = torch.empty((token, topk), dtype=dtypes.i32)
+
+    def run(g, b, w, ids):
+        aiter.biased_grouped_topk_hip(g, b, w, ids, 1, 1, True, 2.5)
+        return w, ids
+
+    candidates = {
+        "register": lambda: run(gating, bias, reg_w, reg_i),
+        "legacy LDS": lambda: run(legacy_gating, legacy_bias, legacy_w, legacy_i),
+    }
+    ret = {"gfx": get_gfx()}
+    ops = token * expert
+    nbytes = (
+        token * expert * gating.element_size()
+        + expert * bias.element_size()
+        + token * topk * (reg_w.element_size() + reg_i.element_size())
+    )
+    for name, fn in candidates.items():
+        _, us = run_perftest(
+            fn,
+            num_iters=num_iters,
+            num_warmup=num_warmup,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = ops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = 0
+
+    assert bool((reg_w_storage[:, topk] == -123).all())
+    assert bool((reg_i_storage[:, topk] == -123).all())
+    reg_i_sorted, reg_perm = reg_i.sort(dim=-1)
+    legacy_i_sorted, legacy_perm = legacy_i.sort(dim=-1)
+    torch.testing.assert_close(reg_i_sorted, legacy_i_sorted, rtol=0, atol=0)
+    torch.testing.assert_close(
+        reg_w.gather(1, reg_perm),
+        legacy_w.gather(1, legacy_perm),
+        rtol=1e-6,
+        atol=2e-7,
+        equal_nan=True,
+    )
+    return ret
+
+
+@benchmark()
 def test_grouped_topk(
     token,
     expert,
@@ -780,6 +861,30 @@ df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info(
     "moeTopkSoftmax_reg_biased_grouped_topk summary (markdown):\n%s", df_md
+)
+
+legacy_set_cases = [
+    (1, 256, 8, dtypes.bf16, "random"),
+    (128, 256, 8, dtypes.bf16, "random"),
+    (2, 128, 4, dtypes.bf16, "random"),
+    (2, 128, 32, dtypes.fp32, "random"),
+    (2, 2048, 32, dtypes.bf16, "random"),
+    (2, 256, 8, dtypes.bf16, "all_nan"),
+    (2, 256, 8, dtypes.bf16, "all_neg_inf_selection"),
+]
+for expert in (128, 192, 256, 384, 512, 896, 1024, 2048):
+    legacy_set_cases.extend(
+        [
+            (2, expert, 8, dtypes.bf16, "all_equal"),
+            (2, expert, 8, dtypes.bf16, "sixteen_way_tie"),
+        ]
+    )
+df = pd.DataFrame(
+    [test_biased_grouped_topk_legacy_set(*case) for case in legacy_set_cases]
+)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_legacy_set summary (markdown):\n%s",
+    df.to_markdown(index=False),
 )
 
 # Odd row stride: host launches rowVec2=false. token>1 is required — row 0 is
