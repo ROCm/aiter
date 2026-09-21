@@ -1573,6 +1573,42 @@ def _fused_moe_impl(
         return _return_output(ret, output)
 
 
+def _pad_blockscale_act_scale(a1_scale, sorted_ids, topk):
+    """Back the activation scale's tail with real memory for per_1x128.
+
+    ``fmoe_fp8_blockscale_g1u1`` indexes the activation scale by
+    ``sorted_ids // topk``, so it can touch row ``sorted_ids.numel() // topk``.
+    ``sorted_ids`` is padded out to whole blocks per expert, so that bound
+    exceeds the one-row-per-token scale the quantizer allocates by
+    ``(num_experts * block_size - topk) // topk`` rows.
+
+    Those rows are read and discarded, but the read must still land on mapped
+    memory: when the scale sits at the tail of a caching-allocator segment, the
+    next page is unmapped and the read faults. Returning a view of a padded
+    buffer keeps the logical shape unchanged.
+
+    Args:
+        a1_scale: Activation scale, one row per token.
+        sorted_ids: Block-padded token-to-expert sort order.
+        topk: Experts per token.
+
+    Returns:
+        A tensor with ``a1_scale``'s shape and values, guaranteed to have
+        allocated rows past its end covering the kernel's addressing range.
+    """
+    rows_read = int(sorted_ids.numel()) // topk + 1
+    rows_have = a1_scale.shape[0]
+    if rows_read <= rows_have:
+        return a1_scale
+    padded = torch.zeros(
+        (rows_read, *a1_scale.shape[1:]),
+        dtype=a1_scale.dtype,
+        device=a1_scale.device,
+    )
+    padded[:rows_have] = a1_scale
+    return padded[:rows_have]
+
+
 def fused_moe_1stage(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1687,6 +1723,8 @@ def fused_moe_1stage(
             w2_scale = w2_scale.view(E, -1)
 
         if quant_type == QuantType.per_1x128:
+            if a1_scale is not None:
+                a1_scale = _pad_blockscale_act_scale(a1_scale, sorted_ids, topk)
             fmoe_func = functools.partial(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
