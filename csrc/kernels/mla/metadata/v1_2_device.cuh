@@ -306,130 +306,133 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
 
         // Phase 2 for this chunk: one warp per batch, as before.
         for(int32_t bid = chunk_lo + warp_id; bid < chunk_hi; bid += num_warps)
-    {
-        const int32_t start_cu           = p_lds_start_cu[bid - chunk_lo];
-        const int32_t remain_payload     = p_lds_remain_payload[bid - chunk_lo];
-        const int32_t num_works_before   = p_lds_works_before[bid - chunk_lo];
-        const int32_t reduce_before      = p_lds_reduce_before[bid - chunk_lo];
-        const int32_t partial_idx_before = p_lds_partial_before[bid - chunk_lo];
+        {
+            const int32_t start_cu           = p_lds_start_cu[bid - chunk_lo];
+            const int32_t remain_payload     = p_lds_remain_payload[bid - chunk_lo];
+            const int32_t num_works_before   = p_lds_works_before[bid - chunk_lo];
+            const int32_t reduce_before      = p_lds_reduce_before[bid - chunk_lo];
+            const int32_t partial_idx_before = p_lds_partial_before[bid - chunk_lo];
 
-        const int32_t kv_indptr0 = params.p_seqlens_kv_indptr[0];
-        const int32_t kv_begin   = params.p_seqlens_kv_indptr[bid] - kv_indptr0;
-        const int32_t kv_end     = params.p_seqlens_kv_indptr[bid + 1] - kv_indptr0;
-        const int32_t seqlen_kv =
-            Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
-        const int32_t num_kv_blocks =
-            integer_divide_ceil_power2(seqlen_kv, kv_gran, params.kv_granularity_log2);
-        const int32_t qo_tile_size = qo_state.get_seqlen(bid);
-        const int32_t qo_start     = qo_state.get_begin(bid);
-        const int32_t qo_end       = qo_state.get_end(bid);
+            const int32_t kv_indptr0 = params.p_seqlens_kv_indptr[0];
+            const int32_t kv_begin   = params.p_seqlens_kv_indptr[bid] - kv_indptr0;
+            const int32_t kv_end     = params.p_seqlens_kv_indptr[bid + 1] - kv_indptr0;
+            const int32_t seqlen_kv =
+                Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
+            const int32_t num_kv_blocks =
+                integer_divide_ceil_power2(seqlen_kv, kv_gran, params.kv_granularity_log2);
+            const int32_t qo_tile_size = qo_state.get_seqlen(bid);
+            const int32_t qo_start     = qo_state.get_begin(bid);
+            const int32_t qo_end       = qo_state.get_end(bid);
 
-        const bool fits_current_cu = (num_kv_blocks + overhead <= remain_payload);
-        int32_t num_fresh_frags, num_frags;
-        bool waste_start_cu;
-        if(fits_current_cu)
-        {
-            num_fresh_frags = 1;
-            num_frags       = 1;
-            waste_start_cu  = false;
-        }
-        else if(remain_payload > overhead)
-        {
-            const int32_t remain_blocks = num_kv_blocks - (remain_payload - overhead);
-            num_fresh_frags             = integer_divide_ceil(remain_blocks, blocks_per_cu);
-            num_frags                   = num_fresh_frags + 1;
-            waste_start_cu              = false;
-        }
-        else
-        {
-            num_fresh_frags = integer_divide_ceil(num_kv_blocks, blocks_per_cu);
-            num_frags       = num_fresh_frags;
-            waste_start_cu  = true;
-        }
-        const bool is_split             = (num_frags > 1);
-        const int32_t first_frag_blocks = remain_payload - overhead;
-
-        // Per-batch reduce bookkeeping + the wasted-CU close (lane 0).
-        if(lane_idx == 0)
-        {
-            if(is_split)
-            {
-                params.p_reduce_indptr[bid + 1]        = reduce_before + num_frags;
-                params.p_reduce_final_map[bid * 2]     = qo_start;
-                params.p_reduce_final_map[bid * 2 + 1] = qo_end;
-            }
-            else
-            {
-                params.p_reduce_indptr[bid + 1] = reduce_before;
-            }
-            if(waste_start_cu && (start_cu + 1 <= num_cu))
-            {
-                params.p_work_indptr[start_cu + 1] = num_works_before;
-            }
-        }
-
-        // Each fragment -> one work covering kv blocks [block_begin, block_end)
-        // of this batch, landing in CU frag_cu.
-        for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
-        {
-            int32_t block_begin, block_end, frag_cu;
+            const bool fits_current_cu = (num_kv_blocks + overhead <= remain_payload);
+            int32_t num_fresh_frags, num_frags;
+            bool waste_start_cu;
             if(fits_current_cu)
             {
-                block_begin = 0;
-                block_end   = num_kv_blocks;
-                frag_cu     = start_cu;
+                num_fresh_frags = 1;
+                num_frags       = 1;
+                waste_start_cu  = false;
             }
-            else if(!waste_start_cu)
+            else if(remain_payload > overhead)
             {
-                block_begin =
-                    (frag_idx == 0) ? 0 : (first_frag_blocks + (frag_idx - 1) * blocks_per_cu);
-                block_end = (frag_idx < num_fresh_frags)
-                                ? (first_frag_blocks + frag_idx * blocks_per_cu)
-                                : num_kv_blocks;
-                frag_cu   = start_cu + frag_idx;
+                const int32_t remain_blocks = num_kv_blocks - (remain_payload - overhead);
+                num_fresh_frags             = integer_divide_ceil(remain_blocks, blocks_per_cu);
+                num_frags                   = num_fresh_frags + 1;
+                waste_start_cu              = false;
             }
             else
             {
-                block_begin = frag_idx * blocks_per_cu;
-                block_end   = (frag_idx < num_fresh_frags - 1) ? ((frag_idx + 1) * blocks_per_cu)
-                                                               : num_kv_blocks;
-                frag_cu     = start_cu + 1 + frag_idx;
+                num_fresh_frags = integer_divide_ceil(num_kv_blocks, blocks_per_cu);
+                num_frags       = num_fresh_frags;
+                waste_start_cu  = true;
+            }
+            const bool is_split             = (num_frags > 1);
+            const int32_t first_frag_blocks = remain_payload - overhead;
+
+            // Per-batch reduce bookkeeping + the wasted-CU close (lane 0).
+            if(lane_idx == 0)
+            {
+                if(is_split)
+                {
+                    params.p_reduce_indptr[bid + 1]        = reduce_before + num_frags;
+                    params.p_reduce_final_map[bid * 2]     = qo_start;
+                    params.p_reduce_final_map[bid * 2 + 1] = qo_end;
+                }
+                else
+                {
+                    params.p_reduce_indptr[bid + 1] = reduce_before;
+                }
+                if(waste_start_cu && (start_cu + 1 <= num_cu))
+                {
+                    params.p_work_indptr[start_cu + 1] = num_works_before;
+                }
             }
 
-            const int32_t frag_kv_start = kv_begin + block_begin * kv_gran;
-            const int32_t frag_kv_end   = opus::min(kv_begin + block_end * kv_gran, kv_end);
-            const int32_t work_idx      = num_works_before + frag_idx;
-            const int32_t partial_qo_loc =
-                is_split ? (partial_idx_before + frag_idx * qo_tile_size) : -1;
-
-            MlaWorkInfo work_info{};
-            work_info.batch_idx       = bid;
-            work_info.qo_start        = qo_start;
-            work_info.qo_end          = qo_end;
-            work_info.kv_start        = frag_kv_start;
-            work_info.kv_end          = frag_kv_end;
-            work_info.kv_offset       = kv_end - frag_kv_end;
-            work_info.partial_qo_loc  = partial_qo_loc;
-            p_work_info_set[work_idx] = work_info;
-
-            if(is_split)
+            // Each fragment -> one work covering kv blocks [block_begin, block_end)
+            // of this batch, landing in CU frag_cu.
+            for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
             {
-                params.p_reduce_partial_map[reduce_before + frag_idx] =
-                    partial_idx_before + frag_idx * qo_tile_size;
-            }
+                int32_t block_begin, block_end, frag_cu;
+                if(fits_current_cu)
+                {
+                    block_begin = 0;
+                    block_end   = num_kv_blocks;
+                    frag_cu     = start_cu;
+                }
+                else if(!waste_start_cu)
+                {
+                    block_begin =
+                        (frag_idx == 0) ? 0 : (first_frag_blocks + (frag_idx - 1) * blocks_per_cu);
+                    block_end = (frag_idx < num_fresh_frags)
+                                    ? (first_frag_blocks + frag_idx * blocks_per_cu)
+                                    : num_kv_blocks;
+                    frag_cu   = start_cu + frag_idx;
+                }
+                else
+                {
+                    block_begin = frag_idx * blocks_per_cu;
+                    block_end   = (frag_idx < num_fresh_frags - 1) ? ((frag_idx + 1) * blocks_per_cu)
+                                                                   : num_kv_blocks;
+                    frag_cu     = start_cu + 1 + frag_idx;
+                }
 
-            // Non-final fragments fully fill (close) their CU with one work.
-            const bool is_last_frag = (frag_idx == num_frags - 1);
-            if(!is_last_frag && (frag_cu + 1 <= num_cu))
-            {
-                params.p_work_indptr[frag_cu + 1] = work_idx + 1;
+                const int32_t frag_kv_start = kv_begin + block_begin * kv_gran;
+                const int32_t frag_kv_end   = opus::min(kv_begin + block_end * kv_gran, kv_end);
+                const int32_t work_idx      = num_works_before + frag_idx;
+                const int32_t partial_qo_loc =
+                    is_split ? (partial_idx_before + frag_idx * qo_tile_size) : -1;
+
+                MlaWorkInfo work_info{};
+                work_info.batch_idx       = bid;
+                work_info.qo_start        = qo_start;
+                work_info.qo_end          = qo_end;
+                work_info.kv_start        = frag_kv_start;
+                work_info.kv_end          = frag_kv_end;
+                work_info.kv_offset       = kv_end - frag_kv_end;
+                work_info.partial_qo_loc  = partial_qo_loc;
+                p_work_info_set[work_idx] = work_info;
+
+                if(is_split)
+                {
+                    params.p_reduce_partial_map[reduce_before + frag_idx] =
+                        partial_idx_before + frag_idx * qo_tile_size;
+                }
+
+                // Non-final fragments fully fill (close) their CU with one work.
+                const bool is_last_frag = (frag_idx == num_frags - 1);
+                if(!is_last_frag && (frag_cu + 1 <= num_cu))
+                {
+                    params.p_work_indptr[frag_cu + 1] = work_idx + 1;
+                }
             }
         }
-    }
-
 
         __syncthreads();
 
+        // Every thread takes a private copy of where the scan stopped, so the
+        // next chunk's phase 1 resumes from it and the totals are in hand after
+        // the loop. The second barrier is what keeps that next phase 1 from
+        // overwriting p_lds_carry while a straggler is still reading it.
         scan_curr_cu        = p_lds_carry[0];
         scan_remain_payload = p_lds_carry[1];
         scan_num_works      = p_lds_carry[2];
