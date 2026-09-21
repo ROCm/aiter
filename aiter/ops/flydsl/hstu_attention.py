@@ -956,12 +956,15 @@ def _make_bwd_kernel_runners(
     stream: torch.cuda.Stream | None = None,
 ) -> dict:
     """Tuning/profiling helper: build the (dV+dK, dQ) launcher pair with an
-    explicit tile config forced on both, and return zero-arg callables that
-    launch ONLY one kernel each: {"dvdk": fn, "dq": fn}.
+    explicit tile config forced on both, and return, per kernel, a zero-arg
+    callable that launches ONLY that kernel plus the output tensors it writes:
+    {"dvdk": (fn, (dv, dk)), "dq": (fn, (dq,))}.
 
     This lets the tuner time the two backward kernels independently (they have
     different optimal configs) without going through the public entry point,
-    which always launches both. Not part of the public API.
+    which always launches both, and read back each kernel's output so a config
+    that compiles but computes garbage can be rejected before it is timed. Not
+    part of the public API.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -1048,7 +1051,10 @@ def _make_bwd_kernel_runners(
                 fx.Stream(launch_stream),
             )
 
-    return {_BWD_KERNEL_DVDK: run_dvdk, _BWD_KERNEL_DQ: run_dq}
+    return {
+        _BWD_KERNEL_DVDK: (run_dvdk, (dv, dk)),
+        _BWD_KERNEL_DQ: (run_dq, (dq,)),
+    }
 
 
 class FlydslHstuAttention(torch.autograd.Function):
