@@ -215,8 +215,13 @@ def fp8_mqa_logits(
             # GLM-5.2 agentic runs p25=664, p50=1650, p90=6475, so it
             # essentially never fired and every prefill ran BLOCK_M=1,
             # re-streaming the cached context per row. Measured crossover on
-            # gfx950 (num_heads=32, head_size=128, seq_len_kv 32k-256k) is
-            # ~1536 rows. It must also be gated on use_buffer_store: BLOCK_M=2
+            # gfx950 (num_heads=32, head_size=128) across the
+            # (seq_len x seq_len_kv) plane is 2048 rows, not the ~1536 a
+            # one-dimensional pass suggested: 1.02-1.40x at and above 2048,
+            # 0.64-0.99x below, bottoming out at 0.64x for 1024 rows. The
+            # crossover is flat in seq_len_kv, so a seq_len threshold on its
+            # own is enough. BLOCK_M=4 and 8 do not compile, so 2 is the
+            # ceiling. It must also be gated on use_buffer_store: BLOCK_M=2
             # on the non-buffer-store path trips an LLVM assertion ("Begin must
             # be less or equal to End") that aborts the process rather than
             # failing the launch.
