@@ -840,6 +840,13 @@ gfx950 stayed exact (``err=0``); merge VGPR 112 → 63 and ISA emitted
 ``M=512`` was flat (no merge). This is not the earlier 8-wide / 64-thread
 128-bit merge miss. Keep scalar per-``D`` merge loads.
 
+**Do not retry** a 64-thread LSE merge with 4-wide ``BufferCopy128b``
+``partial_out`` loads (``d=4*tid``, one wave, ``block=64``). GPU 6 /
+gfx950 stayed exact (``err=0``); width-2051 ``L=512`` went
+18.65 → 18.84 us at ``M=1`` and 21.15 → 21.64 us at ``M=8``;
+``M=512`` was flat (no merge). Distinct from the 8-wide / 64-thread
+and 2-wide / 128-thread merge misses. Keep two-wave scalar merge.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
