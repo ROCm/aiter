@@ -13,9 +13,11 @@ class Cache:
         self._cache: WeakValueDictionary = WeakValueDictionary()
         self._lock = threading.RLock()  # Reentrant lock for thread safety
 
-    def get_or_create(self, kwargs, func):
-        # Create a hashable key from the kwargs
-        key = tuple(sorted((k, v) for k, v in kwargs.items()))
+    def get_or_create(self, kwargs, func, index: int = 0):
+        if index < 0:
+            raise ValueError(f"index must be >= 0, got {index}")
+        # Create a hashable key from the kwargs plus instance index
+        key = (tuple(sorted((k, v) for k, v in kwargs.items())), index)
 
         with self._lock:
             instance = self._cache.get(key)
@@ -54,13 +56,14 @@ class All2AllManagerBase:
         # intra-node and inter-node communication
         self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))
 
-    def get_handle(self, kwargs):
+    def get_handle(self, kwargs, index: int = 0):
         # get a handle for the all2all communication,
-        # based on the kwargs.
+        # based on the kwargs and instance index.
         # different layers can have different configs,
         # e.g. one layer has hidden size 1024, another has 2048.
         # usually the underlying implementation caches the handle
-        # and reuse it for the same config.
+        # and reuse it for the same config. index distinguishes
+        # concurrent ops that share a config (e.g. TBO ubatches).
         raise NotImplementedError
 
     def dispatch(
