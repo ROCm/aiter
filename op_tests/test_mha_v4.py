@@ -579,6 +579,54 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
     assert torch.equal(compiled, expected)
 
 
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 FP8 recipe validation",
+)
+@pytest.mark.parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
+def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
+    """A direction shared by every key must not cost accuracy.
+
+    Softmax is shift invariant in such a component, so the reference barely moves; only the
+    quantizers care. Without the mean subtraction the error grows several-fold here, so this
+    is the tripwire for silently dropping it.
+    """
+    torch.manual_seed(17)
+    q = torch.randn((1, 1024, 4, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(q)
+    base_k = torch.randn_like(q)
+    direction = torch.randn((1, 1, 4, 128), device="cuda", dtype=torch.bfloat16)
+
+    if recipe == "fp8":
+        formats = (native_fp8_format(),) * 3
+        scale_modes = {}
+    elif recipe == "mxfp8":
+        # MXFP8 is selected by the E8M0 scale modes, not by a distinct format.
+        formats = (native_fp8_format(),) * 3
+        scale_modes = {
+            "q_scale_mode": AttentionScaleMode.E8M0_PER_1X32,
+            "k_scale_mode": AttentionScaleMode.E8M0_PER_1X32,
+            "v_scale_mode": AttentionScaleMode.F32_PER_TENSOR,
+        }
+    else:
+        formats = (AttentionFormat.MXFP4,) * 3
+        scale_modes = {}
+
+    errors = []
+    for common in (0.0, 16.0):
+        k = base_k + common * direction
+        reference = _dense_reference(q.float(), k.float(), v.float(), k.shape[1])
+        out = mha_v4(q, k, v, *formats, **scale_modes)
+        errors.append(
+            ((out.float() - reference).norm() / reference.norm()).item(),
+        )
+
+    assert errors[1] < 1.5 * errors[0], (
+        f"{recipe} degrades under a shared K direction: "
+        f"{errors[0]:.4f} -> {errors[1]:.4f}; is K smoothing still applied?"
+    )
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
 @pytest.mark.parametrize("case", ["random", "zero", "powers", "extreme"])
 def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
