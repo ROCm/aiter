@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+from functools import cache
 from typing import NamedTuple
 
 import torch
@@ -47,7 +48,15 @@ IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
-_FLYDSL_UNIFIED_ATTN_ARCH = DEVICE_ARCH == "gfx950"
+
+
+@cache
+def _flydsl_unified_attn_capability(device_index: int) -> tuple[bool, str]:
+    from aiter.ops.flydsl.unified_attention_kernels import GFX950_CUS
+
+    props = torch.cuda.get_device_properties(device_index)
+    arch = props.gcnArchName.split(":", 1)[0]
+    return arch == "gfx950" and props.multi_processor_count >= GFX950_CUS, arch
 
 
 def _is_gluon_available():
@@ -164,10 +173,16 @@ def unified_attention(
         "gluon",
         "flydsl",
     ), f"Unknown backend '{backend}', must be None, 'triton', 'gluon' or 'flydsl'"
+    q_device_index = q.device.index
+    if q_device_index is None:
+        q_device_index = torch.cuda.current_device()
+    with torch.cuda.device(q_device_index):
+        flydsl_available, flydsl_arch = _flydsl_unified_attn_capability(q_device_index)
     if backend == "flydsl":
-        assert (
-            _FLYDSL_UNIFIED_ATTN_ARCH
-        ), f"FlyDSL backend requires gfx950, got '{DEVICE_ARCH}'"
+        assert flydsl_available, (
+            "FlyDSL backend requires a full-chip gfx950, "
+            f"got '{flydsl_arch}' on {q.device}"
+        )
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -220,7 +235,7 @@ def unified_attention(
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
 
-    if backend == "flydsl" or (backend is None and _FLYDSL_UNIFIED_ATTN_ARCH):
+    if backend == "flydsl" or (backend is None and flydsl_available):
         # FlyDSL is optional, but an explicit request must not fall back.
         try:
             from aiter.ops.flydsl.unified_attention_kernels import (

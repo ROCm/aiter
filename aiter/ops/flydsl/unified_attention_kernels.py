@@ -13,8 +13,8 @@ config, falling through to Triton unchanged (matches
 ``flydsl_flash_attn_varlen_func`` / the flydsl branch in
 ``ops/gemm_op_a8w8.py``) -- deliberately no dispatch env var, since a code gate
 states an arch/shape-scoped choice more honestly than another undocumented
-backend flag. Force Triton by setting ``_FLYDSL_UNIFIED_ATTN_ARCH`` to ``False`` in
-the Triton module. Two env knobs govern dispatch: the split-count cap,
+backend flag. Automatic routing is enabled only when the call's ``q.device`` is
+a full-chip gfx950. Two env knobs govern dispatch: the split-count cap,
 ``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``), and
 ``AITER_DECODE_KERNEL``, the decode-kernel on/off master switch (see
 ``_USE_DECODE_KERNEL``).
@@ -52,14 +52,18 @@ __all__ = ["flydsl_unified_attention"]
 
 
 @lru_cache(maxsize=1)
-def is_flydsl_available() -> bool:
-    if importlib.util.find_spec("flydsl") is None:
-        return False
-    # Unsupported architectures can fail during kernel config registration.
-    from flydsl.runtime.device import get_rocm_arch
-    from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+def _is_flydsl_installed() -> bool:
+    return importlib.util.find_spec("flydsl") is not None
 
-    return get_rocm_arch() in SMEM_CAPACITY_MAP
+
+@cache
+def is_flydsl_available(device_index: int) -> bool:
+    if not _is_flydsl_installed():
+        return False
+    with torch.cuda.device(device_index):
+        props = torch.cuda.get_device_properties(device_index)
+    arch = props.gcnArchName.split(":", 1)[0]
+    return arch == "gfx950" and props.multi_processor_count >= GFX950_CUS
 
 
 # Page size is structural, not a builder parameter: the paged path addresses KV
@@ -404,15 +408,15 @@ def _route_decode_kernel(
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
     npages = (int(max_seqlen_k) + _PAGE_SIZE - 1) // _PAGE_SIZE
     num_kv_splits = plan_num_kv_splits(num_seqs, num_kv_heads, npages)
-    mod = _get_decode_kernel(
-        num_query_heads,
-        num_kv_heads,
-        causal,
-        out_dtype_str,
-        shuffled_kv_cache,
-        num_kv_splits,
-    )
     with torch.cuda.device(q.device.index):
+        mod = _get_decode_kernel(
+            num_query_heads,
+            num_kv_heads,
+            causal,
+            out_dtype_str,
+            shuffled_kv_cache,
+            num_kv_splits,
+        )
         mod(
             q.reshape(-1),
             # K/V pass as base pointers only: the kernel rebases a BufferDesc per
@@ -664,7 +668,7 @@ def _supported(
     """Whether this exact configuration can be served. Kept separate from the
     marshalling so it can be unit-tested against meta tensors, with no GPU.
     Causal and non-causal are both built, so this gate does not branch on it."""
-    if not is_flydsl_available():
+    if not is_flydsl_available(q.device.index):
         return False
 
     head_size = q.shape[-1]
@@ -845,10 +849,6 @@ def flydsl_unified_attention(
     Returns ``out`` (written in place) if this configuration is supported, or
     ``None`` so the caller falls through to Triton.
     """
-    # MI350P is gfx950 with half the CUs; the decode planner assumes full chip.
-    if torch.cuda.get_device_properties(q.device).multi_processor_count < GFX950_CUS:
-        return None
-
     # Widen 0-dim scalar descales to [1] before the gate, the recursion, and the
     # kernel see them (vLLM passes per-tensor descales as scalars; FlyDSL's
     # from_dlpack rejects a shape-() tensor). A view, not a copy.
@@ -1130,16 +1130,6 @@ def flydsl_unified_attention(
                 return None
             num_kv_splits = _split_count(num_2d_prgms, target_num_prgms)
 
-    kernel = _get_kernel(
-        num_query_heads,
-        num_kv_heads,
-        bool(causal),
-        out_dtype_str,
-        sinks is not None,
-        num_kv_splits,
-        shuffled_kv_cache,
-    )
-
     workspace = None
     if num_kv_splits > 1:
         # fp32 partial workspace: O_partial + Mrow + Lrow, sized for the dense
@@ -1150,6 +1140,15 @@ def flydsl_unified_attention(
         workspace = torch.empty(ws_elems, device=q.device, dtype=torch.float32)
 
     with torch.cuda.device(q.device.index):
+        kernel = _get_kernel(
+            num_query_heads,
+            num_kv_heads,
+            bool(causal),
+            out_dtype_str,
+            sinks is not None,
+            num_kv_splits,
+            shuffled_kv_cache,
+        )
         kernel(
             # .reshape(-1) relies on _strides_ok already restricting Q/O to
             # flattenable layouts (see _strides_ok), so this is always a
