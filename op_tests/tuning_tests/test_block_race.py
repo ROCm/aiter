@@ -187,7 +187,8 @@ class TestProtectedIncumbent(unittest.TestCase):
         result = race(entrants, constant_timer(truth), **RACE_ARGS)
 
         self.assertEqual(
-            len(result.samples["incumbent"].blocks), result.blocks_run,
+            len(result.samples["incumbent"].blocks),
+            result.blocks_run,
             "the incumbent has to keep being measured, or the comparison "
             "against it goes stale while the race continues",
         )
@@ -312,7 +313,8 @@ class TestJournalReplay(unittest.TestCase):
         for record in records:
             self.assertIn("order", record)
             self.assertEqual(
-                sorted(record["order"]), sorted(record["latencies"]),
+                sorted(record["order"]),
+                sorted(record["latencies"]),
                 "every candidate visited in a block must have latencies stored",
             )
 
@@ -356,7 +358,8 @@ class TestJournalReplay(unittest.TestCase):
         )
         self.assertEqual(resumed.blocks_replayed, journaled)
         self.assertEqual(
-            measured_blocks, [],
+            measured_blocks,
+            [],
             "a resume that already has every block should measure nothing",
         )
 

@@ -438,9 +438,7 @@ class TestTypedCandidateStatus(unittest.TestCase):
         detail = tuner._candidate_failure_detail(
             ValueError("window_size_right is not supported yet")
         )
-        self.assertEqual(
-            detail, "ValueError: window_size_right is not supported yet"
-        )
+        self.assertEqual(detail, "ValueError: window_size_right is not supported yet")
         result = tuner._format_worker_result(
             "shape", -1, 1.0, "unsupported", True, detail
         )

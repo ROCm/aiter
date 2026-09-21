@@ -148,8 +148,7 @@ def _mha_fwd_tuning_key(
         "has_physical_padding": (
             cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
         ),
-        "is_grad": torch.is_grad_enabled()
-        and any(t.requires_grad for t in (q, k, v)),
+        "is_grad": torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)),
     }
     return tuple(csv_scalar(values[field]) for field in MHA_FWD_TUNING_KEY_FIELDS)
 
@@ -3383,6 +3382,7 @@ def _flash_attn_varlen_forward(
             )
     elif selected_backend in (None, "ck"):
         _record_mha_fwd_selection("ck")
+
         # Input validation for padded cumulative arrays if provided
         def _validate(name: str, t: torch.Tensor):
             assert t.dim() == 1, f"{name} must be 1D"
@@ -4020,7 +4020,9 @@ def flash_attn_varlen_func(
     )
     tuned_backend = tuned_plan["backend"] if tuned_plan is not None else None
     num_splits = int(tuned_plan["num_splits"]) if tuned_plan is not None else 0
-    backend_config = tuned_plan.get("backend_config") if tuned_plan is not None else None
+    backend_config = (
+        tuned_plan.get("backend_config") if tuned_plan is not None else None
+    )
     if tuned_backend is not None and tuned_backend not in MHA_FWD_BACKENDS:
         raise ValueError(f"unknown tuned MHA backend {tuned_backend!r}")
 

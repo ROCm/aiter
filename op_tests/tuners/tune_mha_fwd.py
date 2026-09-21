@@ -65,7 +65,6 @@ from aiter.utility.block_race import (
 )
 from aiter.utility.mp_tuner import mp_tuner
 
-
 # Fixed so that --race-candidates draws the same subset on every run; a
 # sampled field that changed between runs would make two runs incomparable.
 MHA_FWD_RACE_SAMPLE_SEED = 20240917
@@ -185,9 +184,7 @@ def _chunked_reference(
     return_lse,
 ):
     """Bounded-memory fp32 oracle; score storage stays below roughly 64 MiB."""
-    output = torch.empty(
-        (*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device
-    )
+    output = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device)
     lse = (
         torch.empty((q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device)
         if return_lse
@@ -208,8 +205,10 @@ def _chunked_reference(
         offset = sk - sq
         for row_begin in range(0, sq, rows):
             row_end = min(sq, row_begin + rows)
-            q_chunk = q_seq[row_begin:row_end].float().reshape(
-                row_end - row_begin, k_seq.shape[1], groups, q_seq.shape[-1]
+            q_chunk = (
+                q_seq[row_begin:row_end]
+                .float()
+                .reshape(row_end - row_begin, k_seq.shape[1], groups, q_seq.shape[-1])
             )
             scores = torch.einsum("qhgd,khd->hgqk", q_chunk, k_seq).reshape(
                 heads, row_end - row_begin, sk
@@ -236,16 +235,14 @@ def _chunked_reference(
             probabilities.nan_to_num_(nan=0.0)
             out = torch.einsum(
                 "hgqk,khd->qhgd",
-                probabilities.reshape(
-                    k_seq.shape[1], groups, row_end - row_begin, sk
-                ),
+                probabilities.reshape(k_seq.shape[1], groups, row_end - row_begin, sk),
                 v_seq,
             ).reshape(row_end - row_begin, heads, v_seq.shape[-1])
             output[q_begin + row_begin : q_begin + row_end].copy_(out.to(q.dtype))
             if lse is not None:
-                lse[
-                    :, q_begin + row_begin : q_begin + row_end
-                ] = torch.logsumexp(scores, dim=-1)
+                lse[:, q_begin + row_begin : q_begin + row_end] = torch.logsumexp(
+                    scores, dim=-1
+                )
     return (output, lse) if lse is not None else output
 
 
@@ -296,9 +293,7 @@ def _run_candidate(
             bool(return_lse),
             int(num_splits),
         )
-        return _normalize_result(
-            (out, lse), return_lse, q.shape[0], q.shape[1]
-        )
+        return _normalize_result((out, lse), return_lse, q.shape[0], q.shape[1])
     if backend == "ck":
         out, lse, _, _ = mha_varlen_fwd(
             q,
@@ -320,9 +315,7 @@ def _run_candidate(
             bool(return_lse),
             False,
         )
-        return _normalize_result(
-            (out, lse), return_lse, q.shape[0], q.shape[1]
-        )
+        return _normalize_result((out, lse), return_lse, q.shape[0], q.shape[1])
     if backend in ("triton", "gluon"):
         from aiter.ops.triton.attention.mha import flash_attn_varlen_func
 
@@ -559,10 +552,7 @@ class MhaFwdTuner(TunerCommon):
             "is_grad",
         ]
         frame = frame.assign(
-            **{
-                field: frame[field].map(_as_bool).astype(int)
-                for field in BOOL_FIELDS
-            }
+            **{field: frame[field].map(_as_bool).astype(int) for field in BOOL_FIELDS}
         )
         if frame[unsupported].astype(bool).any(axis=None):
             raise ValueError(
@@ -572,7 +562,9 @@ class MhaFwdTuner(TunerCommon):
         if (frame["dropout_p"].astype(float) != 0.0).any():
             raise ValueError("dropout tuning requires a reproducible dropout mask")
         if (frame["logits_soft_cap"].astype(float) != 0.0).any():
-            raise ValueError("the enumerated Triton/FlyDSL paths require logits_soft_cap=0")
+            raise ValueError(
+                "the enumerated Triton/FlyDSL paths require logits_soft_cap=0"
+            )
         if (frame["sink_size"].astype(int) != 0).any():
             raise ValueError("sink-token tuning requires explicit sink-token payloads")
         if (frame["how_v3_bf16_cvt"].astype(int) != 1).any():
@@ -585,9 +577,9 @@ class MhaFwdTuner(TunerCommon):
         }
         for field, live_value in hardware.items():
             if field in frame.columns:
-                mismatched = frame[field].astype(str).str.lower() != str(
-                    live_value
-                ).lower()
+                mismatched = (
+                    frame[field].astype(str).str.lower() != str(live_value).lower()
+                )
                 if mismatched.any():
                     raise ValueError(
                         f"workload catalogue {field} does not match the tuning GPU "
@@ -610,9 +602,7 @@ class MhaFwdTuner(TunerCommon):
     @staticmethod
     def _problem_and_candidate(info):
         key, backend, num_splits, backend_config = info
-        problem = MhaFwdProblem.from_mapping(
-            dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key))
-        )
+        problem = MhaFwdProblem.from_mapping(dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key)))
         candidate = MhaFwdCandidate(
             backend,
             int(num_splits),
@@ -675,9 +665,7 @@ class MhaFwdTuner(TunerCommon):
         }
         destination = Path(self._journal_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            destination, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600
-        )
+        descriptor = os.open(destination, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as file:
             file.write(
                 (
@@ -964,7 +952,9 @@ class MhaFwdTuner(TunerCommon):
             for (_, phase), result in journal.items()
             if phase == "first"
         }
-        first_pass = [first_by_info[info] for info in all_infos if info in first_by_info]
+        first_pass = [
+            first_by_info[info] for info in all_infos if info in first_by_info
+        ]
 
         finalists_by_key: dict[tuple, list[tuple]] = {}
         for result in first_pass:
@@ -996,14 +986,10 @@ class MhaFwdTuner(TunerCommon):
             f"{args.finalist_rounds} fresh-worker rounds",
             flush=True,
         )
-        round_results: dict[tuple, list[tuple]] = {
-            info: [] for info in finalist_infos
-        }
+        round_results: dict[tuple, list[tuple]] = {info: [] for info in finalist_infos}
         for round_index in range(args.finalist_rounds):
             phase = f"finalist:{round_index}"
-            finalist_tasks, finalist_data = pending_for_phase(
-                phase, finalist_infos
-            )
+            finalist_tasks, finalist_data = pending_for_phase(phase, finalist_infos)
             while finalist_tasks:
                 before = len(journal)
                 mp_tuner(
@@ -1025,9 +1011,7 @@ class MhaFwdTuner(TunerCommon):
                     raise RuntimeError(
                         f"MHA checkpoint made no progress during {phase}"
                     )
-                finalist_tasks, finalist_data = pending_for_phase(
-                    phase, finalist_infos
-                )
+                finalist_tasks, finalist_data = pending_for_phase(phase, finalist_infos)
             for info in finalist_infos:
                 problem, candidate = self._problem_and_candidate(info)
                 round_results[info].append(
@@ -1037,7 +1021,9 @@ class MhaFwdTuner(TunerCommon):
         final_by_info = {}
         for info, results in round_results.items():
             statuses = [result[3] for result in results]
-            failed_status = next((status for status in statuses if status != "ok"), None)
+            failed_status = next(
+                (status for status in statuses if status != "ok"), None
+            )
             samples = tuple(
                 float(result[1])
                 for result in results
@@ -1140,13 +1126,17 @@ class MhaFwdTuner(TunerCommon):
         rejected = []
         for candidate in candidates:
             info = (key, candidate.backend, candidate.num_splits, candidate.config_json)
-            label = f"{candidate.backend}|{candidate.num_splits}|{candidate.config_json}"
+            label = (
+                f"{candidate.backend}|{candidate.num_splits}|{candidate.config_json}"
+            )
             try:
                 produced = launch(candidate)
                 torch.cuda.synchronize()
                 err_ratio = self._error_ratio(produced, expected, row, args)
             except Exception as error:  # noqa: BLE001 - unsupported is an outcome
-                rejected.append((info, 1.0, "crash", f"{type(error).__name__}: {error}"))
+                rejected.append(
+                    (info, 1.0, "crash", f"{type(error).__name__}: {error}")
+                )
                 continue
             if err_ratio > args.errRatio:
                 rejected.append(
@@ -1176,7 +1166,9 @@ class MhaFwdTuner(TunerCommon):
         )
         journal_path = self._race_block_journal(key)
         journal = (
-            JsonlBlockJournal(journal_path, resume=args.resume) if journal_path else None
+            JsonlBlockJournal(journal_path, resume=args.resume)
+            if journal_path
+            else None
         )
         outcome = race(
             entrants,
@@ -1272,9 +1264,9 @@ class MhaFwdTuner(TunerCommon):
                 ],
             }
         )
-        self._race_winner_by_key[key] = winner_label and info_by_label.get(
-            winner_label, (None,)
-        )[0]
+        self._race_winner_by_key[key] = (
+            winner_label and info_by_label.get(winner_label, (None,))[0]
+        )
 
         for verdict in outcome.verdicts:
             info, err_ratio = info_by_label[verdict.label]
@@ -1310,9 +1302,7 @@ class MhaFwdTuner(TunerCommon):
             row = dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key))
             samples = self._samples_by_info.get(
                 info,
-                (float(us),)
-                if status == "ok" and us > 0 and math.isfinite(us)
-                else (),
+                (float(us),) if status == "ok" and us > 0 and math.isfinite(us) else (),
             )
             row.update(
                 {
@@ -1366,7 +1356,9 @@ class MhaFwdTuner(TunerCommon):
 
         winners = []
         failures = []
-        for key, group in resultdf.groupby(list(MHA_FWD_TUNING_KEY_FIELDS), dropna=False):
+        for key, group in resultdf.groupby(
+            list(MHA_FWD_TUNING_KEY_FIELDS), dropna=False
+        ):
             valid = group[
                 (group["status"] == "ok")
                 & (group["us"] > 0)
@@ -1423,9 +1415,11 @@ class MhaFwdTuner(TunerCommon):
         combined = (
             runtime.copy()
             if old.empty
-            else old.copy()
-            if runtime.empty
-            else pd.concat([old, runtime], ignore_index=True)
+            else (
+                old.copy()
+                if runtime.empty
+                else pd.concat([old, runtime], ignore_index=True)
+            )
         )
         combined = combined.drop_duplicates(
             subset=list(MHA_FWD_TUNING_KEY_FIELDS), keep="last"
@@ -1451,9 +1445,11 @@ class MhaFwdTuner(TunerCommon):
         covered = (
             self.failed.copy()
             if self.success.empty
-            else self.success.copy()
-            if self.failed.empty
-            else pd.concat([self.success, self.failed], ignore_index=True)
+            else (
+                self.success.copy()
+                if self.failed.empty
+                else pd.concat([self.success, self.failed], ignore_index=True)
+            )
         )
         covered_count = (
             covered.drop_duplicates(subset=list(MHA_FWD_TUNING_KEY_FIELDS)).shape[0]
@@ -1463,9 +1459,7 @@ class MhaFwdTuner(TunerCommon):
         run_state = (
             "partial"
             if not self.failed.empty or covered_count < len(self.untunedf)
-            else "verified"
-            if self._selection_proofs
-            else "measured"
+            else "verified" if self._selection_proofs else "measured"
         )
         self._write_evidence(run_state, file)
 
@@ -1681,13 +1675,12 @@ class MhaFwdTuner(TunerCommon):
         return [name.strip() for name in value.split(",") if name.strip()] or None
 
     def _run_fresh_probe(self, row, config_file: str) -> dict[str, Any]:
-        descriptor, proof_path = tempfile.mkstemp(prefix="mha-selection-", suffix=".jsonl")
+        descriptor, proof_path = tempfile.mkstemp(
+            prefix="mha-selection-", suffix=".jsonl"
+        )
         os.close(descriptor)
         os.unlink(proof_path)
-        problem = {
-            field: row[field]
-            for field in MHA_FWD_TUNING_KEY_FIELDS
-        }
+        problem = {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
         problem["_proof_warmup"] = int(self._args.warmup)
         problem["_proof_iters"] = int(self._args.iters)
         # Run the child as a module from the repository root, not as a file
@@ -1772,7 +1765,12 @@ class MhaFwdTuner(TunerCommon):
                 "elapsed_s": time.time() - started,
                 "stderr": completed.stderr[-4000:],
             }
-        except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             return {
                 "status": "failed",
                 "expected": expected,
@@ -1803,13 +1801,10 @@ class MhaFwdTuner(TunerCommon):
             "run_state": run_state,
             "strategy": self._args.strategy,
             "hardware": [
-                {
-                    field: row[field]
-                    for field in MHA_FWD_HARDWARE_KEY_FIELDS
-                }
-                for _, row in self.untunedf[
-                    list(MHA_FWD_HARDWARE_KEY_FIELDS)
-                ].drop_duplicates().iterrows()
+                {field: row[field] for field in MHA_FWD_HARDWARE_KEY_FIELDS}
+                for _, row in self.untunedf[list(MHA_FWD_HARDWARE_KEY_FIELDS)]
+                .drop_duplicates()
+                .iterrows()
             ],
             "software": {
                 "aiter_revision": revision,

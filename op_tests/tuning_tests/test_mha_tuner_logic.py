@@ -178,8 +178,7 @@ class TestMhaCandidateEnumeration(unittest.TestCase):
     def test_candidate_identities_are_unique(self):
         for gfx in ("gfx942", "gfx950", "gfx1250"):
             identities = [
-                candidate.identity
-                for candidate in enumerate_mha_fwd_candidates(gfx)
+                candidate.identity for candidate in enumerate_mha_fwd_candidates(gfx)
             ]
             self.assertEqual(len(identities), len(set(identities)))
 
