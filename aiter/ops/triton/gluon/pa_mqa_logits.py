@@ -399,9 +399,8 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
             context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
             <= context_length - next_n + pid_next_n
         )
-        o = tl.where(mask[None, :], o, float("-inf"))
-
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+        logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
             ptr=OutLogits_buffer
@@ -433,9 +432,8 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
         <= context_length - next_n + pid_next_n
     )
-    o = tl.where(mask[None, :], o, float("-inf"))
-
     logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+    logits = tl.where(mask, logits, float("-inf"))
     gl.amd.cdna3.buffer_store(
         logits,
         ptr=OutLogits_buffer
