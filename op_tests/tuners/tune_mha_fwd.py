@@ -765,7 +765,7 @@ class MhaFwdTuner(TunerCommon):
     def tune(self, untunedf, tunedf, args):
         all_infos, task_by_info, plans = self._plan_candidates(untunedf, args)
         if getattr(args, "strategy", "exhaustive") == "race":
-            return self._tune_by_race(args, untunedf, plans, all_infos, task_by_info)
+            return self._tune_by_race(args, untunedf, plans, all_infos)
         return self._tune_by_screening(args, untunedf, all_infos, task_by_info)
 
     def _plan_candidates(self, untunedf, args):
@@ -1065,7 +1065,7 @@ class MhaFwdTuner(TunerCommon):
 
         return [final_by_info.get(result[0], result) for result in first_pass]
 
-    def _tune_by_race(self, args, untunedf, plans, all_infos, task_by_info):
+    def _tune_by_race(self, args, untunedf, plans, all_infos):
         """Measure each shape as one interleaved elimination race.
 
         Screening measures every candidate once, alone, in its own worker, so
@@ -1076,14 +1076,17 @@ class MhaFwdTuner(TunerCommon):
         rather than one unlucky sample. The finalist rounds it replaces exist
         only to patch the weakness, so they go with it.
 
-        What the finalist rounds also provided, and a single-process race
-        cannot, is evidence that the winner is not an artefact of one
-        process's allocator layout, cached modules or clocks. That is kept as
-        one confirmation round in a fresh worker over the survivors only.
+        Nothing re-measures the winner afterwards. The one thing a
+        single-process race holds fixed is the tensor allocation, but a
+        process-wide effect moves every candidate together and so cannot
+        change their order; only an allocation-by-candidate interaction could,
+        and separating that from noise needs many fresh processes rather than
+        one. A single extra round is weaker evidence than the blocks it would
+        overrule.
         """
         results = []
         for plan in plans:
-            results.extend(self._race_one_shape(args, plan, task_by_info))
+            results.extend(self._race_one_shape(args, plan))
         return results
 
     def _race_block_journal(self, key):
@@ -1099,7 +1102,7 @@ class MhaFwdTuner(TunerCommon):
         digest = sha256(",".join(map(str, key)).encode("utf-8")).hexdigest()[:12]
         return f"{self._journal_path}.race-{digest}.jsonl"
 
-    def _race_one_shape(self, args, plan, task_by_info):
+    def _race_one_shape(self, args, plan):
         key = plan["key"]
         row = plan["row"]
         candidates = plan["candidates"]
@@ -1189,10 +1192,7 @@ class MhaFwdTuner(TunerCommon):
             verbose=args.verbose,
         )
 
-        confirmed = self._confirm_survivors(args, outcome, info_by_label, task_by_info)
-        return self._race_results(
-            args, key, outcome, info_by_label, rejected, confirmed
-        )
+        return self._race_results(args, key, outcome, info_by_label, rejected)
 
     @staticmethod
     def _error_ratio(produced, expected, row, args):
@@ -1222,47 +1222,11 @@ class MhaFwdTuner(TunerCommon):
             )
         return worst
 
-    def _confirm_survivors(self, args, outcome, info_by_label, task_by_info):
-        """Re-measure the survivors once in fresh workers.
-
-        The race is single-process by construction, which is what makes its
-        comparisons paired, and also why it cannot rule out that the whole
-        field was measured inside one unlucky process state. One clean-process
-        round over the handful of survivors answers that cheaply.
-        """
-        survivor_infos = [
-            info_by_label[label][0]
-            for label in outcome.survivors
-            if label in info_by_label
-        ]
-        tasks = [task_by_info[info] for info in survivor_infos if info in task_by_info]
-        if not tasks:
-            return {}
-        print(f"  confirming {len(tasks)} survivors in fresh workers", flush=True)
-        measured = mp_tuner(
-            tasks,
-            [(len(tasks), ())],
-            args.mp,
-            False,
-            True,
-            args.errRatio,
-            timeout=args.timeout,
-            verbose=args.verbose,
-            return_status=True,
-        )
-        return {
-            result[0]: result
-            for result in (measured or ())
-            if result and result[3] == "ok"
-        }
-
-    def _race_results(self, args, key, outcome, info_by_label, rejected, confirmed):
+    def _race_results(self, args, key, outcome, info_by_label, rejected):
         """Turn one race into the result rows the rest of the tuner expects.
 
         Every raced candidate is reported with its race estimate, so the
-        numbers in the profile are all on the same footing. The confirmation
-        measurement is a check on the winner rather than a second unit, and it
-        is recorded in the evidence rather than silently replacing anything.
+        numbers in the profile are all on the same footing.
         """
         results = [
             (info, float("inf"), err, status, detail)
@@ -1271,30 +1235,6 @@ class MhaFwdTuner(TunerCommon):
 
         winner_label = outcome.winner
         tie_break = outcome.tie_break
-        override = ""
-        if confirmed:
-            # If a clean process disagrees by more than the indifference zone,
-            # the race's pick was an artefact of one process and the fresh
-            # measurement wins. Recorded, never silent.
-            best_info, best = min(confirmed.items(), key=lambda item: item[1][1])
-            picked_info = info_by_label.get(winner_label, (None,))[0]
-            picked = confirmed.get(picked_info)
-            if picked is not None and best[1] > 0:
-                margin = (picked[1] - best[1]) / best[1]
-                if margin > args.delta:
-                    override = (
-                        f"confirmation moved the winner: the race pick was "
-                        f"{margin:+.2%} against a fresh-worker measurement"
-                    )
-                    winner_label = next(
-                        (
-                            label
-                            for label, (info, _) in info_by_label.items()
-                            if info == best_info
-                        ),
-                        winner_label,
-                    )
-                    tie_break = "confirmation_override"
 
         self._race_reports.append(
             {
@@ -1321,7 +1261,6 @@ class MhaFwdTuner(TunerCommon):
                 ],
                 "winner": winner_label,
                 "tie_break": tie_break,
-                "confirmation_override": override,
                 "history": [
                     {
                         "block": record.block,
@@ -1341,16 +1280,13 @@ class MhaFwdTuner(TunerCommon):
             info, err_ratio = info_by_label[verdict.label]
             samples = tuple(outcome.samples[verdict.label].block_medians)
             self._samples_by_info[info] = samples
-            detail = verdict.note
-            if verdict.label == winner_label and override:
-                detail = override
             results.append(
                 (
                     info,
                     float(outcome.samples[verdict.label].estimate),
                     float(err_ratio),
                     "ok",
-                    detail,
+                    verdict.note,
                 )
             )
         return results
