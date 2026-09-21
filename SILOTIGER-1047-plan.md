@@ -864,6 +864,13 @@ hints. GPU 6 / gfx950 stayed exact (``err=0``); width-2051 ``L=512``
 went 18.65 → 18.88 us at ``M=1`` and 21.15 → 21.56 us at ``M=8``.
 Keep the default scheduler.
 
+**Do not retry** isolated shuffle-pack 64-bit P LDS stores
+(``UniversalCopy64b`` from ``lane_m % 4 == 0`` after ``shuffle_xor``
+1/2/3). GPU 6 / gfx950 stayed exact (``err=0``); width-2051 ``L=512``
+went 18.65 → 19.28 us at ``M=1``, 21.15 → 21.98 us at ``M=8``, and
+513.29 → 566.07 us at ``M=512``. This is the P half of the earlier
+P/C widening miss. Keep scalar ``p_lds[h, n]`` stores.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
