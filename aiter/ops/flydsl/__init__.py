@@ -104,6 +104,10 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score",
         "build_work_map",
     ),
+    "minimax_m3_index_score_work_map_capacity": (
+        ".kernels.minimax_m3_index_score",
+        "work_map_capacity",
+    ),
     "minimax_m3_index_score_work_map_size": (
         ".kernels.minimax_m3_index_score",
         "work_map_size",
@@ -135,6 +139,7 @@ __all__ = [
     "minimax_m3_index_score_flydsl",
     "minimax_m3_index_score_flydsl_supported",
     "minimax_m3_index_score_work_map",
+    "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
 ]
 

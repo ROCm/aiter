@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Pin down the gfx950 MFMA 16x16x32 bf16 lane mapping.
 
 The index-score kernel's entire design rests on this mapping, so it is asserted
@@ -36,20 +39,22 @@ Run:
     python op_tests/test_flydsl_mfma_lane_mapping.py
 """
 
-import sys
-from pathlib import Path
-
-import torch
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+import argparse
+import itertools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import pandas as pd
+import pytest
+import torch
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import T
 
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 M = N = 16
 K = 32
@@ -108,15 +113,16 @@ def build_probe():
     return launch
 
 
-def main():
-    if not torch.cuda.is_available():
-        raise RuntimeError("requires a ROCm GPU")
-    arch = torch.cuda.get_device_properties(0).gcnArchName
-    print(f"# arch: {arch}")
-    if "gfx950" not in arch:
-        print("SKIP: MFMA(16,16,32) is gfx950-only")
-        return 0
+def run_torch(a, b):
+    return a.float() @ b.float().T
 
+
+@benchmark()
+def test_mapping(dtype=torch.bfloat16):
+    if dtype != torch.bfloat16:
+        raise ValueError("MFMA 16x16x32 probe supports only BF16 operands")
+    if not torch.cuda.is_available() or get_gfx() != "gfx950":
+        pytest.skip("MFMA mapping probe requires gfx950")
     dev = "cuda"
     # Positional codes (see module docstring): vary along both axes, exact in
     # bf16, and asymmetric so a transposed C mapping cannot hide.
@@ -125,19 +131,39 @@ def main():
     kk = torch.arange(K, dtype=torch.float32, device=dev)[None, :]
     a_f32 = (mm + 1) + (kk + 1) / 4
     b_f32 = 2 * (nn + 1) + (kk + 1) / 4
-    a, b = a_f32.to(torch.bfloat16), b_f32.to(torch.bfloat16)
+    a, b = a_f32.to(dtype), b_f32.to(dtype)
     assert torch.equal(a.float(), a_f32) and torch.equal(b.float(), b_f32)
     c = torch.zeros(M, N, dtype=torch.float32, device=dev)
 
     launch = build_probe()
-    _run_compiled(
-        launch,
-        ptr_arg(a, fx.BFloat16),
-        ptr_arg(b, fx.BFloat16),
-        ptr_arg(c, fx.Float32),
-        torch.cuda.current_stream().cuda_stream,
-    )
-    torch.cuda.synchronize()
+
+    def run():
+        _run_compiled(
+            launch,
+            ptr_arg(a, fx.BFloat16),
+            ptr_arg(b, fx.BFloat16),
+            ptr_arg(c, fx.Float32),
+            torch.cuda.current_stream().cuda_stream,
+        )
+        return c
+
+    candidates = {"flydsl": run}
+    ret = {"gfx": get_gfx(), "timing": "repeated-buffer"}
+    ref = run_torch(a, b)
+    for name, fn in candidates.items():
+        got, us = run_perftest(fn, num_rotate_args=1)
+        err = checkAllclose(ref.float(), got.float(), atol=0, rtol=0, tol_err_ratio=0)
+        assert err == 0
+        ret.update(
+            {
+                f"{name} us": us,
+                f"{name} TFLOPS": 2 * M * N * K / us / 1e6,
+                f"{name} TB/s": (a.numel() * 2 + b.numel() * 2 + c.numel() * 4)
+                / us
+                / 1e6,
+                f"{name} err": err,
+            }
+        )
 
     # The claim under test: with A=[M,K] and B=[N,K] both K-major, one MFMA
     # computes C[m,n] = sum_k A[m,k] * B[n,k], i.e. A @ B.T.
@@ -157,47 +183,57 @@ def main():
     ):
         assert not torch.equal(wrong, ref), f"codes cannot distinguish {tag}"
 
-    ok = torch.allclose(c, ref, atol=0, rtol=0)
-    print(f"exact match to A @ B.T : {ok}")
-    if not ok:
-        err = (c - ref).abs()
-        print(f"  mismatched slots : {int((err > 0).sum())} / {M * N}")
-        print(f"  max abs err      : {err.max().item():.6g}")
-        # Which permutation did we actually get? Naming it turns a bare
-        # failure into a pointer at the line to fix.
-        for name, cand in (
-            ("B @ A.T (operands swapped)", b.float() @ a.float().T),
-            ("C transposed (row/col mapping swapped)", ref.T),
-            ("A k-gather wrong (g not scaling k by 8)", a_dup @ b.float().T),
-            ("B k-gather wrong (g not scaling k by 8)", a.float() @ b_dup.T),
-        ):
-            if torch.equal(c, cand):
-                print(f"  -> result actually equals: {name}")
-                break
-        else:
-            print("  -> no known mis-mapping matches; inspect the dump below")
-        print("\n  got[0, :8]:", c[0, :8].tolist())
-        print("  ref[0, :8]:", ref[0, :8].tolist())
-        print("\nFAIL: the assumed lane mapping is wrong -- fix it before trusting\n      any kernel built on it.")
-        return 1
+    assert torch.equal(c, ref)
+    assert torch.equal(c[[0, 1, 2, 3], 0], ref[[0, 1, 2, 3], 0])
+    return ret
 
-    # The property the whole design depends on: a lane's 4 accumulators are
-    # 4 *different M rows* (tokens) at one N column (feature). If instead they
-    # were 4 N columns at one M row, the token reduction would need 4 cross-lane
-    # shuffles rather than a register-local fold.
-    print("\nchecking the reduction-critical property:")
-    lane0_rows = [0, 1, 2, 3]  # g=0 -> C[0..3, u=0]
-    vals = c[lane0_rows, 0]
-    ref_vals = ref[lane0_rows, 0]
-    print(f"  lane 0 holds C[0..3, 0] = {vals.tolist()}")
-    print(f"  expected                = {ref_vals.tolist()}")
-    assert torch.equal(vals, ref_vals)
-    print("  -> one lane holds 4 consecutive M rows at a single N column: CONFIRMED")
-    print("  -> with A=K (M=token), token reduction is register-local. Design holds.")
 
-    print("\nPASS")
-    return 0
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Single BF16 MFMA lane-mapping probe (fixed M=N=16, K=32; no batch axis)"
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        choices=[torch.bfloat16],
+        default=[torch.bfloat16],
+        help="operand dtype list (only bf16 is supported by this instruction)",
+    )
+    return parser.parse_args(argv)
+
+
+def test_cli_dtype():
+    assert parse_args([]).dtype == [torch.bfloat16]
+    assert parse_args(["-d", "bf16"]).dtype == [torch.bfloat16]
+    assert parse_args(["--dtype"]).dtype == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["-d", "fp16"], ["-d", "fp8"], ["-d", "unknown"], ["-b", "2"], ["-s", "16,16,32"]],
+)
+def test_cli_invalid_args(argv):
+    with pytest.raises(SystemExit) as exc:
+        parse_args(argv)
+    assert exc.value.code == 2
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not torch.cuda.is_available() or get_gfx() not in ["gfx950"]:
+        aiter.logger.warning("MFMA mapping probe requires gfx950; skipping")
+        return
+    rows = [test_mapping(dtype) for (dtype,) in itertools.product(args.dtype)]
+    if not rows:
+        aiter.logger.warning("Empty dtype selection; no MFMA tests executed")
+        return
+    aiter.logger.info(
+        "MFMA mapping summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

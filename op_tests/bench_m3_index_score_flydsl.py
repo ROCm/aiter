@@ -1,44 +1,24 @@
-"""FlyDSL index-score against the memory floor.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-Two numbers per shape, because one is needed to interpret the other:
+"""Cold-cache score timing versus a gather/max/write baseline.
 
-  flydsl  -- the kernel
-  floor   -- a kernel that reads the same K bytes and does an elementwise max,
-             no cross-lane reduction at all. This is what "memory bound" would
-             cost. An earlier version of this floor used tl.sum, which compiles
-             to the same DPP+v_max tree as the thing being measured and so was
-             never a memory bound -- that mistake is why the first round of
-             analysis concluded 2x was impossible.
-
-There used to be a third, `triton`, the kernel being replaced. It is gone:
-_decode_index_score_tiled_kernel has been deleted from ATOM now that FlyDSL is
-the only decode scorer, so the speedup column it fed cannot be reproduced here
--- and no number printed by this file is a speedup over Triton, whatever an old
-write-up may say.
-
-Correctness is not re-checked here; test_flydsl_minimax_m3_index_score.py owns
-that. This file only reports time.
-
-IMPORTANT: run on an idle GPU. `rocm-smi --showpids` must be empty. Under a
-co-resident vLLM server the same config measured 165/213/301 us across repeats.
+The baseline preserves a unique [128,128] FP32 slab per (batch, chunk).
+It is not a pure-read physical floor: its output traffic is substantial.
+Historical ratios from the racy shared-output version are not comparable.
+Scorer correctness lives in test_flydsl_minimax_m3_index_score.py; the small
+independent check_floor regression checks every baseline slab before timing.
+Run only on an idle GPU. Times explicitly flush L2 before each sample.
 """
 
 import argparse
 import itertools
-import sys
-from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
 
-ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parent
-sys.path.insert(0, str(WORKSPACE / "ATOM"))
-sys.path.insert(0, str(ROOT))
-
-from atom.model_ops.minimax_m3.index_topk import SPARSE_BLOCK_SIZE
-
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     IndexScoreConfig,
     alloc_score,
@@ -50,7 +30,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     work_chunk,
 )
 
-P = SPARSE_BLOCK_SIZE
+P = 128
 D = 128
 
 # (name, batch, max_q, num_heads, seq_len[, skew]). The middle two
@@ -140,8 +120,7 @@ def _floor_kernel(
 ):
     """Read every K page this request owns; reduce with elementwise max only.
 
-    No tl.sum, no tl.dot, no axis reduction -- so this measures the cost of
-    moving the bytes and nothing else.
+    No dot or axis reduction; each CTA still computes and writes a full slab.
     """
     b = tl.program_id(0)
     c = tl.program_id(1)
@@ -154,17 +133,63 @@ def _floor_kernel(
 
     for p in range(c * chunk_blocks, min((c + 1) * chunk_blocks, nblk)):
         page = tl.load(bt_ptr + b * sbt_b + p)
-        # '.cg' keeps the K stream out of L1. Without it this "floor" was not a
-        # memory floor at all but an L1-fill floor, and it read ~30% slow: it
-        # measured 264 us at b32_q8_s128k bf16 where the same bytes move in 191.
-        # A floor that the kernel under test can beat is worse than no floor.
+        # Keep the historical Triton .cg hint; do not assume it has the same
+        # ISA bit semantics as FlyDSL's NT without inspecting generated ISA.
         k = tl.load(
-            k_ptr + page * sk_blk + pos[:, None] * sk_pos + d[None, :],
+            k_ptr
+            + page.to(tl.int64) * sk_blk.to(tl.int64)
+            + pos[:, None] * sk_pos
+            + d[None, :],
             cache_modifier=".cg",
         )
         acc = tl.maximum(acc, k.to(tl.float32))
 
-    tl.store(out_ptr + b * BLOCK_SIZE_K * D + pos[:, None] * D + d[None, :], acc)
+    tl.store(
+        out_ptr
+        + (b.to(tl.int64) * tl.num_programs(1) + c) * BLOCK_SIZE_K * D
+        + pos[:, None] * D
+        + d[None, :],
+        acc,
+    )
+
+
+def check_floor():
+    """Every CTA must preserve its full max slab, including empty chunks."""
+    batch, mb, chunks = 2, 7, 3
+    k = (
+        torch.arange(batch * mb, device="cuda", dtype=torch.float32)[:, None, None]
+        .expand(-1, P, D)
+        .contiguous()
+    )
+    bt = torch.arange(batch * mb - 1, -1, -1, device="cuda", dtype=torch.int32).view(
+        batch, mb
+    )
+    lens = torch.tensor([7 * P, 2 * P - 1], device="cuda", dtype=torch.int32)
+    out = torch.full((batch, chunks, P, D), float("nan"), device="cuda")
+    blocks = triton.cdiv(mb, chunks)
+    _floor_kernel[(batch, chunks)](
+        k,
+        out,
+        bt,
+        lens,
+        blocks,
+        k.stride(0),
+        k.stride(1),
+        bt.stride(0),
+        BLOCK_SIZE_K=P,
+        D=D,
+    )
+    for b in range(batch):
+        for c in range(chunks):
+            ids = bt[
+                b, c * blocks : min((c + 1) * blocks, triton.cdiv(int(lens[b]), P))
+            ].long()
+            ref = (
+                k[ids].amax(0)
+                if ids.numel()
+                else torch.full((P, D), float("-inf"), device="cuda")
+            )
+            torch.testing.assert_close(out[b, c], ref, rtol=0, atol=0)
 
 
 def make_inputs(batch, max_q, num_heads, seq_len, cache_dtype, seed=0, skew=None):
@@ -252,7 +277,8 @@ def run_case(name, batch, max_q, heads, seq_len, dt, cfgs, flush, args, skew=Non
         batch, max_q, heads, seq_len, dt, skew=skew
     )
     nchunk = floor_chunks(batch, max_block)
-    fout = torch.empty(batch * P * D, dtype=torch.float32, device="cuda")
+    fout = torch.empty(batch * nchunk * P * D, dtype=torch.float32, device="cuda")
+    print(f"# {name}: gather/max/write output footprint {fout.numel()*4/1e6:.3f} MB")
     # Shuffling is a one-off cost paid when the cache is written, so it is
     # hoisted out of the timed region -- and only paid if some config wants it.
     shuf = shuffle_cache(cache) if any(c.shuffled for c in cfgs) else None
@@ -303,6 +329,10 @@ def run_case(name, batch, max_q, heads, seq_len, dt, cfgs, flush, args, skew=Non
 
 
 def main():
+    if not torch.cuda.is_available() or get_gfx() not in ["gfx950"]:
+        print("SKIP: score benchmark requires gfx950")
+        return
+    check_floor()
     ap = argparse.ArgumentParser()
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--repeat", type=int, default=20)
@@ -335,7 +365,9 @@ def main():
     flush = torch.empty(512 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
 
     print(f"# arch: {arch}")
-    print("# floor = same K bytes, elementwise max, no cross-lane reduction\n")
+    print(
+        "# floor = gather/max/write baseline with unique slabs, NOT a pure-read lower bound\n"
+    )
     hdr = (
         f"| {'case':<22} | {'dt':<4} | {'GB':>6} | {'flydsl':>9} | "
         f"{'floor':>9} | {'vs floor':>8} | {'TB/s':>5} |"
@@ -347,18 +379,18 @@ def main():
         return [int(x) for x in v.split(",")]
 
     if args.sweep:
-        space = dict(
-            pages_per_wave=[1, 2], feat_waves=[1, 2, 4], token_waves=[1, 2, 4],
-            q_to_lds=[0, 1], shuffled=[0, 1], waves_per_eu=[0],
-        )  # fmt: skip
+        space = {
+            "pages_per_wave": [1, 2], "feat_waves": [1, 2, 4], "token_waves": [1, 2, 4],
+            "q_to_lds": [0, 1], "shuffled": [0, 1], "waves_per_eu": [0],
+        }  # fmt: skip
     else:
-        space = dict(
-            pages_per_wave=ints(args.ppw), feat_waves=ints(args.feat_waves),
-            token_waves=ints(args.token_waves),
-            q_to_lds=ints(args.q_lds), shuffled=ints(args.shuffled),
-            waves_per_eu=ints(args.wpe), nt_k=ints(args.nt),
-            sched=ints(args.sched),
-        )  # fmt: skip
+        space = {
+            "pages_per_wave": ints(args.ppw), "feat_waves": ints(args.feat_waves),
+            "token_waves": ints(args.token_waves),
+            "q_to_lds": ints(args.q_lds), "shuffled": ints(args.shuffled),
+            "waves_per_eu": ints(args.wpe), "nt_k": ints(args.nt),
+            "sched": ints(args.sched),
+        }  # fmt: skip
     keys = list(space)
     all_cfgs = [
         IndexScoreConfig(**dict(zip(keys, v)))

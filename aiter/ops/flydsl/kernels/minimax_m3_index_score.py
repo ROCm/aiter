@@ -135,6 +135,7 @@ Remaining levers, in the order they are worth trying:
      and 2x the waves again at b16_q1_s8k. Untested.
 """
 
+import math
 from dataclasses import dataclass, replace
 
 import flydsl.compiler as flyc
@@ -326,7 +327,12 @@ _CTA_OVERSUBSCRIBE = 4
 
 
 def resolve_config(
-    batch: int, max_block: int, cfg: IndexScoreConfig, S: int = 0, H: int = 0
+    batch: int,
+    max_block: int,
+    cfg: IndexScoreConfig,
+    S: int = 0,
+    H: int = 0,
+    device=None,
 ):
     """Fill in `cfg`'s shape-dependent fields. Idempotent; explicit wins.
 
@@ -395,9 +401,16 @@ def resolve_config(
         return cfg
 
     if not cfg.pages_per_wave:
+        import torch
+
         from aiter.jit.utils.chip_info import get_cu_num
 
-        target = get_cu_num() * _CTA_OVERSUBSCRIBE
+        cu = (
+            get_cu_num()
+            if device is None
+            else torch.cuda.get_device_properties(device).multi_processor_count
+        )
+        target = cu * _CTA_OVERSUBSCRIBE
         best = 1
         for ppw in (2, 4):
             chunk = (WAVES // (cfg.feat_waves * cfg.token_waves)) * ppw
@@ -411,7 +424,7 @@ def resolve_config(
     return cfg
 
 
-def selection_filter(S: int, H: int, cfg: IndexScoreConfig) -> bool:
+def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
     """Is this config legal for this shape? Mirrors gemm_kernels.selection_filter."""
     # 0 is the "auto" sentinel and legal everywhere; resolve_config only ever
     # picks a value this same filter would accept.
@@ -425,6 +438,8 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig) -> bool:
         return False
     if cfg.waves_per_eu and not 1 <= cfg.waves_per_eu <= 10:
         return False
+    if not 0 <= cfg.nt_k <= 3:
+        return False
     if not -1 <= cfg.sched <= 4:  # -1 is the auto sentinel, see resolve_config
         return False
     if cfg.cp_world < 1 or not 0 <= cfg.cp_rank < cfg.cp_world:
@@ -433,7 +448,7 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig) -> bool:
         from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
         need = q_lds_bytes(S, H, cfg) + reduce_lds_bytes(S, H, cfg)
-        if need > get_lds_capacity_bytes(get_gfx().split(":", 1)[0]):
+        if need > get_lds_capacity_bytes((arch or get_gfx()).split(":", 1)[0]):
             return False
     return True
 
@@ -470,7 +485,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
     S = max query tokens per request (num_spec + 1), H = index heads.
     F = S*H is the feature count, laid out as column n = tok*H + head.
     """
-    if not selection_filter(S, H, cfg):
+    if not selection_filter(S, H, cfg, arch="gfx950"):
         raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
     pages_per_wave = cfg.pages_per_wave
     shuffled = cfg.shuffled
@@ -486,7 +501,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
     # FT feature tiles in total; FTW of them per wave; FT_PAD = FTW*feat_waves
     # is what the LDS buffer is sized on (see _tiling). FEAT_WAVES waves split
     # the feature axis, the remaining PAGE_WAVES cover distinct pages.
-    FT, FTW, FT_PAD = _tiling(S, H, cfg)
+    _ft, FTW, FT_PAD = _tiling(S, H, cfg)
     FEAT_WAVES = cfg.feat_waves
     TOKEN_WAVES = cfg.token_waves
     # FEAT_WAVES x TOKEN_WAVES waves cooperate on one page; PAGE_WAVES groups
@@ -606,7 +621,6 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
         q_buf = ptr_buf_tensor(arg_q, fx.Int32)
         # Indexed in 16 B units, not i32s: every K access is a dwordx4, and the
         # copy atom that carries the cache policy needs the width in the layout.
-        k4_buf = ptr_buf_tensor(arg_k, fx.Int32, unit_elems=4)
         s_buf = ptr_buf_tensor(arg_score, fx.Float32)
         bt_buf = ptr_buf_tensor(arg_bt, fx.Int32)
         wm_buf = ptr_buf_tensor(arg_work, fx.Int32)
@@ -619,7 +633,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
         wm = fx.add_offset(fx.get_iter(wm_buf), n * fx.Int32(2))
         packed = fx.Int32(wm.load(T.i32))
         seq_len = fx.Int32(fx.add_offset(wm, fx.Int32(1)).load(T.i32))
-        b = packed >> fx.Int32(16)
+        b = (packed >> fx.Int32(16)) & fx.Int32(0xFFFF)
         c = packed & fx.Int32(0xFFFF)
         # Pages this request actually owns. Grid is sized from max_seq_len, so
         # trailing waves find nothing to do.
@@ -840,13 +854,29 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
             The table is not sharded -- every rank sees the whole of it -- so
             this indexes with the global id.
             """
+            # Empty CP shards may have no column for CP_RANK at all. They
+            # still form descriptors (and token-split waves execute barriers),
+            # so clamp their speculative load to the always-present column 0.
+            column = (num_pages > zero).select(global_block(p), zero)
             return fx.Int32(
-                fx.add_offset(
-                    fx.get_iter(bt_buf), b * i32_stride_bt_b + global_block(p)
-                ).load(T.i32)
+                fx.add_offset(fx.get_iter(bt_buf), b * i32_stride_bt_b + column).load(
+                    T.i32
+                )
             )
 
         page_ids = [load_page_id((pp < last).select(pp, last)) for pp in pages]
+
+        def page_buffer(page):
+            # Widen BEFORE multiplication. A pool can exceed the descriptor's
+            # 4 GiB range; only within-page offsets belong in the buffer index.
+            page_bytes = fx.Int64(i32_stride_k_blk) * fx.Int64(1 if fp8 else 2)
+            address = fx.Int64(fx.ptrtoint(arg_k)) + fx.Int64(page) * page_bytes
+            ptr = fx.inttoptr(arg_k.type, address)
+            return ptr_buf_tensor(
+                ptr, fx.Int32, unit_elems=4, num_records_bytes=fx.Int32(page_bytes)
+            )
+
+        page_buffers = [page_buffer(page) for page in page_ids]
 
         # -- K fragment access ------------------------------------------------
         # Issue and consume are split so a whole panel's loads (and the next
@@ -862,7 +892,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
         # keep the default policy: they are small and genuinely re-read.
         k_atom = buf_copy_atom(16, fx.Int32, cache_modifier=nt_k)
 
-        def load_k16(unit):
+        def load_k16(page_buf, unit):
             """One 16 B K access at 16 B-unit index `unit`, via the k_atom.
 
             Goes through a copy atom rather than a plain `.load()` because the
@@ -871,7 +901,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
             registers, so the compiler still sinks the s_waitcnt to first use
             and a whole panel's loads remain in flight.
             """
-            src = fx.slice(k4_buf, (unit, None))
+            src = fx.slice(page_buf, (unit, None))
             frag = fx.make_fragment_like(src)
             fx.copy(k_atom, src, frag)
             return fx.Vector(fx.memref_load_vec(frag))
@@ -888,24 +918,24 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
                 # instruction reads WAVE*16 = 1024 contiguous bytes instead of
                 # 16 chunks scattered one row-stride apart. Addressing no longer
                 # involves u, the row stride, or k_offset at all.
-                base = page * i32_stride_k_blk + (
+                base = (
                     fx.Int32((panel * K_LOADS + i) * WAVE) + tw_slot + lane
                 ) * fx.Int32(CHUNK_ELEMS)
                 # base is in cache elements; >>4 (fp8) / >>3 (bf16) turns it into
                 # a 16 B unit index. Both are exact: CHUNK_ELEMS is one 16 B
                 # chunk by construction, and the strides above it are multiples.
                 shift = fx.Int32(4) if const_expr(fp8) else fx.Int32(3)
-                return load_k16(base >> shift)
+                return load_k16(page, base >> shift)
             tok_row = fx.Int32(MFMA_M * panel) + tw_tok + u
-            base = page * i32_stride_k_blk + tok_row * i32_stride_k_pos
+            base = tok_row * i32_stride_k_pos
             if const_expr(fp8):
                 # k_offset(2i) = 64*i + 16*g and k_offset(2i+1) = that + 8, so
                 # the two k-steps are 16 contiguous bytes: one dwordx4, and the
                 # four g-lanes tile exactly one 64 B line.
                 base = base + fx.Int32(64 * i) + g * fx.Int32(16)
-                return load_k16(base >> fx.Int32(4))
+                return load_k16(page, base >> fx.Int32(4))
             base = base + fx.Int32(i * MFMA_K) + g * fx.Int32(8)
-            return load_k16(base >> fx.Int32(3))
+            return load_k16(page, base >> fx.Int32(3))
 
         def convert_k(raws, ks):
             """Widen the raw load holding k-step ks into a bf16 A-fragment.
@@ -1158,8 +1188,8 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
         def body():
             carry = None
             for j in range_constexpr(pages_per_wave):
-                nxt = page_ids[j + 1] if j + 1 < pages_per_wave else None
-                run_max, carry = page_loop(pages[j], page_ids[j], carry, nxt)
+                nxt = page_buffers[j + 1] if j + 1 < pages_per_wave else None
+                run_max, carry = page_loop(pages[j], page_buffers[j], carry, nxt)
                 # With one page per wave and the guard below in place, that
                 # guard already proved the page in range and the extra mask
                 # would be dead.
@@ -1239,8 +1269,8 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
 _CACHE = {}
 
 
-def _get(S, H, fp8, cfg):
-    key = (S, H, fp8, cfg)  # IndexScoreConfig is frozen, hence hashable
+def _get(S, H, fp8, cfg, device):
+    key = (S, H, fp8, cfg, device)  # IndexScoreConfig is frozen, hence hashable
     if key not in _CACHE:
         _CACHE[key] = build_index_score(S, H, fp8, cfg)
     return _CACHE[key]
@@ -1328,17 +1358,31 @@ def make_work_map(seq_lens, max_block, chunk, out=None, world: int = 1, rank: in
     """
     import torch
 
-    assert world >= 1 and 0 <= rank < world, f"bad shard {rank}/{world}"
+    if world < 1 or not 0 <= rank < world or chunk < 1 or max_block < 1:
+        raise ValueError("invalid shard, chunk or max_block")
+    _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, seq_lens.device)
+    if seq_lens.stride() != (1,):
+        raise ValueError("seq_lens must be contiguous")
     batch = seq_lens.shape[0]
     chunks = (max_block + chunk - 1) // chunk
-    assert batch <= 0xFFFF and chunks <= 0x10000, "b and c must pack into 32 bits"
+    if batch > 0xFFFF or chunks > 0x10000 or batch * chunks * 8 > 0xFFFFFFFF:
+        raise ValueError("work_map: packed IDs or address span out of range")
+    if out is not None:
+        _validate_map(out, batch * chunks, seq_lens.device, exact=True)
     if out is None:
-        out = torch.empty((batch * chunks, 2), dtype=torch.int32, device=seq_lens.device)
+        out = torch.empty(
+            (batch * chunks, 2), dtype=torch.int32, device=seq_lens.device
+        )
 
     lens = seq_lens.to(torch.int32)
     nblk = (lens + (PAGE - 1)) // PAGE
     if world > 1:
-        nblk = (nblk - rank).clamp_(min=0).add_(world - 1).div_(world, rounding_mode="floor")
+        nblk = (
+            (nblk - rank)
+            .clamp_(min=0)
+            .add_(world - 1)
+            .div_(world, rounding_mode="floor")
+        )
     nch = (nblk + (chunk - 1)) // chunk  # work items this request owns
     cum = torch.cumsum(nch, 0, dtype=torch.int32)  # inclusive
     n = torch.arange(batch * chunks, dtype=torch.int32, device=seq_lens.device)
@@ -1354,11 +1398,13 @@ def make_work_map(seq_lens, max_block, chunk, out=None, world: int = 1, rank: in
     return out
 
 
-def work_map_size(batch: int, max_block: int, S: int = 0, H: int = 0, cfg=None) -> int:
+def work_map_size(
+    batch: int, max_block: int, S: int = 0, H: int = 0, cfg=None, *, device=None
+) -> int:
     """Rows `make_work_map` will produce -- i.e. the grid, one row per CTA.
 
     The buffer itself is `[rows, 2]` int32; a caller sizing a persistent one for
-    a cudagraph should allocate the worst case (max batch, max blocks) and hand
+    a cudagraph must use work_map_capacity (exact grid size is non-monotonic) and hand
     `make_work_map` a `buf[:rows]` slice, which stays packed and so stays a legal
     kernel argument.
 
@@ -1369,9 +1415,25 @@ def work_map_size(batch: int, max_block: int, S: int = 0, H: int = 0, cfg=None) 
     Under context parallelism `max_block` is the local bound, so this is the
     shard's grid -- roughly 1/world of the unsharded one.
     """
-    cfg = resolve_config(batch, max_block, cfg or IndexScoreConfig(), S, H)
+    cfg = cfg or IndexScoreConfig()
+    _validate_bounds(batch, max_block, cfg, resolved=False)
+    cfg = resolve_config(batch, max_block, cfg, S, H, device=device)
+    _validate_bounds(batch, max_block, cfg)
     chunk = work_chunk(cfg)
     return batch * ((max_block + chunk - 1) // chunk)
+
+
+def work_map_capacity(
+    max_batch: int, max_block: int, S: int = 0, H: int = 0, cfg=None
+) -> int:
+    """Persistent rows for every batch/block bound within the envelope.
+
+    Unlike exact work_map_size, auto depth uses the minimum (one page/wave),
+    so crossing a CU-dependent dispatch threshold cannot exceed this buffer.
+    """
+    cfg = cfg or IndexScoreConfig()
+    cfg = replace(cfg, pages_per_wave=cfg.pages_per_wave or 1)
+    return _validate_bounds(max_batch, max_block, cfg)
 
 
 def build_work_map(seq_lens, max_block, S: int = 0, H: int = 0, cfg=None, out=None):
@@ -1384,14 +1446,38 @@ def build_work_map(seq_lens, max_block, S: int = 0, H: int = 0, cfg=None, out=No
     kernel indexes with the wrong stride.
 
     `out` may be larger than needed (a persistent worst-case buffer sized by
-    `work_map_size`); it is sliced down here, and a short one is an error rather
+    `work_map_capacity`); it is sliced down here, and a short one is an error rather
     than a silently truncated grid.
     """
-    cfg = resolve_config(seq_lens.shape[0], max_block, cfg or IndexScoreConfig(), S, H)
+    import torch
+
+    _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, seq_lens.device)
+    cfg = cfg or IndexScoreConfig()
+    _validate_bounds(seq_lens.shape[0], max_block, cfg, resolved=False)
+    cfg = resolve_config(
+        seq_lens.shape[0],
+        max_block,
+        cfg,
+        S,
+        H,
+        device=seq_lens.device,
+    )
+    _validate_bounds(seq_lens.shape[0], max_block, cfg)
+    if (
+        S
+        and H
+        and not selection_filter(
+            S,
+            H,
+            cfg,
+            arch=torch.cuda.get_device_properties(seq_lens.device).gcnArchName,
+        )
+    ):
+        raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
     chunk = work_chunk(cfg)
     if out is not None:
         rows = seq_lens.shape[0] * ((max_block + chunk - 1) // chunk)
-        assert out.shape[0] >= rows, f"work map buffer holds {out.shape[0]} < {rows}"
+        _validate_map(out, rows, seq_lens.device)
         out = out[:rows]
     # The shard comes from the same cfg the kernel will be compiled against, so
     # the map and the kernel cannot disagree about which blocks this rank owns.
@@ -1400,49 +1486,196 @@ def build_work_map(seq_lens, max_block, S: int = 0, H: int = 0, cfg=None, out=No
     )
 
 
-def index_score_supported(
-    idx_q, cache, S: int, H: int, max_block: int, block_table=None, cfg=None
-) -> bool:
-    """Can `score_flydsl` serve this call?
+def _span(t):
+    """Elements addressed from data_ptr(), including padding (not storage size)."""
+    return 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()))
 
-    `score_flydsl` enforces its envelope with asserts, which is right for a test
-    but wrong for a dispatcher that has a working fallback. This is the same
-    envelope phrased as a question, so a caller can pick the other path without
-    catching AssertionError.
 
-    Cheap but not free (it resolves a config, which reads the CU count) --
-    memoize it on the shape if it is on a per-layer path.
+def _validate_tensor(t, name, dtype, ndim, device, alignment=4, bounded=True):
+    import torch
+
+    if not isinstance(t, torch.Tensor) or t.dtype not in dtype or t.ndim != ndim:
+        raise ValueError(f"{name}: invalid dtype or rank")
+    if t.device != device or t.device.type != "cuda":
+        raise ValueError(f"{name}: expected CUDA tensor on {device}")
+    if any(n < 1 for n in t.shape) or any(
+        st <= 0 or st > 0x7FFFFFFF for st in t.stride()
+    ):
+        raise ValueError(f"{name}: empty shape or unsupported stride")
+    if t.data_ptr() % alignment:
+        raise ValueError(f"{name}: base must be {alignment}-byte aligned")
+    if bounded and (_span(t) > 0x7FFFFFFF or _span(t) * t.element_size() > 0xFFFFFFFF):
+        raise ValueError(f"{name}: strided address span exceeds 32-bit addressing")
+
+
+def _validate_map(out, rows, device, exact=False):
+    import torch
+
+    _validate_tensor(out, "work_map", (torch.int32,), 2, device)
+    if out.shape[1] != 2 or out.stride() != (2, 1) or out.shape[0] < rows:
+        raise ValueError(f"work_map: expected packed [at least {rows}, 2] int32")
+    if exact and out.shape[0] != rows:
+        raise ValueError(f"work_map: expected exact grid slice [{rows}, 2]")
+
+
+def _validate_bounds(batch, max_block, cfg, *, resolved=True) -> int:
+    """Validate packed/address arithmetic and return the exact grid row count."""
+    integer_fields = (
+        cfg.feat_waves,
+        cfg.token_waves,
+        cfg.pages_per_wave,
+        cfg.cp_world,
+        cfg.cp_rank,
+        cfg.sched,
+        cfg.nt_k,
+        cfg.waves_per_eu,
+    )
+    if any(not isinstance(value, int) for value in integer_fields):
+        raise ValueError("config geometry and policy fields must be integers")
+    if (
+        not 0 <= cfg.nt_k <= 3
+        or not -1 <= cfg.sched <= 4
+        or not 0 <= cfg.waves_per_eu <= 10
+    ):
+        raise ValueError("invalid cache, scheduling or occupancy policy")
+    if not isinstance(batch, int) or not 0 <= batch <= 0xFFFF:
+        raise ValueError("batch must be in [0, 65535] for packed request IDs")
+    if not isinstance(max_block, int) or max_block < 1:
+        raise ValueError("max_block must be positive")
+    if (
+        cfg.feat_waves < 1
+        or cfg.token_waves < 1
+        or WAVES % (cfg.feat_waves * cfg.token_waves)
+    ):
+        raise ValueError("invalid wave split")
+    if (
+        cfg.pages_per_wave < 0
+        or cfg.cp_world < 1
+        or not 0 <= cfg.cp_rank < cfg.cp_world
+    ):
+        raise ValueError("invalid page depth or CP shard")
+    if not resolved:
+        return 0  # Geometry only; auto depth must be resolved before packing.
+    # Includes rounded tail lanes and causal token arithmetic, before masking.
+    chunk = work_chunk(replace(cfg, pages_per_wave=cfg.pages_per_wave or 1))
+    chunks = (max_block + chunk - 1) // chunk
+    if chunks > 0x10000 or batch * chunks * 8 > 0xFFFFFFFF:
+        raise ValueError("work_map: packed chunk or address range exceeded")
+    if ((chunks * chunk) * cfg.cp_world + cfg.cp_rank) * PAGE > 0x7FFFFFFF:
+        raise ValueError("max_block: causal token address exceeds int32")
+    return batch * chunks
+
+
+def _validate_metadata(
+    idx_q,
+    cache,
+    S,
+    H,
+    max_block,
+    block_table=None,
+    cfg=None,
+    seq_lens=None,
+    out=None,
+    work_map=None,
+):
+    """Metadata only: no device reads, synchronization, or per-layer allocations.
+
+    Contents are a caller contract: 0 <= seq_lens <= INT32_MAX-127,
+    each length fits max_block's local CP bound and the global block table,
+    and every referenced physical page ID is in [0, cache.shape[0]). Even
+    zero-length requests need a valid clamped table entry at column zero.
+    A supplied map must be rebuilt when lengths change, with the same config.
     """
     import torch
 
-    try:
-        if idx_q.dtype != torch.bfloat16 or idx_q.shape[2] != HEAD_DIM:
-            return False
-        # `fp8 = cache.dtype != bfloat16` downstream, so anything else that is
-        # not e4m3 would be silently reinterpreted rather than rejected.
-        if cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-            return False
-        if cache.ndim != 3 or cache.shape[1] != PAGE or cache.shape[2] != HEAD_DIM:
-            return False
-        if cache.stride(2) != 1 or idx_q.stride(2) != 1:
-            return False
-        if block_table is not None and (
-            block_table.dtype != torch.int32 or block_table.stride(1) != 1
+    if not isinstance(S, int) or not isinstance(H, int) or S < 1 or H < 1:
+        raise ValueError("S and H must be positive integers")
+    device = idx_q.device
+    _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
+    _validate_tensor(
+        cache, "cache", (torch.bfloat16, torch.float8_e4m3fn), 3, device, 16, False
+    )
+    if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx950":
+        raise ValueError("index score requires gfx950")
+    if idx_q.shape[1:] != (H, HEAD_DIM) or idx_q.shape[0] % S:
+        raise ValueError("idx_q: expected [batch*S, H, 128]")
+    if cache.shape[1:] != (PAGE, HEAD_DIM) or cache.shape[0] > 0x7FFFFFFF:
+        raise ValueError("cache: expected [pages, 128, 128] with int32 page IDs")
+    for t, name in ((idx_q, "idx_q"), (cache, "cache")):
+        if t.stride(2) != 1 or any(st * t.element_size() % 16 for st in t.stride()[:2]):
+            raise ValueError(f"{name}: rows and heads/pages must be 16-byte aligned")
+        if (
+            t.stride(1) < HEAD_DIM
+            or t.stride(0) < (t.shape[1] - 1) * t.stride(1) + HEAD_DIM
         ):
-            return False
-        if S < 1 or H < 1 or max_block < 1:
-            return False
-        batch = idx_q.shape[0] // S
-        if batch < 1 or idx_q.shape[0] != batch * S or idx_q.shape[1] != H:
-            return False
-        cfg = resolve_config(batch, max_block, cfg or IndexScoreConfig(), S, H)
-        if not selection_filter(S, H, cfg):
-            return False
-        # make_work_map packs (request, chunk) into one int32.
-        chunk = work_chunk(cfg)
-        chunks = (max_block + chunk - 1) // chunk
-        return batch <= 0xFFFF and chunks <= 0x10000
-    except (AttributeError, IndexError, ValueError, ZeroDivisionError):
+            raise ValueError(f"{name}: overlapping rows are unsupported")
+    if cache.stride(0) * cache.element_size() > 0x7FFFFFFF:
+        raise ValueError("cache: a single page span exceeds int32")
+    batch = idx_q.shape[0] // S
+    cfg = cfg or IndexScoreConfig()
+    _validate_bounds(batch, max_block, cfg, resolved=False)
+    cfg = resolve_config(batch, max_block, cfg, S, H, device=device)
+    rows = _validate_bounds(batch, max_block, cfg)
+    if cfg.shuffled and cache.stride(1) != HEAD_DIM:
+        raise ValueError("shuffled cache must be packed within each page")
+    if not selection_filter(S, H, cfg, arch="gfx950"):
+        raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
+    if block_table is not None:
+        _validate_tensor(block_table, "block_table", (torch.int32,), 2, device)
+        if (
+            block_table.shape[0] != batch
+            or block_table.stride(1) != 1
+            or block_table.stride(0) < block_table.shape[1]
+        ):
+            raise ValueError("block_table: invalid shape or layout")
+    if seq_lens is not None:
+        _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, device)
+        if seq_lens.shape != (batch,) or seq_lens.stride() != (1,):
+            raise ValueError("seq_lens: expected contiguous [batch]")
+    if out is not None:
+        _validate_tensor(out, "out", (torch.float32,), 3, device)
+        if out.shape != (H, batch * S, max_block):
+            raise ValueError("out: expected [H, batch*S, max_block]")
+        # Both production layouts, including non-overlapping aligned padding.
+        st = out.stride()
+        contiguous = st[2] == 1 and st[1] >= max_block and st[0] >= batch * S * st[1]
+        feature = st[0] == 1 and st[1] >= H and st[2] >= batch * S * st[1]
+        if not (contiguous or feature):
+            raise ValueError("out: expected page- or feature-contiguous layout")
+    elif H * batch * S * max_block * 4 > 0xFFFFFFFF:
+        raise ValueError("out: address span exceeds 32-bit addressing")
+    if work_map is not None:
+        _validate_map(work_map, rows, device, exact=True)
+    return batch, cfg
+
+
+def index_score_supported(
+    idx_q,
+    cache,
+    S: int,
+    H: int,
+    max_block: int,
+    block_table=None,
+    cfg=None,
+    *,
+    seq_lens=None,
+    out=None,
+    work_map=None,
+) -> bool:
+    """Metadata-only predicate sharing the execution entry point's validation."""
+    try:
+        _validate_metadata(
+            idx_q, cache, S, H, max_block, block_table, cfg, seq_lens, out, work_map
+        )
+        return True
+    except (
+        AttributeError,
+        IndexError,
+        TypeError,
+        ValueError,
+        ZeroDivisionError,
+        RuntimeError,
+    ):
         return False
 
 
@@ -1522,22 +1755,20 @@ def score_flydsl(
     elif cfg_kwargs:
         raise TypeError("pass either cfg or its fields as keywords, not both")
 
-    assert idx_q.shape[2] == HEAD_DIM, f"head_dim must be {HEAD_DIM}"
-    assert idx_q.dtype == torch.bfloat16
-    assert cache.stride(2) == 1 and idx_q.stride(2) == 1
-    fp8 = cache.dtype != torch.bfloat16
-    batch = seq_lens.shape[0]
-
-    # Before _get, so the cache key is the concrete config and not the sentinel,
-    # and before make_work_map, which needs the resolved chunk size. A caller
-    # passing its own work_map must have resolved with the same bounds -- which
-    # it will have, since the chunk size depends only on batch and max_block.
-    cfg = resolve_config(batch, max_block, cfg, S, H)
+    batch, cfg = _validate_metadata(
+        idx_q, cache, S, H, max_block, block_table, cfg, seq_lens, out, work_map
+    )
+    if block_table is None or seq_lens is None:
+        raise ValueError("block_table and seq_lens are required")
+    scaled = sm_scale * LOG2E
+    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
+        raise ValueError("sm_scale * LOG2E must be finite and positive in FP32")
+    fp8 = cache.dtype == torch.float8_e4m3fn
 
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
 
-    launch, chunk = _get(S, H, fp8, cfg)
+    launch, chunk = _get(S, H, fp8, cfg, idx_q.device.index)
     # Grid depends only on launch-time bounds, never on seq_lens contents, so
     # it stays valid across a cudagraph replay with different lengths.
     chunks = (max_block + chunk - 1) // chunk
@@ -1548,24 +1779,25 @@ def score_flydsl(
             seq_lens, max_block, chunk, world=cfg.cp_world, rank=cfg.cp_rank
         )
 
-    _run_compiled(
-        launch,
-        ptr_arg(idx_q, fx.BFloat16),
-        ptr_arg(cache, fx.Float8E4M3FN if fp8 else fx.BFloat16),
-        ptr_arg(out, fx.Float32),
-        ptr_arg(block_table, fx.Int32),
-        ptr_arg(work_map, fx.Int32),
-        idx_q.stride(0),
-        idx_q.stride(1),
-        cache.stride(0),
-        cache.stride(1),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        block_table.stride(0),
-        float(sm_scale * LOG2E),
-        batch,
-        chunks,
-        torch.cuda.current_stream().cuda_stream,
-    )
+    with torch.cuda.device(idx_q.device):
+        _run_compiled(
+            launch,
+            ptr_arg(idx_q, fx.BFloat16),
+            ptr_arg(cache, fx.Float8E4M3FN if fp8 else fx.BFloat16),
+            ptr_arg(out, fx.Float32),
+            ptr_arg(block_table, fx.Int32),
+            ptr_arg(work_map, fx.Int32),
+            idx_q.stride(0),
+            idx_q.stride(1),
+            cache.stride(0),
+            cache.stride(1),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            block_table.stride(0),
+            float(sm_scale * LOG2E),
+            batch,
+            chunks,
+            torch.cuda.current_stream(idx_q.device).cuda_stream,
+        )
     return out
