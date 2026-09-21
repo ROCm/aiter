@@ -9,6 +9,17 @@ Single Triton kernel. Grid: (batch, heads).
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_fused_kda_spec_parallel_v_repr = make_kernel_repr(
+    "fused_kda_spec_parallel_v_kernel",
+    ["H", "K", "V", "W", "BV", "SPEC_LEN"],
+)
+_fused_kda_spec_finalize_repr = make_kernel_repr(
+    "fused_kda_spec_finalize_kernel",
+    ["H", "K", "V", "W", "SPEC_LEN"],
+)
+
 
 @triton.jit
 def fused_conv_recurrent_norm_kernel(
@@ -329,7 +340,7 @@ def fused_conv_recurrent_norm_kernel(
         )
 
 
-@triton.jit
+@triton.jit(repr=_fused_kda_spec_parallel_v_repr)
 def fused_kda_spec_parallel_v_kernel(
     x_ptr,
     conv_weight_ptr,
@@ -352,6 +363,7 @@ def fused_kda_spec_parallel_v_kernel(
     V: tl.constexpr,
     W: tl.constexpr,
     BV: tl.constexpr,
+    SPEC_LEN: tl.constexpr,
     stride_x_tok,
     stride_cw_group,
     stride_cw_width,
@@ -364,7 +376,12 @@ def fused_kda_spec_parallel_v_kernel(
     stride_indices_seq,
     stride_indices_tok,
 ):
-    """Run the eight-token speculative recurrence in parallel V tiles."""
+    """Run the SPEC_LEN-token speculative recurrence in parallel V tiles.
+
+    Every sequence is expected to hold exactly SPEC_LEN tokens; ssm_state_indices
+    is only SPEC_LEN wide, so the token loop is clamped to that width to keep a
+    longer sequence from indexing past the row.
+    """
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
     i_vt = tl.program_id(2)
@@ -481,7 +498,8 @@ def fused_kda_spec_parallel_v_kernel(
 
     # Software-pipeline token-dependent loads while preserving the loop-carried
     # recurrent state dependency.
-    for i_t in tl.range(0, seq_t, num_stages=2):
+    n_tok = tl.minimum(seq_t, SPEC_LEN)
+    for i_t in tl.range(0, n_tok, num_stages=2):
         tok = bos + i_t
         p_x = x_ptr + tok * stride_x_tok
         b_x_q = tl.load(p_x + q_off + o_k).to(tl.float32)
@@ -528,7 +546,7 @@ def fused_kda_spec_parallel_v_kernel(
         )
 
 
-@triton.jit
+@triton.jit(repr=_fused_kda_spec_finalize_repr)
 def fused_kda_spec_finalize_kernel(
     x_ptr,
     conv_state_ptr,
@@ -545,13 +563,18 @@ def fused_kda_spec_finalize_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     W: tl.constexpr,
+    SPEC_LEN: tl.constexpr,
     stride_x_tok: tl.constexpr,
     stride_cs_slot: tl.constexpr,
     stride_cs_dim: tl.constexpr,
     stride_cs_pos: tl.constexpr,
     stride_og_tok: tl.constexpr,
 ):
-    """Normalize tiled output and commit speculative convolution state once."""
+    """Normalize tiled output and commit speculative convolution state once.
+
+    Launched with SPEC_LEN programs on the token axis, matching the width of the
+    conv state reserved for the speculative window.
+    """
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
     i_t = tl.program_id(2)

@@ -108,6 +108,9 @@ def fused_kda_decode(
     stride_beta_tok = beta.stride(1) if beta.dim() == 3 else beta.stride(0)
     stride_og_tok = out_gate.stride(0)
 
+    # The spec-7 kernels are hard-specialized to an 8-token window: the conv
+    # state reserves W - 1 + 7 == 10 positions and ssm_state_indices is 8 wide.
+    spec_len = 8
     use_parallel_spec7 = (
         is_spec_decoding
         and get_arch() == "gfx950"
@@ -116,7 +119,8 @@ def fused_kda_decode(
         and V == 128
         and W == 4
         and conv_state.shape[2] == 10
-        and T == batch * 8
+        and ssm_state_indices.shape[1] == spec_len
+        and T == batch * spec_len
     )
     if use_parallel_spec7:
         block_v = 16
@@ -149,6 +153,7 @@ def fused_kda_decode(
             V=V,
             W=W,
             BV=block_v,
+            SPEC_LEN=spec_len,
             stride_x_tok=mixed_qkv.stride(0),
             stride_cw_group=stride_cw_group,
             stride_cw_width=stride_cw_width,
@@ -162,7 +167,7 @@ def fused_kda_decode(
             stride_indices_tok=stride_indices_tok,
             num_warps=2,
         )
-        fused_kda_spec_finalize_kernel[(batch, H, 8)](
+        fused_kda_spec_finalize_kernel[(batch, H, spec_len)](
             mixed_qkv,
             conv_state,
             conv_carry,
@@ -178,6 +183,7 @@ def fused_kda_decode(
             K=K,
             V=V,
             W=W,
+            SPEC_LEN=spec_len,
             stride_x_tok=mixed_qkv.stride(0),
             stride_cs_slot=conv_state.stride(0),
             stride_cs_dim=conv_state.stride(1),
