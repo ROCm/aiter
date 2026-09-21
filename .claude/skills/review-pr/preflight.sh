@@ -26,13 +26,24 @@ chk "curl available" "command -v curl" "install curl"
 chk "gh available" "command -v gh" "install GitHub CLI (gh) — fetch.sh Step 1 calls it"
 chk "gh knows baseRefOid (recent enough)" "gh pr view --help 2>&1 | grep -q baseRefOid" "gh too old: 'gh pr view --json ...,baseRefOid' fails and fetch.sh aborts at Step 1 (seen on gh 2.23.0). Install a current gh (>= 2.24)."
 
-echo "[headless GLM]"
-chk "claude-glm on PATH" "command -v claude-glm" "install/symlink claude-glm"
-chk "claude-glm has endpoint config" "[ -r \"\${XDG_CONFIG_HOME:-\$HOME/.config}/claude-glm/endpoints.conf\" ]" "this user is missing ~/.config/claude-glm/ (endpoints + ssh key)"
-if command -v claude-glm >/dev/null 2>&1; then
-  where="$(timeout 40 claude-glm --where 2>/dev/null | head -1)"
-  chk "GLM endpoint resolves" "[ -n '$where' ]" "no endpoint in endpoints.conf can generate a token"
-  [ -n "$where" ] && echo "     -> ${where%%$'\t'*}"
+echo "[headless agent + model endpoint]"
+if [ -n "${AITER_REVIEW_AGENT:-}" ]; then
+  # Direct-agent mode (what RUNNER-SETUP.md provisions): a standalone claude pointed at an on-box
+  # model endpoint. Check exactly what run_one.sh will use, not claude-glm.
+  chk "AITER_REVIEW_AGENT runnable ($AITER_REVIEW_AGENT)" "[ -x '$AITER_REVIEW_AGENT' ] || command -v '$AITER_REVIEW_AGENT'" "AITER_REVIEW_AGENT is not executable / not on PATH"
+  chk "ANTHROPIC_BASE_URL set" "[ -n \"\${ANTHROPIC_BASE_URL:-}\" ]" "set ANTHROPIC_BASE_URL to the on-box model endpoint (see RUNNER-SETUP.md)"
+  if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+    chk "model endpoint answers ($ANTHROPIC_BASE_URL)" "curl -s -m 8 --noproxy '*' \"\$ANTHROPIC_BASE_URL/v1/models\" | grep -q ." "no model server responding at ANTHROPIC_BASE_URL"
+  fi
+else
+  # Tunnel mode: the claude-glm wrapper resolves a remote GLM.
+  chk "claude-glm on PATH" "command -v claude-glm" "install/symlink claude-glm, or set AITER_REVIEW_AGENT + ANTHROPIC_BASE_URL (direct-agent mode)"
+  chk "claude-glm has endpoint config" "[ -r \"\${XDG_CONFIG_HOME:-\$HOME/.config}/claude-glm/endpoints.conf\" ]" "this user is missing ~/.config/claude-glm/ (endpoints + ssh key)"
+  if command -v claude-glm >/dev/null 2>&1; then
+    where="$(timeout 40 claude-glm --where 2>/dev/null | head -1)"
+    chk "GLM endpoint resolves" "[ -n '$where' ]" "no endpoint in endpoints.conf can generate a token"
+    [ -n "$where" ] && echo "     -> ${where%%$'\t'*}"
+  fi
 fi
 
 echo "[publish identity]"

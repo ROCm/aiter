@@ -21,10 +21,14 @@ SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .claude/skills/review-
 PROJ="$(git -C "$SKILL" rev-parse --show-toplevel)"     # repo root
 STATUS="${GITHUB_WORKSPACE:-$PROJ}/.aiter-review-status"
 rm -f "$STATUS"   # fresh run: never inherit a previous run's verdict
-# GUARANTEE a responsible person is always identified: any non-zero exit that did NOT classify
-# itself (an unexpected crash in fetch/gates/collect, a set -e trip) still leaves a status so
-# _notify.py routes it -- to the bot owner (flow) for triage -- instead of dying silently.
-trap 'ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"' EXIT
+# GUARANTEE a responsible person is always identified: any non-zero exit OR a signal kill (the
+# agent/job timeout kills with SIGTERM, which skips a plain EXIT trap) that did NOT classify
+# itself still leaves a status so _notify.py routes it -- to the bot owner (flow) for triage --
+# instead of dying silently. Trap both the exit and the terminating signals.
+_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; }
+_on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; exit 143; }
+trap _on_exit EXIT
+trap _on_signal TERM INT
 
 # GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.
 # The container runs as root; declare the docker sandbox so headless tools work.
@@ -32,10 +36,13 @@ export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 CLAUDE_GLM_QUIET=1
 # Kernel validation off unless a GPU of the matching arch is present; report the gap honestly.
 export REVIEW_AUTO_VALIDATE="${REVIEW_AUTO_VALIDATE:-0}"
 
-# gh's own login may be broken (GraphQL 401 observed) while ~/.git-credentials is fine.
+# gh's own login may be broken (GraphQL 401 observed) while ~/.git-credentials is fine. If so,
+# hold the token in a PLAIN var and hand it only to fetch.sh's env below -- never `export` it, or
+# the headless review agent (--dangerously-skip-permissions on untrusted PR content) inherits a
+# GitHub token from its environment. RUNNER-SETUP.md's GH_CONFIG_DIR path avoids needing this.
+GH_FALLBACK_TOK=""
 if ! gh api repos/"$REPO" --jq .full_name >/dev/null 2>&1; then
-  TOK=$(sed -n 's#https://\([^:]*\):\([^@]*\)@github.com#\2#p' ~/.git-credentials | head -1)
-  [ -n "$TOK" ] && export GH_TOKEN="$TOK" GITHUB_TOKEN="$TOK"
+  GH_FALLBACK_TOK=$(sed -n 's#https://\([^:]*\):\([^@]*\)@github.com#\2#p' ~/.git-credentials | head -1)
 fi
 
 # The box's Claude entrypoint. Default is claude-glm (resolves a remote GLM over a tunnel);
@@ -80,7 +87,11 @@ fi
 # 1) fetch (the skill's own Step-1 fetcher) -> WORK dir
 say "fetch..."
 FL="$(mktemp)"
-(cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
+if [ -n "$GH_FALLBACK_TOK" ]; then
+  (cd "$PROJ" && GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
+else
+  (cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
+fi
 W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
 rm -f "$FL"
 [ -n "$W" ] && [ -d "$W" ] || fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
@@ -104,10 +115,10 @@ say "WORK=$W"
 # requiring its output file to exist and be non-empty before counting the attempt as success.
 run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
   local label="$1" pf="$2" out="$3"; shift 3
-  local n=0 max="${AITER_REVIEW_RETRIES:-3}"
+  local n=0 max="${AITER_REVIEW_RETRIES:-2}"
   while :; do
     n=$((n + 1)); rm -f "$out"
-    if (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-1200}" "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
+    if (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-1000}" "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
     if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error/timeout?)"; return 1; fi
     say "$label attempt $n failed (GLM slow/timeout?); retrying in $((n * 10))s"; sleep $((n * 10))
   done

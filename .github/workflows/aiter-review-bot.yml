@@ -16,7 +16,7 @@
 #
 # Chain (all on the runner, scripts from .claude/skills/review-pr/):
 #   gate (allowlist + real-trigger check) -> claim 👀 -> run_one.sh (headless GLM review)
-#   -> publish.sh (hold 🔴 for a human, post non-🔴, as aiter-bot)
+#   -> _publish.py (posts the review card for EVERY verdict, as aiter-bot)
 name: aiter-review-bot
 
 on:
@@ -38,8 +38,8 @@ jobs:
     if: >
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@aiter-bot review') &&
-      (vars.AITER_REVIEW_AUTHORIZED == '' ||
-       contains(vars.AITER_REVIEW_AUTHORIZED, github.event.comment.user.login))
+      vars.AITER_REVIEW_AUTHORIZED != '' &&
+      contains(vars.AITER_REVIEW_AUTHORIZED, github.event.comment.user.login)
     runs-on: [self-hosted, box308]        # label the runner with these at registration
     timeout-minutes: 90     # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
     env:
@@ -113,10 +113,11 @@ jobs:
             -d '{"content":"eyes"}' >/dev/null || true
 
       - name: Review (headless GLM)
+        id: review
         if: steps.gate.outputs.ok == 'true'
         run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR"
 
-      - name: Publish gate (hold 🔴, post non-🔴)
+      - name: Publish the review card (every verdict, as aiter-bot)
         if: steps.gate.outputs.ok == 'true' && success()
         env:
           AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
@@ -138,4 +139,10 @@ jobs:
           AITER_MACHINE_OWNER: ${{ vars.AITER_MACHINE_OWNER }}
           AITER_FLOW_OWNER: ${{ vars.AITER_FLOW_OWNER }}
           AITER_RUNNER_OWNER: ${{ vars.AITER_RUNNER_OWNER }}
-        run: python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"
+        run: |
+          # belt-and-suspenders: if the review step failed but left no status (a hard job-timeout
+          # kill before run_one's trap ran), synthesize one so it still routes to an owner.
+          if [ "${{ steps.review.outcome }}" = "failure" ] && [ ! -f "$GITHUB_WORKSPACE/.aiter-review-status" ]; then
+            printf 'flow\tthe review step failed with no classified status (a hard timeout kill?) -- see the job log\n' > "$GITHUB_WORKSPACE/.aiter-review-status"
+          fi
+          python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"
