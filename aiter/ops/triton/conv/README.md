@@ -128,9 +128,7 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 ## Reproducing the tests and benchmarks
 
-Run these commands from the AITER repository root (`/app/aiter` in this tree).
-If AITER is not installed in the active environment, prefix a command with
-`PYTHONPATH=/app/aiter`.
+Run these commands from the AITER repository root.
 
 ### Tests
 
@@ -140,11 +138,11 @@ tests do not launch kernels.
 
 ```bash
 python -m pytest op_tests/triton_tests/conv/                       # all Conv1D/2D/3D tests
-python -m pytest op_tests/triton_tests/conv/test_conv2d.py         # Conv2D, 83 tests
+python -m pytest op_tests/triton_tests/conv/test_conv2d.py         # Conv2D tests
 python -m pytest op_tests/triton_tests/conv/test_conv2d.py \
-  -k "no_bias and fp16_nchw"                                      # five-test subset
+  -k "no_bias and fp16_nchw"                                      # no-bias FP16 NCHW tests
 python -m pytest op_tests/triton_tests/conv/test_conv2d.py \
-  -k "test_edge"                                                  # 12-test family
+  -k "test_edge"                                                  # edge-case tests
 ```
 
 The Conv2D tests are parametrized over `(dtype, layout, method)`. Every kernel in
@@ -153,17 +151,14 @@ NHWC is single-dispatch (only `conv2d_nhwc`), so each NHWC test runs once
 per dtype.
 
 The complete Conv3D suite contains numerical/routing, installed-config, and
-benchmark/CLI tests. To run all 200 cases:
+benchmark/CLI tests. Run it with:
 
 ```bash
-python -m pytest \
-  op_tests/triton_tests/conv/test_conv3d.py \
-  op_tests/triton_tests/conv/test_conv3d_config.py \
-  op_tests/triton_tests/conv/test_bench_conv3d.py
+python -m pytest op_tests/triton_tests/conv/test_conv3d.py
 ```
 
-Run only `test_conv3d.py` for the 140 numerical, prepack, cache, validation,
-and routing cases, including all four Wan-style VAE shapes.
+This file covers numerical, prepack, cache, validation, routing,
+installed-configuration, model-database, reporting, and CLI behavior.
 
 ### Benchmark
 
@@ -272,6 +267,9 @@ Conv3D cross-axis flags:
 
 ## Repository layout
 
+Files relevant to the Conv2D and Conv3D implementation are organized as
+follows:
+
 ```
 aiter/ops/triton/conv/                Kernel library
   conv2d.py                           Public API + smart routing
@@ -298,9 +296,7 @@ aiter/ops/triton/configs/<arch>/triton/conv/
 
 op_tests/triton_tests/conv/           Pytest correctness and integration tests
   test_conv2d.py                      Conv2D correctness and routing
-  test_conv3d.py                      Conv3D correctness and routing
-  test_conv3d_config.py               Conv3D config selection and launch keys
-  test_bench_conv3d.py                Conv3D model database and CLI checks
+  test_conv3d.py                      Conv3D correctness, routing, config, and CLI
   _helpers.py                         TestSuite, registry, shape generators
 
 op_tests/op_benchmarks/triton/
