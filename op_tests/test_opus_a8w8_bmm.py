@@ -329,11 +329,14 @@ def check_tilen_column_map():
 # compile coverage those arms get -- without it they are dead code the compiler
 # never instantiates.
 #
-# One shape serves all five: K=1024 is a whole number of each kid's B_K
-# (128 / 256 / 512) and N=128 of each B_N (32 / 64 / 128). Between them the
-# kids span one, two and four B scale groups per tile and both wave grids.
+# One shape serves all five. K=4096 is a whole number of each kid's B_K
+# (128 / 256 / 512) and N=128 of each B_N (32 / 64 / 128). K has to be this
+# large for a reason beyond divisibility: these pipelines prime several K tiles
+# before the steady state and reject a launch that cannot fill the prefetch, so
+# K=1024 left kid 8701 with four tiles against the six it wants. At 4096 the
+# shallowest tiling still has eight. It is also the production K.
 _MX32_KIDS = (8700, 8701, 8702, 8704, 8706)
-_MX32_SHAPE = (2, 128, 128, 1024)  # G, M, N, K
+_MX32_SHAPE = (2, 128, 128, 4096)  # G, M, N, K
 _MX32_GROUP = 32
 _MX32_ERR_TOL = 0.003
 
