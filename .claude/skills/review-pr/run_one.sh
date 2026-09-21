@@ -40,9 +40,19 @@ WORKER_CMD=("$AGENT" -p --dangerously-skip-permissions)
 # Cross-family (restores the refuter's value): set AITER_REVIEW_REFUTER_AGENT to an Opus entrypoint.
 REFUTER_CMD=("${AITER_REVIEW_REFUTER_AGENT:-$AGENT}" -p --dangerously-skip-permissions)
 say() { echo "[run_one #$PR] $*"; }
+# Classify a failed review and expose it so the notify step @-mentions the RIGHT owner:
+#   atom -> GLM/backend (honglie) | flow -> this review pipeline (bot owner) | env -> runner box.
+# Writes <class>TAB<message> to the status file the workflow reads, plus an ::error annotation.
+fail() {  # <class> <exit-code> <message...>
+  local cls="$1" code="$2"; shift 2
+  say "$*"
+  echo "::error title=aiter-bot::[$cls] $*"
+  printf '%s\t%s\n' "$cls" "$*" > "${GITHUB_WORKSPACE:-$PROJ}/.aiter-review-status"
+  exit "$code"
+}
 
 # Fail fast if the prompts have drifted from SKILL.md (they quote it verbatim).
-python3 "$SKILL/check_prompts.py" >/dev/null || { say "prompts drifted from SKILL.md (run check_prompts.py), aborting"; exit 4; }
+python3 "$SKILL/check_prompts.py" >/dev/null || fail flow 4 "prompts drifted from SKILL.md -- regenerate the prompt copies (check_prompts.py)"
 
 # GLM health-gate: a review is worthless if the backend is down, and a dead GLM otherwise
 # hangs ~40s per agent call and dies silently mid-review. When a direct endpoint is configured
@@ -56,11 +66,7 @@ if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
     -d "{\"model\":\"${ANTHROPIC_MODEL:-/models/GLM-5.3}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
     -o /dev/null -w '%{http_code}' 2>/dev/null || true)
   if [ "$_code" != "200" ]; then
-    say "GLM backend unavailable at $ANTHROPIC_BASE_URL (deep inference probe returned '$_code') -- aborting before any work; this is a backend outage, not a problem with the PR"
-    echo "::error title=aiter-bot::GLM backend unavailable ($ANTHROPIC_BASE_URL) -- review skipped, re-trigger when it is back"
-    # sentinel for the workflow's notify step: post to the PR + @-mention the GLM deployment owner
-    printf 'GLM backend unavailable -- deep inference probe returned %s at %s\n' "$_code" "$ANTHROPIC_BASE_URL" > "${GITHUB_WORKSPACE:-$PROJ}/.aiter-glm-down"
-    exit 5
+    fail glm 5 "GLM backend unavailable at $ANTHROPIC_BASE_URL (deep inference probe returned '$_code')"
   fi
   say "GLM ok"
 fi
@@ -71,7 +77,7 @@ FL="$(mktemp)"
 (cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
 W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
 rm -f "$FL"
-[ -n "$W" ] && [ -d "$W" ] || { say "fetch produced no WORK dir, aborting"; exit 1; }
+[ -n "$W" ] && [ -d "$W" ] || fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
 
 # applies.txt fix: the skill's fetch.sh checks `git apply` against PROJECT_ROOT's worktree but
 # reports it as the merge target; re-check on the merge-target worktree checked out at BASE_SHA.
@@ -104,7 +110,7 @@ run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
 # 2) worker (headless GLM), with retry on GLM timeout
 say "worker (GLM)..."
 bash "$SKILL/render.sh" worker "$W" > "$W/_pw.txt"
-run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || exit 2
+run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || fail glm 2 "the GLM worker failed after retries -- the backend is timing out or down"
 
 # 3) refuter (headless GLM) -- Step 7.7; or the NONE line for a 0-finding card
 say "refuter..."
@@ -112,7 +118,7 @@ if grep -qiE '(NO FINDINGS|✅)' "$W/card.md" && ! grep -qE '^(🔴|⚠️|📝)
   printf 'NONE AVAILABLE -- 0 findings on the card (NO FINDINGS); nothing for an independent reader to refute\n' > "$W/independent.txt"
 else
   bash "$SKILL/render.sh" refuter "$W" "$W/card.md" > "$W/_prf.txt"
-  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || exit 3
+  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || fail glm 3 "the GLM refuter failed after retries -- the backend is timing out or down"
 fi
 
 # 4) gates + collect (call the python directly; no thin shell wrappers)

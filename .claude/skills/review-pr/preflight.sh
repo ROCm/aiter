@@ -12,7 +12,7 @@ chk() { if eval "$2" >/dev/null 2>&1; then echo "  ✅ $1"; ok=$((ok+1)); else e
 echo "=== aiter-review-bot runner preflight (user=$(whoami)) ==="
 
 echo "[skill scripts present]"
-for s in fetch.sh triage.py render.sh run_one.sh _lib.py _gates.py _collect.py _publish.py; do
+for s in fetch.sh triage.py render.sh run_one.sh _lib.py _gates.py _collect.py _publish.py _notify.py; do
   chk "$s present" "[ -f '$S/$s' ]" "missing $S/$s"
 done
 

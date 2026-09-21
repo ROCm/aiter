@@ -119,33 +119,20 @@ jobs:
           AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
         run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
 
-      - name: Notify on GLM outage (as aiter-bot, @-mention the GLM owner)
-        # Runs even when the review step failed. run_one.sh drops .aiter-glm-down when its GLM
-        # health probe fails, so the person who triggered the review learns it was a backend
-        # outage (not their PR), and the GLM deployment owner is @-mentioned to go fix it.
+      - name: Report a failed review to the owner (as aiter-bot)
+        # Runs even when the review step failed. run_one.sh writes .aiter-review-status as
+        # "<class>\t<message>" on any classified failure; _notify.py maps the class to the owner
+        # (repo-var overridable) and posts one comment @-mentioning them, so a failure lands on
+        # whoever owns it (glm->honglie, atom->the atom team, machine->huangxin, flow/env->the
+        # bot owner), never on the PR author. The class->owner map lives ONLY in _notify.py;
+        # run_one and this step stay thin, and check_prompts.py fails if run_one emits a class
+        # _notify.py does not know -- so the two cannot drift.
         if: always() && steps.gate.outputs.ok == 'true'
         env:
           AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
-          GLM_OWNER: ${{ vars.AITER_GLM_OWNER }}   # optional repo var; defaults to honglie below
-        run: |
-          f="$GITHUB_WORKSPACE/.aiter-glm-down"
-          [ -f "$f" ] || exit 0
-          OWNER="${GLM_OWNER:-honglie}" DETAIL="$(cat "$f")" python3 - <<'PY'
-          import json, os, urllib.request
-          owner  = os.environ.get("OWNER") or "honglie"
-          detail = os.environ.get("DETAIL", "").strip()
-          body = ("⚠️ **aiter-bot** — the GLM backend is currently unavailable, so this review was "
-                  "skipped. This is a backend outage, **not a problem with this PR**.\n\n"
-                  f"@{owner} (GLM deployment owner) — please check the GLM service on the review "
-                  "runner box.\n\nRe-comment `@aiter-bot review` once it is back."
-                  + (f"\n\n<sub>{detail}</sub>" if detail else ""))
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/issues/{os.environ['PR']}/comments",
-              data=json.dumps({"body": body}).encode(),
-              headers={"Authorization": f"token {os.environ['AITER_BOT_TOKEN']}",
-                       "Accept": "application/vnd.github+json"}, method="POST")
-          try:
-              urllib.request.urlopen(req, timeout=15); print("posted GLM-outage notice")
-          except Exception as e:
-              print(f"notify failed: {e}")
-          PY
+          AITER_GLM_OWNER: ${{ vars.AITER_GLM_OWNER }}
+          AITER_ATOM_OWNER: ${{ vars.AITER_ATOM_OWNER }}
+          AITER_MACHINE_OWNER: ${{ vars.AITER_MACHINE_OWNER }}
+          AITER_FLOW_OWNER: ${{ vars.AITER_FLOW_OWNER }}
+          AITER_RUNNER_OWNER: ${{ vars.AITER_RUNNER_OWNER }}
+        run: python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"

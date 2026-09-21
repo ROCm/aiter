@@ -11,6 +11,7 @@ SKILL.md is always at <repo>/.claude/skills/review-pr/SKILL.md.
 """
 
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -53,6 +54,26 @@ def extract(text, start, end):
     return text[i : j + len(end)]
 
 
+def check_fail_classes():
+    """run_one.sh tags each failure with `fail <class> ...`; _notify.py owns the class->owner
+    map. Assert every class run_one can emit is known to _notify.py, so a failure never routes
+    to nobody and run_one.sh / _notify.py cannot drift apart."""
+    import importlib.util
+
+    run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
+    emitted = set(re.findall(r"\bfail\s+([a-z]+)\s+[0-9]", run_one))
+    spec = importlib.util.spec_from_file_location("_notify", HERE / "_notify.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    known = set(mod.CLASSES)
+    unknown = emitted - known
+    if unknown:
+        print(f"\u274c run_one.sh emits fail classes unknown to _notify.py: {sorted(unknown)}")
+        return 1
+    print(f"\u2705 fail classes consistent: run_one {sorted(emitted)} \u2286 _notify.py {sorted(known)}")
+    return 0
+
+
 def main():
     skill = _skill_md()
     bad = 0
@@ -67,6 +88,7 @@ def main():
         else:
             print(f"❌ {prompt}: quoted block DRIFTED from SKILL.md — re-copy the section verbatim")
             bad += 1
+    bad += check_fail_classes()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
 
