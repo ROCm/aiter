@@ -160,6 +160,27 @@ inline __device__ auto make_layout_rb_mxsk(int lane_id) {
                         lane_id / T::W_N}));
 }
 
+// Which MX block of this MFMA the lane owns, given the lane's index and the
+// fragment width it is split over (W_M for A, W_N for B).
+//
+// A literal 0 at GROUP_K=128, not an expression that evaluates to 0. The
+// arithmetic form is correct there -- (lane_id / 16) / 4 is 0 for every lane of
+// a wave64 -- but the compiler cannot prove lane_id < warp_size, so it keeps
+// the divides and a live value. That was enough extra pressure to move clang
+// 22's "operand has incorrect register class" around between 128 kernels: 8326
+// first, then 8314 and 8320 once always_inline changed the allocation again.
+// The dim this feeds has extent 1 at 128, so the coord can only ever be 0.
+template<typename T>
+__attribute__((always_inline)) OPUS_D int sf_lane_k_block(int lane_id, int frag_w) {
+    if constexpr (T::SF_PER_MFMA_K == 1) {
+        (void)lane_id;
+        (void)frag_w;
+        return 0;
+    } else {
+        return (lane_id / frag_w) / T::SF_LANE_K_DIV;
+    }
+}
+
 template<typename T>
 inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stride_sfa) {
     // The K side is two dims so the lane's own MX block can be addressed: the
@@ -170,8 +191,8 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
     // The A *fragment* layout has carried lane_id / W_M since it was written
     // (make_layout_ra_mxsk's last p coord); the scale layout did not, which is
     // the whole of what made every scale block 128 wide. At GROUP_K=128 the p
-    // dim has extent 1 and SF_LANE_K_DIV sends its coord to 0, so this is the
-    // same address it always produced.
+    // dim has extent 1 and sf_lane_k_block is a literal 0, so this is the same
+    // address it always produced, emitted the same way.
     constexpr auto sfa_block_shape = opus::make_tuple(
         opus::number<T::COM_REP_M>{},
         opus::number<T::T_M>{},
@@ -189,7 +210,7 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
             opus::tuple{stride_sfa, 1_I}),
         opus::unfold_p_coord(sfa_block_dim,
             opus::tuple{wave_id_m, lane_id % T::W_M,
-                        (lane_id / T::W_M) / T::SF_LANE_K_DIV}));
+                        sf_lane_k_block<T>(lane_id, T::W_M)}));
 }
 
 // pack_e8m0x4 (broadcast e8m0 -> x4 word) is shared via opus_gemm_utils.cuh.
@@ -647,7 +668,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
                 load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
-                                    (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
+                                    sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             s_waitcnt_vmcnt(0_I);
         };
@@ -871,7 +892,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr + ng * sf_k_scales + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
-                                        (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
+                                        sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
             } else {
                 // Vec = SCALES_PER_BK: the contiguous per-M-row K-scale bytes are
@@ -881,7 +902,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
-                                        (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
+                                        sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
             }
         };
@@ -1349,7 +1370,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
-                                        (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
+                                        sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
                 if constexpr (!SKIP_SCALE_WAIT) {
                     s_waitcnt_vmcnt(0_I);
@@ -1651,7 +1672,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
             opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
                 load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
-                                    (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
+                                    sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             opus::static_for<MI>([&](auto mi_c) {
                 constexpr int mi = decltype(mi_c)::value;
@@ -1831,7 +1852,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
             load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
-                                (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
+                                sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
@@ -1984,7 +2005,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
             load_sfb_lane<T, ng>(g_sfb, ng * kargs.stride_sfb + scale_base,
-                                (lane_id / T::W_N) / T::SF_LANE_K_DIV, v_sfb);
+                                sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         if constexpr (!SKIP_SCALE_WAIT) {
             s_waitcnt_vmcnt(0_I);
