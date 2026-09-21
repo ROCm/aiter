@@ -11,6 +11,7 @@
 Both entry points share input generation, the FP32 reference and kernel launch.
 Context lengths include the MTP query tokens. Explicit partition counts override
 automatic recommendations; the CLI times attention plus the native reducer.
+Plans default to a per-sequence partition cap equal to the device's CU count.
 Positive sliding windows require a work plan: planned cases check numerics and
 graph replays, while static cases check rejection by the core and wrapper APIs.
 Disabled windows retain both static and planned numerical coverage.
@@ -19,7 +20,7 @@ Disabled windows retain both static and planned numerical coverage.
 import argparse
 import importlib
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 
 import pandas as pd
@@ -285,7 +286,7 @@ def _make_inputs(case, planned=False):
         offset = torch.arange(heads).to(case.sink_dtype) * 0.125
         sinks = torch.where(sinks.abs() < 10, sinks + offset, sinks)
     parts = case.num_partitions
-    if parts is None:
+    if parts is None and not planned:
         parts = get_recommended_splits(
             batch,
             kv_heads,
@@ -305,6 +306,8 @@ def _make_inputs(case, planned=False):
         if planned
         else None
     )
+    if plan is not None:
+        parts = plan.max_partitions
     rows = ql * case.query_group_size
     shape = (
         (kv_heads, plan.capacity, rows) if planned else (batch, kv_heads, parts, rows)
@@ -359,7 +362,6 @@ def _run_flydsl(*args, sliding_window=0, work_plan=None):
         plan_pa_decode(
             args[4],
             args[2].shape[1],
-            max_partitions=args[8],
             query_length=args[7],
             sliding_window=sliding_window,
             plan=work_plan,
@@ -439,15 +441,32 @@ def _assert_contracts(args, options):
             pa_decode(*args[:7], value, *args[8:], **options)
         with pytest.raises(error, match="query_length"):
             plan_pa_decode(args[4], args[2].shape[1], query_length=value)
-    plan = options["work_plan"]
+    context, plan = args[4], options["work_plan"]
+    num_compute_units = torch.cuda.get_device_properties(
+        context.device
+    ).multi_processor_count
+    for parts in (0, num_compute_units + 1):
+        with pytest.raises(ValueError, match="max_partitions"):
+            plan_pa_decode(context, args[2].shape[1], max_partitions=parts)
+        if plan is not None:
+            with pytest.raises(ValueError, match="max_partitions"):
+                replace(plan, max_partitions=parts).validate(
+                    context.numel(), args[2].shape[1], context.device
+                )
+    if plan is None:
+        for parts in (0, MAX_CONTEXT_PARTITIONS + 1):
+            with pytest.raises(ValueError, match="max_context_partition_num"):
+                pa_decode(*args[:8], parts, *args[9:], **options)
     if plan is not None:
         context, heads = args[4], args[2].shape[1]
         reuse = {
-            "max_partitions": plan.max_partitions,
             "sliding_window": plan.sliding_window,
             "query_length": plan.query_length,
             "plan": plan,
         }
+        metadata = plan.work_info, plan.reduce_info
+        assert plan_pa_decode(context, heads, **reuse) is plan
+        assert plan.work_info is metadata[0] and plan.reduce_info is metadata[1]
         changes = [
             (
                 {"max_partitions": 1 if plan.max_partitions != 1 else 2},
@@ -795,6 +814,17 @@ CASES = [
     ),
     _case("large-batch-auto", cache=(128, 0, 1), parts=None, lengths=(257,) * 200),
     _case("small-batch-auto", (1, 1, 8, 128), (16, 0, 0), None, lengths=(257,) * 3),
+    _case("default-cu-window", parts=None, window=1024, sink=FP32, lengths=LENS_1024),
+    # With CU > 256, the long row uses 257 tasks and exercises the larger reducer.
+    _case(
+        "default-cu-head256",
+        (2, 1, 8, 256),
+        (64, 0, 1),
+        parts=None,
+        sink=FP16,
+        dtype=FP16,
+        lengths=(0, 1, 257, 65537),
+    ),
     _case(
         "exact-parts-override",
         (1, 1, 16, 128),
@@ -864,6 +894,17 @@ CASES = [
 @pytest.mark.parametrize("case", CASES)
 def test_pa_decode(case, planned, monkeypatch):
     """Reject static windows; otherwise check real kernels, plans and replays."""
+    if planned and case.num_partitions is not None:
+        context = torch.tensor(case.lengths, dtype=torch.int32)
+        num_compute_units = torch.cuda.get_device_properties(
+            context.device
+        ).multi_processor_count
+        if case.num_partitions > num_compute_units:
+            with pytest.raises(ValueError, match="max_partitions"):
+                plan_pa_decode(
+                    context, case.num_kv_heads, max_partitions=case.num_partitions
+                )
+            return
     args, options, reference = _make_inputs(case, planned)
     if not planned and case.sliding_window > 0:
         with pytest.raises(ValueError, match="work_plan"):
@@ -873,10 +914,20 @@ def test_pa_decode(case, planned, monkeypatch):
         return
     output, context = args[0], args[4]
     scratch, sinks, plan = args[14:17], args[-1], options["work_plan"]
-    if plan is not None and case.workgroup_budget is not None:
-        budget_slots = (
-            case.workgroup_budget + case.num_kv_heads - 1
-        ) // case.num_kv_heads
+    if plan is not None:
+        num_compute_units = torch.cuda.get_device_properties(
+            context.device
+        ).multi_processor_count
+        expected_parts = (
+            num_compute_units if case.num_partitions is None else case.num_partitions
+        )
+        assert args[8] == plan.max_partitions == expected_parts
+        budget = (
+            case.workgroup_budget
+            if case.workgroup_budget is not None
+            else 2 * num_compute_units
+        )
+        budget_slots = (budget + case.num_kv_heads - 1) // case.num_kv_heads
         assert plan.capacity == min(
             context.numel() * args[8], max(context.numel(), budget_slots)
         )

@@ -9,8 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-from .pa_decode_reduce import MAX_CONTEXT_PARTITIONS
-
 
 @triton.jit
 def _plan_pa_decode(
@@ -102,8 +100,11 @@ class PADecodePlan:
     def validate(self, batch_size: int, num_kv_heads: int, device: torch.device):
         if self.num_kv_heads != num_kv_heads:
             raise ValueError("plan KV head count does not match the cache")
-        if not 1 <= self.max_partitions <= MAX_CONTEXT_PARTITIONS:
-            raise ValueError("invalid plan max_partitions")
+        num_compute_units = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+        if not 1 <= self.max_partitions <= num_compute_units:
+            raise ValueError(f"plan max_partitions must be in [1, {num_compute_units}]")
         if self.sliding_window < 0 or self.query_length < 1:
             raise ValueError("invalid plan sliding_window or query_length")
         if self.reduce_info.shape != (batch_size, 2):
@@ -123,7 +124,7 @@ def plan_pa_decode(
     context_lengths: torch.Tensor,
     num_kv_heads: int,
     *,
-    max_partitions: int = MAX_CONTEXT_PARTITIONS,
+    max_partitions: int | None = None,
     workgroup_budget: int | None = None,
     sliding_window: int = 0,
     query_length: int = 1,
@@ -136,6 +137,10 @@ def plan_pa_decode(
     The budget counts task slots over all KV heads before query splitting;
     splitting queries can launch multiple CTAs per slot without extra scratch.
     This is opt-in: uniform or short-context workloads may favor static splits.
+
+    The per-sequence partition limit defaults to the context device's CU count;
+    an explicit limit must be in [1, CU count]. When refreshing an existing
+    plan, omitting ``max_partitions`` preserves its original limit.
 
     A positive ``sliding_window`` counts visible tokens including the query's
     own position; 0 and -1 disable it. Context lengths include the MTP tokens,
@@ -161,14 +166,15 @@ def plan_pa_decode(
         raise ValueError("plan supports batches in [1, 4096]")
     if num_kv_heads < 1:
         raise ValueError("num_kv_heads must be positive")
-    if not 1 <= max_partitions <= MAX_CONTEXT_PARTITIONS:
-        raise ValueError(f"max_partitions must be in [1, {MAX_CONTEXT_PARTITIONS}]")
     dev = context_lengths.device
+    num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
+    if max_partitions is None:
+        max_partitions = num_compute_units if plan is None else plan.max_partitions
+    if not 1 <= max_partitions <= num_compute_units:
+        raise ValueError(f"max_partitions must be in [1, {num_compute_units}]")
     if plan is None:
         if workgroup_budget is None:
-            workgroup_budget = (
-                2 * torch.cuda.get_device_properties(dev).multi_processor_count
-            )
+            workgroup_budget = 2 * num_compute_units
         if workgroup_budget < 1:
             raise ValueError("workgroup_budget must be positive")
         capacity = min(

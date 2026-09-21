@@ -135,17 +135,22 @@ def launch_pa_decode_ps_reduce(
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor | None = None,
 ) -> None:
-    if context_partition_num > MAX_CONTEXT_PARTITIONS:
+    use_work_plan = reduce_info is not None
+    partition_limit = (
+        torch.cuda.get_device_properties(output.device).multi_processor_count
+        if use_work_plan
+        else MAX_CONTEXT_PARTITIONS
+    )
+    if context_partition_num > partition_limit:
         raise ImportError(
-            "FlyDSL pa_decode reduce supports at most "
-            f"{MAX_CONTEXT_PARTITIONS} partitions"
+            f"FlyDSL pa_decode reduce supports at most {partition_limit} partitions"
         )
     use_sinks = sink_token is not None
     # Buffer offsets are byte-sized i32 values. Bound the largest attempted
     # access, not only the current count: an inactive part must not wrap back
     # into valid data. Nonstandard standalone reducer strides keep the old path.
     bounded_plan_logits = (
-        reduce_info is not None
+        use_work_plan
         and context_partition_num <= 64
         and query_seq_len > 0
         and query_group_size > 0
@@ -178,7 +183,7 @@ def launch_pa_decode_ps_reduce(
             output.dtype if sink_token is None else sink_token.dtype
         ),
         use_sinks=use_sinks,
-        use_work_plan=reduce_info is not None,
+        use_work_plan=use_work_plan,
         query_group_size=query_group_size,
         bounded_plan_logits=bounded_plan_logits,
         vectorize_plan_logits=vectorize_plan_logits,
@@ -271,6 +276,8 @@ def pa_decode(
     ``work_plan`` opts into GPU-planned variable partition counts. Build or
     refresh it with ``plan_pa_decode`` on the current stream after updating
     lengths. Its ``max_partitions`` must equal ``max_context_partition_num``.
+    The plan's partition limit is bounded by the query device's CU count;
+    static scheduling retains the fixed limit of 256.
     Its window must match ``sliding_window``, and a windowed plan must be built
     with the same ``query_length`` so it covers every MTP query's window.
     Planned scratch is packed as [KV heads, plan.capacity, query rows (, D)];
@@ -298,7 +305,10 @@ def pa_decode(
         raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
-    if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
+    if (
+        work_plan is None
+        and not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS
+    ):
         raise ValueError(
             f"max_context_partition_num must be in [1, {MAX_CONTEXT_PARTITIONS}], "
             f"got {max_context_partition_num}"

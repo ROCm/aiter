@@ -12,6 +12,7 @@ from flydsl.expr.typing import T
 from .tensor_shim import buf_base_i64, buf_copy_load, ptr_buf_tensor
 from .utils import rcp_f32, udiv_const, urem_const
 
+# Static scheduling limit; work plans use their device's CU count instead.
 MAX_CONTEXT_PARTITIONS = 256
 _DTYPE_MAP = {
     "f32": fx.Float32,
@@ -27,10 +28,15 @@ def _validate_pa_decode_ps_reduce_config(
     output_dtype_str: str,
     logits_dtype_str: str,
     sink_dtype_str: str,
+    use_work_plan: bool = False,
 ) -> None:
-    if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
+    # The plan and launch wrappers validate the device-specific CU bound.
+    if max_context_partition_num < 1 or (
+        not use_work_plan and max_context_partition_num > MAX_CONTEXT_PARTITIONS
+    ):
+        bound = "positive" if use_work_plan else f"in [1, {MAX_CONTEXT_PARTITIONS}]"
         raise ValueError(
-            f"max_context_partition_num must be in [1, {MAX_CONTEXT_PARTITIONS}], "
+            f"max_context_partition_num must be {bound}, "
             f"got {max_context_partition_num}"
         )
     if head_size <= 0 or head_size > 1024 or head_size % 64:
@@ -49,6 +55,7 @@ def is_pa_decode_ps_reduce_supported(
     output_dtype_str: str,
     logits_dtype_str: str,
     sink_dtype_str: str,
+    use_work_plan: bool = False,
 ) -> bool:
     """Return whether the FlyDSL reducer supports a dispatch configuration."""
     try:
@@ -58,6 +65,7 @@ def is_pa_decode_ps_reduce_supported(
             output_dtype_str=output_dtype_str,
             logits_dtype_str=logits_dtype_str,
             sink_dtype_str=sink_dtype_str,
+            use_work_plan=use_work_plan,
         )
     except ValueError:
         return False
@@ -102,6 +110,7 @@ def compile_pa_decode_ps_reduce(
         output_dtype_str=output_dtype_str,
         logits_dtype_str=logits_dtype_str,
         sink_dtype_str=sink_dtype_str,
+        use_work_plan=use_work_plan,
     )
     if query_group_size is not None and query_group_size <= 0:
         raise ValueError("query_group_size must be positive when specified")
