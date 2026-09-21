@@ -110,8 +110,15 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
     return {"x": x, "weight": weight, "bias": bias}
 
 
-def run_flydsl_conv3d(x, weight, bias, params, tile, wgm):
-    return flydsl_conv_implicit(x, weight, bias=bias, tile=tile, wgm=wgm, **params)
+def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
+    # splitk is passed rather than left to the dispatch to re-derive: the value
+    # the caller recorded is the value that runs, so the CSV's splitK column
+    # describes a measurement instead of a second derivation that happens to
+    # agree. The AOT pass compiles against that column, so a drift between the
+    # two would ship an artifact for a split nobody timed.
+    return flydsl_conv_implicit(
+        x, weight, bias=bias, tile=tile, wgm=wgm, splitk=splitk, **params
+    )
 
 
 def conv3d_ref(x, weight, bias, params):
@@ -136,7 +143,34 @@ class Conv3dTuner(TunerCommon):
         "untune_file": "aiter/configs/bf16_untuned_conv3d.csv",
         "tune_file": f"{AITER_CONFIG_CONV3D_BF16}",
         "config_env_name": "AITER_CONFIG_CONV3D_BF16",
+        # Zero, not the common 0.05. The reference here is bf16 and so shares
+        # the kernel's rounding regime (see RTOL/ATOL), which puts every correct
+        # candidate at err_ratio 0 -- a nonzero one is a config that computes the
+        # wrong thing, most often a boundary tile it does not write. At 0.05 such
+        # a candidate is still eligible to win, and since the op test's own bar
+        # (ERR_TOL in test_flydsl_conv_implicit.py) is zero mismatched elements,
+        # the tuner would be writing rows that test then fails. --errRatio still
+        # raises it for a deliberate investigation.
+        "errRatio": 0.0,
     }
+
+    def get_cu_num(self):
+        """The CU count the tuned rows are stamped with.
+
+        ``chip_info.get_cu_num()``, not ``TunerCommon``'s
+        ``torch.cuda.get_device_properties().multi_processor_count``:
+        ``_lookup_tuned_tile`` keys the runtime lookup on the former, so a row
+        written under the latter is one the runtime cannot find. They differ only
+        under ``CU_NUM`` or a CU partition -- and where they do, every shape in
+        the table misses at once and silently falls back to the heuristic tile.
+
+        Also what ``conv3d_policy`` enumerates against here, and what
+        ``conv_kernels._num_cu`` sizes the split-K and tile heuristics by, so the
+        candidate set and the shipped default agree with the runtime's own view.
+        """
+        from aiter.jit.utils.chip_info import get_cu_num as _chip_get_cu_num
+
+        return _chip_get_cu_num()
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -266,7 +300,7 @@ class Conv3dTuner(TunerCommon):
                     generate_data,
                     (n, c, d, h, w, k, kt, kh, kw, groups, has_bias),
                     run_flydsl_conv3d,
-                    (["x", "weight", "bias"], params, tile, wgm),
+                    (["x", "weight", "bias"], params, tile, wgm, sk),
                     {},
                     conv3d_ref,
                     (["x", "weight", "bias"], params),
