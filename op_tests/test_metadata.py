@@ -31,8 +31,15 @@ UNI_SEQLEN_QO = 1
 MAX_SPLIT_PER_BATCH = 16
 IS_CAUSAL = True
 
-# Default serving sweep (kimi Makefile / perf_sweep.sh).
-DEFAULT_BATCHES = [4, 8, 16, 32, 64, 128]
+# Default serving sweep (kimi Makefile / perf_sweep.sh), plus the batch counts
+# that only prefill reaches. num_batches is the concurrency for decode, so the
+# kimi row tops out at 128 -- but a DSA prefill chunk carries one batch per query
+# token, which puts --max-num-batched-tokens on this axis instead. Those large
+# counts are where the parallel planner chunks its LDS scratch, and 4096 / 8192 /
+# 16384 sit at one chunk, the old 8191-batch LDS cliff, and several chunks. Below
+# 4096 none of that code runs, so without these rows the default sweep cannot
+# tell a working chunk carry from a broken one.
+DEFAULT_BATCHES = [4, 8, 16, 32, 64, 128, 4096, 8192, 16384]
 DEFAULT_CTX_LENS = [2048, 4096, 8192]
 
 _PARALLEL_ENV = "AITER_MLA_META_USE_PARALLEL"
