@@ -11,6 +11,11 @@ on:
         description: Name of the Triton wheel artifact uploaded for the caller workflow run.
         required: true
         type: string
+      cache-key:
+        description: Cache key used to share the Triton wheelhouse with downstream jobs.
+        required: false
+        type: string
+        default: ""
       retention-days:
         description: Number of days to keep the Triton wheel artifact.
         required: false
@@ -54,9 +59,18 @@ jobs:
           bash ./.github/scripts/download_triton_wheel.sh triton_wheels
           echo "source=fallback-rocm-${TRITON_DEFAULT_ROCM_VERSION}" >> "${GITHUB_OUTPUT}"
 
+      - name: Save Triton wheel cache
+        if: ${{ inputs.cache-key != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: triton_wheels
+          key: ${{ inputs.cache-key }}
+
       - name: Upload Triton wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact-name }}
           path: triton_wheels/
+          compression-level: 0
           retention-days: ${{ inputs.retention-days }}
