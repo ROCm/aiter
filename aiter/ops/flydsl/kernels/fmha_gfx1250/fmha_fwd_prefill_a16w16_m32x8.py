@@ -953,6 +953,7 @@ def _pv_qk_gemm(
     q_frags_list,
     v_hdim,
     n_block,
+    warp_type,
     o_acc_list=None,
     head=None,
     ring=PVQK_RING,
@@ -1020,7 +1021,7 @@ def _pv_qk_gemm(
 
     # Raise wave priority for the whole WMMA stream: under anti-phase the other half is
     # in its softmax VALU here, and the gemm half must win issue arbitration.
-    rocdl.s_setprio(1)
+    rocdl.s_setprio(2)
     _ring_drive(
         num_frag=num_vfrag + num_kfrag,
         emit=emit,
@@ -1030,7 +1031,7 @@ def _pv_qk_gemm(
         head=head,
         dies=dies,
     )
-    rocdl.s_setprio(0)
+    rocdl.s_setprio(0 if warp_type.is_lo else 1)
     return out_list, s_acc_list
 
 
@@ -1378,6 +1379,13 @@ def _core_attention(
         # wave B's share of the tile).
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
+        # HI enters its resting priority here, at the first point both halves have
+        # reached. Before this the two are still in the symmetric Q/KV prologue; from
+        # here on the lagging half is the one that must not lose arbitration to its
+        # SIMD-mate, and _pv_qk_gemm's exit restores this same level after every gemm.
+        # Compile-time: warp_type is a Python constant, so LO traces no instruction.
+        if not warp_type.is_lo:
+            rocdl.s_setprio(1)
         _issue_views(_late)
         _kv_fence(*_kv_drain)
     else:
@@ -1423,6 +1431,13 @@ def _core_attention(
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
         rocdl.s_wait_dscnt(0)  # Q's ds_loads retired: its LDS is now dead
         gpu.barrier()
+        # HI enters its resting priority here, at the first point both halves have
+        # reached. Before this the two are still in the symmetric Q/KV prologue; from
+        # here on the lagging half is the one that must not lose arbitration to its
+        # SIMD-mate, and _pv_qk_gemm's exit restores this same level after every gemm.
+        # Compile-time: warp_type is a Python constant, so LO traces no instruction.
+        if not warp_type.is_lo:
+            rocdl.s_setprio(1)
         # (4)+(5) Issue the cluster_loads as ONE packed burst between two barriers, before
         # the compiler reuses their source address VGPRs (mode-2 async-source-WAR fix).
         _issue_ptrs(kv0)
@@ -1851,6 +1866,7 @@ def _core_attention(
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
                 n_block=n_block,
+                warp_type=warp_type,
                 o_acc_list=o_resc,
                 head=pvqk_head,
             )
@@ -1870,6 +1886,7 @@ def _core_attention(
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
                 n_block=n_block,
+                warp_type=warp_type,
                 o_acc_list=o_acc,
                 head=pvqk_head,
             )
