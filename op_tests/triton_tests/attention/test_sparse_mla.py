@@ -168,6 +168,20 @@ def test_dot_precision_arch_gate(arch):
             smd._resolve_dot_precision("fp8", "fp8_scalar", arch)
 
 
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_packed_cache_arch_gate(arch):
+    """Packed caches are gfx950-only even where SUPPORTED_ARCHS is wider.
+
+    They return to pa_decode_sparse before the kernel's own arch gate, so
+    widening that gate does not reach them.
+    """
+    if arch in smd.PACKED_ARCHS:
+        smd._check_packed_arch(arch)
+    else:
+        with pytest.raises(ValueError, match="fp8_dsv4_mla"):
+            smd._check_packed_arch(arch)
+
+
 def test_ds_mla_format():
     _skip_unless_supported()
     _run_and_check("dsmla", C=8, H=16, topk=2048, ragged=True)
