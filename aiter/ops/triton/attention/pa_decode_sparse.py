@@ -136,8 +136,11 @@ def pa_decode_sparse(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
     _LOGGER.info(
-        f"PA_DECODE_SPARSE: q={tuple(q.shape)} unified_kv={tuple(unified_kv.shape)} "
-        f"{unified_kv.dtype} kv_indices={tuple(kv_indices.shape)}"
+        "PA_DECODE_SPARSE: q=%s unified_kv=%s %s kv_indices=%s",
+        tuple(q.shape),
+        tuple(unified_kv.shape),
+        unified_kv.dtype,
+        tuple(kv_indices.shape),
     )
 
     # gfx950: route to the merged DSv4 sparse-MLA gluon driver. Format is inferred
