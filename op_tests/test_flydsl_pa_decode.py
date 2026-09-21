@@ -349,9 +349,7 @@ def _make_inputs(case, planned=False):
 def _run_flydsl(*args, sliding_window=0, work_plan=None):
     # The wrapper needs ps=True before sinks.
     args = (*args[:-1], True, args[-1])
-    if work_plan is None:
-        torch.ops.aiter.pa_decode_flydsl(*args, sliding_window=sliding_window)
-    else:
+    if work_plan is not None:
         plan_pa_decode(
             args[4],
             args[2].shape[1],
@@ -359,7 +357,7 @@ def _run_flydsl(*args, sliding_window=0, work_plan=None):
             sliding_window=sliding_window,
             plan=work_plan,
         )
-        pa_decode_flydsl(*args, sliding_window=sliding_window, work_plan=work_plan)
+    pa_decode_flydsl(*args, sliding_window=sliding_window, work_plan=work_plan)
     return args[0]
 
 
