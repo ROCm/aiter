@@ -2248,6 +2248,251 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
 }
 
 /**
+ * Short-row one-block radix specialization for fp32/k=2048 on BPP=12 parts.
+ *
+ * The regular kernel performs three full-row histogram scans, followed by a
+ * fourth full-row emit scan.  For 8K--32K rows the pass-0 crossing bucket is
+ * normally small enough to keep in LDS.  This specialization therefore:
+ *
+ *   1. performs the normal pass-0 full-row histogram;
+ *   2. performs one more full-row scan, emitting values that are already
+ *      known winners and staging the pass-0 crossing bucket in LDS;
+ *   3. resolves the remaining 12+8 radix bits and emits from LDS.
+ *
+ * Adversarial/tied inputs can make the crossing bucket large.  In that case
+ * the pass-1 histogram is still valid, partial output is discarded by
+ * resetting the counters, and the exact regular pass-2 + full-row emit path is
+ * used.  The fallback is slower than baseline only for those unusual rows but
+ * preserves identical top-k semantics without an unbounded LDS allocation.
+ */
+template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES>
+__global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
+                                                     const int64_t len,
+                                                     const IdxT k,
+                                                     T* out,
+                                                     IdxT* out_idx,
+                                                     bool const select_min)
+{
+    static_assert(std::is_same_v<T, float>);
+    static_assert(std::is_same_v<IdxT, int>);
+    constexpr int BitsPerPass       = 12;
+    constexpr int num_buckets       = calc_num_buckets<BitsPerPass>();
+    constexpr int tail_num_buckets  = 1 << 8;
+    constexpr int CandidateCapacity = 2048;
+    constexpr int pass0_start_bit   = 20;
+    constexpr int pass1_start_bit   = 8;
+    constexpr int pass2             = 2;
+
+    __shared__ Counter<T, IdxT> counter;
+    __shared__ IdxT histogram[num_buckets];
+    __shared__ T candidate_values[CandidateCapacity];
+    __shared__ IdxT candidate_indices[CandidateCapacity];
+    __shared__ IdxT candidate_count;
+    __shared__ int candidate_overflow;
+
+    const int64_t batch_id = blockIdx.x;
+    const IdxT row_len     = static_cast<IdxT>(len);
+
+    if(threadIdx.x == 0)
+    {
+        counter.k              = k;
+        counter.len            = row_len;
+        counter.previous_len   = row_len;
+        counter.kth_value_bits = 0;
+        counter.filter_cnt     = 0;
+        counter.out_cnt        = 0;
+        counter.out_back_cnt   = 0;
+    }
+    __syncthreads();
+
+    in += batch_id * len;
+    out_idx += batch_id * k;
+    if constexpr(WRITE_TOPK_VALUES)
+    {
+        out += batch_id * k;
+    }
+
+    // Pass 0: find the high 12-bit crossing prefix.
+    filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, BlockSize>(
+        in,
+        static_cast<IdxT const*>(nullptr),
+        static_cast<T*>(nullptr),
+        static_cast<IdxT*>(nullptr),
+        out,
+        out_idx,
+        row_len,
+        &counter,
+        histogram,
+        select_min,
+        0,
+        k);
+    __syncthreads();
+    scan<IdxT, BitsPerPass, BlockSize>(histogram);
+    __syncthreads();
+    choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, k, 0);
+    __syncthreads();
+
+    // Pass 1: build the middle-12 histogram, immediately emit high-prefix
+    // winners, and retain only the crossing high-prefix bucket in LDS.
+    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+    {
+        histogram[i] = 0;
+    }
+    if(threadIdx.x == 0)
+    {
+        candidate_count    = 0;
+        candidate_overflow = 0;
+    }
+    __syncthreads();
+
+    auto const high_prefix = counter.kth_value_bits;
+    IdxT* const p_out_cnt  = &counter.out_cnt;
+    IdxT* const histogram_ptr              = histogram;
+    T* const candidate_values_ptr       = candidate_values;
+    IdxT* const candidate_indices_ptr   = candidate_indices;
+    IdxT* const p_candidate_count       = &candidate_count;
+    int* const p_candidate_overflow     = &candidate_overflow;
+    auto stage_pass1 = [histogram_ptr,
+                        candidate_values_ptr,
+                        candidate_indices_ptr,
+                        p_candidate_count,
+                        p_candidate_overflow,
+                        p_out_cnt,
+                        out,
+                        out_idx,
+                        high_prefix,
+                        select_min](T value, IdxT idx) {
+        auto const bits = twiddle_in(value, select_min);
+        auto const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
+        if(prefix < high_prefix)
+        {
+            IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+            if constexpr(WRITE_TOPK_VALUES)
+            {
+                out[pos] = value;
+            }
+            out_idx[pos] = idx;
+        }
+        else if(prefix == high_prefix)
+        {
+            IdxT pos = atomicAdd(p_candidate_count, static_cast<IdxT>(1));
+            if(pos < CandidateCapacity)
+            {
+                candidate_values_ptr[pos]  = value;
+                candidate_indices_ptr[pos] = idx;
+            }
+            else
+            {
+                atomicExch(p_candidate_overflow, 1);
+            }
+            int const bucket = __builtin_amdgcn_ubfe(
+                bits, static_cast<unsigned>(pass1_start_bit), static_cast<unsigned>(BitsPerPass));
+            atomicAdd(histogram_ptr + bucket, static_cast<IdxT>(1));
+        }
+    };
+    vectorized_process(threadIdx.x, blockDim.x, in, row_len, stage_pass1);
+    __syncthreads();
+
+    scan<IdxT, BitsPerPass, BlockSize>(histogram);
+    __syncthreads();
+    IdxT const pass1_k = counter.k;
+    choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, pass1_k, 1);
+    __syncthreads();
+
+    if(candidate_overflow)
+    {
+        // The pass-1 histogram/choice above is exact even though LDS staging
+        // overflowed.  Ignore the partial output and continue with the regular
+        // pass-2 scan and regular full-row final emit.
+        if(threadIdx.x == 0)
+        {
+            counter.out_cnt      = 0;
+            counter.out_back_cnt = 0;
+        }
+        __syncthreads();
+
+        IdxT const pass2_k = counter.k;
+        filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, BlockSize>(
+            in,
+            static_cast<IdxT const*>(nullptr),
+            static_cast<T*>(nullptr),
+            static_cast<IdxT*>(nullptr),
+            out,
+            out_idx,
+            row_len,
+            &counter,
+            histogram,
+            select_min,
+            pass2,
+            k);
+        __syncthreads();
+        scan<IdxT, BitsPerPass, BlockSize>(histogram);
+        __syncthreads();
+        choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, pass2_k, pass2);
+        __syncthreads();
+        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
+            in,
+            static_cast<IdxT const*>(nullptr),
+            out,
+            out_idx,
+            row_len,
+            k,
+            &counter,
+            select_min,
+            pass2);
+        return;
+    }
+
+    // Resolve the final eight bits from the staged crossing bucket.  Only the
+    // first 256 histogram slots are live here; using an 8-bit scan avoids the
+    // otherwise unnecessary 4096-bin final scan.
+    for(int i = threadIdx.x; i < tail_num_buckets; i += blockDim.x)
+    {
+        histogram[i] = 0;
+    }
+    __syncthreads();
+
+    IdxT const staged_len       = candidate_count;
+    auto const middle_prefix   = counter.kth_value_bits;
+    for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
+    {
+        auto const bits = twiddle_in(candidate_values[i], select_min);
+        auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
+        if(prefix == middle_prefix)
+        {
+            atomicAdd(histogram + (bits & 0xffu), static_cast<IdxT>(1));
+        }
+    }
+    __syncthreads();
+
+    scan<IdxT, 8, BlockSize>(histogram);
+    __syncthreads();
+    IdxT const pass2_k = counter.k;
+    for(int i = threadIdx.x; i < tail_num_buckets; i += blockDim.x)
+    {
+        IdxT const prev = (i == 0) ? 0 : histogram[i - 1];
+        IdxT const cur  = histogram[i];
+        if(prev < pass2_k && cur >= pass2_k)
+        {
+            counter.k   = pass2_k - prev;
+            counter.len = cur - prev;
+            counter.kth_value_bits |= static_cast<unsigned>(i);
+        }
+    }
+    __syncthreads();
+
+    last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(candidate_values,
+                                                                candidate_indices,
+                                                                out,
+                                                                out_idx,
+                                                                staged_len,
+                                                                k,
+                                                                &counter,
+                                                                select_min,
+                                                                pass2);
+}
+
+/**
  * One-block radix top-k kernel: all passes complete in a single block.
  * Pass 0 histograms the full row; later passes read the candidates the previous
  * pass compacted into `bufs` (falling back to a full re-scan when the candidate
@@ -2798,6 +3043,23 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                                     IdxT k, T* out, IdxT* out_idx, bool select_min,
                                     hipStream_t stream, bool sorted = false, int next_n = 0)
 {
+    // Keep the normal workspace query unchanged (buf == nullptr), and isolate
+    // the extra LDS allocation in a separate kernel specialization.  This
+    // avoids imposing its occupancy cost on any non-target shape.
+    if constexpr(std::is_same_v<T, float> && std::is_same_v<IdxT, int> && BlockSize == 1024 &&
+                 !STABLE && phase == Phase::Prefill)
+    {
+        bool const use_lds_tail = buf != nullptr && topk_oneblock_use_large_bpp() &&
+                                  in_idx == nullptr && rowStarts == nullptr && rowEnds == nullptr &&
+                                  !select_min && k == 2048 && len >= 8192 && len <= 32770;
+        if(use_lds_tail)
+        {
+            radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES>
+                <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
+            return;
+        }
+    }
+
     if (topk_oneblock_use_large_bpp()) {
         standalone_stable_radix_topk_one_block_<T, IdxT, 12, BlockSize, WRITE_TOPK_VALUES, phase, STABLE>(
             buf, buf_size, in, in_idx, batch_size, len, rowStarts, rowEnds,
