@@ -32,6 +32,7 @@ mode costs up to 20%; `tie='low'` is the request. `tie=` also narrows the
 backend set to those that can promise a direction, which costs speed.
 """
 
+import os
 from functools import lru_cache
 
 import torch
@@ -56,6 +57,10 @@ from aiter.ops.flydsl.topk.topk_per_row_small_k import (
     topk_per_row_small_k,
     topk_per_row_small_k_serves,
 )
+from aiter.ops.topk import (
+    top_k_per_row_prefill_sampled,
+    topk_sampled_supports,
+)
 from aiter.ops.topk_plain import topk_plain, topk_plain_batches_ragged_rows
 
 __all__ = ["topk_select", "topk_select_backend"]
@@ -73,7 +78,12 @@ _PLAIN_MAX_K = 2048
 # ...] against a canonical [128, 132, 136, ...]. Serving "low" needs the chunk
 # tie-break made column-aware first.
 _BACKENDS_BY_TIE = {
-    None: ("argmax", "small_k", "plain", "decode", "stream"),
+    # `sampled` is listed under no promise only. Its tie direction has not been
+    # measured, and `topk_select_backend` below records what happens when a
+    # backend is declared for a tie mode it does not honour: `tie='high'` once
+    # fell through to `decode`, which ties the opposite way, silently. Declaring
+    # it for `low` or `high` on a guess would repeat that.
+    None: ("argmax", "small_k", "plain", "decode", "stream", "sampled"),
     "low": ("argmax", "decode", "stream"),
     "high": ("small_k",),
 }
@@ -81,11 +91,20 @@ _BACKENDS_BY_TIE = {
 # measured, 2 of 512 slots differed on a repeat, 18 for one row across a batch of
 # 100. Every other backend is a pure function of the row -- the property a
 # tensor-parallel caller needs, and weaker than promising a direction.
-_NONDETERMINISTIC = frozenset({"plain"})
+# `sampled` is in here because its repeat-stability has NOT been measured, not
+# because it was found unstable. The conservative direction: a caller asking
+# for `deterministic` never reaches it. Measure it and remove it from this set
+# -- `op_tests/test_topk_per_row_stable.py` is the model, and `decode` is the
+# cautionary tale, since a radix select being a pure function of the row is
+# the obvious guess and it is wrong.
+_NONDETERMINISTIC = frozenset({"plain", "sampled"})
 # Order to fall back in when the shape rules name nothing that is available.
 # Streaming first because it takes a row length natively and scales with rows;
 # `plain` last for the reasons below.
-_PREFERENCE = ("argmax", "stream", "decode", "small_k", "plain")
+# `sampled` last: this order only decides who serves when every shape rule
+# declined, and putting it anywhere else would change a fallback that is
+# already fitted. Last means it is picked only when nothing else can serve.
+_PREFERENCE = ("argmax", "stream", "decode", "small_k", "plain", "sampled")
 # Fitted to a 565-cell sweep -- rows 1..16384, widths 2048..1M, k 16..4096, to
 # 8 GiB -- by `topk_backend_fit.py` over `topk_backend_sweep.py`'s table. Re-run
 # both rather than nudging a number: the function is piecewise constant, and
@@ -118,6 +137,9 @@ _STREAM_BLOCK_WIDTHS = (512, 1024)
 # middling width it wins outright -- ahead of small_k, hence tested first. It is
 # never the fastest below k=1024: of the 64 cells it wins, 29 are k=1024 and 35
 # are k=2048.
+# rows * width at which `sampled` becomes the fastest backend here. See
+# `_sampled_takes` for the measurement and for what it was measured on.
+_SAMPLED_MIN_WORK = 1 << 28
 _PLAIN_MANY_ROWS = 256
 _PLAIN_MANY_ROWS_BAND = (8192, 65536)
 _PLAIN_MIN_K = 1024
@@ -287,6 +309,13 @@ def _available(
         for bt in (_STREAM_BLOCK_WIDTHS)
     ):
         out.add("stream")
+    # fp32 only -- the kernel has no half-format build at all. The row-count half
+    # of its predicate cannot be asked here, because this set is memoized without
+    # the row count; `topk_select_backend` asks `topk_sampled_supports` with the
+    # rows it has. Admitting it here and refusing there is the same shape as the
+    # streaming selector's two-block-width case above.
+    if fp32 and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1":
+        out.add("sampled")
     return frozenset(out)
 
 
@@ -318,6 +347,36 @@ def _choose(
             f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
         )
     return topk_select_backend(rows, width, k, available)
+
+
+def _sampled_takes(rows: int, width: int, k: int) -> bool:
+    """Total work past which `sampled` measured fastest of every backend here.
+
+    The threshold is on `rows * width`, not on either alone, and it is sharp:
+    across M=256..4096 the crossover landed on exactly 2**28 elements every
+    time -- 256x1M, 512x512K, 1024x256K, 2048x128K, 4096x64K -- with `sampled`
+    fastest at and above it and another backend fastest below.
+
+    Routing only where `sampled` measured fastest of ALL backends is what makes
+    this safe to ship: a cell that changes hands was already going to be at
+    least as slow under the previous rule, so no cell can regress. That is the
+    A/B-against-the-rule-in-place test this file asks for, rather than the
+    per-cell oracle.
+
+    Below 2**28 it stays out even where it won. M=128 took N=65536 and N=131072
+    and then lost N=262144 through N=1048576, which no monotone rule in the work
+    size can express; leaving those two cells on the old rule costs a little and
+    keeps the threshold honest. The rule is inert for M <= 128 anyway: at the
+    spec's widest N of 1M, M=128 reaches only 2**27.
+
+    **Fitted on `torch.randn` and nothing else.** Top-k time on this machine
+    depends on the value distribution as well as the shape, and every cell
+    behind this constant was measured on one distribution. A tie-dense input
+    moves the answer. Re-fit before trusting it on real data.
+    """
+    if rows * width < _SAMPLED_MIN_WORK:
+        return False
+    return bool(topk_sampled_supports(rows, width, k))
 
 
 def _plain_takes(rows: int, width: int, k: int) -> bool:
@@ -375,6 +434,8 @@ def topk_select_backend(
     # the answer does not need, and lose 1.3x to 12x doing so.
     if "argmax" in available:
         return "argmax"
+    if "sampled" in available and _sampled_takes(rows, width, k):
+        return "sampled"
     if "plain" in available and _plain_takes(rows, width, k):
         return "plain"
     if "small_k" in available and k <= _SMALL_K_MAX_K:
@@ -701,6 +762,22 @@ def _dispatch(
 ):
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
+    elif backend == "sampled":
+        # The kernel takes a [start, end) pair per row, both int32, and emits
+        # indices only -- `topk_select` gathers the values itself further down,
+        # so `values=None` here rather than scratch nobody reads.
+        starts = torch.zeros(rows, dtype=torch.int32, device=input.device)
+        ends = (
+            row_lens.to(torch.int32)
+            if ragged
+            else torch.full(
+                (rows,), input.shape[1], dtype=torch.int32, device=input.device
+            )
+        )
+        top_k_per_row_prefill_sampled(
+            input, starts, ends, idx, None,
+            rows, input.stride(0), input.stride(1), k=topk,
+        )
     elif backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)
     elif backend == "plain":
