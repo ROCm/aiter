@@ -544,6 +544,19 @@ def pa_reduce_v1(
     )
 
 
+@compile_ops("module_pa_ps_reduce_asm", fc_name="pa_ps_reduce", ffi_type="ctypes")
+def _pa_ps_reduce_asm(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
+    final_output: torch.Tensor,
+    final_lse: torch.Tensor | None = None,
+) -> None: ...
+
+
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -602,7 +615,16 @@ def pa_persistent_fwd(
         mask,
         quant_type=quant_type,
     )
-    pa_reduce_v1(
+    reduce_fn = pa_reduce_v1
+    if (
+        K.shape[3] == 16
+        and v_head_dim == 128
+        and output.dtype in (dtypes.bf16, dtypes.fp16)
+        and reduce_final_map is not None
+        and get_gfx() == "gfx950"
+    ):
+        reduce_fn = _pa_ps_reduce_asm
+    reduce_fn(
         logits,
         splitLse,
         reduce_indptr,
