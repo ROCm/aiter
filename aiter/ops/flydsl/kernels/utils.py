@@ -10,11 +10,6 @@ def rcp_f32(value):
     return rocdl.rcp(T.f32, value)
 
 
-def align_up(value: int, align: int) -> int:
-    """Round *value* up to the next multiple of *align* (static ints)."""
-    return ((int(value) + int(align) - 1) // int(align)) * int(align)
-
-
 def pow2_shift(value: int) -> int:
     assert value > 0 and (value & (value - 1)) == 0
     return value.bit_length() - 1
@@ -42,8 +37,3 @@ def urem_const(value, divisor: int):
     if const_expr(is_pow2(divisor)):
         return urem_pow2(value, divisor)
     return value % fx.Int32(divisor)
-
-
-def unflatten_k(k_flat, qkhe_loop: int = 2):
-    n = qkhe_loop * 2
-    return [[k_flat[td * n + j] for j in range(n)] for td in range(len(k_flat) // n)]
