@@ -36,8 +36,7 @@ SPARSE_RECIPES = {
     "f8f6": (FP8, AttentionFormat.MXFP6, {}),
     "f6f8": (AttentionFormat.MXFP6, FP8, {}),
     "f6f4": (AttentionFormat.MXFP6, AttentionFormat.MXFP4, {}),
-    "mxfp4": (AttentionFormat.MXFP4, FP8, {}),
-    "f4f4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4, {}),
+    "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4, {}),
 }
 
 # Two tiles is the baseline the growing counts are judged against; the rest span the region the

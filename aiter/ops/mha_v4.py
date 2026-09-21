@@ -421,15 +421,10 @@ def _resolve_raw_recipe(
     elif q_format in _FP8_FORMATS:
         kind = _RawRecipeKind.FP8
     elif q_format == AttentionFormat.MXFP4:
-        if v_format == AttentionFormat.MXFP6:
+        if v_format != AttentionFormat.MXFP4:
             raise NotImplementedError(
                 "raw preprocessing is not implemented yet for "
                 f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
-            )
-        # Sparse still uses the legacy FP8-V row; update this mode split when its MXFP4-V row lands.
-        if not sparse and _is_fp8_format(v_format):
-            raise NotImplementedError(
-                "dense MXFP4 Q/K with FP8 V does not have a kernel row yet"
             )
         kind = _RawRecipeKind.MXFP4
     elif q_format == AttentionFormat.MXFP6:

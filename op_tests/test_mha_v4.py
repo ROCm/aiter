@@ -1846,7 +1846,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 v,
                 AttentionFormat.MXFP4,
                 AttentionFormat.MXFP4,
-                AttentionFormat.MXFP4 if mask is None else native_fp8_format(),
+                AttentionFormat.MXFP4,
                 block_mask=mask,
             ),
             marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
@@ -1998,7 +1998,7 @@ def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
         ),
         pytest.param(
             AttentionFormat.MXFP4,
-            native_fp8_format(),
+            AttentionFormat.MXFP4,
             marks=pytest.mark.skipif(
                 get_gfx() != "gfx950", reason="gfx950 MXFP4 sparse"
             ),
@@ -2383,22 +2383,10 @@ _EMPTY_ROW_LAUNCHES = [
             v,
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,
-            native_fp8_format(),
+            AttentionFormat.MXFP4,
             block_mask=m,
         ),
         "mxfp4",
-    ),
-    _gfx950_only(
-        lambda q, k, v, m: mha_v4(
-            q,
-            k,
-            v,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            block_mask=m,
-        ),
-        "f4f4",
     ),
 ]
 
