@@ -56,10 +56,12 @@ from aiter.ops.flydsl.conv_kernels import (
     TUNED_KEY_COLUMNS,
     TUNED_LIBTYPE_COLUMN,
     TUNED_RESULT_COLUMNS,
+    _check_supported_arch,
     _is_matmul_fast_path,
     _pad_channels,
     _parse_tuned_bool,
 )
+from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import out_extent
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -91,8 +93,10 @@ RUN_CONFIG_REPS = 3
 RTOL = ATOL = 2e-2
 
 
-def _out_extent(size, pad, dil, kernel, stride):
-    return (size + 2 * pad - (dil * (kernel - 1) + 1)) // stride + 1
+# Taken from the kernel rather than restated: this is what decides npq, and a
+# tuner that sized the GEMM by its own copy would report the wrong M and hand
+# conv3d_policy the wrong shape to enumerate against.
+_out_extent = out_extent
 
 
 def _row_params(row):
@@ -232,20 +236,51 @@ class Conv3dTuner(TunerCommon):
             )
             self.untunedf = self.untunedf[~skip].reset_index(drop=True)
 
+    def _check_shapes_expressible(self):
+        """Reject a row whose convolution has no output to compute.
+
+        A filter wider than its padded input gives an output extent of zero or
+        less. Nothing downstream says so: the policy's last relaxation still
+        returns candidates for it, and every one of them then dies on
+        ``_conv3d_impl``'s assert inside an mp worker, which surfaces as a
+        screen of failed tasks rather than as "this CSV row is impossible".
+        """
+        if self.untunedf is None or self.untunedf.empty:
+            return
+        bad = []
+        for _, row in self.untunedf.iterrows():
+            keys = tuple(row[k] for k in self.keys)
+            _, _, _, extents = self._gemm_dims(keys)
+            if min(extents) < 1:
+                shape = ", ".join(f"{c}={row[c]}" for c in SHAPE_KEYS)
+                bad.append(f"  {shape} -> output {extents}")
+        if bad:
+            raise ValueError(
+                "untuned CSV has row(s) whose filter is larger than the padded "
+                "input, so the convolution has no output:\n" + "\n".join(bad)
+            )
+
     def pre_process(self, args):
         """Load untuned shapes, stamp the device keys, drop already-tuned rows."""
+        # Before anything is enumerated or a GPU is touched. Without it an
+        # unsupported arch is reported once per candidate, from inside an mp
+        # worker, and the one fact that matters -- this op is gfx950-only --
+        # arrives buried in a screen of failed tasks.
+        _check_supported_arch()
         # sortResults reorders against this file, and by then untunedf has had
         # the already-tuned rows dropped, so keep the path rather than the frame.
         self._untune_file = args.untune_file
         if args.all:
             self.get_retune_gemm_list(args)
             self._drop_matmul_fast_path()
+            self._check_shapes_expressible()
             return
         self.untunedf = self.get_untuned_gemm_list(args.untune_file)
         self.untunedf["gfx"] = self.get_gfx()
         self.untunedf["cu_num"] = self.get_cu_num()
         self.untunedf = self.untunedf[self.keys]
         self._drop_matmul_fast_path()
+        self._check_shapes_expressible()
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
         if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
             self.tunedf.insert(0, "gfx", self.get_gfx())
@@ -530,11 +565,16 @@ class Conv3dTuner(TunerCommon):
                         out, us = out_i, us_i
                 ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
                 ok = torch.allclose(out, ref, rtol=RTOL, atol=ATOL)
+                # e2e only, and no kernel_us: run_perftest times the whole call
+                # on the host, which for this op includes the NCDHW->NDHWC
+                # transpose and the weight repack. Reporting that figure a
+                # second time under "Kernel(us)" would put a number in a column
+                # it does not measure; the base reporter drops the column when
+                # nobody fills it.
                 results.append(
                     {
                         "shape": shape,
                         "e2e_us": round(us, 4),
-                        "kernel_us": round(us, 4),
                         "status": "ok" if ok else "mismatch",
                     }
                 )

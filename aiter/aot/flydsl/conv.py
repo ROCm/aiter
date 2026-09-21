@@ -101,8 +101,9 @@ from aiter.ops.flydsl.conv_kernels import (
     _is_matmul_fast_path,
     _pad_channels,
     _parse_tuned_bool,
+    _resolve_splitk,
 )
-from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import TILE_K, make_conv_geometry
+from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import make_conv_geometry, out_extent
 from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
@@ -117,6 +118,21 @@ CONV_AOT_ARCH_DEFAULT = "gfx950"
 # through _parse_tuned_bool below.
 _INT_COLS = tuple(c for c in TUNED_KEY_COLUMNS if c != "bias")
 _CONFIG_COLS = TUNED_RESULT_COLUMNS
+
+
+def _row_npq_per_sample(shape) -> int:
+    """``Do * Ho * Wo`` for one CSV row, by the kernel's own extent rule."""
+    return (
+        out_extent(
+            shape["D"], shape["pad_d"], shape["dil_d"], shape["kT"], shape["stride_d"]
+        )
+        * out_extent(
+            shape["H"], shape["pad_h"], shape["dil_h"], shape["kH"], shape["stride_h"]
+        )
+        * out_extent(
+            shape["W"], shape["pad_w"], shape["dil_w"], shape["kW"], shape["stride_w"]
+        )
+    )
 
 
 def parse_csv(csv_path: str):
@@ -141,10 +157,11 @@ def parse_csv(csv_path: str):
                 shape = {c: int(row[c]) for c in _INT_COLS}
                 config = {c: int(row[c]) for c in _CONFIG_COLS}
                 has_bias = _parse_tuned_bool(row.get("bias"))
-                # Recorded by the tuner. Re-deriving it here would need the
-                # target's CU count, which a build host may not have; what IS
-                # re-derived below is the divisibility the kernel asserts.
-                splitk = int(row.get("splitK") or 1) or 1
+                # Recorded by the tuner. An absent or empty cell is resolved
+                # below the same way the runtime resolves it, rather than
+                # defaulting to 1 -- see there.
+                raw_splitk = row.get("splitK", "")
+                splitk = (int(raw_splitk) or 1) if raw_splitk else None
             except ValueError as exc:
                 print(f"  [WARN] {csv_path}: unparsable row ({exc}), skipping")
                 continue
@@ -159,22 +176,6 @@ def parse_csv(csv_path: str):
             cgp = _pad_channels(shape["C"] // groups)
             c_padded = groups * cgp
 
-            # make_launch_grid asserts that splitK divides the K-tile count: a split
-            # that does not would leave the tail of the K axis unowned by any block
-            # and quietly drop it. The tuner only ever writes a value _resolve_splitk
-            # returned, so this converges a hand-edited row, or one tuned on a device
-            # whose CU count picked a different split. It is the same step _resolve_splitk
-            # ends with, and it needs no CU count -- unlike the heuristic above it,
-            # which is why deriving THAT here is what a build host cannot do. Landing
-            # on the same value keeps the AOT artifact a hit rather than compiling one
-            # the kernel would refuse.
-            k_tiles = (
-                cgp * shape["kT"] * shape["kH"] * shape["kW"] + TILE_K - 1
-            ) // TILE_K
-            splitk = min(max(1, splitk), k_tiles)
-            while splitk > 1 and k_tiles % splitk:
-                splitk -= 1
-
             # Both output layouts, because `out_ndhwc` is a compile-time
             # parameter: it flips the epilogue, which gives up the vectorised
             # store on the n==1 fast path once channels are innermost. The
@@ -185,6 +186,35 @@ def parse_csv(csv_path: str):
                 config["tile_n"],
                 config["wave_m"],
                 config["wave_n"],
+            )
+
+            # splitK is part of the compile key, so this has to land on the value
+            # the runtime will ask for.
+            #
+            # A row that carries the column only needs the divisibility step:
+            # make_launch_grid asserts that splitK divides the K-tile count (a
+            # split that does not leaves the tail of the K axis unowned and
+            # quietly dropped), and converging here keeps a hand-edited row, or
+            # one tuned where the CU count picked a different split, a cache hit
+            # rather than a kernel-side assert.
+            #
+            # A row without it used to default to 1, while the runtime derived a
+            # split from the CU count -- so for any shape the heuristic put a
+            # split on, the AOT artifact was one the runtime never asked for and
+            # the JIT it exists to remove happened anyway. The CU count that
+            # decision needs is in the row, which is why this can be resolved on
+            # a build host with no GPU at all.
+            crs = cgp * shape["kT"] * shape["kH"] * shape["kW"]
+            npq = shape["N"] * _row_npq_per_sample(shape)
+            splitk = _resolve_splitk(
+                splitk,
+                npq,
+                crs,
+                shape["K"],
+                None,
+                tile,
+                groups,
+                num_cu=cu_num or None,
             )
             for out_ndhwc in (False, True):
                 conv_job = {

@@ -175,6 +175,104 @@ def make_conv3d_implicit_param(
     )
 
 
+def _shape_agnostic_key(grid, im2col_plan, scatter_plan):
+    """The compile-time constants a kernel closes over, with the booleans blanked.
+
+    What ``dyn_hw`` promises is that one artifact serves every resolution of a
+    layer. FlyDSL keys an artifact on the scalars the closure captures, so that
+    promise is exactly the statement that no captured scalar carries D/H/W --
+    which is what this reduces the three plans to, so two resolutions can be
+    compared for it.
+
+    Booleans are blanked rather than compared because they are the one thing
+    allowed to move: ``big_in``, ``t_aligned``, ``vec_store`` and the rest are
+    derived from the extents but only as predicates, so they split the layer
+    into a constant number of artifacts instead of one per resolution. An
+    *integer* that moves is the failure this exists to catch -- it would put
+    the resolution back in the key, and the mode would silently degrade to what
+    it was meant to replace, with nothing to show for it but a slower first
+    call per size.
+    """
+
+    def _blank(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, tuple):  # nested NamedTuple (TileConfig)
+            return tuple(_blank(v) for v in value)
+        return value
+
+    return tuple(_blank(v) for v in (*grid, *im2col_plan, *scatter_plan))
+
+
+def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan):
+    """Check ``dyn_hw``'s invariant against a second resolution of this layer.
+
+    Cheap enough to run on every variable-resolution compile: it re-derives the
+    three plans in Python for a probe resolution one output step larger and
+    compares the keys. Nothing is compiled.
+
+    A probe that the gather or the grid cannot express is not a failure of the
+    invariant -- it only means this layer is near one of the reach limits -- so
+    it is skipped rather than raised.
+    """
+    st, sh, sw = param.st, param.sh, param.sw
+    probe = make_conv3d_implicit_param(
+        param.n,
+        param.c,
+        param.d + st,
+        param.h + sh,
+        param.w + sw,
+        param.k,
+        param.kt,
+        param.kh,
+        param.kw,
+        st,
+        sh,
+        sw,
+        param.pt,
+        param.ph,
+        param.pw,
+        param.dt,
+        param.dh,
+        param.dw,
+        param.pad_mode,
+        param.has_bias,
+        param.splitk,
+        param.tile,
+        param.wgm,
+        param.groups,
+        param.out_ndhwc,
+        param.dyn_hw,
+    )
+    try:
+        probe_geom = make_conv_geometry(probe)
+        probe_grid = make_launch_grid(probe, probe_geom, cfg)
+        if probe_grid.m_chunks != 1:
+            # The probe needs M chunking, which this path rules out anyway.
+            return
+        probe_plans = (
+            make_im2col_plan(probe, probe_geom, cfg),
+            make_output_scatter_plan(probe, probe_geom, cfg, probe_grid),
+        )
+    except AssertionError:
+        return
+
+    # Against the grid as the kernel closes over it: x/z/m are blanked there
+    # because the launch reads them from the runtime scalars instead, so they
+    # are the one part of the grid that is allowed to follow the resolution.
+    mine = _shape_agnostic_key(kernel_grid, im2col_plan, scatter_plan)
+    theirs = _shape_agnostic_key(
+        probe_grid._replace(grid_x=0, grid_z=0, grid_m=0), *probe_plans
+    )
+    assert mine == theirs, (
+        "variable resolution asked for, but a compile-time constant still "
+        f"carries the input extents: {param.d}x{param.h}x{param.w} and "
+        f"{probe.d}x{probe.h}x{probe.w} derive different kernel constants "
+        f"({[(a, b) for a, b in zip(mine, theirs) if a != b]}). One artifact "
+        "per layer is no longer what this compiles to."
+    )
+
+
 # One entry per (shape, launch config). A tuning sweep walks ~100 configs per
 # shape and several shapes land in the same worker process, so the upstream 256
 # would evict entries that the same process still needs.
@@ -241,6 +339,11 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         # z from it, so a kernel that kept the real numbers here would be
         # keyed on them and get one artifact per resolution after all.
         kernel_grid = grid._replace(grid_x=0, grid_z=0, grid_m=0)
+        # And that the rest of what the kernel closes over really is free of
+        # the resolution -- the property this whole mode rests on, and one
+        # that a new constant derived from an output extent would break
+        # silently, costing an artifact per size and nothing else.
+        _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan)
     else:
         extra_args = ()
         dyn_unit = None

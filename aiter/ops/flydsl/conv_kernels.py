@@ -37,6 +37,7 @@ from .kernels.conv3d_gfx950_utils import (
     SPLITK_MAX_STAGING_BYTES,
     TILE_K,
     _as_stream,
+    out_extent,
 )
 from .kernels.conv3d_im2col import PADDING_MODES
 from .kernels.conv3d_implicit_gfx950 import (
@@ -696,7 +697,16 @@ def _prep_weight(w, k, kt, kh, kw, c):
     return wk
 
 
-def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
+def _resolve_splitk(
+    splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1, num_cu=None
+):
+    """The number of K splits to launch with.
+
+    ``num_cu`` overrides the device probe, for a caller deciding on behalf of a
+    machine it is not running on: the AOT pass has the target's CU count in the
+    tuned row and no target GPU, and a split derived from the build host's
+    count instead would compile an artifact the target never asks for.
+    """
     k_tiles = (crs + TILE_K - 1) // TILE_K
     if npq * k * 4 > SPLITK_MAX_STAGING_BYTES:
         return 1
@@ -717,7 +727,7 @@ def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
         ):
             sk = 1
         else:
-            num_cu = _num_cu(device)
+            num_cu = _num_cu(device) if num_cu is None else int(num_cu)
             if base >= (3 * num_cu) // 4:
                 sk = 1
             else:
@@ -899,9 +909,9 @@ def _conv3d_impl(
             y = y + bias.to(y.dtype).view(1, k, 1, 1, 1)
         return y.permute(0, 2, 3, 4, 1).contiguous() if out_ndhwc else y
 
-    do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
-    ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
-    wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
+    do = out_extent(d, pt, dt, kt, st)
+    ho = out_extent(h, ph, dh, kh, sh)
+    wo = out_extent(w, pw, dw, kw, sw)
     assert (
         min(do, ho, wo) >= 1
     ), f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"

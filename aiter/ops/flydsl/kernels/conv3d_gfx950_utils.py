@@ -600,6 +600,18 @@ class ConvGeometry(NamedTuple):
     crs: int
 
 
+def out_extent(size, pad, dil, kernel, stride):
+    """One output axis of a convolution, by torch's rule.
+
+    The one copy of this. It decides ``npq``, so the host sizes the output
+    tensor by it, the kernel sizes its grid by it, and the tuner sizes the GEMM
+    it reports by it -- three places that must agree on what a stride or a
+    dilation does to an extent, or the epilogue writes a shape the caller did
+    not allocate.
+    """
+    return (size + 2 * pad - (dil * (kernel - 1) + 1)) // stride + 1
+
+
 def make_conv_geometry(param):
     """The ConvGeometry of one ``Conv3dImplicitParam``.
 
@@ -607,9 +619,9 @@ def make_conv_geometry(param):
     extents but leaves the K axis (CRS) alone.
     """
     cgp = param.c // param.groups
-    do = (param.d + 2 * param.pt - (param.dt * (param.kt - 1) + 1)) // param.st + 1
-    ho = (param.h + 2 * param.ph - (param.dh * (param.kh - 1) + 1)) // param.sh + 1
-    wo = (param.w + 2 * param.pw - (param.dw * (param.kw - 1) + 1)) // param.sw + 1
+    do = out_extent(param.d, param.pt, param.dt, param.kt, param.st)
+    ho = out_extent(param.h, param.ph, param.dh, param.kh, param.sh)
+    wo = out_extent(param.w, param.pw, param.dw, param.kw, param.sw)
     dhw = do * ho * wo
     return ConvGeometry(
         do=do,
