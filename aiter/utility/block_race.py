@@ -19,6 +19,15 @@ because whichever is shipped the result is equally fast. That is what keeps
 the block count a function of delta and the measurement noise rather than of
 the size of the catalogue.
 
+Correctness belongs to the caller. An entrant reaches :func:`race` only
+through the timing function, so nothing here ever sees kernel output and a
+candidate that computes the wrong answer races exactly like one that does
+not. Check it in the same pass that compiles and warms each candidate, before
+any timed call: that pass has to happen anyway, and doing the check there
+keeps a compile off a measurement as well as a wrong candidate out of the
+field. ``_race_one_shape`` in ``op_tests/tuners/tune_mha_fwd.py`` is the
+reference implementation.
+
 Nothing here imports torch at module scope. The caller supplies a timing
 function, for which :func:`cuda_event_timer` is the GPU implementation, so the
 decision logic can be tested on synthetic latencies without a device.
@@ -247,9 +256,10 @@ def measure_blocks(
 def _lower_bound(differences: Sequence[float], per_decision: float) -> float:
     """Lower confidence bound on the mean paired difference."""
     spread = statistics.stdev(differences) / math.sqrt(len(differences))
-    return statistics.mean(differences) - critical_t(
-        per_decision, len(differences) - 1
-    ) * spread
+    return (
+        statistics.mean(differences)
+        - critical_t(per_decision, len(differences) - 1) * spread
+    )
 
 
 def race(
