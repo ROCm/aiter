@@ -315,7 +315,7 @@ def _gluon_flash_attn_forward(
         )
 
     if config is None:
-        config = _get_gluon_config(is_fp8=IS_FP8, has_pe=pe_head_dim > 0)
+        config = _get_gluon_config(is_fp8=IS_FP8, has_pe=pe_head_dim > 0, causal=causal)
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
     BLOCK_N = config.pop("BLOCK_N")
@@ -441,6 +441,18 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
+    # The kernel now carries two loops -- the rotated pipeline and the generic one --
+    # in a single function, and its live set is close to the 256 architected VGPRs a
+    # wave gets at waves_per_eu=2.  Left to the default scheduler that tips into
+    # scratch spills; `iterative-minreg` schedules for register pressure instead of
+    # ILP and pulls it back under.  `amdgpu-agpr-alloc=0,0` keeps the accumulators in
+    # arch VGPRs: on CDNA4 the register file is unified, so parking them in AGPRs buys
+    # nothing and puts v_accvgpr moves on the critical path of the unrolled loop.
+    _LLVM_FN_ATTRS = (
+        ("amdgpu-agpr-alloc", "0,0"),
+        ("amdgpu-sched-strategy", "iterative-minreg"),
+    )
+
     _gluon_attn_fwd[grid](
         q,
         k,
@@ -485,6 +497,10 @@ def _gluon_flash_attn_forward(
         SLIDING_WINDOW=sliding_window,
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
+        # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
+        # into fp8 would throw away far more than the multiply costs.
+        SCALE_ON_Q=not IS_FP8,
+        llvm_fn_attrs=_LLVM_FN_ATTRS,
         **config,
     )
 
