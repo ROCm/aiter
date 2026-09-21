@@ -124,13 +124,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("iq2r_swiglu_out",
           &aiter::iq2r_swiglu_out,
           py::arg("gate_up"),
-          py::arg("output"));
+          py::arg("output"),
+          py::arg("limit"),
+          py::arg("alpha"),
+          py::arg("up_offset"));
     m.def("iq2r_swiglu_quant_out",
           &aiter::iq2r_swiglu_quant_out,
           py::arg("gate_up"),
           py::arg("output"),
           py::arg("scales"),
-          py::arg("activated") = std::nullopt);
+          py::arg("activated") = std::nullopt,
+          py::arg("limit") = 7.0,
+          py::arg("alpha") = 1.702,
+          py::arg("up_offset") = 1.0);
     m.def("iq2r_route_reduce_indexed_out",
           &aiter::iq2r_route_reduce_indexed_out,
           py::arg("route_output"),

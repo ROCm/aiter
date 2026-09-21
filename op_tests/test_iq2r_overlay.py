@@ -9,8 +9,15 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 import aiter.iq2r_overlay as overlay_module
-from aiter.iq2r_checkpoint import iq2r_gpt_oss_source_keys
-from aiter.iq2r_overlay import create_gpt_oss_iq2r_overlay
+from aiter.iq2r_checkpoint import (
+    iq2r_glm5_overlay_keys,
+    iq2r_glm5_source_keys,
+    iq2r_gpt_oss_source_keys,
+)
+from aiter.iq2r_overlay import (
+    create_glm5_iq2r_overlay,
+    create_gpt_oss_iq2r_overlay,
+)
 
 
 class _FakeMetadata:
@@ -51,6 +58,61 @@ def _fake_checkpoint(layer: int):
         down_bias=torch.tensor([[layer, 6]], dtype=torch.bfloat16),
         gate_up_tile_n=128,
         down_tile_n=64,
+        gate_up_metadata=_FakeMetadata("gate_up"),
+        down_metadata=_FakeMetadata("down"),
+        source_shards=(f"compiled-{layer}.safetensors",),
+    )
+
+
+def _write_glm_source_model(path, layers: int, experts: int) -> None:
+    path.mkdir()
+    tensors = {"model.language_model.embed_tokens.weight": torch.arange(4)}
+    # Include one MTP layer after num_hidden_layers. It must remain base FP8 and
+    # must not be rewritten into the runtime's routed-expert overlay.
+    for layer in range(3, layers + 1):
+        for expert in range(experts):
+            for index, name in enumerate(iq2r_glm5_source_keys(layer, expert).values()):
+                tensors[name] = torch.tensor([layer, expert, index])
+    save_file(tensors, path / "model-00001-of-00001.safetensors")
+    weight_map = {name: "model-00001-of-00001.safetensors" for name in tensors}
+    config = {
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "model_type": "glm5_next",
+        "text_config": {
+            "num_hidden_layers": layers,
+            "first_k_dense_replace": 3,
+            "n_routed_experts": experts,
+            "hidden_size": 128,
+            "moe_intermediate_size": 64,
+        },
+        "quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        },
+    }
+    (path / "config.json").write_text(json.dumps(config))
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 456}, "weight_map": weight_map})
+    )
+    (path / "tokenizer.json").write_text("{}")
+
+
+def _fake_glm_checkpoint(layer: int, experts: int):
+    return SimpleNamespace(
+        layer_index=layer,
+        expert_start=0,
+        expert_count=experts,
+        total_experts=experts,
+        model_family="glm5",
+        gate_up_data=torch.full((experts, 2), layer, dtype=torch.uint8),
+        gate_up_auxiliary=torch.zeros((experts, 2), dtype=torch.uint8),
+        gate_up_bias=None,
+        down_data=torch.full((experts, 2), layer + 1, dtype=torch.uint8),
+        down_auxiliary=torch.zeros((experts, 2), dtype=torch.uint8),
+        down_bias=None,
+        gate_up_tile_n=128,
+        down_tile_n=128,
         gate_up_metadata=_FakeMetadata("gate_up"),
         down_metadata=_FakeMetadata("down"),
         source_shards=(f"compiled-{layer}.safetensors",),
@@ -105,3 +167,55 @@ def test_overlay_is_complete_and_index_authoritative(tmp_path, monkeypatch):
     assert manifest["iq2r_to_mxfp4_payload_ratio"] > 0
     assert index["metadata"]["iq2r_layer_count"] == 2
     assert index["metadata"]["iq2r_bytes"] == manifest["iq2r_bytes"]
+
+
+def test_glm_overlay_replaces_only_runtime_routed_experts(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    compiled = tmp_path / "compiled"
+    output = tmp_path / "overlay"
+    experts = 2
+    _write_glm_source_model(source, layers=5, experts=experts)
+    compiled.mkdir()
+
+    monkeypatch.setattr(
+        overlay_module,
+        "load_iq2r_layer_checkpoint",
+        lambda _path, layer: _fake_glm_checkpoint(layer, experts),
+    )
+    manifest_path = create_glm5_iq2r_overlay(source, compiled, output)
+
+    config = json.loads((output / "config.json").read_text())
+    assert config["quantization_config"] == {
+        "quant_method": "iq2r",
+        "schema": "aiter-iq2r-overlay",
+        "schema_version": 2,
+        "base_quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        },
+        "iq2r_modules": ["model.layers.*.mlp.experts"],
+    }
+
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+    for layer in (3, 4):
+        for expert in range(experts):
+            assert all(
+                name not in weight_map
+                for name in iq2r_glm5_source_keys(layer, expert).values()
+            )
+        replacement = f"iq2r-model-layer-{layer:04d}.safetensors"
+        names = iq2r_glm5_overlay_keys(layer)
+        assert all(weight_map[name] == replacement for name in names.values())
+        with safe_open(output / replacement, framework="pt", device="cpu") as shard:
+            assert set(shard.keys()) == set(names.values())
+
+    # Layer 5 is the checkpoint's MTP draft layer and is outside
+    # text_config.num_hidden_layers, so its original FP8 tensors remain indexed.
+    assert all(name in weight_map for name in iq2r_glm5_source_keys(5, 0).values())
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["schema"] == "aiter-iq2r-overlay"
+    assert manifest["first_moe_layer"] == 3
+    assert manifest["layer_count"] == 2
+    assert manifest["removed_source_tensor_count"] == 24

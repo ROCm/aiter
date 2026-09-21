@@ -879,33 +879,25 @@ def fused_moe(
         }
         present = [name for name, value in unsupported.items() if value is not None]
         if present:
-            raise NotImplementedError(
-                "IQ2R GPT-OSS does not support " + ", ".join(present)
-            )
+            raise NotImplementedError("IQ2R does not support " + ", ".join(present))
         if shared_expert_id != -1:
-            raise NotImplementedError("IQ2R GPT-OSS does not support shared experts")
+            raise NotImplementedError("IQ2R does not support fused shared experts")
         if activation != ActivationType.Swiglu:
-            raise ValueError("IQ2R GPT-OSS requires SwiGLU activation")
+            raise ValueError("IQ2R requires SwiGLU activation")
         if doweight_stage1:
             raise NotImplementedError(
-                "IQ2R GPT-OSS applies route weights after the down projection"
+                "IQ2R applies route weights after the down projection"
             )
         if block_size_M not in (None, -1):
             raise ValueError("IQ2R uses its workspace task_rows selection")
         if moe_sorting_dispatch_policy != 0:
             raise ValueError("IQ2R uses its dedicated stable route sorter")
         if hidden_pad != 0 or intermediate_pad != 0:
-            raise ValueError("IQ2R GPT-OSS uses logical 2880 dimensions")
+            raise ValueError("IQ2R requires unpadded logical expert dimensions")
         if dtype not in (None, torch.bfloat16):
-            raise TypeError("IQ2R GPT-OSS output dtype must be bfloat16")
-        if swiglu_limit not in (None, 7.0):
-            raise ValueError("IQ2R GPT-OSS requires swiglu_limit=7.0")
-        if beta not in (None, 1.702):
-            raise ValueError("IQ2R GPT-OSS requires beta=1.702")
-        if linear_beta not in (None, 1.0):
-            raise ValueError("IQ2R GPT-OSS requires linear_beta=1.0")
+            raise TypeError("IQ2R output dtype must be bfloat16")
         if gate_mode not in (None, GateMode.SEPARATED.value):
-            raise ValueError("IQ2R GPT-OSS requires separated gate/up semantics")
+            raise ValueError("IQ2R requires separated gate/up semantics")
         required = {
             "iq2r_w1_auxiliary": iq2r_w1_auxiliary,
             "iq2r_w2_auxiliary": iq2r_w2_auxiliary,
@@ -939,6 +931,9 @@ def fused_moe(
             router_bias=iq2r_router_bias,
             renormalize=iq2r_router_renormalize,
             output=output,
+            swiglu_limit=7.0 if swiglu_limit is None else float(swiglu_limit),
+            swiglu_alpha=1.702 if beta is None else float(beta),
+            swiglu_up_offset=1.0 if linear_beta is None else float(linear_beta),
         )
 
     if (
