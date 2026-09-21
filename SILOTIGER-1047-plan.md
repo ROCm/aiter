@@ -822,6 +822,11 @@ drop the ``di`` loop). ``err=0``; width-2051 ``L=512`` was 18.6 /
 worse; prefill does not launch merge. Keep two waves and two ``D``
 lanes per thread.
 
+**Do not retry** BF16 ``partial_out`` (keep FP32 split partials). GPU 6 /
+gfx950 stayed exact (``err=0``); width-2051 ``L=512`` was 18.91 / 21.23 /
+515.40 us vs 18.65 / 21.15 / 513.29. Decode is flat-to-worse; prefill
+does not use split partials. Keep FP32 ``partial_out``.
+
 **Do not retry** 64-bit ``BufferCopy64b`` ``partial_out`` loads in the
 128-thread LSE merge with consecutive ``D`` pairs (``d=2*tid``). GPU 6 /
 gfx950 stayed exact (``err=0``); merge VGPR 112 → 63 and ISA emitted
