@@ -44,6 +44,27 @@ say() { echo "[run_one #$PR] $*"; }
 # Fail fast if the prompts have drifted from SKILL.md (they quote it verbatim).
 python3 "$SKILL/check_prompts.py" >/dev/null || { say "prompts drifted from SKILL.md (run check_prompts.py), aborting"; exit 4; }
 
+# GLM health-gate: a review is worthless if the backend is down, and a dead GLM otherwise
+# hangs ~40s per agent call and dies silently mid-review. When a direct endpoint is configured
+# (ANTHROPIC_BASE_URL, i.e. an on-box GLM), deep-probe it with a REAL 1-token inference — not
+# the shallow /health, which stays green while inference is wedged — and fail fast with a clear
+# signal. claude-glm mode resolves its own endpoint, so there is nothing to probe here.
+if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+  say "GLM health probe..."
+  _code=$(curl -s -m "${AITER_GLM_PROBE_TIMEOUT:-30}" --noproxy '*' \
+    "$ANTHROPIC_BASE_URL/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${ANTHROPIC_MODEL:-/models/GLM-5.3}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+    -o /dev/null -w '%{http_code}' 2>/dev/null || true)
+  if [ "$_code" != "200" ]; then
+    say "GLM backend unavailable at $ANTHROPIC_BASE_URL (deep inference probe returned '$_code') -- aborting before any work; this is a backend outage, not a problem with the PR"
+    echo "::error title=aiter-bot::GLM backend unavailable ($ANTHROPIC_BASE_URL) -- review skipped, re-trigger when it is back"
+    # sentinel for the workflow's notify step: post to the PR + @-mention the GLM deployment owner
+    printf 'GLM backend unavailable -- deep inference probe returned %s at %s\n' "$_code" "$ANTHROPIC_BASE_URL" > "${GITHUB_WORKSPACE:-$PROJ}/.aiter-glm-down"
+    exit 5
+  fi
+  say "GLM ok"
+fi
+
 # 1) fetch (the skill's own Step-1 fetcher) -> WORK dir
 say "fetch..."
 FL="$(mktemp)"

@@ -118,3 +118,34 @@ jobs:
         env:
           AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
         run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
+
+      - name: Notify on GLM outage (as aiter-bot, @-mention the GLM owner)
+        # Runs even when the review step failed. run_one.sh drops .aiter-glm-down when its GLM
+        # health probe fails, so the person who triggered the review learns it was a backend
+        # outage (not their PR), and the GLM deployment owner is @-mentioned to go fix it.
+        if: always() && steps.gate.outputs.ok == 'true'
+        env:
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+          GLM_OWNER: ${{ vars.AITER_GLM_OWNER }}   # optional repo var; defaults to honglie below
+        run: |
+          f="$GITHUB_WORKSPACE/.aiter-glm-down"
+          [ -f "$f" ] || exit 0
+          OWNER="${GLM_OWNER:-honglie}" DETAIL="$(cat "$f")" python3 - <<'PY'
+          import json, os, urllib.request
+          owner  = os.environ.get("OWNER") or "honglie"
+          detail = os.environ.get("DETAIL", "").strip()
+          body = ("⚠️ **aiter-bot** — the GLM backend is currently unavailable, so this review was "
+                  "skipped. This is a backend outage, **not a problem with this PR**.\n\n"
+                  f"@{owner} (GLM deployment owner) — please check the GLM service on the review "
+                  "runner box.\n\nRe-comment `@aiter-bot review` once it is back."
+                  + (f"\n\n<sub>{detail}</sub>" if detail else ""))
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/issues/{os.environ['PR']}/comments",
+              data=json.dumps({"body": body}).encode(),
+              headers={"Authorization": f"token {os.environ['AITER_BOT_TOKEN']}",
+                       "Accept": "application/vnd.github+json"}, method="POST")
+          try:
+              urllib.request.urlopen(req, timeout=15); print("posted GLM-outage notice")
+          except Exception as e:
+              print(f"notify failed: {e}")
+          PY
