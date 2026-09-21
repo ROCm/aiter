@@ -763,6 +763,14 @@ regressed 18.65 → 19.16 us at ``M=1`` and 21.15 → 22.35 us at ``M=8``;
 hand-rolled ``(n0+lane_m%4)*D + (d-lane_m%4)`` miss. Keep token-major
 decode V: a correct transpose PV-B does not buy back the layout change.
 
+**Do not retry** prefill-only ``LDSReadTrans16_64b`` ``make_tiled_copy_B``
+PV on already row-major ``[BLOCK_N, D]`` with ``(16, 16):(1, D)``.
+GPU 6 / gfx950 stayed exact (``err=0``), decode was flat (18.63 / 21.22 us),
+and occupancy ISA emitted ``32× ds_read_b64_tr_b16`` at the same 257 VGPR /
+36 ``ds_write_b128``, but width-2051 ``L=512`` ``M=512`` only moved
+513.29 → 506.16 us (~1.4%). Below the 3% keep gate. Keep scalar
+``v_lds[n, d]`` gathers on BN64.
+
 **Do not retry** ``BLOCK_N=64`` / 8 splits / 128 threads for
 ``4 < M * Hk < 32``. ``M=8`` stayed correct (``err=0``) but width-2051
 ``L=512`` went 22.7 → 33.5 us; ``M=1`` and prefill were flat. Keep that
