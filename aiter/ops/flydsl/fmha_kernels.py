@@ -258,7 +258,9 @@ def flydsl_flash_attn_paged_prefill_func(
     Supply either a rectangular ``block_table`` and KV token ``seqlen_k``,
     or CSR ``kv_indptr``/``kv_page_indices`` with ``kv_last_page_lens`` for
     pages larger than one. A supplied block table takes precedence. All
-    metadata is int32 on Q's device; maxima are host integer launch bounds.
+    metadata is int32 on Q's device. The maxima are trusted host launch bounds
+    and must cover every request's actual Q/K length; undersized values violate
+    the API contract and are not recomputed from device metadata on this hot path.
     The causal mask is bottom-right aligned, including when Q is longer
     than KV. ``softmax_scale`` defaults to ``Dqk**-0.5`` and must be a
     positive finite Python scalar, independent of the quantization descales.

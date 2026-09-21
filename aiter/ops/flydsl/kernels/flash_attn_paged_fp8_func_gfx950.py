@@ -147,7 +147,10 @@ def flydsl_flash_attn_paged_fp8_func(
     actual KV token lengths. Alternatively, ``kv_indptr[B+1]`` indexes the
     flat ``kv_page_indices`` array; pages larger than one then require
     ``kv_last_page_lens[B]``. A supplied block table takes precedence.
-    Both maxima are nonnegative launch bounds.
+    Both maxima are trusted host launch bounds and must cover every request's
+    actual Q/K length. Passing undersized bounds is invalid; they are not
+    recomputed from device metadata because that would add synchronization or
+    validation launches to this graph-capturable hot path.
     Metadata must be int32 on Q's device. Active IDs and lengths are the
     caller's valid cache metadata; unused table entries are never consumed.
 
