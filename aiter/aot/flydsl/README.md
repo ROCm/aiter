@@ -82,6 +82,13 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
 | `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
 
+### Runtime dispatch
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AITER_UNIFIED_ATTN_MAX_KV_SPLITS` | `16` | Caps the auto-dispatched split-K count for the FlyDSL fp8 `unified_attention` general/prefill-body path (the `_split_count` heuristic). Raise (e.g. `32`) for long-context, small-batch decode: the heuristic keys on machine fill, not KV depth, so very long contexts benefit from a higher cap. Does **not** cap the decode-specialized kernel (`AITER_DECODE_KERNEL=1`), which plans its own split count via `plan_num_kv_splits(...)` under a separate limit. |
+| `AITER_DECODE_KERNEL` | `1` | Master on/off for the FlyDSL decode-specialized kernel (BLOCK_M=16 multi-wave + register-V + split-K). Set to `0` to force the legacy prefill-body/cede path. |
+
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
 > and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
