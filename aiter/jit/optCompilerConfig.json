@@ -1790,6 +1790,23 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_hipb_groupedgemm": {
+        "srcs": [
+            "f'{AITER_GRADLIB_DIR}/csrc/hipb_groupedgemm.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-U__CUDA_NO_HALF_OPERATORS__'",
+            "'-U__CUDA_NO_HALF_CONVERSIONS__'",
+            "'-ftemplate-depth=1024'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_GRADLIB_DIR}/include/'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_top_k_per_row": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'",

@@ -1985,6 +1985,7 @@ def compile_ops(
     gen_fake: Callable[..., Any] | None = None,
     ffi_type: str = "pybind",
     develop: bool = False,
+    mutates_args: list[str] | str = "unknown",
 ):
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
@@ -2296,7 +2297,12 @@ def compile_ops(
                     module._set_current_hip_stream(raw_stream(current_device()))
                 return op(*args, **kwargs)
 
-            @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
+            @torch_compile_guard(
+                mutates_args=mutates_args,
+                device="cuda",
+                gen_fake=gen_fake,
+                calling_func_=func,
+            )
             def custom_wrapper(*args, **kwargs):
                 return wrapper(*args, **kwargs)
 
