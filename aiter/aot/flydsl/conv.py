@@ -106,8 +106,18 @@ from aiter.ops.flydsl.conv_kernels import (
     _parse_tuned_bool,
     _resolve_splitk,
 )
-from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import make_conv_geometry, out_extent
-from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import compile_conv3d_implicit
+from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import (
+    make_conv_geometry,
+    make_launch_grid,
+    make_output_scatter_plan,
+    make_tile_config,
+    out_extent,
+)
+from aiter.ops.flydsl.kernels.conv3d_im2col import make_im2col_plan
+from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import (
+    _shape_agnostic_key,
+    compile_conv3d_implicit,
+)
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,
@@ -121,6 +131,72 @@ CONV_AOT_ARCH_DEFAULT = "gfx950"
 # through _parse_tuned_bool below.
 _INT_COLS = tuple(c for c in TUNED_KEY_COLUMNS if c != "bias")
 _CONFIG_COLS = TUNED_RESULT_COLUMNS
+
+
+# The columns that say which resolution a row was traced at, as opposed to
+# which layer it is. A variable-resolution artifact is shared across them.
+_RESOLUTION_COLS = ("N", "D", "H", "W")
+
+
+def _conv_dedupe_key(job):
+    """What makes two conv rows the same compile.
+
+    On the static path that is the whole row -- one artifact per resolution. A
+    ``dyn_hw`` row closes over no extent, so every resolution of a layer lands
+    on one artifact and compiling each of them separately is wasted build time.
+    The key is then ``_shape_agnostic_key``, the same reduction
+    ``compile_conv3d_implicit`` asserts its invariant against, plus the fields
+    that are not the resolution.
+
+    A row whose plans cannot be derived here falls back to the whole row. A
+    duplicate job costs build time and nothing else, while merging two rows
+    that do not in fact share an artifact would drop one the runtime asks for.
+    """
+    if not job["dyn_hw"]:
+        return job_identity(job)
+    tile = (job["tile_m"], job["tile_n"], job["wave_m"], job["wave_n"])
+    try:
+        param = _implicit_param_from_problem(
+            job["N"],
+            job["C"],
+            job["D"],
+            job["H"],
+            job["W"],
+            job["K"],
+            job["kT"],
+            job["kH"],
+            job["kW"],
+            job["stride_d"],
+            job["stride_h"],
+            job["stride_w"],
+            job["pad_d"],
+            job["pad_h"],
+            job["pad_w"],
+            job["dil_d"],
+            job["dil_h"],
+            job["dil_w"],
+            job["groups"],
+            job["has_bias"],
+            job["splitk"],
+            tile,
+            job["wgm"],
+            job["out_ndhwc"],
+            "zeros",
+            True,
+        )
+        cfg = make_tile_config(param.tile)
+        geom = make_conv_geometry(param)
+        grid = make_launch_grid(param, geom, cfg)
+        agnostic = _shape_agnostic_key(
+            grid._replace(grid_x=0, grid_z=0, grid_m=0),
+            make_im2col_plan(param, geom, cfg),
+            make_output_scatter_plan(param, geom, cfg, grid),
+        )
+    except (AssertionError, ValueError):
+        return job_identity(job)
+    return (agnostic,) + tuple(
+        sorted((k, v) for k, v in job.items() if k not in _RESOLUTION_COLS)
+    )
 
 
 def _row_npq_per_sample(shape) -> int:
@@ -241,14 +317,13 @@ def parse_csv(csv_path: str):
                     **shape,
                     **config,
                 }
-                key = job_identity(conv_job)
+                key = _conv_dedupe_key(conv_job)
                 if key not in seen:
                     seen.add(key)
                     jobs.append(conv_job)
 
-            # The NCDHW->NHWC pre-transpose. Keyed only on (n, padded C, T*H*W),
-            # so several convolutions collapse onto one job. Skipped where the
-            # op itself falls back to torch.permute.
+            # The NCDHW->NHWC pre-transpose, which several convolutions collapse
+            # onto. Skipped where the op itself falls back to torch.permute.
             s = shape["D"] * shape["H"] * shape["W"]
             big = shape["N"] * c_padded * s > 0x7FFFFFFF
             if c_padded % TR_VEC == 0 and not (big and s > TR_MAX_BIG_S):
@@ -261,7 +336,12 @@ def parse_csv(csv_path: str):
                     "c_padded": c_padded,
                     "s": s,
                 }
-                key = job_identity(tr_job)
+                # ``s`` reaches the transpose kernel as a runtime operand, and
+                # the only compile-time thing derived from it is BIG. So one
+                # job per (N, C, BIG) covers every resolution of a layer, and
+                # the ``s`` riding along in the payload is just a value that
+                # re-derives the same BIG at compile time.
+                key = ("transpose", gfx, cu_num, shape["N"], c_padded, big)
                 if key not in seen:
                     seen.add(key)
                     jobs.append(tr_job)
