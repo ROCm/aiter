@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 
+import flydsl.expr as fx
 import torch
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
@@ -15,24 +16,34 @@ from .kernels.tensor_shim import ptr_arg
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
 
 
-def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
-    """Selects the environment override or the CSV setting."""
-    value = os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH")
+def _select_bool_env(name: str, csv_value: int) -> int:
+    """Select a strict 0/1 environment override or the CSV setting."""
+    value = os.environ.get(name)
     if value is None:
-        return int(bool(csv_next_stage_prefetch))
+        return int(bool(csv_value))
     value = value.strip()
     if value not in ("0", "1"):
-        raise ValueError("AITER_TDM_NEXT_STAGE_PREFETCH must be 0 or 1")
+        raise ValueError(f"{name} must be 0 or 1")
     return int(value)
+
+
+def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
+    """Selects the B-only TDM temporal hint."""
+    value = os.environ.get("AITER_TDM_B_TH")
+    temporal_hint = int(csv_tdm_b_th) if value is None else int(value.strip())
+    if not 0 <= temporal_hint <= 6:
+        raise ValueError("AITER_TDM_B_TH must be between 0 and 6")
+    return temporal_hint
 
 
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
     try:
-        requested_cluster_n = (
-            int(env_cluster_n) if env_cluster_n is not None else int(csv_cluster_n)
-        )
+        if env_cluster_n is not None:
+            requested_cluster_n = int(env_cluster_n)
+        else:
+            requested_cluster_n = int(csv_cluster_n)
     except (TypeError, ValueError) as exc:
         raise ValueError("AITER_FLYDSL_MXFP4_CLUSTER_N must be an integer") from exc
     if requested_cluster_n <= 1:
@@ -59,6 +70,37 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
             f"{num_waves}"
         )
     return num_waves
+
+
+def _cycle_counter_shape(
+    contiguous_m: int,
+    n: int,
+    tile_m: int,
+    tile_n: int,
+    m_warp: int,
+    n_warp: int,
+) -> tuple[int, int, int]:
+    """Return the per-wave cycle-counter buffer shape for one launch."""
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import CYCLE_RECORD_FIELDS
+
+    n_tiles = (n + tile_n - 1) // tile_n
+    grid_x = ((contiguous_m + tile_m - 1) // tile_m) * n_tiles
+    return grid_x, m_warp * n_warp, CYCLE_RECORD_FIELDS
+
+
+def allocate_cycle_counters(
+    out,
+    *,
+    contiguous_m,
+    n,
+    tile_m=64,
+    tile_n=256,
+    m_warp=1,
+    n_warp=4,
+):
+    """Allocate the per-wave cycle-counter buffer for a grouped GEMM launch."""
+    shape = _cycle_counter_shape(contiguous_m, n, tile_m, tile_n, m_warp, n_warp)
+    return torch.empty(shape, dtype=torch.uint64, device=out.device)
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -91,14 +133,32 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    tdm_as_in_prologue=0,
+    tdm_b_th=0,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    row_major_ascale=0,
+    a_row_stride_bytes=0,
+    a_scale_row_stride_bytes=0,
+    need_cycle_analysis=0,
+    cycle_analysis=None,
 ):
-    """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
-    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+    """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel.
+
+    When ``need_cycle_analysis`` is enabled, ``cycle_analysis`` must be a
+    contiguous CUDA uint64 tensor shaped ``(num_threadgroups, num_waves, 8)``.
+    Each per-wave record is ``[wave_start, prologue_end, mainloop_end, wave_end,
+    has_work, realtime_start, realtime_end, 0]``. Shader-cycle differences are
+    local to one wave; REALTIME is fixed-frequency and can estimate elapsed time
+    and effective shader frequency when its calibrated frequency is known.
+    """
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        CYCLE_RECORD_FIELDS,
+        launch_gemm_a8w4_tdm,
+    )
 
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -121,6 +181,34 @@ def flydsl_grouped_gemm_a8w4_masked(
         )
     enable_ep_scatter = stage2_scatter is not None
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    need_cycle_analysis = int(bool(need_cycle_analysis))
+    if need_cycle_analysis:
+        expected_shape = _cycle_counter_shape(
+            contiguous_m, N, tile_m, tile_n, m_warp, n_warp
+        )
+        if cycle_analysis is None:
+            raise ValueError("cycle_analysis is required when need_cycle_analysis=1")
+        if cycle_analysis.device != out.device:
+            raise ValueError("cycle_analysis must be on the same device as out")
+        if cycle_analysis.dtype != torch.uint64:
+            raise ValueError("cycle_analysis must have dtype torch.uint64")
+        if not cycle_analysis.is_contiguous():
+            raise ValueError("cycle_analysis must be contiguous")
+        if cycle_analysis.ndim != 3 or tuple(cycle_analysis.shape[1:]) != tuple(
+            expected_shape[1:]
+        ):
+            raise ValueError(
+                "cycle_analysis must have shape "
+                f"(num_threadgroups, {expected_shape[1]}, {CYCLE_RECORD_FIELDS}), "
+                f"got {tuple(cycle_analysis.shape)}"
+            )
+        if cycle_analysis.shape[0] < expected_shape[0]:
+            raise ValueError(
+                f"cycle_analysis needs at least {expected_shape[0]} rows for "
+                f"{expected_shape[0]} "
+                f"threadgroups, got {cycle_analysis.shape[0]}"
+            )
+    cycle_analysis_tensor = out if cycle_analysis is None else cycle_analysis
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -149,7 +237,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         cluster_n,
-        _select_next_stage_prefetch(next_stage_prefetch),
+        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
         waves_per_tensor_tdm,
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
@@ -164,5 +252,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
+        need_cycle_analysis=need_cycle_analysis,
+        cycle_counters=ptr_arg(cycle_analysis_tensor, fx.Int64),
     )
     return out

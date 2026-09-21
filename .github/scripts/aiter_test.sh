@@ -36,6 +36,7 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
@@ -84,9 +85,9 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
-        op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
+        op_tests/multigpu_tests/bench_mega_moe.py)
             {
-                echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
+                echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
             } | tee -a latest_test.log
             test_cmd=(
                 timeout 60m
@@ -104,6 +105,18 @@ for file in "${sharded_files[@]}"; do
                         --combine fused --layers 2 --acc_verify 1
                 '
                 _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_comm_fused_moe.py)
+            {
+                echo "Running comm-fused MoE production validation on 8 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                torchrun
+                --standalone
+                --nproc_per_node=8
+                "$file"
             )
             ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)

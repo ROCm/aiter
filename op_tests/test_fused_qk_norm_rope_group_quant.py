@@ -54,10 +54,30 @@ _FP8_MX_DTYPE = (
 _DEV = "cuda"
 # Positive allow-list: an unknown new card must not silently run an unbuilt
 # kernel. The fused SWA scatter rides the same HIP op, so no extra gate.
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 PE_BYTE_OFFSET = 464
-# MI355X HBM3e peak. Used only for the "%peak" perf column.
-_PEAK_BW_GBPS = 8000.0
+# No "%peak" column: a datasheet peak is not a ceiling this kernel can be measured
+# against, and reporting one against it is actively misleading.
+#
+# The spec number is read/write agnostic, but the two are not interchangeable --
+# gfx1250 measures 15.13 TB/s reading and 10.58 TB/s writing, so the reachable
+# ceiling depends on the shape's own mix. At the V4 contract's 63/37 split the
+# kernel sits at 100.0% of what the card can do while reading 66% of the spec
+# figure, which invites a hunt for headroom that is not there.
+#
+# It is worse at small sizes, where dispatch ramp and drain dominate: T=512 H=32
+# reports 24.5% of spec, yet its transfer runs at 13.06 TB/s against 13.07 for the
+# largest shape -- the whole gap is ~3.3 us of fixed cost, not bandwidth.
+#
+# The GB/s column below is the honest figure. To find out whether a kernel is
+# actually at the floor, measure the card's read and write bandwidth with the
+# kernel itself: build variants that suppress the output stores behind a
+# runtime-false predicate the compiler cannot fold (so the loads and the maths
+# stay live), and fit `T = read/BW_r + write/BW_w` to the all-stores,
+# some-stores and no-stores timings. Verify such a build by its OUTPUT, not its
+# ISA -- the predicate is wave-uniform, so the compiler emits a branch that skips
+# the stores rather than deleting them, and the static store count is unchanged.
+
 # Pin the arg-rotation count. Left to itself, run_perftest derives it from
 # `free_memory` at call time, so two candidates timed in one process rotate a
 # different number of times, land in different L2 states, and their `us`
@@ -368,7 +388,6 @@ def test_fused_qk_norm_rope_group_quant(
         "flydsl_us": (round(fly_us, 3) if fly_us == fly_us else None),  # noqa: PLR0124
         "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),  # noqa: PLR0124
         "GB/s": round(gbps, 0),
-        "%peak": round(gbps / _PEAK_BW_GBPS * 100, 1),
         "err_q": err_q,
         "err_k": err_k,
         "err_kpe": err_kpe,
