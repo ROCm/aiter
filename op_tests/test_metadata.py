@@ -188,14 +188,27 @@ def compare_metadata(golden, test):
     ri_t = test["reduce_indptr"]
     details["reduce_indptr"] = int((ri_g != ri_t).sum().item())
 
-    # Valid prefixes for the reduce maps, derived from the golden reduce_indptr.
+    # Valid regions for the reduce maps, derived from the golden reduce_indptr.
     steps = ri_g[1:] - ri_g[:-1]
     num_groups = int((steps > 0).sum().item())
     num_partial = int(ri_g[-1].item())
 
-    rfm_g = golden["reduce_final_map"][:num_groups]
-    rfm_t = test["reduce_final_map"][:num_groups]
-    details["reduce_final_map"] = int((rfm_g != rfm_t).sum().item())
+    # reduce_final_map is NOT a packed prefix. Both planners write row i only
+    # when tile i is split, at that tile's own index, so the written rows are
+    # scattered over the whole buffer. Taking the first num_groups rows compared
+    # memory neither planner wrote -- at batch=4096 with --jitter, 207 of those
+    # 218 rows, which is 414 of the elements. Since alloc_outputs() hands each
+    # run a fresh torch.empty buffer, that read whatever the two allocations
+    # happened to hold and reported a mismatch that no kernel produced. A split
+    # tile is exactly one whose reduce_indptr step is positive, so compare those
+    # rows and leave the untouched ones alone.
+    written = steps > 0
+    rfm_g = golden["reduce_final_map"].reshape(-1, 2)
+    rfm_t = test["reduce_final_map"].reshape(-1, 2)
+    written = written[: rfm_g.shape[0]]
+    details["reduce_final_map"] = int(
+        (rfm_g[written] != rfm_t[written]).sum().item()
+    )
 
     rpm_g = golden["reduce_partial_map"][:num_partial]
     rpm_t = test["reduce_partial_map"][:num_partial]
