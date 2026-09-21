@@ -3747,9 +3747,11 @@ def flash_attn_varlen_func(
         is_hd192x128 = hdim_q == 192 and hdim_v == 128
         if not ((hdim_q in (64, 128) and hdim_v == hdim_q) or is_hd192x128):
             return False
-        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
-        # yield so it reaches flydsl_flash_attn_varlen_func below.
-        if hdim_q == 128 and is_experimental_enabled():
+        # Experimental FlyDSL m32x8 kernel owns 128/128 and 192/128 when enabled;
+        # yield so it reaches flydsl_flash_attn_varlen_func below. Without 192 here
+        # this gate claims every d192 varlen shape, so the bshd and thd routers
+        # disagree: bshd d192 reaches FlyDSL, thd d192 never does.
+        if hdim_q in (128, 192) and is_experimental_enabled():
             return False
         if nhead_q % nhead_k != 0:
             return False
