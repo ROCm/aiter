@@ -7,12 +7,22 @@ on:
       - docs-website
     paths:
       - 'docs/**'
+      - 'aiter/**'
+      - 'csrc/**'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'setup.py'
       - '.github/workflows/docs.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'docs/**'
+      - 'aiter/**'
+      - 'csrc/**'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'setup.py'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -37,17 +47,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r docs/requirements.txt
 
-      - name: Install AITER (for autodoc)
-        run: |
-          # Install minimal dependencies for doc build
-          # (ROCm not needed for documentation generation)
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e . || true  # Continue even if full install fails
+      - name: Check example source contracts
+        run: python docs/check_examples.py
 
       - name: Build Sphinx documentation
-        run: |
-          cd docs
-          make html
+        run: sphinx-build -n -W --keep-going -b html docs docs/_build/html
 
       - name: Upload documentation artifacts
         uses: actions/upload-artifact@v4
