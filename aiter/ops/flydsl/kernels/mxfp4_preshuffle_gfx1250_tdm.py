@@ -87,6 +87,8 @@ def launch_gemm_a8w4_tdm(
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
+    a_row_stride_bytes: Constexpr[int] = 0,
+    a_scale_row_stride_bytes: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -153,6 +155,8 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride,
         ep_world_size,
         row_major_ascale,
+        a_row_stride_bytes,
+        a_scale_row_stride_bytes,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -175,6 +179,8 @@ def launch_gemm_a8w4_tdm(
     scatter_dst_vectors = (
         scatter_passes + SCATTER_PASSES_PER_VECTOR - 1
     ) // SCATTER_PASSES_PER_VECTOR
+    if (4 * num_waves_per_tensor_tdm) % num_waves:
+        raise ValueError("A/B/SA/SB ownership must cover every workgroup wave")
 
     A_PACK = 2 if a_is_fp4 else 1
     A_ROW_B = tile_k // A_PACK
@@ -193,6 +199,7 @@ def launch_gemm_a8w4_tdm(
     AS_KSTEPS = tile_k // 128
     AS_INNER = AS_KSTEPS * wmma_m_rep * 16
     AS_SUPERS = m_warp
+    AS_FULL_KDW = K // 128
     AS_FULL_INNER = (K // 128) * wmma_m_rep * 16
     # A-scale LDS: one outer row is one wave's M tile, and its inner
     # (k128, wm, lane16) layout gives each WMMA scale operand a contiguous
@@ -210,6 +217,7 @@ def launch_gemm_a8w4_tdm(
         else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
     STAGE_SB = ceildiv(SB_SUPERS * SC_INNER * 4, 16) * 16
+    B_OFF = STAGE_A
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
     # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
@@ -352,7 +360,13 @@ def launch_gemm_a8w4_tdm(
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
-        SA_GROW = K // 128  # row-major: scale dwords per M row
+        # Compact dest rows arrive on the dispatch wire's padded pitch, so the A
+        # row stride is not K bytes and the scale row stride is not K/128 dwords.
+        A_GROW = a_row_stride_bytes if a_row_stride_bytes else A_KROW
+        # row-major: scale dwords per M row
+        SA_GROW = (
+            a_scale_row_stride_bytes // 4 if a_scale_row_stride_bytes else K // 128
+        )
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -416,7 +430,7 @@ def launch_gemm_a8w4_tdm(
             _ep_lsa0 = fx.Int64(ep_win.lsa_ptr(fx.Int32(0), 0))
             _ep_lsa1 = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0))
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
-        a_off0 = blk_m64 * A_KROW
+        a_off0 = blk_m64 * A_GROW
         b_off0 = b_outer_row * Kp16
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
         assert num_waves_per_tensor_tdm in (
@@ -427,9 +441,6 @@ def launch_gemm_a8w4_tdm(
         assert (
             num_waves_per_tensor_tdm <= num_waves
         ), "waves per tensor cannot exceed workgroup waves"
-        assert (
-            4 * num_waves_per_tensor_tdm
-        ) % num_waves == 0, "A/B/SA/SB ownership must cover every workgroup wave"
         shared = fx.AddressSpace.Shared
         p8_shared = fx.PointerType.get(
             elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16
@@ -535,7 +546,7 @@ def launch_gemm_a8w4_tdm(
         add_tdm_loads(
             gA_base,
             a_off0,
-            A_KROW,
+            A_GROW,
             mn_oob,
             A_ROW_B,
             tile_m,
@@ -555,13 +566,47 @@ def launch_gemm_a8w4_tdm(
             PACK_TK * 16,
             tile_n // 16,
             on_i32=False,
-            lds_off=STAGE_A,
+            lds_off=B_OFF,
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
             cache_modifier=tdm_b_th,
         )
-        if const_expr(tdm_as_in_prologue):
+        if const_expr(row_major_ascale and tdm_as_in_prologue):
+            # The compact wire is row-major with a padded global row pitch.
+            # Keep that layout in the resident LDS region too: each owner wave
+            # brings in a slice of M rows across the complete K-scale range.
+            add_tdm_loads(
+                gSA_base,
+                blk_m64 * SA_GROW,
+                SA_GROW,
+                None,
+                AS_FULL_KDW,
+                tile_m,
+                on_i32=True,
+                lds_off=AS_FULL_OFF // 4,
+                lds_row=AS_FULL_KDW,
+                k_adv=0,
+                wv=waves[2],
+                target_jobs=as_prologue_jobs,
+            )
+        elif const_expr(row_major_ascale):
+            # Compact dispatch lands e8m0 row-major at the wire pitch. The
+            # rotating path keeps one tile_k slice in each pipeline buffer.
+            add_tdm_loads(
+                gSA_base,
+                blk_m64 * SA_GROW,
+                SA_GROW,
+                None,
+                SA_KDW,
+                tile_m,
+                on_i32=True,
+                lds_off=SA_OFF // 4,
+                lds_row=SA_KDW,
+                k_adv=SA_KDW * 4,
+                wv=waves[2],
+            )
+        elif const_expr(tdm_as_in_prologue):
             add_tdm_loads(
                 gSA_base,
                 (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
@@ -576,20 +621,6 @@ def launch_gemm_a8w4_tdm(
                 wv=waves[2],
                 split_inner=AS_SUPERS < len(waves[2]),
                 target_jobs=as_prologue_jobs,
-            )
-        elif const_expr(row_major_ascale):
-            add_tdm_loads(
-                gSA_base,
-                blk_m64 * SA_GROW,
-                SA_GROW,
-                None,
-                SA_KDW,
-                tile_m,
-                on_i32=True,
-                lds_off=SA_OFF // 4,
-                lds_row=SA_KDW,
-                k_adv=SA_KDW * 4,
-                wv=waves[2],
             )
         else:
             add_tdm_loads(
@@ -633,7 +664,7 @@ def launch_gemm_a8w4_tdm(
 
         def issue(s, kt, my_jobs=None):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
-            so4 = s * (PITCH // 4)
+            so4 = (s * PITCH) // 4
 
             def emit(j):
                 base = base_i32 if j.on_i32 else pa
@@ -655,10 +686,8 @@ def launch_gemm_a8w4_tdm(
                                 emit(j)
 
         def dispatch_wave_job(fn):
-            """Run ``fn`` with the current wave's jobs."""
-            for g in range_constexpr(len(job_waves)):
-                if owns(job_waves[g]):
-                    fn([j for j in jobs if j.waves == job_waves[g]])
+            """Run ``fn`` once. ``issue`` still filters jobs by wave owner."""
+            fn(None)
 
         def issue_as_prologue():
             """Loads the full A-scale K range into its resident LDS buffer."""
@@ -677,7 +706,7 @@ def launch_gemm_a8w4_tdm(
         # Split each region's offset into a lane-varying base, which keepalive
         # can pin, and a compile-time part that folds into ds_load's offset:.
         lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
-        lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+        lds_b_lane_off = B_OFF + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
         SA_ROWS_PER_LOAD = 16 if wmma_m_rep == 1 else 32
@@ -744,12 +773,18 @@ def launch_gemm_a8w4_tdm(
 
         def load_sa(buf, sm, ksl, kt):
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            if const_expr(row_major_ascale and tdm_as_in_prologue):
+                as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
+                row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD
+                off = (row * AS_FULL_KDW + kt * SA_KDW + ksl) * 4
+                return lds_load_b32(as_base, fx.Int32(off))[0]
+            if const_expr(row_major_ascale):
+                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
+                return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
             if const_expr(tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
                 off = off + wave_m * AS_FULL_INNER * 4 + sa_lane * 4 + kt * AS_INNER * 4
                 return lds_load_b32(as_base, fx.Int32(off))[0]
-            if const_expr(row_major_ascale):
-                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
             return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
         def load_sb(buf, sn, ksl):
@@ -916,9 +951,9 @@ def launch_gemm_a8w4_tdm(
             ``next_stage_buf``, emitted at that last k128 instead of by the caller
             at the tile top; pass None only when an earlier fence already covers it.
 
-            ``my_jobs`` is the owner list already selected by
-            ``dispatch_wave_job``; it only reaches ``issue`` and is unused when
-            ``prefetch_kt`` is None.
+            ``my_jobs`` only reaches ``issue``, which falls back to filtering
+            ``jobs`` by wave owner itself; it is unused when ``prefetch_kt`` is
+            None.
             """
 
             def do_issue():
