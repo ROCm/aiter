@@ -306,6 +306,99 @@ __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
     //         }
 }
 
+// Compact form of the legacy wave64 DPP tie-priority table.
+__device__ __forceinline__ int legacy_topk_lane_rank(int lane)
+{
+    const int low2 = (lane & 3) ^ ((lane & 4) ? 3 : 0);
+    const int bit2 = (((lane >> 2) ^ (lane >> 3)) & 1) << 2;
+    return ((~lane) & 0x38) | bit2 | low2;
+}
+
+// Legacy float4 order: lane + 64 * round, then element 0..3.
+__device__ __forceinline__ int legacy_topk_tie_rank(int expert_id)
+{
+    if(expert_id < 0)
+        return 0x7fffffff;
+    const int vec4_id   = expert_id >> 2;
+    const int lane      = vec4_id & (WARP_SIZE - 1);
+    const int local_pos = ((vec4_id >> 6) << 2) | (expert_id & 3);
+    return (legacy_topk_lane_rank(lane) << 5) | local_pos;
+}
+
+__device__ __forceinline__ bool
+topk_candidate_better(float a_score, int a_id, float b_score, int b_id)
+{
+    if(a_score != b_score)
+        return a_score > b_score;
+    return legacy_topk_tie_rank(a_id) < legacy_topk_tie_rank(b_id);
+}
+
+__device__ __forceinline__ void emit_legacy_ordered_topk(const float* cand_val,
+                                                         const int* cand_idx,
+                                                         const float* sig_scores,
+                                                         float* topk_weights,
+                                                         int* topk_ids,
+                                                         int n_cand,
+                                                         int topk,
+                                                         float routed_scaling_factor,
+                                                         bool need_renorm)
+{
+    const int lane        = threadIdx.x;
+    const float cv        = lane < n_cand ? cand_val[lane] : -INFINITY;
+    const int ci          = lane < n_cand ? cand_idx[lane] : -1;
+    const float sorted_cv = warp_bitonic_merge_sort_to_reg(cv, opus::number<WARP_SIZE>{});
+
+    // Sort values with DPP; use legacy rank only for exact ties.
+    int out_idx   = 0;
+    float w       = 0.0f;
+    float total   = 0.0f;
+    bool selected = false;
+    for(int i = 0; i < topk; ++i)
+    {
+        const float target     = __shfl(sorted_cv, i, WARP_SIZE);
+        const bool match       = lane < n_cand && !selected && cv == target;
+        const uint64_t matches = __ballot(match);
+        int winner_lane;
+        if((matches & (matches - 1)) == 0)
+        {
+            winner_lane = matches != 0 ? __builtin_ctzll(matches) : 0;
+        }
+        else
+        {
+            int rank    = match ? legacy_topk_tie_rank(ci) : 0x7fffffff;
+            auto min_op = [](int a, int b) { return a < b ? a : b; };
+            rank        = wave_reduce<int, decltype(min_op), WARP_SIZE, true>(rank, min_op);
+            const uint64_t winner = __ballot(match && legacy_topk_tie_rank(ci) == rank);
+            winner_lane           = winner != 0 ? __builtin_ctzll(winner) : 0;
+        }
+        if(lane == winner_lane)
+            selected = true;
+        const int winner_id       = __builtin_amdgcn_readlane(ci, winner_lane);
+        const float winner_weight = sig_scores[winner_id];
+        if(need_renorm)
+            total += winner_weight;
+        if(lane == i)
+        {
+            out_idx = winner_id;
+            w       = winner_weight;
+        }
+    }
+    if(need_renorm)
+    {
+        // Preserve the legacy serial renormalization order.
+        w *= routed_scaling_factor / total;
+    }
+    else
+    {
+        w *= routed_scaling_factor;
+    }
+    if(lane < topk)
+    {
+        topk_weights[lane] = w;
+        topk_ids[lane]     = out_idx;
+    }
+}
+
 __device__ void blockReduceMax(float& val, int& idx)
 {
     __shared__ float shared_vals[32];
@@ -632,12 +725,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     }
 }
 
-// Single-group top-k that keeps scores in VGPRs. The generic grouped_topk_kernel
-// re-reads every score from LDS on each of the topk argmax rounds; here each
-// lane owns EXPERTS_PER_LANE experts for the whole kernel. The selected set
-// matches grouped_topk_kernel; the output order does not. grouped_topk_kernel
-// and the sequential fallback below emit descending by score, the pivot path
-// emits candidate-compaction order -- callers must not rely on either.
+// Single-group top-k that keeps scores in VGPRs and preserves legacy ordering.
 // For biased sigmoid the output weights are the pre-bias sigmoid (from LDS),
 // not (score - bias).
 template <typename DTYPE_I,
@@ -773,11 +861,16 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         for_each_owned([&](float& v, int) { lmax = dev_max_(lmax, v); });
         auto max_op = [](float a, float b) { return a > b ? a : b; };
         lmax = wave_reduce<float, decltype(max_op), WARP_SIZE, true>(lmax, max_op);
-        float tsum = 0.0f;
-        for_each_owned([&](float& v, int) {
+        for_each_owned([&](float& v, int id) {
             v = expf(v - lmax);
-            tsum += v;
+            sig_scores[id] = v;
         });
+        __builtin_amdgcn_wave_barrier();
+
+        // Match the legacy lane-strided softmax reduction.
+        float tsum = 0.0f;
+        for(int id = lane; id < num_experts; id += WARP_SIZE)
+            tsum += sig_scores[id];
         auto add_op = [](float a, float b) { return a + b; };
         tsum = wave_reduce<float, decltype(add_op), WARP_SIZE, true>(tsum, add_op);
         for_each_owned([&](float& v, int id) {
@@ -788,14 +881,9 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     // One wave, so no s_barrier, but LDS stores to another lane's slot are
     // not visible to alias analysis. wave_barrier is a compiler fence only.
     __builtin_amdgcn_wave_barrier();
-    // Pivot fast path. The topk largest lane-local maxima sit on topk distinct
-    // lanes, so the topk-th of them is a lower bound on the true topk-th score:
-    // every true winner survives the >= pivot filter. Compacting those few
-    // candidates and selecting among them replaces topk wave argmax rounds
-    // (each a 6-stage dependent bpermute chain) with two wave sorts.
+    // The lane-max pivot keeps every true winner before candidate sorting.
     float* cand_val = sig_scores + num_experts;
     int* cand_idx   = reinterpret_cast<int*>(cand_val + WARP_SIZE);
-    int* final_idx  = cand_idx + WARP_SIZE;
 
     float lmax = -INFINITY;
     for_each_owned([&](float& v, int) { lmax = dev_max_(lmax, v); });
@@ -818,7 +906,7 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     const int n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
     eq_base += n_gt - my_eq;
 
-    if(n_cand <= WARP_SIZE)
+    if(n_cand >= topk && n_cand <= WARP_SIZE)
     {
         int slot_gt = gt_base;
         int slot_eq = eq_base;
@@ -838,41 +926,15 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         });
         __builtin_amdgcn_wave_barrier();
 
-        const float cv = lane < n_cand ? cand_val[lane] : -INFINITY;
-        const float pivot2 =
-            __shfl(warp_bitonic_merge_sort_to_reg(cv, opus::number<WARP_SIZE>{}), topk - 1);
-        const int local_cnt = cumsum_topk_with_pivot(cv, pivot2, opus::number<WARP_SIZE>{});
-        if(lane < n_cand && cv >= pivot2 && local_cnt <= topk)
-        {
-            final_idx[local_cnt - 1] = cand_idx[lane];
-        }
-        __builtin_amdgcn_wave_barrier();
-
-        int out_idx = 0;
-        float w     = 0.0f;
-        if(lane < topk)
-        {
-            out_idx = final_idx[lane];
-            w       = sig_scores[out_idx];
-        }
-        if(need_renorm)
-        {
-            auto add_op = [](float a, float b) { return a + b; };
-            // Reduce across the whole wave with non-winners contributing zero:
-            // works for any topk, unlike a power-of-two lane-group reduce.
-            const float total =
-                wave_reduce<float, decltype(add_op), WARP_SIZE, true>(w, add_op);
-            w *= routed_scaling_factor / total;
-        }
-        else
-        {
-            w *= routed_scaling_factor;
-        }
-        if(lane < topk)
-        {
-            topk_weights[token_idx * stride_tk + lane] = w;
-            topk_ids[token_idx * stride_tk + lane]     = out_idx;
-        }
+        emit_legacy_ordered_topk(cand_val,
+                                 cand_idx,
+                                 sig_scores,
+                                 topk_weights + token_idx * stride_tk,
+                                 topk_ids + token_idx * stride_tk,
+                                 n_cand,
+                                 topk,
+                                 routed_scaling_factor,
+                                 need_renorm);
         return;
     }
 
@@ -886,16 +948,25 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     for(int k = 0; k < topk; ++k)
     {
         float max_val = -INFINITY;
-        int max_idx   = k;
+        int max_idx   = -1;
         for_each_owned([&](float& v, int id) {
-            if(v > max_val)
+            if(v > -INFINITY && topk_candidate_better(v, id, max_val, max_idx))
             {
                 max_val = v;
                 max_idx = id;
             }
         });
 
-        warpReduceMax(max_val, max_idx);
+        using kvp = aiter::KeyValuePair<int, float>;
+        const kvp local{max_idx, max_val};
+        auto arg_max = [](kvp a, kvp b) {
+            return topk_candidate_better(a.value, a.key, b.value, b.key) ? a : b;
+        };
+        const kvp winner = wave_reduce<kvp, decltype(arg_max), WARP_SIZE, true>(local, arg_max);
+        max_val          = winner.value;
+        max_idx          = winner.key;
+        if(max_idx < 0)
+            max_idx = k;
 
         // Retire the winner in place: compare-and-select, no dynamic index.
         for_each_owned([&](float& v, int id) { v = id == max_idx ? -INFINITY : v; });
