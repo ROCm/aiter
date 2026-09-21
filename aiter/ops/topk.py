@@ -592,6 +592,112 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
             ),
         },
     },
+    # The two entries below are fitted on the diagonal *and* on the production
+    # slice (buffer 1048576, live length L), a cell needing to clear both
+    # conditions on each. The two entries above predate that and are fitted on
+    # the diagonal alone. The difference is not cosmetic: on 304 CU a
+    # diagonal-only fit admits 18 cells that lose at the live length, worst
+    # 0.84x, while the two-slice fit admits 288 and loses none. The older pair
+    # happen to be clean under either method; they are not refitted here only
+    # because that would change cards that already work.
+    #
+    # All four entries assume the caller declares `max_row_len`. A decode caller
+    # that allocates a 1048576 buffer and leaves it undeclared gets the config
+    # built from the buffer instead of the live length, and then these bands
+    # admit cells that lose badly: 98 of 315 on 228 CU, worst 0.18x. The two
+    # older entries are no safer there -- 157 of 366 on 80 CU, worst 0.26x --
+    # so this is the padding defect the parameter exists to close, not a
+    # property of the newer fit.
+    ("gfx942", 228): {
+        True: {
+            (256,): (
+                (8_192, 8_192, 256, 512),
+                (16_384, 16_384, 128, 512),
+                (20_000, 20_000, 64, 256),
+                (65_536, 65_536, 1, 4),
+                (131_072, 131_072, 1, 16),
+                (262_144, 262_144, 1, 32),
+                (524_288, 1_048_576, 1, 64),
+            ),
+            (512, 1024, 2048): (
+                (8_192, 16_384, 64, 512),
+                (65_536, 65_536, 1, 8),
+                (131_072, 131_072, 1, 16),
+                (262_144, 262_144, 1, 32),
+                (524_288, 1_048_576, 1, 64),
+            ),
+            (4096,): (
+                (8_192, 16_384, 256, 512),
+                (32_768, 65_536, 1, 64),
+                (131_072, 131_072, 1, 256),
+                (262_144, 1_048_576, 1, 512),
+            ),
+        },
+        False: {
+            (256,): (
+                (4_096, 8_192, 256, 512),
+                (65_536, 65_536, 1, 16),
+                (131_072, 262_144, 1, 32),
+                (524_288, 1_048_576, 1, 64),
+            ),
+            (512, 1024, 2048): (
+                (4_096, 4_096, 256, 512),
+                (8_192, 8_192, 64, 512),
+                (65_536, 65_536, 1, 16),
+                (131_072, 262_144, 1, 32),
+                (524_288, 1_048_576, 1, 64),
+            ),
+            (4096,): (
+                (8_192, 8_192, 256, 512),
+                (32_768, 32_768, 1, 4),
+                (65_536, 131_072, 1, 32),
+                (262_144, 1_048_576, 1, 64),
+            ),
+        },
+    },
+    ("gfx942", 304): {
+        True: {
+            (256,): (
+                (16_384, 16_384, 64, 128),
+                (65_536, 65_536, 1, 8),
+                (131_072, 131_072, 1, 16),
+                (262_144, 262_144, 1, 32),
+                (524_288, 1_048_576, 1, 64),
+            ),
+            (512, 1024, 2048): (
+                (8_192, 8_192, 64, 512),
+                (16_384, 16_384, 64, 128),
+                (65_536, 65_536, 1, 8),
+                (131_072, 131_072, 1, 16),
+                (262_144, 1_048_576, 1, 64),
+            ),
+            (4096,): (
+                (32_768, 32_768, 1, 128),
+                (65_536, 65_536, 1, 32),
+                (131_072, 131_072, 1, 16),
+                (262_144, 1_048_576, 1, 512),
+            ),
+        },
+        False: {
+            (256,): (
+                (4_096, 4_096, 256, 512),
+                (65_536, 65_536, 1, 16),
+                (131_072, 131_072, 1, 32),
+                (262_144, 1_048_576, 1, 64),
+            ),
+            (512, 1024, 2048): (
+                (8_192, 8_192, 128, 512),
+                (32_768, 32_768, 1, 2),
+                (65_536, 262_144, 1, 16),
+                (524_288, 1_048_576, 1, 64),
+            ),
+            (4096,): (
+                (32_768, 32_768, 1, 4),
+                (65_536, 65_536, 1, 32),
+                (131_072, 1_048_576, 1, 64),
+            ),
+        },
+    },
     ("gfx950", 256): {
         True: {
             (256,): (
