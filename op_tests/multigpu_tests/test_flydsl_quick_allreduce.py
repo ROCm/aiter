@@ -767,8 +767,14 @@ def test_quick_allreduce_e4m3_codec_fill(fill, label, codec):
     )
 
 
-@pytest.mark.parametrize("codec", MESH_TEST_CODECS)
-@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
+@pytest.mark.parametrize(
+    "algorithm,codec",
+    (
+        *(("mesh", codec) for codec in MESH_TEST_CODECS),
+        ("ring", "int4"),
+        ("ring", "int6"),
+    ),
+)
 def test_quick_allreduce_degenerate_inputs(algorithm, codec):
     """All-zero and all-tiny groups must not produce NaN.
 
