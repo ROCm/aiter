@@ -688,8 +688,8 @@ def student_t_sf(t: float, degrees: int) -> float:
     return tail if t > 0 else 1.0 - tail
 
 
-def critical_t(confidence: float, degrees: int) -> float:
-    """Two-sided critical value: t with P(|T| > t) == confidence.
+def critical_t(alpha_two_sided: float, degrees: int) -> float:
+    """Two-sided critical value: t with P(|T| > t) == alpha_two_sided.
 
     Bisection rather than a closed form. The Cornish-Fisher expansion from the
     normal quantile is the usual shortcut, but it is worst exactly where this
@@ -697,7 +697,7 @@ def critical_t(confidence: float, degrees: int) -> float:
     correction puts the per-decision alpha -- so it is not worth the risk.
     """
     degrees = max(1, degrees)
-    target = confidence / 2.0
+    target = alpha_two_sided / 2.0
     # Grow the bracket instead of assuming a ceiling. With one degree of
     # freedom and a Bonferroni-shrunk alpha the critical value runs into the
     # hundreds of thousands, and a fixed upper bound would silently saturate
@@ -735,10 +735,10 @@ def check_t_implementation() -> None:
         (10, 0.01): 3.169,
         (29, 0.001): 3.659,
     }
-    for (degrees, confidence), expected in table.items():
-        actual = critical_t(confidence, degrees)
+    for (degrees, alpha), expected in table.items():
+        actual = critical_t(alpha, degrees)
         if abs(actual - expected) > 0.001:
             raise AssertionError(
-                f"t_{{{degrees}}}({confidence}) computed {actual:.4f}, "
+                f"t_{{{degrees}}}({alpha}) computed {actual:.4f}, "
                 f"tables say {expected:.4f}"
             )

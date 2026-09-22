@@ -253,22 +253,22 @@ class MhaFwdProblem:
             hdim_q=int(row["hdim_q"]),
             hdim_v=int(row["hdim_v"]),
             dtype=normalize_mha_dtype(row["dtype"]),
-            causal=_as_bool(row["causal"]),
+            causal=as_bool(row["causal"]),
             window_left=int(row["window_left"]),
             window_right=int(row["window_right"]),
             sink_size=int(row["sink_size"]),
             dropout_p=float(row["dropout_p"]),
             logits_soft_cap=float(row["logits_soft_cap"]),
             how_v3_bf16_cvt=int(row["how_v3_bf16_cvt"]),
-            return_lse=_as_bool(row["return_lse"]),
-            return_attn_probs=_as_bool(row["return_attn_probs"]),
-            has_bias=_as_bool(row["has_bias"]),
-            has_alibi=_as_bool(row["has_alibi"]),
-            has_sink=_as_bool(row["has_sink"]),
-            has_block_table=_as_bool(row["has_block_table"]),
-            has_q_descale=_as_bool(row["has_q_descale"]),
-            has_physical_padding=_as_bool(row["has_physical_padding"]),
-            is_grad=_as_bool(row["is_grad"]),
+            return_lse=as_bool(row["return_lse"]),
+            return_attn_probs=as_bool(row["return_attn_probs"]),
+            has_bias=as_bool(row["has_bias"]),
+            has_alibi=as_bool(row["has_alibi"]),
+            has_sink=as_bool(row["has_sink"]),
+            has_block_table=as_bool(row["has_block_table"]),
+            has_q_descale=as_bool(row["has_q_descale"]),
+            has_physical_padding=as_bool(row["has_physical_padding"]),
+            is_grad=as_bool(row["is_grad"]),
         )
 
     def key(self) -> tuple[str, ...]:
@@ -555,7 +555,7 @@ def mha_fwd_candidate_id(problem: MhaFwdProblem, candidate: MhaFwdCandidate) -> 
     return sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _as_bool(value: Any) -> bool:
+def as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
