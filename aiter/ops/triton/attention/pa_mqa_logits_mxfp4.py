@@ -14,6 +14,7 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_mqa_logits_mxfp4 import (
     _pa_mqa_logits_mxfp4_kernel,
     _pa_mqa_logits_mxfp4_sched_kernel,
+    _prepare_candidates_kernel,
 )
 
 SCALE_GROUP = 32
@@ -274,6 +275,48 @@ def select_config(num_heads, head_size, next_n, page_size, preshuffle=1,
                                int(bool(preshuffle)), bool(clean_logits)))
 
 
+def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
+                           head_size, block=CANDIDATE_BLOCK,
+                           kv_scale_cache=None, scale_mode=SCALE_MODE_WIDE):
+    """Ranked block ids -> (gather, cu_ends), in one launch.
+
+    candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
+    ends:        [B * NEXT_N] int32 exclusive per-row key bound
+    block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row
+
+    Does what build_gather does from positions, plus the sort and the slot
+    count, so a layer group builds the pool once and hands it to every
+    consumer.
+    """
+    from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import (
+        cache_strides, gather_s_unit)
+    rows, k = candidates.shape
+    assert k & (k - 1) == 0, "the sort needs a power-of-two candidate count"
+    # One program per row, so the warps are what fills the machine when the
+    # rows do not. Above that they only cost occupancy.
+    num_warps = (1 if k <= 1024 else 2) if rows >= 4 * get_num_sms() \
+        else (8 if k >= 2048 else 4)
+    assert block_table.shape[0] == rows and block_table.stride(1) == 1
+    n_per_tile = mfma_nonk_dim(num_heads, head_size)
+    page_size, kv_stride, kvs_stride = cache_strides(kv_cache, head_size,
+                                                    kv_scale_cache)
+    assert page_size % block == 0 and block <= n_per_tile
+    num_scales = head_size // SCALE_GROUP
+    s_lo = 64 // n_per_tile
+    dev = candidates.device
+    pos = torch.empty((rows, k), dtype=torch.int64, device=dev)
+    cu = torch.empty((rows,), dtype=torch.int32, device=dev)
+    voff = torch.empty((rows, k), dtype=torch.int32, device=dev)
+    soff = torch.empty((rows, k), dtype=torch.int32, device=dev)
+    _prepare_candidates_kernel[(rows,)](
+        candidates, ends, block_table, pos, cu, voff, soff,
+        candidates.stride(0), block_table.stride(0), k, block, page_size,
+        n_per_tile, head_size // 2, num_scales, kv_stride, kvs_stride,
+        K_WIDTH, gather_s_unit(block, num_scales),
+        (num_scales // s_lo) if scale_mode == SCALE_MODE_WIDE else 1,
+        num_warps=num_warps)
+    return dict(voff=voff, soff=soff, block=block, positions=pos), cu
+
 def build_schedule(context_lens, next_n, num_heads, head_size,
                    page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None,
                    cu_ends=None, gather=0):
@@ -359,6 +402,7 @@ def paged_mxfp4_mqa_logits(
     schedule: torch.Tensor | None = None,
     cu_ends: torch.Tensor | None = None,
     gather: dict | None = None,
+    candidates: torch.Tensor | None = None,
     block_scores: torch.Tensor | None = None,
     calc_logits: bool = True,
     calc_block_scores: bool = False,
@@ -499,6 +543,19 @@ def paged_mxfp4_mqa_logits(
             f"max_model_len {max_model_len} exceeds what a buffer store can "
             "address")
 
+    if candidates is not None:
+        # Build the pool here for a caller that has one consumer. Four of them
+        # should call build_candidate_gather once and pass `gather` instead.
+        assert gather is None, "pass candidates or gather, not both"
+        n = torch.arange(next_n, device=q.device, dtype=torch.int32)
+        key_ends = (cu_ends if cu_ends is not None else
+                    torch.clamp(context_lens.repeat_interleave(next_n)
+                                - next_n + n.repeat(batch) + 1, min=0))
+        gather, cu_ends = build_candidate_gather(
+            candidates, key_ends,
+            block_table.repeat_interleave(next_n, 0).contiguous(),
+            kv_cache, num_heads, head_size, cand_block, kv_scale_cache,
+            scale_mode)
     gather_on = 1 if gather is not None else 0
     gather_block = int(gather["block"]) if gather_on else 8
     if gather_on:

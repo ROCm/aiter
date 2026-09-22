@@ -7,6 +7,8 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (cache_format,
                                             paged_mxfp4_mqa_logits,
                                             preshuffle_cache,
                                             unshuffle_scales, unshuffle_values)
+from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
+    build_candidate_gather)
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import build_gather
 
 SCALE_GROUP = 32
@@ -689,3 +691,65 @@ def test_scores_only_rejects_gather():
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
             st["block_table"], st["mml"], gather=meta, cu_ends=ends,
             block_scores=bs, calc_logits=False, calc_block_scores=True)
+
+
+def _expand_ref(ids, ends, block):
+    """The sort and slot count build_candidate_gather fuses, in torch."""
+    nb = (ends + block - 1) // block
+    ok = (ids >= 0) & (ids < nb[:, None])
+    n_valid = ok.sum(1)
+    max_id = torch.where(ok, ids, torch.full_like(ids, -1)).max(1).values
+    key = torch.where(ok, ids, torch.full_like(ids, 0x7FFFFFFF)).sort(1).values
+    last = ((nb - 1) * block).long()
+    pos = torch.where(key == 0x7FFFFFFF, last[:, None], key.long() * block)
+    tail = torch.minimum(torch.full_like(ends, block), ends - max_id.int() * block)
+    cu = torch.where(n_valid > 0, (n_valid.int() - 1) * block + tail,
+                     torch.zeros_like(ends))
+    return pos, cu.to(torch.int32)
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("block", [8, 32])
+def test_candidate_gather(num_heads, block):
+    """The fused builder is build_gather plus the sort, word for word."""
+    rows = 4
+    st = _make_case(1, rows, num_heads, 128, [4096], 64)
+    ctx = st["ctx"][0]
+    nb, K = (ctx + block - 1) // block, 128
+    g = torch.Generator(device=st["dev"]).manual_seed(5)
+    ids = torch.rand(rows, nb, generator=g, device=st["dev"]).argsort(1)
+    ids = ids[:, :K].to(torch.int32)
+    ids[torch.rand(rows, K, generator=g, device=st["dev"]) < 0.1] = -1
+    ends = torch.randint(1, ctx + 1, (rows,), dtype=torch.int32, device=st["dev"])
+    bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
+
+    pos_r, cu_r = _expand_ref(ids, ends, block)
+    ref = build_gather(pos_r, bt, st["cache"], num_heads, 128, block)
+    got, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads,
+                                     128, block)
+    assert torch.equal(got["voff"], ref["voff"]), "value offsets differ"
+    assert torch.equal(got["soff"], ref["soff"]), "scale offsets differ"
+    assert torch.equal(got["positions"], pos_r) and torch.equal(cu, cu_r)
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_candidates_implicit(num_heads):
+    """Handing the launch ids matches building the pool outside it."""
+    rows, block, K = 4, 8, 128
+    st = _make_case(1, rows, num_heads, 128, [4096], 64)
+    ctx = st["ctx"][0]
+    g = torch.Generator(device=st["dev"]).manual_seed(7)
+    ids = torch.rand(rows, ctx // block, generator=g,
+                     device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
+    ends = row_ends(st["ctx"], rows, None)
+    bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
+    meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads,
+                                      128, block)
+    a = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
+                               st["cl"], st["block_table"], K * block,
+                               gather=meta, cu_ends=cu)
+    b = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
+                               st["cl"], st["block_table"], K * block,
+                               candidates=ids, cu_ends=ends)
+    torch.cuda.synchronize()
+    assert torch.equal(a.view(torch.int32), b.view(torch.int32))

@@ -146,6 +146,50 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
             depth, 1 << depth)
 
 
+
+@triton.jit
+def _prepare_candidates_kernel(
+    ids_ptr, ends_ptr, bt_ptr, pos_ptr, cu_ptr, voff_ptr, soff_ptr,
+    stride_ids, stride_bt,
+    K: tl.constexpr, C: tl.constexpr, PAGE: tl.constexpr, NPT: tl.constexpr,
+    HEAD_BYTES: tl.constexpr, NUM_SCALES: tl.constexpr,
+    KV_STRIDE: tl.constexpr, KVS_STRIDE: tl.constexpr,
+    KW: tl.constexpr, SU: tl.constexpr, TOK_STRIDE: tl.constexpr,
+):
+    """Ranked block ids -> the walk's candidate list, one row per program.
+
+    The rank emits by score and the walk needs by position, so the sort is
+    here; everything after it is block_offsets, which must stay in step.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, K)
+    ids = tl.load(ids_ptr + row * stride_ids + cols)
+    end = tl.load(ends_ptr + row)
+    nblocks = (end + C - 1) // C
+
+    ok = (ids >= 0) & (ids < nblocks)
+    n_valid = tl.sum(ok.to(tl.int32), axis=0)
+    max_id = tl.max(tl.where(ok, ids, -1), axis=0)
+    key = tl.sort(tl.where(ok, ids, 0x7FFFFFFF))
+
+    # Padding repeats the last legal block, so a short row still walks blocks
+    # it owns and cu_ends drops the slots.
+    last = ((nblocks - 1) * C).to(tl.int64)
+    pos = tl.where(key == 0x7FFFFFFF, last, key.to(tl.int64) * C)
+    tl.store(pos_ptr + row * K + cols, pos)
+    tail = tl.minimum(C, end - max_id * C)
+    tl.store(cu_ptr + row, tl.where(n_valid > 0, (n_valid - 1) * C + tail, 0))
+
+    page = pos // PAGE
+    t0 = pos % PAGE
+    pid = tl.load(bt_ptr + row * stride_bt + page).to(tl.int64)
+    bn = (t0 % NPT) * KW + (t0 // NPT) * (NPT * HEAD_BYTES)
+    bs = (t0 % NPT) * TOK_STRIDE + (t0 // NPT) * (NPT * NUM_SCALES)
+    tl.store(voff_ptr + row * K + cols,
+             ((pid * KV_STRIDE + bn) // KW).to(tl.int32))
+    tl.store(soff_ptr + row * K + cols,
+             ((pid * KVS_STRIDE + bs) // SU).to(tl.int32))
+
 @gluon.jit
 def _max_nan(a, b):
     return gl.maximum(a, b, propagate_nan=_NAN_ALL)
