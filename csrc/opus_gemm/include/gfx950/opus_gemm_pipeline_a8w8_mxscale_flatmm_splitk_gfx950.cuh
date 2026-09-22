@@ -670,12 +670,14 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     constexpr int mb = mb_a + mb_b + mb_sf;
 
     if constexpr (DIRECT_ONLY) {
-        __shared__ int b_ready[T::prefetch_k_iter];
-        if (opus::thread_id_x() < T::prefetch_k_iter) {
-            b_ready[opus::thread_id_x()] = -1;
-        }
-        s_waitcnt_lgkmcnt(0_I);  // retire the init writes before other waves read them
-        __builtin_amdgcn_s_barrier();
+        // One barrier per K tile is enough to keep the B ring safe only because
+        // there are at least two slots: the wave that loads B writes slot
+        // (k+1) % prefetch_k_iter while everyone reads slot k % prefetch_k_iter,
+        // so with one slot the load would land on the tile being read.
+        static_assert(T::prefetch_k_iter >= 2,
+                      "the direct-store B ring needs two slots to be barrier-safe");
+        // Half the waves leave; the survivors are the T_M consumer M-waves and
+        // they synchronise among themselves from here on.
         if ((wave_id & 1) == 0) return;
 
         int wave_id_m = wave_id / 2;
@@ -750,13 +752,23 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             const int a_slot = wave_id_m * T::prefetch_k_iter + (k % T::prefetch_k_iter);
             const int b_slot = k % T::prefetch_k_iter;
             s_waitcnt_vmcnt(0_I);
-            if (wave_id_m == 0) {
-                reinterpret_cast<volatile int*>(b_ready)[b_slot] = k;
-            } else {
-                volatile int* ready = reinterpret_cast<volatile int*>(b_ready);
-                while (ready[b_slot] != k) {
-                }
-            }
+            // Every wave has now retired its own loads for tile k, including
+            // wave_id_m 0's B tile, so this barrier is what publishes B -- and,
+            // more to the point, it is what stops wave_id_m 0 from running away.
+            //
+            // It used to publish through a flag in LDS, b_ready[k % pki] = k,
+            // that the other waves spun on with an exact compare. Nothing bounded
+            // how far ahead the writer could get, and the flag word is reused
+            // every pki iterations: once it was pki iterations ahead it stored
+            // k + pki into the slot a wave was still waiting to see k in, and that
+            // wave spun forever. Hence "HW Exception ... reason :GPU Hang".
+            //
+            // It needed a big grid to show up, because nothing makes the waves
+            // drift apart on a small one -- b=4 m=16384 is 8192 workgroups at
+            // 2/CU and hangs every time, b=2 m=1024 is 512 and never did. That is
+            // also why it looked intermittent from the perf sweep, and why it hung
+            // there on 09c52c8a16 as well: the protocol is unchanged from upstream.
+            __builtin_amdgcn_s_barrier();
 
             auto sa = make_smem(smem_a_at(a_slot, 0, 0));
             auto sb = make_smem(smem_b_at(b_slot, 0, 0));
