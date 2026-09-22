@@ -225,120 +225,13 @@ __device__ constexpr void wave_reduce_argmax2(
     }
 }
 
-__inline__ __device__ void warpReduceMax(float& val_o, int& idx)
-{
-    using kvp = aiter::KeyValuePair<int, float>;
-    kvp thread_kvp;
-    thread_kvp.key       = idx;
-    thread_kvp.value     = val_o;
-    auto arg_max = [](kvp a, kvp b) { return a.value > b.value ? a : b; };
-    const kvp result_kvp = wave_reduce<kvp, decltype(arg_max), WARP_SIZE, false>(thread_kvp, arg_max);
-    val_o = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, result_kvp.value), WARP_SIZE - 1));
-    idx = __builtin_bit_cast(int, __builtin_amdgcn_readlane(result_kvp.key, WARP_SIZE - 1));
-    // static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
-    // constexpr int lane_steps  = 6;
-    // constexpr int row_mask    = 0xf;
-    // constexpr int bank_mask   = 0xf;
-    // constexpr bool bound_ctrl = true;
-    // float val                 = val_o;
-
-    // constexpr auto get_dpp_i = [&](auto i_step) {
-    //     if constexpr(i_step.value == 0)
-    //         return 0xb1; // quad_perm:[1,0,3,2]
-    //     if constexpr(i_step.value == 1)
-    //         return 0x4e; // quad_perm:[2,3,0,1]
-    //     if constexpr(i_step.value == 2)
-    //         return 0x114; // row_shr:4
-    //     if constexpr(i_step.value == 3)
-    //         return 0x118; // row_shr:8
-    //     if constexpr(i_step.value == 4)
-    //         return 0x142; // row_bcast:15
-    //     if constexpr(i_step.value == 5)
-    //         return 0x143; // row_bcast:31
-    //     else
-    //         return 0xffff; // return a value to let compile crash
-    // };
-    // opus::static_for<lane_steps>([&](auto i_step) {
-    //     constexpr int dpp_i = get_dpp_i(i_step);
-
-    //     float remote_val = __builtin_bit_cast(
-    //         float,
-    //         __builtin_amdgcn_mov_dpp(
-    //             __builtin_bit_cast(int, val), dpp_i, row_mask, bank_mask, bound_ctrl));
-    //     int remote_idx = __builtin_bit_cast(
-    //         int,
-    //         __builtin_amdgcn_mov_dpp(
-    //             __builtin_bit_cast(int, idx), dpp_i, row_mask, bank_mask, bound_ctrl));
-
-    //     idx = val > remote_val ? idx : remote_idx;
-    //     val = val > remote_val ? val : remote_val;
-    // });
-    // val_o = __builtin_bit_cast(
-    //     float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), WARP_SIZE - 1));
-    // idx = __builtin_amdgcn_readlane(idx, WARP_SIZE - 1);
-
-    // val = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), 63));
-    // if (val==val_o)
-    // {
-    //     unsigned long long active_mask = __builtin_amdgcn_read_exec();
-    //     int first_lane;
-    //     asm volatile("s_ff1_i32_b64 %0, %1\n" : "=s"(first_lane) : "s"(active_mask));
-    //     if(threadIdx.x == first_lane)
-    //     {
-    //         int tmp = __builtin_amdgcn_readlane(idx, first_lane);
-    //         asm volatile("v_writelane_b32 %0, %1, 63\n" : "=v"(idx) : "s"(tmp));
-    //     }
-    // }
-    // val_o = val;
-    // idx = __builtin_amdgcn_readlane(idx, 63);
-
-    // #pragma unroll
-    //         for(int i = 0; i < 6; i++)
-    //         {
-    //             int offset = 1 << i;
-    //             float tmp_val = __shfl_down(val, offset);
-    //             int tmp_idx = __shfl_down(idx, offset);
-    //             if (tmp_val > val)
-    //             {
-    //                 val = tmp_val;
-    //                 idx = tmp_idx;
-    //             }
-    //         }
-}
-
-__device__ void blockReduceMax(float& val, int& idx)
-{
-    __shared__ float shared_vals[32];
-    __shared__ int shared_idxs[32];
-
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid  = threadIdx.x / WARP_SIZE;
-
-    warpReduceMax(val, idx);
-
-    if(lane == 0)
-    {
-        shared_vals[wid] = val;
-        shared_idxs[wid] = idx;
-    }
-    __syncthreads();
-
-    if(wid == 0)
-    {
-        val = (lane < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE) ? shared_vals[lane] : -INFINITY;
-        idx = (lane < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE) ? shared_idxs[lane] : -1;
-
-        warpReduceMax(val, idx);
-    }
-    __syncthreads();
-}
-
 template <typename DTYPE_I,
           typename f32vec,
           int NUM_GRP,
           bool need_renorm,
           bool isBiased,
-          bool isSoftmax>
+          bool isSoftmax,
+          int VEC_PER_LANE = 0>
 __global__ void
 grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens, hidden_size]
                     const DTYPE_I* __restrict__ correction_bias, // [num_expert]
@@ -354,6 +247,12 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 {
     static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
     static constexpr int THREAD_PER_GRP = (WARP_SIZE + NUM_GRP - 1) / NUM_GRP;
+
+    // Not blockDim.x: the build passes -fno-offload-uniform-block, so every use
+    // becomes a kernarg load, a compare and a select behind a vmcnt wait.
+    // Measured 1.09-1.13x on the ungrouped router shapes.
+    static constexpr int BLOCK_SIZE = WARP_SIZE;
+
     // 256 E, 8->4 group, 32 e/group
     const int experts_per_group = num_experts / NUM_GRP;
     extern __shared__ char shared_mem[];
@@ -365,12 +264,6 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 
     float* group_scores = reinterpret_cast<float*>(ptr);
     ptr += NUM_GRP * sizeof(float);
-
-    float* sig_scores = reinterpret_cast<float*>(ptr);
-    if constexpr(isBiased)
-        ptr += num_experts * sizeof(float);
-    // float* bias = reinterpret_cast<float*>(ptr);
-    // ptr += num_experts * sizeof(float);
 
     // int* topk_indices   = reinterpret_cast<int*>(ptr);
     // ptr += topk * sizeof(int);
@@ -384,46 +277,59 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     // float *topk_values_f = reinterpret_cast<float *>(ptr);
 
     f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
-    f32vec* sig_vec               = reinterpret_cast<f32vec*>(sig_scores);
     using cktype_i                = typename aiter::hip2opus<DTYPE_I>::type;
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
 
+    static constexpr int VPL = VEC_PER_LANE > 0 ? VEC_PER_LANE : 1;
+
     if constexpr(!isSoftmax)
     {
         auto const* input_ptr = gating_output + token_idx * stride_gating;
-        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        vec_i tmp[VPL];
+        vec_i tmp2[VPL];
+        for(int e0 = threadIdx.x; e0 < num_experts_vec; e0 += BLOCK_SIZE * VPL)
         {
-            vec_i tmp = reinterpret_cast<vec_i const*>(input_ptr)[e];
-            vec_i tmp2;
-            f32vec tmp2_f32;
-            if constexpr(isBiased)
-                tmp2 = reinterpret_cast<vec_i const*>(correction_bias)[e];
-            f32vec gating;
-            f32vec sig;
 #pragma unroll
-            for(size_t i = 0; i < vec_size; i++)
+            for(int b = 0; b < VPL; b++)
             {
-                gating[i] = static_cast<float>(tmp[i]);
-                gating[i] = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * gating[i]));
-                if constexpr(isBiased)
+                const int e = e0 + b * BLOCK_SIZE;
+                if(e < num_experts_vec)
                 {
-                    sig[i] = gating[i]; // pre-bias sigmoid = routing weight
-                    tmp2_f32[i] = static_cast<float>(tmp2[i]);
-                    gating[i] += tmp2_f32[i];
+                    tmp[b] = reinterpret_cast<vec_i const*>(input_ptr)[e];
+                    if constexpr(isBiased)
+                        tmp2[b] = reinterpret_cast<vec_i const*>(correction_bias)[e];
                 }
             }
-            scores_vec[e] = gating;
-            if constexpr(isBiased)
-                sig_vec[e] = sig;
+#pragma unroll
+            for(int b = 0; b < VPL; b++)
+            {
+                const int e = e0 + b * BLOCK_SIZE;
+                if(e >= num_experts_vec)
+                    continue;
+                f32vec gating;
+                f32vec tmp2_f32;
+#pragma unroll
+                for(size_t i = 0; i < vec_size; i++)
+                {
+                    gating[i] = static_cast<float>(tmp[b][i]);
+                    gating[i] = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * gating[i]));
+                    if constexpr(isBiased)
+                    {
+                        tmp2_f32[i] = static_cast<float>(tmp2[b][i]);
+                        gating[i] += tmp2_f32[i];
+                    }
+                }
+                scores_vec[e] = gating;
+            }
         }
         __syncthreads();
     }
     else
     {
         float max_val = -INFINITY;
-        for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        for(int e = threadIdx.x; e < num_experts; e += BLOCK_SIZE)
         {
 
             float gating = gating_output[token_idx * stride_gating + e];
@@ -437,7 +343,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         auto max_reduce = [](float a, float b) { return a > b ? a : b; };
         max_val = wave_reduce<float, decltype(max_reduce), WARP_SIZE, true>(max_val, max_reduce);
         float thread_sum = 0.0;
-        for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        for(int e = threadIdx.x; e < num_experts; e += BLOCK_SIZE)
         {
             scores[e] = expf(scores[e] - max_val);
             thread_sum += scores[e];
@@ -445,7 +351,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         __syncthreads();
         auto sum_reduce = [](float a, float b) { return a + b; };
         thread_sum = wave_reduce<float, decltype(sum_reduce), WARP_SIZE, true>(thread_sum, sum_reduce);
-        for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        for(int e = threadIdx.x; e < num_experts; e += BLOCK_SIZE)
         {
             scores[e] /= thread_sum;
         }
@@ -467,7 +373,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                     return 0;
             }();
             const int lane_id = threadIdx.x % THREAD_PER_GRP;
-            for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
+            for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += BLOCK_SIZE / THREAD_PER_GRP)
             {
                 float max1 = -INFINITY, max2 = -INFINITY;
                 const int start = g * experts_per_group;
@@ -526,7 +432,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         else
         {
     #pragma unroll
-            for(int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
+            for(int g = threadIdx.x; g < NUM_GRP; g += BLOCK_SIZE)
             {
                 float max1      = -INFINITY;
                 const int start = g * experts_per_group;
@@ -554,7 +460,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             group_scores[max_idx] = -INFINITY;
         }
 
-        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        for(int e = threadIdx.x; e < num_experts_vec; e += BLOCK_SIZE)
         {
             int group_idx = e * vec_size / experts_per_group;
             if(group_scores[group_idx] != -INFINITY)
@@ -573,7 +479,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         float max_val = -INFINITY;
         int max_idx   = k;
 
-        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        for(int e = threadIdx.x; e < num_experts_vec; e += BLOCK_SIZE)
         {
             f32vec tmp = scores_vec[e];
 #pragma unroll
@@ -590,8 +496,11 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         // thread_kvp.value = max_val;
         // const kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
 
-        warpReduceMax(max_val, max_idx);
-        // blockReduceMax(max_val, max_idx);
+        // Value-only DPP max plus a ballot. Folding the 8-byte key/value pair
+        // through wave_reduce instead costs more VALU per wave, and leaves
+        // max_idx non-uniform on a tie, which the scores[max_idx] clear below
+        // cannot tolerate.
+        wave_argmax_dpp(max_val, max_idx);
 
         // if (threadIdx.x == 0)
         {
@@ -599,8 +508,14 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             // max_idx = result_kvp.key;
             if constexpr(isBiased)
             {
-                max_val = sig_scores[max_idx];
-                // max_val -= bias[max_idx];
+                // Undo the selection bias. Caching the pre-bias sigmoid in LDS
+                // instead costs a second num_experts array -- 7,172 B against
+                // 3,588 B at E=896, so 22 waves/CU against the 32-wave cap --
+                // and is worth 1.09x across prefill shapes, but nothing at
+                // decode, where there are fewer tokens than CUs.
+                // correction_bias is token-invariant, so this read should hit
+                // in cache.
+                max_val -= static_cast<float>(correction_bias[max_idx]);
             }
             scores[max_idx] = -INFINITY;
             // topk_indices[k] = max_idx;
@@ -625,7 +540,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         sum = routed_scaling_factor;
     }
 
-    for(int k = threadIdx.x; k < topk; k += blockDim.x)
+    for(int k = threadIdx.x; k < topk; k += BLOCK_SIZE)
     {
         topk_weights[token_idx * stride_tk + k] = topk_value * sum;
         topk_ids[token_idx * stride_tk + k]     = topk_indice;
@@ -972,9 +887,6 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
     float* topk_values = reinterpret_cast<float*>(ptr);
     ptr += topk * sizeof(float);
-
-    float* bias = reinterpret_cast<float*>(ptr);
-    ptr += num_experts * sizeof(float);
 
     // used for arg sort
     int* sorted_k = reinterpret_cast<int*>(ptr);
@@ -1536,6 +1448,48 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             routed_scaling_factor);                                                                \
     });
 
+// A separate macro, not a parameter on LAUNCHER_biased_grouped_topk_kernel:
+// threading per_lane through that chain multiplies grouped_topk_kernel
+// instantiations across vector widths and group counts it never uses.
+#define LAUNCH_GROUPED_TOPK_BATCHED_ONE(VPL, need_renorm)                                           \
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                                          \
+        gating_output.dtype(), "grouped_topk_kernel_batched", [&] {                                \
+            hipLaunchKernelGGL((aiter::grouped_topk_kernel<scalar_t,                               \
+                                                           opus::vector_t<float, 4>,               \
+                                                           1,                                      \
+                                                           need_renorm,                            \
+                                                           true,                                   \
+                                                           false,                                  \
+                                                           VPL>),                                  \
+                               dim3(grid),                                                         \
+                               dim3(block),                                                        \
+                               shared_mem_size,                                                    \
+                               stream,                                                             \
+                               reinterpret_cast<scalar_t*>(gating_output.data_ptr()),              \
+                               reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),            \
+                               reinterpret_cast<float*>(topk_weights.data_ptr()),                  \
+                               reinterpret_cast<int*>(topk_ids.data_ptr()),                        \
+                               stride_gating,                                                      \
+                               stride_tk,                                                          \
+                               num_experts,                                                        \
+                               topk,                                                               \
+                               topk_grp,                                                           \
+                               num_tokens,                                                         \
+                               routed_scaling_factor);                                             \
+        });
+
+#define LAUNCH_GROUPED_TOPK_BATCHED(VPL)                  \
+    case VPL:                                             \
+        if(need_renorm)                                   \
+        {                                                 \
+            LAUNCH_GROUPED_TOPK_BATCHED_ONE(VPL, true)    \
+        }                                                 \
+        else                                              \
+        {                                                 \
+            LAUNCH_GROUPED_TOPK_BATCHED_ONE(VPL, false)   \
+        }                                                 \
+        return;
+
 #define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)             \
     VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "grouped_topk_kernel", [&] {         \
         hipLaunchKernelGGL(                                                                        \
@@ -1654,14 +1608,12 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
-    size_t shared_mem_size =
-        (2 * num_experts * sizeof(float) + num_expert_group * sizeof(float)); // additional buf for sig_scores
+    size_t shared_mem_size = (num_experts * sizeof(float) + num_expert_group * sizeof(float));
     shared_mem_size += !use_opt_sort
                            ? 0
                            : (num_expert_group * sizeof(int) /*group_map_idx*/
                               + topk * sizeof(int)           /*idx+weight*/
                               + topk * sizeof(float)         /*idx+weight*/
-                              //   + num_experts * sizeof(float)                         /*bias*/
                               + (topk > topk_grp ? topk : topk_grp) * sizeof(int)   /* sort_k*/
                               + (topk > topk_grp ? topk : topk_grp) * sizeof(float) /* sort_v*/
                               //    + 64 / num_expert_group * sizeof(float) /* for sorting */
@@ -1669,6 +1621,25 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
 
     HipDeviceGuard device_guard(gating_output.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    // Template the slot count, not the expert count: four instantiations cover
+    // all currently valid expert counts. The gate is narrow only because the
+    // macro hardcodes vec4 and NUM_GRP=1; widening it multiplies
+    // grouped_topk_kernel instantiations.
+    if(num_expert_group == 1 && !use_opt_sort && (num_experts % 4) == 0)
+    {
+        const int warp_sz = static_cast<int>(get_warp_size_func());
+        // vec4 per the gate above, so a row is num_experts/4 vectors.
+        const int per_lane = (num_experts / 4 + warp_sz - 1) / warp_sz;
+        switch(per_lane < 4 ? per_lane : 4)
+        {
+            LAUNCH_GROUPED_TOPK_BATCHED(1)
+            LAUNCH_GROUPED_TOPK_BATCHED(2)
+            LAUNCH_GROUPED_TOPK_BATCHED(3)
+            LAUNCH_GROUPED_TOPK_BATCHED(4)
+        default: break;
+        }
+    }
 
     LAUNCH_KERNEL()
 }
@@ -1724,3 +1695,5 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
 #undef LAUNCHER3
 #undef LAUNCHER2
 #undef LAUNCH_KERNEL
+#undef LAUNCH_GROUPED_TOPK_BATCHED
+#undef LAUNCH_GROUPED_TOPK_BATCHED_ONE
