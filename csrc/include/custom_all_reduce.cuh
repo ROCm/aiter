@@ -517,10 +517,9 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
     // stage 1: reduce scatter
-    // `end - start` is not generally a multiple of `stride`, so a plain
-    // grid-stride loop gives the block a non-uniform trip count and the two
-    // __syncthreads() below pair up across iterations. Round the bound up and
-    // predicate the work instead.
+    // `end - start` is not generally a multiple of `stride`, so a plain grid-stride loop gives
+    // the block a non-uniform trip count and the two __syncthreads() below pair up across
+    // iterations.
     int loop_end = start + (end - start + stride - 1) / stride * stride;
     for(int idx = start + tid; idx < loop_end; idx += stride)
     {
@@ -626,7 +625,7 @@ __global__ void __launch_bounds__(512, 1)
 
     // stage 2: reduce scatter & write result to remote rank
     end = rank != ngpus - 1 ? part : size - part * (ngpus - 1);
-    // Uniform trip count, for the reason given in cross_device_reduce_2stage above.
+    // Uniform trip count, see cross_device_reduce_2stage.
     int loop_end = (end + stride - 1) / stride * stride;
     for(int idx = tid; idx < loop_end; idx += stride)
     {
@@ -1298,7 +1297,7 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     start_sync<ngpus>(sg, self_sg, rank);
 
     int part = m * valid_pack_count / ngpus;
-    // Uniform trip count, for the reason given in cross_device_reduce_2stage above.
+    // Uniform trip count, see cross_device_reduce_2stage.
     int stride   = gridDim.x * tnum_gpu;
     int loop_end = (part + stride - 1) / stride * stride;
     for(int idx = tid; idx < loop_end; idx += stride)
