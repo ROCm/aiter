@@ -409,6 +409,34 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
             }
         }
 
+        // Host-sorted tiles are 32x256/32x512. Irregular inter_dims such as 160
+        // and 320 only have FLAT 16xN kernels (gdx = inter_dim/subGU_n). Prefer
+        // the largest FLAT tile that divides; ignore vskip (FLAT rows are novs).
+        if(selectedKl.empty())
+        {
+            round    = 0xffffffff;
+            empty_cu = num_cu;
+            for(const auto& el : *cfgs)
+            {
+                if(el.first.find(arch_id) != 0)
+                    continue;
+                const auto& cfg = el.second;
+                if(cfg.smf != smf || cfg.flat != 1)
+                    continue;
+                if((inter_dim % cfg.subGU_n) != 0)
+                    continue;
+                tg_num               = inter_dim / cfg.subGU_n * sub_X_cnt;
+                uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
+                if(local_round < round ||
+                   (local_round == round && empty_cu > (local_round * num_cu - tg_num)))
+                {
+                    round      = local_round;
+                    empty_cu   = local_round * num_cu - tg_num;
+                    selectedKl = el.first;
+                }
+            }
+        }
+
         AITER_CHECK(selectedKl != "",
                     __func__,
                     ": No suitable kernel found for inter_dim: ",
