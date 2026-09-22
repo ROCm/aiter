@@ -121,7 +121,9 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_quant_mx(M, N, metric, provider, dtype, use_sr, model_name=None, **kwargs):
+    def bench_quant_mx(
+        M, N, metric, provider, dtype, use_sr, model_name=None, **kwargs
+    ):
         fmt, provider = provider.split("-", 1)
         dtype = get_dtype(dtype)
         x = torch.randn((M, N), dtype=dtype, device="cuda")
