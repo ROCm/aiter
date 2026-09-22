@@ -103,7 +103,7 @@ def build_qsa_k2_family_a_module(
     decode_tr_pv = token_major_v
 
     def make_k_lds_view(k_arr, offset, shape):
-        if token_major_v:
+        if use_k32:
             layout = fx.make_composed_layout(
                 fx.static(fx.SwizzleType.get(3, 3, 3)),
                 offset,
@@ -119,7 +119,7 @@ def build_qsa_k2_family_a_module(
 
         @fx.struct
         class SharedStorage:
-            k: fx.Array[BFloat16, block_n * _K_STRIDE, 16]
+            k: fx.Array[BFloat16, block_n * _D, 16]
             v: fx.Array[BFloat16, block_n * _D, 16]
             p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
             live: fx.Array[Int32, block_n, 16]
@@ -236,11 +236,7 @@ def build_qsa_k2_family_a_module(
         qk_b_copy = fx.make_tiled_copy_B(qk_b_atom, qk_wave_mma).get_slice(lane)
         pv_wave_mma = fx.make_tiled_mma(pv_mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
         pv_b_atom = fx.make_copy_atom(
-            (
-                fx.rocdl.cdna4.LDSReadTrans16_64b()
-                if decode_tr_pv
-                else fx.UniversalCopy64b()
-            ),
+            (fx.rocdl.cdna4.LDSReadTrans16_64b() if use_k32 else fx.UniversalCopy64b()),
             BFloat16,
         )
         pv_b_copy = fx.make_tiled_copy_B(pv_b_atom, pv_wave_mma).get_slice(lane)
@@ -420,7 +416,7 @@ def build_qsa_k2_family_a_module(
                     d_base = wave * Int32(_D // num_waves) + Int32(ks * qk_k)
                     sB = make_k_lds_view(
                         k_arr,
-                        n0 * Int32(_D if token_major_v else _K_STRIDE) + d_base,
+                        n0 * Int32(_D if use_k32 else _K_STRIDE) + d_base,
                         (16, qk_k),
                     )
                     b_src = qk_b_copy.partition_S(sB)
@@ -549,7 +545,7 @@ def build_qsa_k2_family_a_module(
                         ],
                         BFloat16,
                     )
-                    if const_expr(decode_tr_pv):
+                    if const_expr(use_k32):
                         d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
                         sB = fx.make_view(
                             fx.get_iter(v_lds) + Int32(ng * 16) * Int32(_D) + d_base,
