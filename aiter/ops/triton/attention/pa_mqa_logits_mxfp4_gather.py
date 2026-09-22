@@ -52,8 +52,20 @@ def cache_strides(kv_cache, head_size, kv_scale_cache=None):
             page_size * (head_size // SCALE_GROUP))
 
 
+def gather_s_unit(block, num_scales):
+    """The unit the scale list is stored in, in e8m0 bytes.
+
+    Two whenever every resolved scale offset is even, which is what lets the
+    kernel's `* U` hand the 2-byte alignment back to the vectorizer -- without
+    it each of the tile's 2-byte runs splits into two buffer_load_ubyte. The
+    kernel derives the same value from GATHER_BLOCK and NUM_SCALES; the two
+    lines must stay in step.
+    """
+    return 2 if (block % 2 == 0 and num_scales % 2 == 0) else 1
+
+
 def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
-                  kv_stride, kvs_stride, preshuffle=1, scale_mode=1):
+                  kv_stride, kvs_stride, block, preshuffle=1, scale_mode=1):
     """Resolved (value, scale) offsets for the candidate blocks starting at pos0.
 
     `pos0` is [R, K] int64 KV positions, each a multiple of the candidate block
@@ -92,10 +104,12 @@ def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
     soff = pid * kvs_stride + bs
     assert int((voff % K_WIDTH).max()) == 0, "value offsets must be k_width aligned"
     voff = voff // K_WIDTH
+    s_unit = gather_s_unit(block, num_scales)
+    assert int((soff % s_unit).max()) == 0, "scale offsets must be unit aligned"
     assert int(voff.max()) < 2 ** 31 and int(soff.max()) < 2 ** 31, (
         "resolved offsets are i32: the reachable cache is 2 GiB of scale bytes "
         "and 32 GiB of value bytes on this path")
-    return voff.to(torch.int32), soff.to(torch.int32)
+    return voff.to(torch.int32), (soff // s_unit).to(torch.int32)
 
 
 def build_gather(positions, block_table, kv_cache, num_heads, head_size,
@@ -115,8 +129,8 @@ def build_gather(positions, block_table, kv_cache, num_heads, head_size,
                                                      kv_scale_cache)
     assert page_size % block == 0 and block <= n_per_tile
     voff, soff = block_offsets(positions, block_table, page_size, head_size,
-                               n_per_tile, kv_stride, kvs_stride, preshuffle,
-                               scale_mode)
+                               n_per_tile, kv_stride, kvs_stride, block,
+                               preshuffle, scale_mode)
     return dict(voff=voff.contiguous(), soff=soff.contiguous(), block=block,
                 positions=positions)
 

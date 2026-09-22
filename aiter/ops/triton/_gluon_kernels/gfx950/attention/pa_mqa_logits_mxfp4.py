@@ -515,7 +515,13 @@ class KVState:
         # GATHER_BLOCK divides BLOCK_KV, so this is (tile_pos + cols) // GB.
         blk = gl.minimum(tile_pos // self.cfg.GATHER_BLOCK
                          + cols // self.cfg.GATHER_BLOCK, self.last_blk)
-        return gl.load(base_ptr + blk)
+        # A buffer load rather than a pointer load, and not for the reason
+        # USE_BUFFER_LOAD exists: the row base is scalar and folds into the
+        # descriptor, so the per-column term stays i32 and the tile costs one
+        # shift instead of a 64-bit shift-add and a sign extend per stream.
+        # The list is one row of at most max_model_len / GATHER_BLOCK int32,
+        # so it is under the record count whatever the cache is.
+        return gl.amd.cdna4.buffer_load(ptr=base_ptr, offsets=blk)
 
     @gluon.jit
     def gather_scale_base(self, tile_pos):
@@ -540,7 +546,8 @@ class KVState:
         blk = gl.minimum(tile_pos // cfg.GATHER_BLOCK
                          + (b0 * cfg.N_PER_TILE + b2) // cfg.GATHER_BLOCK,
                          self.last_blk)
-        return gl.load(self.gs_ptr + blk)
+        # A buffer load, for the reason gather_base gives.
+        return gl.amd.cdna4.buffer_load(ptr=self.gs_ptr, offsets=blk)
 
     @gluon.jit
     def gather_tok(self, tile_pos, val_layout: gl.constexpr):
@@ -606,10 +613,23 @@ class KVState:
         if self.cfg.GATHER:
             # A per-column page, so there is no single tile base to bump: the
             # whole address goes in the offsets, i32 under buffer_load.
+            #
+            # The `* U` is the same move the value stream makes with
+            # D_PER_TILE: the list is stored in units of it so the multiply
+            # hands the divisibility back. Without it the tile's 2-byte scale
+            # runs lose their alignment at the load and the vectorizer splits
+            # each into two buffer_load_ubyte. The page stride is
+            # PAGE_SIZE * NUM_SCALES and the in-page term is
+            # (t0 % N_PER_TILE) * tok_stride + (t0 // N_PER_TILE) * N_PER_TILE
+            # * NUM_SCALES with t0 a multiple of GATHER_BLOCK, so both are even
+            # when the block and the group count are; gather_s_unit() on the
+            # host is the same two lines and must stay in step with this one.
+            U: gl.constexpr = 2 if (self.cfg.GATHER_BLOCK % 2 == 0
+                                    and self.cfg.NUM_SCALES % 2 == 0) else 1
             if self.cfg.USE_BUFFER_LOAD:
-                gs = gtok[1]
+                gs = gtok[1] * U
             else:
-                gs = gtok[1].to(gl.int64)
+                gs = gtok[1].to(gl.int64) * U
             if self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
                 return _load_scales_wide(self.cfg, self.kv_scales_ptr, gs)
             elif self.cfg.USE_BUFFER_LOAD:

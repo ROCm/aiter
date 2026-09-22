@@ -571,7 +571,32 @@ def paged_mxfp4_mqa_logits(
         # One query row per workgroup: above one row the walk is over the
         # rows' union and each row's store column comes from a per-block slot,
         # none of which the candidate addressing carries.
-        cfg = dict(cfg, block_m=1, row_blocks=next_n)
+        #
+        # The dense walk's two pipeline knobs invert here, both for the same
+        # reason: BLOCK_M is 1 rather than 3, and the candidate list carries
+        # the whole page address.
+        #
+        # DEPTH keeps only its split-page term, and only below 64 heads. The
+        # wide-decode term pays the dense walk because a second tile in flight
+        # covers the block-table read, and the gather does no such read -- so
+        # there it only costs registers, and at 64 heads it costs enough of
+        # them to push the scale load back to bytes. Pinning it to 1 at 64
+        # heads is 1.01-1.06x on its own and 1.19-1.29x once that spill is
+        # counted. A page wider than the tile is the one place a second tile
+        # still pays, 1.03x at decode concurrency 128, measured rather than
+        # explained by the candidate addressing.
+        #
+        # UNROLL goes the other way on a wide chunk: one query row leaves the
+        # registers the dense path at BLOCK_M = 3 does not have, and four
+        # tiles of loads in flight is worth 1.03-1.06x with no spill. Decode
+        # keeps what the dense rule gave it -- the walk is short enough there
+        # that the peeled remainder costs more than the extra loads buy.
+        split_page = page_size > cfg["block_kv"]
+        cfg = dict(cfg, block_m=1, row_blocks=next_n,
+                   depth=2 if (next_n == 1 and split_page and num_heads <= 32)
+                   else 1)
+        if preshuffle and next_n >= COMPUTE_CHUNK:
+            cfg["unroll"] = 4
     block_m, row_blocks = cfg["block_m"], cfg["row_blocks"]
     block_kv, n_per_tile = cfg["block_kv"], cfg["n_per_tile"]
     target_wgs = cfg["target_wgs"]
