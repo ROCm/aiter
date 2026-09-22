@@ -25,9 +25,10 @@ guard and the optional FP8 epilogue. Do not hand-edit; see build_aiter_kernel.py
   sha256: 339400d8b376329c3a727e6c1258d5c43bf54d3147f5707d257ecd1db0e3c9ad
 """
 
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # Config-aware names so a trace row maps to the exact specialization
 # (aiter/ops/triton/README.md, "Config-aware kernel names in traces").
