@@ -222,8 +222,8 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     if block_m == 16:
         block_n = 128
         num_warps = 4
-        tile_per_warp = [1, 2]
-        matrix_instr_nonkdim = 16
+        tile_per_warp = [2, 2]
+        matrix_instr_nonkdim = 32
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -456,8 +456,6 @@ def moe_gemm_a16w4(
                 backend = "triton"
                 config = get_kernel_config_triton(M, N, K, routing_data)
             else:
-                # For smaller M, pipelined kernel performs much better
-                use_pipelined_gluon = M <= 16
                 if use_pipelined_gluon:
                     config = get_kernel_config_gluon_gfx950_pipelined(
                         M, N, K, routing_data

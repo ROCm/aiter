@@ -334,19 +334,55 @@ def _moe_gemm_a16w4(
         offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
         + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
     )
+    # TTGIR shared layouts: #shared2 (X), #shared (W, K-major), #shared1 (scale).
+    SHARED_LAYOUT_X: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
+    SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(
+        16, 1, 8, order=[0, 1]
+    )  # vec=16 matches async 128-bit i8 write
+    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
+        1, 1, 1, order=[1, 0]
+    )
+    x_smem = gl.allocate_shared_memory(
+        X.dtype.element_ty, [BLOCK_M, BLOCK_K], SHARED_LAYOUT_X
+    )
+    w_smem = gl.allocate_shared_memory(
+        W.dtype.element_ty,
+        [PACKED_BLOCK_K_W, PACKED_BLOCK_N_W],
+        SHARED_LAYOUT_W,
+    )
+    ws_smem = gl.allocate_shared_memory(
+        WMxScale.dtype.element_ty,
+        [SCALE_BLOCK_N, PACKED_MX_BLOCK],
+        SHARED_LAYOUT_W_SCALES,
+    )
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=MFMA_LAYOUT)
 
     for k in range(NUM_FULL_K):
         # Load X and W into regs
-        x = gl.amd.cdna3.buffer_load(X_base, x_offsets)
-        w = gl.amd.cdna3.buffer_load(W_base, w_offsets, cache=W_CACHE_MODIFIER)
-        w_scales = gl.amd.cdna3.buffer_load(WMxScale_base, w_scale_offsets)
+        # x = gl.amd.cdna3.buffer_load(X_base, x_offsets)
+        # w = gl.amd.cdna3.buffer_load(W_base, w_offsets, cache=W_CACHE_MODIFIER)
+        # w_scales = gl.amd.cdna3.buffer_load(WMxScale_base, w_scale_offsets)
+
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(x_smem, X_base, x_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            w_smem, W_base, w_offsets, cache_modifier=W_CACHE_MODIFIER
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            ws_smem, WMxScale_base, w_scale_offsets
+        )
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
 
         # Convert Layouts
-        x = gl.convert_layout(x, DOT_LAYOUT_X)
-        w = gl.convert_layout(w, DOT_LAYOUT_W_PACKED)
-        w_scales = gl.convert_layout(w_scales, LOAD_LAYOUT_WS)
+        # x = gl.convert_layout(x, DOT_LAYOUT_X)
+        # w = gl.convert_layout(w, DOT_LAYOUT_W_PACKED)
+        # w_scales = gl.convert_layout(w_scales, LOAD_LAYOUT_WS)
+
+        # Load into regs
+        x = x_smem.load(DOT_LAYOUT_X)
+        w = w_smem.load(DOT_LAYOUT_W_PACKED)
+        w_scales = ws_smem.load(LOAD_LAYOUT_WS)
 
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 

@@ -122,6 +122,7 @@ class Case:
             Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
+            Case(64, 512, 4096, 256, 6, hbm_swizzling=True),
             Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
             Case(16, 1024, 1024, 2, 1, hbm_swizzling=True),
             Case(16, 256, 256, 128, 4, hbm_swizzling=True),
