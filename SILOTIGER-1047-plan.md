@@ -745,6 +745,15 @@ median (three runs) was 20.09 → 23.26 us at `M=1`, 20.52 → 29.37 us
 at `M=8`, and 424.09 → 423.82 us at `M=512`. Keep scalar
 `v_lds[d, col] = v_vec[i]`.
 
+**Do not retry** replacing K (and gfx942 aliased KV) LDS row pad
+`_K_STRIDE = D+8` with `SwizzleType.get(3, 3, 3)` composed on
+`(BLOCK_N, D):(D, 1)`. Store and QK-B shared that map; gfx950 V and C
+stayed unswizzled. GPU 6 / gfx950 focused decode+prefill pytest passed.
+Decode ISA emitted `4× v_bitop3_b32` (`bitop3:0x6c`), `0 v_xor`,
+`3× ds_write_b128`. Width-2051 `L=512` K-pad → XOR median (three runs)
+was 20.09 → 20.72 us at `M=1`, 20.52 → 20.45 us at `M=8` (−0.34%), and
+424.09 → 449.43 us at `M=512`. Keep the pad.
+
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in
 `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`

@@ -331,6 +331,21 @@ num_waves, 64, 4)` is the remaining store map in this phase.
 
 **K pad kept.** Next in phase 4: C stores only.
 
+Replacing the pad with a K-only `SwizzleType.get(3, 3, 3)` composed
+layout on `(BLOCK_N, D):(D, 1)` (store and QK-B share that map; gfx950
+V/C unchanged) compiled and passed focused pytest 2/2. Decode ISA
+emitted `4× v_bitop3_b32` (`bitop3:0x6c`), `0 v_xor`, `3× ds_write_b128`,
+`20× ds_write_b16`. Median vs K-pad `20.09 / 20.52 / 424.09`:
+
+| M | K pad | XOR K | Δ |
+|--:|--:|--:|--:|
+| 1 | 20.09 | 20.72 | +3.14% |
+| 8 | 20.52 | 20.45 | −0.34% |
+| 512 | 424.09 | 449.43 | +5.98% |
+
+Prefill gives back the pad win; decode M=1 regresses. Kernel restored
+to `_K_STRIDE = D+8`. **Do not retry XOR-instead-of-pad.**
+
 C-LDS pad `_C_LANE_STRIDE=66` (logical 64, wave-row stride 264 so
 `wave·264 % 32 = 8·wave`). Indexing `c_lds[ng, wave, lane, i]`
 unchanged. GPU 6 / gfx950, `CACHE=0`. Pytest 2/2. Median vs K-pad
@@ -418,3 +433,8 @@ The parent plan remains the full K2 list.
 - Packing token-major V stores via wave `shuffle_idx` into
   `ds_write_b128` along `BLOCK_N` (layout unchanged). Correct; M=1
   +15.8%, M=8 +43.1%, M=512 flat. Keep scalar `v_lds[d, col] =`.
+- Replacing K (and gfx942 aliased KV) `D+8` pad with
+  `SwizzleType.get(3, 3, 3)` on `(BLOCK_N, D)`. Store and QK-B used
+  the composed map (no pointer-offset into an unswizzled subview).
+  Correct; emit `v_bitop3` not `v_xor`. M=1 +3.14%, M=8 −0.34%,
+  M=512 +5.98% vs K-pad. Keep `_K_STRIDE = D+8`.
