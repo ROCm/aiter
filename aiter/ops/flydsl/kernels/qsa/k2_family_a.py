@@ -32,6 +32,9 @@ _HQ = FAMILY_A_GQA.n_heads
 _HK = FAMILY_A_GQA.kv_heads
 _GROUP = FAMILY_A_GQA.group_size
 _D = FAMILY_A_GQA.head_dim
+# Pad K (and aliased KV) rows so consecutive columns do not share LDS banks
+# on 128-bit stores. D=256 makes n*D a multiple of 32 banks otherwise.
+_K_STRIDE = _D + 8
 _HEAD_PAD = 16
 _DEFAULT_SCALE = _D**-0.5
 _LSE_EMPTY = -1.0e20
@@ -102,7 +105,7 @@ def build_qsa_k2_family_a_module(
 
         @fx.struct
         class SharedStorage:
-            k: fx.Array[BFloat16, block_n * _D, 16]
+            k: fx.Array[BFloat16, block_n * _K_STRIDE, 16]
             v: fx.Array[BFloat16, block_n * _D, 16]
             p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
             live: fx.Array[Int32, block_n, 16]
@@ -118,7 +121,7 @@ def build_qsa_k2_family_a_module(
 
         @fx.struct
         class SharedStorage:
-            kv: fx.Array[BFloat16, block_n * _D, 16]
+            kv: fx.Array[BFloat16, block_n * _K_STRIDE, 16]
             p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
             live: fx.Array[Int32, block_n, 16]
             phys: fx.Array[Int32, block_n, 16]
@@ -188,11 +191,16 @@ def build_qsa_k2_family_a_module(
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        k_lds = getattr(storage, _k_field).view(fx.make_layout((block_n, _D), (_D, 1)))
+        k_lds = getattr(storage, _k_field).view(
+            fx.make_layout((block_n, _K_STRIDE), (_K_STRIDE, 1))
+        )
         v_lds = getattr(storage, _v_field).view(
             fx.make_layout((_D, block_n), (block_n, 1))
             if token_major_v
-            else fx.make_layout((block_n, _D), (_D, 1))
+            else fx.make_layout(
+                (block_n, _K_STRIDE if not use_k32 else _D),
+                (_K_STRIDE if not use_k32 else _D, 1),
+            )
         )
         p_lds = storage.p.view(fx.make_layout((_HEAD_PAD, block_n), (block_n, 1)))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
@@ -335,7 +343,7 @@ def build_qsa_k2_family_a_module(
                 fx.memref_store_vec(k_vec, k_frag)
                 k_tile = fx.make_view(
                     fx.get_iter(k_lds) + Int32(gr * gather_span),
-                    fx.make_layout((block_n, gather_span), (_D, 1)),
+                    fx.make_layout((block_n, gather_span), (_K_STRIDE, 1)),
                 )
                 k_dst = kv_store.partition_D(k_tile)
                 k_store_frag = fx.make_fragment_like(k_dst)
@@ -382,8 +390,8 @@ def build_qsa_k2_family_a_module(
                 for ks in range_constexpr(qk_steps):
                     d_base = wave * Int32(_D // num_waves) + Int32(ks * qk_k)
                     sB = fx.make_view(
-                        fx.get_iter(k_lds) + n0 * Int32(_D) + d_base,
-                        fx.make_layout((16, qk_k), (_D, 1)),
+                        fx.get_iter(k_lds) + n0 * Int32(_K_STRIDE) + d_base,
+                        fx.make_layout((16, qk_k), (_K_STRIDE, 1)),
                     )
                     b_src = qk_b_copy.partition_S(sB)
                     b_frag = fx.make_fragment_like(b_src)
@@ -417,7 +425,7 @@ def build_qsa_k2_family_a_module(
                     fx.memref_store_vec(v_vec, v_frag)
                     v_tile = fx.make_view(
                         fx.get_iter(v_lds) + Int32(gr * gather_span),
-                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                        fx.make_layout((block_n, gather_span), (_K_STRIDE, 1)),
                     )
                     v_dst = kv_store.partition_D(v_tile)
                     v_store_frag = fx.make_fragment_like(v_dst)
