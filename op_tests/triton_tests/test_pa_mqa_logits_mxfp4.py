@@ -423,7 +423,7 @@ def row_ends(ctx_lens, next_n, cu_ends, device="cuda"):
 
 
 def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
-                dynamic=0, cu_ends=None, only=False):
+                dynamic=0, cu_ends=None, only=False, pin_newest=False):
     """One launch of the fused reduce. `only` drops the logits store.
 
     Returns what the launcher returned and the score tensor -- which are the
@@ -437,7 +437,8 @@ def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
         st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
         st["block_table"], mml, preshuffle=preshuffle,
         clean_logits=clean_logits, dynamic=dynamic, cu_ends=cu_ends,
-        block_scores=bs, block_scores_only=only, candidate_block_size=block)
+        block_scores=bs, block_scores_only=only, candidate_block_size=block,
+        pin_newest=pin_newest)
     torch.cuda.synchronize()
     return out, bs
 
@@ -554,6 +555,36 @@ def test_block_scores_nan(block):
     assert int(torch.isnan(bs).sum()) > 0, "the NaN did not reach a block"
     ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), block)
     nd = int((ref.view(torch.int32) != bs.view(torch.int32)).sum())
+    assert nd == 0, f"{nd} differing words"
+
+
+
+@pytest.mark.parametrize("shape", [BSCORE_SHAPES[1], BSCORE_SHAPES[2],
+                                   BSCORE_SHAPES[5]],
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("preshuffle", [1, 0])
+@pytest.mark.parametrize("block", [8, 32])
+def test_block_scores_pin_newest(shape, num_heads, preshuffle, block):
+    """`pin_newest` sets exactly the newest block and moves nothing else.
+
+    The unshuffled path above 32 heads runs two warps and the loop's own block
+    stores are spread across them, so the epilogue needs the barrier it carries:
+    without it the pin races the reduce and loses, non-deterministically and on
+    a different row each run.
+    """
+    _, batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64,
+                    preshuffle=preshuffle)
+    _, base = _bscore_run(st, num_heads, next_n, block, preshuffle)
+    _, got = _bscore_run(st, num_heads, next_n, block, preshuffle,
+                         pin_newest=True)
+    ends = row_ends(st["ctx"], next_n, None)
+    want = base.clone()
+    rows = torch.arange(want.shape[0], device=want.device)
+    live = ends > 0
+    want[rows[live], (ends[live].long() - 1) // block] = float("inf")
+    nd = _same_words(want, got)
     assert nd == 0, f"{nd} differing words"
 
 

@@ -1196,6 +1196,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     BSCORE: gl.constexpr,        # 0 off, 1 block maxima beside the logits,
                                  # 2 block maxima and no logits store
     BSCORE_BLOCK: gl.constexpr,  # columns per candidate block
+    PIN_NEWEST: gl.constexpr,    # force the row's newest block to +inf
 ):
     gl.static_assert(BLOCK_KV % MFMA_NONK_DIM == 0)
     gl.static_assert(PAGE_SIZE % BLOCK_KV == 0,
@@ -1220,6 +1221,8 @@ def _pa_mqa_logits_mxfp4_kernel(
     gl.static_assert((BSCORE == 0) | (BSCORE == 1) | (BSCORE == 2),
                      "BSCORE is 0 off, 1 block maxima beside the logits, "
                      "2 block maxima instead of them")
+    gl.static_assert((PIN_NEWEST == 0) | (BSCORE != 0),
+                     "the pin writes a block score, so it needs BSCORE")
     # The producer walks densely and the consumers gather; no launch is both.
     # Static, not tested: the combination has no caller. It holds for BSCORE 2
     # as much as for 1 -- mode 2 is the *first* pass of a producer whose second
@@ -1341,6 +1344,41 @@ def _pa_mqa_logits_mxfp4_kernel(
         loader = LDSLoader.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
                                       last_page_row, gv_ptr, gs_ptr, last_blk)
         _loop_with_lds(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
+
+    if PIN_NEWEST:
+        # The block holding the row's newest key is a candidate whatever it
+        # scored. Out here rather than in the reduce: it is one element per row,
+        # and a compare per block per tile would pay for it in the steady loop.
+        #
+        # Only the workgroup whose tiles cover that key writes the pin, and that
+        # is the same one whose reduce wrote that block -- so no other workgroup
+        # can land on it afterwards. `ends[r]` and not `row_hi[r]`, because
+        # row_hi is already min'd with this split's share and every split would
+        # then read its own last block as the boundary.
+        #
+        # Inside that workgroup the warps still race. Above one warp the loop's
+        # block_max stores are spread across them and nothing orders them
+        # against this one: Gluon emits barriers for LDS dependencies, not for
+        # two warps writing the same global address. Without the barrier a
+        # warp still in the loop overwrites the pin -- measured, a different
+        # subset of rows each run. One s_barrier, once, outside the loop.
+        gl.barrier()
+        # One thread, not one element of a replicated tensor: the store is a
+        # single dword and the layout has to say so.
+        NT: gl.constexpr = NUM_WARPS * WARP_SIZE
+        lay: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1], threads_per_warp=[WARP_SIZE],
+            warps_per_cta=[NUM_WARPS], order=[0])
+        tid = gl.arange(0, NT, layout=lay)
+        inf = gl.full([NT], float("inf"), gl.float32, layout=lay)
+        for r in gl.static_range(0, BLOCK_M):
+            last = ends[r] - 1
+            tile = last // BLOCK_KV
+            own = (last >= 0) & (tile >= pgm.tile_lo) & (tile < pgm.tile_hi)
+            gl.amd.cdna4.buffer_store(
+                inf, ptr=pgm.bs_ptr + r * pgm.bs_stride_s,
+                offsets=tid * 0 + last // BSCORE_BLOCK,
+                mask=own & (tid == 0))
 
 
 @triton.jit

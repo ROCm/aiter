@@ -379,6 +379,7 @@ def paged_mxfp4_mqa_logits(
     gather: dict | None = None,
     block_scores: torch.Tensor | None = None,
     block_scores_only: bool = False,
+    pin_newest: bool = False,
     candidate_block_size: int = CANDIDATE_BLOCK,
 ) -> torch.Tensor:
     """
@@ -428,6 +429,9 @@ def paged_mxfp4_mqa_logits(
                     is one element per row and belongs in a caller-side
                     scatter, not in a compare per block inside the walk. Not
                     available under gather: the producer walks densely
+    pin_newest:     bool. Force the block holding each row's newest key to +inf, so
+                    recent context is always a candidate whatever it scored. The
+                    reference model does this; leave it off to score honestly
     block_scores_only: bool. Emit the block maxima *instead of* the logits
                     rather than beside them: the logits store and its offset
                     and predicate arithmetic leave the walk, and no
@@ -519,6 +523,7 @@ def paged_mxfp4_mqa_logits(
     # 2 the maxima instead of them. The shape checks that need BLOCK_KV are
     # below; what is resolved here is whether a logits tensor exists at all.
     bscore_on = 0 if block_scores is None else (2 if block_scores_only else 1)
+    assert not pin_newest or bscore_on, "pin_newest writes a block score"
     if block_scores_only:
         assert block_scores is not None, (
             "block_scores_only needs the block_scores tensor it writes; it is "
@@ -731,6 +736,7 @@ def paged_mxfp4_mqa_logits(
         GATHER_PIPE=cfg["gather_pipe"] if gather_on else 0,
         BSCORE=bscore_on,
         BSCORE_BLOCK=cand_block if bscore_on else CANDIDATE_BLOCK,
+        PIN_NEWEST=int(pin_newest),
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
     )
