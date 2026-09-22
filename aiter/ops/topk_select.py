@@ -39,7 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
 from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
     build_topk_per_row_radix_stream_module,
@@ -281,6 +281,60 @@ def _gather_selected(scores, idx, fill):
         BLOCK_K=triton.next_power_of_2(topk),
     )
     return out
+
+
+@triton.jit
+def _stream_small_reject_kernel(
+    scores_ptr,
+    idx_ptr,
+    scores_stride0,
+    idx_stride0,
+    WIDTH: tl.constexpr,
+    REJECTS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Select ``BLOCK_K`` columns by rejecting the bottom one or two.
+
+    The generic stream selector orders fp32 keys descending and columns
+    ascending.  Here the same order is expressed as a signed key so a pair of
+    reductions can find the complement: smaller key is worse and, among equal
+    keys, the larger column is worse.  NaNs collapse above +inf and signed zero
+    collapses to +0, matching the stream key transform exactly.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK_N)
+    live = col < WIDTH
+    score = tl.load(
+        scores_ptr + row * scores_stride0 + col,
+        mask=live,
+        other=0.0,
+    )
+    bits = score.to(tl.int32, bitcast=True)
+    bits = tl.where(bits == -2147483648, 0, bits)
+    key = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+    is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
+    key = tl.where(is_nan | ~live, 0x7FFFFFFF, key)
+
+    worst_key0 = tl.min(key, axis=0)
+    reject0 = tl.max(tl.where(live & (key == worst_key0), col, -1), axis=0)
+    reject_lo = reject0
+    reject_hi = reject0
+    if REJECTS == 2:
+        key1 = tl.where(col == reject0, 0x7FFFFFFF, key)
+        worst_key1 = tl.min(key1, axis=0)
+        reject1 = tl.max(
+            tl.where(live & (col != reject0) & (key1 == worst_key1), col, -1),
+            axis=0,
+        )
+        reject_lo = tl.minimum(reject0, reject1)
+        reject_hi = tl.maximum(reject0, reject1)
+
+    slot = tl.arange(0, BLOCK_K)
+    out_col = tl.where(slot >= reject_lo, slot + 1, slot)
+    if REJECTS == 2:
+        out_col = tl.where(out_col >= reject_hi, out_col + 1, out_col)
+    tl.store(idx_ptr + row * idx_stride0 + slot, out_col)
 
 
 @lru_cache(maxsize=256)
@@ -893,6 +947,32 @@ def _dispatch(
         )
     elif backend == "stream":
         wave = wave_size_of(input.device.index)
+        rejects = input.shape[1] - topk
+        if (
+            not ragged
+            and get_gfx_runtime() == "gfx950"
+            and topk == 2048
+            and rejects in (1, 2)
+        ):
+            # A dense row with k+1/k+2 columns is a reject-one/reject-two
+            # problem, not a general selection problem.  Reduce the bottom
+            # pair(s) and emit their complement directly; this preserves the
+            # stream backend's (value desc, column asc) selected set while
+            # avoiding its three radix passes and candidate-buffer traffic.
+            # Keep gfx942 on the generic path until this geometry is measured
+            # and validated there as well.
+            _stream_small_reject_kernel[(rows,)](
+                input,
+                idx,
+                input.stride(0),
+                idx.stride(0),
+                WIDTH=input.shape[1],
+                REJECTS=rejects,
+                BLOCK_N=4096,
+                BLOCK_K=2048,
+                num_warps=4,
+            )
+            return
         parts = _stream_split_parts(rows, input.shape[1], topk, ragged)
         if parts > 1:
             # Stage 1 launches `rows * parts` blocks and stage 2 launches
