@@ -48,8 +48,8 @@ from aiter.int4_utils import (
     rearrange_4bit_elements,
 )
 from aiter.jit.core import (
-    AITER_CONFIG_FMOE,
     AITER_CONFIG_FHMOE,
+    AITER_CONFIG_FMOE,
     AITER_CONFIG_GROUPED_FMOE,
     AITER_CSRC_DIR,
     AITER_ROOT_DIR,
@@ -6488,11 +6488,14 @@ class FhmoeTuner(FmoeTuner):
                 / 10
             )
         else:
-            w1_dense = torch.randn(
-                (routed_expert, inter_dim, model_dim),
-                dtype=dtype,
-                device="cpu",
-            ) / 10
+            w1_dense = (
+                torch.randn(
+                    (routed_expert, inter_dim, model_dim),
+                    dtype=dtype,
+                    device="cpu",
+                )
+                / 10
+            )
         w2_dense = torch.randn(
             (routed_expert, model_dim, inter_dim), dtype=dtype, device="cpu"
         )
@@ -6513,9 +6516,7 @@ class FhmoeTuner(FmoeTuner):
             w1 = w1.view(w1_shape[0], w1_shape[1], w1_shape[2] // 2)
             w2 = w2.view(w2_shape[0], w2_shape[1], w2_shape[2] // 2)
         if TUNE_MOE_EXPERT_BALANCE:
-            score = torch.zeros(
-                (token, routed_expert), dtype=dtype, device="cpu"
-            )
+            score = torch.zeros((token, routed_expert), dtype=dtype, device="cpu")
             start_col = 0
             end_col = routed_topk
             for token_id in range(token):
@@ -6526,18 +6527,12 @@ class FhmoeTuner(FmoeTuner):
             routing_seed = os.environ.get("TUNE_MOE_ROUTING_SEED")
             if routing_seed is not None:
                 torch.manual_seed(int(routing_seed))
-            score = torch.randn(
-                (token, routed_expert), dtype=dtype, device="cpu"
-            )
+            score = torch.randn((token, routed_expert), dtype=dtype, device="cpu")
         shared_w1_dense = (
-            torch.randn(
-                (1, 2 * inter_dim, model_dim), dtype=dtype, device="cpu"
-            )
-            / 10
+            torch.randn((1, 2 * inter_dim, model_dim), dtype=dtype, device="cpu") / 10
         )
         shared_w2_dense = (
-            torch.randn((1, model_dim, inter_dim), dtype=dtype, device="cpu")
-            / 10
+            torch.randn((1, model_dim, inter_dim), dtype=dtype, device="cpu") / 10
         )
         with torch.device("cpu"):
             shared_w1, shared_w1_scale = FmoeTuner.weight_quant(
@@ -7134,7 +7129,14 @@ class FhmoeTuner(FmoeTuner):
             )
         if args.profile_file:
             profile_df = pd.DataFrame(profile_rows)
-            for col in ("act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type", "gate_mode"):
+            for col in (
+                "act_type",
+                "dtype",
+                "q_dtype_a",
+                "q_dtype_w",
+                "q_type",
+                "gate_mode",
+            ):
                 if col in profile_df.columns:
                     profile_df[col] = profile_df[col].map(self._csv_cell)
             if os.path.exists(args.profile_file):
@@ -7159,7 +7161,14 @@ class FhmoeTuner(FmoeTuner):
                 continue
             kn1, kn2, block_m, us, err = min(valid, key=lambda r: r[3])
             row = dict(zip(self.keys, key))
-            for col in ("act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type", "gate_mode"):
+            for col in (
+                "act_type",
+                "dtype",
+                "q_dtype_a",
+                "q_dtype_w",
+                "q_type",
+                "gate_mode",
+            ):
                 row[col] = self._csv_cell(row[col])
             row.update(
                 {
