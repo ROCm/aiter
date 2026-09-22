@@ -785,7 +785,9 @@ class MegaMoEGfx1250:
             # Compact cannot slice recv_x -- the rows are grouped per expert, not
             # token-major -- so the bound is spent on the geometry instead: it
             # picks the plan's alignment, the GEMM's tile and the GEMM's grid.
-            self._begin_compact_step(recv_token_bound)
+            self._begin_compact_step(
+                self._compact_recv_bound(token_count, recv_token_bound)
+            )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
             hidden_states, topk_weights, topk_ids
         )
@@ -893,6 +895,19 @@ class MegaMoEGfx1250:
     def __exit__(self, *exc):
         self.close()
 
+    def _compact_recv_bound(
+        self, token_count: int, recv_token_bound: int | None
+    ) -> int:
+        """Static safe recv bound for this step.
+
+        Dispatch deduplicates a token's routes to the same peer, so one rank can
+        receive at most ``world_size * token_count`` rows. Use that exact bound
+        when the caller did not provide a tighter graph bucket.
+        """
+        inferred = int(self._config.world_size) * max(1, int(token_count))
+        bound = inferred if recv_token_bound is None else int(recv_token_bound)
+        return max(1, min(bound, int(self._config.max_recv)))
+
     def _compact_plan_for(self, align_m: int, slot: int | None = None):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
@@ -933,7 +948,11 @@ class MegaMoEGfx1250:
             self._compact_plan_launches[key] = launch
         return launch
 
-    def warmup_compact_plan(self, recv_token_bound: int | None = None) -> None:
+    def warmup_compact_plan(
+        self,
+        recv_token_bound: int | None = None,
+        token_count: int | None = None,
+    ) -> None:
         """Compile the compact plan this bound needs, before any graph capture.
 
         The plan is compiled per tile alignment and the alignment follows the
@@ -944,7 +963,12 @@ class MegaMoEGfx1250:
         """
         if not self._compact_plan:
             return
-        self._begin_compact_step(recv_token_bound)
+        tok = (
+            int(self._config.max_tokens_per_rank)
+            if token_count is None
+            else int(token_count)
+        )
+        self._begin_compact_step(self._compact_recv_bound(tok, recv_token_bound))
         for slot in range(self._COMPACT_PLAN_SLOTS):
             self._compact_plan_for(self._compact_step_align_m, slot)
 
@@ -961,9 +985,12 @@ class MegaMoEGfx1250:
         """
         if not self._compact_plan:
             return
-        self._begin_compact_step(recv_token_bound)
+        token_count = int(topk_ids.shape[0])
+        self._begin_compact_step(
+            self._compact_recv_bound(token_count, recv_token_bound)
+        )
         self._launch_compact_plan_async(
-            topk_ids, int(topk_ids.shape[0]), self._compact_slot
+            topk_ids, token_count, self._compact_slot
         )
 
     def _prefetch_next_compact_plan(
@@ -977,8 +1004,11 @@ class MegaMoEGfx1250:
             self._compact_step_rows,
             self._compact_step_recv_bound,
         )
-        self._begin_compact_step(recv_token_bound)
-        self._launch_compact_plan_async(topk_ids, int(topk_ids.shape[0]), nxt)
+        token_count = int(topk_ids.shape[0])
+        self._begin_compact_step(
+            self._compact_recv_bound(token_count, recv_token_bound)
+        )
+        self._launch_compact_plan_async(topk_ids, token_count, nxt)
         (
             self._compact_step_align_m,
             self._compact_step_rows,
@@ -1206,7 +1236,31 @@ class MegaMoEGfx1250:
             config.world_size, dtype=torch.int32, device=device
         )
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        # Points at the quant op's own scale rows, set per dispatch on a quantizing
+        # Quantized dispatch reuses fixed buffers across layers and graph
+        # replays. The public quant wrapper allocates both tensors on every call;
+        # keeping them here removes allocator/capture nodes from the stage-1
+        # critical path without changing the quant kernel or wire format.
+        self._dispatch_quant_payload = None
+        self._dispatch_quant_scales = None
+        if config.is_quant_dispatch_wire:
+            payload_cols = (
+                config.dispatch_token_nbytes
+                // config.dispatch_wire_spec.quant_dtype.itemsize
+            )
+            self._dispatch_quant_payload = torch.empty(
+                (config.max_tokens_per_rank, payload_cols),
+                dtype=config.dispatch_wire_spec.quant_dtype,
+                device=device,
+            )
+            self._dispatch_quant_scales = torch.empty(
+                (
+                    config.max_tokens_per_rank,
+                    config.dispatch_scale_nbytes,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            ).view(dtypes.fp8_e8m0)
+        # Points at the persistent scale rows, set per dispatch on a quantizing
         # wire; 0 (and unread) on bf16.
         self._dispatch_sent_scales_ptr = 0
         self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1608,13 +1662,16 @@ class MegaMoEGfx1250:
             # copy on the far side. Destination-independent, so the bytes are the
             # same either way; the preshuffle cannot move with it, because its
             # destination is the grouped row the receiver assigns.
-            from aiter.ops.quant import per_1x32_mx_quant_hip
+            from aiter.ops.quant import dynamic_per_group_scaled_quant
 
-            payload, scale_rows = per_1x32_mx_quant_hip(
+            payload = self._dispatch_quant_payload[:token_count]
+            scale_rows = self._dispatch_quant_scales[:token_count]
+            dynamic_per_group_scaled_quant(
+                payload,
                 hidden_states,
-                quant_dtype=self._config.dispatch_wire_spec.quant_dtype,
-                scale_type=dtypes.fp8_e8m0,
-                shuffle=False,
+                scale_rows,
+                32,
+                shuffle_scale=False,
             )
             # Straight onto the wire; mori restrides these packed rows while it
             # stages them, so there is no repack here.
