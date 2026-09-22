@@ -33,7 +33,7 @@ IDEAL_PAGE_SIZE = 64
 SCALE_MODE_WIDE = 1
 
 # DeepSeek-V4.1's two-level indexer groups the context in 8-token candidate
-# blocks, which is what a fused block score is a maximum over.
+# blocks, default
 CANDIDATE_BLOCK = 8
 
 def mfma_nonk_dim(num_heads: int, head_size: int) -> int:
@@ -221,20 +221,14 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
             num_warps=1,
             num_buffers=1,
             waves_per_eu=3 if (compute_chunk or wide_decode) else 2,
-            # A second KV tile in flight. Worth its registers where there
-            # are registers to spare, and on a split page it also covers the
-            # longer address chain -- 1.11x on decode there, a spill and 1.3x
-            # the other way on a wide chunk, so decode only.
+            # A second KV tile in flight
             depth=2 if (wide_decode or (next_n == 1 and split_page)) else 1,
             # Two KV tiles per body. Speculative decode has the registers for
-            # it; a wide chunk does not -- at 64 heads it lands one over
-            # waves_per_eu = 3's budget and spills seven words, which costs
-            # 1.17-1.37x, and at 32 heads the second tile buys nothing.
+            # it; a wide chunk does not
             unroll=2 if (spec_rows and block_m <= 6) else 1,
             fold_asm=1 if (compute_chunk or spec_rows or num_heads > 32) else 0)
     else:
-        # LDS path, for an unshuffled cache. A second warp buys issue rate for a
-        # barrier per tile, worth it only where one warp cannot hold the fold.
+        # LDS path, for an unshuffled cache
         block_m = min(2 if (num_heads <= 32 and next_n >= 2) else 1, next_n)
         if next_n == 1:
             waves_per_eu = 2
@@ -258,26 +252,17 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
         n_per_tile=n_per_tile,
         # Workgroups to fill the machine: 4 SIMDs per CU
         target_wgs=4 * get_num_sms() * cfg["waves_per_eu"],
-        # Hoists the block-table read a tile past the KV prefetch. Off at 64
-        # heads, where the extra live value costs more than it buys -- unless
-        # the page is split, where it pays on decode and prefill but not on
-        # speculative decode, which has rows of fold to hide the read behind.
         page_pipe=1 if (num_heads <= 32
                         or (split_page and not 2 <= next_n <= SPEC_ROWS)) else 0,
         m_chunk=n_per_tile if (num_heads > n_per_tile and n_per_tile == 32) else 0,
         num_chains=1,
-        # Hoists the candidate-list read a tile past the KV prefetch, the way
-        # page_pipe hoists the block-table read. Only meaningful under `gather`.
+        # Only meaningful when we gather
         gather_pipe=1,
         relaxed_store=0 if clean_logits else 1,
-        # Follows FOLD_ASM rather than standing alone: without it the SLP
-        # vectorizer pairs the adds into v_pk_add_f32, which has no abs modifier.
+        # Follows FOLD_ASM rather than standing alone, requires unvectorized fma ops
         relu_add=cfg["fold_asm"],
         min_tiles_per_split=4,
-        # Cap on a workgroup's tiles. Loose at decode, where occupancy is in
-        # charge and 64 over-splits by 8-10% at 128K-365K; tight above one query
-        # row, where the row blocks already fill the machine and 128 would halve
-        # the split count for 1-14%.
+        # Cap on a workgroup's tiles
         max_tiles_per_split=128 if next_n == 1 else 64)
     return cfg
 
@@ -375,10 +360,10 @@ def paged_mxfp4_mqa_logits(
     cu_ends: torch.Tensor | None = None,
     gather: dict | None = None,
     block_scores: torch.Tensor | None = None,
-    block_scores_only: bool = False,
-    pin_newest: bool = False,
+    calc_logits: bool = True,
+    calc_block_scores: bool = False,
     candidate_block_size: int = CANDIDATE_BLOCK,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     This function computes the logits to be used by a topk function for sparse
     attention, from an MXFP4 query against a paged MXFP4 KV cache.
@@ -394,10 +379,10 @@ def paged_mxfp4_mqa_logits(
     kv_scale_cache: [NUM_PAGES, PAGE_SIZE, 1, HEAD_SIZE//32], dtype uint8, when the
                     scales are kept apart from the values rather than packed after
                     them. kv_cache is then the values alone
-    out_logits:     [B * NEXT_N, max_model_len], dtype float32, preallocated output.
-                    Must arrive filled with -inf when clean_logits is True
-    clean_logits:   bool. If True, positions row i does not attend to are explicitly
-                    written as -inf. If False those positions are unspecified
+    out_logits:     [B * NEXT_N, max_model_len], dtype float32. Allocated here if
+                    absent; a tensor you pass must arrive -inf under clean_logits
+    clean_logits:   bool. If True, positions row i does not attend to read as
+                    -inf, in either output. If False they are unspecified
     preshuffle:     bool. The cache is stored in dot-operand order (see
                     preshuffle_cache), which reads it straight into the matrix core.
                     If False it is read token-major and staged through LDS
@@ -416,60 +401,30 @@ def paged_mxfp4_mqa_logits(
                     output column j holds candidate slot j. context_lens and
                     block_table are unread on this path
     block_scores:   [B * NEXT_N, ceil(max_model_len / candidate_block_size)],
-                    dtype float32, optional. The two-level indexer's stage-A
-                    block scores, fused into this walk: block b of row i gets
-                    the maximum of that row's logits over columns
-                    [b*C, (b+1)*C), with the columns the row cannot attend to
-                    counted as -inf. Must arrive filled with -inf; blocks past
-                    the row's walk are left untouched. Emitted *unpinned* --
-                    upstream's +inf on the block holding the row's newest key
-                    is one element per row and belongs in a caller-side
-                    scatter, not in a compare per block inside the walk. Not
-                    available under gather: the producer walks densely
-    pin_newest:     bool. Force the block holding each row's newest key to +inf, so
-                    recent context is always a candidate whatever it scored. The
-                    reference model does this; leave it off to score honestly
-    block_scores_only: bool. Emit the block maxima *instead of* the logits
-                    rather than beside them: the logits store and its offset
-                    and predicate arithmetic leave the walk, and no
-                    [B * NEXT_N, max_model_len] tensor is allocated or
-                    written. The maxima are bit-identical to what the same
-                    launch produces with this off -- only the store is gone.
-                    Requires block_scores. See below for who wants it, what it
-                    buys, and what it hands back
+                    dtype float32. Allocated here if absent. Blocks [0,
+                    ceil(context_len / C)) are written, the tail past them is
+                    not -- clean_logits decides what it reads as, exactly as it
+                    does for the logits. The block holding each row's newest
+                    key is pinned to +inf, so recent context is a candidate
+                    whatever it scored
+    calc_logits:    bool, default True
+    calc_block_scores: bool, default False. With calc_logits off no
+                    [B * NEXT_N, max_model_len] logits tensor is allocated or
+                    written at all
     candidate_block_size: int, columns per candidate block. Must divide
                     BLOCK_KV so no block straddles a tile or a KV split
 
     Returns:
-    logits:         [B * NEXT_N, max_model_len], dtype float32 -- or, under
-                    block_scores_only, the caller's block_scores tensor
+                    logits, or block_scores, or both as a pair -- whichever was
+                    asked for
 
-    On block_scores_only
+    About block scores:
     --------------------
     It has one consumer: pass 1 of the two-pass producer. No indexer layer can
     use it alone, because every layer needs its own top-k and that needs
     logits. The producer layer runs this, ranks the maxima into a candidate
     pool, and then runs a second `gather` launch over that pool to recover its
-    own top-k -- which is exact, not approximate: a top-2048-of-8 pool
-    provably contains the layer's own top-512.
-
-    What it buys is the tensor that never exists. At 512 rows x 365K context
-    the dense fp32 logits are 748 MB neither allocated nor stored, and that
-    re-bases vLLM's prefill sub-chunker: it sizes a sub-chunk as
-    M = budget / 4 / N, and what a layer stores is the only thing that sets N,
-    so emitting [M, ctx/C] instead of [M, ctx] gives C times more rows per
-    sub-chunk -- 8x at C = 8, which is 23 launches down to 3 at 365K.
-
-    out_logits and clean_logits are rejected rather than ignored, both being
-    statements about a logits tensor this path does not have.
-
-    The return value is a deliberate ABI choice, not a fallout: the function
-    hands back the caller's `block_scores` tensor. It is the only output there
-    is, and returning it keeps `out = paged_mxfp4_mqa_logits(...)` meaning
-    "the thing this launch produced" in all four modes. The alternative --
-    returning None so that the sole output is unambiguously the out-param the
-    caller already holds -- was rejected because it makes the call site's shape
-    depend on a keyword flag.
+    own top-k.
 
     """
     # Gluon kernel for gfx950 only for now
@@ -515,48 +470,35 @@ def paged_mxfp4_mqa_logits(
     if preshuffle:
         cache_format(num_heads, head_size, page_size)  # validates the geometry
 
-    # One knob rather than two flags with a forbidden corner: 0 off, 1 maxima
-    # beside the logits, 2 instead of them. What is settled here is only whether
-    # a logits tensor exists; the BLOCK_KV shape checks are below.
-    bscore_on = 0 if block_scores is None else (2 if block_scores_only else 1)
-    assert not pin_newest or bscore_on, "pin_newest writes a block score"
-    if block_scores_only:
-        assert block_scores is not None, (
-            "block_scores_only needs the block_scores tensor it writes; it is "
-            "the launch's only output")
-        # Both of these are statements about a logits tensor, and on this path
-        # there is not one. Rejected rather than ignored: a caller that passed
-        # out_logits expecting it filled would get silence.
-        assert out_logits is None, (
-            "out_logits is inapplicable under block_scores_only: no logits are "
-            "written")
-        assert clean_logits, (
-            "clean_logits is inapplicable under block_scores_only: it asks how "
-            "to write the positions of a logits tensor this walk never writes")
+    assert calc_logits or calc_block_scores, "the launch would emit nothing"
+    bscore_on = (1 if calc_logits else 2) if calc_block_scores else 0
+    cand_block = int(candidate_block_size)
+    assert calc_logits or out_logits is None, (
+        "out_logits is inapplicable with calc_logits off: none are written")
+    assert calc_block_scores or block_scores is None, (
+        "block_scores is inapplicable with calc_block_scores off")
 
-    if bscore_on == 2:
-        # The point of the mode. At 512 rows x 365K context this is 748 MB
-        # neither allocated nor written, and it is what lets the caller's
-        # sub-chunker size itself on ceil(ctx / C) columns instead of ctx.
-        logits = None
-    elif out_logits is None:
-        shape = (batch * next_n, max_model_len)
-        logits = (torch.full(shape, float("-inf"), dtype=torch.float32,
-                             device=q.device) if clean_logits
-                  else torch.empty(shape, dtype=torch.float32, device=q.device))
-    else:
-        logits = out_logits
+    def _alloc(cols):
+        # clean_logits picks the fill for both outputs: the walk leaves the
+        # columns past the context untouched either way.
+        shape = (batch * next_n, cols)
+        if clean_logits:
+            return torch.full(shape, float("-inf"), dtype=torch.float32,
+                              device=q.device)
+        return torch.empty(shape, dtype=torch.float32, device=q.device)
+
+    logits = None
+    if calc_logits:
+        logits = out_logits if out_logits is not None else _alloc(max_model_len)
         assert logits.shape == (batch * next_n, max_model_len)
+    if calc_block_scores and block_scores is None:
+        block_scores = _alloc((max_model_len + cand_block - 1) // cand_block)
     if logits is not None:
         # A buffer store addresses the row through a 32-bit record count.
         assert max_model_len * 4 < 2 ** 31, (
             f"max_model_len {max_model_len} exceeds what a buffer store can "
             "address")
 
-    # `gather` is what build_gather returns: two int32 [B*next_n, blocks]
-    # tensors of resolved offsets, page address plus in-page offset. The kernel
-    # adds one per column and reads no block table. cu_ends is the walk length,
-    # in slots.
     gather_on = 1 if gather is not None else 0
     gather_block = int(gather["block"]) if gather_on else 8
     if gather_on:
@@ -573,16 +515,7 @@ def paged_mxfp4_mqa_logits(
     cfg = select_config(num_heads, head_size, next_n, page_size, preshuffle,
                         clean_logits)
     if gather_on:
-        # One query row per workgroup: above one row the walk is the rows'
-        # union and each store column comes from a per-block slot, neither of
-        # which the candidate addressing carries.
-        #
-        # Both pipeline knobs invert here. DEPTH pays the dense walk by covering
-        # its block-table read, and the gather has none -- so it only costs
-        # registers, 1.01-1.06x at 64 heads and 1.19-1.29x once the scale spill
-        # it causes is counted; it survives only on a split page. UNROLL goes
-        # the other way: BLOCK_M = 1 leaves the registers the dense path at 3
-        # does not have, worth 1.03-1.06x on a wide chunk.
+        # One query row per workgroup because of sparsity
         split_page = page_size > cfg["block_kv"]
         cfg = dict(cfg, block_m=1, row_blocks=next_n,
                    depth=2 if (next_n == 1 and split_page and num_heads <= 32)
@@ -599,10 +532,6 @@ def paged_mxfp4_mqa_logits(
     assert block_kv % n_per_tile == 0, (
         f"BLOCK_KV {block_kv} must be a multiple of the MFMA N ({n_per_tile})")
 
-    # The fused stage-A reduce. C divides BLOCK_KV, so a tile owns a whole
-    # number of candidate blocks and a KV split -- cut at BLOCK_KV granularity
-    # -- never splits one, which is what makes the block max purely local.
-    cand_block = int(candidate_block_size)
     if bscore_on:
         assert gather is None, (
             "block maxima are for the dense producer; the consumers gather")
@@ -626,8 +555,7 @@ def paged_mxfp4_mqa_logits(
         assert gather_block <= n_per_tile, (
             "a candidate block must sit inside one shuffle group")
         # The whole address is in the offsets here, so a cache past 2 GiB drops
-        # to 64-bit the way every other offset-addressed path does. The value
-        # list is in k_width units, so only the scale stream is capped.
+        # to 64-bit
         use_buffer_load = num_pages * max(kv_page_stride, kvs_page_stride) < 2 ** 31
 
     # The two that need the batch, which select_config does not see.
@@ -639,9 +567,7 @@ def paged_mxfp4_mqa_logits(
     cfg["kv_reread"] = 1 if row_blocks > 1 else 0
 
     num_kv_splits = cfg["num_kv_splits"]
-    # A gather launch does not build one: every row walks the same tile count,
-    # so there is nothing for a slice plan to even out and the build costs half
-    # a launch. An explicit schedule is still honoured.
+    # A gather launch does not build one
     if schedule is None and dynamic and not gather_on:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
                                   page_size, preshuffle, cu_ends=cu_ends)
@@ -715,10 +641,9 @@ def paged_mxfp4_mqa_logits(
         GATHER_PIPE=cfg["gather_pipe"] if gather_on else 0,
         BSCORE=bscore_on,
         BSCORE_BLOCK=cand_block if bscore_on else CANDIDATE_BLOCK,
-        PIN_NEWEST=int(pin_newest),
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
     )
-    # An ABI choice, argued in the docstring: block_scores is the only output
-    # this mode has, so it is what comes back.
-    return block_scores if bscore_on == 2 else logits
+    if calc_logits and calc_block_scores:
+        return logits, block_scores
+    return logits if calc_logits else block_scores

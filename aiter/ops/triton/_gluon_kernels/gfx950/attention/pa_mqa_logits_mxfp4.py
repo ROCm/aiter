@@ -1171,7 +1171,6 @@ def _pa_mqa_logits_mxfp4_kernel(
     BSCORE: gl.constexpr,        # 0 off, 1 block maxima beside the logits,
                                  # 2 block maxima and no logits store
     BSCORE_BLOCK: gl.constexpr,  # columns per candidate block
-    PIN_NEWEST: gl.constexpr,    # force the row's newest block to +inf
 ):
     gl.static_assert(BLOCK_KV % MFMA_NONK_DIM == 0)
     gl.static_assert(PAGE_SIZE % BLOCK_KV == 0,
@@ -1196,8 +1195,6 @@ def _pa_mqa_logits_mxfp4_kernel(
     gl.static_assert((BSCORE == 0) | (BSCORE == 1) | (BSCORE == 2),
                      "BSCORE is 0 off, 1 block maxima beside the logits, "
                      "2 block maxima instead of them")
-    gl.static_assert((PIN_NEWEST == 0) | (BSCORE != 0),
-                     "the pin writes a block score, so it needs BSCORE")
     # The producer walks densely and the consumers gather; no launch is both.
     # Static, not tested: the combination has no caller. It holds for BSCORE 2
     # as much as for 1 -- mode 2 is the *first* pass of a producer whose second
@@ -1318,7 +1315,7 @@ def _pa_mqa_logits_mxfp4_kernel(
                                       last_page_row, gv_ptr, gs_ptr, last_blk)
         _loop_with_lds(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
 
-    if PIN_NEWEST:
+    if BSCORE:
         # The row's newest block is a candidate whatever it scored. Out here
         # because it is one element per row. Written by the workgroup covering
         # that key -- the one whose reduce wrote it -- and keyed on `ends[r]`,

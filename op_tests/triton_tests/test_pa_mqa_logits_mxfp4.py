@@ -389,7 +389,7 @@ def block_scores_reference(logits, ends, block):
 
     Max rounds nothing and torch.amax propagates NaN the way the kernel's
     reduce does, so this is a bit-identity reference, not a tolerance one.
-    Unpinned: `pin_newest` is tested separately.
+    Pinned like the kernel: the block holding each row's newest key is +inf.
     """
     rows, width = logits.shape
     nb = (width + block - 1) // block
@@ -400,7 +400,11 @@ def block_scores_reference(logits, ends, block):
     col = torch.arange(nb * block, device=logits.device)
     x = torch.where(col[None, :] < ends[:, None], x,
                     torch.full_like(x, float("-inf")))
-    return x.reshape(rows, nb, block).amax(-1)
+    out = x.reshape(rows, nb, block).amax(-1)
+    live = ends > 0
+    out[torch.arange(rows, device=out.device)[live],
+        (ends[live].long() - 1) // block] = float("inf")
+    return out
 
 
 def row_ends(ctx_lens, next_n, cu_ends, device="cuda"):
@@ -415,7 +419,7 @@ def row_ends(ctx_lens, next_n, cu_ends, device="cuda"):
 
 
 def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
-                dynamic=0, cu_ends=None, only=False, pin_newest=False):
+                dynamic=0, cu_ends=None, only=False):
     """One launch of the fused reduce. `only` drops the logits store.
 
     Returns what the launcher returned and the score tensor -- which are the
@@ -429,10 +433,11 @@ def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
         st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
         st["block_table"], mml, preshuffle=preshuffle,
         clean_logits=clean_logits, dynamic=dynamic, cu_ends=cu_ends,
-        block_scores=bs, block_scores_only=only, candidate_block_size=block,
-        pin_newest=pin_newest)
+        block_scores=bs, calc_logits=not only, calc_block_scores=True,
+        candidate_block_size=block)
     torch.cuda.synchronize()
-    return out, bs
+    # "both" hands back a pair; the callers below want the logits half.
+    return (out if only else out[0]), bs
 
 
 def _bscore_arms(st, num_heads, next_n, block, **kw):
@@ -444,7 +449,7 @@ def _bscore_arms(st, num_heads, next_n, block, **kw):
     """
     logits, beside = _bscore_run(st, num_heads, next_n, block, **kw)
     ret, alone = _bscore_run(st, num_heads, next_n, block, only=True, **kw)
-    assert ret is alone, "block_scores_only must hand back its score tensor"
+    assert ret is alone, "calc_logits off must hand back the score tensor"
     return logits, beside, alone
 
 
@@ -483,33 +488,6 @@ def test_block_scores_knobs(shape, num_heads, dynamic, clean_logits):
     assert nd == 0, f"{nd} differing words"
 
 
-@pytest.mark.parametrize("shape", [BSCORE_SHAPES[1], BSCORE_SHAPES[2],
-                                   BSCORE_SHAPES[5]],
-                         ids=lambda s: s[0].replace(" ", "_"))
-@pytest.mark.parametrize("num_heads", [32, 64])
-@pytest.mark.parametrize("preshuffle", [1, 0])
-@pytest.mark.parametrize("block", [8, 32])
-def test_block_scores_pin_newest(shape, num_heads, preshuffle, block):
-    """`pin_newest` sets exactly the newest block and moves nothing else.
-
-    The unshuffled path above 32 heads runs two warps, so without the epilogue's
-    barrier the pin races the reduce and loses a different row each run.
-    """
-    _, batch, next_n, ctx_lens = shape
-    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64,
-                    preshuffle=preshuffle)
-    _, base = _bscore_run(st, num_heads, next_n, block, preshuffle)
-    _, got = _bscore_run(st, num_heads, next_n, block, preshuffle,
-                         pin_newest=True)
-    ends = row_ends(st["ctx"], next_n, None)
-    want = base.clone()
-    rows = torch.arange(want.shape[0], device=want.device)
-    live = ends > 0
-    want[rows[live], (ends[live].long() - 1) // block] = float("inf")
-    nd = _same_words(want, got)
-    assert nd == 0, f"{nd} differing words"
-
-
 @pytest.mark.parametrize("shape", BSCORE_SHAPES[:3],
                          ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
@@ -541,7 +519,7 @@ def test_block_scores_rejects_gather():
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
             st["block_table"], st["mml"], gather=meta, cu_ends=ends,
-            block_scores=bs)
+            block_scores=bs, calc_block_scores=True)
 
 
 def test_block_scores_needs_room():
@@ -552,7 +530,8 @@ def test_block_scores_needs_room():
     with pytest.raises(AssertionError, match="blocks wide"):
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], block_scores=bs)
+            st["block_table"], st["mml"], block_scores=bs,
+            calc_block_scores=True)
 
 
 # block maxima with no logits at all
@@ -563,7 +542,7 @@ def test_block_scores_needs_room():
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("block", [8, 32])
 @pytest.mark.parametrize("preshuffle", [1, 0])
-def test_block_scores_only(shape, num_heads, block, preshuffle):
+def test_scores_only(shape, num_heads, block, preshuffle):
     """The store-free mode must not move a maximum.
 
     Dropping the store frees registers and the scheduler reallocates, so check
@@ -585,7 +564,7 @@ def test_block_scores_only(shape, num_heads, block, preshuffle):
                          ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("dynamic", [0, 1])
-def test_block_scores_only_knobs(shape, num_heads, dynamic):
+def test_scores_only_knobs(shape, num_heads, dynamic):
     """The split plan must not move a maximum with the store gone either.
 
     No clean_logits axis: the mode rejects it rather than ignoring it.
@@ -603,7 +582,7 @@ def test_block_scores_only_knobs(shape, num_heads, dynamic):
 @pytest.mark.parametrize("shape", CU_ENDS_SHAPES,
                          ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("kind", ["compressed", "padded"])
-def test_block_scores_only_cu_ends(shape, kind):
+def test_scores_only_cu_ends(shape, kind):
     """The row bound still reaches the reduce with no store to share it with.
 
     The boundary's -inf select belongs to the block max, not to the store.
@@ -619,7 +598,7 @@ def test_block_scores_only_cu_ends(shape, kind):
 
 
 @pytest.mark.parametrize("block", [8, 16])
-def test_block_scores_only_nan(block):
+def test_scores_only_nan(block):
     """A poisoned e8m0 byte must still propagate with the store gone."""
     batch, next_n, page_size = 2, 1, 64
     st = _make_case(batch, next_n, 32, 128, [1024, 777], page_size)
@@ -635,7 +614,7 @@ def test_block_scores_only_nan(block):
     assert nd == 0, f"{nd} differing words"
 
 
-def test_block_scores_only_allocates_no_logits():
+def test_scores_only_allocates_no_logits():
     """The reason the mode exists: the [rows, ctx] tensor never happens.
 
     16 MB here, 748 MB at the producer's real shape -- absent, not small.
@@ -653,7 +632,8 @@ def test_block_scores_only_allocates_no_logits():
         base = torch.cuda.memory_allocated()
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], mml, block_scores=bs, block_scores_only=only)
+            st["block_table"], mml, block_scores=bs,
+            calc_logits=not only, calc_block_scores=True)
         torch.cuda.synchronize()
         return torch.cuda.max_memory_allocated() - base
 
@@ -663,42 +643,38 @@ def test_block_scores_only_allocates_no_logits():
     assert without < logits_bytes // 2, without
 
 
-def test_block_scores_only_needs_block_scores():
-    """There is nothing else for the mode to write."""
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    with pytest.raises(AssertionError, match="only output"):
-        paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], block_scores_only=True)
+@pytest.mark.parametrize("want_logits,want_scores",
+                         [(True, False), (False, True), (True, True)])
+def test_outputs_allocates(want_logits, want_scores):
+    """Every requested output comes back whether or not the caller owns it."""
+    st = _make_case(1, 4, 32, 128, [512], 64)
+    rows, mml = 4, st["mml"]
+    got = paged_mxfp4_mqa_logits(
+        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+        st["block_table"], mml, calc_logits=want_logits,
+        calc_block_scores=want_scores, candidate_block_size=8)
+    logits, scores = (got if want_logits and want_scores else
+                      (got, None) if want_logits else (None, got))
+    if logits is not None:
+        assert logits.shape == (rows, mml) and logits.dtype == torch.float32
+    if scores is not None:
+        assert scores.shape == (rows, mml // 8)
+        # every block inside the context was written, none is left unset
+        assert not (scores == float("-inf")).all(1).any()
 
 
-def test_block_scores_only_rejects_out_logits():
-    """A logits out-param the walk would never touch is a caller error."""
-    st = _make_case(1, 1, 32, 128, [512], 64)
-    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
-                    device=st["dev"])
-    out = torch.full((1, st["mml"]), float("-inf"), dtype=torch.float32,
-                     device=st["dev"])
-    with pytest.raises(AssertionError, match="out_logits is inapplicable"):
-        paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], out_logits=out, block_scores=bs,
-            block_scores_only=True)
-
-
-def test_block_scores_only_rejects_clean_logits():
-    """clean_logits asks how to write a tensor that does not exist here."""
+def test_block_scores_rejects_logits_only():
+    """A score tensor with nothing asked to write it is a caller error."""
     st = _make_case(1, 1, 32, 128, [512], 64)
     bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
                     device=st["dev"])
-    with pytest.raises(AssertionError, match="clean_logits is inapplicable"):
+    with pytest.raises(AssertionError, match="calc_block_scores off"):
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], clean_logits=False, block_scores=bs,
-            block_scores_only=True)
+            st["block_table"], st["mml"], block_scores=bs)
 
 
-def test_block_scores_only_rejects_gather():
+def test_scores_only_rejects_gather():
     """Mutual exclusion with the gather survives the third BSCORE value.
 
     Pass 1 of a producer whose pass 2 is a gather: two launches, never one.
@@ -712,4 +688,4 @@ def test_block_scores_only_rejects_gather():
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
             st["block_table"], st["mml"], gather=meta, cu_ends=ends,
-            block_scores=bs, block_scores_only=True)
+            block_scores=bs, calc_logits=False, calc_block_scores=True)
