@@ -6656,7 +6656,10 @@ class FhmoeTuner(FmoeTuner):
                 k_batch = kparams.get("k_batch", 1)
                 k_wave = kparams.get("k_wave", 1)
                 tile_k = kparams["tile_k"]
-                if k_batch != 1 or model_dim % k_batch != 0:
+                # Same stage1 k_batch cut as FmoeTuner.gen_flydsl_2stages_task:
+                # drop splits that do not divide K. INTERLEAVE (fp8 A) does not
+                # emit k_batch>1 today; when fp4 A does, keep legal split-k.
+                if model_dim % k_batch != 0:
                     continue
                 k_per_batch = model_dim // k_batch
                 if k_per_batch % tile_k != 0:
