@@ -25,9 +25,18 @@ guard and the optional FP8 epilogue. Do not hand-edit; see build_aiter_kernel.py
   sha256: 339400d8b376329c3a727e6c1258d5c43bf54d3147f5707d257ecd1db0e3c9ad
 """
 
-import torch  # noqa: F401  (kept for parity with the aiter op module layout)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+# Config-aware names so a trace row maps to the exact specialization
+# (aiter/ops/triton/README.md, "Config-aware kernel names in traces").
+# PAD_SLOT_ID is deliberately excluded: it is a protocol sentinel rather than a
+# tuning key, and make_kernel_repr does not sanitize the sign of a negative
+# value, so including it emits an invalid function identifier.
+_small_repr = make_kernel_repr("_fused_decode", ["BATCH", "INDEX64", "HAS_FP8"])
+_tiled_repr = make_kernel_repr("_fused_decode_tiled", ["B32", "INDEX64", "HAS_FP8"])
+_group_repr = make_kernel_repr("_decode_group", ["NW", "KL", "KS", "HAS_FP8"])
 
 
 @gluon.jit
@@ -323,7 +332,7 @@ def _quadrants(value):
     return q00, q01, q10, q11
 
 
-@gluon.jit
+@gluon.jit(repr=_small_repr)
 def _fused_decode(X, BA, History, State, Indices, Weight, Bias, ALog, DTBias,
                   NormWeight, Output, Quantized, Scales, scale, eps, quant_max,
                   KH: gl.constexpr, VH: gl.constexpr,
@@ -475,7 +484,7 @@ def _recurrent_tile(state, state_base, state_offset, q, k, v, decay, beta,
     return core
 
 
-@gluon.jit
+@gluon.jit(repr=_tiled_repr)
 def _fused_decode_tiled(X, BA, History, State, Indices, Weight, Bias, ALog, DTBias,
                         NormWeight, Output, Quantized, Scales, scale, eps, quant_max,
                         KH: gl.constexpr, VH: gl.constexpr,
@@ -621,7 +630,7 @@ def _conv_channels(
     return activated.to(gl.bfloat16).to(gl.float32)
 
 
-@gluon.jit
+@gluon.jit(repr=_group_repr)
 def _decode_group(
     Projection, BA, ConvState, State, Indices, ConvWeight, ConvBias,
     ALog, DtBias, NormWeight, Output, Quantized, Scales, scale, eps, fp8_max,

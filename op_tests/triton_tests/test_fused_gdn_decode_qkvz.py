@@ -218,11 +218,15 @@ def make_inputs(batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, see
 
 def _import_op():
     try:
-        from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
-            fused_gdn_decode_qkvz,
-        )
+        import triton.experimental.gluon  # noqa: F401
     except ImportError:
-        pytest.skip("fused_gdn_decode_qkvz not available")
+        pytest.skip("Triton Gluon not available")
+    # Deliberately not guarded: an ImportError raised from inside the op module
+    # is a broken op, and must fail rather than skip every kernel test below.
+    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
+        fused_gdn_decode_qkvz,
+    )
+
     return fused_gdn_decode_qkvz
 
 
@@ -340,6 +344,16 @@ def test_fused_gdn_decode_correctness(batch):
 
     torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
     torch.testing.assert_close(scales, ref_scales, atol=ATOL, rtol=ATOL)
+    # Compare FP8 in value space, not code space: a 1-ULP e4m3 code difference
+    # near the top of the range is huge as a raw integer and meaningless as a
+    # value. Dequantize with each side's own scale.
+    nv, hd = inp["num_v_heads"], inp["head_v_dim"]
+    torch.testing.assert_close(
+        quant.float().view(-1, nv, hd) * scales[:, :, None],
+        ref_quant.float().view(-1, nv, hd) * ref_scales[:, :, None],
+        atol=ATOL,
+        rtol=0.13,  # e4m3 has ~3 mantissa bits; this is the group-quant bound
+    )
     torch.testing.assert_close(
         inp["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
     )
@@ -358,6 +372,9 @@ def test_fused_gdn_decode_bf16_only():
     _requires_gfx950()
 
     inp = make_inputs(32)
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
     out, quant, scales = fused_gdn_decode_qkvz(
         inp["projected_qkvz"],
         inp["projected_ba"],
@@ -375,6 +392,18 @@ def test_fused_gdn_decode_bf16_only():
     )
     assert out.dtype == torch.bfloat16
     assert quant is None and scales is None
+
+    # HAS_FP8=False is a separate compiled specialization, so its bf16 output
+    # and state mutations need checking too -- not just that it returns None.
+    ref_norm, ref_q, ref_s = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    assert ref_q is None and ref_s is None
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        inp["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        inp["conv_state"].float(), ref_inp["conv_state"].float(), atol=ATOL, rtol=ATOL
+    )
 
 
 def test_fused_gdn_decode_pad_slot():

@@ -37,7 +37,9 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 # SGLang's convention for a padded CUDA-graph row; kernels skip these rows.
 PAD_SLOT_ID = -1
 
-_FP8_QUANT_MAX = {torch.float8_e4m3fn: 448.0, torch.float8_e4m3fnuz: 240.0}
+# gfx950 uses e4m3fn. e4m3fnuz is the gfx942 format and this op is gfx950-only,
+# so advertising it would promise a path that can never run.
+_FP8_QUANT_MAX = {torch.float8_e4m3fn: 448.0}
 _HEAD_DIM = 128
 # Batch at which the large-batch decomposition takes over. Measured crossover is
 # between 64 and 128: below it the latency-hiding path wins, above it the
@@ -54,6 +56,9 @@ def fused_gdn_decode_qkvz_supported(
     ssm_state_indices: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: Optional[torch.Tensor],
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
     quant_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[bool, str]:
     """Report whether this call is covered, and if not, why.
@@ -71,9 +76,13 @@ def fused_gdn_decode_qkvz_supported(
         ssm_state,
         ssm_state_indices,
         conv_weight,
+        conv_bias,
+        A_log,
+        dt_bias,
+        norm_weight,
     )
     if not all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
-        return False, "all inputs must be CUDA tensors"
+        return False, "every launch operand must be a CUDA tensor"
     if ssm_state.ndim != 4 or conv_state.ndim != 3:
         return (
             False,
@@ -84,6 +93,13 @@ def fused_gdn_decode_qkvz_supported(
     _, v_heads, head_v_dim, head_k_dim = ssm_state.shape
     if head_v_dim != _HEAD_DIM or head_k_dim != _HEAD_DIM:
         return False, f"head dims must be {_HEAD_DIM}, got {head_k_dim}/{head_v_dim}"
+
+    if conv_state.shape[0] != ssm_state.shape[0]:
+        return (
+            False,
+            "conv and recurrent pools must have the same slot count, got "
+            f"{conv_state.shape[0]} and {ssm_state.shape[0]}",
+        )
 
     channels = conv_state.shape[1]
     if (channels - v_heads * head_v_dim) % (2 * head_k_dim):
@@ -116,6 +132,24 @@ def fused_gdn_decode_qkvz_supported(
     bf16_args = (projected_qkvz, projected_ba, conv_state, conv_weight, conv_bias)
     if not all(t.dtype is torch.bfloat16 for t in bf16_args):
         return False, "packed projections, conv state/weight/bias must be bf16"
+    if A_log.shape != (v_heads,) or A_log.dtype is not torch.float32:
+        return (
+            False,
+            f"A_log must be fp32 [{v_heads}], got {A_log.dtype} "
+            f"{tuple(A_log.shape)}",
+        )
+    if dt_bias.shape != (v_heads,) or dt_bias.dtype is not torch.bfloat16:
+        return (
+            False,
+            f"dt_bias must be bf16 [{v_heads}], got {dt_bias.dtype} "
+            f"{tuple(dt_bias.shape)}",
+        )
+    if norm_weight.shape != (head_v_dim,) or norm_weight.dtype is not torch.bfloat16:
+        return (
+            False,
+            f"norm_weight must be bf16 [{head_v_dim}], got {norm_weight.dtype} "
+            f"{tuple(norm_weight.shape)}",
+        )
     if ssm_state_indices.dtype is not torch.int32:
         return False, f"state indices must be int32, got {ssm_state_indices.dtype}"
     if ssm_state_indices.shape != (tokens,):
@@ -123,8 +157,23 @@ def fused_gdn_decode_qkvz_supported(
             False,
             f"state indices must be [{tokens}], got {tuple(ssm_state_indices.shape)}",
         )
-    if not conv_state.is_contiguous() or not ssm_state.is_contiguous():
-        return False, "conv and recurrent state pools must be contiguous"
+    # The kernels address every one of these with flat pointer arithmetic, so a
+    # same-shaped strided view would be read from the wrong locations.
+    flat = {
+        "projected_qkvz": projected_qkvz,
+        "projected_ba": projected_ba,
+        "conv_state": conv_state,
+        "ssm_state": ssm_state,
+        "ssm_state_indices": ssm_state_indices,
+        "conv_weight": conv_weight,
+        "conv_bias": conv_bias,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "norm_weight": norm_weight,
+    }
+    non_contiguous = [name for name, t in flat.items() if not t.is_contiguous()]
+    if non_contiguous:
+        return False, f"operands must be contiguous: {', '.join(non_contiguous)}"
 
     if quant_dtype is not None and quant_dtype not in _FP8_QUANT_MAX:
         return False, f"unsupported quant dtype {quant_dtype}"
@@ -158,7 +207,10 @@ def fused_gdn_decode_qkvz(
         conv_state: [N, channels, 3] bf16, rolling conv window. **Mutated in place.**
         ssm_state: [N, VH, VD, KD] fp32, delta-rule state. **Mutated in place.**
         ssm_state_indices: [T] int32, row-to-slot map. Rows equal to
-            ``pad_slot_id`` are skipped entirely.
+            ``pad_slot_id`` are skipped entirely. **Every live row must name a
+            distinct, in-range slot**: each performs a read-modify-write on its
+            own state in a separate program, so duplicate live indices race and
+            are not supported.
         conv_weight: [channels, 4] bf16. conv_bias: [channels] bf16.
         A_log: [VH] fp32. dt_bias: [VH] bf16. norm_weight: [VD] bf16.
         scale: query scaling, typically ``head_k_dim ** -0.5``.
@@ -183,6 +235,9 @@ def fused_gdn_decode_qkvz(
         ssm_state_indices,
         conv_weight,
         conv_bias,
+        A_log,
+        dt_bias,
+        norm_weight,
         quant_dtype,
     )
     if not ok:
