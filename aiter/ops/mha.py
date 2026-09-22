@@ -10,8 +10,10 @@ from typing import Any
 import torch
 from torch import Generator, Tensor
 
+from .. import logger
 from ..jit.core import (
     AITER_CONFIGS,
+    AITER_LOG_TUNED_CONFIG,
     AITER_META_DIR,
     CK_DIR,
     ENABLE_CK,
@@ -167,7 +169,10 @@ def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     prefix = tuple(csv_scalar(hardware[field]) for field in MHA_FWD_HARDWARE_KEY_FIELDS)
     if prefix not in _mha_fwd_tuned_hardware(path):
         return None
-    return _load_mha_fwd_tuning_table(path).get(_mha_fwd_tuning_key(**key_args))
+    plan = _load_mha_fwd_tuning_table(path).get(_mha_fwd_tuning_key(**key_args))
+    if plan is not None and AITER_LOG_TUNED_CONFIG:
+        logger.info("MHA fwd matched a tuned row on %s in %s: %s", prefix, path, plan)
+    return plan
 
 
 def lookup_mha_fwd_tile_config(backend: str, **key_args) -> dict[str, Any] | None:
