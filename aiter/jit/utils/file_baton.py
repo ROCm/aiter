@@ -114,19 +114,14 @@ class FileBaton:
             return False
         except PermissionError:
             return True  # exists but owned by another user
-        # A zombie still answers signal 0, because its PID stays allocated
-        # until the parent reaps it. It has already exited, so it will never
-        # reach release() -- and if a builder dies under a parent that does
-        # not wait(), such as an orphan reparented to init during a killed
-        # test run, the lock it held wedges that module's build for every
-        # later process. Read the state directly and treat a zombie as dead.
+        # A zombie answers signal 0 until its parent reaps it, but has already
+        # exited and will never release(), wedging the build for everyone after.
         try:
             with open(f"/proc/{pid}/stat", "rb") as stat_file:
-                # The comm field can contain spaces and parentheses, so the
-                # state is the first field after the final ')'.
+                # comm may contain spaces and parens; state follows the last ')'
                 return stat_file.read().rpartition(b")")[2].split()[0] != b"Z"
         except (OSError, IndexError):
-            return True  # not Linux, or no procfs: keep the old behaviour
+            return True  # no procfs: trust the signal
 
     def _is_stale(self):
         """A lock is stale if its recorded holder is dead, or if it carries no
