@@ -1927,7 +1927,7 @@ def launch_gemm_a8w4_tdm_optimized(
     gemm2_schedule = all(
         (
             a_is_fp4,
-            K == 3072,
+            K in (2048, 3072),
             tile_n == 256,
             tile_k == 256,
             num_buffers == 4,

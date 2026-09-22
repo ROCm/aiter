@@ -3613,13 +3613,15 @@ def flydsl_moe_fused_quant_preshuffle(
                     os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH", "2")
                 )
                 use_target_tdm_defaults = (
-                    feat_dim == 3072 and rows_per_wave == 2 and prefetch_depth == 2
+                    feat_dim in (2048, 3072)
+                    and rows_per_wave == 2
+                    and prefetch_depth == 2
                 )
                 try:
                     rowgroup_tdm_chunks = int(
                         os.environ.get(
                             "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_TDM_CHUNKS",
-                            "6" if use_target_tdm_defaults else "0",
+                            str(feat_dim // 512) if use_target_tdm_defaults else "0",
                         )
                     )
                 except ValueError as exc:
