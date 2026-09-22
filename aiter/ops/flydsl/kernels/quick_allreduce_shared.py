@@ -16,7 +16,7 @@ import logging
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import rocdl
+from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from . import buffer_ops
@@ -258,3 +258,33 @@ def make_pack_storage(n_i32: int):
         pack: fx.Array[fx.Int32, n_i32, 16]
 
     return PackStorage
+
+
+def make_payload_tensor(*, padded, nbytes, hbm_i32_ptr, hbm_layout):
+    """The handle the atom load/store helpers address an HBM operand through.
+
+    ``num_records_bytes`` is the live payload, so a partial last tile reads 0
+    and its stores are dropped rather than faulting.
+
+    A padded build hands back a raw buffer descriptor; an unpadded one hands
+    back a tiled-copy tensor (layout + descriptor). The split is because a
+    padded build's pad lanes need a *per-lane* poke out of bounds, which the
+    tiled copy's layout-derived addresses cannot express -- only the raw
+    ``buffer_ops.buffer_load/store`` path takes a ``mask``. Unpadded builds are
+    untouched, so no shipped width changes codegen.
+
+    ``hbm_i32_ptr``/``hbm_layout`` are only read on the unpadded branch, so a
+    padded build may pass ``None`` for ``hbm_layout`` (it is never built there).
+    The one-shot, mesh and ring kernels all share this verbatim.
+    """
+
+    def _payload_tensor(ptr, records=None):
+        n = nbytes if records is None else records
+        if const_expr(padded):
+            return buffer_ops.create_buffer_resource_from_addr(
+                ptr, num_records_bytes=n
+            )
+        view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
+        return rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=n)
+
+    return _payload_tensor

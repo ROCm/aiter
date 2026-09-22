@@ -32,7 +32,7 @@ the op that receives it rather than waiting for the tile to be reassembled.
 import math
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp
 
@@ -202,6 +202,68 @@ def padded_row_block(
         f"coverage available here is {widest} atoms, which tops out at "
         f"{max_block * ATOM_ELEMS * widest} elements per row"
     )
+
+
+#: i32 words in one 16 B atom (``ATOM_ELEMS`` bf16 = 8 halves = 4 i32).
+ATOM_I32 = ATOM_ELEMS // 2
+
+
+def make_rowbuf_atom_row(
+    *,
+    atoms_per_row: int,
+    rows_per_tile: int,
+    row_stride_i32: int,
+    block: int,
+    hidden: int,
+    hbm_i32_ptr,
+    hbm_row_layout,
+    atom_i32: int = ATOM_I32,
+):
+    """Build a padded build's per-row buffer-tensor view, shared by all schedules.
+
+    Returns ``_rowbuf_atom_row(ptr_i64, tile, atom)`` -- a one-atom-wide row view
+    (``hbm_row_layout``) over a buffer descriptor whose base is the start of
+    *atom*'s column of *tile*'s row and whose ``num_records`` is the remaining
+    live bytes of that row. Pad columns (element index >= hidden) exceed
+    ``num_records`` for the descriptor, so a plain ``buffer_load_dwordx4`` returns
+    0 and a plain ``buffer_store_dwordx4`` is dropped by the hardware -- no
+    exec-mask split, no per-lane predicate arithmetic. This is the tiled-copy
+    equivalent of the old ``buffer_ops.buffer_load/store(mask=)`` path.
+
+    A fused tile is ``rows_per_tile`` token rows laid end to end, so the atom
+    index splits into a row ``r`` and an atom-within-row ``a`` via ``divmod``.
+    The row base strides by the *true* width (``row_stride_i32``); the column
+    inside it by the *padded* one -- which is the whole of the padding: the
+    tensor's rows stay where they are, only the workgroup gets wider. One-shot
+    passes ``atoms_per_row == atoms`` and ``rows_per_tile == 1``, so ``r == 0``
+    and ``a == atom`` -- the same single-row geometry it had before.
+
+    ``ptr_i64`` is the raw ``Int64`` base of the ``(M, hidden)`` operand;
+    ``atom`` is a trace-time constant, so its column offset and the live-byte
+    count fold at trace time and the descriptor base is one scalar add.
+    """
+
+    def _rowbuf_atom_row(ptr_i64, tile, atom):
+        r, a = divmod(atom, atoms_per_row)
+        # Trace-time: column byte offset of this atom within one row, and the
+        # bytes still live in the descriptor (clamped to 0 for a fully-OOB atom,
+        # which least-padding selection never produces but which stays safe).
+        atom_col_bytes = a * block * atom_i32 * 4
+        live_bytes = max(0, hidden * 2 - atom_col_bytes)
+        # Runtime: byte address of this atom's first element in this row. The row
+        # index is computed in i32 (small), then widened to i64 for the byte
+        # multiply so ``row * row_bytes`` cannot overflow at large M.
+        row = tile * fx.Int32(rows_per_tile) + fx.Int32(r)
+        row_byte_off = fx.Int64(row) * fx.Int64(row_stride_i32 * 4) + fx.Int64(
+            atom_col_bytes
+        )
+        buf_ptr = rocdl.make_buffer_ptr(
+            fx.inttoptr(hbm_i32_ptr, ptr_i64 + row_byte_off),
+            num_records_bytes=fx.Int64(live_bytes),
+        )
+        return fx.make_view(buf_ptr, hbm_row_layout)
+
+    return _rowbuf_atom_row
 
 
 def _quick_reduce_atoms_choices(world_size: int) -> tuple[int, ...]:
