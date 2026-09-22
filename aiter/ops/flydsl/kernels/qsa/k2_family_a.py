@@ -181,9 +181,6 @@ def build_qsa_k2_family_a_module(
             k: fx.Array[BFloat16, block_n * _D, 16]
             v: fx.Array[BFloat16, block_n * _D, 16]
             p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
-            live: fx.Array[Int32, block_n, 16]
-            phys: fx.Array[Int32, block_n, 16]
-            page_off: fx.Array[Int32, block_n, 16]
             m: fx.Array[Float32, _HEAD_PAD, 16]
             l: fx.Array[Float32, _HEAD_PAD, 16]
             alpha: fx.Array[Float32, _HEAD_PAD, 16]
@@ -196,9 +193,6 @@ def build_qsa_k2_family_a_module(
         class SharedStorage:
             kv: fx.Array[BFloat16, block_n * _K_STRIDE, 16]
             p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
-            live: fx.Array[Int32, block_n, 16]
-            phys: fx.Array[Int32, block_n, 16]
-            page_off: fx.Array[Int32, block_n, 16]
             m: fx.Array[Float32, _HEAD_PAD, 16]
             l: fx.Array[Float32, _HEAD_PAD, 16]
             alpha: fx.Array[Float32, _HEAD_PAD, 16]
@@ -276,9 +270,6 @@ def build_qsa_k2_family_a_module(
             )
         )
         p_lds = storage.p.view(fx.make_layout((_HEAD_PAD, block_n), (block_n, 1)))
-        live_lds = storage.live.view(fx.make_layout(block_n, 1))
-        phys_lds = storage.phys.view(fx.make_layout(block_n, 1))
-        page_off_lds = storage.page_off.view(fx.make_layout(block_n, 1))
         m_lds = storage.m.view(fx.make_layout(_HEAD_PAD, 1))
         l_lds = storage.l.view(fx.make_layout(_HEAD_PAD, 1))
         alpha_lds = storage.alpha.view(fx.make_layout(_HEAD_PAD, 1))
@@ -395,25 +386,18 @@ def build_qsa_k2_family_a_module(
             chunk_owner = _idiv(tid, Int32(block_n))
             col_i = base + col
             in_col = col_i < col_end
-            if chunk_owner == zero:
-                safe_col = in_col.select(col_i, col_start)
-                tok = indices[row, safe_col]
-                token_live = valid_req & in_col & (tok >= zero)
-                safe_tok = (tok >= zero).select(tok, zero)
-                logical_page = _idiv(safe_tok, page)
-                page_off_i = safe_tok - logical_page * page
-                table_live = logical_page < table_width
-                safe_logical_page = table_live.select(logical_page, zero)
-                phys = page_table[safe_req, safe_logical_page]
-                phys_live = (phys >= zero) & (phys < n_cache_blocks)
-                live = token_live & table_live & phys_live
-                phys_lds[col] = phys_live.select(phys, zero)
-                page_off_lds[col] = page_off_i
-                live_lds[col] = live.select(one, zero)
-            gpu.barrier()
-            safe_phys = phys_lds[col]
-            page_off_i = page_off_lds[col]
-            live = live_lds[col] != zero
+            safe_col = in_col.select(col_i, col_start)
+            tok = indices[row, safe_col]
+            token_live = valid_req & in_col & (tok >= zero)
+            safe_tok = (tok >= zero).select(tok, zero)
+            logical_page = _idiv(safe_tok, page)
+            page_off_i = safe_tok - logical_page * page
+            table_live = logical_page < table_width
+            safe_logical_page = table_live.select(logical_page, zero)
+            phys = page_table[safe_req, safe_logical_page]
+            phys_live = (phys >= zero) & (phys < n_cache_blocks)
+            live = token_live & table_live & phys_live
+            safe_phys = phys_live.select(phys, zero)
 
             v_frags = []
             if const_expr(decode_tr_pv):
@@ -587,7 +571,21 @@ def build_qsa_k2_family_a_module(
             score_lives = []
             for ng in range_constexpr(n_subtiles):
                 n = Int32(ng * 16) + lane_m
-                score_live = live_lds[n] != zero
+                if const_expr(token_major_v):
+                    score_live = live
+                else:
+                    col_i_n = base + n
+                    in_col_n = col_i_n < col_end
+                    safe_col_n = in_col_n.select(col_i_n, col_start)
+                    tok_n = indices[row, safe_col_n]
+                    token_live_n = valid_req & in_col_n & (tok_n >= zero)
+                    safe_tok_n = (tok_n >= zero).select(tok_n, zero)
+                    logical_page_n = _idiv(safe_tok_n, page)
+                    table_live_n = logical_page_n < table_width
+                    safe_logical_page_n = table_live_n.select(logical_page_n, zero)
+                    phys_n = page_table[safe_req, safe_logical_page_n]
+                    phys_live_n = (phys_n >= zero) & (phys_n < n_cache_blocks)
+                    score_live = token_live_n & table_live_n & phys_live_n
                 score_lives.append(score_live)
                 acc_sum = load_c_acc(ng, zero)
                 for w in range_constexpr(1, num_waves):
