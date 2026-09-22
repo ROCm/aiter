@@ -1170,6 +1170,54 @@ def test_mha_v4_zero_inputs_are_finite(q_format, v_format):
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "scale_modes"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16, {}),
+        (AttentionFormat.BF16, AttentionFormat.FP8, {}),
+        (AttentionFormat.INT8, AttentionFormat.FP8, {}),
+        (AttentionFormat.FP8, AttentionFormat.FP8, {}),
+        (
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            {
+                "q_scale_mode": AttentionScaleMode.E8M0_PER_1X32,
+                "k_scale_mode": AttentionScaleMode.E8M0_PER_1X32,
+                "v_scale_mode": AttentionScaleMode.F32_PER_TENSOR,
+            },
+        ),
+        (AttentionFormat.FP8, AttentionFormat.MXFP6, {}),
+        (AttentionFormat.MXFP6, AttentionFormat.FP8, {}),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6, {}),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP4, {}),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, {}),
+    ],
+)
+def test_mha_v4_empty_heads_are_finite(q_format, v_format, scale_modes):
+    """Sequence-parallel head padding leaves whole (batch, head) slices zero.
+
+    Only reachable with live heads alongside them: f6f8 returned NaN for exactly half its output
+    here, because its per-channel FP8 V quantizer divided by a zero amax while the populated heads
+    kept the tensor looking healthy.
+    """
+    torch.manual_seed(0)
+    q = torch.randn((1, 512, 4, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    for tensor in (q, k, v):
+        tensor[:, :, 2:] = 0
+
+    out = mha_v4(q, k, v, q_format, q_format, v_format, **scale_modes)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all(), (
+        f"{q_format.name}/{v_format.name} produced "
+        f"{int(torch.isnan(out).sum())} NaN on padded heads"
+    )
+    assert torch.count_nonzero(out[:, :, 2:]) == 0
+    assert torch.count_nonzero(out[:, :, :2]) > 0
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
 @pytest.mark.parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
 def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
