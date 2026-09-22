@@ -1576,8 +1576,8 @@ def _fused_moe_impl(
 def _pad_blockscale_act_scale(a1_scale, sorted_ids, topk):
     """Back the activation scale's tail with real memory for per_1x128.
 
-    WORKAROUND: should be fixed in asm kernel. 
-    
+    WORKAROUND: should be fixed in asm kernel.
+
     ``fmoe_fp8_blockscale_g1u1`` indexes the activation scale by
     ``sorted_ids // topk``, so it can touch row ``sorted_ids.numel() // topk``.
     ``sorted_ids`` is padded out to whole blocks per expert, so that bound
