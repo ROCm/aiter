@@ -102,14 +102,23 @@ def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
     # buffer_load_ubyte per byte instead of buffer_load_dwordx4.
     voff = pid * kv_stride + bn
     soff = pid * kvs_stride + bs
-    assert int((voff % K_WIDTH).max()) == 0, "value offsets must be k_width aligned"
-    voff = voff // K_WIDTH
     s_unit = gather_s_unit(block, num_scales)
-    assert int((soff % s_unit).max()) == 0, "scale offsets must be unit aligned"
-    assert int(voff.max()) < 2 ** 31 and int(soff.max()) < 2 ** 31, (
+    # Every bound this function checks, in one device-to-host transfer. They
+    # were a sync apiece, and the resolver already costs more than the launch
+    # it feeds.
+    v_mod, s_mod, p_mod, v_max, s_max = torch.stack(
+        [(voff % K_WIDTH).max(), (soff % s_unit).max(), (pos0 % block).max(),
+         voff.max() // K_WIDTH, soff.max()]).tolist()
+    assert v_mod == 0, "value offsets must be k_width aligned"
+    assert s_mod == 0, "scale offsets must be unit aligned"
+    # With page_size % block this keeps a block inside one shuffle group and one
+    # page, which is what makes this file's opening `c` term loop invariant. A
+    # misaligned start satisfies both checks above and reads the wrong bytes.
+    assert p_mod == 0, "positions must be block-aligned"
+    assert v_max < 2 ** 31 and s_max < 2 ** 31, (
         "resolved offsets are i32: the reachable cache is 2 GiB of scale bytes "
         "and 32 GiB of value bytes on this path")
-    return voff.to(torch.int32), (soff // s_unit).to(torch.int32)
+    return (voff // K_WIDTH).to(torch.int32), (soff // s_unit).to(torch.int32)
 
 
 def build_gather(positions, block_table, kv_cache, num_heads, head_size,
@@ -128,6 +137,7 @@ def build_gather(positions, block_table, kv_cache, num_heads, head_size,
     page_size, kv_stride, kvs_stride = cache_strides(kv_cache, head_size,
                                                      kv_scale_cache)
     assert page_size % block == 0 and block <= n_per_tile
+    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
     voff, soff = block_offsets(positions, block_table, page_size, head_size,
                                n_per_tile, kv_stride, kvs_stride, block,
                                preshuffle, scale_mode)

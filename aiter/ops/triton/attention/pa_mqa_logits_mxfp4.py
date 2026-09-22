@@ -89,6 +89,9 @@ def preshuffle_scales(x: torch.Tensor, n_per_tile: int,
     Both orders keep a token's scales at a constant stride inside a group, so
     both are addressable by a gather finer than the group.
     """
+    # Anything not 0 falls through to mode 1 here while the kernel reads
+    # anything not 1 as mode 0, so an out-of-range mode silently disagrees.
+    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
     WARP_SIZE = 64
     p, rows, ns = x.shape
     if scale_mode == 0:
@@ -102,6 +105,7 @@ def preshuffle_scales(x: torch.Tensor, n_per_tile: int,
 
 def unshuffle_scales(x: torch.Tensor, n_per_tile: int,
                      scale_mode: int = SCALE_MODE_WIDE) -> torch.Tensor:
+    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
     WARP_SIZE = 64
     p, rows, ns = x.shape
     if scale_mode == 0:
@@ -469,6 +473,7 @@ def paged_mxfp4_mqa_logits(
     """
     # Gluon kernel for gfx950 only for now
     assert arch_info.get_arch() == "gfx950", "gfx950 only"
+    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
 
     batch, next_n, num_heads, head_bytes = q.shape
     head_size = head_bytes * 2
