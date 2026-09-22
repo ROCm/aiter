@@ -2,30 +2,9 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Double-buffered implicit-GEMM conv3d (BF16), vendored into aiter.
+"""Double-buffered implicit-GEMM conv3d (BF16).
 
-Upstream is FlyDSL ``kernels/conv/conv3d_implicit.py`` and the public entry point
-still matches its keyword surface, but the body has diverged. aiter-only here:
-``buffer_atomic_add`` -- which upstream imports from ``kernels/common/``, a
-directory flydsl's wheel does not ship, as with the vendored ``buffer_ops``
-module. The tile heuristics and the offline tuned-config
-lookup are aiter-only too but live in ``../conv_kernels.py``, mirroring how
-``tuned_gemm.py`` sits outside ``kernels/gemm_a16w16_gfx950.py``. The NCDHW
-pre-transpose is a second kernel with its own cache, so it lives in
-``conv3d_transpose.py``; what the two share is in ``conv3d_gfx950_utils.py``.
-
-Launching goes through ``conv_kernels._dispatch`` rather than aiter's
-``tensor_shim._run_compiled``: keeping the launcher shape comparable to upstream
-is what makes a re-sync a readable diff, and a conv is launched once per layer
-rather than in a tight loop, so the per-call dispatch ``_run_compiled`` saves
-does not pay for that divergence.
-
-x: (N, C, D, H, W) bf16 NCDHW by default, weight: (K, C/groups, T, R, S) bf16 KCTRS.
-Returns (N, K, Do, Ho, Wo) bf16 by default. ``input_layout`` / ``output_layout`` select
-NCDHW or NDHWC independently; the GEMM itself is channels-last, so NDHWC input skips the
-pre-transpose and NDHWC output is the raw row-major (npq, K) the epilogue produces.
-Supports stride, padding (int, per-axis tuple, or torch's "same" / "valid"),
-padding_mode, dilation, bias, groups, and split-K.
+Dispatch lives in ``conv_kernels.py``; pre-transpose in ``conv3d_transpose.py``.
 """
 
 import functools
@@ -65,16 +44,7 @@ from .conv3d_im2col import Im2colGather, make_im2col_plan
 
 @fx.struct
 class Conv3dImplicitParam:
-    """One compiled conv3d: the problem it solves and the config it runs.
-
-    Every field is a compile-time constant -- the im2col div/mod folding
-    against the filter extents and C/groups is where this kernel's performance
-    comes from -- so one of these is one artifact, and it is the cache key
-    ``compile_conv3d_implicit`` is memoised on. ``dyn_hw`` is the one exception
-    and describes itself below. Build it through
-    ``make_conv3d_implicit_param``, which supplies the defaults fx.struct
-    cannot.
-    """
+    """Problem + launch config. Fields are compile-time; ``dyn_hw`` is the exception."""
 
     n: fx.Constexpr[int]
     c: fx.Constexpr[int]
@@ -101,18 +71,7 @@ class Conv3dImplicitParam:
     wgm: fx.Constexpr[int]
     groups: fx.Constexpr[int]
     out_ndhwc: fx.Constexpr[bool]
-    # Read the input's spatial extents at runtime instead of baking them in,
-    # so one artifact serves every resolution of the same layer. Costs the
-    # im2col decomposition a magic-number reciprocal per divisor in place of
-    # a folded immediate; see ``Divisor`` in conv3d_gfx950_utils.
-    #
-    # d/h/w stay in this struct because the host derives the geometry, the
-    # addressing decisions and the grid from them. What changes is that none of
-    # them reaches the kernel closure: the plans carry only the booleans they
-    # imply (``big_in``, ``vec_store`` and the rest) while the extents
-    # themselves arrive as ``ConvExtents``. The artifact is then keyed on a
-    # handful of booleans rather than on one resolution, which is what
-    # ``_assert_shape_agnostic`` checks.
+    # Runtime D/H/W; host still uses d/h/w to build geometry. Closure must not capture extents.
     dyn_hw: fx.Constexpr[bool]
 
 
@@ -144,11 +103,7 @@ def make_conv3d_implicit_param(
     out_ndhwc=False,
     dyn_hw=False,
 ):
-    """Conv3dImplicitParam with the defaults filled in.
-
-    fx.struct has no field defaults, so the ones a caller may leave out live
-    here, as ``make_gemm_a16w16_gfx950_param`` does for the GEMM.
-    """
+    """Defaults for ``Conv3dImplicitParam`` (fx.struct has none)."""
     return Conv3dImplicitParam(
         n=n,
         c=c,
@@ -180,23 +135,7 @@ def make_conv3d_implicit_param(
 
 
 def _shape_agnostic_key(grid, im2col_plan, scatter_plan):
-    """The compile-time constants a kernel closes over, with the booleans blanked.
-
-    What ``dyn_hw`` promises is that one artifact serves every resolution of a
-    layer. FlyDSL keys an artifact on the scalars the closure captures, so that
-    promise is exactly the statement that no captured scalar carries D/H/W --
-    which is what this reduces the three plans to, so two resolutions can be
-    compared for it.
-
-    Booleans are blanked rather than compared because they are the one thing
-    allowed to move: ``big_in``, ``t_aligned``, ``vec_store`` and the rest are
-    derived from the extents but only as predicates, so they split the layer
-    into a constant number of artifacts instead of one per resolution. An
-    *integer* that moves is the failure this exists to catch -- it would put
-    the resolution back in the key, and the mode would silently degrade to what
-    it was meant to replace, with nothing to show for it but a slower first
-    call per size.
-    """
+    """Closure constants with booleans blanked. Integers must not carry D/H/W."""
 
     def _blank(value):
         if isinstance(value, bool):
@@ -209,16 +148,7 @@ def _shape_agnostic_key(grid, im2col_plan, scatter_plan):
 
 
 def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan):
-    """Check ``dyn_hw``'s invariant against a second resolution of this layer.
-
-    Cheap enough to run on every variable-resolution compile: it re-derives the
-    three plans in Python for a probe resolution one output step larger and
-    compares the keys. Nothing is compiled.
-
-    A probe that the gather or the grid cannot express is not a failure of the
-    invariant -- it only means this layer is near one of the reach limits -- so
-    it is skipped rather than raised.
-    """
+    """Check dyn_hw plans match a probe one output step larger. Unexpressible probes skip."""
     st, sh, sw = param.st, param.sh, param.sw
     probe = make_conv3d_implicit_param(
         param.n,
@@ -277,25 +207,14 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan):
     )
 
 
-# One entry per (shape, launch config). A tuning sweep walks ~100 configs per
-# shape and several shapes land in the same worker process, so the upstream 256
-# would evict entries that the same process still needs.
+# Tuning walks ~100 configs per shape in one process; 256 would evict.
 @functools.lru_cache(maxsize=1024)
 def compile_conv3d_implicit(param: Conv3dImplicitParam):
-    # Only what sizes the GEMM and its grid. The filter extents, strides,
-    # padding and dilation belong to the gather, and the output layout and
-    # bias to the scatter; each reaches its own plan below from `param`
-    # directly, which is why none of them is unpacked here.
     c, k, groups = param.c, param.k, param.groups
 
     cfg = make_tile_config(param.tile)
     BLOCK_THREADS = cfg.block_threads
 
-    # The implicit GEMM this convolution is, derived once and shared with the
-    # gather so the grid the epilogue writes cannot drift from the one A is
-    # read against. `c` is the padded TOTAL channel count and stays the NDHWC
-    # row stride, while CGP is the per-group channel count the GEMM K axis
-    # decomposes against; the two coincide only when groups == 1.
     geom = make_conv_geometry(param)
     CGP = geom.cgp
 
@@ -327,34 +246,19 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     CRS = geom.crs
 
     if const_expr(param.dyn_hw):
-        # The extents leave the closure, so the grid has to be derivable from
-        # the scalars alone. M chunking folds a second axis into grid.z, which
-        # would need the chunk count as one more runtime value; it only
-        # engages past ~16M tiles, so requiring the flat case costs nothing
-        # real and keeps block_coords on its one dynamic input.
         assert grid.m_chunks == 1, (
             f"variable resolution needs a flat M grid, got {grid.m_chunks} chunks "
             f"for npq={geom.npq} at tile_m={cfg.tile_m}"
         )
         extra_args = dyn_shape_values(param, geom, grid)
         dyn_unit = unit_divisors(param, geom)
-        # What the kernel closes over, with the three fields the resolution
-        # moves blanked: grid_m arrives as a scalar and the launch sizes x and
-        # z from it, so a kernel that kept the real numbers here would be
-        # keyed on them and get one artifact per resolution after all.
         kernel_grid = grid._replace(grid_x=0, grid_z=0, grid_m=0)
-        # And that the rest of what the kernel closes over really is free of
-        # the resolution -- the property this whole mode rests on, and one
-        # that a new constant derived from an output extent would break
-        # silently, costing an artifact per size and nothing else.
         _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan)
     else:
         extra_args = ()
         dyn_unit = None
         kernel_grid = grid
-        # Bound here, so the kernel closes over the tuple rather than reading
-        # the extents off ``param`` at trace time -- ``param`` is an fx.struct
-        # and never reaches the cache key. See ``StaticInputExtents``.
+        # NamedTuple, not param.d/h/w: fx.struct is not in the cache key.
         static_in_ext = static_input_extents(param)
 
     elem_ty = fx.BFloat16

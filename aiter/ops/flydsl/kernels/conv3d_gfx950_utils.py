@@ -2,38 +2,9 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 #
-# ruff: noqa: B023
-# The scatter builds small closures over the tile loops and calls each one
-# inside the same iteration, so the loop variable always holds the current
-# value. Binding them as default arguments is not possible -- `bias_val` only
-# exists on the has_bias path -- and per-line waivers do not survive
-# `ruff format`, which moves the flagged column onto continuation lines.
+# ruff: noqa: B023  # scatter closures over tile loops; per-line waivers break under format
 
-"""What the conv3d kernels are assembled from, as ``gemm_a16w16_gfx950_utils.py``
-is for the GEMM.
-
-Four layers, in the order a kernel uses them:
-
-1. What the machine fixes rather than what this operator chose -- the MFMA
-   shape, the wave width, the vector widths a gfx950 load and an LDS write
-   come in, and thin wrappers over the rocdl intrinsics that spell a barrier,
-   a scalar broadcast or a buffer atomic.
-2. ``ConvGeometry``: the implicit GEMM's shape, as the convolution's own
-   implies it. Derived once and shared, because the gather, the grid and the
-   epilogue must all be sized by the same one.
-3. ``LaunchGrid`` / ``block_coords``: how the work is spread over blocks, and
-   what each block decodes to find the tile it owns.
-4. ``OutputScatterPlan`` / ``OutputScatter``: how C goes back to NCDHW.
-
-The gather that makes A look like a matrix is the one piece that did not fit
-here -- it is large enough to be its own module, ``conv3d_im2col.py``, which
-builds on this one. The tile sizes, the barrier interval and the pipeline
-depth are the algorithm's own and stay in ``conv3d_implicit_gfx950.py``.
-
-Running a compiled launcher is a host concern and lives in
-``../conv_kernels.py`` with the rest of the dispatch; only the stream coercion
-both launchers take is here.
-"""
+"""Shared pieces of the conv3d kernels (geometry, grid, scatter). Gather is in conv3d_im2col."""
 
 from typing import NamedTuple
 
@@ -55,11 +26,7 @@ BF16_BYTES = 2
 # moves per lane, and the width ds_write_b128 wants on the far side.
 LDG_VEC = 8
 
-# An offset no buffer descriptor can hold a record for, so the access is
-# dropped rather than performed: *2 = 0xFFFFFF00 bytes (~4.2950 GB), just under
-# the 2^32 a voffset spans. The gather sends a padded tap here to read zero,
-# and the epilogue a masked element to write nowhere -- in both cases turning
-# a predicate into an address, which needs no branch.
+# Predicate-as-address: OOB load/store via a voffset no descriptor can hold.
 OOB_SENTINEL_ELEM = 0x7FFFFF80
 OOB_SENTINEL_BYTES = OOB_SENTINEL_ELEM * BF16_BYTES
 
@@ -73,24 +40,12 @@ def _as_stream(stream):
 
 
 def buffer_atomic_add(vdata, rsrc, offset, soffset, aux):
-    """Buffer-resource atomic fadd (AMD ``raw.ptr.buffer.atomic.fadd``).
-
-    Upstream lives in flydsl's repo-level ``kernels/common/mem_ops.py``, which
-    its wheel does not ship, so aiter keeps this one-line equivalent alongside
-    the vendored ``buffer_ops`` / ``vector`` modules. Operates on a buffer
-    resource plus byte offset, not an ``!llvm.ptr``.
-    """
+    """Buffer-resource atomic fadd (``raw.ptr.buffer.atomic.fadd``)."""
     return fx.rocdl.raw_ptr_buffer_atomic_fadd(vdata, rsrc, offset, soffset, aux)
 
 
 def barrier(vmcnt=0, lgkmcnt=None):
-    """Wait on the named counters, then barrier.
-
-    Not gpu.barrier(): which counters this waits on is the whole point. The
-    caller names only the ones it needs, so the DMAs prefetching the next K
-    tiles stay in flight across the barrier instead of being drained by it.
-    Naming a counter here is a scheduling decision.
-    """
+    """Wait on the named counters, then barrier. Not ``gpu.barrier()``."""
     fx.rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
     fx.rocdl.s_barrier()
 
@@ -101,15 +56,7 @@ def sgpr(x):
 
 
 def flat_buffer_view(ptr, elems, num_records_bytes):
-    """A 1-D buffer view, on which ``slice(view, (None, off))`` is element ``off``.
-
-    Both the gather and the epilogue address their buffer by a flat element
-    index, so the view is one-dimensional over the buffer rather than the
-    tensor's own n-D layout: dividing that by a 1-element tile makes a slice
-    exactly one element, with no coordinate decomposition. ``elems`` only
-    shapes the view -- the sentinel above deliberately points past it, and
-    num_records, not the layout, is what turns that into a zero-fill.
-    """
+    """A 1-D buffer view: ``slice(view, (None, off))`` is element ``off``."""
     buf = fx.rocdl.make_buffer_ptr(ptr, num_records_bytes=num_records_bytes)
     return fx.logical_divide(
         fx.make_view(buf, fx.make_layout(elems, 1)), fx.make_layout(1, 1)
@@ -120,25 +67,8 @@ def in_range(v, hi):
     return (v >= 0) & (v < fx.Int64(hi))
 
 
-# ---------------------------------------------------------------------------
-# Variable resolution: the extents that stop being compile-time constants
-#
-# Folding im2col's div/mod against the output extents is where much of this
-# kernel's performance comes from, and folding needs a literal divisor -- so
-# one artifact belongs to one D/H/W. Where the resolution is arbitrary that
-# is a JIT per new size, which is the cost this exists to remove.
-#
-# Magic-number division is the way out: the divisor arrives as a runtime
-# value carrying its own reciprocal, and the decomposition stays a multiply
-# and a shift -- the two constants move from immediates into kernargs, which
-# is the whole of the difference. ``Divisor`` presents the folded and the
-# magic form behind one interface so the gather and the epilogue keep one
-# body between them.
-#
-# Only the *integers* need this. ``big_in``, ``vec_store`` and the rest of
-# the addressing decisions are booleans, and a boolean left in the cache key
-# costs a constant number of variants rather than one per resolution.
-# ---------------------------------------------------------------------------
+# Variable resolution: runtime extents via magic-number division (Divisor).
+# Booleans (big_in, vec_store, ...) stay in the cache key as a few variants.
 
 
 def magic_u32(d: int):
@@ -166,19 +96,7 @@ MAX_DYN_DIVIDEND = 1 << 31
 
 
 class Divisor:
-    """A divisor that is either a compile-time constant or a runtime value.
-
-    The static form holds a Python int and lets the compiler fold ``//`` and
-    ``%`` exactly as it did before this layer existed. The dynamic form
-    carries a magic reciprocal and a shift, which turns the same
-    decomposition into a multiply and a shift. Both answer ``divmod``, so no
-    call site has to branch on which one it got.
-
-    Not a NamedTuple, and it must never reach a cache key: the dynamic form
-    holds fx runtime values whose repr differs per trace, so a key containing
-    one would never hit. What the compiler needs to know about the choice is
-    carried by the ``dyn_hw`` boolean instead.
-    """
+    """Compile-time int or runtime magic reciprocal. Must not enter the cache key."""
 
     __slots__ = ("_magic", "_shift", "is_static", "value")
 
@@ -208,9 +126,7 @@ def static_divisor(value):
     return Divisor(int(value))
 
 
-# A divisor's reciprocal travels as one scalar rather than two: the shift is
-# under 32 and the magic under 2**32, so ``magic << RCP_SHIFT_BITS | shift``
-# fits an i64 and halves the number of kernargs the extents need.
+# Pack (magic, shift) into one i64 kernarg.
 RCP_SHIFT_BITS = 6
 RCP_SHIFT_MASK = (1 << RCP_SHIFT_BITS) - 1
 
@@ -258,34 +174,14 @@ def gather_valid(base, *masks):
 
 TILE_K = 32
 
-# K tiles consumed between two barriers. Each one is MI_M * MI_N MFMAs, and that
-# product is the only thing that hides global latency here -- the pipeline depth
-# cannot. Costs no LDS (the tiles are stages that already exist) and no extra
-# ds_read/DMA traffic; it just halves the number of barriers. Worth +8..16% on
-# the 3x3 conv2d/conv3d shapes at 2. Reaching the same ratio through TILE_K = 64
-# instead is a trap: it makes the LDS row stride 128B, exactly one bank rotation,
-# and the resulting ds_read_b128 conflicts cost more than the batching wins
-# (measured ~15% slower).
+# K tiles between barriers. TILE_K=64 is slower (LDS bank conflicts).
 TILES_PER_BARRIER = 2
 
 DEFAULT_TILE = (128, 128, 2, 4)
 
 
 def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
-    """Why this (TILE_M, TILE_N, WAVE_M, WAVE_N) cannot compile, or None.
-
-    The launch-config half of ``compile_conv3d_implicit``'s asserts, in a
-    function that costs nothing to call, so a candidate sweep can filter on it
-    instead of paying a compile per rejected config. ``conv3d_policy`` asks this
-    rather than carrying its own copy of the arithmetic: a copy that drifted
-    stricter would prune configs that would have compiled, which shows up as
-    neither an error nor a wrong answer, only as a tuned pick that could have
-    been faster.
-
-    Only the tile-shape constraints live here. c/groups and the channel padding
-    are properties of the problem, not of the launch config, so they stay as
-    asserts at their point of use.
-    """
+    """Why this tile cannot compile, or None. Problem-shape asserts stay at use sites."""
     block_threads = wave_m * wave_n * WARP_SIZE
     if block_threads > 1024:
         return f"BLOCK_THREADS={block_threads} exceeds 1024"
@@ -377,16 +273,7 @@ def weight_bytes(param, geom):
 
 
 class WeightLoader:
-    """B's counterpart to ``Im2colGather``, and much the smaller of the two.
-
-    ``_prep_weight`` already packed the filter as a (K, CRS) row-major matrix,
-    so a tap is one multiply-add rather than a coordinate decomposition -- the
-    asymmetry between this and the gather is the whole difference between an
-    implicit GEMM and a real one.
-
-    Two stages for the same reason the gather has them: the descriptor is the
-    kernel's, the columns are the block's.
-    """
+    """Load packed (K, CRS) weight. Kernel descriptor, then per-block columns."""
 
     def __init__(self, cfg, grid, crs, weight, w_bytes):
         # ``crs`` rather than the whole geometry: it is the only field this
@@ -513,14 +400,7 @@ class MmaTiling:
         )
         self.acc.fill(0.0)
 
-        # Each view's layout IS the coordinate, so partition_C hands back
-        # coordinates rather than data.
-        #
-        # They have to be indexed flat: acc is ((MFMA_C_VALUES, 1), MI_M, MI_N),
-        # and the hierarchical spellings trip a rank assertion in the layout
-        # algebra. Flat index is v + MFMA_C_VALUES * (mi + MI_M * ni); a lane
-        # holds one column and MFMA_C_VALUES consecutive rows per atom, so v = 0
-        # of atom (mi, ni) is all the epilogue needs.
+        # partition_C returns coordinates; index acc flat (layout rank assert).
         self.c_row = self._thr_mma.partition_C(
             fx.make_view(0, fx.make_layout((cfg.tile_m, cfg.tile_n), (1, 0)))
         )
@@ -579,15 +459,7 @@ class MmaTiling:
 
 
 class ConvGeometry(NamedTuple):
-    """The implicit GEMM's shape, as the convolution's own shape implies it.
-
-    A row is one output element, so there are ``npq = N * Do * Ho * Wo`` of
-    them, and the K axis is one group's filter footprint, ``crs``. That makes
-    this both what the gather maps between and what the grid and the epilogue
-    are sized by, which is why it is derived once and shared: two derivations
-    that drifted apart would put the epilogue on a different grid than the
-    gather, for no visible reason.
-    """
+    """Implicit GEMM shape (npq, crs). Derived once for gather, grid, and epilogue."""
 
     do: int
     ho: int
@@ -600,14 +472,7 @@ class ConvGeometry(NamedTuple):
 
 
 def out_extent(size, pad, dil, kernel, stride):
-    """One output axis of a convolution, by torch's rule.
-
-    The one copy of this. It decides ``npq``, so the host sizes the output
-    tensor by it, the kernel sizes its grid by it, and the tuner sizes the GEMM
-    it reports by it -- three places that must agree on what a stride or a
-    dilation does to an extent, or the epilogue writes a shape the caller did
-    not allocate.
-    """
+    """One output axis, torch's rule. The single copy used by host, kernel, and tuner."""
     return (size + 2 * pad - (dil * (kernel - 1) + 1)) // stride + 1
 
 
@@ -635,20 +500,7 @@ def make_conv_geometry(param):
 
 
 class ConvExtents:
-    """The extents the gather and the epilogue actually address against.
-
-    What separates this from ``ConvGeometry`` is when the values are known:
-    a ``ConvGeometry`` is compile-time and reaches the cache key, while this
-    is what the kernel body reads and may hold either Python ints or fx
-    runtime scalars. The field names and the division interface are the same
-    either way, which is what keeps one body across both.
-
-    ``static_extents`` copies a ``ConvGeometry`` straight across with folded
-    divisors, so a kernel that does not opt into variable resolution compiles
-    to what it did before this layer existed.
-
-    Never reaches a cache key, for the reason ``Divisor`` gives.
-    """
+    """Extents the gather/epilogue address against (ints or runtime scalars)."""
 
     __slots__ = (
         "d",
@@ -702,29 +554,7 @@ class ConvExtents:
 
 
 class StaticInputExtents(NamedTuple):
-    """The input's own extents, as a static kernel folds them in.
-
-    A NamedTuple, and that is load-bearing for correctness rather than for
-    tidiness. These values reach the kernel only through ``Conv3dImplicitParam``,
-    which is an ``fx.struct`` -- not a tuple, so FlyDSL's closure-scalar
-    collection skips it silently and nothing in it reaches the cache key. Every
-    other constant the kernel folds in travels in a NamedTuple (``ConvGeometry``,
-    ``Im2colPlan``, ``LaunchGrid``, ``OutputScatterPlan``) and is keyed on; the
-    input extents were the one exception.
-
-    What that cost: the gather bounds-checks its taps against ``d``/``h``/``w``,
-    while the key only carried the *output* extents (through ``ConvGeometry``)
-    and the grid. Two convolutions with the same output extents and different
-    input extents therefore shared one artifact -- and a strided one makes that
-    easy to hit, since floor division maps several input sizes onto one output
-    size. At stride 2 with a 3-tap filter and pad 1, d=7 and d=8 both give
-    do=4: whichever compiled first, the other ran its bounds, leaving the last
-    output plane reading past the end of the input (measured: 24.5% of elements
-    wrong, and correct again when either shape was compiled on its own).
-
-    So: keep this a NamedTuple, and do not fold a new input-side extent into the
-    kernel by reading it off ``param`` at trace time.
-    """
+    """Input extents folded into a static kernel. Must stay a NamedTuple (cache key)."""
 
     d: int
     h: int
@@ -842,26 +672,12 @@ def dyn_shape_values(param, geom, grid):
 
 
 def unit_divisors(param, geom):
-    """Which of the four dynamic divisors are 1, as a compile-time tuple.
-
-    A unit divisor keeps the folded form (see ``pack_reciprocal``), and which
-    ones are unit follows from the layer rather than the resolution -- a 2D
-    conv has ``d == 1`` at every size -- so putting these four booleans in the
-    cache key costs a constant number of artifacts.
-
-    Order matches ``dyn_extents``: (d, wo, hw_o, dhw).
-    """
+    """Which of (d, wo, hw_o, dhw) are 1. Layer-level, not resolution."""
     return (param.d == 1, geom.wo == 1, geom.hw_o == 1, geom.dhw == 1)
 
 
 def dyn_extents(s, unit=(False, False, False, False)):
-    """The runtime form, assembled from the scalars the kernel was handed.
-
-    ``s`` is a ``DynShapeArgs``: the host already derived every extent and
-    its magic reciprocal, so all this does is pair them into ``Divisor``s.
-    ``unit`` is ``unit_divisors``' answer, which decides per divisor between
-    the magic form and the identity the folded form collapses to.
-    """
+    """Runtime ConvExtents from DynShapeArgs + unit_divisors flags."""
     unit_d, unit_wo, unit_hw_o, unit_dhw = unit
 
     def _div(is_unit, value, rcp):
@@ -889,23 +705,7 @@ def dyn_extents(s, unit=(False, False, False, False)):
     )
 
 
-# ---------------------------------------------------------------------------
-# How the work is spread over blocks, and what each block owns
-#
-# Four independent things are folded onto three grid axes:
-#
-# - M over ``grid.x``, spilling into ``grid.z`` as "M chunks" when the tile
-#   count passes what one axis holds;
-# - N over ``grid.y``, over-provisioned to ``groups * tiles_per_group`` so a
-#   grouped conv's N tail is per group rather than global;
-# - split-K over the rest of ``grid.z``;
-# - and, when M fits one axis, a WGM swizzle over x/y that walks WGM rows of M
-#   before moving on in N, so concurrent blocks share B tiles.
-#
-# The grid, its limits and the decode share one arithmetic and so live
-# together: deriving the decode from anything but the grid it was launched
-# with is how a block ends up owning a tile nobody sized for.
-# ---------------------------------------------------------------------------
+# Grid: M on x (chunk into z if needed), N on y (per group), split-K on z, WGM swizzle.
 
 
 # A grid dimension is 32-bit in blocks on x and 16-bit on y/z; x is further
@@ -962,12 +762,7 @@ def make_launch_grid(param, geom, cfg):
 
     k_tiles = (geom.crs + tile_k - 1) // tile_k
     splitk = max(1, min(param.splitk, k_tiles))
-    # Every split has to take a whole number of K tiles. Where it does not,
-    # splitk * tiles_per_split < k_tiles and the tail tiles belong to no block at
-    # all: the K they carry is neither an error nor an out-of-bounds access, just
-    # missing from the sum. ``_resolve_splitk`` walks sk down until it divides, but
-    # the paths that bypass it -- AOT reads the CSV's splitK column straight -- have
-    # no such step, which is what makes this the last line of defence.
+    # splitK must divide k_tiles or the K tail is silently dropped.
     assert k_tiles % splitk == 0, (
         f"splitk={splitk} does not divide k_tiles={k_tiles}: splits would cover only "
         f"{splitk * (k_tiles // splitk)} of them and the rest of the K axis would be "
@@ -1025,18 +820,7 @@ class BlockCoords(NamedTuple):
 
 
 def block_coords(grid, grid_m=None):
-    """Decode this block's ids into the tile it owns.
-
-    ``n_local`` is the column within the group and ``n_offset`` the global
-    one; they differ only for a grouped conv, where the N grid is per group.
-    ``ch_base`` is the group's first input channel, which only the gather
-    needs, and is None when there is one group.
-
-    ``grid_m`` overrides the tile count along M, which the WGM swizzle needs
-    as a number. It is the one part of the grid that follows from the
-    resolution, so a variable-resolution kernel passes the runtime value and
-    everything else keeps reading the compile-time grid.
-    """
+    """Decode this block's tile. Pass runtime ``grid_m`` on the dyn_hw path."""
     if const_expr(grid_m is None):
         grid_m = grid.grid_m
     if const_expr(grid.m_chunks > 1):
@@ -1089,60 +873,20 @@ def block_coords(grid, grid_m=None):
     )
 
 
-# ---------------------------------------------------------------------------
-# The scatter: C back to a convolution's output
-#
-# The GEMM produces a (npq, K) tile; NCDHW wants it as (N, K, Do, Ho, Wo), so
-# a row has to be decomposed back into its sample and spatial position and the
-# store strides along K instead of along the row. That, plus what the tail of
-# an over-provisioned grid must not write, plus split-K accumulating into fp32
-# staging with atomics, is what ``store`` does.
-#
-# An NCDHW output, no split-K, an output a buffer descriptor still reaches and
-# a ``dhw`` that is a multiple of four let the four accumulator values of an
-# MFMA atom land contiguously; that case takes a single 64-bit store and every
-# other one stores element by element. The batch size does not enter into it --
-# the alignment is what keeps the four rows inside one sample. Which case
-# applies is decided once, in the plan.
-# ---------------------------------------------------------------------------
+# Scatter: (npq, K) tile back to NCDHW / NDHWC, plus split-K atomics.
 
 
-# Split-K accumulates through a buffer descriptor, whose num_records is a
-# 32-bit byte count, so the fp32 staging buffer has to fit one.
-#
-# The whole 2**32 is reachable, but only because every part of that address is
-# unsigned: ``OutputScatter.store`` computes the element offset in i64 and hands
-# the atomic an ``fx.Int32(off_sk * 4)``, which is a negative i32 past 2**31 --
-# the access still lands on the right byte, since the hardware reads voffset and
-# num_records as unsigned. This is the hard limit, and what
-# ``make_output_scatter_plan`` asserts against.
+# Split-K staging must fit a 32-bit buffer num_records (unsigned voffset).
 SPLITK_MAX_STAGING_BYTES = 0xFFFFFFFF
 
-# What ``_resolve_splitk`` will put a split on *by itself*. Half the window
-# above, and deliberately so: everything past 2**31 depends on the unsigned
-# reinterpretation described above, so a split nobody asked for does not go
-# there. Only an explicit ``splitk=`` from the caller, or a tuned CSV row, can
-# reach the rest of the window -- and either way it is a value someone measured.
-#
-# Written as its own constant rather than a bare literal next to the one above
-# because the two are not a copy that drifted: they are the hardware's limit and
-# the heuristic's, and a reader who assumes otherwise will "fix" one of them.
+# Heuristic cap: auto splitK stays under 2**31; explicit/CSV splitK may use the rest.
 SPLITK_AUTO_MAX_STAGING_BYTES = 0x7FFFFFFF
 
 
 class OutputScatterPlan(NamedTuple):
-    """What the epilogue knows before the kernel runs.
+    """Epilogue compile constants. NamedTuple so FlyDSL keys on the fields."""
 
-    A NamedTuple for the same reason ``Im2colPlan`` is one: FlyDSL keys a
-    compiled kernel on the scalar values its closure captures, and anything
-    that is not a scalar or a tuple silently drops out of that key.
-    """
-
-    # No field here carries the batch size. A row is split back into
-    # (sample, position) whenever the output is NCDHW, single sample or not:
-    # the divmod costs nothing measurable (a Wan 480x832 encode moved 0.0%),
-    # and making it unconditional is what keeps N out of the cache key
-    # entirely rather than costing two variants.
+    # N is not a field: NCDHW always splits a row into (sample, position).
     k: int
     kg: int
     groups: int
@@ -1205,14 +949,6 @@ def make_output_scatter_plan(param, geom, cfg, grid):
         # branch, but only where the store goes through a buffer descriptor:
         # split-K atomics and the 64-bit BIG_OUT path have no such address.
         route_store=need_chk and not use_splitk and not big_out,
-        # The four values of an MFMA atom are consecutive rows, so they are
-        # only contiguous in memory where a row's neighbour is the next
-        # spatial position: NCDHW, one store, no staging.
-        #
-        # A batch is fine, which is worth saying because it looks like it
-        # should not be. The four rows start at a multiple of 4 and dhw is
-        # required to be one just below, so they cannot straddle a sample,
-        # and their offsets stay contiguous whatever n is.
         vec_store=(
             (not use_splitk)
             and (dhw % MFMA_C_VALUES == 0)

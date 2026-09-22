@@ -1,40 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Offline tile tuner for the FlyDSL implicit-GEMM conv3d.
+"""Offline tile tuner for FlyDSL conv3d.
 
-Follows the csrc tuner pattern (like gemm_a16w16, ck_gemm_a8w8): read shapes
-from an untuned CSV, sweep the launch configs ``conv3d_policy`` enumerates for
-each shape, and write the winner to a checked-in tuned CSV that
-``conv_kernels._lookup_tuned_tile`` reads at runtime.
-
-Differences from the GEMM tuners, all forced by the operator rather than by
-preference:
-
-* **One backend.** There is no asm/CK/triton alternative for this kernel, so
-  there is no per-backend task builder and no ``--libtype`` flag. The tuned CSV
-  still carries a ``libtype`` column, as the GEMM tables do; this tuner always
-  writes ``flydsl`` into it.
-* **Explicit config columns instead of ``solidx``.** The whole launch config is
-  five integers. GEMM stores an index because its asm/CK kernel instances are
-  opaque; here an index would only add a way for a reordered candidate list to
-  silently invalidate a checked-in CSV.
-* **Subclasses ``TunerCommon``, not ``GemmCommonTuner``.** The latter hardcodes
-  ``M``/``N``/``K`` in ``sort_keys`` and unpacks the first five key columns in
-  ``calculate``; a 20-column conv key breaks both.
-
-Write winners into the per-model file, not the header-only canonical
-``aiter/configs/bf16_tuned_conv3d.csv`` (runtime merges model_configs/).
-
-Model tables are per model, so -i and -o name one::
+Reads an untuned CSV, sweeps ``conv3d_policy`` configs, writes winners to a
+per-model tuned CSV. One backend (``libtype=flydsl``), explicit tile columns
+(not solidx). Pass ``-i``/``-o``; the canonical pair is header-only.
 
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
         -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \\
         -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
-
-    python3 csrc/flydsl_conv3d/conv3d_tune.py \\
-        -i aiter/configs/model_configs/wan21_vae_bf16_untuned_conv3d.csv \\
-        -o aiter/configs/model_configs/wan21_vae_bf16_tuned_conv3d.csv
 """
 
 import os
@@ -122,11 +97,7 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
 
 
 def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
-    # splitk is passed rather than left to the dispatch to re-derive: the value
-    # the caller recorded is the value that runs, so the CSV's splitK column
-    # describes a measurement instead of a second derivation that happens to
-    # agree. The AOT pass compiles against that column, so a drift between the
-    # two would ship an artifact for a split nobody timed.
+    # Pass splitk so the CSV column is what ran, matching AOT.
     return flydsl_conv_implicit(
         x, weight, bias=bias, tile=tile, wgm=wgm, splitk=splitk, **params
     )
@@ -154,31 +125,12 @@ class Conv3dTuner(TunerCommon):
         "untune_file": "aiter/configs/bf16_untuned_conv3d.csv",
         "tune_file": f"{AITER_CONFIG_CONV3D_BF16}",
         "config_env_name": "AITER_CONFIG_CONV3D_BF16",
-        # Zero, not the common 0.05. The reference here is bf16 and so shares
-        # the kernel's rounding regime (see RTOL/ATOL), which puts every correct
-        # candidate at err_ratio 0 -- a nonzero one is a config that computes the
-        # wrong thing, most often a boundary tile it does not write. At 0.05 such
-        # a candidate is still eligible to win, and since the op test's own bar
-        # (ERR_TOL in test_flydsl_conv_implicit.py) is zero mismatched elements,
-        # the tuner would be writing rows that test then fails. --errRatio still
-        # raises it for a deliberate investigation.
+        # Zero: a nonzero err_ratio is a wrong config, and the op test bars at 0.
         "errRatio": 0.0,
     }
 
     def get_cu_num(self):
-        """The CU count the tuned rows are stamped with.
-
-        ``chip_info.get_cu_num()``, not ``TunerCommon``'s
-        ``torch.cuda.get_device_properties().multi_processor_count``:
-        ``_lookup_tuned_tile`` keys the runtime lookup on the former, so a row
-        written under the latter is one the runtime cannot find. They differ only
-        under ``CU_NUM`` or a CU partition -- and where they do, every shape in
-        the table misses at once and silently falls back to the heuristic tile.
-
-        Also what ``conv3d_policy`` enumerates against here, and what
-        ``conv_kernels._num_cu`` sizes the split-K and tile heuristics by, so the
-        candidate set and the shipped default agree with the runtime's own view.
-        """
+        """CU stamp for tuned rows: ``chip_info.get_cu_num()``, matching runtime lookup."""
         from aiter.jit.utils.chip_info import get_cu_num as _chip_get_cu_num
 
         return _chip_get_cu_num()
@@ -239,14 +191,7 @@ class Conv3dTuner(TunerCommon):
             self.untunedf = self.untunedf[~skip].reset_index(drop=True)
 
     def _check_shapes_expressible(self):
-        """Reject a row whose convolution has no output to compute.
-
-        A filter wider than its padded input gives an output extent of zero or
-        less. Nothing downstream says so: the policy's last relaxation still
-        returns candidates for it, and every one of them then dies on
-        ``_conv3d_impl``'s assert inside an mp worker, which surfaces as a
-        screen of failed tasks rather than as "this CSV row is impossible".
-        """
+        """Reject a row whose padded input is smaller than the filter."""
         if self.untunedf is None or self.untunedf.empty:
             return
         bad = []
@@ -264,13 +209,7 @@ class Conv3dTuner(TunerCommon):
 
     def pre_process(self, args):
         """Load untuned shapes, stamp the device keys, drop already-tuned rows."""
-        # Before anything is enumerated or a GPU is touched. Without it an
-        # unsupported arch is reported once per candidate, from inside an mp
-        # worker, and the one fact that matters -- this op is gfx950-only --
-        # arrives buried in a screen of failed tasks.
         _check_supported_arch()
-        # sortResults reorders against this file, and by then untunedf has had
-        # the already-tuned rows dropped, so keep the path rather than the frame.
         self._untune_file = args.untune_file
         if args.all:
             self.get_retune_gemm_list(args)
@@ -395,14 +334,7 @@ class Conv3dTuner(TunerCommon):
         return kernel_id if isinstance(kernel_id, str) else str(kernel_id)
 
     def calculate(self, results, bpes=(2, 2, 2)):
-        """TFLOPS and the bytes the conv actually moves.
-
-        FLOP is the GEMM formula unchanged, because implicit GEMM's dimensions
-        are exactly (N*Do*Ho*Wo, K/groups, C/groups*kT*kH*kW). Bandwidth is not:
-        the GEMM form assumes A is read once, while im2col gathers each input
-        element up to kT*kH*kW times. Counting tensor bytes instead keeps this
-        column comparable with the shape tables, not with the GEMM tuners'.
-        """
+        """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse)."""
         info, time, _err = results
         if time == self.INVALID_TIME or time in (0, self.INF_TIME):
             return 0, 0
@@ -460,14 +392,7 @@ class Conv3dTuner(TunerCommon):
         return pd.DataFrame(rows, columns=self.columns)
 
     def sortResults(self, tune_file, issorted, values):
-        """Leave the tuned table in the untuned table's row order.
-
-        The untuned tables list a model's shapes in encode->decode call order;
-        sorting the winners by key throws that away and makes every re-tune
-        reshuffle the file. Rank by the untuned row instead. Anything with no
-        untuned counterpart keeps the base key order, after the rows that have
-        one, so this only ever reorders and never drops.
-        """
+        """Keep tuned rows in the untuned CSV's order."""
         super().sortResults(tune_file, issorted, values)
 
         path = getattr(self, "_untune_file", None)
@@ -515,15 +440,7 @@ class Conv3dTuner(TunerCommon):
 
     @staticmethod
     def _ramp_clocks(seconds=2.0):
-        """Hold the GPU busy until the clocks settle, before anything is timed.
-
-        The compare gate reads the pre-tune benchmark on a device that has been
-        idle and the post-tune one right after a sweep has hammered it, so
-        without this the two halves are measured at different clock states and
-        every verdict carries that bias. Observed at up to 2.1x on the same
-        config and the same shape, which is far larger than the 3% the gate
-        decides on.
-        """
+        """Busy-wait so pre/post-tune clocks match."""
         a = torch.randn((4096, 4096), device="cuda", dtype=torch.bfloat16)
         deadline = time.time() + seconds
         while time.time() < deadline:
@@ -567,12 +484,7 @@ class Conv3dTuner(TunerCommon):
                         out, us = out_i, us_i
                 ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
                 ok = torch.allclose(out, ref, rtol=RTOL, atol=ATOL)
-                # e2e only, and no kernel_us: run_perftest times the whole call
-                # on the host, which for this op includes the NCDHW->NDHWC
-                # transpose and the weight repack. Reporting that figure a
-                # second time under "Kernel(us)" would put a number in a column
-                # it does not measure; the base reporter drops the column when
-                # nobody fills it.
+                # e2e only: run_perftest includes transpose and weight repack.
                 results.append(
                     {
                         "shape": shape,

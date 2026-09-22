@@ -1,25 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""The im2col side of the implicit-GEMM conv3d.
-
-An implicit GEMM differs from an ordinary one in one place only. B is a plain
-(N, K) matrix, but A is not a matrix at all: each of its (row, k) entries is a
-tap into NDHWC input, reached by decomposing the row into (n, ot, oh, ow) and
-k into (c, kt, kh, kw). This module owns that decomposition and the addressing
-it implies, which is what lets the main loop in ``conv3d_implicit_gfx950``
-read like the one in ``gemm_a16w16_gfx950``: its ``async_load_a_to_lds`` walks
-the taps of a K tile and issues one DMA each, and never mentions a
-convolution.
-
-Geometry against addressing is where the split falls. The output extents, npq
-and CRS belong to the caller -- the grid and the epilogue are shaped by them
-too, so they are derived once there and passed in. What lives here is what
-only the gather cares about: the tap fixup each padding mode implies, the
-div/mod folding of the K axis against C/groups and the filter extents, and the
-buffer descriptors, including the rebasing a 32-bit voffset needs when the
-input outgrows what one can reach.
-"""
+"""Im2col gather for implicit-GEMM conv3d: tap addressing, padding, buffer rebasing."""
 
 from typing import NamedTuple
 
@@ -56,30 +38,9 @@ def _bytes_of(elems):
 
 
 class Im2colPlan(NamedTuple):
-    """What one conv's gather knows before the kernel runs.
+    """Gather compile constants. NamedTuple so FlyDSL keys on the fields."""
 
-    Every field is a compile-time constant -- folding the div/mod of the K axis
-    against the filter extents and C/groups is where much of this kernel's
-    performance comes from -- so a plan belongs to one compiled artifact.
-    Build it with ``make_im2col_plan``, which derives the addressing decisions
-    and asserts what this gather cannot express.
-
-    A NamedTuple rather than a dataclass, and that is load-bearing: FlyDSL
-    keys a compiled kernel on its source plus the *scalar* values its closure
-    captures, where scalar means int/float/bool/str/None/tuple/Enum. An
-    ordinary object is not one, so a plan held as anything else would drop
-    every constant in it out of the cache key, and two convolutions that
-    differ only in padding mode or dilation would silently share one binary.
-    """
-
-    # Input and filter. Flat rather than the param struct they come from,
-    # because only tuples and scalars reach the cache key (see above).
-    #
-    # The input's spatial extents are deliberately absent: they are the one
-    # part of the problem that a variable-resolution kernel reads at runtime,
-    # so they travel in ``ConvExtents`` instead. Holding them here would put
-    # them back in the cache key and give every resolution its own artifact,
-    # which is what that mode exists to avoid.
+    # Spatial extents live in ConvExtents, not here (dyn_hw cache key).
     c: int
     kh: int
     kw: int
@@ -119,17 +80,7 @@ class Im2colPlan(NamedTuple):
 
 
 def make_im2col_plan(param, geom, cfg):
-    """An Im2colPlan for one problem and launch config, or an assertion.
-
-    Takes the problem as the ``Conv3dImplicitParam`` the caller already has, and
-    the output geometry as the ``ConvGeometry`` it already derived, so the two
-    cannot disagree with what the rest of the kernel was built against.
-
-    The asserts here are the ones about reach: whether the input fits what a
-    buffer descriptor addresses, on its own and as rebased per sample or per
-    tile. They are the gather's, not the launch config's, so they cannot move
-    into ``validate_launch_config``.
-    """
+    """Im2colPlan, or an assertion about gather reach."""
     tile_m, tile_k = cfg.tile_m, cfg.tile_k
     n, c, d, h, w = param.n, param.c, param.d, param.h, param.w
     kt, kh, kw = param.kt, param.kh, param.kw
@@ -155,13 +106,7 @@ def make_im2col_plan(param, geom, cfg):
     big_in_nm = big_in and n > 1
     x_sample_elems = c * d * h * w
 
-    # n > 1 rebases the descriptor once per sample, so a tap can sit anywhere in
-    # the sample and the whole sample has to fit the 2 GB num_records -- unlike
-    # the per-tile rebasing below, whose reach is bounded by the tile. Without
-    # this check, taps past 2 GB fall outside num_records and read as zero, which
-    # is silently wrong rather than an error. Note how little room that leaves:
-    # BIG_IN needs n * sample > 2 GiB of elements, so at n == 2 the only sample
-    # size that both trips BIG_IN and fits is exactly 2 GB.
+    # n>1 rebases per sample; the whole sample must fit BIG_IN_NR.
     assert not big_in_nm or x_sample_elems * BF16_BYTES <= BIG_IN_NR, (
         f"batched input sample too large for the 32-bit gather: one sample spans "
         f"{x_sample_elems * BF16_BYTES / 2**30:.2f} GiB, past the "
@@ -231,15 +176,7 @@ def make_im2col_plan(param, geom, cfg):
 
 
 class Im2colGather:
-    """The gather of one kernel, then of one block.
-
-    Two stages because the kernel's input descriptor and the block's rows are
-    fixed at different points: build this where the other buffer descriptors
-    are built, and ``bind_block`` once the block knows its own ``m_offset``,
-    which is all that decides which output element each A vector belongs to.
-    ``taps`` then walks a K tile, handing back the source and offset of every
-    A vector for the caller to DMA.
-    """
+    """Gather: bind kernel descriptor, then the block's rows."""
 
     def __init__(self, plan, x, ext):
         self._plan = plan
@@ -347,18 +284,7 @@ class Im2colGather:
         return rows
 
     def _pad_coord(self, v, extent, pad):
-        """Tap coordinate -> in-bounds input coordinate; returns (coord, mask).
-
-        "zeros" leaves the coordinate alone and returns a range mask, which the
-        caller folds into the OOB-sentinel routing so the load reads as zero. Every
-        other mode resolves the coordinate into [0, extent) instead and returns no
-        mask.
-
-        ``extent`` is one of the input's spatial sizes, so it is a literal on the
-        static path and a runtime scalar under variable resolution. Every term it
-        appears in is built through fx, which folds back to the same immediates
-        when it is a literal.
-        """
+        """Tap -> in-bounds coord. zeros: range mask; other modes wrap into [0, extent)."""
         pad_mode = self._plan.pad_mode
         ext_i = fx.Int64(extent)
         if const_expr(pad_mode == "zeros"):
@@ -382,14 +308,7 @@ class Im2colGather:
         return r, None
 
     def _tap_addr(self, i, kbase_i, cc_base, ckk_base):
-        """A vector ``i`` of this K tile as (element offset, valid, sample).
-
-        The K axis decomposes against CGP (per-group channels) while every
-        offset below keeps ``c`` (padded total channels) as the NDHWC row
-        stride. ``cc`` is the absolute input channel: the group base plus the
-        offset within the group. ``sample`` is which sample to rebase on, and
-        only the per-sample descriptor path has one.
-        """
+        """Vector ``i`` of this K tile: (element offset, valid, sample)."""
         plan, ext = self._plan, self._ext
         dec = self._rows[i]
         local_k = dec[0]

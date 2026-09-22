@@ -2,23 +2,10 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Host entry point for the FlyDSL implicit-GEMM convolution.
+"""Host entry for the FlyDSL implicit-GEMM convolution (no DSL).
 
-Everything between a caller's torch tensors and the compiled kernel: the
-keyword surface and its validation, layout and padding normalisation, the
-weight repack cache, the split-K decision, and the rank dispatch that sends a
-call to the 1-D, 2-D or 3-D path. Nothing here emits DSL.
-
-Split out of ``kernels/conv3d_implicit_gfx950.py`` so that module is the kernel and
-its compile, the way ``gemm_kernels.py`` sits in front of
-``kernels/gemm_a16w16_gfx950.py``.
-
-x: (N, C, D, H, W) bf16 NCDHW by default, weight: (K, C/groups, T, R, S) bf16 KCTRS.
-Returns (N, K, Do, Ho, Wo) bf16 by default. ``input_layout`` / ``output_layout`` select
-NCDHW or NDHWC independently; the GEMM itself is channels-last, so NDHWC input skips the
-pre-transpose and NDHWC output is the raw row-major (npq, K) the epilogue produces.
-Supports stride, padding (int, per-axis tuple, or torch's "same" / "valid"),
-padding_mode, dilation, bias, groups, and split-K.
+x: (N, C, D, H, W) bf16 NCDHW by default, weight: (K, C/groups, T, R, S) bf16.
+Returns (N, K, Do, Ho, Wo) bf16. Layouts NCDHW/NDHWC are independent.
 """
 
 import functools
@@ -54,20 +41,8 @@ from .kernels.conv3d_transpose import (
 # Which cards this op runs on
 # ---------------------------------------------------------------------------
 
-# TILE_K = 32 makes the MMA ``mfma_f32_16x16x32_bf16``, which is CDNA4 and
-# nothing else: gfx942 has no K=32 bf16 MFMA to fall back to, so a call there
-# does not run slowly, it dies inside the compile or assembles an instruction
-# the card does not have -- neither of which names the arch as the reason.
-#
-# A positive allow-list rather than a deny-list of the archs known to lack it:
-# an unsupported card that nobody thought of should be told so, not find out by
-# executing an illegal instruction.
-#
-# Checked at the public entry point, which means the 1x1 ``torch.matmul`` fast
-# path below is refused on an unsupported card too, even though it would have
-# run. That is deliberate: one op answers for one set of cards, and a surface
-# where some shapes work and others fail inside the compiler is worse to use
-# than one that says no.
+# TILE_K=32 is mfma_f32_16x16x32_bf16 (CDNA4). Allow-list so an unsupported
+# card fails at the entry, including the 1x1 matmul path.
 SUPPORTED_GFX = ("gfx950",)
 
 
@@ -75,10 +50,7 @@ def _check_supported_arch():
     """Refuse an arch whose MFMA this kernel is written against, before compiling."""
     from aiter.jit.utils.chip_info import get_gfx
 
-    # ``get_gfx()`` rather than ``get_gfx_runtime()``: it is what the tuned
-    # table, the tuner's stamp and the rest of this module already answer to,
-    # and it is memoised, so this costs nothing per call. Feature suffixes
-    # (``gfx950:sramecc+``) are dropped first.
+    # get_gfx matches the tuned table / tuner stamp; strip feature suffixes.
     gfx = get_gfx().split(":", 1)[0]
     if gfx not in SUPPORTED_GFX:
         raise RuntimeError(
@@ -88,16 +60,9 @@ def _check_supported_arch():
         )
 
 
-# ---------------------------------------------------------------------------
-# Offline tuned launch configs: the runtime counterpart to
-# csrc/flydsl_conv3d/conv3d_tune.py. It reads the rows that tuner writes and
-# hands the dispatch below the tile and WGM to launch with, or falls back to
-# the heuristic when this shape was never tuned on this device.
-# ---------------------------------------------------------------------------
+# Tuned launch configs from csrc/flydsl_conv3d/conv3d_tune.py.
 
-# Column order of the bf16_untuned_conv3d family header, and therefore of the
-# lookup key. Single source for the three readers of that CSV: this lookup,
-# csrc/flydsl_conv3d/conv3d_tune.py, and aiter/aot/flydsl/conv.py.
+# Lookup key = untuned CSV header. Shared with the tuner and AOT.
 TUNED_KEY_COLUMNS = (
     "N",
     "C",
@@ -123,15 +88,7 @@ TUNED_KEY_COLUMNS = (
 TUNED_RESULT_COLUMNS = ("tile_m", "tile_n", "wave_m", "wave_n", "wgm")
 TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 
-# Which implementation a row's config belongs to, as `libtype` does for the GEMM
-# tables. It is a *result*, not part of the key: a tuner picks the fastest
-# candidate across whatever backends it knows and records whose config it wrote,
-# so one shape still owns one row.
-#
-# Optional on read. FlyDSL is the only conv3d backend today, so a table without
-# the column -- or with the cell left empty -- is read as all-FlyDSL, and rows
-# naming anything else are skipped rather than handed to a dispatch that cannot
-# run them.
+# Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.
 TUNED_LIBTYPE_COLUMN = "libtype"
 LIBTYPE_FLYDSL = "flydsl"
 
@@ -150,12 +107,7 @@ _MATMUL_FAST_PATH_INT_COLS = (
 
 
 def _parse_tuned_bool(value) -> bool:
-    """Parse a tuned-CSV bias cell.
-
-    Shared by the three readers of that column (this lookup, the tuner and the
-    AOT pass) so they cannot disagree: pandas hands back ``"False"``/``False``/
-    ``0``/NaN depending on the file, and a bare ``bool("False")`` is ``True``.
-    """
+    """Parse a tuned-CSV bias cell. Do not use ``bool("False")``."""
     if value is None:
         return False
     if isinstance(value, bool):
@@ -173,19 +125,7 @@ def _parse_tuned_bool(value) -> bool:
 
 
 def _is_matmul_shape(*, groups, kt, kh, kw, st, sh, sw, pt, ph, pw) -> bool:
-    """Is this convolution just a matmul over the channel axis?
-
-    A 1x1x1 filter at unit stride and no padding makes every output element a
-    dot product of one input element's channels with a filter row, so the op
-    answers it with ``torch.matmul`` and no kernel is compiled at all.
-
-    The one copy of that question. ``_conv3d_impl`` asks it to decide whether to
-    run a kernel and the tuner and the AOT pass ask it (through
-    ``_is_matmul_fast_path``) to decide whether a CSV row is worth compiling; the
-    two drifting apart would leave the runtime launching a kernel for shapes
-    nobody tuned, and no error to say so. Dilation is absent because a 1-tap
-    filter has nothing to space out.
-    """
+    """1x1x1, unit stride, no pad: answered with ``torch.matmul``, no kernel."""
     return (
         groups == 1
         and kt == kh == kw == 1
@@ -239,11 +179,7 @@ def _implicit_param_from_problem(
     pad_mode="zeros",
     dyn_hw=False,
 ):
-    """Compile param for a caller-facing problem (unpadded ``C``).
-
-    Channel padding is applied here so AOT and ``_conv3d_impl`` cannot disagree
-    on the ``c`` field of the cache key.
-    """
+    """Compile param for a caller-facing problem (unpadded ``C``)."""
     return make_conv3d_implicit_param(
         n,
         groups * _pad_channels(c // groups),
@@ -274,35 +210,13 @@ def _implicit_param_from_problem(
     )
 
 
-# Read the input's spatial extents at runtime so one artifact serves every
-# resolution, instead of compiling per D/H/W. The extents reach the gather as
-# magic-number reciprocals rather than folded immediates, which costs a fixed
-# amount per block -- the decomposition they feed runs once per block, not once
-# per tap.
-#
-# On by default, because that fixed cost is only visible where there is little
-# else in the kernel. Measured on gfx950 with flydsl 0.3.4.1 over
-# op_tests/test_flydsl_conv_implicit.py, two runs per setting:
-#
-#   real VAE layers (the 31 cases at or above 50us): median +0.87%, worst
-#       +2.4%, nothing past the run-to-run spread, and down_6_7 reliably 31%
-#       faster
-#   the microsecond keyword-surface cases: up to +48% (1d_nwc, 2.6us -> 3.8us),
-#       where per-block work is most of the kernel
-#
-# Set it to 0 to compile per resolution again -- worth doing for a workload
-# made of tiny convolutions at a fixed set of sizes. The shapes this cannot
-# express -- BIG_IN, BIG_OUT, an M grid that needs chunking -- fall back to
-# that path on their own, see _dyn_hw_ok.
+# Runtime D/H/W so one artifact serves every resolution. Set 0 to compile per
+# size (tiny fixed-shape workloads). BIG_IN/BIG_OUT/M-chunking stay static.
 AITER_CONV3D_DYN_HW = int(os.environ.get("AITER_CONV3D_DYN_HW", "1"))
 
 
 def _dyn_hw_ok(n, c_padded, d, h, w, k, npq, tile):
-    """Whether the variable-resolution path can express this problem.
-
-    Everything it rejects still compiles, just per-resolution as before, so a
-    miss here costs a JIT rather than an error.
-    """
+    """Whether variable-resolution can express this problem. Else per-shape compile."""
     if not AITER_CONV3D_DYN_HW:
         return False
     # The magic-number reciprocals are derived for dividends under 2**31, and
@@ -330,16 +244,7 @@ _TUNED_LOOKUP_LOGGED = set()
 
 @functools.lru_cache(maxsize=1)
 def _load_tuned_table():
-    """Parse the tuned config CSV into ``{(gfx, cu_num, *shape): (tile, wgm, splitk)}``.
-
-    The device columns stay in the key instead of filtering the frame, as in
-    ``gemm_op_a8w8.get_CKGEMM_config`` and ``tuned_gemm.get_GEMM_A16W16_config``:
-    a miss can then tell "tuned, but on another device" from "never tuned", and
-    _log_tuned_lookup says which.
-
-    Returns an empty dict on any failure. A missing or malformed table must
-    degrade to the heuristic, never break a conv.
-    """
+    """``{(gfx, cu_num, *shape): (tile, wgm, splitk)}``. Empty dict on any failure."""
     try:
         import pandas as pd
 
@@ -435,24 +340,9 @@ def _load_tuned_table():
 
 
 def _log_tuned_lookup(table, dev, key, hit, borrowed=False):
-    """Report once per (device, shape) where this conv's launch config came from.
-
-    A hit is reported only under AITER_LOG_TUNED_CONFIG, as in the GEMM
-    lookups; a miss is reported unconditionally, since dropping a tuned config
-    without a word is the outcome worth seeing. An empty table is silent either
-    way: shipping no tuned rows for this op is the normal state, and the
-    heuristic is the intended answer there.
-
-    A borrowed row is reported like a hit but named as one, since it is the
-    outcome where tuning this resolution would still be worth something.
-    """
+    """Log once per (device, shape): hits need AITER_LOG_TUNED_CONFIG; misses always."""
     if not table or (dev, key) in _TUNED_LOOKUP_LOGGED:
         return
-    # Recorded before anything is formatted, and whether or not the line is
-    # going to be emitted: the memo exists so that a tuned hit costs nothing
-    # per conv call, and joining the 20 key columns only to find the log
-    # switched off is not nothing. AITER_LOG_TUNED_CONFIG is read once at
-    # import, so suppressing this shape cannot hide a line someone turns on later.
     _TUNED_LOOKUP_LOGGED.add((dev, key))
     if hit is not None:
         from aiter.jit.core import AITER_LOG_TUNED_CONFIG
@@ -494,15 +384,12 @@ def _log_tuned_lookup(table, dev, key, hit, borrowed=False):
         )
 
 
-# Which positions of a lookup key say what resolution a row was traced at,
-# rather than which layer it is.
+# Resolution fields of a lookup key vs layer identity.
 _RESOLUTION_KEY_IDX = frozenset(
     TUNED_KEY_COLUMNS.index(c) for c in ("N", "D", "H", "W")
 )
 
-# How far the borrowed row's npq may sit from the one being served. Borrowing
-# interpolates between sizes the tuner measured; an order of magnitude away is
-# extrapolation, and the heuristic is the better answer there.
+# Borrow only within this npq ratio of the nearest tuned row of the same layer.
 _BORROW_NPQ_RATIO = 4.0
 
 
@@ -533,29 +420,7 @@ def _tuned_rows_by_layer():
 
 
 def _borrow_tuned_tile(dev, key):
-    """A tuned row for the same layer at another resolution, or None.
-
-    ``dyn_hw`` makes one artifact serve a layer at any size, but the tile is
-    still chosen per row, so a resolution the table does not list would
-    otherwise drop to ``_pick_tile``'s four-tile ladder. The nearest tuned row
-    recovers most of that: measured over the 28 layers the two VAEs have at two
-    resolutions each, borrowing runs 6.3% faster than the heuristic where the
-    exact row would have run 7.6% faster.
-
-    Nearest by npq, since that is the axis a tile is chosen along. ``splitK`` is
-    deliberately not borrowed -- it is sized against the row's own npq and the
-    CU count, so the caller re-derives it.
-
-    At four resolutions neither VAE has a row for, this runs 6.1% faster than
-    the heuristic overall. The gain is not uniform, and the exception has a
-    shape to it: every layer that came out slower was the innermost one, where
-    the channel count is widest and the spatial extent smallest (384->384, 10-16%
-    slower at four sizes, 40% at one). A tile transfers between resolutions of a
-    layer that is large in M; it transfers badly once M is small enough that the
-    tile shape is what decides occupancy. The exact row always wins when the
-    table has one, so a resolution that matters should be tuned rather than left
-    to this.
-    """
+    """Nearest same-layer tuned tile by npq, or None. Does not borrow splitK."""
     rows = _tuned_rows_by_layer().get(dev + _layer_key(key))
     if not rows:
         return None
@@ -569,14 +434,7 @@ def _borrow_tuned_tile(dev, key):
 
 
 def _lookup_tuned_tile(key, device):
-    """Offline-tuned launch config for this exact problem, or None.
-
-    Device identity matches the tuner stamp (``get_gfx`` / ``get_cu_num``), not
-    ``torch.cuda.get_device_properties``: those two disagree under ``GPU_ARCHS`` /
-    ``CU_NUM`` / CU partition, and a miss would silently drop a tuned row.
-    Mixed-arch hosts should set ``HIP_VISIBLE_DEVICES`` the same way GEMM does.
-    ``device`` is unused for the key; kept so call sites stay unchanged.
-    """
+    """Tuned (tile, wgm, splitk) for this device, or a borrowed same-layer row."""
     del device
     if key is None:
         return None
@@ -595,54 +453,24 @@ def _lookup_tuned_tile(key, device):
     return hit
 
 
-# ---------------------------------------------------------------------------
-# Fallback heuristic: the tile and WGM to run when the table has no row.
-#
-# These live here rather than in conv3d_policy because they are the runtime
-# decision, as tuned_gemm's default_config is, while the policy module is the
-# tuner's candidate enumeration -- and because conv_kernels calls them on the
-# path that dispatches a conv, next to the table lookup they back up.
-# _resolve_splitk is the third runtime decision but sits in conv_kernels
-# instead: it keys on TILE_K and DEFAULT_TILE, and the staging window it
-# respects is asserted inside the kernel body.
-# ---------------------------------------------------------------------------
-
+# Fallback tile / WGM when the table has no row.
 TILE_LADDER = ((128, 128, 2, 4), (64, 64, 2, 2), (32, 32, 1, 2))
 
 TILE_MIN_WAVES_PER_CU = 6
 
 TILE_MIN_N_FILL = 0.75
 
-# A 256-wide N tile only pays when it spans K/groups in ONE tile: it halves the M tiles
-# (and with them the A traffic per output element) for at most 1/(1-TILE_MIN_N_FILL) of
-# masked columns. Past 256 the second tile is mostly mask -- measured on gfx950, K/groups
-# = 384 is 1.5x slower on 256x256 than on three clean 128-wide tiles, while K/groups = 192
-# is 1.08-1.17x faster. Hence a closed range, not a "wider is better" ladder step.
+# 256-wide N only when K/groups fills one tile (>= TILE_MIN_N_FILL).
 TILE_WIDE_N = (256, 256, 2, 4)
 TILE_WIDE_N_MIN_KG = int(TILE_WIDE_N[1] * TILE_MIN_N_FILL)
 
-# Grouped-M L2 swizzle. It only has something to reuse when the N grid has more than one
-# tile (with a single n-tile the regrouping is a no-op that still costs index math), and
-# it needs enough blocks in flight for the grouped weight tile to stay hot. Below this it
-# measured neutral-to-negative on every VAE shape.
+# L2 swizzle: needs >1 N-tile and enough blocks in flight.
 WGM_L2_SWIZZLE = 8
 WGM_MIN_BLOCKS_PER_CU = 4
 
 
 def _num_cu(device):
-    """CU count the tile and split-K heuristics size themselves against.
-
-    ``chip_info.get_cu_num()`` first, not ``torch.cuda.get_device_properties``:
-    the tuned table is keyed on the former (see ``_lookup_tuned_tile``), the
-    tuner enumerates its candidates against it, and the AOT jobs are stamped
-    with it. Under ``CU_NUM`` or a CU partition the two disagree, and since the
-    split this picks is part of the compile key, a disagreement is not a
-    differently shaped heuristic answer but an AOT artifact the runtime never
-    asks for.
-
-    torch remains the fallback, and 256 (gfx950's count) the fallback's
-    fallback: this only sizes a heuristic, so a probe failure must not raise.
-    """
+    """CU count for tile/split-K heuristics: ``chip_info.get_cu_num()``, then torch, else 256."""
     try:
         from aiter.jit.utils.chip_info import get_cu_num
 
@@ -802,13 +630,7 @@ def _prep_weight(w, k, kt, kh, kw, c):
 def _resolve_splitk(
     splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1, num_cu=None
 ):
-    """The number of K splits to launch with.
-
-    ``num_cu`` overrides the device probe, for a caller deciding on behalf of a
-    machine it is not running on: the AOT pass has the target's CU count in the
-    tuned row and no target GPU, and a split derived from the build host's
-    count instead would compile an artifact the target never asks for.
-    """
+    """K splits to launch. ``num_cu`` is for AOT (row's CU count, no GPU)."""
     k_tiles = (crs + TILE_K - 1) // TILE_K
     if npq * k * 4 > SPLITK_MAX_STAGING_BYTES:
         return 1
@@ -933,11 +755,7 @@ def _conv3d_impl(
                     p <= ext
                 ), f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
 
-    # Key into the offline-tuned config table. Captured here, before the padding
-    # and channel-padding paths below rewrite n/c/d/h/w, so that it describes the
-    # problem the caller asked for and matches the untuned CSV column order.
-    # Asymmetric padding cannot be expressed with one value per axis, so those
-    # calls fall through to the heuristic rather than matching a wrong row.
+    # Tuned-table key: caller shape, before pad/channel rewrite. Asymmetric pad → None.
     tuned_key = (
         (
             n,
@@ -990,10 +808,7 @@ def _conv3d_impl(
         inline_pad = False
     pad_mode = padding_mode if inline_pad else "zeros"
 
-    # Asked through the shared predicate, not inline: the tuner and the AOT pass
-    # skip exactly these rows, and a second spelling here is how the runtime ends
-    # up launching a kernel for a shape nobody tuned. The padding values are the
-    # post-normalisation ones, so a "same" pad that resolved to zero lands here too.
+    # Same predicate the tuner/AOT skip. Post-normalisation pads, so "same"→0 lands here.
     if _is_matmul_shape(
         groups=groups, kt=kt, kh=kh, kw=kw, st=st, sh=sh, sw=sw, pt=pt, ph=ph, pw=pw
     ):
@@ -1052,8 +867,7 @@ def _conv3d_impl(
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
     def _run(the_tile, the_wgm=1, tuned_splitk=None):
-        # Caller ``splitk=`` wins; else freeze the CSV value so AOT and runtime
-        # share one compile key. ``None`` still means "derive from CU count".
+        # Caller splitk= wins; else freeze the CSV value so AOT and runtime share a key.
         sk_arg = splitk if splitk is not None else tuned_splitk
         sk = _resolve_splitk(sk_arg, npq, crs, k, x.device, the_tile, groups)
         if sk > 1:
@@ -1222,47 +1036,15 @@ def _conv1d_impl(
 def flydsl_conv_implicit(
     x, weight, bias=None, stride=1, padding=0, dilation=1, **kwargs
 ):
-    """Main implicit-GEMM conv entry; dispatches 1D/2D/3D by filter rank.
+    """Implicit-GEMM conv; rank from ``weight.dim() - 2`` (1/2/3).
 
-    Rank is taken from the filter (weight.dim() - 2): 3 -> 3D (N,C,D,H,W)/(K,C,T,R,S).
+    Layouts are independent: NCDHW/NDHWC (or NCHW/NHWC, NCW/NWC). Weight stays
+    KC*. NDHWC input skips the pre-transpose; NDHWC output skips the split-K
+    transpose but loses the vectorised store.
 
-    ``input_layout`` and ``output_layout`` are independent and named per rank:
-    "NCDHW"/"NDHWC", "NCHW"/"NHWC", "NCW"/"NWC". The weight stays KC*, and the batch axis
-    leads in both, so an unbatched input works either way. Channels-last is the kernel's
-    own layout on both sides: an NDHWC input skips the pre-transpose, and an NDHWC output
-    is the (npq, K) index space the GEMM already writes, so it also skips the split-K
-    epilogue's transpose. Channels-last output does give up the vectorized store, since a
-    lane's four accumulator values are four M rows and those are K apart once channels are
-    innermost.
-
-    ``padding`` takes an int, a per-axis tuple, or one of torch's two strings. "valid" is
-    no padding. "same" pads so the output keeps the input's spatial extent, which needs
-    ``dilation * (kernel - 1)`` elements per axis and, like torch, is only defined at
-    stride 1. That total is normally even and costs nothing beyond an ordinary symmetric
-    pad. An even-length filter under odd dilation makes it odd, and torch's rule of
-    putting the extra element on the high side then asks for a pad the kernel cannot
-    express with one value per axis; that case materializes a padded input first, exactly
-    as torch does (it warns about the same copy). ``padding_mode`` applies to "same" too.
-
-    ``dilation`` follows torch semantics: it spaces the filter taps by that factor
-    over the input, shrinking the output to
-    ``(D + 2*pad - dilation*(T-1) - 1)//stride + 1`` per axis. It costs nothing in the
-    GEMM -- the K axis is still C/groups*T*R*S -- it only stretches the im2col gather,
-    so a dilated filter reads a wider input footprint per output row and gets less
-    reuse out of cache than the same filter undilated.
-
-    ``groups`` follows torch semantics: C and K must both be divisible by it and the
-    weight's channel dim is C/groups. Groups map onto the N grid axis, one tile never
-    spanning two groups, so efficiency tracks how well K/groups fills TILE_N. Measured
-    on gfx950 vs torch/MIOpen, moderate cardinality wins across the board (1.5-2.0x for
-    K/groups in [8, 256]). True depthwise (groups == C, so C/groups == 1) is the one
-    weak case at ~0.5x: C/groups=1 pads to the gather's 8-wide vector, wasting 7/8 of
-    the K axis, while K/groups=1 leaves all but one column of the N tile masked.
-    Narrower tiles recover little there -- depthwise wants its own kernel, not this
-    single-GEMM mapping.
-
-    Raises ``RuntimeError`` on an arch outside ``SUPPORTED_GFX``; see that
-    constant for why the refusal covers every shape, fast path included.
+    ``padding``: int, per-axis tuple, ``"valid"``, or ``"same"`` (stride 1).
+    ``groups``: C and K must divide; depthwise (C/groups==1) is the slow case.
+    Raises ``RuntimeError`` outside ``SUPPORTED_GFX``.
     """
     _check_supported_arch()
     spatial_rank = weight.dim() - 2

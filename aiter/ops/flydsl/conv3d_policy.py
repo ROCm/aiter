@@ -1,22 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shape-aware policy selection for the FlyDSL implicit-GEMM conv3d.
+"""Shape-aware launch-config enumeration for FlyDSL conv3d.
 
-Counterpart to ``gemm_a16w16_policy.py``. Enumerates ``(TILE_M, TILE_N, WAVE_M,
-WAVE_N, WGM)`` launch configurations, keeps the legal ones, and prunes to a set
-small enough to tune.
-
-Legality is decided by arithmetic, not by compiling. ``compile_conv3d_implicit``
-asserts its constraints at trace time, so a candidate sweep that discovered them
-by try/except would pay a full compile per rejected config. :func:`is_legal_tile`
-is the closed form of those asserts.
-
-The reason this exists rather than the fixed eight-entry table it replaces: the
-runtime's own ``TILE_LADDER`` only offers N tiles of 128/64/32 plus a 256 wide
-case, all powers of two. A VAE whose ``Cout`` ladder is 96/192/384 lands two of
-its three rungs on 75% N occupancy, and the masked columns still issue MFMA. The
-enumeration below includes 48/96/192 so an exact fit can be expressed at all.
+Closed-form legality via ``validate_launch_config``. Includes 48/96/192 N tiles
+so VAE Cout 96/192/384 can fill TILE_N, unlike the runtime power-of-two ladder.
 """
 
 import itertools
@@ -51,16 +39,8 @@ WAVE_M_VALUES = (1, 2, 3, 4)
 WAVE_N_VALUES = (1, 2, 3, 4, 6)
 WGM_VALUES = (1, 4, 8)
 
-# The kernel's own candidate table and heuristic ladder. These are unioned into
-# every sweep so that the tuned pick can never come out worse than the shipped
-# default -- whatever ``_pick_tile`` would have chosen is always measured too.
-#
-# Spelled out rather than spliced from ``conv_kernels.TILE_LADDER``: this order is
-# the order the tuner measures them in, and ties are broken by whoever is timed
-# first, so re-ordering it would make a re-tune disagree with the checked-in CSVs
-# for no gain. The cost is that a ladder rung added there and not here becomes an
-# incumbent the sweep never measures, which is how a tuned pick ends up slower
-# than the default -- keep the two in step by hand.
+# Kernel table + heuristic ladder, unioned so the tuned pick cannot lose to default.
+# Keep in step with conv_kernels.TILE_LADDER by hand (order is the tuner's measure order).
 BASELINE_TILES = (
     (128, 128, 2, 4),
     (128, 256, 2, 4),
@@ -182,11 +162,8 @@ def _sweep(npq, kg, groups, num_cu, min_n_fill, min_waves, check_waste, check_gr
     return scored
 
 
-# Progressive relaxation. A narrow ``kg`` (``conv_out`` has 32) cannot satisfy
-# the wave floor and the mask-waste rule at once: an exact 32-wide N tile forces
-# WAVE_M*WAVE_N <= 2, while reaching four waves needs a 64-wide tile that is
-# half mask. Rather than pick one rule to weaken globally, drop them in order
-# until something survives.
+# Progressive relaxation until a candidate survives (narrow kg cannot meet
+# wave floor and mask-waste at once).
 _RELAXATIONS = (
     # (min_n_fill, min_waves, check_waste, check_grid)
     (0.5, MIN_WAVES, True, True),
@@ -203,19 +180,7 @@ def get_flydsl_conv3d_configs(
     num_cu,
     max_configs=96,
 ):
-    """Return the candidate launch configs worth tuning for one problem.
-
-    Args:
-        npq: GEMM M extent, ``n * do * ho * wo``.
-        kg: GEMM N extent, ``k // groups``.
-        groups: Convolution groups; one tile never spans two groups.
-        num_cu: Compute units on the target device.
-        max_configs: Cap on the enumerated part, to bound tuning time. The
-            baseline tiles are unioned in afterwards and are not subject to it.
-
-    Returns:
-        List of ``(tile_m, tile_n, wave_m, wave_n, wgm)`` tuples, never empty.
-    """
+    """Candidate ``(tile_m, tile_n, wave_m, wave_n, wgm)`` tuples; never empty."""
     scored = []
     for min_n_fill, min_waves, check_waste, check_grid in _RELAXATIONS:
         scored = _sweep(
@@ -227,15 +192,7 @@ def get_flydsl_conv3d_configs(
     scored.sort(key=lambda item: item[0])
     configs = [config for _, config in scored[:max_configs]]
 
-    # Union in the incumbent (see BASELINE_TILES), at every WGM value rather
-    # than just 1: `_pick_tile` and `_pick_wgm` decide
-    # independently, so pinning the baseline tiles at wgm=1 left the real
-    # incumbent out of the sweep wherever the heuristic wanted the L2 swizzle.
-    # 384->384 @48x70 is one: the heuristic runs (32,32,1,2) at wgm=8, only
-    # (32,32,1,2,1) was offered, and the winner came out 18.9% slower than the
-    # config it was supposed to beat. WGM_VALUES is exactly the range
-    # `_pick_wgm` can return, so covering it closes the hole without coupling
-    # this module to the heuristic's internals.
+    # Union BASELINE_TILES at every WGM_VALUES (heuristic picks tile and wgm independently).
     seen = set(configs)
     for tile in BASELINE_TILES:
         if not is_legal_tile(*tile):

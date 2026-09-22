@@ -2,20 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Tiled NCDHW -> NDHWC transpose, the pre-pass to the implicit-GEMM conv3d.
-
-The convolution is channels-last inside, so an NCDHW input -- what diffusers
-hands us -- is staged through this first. It is a separate kernel and a
-separate ``lru_cache`` from the convolution, which is why the AOT pass emits a
-job for each, and why it lives in its own module rather than inside
-``conv3d_implicit_gfx950.py``.
-
-Measured on gfx950, the transpose is 8-22% of the pair's runtime. Passing
-``input_layout="NDHWC"`` skips it outright, which is the way to avoid the cost
--- folding it into the convolution would cost more than it saves, since the
-gather reads 8 contiguous channels per lane with one ``buffer_load_lds`` and
-NCDHW would break that into eight scalar loads.
-"""
+"""Tiled NCDHW -> NDHWC pre-transpose. Separate cache from the convolution."""
 
 import functools
 
@@ -39,21 +26,7 @@ TR_MAX_BIG_S = (0x7FFFFFFF - (TR_TILE - TR_VEC)) // (TR_TILE - 1)
 
 @functools.lru_cache(maxsize=64)
 def compile_transpose_ncdhw_ndhwc(n, c, s):
-    """Transpose flat (N, C, S) -> (N, S, C) (S == T*H*W). Requires c%8==0.
-
-    S is a kernel operand rather than a compile-time constant, so one
-    artifact serves every resolution of a layer -- the counterpart to the
-    convolution's ``dyn_hw``, and unconditional here because it is nearly
-    free: nothing divides by S (the only division is by ``_TR_VPL``, a tile
-    constant), so it stays an operand of multiplies that were never going to
-    fold into anything cheaper. ``n`` and ``c`` remain compile-time; neither
-    moves with the resolution.
-
-    ``s`` is still an argument and must be the real one: ``BIG`` is derived
-    from it, and it seeds the launch. It reaches the kernel as a runtime
-    operand rather than a folded constant, so it stays out of the key the
-    artifact is cached on.
-    """
+    """Transpose (N, C, S) -> (N, S, C). ``s`` is a runtime operand; requires c%8==0."""
     grid_c = (c + TR_TILE - 1) // TR_TILE
     elem_ty = fx.BFloat16
     BIG = (n * c * s) > 0x7FFFFFFF

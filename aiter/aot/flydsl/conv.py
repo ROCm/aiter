@@ -3,81 +3,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compilation for the FlyDSL implicit-GEMM convolution.
+"""AOT for the FlyDSL implicit-GEMM convolution.
 
-Reads the tuned conv3d CSV, turns every row into a compile job, and fills the
-FlyDSL cache so a model run never pays JIT. The cold cost this removes is
-large and measured: a first Wan2.1 encode spends ~4.5 minutes in step 1 on
-compilation, and a full 679-candidate tuning sweep took 969s cold against 40s
-warm.
+Each tuned CSV row becomes two conv jobs (``out_ndhwc`` True/False) plus the
+NCDHW->NDHWC pre-transpose. Input layout is not in the compile key.
 
-Two kernels per row, not one:
-
-* ``conv3d_implicit_kernel`` -- the convolution itself.
-* ``transpose_ncdhw_ndhwc`` -- the GEMM is channels-last inside, so an NCDHW
-  input (the default, and what diffusers hands us) pays a layout conversion
-  first. It is a separate ``lru_cache``, so precompiling only the convolution
-  would leave this one to JIT.
-
-Unlike the GEMM AOT, no kernel name has to be parsed: the tuned CSV stores the
-launch config as five explicit integer columns, so a job is read straight off
-the row.
-
-Both output layouts are covered, two conv jobs per CSV row. ``out_ndhwc`` is a
-compile-time parameter because it flips the epilogue -- channels-last output
-gives up the vectorised store, since a lane's four accumulator values become
-four M rows that are K apart. The *input* layout is
-not a compile-time parameter: it only decides whether the host runs the
-pre-transpose, so ``NDHWC -> NCDHW`` is served by the same artifact as
-``NCDHW -> NCDHW``. That makes this 2 variants per row rather than 4.
-
-How far coverage reaches past the CSV depends on ``AITER_CONV3D_DYN_HW``.
-
-Off (the default), it reaches nowhere: ``compile_conv3d_implicit`` bakes the
-whole problem shape in -- the im2col div/mod folding against ``(kT, kH, kW)``
-and ``C/groups`` is where this kernel's performance comes from -- so a
-resolution, frame count or bias flag outside the table still JITs.
-
-On, the input's spatial extents are read at runtime and one artifact serves
-every resolution of the same layer. That is not the same as covering sizes the
-table never listed: the tuned lookup is still an exact match on the full shape,
-so an unlisted resolution misses it, takes ``_pick_tile``/``_pick_wgm``
-instead, and asks for a launch config that *is* in the compile key -- a
-different artifact from the one a listed resolution of the same layer built.
-Each resolution the tables are meant to serve therefore needs its own rows.
-What the flag buys is that those rows collapse onto one artifact rather than
-one each. The flag is part of the compile key, which is why ``_resolve_dyn_hw``
-derives it here through the same ``_dyn_hw_ok`` the dispatch uses, and why
-the summary prints it: a build and a run that disagree miss each other
-silently rather than failing. Shapes the dynamic path cannot express (past
-the 2**31 dividend the magic-number division assumes, BIG_IN/BIG_OUT
-addressing, M chunking) fall back to a per-shape artifact on their own.
-
-The pre-transpose is unaffected either way -- it keys on ``(N, padded C,
-D*H*W)`` and stays per-shape.
-
-The compile key is built by ``conv_kernels._implicit_param_from_problem``, the
-same helper ``_conv3d_impl`` calls, so the channel padding and field order
-cannot drift between the two. What the CSV still has to agree on is ``splitK``:
-the runtime freezes the tuned row's value rather than re-deriving it, so a row
-whose ``splitK`` column is missing falls back to the CU-count heuristic and can
-miss this cache. ``run_only_env()`` makes FlyDSL raise on a JIT rather than
-fall back, which is how to verify a row by hand.
+``AITER_CONV3D_DYN_HW`` (default 1) is part of the compile key: one artifact
+per layer instead of per resolution. Build and runtime must agree, or the
+cache misses silently. Use ``run_only_env()`` to fail on a JIT.
 
 Usage::
 
-    # Compile everything in the default (merged) tuned CSV
     python -m aiter.aot.flydsl.conv
-
-    # Custom CSV file(s)
     python -m aiter.aot.flydsl.conv --csv /path/to/bf16_tuned_conv3d.csv
-
-Environment variables:
-    FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
-    GPU_ARCHS / ARCH          Restrict compilation to these architectures.
-    AITER_CONV3D_DYN_HW       Variable-resolution artifacts (default 1). Part of
-                              the compile key, so a build and the runtime that
-                              uses its cache have to agree on it.
 """
 
 from __future__ import annotations
@@ -131,11 +69,8 @@ from aiter.ops.flydsl.kernels.conv3d_transpose import (
     compile_transpose_ncdhw_ndhwc,
 )
 
-# Why parse_csv does not test the transpose's own c % TR_VEC == 0: every channel
-# count reaching it has been through _pad_channels, so it is a multiple of
-# LDG_VEC. That only implies the transpose's precondition while these two
-# independently declared widths stay compatible, which is what this checks --
-# otherwise the condition would go from redundant to missing without a word.
+# _pad_channels rounds C to LDG_VEC, which only implies the transpose's
+# c % TR_VEC == 0 while these two widths stay compatible.
 assert LDG_VEC % TR_VEC == 0, (
     f"channel padding rounds to a multiple of LDG_VEC={LDG_VEC}, which no longer "
     f"guarantees the transpose's c % {TR_VEC} == 0; parse_csv has to test it again"
@@ -144,34 +79,20 @@ assert LDG_VEC % TR_VEC == 0, (
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE]
 CONV_AOT_ARCH_DEFAULT = "gfx950"
 
-# Innermost extent of a probe tensor. Any value above 1 does; see _probe for
-# why it cannot be 1.
+# Innermost probe extent; must be >1 so the unit stride stays on the last axis.
 _PROBE_EXTENT = 8
 
-# The lookup's key columns, minus bias -- the one that is not an integer, read
-# through _parse_tuned_bool below.
 _INT_COLS = tuple(c for c in TUNED_KEY_COLUMNS if c != "bias")
 _CONFIG_COLS = TUNED_RESULT_COLUMNS
 
-
-# The columns that say which resolution a row was traced at, as opposed to
-# which layer it is. A variable-resolution artifact is shared across them.
+# Dropped from the dyn_hw compile-dedupe key (one artifact per layer).
 _RESOLUTION_COLS = ("N", "D", "H", "W")
 
 
 def _conv_dedupe_key(job):
-    """What makes two conv rows the same compile.
+    """Compile identity: whole row, or ``_shape_agnostic_key`` plus non-extent fields.
 
-    On the static path that is the whole row -- one artifact per resolution. A
-    ``dyn_hw`` row closes over no extent, so every resolution of a layer lands
-    on one artifact and compiling each of them separately is wasted build time.
-    The key is then ``_shape_agnostic_key``, the same reduction
-    ``compile_conv3d_implicit`` asserts its invariant against, plus the fields
-    that are not the resolution.
-
-    A row whose plans cannot be derived here falls back to the whole row. A
-    duplicate job costs build time and nothing else, while merging two rows
-    that do not in fact share an artifact would drop one the runtime asks for.
+    Falls back to the whole row if plans cannot be derived here.
     """
     if not job["dyn_hw"]:
         return job_identity(job)
@@ -236,14 +157,7 @@ def _row_npq_per_sample(shape) -> int:
 
 
 def _requested_archs():
-    """The ARCH / GPU_ARCHS restriction as a set, or None for "build them all".
-
-    Read here rather than in ``main`` so that ``run_aot`` -- the ``setup.py``
-    path, which calls ``parse_csv`` through ``collect_aot_jobs`` and never sees
-    the argument parser -- honours it too. Conv contributes more jobs than any
-    other kind, so building the archs a target does not have is the most
-    expensive place to ignore this.
-    """
+    """ARCH / GPU_ARCHS as a set, or None. Applied in parse_csv so setup.py's run_aot sees it."""
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
     if not arch:
         return None
@@ -259,9 +173,7 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         for raw in csv.DictReader(f):
             row = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
-            # Only FlyDSL rows describe something this module can compile. The
-            # column is optional and an empty cell means FlyDSL, so a
-            # pre-libtype table still yields every row.
+            # Empty libtype means FlyDSL (pre-libtype tables).
             libtype = row.get(TUNED_LIBTYPE_COLUMN, "")
             if libtype and libtype != LIBTYPE_FLYDSL:
                 continue
@@ -273,9 +185,7 @@ def parse_csv(csv_path: str):
                 shape = {c: int(row[c]) for c in _INT_COLS}
                 config = {c: int(row[c]) for c in _CONFIG_COLS}
                 has_bias = _parse_tuned_bool(row.get("bias"))
-                # Recorded by the tuner. An absent or empty cell is resolved
-                # below the same way the runtime resolves it, rather than
-                # defaulting to 1 -- see there.
+                # Missing splitK is resolved like the runtime, not defaulted to 1.
                 raw_splitk = row.get("splitK", "")
                 splitk = (int(raw_splitk) or 1) if raw_splitk else None
             except ValueError as exc:
@@ -294,11 +204,7 @@ def parse_csv(csv_path: str):
             cgp = _pad_channels(shape["C"] // groups)
             c_padded = groups * cgp
 
-            # Both output layouts, because `out_ndhwc` is a compile-time
-            # parameter: it flips the epilogue, which gives up the vectorised
-            # store once channels are innermost. The *input* layout is not --
-            # it only decides whether the host runs the pre-transpose -- so
-            # this is 2 variants per row rather than 4.
+            # out_ndhwc is compile-time; input layout is not. Two conv jobs per row.
             tile = (
                 config["tile_m"],
                 config["tile_n"],
@@ -306,22 +212,7 @@ def parse_csv(csv_path: str):
                 config["wave_n"],
             )
 
-            # splitK is part of the compile key, so this has to land on the value
-            # the runtime will ask for.
-            #
-            # A row that carries the column only needs the divisibility step:
-            # make_launch_grid asserts that splitK divides the K-tile count (a
-            # split that does not leaves the tail of the K axis unowned and
-            # quietly dropped), and converging here keeps a hand-edited row, or
-            # one tuned where the CU count picked a different split, a cache hit
-            # rather than a kernel-side assert.
-            #
-            # A row without it used to default to 1, while the runtime derived a
-            # split from the CU count -- so for any shape the heuristic put a
-            # split on, the AOT artifact was one the runtime never asked for and
-            # the JIT it exists to remove happened anyway. The CU count that
-            # decision needs is in the row, which is why this can be resolved on
-            # a build host with no GPU at all.
+            # splitK is in the compile key: match what the runtime will request.
             crs = cgp * shape["kT"] * shape["kH"] * shape["kW"]
             npq = shape["N"] * _row_npq_per_sample(shape)
             splitk = _resolve_splitk(
@@ -343,9 +234,7 @@ def parse_csv(csv_path: str):
                     "has_bias": has_bias,
                     "splitk": splitk,
                     "out_ndhwc": out_ndhwc,
-                    # Part of the compile key, and derived the same way the
-                    # dispatch derives it, so a row lands on the artifact the
-                    # runtime will ask for.
+                    # Same derivation as dispatch; dyn_hw is in the compile key.
                     "dyn_hw": _resolve_dyn_hw(
                         shape=shape,
                         splitk=splitk,
@@ -361,12 +250,9 @@ def parse_csv(csv_path: str):
                     seen.add(key)
                     jobs.append(conv_job)
 
-            # The NCDHW->NHWC pre-transpose, which several convolutions collapse
-            # onto. Skipped where the op itself falls back to torch.permute.
+            # Pre-transpose; skipped when the op falls back to torch.permute.
             s = shape["D"] * shape["H"] * shape["W"]
             big = shape["N"] * c_padded * s > 0x7FFFFFFF
-            # The op's other precondition here, c % TR_VEC == 0, holds by
-            # construction; see the assert this module opens with.
             if not (big and s > TR_MAX_BIG_S):
                 tr_job = {
                     "kind": "transpose",
@@ -377,11 +263,7 @@ def parse_csv(csv_path: str):
                     "c_padded": c_padded,
                     "s": s,
                 }
-                # ``s`` reaches the transpose kernel as a runtime operand, and
-                # the only compile-time thing derived from it is BIG. So one
-                # job per (N, C, BIG) covers every resolution of a layer, and
-                # the ``s`` riding along in the payload is just a value that
-                # re-derives the same BIG at compile time.
+                # s is runtime; compile key is (N, C, BIG).
                 key = ("transpose", gfx, cu_num, shape["N"], c_padded, big)
                 if key not in seen:
                     seen.add(key)
@@ -391,13 +273,7 @@ def parse_csv(csv_path: str):
 
 
 def _resolve_dyn_hw(*, shape, splitk, tile, out_ndhwc, has_bias):
-    """Would the runtime take the variable-resolution path for this row?
-
-    Built from the same ``_implicit_param_from_problem`` and ``_dyn_hw_ok``
-    the dispatch uses, because the answer is part of the compile key: an AOT
-    artifact compiled for one and requested as the other is a silent miss,
-    not an error.
-    """
+    """Whether dispatch would take the variable-resolution path (compile-key field)."""
     probe = _implicit_param_from_problem(
         shape["N"],
         shape["C"],
@@ -438,23 +314,7 @@ def job_arch(cu_num: int = 0, gfx: str = "") -> str:
 
 
 def _probe(rank: int, dtype_is_fp32: bool = False):
-    """A tiny CPU stand-in for one kernel argument.
-
-    The extents are compile-time constants baked in by ``compile_*``, so a
-    handful of elements per argument is enough, and under ``COMPILE_ONLY``
-    FlyDSL persists the artifact without materialising an execution engine, so
-    the buffer is never dereferenced. That is what keeps AOT off the GPU and out
-    of the 442 MiB a real ``down_0_1`` activation would cost.
-
-    What a stand-in does have to reproduce is the part of the signature that
-    reaches the cache key. Under the dynamic layout these kernels take, that is
-    the rank, the dtype, and which axis carries the unit stride -- so the
-    innermost extent has to be above 1, or the unit stride lands one axis in
-    from the end and the artifact is keyed on a layout no real contiguous
-    tensor has. Both that and a wrong rank compile fine and then miss at
-    runtime, silently, because a miss only falls back to JIT. Nothing catches
-    it automatically; see the module docstring.
-    """
+    """CPU stand-in for one kernel argument. Innermost extent must be >1."""
     import torch
 
     return torch.empty(
@@ -534,9 +394,6 @@ def _compile_conv3d_to_cache(
             (tile_m, tile_n, wave_m, wave_n),
             wgm,
             out_ndhwc,
-            # The runtime only reaches the table for zero padding (an asymmetric
-            # pad cannot be expressed with one value per axis), so this is the
-            # only mode a tuned row can describe.
             "zeros",
             dyn_hw,
         )
@@ -624,8 +481,6 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
 
-    # The arch restriction is applied inside parse_csv, so this path and
-    # run_aot's see the same job list.
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
     if arch:
         print(f"[aiter] ARCH={arch}: {len(all_jobs)} jobs match")
@@ -644,8 +499,6 @@ def main():
     print(f"  Total jobs:       {len(all_jobs)}")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch or '(all archs found in CSVs)'}")
-    # The flag is part of the compile key, so a build and a run that disagree
-    # about it miss each other silently. Printed rather than inferred.
     print(f"  AITER_CONV3D_DYN_HW={AITER_CONV3D_DYN_HW}  (must match at runtime)")
     print("=" * 72)
 

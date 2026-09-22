@@ -4,39 +4,13 @@
 
 """Correctness and perf for the FlyDSL implicit-GEMM convolution.
 
-Five sweeps, one table each. The first covers the keyword surface: the entry point
-dispatches 1D/2D/3D off the filter rank, so every rank is here along with stride,
-padding (incl. "same"), dilation, groups, bias and split-K.
-
-The rest are the shapes two real VAEs run, traced rather than assumed:
-
-* Wan2.1, the causal Conv3d calls carrying a feature cache -- 440 of one encode's
-  650 convolutions, and the reason a 3-D kernel is needed at all.
-* Wan2.1, the spatial resamplers and the two time_conv -- the calls that are not
-  cached conv3d but do, or plausibly should, reach this kernel. The 125 genuine
-  1x1 calls of an encode never do and are left to the keyword surface.
-* Wan2.1 decode, only the 8 shapes it adds: 560 of its 600 cached conv3d calls
-  reuse encoder shapes, since the channel ladder is mirrored at the same extents.
-* Qwen-Image, which is the same architecture run at T=1. There the causal Conv3d
-  collapses to an exact conv2d and the model never calls a 3-D kernel, so those
-  rows are conv2d -- testing them as conv3d would measure something else.
-
-The coverage the model tables owe is the tuner's own shape set, in
-`aiter/configs/model_configs/wan21_vae_bf16_untuned_conv3d.csv` (22 rows) and
-`qwenimage_vae_bf16_untuned_conv3d.csv` (16 rows): at the resolution each was
-traced at, every one of those rows is a row of a table here. Both carry the
-resamplers next to the convolutions proper, hence the stride and padding columns;
-only Wan has kT=3 rows, since Qwen runs the same architecture at T=1.
-
-Both VAEs downsample space by 8 and their shapes are generated from the input
-resolution, so the sweeps take one. Time is not a free variable on the Wan side:
-the chunk is 4 frames, the cache is 2, and the two stride-2 time_conv fix the rest,
-so clip length only changes how often each shape runs.
+Keyword surface plus Wan2.1 / Qwen-Image VAE shapes from the tuner's CSVs
+(`wan21_vae_bf16_untuned_conv3d.csv`, `qwenimage_vae_bf16_untuned_conv3d.csv`).
 
 Usage::
 
     python op_tests/test_flydsl_conv_implicit.py
-    python op_tests/test_flydsl_conv_implicit.py -c down_0_1 res_96_L0   # hot shapes
+    python op_tests/test_flydsl_conv_implicit.py -c down_0_1 res_96_L0
     python op_tests/test_flydsl_conv_implicit.py --wan-res 480x832 --wan-frames 17
     python op_tests/test_flydsl_conv_implicit.py --qwen-res 1664x928
 """
@@ -57,22 +31,11 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 TOL = {"rtol": 2e-2, "atol": 2e-2}
 
-# checkAllclose returns the fraction of elements outside TOL and raises only on a
-# catastrophic (non-finite) one, so a sweep that merely tabulates that number exits
-# 0 however wrong the kernel is -- and CI runs this file as a script, where nothing
-# but a non-zero exit counts as a failure. Every row that misses is collected and
-# asserted once at the end of main(), rather than per case: one run should name
-# every failing shape instead of stopping at the first. Only the flydsl column is
-# checked; torch's own error against the fp32 reference is MIOpen's, not this
-# kernel's. The bar is zero mismatched elements, which is what a fp32 accumulator
-# rounded once to bf16 gives against a fp32 reference at 2e-2 -- a nonzero count
-# here has always meant a real defect, not accumulated rounding.
+# CI runs this as a script: checkAllclose only raises on non-finite, so collect
+# flydsl mismatches and assert once at the end of main(). Bar is zero elements.
 ERR_TOL = 0.0
 _FAILED = []
-# SUPPORTED_GFX is the op's own allow-list (TILE_K=32 means mfma_f32_16x16x32_bf16,
-# which is CDNA4 only), imported rather than restated: the op now refuses an
-# unsupported arch itself, and a sweep that skipped on a different list than the
-# one the op enforces would either test nothing or fail on the refusal.
+# SUPPORTED_GFX is the op's allow-list; skip rather than restating it.
 
 
 def _levels(v, n=3):
@@ -94,30 +57,8 @@ def parse_res(text):
     return h, w
 
 
-# Wan2.1 VAE encoder -- the causal Conv3d calls a T=1 rewrite cannot claim.
-#
-# AutoencoderKLWan encodes a clip in chunks along time: frame 0 on its own, then
-# (T-1)//4 chunks of 4 frames. Every chunk after the first prepends 2 cached
-# feature frames, so the leading time slices hold real features instead of the
-# zeros a causal pad would supply and conv3d(pad(x), w) == conv2d(x, w[:,:,-1])
-# stops holding. Those calls are 67.7% of one encode's convolutions and are what
-# the integration layer routes to this kernel.
-#
-# WanCausalConv3d leaves nn.Conv3d's own padding at (0,0,0) and applies its causal
-# padding itself before calling down, so the model hands the kernel an already
-# padded tensor and stride/padding/dilation are all trivial. The x shapes are
-# therefore post-cat-post-pad, matching what F.conv3d receives; time is chunk+2 and
-# the spatial dims carry the usual +2 from padding=1.
-#
-# Only the spatial extents and the call counts move with the input. The time
-# extents are fixed by the architecture: a chunk is 4 frames because the VAE
-# compresses time 4x, the +2 is CACHE_T which is kT-1 for the 3x3x3 filters, and
-# 4 -> 2 -> 1 is the two stride-2 time_conv. So 81 and 17 frames give the same
-# shapes and differ only in how many times each runs.
-#
-# Derived by forward-hook tracing an encode against
-# Wan-AI/Wan2.1-T2V-1.3B-Diffusers vae/config.json (base_dim 96,
-# dim_mult [1,2,4,4], temperal_downsample [F,T,T]).
+# Wan2.1 encoder cached conv3d. Module pads first (padding=0 here); T is chunk+2.
+# Spatial extents scale with input; time extents are fixed by the architecture.
 def wan_vae_conv3d(height, width, frames):
     """(case, x, weight, calls) for the T>1/cached conv3d of one encode."""
     h, w = _levels(height), _levels(width)
@@ -144,29 +85,8 @@ def wan_vae_conv3d(height, width, frames):
     ]
 
 
-# Wan2.1 VAE encoder -- the calls that are not cached conv3d but still reach, or could
-# reach, this kernel. One encode's remaining 125 pointwise calls are a genuine 1x1 in
-# every dimension (3 conv_shortcut, attention qkv/proj, quant_conv), measure 0.96-1.20x
-# here and are never dispatched, so they are not worth a row; the 5D 1x1x1 path is
-# covered for correctness by the keyword surface instead.
-#
-# `plain2d` are WanResample's spatial downsamplers. WanResample folds time into
-# batch, so these are ordinary nn.Conv2d over N*T images, and the ZeroPad2d((0,1,0,1))
-# ahead of them is a separate Sequential entry -- hence the odd H+1 input and
-# padding=0. The integration layer does replace these (0.54-0.86x of torch here).
-# The Wan tuned config carries them, so they hit a tuned tile at either resolution
-# it was traced at, and borrow the nearer of the two at any other.
-#
-# `time1x1` is pointwise in space only: kT=3 makes K = C*3, which is why it behaves
-# nothing like the true 1x1 layers it used to be bucketed with. The integration
-# layer's spatial-kernel gate leaves it on torch, but it measures 0.41-0.66x through
-# the kernel, i.e. ~0.8 ms per encode at 480x832 and ~1.3 ms at 368x544 left on the
-# table. Both sides here are 12-85 us launch-bound kernels timed L2-warm, and
-# torch's 368x544 number is slower than its larger 480x832 one, so re-measure
-# cleanly before moving the gate.
-#
-# The `_t1` rows are the first chunk (1 frame, no cache) and so run once per encode
-# whatever the clip length -- a different batch/time extent, hence a separate shape.
+# Wan2.1 encoder remainder: resamplers (H+1, pad=0), time_conv, first-chunk `_t1`.
+# True 1x1 pointwise stays on torch; covered by the keyword surface.
 def wan_vae_aux(height, width, frames):
     """(case, bucket, x, weight, stride, padding, calls) for the rest of an encode."""
     h, w = _levels(height), _levels(width)
@@ -249,29 +169,9 @@ def wan_vae_aux(height, width, frames):
     ]
 
 
-# Wan2.1 VAE decoder -- the shapes decode adds that encode does not already cover.
-#
-# Decode is 797 further conv calls per clip, but 560 of its 600 cached conv3d calls
-# land on shapes the encoder tables already carry: the channel ladder is mirrored at
-# the same extents, and the decoder's channel reduction happens in the upsampler's
-# Conv2d rather than in a resnet, so every resnet on the way up is same-channel. What
-# is left is these 8, which is also what the untuned config gained for decode.
-#
-# `conv_in`/`conv_out` are the cached causal convs with no encoder counterpart: 16
-# channels in at the latent extent, 3 out at full extent. Their T follows decode's own
-# chunking -- one latent frame plus 2 cache for conv_in, a 4-frame group plus 2 for
-# conv_out.
-#
-# The upsamplers are WanResample's 3x3 Conv2d after the interpolate, so unlike the
-# encoder's downsamplers they are stride 1 padding 1 on the unpadded extent. Their
-# batch is time folded in again, and time grows on the way up (1 -> 2 -> 4), which is
-# why L2 pairs N=1 with N=2 while L1 and L0 pair N=1 with N=4.
+# Wan2.1 decoder shapes not already in the encoder tables (8 rows).
 def wan_vae_decode(height, width, frames):
-    """(case, bucket, x, weight, stride, padding, calls) for one decode.
-
-    The ``w`` prefix is not decoration: -c labels are one global namespace and the
-    Qwen table already owns ``dec_conv_in``, ``dec_up_384_L2`` and friends.
-    """
+    """(case, bucket, x, weight, stride, padding, calls). ``w`` prefix avoids Qwen -c clashes."""
     h, w = _levels(height), _levels(width)
     c = (frames - 1) // 4
     return [
@@ -326,34 +226,7 @@ def wan_vae_decode(height, width, frames):
     ]
 
 
-# Qwen-Image VAE -- the same architecture as Wan's (identical vae/config.json:
-# base_dim 96, dim_mult [1,2,4,4], temperal_downsample [F,T,T]), fine-tuned and run
-# at T=1. That degeneracy is the whole story: with one frame and no cache, every
-# time slice of the filter but the last multiplies zeros, so the integration layer
-# rebinds forward to an exact 2-D convolution
-#
-#     conv3d(causal_pad(x), w) == conv2d(x[:,:,0], w[:,:,-1])
-#
-# and the model never runs a 3-D kernel. The causal rows are therefore conv2d with
-# ordinary padding=1 -- the input is NOT pre-padded, unlike Wan's T>1 calls above.
-# Testing them as conv3d would measure something the model does not do.
-#
-# Encode and decode together: 58 calls collapsing to 16 shapes, since the encoder and
-# decoder resnets meet at the same extents. That is row for row the shape set in
-# aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv, which is
-# what the tuner enumerates and therefore the coverage this test owes. Two kinds are
-# not causal convs and so do not follow the padding=1 form:
-#
-# * `enc_down_*` are WanResample's spatial downsamplers, stride 2 over a ZeroPad2d'd
-#   input -- hence the +1 extent and padding=0, exactly as in the Wan aux table.
-# * `dec_up_*` are the decoder upsamplers' 3x3 Conv2d after the interpolate. They halve
-#   channels one level later than the encoder raises them, so 384->192 appears at both
-#   L2 and L1 and none of them shares a shape with an encoder row.
-#
-# The 9 remaining calls of an encode+decode are pointwise (3 conv_shortcut 1x1x1, 4
-# attention 1x1, quant_conv + post_quant_conv) and are out of both this table and the
-# CSV. The 4 (3,1,1) time_conv never run at T=1 -- the resample time branch is skipped
-# with one frame, confirmed by tracing encode+decode on meta device.
+# Qwen-Image VAE at T=1: causal convs are exact conv2d with padding=1 (not pre-padded).
 def qwen_vae_conv2d(height, width):
     """(case, x, weight, stride, padding, calls) for the conv2d the T=1 path runs."""
     h, w = _levels(height), _levels(width)
@@ -426,18 +299,12 @@ KW_CASES = [
         False,
     ),
     ("3d_groups4", 3, _X3, (48, 8, 3, 3, 3), {"padding": 1, "groups": 4}, None, False),
-    # The VAEs' pointwise layers stay on torch, so this row is what keeps the 5D
-    # 1x1x1 path -- no pad, no tap fixup, K = C -- under test at all.
     ("3d_1x1x1", 3, _X3, (48, 32, 1, 1, 1), {}, None, True),
     ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
     ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
     ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
-    # Channels-last is the kernel's own layout, and the two sides are independent
-    # keywords, so each direction takes its own row: a channels-last input skips
-    # the pre-transpose, a channels-last output skips the split-K epilogue's
-    # transpose and gives up the vectorized store, whatever the batch. torch has
-    # no such argument, hence the ref_kw.
+    # Independent input/output layouts; torch has no such kwargs (ref_kw).
     (
         "3d_in_ndhwc",
         3,
@@ -483,15 +350,9 @@ KW_CASES = [
         {"padding": 1},
         False,
     ),
-    # "valid" takes its own early return out of _resolve_padding, ahead of the
-    # "same" arithmetic, and torch spells it the same way.
     ("3d_valid", 3, _X3, _W3, {"padding": "valid"}, None, False),
-    # An input one rank short goes through the entry's unsqueeze/squeeze, which
-    # nothing else here exercises. torch's functional convs accept it too.
     ("3d_unbatched", 3, (32, 4, 16, 16), _W3, {"padding": 1}, None, False),
-    # True depthwise: C/groups == 1 pads to the gather's 8-wide vector and K/groups
-    # leaves all but one column of the N tile masked, which the entry documents as
-    # the one ~0.5x case. Slow is expected; wrong is not, and only a row says which.
+    # Depthwise: C/groups==1. Slow is expected.
     (
         "3d_depthwise",
         3,
@@ -501,12 +362,7 @@ KW_CASES = [
         None,
         True,
     ),
-    # The launch config is otherwise chosen by problem size, and every shape
-    # above is small enough that _pick_tile lands on the narrowest tile, whose
-    # single MFMA column block makes the epilogue's row/col mapping degenerate.
-    # The VAE sweeps below do exercise the wider tiles, but only at model
-    # resolutions; pin them here so this table stands on its own. torch has no
-    # `tile`, hence the ref_kw.
+    # Pin wider tiles; KW shapes otherwise land on the narrowest _pick_tile.
     (
         "3d_tile_128",
         3,
@@ -710,20 +566,8 @@ def test_qwen_vae_conv2d(case, res, xshape, wshape, stride, padding, dtype, call
     return _bench_vs_torch(case, xshape, wshape, dtype, calls, stride, padding)
 
 
-# Pairs that share every compile-time constant except the input's own extents.
-#
-# stride 2 floor-divides, so two adjacent input sizes land on one output size:
-# d=7 and d=8 both give do=4, and likewise for h and w. Everything the cache key
-# carries -- the output geometry, the grid, the three plans -- is then identical,
-# and the only difference is what the gather bounds-checks its taps against.
-# Those extents used to reach the kernel only through the fx.struct param, which
-# FlyDSL does not collect, so the two shapes shared one artifact and whichever
-# compiled second ran the other's bounds (see StaticInputExtents).
-#
-# The larger of each pair runs first, which is the order that showed it: its
-# kernel permits the wider tap range, so the smaller one reading past the end of
-# its input is what went wrong. Both halves must come out clean, and they only do
-# if the two got separate artifacts.
+# Same compile-time constants, different input extents (stride-2 floor-div).
+# StaticInputExtents must keep these as separate artifacts.
 _KEY_ISOLATION_PAIRS = (
     ("depth", (1, 32, 8, 16, 16), (1, 32, 7, 16, 16)),
     ("height", (1, 32, 4, 32, 16), (1, 32, 4, 31, 16)),

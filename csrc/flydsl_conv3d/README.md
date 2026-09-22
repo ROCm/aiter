@@ -38,13 +38,9 @@ python3 setup.py develop
    it was tuned at -- Qwen-Image covers 1024² and 1328², Wan2.1 368×544 and
    480×832.
 
-   Every resolution you want served needs its own block, even with
-   `AITER_CONV3D_DYN_HW` on. That flag makes one *artifact* serve a layer at any
-   size, but the lookup here is an exact match on the full shape: an unlisted
-   resolution falls back to `_pick_tile`'s heuristic, which can only return one
-   of four tiles and measured ~8% slower than the tuned rows across both VAEs.
-   Since the tile is part of the compile key, that fallback also asks for an
-   artifact the AOT pass never built.
+   Unlisted resolutions borrow the nearest same-layer tuned tile (npq within
+   4x), then fall back to `_pick_tile`. `AITER_CONV3D_DYN_HW` (on by default)
+   shares one *artifact* across resolutions of a layer; tile is still per row.
 
    Pass `-i` and `-o` explicitly. The defaults are the canonical pair, which
    ships header-only, so a run without them finds no shapes and exits rather
