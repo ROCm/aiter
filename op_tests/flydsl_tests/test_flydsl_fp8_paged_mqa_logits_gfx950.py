@@ -44,7 +44,7 @@ def _inputs(kv_len=KV_LEN, batch=BATCH, seed=1079):
         get_fp8_e4m3_dtype(),
         block_size=KV_BLOCK_SIZE,
     )
-    kv_cache, out = _kernel_inputs(inp, batch, MAX_NN, HEAD_DIM, True, KV_BLOCK_SIZE)
+    kv_cache, out = _kernel_inputs(inp, batch, MAX_NN, HEAD_DIM)
     next_n_lens = sample_next_n_lens(batch, MAX_NN, seed=seed).cuda()
     return inp, kv_cache, out, next_n_lens
 

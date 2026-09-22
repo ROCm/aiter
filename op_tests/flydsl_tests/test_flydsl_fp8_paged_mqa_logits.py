@@ -217,12 +217,8 @@ def _build_inputs(
     )
 
 
-def _kernel_inputs(inp, batch_size, next_n, head_dim, preshuffle, block_size):
-    kv_cache_kernel = (
-        preshuffle_kv_data(inp.kv_cache_fp8, head_dim)
-        if preshuffle
-        else inp.kv_cache_fp8
-    )
+def _kernel_inputs(inp, batch_size, next_n, head_dim):
+    kv_cache_kernel = preshuffle_kv_data(inp.kv_cache_fp8, head_dim)
     out = torch.full(
         (batch_size * next_n, inp.max_model_len),
         float("-inf"),
@@ -242,9 +238,7 @@ def _verify_paged_mqa_logits(
     preshuffle,
 ):
     _split_kv = None if split_kv == 0 else split_kv
-    kv_cache_kernel, out = _kernel_inputs(
-        inp, batch_size, next_n, head_dim, preshuffle, block_size
-    )
+    kv_cache_kernel, out = _kernel_inputs(inp, batch_size, next_n, head_dim)
 
     with torch.inference_mode():
         ref = ref_fp8_paged_mqa_logits(
@@ -465,7 +459,7 @@ def exhaustive_cases():
 
 
 def gluon_ab_shapes():
-    H, D = 64, 128
+    H, D = 32, 128
     shapes = []
     for B in (1, 4, 16, 64, 128):
         for avg_kv in (16384, 32768, 65536):
