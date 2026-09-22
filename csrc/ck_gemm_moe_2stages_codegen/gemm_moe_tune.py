@@ -5153,6 +5153,17 @@ class FmoeTuner(TunerCommon):
         resultdf = resultdf[ordered_cols]
         resultdf.to_csv(file, index=False)
 
+    @staticmethod
+    def _pair_nt_agnostic(profileDF, kernel_col):
+        # Only the CK 2-stage instances read the hint; the rest are measured
+        # once, so give them a copy on the nt=1 side of the merge.
+        agnostic = profileDF[
+            ~profileDF[kernel_col].astype(str).str.startswith("moe_ck2stages")
+        ]
+        if agnostic.empty:
+            return profileDF
+        return pd.concat([profileDF, agnostic.assign(nt=1)], ignore_index=True)
+
     def post_process(self, results, args, topk=-1, fast_mode=False):
         profileDF = []
         profileDF = []
@@ -5311,16 +5322,7 @@ class FmoeTuner(TunerCommon):
                     "bw": "bw1",
                 }
             )
-            nt_agnostic = stage1_profileDF[
-                ~stage1_profileDF["kernelName1"]
-                .astype(str)
-                .str.startswith("moe_ck2stages")
-            ]
-            if not nt_agnostic.empty:
-                stage1_profileDF = pd.concat(
-                    [stage1_profileDF, nt_agnostic.assign(nt=1)],
-                    ignore_index=True,
-                )
+            stage1_profileDF = self._pair_nt_agnostic(stage1_profileDF, "kernelName1")
             stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
                 columns=["stage", "ksplit", "flat"]
             )
@@ -5333,6 +5335,7 @@ class FmoeTuner(TunerCommon):
                     "bw": "bw2",
                 }
             )
+            stage2_profileDF = self._pair_nt_agnostic(stage2_profileDF, "kernelName2")
             if (stage1_profileDF.shape[0] == 0 and stage2_profileDF.shape[0] != 0) or (
                 stage1_profileDF.shape[0] != 0 and stage2_profileDF.shape[0] == 0
             ):
