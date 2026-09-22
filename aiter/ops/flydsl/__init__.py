@@ -28,11 +28,11 @@ if _base_version < _MIN_FLYDSL_VERSION:
 
 _LAZY_IMPORTS = {
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
-        ".kernels.mqa_logits.fp8_mqa_logits",
+        ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
     ),
     "FP8_MQA_LOGITS_VARIANTS": (
-        ".kernels.mqa_logits.fp8_mqa_logits",
+        ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
     "compute_varqlen_windows": (
@@ -43,14 +43,26 @@ _LAZY_IMPORTS = {
         ".kernels.flash_attn_func_fp8_gfx950",
         "flydsl_flash_attn_fp8_func",
     ),
+    "flydsl_flash_attn_fp8_supported": (
+        ".kernels.flash_attn_func_fp8_gfx950",
+        "flydsl_flash_attn_fp8_supported",
+    ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_fp8_mqa_logits": (
-        ".kernels.mqa_logits.fp8_mqa_logits",
+        ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
     ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
+    "flydsl_hstu_attention": (
+        ".hstu_attention",
+        "flydsl_hstu_attention",
+    ),
+    "flydsl_hstu_attention_bwd": (
+        ".hstu_attention",
+        "flydsl_hstu_attention_bwd",
+    ),
     "flydsl_hstu_attention_fwd": (
-        ".hstu_attention_kernels",
+        ".hstu_attention",
         "flydsl_hstu_attention_fwd",
     ),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
@@ -85,6 +97,10 @@ _LAZY_IMPORTS = {
         "gather_kv_b_proj_flydsl_supported",
     ),
     "pa_decode": (".pa_decode", "pa_decode"),
+    "gather_kv_b_proj_flydsl_fp8_supported": (
+        ".gather_kv_b_proj",
+        "gather_kv_b_proj_flydsl_fp8_supported",
+    ),
 }
 
 __all__ = [
@@ -93,9 +109,12 @@ __all__ = [
     "GateMode",
     "compute_varqlen_windows",
     "flydsl_flash_attn_fp8_func",
+    "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
+    "flydsl_hstu_attention",
+    "flydsl_hstu_attention_bwd",
     "flydsl_hstu_attention_fwd",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
@@ -106,6 +125,7 @@ __all__ = [
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
+    "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
     "pa_decode",
 ]

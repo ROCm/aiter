@@ -428,8 +428,12 @@ def sparse_mla_fwd(
     num_queries, num_heads, d_qk = q.shape
     fmt = _classify_cache(q, kv_buffer, kv_lora_rank, qk_rope_head_dim, kv_scale)
     _LOGGER.info(
-        f"SPARSE_MLA_FWD: q={tuple(q.shape)} kv_buffer={tuple(kv_buffer.shape)} "
-        f"{kv_buffer.dtype} kv_indices={tuple(kv_indices.shape)} fmt={fmt}"
+        "SPARSE_MLA_FWD: q=%s kv_buffer=%s %s kv_indices=%s fmt=%s",
+        tuple(q.shape),
+        tuple(kv_buffer.shape),
+        kv_buffer.dtype,
+        tuple(kv_indices.shape),
+        fmt,
     )
     _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim)
     _check_index_stream(kv_indptr, kv_indices, num_queries, q.device)

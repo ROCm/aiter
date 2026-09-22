@@ -78,9 +78,8 @@ def check_environments():
 
     if triton_version < required_triton_version:
         logger.warning(
-            f"Current Triton version {triton_version} is below the recommended 3.2.0 version. "
-            "Errors may occur and these issues will not be fixed. "
-            "Please consider upgrading Triton.",
+            "Current Triton version %s is below the recommended 3.2.0 version. Errors may occur and these issues will not be fixed. Please consider upgrading Triton.",
+            triton_version,
         )
 
     # Check Python version
@@ -89,8 +88,8 @@ def check_environments():
 
     if py_version < required_py_version:
         logger.warning(
-            f"Current Python version {py_version} is below the recommended 3.11 version. "
-            "It is recommended to upgrade to Python 3.11 or higher for the best experience.",
+            "Current Python version %s is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.",
+            py_version,
         )
 
 
