@@ -36,10 +36,6 @@ from .mxfp4_gemm_common import (
 )
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 
-STORE_CACHE_MODIFIER = 2
-
-SCALE_STORE_CACHE_MODIFIER = 0
-
 _FP8_E8M0_SHIFT = 7
 
 _G2_EPI_LANES = 32
@@ -971,7 +967,7 @@ def atomic_bf16_epilog(
         bias_f32 = flat_buffer(arg_bias, T.f32, 4)
     out_bf16 = flat_buffer(arg_out, T.bf16, 4)
     out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
-    out_i8 = flat_buffer(arg_out, T.i8, 4)
+    out_i8_ptr = global_typed_ptr(arg_out, T.i8, align=1)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
@@ -982,10 +978,6 @@ def atomic_bf16_epilog(
         )
         if reduce_store_cache_modifier is not None
         else None
-    )
-    store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), Int32)
-    store_i8 = fx.make_copy_atom(
-        fx.rocdl.BufferCopy8b(SCALE_STORE_CACHE_MODIFIER), Int8
     )
 
     def load_scalar(atom, src, index, elem_ty):
@@ -1199,22 +1191,17 @@ def atomic_bf16_epilog(
 
                 def emit_stores(output_col, words, e8m0, rg=rg):
                     row_val_off = row_base_addr + fx.Int64(output_col)
-                    packed_frag = fx.make_rmem_tensor(1, Int32)
                     for d in range_constexpr(len(words)):
-                        packed_frag.store(Vec(words[d]).bitcast(Int32))
-                        fx.copy(
-                            store_i32,
-                            packed_frag,
-                            out_i8[None, row_val_off + fx.Int64(4 * d)],
+                        fx.ptr_store(
+                            Vec(words[d]).bitcast(Int8),
+                            out_i8_ptr + (row_val_off + fx.Int64(4 * d)),
                         )
                     scale_off = (
                         row_base_addr
                         + fx.Int64(output_width)
                         + fx.Int64(_udiv(output_col, fx.Int32(g2_scale_blk)))
                     )
-                    scale_frag = fx.make_rmem_tensor(1, Int8)
-                    scale_frag.store(Vec.from_elements([e8m0.to(Int8)], Int8))
-                    fx.copy(store_i8, scale_frag, out_i8[None, scale_off])
+                    fx.ptr_store(e8m0.to(Int8), out_i8_ptr + scale_off)
 
                 @flyc.jit
                 def store_route_group_if_valid(col_lane8):
