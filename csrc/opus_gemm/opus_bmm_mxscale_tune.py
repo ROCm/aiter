@@ -411,8 +411,9 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             self.RESULTS,
             description="Tune opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a)",
         )
-        # sort N before M like the GEMM tuners (cosmetic ordering of the CSV).
-        self.sort_keys = ["gfx", "b", "n", "m", "k"]
+        # sort N before M like the GEMM tuners (cosmetic ordering of the CSV),
+        # then groupSize, so a shape's 32 and 128 rows land next to each other.
+        self.sort_keys = ["gfx", "b", "n", "m", "k", "groupSize"]
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
@@ -423,7 +424,11 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         info, time, _err = results
         if time == self.INVALID_TIME:
             return 0, 0
-        _gfx, b, m, n, k = info[0]
+        # info[0] is the key tuple, and the tuned schema gained groupSize, so it
+        # carries six fields now. Unpacking five names off it raised for every
+        # single candidate, which is why the sweep reported "tune 0 shapes".
+        shape = dict(zip(self.keys, info[0]))
+        b, m, n, k = (int(shape[name]) for name in ("b", "m", "n", "k"))
         us_s = time * 1e-6
         tflops = round(2 * b * m * n * k / us_s / 1e12, 1)
         # fp8 A + fp8 W + bf16 out.
