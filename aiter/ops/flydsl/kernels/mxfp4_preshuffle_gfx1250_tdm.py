@@ -89,6 +89,7 @@ def launch_gemm_a8w4_tdm(
     row_major_ascale: Constexpr[int] = 0,
     a_row_stride_bytes: Constexpr[int] = 0,
     a_scale_row_stride_bytes: Constexpr[int] = 0,
+    real_k: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -157,6 +158,7 @@ def launch_gemm_a8w4_tdm(
         row_major_ascale,
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
+        real_k,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -264,10 +266,14 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    # K defines the physical layouts and strides; REAL_K only shortens the
+    # reduction loop for logically padded inputs.
+    REAL_K = real_k if real_k else K
+    _real_k = f"_RK{REAL_K}" if REAL_K != K else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
-        f"_b{num_buffers}_K{K}"
+        f"_b{num_buffers}_K{K}{_real_k}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_as_prologue}"
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}"
     )
@@ -289,7 +295,7 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
     ):
-        K_TILES = K // tile_k
+        K_TILES = REAL_K // tile_k
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
         K4 = K // 4

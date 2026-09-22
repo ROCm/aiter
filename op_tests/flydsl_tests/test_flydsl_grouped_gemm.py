@@ -82,6 +82,22 @@ _ACT_BY_NAME = {
     "situv2": ActivationType.Situv2,
 }
 
+
+def _gemm1_real_k(model_dim: int) -> int:
+    """Returns the requested GEMM1 reduction width."""
+    value = os.environ.get("AITER_TDM_GEMM1_REAL_K", "").strip()
+    try:
+        real_k = int(value) if value else model_dim
+    except ValueError as exc:
+        raise ValueError("AITER_TDM_GEMM1_REAL_K must be an integer") from exc
+    if not 0 < real_k <= model_dim:
+        raise ValueError(
+            "AITER_TDM_GEMM1_REAL_K must be in "
+            f"[1, model_dim={model_dim}], got {real_k}"
+        )
+    return real_k
+
+
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
 # Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
@@ -379,6 +395,7 @@ def _run_grouped_via_fused_moe(
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
 
     K = model_dim
+    gemm1_real_k = _gemm1_real_k(model_dim)
     inter = inter_dim
     K_pack = K // 2
     inter_pack = inter // 2
@@ -393,6 +410,8 @@ def _run_grouped_via_fused_moe(
         data_init=data_init,
         generator=generator,
     )
+    if gemm1_real_k < K:
+        w1_logical[..., gemm1_real_k // 2 :] = 0
     w2_logical = _pattern_packed(
         experts,
         K,
@@ -589,14 +608,15 @@ def _gemm_work_metrics(
     output_bytes = 2.0
     stage1_n = 2 * inter_dim
     routed_rows = tokens * topk
+    gemm1_k = _gemm1_real_k(model_dim)
 
-    gemm1_flops = routed_rows * stage1_n * model_dim * 2
+    gemm1_flops = routed_rows * stage1_n * gemm1_k * 2
     gemm1_bytes = (
-        routed_rows * model_dim * input_bytes
-        + routed_rows * model_dim // SCALE_BLOCK
+        routed_rows * gemm1_k * input_bytes
+        + routed_rows * gemm1_k // SCALE_BLOCK
         + routed_rows * inter_dim * output_bytes
-        + experts * model_dim * stage1_n * weight_bytes
-        + experts * model_dim * stage1_n // SCALE_BLOCK
+        + experts * gemm1_k * stage1_n * weight_bytes
+        + experts * gemm1_k * stage1_n // SCALE_BLOCK
     )
     gemm2_flops = tokens * topk * model_dim * inter_dim * 2
     gemm2_bytes = (
@@ -1234,6 +1254,12 @@ def main() -> None:
     )
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--model-dim", type=int, default=7168)
+    parser.add_argument(
+        "--real-k",
+        type=int,
+        default=None,
+        help="GEMM1 reduction width; tensors remain allocated at --model-dim",
+    )
     parser.add_argument("--inter-dim", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
@@ -1306,6 +1332,8 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
+    if args.real_k is not None:
+        os.environ["AITER_TDM_GEMM1_REAL_K"] = str(args.real_k)
     data_init_list = args.data_init or ["constant", "uniform"]
     scale_init_list = args.scale_init or ["constant", "auto"]
     if len(data_init_list) == 1:

@@ -829,6 +829,22 @@ def _grouped_a8w4_tdm_moe(
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
+    _real_k_env = os.environ.get("AITER_TDM_GEMM1_REAL_K", "").strip()
+    try:
+        gemm1_real_k = int(_real_k_env) if _real_k_env else int(model_dim)
+    except ValueError as exc:
+        raise ValueError("AITER_TDM_GEMM1_REAL_K must be an integer") from exc
+    if not 0 < gemm1_real_k <= model_dim:
+        raise ValueError(
+            "AITER_TDM_GEMM1_REAL_K must be in "
+            f"[1, model_dim={model_dim}], got {gemm1_real_k}"
+        )
+    if gemm1_real_k % tile_k:
+        raise ValueError(
+            f"AITER_TDM_GEMM1_REAL_K ({gemm1_real_k}) must be divisible by "
+            f"GEMM1 tile_k ({tile_k})"
+        )
+
     # Bound once, because the quant pass below rebinds a1_scale to the
     # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
     # shape, so nothing downstream could tell which one it was handed.
@@ -998,6 +1014,7 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            real_k=gemm1_real_k,
             **_situ_kw,
         )
     else:
@@ -1033,6 +1050,7 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            real_k=gemm1_real_k,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -1151,6 +1169,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        real_k=gemm1_real_k,
                         **_situ_kw,
                     ),
                 )
@@ -1187,6 +1206,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        real_k=gemm1_real_k,
                         **_situ_kw,
                     ),
                 )
