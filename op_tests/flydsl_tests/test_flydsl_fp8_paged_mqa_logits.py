@@ -327,7 +327,7 @@ def _bench_flydsl_paged_kernel(
     return {"flydsl us": float(us)}
 
 
-def test_fp8_paged_mqa_logits(
+def run_case(
     batch_size,
     next_n,
     heads,
@@ -540,7 +540,7 @@ def run_profile(args):
 def run_gluon_ab(args):
     rows = []
     for B, nn, H, D, kv_len in gluon_ab_shapes():
-        ret = test_fp8_paged_mqa_logits(
+        ret = run_case(
             batch_size=B,
             next_n=nn,
             heads=H,
@@ -636,7 +636,7 @@ def main():
 
     cases = exhaustive_cases() if args.exhaustive else default_cases()
 
-    df = [test_fp8_paged_mqa_logits(bench=args.bench, **c) for c in cases]
+    df = [run_case(bench=args.bench, **c) for c in cases]
     df = pd.DataFrame(df)
     try:
         summary = df.to_markdown(index=False)
