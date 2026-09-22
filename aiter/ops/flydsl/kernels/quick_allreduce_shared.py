@@ -225,6 +225,25 @@ def _acquire_inbox():
     llvm.fence(llvm.AtomicOrdering.acquire, syncscope="one-as")
 
 
+def atom_bf16_to_f32(atom_i32):
+    """16 B of bf16 (8 values) -> 8 f32.
+
+    bf16 is the high half of f32, so this is a widening move, not a conversion
+    -- exact, no rounding.
+    """
+    return fx.Vector(atom_i32).bitcast(fx.BFloat16).to(fx.Float32)
+
+
+def atom_f32_to_bf16(acc_f32):
+    """8 f32 -> 16 B of bf16.
+
+    One rounding, at the end of whatever computed *acc_f32*, which is what makes
+    the exact schedules bit-comparable with ``cross_device_reduce``'s fp32
+    accumulate + single downcast.
+    """
+    return acc_f32.to(fx.BFloat16).bitcast(fx.Int32)
+
+
 def make_pack_storage(n_i32: int):
     """LDS staging for *n_i32* packed words, 16 B aligned.
 

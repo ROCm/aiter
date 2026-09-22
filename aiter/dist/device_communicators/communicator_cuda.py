@@ -73,6 +73,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Borrowed, not owned: the group this was built for still uses it,
             # so destroy() here must not close its IPC inboxes.
             self.fly_comm = reuse_from.fly_comm
+            self.fly_rms_comm = reuse_from.fly_rms_comm
             self._owns_fly_comm = False
             self.symm_mem_comm = reuse_from.symm_mem_comm
             return
@@ -106,6 +107,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
         self.fly_comm = None
+        self.fly_rms_comm = None
         self._owns_fly_comm = True
         self.symm_mem_comm = None
         # if use_torch_symm_mem and current_platform.is_cuda():
@@ -137,13 +139,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
             # FlyDSL all-reduce family: exact one-shot / quantized mesh / ring,
-            # selected by payload size. Opt-in behind AITER_FLY_AR, and the
-            # policy tables are PCIe-only for now.
+            # selected by payload size. Opt-in behind AITER_FLY_AR.
             from aiter.dist.device_communicators.flydsl_all_reduce import (
                 FlyDSLAllReduce,
+                FlyDSLAllReduceRMSNorm,
             )
 
             self.fly_comm = FlyDSLAllReduce(group=self.cpu_group, device=self.device)
+            self.fly_rms_comm = FlyDSLAllReduceRMSNorm(
+                group=self.cpu_group, device=self.device
+            )
 
     @property
     def all2all_manager(self):
@@ -316,6 +321,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
+        
+        # FlyDSL first when enabled. The policy's min_bytes keeps it off 
+        # the decode shapes where cdr_fused:1stage wins.
+        fly_rms_comm = self.fly_rms_comm
+        if (
+            not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and not gemma_norm
+            and fly_rms_comm is not None
+            and not fly_rms_comm.disabled
+            and fly_rms_comm.should_fly_fused_ar_rms(input_, res_inp_, weight_)
+        ):
+            out, res_out = fly_rms_comm.fly_fused_ar_rms(input_, res_inp_, weight_, eps)
+            assert out is not None
+            assert res_out is not None
+            return out, res_out
+
         qr_comm = self.qr_comm
         if (
             not use_1stage
@@ -940,6 +963,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._owns_fly_comm:
                 self.fly_comm.close()
             self.fly_comm = None
+        if self.fly_rms_comm is not None:
+            if self._owns_fly_comm:
+                self.fly_rms_comm.close()
+            self.fly_rms_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self._all2all_manager is not None:

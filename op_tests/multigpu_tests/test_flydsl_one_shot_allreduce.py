@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness for the exact one-shot (1-stage) all-reduce (``OneShotAllReduce``).
+"""Correctness for the exact one-shot (1-stage) all-reduce and its fused form.
 
+Two kernels, one schedule: ``OneShotAllReduce`` (plain) and
+``OneShotAllReduceRMSNorm`` (all-reduce + residual add + RMSNorm, the drop-in
+for ``aiter::allreduce_fusion_kernel_1stage<T, T, N, false>``).
 
 Three things are checked per shape, and the second and third matter more than
 the first:
@@ -15,8 +18,14 @@ the first:
    inbox is double-buffered by ``colour & 1`` and the safety argument depends
    on a straggler's read of call k finishing before anyone's push for call
    k+2; a quiescent test never exercises that. Covered by
-   ``test_one_shot_allreduce_run_ahead``.
+   ``test_one_shot_allreduce_run_ahead`` and its fused counterpart.
 
+The fused suites add a fourth, which is the strongest check here:
+``residual_out`` must be **bit-exact** against the reference, not merely close.
+Both sides sum in rank order in fp32 and round exactly once, so equality is the
+correct expectation -- and it is the only cheap way to catch a missing bf16
+round-trip before the residual add, an error SQNR on ``out`` is far too loose
+to see and that compounds per layer in a real model.
 """
 
 from __future__ import annotations
@@ -74,6 +83,66 @@ RUN_AHEAD_M = 5
 RUN_AHEAD_ITERS = 200
 SQNR_FLOOR_DB = 45.0
 
+# Fused (all-reduce + residual add + RMSNorm) coverage. The tile is one token
+# row there, so `hidden` is baked into the kernel and every distinct width is a
+# distinct build -- unlike the plain kernel, where hidden is just payload bytes.
+#
+# 4096 at m in {1, 32} is the Qwen3-235B decode shape that motivated the kernel;
+# 7168 keeps parity with the plain list above; 2048 and 8192 are the ends of the
+# supported range (BLOCK 256 and 1024 at atoms=1).
+FUSED_HIDDENS = (2048, 4096, 7168, 8192)
+FUSED_M = (1, 2, 5, 8, 32)
+RMS_EPS = 1e-6
+
+_FUSED_SHAPE_CASES = tuple(
+    (m, hidden, f"{m}x{hidden}") for hidden in FUSED_HIDDENS for m in FUSED_M
+)
+
+# Widths with no native row geometry, which run on a *padded* workgroup: BLOCK
+# covers h_pad and the lanes past the real row are masked off. See
+# ``op_tests/dump_data/docs/flydsl_fused_allreduce_hidden_coverage.md``.
+#
+# 896 -> 1024 and 2304 -> 2560 pad within one atom of the row; 2880 -> 3072 is
+# the gpt-oss width and the one that motivated this.
+#
+# ``m`` has to reach past one row. With a single token every pad lane addresses
+# past the end of the tensor, where the descriptor bound masks it for free --
+# so m=1 passes even with the per-lane mask removed entirely. m=32 is what puts
+# a *real* row under the pad, which is the only arrangement where a leaked load
+# reads live data and a leaked store corrupts a neighbour.
+FUSED_PAD_HIDDENS = (896, 2304, 2880)
+_FUSED_PAD_SHAPE_CASES = tuple(
+    (m, hidden, f"{m}x{hidden}pad")
+    for hidden in FUSED_PAD_HIDDENS
+    for m in (1, 5, 32)
+)
+
+# `atoms` sets the *block width* in a fused build (BLOCK = hidden/(8*atoms)),
+# not the tile width, so these cases exercise the reduction ladder rather than
+# the wire -- the plain kernel's atoms cases already cover the wire.
+#
+# atoms=4 at hidden=4096 is BLOCK=128, two waves: the low end, where the LDS
+# partial count drops to 2. An off-by-one in the `BLOCK//64` unrolled combine
+# survives BLOCK=512 and dies here.
+#
+# It also catches a stride bug the default cannot see at all: the per-atom term
+# in the fanout is `atom * BLOCK * ATOM_I32`, which is identically zero at
+# atoms=1 no matter how wrong BLOCK is.
+FUSED_ATOMS_CASES = ((2, 4096), (2, 8192), (4, 4096), (4, 8192))
+
+# The same geometries reached from the other side: pin `block` and let the
+# engine solve for atoms at each width. Worth its own cases because the
+# resolution is per-hidden and hidden-dependent -- block 256 is atoms=4 at 8192
+# and does not exist at 7168 -- so a pinned block is the one knob whose validity
+# the constructor cannot decide on its own.
+FUSED_BLOCK_CASES = ((512, 4096), (256, 8192), (448, 7168))
+
+# Self-skip on the fused kernel: this rank's contribution comes out of registers
+# instead of out of its own inbox. `residual_out` is graded bit-exact, which is
+# what makes this a real check -- reading the register copy must produce the
+# same fp32 accumulation, in the same rank order, as the inbox round trip did.
+FUSED_SKIP_SELF_CASES = ((1, 4096), (8, 7168), (32, 8192))
+
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     ref = ref.double()
@@ -83,6 +152,53 @@ def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     if e == 0:
         return float("inf")
     return 10.0 * torch.log10(torch.tensor(p / e)).item()
+
+
+def _fused_reference(parts, residual, weight, eps):
+    """The C++ contract of ``allreduce_fusion_kernel_1stage<T, T, N, false>``.
+
+    Returns ``(out_ref, residual_out_ref)``. The bf16 round-trip on the third
+    line is not an accident and not an optimization: the unfused path
+    all-reduces into a bf16 tensor before adding the residual, and the fused
+    kernel is required to be a drop-in, so it throws the extra f32 mantissa
+    bits away too. Dropping it here would make this reference disagree with
+    both kernels.
+    """
+    ar = torch.zeros_like(parts[0], dtype=torch.float32)
+    for p in parts:  # rank order, matching the kernel's accumulation order
+        ar += p.float()
+    ar = ar.to(torch.bfloat16).float()
+    s = ar + residual.float()
+    residual_out = s.to(torch.bfloat16)
+    rstd = torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + eps)
+    return (s * rstd * weight.float()).to(torch.bfloat16), residual_out
+
+
+def _fused_inputs(m, hidden, tp, device):
+    """Per-rank contributions, residual and gain. Same seed on every rank."""
+    torch.manual_seed(1234 + m * 8191 + hidden)
+    parts = [
+        torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
+        for r in range(tp)
+    ]
+    residual = torch.randn(m, hidden, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+    return parts, residual, weight
+
+
+def _bits_agree(tensor, tp, dist) -> int | None:
+    """Rank of the first peer whose raw bits differ from rank 0's, or None.
+
+    Widened to int32 because gloo rejects int16 ("Invalid scalar type"); the
+    widening is exact, so the comparison is still on bits.
+    """
+    bits = tensor.view(torch.int16).to(torch.int32).cpu()
+    gathered = [torch.empty_like(bits) for _ in range(tp)]
+    dist.all_gather(gathered, bits)
+    for r, g in enumerate(gathered):
+        if not torch.equal(g, gathered[0]):
+            return r
+    return None
 
 
 def _run_rank(args) -> None:
@@ -96,6 +212,10 @@ def _run_rank(args) -> None:
     dist.init_process_group(
         backend="gloo", init_method=args.init_method, world_size=args.tp, rank=rank
     )
+
+    if args.mode.startswith("fused"):
+        _run_rank_fused(args, rank, device, dist)
+        return
 
     eng = OneShotAllReduce(
         group=dist.group.WORLD,
@@ -204,6 +324,130 @@ def _run_rank(args) -> None:
     dist.destroy_process_group()
 
 
+def _run_rank_fused(args, rank, device, dist) -> None:
+    """``OneShotAllReduceRMSNorm``: the same three questions as the plain kernel,
+    plus one the plain kernel cannot ask.
+
+    ``residual_out`` is checked for **bit-exactness**, not SQNR. Both the kernel
+    and ``_fused_reference`` sum in rank order in fp32 and round exactly once,
+    so equality is the correct expectation and anything else is a bug. It is
+    also the only cheap detector for a missing bf16 round-trip: SQNR on ``out``
+    is far too loose to notice one, and the error it hides compounds per layer.
+
+    ``out`` goes through ``rsqrt``, whose hardware approximation legitimately
+    differs from torch's, so it is graded on SQNR.
+    """
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
+
+    eng = OneShotAllReduceRMSNorm(
+        group=dist.group.WORLD,
+        device=device,
+        rank=rank,
+        world_size=args.tp,
+        # atoms and block are the same knob here -- the row has to fit one
+        # workgroup -- so the caller pins one and leaves the other None.
+        atoms=args.atoms,
+        grid_cap=args.grid_cap,
+        fanout=args.fanout,
+        block=args.block,
+        skip_self=args.skip_self,
+        # As in the plain test: the payload ceiling is a speed policy, not a
+        # correctness limit, so it must not decide what this test covers.
+        max_bytes=1 << 30,
+    )
+
+    def _check(m, hidden, tag):
+        bad = []
+        parts, residual, weight = _fused_inputs(m, hidden, args.tp, device)
+        inp = parts[rank].contiguous()
+        # A real warm launch, so the timed/checked call below is never the one
+        # that JITs. Writes into scratch, not into the buffers checked after.
+        eng.compile_and_launch(inp, residual, weight, RMS_EPS)
+        torch.cuda.synchronize()
+
+        out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+        torch.cuda.synchronize()
+
+        out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+
+        db = _sqnr_db(out_ref.float(), out.float())
+        if db < SQNR_FLOOR_DB:
+            bad.append(
+                f"{tag}: out SQNR {db:.2f} dB below the {SQNR_FLOOR_DB} dB floor"
+            )
+
+        if not torch.equal(res_out.view(torch.int16), res_ref.view(torch.int16)):
+            n = int((res_out.view(torch.int16) != res_ref.view(torch.int16)).sum())
+            bad.append(
+                f"{tag}: residual_out differs from the reference in {n} of "
+                f"{res_out.numel()} bf16 lanes (the all-reduce is not rank-ordered, "
+                "or the bf16 round-trip before the residual add is missing)"
+            )
+
+        for name, t in (("out", out), ("residual_out", res_out)):
+            r = _bits_agree(t, args.tp, dist)
+            if r is not None:
+                bad.append(f"{tag}: {name} on rank {r} differs from rank 0")
+        return bad
+
+    failures = []
+    if args.mode == "fused_run_ahead":
+        m, hidden = args.tokens[0], args.hiddens[0]
+        parts, residual, weight = _fused_inputs(m, hidden, args.tp, device)
+        inp = parts[rank].contiguous()
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+        eng.compile_and_launch(inp, residual, weight, RMS_EPS)
+        out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+        drag = torch.randn(4096, 4096, device=device, dtype=torch.float32)
+        bad = 0
+        checks = 0
+        for it in range(args.iters):
+            # Rank 0 arrives late every third call, so the others run ahead into
+            # the other parity slot -- the case the double-buffered inbox exists
+            # for, and one a quiescent loop never reaches.
+            if rank == 0 and it % 3 == 0:
+                for _ in range(3):
+                    drag = drag @ drag.T * 1e-6
+            eng.allreduce_rmsnorm(
+                inp, residual, weight, RMS_EPS, out=out, residual_out=res_out
+            )
+            if it % 25 == 0:
+                torch.cuda.synchronize()
+                checks += 1
+                if _sqnr_db(
+                    out_ref.float(), out.float()
+                ) < SQNR_FLOOR_DB or not torch.equal(
+                    res_out.view(torch.int16), res_ref.view(torch.int16)
+                ):
+                    bad += 1
+        torch.cuda.synchronize()
+        if bad or _sqnr_db(out_ref.float(), out.float()) < SQNR_FLOOR_DB:
+            failures.append(f"fused run-ahead loop: {bad} bad checks of {checks}")
+    else:
+        for m, hidden in zip(args.tokens, args.hiddens, strict=True):
+            failures.append(_check(m, hidden, f"{m}x{hidden}"))
+
+    gathered = [None] * args.tp
+    dist.all_gather_object(gathered, failures)
+    if rank == 0 and args.out:
+        with open(args.out, "w") as fh:
+            json.dump({"ranks": gathered}, fh)
+    dist.barrier()
+    eng.close()
+    dist.destroy_process_group()
+
+
+def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
+    """One log per (world size, rank, mode, knobs) so concurrent spawn
+    configurations cannot overwrite each other's failure tails.
+
+    *tag* has to name every pinned knob, not just ``atoms``: a block-pinned
+    fused spawn leaves atoms unset, so two of them would otherwise share a path.
+    """
+    return f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_{mode}_{tag}_rank{rank}.log"
+
+
 def _spawn(
     world_size: int,
     pairs: list[tuple[int, int]],
@@ -233,6 +477,11 @@ def _spawn(
     env.setdefault("FLYDSL_GPU_ARCH", ARCH)
     tokens = ",".join(str(t) for t, _ in pairs)
     hiddens = ",".join(str(h) for _, h in pairs)
+    tag = f"a{atoms}"
+    if block is not None:
+        tag += f"_b{block}"
+    if skip_self is not None:
+        tag += "_ss" if skip_self else "_noss"
     procs = []
     logs = []
     for rank in range(world_size):
@@ -270,7 +519,7 @@ def _spawn(
         if rank == 0:
             cmd += ["--out", out_path]
         log = open(  # noqa: SIM115
-            f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_rank{rank}.log",
+            _log_path(world_size, rank, mode, tag),
             "w",
         )
         procs.append(
@@ -290,7 +539,7 @@ def _spawn(
     if rc != 0:
         tails = []
         for rank in range(world_size):
-            path = f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_rank{rank}.log"
+            path = _log_path(world_size, rank, mode, tag)
             try:
                 with open(path) as fh:
                     tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
@@ -327,10 +576,21 @@ def _index_by_shape(
     }
 
 
-def _batch_cache_lookup(key: tuple, pairs: list[tuple[int, int]]) -> dict:
-    """One ``_spawn`` call per `key`, all shapes computed at once."""
+def _batch_cache_lookup(
+    key: tuple, pairs: list[tuple[int, int]], **spawn_kwargs
+) -> dict:
+    """One ``_spawn`` call per `key`, all shapes computed at once.
+
+    ``key`` is ``(world_size, mode)`` or ``(world_size, mode, atoms)``; every
+    axis in it is one that forces a separate spawn. Anything passed in
+    ``spawn_kwargs`` is such an axis too, so it has to be reflected in *key* --
+    two lookups that differ only in a kwarg would otherwise share one cached
+    spawn.
+    """
     if key not in _BATCH_CACHE:
-        ranks = _spawn(key[0], pairs)
+        world_size, mode = key[0], key[1]
+        spawn_kwargs.setdefault("atoms", key[2] if len(key) > 2 else DEFAULT_ATOMS)
+        ranks = _spawn(world_size, pairs, mode=mode, **spawn_kwargs)
         _BATCH_CACHE[key] = _index_by_shape(ranks, pairs)
     return _BATCH_CACHE[key]
 
@@ -344,6 +604,228 @@ def test_one_shot_allreduce_sqnr_and_bitidentity(m, hidden, label, world_size):
     bad_per_rank = batch[(m, hidden)]
     for rank, bad in enumerate(bad_per_rank):
         assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden,label", _FUSED_SHAPE_CASES)
+def test_one_shot_allreduce_rmsnorm(m, hidden, label, world_size):
+    """``OneShotAllReduceRMSNorm`` against an fp32 reference of the C++ contract.
+
+    Per shape: ``out`` at the bf16 SQNR floor, ``residual_out`` **bit-exact**,
+    and both outputs bit-identical across ranks. See ``_run_rank_fused`` for why
+    the middle one is an equality rather than a tolerance.
+    """
+    group_pairs = [(mm, hh) for mm, hh, _ in _FUSED_SHAPE_CASES]
+    batch = _batch_cache_lookup((world_size, "fused"), group_pairs)
+    for rank, bad in enumerate(batch[(m, hidden)]):
+        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden,label", _FUSED_PAD_SHAPE_CASES)
+def test_one_shot_allreduce_rmsnorm_padded(m, hidden, label, world_size):
+    """Widths that only exist because the workgroup is padded past the row.
+
+    Graded exactly like the native widths -- and that is the point. Padding is
+    supposed to be invisible to the answer: the pad lanes load 0, push 0 on the
+    wire and add 0 to the sum of squares, and their stores are dropped, so
+    ``residual_out`` must still be **bit-exact** against the fp32 reference.
+
+    Anything that leaks shows up here rather than as a tolerance wobble. A
+    mask that is one atom too wide reads the next row's first 16 B into the
+    norm; a store that is not dropped overwrites the next row's first 16 B.
+    Both change bits that the equality check sees.
+    """
+    group_pairs = [(mm, hh) for mm, hh, _ in _FUSED_PAD_SHAPE_CASES]
+    # key[2] is read as ``atoms`` by ``_batch_cache_lookup``; the trailing
+    # "pad" is only there to keep this group's spawn out of the plain fused
+    # cache entry, which shares both the mode and the atoms value.
+    batch = _batch_cache_lookup(
+        (world_size, "fused", DEFAULT_ATOMS, "pad"), group_pairs
+    )
+    for rank, bad in enumerate(batch[(m, hidden)]):
+        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+def test_one_shot_allreduce_rmsnorm_padding_is_least_wire():
+    """The padded pick is the narrowest legal width at or above hidden dim.
+
+    Host-side and GPU-free. Guards the selection rule rather than the kernel:
+    padding costs ``(h_pad-hidden)/hidden`` extra wire on a bandwidth-bound
+    schedule, so taking anything but the least is a silent throughput loss.
+
+    Also pins the half of the contract that matters more -- a width with a
+    native geometry must not pad at all, or every shipped shape pays for this.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        fused_block_options,
+        fused_padded_block,
+        fused_padded_block_options,
+    )
+
+    # Every width the padded GPU cases use must have *no* native geometry, or
+    # those cases would be passing on the unpadded path and proving nothing.
+    for hidden in FUSED_PAD_HIDDENS:
+        assert not fused_block_options(hidden), (
+            f"hidden={hidden} is in FUSED_PAD_HIDDENS but builds natively, so "
+            "test_one_shot_allreduce_rmsnorm_padded is not testing padding"
+        )
+        assert fused_padded_block(hidden)[2] > hidden
+
+    for hidden in range(8, 40961, 8):
+        opts = fused_padded_block_options(hidden)
+        if not opts:
+            continue
+        block, atoms, h_pad = fused_padded_block(hidden)
+        assert h_pad >= hidden
+        assert h_pad == min(o[2] for o in opts), (
+            f"hidden={hidden} padded to {h_pad}, but {min(o[2] for o in opts)} "
+            "is legal and moves fewer bytes"
+        )
+        assert block * atoms * 8 == h_pad
+        native = fused_block_options(hidden)
+        if native:
+            assert (h_pad, block, atoms) == (hidden, *native[0]), (
+                f"hidden={hidden} has a native geometry {native[0]} but "
+                f"resolved to a padded {(block, atoms, h_pad)}"
+            )
+
+
+def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
+    """A pinned block a width lacks natively resolves through the padded set.
+
+    ``OneShotAllReduceRMSNorm._geom_for`` is the resolver ``supports_hidden``
+    and the launch path both go through. The two must agree on a pinned block:
+    the bench sweeps ``block=1024``, which hidden=4096 admits only via padding
+    (its native blocks are 512/256/128). An earlier ``_geom_for`` sent every
+    pinned block through the native-only ``fused_atoms_for_block`` and raised on
+    exactly this pair, so ``supports_hidden`` said yes while the warm launch
+    crashed.
+
+    ``_geom_for`` reads only ``self.block``/``self.pad``/``self._ladder``, so it
+    is exercised on a bare instance -- host-side and GPU-free, no process group.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import fused_block_options
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
+
+    def geom(block, pad, hidden, rung_atoms=1):
+        eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
+        eng.block = block
+        eng.pad = pad
+        return OneShotAllReduceRMSNorm._geom_for(eng, hidden, rung_atoms)
+
+    # 4096 admits 512/256/128 natively; 1024 only by padding to h_pad=8192.
+    assert 1024 not in [b for b, _ in fused_block_options(4096)]
+
+    # The regression: pinned non-native block, padding on -> resolves, no raise.
+    atoms, h_pad = geom(1024, True, 4096)
+    assert h_pad == 8192 and 1024 * atoms * 8 == h_pad
+
+    # A pinned block the width *does* admit natively stays native (h_pad==hidden).
+    assert geom(512, True, 4096) == (1, 4096)
+
+    # supports_hidden and _geom_for must give the same yes/no on the pin. When
+    # supports_hidden says yes, _geom_for must return a geometry that honours
+    # the pin rather than raising.
+    for block in (128, 256, 512, 1024):
+        eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
+        eng.block = block
+        eng.pad = True
+        if eng.supports_hidden(4096):
+            atoms, h_pad = OneShotAllReduceRMSNorm._geom_for(eng, 4096, 1)
+            assert block * atoms * 8 == h_pad, (block, atoms, h_pad)
+
+    # Padding off: a pinned non-native block has no geometry, so _geom_for hands
+    # back the rung atoms and lets the build raise -- it must not resolve to a
+    # padded width behind the caller's back.
+    assert geom(1024, False, 4096) == (1, 4096)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("atoms,hidden", FUSED_ATOMS_CASES)
+def test_one_shot_allreduce_rmsnorm_atoms(atoms, hidden, world_size):
+    """Narrower blocks: ``atoms`` sets BLOCK = hidden/(8*atoms) in a fused build.
+
+    Covers the low end of the reduction ladder (atoms=4 at hidden=4096 is a
+    two-wave block) and the per-atom fanout stride, which is identically zero
+    at the atoms=1 default and so is untested by every case above.
+    """
+    pairs = [(m, hidden) for m in (1, 8)]
+    # hidden is in the key as well as atoms: two cases can share an atoms value
+    # and differ only in width, and they are different spawns.
+    batch = _batch_cache_lookup((world_size, "fused", atoms, hidden), pairs)
+    for m, _ in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} atoms={atoms}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("block,hidden", FUSED_BLOCK_CASES)
+def test_one_shot_allreduce_rmsnorm_block(block, hidden, world_size):
+    """Pinning ``block`` instead of ``atoms``, which is the tuner's currency.
+
+    The engine has to solve ``block * atoms * 8 == hidden`` for atoms at this
+    width and build the same kernel the equivalent atoms pin would. What this
+    catches that ``..._atoms`` does not is the resolution itself: an off-by-one
+    there produces a *valid* kernel of the wrong width, which still runs.
+    """
+    pairs = [(m, hidden) for m in (1, 8)]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", f"b{block}", hidden),
+        pairs,
+        atoms=None,
+        block=block,
+    )
+    for m, _ in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} block={block}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden", FUSED_SKIP_SELF_CASES)
+def test_one_shot_allreduce_rmsnorm_skip_self(m, hidden, world_size):
+    """Self-skip under the fused epilogue.
+
+    The plain kernel's self-skip cases cover the wire -- one fewer store, one
+    fewer flag, a remapped spin lane. What is specific here is that the fused
+    epilogue consumes the *unrounded* fp32 accumulator, so it is the path where
+    substituting the register copy for the inbox copy could change a rounding.
+    ``residual_out`` is bit-exact against the reference, so it cannot.
+    """
+    pairs = [(m, hidden)]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", "ss", m, hidden),
+        pairs,
+        # Explicit: key[2] is a label here, not an atoms value, so the
+        # positional inference in _batch_cache_lookup must not be relied on.
+        atoms=DEFAULT_ATOMS,
+        skip_self=True,
+    )
+    for rank, bad in enumerate(batch[(m, hidden)]):
+        assert (
+            not bad
+        ), f"{m}x{hidden} skip_self, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+def test_one_shot_allreduce_rmsnorm_run_ahead(world_size):
+    """The fused kernel under deliberate rank skew.
+
+    The epilogue reuses one LDS buffer across every token of the grid-stride
+    loop, ordered only by the barrier already inside ``_publish``. A quiescent
+    single call never puts weight on that argument; this does.
+    """
+    ranks = _spawn(
+        world_size, [(RUN_AHEAD_M, 4096)], mode="fused_run_ahead", iters=RUN_AHEAD_ITERS
+    )
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
@@ -409,6 +891,11 @@ def main():
         default=None,
     )
     ap.add_argument("--block", type=int, default=None, choices=SUPPORTED_BLOCKS)
+    ap.add_argument(
+        "--plain-only",
+        action="store_true",
+        help="skip the fused (all-reduce + residual + RMSNorm) suites",
+    )
     args = ap.parse_args()
 
     n = torch.cuda.device_count()
@@ -444,6 +931,53 @@ def main():
     )
     failures += [f"rank {r}: {bad}" for r, bad in enumerate(run_ahead_ranks) if bad]
 
+    if not args.plain_only:
+        fused_pairs = [(m, h) for m, h, _ in _FUSED_SHAPE_CASES]
+        fused_ranks = _spawn(
+            args.tp,
+            fused_pairs,
+            atoms=args.atoms,
+            grid_cap=args.grid_cap,
+            fanout=args.fanout,
+            mode="fused",
+        )
+        failures += [
+            f"fused rank {r}: {bad}"
+            for r, shape_bads in enumerate(fused_ranks)
+            for bad in shape_bads
+            if bad
+        ]
+
+        for fused_atoms, fused_hidden in FUSED_ATOMS_CASES:
+            atom_ranks = _spawn(
+                args.tp,
+                [(m, fused_hidden) for m in (1, 8)],
+                atoms=fused_atoms,
+                grid_cap=args.grid_cap,
+                fanout=args.fanout,
+                mode="fused",
+            )
+            failures += [
+                f"fused atoms={fused_atoms} hidden={fused_hidden} rank {r}: {bad}"
+                for r, shape_bads in enumerate(atom_ranks)
+                for bad in shape_bads
+                if bad
+            ]
+
+        fused_ahead = _spawn(
+            args.tp,
+            [(RUN_AHEAD_M, 4096)],
+            atoms=args.atoms,
+            grid_cap=args.grid_cap,
+            fanout=args.fanout,
+            mode="fused_run_ahead",
+        )
+        failures += [
+            f"fused run-ahead rank {r}: {bad}"
+            for r, bad in enumerate(fused_ahead)
+            if bad
+        ]
+
     if failures:
         print("FAIL\n  " + "\n  ".join(failures))
         raise SystemExit(1)
@@ -465,7 +999,11 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument("--block", type=int, default=None)
-    parser.add_argument("--mode", default="shapes", choices=("shapes", "run_ahead"))
+    parser.add_argument(
+        "--mode",
+        default="shapes",
+        choices=("shapes", "run_ahead", "fused", "fused_run_ahead"),
+    )
     parser.add_argument("--tokens", default="")
     parser.add_argument("--hiddens", default="")
     parser.add_argument("--iters", type=int, default=RUN_AHEAD_ITERS)

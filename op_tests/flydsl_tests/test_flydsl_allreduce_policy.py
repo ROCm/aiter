@@ -44,7 +44,11 @@ def test_thresholds_partition_by_size(cell):
     overlap. ``FamilyPolicy.__post_init__`` enforces it; this pins that the
     shipped values actually satisfy it rather than that the check exists."""
     p = P.FAMILY_POLICY[cell]
-    assert 0 < p.oneshot_max <= p.mesh_max <= p.max_bytes
+    assert 0 < p.oneshot_max
+    if p.mesh_max is not None:
+        assert p.oneshot_max <= p.mesh_max
+    if p.mesh_max is not None and p.ring_max is not None:
+        assert p.mesh_max <= p.ring_max
     assert 0 < p.oneshot_max_exact
     assert p.min_bytes <= p.oneshot_max
 
@@ -59,7 +63,13 @@ def test_resolved_policy_partitions_by_size(cell):
     observes the two disagreeing."""
     for mode in P.ACCURACY_MODES:
         p = P.resolve(cell[0], cell[1], mode=mode)
-        assert 0 < p.oneshot_max <= p.oneshot_max_exact <= p.mesh_max <= p.max_bytes
+        assert 0 < p.oneshot_max == p.oneshot_max_exact
+        # mesh_max=0 / ring_max=0 are "algorithm disabled" sentinels (exact mode);
+        # ordering only applies to active (positive or None) ceilings.
+        if p.mesh_max is not None and p.mesh_max > 0:
+            assert p.oneshot_max <= p.mesh_max
+        if p.mesh_max is not None and p.mesh_max > 0 and p.ring_max is not None and p.ring_max > 0:
+            assert p.mesh_max <= p.ring_max
         assert p.min_bytes <= p.oneshot_max
 
 
@@ -90,9 +100,16 @@ def test_oneshot_ceiling_shrinks_with_world_size():
 
 
 def test_xgmi_never_selects_the_ring():
-    """On xGMI the ring is never dispatched at any size or world."""
+    """On xGMI the ring is never dispatched at any size or world.
+
+    xGMI is an all-pairs equidistant fabric: the ring's sequential hops offer
+    no locality advantage, and the mesh's parallel fanout always wins. The
+    policy expresses this with ``mesh_max=None`` (unbounded mesh, no ring
+    window) rather than a finite sentinel.
+    """
     for ws in WORLDS:
         p = P.resolve("xgmi", ws, mode="fast")
+        assert p.mesh_max is None
         assert "ring" not in P.families_reachable(p)
         assert P.pick_family(1 << 30, p) == "mesh"
 
@@ -186,7 +203,9 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
         for _floor, *_ in oneshot_ladder(ws, link)[1:]:
             assert _floor < one_hi, ("oneshot", link, ws, _floor)
         for floor, *_ in MESH_ST_LADDER[ws][1:]:
-            assert floor < p.mesh_max, ("mesh", link, ws, floor)
+            # mesh_max=None means the mesh window is unbounded; every rung
+            # is inside it by definition.
+            assert p.mesh_max is None or floor < p.mesh_max, ("mesh", link, ws, floor)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.
 
@@ -209,7 +228,7 @@ def test_accuracy_mode_env():
 def test_exact_mode_is_oneshot_only():
     """``"exact"`` is not just a wider one-shot boundary -- it is a different
     policy shape. Above ``oneshot_max_exact`` there is no mesh/ring window at
-    all: ``mesh_max`` and ``max_bytes`` collapse onto ``oneshot_max``, so
+    all: ``mesh_max=0`` and ``ring_max=0`` (disabled sentinels), so
     ``should_fly_all_reduce`` declines any larger payload instead of routing
     it to a quantized schedule. A caller who never touches
     ``AITER_FLY_AR_ACCURACY`` gets bit-exact FlyDSL or no FlyDSL, never
@@ -218,8 +237,8 @@ def test_exact_mode_is_oneshot_only():
     for link in P.LINKS:
         for ws in WORLDS:
             exact = P.resolve(link, ws, mode="exact")
-            assert exact.mesh_max == exact.oneshot_max
-            assert exact.max_bytes == exact.oneshot_max
+            assert exact.mesh_max == 0
+            assert exact.ring_max == 0
             assert P.families_reachable(exact) == ("oneshot",)
             assert exact.oneshot_max == P.FAMILY_POLICY[(link, ws)].oneshot_max_exact
 
@@ -227,11 +246,16 @@ def test_exact_mode_is_oneshot_only():
 def test_fast_mode_still_prefers_exactness_where_free():
     """``"fast"`` keeps the original two-boundary shape: one-shot up to
     ``oneshot_max``, mesh/ring beyond it -- unaffected by ``"exact"`` existing
-    as a separate, stricter policy."""
+    as a separate, stricter policy.
+
+    On PCIe all three families are reachable: mesh_max is finite (the ring
+    window starts above it) and ring_max=None (the ring window is unbounded).
+    """
     for ws in WORLDS:
         p = P.resolve("pcie", ws, mode="fast")
+        assert p.mesh_max is not None
         assert p.mesh_max > p.oneshot_max
-        assert p.max_bytes > p.mesh_max
+        assert p.ring_max is None  # ring window is unbounded on PCIe
 
 
 def test_enable_flag_is_opt_in_only():
@@ -270,7 +294,7 @@ def test_exact_mode_ignores_mesh_max_override():
     a warning) rather than applied."""
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
         p = P.resolve("pcie", 4, mode="exact")
-        assert p.mesh_max == p.oneshot_max
+        assert p.mesh_max == 0
         assert p.mesh_max != 1048576
 
 
