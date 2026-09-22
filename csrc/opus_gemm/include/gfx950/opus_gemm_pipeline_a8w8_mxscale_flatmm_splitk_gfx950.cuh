@@ -567,22 +567,38 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                            + (size_t)batch_id * kargs.stride_sfa_batch
                            + (size_t)row * kargs.stride_sfa + sf_start,
                            sfa_bytes);
-    // Bounded like g_sfa, and it has to be. The scale ring's padding lanes read
-    // past the live groups on purpose, and the comment justifying that said the
-    // reads "return zero through the buffer's num_records bound" -- true of
-    // g_sfa, which carries sfa_bytes, and not of this buffer, which carried no
-    // bound at all. Unbounded they fault: that is the GPU coredump the tune
-    // sweep died on, and it stayed hidden because whether a padding lane lands
-    // inside the allocation depends on the shape -- N=256, which the correctness
-    // check uses, happens to be safe where N=1024 is not.
-    const unsigned int sfb_groups_avail =
-        (unsigned int)(ceil_div(kargs.n, T::GROUP_N) - col / T::GROUP_N);
-    const unsigned int sfb_bytes =
-        sfb_groups_avail * (unsigned int)kargs.stride_sfb * sizeof(D_SF);
-    auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
-                           + (size_t)batch_id * kargs.stride_sfb_batch
-                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start,
-                           sfb_bytes);
+    // Two shapes for the preloaded scales, picked by the traits rather than by a
+    // template flag so the codegen and every existing instantiation stay as they
+    // are: GROUP_K=128 keeps the whole-split panel described at the LDS sizing
+    // below, GROUP_K=32 takes the ring, because the panel cannot hold a 32 split.
+    constexpr bool SF_PANEL = PRELOAD_SF_LDS && !T::SF_USE_RING;
+    constexpr bool SF_RING  = PRELOAD_SF_LDS && T::SF_USE_RING;
+
+    // The scale ring's padding lanes read past the live groups on purpose, so a
+    // ring kid needs a num_records or those reads fault -- that was the coredump
+    // the tune sweep died on. Nothing else reads past, and deriving a bound per
+    // tile cost the 128 path 5% at M=1 and M=16 on the B_M=16 tileN kids, so
+    // every non-ring kid keeps the unbounded descriptor it has always had. 0xffffffff
+    // is what make_gmem's size defaults to, so that path is unchanged bit for bit.
+    //
+    // The ring's bound is the group extent, not stride_sfb_batch: that field is
+    // w_scale.stride(0), which is 0 when the caller shares one set of scales
+    // across the batch, and a num_records of 0 reads every scale as zero.
+    //
+    // A ring kid also keeps its group base in the per-load offsets via sfb_base
+    // rather than in the pointer, so the bound stays relative to the batch slice.
+    const D_SF* p_sfb = reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
+                        + (size_t)batch_id * kargs.stride_sfb_batch;
+    int sfb_base = 0;
+    unsigned int sfb_records = 0xffffffff;
+    if constexpr (SF_RING) {
+        sfb_base = (col / T::GROUP_N) * kargs.stride_sfb + sf_start;
+        sfb_records = (unsigned int)(ceil_div(kargs.n, T::GROUP_N) * kargs.stride_sfb)
+                      * sizeof(D_SF);
+    } else {
+        p_sfb += (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start;
+    }
+    auto g_sfb = make_gmem(p_sfb, sfb_records);
 
     int role = ((wave_id & 1) ^ ((wgid >> 8) & 1));
 
@@ -602,13 +618,6 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // for a compile-time K upper bound (SFA_K_MAX); the actual packed count is a
     // runtime value so any K<=SFA_K_MAX (K%B_K==0) works. SFA_K_MAX=8192 keeps the
     // combined panel <=~4.2 KiB, well inside the WG_PER_CU=2 LDS headroom.
-    //
-    // Two shapes, picked by the traits rather than by a template flag so the
-    // codegen and every existing instantiation stay as they are: GROUP_K=128
-    // keeps this whole-split panel, GROUP_K=32 takes the ring, because the panel
-    // cannot hold a 32 split (T::SF_USE_RING).
-    constexpr bool SF_PANEL = PRELOAD_SF_LDS && !T::SF_USE_RING;
-    constexpr bool SF_RING  = PRELOAD_SF_LDS && T::SF_USE_RING;
     constexpr int SFA_K_MAX        = 8192;
     constexpr int SFA_K_TILES_MAX  = SF_PANEL ? (SFA_K_MAX / T::B_K) : 1;
     constexpr int SF_SCALES_MAX    = SFA_K_TILES_MAX * T::SCALES_PER_BK;
@@ -720,7 +729,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
             opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             s_waitcnt_vmcnt(0_I);
@@ -801,22 +810,25 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         // exposed rather than overlapped. A chunk must not span two panel rows and
         // its source offset must stay naturally aligned, so the width has to divide
         // both sf_k_scales and the row stride; hence the short-K fallbacks.
-        auto fill = [&](auto vec_c, auto sm, auto g, int stride, int total) {
+        // `base` is the tile's own offset into the buffer. g_sfa still carries
+        // its row in the pointer so it passes 0; g_sfb no longer carries its
+        // group base, so it passes sfb_base.
+        auto fill = [&](auto vec_c, auto sm, auto g, int stride, int base, int total) {
             constexpr int VEC = decltype(vec_c)::value;
             for (int idx = tid * VEC; idx < total; idx += T::BLOCK_SIZE * VEC) {
                 const int r  = idx / sf_k_scales;
                 const int kt = idx - r * sf_k_scales;
-                sm.template store<VEC>(load<VEC>(g, r * stride + kt), idx);
+                sm.template store<VEC>(load<VEC>(g, base + r * stride + kt), idx);
             }
         };
-        auto fill_panel = [&](auto sm, auto g, int stride, int total) {
+        auto fill_panel = [&](auto sm, auto g, int stride, int base, int total) {
             const int widths = sf_k_scales | stride;
-            if      ((widths & 15) == 0) fill(number<16>{}, sm, g, stride, total);
-            else if ((widths & 3) == 0)  fill(number<4>{},  sm, g, stride, total);
-            else                         fill(number<1>{},  sm, g, stride, total);
+            if      ((widths & 15) == 0) fill(number<16>{}, sm, g, stride, base, total);
+            else if ((widths & 3) == 0)  fill(number<4>{},  sm, g, stride, base, total);
+            else                         fill(number<1>{},  sm, g, stride, base, total);
         };
-        fill_panel(sm_sfa, g_sfa, kargs.stride_sfa, sfa_total);
-        fill_panel(sm_sfb, g_sfb, kargs.stride_sfb, sfb_total);
+        fill_panel(sm_sfa, g_sfa, kargs.stride_sfa, 0, sfa_total);
+        fill_panel(sm_sfb, g_sfb, kargs.stride_sfb, sfb_base, sfb_total);
         // vmcnt retires the global reads feeding the panel; lgkmcnt retires the
         // ds_writes that actually publish it. s_barrier does neither on its own.
         s_waitcnt_vmcnt(0_I);
@@ -872,7 +884,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     constexpr int c = decltype(c_c)::value * CHUNK;
                     const int idx = c + wave_base + lane_off;
                     async_load<VEC>(g_sfb, slot_b + c + wave_base,
-                                    (idx / SPBK) * kargs.stride_sfb
+                                    sfb_base + (idx / SPBK) * kargs.stride_sfb
                                         + k_off + idx % SPBK);
                 });
             }
@@ -1031,7 +1043,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
                 opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
+                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
             }
@@ -1346,6 +1358,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
 
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
                          + (size_t)batch_id * kargs.stride_b_batch + (size_t)col * kargs.stride_b);
+    // No ring in this kernel, so nothing reads past the live groups and the
+    // descriptor stays unbounded as it always was. sfb_base exists only so the
+    // load sites can keep the same shape as the ring kernel's.
+    const int sfb_base = 0;
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                            + (size_t)batch_id * kargs.stride_sfb_batch
                            + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
@@ -1499,7 +1515,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
                 vtype_sfb v_sfb;
                 opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
+                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
                 if constexpr (!SKIP_SCALE_WAIT) {
@@ -1682,6 +1698,10 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
 
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
                          + (size_t)batch_id * kargs.stride_b_batch + (size_t)col * kargs.stride_b);
+    // No ring in this kernel, so nothing reads past the live groups and the
+    // descriptor stays unbounded as it always was. sfb_base exists only so the
+    // load sites can keep the same shape as the ring kernel's.
+    const int sfb_base = 0;
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                            + (size_t)batch_id * kargs.stride_sfb_batch
                            + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
@@ -1801,7 +1821,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
             vtype_sfb v_sfb;
             opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             opus::static_for<MI>([&](auto mi_c) {
@@ -1945,6 +1965,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
                            + (size_t)batch_id * kargs.stride_sfa_batch
                            + (size_t)row * kargs.stride_sfa);
+    // No ring in this kernel, so nothing reads past the live groups and the
+    // descriptor stays unbounded as it always was. sfb_base exists only so the
+    // load sites can keep the same shape as the ring kernel's.
+    const int sfb_base = 0;
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                            + (size_t)batch_id * kargs.stride_sfb_batch
                            + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
@@ -1985,7 +2009,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
             // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
             // instantiation would read wave 0's scale groups from every wave.
             static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
-            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + scale_base,
+            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + sfb_base + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         s_waitcnt_vmcnt(0_I);
@@ -2065,6 +2089,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
                            + (size_t)batch_id * kargs.stride_sfa_batch
                            + (size_t)row * kargs.stride_sfa);
+    // No ring in this kernel, so nothing reads past the live groups and the
+    // descriptor stays unbounded as it always was. sfb_base exists only so the
+    // load sites can keep the same shape as the ring kernel's.
+    const int sfb_base = 0;
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                            + (size_t)batch_id * kargs.stride_sfb_batch
                            + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
@@ -2142,7 +2170,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
             // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
             // instantiation would read wave 0's scale groups from every wave.
             static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
-            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + scale_base,
+            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + sfb_base + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         if constexpr (!SKIP_SCALE_WAIT) {
