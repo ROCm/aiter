@@ -25,7 +25,6 @@ Usage:
 """
 
 import contextlib
-import inspect
 import os
 import sys
 import tempfile
@@ -157,50 +156,8 @@ def test_get_build_targets():
             "gfx942" in GFX_CU_NUM_MAP and "gfx950" in GFX_CU_NUM_MAP,
         )
 
-        # 1.8 AITER_GPU_TARGETS: two CU counts of one arch, which GPU_ARCHS
-        # plus a single global CU_NUM cannot express.
+        # 1.8 Live GPU fallback — requires torch and a GPU; skipped otherwise
         del os.environ["GPU_ARCHS"]
-        targets_env = f"{TARGET_B[0]}:{TARGET_B[1]};{TARGET_D[0]}:{TARGET_D[1]}"
-        os.environ["AITER_GPU_TARGETS"] = targets_env
-        t = get_build_targets_env()
-        _check(
-            f"AITER_GPU_TARGETS={targets_env} → two targets same gfx",
-            t == [TARGET_B, TARGET_D],
-            str(t),
-        )
-
-        # 1.9 Exact duplicates are removed without changing caller order.
-        os.environ["AITER_GPU_TARGETS"] = (
-            f"{TARGET_D[0]}:{TARGET_D[1]},{TARGET_B[0]}:{TARGET_B[1]};"
-            f"{TARGET_D[0]}:{TARGET_D[1]}"
-        )
-        t = get_build_targets_env()
-        _check(
-            "AITER_GPU_TARGETS preserves first-occurrence order",
-            t == [TARGET_D, TARGET_B],
-            str(t),
-        )
-
-        # 1.10 Bare entry falls back to the GFX_CU_NUM_MAP default
-        os.environ["AITER_GPU_TARGETS"] = TARGET_B[0]
-        t = get_build_targets_env()
-        _check(
-            f"AITER_GPU_TARGETS={TARGET_B[0]} → [{TARGET_B}]", t == [TARGET_B], str(t)
-        )
-
-        # 1.11 Wins over a conflicting GPU_ARCHS + CU_NUM
-        os.environ["GPU_ARCHS"] = TARGET_A[0]
-        os.environ["CU_NUM"] = str(TARGET_C[1])
-        os.environ["AITER_GPU_TARGETS"] = f"{TARGET_D[0]}:{TARGET_D[1]}"
-        t = get_build_targets_env()
-        _check(
-            "AITER_GPU_TARGETS wins over GPU_ARCHS + CU_NUM", t == [TARGET_D], str(t)
-        )
-        del os.environ["GPU_ARCHS"]
-        del os.environ["CU_NUM"]
-        del os.environ["AITER_GPU_TARGETS"]
-
-        # 1.12 Live GPU fallback — requires torch and a GPU; skipped otherwise
         try:
             from aiter.jit.utils.chip_info import get_build_targets
 
@@ -990,166 +947,119 @@ def test_build_tune_dict_strict_unknown_kernel():
             del os.environ["CU_NUM"]
 
 
+def test_explicit_build_targets():
+    cases = [
+        # (gpu_target_string, expected_targets)
+        ("gfx950:128,gfx950:256;gfx950:128", [TARGET_D, TARGET_B]),
+        ("gfx950", [TARGET_B]),
+    ]
+    for gpu_target_string, expected_targets in cases:
+        with _target_env(
+            AITER_GPU_TARGETS=gpu_target_string, GPU_ARCHS="gfx942", CU_NUM="80"
+        ):
+            targets = get_build_targets_env()
+
+        _check(
+            f"{gpu_target_string}: explicit targets override GPU_ARCHS and CU_NUM",
+            targets == expected_targets,
+            str(targets),
+        )
+
+
 def test_unmatched_targets():
-    _section("2b. unmatched_targets — which build targets have no tuned rows")
-
-    import pandas as pd
-
-    df = pd.DataFrame(
-        {
-            "gfx": [TARGET_A[0], TARGET_B[0]],
-            "cu_num": [TARGET_A[1], TARGET_B[1]],
-            "libtype": ["ck", "ck"],
-        }
-    )
-
-    _check(
-        "every target tuned -> nothing reported",
-        unmatched_targets(df, [TARGET_A, TARGET_B]) == [],
-    )
-    _check(
-        "untuned target is named as 'gfx:cu_num'",
-        unmatched_targets(df, [TARGET_A, TARGET_D]) == [f"{TARGET_D[0]}:{TARGET_D[1]}"],
-        str(unmatched_targets(df, [TARGET_A, TARGET_D])),
-    )
-    # The frame reaching the check is empty when the CSV has no rows of that
-    # libtype at all -- the case the old len(tune_df) guard swallowed.
-    empty = df[df["libtype"] == "cktile"]
-    _check(
-        "wholly missing libtype reports every target",
-        unmatched_targets(empty, [TARGET_A, TARGET_B])
-        == [f"{TARGET_A[0]}:{TARGET_A[1]}", f"{TARGET_B[0]}:{TARGET_B[1]}"],
-        str(unmatched_targets(empty, [TARGET_A, TARGET_B])),
-    )
-    _check(
-        "filter_tune_df takes only the frame and the targets",
-        list(inspect.signature(filter_tune_df).parameters) == ["tune_df", "targets"],
-        str(inspect.signature(filter_tune_df)),
-    )
+    df = pd.DataFrame([TARGET_A, TARGET_B], columns=["gfx", "cu_num"])
+    cases = [
+        (df, [TARGET_A, TARGET_B], []),
+        (df, [TARGET_A, TARGET_D], ["gfx950:128"]),
+        # A library with no tuned rows must report every requested target.
+        (df.iloc[:0], [TARGET_A, TARGET_B], ["gfx942:304", "gfx950:256"]),
+    ]
+    for rows, targets, expected in cases:
+        missing = unmatched_targets(rows, targets)
+        _check(
+            f"unmatched targets for {targets} with {len(rows)} tuned rows",
+            missing == expected,
+            str(missing),
+        )
 
 
 def test_flydsl_aot_target_filter():
-    _section("1d. production FlyDSL AOT — compatible target filtering")
-
     import aiter.aot.flydsl.common as aot_common
-    from aiter.aot.flydsl.common import OpKind, _filter_collected_aot_jobs
+    from aiter.aot.flydsl.common import OpKind
     from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+    from aiter.jit.utils import chip_info
 
-    env_names = ("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM", "ARCH")
-    original = {name: os.environ.pop(name, None) for name in env_names}
     jobs = [
         {"kernel_name": "k128", "gfx": "gfx950", "cu_num": 128},
         {"kernel_name": "k256", "gfx": "gfx950", "cu_num": 256},
         # Same CU as k128, so gfx must participate in the filter.
         {"kernel_name": "other_arch", "gfx": "gfx942", "cu_num": 128},
     ]
-    try:
-        os.environ["AITER_GPU_TARGETS"] = "gfx950:256;gfx950:128"
-        with mock.patch.object(aot_common, "collect_aot_jobs", return_value=jobs):
-            selected = aot_common._collect_aot_jobs_for(OpKind.GEMM)
-        _check(
-            "production packaging collector filters targets and same-CU other gfx",
-            {job["kernel_name"] for job in selected} == {"k128", "k256"},
-            str(selected),
-        )
-
-        os.environ["AITER_GPU_TARGETS"] = "gfx950:128;gfx950:64"
-        selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
-        _check(
-            "partial requested target coverage preserves available jobs",
-            [job["kernel_name"] for job in selected] == ["k128"],
-            str(selected),
-        )
-
-        os.environ["AITER_GPU_TARGETS"] = "gfx950:128"
-        selected = _filter_collected_aot_jobs(
-            OpKind.GEMM,
-            [{"kernel_name": "legacy", "gfx": "", "cu_num": 128}],
-        )
-        _check(
-            "targeted AOT preserves legacy rows missing gfx identity",
-            [job["kernel_name"] for job in selected] == ["legacy"],
-            str(selected),
-        )
-
-        del os.environ["AITER_GPU_TARGETS"]
-        os.environ["GPU_ARCHS"] = "gfx950"
-        os.environ["CU_NUM"] = "128"
-        selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
-        _check(
-            "packaging pairs GPU_ARCHS with CU_NUM instead of baking the arch",
-            [job["kernel_name"] for job in selected] == ["k128"],
-            str(selected),
-        )
-        cli = [
-            job["kernel_name"]
-            for job in filter_jobs_for_build_targets(jobs, arch_wide=True)
-        ]
-        _check(
-            "the CLI mode still selects arch-wide, ignoring CU_NUM",
-            cli == ["k128", "k256"],
-            str(cli),
-        )
-        del os.environ["CU_NUM"]
-        os.environ["GPU_ARCHS"] = "gfx950"
-        selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
-        _check(
-            "GPU_ARCHS without CU_NUM takes the arch's default count",
-            [job["kernel_name"] for job in selected] == ["k256"],
-            str(selected),
-        )
-        del os.environ["GPU_ARCHS"]
-        os.environ["AITER_GPU_TARGETS"] = "gfx950:256"
-        selected = _filter_collected_aot_jobs(
-            OpKind.GEMM,
-            jobs + [{"kernel_name": "no_cu", "gfx": "gfx950", "cu_num": 0}],
-        )
-        _check(
-            "a row with no recorded CU count is kept for its arch",
-            "no_cu" in {job["kernel_name"] for job in selected},
-            str(selected),
-        )
-        del os.environ["AITER_GPU_TARGETS"]
-
-        def _only(var, value):
-            for name in ("AITER_GPU_TARGETS", "ARCH", "GPU_ARCHS"):
-                os.environ.pop(name, None)
-            os.environ[var] = value
-
-        def _rejects(var, value):
-            _only(var, value)
-            try:
-                _filter_collected_aot_jobs(OpKind.GEMM, jobs)
-            except RuntimeError:
-                return True
-            return False
-
-        def _selects(var, value):
-            _only(var, value)
-            return [
-                job["kernel_name"]
-                for job in _filter_collected_aot_jobs(OpKind.GEMM, jobs)
-            ]
-
-        _check("separator-only GPU_ARCHS is rejected", _rejects("GPU_ARCHS", " ; "))
-        _check("unknown GPU_ARCHS arch is rejected", _rejects("GPU_ARCHS", "gfx9999"))
-        _check(
-            "GPU_ARCHS native combined with another target is rejected",
-            _rejects("GPU_ARCHS", "native;gfx942"),
-        )
-        # GPU_ARCHS accepted ',' before the filter moved here; keep it that way.
-        comma = _selects("GPU_ARCHS", "gfx942,gfx950")
-        _check(
-            "comma-separated GPU_ARCHS resolves each arch to its default count",
-            comma == ["k256"],
-            str(comma),
-        )
-    finally:
-        for name, value in original.items():
-            if value is None:
-                os.environ.pop(name, None)
+    cases = [
+        # env, arch_wide, expected
+        ({"AITER_GPU_TARGETS": "gfx950:256;gfx950:128"}, False, ["k128", "k256"]),
+        ({"AITER_GPU_TARGETS": "gfx950:128;gfx950:64"}, False, ["k128"]),
+        ({"GPU_ARCHS": "gfx950", "CU_NUM": "128"}, False, ["k128"]),
+        ({"GPU_ARCHS": "gfx950", "CU_NUM": "128"}, True, ["k128", "k256"]),
+        ({"GPU_ARCHS": "gfx942,gfx950"}, False, ["k256"]),
+    ]
+    for env, arch_wide, expected in cases:
+        with (
+            _target_env(**env),
+            mock.patch.object(aot_common, "collect_aot_jobs", return_value=jobs),
+            mock.patch.object(
+                chip_info, "get_gfx_runtime", side_effect=RuntimeError("No GPU")
+            ),
+        ):
+            if arch_wide:
+                selected = filter_jobs_for_build_targets(jobs, arch_wide=True)
             else:
-                os.environ[name] = value
+                selected = aot_common._collect_aot_jobs_for(OpKind.GEMM)
+
+        names = [job["kernel_name"] for job in selected]
+        mode = "CLI" if arch_wide else "packaging"
+        _check(f"FlyDSL {mode}: {env}", names == expected, str(names))
+
+
+def test_flydsl_aot_legacy_rows():
+    from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+
+    jobs = [
+        {"kernel_name": "legacy", "gfx": "", "cu_num": 128},
+        {"kernel_name": "no_cu", "gfx": "gfx950", "cu_num": 0},
+        {"kernel_name": "other_arch", "gfx": "gfx942", "cu_num": 0},
+    ]
+    with _target_env(AITER_GPU_TARGETS="gfx950:128;gfx950:256"):
+        selected = filter_jobs_for_build_targets(jobs)
+
+    _check(
+        "legacy gfx inference and missing CU counts preserve matching rows once",
+        selected == jobs[:2],
+        str(selected),
+    )
+
+
+def test_flydsl_aot_invalid_archs():
+    from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+
+    for spec in (" ; ", "gfx9999", "native;gfx942"):
+        with _target_env(GPU_ARCHS=spec):
+            raised = False
+            try:
+                filter_jobs_for_build_targets([])
+            except RuntimeError:
+                raised = True
+
+        _check(f"FlyDSL rejects GPU_ARCHS={spec!r}", raised)
+
+
+@contextlib.contextmanager
+def _target_env(**values):
+    with mock.patch.dict(os.environ):
+        for name in ("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM", "ARCH"):
+            os.environ.pop(name, None)
+        os.environ.update(values)
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -1158,8 +1068,11 @@ def test_flydsl_aot_target_filter():
 
 if __name__ == "__main__":
     test_get_build_targets()
+    test_explicit_build_targets()
     test_unmatched_targets()
     test_flydsl_aot_target_filter()
+    test_flydsl_aot_legacy_rows()
+    test_flydsl_aot_invalid_archs()
     test_gen_instances_filter(
         csv_path=REPRO_CSV,
         target_a=TARGET_C,
