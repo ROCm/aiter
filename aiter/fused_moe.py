@@ -2624,6 +2624,126 @@ def _flydsl_stage2_fp8_enabled():
     return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
+def _flydsl_heuristic_tier(token):
+    """Per token tier: (tile_m, stage1 suffix, stage2 suffix)."""
+    if token < 2048:
+        return 32, "_w2", "_bnt2"
+    if token < 4096:
+        return 64, "_w3_bnt0", ""
+    if token < 16384:
+        return 128, "_w2_bnt0", ""
+    return 64, "_w4_bnt0", ""
+
+
+def _ep_sort_block_m(token, topk, expert):
+    """Sort block size for an EP dispatch buffer, from expected rows per expert.
+
+    ``token`` counts rows of a receive buffer provisioned for worst-case fan-in
+    (every peer routing all of its tokens here), so it holds ``token // topk``
+    real tokens. Post-dispatch each row has ~2 valid slots: one routed local
+    expert plus the fused shared expert. Sizing the block above the resulting
+    rows-per-expert only buys padding, which both stages then traverse.
+    """
+    real_tokens = max(1, int(token) // max(1, int(topk)))
+    rows_per_expert = max(1, (2 * real_tokens) // max(1, int(expert)))
+    for bm in (32, 64, 128):
+        if rows_per_expert <= bm:
+            return bm
+    return 128
+
+
+def _retile_flydsl_for_ep(kn1, kn2, token, topk, expert, inter_dim, block_m):
+    """Re-tile a tuned FlyDSL 2-stage pair to the EP-appropriate sort block.
+
+    Returns ``(block_m, kn1, kn2)`` unchanged when the tuned row already matches
+    or when either re-tiled name is not a registered kernel. stage2 is named
+    ``_persist`` so it takes the path whose tile loop is bounded by
+    ``num_valid_ids`` rather than by the (over-provisioned) buffer.
+    """
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_kernel_name,
+        get_flydsl_kernel_params,
+        pick_flydsl_stage2_tile_k,
+    )
+
+    parsed1 = get_flydsl_kernel_params(kn1)
+    if parsed1 is None:
+        return block_m, kn1, kn2
+    bm = _ep_sort_block_m(token, topk, expert)
+    if bm >= int(block_m):
+        return block_m, kn1, kn2
+    a_dtype = parsed1.get("a_dtype")
+    b_dtype = parsed1.get("b_dtype")
+    out_dtype = parsed1.get("out_dtype")
+    if not (a_dtype and b_dtype):
+        return block_m, kn1, kn2
+    real_tokens = max(1, int(token) // max(1, int(topk)))
+    _, s1_sfx, s2_sfx = _flydsl_heuristic_tier(real_tokens)
+    base1 = flydsl_kernel_name(1, a_dtype, b_dtype, "bf16", bm, 128, 256)
+    tail1 = ("_gui" if a_dtype == "fp8" else "") + (
+        "_fp8" if str(out_dtype) == "fp8" else ""
+    )
+    base2 = flydsl_kernel_name(
+        2,
+        a_dtype,
+        b_dtype,
+        "bf16",
+        bm,
+        128,
+        pick_flydsl_stage2_tile_k(inter_dim),
+        "atomic",
+    )
+
+    def _first_registered(candidates):
+        for name in candidates:
+            if get_flydsl_kernel_params(name) is not None:
+                return name
+        return None
+
+    new1 = _first_registered([base1 + s1_sfx + tail1, base1 + tail1])
+    new2 = _first_registered([base2 + s2_sfx, base2])
+    if new1 is None or new2 is None:
+        return block_m, kn1, kn2
+    return bm, new1, new2 + "_persist"
+
+
+def _demote_flydsl_v2_stage2_for_ep(kn2, token, inter_dim, block_m):
+    """Return a non-layout FlyDSL stage2 name equivalent to layout-v2 ``kn2``.
+
+    The v2 layout GEMM2 costs 2.6x its non-layout sibling under EP with
+    shared-expert fusion (405us vs 157us per call on DSV4-Pro EP8/MoRI), while
+    measuring only ~13% apart in the tuner, which routes tokens without an
+    expert mask. Tuned CSVs produced with the tuner default
+    (``TUNE_ONLY=flydslv2``) therefore name a layout-v2 stage2 for EP shapes
+    that must not run there. Returns None if no valid substitute exists.
+    """
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_kernel_name,
+        get_flydsl_kernel_params,
+        pick_flydsl_stage2_tile_k,
+    )
+
+    cfg = parse_flydsl_v2_gemm2_kernel(kn2)
+    if cfg is None:
+        return None
+    tile_m, _, s2_sfx = _flydsl_heuristic_tier(token)
+    tile_m = min(tile_m, int(block_m)) if block_m else tile_m
+    base = flydsl_kernel_name(
+        2,
+        cfg["a_dtype"],
+        cfg["b_dtype"],
+        cfg["out_dtype"],
+        tile_m,
+        128,
+        pick_flydsl_stage2_tile_k(inter_dim),
+        "atomic",
+    )
+    for name in (f"{base}{s2_sfx}", base):
+        if get_flydsl_kernel_params(name) is not None:
+            return name
+    return None
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3214,6 +3334,28 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    ep_stage2_override = None
+    if (
+        cfg is not None
+        and is_ep
+        and kn2.startswith("flydsl_moe2_layout_")
+        and os.environ.get("AITER_ALLOW_EP_FLYDSL_V2_STAGE2", "0") != "1"
+    ):
+        ep_stage2_override = _demote_flydsl_v2_stage2_for_ep(
+            kn2, token, inter_dim, cfg.get("block_m", BLOCK_SIZE_M)
+        )
+        if ep_stage2_override is None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding layout-v2 stage2 {kn2} for EP shape "
+                f"{keys}: no non-layout substitute; using default heuristics"
+            )
+        else:
+            logger.warning(
+                f"[fused_moe] layout-v2 stage2 is not used under EP for {keys}; "
+                f"substituting {ep_stage2_override}"
+            )
+
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
     weights_shuffled = (
@@ -3348,8 +3490,27 @@ def get_2stage_cfgs(
         else:
             ksplit = 0
         kernelName1 = cfg["kernelName1"]
-        kernelName2 = cfg["kernelName2"]
+        kernelName2 = (
+            cfg["kernelName2"] if ep_stage2_override is None else ep_stage2_override
+        )
         run_1stage = cfg.get("run_1stage", False)
+        if (
+            is_ep
+            and not run_1stage
+            and str(kernelName1).startswith("flydsl_moe1_")
+            and str(kernelName2).startswith("flydsl_moe2_")
+            and os.environ.get("AITER_EP_RETILE", "1") == "1"
+        ):
+            _bm_ep, _kn1_ep, _kn2_ep = _retile_flydsl_for_ep(
+                kernelName1, kernelName2, token, topk, expert, inter_dim, block_m
+            )
+            if _bm_ep != block_m:
+                logger.warning(
+                    f"[fused_moe] EP re-tile for {keys}: block_m {block_m} -> "
+                    f"{_bm_ep}, {kernelName1} -> {_kn1_ep}, "
+                    f"{kernelName2} -> {_kn2_ep}"
+                )
+                block_m, kernelName1, kernelName2 = _bm_ep, _kn1_ep, _kn2_ep
         if not is_shuffled and not run_1stage:
             logger.warning(
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -3685,15 +3846,7 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
-        if token < 2048:
-            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
-        elif token < 4096:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
-        elif token < 16384:
-            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
-        else:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        _tile_m, _s1_sfx, _s2_sfx = _flydsl_heuristic_tier(token)
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
