@@ -61,9 +61,8 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.build_targets import (
     KNOWN_GFX,
     _parse_gpu_targets_env,
-    get_build_targets_env,
 )
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_build_targets, get_gfx_runtime
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
@@ -809,91 +808,12 @@ def job_arch(cu_num: int = 0, gfx: str = "") -> str:
     return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
 
 
-def _job_target(job: dict) -> tuple[str, int]:
-    gfx = str(job.get("gfx") or "").strip().lower()
-    cu_num = int(job.get("cu_num") or 0)
-    return gfx or job_arch(cu_num), cu_num
-
-
-def _legacy_cu_nums(jobs: list[dict]) -> list[int]:
-    return sorted(
-        {
-            int(job.get("cu_num") or 0)
-            for job in jobs
-            if not str(job.get("gfx") or "").strip()
-        }
-    )
-
-
-def _select_for_targets(
-    jobs: list[dict], targets: list[tuple[str, int]]
-) -> tuple[list[dict], list[str]]:
-    """Jobs matching any target, and the targets nothing matched."""
-    wanted = set(targets)
-    selected: list[dict] = []
-    covered: set[tuple[str, int]] = set()
-    for job in jobs:
-        gfx, cu_num = _job_target(job)
-        # cu_num 0 means no count was recorded, so the row stays in for
-        # every target of its arch.
-        hits = {t for t in wanted if t[0] == gfx and (t[1] == cu_num or cu_num == 0)}
-        if hits:
-            selected.append(job)
-            covered |= hits
-    return selected, [f"{gfx}:{cu}" for gfx, cu in sorted(wanted - covered)]
-
-
-def _select_for_archs(
-    jobs: list[dict], archs: set[str]
-) -> tuple[list[dict], list[str]]:
-    """Jobs whose arch was requested, and the arches nothing matched."""
-    selected = [job for job in jobs if _job_target(job)[0] in archs]
-    present = {_job_target(job)[0] for job in selected}
-    return selected, sorted(archs - present)
-
-
-def _warn_legacy_rows(jobs: list[dict]) -> None:
-    for cu_num in _legacy_cu_nums(jobs):
-        # Inferring the arch from a CU count is ambiguous for arches sharing one.
-        print(
-            f"  [WARN] FlyDSL GEMM row has no gfx; inferring {job_arch(cu_num)} "
-            f"from legacy cu_num={cu_num}. Re-run the tuner to record gfx."
-        )
-
-
-def _warn_unmatched(missing: list[str]) -> None:
-    if missing:
-        print(
-            f"  [WARN] The configured GEMM CSVs have no FlyDSL GEMM jobs for "
-            f"{', '.join(missing)}; those targets will use their existing "
-            "runtime fallback."
-        )
-
-
-def _archs_from_env(value: str) -> set[str]:
-    """Arch names in an ARCH/GPU_ARCHS value. Raises ValueError on a bad one."""
-    archs = {a.strip().lower() for a in re.split(r"[;,]", value) if a.strip()}
-    if not archs:
-        raise ValueError("contains no valid architecture names")
-    if "native" in archs:
-        if len(archs) != 1:
-            raise ValueError("'native' cannot be combined with other targets")
-        archs = {get_gfx_runtime()}
-    unknown = archs - KNOWN_GFX
-    if unknown:
-        raise ValueError(f"contains unknown target(s): {sorted(unknown)}")
-    return archs
-
-
 def active_target_env(*, cli: bool = True) -> tuple[str, str] | None:
-    """The env var driving target selection, and its value.
-
-    ARCH is part of main()'s existing filter and is left there; the packaging
-    path reads only the two variables this filter introduces.
-    """
-    names = ["AITER_GPU_TARGETS", "GPU_ARCHS"]
+    """First configured target variable; packaging ignores the CLI-only ARCH."""
     if cli:
-        names.insert(1, "ARCH")
+        names = ("AITER_GPU_TARGETS", "ARCH", "GPU_ARCHS")
+    else:
+        names = ("AITER_GPU_TARGETS", "GPU_ARCHS")
     for var_name in names:
         value = (os.environ.get(var_name) or "").strip()
         if value:
@@ -901,45 +821,90 @@ def active_target_env(*, cli: bool = True) -> tuple[str, str] | None:
     return None
 
 
-def _targets_from_archs_env(value: str) -> list[tuple[str, int]]:
-    """The (gfx, cu_num) pairs GPU_ARCHS and CU_NUM resolve to."""
-    # get_build_targets_env reads no live GPU, so expand 'native' first.
+def _archs_from_env(value: str) -> set[str]:
+    """Arch names in an ARCH/GPU_ARCHS value. Raises ValueError on a bad one."""
+    archs = {a.strip().lower() for a in re.split(r"[;,]", value) if a.strip()}
+    if not archs:
+        raise ValueError("contains no valid architecture names")
+    if "native" in archs and len(archs) != 1:
+        raise ValueError("'native' cannot be combined with other targets")
+    unknown = archs - KNOWN_GFX - {"native"}
+    if unknown:
+        raise ValueError(f"contains unknown target(s): {sorted(unknown)}")
+    return archs
+
+
+def _requested_targets(
+    var_name: str, value: str, *, arch_wide: bool
+) -> set[tuple[str, int | None]]:
+    """Resolve (gfx, CU count) targets; None means every CU count of an arch."""
+    if var_name == "AITER_GPU_TARGETS":
+        return set(_parse_gpu_targets_env())
+
     archs = _archs_from_env(value)
+    if arch_wide:
+        if archs == {"native"}:
+            archs = {get_gfx_runtime()}
+        return {(gfx, None) for gfx in archs}
+
+    # Normalize separators/case before resolving packaging targets. The shared
+    # resolver handles CU_NUM, native detection, and live-device CU counts.
     with override_env("GPU_ARCHS", ";".join(sorted(archs))):
-        return get_build_targets_env()
+        return set(get_build_targets())
 
 
 def filter_jobs_for_build_targets(
     jobs: list[dict], *, arch_wide: bool = False
 ) -> list[dict]:
-    """Select the jobs to bake for the configured targets.
+    """Select jobs for AITER_GPU_TARGETS, or for GPU_ARCHS with CU_NUM.
 
-    arch_wide is main()'s selection: on arch alone, ignoring CU_NUM. Otherwise
-    GPU_ARCHS and CU_NUM resolve to exact (gfx, cu_num) pairs.
+    The CLI passes arch_wide=True: ARCH takes priority over GPU_ARCHS and both
+    select every CU count of the requested architectures. AITER_GPU_TARGETS
+    always selects exact targets and takes priority over either variable.
     """
     active = active_target_env(cli=arch_wide)
     if active is None:
         return jobs
     var_name, value = active
-    if var_name == "AITER_GPU_TARGETS":
-        # Not get_build_targets_env: it folds GPU_ARCHS in, and the two are
-        # separate contracts here.
-        selected, missing = _select_for_targets(jobs, _parse_gpu_targets_env())
-    elif arch_wide:
-        # ARCH and a bare GPU_ARCHS name an arch and carry no CU count.
-        try:
-            archs = _archs_from_env(value)
-        except ValueError as e:
-            raise RuntimeError(f"{var_name} {e}.") from None
-        selected, missing = _select_for_archs(jobs, archs)
-    else:
-        try:
-            targets = _targets_from_archs_env(value)
-        except ValueError as e:
-            raise RuntimeError(f"{var_name} {e}.") from None
-        selected, missing = _select_for_targets(jobs, targets)
-    _warn_legacy_rows(jobs)
-    _warn_unmatched(missing)
+    try:
+        targets = _requested_targets(var_name, value, arch_wide=arch_wide)
+    except ValueError as e:
+        raise RuntimeError(f"{var_name} {e}.") from None
+
+    selected = []
+    covered = set()
+    legacy_cu_nums = set()
+    for job in jobs:
+        gfx = str(job.get("gfx") or "").strip().lower()
+        cu_num = int(job.get("cu_num") or 0)
+        if not gfx:
+            gfx = job_arch(cu_num)
+            legacy_cu_nums.add(cu_num)
+
+        # A job with no recorded CU count (0) matches every target of its arch.
+        matches = {
+            (target_gfx, target_cu)
+            for target_gfx, target_cu in targets
+            if gfx == target_gfx and (target_cu is None or cu_num in (0, target_cu))
+        }
+        if matches:
+            selected.append(job)
+            covered.update(matches)
+
+    for cu_num in sorted(legacy_cu_nums):
+        print(
+            f"  [WARN] FlyDSL GEMM row has no gfx; inferring {job_arch(cu_num)} "
+            f"from legacy cu_num={cu_num}. Re-run the tuner to record gfx."
+        )
+    missing = [
+        gfx if cu is None else f"{gfx}:{cu}" for gfx, cu in sorted(targets - covered)
+    ]
+    if missing:
+        print(
+            f"  [WARN] The configured GEMM CSVs have no FlyDSL GEMM jobs for "
+            f"{', '.join(missing)}; those targets will use their existing "
+            "runtime fallback."
+        )
     return selected
 
 
