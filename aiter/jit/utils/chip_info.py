@@ -53,12 +53,12 @@ def get_gpu_model(device_id: int = 0) -> str:
 
         return normalize_gpu_model(torch.cuda.get_device_name(int(device_id)))
     except Exception as error:  # noqa: BLE001 - callers fail closed to "unknown"
-        # "unknown" becomes part of the tuning key, so every tuned row silently
-        # stops matching; without this the cause is invisible.
         logger.debug("GPU model detection failed, keying as unknown: %s", error)
         return "unknown"
 
 
+# Hardware column names of a tuned CSV, in key order. Mirrors the keys of
+# get_tuning_hardware() below.
 TUNING_HARDWARE_FIELDS = ("gfx", "gpu_model", "cu_num")
 
 
@@ -66,8 +66,7 @@ def get_tuning_hardware(device_id: int = 0) -> dict[str, str | int]:
     """Return the hardware identity a tuned row is only valid for.
 
     A measurement is specific to the arch, the SKU and the CU count it ran on,
-    so tuning families scope their rows by this triple. Keys match
-    ``TUNING_HARDWARE_FIELDS``, which is the column order a tuned CSV uses.
+    so tuning families scope their rows by this triple.
     """
 
     import torch

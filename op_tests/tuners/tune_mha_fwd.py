@@ -29,7 +29,7 @@ import triton  # noqa: F401  # ROCm environments may require Triton before torch
 import torch
 
 from aiter.jit.core import AITER_CONFIG_MHA_FWD
-from aiter.jit.utils.chip_info import get_gpu_model
+from aiter.jit.utils.chip_info import TUNING_HARDWARE_FIELDS, get_gpu_model
 from aiter.ops.mha import (
     _fmha_v3_varlen_splitkv_fwd,
     _load_mha_fwd_tuning_table,
@@ -40,7 +40,6 @@ from aiter.ops.mha import (
 from aiter.ops.mha_fwd_policy import (
     as_bool,
     MHA_FWD_CANDIDATE_FIELDS,
-    MHA_FWD_HARDWARE_KEY_FIELDS,
     MHA_FWD_INDIFFERENCE_DELTA,
     MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
@@ -1806,8 +1805,8 @@ class MhaFwdTuner(TunerCommon):
             "run_state": run_state,
             "strategy": self._args.strategy,
             "hardware": [
-                {field: row[field] for field in MHA_FWD_HARDWARE_KEY_FIELDS}
-                for _, row in self.untunedf[list(MHA_FWD_HARDWARE_KEY_FIELDS)]
+                {field: row[field] for field in TUNING_HARDWARE_FIELDS}
+                for _, row in self.untunedf[list(TUNING_HARDWARE_FIELDS)]
                 .drop_duplicates()
                 .iterrows()
             ],

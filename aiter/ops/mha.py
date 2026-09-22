@@ -21,7 +21,12 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx, get_tuning_hardware
+from ..jit.utils.chip_info import (
+    TUNING_HARDWARE_FIELDS,
+    get_cu_num,
+    get_gfx,
+    get_tuning_hardware,
+)
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
@@ -30,7 +35,6 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .mha_fwd_policy import (
     MHA_FWD_BACKENDS,
-    MHA_FWD_HARDWARE_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdPlan,
@@ -94,7 +98,7 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], dict[str, Any
 
 @functools.lru_cache(maxsize=4)
 def _mha_fwd_tuned_hardware(path: str) -> frozenset[tuple[str, ...]]:
-    span = len(MHA_FWD_HARDWARE_KEY_FIELDS)
+    span = len(TUNING_HARDWARE_FIELDS)
     return frozenset(key[:span] for key in _load_mha_fwd_tuning_table(path))
 
 
@@ -166,7 +170,7 @@ def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     q = key_args["q"]
     device_id = q.device.index if q.device.index is not None else 0
     hardware = get_tuning_hardware(device_id)
-    prefix = tuple(csv_scalar(hardware[field]) for field in MHA_FWD_HARDWARE_KEY_FIELDS)
+    prefix = tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
     if prefix not in _mha_fwd_tuned_hardware(path):
         return None
     plan = _load_mha_fwd_tuning_table(path).get(_mha_fwd_tuning_key(**key_args))
