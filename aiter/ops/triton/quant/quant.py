@@ -18,6 +18,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _nvfp4_quant_op,
     _static_per_tensor_quant_fp8_i8_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -178,31 +179,88 @@ def dynamic_mxfp4_quant(
     scaling_mode: str = "even",
     x_fp4: torch.Tensor | None = None,
     blockscale_e8m0: torch.Tensor | None = None,
+    *,
+    use_sr: bool = False,
+    philox_seed: int | None = None,
+    philox_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize a tensor to MX FP4 format.
+    """Quantize a two-dimensional tensor to row-wise MXFP4.
 
     Args:
-        x: The input tensor, typically fp16 or bf16.
+        x: The input tensor, typically fp16, bf16, or fp32. Stochastic
+            rounding currently supports bf16 and fp32.
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
         x_fp4, blockscale_e8m0: Optional pre-allocated uint8 outputs, shaped
             (M, N // 2) and (M, ceil(N / 32)). N need not be a multiple of 32
             (only (N // 2) % 2 == 0 is asserted); a trailing partial block still
             gets its own scale column, so the scale width is the ceiling, not
             N // 32. Allocated column-major when omitted.
+        use_sr: Use gfx950 native stochastic rounding for the E2M1 payload.
+            The E8M0 scale remains deterministic round-to-nearest-even.
+        philox_seed: Non-negative Philox seed. Required when ``use_sr=True``.
+        philox_offset: Non-negative starting Philox counter. Callers must use
+            disjoint counter ranges across launches that require independent
+            rounding noise. One counter supplies four packed E2M1 pairs.
+
     Returns:
-        A tuple of (x_fp4, blockscale_e8m0).
+        A tuple ``(x_fp4, blockscale_e8m0)``. The payload has shape
+        ``(M, N // 2)`` and dtype uint8. The raw E8M0 scale has shape
+        ``(M, ceil(N / 32))`` and dtype uint8.
+
+    Raises:
+        TypeError: If stochastic rounding receives an unsupported dtype or
+            non-integer Philox argument.
+        ValueError: If stochastic-rounding arguments or shape are invalid.
+        RuntimeError: If stochastic rounding is requested outside gfx950.
     """
-    _LOGGER.info("DYNAMIC_MXFP4_QUANT: x=%s", tuple(x.shape))
+    _LOGGER.info("DYNAMIC_MXFP4_QUANT: x=%s use_sr=%s", tuple(x.shape), use_sr)
+    if use_sr and x.dim() != 2:
+        raise ValueError(f"use_sr=True requires a 2-D tensor, got {x.dim()} dimensions")
     # Assume x is 2D-Tensor for now
     M, N = x.shape
 
-    assert (N // 2) % 2 == 0
-
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
+
+    if use_sr:
+        if scaling_mode != "even":
+            raise ValueError(
+                "use_sr=True requires scaling_mode='even', " f"got {scaling_mode!r}"
+            )
+        if x.dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError(
+                "use_sr=True requires bfloat16 or float32 input, " f"got {x.dtype}"
+            )
+        if M <= 0 or N <= 0:
+            raise ValueError(
+                f"use_sr=True requires non-empty input, got {tuple(x.shape)}"
+            )
+        if N % MXFP4_QUANT_BLOCK_SIZE != 0:
+            raise ValueError(
+                "use_sr=True requires x.shape[1] to be divisible by "
+                f"{MXFP4_QUANT_BLOCK_SIZE}, got {N}"
+            )
+        if arch_info.get_arch() != "gfx950":
+            raise RuntimeError("MXFP4 stochastic rounding requires gfx950")
+        if philox_seed is None:
+            raise ValueError("philox_seed is required when use_sr=True")
+        if not isinstance(philox_seed, int) or not isinstance(philox_offset, int):
+            raise TypeError("philox_seed and philox_offset must be integers")
+        max_counter = (1 << 63) - 1
+        counters_used = M * N // 8
+        if not 0 <= philox_seed <= max_counter:
+            raise ValueError("philox_seed must be in [0, 2**63 - 1]")
+        max_offset = (1 << 63) - counters_used
+        if not 0 <= philox_offset <= max_offset:
+            raise ValueError(
+                "philox_offset must be non-negative and leave room for all counters"
+            )
+    elif philox_seed is not None or philox_offset != 0:
+        raise ValueError("Philox arguments are only valid when use_sr=True")
+    else:
+        assert (N // 2) % 2 == 0
+
     if x_fp4 is None:
         x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     else:
@@ -262,8 +320,11 @@ def dynamic_mxfp4_quant(
         *blockscale_e8m0.stride(),
         M=M,
         N=N,
+        philox_seed=philox_seed if philox_seed is not None else 0,
+        philox_offset=philox_offset,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         SCALING_MODE=0,
+        USE_SR=use_sr,
         NUM_ITER=NUM_ITER,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
