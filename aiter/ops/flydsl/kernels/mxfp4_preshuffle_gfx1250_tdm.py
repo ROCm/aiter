@@ -65,6 +65,7 @@ EXPLICIT_VGPR_PARTITION = int(
 )
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
 WAVE_LDS_ORDER = int(os.environ.get("AITER_FLYDSL_WAVE_LDS_ORDER", "0"))
+FAKE_NO_TDM_ISSUE = int(os.environ.get("AITER_FLYDSL_FAKE_NO_TDM_ISSUE", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
@@ -81,6 +82,8 @@ if PLANAR_LDS not in (0, 1):
     raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
 if WAVE_LDS_ORDER not in (0, 1):
     raise ValueError("AITER_FLYDSL_WAVE_LDS_ORDER must be 0 or 1")
+if FAKE_NO_TDM_ISSUE not in (0, 1):
+    raise ValueError("AITER_FLYDSL_FAKE_NO_TDM_ISSUE must be 0 or 1")
 
 
 @flyc.jit
@@ -197,6 +200,7 @@ def launch_gemm_a8w4_tdm(
         EXPLICIT_VGPR_PARTITION,
         PLANAR_LDS,
         WAVE_LDS_ORDER,
+        FAKE_NO_TDM_ISSUE,
         need_cycle_analysis,
     )
     _ = cache_tag
@@ -305,6 +309,7 @@ def launch_gemm_a8w4_tdm(
     _explicit_vgpr_partition = "_regpart" if EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if PLANAR_LDS else ""
     _wave_lds_order = "_interleavelds" if WAVE_LDS_ORDER else ""
+    _fake_no_tdm_issue = "_fake_no_tdm_issue" if FAKE_NO_TDM_ISSUE else ""
     _profile = "_profile" if need_cycle_analysis else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
@@ -313,7 +318,7 @@ def launch_gemm_a8w4_tdm(
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}"
         f"{_mma_group}{_ds_first}{_column_major}{_scale_lo256}"
         f"{_lds_rmem_lo256}{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_wave_lds_order}{_ep}{_profile}"
+        f"{_wave_lds_order}{_fake_no_tdm_issue}{_ep}{_profile}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -535,7 +540,7 @@ def launch_gemm_a8w4_tdm(
                 num_warps=nw,
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask),
+                early_timeout=False,
                 **pad_kw,
             )
             if wg_mask:
@@ -629,6 +634,8 @@ def launch_gemm_a8w4_tdm(
             return pred
 
         def issue(s, kt, my_jobs=None):
+            if const_expr(FAKE_NO_TDM_ISSUE):
+                return
             base_i8 = fx.recast_iter(p8_shared, base_ptr)
 
             def emit(j):
@@ -1068,7 +1075,15 @@ def launch_gemm_a8w4_tdm(
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
-                    TDM_PER if (prefetch_kt is not None and ksl + 1 == KWS) else 0,
+                    (
+                        TDM_PER
+                        if (
+                            not FAKE_NO_TDM_ISSUE
+                            and prefetch_kt is not None
+                            and ksl + 1 == KWS
+                        )
+                        else 0
+                    ),
                     schedule_slots,
                 )
                 first_ds = min(DS_FIRST_N, future_schedule[0])
