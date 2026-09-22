@@ -423,18 +423,40 @@ def row_ends(ctx_lens, next_n, cu_ends, device="cuda"):
 
 
 def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
-                dynamic=0, cu_ends=None):
+                dynamic=0, cu_ends=None, only=False):
+    """One launch of the fused reduce. `only` drops the logits store.
+
+    Returns what the launcher returned and the score tensor -- which are the
+    same object under `only`, that being the mode's whole output.
+    """
     rows, mml = len(st["ctx"]) * next_n, st["mml"]
     nb = (mml + block - 1) // block
     bs = torch.full((rows, nb), float("-inf"), dtype=torch.float32,
                     device=st["dev"])
-    logits = paged_mxfp4_mqa_logits(
+    out = paged_mxfp4_mqa_logits(
         st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
         st["block_table"], mml, preshuffle=preshuffle,
         clean_logits=clean_logits, dynamic=dynamic, cu_ends=cu_ends,
-        block_scores=bs, candidate_block_size=block)
+        block_scores=bs, block_scores_only=only, candidate_block_size=block)
     torch.cuda.synchronize()
-    return logits, bs
+    return out, bs
+
+
+def _bscore_arms(st, num_heads, next_n, block, **kw):
+    """The same launch twice: maxima beside the logits, then instead of them.
+
+    The mode is allowed to change exactly one thing -- that no logits are
+    stored. Every block maximum must therefore be the same word, which is what
+    the callers below assert. Returns (logits, beside, alone).
+    """
+    logits, beside = _bscore_run(st, num_heads, next_n, block, **kw)
+    ret, alone = _bscore_run(st, num_heads, next_n, block, only=True, **kw)
+    assert ret is alone, "block_scores_only must hand back its score tensor"
+    return logits, beside, alone
+
+
+def _same_words(a, b):
+    return int((a.view(torch.int32) != b.view(torch.int32)).sum())
 
 
 BSCORE_SHAPES = [
@@ -579,3 +601,170 @@ def test_block_scores_needs_room():
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
             st["block_table"], st["mml"], block_scores=bs)
+
+
+# block maxima with no logits at all
+
+
+@pytest.mark.parametrize("shape", BSCORE_SHAPES,
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("block", [8, 32])
+@pytest.mark.parametrize("preshuffle", [1, 0])
+def test_block_scores_only(shape, num_heads, block, preshuffle):
+    """The gate on the store-free mode: the maxima must not move.
+
+    Dropping the logits store frees registers and lets the scheduler pick a
+    different allocation, so this is the test that says the reduce still saw
+    the same columns -- against the arm that emits both, word for word, and
+    against the same torch reference that arm answers to.
+    """
+    _, batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64,
+                    preshuffle=preshuffle)
+    logits, beside, alone = _bscore_arms(st, num_heads, next_n, block,
+                                         preshuffle=preshuffle)
+    nd = _same_words(beside, alone)
+    assert nd == 0, f"{nd} differing words against the alongside arm"
+    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), block)
+    nd = _same_words(ref, alone)
+    assert nd == 0, f"{nd} differing words against the reference"
+
+
+@pytest.mark.parametrize("shape", BSCORE_SHAPES[:4],
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("dynamic", [0, 1])
+def test_block_scores_only_knobs(shape, num_heads, dynamic):
+    """The split plan must not move a maximum with the store gone either.
+
+    clean_logits is absent from this matrix on purpose: it is rejected in this
+    mode rather than ignored, so RELAXED_STORE is always 0 here and the
+    per-row select is never the one the logits store would have dropped.
+    """
+    _, batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64)
+    logits, beside, alone = _bscore_arms(st, num_heads, next_n, 8,
+                                         dynamic=dynamic)
+    assert _same_words(beside, alone) == 0
+    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), 8)
+    nd = _same_words(ref, alone)
+    assert nd == 0, f"{nd} differing words"
+
+
+@pytest.mark.parametrize("shape", CU_ENDS_SHAPES,
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("kind", ["compressed", "padded"])
+def test_block_scores_only_cu_ends(shape, kind):
+    """The row bound still reaches the reduce with no store to share it with.
+
+    The -inf select at the causal boundary was written for the block max, not
+    for the store, so removing the store must not remove it.
+    """
+    _, batch, next_n, ctx_lens = shape
+    ends_t = cu_ends_for(kind, ctx_lens, next_n)
+    st = _make_case(batch, next_n, 32, 128, ctx_lens, 64)
+    logits, beside, alone = _bscore_arms(st, 32, next_n, 8, cu_ends=ends_t)
+    assert _same_words(beside, alone) == 0
+    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, ends_t), 8)
+    nd = _same_words(ref, alone)
+    assert nd == 0, f"{nd} differing words"
+
+
+@pytest.mark.parametrize("block", [8, 16])
+def test_block_scores_only_nan(block):
+    """A poisoned e8m0 byte must still propagate with the store gone."""
+    batch, next_n, page_size = 2, 1, 64
+    st = _make_case(batch, next_n, 32, 128, [1024, 777], page_size)
+    flat = st["cache"].view(st["cache"].shape[0], -1)
+    scales = flat[:, page_size * 64:]
+    for i in st["block_table"].reshape(-1).tolist()[:4]:
+        scales[i, 5] = 255
+    logits, beside, alone = _bscore_arms(st, 32, next_n, block)
+    assert int(torch.isnan(alone).sum()) > 0, "the NaN did not reach a block"
+    assert _same_words(beside, alone) == 0
+    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), block)
+    nd = _same_words(ref, alone)
+    assert nd == 0, f"{nd} differing words"
+
+
+def test_block_scores_only_allocates_no_logits():
+    """The reason the mode exists: the [rows, ctx] tensor never happens.
+
+    At 512 rows x 8192 columns that is 16 MB here and 748 MB at the shape the
+    producer runs; the point is that the allocation is absent, not small.
+    """
+    batch, next_n, num_heads = 1, 512, 32
+    st = _make_case(batch, next_n, num_heads, 128, [8192], 64)
+    rows, mml = next_n, st["mml"]
+    logits_bytes = rows * mml * 4
+
+    def extra(only):
+        bs = torch.full((rows, mml // 8), float("-inf"), dtype=torch.float32,
+                        device=st["dev"])
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], mml, block_scores=bs, block_scores_only=only)
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - base
+
+    with_store = extra(False)
+    without = extra(True)
+    assert with_store >= logits_bytes, with_store
+    assert without < logits_bytes // 2, without
+
+
+def test_block_scores_only_needs_block_scores():
+    """There is nothing else for the mode to write."""
+    st = _make_case(1, 1, 32, 128, [512], 64)
+    with pytest.raises(AssertionError, match="only output"):
+        paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], st["mml"], block_scores_only=True)
+
+
+def test_block_scores_only_rejects_out_logits():
+    """A logits out-param the walk would never touch is a caller error."""
+    st = _make_case(1, 1, 32, 128, [512], 64)
+    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
+                    device=st["dev"])
+    out = torch.full((1, st["mml"]), float("-inf"), dtype=torch.float32,
+                     device=st["dev"])
+    with pytest.raises(AssertionError, match="out_logits is inapplicable"):
+        paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], st["mml"], out_logits=out, block_scores=bs,
+            block_scores_only=True)
+
+
+def test_block_scores_only_rejects_clean_logits():
+    """clean_logits asks how to write a tensor that does not exist here."""
+    st = _make_case(1, 1, 32, 128, [512], 64)
+    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
+                    device=st["dev"])
+    with pytest.raises(AssertionError, match="clean_logits is inapplicable"):
+        paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], st["mml"], clean_logits=False, block_scores=bs,
+            block_scores_only=True)
+
+
+def test_block_scores_only_rejects_gather():
+    """Mutual exclusion with the gather survives the third BSCORE value.
+
+    The mode is pass 1 of a producer whose pass 2 *is* a gather -- two
+    launches, never one.
+    """
+    st = _make_case(1, 1, 32, 128, [512], 64)
+    pos, ends = _identity_list(st, 1, 8)
+    meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
+    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
+                    device=st["dev"])
+    with pytest.raises(AssertionError, match="dense producer"):
+        paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], st["mml"], gather=meta, cu_ends=ends,
+            block_scores=bs, block_scores_only=True)

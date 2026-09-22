@@ -250,6 +250,7 @@ class Config:
     GATHER_BLOCK: gl.constexpr
     GATHER_PIPE: gl.constexpr
     BSCORE: gl.constexpr
+    STORE_LOGITS: gl.constexpr
     BSCORE_BLOCK: gl.constexpr
     BLOCKS_PER_TILE: gl.constexpr
     N_PER_TILE: gl.constexpr
@@ -315,10 +316,18 @@ class Config:
         self.GATHER = gl.constexpr(GATHER)
         self.GATHER_BLOCK = gl.constexpr(GATHER_BLOCK)
         self.GATHER_PIPE = gl.constexpr(GATHER_PIPE)
-        # Emit a per-row maximum over every BSCORE_BLOCK columns beside the
-        # logits, so the two-level indexer's block scores cost a reduce in the
-        # walk instead of a second pass over the logits it just wrote.
+        # Emit a per-row maximum over every BSCORE_BLOCK columns, so the
+        # two-level indexer's block scores cost a reduce in the walk instead of
+        # a second pass over the logits it just wrote. Three modes of one knob:
+        #   0  off
+        #   1  the maxima beside the logits, for a layer that needs both
+        #   2  the maxima instead of the logits -- pass 1 of the two-pass
+        #      producer, which ranks them into a candidate pool and then
+        #      gathers its own top-k out of that pool, so the [rows, ctx] fp32
+        #      logits tensor is never allocated and never written
+        # 2 changes no value 1 writes; it only drops the store.
         self.BSCORE = gl.constexpr(BSCORE)
+        self.STORE_LOGITS = gl.constexpr(BSCORE != 2)
         self.BSCORE_BLOCK = gl.constexpr(BSCORE_BLOCK)
         self.BLOCKS_PER_TILE = gl.constexpr(BLOCK_KV // BSCORE_BLOCK)
         self.N_PER_TILE = gl.constexpr(MFMA_NONK_DIM)
@@ -961,22 +970,27 @@ class Program:
         cfg: gl.constexpr = self.cfg
         col = gl.arange(0, cfg.BLOCK_KV, layout=gl.SliceLayout(0, cfg.mfma_layout))
         pos = tile_pos + col
-        offsets = pos * self.stride_k
+        if cfg.STORE_LOGITS:
+            offsets = pos * self.stride_k
         for r in gl.static_range(0, cfg.BLOCK_M):
             scores = _row_logits(cfg, qs[r], qss[r], ws[r], k, k_scale)
             if cfg.BLOCK_M == 1:
                 if cfg.BSCORE and MASKED:
                     scores = gl.where(pos < row_hi[r], scores, float("-inf"))
-                mask = pos < row_hi[r]
+                if cfg.STORE_LOGITS:
+                    mask = pos < row_hi[r]
             elif cfg.RELAXED_STORE:
                 if cfg.BSCORE:
                     scores = gl.where(pos < row_hi[r], scores, float("-inf"))
-                mask = pos < self.store_hi
+                if cfg.STORE_LOGITS:
+                    mask = pos < self.store_hi
             else:
                 scores = gl.where(pos < row_hi[r], scores, float("-inf"))
-                mask = pos < self.store_hi
-            gl.amd.cdna4.buffer_store(scores, ptr=self.out_ptr + r * self.stride_s,
-                                      offsets=offsets, mask=mask)
+                if cfg.STORE_LOGITS:
+                    mask = pos < self.store_hi
+            if cfg.STORE_LOGITS:
+                gl.amd.cdna4.buffer_store(scores, ptr=self.out_ptr + r * self.stride_s,
+                                          offsets=offsets, mask=mask)
             if cfg.BSCORE:
                 self.block_max(scores, r, tile_pos)
 
@@ -1119,7 +1133,8 @@ def _pa_mqa_logits_mxfp4_kernel(
     gather_s_ptr,      # int32 [B*NEXT_N, blocks] resolved scale byte offsets
     block_scores_ptr,  # fp32  [B * NEXT_N, ceil(max_model_len / BSCORE_BLOCK)]
                        # per-row block maxima; None unless BSCORE
-    logits_ptr,        # fp32  [B * NEXT_N, max_model_len]
+    logits_ptr,        # fp32  [B * NEXT_N, max_model_len]; None under
+                       # BSCORE == 2, which writes no logits at all
     next_n: gl.int32,
     num_kv_splits: gl.int32,
     stride_q_b: gl.int32, stride_q_n: gl.int32,
@@ -1158,7 +1173,8 @@ def _pa_mqa_logits_mxfp4_kernel(
     GATHER: gl.constexpr,        # walk a host-resolved candidate list
     GATHER_BLOCK: gl.constexpr,  # KV tokens per candidate block
     GATHER_PIPE: gl.constexpr,   # hoist the candidate-list read one iteration
-    BSCORE: gl.constexpr,        # emit per-row block maxima beside the logits
+    BSCORE: gl.constexpr,        # 0 off, 1 block maxima beside the logits,
+                                 # 2 block maxima and no logits store
     BSCORE_BLOCK: gl.constexpr,  # columns per candidate block
 ):
     gl.static_assert(BLOCK_KV % MFMA_NONK_DIM == 0)
@@ -1181,8 +1197,13 @@ def _pa_mqa_logits_mxfp4_kernel(
         "a candidate block must tile BLOCK_KV, so that no block straddles a "
         "tile or a KV split and the reduce stays local",
     )
+    gl.static_assert((BSCORE == 0) | (BSCORE == 1) | (BSCORE == 2),
+                     "BSCORE is 0 off, 1 block maxima beside the logits, "
+                     "2 block maxima instead of them")
     # The producer walks densely and the consumers gather; no launch is both.
-    # Static, not tested: the combination has no caller.
+    # Static, not tested: the combination has no caller. It holds for BSCORE 2
+    # as much as for 1 -- mode 2 is the *first* pass of a producer whose second
+    # pass is a gather, and those are two launches, never one.
     gl.static_assert((BSCORE == 0) | (GATHER == 0),
                      "block maxima are for the dense producer, not the gather")
 
@@ -1257,8 +1278,19 @@ def _pa_mqa_logits_mxfp4_kernel(
     else:
         bs_ptr = logits_ptr
         bs_stride_s: gl.int32 = 0
-    pgm = Program.initialize(cfg, logits_ptr + w_row.to(gl.int64) * stride_logits_s,
-                             stride_logits_s, stride_logits_k, context_len,
+    if BSCORE == 2:
+        # There is no logits row to address: logits_ptr arrives as None and
+        # specializes away. The placeholder mirrors what bs_ptr does with the
+        # reduce off -- nothing in the walk reads either.
+        out_ptr = bs_ptr
+        out_stride_s: gl.int32 = 0
+        out_stride_k: gl.int32 = 0
+    else:
+        out_ptr = logits_ptr + w_row.to(gl.int64) * stride_logits_s
+        out_stride_s = stride_logits_s
+        out_stride_k = stride_logits_k
+    pgm = Program.initialize(cfg, out_ptr,
+                             out_stride_s, out_stride_k, context_len,
                              block_end, split_id, num_kv_splits,
                              slice_idx, num_slices, bs_ptr, bs_stride_s,
                              HAS_KV_SPLIT, DYNAMIC)

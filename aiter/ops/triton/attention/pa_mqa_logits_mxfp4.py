@@ -364,6 +364,7 @@ def paged_mxfp4_mqa_logits(
     cu_ends: torch.Tensor | None = None,
     gather: dict | None = None,
     block_scores: torch.Tensor | None = None,
+    block_scores_only: bool = False,
     candidate_block_size: int = CANDIDATE_BLOCK,
 ) -> torch.Tensor:
     """
@@ -413,11 +414,47 @@ def paged_mxfp4_mqa_logits(
                     is one element per row and belongs in a caller-side
                     scatter, not in a compare per block inside the walk. Not
                     available under gather: the producer walks densely
+    block_scores_only: bool. Emit the block maxima *instead of* the logits
+                    rather than beside them: the logits store and its offset
+                    and predicate arithmetic leave the walk, and no
+                    [B * NEXT_N, max_model_len] tensor is allocated or
+                    written. The maxima are bit-identical to what the same
+                    launch produces with this off -- only the store is gone.
+                    Requires block_scores. See below for who wants it, what it
+                    buys, and what it hands back
     candidate_block_size: int, columns per candidate block. Must divide
                     BLOCK_KV so no block straddles a tile or a KV split
 
     Returns:
-    logits:         [B * NEXT_N, max_model_len], dtype float32
+    logits:         [B * NEXT_N, max_model_len], dtype float32 -- or, under
+                    block_scores_only, the caller's block_scores tensor
+
+    On block_scores_only
+    --------------------
+    It has one consumer: pass 1 of the two-pass producer. No indexer layer can
+    use it alone, because every layer needs its own top-k and that needs
+    logits. The producer layer runs this, ranks the maxima into a candidate
+    pool, and then runs a second `gather` launch over that pool to recover its
+    own top-k -- which is exact, not approximate: a top-2048-of-8 pool
+    provably contains the layer's own top-512.
+
+    What it buys is the tensor that never exists. At 512 rows x 365K context
+    the dense fp32 logits are 748 MB neither allocated nor stored, and that
+    re-bases vLLM's prefill sub-chunker: it sizes a sub-chunk as
+    M = budget / 4 / N, and what a layer stores is the only thing that sets N,
+    so emitting [M, ctx/C] instead of [M, ctx] gives C times more rows per
+    sub-chunk -- 8x at C = 8, which is 23 launches down to 3 at 365K.
+
+    out_logits and clean_logits are rejected rather than ignored, both being
+    statements about a logits tensor this path does not have.
+
+    The return value is a deliberate ABI choice, not a fallout: the function
+    hands back the caller's `block_scores` tensor. It is the only output there
+    is, and returning it keeps `out = paged_mxfp4_mqa_logits(...)` meaning
+    "the thing this launch produced" in all four modes. The alternative --
+    returning None so that the sole output is unambiguously the out-param the
+    caller already holds -- was rejected because it makes the call site's shape
+    depend on a keyword flag.
 
     """
     # Gluon kernel for gfx950 only for now
@@ -462,7 +499,31 @@ def paged_mxfp4_mqa_logits(
     if preshuffle:
         cache_format(num_heads, head_size, page_size)  # validates the geometry
 
-    if out_logits is None:
+    # The fused stage-A reduce, as three values of one knob rather than two
+    # flags with a forbidden corner: 0 off, 1 the maxima beside the logits,
+    # 2 the maxima instead of them. The shape checks that need BLOCK_KV are
+    # below; what is resolved here is whether a logits tensor exists at all.
+    bscore_on = 0 if block_scores is None else (2 if block_scores_only else 1)
+    if block_scores_only:
+        assert block_scores is not None, (
+            "block_scores_only needs the block_scores tensor it writes; it is "
+            "the launch's only output")
+        # Both of these are statements about a logits tensor, and on this path
+        # there is not one. Rejected rather than ignored: a caller that passed
+        # out_logits expecting it filled would get silence.
+        assert out_logits is None, (
+            "out_logits is inapplicable under block_scores_only: no logits are "
+            "written")
+        assert clean_logits, (
+            "clean_logits is inapplicable under block_scores_only: it asks how "
+            "to write the positions of a logits tensor this walk never writes")
+
+    if bscore_on == 2:
+        # The point of the mode. At 512 rows x 365K context this is 748 MB
+        # neither allocated nor written, and it is what lets the caller's
+        # sub-chunker size itself on ceil(ctx / C) columns instead of ctx.
+        logits = None
+    elif out_logits is None:
         shape = (batch * next_n, max_model_len)
         logits = (torch.full(shape, float("-inf"), dtype=torch.float32,
                              device=q.device) if clean_logits
@@ -470,9 +531,11 @@ def paged_mxfp4_mqa_logits(
     else:
         logits = out_logits
         assert logits.shape == (batch * next_n, max_model_len)
-    # A buffer store addresses the row through a 32-bit record count.
-    assert max_model_len * 4 < 2 ** 31, (
-        f"max_model_len {max_model_len} exceeds what a buffer store can address")
+    if logits is not None:
+        # A buffer store addresses the row through a 32-bit record count.
+        assert max_model_len * 4 < 2 ** 31, (
+            f"max_model_len {max_model_len} exceeds what a buffer store can "
+            "address")
 
     # A candidate gather. `gather` is what build_gather returns: two int32
     # [B*next_n, blocks] tensors of already-resolved offsets -- page address
@@ -512,7 +575,6 @@ def paged_mxfp4_mqa_logits(
     # The fused stage-A reduce. C divides BLOCK_KV, so a tile owns a whole
     # number of candidate blocks and a KV split -- cut at BLOCK_KV granularity
     # -- never splits one, which is what makes the block max purely local.
-    bscore_on = 1 if block_scores is not None else 0
     cand_block = int(candidate_block_size)
     if bscore_on:
         assert gather is None, (
@@ -593,8 +655,8 @@ def paged_mxfp4_mqa_logits(
         stride_qs_b=q_scales.stride(0),
         stride_qs_n=q_scales.stride(1),
         stride_w_s=weights.stride(0),
-        stride_logits_s=logits.stride(0),
-        stride_logits_k=logits.stride(1),
+        stride_logits_s=logits.stride(0) if logits is not None else 0,
+        stride_logits_k=logits.stride(1) if logits is not None else 0,
         stride_blk_b=block_table.stride(0),
         stride_gather_r=g_voff.stride(0) if gather_on else 0,
         stride_bs_s=block_scores.stride(0) if bscore_on else None,
@@ -632,4 +694,6 @@ def paged_mxfp4_mqa_logits(
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
     )
-    return logits
+    # An ABI choice, argued in the docstring: block_scores is the only output
+    # this mode has, so it is what comes back.
+    return block_scores if bscore_on == 2 else logits
