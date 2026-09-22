@@ -906,9 +906,7 @@ def _dispatch(
             )
             return
         block_threads = topk_per_row_radix_stream_block_threads(rows, topk)
-        lds_plan = topk_per_row_radix_stream_lds_plan(
-            rows, input.shape[1], topk
-        )
+        lds_plan = topk_per_row_radix_stream_lds_plan(rows, input.shape[1], topk)
         # The direct terminal placement is measured and regression-tested at
         # k=2048.  A row with width == k needs no selection, so leave that
         # existing fast path alone. Keep the dispatch boundary narrow until
