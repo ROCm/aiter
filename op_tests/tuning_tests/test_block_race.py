@@ -20,7 +20,7 @@ from aiter.utility.block_race import (
     JsonlBlockJournal,
     RaceEntrant,
     Samples,
-    check_t_implementation,
+    critical_t,
     race,
     select_winner,
 )
@@ -58,7 +58,19 @@ class TestStatistics(unittest.TestCase):
         """The continued fraction is the one piece that can be wrong without
         looking wrong: a bad critical value does not raise, it just eliminates
         candidates the evidence does not support."""
-        check_t_implementation()
+        published = {
+            (1, 0.05): 12.706,
+            (2, 0.05): 4.303,
+            (5, 0.05): 2.571,
+            (10, 0.05): 2.228,
+            (29, 0.05): 2.045,
+            (2, 0.01): 9.925,
+            (10, 0.01): 3.169,
+            (29, 0.001): 3.659,
+        }
+        for (degrees, alpha), expected in published.items():
+            with self.subTest(degrees=degrees, alpha=alpha):
+                self.assertAlmostEqual(critical_t(alpha, degrees), expected, delta=1e-3)
 
 
 class TestElimination(unittest.TestCase):
