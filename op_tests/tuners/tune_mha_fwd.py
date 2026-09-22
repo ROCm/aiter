@@ -1576,16 +1576,21 @@ class MhaFwdTuner(TunerCommon):
         choose on, which is the whole reason the race picks by steadiness and
         prefers the incumbent.
         """
-        picked = getattr(self, "_race_winner_by_key", {}).get(key)
-        if picked is not None:
-            match = valid[
-                (valid["backend"] == picked[1])
-                & (valid["num_splits"] == picked[2])
-                & (valid["backend_config"] == picked[3])
-            ]
-            if not match.empty:
-                return match.iloc[0].copy()
-        return valid.iloc[0].copy()
+        picked = self._race_winner_by_key.get(key)
+        if picked is None:
+            return valid.iloc[0].copy()
+        match = valid[
+            (valid["backend"] == picked[1])
+            & (valid["num_splits"] == picked[2])
+            & (valid["backend_config"] == picked[3])
+        ]
+        if match.empty:
+            raise RuntimeError(
+                f"race winner {picked[1:]} for {key} is absent from the gated "
+                "results; publishing the fastest point estimate would ship a "
+                "candidate the race never certified"
+            )
+        return match.iloc[0].copy()
 
     def _record_promotion(self, key, challenger, incumbent, margin, noise, decision):
         """Keep why each shape was or was not retuned, for the evidence file.

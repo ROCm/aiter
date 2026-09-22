@@ -30,6 +30,7 @@ class TestIncumbentGate(unittest.TestCase):
         tuner = MhaFwdTuner.__new__(MhaFwdTuner)
         tuner._incumbents_by_key = {self.KEY: {("gluon", self.INCUMBENT_CONFIG)}}
         tuner._promotions = []
+        tuner._race_winner_by_key = {}
         return tuner
 
     def _frame(self, challenger_us, incumbent_us, samples=(1000.0, 1001.0)):
