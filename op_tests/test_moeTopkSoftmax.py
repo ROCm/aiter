@@ -392,6 +392,23 @@ def test_biased_grouped_topk_stable(
         gating[:, -16:] = 0
         bias.zero_()
 
+    legacy_gating = torch.full((token, expert + 4), -torch.inf, dtype=dtype)
+    legacy_gating[:, :expert] = gating
+    legacy_bias = torch.full((expert + 4,), -torch.inf, dtype=dtype)
+    legacy_bias[:expert] = bias
+    legacy_w = torch.empty((token, topk), dtype=dtypes.fp32)
+    legacy_ids = torch.empty((token, topk), dtype=dtypes.i32)
+    aiter.biased_grouped_topk_hip(
+        legacy_gating,
+        legacy_bias,
+        legacy_w,
+        legacy_ids,
+        1,
+        1,
+        True,
+        2.5,
+    )
+
     w = torch.empty((token, topk), dtype=dtypes.fp32)
     ids = torch.empty((token, topk), dtype=dtypes.i32)
     _, us = run_perftest(
@@ -406,20 +423,8 @@ def test_biased_grouped_topk_stable(
         2.5,
     )
 
-    repeat_w = torch.empty_like(w)
-    repeat_i = torch.empty_like(ids)
-    aiter.biased_grouped_topk_hip(gating, bias, repeat_w, repeat_i, 1, 1, True, 2.5)
-
-    ids_sorted, perm = ids.sort(dim=-1)
-    repeat_i_sorted, repeat_perm = repeat_i.sort(dim=-1)
-    torch.testing.assert_close(ids_sorted, repeat_i_sorted, rtol=0, atol=0)
-    torch.testing.assert_close(
-        w.gather(1, perm),
-        repeat_w.gather(1, repeat_perm),
-        rtol=1e-6,
-        atol=2e-7,
-        equal_nan=True,
-    )
+    torch.testing.assert_close(ids, legacy_ids, rtol=0, atol=0)
+    torch.testing.assert_close(w, legacy_w, rtol=0, atol=0, equal_nan=True)
 
     return {"err": 0, "us": us}
 
