@@ -1576,25 +1576,13 @@ def _fused_moe_impl(
 def _pad_blockscale_act_scale(a1_scale, sorted_ids, topk):
     """Back the activation scale's tail with real memory for per_1x128.
 
+    WORKAROUND: should be fixed in asm kernel. 
+    
     ``fmoe_fp8_blockscale_g1u1`` indexes the activation scale by
     ``sorted_ids // topk``, so it can touch row ``sorted_ids.numel() // topk``.
     ``sorted_ids`` is padded out to whole blocks per expert, so that bound
     exceeds the one-row-per-token scale the quantizer allocates by
     ``(num_experts * block_size - topk) // topk`` rows.
-
-    Those rows are read and discarded, but the read must still land on mapped
-    memory: when the scale sits at the tail of a caching-allocator segment, the
-    next page is unmapped and the read faults. Returning a view of a padded
-    buffer keeps the logical shape unchanged.
-
-    Args:
-        a1_scale: Activation scale, one row per token.
-        sorted_ids: Block-padded token-to-expert sort order.
-        topk: Experts per token.
-
-    Returns:
-        A tensor with ``a1_scale``'s shape and values, guaranteed to have
-        allocated rows past its end covering the kernel's addressing range.
     """
     rows_read = int(sorted_ids.numel()) // topk + 1
     rows_have = a1_scale.shape[0]
