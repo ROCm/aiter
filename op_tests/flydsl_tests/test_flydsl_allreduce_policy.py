@@ -50,33 +50,35 @@ def test_thresholds_partition_by_size(cell):
 
 
 @pytest.mark.parametrize("cell", CELLS)
-def test_resolved_policy_partitions_by_size(cell):
-    """Whatever the two raw ceilings do relative to each other, the policy a
-    dispatch path actually sees must still tile the size axis in order.
+def test_resolved_slots_partition_by_size(cell):
+    """Each slot's own view must be internally ordered.
 
-    This is the invariant that matters: ``resolve`` collapses ``oneshot_max``
-    and ``oneshot_max_exact`` onto a single boundary per mode, so no caller ever
-    observes the two disagreeing."""
-    for mode in P.ACCURACY_MODES:
-        p = P.resolve(cell[0], cell[1], mode=mode)
-        assert 0 < p.oneshot_max <= p.oneshot_max_exact <= p.mesh_max <= p.max_bytes
-        assert p.min_bytes <= p.oneshot_max
+    The two views do not have to meet -- see
+    ``test_the_one_gap_is_where_cdr_wins`` -- but neither may be inverted."""
+    one = P.resolve_oneshot(*cell)
+    quant = P.resolve_quant(*cell)
+    assert 0 < one.max_bytes
+    assert one.min_bytes <= one.max_bytes
+    assert 0 < quant.floor <= quant.mesh_max <= quant.max_bytes
 
 
 def test_exact_and_fast_ceilings_need_not_order():
     """The two one-shot ceilings are measured against *different* alternatives,
     so neither bounds the other.
 
-    ``oneshot_max`` is where the quantized mesh overtakes the one-shot;
-    ``oneshot_max_exact`` is where the fallback the caller would otherwise use
-    overtakes it, since exact mode declines rather than quantizing.
+    ``oneshot_max`` is where the quantized mesh overtakes the one-shot, and so
+    is the quick-reduce slot's floor; ``oneshot_max_exact`` is where
+    ``cross_device_reduce`` overtakes it, and so is the custom-all-reduce slot's
+    ceiling.
     """
-    assert P.FAMILY_POLICY[("pcie", 4)].oneshot_max_exact > P.FAMILY_POLICY[
-        ("pcie", 4)
-    ].oneshot_max
-    assert P.FAMILY_POLICY[("xgmi", 4)].oneshot_max_exact < P.FAMILY_POLICY[
-        ("xgmi", 4)
-    ].oneshot_max
+    assert (
+        P.FAMILY_POLICY[("pcie", 4)].oneshot_max_exact
+        > P.FAMILY_POLICY[("pcie", 4)].oneshot_max
+    )
+    assert (
+        P.FAMILY_POLICY[("xgmi", 4)].oneshot_max_exact
+        < P.FAMILY_POLICY[("xgmi", 4)].oneshot_max
+    )
 
 
 def test_oneshot_ceiling_shrinks_with_world_size():
@@ -92,25 +94,26 @@ def test_oneshot_ceiling_shrinks_with_world_size():
 def test_xgmi_never_selects_the_ring():
     """On xGMI the ring is never dispatched at any size or world."""
     for ws in WORLDS:
-        p = P.resolve("xgmi", ws, mode="fast")
-        assert "ring" not in P.families_reachable(p)
-        assert P.pick_family(1 << 30, p) == "mesh"
+        p = P.resolve_quant("xgmi", ws)
+        assert "ring" not in P.quant_families_reachable(p)
+        assert P.pick_quant_family(1 << 30, p) == "mesh"
 
 
 @pytest.mark.parametrize("ws", WORLDS)
-def test_pick_family_is_monotone(ws):
-    """Family choice must never go backwards as the payload grows.
+def test_dispatch_is_monotone(ws):
+    """The path choice must never go backwards as the payload grows.
 
-    Three families only ever coexist in ``"fast"`` mode -- ``"exact"`` is
-    single-family by design (see ``test_exact_mode_is_oneshot_only``), so that
-    is the mode this checks the three-way monotonicity in.
+    Composed across both slots, in the order ``CudaCommunicator.all_reduce``
+    consults them, so this is the ordering a payload actually experiences.
     """
-    p = P.resolve("pcie", ws, mode="fast")
-    order = {"oneshot": 0, "mesh": 1, "ring": 2}
-    seen = [order[P.pick_family(n, p)] for n in (1 << k for k in range(4, 31))]
+    order = {"oneshot": 0, "mesh": 1, "ring": 2, "fallback": 3}
+    seen = [order[_slot_of("pcie", ws, n)] for n in (1 << k for k in range(4, 31))]
     assert seen == sorted(seen)
-    # And all three are actually reachable on PCIe, or a family is dead code.
-    assert set(P.families_reachable(p)) == {"oneshot", "mesh", "ring"}
+    # And all three FlyDSL families are reachable on PCIe, or one is dead code.
+    assert set(P.quant_families_reachable(P.resolve_quant("pcie", ws))) == {
+        "mesh",
+        "ring",
+    }
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -155,7 +158,7 @@ def test_oneshot_ladder_is_keyed_on_the_fabric(ws):
 
 def test_max_payload_bytes_is_keyed_on_the_fabric():
     """The default ceiling is where the fallback overtakes the one-shot, which
-    is a property of the fabric. 
+    is a property of the fabric.
     """
     for ws in WORLDS:
         for link in P.LINKS:
@@ -178,15 +181,15 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
     The one-shot window is the wider of the two ceilings.
     """
     for link in P.LINKS:
-        # "fast" mode: exact mode has no mesh/ring window at all (mesh_max ==
-        # oneshot_max there by design), which would make every mesh rung above
-        # the smallest look like it fails this check for the wrong reason.
-        p = P.resolve(link, ws, mode="fast")
-        one_hi = max(p.oneshot_max, P.FAMILY_POLICY[(link, ws)].oneshot_max_exact)
+        quant = P.resolve_quant(link, ws)
+        # The one-shot's window is the wider of the two ceilings: it serves up
+        # to its own ceiling when the quant slot is closed, and up to the quant
+        # floor when that slot is open.
+        one_hi = max(P.resolve_oneshot(link, ws).max_bytes, quant.floor)
         for _floor, *_ in oneshot_ladder(ws, link)[1:]:
             assert _floor < one_hi, ("oneshot", link, ws, _floor)
         for floor, *_ in MESH_ST_LADDER[ws][1:]:
-            assert floor < p.mesh_max, ("mesh", link, ws, floor)
+            assert floor < quant.mesh_max, ("mesh", link, ws, floor)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.
 
@@ -195,43 +198,124 @@ def _env(**kw):
     return mock.patch.dict(os.environ, {k: v for k, v in kw.items()}, clear=False)
 
 
-def test_accuracy_mode_env():
-    with _env(AITER_FLY_AR_ACCURACY="fast"):
-        assert P.accuracy_mode() == "fast"
-    with _env(AITER_FLY_AR_ACCURACY="EXACT"):
-        assert P.accuracy_mode() == "exact"
-    # An unrecognised value warns and falls back rather than raising: a typo in
-    # an env var must not take a model down.
-    with _env(AITER_FLY_AR_ACCURACY="nonsense"):
-        assert P.accuracy_mode() == P.DEFAULT_ACCURACY
+# --- the two-slot dispatch oracle -------------------------------------------
+#
+# The refactor that split one FlyDSL dispatcher into two slot-resident backends
+# has to be routing-neutral: the kernels moved, they did not change, so if every
+# payload still reaches the same schedule then performance follows. That is a
+# statement about host-side integer comparisons only, which makes it provable
+# here rather than on an 8-GPU machine.
 
 
-def test_exact_mode_is_oneshot_only():
-    """``"exact"`` is not just a wider one-shot boundary -- it is a different
-    policy shape. Above ``oneshot_max_exact`` there is no mesh/ring window at
-    all: ``mesh_max`` and ``max_bytes`` collapse onto ``oneshot_max``, so
-    ``should_fly_all_reduce`` declines any larger payload instead of routing
-    it to a quantized schedule. A caller who never touches
-    ``AITER_FLY_AR_ACCURACY`` gets bit-exact FlyDSL or no FlyDSL, never
-    quantized FlyDSL.
+def _slot_of(link: str, ws: int, nbytes: int) -> str:
+    """Which path *nbytes* reaches, composed in real dispatch order.
+
+    ``CudaCommunicator.all_reduce`` tries the quick-reduce slot, then the
+    custom-all-reduce slot, then RCCL. *quant_open* mirrors
+    ``AITER_QUICK_REDUCE_QUANTIZATION``: ``INT4`` opens the quantized slot,
+    ``NONE`` closes it.
     """
-    for link in P.LINKS:
-        for ws in WORLDS:
-            exact = P.resolve(link, ws, mode="exact")
-            assert exact.mesh_max == exact.oneshot_max
-            assert exact.max_bytes == exact.oneshot_max
-            assert P.families_reachable(exact) == ("oneshot",)
-            assert exact.oneshot_max == P.FAMILY_POLICY[(link, ws)].oneshot_max_exact
+    quant = P.resolve_quant(link, ws)
+    if quant.floor < nbytes <= quant.max_bytes:
+        return P.pick_quant_family(nbytes, quant)
+    one = P.resolve_oneshot(link, ws)
+    if one.min_bytes <= nbytes <= one.max_bytes:
+        return "oneshot"
+    return "fallback"
 
 
-def test_fast_mode_still_prefers_exactness_where_free():
-    """``"fast"`` keeps the original two-boundary shape: one-shot up to
-    ``oneshot_max``, mesh/ring beyond it -- unaffected by ``"exact"`` existing
-    as a separate, stricter policy."""
-    for ws in WORLDS:
-        p = P.resolve("pcie", ws, mode="fast")
-        assert p.mesh_max > p.oneshot_max
-        assert p.max_bytes > p.mesh_max
+def _slot_of_quant_closed(link: str, ws: int, nbytes: int) -> str:
+    one = P.resolve_oneshot(link, ws)
+    return "oneshot" if one.min_bytes <= nbytes <= one.max_bytes else "fallback"
+
+
+def _legacy_resolve(link: str, ws: int, mode: str):
+    """A frozen copy of the deleted ``resolve()``, for equivalence only.
+
+    Deliberately duplicated rather than imported: its whole value is that it
+    does *not* track the module under test.
+    """
+    base = P.FAMILY_POLICY[(link, ws)]
+    if mode == "exact":
+        one = base.oneshot_max_exact
+        return (one, one, one)  # (oneshot_max, mesh_max, max_bytes)
+    return (base.oneshot_max, max(base.mesh_max, base.oneshot_max), base.max_bytes)
+
+
+def _legacy_pick(nbytes: int, triple) -> str:
+    """A frozen copy of the deleted ``pick_family()`` + the window check."""
+    oneshot_max, mesh_max, max_bytes = triple
+    if not 0 <= nbytes <= max_bytes:
+        return "fallback"
+    if nbytes <= oneshot_max:
+        return "oneshot"
+    return "mesh" if nbytes <= mesh_max else "ring"
+
+
+_LADDER = sorted({n for k in range(4, 32) for n in (1 << k, (1 << k) + (1 << (k - 1)))})
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_slots_share_one_boundary(cell):
+    """The quick-reduce floor *is* the one-shot/mesh crossover.
+
+    One number read from two sides. If they ever drift apart, payloads either
+    get double-claimed (the floor drops below the crossover) or fall into a hole
+    neither family serves.
+    """
+    link, ws = cell
+    assert P.resolve_quant(link, ws).floor == P.FAMILY_POLICY[cell].oneshot_max
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
+        assert P.resolve_quant(link, ws).floor == 65536
+        # The override moves both readings, or the boundary splits in two.
+        assert P.resolve_oneshot(link, ws).max_bytes == 65536
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_two_slot_dispatch_reproduces_legacy_pick_family(cell):
+    """Every payload reaches the schedule the single dispatcher sent it to.
+
+    ``AITER_QUICK_REDUCE_QUANTIZATION=INT4`` must reproduce legacy ``fast``, and
+    ``NONE`` must reproduce legacy ``exact`` -- those were the two shapes the
+    deleted ``AITER_FLY_AR_ACCURACY`` selected between.
+
+    The one sanctioned divergence is the band where ``oneshot_max_exact <
+    oneshot_max``: legacy ``fast`` ran the one-shot there because a single
+    object picked a family before anything could compare it against ``cdr``,
+    and the split correctly declines to ``cdr`` instead. It is asserted as an
+    exception rather than waved through, so a *new* divergence still fails.
+    """
+    link, ws = cell
+    base = P.FAMILY_POLICY[cell]
+    fast, exact = _legacy_resolve(link, ws, "fast"), _legacy_resolve(link, ws, "exact")
+
+    for n in _LADDER:
+        got, want = _slot_of(link, ws, n), _legacy_pick(n, fast)
+        if got != want:
+            assert base.oneshot_max_exact < base.oneshot_max, (cell, n, got, want)
+            assert base.oneshot_max_exact < n <= base.oneshot_max, (cell, n)
+            assert (want, got) == ("oneshot", "fallback"), (cell, n, got, want)
+
+        assert _slot_of_quant_closed(link, ws, n) == _legacy_pick(n, exact), (cell, n)
+
+
+def test_the_one_gap_is_where_cdr_wins():
+    """Pin the sanctioned divergence to the single row that has it.
+
+    A second row developing a gap is a fitting result worth noticing, not
+    something the oracle above should absorb silently.
+    """
+    gapped = [
+        c
+        for c in CELLS
+        if P.FAMILY_POLICY[c].oneshot_max_exact < P.FAMILY_POLICY[c].oneshot_max
+    ]
+    assert gapped == [("xgmi", 4)], gapped
+    # In the gap both FlyDSL families decline, leaving cross_device_reduce --
+    # which is exactly what oneshot_max_exact says is faster there.
+    p = P.FAMILY_POLICY[("xgmi", 4)]
+    mid = (p.oneshot_max_exact + p.oneshot_max) // 2
+    assert _slot_of("xgmi", 4, mid) == "fallback"
 
 
 def test_enable_flag_is_opt_in_only():
@@ -246,53 +330,41 @@ def test_enable_flag_is_opt_in_only():
 
 
 def test_byte_overrides():
-    # ONESHOT_MAX_VAR applies in both modes -- exact mode's default here is
-    # oneshot_max_exact, so leaving mode unset still exercises the override
-    # against a real baseline.
-    table = P.FAMILY_POLICY[("pcie", 8)].oneshot_max_exact
+    table_one = P.FAMILY_POLICY[("pcie", 8)].oneshot_max_exact
+    table_floor = P.FAMILY_POLICY[("pcie", 8)].oneshot_max
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
-        assert P.resolve("pcie", 8).oneshot_max == 65536
-    # MESH_MAX_VAR only has an effect in "fast" mode -- see
-    # test_exact_mode_ignores_mesh_max_override for the exact-mode case.
+        assert P.resolve_oneshot("pcie", 8).max_bytes == 65536
+        assert P.resolve_quant("pcie", 8).floor == 65536
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
-        assert P.resolve("pcie", 4, mode="fast").mesh_max == 1048576
+        assert P.resolve_quant("pcie", 4).mesh_max == 1048576
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="-1"):
-        assert P.resolve("pcie", 8).oneshot_max == table
+        assert P.resolve_oneshot("pcie", 8).max_bytes == table_one
+        assert P.resolve_quant("pcie", 8).floor == table_floor
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="lots"):
-        assert P.resolve("pcie", 8).oneshot_max == table
-
-
-def test_exact_mode_ignores_mesh_max_override():
-    """Honouring ``AITER_FLY_AR_MESH_MAX_BYTES`` in exact mode would reopen the
-    mesh/ring window ``"exact"`` exists to close, so it is ignored there (with
-    a warning) rather than applied."""
-    with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
-        p = P.resolve("pcie", 4, mode="exact")
-        assert p.mesh_max == p.oneshot_max
-        assert p.mesh_max != 1048576
+        assert P.resolve_oneshot("pcie", 8).max_bytes == table_one
+        assert P.resolve_quant("pcie", 8).floor == table_floor
 
 
 def test_override_cannot_invert_the_partition():
-    """Pushing the one-shot ceiling above the mesh floor means "give me the
-    one-shot up to here", not "crash" -- the mesh window closes instead.
-
-    "fast" mode: exact mode already has no independent mesh window to invert
-    (mesh_max tracks oneshot_max unconditionally there), so this property is
-    only meaningful where the two boundaries are otherwise independent.
-    """
+    """Pushing the one-shot ceiling past the mesh window means "give me the
+    one-shot up to here", not "crash" -- the mesh window closes instead."""
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(64 << 20)):
-        p = P.resolve("pcie", 4, mode="fast")
-        assert p.mesh_max >= p.oneshot_max
-        assert P.pick_family(1 << 20, p) == "oneshot"
+        p = P.resolve_quant("pcie", 4)
+        assert p.mesh_max >= p.floor
+        assert P.quant_families_reachable(p) == ("ring",)
+        # A payload under the raised ceiling now reaches the one-shot, because
+        # the quant slot's floor moved with it.
+        assert _slot_of("pcie", 4, 1 << 20) == "oneshot"
 
 
-def test_resolve_rejects_unknown_keys():
-    with pytest.raises(ValueError):
-        P.resolve("infiniband", 4)
-    with pytest.raises(ValueError):
-        P.resolve("pcie", 3)
+def test_resolvers_reject_unknown_keys():
+    for resolve in (P.resolve_oneshot, P.resolve_quant):
+        with pytest.raises(ValueError):
+            resolve("infiniband", 4)
+        with pytest.raises(ValueError):
+            resolve("pcie", 3)
 
 
 if __name__ == "__main__":

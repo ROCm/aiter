@@ -400,6 +400,80 @@ def test_reuse_flag_disagreement_asserts():
 
 
 # --------------------------------------------------------------------------- #
+# Allreduce-communicator ownership (GPU-free, no process group)
+#
+# _StubCommunicator replaces CudaCommunicator wholesale, so the suite above
+# never reaches the real destroy(). These drive it directly: it is the one place
+# that decides whether closing this coordinator tears down IPC inboxes a
+# *different* coordinator is still reducing over.
+# --------------------------------------------------------------------------- #
+class _RecordingComm:
+    """Stands in for qr_comm/ca_comm, counting close() so destroy can be graded."""
+
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+def _run_real_destroy(owns: bool):
+    """Drive the real ``CudaCommunicator.destroy`` over recording comms.
+
+    ``__new__`` plus the four attributes destroy() touches, rather than a real
+    construction: the behaviour under test is the ownership branch, and building
+    a genuine communicator would need a process group and two GPUs to reach it.
+    """
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+
+    comm = CudaCommunicator.__new__(CudaCommunicator)
+    comm.pynccl_comm = None
+    comm.qr_comm = _RecordingComm()
+    comm.ca_comm = _RecordingComm()
+    comm._owns_ar_comms = owns
+    comm._all2all_manager = None
+
+    qr, ca = comm.qr_comm, comm.ca_comm
+    CudaCommunicator.destroy(comm)
+    return comm, qr, ca
+
+
+def test_destroy_closes_owned_allreduce_comms():
+    """An owning coordinator closes both slots, and closes them exactly once.
+
+    Dropping the reference instead would defer the IPC teardown to garbage
+    collection, which can land after the process group is gone -- both slots can
+    hold inboxes opened against every peer.
+    """
+    comm, qr, ca = _run_real_destroy(owns=True)
+    assert (qr.closed, ca.closed) == (1, 1)
+    assert comm.qr_comm is None and comm.ca_comm is None
+
+
+def test_destroy_leaves_borrowed_allreduce_comms_open():
+    """A borrower drops its references without closing.
+
+    Under reuse the two coordinators share one pair of communicators, so closing
+    here would pull the inboxes out from under the group that built them.
+    """
+    comm, qr, ca = _run_real_destroy(owns=False)
+    assert (qr.closed, ca.closed) == (0, 0)
+    # Still cleared: the borrower must not keep a live handle either.
+    assert comm.qr_comm is None and comm.ca_comm is None
+
+
+def test_destroy_is_idempotent():
+    """A second destroy() must not double-close: close() is reached through the
+    attribute destroy() just cleared, so a repeat is a no-op rather than a
+    second hipIpcCloseMemHandle over the same peers."""
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+
+    comm, qr, ca = _run_real_destroy(owns=True)
+    CudaCommunicator.destroy(comm)
+    assert (qr.closed, ca.closed) == (1, 1)
+
+
+# --------------------------------------------------------------------------- #
 # Handle-sharing surface (needs 2 GPUs / NCCL)
 # --------------------------------------------------------------------------- #
 def _gpu_init(rank, world_size, port, topo, reuse):
@@ -453,6 +527,9 @@ def _gpu_worker(rank, world_size, port, topo, reuse):
                 is not tp.device_communicator.pynccl_comm
             )
             assert ep.device_communicator.is_ep_communicator is True
+            # ...and so each is responsible for closing its own allreduce slots.
+            assert ep.device_communicator._owns_ar_comms is True
+            assert tp.device_communicator._owns_ar_comms is True
             _gpu_teardown()
             if rank == 0:
                 print(f"[gpu:{topo}:noreuse] PASSED")
@@ -474,6 +551,11 @@ def _gpu_worker(rank, world_size, port, topo, reuse):
         )
         assert ep.device_communicator.ca_comm is source.device_communicator.ca_comm
         assert ep.device_communicator.qr_comm is source.device_communicator.qr_comm
+        # Shared handles, single owner. Both slots can hold IPC inboxes opened
+        # against every peer, so if the borrower also claimed ownership its
+        # destroy() would close them while the source is still reducing.
+        assert ep.device_communicator._owns_ar_comms is False
+        assert source.device_communicator._owns_ar_comms is True
         assert ep.device_group is source.device_group
         # ...but cpu_group stays private for mori (see the GPU-free suite).
         assert ep.cpu_group is not source.cpu_group

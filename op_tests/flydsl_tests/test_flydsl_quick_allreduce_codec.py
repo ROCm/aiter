@@ -437,13 +437,9 @@ def test_fp16_codec_memory_path_matches_register_path():
     assert torch.equal(through_lds, in_regs)
 
 
-def _resolve(monkeypatch, algorithm, world_size, env=None, rs=None, ag=None):
+def _resolve(algorithm, world_size, rs=None, ag=None):
     from aiter.ops.flydsl import quick_allreduce_int4 as host
 
-    # Patch the parsed value rather than os.environ: the variable is read once
-    # at import, which is the behaviour under test everywhere else.
-    monkeypatch.setattr(host, "AITER_ALL_REDUCE_CODEC", env)
-    monkeypatch.setattr(host, "_warned_codecs", set())
     return host._resolve_codecs(host.ALGORITHMS[algorithm], world_size, rs, ag)
 
 
@@ -451,34 +447,56 @@ def _resolve(monkeypatch, algorithm, world_size, env=None, rs=None, ag=None):
     "world_size,expected",
     ((2, ("int4", "int4")), (4, ("int4", "int4")), (8, ("int6", "int4"))),
 )
-def test_ring_codec_defaults_widen_only_at_tp8(monkeypatch, world_size, expected):
-    """TP8 is the only world size where INT4 misses the floor."""
-    assert _resolve(monkeypatch, "ring", world_size) == expected
+def test_ring_codec_defaults_widen_only_at_tp8(world_size, expected):
+    """TP8 is the only world size where INT4 misses the floor.
+
+    Production dispatch passes ``None`` for both laps precisely to land here --
+    see ``_FLY_REGIMES`` in ``quick_all_reduce.py``.
+    """
+    assert _resolve("ring", world_size) == expected
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_mesh_is_int4_at_every_world_size(monkeypatch, world_size):
-    """The mesh has no separable lap, so the per-N default must not leak into it."""
-    assert _resolve(monkeypatch, "mesh", world_size) == ("int4", "int4")
+def test_mesh_is_int4_at_every_world_size(world_size):
+    """The mesh has no separable lap, so the per-N default must not leak into it.
+
+    It also has no INT6 kernel at all, which is why the TP8 reduce-scatter
+    default narrows back to INT4 here rather than raising.
+    """
+    assert _resolve("mesh", world_size) == ("int4", "int4")
 
 
-@pytest.mark.parametrize("env,expected", (("int4", "int4"), ("int6", "int6")))
-def test_env_override_sets_both_laps(monkeypatch, env, expected):
-    """One variable, both laps -- including the all-gather lap, which has no
-    other way to reach INT6."""
-    assert _resolve(monkeypatch, "ring", 8, env=env) == (expected, expected)
+@pytest.mark.parametrize("codec", ("int4", "int6"))
+def test_explicit_arguments_set_both_laps(codec):
+    """Pinning a wire format is per-lap and explicit.
+
+    This is the path that replaced ``AITER_ALL_REDUCE_CODEC``: the all-gather
+    lap has no other way to reach INT6, and at TP8 an explicit ``"int4"`` is a
+    real downgrade of the reduce-scatter lap rather than a restatement of its
+    default.
+    """
+    assert _resolve("ring", 8, rs=codec, ag=codec) == (codec, codec)
 
 
-def test_explicit_argument_outranks_the_environment(monkeypatch):
-    assert _resolve(monkeypatch, "ring", 8, env="int6", rs="int4") == ("int4", "int6")
+def test_explicit_argument_outranks_the_per_world_default():
+    """TP8's reduce-scatter lap defaults to INT6; asking for INT4 must get it."""
+    assert _resolve("ring", 8) == ("int6", "int4")
+    assert _resolve("ring", 8, rs="int4") == ("int4", "int4")
 
 
-def test_env_that_the_schedule_cannot_build_falls_back(monkeypatch):
-    """A process-wide variable must not break an unrelated call site."""
-    assert _resolve(monkeypatch, "mesh", 8, env="int6") == ("int4", "int4")
+def test_one_lap_can_be_pinned_without_disturbing_the_other():
+    """The laps resolve independently, so pinning the cheap one leaves the
+    reduce-scatter lap on its per-world default."""
+    assert _resolve("ring", 8, ag="int6") == ("int6", "int6")
+    assert _resolve("ring", 8, ag="int4") == ("int6", "int4")
 
 
-def test_explicit_codec_the_schedule_cannot_build_raises(monkeypatch):
-    """Unlike the environment: naming it in code is a programming error."""
+def test_explicit_codec_the_schedule_cannot_build_raises():
+    """Naming a codec the schedule has no kernel for is a programming error.
+
+    Only the per-world *default* narrows silently (see
+    ``test_mesh_is_int4_at_every_world_size``); an explicit argument raises, so
+    a caller never believes it pinned a wire format it did not get.
+    """
     with pytest.raises(ValueError, match="rs_codec"):
-        _resolve(monkeypatch, "mesh", 8, rs="int6")
+        _resolve("mesh", 8, rs="int6")

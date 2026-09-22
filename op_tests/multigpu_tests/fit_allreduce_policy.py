@@ -29,10 +29,10 @@ Two answers come out per world size, not one:
 
 * ``fast`` -- minimise latency, whatever the numerics cost. Chooses among all
   three families (one-shot, mesh, ring).
-* ``exact`` -- ``AITER_FLY_AR_ACCURACY=exact`` (the shipped default) never
-  builds a quantized engines at all: above its one-shot ceiling,
-  ``should_fly_all_reduce`` just declines and the caller falls through to
-  whatever it would otherwise dispatch to.
+* ``exact`` -- the quick-reduce slot closed (in production,
+  ``AITER_QUICK_REDUCE_QUANTIZATION=NONE``) so no quantized engine is built at
+  all: above its one-shot ceiling the custom-all-reduce slot declines and the
+  payload falls through to ``cdr``.
 
 Usage::
 
@@ -352,11 +352,17 @@ def fit_families(samples, *, exact_slack: float | None):
 # Level 2b: the real "exact" mode ceiling -- one-shot vs. what it declines to
 # --------------------------------------------------------------------------
 
-# What CudaCommunicator.all_reduce actually falls through to once FlyDSL
-# declines a payload in exact mode: `use_new` is hardcoded True with no env
-# lever, so `cdr_naive` never runs in production, and rccl is reachable only
-# past AITER_CUSTOM_AR_MAX_SIZE (64 MiB) -- far above anything measured here.
+# What CudaCommunicator.all_reduce actually falls through to once every FlyDSL
+# family declines a payload: `use_new` is hardcoded True with no env lever, so
+# `cdr_naive` never runs in production, and rccl is reachable only past
+# AITER_CUSTOM_AR_MAX_SIZE (64 MiB) -- far above anything measured here.
 # This is the oracle the shipped `oneshot_max_exact` is fitted against.
+#
+# Since the split, `cdr` is not merely the fallback but the *slot-mate*: the
+# one-shot lives inside CustomAllreduce, whose other backend is exactly this
+# kernel. So `oneshot_max_exact` is now the boundary between two backends of
+# one dispatcher, which is why it can be read straight off as that slot's
+# ceiling with no refit. See `allreduce_policy.resolve_oneshot`.
 EXACT_FALLBACK_PRIMARY = ("cdr",)
 # cdr's own 1stage/2stage internal dispatch has occasional cliffs (see the
 # KB); cdr_naive and rccl are measured and reported alongside as a robustness
@@ -733,8 +739,8 @@ def audit_declines(samples, slack: float, oracle_keys, oneshot_keys, verbose) ->
 def audit_auto(samples, slack: float, verbose: bool, *, accuracy: str = "fast") -> int:
     """Grade the shipped dispatcher against the pinned rows. Returns failures.
 
-    ``fly_auto`` routes through ``FlyDSLAllReduce``, i.e. the tables as actually
-    shipped -- both levels of heuristic, resolved at launch. The pinned rows are
+    ``fly_auto`` routes through the two slot resolvers composed in dispatch
+    order, i.e. the tables as actually shipped. The pinned rows are
     the oracle it is held to. This is the acceptance test for the whole
     exercise: everything else in this script *fits* a table, and this is the
     only thing that asks whether the table, once compiled into engines and

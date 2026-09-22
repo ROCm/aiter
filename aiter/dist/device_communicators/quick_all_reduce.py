@@ -38,6 +38,25 @@ except Exception:  # noqa: BLE001
     quick_ar = False
 
 
+# Importing these pulls in flydsl, an optional dependency whose version is
+# checked at import time.
+try:
+    from aiter.ops.flydsl import allreduce_policy as fly_policy
+    from aiter.ops.flydsl.quick_allreduce_int4 import QuickAllReduceInt4
+    _FLY_IMPORT_OK = True
+except Exception:  # noqa: BLE001
+    fly_policy = None
+    QuickAllReduceInt4 = None
+    _FLY_IMPORT_OK = False
+
+_FLY_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+# Quantization regimes the FlyDSL backend can serve, mapped to the wire formats
+# to pin on the ring's two laps. ``None`` means "use the schedule's own per-world
+# default".
+_FLY_REGIMES = {QuickReduceRegime.INT4: (None, None)}
+
+
 def qr_rocm_arch_available():
     try:
         props = torch.cuda.get_device_properties(0)
@@ -56,6 +75,14 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+def all_ranks_agree(ok: bool, group) -> bool:
+    """Whether *every* rank in *group* reports success."""
+
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
 def qr_exchange_handles(ptr, world_size, group):
     # 64 == sizeof(hipIpcMemHandle_t); must be host memory (qr_get_handle memcpys into data_ptr)
     handle = torch.empty(64, dtype=torch.uint8, device="cpu")
@@ -69,7 +96,6 @@ MB = 1024 * 1024
 
 
 class QuickAllReduce:
-
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 8]
     _SUPPORTED_DTYPES: ClassVar[list[Any]] = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
@@ -106,6 +132,8 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self._fly_policy = None
+        self._fly_engines: dict[str, Any] = {}
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -116,9 +144,9 @@ class QuickAllReduce:
             return
 
         self.group = group
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "Custom quick allreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "Custom quick allreduce should be attached to a non-NCCL group."
+        )
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom quick allreduce for
             # multi-node case.
@@ -179,6 +207,82 @@ class QuickAllReduce:
             return
 
         self.init_quick_all_reduce()
+        self._init_fly_backend()
+
+    def _init_fly_backend(self):
+        """Build the FlyDSL mesh/ring engines that will serve plain all-reduce."""
+
+        if not _FLY_IMPORT_OK or not fly_policy.enabled():
+            return
+        if getattr(self, "qr_quant_level", None) not in _FLY_REGIMES:
+            return
+
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+        if arch not in _FLY_SUPPORTED_ARCHS:
+            logger.debug(
+                "FlyDSL quick-reduce backend disabled: unsupported arch %s.", arch
+            )
+            return
+
+        rs_codec, ag_codec = _FLY_REGIMES[self.qr_quant_level]
+        link = fly_policy.detect_link()
+        ok = True
+        try:
+            policy = fly_policy.resolve_quant(link, self.world_size)
+            for family in fly_policy.quant_families_reachable(policy):
+                self._fly_engines[family] = QuickAllReduceInt4(
+                    group=self.group,
+                    device=self.device,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    algorithm=family,
+                    rs_codec=rs_codec,
+                    ag_codec=ag_codec,
+                    min_bytes=0,
+                )
+        except Exception:
+            logger.warning(
+                "FlyDSL quick-reduce backend disabled: engine construction failed.",
+                exc_info=True,
+            )
+            ok = False
+
+        if not all_ranks_agree(ok, self.group):
+            if ok:
+                logger.warning(
+                    "FlyDSL quick-reduce backend disabled: a peer rank failed to "
+                    "build its engines."
+                )
+            self._close_fly_engines()
+            return
+
+        self._fly_policy = policy
+        logger.info(
+            "Quick-reduce slot: FlyDSL %s serves plain all-reduce (TP%d on %s, "
+            "%d KiB < bytes <= %s, %.1f MiB of IPC inbox).",
+            "+".join(self._fly_engines),
+            self.world_size,
+            link,
+            policy.floor >> 10,
+            (
+                "no limit"
+                if policy.mesh_max >= fly_policy.NO_MAX
+                else f"{policy.mesh_max >> 10} KiB"
+            ),
+            sum(e.inbox_bytes for e in self._fly_engines.values()) / 2**20,
+            self.use_fp16_kernels,
+        )
+
+    def _close_fly_engines(self):
+        for eng in getattr(self, "_fly_engines", {}).values():
+            try:
+                eng.close()
+            except (AttributeError, RuntimeError):
+                pass
+        self._fly_engines = {}
+        self._fly_policy = None
 
     def init_quick_all_reduce(self):
         # On RocM, bfloat16 kernels are slower than fp16
@@ -248,10 +352,37 @@ class QuickAllReduce:
         world_size = dist.get_world_size(group=self.group)
         qr_exchange_handles(self._ptr, world_size, self.group)
 
+    def _should_fly(self, inp: torch.Tensor) -> bool:
+        """Whether the FlyDSL backend can and should serve *inp*. Never raises."""
+
+        if self._fly_policy is None:
+            return False
+        if inp.dtype is not torch.bfloat16:
+            return False
+        if not inp.is_contiguous():
+            return False
+        if inp.data_ptr() % 16:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes % 16:
+            return False
+        p = self._fly_policy
+        if not p.floor < nbytes <= p.max_bytes:
+            return False
+        
+        return fly_policy.pick_quant_family(nbytes, p) in self._fly_engines
+
     def should_quick_allreduce(self, inp: torch.Tensor):
         """
         Check if quickreduce is available
         """
+        if self.disabled:
+            return False
+        return self._should_fly(inp) or self._should_hip(inp)
+
+    def _should_hip(self, inp: torch.Tensor) -> bool:
+        """Whether the HIP quick-reduce kernel can serve *inp*."""
+
         if self.disabled:
             return False
         if inp.dtype not in self._SUPPORTED_DTYPES:
@@ -275,9 +406,15 @@ class QuickAllReduce:
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
         # quick allreduce doesn't require a separate graph mode,
-        # as QR uses static IPC buffer.
+        # as QR uses static IPC buffer. The same holds for the FlyDSL
+        # schedules, whose IPC inbox is likewise allocated once at init.
         if out is None:
             out = torch.empty_like(inp)
+        if self._should_fly(inp):
+            nbytes = inp.numel() * inp.element_size()
+            family = fly_policy.pick_quant_family(nbytes, self._fly_policy)
+            self._fly_engines[family].allreduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
@@ -290,7 +427,7 @@ class QuickAllReduce:
         weight: torch.Tensor,
         hidden_dim: int,
     ):
-        if not self.should_quick_allreduce(inp):
+        if not self._should_hip(inp):
             return False
         if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
             return False
@@ -329,11 +466,15 @@ class QuickAllReduce:
         return out, residual_out
 
     def close(self):
-        if not self.disabled and getattr(self, "_ptr", None):
+        # Both backends, and not gated on self.disabled: the FlyDSL engines hold
+        # IPC inboxes opened against every peer, which have to be released
+        # before the process group goes away even if the slot is disabled.
+        self._close_fly_engines()
+        if getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
             self._ptr = 0
-            self.disabled = True
+        self.disabled = True
 
     def __del__(self):
         self.close()

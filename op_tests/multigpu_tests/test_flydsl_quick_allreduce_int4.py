@@ -79,9 +79,9 @@ SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # regression, not a known cost of the schedule.
 SQNR_MIN_DB = {"mesh": 18.0, "ring": 18.0}
 
-# INT4 at TP8 is still a supported configuration -- AITER_ALL_REDUCE_CODEC=INT4
-# reaches it -- and is covered by its own case rather than skipped. It is held
-# to what it actually delivers, not to the shipping floor.
+# INT4 at TP8 is still a supported configuration -- pinning both laps reaches
+# it -- and is covered by its own case rather than skipped. It is held to what
+# it actually delivers, not to the shipping floor.
 SQNR_MIN_DB_TP8_INT4_RING = 15.0
 
 # A 32 KiB tile the kernel never wrote scores ~0 dB; codec noise stays above 8.
@@ -309,10 +309,9 @@ def _run_rank(
         # The case list deliberately includes sub-threshold shapes (8x1024 is
         # 16 KiB, well under MIN_PAYLOAD_BYTES) to cover the partial-tile path.
         min_bytes=0,
-        # None means "let the host default it" -- the env-var codec mechanism
-        # (AITER_ALL_REDUCE_CODEC, set by _spawn's `codec` arg) still applies.
-        # Explicit here only for the lap-isolation test, which needs the two
-        # laps to differ and the env var cannot express that.
+        # None means "let the host default it", which is what production
+        # dispatch passes. _spawn's `codec` arg fills both of these in when a
+        # test wants a pinned wire format.
         rs_codec=rs_codec,
         ag_codec=ag_codec,
     )
@@ -374,8 +373,8 @@ def _run_rank(
                 "algorithm": algorithm,
                 "inbox_memory": fly.inbox_memory,
                 # Resolved, not requested: these come from the per-world-size
-                # default unless AITER_ALL_REDUCE_CODEC overrode it, and a
-                # regression should name the codec that produced it.
+                # default unless the caller pinned a lap, and a regression
+                # should name the codec that produced it.
                 "rs_codec": fly.rs_codec,
                 "ag_codec": fly.ag_codec,
                 "st1_grid": int(st1.grid),
@@ -438,25 +437,17 @@ def _spawn(
     hidden_list = [h for _, h in pairs]
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
 
-    # Pin the codec the way a deployment would, rather than through a private
-    # test-only flag: this exercises the override path itself, while leaving it
-    # unset exercises the per-world-size default. It has to go through the
-    # environment because the host parses it once at import, and a spawn worker
-    # inherits the environment as it stood when the Pool was created -- hence
-    # setting it around the Pool construction rather than around the calls.
-    prev_codec = os.environ.get("AITER_ALL_REDUCE_CODEC")
+    # ``codec`` pins both laps, ``rs_codec``/``ag_codec`` pin one each; they are
+    # the same mechanism now that the codec is a constructor argument rather
+    # than a process-wide variable, so the broad form just fills in the narrow
+    # ones. Leaving all three unset is the shipping configuration, and the only
+    # one that reaches the per-world-size defaults.
     if codec is not None:
-        os.environ["AITER_ALL_REDUCE_CODEC"] = codec.upper()
-    else:
-        os.environ.pop("AITER_ALL_REDUCE_CODEC", None)
-    try:
-        pool = Pool(processes=world_size)
-    finally:
-        if prev_codec is None:
-            os.environ.pop("AITER_ALL_REDUCE_CODEC", None)
-        else:
-            os.environ["AITER_ALL_REDUCE_CODEC"] = prev_codec
+        if rs_codec is not None or ag_codec is not None:
+            raise ValueError("pass codec= or rs_codec=/ag_codec=, not both")
+        rs_codec = ag_codec = codec.lower()
 
+    pool = Pool(processes=world_size)
     try:
         results = [
             pool.apply_async(
@@ -611,13 +602,17 @@ def test_quick_allreduce_int4_sqnr_vs_fp32_allreduce(
     [(t, h, lbl) for ws, t, h, lbl in _PYTEST_CASES if ws == 8],
 )
 def test_quick_allreduce_int4_ring_tp8_int4_codec(tokens, hidden, label):
-    """TP8 ring forced back to an all-INT4 wire by the environment override.
+    """TP8 ring forced back to an all-INT4 wire by pinning both laps.
 
-    Two things at once: that ``AITER_ALL_REDUCE_CODEC`` actually reaches the
+    Two things at once: that an explicitly pinned codec actually reaches the
     kernel, and that the configuration it selects still produces a sane result.
     It is held to :data:`SQNR_MIN_DB_TP8_INT4_RING`, not to the shipping floor
     -- INT4 at TP8 is ~3 dB under that by construction, which is the whole
     reason the default is INT6 there.
+
+    That gap is also why production dispatch passes no codec at all: see
+    ``_FLY_REGIMES`` in ``quick_all_reduce.py``, which maps the INT4 regime to
+    ``(None, None)`` so this lap keeps its INT6 default.
     """
     group_pairs = [(t, h) for ws, t, h, _ in _PYTEST_CASES if ws == 8]
     batch = _batch_cache_lookup(

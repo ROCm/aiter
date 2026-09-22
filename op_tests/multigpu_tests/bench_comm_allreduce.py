@@ -252,7 +252,6 @@ _FP8_MIN_NUMEL = 128 * 2048
 # flydsl's SMEM_CAPACITY_MAP). A failed import here is that gate -- there is no
 # separate availability predicate to mirror.
 try:
-    from aiter.dist.device_communicators.flydsl_all_reduce import FlyDSLAllReduce
     from aiter.ops.flydsl import QuickAllReduceInt4
     from aiter.ops.flydsl import allreduce_policy as policy
     from aiter.ops.flydsl.one_shot_allreduce import (
@@ -273,23 +272,24 @@ except Exception:  # noqa: BLE001
     ALGORITHMS = {}
     _resolve_codecs = None
     has_xgmi_peer_links = None
-    FlyDSLAllReduce = None
     policy = None
     HAS_FLY_INT4 = False
 
-# FlyDSLAllReduce is opt-in and self-disabling; the bench turns it on for its
-# own `fly_auto` row the same way it forces a quick-reduce regime for the qr_*
-# rows, and for the same reason -- measuring a path production can reach
-# requires enabling it.
+# The FlyDSL schedules are opt-in and self-disabling; the bench turns them on
+# for its own `fly_auto` row the same way it forces a quick-reduce regime for
+# the qr_* rows, and for the same reason -- measuring a path production can
+# reach requires enabling it.
 _FLY_ENV = "AITER_FLY_AR"
 
-# AITER_FLY_AR_ACCURACY defaults to "exact", which never opens the mesh/ring
-# window at all -- past oneshot_max_exact the policy has no window and
-# should_fly_all_reduce simply declines the payload. `fly_auto`'s mode is a
-# bench CLI flag (--fly-accuracy, default "fast") rather than whatever the
-# launching shell happens to export, so a report's accuracy regime is always
-# what its own command line says.
-_FLY_ACCURACY_ENV = "AITER_FLY_AR_ACCURACY"
+# Whether `fly_auto` opens the quantized window. In production this is
+# AITER_QUICK_REDUCE_QUANTIZATION: INT4 opens the quick-reduce slot to the
+# mesh/ring, NONE closes it and leaves only the exact one-shot. The bench reads
+# its *own* variable instead, set from --fly-accuracy, for two reasons: a
+# report's regime should be what its command line says rather than whatever the
+# launching shell exported, and main() already pins
+# AITER_QUICK_REDUCE_QUANTIZATION="FP" for the qr_* rows -- reading that here
+# would silently force fly_auto's window shut in any sweep containing one.
+_FLY_ACCURACY_ENV = "AITER_BENCH_FLY_QR_SLOT"
 _FLY_ACCURACY_CHOICES = ("fast", "exact")
 _FLY_ACCURACY_DEFAULT = "fast"
 
@@ -310,6 +310,121 @@ def _bench_fly_accuracy_mode() -> str:
     pinned mesh/ring row is not "relevant for the mode" there either.
     """
     return os.environ.get(_FLY_ACCURACY_ENV, _FLY_ACCURACY_DEFAULT)
+
+
+class _FlyAutoWindow:
+    """The composed dispatch window, in the shape the bench's probes expect."""
+
+    __slots__ = ("max_bytes", "mesh_max", "oneshot_max")
+
+    def __init__(self, oneshot_max: int, mesh_max: int, max_bytes: int):
+        self.oneshot_max = oneshot_max
+        self.mesh_max = mesh_max
+        self.max_bytes = max_bytes
+
+
+class _FlyAutoOracle:
+    """What production dispatch does to a FlyDSL-eligible payload, in one object.
+
+    Production has no such object any more -- that is the point of the refactor
+    this bench outlived. The one-shot lives in ``CustomAllreduce`` and the
+    mesh/ring in ``QuickAllReduce``, and which one a payload reaches is decided
+    by ``CudaCommunicator.all_reduce`` trying the quick-reduce slot first.
+
+    So this reproduces the *composition* rather than re-implementing it: every
+    boundary comes from ``allreduce_policy``'s two resolvers, consulted in that
+    same order. It carries no thresholds of its own, so it cannot drift from the
+    shipped tables. Instantiating the real communicators instead would drag in a
+    1 GiB registered pool and the whole IPC pool machinery for a row that only
+    needs to time two kernels.
+    """
+
+    def __init__(self, *, group, device, rank, world_size, link, quant_open: bool):
+        self.disabled = True
+        self._engines = {}
+        self.link = link
+        self.quant_open = quant_open
+
+        one = policy.resolve_oneshot(link, world_size)
+        quant = policy.resolve_quant(link, world_size)
+        self._one = one
+        self._quant = quant
+
+        # The quick-reduce slot is tried first, so when it is open it claims
+        # everything above its floor and the one-shot keeps only what is at or
+        # below it. When it is closed the one-shot keeps its own wider ceiling.
+        if quant_open:
+            self.reachable = ("oneshot",) + policy.quant_families_reachable(quant)
+            self.policy = _FlyAutoWindow(quant.floor, quant.mesh_max, quant.max_bytes)
+        else:
+            self.reachable = ("oneshot",)
+            self.policy = _FlyAutoWindow(one.max_bytes, one.max_bytes, one.max_bytes)
+
+        common = {
+            "group": group,
+            "device": device,
+            "rank": rank,
+            "world_size": world_size,
+        }
+        for family in self.reachable:
+            if family == "oneshot":
+                self._engines[family] = OneShotAllReduce(
+                    **common, max_bytes=self.policy.oneshot_max, link=link
+                )
+            else:
+                # min_bytes=0: the composed window above already decided this
+                # engine is the right one, and the class's standalone floor
+                # would reject sizes the policy just chose it for.
+                self._engines[family] = QuickAllReduceInt4(
+                    **common, algorithm=family, min_bytes=0
+                )
+        self.disabled = False
+
+    @property
+    def inbox_bytes(self) -> int:
+        return sum(e.inbox_bytes for e in self._engines.values())
+
+    def family_for(self, nbytes: int) -> str:
+        nbytes = int(nbytes)
+        if self.quant_open and nbytes > self._quant.floor:
+            return policy.pick_quant_family(nbytes, self._quant)
+        return "oneshot"
+
+    def variant(self, nbytes: int) -> str:
+        family = self.family_for(nbytes)
+        eng = self._engines.get(family)
+        return f"{family}:{eng.variant(int(nbytes))}" if eng is not None else family
+
+    def should_fly_all_reduce(self, inp) -> bool:
+        if self.disabled or inp.dtype is not dtypes.bf16:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes % 16 or not inp.is_contiguous() or inp.data_ptr() % 16:
+            return False
+        family = self.family_for(nbytes)
+        if family == "oneshot":
+            hi = self._quant.floor if self.quant_open else self._one.max_bytes
+            if not self._one.min_bytes <= nbytes <= hi:
+                return False
+        elif nbytes > self._quant.max_bytes:
+            return False
+        return family in self._engines
+
+    def fly_all_reduce(self, inp, out=None):
+        if out is None:
+            out = torch.empty_like(inp)
+        nbytes = inp.numel() * inp.element_size()
+        self._engines[self.family_for(nbytes)].allreduce(inp, out)
+        return out
+
+    def close(self):
+        for eng in self._engines.values():
+            try:
+                eng.close()
+            except (AttributeError, RuntimeError):
+                pass
+        self._engines = {}
+        self.disabled = True
 
 
 def _aiter_origin() -> str:
@@ -610,12 +725,13 @@ CANDIDATES = (
         rs_codec="int6",
         ag_codec="int4",
     ),
-    # Production dispatch: FlyDSLAllReduce picking a family per payload size.
-    # Its accuracy mode is the bench's own --fly-accuracy flag (default
-    # "fast", see `_FLY_ACCURACY_ENV`), not whatever AITER_FLY_AR_ACCURACY the
-    # launching shell happens to export -- at the shipped default of
-    # accuracy=exact this row's window is capped at oneshot_max_exact and the
-    # mesh/ring rungs are never reached at all (see allreduce_policy.resolve).
+    # Production dispatch: the two slots composed in the order
+    # CudaCommunicator.all_reduce consults them, picking a family per payload
+    # size (see `_FlyAutoOracle`). Whether the quantized window is open is the
+    # bench's own --fly-accuracy flag (default "fast", see
+    # `_FLY_ACCURACY_ENV`), standing in for AITER_QUICK_REDUCE_QUANTIZATION --
+    # with the quick-reduce slot closed this row's window is capped at
+    # oneshot_max_exact and the mesh/ring rungs are never reached at all.
     # The acceptance test for the whole heuristic -- it must stay within ~10%
     # of the best pinned row at every shape, which is what
     # `fit_allreduce_policy.py --audit-auto` checks (run with --fly-accuracy
@@ -1195,11 +1311,11 @@ def _bench_shape(
         and not (c.family == "qr" and qr_comm is None)
         and not (c.family == "fly" and c.fly_cfg not in fly)
         and not (c.family == "fly1s" and c.fly1s_cfg not in fly1s)
-        # flyauto's window is dynamic (depends on AITER_FLY_AR_ACCURACY, only
-        # known once the object exists), unlike every other family's static
-        # applicable() check -- and under the default accuracy=exact policy it
-        # is a real "n/a" above oneshot_max, since that policy builds no
-        # mesh/ring engine at all. should_fly_all_reduce is the one predicate
+        # flyauto's window is dynamic (depends on whether the quantized slot is
+        # open, only known once the object exists), unlike every other family's
+        # static applicable() check -- and with that slot closed it is a real
+        # "n/a" above oneshot_max, since no mesh/ring engine is built at all.
+        # should_fly_all_reduce is the one predicate
         # that already knows this; calling fly_all_reduce without checking it
         # first is a KeyError on any shape past the ceiling.
         and not (
@@ -1440,11 +1556,9 @@ def _worker(
             fly1s[cfg].compile_and_launch(warm, torch.empty_like(warm))
         del warm
 
-    # Production dispatch, built last so its three internal engines exchange
-    # handles after every pinned one -- the exchange is a collective and the
-    # order has to match across ranks. It self-disables unless AITER_FLY_AR is
-    # set, which main() does when this row is in the sweep, alongside
-    # AITER_FLY_AR_ACCURACY from --fly-accuracy.
+    # Production dispatch, built last so its internal engines exchange handles
+    # after every pinned one -- the exchange is a collective and the order has
+    # to match across ranks.
     flyauto = None
     if (
         any(c.family == "flyauto" and c.key in keys for c in CANDIDATES)
@@ -1454,14 +1568,24 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         dist.barrier(group=group)
-        comm = FlyDSLAllReduce(group=tp_group.cpu_group, device=device)
-        if comm.disabled:
-            logger.warning(
-                "rank %d: fly_auto requested but FlyDSLAllReduce disabled "
-                "itself; its column will be absent",
-                rank,
+        try:
+            comm = _FlyAutoOracle(
+                group=tp_group.cpu_group,
+                device=device,
+                rank=rank,
+                world_size=tp_size,
+                link="xgmi" if has_xgmi_peer_links() else "pcie",
+                quant_open=_bench_fly_accuracy_mode() == "fast",
             )
-        else:
+        except Exception:
+            comm = None
+            logger.warning(
+                "rank %d: fly_auto requested but its engines failed to build; "
+                "its column will be absent",
+                rank,
+                exc_info=True,
+            )
+        if comm is not None:
             flyauto = comm
             # One warm call per reachable family, so nothing JITs inside a
             # timed region. A family is only compiled by a payload that reaches
@@ -1475,12 +1599,12 @@ def _worker(
                 "ring": max(1, flyauto.policy.mesh_max // tok + 1),
             }
             # Only the families this policy can actually select, which is the
-            # same list FlyDSLAllReduce built engines from. A family it
-            # disables is disabled by a *sentinel* ceiling mesh_max = NO_MAX (1 << 62) 
-            # so the ring is never auto-selected. A probe sized from that ceiling asks
-            # for an exabyte and dies in torch.zeros below, before any of the
-            # guards downstream get to reject it.
-            reachable = policy.families_reachable(flyauto.policy)
+            # same list the oracle built engines from. A family it disables is
+            # disabled by a *sentinel* ceiling mesh_max = NO_MAX (1 << 62) so
+            # the ring is never auto-selected. A probe sized from that ceiling
+            # asks for an exabyte and dies in torch.zeros below, before any of
+            # the guards downstream get to reject it.
+            reachable = flyauto.reachable
             for family, m in probes.items():
                 # Everything decidable from the byte count is decided before
                 # the allocation.
@@ -2412,7 +2536,9 @@ def main():
         "--fly-accuracy",
         choices=_FLY_ACCURACY_CHOICES,
         default=_FLY_ACCURACY_DEFAULT,
-        help="AITER_FLY_AR_ACCURACY for every FlyDSL candidate in the sweep\n"
+        help="whether the quantized (quick-reduce) window is open for every\n"
+        "FlyDSL candidate in the sweep -- production's\n"
+        "AITER_QUICK_REDUCE_QUANTIZATION=INT4 vs NONE\n"
         "(ignored if none are). 'fast' (default) opens the mesh/ring window\n"
         "past the one-shot ceiling, so `fly_auto` exercises the full\n"
         "three-family policy at every shape, and pinned fly_int4*/\n"
@@ -2611,9 +2737,9 @@ def main():
     # Remember what the deployment would do before overriding the environment
     # for our own QR candidates; `prod path` is reported against this value.
     if any(c.family == "flyauto" for c in CANDIDATES if c.key in keys):
-        # FlyDSLAllReduce is opt-in; set it before the ranks are spawned so the
-        # children inherit it. Unlike _QR_ENV this does not change `prod path`,
-        # which reports the custom-AR/quick-reduce dispatch only.
+        # The FlyDSL schedules are opt-in; set it before the ranks are spawned
+        # so the children inherit it. Unlike _QR_ENV this does not change
+        # `prod path`, which reports the custom-AR/quick-reduce dispatch only.
         os.environ[_FLY_ENV] = "1"
     # --fly-accuracy, not whatever accuracy mode the launching shell happens to
     # have exported -- a report's accuracy regime should be exactly what its own

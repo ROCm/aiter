@@ -19,7 +19,7 @@ once, and the partial's extremum grows with the number of contributions folded
 into it. Hence the two codec knobs. Widening the reduce-scatter lap to INT6 improves
 accuracy with the cost of using slightly more bandwidth. The all-gather lap forwards
 the bytes it received untouched, so it contributes exactly one quantization and stays
-INT4 unless asked otherwise by env variable AITER_ALL_REDUCE_CODEC.
+INT4 unless the caller pins it via the ``ag_codec`` argument.
 
 A third wire format, ``"fp16"``, is a lossless passthrough. Mainly for testing.
 """

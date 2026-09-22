@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import ctypes
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +28,6 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.quick_allreduce_codec import CODECS
 from .kernels.quick_allreduce_int4 import (
     MESH_CODECS,
     MESH_ST_LADDER,
@@ -62,34 +60,6 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # mode; only the memory type changes.
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained", "default")
 
-# Process-wide codec override, applied to *both* laps of whichever schedule is
-# selected. Unset means the per-world-size defaults in ``_resolve_codecs``.
-_CODEC_ENV_VAR = "AITER_ALL_REDUCE_CODEC"
-
-
-def _parse_codec_env() -> str | None:
-    """The codec named by ``AITER_ALL_REDUCE_CODEC``, or None.
-
-    Parsed once at import so an unrecognized value warns once rather than per
-    ``QuickAllReduceInt4``. An unrecognized value is ignored rather than fatal.
-    """
-    raw = os.environ.get(_CODEC_ENV_VAR)
-    if raw is None or not raw.strip():
-        return None
-    name = raw.strip().lower()
-    if name not in CODECS:
-        logger.warning(
-            "QuickAllReduceInt4: ignoring %s=%r, expected one of %s",
-            _CODEC_ENV_VAR,
-            raw,
-            tuple(n.upper() for n in CODECS),
-        )
-        return None
-    return name
-
-
-AITER_ALL_REDUCE_CODEC = _parse_codec_env()
-
 # Smallest payload sent through this kernel, in bytes.
 MIN_PAYLOAD_BYTES = 128 << 10
 
@@ -108,8 +78,9 @@ _MIN_BATCH_BLOCKS = 32
 #
 # This is only the *standalone* guard rail -- what ``QuickAllReduceInt4``
 # refuses below when someone constructs one directly with ``algorithm="ring"``.
-# Production dispatch does not consult it; ``FlyDSLAllReduce`` owns the real
-# boundary, which is additionally keyed on link type.
+# Production dispatch does not consult it; the FlyDSL backend inside
+# ``QuickAllReduce`` owns the real boundary via ``allreduce_policy.resolve_quant``,
+# which is additionally keyed on link type.
 _RING_MIN_PAYLOAD_BYTES_BY_WORLD = {
     2: 4 << 20,
     4: 12 << 20,
@@ -227,41 +198,18 @@ DEFAULT_ALGORITHM = "mesh"
 _RS_INT6_MIN_WORLD = 8
 
 
-_warned_codecs: set[tuple[str, str, str]] = set()
-
-
-def _warn_codec_unavailable(algo_name, label, requested, used):
-    """Say it once per (schedule, lap, request), not once per engine.
-
-    ``QuickAllReduceInt4`` builds one engine per super-tile rung, so a
-    per-construction warning would fire several times for one object and again
-    for every object -- for a condition that is a property of the schedule and
-    cannot change within a process.
-    """
-    key = (algo_name, label, requested)
-    if key in _warned_codecs:
-        return
-    _warned_codecs.add(key)
-    logger.warning(
-        "QuickAllReduceInt4: %s=%s does not apply to %s on algorithm=%r; using %r",
-        _CODEC_ENV_VAR,
-        requested.upper(),
-        label,
-        algo_name,
-        used,
-    )
-
-
 def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
-    """Codecs for one engine: explicit argument > env var > per-N default.
+    """Codecs for one engine: explicit argument > per-N default.
 
-    ``None`` means "not specified", which is why the constructor cannot simply
-    default these to ``"int4"``: an explicit ``rs_codec="int4"`` has to outrank
-    ``AITER_ALL_REDUCE_CODEC=INT6``, and it cannot if the two are
-    indistinguishable by the time they get here.
+    ``None`` means "not specified", and the caller is expected to pass it
+    whenever it wants the schedule's own default rather than a pinned wire
+    format. That distinction matters at TP8, where the ring's reduce-scatter
+    lap defaults to INT6: an explicit ``rs_codec="int4"`` there is a real
+    downgrade, not a restatement of the default.
 
-    A codec the selected schedule cannot build falls back with a warning rather
-    than raising. An explicit argument still raises.
+    A codec the selected schedule cannot build raises. The per-N *default*
+    silently narrows to what the schedule supports -- the mesh has no INT6
+    path, so TP8's INT6 reduce-scatter default does not leak into it.
     """
     rs_default = "int6" if world_size >= _RS_INT6_MIN_WORLD else "int4"
 
@@ -280,11 +228,6 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
         # The default is a property of the world size, not of the schedule.
         if default not in supported:
             default = supported[0]
-        env = AITER_ALL_REDUCE_CODEC
-        if env is not None and env != default:
-            if env in supported:
-                return env
-            _warn_codec_unavailable(algo.name, label, env, default)
         return default
 
     resolved_rs = _pick(rs_codec, rs_default, algo.rs_codecs, "rs_codec")
@@ -523,9 +466,10 @@ class QuickAllReduceInt4:
     single quantization, so it defaults to ``"int4"`` everywhere and widens
     only by request.
 
-    Leave both ``None`` to get those defaults. ``AITER_ALL_REDUCE_CODEC=INT4``
-    or ``INT6`` overrides them process-wide, for both laps at once; an explicit
-    argument here outranks the environment.
+    Leave both ``None`` to get those defaults -- which is what production
+    dispatch does, so that TP8 keeps its INT6 reduce-scatter lap. Pinning a lap
+    is a deliberate downgrade or upgrade of the wire format and is spelled out
+    as an argument; there is no environment override.
 
     ``inbox_memory`` selects how the IPC inbox is allocated:
 

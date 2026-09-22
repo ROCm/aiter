@@ -64,7 +64,7 @@ class OneShotAllReduce:
     the same constraint ``QuickAllReduceInt4`` has and for the same reason.
 
     ``atoms``, ``grid_cap``, ``fanout`` and ``block`` are the tuning surface.
-    ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it 
+    ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it
     from above.
 
     ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
@@ -157,9 +157,7 @@ class OneShotAllReduce:
         self.world_size = int(world_size)
         self.inbox_memory = resolved_inbox
         self.max_bytes = (
-            max_payload_bytes(world_size, link)
-            if max_bytes is None
-            else int(max_bytes)
+            max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
         self.probe = probe
         self.spin_sleep = int(spin_sleep)
@@ -344,8 +342,12 @@ class OneShotAllReduce:
         with the same shape. Used by ``bench_comm_allreduce.py`` and the
         flydsl op tests to force a real warm launch (and, for the tests, to
         exercise the launch path directly) before timing or correctness
-        checks begin. Production never calls this: it tolerates the first
-        real call paying a JIT-compile cost instead.
+        checks begin.
+
+        ``CustomAllreduce`` also calls it once at init. Not for timing: the JIT
+        issues HIP calls, and leaving the first compile to the first real
+        all-reduce lets it land inside an active CUDA graph capture, where those
+        calls would be recorded rather than executed.
         """
         if out is None:
             out = torch.empty_like(inp)

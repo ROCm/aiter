@@ -68,12 +68,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 f"{reuse_from.device}, this group is on {self.device}"
             )
             self.pynccl_comm = reuse_from.pynccl_comm
+            # Borrowed, not owned: both all-reduce slots can hold IPC inboxes
+            # opened against every peer, and the group they were built for still
+            # uses them, so destroy() here must not close them.
             self.ca_comm = reuse_from.ca_comm
             self.qr_comm = reuse_from.qr_comm
-            # Borrowed, not owned: the group this was built for still uses it,
-            # so destroy() here must not close its IPC inboxes.
-            self.fly_comm = reuse_from.fly_comm
-            self._owns_fly_comm = False
+            self._owns_ar_comms = False
             self.symm_mem_comm = reuse_from.symm_mem_comm
             return
 
@@ -105,8 +105,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
-        self.fly_comm = None
-        self._owns_fly_comm = True
+        self._owns_ar_comms = True
         self.symm_mem_comm = None
         # if use_torch_symm_mem and current_platform.is_cuda():
         #     self.symm_mem_comm = SymmMemCommunicator(
@@ -135,15 +134,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # If it's a rocm, 'use_custom_allreduce==True' means it must
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
-
-            # FlyDSL all-reduce family: exact one-shot / quantized mesh / ring,
-            # selected by payload size. Opt-in behind AITER_FLY_AR, and the
-            # policy tables are PCIe-only for now.
-            from aiter.dist.device_communicators.flydsl_all_reduce import (
-                FlyDSLAllReduce,
-            )
-
-            self.fly_comm = FlyDSLAllReduce(group=self.cpu_group, device=self.device)
 
     @property
     def all2all_manager(self):
@@ -208,22 +198,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
-        # FlyDSL first when enabled, then quick reduce, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
-        #
-        # FlyDSL leads because at the sizes it accepts it is the exact one-shot
-        # schedule, which is bit-comparable with cross_device_reduce rather
-        # than quantized. It declines everything else.
-        fly_comm = self.fly_comm
-        if (
-            fly_comm is not None
-            and not fly_comm.disabled
-            and fly_comm.should_fly_all_reduce(input_)
-        ):
-            out = fly_comm.fly_all_reduce(input_)
-            assert out is not None
-            return out
-
+        # Quick reduce, then custom allreduce, then pynccl. (quick reduce just
+        # for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -930,18 +906,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def destroy(self):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
-        if self.qr_comm is not None:
-            self.qr_comm = None
-        if self.fly_comm is not None:
-            # Closed rather than merely dropped: it holds IPC inboxes opened
-            # against every peer, and the peers' handles have to be released
-            # before the process group goes away. A borrowed engine belongs to
-            # the group it was built for, which closes it itself.
-            if self._owns_fly_comm:
-                self.fly_comm.close()
-            self.fly_comm = None
-        if self.ca_comm is not None:
-            self.ca_comm = None
+        # Closed rather than merely dropped: either slot may hold IPC inboxes
+        # opened against every peer, and those handles have to be released
+        # before the process group goes away. Dropping the reference defers that
+        # to garbage collection, which can land after the group is gone. A
+        # borrowed pair belongs to the group it was built for, which closes it.
+        for name in ("qr_comm", "ca_comm"):
+            comm = getattr(self, name, None)
+            if comm is not None:
+                if self._owns_ar_comms:
+                    comm.close()
+                setattr(self, name, None)
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()
             self._all2all_manager = None

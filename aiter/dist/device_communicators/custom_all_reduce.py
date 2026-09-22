@@ -32,7 +32,32 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
 
+from .quick_all_reduce import all_ranks_agree
 from .rocm_version import get_rocm_version
+
+# Importing this pulls in flydsl, an optional dependency whose version is
+# checked at import time.
+try:
+    from aiter.ops.flydsl import allreduce_policy as fly_policy
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
+    _FLY_IMPORT_OK = True
+except Exception:  # noqa: BLE001
+    fly_policy = None
+    OneShotAllReduce = None
+    _FLY_IMPORT_OK = False
+
+_FLY_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+# CustomAllreduce supports world size 6; no FlyDSL schedule does.
+_FLY_SUPPORTED_WORLDS = (2, 4, 8)
+
+
+def _close_quietly(engine):
+    if engine is None:
+        return
+    try:
+        engine.close()
+    except (AttributeError, RuntimeError):
+        pass
 
 
 def _detect_gfx1250() -> bool:
@@ -792,9 +817,9 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
@@ -925,6 +950,81 @@ class CustomAllreduce:
             self._init_gfx1250(rank, world_size, max_size)
         else:
             self._init_ipc(rank, world_size, max_size)
+
+        self._fly_oneshot = None
+        self._fly_policy = None
+        self._init_fly_oneshot()
+
+    def _init_fly_oneshot(self):
+        """Build the FlyDSL exact one-shot that fronts small plain all-reduces."""
+
+        if self.disabled or not _FLY_IMPORT_OK or not fly_policy.enabled():
+            return
+        
+        if self.world_size not in _FLY_SUPPORTED_WORLDS:
+            return
+
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+        if arch not in _FLY_SUPPORTED_ARCHS:
+            logger.debug("FlyDSL one-shot disabled: unsupported arch %s.", arch)
+            return
+
+        link = fly_policy.detect_link()
+        engine = None
+        policy = None
+        ok = True
+        try:
+            policy = fly_policy.resolve_oneshot(link, self.world_size)
+            engine = OneShotAllReduce(
+                group=self.group,
+                device=self.device,
+                rank=self.rank,
+                world_size=self.world_size,
+                max_bytes=policy.max_bytes,
+                link=link,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("FlyDSL one-shot disabled: init failed.", exc_info=True)
+            ok = False
+
+        if not all_ranks_agree(ok, self.group):
+            if ok:
+                logger.warning(
+                    "FlyDSL one-shot disabled: a peer rank failed to initialize."
+                )
+            _close_quietly(engine)
+            return
+
+        ok = True
+        try:
+            # Compile every rung now -- one call walks the whole ladder.
+            # TODO: Implement proper AOT compilation such that we don't need launch here.
+            warm = torch.zeros(2048, dtype=torch.bfloat16, device=self.device)
+            engine.compile_and_launch(warm)
+        except Exception:  # noqa: BLE001
+            logger.warning("FlyDSL one-shot disabled: warmup failed.", exc_info=True)
+            ok = False
+
+        if not all_ranks_agree(ok, self.group):
+            if ok:
+                logger.warning(
+                    "FlyDSL one-shot disabled: a peer rank failed to warm up."
+                )
+            _close_quietly(engine)
+            return
+
+        self._fly_oneshot = engine
+        self._fly_policy = policy
+        logger.info(
+            "Custom all-reduce slot: FlyDSL exact one-shot serves plain bf16 "
+            "all-reduce up to %d KiB (TP%d on %s, %.1f MiB of IPC inbox).",
+            policy.max_bytes >> 10,
+            self.world_size,
+            link,
+            engine.inbox_bytes / 2**20,
+        )
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
@@ -1167,6 +1267,26 @@ class CustomAllreduce:
                 return inp_size <= min(self._car_max_size, self.max_size / 2)
         return False
 
+    def _should_fly_oneshot(
+        self, inp: torch.Tensor, use_new: bool, open_fp8_quant: bool
+    ) -> bool:
+        """Whether the FlyDSL one-shot should serve *inp*. Never raises."""
+
+        if self._fly_oneshot is None:
+            return False
+        if open_fp8_quant or not use_new:
+            return False
+        if inp.dtype is not torch.bfloat16:
+            return False
+        if not inp.is_contiguous():
+            return False
+        if inp.data_ptr() % 16:
+            return False
+        if inp.device.index != self.device.index:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        return self._fly_policy.min_bytes <= nbytes <= self._fly_policy.max_bytes
+
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
             inp
@@ -1231,6 +1351,10 @@ class CustomAllreduce:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
+        if self._should_fly_oneshot(input, use_new, open_fp8_quant):
+            out = torch.empty_like(input)
+            self._fly_oneshot.allreduce(input, out)
+            return out
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(
@@ -2146,7 +2270,12 @@ class CustomAllreduce:
         )
 
     def close(self):
-        if not self.disabled and getattr(self, "_ptr", 0):
+        # Not gated on self.disabled: the one-shot holds an IPC inbox opened
+        # against every peer, and those handles have to be released before the
+        # process group goes away regardless of the slot's state.
+        _close_quietly(getattr(self, "_fly_oneshot", None))
+        self._fly_oneshot = None
+        if getattr(self, "_ptr", 0):
             try:
                 self._ops_dispose(self._ptr)
             except (AttributeError, RuntimeError):
