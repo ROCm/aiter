@@ -126,12 +126,15 @@ from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import (
 )
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
-    TR_VEC,
     compile_transpose_ncdhw_ndhwc,
 )
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE]
 CONV_AOT_ARCH_DEFAULT = "gfx950"
+
+# Innermost extent of a probe tensor. Any value above 1 does; see _probe for
+# why it cannot be 1.
+_PROBE_EXTENT = 8
 
 # The lookup's key columns, minus bias -- the one that is not an integer, read
 # through _parse_tuned_bool below.
@@ -332,7 +335,10 @@ def parse_csv(csv_path: str):
             # onto. Skipped where the op itself falls back to torch.permute.
             s = shape["D"] * shape["H"] * shape["W"]
             big = shape["N"] * c_padded * s > 0x7FFFFFFF
-            if c_padded % TR_VEC == 0 and not (big and s > TR_MAX_BIG_S):
+            # The op's other precondition on this path, c % TR_VEC == 0, is
+            # against the caller's channel count; _pad_channels has already
+            # rounded this one up to a multiple of LDG_VEC, the same 8.
+            if not (big and s > TR_MAX_BIG_S):
                 tr_job = {
                     "kind": "transpose",
                     "kernel_name": "transpose_ncdhw_ndhwc",
@@ -405,22 +411,25 @@ def job_arch(cu_num: int = 0, gfx: str = "") -> str:
 def _probe(rank: int, dtype_is_fp32: bool = False):
     """A tiny CPU stand-in for one kernel argument.
 
-    Only the rank and dtype reach the cache key -- the extents are compile-time
-    constants baked in by ``compile_*`` -- so eight elements per argument is
-    enough, and under ``COMPILE_ONLY`` FlyDSL persists the artifact without
-    materialising an execution engine, so the buffer is never dereferenced.
-    That is what keeps AOT off the GPU and out of the 442 MiB a real
-    ``down_0_1`` activation would cost.
+    The extents are compile-time constants baked in by ``compile_*``, so a
+    handful of elements per argument is enough, and under ``COMPILE_ONLY``
+    FlyDSL persists the artifact without materialising an execution engine, so
+    the buffer is never dereferenced. That is what keeps AOT off the GPU and out
+    of the 442 MiB a real ``down_0_1`` activation would cost.
 
-    The rank does matter, though: a rank-1 stand-in compiles fine and then
-    misses at runtime, which is silent because the miss just falls back to JIT.
-    Nothing catches that automatically; see the module docstring.
+    What a stand-in does have to reproduce is the part of the signature that
+    reaches the cache key. Under the dynamic layout these kernels take, that is
+    the rank, the dtype, and which axis carries the unit stride -- so the
+    innermost extent has to be above 1, or the unit stride lands one axis in
+    from the end and the artifact is keyed on a layout no real contiguous
+    tensor has. Both that and a wrong rank compile fine and then miss at
+    runtime, silently, because a miss only falls back to JIT. Nothing catches
+    it automatically; see the module docstring.
     """
     import torch
 
-    shape = (1,) * (rank - 1) + (TR_VEC,) if rank > 1 else (TR_VEC,)
     return torch.empty(
-        shape,
+        (1,) * (rank - 1) + (_PROBE_EXTENT,),
         device=torch.device("cpu"),
         dtype=torch.float32 if dtype_is_fp32 else torch.bfloat16,
     )
