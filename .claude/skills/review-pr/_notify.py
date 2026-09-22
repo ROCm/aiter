@@ -17,9 +17,9 @@ import urllib.request
 CLASSES = {
     "flow":    ("AITER_FLOW_OWNER",    "zufayu",   "the review pipeline itself (bot logic / prompts)"),
     "env":     ("AITER_RUNNER_OWNER",  "zufayu",   "the runner environment (gh, token, git)"),
-    "glm":     ("AITER_GLM_OWNER",     "honglie",  "the GLM model service"),
-    "atom":    ("AITER_ATOM_OWNER",    "",         "the ATOM serving framework"),
-    "machine": ("AITER_MACHINE_OWNER", "huangxin", "the machine (GPU, disk, network, OS)"),
+    "glm":     ("AITER_GLM_OWNER",     "yhl-amd",  "the GLM model service"),
+    "atom":    ("AITER_ATOM_OWNER",    "valarLip",         "the ATOM serving framework"),
+    "machine": ("AITER_MACHINE_OWNER", "gyohuangxin", "the machine (GPU, disk, network, OS)"),
 }
 
 
