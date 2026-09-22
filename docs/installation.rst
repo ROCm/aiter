@@ -91,6 +91,53 @@ Environment Variables
      - Max parallel compilation threads
      - Auto-calculated
 
+Build Target Resolution
+"""""""""""""""""""""""
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 20 15 40
+
+   * - ``AITER_GPU_TARGETS``
+     - ``GPU_ARCHS``
+     - ``CU_NUM``
+     - Build targets
+   * - ``gfx950:128;gfx950:256``
+     - ignored
+     - ignored
+     - ``gfx950:128``, ``gfx950:256``
+   * - ``gfx942;gfx950:128``
+     - ignored
+     - ignored
+     - ``gfx942:304``, ``gfx950:128``
+   * - unset
+     - ``gfx942;gfx950``
+     - unset
+     - ``gfx942:304``, ``gfx950:256`` [#cu]_
+   * - unset
+     - ``gfx942;gfx950``
+     - ``80``
+     - ``gfx942:80``, ``gfx950:80``
+   * - unset
+     - ``gfx950``
+     - unset, no GPU
+     - ``gfx950:256``
+   * - unset
+     - unset or ``native``
+     - unset
+     - live architecture at its live CU count
+   * - unset
+     - unset or ``native``
+     - ``80``
+     - live architecture at ``80``
+   * - unset
+     - unset or ``native``
+     - any, no GPU
+     - error
+
+.. [#cu] The architecture matching the live device takes that
+   device's CU count.
+
 Example Configurations
 """"""""""""""""""""""
 
