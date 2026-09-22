@@ -145,6 +145,19 @@ _STREAM_BLOCK_WIDTHS = (512, 1024)
 # rows * width at which `sampled` becomes the fastest backend here. See
 # `_sampled_takes` for the measurement and for what it was measured on.
 _SAMPLED_MIN_WORK = 1 << 28
+# The second door into `sampled`, on the width rather than on the product,
+# because the product cannot express the wide few-row corner at all: 128 rows of
+# the spec's widest N is 2**27, under the work threshold above. See
+# `_sampled_takes` for what was measured.
+#
+# There is no row floor. One was needed while `topk_shape.hip.hpp`'s small-S
+# rule could plan a candidate window that filled Phase C's cap to the brim, so
+# that 1.2% of rows at N=524288 overflowed into a ~350us exact fallback;
+# `CAP_SAFE_FILL` removed that, and with it the reason. Kept as a named constant
+# rather than deleted because the next shape that cannot tolerate a fallback
+# will want somewhere to say so.
+_SAMPLED_MIN_WIDTH = 131072
+_SAMPLED_MIN_ROWS = 1
 _PLAIN_MANY_ROWS = 256
 _PLAIN_MANY_ROWS_BAND = (8192, 65536)
 _PLAIN_MIN_K = 1024
@@ -392,8 +405,29 @@ def _sampled_takes(rows: int, width: int, k: int) -> bool:
     depends on the value distribution as well as the shape, and every cell
     behind this constant was measured on one distribution. A tie-dense input
     moves the answer. Re-fit before trusting it on real data.
+
+    The work threshold is no longer the only door. It cannot reach the wide,
+    few-row corner at all -- 128 rows of the spec's widest N is 2**27 -- and
+    that corner is where `sampled` now wins by the most: re-measured over the
+    390-cell grid it is the fastest arm on every cell of N >= 131072 except one,
+    by up to 2.96x (m=128 n=1M, `decode` 387.5us against 131.1us). So a width
+    door was added beside the work door. Simulated over the measured table
+    against the rule it replaces: +8 green cells, 0.943x of the total time, and
+    no cell more than 2% slower.
+
+    No row floor, and that is load-bearing rather than an omission. This gate
+    first shipped with one at 64 rows, because below that `topk_shape.hip.hpp`
+    took its small-S rule and planned a candidate window that filled Phase C's
+    cap to 99% -- 1.2% of rows at N=524288 then overflowed into the exact
+    fallback at a flat ~350us each, which took m=32 n=524288 from 39us to 388us
+    on one row in 32. `CAP_SAFE_FILL` made the S-rule leave headroom instead
+    (measured after: 0 fallback rows in 384 there), so the floor came out and
+    72 more cells changed hands at a median 0.711x, none slower.
     """
-    if rows * width < _SAMPLED_MIN_WORK:
+    if not (
+        rows * width >= _SAMPLED_MIN_WORK
+        or (width >= _SAMPLED_MIN_WIDTH and rows >= _SAMPLED_MIN_ROWS)
+    ):
         return False
     return bool(topk_sampled_supports(rows, width, k))
 
