@@ -150,10 +150,12 @@ def launch_gemm(
         i32_n: fx.Int32,
     ):
         scale_atoms = _scale_mma_atoms(a_dtype, b_dtype)
-        tid = fx.Int32(fx.thread_idx.x)
-        bid_x, bid_y, bid_z = fx.block_idx
+        tid = fx.Int32(gpu.thread_id("x"))
+        bid_x = gpu.block_id("x")
+        bid_y = gpu.block_id("y")
+        bid_z = fx.Int32(gpu.block_id("z"))
         if const_expr(k_batch > 1):
-            k_tile_start = fx.Int32(bid_z % k_batch) * fx.Int32(k_tiles_local)
+            k_tile_start = (bid_z % k_batch) * fx.Int32(k_tiles_local)
         else:
             k_tile_start = fx.Int32(0)
         wave = rocdl.readfirstlane(T.i32, tid // 64)
@@ -165,8 +167,8 @@ def launch_gemm(
             from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 
             block_m, block_n = xcd_remap_bx_by(
-                fx.Index(bid_x),
-                fx.Index(bid_y),
+                bid_x,
+                bid_y,
                 fx.Index(i32_m),
                 tile_m=BM,
                 tile_n=BN,
@@ -176,8 +178,8 @@ def launch_gemm(
             block_m = fx.Int32(block_m) * BM
             block_n = fx.Int32(block_n) * BN
         else:
-            block_m = bid_x * BM
-            block_n = bid_y * BN
+            block_m = fx.Int32(bid_x) * BM
+            block_n = fx.Int32(bid_y) * BN
 
         a_rstride = fx.Int32(a_row_bytes)
         scale_a_rstride = fx.Int32(scale_chunk_dwords)
@@ -575,12 +577,14 @@ _REDUCE_BLOCK = 256
 
 
 def _pack_pair_from_f32(accumulator_low, accumulator_high, out_dtype, *, i32):
-    out_type = T.bf16 if out_dtype == "bf16" else T.f16
-    low_i16 = arith.bitcast(T.i16, arith.trunc_f(out_type, accumulator_low))
-    high_i16 = arith.bitcast(T.i16, arith.trunc_f(out_type, accumulator_high))
+    out_ty = BFloat16 if out_dtype == "bf16" else Float16
+    low = accumulator_low.to(out_ty)
+    high = accumulator_high.to(out_ty)
+    low_i16 = arith.bitcast(T.i16, low.ir_value())
+    high_i16 = arith.bitcast(T.i16, high.ir_value())
     low_i32 = fx.Int32(arith.extui(i32, low_i16))
     high_i32 = fx.Int32(arith.extui(i32, high_i16))
-    return low_i32 | (high_i32 << arith.constant(16, type=i32))
+    return low_i32 | (high_i32 << fx.Int32(16))
 
 
 @flyc.jit
@@ -604,17 +608,17 @@ def launch_splitk_reduce(
     ):
         f32 = T.f32
         i32 = T.i32
-        block = fx.block_idx.x
-        thread = fx.thread_idx.x
+        block = fx.Int32(gpu.block_id("x"))
+        thread = fx.Int32(gpu.thread_id("x"))
         input_resource = ptr_rsrc(tmp)
         output_resource = ptr_rsrc(out)
-        dword = fx.Int32(block) * _REDUCE_BLOCK + fx.Int32(thread)
+        dword = block * _REDUCE_BLOCK + thread
         if dword < n_out_dwords_i32:
-            first_element = dword * arith.constant(2, type=i32)
+            first_element = dword * fx.Int32(2)
             accumulator_low = fx.Float32(0.0)
             accumulator_high = fx.Float32(0.0)
             for split_index in range_constexpr(split_k):
-                split_offset = arith.constant(split_index, type=i32) * slab_stride_i32
+                split_offset = fx.Int32(split_index) * slab_stride_i32
                 raw = buffer_ops.buffer_load(
                     input_resource,
                     first_element + split_offset,
