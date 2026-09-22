@@ -244,8 +244,9 @@ def compare_metadata(golden, test):
 
 
 @benchmark()
-def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters,
-                  batch_chunk=0):
+def test_metadata(
+    batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters, batch_chunk=0
+):
     if batch_chunk:
         os.environ[_CHUNK_ENV] = str(batch_chunk)
     else:
@@ -281,8 +282,12 @@ def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_i
     # what runs today whenever the parallel path bails out, so it is timed.
     candidates = {"serial": "0", "parallel": "1"}
 
-    ret = {"gfx": get_gfx(), "chunk": batch_chunk or MLA_V12_DEFAULT_CHUNK,
-           "num_works": num_works, "num_split_groups": num_groups}
+    ret = {
+        "gfx": get_gfx(),
+        "chunk": batch_chunk or MLA_V12_DEFAULT_CHUNK,
+        "num_works": num_works,
+        "num_split_groups": num_groups,
+    }
     us = {}
     for name, env in candidates.items():
         os.environ[_PARALLEL_ENV] = env
@@ -302,7 +307,9 @@ def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_i
     # against, so its err is 0 by construction and would be a noise column.
     ret["parallel err"] = max(mism.values()) if mism else 0
     ret["match"] = ok
-    ret["speedup"] = round(us["serial"] / us["parallel"], 3) if us["parallel"] else float("nan")
+    ret["speedup"] = (
+        round(us["serial"] / us["parallel"], 3) if us["parallel"] else float("nan")
+    )
     return ret
 
 
@@ -383,19 +390,19 @@ def main():
     for batch_chunk, ctx_len, batch_size in itertools.product(
         args.batch_chunk, args.ctx_len, args.batch
     ):
-            row = test_metadata(
-                batch_size,
-                ctx_len,
-                dtype,
-                kvtype,
-                nhead,
-                args.jitter,
-                args.seed,
-                args.num_iters,
-                batch_chunk,
-            )
-            rows.append(row)
-            all_match = all_match and row["match"]
+        row = test_metadata(
+            batch_size,
+            ctx_len,
+            dtype,
+            kvtype,
+            nhead,
+            args.jitter,
+            args.seed,
+            args.num_iters,
+            batch_chunk,
+        )
+        rows.append(row)
+        all_match = all_match and row["match"]
 
     df = pd.DataFrame(rows)
     aiter.logger.info(
