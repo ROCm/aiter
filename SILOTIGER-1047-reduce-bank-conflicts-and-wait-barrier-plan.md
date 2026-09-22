@@ -487,3 +487,20 @@ The parent plan remains the full K2 list.
   the composed map (no pointer-offset into an unswizzled subview).
   Correct; emit `v_bitop3` not `v_xor`. M=1 +3.14%, M=8 −0.34%,
   M=512 +5.98% vs K-pad. Keep `_K_STRIDE = D+8`.
+- Publishing decode V as 64-bit LDS stores to match AMD's four
+  `ds_write_b64`, in either form. Both are correct (`err=0`) and both
+  regress, measured 2026-09-22 against a back-to-back HEAD baseline of
+  `15.05 / 17.88 / 410.46`:
+  - volatile i64 stores on `(BLOCK_N, gather_span):(D, 1)` — emits the
+    literal 4× `ds_write_b64`; M=1 +5.0%, M=8 +8.7%, M=512 flat.
+  - split-row map (low 4 of every 8-element gather run, then the high 4,
+    so the pair sits `D/2` apart and cannot merge) with PV-B reading the
+    same `((4,2,2),16):((1,D/2,4),D)` view — LLVM picks 2× `ds_write2_b64`;
+    M=1 +8.7%, M=8 +13.4%, M=512 flat.
+  Split-row emits an *identical* instruction mix to the baseline (660
+  total / 422 VALU / 33 LDS) and is still the slowest, so the cost is LDS
+  bank behaviour, not the volatile barrier or instruction count. AMD's
+  `b64` pairs follow from its two-region V LDS (`+0/+8` and
+  `+4096/+4104`); the opcode does not transfer to our single-region
+  `[BLOCK_N, D]` tile. Keep the 128-bit V publish. Re-open only together
+  with AMD's V geometry, not as an opcode match.
