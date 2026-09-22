@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Exhaustive, correctness-gated tuner for packed-varlen MHA forward.
@@ -24,10 +23,11 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, ClassVar
 
+import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 import pandas as pd
-import triton  # noqa: F401  # ROCm environments may require Triton before torch.
 import torch
 
+from aiter import logger
 from aiter.jit.core import AITER_CONFIG_MHA_FWD
 from aiter.jit.utils.chip_info import TUNING_HARDWARE_FIELDS, get_gpu_model
 from aiter.ops.mha import (
@@ -38,7 +38,6 @@ from aiter.ops.mha import (
     mha_varlen_fwd,
 )
 from aiter.ops.mha_fwd_policy import (
-    as_bool,
     MHA_FWD_CANDIDATE_FIELDS,
     MHA_FWD_INDIFFERENCE_DELTA,
     MHA_FWD_METRIC_FIELDS,
@@ -50,6 +49,7 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdCandidate,
     MhaFwdProblem,
+    as_bool,
     canonical_backend_config,
     enumerate_mha_fwd_candidates,
     mha_fwd_candidate_id,
@@ -1659,10 +1659,11 @@ class MhaFwdTuner(TunerCommon):
                         has_pe=False,
                         head_dim_v=int(row.hdim_v),
                     )
-            except Exception:
+            except Exception as error:  # noqa: BLE001 - any failure means no incumbent
                 # A backend with no resolvable default has no incumbent to
                 # beat, which is a weaker claim than one we can measure but
                 # not a reason to abandon the sweep.
+                logger.debug("no %s incumbent for this shape: %s", backend, error)
                 continue
             if not isinstance(config, dict):
                 continue

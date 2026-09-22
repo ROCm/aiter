@@ -15,10 +15,7 @@ import pandas as pd
 import torch
 
 from aiter import dtypes, logger
-from aiter.jit.utils.chip_info import (
-    get_gfx_runtime as _chip_get_gfx,
-    get_gpu_model as _chip_get_gpu_model,
-)
+from aiter.jit.utils import chip_info
 
 INVALID_TIME = -1
 
@@ -490,10 +487,10 @@ class TunerCommon:
         return cu_num
 
     def get_gfx(self):
-        return _chip_get_gfx()
+        return chip_info.get_gfx_runtime()
 
     def get_gpu_model(self):
-        return _chip_get_gpu_model(torch.cuda.current_device())
+        return chip_info.get_gpu_model(torch.cuda.current_device())
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""

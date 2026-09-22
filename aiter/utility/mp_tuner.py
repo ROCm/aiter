@@ -460,8 +460,8 @@ def work_group(
         gc.collect()
         try:
             torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001 - a faulted HIP context may reject cleanup
-            pass
+        except Exception as error:  # noqa: BLE001 - cleanup is best-effort
+            logger.debug("cache cleanup after a faulted context failed: %s", error)
 
 
 def get_pid():

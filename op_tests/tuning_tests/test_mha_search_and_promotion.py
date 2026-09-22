@@ -11,12 +11,11 @@ import unittest
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 import pandas as pd
 
-from op_tests.tuners.tune_mha_fwd import MhaFwdTuner
-
 from aiter.ops.mha_fwd_policy import (
     MHA_FWD_TILE_CONFIG_BACKENDS,
     enumerate_mha_fwd_candidates,
 )
+from op_tests.tuners.tune_mha_fwd import MhaFwdTuner
 
 
 class TestIncumbentGate(unittest.TestCase):

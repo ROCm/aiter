@@ -23,9 +23,8 @@ import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm en
 import torch
 
 from aiter.ops import mha
-from aiter.ops.triton.attention import mha as triton_mha
-
 from aiter.ops.mha_fwd_policy import MHA_FWD_RUNTIME_CSV_FIELDS
+from aiter.ops.triton.attention import mha as triton_mha
 
 TILES = {
     "BLOCK_M": 64,
