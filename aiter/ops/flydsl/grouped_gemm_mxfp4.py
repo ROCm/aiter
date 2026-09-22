@@ -183,6 +183,46 @@ def _select_wmma_reuse(default: int = 0) -> int:
     return value
 
 
+def supports_gfx1250_a_preshuffle(
+    *,
+    N: int,
+    K: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+    out_is_f16: int,
+    a_is_fp4: int,
+    stage1_act: int,
+    stage1_quant_out: int,
+    has_bias: int,
+    n_experts: int,
+) -> bool:
+    """Return whether the retained kernel can consume A-preshuffled A."""
+    num_buffers = min(num_buffers, max(1, K // tile_k))
+    common = all(
+        (
+            a_is_fp4,
+            stage1_quant_out == 0,
+            out_is_f16 == 0,
+            has_bias == 0,
+            n_experts > 0,
+            (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+            in (
+                (64, 256, 256, 1, 4, 2),
+                (256, 256, 256, 2, 2, 4),
+            ),
+        )
+    )
+    if not common:
+        return False
+    if stage1_act == 1:
+        return K == 7168 and N in (4096, 6144)
+    return stage1_act == 0 and N == 7168 and K in (2048, 3072)
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -335,7 +375,25 @@ def flydsl_grouped_gemm_a8w4_masked(
         )
 
     enable_ep_scatter = stage2_scatter is not None
-    use_optimized = (target_fp4_prefill or target_gemm2) and not any(
+    a_preshuffle_supported = bool(a_preshuffle) and supports_gfx1250_a_preshuffle(
+        N=N,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        num_buffers=num_buffers,
+        out_is_f16=out_is_f16,
+        a_is_fp4=a_is_fp4,
+        stage1_act=stage1_act,
+        stage1_quant_out=stage1_quant_out,
+        has_bias=has_bias,
+        n_experts=n_experts,
+    )
+    use_optimized = (
+        target_fp4_prefill or target_gemm2 or a_preshuffle_supported
+    ) and not any(
         (
             enable_ep_scatter,
             bool(tdm_as_in_prologue),
@@ -431,10 +489,12 @@ def flydsl_grouped_gemm_a8w4_masked(
             else 0,
             _select_wmma_reuse() if target_fp4_prefill else 0,
             _select_binary_int("AITER_FLYDSL_GEMM1_DELAY_ACC_ZERO", 0),
-            (
-                _select_binary_int("AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE", 0)
-                if target_fp4_prefill
-                else _select_binary_int("AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE", 0)
+            _select_binary_int("AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE", 0)
+            if target_fp4_prefill
+            else (
+                _select_binary_int("AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE", 0)
+                if target_gemm2
+                else 0
             ),
             (
                 _select_gemm2_output_split_wm()

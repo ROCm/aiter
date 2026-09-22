@@ -559,7 +559,10 @@ def _grouped_a8w4_tdm_moe(
 
     import torch
 
-    from aiter.ops.flydsl.grouped_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+        flydsl_grouped_gemm_a8w4_masked,
+        supports_gfx1250_a_preshuffle,
+    )
     from aiter.ops.flydsl.moe_kernels import (
         flydsl_moe_fused_ep_route_quant_compact,
         flydsl_moe_fused_quant_preshuffle,
@@ -874,6 +877,53 @@ def _grouped_a8w4_tdm_moe(
     # per dest row: nothing local re-lays it out, so gemm1 takes the 16-row
     # interleave on its LDS->register read instead.
     _row_major_ascale = _compact and _prequantized
+    _a_preshuffle_common = not any(
+        (
+            enable_ep_scatter,
+            bool(tdm_as_in_prologue),
+            bool(tdm_b_th),
+            bool(_row_major_ascale),
+        )
+    )
+    # Serving captures decode and prefill shapes in the same process. Keep the
+    # opt-in enabled only for shapes accepted by the retained optimized kernel;
+    # all other shapes continue through the ordinary row-major producer/GEMM.
+    _gemm1_a_preshuffle = _gemm1_a_preshuffle and _a_preshuffle_common and (
+        supports_gfx1250_a_preshuffle(
+            N=two_inter,
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            num_buffers=num_buffers,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act,
+            stage1_quant_out=0,
+            has_bias=int(_b1 is not None),
+            n_experts=E,
+        )
+    )
+    _gemm2_a_preshuffle = _gemm2_a_preshuffle and _a_preshuffle_common and (
+        supports_gfx1250_a_preshuffle(
+            N=model_dim,
+            K=inter_dim,
+            tile_m=tile_m2,
+            tile_n=tile_n2,
+            tile_k=tile_k2,
+            m_warp=m_warp2,
+            n_warp=n_warp2,
+            num_buffers=num_buffers2,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=0,
+            stage1_quant_out=0,
+            has_bias=int(_b2 is not None),
+            n_experts=E,
+        )
+    )
     # Local quant instead writes one compact row-major row per token and rebuilds
     # the interleaved layout gemm1 reads in a second pass, so neither write lands
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
