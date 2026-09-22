@@ -43,8 +43,15 @@ constexpr int N_LDS_SMALL_M_LIMIT = 256;
 constexpr int LDS_BYTES_PER_BLOCK_MAX = 160 * 1024;
 
 constexpr int PHASE_C_CAP_MAX = 8192;
-constexpr int WSTAGE_WAVES    = 8;
-constexpr int WSTAGE_CAP      = 320;
+// How full of candidates Phase C's area may be PLANNED to get. The margin clamp
+// in derive_shape_params has always used this fraction; naming it lets the
+// sample-count search use the same one, which is the whole of the fix for the
+// N=524288 fallbacks. Filling the cap to its brim is what leaves a row nowhere
+// to go, and a row with nowhere to go costs a flat ~350 us in the exact
+// fallback.
+constexpr double CAP_SAFE_FILL = 0.85;
+constexpr int WSTAGE_WAVES     = 8;
+constexpr int WSTAGE_CAP       = 320;
 
 // The K the GEOMETRY has to serve on a ragged launch, which is not the caller's
 // K. A ragged row ranks min(K, row_len) <= min(K, N) elements and pads the rest
@@ -368,7 +375,21 @@ static inline int derive_sample_s_for_n(int M, int N, int K, float margin_unused
         if(!sample_stride_exact(N, S))
             continue;
         const double m = auto_margin(K, S, N);
-        if(candidate_hi(K, S, N, m) <= (double)PHASE_C_CAP_MAX)
+        // candidate_hi is the THREE-SIGMA upper edge, so accepting it at the cap
+        // accepts a plan that overflows on any row past 3 sigma -- and this loop
+        // takes the FIRST S that fits, which is the one with the least headroom
+        // there is. It cost exactly that: at N=524288 it chose S=5440, putting the
+        // edge at 99.1% of the cap, 3.09 sigma of room, and 1.2% of rows then
+        // overflowed into phase_d_fallback at a flat ~350 us each. Measured at
+        // N=1048576 it is 99.7% and 3.04 sigma; every other width and both of
+        // rule 0's was 5.7 to 15.2 sigma.
+        //
+        // CAP_SAFE_FILL is the fraction derive_shape_params already treats as the
+        // safe level for the same cap when it clamps the margin, reused rather than
+        // fitted. It moves N=524288 to S=6528 (edge at 84.9%, 4.94 sigma) and
+        // N=1048576 to S=13056, and leaves N <= 262144 -- where the edge was
+        // already 51.9% and 72.6% -- untouched.
+        if(candidate_hi(K, S, N, m) <= CAP_SAFE_FILL * (double)PHASE_C_CAP_MAX)
             return S;
     }
     return SAMPLE_S_MAX;
@@ -583,7 +604,7 @@ static inline ShapeParams derive_shape_params(int M,
             S = repaired;
     }
     margin                  = margin_override > 0.f ? margin_override : auto_margin(K, S, N);
-    const double cap_margin = 0.85 * (double)PHASE_C_CAP_MAX / (double)K;
+    const double cap_margin = CAP_SAFE_FILL * (double)PHASE_C_CAP_MAX / (double)K;
     const double eff_margin = std::min((double)margin, cap_margin);
     const int rank          = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
     const int cap           = derive_cap(K, margin, S, N);
