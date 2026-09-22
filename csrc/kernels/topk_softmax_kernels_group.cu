@@ -23,6 +23,7 @@
 #include "moe_op.h"
 #include "warp_sort.h"
 #include <cfloat>
+#include <cstdint>
 #include <hip/hip_runtime.h>
 
 #ifndef AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE
@@ -307,6 +308,10 @@ __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 }
 
 // Compact form of the legacy wave64 DPP tie-priority table.
+constexpr int kLegacyTopKLocalBits      = 5;
+constexpr int kTopKRegMaxExpertsPerLane = 1 << kLegacyTopKLocalBits;
+
+// Only the wave64 register path calls this helper; LAUNCHER_TOPK_REG gates it.
 __device__ __forceinline__ int legacy_topk_lane_rank(int lane)
 {
     const int low2 = (lane & 3) ^ ((lane & 4) ? 3 : 0);
@@ -322,7 +327,7 @@ __device__ __forceinline__ int legacy_topk_tie_rank(int expert_id)
     const int vec4_id   = expert_id >> 2;
     const int lane      = vec4_id & (WARP_SIZE - 1);
     const int local_pos = ((vec4_id >> 6) << 2) | (expert_id & 3);
-    return (legacy_topk_lane_rank(lane) << 5) | local_pos;
+    return (legacy_topk_lane_rank(lane) << kLegacyTopKLocalBits) | local_pos;
 }
 
 __device__ __forceinline__ bool
@@ -358,9 +363,11 @@ __device__ __forceinline__ void emit_legacy_ordered_topk(const float* cand_val,
         const bool match       = lane < n_cand && !selected && cv == target;
         const uint64_t matches = __ballot(match);
         int winner_lane;
+        // The caller admits this helper only when finite-only compaction found
+        // at least topk candidates, so every sorted target has a live match.
         if((matches & (matches - 1)) == 0)
         {
-            winner_lane = matches != 0 ? __builtin_ctzll(matches) : 0;
+            winner_lane = __builtin_ctzll(matches);
         }
         else
         {
@@ -712,8 +719,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 
     if(need_renorm)
     {
-        sum = routed_scaling_factor / sum;
-        ;
+        sum = sum > 0.0f ? routed_scaling_factor / sum : 0.0f;
     }
     else
     {
@@ -750,6 +756,8 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     static constexpr int NVEC     = EXPERTS_PER_LANE / 2;
     static constexpr bool HAS_TAIL = (EXPERTS_PER_LANE % 2) != 0;
     static_assert(!(isBiased && isSoftmax), "biased path is sigmoid only");
+    static_assert(EXPERTS_PER_LANE <= kTopKRegMaxExpertsPerLane,
+                  "legacy tie-rank encoding reserves five local-position bits");
 
     using cktype_i = typename aiter::hip2opus<DTYPE_I>::type;
     using vec_i    = opus::vector_t<cktype_i, 2>;
@@ -875,6 +883,9 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
             tsum += sig_scores[id];
         auto add_op = [](float a, float b) { return a + b; };
         tsum = wave_reduce<float, decltype(add_op), WARP_SIZE, true>(tsum, add_op);
+        // Complete every lane's strided reads before any lane overwrites the
+        // same LDS words with normalized values.
+        __builtin_amdgcn_wave_barrier();
         for_each_owned([&](float& v, int id) {
             v /= tsum;
             sig_scores[id] = v;
@@ -908,7 +919,7 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     const int n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
     eq_base += n_gt - my_eq;
 
-    if(n_cand >= topk && n_cand <= WARP_SIZE)
+    if(pivot > -INFINITY && n_cand >= topk && n_cand <= WARP_SIZE)
     {
         int slot_gt = gt_base;
         int slot_eq = eq_base;
@@ -971,18 +982,18 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         const bool has_valid_candidate = max_idx >= 0;
         if(!has_valid_candidate)
         {
-            // topk <= 32 and num_experts >= 64 on this path, so an unused ID in
-            // [0, 31] always exists. Prefer IDs at or after k to preserve the
-            // legacy fallback order whenever its default ID is still unused.
+            // The wave64 launcher gate enforces topk <= 32, so an unused ID in
+            // [0, 31] always exists before each synthetic round.
             const uint32_t unused          = ~selected_low_mask;
             const uint32_t unused_from_k   = unused & (~0u << k);
             const uint32_t fallback_source = unused_from_k != 0 ? unused_from_k : unused;
             max_idx                        = __builtin_ctz(fallback_source);
         }
-        if(max_idx < 32)
+        if(max_idx >= 0 && max_idx < 32)
             selected_low_mask |= 1u << max_idx;
 
-        // Retire the winner in place: compare-and-select, no dynamic index.
+        // Scores only transition to -Inf and never become selectable again, so
+        // retiring a synthetic filler cannot hide a later valid candidate.
         for_each_owned([&](float& v, int id) { v = id == max_idx ? -INFINITY : v; });
 
         max_val     = has_valid_candidate ? sig_scores[max_idx] : 0.0f;
@@ -1458,7 +1469,9 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             if(need_renorm)
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
-                topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
+                topk_v = sum > 0.0f
+                             ? topk_v * routed_scaling_factor * __builtin_amdgcn_rcpf(sum)
+                             : 0.0f;
             }
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
@@ -1487,7 +1500,9 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             if(need_renorm)
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
-                topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
+                topk_v = sum > 0.0f
+                             ? topk_v * routed_scaling_factor * __builtin_amdgcn_rcpf(sum)
+                             : 0.0f;
             }
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
@@ -1541,7 +1556,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
  */
 #define LAUNCHER_TOPK_REG()                                                          \
     {                                                                                \
-        constexpr int kMaxExpertsPerLane = 32;                                       \
+        constexpr int kMaxExpertsPerLane = aiter::kTopKRegMaxExpertsPerLane;         \
         const int reg_lanes        = static_cast<int>(get_warp_size_func());         \
         const int experts_per_lane = reg_lanes > 0 ? num_experts / reg_lanes : 0;    \
         if(topk_grp == num_expert_group &&                                           \
@@ -1554,7 +1569,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         {                                                                            \
             const size_t shared_mem_size = num_experts * sizeof(float) +             \
                                            reg_lanes * sizeof(float) +               \
-                                           2 * reg_lanes * sizeof(int);              \
+                                           reg_lanes * sizeof(int);                  \
             AITER_TOPK_REG_LAUNCH_EPLS(AITER_TOPK_REG_LAUNCH_ONE)                    \
         }                                                                            \
     }

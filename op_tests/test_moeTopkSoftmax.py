@@ -383,7 +383,21 @@ def test_grouped_topk_stable(
     mode,
     need_renorm,
     pattern,
+    strided_output,
 ):
+    mode_id = {"biased": 0, "sigmoid": 1, "softmax": 2}[mode]
+    pattern_id = {
+        "random": 0,
+        "all_equal": 1,
+        "sixteen_way_tie": 2,
+        "one_finite": 3,
+        "all_nan": 4,
+        "masked_scores": 5,
+        "all_zero_sigmoid": 6,
+    }[pattern]
+    torch.manual_seed(
+        5632 + token * 17 + expert * 3 + topk + mode_id * 1009 + pattern_id * 101
+    )
     gating = torch.randn((token, expert), dtype=dtype)
     bias = (torch.randn(expert) * 0.05).to(dtype)
     if pattern == "all_equal":
@@ -400,9 +414,30 @@ def test_grouped_topk_stable(
     elif pattern == "all_nan":
         gating.fill_(torch.nan)
         bias.zero_()
+    elif pattern == "masked_scores":
+        if token != 2 or expert != 128 or mode != "biased":
+            raise AssertionError("masked_scores requires biased token=2, E=128")
+        gating.zero_()
+        bias.fill_(-torch.inf)
+        bias[:3] = 0
+        # Row 0 previously entered the candidate fast path with 64 staged
+        # values, while row 1 entered fallback with 65. Both must now emit the
+        # same three valid experts followed by inert fillers.
+        gating[0, 64:] = torch.nan
+        gating[1, 65:] = torch.nan
+    elif pattern == "all_zero_sigmoid":
+        if mode == "softmax":
+            raise AssertionError("all_zero_sigmoid is not a softmax pattern")
+        gating.fill_(-100)
+        bias.zero_()
 
-    w = torch.empty((token, topk), dtype=dtypes.fp32)
-    ids = torch.empty((token, topk), dtype=dtypes.i32)
+    def make_output(dtype):
+        if strided_output:
+            return torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtype)
+        return torch.empty((token, topk), dtype=dtype)
+
+    w = make_output(dtypes.fp32)
+    ids = make_output(dtypes.i32)
     if mode == "biased":
         _, us = run_perftest(
             aiter.biased_grouped_topk_hip,
@@ -414,6 +449,8 @@ def test_grouped_topk_stable(
             1,
             need_renorm,
             2.5,
+            num_iters=2,
+            num_warmup=1,
         )
     else:
         _, us = run_perftest(
@@ -426,25 +463,54 @@ def test_grouped_topk_stable(
             need_renorm,
             mode == "softmax",
             2.5,
+            num_iters=2,
+            num_warmup=1,
         )
 
-    if pattern in ("one_finite", "all_nan"):
-        assert mode == "biased" and need_renorm
-        assert ((ids >= 0) & (ids < expert)).all()
+    degenerate_patterns = {
+        "one_finite",  # Only one selectable expert; remaining slots must be inert.
+        "all_nan",  # No selectable expert.
+        "masked_scores",  # Same row result across candidate fast path and fallback.
+        "all_zero_sigmoid",  # Zero renorm denominator must produce finite zero weights.
+    }
+    if pattern in degenerate_patterns:
+        invalid_ids = int(((ids < 0) | (ids >= expert)).sum().item())
         sorted_ids = ids.sort(dim=-1).values
-        assert (sorted_ids[:, 1:] != sorted_ids[:, :-1]).all()
+        duplicate_ids = int((sorted_ids[:, 1:] == sorted_ids[:, :-1]).sum().item())
         expected_w = torch.zeros_like(w)
         if pattern == "one_finite":
-            assert (ids[:, 0] == 2).all()
+            if mode != "biased":
+                raise AssertionError("one_finite requires biased mode")
             expected_w[:, 0] = 2.5
-        torch.testing.assert_close(w, expected_w, rtol=0, atol=0)
+            wrong_first_id = int((ids[:, 0] != 2).sum().item())
+        elif pattern == "masked_scores":
+            expected_w[:, :3] = 2.5 / 3 if need_renorm else 1.25
+            wrong_first_id = int(
+                (ids[:, :3] != torch.arange(3, dtype=ids.dtype)).sum().item()
+            )
+        else:
+            wrong_first_id = 0
+        weight_err = checkAllclose(
+            w,
+            expected_w,
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0,
+            msg=f"{mode}/{pattern}: degenerate weights",
+        )
+        err = invalid_ids + duplicate_ids + wrong_first_id + int(weight_err != 0)
+        if err:
+            raise AssertionError(
+                f"{mode}/{pattern}: invalid={invalid_ids}, duplicates={duplicate_ids}, "
+                f"winner={wrong_first_id}, weight_err={weight_err}"
+            )
     else:
         legacy_gating = torch.full((token, expert + 4), -torch.inf, dtype=dtype)
         legacy_gating[:, :expert] = gating
         legacy_bias = torch.full((expert + 4,), -torch.inf, dtype=dtype)
         legacy_bias[:expert] = bias
-        legacy_w = torch.empty((token, topk), dtype=dtypes.fp32)
-        legacy_ids = torch.empty((token, topk), dtype=dtypes.i32)
+        legacy_w = make_output(dtypes.fp32)
+        legacy_ids = make_output(dtypes.i32)
         if mode == "biased":
             aiter.biased_grouped_topk_hip(
                 legacy_gating,
@@ -467,10 +533,82 @@ def test_grouped_topk_stable(
                 mode == "softmax",
                 2.5,
             )
-        torch.testing.assert_close(ids, legacy_ids, rtol=0, atol=0)
-        torch.testing.assert_close(w, legacy_w, rtol=0, atol=0, equal_nan=True)
+        padding_ids = int(((legacy_ids < 0) | (legacy_ids >= expert)).sum().item())
+        id_err = checkAllclose(
+            ids,
+            legacy_ids,
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0,
+            msg=f"{mode}/{pattern}: ordered ids",
+        )
+        weight_bit_errors = int(
+            (
+                w.contiguous().view(torch.int32)
+                != legacy_w.contiguous().view(torch.int32)
+            )
+            .sum()
+            .item()
+        )
+        err = padding_ids + int(id_err != 0) + weight_bit_errors
+        if err:
+            raise AssertionError(
+                f"{mode}/{pattern}: padding_ids={padding_ids}, id_err={id_err}, "
+                f"weight_bit_errors={weight_bit_errors}"
+            )
 
-    return {"err": 0, "us": us}
+    return {"err": err, "us": us}
+
+
+@benchmark()
+def test_grouped_topk_zero_renorm(path):
+    token, topk = 1, 8
+    expert = 260 if path == "lds" else 256
+    gating = torch.full((token, expert), -100, dtype=dtypes.bf16)
+    w = torch.empty((token, topk), dtype=dtypes.fp32)
+    ids = torch.empty((token, topk), dtype=dtypes.i32)
+
+    if path == "lds":
+        _, us = run_perftest(
+            aiter.grouped_topk,
+            gating,
+            w,
+            ids,
+            1,
+            1,
+            True,
+            False,
+            2.5,
+            num_iters=2,
+            num_warmup=1,
+        )
+    else:
+        bias = torch.zeros(expert, dtype=dtypes.bf16)
+        _, us = run_perftest(
+            aiter.biased_grouped_topk_hip,
+            gating,
+            bias,
+            w,
+            ids,
+            8,
+            4,
+            True,
+            2.5,
+            num_iters=2,
+            num_warmup=1,
+        )
+
+    err = checkAllclose(
+        w,
+        torch.zeros_like(w),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        msg=f"{path}: zero renorm",
+    )
+    if err or not torch.isfinite(w).all().item():
+        raise AssertionError(f"{path}: zero renorm produced {w}")
+    return {"err": err, "us": us}
 
 
 @benchmark()
@@ -884,27 +1022,40 @@ aiter.logger.info(
 # Compare regular register cases with the LDS path and cover degenerate rows
 # where the register fallback must produce unique, inert expert slots.
 stable_cases = [
-    (1, 128, 8, dtypes.bf16, "biased", True, "random"),
-    (1, 256, 8, dtypes.bf16, "biased", True, "random"),  # GLM-5.2 router
-    (1, 2048, 8, dtypes.bf16, "biased", True, "random"),
-    (1, 256, 8, dtypes.bf16, "biased", True, "all_equal"),
-    (1, 256, 8, dtypes.bf16, "biased", True, "sixteen_way_tie"),
-    (1, 256, 8, dtypes.bf16, "biased", False, "sixteen_way_tie"),
-    (1, 256, 8, dtypes.bf16, "sigmoid", True, "random"),
-    (1, 256, 8, dtypes.bf16, "sigmoid", True, "all_equal"),
-    (1, 256, 8, dtypes.bf16, "sigmoid", True, "sixteen_way_tie"),
-    (1, 256, 8, dtypes.bf16, "sigmoid", False, "sixteen_way_tie"),
-    (1, 256, 8, dtypes.bf16, "softmax", True, "random"),
-    (1, 256, 8, dtypes.bf16, "softmax", True, "all_equal"),
-    (1, 256, 8, dtypes.bf16, "softmax", True, "sixteen_way_tie"),
-    (1, 256, 8, dtypes.bf16, "softmax", False, "sixteen_way_tie"),
-    (1, 256, 8, dtypes.bf16, "biased", True, "one_finite"),
-    (1, 256, 8, dtypes.bf16, "biased", True, "all_nan"),
-    (1, 256, 32, dtypes.bf16, "biased", True, "one_finite"),
+    (1, 128, 8, dtypes.bf16, "biased", True, "random", False),
+    (1, 256, 8, dtypes.bf16, "biased", True, "random", False),  # GLM-5.2 router
+    (1, 2048, 8, dtypes.bf16, "biased", True, "random", False),
+    (1, 256, 8, dtypes.bf16, "biased", True, "all_equal", False),
+    (1, 256, 8, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    (1, 256, 8, dtypes.bf16, "biased", False, "sixteen_way_tie", False),
+    (1, 256, 8, dtypes.bf16, "sigmoid", True, "random", False),
+    (1, 256, 8, dtypes.bf16, "sigmoid", True, "sixteen_way_tie", False),
+    (1, 256, 8, dtypes.bf16, "sigmoid", False, "sixteen_way_tie", False),
+    (1, 256, 8, dtypes.bf16, "softmax", True, "random", False),
+    (1, 256, 8, dtypes.bf16, "softmax", True, "sixteen_way_tie", False),
+    (1, 256, 8, dtypes.bf16, "softmax", False, "sixteen_way_tie", False),
+    (128, 256, 8, dtypes.bf16, "biased", True, "random", True),
+    (128, 256, 8, dtypes.bf16, "sigmoid", True, "random", True),
+    (128, 256, 8, dtypes.bf16, "softmax", False, "random", True),
+    (1, 256, 8, dtypes.bf16, "biased", True, "one_finite", False),
+    (1, 256, 32, dtypes.bf16, "biased", True, "one_finite", False),
+    (2, 128, 8, dtypes.bf16, "biased", True, "masked_scores", True),
+    (2, 128, 8, dtypes.bf16, "biased", False, "masked_scores", False),
+    (1, 256, 8, dtypes.bf16, "biased", True, "all_nan", False),
+    (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_nan", False),
+    (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
+    (1, 256, 8, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
+    (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_zero_sigmoid", False),
 ]
 df = pd.DataFrame([test_grouped_topk_stable(*case) for case in stable_cases])
 aiter.logger.info(
     "moeTopkSoftmax_reg_stable summary (markdown):\n%s",
+    df.to_markdown(index=False),
+)
+
+df = pd.DataFrame([test_grouped_topk_zero_renorm(path) for path in ("lds", "opt_sort")])
+aiter.logger.info(
+    "moeTopkSoftmax_zero_renorm summary (markdown):\n%s",
     df.to_markdown(index=False),
 )
 
