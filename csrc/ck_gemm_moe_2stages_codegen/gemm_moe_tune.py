@@ -6691,12 +6691,18 @@ class FhmoeTuner(FmoeTuner):
         return pairs
 
     @staticmethod
+    def _lookup_token(token):
+        # Serving get_2stage_cfgs looks up get_padded_M(token_num), not the
+        # catalogue token. Time and publish under that same key.
+        return get_padded_M(int(token))
+
+    @staticmethod
     def _write_candidate_csv(path, shape, block_m, kn1, kn2):
         gate_mode = shape["gate_mode"]
         row = {
             "gfx": shape["gfx"],
             "cu_num": shape["cu_num"],
-            "token": get_padded_M(shape["token"]),
+            "token": FhmoeTuner._lookup_token(shape["token"]),
             "model_dim": shape["model_dim"],
             "inter_dim": shape["inter_dim"],
             "expert": shape["expert"],
@@ -7116,17 +7122,17 @@ class FhmoeTuner(FmoeTuner):
             key = tuple(info[0])
             kn1, kn2, block_m = info[1], info[2], info[3]
             grouped[key].append((kn1, kn2, block_m, us, err))
-            profile_rows.append(
-                {
-                    **dict(zip(self.keys, key)),
-                    "block_m": block_m,
-                    "ksplit": 0,
-                    "kernelName1": kn1,
-                    "kernelName2": kn2,
-                    "us": us,
-                    "err": err,
-                }
-            )
+            profile_row = {
+                **dict(zip(self.keys, key)),
+                "block_m": block_m,
+                "ksplit": 0,
+                "kernelName1": kn1,
+                "kernelName2": kn2,
+                "us": us,
+                "err": err,
+            }
+            profile_row["token"] = self._lookup_token(profile_row["token"])
+            profile_rows.append(profile_row)
         if args.profile_file:
             profile_df = pd.DataFrame(profile_rows)
             for col in (
@@ -7161,6 +7167,7 @@ class FhmoeTuner(FmoeTuner):
                 continue
             kn1, kn2, block_m, us, err = min(valid, key=lambda r: r[3])
             row = dict(zip(self.keys, key))
+            row["token"] = self._lookup_token(row["token"])
             for col in (
                 "act_type",
                 "dtype",
