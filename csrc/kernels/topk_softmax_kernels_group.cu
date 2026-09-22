@@ -34,6 +34,27 @@
 #define AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE_USE_INLINE_ASM 1
 #endif
 
+// Minimum topk for the register-resident path. Tunable so the crossover can be
+// re-measured per arch rather than guessed.
+#ifndef AITER_TOPK_REG_MIN_TOPK
+#define AITER_TOPK_REG_MIN_TOPK 4
+#endif
+
+// Wave64 EPL = num_experts / 64. Instantiating 1..32 dominates module_moe_asm
+// device codegen; keep the shapes this path is meant to hit, fall back to LDS
+// for the rest. Override by defining AITER_TOPK_REG_LAUNCH_EPLS before include.
+#ifndef AITER_TOPK_REG_LAUNCH_EPLS
+#define AITER_TOPK_REG_LAUNCH_EPLS(X) \
+    X(2)  /* E=128 */                 \
+    X(3)  /* E=192 */                 \
+    X(4)  /* E=256 */                 \
+    X(6)  /* E=384 */                 \
+    X(8)  /* E=512 */                 \
+    X(14) /* E=896 */                 \
+    X(16) /* E=1024 */                \
+    X(32) /* E=2048 */
+#endif
+
 #ifndef C_LOG2E
 #define C_LOG2E 1.44269504088896340736 // log2(e)
 #endif
@@ -611,6 +632,303 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     }
 }
 
+// Single-group top-k that keeps scores in VGPRs. The generic grouped_topk_kernel
+// re-reads every score from LDS on each of the topk argmax rounds; here each
+// lane owns EXPERTS_PER_LANE experts for the whole kernel. The selected set
+// matches grouped_topk_kernel; the output order does not. grouped_topk_kernel
+// and the sequential fallback below emit descending by score, the pivot path
+// emits candidate-compaction order -- callers must not rely on either.
+// For biased sigmoid the output weights are the pre-bias sigmoid (from LDS),
+// not (score - bias).
+template <typename DTYPE_I,
+          int EXPERTS_PER_LANE,
+          bool isBiased,
+          bool isSoftmax,
+          bool rowVec2>
+__global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
+                                       const DTYPE_I* __restrict__ correction_bias,
+                                       float* __restrict__ topk_weights,
+                                       int* __restrict__ topk_ids,
+                                       const size_t stride_gating,
+                                       const size_t stride_tk,
+                                       const int num_experts,
+                                       const int topk,
+                                       const int num_tokens,
+                                       const float routed_scaling_factor,
+                                       const bool need_renorm)
+{
+    static constexpr int NVEC     = EXPERTS_PER_LANE / 2;
+    static constexpr bool HAS_TAIL = (EXPERTS_PER_LANE % 2) != 0;
+    static_assert(!(isBiased && isSoftmax), "biased path is sigmoid only");
+
+    using cktype_i = typename aiter::hip2opus<DTYPE_I>::type;
+    using vec_i    = opus::vector_t<cktype_i, 2>;
+    if constexpr(!isBiased)
+        (void)correction_bias;
+
+    extern __shared__ char shared_mem[];
+    const int lane      = threadIdx.x;
+    const int token_idx = blockIdx.x;
+    float* sig_scores   = reinterpret_cast<float*>(shared_mem);
+
+    auto const* input_ptr = gating_output + token_idx * stride_gating;
+
+    // Lane-owned scores. Vec2 rounds first (coalesced pairs), then one scalar
+    // tail when EXPERTS_PER_LANE is odd: lane L owns expert
+    // 2 * NVEC * WARP_SIZE + L.
+    float s[NVEC == 0 ? 1 : NVEC][2];
+    float s_tail = -INFINITY;
+
+    // Visits every score this lane owns as (score&, expert id). Fully unrolled
+    // with compile-time indices so s[][] stays in registers -- a dynamic index
+    // would push it to scratch -- and so the id arithmetic lives in one place.
+    auto for_each_owned = [&](auto&& fn) {
+        if constexpr(NVEC > 0)
+        {
+            opus::static_for<NVEC>([&](auto j) {
+                opus::static_for<2>([&](auto i) {
+                    fn(s[j.value][i.value], (lane + j.value * WARP_SIZE) * 2 + i.value);
+                });
+            });
+        }
+        if constexpr(HAS_TAIL)
+        {
+            fn(s_tail, 2 * NVEC * WARP_SIZE + lane);
+        }
+    };
+
+    auto load_sigmoid = [&](auto g, int eid, float& dst, float bias) {
+        float sig       = static_cast<float>(g);
+        sig             = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * sig));
+        sig_scores[eid] = sig;
+        dst             = sig + bias;
+    };
+
+    // Vec2 needs the row pointer 2-element aligned. Host picks rowVec2 from
+    // stride_gating % 2 so the even path stays a pure vec2 load.
+#pragma unroll
+    for(int j = 0; j < NVEC; j++)
+    {
+        const int e2 = lane + j * WARP_SIZE;
+        if constexpr(rowVec2)
+        {
+            vec_i g = reinterpret_cast<vec_i const*>(input_ptr)[e2];
+            if constexpr(isSoftmax)
+            {
+#pragma unroll
+                for(int i = 0; i < 2; i++)
+                    s[j][i] = static_cast<float>(g[i]);
+            }
+            else if constexpr(isBiased)
+            {
+                vec_i b = reinterpret_cast<vec_i const*>(correction_bias)[e2];
+#pragma unroll
+                for(int i = 0; i < 2; i++)
+                    load_sigmoid(g[i], e2 * 2 + i, s[j][i], static_cast<float>(b[i]));
+            }
+            else
+            {
+#pragma unroll
+                for(int i = 0; i < 2; i++)
+                    load_sigmoid(g[i], e2 * 2 + i, s[j][i], 0.0f);
+            }
+        }
+        else
+        {
+            auto consume = [&](auto g0, auto g1) {
+                if constexpr(isSoftmax)
+                {
+                    s[j][0] = static_cast<float>(g0);
+                    s[j][1] = static_cast<float>(g1);
+                }
+                else if constexpr(isBiased)
+                {
+                    vec_i b = reinterpret_cast<vec_i const*>(correction_bias)[e2];
+                    load_sigmoid(g0, e2 * 2, s[j][0], static_cast<float>(b[0]));
+                    load_sigmoid(g1, e2 * 2 + 1, s[j][1], static_cast<float>(b[1]));
+                }
+                else
+                {
+                    load_sigmoid(g0, e2 * 2, s[j][0], 0.0f);
+                    load_sigmoid(g1, e2 * 2 + 1, s[j][1], 0.0f);
+                }
+            };
+            consume(input_ptr[e2 * 2], input_ptr[e2 * 2 + 1]);
+        }
+    }
+    if constexpr(HAS_TAIL)
+    {
+        const int eid = 2 * NVEC * WARP_SIZE + lane;
+        if constexpr(isSoftmax)
+            s_tail = static_cast<float>(input_ptr[eid]);
+        else if constexpr(isBiased)
+            load_sigmoid(
+                input_ptr[eid], eid, s_tail, static_cast<float>(correction_bias[eid]));
+        else
+            load_sigmoid(input_ptr[eid], eid, s_tail, 0.0f);
+    }
+    if constexpr(isSoftmax)
+    {
+        float lmax = -INFINITY;
+        for_each_owned([&](float& v, int) { lmax = dev_max_(lmax, v); });
+        auto max_op = [](float a, float b) { return a > b ? a : b; };
+        lmax = wave_reduce<float, decltype(max_op), WARP_SIZE, true>(lmax, max_op);
+        float tsum = 0.0f;
+        for_each_owned([&](float& v, int) {
+            v = expf(v - lmax);
+            tsum += v;
+        });
+        auto add_op = [](float a, float b) { return a + b; };
+        tsum = wave_reduce<float, decltype(add_op), WARP_SIZE, true>(tsum, add_op);
+        for_each_owned([&](float& v, int id) {
+            v /= tsum;
+            sig_scores[id] = v;
+        });
+    }
+    // One wave, so no s_barrier, but LDS stores to another lane's slot are
+    // not visible to alias analysis. wave_barrier is a compiler fence only.
+    __builtin_amdgcn_wave_barrier();
+    // Pivot fast path. The topk largest lane-local maxima sit on topk distinct
+    // lanes, so the topk-th of them is a lower bound on the true topk-th score:
+    // every true winner survives the >= pivot filter. Compacting those few
+    // candidates and selecting among them replaces topk wave argmax rounds
+    // (each a 6-stage dependent bpermute chain) with two wave sorts.
+    float* cand_val = sig_scores + num_experts;
+    int* cand_idx   = reinterpret_cast<int*>(cand_val + WARP_SIZE);
+    int* final_idx  = cand_idx + WARP_SIZE;
+
+    float lmax = -INFINITY;
+    for_each_owned([&](float& v, int) { lmax = dev_max_(lmax, v); });
+    const float pivot =
+        __shfl(warp_bitonic_merge_sort_to_reg(lmax, opus::number<WARP_SIZE>{}), topk - 1);
+
+    // Rank candidates: all elements above the pivot first, then the ties, so a
+    // plateau at the pivot cannot hand out the same slot twice.
+    int my_gt = 0;
+    for_each_owned([&](float& v, int) { my_gt += v > pivot ? 1 : 0; });
+    int gt_base = my_gt;
+    warp_cumsum(gt_base, opus::number<WARP_SIZE>{});
+    const int n_gt = __builtin_amdgcn_readlane(gt_base, WARP_SIZE - 1);
+    gt_base -= my_gt;
+
+    int my_eq = 0;
+    for_each_owned([&](float& v, int) { my_eq += v == pivot ? 1 : 0; });
+    int eq_base = my_eq;
+    warp_cumsum(eq_base, opus::number<WARP_SIZE>{});
+    const int n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
+    eq_base += n_gt - my_eq;
+
+    if(n_cand <= WARP_SIZE)
+    {
+        int slot_gt = gt_base;
+        int slot_eq = eq_base;
+        for_each_owned([&](float& v, int id) {
+            if(v > pivot)
+            {
+                cand_val[slot_gt] = v;
+                cand_idx[slot_gt] = id;
+                slot_gt++;
+            }
+            else if(v == pivot)
+            {
+                cand_val[slot_eq] = v;
+                cand_idx[slot_eq] = id;
+                slot_eq++;
+            }
+        });
+        __builtin_amdgcn_wave_barrier();
+
+        const float cv = lane < n_cand ? cand_val[lane] : -INFINITY;
+        const float pivot2 =
+            __shfl(warp_bitonic_merge_sort_to_reg(cv, opus::number<WARP_SIZE>{}), topk - 1);
+        const int local_cnt = cumsum_topk_with_pivot(cv, pivot2, opus::number<WARP_SIZE>{});
+        if(lane < n_cand && cv >= pivot2 && local_cnt <= topk)
+        {
+            final_idx[local_cnt - 1] = cand_idx[lane];
+        }
+        __builtin_amdgcn_wave_barrier();
+
+        int out_idx = 0;
+        float w     = 0.0f;
+        if(lane < topk)
+        {
+            out_idx = final_idx[lane];
+            w       = sig_scores[out_idx];
+        }
+        if(need_renorm)
+        {
+            auto add_op = [](float a, float b) { return a + b; };
+            // Reduce across the whole wave with non-winners contributing zero:
+            // works for any topk, unlike a power-of-two lane-group reduce.
+            const float total =
+                wave_reduce<float, decltype(add_op), WARP_SIZE, true>(w, add_op);
+            w *= routed_scaling_factor / total;
+        }
+        else
+        {
+            w *= routed_scaling_factor;
+        }
+        if(lane < topk)
+        {
+            topk_weights[token_idx * stride_tk + lane] = w;
+            topk_ids[token_idx * stride_tk + lane]     = out_idx;
+        }
+        return;
+    }
+
+    // Fallback for more candidates than the wave can stage one per lane. Rare --
+    // a poison probe measured zero hits over 4096 rows of the benchmark
+    // distribution -- but correctness depends on it, so it stays. Still register
+    // resident; it only gives up the pivot, not the VGPR-held scores.
+    float sum       = 0.0f;
+    int topk_indice = 0;
+    float topk_value = 0.0f;
+    for(int k = 0; k < topk; ++k)
+    {
+        float max_val = -INFINITY;
+        int max_idx   = k;
+        for_each_owned([&](float& v, int id) {
+            if(v > max_val)
+            {
+                max_val = v;
+                max_idx = id;
+            }
+        });
+
+        warpReduceMax(max_val, max_idx);
+
+        // Retire the winner in place: compare-and-select, no dynamic index.
+        for_each_owned([&](float& v, int id) { v = id == max_idx ? -INFINITY : v; });
+
+        max_val     = sig_scores[max_idx];
+        topk_indice = lane == k ? max_idx : topk_indice;
+        topk_value  = lane == k ? max_val : topk_value;
+        if(need_renorm)
+        {
+            sum += max_val;
+        }
+    }
+
+    if(need_renorm)
+    {
+        sum = routed_scaling_factor / sum;
+    }
+    else
+    {
+        sum = routed_scaling_factor;
+    }
+
+    // One winner per lane: topk_indice/topk_value are single registers written
+    // under `lane == k`, so lanes beyond topk-1 hold nothing. The gate's
+    // topk <= lanes/2 keeps that in range; a strided loop here would just
+    // re-write lane 0's winner and silently corrupt the tail.
+    if(lane < topk)
+    {
+        topk_weights[token_idx * stride_tk + lane] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane]     = topk_indice;
+    }
+}
+
 template <typename DTYPE_I,
           typename f32vec,
           int NUM_GRP,
@@ -1094,22 +1412,68 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 }
 } // namespace aiter
 
-#define LAUNCH_KERNEL()                                    \
-    switch(num_experts % 4)                                \
-    {                                                      \
-    case 0:                                                \
-        using vec4_type = opus::vector_t<float, 4>; \
-        LAUNCHER2(vec4_type)                               \
-        break;                                             \
-    case 2:                                                \
-        using vec2_type = opus::vector_t<float, 2>; \
-        LAUNCHER2(vec2_type)                               \
-        break;                                             \
-    default:                                               \
-        using vec1_type = opus::vector_t<float, 1>; \
-        LAUNCHER2(vec1_type)                               \
-        break;                                             \
+#define LAUNCH_KERNEL()                                                        \
+    LAUNCHER_TOPK_REG()                                                        \
+    switch(num_experts % 4)                                                    \
+    {                                                                          \
+    case 0:                                                                    \
+        using vec4_type = opus::vector_t<float, 4>;                            \
+        LAUNCHER2(vec4_type)                                                   \
+        break;                                                                 \
+    case 2:                                                                    \
+        using vec2_type = opus::vector_t<float, 2>;                            \
+        LAUNCHER2(vec2_type)                                                   \
+        break;                                                                 \
+    default:                                                                   \
+        using vec1_type = opus::vector_t<float, 1>;                            \
+        LAUNCHER2(vec1_type)                                                   \
+        break;                                                                 \
     }
+#define AITER_TOPK_REG_LAUNCH_ONE(EPL)                                               \
+            if(experts_per_lane == (EPL))                                            \
+            {                                                                        \
+                if constexpr(isBiased)                                               \
+                {                                                                    \
+                    LAUNCHER_topk_reg_kernel(EPL, true, false)                       \
+                }                                                                    \
+                else if(isSoftmax)                                                   \
+                {                                                                    \
+                    LAUNCHER_topk_reg_kernel(EPL, false, true)                       \
+                }                                                                    \
+                else                                                                 \
+                {                                                                    \
+                    LAUNCHER_topk_reg_kernel(EPL, false, false)                      \
+                }                                                                    \
+                return;                                                              \
+            }
+
+/* Register-resident path. Gates:
+ * - no group filter: topk_grp == num_expert_group
+ * - wave64 only (wave32 untested)
+ * - num_experts % 64 == 0
+ * - experts-per-lane in AITER_TOPK_REG_LAUNCH_EPLS (else LDS)
+ * - topk in [AITER_TOPK_REG_MIN_TOPK, 32]
+ */
+#define LAUNCHER_TOPK_REG()                                                          \
+    {                                                                                \
+        constexpr int kMaxExpertsPerLane = 32;                                       \
+        const int reg_lanes        = static_cast<int>(get_warp_size_func());         \
+        const int experts_per_lane = reg_lanes > 0 ? num_experts / reg_lanes : 0;    \
+        if(topk_grp == num_expert_group &&                                           \
+           reg_lanes == 64 &&                                                        \
+           (num_experts % reg_lanes) == 0 &&                                         \
+           experts_per_lane >= 1 &&                                                  \
+           experts_per_lane <= kMaxExpertsPerLane &&                                 \
+           topk <= reg_lanes / 2 &&                                                  \
+           topk >= AITER_TOPK_REG_MIN_TOPK)                                          \
+        {                                                                            \
+            const size_t shared_mem_size = num_experts * sizeof(float) +             \
+                                           reg_lanes * sizeof(float) +               \
+                                           2 * reg_lanes * sizeof(int);              \
+            AITER_TOPK_REG_LAUNCH_EPLS(AITER_TOPK_REG_LAUNCH_ONE)                    \
+        }                                                                            \
+    }
+
 #define LAUNCHER2(VEC_F)                                                                    \
     switch(num_expert_group)                                                                \
     {                                                                                       \
@@ -1221,6 +1585,41 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                                routed_scaling_factor);                            \
         });
 
+#define LAUNCHER_topk_reg_kernel(EPL, isBiased, isSoftmax)                            \
+    if((stride_gating % 2) == 0)                                                                   \
+    {                                                                                              \
+        LAUNCHER_topk_reg_kernel_row(EPL, isBiased, isSoftmax, true)                  \
+    }                                                                                              \
+    else                                                                                           \
+    {                                                                                              \
+        LAUNCHER_topk_reg_kernel_row(EPL, isBiased, isSoftmax, false)                 \
+    }
+
+#define LAUNCHER_topk_reg_kernel_row(EPL, isBiased, isSoftmax, rowVec2)               \
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "topk_reg_kernel", [&] {           \
+        hipLaunchKernelGGL((aiter::topk_reg_kernel<scalar_t,                                       \
+                                                   EPL,                                            \
+                                                   isBiased,                                       \
+                                                   isSoftmax,                                      \
+                                                   rowVec2>),                                      \
+                           dim3(grid),                                                             \
+                           dim3(block),                                                            \
+                           shared_mem_size,                                                        \
+                           stream,                                                                 \
+                           reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                  \
+                           isBiased ? reinterpret_cast<scalar_t*>(correction_bias.data_ptr())      \
+                                    : nullptr,                                                     \
+                           reinterpret_cast<float*>(topk_weights.data_ptr()),                      \
+                           reinterpret_cast<int*>(topk_ids.data_ptr()),                            \
+                           stride_gating,                                                          \
+                           stride_tk,                                                              \
+                           num_experts,                                                            \
+                           topk,                                                                   \
+                           num_tokens,                                                             \
+                           routed_scaling_factor,                                                  \
+                           need_renorm);                                                            \
+    });
+
 void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, num_experts]
                          const aiter_tensor_t& correction_bias, // [num_expert]
                          const aiter_tensor_t& topk_weights,    // [num_tokens, topk]
@@ -1317,6 +1716,10 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
     LAUNCH_KERNEL()
 }
 
+#undef LAUNCHER_topk_reg_kernel_row
+#undef LAUNCHER_topk_reg_kernel
+#undef AITER_TOPK_REG_LAUNCH_ONE
+#undef LAUNCHER_TOPK_REG
 #undef LAUNCHER4
 #undef LAUNCHER3
 #undef LAUNCHER2

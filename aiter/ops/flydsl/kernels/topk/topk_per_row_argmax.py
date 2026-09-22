@@ -86,6 +86,14 @@ _MIN_SLICE_VECTORS = 512
 # call over a 32768-wide row -- decode against a vocabulary, the common argmax --
 # splits four ways and loses 13%, where one split is already at 6.05 TB/s.
 _LONG_ROW_VECTORS = 16384
+# Columns below which no split pays at any row count: such a row is a handful of
+# block-iterations, and a split trades two of them for a second kernel launch.
+# In COLUMNS, so NOT `_LONG_ROW_VECTORS` despite the equal number -- the two
+# dtypes agree cell for cell here while their vector counts differ by two.
+# Worst cell over the 166-cell sweep: 1.582x here, 1.713 at 8192, 1.696 at
+# 32768, 2.362 ungated. Swept again under flydsl 0.3.2, which picks the same
+# threshold on every one of those four figures.
+_SPLITTABLE_ROW_COLUMNS = 16384
 
 
 def topk_per_row_argmax_splits(rows: int, width: int, vec: int = _VEC) -> int:
@@ -95,11 +103,13 @@ def topk_per_row_argmax_splits(rows: int, width: int, vec: int = _VEC) -> int:
     worth launching for. At 16384 rows of 2048 columns this is 1 -- the rows fill
     it on their own -- and at one row of 262144 it is 128, which is 11x.
 
-    `vec` is the caller's element count per vector, which the dtype sets. The
-    thresholds below are in vectors rather than columns, so a bf16 row -- half
-    the bytes, half the vectors -- reaches them where its byte count does, not
-    where its column count does. Measured per dtype; see the sweep note above.
+    `vec` is the caller's element count per vector, which the dtype sets. How
+    far to split is thresholded in vectors, where a row reaches the bound at its
+    byte count; whether to split at all is thresholded in columns, where the two
+    dtypes agree. Both are measured.
     """
+    if width <= _SPLITTABLE_ROW_COLUMNS:
+        return 1
     vectors = (width + vec - 1) // vec
     by_fill = max(1, -(-_TARGET_WORKGROUPS // max(rows, 1)))
     by_work = (
@@ -110,24 +120,28 @@ def topk_per_row_argmax_splits(rows: int, width: int, vec: int = _VEC) -> int:
 
 @cache
 def build_topk_per_row_argmax_module(
-    splits: int,
+    single: bool,
     elem=Float32,
     block_threads: int = _BLOCK_THREADS,
     vec: int | None = None,
 ):
-    """Compile the two halves of a `splits`-way per-row argmax.
+    """Compile the two halves of a per-row argmax.
 
-    Returns `(slice_launcher, fold_launcher)`; the fold is None at one split,
-    where the slice kernel writes the answer itself and there is nothing to
-    fold. The row width is a runtime value -- nothing here is sized by it, which
-    is what lets one build serve every width.
+    Returns `(slice_launcher, fold_launcher)`; the fold is None when `single`,
+    where one workgroup holds the whole row, so the slice kernel writes the
+    answer itself and there is nothing to fold. The split count is a runtime
+    argument, as the row width and the row count already are; `single` is the
+    only thing left that shapes a body.
+
+    **Do not make the split count a build parameter again.** It follows the row
+    count, so a build per split is a build per batch size -- 31 of them over a
+    129280-wide vocabulary -- and each first use compiles with the device idle,
+    measured at 16-27 ms apiece on a serving trace.
 
     `elem` is the score element type. Only the slice half reads scores, so the
     fold is the same kernel for every dtype; the partials it folds are int32
     ordering keys, which is what lets that be true.
     """
-    if splits < 1:
-        raise ValueError(f"splits must be positive, got {splits}")
     if block_threads & (block_threads - 1):
         raise ValueError(f"block must be a power of two, got {block_threads}")
     if elem not in VEC_BY_ELEM:
@@ -154,7 +168,7 @@ def build_topk_per_row_argmax_module(
             name="topk_per_row_argmax_"
             + kernel_signature(
                 fold=folding,
-                sp=splits,
+                single=single,
                 blk=block_threads,
                 vec=vec,
                 ty=_ELEM_TAG[elem],
@@ -168,6 +182,7 @@ def build_topk_per_row_argmax_module(
             part_key: fx.Tensor,
             part_col: fx.Tensor,
             vectors: fx.Int32,
+            splits: fx.Int32,
         ):
             tid = fx.thread_idx.x
             zero = Int32(0)
@@ -190,16 +205,11 @@ def build_topk_per_row_argmax_module(
                 # 256-thread block. A thread's slots ascend, so its columns do
                 # too, and a strict `>` keeps the earliest of a tie; the tree
                 # below has the column rule for across threads.
-                for chunk in range_constexpr(
-                    (splits + block_threads - 1) // block_threads
-                ):
-                    slot = tid + Int32(chunk * block_threads)
-                    live = slot < Int32(splits)
-                    safe = live.select(slot, zero)
-                    peer_key = row_key[safe]
-                    better = live & (peer_key > my_key)
+                for slot in range(tid, splits, Int32(block_threads)):
+                    peer_key = row_key[slot]
+                    better = peer_key > my_key
                     my_key = better.select(peer_key, my_key)
-                    my_col = better.select(row_col[safe], my_col)
+                    my_col = better.select(row_col[slot], my_col)
             else:
                 part = fx.block_idx.x
                 row = fx.block_idx.y
@@ -213,11 +223,14 @@ def build_topk_per_row_argmax_module(
                     ),
                     fx.make_layout(vec, 1),
                 )
-                # Whole vectors per workgroup, rounded up, so the last slice is
-                # the short one and the bounds-check covers its tail.
-                slice_vecs = (vectors + Int32(splits - 1)) // Int32(splits)
-                first = part * slice_vecs
-                last = fx.min(first + slice_vecs, vectors)
+                if const_expr(single):
+                    first, last = zero, vectors
+                else:
+                    # Whole vectors per workgroup, rounded up, so the last slice
+                    # is the short one and the bounds-check covers its tail.
+                    slice_vecs = (vectors + splits - Int32(1)) // splits
+                    first = part * slice_vecs
+                    last = fx.min(first + slice_vecs, vectors)
 
                 my_key = bottom
                 my_col = Int32(-1)
@@ -266,7 +279,7 @@ def build_topk_per_row_argmax_module(
                 step //= 2
 
             if tid == zero:
-                if const_expr(folding or splits == 1):
+                if const_expr(folding or single):
                     fx.slice(indices, (row, None))[zero] = red_col[zero]
                 else:
                     fx.slice(part_key, (row, None))[part] = red_key[zero]
@@ -285,10 +298,13 @@ def build_topk_per_row_argmax_module(
         part_key: fx.Tensor,
         part_col: fx.Tensor,
         vectors: fx.Int32,
+        splits: fx.Int32,
         rows: fx.Int32,
         stream: fx.Stream,
     ):
-        slice_kernel(scores, row_lens, indices, part_key, part_col, vectors).launch(
+        slice_kernel(
+            scores, row_lens, indices, part_key, part_col, vectors, splits
+        ).launch(
             grid=(splits, rows, 1),
             block=(block_threads, 1, 1),
             stream=stream,
@@ -302,13 +318,16 @@ def build_topk_per_row_argmax_module(
         part_key: fx.Tensor,
         part_col: fx.Tensor,
         vectors: fx.Int32,
+        splits: fx.Int32,
         rows: fx.Int32,
         stream: fx.Stream,
     ):
-        fold_kernel(scores, row_lens, indices, part_key, part_col, vectors).launch(
+        fold_kernel(
+            scores, row_lens, indices, part_key, part_col, vectors, splits
+        ).launch(
             grid=(rows, 1, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
 
-    return launch_argmax_slice, (launch_argmax_fold if splits > 1 else None)
+    return launch_argmax_slice, (None if single else launch_argmax_fold)
