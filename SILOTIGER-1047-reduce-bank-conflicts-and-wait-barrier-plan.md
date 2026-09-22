@@ -534,3 +534,11 @@ The parent plan remains the full K2 list.
   at `M=1/8/512`: decode −4.1%/−3.8%, prefill **+23%**. Prefill
   `gather_rounds=16` doubles live K/V VGPRs. Distinct from hoist-V-before
   K-publish and from next-tile-K-with-PV. Keep in-loop issue/wait.
+- Decode-only packed P stores that keep the P-LDS join. Wave-0 writes the
+  four in-register heads as `UniversalCopy64b` into N-major
+  `(BLOCK_N, 16):(16, 1)`; PV still scalar-gathers four tokens. No
+  `shuffle_idx`. Correct (`err=0`). Width-2051 `L=512` medians
+  `14.41 / 17.08 / 393.63` us versus P-join HEAD `14.46 / 17.31 / 392.51`
+  at `M=1/8/512`: decode −0.4%/−1.3%, prefill flat. Writer-contiguous
+  4-head packs make PV-A strided. Keep scalar `p_lds[head, n]` and the
+  head-major map. Conflict/wait keep-gate is dry.
