@@ -236,12 +236,35 @@ def test_gemm_decode(m, n, k, dtype):
 test_gemm_decode.__test__ = False
 
 
+CORRECTNESS_CASES = (
+    test_wave_public_path_no_bias,
+    test_wave_public_path_bias_and_odd_n_and_k_tails,
+    test_block_mfma_global,
+    test_block_mfma_full_lds_k_padding_and_n_boundary,
+    test_block_mfma_persistent_n_multiple_turns_and_partial_group,
+)
+
+
+def _run_correctness_cases() -> None:
+    """Run the pytest cases as part of the plain `python3 <file>` invocation.
+
+    CI runs op_tests files as scripts, so anything reachable only through
+    pytest never executes there. Rather than teach the CI runner about this
+    file, the sweep in main() calls the cases directly -- they take no
+    arguments and no fixtures, so the two entry points stay equivalent.
+    """
+    for case in CORRECTNESS_CASES:
+        aiter.logger.info("running %s", case.__name__)
+        case()
+
+
 def main():
     if ARCH not in SUPPORTED_ARCHS:
         aiter.logger.warning("gemm_decode_bf16 unsupported on %s; skipping", ARCH)
         return
 
     torch.set_default_device("cuda")
+    _run_correctness_cases()
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
