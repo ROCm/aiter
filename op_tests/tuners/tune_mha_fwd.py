@@ -1977,15 +1977,13 @@ class MhaFwdTuner(TunerCommon):
             "races": self._race_reports,
             "coverage_limits": [
                 (
-                    "CK is measured as built. Its tile recipe is a compile-time"
-                    " instantiation chosen from a table in CK's own codegen, and"
-                    " nothing in this tree exposes a runtime override, so a CK"
-                    " winner here is CK at whatever recipe its own heuristic"
-                    " picks. Where that table lists one recipe for the head dims"
-                    " -- bf16 192/128 among them -- there is nothing to choose;"
-                    " where it lists several, this run did not explore them."
-                    " Tuning that table is PR #5024's job and needs its"
-                    " unmerged config hook."
+                    "CK is measured as built. Its tile recipe comes from a"
+                    " table CK bakes in when the module is JIT-compiled, so"
+                    " there is no per-call knob to sweep and a ck winner here"
+                    " is CK at its own default tiling. Tuning those tiles is"
+                    " the separate pipeline in PR #5024, which rebuilds CK per"
+                    " candidate tile; deploying its JSON changes what this"
+                    " tuner measures for ck."
                 ),
             ],
             "command": [sys.executable, *sys.argv],
