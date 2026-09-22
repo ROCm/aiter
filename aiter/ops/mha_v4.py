@@ -190,8 +190,11 @@ _MHA_V4_Q_TILE = 256
 _MHA_V4_SPARSE_MODE = 1
 
 # Shared-K component, relative to a typical K row, above which removing it improves quantization.
-# Measured crossover: gains stay within noise to 0.6 and reach 1.16x by 0.85. See _k_mean.
-_K_SMOOTH_MIN_COMMON = 0.7
+# Real video models run to 0.67 (HunyuanVideo 1.5) and 0.76 (Wan) at the extreme, and on the one
+# captured layer above 0.7 the recipes disagree: FP8 lost 7% while MXFP4 and F8F6 gained. The win
+# is only consistent past ~0.85, where it is already 1.16x-1.31x, so the gate sits there and
+# leaves every layer either model actually produces untouched.
+_K_SMOOTH_MIN_COMMON = 0.85
 _K_SMOOTH_SAMPLE_ROWS = 2048
 
 
@@ -1041,8 +1044,8 @@ def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
 
     It is also not a win at every magnitude. The subtraction takes energy out of K's RMS but not
     out of its outliers, so a per-tensor scale (set by amax) gets relatively coarser. Below a
-    common mode of ~0.7 that costs more than the shared component does, and real traces sit at
-    0.3-0.5, so the gate leaves them untouched.
+    common mode of ~0.85 that costs more than the shared component does, and real traces sit at
+    0.12-0.76, so the gate leaves them untouched.
     """
     if kind in (_RawRecipeKind.BF16, _RawRecipeKind.BF16_FP8):
         return None
