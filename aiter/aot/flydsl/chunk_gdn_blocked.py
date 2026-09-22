@@ -64,11 +64,32 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
 
             candidates = (
                 {"phase": "build_map", "H": H, "Hg": Hg, "cu_num": cu_num},
-                {"phase": "emit", "H": H, "Hg": Hg, "cu_num": cu_num},
+                {
+                    "phase": "emit",
+                    "H": H,
+                    "Hg": Hg,
+                    "state_bf16": False,
+                    "cu_num": cu_num,
+                },
+                {
+                    "phase": "emit",
+                    "H": H,
+                    "Hg": Hg,
+                    "state_bf16": True,
+                    "cu_num": cu_num,
+                },
                 {
                     "phase": "carry",
                     "H": H,
                     "use_initial_state": True,
+                    "state_bf16": False,
+                    "cu_num": cu_num,
+                },
+                {
+                    "phase": "carry",
+                    "H": H,
+                    "use_initial_state": True,
+                    "state_bf16": True,
                     "cu_num": cu_num,
                 },
                 {
@@ -164,7 +185,9 @@ def _compile_build_map_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None
         )
 
 
-def _compile_emit_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None:
+def _compile_emit_to_cache(
+    *, arch: str, H: int, Hg: int, state_bf16: bool, **kwargs
+) -> None:
     del kwargs
 
     import torch
@@ -184,7 +207,11 @@ def _compile_emit_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None:
     g = torch.empty((B, H, T), device=dev, dtype=torch.float32)
     h = torch.empty((B, 1, H, V, K), device=dev, dtype=torch.bfloat16)
     entry = torch.empty((blocks, H, K, V), device=dev, dtype=torch.float32)
-    final_state = torch.empty((n_prefill, H, V, K), device=dev, dtype=torch.float32)
+    final_state = torch.empty(
+        (n_prefill, H, V, K),
+        device=dev,
+        dtype=torch.bfloat16 if state_bf16 else torch.float32,
+    )
     kernel_cu_seqlens = torch.empty((n_prefill + 1,), device=dev, dtype=torch.int32)
     chunk_offsets = torch.empty((n_prefill + 1,), device=dev, dtype=torch.int32)
     block_seq_id = torch.empty((blocks,), device=dev, dtype=torch.int32)
@@ -205,7 +232,7 @@ def _compile_emit_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None:
         SAVE_NEW_VALUE=True,
         IS_VARLEN=True,
         WU_CONTIGUOUS=True,
-        STATE_DTYPE_BF16=False,
+        STATE_DTYPE_BF16=state_bf16,
         SNAPSHOT_DTYPE_BF16=True,
         G_IS_LOG2_SCALED=True,
         USE_STATE_INDICES=False,
@@ -244,7 +271,7 @@ def _compile_emit_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None:
 
 
 def _compile_carry_to_cache(
-    *, arch: str, H: int, use_initial_state: bool, **kwargs
+    *, arch: str, H: int, use_initial_state: bool, state_bf16: bool = False, **kwargs
 ) -> None:
     del arch, kwargs
 
@@ -254,11 +281,19 @@ def _compile_carry_to_cache(
     blocks = requests = 1
     K = V = 128
     maps = torch.empty((blocks, H, K + V, K), device=dev, dtype=torch.float32)
-    h0_or_maps = torch.empty((requests, H, V, K), device=dev, dtype=torch.float32)
+    h0_or_maps = torch.empty(
+        (requests, H, V, K),
+        device=dev,
+        dtype=torch.bfloat16 if (use_initial_state and state_bf16) else torch.float32,
+    )
     entry = torch.empty((blocks, H, K, V), device=dev, dtype=torch.float32)
     block_prefix = torch.empty((requests + 1,), device=dev, dtype=torch.int32)
 
-    launch = compile_chunk_gdn_carry(H=H, use_initial_state=use_initial_state)
+    launch = compile_chunk_gdn_carry(
+        H=H,
+        use_initial_state=use_initial_state,
+        STATE_DTYPE_BF16=state_bf16,
+    )
     with compile_only_env():
         _run_compiled(
             launch,
@@ -277,7 +312,11 @@ def _format_shape_str(job: dict[str, Any]) -> str:
     h = job.get("H")
     hg = job.get("Hg")
     use_h0 = job.get("use_initial_state")
-    return f"chunk_gdn_blocked phase={phase} H={h} Hg={hg} use_h0={use_h0}"
+    state_bf16 = job.get("state_bf16")
+    return (
+        f"chunk_gdn_blocked phase={phase} H={h} Hg={hg} use_h0={use_h0} "
+        f"state_bf16={state_bf16}"
+    )
 
 
 def compile_one_config(*, cu_num: int = 0, phase: str, **kwargs) -> dict[str, Any]:

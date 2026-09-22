@@ -10,7 +10,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from ..gdr_common import _gview, _load_vec, _store_vec
 
 
-def compile_chunk_gdn_carry(*, H: int, use_initial_state: bool):
+def compile_chunk_gdn_carry(
+    *, H: int, use_initial_state: bool, STATE_DTYPE_BF16: bool = False
+):
     K = V = 128
     BV = 16
     THREADS = 256
@@ -43,6 +45,11 @@ def compile_chunk_gdn_carry(*, H: int, use_initial_state: bool):
         first = _load_vec(cp_i32, fx.slice(prefix, (request, None)), 1, fx.Int32)
         end = _load_vec(cp_i32, fx.slice(prefix, (request + 1, None)), 1, fx.Int32)
         cp = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        state_num = fx.BFloat16 if STATE_DTYPE_BF16 else fx.Float32
+        cp_state = fx.make_copy_atom(
+            fx.rocdl.BufferCopy16b() if STATE_DTYPE_BF16 else fx.rocdl.BufferCopy32b(),
+            state_num,
+        )
         lds_cp = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
         # Keep the packed parent strides; build-map stores probe-major [Aᵀ,Cᵀ].
         maps = _gview(
@@ -67,7 +74,12 @@ def compile_chunk_gdn_carry(*, H: int, use_initial_state: bool):
                 if const_expr(use_initial_state):
                     # Public h0 is [N,H,V,K]; maps and entries use native [K,V].
                     h0 = _gview(h0_tensor, request_head * V * K, (V, K, 1), (K, 1, 1))
-                    seed = _load_vec(cp, fx.slice(h0, (v, row, None)), 1, fx.Float32)
+                    loaded_seed = _load_vec(
+                        cp_state, fx.slice(h0, (v, row, None)), 1, state_num
+                    )
+                    if const_expr(state_num == fx.BFloat16):
+                        loaded_seed = loaded_seed.to(fx.Float32)
+                    seed = loaded_seed
                 _store_vec(
                     lds_cp, fx.slice(state, (row, col, None)), seed, 1, fx.Float32
                 )

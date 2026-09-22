@@ -949,7 +949,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         and _total_chunks >= 128
         and k.dtype == w.dtype == u.dtype == torch.bfloat16
         and snapshot_bf16
-        and not state_bf16
         and output_final_state
         and save_new_value
         and not inplace
@@ -978,6 +977,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
                 cu_seqlens=cu_seqlens,
                 prefill_metadata=adaptive_metadata,
                 target_segments=target_segments,
+                state_dtype=resolved_state_dtype,
             )
 
     h = k.new_empty(h_shape, dtype=resolved_snapshot_dtype)
@@ -1111,10 +1111,16 @@ def _build_chunk_gdn_block_maps(
 
 
 @functools.lru_cache(maxsize=32)
-def _get_or_compile_chunk_gdn_carry(heads: int, use_initial_state: bool):
+def _get_or_compile_chunk_gdn_carry(
+    heads: int, use_initial_state: bool, state_bf16: bool = False
+):
     from .kernels.gdr_prefill.chunk_gdn_carry_gfx950 import compile_chunk_gdn_carry
 
-    return compile_chunk_gdn_carry(H=heads, use_initial_state=use_initial_state)
+    return compile_chunk_gdn_carry(
+        H=heads,
+        use_initial_state=use_initial_state,
+        STATE_DTYPE_BF16=state_bf16,
+    )
 
 
 def _carry_chunk_gdn_block_maps(
@@ -1149,15 +1155,21 @@ def _carry_chunk_gdn_block_maps(
     if initial_state is not None:
         if (
             initial_state.shape != (requests, heads, K, V)
-            or initial_state.dtype != torch.float32
+            or initial_state.dtype not in (torch.float32, torch.bfloat16)
             or initial_state.device != maps.device
         ):
-            raise ValueError("Carry initial_state must be colocated fp32 [N,H,V,K].")
+            raise ValueError(
+                "Carry initial_state must be colocated fp32/bf16 [N,H,V,K]."
+            )
         initial_state = _require_contiguous(initial_state, "initial_state")
     entry = torch.empty((blocks, heads, K, V), device=maps.device, dtype=maps.dtype)
     if blocks != schedule.total_blocks or schedule.block_prefix.device != maps.device:
         raise ValueError("Carry maps must match the block schedule.")
-    launch = _get_or_compile_chunk_gdn_carry(heads, initial_state is not None)
+    launch = _get_or_compile_chunk_gdn_carry(
+        heads,
+        initial_state is not None,
+        initial_state is not None and initial_state.dtype is torch.bfloat16,
+    )
     _run_compiled(
         launch,
         maps,
@@ -1182,6 +1194,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     block_chunks: int = 64,
     target_segments: int | None = None,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Approximate recurrence via BF16-rounded block maps, FP32 carry, and emit.
 
@@ -1229,7 +1242,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     )
     v_new = torch.empty_like(u)
     final_state = torch.empty(
-        (schedule.n_prefill, H, V, K), device=k.device, dtype=torch.float32
+        (schedule.n_prefill, H, V, K), device=k.device, dtype=state_dtype
     )
     dummy, int_dummy = _placeholder_pair(k.device)
     launch = _get_or_compile_opt(
@@ -1249,6 +1262,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
         g_head_major=True,
         g_log2_scaled=True,
         block_entry_seed=True,
+        state_bf16=(state_dtype is torch.bfloat16),
     )
     _run_compiled(
         launch,
