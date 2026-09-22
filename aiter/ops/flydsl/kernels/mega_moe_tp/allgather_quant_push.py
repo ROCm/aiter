@@ -1,31 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""AllGather that quantizes on the wire: MXFP4 quant fused into the push.
-
-On the MXFP4 wire the unfused chain is two launches over three passes of the
-activation::
-
-    per_1x32_mx_quant   x_local[m, H] bf16  ->  xq[m, H/2] + scale[m, H/32]
-    ag_push             xq, scale, route    ->  every peer's arena
-
-The quantization is pure per-row-group arithmetic with no cross-thread
-dependency, so there is no reason for it to be its own kernel and its own
-round trip through HBM.  This module reads ``x_local`` once, quantizes in
-registers, and stores the packed result straight into all ``TP`` peers --
-removing a launch, the staging buffer, and a full read-modify-write of it.
-
-Work split
-----------
-One thread owns ``GROUPS_PER_THREAD`` consecutive 32-element MX groups, i.e.
-128 activations: 256 B in, 64 B of packed FP4 out, and 4 B of E8M0 out.  Four
-groups rather than one is what makes the scale store a whole dword, so the
-narrow side of the payload never drops to byte stores.  ``model_dim`` must
-therefore be a multiple of 128; :func:`quant_push_supported` reports that, and
-the caller keeps the split quant + push for shapes that fail it.
-
-The routing regions are plain copies, unchanged from
-:mod:`.allgather_push` -- they carry no arithmetic to fuse.
-"""
+"""AllGather that quantizes on the wire: MXFP4 quant fused into the push."""
 
 from __future__ import annotations
 
@@ -63,15 +38,10 @@ __all__ = [
 ]
 
 _BLOCK = int(os.environ.get("AITER_TP_AGQ_BLOCK", "256"))
-#: fp32 bits of 1/max_pos for the RoundUp ceil_pow2(amax/max_pos) scale; fp4's
-#: max_pos is 6. Same constant the standalone quant kernel uses, so the two
-#: produce bit-identical output.
 _FP4_INV_MAX_POS_BITS = 0x3E2AAAAB
 _MX_GROUP = 32
-#: Four groups per thread makes the E8M0 side exactly one dword.
 GROUPS_PER_THREAD = 4
-QUANT_ELEMS_PER_THREAD = _MX_GROUP * GROUPS_PER_THREAD  # 128
-#: Region indices in the descriptor, matching the fp4-wire region order.
+QUANT_ELEMS_PER_THREAD = _MX_GROUP * GROUPS_PER_THREAD
 _R_PAYLOAD, _R_SCALE, _R_IDS, _R_WEIGHTS = 0, 1, 2, 3
 _REGIONS = 4
 
@@ -81,20 +51,8 @@ def quant_push_supported(model_dim: int, topk: int) -> bool:
     return model_dim % QUANT_ELEMS_PER_THREAD == 0 and (topk * 4) % 4 == 0
 
 
-#: Probe: drop the per-CTA acquire in the AllGather gate. WRONG RESULTS; it
-#: exists to price that fence. The acquire is an L2 invalidate executed once
-#: per CTA, and the hosting kernel's grid is sized by *padded* sort blocks --
-#: hundreds to thousands even at 16 tokens -- so it is a fixed cost that does
-#: not shrink with the token count.
-_GATE_ACQUIRE = os.environ.get("AITER_TP_MEGA_GATE_ACQUIRE", "1") == "1"
-
 def quant_push_units(rows: int, model_dim: int, topk: int, regions: str = "all") -> int:
-    """Grid-stride work items one fused push covers, for the selected regions.
-
-    Must mirror the kernel's own split exactly: a route row that is not a whole
-    number of :data:`..allgather_push.PUSH_VEC_BYTES` (topk 6 or 9, say) drops
-    to dword copies and therefore has *more* units per row, not fewer.
-    """
+    """Grid-stride work items one fused push covers, for the selected regions."""
     route_row_bytes = topk * 4
     route_unit = PUSH_VEC_BYTES if route_row_bytes % PUSH_VEC_BYTES == 0 else 4
     quant = rows * (model_dim // QUANT_ELEMS_PER_THREAD)
@@ -116,32 +74,7 @@ def compile_allgather_quant_push(
     regions: str = "all",
     _composition=None,
 ):
-    """Build the quantize-and-push AllGather launcher for one shape.
-
-    The descriptor is the ordinary four-region fp4-wire descriptor, except that
-    region 0's source address is the **BF16** ``x_local`` rather than a
-    pre-quantized buffer, and region 1 has no source at all -- the E8M0 scales
-    are produced here.
-
-    With ``_composition`` set, the three pieces are handed to the caller instead
-    of being wrapped in a kernel, so a larger kernel can host them. That is how
-    the megakernel gets ``quant -> AG`` without a second copy of this code.
-
-    ``regions`` selects what the standalone kernel pushes:
-
-    ``all``
-        payload, scales and route -- the original one-collective behaviour.
-    ``route``
-        topk ids and weights only. The expert sort reads these and must finish
-        before the fused region runs, so the route cannot ride along with the
-        payload once the payload push lives inside the megakernel.
-    ``payload``
-        activation and scales only, for the same split.
-
-    Each variant still ends in the same arrival barrier, and two of them running
-    back to back on one stream is safe: the first barrier synchronises every
-    rank before the second starts, so the epochs cannot interleave.
-    """
+    """Build the quantize-and-push AllGather launcher for one shape."""
     if regions not in ("all", "route", "payload"):
         raise ValueError(f"regions must be all/route/payload, got {regions!r}")
     if not 1 <= tp_size <= 8:
@@ -165,10 +98,6 @@ def compile_allgather_quant_push(
         f"mega_moe_tp_agq_push_tp{tp_size}_h{model_dim}_k{topk}_b{block}{suffix}"
     )
 
-    # The kernel body is split into three emitters so the megakernel can host
-    # the same code: it needs the quant+payload push and the AllGather barrier
-    # inline, while the routing push runs as its own earlier step (the expert
-    # sort reads the route and has to finish before the fused region starts).
     @flyc.jit
     def emit_quant_payload_push(arg_desc, i32_rank, i32_rows, bid, gid, stride):
         """Quantize this rank's rows to MXFP4 and push them to every peer."""
@@ -186,8 +115,6 @@ def compile_allgather_quant_push(
         )
         scale_offset = desc_slot(arg_desc, desc_region_offset(tp_size, _R_SCALE))
 
-        # Peer destinations, resolved once. Stagger by rank *and* block so the
-        # grid spreads over all xGMI links instead of pounding one.
         payload_dst = []
         scale_dst = []
         for slot in range_constexpr(tp_size):
@@ -208,13 +135,11 @@ def compile_allgather_quant_push(
                 )
             )
 
-        # -- quantize and push the activation ------------------------------
         quant_units = i32_rows * fx.Int32(chunks_per_row)
         for unit in range(gid, quant_units, stride):
             u = fx.Int32(unit)
             row = u // fx.Int32(chunks_per_row)
             chunk = u - row * fx.Int32(chunks_per_row)
-            # 128 bf16 = 256 B = 16 dwordx4 loads, starting at this chunk.
             src_unit = (
                 row * fx.Int32(model_dim * 2 // PUSH_VEC_BYTES)
                 + chunk * fx.Int32(QUANT_ELEMS_PER_THREAD * 2 // PUSH_VEC_BYTES)
@@ -265,12 +190,10 @@ def compile_allgather_quant_push(
                         )
                     words.append(packed)
 
-            # Four E8M0 bytes, little-endian, as one dword.
             scale_word = scale_byte[0]
             for g in range_constexpr(GROUPS_PER_THREAD - 1):
                 scale_word = scale_word | (scale_byte[g + 1] << fx.Int32(8 * (g + 1)))
 
-            # 64 B of payload as four dwordx4, 4 B of scale as one dword.
             payload_unit = row * fx.Int32(payload_row_bytes // PUSH_VEC_BYTES) + (
                 chunk * fx.Int32(GROUPS_PER_THREAD)
             )
@@ -296,7 +219,6 @@ def compile_allgather_quant_push(
     @flyc.jit
     def emit_route_push(arg_desc, i32_rank, i32_rows, bid, gid, stride):
         """Push topk ids and weights to every peer (regions 2 and 3)."""
-        # -- push the route ------------------------------------------------
         route_bytes = fx.Int64(i32_rows) * fx.Int64(route_row_bytes)
         route_units = i32_rows * fx.Int32(route_units_per_row)
         for region in range_constexpr(2):
@@ -332,46 +254,17 @@ def compile_allgather_quant_push(
 
     @flyc.jit
     def emit_ag_gate(arg_desc, entry_epoch, tid):
-        """Wait until this rank's AllGather has completed, and nothing else.
-
-        For CTAs that did not push. They never touch the arrival counter, so a
-        CTA still queued behind them costs nothing -- which is what lets the
-        hosting kernel use a grid larger than the device holds at once.
-        """
+        """Wait until this rank's AllGather has completed, and nothing else."""
         if tid == fx.Int32(0):
             comm.spin_until_ge_i32_agent(
                 desc_slot(arg_desc, done_index), entry_epoch
             )
-            if const_expr(_GATE_ACQUIRE):
-                comm.fence_agent_acquire()
+            comm.fence_agent_acquire()
         gpu.barrier()
 
     @flyc.jit
     def emit_ag_barrier(arg_desc, i32_rank, i32_grid, tid, entry_epoch=None):
-        """Publish this rank's arrival and wait until every peer has landed.
-
-        Only tid 0 of the *last* CTA to arrive does the cross-rank spin; every
-        other CTA increments the counter and moves on. For a standalone push
-        that is exactly right -- the kernel ends there, and the next kernel on
-        the stream sees the data.
-
-        It is *not* enough for a kernel whose CTAs continue: they would go read
-        peer rows that are still in flight, having waited for nothing. Passing
-        ``entry_epoch`` turns this into a real gate -- the completing CTA
-        publishes :data:`AG_DESC_DONE` after its cross-rank wait, and every CTA
-        spins on that before returning.
-
-        It must be a value every CTA agrees on *regardless of when it was
-        dispatched*. The AllGather's own epoch is not that: it is bumped here,
-        before the cross-rank wait, so a late CTA reads the bumped value, waits
-        for one more than will ever be published, and hangs. Pass the
-        ReduceScatter epoch instead -- that one is bumped only after every CTA
-        has arrived at the tail, i.e. never during the launch.
-
-        This is also why such a kernel needs every CTA resident: they all wait
-        here, and a waiting CTA holds a slot an unscheduled pusher needs.
-        """
-        # -- barrier, identical to the copy-only push -----------------------
+        """Publish this rank's arrival and wait until every peer has landed."""
         comm.fence_agent_release()
         gpu.barrier()
         if tid == fx.Int32(0):
@@ -401,8 +294,6 @@ def compile_allgather_quant_push(
                     )
                 comm.fence_system_acquire()
                 if entry_epoch is not None:
-                    # Publish only now: the epoch above is bumped *before* the
-                    # cross-rank wait, so it cannot serve as the gate.
                     comm.store_i32_global_agent_release(
                         desc_slot(arg_desc, done_index), entry_epoch
                     )
@@ -436,8 +327,6 @@ def compile_allgather_quant_push(
         bid = fx.Int32(gpu.block_id("x"))
         gid = bid * fx.Int32(block) + tid
         stride = i32_grid * fx.Int32(block)
-        # Plain Python branches: ``regions`` is a build-time string, so the
-        # tracer only ever sees the selected calls.
         if regions in ("all", "payload"):
             emit_quant_payload_push(arg_desc, i32_rank, i32_rows, bid, gid, stride)
         if regions in ("all", "route"):

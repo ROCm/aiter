@@ -1,39 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Host runtime for the fused TP MoE collectives.
-
-Both legs of the layer run as a single kernel launch over one symmetric arena:
-
-``all_gather``
-    Pushes the activation payload, its E8M0 scales, and the routing ids and
-    weights straight into every peer's arena, replacing four NCCL
-    ``all_gather_into_tensor`` calls plus the routing unpack copies.
-
-``reduce_scatter``
-    Pulls this rank's token range out of every peer's GEMM2 partial and sums it
-    in FP32, replacing ``reduce_scatter_tensor``.
-
-The destination buffers are the ones GEMM1, ``moe_sorting`` and GEMM2 already
-read and write, so the compute in between is untouched: ``payload``/``scale``
-are the pre-quantized activation operand, ``topk_ids``/``topk_weights`` are the
-gathered route, and ``partial`` is the GEMM2 atomic-accumulation target.
-
-Where each backend wins
------------------------
-The fused kernels trade NCCL's multi-channel pipelining for a single launch and
-no staging, which is the right trade while the transfer is latency-bound and
-the wrong one once it is purely bandwidth-bound.  Measured on TP8 gfx950 at
-H=3584 / topk=16 (fused vs NCCL, higher is better)::
-
-    global tokens      8    128    512   2048   8192  32768
-    AllGather      3.06x  3.36x  3.17x  2.56x  1.66x  0.89x
-    ReduceScatter  1.68x  1.30x  1.51x  1.18x  0.56x  0.60x
-
-So ``backend="auto"`` runs the fused path up to a per-leg byte budget and hands
-the rest to NCCL.  The budgets sit just past the measured crossovers and are
-overridable: this is a machine-specific tuning point, not a property of the
-algorithm.
-"""
+"""Host runtime for the fused TP MoE collectives."""
 
 from __future__ import annotations
 
@@ -84,37 +51,12 @@ from .reduce_scatter import (
 )
 from .symmetric_arena import SymmetricArena
 
-#: Upper bound on grid width, expressed as resident CTAs per CU. Past this the
-#: extra CTAs only add launch and tail overhead.
 _MAX_WAVES_PER_CU = 4
 
-#: Per-leg wire budget (bytes this rank moves across the fabric) below which the
-#: fused kernel beats NCCL. Past it NCCL's pipelined multi-channel transfer
-#: wins. Both are overridable; 0 disables the fused path, -1 always uses it.
 _AG_FUSED_MAX_BYTES = int(os.environ.get("AITER_TP_AG_FUSED_MAX_BYTES", 32 << 20))
 _RS_FUSED_MAX_BYTES = int(os.environ.get("AITER_TP_RS_FUSED_MAX_BYTES", 24 << 20))
-#: Budget for a *different* decision: folding the ReduceScatter into a compute
-#: kernel's tail versus running it as the standalone fused pair. That crossover
-#: sits much later than the fused-vs-NCCL one above, because the tail is being
-#: compared against the fused pull rather than against NCCL. Measured rs_gain on
-#: TP8 (>1 means the tail wins):
-#:
-#:     bytes     6M    12M    21M    42M    49M    84M    98M   196M
-#:     gain    1.45   1.18   0.93   1.00   1.09   0.76   0.86   0.79
-#:
-#: so the tail holds to ~49 MB and is clearly losing by ~84 MB. 64 MB splits
-#: them. Like the budgets above this is a machine-specific tuning point.
 _RS_TAIL_MAX_BYTES = int(os.environ.get("AITER_TP_RS_TAIL_MAX_BYTES", 64 << 20))
-#: Route the non-fused ReduceScatter through aiter's one-shot instead of RCCL.
-#:
-#: The unfused reference uses `tensor_model_parallel_reduce_scatter(
-#: use_custom=True)`; this path used `dist.reduce_scatter_tensor`, and the two
-#: are not equivalent -- `--comm rccl` costs the split baseline 106 us at
-#: kimi3 / 8192 and 58 us at dsv4 / 8192 against `--comm custom`.
 _RS_CUSTOM = os.environ.get("AITER_TP_RS_CUSTOM", "0") == "1"
-#: Route the non-fused AllGather through aiter's one-shot instead of RCCL.
-#: Counterpart of :data:`_RS_CUSTOM`; the AllGather fallback here was also
-#: `dist.*`, which is not what the unfused reference runs.
 _AG_CUSTOM = os.environ.get("AITER_TP_AG_CUSTOM", "0") == "1"
 
 COLLECTIVE_BACKENDS = ("auto", "fused", "nccl")
@@ -130,10 +72,10 @@ __all__ = [
 class GatheredActivations:
     """Views of the arena holding the full token set after the push."""
 
-    payload: torch.Tensor  # [M, H/2] uint8 (MXFP4) or [M, H] bf16
-    scale: torch.Tensor | None  # [M, H/32] e8m0, None on the BF16 wire
-    topk_ids: torch.Tensor  # [M, topk] int32
-    topk_weights: torch.Tensor  # [M, topk] float32
+    payload: torch.Tensor
+    scale: torch.Tensor | None
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
     tokens: int
 
 
@@ -154,12 +96,7 @@ def tp_moe_collectives_supported(
 
 
 class TpMoeCollectives:
-    """One-launch AllGather and ReduceScatter over a shared symmetric arena.
-
-    ``fp4_wire`` selects the MXFP4 wire (payload + E8M0 scales, 3.77x less
-    traffic than BF16); with ``fp4_wire=False`` the payload region carries raw
-    BF16 for the GEMM1 variants that quantize inline.
-    """
+    """One-launch AllGather and ReduceScatter over a shared symmetric arena."""
 
     def __init__(
         self,
@@ -213,12 +150,7 @@ class TpMoeCollectives:
         rs_flags = arena.reserve("rs_flags", (self.world_size,), torch.int32)
         ag_arrive = arena.reserve("ag_arrive", (1,), torch.int32)
         rs_arrive = arena.reserve("rs_arrive", (1,), torch.int32)
-        # Device-side epoch and phase-release counters keep both kernels free of
-        # host state, so a captured graph replays correctly.
         ag_epoch = arena.reserve("ag_epoch", (1,), torch.int32)
-        # Local-only: a kernel that continues past the AllGather spins on this
-        # after the completing CTA publishes it. Distinct from ag_epoch, which
-        # is bumped *before* the cross-rank wait.
         ag_done = arena.reserve("ag_done", (1,), torch.int32)
         rs_epoch = arena.reserve("rs_epoch", (1,), torch.int32)
         arena.commit()
@@ -228,8 +160,6 @@ class TpMoeCollectives:
         self._ids = ids
         self._weights = weights
         self._partial = partial
-        # Only this rank ever writes or reads its own output, so it stays out of
-        # the arena.
         self._output = torch.empty(
             (self.max_local_tokens, h), dtype=dtypes.bf16, device=self.device
         )
@@ -240,7 +170,6 @@ class TpMoeCollectives:
         self._cu_num = get_cu_num()
         self._grid_blocks = grid_blocks
 
-        # -- AllGather descriptor ---------------------------------------------
         regions = len(self._ag_regions)
         self._ag_desc, self._ag_desc_host = self._new_desc(
             ag_desc_size(self.world_size, regions), ag_arrive, ag_flags
@@ -259,21 +188,9 @@ class TpMoeCollectives:
             desc_region_src(self.world_size, index) for index in range(regions)
         ]
         self._ag_sources: tuple[int, ...] = ()
-        #: Pinned mirror of ``_ag_desc_host``. The H2D below has to be
-        #: capturable, and an *unpinned* CPU source is not -- torch refuses it
-        #: with "Cannot copy between CPU and CUDA tensors during CUDA graph
-        #: capture". A pinned staging buffer is, and it is re-read on every
-        #: replay, so a captured graph still sees whatever the host last wrote.
         self._ag_desc_pinned: "torch.Tensor | None" = None
         self._ag_launch = compile_allgather_push(self.world_size, self.row_bytes)
-        # Quantize-on-the-wire variant: same arena, same descriptor, but
-        # region 0's source is the BF16 activation and the E8M0 scales are
-        # produced in the kernel instead of read from a staging buffer.
         self._agq_launch = None
-        # Route-only and payload-only variants of the same push. The megakernel
-        # hosts the payload half itself, so the route has to go on the wire
-        # first and separately -- the expert sort reads it and must finish
-        # before the fused region starts.
         self._agq_route_launch = None
         self._agq_payload_launch = None
         if self.fp4_wire and quant_push_supported(self.model_dim, self.topk):
@@ -287,11 +204,9 @@ class TpMoeCollectives:
                 self.world_size, self.model_dim, self.topk, regions="payload"
             )
 
-        # -- ReduceScatter descriptor -----------------------------------------
         self._rs_desc, rs_host = self._new_desc(
             rs_desc_size(self.world_size), rs_arrive, rs_flags
         )
-        # Local-only, deliberately outside the arena: see RS_ARRIVE_SLOTS.
         self._rs_fanin = torch.zeros(
             RS_ARRIVE_SLOTS, dtype=torch.int32, device=self.device
         )
@@ -308,7 +223,6 @@ class TpMoeCollectives:
         self._rs_publish = compile_reduce_scatter_publish(self.world_size)
         self._rs_pull = compile_reduce_scatter_pull(self.world_size, h)
 
-    # -- descriptor helpers -------------------------------------------------
     def _new_desc(self, size: int, arrive, flags):
         host = [0] * size
         host[DESC_ARRIVE] = int(arrive.peer_ptrs[self.rank])
@@ -321,14 +235,7 @@ class TpMoeCollectives:
         )
 
     def _publish_ag_sources(self, sources: tuple[int, ...]) -> None:
-        """Push the per-call source addresses into the device descriptor.
-
-        A model reuses the same activation buffers every step, so this normally
-        detects "unchanged" and skips the H2D copy entirely. The fused path is
-        the exception: its quantized activation comes from the caching
-        allocator and moves, so this fires on the capture call too -- which is
-        why the staging buffer has to be pinned.
-        """
+        """Push the per-call source addresses into the device descriptor."""
         if sources == self._ag_sources:
             return
         staging = self._ag_desc_pinned
@@ -345,14 +252,7 @@ class TpMoeCollectives:
         self._ag_sources = sources
 
     def _grid(self, units: int, block: int, unroll: int) -> int:
-        """CTAs for one grid-stride pass, sized purely for bandwidth.
-
-        No kernel here makes a CTA wait on a sibling -- the arrival counters are
-        fetch-and-add only, and the one CTA that does spin is the last to
-        arrive, so everything else has already finished. That means the grid is
-        free to exceed what the device holds at once; the cap below only keeps
-        launch overhead sane at token counts that do not need the width.
-        """
+        """CTAs for one grid-stride pass, sized purely for bandwidth."""
         if self._grid_blocks:
             return int(self._grid_blocks)
         per_block = block * unroll
@@ -367,7 +267,6 @@ class TpMoeCollectives:
             return self.backend == "fused"
         return budget < 0 or wire_bytes <= budget
 
-    # -- AllGather ----------------------------------------------------------
     def ag_wire_bytes(self, rows: int) -> int:
         """Bytes this rank pushes over the fabric for one AllGather."""
         return rows * sum(self.row_bytes) * (self.world_size - 1)
@@ -408,11 +307,8 @@ class TpMoeCollectives:
                 torch.cuda.current_stream(),
             )
         else:
-            # Same destinations, so everything downstream is unaffected by
-            # which backend ran.
             for tensor, region in zip(tensors, self._ag_regions):
                 if _AG_CUSTOM:
-                    # The same one-shot AllGather the unfused reference uses.
                     from aiter.dist.communication_op import (
                         tensor_model_parallel_all_gather,
                     )
@@ -434,7 +330,6 @@ class TpMoeCollectives:
             tokens=total,
         )
 
-    # -- GEMM2 target -------------------------------------------------------
     def partial_buffer(self, tokens: int) -> torch.Tensor:
         """The ``[tokens, H]`` arena slice GEMM2 accumulates into."""
         if tokens > self._partial.shape[0]:
@@ -444,12 +339,7 @@ class TpMoeCollectives:
         return self._partial.local[:tokens]
 
     def payload_views(self, total_tokens: int):
-        """The arena payload and scale slices, *without* pushing anything.
-
-        For the megakernel, which does the quantize-and-push itself: the caller
-        still has to hand GEMM1 the addresses those rows will live at, and they
-        are the same arena regions :meth:`all_gather_payload` would have filled.
-        """
+        """The arena payload and scale slices, *without* pushing anything."""
         if total_tokens > self._payload.local.shape[0]:
             raise ValueError(
                 f"{total_tokens} tokens exceeds the payload arena "
@@ -458,13 +348,7 @@ class TpMoeCollectives:
         return self._payload.local[:total_tokens], self._scale.local[:total_tokens]
 
     def route_views(self, total_tokens: int):
-        """The arena route slices, *without* pushing anything.
-
-        The counterpart of :meth:`payload_views` for a megakernel that pushes
-        the route itself. Same regions :meth:`all_gather_route` would have
-        filled, so the sort inside that kernel and everything downstream read
-        the addresses they always did.
-        """
+        """The arena route slices, *without* pushing anything."""
         if total_tokens > self._ids.local.shape[0]:
             raise ValueError(
                 f"{total_tokens} tokens exceeds the route arena "
@@ -473,13 +357,7 @@ class TpMoeCollectives:
         return self._weights.local[:total_tokens], self._ids.local[:total_tokens]
 
     def publish_payload_source(self, x_local, topk_ids, topk_weights) -> None:
-        """Point the descriptor at the operands a hosted push will read.
-
-        A kernel that does the push itself never calls ``all_gather_*``, so
-        nothing else writes these slots for it. Region 1 (scales) has no source
-        -- the push produces them -- but the slot still has to hold a mapped
-        address.
-        """
+        """Point the descriptor at the operands a hosted push will read."""
         self._check_push_activation(x_local, int(x_local.shape[0]))
         self._publish_ag_sources(
             (
@@ -491,11 +369,7 @@ class TpMoeCollectives:
         )
 
     def ag_descriptor(self) -> int:
-        """Device address of the AllGather descriptor.
-
-        A kernel that hosts the push needs the same descriptor the standalone
-        push kernel reads: peer bases, region offsets, arrival counter, epoch.
-        """
+        """Device address of the AllGather descriptor."""
         return int(self._ag_desc.data_ptr())
 
     def quant_push_available(self) -> bool:
@@ -503,18 +377,10 @@ class TpMoeCollectives:
         return self._agq_launch is not None
 
     def all_gather_route(self, topk_ids, topk_weights):
-        """AllGather the routing metadata alone, ahead of everything else.
-
-        ``topk*8`` bytes per token, about 1/45 of the activation payload, and it
-        is the expert sort's only input -- so running it first lets the sort
-        finish while the activation is still being quantized and pushed. Returns
-        ``(topk_weights_all, topk_ids_all)``.
-        """
+        """AllGather the routing metadata alone, ahead of everything else."""
         if self._agq_route_launch is None:
             raise RuntimeError("this shape has no fused quantize-and-push kernel")
         rows = self._check_push_rows(topk_ids, topk_weights)
-        # Regions 0/1 are untouched here, but every descriptor slot still has to
-        # hold a mapped address.
         self._publish_ag_sources(
             (
                 int(topk_ids.data_ptr()),
@@ -528,11 +394,7 @@ class TpMoeCollectives:
         return self._weights.local[:total], self._ids.local[:total]
 
     def all_gather_payload(self, x_local):
-        """AllGather the activation, quantizing to MXFP4 on the way out.
-
-        The payload half of :meth:`all_gather_quant`, for callers that already
-        pushed the route separately. Returns ``(payload, scale)``.
-        """
+        """AllGather the activation, quantizing to MXFP4 on the way out."""
         if self._agq_payload_launch is None:
             raise RuntimeError("this shape has no fused quantize-and-push kernel")
         rows = int(x_local.shape[0])
@@ -584,12 +446,7 @@ class TpMoeCollectives:
         )
 
     def all_gather_quant(self, x_local, topk_ids, topk_weights):
-        """AllGather a BF16 activation, quantizing to MXFP4 on the way out.
-
-        Same result as ``all_gather`` on a pre-quantized operand -- the packed
-        payload and E8M0 scales land in the same arena regions -- but the quant
-        kernel, its staging buffers, and the round trip through them are gone.
-        """
+        """AllGather a BF16 activation, quantizing to MXFP4 on the way out."""
         if self._agq_launch is None:
             raise RuntimeError("this shape has no fused quantize-and-push kernel")
         rows = int(topk_ids.shape[0])
@@ -606,8 +463,6 @@ class TpMoeCollectives:
         for tensor in (topk_ids, topk_weights):
             if not tensor.is_contiguous():
                 raise ValueError("every push source must be contiguous")
-        # Region 1 (scales) has no source -- the kernel produces them -- but the
-        # descriptor slot still has to hold a mapped address.
         self._publish_ag_sources(
             (
                 int(x_local.data_ptr()),
@@ -634,27 +489,12 @@ class TpMoeCollectives:
             tokens=total,
         )
 
-    # -- ReduceScatter ------------------------------------------------------
     def rs_fused_is_profitable(self, local_rows: int) -> bool:
-        """Whether folding the ReduceScatter into a compute kernel still wins.
-
-        A kernel that grows the RS tail needs its own budget: past a point the
-        tail loses to the standalone fused pair, and it has no fallback of its
-        own. Skipping the check entirely cost 0.98x at glm5 / 32768 tokens,
-        where the tail ran 32% slower than the split path; reusing
-        ``_RS_FUSED_MAX_BYTES`` instead over-corrected and gave back 15-24 us at
-        kimi3 / 4096-8192. See :data:`_RS_TAIL_MAX_BYTES`.
-        """
+        """Whether folding the ReduceScatter into a compute kernel still wins."""
         return self._use_fused(self.rs_wire_bytes(local_rows), _RS_TAIL_MAX_BYTES)
 
     def rs_descriptor(self) -> int:
-        """Device address of the ReduceScatter descriptor.
-
-        A kernel that folds the ReduceScatter into its own tail needs the same
-        descriptor :meth:`reduce_scatter` hands the standalone publish and pull
-        kernels; handing out the pointer keeps the arena and its slot layout
-        owned here.
-        """
+        """Device address of the ReduceScatter descriptor."""
         return int(self._rs_desc.data_ptr())
 
     def output_buffer(self, local_tokens: int) -> torch.Tensor:
@@ -675,10 +515,6 @@ class TpMoeCollectives:
             )
         if not self._use_fused(self.rs_wire_bytes(local_tokens), _RS_FUSED_MAX_BYTES):
             if _RS_CUSTOM:
-                # The same one-shot ReduceScatter the unfused reference uses.
-                # `dist.reduce_scatter_tensor` is RCCL, and on this layer RCCL
-                # costs ~106 us more than the one-shot at kimi3 / 8192 tokens --
-                # which is most of the gap the fused path still has there.
                 from aiter.dist.communication_op import (
                     tensor_model_parallel_reduce_scatter,
                 )

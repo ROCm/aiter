@@ -1,28 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Top-k reduce + ReduceScatter as one kernel, for reduce-epilogue GEMM2 rows.
-
-:mod:`.stage2_rs` folds the ReduceScatter into GEMM2 itself, which only works
-when the tuned GEMM2 has an ``atomic`` epilogue -- it accumulates the ``[M, H]``
-partial in place, so it *is* the last kernel to write it.  A ``reduce``-epilogue
-row instead stages per-route rows and a separate reduction kernel produces the
-partial, and that is the kernel the ReduceScatter belongs in::
-
-    gemm2 (reduce)   ->  route[M*topk, H]
-    moe_reduction    ->  partial[M, H]        <- this module adds the tail here
-    rs_publish       ->  (gone)
-    rs_pull          ->  (gone)
-
-The reduction body is reused verbatim from :mod:`..moe_reduce`; only the tail is
-new, and that is shared with the atomic path via :func:`..mega_moe_tp.rs_tail`.
-
-This matters at prefill: the tuned rows that pick a ``reduce`` epilogue are the
-large-M ones, exactly where the ReduceScatter is most expensive (120 us of a
-788 us layer at 4096 global tokens on kimi3 TP8).
-
-The grid is the reduction kernel's own ``(m_tokens, gy)``, so the tail gets a
-linearized ``by * gridDim.x + bx``.
-"""
+"""Top-k reduce + ReduceScatter as one kernel, for reduce-epilogue GEMM2 rows."""
 
 from __future__ import annotations
 
@@ -67,13 +45,7 @@ def compile_reduce_rs(
     pitch_align: int | None = None,
     service_blocks: int = _SERVICE_BLOCKS,
 ):
-    """Build the fused reduction + ReduceScatter launcher for one shape.
-
-    Mirrors :func:`..moe_reduce.compile_moe_reduction`'s vector width, block and
-    grid choices so the reduction half behaves exactly as the standalone kernel
-    does; the EP mask path is deliberately not carried over, since a TP layer
-    has no masked routes.
-    """
+    """Build the fused reduction + ReduceScatter launcher for one shape."""
     if not 1 <= tp_size <= 8:
         raise ValueError(f"tp_size must be in [1, 8], got {tp_size}")
     if model_dim % RS_UNIT_ELEMS:
@@ -122,7 +94,7 @@ def compile_reduce_rs(
             topk,
             model_dim,
             dtype_str,
-            False,  # use_mask: a TP layer routes every token locally
+            False,
             0,
             out_dtype_str,
             use_weight,
@@ -130,8 +102,6 @@ def compile_reduce_rs(
             fp8_row_stride,
             block,
         )
-        # gridDim.x is the runtime token count and gridDim.y the constant column
-        # split, so linearize before handing the tail a flat CTA id.
         gx = fx.Int32(gpu.grid_dim.x)
         cta = fx.Int32(gpu.block_id("y")) * gx + fx.Int32(gpu.block_id("x"))
         emit_rs_tail(
@@ -198,11 +168,7 @@ def run_reduce_rs(
     fp8_pitch_align=None,
     stream=None,
 ):
-    """Host side: reduce the staged routes into the arena, then ReduceScatter.
-
-    ``target`` is GEMM2's per-route output, ``partial`` the ``[M, H]`` arena
-    slice, and the return is ``output[:local_rows]``.
-    """
+    """Host side: reduce the staged routes into the arena, then ReduceScatter."""
     out_dtype_str = "bf16" if partial.dtype == torch.bfloat16 else "f16"
     if is_fp8:
         from ..mxfp4_gemm_common import FP8OUT_PITCH_ALIGN

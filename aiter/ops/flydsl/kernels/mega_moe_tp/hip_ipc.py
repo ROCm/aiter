@@ -1,17 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The four HIP IPC calls :mod:`.symmetric_arena` needs, via ctypes.
-
-``hipIpcGetMemHandle`` and friends are plain runtime entry points, so a ctypes
-wrapper reaches them without adding a pybind binding to
-``module_custom_all_reduce`` -- a C++ module this path has nothing else to do
-with, and one whose JIT rebuild every caller would then pay for.  It also keeps
-the whole TP MoE feature inside ``aiter/ops/flydsl``.
-
-Modelled on :mod:`aiter.dist.cuda_wrapper`, which is not reused directly
-because it resolves ``libcudart``; on a ROCm stack the runtime is
-``libamdhip64``.
-"""
+"""The four HIP IPC calls :mod:`.symmetric_arena` needs, via ctypes."""
 
 from __future__ import annotations
 
@@ -27,7 +16,6 @@ __all__ = [
     "mem_allocation_base",
 ]
 
-#: ``HIP_IPC_HANDLE_SIZE``.
 IPC_HANDLE_BYTES = 64
 
 _LAZY_ENABLE_PEER_ACCESS = 1
@@ -45,23 +33,18 @@ class _Function:
 
 
 _EXPORTED = [
-    # const char* hipGetErrorString(hipError_t)
     _Function("hipGetErrorString", ctypes.c_char_p, [ctypes.c_int]),
-    # hipError_t hipIpcGetMemHandle(hipIpcMemHandle_t*, void*)
     _Function(
         "hipIpcGetMemHandle",
         ctypes.c_int,
         [ctypes.POINTER(hipIpcMemHandle_t), ctypes.c_void_p],
     ),
-    # hipError_t hipIpcOpenMemHandle(void**, hipIpcMemHandle_t, unsigned int)
     _Function(
         "hipIpcOpenMemHandle",
         ctypes.c_int,
         [ctypes.POINTER(ctypes.c_void_p), hipIpcMemHandle_t, ctypes.c_uint],
     ),
-    # hipError_t hipIpcCloseMemHandle(void*)
     _Function("hipIpcCloseMemHandle", ctypes.c_int, [ctypes.c_void_p]),
-    # hipError_t hipMemGetAddressRange(hipDeviceptr_t*, size_t*, hipDeviceptr_t)
     _Function(
         "hipMemGetAddressRange",
         ctypes.c_int,
@@ -90,8 +73,6 @@ def _funcs() -> dict[str, Any]:
     global _FUNCS
     if _FUNCS is not None:
         return _FUNCS
-    # torch has the runtime mapped long before anything here runs; the plain
-    # soname is only a fallback for an odd loader setup.
     path = _loaded_library_path("libamdhip64") or "libamdhip64.so"
     lib = ctypes.CDLL(path)
     resolved = {}
@@ -124,12 +105,7 @@ def ipc_get_mem_handle(ptr: int) -> bytes:
 
 
 def ipc_open_mem_handle(handle: bytes) -> int:
-    """Map a peer's exported allocation and return its device address here.
-
-    The caller owns the mapping and must release it with
-    :func:`ipc_close_mem_handle`.  ``hipIpcOpenMemHandle`` maps into the
-    *current* device, so callers set it before calling.
-    """
+    """Map a peer's exported allocation and return its device address here."""
     if len(handle) != IPC_HANDLE_BYTES:
         raise ValueError(
             f"IPC handle must be {IPC_HANDLE_BYTES} bytes, got {len(handle)}"
@@ -161,12 +137,7 @@ def ipc_close_mem_handle(peer_ptr: int) -> None:
 
 
 def mem_allocation_base(ptr: int) -> int:
-    """Base address of the allocation that contains ``ptr``.
-
-    ``hipIpcGetMemHandle`` exports a whole allocation and the importing side
-    gets back its base, so a sub-allocation (anything the torch caching
-    allocator hands out) needs this delta to be addressable by a peer.
-    """
+    """Base address of the allocation that contains ``ptr``."""
     funcs = _funcs()
     base = ctypes.c_void_p()
     size = ctypes.c_size_t()

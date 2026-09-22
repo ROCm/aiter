@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Shared P2P primitives for the fused TP MoE kernels.
-
-The peers live in a :class:`~.symmetric_arena.SymmetricArena`, so a
-region has the same byte offset on every rank and a peer address is just
-``base_ptrs[peer] + region_offset``.  ``base_ptrs`` reaches the kernel through a
-small int64 descriptor tensor rather than the fixed 4 GiB VA stride the mori
-windows use, because HIP IPC hands back arbitrary addresses.
-"""
+"""Shared P2P primitives for the fused TP MoE kernels."""
 
 import flydsl.expr as fx
 from flydsl.expr.typing import T
@@ -30,15 +23,6 @@ __all__ = [
     "store_words",
 ]
 
-# ---------------------------------------------------------------------------
-# Descriptor layout (int64 entries), built once on the host.
-#
-#   0                      local arrive-counter address (i32)
-#   1                      byte offset of the [world_size] i32 flag array
-#   2 .. 2+TP-1            peer arena base addresses
-#   2+TP + 2*r             source address of region r (rank-local)
-#   2+TP + 2*r + 1         byte offset of region r inside the arena
-# ---------------------------------------------------------------------------
 DESC_ARRIVE = 0
 DESC_FLAGS = 1
 DESC_PEER_BASE = 2
@@ -72,11 +56,7 @@ def desc_peer_base(desc_addr, peer):
 
 
 def flat_buffer(addr, elem, num_records_bytes):
-    """Bounded flat V# view over a raw global address.
-
-    The hardware ``num_records`` bound is what keeps a grid-stride tail from
-    running off the end of a region, so it is always passed explicitly.
-    """
+    """Bounded flat V# view over a raw global address."""
     return ptr_buf_tensor(
         global_typed_ptr(addr, elem.ir_type, align=max(1, elem.width // 8)),
         elem,

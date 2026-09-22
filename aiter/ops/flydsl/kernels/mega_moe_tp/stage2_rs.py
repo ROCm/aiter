@@ -1,65 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""GEMM2 + weighted top-k reduce + ReduceScatter in one kernel launch.
-
-The tail of the TP MoE layer is three launches today::
-
-    gemm2 (flydsl_moe2_layout_afp4_wfp4_*)  ->  partial[M, H]  (atomic fadd)
-    rs_publish                              ->  L2 writeback + epoch broadcast
-    rs_pull                                 ->  y_local[m, H]
-
-All three touch the same symmetric-arena slice and the only real dependency
-between them is "every rank's GEMM2 has landed", so this module folds them into
-one kernel and pays a device-side counter for that dependency instead of two
-launches plus the host gap between them.
-
-Shape
------
-The GEMM half is not reimplemented: ``mxmoe_dispatcher.compile_gemm2_a4w4_port``
-takes a ``_composition`` callable and hands back ``emit_gemm2_tile``, so the
-tuned tile -- same BM/BN/BK, same spatial partitioner, same atomic epilogue --
-is emitted verbatim inside a kernel this module owns.
-
-The grid is the ordinary GEMM2 grid; no CTA is added and none is reserved::
-
-    every CTA          run its GEMM2 tile, agent-release, then arrive at
-                       fan-in counter `bx % service`
-    high `service` ids additionally: drain the counter each owns, system-release
-                       (L2 writeback), and once all have: bump the epoch and
-                       push it to every peer's flag slot; then wait for all TP
-                       flags and pull this rank's row range out of every peer's
-                       partial, summing in FP32
-
-Three details are load-bearing.
-
-*The arrival fans in over `service` counters.*  A prefill GEMM2 grid runs to
-tens of thousands of CTAs, and funnelling that many device-scope atomics through
-one address serializes into milliseconds -- measured at 5x slower end to end.
-Each counter also sits on its own 128-byte line: packed adjacently they share
-two lines and the fan-in buys nothing. With one line per counter and `service` a
-multiple of the eight XCDs, counter `j` is only ever touched from XCD `j % 8`,
-so the line never migrates.
-
-*Cache maintenance is rationed.*  A GEMM2 CTA ends with a bare
-``s_waitcnt vmcnt(0)`` to drain its atomic epilogue; an agent-scope *fence*
-there is a cache writeback, and one per CTA over a ~25k-CTA grid cost 1995 us
-of tail against 23 us for the drain.  The writeback that actually pushes those
-lines to where a peer can read them is issued exactly ``WRITEBACK_BLOCKS``
-times, once per XCD, after the whole local grid has arrived -- deliberately
-decoupled from ``service``, because paying one per service CTA made a 256-wide
-service group 2.3x slower than a 32-wide one even though the pull wants to be
-wide.
-
-*The service CTAs are the high block ids.*  They are dispatched last, so they
-begin waiting as the local GEMM drains rather than holding a CU idle -- and
-spin-loading the fabric -- through the whole tile sweep.  Reading the epoch at
-kernel entry stays correct at any block id: the bump cannot happen until every
-CTA has arrived, and a CTA must be dispatched before it can arrive.
-
-Nothing deadlocks when the grid exceeds what the device holds at once: the
-service CTAs spin, but the other ``grid - service`` CTAs retire and free their
-slots, so the queued producers still drain.
-"""
+"""GEMM2 + weighted top-k reduce + ReduceScatter in one kernel launch."""
 
 from __future__ import annotations
 
@@ -85,29 +26,9 @@ from .rs_tail import emit_rs_tail, read_epoch, rs_tail_slots
 __all__ = ["compile_stage2_rs", "run_stage2_rs", "stage2_rs_supported"]
 
 _BLOCK = 256
-#: CTAs that stay behind to run the ReduceScatter. They are ordinary GEMM2
-#: producers first, so this costs no tile throughput -- only the tail, where
-#: they hold their slots while the last producers drain.
-#:
-#: Swept at 32/64/128/256 on TP8 kimi3: flat within noise once the peer poll is
-#: single-CTA (before that, 256 was 2.3x worse than 32 purely from flag-poll
-#: traffic). 128 sits at or near the best at every token count.
 _SERVICE_BLOCKS = min(
     MAX_SERVICE_BLOCKS, int(os.environ.get("AITER_TP_STAGE2_RS_SERVICE", "128"))
 )
-#: Two bisect knobs, kept because they are what actually located the one bug
-#: this kernel has had. Both make the caller fall back to the standalone
-#: collective, so a run stays meaningful:
-#:
-#: * ``GEMMONLY`` emits the GEMM2 tile and no tail -- separates "my GEMM2
-#:   invocation differs from the tuned wrapper's" from "the tail is wrong".
-#: * ``REDO`` runs the tail and then redoes the ReduceScatter -- separates "the
-#:   tail corrupts the partial" from "only the tail's own pull is wrong".
-#:
-#: Used together they took `rel_l2 1.0 at small M` from "BM16 is broken" to the
-#: real condition, `local_tokens == 1`.
-_GEMM_ONLY = os.environ.get("AITER_TP_STAGE2_RS_GEMMONLY", "0") == "1"
-_REDO_RS = os.environ.get("AITER_TP_STAGE2_RS_REDO", "0") == "1"
 
 
 @functools.cache
@@ -131,12 +52,7 @@ def compile_stage2_rs(
     g2_kstatic: bool = False,
     service_blocks: int = _SERVICE_BLOCKS,
 ):
-    """Build the fused GEMM2 + ReduceScatter launcher for one tuned GEMM2 row.
-
-    Every GEMM-shaped argument is the one
-    :func:`~aiter.ops.flydsl.kernels.mxmoe_dispatcher.get_g2` would pass for the
-    same tuned kernel name, so the emitted tile is the tuned tile.
-    """
+    """Build the fused GEMM2 + ReduceScatter launcher for one tuned GEMM2 row."""
     if not 1 <= tp_size <= 8:
         raise ValueError(f"tp_size must be in [1, 8], got {tp_size}")
     if model_dim % RS_UNIT_ELEMS:
@@ -146,8 +62,6 @@ def compile_stage2_rs(
     if service_blocks <= 0:
         raise ValueError(f"service_blocks must be positive, got {service_blocks}")
 
-    # Mirror the knob resolution in compile_gemm2_a4w4_port so the spatial
-    # partitioner this kernel replays matches the one the tile was built with.
     if g2_spart is None:
         g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
     g2_spart = int(g2_spart)
@@ -157,8 +71,6 @@ def compile_stage2_rs(
     tail_slots = rs_tail_slots(tp_size)
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage, **_extra):
-        # ``**_extra`` absorbs hook fields this composition does not need
-        # (``lds_bytes``, added for compositions that host a second GEMM).
         name = f"{module_name}_tp{tp_size}_rs_h{model_dim}_sv{service_blocks}"
 
         @flyc.kernel(name=name, known_block_size=[_BLOCK, 1, 1])
@@ -190,7 +102,6 @@ def compile_stage2_rs(
 
             epoch_addr, epoch = read_epoch(arg_desc, tail_slots)
 
-            # -- GEMM2 tile ------------------------------------------------
             num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(BN))
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
             total_m_blocks = _udiv(cumsum0, BM)
@@ -228,25 +139,20 @@ def compile_stage2_rs(
                     lds,
                 )
 
-            if const_expr(not _GEMM_ONLY):
-                # -- arrival, publish, ReduceScatter -------------------------
-            # Shared with the reduce-epilogue path; see :mod:`.rs_tail` for why
-            # the drain is a bare s_waitcnt, why the counters are not in the
-            # arena, and why the writeback and the peer poll are rationed.
-                emit_rs_tail(
-                    arg_desc,
-                    i32_rank,
-                    i32_rows,
-                    epoch_addr,
-                    epoch,
-                    bx_i32,
-                    grid_nb,
-                    tx_i32,
-                    tp_size=tp_size,
-                    model_dim=model_dim,
-                    block=_BLOCK,
-                    service_blocks=service_blocks,
-                )
+            emit_rs_tail(
+                arg_desc,
+                i32_rank,
+                i32_rows,
+                epoch_addr,
+                epoch,
+                bx_i32,
+                grid_nb,
+                tx_i32,
+                tp_size=tp_size,
+                model_dim=model_dim,
+                block=_BLOCK,
+                service_blocks=service_blocks,
+            )
 
 
         @flyc.jit
@@ -329,28 +235,7 @@ def _as_u8(tensor):
 
 
 def stage2_rs_supported(kernel_cfg) -> bool:
-    """Whether a parsed ``flydsl_moe2_layout_*`` row can carry the fused tail.
-
-    Both epilogues can, by different routes:
-
-    * ``atomic`` accumulates the ``[M, H]`` arena partial in place, so GEMM2 is
-      itself the last kernel to write it and grows the tail here.
-    * ``reduce`` stages per-route rows and a reduction kernel produces the
-      partial, so the tail goes there instead
-      (:mod:`.reduce_rs`) -- which is the more valuable of the two, because the
-      tuned rows that pick ``reduce`` are the large-M ones where the
-      ReduceScatter costs the most.
-
-    Persistent GEMM2 is excluded: its grid is ``cu_num * n_blocks`` rather than
-    the tile count the arrival fan-in assumes.
-
-    The row's tile size does *not* enter into it. An earlier version excluded
-    ``tile_m == 16`` after BM16 rows produced garbage, but a bisect showed the
-    real condition is ``local_tokens == 1`` -- BM16 merely correlated, because 8
-    global tokens on TP8 is the only case in the sweep with one local row. BM16
-    at 64/128/256 tokens is correct. That gate lives at the call site, which is
-    the only place that knows the row count.
-    """
+    """Whether a parsed ``flydsl_moe2_layout_*`` row can carry the fused tail."""
     return (
         kernel_cfg is not None
         and kernel_cfg.get("epilog") in ("atomic", "reduce")
@@ -383,13 +268,7 @@ def run_stage2_rs(
     block_m=None,
     stream=None,
 ):
-    """Host side of the fused GEMM2 + ReduceScatter.
-
-    Mirrors ``mxmoe_dispatcher.mxfp4_moe_gemm2``'s launcher selection and grid
-    sizing so the GEMM half behaves exactly as the unfused call would, then
-    adds the arena descriptor, this rank's id and its local row count for the
-    ReduceScatter half.  Returns ``output[:local_rows]``.
-    """
+    """Host side of the fused GEMM2 + ReduceScatter."""
     BM = kernel_cfg["tile_m"]
     BN = kernel_cfg["tile_n"]
     BK = kernel_cfg["tile_k"]
@@ -434,7 +313,7 @@ def run_stage2_rs(
         num_valid_ids.data_ptr(),
         sorted_token_ids.data_ptr(),
         sorted_weights.data_ptr(),
-        partial.data_ptr(),  # unused bias pointer; any valid device address
+        partial.data_ptr(),
         int(M_logical),
         int(max_m_blocks),
         int(grid_blocks),
@@ -446,4 +325,4 @@ def run_stage2_rs(
         int(local_rows),
         stream if stream is not None else torch.cuda.current_stream(),
     )
-    return None if (_GEMM_ONLY or _REDO_RS) else output[:local_rows]
+    return output[:local_rows]
