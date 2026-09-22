@@ -50,7 +50,7 @@ def _time_us(call, iters, reps):
     decode shapes the launch overhead dominates: measured here, bs=8 / ctx 8192
     reads as 26.6 us under do_bench against 8.0 us graph-captured. Worse for a
     comparison, the distortion is not common-mode -- the fused op is two
-    launches and the stock composition is four, so do_bench flatters the one
+    launches and the stock composition is three, so do_bench flatters the one
     with fewer launches and understates the speedup.
 
     Capturing many invocations per graph amortises the per-replay setup (~9.3 us
@@ -83,8 +83,17 @@ def _time_us(call, iters, reps):
 
 
 def _stock_composition(q, kc, vc, indptr, indices, gate, scale, max_context):
-    """The three launches this op replaces, as one callable."""
+    """The three launches this op replaces, as one callable.
+
+    The gate step uses aiter's own `fused_sigmoid_mul`, NOT `flat *
+    torch.sigmoid(gate)`. The torch spelling is two kernels rather than one, and
+    the caller this op targets (SGLang's Qwen3-Next decode) runs a single fused
+    sigmoid-gate multiply -- so timing the torch spelling would inflate the
+    baseline by a launch this op does not actually remove, and overstate the
+    speedup (measured: +4% at bs=64 and +21% at bs=1, ctx 8192).
+    """
     from aiter import paged_attention_ragged
+    from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
     from aiter.ops.triton.quant.fused_fp8_quant import fused_flatten_fp8_group_quant
 
     rows, heads, _ = q.shape
@@ -95,6 +104,9 @@ def _stock_composition(q, kc, vc, indptr, indices, gate, scale, max_context):
     last_page = torch.ones(rows, dtype=torch.int32, device=q.device)
     one = torch.ones(1, dtype=torch.float32, device=q.device)
     flat = out.view(rows, heads * HEAD_DIM)
+    # Separate destination: fused_sigmoid_mul defaults to writing in place, which
+    # would compound across the invocations captured in one graph.
+    gated_buf = torch.empty_like(flat)
 
     def call():
         paged_attention_ragged(
@@ -118,7 +130,7 @@ def _stock_composition(q, kc, vc, indptr, indices, gate, scale, max_context):
             None,
             _PARTITION_SIZE,
         )
-        gated = flat * torch.sigmoid(gate)
+        gated = fused_sigmoid_mul(flat, gate, out=gated_buf)
         return fused_flatten_fp8_group_quant(gated.view(rows, heads, HEAD_DIM), 128)
 
     return call

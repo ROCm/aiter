@@ -57,7 +57,11 @@ _LOGGER = AiterTritonLogger()
 
 HEAD_DIM = 256
 QUANT_GROUP = 128
-_FP8_MAX = {torch.float8_e4m3fn: 448.0, torch.float8_e4m3fnuz: 240.0}
+# gfx950 (CDNA4) reads OCP e4m3 natively; `float8_e4m3fnuz` is the gfx942
+# encoding, so the same bytes mean different values here. This op is gfx950-only,
+# so fnuz is rejected rather than reinterpreted -- see the cache predicate below.
+# `pa_decode_sparse` makes the same restriction for the same reason.
+_FP8_MAX = {torch.float8_e4m3fn: 448.0}
 # Crossover between the two bodies, in real context tokens. Measured, not a
 # guess -- see the module docstring.
 _SHORT_CONTEXT_MAX = 32768
@@ -93,8 +97,12 @@ def paged_attention_output_gate_supported(
         )
     if key_cache.dtype is not value_cache.dtype:
         return False, "key_cache and value_cache must have the same dtype"
-    if key_cache.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        return False, f"KV cache must be fp8 e4m3, got {key_cache.dtype}"
+    if key_cache.dtype is not torch.float8_e4m3fn:
+        # Not `in (e4m3fn, e4m3fnuz)`: fnuz is the gfx942 encoding, and feeding
+        # those bytes to this gfx950 body would silently dequantize them wrong.
+        return False, (
+            f"KV cache must be fp8 e4m3fn (OCP encoding), got {key_cache.dtype}"
+        )
     if gate.shape != (query.shape[0], heads * HEAD_DIM):
         return False, (
             f"gate must be [T, H*{HEAD_DIM}] = "
@@ -107,8 +115,16 @@ def paged_attention_output_gate_supported(
             return False, f"{name} must have stride(2) == 1"
     if gate.stride(1) != 1:
         return False, "gate must have stride(1) == 1"
+    # The long body adds the head-dim offset unscaled (`... + qdims[None, :]`),
+    # so it reads the wrong elements unless the dim stride is 1. Only the short
+    # body is given a QUERY_DIM_STRIDE, and body selection is not known here, so
+    # require it of both rather than accept a layout one of them mishandles.
+    if query.stride(2) != 1:
+        return False, "query must have stride(2) == 1"
     if quant_dtype is not None and quant_dtype not in _FP8_MAX:
-        return False, f"quant_dtype must be an fp8 e4m3 type, got {quant_dtype}"
+        return False, (
+            f"quant_dtype must be float8_e4m3fn (OCP e4m3), got {quant_dtype}"
+        )
     return True, ""
 
 
@@ -181,6 +197,11 @@ def paged_attention_output_gate_group_fp8_quant(
         raise ValueError("k_scale and v_scale must both be given or both be None")
     if kv_indptr.dtype != torch.int32 or kv_indices.dtype != torch.int32:
         raise ValueError("kv_indptr and kv_indices must be int32")
+    # Both bodies walk these as flat pointer offsets (`indptr_ptr + row`,
+    # `indices_ptr + begin + offset`), so a strided view would silently read the
+    # wrong row boundaries or page slots rather than fail.
+    if not kv_indptr.is_contiguous() or not kv_indices.is_contiguous():
+        raise ValueError("kv_indptr and kv_indices must be contiguous")
 
     rows, heads, _ = query.shape
     short = _short_body_selected(heads, key_cache, value_cache, max_context)
