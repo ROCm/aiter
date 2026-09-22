@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+import os
 import torch
 import torch.distributed as dist
 
@@ -171,7 +172,6 @@ class SymmetricArena:
                 else:
                     base_ptrs.append(_open_once(peer_handle) + peer_offset)
         self._base_ptrs = tuple(base_ptrs)
-
         for entry in self._slices.values():
             end = entry.offset + entry.nbytes
             entry.local = (

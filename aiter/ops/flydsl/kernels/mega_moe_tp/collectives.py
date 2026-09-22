@@ -105,6 +105,17 @@ _RS_FUSED_MAX_BYTES = int(os.environ.get("AITER_TP_RS_FUSED_MAX_BYTES", 24 << 20
 #: so the tail holds to ~49 MB and is clearly losing by ~84 MB. 64 MB splits
 #: them. Like the budgets above this is a machine-specific tuning point.
 _RS_TAIL_MAX_BYTES = int(os.environ.get("AITER_TP_RS_TAIL_MAX_BYTES", 64 << 20))
+#: Route the non-fused ReduceScatter through aiter's one-shot instead of RCCL.
+#:
+#: The unfused reference uses `tensor_model_parallel_reduce_scatter(
+#: use_custom=True)`; this path used `dist.reduce_scatter_tensor`, and the two
+#: are not equivalent -- `--comm rccl` costs the split baseline 106 us at
+#: kimi3 / 8192 and 58 us at dsv4 / 8192 against `--comm custom`.
+_RS_CUSTOM = os.environ.get("AITER_TP_RS_CUSTOM", "0") == "1"
+#: Route the non-fused AllGather through aiter's one-shot instead of RCCL.
+#: Counterpart of :data:`_RS_CUSTOM`; the AllGather fallback here was also
+#: `dist.*`, which is not what the unfused reference runs.
+_AG_CUSTOM = os.environ.get("AITER_TP_AG_CUSTOM", "0") == "1"
 
 COLLECTIVE_BACKENDS = ("auto", "fused", "nccl")
 
@@ -248,6 +259,12 @@ class TpMoeCollectives:
             desc_region_src(self.world_size, index) for index in range(regions)
         ]
         self._ag_sources: tuple[int, ...] = ()
+        #: Pinned mirror of ``_ag_desc_host``. The H2D below has to be
+        #: capturable, and an *unpinned* CPU source is not -- torch refuses it
+        #: with "Cannot copy between CPU and CUDA tensors during CUDA graph
+        #: capture". A pinned staging buffer is, and it is re-read on every
+        #: replay, so a captured graph still sees whatever the host last wrote.
+        self._ag_desc_pinned: "torch.Tensor | None" = None
         self._ag_launch = compile_allgather_push(self.world_size, self.row_bytes)
         # Quantize-on-the-wire variant: same arena, same descriptor, but
         # region 0's source is the BF16 activation and the E8M0 scales are
@@ -307,16 +324,24 @@ class TpMoeCollectives:
         """Push the per-call source addresses into the device descriptor.
 
         A model reuses the same activation buffers every step, so this normally
-        detects "unchanged" and skips the H2D copy entirely.
+        detects "unchanged" and skips the H2D copy entirely. The fused path is
+        the exception: its quantized activation comes from the caching
+        allocator and moves, so this fires on the capture call too -- which is
+        why the staging buffer has to be pinned.
         """
         if sources == self._ag_sources:
             return
+        staging = self._ag_desc_pinned
+        if staging is None:
+            staging = torch.tensor(
+                self._ag_desc_host, dtype=torch.int64, device="cpu",
+                pin_memory=True,
+            )
+            self._ag_desc_pinned = staging
         for slot, address in zip(self._ag_source_slots, sources):
             self._ag_desc_host[slot] = int(address)
-        self._ag_desc.copy_(
-            torch.tensor(self._ag_desc_host, dtype=torch.int64, device="cpu"),
-            non_blocking=True,
-        )
+            staging[slot] = int(address)
+        self._ag_desc.copy_(staging, non_blocking=True)
         self._ag_sources = sources
 
     def _grid(self, units: int, block: int, unroll: int) -> int:
@@ -386,9 +411,21 @@ class TpMoeCollectives:
             # Same destinations, so everything downstream is unaffected by
             # which backend ran.
             for tensor, region in zip(tensors, self._ag_regions):
-                dist.all_gather_into_tensor(
-                    region.local[:total], tensor, group=self.group
-                )
+                if _AG_CUSTOM:
+                    # The same one-shot AllGather the unfused reference uses.
+                    from aiter.dist.communication_op import (
+                        tensor_model_parallel_all_gather,
+                    )
+
+                    region.local[:total].copy_(
+                        tensor_model_parallel_all_gather(
+                            tensor, use_custom=True, dim=0
+                        )
+                    )
+                else:
+                    dist.all_gather_into_tensor(
+                        region.local[:total], tensor, group=self.group
+                    )
         return GatheredActivations(
             payload=self._payload.local[:total],
             scale=None if self._scale is None else self._scale.local[:total],
@@ -419,6 +456,21 @@ class TpMoeCollectives:
                 f"({self._payload.local.shape[0]})"
             )
         return self._payload.local[:total_tokens], self._scale.local[:total_tokens]
+
+    def route_views(self, total_tokens: int):
+        """The arena route slices, *without* pushing anything.
+
+        The counterpart of :meth:`payload_views` for a megakernel that pushes
+        the route itself. Same regions :meth:`all_gather_route` would have
+        filled, so the sort inside that kernel and everything downstream read
+        the addresses they always did.
+        """
+        if total_tokens > self._ids.local.shape[0]:
+            raise ValueError(
+                f"{total_tokens} tokens exceeds the route arena "
+                f"({self._ids.local.shape[0]})"
+            )
+        return self._weights.local[:total_tokens], self._ids.local[:total_tokens]
 
     def publish_payload_source(self, x_local, topk_ids, topk_weights) -> None:
         """Point the descriptor at the operands a hosted push will read.
@@ -622,6 +674,21 @@ class TpMoeCollectives:
                 f"{self.max_local_tokens}"
             )
         if not self._use_fused(self.rs_wire_bytes(local_tokens), _RS_FUSED_MAX_BYTES):
+            if _RS_CUSTOM:
+                # The same one-shot ReduceScatter the unfused reference uses.
+                # `dist.reduce_scatter_tensor` is RCCL, and on this layer RCCL
+                # costs ~106 us more than the one-shot at kimi3 / 8192 tokens --
+                # which is most of the gap the fused path still has there.
+                from aiter.dist.communication_op import (
+                    tensor_model_parallel_reduce_scatter,
+                )
+
+                out = tensor_model_parallel_reduce_scatter(
+                    self._partial.local[: local_tokens * self.world_size],
+                    use_custom=True,
+                )
+                self._output[:local_tokens].copy_(out)
+                return self._output[:local_tokens]
             dist.reduce_scatter_tensor(
                 self._output[:local_tokens],
                 self._partial.local[: local_tokens * self.world_size],

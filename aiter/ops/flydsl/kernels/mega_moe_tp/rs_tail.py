@@ -48,6 +48,7 @@ until every CTA has arrived and a CTA must be dispatched before it can arrive.
 
 from __future__ import annotations
 
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -79,6 +80,12 @@ from .reduce_scatter import (
 __all__ = ["emit_phase_barrier", "emit_rs_tail", "read_epoch", "rs_tail_slots"]
 
 _VEC_WORDS = RS_UNIT_ELEMS // 2
+
+
+def rs_service_low() -> bool:
+    """Kept for the hosting kernel's module-name hash; always False now."""
+    return False
+
 
 
 def rs_tail_slots(tp_size: int):
@@ -165,7 +172,21 @@ def emit_rs_tail(
     slots = rs_tail_slots(tp_size)
     arrive_base = desc_slot(arg_desc, slots["fanin"])
     flags_offset = desc_slot(arg_desc, DESC_FLAGS)
-    service = fx.min(ctas, fx.Int32(service_blocks))
+    # How many CTAs run the collective. Capped by the *work*, not just by
+    # ``service_blocks``: the pull-reduce has ``i32_rows * units_per_row``
+    # units to move, and at decode sizes that is a handful -- kimi3 M=8 is 448
+    # units, which 2 CTAs cover. Handing it 128 CTAs means 126 of them spin
+    # through the whole rendezvous and then issue peer reads for nothing.
+    # Worth +2.3% at kimi3 M=8; saturates back to ``service_blocks`` as soon as
+    # the rows grow, so large M is untouched.
+    units_total = i32_rows * fx.Int32(units_per_row)
+    work_ctas = (units_total + fx.Int32(block - 1)) // fx.Int32(block)
+    service = fx.min(fx.min(ctas, fx.Int32(service_blocks)), fx.max(work_ctas, fx.Int32(1)))
+    # The *last* block ids run the collective. Taking the lowest instead --
+    # which is what the AllGather push does, and for the apparently good reason
+    # that low ids are dispatched first and are therefore resident from the
+    # start -- was measured and is **worse**: -1.1% at kimi3 M=8, -1.4% at
+    # M=64. The dispatch-wave latency this was meant to remove is not there.
     first_service = ctas - service
 
     rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)

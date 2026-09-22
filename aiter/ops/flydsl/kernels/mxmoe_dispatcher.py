@@ -321,6 +321,7 @@ def compile_gemm2_a4w4_port(
         lds,
         mn_idx=None,
         resolved_input_rows=(),
+        lds_base=None,
     ):
         num_n_blocks = _udiv(i32_hidden, BN)
         k_bytes = _udiv(i32_inter, 1 if is_f8 else 2)
@@ -330,7 +331,13 @@ def compile_gemm2_a4w4_port(
             else fx.Int64(i32_max_m_blocks) * fx.Int64(BM)
         )
         aq_num = aq_rows * fx.Int64(k_bytes)
-        lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
+        # ``lds_base`` lets a composing kernel hand in a region other than the
+        # storage's own base -- what double-buffering across tiles needs, since
+        # FlyDSL allows only one SharedAllocator per kernel and the second
+        # region has to be an offset into the first.
+        lds_base_i32 = fx.Int32(
+            fx.ptrtoint(lds.buf.ptr if lds_base is None else lds_base)
+        )
 
         def issue_all_a_loads(m_row0):
             for slot in range_constexpr(a_preload):
@@ -477,6 +484,7 @@ def compile_gemm2_a4w4_port(
         i32_inter,
         i32_hidden,
         lds,
+        lds_base=None,
     ):
         m_row = m_block_idx * fx.Int32(BM)
         # No resolver means the composition feeds GEMM2 the ordinary sorted-row
@@ -508,6 +516,7 @@ def compile_gemm2_a4w4_port(
             i32_hidden,
             fx.Int32(0),
             lds,
+            lds_base=lds_base,
             mn_idx=(m_block_idx, n_block_idx),
             resolved_input_rows=resolved_rows,
         )

@@ -1275,7 +1275,7 @@ def _fused_moe_impl(
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
         # BM16's adaptive sort already emits routes and zeroes the output without
         # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = moe_sorting(
+        sorting_ret = (metadata.sorting or moe_sorting)(
             topk_ids,
             topk_weight,
             global_E,
@@ -1713,6 +1713,13 @@ class MOEMetadata:
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
     max_sorted_blocks: int | None = None
+    #: Replaces :func:`moe_sorting` for this call.
+    #:
+    #: A caller whose kernel sorts internally still needs the buffers the sort
+    #: would have produced -- and needs the output zeroed, which ``moe_sorting``
+    #: also does -- but not the sort itself. Same signature and same return
+    #: tuple; ``None`` keeps the normal path.
+    sorting: Callable | None = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):

@@ -112,6 +112,60 @@ _BF16_VIA_IMPL = os.environ.get("AITER_TP_MEGA_BF16_VIA_IMPL", "0") == "1"
 #: what remains suspect is inline quantization running inside a persistent
 #: grid-stride loop. Since the single-family path a megakernel has to serve is
 #: FP4-only, the fix is to scope the feature rather than to keep it off.
+#: Record per-step device times on the fused path (eager only). See
+#: :meth:`MegaMoeTP._forward_timed`.
+#: Mirror of ``stage12_rs._FUSE_SORT``. Read here too because the host pass has
+#: to stop sorting in the same run the kernel starts.
+_STAGE2_TARGETS = {}
+
+
+def _stage2_target(shape, dtype, device):
+    """Staging buffer for the ``reduce`` epilogue's GEMM2 output.
+
+    Cached, not allocated per call: **a CUDA graph records the address**, so a
+    buffer that is freed and re-allocated between capture and replay leaves the
+    kernel writing into whatever took its place. dsv3 and dsv4 at 2048 tokens
+    SIGSEGV'd under graph capture while passing eagerly -- 2048 is the first
+    bucket whose tuned row uses ``reduce``, so it is the first one to allocate
+    this at all.
+
+    Same trade the other graph-safe buffers in this layer make (``_taskq_ptr``,
+    ``_alloc_sorting``, ``_route_target``): exact shape in the key, one buffer
+    per bucket.
+    """
+    key = (tuple(int(x) for x in shape), str(dtype), str(device))
+    buf = _STAGE2_TARGETS.get(key)
+    if buf is None:
+        buf = torch.empty(tuple(int(x) for x in shape), dtype=dtype, device=device)
+        _STAGE2_TARGETS[key] = buf
+    return buf
+
+
+def _kernel_sorts(global_tokens: int, num_experts: int) -> bool:
+    """Mirror of ``stage12_rs.kernel_sorts``; the host pass has to stop sorting
+    exactly when the kernel starts, and only for the shapes it can handle."""
+    from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import (
+        kernel_sorts,
+        kernel_sorts_mp,
+    )
+
+    # Either inline path means the host must stop sorting: the oneshot one
+    # (<= 16 tokens) or the multiphase one (decode). They are separate gates
+    # because they are separate algorithms, but from the host's side the
+    # question is the same -- does the kernel produce ``sorted_ids`` itself.
+    return kernel_sorts(global_tokens, num_experts) or kernel_sorts_mp(
+        global_tokens, num_experts
+    )
+#: Mirror of ``stage12_rs._FAST_SORT``: the host has to stop asking for aux
+#: outputs in the same run the kernel starts deriving them.
+_FAST_SORT_HOST = os.environ.get("AITER_TP_MEGA_FAST_SORT", "0") == "1"
+#: Copy the gathered activation out of the IPC arena before GEMM1 reads it.
+_AG_COPYOUT = os.environ.get("AITER_TP_MEGA_AG_COPYOUT", "0") == "1"
+_TIME_STEPS = os.environ.get("AITER_TP_MEGA_TIME", "0") == "1"
+#: Additionally split the AllGather step into route-push and descriptor-publish.
+#: Separate from ``_TIME_STEPS`` because the inner events add their own
+#: synchronisation, which inflates every number around them.
+_TIME_AG = os.environ.get("AITER_TP_MEGA_TIME_AG", "0") == "1"
 _STAGE12 = os.environ.get("AITER_TP_MEGA_STAGE12", "0") == "1"
 #: Smallest ``local_tokens`` the merged kernel serves. 1 is measured-correct on
 #: the FP4 wire; the standalone fused ReduceScatter tail needs 2, but the merged
@@ -649,6 +703,8 @@ class MegaMoeTP:
         self._comm: dict[str, TpMoeCollectives] = {}
 
         self._quant = get_hip_quant(QUANT_TYPE)
+        #: Sort-output buffers for :meth:`_alloc_sorting`, keyed by shape.
+        self._sort_bufs: dict = {}
         situ = cfg.activation == ActivationType.Situv2
         # Exactly the kwargs the ordinary two-stage path uses, so the tuned
         # config lookup lands on the same row as an unfused call would.
@@ -1044,7 +1100,54 @@ class MegaMoeTP:
                 # The megakernel pushes the payload itself. Only the route goes
                 # on the wire here, because the sort runs between this call and
                 # the kernel and reads it.
-                weights_all, ids_all = comm.all_gather_route(topk_ids, topk_weights)
+                if _TIME_AG and not torch.cuda.is_current_stream_capturing():
+                    sub = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+                    sub[0].record()
+                    weights_all, ids_all = comm.all_gather_route(
+                        topk_ids, topk_weights
+                    )
+                    sub[1].record()
+                    comm.publish_payload_source(x_local, topk_ids, topk_weights)
+                    sub[2].record()
+                    torch.cuda.synchronize()
+                    self._ag_sub_us = (
+                        sub[0].elapsed_time(sub[1]) * 1e3,
+                        sub[1].elapsed_time(sub[2]) * 1e3,
+                    )
+                    payload, scale = comm.payload_views(total)
+                    return (
+                        payload.view(AQ_DTYPE),
+                        scale.view(dtypes.fp8_e8m0),
+                        weights_all,
+                        ids_all,
+                    )
+                if _kernel_sorts(total, cfg.experts):
+                    # The megakernel pushes the route too, and sorts after its
+                    # gate, so nothing between here and the launch reads the
+                    # gathered route -- and it costs one cross-rank rendezvous
+                    # fewer than pushing it from here.
+                    weights_all, ids_all = comm.route_views(total)
+                else:
+                    if os.environ.get("AITER_TP_MEGA_AG_SKIP", "0") == "1":
+                        # Probe: skip the route AllGather entirely. WRONG
+                        # RESULTS. Unlike AG_TWICE this prices the *first*
+                        # rendezvous, which is the one that absorbs whatever
+                        # skew the ranks arrive with -- a second one is cheap
+                        # precisely because the first aligned everybody.
+                        weights_all, ids_all = comm.route_views(total)
+                    elif os.environ.get("AITER_TP_MEGA_AG_TWICE", "0") == "1":
+                        # Same "do it twice" form as AITER_TP_MEGA_SORT_TWICE:
+                        # the difference against a normal run is one route
+                        # AllGather, with nothing else disturbed. Results stay
+                        # correct, so this runs under the real accuracy gate.
+                        comm.all_gather_route(topk_ids, topk_weights)
+                        weights_all, ids_all = comm.all_gather_route(
+                            topk_ids, topk_weights
+                        )
+                    else:
+                        weights_all, ids_all = comm.all_gather_route(
+                            topk_ids, topk_weights
+                        )
                 # The route push left region 0 pointing at the routing tensors;
                 # repoint it at the activation the megakernel will quantize.
                 if _MEGA_AG_ALSO_HOST:
@@ -1059,6 +1162,20 @@ class MegaMoeTP:
                 )
             if cfg.ag_quant_fuse != "off" and comm.quant_push_available():
                 gathered = comm.all_gather_quant(x_local, topk_ids, topk_weights)
+                if _AG_COPYOUT:
+                    # Probe: hand GEMM1 a plain-allocation copy of the gathered
+                    # activation instead of the arena view. The arena is
+                    # IPC-exported symmetric memory; `rs_tail`'s notes record
+                    # that atomics on those pages bypass L2 for a fabric round
+                    # trip, and if ordinary loads are affected too then GEMM1
+                    # has been reading its A operand out of uncached memory.
+                    # Costs one 13.6 MB copy at kimi3 / 8192.
+                    return (
+                        gathered.payload.view(AQ_DTYPE).clone(),
+                        gathered.scale.view(dtypes.fp8_e8m0).clone(),
+                        gathered.topk_weights,
+                        gathered.topk_ids,
+                    )
                 return (
                     gathered.payload.view(AQ_DTYPE),
                     gathered.scale.view(dtypes.fp8_e8m0),
@@ -1198,21 +1315,19 @@ class MegaMoeTP:
             if fp8_inter:
                 scale_blk = fp8out_scale_blk(model_dim) if kstatic else 8
                 pitch_align = FP8OUT_PITCH_ALIGN if kstatic else 0
-                target = _torch.empty(
+                target = _stage2_target(
                     (
                         token_num * topk,
                         fp8out_row_bytes(
                             model_dim, scale_blk=scale_blk, pitch_align=pitch_align
                         ),
                     ),
-                    dtype=_torch.uint8,
-                    device=moe_out.device,
+                    _torch.uint8,
+                    moe_out.device,
                 )
             else:
-                target = _torch.empty(
-                    (token_num, topk, model_dim),
-                    dtype=moe_out.dtype,
-                    device=moe_out.device,
+                target = _stage2_target(
+                    (token_num, topk, model_dim), moe_out.dtype, moe_out.device
                 )
             mxfp4_moe_gemm2(
                 inter_sorted_quant=_mxfp4_scale_u8(inter_states),
@@ -1290,7 +1405,140 @@ class MegaMoeTP:
         except Exception:  # noqa: BLE001 - probe only, never fatal
             return False
 
-    def _fused_stage12(self, plan, local_tokens, comm, g2_cfg, base_transform=None):
+    def _alloc_sorting(
+        self,
+        topk_ids,
+        topk_weight,
+        num_experts,
+        model_dim,
+        dtype,
+        block_size,
+        *,
+        accumulate=True,
+        output_aux=False,
+        output=None,
+        **_kwargs,
+    ):
+        """A ``moe_sorting`` stand-in for a kernel that sorts itself.
+
+        Drop-in for :data:`MOEMetadata.sorting`. It keeps the two things the
+        rest of the pipeline needs from ``moe_sorting`` -- buffers of the right
+        shape, and a zeroed output for the atomic epilogue -- and skips the
+        sort, which the merged kernel does after its AllGather gate.
+
+        The buffers are cached on the instance rather than allocated per call:
+        their shapes depend only on the static bound, and a CUDA graph capture
+        needs the same addresses on every replay.
+        """
+        if os.environ.get("AITER_TP_MEGA_SORT_PASSTHRU", "0") == "1":
+            from aiter.fused_moe import moe_sorting as _real
+
+            if os.environ.get("AITER_TP_MEGA_SORT_TWICE", "0") == "1":
+                # Run the real sort an extra time and throw the first away.
+                # (full_with_two_sorts - full) is one sort's cost, with nothing
+                # else disturbed -- unlike replacing it, which also zeroes
+                # `num_valid` and so empties the kernel's m-block loop.
+                _real(
+                    topk_ids, topk_weight, num_experts, model_dim, dtype,
+                    block_size, accumulate=accumulate, output_aux=output_aux,
+                    output=output,
+                )
+            ret = _real(
+                topk_ids, topk_weight, num_experts, model_dim, dtype, block_size,
+                accumulate=accumulate, output_aux=output_aux, output=output,
+            )
+            # Bisect which of the sort's outputs the merged kernel still needs
+            # from the host: clobber one and see whether accuracy survives.
+            # Names follow the return order.
+            if os.environ.get("AITER_TP_MEGA_SORT_DEBUG", "0") == "1":
+                # A dedicated sink: ``reverse_sorted`` is only M*topk long,
+                # far short of ``sorted_ids``, and the padding rows past that
+                # are exactly what has to be inspected.
+                if getattr(self, "_sort_dbg_sink", None) is None or (
+                    self._sort_dbg_sink.numel() != ret[0].numel()
+                ):
+                    self._sort_dbg_sink = torch.full_like(ret[0], -2)
+                self._sort_dbg_ref = ret[0].clone()
+            which = os.environ.get("AITER_TP_MEGA_SORT_CLOBBER", "")
+            if which:
+                names = (
+                    "sorted_ids",
+                    "sorted_weights",
+                    "sorted_expert_ids",
+                    "num_valid",
+                    "moe_buf",
+                    "m_indices",
+                    "reverse_sorted",
+                )
+                idx = names.index(which)
+                ret[idx].fill_(-1)
+            return ret
+        topk = int(topk_ids.shape[1])
+        device = topk_ids.device
+        padded = int(topk_ids.numel() + num_experts * block_size - topk)
+        blocks = int((padded + block_size - 1) // block_size)
+        key = (padded, blocks, int(topk_ids.numel()))
+        buf = self._sort_bufs.get(key)
+        if buf is None:
+            i32 = dict(dtype=dtypes.i32, device=device)
+            buf = (
+                torch.empty(padded, **i32),
+                torch.empty(padded, dtype=dtypes.fp32, device=device),
+                torch.empty(blocks, **i32),
+                torch.zeros(2, **i32),
+                torch.empty(padded, **i32),
+                torch.empty(int(topk_ids.numel()), **i32),
+            )
+            self._sort_bufs[key] = buf
+        sorted_ids, sorted_weights, sorted_eids, num_valid, m_indices, rev = buf
+        moe_buf = (
+            output
+            if output is not None
+            else torch.empty(
+                (int(topk_ids.shape[0]), int(model_dim)), dtype=dtype, device=device
+            )
+        )
+        if accumulate:
+            # The atomic epilogue accumulates into this; ``moe_sorting`` is what
+            # normally zeroes it.
+            moe_buf.zero_()
+        ret = (sorted_ids, sorted_weights, sorted_eids, num_valid, moe_buf)
+        if output_aux:
+            return (*ret, m_indices, rev)
+        return ret
+
+    def _diff_sorted_ids(self) -> None:
+        """Print where the in-kernel sort's ``sorted_ids`` differs from the
+        reference sort's, once, from rank 0."""
+        ref = getattr(self, "_sort_dbg_ref", None)
+        got = getattr(self, "_sort_dbg_sink", None)
+        if ref is None or got is None or getattr(self, "_sort_diffed", False):
+            return
+        self._sort_diffed = True
+        if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+            return
+        n = min(ref.numel(), got.numel())
+        a, b = ref[:n], got[:n]
+        bad = (a != b).nonzero().flatten()
+        print(f"[SORTDIFF] n={n} mismatches={bad.numel()}", flush=True)
+        for i in bad[:12].tolist():
+            ra, rb = int(a[i]), int(b[i])
+            print(
+                f"  [{i:6d}] ref={ra:#010x} (slot={ra >> 24} tok={ra & 0xFFFFFF})"
+                f"  got={rb:#010x} (slot={rb >> 24} tok={rb & 0xFFFFFF})",
+                flush=True,
+            )
+
+    def _fused_stage12(
+        self,
+        plan,
+        local_tokens,
+        comm,
+        g2_cfg,
+        base_transform=None,
+        tk_ids=None,
+        tk_weights=None,
+    ):
         """Replace stage1+stage2 with one GEMM1+GEMM2+ReduceScatter kernel.
 
         ``stage1`` keeps its own identity and keywords -- ``fused_moe_2stages``
@@ -1376,6 +1624,12 @@ class MegaMoeTP:
                 topk=cfg.topk,
                 fuse_ag=mega_ag,
                 waves_per_eu=plan.waves_per_eu,
+                # Only read when the kernel runs the sort itself; see
+                # ``AITER_TP_MEGA_FUSE_SORT`` in ``stage12_rs``.
+                tk_ids=tk_ids,
+                tk_weights=tk_weights,
+                num_valid=num_valid_ids,
+                dbg=getattr(self, "_sort_dbg_sink", None),
             )
             return moe_out
 
@@ -1389,6 +1643,52 @@ class MegaMoeTP:
                 **base.stage1.keywords,
                 _gemm1_launch=capture_gemm1,
             )
+            if _FAST_SORT_HOST:
+                # No aux outputs -> `moe_sorting` takes its FlyDSL fast path.
+                # The kernel derives `m_indices` itself; `reverse_sorted` is
+                # only read by the non-atomic scatter path, which this kernel
+                # does not take.
+                return replace(
+                    base,
+                    stage1=stage1,
+                    stage2=stage2_partial,
+                    output_aux=False,
+                )
+            if os.environ.get("AITER_TP_MEGA_NO_AUX", "0") == "1":
+                # Probe: ask for no aux outputs, which is the only thing keeping
+                # `moe_sorting` off its fast FlyDSL path (see the dispatch
+                # condition in `fused_moe.moe_sorting`). WRONG RESULTS -- GEMM1
+                # then reads a stale `m_indices` -- but it prices the sorter
+                # swap before the real fix (derive m_indices in-kernel) is built.
+                return replace(
+                    base,
+                    stage1=stage1,
+                    stage2=stage2_partial,
+                    output_aux=False,
+                )
+            if os.environ.get("AITER_TP_MEGA_SORT_SKIP", "0") == "1":
+                # Probe: drop `moe_sorting` outright, keeping only the buffers
+                # and the zeroed output. WRONG RESULTS; it prices the sort in
+                # graph mode, where per-call events cannot be recorded.
+                return replace(
+                    base,
+                    stage1=stage1,
+                    stage2=stage2_partial,
+                    sorting=self._alloc_sorting,
+                )
+            if _kernel_sorts(
+                local_tokens * cfg.world_size, cfg.experts
+            ) or os.environ.get(
+                "AITER_TP_MEGA_SORT_PASSTHRU", "0"
+            ) == "1":
+                # The merged kernel sorts after its AllGather gate, so the host
+                # pass only has to hand back buffers and a zeroed output.
+                return replace(
+                    base,
+                    stage1=stage1,
+                    stage2=stage2_partial,
+                    sorting=self._alloc_sorting,
+                )
             return replace(base, stage1=stage1, stage2=stage2_partial)
 
         return transform, box
@@ -1470,6 +1770,8 @@ class MegaMoeTP:
                 self._collectives(plan.ag_wire),
                 parse_flydsl_v2_gemm2_kernel(plan.gemm2_kernel),
                 base_transform=transform,
+                tk_ids=topk_ids_all,
+                tk_weights=topk_weights_all,
             )
             partial = _fused_moe_impl(
                 a1,
@@ -1483,6 +1785,27 @@ class MegaMoeTP:
                 _metadata_transform=stage12_transform,
                 **kwargs,
             )
+            if os.environ.get("AITER_TP_MEGA_SORT_DEBUG", "0") == "1":
+                self._diff_sorted_ids()
+            if os.environ.get(
+                "AITER_TP_MEGA_COUNT", "0"
+            ) == "1" and not torch.cuda.is_current_stream_capturing():
+                # The readout is a device->host copy; doing it under capture
+                # fails the capture outright (and silently turns every graph
+                # number into NaN).
+                from aiter.ops.flydsl.kernels.mega_moe_tp.stage12_rs import (
+                    read_counts,
+                )
+
+                counts = read_counts(a1.device)
+                seen = getattr(self, "_count_seen", 0)
+                self._count_seen = seen + 1
+                if seen and int(os.environ.get("LOCAL_RANK", "0")) == 0:
+                    print(
+                        f"[COUNT] m_blocks={counts[0]} g1_tiles={counts[1]} "
+                        f"g2_tiles={counts[2]}",
+                        flush=True,
+                    )
             return partial, box[0]
 
         box = None
@@ -1623,6 +1946,8 @@ class MegaMoeTP:
         if not x_local.is_contiguous():
             x_local = x_local.contiguous()
         plan = self.plan(m * cfg.world_size)
+        if _TIME_STEPS and not torch.cuda.is_current_stream_capturing():
+            return self._forward_timed(x_local, topk_weights, topk_ids, plan, m)
         a1, a1_scale, wts, ids = self.all_gather(
             x_local, topk_weights, topk_ids, plan=plan
         )
@@ -1630,6 +1955,82 @@ class MegaMoeTP:
         if y_local is not None:
             return y_local
         return self.reduce_scatter(m, plan)
+
+    #: Per-step device timing for the fused path.
+    #:
+    #: This is *not* a skip-and-subtract probe. Every step still runs and the
+    #: result is correct; the events only read back where the device time went.
+    #: Subtraction was exhausted because composite skips interact -- removing
+    #: the AllGather also removes the cross-rank rendezvous, so the difference
+    #: prices two things at once (see ``opt_0921_v3.txt``).
+    #:
+    #: It cannot run under graph capture (events would be captured, not timed),
+    #: so it measures the eager path. That is still the right read for *where*
+    #: the time is: graph replay removes host dispatch, not device work.
+    #: Event pairs recorded around each ``moe_sorting`` call, so ``local_moe``
+    #: can be split into the sort and the merged kernel. The sort runs inside
+    #: ``aiter.fused_moe._fused_moe_impl``, not in this class, so bracketing it
+    #: means wrapping the callee -- done here rather than in ``fused_moe.py`` to
+    #: keep the probe out of a shared file.
+    _sort_events: "list" = []
+
+    @staticmethod
+    def _install_sort_probe():
+        from aiter import fused_moe as _fm
+
+        if getattr(_fm.moe_sorting, "_mega_timed", False):
+            return
+
+        original = _fm.moe_sorting
+
+        def timed(*args, **kwargs):
+            start = torch.cuda.Event(enable_timing=True)
+            stop = torch.cuda.Event(enable_timing=True)
+            start.record()
+            out = original(*args, **kwargs)
+            stop.record()
+            MegaMoeTP._sort_events.append((start, stop))
+            return out
+
+        timed._mega_timed = True
+        _fm.moe_sorting = timed
+
+    def _forward_timed(self, x_local, topk_weights, topk_ids, plan, m):
+        self._install_sort_probe()
+        MegaMoeTP._sort_events.clear()
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+        ev[0].record()
+        a1, a1_scale, wts, ids = self.all_gather(
+            x_local, topk_weights, topk_ids, plan=plan
+        )
+        ev[1].record()
+        _, y_local = self.local_moe(a1, a1_scale, wts, ids, plan=plan, local_tokens=m)
+        ev[2].record()
+        out = y_local if y_local is not None else self.reduce_scatter(m, plan)
+        ev[3].record()
+        torch.cuda.synchronize()
+        self._step_us = tuple(
+            ev[i].elapsed_time(ev[i + 1]) * 1e3 for i in range(3)
+        )
+        seen = getattr(self, "_step_seen", 0)
+        self._step_seen = seen + 1
+        # Skip the first call: it compiles and warms the arena.
+        if seen and int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            ag, moe, rs = self._step_us
+            sub = getattr(self, "_ag_sub_us", None)
+            detail = (
+                "" if sub is None else f" [route={sub[0]:7.1f} pub={sub[1]:7.1f}]"
+            )
+            sort = sum(
+                a.elapsed_time(b) * 1e3 for a, b in MegaMoeTP._sort_events
+            )
+            print(
+                f"[STEP] m={m} ag={ag:8.1f} local_moe={moe:8.1f} "
+                f"rs={rs:8.1f} total={ag + moe + rs:8.1f}{detail}"
+                f" sort={sort:8.1f} kern={moe - sort:8.1f}",
+                flush=True,
+            )
+        return out
 
     __call__ = forward
 
