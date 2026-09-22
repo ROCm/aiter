@@ -144,13 +144,13 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
     AiterAsmKernel* kernel = nullptr;
     if(final_output->dtype() == AITER_DTYPE_fp16)
     {
-        static AiterAsmKernel implementation("pa_p16_d128_reduce_ps_fp16",
+        static AiterAsmKernel implementation("_ZN5aiter26pa_p16_d128_reduce_ps_fp16E",
                                               "pa/pa_p16_d128_reduce_ps_fp16.co");
         kernel = &implementation;
     }
     else
     {
-        static AiterAsmKernel implementation("pa_p16_d128_reduce_ps_bf16",
+        static AiterAsmKernel implementation("_ZN5aiter26pa_p16_d128_reduce_ps_bf16E",
                                               "pa/pa_p16_d128_reduce_ps_bf16.co");
         kernel = &implementation;
     }

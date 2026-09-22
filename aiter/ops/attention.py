@@ -579,6 +579,16 @@ def pa_persistent_fwd(
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run persistent attention and merge only materialized partial outputs.
+
+    ``work_info[:, 1]`` is the partial index (``partial_indptr`` in the
+    scheduling diagram). A value of -1 writes directly to ``output`` and
+    contributes no entry to the reduction maps. Empty reduction maps skip
+    the reducer launch. With preallocated GPU maps, the reducer is launched
+    and exits on the device when the reduction map end is zero; no metadata
+    is read back to the host. Mixed batches still merge their partial rows.
+    Direct-output rows do not populate the returned final LSE.
+    """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
@@ -615,6 +625,9 @@ def pa_persistent_fwd(
         mask,
         quant_type=quant_type,
     )
+    if reduce_partial_map.numel() == 0 or reduce_indptr.numel() == 1:
+        return logits, final_lse
+
     reduce_fn = pa_reduce_v1
     if (
         K.shape[3] == 16
