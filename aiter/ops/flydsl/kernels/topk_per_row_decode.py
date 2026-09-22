@@ -12,7 +12,6 @@ from flydsl.expr import (
     Array,
     Float32,
     Int32,
-    arith,
     as_ir_value,
     const_expr,
     gpu,
@@ -23,6 +22,7 @@ from flydsl.expr import (
 )
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.candidate_topk_common import f32_to_ordered_i32
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
@@ -151,12 +151,7 @@ def _radix_pass(pass_idx: int) -> _RadixPass:
 
 
 def _f32_to_ord(val, *, nan_to_bottom: bool = False):
-    bits = val.bitcast(Int32)
-    ords = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
-    abs_bits = bits & fx.Int32(0x7FFFFFFF)
-    is_nan = arith.cmpi(arith.CmpIPredicate.ugt, abs_bits, fx.Int32(0x7F800000))
-    nan_key = fx.Int32(-(1 << 31) if nan_to_bottom else 0x7FFFFFFF)
-    return is_nan.select(nan_key, ords)
+    return f32_to_ordered_i32(val, nan_to_bottom=nan_to_bottom)
 
 
 def _row_length(row, row_ends, width, next_n):
@@ -262,6 +257,7 @@ def build_topk_per_row_decode_module(
     combine_histograms: bool = False,
     use_split_counts: bool = False,
     precomputed_first_pass: bool = False,
+    clear_outputs_before_gather: bool = False,
 ):
     """Build a multi-launch radix TopK with runtime row width and MTP geometry."""
     if wave_size not in (32, 64):
@@ -320,6 +316,7 @@ def build_topk_per_row_decode_module(
         ch=combine_histograms,
         sc=use_split_counts,
         pf=precomputed_first_pass,
+        cg=clear_outputs_before_gather,
     )
 
     # The histogram and reduce-select bodies are each instantiated once per
@@ -625,9 +622,10 @@ def build_topk_per_row_decode_module(
                     row_state[_STATE_REMAINING_K] = remaining_k - bin_elems_above
                 bin_elems_above = bin_elems_above + bin_count
 
-        # The skipped pass-0 path can have fewer than k live candidates. Clear
-        # reused outputs in the last per-row reduce so the following multi-CTA
-        # gather only has to overwrite admitted candidates.
+        # A fixed-width split bag can have fewer than k live candidates even
+        # though row_ends describes its full storage width. Clear reused
+        # outputs in the last per-row reduce so the following multi-CTA gather
+        # only has to overwrite admitted candidates.
         if const_expr(initialize_outputs):
             row_indices = fx.slice(output_indices, (row, None))
             row_values = fx.slice(output_values, (row, None))
@@ -1130,7 +1128,7 @@ def build_topk_per_row_decode_module(
                 fx.Int32(uint32_to_int32(rp.radix_mask << rp.shift)),
                 rp.num_bins,
                 fx.Int32(pass_idx == 0),
-                precomputed_first_pass and pass_idx == _NUM_RADIX_PASSES - 1,
+                clear_outputs_before_gather and pass_idx == _NUM_RADIX_PASSES - 1,
                 write_values,
             )
             reduce_select.launch(

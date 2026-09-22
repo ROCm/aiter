@@ -54,8 +54,8 @@ def make_streaming_topk_storage(
     return StreamingTopKStorage
 
 
-def f32_to_ordered_i32(value):
-    """Map float32 to signed-order int32, canonicalizing NaNs to the bottom."""
+def f32_to_ordered_i32(value, *, nan_to_bottom: bool = True):
+    """Map float32 to signed-order int32 with an explicit NaN convention."""
     bits = value.bitcast(fx.Int32)
     ordered = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
     abs_bits = bits & fx.Int32(0x7FFFFFFF)
@@ -64,7 +64,8 @@ def f32_to_ordered_i32(value):
         abs_bits,
         fx.Int32(0x7F800000),
     )
-    return arith.select(is_nan, fx.Int32(INT32_MIN), ordered)
+    nan_key = fx.Int32(INT32_MIN if nan_to_bottom else 0x7FFFFFFF)
+    return arith.select(is_nan, nan_key, ordered)
 
 
 def radix_pass_bits(pass_index):

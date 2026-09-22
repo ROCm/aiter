@@ -152,8 +152,8 @@ def run_torch(case):
             span = physical[begin : begin + _ORACLE_CHUNK]
             keys = flat_kv[span]
             dots = torch.sum(q[row].float()[:, None, :] * keys[None, :, :], dim=-1)
-            scaled = dots * flat_scales[span][None, :]
-            activated = torch.relu(scaled)
+            scales = torch.nan_to_num(flat_scales[span], nan=0.0).clamp_min(0)
+            activated = torch.relu(dots) * scales[None, :]
             row_out[begin : begin + span.numel()] = torch.sum(
                 case.weights[row, :, None] * activated, dim=0
             )
@@ -500,6 +500,21 @@ def test_preshuffled_page64_threshold_ties_and_nan_bottom():
         _assert_topk_values(finite, finite[got], k, msg=f"row={row} nan-to-bottom")
         assert not torch.isnan(nan_scores[row, 0]).any()
 
+    negative_case = _make_case(1, 256, 64, seed=50)
+    negative_case.scales.fill_(-1)
+    negative_scores, _, _ = flydsl_fp8_paged_mqa_local_topk(
+        negative_case.q,
+        _preshuffle_kv(negative_case.kv),
+        negative_case.scales,
+        negative_case.weights,
+        negative_case.lengths,
+        negative_case.block_tables,
+        k=k,
+        num_splits=1,
+        preshuffled=True,
+    )
+    assert torch.equal(negative_scores, torch.zeros_like(negative_scores))
+
 
 def test_auto_split_plan():
     length, k, cu_count = 1_048_576, 2048, 256
@@ -646,6 +661,103 @@ def test_caller_outputs_are_fully_overwritten_for_short_rows(length):
         _assert_compact_topk(case, scores, positions, k)
         out_scores.fill_(7.0)
         out_positions.fill_(123)
+
+
+def test_nonprecomputed_merge_fully_overwrites_short_rows():
+    _require_supported_gpu()
+    rows, splits, k, live = 1, 2, 128, 32
+    scores = torch.full(
+        (rows, splits, k), -float("inf"), dtype=torch.float32, device="cuda"
+    )
+    positions = torch.full((rows, splits, k), -1, dtype=torch.int32, device="cuda")
+    counts = torch.full((rows, splits), live, dtype=torch.int32, device="cuda")
+    for split in range(splits):
+        begin = split * live
+        scores[0, split, :live] = torch.arange(
+            begin, begin + live, dtype=torch.float32, device="cuda"
+        )
+        positions[0, split, :live] = torch.arange(
+            begin, begin + live, dtype=torch.int32, device="cuda"
+        )
+
+    out_scores = torch.full((rows, k), 7.0, dtype=torch.float32, device="cuda")
+    out_positions = torch.full((rows, k), 123, dtype=torch.int32, device="cuda")
+    selected_scores, selected_positions = split_topk_merge(
+        scores,
+        positions,
+        counts,
+        k=k,
+        out_scores=out_scores,
+        out_positions=out_positions,
+    )
+    assert selected_scores.data_ptr() == out_scores.data_ptr()
+    assert selected_positions.data_ptr() == out_positions.data_ptr()
+    assert set(selected_positions[0, : 2 * live].cpu().tolist()) == set(range(2 * live))
+    assert torch.all(selected_positions[0, 2 * live :] == -1)
+    assert torch.all(torch.isneginf(selected_scores[0, 2 * live :]))
+
+    merged_scores, merged_positions = merge_local_topk_candidates(
+        scores, positions, counts, k=k
+    )
+    assert set(merged_positions[0, : 2 * live].cpu().tolist()) == set(range(2 * live))
+    assert torch.all(merged_positions[0, 2 * live :] == -1)
+    assert torch.all(torch.isneginf(merged_scores[0, 2 * live :]))
+
+
+def test_split_topk_merge_validates_caller_outputs():
+    _require_supported_gpu()
+    rows, splits, k = 2, 2, 128
+    scores = torch.zeros((rows, splits, k), dtype=torch.float32, device="cuda")
+    positions = torch.zeros((rows, splits, k), dtype=torch.int32, device="cuda")
+    counts = torch.full((rows, splits), k, dtype=torch.int32, device="cuda")
+
+    invalid_outputs = (
+        {"out_scores": torch.empty((rows, k - 1), device="cuda")},
+        {"out_positions": torch.empty((rows, k), dtype=torch.int64, device="cuda")},
+        {"out_scores": torch.empty((k, rows), device="cuda").t()},
+        {"out_positions": torch.empty((rows, k), dtype=torch.int32)},
+    )
+    for outputs in invalid_outputs:
+        with pytest.raises(ValueError):
+            split_topk_merge(scores, positions, counts, k=k, **outputs)
+
+
+def test_packed_input_contract_guards():
+    _require_supported_gpu()
+    case = _make_case(1, 128, 64, seed=83)
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    args = (
+        case.q,
+        packed,
+        case.scales,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+    )
+    with pytest.raises(ValueError, match="k_scales must be None"):
+        flydsl_fp8_paged_mqa_local_topk(*args, k=128, preshuffled=True)
+    with pytest.raises(ValueError, match="requires preshuffled=True"):
+        flydsl_fp8_paged_mqa_local_topk(
+            case.q,
+            packed,
+            None,
+            case.weights,
+            case.lengths,
+            case.block_tables,
+            k=128,
+            preshuffled=False,
+        )
+    with pytest.raises(ValueError, match="requires preshuffled=True"):
+        flydsl_fp8_paged_mqa_topk(
+            case.q,
+            packed,
+            None,
+            case.weights,
+            case.lengths,
+            case.block_tables,
+            k=128,
+            preshuffled=False,
+        )
 
 
 def test_k2048_reservoir_and_existing_stage_b():

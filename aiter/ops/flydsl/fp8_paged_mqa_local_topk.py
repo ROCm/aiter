@@ -16,6 +16,7 @@ from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
     launch_fp8_paged_mqa_local_topk,
 )
 from .split_topk_merge import (
+    _require_merge_outputs,
     _require_merge_workspace,
     split_topk_merge,
     split_topk_merge_workspace,
@@ -153,6 +154,8 @@ def _prepare_stage_a(
     packed_shape = _packed_page_shape(kv_cache)
     if packed_shape is None:
         _require_cuda_contiguous("k_scales", k_scales)
+    elif k_scales is not None:
+        raise ValueError("k_scales must be None when kv_cache contains packed scales")
 
     device = q_fp8.device
     kv_cache, k_scales, packed, num_pages, page_size = _normalize_kv_inputs(
@@ -182,6 +185,8 @@ def _prepare_stage_a(
         )
     if not isinstance(preshuffled, bool):
         raise TypeError(f"preshuffled must be bool, got {type(preshuffled).__name__}")
+    if packed and not preshuffled:
+        raise ValueError("packed kv_cache requires preshuffled=True")
 
     rows = q_fp8.shape[0]
     if weights.shape != (rows, 32) or weights.dtype != torch.float32:
@@ -286,6 +291,7 @@ def flydsl_fp8_paged_mqa_local_topk(
     larger than ``block_tables.shape[1] * page_size`` are clamped to that table
     span. Block-table entries outside ``[0, num_pages)`` are not scored (they
     contribute ``-inf``); the kernel will not index the KV cache with those ids.
+    Negative or NaN ``k_scales`` contribute zero.
 
     If ``workspace`` is set and ``num_splits > 1``, Stage A fills that pair's
     pass-0 histogram for ``split_topk_merge(..., precomputed_first_pass=True)``.
@@ -347,13 +353,15 @@ def flydsl_fp8_paged_mqa_topk(
     *,
     k=2048,
     num_splits=None,
+    preshuffled=True,
     workspace=None,
     out_scores=None,
     out_positions=None,
 ):
     """Compute exact TopK through compact split-local candidate bags.
 
-    Packed pages may pass ``k_scales=None``. Lengths and block-table ids follow
+    Packed pages require ``k_scales=None``. This compact specialization requires
+    ``preshuffled=True``. Lengths and block-table ids follow
     the same safety contract as ``flydsl_fp8_paged_mqa_local_topk``.
 
     Serving / CUDA-graph caller
@@ -391,6 +399,8 @@ def flydsl_fp8_paged_mqa_topk(
 
     ``num_splits == 1`` has no merge and rejects ``workspace``.
     """
+    if preshuffled is not True:
+        raise ValueError("flydsl_fp8_paged_mqa_topk requires preshuffled=True")
     launch = _prepare_stage_a(
         q_fp8,
         kv_cache,
@@ -400,8 +410,15 @@ def flydsl_fp8_paged_mqa_topk(
         block_tables,
         k=k,
         num_splits=num_splits,
-        preshuffled=True,
+        preshuffled=preshuffled,
         require_page64=True,
+    )
+    out_scores, out_positions = _require_merge_outputs(
+        out_scores,
+        out_positions,
+        rows=launch.rows,
+        k=launch.k,
+        device=launch.q_fp8.device,
     )
     merge_ws = _merge_workspace(
         workspace,
@@ -423,7 +440,7 @@ def flydsl_fp8_paged_mqa_topk(
             launch.candidate_counts,
             topk=launch.k,
             num_splits=launch.num_splits,
-            preshuffled=True,
+            preshuffled=preshuffled,
             arch=launch.arch,
             stream=launch.stream,
             packed=launch.packed,

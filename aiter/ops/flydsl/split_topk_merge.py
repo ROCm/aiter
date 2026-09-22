@@ -75,6 +75,7 @@ def _build_split_topk_merge(k: int, splits: int, precomputed_first_pass: bool):
         combine_histograms=True,
         use_split_counts=True,
         precomputed_first_pass=precomputed_first_pass,
+        clear_outputs_before_gather=True,
     )
 
 
@@ -127,6 +128,33 @@ def _require_merge_workspace(
                 f"{name} must have shape {expected}, got {tuple(tensor.shape)}"
             )
     return histogram, state
+
+
+def _require_merge_outputs(
+    out_scores: torch.Tensor | None,
+    out_positions: torch.Tensor | None,
+    *,
+    rows: int,
+    k: int,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    for name, tensor, dtype in (
+        ("out_scores", out_scores, torch.float32),
+        ("out_positions", out_positions, torch.int32),
+    ):
+        if tensor is None:
+            continue
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+        if tensor.dtype != dtype or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous {dtype}")
+        if tensor.shape != (rows, k):
+            raise ValueError(
+                f"{name} must have shape {(rows, k)}, got {tuple(tensor.shape)}"
+            )
+    return out_scores, out_positions
 
 
 def _row_ends(device: torch.device, rows: int, width: int) -> torch.Tensor:
@@ -191,6 +219,13 @@ def split_topk_merge(
         raise ValueError("candidate_counts must be contiguous")
 
     device = candidate_scores.device
+    out_scores, out_positions = _require_merge_outputs(
+        out_scores,
+        out_positions,
+        rows=rows,
+        k=k,
+        device=device,
+    )
     width = splits * k
     scores = candidate_scores.view(rows, width)
     positions = candidate_positions.view(rows, width)
