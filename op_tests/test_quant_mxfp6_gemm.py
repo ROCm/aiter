@@ -14,9 +14,21 @@ pytestmark = pytest.mark.skipif(
 
 
 def _pack_out(x: torch.Tensor, backend: str) -> tuple[torch.Tensor, torch.Tensor]:
-    packed_size, scale_size = mxfp6.mxfp6_gemm_pack_size(*x.shape)
+    rows, K = x.shape
+    _, padK, packed_size, scale_size = mxfp6._mxfp6_gemm_pack_layout(rows, K)
     packed = torch.full((packed_size,), 0xA5, dtype=torch.uint8, device=x.device)
     packed_scale = torch.full((scale_size,), 0x5A, dtype=torch.uint8, device=x.device)
+    if backend == "triton":
+        mxfp6._launch_quant_mxfp6_gemm_triton(
+            x,
+            packed,
+            packed_scale,
+            rows,
+            K,
+            padK,
+            mxfp6._is_gfx950_device(x.device),
+        )
+        return packed, packed_scale
     previous_backend = mxfp6._QUANT_BACKEND
     try:
         mxfp6._QUANT_BACKEND = backend
@@ -51,6 +63,31 @@ def test_quant_mxfp6_gemm_rejects_oversized_shape_before_allocation():
     huge_view = torch.empty(1, dtype=torch.bfloat16).expand(65536, 65536)
     with pytest.raises(ValueError, match="2 GiB"):
         mxfp6.quant_mxfp6_gemm(huge_view)
+
+
+def test_cpu_out_accepts_misaligned_contiguous_buffers():
+    x = torch.randn((1, 32), dtype=torch.bfloat16, device="cpu")
+    expected_packed, expected_scale = mxfp6.quant_mxfp6_gemm(x)
+    packed_storage = torch.empty(
+        expected_packed.numel() + 1, dtype=torch.uint8, device="cpu"
+    )
+    scale_storage = torch.empty(
+        expected_scale.numel() + 1, dtype=torch.uint8, device="cpu"
+    )
+    packed = packed_storage[1:]
+    packed_scale = scale_storage[1:]
+    assert packed.data_ptr() % 16 != 0
+    assert packed_scale.data_ptr() % 16 != 0
+
+    actual_packed, actual_scale = mxfp6.quant_mxfp6_gemm_out(x, packed, packed_scale)
+
+    assert torch.equal(actual_packed, expected_packed)
+    assert torch.equal(actual_scale, expected_scale)
+
+
+def test_explicit_triton_backend_is_rejected():
+    with pytest.raises(ValueError, match="not a safe public backend"):
+        mxfp6._normalize_quant_backend("triton")
 
 
 def test_torch_pack_helpers_validate_physical_layout():
@@ -186,10 +223,7 @@ def test_hip_packer_avoids_hadamard_intermediate_overflow(
 
     # The DC coefficient of an all-max block exceeds fp32/MXFP6 range. It must
     # saturate positively without inf-inf cancellation creating spurious signs.
-    # The explicit Triton override retains its documented legacy input limit;
-    # default gfx950 dispatch uses this full-range HIP path.
     extreme = torch.full((1, 32), max_bf16, dtype=torch.bfloat16, device="cuda")
-    assert max_bf16 > mxfp6._TRITON_MAX_SAFE_INPUT_AMAX
     packed, scale = _pack_out(extreme, "hip")
     codes = _unpack_first_block(packed)
     assert int(scale[0]) == 254
@@ -210,7 +244,6 @@ def test_hip_packer_preserves_low_e8m0_scales(
     x = torch.zeros((1, 32), dtype=torch.bfloat16, device="cuda")
     x[0, 0] = 2.0**exponent
     monkeypatch.setattr(mxfp6, "_QUANT_BACKEND", "hip")
-    assert exponent + 122 < mxfp6._TRITON_MIN_E8M0_SCALE_BYTE
     packed, scale = _pack_out(x, "hip")
     assert torch.all(_unpack_first_block(packed) == 27)
     assert int(scale[0]) == exponent + 122
@@ -244,11 +277,9 @@ def test_hip_packer_handles_misaligned_contiguous_input(
 
 
 @pytest.mark.parametrize("target", ["packed", "scale"])
-@pytest.mark.parametrize("backend", ["hip", "triton"])
 def test_packer_rejects_misaligned_output(
     monkeypatch: pytest.MonkeyPatch,
     target: str,
-    backend: str,
 ):
     rows, cols = 17, 128
     x = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda")
@@ -262,7 +293,7 @@ def test_packer_rejects_misaligned_output(
         storage = torch.empty(scale_size + 1, dtype=torch.uint8, device="cuda")
         packed_scale = storage[1:]
 
-    monkeypatch.setattr(mxfp6, "_QUANT_BACKEND", backend)
+    monkeypatch.setattr(mxfp6, "_QUANT_BACKEND", "hip")
     with pytest.raises(ValueError, match="16-byte-aligned"):
         mxfp6.quant_mxfp6_gemm_out(x, packed, packed_scale)
 
@@ -295,6 +326,42 @@ def test_backend_architecture_check_is_device_specific(
         assert not mxfp6._is_gfx950_device(torch.device("cuda:1"))
     finally:
         mxfp6._is_gfx950_device_index.cache_clear()
+
+
+def test_auto_unsupported_dtype_uses_safe_torch_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    x = torch.randn((1, 32), dtype=torch.float32, device="cuda")
+    monkeypatch.setattr(mxfp6, "_QUANT_BACKEND", "auto")
+    monkeypatch.setattr(
+        mxfp6,
+        "_launch_quant_mxfp6_gemm_triton",
+        lambda *_args, **_kwargs: pytest.fail("public auto dispatch used Triton"),
+    )
+
+    actual_packed, actual_scale = mxfp6.quant_mxfp6_gemm(x)
+    codes, scales = mxfp6.quant_mxfp6_torch(torch.nn.functional.pad(x, (0, 96, 0, 255)))
+    expected_packed = mxfp6.pack_big_torch(codes)
+    expected_scale = mxfp6.pack_scale_torch(scales, 256)
+
+    assert torch.equal(actual_packed, expected_packed)
+    assert torch.equal(actual_scale, expected_scale)
+
+
+@torch.no_grad()
+def test_a6w6_compiles_fullgraph_without_explicit_kernel():
+    compiled = torch.compile(mxfp6.gemm_a6w6, dynamic=True, fullgraph=True)
+    for M, N, K in ((257, 513, 129), (512, 5120, 5120)):
+        x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+        w = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
+        x_packed, x_scale = mxfp6.quant_mxfp6_gemm(x)
+        w_packed, w_scale = mxfp6.quant_mxfp6_gemm(w)
+        args = (x_packed, w_packed, x_scale, w_scale, M, N, K)
+
+        eager = mxfp6.gemm_a6w6(*args)
+        actual = compiled(*args)
+
+        assert torch.equal(actual, eager)
 
 
 if __name__ == "__main__":
