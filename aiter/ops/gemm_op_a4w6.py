@@ -42,6 +42,8 @@ def _default_gemm_a4w6_kernel(M: int, N: int, K: int) -> str:
         return _MFMA32_SMALL_KERNEL
     if K > N and (padK > _GROUPED_SWIZZLE_MAX_K or grouped_grid_in_bounds):
         return _MFMA32_LONG_K_KERNEL
+    # The MI355X sweep selected natural order for the representative N == K
+    # A4W6 shapes; A6W4 intentionally uses grouped order for equality.
     if N > K and padK <= _GROUPED_SWIZZLE_MAX_K and grouped_grid_in_bounds:
         return _MFMA32_GROUPED_KERNEL
     return _MFMA32_SWZ0_KERNEL

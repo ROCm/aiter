@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
+
+import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
 
+import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.gemm_op_a6w4 import (
     _select_gemm_a6w4_kernel,
@@ -22,6 +27,7 @@ from aiter.ops.gemm_op_a6w6 import (
     quant_mxfp6_torch,
 )
 from aiter.ops.quant import per_1x32_f4_quant
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import dtypes, fp4_utils
 from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE
 
@@ -64,6 +70,93 @@ def _quantized_reference(
     w_scale_f32 = fp4_utils.e8m0_to_f32(w_scales.view(torch.uint8))
     w_dequant *= w_scale_f32.repeat_interleave(32, dim=1)
     return x_dequant @ w_dequant.T
+
+
+@benchmark()
+def test_gemm_a6w4_benchmark(dtype, batch, M, N, K, round_mode):
+    if dtype != dtypes.bf16:
+        raise ValueError(f"gemm_a6w4 only supports bf16, got {dtype}")
+    if batch != 1:
+        raise ValueError(f"gemm_a6w4 is unbatched, got batch={batch}")
+
+    torch.manual_seed(M + N + K)
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    # The torch oracle matches the quantized operands and is intentionally untimed.
+    quantized_ref = _quantized_reference(x, w, round_mode)
+
+    # Both operands are prepared once for the GEMM-only candidate. The dynamic
+    # candidate re-packs only the activation inside its timed zero-argument call.
+    x_packed, x_scales = quant_mxfp6_gemm(x)
+    w_packed, w_scales = quant_mxfp4_gemm(w, round_mode=round_mode)
+
+    def run_gemm():
+        return gemm_a6w4(
+            x_packed,
+            w_packed,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            dtype=dtype,
+        )
+
+    def run_quant_gemm():
+        dynamic_x_packed, dynamic_x_scales = quant_mxfp6_gemm(x)
+        return gemm_a6w4(
+            dynamic_x_packed,
+            w_packed,
+            dynamic_x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            dtype=dtype,
+        )
+
+    candidates = {
+        "gemm": run_gemm,
+        "quant_gemm": run_quant_gemm,
+    }
+
+    flops = 2 * M * N * K
+    # GEMM reads both packed operands and their e8m0 scales, then writes the
+    # physical padded bf16 result. Dynamic quantization additionally reads x
+    # and writes the packed activation and scales that GEMM subsequently reads.
+    output_nbytes = _ceil(M, 256) * _ceil(N, 256) * dtype.itemsize
+    gemm_nbytes = (
+        x_packed.nbytes
+        + x_scales.nbytes
+        + w_packed.nbytes
+        + w_scales.nbytes
+        + output_nbytes
+    )
+    candidate_nbytes = {
+        "gemm": gemm_nbytes,
+        "quant_gemm": (gemm_nbytes + x.nbytes + x_packed.nbytes + x_scales.nbytes),
+    }
+
+    ret = {"gfx": get_gfx_runtime()}
+    for name, candidate in candidates.items():
+        out, us = run_perftest(candidate)
+        err = checkAllclose(
+            quantized_ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"{name}: gemm_a6w4",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = candidate_nbytes[name] / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+# Script-only benchmark entry point; the regression tests below own pytest coverage.
+test_gemm_a6w4_benchmark.__test__ = False
 
 
 @pytest.mark.parametrize(
@@ -194,6 +287,8 @@ def test_a6w4_long_k_path_matches_swizzle0_bitwise():
 
 def test_a6w4_dispatch_respects_grouped_kernel_bounds():
     assert _select_gemm_a6w4_kernel(512, 5120, 5120, None) == MFMA32_SMALL_KERNEL
+    # Equality is intentionally format-specific: A6W4's tuned square default
+    # is grouped, while A4W6's is natural order.
     assert _select_gemm_a6w4_kernel(9450, 5120, 5120, None) == MFMA32_GROUPED_KERNEL
     assert _select_gemm_a6w4_kernel(9450, 13824, 5120, None) == MFMA32_GROUPED_KERNEL
     assert _select_gemm_a6w4_kernel(9450, 5120, 13824, None) == MFMA32_LONG_K_KERNEL
@@ -282,5 +377,91 @@ def test_mixed_pack_sizes_reject_invalid_or_oversized_shapes(pack_size):
         pack_size(65536, 65536)
 
 
+def main() -> int:
+    pytest_result = pytest.main([__file__, "-q"])
+    if pytest_result != pytest.ExitCode.OK:
+        return int(pytest_result)
+
+    try:
+        gfx = get_gfx_runtime() if torch.cuda.is_available() else "unavailable"
+    except (AssertionError, IndexError, KeyError, RuntimeError):
+        gfx = "unavailable"
+    if gfx != "gfx950":
+        aiter.logger.warning(
+            "gemm_a6w4 benchmark requires gfx950; skipping sweep on %s", gfx
+        )
+        return 0
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        choices=[dtypes.bf16],
+        default=[dtypes.bf16],
+        metavar="{bf16}",
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        choices=[1],
+        default=[1],
+        help="""Batch size (gemm_a6w4 is unbatched).
+        e.g.: -b 1""",
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (512, 5120, 5120),
+            (9450, 5120, 5120),
+            (9450, 13824, 5120),
+            (9450, 5120, 13824),
+        ],
+        help="""Shape of mnk.
+        e.g.: -s 512,5120,5120""",
+    )
+    parser.add_argument(
+        "--round-mode",
+        type=int,
+        nargs="*",
+        choices=range(4),
+        default=[MX_DEFAULT_ROUND_MODE],
+        help="""MXFP4 weight quantization round mode.
+        e.g.: --round-mode 1""",
+    )
+    args = parser.parse_args()
+
+    invalid_shapes = [
+        shape for shape in args.mnk if not isinstance(shape, tuple) or len(shape) != 3
+    ]
+    if invalid_shapes:
+        parser.error(f"--mnk expects M,N,K triples, got {invalid_shapes}")
+
+    rows = []
+    for dtype, batch, (M, N, K), round_mode in itertools.product(
+        args.dtype,
+        args.batch,
+        args.mnk,
+        args.round_mode,
+    ):
+        rows.append(test_gemm_a6w4_benchmark(dtype, batch, M, N, K, round_mode))
+    frame = pd.DataFrame(rows)
+    aiter.logger.info(
+        "gemm_a6w4 summary (markdown):\n%s", frame.to_markdown(index=False)
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    raise SystemExit(main())

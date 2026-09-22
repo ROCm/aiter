@@ -49,6 +49,9 @@ _GROUPED_SWIZZLE_MAX_N = 16384
 _GROUPED_SWIZZLE_MAX_K = 6144
 
 
+# ``develop=True`` does not bypass the persistent JIT cache. It enables the
+# torch-free aiter_tensor_t conversion and current-HIP-stream handoff required
+# by module_quant, matching the existing MXFP6 binding.
 @compile_ops("module_quant", fc_name="quant_mxfp4_gemm_hip_out", develop=True)
 def quant_mxfp4_gemm_hip_out(
     input: Tensor,
@@ -110,6 +113,8 @@ def _default_gemm_a6w4_kernel(M: int, N: int, K: int) -> str:
         return _MFMA32_SMALL_KERNEL
     if K > N and (padK > _GROUPED_SWIZZLE_MAX_K or grouped_grid_in_bounds):
         return _MFMA32_LONG_K_KERNEL
+    # The MI355X sweep selected grouped order for the representative N == K
+    # A6W4 shapes; A4W6 intentionally keeps natural order for equality.
     if padK <= _GROUPED_SWIZZLE_MAX_K and grouped_grid_in_bounds:
         return _MFMA32_GROUPED_KERNEL
     return _MFMA32_SWZ0_KERNEL

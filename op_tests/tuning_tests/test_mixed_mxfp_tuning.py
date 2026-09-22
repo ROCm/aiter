@@ -423,8 +423,8 @@ class TestMixedMxfpTunerState(unittest.TestCase):
                 tuner = GemmMixedMxfpTuner(family, f"test_{family}")
                 defaults = tuner.get_arg_defaults()
                 with (
+                    mock.patch.dict(os.environ, {"CU_NUM": "80"}),
                     mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
-                    mock.patch.object(tuner, "get_cu_num", return_value=256),
                     mock.patch.object(
                         torch.cuda,
                         "current_device",
@@ -439,6 +439,7 @@ class TestMixedMxfpTunerState(unittest.TestCase):
                         )
                     )
                 self.assertEqual(len(tuner.untunedf), 57)
+                self.assertEqual(set(tuner.untunedf["cu_num"]), {80})
 
     def test_restore_config_env_clears_runtime_caches(self):
         for family, module in FAMILIES:

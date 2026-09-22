@@ -480,6 +480,11 @@ class GemmMixedMxfpTuner(GemmCommonTuner):
         op, *_unused = _get_ops(self.family)
         getattr(op, f"clear_gemm_{self.family}_config_cache")()
 
+    def get_cu_num(self):
+        """Use the same CU_NUM override as mixed-MXFP runtime dispatch."""
+        cu_override = int((os.getenv("CU_NUM") or "0").strip())
+        return cu_override if cu_override != 0 else super().get_cu_num()
+
     def _restore_config_env(self, env_name, old_val, old_rebuild=0):
         super()._restore_config_env(env_name, old_val, old_rebuild)
         from aiter.jit import core as jit_core

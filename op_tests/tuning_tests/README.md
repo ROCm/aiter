@@ -15,6 +15,17 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
 
+## CI coverage
+
+Fast deterministic tuning validation is part of the normal pull-request test
+sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
+validation, shape-collision checks, and the mixed-MXFP tuner unit tests.
+
+The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
+schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
+scheduled/manual because they require gfx950 and have substantially longer
+runtime budgets.
+
 ## Tuner family coverage
 
 | Family | Tuner script | Tuned CSVs validated | run_config | pipeline |
