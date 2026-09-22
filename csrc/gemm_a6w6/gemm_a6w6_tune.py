@@ -23,6 +23,7 @@ PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
 _MANIFEST_NAME = "f6gemm_bf16_per1x32Fp6.csv"
 _MANIFEST_COLUMNS = frozenset(
     {
+        "id",
         "tile_M",
         "tile_N",
         "block_size",
@@ -31,14 +32,14 @@ _MANIFEST_COLUMNS = frozenset(
         "swizzle_max_M",
         "swizzle_max_N",
         "swizzle_max_K",
-        "knl_name",
-        "co_name",
+        "kernel",
+        "object",
     }
 )
 
 
 class F6GemmCandidate(TypedDict):
-    kernel_id: int
+    id: int
     kernel_name: str
     tile_m: int
     tile_n: int
@@ -65,21 +66,27 @@ def _manifest_path() -> str:
 
 def load_f6gemm_candidates() -> list[F6GemmCandidate]:
     manifest = _manifest_path()
-    configs = pd.read_csv(manifest)
+    configs = pd.read_csv(manifest, skipinitialspace=True)
+    configs.columns = configs.columns.str.strip()
     missing = _MANIFEST_COLUMNS - set(configs.columns)
     if missing:
         raise ValueError(f"{manifest} is missing columns: {sorted(missing)}")
 
     candidates: list[F6GemmCandidate] = []
     seen_names: set[str] = set()
-    for kernel_id, row in configs.iterrows():
-        kernel_name = str(row["knl_name"]).strip()
-        co_name = str(row["co_name"]).strip()
+    seen_ids: set[int] = set()
+    for _, row in configs.iterrows():
+        kernel_id = int(row["id"])
+        kernel_name = str(row["kernel"]).strip()
+        co_name = str(row["object"]).strip()
         if not kernel_name or kernel_name in seen_names:
             raise ValueError(f"invalid or duplicate A6W6 kernel name: {kernel_name!r}")
         if not co_name:
             raise ValueError(f"{kernel_name} has an empty code-object name")
+        if kernel_id < 0 or kernel_id in seen_ids:
+            raise ValueError(f"invalid or duplicate A6W6 kernel ID: {kernel_id}")
         seen_names.add(kernel_name)
+        seen_ids.add(kernel_id)
         if int(row["splitK"]) != 0:
             raise ValueError(f"{kernel_name} advertises unsupported split-K")
         if str(row["pack_layout"]).strip() != PACK_LAYOUT:
@@ -102,7 +109,7 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
             raise ValueError(f"{kernel_name} has invalid swizzle bounds")
         candidates.append(
             {
-                "kernel_id": int(kernel_id),
+                "id": int(kernel_id),
                 "kernel_name": kernel_name,
                 "tile_m": tile_m,
                 "tile_n": tile_n,
@@ -113,6 +120,9 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
         )
     if not candidates:
         raise RuntimeError(f"no compatible A6W6 candidates in {manifest}")
+    if seen_ids != set(range(len(seen_ids))):
+        raise ValueError("A6W6 kernel IDs must be contiguous starting at zero")
+    candidates.sort(key=lambda candidate: candidate["id"])
     return candidates
 
 
@@ -336,7 +346,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
         _disable_core_dumps()
         self.candidates = load_f6gemm_candidates()
         self.candidates_by_id = {
-            candidate["kernel_id"]: candidate for candidate in self.candidates
+            candidate["id"]: candidate for candidate in self.candidates
         }
         super().__init__(*args, **kwargs)
 
@@ -447,7 +457,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
                 )
 
             selected = candidates_by_name[selected_kernel]
-            guarded.at[index, "kernelId"] = selected["kernel_id"]
+            guarded.at[index, "kernelId"] = selected["id"]
             guarded.at[index, "kernelName"] = selected_kernel
             guarded.at[index, "splitK"] = 0
             if validation is not None:
@@ -471,7 +481,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
                             N,
                             K,
                         ),
-                        selected["kernel_id"],
+                        selected["id"],
                         0,
                         selected_kernel,
                     ),
@@ -582,7 +592,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
             if not compatible_candidates:
                 raise RuntimeError(f"no safe A6W6 candidate for {(M, N, K)}")
             for candidate in compatible_candidates:
-                kernel_id = candidate["kernel_id"]
+                kernel_id = candidate["id"]
                 kernel_name = candidate["kernel_name"]
                 info = ((gfx, cu_num, M, N, K), kernel_id, 0, kernel_name)
                 tasks.append(

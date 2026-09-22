@@ -72,7 +72,22 @@ def read_csv_strip_comments(path: str, **kwargs):
     """Read a CSV file with comment preprocessing."""
     with open(path, encoding="utf-8-sig") as f:
         raw = f.read()
-    return pd.read_csv(StringIO(_strip_csv_comments(raw)), **kwargs)
+    frame = pd.read_csv(
+        StringIO(_strip_csv_comments(raw)), skipinitialspace=True, **kwargs
+    )
+    frame.columns = frame.columns.str.strip()
+    aliases = {"kernel": "knl_name", "object": "co_name"}
+    conflicts = [
+        alias
+        for alias, canonical in aliases.items()
+        if alias in frame.columns and canonical in frame.columns
+    ]
+    if conflicts:
+        raise ValueError(f"conflicting assembly CSV aliases in {path}: {conflicts}")
+    frame = frame.rename(columns=aliases)
+    for column in frame.select_dtypes(include="object"):
+        frame[column] = frame[column].str.strip()
+    return frame
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
