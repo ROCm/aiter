@@ -148,9 +148,6 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
 
 @gluon.jit
 def _max_nan(a, b):
-    # The reduction _block_scores_kernel uses. Also the cheaper one on gfx950:
-    # v_maximum3_f32 propagates NaN in one instruction, where the non-
-    # propagating max needs a canonicalising v_max_f32 x,x,x per operand first.
     return gl.maximum(a, b, propagate_nan=_NAN_ALL)
 
 
@@ -161,9 +158,6 @@ def _relu(x, RELU_ADD: gl.constexpr):
     # registers, just a faster (VALU overlap). Needs to be paired with the
     # scalar FMA fold to stop the v_add getting packed: v_pk_add_f32 has no abs
     # modifier.
-    #
-    # Differs from max(x, 0) only at x = -inf and |x| > 2**127; the launcher
-    # docstring states the contract.
     if RELU_ADD:
         return x + gl.abs(x)
     return gl.maximum(x, 0, propagate_nan=_NAN_ALL)
@@ -279,11 +273,10 @@ class Config:
         self.HEAD_BYTES = gl.constexpr(HEAD_SIZE // 2)
         self.NUM_SCALES = gl.constexpr(HEAD_SIZE // SCALE_GROUP.value)
         self.PAGE_SIZE = gl.constexpr(PAGE_SIZE)
+        assert PAGE_SIZE & (PAGE_SIZE - 1) == 0, "page_size must be a power of two"
         # Split the position with a mask and a shift. `%` and `//` are signed,
         # and a signed divide by a power of two carries a sign correction the
-        # value can never need -- free where the tile is the page and the whole
-        # expression folds, 5-10 SALU a loop where it is not.
-        assert PAGE_SIZE & (PAGE_SIZE - 1) == 0, "page_size must be a power of two"
+        # value can never need, cheaper SALU
         self.PAGE_MASK = gl.constexpr(PAGE_SIZE - 1)
         self.PAGE_SHIFT = gl.constexpr((PAGE_SIZE - 1).bit_length())
         self.BLOCK_KV = gl.constexpr(BLOCK_KV)
@@ -306,7 +299,7 @@ class Config:
         self.SCALE_MODE = gl.constexpr(SCALE_MODE)
         self.USE_BUFFER_LOAD = gl.constexpr(USE_BUFFER_LOAD)
         self.RELAXED_STORE = gl.constexpr(RELAXED_STORE)
-        # Walk a host-resolved candidate list in GATHER_BLOCK-token units
+        # Walk a candidate list in GATHER_BLOCK-token units
         # instead of BLOCK_KV contiguous positions. GATHER_PIPE reads that list
         # an iteration early, the way PAGE_PIPE reads the block table.
         self.GATHER = gl.constexpr(GATHER)
@@ -348,16 +341,12 @@ class Config:
         self.kv_scale_layout = gl.constexpr(gl.amd.cdna4.get_mfma_scale_layout(
             self.dot_b.value, [BLOCK_KV, HEAD_SIZE // SCALE_GROUP.value]))
 
-        # Only the unshuffled path stages through LDS, but the layouts are cheap
-        # to build and keeping them unconditional avoids a constexpr branch in
-        # the aggregate.
+        # Only the unshuffled path stages through LDS
         blocked, shared = _staging_layouts(HEAD_SIZE // 2, BLOCK_KV, NUM_WARPS,
                                            WARP_SIZE.value)
         self.blocked_kv = gl.constexpr(blocked)
         self.shared_kv = gl.constexpr(shared)
 
-
-# Q
 
 
 @gluon.jit
@@ -368,10 +357,7 @@ def _load_q_chunk(cfg, q_ptr, qs_ptr, w_ptr, HEAD_OFFSET: gl.constexpr,
     hs = gl.arange(0, ROWS, layout=gl.SliceLayout(1, cfg.q_scale_layout))[:, None]
     ss = gl.arange(0, cfg.NUM_SCALES,
                    layout=gl.SliceLayout(0, cfg.q_scale_layout))[None, :]
-    # Q is token major and converted here. It is loaded once per row block
-    # rather than once per tile, so the convert amortizes over the whole walk --
-    # preshuffling Q measured within noise on every shape, which is why only the
-    # cache has a shuffled layout.
+    # Q is token major and converted here
     lay: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],
         threads_per_warp=[WARP_SIZE // (cfg.HEAD_BYTES // 16),
@@ -414,16 +400,12 @@ def _load_q_row(cfg, q_ptr, qs_ptr, w_ptr):
         return _load_q_chunk(cfg, q_ptr, qs_ptr, w_ptr, 0, cfg.NUM_HEADS)
 
 
-# paged addressing, shared by both loaders
-
-
 @aggregate
 @strip_annotate
 class KVState:
     """The cache, the block table and the offsets inside a page.
 
-    Address is page_id * PAGE_STRIDE + (tile_pos % PAGE_SIZE) * PER_TOKEN; the
-    second term is layout independent, since a tile is the same size either way.
+    Address is page_id * PAGE_STRIDE + (tile_pos % PAGE_SIZE) * PER_TOKEN
     """
 
     cfg: Config
@@ -458,10 +440,7 @@ class KVState:
                            layout=gl.SliceLayout(1, val_layout))[:, None]
         offs_n = gl.arange(0, cfg.BLOCK_KV,
                            layout=gl.SliceLayout(0, val_layout))[None, :]
-        # Both byte maps are separable and a block never straddles a shuffle
-        # group, so B(t0 + c) = B(t0) + c * stride. Only the `c` term is loop
-        # invariant and lives here; B(t0) and the page arrive per tile as one
-        # runtime vector, which is the whole of the addressing change.
+        # Do the loop invariant calculation early
         if cfg.GATHER:
             offs_n = offs_n % cfg.GATHER_BLOCK
         if cfg.PRESHUFFLE:
@@ -477,8 +456,6 @@ class KVState:
         if cfg.GATHER:
             sn = sn % cfg.GATHER_BLOCK
         if cfg.PRESHUFFLE:
-            # Only read on the SCALE_MODE 0 path; mode 1's index space is the
-            # four-dimensional one _load_scales_wide builds.
             sc = _shuffled_scale_offsets(sn, ss, cfg.NUM_SCALES, cfg.N_PER_TILE)
         else:
             sc = _token_major_scale_offsets(sn, ss, cfg.NUM_SCALES)
@@ -495,20 +472,16 @@ class KVState:
         block -> position -> block table -> page chain: one load and one
         broadcast add.
 
-        `tile_pos` is a slot index here, not a KV position -- the walk is over
+        `tile_pos` is a slot index here, not a KV position, the walk is over
         the compact candidate list and the store columns are compact too.
-        Clamped rather than masked, for the same reason page_token is: a slot
-        past the end of the list still lands on a block this row owns, and its
-        columns are dropped by store_hi at the store.
+        Clamped rather than masked, store mask handles the rest
         """
         cols = gl.arange(0, self.cfg.BLOCK_KV, layout=gl.SliceLayout(AXIS, layout))
-        # Split so the tile term stays scalar and the column term is constant:
-        # GATHER_BLOCK divides BLOCK_KV, so this is (tile_pos + cols) // GB.
+        # Split so the tile term stays scalar
         blk = gl.minimum(tile_pos // self.cfg.GATHER_BLOCK
                          + cols // self.cfg.GATHER_BLOCK, self.last_blk)
         # Buffer, not pointer: the row base is scalar and folds into the
-        # descriptor, so the per-column term stays i32 -- one shift a tile
-        # instead of a 64-bit shift-add and a sign extend per stream.
+        # descriptor, so the per-column term stays i32
         return gl.amd.cdna4.buffer_load(ptr=base_ptr, offsets=blk)
 
     @gluon.jit
@@ -519,8 +492,7 @@ class KVState:
         rather than [BLOCK_KV, NUM_SCALES] (see _load_scales_wide), so its
         candidate index has to be built on that shape: the token is
         b0 * N_PER_TILE + b2, and the block it belongs to is that over
-        GATHER_BLOCK. Broadcast over the two scale axes, which the block does
-        not depend on.
+        GATHER_BLOCK. Broadcast over the two scale axes
         """
         cfg: gl.constexpr = self.cfg
         S_LO: gl.constexpr = WARP_SIZE // cfg.N_PER_TILE
@@ -640,7 +612,7 @@ def _load_scales_wide(cfg, ptr, gbase):
     space, or a scalar 0 when the walk is contiguous and the page rides in
     `ptr` instead. The stored order puts the token axis at stride S_HI inside a
     group of N_PER_TILE, so a candidate block of at most N_PER_TILE tokens is
-    still one broadcast add -- which is why the gather does not need a byte
+    still one broadcast add, which is why the gather does not need a byte
     order of its own here.
 
     Grouping one MFMA tile keeps the order independent of BLOCK_KV and caps the
@@ -894,9 +866,7 @@ class Program:
         else:
             tile_lo: gl.int32 = 0
             tile_hi = n_tiles
-        # The one column bound every store answers to: it keeps a walk that ran
-        # past its own end out of the next split's columns and out of the region
-        # the caller pre-filled with -inf.
+        # Stops spilling stores on each other's write region
         # The compact end under GATHER: output column j is candidate slot j.
         store_hi = gl.minimum(keys if cfg.GATHER else context_len,
                               tile_hi * cfg.BLOCK_KV)
@@ -905,15 +875,10 @@ class Program:
 
     @gluon.jit
     def row_bounds(self, ends, BLOCK_M: gl.constexpr):
-        # One exclusive bound per row, folding the row's causal end, the split's
-        # share and the end of the context. All loop invariant, so the walk
-        # never recomputes a window.
+        # One exclusive bound per row
         out = ()
         for r in gl.static_range(0, BLOCK_M):
             if self.cfg.GATHER:
-                # The store column and the masking position are the same number
-                # here: the list was causally filtered on the host, so the only
-                # bound left is the compact end.
                 out = out + (self.store_hi,)
             else:
                 out = out + (gl.minimum(ends[r], self.store_hi),)
@@ -924,11 +889,7 @@ class Program:
         """A per-row max over each BSCORE_BLOCK columns of this tile.
 
         The candidate block divides BLOCK_KV, so a tile owns a whole number of
-        blocks and no block is split across tiles or across KV splits -- the
-        reduce is entirely local and needs no second pass to combine.
-
-        Unpinned: the +inf on the row's newest block is one element per row and
-        belongs in the caller's scatter, not in a compare per block here.
+        blocks
         """
         cfg: gl.constexpr = self.cfg
         C: gl.constexpr = cfg.BSCORE_BLOCK
@@ -936,16 +897,14 @@ class Program:
         grouped = scores.reshape([BPT, C])
         # Adjacent columns are adjacent lanes under the MFMA layout, so this is
         # a cross-lane reduce: at C <= N_PER_TILE it stays inside a DPP row.
-        # The result is replicated over the C lanes and the store's redundancy
-        # mask picks one of them, so there is one dword per block per tile.
         best = gl.reduce(grouped, 1, _max_nan)
         blk = gl.arange(0, BPT, layout=gl.SliceLayout(1, grouped.type.layout))
+        # The same bound the logits store has. Not droppable on MASKED=False
+        # tiles the way emit's select is -- tried, and it faults out of bounds
+        # at ctx 1047 / C 32 / 64 heads / unshuffled.
         gl.amd.cdna4.buffer_store(
             best, ptr=self.bs_ptr + r * self.bs_stride_s,
             offsets=tile_pos // C + blk,
-            # The same bound the logits store answers to, read in block space:
-            # it keeps a walk that ran past its own end out of the next split's
-            # blocks and out of the region the caller pre-filled with -inf.
             mask=tile_pos + blk * C < self.store_hi)
 
     @gluon.jit
