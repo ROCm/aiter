@@ -850,19 +850,28 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 constexpr int SPBK  = T::SCALES_PER_BK;
                 D_SF* slot = smem_sf
                            + (issue_k % T::prefetch_k_iter) * T::SF_RING_SLOT;
-                const int plane =
-                    (wave_id_prod * (int)opus::get_warp_size() + lane_id) * VEC;
+                // The LDS destination has to be wave-uniform: buffer_load_lds
+                // adds lane_id * size to it itself. So only the wave's share of
+                // the chunk goes in the pointer, and the lane term appears just
+                // once -- in the global offset, which is a VGPR and per-lane by
+                // nature. Folding the lane into both is what the first version
+                // did, and it wrote outside the slot.
+                const int wave_base =
+                    wave_id_prod * (int)opus::get_warp_size() * VEC;
+                const int lane_off = lane_id * VEC;
                 const int k_off = issue_k * SPBK;
                 opus::static_for<T::SF_RING_A_BYTES / CHUNK>([&](auto c_c) {
-                    const int idx = decltype(c_c)::value * CHUNK + plane;
-                    async_load<VEC>(g_sfa, slot + idx,
+                    constexpr int c = decltype(c_c)::value * CHUNK;
+                    const int idx = c + wave_base + lane_off;
+                    async_load<VEC>(g_sfa, slot + c + wave_base,
                                     (idx / SPBK) * kargs.stride_sfa
                                         + k_off + idx % SPBK);
                 });
                 D_SF* slot_b = slot + T::SF_RING_A_BYTES;
                 opus::static_for<T::SF_RING_B_BYTES / CHUNK>([&](auto c_c) {
-                    const int idx = decltype(c_c)::value * CHUNK + plane;
-                    async_load<VEC>(g_sfb, slot_b + idx,
+                    constexpr int c = decltype(c_c)::value * CHUNK;
+                    const int idx = c + wave_base + lane_off;
+                    async_load<VEC>(g_sfb, slot_b + c + wave_base,
                                     (idx / SPBK) * kargs.stride_sfb
                                         + k_off + idx % SPBK);
                 });
