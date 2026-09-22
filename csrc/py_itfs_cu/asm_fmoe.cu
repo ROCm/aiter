@@ -606,6 +606,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
@@ -626,6 +628,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
@@ -669,19 +673,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         AITER_CHECK(false, __func__, ": unsupport current input type:", AiterDtype_to_str(input->dtype()));
     }
 
-    // The small-tile asm MXFP4 kernels drain O through a tile schedule derived
-    // from model_dim/1024, with no handling for a short trailing tile. Below
-    // 1024 no tiles are produced at all and the output buffer is left
-    // untouched; a non-multiple leaves the remainder columns unwritten. Both
-    // return a silently wrong result instead of failing, so require an exact
-    // multiple. A multiple of 256 is not enough: model_dim=2304 drops 256
-    // columns. Larger tiles use a different epilogue and are not constrained.
-    if(is_mxfp4 && impl_ptr->get_sub_GU() <= 128)
+    // The asm MXFP4 O-flush walks full 1024-dim blocks, then waves 0/1 drain a
+    // 512-dim tail when dim bit 9 is set. That covers every multiple of 512
+    // (dim=512 is tail-only). A 256 remainder is unwritten, so reject it.
+    if(is_mxfp4)
     {
-        AITER_CHECK(model_dim >= 1024 && (model_dim % 1024) == 0,
+        AITER_CHECK(model_dim >= 512 && (model_dim % 512) == 0,
                     __func__,
-                    " asm MXFP4 kernels with sub_GU <= 128 require model_dim to be a positive "
-                    "multiple of 1024; got model_dim=" +
+                    " asm MXFP4 kernels require model_dim to be a positive "
+                    "multiple of 512; got model_dim=" +
                         std::to_string(model_dim));
     }
 

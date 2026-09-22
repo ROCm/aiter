@@ -1,0 +1,3 @@
+knl_name,co_name,atm,vskip,smf,tg_num_perCU,ps,subGU_m,subGU_n,flat,bdx
+_ZN5aiter51fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_situv2_16x32E,fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_situv2_16x32.co,0,0,0,2,0,16,32,1,256
+_ZN5aiter52fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_situv2_16x192E,fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_situv2_16x192.co,0,0,0,1,0,16,192,1,256

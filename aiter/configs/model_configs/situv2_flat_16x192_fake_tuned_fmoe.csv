@@ -1,0 +1,3 @@
+gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us1,kernelName1,err1,us2,kernelName2,err2,us,run_1stage,xbf16,flat,tflops,bw,_tag
+gfx950,256,8,3584,384,896,16,ActivationType.Situv2,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,_ZN5aiter52fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_situv2_16x192E,0.0%,0,,0.0%,0,1,1,1,0,0,fake_flat_situv2
+gfx950,256,32,3584,384,896,16,ActivationType.Situv2,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,_ZN5aiter52fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_situv2_16x192E,0.0%,0,,0.0%,0,1,1,1,0,0,fake_flat_situv2
