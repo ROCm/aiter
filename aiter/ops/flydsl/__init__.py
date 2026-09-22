@@ -8,6 +8,8 @@ from importlib import import_module
 import flydsl as _flydsl
 from packaging.version import Version
 
+from aiter.fused_moe_registry import register_fused_moe_impl
+
 from .moe_common import GateMode
 
 _MIN_FLYDSL_VERSION = Version("0.2.4")
@@ -30,11 +32,11 @@ _LAZY_IMPORTS = {
     "ContractionMode": (".gemm_kernels", "ContractionMode"),
     "DecodeConfig": (".gemm_kernels", "DecodeConfig"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
-        ".kernels.mqa_logits.fp8_mqa_logits",
+        ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
     ),
     "FP8_MQA_LOGITS_VARIANTS": (
-        ".kernels.mqa_logits.fp8_mqa_logits",
+        ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
     "OutputRounding": (".gemm_kernels", "OutputRounding"),
@@ -49,14 +51,26 @@ _LAZY_IMPORTS = {
         ".kernels.flash_attn_func_fp8_gfx950",
         "flydsl_flash_attn_fp8_func",
     ),
+    "flydsl_flash_attn_fp8_supported": (
+        ".kernels.flash_attn_func_fp8_gfx950",
+        "flydsl_flash_attn_fp8_supported",
+    ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_fp8_mqa_logits": (
-        ".kernels.mqa_logits.fp8_mqa_logits",
+        ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
     ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
+    "flydsl_hstu_attention": (
+        ".hstu_attention",
+        "flydsl_hstu_attention",
+    ),
+    "flydsl_hstu_attention_bwd": (
+        ".hstu_attention",
+        "flydsl_hstu_attention_bwd",
+    ),
     "flydsl_hstu_attention_fwd": (
-        ".hstu_attention_kernels",
+        ".hstu_attention",
         "flydsl_hstu_attention_fwd",
     ),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
@@ -98,6 +112,11 @@ _LAZY_IMPORTS = {
         ".gemm_kernels",
         "parse_gemm_decode_kernel_name",
     ),
+    "pa_decode": (".pa_decode", "pa_decode"),
+    "gather_kv_b_proj_flydsl_fp8_supported": (
+        ".gather_kv_b_proj",
+        "gather_kv_b_proj_flydsl_fp8_supported",
+    ),
 }
 
 __all__ = [
@@ -114,9 +133,12 @@ __all__ = [
     "compile_gemm_decode_bf16",
     "compute_varqlen_windows",
     "flydsl_flash_attn_fp8_func",
+    "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
+    "flydsl_hstu_attention",
+    "flydsl_hstu_attention_bwd",
     "flydsl_hstu_attention_fwd",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
@@ -127,13 +149,18 @@ __all__ = [
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
+    "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
     "gemm_decode_bf16",
     "gemm_decode_kernel_name",
     "get_decode_arch_traits",
     "iter_gemm_decode_configs",
+    "pa_decode",
     "parse_gemm_decode_kernel_name",
 ]
+
+_fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
+register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
 
 
 def __getattr__(name: str):
