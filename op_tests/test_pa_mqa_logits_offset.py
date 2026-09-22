@@ -271,7 +271,9 @@ def test_paged_mqa_logits_non_preshuffle(
         pytest.param("plain", 1, id="plain-B1"),
         pytest.param("plain", 64, id="plain-B64"),
         # Preshuffle splits on ChunkKPerStage % KVBlockSize: B64 loads a page
-        # index per lane, B256 keeps one page per stage.
+        # index per lane, B256 keeps one page per stage. B8 is shorter than the
+        # 16-token MFMA tile, so the tile spans two pages.
+        pytest.param("preshuffle", 8, id="preshuffle-B8"),
         pytest.param("preshuffle", 64, id="preshuffle-B64"),
         pytest.param("preshuffle", 256, id="preshuffle-B256"),
     ],
@@ -324,7 +326,9 @@ def test_paged_mqa_logits_large_kv_offsets(
         len(physical_pages), block_bytes, dtype=torch.uint8, device=device
     )
     value_bytes = block_size * hidden_dim
-    values = shuffle_weight(kv) if preshuffle else kv
+    # A page shorter than the 16-token MFMA tile can only be shuffled in groups
+    # of its own length; the kernel then reads the tile from several pages.
+    values = shuffle_weight(kv, layout=(min(block_size, 16), 16)) if preshuffle else kv
     compact[:, :value_bytes] = values.reshape(len(physical_pages), -1).view(torch.uint8)
     compact[:, value_bytes:] = scales.view(torch.uint8)
     # Only four pages are referenced. Place them around the address boundary

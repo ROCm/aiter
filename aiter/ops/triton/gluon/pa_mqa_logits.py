@@ -668,6 +668,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     ChunkKStagePerContextBlock: gl.constexpr = KVBlockSize // ChunkKPerStage
 
     LoadBlockIndiceForEachStage: gl.constexpr = ChunkKPerStage % KVBlockSize == 0
+    # Rows per shuffled group, matching the `layout=(ShuffleRows, 16)` the host
+    # passed to shuffle_weight. A page shorter than the 16-token MFMA tile can
+    # only be shuffled in groups of its own length, so the tile is then read
+    # from 16 // KVBlockSize pages -- which the per-lane page index already does.
+    ShuffleRows: gl.constexpr = KVBlockSize if KVBlockSize < 16 else 16
 
     # DS_WRITE: gl.constexpr = 0x200
     DS_READ: gl.constexpr = 0x100
@@ -766,16 +771,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b)) % 16
             + gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b))
             // 16
-            * 256
+            * (ShuffleRows * 16)
         )[:, None] + (
             gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-            % 16
+            % ShuffleRows
             * 16
             + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
             % KVBlockSize
-            // 16
-            * 16
-            * 128
+            // ShuffleRows
+            * ShuffleRows
+            * HiddenDim
         )[
             None, :
         ]
@@ -1092,16 +1097,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b)) % 16
             + gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b))
             // 16
-            * 256
+            * (ShuffleRows * 16)
         )[:, None] + (
             gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-            % 16
+            % ShuffleRows
             * 16
             + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
             % KVBlockSize
-            // 16
-            * 16
-            * 128
+            // ShuffleRows
+            * ShuffleRows
+            * HiddenDim
         )[
             None, :
         ]
@@ -1496,6 +1501,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     ChunkKStagePerContextBlock: gl.constexpr = KVBlockSize // ChunkKPerStage
 
     LoadBlockIndiceForEachStage: gl.constexpr = ChunkKPerStage % KVBlockSize == 0
+    # Rows per shuffled group, matching the `layout=(ShuffleRows, 16)` the host
+    # passed to shuffle_weight. A page shorter than the 16-token MFMA tile can
+    # only be shuffled in groups of its own length, so the tile is then read
+    # from 16 // KVBlockSize pages -- which the per-lane page index already does.
+    ShuffleRows: gl.constexpr = KVBlockSize if KVBlockSize < 16 else 16
 
     # DS_WRITE: gl.constexpr = 0x200
     DS_READ: gl.constexpr = 0x100
@@ -1611,16 +1621,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
             gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b)) % 16
             + gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b))
             // 16
-            * 256
+            * (ShuffleRows * 16)
         )[:, None] + (
             gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-            % 16
+            % ShuffleRows
             * 16
             + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
             % KVBlockSize
-            // 16
-            * 16
-            * 128
+            // ShuffleRows
+            * ShuffleRows
+            * HiddenDim
         )[
             None, :
         ]
@@ -1941,16 +1951,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
             gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b)) % 16
             + gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b))
             // 16
-            * 256
+            * (ShuffleRows * 16)
         )[:, None] + (
             gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-            % 16
+            % ShuffleRows
             * 16
             + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
             % KVBlockSize
-            // 16
-            * 16
-            * 128
+            // ShuffleRows
+            * ShuffleRows
+            * HiddenDim
         )[
             None, :
         ]
