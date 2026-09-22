@@ -28,6 +28,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gather_kv_b_proj import (
     gather_kv_b_proj_flydsl,
+    gather_kv_b_proj_flydsl_fp8_supported,
     gather_kv_b_proj_flydsl_supported,
 )
 from aiter.ops.shuffle import shuffle_weight
@@ -40,6 +41,68 @@ KV_C_DIM = 512
 KV_PE_DIM = 64
 QK_NOPE_HEAD_DIM = 128
 V_HEAD_DIM = 128
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "supported",
+        "gfx942",
+        "bf16_output",
+        "missing_scale",
+        "scale_dtype",
+        "scale_device",
+        "weight_rank",
+        "weight_device",
+        "zero_heads",
+    ],
+)
+def test_fp8_supported_metadata(monkeypatch, case):
+    """Check FP8 capability without a device allocation, launch or scale read."""
+    from torch._subclasses import fake_tensor
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    from aiter.ops.flydsl import gather_kv_b_proj as gather
+
+    monkeypatch.setattr(fake_tensor, "init_gpu_context", lambda device: None)
+    monkeypatch.setattr(
+        gather, "_arch_of", lambda index: "gfx942" if case == "gfx942" else "gfx950"
+    )
+    monkeypatch.setattr(gather, "_lds_capacity", lambda: 131072)
+    monkeypatch.setattr(
+        gather, "compile_gather_kv_b_proj", lambda **kw: pytest.fail("compiled")
+    )
+    with FakeTensorMode() as mode:
+
+        def fake(shape, dtype=torch.float8_e4m3fn, device="cuda:0"):
+            return FakeTensor(
+                mode,
+                torch.empty(shape, dtype=dtype, device="meta"),
+                torch.device(device),
+            )
+
+        heads = 0 if case == "zero_heads" else 12
+        cache = fake((64, 1, 576))
+        weight = fake(
+            (heads * 256, 512), device="cuda:1" if case == "weight_device" else "cuda:0"
+        )
+        if case == "weight_rank":
+            weight = fake((12 * 256 * 512,))
+        weight_scale = fake((heads * 256,), torch.float32)
+        dtype = torch.bfloat16 if case == "bf16_output" else torch.float8_e4m3fn
+        k, v = fake((16, heads, 192), dtype), fake((16, heads, 128), dtype)
+        ks = fake((1,), torch.float32)
+        vs = fake((1,), torch.float32)
+        if case == "missing_scale":
+            ks = None
+        elif case == "scale_dtype":
+            ks = fake((1,), torch.bfloat16)
+        elif case == "scale_device":
+            ks = fake((1,), torch.float32, "cuda:1")
+        assert gather_kv_b_proj_flydsl_fp8_supported(
+            cache, weight, weight_scale, k, v, k_out_scale=ks, v_out_scale=vs
+        ) is (case == "supported")
+
 
 # (qk_nope_head_dim, v_head_dim). DeepSeek fills both B LDS halves exactly; GLM-5.2
 # is unequal, so the k half pads to 256 and its last 64 columns must be dropped.
@@ -344,6 +407,14 @@ def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op(dims, output_dtype
     """The support predicate must agree with launch validation."""
     ok = _make_case(256, 12, output_dtype=output_dtype, dims=dims)
     assert _supported(ok)
+    assert gather_kv_b_proj_flydsl_fp8_supported(
+        ok["k_buffer"],
+        shuffle_weight(ok["weight"], layout=(16, 16)),
+        ok["weight_scale"],
+        ok["k_prefix"],
+        ok["v_prefix"],
+        **ok["out_scales"],
+    ) is (output_dtype != torch.bfloat16)
     _run_flydsl(ok)  # and it really runs
 
     for kw, needle in (
@@ -694,6 +765,15 @@ def test_fp8_output_validation(invalid):
         case["v_prefix"] = case["v_prefix"].to(torch.bfloat16)
     elif invalid == "strided":
         case["k_prefix"] = case["k_prefix"].transpose(0, 1).contiguous().transpose(0, 1)
+    assert not gather_kv_b_proj_flydsl_fp8_supported(
+        case["k_buffer"],
+        shuffle_weight(case["weight"], layout=(16, 16)),
+        case["weight_scale"],
+        case["k_prefix"],
+        case["v_prefix"],
+        k_out_scale=ks,
+        v_out_scale=vs,
+    )
     with pytest.raises(ValueError):
         _run_flydsl(case, k_out_scale=ks, v_out_scale=vs)
 
