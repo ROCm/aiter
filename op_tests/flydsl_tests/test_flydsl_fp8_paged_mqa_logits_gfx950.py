@@ -17,7 +17,7 @@ from op_tests.flydsl_tests.ragged_nn import (
     ref_padded_ragged,
     sample_next_n_lens,
 )
-from op_tests.flydsl_tests.test_flydsl_fp8_paged_mqa_logits import (
+from op_tests.test_flydsl_fp8_paged_mqa_logits import (
     _build_inputs,
     _kernel_inputs,
     calc_diff,

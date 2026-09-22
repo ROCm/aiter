@@ -7,9 +7,7 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx950 import (
-    flydsl_fp8_paged_mqa_logits,
-)
+from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.flydsl_tests.ragged_nn import (
     MAX_NN,
