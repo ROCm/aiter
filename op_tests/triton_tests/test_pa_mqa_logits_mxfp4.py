@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
-
 import pytest
 import torch
 
@@ -54,7 +52,7 @@ def calc_diff(x, y):
     return 1 - 2 * (x * y).sum() / (x * x + y * y).sum()
 
 
-def reference(q_deq, kv_deq, weights, ctx_lens, max_model_len):
+def reference(q_deq, kv_deq, weights, ctx_lens, max_model_len, cu_ends=None):
     batch, next_n = q_deq.shape[0], q_deq.shape[1]
     out = torch.full((batch * next_n, max_model_len), float("-inf"),
                      dtype=torch.float32, device=q_deq.device)
@@ -66,17 +64,40 @@ def reference(q_deq, kv_deq, weights, ctx_lens, max_model_len):
         for n in range(next_n):
             row = (torch.relu(q_deq[b, n].float() @ k.T)
                    * weights[b * next_n + n].float()[:, None]).sum(dim=0)
+            # Exclusive, and clamped to the context the way the kernel's
+            # store_hi clamps it. Without a tensor it is the kernel's own rule.
+            end = (ctx - next_n + n + 1 if cu_ends is None
+                   else min(int(cu_ends[b * next_n + n]), ctx))
             pos = torch.arange(ctx, device=q_deq.device)
             out[b * next_n + n, :ctx] = torch.where(
-                pos <= ctx - next_n + n, row, torch.full_like(row, float("-inf")))
+                pos < end, row, torch.full_like(row, float("-inf")))
     return out
 
 
+def cu_ends_for(kind, ctx_lens, next_n, ratio=2, device="cuda"):
+    """Per-row exclusive bounds, indexed like weights.
+
+    compressed  one key per `ratio` tokens, so the bound steps every `ratio` rows
+    padded      parked rows, including a block's last -- so its furthest row is
+                not its last
+    """
+    ends = []
+    for b, ctx in enumerate(ctx_lens):
+        for n in range(next_n):
+            if kind == "compressed":
+                e = (ratio * ctx - next_n + n + 1) // ratio
+            elif kind == "padded":
+                tail = next_n > 1 and n == next_n - 1
+                e = 0 if (b % 2 or tail) else ctx - next_n + n + 1
+            else:
+                raise ValueError(kind)
+            ends.append(max(e, 0))
+    return torch.tensor(ends, dtype=torch.int32, device=device)
 
 
 def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
              page_offset=0, seed=SEED, check_inf=True, preshuffle=1,
-             clean_logits=True, dynamic=0):
+             clean_logits=True, dynamic=0, cu_ends=None):
     dev = "cuda"
     torch.manual_seed(seed)
     ctx = [int(c) for c in ctx_lens]
@@ -126,14 +147,18 @@ def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
     cl_t = torch.tensor(ctx, dtype=torch.int32, device=dev)
     out = paged_mxfp4_mqa_logits(
         qp, qsp, cache, weights, cl_t, block_table, mml,
-        preshuffle=preshuffle, clean_logits=clean_logits, dynamic=dynamic)
+        preshuffle=preshuffle, clean_logits=clean_logits, dynamic=dynamic,
+        cu_ends=cu_ends)
     torch.cuda.synchronize()
 
-    ref = reference(dequantize(q4, q4s), dequantize(kv4, kv4s), weights, ctx, mml)
+    ref = reference(dequantize(q4, q4s), dequantize(kv4, kv4s), weights, ctx, mml,
+                    cu_ends)
     # Only the in-window positions are defined without clean_logits, and they
     # are the ones a top-k reads either way.
     fin = torch.isfinite(ref)
-    diff = float(calc_diff(out[fin], ref[fin]))
+    # Every row parked: the -inf pattern is the whole check, and calc_diff over
+    # nothing is a nan.
+    diff = float(calc_diff(out[fin], ref[fin])) if bool(fin.any()) else 0.0
     inf_ok = (bool(torch.equal(torch.isinf(out), torch.isinf(ref)))
               if (check_inf and clean_logits) else True)
     gib = num_pages * page_size * (head_size // 2 + head_size // SCALE_GROUP) / 2**30
@@ -172,6 +197,33 @@ def test_shape(shape, num_heads, head_size, page_size, preshuffle,
                                clean_logits=clean_logits, dynamic=dynamic)
     assert diff <= TOL, f"residual {diff:.3e}"
     assert inf_ok, "the -inf pattern does not match the reference"
+
+
+CU_ENDS_SHAPES = [
+    ("decode b8", 8, 1, [2048, 1024, 4096, 512, 3000, 777, 64, 129]),
+    ("spec n=6", 4, 6, [2048, 1500, 601, 64]),
+    ("chunk n=16", 4, 16, [4096, 97, 1024, 33]),
+    # Contexts shorter than the chunk
+    ("short ctx n=16", 4, 16, [8, 12, 4, 16]),
+]
+
+
+@pytest.mark.parametrize("shape", CU_ENDS_SHAPES,
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("kind", ["compressed", "padded"])
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("dynamic", [0, 1])
+def test_cu_ends(shape, kind, num_heads, dynamic):
+    """Bounds the kernel's own rule cannot express: a compressed cache, whose
+    bound steps once per two rows, and parked rows."""
+    _, batch, next_n, ctx_lens = shape
+    ends = cu_ends_for(kind, ctx_lens, next_n)
+    diff, inf_ok, _ = run_case(batch, next_n, num_heads, 128, ctx_lens, 64,
+                               seed=SEED, dynamic=dynamic, cu_ends=ends)
+    assert diff <= TOL, f"residual {diff:.3e}"
+    assert inf_ok, "the -inf pattern does not match the reference"
+
+
 
 
 @pytest.mark.parametrize("gib", [5.0, ])

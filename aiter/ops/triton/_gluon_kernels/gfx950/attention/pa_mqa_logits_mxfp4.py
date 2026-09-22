@@ -150,14 +150,9 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
 def _relu(x, RELU_ADD: gl.constexpr):
     # RELU_ADD spells relu as (x + |x|)/2: one v_add_f32 with an abs source
     # modifier where max(x, 0) is a v_maximum3_f32, same instruction count and
-    # registers, just a faster opcode here. The halving rides on the per-head
-    # weight in the prologue.
-    #
-    # Two ways to lose it, both measured. Do not also wrap it in inline asm --
-    # each asm block is a scheduling barrier, s_nop 29 -> 46 at 64 heads. And do
-    # not let the SLP vectorizer reach it: v_pk_add_f32 has no abs modifier, so
-    # packing forces an explicit v_and_b32 per element plus copies, +65-73% VALU
-    # and 0.70-0.73x. FOLD_ASM is what keeps these adds scalar, for free.
+    # registers, just a faster (VALU overlap). Needs to be paired with the
+    # scalar FMA fold to stop the v_add getting packed: v_pk_add_f32 has no abs
+    # modifier.
     #
     # Differs from max(x, 0) only at x = -inf and |x| > 2**127; the launcher
     # docstring states the contract.
@@ -169,9 +164,7 @@ def _relu(x, RELU_ADD: gl.constexpr):
 @gluon.jit
 def _fma_unpacked(a, b, c):
     # a * b + c as one v_fma_f32 the SLP vectorizer cannot pair. Packed FP32
-    # cannot co-issue in an MFMA shadow on gfx950 and needs even-aligned pairs,
-    # so keeping these scalar is what frees the registers BLOCK_M and
-    # waves_per_eu spend. is_pure=False or LLVM dedups asm blocks it thinks equal.
+    # cannot co-issue in an MFMA shadow on gfx950 and needs even-aligned pairs
     return gl.inline_asm_elementwise("v_fma_f32 $0, $1, $2, $3", "=v,v,v,v",
                                      [a, b, c], dtype=gl.float32,
                                      is_pure=False, pack=1)
@@ -440,11 +433,7 @@ class KVState:
 
     @gluon.jit
     def page_token(self, tile_pos):
-        # Split out from the loads so the walk can issue it an iteration early:
-        # it is a dependent load in front of every KV address in the tile, and
-        # DEPTH does not hide it. Clamped to a page the sequence owns, which is
-        # what lets every KV load run unmasked -- a tile past the context reads
-        # real bytes and produces real, wrong logits that the store drops.
+        # Split out from the loads so the walk can issue it an iteration early
         return gl.load(self.blk_ptr
                        + gl.minimum(tile_pos >> self.cfg.PAGE_SHIFT,
                                     self.last_page_row))
@@ -493,10 +482,7 @@ def _load_scales_wide(cfg, ptr):
     """The whole scale tile, read over the run the stored order makes contiguous.
 
     Grouping one MFMA tile keeps the order independent of BLOCK_KV and caps the
-    run at S_HI bytes -- a lane gets group_size * NUM_SCALES / 64, so widening
-    would mean grouping more tokens than a tile has. Triton takes vector width
-    from contiguity in index space, hence the reshaped view and the fold back,
-    which is a register rename. Keep both page strides constexpr or the
+    run at S_HI bytes. Keep both page strides constexpr or the
     vectorizer loses the divisibility and every load collapses to a ubyte.
     """
     S_LO: gl.constexpr = WARP_SIZE // cfg.N_PER_TILE
@@ -517,12 +503,6 @@ def _load_scales_wide(cfg, ptr):
     return (raw.reshape([N_HI, S_LO, cfg.N_PER_TILE, S_HI])
             .permute((0, 2, 3, 1))
             .reshape([cfg.BLOCK_KV, cfg.NUM_SCALES]))
-
-
-# the two KV loaders
-#
-# Same vocabulary -- page_token, scales, and either values or issue/consume --
-# so the walks read the same and nothing else branches on which one it got.
 
 
 @aggregate
@@ -595,11 +575,8 @@ class LDSLoader:
     def issue(self, tile_pos, page, buffer_id):
         """Start one tile's global-to-LDS copy. No mask: see page_token.
 
-        The page rides in the offsets, not the base pointer -- the opposite of
-        the register path -- because buffer_load_to_shared crashes the AMDGPU
-        backend on a runtime-varying base when the loop also carries async
-        copies. Cost: i32 offsets, so past 2 GiB the launcher clears
-        USE_BUFFER_LOAD and the same arithmetic runs through plain pointers.
+        The page rides in the offsets, not the base pointer:
+        buffer_load_to_shared crashes the backend on a runtime-varying base.
         """
         cfg: gl.constexpr = self.st.cfg
         dest = self.kv_shared.index(buffer_id)
@@ -624,9 +601,6 @@ class LDSLoader:
 
 @gluon.jit
 def _dot(cfg, q, q_scale, k, k_scale, ROWS: gl.constexpr):
-    # Both operands carry their own e8m0 block scales and the matrix core
-    # applies both, so the accumulator comes out in real units and there is no
-    # trailing per-token multiply.
     acc = gl.zeros([ROWS, cfg.BLOCK_KV], dtype=gl.float32, layout=cfg.mfma_layout)
     return gl.amd.cdna4.mfma_scaled(a=q, a_scale=q_scale, a_format="e2m1",
                                     b=k, b_scale=k_scale, b_format="e2m1",
@@ -682,17 +656,15 @@ class Program:
         self.store_hi = store_hi
 
     @gluon.jit
-    def initialize(cfg, out_ptr, stride_s, stride_k, context_len, block_first,
+    def initialize(cfg, out_ptr, stride_s, stride_k, context_len, block_end,
                    split_id, num_kv_splits, slice_idx, num_slices,
                    HAS_KV_SPLIT: gl.constexpr, DYNAMIC: gl.constexpr):
-        # Walk only as far as the block's last row can attend. For decode that
-        # is the whole context; for a prefill chunk it is most of the work.
-        keys = gl.minimum(context_len, block_first + cfg.BLOCK_M)
+        # Walk only as far as the furthest of the block's rows can attend
+        keys = gl.minimum(context_len, block_end)
         n_tiles = gl.maximum((keys + cfg.BLOCK_KV - 1) // cfg.BLOCK_KV, 0)
         if DYNAMIC:
             # Slice slice_idx of num_slices, converted against this layer's own
-            # tile count -- which is what lets one schedule serve layers whose
-            # contexts differ by a compression factor.
+            # tile count
             per = (n_tiles + gl.maximum(num_slices, 1) - 1) // gl.maximum(num_slices, 1)
             tile_lo = slice_idx * per
             tile_hi = gl.maximum(gl.minimum(tile_lo + per, n_tiles), tile_lo)
@@ -710,13 +682,13 @@ class Program:
         return Program(cfg, out_ptr, stride_s, stride_k, tile_lo, tile_hi, store_hi)
 
     @gluon.jit
-    def row_bounds(self, limits, BLOCK_M: gl.constexpr):
-        # One exclusive bound per row, folding the causal limit, the split's
+    def row_bounds(self, ends, BLOCK_M: gl.constexpr):
+        # One exclusive bound per row, folding the row's causal end, the split's
         # share and the end of the context. All loop invariant, so the walk
         # never recomputes a window.
         out = ()
         for r in gl.static_range(0, BLOCK_M):
-            out = out + (gl.minimum(limits[r] + 1, self.store_hi),)
+            out = out + (gl.minimum(ends[r], self.store_hi),)
         return out
 
     @gluon.jit
@@ -742,9 +714,6 @@ class Program:
                 mask = pos < self.store_hi
             gl.amd.cdna4.buffer_store(scores, ptr=self.out_ptr + r * self.stride_s,
                                       offsets=offsets, mask=mask)
-
-
-# the two walks
 
 
 @gluon.jit
@@ -854,6 +823,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     kv_scales_ptr,     # uint8 paged, page p's e8m0 at p * KVS_PAGE_STRIDE
     weights_ptr,       # fp32  [B * NEXT_N, H]
     context_lens_ptr,  # int32 [B]
+    cu_ends_ptr,       # int32 [B * NEXT_N] exclusive row end; None unless HAS_CU_ENDS
     block_table_ptr,   # int32 [B, stride_blk_b]
     sched_ptr,         # int32 [grid, 4] descriptors; unused unless DYNAMIC
     logits_ptr,        # fp32  [B * NEXT_N, max_model_len]
@@ -888,6 +858,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     HAS_KV_SPLIT: gl.constexpr,
     KV_REREAD: gl.constexpr,
     DYNAMIC: gl.constexpr,
+    HAS_CU_ENDS: gl.constexpr,
 ):
     gl.static_assert(BLOCK_KV % MFMA_NONK_DIM == 0)
     gl.static_assert(PAGE_SIZE % BLOCK_KV == 0,
@@ -931,21 +902,36 @@ def _pa_mqa_logits_mxfp4_kernel(
     qs_base = batch_id.to(gl.int64) * stride_qs_b + n0.to(gl.int64) * stride_qs_n
     w_row = batch_id.to(gl.int64) * next_n + n0
 
-    mfma_qs, q_scales, w_blocks, limits = (), (), (), ()
+    # Loaded beside the Q rows: BLOCK_M scalar loads, nothing per KV tile. It
+    # replaces the built-in rule and may also exceed it. Needed when the boundary
+    # is not one key per row -- a compressed cache, or a context-parallel shard.
+    mfma_qs, q_scales, w_blocks, ends = (), (), (), ()
     for r in gl.static_range(0, BLOCK_M):
         q, qs, w = _load_q_row(cfg, Q_ptr + (q_base + r * stride_q_n),
                                q_scales_ptr + (qs_base + r * stride_qs_n),
                                weights_ptr + (w_row + r) * stride_w_s)
         mfma_qs, q_scales, w_blocks = mfma_qs + (q,), q_scales + (qs,), w_blocks + (w,)
-        limits = limits + (context_len - next_n + n0 + r,)
+        if HAS_CU_ENDS:
+            ends = ends + (gl.load(cu_ends_ptr + (w_row + r)),)
+        else:
+            ends = ends + (context_len - next_n + n0 + r + 1,)
+
+    if HAS_CU_ENDS:
+        # Max over the block's rows: only the built-in rule puts the furthest
+        # last.
+        block_end = ends[0]
+        for r in gl.static_range(1, BLOCK_M):
+            block_end = gl.maximum(block_end, ends[r])
+    else:
+        block_end = context_len - next_n + n0 + BLOCK_M
 
     pgm = Program.initialize(cfg, logits_ptr + w_row.to(gl.int64) * stride_logits_s,
                              stride_logits_s, stride_logits_k, context_len,
-                             context_len - next_n + n0, split_id, num_kv_splits,
+                             block_end, split_id, num_kv_splits,
                              slice_idx, num_slices, HAS_KV_SPLIT, DYNAMIC)
     if pgm.tile_lo >= pgm.tile_hi:
         return
-    row_hi = pgm.row_bounds(limits, BLOCK_M)
+    row_hi = pgm.row_bounds(ends, BLOCK_M)
 
     blk_ptr = block_table_ptr + batch_id * stride_blk_b
     # Both bounds matter: the context says how many pages are filled, the
@@ -965,9 +951,9 @@ def _pa_mqa_logits_mxfp4_kernel(
 
 @triton.jit
 def _pa_mqa_logits_mxfp4_sched_kernel(
-    context_lens_ptr, sched_ptr, batch, next_n, num_ctas,
+    context_lens_ptr, cu_ends_ptr, sched_ptr, batch, next_n, num_ctas,
     BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
-    ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr,
+    ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr, HAS_CU_ENDS: tl.constexpr,
 ):
     # A "unit" is one (sequence, row block) pair; a "slot" is one workgroup of
     # the launch. The job is to give every slot a slice of some unit's KV walk,
@@ -983,11 +969,25 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     ctx = tl.load(context_lens_ptr + seq, mask=live, other=0)
 
     # The same causal trim the main kernel applies, clamped trailing row block
-    # and all, so this counts tiles that are really walked.
+    # and all, so this counts tiles that are really walked. The count only sets
+    # the balance: a live unit is floored at one tile below, so it keeps its slot
+    # whatever the trim thinks, and the kernel re-derives the real walk.
     first_row = (row_blk if BLOCK_M == 1
                  else tl.minimum(row_blk * BLOCK_M, next_n - BLOCK_M))
-    keys = tl.minimum(ctx, ctx - next_n + first_row + BLOCK_M)
-    tiles = tl.maximum(tl.cdiv(keys, BLOCK_KV), 0)
+    if HAS_CU_ENDS:
+        block_end = tl.zeros([ALIGN_W], tl.int32)
+        for r in tl.static_range(0, BLOCK_M):
+            block_end = tl.maximum(
+                block_end,
+                tl.load(cu_ends_ptr + seq * next_n + first_row + r,
+                        mask=live, other=0))
+    else:
+        block_end = ctx - next_n + first_row + BLOCK_M
+    keys = tl.minimum(ctx, block_end)
+    # Floored at one so a live unit always owns a slot. Whether a unit is live
+    # must not depend on the bound: the launch may hold a cu_ends this kernel was
+    # not given, and a unit with no slot has nothing to compute its rows.
+    tiles = tl.maximum(tl.cdiv(keys, BLOCK_KV), 1)
     tiles = tl.where(live & (ctx > 0), tiles, 0)
 
     # Step 2: how many tiles go in a slice, the same for every slot
@@ -1003,7 +1003,6 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     slots_used = tl.sum(n_slices)
 
     # Step 4: Calculate ownership.
-    # An empty unit ends where it starts, so it is counted from its own slot onward and never owns one.
     slot = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
     owner_unit = tl.sum(
         ((first_slot + n_slices)[None, :] <= slot[:, None]).to(tl.int32), axis=1)

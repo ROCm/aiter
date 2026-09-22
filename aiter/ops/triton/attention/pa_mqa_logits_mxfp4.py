@@ -251,11 +251,14 @@ def select_config(num_heads, head_size, next_n, page_size, preshuffle=1,
 
 
 def build_schedule(context_lens, next_n, num_heads, head_size,
-                   page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None):
+                   page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None,
+                   cu_ends=None):
     """Descriptors for one launch, or None if the shape does not fit.
 
     A descriptor is (sequence, row block, slice index, slice count), relative
     rather than absolute, so the kernel converts it against its own tile count.
+
+    cu_ends only affects balance here.
     """
     plan = select_config(num_heads, head_size, next_n, page_size, preshuffle)
     row_blocks, block_m = plan["row_blocks"], plan["block_m"]
@@ -277,6 +280,7 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     SCHED_BLOCK_P = 4
     _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(target_wgs, SCHED_BLOCK_P),)](
         context_lens,
+        cu_ends,
         out,
         batch,
         next_n,
@@ -286,6 +290,7 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         ROW_BLOCKS=row_blocks,
         ALIGN_W=align_w,
         BLOCK_P=SCHED_BLOCK_P,
+        HAS_CU_ENDS=1 if cu_ends is not None else 0,
         num_warps=4,
     )
     # The launcher takes the grid from the length, so the length is the contract
@@ -323,6 +328,7 @@ def paged_mxfp4_mqa_logits(
     preshuffle: int = 1,
     dynamic: int = 0,
     schedule: torch.Tensor | None = None,
+    cu_ends: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     This function computes the logits to be used by a topk function for sparse
@@ -350,6 +356,10 @@ def paged_mxfp4_mqa_logits(
                     sequences differ in length
     schedule:       [NUM_CTAS, 4], dtype int32, work descriptors from
                     build_schedule. Takes precedence over dynamic
+    cu_ends:        [B * NEXT_N], dtype int32, optional. Exclusive per-row key
+                    bound, indexed like weights, defaulting to
+                    context_lens[b] - NEXT_N + n + 1; pass it under compression
+                    or context parallelism. build_schedule needs the same tensor
 
     Returns:
     logits:         [B * NEXT_N, max_model_len], dtype float32
@@ -371,6 +381,10 @@ def paged_mxfp4_mqa_logits(
     assert block_table.shape[0] == batch
     assert context_lens.dtype == torch.int32
     assert weights.shape == (batch * next_n, num_heads) and weights.stride(1) == 1
+    if cu_ends is not None:
+        assert cu_ends.dtype == torch.int32, "cu_ends must be int32"
+        assert cu_ends.shape == (batch * next_n,) and cu_ends.stride(0) == 1, (
+            "cu_ends must be a contiguous [B * NEXT_N] vector, indexed like weights")
 
     # page_size comes from the cache rather than the caller: both layouts pin it
     # exactly, and a second source could disagree with the bytes.
@@ -431,7 +445,7 @@ def paged_mxfp4_mqa_logits(
     num_kv_splits = cfg["num_kv_splits"]
     if schedule is None and dynamic:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
-                                  page_size, preshuffle)
+                                  page_size, preshuffle, cu_ends=cu_ends)
     use_dynamic = schedule is not None
     if use_dynamic:
         schedule = _check_schedule(schedule, context_lens.device)
@@ -449,6 +463,8 @@ def paged_mxfp4_mqa_logits(
         kv_scales_ptr=scales,
         weights_ptr=weights,
         context_lens_ptr=context_lens,
+        # None specializes to a constexpr, so an unused argument leaves no trace.
+        cu_ends_ptr=cu_ends,
         block_table_ptr=block_table,
         sched_ptr=schedule,
         logits_ptr=logits,
@@ -486,6 +502,7 @@ def paged_mxfp4_mqa_logits(
         HAS_KV_SPLIT=1 if (num_kv_splits > 1 or use_dynamic) else 0,
         KV_REREAD=cfg["kv_reread"],
         DYNAMIC=int(use_dynamic),
+        HAS_CU_ENDS=1 if cu_ends is not None else 0,
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
     )
