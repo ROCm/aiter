@@ -503,8 +503,10 @@ def attn_res_fwd(
         raise ValueError(f"layout must be 'sequence' or 'packed', got {layout!r}")
 
     _LOGGER.info(
-        f"ATTN_RES: query={tuple(query.shape)} rms_weight={tuple(rms_weight.shape)} "
-        f"layout={layout}"
+        "ATTN_RES: query=%s rms_weight=%s layout=%s",
+        tuple(query.shape),
+        tuple(rms_weight.shape),
+        layout,
     )
 
     has_onorm = output_rms_weight is not None
@@ -729,8 +731,9 @@ def attn_res_gate(
 
     if _LOGGER.get_logger().isEnabledFor(logging.INFO):
         _LOGGER.info(
-            f"ATTN_RES_GATE: prefix={tuple(prefix.shape)} "
-            f"block_residual={tuple(block_residual.shape)}"
+            "ATTN_RES_GATE: prefix=%s block_residual=%s",
+            tuple(prefix.shape),
+            tuple(block_residual.shape),
         )
 
     output_shape = prefix.shape  # [.., D]
