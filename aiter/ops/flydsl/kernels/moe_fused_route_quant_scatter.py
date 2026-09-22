@@ -85,6 +85,7 @@ from aiter.ops.flydsl.kernels.quant_utils import (
     _DTYPE_CFG as _APRE_DTYPE_CFG,
     _M as _APRE_M,
     emit_f32_to_e2m1,
+    emit_mx_e8m0_scale,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -202,7 +203,7 @@ def _emit_pk8_lane_amax(bf16x8, c):
     f32x8 = bf16x8.to(fx.Float32)
     acc = fx.Float32(c.c0_f32)
     for j in range_constexpr(8):
-        acc = acc.maximumf(abs(f32x8[j]))
+        acc = fx.max(acc, abs(f32x8[j]))
     return acc
 
 
@@ -462,9 +463,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 peer_amax = block_amax.shuffle_xor(
                     arith.constant(dist, type=i32), c.c_wave
                 )
-                block_amax = fx.Float32(block_amax).maximumf(peer_amax)
+                block_amax = fx.max(block_amax, peer_amax)
 
-            e8m0_scale = _emit_mx_e8m0_scale_apre(
+            e8m0_scale = emit_mx_e8m0_scale(
                 block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
             )
             # scale 2^(e8m0-127); the HW divides each input by its exponent
@@ -499,16 +500,14 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
 
             # per-block amax: max over this lane's 2 elems, then a butterfly
             # shuffle_xor across the block's 16 lanes.
-            block_amax = fx.Float32(c.c0_f32).maximumf(
-                fx.Float32(abs(x0)).maximumf(abs(x1))
-            )
+            block_amax = fx.max(fx.Float32(c.c0_f32), fx.max(abs(x0), abs(x1)))
             for dist in c.amax_shuffle_dists:
                 peer_amax = block_amax.shuffle_xor(
                     arith.constant(dist, type=i32), c.c_wave
                 )
-                block_amax = fx.Float32(block_amax).maximumf(peer_amax)
+                block_amax = fx.max(block_amax, peer_amax)
 
-            e8m0_scale = _emit_mx_e8m0_scale_apre(
+            e8m0_scale = emit_mx_e8m0_scale(
                 block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
             )
 
