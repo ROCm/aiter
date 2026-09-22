@@ -523,6 +523,36 @@ class TestMhaPublicDispatch(unittest.TestCase):
         self.assertEqual(triton_entry.call_args.kwargs["backend"], "triton")
         self.assertEqual(triton_entry.call_args.kwargs["config"], {"BLOCK_M": 64})
 
+    def test_unhonorable_tuned_backend_falls_back_instead_of_raising(self):
+        # The lookup key takes the running arch while the asm gate takes the
+        # built one, so a tuned asm_v3 row can reach a call no asm kernel can
+        # serve. Failing the call would be worse than ignoring the row.
+        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
+        with (
+            mock.patch.object(mha, "get_gfx", return_value="gfx1201"),
+            mock.patch.object(
+                mha, "mha_varlen_fwd", return_value=("ck", None, None, None)
+            ) as ck,
+        ):
+            out, *_ = mha._flash_attn_varlen_forward(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                None,
+                None,
+                8,
+                16,
+                0,
+                0.0,
+                0.125,
+                False,
+                selected_backend="asm_v3",
+            )
+        self.assertEqual(out, "ck")
+        ck.assert_called_once()
+
     def test_triton_public_varlen_reads_csv_tiles_when_config_is_none(self):
         from aiter.ops.triton.attention import mha as triton_mha
 

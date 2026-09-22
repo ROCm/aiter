@@ -170,6 +170,10 @@ def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     q = key_args["q"]
     device_id = q.device.index if q.device.index is not None else 0
     hardware = get_tuning_hardware(device_id)
+    # The kernel gates below test the built arch, so a row keyed on the running
+    # arch is only safe to apply when the two agree.
+    if hardware["gfx"] != get_gfx():
+        return None
     prefix = tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
     if prefix not in _mha_fwd_tuned_hardware(path):
         return None
@@ -3399,7 +3403,16 @@ def _flash_attn_varlen_forward(
                 cu_seqlens_q_padded,
                 cu_seqlens_k_padded,
             )
-    elif selected_backend in (None, "ck"):
+    else:
+        if selected_backend not in (None, "ck"):
+            # A tuned row is a performance hint, not a correctness contract:
+            # honoring it is impossible here, so run the call rather than fail
+            # it.
+            logger.warning(
+                "tuned MHA backend %r cannot be honored for this call; "
+                "falling back to ck",
+                selected_backend,
+            )
         _record_mha_fwd_selection("ck")
 
         # Input validation for padded cumulative arrays if provided
@@ -3448,10 +3461,6 @@ def _flash_attn_varlen_forward(
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_k_padded=cu_seqlens_k_padded,
             sink_ptr=sink_ptr,
-        )
-    else:
-        raise ValueError(
-            f"tuned MHA backend {selected_backend!r} is incompatible with this call"
         )
     return out, softmax_lse, S_dmask, rng_state
 

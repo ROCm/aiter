@@ -2,35 +2,26 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Interleaved randomized-block measurement with delta-based elimination.
 
-A tuner that measures one candidate at a time, in isolation, pays process and
-load cost per candidate and compares candidates that never saw the same
-machine conditions. This measures the whole field in one process as a
-randomized complete block design: each block visits every surviving candidate
-once, in a fresh random order, running a short run of calls per visit.
-
-Blocking is what makes the comparison paired, so drift that moves one
-candidate within a block moves them all and cancels in the differences.
-Randomizing the order each block is what stops position within a block from
+The whole field is measured in one process as a randomized complete block
+design. Each block visits every surviving candidate once, in a fresh random
+order, timing a short run of calls per visit. Blocking pairs the comparison so
+drift cancels in the differences; reshuffling each block keeps position from
 being confounded with the candidate.
 
-Selection, not hypothesis testing, is the objective. Two candidates within
-``delta`` of each other are a finished question rather than a harder one,
-because whichever is shipped the result is equally fast. That is what keeps
-the block count a function of delta and the measurement noise rather than of
-the size of the catalogue.
+The objective is selection rather than hypothesis testing, so candidates
+within ``delta`` are treated as settled. That keeps the block count a function
+of delta and the measurement noise, not of the size of the catalogue.
 
-Correctness belongs to the caller. An entrant reaches :func:`race` only
-through the timing function, so nothing here ever sees kernel output and a
-candidate that computes the wrong answer races exactly like one that does
-not. Check it in the same pass that compiles and warms each candidate, before
-any timed call: that pass has to happen anyway, and doing the check there
-keeps a compile off a measurement as well as a wrong candidate out of the
-field. ``_race_one_shape`` in ``op_tests/tuners/tune_mha_fwd.py`` is the
-reference implementation.
+Two constraints on callers:
 
-Nothing here imports torch at module scope. The caller supplies a timing
-function, for which :func:`cuda_event_timer` is the GPU implementation, so the
-decision logic can be tested on synthetic latencies without a device.
+Correctness is the caller's. Entrants reach :func:`race` only through the
+timing function, so nothing here sees kernel output and a candidate computing
+the wrong answer races like any other. Check it in the pass that compiles and
+warms each candidate, before any timed call. ``_race_one_shape`` in
+``op_tests/tuners/tune_mha_fwd.py`` is the reference implementation.
+
+Nothing here imports torch at module scope, so the decision logic is testable
+on synthetic latencies. :func:`cuda_event_timer` is the GPU timing function.
 """
 
 from __future__ import annotations
@@ -71,11 +62,10 @@ __all__ = [
 class RaceEntrant:
     """One thing to be measured.
 
-    ``payload`` is opaque to this module: it is whatever the caller needs back
-    when the race names a winner. ``protected`` marks an entrant that is
-    measured in every block but never eliminated, which is how the
-    configuration already in use stays in the field. A run that stops
-    measuring the incumbent cannot tell an improvement from a regression.
+    ``payload`` is opaque here: whatever the caller wants back when the race
+    names a winner. ``protected`` marks an entrant measured in every block but
+    never eliminated, which is how the configuration already in use stays in
+    the field.
     """
 
     label: str
@@ -102,9 +92,8 @@ class Samples:
     def relative_spread(self) -> float:
         """Block-to-block standard deviation as a fraction of the estimate.
 
-        This is the tie-break statistic. Among candidates that are equally
-        fast in expectation, the steadier one is the one more likely to still
-        be fast in the next session.
+        The tie-break statistic: among candidates equally fast in
+        expectation, prefer the one whose speed repeats.
         """
         medians = self.block_medians
         estimate = self.estimate
@@ -156,10 +145,9 @@ class RaceResult:
 class BlockJournal:
     """Append-only record of completed blocks, for resuming an interrupted race.
 
-    The unit of durable progress is the completed block: after block k every
-    surviving candidate has been measured k times, and because elimination is
-    a pure function of the accumulated samples, replaying those blocks
-    reconstructs the state exactly. Nothing needs to be re-measured.
+    The completed block is the unit of durable progress. Elimination is a pure
+    function of the accumulated samples, so replaying whole blocks
+    reconstructs the state exactly and nothing is re-measured.
     """
 
     def append(self, record: dict) -> None:  # pragma: no cover - interface
@@ -172,15 +160,22 @@ class BlockJournal:
 class JsonlBlockJournal(BlockJournal):
     """A journal backed by one JSON object per line.
 
-    A process killed mid-write leaves one truncated final line. Reading stops
-    at the first line that does not parse rather than failing, so a resume
-    picks up from the last block that was written whole.
+    A resume picks up from the last block written whole. A process killed
+    mid-write leaves an unterminated final line, which is dropped on open so
+    that appends cannot land after invalid JSON and hide every block written
+    since.
     """
 
     def __init__(self, path: str, resume: bool = False):
         self.path = path
-        if not resume and os.path.exists(path):
-            os.remove(path)
+        if not resume:
+            if os.path.exists(path):
+                os.remove(path)
+        elif os.path.isfile(path):
+            with open(path, "rb+") as handle:
+                payload = handle.read()
+                if payload and not payload.endswith(b"\n"):
+                    handle.truncate(payload.rfind(b"\n") + 1)
 
     def append(self, record: dict) -> None:
         directory = os.path.dirname(self.path)
@@ -207,7 +202,7 @@ class JsonlBlockJournal(BlockJournal):
 def cuda_event_timer(invoke: Callable[[RaceEntrant], Any]):
     """Time ``invoke`` with CUDA events, returning microseconds per call.
 
-    Imported lazily so this module stays usable, and testable, without torch.
+    torch is imported lazily so this module stays importable without it.
     """
     import torch
 
@@ -238,8 +233,7 @@ def measure_blocks(
     """Run a randomized complete block design over the whole field.
 
     No elimination: every entrant is measured in every block. This is the
-    reference the race is checked against, and what the block-size calibration
-    and noise-floor experiments use.
+    reference the race is checked against.
     """
     rng = random.Random(seed)
     samples = {entrant.label: Samples() for entrant in entrants}
@@ -279,30 +273,25 @@ def race(
 ) -> RaceResult:
     """Eliminate candidates that are worse than the leader by more than delta.
 
-    Both decisions read the same lower bound on the paired difference against
-    the leader, but they ask opposite questions of it, and the asymmetry is
-    where most of the budget is saved. Eliminating a candidate needs proof it
-    is more than delta *worse* than the leader. Stopping only needs proof that
-    no survivor is more than delta *better* -- that is the only way picking the
-    leader could turn out wrong. Certifying the reverse, that a close candidate
-    is definitely not slightly worse, costs many blocks and buys nothing,
-    because if it were slightly worse we would still be shipping the leader.
+    Elimination and stopping read the same lower bound on the paired
+    difference against the leader, but ask opposite questions of it, which is
+    where the budget is saved. Dropping a candidate needs proof it is more
+    than delta *worse*. Stopping needs proof only that no survivor is more
+    than delta *better*, since that is the only way picking the leader could
+    be wrong.
 
-    Elimination is permanent and the leader is recomputed every block, so the
-    comparison is always against the best evidence so far. Candidates are
-    compared on the blocks they both took part in, which keeps every
-    comparison paired even though they leave the race at different times.
+    Elimination is permanent and the leader is recomputed every block, so a
+    comparison always uses the best evidence so far. Candidates are compared
+    on the blocks they both ran, which keeps the pairing even though they
+    leave at different times.
 
-    Protected entrants are measured like everyone else and are never removed.
-    A protected entrant that the same test would have dropped is reported as
-    ``protected_behind``, so being kept in the field is not mistaken for being
-    within delta of the leader.
+    Protected entrants are measured but never removed. One the same test would
+    have dropped is reported ``protected_behind``, so being kept is not read
+    as being within delta.
 
     ``survivors`` is the set that may be published: the leader plus whatever
     measured inside the indifference zone. Candidates that merely outlasted
-    the budget without being separated are reported ``undecided`` and are not
-    eligible, because surviving elimination proves only that the evidence was
-    not strong enough to drop them.
+    the budget are reported ``undecided`` and are not eligible.
     """
     rng = random.Random(seed)
     samples = {entrant.label: Samples() for entrant in entrants}
@@ -314,12 +303,8 @@ def race(
     replay = list(journal.records()) if (journal is not None and resume) else []
     replayed = 0
 
-    # Union bound over every candidate and every look. Peeking after each
-    # block is repeated testing, so an uncorrected alpha would drift. This is
-    # conservative rather than tight -- an anytime-valid bound such as
-    # empirical Bernstein would spend the budget better -- but the eliminations
-    # that dominate the cost are decided by factors of ten, where the
-    # difference between a tight bound and a loose one is a block at most.
+    # Union bound over every candidate and every look, since peeking after
+    # each block is repeated testing and an uncorrected alpha would drift.
     per_decision = alpha / max(1, len(entrants) * max_blocks)
 
     calls_spent = 0
@@ -492,19 +477,14 @@ def select_winner(
     samples: dict[str, Samples],
     by_label: dict[str, RaceEntrant],
 ) -> tuple[str, str]:
-    """Pick one config from a set the race has declared equally fast.
+    """Pick one config from a set the race declared equally fast.
 
-    None of the survivors is meaningfully faster than the others, so this rule
-    is not about speed. Its job is to make a re-tune return the same answer and
-    leave the config file untouched when nothing genuinely improved.
+    No survivor is meaningfully faster than another, so this rule is not about
+    speed. It exists to make a re-tune return the same answer and leave the
+    config file alone when nothing improved.
 
-    The incumbent wins first, because keeping it is the outcome that changes
-    nothing. Otherwise the steadiest survivor wins: a variance estimated from a
-    dozen blocks is itself noisy, so this is a tie-break and not a ranking
-    criterion, but between two configurations that are equally fast in
-    expectation it prefers the one whose speed is more repeatable. The final
-    fallback is a stable sort on the label, so even exactly tied spreads
-    produce the same answer on every run.
+    The incumbent wins first, then the steadiest survivor, then a stable sort
+    on the label so exactly tied spreads still resolve the same way every run.
     """
     if not survivors:
         raise ValueError("a race cannot finish with no survivors")
@@ -537,9 +517,8 @@ def rank(samples: dict[str, Samples]) -> list[tuple[str, float]]:
 def position_effect(samples: dict[str, Samples]) -> list[tuple[int, float, int]]:
     """Latency by position within a block, relative to each candidate's median.
 
-    A switching cost that lands inside the timed calls shows up as the first
-    positions running slow. Normalizing per candidate lets fast and slow
-    candidates be pooled.
+    A switching cost inside the timed calls shows up as early positions
+    running slow. Normalizing per candidate lets fast and slow ones pool.
     """
     by_position: dict[int, list[float]] = {}
     for sample in samples.values():
@@ -558,9 +537,9 @@ def position_effect(samples: dict[str, Samples]) -> list[tuple[int, float, int]]
 def wilcoxon_floor(blocks: int) -> float:
     """Smallest one-sided p a signed-rank test can return with this many pairs.
 
-    Worth printing rather than discovering: at four blocks the floor is 0.0625,
-    so no comparison can clear alpha=0.05 and every candidate survives the
-    filter no matter how slow it is. That is a powerless test, not a tie.
+    Worth printing rather than discovering: at four blocks the floor is
+    0.0625, so nothing can clear alpha=0.05 and every candidate survives no
+    matter how slow. That is a powerless test, not a tie.
     """
     return 0.5**blocks if blocks > 0 else 1.0
 
@@ -568,11 +547,10 @@ def wilcoxon_floor(blocks: int) -> float:
 def indistinguishable_set(samples: dict[str, Samples], alpha: float = 0.05):
     """Candidates that cannot be separated from the fastest.
 
-    Choosing the single fastest point estimate out of many is biased: the
-    maximum of noisy estimates is optimistic, and second place is often not
-    distinguishable from first. Reporting the set that survives a paired test
-    against the leader says what the measurement actually supports, and leaves
-    the choice within that set to a policy that can prefer the incumbent.
+    Picking the single fastest point estimate is biased, because the maximum
+    of noisy estimates is optimistic. The set that survives a paired test
+    against the leader is what the measurement supports, leaving the choice
+    within it to a policy that can prefer the incumbent.
     """
     ordered = rank(samples)
     best_label = ordered[0][0]
@@ -589,14 +567,10 @@ def indistinguishable_set(samples: dict[str, Samples], alpha: float = 0.05):
         if all(d == 0 for d in differences):
             raw.append((label, 1.0))
             continue
-        # A paired t on the block differences rather than a signed-rank test.
-        # Rank tests are distribution-free but discard effect size, so their
-        # smallest attainable p depends only on the number of blocks: at eight
-        # blocks the floor is 1/256, which is above the Holm threshold once
-        # there are sixteen comparisons, and a candidate twenty-five times
-        # slower than the leader is declared a tie. The block values being
-        # compared are already medians of many calls, so approximate normality
-        # is a far weaker assumption here than at the level of raw latencies.
+        # A paired t on the block differences rather than a signed-rank test,
+        # whose smallest attainable p depends only on the block count (see
+        # wilcoxon_floor). These values are already medians of many calls, so
+        # approximate normality is a weak assumption here.
         spread = statistics.stdev(differences) / math.sqrt(len(differences))
         if spread <= 0.0:
             raw.append((label, 0.0))

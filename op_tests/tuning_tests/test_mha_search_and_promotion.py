@@ -104,6 +104,18 @@ class TestIncumbentGate(unittest.TestCase):
         self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
         self.assertEqual(tuner._promotions[0]["decision"], "incumbent_fastest")
 
+    def test_a_race_that_certified_nobody_refuses_to_publish(self):
+        """Screening has no recorded winner and ranks by latency, so its
+        fastest row is the pick. A race that recorded no winner is a different
+        situation: taking the fastest row there could ship a candidate the
+        race eliminated."""
+        tuner = self._tuner()
+        tuner._race_winner_by_key = {self.KEY: None}
+        with self.assertRaises(RuntimeError):
+            tuner._gate_against_incumbent(
+                self.KEY, self._frame(challenger_us=800.0, incumbent_us=1000.0)
+            )
+
     def test_more_rounds_make_the_gate_more_sensitive_not_less(self):
         """A range-based threshold widens as samples are added, so gathering
         more evidence would make a real improvement harder to publish. The

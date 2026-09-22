@@ -21,6 +21,7 @@ from aiter.utility.block_race import (
     RaceEntrant,
     Samples,
     critical_t,
+    measure_blocks,
     race,
     select_winner,
 )
@@ -277,6 +278,54 @@ class TestTieBreak(unittest.TestCase):
         self.assertEqual(len(picks), 1, f"selection depended on input order: {picks}")
 
 
+class TestStrategyAgreement(unittest.TestCase):
+    """The claim the race exists to support: it reaches the answer exhaustive
+    screening reaches, for a fraction of the calls. Nothing else in the suite
+    would fail if the two strategies disagreed."""
+
+    @staticmethod
+    def _field(seed):
+        # One clear winner, a near-tie beside it, and a spread of slower
+        # candidates: the shape of a real tile-config catalogue.
+        rng = random.Random(seed)
+        truth = {"fast": 100.0, "near": 101.5}
+        truth.update({f"slow{i}": rng.uniform(115.0, 400.0) for i in range(18)})
+        return truth
+
+    def test_the_race_picks_what_measuring_everything_would_pick(self):
+        delta = RACE_ARGS["delta"]
+        for seed in range(6):
+            with self.subTest(seed=seed):
+                truth = self._field(seed)
+                entrants = [RaceEntrant(label) for label in truth]
+
+                raced = race(entrants, constant_timer(truth, seed=seed), **RACE_ARGS)
+                screened = measure_blocks(
+                    entrants,
+                    constant_timer(truth, seed=seed),
+                    block_calls=RACE_ARGS["block_calls"],
+                    blocks=RACE_ARGS["max_blocks"],
+                    seed=RACE_ARGS["seed"],
+                )
+                exhaustive = min(screened, key=lambda label: screened[label].estimate)
+
+                self.assertLessEqual(
+                    truth[raced.winner],
+                    truth[exhaustive] * (1.0 + delta),
+                    f"race published {raced.winner} where measuring every "
+                    f"candidate published {exhaustive}",
+                )
+
+    def test_the_race_gets_there_on_fewer_calls(self):
+        truth = self._field(0)
+        entrants = [RaceEntrant(label) for label in truth]
+        raced = race(entrants, constant_timer(truth, seed=0), **RACE_ARGS)
+        exhaustive_calls = (
+            len(entrants) * RACE_ARGS["max_blocks"] * RACE_ARGS["block_calls"]
+        )
+        self.assertLess(raced.calls_spent, exhaustive_calls / 2)
+
+
 class TestJournalReplay(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.mkdtemp()
@@ -342,6 +391,26 @@ class TestJournalReplay(unittest.TestCase):
 
         journal = JsonlBlockJournal(self.path, resume=True)
         self.assertEqual(len(list(journal.records())), len(lines) - 1)
+
+    def test_a_second_resume_keeps_what_the_first_one_finished(self):
+        """The torn line has to go, not just be read around. Appending after
+        it would leave every later block behind unparseable JSON."""
+        self._run_and_journal()
+        with open(self.path) as handle:
+            lines = handle.readlines()
+        with open(self.path, "w") as handle:
+            handle.writelines(lines[:-1])
+            handle.write('{"block": 99, "order": ["fa')
+
+        first = JsonlBlockJournal(self.path, resume=True)
+        first.append({"block": len(lines), "order": [], "latencies": {}})
+
+        second = JsonlBlockJournal(self.path, resume=True)
+        self.assertEqual(
+            len(list(second.records())),
+            len(lines),
+            "the block the first resume completed must survive the second",
+        )
 
     def test_resuming_continues_instead_of_starting_over(self):
         truth = {"fast": 100.0, "near": 100.6, "slow": 250.0}
