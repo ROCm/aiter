@@ -385,7 +385,10 @@ __device__ __forceinline__ void emit_legacy_ordered_topk(const float* cand_val,
     if(need_renorm)
     {
         // Preserve the legacy serial renormalization order.
-        w *= routed_scaling_factor / total;
+        if(total > 0.0f)
+            w *= routed_scaling_factor / total;
+        else
+            w = 0.0f;
     }
     else
     {
@@ -941,9 +944,10 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     // a poison probe measured zero hits over 4096 rows of the benchmark
     // distribution -- but correctness depends on it, so it stays. Still register
     // resident; it only gives up the pivot, not the VGPR-held scores.
-    float sum       = 0.0f;
-    int topk_indice = 0;
-    float topk_value = 0.0f;
+    float sum                  = 0.0f;
+    int topk_indice            = 0;
+    float topk_value           = 0.0f;
+    uint32_t selected_low_mask = 0;
     for(int k = 0; k < topk; ++k)
     {
         float max_val = -INFINITY;
@@ -964,13 +968,24 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         const kvp winner = wave_reduce<kvp, decltype(arg_max), WARP_SIZE, true>(local, arg_max);
         max_val          = winner.value;
         max_idx          = winner.key;
-        if(max_idx < 0)
-            max_idx = k;
+        const bool has_valid_candidate = max_idx >= 0;
+        if(!has_valid_candidate)
+        {
+            // topk <= 32 and num_experts >= 64 on this path, so an unused ID in
+            // [0, 31] always exists. Prefer IDs at or after k to preserve the
+            // legacy fallback order whenever its default ID is still unused.
+            const uint32_t unused          = ~selected_low_mask;
+            const uint32_t unused_from_k   = unused & (~0u << k);
+            const uint32_t fallback_source = unused_from_k != 0 ? unused_from_k : unused;
+            max_idx                        = __builtin_ctz(fallback_source);
+        }
+        if(max_idx < 32)
+            selected_low_mask |= 1u << max_idx;
 
         // Retire the winner in place: compare-and-select, no dynamic index.
         for_each_owned([&](float& v, int id) { v = id == max_idx ? -INFINITY : v; });
 
-        max_val     = sig_scores[max_idx];
+        max_val     = has_valid_candidate ? sig_scores[max_idx] : 0.0f;
         topk_indice = lane == k ? max_idx : topk_indice;
         topk_value  = lane == k ? max_val : topk_value;
         if(need_renorm)
@@ -981,7 +996,7 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
 
     if(need_renorm)
     {
-        sum = routed_scaling_factor / sum;
+        sum = sum > 0.0f ? routed_scaling_factor / sum : 0.0f;
     }
     else
     {
