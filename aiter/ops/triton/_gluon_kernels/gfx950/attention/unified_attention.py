@@ -329,7 +329,6 @@ class AttentionConfig:
     stride_v_cache_1: gl.constexpr
     stride_v_cache_2: gl.constexpr
     stride_v_cache_3: gl.constexpr
-    block_table_stride: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -364,7 +363,6 @@ class AttentionConfig:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
-        block_table_stride,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -466,7 +464,6 @@ class AttentionConfig:
         self.stride_v_cache_1 = gl.constexpr(stride_v_cache_1)
         self.stride_v_cache_2 = gl.constexpr(stride_v_cache_2)
         self.stride_v_cache_3 = gl.constexpr(stride_v_cache_3)
-        self.block_table_stride = gl.constexpr(block_table_stride)
 
 
 @aggregate
@@ -509,6 +506,7 @@ class AsyncKVLoader:
     key_cache_ptr: gl.tensor
     value_cache_ptr: gl.tensor
     block_tables_ptr_shifted: gl.tensor
+    block_table_stride: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_base_offset: gl.tensor
@@ -522,6 +520,7 @@ class AsyncKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         k_shared,
         v_shared,
         k_base_offset,
@@ -536,6 +535,7 @@ class AsyncKVLoader:
         self.k_base_offset = k_base_offset
         self.v_base_offset = v_base_offset
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.block_table_stride = block_table_stride
 
     @gluon.jit
     def initialize(
@@ -543,6 +543,7 @@ class AsyncKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         REMOVE_INDIRECT_ACCESS,
@@ -630,6 +631,7 @@ class AsyncKVLoader:
             key_cache_ptr,
             value_cache_ptr,
             block_tables_ptr_shifted,
+            block_table_stride,
             k_shared,
             v_shared,
             k_base_offset,
@@ -750,7 +752,7 @@ class AsyncKVLoader:
             # clamp to the last column so the loop's j+2 prefetch
             # never reads past the (padded) block table
             if self.cfg.ALL_DECODE:
-                i = gl.minimum(i, self.cfg.block_table_stride - 1)
+                i = gl.minimum(i, self.block_table_stride - 1)
             blk = gl.load(self.block_tables_ptr_shifted + i)
         # For >2 GB caches (not USE_LOAD_BUFFER_OP) this is the one term that can exceed int32
         if self.cfg.USE_LOAD_BUFFER_OP:
@@ -774,6 +776,7 @@ class AsyncGatherKVLoader:
     key_cache_ptr: gl.tensor
     value_cache_ptr: gl.tensor
     block_tables_ptr_shifted: gl.tensor
+    block_table_stride: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_head_d_offset: gl.tensor
@@ -790,6 +793,7 @@ class AsyncGatherKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         k_shared,
         v_shared,
         k_head_d_offset,
@@ -803,6 +807,7 @@ class AsyncGatherKVLoader:
         self.key_cache_ptr = key_cache_ptr
         self.value_cache_ptr = value_cache_ptr
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.block_table_stride = block_table_stride
         self.k_shared = k_shared
         self.v_shared = v_shared
         self.k_head_d_offset = k_head_d_offset
@@ -817,6 +822,7 @@ class AsyncGatherKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         REMOVE_INDIRECT_ACCESS,
@@ -915,6 +921,7 @@ class AsyncGatherKVLoader:
             key_cache_ptr,
             value_cache_ptr,
             block_tables_ptr_shifted,
+            block_table_stride,
             k_shared,
             v_shared,
             k_head_d_offset,
@@ -1032,11 +1039,11 @@ class AsyncGatherKVLoader:
         seq_offset_v = i * self.cfg.TILE_SIZE + self.offs_n_v
         # clamp so the loop's j+2 prefetch never reads past the block table
         block_table_idx_k = gl.minimum(
-            seq_offset_k // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
-        )
+            seq_offset_k // self.cfg.BLOCK_SIZE, self.block_table_stride - 1
+        ).to(gl.int32)
         block_table_idx_v = gl.minimum(
-            seq_offset_v // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
-        )
+            seq_offset_v // self.cfg.BLOCK_SIZE, self.block_table_stride - 1
+        ).to(gl.int32)
         block_ids_k = gl.amd.cdna4.buffer_load(
             ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_k
         )
@@ -1720,7 +1727,7 @@ def _unified_attention_gluon_kernel(
     stride_v_cache_1: gl.constexpr,
     stride_v_cache_2: gl.constexpr,
     stride_v_cache_3: gl.constexpr,
-    block_table_stride: gl.constexpr,
+    block_table_stride: tl.int32,
     num_seqs: tl.int32,
     SCALE,
     SOFTCAP,
@@ -1793,7 +1800,6 @@ def _unified_attention_gluon_kernel(
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
-        block_table_stride,
     )
 
     if not USE_STORE_BUFFER_OP:
@@ -1909,6 +1915,7 @@ def _unified_attention_gluon_kernel(
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         REMOVE_INDIRECT_ACCESS,
