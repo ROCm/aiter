@@ -4,8 +4,9 @@ Offline tile tuner for `flydsl_conv_implicit`, the implicit-GEMM convolution. It
 reads shapes from an untuned CSV, sweeps the launch configs
 `aiter/ops/flydsl/conv3d_policy.py` enumerates for each one, and writes the
 winner to a checked-in tuned CSV that `conv_kernels._lookup_tuned_tile` reads
-at runtime. A shape with no tuned row falls back to the heuristic tile ladder,
-so tuning is an optimization rather than a prerequisite.
+at runtime. A shape with no tuned row of its own borrows the nearest tuned
+resolution of the same layer, and falls back to the heuristic tile ladder when
+there is not one, so tuning is an optimization rather than a prerequisite.
 
 Single backend, unlike the GEMM tuners: there is no asm/CK/triton alternative
 for this kernel, so there is no `--libtype` flag and no `gemm_tuner.py`-style
@@ -98,8 +99,10 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
    each of those artifacts then serves -- one covers a layer at any resolution
    instead of the one it was compiled for -- but it is part of the compile key,
    so a build and the runtime reading its cache have to agree on it. Tile lookup
-   is unaffected: that still needs an exact 20-column match, so a resolution
-   with no row still runs on the heuristic tile, just without the JIT. Both it and the runtime build the compile key through
+   is unaffected: it still needs an exact 20-column match, and a resolution
+   without one borrows the nearest tuned row of the same layer rather than
+   getting its own tuned tile -- it just no longer pays a JIT for the artifact.
+   Both the AOT pass and the runtime build the compile key through
    `conv_kernels._implicit_param_from_problem`, so channel padding and field
    order cannot drift between them. `splitK` is the remaining coupling: the
    runtime freezes the tuned row's value instead of re-deriving it, so a row

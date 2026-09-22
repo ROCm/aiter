@@ -154,8 +154,8 @@ def wan_vae_conv3d(height, width, frames):
 # batch, so these are ordinary nn.Conv2d over N*T images, and the ZeroPad2d((0,1,0,1))
 # ahead of them is a separate Sequential entry -- hence the odd H+1 input and
 # padding=0. The integration layer does replace these (0.54-0.86x of torch here).
-# The Wan tuned config carries them, so they hit a tuned tile at the resolution it
-# was traced at and fall back to _pick_tile's heuristic at any other.
+# The Wan tuned config carries them, so they hit a tuned tile at either resolution
+# it was traced at, and borrow the nearer of the two at any other.
 #
 # `time1x1` is pointwise in space only: kT=3 makes K = C*3, which is why it behaves
 # nothing like the true 1x1 layers it used to be bucketed with. The integration
@@ -800,7 +800,7 @@ def main():
         help="Wan clip HxW, multiples of 8. 480x832 is what the integration report "
         "benchmarks and 368x544 what its 8-GPU training run feeds the VAE; "
         "wan21_vae_bf16_tuned_conv3d.csv holds both. Any other size runs the same "
-        "shapes on the heuristic tile.",
+        "shapes on a tile borrowed from the nearer of the two.",
     )
     p.add_argument(
         "--wan-frames",
@@ -816,7 +816,7 @@ def main():
         default=["1024x1024", "1328x1328"],
         help="Qwen-Image HxW, multiples of 8. qwenimage_vae_bf16_tuned_conv3d.csv "
         "holds both defaults; any other legal size (1664x928, ...) runs the same 16 "
-        "shapes at different extents on the heuristic tile.",
+        "shapes at different extents, on a tile borrowed from the nearer default.",
     )
     args = p.parse_args()
     _FAILED.clear()
