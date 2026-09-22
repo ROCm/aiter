@@ -527,3 +527,10 @@ The parent plan remains the full K2 list.
   The shallower K-major schedule was also ~1% slower at prefill. Keep
   the existing per-N-subtile one-read-ahead loop; static `lgkmcnt(2)`
   frequency alone was not the bottleneck.
+- Carrying current-tile K/V vectors plus a next-tile `buffer_load` through
+  the QK/softmax/PV `range(..., init=)` (wait after PV, clamp last-tile
+  prefetch). Correct (`err=0`). Width-2051 `L=512` medians
+  `13.86 / 16.65 / 484.14` us versus P-join HEAD `14.46 / 17.31 / 392.51`
+  at `M=1/8/512`: decode −4.1%/−3.8%, prefill **+23%**. Prefill
+  `gather_rounds=16` doubles live K/V VGPRs. Distinct from hoist-V-before
+  K-publish and from next-tile-K-with-PV. Keep in-loop issue/wait.
