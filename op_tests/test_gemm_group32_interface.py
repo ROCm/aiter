@@ -82,7 +82,8 @@ def test_invalid_file_bounds(config_dir, bounds):
 
 @pytest.mark.parametrize("group_n", [1, 32])
 @pytest.mark.parametrize("libtype", [None, "triton", "ck", "cktile", "unknown"])
-def test_public_native_group32_route(monkeypatch, group_n, libtype):
+@pytest.mark.parametrize("split_k", [None, 3])
+def test_public_native_group32_route(monkeypatch, group_n, libtype, split_k):
     calls = []
     expected = torch.empty((3, 65), dtype=torch.float32)
 
@@ -104,12 +105,19 @@ def test_public_native_group32_route(monkeypatch, group_n, libtype):
     ws = torch.empty(((65 + group_n - 1) // group_n, 2), dtype=torch.float8_e8m0fnu)
     if libtype not in (None, "triton"):
         with pytest.raises(AssertionError, match="Unsupported libtype"):
-            gemm_op_a8w8.gemm_a8w8_blockscale(x, w, xs, ws, dtype=torch.float32)
+            gemm_op_a8w8.gemm_a8w8_blockscale(
+                x, w, xs, ws, dtype=torch.float32, split_k=split_k
+            )
         assert calls == ["lookup"]
         return
-    actual = gemm_op_a8w8.gemm_a8w8_blockscale(x, w, xs, ws, dtype=torch.float32)
+    actual = gemm_op_a8w8.gemm_a8w8_blockscale(
+        x, w, xs, ws, dtype=torch.float32, split_k=split_k
+    )
     assert actual is expected
-    assert calls == ["lookup", {"dtype": torch.float32, "weight_group_rows": group_n}]
+    assert calls == [
+        "lookup",
+        {"dtype": torch.float32, "weight_group_rows": group_n, "split_k": split_k},
+    ]
 
 
 @pytest.mark.parametrize("libtype", ["ck", "cktile"])
@@ -219,3 +227,16 @@ def test_legacy_triton_config_and_fallback(monkeypatch, configured):
         torch.empty((1, 1)),
     )
     assert calls == ["lookup", "triton"]
+
+
+def test_legacy_scale_format_rejects_native_split_override():
+    with pytest.raises(
+        AssertionError, match="split_k override requires native group32"
+    ):
+        gemm_op_a8w8.gemm_a8w8_blockscale(
+            torch.empty((3, 128), dtype=torch.float8_e4m3fn),
+            torch.empty((128, 128), dtype=torch.float8_e4m3fn),
+            torch.empty((3, 1)),
+            torch.empty((1, 1)),
+            split_k=3,
+        )

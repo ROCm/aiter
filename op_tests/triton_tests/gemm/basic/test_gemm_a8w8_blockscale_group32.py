@@ -241,9 +241,10 @@ def test_invalid_group32_contract(invalid):
         gemm_a8w8_blockscale_group32(x, w, xs, ws, **kwargs)
 
 
-def test_public_group32_compile_dynamic_rows():
+@pytest.mark.parametrize("split_k", [None, 3])
+def test_public_group32_compile_dynamic_rows(split_k):
     def forward(x, w, xs, ws):
-        return gemm_a8w8_blockscale(x, w, xs, ws)
+        return gemm_a8w8_blockscale(x, w, xs, ws, split_k=split_k)
 
     compiled = torch.compile(forward, fullgraph=True, dynamic=True)
     for m in (3, 7, 65):
@@ -254,19 +255,20 @@ def test_public_group32_compile_dynamic_rows():
 
 
 @pytest.mark.parametrize("configured", [False, True])
-def test_public_group32_graph_replay(configured, monkeypatch):
+@pytest.mark.parametrize("split_k", [None, 3])
+def test_public_group32_graph_replay(configured, split_k, monkeypatch):
     if configured:
         monkeypatch.setattr(
             gemm_op_a8w8, "get_CKGEMM_config", lambda *args: {"libtype": "triton"}
         )
     x, w, xs, ws = _operands(3, 4096, 1280)
-    gemm_a8w8_blockscale(x, w, xs, ws)
+    gemm_a8w8_blockscale(x, w, xs, ws, split_k=split_k)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = gemm_a8w8_blockscale(x, w, xs, ws)
+        actual = gemm_a8w8_blockscale(x, w, xs, ws, split_k=split_k)
     x.copy_((x.float() * 0.5).to(x.dtype))
     xs.view(torch.uint8).add_(1)
     graph.replay()
-    expected = gemm_a8w8_blockscale_group32(x, w, xs, ws)
+    expected = gemm_a8w8_blockscale_group32(x, w, xs, ws, split_k=split_k)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
