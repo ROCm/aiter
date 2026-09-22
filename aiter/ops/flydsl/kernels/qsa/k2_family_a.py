@@ -560,7 +560,7 @@ def build_qsa_k2_family_a_module(
         m_final = Float32(results[out_chunks])
         l_final = Float32(results[out_chunks + 1])
         h0 = lane_kg * Int32(4)
-        m4 = fx.Vector.from_elements(
+        fx.Vector.from_elements(
             [
                 gpu.shuffle_idx(m_final, h0 + Int32(i), Int32(64))
                 for i in range_constexpr(4)
