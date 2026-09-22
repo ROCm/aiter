@@ -418,6 +418,8 @@ def _gemm1_body(
         halves = range_constexpr(2) if khalf is None else (khalf,)
         if const_expr(kMChunks == 1):
             order = [(0, k) for k in halves]
+        elif const_expr(not k_split):
+            order = [(i, k) for k in halves for i in range_constexpr(kMChunks)]
         else:
             order = [
                 (sub * 2 + i, k)
@@ -1454,7 +1456,7 @@ def _gemm1_body(
 def _bm_constants(
     BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=kStages
 ):
-    kAStages = k_stages + 1
+    kAStages = 2 if (BM == 128 and BN != 256) else k_stages + 1
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = k_wave * kAStages * BM * KH_TILE

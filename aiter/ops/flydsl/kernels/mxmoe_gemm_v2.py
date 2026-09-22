@@ -1314,7 +1314,8 @@ def atomic_bf16_epilog(
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
 
-    rocdl.s_waitcnt(vmcnt=0)
+    if const_expr(prefetched_ids is not None or (use_reduce and route_out_fp8)):
+        rocdl.s_waitcnt(vmcnt=0)
 
     for mr in range_constexpr(M_REPS):
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
