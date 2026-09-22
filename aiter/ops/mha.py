@@ -19,7 +19,7 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime, get_gpu_model
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_tuning_hardware
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
@@ -90,14 +90,6 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], dict[str, Any
     return table
 
 
-def _mha_fwd_hardware(device_id: int) -> dict[str, Any]:
-    return {
-        "gfx": get_gfx_runtime(),
-        "gpu_model": get_gpu_model(device_id),
-        "cu_num": torch.cuda.get_device_properties(device_id).multi_processor_count,
-    }
-
-
 @functools.lru_cache(maxsize=4)
 def _mha_fwd_tuned_hardware(path: str) -> frozenset[tuple[str, ...]]:
     span = len(MHA_FWD_HARDWARE_KEY_FIELDS)
@@ -131,7 +123,7 @@ def _mha_fwd_tuning_key(
 ) -> tuple[str, ...]:
     device_id = q.device.index if q.device.index is not None else 0
     values = {
-        **_mha_fwd_hardware(device_id),
+        **get_tuning_hardware(device_id),
         "mode": mode,
         "batch": batch,
         "total_q": q.shape[0] if mode == "varlen" else batch * q.shape[1],
@@ -170,7 +162,8 @@ def _mha_fwd_tuning_key(
 def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     path = os.path.abspath(AITER_CONFIGS.AITER_CONFIG_MHA_FWD_FILE)
     q = key_args["q"]
-    hardware = _mha_fwd_hardware(q.device.index if q.device.index is not None else 0)
+    device_id = q.device.index if q.device.index is not None else 0
+    hardware = get_tuning_hardware(device_id)
     prefix = tuple(csv_scalar(hardware[field]) for field in MHA_FWD_HARDWARE_KEY_FIELDS)
     if prefix not in _mha_fwd_tuned_hardware(path):
         return None

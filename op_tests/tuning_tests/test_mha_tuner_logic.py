@@ -248,14 +248,10 @@ class TestMhaTunedPolicy(unittest.TestCase):
     def test_seeded_kimi_row_is_exact(self):
         config = Path(mha.__file__).parents[1] / "configs" / "tuned_mha_fwd.csv"
         table = mha._load_mha_fwd_tuning_table(os.fspath(config))
-        with (
-            mock.patch.object(mha, "get_gfx_runtime", return_value="gfx942"),
-            mock.patch.object(mha, "get_gpu_model", return_value="mi325x"),
-            mock.patch.object(
-                mha.torch.cuda,
-                "get_device_properties",
-                return_value=mock.Mock(multi_processor_count=304),
-            ),
+        with mock.patch.object(
+            mha,
+            "get_tuning_hardware",
+            return_value={"gfx": "gfx942", "gpu_model": "mi325x", "cu_num": 304},
         ):
             key = mha._mha_fwd_tuning_key(**self._key_args())
         self.assertEqual(table[key]["backend"], "asm_v3")
@@ -310,14 +306,10 @@ class TestMhaTunedPolicy(unittest.TestCase):
     def test_different_gpu_model_does_not_match(self):
         config = Path(mha.__file__).parents[1] / "configs" / "tuned_mha_fwd.csv"
         table = mha._load_mha_fwd_tuning_table(os.fspath(config))
-        with (
-            mock.patch.object(mha, "get_gfx_runtime", return_value="gfx942"),
-            mock.patch.object(mha, "get_gpu_model", return_value="mi300x"),
-            mock.patch.object(
-                mha.torch.cuda,
-                "get_device_properties",
-                return_value=mock.Mock(multi_processor_count=304),
-            ),
+        with mock.patch.object(
+            mha,
+            "get_tuning_hardware",
+            return_value={"gfx": "gfx942", "gpu_model": "mi300x", "cu_num": 304},
         ):
             key = mha._mha_fwd_tuning_key(**self._key_args())
         self.assertNotIn(key, table)

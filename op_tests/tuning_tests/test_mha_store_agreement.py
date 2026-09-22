@@ -97,14 +97,15 @@ class TestBothDoorsOpenOnTheSameStore(unittest.TestCase):
         }
 
     def _hardware(self):
-        return (
-            mock.patch.object(mha, "get_gfx_runtime", return_value="gfx950"),
-            mock.patch.object(mha, "get_gpu_model", return_value="mi355x"),
-            mock.patch.object(
-                mha.torch.cuda,
-                "get_device_properties",
-                return_value=mock.Mock(multi_processor_count=256),
-            ),
+        """Pin the hardware identity the row is keyed by.
+
+        Patching the resolver rather than the arch and model lookups it calls,
+        so the fixed key survives those moving to chip_info.
+        """
+        return mock.patch.object(
+            mha,
+            "get_tuning_hardware",
+            return_value={"gfx": "gfx950", "gpu_model": "mi355x", "cu_num": 256},
         )
 
     def _write_csv(self, directory, backend="triton", config_json=TILES_JSON):
@@ -115,8 +116,8 @@ class TestBothDoorsOpenOnTheSameStore(unittest.TestCase):
         lookup it is meant to be found by.
         """
         q, k, v, _, _ = self._tensors()
-        gfx, model, props = self._hardware()
-        with gfx, model, props:
+        hardware = self._hardware()
+        with hardware:
             key = mha._mha_fwd_tuning_key(**self._key_args(q, k, v))
         row = dict(zip(mha.MHA_FWD_TUNING_KEY_FIELDS, key))
         row.update({"backend": backend, "num_splits": 0, "backend_config": config_json})
@@ -130,12 +131,10 @@ class TestBothDoorsOpenOnTheSameStore(unittest.TestCase):
     def _config_through_router(self, path):
         """What the kernel receives when the caller goes through the router."""
         q, k, v, cu_q, cu_k = self._tensors()
-        gfx, model, props = self._hardware()
+        hardware = self._hardware()
         with (
             _config_file(path),
-            gfx,
-            model,
-            props,
+            hardware,
             mock.patch.object(
                 triton_mha._FlashAttnVarlenFunc, "apply", return_value="ok"
             ) as apply,
@@ -155,12 +154,10 @@ class TestBothDoorsOpenOnTheSameStore(unittest.TestCase):
     def _config_through_public_path(self, path):
         """What the kernel receives when the caller uses its own entry point."""
         q, k, v, cu_q, cu_k = self._tensors()
-        gfx, model, props = self._hardware()
+        hardware = self._hardware()
         with (
             _config_file(path),
-            gfx,
-            model,
-            props,
+            hardware,
             mock.patch.object(
                 triton_mha._FlashAttnVarlenFunc, "apply", return_value="ok"
             ) as apply,
@@ -200,12 +197,10 @@ class TestBothDoorsOpenOnTheSameStore(unittest.TestCase):
         q, k, v, cu_q, cu_k = self._tensors()
         with tempfile.TemporaryDirectory() as directory:
             path = self._write_csv(directory)
-            gfx, model, props = self._hardware()
+            hardware = self._hardware()
             with (
                 _config_file(path),
-                gfx,
-                model,
-                props,
+                hardware,
                 mock.patch.object(
                     triton_mha._FlashAttnVarlenFunc, "apply", return_value="ok"
                 ) as apply,
@@ -229,8 +224,8 @@ class TestBothDoorsOpenOnTheSameStore(unittest.TestCase):
         would quietly narrow what the kernel supports."""
         with tempfile.TemporaryDirectory() as directory:
             path = self._write_csv(directory)
-            gfx, model, props = self._hardware()
-            with gfx, model, props:
+            hardware = self._hardware()
+            with hardware:
                 key_args = self._key_args(*self._tensors()[:3])
                 key_args["max_seqlen_k"] = 99999  # not the measured shape
                 with _config_file(path):
@@ -248,12 +243,10 @@ class TestBothDoorsOpenOnTheSameStore(unittest.TestCase):
                 backend="gluon",
                 config_json='{"BLOCK_M":64,"BLOCK_N":32,"num_warps":4,"waves_per_eu":2}',
             )
-            gfx, model, props = self._hardware()
+            hardware = self._hardware()
             with (
                 _config_file(path),
-                gfx,
-                model,
-                props,
+                hardware,
             ):
                 mha._load_mha_fwd_tuning_table.cache_clear()
                 key_args = self._key_args(*self._tensors()[:3])

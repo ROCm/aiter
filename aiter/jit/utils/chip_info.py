@@ -59,6 +59,26 @@ def get_gpu_model(device_id: int = 0) -> str:
         return "unknown"
 
 
+TUNING_HARDWARE_FIELDS = ("gfx", "gpu_model", "cu_num")
+
+
+def get_tuning_hardware(device_id: int = 0) -> dict[str, str | int]:
+    """Return the hardware identity a tuned row is only valid for.
+
+    A measurement is specific to the arch, the SKU and the CU count it ran on,
+    so tuning families scope their rows by this triple. Keys match
+    ``TUNING_HARDWARE_FIELDS``, which is the column order a tuned CSV uses.
+    """
+
+    import torch
+
+    return {
+        "gfx": get_gfx_runtime(),
+        "gpu_model": get_gpu_model(device_id),
+        "cu_num": torch.cuda.get_device_properties(device_id).multi_processor_count,
+    }
+
+
 @functools.lru_cache(maxsize=1)
 def _rocminfo_output() -> str:
     """rocminfo stdout, run once and shared by every parser below.
