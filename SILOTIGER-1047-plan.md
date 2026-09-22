@@ -729,6 +729,14 @@ width-2051 `L=512` K-pad → C-pad median (three runs) was
 424.09 → 431.45 us at `M=512`. Keep unpadded
 `(n_subtiles, num_waves, 64, 4)`.
 
+**Do not retry** packing decode token-major V stores with wave
+`shuffle_idx` into 128-bit stores along `BLOCK_N` while keeping
+`(D, BLOCK_N):(BLOCK_N, 1)` for PV. GPU 6 / gfx950 focused
+decode+prefill pytest passed, but width-2051 `L=512` K-pad → pack
+median (three runs) was 20.09 → 23.26 us at `M=1`, 20.52 → 29.37 us
+at `M=8`, and 424.09 → 423.82 us at `M=512`. Keep scalar
+`v_lds[d, col] = v_vec[i]`.
+
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in
 `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`

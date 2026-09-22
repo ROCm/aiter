@@ -30,7 +30,7 @@ when that is the ticket convention.
 - [x] 3. Overlap K/V `buffer_load` with LDS wait/barrier
 - [x] 4. Bank-conflict-free K (and C) stores; V layout unchanged
       (K pad **kept**; C 66-lane pad **reverted**)
-- [ ] 5. Token-major V: pack stores only
+- [x] 5. Token-major V: pack stores only
 - [ ] 6. Optional: drop C-LDS QK reduce (last, likely small)
 - [ ] 7. Stop: within ~2× AMD per-wave conflict/wait **or** keep-gate dry
 
@@ -332,9 +332,23 @@ M=8 under 3%; M=1 and prefill regress. Kernel C layout restored.
 Keep `v_lds[d, col]` for PV. Replace scalar `ds_write_b16` with wider
 stores that still land in that layout.
 
-- [ ] Decode-only. If PV `lgkmcnt` / waitcnt rises, revert — same
-      failure class as the row-major V keep-gate misses.
-- [ ] **Done when:** kept or reverted + note.
+- [x] Decode-only shuffle-pack of 8 consecutive columns into
+      `ds_write_b128` on `(D, BLOCK_N):(BLOCK_N, 1)`. PV-B reads
+      unchanged. Prefill row-major V unchanged.
+- [x] **Done.** Missed keep-gate; scalar `v_lds[d, col]` restored.
+
+GPU 6 / gfx950, `CACHE=0`. Pytest 2/2. Median vs K-pad baseline
+`20.09 / 20.52 / 424.09`:
+
+| M | K pad | pack V | Δ |
+|--:|--:|--:|--:|
+| 1 | 20.09 | 23.26 | +15.8% |
+| 8 | 20.52 | 29.37 | +43.1% |
+| 512 | 424.09 | 423.82 | −0.06% |
+
+Prefill flat (decode-only). Decode paid for `shuffle_idx` gather of
+the 8-col vector. Same failure class as row-major V / transpose PV.
+**Next: phase 6 skip-or-try, then stop.**
 
 ### 6. Optional: drop C-LDS QK reduce
 
@@ -377,3 +391,6 @@ The parent plan remains the full K2 list.
 - Padding C-LDS's 64-lane axis to 66. Correct; M=8 −2.63%, M=1 +1.10%,
   M=512 +1.74% vs K-pad baseline. Keep unpadded `(n_subtiles,
   num_waves, 64, 4)`.
+- Packing token-major V stores via wave `shuffle_idx` into
+  `ds_write_b128` along `BLOCK_N` (layout unchanged). Correct; M=1
+  +15.8%, M=8 +43.1%, M=512 flat. Keep scalar `v_lds[d, col] =`.
