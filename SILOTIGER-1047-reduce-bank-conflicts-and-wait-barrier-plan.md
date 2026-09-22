@@ -504,3 +504,15 @@ The parent plan remains the full K2 list.
   `+4096/+4104`); the opcode does not transfer to our single-region
   `[BLOCK_N, D]` tile. Keep the 128-bit V publish. Re-open only together
   with AMD's V geometry, not as an opcode match.
+- Extending the existing prefill QK one-read-ahead pipeline across all
+  four N subtiles. Two correct K-major schedules were measured:
+  (1) issue four current-round K32 LDS reads before four independent
+  MFMAs; (2) additionally issue all four next-round reads before
+  consuming the current round. The deeper version changed prefill ISA
+  wait counts from `lgkmcnt(1/2) = 11/16` to `16/13`, with MFMA count
+  (48) and VGPR allocation (257) unchanged. It nevertheless measured
+  `14.90 / 17.64 / 414.74` us versus a back-to-back HEAD baseline of
+  `14.88 / 17.54 / 410.42` at `M=1/8/512`: decode flat, prefill +1.05%.
+  The shallower K-major schedule was also ~1% slower at prefill. Keep
+  the existing per-N-subtile one-read-ahead loop; static `lgkmcnt(2)`
+  frequency alone was not the bottleneck.
