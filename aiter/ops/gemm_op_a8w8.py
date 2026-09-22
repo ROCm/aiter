@@ -861,7 +861,8 @@ def gemm_a8w8_blockscale(
 ) -> torch.Tensor:
     """Blockscaled A8W8 GEMM with configuration-first backend dispatch.
 
-    Native E8M0 group32 operands use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32;
+    Native E8M0 group32 scales (typed tensors or uint8 views) use
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32;
     FP32 128x128 scales use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE. Both tables are
     queried through get_CKGEMM_config before choosing a fallback. Group32
     currently supports libtype="triton", also its default on a config miss.
@@ -870,12 +871,20 @@ def gemm_a8w8_blockscale(
     partition count without changing configured backend selection.
     """
     is_group32 = (
-        x_scale.dtype == dtypes.fp8_e8m0
-        and w_scale.dtype == dtypes.fp8_e8m0
-        and x_scale.ndim == 2
-        and XQ.ndim == 2
-        and x_scale.shape[1] == XQ.shape[1] // 32
+        x_scale.dtype in (dtypes.fp8_e8m0, torch.uint8)
+        and w_scale.dtype in (dtypes.fp8_e8m0, torch.uint8)
+        and XQ.ndim == WQ.ndim == 2
+        and x_scale.shape == (XQ.shape[0], XQ.shape[1] // 32)
+        and w_scale.shape
+        in (
+            (WQ.shape[0], WQ.shape[1] // 32),
+            (-(-WQ.shape[0] // 32), WQ.shape[1] // 32),
+        )
     )
+    # A malformed byte-scale layout must not fall through to FP32 CK dispatch.
+    assert (
+        is_group32 or x_scale.dtype == w_scale.dtype == dtypes.fp32
+    ), "Expected E8M0 group32 scale shapes (typed or uint8), or FP32 128x128 scales"
     assert (
         split_k is None or is_group32
     ), "split_k override requires native group32 operands"

@@ -20,22 +20,26 @@ from aiter.test_common import checkAllclose
 pytestmark = pytest.mark.skipif(get_gfx() != "gfx950", reason="CDNA4 packed MFMA")
 
 
-def _operands(m, n, k):
+def generate_inputs(m, n, k, weight_group_rows=32):
     torch.manual_seed(m + n + k)
     x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
     weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
     xs = torch.randint(122, 131, (m, k // 32), device="cuda", dtype=torch.uint8)
     ws = torch.randint(
-        122, 131, ((n + 31) // 32, k // 32), device="cuda", dtype=torch.uint8
+        122,
+        131,
+        (-(-n // weight_group_rows), k // 32),
+        device="cuda",
+        dtype=torch.uint8,
     )
     return x, weight, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu)
 
 
-def _reference(x, weight, xs, ws):
+def run_torch(x, weight, xs, ws, weight_group_rows=32):
     # FP64 is independent of the MFMA's internal block accumulation and of
     # either implementation's K reduction order.
     a = x.double() * xs.double().repeat_interleave(32, -1)
-    b = weight.double() * ws.double().repeat_interleave(32, 0)[
+    b = weight.double() * ws.double().repeat_interleave(weight_group_rows, 0)[
         : weight.shape[0]
     ].repeat_interleave(32, -1)
     return a @ b.T
@@ -64,9 +68,9 @@ def _reference(x, weight, xs, ws):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_group32_projection_panel_scales_and_tails(m, n, k, dtype):
-    x, weight, xs, ws = _operands(m, n, k)
+    x, weight, xs, ws = generate_inputs(m, n, k)
     actual = gemm_a8w8_blockscale_group32(x, weight, xs, ws, dtype=dtype)
-    expected = _reference(x, weight, xs, ws)
+    expected = run_torch(x, weight, xs, ws)
     peak = expected.abs().max().item()
     # Keep the established native-MFMA FP32 bound. BF16 additionally rounds
     # output; near cancellation still uses the same peak-relative floor.
@@ -84,20 +88,16 @@ def test_group32_projection_panel_scales_and_tails(m, n, k, dtype):
 
 @pytest.mark.parametrize("m,packed", [(3, True), (129, False)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_tuned_variants_with_column_and_k_tails(m, packed, dtype):
-    # Reuse a measured tile with irregular N and K to exercise masks in both
-    # optimized variants; an untuned geometry alone would use DEFAULT.json.
-    config, tuned = get_gemm_config("GEMM-A8W8_BLOCKSCALE_GROUP32", m, 8192, 1280)
+def test_tuned_variants_use_production_config(m, packed, dtype):
+    n, k = 8192, 1280
+    config, tuned = get_gemm_config("GEMM-A8W8_BLOCKSCALE_GROUP32", m, n, k)
     assert tuned
-    if packed:
-        assert "packed" in config
-    else:
-        # Exercise N-first masking independently of which traversal wins tuning.
-        config.pop("packed", None)
-        config["N_FIRST"] = True
-    x, w, xs, ws = _operands(m, 8193, 1312)
-    actual = gemm_a8w8_blockscale_group32(x, w, xs, ws, dtype=dtype, config=config)
-    expected = _reference(x, w, xs, ws)
+    assert ("packed" in config) == packed
+    if not packed:
+        assert config["N_FIRST"]
+    x, w, xs, ws = generate_inputs(m, n, k)
+    actual = gemm_a8w8_blockscale_group32(x, w, xs, ws, dtype=dtype)
+    expected = run_torch(x, w, xs, ws)
     torch.testing.assert_close(
         actual.float(),
         expected.to(dtype).float(),
@@ -134,7 +134,7 @@ def test_group32_projection_extreme_scale_codes(a_code, b_code):
     "rows,n,k,split_k", [(3, 4096, 1280, None), (33, 8193, 576, 3)]
 )
 def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split_k):
-    x, weight, xs, ws = _operands(2 * rows, n, k)
+    x, weight, xs, ws = generate_inputs(2 * rows, n, k)
     gemm_a8w8_blockscale_group32(
         x, weight, xs, ws, dtype=torch.float32, split_k=split_k
     )
@@ -148,7 +148,7 @@ def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split
         x.copy_((x.float() * factor).to(x.dtype))
         xs.view(torch.uint8).add_(1)
         graph.replay()
-        expected = _reference(x, weight, xs, ws)
+        expected = run_torch(x, weight, xs, ws)
         torch.testing.assert_close(
             actual.float(),
             expected.float(),
@@ -159,7 +159,7 @@ def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
-    x, weight, xs, ws = _operands(97, 8193, 576)
+    x, weight, xs, ws = generate_inputs(97, 8193, 576)
     # Per-row scales share the scheduling kernel but not the compact weight grid.
     ws = ws.repeat_interleave(32, 0)[: weight.shape[0]].contiguous()
     actual = gemm_a8w8_blockscale_group32(
@@ -185,22 +185,26 @@ def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
 )
 @pytest.mark.parametrize("group_n", [1, 32])
 @pytest.mark.parametrize("configured", [False, True])
-def test_public_group32_dispatch(m, n, k, group_n, configured, monkeypatch):
+@pytest.mark.parametrize("raw_views", [False, True])
+def test_public_group32_dispatch(m, n, k, group_n, configured, raw_views, monkeypatch):
     if configured:
         monkeypatch.setattr(
             gemm_op_a8w8, "get_CKGEMM_config", lambda *args: {"libtype": "triton"}
         )
-    x, w, xs, ws = _operands(m, n, k)
+    x, w, xs, ws = generate_inputs(m, n, k)
     if group_n == 1:
         ws = ws.repeat_interleave(32, 0)[:n].contiguous()
     expected = gemm_a8w8_blockscale_group32(x, w, xs, ws, weight_group_rows=group_n)
-    actual = gemm_a8w8_blockscale(x, w, xs, ws)
+    operands = (x, w, xs, ws)
+    if raw_views:
+        operands = tuple(t.view(torch.uint8) for t in operands)
+    actual = gemm_a8w8_blockscale(*operands)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("split_k", [None, 1, 3, 100])
 def test_raw_views_and_preallocated_output(split_k):
-    x, w, xs, ws = _operands(63, 8193, 576)
+    x, w, xs, ws = generate_inputs(63, 8193, 576)
     output = torch.empty((63, 8193), dtype=torch.bfloat16, device="cuda")
     actual = gemm_a8w8_blockscale_group32(
         x.view(torch.uint8),
@@ -211,7 +215,7 @@ def test_raw_views_and_preallocated_output(split_k):
         split_k=split_k,
     )
     assert actual is output
-    expected = _reference(x, w, xs, ws).to(output.dtype)
+    expected = run_torch(x, w, xs, ws).to(output.dtype)
     checkAllclose(
         expected,
         actual,
@@ -225,7 +229,7 @@ def test_raw_views_and_preallocated_output(split_k):
     "invalid", ["stride", "scale_shape", "scale_dtype", "output", "split"]
 )
 def test_invalid_group32_contract(invalid):
-    x, w, xs, ws = _operands(3, 2053, 1280)
+    x, w, xs, ws = generate_inputs(3, 2053, 1280)
     kwargs = {}
     if invalid == "stride":
         x = x.T.contiguous().T
@@ -248,7 +252,7 @@ def test_public_group32_compile_dynamic_rows(split_k):
 
     compiled = torch.compile(forward, fullgraph=True, dynamic=True)
     for m in (3, 7, 65):
-        x, w, xs, ws = _operands(m, 4096, 1280)
+        x, w, xs, ws = generate_inputs(m, 4096, 1280)
         torch.testing.assert_close(
             compiled(x, w, xs, ws), forward(x, w, xs, ws), rtol=0, atol=0
         )
@@ -261,7 +265,7 @@ def test_public_group32_graph_replay(configured, split_k, monkeypatch):
         monkeypatch.setattr(
             gemm_op_a8w8, "get_CKGEMM_config", lambda *args: {"libtype": "triton"}
         )
-    x, w, xs, ws = _operands(3, 4096, 1280)
+    x, w, xs, ws = generate_inputs(3, 4096, 1280)
     gemm_a8w8_blockscale(x, w, xs, ws, split_k=split_k)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -272,3 +276,18 @@ def test_public_group32_graph_replay(configured, split_k, monkeypatch):
     graph.replay()
     expected = gemm_a8w8_blockscale_group32(x, w, xs, ws, split_k=split_k)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("n", [1, 2, 16, 31, 32, 33])
+@pytest.mark.parametrize("group_n", [1, 32])
+@pytest.mark.parametrize("raw_views", [False, True])
+def test_public_small_n_scale_layouts(n, group_n, raw_views):
+    x, w, xs, ws = generate_inputs(3, n, 128, weight_group_rows=group_n)
+    expected = run_torch(x, w, xs, ws, weight_group_rows=group_n)
+    operands = (x, w, xs, ws)
+    if raw_views:
+        operands = tuple(t.view(torch.uint8) for t in operands)
+    actual = gemm_a8w8_blockscale(*operands, dtype=torch.float32)
+    torch.testing.assert_close(
+        actual.double(), expected, rtol=3e-5, atol=5e-5 * expected.abs().max().item()
+    )

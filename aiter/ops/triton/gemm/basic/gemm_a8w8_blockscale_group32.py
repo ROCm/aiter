@@ -90,8 +90,18 @@ def gemm_a8w8_blockscale_group32(
     w_scale = w_scale.view(torch.uint8)
     if config is None:
         config, _ = _get_config(M, N, K)
-    packed = config.get("packed")
-    if packed is not None and weight_group_rows == 32 and split_k is None:
+    packed = (
+        config.get("packed") if weight_group_rows == 32 and split_k is None else None
+    )
+    launch_config = config if packed is None else packed
+    launch_options = {
+        key: launch_config[key]
+        for key in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim")
+    }
+    # Triton's repr callback sees constexpr arguments, not compiler options.
+    # Carry the same values into the name without a second source of tuning.
+    launch_repr = tuple(launch_options.items())
+    if packed is not None:
         block_m, block_n = packed["BLOCK_SIZE_M"], packed["BLOCK_SIZE_N"]
         _gemm_a8w8_blockscale_group32_packed_kernel[
             (-(-M // block_m), -(-N // block_n))
@@ -108,10 +118,8 @@ def gemm_a8w8_blockscale_group32(
             block_n,
             packed["BLOCK_SIZE_K"],
             packed["K_PACK"],
-            num_warps=packed["num_warps"],
-            num_stages=packed["num_stages"],
-            waves_per_eu=packed["waves_per_eu"],
-            matrix_instr_nonkdim=packed["matrix_instr_nonkdim"],
+            LAUNCH_OPTIONS=launch_repr,
+            **launch_options,
         )
         return y
 
@@ -145,10 +153,8 @@ def gemm_a8w8_blockscale_group32(
         block_n,
         block_k,
         N_FIRST=n_first,
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+        LAUNCH_OPTIONS=launch_repr,
+        **launch_options,
     )
     if num_splits > 1:
         reduce_m = config["REDUCE_BLOCK_SIZE_M"]

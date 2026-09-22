@@ -17,11 +17,22 @@ _gemm_group32_repr = make_kernel_repr(
         "GROUP_N",
         "SPLITK_BLOCK_SIZE",
         "N_FIRST",
+        "N",
+        "K",
+        "LAUNCH_OPTIONS",
     ],
 )
 _gemm_group32_packed_repr = make_kernel_repr(
     "_gemm_a8w8_blockscale_group32_packed_kernel",
-    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "K_PACK"],
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "K_PACK",
+        "N",
+        "K",
+        "LAUNCH_OPTIONS",
+    ],
 )
 
 
@@ -42,6 +53,7 @@ def _gemm_a8w8_blockscale_group32_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    LAUNCH_OPTIONS: tl.constexpr,
     N_FIRST: tl.constexpr = False,
 ):
     """E4M3 x E4M3 with E8M0 group scales, on the CDNA4 microscaling MFMA.
@@ -115,6 +127,7 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     K_PACK: tl.constexpr,
+    LAUNCH_OPTIONS: tl.constexpr,
 ):
     """Small-M group32 GEMM with K panels packed into MFMA rows/columns.
 

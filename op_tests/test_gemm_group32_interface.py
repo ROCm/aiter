@@ -83,7 +83,18 @@ def test_invalid_file_bounds(config_dir, bounds):
 @pytest.mark.parametrize("group_n", [1, 32])
 @pytest.mark.parametrize("libtype", [None, "triton", "ck", "cktile", "unknown"])
 @pytest.mark.parametrize("split_k", [None, 3])
-def test_public_native_group32_route(monkeypatch, group_n, libtype, split_k):
+@pytest.mark.parametrize(
+    "scale_dtypes",
+    [
+        (torch.float8_e8m0fnu, torch.float8_e8m0fnu),
+        (torch.uint8, torch.uint8),
+        (torch.float8_e8m0fnu, torch.uint8),
+        (torch.uint8, torch.float8_e8m0fnu),
+    ],
+)
+def test_public_native_group32_route(
+    monkeypatch, group_n, libtype, split_k, scale_dtypes
+):
     calls = []
     expected = torch.empty((3, 65), dtype=torch.float32)
 
@@ -101,8 +112,8 @@ def test_public_native_group32_route(monkeypatch, group_n, libtype, split_k):
     monkeypatch.setattr(group32, "gemm_a8w8_blockscale_group32", backend)
     x = torch.empty((3, 64), dtype=torch.float8_e4m3fn)
     w = torch.empty((65, 64), dtype=torch.float8_e4m3fn)
-    xs = torch.empty((3, 2), dtype=torch.float8_e8m0fnu)
-    ws = torch.empty(((65 + group_n - 1) // group_n, 2), dtype=torch.float8_e8m0fnu)
+    xs = torch.empty((3, 2), dtype=scale_dtypes[0])
+    ws = torch.empty(((65 + group_n - 1) // group_n, 2), dtype=scale_dtypes[1])
     if libtype not in (None, "triton"):
         with pytest.raises(AssertionError, match="Unsupported libtype"):
             gemm_op_a8w8.gemm_a8w8_blockscale(
@@ -240,3 +251,25 @@ def test_legacy_scale_format_rejects_native_split_override():
             torch.empty((1, 1)),
             split_k=3,
         )
+
+
+@pytest.mark.parametrize(
+    "invalid", ["activation_groups", "weight_groups", "mixed_formats"]
+)
+def test_invalid_byte_scales_never_reach_legacy_dispatch(monkeypatch, invalid):
+    def lookup(*args):
+        pytest.fail("Invalid byte scales reached backend configuration lookup")
+
+    monkeypatch.setattr(gemm_op_a8w8, "get_CKGEMM_config", lookup)
+    x = torch.empty((3, 128), dtype=torch.float8_e4m3fn)
+    w = torch.empty((65, 128), dtype=torch.float8_e4m3fn)
+    xs = torch.empty((3, 4), dtype=torch.uint8)
+    ws = torch.empty((3, 4), dtype=torch.uint8)
+    if invalid == "activation_groups":
+        xs = torch.empty((3, 1), dtype=torch.uint8)
+    elif invalid == "weight_groups":
+        ws = torch.empty((3, 1), dtype=torch.uint8)
+    else:
+        xs = xs.float()
+    with pytest.raises(AssertionError, match="Expected E8M0 group32 scale shapes"):
+        gemm_op_a8w8.gemm_a8w8_blockscale(x, w, xs, ws)
