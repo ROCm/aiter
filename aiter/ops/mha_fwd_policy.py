@@ -14,7 +14,8 @@ from hashlib import sha256
 from itertools import product
 from typing import Any, Literal
 
-MHA_FWD_HARDWARE_KEY_FIELDS = ("gfx", "gpu_model", "cu_num")
+from ..jit.utils.chip_info import TUNING_HARDWARE_FIELDS
+
 MHA_FWD_PROBLEM_KEY_FIELDS = (
     "mode",
     "batch",
@@ -46,7 +47,7 @@ MHA_FWD_PROBLEM_KEY_FIELDS = (
     "is_grad",
 )
 MHA_FWD_TUNING_KEY_FIELDS = (
-    *MHA_FWD_HARDWARE_KEY_FIELDS,
+    *TUNING_HARDWARE_FIELDS,
     *MHA_FWD_PROBLEM_KEY_FIELDS,
 )
 MHA_FWD_CANDIDATE_FIELDS = ("backend", "num_splits", "backend_config")
