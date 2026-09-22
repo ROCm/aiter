@@ -1976,7 +1976,17 @@ class MhaFwdTuner(TunerCommon):
             ),
             "races": self._race_reports,
             "coverage_limits": [
-                "CK tile recipes remain the default CK launch; this tuner does not dump PR #5024 JSON",
+                (
+                    "CK is measured as built. Its tile recipe is a compile-time"
+                    " instantiation chosen from a table in CK's own codegen, and"
+                    " nothing in this tree exposes a runtime override, so a CK"
+                    " winner here is CK at whatever recipe its own heuristic"
+                    " picks. Where that table lists one recipe for the head dims"
+                    " -- bf16 192/128 among them -- there is nothing to choose;"
+                    " where it lists several, this run did not explore them."
+                    " Tuning that table is PR #5024's job and needs its"
+                    " unmerged config hook."
+                ),
             ],
             "command": [sys.executable, *sys.argv],
             "started_at_unix_s": self._run_started_at,
