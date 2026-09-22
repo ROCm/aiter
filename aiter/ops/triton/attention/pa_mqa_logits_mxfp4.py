@@ -27,6 +27,12 @@ MIN_DYNAMIC_BATCH = 4
 # this is the most performant page size
 IDEAL_PAGE_SIZE = 64
 
+# The preshuffled cache's e8m0 byte order. 1 is what ships: one MFMA tile per
+# group with the scale axis innermost, read as one wide run. 0 is the narrow
+# order, kept only so a gather can be measured against a cache it was not
+# written for.
+SCALE_MODE_WIDE = 1
+
 def mfma_nonk_dim(num_heads: int, head_size: int) -> int:
     # 32x32x64 leaves one head bit across lanes where 16x16x128 leaves two, so
     # the head sum needs one cross-lane step instead of two.
@@ -65,24 +71,38 @@ def unshuffle_values(x: torch.Tensor, n_per_tile: int,
             .permute(0, 1, 3, 2, 4).contiguous().reshape(p, rows, d))
 
 
-def preshuffle_scales(x: torch.Tensor, n_per_tile: int) -> torch.Tensor:
+def preshuffle_scales(x: torch.Tensor, n_per_tile: int,
+                      scale_mode: int = SCALE_MODE_WIDE) -> torch.Tensor:
     """[P, page, D//32] e8m0 into the order the scale load reads.
 
-    Group is one MFMA tile, lane's run over the scale axis innermost -- both
-    from num_heads and head_size, so the order carries no BLOCK_KV and no warp
-    count.
+    Mode 1, the default, groups one MFMA tile and puts the lane's run over the
+    scale axis innermost -- both from num_heads and head_size, so the order
+    carries no BLOCK_KV and no warp count -- and a whole tile is then one wide
+    run. Mode 0 puts the token axis innermost instead, which costs the dense
+    reader a byte-wide load per group and buys nothing; it exists so a candidate
+    gather can be priced against a storage order that is not the shipping one.
+
+    Both orders keep a token's scales at a constant stride inside a group, so
+    both are addressable by a gather finer than the group.
     """
     WARP_SIZE = 64
     p, rows, ns = x.shape
+    if scale_mode == 0:
+        return (x.reshape(p, rows // n_per_tile, n_per_tile, ns)
+                .permute(0, 1, 3, 2).contiguous().reshape(p, rows, ns))
     s_lo = WARP_SIZE // n_per_tile
     s_hi = ns // s_lo
     return (x.reshape(p, rows // n_per_tile, n_per_tile, s_hi, s_lo)
             .permute(0, 1, 4, 2, 3).contiguous().reshape(p, rows, ns))
 
 
-def unshuffle_scales(x: torch.Tensor, n_per_tile: int) -> torch.Tensor:
+def unshuffle_scales(x: torch.Tensor, n_per_tile: int,
+                     scale_mode: int = SCALE_MODE_WIDE) -> torch.Tensor:
     WARP_SIZE = 64
     p, rows, ns = x.shape
+    if scale_mode == 0:
+        return (x.reshape(p, rows // n_per_tile, ns, n_per_tile)
+                .permute(0, 1, 3, 2).contiguous().reshape(p, rows, ns))
     s_lo = WARP_SIZE // n_per_tile
     s_hi = ns // s_lo
     return (x.reshape(p, rows // n_per_tile, s_lo, n_per_tile, s_hi)
@@ -90,12 +110,13 @@ def unshuffle_scales(x: torch.Tensor, n_per_tile: int) -> torch.Tensor:
 
 
 def preshuffle_cache(values: torch.Tensor, scales: torch.Tensor,
-                     num_heads: int, head_size: int):
+                     num_heads: int, head_size: int,
+                     scale_mode: int = SCALE_MODE_WIDE):
     """Natural order into the stored order. A cache-prep kernel should emit
     these bytes directly; this is the reference for what that means."""
     f = cache_format(num_heads, head_size, values.shape[1])
     return (preshuffle_values(values, f["n_per_tile"], f["d_per_tile"]),
-            preshuffle_scales(scales, f["n_per_tile"]))
+            preshuffle_scales(scales, f["n_per_tile"], scale_mode))
 
 
 def pack_cache(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -234,6 +255,9 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
                         or (split_page and not 2 <= next_n <= SPEC_ROWS)) else 0,
         m_chunk=n_per_tile if (num_heads > n_per_tile and n_per_tile == 32) else 0,
         num_chains=1,
+        # Hoists the candidate-list read a tile past the KV prefetch, the way
+        # page_pipe hoists the block-table read. Only meaningful under `gather`.
+        gather_pipe=1,
         relaxed_store=0 if clean_logits else 1,
         # Follows FOLD_ASM rather than standing alone: without it the SLP
         # vectorizer pairs the adds into v_pk_add_f32, which has no abs modifier.
@@ -252,16 +276,19 @@ def select_config(num_heads, head_size, next_n, page_size, preshuffle=1,
 
 def build_schedule(context_lens, next_n, num_heads, head_size,
                    page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None,
-                   cu_ends=None):
+                   cu_ends=None, gather=0):
     """Descriptors for one launch, or None if the shape does not fit.
 
     A descriptor is (sequence, row block, slice index, slice count), relative
     rather than absolute, so the kernel converts it against its own tile count.
 
-    cu_ends only affects balance here.
+    cu_ends only affects balance here. Pass the same gather flag the launch
+    uses, or the slot counts are read as key positions.
     """
     plan = select_config(num_heads, head_size, next_n, page_size, preshuffle)
     row_blocks, block_m = plan["row_blocks"], plan["block_m"]
+    if gather:
+        row_blocks, block_m = next_n, 1
     block_kv, target_wgs = plan["block_kv"], plan["target_wgs"]
     batch = int(context_lens.numel())
     work = batch * row_blocks
@@ -291,6 +318,7 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         ALIGN_W=align_w,
         BLOCK_P=SCHED_BLOCK_P,
         HAS_CU_ENDS=1 if cu_ends is not None else 0,
+        GATHER=int(gather),
         num_warps=4,
     )
     # The launcher takes the grid from the length, so the length is the contract
@@ -326,9 +354,11 @@ def paged_mxfp4_mqa_logits(
     out_logits: torch.Tensor | None = None,
     clean_logits: bool = True,
     preshuffle: int = 1,
+    scale_mode: int = SCALE_MODE_WIDE,
     dynamic: int = 0,
     schedule: torch.Tensor | None = None,
     cu_ends: torch.Tensor | None = None,
+    gather: dict | None = None,
 ) -> torch.Tensor:
     """
     This function computes the logits to be used by a topk function for sparse
@@ -359,7 +389,13 @@ def paged_mxfp4_mqa_logits(
     cu_ends:        [B * NEXT_N], dtype int32, optional. Exclusive per-row key
                     bound, indexed like weights, defaulting to
                     context_lens[b] - NEXT_N + n + 1; pass it under compression
-                    or context parallelism. build_schedule needs the same tensor
+                    or context parallelism. build_schedule needs the same tensor.
+                    Under gather it counts the row's valid candidate slots
+                    instead, the list having been causally filtered already
+    gather:         what build_gather returns. The walk then runs over a
+                    host-resolved candidate list rather than the context, and
+                    output column j holds candidate slot j. context_lens and
+                    block_table are unread on this path
 
     Returns:
     logits:         [B * NEXT_N, max_model_len], dtype float32
@@ -419,8 +455,31 @@ def paged_mxfp4_mqa_logits(
     assert max_model_len * 4 < 2 ** 31, (
         f"max_model_len {max_model_len} exceeds what a buffer store can address")
 
+    # A candidate gather. `gather` is what build_gather returns: two int32
+    # [B*next_n, blocks] tensors of already-resolved offsets -- page address
+    # plus the block's own offset inside its page. The kernel adds one of those
+    # per column and nothing else; there is no block-table read on this path.
+    # The walk length is the row's valid slot count, which arrives as cu_ends.
+    gather_on = 1 if gather is not None else 0
+    gather_block = int(gather["block"]) if gather_on else 8
+    if gather_on:
+        g_voff, g_soff = gather["voff"], gather["soff"]
+        assert g_voff.dtype == torch.int32 and g_soff.dtype == torch.int32
+        assert g_voff.shape == g_soff.shape, (g_voff.shape, g_soff.shape)
+        assert g_voff.stride(1) == 1 and g_soff.stride(1) == 1
+        assert g_voff.stride(0) == g_soff.stride(0)
+        assert g_voff.shape[0] == batch * next_n, g_voff.shape
+        assert cu_ends is not None, (
+            "the gather takes its walk length from cu_ends, read as the row's "
+            "count of valid candidate slots")
+
     cfg = select_config(num_heads, head_size, next_n, page_size, preshuffle,
                         clean_logits)
+    if gather_on:
+        # One query row per workgroup: above one row the walk is over the
+        # rows' union and each row's store column comes from a per-block slot,
+        # none of which the candidate addressing carries.
+        cfg = dict(cfg, block_m=1, row_blocks=next_n)
     block_m, row_blocks = cfg["block_m"], cfg["row_blocks"]
     block_kv, n_per_tile = cfg["block_kv"], cfg["n_per_tile"]
     target_wgs = cfg["target_wgs"]
@@ -433,6 +492,14 @@ def paged_mxfp4_mqa_logits(
 
     use_buffer_load = bool(preshuffle) or (
         num_pages * max(kv_page_stride, kvs_page_stride) < 2 ** 31)
+    if gather_on:
+        assert block_kv % gather_block == 0 and page_size % gather_block == 0
+        assert gather_block <= n_per_tile, (
+            "a candidate block must sit inside one shuffle group")
+        # The whole address is in the offsets here, so a cache past 2 GiB drops
+        # to 64-bit the way every other offset-addressed path does. The value
+        # list is in k_width units, so only the scale stream is capped.
+        use_buffer_load = num_pages * max(kv_page_stride, kvs_page_stride) < 2 ** 31
 
     # The two that need the batch, which select_config does not see.
     cfg["num_kv_splits"] = _kv_splits(
@@ -443,7 +510,13 @@ def paged_mxfp4_mqa_logits(
     cfg["kv_reread"] = 1 if row_blocks > 1 else 0
 
     num_kv_splits = cfg["num_kv_splits"]
-    if schedule is None and dynamic:
+    # A gather launch does not build one. Every row walks the same
+    # ceil(slots / BLOCK_KV) tiles, so there is no spread for a slice plan to
+    # even out, and the build costs about half a launch. A dynamic=1 set for the
+    # step must not drag a consumer layer in. An explicit schedule is still
+    # honoured, and build_schedule takes the same gather flag so its tile count
+    # comes out of the slot counts.
+    if schedule is None and dynamic and not gather_on:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
                                   page_size, preshuffle, cu_ends=cu_ends)
     use_dynamic = schedule is not None
@@ -467,6 +540,8 @@ def paged_mxfp4_mqa_logits(
         cu_ends_ptr=cu_ends,
         block_table_ptr=block_table,
         sched_ptr=schedule,
+        gather_v_ptr=g_voff if gather_on else schedule,
+        gather_s_ptr=g_soff if gather_on else schedule,
         logits_ptr=logits,
         next_n=next_n,
         num_kv_splits=num_kv_splits,
@@ -478,6 +553,7 @@ def paged_mxfp4_mqa_logits(
         stride_logits_s=logits.stride(0),
         stride_logits_k=logits.stride(1),
         stride_blk_b=block_table.stride(0),
+        stride_gather_r=g_voff.stride(0) if gather_on else 0,
         max_blocks=block_table.shape[1],
         NUM_HEADS=num_heads,
         HEAD_SIZE=head_size,
@@ -497,12 +573,16 @@ def paged_mxfp4_mqa_logits(
         RELU_ADD=cfg["relu_add"],
         RELAXED_STORE=cfg["relaxed_store"],
         PRESHUFFLE=preshuffle,
+        SCALE_MODE=int(scale_mode),
         USE_BUFFER_LOAD=use_buffer_load,
         MFMA_NONK_DIM=n_per_tile,
         HAS_KV_SPLIT=1 if (num_kv_splits > 1 or use_dynamic) else 0,
         KV_REREAD=cfg["kv_reread"],
         DYNAMIC=int(use_dynamic),
         HAS_CU_ENDS=1 if cu_ends is not None else 0,
+        GATHER=gather_on,
+        GATHER_BLOCK=gather_block,
+        GATHER_PIPE=cfg["gather_pipe"] if gather_on else 0,
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
     )

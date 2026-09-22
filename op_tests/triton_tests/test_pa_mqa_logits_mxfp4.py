@@ -7,6 +7,7 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (cache_format,
                                             paged_mxfp4_mqa_logits,
                                             preshuffle_cache,
                                             unshuffle_scales, unshuffle_values)
+from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import build_gather
 
 SCALE_GROUP = 32
 SEED = 0
@@ -95,9 +96,9 @@ def cu_ends_for(kind, ctx_lens, next_n, ratio=2, device="cuda"):
     return torch.tensor(ends, dtype=torch.int32, device=device)
 
 
-def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
-             page_offset=0, seed=SEED, check_inf=True, preshuffle=1,
-             clean_logits=True, dynamic=0, cu_ends=None):
+def _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
+               page_offset=0, seed=SEED, preshuffle=1):
+    """The quantised inputs and the packed cache, seeded so two calls agree."""
     dev = "cuda"
     torch.manual_seed(seed)
     ctx = [int(c) for c in ctx_lens]
@@ -141,12 +142,24 @@ def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
     flat[phys, :page_size * hb] = sv.reshape(used, -1)
     flat[phys, page_size * hb:] = ss.reshape(used, -1)
     del v_used, s_used, sv, ss, flat
-    qp, qsp = q4, q4s
 
-    mml = per_seq * page_size
-    cl_t = torch.tensor(ctx, dtype=torch.int32, device=dev)
+    return dict(q4=q4, q4s=q4s, kv4=kv4, kv4s=kv4s, cache=cache,
+                weights=weights, block_table=block_table, ctx=ctx,
+                cl=torch.tensor(ctx, dtype=torch.int32, device=dev),
+                mml=per_seq * page_size, num_pages=num_pages, dev=dev)
+
+
+def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
+             page_offset=0, seed=SEED, check_inf=True, preshuffle=1,
+             clean_logits=True, dynamic=0, cu_ends=None):
+    st = _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
+                    page_offset, seed, preshuffle)
+    q4, q4s, kv4, kv4s = st["q4"], st["q4s"], st["kv4"], st["kv4s"]
+    cache, weights, ctx, mml = st["cache"], st["weights"], st["ctx"], st["mml"]
+    num_pages = st["num_pages"]
+
     out = paged_mxfp4_mqa_logits(
-        qp, qsp, cache, weights, cl_t, block_table, mml,
+        q4, q4s, cache, weights, st["cl"], st["block_table"], mml,
         preshuffle=preshuffle, clean_logits=clean_logits, dynamic=dynamic,
         cu_ends=cu_ends)
     torch.cuda.synchronize()
@@ -224,6 +237,122 @@ def test_cu_ends(shape, kind, num_heads, dynamic):
     assert inf_ok, "the -inf pattern does not match the reference"
 
 
+GATHER_SHAPES = [
+    ("decode b4", 4, 1, [2048, 1024, 512, 129]),
+    ("spec n=4", 2, 4, [2048, 601]),
+]
+
+
+def _gather_run(st, num_heads, head_size, next_n, block, preshuffle,
+                positions, cu_ends, dynamic=0):
+    meta = build_gather(positions,
+                        st["block_table"].repeat_interleave(next_n, 0),
+                        st["cache"], num_heads, head_size, block,
+                        preshuffle=preshuffle)
+    out = paged_mxfp4_mqa_logits(
+        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+        st["block_table"], st["mml"], preshuffle=preshuffle, gather=meta,
+        cu_ends=cu_ends, dynamic=dynamic)
+    torch.cuda.synchronize()
+    return out
+
+
+def _identity_list(st, next_n, block):
+    """The candidate list [0, block, 2*block, ...] and each row's slot count.
+
+    The count is the kernel's own causal bound, so compact column j is KV
+    position j and the two arms must agree bit for bit.
+    """
+    dev, mml = st["dev"], st["mml"]
+    rows = len(st["ctx"]) * next_n
+    r = torch.arange(rows, device=dev) % next_n
+    ctx_r = torch.tensor(st["ctx"], device=dev).repeat_interleave(next_n)
+    ends = torch.clamp(ctx_r - next_n + r + 1, min=0).to(torch.int32)
+    k = (mml + block - 1) // block
+    base = (torch.arange(k, device=dev) * block)[None, :]
+    last = (((ends.long() - 1) // block) * block).clamp(min=0)[:, None]
+    return torch.minimum(base.expand(rows, k), last).contiguous(), ends
+
+
+@pytest.mark.parametrize("shape", GATHER_SHAPES,
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("preshuffle", [1, 0])
+@pytest.mark.parametrize("block", [8, 16, 32])
+def test_gather_identity(shape, num_heads, preshuffle, block):
+    """The primary gate on the candidate gather.
+
+    The block-to-byte map is not linear in the block index -- at page 64 the
+    eight 8-token blocks of a page start at 0, 128, 256, 384, 2048, 2176, 2304,
+    2432 -- so multiplying a block index by a stride produces plausible garbage
+    that no tolerance check catches. Fed the identity list the gather walks the
+    same positions in the same order through a different addressing path, so
+    the only acceptable result is bit-identity.
+    """
+    _, batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64,
+                    preshuffle=preshuffle)
+    ref = paged_mxfp4_mqa_logits(
+        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+        st["block_table"], st["mml"], preshuffle=preshuffle).clone()
+    torch.cuda.synchronize()
+    pos, ends = _identity_list(st, next_n, block)
+    got = _gather_run(st, num_heads, 128, next_n, block, preshuffle, pos, ends)
+    nd = int((ref.view(torch.int32) != got.view(torch.int32)).sum())
+    assert nd == 0, f"{nd} differing words"
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("preshuffle", [1, 0])
+def test_gather_scattered(num_heads, preshuffle):
+    """A genuinely scattered list, against the dequantised cache.
+
+    Also the check that cu_ends is read in slot space: the output is compact,
+    so row r holds its candidates at columns [0, cu_ends[r]) whatever KV
+    positions they came from, and everything past that stays -inf.
+    """
+    batch, next_n, block, nb = 2, 2, 8, 16
+    st = _make_case(batch, next_n, num_heads, 128, [1024, 768], 64,
+                    preshuffle=preshuffle)
+    dev, rows = st["dev"], batch * next_n
+    g = torch.Generator(device=dev).manual_seed(7)
+    pos = torch.stack([
+        torch.randperm(768 // block, device=dev, generator=g)[:nb].sort().values
+        for _ in range(rows)]).long() * block
+    ends = torch.full((rows,), nb * block, dtype=torch.int32, device=dev)
+    got = _gather_run(st, num_heads, 128, next_n, block, preshuffle, pos, ends)
+
+    kv_deq = dequantize(st["kv4"], st["kv4s"])
+    q_deq = dequantize(st["q4"], st["q4s"])
+    slots = (pos[:, :, None]
+             + torch.arange(block, device=dev)[None, None, :]).reshape(rows, -1)
+    ref = torch.full_like(got, float("-inf"))
+    for r in range(rows):
+        b = r // next_n
+        k = kv_deq[b].index_select(0, slots[r]).float()
+        qk = torch.relu(q_deq[b, r % next_n].float() @ k.T)
+        ref[r, :nb * block] = (qk * st["weights"][r].float()[:, None]).sum(0)
+    assert float(calc_diff(got[:, :nb * block], ref[:, :nb * block])) <= TOL
+    assert bool(torch.isinf(got[:, nb * block:]).all()), "tail is not -inf"
+
+
+def test_gather_needs_cu_ends():
+    """cu_ends is the gather's walk length, so it is not optional there."""
+    st = _make_case(1, 1, 32, 128, [512], 64)
+    pos, _ = _identity_list(st, 1, 8)
+    with pytest.raises(AssertionError, match="cu_ends"):
+        _gather_run(st, 32, 128, 1, 8, 1, pos, None)
+
+
+def test_gather_ignores_dynamic():
+    """A gather launch does not build a device schedule: every row walks the
+    same tile count, so there is no spread to even out. dynamic=1 set for the
+    step must leave the result alone."""
+    st = _make_case(4, 1, 32, 128, [2048, 1024, 512, 129], 64)
+    pos, ends = _identity_list(st, 1, 8)
+    a = _gather_run(st, 32, 128, 1, 8, 1, pos, ends).clone()
+    b = _gather_run(st, 32, 128, 1, 8, 1, pos, ends, dynamic=1)
+    assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
 @pytest.mark.parametrize("gib", [5.0, ])

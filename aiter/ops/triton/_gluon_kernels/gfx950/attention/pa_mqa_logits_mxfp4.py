@@ -235,8 +235,12 @@ class Config:
     FOLD_ASM: gl.constexpr
     RELU_ADD: gl.constexpr
     PRESHUFFLE: gl.constexpr
+    SCALE_MODE: gl.constexpr
     USE_BUFFER_LOAD: gl.constexpr
     RELAXED_STORE: gl.constexpr
+    GATHER: gl.constexpr
+    GATHER_BLOCK: gl.constexpr
+    GATHER_PIPE: gl.constexpr
     N_PER_TILE: gl.constexpr
     D_PER_TILE: gl.constexpr
     Q_CACHE: gl.constexpr
@@ -255,9 +259,9 @@ class Config:
     def __init__(self, NUM_HEADS, HEAD_SIZE, PAGE_SIZE, BLOCK_KV, BLOCK_M,
                  KV_PAGE_STRIDE, KVS_PAGE_STRIDE, NUM_WARPS, NUM_BUFFERS, DEPTH,
                  UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
-                 PRESHUFFLE, USE_BUFFER_LOAD, RELAXED_STORE,
+                 PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
                  MFMA_NONK_DIM, HAS_KV_SPLIT,
-                 KV_REREAD):
+                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE):
         self.NUM_HEADS = gl.constexpr(NUM_HEADS)
         self.HEAD_BYTES = gl.constexpr(HEAD_SIZE // 2)
         self.NUM_SCALES = gl.constexpr(HEAD_SIZE // SCALE_GROUP.value)
@@ -283,8 +287,22 @@ class Config:
         self.FOLD_ASM = gl.constexpr(FOLD_ASM)
         self.RELU_ADD = gl.constexpr(RELU_ADD)
         self.PRESHUFFLE = gl.constexpr(PRESHUFFLE)
+        # The preshuffled cache's e8m0 byte order. 1 groups one MFMA tile with
+        # the scale axis innermost, which is what lets a whole tile be read as
+        # one wide run; 0 puts the token axis innermost, one buffer_load_ubyte
+        # per group. Both are gatherable at any granularity up to N_PER_TILE --
+        # they differ in load width, not in whether a candidate block's bytes
+        # are addressable -- so which one a shared cache is written in is a
+        # question about the dense reader, not about the gather.
+        self.SCALE_MODE = gl.constexpr(SCALE_MODE)
         self.USE_BUFFER_LOAD = gl.constexpr(USE_BUFFER_LOAD)
         self.RELAXED_STORE = gl.constexpr(RELAXED_STORE)
+        # Walk a host-resolved candidate list in GATHER_BLOCK-token units
+        # instead of BLOCK_KV contiguous positions. GATHER_PIPE reads that list
+        # an iteration early, the way PAGE_PIPE reads the block table.
+        self.GATHER = gl.constexpr(GATHER)
+        self.GATHER_BLOCK = gl.constexpr(GATHER_BLOCK)
+        self.GATHER_PIPE = gl.constexpr(GATHER_PIPE)
         self.N_PER_TILE = gl.constexpr(MFMA_NONK_DIM)
         self.D_PER_TILE = gl.constexpr(K_WIDTH.value)
         # A split re-reads Q, so keep it in L1. The KV stream takes .cg when one
@@ -396,10 +414,13 @@ class KVState:
     last_page_row: gl.tensor
     val_offsets: gl.tensor
     scale_offsets: gl.tensor
+    gv_ptr: gl.tensor
+    gs_ptr: gl.tensor
+    last_blk: gl.tensor
 
     @gluon.constexpr_function
     def __init__(self, cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
-                 val_offsets, scale_offsets):
+                 val_offsets, scale_offsets, gv_ptr, gs_ptr, last_blk):
         self.cfg = cfg
         self.KV_ptr = KV_ptr
         self.kv_scales_ptr = kv_scales_ptr
@@ -407,14 +428,24 @@ class KVState:
         self.last_page_row = last_page_row
         self.val_offsets = val_offsets
         self.scale_offsets = scale_offsets
+        self.gv_ptr = gv_ptr
+        self.gs_ptr = gs_ptr
+        self.last_blk = last_blk
 
     @gluon.jit
     def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
-                   val_layout: gl.constexpr):
+                   gv_ptr, gs_ptr, last_blk, val_layout: gl.constexpr):
         offs_d = gl.arange(0, cfg.HEAD_BYTES,
                            layout=gl.SliceLayout(1, val_layout))[:, None]
         offs_n = gl.arange(0, cfg.BLOCK_KV,
                            layout=gl.SliceLayout(0, val_layout))[None, :]
+        # Both byte maps are separable -- A(d) + B(n) -- and a candidate block
+        # never straddles a shuffle group, so B(t0 + c) = B(t0) + c * stride for
+        # c < GATHER_BLOCK. Only the `c` term is loop invariant and lives here;
+        # B(t0) plus the page address arrives per tile as one runtime vector,
+        # which is the whole of the addressing change.
+        if cfg.GATHER:
+            offs_n = offs_n % cfg.GATHER_BLOCK
         if cfg.PRESHUFFLE:
             val = _shuffled_offsets(offs_d, offs_n, cfg.HEAD_BYTES,
                                     cfg.N_PER_TILE, cfg.D_PER_TILE)
@@ -425,18 +456,98 @@ class KVState:
                        layout=gl.SliceLayout(1, cfg.kv_scale_layout))[:, None]
         ss = gl.arange(0, cfg.NUM_SCALES,
                        layout=gl.SliceLayout(0, cfg.kv_scale_layout))[None, :]
+        if cfg.GATHER:
+            sn = sn % cfg.GATHER_BLOCK
         if cfg.PRESHUFFLE:
+            # Only read on the SCALE_MODE 0 path; mode 1's index space is the
+            # four-dimensional one _load_scales_wide builds.
             sc = _shuffled_scale_offsets(sn, ss, cfg.NUM_SCALES, cfg.N_PER_TILE)
         else:
             sc = _token_major_scale_offsets(sn, ss, cfg.NUM_SCALES)
-        return KVState(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, val, sc)
+        return KVState(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, val,
+                       sc, gv_ptr, gs_ptr, last_blk)
+
+    @gluon.jit
+    def gather_base(self, tile_pos, base_ptr, layout: gl.constexpr,
+                    AXIS: gl.constexpr):
+        """This tile's per-column base offset, from the host-resolved list.
+
+        One int32 per candidate block, already holding the page address plus
+        the block's own offset inside its page, so the walk carries no
+        block -> position -> block table -> page chain: one load and one
+        broadcast add.
+
+        `tile_pos` is a slot index here, not a KV position -- the walk is over
+        the compact candidate list and the store columns are compact too.
+        Clamped rather than masked, for the same reason page_token is: a slot
+        past the end of the list still lands on a block this row owns, and its
+        columns are dropped by store_hi at the store.
+        """
+        cols = gl.arange(0, self.cfg.BLOCK_KV, layout=gl.SliceLayout(AXIS, layout))
+        # Split so the tile term stays scalar and the column term is constant:
+        # GATHER_BLOCK divides BLOCK_KV, so this is (tile_pos + cols) // GB.
+        blk = gl.minimum(tile_pos // self.cfg.GATHER_BLOCK
+                         + cols // self.cfg.GATHER_BLOCK, self.last_blk)
+        return gl.load(base_ptr + blk)
+
+    @gluon.jit
+    def gather_scale_base(self, tile_pos):
+        """The scale stream's per-column base in the wide load's index space.
+
+        The preshuffled scale tile is read as [N_HI, S_LO, N_PER_TILE, S_HI]
+        rather than [BLOCK_KV, NUM_SCALES] (see _load_scales_wide), so its
+        candidate index has to be built on that shape: the token is
+        b0 * N_PER_TILE + b2, and the block it belongs to is that over
+        GATHER_BLOCK. Broadcast over the two scale axes, which the block does
+        not depend on.
+        """
+        cfg: gl.constexpr = self.cfg
+        S_LO: gl.constexpr = WARP_SIZE // cfg.N_PER_TILE
+        S_HI: gl.constexpr = cfg.NUM_SCALES // S_LO
+        N_HI: gl.constexpr = cfg.BLOCK_KV // cfg.N_PER_TILE
+        lr: gl.constexpr = _scale_group_layout(cfg.kv_scale_layout, cfg.N_PER_TILE,
+                                               S_LO, S_HI, N_HI)
+        b0 = gl.arange(0, N_HI, layout=_axis_layout(lr, 0, 4))[:, None, None, None]
+        b2 = gl.arange(0, cfg.N_PER_TILE,
+                       layout=_axis_layout(lr, 2, 4))[None, None, :, None]
+        blk = gl.minimum(tile_pos // cfg.GATHER_BLOCK
+                         + (b0 * cfg.N_PER_TILE + b2) // cfg.GATHER_BLOCK,
+                         self.last_blk)
+        return gl.load(self.gs_ptr + blk)
+
+    @gluon.jit
+    def gather_tok(self, tile_pos, val_layout: gl.constexpr):
+        """Both streams' per-column bases for one tile, as a carryable pair.
+
+        Split out from the loads for the same reason page_token is: it is a
+        dependent memory load standing directly in front of every KV address in
+        the tile. GATHER_PIPE is what lets the walk issue it an iteration early.
+        """
+        if self.cfg.GATHER:
+            # The scale base has to be built on whichever index space its load
+            # uses: the four-dimensional one for the wide mode-1 read, the
+            # plain [BLOCK_KV, NUM_SCALES] one otherwise.
+            if self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
+                return (self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
+                        self.gather_scale_base(tile_pos))
+            else:
+                return (self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
+                        self.gather_base(tile_pos, self.gs_ptr,
+                                         self.cfg.kv_scale_layout, 1))
+        else:
+            return tile_pos * 0, tile_pos * 0
 
     @gluon.jit
     def page_token(self, tile_pos):
         # Split out from the loads so the walk can issue it an iteration early
-        return gl.load(self.blk_ptr
-                       + gl.minimum(tile_pos >> self.cfg.PAGE_SHIFT,
-                                    self.last_page_row))
+        if self.cfg.GATHER:
+            # The candidate list already carries the page, so there is no table
+            # read left to hoist.
+            return tile_pos * 0
+        else:
+            return gl.load(self.blk_ptr
+                           + gl.minimum(tile_pos >> self.cfg.PAGE_SHIFT,
+                                        self.last_page_row))
 
     @gluon.jit
     def tile_ptr(self, base, tile_pos, page, PAGE_STRIDE: gl.constexpr,
@@ -459,17 +570,34 @@ class KVState:
                     + in_page.to(gl.int64) * PER_TOKEN)
 
     @gluon.jit
-    def scales(self, tile_pos, page):
+    def scales(self, tile_pos, page, gtok):
         """One [BLOCK_KV, NUM_SCALES] e8m0 tile in the MFMA's scale layout.
 
         Never goes through LDS on either path -- 256 bytes at head_size 128,
         loaded straight into the distribution the scaled MFMA wants.
         """
-        if self.cfg.PRESHUFFLE:
+        if self.cfg.GATHER:
+            # A per-column page, so there is no single tile base to bump: the
+            # whole address goes in the offsets, i32 under buffer_load.
+            if self.cfg.USE_BUFFER_LOAD:
+                gs = gtok[1]
+            else:
+                gs = gtok[1].to(gl.int64)
+            if self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
+                return _load_scales_wide(self.cfg, self.kv_scales_ptr, gs)
+            elif self.cfg.USE_BUFFER_LOAD:
+                return gl.amd.cdna4.buffer_load(
+                    ptr=self.kv_scales_ptr,
+                    offsets=self.scale_offsets + gs[:, None],
+                    cache=self.cfg.KV_CACHE)
+            else:
+                return gl.load(self.kv_scales_ptr + self.scale_offsets
+                               + gs[:, None], cache_modifier=self.cfg.KV_CACHE)
+        elif self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
             return _load_scales_wide(
                 self.cfg,
                 self.tile_ptr(self.kv_scales_ptr, tile_pos, page,
-                              self.cfg.KVS_PAGE_STRIDE, self.cfg.NUM_SCALES))
+                              self.cfg.KVS_PAGE_STRIDE, self.cfg.NUM_SCALES), 0)
         else:
             ptr = self.tile_ptr(self.kv_scales_ptr, tile_pos, page,
                                 self.cfg.KVS_PAGE_STRIDE, self.cfg.NUM_SCALES)
@@ -478,8 +606,15 @@ class KVState:
 
 
 @gluon.jit
-def _load_scales_wide(cfg, ptr):
+def _load_scales_wide(cfg, ptr, gbase):
     """The whole scale tile, read over the run the stored order makes contiguous.
+
+    `gbase` is the gather's per-candidate-block base on this same 4-D index
+    space, or a scalar 0 when the walk is contiguous and the page rides in
+    `ptr` instead. The stored order puts the token axis at stride S_HI inside a
+    group of N_PER_TILE, so a candidate block of at most N_PER_TILE tokens is
+    still one broadcast add -- which is why the gather does not need a byte
+    order of its own here.
 
     Grouping one MFMA tile keeps the order independent of BLOCK_KV and caps the
     run at S_HI bytes. Keep both page strides constexpr or the
@@ -495,11 +630,17 @@ def _load_scales_wide(cfg, ptr):
     b2 = gl.arange(0, cfg.N_PER_TILE,
                    layout=_axis_layout(lr, 2, 4))[None, None, :, None]
     b3 = gl.arange(0, S_HI, layout=_axis_layout(lr, 3, 4))[None, None, None, :]
-    raw = gl.amd.cdna4.buffer_load(
-        ptr=ptr,
-        offsets=b0 * (cfg.N_PER_TILE * cfg.NUM_SCALES)
-                + (b2 + b1 * cfg.N_PER_TILE) * S_HI + b3,
-        cache=cfg.KV_CACHE)
+    if cfg.GATHER:
+        # The group term is in gbase, and the token index is the block-local
+        # one: Bs(t0 + c) == Bs(t0) + c * S_HI.
+        offs = (b2 % cfg.GATHER_BLOCK + b1 * cfg.N_PER_TILE) * S_HI + b3 + gbase
+    else:
+        offs = (b0 * (cfg.N_PER_TILE * cfg.NUM_SCALES)
+                + (b2 + b1 * cfg.N_PER_TILE) * S_HI + b3)
+    if cfg.GATHER and not cfg.USE_BUFFER_LOAD:
+        raw = gl.load(ptr + offs, cache_modifier=cfg.KV_CACHE)
+    else:
+        raw = gl.amd.cdna4.buffer_load(ptr=ptr, offsets=offs, cache=cfg.KV_CACHE)
     return (raw.reshape([N_HI, S_LO, cfg.N_PER_TILE, S_HI])
             .permute((0, 2, 3, 1))
             .reshape([cfg.BLOCK_KV, cfg.NUM_SCALES]))
@@ -518,25 +659,49 @@ class RegLoader:
         self.st = st
 
     @gluon.jit
-    def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row):
+    def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
+                   gv_ptr, gs_ptr, last_blk):
         return RegLoader(KVState.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                            last_page_row, cfg.dot_b))
+                                            last_page_row, gv_ptr, gs_ptr,
+                                            last_blk, cfg.dot_b))
 
     @gluon.jit
     def page_token(self, tile_pos):
         return self.st.page_token(tile_pos)
 
     @gluon.jit
-    def scales(self, tile_pos, page):
-        return self.st.scales(tile_pos, page)
+    def gather_tok(self, tile_pos):
+        return self.st.gather_tok(tile_pos, self.st.cfg.dot_b)
 
     @gluon.jit
-    def values(self, tile_pos, page):
+    def scales(self, tile_pos, page, gtok):
+        return self.st.scales(tile_pos, page, gtok)
+
+    @gluon.jit
+    def values(self, tile_pos, page, gtok):
         cfg: gl.constexpr = self.st.cfg
-        return gl.amd.cdna4.buffer_load(
-            ptr=self.st.tile_ptr(self.st.KV_ptr, tile_pos, page,
-                                 cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES),
-            offsets=self.st.val_offsets, cache=cfg.KV_CACHE)
+        if cfg.GATHER:
+            # `* D_PER_TILE` is not arithmetic for its own sake: an offset that
+            # arrives from memory carries no provable alignment, and without one
+            # Triton refuses to vectorise the load and emits one
+            # buffer_load_ubyte per byte. Storing the list in D_PER_TILE units
+            # and multiplying by the constant hands the divisibility back.
+            if cfg.USE_BUFFER_LOAD:
+                return gl.amd.cdna4.buffer_load(
+                    ptr=self.st.KV_ptr,
+                    offsets=self.st.val_offsets
+                            + (gtok[0] * cfg.D_PER_TILE)[None, :],
+                    cache=cfg.KV_CACHE)
+            else:
+                return gl.load(
+                    self.st.KV_ptr + self.st.val_offsets
+                    + (gtok[0].to(gl.int64) * cfg.D_PER_TILE)[None, :],
+                    cache_modifier=cfg.KV_CACHE)
+        else:
+            return gl.amd.cdna4.buffer_load(
+                ptr=self.st.tile_ptr(self.st.KV_ptr, tile_pos, page,
+                                     cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES),
+                offsets=self.st.val_offsets, cache=cfg.KV_CACHE)
 
 
 @aggregate
@@ -555,9 +720,11 @@ class LDSLoader:
         self.kv_shared = kv_shared
 
     @gluon.jit
-    def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row):
+    def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
+                   gv_ptr, gs_ptr, last_blk):
         st = KVState.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                last_page_row, cfg.blocked_kv)
+                                last_page_row, gv_ptr, gs_ptr, last_blk,
+                                cfg.blocked_kv)
         shared = gl.allocate_shared_memory(
             KV_ptr.type.element_ty,
             [cfg.NUM_BUFFERS, cfg.HEAD_BYTES, cfg.BLOCK_KV], layout=cfg.shared_kv)
@@ -568,11 +735,15 @@ class LDSLoader:
         return self.st.page_token(tile_pos)
 
     @gluon.jit
-    def scales(self, tile_pos, page):
-        return self.st.scales(tile_pos, page)
+    def gather_tok(self, tile_pos):
+        return self.st.gather_tok(tile_pos, self.st.cfg.blocked_kv)
 
     @gluon.jit
-    def issue(self, tile_pos, page, buffer_id):
+    def scales(self, tile_pos, page, gtok):
+        return self.st.scales(tile_pos, page, gtok)
+
+    @gluon.jit
+    def issue(self, tile_pos, page, gtok, buffer_id):
         """Start one tile's global-to-LDS copy. No mask: see page_token.
 
         The page rides in the offsets, not the base pointer:
@@ -580,8 +751,19 @@ class LDSLoader:
         """
         cfg: gl.constexpr = self.st.cfg
         dest = self.kv_shared.index(buffer_id)
-        offsets = self.st.val_offsets + self.st.page_off(
-            tile_pos, page, cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES)
+        if cfg.GATHER:
+            # The gather needs nothing new here: the page was already in the
+            # offsets rather than the base, which is exactly the form a
+            # per-column page takes. Only where the number comes from moves.
+            if cfg.USE_BUFFER_LOAD:
+                offsets = (self.st.val_offsets
+                           + (gtok[0] * cfg.D_PER_TILE)[None, :])
+            else:
+                offsets = (self.st.val_offsets
+                           + (gtok[0].to(gl.int64) * cfg.D_PER_TILE)[None, :])
+        else:
+            offsets = self.st.val_offsets + self.st.page_off(
+                tile_pos, page, cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES)
         if cfg.USE_BUFFER_LOAD:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 dest, self.st.KV_ptr, offsets, cache_modifier=cfg.KV_CACHE)
@@ -659,8 +841,14 @@ class Program:
     def initialize(cfg, out_ptr, stride_s, stride_k, context_len, block_end,
                    split_id, num_kv_splits, slice_idx, num_slices,
                    HAS_KV_SPLIT: gl.constexpr, DYNAMIC: gl.constexpr):
-        # Walk only as far as the furthest of the block's rows can attend
-        keys = gl.minimum(context_len, block_end)
+        if cfg.GATHER:
+            # block_end counts candidate slots here, not key positions: the
+            # walk is over a compact list the host already causally filtered,
+            # so there is no context length to clamp it against.
+            keys = gl.maximum(block_end, 0)
+        else:
+            # Walk only as far as the furthest of the block's rows can attend
+            keys = gl.minimum(context_len, block_end)
         n_tiles = gl.maximum((keys + cfg.BLOCK_KV - 1) // cfg.BLOCK_KV, 0)
         if DYNAMIC:
             # Slice slice_idx of num_slices, converted against this layer's own
@@ -678,7 +866,9 @@ class Program:
         # The one column bound every store answers to: it keeps a walk that ran
         # past its own end out of the next split's columns and out of the region
         # the caller pre-filled with -inf.
-        store_hi = gl.minimum(context_len, tile_hi * cfg.BLOCK_KV)
+        # The compact end under GATHER: output column j is candidate slot j.
+        store_hi = gl.minimum(keys if cfg.GATHER else context_len,
+                              tile_hi * cfg.BLOCK_KV)
         return Program(cfg, out_ptr, stride_s, stride_k, tile_lo, tile_hi, store_hi)
 
     @gluon.jit
@@ -688,7 +878,13 @@ class Program:
         # never recomputes a window.
         out = ()
         for r in gl.static_range(0, BLOCK_M):
-            out = out + (gl.minimum(ends[r], self.store_hi),)
+            if self.cfg.GATHER:
+                # The store column and the masking position are the same number
+                # here: the list was causally filtered on the host, so the only
+                # bound left is the compact end.
+                out = out + (self.store_hi,)
+            else:
+                out = out + (gl.minimum(ends[r], self.store_hi),)
         return out
 
     @gluon.jit
@@ -728,21 +924,33 @@ def _loop_with_reg(pgm, loader, qs, qss, ws, row_hi):
     # goes before the 4 KB value tile, which makes the wait that releases it the
     # later and looser one.
     p0 = loader.page_token(pos)
-    s0 = loader.scales(pos, p0)
-    k0 = loader.values(pos, p0)
+    g0 = loader.gather_tok(pos)
+    s0 = loader.scales(pos, p0, g0)
+    k0 = loader.values(pos, p0, g0)
     if cfg.DEPTH == 2:
         p1 = loader.page_token(pos + BKV)
-        s1 = loader.scales(pos + BKV, p1)
-        k1 = loader.values(pos + BKV, p1)
+        g1 = loader.gather_tok(pos + BKV)
+        s1 = loader.scales(pos + BKV, p1, g1)
+        k1 = loader.values(pos + BKV, p1, g1)
     pn = loader.page_token(pos + AHEAD) if cfg.PAGE_PIPE else 0
+    # The candidate list, an iteration ahead of the tile it addresses. Same
+    # trade as PAGE_PIPE: two more live values against a dependent load
+    # standing directly in front of every KV address in the tile.
+    gn = loader.gather_tok(pos + AHEAD) if cfg.GATHER_PIPE else (0, 0)
 
     unroll: gl.constexpr = cfg.UNROLL if cfg.UNROLL > 1 else None
     for _i in tl.range(0, pgm.tile_hi - pgm.tile_lo - cfg.DEPTH,
                        loop_unroll_factor=unroll):
         if not cfg.PAGE_PIPE:
             pn = loader.page_token(pos + AHEAD)
-        s_new = loader.scales(pos + AHEAD, pn)
-        k_new = loader.values(pos + AHEAD, pn)
+        if cfg.GATHER_PIPE:
+            gc = gn
+        else:
+            gc = loader.gather_tok(pos + AHEAD)
+        s_new = loader.scales(pos + AHEAD, pn, gc)
+        k_new = loader.values(pos + AHEAD, pn, gc)
+        if cfg.GATHER_PIPE:
+            gn = loader.gather_tok(pos + AHEAD + BKV)
         if cfg.PAGE_PIPE:
             pn = loader.page_token(pos + AHEAD + BKV)
         pgm.emit(qs, qss, ws, row_hi, k0, s0, pos)
@@ -771,23 +979,32 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
     pos = pgm.tile_lo * BKV
 
     pa = loader.page_token(pos)
-    loader.issue(pos, pa, 0)
+    ga = loader.gather_tok(pos)
+    loader.issue(pos, pa, ga, 0)
     pb = loader.page_token(pos + BKV)
-    loader.issue(pos + BKV, pb, 1)
+    gb = loader.gather_tok(pos + BKV)
+    loader.issue(pos + BKV, pb, gb, 1)
     pn = loader.page_token(pos + 2 * BKV) if cfg.PAGE_PIPE else 0
+    gn = loader.gather_tok(pos + 2 * BKV) if cfg.GATHER_PIPE else (0, 0)
 
     unroll: gl.constexpr = cfg.UNROLL if cfg.UNROLL > 1 else None
     buf: gl.int32 = 0
     for _i in tl.range(0, n_tiles - 2, loop_unroll_factor=unroll):
         if not cfg.PAGE_PIPE:
             pn = loader.page_token(pos + 2 * BKV)
-        kv_scale = loader.scales(pos, pa)
+        if not cfg.GATHER_PIPE:
+            gn = loader.gather_tok(pos + 2 * BKV)
+        kv_scale = loader.scales(pos, pa, ga)
         k = loader.consume(1, buf)
-        loader.issue(pos + 2 * BKV, pn, buf)
+        loader.issue(pos + 2 * BKV, pn, gn, buf)
         if cfg.PAGE_PIPE:
             pa, pb, pn = pb, pn, loader.page_token(pos + 3 * BKV)
         else:
             pa, pb = pb, pn
+        if cfg.GATHER_PIPE:
+            ga, gb, gn = gb, gn, loader.gather_tok(pos + 3 * BKV)
+        else:
+            ga, gb = gb, gn
         pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos)
         buf = 1 - buf
         pos += BKV
@@ -795,13 +1012,14 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
     # Two groups are outstanding whenever n_tiles >= 2; at one tile the second
     # was issued anyway and is simply never read.
     if n_tiles > 1:
-        kv_scale = loader.scales(pos, pa)
+        kv_scale = loader.scales(pos, pa, ga)
         k = loader.consume(1, buf)
         pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos)
         pos += BKV
         buf = 1 - buf
         pa = pb
-    kv_scale = loader.scales(pos, pa)
+        ga = gb
+    kv_scale = loader.scales(pos, pa, ga)
     k = loader.consume(0, buf)
     pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos)
 
@@ -810,7 +1028,7 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
 
 _repr = make_kernel_repr("_pa_mqa_logits_mxfp4_kernel",
                          ["NUM_HEADS", "HEAD_SIZE", "PAGE_SIZE", "BLOCK_KV",
-                          "BLOCK_M", "PRESHUFFLE", "DEPTH",
+                          "BLOCK_M", "PRESHUFFLE", "GATHER", "DEPTH",
                           "UNROLL", "M_CHUNK", "MFMA_NONK_DIM", "NUM_WARPS",
                           "HAS_KV_SPLIT", "FOLD_ASM", "RELU_ADD"])
 
@@ -823,9 +1041,12 @@ def _pa_mqa_logits_mxfp4_kernel(
     kv_scales_ptr,     # uint8 paged, page p's e8m0 at p * KVS_PAGE_STRIDE
     weights_ptr,       # fp32  [B * NEXT_N, H]
     context_lens_ptr,  # int32 [B]
-    cu_ends_ptr,       # int32 [B * NEXT_N] exclusive row end; None unless HAS_CU_ENDS
+    cu_ends_ptr,       # int32 [B * NEXT_N] exclusive row end, or the row's
+                       # candidate slot count under GATHER; None unless HAS_CU_ENDS
     block_table_ptr,   # int32 [B, stride_blk_b]
     sched_ptr,         # int32 [grid, 4] descriptors; unused unless DYNAMIC
+    gather_v_ptr,      # int32 [B*NEXT_N, blocks] resolved value offsets
+    gather_s_ptr,      # int32 [B*NEXT_N, blocks] resolved scale byte offsets
     logits_ptr,        # fp32  [B * NEXT_N, max_model_len]
     next_n: gl.int32,
     num_kv_splits: gl.int32,
@@ -834,6 +1055,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     stride_w_s: gl.int32,
     stride_logits_s: gl.int32, stride_logits_k: gl.int32,
     stride_blk_b: gl.int32,
+    stride_gather_r: gl.int32,
     max_blocks: gl.int32,
     NUM_HEADS: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
@@ -852,6 +1074,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     FOLD_ASM: gl.constexpr,
     RELU_ADD: gl.constexpr,
     PRESHUFFLE: gl.constexpr,
+    SCALE_MODE: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     RELAXED_STORE: gl.constexpr,
     MFMA_NONK_DIM: gl.constexpr,
@@ -859,17 +1082,31 @@ def _pa_mqa_logits_mxfp4_kernel(
     KV_REREAD: gl.constexpr,
     DYNAMIC: gl.constexpr,
     HAS_CU_ENDS: gl.constexpr,
+    GATHER: gl.constexpr,        # walk a host-resolved candidate list
+    GATHER_BLOCK: gl.constexpr,  # KV tokens per candidate block
+    GATHER_PIPE: gl.constexpr,   # hoist the candidate-list read one iteration
 ):
     gl.static_assert(BLOCK_KV % MFMA_NONK_DIM == 0)
     gl.static_assert(PAGE_SIZE % BLOCK_KV == 0,
                      "BLOCK_KV must divide the page so a tile never spans two")
+    gl.static_assert(
+        (GATHER == 0) | ((BLOCK_M == 1) & (BLOCK_KV % GATHER_BLOCK == 0)
+                         & (PAGE_SIZE % GATHER_BLOCK == 0)
+                         & (GATHER_BLOCK <= MFMA_NONK_DIM)),
+        "a candidate block must tile BLOCK_KV, sit inside one page and one "
+        "shuffle group, and the gather is one query row per workgroup",
+    )
+    gl.static_assert(
+        (GATHER == 0) | (HAS_CU_ENDS == 1),
+        "the gather takes its walk length from cu_ends, read as a slot count",
+    )
 
     cfg = Config(NUM_HEADS, HEAD_SIZE, PAGE_SIZE, BLOCK_KV, BLOCK_M,
                  KV_PAGE_STRIDE, KVS_PAGE_STRIDE, NUM_WARPS, NUM_BUFFERS, DEPTH,
                  UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
-                 PRESHUFFLE, USE_BUFFER_LOAD, RELAXED_STORE,
+                 PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
                  MFMA_NONK_DIM, HAS_KV_SPLIT,
-                 KV_REREAD)
+                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE)
 
     if DYNAMIC:
         desc = sched_ptr + gl.program_id(0) * 4
@@ -905,6 +1142,8 @@ def _pa_mqa_logits_mxfp4_kernel(
     # Loaded beside the Q rows: BLOCK_M scalar loads, nothing per KV tile. It
     # replaces the built-in rule and may also exceed it. Needed when the boundary
     # is not one key per row -- a compressed cache, or a context-parallel shard.
+    # Under GATHER the same number counts the row's valid candidate slots: the
+    # coordinate space changes, the bound's role does not.
     mfma_qs, q_scales, w_blocks, ends = (), (), (), ()
     for r in gl.static_range(0, BLOCK_M):
         q, qs, w = _load_q_row(cfg, Q_ptr + (q_base + r * stride_q_n),
@@ -918,7 +1157,8 @@ def _pa_mqa_logits_mxfp4_kernel(
 
     if HAS_CU_ENDS:
         # Max over the block's rows: only the built-in rule puts the furthest
-        # last.
+        # last. Trivial under GATHER, which is one row per workgroup, and still
+        # the right reduction there -- the widest walk any row needs.
         block_end = ends[0]
         for r in gl.static_range(1, BLOCK_M):
             block_end = gl.maximum(block_end, ends[r])
@@ -939,13 +1179,22 @@ def _pa_mqa_logits_mxfp4_kernel(
     last_page_row = gl.minimum((context_len + PAGE_SIZE - 1) // PAGE_SIZE,
                                max_blocks) - 1
 
+    # The candidate list is per query row and its page ids are already resolved
+    # on the host, so the walk carries no block -> position -> table -> page
+    # chain: one int32 per candidate block per stream, added in. block_end is
+    # the row's slot count here, so it is also the last block's index.
+    g_base = w_row.to(gl.int64) * stride_gather_r
+    gv_ptr = gather_v_ptr + g_base
+    gs_ptr = gather_s_ptr + g_base
+    last_blk = gl.maximum((block_end + GATHER_BLOCK - 1) // GATHER_BLOCK - 1, 0)
+
     if PRESHUFFLE:
         loader = RegLoader.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                      last_page_row)
+                                      last_page_row, gv_ptr, gs_ptr, last_blk)
         _loop_with_reg(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
     else:
         loader = LDSLoader.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                      last_page_row)
+                                      last_page_row, gv_ptr, gs_ptr, last_blk)
         _loop_with_lds(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
 
 
@@ -954,6 +1203,7 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     context_lens_ptr, cu_ends_ptr, sched_ptr, batch, next_n, num_ctas,
     BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
     ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr, HAS_CU_ENDS: tl.constexpr,
+    GATHER: tl.constexpr,
 ):
     # A "unit" is one (sequence, row block) pair; a "slot" is one workgroup of
     # the launch. The job is to give every slot a slice of some unit's KV walk,
@@ -983,7 +1233,9 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
                         mask=live, other=0))
     else:
         block_end = ctx - next_n + first_row + BLOCK_M
-    keys = tl.minimum(ctx, block_end)
+    # Under the gather block_end counts candidate slots, which the context
+    # length does not bound.
+    keys = block_end if GATHER else tl.minimum(ctx, block_end)
     # Floored at one so a live unit always owns a slot. Whether a unit is live
     # must not depend on the bound: the launch may hold a cu_ends this kernel was
     # not given, and a unit with no slot has nothing to compute its rows.
