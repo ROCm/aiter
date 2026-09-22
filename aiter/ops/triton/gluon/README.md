@@ -57,6 +57,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
   <td>TBD</td><td>TBD</td><td>TBD</td>
 </tr>
+<tr>
+  <td><code>paged_attention_output_gate</code></td><td>Paged Attn<br>Decode<br>+ Gate<br>+ FP8 Quant</td><td>CDNA4</td>
+  <td nowrap>Q: bf16 [T, H, 256]<br>KV: fp8_e4m3<br>Out: bf16 (+ optional fp8<br>and fp32 group scales)<br>PAGE_SIZE=1 (CSR<br>kv_indptr/kv_indices)<br>HEAD_DIM=256<br>nhead &le; 16<br>Per-tensor k_scale/v_scale<br>Two bodies, selected by<br>max_context &le; 32768</td>
+  <td>python op_tests/op_benchmarks/<br>triton/bench_paged_attention_<br>output_gate.py \<br>--context 8192 --compare</td>
+  <td>~6.53<br>TB/s</td><td>&mdash;</td><td>&mdash;</td>
+</tr>
 </table>
 </small>
 
@@ -262,3 +268,23 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | KV block sizes | 16, 64, 1024 (selected by kernel variant) |
 | Context partition | 256 (static_assert) |
 | Constraint | `query_length * query_group_size` &le; 64 |
+### `paged_attention_output_gate.py` — Paged Attention Decode + Output Gate + Group-FP8
+
+**Function:** `paged_attention_output_gate_group_fp8_quant(query, key_cache, value_cache, kv_indptr, kv_indices, gate, *, scale, max_context=None, k_scale=None, v_scale=None, quant_dtype=None)`
+
+**Description:** Separate-K/V paged decode over a CSR index list at `page_size = 1`, whose epilogue applies a sigmoid output gate and optionally emits group-128 FP8 alongside the BF16 result. Folding the gate and the quant into the split-K merge replaces three launches with two at the Qwen3-Next full-attention boundary. Two kernel bodies differing in split-K decomposition are selected by a `max_context` range check; `max_context` is a body selector only and never clamps the live context, which always comes from `kv_indptr`.
+
+| Parameter | Details |
+|-----------|---------|
+| Arch | gfx950 (CDNA4) only |
+| Q dtype | bf16, `[T, H, 256]` |
+| KV dtype | fp8_e4m3, `[pages, 1, 256]` |
+| Output | bf16 `[T, H*256]`; with `quant_dtype` also fp8 `[T, H*256]` + fp32 scales `[T, H*2]` |
+| Gate | bf16 `[T, H*256]`, row stride honoured (need not be contiguous) |
+| Page size | 1 (CSR `kv_indptr` / `kv_indices`) |
+| Head dim | 256 |
+| Heads | &le; 16 |
+| Scales | per-tensor `k_scale` / `v_scale` |
+| Body selection | `max_context` &le; 32768 &rarr; short-context body; above &rarr; long-context body |
+| Batch | not a kernel constant &mdash; one binary serves any batch size |
+| Support probe | `paged_attention_output_gate_supported(...) -> (bool, reason)`; callers fall back rather than fail |
