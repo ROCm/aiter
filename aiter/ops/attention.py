@@ -1009,8 +1009,14 @@ def get_ps_metadata_info_v1(
     num_head_k: int,
     max_qlen: int,
     qlen_granularity: int = 256,
+    total_qlen: int | None = None,
 ):
     """
+    Args:
+        total_qlen: Upper bound on the sum of query lengths over the batch of a
+            single call, e.g. the serving engine's token budget. None means
+            unknown, in which case every batch is assumed to carry max_qlen query
+            tokens.
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
@@ -1018,6 +1024,10 @@ def get_ps_metadata_info_v1(
         4. Shape of reduce_indptr followed by its scalar type.
         5. Shape of reduce_final_map followed by its scalar type.
         6. Shape of reduce_partial_map followed by its scalar type.
+        7. Number of rows of the partial logits/attn_lse pool that
+           reduce_partial_map indexes into, i.e. the leading dimension of the
+           (rows, num_head_q, v_head_dim) partial output and the (rows,
+           num_head_q) partial lse that get_ps_metadata_v1 addresses.
     """
 
     device = torch.cuda.current_device()
@@ -1030,6 +1040,12 @@ def get_ps_metadata_info_v1(
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
+    if total_qlen is not None:
+        assert total_qlen > 0, "total_qlen must be positive, use None if unknown"
+        # sum_i ceil(qlen_i / g) <= ceil(sum_i qlen_i / g) + (batch_size - 1),
+        # since only the last tile of each batch is a partially filled one.
+        budget_qo_tile_cnt = math.ceil(total_qlen / qlen_granularity) + batch_size - 1
+        qo_tile_cnt = min(qo_tile_cnt, max(budget_qo_tile_cnt, max_qo_split_per_batch))
     # a work item is created either
     #   1. for every qo tile (no split)
     #   2. every split qo tile, which can be done at most #TG times in total
@@ -1044,6 +1060,7 @@ def get_ps_metadata_info_v1(
         (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
         ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
         (max_partials, torch.int32),  # reduce_partial_map
+        max_partials * qlen_granularity,  # partial logits/attn_lse rows
     )
 
 

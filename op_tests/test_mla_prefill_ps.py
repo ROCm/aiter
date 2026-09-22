@@ -303,11 +303,13 @@ def test_mla_prefill(
         (reduce_indptr_size, reduce_indptr_type),
         (reduce_final_map_size, reduce_final_map_type),
         (reduce_partial_map_size, reduce_partial_map_type),
+        max_partial_rows,
     ) = aiter.get_ps_metadata_info_v1(
         batch_size=batch_size,
         num_head_k=num_head_kv,
         max_qlen=max_qlen,
         qlen_granularity=qlen_granularity,
+        total_qlen=num_tokens,
     )
     work_metadata_ptrs = torch.empty(
         work_meta_data_size, dtype=work_meta_data_type, device=device
@@ -408,12 +410,12 @@ def test_mla_prefill(
     total_s, nhead, _ = output.shape
     tile_q = 256
     logits = torch.empty(
-        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+        (max_partial_rows, nhead, v_head_dim),
         dtype=dtypes.fp32,
         device=device,
     )
     attn_lse = torch.empty(
-        (reduce_partial_map.size(0) * tile_q, nhead),
+        (max_partial_rows, nhead),
         dtype=dtypes.fp32,
         device=device,
     )
