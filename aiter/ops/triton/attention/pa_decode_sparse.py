@@ -158,6 +158,11 @@ def pa_decode_sparse(
             keys the sparse top-k selects. The two hold the identical record.
             Supported on the gfx950 packed path and on the gfx1250 vLLM
             ``fp8_ds_mla`` path; must be None otherwise.
+
+            Both read the same KV format, but each takes ONE Q form for now:
+            gfx950 bf16 Q (a16w8), gfx1250 packed fp8 Q plus ``q_rope``
+            (a8w8). gfx950's kernel has no Q-side scale operand and gfx1250's
+            has no bf16 Q path, so the two are not interchangeable.
         unified_kv_rope: gfx1250-only — ``[total_pages, 64]`` bf16 RoPE plane.
             Supplying it selects the DSv4 "2buff" packed-fp8 path, in which
             ``unified_kv`` is the ``[total_pages, 512]`` fp8 pool laid out
@@ -572,7 +577,8 @@ def pa_decode_sparse(
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
         HAS_EXTRA=False,
-        MAIN_IS_RUN=False,
+        MAIN_IS_WINDOW=False,
+        MAIN_BLOCK_SIZE_RED=1,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
@@ -1180,7 +1186,8 @@ def _pa_decode_sparse_v4_2buff(
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
         HAS_EXTRA=False,
-        MAIN_IS_RUN=False,
+        MAIN_IS_WINDOW=False,
+        MAIN_BLOCK_SIZE_RED=1,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
@@ -1270,7 +1277,7 @@ def _pa_decode_sparse_v4(
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
     block_k: int | None = None,
-    main_is_run: bool = False,
+    main_is_window: bool = False,
 ):
     """gfx1250 driver for the DSv4 unified paged cache (vLLM ``fp8_ds_mla``).
 
@@ -1440,20 +1447,20 @@ def _pa_decode_sparse_v4(
         attn_num_warps = 1
         max_num_wg = 1024
     block_k = block_k_default if block_k is None else int(block_k)
-    if main_is_run:
-        # The caller promises main_indices is one ascending run per token. The
-        # tiling is then aligned to the global slot space, which only keeps a
-        # tile inside one page while BLOCK_K divides the page.
-        if has_extra:
-            raise RuntimeError(
-                "main_is_run is single-stream for now; the top-k stream still "
-                "needs the gather path"
-            )
-        if main_block_size % block_k:
-            raise RuntimeError(
-                f"main_is_run needs block_k ({block_k}) to divide the cache's "
-                f"block_size ({main_block_size}), or a tile straddles two pages"
-            )
+    # main_is_window promises MAIN_INDICES is a sliding WINDOW per token: a
+    # contiguous range of positions. Not one ascending run of slots -- the slots
+    # come from a block table, so they are contiguous only inside a page and the
+    # page order is the allocator's. The tiling is therefore aligned to the page
+    # grid, and each tile's base slot is read rather than extrapolated, which
+    # only holds while BLOCK_K divides the page.
+    #
+    # It says nothing about extra_indices: the top-k stream is genuinely
+    # scattered and keeps the gather path, in a second phase.
+    if main_is_window and main_block_size % block_k:
+        raise RuntimeError(
+            f"main_is_window needs block_k ({block_k}) to divide the cache's "
+            f"block_size ({main_block_size}), or a tile straddles two pages"
+        )
     if ctas_h > 1:
         # block_h is the CLUSTER tile: each CTA owns block_h // ctas_h heads,
         # and warps follow the per-CTA tile (16 heads -> 1 warp). The per-CTA
@@ -1585,7 +1592,7 @@ def _pa_decode_sparse_v4(
         MAIN_CONTIG_BLOCKS=main_contig_blocks,
         EXTRA_CONTIG_BLOCKS=extra_contig_blocks,
         HAS_EXTRA=has_extra,
-        MAIN_IS_RUN=bool(main_is_run),
+        MAIN_IS_WINDOW=bool(main_is_window),
         num_warps=attn_num_warps,
         num_stages=2,
         waves_per_eu=waves_per_eu,
@@ -1630,7 +1637,8 @@ def _pa_decode_sparse_v4(
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
         HAS_EXTRA=has_extra,
-        MAIN_IS_RUN=bool(main_is_run),
+        MAIN_IS_WINDOW=bool(main_is_window),
+        MAIN_BLOCK_SIZE_RED=main_block_size,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )

@@ -766,8 +766,10 @@ def widen_to_int32_overflow(cache, kv_deq):
     itemsize = cache.element_size()
     pitch = triton.cdiv(2**31, max(1, nb - 1) * itemsize)
     pitch = max(pitch, block * row)
-    # the packed fp8 cache is viewed as bfloat16, which needs an even stride
-    pitch += pitch % 2
+    # gfx950 views the packed cache as bfloat16, so the stride must be even;
+    # gfx1250's data descriptor counts 64-BYTE rows, so round up to that. The
+    # stronger alignment satisfies both.
+    pitch = ((pitch + 63) // 64) * 64
     pool = torch.empty(
         pitch * (nb - 1) + block * row, dtype=cache.dtype, device=cache.device
     )
@@ -819,18 +821,39 @@ def two_loop_reference(
 @pytest.mark.parametrize("extra_len", [8, 256])
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("strided_cache", [False, True])
-def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_cache):
-    """gfx950 vLLM DSv4 decode path: SWA (main) + top-k (extra) two-loop over
-    packed caches. fp8 (fp8_ds_mla) is the vLLM production format; bf16 is also
-    exercised. Skipped off gfx950 (extra_* is a packed-only gluon path)."""
+def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
+                                    strided_cache):
+    """SWA (main) + top-k (extra) attended in one pass, on gfx950 and gfx1250.
+
+    Both backends read the SAME cache -- ``[nb, block, 584]`` uint8, 448 B fp8
+    NoPE | 128 B bf16 RoPE per token then a per-block trailer of 8 UE8M0 scale
+    bytes -- so one construction and one reference serve both.
+
+    They differ in Q, and **each supports exactly one form for now**:
+
+        gfx950   bf16 Q                              -> a16w8
+        gfx1250  packed fp8 Q + its bf16 RoPE plane  -> a8w8
+
+    That is what is implemented rather than a design position: gfx950's kernel
+    carries no Q-side scale operand at all, so it could not read a packed Q, and
+    gfx1250's has no bf16 Q path. The test therefore packs Q for gfx1250 and
+    dequantizes it for the reference, so a8w8's Q quantization is accounted for
+    instead of being absorbed by the tolerance.
+
+    The bf16 block cache is likewise gfx950-only; gfx1250 reads the 584-byte
+    fp8 record only.
+    """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if arch_info.get_arch() != "gfx950":
-        pytest.skip("two-loop (extra_*) is a gfx950 packed-cache-only path")
+    arch = arch_info.get_arch()
+    if arch not in ("gfx950", "gfx1250"):
+        pytest.skip("the extra_* two-stream path is gfx950/gfx1250 only")
+    if arch == "gfx1250" and dtype == "bf16":
+        pytest.skip("gfx1250's paged path reads the 584-byte fp8 record only")
     if strided_cache:
         # The pool has to span >2 GiB for the offsets to overflow, so pin the
         # regression to one shape -- the fp8 production format at the largest T
-        # -- rather than paying it on all 24 combinations.
+        # -- rather than paying it on all combinations.
         if dtype != "fp8" or T != 128:
             pytest.skip("strided-cache case is pinned to the fp8 T=128 shape")
         if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
@@ -863,8 +886,20 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
         0, T * extra_len + 1, extra_len, dtype=torch.int32, device=device
     )
 
+    # Q: bf16 on gfx950, packed fp8 + RoPE plane on gfx1250. The reference sees
+    # whatever the kernel will actually read, so a8w8's Q quantization is
+    # accounted for rather than hidden in the tolerance.
+    kwargs = {}
+    if arch == "gfx1250":
+        q_packed, q_rope = v4_pack_2buff(q)
+        q_in, q_ref = q_packed, v4_unpack_2buff(q_packed, q_rope)
+        kwargs["q_rope"] = q_rope
+        kwargs["has_invalid"] = False
+    else:
+        q_in, q_ref = q, q
+
     ref = two_loop_reference(
-        q,
+        q_ref,
         main_deq,
         main_idx,
         main_indptr,
@@ -875,7 +910,7 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
         softmax_scale,
     )
     out = pa_decode_sparse(
-        q,
+        q_in,
         main_cache,
         main_idx,
         main_indptr,
@@ -884,6 +919,7 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
         extra_cache=extra_cache,
         extra_indices=extra_idx,
         extra_indptr=extra_indptr,
+        **kwargs,
     )
 
     tol = 1e-2 if dtype == "fp8" else 5e-3

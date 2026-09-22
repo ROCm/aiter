@@ -310,7 +310,8 @@ def _pa_decode_sparse_reduce(
     BLOCK_K: tl.constexpr,
     USE_EXP2: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
-    MAIN_IS_RUN: tl.constexpr,
+    MAIN_IS_WINDOW: tl.constexpr,
+    MAIN_BLOCK_SIZE_RED: tl.constexpr,
 ):
     """Combine KV_SPLITS partials, fold in attn_sink, write final output.
 
@@ -333,14 +334,10 @@ def _pa_decode_sparse_reduce(
     kv_len = kv_end - kv_start
     # Counted in TILES so the extra stream's can join the total; this is the
     # same split, since cdiv(cdiv(L, BLOCK_K), S) == cdiv(L, S*BLOCK_K).
-    if MAIN_IS_RUN:
-        run_start = tl.load(main_indices_ptr + kv_start)
-        run_tile0 = run_start // BLOCK_K
-        num_tiles = tl.maximum(
-            (run_start + kv_len - 1) // BLOCK_K - run_tile0 + 1, 0
-        )
-    else:
-        num_tiles = tl.cdiv(kv_len, BLOCK_K)
+    # MAIN_IS_WINDOW is a gfx1250 paged-cache mode; this reduce serves the bf16
+    # and uniform-pool paths, which never set it.
+    tl.static_assert(not MAIN_IS_WINDOW, "MAIN_IS_WINDOW needs the gluon reduce")
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
     if HAS_EXTRA:
         extra_start = tl.load(extra_indptr_ptr + t)
         extra_end = tl.load(extra_indptr_ptr + t + 1)
