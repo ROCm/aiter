@@ -554,37 +554,41 @@ class OneShotAllReduceRMSNorm:
     def _geom_for(self, hidden: int, rung_atoms: int) -> tuple[int, int]:
         """``(atoms, h_pad)`` for a rung at hidden dim.
 
-        A width with a native geometry resolves exactly. A width without one 
-        falls to the padded set, and there the *pad* leads.
-        ``fused_padded_block_options`` is ordered by ascending ``h_pad``, so
-        this takes the least wire volume available and only then uses the rung's
-        ``atoms`` (or a pinned ``block``) to break the tie.
+        A width with a native geometry resolves exactly and ``h_pad ==
+        hidden``. A width that native geometry cannot cover falls to the
+        padded set, where the pad leads. ``fused_padded_block_options`` is
+        ordered by ascending ``h_pad``, so this takes the least wire volume
+        available and only then uses the rung's ``atoms`` to break the tie.
         """
         hidden = int(hidden)
         native = fused_block_options(hidden)
-        if native:
-            want = (
-                fused_atoms_for_block(hidden, self.block)
-                if self.block
-                else int(rung_atoms)
-            )
+        if self.block:
+            native_atoms = next((a for b, a in native if b == self.block), None)
+            if native_atoms is not None:
+                return native_atoms, hidden
+        elif native:
             legal = [a for _b, a in native]
+            want = int(rung_atoms)
             atoms = want if want in legal else min(legal, key=lambda a: (abs(a - want), a))
             return atoms, hidden
 
         opts = fused_padded_block_options(hidden) if self.pad else ()
-        if not opts:
-            # No geometry at all. Returning the rung's own atoms lets the build
-            # raise with the message that names the constraint that failed.
-            return int(rung_atoms), hidden
         if self.block:
             pinned = [o for o in opts if o[0] == self.block]
             if pinned:
                 return pinned[0][1], pinned[0][2]
-        least_pad = opts[0][2]
-        tied = [o for o in opts if o[2] == least_pad]
-        _b, atoms, h_pad = min(tied, key=lambda o: (abs(o[1] - int(rung_atoms)), o[1]))
-        return atoms, h_pad
+        elif opts:
+            least_pad = opts[0][2]
+            tied = [o for o in opts if o[2] == least_pad]
+            _b, atoms, h_pad = min(
+                tied, key=lambda o: (abs(o[1] - int(rung_atoms)), o[1])
+            )
+            return atoms, h_pad
+
+        # No geometry at all -- or a pinned block padding cannot reach. Returning
+        # the rung's own atoms lets the build raise with the message that names
+        # the constraint that failed.
+        return int(rung_atoms), hidden
 
     def _cfg_key(self, hidden: int, rung: tuple) -> tuple:
         """A ladder rung's engine key at *hidden*."""

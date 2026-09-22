@@ -332,8 +332,14 @@ try:
     from aiter.ops.flydsl.kernels.one_shot_allreduce import (
         fused_hidden_supported as _fused_hidden_supported,
     )
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        fused_padded_block_options as _fused_padded_block_options,
+    )
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
         quick_reduce_hidden_supported as _flyqr_hidden_supported,
+    )
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_padded_row_block_options as _flyqr_padded_block_options,
     )
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
         quick_reduce_row_block_options as _flyqr_block_options,
@@ -358,8 +364,10 @@ except Exception:  # noqa: BLE001
     OneShotAllReduceRMSNorm = None
     _fused_hidden_supported = None
     _fused_block_options = None
+    _fused_padded_block_options = None
     _flyqr_hidden_supported = None
     _flyqr_block_options = None
+    _flyqr_padded_block_options = None
     MIN_PAYLOAD_BYTES = 0
     ALGORITHMS = {}
     _resolve_codecs = None
@@ -402,6 +410,13 @@ def _bench_fly_accuracy_mode() -> str:
     pinned mesh/ring row is not "relevant for the mode" there either.
     """
     return os.environ.get(_FLY_ACCURACY_ENV, _FLY_ACCURACY_DEFAULT)
+
+
+def _bench_fly_pad_enabled() -> bool:
+    """Whether the bench admits padded fused builds, matching production."""
+    if _fused_padded_block_options is None:
+        return False
+    return policy.fused_pad_enabled()
 
 
 def _aiter_origin() -> str:
@@ -1030,11 +1045,21 @@ def _fused_hidden_ok(hidden: int, cand: Candidate) -> bool:
     """
     if _fused_hidden_supported is None:
         return False
+    pad = _bench_fly_pad_enabled()
     if cand.block is not None:
         if _fused_block_options is None:
             return False
-        return any(b == cand.block for b, _ in _fused_block_options(int(hidden)))
-    return _fused_hidden_supported(int(hidden), 1 if cand.atoms is None else cand.atoms)
+        if any(b == cand.block for b, _ in _fused_block_options(int(hidden))):
+            return True
+        return pad and any(
+            b == cand.block for b, _a, _h in _fused_padded_block_options(int(hidden))
+        )
+    atoms = 1 if cand.atoms is None else cand.atoms
+    if _fused_hidden_supported(int(hidden), atoms):
+        return True
+    return pad and any(
+        a == atoms for _b, a, _h in _fused_padded_block_options(int(hidden))
+    )
 
 
 def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
@@ -1046,16 +1071,25 @@ def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
     two-shot geometry also has to land a rank-tile on the 64 B sector grid, and
     at TP8 that leaves exactly one block per width.
     """
-    if _flyqr_hidden_supported is None or not _flyqr_hidden_supported(
-        int(hidden), int(world_size)
-    ):
+    if _flyqr_hidden_supported is None:
+        return False
+    pad = _bench_fly_pad_enabled()
+    native = _flyqr_hidden_supported(int(hidden), int(world_size))
+    padded = pad and bool(
+        _flyqr_padded_block_options(int(hidden), int(world_size))
+    )
+    if not native and not padded:
         return False
     if cand.block is None:
         return True
     if _flyqr_block_options is None:
         return False
-    opts = _flyqr_block_options(int(hidden), int(world_size))
-    return any(b == cand.block for b, _ in opts)
+    if any(b == cand.block for b, _ in _flyqr_block_options(int(hidden), int(world_size))):
+        return True
+    return pad and any(
+        b == cand.block
+        for b, _a, _h in _flyqr_padded_block_options(int(hidden), int(world_size))
+    )
 
 
 def applicable(
@@ -1471,6 +1505,17 @@ def production_fused_path(ca_comm, qr_comm, x, weight, world_size: int, prod_reg
     return "separate"
 
 
+def _pad_tag(variant: str | None, eng, hidden) -> str | None:
+    """Append ``/pad<h_pad>`` when *eng* runs *hidden* on a padded workgroup."""
+    if variant is None or hidden is None:
+        return variant
+    pads = getattr(eng, "pads_hidden", None)
+    if pads is None:
+        return variant
+    h_pad = pads(int(hidden))
+    return variant if h_pad == int(hidden) else f"{variant}/pad{h_pad}"
+
+
 def _variant_of(
     cand: Candidate,
     fly,
@@ -1494,10 +1539,14 @@ def _variant_of(
         # The fused engine's variant is a function of hidden as well as bytes:
         # the tile is one token row, so the width is baked into the symbol.
         eng = (fly1s_rms or {}).get(cand.fly1s_rms_cfg)
-        return eng.variant(int(hidden), int(nbytes)) if eng is not None else None
+        if eng is None:
+            return None
+        return _pad_tag(eng.variant(int(hidden), int(nbytes)), eng, hidden)
     if cand.family == "fused_flyauto":
         # `<family>:<symbol>`, so the report says which family the shipped
-        # fused policy picked here as well as which binary it ran.
+        # fused policy picked here as well as which binary it ran. This engine
+        # *is* the production dispatcher, whose ``variant`` already appends the
+        # ``/pad<h_pad>`` tag itself, so it is not re-tagged here.
         return (
             fused_flyauto.variant(int(hidden), int(nbytes))
             if fused_flyauto is not None
@@ -1507,7 +1556,9 @@ def _variant_of(
         # Same reason, for the same reason: a fused two-shot build sizes its
         # block to the row, so hidden reaches the symbol.
         eng = (flyqr_rms or {}).get(cand.flyqr_rms_cfg)
-        return eng.variant(int(hidden), int(nbytes)) if eng is not None else None
+        if eng is None:
+            return None
+        return _pad_tag(eng.variant(int(hidden), int(nbytes)), eng, hidden)
     if cand.family == "separate":
         if cand.sep_ar == "fly1s":
             eng = fly1s.get(cand.fly1s_cfg)
@@ -2357,6 +2408,10 @@ def _worker(
                 rank=rank,
                 world_size=tp_size,
                 max_bytes=_fly1s_ceiling(tp_size),
+                # Same padding policy the shipped dispatcher builds with, so a
+                # width with no native geometry fuses here exactly where it does
+                # in production. ``applicable`` gates on the same flag.
+                pad=_bench_fly_pad_enabled(),
                 **kw,
             )
         # Warm every (config, hidden) this sweep will touch, before any timing
@@ -2399,6 +2454,7 @@ def _worker(
                 rank=rank,
                 world_size=tp_size,
                 algorithm=cfg[0],
+                pad=_bench_fly_pad_enabled(),
                 **_fly_kwargs(
                     cfg[1:],
                     ("super_tile", "grid_cap", "rs_codec", "ag_codec", "block"),
