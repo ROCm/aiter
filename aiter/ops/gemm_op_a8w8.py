@@ -828,7 +828,7 @@ def gemm_a8w8_blockscale_fake(
     return Y
 
 
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_fake)
+@torch_compile_guard(mutates_args=[], gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
     XQ: Tensor,
     WQ: Tensor,
@@ -837,6 +837,34 @@ def gemm_a8w8_blockscale(
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
 ) -> torch.Tensor:
+    """Blockscaled A8W8 GEMM with the existing 128x128 or native group32 format.
+
+    E8M0 scales with K/32 activation groups select the gfx950 Triton backend.
+    Its weights are unshuffled and use compact 32x32 or 1x32 scales. Other
+    operands retain the existing 128x128 backend dispatch.
+    """
+    # Native group32 scales identify a different quantization contract from
+    # the 128x128 CK/ASM inputs. Keep them compact and in E8M0 throughout.
+    if (
+        x_scale.dtype == dtypes.fp8_e8m0
+        and w_scale.dtype == dtypes.fp8_e8m0
+        and x_scale.ndim == 2
+        and XQ.ndim == 2
+        and x_scale.shape[1] == XQ.shape[1] // 32
+    ):
+        assert not isBpreshuffled, "Group32 FP8 GEMM requires native weights"
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+            gemm_a8w8_blockscale_group32,
+        )
+
+        # A single scale row is shared by up to 32 weight rows, or one row
+        # per output channel. The backend validates the complete scale grid.
+        assert WQ.ndim == w_scale.ndim == 2, "Expected matrix weights and scales"
+        group_n = 32 if w_scale.shape[0] == -(-WQ.shape[0] // 32) else 1
+        return gemm_a8w8_blockscale_group32(
+            XQ, WQ, x_scale, w_scale, dtype=dtype, weight_group_rows=group_n
+        )
+
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
