@@ -363,6 +363,7 @@ def build_qsa_k2_family_a_module(
                 fx.copy(lds_copy, k_store_frag, k_dst)
             if const_expr(token_major_v):
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
+                fx.rocdl.s_barrier()
             else:
                 gpu.barrier()
 
