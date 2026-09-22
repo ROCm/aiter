@@ -903,6 +903,9 @@ def _grouped_a8w4_tdm_moe(
             stage1_act=stage1_act,
             stage1_quant_out=0,
             has_bias=int(_b1 is not None),
+            cluster_n=cluster_n,
+            next_stage_prefetch=next_stage_prefetch,
+            waves_per_tensor_tdm=waves_per_tensor_tdm,
             n_experts=E,
         )
     )
@@ -921,6 +924,9 @@ def _grouped_a8w4_tdm_moe(
             stage1_act=0,
             stage1_quant_out=0,
             has_bias=int(_b2 is not None),
+            cluster_n=cluster_n,
+            next_stage_prefetch=next_stage_prefetch,
+            waves_per_tensor_tdm=waves_per_tensor_tdm,
             n_experts=E,
         )
     )

@@ -198,10 +198,19 @@ def supports_gfx1250_a_preshuffle(
     stage1_act: int,
     stage1_quant_out: int,
     has_bias: int,
+    cluster_n: int,
+    next_stage_prefetch: int,
+    waves_per_tensor_tdm: int,
     n_experts: int,
 ) -> bool:
-    """Return whether the retained kernel can consume A-preshuffled A."""
+    """Return whether this stage exactly matches an A-preshuffle tuned tile."""
     num_buffers = min(num_buffers, max(1, K // tile_k))
+    n_tiles = (N + tile_n - 1) // tile_n
+    cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    next_stage_prefetch = _select_bool_env(
+        "AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch
+    )
     common = all(
         (
             a_is_fp4,
@@ -210,17 +219,28 @@ def supports_gfx1250_a_preshuffle(
             has_bias == 0,
             n_experts > 0,
             (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
-            in (
-                (64, 256, 256, 1, 4, 2),
-                (256, 256, 256, 2, 2, 4),
-            ),
+            == (256, 256, 256, 2, 2, 4),
+            cluster_n == 4,
+            next_stage_prefetch == 1,
         )
     )
     if not common:
         return False
     if stage1_act == 1:
-        return K == 7168 and N in (4096, 6144)
-    return stage1_act == 0 and N == 7168 and K in (2048, 3072)
+        waves_per_tensor_tdm = _select_gemm1_num_waves_per_tensor_tdm(
+            waves_per_tensor_tdm
+        )
+        return (
+            K == 7168
+            and N in (4096, 6144)
+            and waves_per_tensor_tdm in (1, 2, 4)
+        )
+    if stage1_act == 0 and N == 7168 and K in (2048, 3072):
+        waves_per_tensor_tdm = _select_gemm2_num_waves_per_tensor_tdm(
+            waves_per_tensor_tdm
+        )
+        return waves_per_tensor_tdm in (1, 2)
+    return False
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -375,25 +395,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         )
 
     enable_ep_scatter = stage2_scatter is not None
-    a_preshuffle_supported = bool(a_preshuffle) and supports_gfx1250_a_preshuffle(
-        N=N,
-        K=K,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        m_warp=m_warp,
-        n_warp=n_warp,
-        num_buffers=num_buffers,
-        out_is_f16=out_is_f16,
-        a_is_fp4=a_is_fp4,
-        stage1_act=stage1_act,
-        stage1_quant_out=stage1_quant_out,
-        has_bias=has_bias,
-        n_experts=n_experts,
-    )
-    use_optimized = (
-        target_fp4_prefill or target_gemm2 or a_preshuffle_supported
-    ) and not any(
+    use_optimized = (target_fp4_prefill or target_gemm2) and not any(
         (
             enable_ep_scatter,
             bool(tdm_as_in_prologue),
@@ -489,12 +491,10 @@ def flydsl_grouped_gemm_a8w4_masked(
             else 0,
             _select_wmma_reuse() if target_fp4_prefill else 0,
             _select_binary_int("AITER_FLYDSL_GEMM1_DELAY_ACC_ZERO", 0),
-            _select_binary_int("AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE", 0)
-            if target_fp4_prefill
-            else (
-                _select_binary_int("AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE", 0)
-                if target_gemm2
-                else 0
+            (
+                _select_binary_int("AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE", 0)
+                if target_fp4_prefill
+                else _select_binary_int("AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE", 0)
             ),
             (
                 _select_gemm2_output_split_wm()
