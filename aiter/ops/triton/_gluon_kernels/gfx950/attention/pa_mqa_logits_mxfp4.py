@@ -465,7 +465,7 @@ class KVState:
     @gluon.jit
     def gather_base(self, tile_pos, base_ptr, layout: gl.constexpr,
                     AXIS: gl.constexpr):
-        """This tile's per-column base offset, from the host-resolved list.
+        """This tile's per-column base offset.
 
         One int32 per candidate block, already holding the page address plus
         the block's own offset inside its page, so the walk carries no
@@ -572,10 +572,9 @@ class KVState:
         """
         if self.cfg.GATHER:
             # A per-column page, so the whole address goes in the offsets.
-            # `* U` is the value stream's D_PER_TILE move: the list is stored in
+            # U is the value stream's D_PER_TILE move: the list is stored in
             # units of U so the multiply hands the 2-byte alignment back, and
             # without it each scale run splits into two buffer_load_ubyte.
-            # gather_s_unit() picks the same U and must stay in step.
             U: gl.constexpr = 2 if (self.cfg.GATHER_BLOCK % 2 == 0
                                     and self.cfg.NUM_SCALES % 2 == 0) else 1
             if self.cfg.USE_BUFFER_LOAD:
@@ -630,8 +629,7 @@ def _load_scales_wide(cfg, ptr, gbase):
                    layout=_axis_layout(lr, 2, 4))[None, None, :, None]
     b3 = gl.arange(0, S_HI, layout=_axis_layout(lr, 3, 4))[None, None, None, :]
     if cfg.GATHER:
-        # The group term is in gbase, and the token index is the block-local
-        # one: Bs(t0 + c) == Bs(t0) + c * S_HI.
+        # The group term is in gbase, and the token index is block-local
         offs = (b2 % cfg.GATHER_BLOCK + b1 * cfg.N_PER_TILE) * S_HI + b3 + gbase
     else:
         offs = (b0 * (cfg.N_PER_TILE * cfg.NUM_SCALES)
@@ -750,9 +748,6 @@ class LDSLoader:
         cfg: gl.constexpr = self.st.cfg
         dest = self.kv_shared.index(buffer_id)
         if cfg.GATHER:
-            # The gather needs nothing new here: the page was already in the
-            # offsets rather than the base, which is exactly the form a
-            # per-column page takes. Only where the number comes from moves.
             if cfg.USE_BUFFER_LOAD:
                 offsets = (self.st.val_offsets
                            + (gtok[0] * cfg.D_PER_TILE)[None, :])
@@ -774,9 +769,6 @@ class LDSLoader:
     def consume(self, wait_count, buffer_id):
         gl.amd.cdna4.async_copy.wait_group(wait_count)
         return self.kv_shared.index(buffer_id).load(layout=self.st.cfg.dot_b)
-
-
-# the inner product and the store
 
 
 @gluon.jit
@@ -811,9 +803,6 @@ def _row_logits(cfg, q, q_scale, w, k, k_scale):
 @strip_annotate
 class Program:
     """This workgroup's rows and the window they own.
-
-    A split partitions the output, not a sum -- two splits of one row write
-    disjoint columns, so there is nothing to reduce afterwards.
     """
 
     cfg: Config
@@ -899,16 +888,6 @@ class Program:
         # a cross-lane reduce: at C <= N_PER_TILE it stays inside a DPP row.
         best = gl.reduce(grouped, 1, _max_nan)
         blk = gl.arange(0, BPT, layout=gl.SliceLayout(1, grouped.type.layout))
-        # The same bound the logits store has, and not droppable on
-        # MASKED=False tiles: at UNROLL 2 a short segment faults out of bounds
-        # (ctx 1047, C 32, 64 heads, unshuffled). UNROLL 1 is clean and so is
-        # one long segment, so it needs both. Not the trip count, not the
-        # unrolled loop at the boundary, and not a near miss -- a 4x wider
-        # tensor faults too.
-        #
-        # Not worth chasing: dropping both store masks measures 1.00x dense,
-        # 1.01x block max and 1.01x gather at 32 heads, and 1.037x / 1.016x at
-        # 64 -- only the 64-head block max clears its own spread.
         gl.amd.cdna4.buffer_store(
             best, ptr=self.bs_ptr + r * self.bs_stride_s,
             offsets=tile_pos // C + blk,
@@ -920,14 +899,7 @@ class Program:
         # One row: the bound is exact, so it goes straight into the predicate.
         # Several: a per-row predicate would need one exec mask per row, so the
         # per-row part goes in a select under a shared predicate instead.
-        # RELAXED_STORE drops that select -- those columns are unspecified with
-        # clean_logits off. The union bound stays; it is what keeps the store
-        # inside this row and this split.
-        #
-        # A block max must *see* the boundary as -inf, where the store predicate
-        # only drops the column. MASKED marks a tile that can cross one: at
-        # BLOCK_M == 1 that is the peeled tail alone, and above one row the
-        # select is unconditional anyway unless RELAXED_STORE dropped it.
+        # RELAXED_STORE drops that select
         cfg: gl.constexpr = self.cfg
         col = gl.arange(0, cfg.BLOCK_KV, layout=gl.SliceLayout(0, cfg.mfma_layout))
         pos = tile_pos + col
@@ -978,8 +950,7 @@ def _loop_with_reg(pgm, loader, qs, qss, ws, row_hi):
         k1 = loader.values(pos + BKV, p1, g1)
     pn = loader.page_token(pos + AHEAD) if cfg.PAGE_PIPE else 0
     # The candidate list, an iteration ahead of the tile it addresses. Same
-    # trade as PAGE_PIPE: two more live values against a dependent load
-    # standing directly in front of every KV address in the tile.
+    # trade as PAGE_PIPE
     gn = loader.gather_tok(pos + AHEAD) if cfg.GATHER_PIPE else (0, 0)
 
     unroll: gl.constexpr = cfg.UNROLL if cfg.UNROLL > 1 else None
@@ -1004,8 +975,6 @@ def _loop_with_reg(pgm, loader, qs, qss, ws, row_hi):
             k0, s0 = k_new, s_new
         pos += BKV
 
-    # A segment shorter than the pipeline walks past its own end; every store
-    # there is bounded by store_hi, so it costs work and nothing else.
     pgm.emit(qs, qss, ws, row_hi, k0, s0, pos)
     if cfg.DEPTH == 2:
         pgm.emit(qs, qss, ws, row_hi, k1, s1, pos + BKV)
@@ -1161,10 +1130,6 @@ def _pa_mqa_logits_mxfp4_kernel(
     gl.static_assert((BSCORE == 0) | (BSCORE == 1) | (BSCORE == 2),
                      "BSCORE is 0 off, 1 block maxima beside the logits, "
                      "2 block maxima instead of them")
-    # The producer walks densely and the consumers gather; no launch is both.
-    # Static, not tested: the combination has no caller. It holds for BSCORE 2
-    # as much as for 1 -- mode 2 is the *first* pass of a producer whose second
-    # pass is a gather, and those are two launches, never one.
     gl.static_assert((BSCORE == 0) | (GATHER == 0),
                      "block maxima are for the dense producer, not the gather")
 
@@ -1186,8 +1151,6 @@ def _pa_mqa_logits_mxfp4_kernel(
         if num_slices <= slice_idx:
             return
     else:
-        # Reversed: the walk is trimmed at each block's causal limit, so block 0
-        # of a prefill chunk has the least work and the last has the most.
         # Longest first keeps the grid's tail short.
         row_block = gl.num_programs(0) - 1 - gl.program_id(0)
         batch_id = gl.program_id(1)
@@ -1207,9 +1170,6 @@ def _pa_mqa_logits_mxfp4_kernel(
     qs_base = batch_id.to(gl.int64) * stride_qs_b + n0.to(gl.int64) * stride_qs_n
     w_row = batch_id.to(gl.int64) * next_n + n0
 
-    # BLOCK_M scalar loads beside the Q rows, nothing per KV tile. Replaces the
-    # built-in rule and may exceed it, for a compressed cache or a CP shard.
-    # Under GATHER it counts valid candidate slots instead of keys.
     mfma_qs, q_scales, w_blocks, ends = (), (), (), ()
     for r in gl.static_range(0, BLOCK_M):
         q, qs, w = _load_q_row(cfg, Q_ptr + (q_base + r * stride_q_n),
@@ -1222,9 +1182,6 @@ def _pa_mqa_logits_mxfp4_kernel(
             ends = ends + (context_len - next_n + n0 + r + 1,)
 
     if HAS_CU_ENDS:
-        # Max over the block's rows: only the built-in rule puts the furthest
-        # last. Trivial under GATHER, which is one row per workgroup, and still
-        # the right reduction there -- the widest walk any row needs.
         block_end = ends[0]
         for r in gl.static_range(1, BLOCK_M):
             block_end = gl.maximum(block_end, ends[r])
@@ -1239,8 +1196,7 @@ def _pa_mqa_logits_mxfp4_kernel(
         bs_stride_s: gl.int32 = 0
     if BSCORE == 2:
         # There is no logits row to address: logits_ptr arrives as None and
-        # specializes away. The placeholder mirrors what bs_ptr does with the
-        # reduce off -- nothing in the walk reads either.
+        # specializes away
         out_ptr = bs_ptr
         out_stride_s: gl.int32 = 0
         out_stride_k: gl.int32 = 0
@@ -1258,15 +1214,10 @@ def _pa_mqa_logits_mxfp4_kernel(
     row_hi = pgm.row_bounds(ends, BLOCK_M)
 
     blk_ptr = block_table_ptr + batch_id * stride_blk_b
-    # Both bounds matter: the context says how many pages are filled, the
-    # table's width how many exist.
     last_page_row = gl.minimum((context_len + PAGE_SIZE - 1) // PAGE_SIZE,
                                max_blocks) - 1
 
-    # The candidate list is per query row and its page ids are already resolved
-    # on the host, so the walk carries no block -> position -> table -> page
-    # chain: one int32 per candidate block per stream, added in. block_end is
-    # the row's slot count here, so it is also the last block's index.
+    # The candidate list is per query row
     g_base = w_row.to(gl.int64) * stride_gather_r
     gv_ptr = gather_v_ptr + g_base
     gs_ptr = gather_s_ptr + g_base
@@ -1282,11 +1233,7 @@ def _pa_mqa_logits_mxfp4_kernel(
         _loop_with_lds(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
 
     if BSCORE:
-        # The row's newest block is a candidate whatever it scored. Out here
-        # because it is one element per row. Written by the workgroup covering
-        # that key -- the one whose reduce wrote it -- and keyed on `ends[r]`,
-        # not `row_hi[r]`, or every split claims its own last block. Its warps
-        # still race, and Gluon barriers LDS, not two warps on one address.
+        # The row's newest block is a candidate whatever it scored
         gl.barrier()
         # One thread, not one element of a replicated tensor.
         NT: gl.constexpr = NUM_WARPS * WARP_SIZE
