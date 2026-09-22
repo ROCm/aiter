@@ -34,9 +34,7 @@ _TUNE_KN2_A = "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic_bnt2"
 _TUNE_KN2_B = "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic_persist"
 _TUNE_KN2S = frozenset((_TUNE_KN2_A, _TUNE_KN2_B))
 _SHIPPED_TOKEN1_KN2 = "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic"
-_KERNEL_REGEX = (
-    rf"{_TUNE_KN1} {_TUNE_KN2_A}$|{_TUNE_KN1} {_TUNE_KN2_B}$"
-)
+_KERNEL_REGEX = rf"{_TUNE_KN1} {_TUNE_KN2_A}$|{_TUNE_KN1} {_TUNE_KN2_B}$"
 # fused_moe refuses M=16 unless the CSV has every power-of-two through 16.
 _TUNE_TOKENS = (1, 2, 4, 8, 16)
 _REPLAY_TOKENS = (1, 16)
@@ -144,8 +142,7 @@ def _cleanup_stale_lock_files():
 
 
 def _child_script(token):
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         import sys
         sys.path.insert(
             0,
@@ -214,8 +211,7 @@ def _child_script(token):
             print("REPLAY_RAISE", str(exc))
             raise SystemExit(0)
         print("REPLAY_OK", tuple(out.shape))
-        """
-    )
+        """)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
