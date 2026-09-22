@@ -902,8 +902,9 @@ class Program:
         # The same bound the logits store has, and not droppable on
         # MASKED=False tiles: at UNROLL 2 a short segment faults out of bounds
         # (ctx 1047, C 32, 64 heads, unshuffled). UNROLL 1 is clean and so is
-        # one long segment, so it needs both -- mechanism not established, and
-        # clamping the trip count does not fix it.
+        # one long segment, so it needs both. Mechanism not established:
+        # it is not the trip count, not the unrolled loop at the boundary, and
+        # not a near miss -- a 4x wider tensor faults too.
         gl.amd.cdna4.buffer_store(
             best, ptr=self.bs_ptr + r * self.bs_stride_s,
             offsets=tile_pos // C + blk,
