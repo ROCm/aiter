@@ -28,8 +28,8 @@ when that is the ticket convention.
 - [x] 1. Lock launch paths; decode ATT that actually hits a CU
 - [x] 2. Pack live / phys / page_off LDS
 - [x] 3. Overlap K/V `buffer_load` with LDS wait/barrier
-- [ ] 4. Bank-conflict-free K (and C) stores; V layout unchanged
-      (K pad **kept**; C still open)
+- [x] 4. Bank-conflict-free K (and C) stores; V layout unchanged
+      (K pad **kept**; C 66-lane pad **reverted**)
 - [ ] 5. Token-major V: pack stores only
 - [ ] 6. Optional: drop C-LDS QK reduce (last, likely small)
 - [ ] 7. Stop: within ~2× AMD per-wave conflict/wait **or** keep-gate dry
@@ -281,8 +281,8 @@ and C-publish. Swizzle/pad/phase the **existing** tiled K/C maps.
       V stays unpadded stride `D`. C LDS not in this ISA line.
 - [x] **Do not** switch decode V to `[BLOCK_N, D]`.
 - [x] Keep-gate on K pad; PMC conflict/wave moved.
-- [ ] C stores still open (next ISA line in this phase).
-- [ ] **Done when:** C kept or reverted + note (K already kept).
+- [x] C 64→66 lane-axis pad: pytest 2/2, miss keep-gate, reverted.
+- [x] **Done.** K kept; do not retry C 66-pad. Phase 5 next.
 
 Measured 2026-09-22 GPU 6 / gfx950, `CACHE=0`, `ROCM_PATH=/root/.flydsl/toolkit`.
 Focused pytest `test_k2_family_a_*` 2/2. Width-2051 `L=512` median of
@@ -312,6 +312,20 @@ still expected (col vs col+8 on the pad). C-LDS `(n_subtiles,
 num_waves, 64, 4)` is the remaining store map in this phase.
 
 **K pad kept.** Next in phase 4: C stores only.
+
+C-LDS pad `_C_LANE_STRIDE=66` (logical 64, wave-row stride 264 so
+`wave·264 % 32 = 8·wave`). Indexing `c_lds[ng, wave, lane, i]`
+unchanged. GPU 6 / gfx950, `CACHE=0`. Pytest 2/2. Median vs K-pad
+baseline `20.09 / 20.52 / 424.09`:
+
+| M | K pad | C 66-pad | Δ |
+|--:|--:|--:|--:|
+| 1 | 20.09 | 20.31 | +1.10% |
+| 8 | 20.52 | 19.98 | −2.63% |
+| 512 | 424.09 | 431.45 | +1.74% |
+
+M=8 under 3%; M=1 and prefill regress. Kernel C layout restored.
+**Phase 4 done.** Next: phase 5 (pack token-major V stores).
 
 ### 5. Token-major V: pack stores only
 
@@ -360,3 +374,6 @@ The parent plan remains the full K2 list.
 - Hoisting gfx950 V `buffer_load` before the K-publish `lgkmcnt(0)` /
   `s_barrier`. ISA moved the loads; wall-clock missed 3% (M=1 +0.25%,
   M=8 −0.48%, M=512 −0.45%). Keep V gather after that barrier.
+- Padding C-LDS's 64-lane axis to 66. Correct; M=8 −2.63%, M=1 +1.10%,
+  M=512 +1.74% vs K-pad baseline. Keep unpadded `(n_subtiles,
+  num_waves, 64, 4)`.

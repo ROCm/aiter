@@ -722,6 +722,13 @@ conflict/wave dropped (decode 1032 → 384, prefill 93984 → 51744);
 MFMA/wave stayed 24 / 1584. New keep-gate baseline **20.09 / 20.52 /
 424.09**. C-LDS is still unpadded.
 
+**Do not retry** padding C-LDS's 64-lane axis to 66 (`_C_LANE_STRIDE=66`,
+logical 64). GPU 6 / gfx950 focused decode+prefill pytest passed, but
+width-2051 `L=512` K-pad → C-pad median (three runs) was
+20.09 → 20.31 us at `M=1`, 20.52 → 19.98 us at `M=8` (−2.63%), and
+424.09 → 431.45 us at `M=512`. Keep unpadded
+`(n_subtiles, num_waves, 64, 4)`.
+
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in
 `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`
