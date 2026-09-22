@@ -240,7 +240,7 @@ def compare_metadata(golden, test):
     )
 
     ok = all(v == 0 for v in details.values())
-    return ok, details, num_works, num_groups
+    return ok, details, num_works, num_groups, num_partial
 
 
 @benchmark()
@@ -259,7 +259,7 @@ def test_metadata(
     # Golden (serial planner) vs parallel planner -- must be bit identical.
     golden = run_path(inputs, out_meta, dtype, kvtype, use_parallel=False)
     parallel = run_path(inputs, out_meta, dtype, kvtype, use_parallel=True)
-    ok, mism, num_works, num_groups = compare_metadata(golden, parallel)
+    ok, mism, num_works, num_groups, num_partial = compare_metadata(golden, parallel)
 
     if not ok:
         print(f"  [MISMATCH] bs={batch_size} ctx={ctx_len} nhead={nhead}: {mism}")
@@ -276,6 +276,7 @@ def test_metadata(
         + num_works * work_bytes  # work_info_set
         + (batch_size + 1) * 4  # reduce_indptr
         + num_groups * 2 * 4  # reduce_final_map, split tiles only
+        + num_partial * 4  # reduce_partial_map, one entry per partial fragment
     )
 
     # The serial planner is both the reference and a kernel under test: it is
@@ -343,7 +344,7 @@ def main():
         "-b",
         "--batch",
         type=int,
-        nargs="*",
+        nargs="+",
         default=DEFAULT_BATCHES,
         help="Batch sizes (== serving concurrency).",
     )
@@ -351,7 +352,7 @@ def main():
         "-c",
         "--ctx-len",
         type=int,
-        nargs="*",
+        nargs="+",
         default=DEFAULT_CTX_LENS,
         help="KV context lengths (== serving ISL).",
     )
@@ -363,7 +364,7 @@ def main():
     parser.add_argument(
         "--batch-chunk",
         type=int,
-        nargs="*",
+        nargs="+",
         default=[0],
         help="Planner chunk ceilings to sweep; 0 leaves the built-in one. A value\n"
         "below it forces the runtime-chunk kernel, which is what gfx942 runs.",
@@ -409,6 +410,10 @@ def main():
         "mla metadata planner summary (markdown):\n%s", df.to_markdown(index=False)
     )
 
+    assert rows, (
+        "the sweep ran no shapes -- an empty axis would otherwise report a pass "
+        "without comparing anything"
+    )
     assert all_match, "parallel MLA metadata planner diverged from serial reference"
 
 
