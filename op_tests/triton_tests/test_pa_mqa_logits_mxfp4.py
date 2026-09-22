@@ -382,3 +382,200 @@ def test_addressing(gib, preshuffle):
         pytest.skip("out of memory")
     assert diff <= TOL, f"residual {diff:.3e} at {real:.1f} GiB"
     assert inf_ok, "the -inf pattern does not match the reference"
+
+
+# block maxima
+
+
+def block_scores_reference(logits, ends, block):
+    """Per-row maximum over each `block` columns, out-of-window read as -inf.
+
+    Bit-identical to the reduction the two-level indexer's candidate creation
+    does upstream (vLLM `_block_scores_kernel`): max is associative,
+    commutative and rounds nothing, columns past the row's end load as -inf,
+    and torch.amax propagates NaN the way tl.maximum(propagate_nan=ALL) does.
+    So there is no tolerance here -- the only acceptable answer is bit-identity.
+
+    Unpinned, like the kernel: upstream's +inf on the block holding the row's
+    newest key is one element per row and is the caller's scatter.
+    """
+    rows, width = logits.shape
+    nb = (width + block - 1) // block
+    x = logits
+    if nb * block > width:
+        x = torch.nn.functional.pad(x, (0, nb * block - width),
+                                    value=float("-inf"))
+    col = torch.arange(nb * block, device=logits.device)
+    x = torch.where(col[None, :] < ends[:, None], x,
+                    torch.full_like(x, float("-inf")))
+    return x.reshape(rows, nb, block).amax(-1)
+
+
+def row_ends(ctx_lens, next_n, cu_ends, device="cuda"):
+    """The exclusive per-row column bound the kernel's stores answer to."""
+    out = []
+    for b, ctx in enumerate(ctx_lens):
+        for n in range(next_n):
+            e = (ctx - next_n + n + 1 if cu_ends is None
+                 else int(cu_ends[b * next_n + n]))
+            out.append(max(min(e, ctx), 0))
+    return torch.tensor(out, dtype=torch.int32, device=device)
+
+
+def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
+                dynamic=0, cu_ends=None):
+    rows, mml = len(st["ctx"]) * next_n, st["mml"]
+    nb = (mml + block - 1) // block
+    bs = torch.full((rows, nb), float("-inf"), dtype=torch.float32,
+                    device=st["dev"])
+    logits = paged_mxfp4_mqa_logits(
+        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+        st["block_table"], mml, preshuffle=preshuffle,
+        clean_logits=clean_logits, dynamic=dynamic, cu_ends=cu_ends,
+        block_scores=bs, candidate_block_size=block)
+    torch.cuda.synchronize()
+    return logits, bs
+
+
+BSCORE_SHAPES = [
+    ("decode b1", 1, 1, [1047]),
+    ("decode b8", 8, 1, [2048, 1024, 4096, 512, 3000, 777, 64, 129]),
+    ("spec n=6", 4, 6, [2048, 1500, 601, 64]),
+    ("prefill 512", 1, 512, [8192]),
+    ("tiny ctx", 3, 1, [1, 33, 64]),
+    ("ragged", 5, 3, [97, 4096, 1, 2049, 512]),
+]
+
+
+@pytest.mark.parametrize("shape", BSCORE_SHAPES,
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("block", [8, 32])
+@pytest.mark.parametrize("preshuffle", [1, 0])
+def test_block_scores(shape, num_heads, block, preshuffle):
+    """The gate on the fused candidate-creation reduce.
+
+    A block maximum over the same logits cannot round, so anything other than
+    0 differing words means the reduce saw different columns -- a lane past the
+    row's causal end, a block straddling a KV split, or a stale register.
+    """
+    _, batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64,
+                    preshuffle=preshuffle)
+    logits, bs = _bscore_run(st, num_heads, next_n, block, preshuffle)
+    ends = row_ends(st["ctx"], next_n, None)
+    ref = block_scores_reference(logits, ends, block)
+    nd = int((ref.view(torch.int32) != bs.view(torch.int32)).sum())
+    assert nd == 0, f"{nd} differing words"
+
+
+@pytest.mark.parametrize("shape", BSCORE_SHAPES[:4],
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("dynamic", [0, 1])
+@pytest.mark.parametrize("clean_logits", [True, False])
+def test_block_scores_knobs(shape, num_heads, dynamic, clean_logits):
+    """The split plan and the store relaxation must not move a block maximum.
+
+    A KV split is cut at BLOCK_KV granularity and a candidate block divides it,
+    so no block straddles a split and no split writes another's blocks.
+    clean_logits off drops the per-row select from the logits store, which the
+    reduce cannot afford to lose.
+    """
+    _, batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64)
+    logits, bs = _bscore_run(st, num_heads, next_n, 8, clean_logits=clean_logits,
+                             dynamic=dynamic)
+    ends = row_ends(st["ctx"], next_n, None)
+    ref = block_scores_reference(logits, ends, 8)
+    nd = int((ref.view(torch.int32) != bs.view(torch.int32)).sum())
+    assert nd == 0, f"{nd} differing words"
+
+
+@pytest.mark.parametrize("shape", CU_ENDS_SHAPES,
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("kind", ["compressed", "padded"])
+@pytest.mark.parametrize("dynamic", [0, 1])
+def test_block_scores_cu_ends(shape, kind, dynamic):
+    """The reduce reads the same row bound the store does.
+
+    Under a compressed cache the boundary is not one key per row, so a block
+    max that used the kernel's built-in rule would pick up positions the row
+    cannot attend to -- and being a max, it would keep the largest of them.
+    """
+    _, batch, next_n, ctx_lens = shape
+    ends_t = cu_ends_for(kind, ctx_lens, next_n)
+    st = _make_case(batch, next_n, 32, 128, ctx_lens, 64)
+    logits, bs = _bscore_run(st, 32, next_n, 8, dynamic=dynamic, cu_ends=ends_t)
+    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, ends_t), 8)
+    nd = int((ref.view(torch.int32) != bs.view(torch.int32)).sum())
+    assert nd == 0, f"{nd} differing words"
+
+
+@pytest.mark.parametrize("block", [8, 16])
+def test_block_scores_nan(block):
+    """NaN is the only place a "max is a max" argument can break.
+
+    e8m0 0xFF is NaN in OCP MX, so a poisoned scale byte makes one token's
+    logits NaN for every row that reads it. The reduce must propagate it --
+    tl.maximum(propagate_nan=ALL) upstream, gl.maximum(propagate_nan=ALL) here
+    -- while -inf still marks padding.
+    """
+    batch, next_n, page_size, ctx = 2, 1, 64, 1024
+    st = _make_case(batch, next_n, 32, 128, [ctx, 777], page_size)
+    flat = st["cache"].view(st["cache"].shape[0], -1)
+    scales = flat[:, page_size * 64:]
+    for i in st["block_table"].reshape(-1).tolist()[:4]:
+        scales[i, 5] = 255
+    logits, bs = _bscore_run(st, 32, next_n, block)
+    assert int(torch.isnan(logits).sum()) > 0, "no NaN reached the logits"
+    assert int(torch.isnan(bs).sum()) > 0, "the NaN did not reach a block"
+    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), block)
+    nd = int((ref.view(torch.int32) != bs.view(torch.int32)).sum())
+    assert nd == 0, f"{nd} differing words"
+
+
+@pytest.mark.parametrize("shape", BSCORE_SHAPES[:3],
+                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_block_scores_leaves_logits_alone(shape, num_heads):
+    """The maxima come out beside the logits, not instead of them.
+
+    The producer needs its own logits for its own top-k; what the fusion
+    deletes is the separate read pass, so the logits must be word-identical to
+    a launch without the side output.
+    """
+    _, batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64)
+    plain = paged_mxfp4_mqa_logits(
+        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+        st["block_table"], st["mml"]).clone()
+    torch.cuda.synchronize()
+    fused, _ = _bscore_run(st, num_heads, next_n, 8)
+    nd = int((plain.view(torch.int32) != fused.view(torch.int32)).sum())
+    assert nd == 0, f"{nd} differing words in the logits"
+
+
+def test_block_scores_rejects_gather():
+    """The producer is dense and the consumers gather; no launch is both."""
+    st = _make_case(1, 1, 32, 128, [512], 64)
+    pos, ends = _identity_list(st, 1, 8)
+    meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
+    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
+                    device=st["dev"])
+    with pytest.raises(AssertionError, match="dense producer"):
+        paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], st["mml"], gather=meta, cu_ends=ends,
+            block_scores=bs)
+
+
+def test_block_scores_needs_room():
+    """A score tensor too narrow for max_model_len is a caller error."""
+    st = _make_case(1, 1, 32, 128, [512], 64)
+    bs = torch.full((1, st["mml"] // 8 - 1), float("-inf"),
+                    dtype=torch.float32, device=st["dev"])
+    with pytest.raises(AssertionError, match="blocks wide"):
+        paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], st["mml"], block_scores=bs)

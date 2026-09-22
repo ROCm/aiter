@@ -33,6 +33,10 @@ IDEAL_PAGE_SIZE = 64
 # written for.
 SCALE_MODE_WIDE = 1
 
+# DeepSeek-V4.1's two-level indexer groups the context in 8-token candidate
+# blocks, which is what a fused block score is a maximum over.
+CANDIDATE_BLOCK = 8
+
 def mfma_nonk_dim(num_heads: int, head_size: int) -> int:
     # 32x32x64 leaves one head bit across lanes where 16x16x128 leaves two, so
     # the head sum needs one cross-lane step instead of two.
@@ -359,6 +363,8 @@ def paged_mxfp4_mqa_logits(
     schedule: torch.Tensor | None = None,
     cu_ends: torch.Tensor | None = None,
     gather: dict | None = None,
+    block_scores: torch.Tensor | None = None,
+    candidate_block_size: int = CANDIDATE_BLOCK,
 ) -> torch.Tensor:
     """
     This function computes the logits to be used by a topk function for sparse
@@ -396,6 +402,19 @@ def paged_mxfp4_mqa_logits(
                     host-resolved candidate list rather than the context, and
                     output column j holds candidate slot j. context_lens and
                     block_table are unread on this path
+    block_scores:   [B * NEXT_N, ceil(max_model_len / candidate_block_size)],
+                    dtype float32, optional. The two-level indexer's stage-A
+                    block scores, fused into this walk: block b of row i gets
+                    the maximum of that row's logits over columns
+                    [b*C, (b+1)*C), with the columns the row cannot attend to
+                    counted as -inf. Must arrive filled with -inf; blocks past
+                    the row's walk are left untouched. Emitted *unpinned* --
+                    upstream's +inf on the block holding the row's newest key
+                    is one element per row and belongs in a caller-side
+                    scatter, not in a compare per block inside the walk. Not
+                    available under gather: the producer walks densely
+    candidate_block_size: int, columns per candidate block. Must divide
+                    BLOCK_KV so no block straddles a tile or a KV split
 
     Returns:
     logits:         [B * NEXT_N, max_model_len], dtype float32
@@ -490,6 +509,27 @@ def paged_mxfp4_mqa_logits(
     assert block_kv % n_per_tile == 0, (
         f"BLOCK_KV {block_kv} must be a multiple of the MFMA N ({n_per_tile})")
 
+    # The fused stage-A reduce. C divides BLOCK_KV, so a tile owns a whole
+    # number of candidate blocks and a KV split -- cut at BLOCK_KV granularity
+    # -- never splits one, which is what makes the block max purely local.
+    bscore_on = 1 if block_scores is not None else 0
+    cand_block = int(candidate_block_size)
+    if bscore_on:
+        assert gather is None, (
+            "block maxima are for the dense producer; the consumers gather")
+        assert block_scores.dtype == torch.float32
+        assert cand_block <= block_kv and block_kv % cand_block == 0, (
+            f"candidate_block_size {cand_block} must divide BLOCK_KV "
+            f"{block_kv} or a block straddles a tile")
+        n_blocks = (max_model_len + cand_block - 1) // cand_block
+        assert block_scores.shape[0] == batch * next_n, block_scores.shape
+        assert block_scores.shape[1] >= n_blocks, (
+            f"block_scores is {block_scores.shape[1]} blocks wide, needs "
+            f"{n_blocks} for max_model_len {max_model_len}")
+        assert block_scores.stride(1) == 1, "block_scores rows must be contiguous"
+        assert block_scores.shape[1] * 4 < 2 ** 31, (
+            "block_scores row exceeds what a buffer store can address")
+
     use_buffer_load = bool(preshuffle) or (
         num_pages * max(kv_page_stride, kvs_page_stride) < 2 ** 31)
     if gather_on:
@@ -542,6 +582,9 @@ def paged_mxfp4_mqa_logits(
         sched_ptr=schedule,
         gather_v_ptr=g_voff if gather_on else schedule,
         gather_s_ptr=g_soff if gather_on else schedule,
+        # None specializes to a constexpr, so neither reaches the kernarg
+        # segment with the reduce off.
+        block_scores_ptr=block_scores if bscore_on else None,
         logits_ptr=logits,
         next_n=next_n,
         num_kv_splits=num_kv_splits,
@@ -554,6 +597,7 @@ def paged_mxfp4_mqa_logits(
         stride_logits_k=logits.stride(1),
         stride_blk_b=block_table.stride(0),
         stride_gather_r=g_voff.stride(0) if gather_on else 0,
+        stride_bs_s=block_scores.stride(0) if bscore_on else None,
         max_blocks=block_table.shape[1],
         NUM_HEADS=num_heads,
         HEAD_SIZE=head_size,
@@ -583,6 +627,8 @@ def paged_mxfp4_mqa_logits(
         GATHER=gather_on,
         GATHER_BLOCK=gather_block,
         GATHER_PIPE=cfg["gather_pipe"] if gather_on else 0,
+        BSCORE=bscore_on,
+        BSCORE_BLOCK=cand_block if bscore_on else CANDIDATE_BLOCK,
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
     )

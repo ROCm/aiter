@@ -147,6 +147,14 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
 
 
 @gluon.jit
+def _max_nan(a, b):
+    # The reduction _block_scores_kernel uses. Also the cheaper one on gfx950:
+    # v_maximum3_f32 propagates NaN in one instruction, where the non-
+    # propagating max needs a canonicalising v_max_f32 x,x,x per operand first.
+    return gl.maximum(a, b, propagate_nan=_NAN_ALL)
+
+
+@gluon.jit
 def _relu(x, RELU_ADD: gl.constexpr):
     # RELU_ADD spells relu as (x + |x|)/2: one v_add_f32 with an abs source
     # modifier where max(x, 0) is a v_maximum3_f32, same instruction count and
@@ -241,6 +249,9 @@ class Config:
     GATHER: gl.constexpr
     GATHER_BLOCK: gl.constexpr
     GATHER_PIPE: gl.constexpr
+    BSCORE: gl.constexpr
+    BSCORE_BLOCK: gl.constexpr
+    BLOCKS_PER_TILE: gl.constexpr
     N_PER_TILE: gl.constexpr
     D_PER_TILE: gl.constexpr
     Q_CACHE: gl.constexpr
@@ -261,7 +272,8 @@ class Config:
                  UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
                  PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
                  MFMA_NONK_DIM, HAS_KV_SPLIT,
-                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE):
+                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE,
+                 BSCORE, BSCORE_BLOCK):
         self.NUM_HEADS = gl.constexpr(NUM_HEADS)
         self.HEAD_BYTES = gl.constexpr(HEAD_SIZE // 2)
         self.NUM_SCALES = gl.constexpr(HEAD_SIZE // SCALE_GROUP.value)
@@ -303,6 +315,12 @@ class Config:
         self.GATHER = gl.constexpr(GATHER)
         self.GATHER_BLOCK = gl.constexpr(GATHER_BLOCK)
         self.GATHER_PIPE = gl.constexpr(GATHER_PIPE)
+        # Emit a per-row maximum over every BSCORE_BLOCK columns beside the
+        # logits, so the two-level indexer's block scores cost a reduce in the
+        # walk instead of a second pass over the logits it just wrote.
+        self.BSCORE = gl.constexpr(BSCORE)
+        self.BSCORE_BLOCK = gl.constexpr(BSCORE_BLOCK)
+        self.BLOCKS_PER_TILE = gl.constexpr(BLOCK_KV // BSCORE_BLOCK)
         self.N_PER_TILE = gl.constexpr(MFMA_NONK_DIM)
         self.D_PER_TILE = gl.constexpr(K_WIDTH.value)
         # A split re-reads Q, so keep it in L1. The KV stream takes .cg when one
@@ -825,10 +843,12 @@ class Program:
     tile_lo: gl.tensor
     tile_hi: gl.tensor
     store_hi: gl.tensor
+    bs_ptr: gl.tensor
+    bs_stride_s: gl.tensor
 
     @gluon.constexpr_function
     def __init__(self, cfg, out_ptr, stride_s, stride_k, tile_lo, tile_hi,
-                 store_hi):
+                 store_hi, bs_ptr, bs_stride_s):
         self.cfg = cfg
         self.out_ptr = out_ptr
         self.stride_s = stride_s
@@ -836,10 +856,13 @@ class Program:
         self.tile_lo = tile_lo
         self.tile_hi = tile_hi
         self.store_hi = store_hi
+        self.bs_ptr = bs_ptr
+        self.bs_stride_s = bs_stride_s
 
     @gluon.jit
     def initialize(cfg, out_ptr, stride_s, stride_k, context_len, block_end,
                    split_id, num_kv_splits, slice_idx, num_slices,
+                   bs_ptr, bs_stride_s,
                    HAS_KV_SPLIT: gl.constexpr, DYNAMIC: gl.constexpr):
         if cfg.GATHER:
             # block_end counts candidate slots here, not key positions: the
@@ -869,7 +892,8 @@ class Program:
         # The compact end under GATHER: output column j is candidate slot j.
         store_hi = gl.minimum(keys if cfg.GATHER else context_len,
                               tile_hi * cfg.BLOCK_KV)
-        return Program(cfg, out_ptr, stride_s, stride_k, tile_lo, tile_hi, store_hi)
+        return Program(cfg, out_ptr, stride_s, stride_k, tile_lo, tile_hi,
+                       store_hi, bs_ptr, bs_stride_s)
 
     @gluon.jit
     def row_bounds(self, ends, BLOCK_M: gl.constexpr):
@@ -888,13 +912,52 @@ class Program:
         return out
 
     @gluon.jit
-    def emit(self, qs, qss, ws, row_hi, k, k_scale, tile_pos):
+    def block_max(self, scores, r: gl.constexpr, tile_pos):
+        """A per-row max over each BSCORE_BLOCK columns of this tile.
+
+        The candidate block divides BLOCK_KV, so a tile owns a whole number of
+        blocks and no block is split across tiles or across KV splits -- the
+        reduce is entirely local and needs no second pass to combine.
+
+        Unpinned: the +inf on the row's newest block is one element per row and
+        belongs in the caller's scatter, not in a compare per block here.
+        """
+        cfg: gl.constexpr = self.cfg
+        C: gl.constexpr = cfg.BSCORE_BLOCK
+        BPT: gl.constexpr = cfg.BLOCKS_PER_TILE
+        grouped = scores.reshape([BPT, C])
+        # Adjacent columns are adjacent lanes under the MFMA layout, so this is
+        # a cross-lane reduce: at C <= N_PER_TILE it stays inside a DPP row.
+        # The result is replicated over the C lanes and the store's redundancy
+        # mask picks one of them, so there is one dword per block per tile.
+        best = gl.reduce(grouped, 1, _max_nan)
+        blk = gl.arange(0, BPT, layout=gl.SliceLayout(1, grouped.type.layout))
+        gl.amd.cdna4.buffer_store(
+            best, ptr=self.bs_ptr + r * self.bs_stride_s,
+            offsets=tile_pos // C + blk,
+            # The same bound the logits store answers to, read in block space:
+            # it keeps a walk that ran past its own end out of the next split's
+            # blocks and out of the region the caller pre-filled with -inf.
+            mask=tile_pos + blk * C < self.store_hi)
+
+    @gluon.jit
+    def emit(self, qs, qss, ws, row_hi, k, k_scale, tile_pos,
+             MASKED: gl.constexpr = True):
         # One row: the bound is exact, so it goes straight into the predicate.
         # Several: a per-row predicate would need one exec mask per row, so the
         # per-row part goes in a select under a shared predicate instead.
         # RELAXED_STORE drops that select -- those columns are unspecified with
         # clean_logits off. The union bound stays; it is what keeps the store
         # inside this row and this split.
+        #
+        # A block max has to *see* the causal boundary as -inf, where the store
+        # predicate merely drops the column, or it picks up a lane past the
+        # row's end. MASKED says this tile can cross one. At BLOCK_M == 1 only
+        # a peeled tile can: tile_hi is ceil(row_hi / BLOCK_KV), so tile
+        # tile_hi - 1 is the only one that straddles and the pipeline always
+        # peels it. Above one row the bounds differ per row and any tile can
+        # cross, so the select is not peelable there -- but it is already
+        # unconditional unless RELAXED_STORE dropped it.
         cfg: gl.constexpr = self.cfg
         col = gl.arange(0, cfg.BLOCK_KV, layout=gl.SliceLayout(0, cfg.mfma_layout))
         pos = tile_pos + col
@@ -902,14 +965,20 @@ class Program:
         for r in gl.static_range(0, cfg.BLOCK_M):
             scores = _row_logits(cfg, qs[r], qss[r], ws[r], k, k_scale)
             if cfg.BLOCK_M == 1:
+                if cfg.BSCORE and MASKED:
+                    scores = gl.where(pos < row_hi[r], scores, float("-inf"))
                 mask = pos < row_hi[r]
             elif cfg.RELAXED_STORE:
+                if cfg.BSCORE:
+                    scores = gl.where(pos < row_hi[r], scores, float("-inf"))
                 mask = pos < self.store_hi
             else:
                 scores = gl.where(pos < row_hi[r], scores, float("-inf"))
                 mask = pos < self.store_hi
             gl.amd.cdna4.buffer_store(scores, ptr=self.out_ptr + r * self.stride_s,
                                       offsets=offsets, mask=mask)
+            if cfg.BSCORE:
+                self.block_max(scores, r, tile_pos)
 
 
 @gluon.jit
@@ -953,7 +1022,7 @@ def _loop_with_reg(pgm, loader, qs, qss, ws, row_hi):
             gn = loader.gather_tok(pos + AHEAD + BKV)
         if cfg.PAGE_PIPE:
             pn = loader.page_token(pos + AHEAD + BKV)
-        pgm.emit(qs, qss, ws, row_hi, k0, s0, pos)
+        pgm.emit(qs, qss, ws, row_hi, k0, s0, pos, MASKED=False)
         if cfg.DEPTH == 2:
             k0, s0, k1, s1 = k1, s1, k_new, s_new
         else:
@@ -1005,7 +1074,7 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
             ga, gb, gn = gb, gn, loader.gather_tok(pos + 3 * BKV)
         else:
             ga, gb = gb, gn
-        pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos)
+        pgm.emit(qs, qss, ws, row_hi, k, kv_scale, pos, MASKED=False)
         buf = 1 - buf
         pos += BKV
 
@@ -1028,7 +1097,8 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
 
 _repr = make_kernel_repr("_pa_mqa_logits_mxfp4_kernel",
                          ["NUM_HEADS", "HEAD_SIZE", "PAGE_SIZE", "BLOCK_KV",
-                          "BLOCK_M", "PRESHUFFLE", "GATHER", "DEPTH",
+                          "BLOCK_M", "PRESHUFFLE", "GATHER", "BSCORE",
+                          "BSCORE_BLOCK", "DEPTH",
                           "UNROLL", "M_CHUNK", "MFMA_NONK_DIM", "NUM_WARPS",
                           "HAS_KV_SPLIT", "FOLD_ASM", "RELU_ADD"])
 
@@ -1047,6 +1117,8 @@ def _pa_mqa_logits_mxfp4_kernel(
     sched_ptr,         # int32 [grid, 4] descriptors; unused unless DYNAMIC
     gather_v_ptr,      # int32 [B*NEXT_N, blocks] resolved value offsets
     gather_s_ptr,      # int32 [B*NEXT_N, blocks] resolved scale byte offsets
+    block_scores_ptr,  # fp32  [B * NEXT_N, ceil(max_model_len / BSCORE_BLOCK)]
+                       # per-row block maxima; None unless BSCORE
     logits_ptr,        # fp32  [B * NEXT_N, max_model_len]
     next_n: gl.int32,
     num_kv_splits: gl.int32,
@@ -1056,6 +1128,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     stride_logits_s: gl.int32, stride_logits_k: gl.int32,
     stride_blk_b: gl.int32,
     stride_gather_r: gl.int32,
+    stride_bs_s,       # None unless BSCORE, so it leaves no kernarg when off
     max_blocks: gl.int32,
     NUM_HEADS: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
@@ -1085,6 +1158,8 @@ def _pa_mqa_logits_mxfp4_kernel(
     GATHER: gl.constexpr,        # walk a host-resolved candidate list
     GATHER_BLOCK: gl.constexpr,  # KV tokens per candidate block
     GATHER_PIPE: gl.constexpr,   # hoist the candidate-list read one iteration
+    BSCORE: gl.constexpr,        # emit per-row block maxima beside the logits
+    BSCORE_BLOCK: gl.constexpr,  # columns per candidate block
 ):
     gl.static_assert(BLOCK_KV % MFMA_NONK_DIM == 0)
     gl.static_assert(PAGE_SIZE % BLOCK_KV == 0,
@@ -1100,13 +1175,24 @@ def _pa_mqa_logits_mxfp4_kernel(
         (GATHER == 0) | (HAS_CU_ENDS == 1),
         "the gather takes its walk length from cu_ends, read as a slot count",
     )
+    gl.static_assert(
+        (BSCORE == 0) | ((BSCORE_BLOCK <= BLOCK_KV)
+                         & (BLOCK_KV % BSCORE_BLOCK == 0)),
+        "a candidate block must tile BLOCK_KV, so that no block straddles a "
+        "tile or a KV split and the reduce stays local",
+    )
+    # The producer walks densely and the consumers gather; no launch is both.
+    # Static, not tested: the combination has no caller.
+    gl.static_assert((BSCORE == 0) | (GATHER == 0),
+                     "block maxima are for the dense producer, not the gather")
 
     cfg = Config(NUM_HEADS, HEAD_SIZE, PAGE_SIZE, BLOCK_KV, BLOCK_M,
                  KV_PAGE_STRIDE, KVS_PAGE_STRIDE, NUM_WARPS, NUM_BUFFERS, DEPTH,
                  UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
                  PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
                  MFMA_NONK_DIM, HAS_KV_SPLIT,
-                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE)
+                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE,
+                 BSCORE, BSCORE_BLOCK)
 
     if DYNAMIC:
         desc = sched_ptr + gl.program_id(0) * 4
@@ -1165,10 +1251,17 @@ def _pa_mqa_logits_mxfp4_kernel(
     else:
         block_end = context_len - next_n + n0 + BLOCK_M
 
+    if BSCORE:
+        bs_ptr = block_scores_ptr + w_row.to(gl.int64) * stride_bs_s
+        bs_stride_s = stride_bs_s
+    else:
+        bs_ptr = logits_ptr
+        bs_stride_s: gl.int32 = 0
     pgm = Program.initialize(cfg, logits_ptr + w_row.to(gl.int64) * stride_logits_s,
                              stride_logits_s, stride_logits_k, context_len,
                              block_end, split_id, num_kv_splits,
-                             slice_idx, num_slices, HAS_KV_SPLIT, DYNAMIC)
+                             slice_idx, num_slices, bs_ptr, bs_stride_s,
+                             HAS_KV_SPLIT, DYNAMIC)
     if pgm.tile_lo >= pgm.tile_hi:
         return
     row_hi = pgm.row_bounds(ends, BLOCK_M)
