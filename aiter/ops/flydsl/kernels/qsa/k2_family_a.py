@@ -624,12 +624,11 @@ def build_qsa_k2_family_a_module(
             l_new = [l_prev[i] * alpha[i] + p_sum[i] for i in range_constexpr(4)]
             m4_out = fx.Vector.from_elements(m_new, Float32)
             l4_out = fx.Vector.from_elements(l_new, Float32)
-            if wave == zero:
-                if lane_m == zero:
-                    for i in range_constexpr(4):
-                        m_lds[heads[i]] = m_new[i]
-                        l_lds[heads[i]] = l_new[i]
-                        alpha_lds[heads[i]] = alpha[i]
+            if wave == zero and lane_m == zero:
+                for i in range_constexpr(4):
+                    m_lds[heads[i]] = m_new[i]
+                    l_lds[heads[i]] = l_new[i]
+                    alpha_lds[heads[i]] = alpha[i]
             gpu.barrier()
 
             alpha4 = fx.Vector.from_elements(
