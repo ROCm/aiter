@@ -10,7 +10,7 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 

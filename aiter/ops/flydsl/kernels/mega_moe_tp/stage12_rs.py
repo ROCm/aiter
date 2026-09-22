@@ -16,10 +16,8 @@ from flydsl.expr.typing import Int8, T
 
 from ..mxfp4_gemm1 import compile_gemm1_a4w4_port
 from ..mxfp4_gemm_common import _udiv, _umod, global_typed_ptr
-from .. import communication_ops_utils as comm
-from .p2p import desc_slot
 from ..mxmoe_dispatcher import compile_gemm2_a4w4_port
-from ..tensor_shim import _run_compiled as run_compiled, buf_copy_atom, ptr_buf_tensor
+from ..tensor_shim import _run_compiled as run_compiled
 from .reduce_scatter import MAX_SERVICE_BLOCKS, RS_UNIT_ELEMS
 from .rs_tail import (
     emit_phase_barrier,

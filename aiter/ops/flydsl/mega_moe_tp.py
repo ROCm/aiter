@@ -25,7 +25,6 @@ from .mxfp4_kname import (
 
 logger = logging.getLogger("aiter")
 
-_BF16_VIA_IMPL = os.environ.get("AITER_TP_MEGA_BF16_VIA_IMPL", "0") == "1"
 _STAGE2_TARGETS = {}
 
 
@@ -630,7 +629,7 @@ class MegaMoeTP:
                 kernel2,
                 None,
                 bucket,
-                self._fuses_rs(kernel2) if _BF16_VIA_IMPL else False,
+                False,
             )
         if prequant_ok:
             return _CasePlan(
@@ -673,7 +672,7 @@ class MegaMoeTP:
             kernel2,
             None,
             bucket,
-            self._fuses_rs(kernel2) if _BF16_VIA_IMPL else False,
+            False,
         )
 
     def _collectives(self, wire: str) -> TpMoeCollectives:
@@ -1092,7 +1091,7 @@ class MegaMoeTP:
         plan = plan or self.plan(total)
         output = self._collectives(plan.ag_wire).partial_buffer(total)
         fuse12 = _stage12_on() and a1_scale is not None and self._fuses_stage12(plan)
-        if a1_scale is None and not (_BF16_VIA_IMPL or fuse12):
+        if a1_scale is None and not fuse12:
             return (
                 fused_moe(
                     a1,

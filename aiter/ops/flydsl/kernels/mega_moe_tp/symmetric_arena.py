@@ -7,12 +7,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-import os
 import torch
 import torch.distributed as dist
 
 from .hip_ipc import (
-    ipc_close_mem_handle,
     ipc_get_mem_handle,
     ipc_open_mem_handle,
     mem_allocation_base,
@@ -166,11 +164,3 @@ class SymmetricArena:
         self._committed = False
 
 
-def _close_all_open_handles() -> None:
-    """Release every peer mapping this process holds. Test/teardown helper."""
-    for peer in _OPEN_HANDLES.values():
-        try:
-            ipc_close_mem_handle(peer)
-        except Exception as exc:
-            logger.warning("[symmetric_arena] ipc_close_mem_handle failed: %s", exc)
-    _OPEN_HANDLES.clear()
