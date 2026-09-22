@@ -53,13 +53,18 @@ _LOGGER = AiterTritonLogger()
 
 def _mxfp4_gfx1250_config(M: int, N: int) -> dict:
     """
-    Tuned launch config for dynamic_mxfp4_quant's gfx1250 gluon path, resolved
-    from configs/gfx1250/gluon/quant/quant_mxfp4/DEFAULT.json's default+rules
-    tree (see config_utils.select_tuned_config), tuned by a benchmark sweep.
-    BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived, not tunable via JSON, at the
-    M <= 32 and N <= 1024 edges (BLOCK_SIZE_N must stay a multiple of 32).
+    Tuned launch config for dynamic_mxfp4_quant, resolved from
+    configs/gfx1250/gluon/quant/quant_mxfp4/DEFAULT.json's default+rules tree
+    (see config_utils.select_tuned_config), tuned by a benchmark sweep on
+    gfx1250. Also used, unchanged, as the plain-Triton fallback kernel's
+    launch config on every other arch -- always resolved against the gfx1250
+    config tree regardless of the arch actually running. BLOCK_SIZE_M/
+    BLOCK_SIZE_N are shape-derived, not tunable via JSON, at the M <= 32 and
+    N <= 1024 edges (BLOCK_SIZE_N must stay a multiple of 32).
     """
-    cfg_dir = resolve_config_dir("quant", "QUANT-MXFP4", backend="gluon")
+    cfg_dir = resolve_config_dir(
+        "quant", "QUANT-MXFP4", backend="gluon", arch="gfx1250"
+    )
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     cfg = select_tuned_config(tuned, M=M, N=N)
     if M <= 32:
