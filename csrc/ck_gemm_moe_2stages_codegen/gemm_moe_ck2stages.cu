@@ -28,11 +28,6 @@ static inline int map_activation_to_ck_stage1(int activation)
         return 3;
     case ActivationType::GeluTanh:
         return 4;
-    case ActivationType::Relu2:
-        TORCH_CHECK(false,
-                    "relu2 activation is not yet implemented for the fused CK MoE GEMM "
-                    "(ck_moe_stage1); only Silu/Gelu/Swiglu/GeluTanh are currently supported here.");
-        return -1; // unreachable; TORCH_CHECK(false, ...) always throws
     default:
         TORCH_CHECK(false, "Unsupported activation for ck_moe_stage1: ", activation);
         return -1;
