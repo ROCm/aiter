@@ -25,7 +25,7 @@ when that is the ticket convention.
 ## Progress
 
 - [x] 0. Baseline PMC + ATT (physical GPU 6)
-- [ ] 1. Lock launch paths; decode ATT that actually hits a CU
+- [x] 1. Lock launch paths; decode ATT that actually hits a CU
 - [ ] 2. Pack live / phys / page_off LDS
 - [ ] 3. Overlap K/V `buffer_load` with LDS wait/barrier
 - [ ] 4. Bank-conflict-free K (and C) stores; V layout unchanged
@@ -137,15 +137,67 @@ C-LDS QK publish ~11k.
 
 ### 1. Lock launch paths; decode ATT that actually hits a CU
 
-- [ ] Confirm HEAD still decode BN16 / 256-thread / token-major V and
+- [x] Confirm HEAD still decode BN16 / 256-thread / token-major V and
       prefill BN64 / 128-thread / row-major V.
-- [ ] Capture non-empty decode ATT (`M=8` and/or wide SE mask,
+- [x] Capture non-empty decode ATT (`M=8` and/or wide SE mask,
       `--att-gpu-index 6`, kernel-include split). Rank `s_barrier`
       vs the BN64 map.
-- [ ] **Done when:** a `stats_*.csv` names
+- [x] **Done when:** a `stats_*.csv` names
       `qsa_k2_family_a_port_split_ps16_bn16_*` with hitcount > 0.
       If the 449k / 122k ranking differs from BN64, reorder phases 2–6
       in this file before implementing.
+
+Measured 2026-09-22 on GPU 6 / gfx950. `_launch_config` (`Hk=2`,
+`n_sel=2051`, `use_k32` ⇒ `token_major_v = (block_n==16)`):
+
+| M | `base_programs` | `BLOCK_N` | threads | splits | V layout |
+|--:|--:|--:|--:|--:|--|
+| 1 | 2 | 16 | 256 | 32 | token-major |
+| 8 | 16 | 16 | 256 | 32 | token-major |
+| 512 | 1024 | 64 | 128 | 1 | row-major |
+
+`M=8` is the same decode kernel as `M=1` (512 WGs vs 64). Trace:
+`tickets/1047/tmp/k2_pmc_att/att_flydsl_m8/stats_ui_output_agent_43127_dispatch_138.csv`.
+First instruction comment:
+`qsa_k2_family_a_port_split_ps16_bn16_blk256_ns32_qkk32`. Hitcounts
+on `s_barrier` are 16 (prologue) and 64 (loop). `--att-gpu-index 6`
+`--att-target-cu 0` was enough; no wide SE mask.
+
+Opcode latency (decode `M=8` vs prefill `M=512` FlyDSL):
+
+| | decode M=8 | prefill M=512 |
+|--|--:|--:|
+| `s_waitcnt` | 37.9% | ~24% |
+| `s_barrier` | 37.8% | ~13% |
+| `ds_write_b128` | 3.9% | (hottest ds) |
+| `ds_write_b16` (token-major V) | 3.2% | n/a |
+| MFMA | 0.42% | 1.2% |
+
+Waitcnt split on decode: `lgkmcnt(0)` 44.8k stall, `vmcnt(1)` 39.8k,
+`vmcnt(0)` 10.5k. Decode is already ~half `vmcnt`.
+
+`s_barrier` map (decode `M=8`, stall; source in `k2_family_a.py`):
+
+| stall | vaddr | after | next | source |
+|--:|--:|--|--|--|
+| 67520 | 8804 | `lgkmcnt(0)` | `ds_read` P/V for PV | loop `gpu.barrier()` ~468 |
+| 25664 | 9172 | `ds_write_b32` page_off / phys / live + `lgkmcnt(0)` | `ds_read_b32` those rows | ~314 |
+| 7660 | 9588 | `ds_write_b128` K + `lgkmcnt(0)` | `buffer_load_dwordx4` V | ~344 |
+| 3916 | 9960 | `ds_write_b16` token-major V + `lgkmcnt(0)` | C-LDS reads | ~398 |
+| 1360 | 8976 | QK MFMA | column-0 gather | loop entry ~293 |
+| 80 | 8032 | init m/l | | ~285 |
+
+Prefill hottest pair was tile-join then live/phys (`~449k` / `~122k`).
+Decode hottest join is the **softmax / P-LDS publish** (~468), not
+loop-entry (~293, only 1.4k). Second is still live/phys (~314).
+Phases **2–6 stay in order**: pack live/phys first (shared
+decode+prefill, still #2), then overlap gathers (K barrier already
+sits in front of `buffer_load`), then K/C maps, then pack V stores,
+C-LDS last (4th, small). Do not add a P-LDS rewrite ahead of phase 2;
+~468 is a full-WG join after P stores, same class as the BN64 tile
+barrier, and packing live/phys does not depend on it.
+
+**Done.** Next: phase 2.
 
 ### 2. Pack live / phys / page_off LDS
 
