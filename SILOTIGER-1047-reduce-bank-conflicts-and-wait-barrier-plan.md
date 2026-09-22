@@ -216,7 +216,7 @@ Shared decode+prefill. ATT’s second-hottest FlyDSL barrier is
 - [x] Vector / conflict-free stores for live, phys, page_off.
       **Reverted 2026-09-22:** replaced the three Int32 LDS rows with
       one `[BLOCK_N, 4]` row (`phys`, `page_off`, `live`, pad) and one
-      `UniversalCopy128b(Int32)` per translating column. Readers kept
+      128-bit vector store per translating column. Readers kept
       the same logical values and the translate barrier stayed.
 - [x] Fold or delay that barrier if the next reader still orders.
       Skipped: the parent plan already keep-gate-lost per-thread
@@ -226,15 +226,17 @@ Shared decode+prefill. ATT’s second-hottest FlyDSL barrier is
 - [x] **Done when:** packed stores kept (≥3%) or reverted + note.
 
 Correctness: focused GPU-6 pytest passed (`2 passed`, decode and
-prefill, `CACHE=0`, `ROCM_PATH=/root/.flydsl/toolkit`).
+prefill, `CACHE=0`, `ROCM_PATH=/root/.flydsl/toolkit`). ISA:
+three metadata `ds_write_b32` instructions became one
+`ds_write_b128` (offset 20992).
 
-| width-2051 `L=512` wrapper | HEAD | packed median (2 runs) | delta |
+| width-2051 `L=512` wrapper | HEAD median (3 runs) | packed median (3 runs) | speedup |
 |--|--:|--:|--:|
-| M=1 | 19.10 µs | 19.565 µs | **+2.4%** |
-| M=8 | 20.57 µs | 20.09 µs | -2.3% |
-| M=512 | 517.93 µs | 517.52 µs | -0.08% |
+| M=1 | 20.18 µs | 20.19 µs | -0.05% |
+| M=8 | 20.86 µs | 20.69 µs | +0.81% |
+| M=512 | 515.98 µs | 518.41 µs | -0.47% |
 
-No row reaches the 3% keep gate, and decode M=1 regresses. Kernel
+No row reaches the 3% keep gate, and M=1/prefill regress. Kernel
 restored to HEAD; no PMC/ATT follow-up for a reverted change.
 **Done. Next: phase 3.**
 
@@ -299,5 +301,6 @@ The parent plan remains the full K2 list.
 - Reading `lld invocation failed` as a kernel-source bug. It is an
   environment fault in this container (see the `ROCM_PATH` lock).
 - Packing `phys/page_off/live/pad` into one `[BLOCK_N,4]` Int32 LDS
-  row with `UniversalCopy128b`. Correct, but M=1 regressed 2.4%,
-  M=8 improved only 2.3%, and M=512 was flat; all miss the 3% gate.
+  row with one 128-bit vector store. Correct and emitted
+  `ds_write_b128`, but M=1 was flat, M=8 improved only 0.81%, and
+  M=512 regressed 0.47%; all miss the 3% gate.

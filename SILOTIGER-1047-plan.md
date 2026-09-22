@@ -695,6 +695,15 @@ but width-2051 ``L=512`` went to 24.1 / 23.8 / 608.9 us vs 24.3 /
 24.1 / 586.7; prefill paid for dropping the translate barrier. Keep
 phys/page/live LDS.
 
+**Do not retry** packing `phys/page_off/live/pad` into one
+`[BLOCK_N,4]` Int32 LDS row with one 128-bit vector store per
+translated column. GPU 6 / gfx950 focused decode+prefill pytest passed
+and ISA changed three metadata `ds_write_b32` to one `ds_write_b128`,
+but width-2051 `L=512` HEAD → packed median (three runs) was
+20.18 → 20.19 us at `M=1`, 20.86 → 20.69 us at `M=8`, and
+515.98 → 518.41 us at `M=512`. The only gain was 0.81%, under the
+3% keep gate; keep the three scalar LDS rows.
+
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in
 `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`
