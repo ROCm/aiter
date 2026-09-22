@@ -27,7 +27,7 @@ when that is the ticket convention.
 - [x] 0. Baseline PMC + ATT (physical GPU 6)
 - [x] 1. Lock launch paths; decode ATT that actually hits a CU
 - [x] 2. Pack live / phys / page_off LDS
-- [ ] 3. Overlap K/V `buffer_load` with LDS wait/barrier
+- [x] 3. Overlap K/V `buffer_load` with LDS wait/barrier
 - [ ] 4. Bank-conflict-free K (and C) stores; V layout unchanged
 - [ ] 5. Token-major V: pack stores only
 - [ ] 6. Optional: drop C-LDS QK reduce (last, likely small)
@@ -245,10 +245,30 @@ restored to HEAD; no PMC/ATT follow-up for a reverted change.
 AMD issues `buffer_load_dwordx4` then waits `vmcnt` across a barrier.
 FlyDSL waits LDS, barriers, then loads.
 
-- [ ] Issue gathers before `lgkmcnt(0)` / the tile barrier; do not add
+- [x] Issue gathers before `lgkmcnt(0)` / the tile barrier; do not add
       barriers.
-- [ ] Keep-gate; ATT should move stall from `lgkmcnt` toward `vmcnt`.
-- [ ] **Done when:** kept or reverted + note.
+      **Reverted 2026-09-22:** gfx950 `use_k32` issued V `g_copy` after
+      K LDS stores and before the K-publish barrier; V LDS stores and
+      QK ran after it. No extra barrier. Distinct from the parent
+      next-tile-K-with-PV miss.
+- [x] Keep-gate; ATT should move stall from `lgkmcnt` toward `vmcnt`.
+      Skipped ATT: wall-clock missed the gate.
+- [x] **Done when:** kept or reverted + note.
+
+Correctness: focused GPU-6 pytest passed (`2 passed`, decode and
+prefill, `CACHE=0`, `ROCM_PATH=/root/.flydsl/toolkit`). Decode ISA:
+V `buffer_load_dwordx4` sits with K loads after the live/phys barrier
+and before K `ds_write_b128` + `lgkmcnt(0)` + `s_barrier`; QK then
+waits `vmcnt(1)`.
+
+| width-2051 `L=512` wrapper | HEAD median (3 runs) | hoist median (3 runs) | speedup |
+|--|--:|--:|--:|
+| M=1 | 20.18 µs | 20.13 µs | +0.25% |
+| M=8 | 20.86 µs | 20.96 µs | -0.48% |
+| M=512 | 515.98 µs | 518.30 µs | -0.45% |
+
+No row reaches the 3% keep gate. Kernel restored to HEAD.
+**Done. Next: phase 4.**
 
 ### 4. Bank-conflict-free K (and C) stores; V layout unchanged
 
@@ -304,3 +324,6 @@ The parent plan remains the full K2 list.
   row with one 128-bit vector store. Correct and emitted
   `ds_write_b128`, but M=1 was flat, M=8 improved only 0.81%, and
   M=512 regressed 0.47%; all miss the 3% gate.
+- Hoisting gfx950 V `buffer_load` before the K-publish `lgkmcnt(0)` /
+  `s_barrier`. ISA moved the loads; wall-clock missed 3% (M=1 +0.25%,
+  M=8 −0.48%, M=512 −0.45%). Keep V gather after that barrier.

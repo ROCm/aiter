@@ -704,6 +704,15 @@ but width-2051 `L=512` HEAD → packed median (three runs) was
 515.98 → 518.41 us at `M=512`. The only gain was 0.81%, under the
 3% keep gate; keep the three scalar LDS rows.
 
+**Do not retry** hoisting gfx950 V `buffer_load` (`g_copy`) to before
+the K-publish `lgkmcnt(0)` / `s_barrier`. Distinct from overlapping
+the next tile's K with PV. GPU 6 / gfx950 focused decode+prefill
+pytest passed and decode ISA issued V loads before that barrier, but
+width-2051 `L=512` HEAD → hoist median (three runs) was
+20.18 → 20.13 us at `M=1`, 20.86 → 20.96 us at `M=8`, and
+515.98 → 518.30 us at `M=512`. Keep V gather after the K-publish
+barrier.
+
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in
 `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`
