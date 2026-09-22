@@ -25,7 +25,6 @@ from aiter.ops.mha_fwd_policy import (
     MhaFwdCandidate,
     MhaFwdPlan,
     MhaFwdProblem,
-    MhaFwdResult,
     enumerate_mha_fwd_candidates,
     mha_fwd_candidate_id,
 )
@@ -111,16 +110,6 @@ class TestMhaTypedPolicy(unittest.TestCase):
         self.assertEqual(MhaFwdCandidate("asm_v3", 3).identity[:2], ("asm_v3", 3))
         with self.assertRaises(ValueError):
             MhaFwdCandidate("triton", 3)
-
-    def test_result_uses_median_of_positive_samples(self):
-        result = MhaFwdResult(
-            MhaFwdProblem.from_mapping(_problem_row()),
-            MhaFwdCandidate("asm_v3", 3),
-            "ok",
-            0.0,
-            (2.3, 2.1, 2.2),
-        )
-        self.assertEqual(result.median_us, 2.2)
 
     def test_candidate_id_is_stable_and_problem_specific(self):
         problem = MhaFwdProblem.from_mapping(_problem_row())

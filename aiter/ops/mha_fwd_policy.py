@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import math
 import random
-import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -63,30 +62,7 @@ MHA_FWD_RUNTIME_CSV_FIELDS = (
     *MHA_FWD_TUNING_KEY_FIELDS,
     *MHA_FWD_CANDIDATE_FIELDS,
 )
-MHA_FWD_MEASUREMENT_CSV_FIELDS = (
-    *MHA_FWD_TUNING_KEY_FIELDS,
-    *MHA_FWD_CANDIDATE_FIELDS,
-    *MHA_FWD_METRIC_FIELDS,
-)
-
 MhaFwdBackend = Literal["asm_v3", "ck", "flydsl", "gluon", "opus", "triton"]
-MhaFwdStatus = Literal[
-    "ok",
-    "unsupported",
-    "mismatch",
-    "oom_preflight",
-    "oom_runtime",
-    "timeout",
-    "crash",
-]
-MhaFwdRunState = Literal[
-    "failed",
-    "partial",
-    "measured",
-    "verified",
-    "review-ready",
-]
-
 MHA_FWD_BACKENDS = frozenset({"asm_v3", "ck", "flydsl", "gluon", "opus", "triton"})
 MHA_FWD_TILE_CONFIG_BACKENDS = frozenset({"gluon", "triton"})
 MHA_FWD_TILE_CONFIG_KEYS = {
@@ -103,20 +79,6 @@ MHA_FWD_TILE_CONFIG_KEYS = {
     ),
     "gluon": frozenset({"BLOCK_M", "BLOCK_N", "num_warps", "waves_per_eu"}),
 }
-MHA_FWD_RESULT_STATUSES = frozenset(
-    {
-        "ok",
-        "unsupported",
-        "mismatch",
-        "oom_preflight",
-        "oom_runtime",
-        "timeout",
-        "crash",
-    }
-)
-MHA_FWD_RUN_STATES = frozenset(
-    {"failed", "partial", "measured", "verified", "review-ready"}
-)
 
 
 def csv_scalar(value: Any) -> str:
@@ -333,34 +295,6 @@ class MhaFwdPlan:
                 "ASM split policy requires the compatible gfx942 packed-varlen "
                 "bf16 D_QK=192/D_V=128 inference path"
             )
-
-
-@dataclass(frozen=True, slots=True)
-class MhaFwdResult:
-    problem: MhaFwdProblem
-    candidate: MhaFwdCandidate
-    status: MhaFwdStatus
-    err_ratio: float
-    samples_us: tuple[float, ...] = ()
-    detail: str = ""
-
-    def __post_init__(self) -> None:
-        if self.status not in MHA_FWD_RESULT_STATUSES:
-            raise ValueError(f"unsupported MHA result status {self.status!r}")
-        if not math.isfinite(self.err_ratio) or self.err_ratio < 0:
-            raise ValueError("err_ratio must be finite and non-negative")
-        if any(not math.isfinite(sample) or sample <= 0 for sample in self.samples_us):
-            raise ValueError("timing samples must be finite and positive")
-        if self.status == "ok" and not self.samples_us:
-            raise ValueError("successful MHA results require timing samples")
-
-    @property
-    def median_us(self) -> float:
-        return (
-            float(statistics.median(self.samples_us))
-            if self.samples_us
-            else float("inf")
-        )
 
 
 def validate_mha_fwd_plan_fields(
