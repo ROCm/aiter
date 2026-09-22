@@ -7,6 +7,11 @@ The kernel is the gfx950 H=32 / D=128 / KVB=64 preshuffled path the indexer
 calls: compact Q ``[B, next_n, 32, 128]``, preallocated ``out_logits``, optional
 ``next_n_lens``. Torch is the reference only (not timed). Gluon is a candidate
 on the uniform compact path.
+
+Shape mapping (decode indexer):
+- ``batch`` = nq sequences
+- ``next_n`` = MTP rows per sequence (compact ``Q.shape[1]`` / ragged pad)
+- ``kv_len`` = tokens per sequence (multiple of kvb=64 preferred)
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ INDEX_DIM = HEAD_DIM + 4
 MAX_NN = 8
 WIDE_MAX_MODEL_LEN = 1 << 20
 _E4M3_NATIVE = get_fp8_e4m3_dtype()
+_Q_DTYPE = {"fn": torch.float8_e4m3fn}
 
 try:
     from aiter.ops.triton.attention.pa_mqa_logits import (
@@ -345,9 +351,10 @@ def _time_candidates(candidates, ref, flops, nbytes, msg):
 
 
 @benchmark()
-def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv):
+def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
+    q_dtype = _Q_DTYPE[dtype]
     inp = _build_inputs(
-        batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE, block_size=KV_BLOCK_SIZE
+        batch, next_n, HEADS, HEAD_DIM, kv_len, q_dtype, block_size=KV_BLOCK_SIZE
     )
     kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
     ref = run_torch(
@@ -461,6 +468,7 @@ def test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv):
     unused = ~live_row_mask(next_n_lens, next_n, inp.max_model_len)[:, 0]
     if unused.any():
         assert torch.all(ref[unused] == float("-inf"))
+        assert torch.all(out[unused] == float("-inf"))
     return ret
 
 
@@ -471,32 +479,32 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len):
     inp = _build_inputs(
         batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE, block_size=KV_BLOCK_SIZE
     )
-    kv_cache_kernel, compact = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+    kv_cache_kernel, _compact = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
     next_n_lens = torch.ones(batch, dtype=torch.int32, device="cuda")
     wide = torch.full(
         (batch * next_n, WIDE_MAX_MODEL_LEN),
         float("-inf"),
         dtype=torch.float32,
     )
+    ref = ref_padded_ragged(
+        inp.q,
+        inp.kv_cache_fp8,
+        inp.weights,
+        inp.context_lens,
+        inp.block_tables,
+        next_n_lens,
+        inp.max_model_len,
+        inp.fp8_dtype,
+        max_nn=next_n,
+        block_size=KV_BLOCK_SIZE,
+    )
     split = 1
 
+    scored = wide[:, : inp.max_model_len]
+
     def flydsl():
-        compact.fill_(float("-inf"))
         wide.fill_(float("-inf"))
         flydsl_fp8_paged_mqa_logits(
-            inp.q_fp8,
-            kv_cache_kernel,
-            inp.weights,
-            compact,
-            inp.context_lens,
-            inp.block_tables,
-            inp.max_model_len,
-            next_n_lens=next_n_lens,
-            Preshuffle=True,
-            KVBlockSize=KV_BLOCK_SIZE,
-            SplitKV=split,
-        )
-        return flydsl_fp8_paged_mqa_logits(
             inp.q_fp8,
             kv_cache_kernel,
             inp.weights,
@@ -509,23 +517,14 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len):
             KVBlockSize=KV_BLOCK_SIZE,
             SplitKV=split,
         )
+        return scored
 
-    with torch.inference_mode():
-        got, us = run_perftest(flydsl)
-    valid_cols = min(kv_len, compact.shape[1])
-    assert torch.equal(got[:, :valid_cols], compact[:, :valid_cols])
-    if batch * next_n > 512:
-        assert torch.equal(got[512:, :valid_cols], compact[512:, :valid_cols])
     flops, nbytes = _roofline(
-        batch, 1, kv_len, inp.context_lens, inp.q_fp8, inp.weights, compact
+        batch, 1, kv_len, inp.context_lens, inp.q_fp8, inp.weights, wide
     )
-    return {
-        "gfx": get_gfx(),
-        "flydsl us": us,
-        "flydsl TFLOPS": flops / us / 1e6,
-        "flydsl TB/s": nbytes / us / 1e6,
-        "flydsl err": 0.0,
-    }
+    return _time_candidates(
+        {"flydsl": (flydsl, scored)}, ref, flops, nbytes, "paged wide_out"
+    )
 
 
 def _summarize(name, rows):
@@ -554,6 +553,7 @@ def main():
         type=str,
         nargs="*",
         default=["fn"],
+        choices=list(_Q_DTYPE),
         help="Q dtype tag. gfx950 uses native E4M3 FN.\n    e.g.: -d fn",
     )
     parser.add_argument(
@@ -568,7 +568,7 @@ def main():
         "--next-n",
         type=int,
         nargs="*",
-        default=[8],
+        default=[1, 2, 4, 8],
         help="Compact Q dim-1 / ragged pad.\n    e.g.: --next-n 1 8",
     )
     parser.add_argument(
@@ -589,15 +589,43 @@ def main():
         "--ragged-batch",
         type=int,
         nargs="*",
-        default=[4, 8],
+        default=[1, 8, 24],
         help="Batch for the ragged table.",
+    )
+    parser.add_argument(
+        "--ragged-next-n",
+        type=int,
+        nargs="*",
+        default=[8],
+        help="Ragged pad (max next_n).",
     )
     parser.add_argument(
         "--ragged-kv-len",
         type=int,
         nargs="*",
-        default=[128, 192],
-        help="Context for the ragged table (short-page coverage).",
+        default=[128, 192, 256, 448],
+        help="Context for the ragged table (2/3/4/7 pages of kvb=64).",
+    )
+    parser.add_argument(
+        "--ragged-split-kv",
+        type=int,
+        nargs="*",
+        default=[0, 3],
+        help="SplitKV for the ragged table.",
+    )
+    parser.add_argument(
+        "--long-batch",
+        type=int,
+        nargs="*",
+        default=[16],
+        help="Batch for the long-context ragged table.",
+    )
+    parser.add_argument(
+        "--long-kv-len",
+        type=int,
+        nargs="*",
+        default=[32768],
+        help="Context for the long-context ragged table.",
     )
     parser.add_argument(
         "--wide-batch",
@@ -608,24 +636,42 @@ def main():
     )
     args = parser.parse_args()
 
-    compact = []
-    for _, batch, next_n, kv_len, split_kv in itertools.product(
-        args.dtype, args.batch, args.next_n, args.kv_len, args.split_kv
-    ):
-        compact.append(test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv))
-    _summarize("fp8_paged_mqa_logits", compact)
+    compact = [
+        test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype)
+        for dtype, batch, next_n, kv_len, split_kv in itertools.product(
+            args.dtype, args.batch, args.next_n, args.kv_len, args.split_kv
+        )
+    ]
+    if compact:
+        _summarize("fp8_paged_mqa_logits", compact)
 
-    ragged = []
-    for batch, next_n, kv_len, split_kv in itertools.product(
-        args.ragged_batch, args.next_n, args.ragged_kv_len, args.split_kv
-    ):
-        ragged.append(test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv))
-    _summarize("fp8_paged_mqa_logits_ragged", ragged)
+    ragged = [
+        test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv)
+        for batch, next_n, kv_len, split_kv in itertools.product(
+            args.ragged_batch,
+            args.ragged_next_n,
+            args.ragged_kv_len,
+            args.ragged_split_kv,
+        )
+    ]
+    if ragged:
+        _summarize("fp8_paged_mqa_logits_ragged", ragged)
 
-    wide = []
-    for batch in args.wide_batch:
-        wide.append(test_fp8_paged_mqa_logits_wide_out(batch, KV_BLOCK_SIZE))
-    _summarize("fp8_paged_mqa_logits_wide_out", wide)
+    long_ctx = [
+        test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv)
+        for batch, next_n, kv_len, split_kv in itertools.product(
+            args.long_batch, args.ragged_next_n, args.long_kv_len, args.split_kv
+        )
+    ]
+    if long_ctx:
+        _summarize("fp8_paged_mqa_logits_ragged_long", long_ctx)
+
+    wide = [
+        test_fp8_paged_mqa_logits_wide_out(batch, KV_BLOCK_SIZE)
+        for batch in args.wide_batch
+    ]
+    if wide:
+        _summarize("fp8_paged_mqa_logits_wide_out", wide)
 
 
 if __name__ == "__main__":
