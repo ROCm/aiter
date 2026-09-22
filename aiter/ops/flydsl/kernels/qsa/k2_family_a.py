@@ -76,24 +76,40 @@ def _dpp_f32(x, dpp_ctrl):
     return _i32_as_f32(swapped)
 
 
-def _token_row_reduce_max(x):
-    """16-wide token max on gfx950 via DPP xor 1,2,4,8.
+def _token_row_reduce_max_n(vals):
+    """16-wide token max on a pack of independent heads.
 
-    Live AMD softmax uses ``v_permlane32_swap`` then ``v_permlane16_swap``
-    (xor 32/16) because its four C regs are tokens. This kernel's C map is
-    ``acc4[i]`` = head ``lane_kg*4+i``, token = ``lane_m``, so those hops
-    mix heads (oracle err?0.97). DPP butterfly is the VALU reduce that
-    matches xor 1,2,4,8 without ``ds_swizzle``.
+    Hop-outer so the four head registers share each DPP/shuffle distance,
+    matching AMD's ``v_max``/``v_max3`` then one permute, not four serial
+    butterflies. Distances are still xor 1,2,4,8 (token = ``lane_m``).
     """
+    vals = list(vals)
     for ctrl in (_DPP_XOR_1, _DPP_XOR_2, _DPP_XOR_4, _DPP_XOR_8):
-        x = x.maximumf(_dpp_f32(x, ctrl))
-    return x
+        nxt = [_dpp_f32(v, ctrl) for v in vals]
+        vals = [a.maximumf(b) for a, b in zip(vals, nxt)]
+    return vals
 
 
-def _token_row_reduce_sum(x):
+def _token_row_reduce_sum_n(vals):
+    vals = list(vals)
     for ctrl in (_DPP_XOR_1, _DPP_XOR_2, _DPP_XOR_4, _DPP_XOR_8):
-        x = x + _dpp_f32(x, ctrl)
-    return x
+        nxt = [_dpp_f32(v, ctrl) for v in vals]
+        vals = [a + b for a, b in zip(vals, nxt)]
+    return vals
+
+
+def _shuffle_reduce_max_n(vals):
+    vals = list(vals)
+    for sh in (1, 2, 4, 8):
+        vals = [v.maximumf(v.shuffle_xor(Int32(sh), Int32(64))) for v in vals]
+    return vals
+
+
+def _shuffle_reduce_sum_n(vals):
+    vals = list(vals)
+    for sh in (1, 2, 4, 8):
+        vals = [v + v.shuffle_xor(Int32(sh), Int32(64)) for v in vals]
+    return vals
 
 
 def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
@@ -548,50 +564,51 @@ def build_qsa_k2_family_a_module(
             # Softmax reads C and live, not V; the post-QK barrier already
             # published C. V and P meet at the barrier before PV.
             if wave == zero:
-                for i in range_constexpr(4):
-                    h = lane_kg * Int32(4) + Int32(i)
-                    tile_max = _neg_inf()
-                    scores = []
-                    score_lives = []
-                    for ng in range_constexpr(n_subtiles):
-                        n = Int32(ng * 16) + lane_m
-                        score_live = live_lds[n] != zero
+                h0 = lane_kg * Int32(4)
+                heads = [h0 + Int32(i) for i in range_constexpr(4)]
+                tile_max = [_neg_inf() for _ in range_constexpr(4)]
+                scores = []
+                score_lives = []
+                for ng in range_constexpr(n_subtiles):
+                    n = Int32(ng * 16) + lane_m
+                    score_live = live_lds[n] != zero
+                    score_lives.append(score_live)
+                    sc = []
+                    for i in range_constexpr(4):
                         score = c_lds[ng, zero, lane, i]
                         for w in range_constexpr(1, num_waves):
                             score = score + c_lds[ng, w, lane, i]
                         score = score * softmax_scale_log2
                         score = score_live.select(score, _neg_inf())
-                        scores.append(score)
-                        score_lives.append(score_live)
-                        tile_max = tile_max.maximumf(score)
-                    if const_expr(use_k32):
-                        tile_max = _token_row_reduce_max(tile_max)
-                    else:
-                        for sh in (1, 2, 4, 8):
-                            tile_max = tile_max.maximumf(
-                                tile_max.shuffle_xor(Int32(sh), Int32(64))
-                            )
-                    m_prev = m_lds[h]
-                    l_prev = l_lds[h]
-                    m_new = m_prev.maximumf(tile_max)
-                    alpha = _exp2(m_prev - m_new)
-                    p_sum = Float32(0.0)
-                    for ng in range_constexpr(n_subtiles):
-                        n = Int32(ng * 16) + lane_m
+                        sc.append(score)
+                        tile_max[i] = tile_max[i].maximumf(score)
+                    scores.append(sc)
+                m_prev = [m_lds[heads[i]] for i in range_constexpr(4)]
+                l_prev = [l_lds[heads[i]] for i in range_constexpr(4)]
+                if const_expr(use_k32):
+                    tile_max = _token_row_reduce_max_n(tile_max)
+                else:
+                    tile_max = _shuffle_reduce_max_n(tile_max)
+                m_new = [m_prev[i].maximumf(tile_max[i]) for i in range_constexpr(4)]
+                alpha = [_exp2(m_prev[i] - m_new[i]) for i in range_constexpr(4)]
+                p_sum = [Float32(0.0) for _ in range_constexpr(4)]
+                for ng in range_constexpr(n_subtiles):
+                    n = Int32(ng * 16) + lane_m
+                    for i in range_constexpr(4):
                         p = score_lives[ng].select(
-                            _exp2(scores[ng] - m_new), Float32(0.0)
+                            _exp2(scores[ng][i] - m_new[i]), Float32(0.0)
                         )
-                        p_lds[h, n] = p.to(BFloat16)
-                        p_sum = p_sum + p
-                    if const_expr(use_k32):
-                        p_sum = _token_row_reduce_sum(p_sum)
-                    else:
-                        for sh in (1, 2, 4, 8):
-                            p_sum = p_sum + p_sum.shuffle_xor(Int32(sh), Int32(64))
-                    if lane_m == zero:
-                        m_lds[h] = m_new
-                        l_lds[h] = l_prev * alpha + p_sum
-                        alpha_lds[h] = alpha
+                        p_lds[heads[i], n] = p.to(BFloat16)
+                        p_sum[i] = p_sum[i] + p
+                if const_expr(use_k32):
+                    p_sum = _token_row_reduce_sum_n(p_sum)
+                else:
+                    p_sum = _shuffle_reduce_sum_n(p_sum)
+                if lane_m == zero:
+                    for i in range_constexpr(4):
+                        m_lds[heads[i]] = m_new[i]
+                        l_lds[heads[i]] = l_prev[i] * alpha[i] + p_sum[i]
+                        alpha_lds[heads[i]] = alpha[i]
             gpu.barrier()
 
             alpha4 = fx.Vector.from_elements(
