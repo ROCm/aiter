@@ -5156,7 +5156,10 @@ class FmoeTuner(TunerCommon):
     @staticmethod
     def _pair_nt_agnostic(profileDF, kernel_col):
         # Only the CK 2-stage instances read the hint; the rest are measured
-        # once, so give them a copy on the nt=1 side of the merge.
+        # once, so give them a copy on the nt=1 side of the merge. With the
+        # sweep off there is no such side and the copy would survive as a tie.
+        if not (profileDF["nt"] == 1).any():
+            return profileDF
         agnostic = profileDF[
             ~profileDF[kernel_col].astype(str).str.startswith("moe_ck2stages")
         ]
