@@ -25,15 +25,15 @@ from aiter.utility.block_race import (
     select_winner,
 )
 
-RACE_ARGS = dict(
-    delta=0.02,
-    alpha=0.05,
-    block_calls=10,
-    min_blocks=3,
-    max_blocks=30,
-    seed=4242,
-    verbose=False,
-)
+RACE_ARGS = {
+    "delta": 0.02,
+    "alpha": 0.05,
+    "block_calls": 10,
+    "min_blocks": 3,
+    "max_blocks": 30,
+    "seed": 4242,
+    "verbose": False,
+}
 
 
 def constant_timer(latency_by_label, noise=0.004, seed=1):
@@ -321,7 +321,7 @@ class TestJournalReplay(unittest.TestCase):
     def test_a_torn_final_line_is_dropped_rather_than_failing_the_resume(self):
         """A process killed mid-write leaves one truncated line. Losing the
         last block is correct; refusing to resume is not."""
-        entrants, live = self._run_and_journal()
+        self._run_and_journal()
         with open(self.path) as handle:
             lines = handle.readlines()
         with open(self.path, "w") as handle:

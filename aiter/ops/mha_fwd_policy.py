@@ -115,7 +115,8 @@ def parse_backend_config(value: Any) -> dict[str, Any] | None:
         return None
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
-        raise ValueError("backend_config must be a JSON object")
+        # ValueError, not TypeError: the CSV loader wraps it to add file:line.
+        raise ValueError("backend_config must be a JSON object")  # noqa: TRY004
     return parsed
 
 

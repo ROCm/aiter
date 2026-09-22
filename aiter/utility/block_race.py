@@ -41,29 +41,30 @@ import os
 import random
 import statistics
 import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
 
 __all__ = [
+    "BlockJournal",
+    "BlockRecord",
+    "JsonlBlockJournal",
     "RaceEntrant",
+    "RaceResult",
     "Samples",
     "Verdict",
-    "BlockRecord",
-    "RaceResult",
-    "BlockJournal",
-    "JsonlBlockJournal",
-    "cuda_event_timer",
-    "measure_blocks",
-    "race",
-    "select_winner",
-    "rank",
-    "position_effect",
-    "indistinguishable_set",
-    "wilcoxon_floor",
-    "critical_t",
-    "student_t_sf",
-    "regularized_incomplete_beta",
     "check_t_implementation",
+    "critical_t",
+    "cuda_event_timer",
+    "indistinguishable_set",
+    "measure_blocks",
+    "position_effect",
+    "race",
+    "rank",
+    "regularized_incomplete_beta",
+    "select_winner",
+    "student_t_sf",
+    "wilcoxon_floor",
 ]
 
 
