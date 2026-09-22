@@ -235,10 +235,26 @@ def _row_npq_per_sample(shape) -> int:
     )
 
 
+def _requested_archs():
+    """The ARCH / GPU_ARCHS restriction as a set, or None for "build them all".
+
+    Read here rather than in ``main`` so that ``run_aot`` -- the ``setup.py``
+    path, which calls ``parse_csv`` through ``collect_aot_jobs`` and never sees
+    the argument parser -- honours it too. Conv contributes more jobs than any
+    other kind, so building the archs a target does not have is the most
+    expensive place to ignore this.
+    """
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
+    if not arch:
+        return None
+    return {a.strip() for a in re.split(r"[;,]", arch) if a.strip()} or None
+
+
 def parse_csv(csv_path: str):
     """Parse the tuned conv CSV into unique conv and transpose compile jobs."""
     jobs = []
     seen = set()
+    keep_archs = _requested_archs()
 
     with open(csv_path, newline="") as f:
         for raw in csv.DictReader(f):
@@ -271,6 +287,8 @@ def parse_csv(csv_path: str):
 
             cu_num = int(row.get("cu_num") or 0)
             gfx = row.get("gfx", "")
+            if keep_archs is not None and job_arch(cu_num, gfx) not in keep_archs:
+                continue
 
             groups = shape["groups"]
             cgp = _pad_channels(shape["C"] // groups)
@@ -606,14 +624,11 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
 
+    # The arch restriction is applied inside parse_csv, so this path and
+    # run_aot's see the same job list.
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
     if arch:
-        arch_set = {a.strip() for a in re.split(r"[;,]", arch) if a.strip()}
-        n_before = len(all_jobs)
-        all_jobs = [
-            j for j in all_jobs if job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
-        ]
-        print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
+        print(f"[aiter] ARCH={arch}: {len(all_jobs)} jobs match")
 
     conv_jobs = [j for j in all_jobs if j["kind"] == "conv3d"]
     tr_jobs = [j for j in all_jobs if j["kind"] == "transpose"]
