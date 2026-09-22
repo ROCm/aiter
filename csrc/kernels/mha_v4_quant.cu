@@ -80,7 +80,8 @@ __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ ou
                                                          const int32_t seq_heads,
                                                          const int32_t m,
                                                          const int32_t in_stride,
-                                                         const int32_t out_stride)
+                                                         const int32_t out_stride,
+                                                         float* __restrict__ partial_amax = nullptr)
 {
     constexpr int dim         = kHeadDim;
     constexpr int warp_size   = opus::get_warp_size();
@@ -139,6 +140,24 @@ __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ ou
             rotated[i] = static_cast<DTYPE_I>(af[i] * dim_rsqrt);
         *reinterpret_cast<outxvec_t*>(out + static_cast<int64_t>(row) * out_stride +
                                       lane * vec_size) = rotated;
+    }
+
+    // The rotated values are already in registers, so a per-tensor amax costs a reduction rather
+    // than the extra full read a separate pass would need.
+    if(partial_amax != nullptr)
+    {
+        float local = 0.0f;
+        if(row < m)
+        {
+#pragma unroll
+            for(int i = 0; i < vec_size; i++)
+                local = fmaxf(local, fabsf(static_cast<float>(
+                                  static_cast<DTYPE_I>(af[i] * dim_rsqrt))));
+        }
+        auto max_op  = [](float a, float b) { return fmaxf(a, b); };
+        local        = multithread_reduce(local, max_op, opus::get_warp_size());
+        if(threadIdx.x == 0)
+            partial_amax[blockIdx.x] = local;
     }
 }
 
@@ -832,7 +851,8 @@ static const float* check_k_mean(const aiter_tensor_t& mean,
 
 void rotate_activation_hd128(aiter_tensor_t& out,
                              const aiter_tensor_t& input,
-                             const aiter_tensor_t& mean)
+                             const aiter_tensor_t& mean,
+                             aiter_tensor_t& partial_amax)
 {
     constexpr int32_t dim        = kHeadDim;
     constexpr int32_t block_size = WARP_SIZE;
@@ -865,6 +885,14 @@ void rotate_activation_hd128(aiter_tensor_t& out,
     int32_t heads         = 1;
     int32_t seq_heads     = m;
     mean_ptr              = check_k_mean(mean, input, heads, seq_heads);
+    float* amax_ptr = nullptr;
+    if(partial_amax.numel() > 0)
+    {
+        AITER_CHECK(partial_amax.dtype() == AITER_DTYPE_fp32, "partial amax must be fp32");
+        AITER_CHECK(partial_amax.numel() >= grid.x,
+                    "partial amax needs one slot per rotate block");
+        amax_ptr = reinterpret_cast<float*>(partial_amax.data_ptr());
+    }
     const hipStream_t stream = aiter::getCurrentHIPStream();
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "rotate_activation_hd128", [&] {
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
@@ -876,7 +904,8 @@ void rotate_activation_hd128(aiter_tensor_t& out,
             seq_heads,
             m,
             in_stride,
-            out_stride);
+            out_stride,
+            amax_ptr);
     });
 }
 

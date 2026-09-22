@@ -64,7 +64,9 @@ def mha_v4_q_multiplier(softmax_scale: float) -> float:
 
 
 @compile_ops("module_mha_v4_quant", fc_name="rotate_activation_hd128", develop=True)
-def _rotate_activation_hd128(out: Tensor, input: Tensor, mean: Tensor) -> None:
+def _rotate_activation_hd128(
+    out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor
+) -> None:
     """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
 
 
@@ -74,10 +76,19 @@ def _or_empty(input: Tensor, mean: Optional[Tensor]) -> Tensor:  # noqa: UP045
 
 
 def rotate_activation_hd128(
-    out: Tensor, input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+    out: Tensor,
+    input: Tensor,
+    mean: Optional[Tensor] = None,  # noqa: UP045
+    partial_amax: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
-    """Rotate hd128 rows, first subtracting a (batch, heads, 128) fp32 `mean` when given."""
-    _rotate_activation_hd128(out, input, _or_empty(input, mean))
+    """Rotate hd128 rows, first subtracting a (batch, heads, 128) fp32 `mean` when given.
+
+    Pass `partial_amax` to have the kernel also emit a per-block amax of the rotated values,
+    which saves a per-tensor quantizer the full extra read its own amax pass would cost.
+    """
+    _rotate_activation_hd128(
+        out, input, _or_empty(input, mean), _or_empty(input, partial_amax)
+    )
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -164,32 +175,52 @@ def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, 
     return input.shape
 
 
+# vec_size(16) * warp(64) / dim(128); must track the hd128 rotate kernel's m_block.
+MHA_V4_ROTATE_ROWS_PER_BLOCK = 8
+
+
 def _quantize_per_tensor(
-    input: Tensor, output_dtype: torch.dtype, dtype_max: float, clip: float
+    input: Tensor,
+    output_dtype: torch.dtype,
+    dtype_max: float,
+    clip: float,
+    partial: Optional[Tensor] = None,  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
+    """Quantize to a single scale. `partial` supplies precomputed per-block amaxes."""
     if not input.is_contiguous():
         raise ValueError("MHA v4 per-tensor quantization requires contiguous input")
     numel = input.numel()
     blocks = triton.cdiv(numel, MHA_V4_PER_TENSOR_BLOCK_SIZE)
-    partial = input.new_empty((blocks,), dtype=torch.float32)
     scale = input.new_empty((1,), dtype=torch.float32)
     output = input.new_empty(input.shape, dtype=output_dtype)
-    mha_v4_per_tensor_amax_kernel[(blocks,)](
-        input,
-        partial,
-        numel,
-        BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
-        num_warps=8,
-    )
-    scale_block = triton.next_power_of_2(blocks)
-    mha_v4_per_tensor_scale_kernel[(1,)](
-        partial,
-        scale,
-        blocks,
-        dtype_max=dtype_max / clip,
-        BLOCK_SIZE=scale_block,
-        num_warps=8,
-    )
+    if partial is None:
+        partial = input.new_empty((blocks,), dtype=torch.float32)
+        mha_v4_per_tensor_amax_kernel[(blocks,)](
+            input,
+            partial,
+            numel,
+            BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
+            num_warps=8,
+        )
+        scale_block = triton.next_power_of_2(blocks)
+        mha_v4_per_tensor_scale_kernel[(1,)](
+            partial,
+            scale,
+            blocks,
+            dtype_max=dtype_max / clip,
+            BLOCK_SIZE=scale_block,
+            num_warps=8,
+        )
+    else:
+        # The rotate kernel emits one partial per 8-row block, far more than the per-tensor amax
+        # kernel would, so a single-program Triton reduction over them would need an unusable
+        # BLOCK_SIZE. torch reduces the small fp32 vector instead.
+        # An all-zero tensor must yield scale 1.0, not 0 (which would make the quantized
+        # data NaN) and not an epsilon; this matches the Triton scale kernel's contract.
+        amax = partial.amax()
+        scale.copy_(
+            torch.where(amax > 0, amax / (dtype_max / clip), amax.new_ones(())).view(1)
+        )
     mha_v4_per_tensor_quant_kernel[(blocks,)](
         input,
         output,
@@ -232,12 +263,20 @@ def _quantize_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 def quantize_fp8_rotated(
     input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
-    """Rotate hd128 rows, optionally removing `mean` first, then per-tensor FP8 quantize."""
+    """Rotate hd128 rows, optionally removing `mean` first, then per-tensor FP8 quantize.
+
+    The rotation kernel emits the amax as it goes, so this costs two passes over the tensor
+    rather than three.
+    """
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
     rotated = torch.empty_like(input)
-    rotate_activation_hd128(rotated, input, mean)
-    return quantize_fp8(rotated)
+    blocks = triton.cdiv(input.numel() // 128, MHA_V4_ROTATE_ROWS_PER_BLOCK)
+    partial = input.new_empty((blocks,), dtype=torch.float32)
+    rotate_activation_hd128(rotated, input, mean, partial)
+    return _quantize_per_tensor(
+        rotated, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0, partial
+    )
 
 
 def block_scale_storage(

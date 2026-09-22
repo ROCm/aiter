@@ -12,7 +12,8 @@ namespace torch_itfs {
 // fusing K-smoothing into the rotation pass; pass an empty tensor to skip it.
 void rotate_activation_hd128(aiter_tensor_t& out,
                              const aiter_tensor_t& input,
-                             const aiter_tensor_t& mean);
+                             const aiter_tensor_t& mean,
+                             aiter_tensor_t& partial_amax);
 
 // Rotate hd128 rows and emit token-major MX data plus one E8M0 scale per 32 values. `mean` is
 // the optional K mean documented above; pass an empty tensor for Q.
