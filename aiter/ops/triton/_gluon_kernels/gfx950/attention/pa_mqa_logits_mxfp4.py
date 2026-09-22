@@ -899,9 +899,11 @@ class Program:
         # a cross-lane reduce: at C <= N_PER_TILE it stays inside a DPP row.
         best = gl.reduce(grouped, 1, _max_nan)
         blk = gl.arange(0, BPT, layout=gl.SliceLayout(1, grouped.type.layout))
-        # The same bound the logits store has. Not droppable on MASKED=False
-        # tiles the way emit's select is -- tried, and it faults out of bounds
-        # at ctx 1047 / C 32 / 64 heads / unshuffled.
+        # The same bound the logits store has, and not droppable on
+        # MASKED=False tiles: at UNROLL 2 a short segment faults out of bounds
+        # (ctx 1047, C 32, 64 heads, unshuffled). UNROLL 1 is clean and so is
+        # one long segment, so it needs both -- mechanism not established, and
+        # clamping the trip count does not fix it.
         gl.amd.cdna4.buffer_store(
             best, ptr=self.bs_ptr + r * self.bs_stride_s,
             offsets=tile_pos // C + blk,
