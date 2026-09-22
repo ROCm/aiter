@@ -26,7 +26,7 @@ when that is the ticket convention.
 
 - [x] 0. Baseline PMC + ATT (physical GPU 6)
 - [x] 1. Lock launch paths; decode ATT that actually hits a CU
-- [ ] 2. Pack live / phys / page_off LDS
+- [x] 2. Pack live / phys / page_off LDS
 - [ ] 3. Overlap K/V `buffer_load` with LDS wait/barrier
 - [ ] 4. Bank-conflict-free K (and C) stores; V layout unchanged
 - [ ] 5. Token-major V: pack stores only
@@ -96,6 +96,15 @@ apply.
 - **rocprof under JIT:** fill FlyDSL cache then
   `FLYDSL_RUNTIME_ENABLE_CACHE=1` for ATT/PMC; keep-gate benches stay
   `CACHE=0`.
+- **`CACHE=0` needs `ROCM_PATH=/root/.flydsl/toolkit`.** FlyDSL runs
+  `gpu-module-to-binary` with an empty `toolkit=`, so MLIR resolves
+  `ld.lld` from `ROCM_PATH`, which is unset in this container. Every
+  *real* compile then dies with `lld invocation failed` — the ROCm
+  wheel puts the linker at `_rocm_sdk_core/lib/llvm/bin`, not the
+  `llvm/bin` MLIR appends. `CACHE=1` hides this by hitting the disk
+  cache, so it looks like "the edit broke the compile" when in fact
+  any source edit (new cache key) fails and HEAD fails too. Always
+  run the HEAD control with `CACHE=0` before blaming a kernel edit.
 - **Packaging holes (container, not git):** unversioned
   `librocprof-trace-decoder.so` and
   `lib/rocprofiler-sdk/librocprofv3-list-avail.so` may need symlinks
@@ -204,10 +213,30 @@ barrier, and packing live/phys does not depend on it.
 Shared decode+prefill. ATT’s second-hottest FlyDSL barrier is
 `ds_write_b32` then `lgkmcnt(0)` then barrier.
 
-- [ ] Vector / conflict-free stores for live, phys, page_off.
-- [ ] Fold or delay that barrier if the next reader still orders.
-- [ ] Keep-gate `M=1` first, then `M=8` / `M=512`.
-- [ ] **Done when:** kept (≥3%) or reverted + do-not-retry note.
+- [x] Vector / conflict-free stores for live, phys, page_off.
+      **Reverted 2026-09-22:** replaced the three Int32 LDS rows with
+      one `[BLOCK_N, 4]` row (`phys`, `page_off`, `live`, pad) and one
+      `UniversalCopy128b(Int32)` per translating column. Readers kept
+      the same logical values and the translate barrier stayed.
+- [x] Fold or delay that barrier if the next reader still orders.
+      Skipped: the parent plan already keep-gate-lost per-thread
+      redundant page translation. The earlier untested replay was
+      only an environment failure, not evidence for reopening it.
+- [x] Keep-gate `M=1` first, then `M=8` / `M=512`.
+- [x] **Done when:** packed stores kept (≥3%) or reverted + note.
+
+Correctness: focused GPU-6 pytest passed (`2 passed`, decode and
+prefill, `CACHE=0`, `ROCM_PATH=/root/.flydsl/toolkit`).
+
+| width-2051 `L=512` wrapper | HEAD | packed median (2 runs) | delta |
+|--|--:|--:|--:|
+| M=1 | 19.10 µs | 19.565 µs | **+2.4%** |
+| M=8 | 20.57 µs | 20.09 µs | -2.3% |
+| M=512 | 517.93 µs | 517.52 µs | -0.08% |
+
+No row reaches the 3% keep gate, and decode M=1 regresses. Kernel
+restored to HEAD; no PMC/ATT follow-up for a reverted change.
+**Done. Next: phase 3.**
 
 ### 3. Overlap K/V `buffer_load` with LDS wait/barrier
 
@@ -267,3 +296,8 @@ The parent plan remains the full K2 list.
 - In-register full-D QK as a first experiment (parent `ld.lld` miss).
 - PMC groups that include `SQ_INSTS_LDS` with the eight-counter pass.
 - ATT `--att-gpu-index 0` under `HIP_VISIBLE_DEVICES=6`.
+- Reading `lld invocation failed` as a kernel-source bug. It is an
+  environment fault in this container (see the `ROCM_PATH` lock).
+- Packing `phys/page_off/live/pad` into one `[BLOCK_N,4]` Int32 LDS
+  row with `UniversalCopy128b`. Correct, but M=1 regressed 2.4%,
+  M=8 improved only 2.3%, and M=512 was flat; all miss the 3% gate.
