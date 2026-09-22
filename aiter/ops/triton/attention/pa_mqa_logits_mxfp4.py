@@ -223,7 +223,11 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
             # longer address chain -- 1.11x on decode there, a spill and 1.3x
             # the other way on a wide chunk, so decode only.
             depth=2 if (wide_decode or (next_n == 1 and split_page)) else 1,
-            unroll=2 if ((compute_chunk or spec_rows) and block_m <= 6) else 1,
+            # Two KV tiles per body. Speculative decode has the registers for
+            # it; a wide chunk does not -- at 64 heads it lands one over
+            # waves_per_eu = 3's budget and spills seven words, which costs
+            # 1.17-1.37x, and at 32 heads the second tile buys nothing.
+            unroll=2 if (spec_rows and block_m <= 6) else 1,
             fold_asm=1 if (compute_chunk or spec_rows or num_heads > 32) else 0)
     else:
         # LDS path, for an unshuffled cache. A second warp buys issue rate for a
@@ -267,7 +271,13 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
         # vectorizer pairs the adds into v_pk_add_f32, which has no abs modifier.
         relu_add=cfg["fold_asm"],
         min_tiles_per_split=4,
-        max_tiles_per_split=64)
+        # The balance term's cap on a workgroup's tiles. Decode wants it loose:
+        # one row block per sequence leaves the occupancy term in charge, and
+        # at a long context 64 splits past what occupancy asked for, which
+        # costs 8-10% at 128K-365K. Above one query row the row blocks already
+        # fill the machine, the occupancy term is small, and the same value
+        # halves the split count and costs 1-14%.
+        max_tiles_per_split=128 if next_n == 1 else 64)
     return cfg
 
 
