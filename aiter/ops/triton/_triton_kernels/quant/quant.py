@@ -127,6 +127,21 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
 
 
 @triton.jit
+def _mxfp4_scale_from_amax(amax):
+    """Convert an FP32 absolute maximum to E8M0 and its reciprocal."""
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    # A biased value of 255 is E8M0 NaN, so 254 is the largest finite scale.
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127
+    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+    return bs_e8m0, quant_scale
+
+
+@triton.jit
 def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N,
@@ -134,8 +149,8 @@ def _mxfp4_quant_op(
     MXFP4_QUANT_BLOCK_SIZE,
 ):
     """
-    Converts given x (in its native load dtype, e.g. bf16) to mxfp4 format.
-    x: [BLOCK_SIZE_M, BLOCK_SIZE_N]
+    Converts given x (in fp32) to mxfp4 format.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
 
     """
     EXP_BIAS_FP32: tl.constexpr = 127
@@ -149,19 +164,9 @@ def _mxfp4_quant_op(
     min_normal: tl.constexpr = 1
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE).to(tl.float32)
-    # Calculate scale
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-    amax = amax.to(tl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(tl.float32, bitcast=True)
-    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
-    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-
-    # blockscale_e8m0
-    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
-
-    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+    bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
 
     # Compute quantized x
     qx = x * quant_scale
@@ -330,6 +335,94 @@ def _nvfp4_quant_op(
     return x_fp4, scale_e4m3.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
 
+@triton.jit
+def _mxfp4_e8m0_to_fp32(scales):
+    """Decode E8M0, including raw zero's exact value of 2^-127."""
+    scale_bits = scales.to(tl.uint32) << 23
+    scale_bits = tl.where(scales == 0, 0x00400000, scale_bits)
+    return scale_bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _mxfp4_sr_random_words(
+    rows,
+    pid_n,
+    N,
+    philox_seed,
+    philox_offset,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Generate one random word per packed pair from non-overlapping counters."""
+    COUNTERS_PER_TILE_ROW: tl.constexpr = BLOCK_SIZE_N // 8
+    rows_u64 = rows.to(tl.uint64)
+    pid_n_u64 = tl.cast(pid_n, tl.uint64)
+    counter_cols_u64 = pid_n_u64 * COUNTERS_PER_TILE_ROW + tl.arange(
+        0, COUNTERS_PER_TILE_ROW
+    ).to(tl.uint64)
+    counters_per_row = tl.cast(N // 8, tl.uint64)
+    offsets = (
+        tl.cast(philox_offset, tl.uint64)
+        + rows_u64[:, None] * counters_per_row
+        + counter_cols_u64[None, :]
+    )
+    r0, r1, r2, r3 = tl.randint4x(philox_seed, offsets)
+    return tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(
+        BLOCK_SIZE_M, BLOCK_SIZE_N // 2
+    )
+
+
+@triton.jit
+def _mxfp4_sr_pack(
+    x,
+    scales,
+    random_words,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+):
+    """Pack pairs with gfx950 stochastic scaled E2M1 conversion."""
+    HALF_BLOCK_SIZE_N: tl.constexpr = BLOCK_SIZE_N // 2
+    HALF_QUANT_BLOCK_SIZE: tl.constexpr = MXFP4_QUANT_BLOCK_SIZE // 2
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+
+    x0, x1 = tl.split(x.reshape(BLOCK_SIZE_M, HALF_BLOCK_SIZE_N, 2))
+    scale_fp32 = _mxfp4_e8m0_to_fp32(scales)
+    scale_fp32 = (
+        scale_fp32.expand_dims(axis=2)
+        .broadcast_to(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, HALF_QUANT_BLOCK_SIZE)
+        .reshape(BLOCK_SIZE_M, HALF_BLOCK_SIZE_N)
+    )
+
+    if x0.type.element_ty == tl.float32:
+        packed_input = (x1.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | x0.to(
+            tl.uint32, bitcast=True
+        )
+        packed = tl.inline_asm_elementwise(
+            asm="v_cvt_scalef32_sr_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];",
+            constraints="=&v,v,v,v",
+            args=[packed_input, random_words, scale_fp32],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+    else:
+        tl.static_assert(x0.type.element_ty == tl.bfloat16)
+        packed_input = (x1.to(tl.uint16, bitcast=True).to(tl.uint32) << 16) | x0.to(
+            tl.uint16, bitcast=True
+        )
+        packed = tl.inline_asm_elementwise(
+            asm="v_cvt_scalef32_sr_pk_fp4_bf16 $0, $1, $2, $3 op_sel:[0,0,0,0];",
+            constraints="=&v,v,v,v",
+            args=[packed_input, random_words, scale_fp32],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+
+    return (packed & 0xFF).to(tl.uint8).reshape(BLOCK_SIZE_M, HALF_BLOCK_SIZE_N)
+
+
 _dynamic_mxfp4_quant_repr = make_kernel_repr(
     "_dynamic_mxfp4_quant_kernel",
     [
@@ -340,6 +433,7 @@ _dynamic_mxfp4_quant_repr = make_kernel_repr(
         "MXFP4_QUANT_BLOCK_SIZE",
         "EVEN_M_N",
         "SCALING_MODE",
+        "USE_SR",
         "num_warps",
     ],
 )
@@ -364,6 +458,8 @@ def _dynamic_mxfp4_quant_kernel(
     stride_bs_n_in,
     M,
     N,
+    philox_seed,
+    philox_offset,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     NUM_ITER: tl.constexpr,
@@ -371,13 +467,22 @@ def _dynamic_mxfp4_quant_kernel(
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     EVEN_M_N: tl.constexpr,
     SCALING_MODE: tl.constexpr,
-    # Declared so the launch warp count reaches the repr and distinguishes the
-    # compiled artifacts; Triton still applies it as the launch option.
+    USE_SR: tl.constexpr,
+    # Keep the launch warp count in the repr for traceable specializations.
     num_warps: tl.constexpr,
 ):
+    if USE_SR:
+        tl.static_assert(
+            x_ptr.type.element_ty == tl.float32 or x_ptr.type.element_ty == tl.bfloat16
+        )
+        tl.static_assert(BLOCK_SIZE_N % MXFP4_QUANT_BLOCK_SIZE == 0)
+
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
-    # cast strides to int64, in case M*N > max int32
+    if USE_SR:
+        loop_limit = tl.cdiv(N, BLOCK_SIZE_N)
+    else:
+        loop_limit = N
     stride_x_m = tl.cast(stride_x_m_in, tl.int64)
     stride_x_n = tl.cast(stride_x_n_in, tl.int64)
     stride_x_fp4_m = tl.cast(stride_x_fp4_m_in, tl.int64)
@@ -387,47 +492,82 @@ def _dynamic_mxfp4_quant_kernel(
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
 
-    for pid_n in tl.range(start_n, min(start_n + NUM_ITER, N), num_stages=NUM_STAGES):
+    for pid_n in tl.range(
+        start_n,
+        min(start_n + NUM_ITER, loop_limit),
+        num_stages=NUM_STAGES,
+    ):
         x_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
 
-        if EVEN_M_N:
-            x = tl.load(x_ptr + x_offs, cache_modifier=".cg")
-        else:
-            x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-            x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg")
+        if USE_SR:
+            if EVEN_M_N:
+                x = tl.load(x_ptr + x_offs, cache_modifier=".cg")
+            else:
+                x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+                x = tl.load(
+                    x_ptr + x_offs,
+                    mask=x_mask,
+                    other=0.0,
+                    cache_modifier=".cg",
+                )
 
-        out_tensor, bs_e8m0 = _mxfp4_quant_op(
-            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-        )
+            x_grouped = x.to(tl.float32).reshape(
+                BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE
+            )
+            amax = tl.max(tl.abs(x_grouped), axis=-1, keep_dims=True)
+            bs_e8m0, _ = _mxfp4_scale_from_amax(amax)
+            bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+            random_words = _mxfp4_sr_random_words(
+                x_offs_m,
+                pid_n,
+                N,
+                philox_seed,
+                philox_offset,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+            )
+            out_tensor = _mxfp4_sr_pack(
+                x,
+                bs_e8m0,
+                random_words,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            )
+        else:
+            if EVEN_M_N:
+                x = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
+            else:
+                x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+                x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
+                    tl.float32
+                )
+
+            out_tensor, bs_e8m0 = _mxfp4_quant_op(
+                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
 
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
         out_offs = (
             out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
         )
-
-        if EVEN_M_N:
-            tl.store(x_fp4_ptr + out_offs, out_tensor)
-        else:
-            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-            tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
-
         bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+
         if EVEN_M_N:
+            tl.store(x_fp4_ptr + out_offs, out_tensor)
             tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
+            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
             bs_mask = (bs_offs_m < M)[:, None] & (
                 bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
             )[None, :]
-            tl.store(
-                bs_ptr + bs_offs,
-                bs_e8m0,
-                mask=bs_mask,
-            )
+            tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+            tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 
 # MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3

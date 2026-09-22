@@ -42,6 +42,8 @@ def get_dtype(dtype_str: str) -> torch.dtype:
         return torch.bfloat16
     if dtype_str == "fp16":
         return torch.float16
+    if dtype_str == "fp32":
+        return torch.float32
     raise ValueError(f"Unsupported dtype: {dtype_str}")
 
 
@@ -76,7 +78,10 @@ def parse_shape_args(args) -> list[tuple[str, int, int]]:
         return [("custom", M, N)]
     if args.model is not None:
         return model_benchmark_shapes(args)
-    return [("default", M, N) for M, N in get_default_shapes()]
+    shapes = get_default_shapes()
+    if args.use_sr:
+        shapes = [(M, N) for M, N in shapes if N % 32 == 0]
+    return [("default", M, N) for M, N in shapes]
 
 
 def run_benchmark(args):
@@ -85,6 +90,12 @@ def run_benchmark(args):
 
     x_vals = parse_shape_args(args)
     line_vals = get_line_vals(args)
+    if args.use_sr and line_vals != ["mxfp4-triton"]:
+        raise ValueError("--use-sr currently requires --format mxfp4 --provider triton")
+    if args.use_sr and args.dtype not in ("bf16", "fp32"):
+        raise ValueError("--use-sr requires --dtype bf16 or fp32")
+    if args.use_sr and any(M <= 0 or N <= 0 or N % 32 != 0 for _, M, N in x_vals):
+        raise ValueError("--use-sr requires positive shapes with N divisible by 32")
 
     if args.metric == "time":
         ylabel = "Time (ms)"
@@ -105,11 +116,13 @@ def run_benchmark(args):
         styles=[(colors[i % len(colors)], "-") for i in range(len(line_vals))],
         ylabel=ylabel,
         plot_name=get_caller_name_no_ext(),
-        args={"metric": args.metric, "dtype": args.dtype},
+        args={"metric": args.metric, "dtype": args.dtype, "use_sr": args.use_sr},
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_quant_mx(M, N, metric, provider, dtype, model_name=None, **kwargs):
+    def bench_quant_mx(
+        M, N, metric, provider, dtype, use_sr, model_name=None, **kwargs
+    ):
         fmt, provider = provider.split("-", 1)
         dtype = get_dtype(dtype)
         x = torch.randn((M, N), dtype=dtype, device="cuda")
@@ -118,7 +131,10 @@ def run_benchmark(args):
         # run_perftest rotates through enough distinct input copies to exceed
         # L2 capacity and measures actual device kernel time via the
         # profiler, so results aren't inflated by cache/address locality.
-        _, us = run_perftest(quant_fn, x)
+        if use_sr:
+            _, us = run_perftest(quant_fn, x, use_sr=True, philox_seed=1234)
+        else:
+            _, us = run_perftest(quant_fn, x)
         ms = us * 1e-3
 
         # Read x and write quantized output + block scales.
@@ -184,9 +200,14 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["bf16", "fp16"],
+        choices=["bf16", "fp16", "fp32"],
         default="bf16",
         help="Input dtype.",
+    )
+    parser.add_argument(
+        "--use-sr",
+        action="store_true",
+        help="Benchmark gfx950 stochastic rounding with a fixed Philox seed.",
     )
     parser.add_argument(
         "--metric",

@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import os
 import random
 import sys
 
@@ -37,7 +38,6 @@ TEST_NAME = "main.normal_accuracy_performance.jit"
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
 
-torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 # Global configuration
@@ -1184,7 +1184,6 @@ def run_pa_gluon_test(
     seed = 123
     setup_seed(seed)
     device = "cuda:0"
-    torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
     assert (
         num_query_heads % num_kv_heads == 0
@@ -1203,7 +1202,11 @@ def run_pa_gluon_test(
     total_queries = query_output_indptr[-1].item()
 
     qkv_tensor = torch.randn(
-        total_queries, num_query_heads + 2 * num_kv_heads, head_size, dtype=data_type
+        total_queries,
+        num_query_heads + 2 * num_kv_heads,
+        head_size,
+        dtype=data_type,
+        device=device,
     )
     query, _key, _value = torch.split(
         qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
@@ -1943,10 +1946,12 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
         ps_options,
     )
 
+    # Unit tests only check pass/fail; only a CLI run keeps the CSV report.
+    write_output_file = "PYTEST_CURRENT_TEST" not in os.environ
     output_file = f"run_pa_gluon_test.{TEST_NAME}.block_size_{block_sizes[0]}.triton.{TRITON_VERSION}.csv"
-    results_df.to_csv(output_file, index=False)
-
-    logger.info("\nResults saved to %s", output_file)
+    if write_output_file:
+        results_df.to_csv(output_file, index=False)
+        logger.info("\nResults saved to %s", output_file)
     logger.info("\nSummary:\n%s", results_df)
 
     # Print mean of selected columns grouped by compute_type
@@ -2034,7 +2039,10 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
             "\nTests failed! %d test case(s) exceeded the error threshold. ",
             total_errors,
         )
-        logger.warning("Please check rows with non-zero err_gluon in %s.", output_file)
+        if write_output_file:
+            logger.warning(
+                "Please check rows with non-zero err_gluon in %s.", output_file
+            )
         assert False, f"{total_errors} test case(s) exceeded the error threshold"
     else:
         logger.info("\nAll tests passed!")
