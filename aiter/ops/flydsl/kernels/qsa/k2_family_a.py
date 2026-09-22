@@ -100,6 +100,7 @@ def build_qsa_k2_family_a_module(
     gather_rounds = d_chunks // col_owners
     gather_span = col_owners * vec
     token_major_v = use_k32 and block_n == 16
+    decode_tr_pv = token_major_v
 
     def make_k_lds_view(k_arr, offset, shape):
         if token_major_v:
@@ -206,9 +207,7 @@ def build_qsa_k2_family_a_module(
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_arr = getattr(storage, _k_field)
         v_lds = getattr(storage, _v_field).view(
-            fx.make_layout((_D, block_n), (block_n, 1))
-            if token_major_v
-            else fx.make_layout(
+            fx.make_layout(
                 (block_n, _K_STRIDE if not use_k32 else _D),
                 (_K_STRIDE if not use_k32 else _D, 1),
             )
@@ -236,7 +235,14 @@ def build_qsa_k2_family_a_module(
         )
         qk_b_copy = fx.make_tiled_copy_B(qk_b_atom, qk_wave_mma).get_slice(lane)
         pv_wave_mma = fx.make_tiled_mma(pv_mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
-        pv_b_atom = fx.make_copy_atom(fx.UniversalCopy64b(), BFloat16)
+        pv_b_atom = fx.make_copy_atom(
+            (
+                fx.rocdl.cdna4.LDSReadTrans16_64b()
+                if decode_tr_pv
+                else fx.UniversalCopy64b()
+            ),
+            BFloat16,
+        )
         pv_b_copy = fx.make_tiled_copy_B(pv_b_atom, pv_wave_mma).get_slice(lane)
 
         def qk_mfma(a_vec, b_vec, c_vec):
@@ -385,19 +391,14 @@ def build_qsa_k2_family_a_module(
                         BFloat16,
                     )
                     fx.memref_store_vec(v_vec, v_frag)
-                    if const_expr(token_major_v):
-                        d0 = d_chunk * Int32(vec)
-                        for i in range_constexpr(vec):
-                            v_lds[d0 + Int32(i), col] = v_vec[i]
-                    else:
-                        v_tile = fx.make_view(
-                            fx.get_iter(v_lds) + Int32(gr * gather_span),
-                            fx.make_layout((block_n, gather_span), (_D, 1)),
-                        )
-                        v_dst = kv_store.partition_D(v_tile)
-                        v_store_frag = fx.make_fragment_like(v_dst)
-                        fx.memref_store_vec(v_vec, v_store_frag)
-                        fx.copy(lds_copy, v_store_frag, v_dst)
+                    v_tile = fx.make_view(
+                        fx.get_iter(v_lds) + Int32(gr * gather_span),
+                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                    )
+                    v_dst = kv_store.partition_D(v_tile)
+                    v_store_frag = fx.make_fragment_like(v_dst)
+                    fx.memref_store_vec(v_vec, v_store_frag)
+                    fx.copy(lds_copy, v_store_frag, v_dst)
             if const_expr(token_major_v):
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
@@ -519,13 +520,11 @@ def build_qsa_k2_family_a_module(
                         ],
                         BFloat16,
                     )
-                    if const_expr(token_major_v):
+                    if const_expr(decode_tr_pv):
                         d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
                         sB = fx.make_view(
-                            fx.get_iter(v_lds)
-                            + d_base * Int32(block_n)
-                            + Int32(ng * 16),
-                            fx.make_layout((16, 16), (block_n, 1)),
+                            fx.get_iter(v_lds) + Int32(ng * 16) * Int32(_D) + d_base,
+                            fx.make_layout((16, 16), (1, _D)),
                         )
                         b_src = pv_b_copy.partition_S(sB)
                         b_frag = fx.make_fragment_like(b_src)
