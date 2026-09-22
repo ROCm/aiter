@@ -38,6 +38,7 @@ from aiter.ops.mha import (
     mha_varlen_fwd,
 )
 from aiter.ops.mha_fwd_policy import (
+    MHA_FWD_BACKENDS,
     MHA_FWD_CANDIDATE_FIELDS,
     MHA_FWD_INDIFFERENCE_DELTA,
     MHA_FWD_METRIC_FIELDS,
@@ -53,6 +54,7 @@ from aiter.ops.mha_fwd_policy import (
     canonical_backend_config,
     enumerate_mha_fwd_candidates,
     mha_fwd_candidate_id,
+    parse_backend_config,
 )
 from aiter.test_common import checkAllclose
 from aiter.utility.base_tuner import TunerCommon
@@ -399,6 +401,7 @@ class MhaFwdTuner(TunerCommon):
         self._all_results = pd.DataFrame(columns=self.columns)
         self._selection_proofs: list[dict[str, Any]] = []
         self._incumbents_by_key: dict[tuple, set[tuple[str, str]]] = {}
+        self._autoselect_by_key: dict[tuple, dict[str, Any] | None] = {}
         self._promotions: list[dict[str, Any]] = []
         self._race_reports: list[dict[str, Any]] = []
         self._race_winner_by_key: dict[tuple, tuple] = {}
@@ -786,11 +789,14 @@ class MhaFwdTuner(TunerCommon):
             # on the same GPU, is what lets the run tell an improvement from a
             # reordering of noise. Without it the comparison is against a
             # number from another session.
-            incumbents = self._incumbent_candidates(row)
+            selection = self._resolve_autoselect(row)
+            self._autoselect_by_key[key] = selection
+            incumbents = self._incumbent_candidates(selection)
             known = {candidate.identity for candidate in candidates}
-            for incumbent in incumbents:
-                if incumbent.identity not in known:
-                    candidates.append(incumbent)
+            for extra in (*self._shipped_tile_candidates(row), *incumbents):
+                if extra.identity not in known:
+                    candidates.append(extra)
+                    known.add(extra.identity)
             self._incumbents_by_key[key] = {
                 (candidate.backend, canonical_backend_config(candidate.backend_config))
                 for candidate in incumbents
@@ -1067,16 +1073,33 @@ class MhaFwdTuner(TunerCommon):
             results.extend(self._race_one_shape(args, plan))
         return results
 
-    def _race_block_journal(self, key):
+    def _race_block_journal(self, args, key, candidates):
         """Per-block checkpoint for one shape, beside the candidate journal.
 
         The candidate journal records finished candidate-phases while a race's
         unit of durable progress is the finished block, so they cannot share a
         file. They do share the ``--resume`` flag and the directory.
+
+        The name digests the candidate field and the race parameters as well
+        as the shape, because a replayed block is only meaningful for the race
+        that produced it. Changing the catalogue or the thresholds therefore
+        lands on a different file and the stale blocks are never read, rather
+        than being replayed into a race they do not describe.
         """
         if not self._journal_path:
             return None
-        digest = sha256(",".join(map(str, key)).encode("utf-8")).hexdigest()[:12]
+        fingerprint = json.dumps(
+            {
+                "key": list(map(str, key)),
+                "candidates": sorted(candidate.identity for candidate in candidates),
+                "delta": float(args.delta),
+                "alpha": float(args.race_alpha),
+                "block_calls": int(args.race_block_calls),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
         return f"{self._journal_path}.race-{digest}.jsonl"
 
     def _race_one_shape(self, args, plan):
@@ -1155,7 +1178,9 @@ class MhaFwdTuner(TunerCommon):
             f"(delta={args.delta:.1%}, at most {args.race_max_blocks} blocks)",
             flush=True,
         )
-        journal_path = self._race_block_journal(key)
+        journal_path = self._race_block_journal(
+            args, key, [entrant.payload for entrant in entrants]
+        )
         journal = (
             JsonlBlockJournal(journal_path, resume=args.resume)
             if journal_path
@@ -1362,7 +1387,10 @@ class MhaFwdTuner(TunerCommon):
                 failures.append(failed)
                 continue
             winner = self._gate_against_incumbent(key, valid)
-            winners.append(winner)
+            # None means auto-select already does as well as anything measured,
+            # and no row is how a shape reaches auto-select.
+            if winner is not None:
+                winners.append(winner)
 
         winnerdf = pd.DataFrame(winners, columns=self.columns)
         failuredf = pd.DataFrame(failures, columns=self.columns)
@@ -1485,7 +1513,7 @@ class MhaFwdTuner(TunerCommon):
         return statistics.stdev(samples) / math.sqrt(len(samples))
 
     def _gate_against_incumbent(self, key, valid):
-        """The row to publish, keeping the incumbent when nothing beat it.
+        """The row to publish, or None to leave the shape on auto-select.
 
         Publishing a winner that sits inside measurement noise of the
         incumbent buys nothing and risks shipping a regression a contended
@@ -1493,8 +1521,6 @@ class MhaFwdTuner(TunerCommon):
         """
         fastest = self._race_pick(key, valid)
         incumbents = self._incumbents_by_key.get(key, set())
-        if not incumbents:
-            return fastest
         if (fastest["backend"], fastest["backend_config"]) in incumbents:
             fastest["detail"] = "incumbent retained: nothing measured beat it"
             self._record_promotion(key, fastest, fastest, 0.0, 0.0, "incumbent_fastest")
@@ -1506,9 +1532,7 @@ class MhaFwdTuner(TunerCommon):
             )
         ]
         if measured.empty:
-            fastest["detail"] = "incumbent not measured; improvement unverified"
-            self._record_promotion(key, fastest, None, None, None, "incumbent_absent")
-            return fastest
+            return self._gate_against_autoselect(key, fastest)
 
         incumbent = measured.iloc[0]
         gain_us = float(incumbent["us"]) - float(fastest["us"])
@@ -1526,6 +1550,48 @@ class MhaFwdTuner(TunerCommon):
             return kept
         fastest["detail"] = f"beat incumbent by {margin:.2%} against {noise:.2%} spread"
         self._record_promotion(key, fastest, incumbent, margin, noise, "promoted")
+        return fastest
+
+    def _gate_against_autoselect(self, key, fastest):
+        """Gate a winner against a dispatch choice the catalogue cannot name.
+
+        asm_v3 leaves its split count to C++, which reports 0, and 0 is not a
+        legal candidate split, so the shipped configuration cannot be entered
+        in the field and is timed by the fresh probe instead. One probe
+        latency carries no round spread, so the bar is the fixed indifference
+        delta rather than a standard-error separation.
+
+        Returning None leaves the shape out of the published table, which is
+        what retaining this incumbent means: no row is how the shape reaches
+        auto-select in the first place.
+        """
+        selection = self._autoselect_by_key.get(key)
+        latency = None if selection is None else selection.get("latency_us")
+        if not latency or float(latency) <= 0:
+            fastest["detail"] = "incumbent not measured; improvement unverified"
+            self._record_promotion(key, fastest, None, None, None, "incumbent_absent")
+            return fastest
+
+        latency = float(latency)
+        backend = selection["identity"][0]
+        baseline = {"backend": backend, "backend_config": "", "us": latency}
+        margin = (latency - float(fastest["us"])) / latency
+        args = getattr(self, "_args", None)
+        noise = float(getattr(args, "delta", MHA_FWD_INDIFFERENCE_DELTA))
+        if margin <= noise:
+            print(
+                f"leaving {key} on auto-select: {backend} at {latency:.1f} us "
+                f"was not beaten by {noise:.2%}",
+                flush=True,
+            )
+            self._record_promotion(
+                key, fastest, baseline, margin, noise, "autoselect_retained"
+            )
+            return None
+        fastest["detail"] = (
+            f"beat auto-select {backend} by {margin:.2%} against {noise:.2%} spread"
+        )
+        self._record_promotion(key, fastest, baseline, margin, noise, "promoted")
         return fastest
 
     def _indifference_threshold(self, challenger, incumbent) -> float:
@@ -1606,21 +1672,98 @@ class MhaFwdTuner(TunerCommon):
             }
         )
 
-    def _incumbent_candidates(self, row) -> list[MhaFwdCandidate]:
-        """The tile dicts the dict-config kernels resolve for this shape today.
+    def _incumbent_candidates(self, selection) -> list[MhaFwdCandidate]:
+        """The configuration the shipped dispatch resolves for this shape today.
 
         A run that never measures the configuration already in use cannot tell
         an improvement from a regression, so the incumbent is measured in the
         same sweep on the same GPU as its challengers.
 
-        Each kernel's own resolver is asked what it would launch, so this is
-        the shipped default rather than a value restated here.
+        Dispatch itself is asked, with the tuned table emptied so the answer
+        is today's auto-select rather than a row an earlier run published.
+        Restating the selection rules here would let them drift from the ones
+        that actually run, and picking a fixed backend would compare against
+        a kernel this shape never reaches.
+
+        An auto-select the catalogue cannot name yields no candidate: asm_v3
+        leaves its split count to C++, which reports 0, and 0 is not a legal
+        candidate split. The probe latency recorded beside it becomes the bar
+        instead, so the shape is still gated rather than waved through.
+        """
+        if selection is None:
+            return []
+        backend, num_splits, config_json = selection["identity"]
+        try:
+            return [
+                MhaFwdCandidate(
+                    backend=backend,
+                    num_splits=num_splits,
+                    backend_config=parse_backend_config(config_json),
+                )
+            ]
+        except ValueError as error:
+            logger.info(
+                "dispatch resolves %r for this shape, which the catalogue "
+                "cannot name (%s); gating against the probe latency instead",
+                backend,
+                error,
+            )
+            return []
+
+    def _resolve_autoselect(self, row) -> dict[str, Any] | None:
+        """Identify and time what dispatch does for this shape with no tuned row.
+
+        The probe runs the public operator in a fresh process against an empty
+        tuned table, so both the identity and the latency come from the path a
+        caller on this branch would take today.
+        """
+        descriptor, empty_table = tempfile.mkstemp(
+            prefix="mha-autoselect-", suffix=".csv"
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(",".join(MHA_FWD_RUNTIME_CSV_FIELDS) + "\n")
+            proof = self._run_fresh_probe(row, empty_table)
+        finally:
+            os.unlink(empty_table)
+        if proof["status"] != "verified":
+            logger.warning(
+                "could not establish what dispatch does for this shape "
+                "(%s); its winner will be published as unverified",
+                proof.get("stderr", "").strip().splitlines()[-1:] or "no detail",
+            )
+            return None
+        observed = proof["observed"]
+        backend = observed.get("backend")
+        if backend not in MHA_FWD_BACKENDS:
+            return None
+        return {
+            "identity": (
+                backend,
+                int(observed.get("num_splits") or 0),
+                observed.get("backend_config") or "",
+            ),
+            "latency_us": proof.get("latency_us"),
+        }
+
+    def _shipped_tile_candidates(self, row) -> list[MhaFwdCandidate]:
+        """The tile dicts the dict-config kernels resolve for this shape today.
+
+        These are measured whatever dispatch currently prefers, so that a
+        sampled field still contains each tile backend's shipped default
+        rather than only the tiles the sample happened to draw.
+
+        ``has_pe`` follows the head dims the way the kernel wrappers derive
+        it, because the resolvers return a different tile shape for an
+        asymmetric head dim and hardcoding it would inject a default this
+        shape never launches.
         """
         import torch
 
         dtype = getattr(torch, str(row.dtype), torch.bfloat16)
+        has_pe = int(row.hdim_q) - int(row.hdim_v) > 0
 
-        incumbents = []
+        shipped = []
         for backend in sorted(MHA_FWD_TILE_CONFIG_BACKENDS):
             try:
                 if backend == "gluon":
@@ -1628,7 +1771,7 @@ class MhaFwdTuner(TunerCommon):
                         _get_config as resolve,
                     )
 
-                    config = resolve(is_fp8=False, has_pe=False)
+                    config = resolve(is_fp8=False, has_pe=has_pe)
                 else:
                     from aiter.ops.triton._triton_kernels.attention.mha import (
                         _get_config as resolve,
@@ -1637,23 +1780,20 @@ class MhaFwdTuner(TunerCommon):
                     config = resolve(
                         float(row.dropout_p) > 0,
                         dtype,
-                        has_pe=False,
+                        has_pe=has_pe,
                         head_dim_v=int(row.hdim_v),
                     )
-            except Exception as error:  # noqa: BLE001 - any failure means no incumbent
-                # A backend with no resolvable default has no incumbent to
-                # beat, which is a weaker claim than one we can measure but
-                # not a reason to abandon the sweep.
-                logger.debug("no %s incumbent for this shape: %s", backend, error)
+            except Exception as error:  # noqa: BLE001 - no default is an outcome
+                logger.debug("no %s default for this shape: %s", backend, error)
                 continue
             if not isinstance(config, dict):
                 continue
-            incumbents.append(
+            shipped.append(
                 MhaFwdCandidate(
                     backend=backend, num_splits=0, backend_config=dict(config)
                 )
             )
-        return incumbents
+        return shipped
 
     def _restricted_backends(self) -> list[str] | None:
         """Backends this run is allowed to measure, or None for all of them."""
