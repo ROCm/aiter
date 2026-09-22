@@ -149,8 +149,8 @@ def _mxfp4_quant_op(
     MXFP4_QUANT_BLOCK_SIZE,
 ):
     """
-    Converts given x (in fp32) to mxfp4 format.
-    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
+    Converts given x (in its native load dtype, e.g. bf16) to mxfp4 format.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
     """
     EXP_BIAS_FP32: tl.constexpr = 127
@@ -164,7 +164,8 @@ def _mxfp4_quant_op(
     min_normal: tl.constexpr = 1
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE).to(tl.float32)
+    # Calculate scale
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
     bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
 
@@ -538,12 +539,10 @@ def _dynamic_mxfp4_quant_kernel(
             )
         else:
             if EVEN_M_N:
-                x = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
+                x = tl.load(x_ptr + x_offs, cache_modifier=".cg")
             else:
                 x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-                x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
-                    tl.float32
-                )
+                x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg")
 
             out_tensor, bs_e8m0 = _mxfp4_quant_op(
                 x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
