@@ -282,12 +282,25 @@ def build_qsa_k2_family_a_module(
         m_lds = storage.m.view(fx.make_layout(_HEAD_PAD, 1))
         l_lds = storage.l.view(fx.make_layout(_HEAD_PAD, 1))
         alpha_lds = storage.alpha.view(fx.make_layout(_HEAD_PAD, 1))
-        c_lds = storage.c.view(
-            fx.make_layout(
-                (n_subtiles, num_waves, 64, 4),
-                (num_waves * 64 * 4, 64 * 4, 4, 1),
-            )
-        )
+        # Packed 16x4 C exchange; softmax load-sums into registers once.
+        c_iter = fx.recast_iter(Float32, storage.c.ptr)
+        c_atom = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)
+
+        def c_lane_view(ng, wv, ln):
+            off = (Int32(ng) * Int32(num_waves) + wv) * Int32(256) + ln * Int32(4)
+            return fx.make_view(c_iter + off, fx.make_layout(4, 1))
+
+        def store_c_acc(ng, acc4):
+            dst = c_lane_view(ng, wave, lane)
+            frag = fx.make_fragment_like(dst)
+            fx.memref_store_vec(acc4, frag)
+            fx.copy(c_atom, frag, dst)
+
+        def load_c_acc(ng, wv):
+            src = c_lane_view(ng, wv, lane)
+            frag = fx.make_fragment_like(src)
+            fx.copy(c_atom, src, frag)
+            return fx.Vector(fx.memref_load_vec(frag))
 
         qk_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, qk_k, BFloat16))
         pv_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, BFloat16))
@@ -510,8 +523,7 @@ def build_qsa_k2_family_a_module(
                     fx.Vector(fx.memref_load_vec(b_frag)),
                     acc4,
                 )
-                for i in range_constexpr(4):
-                    c_lds[ng, wave, lane, i] = acc4[i]
+                store_c_acc(ng, acc4)
             gpu.barrier()
 
             if const_expr(decode_tr_pv):
@@ -561,8 +573,7 @@ def build_qsa_k2_family_a_module(
                     fx.memref_store_vec(v_vec, v_store_frag)
                     fx.copy(lds_copy, v_store_frag, v_dst)
 
-            # Softmax reads C and live, not V; the post-QK barrier already
-            # published C. V and P meet at the barrier before PV.
+            # Softmax load-sums packed C into registers (the 16x4 fragment).
             if wave == zero:
                 h0 = lane_kg * Int32(4)
                 heads = [h0 + Int32(i) for i in range_constexpr(4)]
@@ -573,12 +584,12 @@ def build_qsa_k2_family_a_module(
                     n = Int32(ng * 16) + lane_m
                     score_live = live_lds[n] != zero
                     score_lives.append(score_live)
+                    acc_sum = load_c_acc(ng, zero)
+                    for w in range_constexpr(1, num_waves):
+                        acc_sum = acc_sum + load_c_acc(ng, Int32(w))
                     sc = []
                     for i in range_constexpr(4):
-                        score = c_lds[ng, zero, lane, i]
-                        for w in range_constexpr(1, num_waves):
-                            score = score + c_lds[ng, w, lane, i]
-                        score = score * softmax_scale_log2
+                        score = acc_sum[i] * softmax_scale_log2
                         score = score_live.select(score, _neg_inf())
                         sc.append(score)
                         tile_max[i] = tile_max[i].maximumf(score)
