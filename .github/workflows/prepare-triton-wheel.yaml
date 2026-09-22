@@ -108,7 +108,7 @@ jobs:
           echo "source=fallback-rocm-${TRITON_DEFAULT_ROCM_VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Save Triton wheel cache
-        if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
+        if: steps.restore_triton_wheel.outputs.cache-hit != 'true' && steps.download_triton_wheel.outputs.source == 'image'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
