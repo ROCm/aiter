@@ -542,3 +542,24 @@ The parent plan remains the full K2 list.
   at `M=1/8/512`: decode −0.4%/−1.3%, prefill flat. Writer-contiguous
   4-head packs make PV-A strided. Keep scalar `p_lds[head, n]` and the
   head-major map. Conflict/wait keep-gate is dry.
+- Triton-shaped K2 in one pass: every wave runs full-D QK into registers,
+  in-wave `shuffle_idx` P for PV, m/l in registers, SharedStorage is K/V
+  (MMA scratch) only. Correct (`err=0`). Width-2051 `L=512` medians
+  `15.30 / 19.87 / 446.66` us versus P-join HEAD `14.46 / 17.31 / 392.51`
+  at `M=1/8/512`: **+5.8% / +14.8% / +13.8%**. Redundant 8×K32 QK plus
+  decode permute tax dominate dropping C/P/m/l LDS. Keep D-split QK,
+  C exchange, decode P-LDS, and prefill-only P shuffle.
+- Retained full Triton operand contract (explicit request, even on a mixed
+  gate): compute transposed `K @ Q^T`, so each QK C fragment is already the
+  PV-A token vector; softmax m/l stay scalar in that register map; four
+  alpha/epilogue shuffles bridge to PV-C's four-head map. K and V overlay
+  one MMA scratch, with a barrier before overwrite. No C/P/metadata LDS.
+  Focused decode+prefill pytest passes (`2 passed`, `err=0`). Width-2051
+  `L=512` medians are `16.47 / 20.29 / 318.13` us versus P-join HEAD
+  `14.46 / 17.31 / 392.51`: **+13.9% / +17.2% / -18.9%** at
+  `M=1/8/512`. Live AMD medians in the same runs were
+  `9.93 / 13.30 / 202.80` us. Emitted decode/prefill LDS is exactly
+  `8192 / 32768` bytes; decode has 8 K32 QK + 4 K16 PV, no scalar LDS,
+  120 VGPR; prefill has 32 K32 QK + 32 K16 PV, no scalar LDS, 226 VGPR.
+  Keep this source despite the decode miss; it materially narrows prefill
+  from ~1.95x to ~1.57x live AMD.

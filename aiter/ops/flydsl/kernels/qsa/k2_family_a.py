@@ -11,9 +11,9 @@ BLOCK_N=64 / two waves / one split and writes output directly.
 
 gfx942 aliases K and V in one LDS tile so BLOCK_N=64 stays under 64 KiB.
 gfx950 stores K and V separately and gathers this tile's V after K is
-visible so QK can run while V is in flight.  The post-QK barrier still
-publishes C for softmax.  Expand, partial RoPE, and the sigmoid output
-gate remain outside K2.
+visible so QK can run while V is in flight.  Softmax stays in registers
+(full-D QK on every wave, in-wave P transpose); LDS is MMA scratch only.
+Expand, partial RoPE, and the sigmoid output gate remain outside K2.
 """
 
 from functools import lru_cache
@@ -21,10 +21,8 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import BFloat16, Float32, Int32, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fxmath
-from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_GQA
@@ -53,63 +51,6 @@ def _neg_inf():
 
 def _exp2(x):
     return Float32(fx.rocdl.exp2(Float32.ir_type, Float32(x).ir_value()))
-
-
-def _f32_as_i32(x):
-    return llvm.bitcast(T.i32, Float32(x).ir_value())
-
-
-def _i32_as_f32(x):
-    return Float32(llvm.bitcast(T.f32, x))
-
-
-# Butterfly DPP ctrls for xor 1, 2, 4, 8 within a 16-lane row (coop warp_reduce).
-_DPP_XOR_1 = 0xB1
-_DPP_XOR_2 = 0x4E
-_DPP_XOR_4 = 0x141
-_DPP_XOR_8 = 0x128
-
-
-def _dpp_f32(x, dpp_ctrl):
-    bits = _f32_as_i32(x)
-    swapped = fx.rocdl.update_dpp(T.i32, bits, bits, dpp_ctrl, 0xF, 0xF, True)
-    return _i32_as_f32(swapped)
-
-
-def _token_row_reduce_max_n(vals):
-    """16-wide token max on a pack of independent heads.
-
-    Hop-outer so the four head registers share each DPP/shuffle distance,
-    matching AMD's ``v_max``/``v_max3`` then one permute, not four serial
-    butterflies. Distances are still xor 1,2,4,8 (token = ``lane_m``).
-    """
-    vals = list(vals)
-    for ctrl in (_DPP_XOR_1, _DPP_XOR_2, _DPP_XOR_4, _DPP_XOR_8):
-        nxt = [_dpp_f32(v, ctrl) for v in vals]
-        vals = [a.maximumf(b) for a, b in zip(vals, nxt)]
-    return vals
-
-
-def _token_row_reduce_sum_n(vals):
-    vals = list(vals)
-    for ctrl in (_DPP_XOR_1, _DPP_XOR_2, _DPP_XOR_4, _DPP_XOR_8):
-        nxt = [_dpp_f32(v, ctrl) for v in vals]
-        vals = [a + b for a, b in zip(vals, nxt)]
-    return vals
-
-
-def _shuffle_reduce_max_n(vals):
-    vals = list(vals)
-    for sh in (1, 2, 4, 8):
-        vals = [v.maximumf(v.shuffle_xor(Int32(sh), Int32(64))) for v in vals]
-    return vals
-
-
-def _shuffle_reduce_sum_n(vals):
-    vals = list(vals)
-    for sh in (1, 2, 4, 8):
-        vals = [v + v.shuffle_xor(Int32(sh), Int32(64)) for v in vals]
-    return vals
 
 
 def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
@@ -151,7 +92,7 @@ def build_qsa_k2_family_a_module(
     n_subtiles = block_n // 16
     qk_k = 32 if use_k32 else 16
     qk_vec = qk_k // 4
-    qk_steps = _D // (num_waves * qk_k)
+    qk_steps = _D // qk_k
     out_chunks = _D // (num_waves * 16)
     vec = 8
     d_chunks = _D // vec
@@ -178,25 +119,14 @@ def build_qsa_k2_family_a_module(
 
         @fx.struct
         class SharedStorage:
-            k: fx.Array[BFloat16, block_n * _D, 16]
-            v: fx.Array[BFloat16, block_n * _D, 16]
-            p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
-            m: fx.Array[Float32, _HEAD_PAD, 16]
-            l: fx.Array[Float32, _HEAD_PAD, 16]
-            alpha: fx.Array[Float32, _HEAD_PAD, 16]
-            c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
+            kv: fx.Array[BFloat16, block_n * _D, 16]
 
-        _k_field, _v_field = "k", "v"
+        _k_field, _v_field = "kv", "kv"
     else:
 
         @fx.struct
         class SharedStorage:
             kv: fx.Array[BFloat16, block_n * _K_STRIDE, 16]
-            p: fx.Array[BFloat16, _HEAD_PAD * block_n, 16]
-            m: fx.Array[Float32, _HEAD_PAD, 16]
-            l: fx.Array[Float32, _HEAD_PAD, 16]
-            alpha: fx.Array[Float32, _HEAD_PAD, 16]
-            c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
 
         _k_field, _v_field = "kv", "kv"
 
@@ -269,29 +199,6 @@ def build_qsa_k2_family_a_module(
                 (_K_STRIDE if not use_k32 else _D, 1),
             )
         )
-        p_lds = storage.p.view(fx.make_layout((_HEAD_PAD, block_n), (block_n, 1)))
-        m_lds = storage.m.view(fx.make_layout(_HEAD_PAD, 1))
-        l_lds = storage.l.view(fx.make_layout(_HEAD_PAD, 1))
-        alpha_lds = storage.alpha.view(fx.make_layout(_HEAD_PAD, 1))
-        # Packed 16x4 C exchange; softmax load-sums into registers once.
-        c_iter = fx.recast_iter(Float32, storage.c.ptr)
-        c_atom = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)
-
-        def c_lane_view(ng, wv, ln):
-            off = (Int32(ng) * Int32(num_waves) + wv) * Int32(256) + ln * Int32(4)
-            return fx.make_view(c_iter + off, fx.make_layout(4, 1))
-
-        def store_c_acc(ng, acc4):
-            dst = c_lane_view(ng, wave, lane)
-            frag = fx.make_fragment_like(dst)
-            fx.memref_store_vec(acc4, frag)
-            fx.copy(c_atom, frag, dst)
-
-        def load_c_acc(ng, wv):
-            src = c_lane_view(ng, wv, lane)
-            frag = fx.make_fragment_like(src)
-            fx.copy(c_atom, src, frag)
-            return fx.Vector(fx.memref_load_vec(frag))
 
         qk_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, qk_k, BFloat16))
         pv_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, BFloat16))
@@ -300,7 +207,8 @@ def build_qsa_k2_family_a_module(
             fx.UniversalCopy128b() if qk_k == 32 else fx.UniversalCopy64b(),
             BFloat16,
         )
-        qk_b_copy = fx.make_tiled_copy_B(qk_b_atom, qk_wave_mma).get_slice(lane)
+        qk_a_copy = fx.make_tiled_copy_A(qk_b_atom, qk_wave_mma).get_slice(lane)
+        qk_q_copy = fx.make_tiled_copy_B(g_copy, qk_wave_mma).get_slice(lane)
         pv_wave_mma = fx.make_tiled_mma(pv_mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
         pv_b_atom = fx.make_copy_atom(
             (fx.rocdl.cdna4.LDSReadTrans16_64b() if use_k32 else fx.UniversalCopy64b()),
@@ -338,43 +246,35 @@ def build_qsa_k2_family_a_module(
         col_end_unclamped = tile_end * Int32(block_n)
         col_end = (col_end_unclamped < n_sel).select(col_end_unclamped, n_sel)
 
-        # Load the Q fragments once and carry them in registers for every tile.
+        # Form Q as the B operand of K @ Q^T. This makes the QK C fragment
+        # token-major in registers, which is already the PV A fragment map.
         q_live = lane_m < Int32(_GROUP)
-        q_head = kv_h * Int32(_GROUP) + lane_m
-        safe_q_head = q_live.select(q_head, kv_h * Int32(_GROUP))
-        q_row = fx.logical_divide(fx.slice(q_buf, (row, safe_q_head, None)), vec_layout)
         q_regs = []
         for ks in range_constexpr(qk_steps):
-            q_d0 = (
-                wave * Int32(_D // num_waves)
-                + Int32(ks * qk_k)
-                + lane_kg * Int32(qk_vec)
+            q_base = (row * Int32(_HQ) + kv_h * Int32(_GROUP)) * Int32(_D) + Int32(
+                ks * qk_k
             )
-            d_chunk = _idiv(q_d0, Int32(vec))
-            q_off = q_d0 - d_chunk * Int32(vec)
-            q_src = fx.slice(q_row, (None, d_chunk))
+            q_tile = fx.make_view(
+                fx.get_iter(q_buf) + q_base,
+                fx.make_layout((16, qk_k), (_D, 1)),
+            )
+            q_src = qk_q_copy.partition_S(q_tile)
             q_frag = fx.make_fragment_like(q_src)
             fx.copy(g_copy, q_src, q_frag)
             q_vec = fx.Vector(fx.memref_load_vec(q_frag))
             q_regs.append(
                 fx.Vector.from_elements(
                     [
-                        q_live.select(
-                            q_vec[q_off + Int32(i)].to(Float32), Float32(0.0)
-                        ).to(BFloat16)
+                        q_live.select(q_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
                         for i in range_constexpr(qk_vec)
                     ],
                     BFloat16,
                 )
             )
-        if tid < Int32(_HEAD_PAD):
-            m_lds[tid] = _neg_inf()
-            l_lds[tid] = Float32(0.0)
-        gpu.barrier()
 
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
-        init_acc.append(fx.Vector.filled(4, float("-inf"), Float32))
-        init_acc.append(fx.Vector.filled(4, 0.0, Float32))
+        init_acc.append(Float32(float("-inf")))
+        init_acc.append(Float32(0.0))
         n_tiles = tile_end - tile_start
         start = fx.Int64(0)
         stop = fx.Int64(n_tiles)
@@ -445,73 +345,54 @@ def build_qsa_k2_family_a_module(
             else:
                 gpu.barrier()
 
+            v_frags_pf = []
             if const_expr(use_k32) and const_expr(not decode_tr_pv):
                 v_row_pf = fx.logical_divide(
                     fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
                 )
-                v_frags_pf = []
                 for gr in range_constexpr(gather_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row_pf, (None, d_chunk))
                     v_frag = fx.make_fragment_like(v_src)
                     fx.copy(g_copy, v_src, v_frag)
                     v_frags_pf.append(v_frag)
-                for gr in range_constexpr(gather_rounds):
-                    v_vec = fx.Vector(fx.memref_load_vec(v_frags_pf[gr]))
-                    v_vec = fx.Vector.from_elements(
-                        [
-                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                            for i in range_constexpr(vec)
-                        ],
-                        BFloat16,
-                    )
-                    v_tile = fx.make_view(
-                        fx.get_iter(v_lds) + Int32(gr * gather_span),
-                        fx.make_layout((block_n, gather_span), (_D, 1)),
-                    )
-                    v_dst = kv_store.partition_D(v_tile)
-                    v_store_frag = fx.make_fragment_like(v_dst)
-                    fx.memref_store_vec(v_vec, v_store_frag)
-                    fx.copy(lds_copy, v_store_frag, v_dst)
 
-            # QK: issue the next K LDS read before consuming the current one so
-            # the compiler can wait lgkmcnt(1) between MFMAs, matching AMD.
+            # Compute K @ Q^T. The transposed QK C map is token-major in each
+            # lane and can feed PV A without a P-LDS or bpermute transpose.
+            qk_accs = []
             for ng in range_constexpr(n_subtiles):
                 n0 = Int32(ng * 16)
                 acc4 = fx.Vector.filled(4, 0.0, Float32)
-                d_base = wave * Int32(_D // num_waves)
-                sB = make_k_lds_view(
-                    k_arr,
-                    n0 * Int32(_D if use_k32 else _K_STRIDE) + d_base,
-                    (16, qk_k),
-                )
-                b_src = qk_b_copy.partition_S(sB)
-                b_frag = fx.make_fragment_like(b_src)
-                fx.copy(qk_b_atom, b_src, b_frag)
+                k_row_bytes = Int32(_D if use_k32 else _K_STRIDE)
+                sA = make_k_lds_view(k_arr, n0 * k_row_bytes, (16, qk_k))
+                a_src = qk_a_copy.partition_S(sA)
+                a_frag = fx.make_fragment_like(a_src)
+                fx.copy(qk_b_atom, a_src, a_frag)
                 for ks in range_constexpr(qk_steps - 1):
-                    d_base_n = wave * Int32(_D // num_waves) + Int32((ks + 1) * qk_k)
-                    sB_n = make_k_lds_view(
+                    sA_n = make_k_lds_view(
                         k_arr,
-                        n0 * Int32(_D if use_k32 else _K_STRIDE) + d_base_n,
+                        n0 * k_row_bytes + Int32((ks + 1) * qk_k),
                         (16, qk_k),
                     )
-                    b_src_n = qk_b_copy.partition_S(sB_n)
-                    b_frag_n = fx.make_fragment_like(b_src_n)
-                    fx.copy(qk_b_atom, b_src_n, b_frag_n)
+                    a_src_n = qk_a_copy.partition_S(sA_n)
+                    a_frag_n = fx.make_fragment_like(a_src_n)
+                    fx.copy(qk_b_atom, a_src_n, a_frag_n)
                     acc4 = qk_mfma(
+                        fx.Vector(fx.memref_load_vec(a_frag)),
                         fx.Vector(q_regs[ks]),
-                        fx.Vector(fx.memref_load_vec(b_frag)),
                         acc4,
                     )
-                    b_frag = b_frag_n
+                    a_frag = a_frag_n
                 acc4 = qk_mfma(
+                    fx.Vector(fx.memref_load_vec(a_frag)),
                     fx.Vector(q_regs[qk_steps - 1]),
-                    fx.Vector(fx.memref_load_vec(b_frag)),
                     acc4,
                 )
-                store_c_acc(ng, acc4)
-            gpu.barrier()
+                qk_accs.append(acc4)
 
+            # K and V share one MMA scratch. All waves must finish their K
+            # reads before any lane overlays that storage with V.
+            gpu.barrier()
             if const_expr(decode_tr_pv):
                 for gr in range_constexpr(gather_rounds):
                     v_vec = fx.Vector(fx.memref_load_vec(v_frags[gr]))
@@ -532,6 +413,25 @@ def build_qsa_k2_family_a_module(
                     fx.copy(lds_copy64, v_store_frag, v_dst)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
+            elif const_expr(use_k32):
+                for gr in range_constexpr(gather_rounds):
+                    v_vec = fx.Vector(fx.memref_load_vec(v_frags_pf[gr]))
+                    v_vec = fx.Vector.from_elements(
+                        [
+                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
+                            for i in range_constexpr(vec)
+                        ],
+                        BFloat16,
+                    )
+                    v_tile = fx.make_view(
+                        fx.get_iter(v_lds) + Int32(gr * gather_span),
+                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                    )
+                    v_dst = kv_store.partition_D(v_tile)
+                    v_store_frag = fx.make_fragment_like(v_dst)
+                    fx.memref_store_vec(v_vec, v_store_frag)
+                    fx.copy(lds_copy, v_store_frag, v_dst)
+                gpu.barrier()
             elif const_expr(not use_k32):
                 v_row = fx.logical_divide(
                     fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
@@ -558,22 +458,18 @@ def build_qsa_k2_family_a_module(
                     v_store_frag = fx.make_fragment_like(v_dst)
                     fx.memref_store_vec(v_vec, v_store_frag)
                     fx.copy(lds_copy, v_store_frag, v_dst)
+                gpu.barrier()
 
-            # Softmax load-sums packed C into registers. m/l ride the tile
-            # loop (one definition path, no if-rebind). P/alpha still go
-            # through LDS for PV.
-            m4 = fx.Vector(state[out_chunks])
-            l4 = fx.Vector(state[out_chunks + 1])
-            h0 = lane_kg * Int32(4)
-            heads = [h0 + Int32(i) for i in range_constexpr(4)]
-            tile_max = [_neg_inf() for _ in range_constexpr(4)]
+            m_prev = Float32(state[out_chunks])
+            l_prev = Float32(state[out_chunks + 1])
+            tile_max = _neg_inf()
             scores = []
             score_lives = []
             for ng in range_constexpr(n_subtiles):
-                n = Int32(ng * 16) + lane_m
-                if const_expr(token_major_v):
-                    score_live = live
-                else:
+                sc = []
+                lives = []
+                for i in range_constexpr(4):
+                    n = Int32(ng * 16) + lane_kg * Int32(4) + Int32(i)
                     col_i_n = base + n
                     in_col_n = col_i_n < col_end
                     safe_col_n = in_col_n.select(col_i_n, col_start)
@@ -586,109 +482,50 @@ def build_qsa_k2_family_a_module(
                     phys_n = page_table[safe_req, safe_logical_page_n]
                     phys_live_n = (phys_n >= zero) & (phys_n < n_cache_blocks)
                     score_live = token_live_n & table_live_n & phys_live_n
-                score_lives.append(score_live)
-                acc_sum = load_c_acc(ng, zero)
-                for w in range_constexpr(1, num_waves):
-                    acc_sum = acc_sum + load_c_acc(ng, Int32(w))
-                sc = []
-                for i in range_constexpr(4):
-                    score = acc_sum[i] * softmax_scale_log2
+                    score = qk_accs[ng][i] * softmax_scale_log2
                     score = score_live.select(score, _neg_inf())
                     sc.append(score)
-                    tile_max[i] = tile_max[i].maximumf(score)
+                    lives.append(score_live)
+                    tile_max = tile_max.maximumf(score)
                 scores.append(sc)
-            m_prev = [m4[i] for i in range_constexpr(4)]
-            l_prev = [l4[i] for i in range_constexpr(4)]
-            if const_expr(use_k32):
-                tile_max = _token_row_reduce_max_n(tile_max)
-            else:
-                tile_max = _shuffle_reduce_max_n(tile_max)
-            m_new = [m_prev[i].maximumf(tile_max[i]) for i in range_constexpr(4)]
-            alpha = [_exp2(m_prev[i] - m_new[i]) for i in range_constexpr(4)]
-            p_sum = [Float32(0.0) for _ in range_constexpr(4)]
-            p_write = []
+                score_lives.append(lives)
+            tile_peer = tile_max.shuffle_xor(Int32(32), Int32(64))
+            tile_max = tile_max.maximumf(tile_peer)
+            tile_peer = tile_max.shuffle_xor(Int32(16), Int32(64))
+            tile_max = tile_max.maximumf(tile_peer)
+            m_new = m_prev.maximumf(tile_max)
+            alpha = _exp2(m_prev - m_new)
+            p_sum = Float32(0.0)
+            p_vecs = []
             for ng in range_constexpr(n_subtiles):
-                n = Int32(ng * 16) + lane_m
-                heads_p = []
+                probs = []
                 for i in range_constexpr(4):
-                    p = score_lives[ng].select(
-                        _exp2(scores[ng][i] - m_new[i]), Float32(0.0)
+                    p = score_lives[ng][i].select(
+                        _exp2(scores[ng][i] - m_new), Float32(0.0)
                     )
-                    p_sum[i] = p_sum[i] + p
-                    heads_p.append(p)
-                    if const_expr(token_major_v) and wave == zero:
-                        p_lds[heads[i], n] = p.to(BFloat16)
-                p_write.append(heads_p)
-            if const_expr(use_k32):
-                p_sum = _token_row_reduce_sum_n(p_sum)
-            else:
-                p_sum = _shuffle_reduce_sum_n(p_sum)
-            l_new = [l_prev[i] * alpha[i] + p_sum[i] for i in range_constexpr(4)]
-            m4_out = fx.Vector.from_elements(m_new, Float32)
-            l4_out = fx.Vector.from_elements(l_new, Float32)
-            if const_expr(token_major_v):
-                if wave == zero and lane_m == zero:
-                    for i in range_constexpr(4):
-                        m_lds[heads[i]] = m_new[i]
-                        l_lds[heads[i]] = l_new[i]
-                        alpha_lds[heads[i]] = alpha[i]
-                gpu.barrier()
-                alpha4 = fx.Vector.from_elements(
-                    [
-                        alpha_lds[lane_kg * Int32(4)],
-                        alpha_lds[lane_kg * Int32(4) + one],
-                        alpha_lds[lane_kg * Int32(4) + Int32(2)],
-                        alpha_lds[lane_kg * Int32(4) + Int32(3)],
-                    ],
-                    Float32,
-                )
-            else:
-                if wave == zero and lane_m == zero:
-                    for i in range_constexpr(4):
-                        m_lds[heads[i]] = m_new[i]
-                        l_lds[heads[i]] = l_new[i]
-                src_base = _idiv(lane_m, Int32(4)) * Int32(16) + lane_kg * Int32(4)
-                i_sel = lane_m % Int32(4)
-                p_vecs_pf = []
-                for ng in range_constexpr(n_subtiles):
-                    tok_p = []
-                    for k in range_constexpr(4):
-                        src = src_base + Int32(k)
-                        e0 = gpu.shuffle_idx(p_write[ng][0], src, Int32(64))
-                        e1 = gpu.shuffle_idx(p_write[ng][1], src, Int32(64))
-                        e2 = gpu.shuffle_idx(p_write[ng][2], src, Int32(64))
-                        e3 = gpu.shuffle_idx(p_write[ng][3], src, Int32(64))
-                        picked = (i_sel == zero).select(
-                            e0,
-                            (i_sel == one).select(
-                                e1, (i_sel == Int32(2)).select(e2, e3)
-                            ),
-                        )
-                        tok_p.append(picked.to(BFloat16))
-                    p_vecs_pf.append(fx.Vector.from_elements(tok_p, BFloat16))
-                alpha4 = fx.Vector.from_elements(alpha, Float32)
+                    p_sum = p_sum + p
+                    probs.append(p.to(BFloat16))
+                p_vecs.append(fx.Vector.from_elements(probs, BFloat16))
+            p_peer = p_sum.shuffle_xor(Int32(32), Int32(64))
+            p_sum = p_sum + p_peer
+            p_peer = p_sum.shuffle_xor(Int32(16), Int32(64))
+            p_sum = p_sum + p_peer
+            l_new = l_prev * alpha + p_sum
+            h0 = lane_kg * Int32(4)
+            alpha4 = fx.Vector.from_elements(
+                [
+                    gpu.shuffle_idx(alpha, h0 + Int32(i), Int32(64))
+                    for i in range_constexpr(4)
+                ],
+                Float32,
+            )
             next_acc = []
             for c in range_constexpr(out_chunks):
                 d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
                 acc4 = fx.Vector(state[c]) * alpha4
-                p_vecs = []
                 v_ops = []
                 for ng in range_constexpr(n_subtiles):
                     n0 = Int32(ng * 16) + lane_kg * Int32(4)
-                    if const_expr(token_major_v):
-                        p_vecs.append(
-                            fx.Vector.from_elements(
-                                [
-                                    p_lds[lane_m, n0],
-                                    p_lds[lane_m, n0 + one],
-                                    p_lds[lane_m, n0 + Int32(2)],
-                                    p_lds[lane_m, n0 + Int32(3)],
-                                ],
-                                BFloat16,
-                            )
-                        )
-                    else:
-                        p_vecs.append(p_vecs_pf[ng])
                     if const_expr(use_k32):
                         d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
                         sB = fx.make_view(
@@ -718,17 +555,30 @@ def build_qsa_k2_family_a_module(
                         v_vec = v_ops[ng]
                     acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
                 next_acc.append(acc4)
-            results = yield next_acc + [m4_out, l4_out]
+            results = yield next_acc + [m_new, l_new]
 
-        if const_expr(not token_major_v):
-            gpu.barrier()
-        m_final = storage.m.view(fx.make_layout(_HEAD_PAD, 1))
-        l_final = storage.l.view(fx.make_layout(_HEAD_PAD, 1))
+        m_final = Float32(results[out_chunks])
+        l_final = Float32(results[out_chunks + 1])
+        h0 = lane_kg * Int32(4)
+        m4 = fx.Vector.from_elements(
+            [
+                gpu.shuffle_idx(m_final, h0 + Int32(i), Int32(64))
+                for i in range_constexpr(4)
+            ],
+            Float32,
+        )
+        l4 = fx.Vector.from_elements(
+            [
+                gpu.shuffle_idx(l_final, h0 + Int32(i), Int32(64))
+                for i in range_constexpr(4)
+            ],
+            Float32,
+        )
         for i in range_constexpr(4):
             local_head = lane_kg * Int32(4) + Int32(i)
             if local_head < Int32(_GROUP):
                 head = kv_h * Int32(_GROUP) + local_head
-                den = l_final[local_head]
+                den = l4[i]
                 has = den > Float32(0.0)
                 for c in range_constexpr(out_chunks):
                     d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
@@ -737,12 +587,12 @@ def build_qsa_k2_family_a_module(
                         out[row, head, d] = value.to(BFloat16)
                     else:
                         partial_out[split, row, head, d] = value
-        if n_splits > 1 and tid < Int32(_GROUP):
-            head = kv_h * Int32(_GROUP) + tid
-            den = l_final[tid]
+        if n_splits > 1 and lane_kg == zero and lane_m < Int32(_GROUP):
+            head = kv_h * Int32(_GROUP) + lane_m
+            den = l_final
             has = den > Float32(0.0)
             lse = has.select(
-                m_final[tid] + fxmath.log(den) * Float32(_LOG2E),
+                m_final + fxmath.log(den) * Float32(_LOG2E),
                 Float32(_LSE_EMPTY),
             )
             partial_lse[split, row, head] = lse
