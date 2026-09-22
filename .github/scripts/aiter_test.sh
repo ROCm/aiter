@@ -36,6 +36,7 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
@@ -123,6 +124,19 @@ for file in "${sharded_files[@]}"; do
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
+            ;;
+        op_tests/test_flydsl_pa_decode.py)
+            # The CLI sweep is separate from the compact parametrized regression.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 -m pytest -q "$test_file"
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
             ;;
         op_tests/test_gemm_a6w6.py)
             {

@@ -34,6 +34,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -821,7 +822,7 @@ def _row_to_kwargs(row):
     inter_dim = int(row["inter_dim"])
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    gate_mode = _effective_gate_mode(q_type, aq_dtype, wq_dtype)
     return {
         "dtype": _str2dtype(row["dtype"]),
         "token": int(row["token"]),
@@ -950,7 +951,7 @@ def _situv2_beta_kwargs(act_type):
     return {}
 
 
-def _effective_gate_mode(aq_dtype, wq_dtype):
+def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
     # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
     # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
     # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
@@ -962,7 +963,11 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
-    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
+    if (
+        q_type == aiter.QuantType.per_1x32
+        and aq_dtype == dtypes.fp8
+        and wq_dtype == dtypes.fp8
+    ):
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
@@ -1100,7 +1105,7 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=_effective_gate_mode(quant_type, aq_dtype, wq_dtype),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
@@ -1210,6 +1215,35 @@ def _iter_legacy_cases():
                         act_type,
                         **_situv2_beta_kwargs(act_type),
                     ), extras
+
+
+def test_route_workspace_token_capacity():
+    cases = (
+        (1, 1),
+        (247, 256),
+        (256, 256),
+        (257, 512),
+        (32768, 32768),
+        (32769, 65536),
+        (65536, 65536),
+        (65537, 131072),
+        (117626, 131072),
+        (128332, 131072),
+        (131072, 131072),
+        (131073, 262144),
+    )
+    for token_num, expected_capacity in cases:
+        assert _route_workspace_token_capacity(token_num) == expected_capacity
+
+    for token_num in (0, -1):
+        try:
+            _route_workspace_token_capacity(token_num)
+        except ValueError as error:
+            assert "must be positive" in str(error)
+        else:
+            raise AssertionError(f"expected ValueError for token_num={token_num}")
+
+    aiter.logger.info("moe_2stage: route workspace capacity passed")
 
 
 def test_bm16_tiled_scale_boundary():
@@ -1406,6 +1440,7 @@ def _iter_with_env(case_iter, **env_overrides):
 
 
 _case_iters = []
+test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
