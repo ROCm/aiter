@@ -429,9 +429,10 @@ of the assignment below.
 **Assignees — added for you.** Where the repository variable
 `PR_ASSIGN_COMMITTERS` is set to `true`, a PR is assigned to everyone who has
 committed to it, most commits first, up to GitHub's cap of ten; only accounts
-with push access can be assigned at all. Taking yourself off is final — the
-automation never adds anyone back. Where that variable is unset, nothing is
-assigned.
+with push access can be assigned at all. A PR from a fork is assigned to its
+author only, since commit authorship there is unverified. Taking yourself off
+is final — the automation never adds anyone back. Where that variable is
+unset, nothing is assigned.
 
 **Type prefixes — added by you.** These are never touched by the automation;
 add whichever applies:

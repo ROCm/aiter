@@ -245,11 +245,14 @@ jobs:
             const commits = await github.paginate(github.rest.pulls.listCommits, {
               owner, repo, pull_number: pr.number, per_page: 100,
             });
+            // From a fork only the PR author counts: commit authorship is forgeable.
+            const fork = pr.head.repo?.id !== pr.base.repo.id;
             const weight = new Map();
             for (const c of commits) {
               const login = c.author?.login;
               if (!login) continue;
               if (c.author.type === 'Bot' || login.endsWith('[bot]')) continue;
+              if (fork && login !== pr.user.login) continue;
               weight.set(login, (weight.get(login) || 0) + 1);
             }
 
