@@ -143,7 +143,10 @@ def shuffle_weight(
     pad_k_to: int = 0,
 ) -> torch.Tensor:
     x_type = x.dtype
-    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+    is_packed_fp4 = (
+        hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2
+    )
+    if is_packed_fp4:
         x = x.view(torch.uint8)
 
     original_k = x.shape[-1]
@@ -179,7 +182,12 @@ def shuffle_weight(
         return x_
 
     IN, IK = layout
-    BK = IK * 2
+    # A packed FP4 byte already contains two logical K values. Its 16x16
+    # preshuffle tile is therefore IK bytes wide, not IK*2 bytes. Grouping two
+    # adjacent tiles was layout-equivalent for widths divisible by 32 bytes, but
+    # unnecessarily rejected valid 16-byte-aligned widths such as K=160
+    # (80 packed bytes), used by the FLAT 16x160 MoE kernel.
+    BK = IK if is_packed_fp4 else IK * 2
     K = 16 // x.element_size() if not use_int4 else 32
     BN = IN
     assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"

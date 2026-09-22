@@ -79,6 +79,25 @@ def parse_num_expert_activated():
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 
+def e8m0_shuffle_exact_experts(scale, E):
+    """``e8m0_shuffle`` a weight scale, trimmed back to an exact E multiple.
+
+    The shuffle pads the row count up to a multiple of 256. With a fused/shared
+    expert the expert count is odd (e.g. 513), so those pad rows leave the
+    buffer's numel a non-multiple of E and fused_moe's ``view(E, -1)`` fails.
+    The shuffle permutes within 32-row bands and preserves band order, so each
+    expert's rows stay contiguous and the pad rows can be dropped. This returns
+    a view, keeping the padded allocation alive so tile-granular reads past the
+    last real row still land in allocated memory.
+    """
+    shuffled = fp4_utils.e8m0_shuffle(scale)
+    rows = E * (scale.shape[0] // E)
+    keep = rows * shuffled.shape[1]
+    if shuffled.numel() == keep:
+        return shuffled
+    return shuffled.reshape(-1)[:keep].view(rows, shuffled.shape[1])
+
+
 @benchmark()
 def test_fmoe(
     dtype,
@@ -384,11 +403,11 @@ def test_fmoe(
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
-        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        w1_scale_aiter = e8m0_shuffle_exact_experts(w1_scale, E)
+        w2_scale_aiter = e8m0_shuffle_exact_experts(w2_scale, E)
     else:
-        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        w1_scale_aiter = e8m0_shuffle_exact_experts(w1_scale, E)
+        w2_scale_aiter = e8m0_shuffle_exact_experts(w2_scale, E)
 
     # # ######################## stage 1 start ###########
     stage1_ref_dtype = dtype
