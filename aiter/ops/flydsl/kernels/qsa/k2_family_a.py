@@ -606,15 +606,19 @@ def build_qsa_k2_family_a_module(
             m_new = [m_prev[i].maximumf(tile_max[i]) for i in range_constexpr(4)]
             alpha = [_exp2(m_prev[i] - m_new[i]) for i in range_constexpr(4)]
             p_sum = [Float32(0.0) for _ in range_constexpr(4)]
+            p_write = []
             for ng in range_constexpr(n_subtiles):
                 n = Int32(ng * 16) + lane_m
+                heads_p = []
                 for i in range_constexpr(4):
                     p = score_lives[ng].select(
                         _exp2(scores[ng][i] - m_new[i]), Float32(0.0)
                     )
                     p_sum[i] = p_sum[i] + p
-                    if wave == zero:
+                    heads_p.append(p)
+                    if const_expr(token_major_v) and wave == zero:
                         p_lds[heads[i], n] = p.to(BFloat16)
+                p_write.append(heads_p)
             if const_expr(use_k32):
                 p_sum = _token_row_reduce_sum_n(p_sum)
             else:
@@ -622,22 +626,47 @@ def build_qsa_k2_family_a_module(
             l_new = [l_prev[i] * alpha[i] + p_sum[i] for i in range_constexpr(4)]
             m4_out = fx.Vector.from_elements(m_new, Float32)
             l4_out = fx.Vector.from_elements(l_new, Float32)
-            if wave == zero and lane_m == zero:
-                for i in range_constexpr(4):
-                    m_lds[heads[i]] = m_new[i]
-                    l_lds[heads[i]] = l_new[i]
-                    alpha_lds[heads[i]] = alpha[i]
-            gpu.barrier()
-
-            alpha4 = fx.Vector.from_elements(
-                [
-                    alpha_lds[lane_kg * Int32(4)],
-                    alpha_lds[lane_kg * Int32(4) + one],
-                    alpha_lds[lane_kg * Int32(4) + Int32(2)],
-                    alpha_lds[lane_kg * Int32(4) + Int32(3)],
-                ],
-                Float32,
-            )
+            if const_expr(token_major_v):
+                if wave == zero and lane_m == zero:
+                    for i in range_constexpr(4):
+                        m_lds[heads[i]] = m_new[i]
+                        l_lds[heads[i]] = l_new[i]
+                        alpha_lds[heads[i]] = alpha[i]
+                gpu.barrier()
+                alpha4 = fx.Vector.from_elements(
+                    [
+                        alpha_lds[lane_kg * Int32(4)],
+                        alpha_lds[lane_kg * Int32(4) + one],
+                        alpha_lds[lane_kg * Int32(4) + Int32(2)],
+                        alpha_lds[lane_kg * Int32(4) + Int32(3)],
+                    ],
+                    Float32,
+                )
+            else:
+                if wave == zero and lane_m == zero:
+                    for i in range_constexpr(4):
+                        m_lds[heads[i]] = m_new[i]
+                        l_lds[heads[i]] = l_new[i]
+                src_base = _idiv(lane_m, Int32(4)) * Int32(16) + lane_kg * Int32(4)
+                i_sel = lane_m % Int32(4)
+                p_vecs_pf = []
+                for ng in range_constexpr(n_subtiles):
+                    tok_p = []
+                    for k in range_constexpr(4):
+                        src = src_base + Int32(k)
+                        e0 = gpu.shuffle_idx(p_write[ng][0], src, Int32(64))
+                        e1 = gpu.shuffle_idx(p_write[ng][1], src, Int32(64))
+                        e2 = gpu.shuffle_idx(p_write[ng][2], src, Int32(64))
+                        e3 = gpu.shuffle_idx(p_write[ng][3], src, Int32(64))
+                        picked = (i_sel == zero).select(
+                            e0,
+                            (i_sel == one).select(
+                                e1, (i_sel == Int32(2)).select(e2, e3)
+                            ),
+                        )
+                        tok_p.append(picked.to(BFloat16))
+                    p_vecs_pf.append(fx.Vector.from_elements(tok_p, BFloat16))
+                alpha4 = fx.Vector.from_elements(alpha, Float32)
             next_acc = []
             for c in range_constexpr(out_chunks):
                 d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
@@ -646,17 +675,20 @@ def build_qsa_k2_family_a_module(
                 v_ops = []
                 for ng in range_constexpr(n_subtiles):
                     n0 = Int32(ng * 16) + lane_kg * Int32(4)
-                    p_vecs.append(
-                        fx.Vector.from_elements(
-                            [
-                                p_lds[lane_m, n0],
-                                p_lds[lane_m, n0 + one],
-                                p_lds[lane_m, n0 + Int32(2)],
-                                p_lds[lane_m, n0 + Int32(3)],
-                            ],
-                            BFloat16,
+                    if const_expr(token_major_v):
+                        p_vecs.append(
+                            fx.Vector.from_elements(
+                                [
+                                    p_lds[lane_m, n0],
+                                    p_lds[lane_m, n0 + one],
+                                    p_lds[lane_m, n0 + Int32(2)],
+                                    p_lds[lane_m, n0 + Int32(3)],
+                                ],
+                                BFloat16,
+                            )
                         )
-                    )
+                    else:
+                        p_vecs.append(p_vecs_pf[ng])
                     if const_expr(use_k32):
                         d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
                         sB = fx.make_view(
@@ -688,6 +720,8 @@ def build_qsa_k2_family_a_module(
                 next_acc.append(acc4)
             results = yield next_acc + [m4_out, l4_out]
 
+        if const_expr(not token_major_v):
+            gpu.barrier()
         m_final = storage.m.view(fx.make_layout(_HEAD_PAD, 1))
         l_final = storage.l.view(fx.make_layout(_HEAD_PAD, 1))
         for i in range_constexpr(4):
