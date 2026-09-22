@@ -113,6 +113,7 @@ from aiter.ops.flydsl.conv_kernels import (
     _resolve_splitk,
 )
 from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import (
+    LDG_VEC,
     make_conv_geometry,
     make_launch_grid,
     make_output_scatter_plan,
@@ -126,7 +127,18 @@ from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import (
 )
 from aiter.ops.flydsl.kernels.conv3d_transpose import (
     TR_MAX_BIG_S,
+    TR_VEC,
     compile_transpose_ncdhw_ndhwc,
+)
+
+# Why parse_csv does not test the transpose's own c % TR_VEC == 0: every channel
+# count reaching it has been through _pad_channels, so it is a multiple of
+# LDG_VEC. That only implies the transpose's precondition while these two
+# independently declared widths stay compatible, which is what this checks --
+# otherwise the condition would go from redundant to missing without a word.
+assert LDG_VEC % TR_VEC == 0, (
+    f"channel padding rounds to a multiple of LDG_VEC={LDG_VEC}, which no longer "
+    f"guarantees the transpose's c % {TR_VEC} == 0; parse_csv has to test it again"
 )
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE]
@@ -335,9 +347,8 @@ def parse_csv(csv_path: str):
             # onto. Skipped where the op itself falls back to torch.permute.
             s = shape["D"] * shape["H"] * shape["W"]
             big = shape["N"] * c_padded * s > 0x7FFFFFFF
-            # The op's other precondition on this path, c % TR_VEC == 0, is
-            # against the caller's channel count; _pad_channels has already
-            # rounded this one up to a multiple of LDG_VEC, the same 8.
+            # The op's other precondition here, c % TR_VEC == 0, holds by
+            # construction; see the assert this module opens with.
             if not (big and s > TR_MAX_BIG_S):
                 tr_job = {
                     "kind": "transpose",
