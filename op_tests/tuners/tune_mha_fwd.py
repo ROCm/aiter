@@ -743,8 +743,8 @@ class MhaFwdTuner(TunerCommon):
         """Which catalogue the candidates come from.
 
         ``race`` names how the field is measured, not which field it is, so it
-        draws from the full catalogue. Keeping the two apart means the race is
-        never quietly handed a sampled grid and reported as a complete search.
+        draws from the full catalogue. Keeping the two apart stops a sampled
+        grid from being reported as a complete search.
         """
         strategy = getattr(self._args, "strategy", "exhaustive")
         return "exhaustive" if strategy == "race" else strategy
@@ -758,9 +758,8 @@ class MhaFwdTuner(TunerCommon):
     def _plan_candidates(self, untunedf, args):
         """Enumerate every candidate once, for whichever measurement follows.
 
-        Screening and racing need the same three things -- the candidate list,
-        the arguments that build the data, and the arguments that launch a
-        candidate on it -- so they are assembled here rather than twice.
+        Screening and racing need the same candidate list, data arguments and
+        launch arguments, so these are assembled once rather than twice.
         """
         all_infos = []
         task_by_info = {}
@@ -1053,21 +1052,15 @@ class MhaFwdTuner(TunerCommon):
     def _tune_by_race(self, args, untunedf, plans, all_infos):
         """Measure each shape as one interleaved elimination race.
 
-        Screening measures every candidate once, alone, in its own worker, so
-        a single contended measurement drops a candidate permanently and the
-        top eight have to be re-measured to undo that. A race does not have
-        that weakness: every survivor is measured in every block, paired
-        against the others, and leaving the field requires statistical proof
-        rather than one unlucky sample. The finalist rounds it replaces exist
-        only to patch the weakness, so they go with it.
+        Screening measures each candidate once, alone. One contended
+        measurement therefore drops a candidate for good, and the finalist
+        rounds exist only to undo that. A race measures every survivor in
+        every block, paired against the others, and leaving the field takes
+        statistical proof, so the finalist rounds go with it.
 
-        Nothing re-measures the winner afterwards. The one thing a
-        single-process race holds fixed is the tensor allocation, but a
-        process-wide effect moves every candidate together and so cannot
-        change their order; only an allocation-by-candidate interaction could,
-        and separating that from noise needs many fresh processes rather than
-        one. A single extra round is weaker evidence than the blocks it would
-        overrule.
+        Nothing re-measures the winner. A process-wide effect moves every
+        candidate together and cannot change their order, and one extra round
+        is weaker evidence than the blocks it would overrule.
         """
         results = []
         for plan in plans:
@@ -1077,10 +1070,9 @@ class MhaFwdTuner(TunerCommon):
     def _race_block_journal(self, key):
         """Per-block checkpoint for one shape, beside the candidate journal.
 
-        The candidate journal records finished candidate-phases; a race's unit
-        of durable progress is the finished block. The records cannot share a
-        file, but they share the ``--resume`` flag and the directory, so there
-        is still only one thing for an operator to know about.
+        The candidate journal records finished candidate-phases while a race's
+        unit of durable progress is the finished block, so they cannot share a
+        file. They do share the ``--resume`` flag and the directory.
         """
         if not self._journal_path:
             return None
@@ -1217,7 +1209,7 @@ class MhaFwdTuner(TunerCommon):
         """Turn one race into the result rows the rest of the tuner expects.
 
         Every raced candidate is reported with its race estimate, so the
-        numbers in the profile are all on the same footing.
+        profile's numbers are on the same footing.
         """
         results = [
             (info, float("inf"), err, status, detail)
@@ -1477,12 +1469,10 @@ class MhaFwdTuner(TunerCommon):
     def _standard_error_us(row) -> float:
         """Standard error of a candidate's finalist-round measurements.
 
-        The finalist rounds are the only repeated observation the run has, so
-        their scatter is what it knows about its own reproducibility. The
-        standard error rather than the range: the range of a sample grows as
-        samples are added, so a range-based threshold would make the run
-        harder to satisfy the more evidence it gathered. The standard error
-        shrinks as 1/sqrt(n), which makes --finalist-rounds the lever for
+        The finalist rounds are the run's only repeated observation, so their
+        scatter is what it knows about its own reproducibility. Standard error
+        rather than range, because a range widens as samples are added while
+        this shrinks as 1/sqrt(n), making --finalist-rounds the lever for
         resolving smaller improvements.
         """
         try:
@@ -1495,13 +1485,11 @@ class MhaFwdTuner(TunerCommon):
         return statistics.stdev(samples) / math.sqrt(len(samples))
 
     def _gate_against_incumbent(self, key, valid):
-        """Return the row to publish: the fastest candidate, unless it cannot
-        be told apart from the configuration already in use.
+        """The row to publish, keeping the incumbent when nothing beat it.
 
-        Publishing a winner that is inside measurement noise of the incumbent
-        buys nothing and risks shipping a regression that a contended sweep
-        happened to rank first. When the two cannot be separated the incumbent
-        is kept, which is the outcome that changes nothing.
+        Publishing a winner that sits inside measurement noise of the
+        incumbent buys nothing and risks shipping a regression a contended
+        sweep happened to rank first.
         """
         fastest = self._race_pick(key, valid)
         incumbents = self._incumbents_by_key.get(key, set())
@@ -1541,19 +1529,11 @@ class MhaFwdTuner(TunerCommon):
         return fastest
 
     def _indifference_threshold(self, challenger, incumbent) -> float:
-        """How much better a challenger has to be before it displaces the
-        configuration already in use.
+        """The relative margin a challenger must beat the incumbent by.
 
-        Under the race, delta. The race declares anything inside delta a
-        settled question and stops gathering evidence there, so applying a
-        standard-error test on top would let the gate promote a challenger the
-        measurement itself called a tie -- and because the standard error
-        shrinks as blocks accumulate, it would do so more eagerly the longer
-        the race ran. One definition of indistinguishable, used end to end.
-
-        Otherwise the screening path's two-sample separation at roughly 95%:
-        the gain has to clear twice the combined standard error of the two
-        candidates' round means.
+        Under ``--strategy race``, delta. Otherwise twice the combined
+        standard error of the two candidates' finalist rounds, as a fraction
+        of the incumbent's latency: a two-sample separation at roughly 95%.
         """
         args = getattr(self, "_args", None)
         if getattr(args, "strategy", "exhaustive") == "race":
@@ -1568,16 +1548,22 @@ class MhaFwdTuner(TunerCommon):
         )
 
     def _race_pick(self, key, valid):
-        """The candidate the race selected, rather than whichever sorted first.
+        """The row the race certified, or the fastest one if no race was run.
 
-        Sorting by latency would throw away the tie-break: inside the
-        indifference zone the fastest point estimate is the noisiest thing to
-        choose on, which is the whole reason the race picks by steadiness and
-        prefers the incumbent.
+        Screening ranks by latency, so there its fastest row is the pick. A
+        race ranks by steadiness and prefers the incumbent, so reading its
+        fastest row instead would discard that tie-break and can publish a
+        candidate the race eliminated.
         """
-        picked = self._race_winner_by_key.get(key)
-        if picked is None:
+        if key not in self._race_winner_by_key:
             return valid.iloc[0].copy()
+        picked = self._race_winner_by_key[key]
+        if picked is None:
+            raise RuntimeError(
+                f"the race for {key} certified no winner; publishing the "
+                "fastest point estimate would ship a candidate the race "
+                "never certified"
+            )
         match = valid[
             (valid["backend"] == picked[1])
             & (valid["num_splits"] == picked[2])
@@ -1594,9 +1580,8 @@ class MhaFwdTuner(TunerCommon):
     def _record_promotion(self, key, challenger, incumbent, margin, noise, decision):
         """Keep why each shape was or was not retuned, for the evidence file.
 
-        Without this a reader of the published table cannot tell a measured
-        improvement from a tie that happened to sort first, which is the
-        distinction the incumbent comparison exists to make.
+        Without it a reader of the published table cannot tell a measured
+        improvement from a tie that happened to sort first.
         """
         self._promotions.append(
             {
@@ -1624,16 +1609,12 @@ class MhaFwdTuner(TunerCommon):
     def _incumbent_candidates(self, row) -> list[MhaFwdCandidate]:
         """The tile dicts the dict-config kernels resolve for this shape today.
 
-        A tuning run that never measures the configuration already in use
-        cannot tell an improvement from a regression. Any gap in the candidate
-        catalogue, and any single contended measurement, then publishes a
-        result that is worse than shipping nothing. Measuring the incumbent in
-        the same sweep, on the same GPU, under the same conditions, turns that
-        guarantee from a policy into a comparison.
+        A run that never measures the configuration already in use cannot tell
+        an improvement from a regression, so the incumbent is measured in the
+        same sweep on the same GPU as its challengers.
 
-        This asks each kernel's own resolver what it would launch, so the
-        incumbent is whatever the shipped default actually is rather than a
-        value restated here.
+        Each kernel's own resolver is asked what it would launch, so this is
+        the shipped default rather than a value restated here.
         """
         import torch
 
