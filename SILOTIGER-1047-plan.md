@@ -693,7 +693,15 @@ to fold the P barrier.
 (and softmax) redundant `indices`/`page_table` loads. Oracle ``err=0``,
 but width-2051 ``L=512`` went to 24.1 / 23.8 / 608.9 us vs 24.3 /
 24.1 / 586.7; prefill paid for dropping the translate barrier. Keep
-phys/page/live LDS.
+phys/page/live LDS. A later replay on the retained K-pad kernel removed
+only `phys/page_off` LDS, kept one owner-written `live_lds` row, and
+delayed its wait to the post-QK barrier. With
+`ROCM_PATH=/root/.flydsl/toolkit`, it compiled and passed focused decode
+and prefill tests; the earlier `ld.lld` failure was environmental.
+Paired medians were 20.69 / 20.73 / 434.51 us vs baseline
+20.20 / 20.98 / 423.73 us at `M=1/8/512`. The 1.2% `M=8` gain misses
+the 3% gate while `M=1` and prefill regress, so cooperative
+`phys/page/live` LDS remains.
 
 **Do not retry** packing `phys/page_off/live/pad` into one
 `[BLOCK_N,4]` Int32 LDS row with one 128-bit vector store per

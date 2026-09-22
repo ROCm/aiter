@@ -220,9 +220,13 @@ Shared decode+prefill. ATT’s second-hottest FlyDSL barrier is
       128-bit vector store per translating column. Readers kept
       the same logical values and the translate barrier stayed.
 - [x] Fold or delay that barrier if the next reader still orders.
-      Skipped: the parent plan already keep-gate-lost per-thread
-      redundant page translation. The earlier untested replay was
-      only an environment failure, not evidence for reopening it.
+      **Reverted 2026-09-22 after an explicit retry:** every thread
+      redundantly loads `indices`/`page_table`, keeps `phys/page_off`
+      in registers, and only column owners publish `live_lds`; the
+      post-QK barrier makes `live_lds` visible to softmax. The earlier
+      `ld.lld` error was only the missing `ROCM_PATH`, not a codegen
+      failure. With that fixed, the variant compiled and passed both
+      focused tests, but regressed `M=1` and `M=512`.
 - [x] Keep-gate `M=1` first, then `M=8` / `M=512`.
 - [x] **Done when:** packed stores kept (≥3%) or reverted + note.
 
@@ -240,6 +244,20 @@ three metadata `ds_write_b32` instructions became one
 No row reaches the 3% keep gate, and M=1/prefill regress. Kernel
 restored to HEAD; no PMC/ATT follow-up for a reverted change.
 **Done. Next: phase 3.**
+
+The registers-only translate retry used the retained K-pad baseline.
+Focused decode+prefill pytest passed (`2 passed`) with `CACHE=0` and
+`ROCM_PATH=/root/.flydsl/toolkit`. Median of three paired
+`warmup=20`/`iters=100` runs:
+
+| M | K-pad baseline | registers-only translate | delta |
+|--:|--:|--:|--:|
+| 1 | 20.20 us | 20.69 us | +2.4% |
+| 8 | 20.98 us | 20.73 us | -1.2% |
+| 512 | 423.73 us | 434.51 us | +2.5% |
+
+No row improves by 3%; decode `M=1` and prefill regress. Kernel
+restored to the cooperative translate with three scalar LDS rows.
 
 ### 3. Overlap K/V `buffer_load` with LDS wait/barrier
 
@@ -381,6 +399,12 @@ The parent plan remains the full K2 list.
 - ATT `--att-gpu-index 0` under `HIP_VISIBLE_DEVICES=6`.
 - Reading `lld invocation failed` as a kernel-source bug. It is an
   environment fault in this container (see the `ROCM_PATH` lock).
+- Replicating `indices`/`page_table` loads across every chunk owner,
+  keeping `phys/page_off` in registers, and delaying the sole
+  `live_lds` publish wait to the post-QK barrier. It compiles with the
+  correct `ROCM_PATH` and passes the oracle, but M=1 / M=8 / M=512
+  measured 20.69 / 20.73 / 434.51 us vs paired baseline
+  20.20 / 20.98 / 423.73 us. Keep cooperative translation.
 - Packing `phys/page_off/live/pad` into one `[BLOCK_N,4]` Int32 LDS
   row with one 128-bit vector store. Correct and emitted
   `ds_write_b128`, but M=1 was flat, M=8 improved only 0.81%, and
