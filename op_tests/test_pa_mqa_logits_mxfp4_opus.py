@@ -13,8 +13,9 @@ build into, so the path under test is the path a caller gets, layout check inclu
 runs on BOTH targets: it builds the NATURAL (3-D) scale/cache layouts on gfx1250 and the
 MFMA-permuted (4-D) ones on gfx950 (``_is_permuted`` / ``_scale_to_opus`` below), while the
 dequantized reference reads the natural E8M0 either way. The kernel INSTANCES differ per arch --
-gfx1250 packs up to four query rows per tile, gfx950 runs one and names its instances by KV tile
-width -- and ``_variants()`` returns the right set. The two tile-cut probes
+gfx1250 packs up to four query rows per tile (``qlen4_kv64``, ``qlen1_kv64``), gfx950 runs one
+and adds a wider 256-token KV tile (``qlen1_kv64``, ``qlen1_kv256``) -- and ``_variants()``
+returns the right set. The two tile-cut probes
 (``assert_qshare_windows``, ``check_row_id_bound``) are gfx1250-only and gate on ``q_per_block``.
 
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py             # the full default sweep
@@ -410,9 +411,10 @@ def _qpb_max():
 
 
 def _resolve_variant(name):
-    """The perf decode sweep names gfx1250 instances. On an arch that did not compile that name
-    -- gfx950, whose instances are ``mfma_kv64`` / ``mfma_kv256`` -- fall back to its default
-    (``None``), so one shape list drives both targets without naming an arch."""
+    """The perf decode sweep names instances by the shared ``qlen{Q}_kv{K}`` convention. Both
+    arches compile ``qlen1_kv64``, so it resolves natively on each; a name the running arch did
+    NOT compile (gfx1250's ``qlen4_kv64`` on gfx950, or gfx950's ``qlen1_kv256`` on gfx1250)
+    falls back to its default (``None``), so one shape list drives both targets."""
     if name is None:
         return None
     return name if name in {v.name for v in _variants()} else None

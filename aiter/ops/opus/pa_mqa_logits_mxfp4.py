@@ -165,17 +165,19 @@ _VARIANTS = {
         MqaLogitsVariant("qlen1_kv64", q_per_block=1, block_k=64, cta_resident=3072),
     ),
     GFX950: (
-        # One row per CTA, one wave over a 64-token KV tile: the shipped default.
-        MqaLogitsVariant("mfma_kv64", q_per_block=1, block_k=64, cta_resident=1024),
+        # One row per CTA, one wave over a 64-token KV tile: the shipped default. Same
+        # (q_per_block, block_k) as gfx1250's `qlen1_kv64`, so it shares the name -- the arch is
+        # what the layout and the kernel body differ on, and the tables are keyed by it.
+        MqaLogitsVariant("qlen1_kv64", q_per_block=1, block_k=64, cta_resident=1024),
         # One row per CTA, four waves over a 256-token KV tile: pays off on long windows.
-        MqaLogitsVariant("mfma_kv256", q_per_block=1, block_k=256, cta_resident=512),
+        MqaLogitsVariant("qlen1_kv256", q_per_block=1, block_k=256, cta_resident=512),
     ),
 }
 
 # What a caller that passes no `variant` gets, per arch. NAMED and not positional, so adding an
 # instance to a list above cannot move it. A fixed default, deliberately, and not a rule over the
 # shape -- any such rule reads a mean over the batch, so a mixed forward misroutes part of it.
-_DEFAULT_VARIANT = {GFX1250: "qlen4_kv64", GFX950: "mfma_kv64"}
+_DEFAULT_VARIANT = {GFX1250: "qlen4_kv64", GFX950: "qlen1_kv64"}
 
 # Mirrors of the C++ constants. `_cta_info` is the ONLY place the buffer size is computed: the
 # builder's own scratch sits past the slots in the same buffer, so open-coding `num_ctas * 8`
