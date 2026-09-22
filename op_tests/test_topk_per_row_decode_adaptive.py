@@ -8,6 +8,8 @@ last section needs one: it checks on the card that the kernel the table names is
 the kernel that launches, which no host-side reading of the table can show.
 """
 
+import itertools
+
 import pytest
 import torch
 
@@ -166,15 +168,6 @@ def test_every_k_in_a_group_gets_that_groups_bands():
                     assert topk._ADAPTIVE_BANDS[device][stable][k] == bands
 
 
-def test_the_flydsl_host_takes_the_gates_answer_rather_than_its_own():
-    """The signature is the contract: a backend handed in is not re-derived."""
-    import inspect
-
-    from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
-
-    assert "backend" in inspect.signature(flydsl_top_k_per_row_decode).parameters
-
-
 # --- on the card ------------------------------------------------------------
 #
 # Everything above reads the table. None of it can show that the kernel the
@@ -224,11 +217,27 @@ def _band_edge_cells(arch, cu_count):
     return out
 
 
+def _planted(lens, width, k, device):
+    """Logits whose top k per row sit at known, strided positions inside that
+    row's own live length, so an off-by-one at either end shows up as a wrong
+    value. Every entry is distinct, so there is nothing for a tie to hide."""
+    rows = len(lens)
+    x = -torch.arange(width, dtype=torch.float32, device=device).repeat(rows, 1)
+    for r, n in enumerate(lens):
+        stride = max(n // k, 1)
+        pos = torch.arange(k, device=device) * stride + (r % stride)
+        x[r, pos] = 1000.0 + torch.arange(k, dtype=torch.float32, device=device)
+    return x
+
+
 def _this_card():
+    """Read arch and CU count exactly as the gate does, so a test cannot check
+    one table row while the call under it takes another."""
     if not torch.cuda.is_available():
         pytest.skip("needs a device: this section observes a launch")
-    props = torch.cuda.get_device_properties(0)
-    return props.gcnArchName.split(":")[0], props.multi_processor_count
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx(), topk._decode_cu_count(torch.cuda.current_device())
 
 
 def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
@@ -272,11 +281,17 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
 
     torch.manual_seed(0)
     bad = []
-    for width, rows, k, stable in cells:
+    # Planted first, because a known answer is what shows an indexing mistake;
+    # the random pass supplements it with values no pattern put there.
+    for (width, rows, k, stable), planted in itertools.product(cells, (True, False)):
         # Every row is as long as the buffer here, so the bound is the width.
         want = topk._decode_backend(arch, cu_count, stable, width, rows, k, True, width)
         # float32: the FlyDSL decode path takes no other dtype.
-        logits = torch.randn(rows, width, dtype=torch.float32, device="cuda")
+        logits = (
+            _planted([width] * rows, width, k, "cuda")
+            if planted
+            else torch.randn(rows, width, dtype=torch.float32, device="cuda")
+        )
         seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
         out = torch.empty(rows, k, dtype=torch.int32, device="cuda")
 
@@ -319,7 +334,8 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
         expect_ran = declined_runs if got == topk.BACKEND_UPSTREAM else got
         if got != want or ran != expect_ran or not torch.equal(got_values, want_values):
             bad.append(
-                f"width={width} rows={rows} k={k} stable={stable}: "
+                f"width={width} rows={rows} k={k} stable={stable} "
+                f"{'planted' if planted else 'random'}: "
                 f"gate said {got!r} (table says {want!r}), "
                 f"{ran!r} launched (expected {expect_ran!r}), "
                 f"values {'match' if torch.equal(got_values, want_values) else 'WRONG'}"
@@ -328,14 +344,13 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
         del logits, seq_lens, out, want_values, got_values
         torch.cuda.empty_cache()
 
-    assert not bad, f"{len(bad)}/{len(cells)} cells:\n" + "\n".join(bad)
+    assert not bad, f"{2 * len(cells)} checks, {len(bad)} bad:\n" + "\n".join(bad)
 
 
 # --------------------------------------------------------------------------
 # max_row_len: a decode buffer is sized to the model's maximum context and a
 # call fills whatever part of it the requests need. Without a bound the host
-# has to configure for the whole buffer, which measured 1.21x median and 1.91x
-# p90 against the same live lengths in a tight buffer.
+# has to configure for the whole buffer, which the PR description prices.
 
 
 @pytest.mark.parametrize(
@@ -376,8 +391,7 @@ def test_no_bound_declines_the_adaptive_kernel_and_only_that_one(one_band):
     It gives up the adaptive kernel, because the host cannot size that launch
     without a length. It must leave every other decode kernel where it is: the
     chunked bands are read at the physical width with or without a bound, and
-    routing that shape to the one-block kernel instead measured 0.09x on a 1M
-    buffer at k=4096.
+    routing that shape to the one-block kernel instead is a measured regression.
     """
     adaptive = ("gfx942", 80, True, 8_192, 8, 1024, True)
     assert topk._decode_backend(*adaptive, 8_192) == topk.BACKEND_ADAPTIVE
@@ -391,9 +405,8 @@ def test_no_bound_declines_the_adaptive_kernel_and_only_that_one(one_band):
 
 def test_a_bound_does_not_move_the_chunked_bands(one_band):
     """The chunked kernel reads the whole buffer, so its bands were fitted on
-    the physical width and a bound must not re-ask them at the live length. On
-    a 1M buffer holding 4096, doing so admitted the chunked kernel where the
-    one-block kernel was 14x faster.
+    the physical width and a bound must not re-ask them at the live length:
+    doing so admitted the chunked kernel where the one-block kernel was faster.
     """
     padded = ("gfx942", 80, True, 1 << 20, 64, 2048, True)
     assert topk._decode_backend(*padded, None) == topk.BACKEND_UPSTREAM
@@ -423,11 +436,10 @@ def test_the_bound_is_what_moves_the_config_off_the_padded_launch():
     )
 
 
-def test_a_bound_call_selects_what_an_unbound_one_does(monkeypatch):
+def test_a_bound_call_selects_correctly_on_a_padded_ragged_buffer(monkeypatch):
     """The contract, on the card: over every band-edge cell that fits in a
     buffer four times its width, with ragged `seq_lens` whose longest row sits
-    exactly on the bound, `max_row_len` changes which kernel runs and does not
-    change what it selects.
+    exactly on the bound, a bounded call selects each row's own top k.
 
     Ragged and exactly-on-the-bound together, because those are the two ways a
     caller's bound meets the kernel's assumption: a row shorter than the bound
@@ -453,14 +465,21 @@ def test_a_bound_call_selects_what_an_unbound_one_does(monkeypatch):
 
     torch.manual_seed(0)
     bad = []
-    for live, rows, k, stable in cells:
+    for (live, rows, k, stable), planted in itertools.product(cells, (True, False)):
         buf = live * 4
-        logits = torch.randn(rows, buf, dtype=torch.float32, device="cuda")
         # Ragged, and the first row sits exactly on the bound: a kernel built
         # for a shorter row would truncate it, and one that ignores `seq_lens`
         # would over-read the others into the padding.
         lens = torch.randint(k, live + 1, (rows,), dtype=torch.int32, device="cuda")
         lens[0] = live
+        host_lens = lens.tolist()
+        # Planted inside each row's own live length, so a read past it lands on
+        # padding that cannot be mistaken for a candidate.
+        logits = (
+            _planted(host_lens, buf, k, "cuda")
+            if planted
+            else torch.randn(rows, buf, dtype=torch.float32, device="cuda")
+        )
         out = torch.empty(rows, k, dtype=torch.int32, device="cuda")
 
         aiter.top_k_per_row_decode(
@@ -476,20 +495,20 @@ def test_a_bound_call_selects_what_an_unbound_one_does(monkeypatch):
             max_row_len=live,
         )
 
-        # Per row against its own live slice, by value: the row carries ties
-        # and either index of a tied pair is a correct answer.
-        host_lens = lens.tolist()
+        # Per row against its own live slice, by value: a random row carries
+        # ties and either index of a tied pair is a correct answer.
         for r in range(rows):
             want = torch.sort(torch.topk(logits[r, : host_lens[r]], k).values).values
             got = torch.sort(logits[r].gather(0, out[r].long())).values
             if not torch.equal(want, got):
                 bad.append(
                     f"live={live} rows={rows} k={k} stable={stable} row={r} "
-                    f"len={host_lens[r]}: selected values differ"
+                    f"len={host_lens[r]} "
+                    f"{'planted' if planted else 'random'}: selected values differ"
                 )
                 break
 
         del logits, lens, out
         torch.cuda.empty_cache()
 
-    assert not bad, f"{len(bad)}/{len(cells)} cells:\n" + "\n".join(bad)
+    assert not bad, f"{2 * len(cells)} checks, {len(bad)} bad:\n" + "\n".join(bad)

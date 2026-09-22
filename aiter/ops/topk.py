@@ -523,30 +523,21 @@ BACKEND_UPSTREAM = "upstream"
 BACKEND_CHUNKED = "chunked"
 BACKEND_ADAPTIVE = "adaptive"
 
-# Which shapes the adaptive kernel is the fastest of the four for, as
-# (minimum width, maximum width, minimum rows, maximum rows) per k and per emit,
-# all bounds inclusive and a maximum width of None meaning no upper bound. A row
-# minimum is not decoration: one row of a narrow buffer goes to the one-block HIP
-# kernel, which has no grid to fill there while this one pays for having a grid.
+# Which shapes the adaptive kernel is fastest for, as (minimum width, maximum
+# width, minimum rows, maximum rows) per k and per emit, bounds inclusive and a
+# maximum width of None meaning no upper bound. The row minimum is not
+# decoration: one row of a narrow buffer goes to the one-block HIP kernel, which
+# has no grid to fill while this one pays for having one.
 #
-# Keyed by CU count as well as arch, because one arch name spans several and the
-# grid the measurements were taken against is built from that count. Anything
-# outside this table -- another CU count, a k with no row, a width past the
-# widest measured -- keeps the chunked gate above, so an unmeasured shape is
-# unchanged rather than guessed at, and measuring another card is an entry here
-# and nothing else.
+# Keyed by CU count as well as arch: one arch name spans several, and the grid
+# these were measured against is built from that count. A pair the table does
+# not name keeps the chunked gate below, so an unmeasured shape is unchanged.
 #
-# Every edge is read off a sweep of the whole grid against all four decode
-# kernels, and a cell is only taken when both of these hold, which are different
-# questions asked of different baselines:
-#
-#   this kernel is no slower than the best of the four        (nothing regresses)
-#   and at least 1.05x faster than the kernel that runs today (the win is real)
-#
-# The second condition is why a cell that is merely 1.00x to 1.05x is declined:
-# that margin is not separable from run-to-run noise, so claiming it would be
-# claiming more than the measurement supports. The PR description holds the
-# per-cell scores.
+# A cell is taken only when this kernel is no slower than the best of the four
+# and at least 1.05x faster than what runs there today, on a full buffer and on
+# a padded one alike, which the gate cannot tell apart. Every entry assumes the
+# caller declares `max_row_len`; without it the config comes from the buffer and
+# these bands stop being safe. The PR description holds the per-cell scores.
 _ADAPTIVE_BANDS_BY_K_GROUP = {
     ("gfx942", 80): {
         True: {
@@ -558,8 +549,8 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
                 (524_288, 1_048_576, 1, 32),
             ),
             (512, 1024, 2048): (
-                (4_096, 8_192, 128, 512),
-                (16_384, 16_384, 64, 512),
+                (4_096, 4_096, 128, 512),
+                (8_192, 16_384, 64, 512),
                 (20_000, 20_000, 128, 512),
                 (65_536, 65_536, 1, 4),
                 (131_072, 262_144, 1, 16),
@@ -594,22 +585,6 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
             ),
         },
     },
-    # The two entries below are fitted on the diagonal *and* on the production
-    # slice (buffer 1048576, live length L), a cell needing to clear both
-    # conditions on each. The two entries above predate that and are fitted on
-    # the diagonal alone. The difference is not cosmetic: on 304 CU a
-    # diagonal-only fit admits 18 cells that lose at the live length, worst
-    # 0.84x, while the two-slice fit admits 288 and loses none. The older pair
-    # happen to be clean under either method; they are not refitted here only
-    # because that would change cards that already work.
-    #
-    # All four entries assume the caller declares `max_row_len`. A decode caller
-    # that allocates a 1048576 buffer and leaves it undeclared gets the config
-    # built from the buffer instead of the live length, and then these bands
-    # admit cells that lose badly: 98 of 315 on 228 CU, worst 0.18x. The two
-    # older entries are no safer there -- 157 of 366 on 80 CU, worst 0.26x --
-    # so this is the padding defect the parameter exists to close, not a
-    # property of the newer fit.
     ("gfx942", 228): {
         True: {
             (256,): (
@@ -707,36 +682,30 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
                 (262_144, 1_048_576, 1, 64),
             ),
             (512, 1024, 2048): (
-                (131_072, 131_072, 1, 16),
-                (262_144, 262_144, 1, 8),
-                (524_288, 1_048_576, 1, 64),
+                (131_072, 131_072, 1, 32),
+                (262_144, 1_048_576, 1, 64),
             ),
             (4096,): (
                 (32_768, 32_768, 1, 16),
                 (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 16),
-                (262_144, 262_144, 32, 512),
-                (524_288, 1_048_576, 1, 512),
+                (131_072, 131_072, 1, 128),
+                (262_144, 1_048_576, 1, 512),
             ),
         },
         False: {
             (256,): (
-                (4_096, 4_096, 512, 512),
                 (65_536, 65_536, 1, 2),
-                (131_072, 131_072, 1, 32),
+                (131_072, 131_072, 1, 16),
                 (262_144, 1_048_576, 1, 64),
             ),
             (512, 1024, 2048): (
-                (4_096, 4_096, 512, 512),
                 (65_536, 65_536, 1, 8),
-                (131_072, 262_144, 1, 16),
-                (524_288, 1_048_576, 1, 64),
+                (131_072, 131_072, 1, 32),
+                (262_144, 1_048_576, 1, 64),
             ),
             (4096,): (
-                (32_768, 32_768, 1, 1),
                 (65_536, 65_536, 1, 32),
-                (131_072, 262_144, 1, 16),
-                (524_288, 1_048_576, 1, 64),
+                (131_072, 1_048_576, 1, 64),
             ),
         },
     },
@@ -827,8 +796,8 @@ def decode_adaptive_width(width: int, max_row_len: int) -> int:
     It is required here: `None` reaching this function is a bug, because the gate
     declines the adaptive path outright when the caller states no bound (see
     `decode_backend_for_call`). Configuring from the physical width instead --
-    what a `None` fallback would do -- was measured to send 157 of 366 admitted
-    MI308X shapes backwards, so it is not offered.
+    what a `None` fallback would do -- was measured to send a third of the
+    admitted MI308X shapes backwards, so it is not offered.
     """
     if max_row_len is None:
         raise ValueError(
@@ -877,8 +846,8 @@ def decode_backend_for_call(
         values is None,
         # No bound means the host cannot size the adaptive config, and the only
         # value it could fall back to -- the physical width -- ships a measured
-        # regression (157 of 366 admitted MI308X shapes). Decline it; the chunked
-        # bands above still see the width, so the call lands where it does today.
+        # regression. Decline it; the chunked bands above still see the width,
+        # so the call lands where it does today.
         None if max_row_len is None else decode_adaptive_width(width, max_row_len),
     )
     if backend == BACKEND_UPSTREAM:
