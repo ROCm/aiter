@@ -196,6 +196,20 @@ def _full_rows(rows: int, width: int, device: torch.device) -> torch.Tensor:
 
 
 @lru_cache(maxsize=8)
+def _zero_rows(rows: int, device: torch.device) -> torch.Tensor:
+    """The default `begin`: every row starting at column 0.
+
+    The `_full_rows` argument applied to the other end of the range. `sampled`
+    is the only backend that takes a start per row, and it built this per call
+    until it was measured: two fill launches for a pair of constants, worth 8.1us
+    at 4096 rows and a fifth of the whole call at 64. Calling the kernel directly
+    rather than through this entry measured 1.20x at m=64 n=524288 and 1.13x at
+    m=64 n=1048576, and this pair is that gap.
+    """
+    return torch.zeros(rows, dtype=torch.int32, device=device)
+
+
+@lru_cache(maxsize=8)
 def _no_range(device: torch.device) -> torch.Tensor:
     """`plain`'s "no per-row range given" sentinel."""
     return torch.empty(0, dtype=torch.int32, device=device)
@@ -771,14 +785,16 @@ def _dispatch(
         # The kernel takes a [start, end) pair per row, both int32, and emits
         # indices only -- `topk_select` gathers the values itself further down,
         # so `values=None` here rather than scratch nobody reads.
-        starts = torch.zeros(rows, dtype=torch.int32, device=input.device)
-        ends = (
-            row_lens.to(torch.int32)
-            if ragged
-            else torch.full(
-                (rows,), input.shape[1], dtype=torch.int32, device=input.device
-            )
-        )
+        #
+        # Neither end of that pair is built here any more. `row_lens` already IS
+        # the per-row end -- `_full_rows` when the caller gave no `end`, the
+        # caller's own tensor otherwise -- and the entry has already refused
+        # anything that is not int32 `[rows]`, so the old `.to(torch.int32)` was
+        # a no-op and the `torch.full` beside it rebuilt, every call, the tensor
+        # `_full_rows` was cached to avoid. The starts are the same constant at
+        # the other end of the range.
+        starts = _zero_rows(rows, input.device)
+        ends = row_lens
         top_k_per_row_prefill_sampled(
             input,
             starts,
