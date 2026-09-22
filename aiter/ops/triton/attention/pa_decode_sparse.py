@@ -150,8 +150,14 @@ def pa_decode_sparse(
             ``kv_splits == 1`` (the single-CTA path already produces the final
             ``out`` directly). Useful for profiling the main kernel in
             isolation and for callers that fold the reduce into a downstream op.
-        extra_cache/extra_indices/extra_indptr: gfx950 packed-only — the SWA+top-k
-            two-loop's second (top-k) cache + index set; must be None otherwise.
+        extra_cache/extra_indices/extra_indptr: a second cache and ragged index
+            set attended over in the same pass. vLLM's decode splits its keys
+            this way and these follow its naming: the FIRST (positional) cache
+            is its ``main_cache`` = ``swa_k_cache``, the sliding-window keys,
+            and this one is its ``extra_cache`` = ``kv_cache``, the compressed
+            keys the sparse top-k selects. The two hold the identical record.
+            Supported on the gfx950 packed path and on the gfx1250 vLLM
+            ``fp8_ds_mla`` path; must be None otherwise.
         unified_kv_rope: gfx1250-only — ``[total_pages, 64]`` bf16 RoPE plane.
             Supplying it selects the DSv4 "2buff" packed-fp8 path, in which
             ``unified_kv`` is the ``[total_pages, 512]`` fp8 pool laid out
@@ -234,6 +240,9 @@ def pa_decode_sparse(
             has_invalid=has_invalid,
             skip_reduce=skip_reduce,
             out=out,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+            extra_indptr=extra_indptr,
         )
 
     v4_2buff = unified_kv_rope is not None
@@ -307,7 +316,10 @@ def pa_decode_sparse(
 
     assert (
         extra_cache is None and extra_indices is None and extra_indptr is None
-    ), "extra_cache/extra_indices/extra_indptr are gfx950 packed-only"
+    ), (
+        "extra_cache/extra_indices/extra_indptr need the gfx950 packed path or "
+        "the gfx1250 fp8_ds_mla path"
+    )
 
     quant_kv = kv_scales is not None
     if quant_kv:
@@ -531,6 +543,7 @@ def pa_decode_sparse(
         acc_partial,
         attn_sink,
         kv_indptr,
+        kv_indptr,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -552,6 +565,7 @@ def pa_decode_sparse(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
+        HAS_EXTRA=False,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
@@ -1130,6 +1144,7 @@ def _pa_decode_sparse_v4_2buff(
         acc_partial,
         attn_sink,
         kv_indptr,
+        kv_indptr,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -1151,15 +1166,72 @@ def _pa_decode_sparse_v4_2buff(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
+        HAS_EXTRA=False,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
     return out
+
+
+def _v4_cache_geometry(cache: torch.Tensor, name: str):
+    """Validate one fp8_ds_mla paged cache and derive what the kernel needs.
+
+    Returns ``(nb, block_size, rows_data, rows_sc, blk_units_data,
+    blk_units_sc, contiguous_blocks)``. Both KV streams are the identical
+    record, so main and extra go through this unchanged.
+    """
+    if cache.dim() != 3:
+        raise RuntimeError(
+            f"{name} must be [nb, block_size, {_V4_REC_BYTES}] uint8, got "
+            f"{tuple(cache.shape)}"
+        )
+    nb, block_size, rec = cache.shape
+    if rec != _V4_REC_BYTES:
+        raise RuntimeError(
+            f"{name} records are {rec} B, expected {_V4_REC_BYTES} "
+            f"(448 fp8 NoPE | 128 B bf16 RoPE | 8 B UE8M0)"
+        )
+    if cache.dtype not in _V4_PACKED_FP8_DTYPES:
+        raise RuntimeError(f"{name} must be uint8/e4m3 bytes, got {cache.dtype}")
+    # Only the LAST TWO dims must be packed: a vLLM cache is a view into a
+    # shared allocation, so its block stride is larger than the block's own
+    # content -- shape (81887, 64, 584) with stride (1435968, 584, 1). That
+    # stride is passed to the kernel rather than assumed.
+    if cache.stride(2) != 1 or cache.stride(1) != rec:
+        raise RuntimeError(
+            f"{name} rows must be packed: expected stride (.., "
+            f"{rec}, 1), got {tuple(cache.stride())}"
+        )
+    # gcd(bs*584, 576) = 64 and gcd(bs*584, 8) = 8 make the descriptors'
+    # row indices integral; both need block_size divisible by 8.
+    if block_size % 8:
+        raise RuntimeError(
+            f"{name} block_size must be a multiple of 8 for the unit-strided "
+            f"descriptors, got {block_size}"
+        )
+    blk_stride = cache.stride(0)
+    if blk_stride % _V4_DATA_UNIT or blk_stride % _V4_SC_UNIT:
+        raise RuntimeError(
+            f"{name} block stride {blk_stride} B must be a multiple of "
+            f"{_V4_DATA_UNIT} and {_V4_SC_UNIT} for the unit-strided descriptors"
+        )
+    total_bytes = (nb - 1) * blk_stride + block_size * _V4_REC_BYTES
+    return (
+        nb,
+        block_size,
+        total_bytes // _V4_DATA_UNIT,
+        total_bytes // _V4_SC_UNIT,
+        blk_stride // _V4_DATA_UNIT,
+        blk_stride // _V4_SC_UNIT,
+        blk_stride == block_size * _V4_REC_BYTES,
+    )
+
+
 def _pa_decode_sparse_v4(
     q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
+    main_cache: torch.Tensor,
+    main_indices: torch.Tensor,
+    main_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
     q_rope: torch.Tensor | None = None,
@@ -1172,18 +1244,33 @@ def _pa_decode_sparse_v4(
     has_invalid: bool = True,
     skip_reduce: bool = False,
     out: torch.Tensor | None = None,
+    extra_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_indptr: torch.Tensor | None = None,
 ):
     """gfx1250 driver for the DSv4 unified paged cache (vLLM ``fp8_ds_mla``).
 
     The cache vLLM allocates for DeepSeek-V4, handed over with no repack:
 
-      kv_cache  [nb, block_size, 584] uint8, per block of block_size tokens
+      main_cache  [nb, block_size, 584] uint8, per block of block_size tokens
         [0,      bs*576)         448 B fp8 NoPE | 128 B bf16 RoPE, per token
         [bs*576, bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad, per token
-      q         [N, H, 512] fp8 packed    q_rope [N, H, 64] bf16
+      q           [N, H, 512] fp8 packed    q_rope [N, H, 64] bf16
 
-    ``kv_indices`` are GLOBAL slot ids (block * block_size + position), which is
-    what the sparse top-k produces; the kernel gathers exactly those rows.
+    ``main_indices`` are GLOBAL slot ids (block * block_size + position) --
+    what both the sliding window and the sparse top-k produce; the kernel
+    gathers exactly those rows.
+
+    A SECOND stream may be attended over in the same pass by passing
+    ``extra_cache`` with its own ``extra_indices`` / ``extra_indptr``. vLLM's
+    decode needs this, and the naming is its own:
+
+      main_cache  = ``swa_k_cache``, the sliding-window keys
+      extra_cache = ``kv_cache``, the compressed keys the sparse top-k selects
+
+    They are two separate allocations holding the identical record, and may
+    differ in paged block size and in block stride. Both are attended in one
+    pass, so the softmax is over their union.
 
     This is the format for a stock vLLM deployment. ``_pa_decode_sparse_v4_2buff``
     is the ATOM/asm two-buffer pool; same math, different packing.
@@ -1198,27 +1285,40 @@ def _pa_decode_sparse_v4(
         raise RuntimeError(
             "kv_scales must be None: the UE8M0 group scales are inside the cache"
         )
-    if kv_cache.dim() != 3:
-        raise RuntimeError(
-            f"kv_cache must be [nb, block_size, {_V4_REC_BYTES}] uint8, got "
-            f"{tuple(kv_cache.shape)}"
+    (
+        nb,
+        main_block_size,
+        main_rows_data,
+        main_rows_sc,
+        main_blk_units_data,
+        main_blk_units_sc,
+        main_contig_blocks,
+    ) = _v4_cache_geometry(main_cache, "main_cache")
+
+    has_extra = extra_cache is not None
+    if has_extra:
+        if extra_indices is None or extra_indptr is None:
+            raise RuntimeError(
+                "extra_cache needs extra_indices and extra_indptr alongside it"
+            )
+        (
+            _,
+            extra_block_size,
+            extra_rows_data,
+            extra_rows_sc,
+            extra_blk_units_data,
+            extra_blk_units_sc,
+            extra_contig_blocks,
+        ) = _v4_cache_geometry(extra_cache, "extra_cache")
+        assert extra_indices.dtype == torch.int32 and extra_indices.is_contiguous()
+        assert extra_indptr.dtype == torch.int32 and extra_indptr.is_contiguous()
+        assert extra_indptr.shape == main_indptr.shape, (
+            f"extra_indptr {tuple(extra_indptr.shape)} must match main_indptr "
+            f"{tuple(main_indptr.shape)}: both are per-token offsets"
         )
-    nb, block_size, rec = kv_cache.shape
-    if rec != _V4_REC_BYTES:
+    elif extra_indices is not None or extra_indptr is not None:
         raise RuntimeError(
-            f"kv_cache records are {rec} B, expected {_V4_REC_BYTES} "
-            f"(448 fp8 NoPE | 128 B bf16 RoPE | 8 B UE8M0)"
-        )
-    if kv_cache.dtype not in _V4_PACKED_FP8_DTYPES:
-        raise RuntimeError(f"kv_cache must be uint8/e4m3 bytes, got {kv_cache.dtype}")
-    if not kv_cache.is_contiguous():
-        raise RuntimeError("kv_cache must be contiguous")
-    # gcd(bs*584, 576) = 64 and gcd(bs*584, 8) = 8 make the descriptors'
-    # row indices integral; both need block_size divisible by 8.
-    if block_size % 8:
-        raise RuntimeError(
-            f"block_size must be a multiple of 8 for the unit-strided "
-            f"descriptors, got {block_size}"
+            "extra_indices/extra_indptr were given without an extra_cache"
         )
 
     if q_rope is None:
@@ -1231,12 +1331,12 @@ def _pa_decode_sparse_v4(
     assert q_rope.shape == (T, H, _V4_DIM_ROPE) and q_rope.dtype == torch.bfloat16
     assert q_rope.is_contiguous()
 
-    assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
-    assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
+    assert main_indices.dtype == torch.int32 and main_indices.is_contiguous()
+    assert main_indptr.dtype == torch.int32 and main_indptr.is_contiguous()
 
     _LOGGER.info(
-        f"PA_DECODE_SPARSE_V4 T={T} H={H} D={D} bs={block_size} "
-        f"total_indices={kv_indices.shape[0]}"
+        f"PA_DECODE_SPARSE_V4 T={T} H={H} D={D} bs={main_block_size} "
+        f"total_indices={main_indices.shape[0]}"
     )
 
     out = _check_out(out, q, torch.bfloat16)
@@ -1245,14 +1345,27 @@ def _pa_decode_sparse_v4(
     # inside the rows, and an fp8-typed tile would reinterpret them as e4m3
     # (byte 0x7F == scale 2^0 is an e4m3 NaN). The NoPE bytes are bitcast back
     # to e4m3 in-kernel.
-    kv_u8 = kv_cache.view(torch.uint8).reshape(-1)
+    # reshape(-1) would copy a non-contiguous cache; the descriptors only need
+    # the base pointer, and a dtype view keeps it because the last dim is packed.
+    main_u8 = main_cache.view(torch.uint8)
     # Three views of the same bytes: the descriptors differ only in base offset,
     # element type and the unit their row index counts in.
-    kv_e4m3 = kv_u8.view(torch.float8_e4m3fn)
-    kv_bf16 = kv_u8.view(torch.bfloat16)
-    total_bytes = nb * block_size * _V4_REC_BYTES
-    kv_rows_data = total_bytes // _V4_DATA_UNIT
-    kv_rows_sc = total_bytes // _V4_SC_UNIT
+    main_e4m3 = main_u8.view(torch.float8_e4m3fn)
+    main_bf16 = main_u8.view(torch.bfloat16)
+    if has_extra:
+        extra_u8 = extra_cache.view(torch.uint8)
+        extra_e4m3 = extra_u8.view(torch.float8_e4m3fn)
+        extra_bf16 = extra_u8.view(torch.bfloat16)
+    else:
+        # The kernel's extra arguments are dead under HAS_EXTRA=False, but they
+        # still have to typecheck, so they take the main stream's.
+        extra_u8, extra_e4m3, extra_bf16 = main_u8, main_e4m3, main_bf16
+        extra_indices, extra_indptr = main_indices, main_indptr
+        extra_block_size = main_block_size
+        extra_rows_data, extra_rows_sc = main_rows_data, main_rows_sc
+        extra_blk_units_data = main_blk_units_data
+        extra_blk_units_sc = main_blk_units_sc
+        extra_contig_blocks = main_contig_blocks
     q_u8 = q.view(torch.uint8)
 
     # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
@@ -1326,7 +1439,9 @@ def _pa_decode_sparse_v4(
     USE_EXP2 = True
 
     if kv_splits is None:
-        max_kv_len = kv_indices.shape[0]
+        max_kv_len = main_indices.shape[0]
+        if has_extra:
+            max_kv_len += extra_indices.shape[0]
         max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
@@ -1361,23 +1476,34 @@ def _pa_decode_sparse_v4(
         q,
         q_u8,
         q_rope,
-        kv_u8,
-        kv_e4m3,
-        kv_bf16,
-        kv_indices,
-        kv_indptr,
+        main_u8,
+        main_e4m3,
+        main_bf16,
+        main_indices,
+        main_indptr,
+        extra_u8,
+        extra_e4m3,
+        extra_bf16,
+        extra_indices,
+        extra_indptr,
         m_partial,
         l_partial,
         acc_partial,
         attn_sink,
         out,
-        nb * block_size,
+        nb * main_block_size,
         q.stride(0),
         q.stride(1),
         q_rope.stride(0),
         q_rope.stride(1),
-        kv_rows_data,
-        kv_rows_sc,
+        main_rows_data,
+        main_rows_sc,
+        main_blk_units_data,
+        main_blk_units_sc,
+        extra_rows_data,
+        extra_rows_sc,
+        extra_blk_units_data,
+        extra_blk_units_sc,
         mp_strides[0],
         mp_strides[1],
         mp_strides[2],
@@ -1401,12 +1527,16 @@ def _pa_decode_sparse_v4(
         NOPE_DIM=_V4_DIM_NOPE,
         ROPE_DIM=_V4_DIM_ROPE,
         GROUP_SIZE=_FP8_GROUP_SIZE,
-        BLOCK_SIZE=block_size,
+        MAIN_BLOCK_SIZE=main_block_size,
+        EXTRA_BLOCK_SIZE=extra_block_size,
         Q_IN_VGPR=(attn_num_warps <= 4),
         HAS_INVALID=bool(has_invalid),
         Q_TDM=bool(q_tdm),
         USE_EXP2=USE_EXP2,
         CTAS_H=ctas_h,
+        MAIN_CONTIG_BLOCKS=main_contig_blocks,
+        EXTRA_CONTIG_BLOCKS=extra_contig_blocks,
+        HAS_EXTRA=has_extra,
         num_warps=attn_num_warps,
         num_stages=2,
         waves_per_eu=waves_per_eu,
@@ -1426,7 +1556,8 @@ def _pa_decode_sparse_v4(
         l_partial,
         acc_partial,
         attn_sink,
-        kv_indptr,
+        main_indptr,
+        extra_indptr,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -1448,6 +1579,7 @@ def _pa_decode_sparse_v4(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
+        HAS_EXTRA=has_extra,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )

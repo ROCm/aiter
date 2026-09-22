@@ -561,6 +561,7 @@ def _pa_decode_sparse_reduce(
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32 — used to derive per-token kv_len
+    extra_indptr_ptr,  # [N+1] int32 — the extra stream's, when HAS_EXTRA
     out_ptr,  # [N, H, D]
     mp_stride_t: gl.constexpr,
     mp_stride_k: gl.constexpr,
@@ -582,6 +583,7 @@ def _pa_decode_sparse_reduce(
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
     USE_EXP2: gl.constexpr,
+    HAS_EXTRA: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     """Gluon reduce for pa_decode_sparse: combine KV_SPLITS partials, fold in
@@ -671,9 +673,19 @@ def _pa_decode_sparse_reduce(
     # Scrub stale segments (TDM bulk-loads the full slab including segments
     # that the split kernel early-returned on — uninit garbage * 0 == NaN).
     offs_k = gl.arange(0, KV_SPLITS, layout=gl.SliceLayout(1, L_KH))
+    # Counted in TILES, which is the same split as before -- cdiv(cdiv(L,
+    # BLOCK_K), KV_SPLITS) == cdiv(L, KV_SPLITS*BLOCK_K) -- but lets the extra
+    # stream's tiles join the total, exactly as the main kernel counts them.
     kv_len = kv_end - kv_start
-    tiles_per_segment = gl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-    act_num_segments = gl.cdiv(kv_len, tiles_per_segment * BLOCK_K)
+    num_tiles = gl.cdiv(kv_len, BLOCK_K)
+    if HAS_EXTRA:
+        extra_start = gl.load(extra_indptr_ptr + t)
+        extra_end = gl.load(extra_indptr_ptr + t + 1)
+        num_tiles += gl.cdiv(extra_end - extra_start, BLOCK_K)
+    tiles_per_segment = gl.cdiv(num_tiles, KV_SPLITS)
+    # maximum() only guards a token with no keys at all, which the caller is
+    # free to hand us: every segment is then inactive and the output is zero.
+    act_num_segments = gl.cdiv(num_tiles, gl.maximum(tiles_per_segment, 1))
     seg_active = offs_k[:, None] < act_num_segments
     neg_inf = gl.full([KV_SPLITS, BLOCK_H], float("-inf"), gl.float32, layout=L_KH)
     zero_kh = gl.full([KV_SPLITS, BLOCK_H], 0.0, gl.float32, layout=L_KH)
@@ -1986,6 +1998,193 @@ def _v4_expand_scales(
     out_smem.store(gl.reshape(e3, [BLOCK_K, 2 * SC_RAW]))
 
 
+# --------------------------------------------------------------------------- #
+# Two KV streams
+# --------------------------------------------------------------------------- #
+# vLLM attends over two paged caches per token, and the names here are its own
+# (`rocm_sparse_attn_decode`, `_sparse_attn_decode_gfx950_partial_kernel`):
+#
+#     main  = swa_k_cache : the sliding-window keys
+#     extra = kv_cache    : the compressed keys the sparse top-k selects
+#
+# Note which way round that is -- HAS_EXTRA is the TOP-K stream, not the SWA
+# one, and the tensor vLLM calls `kv_cache` is the one we take as extra.
+#
+# The two hold the IDENTICAL fp8_ds_mla record, so only the base pointer, the
+# paged block size and the cache's block stride differ, and one pipeline walks
+# both. The kernel requires only that a tile never straddles the boundary,
+# which holds because each stream's tile count is rounded up on its own.
+
+
+@gluon.jit
+def _v4_slot_rows(
+    safe_slot,
+    is_main,
+    main_blk_units_data,
+    main_blk_units_sc,
+    extra_blk_units_data,
+    extra_blk_units_sc,
+    MAIN_BLOCK_SIZE: gl.constexpr,
+    EXTRA_BLOCK_SIZE: gl.constexpr,
+    DATA_ROW_UNITS: gl.constexpr,
+    MAIN_SC_BASE_UNITS: gl.constexpr,
+    EXTRA_SC_BASE_UNITS: gl.constexpr,
+    MAIN_DATA_BLK_UNITS: gl.constexpr,
+    MAIN_SC_BLK_UNITS: gl.constexpr,
+    EXTRA_DATA_BLK_UNITS: gl.constexpr,
+    EXTRA_SC_BLK_UNITS: gl.constexpr,
+    MAIN_CONTIG_BLOCKS: gl.constexpr,
+    EXTRA_CONTIG_BLOCKS: gl.constexpr,
+    HAS_EXTRA: gl.constexpr,
+):
+    """A global slot -> its (data row, scale row), in the descriptors' units.
+
+    Both streams' forms are computed and then selected, rather than branched on:
+    the paged block size is a power of two, so each form is a shift and a mask,
+    and keeping the select here leaves the TDM ops as the only thing inside the
+    runtime branch.
+    """
+    blk = safe_slot // MAIN_BLOCK_SIZE
+    pos = safe_slot % MAIN_BLOCK_SIZE
+    if MAIN_CONTIG_BLOCKS:
+        data_row = blk * MAIN_DATA_BLK_UNITS + pos * DATA_ROW_UNITS
+        sc_row = blk * MAIN_SC_BLK_UNITS + MAIN_SC_BASE_UNITS + pos
+    else:
+        data_row = blk * main_blk_units_data + pos * DATA_ROW_UNITS
+        sc_row = blk * main_blk_units_sc + MAIN_SC_BASE_UNITS + pos
+    if HAS_EXTRA:
+        x_blk = safe_slot // EXTRA_BLOCK_SIZE
+        x_pos = safe_slot % EXTRA_BLOCK_SIZE
+        if EXTRA_CONTIG_BLOCKS:
+            x_data_row = x_blk * EXTRA_DATA_BLK_UNITS + x_pos * DATA_ROW_UNITS
+            x_sc_row = x_blk * EXTRA_SC_BLK_UNITS + EXTRA_SC_BASE_UNITS + x_pos
+        else:
+            x_data_row = x_blk * extra_blk_units_data + x_pos * DATA_ROW_UNITS
+            x_sc_row = x_blk * extra_blk_units_sc + EXTRA_SC_BASE_UNITS + x_pos
+        data_row = gl.where(is_main, data_row, x_data_row)
+        sc_row = gl.where(is_main, sc_row, x_sc_row)
+    return data_row, sc_row
+
+
+@gluon.jit
+def _v4_gather_tile(
+    kv_desc,
+    rope_desc,
+    mxs_desc,
+    main_e4m3_ptr,
+    main_bf16_ptr,
+    main_u8_ptr,
+    extra_e4m3_ptr,
+    extra_bf16_ptr,
+    extra_u8_ptr,
+    main_rows_data,
+    main_rows_sc,
+    extra_rows_data,
+    extra_rows_sc,
+    data_row,
+    sc_row,
+    is_main,
+    kv_buf,
+    rope_buf,
+    sc_buf,
+    kv_packed_shared: gl.constexpr,
+    rope_shared: gl.constexpr,
+    mxs_shared: gl.constexpr,
+    NOPE_DIM: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
+    SC_RAW: gl.constexpr,
+    DATA_UNIT: gl.constexpr,
+    SC_UNIT: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_D: gl.constexpr,
+    HAS_EXTRA: gl.constexpr,
+):
+    """Gather one tile's NoPE / RoPE / scale rows from the stream that owns it.
+
+    The stream is chosen by selecting the descriptor's base pointer and row
+    bound, NOT by branching around the DMA. An earlier cut did branch, and the
+    tiles that took the else side came back partly garbage: the loop maintains
+    an explicit "exactly 4 TDM ops outstanding" invariant by hand, and an op
+    inside an scf.if does not survive it. Here the three async_gathers sit in
+    straight-line code exactly where the one-stream kernel had them.
+
+    Every descriptor field but the base and the row bound is identical between
+    the streams, because they hold the identical record.
+    """
+    if HAS_EXTRA:
+        rows_data = gl.where(is_main, main_rows_data, extra_rows_data)
+        rows_sc = gl.where(is_main, main_rows_sc, extra_rows_sc)
+        tile_kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=gl.where(is_main, main_e4m3_ptr, extra_e4m3_ptr),
+            shape=[rows_data, NOPE_DIM],
+            strides=[DATA_UNIT, 1],
+            block_shape=[BLOCK_K, BLOCK_D],
+            layout=kv_packed_shared,
+        )
+        tile_rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=gl.where(is_main, main_bf16_ptr, extra_bf16_ptr) + NOPE_DIM // 2,
+            shape=[rows_data, ROPE_DIM],
+            strides=[DATA_UNIT // 2, 1],
+            block_shape=[BLOCK_K, ROPE_DIM],
+            layout=rope_shared,
+        )
+        tile_mxs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=gl.where(is_main, main_u8_ptr, extra_u8_ptr),
+            shape=[rows_sc, SC_RAW - 1],
+            strides=[SC_UNIT, 1],
+            block_shape=[BLOCK_K, SC_RAW],
+            layout=mxs_shared,
+        )
+        gl.amd.gfx1250.tdm.async_gather(tile_kv_desc, data_row, kv_buf)
+        gl.amd.gfx1250.tdm.async_gather(tile_rope_desc, data_row, rope_buf)
+        gl.amd.gfx1250.tdm.async_gather(tile_mxs_desc, sc_row, sc_buf)
+    else:
+        gl.amd.gfx1250.tdm.async_gather(kv_desc, data_row, kv_buf)
+        gl.amd.gfx1250.tdm.async_gather(rope_desc, data_row, rope_buf)
+        gl.amd.gfx1250.tdm.async_gather(mxs_desc, sc_row, sc_buf)
+
+
+@gluon.jit
+def _v4_fetch_slots(
+    slot_desc,
+    main_slot_base,
+    extra_slot_base,
+    main_len,
+    extra_len,
+    j,
+    main_tiles,
+    dst,
+    slot_shared: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    HAS_EXTRA: gl.constexpr,
+):
+    """Prefetch global tile ``j``'s slot vector, from the stream that owns it.
+
+    Selected rather than branched, for the reason ``_v4_gather_tile`` gives.
+
+    ``j`` may run past the end -- the pipeline prefetches two tiles ahead. The
+    descriptor's extent is the stream's own length, so TDM zero-fills there and
+    the tile is never consumed.
+    """
+    if HAS_EXTRA:
+        is_main = j < main_tiles
+        n = gl.where(is_main, main_len, extra_len)
+        tile_slot_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=gl.where(is_main, main_slot_base, extra_slot_base),
+            shape=[1, n],
+            # The row stride is a formality -- the block never leaves row 0 --
+            # but a stream can be empty for a token, and a zero stride is not
+            # worth finding out about.
+            strides=[gl.maximum(n, 1), 1],
+            block_shape=[1, BLOCK_K],
+            layout=slot_shared,
+        )
+        jj = gl.where(is_main, j, j - main_tiles)
+        gl.amd.gfx1250.tdm.async_load(tile_slot_desc, [0, jj * BLOCK_K], dst)
+    else:
+        gl.amd.gfx1250.tdm.async_load(slot_desc, [0, j * BLOCK_K], dst)
+
+
 _pa_decode_sparse_v4_repr = make_kernel_repr(
     "_pa_decode_sparse_v4",
     [
@@ -1995,6 +2194,9 @@ _pa_decode_sparse_v4_repr = make_kernel_repr(
         "H",
         "D",
         "KV_SPLITS",
+        # In the name because a trace should say which of the two builds ran:
+        # the second stream roughly doubles the keys per token.
+        "HAS_EXTRA",
     ],
 )
 
@@ -2004,11 +2206,16 @@ def _pa_decode_sparse_v4(
     q_ptr,  # [T, H, D] packed e4m3
     q_u8_ptr,  # uint8 alias of q_ptr, for its E8M0 block
     q_rope_ptr,  # [T, H, ROPE_DIM] bf16
-    kv_u8_ptr,  # [nb, BLOCK_SIZE, 584] uint8 -- the whole vLLM fp8_ds_mla block
-    kv_e4m3_ptr,  # e4m3 alias of kv_u8_ptr (reads the NoPE bytes)
-    kv_bf16_ptr,  # bf16 alias of kv_u8_ptr (reads the RoPE bytes)
-    kv_indices_ptr,
-    kv_indptr_ptr,
+    main_u8_ptr,  # [nb, MAIN_BLOCK_SIZE, 584] uint8 -- the whole vLLM fp8_ds_mla block
+    main_e4m3_ptr,  # e4m3 alias of main_u8_ptr (reads the NoPE bytes)
+    main_bf16_ptr,  # bf16 alias of main_u8_ptr (reads the RoPE bytes)
+    main_indices_ptr,
+    main_indptr_ptr,
+    extra_u8_ptr,  # the extra stream: a second cache in the identical record layout
+    extra_e4m3_ptr,
+    extra_bf16_ptr,
+    extra_indices_ptr,
+    extra_indptr_ptr,
     m_partial_ptr,
     l_partial_ptr,
     acc_partial_ptr,
@@ -2019,8 +2226,14 @@ def _pa_decode_sparse_v4(
     q_stride_h: gl.constexpr,
     qr_stride_t: gl.constexpr,
     qr_stride_h: gl.constexpr,
-    kv_rows_data: gl.constexpr,  # row bound, in DATA_UNIT-byte units
-    kv_rows_sc: gl.constexpr,  # row bound, in SC_UNIT-byte units
+    main_rows_data: gl.constexpr,  # row bound, in DATA_UNIT-byte units
+    main_rows_sc: gl.constexpr,  # row bound, in SC_UNIT-byte units
+    main_blk_units_data,  # cache block stride, in DATA_UNIT-byte units (runtime)
+    main_blk_units_sc,  # cache block stride, in SC_UNIT-byte units (runtime)
+    extra_rows_data: gl.constexpr,  # the same four, for the extra cache
+    extra_rows_sc: gl.constexpr,
+    extra_blk_units_data,
+    extra_blk_units_sc,
     mp_stride_t: gl.constexpr,
     mp_stride_k: gl.constexpr,
     mp_stride_h: gl.constexpr,
@@ -2044,12 +2257,16 @@ def _pa_decode_sparse_v4(
     NOPE_DIM: gl.constexpr,
     ROPE_DIM: gl.constexpr,
     GROUP_SIZE: gl.constexpr,
-    BLOCK_SIZE: gl.constexpr,  # paged-cache tokens per block (256 for DSv4)
+    MAIN_BLOCK_SIZE: gl.constexpr,  # paged-cache tokens per block (256 for DSv4)
+    EXTRA_BLOCK_SIZE: gl.constexpr,  # the extra cache's, which need not match
     Q_IN_VGPR: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     Q_TDM: gl.constexpr,
     USE_EXP2: gl.constexpr,
     CTAS_H: gl.constexpr,
+    MAIN_CONTIG_BLOCKS: gl.constexpr,
+    EXTRA_CONTIG_BLOCKS: gl.constexpr,
+    HAS_EXTRA: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
@@ -2065,7 +2282,7 @@ def _pa_decode_sparse_v4(
     # pad byte of 0xFF is E8M0 NaN and 0 * NaN poisons the whole score row.
     REAL_MX_BLOCKS: gl.constexpr = NOPE_DIM // 32
 
-    # vLLM fp8_ds_mla, per paged block of BLOCK_SIZE tokens:
+    # vLLM fp8_ds_mla, per paged block of MAIN_BLOCK_SIZE tokens:
     #   [0,        bs*576)          token data, 448 fp8 NoPE | 128 B bf16 RoPE
     #   [bs*576,   bs*576 + bs*8)   UE8M0 scales, 7 real + 1 pad per token
     # so a global slot's three pieces are affine in the slot only WITHIN a
@@ -2077,10 +2294,25 @@ def _pa_decode_sparse_v4(
     REC_BYTES: gl.constexpr = ROW_BYTES + SC_RAW  # 584
     DATA_UNIT: gl.constexpr = 64
     DATA_ROW_UNITS: gl.constexpr = ROW_BYTES // DATA_UNIT  # 9
-    DATA_BLK_UNITS: gl.constexpr = BLOCK_SIZE * REC_BYTES // DATA_UNIT
     SC_UNIT: gl.constexpr = SC_RAW  # 8
-    SC_BLK_UNITS: gl.constexpr = BLOCK_SIZE * REC_BYTES // SC_UNIT
-    SC_BASE_UNITS: gl.constexpr = BLOCK_SIZE * ROW_BYTES // SC_UNIT
+    # The block stride arrives at runtime (main_blk_units_data / main_blk_units_sc): a
+    # vLLM cache is a view into a shared allocation, so its stride(0) is not
+    # MAIN_BLOCK_SIZE*REC_BYTES. Everything WITHIN a block is unaffected, so the
+    # trailer offset and the record stride stay constexpr.
+    MAIN_SC_BASE_UNITS: gl.constexpr = MAIN_BLOCK_SIZE * ROW_BYTES // SC_UNIT
+    # A compile-time block stride strength-reduces to shifts/adds; a runtime one
+    # is a real integer multiply per slot per tile, on the address-generation
+    # path. Measured cost of always taking the runtime form: +20% at
+    # T=16/kv=4096 and +22% at T=64/kv=1024. So keep the constant form for the
+    # contiguous caches (our own packing, ATOM) and pay the multiply only for a
+    # vLLM view, which is the only case that needs it.
+    MAIN_DATA_BLK_UNITS: gl.constexpr = MAIN_BLOCK_SIZE * REC_BYTES // DATA_UNIT
+    MAIN_SC_BLK_UNITS: gl.constexpr = MAIN_BLOCK_SIZE * REC_BYTES // SC_UNIT
+    # Same three for the extra cache. Its record is identical, so only the
+    # paged block size enters.
+    EXTRA_SC_BASE_UNITS: gl.constexpr = EXTRA_BLOCK_SIZE * ROW_BYTES // SC_UNIT
+    EXTRA_DATA_BLK_UNITS: gl.constexpr = EXTRA_BLOCK_SIZE * REC_BYTES // DATA_UNIT
+    EXTRA_SC_BLK_UNITS: gl.constexpr = EXTRA_BLOCK_SIZE * REC_BYTES // SC_UNIT
 
     # QK tiles warps along M, PV along N -- as the bf16 kernel does. With PV
     # tiled along M every warp reads the FULL width of the staging tile for
@@ -2278,10 +2510,13 @@ def _pa_decode_sparse_v4(
 
     # Issued before the Q descriptors so this scalar load is in flight while
     # the Q TDM loads are set up and issued. Only the LOADS are hoisted: the
-    # s_wait_kmcnt lands on the first consumer, so computing kv_len here would
+    # s_wait_kmcnt lands on the first consumer, so computing main_len here would
     # drag the wait back above the tensor_load_to_lds and defeat the point.
-    kv_start = gl.load(kv_indptr_ptr + t)
-    kv_end = gl.load(kv_indptr_ptr + t + 1)
+    main_start = gl.load(main_indptr_ptr + t)
+    main_end = gl.load(main_indptr_ptr + t + 1)
+    if HAS_EXTRA:
+        extra_start = gl.load(extra_indptr_ptr + t)
+        extra_end = gl.load(extra_indptr_ptr + t + 1)
 
     # ---- Q (once per program): stays e4m3, its E8M0 block is the scale operand ----
     qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
@@ -2377,9 +2612,26 @@ def _pa_decode_sparse_v4(
         # so it cannot hide in the E8M0 scale either -- it is applied to the scores.
         mfma_qr = gl.convert_layout(q_rope, dot_qr_layout)
 
-    kv_len = kv_end - kv_start
-    tiles_per_segment = gl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-    if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
+    # The two streams' tiles are laid end to end and the split walks the
+    # concatenation: global tile j is main's tile j while j < main_tiles, and
+    # extra's tile j - main_tiles after that. Each count is rounded up on its own,
+    # so no tile straddles the two caches.
+    #
+    # Splitting in TILES rather than in keys is the same split as before, since
+    # cdiv(cdiv(L, BLOCK_K), KV_SPLITS) == cdiv(L, KV_SPLITS * BLOCK_K); it is
+    # only written this way so the extra stream's tiles can join the count.
+    main_len = main_end - main_start
+    main_tiles = gl.cdiv(main_len, BLOCK_K)
+    if HAS_EXTRA:
+        extra_len = extra_end - extra_start
+        num_tiles = main_tiles + gl.cdiv(extra_len, BLOCK_K)
+    else:
+        num_tiles = main_tiles
+    tiles_per_segment = gl.cdiv(num_tiles, KV_SPLITS)
+    tile_start = pid_k * tiles_per_segment
+    tile_end = gl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+    num_iters = tile_end - tile_start
+    if num_iters <= 0:
         # Q's TDM loads are still in flight here and nothing downstream waits
         # on this path: s_endpgm does not drain them, so without this the CTA
         # would exit with DMA still writing into LDS the workgroup is
@@ -2387,10 +2639,6 @@ def _pa_decode_sparse_v4(
         if Q_TDM:
             gl.amd.gfx1250.tdm.async_wait(0)
         return
-    num_tiles = gl.cdiv(kv_len, BLOCK_K)
-    tile_start = pid_k * tiles_per_segment
-    tile_end = gl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
-    num_iters = tile_end - tile_start
 
     h_offs_mma_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT))
     h_offs_mma_row_eff = h_off_base + h_offs_mma_row
@@ -2439,12 +2687,12 @@ def _pa_decode_sparse_v4(
     NUM_BUFFERS: gl.constexpr = 2
     NUM_STAGE: gl.constexpr = 1
     kv_bufs = gl.allocate_shared_memory(
-        kv_e4m3_ptr.dtype.element_ty,
+        main_e4m3_ptr.dtype.element_ty,
         [NUM_BUFFERS, BLOCK_K, BLOCK_D],
         kv_packed_shared,
     )
     rope_bufs = gl.allocate_shared_memory(
-        kv_bf16_ptr.dtype.element_ty,
+        main_bf16_ptr.dtype.element_ty,
         [NUM_BUFFERS, BLOCK_K, ROPE_DIM],
         rope_shared,
     )
@@ -2463,7 +2711,7 @@ def _pa_decode_sparse_v4(
     )
     NUM_SLOT_BUFFERS: gl.constexpr = 4
     slot_bufs = gl.allocate_shared_memory(
-        kv_indices_ptr.dtype.element_ty,
+        main_indices_ptr.dtype.element_ty,
         [NUM_SLOT_BUFFERS, 1, BLOCK_K],
         slot_shared,
     )
@@ -2472,8 +2720,8 @@ def _pa_decode_sparse_v4(
     # out-of-range columns, so the row's scale and pad bytes land as zeros and
     # the e4m3 operand can span the padded 512 without a NaN reaching the MMA.
     kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=kv_e4m3_ptr,
-        shape=[kv_rows_data, NOPE_DIM],
+        base=main_e4m3_ptr,
+        shape=[main_rows_data, NOPE_DIM],
         strides=[DATA_UNIT, 1],
         block_shape=[BLOCK_K, BLOCK_D],
         layout=kv_packed_shared,
@@ -2484,16 +2732,23 @@ def _pa_decode_sparse_v4(
     # data the kv descriptor already zero-fills -- where 0 * NaN poisons the
     # whole score row.
     mxs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=kv_u8_ptr,
-        shape=[kv_rows_sc, SC_RAW - 1],
+        base=main_u8_ptr,
+        shape=[main_rows_sc, SC_RAW - 1],
         strides=[SC_UNIT, 1],
         block_shape=[BLOCK_K, SC_RAW],
         layout=mxs_shared,
     )
+    if HAS_EXTRA:
+        # main_len can be 0 here: a token may have only extra keys. The one-stream
+        # path returned before this point in that case, so its stride is left
+        # exactly as it was.
+        slot_row_stride = gl.maximum(main_len, 1)
+    else:
+        slot_row_stride = main_len
     slot_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=kv_indices_ptr + kv_start,
-        shape=[1, kv_len],
-        strides=[kv_len, 1],
+        base=main_indices_ptr + main_start,
+        shape=[1, main_len],
+        strides=[slot_row_stride, 1],
         block_shape=[1, BLOCK_K],
         layout=slot_shared,
     )
@@ -2503,12 +2758,23 @@ def _pa_decode_sparse_v4(
     # Same row index as the NoPE gather -- the RoPE half sits NOPE_DIM bytes
     # into the very same record -- so base and stride just move to bf16 units.
     rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=kv_bf16_ptr + NOPE_DIM // 2,
-        shape=[kv_rows_data, ROPE_DIM],
+        base=main_bf16_ptr + NOPE_DIM // 2,
+        shape=[main_rows_data, ROPE_DIM],
         strides=[DATA_UNIT // 2, 1],
         block_shape=[BLOCK_K, ROPE_DIM],
         layout=rope_shared,
     )
+
+    # The extra stream's descriptors are built per tile inside _v4_gather_tile /
+    # _v4_fetch_slots, from a selected base -- see the reason there. Only the
+    # two bases have to be prepared here.
+    if HAS_EXTRA:
+        main_slot_base = main_indices_ptr + main_start
+        extra_slot_base = extra_indices_ptr + extra_start
+    else:
+        main_slot_base = main_indices_ptr
+        extra_slot_base = main_indices_ptr
+        extra_len = main_len
 
     # ---- Prologue ----
     # Retire Q here, as late as possible but before any slot/KV gather is in
@@ -2523,11 +2789,15 @@ def _pa_decode_sparse_v4(
             qv0, qv1, qv2, qv3, qsv0, qsv1, qsv2, qsv3 = _v4_load_q_regs(
                 q_smem, qs_smem, dot_q_layout, q_sc_chunk_layout, BLOCK_D, MXK
             )
-    gl.amd.gfx1250.tdm.async_load(
-        slot_desc, [0, tile_start * BLOCK_K], slot_bufs.index(0)
+    _v4_fetch_slots(
+        slot_desc, main_slot_base, extra_slot_base, main_len, extra_len,
+        tile_start, main_tiles, slot_bufs.index(0),
+        slot_shared, BLOCK_K, HAS_EXTRA,
     )
-    gl.amd.gfx1250.tdm.async_load(
-        slot_desc, [0, (tile_start + 1) * BLOCK_K], slot_bufs.index(1)
+    _v4_fetch_slots(
+        slot_desc, main_slot_base, extra_slot_base, main_len, extra_len,
+        tile_start + 1, main_tiles, slot_bufs.index(1),
+        slot_shared, BLOCK_K, HAS_EXTRA,
     )
     gl.amd.gfx1250.tdm.async_wait(1)
     slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=SLOT_BLOCKED_LAYOUT)
@@ -2537,13 +2807,39 @@ def _pa_decode_sparse_v4(
         cur_valid = gl.convert_layout(valid_wide, valid_col_mma)
     else:
         safe_slot_cur = slot_reg
-    cur_blk = safe_slot_cur // BLOCK_SIZE
-    cur_pos = safe_slot_cur % BLOCK_SIZE
-    cur_data_row = cur_blk * DATA_BLK_UNITS + cur_pos * DATA_ROW_UNITS
-    cur_sc_row = cur_blk * SC_BLK_UNITS + SC_BASE_UNITS + cur_pos
-    gl.amd.gfx1250.tdm.async_gather(kv_desc, cur_data_row, kv_bufs.index(0))
-    gl.amd.gfx1250.tdm.async_gather(rope_desc, cur_data_row, rope_bufs.index(0))
-    gl.amd.gfx1250.tdm.async_gather(mxs_desc, cur_sc_row, raw_sc_bufs.index(0))
+    if HAS_EXTRA:
+        # With two streams the LAST tile of each is short, not just the last of
+        # the loop, so the column mask is carried per tile from here on. The
+        # slot descriptor zero-fills past its extent, and slot 0 is a real slot,
+        # so this mask is what keeps those columns out of the softmax.
+        cur_is_main = tile_start < main_tiles
+        cur_lo = gl.where(cur_is_main, tile_start, tile_start - main_tiles) * BLOCK_K
+        cur_hi = gl.where(cur_is_main, main_len, extra_len)
+        cur_in_range = (cur_lo + k_offs_mma) < cur_hi
+        if HAS_INVALID:
+            cur_valid = cur_valid & cur_in_range
+        else:
+            cur_valid = cur_in_range
+    else:
+        cur_is_main = True
+    cur_data_row, cur_sc_row = _v4_slot_rows(
+        safe_slot_cur, cur_is_main,
+        main_blk_units_data, main_blk_units_sc, extra_blk_units_data, extra_blk_units_sc,
+        MAIN_BLOCK_SIZE, EXTRA_BLOCK_SIZE, DATA_ROW_UNITS,
+        MAIN_SC_BASE_UNITS, EXTRA_SC_BASE_UNITS,
+        MAIN_DATA_BLK_UNITS, MAIN_SC_BLK_UNITS, EXTRA_DATA_BLK_UNITS, EXTRA_SC_BLK_UNITS,
+        MAIN_CONTIG_BLOCKS, EXTRA_CONTIG_BLOCKS, HAS_EXTRA,
+    )
+    _v4_gather_tile(
+        kv_desc, rope_desc, mxs_desc,
+        main_e4m3_ptr, main_bf16_ptr, main_u8_ptr, extra_e4m3_ptr, extra_bf16_ptr, extra_u8_ptr,
+        main_rows_data, main_rows_sc, extra_rows_data, extra_rows_sc,
+        cur_data_row, cur_sc_row, cur_is_main,
+        kv_bufs.index(0), rope_bufs.index(0), raw_sc_bufs.index(0),
+        kv_packed_shared, rope_shared, mxs_shared,
+        NOPE_DIM, ROPE_DIM, SC_RAW, DATA_UNIT, SC_UNIT, BLOCK_K, BLOCK_D,
+        HAS_EXTRA,
+    )
     # Two-deep, like the asm kernel: tile i+1 is gathered while tile i is
     # consumed, so only two KV ring slots and ONE dequant staging tile are
     # live. Three-deep hides the dequant better per iteration, but its LDS
@@ -2571,23 +2867,44 @@ def _pa_decode_sparse_v4(
             next_valid = gl.convert_layout(valid_wide, valid_col_mma)
         else:
             safe_next_slot = slot_reg
-        gl.amd.gfx1250.tdm.async_load(
-            slot_desc,
-            [0, (tile_start + i + 2) * BLOCK_K],
+        _v4_fetch_slots(
+            slot_desc, main_slot_base, extra_slot_base, main_len, extra_len,
+            tile_start + i + 2, main_tiles,
             slot_bufs.index((i + 2) % NUM_SLOT_BUFFERS),
+            slot_shared, BLOCK_K, HAS_EXTRA,
         )
-        next_blk = safe_next_slot // BLOCK_SIZE
-        next_pos = safe_next_slot % BLOCK_SIZE
-        next_data_row = next_blk * DATA_BLK_UNITS + next_pos * DATA_ROW_UNITS
-        next_sc_row = next_blk * SC_BLK_UNITS + SC_BASE_UNITS + next_pos
-        gl.amd.gfx1250.tdm.async_gather(
-            kv_desc, next_data_row, kv_bufs.index((i + 1) % NUM_BUFFERS)
+        if HAS_EXTRA:
+            next_j = tile_start + i + 1
+            next_is_main = next_j < main_tiles
+            next_lo = gl.where(next_is_main, next_j, next_j - main_tiles) * BLOCK_K
+            next_hi = gl.where(next_is_main, main_len, extra_len)
+            next_in_range = (next_lo + k_offs_mma) < next_hi
+            if HAS_INVALID:
+                next_valid = next_valid & next_in_range
+            else:
+                next_valid = next_in_range
+        else:
+            next_is_main = True
+        next_data_row, next_sc_row = _v4_slot_rows(
+            safe_next_slot, next_is_main,
+            main_blk_units_data, main_blk_units_sc, extra_blk_units_data, extra_blk_units_sc,
+            MAIN_BLOCK_SIZE, EXTRA_BLOCK_SIZE, DATA_ROW_UNITS,
+            MAIN_SC_BASE_UNITS, EXTRA_SC_BASE_UNITS,
+            MAIN_DATA_BLK_UNITS, MAIN_SC_BLK_UNITS, EXTRA_DATA_BLK_UNITS, EXTRA_SC_BLK_UNITS,
+            MAIN_CONTIG_BLOCKS, EXTRA_CONTIG_BLOCKS, HAS_EXTRA,
         )
-        gl.amd.gfx1250.tdm.async_gather(
-            rope_desc, next_data_row, rope_bufs.index((i + 1) % NUM_BUFFERS)
-        )
-        gl.amd.gfx1250.tdm.async_gather(
-            mxs_desc, next_sc_row, raw_sc_bufs.index((i + 1) % NUM_BUFFERS)
+        _v4_gather_tile(
+            kv_desc, rope_desc, mxs_desc,
+            main_e4m3_ptr, main_bf16_ptr, main_u8_ptr,
+            extra_e4m3_ptr, extra_bf16_ptr, extra_u8_ptr,
+            main_rows_data, main_rows_sc, extra_rows_data, extra_rows_sc,
+            next_data_row, next_sc_row, next_is_main,
+            kv_bufs.index((i + 1) % NUM_BUFFERS),
+            rope_bufs.index((i + 1) % NUM_BUFFERS),
+            raw_sc_bufs.index((i + 1) % NUM_BUFFERS),
+            kv_packed_shared, rope_shared, mxs_shared,
+            NOPE_DIM, ROPE_DIM, SC_RAW, DATA_UNIT, SC_UNIT, BLOCK_K, BLOCK_D,
+            HAS_EXTRA,
         )
 
         # 2. retire KV/RoPE/MXS(i), gathered one iteration ago
@@ -2677,7 +2994,7 @@ def _pa_decode_sparse_v4(
         )
         scores = (scores + gl.convert_layout(scores_r, QK_WMMA_LAYOUT)) * qk_scale
 
-        if HAS_INVALID:
+        if HAS_INVALID or HAS_EXTRA:
             scores = scores + gl.where(cur_valid, 0.0, float("-inf"))[None, :]
 
         m_block = gl.max(scores, axis=1)
@@ -2705,7 +3022,7 @@ def _pa_decode_sparse_v4(
 
         m_i = m_new
         l_i = l_new
-        if HAS_INVALID:
+        if HAS_INVALID or HAS_EXTRA:
             cur_valid = next_valid
 
     # ---- Epilogue: final (possibly partial) tile ----
@@ -2714,12 +3031,17 @@ def _pa_decode_sparse_v4(
     gl.amd.gfx1250.tdm.async_wait(0)
     if CTAS_H > 1:
         gl.amd.gfx1250.cluster.wait()
-    j_final = tile_end - 1
-    final_in_range = (j_final * BLOCK_K + k_offs_mma) < kv_len
-    if HAS_INVALID:
-        valid_col = final_in_range & cur_valid
+    if HAS_EXTRA:
+        # cur_valid already carries the final tile's column range, because with
+        # two streams a short tile can land anywhere in the loop, not only last.
+        valid_col = cur_valid
     else:
-        valid_col = final_in_range
+        j_final = tile_end - 1
+        final_in_range = (j_final * BLOCK_K + k_offs_mma) < main_len
+        if HAS_INVALID:
+            valid_col = final_in_range & cur_valid
+        else:
+            valid_col = final_in_range
 
     final_idx = (num_iters - 1) % NUM_BUFFERS
     _v4_expand_scales(

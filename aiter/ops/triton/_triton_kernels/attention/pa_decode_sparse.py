@@ -286,6 +286,7 @@ def _pa_decode_sparse_reduce(
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32 — used to derive per-token kv_len
+    extra_indptr_ptr,  # [N+1] int32 — the extra stream's, when HAS_EXTRA
     out_ptr,  # [N, H, D]
     mp_stride_t: tl.constexpr,
     mp_stride_k: tl.constexpr,
@@ -307,6 +308,7 @@ def _pa_decode_sparse_reduce(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
 ):
     """Combine KV_SPLITS partials, fold in attn_sink, write final output.
 
@@ -327,10 +329,17 @@ def _pa_decode_sparse_reduce(
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
     kv_len = kv_end - kv_start
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    # Counted in TILES so the extra stream's can join the total; this is the
+    # same split, since cdiv(cdiv(L, BLOCK_K), S) == cdiv(L, S*BLOCK_K).
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + t)
+        extra_end = tl.load(extra_indptr_ptr + t + 1)
+        num_tiles += tl.cdiv(extra_end - extra_start, BLOCK_K)
+    tiles_per_segment = tl.cdiv(num_tiles, KV_SPLITS)
     # Only the first ``act_num_segments`` slots of the partial buffer were
     # actually written by the split kernel; the rest are stale.
-    act_num_segments = tl.cdiv(kv_len, tiles_per_segment * BLOCK_K)
+    act_num_segments = tl.cdiv(num_tiles, tl.maximum(tiles_per_segment, 1))
     segm_mask = k_offs < act_num_segments
 
     m_p = tl.load(
