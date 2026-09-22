@@ -287,6 +287,25 @@ waits `vmcnt(1)`.
 | M=512 | 515.98 µs | 518.30 µs | -0.45% |
 
 No row reaches the 3% keep gate. Kernel restored to HEAD.
+
+A second schedule experiment rebuilt FlyDSL branch
+`strided-copy-and-waitcnt` at `d9163c1`, then replaced only the
+K-publish `gpu.barrier()` with `s_waitcnt(lgkmcnt=0)`, the existing
+gfx950 V gather/store, and raw `s_barrier`. Focused pytest passed 2/2.
+ISA matched the intended line: decode K `ds_write_b128` → line 349
+`lgkmcnt(0)` → lines 350–393 V loads/stores → line 394 `s_barrier`;
+prefill used the same order at lines 1031–1351. Nevertheless decode
+nearly doubled:
+
+| width-2051 `L=512` wrapper | paired K-pad baseline | split wait/barrier | delta |
+|--|--:|--:|--:|
+| M=1 | 20.32 µs | 40.01 µs | +96.9% |
+| M=8 | 20.08 µs | 41.60 µs | +107.2% |
+| M=512 | 423.68 µs | 424.35 µs | +0.16% |
+
+The rebuilt UniversalCopy lowering itself left the K-pad baseline
+materially unchanged. Kernel restored to `gpu.barrier()`. Do not retry
+splitting the K-publish wait/barrier around the V gather.
 **Done. Next: phase 4.**
 
 ### 4. Bank-conflict-free K (and C) stores; V layout unchanged
@@ -383,6 +402,33 @@ Prefill flat (decode-only). Decode paid for `shuffle_idx` gather of
 the 8-col vector. Same failure class as row-major V / transpose PV.
 **Next: phase 6 skip-or-try, then stop.**
 
+#### Combined AMD-shaped override (retained despite gate miss)
+
+Per explicit request, the one-line keep-gate rule was suspended and
+the three decode-only changes were retried as one whole on rebuilt
+FlyDSL `d9163c1`: K `Swizzle<3,3,3>` with matching QK-B reads,
+8-column shuffle-packed token-major V stores, and K
+`lgkmcnt(0)` → V gather/store → V `lgkmcnt(0)` → raw `s_barrier`.
+Prefill keeps the `D+8` K pad, row-major V, and `gpu.barrier()`.
+Focused decode+prefill pytest passed 2/2 (`err=0`).
+
+Decode ISA has `4× v_bitop3_b32`, `5× ds_write_b128`, and
+`4× ds_write_b16`; the V transpose costs `128× ds_bpermute_b32`.
+VGPR rose to 119 (SGPR 75), while LDS stayed 21632 bytes. The two
+waits bracket the V loads/stores before the raw barrier as intended.
+
+| width-2051 `L=512` wrapper | K-pad baseline | combined median (3 runs) | delta |
+|--|--:|--:|--:|
+| M=1 | 20.09 µs | 23.80 µs | +18.5% |
+| M=8 | 20.52 µs | 30.94 µs | +50.8% |
+| M=512 | 424.09 µs | 424.30 µs | +0.05% |
+
+A direct wrapper run measured combined vs live AMD at
+25.12 / 10.99, 31.57 / 14.49, and 424.81 / 203.70 µs for
+M=1/8/512. The interaction does not recover the shuffle/VGPR cost.
+Unlike prior misses, the combined kernel is intentionally **left in
+the source tree**; phase 6 remains unopened.
+
 ### 6. Optional: drop C-LDS QK reduce
 
 Last. ATT ~11k stall vs 449k tile barrier. Parent plan already
@@ -427,6 +473,9 @@ The parent plan remains the full K2 list.
 - Hoisting gfx950 V `buffer_load` before the K-publish `lgkmcnt(0)` /
   `s_barrier`. ISA moved the loads; wall-clock missed 3% (M=1 +0.25%,
   M=8 −0.48%, M=512 −0.45%). Keep V gather after that barrier.
+- Splitting K-publish into `s_waitcnt(lgkmcnt=0)`, V gather/store, then
+  raw `s_barrier`. ISA matched exactly, but decode regressed +96.9% /
+  +107.2% at M=1/8 and prefill was flat. Keep `gpu.barrier()` before V.
 - Padding C-LDS's 64-lane axis to 66. Correct; M=8 −2.63%, M=1 +1.10%,
   M=512 +1.74% vs K-pad baseline. Keep unpadded `(n_subtiles,
   num_waves, 64, 4)`.

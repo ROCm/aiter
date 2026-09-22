@@ -721,6 +721,15 @@ width-2051 `L=512` HEAD → hoist median (three runs) was
 515.98 → 518.30 us at `M=512`. Keep V gather after the K-publish
 barrier.
 
+**Do not retry** splitting the K-publish barrier into
+`s_waitcnt(lgkmcnt=0)`, the existing gfx950 V gather/store, then raw
+`s_barrier`. This used rebuilt FlyDSL `d9163c1` (stride-aware
+UniversalCopy), not a custom backend. Focused decode+prefill pytest
+passed and ISA matched the requested order on BN16 and BN64. Paired
+K-pad → split medians were 20.32 → 40.01 us at `M=1`, 20.08 → 41.60 us
+at `M=8`, and 423.68 → 424.35 us at `M=512`. Decode regressed 97–107%;
+keep the original `gpu.barrier()` before V.
+
 **Kept** K (and gfx942 aliased KV) LDS row pad `_K_STRIDE = D+8`.
 Does not change decode token-major V. GPU 6 / gfx950 focused
 decode+prefill pytest passed. Width-2051 `L=512` HEAD → pad median
@@ -753,6 +762,19 @@ Decode ISA emitted `4× v_bitop3_b32` (`bitop3:0x6c`), `0 v_xor`,
 `3× ds_write_b128`. Width-2051 `L=512` K-pad → XOR median (three runs)
 was 20.09 → 20.72 us at `M=1`, 20.52 → 20.45 us at `M=8` (−0.34%), and
 424.09 → 449.43 us at `M=512`. Keep the pad.
+
+**Combined override retained by request:** retry decode-only K
+`Swizzle<3,3,3>`, 8-column shuffle-packed token-major V stores, and
+K `lgkmcnt(0)` → V gather/store → V `lgkmcnt(0)` → raw `s_barrier`
+as one whole. Prefill retains the `D+8` pad and original schedule.
+Rebuilt FlyDSL `d9163c1`; focused pytest passed 2/2 (`err=0`). Decode
+ISA emitted `4× v_bitop3_b32`, `5× ds_write_b128`, `4× ds_write_b16`,
+and `128× ds_bpermute_b32`; VGPR rose to 119. Width-2051 `L=512`
+K-pad → combined medians were 20.09 → 23.80 us at `M=1`,
+20.52 → 30.94 us at `M=8`, and 424.09 → 424.30 us at `M=512`.
+This still misses the gate, but the kernel changes are intentionally
+not reverted. Do not interpret the earlier per-line DNR entries as
+describing the current source state.
 
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in

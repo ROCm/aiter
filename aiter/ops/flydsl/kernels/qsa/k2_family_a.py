@@ -101,6 +101,19 @@ def build_qsa_k2_family_a_module(
     gather_span = col_owners * vec
     token_major_v = use_k32 and block_n == 16
 
+    def make_k_lds_view(k_arr, offset, shape):
+        if token_major_v:
+            layout = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(3, 3, 3)),
+                offset,
+                fx.make_layout(shape, (_D, 1)),
+            )
+            ptr = k_arr.ptr
+        else:
+            layout = fx.make_layout(shape, (_K_STRIDE, 1))
+            ptr = k_arr.ptr + offset
+        return fx.make_view(ptr, layout)
+
     if use_k32:
 
         @fx.struct
@@ -191,9 +204,7 @@ def build_qsa_k2_family_a_module(
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        k_lds = getattr(storage, _k_field).view(
-            fx.make_layout((block_n, _K_STRIDE), (_K_STRIDE, 1))
-        )
+        k_arr = getattr(storage, _k_field)
         v_lds = getattr(storage, _v_field).view(
             fx.make_layout((_D, block_n), (block_n, 1))
             if token_major_v
@@ -341,15 +352,19 @@ def build_qsa_k2_family_a_module(
                     BFloat16,
                 )
                 fx.memref_store_vec(k_vec, k_frag)
-                k_tile = fx.make_view(
-                    fx.get_iter(k_lds) + Int32(gr * gather_span),
-                    fx.make_layout((block_n, gather_span), (_K_STRIDE, 1)),
+                k_tile = make_k_lds_view(
+                    k_arr,
+                    Int32(gr * gather_span),
+                    (block_n, gather_span),
                 )
                 k_dst = kv_store.partition_D(k_tile)
                 k_store_frag = fx.make_fragment_like(k_dst)
                 fx.memref_store_vec(k_vec, k_store_frag)
                 fx.copy(lds_copy, k_store_frag, k_dst)
-            gpu.barrier()
+            if const_expr(token_major_v):
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+            else:
+                gpu.barrier()
 
             if const_expr(use_k32):
                 v_row = fx.logical_divide(
@@ -370,9 +385,36 @@ def build_qsa_k2_family_a_module(
                     )
                     fx.memref_store_vec(v_vec, v_frag)
                     if const_expr(token_major_v):
+                        # Pack 8 consecutive columns at one D so LDS stores
+                        # are ds_write_b128 into (D, BLOCK_N):(BLOCK_N, 1).
                         d0 = d_chunk * Int32(vec)
-                        for i in range_constexpr(vec):
-                            v_lds[d0 + Int32(i), col] = v_vec[i]
+                        lane_base = _idiv(lane, Int32(16)) * Int32(16)
+                        group = _idiv(col, Int32(8))
+                        src0 = lane_base + group * Int32(8)
+                        irow = col - group * Int32(8)
+                        packed = []
+                        for k in range_constexpr(8):
+                            src_lane = src0 + Int32(k)
+                            gathered = fx.Vector.from_elements(
+                                [
+                                    BFloat16(
+                                        gpu.shuffle_idx(v_vec[j], src_lane, Int32(64))
+                                    )
+                                    for j in range_constexpr(vec)
+                                ],
+                                BFloat16,
+                            )
+                            packed.append(gathered[irow])
+                        store_vec = fx.Vector.from_elements(packed, BFloat16)
+                        v_pack = fx.make_view(
+                            fx.get_iter(v_lds)
+                            + (d0 + irow) * Int32(block_n)
+                            + group * Int32(8),
+                            fx.make_layout(8, 1),
+                        )
+                        pack_frag = fx.make_fragment_like(v_pack)
+                        fx.memref_store_vec(store_vec, pack_frag)
+                        fx.copy(lds_copy, pack_frag, v_pack)
                     else:
                         v_tile = fx.make_view(
                             fx.get_iter(v_lds) + Int32(gr * gather_span),
@@ -382,6 +424,9 @@ def build_qsa_k2_family_a_module(
                         v_store_frag = fx.make_fragment_like(v_dst)
                         fx.memref_store_vec(v_vec, v_store_frag)
                         fx.copy(lds_copy, v_store_frag, v_dst)
+            if const_expr(token_major_v):
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                fx.rocdl.s_barrier()
 
             # QK: waves partition D, then wave 0 reduces their C fragments.
             for ng in range_constexpr(n_subtiles):
@@ -389,9 +434,10 @@ def build_qsa_k2_family_a_module(
                 acc4 = fx.Vector.filled(4, 0.0, Float32)
                 for ks in range_constexpr(qk_steps):
                     d_base = wave * Int32(_D // num_waves) + Int32(ks * qk_k)
-                    sB = fx.make_view(
-                        fx.get_iter(k_lds) + n0 * Int32(_K_STRIDE) + d_base,
-                        fx.make_layout((16, qk_k), (_K_STRIDE, 1)),
+                    sB = make_k_lds_view(
+                        k_arr,
+                        n0 * Int32(_D if token_major_v else _K_STRIDE) + d_base,
+                        (16, qk_k),
                     )
                     b_src = qk_b_copy.partition_S(sB)
                     b_frag = fx.make_fragment_like(b_src)
