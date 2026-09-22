@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a16w16 import get_semaphore_workspace
+from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import tgemm, triton_gemm
@@ -453,13 +453,11 @@ def check_graph(dtype, m, n, k, otype):
     torch.cuda.synchronize()
     eager = out.clone()
 
-    # Leave the counter dirty on the stream the graph captures on -- the state
-    # production reaches, and the one an unfixed build cannot recover from.
+    # Capture on a stream no warmup ran on: that is what makes the counter's
+    # (device, stream) key miss and allocate inside the capture region, which is
+    # where it can inherit a freed intermediate's address.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        get_semaphore_workspace(x.device).fill_(2)
-    stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
@@ -480,24 +478,34 @@ def check_graph(dtype, m, n, k, otype):
     )
     assert err == 0, f"graph replay diverged from eager at {(m, n, k)} {dtype} {otype}"
 
-    # The workspace a capture hands out must have its zero-fill recorded as a
-    # graph node, or replay N starts from whatever replay N-1 left. Checked on
-    # its own graph, with no kernel, so a regression asserts here in
-    # milliseconds instead of spinning in the GEMM above.
+    # The counter a capture hands out must not live on an address another graph
+    # in the same pool writes. The kernel hands it back at zero on its own, so
+    # nothing has to re-zero it per replay -- but an inherited address is
+    # overwritten every replay. Checked without a kernel so a regression asserts
+    # here in milliseconds instead of spinning in the GEMM above.
     sink = torch.zeros(1, device=x.device)
+    pool = torch.cuda.graph_pool_handle()
+    src = torch.full((_SEMA_SHAPE[0] * _SEMA_SHAPE[1],), 3.0, device=x.device)
+    decoy = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(decoy, pool=pool, stream=stream):
+        transient = src * 2.0
+        transient_ptr = transient.data_ptr()
+        transient.sum()
+        del transient
     probe = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(probe, stream=stream):
+    with torch.cuda.graph(probe, pool=pool, stream=stream):
         sema = get_semaphore_workspace(x.device)
         sink.add_(1)  # a graph needs at least one node
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    sema.view(torch.int32).fill_(2)
-    torch.cuda.synchronize()
-    probe.replay()
+    assert (
+        sema.data_ptr() != transient_ptr
+    ), f"splitK counter inherited a freed intermediate's address at {(m, n, k)}"
+    decoy.replay()
     torch.cuda.synchronize()
     assert (
         int(sema.view(torch.int32).max().item()) == 0
-    ), f"capture recorded no zero-fill for the splitK counter at {(m, n, k)}"
+    ), f"another graph in the pool wrote into the splitK counter at {(m, n, k)}"
 
 
 parser = argparse.ArgumentParser(
