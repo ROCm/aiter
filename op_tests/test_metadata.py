@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import itertools
 import os
 import random
 
@@ -43,6 +44,12 @@ DEFAULT_BATCHES = [4, 8, 16, 32, 64, 128, 4096, 8192, 16384]
 DEFAULT_CTX_LENS = [2048, 4096, 8192]
 
 _PARALLEL_ENV = "AITER_MLA_META_USE_PARALLEL"
+# Lowering the planner's chunk ceiling forces the runtime-chunk kernel. A card
+# whose LDS fits the full chunk always gets the folded instantiation, so this is
+# the only way a gfx950 run reaches the path gfx942 takes in production.
+_CHUNK_ENV = "AITER_MLA_META_BATCH_CHUNK"
+# Mirrors MLA_V12_PARALLEL_BATCH_CHUNK; only ever a label in the table.
+MLA_V12_DEFAULT_CHUNK = 4096
 
 # Every card the MLA metadata planner is built and validated for.
 SUPPORTED_GFX = ["gfx942", "gfx950"]
@@ -237,7 +244,13 @@ def compare_metadata(golden, test):
 
 
 @benchmark()
-def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters):
+def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters,
+                  batch_chunk=0):
+    if batch_chunk:
+        os.environ[_CHUNK_ENV] = str(batch_chunk)
+    else:
+        os.environ.pop(_CHUNK_ENV, None)
+
     inputs, out_meta, _kv_lens = build_decode_inputs(
         batch_size, ctx_len, dtype, kvtype, nhead, jitter=jitter, seed=seed
     )
@@ -268,7 +281,8 @@ def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_i
     # what runs today whenever the parallel path bails out, so it is timed.
     candidates = {"serial": "0", "parallel": "1"}
 
-    ret = {"gfx": get_gfx(), "num_works": num_works, "num_split_groups": num_groups}
+    ret = {"gfx": get_gfx(), "chunk": batch_chunk or MLA_V12_DEFAULT_CHUNK,
+           "num_works": num_works, "num_split_groups": num_groups}
     us = {}
     for name, env in candidates.items():
         os.environ[_PARALLEL_ENV] = env
@@ -339,6 +353,14 @@ def main():
         action="store_true",
         help="Randomize per-sequence KV length in [ctx/2, ctx] (decode spread).",
     )
+    parser.add_argument(
+        "--batch-chunk",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="Planner chunk ceilings to sweep; 0 leaves the built-in one. A value\n"
+        "below it forces the runtime-chunk kernel, which is what gfx942 runs.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iters", type=int, default=101)
     args = parser.parse_args()
@@ -358,8 +380,9 @@ def main():
 
     rows = []
     all_match = True
-    for ctx_len in args.ctx_len:
-        for batch_size in args.batch:
+    for batch_chunk, ctx_len, batch_size in itertools.product(
+        args.batch_chunk, args.ctx_len, args.batch
+    ):
             row = test_metadata(
                 batch_size,
                 ctx_len,
@@ -369,6 +392,7 @@ def main():
                 args.jitter,
                 args.seed,
                 args.num_iters,
+                batch_chunk,
             )
             rows.append(row)
             all_match = all_match and row["match"]

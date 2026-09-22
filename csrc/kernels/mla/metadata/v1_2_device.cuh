@@ -1194,6 +1194,20 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     // pinned instantiation, which is what ran before the chunk became a
     // parameter at all. Capping here would push every decode-sized call onto the
     // runtime path and cost it the folding.
+    // Lowering the ceiling forces the runtime-chunk instantiation. On a card
+    // whose LDS fits the full chunk the dispatch always picks the folded one, so
+    // without this hook the runtime path -- the path gfx942 takes in production
+    // -- is unreachable from any gfx950 test.
+    int32_t chunk_ceiling = MLA_V12_PARALLEL_BATCH_CHUNK;
+    if(const char* chunk_env = std::getenv("AITER_MLA_META_BATCH_CHUNK"))
+    {
+        const int32_t want = std::atoi(chunk_env);
+        if((want > 0) && (want < chunk_ceiling))
+        {
+            chunk_ceiling = want;
+        }
+    }
+
     auto chunk_that_fits = [&](const int32_t reserved) -> int32_t {
         const int32_t room = lds_size - reserved - kMlaV12ScratchScalarBytes;
         if(room < kMlaV12ScratchBytesPerBatch)
@@ -1201,9 +1215,7 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
             return 0;
         }
         const int32_t chunk = room / kMlaV12ScratchBytesPerBatch;
-        return (chunk > MLA_V12_PARALLEL_BATCH_CHUNK)
-                   ? static_cast<int32_t>(MLA_V12_PARALLEL_BATCH_CHUNK)
-                   : chunk;
+        return (chunk > chunk_ceiling) ? chunk_ceiling : chunk;
     };
     // A chunk below the floor spends more on the three barriers bracketing each
     // pass than the pass saves, so the serial planner is the better answer.
