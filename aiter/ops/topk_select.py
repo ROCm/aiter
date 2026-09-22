@@ -970,8 +970,8 @@ def _dispatch(
     elif backend == "stream":
         wave = wave_size_of(input.device.index)
         rejects = input.shape[1] - topk
-        small_reject = (
-            0 < rejects <= 4
+        small_reject = rejects > 0 and (
+            rejects <= 4
             or (rows >= 1024 and rejects <= 7)
             or (rows >= 4096 and rejects <= 8)
         )
