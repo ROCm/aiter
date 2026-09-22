@@ -73,6 +73,15 @@ struct MhaV4Recipe
 };
 
 constexpr int64_t kHeadDim = 128;
+constexpr int64_t kGfx950StagedSparseMaxKvTiles = 8192;
+
+bool uses_gfx950_staged_sparse_lut(const MhaV4Recipe& recipe)
+{
+    return recipe.q_format == format_id(AttentionFormat::Bf16) ||
+           recipe.q_format == format_id(AttentionFormat::Fp8E4M3) ||
+           recipe.q_format == format_id(AttentionFormat::Fp4E2M1) ||
+           recipe.q_format == format_id(AttentionFormat::Int8);
+}
 
 struct PointerSlot
 {
@@ -937,6 +946,14 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
     const int64_t q_tiles  = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
     const int64_t kv_tiles = (shapes.seqlen_k + cfg.ts_kv - 1) / cfg.ts_kv;
+    if(arch == "gfx950" && uses_gfx950_staged_sparse_lut(recipe))
+    {
+        TORCH_CHECK(kv_tiles <= kGfx950StagedSparseMaxKvTiles,
+                    "gfx950 LDS-staged sparse MHA v4 supports at most ",
+                    kGfx950StagedSparseMaxKvTiles,
+                    " KV tiles, got ",
+                    kv_tiles);
+    }
     const int64_t lut_rows = shapes.batch * shapes.nhead_q * q_tiles;
     TORCH_CHECK(kv_block_indices.is_cuda() && lut_start.is_cuda() && lut_count.is_cuda(),
                 "LUT tensors must be GPU tensors");

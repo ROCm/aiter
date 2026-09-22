@@ -233,7 +233,9 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.BF16,
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse"),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
+            ),
             id="bf16",
         ),
         pytest.param(
@@ -246,7 +248,9 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 native_fp8_format(),
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse"),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
+            ),
             id="bf16fp8",
         ),
         pytest.param(
@@ -781,6 +785,30 @@ def _gfx950_only(launch, label):
 
 
 _EMPTY_ROW_LAUNCHES = [
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            block_mask=m,
+        ),
+        "bf16",
+    ),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            native_fp8_format(),
+            block_mask=m,
+        ),
+        "bf16fp8",
+    ),
     pytest.param(
         lambda q, k, v, m: mha_v4(
             q,
@@ -987,6 +1015,36 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
         )
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse")
+def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
+    max_tiles = 8192
+    kv_tile = mha_v4_kv_tile()
+    q = torch.zeros((1, 1, 1, 128), device="cuda", dtype=torch.bfloat16)
+    backing = torch.zeros(128, device="cuda", dtype=torch.bfloat16)
+    kv = backing.as_strided((1, (max_tiles + 1) * kv_tile, 1, 128), (0, 0, 0, 1))
+    indices = torch.zeros(1, device="cuda", dtype=torch.int32)
+    row = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="supports at most 8192 KV tiles"):
+        mha_v4_packed(
+            q,
+            kv,
+            kv,
+            q,
+            kv,
+            kv,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            kv_block_indices=indices,
+            lut_start=row,
+            lut_count=row,
+        )
+
+
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 @pytest.mark.skipif(
     not _mha_v4_sparse_co_available(),
@@ -1072,6 +1130,8 @@ _MX_SCALES = {
 
 # (q/k format, v format, kwargs). K takes Q's format, as the manifest rows do.
 SPARSE_RECIPES = {
+    "bf16": (AttentionFormat.BF16, AttentionFormat.BF16, {}),
+    "bf16fp8": (AttentionFormat.BF16, FP8, {}),
     "i8fp8": (AttentionFormat.INT8, FP8, {}),
     "fp8": (FP8, FP8, {}),
     "mxfp8": (FP8, FP8, _MX_SCALES),
@@ -1165,7 +1225,9 @@ def test_mha_v4_sparse_skipping_lut_holds_as_tile_count_grows(recipe_name):
 
 
 @requires_sparse
-@pytest.mark.parametrize("recipe_name", ["i8fp8", "fp8", "mxfp8", "f6f8"])
+@pytest.mark.parametrize(
+    "recipe_name", ["bf16", "bf16fp8", "i8fp8", "fp8", "mxfp8", "f6f8"]
+)
 def test_mha_v4_sparse_all_true_lut_matches_dense_bitwise(recipe_name):
     """An all-true LUT selects every tile, so the walk must reduce exactly to the dense one.
 
