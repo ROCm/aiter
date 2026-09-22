@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 import aiter
+import aiter.ops.gemm_op_a6w4 as a6w4_ops
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.gemm_op_a6w4 import (
     _select_gemm_a6w4_kernel,
@@ -322,6 +323,30 @@ def test_a6w4_asm_rejects_malformed_or_misaligned_buffers():
     misaligned_x.copy_(x_packed)
     with pytest.raises(RuntimeError, match="aligned to 16 bytes"):
         gemm_a6w4_asm(misaligned_x, w_packed, x_scales, w_scales, out, K)
+
+
+def test_mxfp4_compile_launch_avoids_device_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tensors = (torch.empty(0, device="meta"),) * 3
+    calls = []
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        a6w4_ops,
+        "_native_quant_mxfp4_gemm_hip_out",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "device",
+        lambda *_args, **_kwargs: pytest.fail(
+            "compile-time launch entered a CUDA device context"
+        ),
+    )
+
+    a6w4_ops._launch_quant_mxfp4_gemm_hip_out(*tensors, MX_DEFAULT_ROUND_MODE)
+
+    assert len(calls) == 1
 
 
 @torch.no_grad()

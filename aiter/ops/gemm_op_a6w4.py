@@ -64,6 +64,23 @@ def quant_mxfp4_gemm_hip_out(
 _native_quant_mxfp4_gemm_hip_out = quant_mxfp4_gemm_hip_out
 
 
+def _launch_quant_mxfp4_gemm_hip_out(
+    input: Tensor,
+    packed: Tensor,
+    packed_scale: Tensor,
+    round_mode: int,
+) -> None:
+    """Call the native packer without a compile-time device context."""
+    if (
+        torch.compiler.is_compiling()
+        or input.device.index == torch.cuda.current_device()
+    ):
+        _native_quant_mxfp4_gemm_hip_out(input, packed, packed_scale, round_mode)
+        return
+    with torch.cuda.device(input.device):
+        _native_quant_mxfp4_gemm_hip_out(input, packed, packed_scale, round_mode)
+
+
 def quant_mxfp4_gemm_hip_out(
     input: Tensor,
     packed: Tensor,
@@ -99,8 +116,7 @@ def quant_mxfp4_gemm_hip_out(
     ):
         raise ValueError("quant_mxfp4_gemm_hip_out requires 16-byte-aligned outputs")
     round_mode_int = _normalize_round_mode(round_mode)
-    with torch.cuda.device(input.device):
-        _native_quant_mxfp4_gemm_hip_out(input, packed, packed_scale, round_mode_int)
+    _launch_quant_mxfp4_gemm_hip_out(input, packed, packed_scale, round_mode_int)
 
 
 def _default_gemm_a6w4_kernel(M: int, N: int, K: int) -> str:
