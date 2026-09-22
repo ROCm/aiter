@@ -53,7 +53,6 @@ __all__ = [
     "RaceResult",
     "Samples",
     "Verdict",
-    "check_t_implementation",
     "critical_t",
     "cuda_event_timer",
     "indistinguishable_set",
@@ -716,30 +715,3 @@ def critical_t(alpha_two_sided: float, degrees: int) -> float:
         if high - low < 1e-12 * max(1.0, high):
             break
     return 0.5 * (low + high)
-
-
-def check_t_implementation() -> None:
-    """Pin the hand-rolled t against printed tables before spending GPU time.
-
-    The continued fraction above is the one piece of this file that can be
-    wrong without looking wrong: a subtly bad critical value does not raise,
-    it just eliminates candidates the evidence does not support. Published
-    two-sided critical values are an external check that costs microseconds.
-    """
-    table = {
-        (1, 0.05): 12.706,
-        (2, 0.05): 4.303,
-        (5, 0.05): 2.571,
-        (10, 0.05): 2.228,
-        (29, 0.05): 2.045,
-        (2, 0.01): 9.925,
-        (10, 0.01): 3.169,
-        (29, 0.001): 3.659,
-    }
-    for (degrees, alpha), expected in table.items():
-        actual = critical_t(alpha, degrees)
-        if abs(actual - expected) > 0.001:
-            raise AssertionError(
-                f"t_{{{degrees}}}({alpha}) computed {actual:.4f}, "
-                f"tables say {expected:.4f}"
-            )

@@ -62,11 +62,13 @@ def get_gpu_model(device_id: int = 0) -> str:
 TUNING_HARDWARE_FIELDS = ("gfx", "gpu_model", "cu_num")
 
 
+@functools.lru_cache(maxsize=8)
 def get_tuning_hardware(device_id: int = 0) -> dict[str, str | int]:
     """Return the hardware identity a tuned row is only valid for.
 
     A measurement is specific to the arch, the SKU and the CU count it ran on,
-    so tuning families scope their rows by this triple.
+    so tuning families scope their rows by this triple. The result is cached
+    and shared, so callers must not mutate it.
     """
 
     import torch
