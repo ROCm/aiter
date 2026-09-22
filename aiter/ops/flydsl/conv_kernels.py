@@ -434,7 +434,7 @@ def _load_tuned_table():
         return {}
 
 
-def _log_tuned_lookup(table, dev, key, hit):
+def _log_tuned_lookup(table, dev, key, hit, borrowed=False):
     """Report once per (device, shape) where this conv's launch config came from.
 
     A hit is reported only under AITER_LOG_TUNED_CONFIG, as in the GEMM
@@ -442,6 +442,9 @@ def _log_tuned_lookup(table, dev, key, hit):
     without a word is the outcome worth seeing. An empty table is silent either
     way: shipping no tuned rows for this op is the normal state, and the
     heuristic is the intended answer there.
+
+    A borrowed row is reported like a hit but named as one, since it is the
+    outcome where tuning this resolution would still be worth something.
     """
     if not table or (dev, key) in _TUNED_LOOKUP_LOGGED:
         return
@@ -463,6 +466,14 @@ def _log_tuned_lookup(table, dev, key, hit):
     if hit is not None:
         splitk = hit[2]
         sk_s = f", splitK={splitk}" if splitk is not None else ""
+        if borrowed:
+            logger.info(
+                f"conv3d_implicit: {shape} has no tuned row of its own on "
+                f"gfx={dev[0]}, cu_num={dev[1]}; borrowing this layer's nearest "
+                f"tuned resolution, tile={hit[0]}, wgm={hit[1]}. Tune this shape "
+                f"for the exact config."
+            )
+            return
         logger.info(
             f"conv3d_implicit: {shape} is tuned on gfx={dev[0]}, "
             f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}."
@@ -481,6 +492,80 @@ def _log_tuned_lookup(table, dev, key, hit):
             f"conv3d_implicit: {shape} has no tuned row for gfx={dev[0]}, "
             f"cu_num={dev[1]}; using the heuristic tile."
         )
+
+
+# Which positions of a lookup key say what resolution a row was traced at,
+# rather than which layer it is.
+_RESOLUTION_KEY_IDX = frozenset(
+    TUNED_KEY_COLUMNS.index(c) for c in ("N", "D", "H", "W")
+)
+
+# How far the borrowed row's npq may sit from the one being served. Borrowing
+# interpolates between sizes the tuner measured; an order of magnitude away is
+# extrapolation, and the heuristic is the better answer there.
+_BORROW_NPQ_RATIO = 4.0
+
+
+def _layer_key(key):
+    """The part of a lookup key that identifies the layer, not the resolution."""
+    return tuple(v for i, v in enumerate(key) if i not in _RESOLUTION_KEY_IDX)
+
+
+def _key_npq(key):
+    """The implicit GEMM's row count for one lookup key."""
+    f = dict(zip(TUNED_KEY_COLUMNS, key))
+    return (
+        f["N"]
+        * out_extent(f["D"], f["pad_d"], f["dil_d"], f["kT"], f["stride_d"])
+        * out_extent(f["H"], f["pad_h"], f["dil_h"], f["kH"], f["stride_h"])
+        * out_extent(f["W"], f["pad_w"], f["dil_w"], f["kW"], f["stride_w"])
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _tuned_rows_by_layer():
+    """The tuned table regrouped as ``{(gfx, cu_num, *layer): [(npq, hit), ...]}``."""
+    by_layer = {}
+    for key, hit in _load_tuned_table().items():
+        dev, shape = key[:2], key[2:]
+        by_layer.setdefault(dev + _layer_key(shape), []).append((_key_npq(shape), hit))
+    return by_layer
+
+
+def _borrow_tuned_tile(dev, key):
+    """A tuned row for the same layer at another resolution, or None.
+
+    ``dyn_hw`` makes one artifact serve a layer at any size, but the tile is
+    still chosen per row, so a resolution the table does not list would
+    otherwise drop to ``_pick_tile``'s four-tile ladder. The nearest tuned row
+    recovers most of that: measured over the 28 layers the two VAEs have at two
+    resolutions each, borrowing runs 6.3% faster than the heuristic where the
+    exact row would have run 7.6% faster.
+
+    Nearest by npq, since that is the axis a tile is chosen along. ``splitK`` is
+    deliberately not borrowed -- it is sized against the row's own npq and the
+    CU count, so the caller re-derives it.
+
+    At four resolutions neither VAE has a row for, this runs 6.1% faster than
+    the heuristic overall. The gain is not uniform, and the exception has a
+    shape to it: every layer that came out slower was the innermost one, where
+    the channel count is widest and the spatial extent smallest (384->384, 10-16%
+    slower at four sizes, 40% at one). A tile transfers between resolutions of a
+    layer that is large in M; it transfers badly once M is small enough that the
+    tile shape is what decides occupancy. The exact row always wins when the
+    table has one, so a resolution that matters should be tuned rather than left
+    to this.
+    """
+    rows = _tuned_rows_by_layer().get(dev + _layer_key(key))
+    if not rows:
+        return None
+    want = _key_npq(key)
+    if want <= 0:
+        return None
+    npq, hit = min(rows, key=lambda row: abs(row[0] - want))
+    if not npq or not 1 / _BORROW_NPQ_RATIO <= want / npq <= _BORROW_NPQ_RATIO:
+        return None
+    return (hit[0], hit[1], None)
 
 
 def _lookup_tuned_tile(key, device):
@@ -503,7 +588,10 @@ def _lookup_tuned_tile(key, device):
         return None
     table = _load_tuned_table()
     hit = table.get((*dev, *key))
-    _log_tuned_lookup(table, dev, key, hit)
+    borrowed = hit is None
+    if borrowed:
+        hit = _borrow_tuned_tile(dev, key)
+    _log_tuned_lookup(table, dev, key, hit, borrowed=borrowed)
     return hit
 
 
