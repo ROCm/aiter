@@ -354,6 +354,28 @@ def topk_per_row_radix_stream_lds_plan(
     return None
 
 
+def topk_per_row_radix_stream_window_cap(
+    k: int,
+    block_threads: int = _BLOCK_THREADS,
+    lds_budgets: tuple[int, int] | None = None,
+    vec: int = _VEC,
+    lds_plan: tuple[int, int] | None = None,
+) -> int:
+    """Maximum row width that completes in the initial candidate window."""
+    lds_budgets = lds_budgets or _lds_budgets()
+    resolved = _resolve_lds(
+        k, block_threads, lds_budgets, vec, plan=lds_plan
+    )
+    if resolved is None:
+        raise ValueError(
+            "[FlyDSL topk_per_row_radix_stream] no LDS plan for "
+            f"k={k}, block_threads={block_threads}"
+        )
+    unroll, soft_trigger = resolved
+    capacity = k + soft_trigger + unroll * block_threads * vec
+    return (capacity // vec) * vec
+
+
 @lru_cache(maxsize=64)
 def topk_per_row_radix_stream_serves(
     k: int,
@@ -397,6 +419,7 @@ def build_topk_per_row_radix_stream_module(
     wave_size: int,
     partial: bool = False,
     labelled: bool = False,
+    terminal: bool = False,
     block_threads: int = _BLOCK_THREADS,
     lds_budgets: tuple[int, int] | None = None,
     vec: int = _VEC,
@@ -424,12 +447,22 @@ def build_topk_per_row_radix_stream_module(
     by the ORIGINAL column and so return the same answer as an unsplit one.
     A slice selector has positions that mean something and never needs it, so
     the two modes are exclusive.
+
+    `terminal` is for an unsplit row that fits wholly in the initial candidate
+    window. There is no later tile to consume the selected keys, so compact can
+    write each winning column directly to the output and omit the survivor
+    copy, threshold publication, final coalesced copy, and their two barriers.
     """
     if labelled and partial:
         raise ValueError(
             "[FlyDSL topk_per_row_radix_stream] `labelled` relabels the columns "
             "a block reports and `partial` renumbers them into the row's own "
             "coordinates; asking for both leaves the answer's columns undefined"
+        )
+    if terminal and (partial or labelled):
+        raise ValueError(
+            "[FlyDSL topk_per_row_radix_stream] the terminal-window build is "
+            "only valid for an unsplit, unlabelled selection"
         )
     lds_budgets = lds_budgets or _lds_budgets()
     reason = topk_per_row_radix_stream_serves(
@@ -466,17 +499,19 @@ def build_topk_per_row_radix_stream_module(
         scan: fx.Array[Int32, num_waves, 16]
         state: fx.Array[Int32, _ST_SLOTS, 16]
 
+    signature_args = {
+        "k": k,
+        "wave": wave_size,
+        "part": partial,
+        "lab": labelled,
+    }
+    if terminal:
+        signature_args["term"] = True
+    signature_args.update(blk=block_threads, vec=vec, cap=capacity)
+
     @flyc.kernel(
         name="topk_per_row_radix_stream_"
-        + kernel_signature(
-            k=k,
-            wave=wave_size,
-            part=partial,
-            lab=labelled,
-            blk=block_threads,
-            vec=vec,
-            cap=capacity,
-        ),
+        + kernel_signature(**signature_args),
         known_block_size=[block_threads, 1, 1],
     )
     def topk_per_row_radix_stream_kernel(
@@ -700,14 +735,26 @@ def build_topk_per_row_radix_stream_module(
                 need = need_low - state[_ST_ABOVE]
             return cut, n_eq, need
 
-        def compact(count, cand_key, cand_col, keep_key, keep_col, hist, scan, state):
+        def compact(
+            count,
+            cand_key,
+            cand_col,
+            keep_key,
+            keep_col,
+            hist,
+            scan,
+            state,
+            output_idx,
+            output_base,
+            output_col_base,
+        ):
             """Reduce cand[0:count] to its top k, and leave the cut in `state`.
 
-            Winners go to a separate buffer before being copied back: writing
-            them over the array the other threads are still reading is the one
-            race this structure has, and a k-element copy is cheaper than the
-            double buffering that would avoid it -- and far cheaper than holding
-            the whole buffer in registers to dodge the reads.
+            A streamed row puts winners in a separate buffer before copying
+            them back: writing over candidates that other threads still read is
+            the one race this structure has. A terminal window has no consumer
+            after this compact, so its winners can instead go straight to their
+            final global slots.
 
             The answer is the k largest ordered by (key descending, column
             ascending). Only the second half of that order costs anything, and
@@ -792,25 +839,32 @@ def build_topk_per_row_radix_stream_module(
                 if _ugt(key, cut):
                     slot = atomic_add_i32(state, one, _ST_KEPT, "workgroup")
                     if slot < top_k:
-                        keep_key[slot] = key
-                        keep_col[slot] = col
+                        if terminal:
+                            output_idx[output_base + slot] = output_col_base + col
+                        else:
+                            keep_key[slot] = key
+                            keep_col[slot] = col
                 if (key == cut) & (col <= cut_col):
                     taken = atomic_add_i32(state, one, _ST_TIED, "workgroup")
                     slot = top_k - one - taken
                     if slot >= zero:
-                        keep_key[slot] = key
-                        keep_col[slot] = col
-                        # The worst held element is the last tie by column, and
-                        # a max is the same whatever order the lanes arrive in.
-                        atomic_max_i32(state, col, _ST_THR_COL, "workgroup")
-            gpu.barrier()
-            for i in range(tid, top_k, Int32(block_threads)):
-                cand_key[i] = keep_key[i]
-                cand_col[i] = keep_col[i]
-            if tid == zero:
-                state[_ST_ARRIVED] = zero
-                state[_ST_THR] = cut
-            gpu.barrier()
+                        if terminal:
+                            output_idx[output_base + slot] = output_col_base + col
+                        else:
+                            keep_key[slot] = key
+                            keep_col[slot] = col
+                            # The worst held element is the last tie by column,
+                            # and a max is the same whatever order lanes arrive.
+                            atomic_max_i32(state, col, _ST_THR_COL, "workgroup")
+            if not terminal:
+                gpu.barrier()
+                for i in range(tid, top_k, Int32(block_threads)):
+                    cand_key[i] = keep_key[i]
+                    cand_col[i] = keep_col[i]
+                if tid == zero:
+                    state[_ST_ARRIVED] = zero
+                    state[_ST_THR] = cut
+                gpu.barrier()
 
         def absorb(base, cand_key, cand_col, state):
             """Filter one group of `unroll` tiles, re-selecting between them.
@@ -924,18 +978,47 @@ def build_topk_per_row_radix_stream_module(
                         cand_col[col] = labels[j] if labelled else col
             gpu.barrier()
 
-            compact(window, cand_key, cand_col, keep_key, keep_col, hist, scan, state)
+            compact(
+                window,
+                cand_key,
+                cand_col,
+                keep_key,
+                keep_col,
+                hist,
+                scan,
+                state,
+                row_indices,
+                out_base,
+                col_base,
+            )
 
-            groups = fx.ceildiv(row_len - window, Int32(unroll * tile))
-            for _t in range(zero, groups, one):
-                absorb(
-                    window + Int32(_t) * Int32(unroll * tile),
-                    cand_key,
-                    cand_col,
-                    state,
-                )
+            if not terminal:
+                groups = fx.ceildiv(row_len - window, Int32(unroll * tile))
+                for _t in range(zero, groups, one):
+                    absorb(
+                        window + Int32(_t) * Int32(unroll * tile),
+                        cand_key,
+                        cand_col,
+                        state,
+                    )
+                    arrived = state[_ST_ARRIVED]
+                    if arrived >= Int32(soft_trigger):
+                        compact(
+                            top_k + arrived,
+                            cand_key,
+                            cand_col,
+                            keep_key,
+                            keep_col,
+                            hist,
+                            scan,
+                            state,
+                            row_indices,
+                            out_base,
+                            col_base,
+                        )
+
                 arrived = state[_ST_ARRIVED]
-                if arrived >= Int32(soft_trigger):
+                if arrived > zero:
                     compact(
                         top_k + arrived,
                         cand_key,
@@ -945,28 +1028,18 @@ def build_topk_per_row_radix_stream_module(
                         hist,
                         scan,
                         state,
+                        row_indices,
+                        out_base,
+                        col_base,
                     )
 
-            arrived = state[_ST_ARRIVED]
-            if arrived > zero:
-                compact(
-                    top_k + arrived,
-                    cand_key,
-                    cand_col,
-                    keep_key,
-                    keep_col,
-                    hist,
-                    scan,
-                    state,
-                )
-
-            for i in range(tid, top_k, Int32(block_threads)):
-                col = col_base + cand_col[i]
-                row_indices[out_base + i] = col
-                if partial:
-                    # The merge selects on values, so re-read each winner; k
-                    # gathered loads against a slice of N/G.
-                    row_vals[out_base + i] = scores[row, col]
+                for i in range(tid, top_k, Int32(block_threads)):
+                    col = col_base + cand_col[i]
+                    row_indices[out_base + i] = col
+                    if partial:
+                        # The merge selects on values, so re-read each winner; k
+                        # gathered loads against a slice of N/G.
+                        row_vals[out_base + i] = scores[row, col]
 
     @flyc.jit
     def launch_topk_per_row_radix_stream(
@@ -1000,5 +1073,6 @@ def build_topk_per_row_radix_stream_module(
         "arrivals_cap": arrivals_cap,
         "lds_bytes": (capacity + k) * 8 + _NUM_BUCKETS * 4,
         "labelled": labelled,
+        "terminal": terminal,
     }
     return launch_topk_per_row_radix_stream

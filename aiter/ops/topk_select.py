@@ -46,6 +46,7 @@ from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
     topk_per_row_radix_stream_block_threads,
     topk_per_row_radix_stream_lds_plan,
     topk_per_row_radix_stream_serves,
+    topk_per_row_radix_stream_window_cap,
 )
 from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
 from aiter.ops.flydsl.topk.topk_per_row_argmax import (
@@ -904,6 +905,23 @@ def _dispatch(
                 stream,
             )
             return
+        block_threads = topk_per_row_radix_stream_block_threads(rows, topk)
+        lds_plan = topk_per_row_radix_stream_lds_plan(
+            rows, input.shape[1], topk
+        )
+        # The direct terminal placement is measured and regression-tested at
+        # k=2048.  A row with width == k needs no selection, so leave that
+        # existing fast path alone. Keep the dispatch boundary narrow until
+        # the other k values have equivalent coverage rather than silently
+        # broadening their path.
+        terminal = (
+            topk == 2048
+            and input.shape[1] > topk
+            and input.shape[1]
+            <= topk_per_row_radix_stream_window_cap(
+                topk, block_threads=block_threads, lds_plan=lds_plan
+            )
+        )
         _run_compiled(
             # The block width follows the ROW COUNT and k, not the row width --
             # see the sweep behind `topk_per_row_radix_stream_block_threads`.
@@ -912,10 +930,11 @@ def _dispatch(
             build_topk_per_row_radix_stream_module(
                 topk,
                 wave,
-                block_threads=topk_per_row_radix_stream_block_threads(rows, topk),
+                terminal=terminal,
+                block_threads=block_threads,
                 # The deepest prefetch the budget allows is not the one that
                 # wins, and the budget has no term for the row count.
-                lds_plan=topk_per_row_radix_stream_lds_plan(rows, input.shape[1], topk),
+                lds_plan=lds_plan,
             ),
             input,
             row_lens,
