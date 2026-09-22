@@ -138,6 +138,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_pa_v1.py]=27
     FILE_TIMES[op_tests/test_hipblaslt_lifecycle.py]=26
     FILE_TIMES[op_tests/test_flydsl_mla_reduce.py]=25
+    FILE_TIMES[op_tests/test_flydsl_mxscale_preshuffle.py]=25
     FILE_TIMES[op_tests/test_kvcache_blockscale.py]=25
     FILE_TIMES[op_tests/test_moe_blockscale.py]=25
     FILE_TIMES[op_tests/test_sample.py]=24

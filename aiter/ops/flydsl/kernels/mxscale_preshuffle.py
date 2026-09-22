@@ -83,20 +83,11 @@ def launch_gemm(
     a_dtype: Constexpr[str],
     out_dtype: Constexpr[str],
     b_dtype: Constexpr[str],
-    batch: Constexpr[int],
-    a_row_stride: Constexpr[int],
-    a_batch_stride: Constexpr[int],
-    sca_row_stride: Constexpr[int],
-    sca_batch_stride: Constexpr[int],
-    c_row_stride: Constexpr[int],
-    c_batch_stride: Constexpr[int],
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
 ):
     """Launch one statically configured MX-scale GEMM."""
-    if const_expr(batch != 1):
-        raise ValueError("mxscale preshuffle GEMM launches 2D contiguous tensors only")
     if const_expr(a_dtype not in ("fp4", "fp8") or b_dtype not in ("fp4", "fp8")):
         raise ValueError(
             f"unsupported dtypes {a_dtype}/{b_dtype}; expected fp4 or fp8 operands"
@@ -162,10 +153,8 @@ def launch_gemm(
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
         if const_expr(k_batch > 1):
-            batch_index = bid_z // k_batch
             k_tile_start = fx.Int32(bid_z % k_batch) * fx.Int32(k_tiles_local)
         else:
-            batch_index = bid_z
             k_tile_start = fx.Int32(0)
         wave = rocdl.readfirstlane(T.i32, tid // 64)
         lane = tid % 64
@@ -190,42 +179,12 @@ def launch_gemm(
             block_m = bid_x * BM
             block_n = bid_y * BN
 
-        if const_expr(batch > 1):
-            a_rstride = fx.Int32(a_row_bytes if a_row_stride < 0 else a_row_stride)
-            scale_a_rstride = fx.Int32(
-                scale_chunk_dwords if sca_row_stride < 0 else sca_row_stride
-            )
-            batch_i64 = fx.Int64(batch_index)
-            if const_expr(a_batch_stride < 0):
-                arg_a = arg_a + batch_i64 * (fx.Int64(i32_m) * fx.Int64(a_row_bytes))
-            else:
-                arg_a = arg_a + batch_i64 * fx.Int64(a_batch_stride)
-            arg_b = arg_b + batch_i64 * fx.Int64(N * b_row_bytes)
-            if const_expr(sca_batch_stride < 0):
-                scale_batch_stride = (
-                    fx.Int64((i32_m + 31) // 32)
-                    * fx.Int64(scale_chunk_dwords)
-                    * fx.Int64(4)
-                )
-                arg_scale_a = arg_scale_a + batch_i64 * scale_batch_stride
-            else:
-                arg_scale_a = arg_scale_a + batch_i64 * fx.Int64(sca_batch_stride)
-            arg_scale_b = arg_scale_b + batch_i64 * fx.Int64(
-                (N // 32) * scale_chunk_dwords * 4
-            )
-        else:
-            a_rstride = fx.Int32(a_row_bytes)
-            scale_a_rstride = fx.Int32(scale_chunk_dwords)
-
+        a_rstride = fx.Int32(a_row_bytes)
+        scale_a_rstride = fx.Int32(scale_chunk_dwords)
         i8_global = fx.PointerType.get(
             T.i8, address_space=fx.AddressSpace.Global, alignment=16
         )
-        if const_expr(batch > 1 and a_row_stride >= 0):
-            a_num_records = fx.Int64(i32_m - fx.Int32(1)) * fx.Int64(
-                a_rstride
-            ) + fx.Int64(a_row_bytes)
-        else:
-            a_num_records = fx.Int64(i32_m) * fx.Int64(a_row_bytes)
+        a_num_records = fx.Int64(i32_m) * fx.Int64(a_row_bytes)
         a_flat = fx.rocdl.make_buffer_tensor(
             fx.Tensor(
                 fx.make_view(
@@ -333,15 +292,9 @@ def launch_gemm(
         )
         scale_layout = fx.make_layout(1 << 28, 1)
         a_scale_chunks = (i32_m + 31) // 32
-        if const_expr(batch > 1 and sca_row_stride >= 0):
-            a_scale_num_records = (
-                fx.Int64(a_scale_chunks - 1) * fx.Int64(scale_a_rstride)
-                + fx.Int64(scale_chunk_dwords)
-            ) * fx.Int64(4)
-        else:
-            a_scale_num_records = (
-                fx.Int64(a_scale_chunks) * fx.Int64(scale_chunk_dwords) * fx.Int64(4)
-            )
+        a_scale_num_records = (
+            fx.Int64(a_scale_chunks) * fx.Int64(scale_chunk_dwords) * fx.Int64(4)
+        )
         b_scale_num_records = fx.Int64((N // 32) * scale_chunk_dwords * 4)
         a_scale_flat = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(
@@ -534,7 +487,7 @@ def launch_gemm(
             results = yield accumulators
         accumulators = results
 
-        c_stride = N if c_row_stride < 0 else c_row_stride
+        c_stride = N
         if const_expr(k_batch > 1):
             store_elem = Float32
             element_bytes = 4
@@ -545,13 +498,6 @@ def launch_gemm(
             store_elem = out_elem
             element_bytes = 2
             c_addr = arg_c
-            if const_expr(batch > 1):
-                c_batch_bytes = (
-                    fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
-                    if c_batch_stride < 0
-                    else fx.Int64(c_batch_stride)
-                )
-                c_addr = c_addr + fx.Int64(batch_index) * c_batch_bytes
 
         c_tile_addr = c_addr + fx.Int64(block_m) * fx.Int64(c_stride) * fx.Int64(
             element_bytes
@@ -608,7 +554,7 @@ def launch_gemm(
     waves = waves_per_eu if const_expr(waves_per_eu > 0) else None
     grid_x = (i32_m + (BM - 1)) // BM
     grid_y = i32_n // BN
-    grid_z = batch * k_batch
+    grid_z = k_batch
     kernel_gemm(
         c_addr,
         a_addr,

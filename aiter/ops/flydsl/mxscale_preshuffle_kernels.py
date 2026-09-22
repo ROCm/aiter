@@ -174,13 +174,6 @@ def flydsl_mxscale_preshuffle_gemm(
         a_dtype,
         out_dtype,
         b_dtype,
-        1,  # batch
-        -1,  # a_row_stride
-        -1,  # a_batch_stride
-        -1,  # sca_row_stride
-        -1,  # sca_batch_stride
-        -1,  # c_row_stride
-        -1,  # c_batch_stride
         int(waves_per_eu),
         int(xcd_swizzle),
         split_k,
