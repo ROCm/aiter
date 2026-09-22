@@ -253,7 +253,7 @@ def _gather_run(st, num_heads, head_size, next_n, block, preshuffle,
                         preshuffle=preshuffle)
     out = paged_mxfp4_mqa_logits(
         st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-        st["block_table"], st["mml"], preshuffle=preshuffle, gather=meta,
+        st["block_table"], st["mml"], preshuffle=preshuffle, use_gather=True, candidates=meta,
         cu_ends=cu_ends, dynamic=dynamic)
     torch.cuda.synchronize()
     return out
@@ -520,7 +520,7 @@ def test_block_scores_rejects_gather():
     with pytest.raises(AssertionError, match="dense producer"):
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], gather=meta, cu_ends=ends,
+            st["block_table"], st["mml"], use_gather=True, candidates=meta, cu_ends=ends,
             block_scores=bs, calc_block_scores=True)
 
 
@@ -689,7 +689,7 @@ def test_scores_only_rejects_gather():
     with pytest.raises(AssertionError, match="dense producer"):
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], gather=meta, cu_ends=ends,
+            st["block_table"], st["mml"], use_gather=True, candidates=meta, cu_ends=ends,
             block_scores=bs, calc_logits=False, calc_block_scores=True)
 
 
@@ -747,9 +747,9 @@ def test_candidates_implicit(num_heads):
                                       128, block)
     a = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
                                st["cl"], st["block_table"], K * block,
-                               gather=meta, cu_ends=cu)
+                               use_gather=True, candidates=meta, cu_ends=cu)
     b = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
                                st["cl"], st["block_table"], K * block,
-                               candidates=ids, cu_ends=ends)
+                               use_gather=True, candidates=ids, cu_ends=ends)
     torch.cuda.synchronize()
     assert torch.equal(a.view(torch.int32), b.view(torch.int32))

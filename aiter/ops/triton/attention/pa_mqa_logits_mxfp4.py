@@ -401,8 +401,8 @@ def paged_mxfp4_mqa_logits(
     dynamic: int = 0,
     schedule: torch.Tensor | None = None,
     cu_ends: torch.Tensor | None = None,
-    gather: dict | None = None,
-    candidates: torch.Tensor | None = None,
+    use_gather: bool = False,
+    candidates: torch.Tensor | dict | None = None,
     block_scores: torch.Tensor | None = None,
     calc_logits: bool = True,
     calc_block_scores: bool = False,
@@ -439,11 +439,12 @@ def paged_mxfp4_mqa_logits(
                     context_lens[b] - NEXT_N + n + 1; pass it under compression
                     or context parallelism. build_schedule needs the same tensor.
                     Under gather it counts the row's valid candidate slots
-                    instead, the list having been causally filtered already
-    gather:         what build_gather returns. The walk then runs over a
-                    host-resolved candidate list rather than the context, and
-                    output column j holds candidate slot j. context_lens and
-                    block_table are unread on this path
+    use_gather:     bool. Walk a candidate list rather than the context, so
+                    output column j holds candidate slot j
+    candidates:     [B * NEXT_N, K] int32 ranked block ids, resolved here, or
+                    what build_candidate_gather returned, used as is. cu_ends
+                    is the per-row key bound for the first and the slot count
+                    for the second
     block_scores:   [B * NEXT_N, ceil(max_model_len / candidate_block_size)],
                     dtype float32. Allocated here if absent. Blocks [0,
                     ceil(context_len / C)) are written, the tail past them is
@@ -543,19 +544,25 @@ def paged_mxfp4_mqa_logits(
             f"max_model_len {max_model_len} exceeds what a buffer store can "
             "address")
 
-    if candidates is not None:
-        # Build the pool here for a caller that has one consumer. Four of them
-        # should call build_candidate_gather once and pass `gather` instead.
-        assert gather is None, "pass candidates or gather, not both"
-        n = torch.arange(next_n, device=q.device, dtype=torch.int32)
-        key_ends = (cu_ends if cu_ends is not None else
-                    torch.clamp(context_lens.repeat_interleave(next_n)
-                                - next_n + n.repeat(batch) + 1, min=0))
-        gather, cu_ends = build_candidate_gather(
-            candidates, key_ends,
-            block_table.repeat_interleave(next_n, 0).contiguous(),
-            kv_cache, num_heads, head_size, cand_block, kv_scale_cache,
-            scale_mode)
+    assert use_gather or candidates is None, (
+        "candidates is inapplicable with use_gather off")
+    gather = None
+    if use_gather:
+        assert candidates is not None, "use_gather needs a candidate list"
+        if isinstance(candidates, dict):
+            gather = candidates
+        else:
+            # Resolved here for a single consumer. A layer group should call
+            # build_candidate_gather once and pass what it returns.
+            n = torch.arange(next_n, device=q.device, dtype=torch.int32)
+            key_ends = (cu_ends if cu_ends is not None else
+                        torch.clamp(context_lens.repeat_interleave(next_n)
+                                    - next_n + n.repeat(batch) + 1, min=0))
+            gather, cu_ends = build_candidate_gather(
+                candidates, key_ends,
+                block_table.repeat_interleave(next_n, 0).contiguous(),
+                kv_cache, num_heads, head_size, cand_block, kv_scale_cache,
+                scale_mode)
     gather_on = 1 if gather is not None else 0
     gather_block = int(gather["block"]) if gather_on else 8
     if gather_on:
