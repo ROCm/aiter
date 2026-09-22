@@ -1,4 +1,4 @@
-# SMI monitoring plots
+# SMI monitoring plots and raw-sample timelines
 
 Enable automatic reports for benchmarks that emit `AITER_SMI_RESULT` records:
 
@@ -96,4 +96,74 @@ CPU-only checks:
 
 ```bash
 python3 -m unittest discover -s op_tests -p 'test_smi_plot*.py' -v
+```
+
+## Preserve timestamped samples for detailed timelines
+
+`AITER_SMI_TRACE=1` independently enables raw-sample export. The monitor writes
+every already-collected sample after each monitoring window completes; no
+disk writes are added to the polling loop. The output root defaults to
+`./smi_traces`. Set `AITER_SMI_TRACE_DIR` to override it. Setting a directory
+alone does not enable tracing, and the existing summary format and stdout or
+`AITER_SMI_OUTPUT_PATH` destination remain unchanged.
+
+For automatic summary plots and raw capture together:
+
+```bash
+ENABLE_CK=0 \
+AITER_SMI_MONITOR=1 \
+AITER_SMI_PLOT=1 \
+AITER_SMI_PLOT_DIR=/data/gemm_run/summary-plots \
+AITER_SMI_TRACE=1 \
+AITER_SMI_TRACE_DIR=/data/gemm_run/traces \
+AITER_SMI_DURATION=10 \
+AITER_SMI_INTERVAL=0.05 \
+AITER_SMI_SKIP_FUNCTIONS=run_torch \
+python3 op_tests/test_gemm_a8w8_blockscale.py \
+  --flydsl --bpreshuffle True --apre True --data-init norm \
+  -m 512 -nk 6144,7168 7168,3072 8192,1536 2048,7168 65536,1536 7168,16384
+```
+
+Each process writes a fresh `run-<unique-id>/samples.jsonl` under the trace
+root. Each `AITER_SMI_TRACE` record contains schema version 1, the original
+label/device/interval/duration/summary metadata, `sample_count`, and a `samples`
+array preserving the original sample dictionaries and `timestamp_s` values.
+Monotonic window start/end times support precise elapsed positions; the
+approximate Unix start time provides a wall-clock reference. Polling is not
+assumed to be exactly periodic. Errors are reported on stderr without changing
+the benchmark result, and forced termination can lose an in-progress window.
+
+Detailed timeline rendering is an explicit standalone step:
+
+```bash
+python3 aiter/smi_trace_plot.py /data/gemm_run/traces \
+  --output /data/gemm_run/timelines
+```
+
+The renderer creates a PNG/SVG per case, comparing function variants in
+separate columns with clocks, power, activity, temperature, and VRAM panels.
+Every observation appears at its recorded time relative to its own run start.
+The columns do not imply concurrent execution. Matplotlib simplification is
+disabled; no smoothing, averaging, resampling, or downsampling is applied.
+Missing/null and firmware `N/A` readings are retained and plotted as gaps;
+arbitrary corrupt values produce an error. SoC clock is unavailable on some
+devices. Repeated readings can reflect the firmware's own update interval.
+
+Input can be a file or a directory recursively scanned for `*.log`/`*.jsonl`;
+use repeatable `--pattern` options to override the patterns. Each source file
+and case is grouped independently. Repeated runs are retained and paginated
+at two columns per chart by default (`--max-columns` allows one through four).
+Aggregate-only summary logs cannot supply raw observations and are ignored.
+
+`index.html` links all case plots. `raw_points.csv` preserves every sample's
+timestamp, elapsed position, metric values, and full original dictionary in
+`raw_sample_json`. The manifest retains input hashes, run metadata, summary
+statistics, counts, and warnings. Invalid timestamps/counts are rejected rather
+than inferred. Samples outside recorded window boundaries are retained with a
+warning. Use the JSONL trace to regenerate plots without rerunning a benchmark.
+
+Run both summary and raw-timeline CPU checks with:
+
+```bash
+python3 -m unittest discover -s op_tests -p 'test_smi_*.py' -v
 ```

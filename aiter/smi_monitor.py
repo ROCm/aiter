@@ -29,6 +29,11 @@ Plotting copies emitted results into a fresh run directory under
 normal process exit. Existing stdout / ``AITER_SMI_OUTPUT_PATH`` output is
 preserved. Matplotlib is optional and loaded only in the plotting subprocess.
 Long-lived callers can explicitly call ``flush_smi_plots()`` after a workload.
+
+Set ``AITER_SMI_TRACE=1`` to also preserve every timestamped sample under
+``AITER_SMI_TRACE_DIR`` (default: ``./smi_traces``). Raw capture is independent
+of summary plotting; render it with the standalone ``aiter/smi_trace_plot.py``
+CLI for detailed per-case timelines.
 """
 
 from __future__ import annotations
@@ -571,6 +576,8 @@ def replay_with_smi(
 
     synchronize()
     launches = 0
+    trace_enabled = os.environ.get("AITER_SMI_TRACE", "0") == "1"
+    start_wall_s = time.time() if trace_enabled else None
     start = time.perf_counter()
     with monitor_gpu(device_index=device, interval_s=interval_s) as monitor:
         while launches == 0 or time.perf_counter() - start < duration_s:
@@ -578,7 +585,8 @@ def replay_with_smi(
                 fn()
             launches += batch_iters
             synchronize()
-    elapsed_s = time.perf_counter() - start
+    end = time.perf_counter()
+    elapsed_s = end - start
 
     result = {
         "label": label,
@@ -598,4 +606,14 @@ def replay_with_smi(
     # A shared JSONL sink survives fd silencing and child processes. Standalone
     # UT runs without a sink still get a machine-readable stdout record.
     emit_smi_result(result)
+    if trace_enabled:
+        from aiter.smi_trace import emit_smi_trace
+
+        emit_smi_trace(
+            result,
+            monitor.samples,
+            start_s=start,
+            end_s=end,
+            start_unix_s=start_wall_s,
+        )
     return result
