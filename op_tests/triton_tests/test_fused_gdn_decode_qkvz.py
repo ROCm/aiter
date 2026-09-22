@@ -178,17 +178,17 @@ def make_inputs(batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, see
     group_width = 2 * head_dim + 2 * ratio * head_dim
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
 
-    return dict(
-        projected_qkvz=torch.randn(
+    return {
+        "projected_qkvz": torch.randn(
             batch, num_k_heads * group_width, dtype=torch.bfloat16, device=device
         ),
-        projected_ba=torch.randn(
+        "projected_ba": torch.randn(
             batch, 2 * num_v_heads, dtype=torch.bfloat16, device=device
         ),
-        conv_state=torch.randn(
+        "conv_state": torch.randn(
             num_slots, channels, width - 1, dtype=torch.bfloat16, device=device
         ),
-        ssm_state=torch.randn(
+        "ssm_state": torch.randn(
             num_slots,
             num_v_heads,
             head_dim,
@@ -196,24 +196,23 @@ def make_inputs(batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, see
             dtype=torch.float32,
             device=device,
         ),
-        # Slot 0 is reserved for CUDA-graph dummy traffic; allocate from 1 up.
-        ssm_state_indices=torch.arange(1, batch + 1, dtype=torch.int32, device=device),
-        # Deployed dtypes: conv/norm/dt parameters arrive as bf16 model weights,
-        # A_log as fp32, and the recurrent state as fp32. Two of the seven
-        # Artemis variants (m16, m64) assert exactly this; the rest accept
-        # whatever the pointer says, which is why the contract is worth pinning.
-        conv_weight=torch.randn(channels, width, dtype=torch.bfloat16, device=device),
-        conv_bias=torch.randn(channels, dtype=torch.bfloat16, device=device),
-        A_log=torch.randn(num_v_heads, dtype=torch.float32, device=device),
-        dt_bias=torch.randn(num_v_heads, dtype=torch.bfloat16, device=device),
-        norm_weight=torch.randn(head_dim, dtype=torch.bfloat16, device=device),
-        scale=head_dim**-0.5,
-        norm_eps=1e-6,
-        num_k_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        head_k_dim=head_dim,
-        head_v_dim=head_dim,
-    )
+        "ssm_state_indices": torch.arange(
+            1, batch + 1, dtype=torch.int32, device=device
+        ),
+        "conv_weight": torch.randn(
+            channels, width, dtype=torch.bfloat16, device=device
+        ),
+        "conv_bias": torch.randn(channels, dtype=torch.bfloat16, device=device),
+        "A_log": torch.randn(num_v_heads, dtype=torch.float32, device=device),
+        "dt_bias": torch.randn(num_v_heads, dtype=torch.bfloat16, device=device),
+        "norm_weight": torch.randn(head_dim, dtype=torch.bfloat16, device=device),
+        "scale": head_dim**-0.5,
+        "norm_eps": 1e-6,
+        "num_k_heads": num_k_heads,
+        "num_v_heads": num_v_heads,
+        "head_k_dim": head_dim,
+        "head_v_dim": head_dim,
+    }
 
 
 def _import_op():
@@ -458,7 +457,11 @@ def test_fused_gdn_decode_determinism():
         inp["dt_bias"],
         inp["norm_weight"],
     )
-    kwargs = dict(scale=inp["scale"], norm_eps=inp["norm_eps"], quant_dtype=FP8_DTYPE)
+    kwargs = {
+        "scale": inp["scale"],
+        "norm_eps": inp["norm_eps"],
+        "quant_dtype": FP8_DTYPE,
+    }
     first = fused_gdn_decode_qkvz(
         *args[:2], *[a.clone() for a in args[2:4]], *args[4:], **kwargs
     )

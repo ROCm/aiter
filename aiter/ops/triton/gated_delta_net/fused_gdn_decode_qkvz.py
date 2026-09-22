@@ -23,10 +23,7 @@ hand-written ``v_exp_f32``/``v_rcp_f32`` inline asm and explicit register
 layouts.
 """
 
-from typing import Optional, Tuple
-
 import torch
-
 from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
     _decode_group,
     _fused_decode,
@@ -55,12 +52,12 @@ def fused_gdn_decode_qkvz_supported(
     ssm_state: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     conv_weight: torch.Tensor,
-    conv_bias: Optional[torch.Tensor],
+    conv_bias: torch.Tensor | None,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     norm_weight: torch.Tensor,
-    quant_dtype: Optional[torch.dtype] = None,
-) -> Tuple[bool, str]:
+    quant_dtype: torch.dtype | None = None,
+) -> tuple[bool, str]:
     """Report whether this call is covered, and if not, why.
 
     Returns ``(True, "")`` or ``(False, reason)``. The reason is meant to be
@@ -95,10 +92,9 @@ def fused_gdn_decode_qkvz_supported(
         return False, f"head dims must be {_HEAD_DIM}, got {head_k_dim}/{head_v_dim}"
 
     if conv_state.shape[0] != ssm_state.shape[0]:
-        return (
-            False,
+        return False, (
             "conv and recurrent pools must have the same slot count, got "
-            f"{conv_state.shape[0]} and {ssm_state.shape[0]}",
+            f"{conv_state.shape[0]} and {ssm_state.shape[0]}"
         )
 
     channels = conv_state.shape[1]
@@ -133,22 +129,19 @@ def fused_gdn_decode_qkvz_supported(
     if not all(t.dtype is torch.bfloat16 for t in bf16_args):
         return False, "packed projections, conv state/weight/bias must be bf16"
     if A_log.shape != (v_heads,) or A_log.dtype is not torch.float32:
-        return (
-            False,
+        return False, (
             f"A_log must be fp32 [{v_heads}], got {A_log.dtype} "
-            f"{tuple(A_log.shape)}",
+            f"{tuple(A_log.shape)}"
         )
     if dt_bias.shape != (v_heads,) or dt_bias.dtype is not torch.bfloat16:
-        return (
-            False,
+        return False, (
             f"dt_bias must be bf16 [{v_heads}], got {dt_bias.dtype} "
-            f"{tuple(dt_bias.shape)}",
+            f"{tuple(dt_bias.shape)}"
         )
     if norm_weight.shape != (head_v_dim,) or norm_weight.dtype is not torch.bfloat16:
-        return (
-            False,
+        return False, (
             f"norm_weight must be bf16 [{head_v_dim}], got {norm_weight.dtype} "
-            f"{tuple(norm_weight.shape)}",
+            f"{tuple(norm_weight.shape)}"
         )
     if ssm_state_indices.dtype is not torch.int32:
         return False, f"state indices must be int32, got {ssm_state_indices.dtype}"
@@ -194,9 +187,9 @@ def fused_gdn_decode_qkvz(
     *,
     scale: float,
     norm_eps: float,
-    quant_dtype: Optional[torch.dtype] = None,
+    quant_dtype: torch.dtype | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused GDN decode: split + conv1d + recurrence + gated RMSNorm [+ FP8].
 
     Args:

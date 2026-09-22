@@ -26,7 +26,6 @@ import argparse
 import sys
 
 import torch
-
 from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
     fused_gdn_decode_qkvz,
 )
@@ -44,22 +43,23 @@ def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda"):
     group_width = 2 * head_dim + 2 * ratio * head_dim
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
     slots = max(slots, batch + 1)
-    bf16 = dict(dtype=torch.bfloat16, device=device)
-    return dict(
-        projected_qkvz=torch.randn(batch, num_k_heads * group_width, **bf16),
-        projected_ba=torch.randn(batch, 2 * num_v_heads, **bf16),
-        conv_state=torch.randn(slots, channels, _CONV_WIDTH - 1, **bf16),
-        ssm_state=torch.randn(
+    bf16 = {"dtype": torch.bfloat16, "device": device}
+    return {
+        "projected_qkvz": torch.randn(batch, num_k_heads * group_width, **bf16),
+        "projected_ba": torch.randn(batch, 2 * num_v_heads, **bf16),
+        "conv_state": torch.randn(slots, channels, _CONV_WIDTH - 1, **bf16),
+        "ssm_state": torch.randn(
             slots, num_v_heads, head_dim, head_dim, dtype=torch.float32, device=device
         ),
-        # Distinct live slots: duplicates would race between rows.
-        ssm_state_indices=torch.arange(1, batch + 1, dtype=torch.int32, device=device),
-        conv_weight=torch.randn(channels, _CONV_WIDTH, **bf16),
-        conv_bias=torch.randn(channels, **bf16),
-        A_log=torch.randn(num_v_heads, dtype=torch.float32, device=device),
-        dt_bias=torch.randn(num_v_heads, **bf16),
-        norm_weight=torch.randn(head_dim, **bf16),
-    )
+        "ssm_state_indices": torch.arange(
+            1, batch + 1, dtype=torch.int32, device=device
+        ),
+        "conv_weight": torch.randn(channels, _CONV_WIDTH, **bf16),
+        "conv_bias": torch.randn(channels, **bf16),
+        "A_log": torch.randn(num_v_heads, dtype=torch.float32, device=device),
+        "dt_bias": torch.randn(num_v_heads, **bf16),
+        "norm_weight": torch.randn(head_dim, **bf16),
+    }
 
 
 def bytes_moved(batch, num_k_heads, head_dim, fp8):
@@ -91,7 +91,7 @@ def bench_one(batch, num_k_heads, head_dim, slots, quant_dtype, iters, warmup=25
         inp["dt_bias"],
         inp["norm_weight"],
     )
-    kwargs = dict(scale=head_dim**-0.5, norm_eps=1e-6, quant_dtype=quant_dtype)
+    kwargs = {"scale": head_dim**-0.5, "norm_eps": 1e-6, "quant_dtype": quant_dtype}
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
