@@ -21,8 +21,10 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import BFloat16, Float32, Int32, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fxmath
+from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_GQA
@@ -51,6 +53,47 @@ def _neg_inf():
 
 def _exp2(x):
     return Float32(fx.rocdl.exp2(Float32.ir_type, Float32(x).ir_value()))
+
+
+def _f32_as_i32(x):
+    return llvm.bitcast(T.i32, Float32(x).ir_value())
+
+
+def _i32_as_f32(x):
+    return Float32(llvm.bitcast(T.f32, x))
+
+
+# Butterfly DPP ctrls for xor 1, 2, 4, 8 within a 16-lane row (coop warp_reduce).
+_DPP_XOR_1 = 0xB1
+_DPP_XOR_2 = 0x4E
+_DPP_XOR_4 = 0x141
+_DPP_XOR_8 = 0x128
+
+
+def _dpp_f32(x, dpp_ctrl):
+    bits = _f32_as_i32(x)
+    swapped = fx.rocdl.update_dpp(T.i32, bits, bits, dpp_ctrl, 0xF, 0xF, True)
+    return _i32_as_f32(swapped)
+
+
+def _token_row_reduce_max(x):
+    """16-wide token max on gfx950 via DPP xor 1,2,4,8.
+
+    Live AMD softmax uses ``v_permlane32_swap`` then ``v_permlane16_swap``
+    (xor 32/16) because its four C regs are tokens. This kernel's C map is
+    ``acc4[i]`` = head ``lane_kg*4+i``, token = ``lane_m``, so those hops
+    mix heads (oracle err?0.97). DPP butterfly is the VALU reduce that
+    matches xor 1,2,4,8 without ``ds_swizzle``.
+    """
+    for ctrl in (_DPP_XOR_1, _DPP_XOR_2, _DPP_XOR_4, _DPP_XOR_8):
+        x = x.maximumf(_dpp_f32(x, ctrl))
+    return x
+
+
+def _token_row_reduce_sum(x):
+    for ctrl in (_DPP_XOR_1, _DPP_XOR_2, _DPP_XOR_4, _DPP_XOR_8):
+        x = x + _dpp_f32(x, ctrl)
+    return x
 
 
 def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
@@ -195,11 +238,15 @@ def build_qsa_k2_family_a_module(
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+        lds_copy64 = fx.make_copy_atom(fx.UniversalCopy64b(), BFloat16)
         kv_tile, kv_tv = fx.make_layout_tv(
             fx.make_layout((block_n, col_owners), (1, block_n)),
             fx.make_layout((1, vec), (vec, 1)),
         )
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
+        # Same 8-wide thread map as kv_store; the 64-bit atom emits two
+        # ds_write_b64 per thread (AMD decode V).
+        v64_store = fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
         q_buf = fx.rocdl.make_buffer_tensor(q)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
@@ -465,10 +512,10 @@ def build_qsa_k2_family_a_module(
                         fx.get_iter(v_lds) + Int32(gr * gather_span),
                         fx.make_layout((block_n, gather_span), (_D, 1)),
                     )
-                    v_dst = kv_store.partition_D(v_tile)
+                    v_dst = v64_store.partition_D(v_tile)
                     v_store_frag = fx.make_fragment_like(v_dst)
                     fx.memref_store_vec(v_vec, v_store_frag)
-                    fx.copy(lds_copy, v_store_frag, v_dst)
+                    fx.copy(lds_copy64, v_store_frag, v_dst)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
             elif const_expr(not use_k32):
@@ -517,10 +564,13 @@ def build_qsa_k2_family_a_module(
                         scores.append(score)
                         score_lives.append(score_live)
                         tile_max = tile_max.maximumf(score)
-                    for sh in (1, 2, 4, 8):
-                        tile_max = tile_max.maximumf(
-                            tile_max.shuffle_xor(Int32(sh), Int32(64))
-                        )
+                    if const_expr(use_k32):
+                        tile_max = _token_row_reduce_max(tile_max)
+                    else:
+                        for sh in (1, 2, 4, 8):
+                            tile_max = tile_max.maximumf(
+                                tile_max.shuffle_xor(Int32(sh), Int32(64))
+                            )
                     m_prev = m_lds[h]
                     l_prev = l_lds[h]
                     m_new = m_prev.maximumf(tile_max)
@@ -533,8 +583,11 @@ def build_qsa_k2_family_a_module(
                         )
                         p_lds[h, n] = p.to(BFloat16)
                         p_sum = p_sum + p
-                    for sh in (1, 2, 4, 8):
-                        p_sum = p_sum + p_sum.shuffle_xor(Int32(sh), Int32(64))
+                    if const_expr(use_k32):
+                        p_sum = _token_row_reduce_sum(p_sum)
+                    else:
+                        for sh in (1, 2, 4, 8):
+                            p_sum = p_sum + p_sum.shuffle_xor(Int32(sh), Int32(64))
                     if lane_m == zero:
                         m_lds[h] = m_new
                         l_lds[h] = l_prev * alpha + p_sum
