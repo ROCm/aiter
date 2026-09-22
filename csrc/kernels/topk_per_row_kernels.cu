@@ -1321,6 +1321,87 @@ choose_bucket(Counter<T, IdxT>* counter, IdxT const* histogram, const IdxT k, in
 }
 
 /**
+ * Scan a local histogram and choose the crossing bucket without writing the
+ * inclusive prefixes back to LDS.  The ordinary scan()+choose_bucket() pair
+ * stores every prefix through BlockStore, synchronizes, and immediately reads
+ * the same values again.  The 32K fp32 LDS-tail path clears the histogram
+ * after every choice, so keeping both the original count and inclusive prefix
+ * in registers avoids that otherwise-dead round trip.
+ */
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
+__device__ void scan_and_choose_bucket(Counter<T, IdxT>* counter,
+                                       IdxT const* histogram,
+                                       const IdxT k,
+                                       int const start_bit)
+{
+    constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
+    if constexpr(num_buckets >= BlockSize)
+    {
+        static_assert(num_buckets % BlockSize == 0);
+        constexpr int items_per_thread = num_buckets / BlockSize;
+        using BlockLoad = hipcub::BlockLoad<IdxT,
+                                             BlockSize,
+                                             items_per_thread,
+                                             hipcub::BLOCK_LOAD_TRANSPOSE>;
+        using BlockScan = hipcub::BlockScan<IdxT, BlockSize>;
+
+        __shared__ union
+        {
+            typename BlockLoad::TempStorage load;
+            typename BlockScan::TempStorage scan;
+        } temp_storage;
+
+        IdxT counts[items_per_thread];
+        IdxT inclusive[items_per_thread];
+        BlockLoad(temp_storage.load).Load(histogram, counts);
+        __syncthreads();
+        BlockScan(temp_storage.scan).InclusiveSum(counts, inclusive);
+
+#pragma unroll
+        for(int item = 0; item < items_per_thread; ++item)
+        {
+            IdxT const prev = inclusive[item] - counts[item];
+            IdxT const cur  = inclusive[item];
+            if(prev < k && cur >= k)
+            {
+                int const bucket = static_cast<int>(threadIdx.x) * items_per_thread + item;
+                counter->k       = k - prev;
+                counter->len     = cur - prev;
+                using Bits       = typename aiter::radix_traits<T>::UnsignedBits;
+                counter->kth_value_bits |= static_cast<Bits>(bucket)
+                                           << start_bit;
+            }
+        }
+    }
+    else
+    {
+        using BlockScan = hipcub::BlockScan<IdxT, BlockSize>;
+        __shared__ typename BlockScan::TempStorage temp_storage;
+
+        IdxT count = 0;
+        if(threadIdx.x < num_buckets)
+        {
+            count = histogram[threadIdx.x];
+        }
+        IdxT inclusive = 0;
+        BlockScan(temp_storage).InclusiveSum(count, inclusive);
+
+        if(threadIdx.x < num_buckets)
+        {
+            IdxT const prev = inclusive - count;
+            if(prev < k && inclusive >= k)
+            {
+                counter->k   = k - prev;
+                counter->len = inclusive - prev;
+                using Bits   = typename aiter::radix_traits<T>::UnsignedBits;
+                counter->kth_value_bits |= static_cast<Bits>(threadIdx.x)
+                                           << start_bit;
+            }
+        }
+    }
+}
+
+/**
  * Last-pass filter: write final top-k results.
  * bits < kth: definite top-k, written front-to-back.
  * bits == kth: fill from back (up to num_of_kth_needed).
@@ -2275,10 +2356,12 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
 {
     static_assert(std::is_same_v<T, float>);
     static_assert(std::is_same_v<IdxT, int>);
+    static_assert(!WRITE_TOPK_VALUES);
     constexpr int BitsPerPass       = 12;
     constexpr int num_buckets       = calc_num_buckets<BitsPerPass>();
     constexpr int tail_num_buckets  = 1 << 8;
     constexpr int CandidateCapacity = 2048;
+    constexpr int WinnerCapacity    = 2048;
     constexpr int pass0_start_bit   = 20;
     constexpr int pass1_start_bit   = 8;
     constexpr int pass2             = 2;
@@ -2287,6 +2370,12 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     __shared__ IdxT histogram[num_buckets];
     __shared__ T candidate_values[CandidateCapacity];
     __shared__ IdxT candidate_indices[CandidateCapacity];
+    // Pass-1 winners are sparse across the row.  Staging their indices in LDS
+    // keeps the dependent global stores out of the full-row streaming scan;
+    // they are flushed contiguously after the pass.  The number of definite
+    // winners is strictly less than k, and this specialization is dispatched
+    // only for k == 2048, so WinnerCapacity cannot overflow.
+    __shared__ IdxT winner_indices[WinnerCapacity];
     __shared__ IdxT candidate_count;
     __shared__ int candidate_overflow;
 
@@ -2335,9 +2424,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     };
     vectorized_process(threadIdx.x, blockDim.x, in, row_len, build_pass0_histogram);
     __syncthreads();
-    scan<IdxT, BitsPerPass, BlockSize>(histogram);
-    __syncthreads();
-    choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, k, 0);
+    scan_and_choose_bucket<T, IdxT, BitsPerPass, BlockSize>(
+        &counter, histogram, k, pass0_start_bit);
     __syncthreads();
 
     // Pass 1: build the middle-12 histogram, immediately emit high-prefix
@@ -2358,16 +2446,16 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     IdxT* const histogram_ptr              = histogram;
     T* const candidate_values_ptr       = candidate_values;
     IdxT* const candidate_indices_ptr   = candidate_indices;
+    IdxT* const winner_indices_ptr      = winner_indices;
     IdxT* const p_candidate_count       = &candidate_count;
     int* const p_candidate_overflow     = &candidate_overflow;
     auto stage_pass1 = [histogram_ptr,
                         candidate_values_ptr,
                         candidate_indices_ptr,
+                        winner_indices_ptr,
                         p_candidate_count,
                         p_candidate_overflow,
                         p_out_cnt,
-                        out,
-                        out_idx,
                         high_prefix,
                         select_min](T value, IdxT idx) {
         auto const bits = twiddle_in(value, select_min);
@@ -2375,11 +2463,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         if(prefix < high_prefix)
         {
             IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-            if constexpr(WRITE_TOPK_VALUES)
-            {
-                out[pos] = value;
-            }
-            out_idx[pos] = idx;
+            winner_indices_ptr[pos] = idx;
         }
         else if(prefix == high_prefix)
         {
@@ -2401,11 +2485,23 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     vectorized_process(threadIdx.x, blockDim.x, in, row_len, stage_pass1);
     __syncthreads();
 
-    scan<IdxT, BitsPerPass, BlockSize>(histogram);
-    __syncthreads();
     IdxT const pass1_k = counter.k;
-    choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, pass1_k, 1);
+    scan_and_choose_bucket<T, IdxT, BitsPerPass, BlockSize>(
+        &counter, histogram, pass1_k, pass1_start_bit);
     __syncthreads();
+
+    // Only publish a successful staged pass.  On overflow the exact fallback
+    // below recomputes the complete answer from the original row.  Otherwise
+    // this dense flush replaces ~k sparse global stores with at most two
+    // coalesced stores per thread.
+    if(!candidate_overflow)
+    {
+        IdxT const winner_count = counter.out_cnt;
+        for(IdxT i = static_cast<IdxT>(threadIdx.x); i < winner_count; i += BlockSize)
+        {
+            out_idx[i] = winner_indices[i];
+        }
+    }
 
     if(candidate_overflow)
     {
@@ -2444,9 +2540,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         };
         vectorized_process(threadIdx.x, blockDim.x, in, row_len, build_pass2_histogram);
         __syncthreads();
-        scan<IdxT, BitsPerPass, BlockSize>(histogram);
-        __syncthreads();
-        choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, pass2_k, pass2);
+        scan_and_choose_bucket<T, IdxT, BitsPerPass, BlockSize>(
+            &counter, histogram, pass2_k, 0);
         __syncthreads();
         last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
             in,
@@ -2458,6 +2553,37 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
             &counter,
             select_min,
             pass2);
+        return;
+    }
+
+    // With random fp32 data the selected 24-bit prefix almost always names a
+    // single element.  In that exact case the remaining low byte is already
+    // known from that element, so avoid clearing/building/scanning the 256-bin
+    // tail histogram.  Ties and other multi-element prefixes keep the normal
+    // exact radix tail below.
+    if(counter.len == 1)
+    {
+        auto const middle_prefix = counter.kth_value_bits;
+        IdxT const staged_len     = candidate_count;
+        for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
+        {
+            auto const bits = twiddle_in(candidate_values[i], select_min);
+            auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
+            if(prefix == middle_prefix)
+            {
+                counter.kth_value_bits |= bits & 0xffu;
+            }
+        }
+        __syncthreads();
+        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(candidate_values,
+                                                                    candidate_indices,
+                                                                    out,
+                                                                    out_idx,
+                                                                    staged_len,
+                                                                    k,
+                                                                    &counter,
+                                                                    select_min,
+                                                                    pass2);
         return;
     }
 
@@ -2483,20 +2609,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     }
     __syncthreads();
 
-    scan<IdxT, 8, BlockSize>(histogram);
-    __syncthreads();
     IdxT const pass2_k = counter.k;
-    for(int i = threadIdx.x; i < tail_num_buckets; i += blockDim.x)
-    {
-        IdxT const prev = (i == 0) ? 0 : histogram[i - 1];
-        IdxT const cur  = histogram[i];
-        if(prev < pass2_k && cur >= pass2_k)
-        {
-            counter.k   = pass2_k - prev;
-            counter.len = cur - prev;
-            counter.kth_value_bits |= static_cast<unsigned>(i);
-        }
-    }
+    scan_and_choose_bucket<T, IdxT, 8, BlockSize>(&counter, histogram, pass2_k, 0);
     __syncthreads();
 
     last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(candidate_values,
