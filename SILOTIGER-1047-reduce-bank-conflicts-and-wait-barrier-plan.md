@@ -29,6 +29,7 @@ when that is the ticket convention.
 - [x] 2. Pack live / phys / page_off LDS
 - [x] 3. Overlap K/V `buffer_load` with LDS wait/barrier
 - [ ] 4. Bank-conflict-free K (and C) stores; V layout unchanged
+      (K pad **kept**; C still open)
 - [ ] 5. Token-major V: pack stores only
 - [ ] 6. Optional: drop C-LDS QK reduce (last, likely small)
 - [ ] 7. Stop: within ~2× AMD per-wave conflict/wait **or** keep-gate dry
@@ -275,10 +276,42 @@ No row reaches the 3% keep gate. Kernel restored to HEAD.
 Prefill ATT: expensive `ds_write_b128` + `lgkmcnt(0)` before KV-publish
 and C-publish. Swizzle/pad/phase the **existing** tiled K/C maps.
 
-- [ ] Decode-only K/C if the maps differ; else one shared change.
-- [ ] **Do not** switch decode V to `[BLOCK_N, D]`.
-- [ ] Keep-gate; PMC conflict/wave must move.
-- [ ] **Done when:** kept or reverted + note.
+- [x] Shared K-row pad `_K_STRIDE = D+8` (gfx950 `k` and gfx942 aliased
+      `kv`). Decode token-major V stays `[D, BLOCK_N]`. gfx950 row-major
+      V stays unpadded stride `D`. C LDS not in this ISA line.
+- [x] **Do not** switch decode V to `[BLOCK_N, D]`.
+- [x] Keep-gate on K pad; PMC conflict/wave moved.
+- [ ] C stores still open (next ISA line in this phase).
+- [ ] **Done when:** C kept or reverted + note (K already kept).
+
+Measured 2026-09-22 GPU 6 / gfx950, `CACHE=0`, `ROCM_PATH=/root/.flydsl/toolkit`.
+Focused pytest `test_k2_family_a_*` 2/2. Width-2051 `L=512` median of
+three `warmup=20`/`iters=100` vs HEAD `20.18 / 20.86 / 515.98`:
+
+| M | HEAD | K pad | Δ |
+|--:|--:|--:|--:|
+| 1 | 20.18 | 20.09 | −0.45% |
+| 8 | 20.86 | 20.52 | −1.63% |
+| 512 | 515.98 | 424.09 | **−17.8%** |
+
+Keep: prefill clears 3%; decode does not regress. New wall-clock
+baseline is **20.09 / 20.52 / 424.09**.
+
+PMC (rocprofv3 8-counter pass, last split dispatch per-wave; this
+sqlite path reports fewer `SQ_WAVES` than phase-0 CSV, so compare
+/wave not totals):
+
+| | M=1 conflict/wave | M=1 wait LDS/wave | M=1 MFMA/wave | M=512 conflict | M=512 wait LDS | M=512 MFMA |
+|--|--:|--:|--:|--:|--:|--:|
+| HEAD (phase 0 CSV) | 1032 | 146 | 24.2 | 93984 | 44095 | 1584 |
+| K pad | 384 | 70 | 24.0 | 51744 | 27279 | 1584 |
+
+LDS `group_segment_size` 21632 (decode) / 77760 (prefill) vs
+21504 / 76800. MFMA/wave unchanged. Leftover decode conflicts are
+still expected (col vs col+8 on the pad). C-LDS `(n_subtiles,
+num_waves, 64, 4)` is the remaining store map in this phase.
+
+**K pad kept.** Next in phase 4: C stores only.
 
 ### 5. Token-major V: pack stores only
 

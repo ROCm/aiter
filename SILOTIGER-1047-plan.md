@@ -713,6 +713,15 @@ width-2051 `L=512` HEAD → hoist median (three runs) was
 515.98 → 518.30 us at `M=512`. Keep V gather after the K-publish
 barrier.
 
+**Kept** K (and gfx942 aliased KV) LDS row pad `_K_STRIDE = D+8`.
+Does not change decode token-major V. GPU 6 / gfx950 focused
+decode+prefill pytest passed. Width-2051 `L=512` HEAD → pad median
+(three runs) was 20.18 → 20.09 us at `M=1`, 20.86 → 20.52 us at
+`M=8`, and 515.98 → 424.09 us at `M=512` (−17.8% prefill). PMC
+conflict/wave dropped (decode 1032 → 384, prefill 93984 → 51744);
+MFMA/wave stayed 24 / 1584. New keep-gate baseline **20.09 / 20.52 /
+424.09**. C-LDS is still unpadded.
+
 **Do not retry** MMA-native QK A (`make_tiled_copy_A` of global Q into
 the QK A fragment). The compiler aborted in
 `CopyOpUniversalCopyType::emitAtomCallSSA`. Keep the 128-bit `g_copy`
